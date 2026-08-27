@@ -26,21 +26,16 @@ pub const DEFAULT_HNSW_PROPOSAL_WAVE_SIZE: u32 = 64;
 pub const DEFAULT_HNSW_WARMUP_POINT_COUNT: u32 = 4_096;
 pub const DEFAULT_HNSW_FILTER_BLOCK_ROWS: u32 = 20_000;
 pub const DEFAULT_HNSW_FILTER_M: u32 = 8;
-/// Dimension at which the built-in sequential/random score ratio was measured.
-pub const DEFAULT_HNSW_DISTANCE_COST_REFERENCE_DIMENSION: u32 = 32;
-/// Deterministic deployment profile: at the reference dimension, one random
-/// graph score costs as much as this many scores over the sequential
-/// predicate-covering layout. The model decomposes that ratio into one
-/// dimension-proportional score plus a fixed random-access cost, so it does not
-/// incorrectly preserve a 32D ratio for 768D vectors.
-pub const DEFAULT_HNSW_SEQUENTIAL_COVERING_SCORES_PER_RANDOM_SCORE: u32 = 14;
-/// Deterministic deployment profile for batched point-id gathers from base
-/// vector storage. It is independent from the covering-layout value so the two
-/// physical classes can be calibrated and pinned separately.
-pub const DEFAULT_HNSW_INDEXED_BASE_SCORES_PER_RANDOM_SCORE: u32 = 1;
+/// Fixed cost of initiating one random vector-row access. Cost profiles use a
+/// dimension unit rather than a reference-dimension ratio, so graph scoring
+/// can price the actual durable routing representation.
+pub const DEFAULT_HNSW_RANDOM_ACCESS_COST_UNITS: u32 = 416;
+pub const DEFAULT_HNSW_EXACT_F32_DIMENSION_COST_UNITS: u32 = 1;
+pub const DEFAULT_HNSW_SEQUENTIAL_DIMENSION_COST_UNITS: u32 = 1;
+pub const DEFAULT_HNSW_SYMMETRIC_I16_DIMENSION_COST_UNITS: u32 = 1;
 /// Deterministic graph-work profile. HNSW level-0 neighborhoods overlap, so
 /// one unit of `ef` can score points across several expanded neighborhoods and
-/// is not bounded by one row's average or maximum degree. Revision 4 uses 24,
+/// is not bounded by one row's average or maximum degree. Revisions 4-5 use 24,
 /// measured as 24.7 at high `ef` on the reproducible 10M uniform-32d workload
 /// with M=16, M0=32 and ef_construct=100. Different graph contracts or hardware
 /// should publish an offline calibration instead of mutating process-local
@@ -49,14 +44,17 @@ pub const DEFAULT_HNSW_GRAPH_SCORED_POINTS_PER_EF: u32 = 24;
 /// Revision of the built-in, reproducible distance-cost calibration. Changing
 /// a coefficient or the physical-work interpretation requires a new revision
 /// so persisted definitions describe the exact decision surface they use.
-/// Revision 4 calibrates covering/indexed-base work to 14/1 at 32 dimensions,
-/// dimension-scales the fixed random-access component, consumes the graph
-/// coefficient directly, and charges the eager-admission retry when the final
-/// deferred beam cannot be expected to hold Top-K headroom.
-pub const HNSW_BUILT_IN_DISTANCE_COST_REVISION: u32 = 4;
+/// Revision 5 represents physical work directly as fixed random-access and
+/// per-dimension units. Graph scoring is charged against the artifact's actual
+/// routing representation, so compact i16 navigation is not costed as a full
+/// canonical f32 row. Revision 4 used derived reference-dimension ratios.
+pub const HNSW_BUILT_IN_DISTANCE_COST_REVISION: u32 = 5;
 pub const MAX_HNSW_FILTER_COLUMNS: usize = 8;
 pub const HNSW_FILTER_TOPOLOGY_VERSION: u32 = 4;
-/// Version 13 upgrades compact construction routing to per-coordinate i16.
+/// Version 14 makes compact encoding and its non-zero routing dimension a
+/// single sum type, so an invalid encoding/dimension pair cannot exist in a
+/// catalog, build contract, compaction job, or in-memory plan. Version 13
+/// upgrades compact construction routing to per-coordinate i16.
 /// The wider code preserves ordered low-amplitude geometry that an i8 image
 /// can collapse, while remaining substantially smaller than canonical f32.
 /// Version 12 makes the construction routing-vector encoding part of the
@@ -86,7 +84,7 @@ pub const HNSW_FILTER_TOPOLOGY_VERSION: u32 = 4;
 /// followed by cycle walking. One-point warm-up waves and deterministic frozen
 /// proposal waves remain durable topology fields; changing point ordering or
 /// publication semantics requires a new contract version.
-pub const HNSW_BUILD_CONTRACT_VERSION: u32 = 13;
+pub const HNSW_BUILD_CONTRACT_VERSION: u32 = 14;
 /// Maximum number of deterministic source coordinates retained by the
 /// compact construction routing space. The original f32 dimension remains
 /// authoritative for SQL scoring and exact re-ranking.
@@ -99,19 +97,48 @@ pub const DEFAULT_HNSW_BUILD_ROUTING_DIMENSIONS: u32 = 128;
 /// changing SQL storage. Query artifacts retain the canonical f32 vectors and
 /// return scores in the requested metric; this field only defines how durable
 /// graph topology was constructed.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum HnswBuildVectorEncoding {
     ExactF32,
-    #[default]
-    SymmetricI16,
+    SymmetricI16 {
+        routing_dimensions: std::num::NonZeroU16,
+    },
+}
+
+impl HnswBuildVectorEncoding {
+    pub fn symmetric_i16(routing_dimensions: u32) -> paro_common::error::Result<Self> {
+        let routing_dimensions = u16::try_from(routing_dimensions)
+            .ok()
+            .and_then(std::num::NonZeroU16::new)
+            .ok_or_else(|| {
+                paro_common::error::invalid_input(format!(
+                    "symmetric-i16 HNSW routing dimensions must be between 1 and {}, got {routing_dimensions}",
+                    u16::MAX
+                ))
+            })?;
+        Ok(Self::SymmetricI16 { routing_dimensions })
+    }
+
+    pub fn default_for_dimension(dimension: u32) -> paro_common::error::Result<Self> {
+        Self::symmetric_i16(dimension.min(DEFAULT_HNSW_BUILD_ROUTING_DIMENSIONS))
+    }
+
+    pub const fn routing_dimensions(self) -> Option<u16> {
+        match self {
+            Self::ExactF32 => None,
+            Self::SymmetricI16 { routing_dimensions } => Some(routing_dimensions.get()),
+        }
+    }
 }
 
 impl std::fmt::Display for HnswBuildVectorEncoding {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::ExactF32 => f.write_str("exact_f32"),
-            Self::SymmetricI16 => f.write_str("symmetric_i16"),
+            Self::SymmetricI16 { routing_dimensions } => {
+                write!(f, "symmetric_i16({routing_dimensions})")
+            }
         }
     }
 }
@@ -531,9 +558,10 @@ impl std::fmt::Display for HnswDistanceCostProfileSource {
 #[serde(deny_unknown_fields)]
 pub struct HnswDistanceCostProfile {
     pub source: HnswDistanceCostProfileSource,
-    pub reference_dimension: u32,
-    pub sequential_covering_scores_per_random_score: u32,
-    pub indexed_base_scores_per_random_score: u32,
+    pub random_access_cost_units: u32,
+    pub exact_f32_dimension_cost_units: u32,
+    pub sequential_dimension_cost_units: u32,
+    pub symmetric_i16_dimension_cost_units: u32,
     pub graph_scored_points_per_ef: u32,
 }
 
@@ -543,10 +571,10 @@ impl Default for HnswDistanceCostProfile {
             source: HnswDistanceCostProfileSource::BuiltIn {
                 revision: HNSW_BUILT_IN_DISTANCE_COST_REVISION,
             },
-            reference_dimension: DEFAULT_HNSW_DISTANCE_COST_REFERENCE_DIMENSION,
-            sequential_covering_scores_per_random_score:
-                DEFAULT_HNSW_SEQUENTIAL_COVERING_SCORES_PER_RANDOM_SCORE,
-            indexed_base_scores_per_random_score: DEFAULT_HNSW_INDEXED_BASE_SCORES_PER_RANDOM_SCORE,
+            random_access_cost_units: DEFAULT_HNSW_RANDOM_ACCESS_COST_UNITS,
+            exact_f32_dimension_cost_units: DEFAULT_HNSW_EXACT_F32_DIMENSION_COST_UNITS,
+            sequential_dimension_cost_units: DEFAULT_HNSW_SEQUENTIAL_DIMENSION_COST_UNITS,
+            symmetric_i16_dimension_cost_units: DEFAULT_HNSW_SYMMETRIC_I16_DIMENSION_COST_UNITS,
             graph_scored_points_per_ef: DEFAULT_HNSW_GRAPH_SCORED_POINTS_PER_EF,
         }
     }
@@ -584,46 +612,68 @@ impl HnswDistanceCostModel {
         vector_dimension: u32,
         profile: HnswDistanceCostProfile,
     ) -> u64 {
-        Self::sequential_work(workload.sequential_rows, vector_dimension, profile).saturating_add(
-            workload.indexed_base_rows.div_ceil(u64::from(
-                profile.indexed_base_scores_per_random_score.max(1),
-            )),
-        )
+        let dimension = u64::from(vector_dimension.max(1));
+        let sequential_score =
+            dimension.saturating_mul(u64::from(profile.sequential_dimension_cost_units.max(1)));
+        let indexed_score = u64::from(profile.random_access_cost_units.max(1)).saturating_add(
+            dimension.saturating_mul(u64::from(profile.exact_f32_dimension_cost_units.max(1))),
+        );
+        workload
+            .sequential_rows
+            .saturating_mul(sequential_score)
+            .saturating_add(workload.indexed_base_rows.saturating_mul(indexed_score))
     }
 
-    /// Convert sequential covering scores into random-score-equivalent work.
-    ///
-    /// At the calibrated reference dimension the conversion is exactly the
-    /// persisted ratio. For wider vectors, both paths pay the same linear
-    /// arithmetic/streaming component while only random graph access retains
-    /// the fixed latency component. This makes the ratio converge toward one
-    /// instead of treating a 32D cache-miss measurement as dimension-free.
+    /// Cost a contiguous exact scan in the same direct physical units used by
+    /// graph and indexed-base scoring. Sequential rows pay no random-access
+    /// charge; their cost grows only with the canonical vector width.
     pub fn sequential_work(
         rows: u64,
         vector_dimension: u32,
         profile: HnswDistanceCostProfile,
     ) -> u64 {
-        let dimension = u64::from(vector_dimension.max(1));
-        let reference_dimension = u64::from(profile.reference_dimension.max(1));
-        let reference_ratio = u64::from(profile.sequential_covering_scores_per_random_score.max(1));
-        let random_score_cost = dimension.saturating_add(
-            reference_ratio
-                .saturating_sub(1)
-                .saturating_mul(reference_dimension),
-        );
-        rows.saturating_mul(dimension).div_ceil(random_score_cost)
+        rows.saturating_mul(u64::from(vector_dimension.max(1)))
+            .saturating_mul(u64::from(profile.sequential_dimension_cost_units.max(1)))
     }
 
     pub fn graph_work(
         total_rows: u64,
         effective_ef: usize,
+        vector_dimension: u32,
+        vector_encoding: HnswBuildVectorEncoding,
         cost_profile: HnswDistanceCostProfile,
     ) -> u64 {
+        // Compact routing reduces random graph-row width, but its complete ef
+        // beam crosses the lossy/exact boundary before final Top-K. Charge
+        // that canonical random gather explicitly; otherwise the planner
+        // would price only half of the executable compact path.
         let navigation = total_rows.max(1).ilog2() as u64;
-        navigation.saturating_add(
+        let scored_points = navigation.saturating_add(
             (effective_ef.max(1) as u64)
                 .saturating_mul(u64::from(cost_profile.graph_scored_points_per_ef.max(1))),
-        )
+        );
+        let (scoring_dimension, dimension_units, exact_rerank_rows) = match vector_encoding {
+            HnswBuildVectorEncoding::ExactF32 => (
+                u64::from(vector_dimension.max(1)),
+                u64::from(cost_profile.exact_f32_dimension_cost_units.max(1)),
+                0,
+            ),
+            HnswBuildVectorEncoding::SymmetricI16 { routing_dimensions } => (
+                u64::from(routing_dimensions.get()),
+                u64::from(cost_profile.symmetric_i16_dimension_cost_units.max(1)),
+                effective_ef.max(1) as u64,
+            ),
+        };
+        let random_access = u64::from(cost_profile.random_access_cost_units.max(1));
+        let score_cost =
+            random_access.saturating_add(scoring_dimension.saturating_mul(dimension_units));
+        let exact_rerank_cost =
+            random_access.saturating_add(u64::from(vector_dimension.max(1)).saturating_mul(
+                u64::from(cost_profile.exact_f32_dimension_cost_units.max(1)),
+            ));
+        scored_points
+            .saturating_mul(score_cost)
+            .saturating_add(exact_rerank_rows.saturating_mul(exact_rerank_cost))
     }
 
     /// Expected graph passes implied by the executable algorithm, not a
@@ -653,15 +703,20 @@ impl HnswDistanceCostModel {
     }
 
     pub fn graph_work_for_search(input: HnswSegmentSearchInput) -> u64 {
-        Self::graph_work(input.total_rows, input.effective_ef, input.cost_profile).saturating_mul(
-            Self::graph_passes(
-                input.filter_kind,
-                input.matching_rows,
-                input.total_rows,
-                input.top_k,
-                input.effective_ef,
-            ),
+        Self::graph_work(
+            input.total_rows,
+            input.effective_ef,
+            input.vector_dimension,
+            input.vector_encoding,
+            input.cost_profile,
         )
+        .saturating_mul(Self::graph_passes(
+            input.filter_kind,
+            input.matching_rows,
+            input.total_rows,
+            input.top_k,
+            input.effective_ef,
+        ))
     }
 
     #[cfg(test)]
@@ -673,7 +728,14 @@ impl HnswDistanceCostModel {
         cost_profile: HnswDistanceCostProfile,
     ) -> bool {
         let exact_work = Self::exact_work(exact_scan_workload, vector_dimension, cost_profile);
-        exact_work <= Self::graph_work(total_rows, effective_ef, cost_profile)
+        exact_work
+            <= Self::graph_work(
+                total_rows,
+                effective_ef,
+                vector_dimension,
+                HnswBuildVectorEncoding::ExactF32,
+                cost_profile,
+            )
     }
 }
 
@@ -689,6 +751,7 @@ pub struct HnswSegmentSearchInput {
     pub top_k: usize,
     pub effective_ef: usize,
     pub vector_dimension: u32,
+    pub vector_encoding: HnswBuildVectorEncoding,
     pub exact_scan_workload: HnswExactScanWorkload,
     pub cost_profile: HnswDistanceCostProfile,
 }
@@ -814,6 +877,7 @@ pub fn estimate_filtered_search_strategy(
         top_k,
         effective_ef,
         vector_dimension,
+        vector_encoding: policy.vector_encoding,
         exact_scan_workload: HnswExactScanWorkload::indexed_base(matching_rows),
         cost_profile: policy.distance_cost,
     };
@@ -1004,9 +1068,6 @@ pub struct HnswBuildContract {
     pub ef_construct: u32,
     pub distance: super::DistanceMetric,
     pub vector_encoding: HnswBuildVectorEncoding,
-    /// Number of source coordinates used by a compact routing encoding. Zero
-    /// is reserved for `ExactF32`, whose routing space is the base dimension.
-    pub routing_dimensions: u32,
     pub build_seed: u64,
     /// Number of point proposals computed against one frozen topology.
     pub proposal_wave_size: u32,
@@ -1036,23 +1097,6 @@ impl HnswBuildContract {
                 self.ef_construct, self.m
             )));
         }
-        match self.vector_encoding {
-            HnswBuildVectorEncoding::ExactF32 if self.routing_dimensions != 0 => {
-                return Err(paro_common::error::data_corrupted(
-                    "exact-f32 HNSW construction must not declare compact routing dimensions",
-                ));
-            }
-            HnswBuildVectorEncoding::SymmetricI16
-                if !(1..=u16::MAX as u32).contains(&self.routing_dimensions) =>
-            {
-                return Err(paro_common::error::data_corrupted(format!(
-                    "symmetric-i16 HNSW routing dimensions must be between 1 and {}, got {}",
-                    u16::MAX,
-                    self.routing_dimensions
-                )));
-            }
-            _ => {}
-        }
         if !(1..=4_096).contains(&self.proposal_wave_size) {
             return Err(paro_common::error::data_corrupted(format!(
                 "invalid HNSW proposal_wave_size {}, expected 1..=4096",
@@ -1075,6 +1119,7 @@ impl HnswBuildContract {
 pub struct HnswSearchPolicy {
     pub ef_search: usize,
     pub distance_cost: HnswDistanceCostProfile,
+    pub vector_encoding: HnswBuildVectorEncoding,
 }
 
 impl Default for HnswSearchPolicy {
@@ -1082,6 +1127,7 @@ impl Default for HnswSearchPolicy {
         Self {
             ef_search: DEFAULT_HNSW_EF_SEARCH as usize,
             distance_cost: HnswDistanceCostProfile::default(),
+            vector_encoding: HnswBuildVectorEncoding::ExactF32,
         }
     }
 }
@@ -1159,7 +1205,6 @@ impl HnswConfig {
             })?,
             distance,
             vector_encoding: HnswBuildVectorEncoding::ExactF32,
-            routing_dimensions: 0,
             build_seed: self.build_seed,
             proposal_wave_size: DEFAULT_HNSW_PROPOSAL_WAVE_SIZE,
             warmup_point_count: DEFAULT_HNSW_WARMUP_POINT_COUNT,
@@ -1174,20 +1219,11 @@ impl HnswConfig {
             .expect("test HNSW configuration is valid")
     }
 
-    pub const fn search_policy(self) -> HnswSearchPolicy {
+    pub fn search_policy(self) -> HnswSearchPolicy {
         HnswSearchPolicy {
             ef_search: self.ef,
-            distance_cost: HnswDistanceCostProfile {
-                source: HnswDistanceCostProfileSource::BuiltIn {
-                    revision: HNSW_BUILT_IN_DISTANCE_COST_REVISION,
-                },
-                reference_dimension: DEFAULT_HNSW_DISTANCE_COST_REFERENCE_DIMENSION,
-                sequential_covering_scores_per_random_score:
-                    DEFAULT_HNSW_SEQUENTIAL_COVERING_SCORES_PER_RANDOM_SCORE,
-                indexed_base_scores_per_random_score:
-                    DEFAULT_HNSW_INDEXED_BASE_SCORES_PER_RANDOM_SCORE,
-                graph_scored_points_per_ef: DEFAULT_HNSW_GRAPH_SCORED_POINTS_PER_EF,
-            },
+            distance_cost: HnswDistanceCostProfile::default(),
+            vector_encoding: HnswBuildVectorEncoding::ExactF32,
         }
     }
 }
@@ -1355,11 +1391,17 @@ mod tests {
                 32,
                 HnswDistanceCostProfile::default(),
             ),
-            100_000
+            44_800_000
         );
         assert_eq!(
-            HnswDistanceCostModel::graph_work(10_000_000, 160, HnswDistanceCostProfile::default(),),
-            3_863
+            HnswDistanceCostModel::graph_work(
+                10_000_000,
+                160,
+                32,
+                HnswBuildVectorEncoding::ExactF32,
+                HnswDistanceCostProfile::default(),
+            ),
+            1_730_624
         );
         assert!(!HnswDistanceCostModel::prefers_exact_scan(
             10_000_000,
@@ -1388,6 +1430,7 @@ mod tests {
             top_k: 10,
             effective_ef: 160,
             vector_dimension: 32,
+            vector_encoding: HnswBuildVectorEncoding::ExactF32,
             exact_scan_workload: HnswExactScanWorkload::sequential(100_000),
             cost_profile: profile,
         };
@@ -1455,18 +1498,48 @@ mod tests {
             profile,
         ));
         assert_eq!(
-            HnswDistanceCostModel::graph_work(10_000_000, 8_192, profile),
-            196_631
+            HnswDistanceCostModel::graph_work(
+                10_000_000,
+                8_192,
+                32,
+                HnswBuildVectorEncoding::ExactF32,
+                profile,
+            ),
+            88_090_688
         );
+    }
+
+    #[test]
+    fn graph_cost_uses_the_artifact_routing_representation() {
+        let profile = HnswDistanceCostProfile::default();
+        let exact = HnswDistanceCostModel::graph_work(
+            10_000_000,
+            640,
+            768,
+            HnswBuildVectorEncoding::ExactF32,
+            profile,
+        );
+        let compact = HnswDistanceCostModel::graph_work(
+            10_000_000,
+            640,
+            768,
+            HnswBuildVectorEncoding::symmetric_i16(128).unwrap(),
+            profile,
+        );
+        assert!(compact < exact);
+        let scored_points = 10_000_000u64.ilog2() as u64 + 640 * 24;
+        let expected_compact = scored_points * (416 + 128) + 640 * (416 + 768);
+        assert_eq!(compact, expected_compact);
     }
 
     #[test]
     fn distance_cost_profile_is_explicit_and_physical_class_specific() {
         let profile = HnswDistanceCostProfile {
             source: HnswDistanceCostProfileSource::OfflineCalibration { calibration_id: 7 },
-            reference_dimension: 32,
-            sequential_covering_scores_per_random_score: 32,
-            indexed_base_scores_per_random_score: 8,
+            random_access_cost_units: 32,
+            exact_f32_dimension_cost_units: 1,
+            sequential_dimension_cost_units: 1,
+            symmetric_i16_dimension_cost_units: 1,
             graph_scored_points_per_ef: 24,
         };
         assert_eq!(
@@ -1475,7 +1548,7 @@ mod tests {
                 32,
                 profile,
             ),
-            1_000
+            1_024_000
         );
         assert_eq!(
             HnswDistanceCostModel::exact_work(
@@ -1483,7 +1556,7 @@ mod tests {
                 32,
                 profile,
             ),
-            4_000
+            2_048_000
         );
         assert_eq!(
             HnswDistanceCostModel::exact_work(
@@ -1494,7 +1567,7 @@ mod tests {
                 32,
                 profile,
             ),
-            1_750
+            1_280_000
         );
         assert_eq!(HnswDistanceCostModel::exact_scan_parallelism(32_767, 8), 1);
         assert_eq!(HnswDistanceCostModel::exact_scan_parallelism(32_768, 8), 2);
@@ -1513,6 +1586,7 @@ mod tests {
                 top_k: 10,
                 effective_ef: 100,
                 vector_dimension: 32,
+                vector_encoding: policy.vector_encoding,
                 exact_scan_workload: HnswExactScanWorkload::sequential(10_000),
                 cost_profile: policy.distance_cost,
             }),
@@ -1527,6 +1601,7 @@ mod tests {
                 top_k: 10,
                 effective_ef: 100,
                 vector_dimension: 32,
+                vector_encoding: policy.vector_encoding,
                 exact_scan_workload: HnswExactScanWorkload::indexed_base(10_000),
                 cost_profile: policy.distance_cost,
             }),
@@ -1545,6 +1620,7 @@ mod tests {
             top_k: 10,
             effective_ef: 160,
             vector_dimension: 32,
+            vector_encoding: policy.vector_encoding,
             exact_scan_workload: HnswExactScanWorkload::indexed_base(5_000_000),
             cost_profile: policy.distance_cost,
         };

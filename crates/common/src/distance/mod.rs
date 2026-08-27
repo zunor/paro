@@ -72,6 +72,35 @@ pub fn prefetch_vector_read(vector: &[f32]) {
     }
 }
 
+/// Hint that the leading cache lines of an encoded routing row will be read
+/// soon. Unlike `prefetch_vector_read`, this accepts byte-aligned persistent
+/// regions and therefore does not manufacture an aligned typed slice.
+#[inline]
+pub fn prefetch_bytes_read(bytes: &[u8]) {
+    const CACHE_LINE_BYTES: usize = 64;
+    const MAX_PREFETCH_BYTES: usize = 256;
+
+    for offset in (0..bytes.len().min(MAX_PREFETCH_BYTES)).step_by(CACHE_LINE_BYTES) {
+        let address = unsafe { bytes.as_ptr().add(offset) };
+        #[cfg(target_arch = "aarch64")]
+        unsafe {
+            simd_neon::prefetch_l1(address.cast::<f32>());
+        }
+        #[cfg(target_arch = "x86_64")]
+        unsafe {
+            std::arch::x86_64::_mm_prefetch(address.cast::<i8>(), std::arch::x86_64::_MM_HINT_T0);
+        }
+        #[cfg(target_arch = "x86")]
+        unsafe {
+            std::arch::x86::_mm_prefetch(address.cast::<i8>(), std::arch::x86::_MM_HINT_T0);
+        }
+        #[cfg(not(any(target_arch = "aarch64", target_arch = "x86", target_arch = "x86_64")))]
+        {
+            let _ = address;
+        }
+    }
+}
+
 /// Compute L2 squared distance (sum of squared differences).
 ///
 /// Automatically selects the best SIMD implementation available.

@@ -624,13 +624,17 @@ impl SegmentWriter {
         self.prepare_hnsw_filter_blocks()?;
         // Write column data to file
         for i in 0..self.column_writers.len() {
-            // Ensure 8-byte alignment for column data (required for mmap vector access)
+            // Column writers build their mmap pages in a zero-based private
+            // buffer. Align the buffer's eventual segment base to the same
+            // cache-line boundary so every relative vector/HNSW alignment is
+            // also valid in the published file.
             let current_pos = self
                 .file_writer
                 .stream_position()
                 .map_err(|e| paro_error::io_error(e.to_string()))?;
-            if current_pos % 8 != 0 {
-                let padding = 8 - (current_pos % 8);
+            let alignment = HNSW_ARTIFACT_ALIGNMENT as u64;
+            if current_pos % alignment != 0 {
+                let padding = alignment - (current_pos % alignment);
                 self.file_writer
                     .write_all(&vec![0u8; padding as usize])
                     .map_err(|e| paro_error::io_error(e.to_string()))?;

@@ -58,6 +58,7 @@ pub use persistence::{
 };
 pub use predicate_scan::PredicateScanLayout;
 pub(crate) use predicate_scan::PREDICATE_SCAN_BUILD_STREAM_BYTES;
+pub(crate) use scorer::GraphVectorScorer;
 pub use scorer::VectorScorer;
 pub use search_context::{FixedLengthPriorityQueue, SearchContext};
 pub use types::*;

@@ -10,7 +10,7 @@ use super::artifact_integrity::{
     IntegrityDescriptor,
 };
 use super::entry_points::EntryPoints;
-use super::graph::{GraphLayers, PredicatePartitionSeeds};
+use super::graph::{GraphLayers, GraphSearchLimits, PredicatePartitionSeeds};
 use super::graph_links::GraphLinks;
 use super::hnsw_builder::hnsw_build_pool;
 use super::predicate_scan::{
@@ -23,11 +23,12 @@ use super::vector_storage::{
     VectorStorage,
 };
 use super::{
-    BatchScorer, DistanceMetric, GraphLayersBuilder, HnswBuildContract, HnswBuildStopCheck,
-    HnswBuildVectorEncoding, HnswDistanceCostModel, HnswExactScanKind, HnswExactScanWorkload,
-    HnswFilterTopologyContract, HnswSearchFilter, HnswSearchOutcome, HnswSearchPath,
-    HnswSearchPolicy, HnswSearchResult, HnswSearchStrategy, PointOffset, PreparedQuery, ScoreType,
-    ScoredPoint, SearchAlgorithm, SearchParams, VectorScorer, HNSW_BUILD_CONTRACT_VERSION,
+    BatchScorer, DistanceMetric, GraphLayersBuilder, GraphVectorScorer, HnswBuildContract,
+    HnswBuildStopCheck, HnswBuildVectorEncoding, HnswDistanceCostModel, HnswExactScanKind,
+    HnswExactScanWorkload, HnswFilterTopologyContract, HnswSearchFilter, HnswSearchOutcome,
+    HnswSearchPath, HnswSearchPolicy, HnswSearchResult, HnswSearchStrategy, PointOffset,
+    PreparedQuery, ScoreType, ScoredPoint, SearchAlgorithm, SearchParams, VectorScorer,
+    HNSW_BUILD_CONTRACT_VERSION,
 };
 #[cfg(test)]
 use super::{HnswConfig, HnswSegmentSearchInput};
@@ -54,6 +55,8 @@ use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
 const HNSW_ARTIFACT_MAGIC: [u8; 4] = *b"HNSW";
+/// Version 19 aligns compact routing-code rows to a cache-line boundary inside
+/// every envelope. Version 18 adds the chunk-authenticated integrity hierarchy.
 /// Version 17 persists compact routing codes beside canonical f32 vectors so
 /// graph navigation and graph construction use the same metric image while
 /// exact re-ranking retains SQL-visible f32 semantics.
@@ -67,7 +70,7 @@ const HNSW_ARTIFACT_MAGIC: [u8; 4] = *b"HNSW";
 /// longer pays an independent random offset-table lookup. Version 11's
 /// canonical predicate dictionary keys remain part of the format. Earlier
 /// graph layouts are intentionally rejected rather than translated at open.
-pub const HNSW_ARTIFACT_FORMAT_VERSION: u32 = 18;
+pub const HNSW_ARTIFACT_FORMAT_VERSION: u32 = 19;
 const HNSW_ARTIFACT_VERSION: u32 = HNSW_ARTIFACT_FORMAT_VERSION;
 pub(crate) const HNSW_ARTIFACT_HEADER_LEN: usize = 208;
 const HNSW_NORM_COUNT_FIELD: usize = 48;
@@ -86,14 +89,21 @@ const HNSW_VECTOR_ENCODING_F32_LE: u32 = 1;
 fn build_vector_encoding_tag(encoding: HnswBuildVectorEncoding) -> u8 {
     match encoding {
         HnswBuildVectorEncoding::ExactF32 => 0,
-        HnswBuildVectorEncoding::SymmetricI16 => 1,
+        HnswBuildVectorEncoding::SymmetricI16 { .. } => 1,
     }
 }
 
-fn build_vector_encoding_from_tag(tag: u8) -> Result<HnswBuildVectorEncoding> {
+fn build_vector_encoding_from_tag(
+    tag: u8,
+    routing_dimensions: u16,
+) -> Result<HnswBuildVectorEncoding> {
     match tag {
-        0 => Ok(HnswBuildVectorEncoding::ExactF32),
-        1 => Ok(HnswBuildVectorEncoding::SymmetricI16),
+        0 if routing_dimensions == 0 => Ok(HnswBuildVectorEncoding::ExactF32),
+        0 => Err(error::data_corrupted(
+            "exact-f32 HNSW artifact declares compact routing dimensions",
+        )),
+        1 => HnswBuildVectorEncoding::symmetric_i16(u32::from(routing_dimensions))
+            .map_err(|err| error::data_corrupted(err.to_string())),
         _ => Err(error::data_corrupted(format!(
             "unknown HNSW build vector encoding tag {tag}"
         ))),
@@ -211,13 +221,17 @@ struct ExactScanResult {
 /// Durable byte alignment for an mmap-backed HNSW envelope. Every nested
 /// typed region is aligned relative to the envelope, so its file offset must
 /// preserve the same base alignment.
-pub const HNSW_ARTIFACT_ALIGNMENT: usize = 8;
+pub const HNSW_ARTIFACT_ALIGNMENT: usize = 64;
 
 fn aligned_offset(offset: usize, alignment: usize) -> Result<usize> {
     offset
         .checked_add(alignment - 1)
         .map(|value| value / alignment * alignment)
         .ok_or_else(|| error::out_of_range("HNSW artifact alignment overflow"))
+}
+
+fn alignment_padding(offset: usize, alignment: usize) -> Result<usize> {
+    Ok(aligned_offset(offset, alignment)?.saturating_sub(offset))
 }
 
 /// O(1) keyed permutation of point ids used to decouple frozen-wave membership
@@ -399,14 +413,13 @@ fn decode_build_contract(header: &[u8]) -> Result<(HnswBuildContract, usize)> {
         },
         vector_encoding: {
             let encoding = take_artifact_bytes(header, &mut offset, 1, "build vector encoding")?[0];
-            build_vector_encoding_from_tag(encoding)?
+            let routing_dimensions = u16::from_le_bytes(
+                take_artifact_bytes(header, &mut offset, 2, "build routing dimensions")?
+                    .try_into()
+                    .expect("u16 width"),
+            );
+            build_vector_encoding_from_tag(encoding, routing_dimensions)?
         },
-        routing_dimensions: u16::from_le_bytes(
-            take_artifact_bytes(header, &mut offset, 2, "build routing dimensions")?
-                .try_into()
-                .expect("u16 width"),
-        )
-        .into(),
         build_seed: {
             u64::from_le_bytes(
                 take_artifact_bytes(header, &mut offset, 8, "build seed")?
@@ -1008,6 +1021,22 @@ impl HnswIndex {
         Self::build_with_controls(storage, build_contract, Some(pool), None)
     }
 
+    pub(crate) fn try_build_in_workspace(
+        storage: Arc<dyn VectorStorage>,
+        build_contract: HnswBuildContract,
+        workspace_dir: &Path,
+    ) -> Result<Self> {
+        let (pool, _) = hnsw_build_pool()?;
+        Self::build_with_controls_and_filter_blocks_in_workspace(
+            storage,
+            build_contract,
+            HnswFilterBlocks::default(),
+            Some(pool),
+            None,
+            Some(workspace_dir),
+        )
+    }
+
     #[cfg(test)]
     pub fn build(
         storage: Arc<dyn VectorStorage>,
@@ -1074,10 +1103,33 @@ impl HnswIndex {
         let storage = prepare_build_vector_storage(
             storage,
             build_contract.vector_encoding,
-            build_contract.routing_dimensions,
             build_contract.build_seed,
             workspace_dir,
         )?;
+        Self::build_prepared_with_controls_and_filter_blocks(
+            storage,
+            build_contract,
+            filter_blocks,
+            pool,
+            stop_check,
+        )
+    }
+
+    /// Build from a storage whose construction metric has already been
+    /// prepared for `build_contract`.
+    ///
+    /// Predicate-local graphs project point ids onto the generation's routing
+    /// space and must enter here. Sending them through the public preparation
+    /// boundary again would derive block-local dimensions/scales and silently
+    /// construct a different metric from the parent graph.
+    fn build_prepared_with_controls_and_filter_blocks(
+        storage: Arc<dyn VectorStorage>,
+        build_contract: HnswBuildContract,
+        filter_blocks: HnswFilterBlocks,
+        pool: Option<&rayon::ThreadPool>,
+        stop_check: Option<&HnswBuildStopCheck>,
+    ) -> Result<Self> {
+        let distance = build_contract.distance;
         let num_vectors = storage.num_vectors();
         if num_vectors > PointOffset::MAX as usize {
             return Err(error::configuration_limit_exceeded(
@@ -1458,6 +1510,10 @@ impl HnswIndex {
                 for result in wave_results {
                     visit(result)?;
                 }
+            } else {
+                return Err(error::internal(
+                    "parallel HNSW predicate-block wave requires a build pool",
+                ));
             }
         }
         Ok(())
@@ -1472,12 +1528,13 @@ impl HnswIndex {
         if stop_check.is_some_and(HnswBuildStopCheck::should_stop) {
             return Err(error::query_canceled());
         }
-        let local = Self::build_with_controls(
+        let local = Self::build_prepared_with_controls_and_filter_blocks(
             Arc::new(PointRemappedBuildVectorStorage::try_new(
                 Arc::clone(storage),
                 Arc::clone(&prepared.graph_point_ids),
             )?),
             prepared.local_contract,
+            HnswFilterBlocks::default(),
             pool,
             stop_check,
         )?;
@@ -1671,8 +1728,11 @@ impl HnswIndex {
             self.build_contract.vector_encoding,
         ));
         header.extend_from_slice(
-            &u16::try_from(self.build_contract.routing_dimensions)
-                .map_err(|_| error::out_of_range("HNSW routing dimensions exceed u16"))?
+            &self
+                .build_contract
+                .vector_encoding
+                .routing_dimensions()
+                .unwrap_or(0)
                 .to_le_bytes(),
         );
         header.extend_from_slice(&self.build_contract.build_seed.to_le_bytes());
@@ -1743,6 +1803,8 @@ impl HnswIndex {
 
         writer.seek(SeekFrom::Start(artifact_start))?;
         writer.write_all(&header)?;
+        let vector_padding = alignment_padding(HNSW_ARTIFACT_HEADER_LEN, HNSW_ARTIFACT_ALIGNMENT)?;
+        writer.write_all(&[0; HNSW_ARTIFACT_ALIGNMENT][..vector_padding])?;
         self.vector_storage
             .try_for_each_contiguous_chunk(&mut |vectors| write_f32_slice(writer, vectors))?;
         if let Some(norms) = norms {
@@ -1759,6 +1821,15 @@ impl HnswIndex {
                 )?;
             }
             write_f32_iter(writer, routing.scales.iter().copied())?;
+            let relative_position = usize::try_from(
+                writer
+                    .stream_position()?
+                    .checked_sub(artifact_start)
+                    .ok_or_else(|| error::internal("HNSW writer moved before artifact start"))?,
+            )
+            .map_err(|_| error::out_of_range("HNSW artifact offset exceeds usize"))?;
+            let padding = alignment_padding(relative_position, HNSW_ARTIFACT_ALIGNMENT)?;
+            writer.write_all(&[0; HNSW_ARTIFACT_ALIGNMENT][..padding])?;
             writer.write_all(routing.codes)?;
             if let Some(norms) = routing.inverse_norms {
                 write_f32_iter(writer, norms.iter())?;
@@ -2025,10 +2096,8 @@ impl HnswIndex {
                 }
                 0
             }
-            HnswBuildVectorEncoding::SymmetricI16 => {
-                let encoded_dimension = usize::try_from(build_contract.routing_dimensions)
-                    .map_err(|_| error::data_corrupted("HNSW routing dimensions exceed usize"))?
-                    .next_multiple_of(16);
+            HnswBuildVectorEncoding::SymmetricI16 { routing_dimensions } => {
+                let encoded_dimension = usize::from(routing_dimensions.get()).next_multiple_of(16);
                 let expected_codes = vector_count
                     .checked_mul(encoded_dimension)
                     .and_then(|values| values.checked_mul(std::mem::size_of::<i16>()))
@@ -2038,8 +2107,7 @@ impl HnswIndex {
                         "HNSW routing-code length mismatch: expected {expected_codes}, got {routing_code_len}"
                     )));
                 }
-                let expected_metadata = usize::try_from(build_contract.routing_dimensions)
-                    .map_err(|_| error::data_corrupted("HNSW routing dimensions exceed usize"))?
+                let expected_metadata = usize::from(routing_dimensions.get())
                     .checked_mul(std::mem::size_of::<u32>() + std::mem::size_of::<f32>())
                     .ok_or_else(|| {
                         error::data_corrupted("HNSW routing metadata length overflow")
@@ -2069,16 +2137,39 @@ impl HnswIndex {
                     .and_then(|predicate_bytes| bytes.checked_add(predicate_bytes))
             })
             .ok_or_else(|| error::data_corrupted("HNSW entry metadata length overflow"))?;
+        let vector_padding = alignment_padding(HNSW_ARTIFACT_HEADER_LEN, HNSW_ARTIFACT_ALIGNMENT)?;
+        let routing_code_padding = if routing_code_len == 0 {
+            0
+        } else {
+            alignment_padding(
+                HNSW_ARTIFACT_HEADER_LEN
+                    .checked_add(vector_padding)
+                    .and_then(|bytes| bytes.checked_add(vector_bytes))
+                    .and_then(|bytes| bytes.checked_add(norm_bytes))
+                    .and_then(|bytes| bytes.checked_add(routing_metadata_len))
+                    .ok_or_else(|| error::data_corrupted("HNSW routing-code offset overflow"))?,
+                HNSW_ARTIFACT_ALIGNMENT,
+            )?
+        };
         integrity.verify_range(
             HNSW_ARTIFACT_HEADER_LEN,
-            vector_bytes
-                .checked_add(norm_bytes)
+            vector_padding
+                .checked_add(vector_bytes)
+                .and_then(|bytes| bytes.checked_add(norm_bytes))
                 .and_then(|bytes| bytes.checked_add(routing_metadata_len))
+                .and_then(|bytes| bytes.checked_add(routing_code_padding))
                 .and_then(|bytes| bytes.checked_add(routing_code_len))
                 .and_then(|bytes| bytes.checked_add(routing_norm_bytes))
                 .and_then(|bytes| bytes.checked_add(entry_bytes))
                 .ok_or_else(|| error::data_corrupted("HNSW metadata length overflow"))?,
         )?;
+        let vector_alignment =
+            take_artifact_bytes(data, &mut offset, vector_padding, "vector alignment")?;
+        if vector_alignment.iter().any(|byte| *byte != 0) {
+            return Err(error::data_corrupted(
+                "HNSW vector alignment padding is not zeroed",
+            ));
+        }
         let vector_start = offset;
         take_artifact_bytes(data, &mut offset, vector_bytes, "embedded vectors")?;
         let vector_storage =
@@ -2099,7 +2190,10 @@ impl HnswIndex {
         };
         let routing_metadata =
             take_artifact_bytes(data, &mut offset, routing_metadata_len, "routing metadata")?;
-        let routing_dimensions = build_contract.routing_dimensions as usize;
+        let routing_dimensions = build_contract
+            .vector_encoding
+            .routing_dimensions()
+            .map_or(0, usize::from);
         let (routing_dimension_bytes, routing_scale_bytes) = routing_metadata
             .split_at(routing_dimensions.saturating_mul(std::mem::size_of::<u32>()));
         let selected_dimensions = routing_dimension_bytes
@@ -2112,6 +2206,13 @@ impl HnswIndex {
             .map(|bytes| f32::from_le_bytes(bytes.try_into().expect("f32 width")))
             .collect::<Vec<_>>()
             .into_boxed_slice();
+        let routing_padding =
+            take_artifact_bytes(data, &mut offset, routing_code_padding, "routing alignment")?;
+        if routing_padding.iter().any(|byte| *byte != 0) {
+            return Err(error::data_corrupted(
+                "HNSW routing-code alignment padding is not zeroed",
+            ));
+        }
         let routing_start = offset;
         take_artifact_bytes(data, &mut offset, routing_code_len, "routing codes")?;
         let routing_codes = backing.i16_routing_backing(routing_start, routing_code_len)?;
@@ -2127,7 +2228,10 @@ impl HnswIndex {
         } else {
             Some(backing.inverse_norms(routing_norm_start, routing_norm_bytes)?)
         };
-        if build_contract.vector_encoding == HnswBuildVectorEncoding::SymmetricI16 {
+        if matches!(
+            build_contract.vector_encoding,
+            HnswBuildVectorEncoding::SymmetricI16 { .. }
+        ) {
             vector_storage = SymmetricI16BuildVectorStorage::from_persisted(
                 vector_storage,
                 routing_codes,
@@ -2283,19 +2387,19 @@ impl HnswIndex {
                 PredicatePartitionSeeds::new(predicate_seed_rows, ef.saturating_mul(2));
             let admission = filter_row_set.map(ExactRowSet::admission);
             let mut graph_scorer =
-                VectorScorer::new_routing(&prepared_query, self.vector_storage.as_ref())?;
+                GraphVectorScorer::new(&prepared_query, self.vector_storage.as_ref())?;
             // A compact routing metric owns navigation, not final candidate
             // elimination. Its complete retained beam must cross the exact
             // metric boundary: trimming to an arbitrary multiple of K in the
             // lossy domain makes a larger `ef` incapable of improving recall.
-            let graph_top_k = if graph_scorer.uses_i16_routing() {
+            let rerank_window = if graph_scorer.uses_compact_routing() {
                 ef
             } else {
                 top_k
             };
+            let limits = GraphSearchLimits::try_new(top_k, rerank_window, ef)?;
             let graph_result = self.graph.search_one(
-                graph_top_k,
-                ef,
+                limits,
                 algorithm,
                 &mut graph_scorer,
                 admission.as_ref(),
@@ -2307,7 +2411,7 @@ impl HnswIndex {
             )?;
             graph_scored_points = graph_scorer.scored_point_count();
             let mut results = graph_result.points;
-            if graph_scorer.uses_i16_routing() {
+            if graph_scorer.uses_compact_routing() {
                 for point in &mut results {
                     point.score = exact_scorer.score_point(point.idx);
                 }
@@ -2382,6 +2486,7 @@ impl HnswIndex {
             effective_ef: policy.effective_ef(top_k, params.ef),
             vector_dimension: u32::try_from(self.vector_storage.vector_dim())
                 .map_err(|_| error::out_of_range("HNSW vector dimension exceeds u32"))?,
+            vector_encoding: self.build_contract.vector_encoding,
             exact_scan_workload: self.exact_scan_workload(filter),
             cost_profile: policy.distance_cost,
         });
@@ -2470,23 +2575,23 @@ impl HnswIndex {
             let admission = filter_row_set.map(ExactRowSet::admission);
             let mut graph_scorers = queries
                 .iter()
-                .map(|query| VectorScorer::new_routing(query, self.vector_storage.as_ref()))
+                .map(|query| GraphVectorScorer::new(query, self.vector_storage.as_ref()))
                 .collect::<Result<Vec<_>>>()?;
             let uses_compact_routing = graph_scorers
                 .first()
-                .is_some_and(VectorScorer::uses_i16_routing);
+                .is_some_and(GraphVectorScorer::uses_compact_routing);
             if graph_scorers
                 .iter()
-                .any(|scorer| scorer.uses_i16_routing() != uses_compact_routing)
+                .any(|scorer| scorer.uses_compact_routing() != uses_compact_routing)
             {
                 return Err(error::data_corrupted(
                     "HNSW batch scorers disagree on the artifact routing representation",
                 ));
             }
-            let graph_top_k = if uses_compact_routing { ef } else { top_k };
+            let rerank_window = if uses_compact_routing { ef } else { top_k };
+            let limits = GraphSearchLimits::try_new(top_k, rerank_window, ef)?;
             let results = self.graph.search_many(
-                graph_top_k,
-                ef,
+                limits,
                 algorithm,
                 &mut graph_scorers,
                 admission.as_ref(),
@@ -3598,9 +3703,10 @@ mod tests {
     fn frozen_wave_build_is_byte_deterministic_across_pool_widths() {
         let vectors = make_sift_like_vectors(0xdef, 4_352, 24, 16);
         for distance in [DistanceMetric::Euclidean, DistanceMetric::Cosine] {
-            let contract = HnswConfig::new(12, 72)
+            let mut contract = HnswConfig::new(12, 72)
                 .with_build_seed(0x0fed_cba9_8765_4321)
                 .build_contract(distance);
+            contract.vector_encoding = HnswBuildVectorEncoding::default_for_dimension(24).unwrap();
             let build = |width| {
                 let pool = rayon::ThreadPoolBuilder::new()
                     .num_threads(width)
@@ -3628,6 +3734,7 @@ mod tests {
         let mut contract = HnswConfig::new(12, 72)
             .with_build_seed(0x6d91_e31a_472b_850f)
             .build_contract(DistanceMetric::Euclidean);
+        contract.vector_encoding = HnswBuildVectorEncoding::default_for_dimension(24).unwrap();
         contract.filter_topology =
             HnswFilterTopologyContract::from_columns(&[7], BLOCK_ROWS as u32, 4).unwrap();
         let make_blocks = || HnswFilterBlocks {
@@ -3681,11 +3788,10 @@ mod tests {
         let vectors = make_sift_like_vectors(0x123, 2_048, 32, 24);
         let queries = make_sift_like_queries(0x456, &vectors, 64, 0.02);
         let config = HnswConfig::new(16, 96).with_ef(96);
+        let mut contract = config.build_contract(DistanceMetric::Euclidean);
+        contract.vector_encoding = HnswBuildVectorEncoding::default_for_dimension(32).unwrap();
         let index = HnswBuilder::new()
-            .build(
-                make_storage(&vectors),
-                config.build_contract(DistanceMetric::Euclidean),
-            )
+            .build(make_storage(&vectors), contract)
             .unwrap();
         let recall = average_recall_at_k(
             &index,
@@ -4343,8 +4449,7 @@ mod tests {
         let mut contract = HnswConfig::new(16, 96)
             .with_ef(96)
             .build_contract(DistanceMetric::Euclidean);
-        contract.vector_encoding = HnswBuildVectorEncoding::SymmetricI16;
-        contract.routing_dimensions = 8;
+        contract.vector_encoding = HnswBuildVectorEncoding::symmetric_i16(8).unwrap();
         contract.validate().unwrap();
         let index = HnswIndex::build_with_controls(storage, contract, None, None).unwrap();
         assert!(index.vector_storage.i16_routing_view().is_some());

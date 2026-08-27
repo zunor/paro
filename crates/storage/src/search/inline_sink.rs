@@ -597,6 +597,37 @@ impl HnswInlineThreshold {
         )
     }
 
+    /// Durable compact-routing payload owned by one HNSW artifact. Canonical
+    /// f32 vectors are accounted separately; this covers the aligned i16 code
+    /// matrix, coordinate/scale metadata, optional routing cosine norms, and
+    /// bounded alignment padding introduced by the envelope format.
+    pub fn estimate_routing_artifact_bytes(
+        vector_count: u64,
+        contract: &crate::index::hnsw::HnswBuildContract,
+    ) -> u64 {
+        let crate::index::hnsw::HnswBuildVectorEncoding::SymmetricI16 { routing_dimensions } =
+            contract.vector_encoding
+        else {
+            return 0;
+        };
+        let routing_dimensions = u64::from(routing_dimensions.get());
+        let padded_dimensions = routing_dimensions.saturating_add(15) / 16 * 16;
+        let codes = vector_count
+            .saturating_mul(padded_dimensions)
+            .saturating_mul(std::mem::size_of::<i16>() as u64);
+        let metadata = routing_dimensions
+            .saturating_mul((std::mem::size_of::<u32>() + std::mem::size_of::<f32>()) as u64);
+        let routing_norms = if contract.distance == crate::index::hnsw::DistanceMetric::Cosine {
+            vector_count.saturating_mul(std::mem::size_of::<f32>() as u64)
+        } else {
+            0
+        };
+        codes
+            .saturating_add(metadata)
+            .saturating_add(routing_norms)
+            .saturating_add((crate::index::hnsw::HNSW_ARTIFACT_ALIGNMENT * 2) as u64)
+    }
+
     /// Mutable graph-builder resident estimate. This belongs only to runtime
     /// admission/accounting and must not determine the durable segment shape.
     fn estimate_builder_graph_memory_bytes(vector_count: u64, m: u32) -> u64 {
@@ -657,12 +688,41 @@ impl HnswInlineThreshold {
         contract: &crate::index::hnsw::HnswBuildContract,
         build_width: usize,
     ) -> u64 {
-        let metric_preprocessing_bytes =
+        let base_metric_preprocessing_bytes =
             if contract.distance == crate::index::hnsw::DistanceMetric::Cosine {
                 vector_count.saturating_mul(std::mem::size_of::<f32>() as u64)
             } else {
                 0
             };
+        let routing_workspace_bytes = match contract.vector_encoding {
+            crate::index::hnsw::HnswBuildVectorEncoding::ExactF32 => 0,
+            crate::index::hnsw::HnswBuildVectorEncoding::SymmetricI16 { routing_dimensions } => {
+                // The encoded row is padded to the construction kernel's
+                // 16-element boundary. File-backed workspaces still count:
+                // graph construction touches them randomly, so their resident
+                // set competes for the same query/build memory budget.
+                let routing_dimensions = u64::from(routing_dimensions.get());
+                let padded_dimensions = routing_dimensions.saturating_add(15) / 16 * 16;
+                let codes = vector_count
+                    .saturating_mul(padded_dimensions)
+                    .saturating_mul(std::mem::size_of::<i16>() as u64);
+                let coordinate_metadata = u64::from(dimension.max(1))
+                    .saturating_mul(2)
+                    .saturating_mul(std::mem::size_of::<f32>() as u64)
+                    .saturating_add(routing_dimensions.saturating_mul(
+                        (std::mem::size_of::<usize>() + 2 * std::mem::size_of::<f32>()) as u64,
+                    ));
+                let routing_norms =
+                    if contract.distance == crate::index::hnsw::DistanceMetric::Cosine {
+                        vector_count.saturating_mul(std::mem::size_of::<f32>() as u64)
+                    } else {
+                        0
+                    };
+                codes
+                    .saturating_add(coordinate_metadata)
+                    .saturating_add(routing_norms)
+            }
+        };
         Self::estimate_build_peak_memory_bytes(
             vector_count,
             dimension,
@@ -677,7 +737,8 @@ impl HnswInlineThreshold {
             contract.ef_construct,
             build_width,
         ))
-        .saturating_add(metric_preprocessing_bytes)
+        .saturating_add(base_metric_preprocessing_bytes)
+        .saturating_add(routing_workspace_bytes)
     }
 
     fn estimate_filter_build_peak_memory_bytes(
@@ -935,6 +996,41 @@ mod tests {
     }
 
     #[test]
+    fn compact_routing_and_both_cosine_norm_images_are_admission_accounted() {
+        const POINTS: u64 = 10_000;
+        const DIMENSION: u32 = 768;
+        const ROUTING_DIMENSIONS: u32 = 128;
+        let exact = crate::index::hnsw::HnswConfig::new(16, 100)
+            .build_contract(crate::index::hnsw::DistanceMetric::Euclidean);
+        let mut compact = exact;
+        compact.vector_encoding =
+            crate::index::hnsw::HnswBuildVectorEncoding::symmetric_i16(ROUTING_DIMENSIONS).unwrap();
+        let exact_peak = HnswInlineThreshold::estimate_contract_build_peak_memory_bytes(
+            POINTS, DIMENSION, &exact, 4,
+        );
+        let compact_peak = HnswInlineThreshold::estimate_contract_build_peak_memory_bytes(
+            POINTS, DIMENSION, &compact, 4,
+        );
+        let expected_code_bytes =
+            POINTS * u64::from(ROUTING_DIMENSIONS) * std::mem::size_of::<i16>() as u64;
+        assert!(compact_peak >= exact_peak.saturating_add(expected_code_bytes));
+        assert!(
+            HnswInlineThreshold::estimate_routing_artifact_bytes(POINTS, &compact)
+                >= expected_code_bytes
+        );
+
+        compact.distance = crate::index::hnsw::DistanceMetric::Cosine;
+        let cosine_peak = HnswInlineThreshold::estimate_contract_build_peak_memory_bytes(
+            POINTS, DIMENSION, &compact, 4,
+        );
+        assert_eq!(
+            cosine_peak - compact_peak,
+            POINTS * 2 * std::mem::size_of::<f32>() as u64,
+            "cosine compact builds own base and routing inverse-norm images"
+        );
+    }
+
+    #[test]
     fn persisted_fixed_record_budget_does_not_inherit_builder_container_overhead() {
         let points = 1_000_000;
         let resident = HnswInlineThreshold::estimate_graph_memory_bytes(points, 16);
@@ -977,8 +1073,9 @@ mod tests {
                 "version": HNSW_PROVIDER_CONFIG_VERSION,
                 "dimension": 4,
                 "distance": "euclidean",
-                "build_vector_encoding": "symmetric_i16",
-                "build_routing_dimensions": 4,
+                "build_vector_encoding": {
+                    "symmetric_i16": { "routing_dimensions": 4 }
+                },
                 "m": 8,
                 "ef_construct": 64,
                 "ef_search": 64,
@@ -987,9 +1084,10 @@ mod tests {
                         "kind": "built_in",
                         "revision": crate::index::hnsw::HNSW_BUILT_IN_DISTANCE_COST_REVISION
                     },
-                    "reference_dimension": crate::search::DEFAULT_HNSW_DISTANCE_COST_REFERENCE_DIMENSION,
-                    "sequential_covering_scores_per_random_score": crate::search::DEFAULT_HNSW_SEQUENTIAL_COVERING_SCORES_PER_RANDOM_SCORE,
-                    "indexed_base_scores_per_random_score": crate::search::DEFAULT_HNSW_INDEXED_BASE_SCORES_PER_RANDOM_SCORE,
+                    "random_access_cost_units": crate::search::DEFAULT_HNSW_RANDOM_ACCESS_COST_UNITS,
+                    "exact_f32_dimension_cost_units": crate::search::DEFAULT_HNSW_EXACT_F32_DIMENSION_COST_UNITS,
+                    "sequential_dimension_cost_units": crate::search::DEFAULT_HNSW_SEQUENTIAL_DIMENSION_COST_UNITS,
+                    "symmetric_i16_dimension_cost_units": crate::search::DEFAULT_HNSW_SYMMETRIC_I16_DIMENSION_COST_UNITS,
                     "graph_scored_points_per_ef": crate::search::DEFAULT_HNSW_GRAPH_SCORED_POINTS_PER_EF
                 },
                 "build_seed": 1,

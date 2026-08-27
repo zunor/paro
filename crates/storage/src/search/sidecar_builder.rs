@@ -90,8 +90,11 @@ impl SidecarArtifactBuilder for ProviderSidecarArtifactBuilder {
                     provider.dimension,
                     provider.filter_columns.len(),
                 );
+                let routing_bytes =
+                    HnswInlineThreshold::estimate_routing_artifact_bytes(rows, &contract);
                 let protected_bytes = vector_bytes
                     .saturating_add(metric_bytes)
+                    .saturating_add(routing_bytes)
                     .saturating_add(base_graph_bytes)
                     .saturating_add(filter_graph_bytes)
                     .saturating_add(covering_scan_bytes)
@@ -1010,8 +1013,8 @@ mod tests {
             version: HNSW_PROVIDER_CONFIG_VERSION,
             dimension: 2,
             distance: DistanceMetric::Euclidean,
-            build_vector_encoding: crate::index::hnsw::HnswBuildVectorEncoding::SymmetricI16,
-            build_routing_dimensions: 2,
+            build_vector_encoding: crate::index::hnsw::HnswBuildVectorEncoding::symmetric_i16(2)
+                .unwrap(),
             m: 4,
             ef_construct: 8,
             ef_search: 16,

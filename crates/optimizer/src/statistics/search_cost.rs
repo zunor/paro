@@ -7,8 +7,8 @@
 
 use paro_planner::operator::{FullTextQueryStats, FullTextScoreMode};
 use paro_storage::index::hnsw::{
-    estimate_filtered_search_strategy, HnswFilteredSearchStrategy, HnswQueryOptions,
-    HnswSearchObjective, HnswSearchPolicy,
+    estimate_filtered_search_strategy, HnswDistanceCostModel, HnswExactScanWorkload,
+    HnswFilteredSearchStrategy, HnswQueryOptions, HnswSearchObjective, HnswSearchPolicy,
 };
 use paro_storage::search::ExactFilterMaterialization;
 use paro_storage::statistics::{
@@ -85,8 +85,6 @@ fn clamp_selectivity(value: f64) -> f64 {
 pub struct VectorScanCostModel;
 
 impl VectorScanCostModel {
-    const REFERENCE_VECTOR_DIMENSION: f64 = 128.0;
-
     /// Estimate the provider-owned dense Top-K source, including its exact
     /// filtered fallback. A selective predicate does not force the generic
     /// scan + row-fetch + Top-N plan: the provider compares its physical exact
@@ -109,42 +107,41 @@ impl VectorScanCostModel {
         };
         let log_n = n.ln().max(1.0);
         let effective_ef = policy.effective_ef(k, options.ef);
-        let ef_val = effective_ef as f64;
-        let dim_factor = (stats.dimension.max(1) as f64 / 128.0).max(1.0);
         // Planning and execution consume the same immutable definition-owned
         // profile. Timing history from this process cannot change EXPLAIN or
         // make otherwise identical replicas choose different paths.
         let vector_dimension = u32::try_from(stats.dimension).unwrap_or(u32::MAX).max(1);
-        let dimension = f64::from(vector_dimension);
-        let reference_dimension = f64::from(policy.distance_cost.reference_dimension.max(1));
-        let reference_ratio = f64::from(
-            policy
-                .distance_cost
-                .sequential_covering_scores_per_random_score
-                .max(1),
-        );
-        let sequential_vector_scan_factor =
-            dimension / (dimension + (reference_ratio - 1.0) * reference_dimension);
+        // HNSW's definition-owned profile uses integer physical work units so
+        // exact and graph paths compare reproducibly. The global optimizer,
+        // however, compares providers with ordinary row/operator costs. Cross
+        // that boundary in one place by normalizing distance work to one
+        // canonical random f32 score; never leak raw hardware units into the
+        // global plan search.
+        let canonical_random_score_units =
+            u64::from(policy.distance_cost.random_access_cost_units.max(1))
+                .saturating_add(u64::from(vector_dimension).saturating_mul(u64::from(
+                    policy.distance_cost.exact_f32_dimension_cost_units.max(1),
+                )))
+                .max(1) as f64;
         // Planning cannot assume every predicate part has a generation
         // covering layout: a fresh tail may still gather base vectors. Use
         // the conservative indexed-base profile for filtered exact scoring;
         // runtime has exact per-part physical evidence and applies the
         // weighted profile without changing result semantics.
-        let filtered_exact_scan_factor = 1.0
-            / policy
-                .distance_cost
-                .indexed_base_scores_per_random_score
-                .max(1) as f64;
-        // A scalar comparison is one lane of the reference 128D sequential
-        // vector score. Bitmap emission is modeled separately below, so this
-        // coefficient remains derived rather than becoming another unrelated
-        // threshold.
-        let sequential_scalar_scan_factor =
-            sequential_vector_scan_factor / Self::REFERENCE_VECTOR_DIMENSION;
-        let scored_points_per_ef = policy.distance_cost.graph_scored_points_per_ef.max(1) as f64;
-        let scored_points = ef_val * scored_points_per_ef;
-        let raw_graph_cost = (log_n + scored_points) * dim_factor;
-        let graph_cost = raw_graph_cost;
+        // A scalar comparison is one sequential physical work unit. Bitmap
+        // emission is modeled separately below; there is no independent
+        // reference dimension or process-local timing state.
+        let sequential_scalar_scan_cost =
+            f64::from(policy.distance_cost.sequential_dimension_cost_units.max(1))
+                / canonical_random_score_units;
+        let graph_cost = HnswDistanceCostModel::graph_work(
+            stats.num_indexed_vectors as u64,
+            effective_ef,
+            vector_dimension,
+            policy.vector_encoding,
+            policy.distance_cost,
+        ) as f64
+            / canonical_random_score_units;
         let bitmap_cost = match filter_materialization {
             None => 0.0,
             Some(ExactFilterMaterialization::ScalarIndex) => {
@@ -158,18 +155,23 @@ impl VectorScanCostModel {
                 let scanned_fraction = scanned_rows as f64 / represented_rows;
                 log_n
                     + candidate_rows / u64::BITS as f64
-                    + n * scanned_fraction * sequential_scalar_scan_factor
+                    + n * scanned_fraction * sequential_scalar_scan_cost
             }
             Some(ExactFilterMaterialization::ColumnScan) => {
-                n * sequential_scalar_scan_factor + candidate_rows / u64::BITS as f64
+                n * sequential_scalar_scan_cost + candidate_rows / u64::BITS as f64
             }
         };
-        let exact_scan_factor = if filtered {
-            filtered_exact_scan_factor
+        let exact_workload = if filtered {
+            HnswExactScanWorkload::indexed_base(candidate_rows as u64)
         } else {
-            sequential_vector_scan_factor
+            HnswExactScanWorkload::sequential(candidate_rows as u64)
         };
-        let exact_scan_cost = (candidate_rows * dim_factor * exact_scan_factor).max(1.0);
+        let exact_scan_cost = HnswDistanceCostModel::exact_work(
+            exact_workload,
+            vector_dimension,
+            policy.distance_cost,
+        ) as f64
+            / canonical_random_score_units;
 
         if options.objective == HnswSearchObjective::Exact {
             return bitmap_cost + exact_scan_cost;
@@ -338,11 +340,15 @@ mod tests {
             Some(ExactFilterMaterialization::ScalarIndex),
         );
 
-        assert!(cost > 1.0);
-        assert!(
-            cost < 50.0,
-            "exact search source must beat generic row Top-N"
-        );
+        let expected = HnswDistanceCostModel::exact_work(
+            HnswExactScanWorkload::indexed_base(20),
+            100,
+            policy.distance_cost,
+        ) as f64
+            / (policy.distance_cost.random_access_cost_units as f64 + 100.0)
+            + (20_000.0f64).ln()
+            + 20.0 / u64::BITS as f64;
+        assert!((cost - expected).abs() < 1e-9);
     }
 
     #[test]
@@ -395,18 +401,12 @@ mod tests {
             policy,
             Some(ExactFilterMaterialization::ColumnScan),
         );
-        let dimension = 128.0;
-        let reference_dimension = f64::from(policy.distance_cost.reference_dimension.max(1));
-        let ratio = f64::from(
-            policy
-                .distance_cost
-                .sequential_covering_scores_per_random_score
-                .max(1),
-        );
-        let sequential_vector_scan_factor =
-            dimension / (dimension + (ratio - 1.0) * reference_dimension);
-        let expected_scan_delta = 1_000_000.0 * sequential_vector_scan_factor
-            / VectorScanCostModel::REFERENCE_VECTOR_DIMENSION
+        let expected_scan_delta = 1_000_000.0
+            * f64::from(policy.distance_cost.sequential_dimension_cost_units)
+            / f64::from(
+                policy.distance_cost.random_access_cost_units
+                    + 128 * policy.distance_cost.exact_f32_dimension_cost_units,
+            )
             - 1_000_000.0_f64.ln();
         assert!(scan > postings, "scan={scan}, postings={postings}");
         assert!(

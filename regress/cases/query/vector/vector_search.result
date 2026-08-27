@@ -60,8 +60,10 @@ CREATE VECTOR INDEX idx_indexed_items_emb ON indexed_items (emb)
     ef_construct = 32
     ef_search = 24
     build_seed = 7
-    sequential_covering_scores_per_random_score = 1
-    indexed_base_scores_per_random_score = 1
+    random_access_cost_units = 1
+    exact_f32_dimension_cost_units = 1
+    sequential_dimension_cost_units = 1
+    symmetric_i16_dimension_cost_units = 1
     graph_scored_points_per_ef = 1
     distance_cost_calibration_id = 1
     filter_columns = 'id,bucket'
@@ -96,7 +98,7 @@ PROJECTION  (rows=2)
     Limit: 2
     Search Objective: cost_optimized: definition-pinned cost selects exact scoring or graph traversal
     Search Ef: default
-    Exact/Graph Cost Profile: covering=1 sequential scores/random score, indexed-base=1 gathered scores/random score, graph=1 unique scores/ef (source=offline-calibration-1, definition-pinned); observed generation average level-0 degree=16.00 is descriptive, not a cost cap
+    Exact/Graph Cost Profile: random-access=1 units, exact-f32=1 units/dimension, sequential=1 units/dimension, symmetric-i16=1 units/dimension, graph=1 unique scores/ef, routing=symmetric_i16(3) (source=offline-calibration-1, definition-pinned); observed generation average level-0 degree=16.00 is descriptive, not a cost cap
 
 -- @normalize explain_search_ids
 EXPLAIN SELECT id FROM indexed_items
@@ -115,7 +117,7 @@ PROJECTION  (rows=2)
     Limit: 2
     Search Objective: cost_optimized: definition-pinned cost selects exact scoring or graph traversal
     Search Ef: default
-    Exact/Graph Cost Profile: covering=1 sequential scores/random score, indexed-base=1 gathered scores/random score, graph=1 unique scores/ef (source=offline-calibration-1, definition-pinned); observed generation average level-0 degree=16.00 is descriptive, not a cost cap
+    Exact/Graph Cost Profile: random-access=1 units, exact-f32=1 units/dimension, sequential=1 units/dimension, symmetric-i16=1 units/dimension, graph=1 unique scores/ef, routing=symmetric_i16(3) (source=offline-calibration-1, definition-pinned); observed generation average level-0 degree=16.00 is descriptive, not a cost cap
     Pushed Predicate: bucket = 3
     Filter Pushdown: exact segment row set from scalar index; ordinal admission and posting scan; no residual filter
     Filter Rows (estimated): 205
@@ -140,7 +142,7 @@ PROJECTION  (rows=2)
     Limit: 2
     Search Objective: cost_optimized: definition-pinned cost selects exact scoring or graph traversal
     Search Ef: default
-    Exact/Graph Cost Profile: covering=1 sequential scores/random score, indexed-base=1 gathered scores/random score, graph=1 unique scores/ef (source=offline-calibration-1, definition-pinned); observed generation average level-0 degree=16.00 is descriptive, not a cost cap
+    Exact/Graph Cost Profile: random-access=1 units, exact-f32=1 units/dimension, sequential=1 units/dimension, symmetric-i16=1 units/dimension, graph=1 unique scores/ef, routing=symmetric_i16(3) (source=offline-calibration-1, definition-pinned); observed generation average level-0 degree=16.00 is descriptive, not a cost cap
     Pushed Predicate: id = 1
     Filter Pushdown: exact segment row set from scalar index; ordinal admission and posting scan; no residual filter
     Filter Rows (estimated): 1
@@ -165,7 +167,7 @@ PROJECTION  (rows=2)
     Limit: 2
     Search Objective: cost_optimized: definition-pinned cost selects exact scoring or graph traversal
     Search Ef: default
-    Exact/Graph Cost Profile: covering=1 sequential scores/random score, indexed-base=1 gathered scores/random score, graph=1 unique scores/ef (source=offline-calibration-1, definition-pinned); observed generation average level-0 degree=16.00 is descriptive, not a cost cap
+    Exact/Graph Cost Profile: random-access=1 units, exact-f32=1 units/dimension, sequential=1 units/dimension, symmetric-i16=1 units/dimension, graph=1 unique scores/ef, routing=symmetric_i16(3) (source=offline-calibration-1, definition-pinned); observed generation average level-0 degree=16.00 is descriptive, not a cost cap
     Pushed Predicate: id <= 1024
     Filter Pushdown: exact segment row set from scalar index; ordinal admission and posting scan; no residual filter
     Filter Rows (estimated): 1024
@@ -254,7 +256,7 @@ PROJECTION  (rows=2)
     Limit: 2
     Search Objective: cost_optimized: definition-pinned cost selects exact scoring or graph traversal
     Search Ef: default
-    Exact/Graph Cost Profile: covering=1 sequential scores/random score, indexed-base=1 gathered scores/random score, graph=1 unique scores/ef (source=offline-calibration-1, definition-pinned); observed generation average level-0 degree=16.00 is descriptive, not a cost cap
+    Exact/Graph Cost Profile: random-access=1 units, exact-f32=1 units/dimension, sequential=1 units/dimension, symmetric-i16=1 units/dimension, graph=1 unique scores/ef, routing=symmetric_i16(3) (source=offline-calibration-1, definition-pinned); observed generation average level-0 degree=16.00 is descriptive, not a cost cap
     Pushed Predicate: bucket = 3
     Filter Pushdown: exact segment row set from scalar index; ordinal admission and posting scan; no residual filter
     Filter Rows (estimated): 205
@@ -283,7 +285,7 @@ PROJECTION  (rows=2)
     Limit: 2
     Search Objective: cost_optimized: definition-pinned cost selects exact scoring or graph traversal
     Search Ef: 37
-    Exact/Graph Cost Profile: covering=1 sequential scores/random score, indexed-base=1 gathered scores/random score, graph=1 unique scores/ef (source=offline-calibration-1, definition-pinned); observed generation average level-0 degree=16.00 is descriptive, not a cost cap
+    Exact/Graph Cost Profile: random-access=1 units, exact-f32=1 units/dimension, sequential=1 units/dimension, symmetric-i16=1 units/dimension, graph=1 unique scores/ef, routing=symmetric_i16(3) (source=offline-calibration-1, definition-pinned); observed generation average level-0 degree=16.00 is descriptive, not a cost cap
 
 -- @normalize explain_search_ids
 EXPLAIN SELECT /*+ VECTOR_SEARCH_MODE('exact') */ id
@@ -304,7 +306,7 @@ PROJECTION  (rows=2)
     Limit: 2
     Search Objective: exact: score every admitted vector; graph traversal disabled
     Search Ef: default
-    Exact/Graph Cost Profile: covering=1 sequential scores/random score, indexed-base=1 gathered scores/random score, graph=1 unique scores/ef (source=offline-calibration-1, definition-pinned); observed generation average level-0 degree=16.00 is descriptive, not a cost cap
+    Exact/Graph Cost Profile: random-access=1 units, exact-f32=1 units/dimension, sequential=1 units/dimension, symmetric-i16=1 units/dimension, graph=1 unique scores/ef, routing=symmetric_i16(3) (source=offline-calibration-1, definition-pinned); observed generation average level-0 degree=16.00 is descriptive, not a cost cap
     Pushed Predicate: id <= 1024
     Filter Pushdown: exact segment row set from scalar index; ordinal admission and posting scan; no residual filter
     Filtered Strategy: query objective forces exact row-set distance scan; HNSW navigation, predicate topology, and adaptive refinement are disabled

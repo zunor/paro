@@ -616,18 +616,14 @@ impl GraphLayersBuilder {
         mut left: PointOffset,
         mut right: PointOffset,
     ) -> ScoreType {
-        if distance == DistanceMetric::Cosine {
+        if distance == DistanceMetric::Cosine && left > right {
             // Only cosine consumes point-owned norm factors in a left-
             // associative multiply. The other finite-valued metrics are
             // bitwise symmetric, so keep their multi-billion-call build loop
             // free of a random point-id compare and conditional swap.
-            if left > right {
-                std::mem::swap(&mut left, &mut right);
-            }
-            storage.construction_similarity(distance, left, right)
-        } else {
-            storage.construction_similarity(distance, left, right)
+            std::mem::swap(&mut left, &mut right);
         }
+        storage.construction_similarity(distance, left, right)
     }
 
     /// Helper to iterate over links of a point at a specific level during build.

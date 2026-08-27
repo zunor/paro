@@ -1071,15 +1071,13 @@ fn push_vector_search_properties(
         properties,
         "Exact/Graph Cost Profile",
         format!(
-            "covering={} sequential scores/random score at {}D reference, indexed-base={} gathered scores/random score, graph={} unique scores/ef (source={}, definition-pinned); random-access cost is dimension-scaled; observed generation average level-0 degree={:.2} is descriptive, not a cost cap",
-            spec.search_policy
-                .distance_cost
-                .sequential_covering_scores_per_random_score,
-            spec.search_policy.distance_cost.reference_dimension,
-            spec.search_policy
-                .distance_cost
-                .indexed_base_scores_per_random_score,
+            "random-access={} units, exact-f32={} units/dimension, sequential={} units/dimension, symmetric-i16={} units/dimension, graph={} unique scores/ef, routing={} (source={}, definition-pinned); observed generation average level-0 degree={:.2} is descriptive, not a cost cap",
+            spec.search_policy.distance_cost.random_access_cost_units,
+            spec.search_policy.distance_cost.exact_f32_dimension_cost_units,
+            spec.search_policy.distance_cost.sequential_dimension_cost_units,
+            spec.search_policy.distance_cost.symmetric_i16_dimension_cost_units,
             spec.search_policy.distance_cost.graph_scored_points_per_ef,
+            spec.search_policy.vector_encoding,
             spec.search_policy.distance_cost.source,
             spec.avg_level0_degree,
         ),

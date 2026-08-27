@@ -101,11 +101,10 @@ impl HnswMaintenanceRequest {
             tail_window,
             rowset_refs,
             estimated_build_peak_memory_bytes:
-                HnswInlineThreshold::estimate_build_peak_memory_bytes(
+                HnswInlineThreshold::estimate_contract_build_peak_memory_bytes(
                     vector_count,
                     provider.dimension,
-                    provider.m,
-                    provider.ef_construct,
+                    &provider.build_contract(),
                     crate::index::hnsw::hnsw_build_thread_count(),
                 ),
             dimension: provider.dimension,
@@ -974,8 +973,8 @@ mod tests {
             version: crate::search::HNSW_PROVIDER_CONFIG_VERSION,
             dimension: 16,
             distance: crate::index::hnsw::DistanceMetric::Euclidean,
-            build_vector_encoding: crate::index::hnsw::HnswBuildVectorEncoding::SymmetricI16,
-            build_routing_dimensions: 16,
+            build_vector_encoding: crate::index::hnsw::HnswBuildVectorEncoding::symmetric_i16(16)
+                .unwrap(),
             m: 8,
             ef_construct: 64,
             ef_search: 100,

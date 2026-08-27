@@ -14,7 +14,7 @@ use super::types::{
     SearchAlgorithm,
 };
 use super::visited_pool::VisitedPool;
-use super::VectorScorer;
+use super::GraphVectorScorer;
 use crate::index::{ExactRowAdmission, ExactRowSet};
 use crate::search::{ResourceBudget, SearchMemoryReservation, SearchWorkBudget};
 use paro_common::error::{self as paro_error, Result};
@@ -51,6 +51,40 @@ pub(crate) struct GraphSearchResult {
     pub(crate) predicate_admission: HnswPredicateAdmissionMode,
     pub(crate) predicate_topology_used: bool,
     pub(crate) predicate_refined: bool,
+}
+
+/// Independent cardinality limits for one graph search.
+///
+/// `top_k` is the SQL result cardinality and is the only value allowed to
+/// influence adaptive predicate decisions. `rerank_window` is the number of
+/// lossy-routing candidates that cross into exact scoring. Keeping them in a
+/// single validated value prevents a wider rerank window from silently
+/// changing routing-beam width, admission headroom, or locality tests.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct GraphSearchLimits {
+    top_k: usize,
+    rerank_window: usize,
+    ef: usize,
+}
+
+impl GraphSearchLimits {
+    pub(crate) fn try_new(top_k: usize, rerank_window: usize, ef: usize) -> Result<Self> {
+        if rerank_window < top_k || rerank_window > ef {
+            return Err(paro_error::invalid_input(format!(
+                "HNSW rerank window {rerank_window} must be between Top-K {top_k} and ef {ef}"
+            )));
+        }
+        Ok(Self {
+            top_k,
+            rerank_window,
+            ef,
+        })
+    }
+
+    #[cfg(test)]
+    fn top_k(self) -> usize {
+        self.top_k
+    }
 }
 
 /// Lazily materialized witnesses for predicate-topology partitions.
@@ -179,10 +213,9 @@ impl GraphLayers {
     /// Primary search entry point for a single query.
     pub(crate) fn search_one(
         &self,
-        top: usize,
-        ef: usize,
+        limits: GraphSearchLimits,
         algorithm: SearchAlgorithm,
-        scorer: &mut VectorScorer<'_>,
+        scorer: &mut GraphVectorScorer<'_>,
         filter: Option<&ExactRowAdmission<'_>>,
         predicate_partition_seeds: &mut PredicatePartitionSeeds<'_>,
         predicate_columns: &[u32],
@@ -190,7 +223,7 @@ impl GraphLayers {
         random_entry_point: bool,
         budget: &ResourceBudget,
     ) -> Result<GraphSearchResult> {
-        if top == 0 {
+        if limits.top_k == 0 {
             return Ok(GraphSearchResult {
                 points: Vec::new(),
                 predicate_admission: HnswPredicateAdmissionMode::NotApplicable,
@@ -210,8 +243,7 @@ impl GraphLayers {
 
         self.search_from_entry_point(
             entry_point,
-            top,
-            ef,
+            limits,
             algorithm,
             scorer,
             filter,
@@ -225,10 +257,9 @@ impl GraphLayers {
     /// Batched search entry point for multiple queries sharing one filter bitmap.
     pub(crate) fn search_many(
         &self,
-        top: usize,
-        ef: usize,
+        limits: GraphSearchLimits,
         algorithm: SearchAlgorithm,
-        scorers: &mut [VectorScorer<'_>],
+        scorers: &mut [GraphVectorScorer<'_>],
         filter: Option<&ExactRowAdmission<'_>>,
         predicate_partition_seeds: &mut PredicatePartitionSeeds<'_>,
         predicate_columns: &[u32],
@@ -239,7 +270,7 @@ impl GraphLayers {
         if scorers.is_empty() {
             return Ok(Vec::new());
         }
-        if top == 0 {
+        if limits.top_k == 0 {
             return Ok((0..scorers.len())
                 .map(|_| GraphSearchResult {
                     points: Vec::new(),
@@ -259,8 +290,7 @@ impl GraphLayers {
             match entry_point {
                 Some(entry_point) => results.push(self.search_from_entry_point(
                     entry_point,
-                    top,
-                    ef,
+                    limits,
                     algorithm,
                     scorer,
                     filter,
@@ -309,16 +339,20 @@ impl GraphLayers {
     fn search_from_entry_point(
         &self,
         entry_point: EntryPoint,
-        top: usize,
-        ef: usize,
+        limits: GraphSearchLimits,
         algorithm: SearchAlgorithm,
-        scorer: &mut VectorScorer<'_>,
+        scorer: &mut GraphVectorScorer<'_>,
         filter: Option<&ExactRowAdmission<'_>>,
         predicate_partition_seeds: &mut PredicatePartitionSeeds<'_>,
         predicate_columns: &[u32],
         predicate_topology_available: bool,
         budget: &ResourceBudget,
     ) -> Result<GraphSearchResult> {
+        let GraphSearchLimits {
+            top_k,
+            rerank_window,
+            ef,
+        } = limits;
         // Authentication state belongs to this complete logical graph read.
         // Snapshot it once so a fully verified sidecar never reloads integrity
         // state for every expanded candidate.
@@ -329,7 +363,7 @@ impl GraphLayers {
             match algorithm {
                 SearchAlgorithm::Hnsw => (
                     self.search_on_level(links, zero_level_entry, ef, scorer, budget)?
-                        .into_top_sorted_vec(top),
+                        .into_top_sorted_vec(rerank_window),
                     HnswPredicateAdmissionMode::NotApplicable,
                     false,
                     false,
@@ -340,7 +374,8 @@ impl GraphLayers {
                         None => self.search_masked_topk(
                             links,
                             zero_level_entry,
-                            top,
+                            top_k,
+                            rerank_window,
                             ef,
                             scorer,
                             |_| true,
@@ -353,7 +388,8 @@ impl GraphLayers {
                         Some(ExactRowAdmission::Roaring(bitmap)) => self.search_masked_topk(
                             links,
                             zero_level_entry,
-                            top,
+                            top_k,
+                            rerank_window,
                             ef,
                             scorer,
                             |row_id| bitmap.contains(row_id),
@@ -370,7 +406,8 @@ impl GraphLayers {
                         }) => self.search_masked_topk(
                             links,
                             zero_level_entry,
-                            top,
+                            top_k,
+                            rerank_window,
                             ef,
                             scorer,
                             |row_id| {
@@ -392,7 +429,8 @@ impl GraphLayers {
                         Some(ExactRowAdmission::Dense(domain_len)) => self.search_masked_topk(
                             links,
                             zero_level_entry,
-                            top,
+                            top_k,
+                            rerank_window,
                             ef,
                             scorer,
                             |row_id| row_id < *domain_len,
@@ -406,7 +444,8 @@ impl GraphLayers {
                             .search_masked_topk(
                                 links,
                                 zero_level_entry,
-                                top,
+                                top_k,
+                                rerank_window,
                                 ef,
                                 scorer,
                                 |row_id| admission.contains(row_id),
@@ -419,7 +458,7 @@ impl GraphLayers {
                     }
                 }
             };
-        points.truncate(top);
+        points.truncate(rerank_window);
         Ok(GraphSearchResult {
             points,
             predicate_admission,
@@ -433,7 +472,7 @@ impl GraphLayers {
         &self,
         links_view: GraphLinksReadView<'_>,
         entry_point: EntryPoint,
-        scorer: &mut VectorScorer<'_>,
+        scorer: &mut GraphVectorScorer<'_>,
         work: &SearchWorkBudget,
     ) -> Result<ScoredPoint> {
         let mut current_point = entry_point.point_id;
@@ -479,7 +518,7 @@ impl GraphLayers {
         links_view: GraphLinksReadView<'_>,
         entry_point: ScoredPoint,
         ef: usize,
-        scorer: &mut VectorScorer,
+        scorer: &mut GraphVectorScorer,
         budget: &ResourceBudget,
     ) -> Result<FixedLengthPriorityQueue<ScoredPoint>> {
         let _visited_reservation =
@@ -524,9 +563,10 @@ impl GraphLayers {
         &self,
         links_view: GraphLinksReadView<'_>,
         entry_point: ScoredPoint,
-        top: usize,
+        top_k: usize,
+        rerank_window: usize,
         ef: usize,
-        scorer: &mut VectorScorer,
+        scorer: &mut GraphVectorScorer,
         admits: F,
         adaptive_predicate_refinement: bool,
         predicate_partition_seeds: &mut PredicatePartitionSeeds<'_>,
@@ -543,7 +583,7 @@ impl GraphLayers {
         // work.  Keep a bounded routing beam when the local topology exists;
         // providers without that topology retain the full ordinary HNSW beam.
         let routing_ef = if predicate_topology_available {
-            ef.min(PREDICATE_ROUTING_EF.max(top))
+            ef.min(PREDICATE_ROUTING_EF.max(top_k))
         } else {
             ef
         };
@@ -571,22 +611,25 @@ impl GraphLayers {
             seeds.retain(|point| admits(point.idx));
             let admission_window_full =
                 admission_capacity == ef && seeds.len() == admission_capacity;
-            let kth_score = if top != 0 && seeds.len() >= top {
-                let (_, kth, _) = seeds.select_nth_unstable_by(top - 1, |a, b| b.cmp(a));
+            let kth_score = if top_k != 0 && seeds.len() >= top_k {
+                let (_, kth, _) = seeds.select_nth_unstable_by(top_k - 1, |a, b| b.cmp(a));
                 Some(kth.score)
             } else {
                 None
             };
             let should_retry = should_refine_predicate(
-                top,
+                top_k,
                 admission_capacity,
                 seeds.len(),
                 admission_window_full,
                 kth_score,
                 phase_one_floor,
             );
-            if seeds.len() >= top && !should_retry {
-                seeds.truncate(top);
+            if seeds.len() >= top_k && !should_retry {
+                if seeds.len() > rerank_window {
+                    seeds.select_nth_unstable_by(rerank_window - 1, |a, b| b.cmp(a));
+                    seeds.truncate(rerank_window);
+                }
                 seeds.sort_unstable_by(|a, b| b.cmp(a));
                 return Ok((
                     seeds,
@@ -604,7 +647,8 @@ impl GraphLayers {
         let mut context = SearchContext::new(entry_point, routing_ef);
         // Preserve the routing beam's admitted candidates as diverse local
         // topology seeds; only the final public result is truncated to K.
-        let mut filtered = FixedLengthPriorityQueue::new(routing_ef.max(top));
+        let admission_capacity = routing_ef.max(rerank_window);
+        let mut filtered = FixedLengthPriorityQueue::new(admission_capacity);
         let mut neighbors = Vec::with_capacity(self.hnsw_m.get_m(0));
         visited.check_and_update_visited(entry_point.idx);
         if admits(entry_point.idx) {
@@ -654,12 +698,12 @@ impl GraphLayers {
         }
 
         let should_refine = should_refine_predicate(
-            top,
-            routing_ef.max(top),
+            top_k,
+            admission_capacity,
             seeds.len(),
             filtered_window_full,
             seeds
-                .get(top.saturating_sub(1).min(seeds.len().saturating_sub(1)))
+                .get(top_k.saturating_sub(1).min(seeds.len().saturating_sub(1)))
                 .map(|point| point.score),
             phase_one_floor,
         );
@@ -705,12 +749,12 @@ impl GraphLayers {
         }
 
         let should_refine_after_topology = should_refine_predicate(
-            top,
-            routing_ef.max(top),
+            top_k,
+            admission_capacity,
             seeds.len(),
             filtered_window_full,
             seeds
-                .get(top.saturating_sub(1).min(seeds.len().saturating_sub(1)))
+                .get(top_k.saturating_sub(1).min(seeds.len().saturating_sub(1)))
                 .map(|point| point.score),
             phase_one_floor,
         );
@@ -825,7 +869,7 @@ impl GraphLayers {
         partition_seeds: &[PointOffset],
         predicate_columns: &[u32],
         ef: usize,
-        scorer: &mut VectorScorer<'_>,
+        scorer: &mut GraphVectorScorer<'_>,
         admits: &F,
         budget: &ResourceBudget,
     ) -> Result<(Vec<ScoredPoint>, bool)>
@@ -919,7 +963,7 @@ impl GraphLayers {
         &self,
         entry: PredicateEntryPoint,
         predicate_links_view: GraphLinksReadView<'_>,
-        scorer: &mut VectorScorer<'_>,
+        scorer: &mut GraphVectorScorer<'_>,
         admits: &F,
         work: &SearchWorkBudget,
     ) -> Result<Option<ScoredPoint>>
@@ -1074,6 +1118,20 @@ mod tests {
     }
 
     #[test]
+    fn rerank_window_does_not_replace_user_top_k() {
+        let limits = GraphSearchLimits::try_new(10, 160, 160).unwrap();
+        assert_eq!(limits.top_k(), 10);
+        assert!(!should_refine_predicate(
+            limits.top_k(),
+            160,
+            15,
+            false,
+            Some(1.0),
+            0.5,
+        ));
+    }
+
+    #[test]
     fn adaptive_refinement_uses_locality_as_well_as_admission_count() {
         assert!(should_refine_predicate(10, 160, 20, false, Some(0.4), 0.5,));
         assert!(should_refine_predicate(10, 160, 0, false, None, 0.5));
@@ -1113,7 +1171,7 @@ mod tests {
         );
         let storage = InMemoryVectorStorage::new(vec![10.0, 5.0, 0.0, 100.0], 1);
         let query = DistanceMetric::Euclidean.prepare(&[0.0]);
-        let mut scorer = VectorScorer::new(&query, &storage).unwrap();
+        let mut scorer = GraphVectorScorer::new(&query, &storage).unwrap();
         let seed = ScoredPoint {
             idx: 0,
             score: scorer.score_point(0),

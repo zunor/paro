@@ -433,6 +433,11 @@ impl VectorSearchCursor {
             effective_ef,
             vector_dimension: u32::try_from(self.vector_dim)
                 .map_err(|_| paro_error::out_of_range("HNSW vector dimension exceeds u32"))?,
+            vector_encoding: inline_index
+                .as_ref()
+                .map_or(self.search_policy.vector_encoding, |index| {
+                    index.build_contract.vector_encoding
+                }),
             exact_scan_workload,
             cost_profile: self.search_policy.distance_cost,
         });
@@ -555,6 +560,7 @@ impl VectorSearchCursor {
             effective_ef,
             vector_dimension: u32::try_from(self.vector_dim)
                 .map_err(|_| paro_error::out_of_range("HNSW vector dimension exceeds u32"))?,
+            vector_encoding: index.build_contract.vector_encoding,
             exact_scan_workload: index.exact_scan_workload(filter),
             cost_profile: self.search_policy.distance_cost,
         });

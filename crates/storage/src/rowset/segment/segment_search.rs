@@ -108,6 +108,7 @@ impl Segment {
             effective_ef: policy.effective_ef(top_k, params.ef),
             vector_dimension: u32::try_from(index.vector_storage.vector_dim())
                 .map_err(|_| paro_error::out_of_range("HNSW vector dimension exceeds u32"))?,
+            vector_encoding: index.build_contract.vector_encoding,
             exact_scan_workload: index.exact_scan_workload(filter),
             cost_profile: policy.distance_cost,
         });

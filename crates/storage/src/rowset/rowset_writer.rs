@@ -2014,7 +2014,6 @@ mod tests {
                 "dimension": 2,
                 "distance": "euclidean",
                 "build_vector_encoding": "exact_f32",
-                "build_routing_dimensions": 0,
                 "m": 8,
                 "ef_construct": 64,
                 "ef_search": 64,
@@ -2023,12 +2022,10 @@ mod tests {
                         "kind": "built_in",
                         "revision": crate::index::hnsw::HNSW_BUILT_IN_DISTANCE_COST_REVISION
                     },
-                    "reference_dimension":
-                        crate::search::DEFAULT_HNSW_DISTANCE_COST_REFERENCE_DIMENSION,
-                    "sequential_covering_scores_per_random_score":
-                        crate::search::DEFAULT_HNSW_SEQUENTIAL_COVERING_SCORES_PER_RANDOM_SCORE,
-                    "indexed_base_scores_per_random_score":
-                        crate::search::DEFAULT_HNSW_INDEXED_BASE_SCORES_PER_RANDOM_SCORE,
+                    "random_access_cost_units": crate::search::DEFAULT_HNSW_RANDOM_ACCESS_COST_UNITS,
+                    "exact_f32_dimension_cost_units": crate::search::DEFAULT_HNSW_EXACT_F32_DIMENSION_COST_UNITS,
+                    "sequential_dimension_cost_units": crate::search::DEFAULT_HNSW_SEQUENTIAL_DIMENSION_COST_UNITS,
+                    "symmetric_i16_dimension_cost_units": crate::search::DEFAULT_HNSW_SYMMETRIC_I16_DIMENSION_COST_UNITS,
                     "graph_scored_points_per_ef":
                         crate::search::DEFAULT_HNSW_GRAPH_SCORED_POINTS_PER_EF
                 },

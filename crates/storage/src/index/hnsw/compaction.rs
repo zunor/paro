@@ -5,6 +5,7 @@ use crate::compaction::execution::index_rebuild::{
     CompactionGenerationContext, CompactionIndexRebuilder,
 };
 use crate::compaction::plan::types::CompactionPlan;
+use crate::index::hnsw::vector_storage::prepare_build_vector_storage;
 #[cfg(test)]
 use crate::index::hnsw::HnswConfig;
 use crate::index::hnsw::{
@@ -85,15 +86,15 @@ impl HnswIndexRebuilder {
                                 c.hnsw_distance, c.id
                             ))
                         })?,
-                        vector_encoding: crate::index::hnsw::HnswBuildVectorEncoding::SymmetricI16,
-                        routing_dimensions: u32::try_from(dim)
-                            .map_err(|_| {
-                                paro_error::data_corrupted(format!(
-                                    "HNSW dimension {dim} on column {} exceeds durable u32 width",
-                                    c.id
-                                ))
-                            })?
-                            .min(crate::index::hnsw::DEFAULT_HNSW_BUILD_ROUTING_DIMENSIONS),
+                        vector_encoding:
+                            crate::index::hnsw::HnswBuildVectorEncoding::default_for_dimension(
+                                u32::try_from(dim).map_err(|_| {
+                                    paro_error::data_corrupted(format!(
+                                        "HNSW dimension {dim} on column {} exceeds durable u32 width",
+                                        c.id
+                                    ))
+                                })?,
+                            )?,
                         build_seed: crate::index::hnsw::DEFAULT_HNSW_BUILD_SEED,
                         proposal_wave_size: crate::index::hnsw::DEFAULT_HNSW_PROPOSAL_WAVE_SIZE,
                         warmup_point_count: crate::index::hnsw::DEFAULT_HNSW_WARMUP_POINT_COUNT,
@@ -125,9 +126,6 @@ impl HnswIndexRebuilder {
                 let Some(index) = segment.open_hnsw_index(indexed_col.column_id)? else {
                     continue;
                 };
-                if index.build_contract != indexed_col.build_contract {
-                    continue;
-                }
                 if index.vector_storage.vector_dim() != indexed_col.dim {
                     continue;
                 }
@@ -138,6 +136,30 @@ impl HnswIndexRebuilder {
             }
         }
         Ok(candidates)
+    }
+
+    /// Resolve the immutable build contract from the artifacts being
+    /// compacted. A compaction must preserve an explicit definition choice;
+    /// deriving compact routing from vector dimension would silently turn an
+    /// exact-f32 index into a lossy one. The schema-derived contract is only
+    /// the creation contract for a legacy column that has no source artifact.
+    fn resolve_build_contract(
+        schema_contract: HnswBuildContract,
+        old_indexes: &[Arc<HnswIndex>],
+    ) -> Result<HnswBuildContract> {
+        let Some(first) = old_indexes.first() else {
+            return Ok(schema_contract);
+        };
+        let contract = first.build_contract;
+        if old_indexes
+            .iter()
+            .any(|index| index.build_contract != contract)
+        {
+            return Err(paro_error::data_corrupted(
+                "compaction inputs contain heterogeneous HNSW build contracts",
+            ));
+        }
+        Ok(contract)
     }
 
     fn rebuild_segment_indexes(
@@ -180,8 +202,14 @@ impl HnswIndexRebuilder {
                 .get(&indexed_col.column_id)
                 .map(Vec::as_slice)
                 .unwrap_or(&[]);
-            let rebuilt_index =
-                Self::build_segment_index(output_storage, *indexed_col, old_candidates)?;
+            let rebuilt_index = Self::build_segment_index(
+                output_storage,
+                *indexed_col,
+                old_candidates,
+                segment.file_path().parent().ok_or_else(|| {
+                    paro_error::internal("compaction segment path has no parent directory")
+                })?,
+            )?;
             let ptr = Self::write_hnsw_page(&mut file, &rebuilt_index)?;
 
             let target = &mut footer.column_metas[meta_idx];
@@ -212,23 +240,34 @@ impl HnswIndexRebuilder {
         output_storage: Arc<dyn VectorStorage>,
         indexed_col: HnswIndexedColumn,
         old_candidates: &[Arc<HnswIndex>],
+        workspace_dir: &std::path::Path,
     ) -> Result<HnswIndex> {
-        if let Some(index) =
-            Self::build_index_with_healer(output_storage.clone(), indexed_col, old_candidates)?
-        {
+        if let Some(index) = Self::build_index_with_healer(
+            output_storage.clone(),
+            indexed_col,
+            old_candidates,
+            workspace_dir,
+        )? {
             return Ok(index);
         }
 
-        HnswIndex::try_build(output_storage, indexed_col.build_contract)
+        HnswIndex::try_build_in_workspace(output_storage, indexed_col.build_contract, workspace_dir)
     }
 
     fn build_index_with_healer(
         output_storage: Arc<dyn VectorStorage>,
         indexed_col: HnswIndexedColumn,
         old_candidates: &[Arc<HnswIndex>],
+        workspace_dir: &std::path::Path,
     ) -> Result<Option<HnswIndex>> {
         let output_storage =
             IndexedVectorStorage::prepare(output_storage, indexed_col.build_contract.distance);
+        let output_storage = prepare_build_vector_storage(
+            output_storage,
+            indexed_col.build_contract.vector_encoding,
+            indexed_col.build_contract.build_seed,
+            Some(workspace_dir),
+        )?;
         let Some((best_old_index, signature_overlap)) =
             Self::select_best_old_index(output_storage.as_ref(), old_candidates)
         else {
@@ -512,7 +551,7 @@ impl CompactionIndexRebuilder for HnswIndexRebuilder {
         plan: &CompactionPlan,
     ) -> Result<()> {
         rowset.load()?;
-        let indexed_columns = Self::collect_indexed_columns(tablet)?;
+        let mut indexed_columns = Self::collect_indexed_columns(tablet)?;
         if indexed_columns.is_empty() {
             return Ok(());
         }
@@ -524,6 +563,16 @@ impl CompactionIndexRebuilder for HnswIndexRebuilder {
                 indexed_col.column_id,
                 Self::collect_old_indexes(&input_rowsets, *indexed_col)?,
             );
+        }
+
+        for indexed_col in &mut indexed_columns {
+            indexed_col.build_contract = Self::resolve_build_contract(
+                indexed_col.build_contract,
+                old_indexes_by_col
+                    .get(&indexed_col.column_id)
+                    .map(Vec::as_slice)
+                    .unwrap_or_default(),
+            )?;
         }
 
         for segment in rowset.segments() {
@@ -601,16 +650,40 @@ mod tests {
         ]);
 
         let old_index = Arc::new(HnswIndex::build(Arc::new(old_vectors), config, distance));
+        let workspace = TempDir::new().unwrap();
         let healed = HnswIndexRebuilder::build_index_with_healer(
             Arc::new(output_vectors),
             indexed_col,
             &[old_index],
+            workspace.path(),
         )
         .unwrap();
         assert!(
             healed.is_none(),
             "low-overlap compaction should fallback to full rebuild"
         );
+    }
+
+    #[test]
+    fn compaction_preserves_the_artifact_owned_build_contract() {
+        let config = HnswConfig::new(8, 32);
+        let distance = DistanceMetric::Euclidean;
+        let exact_contract = config.try_build_contract(distance).unwrap();
+        let old = Arc::new(HnswIndex::build(
+            Arc::new(storage(&[
+                vec![1.0, 1.0, 1.0, 1.0],
+                vec![2.0, 2.0, 2.0, 2.0],
+            ])),
+            config,
+            distance,
+        ));
+        let mut schema_fallback = exact_contract;
+        schema_fallback.vector_encoding =
+            crate::index::hnsw::HnswBuildVectorEncoding::symmetric_i16(4).unwrap();
+
+        let resolved = HnswIndexRebuilder::resolve_build_contract(schema_fallback, &[old])
+            .expect("homogeneous source contract");
+        assert_eq!(resolved, exact_contract);
     }
 
     fn write_vector_segment(
@@ -641,7 +714,18 @@ mod tests {
                 ColumnData::new(vec_bytes, vectors.len() as u32),
             ])
             .unwrap();
-        writer.finalize().unwrap();
+        let segment = writer.finalize().unwrap();
+        if build_hnsw {
+            let pointer = segment
+                .get_column_meta(1)
+                .and_then(|meta| meta.hnsw_index_pointer)
+                .expect("test fixture HNSW page");
+            assert_eq!(
+                pointer.offset % HNSW_ARTIFACT_ALIGNMENT as u64,
+                0,
+                "test fixture must publish an aligned HNSW envelope"
+            );
+        }
     }
 
     #[test]
@@ -704,7 +788,10 @@ mod tests {
             0,
         )
         .unwrap();
-        let old_index = old_segment.hnsw_index(1).expect("old hnsw index");
+        let old_index = old_segment
+            .open_hnsw_index(1)
+            .unwrap()
+            .expect("old hnsw index");
 
         let new_segment = Segment::open(
             0,
@@ -717,7 +804,7 @@ mod tests {
         )
         .unwrap();
         assert!(
-            new_segment.hnsw_index(1).is_none(),
+            new_segment.open_hnsw_index(1).unwrap().is_none(),
             "new segment should not have HNSW index before compaction rebuild"
         );
 
@@ -738,7 +825,8 @@ mod tests {
         let rebuilt =
             Segment::open(0, &new_path, schema, SegmentOptions::default(), 0, 1, 0).unwrap();
         let rebuilt_index = rebuilt
-            .hnsw_index(1)
+            .open_hnsw_index(1)
+            .unwrap()
             .expect("rebuilt segment should contain HNSW index");
         assert_eq!(rebuilt_index.graph.links.num_points(), new_vectors.len());
     }

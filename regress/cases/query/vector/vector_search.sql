@@ -34,8 +34,10 @@ CREATE VECTOR INDEX idx_indexed_items_emb ON indexed_items (emb)
     ef_construct = 32
     ef_search = 24
     build_seed = 7
-    sequential_covering_scores_per_random_score = 1
-    indexed_base_scores_per_random_score = 1
+    random_access_cost_units = 1
+    exact_f32_dimension_cost_units = 1
+    sequential_dimension_cost_units = 1
+    symmetric_i16_dimension_cost_units = 1
     graph_scored_points_per_ef = 1
     distance_cost_calibration_id = 1
     filter_columns = 'id,bucket'

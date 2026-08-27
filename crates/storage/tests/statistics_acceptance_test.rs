@@ -190,7 +190,6 @@ fn test_index_statistics() {
                 ef_construct: 50,
                 distance: DistanceMetric::Cosine,
                 vector_encoding: paro_storage::index::hnsw::HnswBuildVectorEncoding::ExactF32,
-                routing_dimensions: 0,
                 build_seed: DEFAULT_HNSW_BUILD_SEED,
                 proposal_wave_size: DEFAULT_HNSW_PROPOSAL_WAVE_SIZE,
                 warmup_point_count: DEFAULT_HNSW_WARMUP_POINT_COUNT,

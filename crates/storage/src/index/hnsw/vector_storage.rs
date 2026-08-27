@@ -289,6 +289,7 @@ pub(crate) struct SymmetricI16BuildVectorStorage {
     row_stride_bytes: usize,
     selected_dimensions: Box<[usize]>,
     scales: Box<[f32]>,
+    scale_squares: Box<[f32]>,
     routing_inverse_norms: Option<CosineInverseNorms>,
 }
 
@@ -345,6 +346,11 @@ impl SymmetricI16BuildVectorStorage {
                     max_abs / 32_767.0
                 }
             })
+            .collect::<Vec<_>>()
+            .into_boxed_slice();
+        let scale_squares = scales
+            .iter()
+            .map(|scale| scale * scale)
             .collect::<Vec<_>>()
             .into_boxed_slice();
         let encoded_dimension = routing_dimensions
@@ -447,6 +453,7 @@ impl SymmetricI16BuildVectorStorage {
             row_stride_bytes,
             selected_dimensions,
             scales,
+            scale_squares,
             routing_inverse_norms: routing_inverse_norms
                 .map(|values| CosineInverseNorms::Owned(Arc::from(values))),
         }))
@@ -527,6 +534,11 @@ impl SymmetricI16BuildVectorStorage {
             dimension,
             row_stride_bytes,
             selected_dimensions,
+            scale_squares: scales
+                .iter()
+                .map(|scale| scale * scale)
+                .collect::<Vec<_>>()
+                .into_boxed_slice(),
             scales,
             routing_inverse_norms,
         }))
@@ -593,16 +605,16 @@ impl VectorStorage for SymmetricI16BuildVectorStorage {
         let right_code = self.code(right);
         match distance {
             DistanceMetric::Euclidean => {
-                -weighted_i16_l2_squared(left_code, right_code, &self.scales)
+                -weighted_i16_l2_squared(left_code, right_code, &self.scale_squares)
             }
             DistanceMetric::DotProduct => {
-                weighted_i16_dot_product(left_code, right_code, &self.scales)
+                weighted_i16_dot_product(left_code, right_code, &self.scale_squares)
             }
             DistanceMetric::Cosine => {
                 let norms = self.routing_inverse_norms.as_ref().unwrap_or_else(|| {
                     unreachable!("symmetric-i16 routing norms are prepared once")
                 });
-                weighted_i16_dot_product(left_code, right_code, &self.scales)
+                weighted_i16_dot_product(left_code, right_code, &self.scale_squares)
                     * (norms.value(left) * norms.value(right))
             }
             DistanceMetric::Manhattan => {
@@ -615,18 +627,19 @@ impl VectorStorage for SymmetricI16BuildVectorStorage {
 pub(crate) fn prepare_build_vector_storage(
     base: Arc<dyn VectorStorage>,
     encoding: super::HnswBuildVectorEncoding,
-    routing_dimensions: u32,
     build_seed: u64,
     workspace_dir: Option<&Path>,
 ) -> Result<Arc<dyn VectorStorage>> {
     match encoding {
         super::HnswBuildVectorEncoding::ExactF32 => Ok(base),
-        super::HnswBuildVectorEncoding::SymmetricI16 => SymmetricI16BuildVectorStorage::prepare(
-            base,
-            routing_dimensions as usize,
-            build_seed,
-            workspace_dir,
-        ),
+        super::HnswBuildVectorEncoding::SymmetricI16 { routing_dimensions } => {
+            SymmetricI16BuildVectorStorage::prepare(
+                base,
+                usize::from(routing_dimensions.get()),
+                build_seed,
+                workspace_dir,
+            )
+        }
     }
 }
 
@@ -803,29 +816,28 @@ fn splitmix64(mut value: u64) -> u64 {
 }
 
 #[inline]
-pub(crate) fn weighted_i16_dot_product(left: &[u8], right: &[u8], scales: &[f32]) -> f32 {
+pub(crate) fn weighted_i16_dot_product(left: &[u8], right: &[u8], scale_squares: &[f32]) -> f32 {
     left.chunks_exact(std::mem::size_of::<i16>())
         .zip(right.chunks_exact(std::mem::size_of::<i16>()))
-        .zip(scales)
-        .map(|((left, right), &scale)| {
+        .zip(scale_squares)
+        .map(|((left, right), &scale_square)| {
             let left = i16::from_le_bytes(left.try_into().expect("i16 width"));
             let right = i16::from_le_bytes(right.try_into().expect("i16 width"));
-            f32::from(left) * f32::from(right) * scale * scale
+            f32::from(left) * f32::from(right) * scale_square
         })
         .sum()
 }
 
 #[inline]
-pub(crate) fn weighted_i16_l2_squared(left: &[u8], right: &[u8], scales: &[f32]) -> f32 {
+pub(crate) fn weighted_i16_l2_squared(left: &[u8], right: &[u8], scale_squares: &[f32]) -> f32 {
     left.chunks_exact(std::mem::size_of::<i16>())
         .zip(right.chunks_exact(std::mem::size_of::<i16>()))
-        .zip(scales)
-        .map(|((left, right), &scale)| {
+        .zip(scale_squares)
+        .map(|((left, right), &scale_square)| {
             let left = i16::from_le_bytes(left.try_into().expect("i16 width"));
             let right = i16::from_le_bytes(right.try_into().expect("i16 width"));
             let delta = f32::from(left) - f32::from(right);
-            let scaled = delta * scale;
-            scaled * scaled
+            delta * delta * scale_square
         })
         .sum()
 }
@@ -1604,8 +1616,7 @@ mod tests {
             let raw = IndexedVectorStorage::prepare(raw, metric);
             let encoded = prepare_build_vector_storage(
                 Arc::clone(&raw),
-                super::super::HnswBuildVectorEncoding::SymmetricI16,
-                3,
+                super::super::HnswBuildVectorEncoding::symmetric_i16(3).unwrap(),
                 17,
                 None,
             )
@@ -1634,8 +1645,7 @@ mod tests {
         ));
         let routing = prepare_build_vector_storage(
             raw,
-            super::super::HnswBuildVectorEncoding::SymmetricI16,
-            2,
+            super::super::HnswBuildVectorEncoding::symmetric_i16(2).unwrap(),
             19,
             None,
         )

@@ -48,7 +48,6 @@ impl<'a> PreparedVectorScoring<'a> {
             dimension: self.dimension,
             point_count: self.point_count,
             kernel: self.kernel,
-            routing: None,
             scores_buffer: Vec::new(),
             scored_points: Cell::new(0),
         }
@@ -79,14 +78,13 @@ mod tests {
             Arc::new(InMemoryVectorStorage::new(vec![0.0, 1.0], 1));
         let storage = prepare_build_vector_storage(
             storage,
-            HnswBuildVectorEncoding::SymmetricI16,
-            1,
+            HnswBuildVectorEncoding::symmetric_i16(1).unwrap(),
             7,
             None,
         )
         .unwrap();
         let query = DistanceMetric::Euclidean.prepare(&[-100.0]);
-        let scorer = VectorScorer::new_routing(&query, storage.as_ref()).unwrap();
+        let scorer = GraphVectorScorer::new(&query, storage.as_ref()).unwrap();
 
         assert_eq!(scorer.score_point(0), -10_000.0);
         assert_eq!(scorer.score_point(1), -10_201.0);
@@ -100,7 +98,6 @@ pub struct VectorScorer<'a> {
     dimension: usize,
     point_count: usize,
     kernel: ScoringKernel<'a>,
-    routing: Option<I16RoutingScoring<'a>>,
     scores_buffer: Vec<ScoreType>,
     scored_points: Cell<u64>,
 }
@@ -134,6 +131,147 @@ impl I16RoutingScoring<'_> {
                 -f32_query_i16_l1_distance(&self.query, code, self.view.scales)
             }
         }
+    }
+
+    #[inline(always)]
+    fn prefetch_point(&self, point_id: usize) {
+        let start = point_id * self.view.row_stride_bytes;
+        distance::prefetch_bytes_read(&self.view.codes[start..start + self.view.row_stride_bytes]);
+    }
+}
+
+/// Graph-navigation scorer. It may use a lossy compact routing image, but it
+/// deliberately exposes no cached-vector or exact-scan API. Exact SQL scores
+/// are owned by [`VectorScorer`], so an already fetched f32 row can no longer
+/// be silently ignored by a compact scorer.
+pub(crate) struct GraphVectorScorer<'a> {
+    exact: VectorScorer<'a>,
+    routing: Option<I16RoutingScoring<'a>>,
+    scores_buffer: Vec<ScoreType>,
+    scored_points: Cell<u64>,
+}
+
+impl<'a> GraphVectorScorer<'a> {
+    pub(crate) fn new(
+        query: &'a PreparedQuery,
+        vector_storage: &'a dyn VectorStorage,
+    ) -> paro_common::error::Result<Self> {
+        let exact = VectorScorer::new(query, vector_storage)?;
+        let routing = vector_storage
+            .i16_routing_view()
+            .map(|view| {
+                if view.source_dimension != query.as_slice().len()
+                    || view
+                        .selected_dimensions
+                        .len()
+                        .saturating_mul(std::mem::size_of::<i16>())
+                        > view.row_stride_bytes
+                    || view.scales.len() != view.selected_dimensions.len()
+                {
+                    return Err(paro_common::error::data_corrupted(
+                        "HNSW routing image disagrees with the query dimension",
+                    ));
+                }
+                let mut routing_query = Vec::with_capacity(view.selected_dimensions.len());
+                let mut squared_norm = 0.0f32;
+                for &source_dimension in view.selected_dimensions {
+                    let value = query.as_slice()[source_dimension];
+                    routing_query.push(value);
+                    squared_norm += value * value;
+                }
+                let query_inverse_norm = if squared_norm < f32::EPSILON {
+                    0.0
+                } else {
+                    squared_norm.sqrt().recip()
+                };
+                Ok(I16RoutingScoring {
+                    view,
+                    query: routing_query.into_boxed_slice(),
+                    query_inverse_norm,
+                })
+            })
+            .transpose()?;
+        Ok(Self {
+            exact,
+            routing,
+            scores_buffer: Vec::new(),
+            scored_points: Cell::new(0),
+        })
+    }
+
+    pub(crate) fn uses_compact_routing(&self) -> bool {
+        self.routing.is_some()
+    }
+
+    pub(crate) fn point_count(&self) -> usize {
+        self.exact.point_count()
+    }
+
+    pub(crate) fn scored_point_count(&self) -> u64 {
+        self.scored_points.get()
+    }
+
+    pub(crate) fn score_point(&self, point_id: PointOffset) -> ScoreType {
+        self.scored_points
+            .set(self.scored_points.get().saturating_add(1));
+        self.routing.as_ref().map_or_else(
+            || {
+                self.exact
+                    .score_cached_point(point_id, self.exact.vector(point_id))
+            },
+            |routing| routing.score_point(self.exact.query.metric(), point_id),
+        )
+    }
+
+    #[inline(always)]
+    pub(crate) fn prefetch_graph_point(&self, point: GraphPoint) {
+        if let Some(routing) = &self.routing {
+            routing.prefetch_point(point.index());
+        } else {
+            self.exact.prefetch_graph_point(point);
+        }
+    }
+
+    pub(crate) fn score_points_unfiltered<'b>(
+        &'b mut self,
+        points: &'b [PointOffset],
+    ) -> impl Iterator<Item = ScoredPoint> + 'b {
+        self.scores_buffer.resize(points.len(), 0.0);
+        self.scored_points
+            .set(self.scored_points.get().saturating_add(points.len() as u64));
+        if let Some(routing) = &self.routing {
+            for (score, &point_id) in self.scores_buffer.iter_mut().zip(points) {
+                *score = routing.score_point(self.exact.query.metric(), point_id);
+            }
+        } else {
+            VectorScorer::fill_scores_untracked(
+                self.exact.query,
+                self.exact.kernel,
+                self.exact.vectors,
+                self.exact.dimension,
+                points,
+                &mut self.scores_buffer,
+            );
+        }
+        points
+            .iter()
+            .zip(self.scores_buffer.iter())
+            .map(|(&idx, &score)| ScoredPoint { idx, score })
+    }
+
+    pub(crate) fn score_points<'b>(
+        &'b mut self,
+        points: &'b mut Vec<PointOffset>,
+        filter_bitmap: Option<&roaring::RoaringBitmap>,
+        limit: usize,
+    ) -> impl Iterator<Item = ScoredPoint> + 'b {
+        if let Some(bitmap) = filter_bitmap {
+            points.retain(|id| bitmap.contains(*id));
+        }
+        if limit != 0 {
+            points.truncate(limit);
+        }
+        self.score_points_unfiltered(points.as_slice())
     }
 }
 
@@ -186,58 +324,9 @@ impl<'a> VectorScorer<'a> {
             dimension,
             point_count: vector_storage.num_vectors(),
             kernel,
-            routing: None,
             scores_buffer: Vec::new(),
             scored_points: Cell::new(0),
         })
-    }
-
-    pub fn new_routing(
-        query: &'a PreparedQuery,
-        vector_storage: &'a dyn VectorStorage,
-    ) -> paro_common::error::Result<Self> {
-        let mut scorer = Self::new(query, vector_storage)?;
-        let Some(view) = vector_storage.i16_routing_view() else {
-            return Ok(scorer);
-        };
-        if view.source_dimension != query.as_slice().len()
-            || view
-                .selected_dimensions
-                .len()
-                .saturating_mul(std::mem::size_of::<i16>())
-                > view.row_stride_bytes
-        {
-            return Err(paro_common::error::data_corrupted(
-                "HNSW routing image disagrees with the query dimension",
-            ));
-        }
-        let mut routing_query = Vec::with_capacity(view.selected_dimensions.len());
-        let mut squared_norm = 0.0f32;
-        if view.scales.len() != view.selected_dimensions.len() {
-            return Err(paro_common::error::data_corrupted(
-                "HNSW routing scale cardinality disagrees with selected dimensions",
-            ));
-        }
-        for &source_dimension in view.selected_dimensions {
-            let value = query.as_slice()[source_dimension];
-            routing_query.push(value);
-            squared_norm += value * value;
-        }
-        let query_inverse_norm = if squared_norm < f32::EPSILON {
-            0.0
-        } else {
-            squared_norm.sqrt().recip()
-        };
-        scorer.routing = Some(I16RoutingScoring {
-            view,
-            query: routing_query.into_boxed_slice(),
-            query_inverse_norm,
-        });
-        Ok(scorer)
-    }
-
-    pub(crate) fn uses_i16_routing(&self) -> bool {
-        self.routing.is_some()
     }
 
     /// Score a single point.
@@ -270,9 +359,6 @@ impl<'a> VectorScorer<'a> {
     /// checked vector slice solely to issue non-dereferencing prefetch hints.
     #[inline(always)]
     pub(crate) fn prefetch_graph_point(&self, point: GraphPoint) {
-        if self.routing.is_some() {
-            return;
-        }
         let start = point.index() * self.dimension;
         // SAFETY: HnswIndex validates graph/vector cardinality at construction,
         // and `GraphLinks::search_view` repeats that proof at the search
@@ -288,10 +374,6 @@ impl<'a> VectorScorer<'a> {
     }
 
     pub(crate) fn prepared_scoring(&self) -> PreparedVectorScoring<'a> {
-        assert!(
-            self.routing.is_none(),
-            "compact routing scorer cannot be used for exact-scan workers"
-        );
         PreparedVectorScoring {
             query: self.query,
             vectors: self.vectors,
@@ -310,9 +392,6 @@ impl<'a> VectorScorer<'a> {
 
     /// Score an indexed point whose vector has already been fetched.
     pub fn score_cached_point(&self, point_id: PointOffset, vector: &[f32]) -> ScoreType {
-        if let Some(routing) = &self.routing {
-            return routing.score_point(self.query.metric(), point_id);
-        }
         match self.kernel {
             ScoringKernel::Cosine(norms) => self.query.metric().similarity_prepared_with_norm(
                 self.query.as_slice(),
@@ -344,49 +423,58 @@ impl<'a> VectorScorer<'a> {
         self.scores_buffer.resize(points.len(), 0.0);
         self.scored_points
             .set(self.scored_points.get().saturating_add(points.len() as u64));
-        let query = self.query.as_slice();
-        if let Some(routing) = &self.routing {
-            for (i, &point_id) in points.iter().enumerate() {
-                self.scores_buffer[i] = routing.score_point(self.query.metric(), point_id);
-            }
-        } else {
-            match self.kernel {
-                ScoringKernel::Cosine(norms) => {
-                    for (i, &point_id) in points.iter().enumerate() {
-                        self.scores_buffer[i] = distance::dot_product(query, self.vector(point_id))
-                            * norms.value(point_id);
-                    }
-                }
-                ScoringKernel::Euclidean => {
-                    distance::l2_squared_batch_indexed(
-                        query,
-                        self.vectors,
-                        self.dimension,
-                        points,
-                        &mut self.scores_buffer,
-                    );
-                    for score in &mut self.scores_buffer {
-                        *score = -*score;
-                    }
-                }
-                ScoringKernel::DotProduct => {
-                    for (i, &point_id) in points.iter().enumerate() {
-                        self.scores_buffer[i] = distance::dot_product(query, self.vector(point_id));
-                    }
-                }
-                ScoringKernel::Manhattan => {
-                    for (i, &point_id) in points.iter().enumerate() {
-                        self.scores_buffer[i] =
-                            -distance::l1_distance(query, self.vector(point_id));
-                    }
-                }
-            }
-        }
+        Self::fill_scores_untracked(
+            self.query,
+            self.kernel,
+            self.vectors,
+            self.dimension,
+            points,
+            &mut self.scores_buffer,
+        );
         let scores = &self.scores_buffer;
         points
             .iter()
             .zip(scores.iter())
             .map(|(&idx, &score)| ScoredPoint { idx, score })
+    }
+
+    fn fill_scores_untracked(
+        prepared_query: &PreparedQuery,
+        kernel: ScoringKernel<'_>,
+        vectors: &[f32],
+        dimension: usize,
+        points: &[PointOffset],
+        scores: &mut [ScoreType],
+    ) {
+        let query = prepared_query.as_slice();
+        let vector = |point_id: PointOffset| {
+            let start = point_id as usize * dimension;
+            &vectors[start..start + dimension]
+        };
+        match kernel {
+            ScoringKernel::Cosine(norms) => {
+                for (i, &point_id) in points.iter().enumerate() {
+                    scores[i] =
+                        distance::dot_product(query, vector(point_id)) * norms.value(point_id);
+                }
+            }
+            ScoringKernel::Euclidean => {
+                distance::l2_squared_batch_indexed(query, vectors, dimension, points, scores);
+                for score in scores {
+                    *score = -*score;
+                }
+            }
+            ScoringKernel::DotProduct => {
+                for (i, &point_id) in points.iter().enumerate() {
+                    scores[i] = distance::dot_product(query, vector(point_id));
+                }
+            }
+            ScoringKernel::Manhattan => {
+                for (i, &point_id) in points.iter().enumerate() {
+                    scores[i] = -distance::l1_distance(query, vector(point_id));
+                }
+            }
+        }
     }
 
     /// Score global point identities from a contiguous alternate row-major

@@ -624,6 +624,11 @@ pub struct ScalarColumnWriter<W: DataWriter> {
 impl<W: DataWriter> ScalarColumnWriter<W> {
     /// Create a new scalar column writer.
     pub fn new(opts: ColumnWriterOptions, writer: W) -> Result<Self> {
+        if opts.field_type == FieldType::Vector && opts.compression != CompressionType::None {
+            return Err(paro_error::invalid_input(
+                "vector data pages are mmap-backed and cannot be compressed",
+            ));
+        }
         let registry = get_encoding_registry();
         let encoding = if opts.encoding == EncodingType::Default {
             registry.get_default_encoding(opts.field_type, false)
@@ -1076,17 +1081,7 @@ impl<W: DataWriter> ScalarColumnWriter<W> {
         // column: page footers make adjacent page bodies non-contiguous and
         // do not preserve the next page's alignment by accident.
         let ptr = if self.opts.field_type == FieldType::Vector {
-            if self.opts.compression != CompressionType::None {
-                return Err(paro_error::internal(
-                    "vector data pages must be uncompressed mmap pages",
-                ));
-            }
-            PageIO::write_mmap_page(
-                &mut self.writer,
-                &page_body,
-                &footer,
-                std::mem::align_of::<f32>(),
-            )?
+            PageIO::write_mmap_page(&mut self.writer, &page_body, &footer, 64)?
         } else {
             let codec_ref = self.codec.as_deref();
             PageIO::compress_and_write_page(
@@ -1644,6 +1639,17 @@ mod tests {
         assert!(!opts.is_nullable);
         assert_eq!(opts.compression, CompressionType::Zstd);
         assert_eq!(opts.page_size, 128 * 1024);
+    }
+
+    #[test]
+    fn vector_compression_is_rejected_when_the_writer_is_created() {
+        let opts = ColumnWriterOptions::new(FieldType::Vector, 1)
+            .with_fixed_len(4 * std::mem::size_of::<f32>())
+            .with_compression(CompressionType::Lz4);
+        let error = ScalarColumnWriter::new(opts, Cursor::new(Vec::new()))
+            .err()
+            .expect("compressed vector writer must be rejected");
+        assert!(error.to_string().contains("cannot be compressed"));
     }
 
     #[test]

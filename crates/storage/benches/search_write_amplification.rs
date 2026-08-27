@@ -306,9 +306,11 @@ fn search_definition(
             version: paro_storage::search::HNSW_PROVIDER_CONFIG_VERSION,
             dimension: dimension.unwrap_or(HNSW_DIMENSION as u64) as u32,
             distance: paro_storage::index::hnsw::DistanceMetric::Euclidean,
-            build_vector_encoding: paro_storage::index::hnsw::HnswBuildVectorEncoding::SymmetricI16,
-            build_routing_dimensions: (dimension.unwrap_or(HNSW_DIMENSION as u64) as u32)
-                .min(paro_storage::index::hnsw::DEFAULT_HNSW_BUILD_ROUTING_DIMENSIONS),
+            build_vector_encoding:
+                paro_storage::index::hnsw::HnswBuildVectorEncoding::default_for_dimension(
+                    dimension.unwrap_or(HNSW_DIMENSION as u64) as u32,
+                )
+                .unwrap(),
             m: 16,
             ef_construct: 64,
             ef_search: 64,
