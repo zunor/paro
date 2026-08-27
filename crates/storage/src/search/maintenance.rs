@@ -305,6 +305,37 @@ mod tests {
     }
 
     #[test]
+    fn maintenance_scheduler_drains_tail_before_large_artifact_compaction() {
+        let manifest = sample_loaded_manifest(2, 0);
+        let definition = SearchIndexDefinition {
+            definition_id: 7,
+            table_id: 11,
+            name: "docs_fts".to_string(),
+            kind: SearchIndexKind::FullText,
+            column_ids: vec![0],
+            expression: None,
+            provider_config: serde_json::json!({"version": 1, "config": "simple"}),
+            freshness_policy: SearchFreshnessPolicy::default_for_kind(SearchIndexKind::FullText),
+            config_fingerprint: 99,
+        };
+
+        let decision = MaintenanceScheduler::default().decide_definition(
+            &definition,
+            &manifest,
+            GcDecision::CompactOnly,
+            &ArtifactGcContext {
+                bytes_on_disk: 256 * 1024 * 1024,
+                ..Default::default()
+            },
+            0,
+        );
+
+        assert_eq!(decision.gc_decision, GcDecision::CompactOnly);
+        assert_eq!(decision.action, SearchMaintenanceAction::CatchUp);
+        assert_eq!(decision.estimate.benefit.expected_tail_rows_drained, 2);
+    }
+
+    #[test]
     fn maintenance_scheduler_requests_manifest_delta_compaction_over_soft_window() {
         let manifest = sample_loaded_manifest(0, DELTA_COUNT_SOFT_LIMIT + 1);
 

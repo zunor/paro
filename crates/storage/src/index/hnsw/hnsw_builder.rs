@@ -9,6 +9,34 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, OnceLock};
 
+/// Runtime scheduling policy for an HNSW build.
+///
+/// This policy is deliberately absent from [`HnswBuildContract`]: it controls
+/// how many workers may execute immutable proposal/publish partitions, never
+/// wave membership or durable topology. The frozen-wave builder is required
+/// to produce identical bytes for every granted width.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum HnswBuildExecutionPolicy {
+    /// User-requested index construction may consume the complete shared pool.
+    #[default]
+    Foreground,
+    /// Background catch-up and generation compaction preserve foreground CPU.
+    Maintenance,
+}
+
+impl HnswBuildExecutionPolicy {
+    fn granted_parallelism(self, pool_width: usize) -> usize {
+        match self {
+            Self::Foreground => pool_width.max(1),
+            // A maintenance build must make progress without monopolizing the
+            // process. Reserve half of the shared pool for foreground work;
+            // no private pool or extra OS thread is made. This also keeps a
+            // large catch-up inside the bounded-lag maintenance envelope.
+            Self::Maintenance => pool_width.div_ceil(2).max(1),
+        }
+    }
+}
+
 struct HnswBuildPool {
     threads: usize,
     pool: ThreadPool,
@@ -127,6 +155,7 @@ impl fmt::Debug for HnswBuildStopCheck {
 pub struct HnswBuilder {
     stop_check: Option<HnswBuildStopCheck>,
     workspace_dir: Option<PathBuf>,
+    execution_policy: HnswBuildExecutionPolicy,
 }
 
 impl HnswBuilder {
@@ -147,17 +176,23 @@ impl HnswBuilder {
         self
     }
 
+    pub fn with_execution_policy(mut self, execution_policy: HnswBuildExecutionPolicy) -> Self {
+        self.execution_policy = execution_policy;
+        self
+    }
+
     pub fn build(
         &self,
         storage: Arc<dyn VectorStorage>,
         build_contract: HnswBuildContract,
     ) -> Result<HnswIndex> {
-        let (pool, _) = hnsw_build_pool()?;
-        HnswIndex::build_with_controls_and_filter_blocks_in_workspace(
+        let (pool, pool_width) = hnsw_build_pool()?;
+        HnswIndex::build_with_controls_and_filter_blocks_in_workspace_with_parallelism(
             storage,
             build_contract,
             HnswFilterBlocks::default(),
             Some(pool),
+            self.execution_policy.granted_parallelism(pool_width),
             self.stop_check.as_ref(),
             self.workspace_dir.as_deref(),
         )
@@ -169,12 +204,13 @@ impl HnswBuilder {
         build_contract: HnswBuildContract,
         filter_blocks: HnswFilterBlocks,
     ) -> Result<HnswIndex> {
-        let (pool, _) = hnsw_build_pool()?;
-        HnswIndex::build_with_controls_and_filter_blocks_in_workspace(
+        let (pool, pool_width) = hnsw_build_pool()?;
+        HnswIndex::build_with_controls_and_filter_blocks_in_workspace_with_parallelism(
             storage,
             build_contract,
             filter_blocks,
             Some(pool),
+            self.execution_policy.granted_parallelism(pool_width),
             self.stop_check.as_ref(),
             self.workspace_dir.as_deref(),
         )

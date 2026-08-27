@@ -25,6 +25,12 @@ pub enum GcDecision {
 #[derive(Debug, Clone, PartialEq, Default)]
 pub struct ArtifactGcContext {
     pub bytes_on_disk: u64,
+    /// Number of independently searched immutable artifacts in the active
+    /// generation. For graph providers this is query fan-out, not merely a
+    /// storage accounting detail.
+    pub artifact_count: usize,
+    pub indexed_rows: u64,
+    pub largest_artifact_rows: u64,
     pub tombstone_ratio: Option<f32>,
     pub query_pressure: Option<f32>,
     pub provider_stats: Option<SearchProviderStats>,

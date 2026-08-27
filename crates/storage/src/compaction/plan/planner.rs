@@ -5,13 +5,19 @@ use crate::compaction::plan::policy::{
     BaseCompactionPolicy, CompactionPolicy, CompactionRowsetSet, CompactionSelection,
     CumulativeCompactionPolicy, SizeTieredCompactionPolicy,
 };
+#[cfg(test)]
+use crate::compaction::plan::types::PolicyKind;
 use crate::compaction::plan::types::{
-    CompactionInput, CompactionPlan, CompactionPlanId, CompactionReason, CumulativePointAction,
-    ExecutionLayout, MergeSemantics, PkDeltaGuard, PolicyKind, ReadSnapshot,
+    CompactionInput, CompactionPlan, CompactionPlanId, ExecutionLayout, MergeSemantics,
+    PkDeltaGuard, ReadSnapshot,
 };
+use crate::compaction::publish::{PkIndexUpsertCandidate, SegmentDeleteDelta};
 use crate::rowset::RowsetSharedPtr;
 use crate::tablet::{KeysType, Tablet, Version};
 use paro_common::error::{self as paro_error, Result};
+use paro_common::types::LogicalType;
+use std::collections::BTreeSet;
+use std::mem::size_of;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 const PK_PUBLISH_DELTA_MAX_ROWS: u64 = 5_000_000;
@@ -133,19 +139,37 @@ impl CompactionPlanner {
         if captured.rowsets().len() <= 1 {
             return Ok(None);
         }
-        let rowsets = captured.rowsets().to_vec();
+
+        // Primary-key semantics belong to the merger, not to a full-table
+        // selection policy. Rewriting an established base for every new
+        // rowset creates unbounded write/index amplification and can starve
+        // HNSW tail catch-up. Select the same leveled, contiguous ranges as
+        // other tables and apply latest-key deduplication within that range.
+        let size_tiered = SizeTieredCompactionPolicy::new();
+        let cumulative = CumulativeCompactionPolicy::new();
+        let base = BaseCompactionPolicy::new();
+        let policies: [&dyn CompactionPolicy; 3] = [&size_tiered, &cumulative, &base];
+        let mut selected = None;
+        for policy in policies {
+            if let Some(selection) = Self::select(captured, policy)? {
+                selected = Some(selection);
+                break;
+            }
+        }
+        let Some(CompactionSelection { decision, rowsets }) = selected else {
+            return Ok(None);
+        };
 
         let output_version = output_version_for(&rowsets)?;
         let input_rowsets: Vec<CompactionInput> =
             rowsets.into_iter().map(CompactionInput::new).collect();
-        let score = input_rowsets.len() as f64;
         let pk_delta_guard = build_pk_delta_guard(tablet, &input_rowsets)?;
 
         Ok(Some(CompactionPlan {
             plan_id: next_plan_id(),
             tablet_id: tablet.tablet_id(),
-            policy_kind: PolicyKind::PrimaryKeyFull,
-            cumulative_point_action: CumulativePointAction::Preserve,
+            policy_kind: decision.policy_kind,
+            cumulative_point_action: decision.cumulative_point_action,
             execution_layout: ExecutionLayout::Horizontal,
             merge_semantics: MergeSemantics::Deduplicate,
             input_rowsets,
@@ -156,8 +180,8 @@ impl CompactionPlanner {
             },
             output_version,
             output_rowset_id: tablet.next_rowset_id(),
-            score,
-            reason: CompactionReason::PrimaryKeyFullDedup,
+            score: decision.score,
+            reason: decision.reason,
             pk_delta_guard: Some(pk_delta_guard),
         }))
     }
@@ -251,9 +275,10 @@ fn build_pk_delta_guard(
     tablet: &Tablet,
     input_rowsets: &[CompactionInput],
 ) -> Result<PkDeltaGuard> {
+    let estimated_rows = input_rowsets.iter().map(|input| input.num_rows).sum();
     let guard = PkDeltaGuard {
-        estimated_rows: input_rowsets.iter().map(|input| input.num_rows).sum(),
-        estimated_bytes: input_rowsets.iter().map(|input| input.size_bytes).sum(),
+        estimated_rows,
+        estimated_bytes: estimate_pk_publish_delta_bytes(tablet, input_rowsets, estimated_rows)?,
         max_rows: PK_PUBLISH_DELTA_MAX_ROWS,
         max_bytes: PK_PUBLISH_DELTA_MAX_BYTES,
     };
@@ -266,6 +291,124 @@ fn build_pk_delta_guard(
         )));
     }
     Ok(guard)
+}
+
+/// Estimate the retained publication delta, not the table rows being rewritten.
+///
+/// A PK compaction row may contain a multi-kilobyte vector while its publish
+/// record contains only the encoded primary key and two physical locations.
+/// Charging the full row payload makes the resource guard dimension-dependent
+/// and rejects perfectly bounded compactions. Fixed-width and bounded keys are
+/// derived from the durable schema. For unbounded byte keys, segment column
+/// footprints provide a data-dependent estimate without charging unrelated
+/// value/vector columns.
+fn estimate_pk_publish_delta_bytes(
+    tablet: &Tablet,
+    input_rowsets: &[CompactionInput],
+    estimated_rows: u64,
+) -> Result<u64> {
+    let schema = tablet
+        .schema()
+        .ok_or_else(|| paro_error::internal("PK delta estimate requires tablet schema"))?;
+    let key_columns = schema.key_columns();
+    let fixed_or_bounded_key_bytes = key_columns.iter().try_fold(0_u64, |total, column| {
+        encoded_key_column_bound(&column.logical_type, column.length)
+            .map(|bytes| total.saturating_add(bytes))
+    });
+    let key_payload_bytes = match fixed_or_bounded_key_bytes {
+        Some(per_row) => estimated_rows.saturating_mul(per_row),
+        None => estimate_unbounded_key_payload(input_rowsets, key_columns)?,
+    };
+
+    let candidate_headers = estimated_rows
+        .saturating_mul(u64::try_from(size_of::<PkIndexUpsertCandidate>()).unwrap_or(u64::MAX));
+    let segment_count = input_rowsets.iter().try_fold(0_u64, |total, input| {
+        input.rowset.load()?;
+        Ok::<_, paro_common::error::ParoError>(
+            total.saturating_add(u64::from(input.rowset.num_segments())),
+        )
+    })?;
+    let delete_delta_headers = segment_count
+        .saturating_mul(u64::try_from(size_of::<SegmentDeleteDelta>()).unwrap_or(u64::MAX));
+    // Internal duplicate deletion is represented as a bitmap. One bit per
+    // input row is the conservative dense bound; sparse containers are no
+    // larger for the cardinalities where they are selected.
+    let delete_bitmap_bytes = estimated_rows.div_ceil(8);
+
+    Ok(candidate_headers
+        .saturating_add(key_payload_bytes)
+        .saturating_add(delete_delta_headers)
+        .saturating_add(delete_bitmap_bytes))
+}
+
+fn encoded_key_column_bound(logical_type: &LogicalType, declared_length: u32) -> Option<u64> {
+    let fixed = match logical_type {
+        LogicalType::Boolean | LogicalType::TinyInt | LogicalType::UTinyInt => 1,
+        LogicalType::SmallInt | LogicalType::USmallInt => 2,
+        LogicalType::Integer | LogicalType::UInteger | LogicalType::Float | LogicalType::Date => 4,
+        LogicalType::BigInt
+        | LogicalType::UBigInt
+        | LogicalType::Double
+        | LogicalType::Timestamp
+        | LogicalType::TimestampTz
+        | LogicalType::Time => 8,
+        LogicalType::HugeInt | LogicalType::UHugeInt | LogicalType::Uuid => 16,
+        LogicalType::Decimal { precision, .. } => {
+            if *precision <= 18 {
+                8
+            } else {
+                16
+            }
+        }
+        LogicalType::Varchar
+        | LogicalType::VarcharCollation(_)
+        | LogicalType::TsVector
+        | LogicalType::TsQuery
+        | LogicalType::Blob
+        | LogicalType::Json
+        | LogicalType::Jsonb => {
+            if declared_length == 0 {
+                return None;
+            }
+            // Comparable byte encoding stores an 8-byte group plus marker and
+            // an additional terminator group for exact multiples of eight.
+            return Some((u64::from(declared_length) / 8 + 1).saturating_mul(9));
+        }
+        _ => return None,
+    };
+    Some(fixed)
+}
+
+fn estimate_unbounded_key_payload(
+    input_rowsets: &[CompactionInput],
+    key_columns: &[crate::tablet::TabletColumn],
+) -> Result<u64> {
+    let key_ids = key_columns
+        .iter()
+        .map(|column| column.id)
+        .collect::<BTreeSet<_>>();
+    let mut raw_bytes = 0_u64;
+    let mut rows = 0_u64;
+    for input in input_rowsets {
+        input.rowset.load()?;
+        rows = rows.saturating_add(input.num_rows);
+        for segment in input.rowset.segments() {
+            raw_bytes = raw_bytes.saturating_add(
+                segment
+                    .column_metas()
+                    .iter()
+                    .filter(|meta| key_ids.contains(&meta.column_id))
+                    .map(|meta| meta.total_mem_footprint)
+                    .sum::<u64>(),
+            );
+        }
+    }
+    // Account for 8-byte comparable groups and one terminator group per key
+    // row. The source footprint may already contain offsets/null metadata, so
+    // this intentionally remains conservative.
+    Ok(raw_bytes
+        .saturating_add(raw_bytes.div_ceil(8))
+        .saturating_add(rows.saturating_mul(9)))
 }
 
 fn next_plan_id() -> CompactionPlanId {
@@ -294,6 +437,27 @@ mod tests {
             .unwrap(),
         );
         let tablet = Tablet::new(1, 1, 0, schema, temp.path(), None).unwrap();
+        (temp, tablet)
+    }
+
+    fn test_primary_key_vector_tablet(dimension: usize) -> (tempfile::TempDir, Tablet) {
+        let temp = tempfile::tempdir().unwrap();
+        let schema = Arc::new(
+            TabletSchema::new(
+                2,
+                vec![
+                    TabletColumn::key(0, "id", LogicalType::BigInt),
+                    TabletColumn::new(
+                        1,
+                        "embedding",
+                        LogicalType::Array(Box::new(LogicalType::Float), dimension),
+                    ),
+                ],
+                KeysType::PrimaryKeys,
+            )
+            .unwrap(),
+        );
+        let tablet = Tablet::new(2, 1, 0, schema, temp.path(), None).unwrap();
         (temp, tablet)
     }
 
@@ -358,5 +522,57 @@ mod tests {
             .unwrap()
             .expect("one newer byte per five baseline bytes admits the rewrite");
         assert_eq!(plan.input_rowsets.len(), 4);
+    }
+
+    #[test]
+    fn pk_publish_delta_estimate_excludes_non_key_vector_payload() {
+        let (_temp, tablet) = test_primary_key_vector_tablet(768);
+        let rows = 1_000_000;
+        let estimated = estimate_pk_publish_delta_bytes(&tablet, &[], rows).unwrap();
+
+        assert!(estimated < PK_PUBLISH_DELTA_MAX_BYTES);
+        assert_eq!(
+            estimated,
+            rows * u64::try_from(size_of::<PkIndexUpsertCandidate>()).unwrap()
+                + rows * size_of::<i64>() as u64
+                + rows.div_ceil(8)
+        );
+    }
+
+    #[test]
+    fn comparable_key_width_models_fixed_and_bounded_values() {
+        assert_eq!(encoded_key_column_bound(&LogicalType::BigInt, 0), Some(8));
+        assert_eq!(encoded_key_column_bound(&LogicalType::Uuid, 0), Some(16));
+        assert_eq!(encoded_key_column_bound(&LogicalType::Varchar, 8), Some(18));
+        assert_eq!(encoded_key_column_bound(&LogicalType::Varchar, 9), Some(18));
+        assert_eq!(encoded_key_column_bound(&LogicalType::Varchar, 0), None);
+    }
+
+    #[test]
+    fn primary_key_planner_compacts_delta_level_without_rewriting_large_base() {
+        let (_temp, tablet) = test_primary_key_vector_tablet(128);
+        add_sized_rowset(&tablet, 1, 1, 512 * 1024 * 1024, true);
+        add_sized_rowset(&tablet, 2, 2, 4 * 1024 * 1024, false);
+        add_sized_rowset(&tablet, 3, 3, 4 * 1024 * 1024, false);
+
+        let plan = CompactionPlanner::plan(&tablet).unwrap().unwrap();
+        assert_eq!(plan.merge_semantics, MergeSemantics::Deduplicate);
+        assert_eq!(plan.policy_kind, PolicyKind::SizeTiered);
+        assert_eq!(
+            plan.input_rowsets
+                .iter()
+                .map(|input| input.rowset.rowset_id())
+                .collect::<Vec<_>>(),
+            vec![2, 3]
+        );
+    }
+
+    #[test]
+    fn primary_key_planner_defers_tiny_delta_against_large_base() {
+        let (_temp, tablet) = test_primary_key_vector_tablet(128);
+        add_sized_rowset(&tablet, 1, 1, 512 * 1024 * 1024, true);
+        add_sized_rowset(&tablet, 2, 2, 4 * 1024 * 1024, false);
+
+        assert!(CompactionPlanner::plan(&tablet).unwrap().is_none());
     }
 }

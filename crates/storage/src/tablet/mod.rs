@@ -64,7 +64,9 @@ static DELETE_PATCH_INLINE_ROW_REF_THRESHOLD: AtomicUsize =
 
 // Re-export main types
 pub use crate::rowset::PhysicalRowRef;
-pub use layout_maintenance_gate::{LayoutMaintenanceGate, LayoutMaintenanceLease};
+pub use layout_maintenance_gate::{
+    LayoutMaintenanceGate, LayoutMaintenanceLease, LayoutMaintenanceSnapshot,
+};
 pub use schema_adapter::TabletSchemaAdaptationPlan;
 pub use statistics::{TabletColumnStatistics, TabletStatistics};
 pub use tablet_meta::{SearchGenerationHeadMeta, TabletMeta};

@@ -308,9 +308,12 @@ impl MaintenanceScheduler {
             GcDecision::Heal => SearchMaintenanceAction::CatchUp,
             GcDecision::Rebuild => SearchMaintenanceAction::Rebuild,
         };
-        if manifest.root.maintenance_state.recovery.tail_pending_rows > 0
-            && matches!(action, SearchMaintenanceAction::Skip)
-        {
+        // Freshness debt is the write-admission liveness boundary. Drain the
+        // immutable tail before optional GC/repack work, regardless of the GC
+        // recommendation for the older artifact set. Otherwise a large base
+        // that qualifies for compaction can permanently starve catch-up and
+        // leave every foreground writer blocked at the tail high watermark.
+        if manifest.root.maintenance_state.recovery.tail_pending_rows > 0 {
             action = SearchMaintenanceAction::CatchUp;
         }
         let manifest_delta_pressure = manifest_delta_pressure(manifest, delta_window_bytes);

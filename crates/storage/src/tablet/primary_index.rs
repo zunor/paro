@@ -23,7 +23,7 @@ use std::collections::{HashMap, HashSet};
 use std::hash::{Hash, Hasher};
 use std::path::PathBuf;
 use std::sync::atomic::Ordering;
-use std::sync::Arc;
+use std::sync::{Arc, RwLockReadGuard, RwLockWriteGuard};
 use tracing::warn;
 
 #[derive(Debug)]
@@ -80,8 +80,16 @@ impl Tablet {
         self.data_dir().join("primary_index")
     }
 
-    fn persistent_index(&self) -> Result<PersistentIndex> {
-        PersistentIndex::new(self.persistent_index_dir())
+    fn persistent_index(&self) -> Result<RwLockReadGuard<'_, PersistentIndex>> {
+        self.persistent_primary_index
+            .read()
+            .map_err(|_| paro_error::internal("lock persistent primary index for read"))
+    }
+
+    fn persistent_index_mut(&self) -> Result<RwLockWriteGuard<'_, PersistentIndex>> {
+        self.persistent_primary_index
+            .write()
+            .map_err(|_| paro_error::internal("lock persistent primary index for write"))
     }
 
     pub fn lookup_primary_key(&self, key: &[u8]) -> Result<Option<RowID>> {
@@ -919,7 +927,7 @@ impl Tablet {
         }
 
         let provenance = self.primary_index_provenance()?;
-        let mut persistent = self.persistent_index()?;
+        let mut persistent = self.persistent_index_mut()?;
         if let Err(err) = persistent.flush_l0_with_provenance(idx.as_ref(), true, Some(provenance))
         {
             self.primary_index_flush_requested
@@ -1069,12 +1077,8 @@ impl Tablet {
     pub(super) fn persist_primary_index_snapshot(&self) -> Result<()> {
         let complete = self.materialize_complete_primary_index()?;
         let provenance = self.primary_index_provenance()?;
-        let persistent = self.persistent_index().or_else(|_| {
-            let _ = std::fs::remove_dir_all(self.persistent_index_dir());
-            self.persistent_index()
-        })?;
+        let mut persistent = self.persistent_index_mut()?;
         persistent.reset()?;
-        let mut persistent = self.persistent_index()?;
         persistent.flush_l0_with_provenance(&complete, true, Some(provenance))?;
         Ok(())
     }

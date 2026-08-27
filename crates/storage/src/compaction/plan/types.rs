@@ -36,7 +36,6 @@ pub enum PolicyKind {
     Base,
     Cumulative,
     SizeTiered,
-    PrimaryKeyFull,
 }
 
 impl fmt::Display for PolicyKind {
@@ -45,7 +44,6 @@ impl fmt::Display for PolicyKind {
             PolicyKind::Base => write!(f, "BASE"),
             PolicyKind::Cumulative => write!(f, "CUMULATIVE"),
             PolicyKind::SizeTiered => write!(f, "SIZE_TIERED"),
-            PolicyKind::PrimaryKeyFull => write!(f, "PRIMARY_KEY_FULL"),
         }
     }
 }
@@ -75,7 +73,6 @@ pub enum CompactionReason {
     BasePolicy,
     CumulativePolicy,
     SizeTieredPolicy,
-    PrimaryKeyFullDedup,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]

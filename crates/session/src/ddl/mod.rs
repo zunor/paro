@@ -973,6 +973,7 @@ impl DdlApplyContext for SessionDdlBridge {
                 )
                 .create_table_from_specs(&specs)?,
         );
+        self.db.bind_table_runtime_services(storage.as_ref());
 
         let schema_txn = CatalogSnapshot::writer(self.txn_id, self.start_time);
         let schema = self.db.catalog().get_schema(&schema_txn, &info.schema)?;

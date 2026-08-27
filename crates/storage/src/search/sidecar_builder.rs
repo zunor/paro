@@ -27,9 +27,9 @@ use super::stats::{HnswProviderStats, SearchArtifactStats, SearchProviderStats};
 use super::tail::{TailMutationKind, TailPendingEntry};
 use crate::index::bitmap::BitmapIndexWriter;
 use crate::index::hnsw::{
-    open_plain_vector_column_pages, HnswBuildStopCheck, HnswBuilder, HnswFilterBlock,
-    HnswFilterBlocks, HnswFilterColumnBlocks, HnswFilterTopologyContract, PartitionedVectorStorage,
-    VectorStorage,
+    open_plain_vector_column_pages, HnswBuildExecutionPolicy, HnswBuildStopCheck, HnswBuilder,
+    HnswFilterBlock, HnswFilterBlocks, HnswFilterColumnBlocks, HnswFilterTopologyContract,
+    PartitionedVectorStorage, VectorStorage,
 };
 use crate::metrics::{storage_metrics, SearchSidecarBuildMetricKey};
 use crate::rowset::column::ColumnBatch;
@@ -42,11 +42,22 @@ const SIDECAR_BUILD_BATCH_ROWS: usize = 8192;
 #[derive(Debug, Clone)]
 pub(crate) struct ProviderSidecarArtifactBuilder {
     store: SidecarArtifactStore,
+    hnsw_execution_policy: HnswBuildExecutionPolicy,
 }
 
 impl ProviderSidecarArtifactBuilder {
     pub(crate) fn new(store: SidecarArtifactStore) -> Self {
-        Self { store }
+        Self {
+            store,
+            hnsw_execution_policy: HnswBuildExecutionPolicy::Foreground,
+        }
+    }
+
+    pub(crate) fn for_maintenance(store: SidecarArtifactStore) -> Self {
+        Self {
+            store,
+            hnsw_execution_policy: HnswBuildExecutionPolicy::Maintenance,
+        }
     }
 }
 
@@ -172,6 +183,7 @@ impl SidecarArtifactBuilder for ProviderSidecarArtifactBuilder {
                 budget,
                 input.stop_check.as_ref(),
                 writer.workspace_dir(),
+                self.hnsw_execution_policy,
             )? {
                 let location = writer.append_streamed_artifact(|file, offset| {
                     partition
@@ -303,6 +315,7 @@ fn build_hnsw_partition_sidecar_artifact(
     budget: &BuildBudget,
     stop_check: Option<&super::inline_sink::SearchBuildStopCheck>,
     workspace_dir: &Path,
+    execution_policy: HnswBuildExecutionPolicy,
 ) -> Result<Option<HnswPartitionArtifact>> {
     let column_id = definition
         .column_ids
@@ -407,7 +420,9 @@ fn build_hnsw_partition_sidecar_artifact(
         partition_segments.iter().map(AsRef::as_ref),
         &provider.build_contract().filter_topology,
     )?;
-    let mut builder = HnswBuilder::new().with_workspace_dir(workspace_dir);
+    let mut builder = HnswBuilder::new()
+        .with_workspace_dir(workspace_dir)
+        .with_execution_policy(execution_policy);
     if let Some(stop_check) = stop_check.cloned() {
         builder =
             builder.with_stop_check(HnswBuildStopCheck::new(move || stop_check.should_stop()));
@@ -1073,6 +1088,7 @@ mod tests {
             },
             None,
             temp_dir.path(),
+            HnswBuildExecutionPolicy::Foreground,
         )
         .unwrap()
         .expect("partition artifact");

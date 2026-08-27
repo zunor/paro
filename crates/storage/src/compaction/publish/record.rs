@@ -57,6 +57,7 @@ pub struct CompactionPublishRecord {
 pub struct CompactionPublishRequest {
     pub output: CompactionBuildOutput,
     pub record: CompactionPublishRecord,
+    pub mutation: TabletMutation,
     pub maintenance_plan: PreparedMaintenancePlan,
     pub token: PrepareToken,
 }
@@ -95,32 +96,46 @@ pub fn maintenance_storage_op(
 ) -> StorageCommitOp {
     StorageCommitOp::Tablet(TabletApplyOp {
         tablet_id: record.tablet_id,
-        mutations: vec![TabletMutation::PublishCompaction {
-            plan_id: record.plan_id.0,
-            job_id: record.job_id.0,
-            output_rowset_id: record.output_rowset_id,
-            output_version: VersionSpan {
-                start: record.output_version.start,
-                end: record.output_version.end,
-            },
+        mutations: vec![compaction_mutation(
+            record,
             staged_ref,
             output_ref,
-            replaced_inputs: record.replaced_inputs.clone(),
-            retired_inputs: retired_inputs
-                .iter()
-                .map(|input| RetiredRowsetInput {
-                    rowset_id: input.rowset_id,
-                    start_version: input.version.start,
-                    end_version: input.version.end,
-                    rssids: input.rssids.clone(),
-                })
-                .collect(),
-            cumulative_point_action: match record.cumulative_point_action {
-                CumulativePointAction::Preserve => CompactionCumulativePointAction::Preserve,
-                CumulativePointAction::AdvanceToOutputEndExclusive => {
-                    CompactionCumulativePointAction::AdvanceToOutputEndExclusive
-                }
-            },
-        }],
+            retired_inputs,
+        )],
     })
+}
+
+pub fn compaction_mutation(
+    record: &CompactionPublishRecord,
+    staged_ref: ArtifactRef,
+    output_ref: ArtifactRef,
+    retired_inputs: &[RetiredInput],
+) -> TabletMutation {
+    TabletMutation::PublishCompaction {
+        plan_id: record.plan_id.0,
+        job_id: record.job_id.0,
+        output_rowset_id: record.output_rowset_id,
+        output_version: VersionSpan {
+            start: record.output_version.start,
+            end: record.output_version.end,
+        },
+        staged_ref,
+        output_ref,
+        replaced_inputs: record.replaced_inputs.clone(),
+        retired_inputs: retired_inputs
+            .iter()
+            .map(|input| RetiredRowsetInput {
+                rowset_id: input.rowset_id,
+                start_version: input.version.start,
+                end_version: input.version.end,
+                rssids: input.rssids.clone(),
+            })
+            .collect(),
+        cumulative_point_action: match record.cumulative_point_action {
+            CumulativePointAction::Preserve => CompactionCumulativePointAction::Preserve,
+            CumulativePointAction::AdvanceToOutputEndExclusive => {
+                CompactionCumulativePointAction::AdvanceToOutputEndExclusive
+            }
+        },
+    }
 }

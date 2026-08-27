@@ -654,7 +654,7 @@ impl CommitRuntimeInner {
                 batch.push(candidate);
             }
 
-            self.sequence_append_schedule(batch);
+            self.sequence_append_schedule(owner, batch);
             scheduled_batches = scheduled_batches.saturating_add(1);
         }
         if !local.is_empty() {
@@ -676,7 +676,11 @@ impl CommitRuntimeInner {
         CommitTs::new(self.sequencer.next_commit_ts().into_raw().saturating_sub(1))
     }
 
-    fn sequence_append_schedule(&self, entries: Vec<CommitQueueEntry>) {
+    fn sequence_append_schedule(
+        &self,
+        owner: &super::CommitDrainOwner,
+        entries: Vec<CommitQueueEntry>,
+    ) {
         let ordered = entries
             .into_iter()
             .map(|entry| OrderedCommitPlan {
@@ -720,15 +724,25 @@ impl CommitRuntimeInner {
         );
 
         match result {
-            Ok(batch) => self.handle_append_success(batch),
-            Err(error) => self.handle_sequence_or_append_error(error),
+            Ok(batch) => self.handle_append_success(owner, batch),
+            Err(error) => self.handle_sequence_or_append_error(owner, error),
         }
     }
 
     fn handle_append_success(
         &self,
+        owner: &super::CommitDrainOwner,
         batch: CommitSequencerOrderedBatch<CommitAppendBatch, CommitQueueEntry>,
     ) {
+        if !batch.deferred.is_empty() {
+            owner.defer_entries(
+                batch
+                    .deferred
+                    .into_iter()
+                    .map(|ordered| ordered.payload)
+                    .collect(),
+            );
+        }
         for rejected in batch.rejected {
             self.completions.mark_rejected(
                 rejected.payload.completion,
@@ -769,6 +783,7 @@ impl CommitRuntimeInner {
 
     fn handle_sequence_or_append_error(
         &self,
+        owner: &super::CommitDrainOwner,
         error: CommitSequencerOrderedError<AppendCommitError, SequencedCommitJob, CommitQueueEntry>,
     ) {
         match error {
@@ -777,8 +792,17 @@ impl CommitRuntimeInner {
                 durable_committed,
                 accepted,
                 rejected,
+                deferred,
                 ..
             } => {
+                if !deferred.is_empty() {
+                    owner.defer_entries(
+                        deferred
+                            .into_iter()
+                            .map(|ordered| ordered.payload)
+                            .collect(),
+                    );
+                }
                 for rejected in rejected {
                     self.completions.mark_rejected(
                         rejected.payload.completion,

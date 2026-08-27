@@ -108,8 +108,9 @@ pub use sequencer::{
     CommitBackpressureSnapshot, CommitFenceRejectReason, CommitSequencer,
     CommitSequencerAppendError, CommitSequencerError, CommitSequencerMetrics,
     CommitSequencerOptions, CommitSequencerOrderedBatch, CommitSequencerOrderedError,
-    CommitSequencingPlan, InFlightAcceptedPlan, InFlightCommitBatch, OrderedCommitPlan,
-    RejectedCommitPlan, RejectedOrderedCommit, SequencedCommit, SequencedCommitBatch,
+    CommitSequencingPlan, CommitWriteConflictScope, InFlightAcceptedPlan, InFlightCommitBatch,
+    OrderedCommitPlan, RejectedCommitPlan, RejectedOrderedCommit, SequencedCommit,
+    SequencedCommitBatch,
 };
 pub use txn_record::{
     CommittedRecord, CommittedRecordApplier, CommittedTxnRecord, MaintenanceRecord, PublishResult,

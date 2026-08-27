@@ -316,7 +316,7 @@ impl GraphLayersBuilder {
     ) -> Result<()> {
         let entry_points = self.snapshot_entry_points();
         let proposal = self.propose_new_point(point_id, &entry_points, storage, distance)?;
-        self.publish_frozen_wave(vec![proposal], storage, distance, false);
+        self.publish_frozen_wave(vec![proposal], storage, distance, 1);
         Ok(())
     }
 
@@ -443,7 +443,7 @@ impl GraphLayersBuilder {
         mut proposals: Vec<FrozenPointProposal>,
         storage: &dyn VectorStorage,
         distance: DistanceMetric,
-        parallel: bool,
+        parallelism: usize,
     ) {
         proposals.sort_unstable_by_key(|proposal| proposal.point_id);
         let mut reciprocal = Vec::new();
@@ -514,8 +514,11 @@ impl GraphLayersBuilder {
                 }
             }
         };
-        if parallel {
-            groups.into_par_iter().for_each(publish_group);
+        if parallelism > 1 {
+            let chunk_size = groups.len().div_ceil(parallelism).max(1);
+            groups
+                .par_chunks(chunk_size)
+                .for_each(|chunk| chunk.iter().copied().for_each(&publish_group));
         } else {
             groups.into_iter().for_each(publish_group);
         }

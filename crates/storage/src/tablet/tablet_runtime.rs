@@ -25,12 +25,12 @@ use super::versioned_rowset_catalog::{
 use crate::compaction::plan::types::CumulativePointAction;
 use crate::compaction::publish::record::{
     CompactionPublishConflict, CompactionPublishConflictReason, CompactionPublishRecord,
-    RetiredInput,
+    PkPublishDelta, RetiredInput,
 };
 use crate::meta::TabletMetaManager;
 use crate::metrics::storage_metrics;
 use crate::primary_key::{
-    primary_key_hash, DeleteVector, PrimaryIndex, RowID, RssidManager,
+    primary_key_hash, DeleteVector, PersistentIndex, PrimaryIndex, RowID, RssidManager,
     PERSISTENT_INDEX_FORMAT_VERSION,
 };
 use crate::rowset::segment::{Segment, SegmentOptions, SegmentSharedPtr};
@@ -537,6 +537,12 @@ pub struct Tablet {
     /// the current layout. Ordinary reads never acquire this gate.
     layout_maintenance_gate: super::LayoutMaintenanceGate,
 
+    /// Serializes compaction preflight, durable append, and ordered apply for
+    /// one tablet. Unlike `meta_lock`, this guard may span a journal wait: no
+    /// transaction apply path acquires it, so it cannot invert tablet apply
+    /// ordering.
+    compaction_publish_lock: Mutex<()>,
+
     /// Outermost lock for every search-generation manifest/head transition.
     /// It is acquired before `meta_lock` and before registry definition locks,
     /// eliminating the rowset-publish (meta -> definition) versus maintenance
@@ -570,6 +576,11 @@ pub struct Tablet {
     /// In-memory primary index (L0) for PRIMARY_KEYS model.
     pub(super) primary_index: RwLock<Arc<PrimaryIndex>>,
 
+    /// Tablet-owned persistent primary-index view. Its immutable readers and
+    /// format proof live for the tablet lifetime instead of being rebuilt for
+    /// every missing-key probe.
+    pub(super) persistent_primary_index: RwLock<PersistentIndex>,
+
     /// Flush request flag for L0→L1 persistent index.
     pub(super) primary_index_flush_requested: Arc<AtomicBool>,
 
@@ -599,6 +610,12 @@ pub struct Tablet {
 /// lock for this tablet.
 pub(crate) struct SearchGenerationPublishGuard<'a> {
     tablet_id: TabletId,
+    _guard: MutexGuard<'a, ()>,
+}
+
+/// Typed proof that one compaction publication owns the tablet-local durable
+/// publication slot. This guard is intentionally independent of `meta_lock`.
+pub(crate) struct CompactionPublishGuard<'a> {
     _guard: MutexGuard<'a, ()>,
 }
 
@@ -646,6 +663,8 @@ impl Tablet {
         let applied_mutations = meta.applied_mutations().iter().copied().collect();
         let primary_index_flush_requested = Arc::new(AtomicBool::new(false));
         let primary_index = Arc::new(PrimaryIndex::new());
+        let persistent_primary_index =
+            PersistentIndex::open_rebuildable(data_dir.join("primary_index"))?;
         {
             let flush_flag = primary_index_flush_requested.clone();
             primary_index.register_mem_exceed_callback(move |_| {
@@ -672,6 +691,7 @@ impl Tablet {
             next_rowset_id: AtomicI64::new(1),
             layout_epoch: AtomicU64::new(layout_epoch),
             layout_maintenance_gate: super::LayoutMaintenanceGate::default(),
+            compaction_publish_lock: Mutex::new(()),
             search_generation_publish_lock: Mutex::new(()),
             applied_lsn: AtomicU64::new(applied_lsn),
             rssid_manager,
@@ -682,6 +702,7 @@ impl Tablet {
             rowset_maintenance_ids: RwLock::new(HashMap::new()),
             applied_mutations: RwLock::new(applied_mutations),
             primary_index: RwLock::new(primary_index),
+            persistent_primary_index: RwLock::new(persistent_primary_index),
             primary_index_flush_requested,
             primary_index_full: AtomicBool::new(true),
             statistics_cache: RwLock::new(None),
@@ -1085,6 +1106,10 @@ impl Tablet {
         self.layout_epoch.load(Ordering::Acquire)
     }
 
+    pub fn layout_maintenance_snapshot(&self) -> super::LayoutMaintenanceSnapshot {
+        self.layout_maintenance_gate.snapshot()
+    }
+
     pub fn acquire_stable_layout_lease(
         &self,
         owner_id: u64,
@@ -1128,6 +1153,20 @@ impl Tablet {
             tablet_id: self.tablet_id(),
             _guard: guard,
         })
+    }
+
+    pub(crate) fn acquire_compaction_publish_guard(&self) -> Result<CompactionPublishGuard<'_>> {
+        let guard = match self.compaction_publish_lock.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => {
+                tracing::error!(
+                    tablet_id = self.tablet_id(),
+                    "recovering poisoned compaction publication lock"
+                );
+                poisoned.into_inner()
+            }
+        };
+        Ok(CompactionPublishGuard { _guard: guard })
     }
 
     pub fn applied_lsn(&self) -> u64 {
@@ -3586,6 +3625,27 @@ impl Tablet {
     }
 
     pub(crate) fn apply_compaction_publish(&self, op: &TabletMutation) -> Result<()> {
+        self.apply_compaction_publish_with_context(op, None, 0)
+    }
+
+    /// Apply a durable compaction mutation in its ordered tablet lane while
+    /// using an ephemeral primary-index delta as an acceleration only. The
+    /// mutation remains independently replayable without the delta.
+    pub(crate) fn apply_compaction_publish_online(
+        &self,
+        op: &TabletMutation,
+        pk_delta: Option<&PkPublishDelta>,
+        maintenance_id: u64,
+    ) -> Result<()> {
+        self.apply_compaction_publish_with_context(op, pk_delta, maintenance_id)
+    }
+
+    fn apply_compaction_publish_with_context(
+        &self,
+        op: &TabletMutation,
+        pk_delta: Option<&PkPublishDelta>,
+        maintenance_id: u64,
+    ) -> Result<()> {
         let TabletMutation::PublishCompaction {
             output_rowset_id,
             output_version,
@@ -3651,6 +3711,22 @@ impl Tablet {
         };
 
         output.make_visible()?;
+        let checkpoint_ticket = self
+            .begin_checkpoint_compaction_publish()
+            .map(|mut ticket| {
+                if maintenance_id != 0 {
+                    ticket.maintenance_id = maintenance_id;
+                }
+                ticket
+            });
+        let output_maintenance_id = if maintenance_id != 0 {
+            maintenance_id
+        } else {
+            checkpoint_ticket
+                .as_ref()
+                .map(|ticket| ticket.maintenance_id)
+                .unwrap_or(0)
+        };
         self.with_meta_lock("apply compaction publish", || {
             self.install_compaction_publish_locked(
                 &live_inputs,
@@ -3659,7 +3735,7 @@ impl Tablet {
                     .map(Self::retired_input_from_op)
                     .collect::<Vec<_>>(),
                 output.clone(),
-                0,
+                output_maintenance_id,
                 match cumulative_point_action {
                     CompactionCumulativePointAction::Preserve => CumulativePointAction::Preserve,
                     CompactionCumulativePointAction::AdvanceToOutputEndExclusive => {
@@ -3667,10 +3743,22 @@ impl Tablet {
                     }
                 },
                 true,
-            )
+            )?;
+            if let Some(pk_delta) = pk_delta {
+                self.apply_compaction_publish_delta(
+                    output.rowset_id(),
+                    output.end_version(),
+                    pk_delta,
+                )?;
+            }
+            Ok(())
         })?;
+        if let Some(ticket) = checkpoint_ticket {
+            self.finish_checkpoint_compaction_publish(ticket);
+        }
         self.save_meta()?;
         self.validate_primary_index_consistency_after_compaction(output.as_ref())?;
+        self.maybe_flush_primary_index()?;
         Ok(())
     }
 

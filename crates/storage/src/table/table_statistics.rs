@@ -86,6 +86,22 @@ impl TableHandle {
             .hnsw_generation_statistics(definition_id)
     }
 
+    /// Number of independent immutable partitions searched by this
+    /// generation. Exposing fan-out makes background coalescing observable to
+    /// operators and benchmark harnesses instead of inferring it from latency.
+    pub fn search_generation_artifact_count(&self, definition_id: u64) -> Option<usize> {
+        self.search_registry
+            .generation_artifact_count(definition_id)
+    }
+
+    /// Provider work currently executing for this table. This is a lifecycle
+    /// signal, not a heuristic: a maintenance fence must not declare a
+    /// generation stable while catch-up or coalescing is still building its
+    /// replacement artifact.
+    pub fn active_search_maintenance_tasks(&self) -> usize {
+        self.search_registry.active_maintenance_tasks()
+    }
+
     /// Aggregate sparse vector index statistics across visible rowsets.
     pub fn sparse_index_statistics(&self, column_id: ColumnId) -> Option<SparseIndexStatistics> {
         let visible = self.max_version();

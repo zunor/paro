@@ -1732,6 +1732,35 @@ mod tests {
     }
 
     #[test]
+    fn primary_key_append_retains_fine_grained_commit_locks() {
+        let table = create_table_with_keys(
+            &[LogicalType::Integer, LogicalType::Integer],
+            KeysType::PrimaryKeys,
+        );
+        let txn = Transaction::new(9203, 9203);
+        txn.append_to_tablet(
+            CommandId::new(0),
+            table.tablet(),
+            &test_chunk_from_vectors(vec![test_i32_vector(&[1, 2]), test_i32_vector(&[10, 20])]),
+            SearchWriteContext::default(),
+        )
+        .expect("append primary-key batch");
+
+        let lock_set = txn.frozen_lock_set();
+        assert_eq!(
+            lock_set
+                .locks()
+                .iter()
+                .filter(|request| matches!(request.resource, LockResource::PrimaryKey { .. }))
+                .count(),
+            2
+        );
+        assert!(lock_set.locks().iter().any(|request| {
+            request.mode == LockMode::IX && matches!(request.resource, LockResource::Table { .. })
+        }));
+    }
+
+    #[test]
     fn test_storage_participant_state_is_resolved_from_transaction_view() {
         let txn = Transaction::new(9001, 9001);
         let states = ParticipantStateSet::from_vec(vec![txn.storage_participant_state()]);

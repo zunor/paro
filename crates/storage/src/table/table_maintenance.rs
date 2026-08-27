@@ -15,6 +15,21 @@ use std::sync::Arc;
 use std::time::Duration;
 
 const TABLE_SHUTDOWN_DRAIN_TIMEOUT: Duration = Duration::from_secs(30);
+const FOREGROUND_OPTIMIZE_DRAIN_TIMEOUT: Duration = Duration::from_secs(10 * 60);
+
+struct ForegroundCompactionRegistration {
+    manager: Arc<crate::compaction::compaction_manager::CompactionManager>,
+    tablet: Arc<crate::tablet::Tablet>,
+}
+
+impl Drop for ForegroundCompactionRegistration {
+    fn drop(&mut self) {
+        // `drain_tablet` keeps the tablet out of background admission. Restore
+        // that registration on every success/error exit from foreground
+        // OPTIMIZE so subsequent level-triggered maintenance remains live.
+        self.manager.register_tablet(Arc::clone(&self.tablet));
+    }
+}
 
 impl TableHandle {
     fn restore_runtime_indexes_for_rowset(&self, rowset_id: u64) -> Result<()> {
@@ -185,6 +200,50 @@ impl TableHandle {
             self.search_registry.refresh_after_rowset_replacement()?;
         }
         Ok(compacted)
+    }
+
+    /// Own compaction for this tablet until its current physical debt is
+    /// drained, then reconcile provider-owned derived state.
+    ///
+    /// An explicit OPTIMIZE is a foreground maintenance boundary, not a hint
+    /// for the periodic scheduler. It first removes the tablet from background
+    /// admission and drains any already accepted job, preventing two plans
+    /// from rebuilding the same immutable inputs. Planning is repeated after
+    /// every publication because each result changes the version graph.
+    pub fn optimize_all(&self, max_compactions: Option<usize>) -> Result<usize> {
+        let _registration = if let Some(manager) = self.bound_compaction_manager() {
+            manager.drain_tablet(
+                self.tablet_id(),
+                "foreground OPTIMIZE TABLE",
+                FOREGROUND_OPTIMIZE_DRAIN_TIMEOUT,
+            )?;
+            Some(ForegroundCompactionRegistration {
+                manager,
+                tablet: self.tablet(),
+            })
+        } else {
+            None
+        };
+
+        let limit = max_compactions.unwrap_or(usize::MAX);
+        let mut completed = 0usize;
+        while completed < limit && self.optimize_compact()? {
+            completed = completed.saturating_add(1);
+        }
+
+        // Physical publication normally installs one directly usable search
+        // artifact for the output rowset. Run provider maintenance to drain a
+        // remaining tail or manifest delta before reporting the explicit
+        // optimization complete; each sweep is one fair definition quantum.
+        for _ in 0..64 {
+            let report = self.search_derived_maintenance_sweep()?;
+            if !report.has_pending_work() {
+                return Ok(completed);
+            }
+        }
+        Err(paro_error::artifact_not_ready(
+            "OPTIMIZE TABLE exhausted its derived-search maintenance quanta",
+        ))
     }
 
     /// Validate that the committed rowset version graph is internally legal.

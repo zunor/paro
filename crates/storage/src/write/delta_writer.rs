@@ -878,16 +878,15 @@ impl DeltaWriter {
         };
 
         // Track written keys and prior locations for delete vector + index updates.
-        let mut prior_locs: Vec<Option<RowID>> = Vec::with_capacity(ordered_rows.len());
-
-        for (row_idx, (key, _)) in ordered_rows.iter().enumerate() {
-            let old = if let Some(base_rowids) = partial_base_rowids.as_ref() {
-                Some(base_rowids[row_idx])
-            } else {
-                self.lookup_visible_primary_key(key)?
-            };
-            prior_locs.push(old);
-        }
+        let prior_locs = if let Some(base_rowids) = partial_base_rowids.as_ref() {
+            base_rowids.iter().copied().map(Some).collect::<Vec<_>>()
+        } else {
+            let keys = ordered_rows
+                .iter()
+                .map(|(key, _)| key.clone())
+                .collect::<Vec<_>>();
+            self.lookup_visible_primary_keys(&keys)?
+        };
 
         for row_id in prior_locs.iter().flatten() {
             self.mark_delete(*row_id)?;
@@ -978,14 +977,31 @@ impl DeltaWriter {
         Ok(())
     }
 
-    fn lookup_visible_primary_key(&self, key: &[u8]) -> Result<Option<RowID>> {
-        if let Some(row_id) = self.primary_key_overlay.get(key) {
-            return Ok(*row_id);
+    fn lookup_visible_primary_keys(&self, keys: &[Vec<u8>]) -> Result<Vec<Option<RowID>>> {
+        let mut resolved = vec![None; keys.len()];
+        let mut missing_positions = Vec::new();
+        let mut missing_keys = Vec::new();
+        for (position, key) in keys.iter().enumerate() {
+            if let Some(row_id) = self.primary_key_overlay.get(key) {
+                resolved[position] = *row_id;
+            } else {
+                missing_positions.push(position);
+                missing_keys.push(key.clone());
+            }
         }
-        if let Some(read_ts) = self.read_ts {
-            return self.tablet.lookup_primary_key_at(key, read_ts.into_raw());
+        if missing_keys.is_empty() {
+            return Ok(resolved);
         }
-        self.tablet.lookup_primary_key(key)
+        let persisted = if let Some(read_ts) = self.read_ts {
+            self.tablet
+                .lookup_primary_keys_at(&missing_keys, read_ts.into_raw())?
+        } else {
+            self.tablet.lookup_primary_keys(&missing_keys)?
+        };
+        for (position, row_id) in missing_positions.into_iter().zip(persisted) {
+            resolved[position] = row_id;
+        }
+        Ok(resolved)
     }
 }
 

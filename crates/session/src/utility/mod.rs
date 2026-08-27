@@ -31,6 +31,9 @@ pub(crate) async fn execute_utility_command<S: ResultSink>(
         }
         UtilityCommand::Discard(stmt) => discard::execute_discard(session, stmt.target, sink).await,
         UtilityCommand::Checkpoint(_) => maintenance::execute_checkpoint(session, sink).await,
+        UtilityCommand::OptimizeTable(stmt) => {
+            maintenance::execute_optimize_table(session, &stmt, sink).await
+        }
         UtilityCommand::CreateDatabase(stmt) => {
             database_ddl::execute_create_database(session, &stmt, sink).await
         }

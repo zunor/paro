@@ -739,16 +739,32 @@ fn populate_paro_indexes(global_state: &mut dyn GlobalTableFunctionState, ctx: &
                                 .unwrap_or(0);
                             let extra_info = match idx.index_type {
                                 IndexType::HNSW => {
-                                    let stats = table_entry
-                                        .and_then(|table| table.get_storage())
-                                        .map(|storage| {
-                                            storage.hnsw_generation_statistics(
-                                                idx.base.base.object_id.raw(),
-                                            )
-                                        });
+                                    let storage = table_entry.and_then(|table| table.get_storage());
+                                    let stats = storage.map(|storage| {
+                                        storage.hnsw_generation_statistics(
+                                            idx.base.base.object_id.raw(),
+                                        )
+                                    });
                                     if let Some(Ok(Some(stats))) = stats.as_ref() {
                                         entry_count =
                                             stats.num_indexed_vectors.min(i64::MAX as usize) as i64;
+                                        let artifact_count = storage.and_then(|storage| {
+                                            storage.search_generation_artifact_count(
+                                                idx.base.base.object_id.raw(),
+                                            )
+                                        });
+                                        let maintenance = storage.map(|storage| {
+                                            let tablet = storage.tablet();
+                                            let layout = tablet.layout_maintenance_snapshot();
+                                            json!({
+                                                "active_search_tasks": storage.active_search_maintenance_tasks(),
+                                                "rowset_count": tablet.num_rowsets(),
+                                                "layout_epoch": tablet.layout_epoch(),
+                                                "layout_shared_holders": layout.shared_holders,
+                                                "layout_exclusive_holders": layout.exclusive_holders,
+                                                "layout_exclusive_waiters": layout.exclusive_waiters,
+                                            })
+                                        });
                                         json!({
                                             "column_ids": idx.get_column_ids().iter().map(|column_id| column_id.index).collect::<Vec<_>>(),
                                             "column_names": column_names,
@@ -758,6 +774,8 @@ fn populate_paro_indexes(global_state: &mut dyn GlobalTableFunctionState, ctx: &
                                             "max_level": stats.max_level,
                                             "m": stats.m,
                                             "ef_construction": stats.ef_construction,
+                                            "artifact_count": artifact_count,
+                                            "maintenance": maintenance,
                                             "provider_config": &idx.provider_config,
                                             "failure_reason": idx.failure_reason(),
                                             "coverage": idx.coverage().map(|coverage| {

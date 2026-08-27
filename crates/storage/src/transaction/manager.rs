@@ -949,8 +949,12 @@ impl TransactionManager {
         let retention = self.retention_registry.watermarks();
         let read_snapshot_lease_count = retention.lease_count(RetentionLeaseKind::ReadSnapshot);
         let conflict = self.write_conflict_index.stats();
-        let lock = self.lock_manager.stats();
-        let read_dependency = self.read_dependency_index.stats();
+        // Foreground statements freeze this snapshot.  Only consume the
+        // lock-free operational counters here; exact live lock/dependency
+        // cardinalities are explicit diagnostic operations because they walk
+        // every synchronization shard.
+        let lock = self.lock_manager.contention_stats();
+        let read_dependency = self.read_dependency_index.telemetry_counters();
         let ssi_abort_due_to_exact_dependency = self
             .ssi_abort_due_to_exact_dependency
             .load(Ordering::Acquire);

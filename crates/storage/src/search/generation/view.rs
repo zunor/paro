@@ -150,6 +150,14 @@ pub(crate) struct SearchView {
 }
 
 impl SearchView {
+    pub(crate) fn generation_artifact_count(&self, definition_id: u64) -> Option<usize> {
+        self.definitions
+            .get(&definition_id)?
+            .manifest
+            .as_ref()
+            .map(|manifest| manifest.artifacts.artifacts.len())
+    }
+
     pub(crate) fn hnsw_generation_statistics(
         &self,
         definition_id: u64,

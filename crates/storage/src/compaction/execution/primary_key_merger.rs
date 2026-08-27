@@ -213,13 +213,16 @@ impl PrimaryKeyMerger {
                 .map(|input| input.rowset.end_version())
                 .max()
                 .unwrap_or(-1),
+            // Transfer key ownership into the publication delta. Cloning every
+            // encoded key here used to retain a second full key payload at the
+            // peak of large PK compactions.
             upsert_candidates: latest
-                .iter()
+                .into_iter()
                 .map(
                     |(key, (output_location, source_location))| PkIndexUpsertCandidate {
-                        key: key.clone(),
-                        output_location: *output_location,
-                        source_location: *source_location,
+                        key,
+                        output_location,
+                        source_location,
                     },
                 )
                 .collect(),

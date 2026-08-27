@@ -18,6 +18,19 @@ struct GateState {
     exclusive_waiters: usize,
 }
 
+/// Non-blocking observability for a tablet's physical-layout lifecycle.
+///
+/// A maintenance fence can use this together with the tablet rowset graph to
+/// distinguish a stable layout from the publication window of an in-flight
+/// compaction or staged generation build.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct LayoutMaintenanceSnapshot {
+    pub shared_holders: usize,
+    pub exclusive_owner: Option<u64>,
+    pub exclusive_holders: usize,
+    pub exclusive_waiters: usize,
+}
+
 #[derive(Debug, Default)]
 struct GateInner {
     state: Mutex<GateState>,
@@ -36,6 +49,16 @@ pub struct LayoutMaintenanceGate {
 }
 
 impl LayoutMaintenanceGate {
+    pub fn snapshot(&self) -> LayoutMaintenanceSnapshot {
+        let state = self.lock_state("snapshot layout maintenance gate");
+        LayoutMaintenanceSnapshot {
+            shared_holders: state.shared_holders,
+            exclusive_owner: state.exclusive_owner,
+            exclusive_holders: state.exclusive_holders,
+            exclusive_waiters: state.exclusive_waiters,
+        }
+    }
+
     /// Foreground storage publication waits for the stable-layout owner.
     ///
     /// DML acquires this lease during commit preparation, before transaction
@@ -236,6 +259,23 @@ mod tests {
         let _exclusive = gate.acquire_exclusive(7, || false).unwrap();
         let err = gate.acquire_shared(|| true).unwrap_err();
         assert!(err.is_query_canceled());
+    }
+
+    #[test]
+    fn snapshot_tracks_active_layout_leases() {
+        let gate = LayoutMaintenanceGate::default();
+        assert_eq!(gate.snapshot(), LayoutMaintenanceSnapshot::default());
+
+        let shared = gate.try_acquire_shared().unwrap().unwrap();
+        assert_eq!(gate.snapshot().shared_holders, 1);
+        drop(shared);
+
+        let exclusive = gate.acquire_exclusive(17, || false).unwrap();
+        let snapshot = gate.snapshot();
+        assert_eq!(snapshot.exclusive_owner, Some(17));
+        assert_eq!(snapshot.exclusive_holders, 1);
+        drop(exclusive);
+        assert_eq!(gate.snapshot(), LayoutMaintenanceSnapshot::default());
     }
 
     #[test]

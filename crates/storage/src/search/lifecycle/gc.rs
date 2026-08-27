@@ -15,7 +15,7 @@ impl ArtifactGcPolicy for HnswGcPolicy {
             GcDecision::Rebuild
         } else if tombstone_ratio >= 0.05 && context.query_pressure.unwrap_or_default() >= 0.7 {
             GcDecision::Heal
-        } else if context.bytes_on_disk >= 256 * 1024 * 1024 {
+        } else if hnsw_generation_needs_compaction(context) {
             GcDecision::CompactOnly
         } else {
             GcDecision::Skip
@@ -28,7 +28,7 @@ impl ArtifactGcPolicy for SparseGcPolicy {
         let tombstone_ratio = context.tombstone_ratio.unwrap_or_default();
         if tombstone_ratio >= 0.35 {
             GcDecision::Rebuild
-        } else if context.bytes_on_disk >= 128 * 1024 * 1024 {
+        } else if context.artifact_count >= 32 {
             GcDecision::CompactOnly
         } else {
             GcDecision::Skip
@@ -43,12 +43,29 @@ impl ArtifactGcPolicy for FullTextGcPolicy {
             GcDecision::Rebuild
         } else if tombstone_ratio >= 0.1 && context.query_pressure.unwrap_or_default() >= 0.6 {
             GcDecision::Heal
-        } else if context.bytes_on_disk >= 128 * 1024 * 1024 {
+        } else if context.artifact_count >= 32 {
             GcDecision::CompactOnly
         } else {
             GcDecision::Skip
         }
     }
+}
+
+/// HNSW compaction is a levelled fan-out policy. Absolute artifact size is
+/// not garbage: rebuilding one already-coarse graph because it exceeds a byte
+/// threshold creates an endless rewrite loop. Compact when accumulated small
+/// partitions form a meaningful next level, or when fan-out itself reaches a
+/// hard ceiling.
+fn hnsw_generation_needs_compaction(context: &ArtifactGcContext) -> bool {
+    if context.artifact_count <= 1 {
+        return false;
+    }
+    let rows_outside_largest = context
+        .indexed_rows
+        .saturating_sub(context.largest_artifact_rows);
+    let level_target = context.largest_artifact_rows.div_ceil(4).max(32_768);
+    context.artifact_count >= 32
+        || (context.artifact_count >= 8 && rows_outside_largest >= level_target)
 }
 
 pub(crate) fn gc_policy_for_kind(kind: SearchIndexKind) -> &'static dyn ArtifactGcPolicy {
@@ -77,7 +94,7 @@ mod tests {
         );
         assert_eq!(
             gc_policy_for_kind(SearchIndexKind::Sparse).should_gc(&ArtifactGcContext {
-                bytes_on_disk: 129 * 1024 * 1024,
+                artifact_count: 32,
                 ..ArtifactGcContext::default()
             }),
             GcDecision::CompactOnly
@@ -89,6 +106,30 @@ mod tests {
                 ..ArtifactGcContext::default()
             }),
             GcDecision::Heal
+        );
+    }
+
+    #[test]
+    fn hnsw_compaction_is_levelled_and_stable_after_coalescing() {
+        let policy = gc_policy_for_kind(SearchIndexKind::Hnsw);
+        assert_eq!(
+            policy.should_gc(&ArtifactGcContext {
+                bytes_on_disk: 2 * 1024 * 1024 * 1024,
+                artifact_count: 1,
+                indexed_rows: 500_000,
+                largest_artifact_rows: 500_000,
+                ..ArtifactGcContext::default()
+            }),
+            GcDecision::Skip
+        );
+        assert_eq!(
+            policy.should_gc(&ArtifactGcContext {
+                artifact_count: 26,
+                indexed_rows: 500_000,
+                largest_artifact_rows: 400_000,
+                ..ArtifactGcContext::default()
+            }),
+            GcDecision::CompactOnly
         );
     }
 }

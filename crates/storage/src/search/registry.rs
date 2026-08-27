@@ -4,6 +4,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard, RwLock};
 use std::time::{Duration, Instant};
 
@@ -102,7 +103,18 @@ struct MaintenanceFailureBackoff {
 struct SearchIngestAdmissionState {
     reserved_rows: u64,
     reserved_bytes: u64,
+    /// Committed rowsets not yet represented by a durable generation
+    /// manifest. Deferred HNSW publication deliberately does not write one
+    /// manifest revision per foreground transaction, so manifest tail counts
+    /// alone are not a level-triggered measure of current debt.
+    unmanifested_hnsw: BTreeMap<u64, BTreeMap<RowsetId, SearchIngestDebt>>,
     progress_epoch: u64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct SearchIngestDebt {
+    rows: u64,
+    bytes: u64,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -112,6 +124,23 @@ struct HnswIngestAdmissionBlocker {
     pending_bytes: u64,
     row_limit: u64,
     byte_limit: u64,
+}
+
+struct ActiveSearchMaintenance<'a> {
+    count: &'a AtomicUsize,
+}
+
+impl<'a> ActiveSearchMaintenance<'a> {
+    fn enter(count: &'a AtomicUsize) -> Self {
+        count.fetch_add(1, Ordering::AcqRel);
+        Self { count }
+    }
+}
+
+impl Drop for ActiveSearchMaintenance<'_> {
+    fn drop(&mut self) {
+        self.count.fetch_sub(1, Ordering::AcqRel);
+    }
 }
 
 pub(crate) struct SearchIndexRegistry {
@@ -138,6 +167,12 @@ pub(crate) struct SearchIndexRegistry {
     hnsw_task_scheduler: RwLock<Option<Arc<TaskScheduler>>>,
     maintenance_notifier: RwLock<Option<Arc<dyn Fn(SearchMaintenanceUrgency) + Send + Sync>>>,
     maintenance_failures: Mutex<BTreeMap<u64, MaintenanceFailureBackoff>>,
+    active_maintenance_tasks: AtomicUsize,
+    /// Monotonic foreground-ingest epoch used to preempt optional
+    /// whole-generation work as soon as a writer reserves publication
+    /// capacity. Waiting for `rowset_published` is too late: enough admitted
+    /// commits can fill the bounded tail before any ordered apply completes.
+    foreground_ingest_epoch: Arc<AtomicU64>,
     ingest_admission: Mutex<SearchIngestAdmissionState>,
     maintenance_progress_changed: Condvar,
 }
@@ -168,15 +203,12 @@ impl RowsetPublishObserver for SearchIndexRegistry {
             .lock()
             .map_err(|_| paro_error::internal("lock search ingest admission"))?;
         loop {
-            let blocked = self.hnsw_ingest_admission_blocker(
-                incoming_rows,
-                incoming_bytes,
-                admission.reserved_rows,
-                admission.reserved_bytes,
-            );
+            let blocked =
+                self.hnsw_ingest_admission_blocker(incoming_rows, incoming_bytes, &admission);
             let Some(blocker) = blocked else {
                 admission.reserved_rows = admission.reserved_rows.saturating_add(incoming_rows);
                 admission.reserved_bytes = admission.reserved_bytes.saturating_add(incoming_bytes);
+                self.foreground_ingest_epoch.fetch_add(1, Ordering::Release);
                 return Ok(());
             };
             if blocker.pending_rows == 0
@@ -271,6 +303,7 @@ impl RowsetPublishObserver for SearchIndexRegistry {
         if tablet_id != self.tablet.tablet_id() {
             return;
         }
+        self.record_unmanifested_hnsw_rowset(&rowset);
         let (prepared, stale_definition_ids) = search_updates.into_parts();
         let maintenance_needed = !prepared.is_empty()
             || !stale_definition_ids.is_empty()
@@ -392,21 +425,35 @@ impl SearchIndexRegistry {
         &self,
         incoming_rows: u64,
         incoming_bytes: u64,
-        reserved_rows: u64,
-        reserved_bytes: u64,
+        admission: &SearchIngestAdmissionState,
     ) -> Option<HnswIngestAdmissionBlocker> {
         self.view.load().definitions.values().find_map(|state| {
             if state.definition.kind != SearchIndexKind::Hnsw {
                 return None;
             }
             let manifest = state.manifest.as_ref()?;
-            let pending_rows = manifest.root.maintenance_state.recovery.tail_pending_rows;
-            let pending_bytes = manifest
+            let manifest_pending_rows = manifest.root.maintenance_state.recovery.tail_pending_rows;
+            let manifest_pending_bytes = manifest
                 .tail_pending_entries
                 .iter()
                 .filter(|entry| entry.mutation != TailMutationKind::Delete)
                 .map(|entry| entry.byte_count)
                 .sum::<u64>();
+            let accounted_rowsets = manifest_accounted_rowsets(manifest);
+            let (unmanifested_rows, unmanifested_bytes) = admission
+                .unmanifested_hnsw
+                .get(&state.definition.definition_id)
+                .into_iter()
+                .flat_map(|rowsets| rowsets.iter())
+                .filter(|(rowset_id, _)| !accounted_rowsets.contains(rowset_id))
+                .fold((0u64, 0u64), |(rows, bytes), (_, debt)| {
+                    (
+                        rows.saturating_add(debt.rows),
+                        bytes.saturating_add(debt.bytes),
+                    )
+                });
+            let pending_rows = manifest_pending_rows.saturating_add(unmanifested_rows);
+            let pending_bytes = manifest_pending_bytes.saturating_add(unmanifested_bytes);
             let exact_limit =
                 provider_tail_exact_merge_policy(SearchIndexKind::Hnsw).hard_row_limit;
             let row_limit = match state.definition.freshness_policy {
@@ -419,11 +466,11 @@ impl SearchIndexRegistry {
             let byte_limit = TailExactMergeBudget::for_search_kind(SearchIndexKind::Hnsw)
                 .max_tail_exact_merge_bytes;
             (pending_rows
-                .saturating_add(reserved_rows)
+                .saturating_add(admission.reserved_rows)
                 .saturating_add(incoming_rows)
                 > row_limit
                 || pending_bytes
-                    .saturating_add(reserved_bytes)
+                    .saturating_add(admission.reserved_bytes)
                     .saturating_add(incoming_bytes)
                     > byte_limit)
                 .then_some(HnswIngestAdmissionBlocker {
@@ -434,6 +481,44 @@ impl SearchIndexRegistry {
                     byte_limit,
                 })
         })
+    }
+
+    fn record_unmanifested_hnsw_rowset(&self, rowset: &RowsetSharedPtr) {
+        let definition_ids = self
+            .view
+            .load()
+            .definitions
+            .values()
+            .filter(|state| {
+                state.definition.kind == SearchIndexKind::Hnsw
+                    && !matches!(
+                        state.definition.freshness_policy,
+                        SearchFreshnessPolicy::Required
+                    )
+            })
+            .map(|state| state.definition.definition_id)
+            .collect::<Vec<_>>();
+        if definition_ids.is_empty() {
+            return;
+        }
+        let rows = rowset.num_rows();
+        let bytes = match rowset.total_disk_size() {
+            0 => rows.saturating_mul(64),
+            bytes => bytes,
+        };
+        let mut admission = self
+            .ingest_admission
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        for definition_id in definition_ids {
+            admission
+                .unmanifested_hnsw
+                .entry(definition_id)
+                .or_default()
+                .insert(rowset.rowset_id(), SearchIngestDebt { rows, bytes });
+        }
+        admission.progress_epoch = admission.progress_epoch.saturating_add(1);
+        self.maintenance_progress_changed.notify_all();
     }
 
     fn disable_definition_capability(&self, definition_id: u64) -> Result<()> {
@@ -466,6 +551,8 @@ impl SearchIndexRegistry {
             hnsw_task_scheduler: RwLock::new(None),
             maintenance_notifier: RwLock::new(None),
             maintenance_failures: Mutex::new(BTreeMap::new()),
+            active_maintenance_tasks: AtomicUsize::new(0),
+            foreground_ingest_epoch: Arc::new(AtomicU64::new(0)),
             ingest_admission: Mutex::new(SearchIngestAdmissionState::default()),
             maintenance_progress_changed: Condvar::new(),
         };
@@ -830,6 +917,14 @@ impl SearchIndexRegistry {
         self.view.load().hnsw_generation_statistics(definition_id)
     }
 
+    pub(crate) fn generation_artifact_count(&self, definition_id: u64) -> Option<usize> {
+        self.view.load().generation_artifact_count(definition_id)
+    }
+
+    pub(crate) fn active_maintenance_tasks(&self) -> usize {
+        self.active_maintenance_tasks.load(Ordering::Acquire)
+    }
+
     pub(crate) fn hnsw_filter_topology(
         &self,
         column_id: ColumnId,
@@ -928,7 +1023,7 @@ impl SearchIndexRegistry {
         let Some(generation) = &state.generation else {
             return Ok(OpenSearchCursorResult::NotQueryable);
         };
-        if token.is_generation_stale(generation.generation_id) {
+        if token.is_stale(generation.generation_id, generation.root_version) {
             return Ok(OpenSearchCursorResult::CapabilityTokenStale);
         }
         if !token.is_queryable()
@@ -1042,7 +1137,7 @@ impl SearchIndexRegistry {
         }
 
         let sidecar_store = SidecarArtifactStore::new(self.tablet.data_dir().clone());
-        let builder = ProviderSidecarArtifactBuilder::new(sidecar_store.clone());
+        let builder = ProviderSidecarArtifactBuilder::for_maintenance(sidecar_store.clone());
         let input = super::inline_sink::SidecarBuildInput {
             definition: state.definition.clone(),
             generation_id: manifest.root.generation_id,
@@ -1129,6 +1224,198 @@ impl SearchIndexRegistry {
         record_tail_metrics_for_state(&next_state);
         self.signal_maintenance_progress()?;
         Ok(touched)
+    }
+
+    /// Coalesce an immutable HNSW artifact prefix without rewriting table
+    /// rowsets. Provider work runs against retained rowset handles; publish
+    /// replaces only the exact artifact identities captured at the start, so
+    /// concurrent ingest can append disjoint tail/artifacts and be rebased.
+    pub(crate) fn compact_hnsw_generation(
+        &self,
+        definition_id: u64,
+        force_rebuild: bool,
+    ) -> Result<bool> {
+        self.ensure_fresh();
+        let _build_guard = self.lock_definition_build(definition_id);
+        let current = self.view.load_full();
+        let Some(state) = current.definitions.get(&definition_id).cloned() else {
+            return Ok(false);
+        };
+        drop(current);
+        if state.definition.kind != SearchIndexKind::Hnsw {
+            return Ok(false);
+        }
+        let Some(manifest) = state.manifest.as_ref() else {
+            return Ok(false);
+        };
+        let selected_artifacts = manifest.artifacts.artifacts.clone();
+        if selected_artifacts.is_empty() || (!force_rebuild && selected_artifacts.len() <= 1) {
+            return Ok(false);
+        }
+        if !force_rebuild
+            && crate::compaction::plan::CompactionPlanner::plan(self.tablet.as_ref())?.is_some()
+        {
+            // A physical rowset compaction rebuilds the HNSW coverage for its
+            // output and publishes that coverage with the rowset mutation.
+            // Coalescing the current generation while that rewrite is
+            // eligible would build the same logical graph twice: once over
+            // soon-to-be-retired rowset identities and once over the compacted
+            // output.  Prefer the physical rewrite and let the next
+            // level-triggered sweep observe its published generation.
+            return Ok(false);
+        }
+        {
+            let admission = self
+                .ingest_admission
+                .lock()
+                .map_err(|_| paro_error::internal("lock search ingest admission"))?;
+            let has_unmanifested_debt = admission
+                .unmanifested_hnsw
+                .get(&definition_id)
+                .is_some_and(|rowsets| !rowsets.is_empty());
+            if admission.reserved_rows > 0
+                || admission.reserved_bytes > 0
+                || has_unmanifested_debt
+                || manifest.root.maintenance_state.recovery.tail_pending_rows > 0
+            {
+                // Generation compaction is optional and must never enter the
+                // build executor ahead of freshness work already admitted by
+                // foreground writers.
+                return Ok(false);
+            }
+        }
+        let generation_id = state
+            .generation
+            .as_ref()
+            .ok_or_else(|| paro_error::internal("HNSW compaction requires a generation"))?
+            .generation_id;
+
+        let snapshot_version = self.tablet.max_version();
+        let visible_rowsets = self.tablet.capture_consistent_rowsets(snapshot_version)?;
+        let visible_by_id = visible_rowsets
+            .into_iter()
+            .map(|rowset| (rowset.rowset_id(), rowset))
+            .collect::<BTreeMap<_, _>>();
+        let (tail_window, rowset_refs) =
+            hnsw_compaction_build_input(&selected_artifacts, &visible_by_id)?;
+        if tail_window.is_empty() {
+            return Ok(false);
+        }
+
+        let sidecar_store = SidecarArtifactStore::new(self.tablet.data_dir().clone());
+        let builder = ProviderSidecarArtifactBuilder::for_maintenance(sidecar_store.clone());
+        let build_epoch = self.foreground_ingest_epoch.load(Ordering::Acquire);
+        let foreground_epoch = Arc::clone(&self.foreground_ingest_epoch);
+        let stop_check = SearchBuildStopCheck::new(move || {
+            foreground_epoch.load(Ordering::Acquire) != build_epoch
+        });
+        let input = SidecarBuildInput {
+            definition: state.definition.clone(),
+            generation_id,
+            tail_window,
+            rowset_refs,
+            snapshot_version,
+            stop_check: Some(stop_check),
+        };
+        let estimate = builder.estimate_cost(&input)?;
+        let result = match builder.build(
+            input,
+            &BuildBudget {
+                cost_envelope: estimate.cost,
+                deadline: None,
+                grant_id: None,
+            },
+        ) {
+            Ok(result) => result,
+            Err(error)
+                if error.is_query_canceled()
+                    && self.foreground_ingest_epoch.load(Ordering::Acquire) != build_epoch =>
+            {
+                // Foreground freshness debt preempts optional graph
+                // coalescing. The level-triggered scheduler will select
+                // CatchUp on the next pass, while this compaction remains
+                // eligible after the table becomes quiet.
+                return Ok(false);
+            }
+            Err(error) => return Err(error),
+        };
+        let sidecar_file_ids = sidecar_file_ids_for_artifacts(&result.artifact_refs);
+        if let Err(error) = validate_hnsw_compaction_result(
+            &state.definition,
+            generation_id,
+            &selected_artifacts,
+            &result.artifact_refs,
+        ) {
+            remove_sidecar_packages(&sidecar_store, &sidecar_file_ids);
+            return Err(error);
+        }
+
+        // Re-enter the ordered publication section only after the graph has
+        // been built. Every selected artifact must still be present verbatim;
+        // otherwise rowset replacement or another compaction won the race.
+        let publication_guard = self.tablet.acquire_search_generation_publish_guard()?;
+        let definition_lock = self.definition_lock(definition_id);
+        let _guard = definition_lock
+            .lock()
+            .map_err(|_| paro_error::internal("lock search definition publish lock"))?;
+        let latest = self.view.load_full();
+        let Some(latest_state) = latest.definitions.get(&definition_id).cloned() else {
+            remove_sidecar_packages(&sidecar_store, &sidecar_file_ids);
+            return Ok(false);
+        };
+        drop(latest);
+        let selected_still_live = latest_state.definition == state.definition
+            && latest_state.origin == state.origin
+            && latest_state
+                .generation
+                .as_ref()
+                .is_some_and(|generation| generation.generation_id == generation_id)
+            && latest_state.manifest.as_ref().is_some_and(|manifest| {
+                selected_artifacts.iter().all(|selected| {
+                    manifest
+                        .artifacts
+                        .artifacts
+                        .iter()
+                        .any(|current| current == selected)
+                })
+            });
+        if !selected_still_live {
+            remove_sidecar_packages(&sidecar_store, &sidecar_file_ids);
+            return Ok(false);
+        }
+
+        let next_state = match self.publish_hnsw_compaction_delta(
+            &latest_state,
+            &selected_artifacts,
+            result.artifact_refs,
+        ) {
+            Ok(next_state) => next_state,
+            Err(error) => {
+                remove_sidecar_packages(&sidecar_store, &sidecar_file_ids);
+                return Err(error);
+            }
+        };
+        let completion = match publish_head_for_state(
+            &self.tablet,
+            &self.manifests,
+            &next_state,
+            &publication_guard,
+        ) {
+            Ok(completion) => completion,
+            Err(error) => {
+                self.retire_unpublished_revision(&latest_state, &next_state);
+                return Err(error);
+            }
+        };
+        let view_result =
+            self.publish_durable_revision_state(&latest_state, next_state, &completion);
+        drop(_guard);
+        drop(publication_guard);
+        completion.finish()?;
+        view_result?;
+        self.sweep_retired();
+        self.signal_maintenance_progress()?;
+        Ok(true)
     }
 
     /// A catch-up build owns a frozen prefix, not the whole manifest head.
@@ -1235,6 +1522,15 @@ impl SearchIndexRegistry {
                     .iter()
                     .map(|artifact| artifact.stats.bytes_on_disk)
                     .sum(),
+                artifact_count: manifest.artifacts.artifacts.len(),
+                indexed_rows: manifest.root.generation_stats.indexed_rows,
+                largest_artifact_rows: manifest
+                    .artifacts
+                    .artifacts
+                    .iter()
+                    .map(|artifact| artifact.stats.row_count)
+                    .max()
+                    .unwrap_or_default(),
                 tombstone_ratio: Some(
                     manifest.root.maintenance_state.tombstone_ratio_millis as f32 / 1000.0,
                 ),
@@ -1325,6 +1621,8 @@ impl SearchIndexRegistry {
         // definition set cannot monopolize the shared HNSW build executor.
         if let Some(task) = self.maintenance_scheduler.pop_next_task() {
             let _grant_lease = self.maintenance_scheduler.scoped_task_lease(&task);
+            let _active_maintenance =
+                ActiveSearchMaintenance::enter(&self.active_maintenance_tasks);
             let definition_id = task.request.definition_id;
             let task_result = match task.request.action {
                 SearchMaintenanceAction::CatchUp => self
@@ -1336,9 +1634,15 @@ impl SearchIndexRegistry {
                 SearchMaintenanceAction::RepackSidecar => self
                     .repack_sidecars_for_definition(definition_id)
                     .map(|repacked| (repacked > 0, 0)),
-                SearchMaintenanceAction::Compact | SearchMaintenanceAction::Rebuild => {
+                SearchMaintenanceAction::Compact => {
                     report.compaction_requested = true;
-                    Ok((false, 0))
+                    self.compact_hnsw_generation(definition_id, false)
+                        .map(|updated| (updated, 0))
+                }
+                SearchMaintenanceAction::Rebuild => {
+                    report.compaction_requested = true;
+                    self.compact_hnsw_generation(definition_id, true)
+                        .map(|updated| (updated, 0))
                 }
                 SearchMaintenanceAction::Skip => Ok((false, 0)),
             };
@@ -1390,10 +1694,38 @@ impl SearchIndexRegistry {
     }
 
     fn signal_maintenance_progress(&self) -> Result<()> {
+        let current = self.view.load_full();
+        let visible_rowset_ids = self
+            .tablet
+            .capture_consistent_rowsets(self.tablet.max_version())?
+            .into_iter()
+            .map(|rowset| rowset.rowset_id())
+            .collect::<BTreeSet<_>>();
+        let accounted_by_definition = current
+            .definitions
+            .iter()
+            .filter_map(|(definition_id, state)| {
+                state
+                    .manifest
+                    .as_ref()
+                    .map(|manifest| (*definition_id, manifest_accounted_rowsets(manifest)))
+            })
+            .collect::<BTreeMap<_, _>>();
         let mut admission = self
             .ingest_admission
             .lock()
             .map_err(|_| paro_error::internal("lock search maintenance progress"))?;
+        admission
+            .unmanifested_hnsw
+            .retain(|definition_id, rowsets| {
+                let Some(accounted) = accounted_by_definition.get(definition_id) else {
+                    return false;
+                };
+                rowsets.retain(|rowset_id, _| {
+                    visible_rowset_ids.contains(rowset_id) && !accounted.contains(rowset_id)
+                });
+                !rowsets.is_empty()
+            });
         admission.progress_epoch = admission.progress_epoch.saturating_add(1);
         self.maintenance_progress_changed.notify_all();
         Ok(())
@@ -1667,21 +1999,15 @@ impl SearchIndexRegistry {
         }
 
         let visible_version = self.tablet.max_version();
-        if !force
-            && state
-                .generation
-                .as_ref()
-                .is_some_and(|generation| generation.build_snapshot_version == visible_version)
-        {
-            return Ok(state.capability.clone());
-        }
-
         let visible_rowsets = self.tablet.capture_consistent_rowsets(visible_version)?;
         drop(_guard);
         drop(publication_guard);
 
         let next_state =
             self.refresh_state_from_snapshot(&state, visible_version, &visible_rowsets, force)?;
+        if head_for_state(&self.manifests, &next_state) == head_for_state(&self.manifests, &state) {
+            return Ok(state.capability.clone());
+        }
 
         let publication_guard = self.tablet.acquire_search_generation_publish_guard()?;
         let definition_lock = self.definition_lock(definition_id);
@@ -1731,6 +2057,7 @@ impl SearchIndexRegistry {
         completion.finish()?;
         view_result?;
         self.sweep_retired();
+        self.signal_maintenance_progress()?;
         Ok(next_state.capability)
     }
 
@@ -2442,6 +2769,93 @@ impl SearchIndexRegistry {
         Ok(next_state)
     }
 
+    fn publish_hnsw_compaction_delta(
+        &self,
+        state: &SearchDefinitionState,
+        removed_artifacts: &[SearchArtifactRef],
+        mut added_artifacts: Vec<SearchArtifactRef>,
+    ) -> Result<SearchDefinitionState> {
+        let started_at = Instant::now();
+        let current_manifest = state.manifest.as_ref().ok_or_else(|| {
+            paro_error::internal("HNSW compaction publish requires existing manifest")
+        })?;
+        let generation = state
+            .generation
+            .as_ref()
+            .ok_or_else(|| paro_error::internal("HNSW compaction publish requires generation"))?;
+        let definition_id = state.definition.definition_id;
+        added_artifacts = assign_generation_id(added_artifacts, generation.generation_id);
+
+        let removed_keys = removed_artifacts
+            .iter()
+            .map(search_artifact_key)
+            .collect::<BTreeSet<_>>();
+        let mut materialized_artifacts = current_manifest
+            .artifacts
+            .artifacts
+            .iter()
+            .filter(|artifact| !removed_keys.contains(&search_artifact_key(artifact)))
+            .cloned()
+            .collect::<Vec<_>>();
+        materialized_artifacts.extend(added_artifacts.iter().cloned());
+        let materialized = GenerationArtifactSet::try_new(materialized_artifacts.clone())?;
+
+        let mut root = current_manifest.root.clone();
+        root.build_epoch = state.next_build_epoch;
+        // Compaction changes only derived physical layout. It must not claim a
+        // newer table snapshot than the manifest it rebases onto.
+        root.generation_stats =
+            generation_stats_from_artifacts(&state.definition, &materialized.artifacts)?;
+        let tail_pending = TailPendingSet {
+            entries: current_manifest.tail_pending_entries.clone(),
+        };
+        root.coverage = coverage_for_definition(&state.definition, &tail_pending);
+        root.execution_modes = execution_modes_for_definition(&state.definition, &root.coverage);
+        root.maintenance_state = build_maintenance_state(
+            &state.definition,
+            root.build_snapshot_version,
+            root.build_epoch,
+            root.generation_stats.indexed_rows,
+            &tail_pending,
+            current_manifest.root.maintenance_state.tombstone_rows,
+            Some(current_manifest.root.build_epoch),
+            current_manifest
+                .root
+                .maintenance_state
+                .recovery
+                .superseded_build_epochs
+                .clone(),
+        );
+
+        let mut entries = removed_artifacts
+            .iter()
+            .map(|artifact| ManifestDeltaEntry::RemoveArtifact(artifact.coverage.clone()))
+            .collect::<Vec<_>>();
+        entries.extend(
+            added_artifacts
+                .iter()
+                .cloned()
+                .map(ManifestDeltaEntry::AddArtifact),
+        );
+        let mut revision =
+            self.manifests
+                .begin_revision_from_manifest(definition_id, root, current_manifest)?;
+        revision.append_delta(&ManifestDelta::new(entries))?;
+        let loaded = revision.commit()?;
+        debug_assert_eq!(loaded.artifacts.artifacts, materialized.artifacts);
+        let next_state = state.clone().with_manifest(loaded);
+        storage_metrics().record_search_manifest_publish(
+            self.manifests.codec_label(),
+            elapsed_micros_since(started_at),
+        );
+        storage_metrics().set_search_manifest_delta_count(
+            self.manifests.codec_label(),
+            next_state.manifest_delta_count(),
+        );
+        record_tail_metrics_for_state(&next_state);
+        Ok(next_state)
+    }
+
     fn publish_sidecar_repack_delta(
         &self,
         state: &SearchDefinitionState,
@@ -2977,6 +3391,28 @@ impl SearchIndexRegistry {
     }
 }
 
+fn manifest_accounted_rowsets(manifest: &LoadedManifest) -> BTreeSet<RowsetId> {
+    manifest
+        .artifacts
+        .artifacts
+        .iter()
+        .flat_map(|artifact| {
+            artifact
+                .coverage
+                .segments()
+                .iter()
+                .map(|span| span.segment.rowset_id)
+        })
+        .chain(
+            manifest
+                .tail_pending_entries
+                .iter()
+                .filter(|entry| entry.mutation != TailMutationKind::Delete)
+                .map(|entry| entry.rowset_id),
+        )
+        .collect()
+}
+
 fn expected_segment_rows(
     visible_rowsets: &[RowsetSharedPtr],
 ) -> Result<BTreeMap<ArtifactSegmentRef, u64>> {
@@ -3000,6 +3436,108 @@ fn expected_segment_rows(
         }
     }
     Ok(expected)
+}
+
+fn hnsw_compaction_build_input(
+    selected_artifacts: &[SearchArtifactRef],
+    visible_rowsets: &BTreeMap<RowsetId, RowsetSharedPtr>,
+) -> Result<(Vec<TailPendingEntry>, Vec<RowsetSharedPtr>)> {
+    let mut segments_by_rowset = BTreeMap::<RowsetId, BTreeMap<u32, u64>>::new();
+    for artifact in selected_artifacts {
+        if artifact.kind != SearchIndexKind::Hnsw {
+            return Err(paro_error::invalid_input(
+                "HNSW compaction input contains a non-HNSW artifact",
+            ));
+        }
+        for span in artifact.coverage.segments() {
+            if segments_by_rowset
+                .entry(span.segment.rowset_id)
+                .or_default()
+                .insert(span.segment.segment_id, span.row_count)
+                .is_some()
+            {
+                return Err(paro_error::data_corrupted(format!(
+                    "HNSW compaction input overlaps segment {}/{}",
+                    span.segment.rowset_id, span.segment.segment_id
+                )));
+            }
+        }
+    }
+
+    let mut tail_window = Vec::with_capacity(segments_by_rowset.len());
+    let mut rowset_refs = Vec::with_capacity(segments_by_rowset.len());
+    for (rowset_id, segments) in segments_by_rowset {
+        let Some(rowset) = visible_rowsets.get(&rowset_id).cloned() else {
+            // A table-layout publication won the race. The caller will retry
+            // from a fresh immutable artifact set on the next level-triggered
+            // maintenance pass.
+            return Ok((Vec::new(), Vec::new()));
+        };
+        rowset.load()?;
+        let physical_rows = rowset
+            .segments()
+            .iter()
+            .map(|segment| (segment.segment_id(), segment.num_rows() as u64))
+            .collect::<BTreeMap<_, _>>();
+        for (&segment_id, &row_count) in &segments {
+            if physical_rows.get(&segment_id).copied() != Some(row_count) {
+                return Ok((Vec::new(), Vec::new()));
+            }
+        }
+        tail_window.push(TailPendingEntry {
+            entry_id: TailEntryId::UNASSIGNED,
+            rowset_id,
+            segment_ids: segments.keys().copied().collect(),
+            mutation: TailMutationKind::Append,
+            row_count: segments.values().copied().sum(),
+            byte_count: rowset.data_disk_size(),
+            row_image_ref: Some(TailRowImageRef::WholeRowset),
+        });
+        rowset_refs.push(rowset);
+    }
+    Ok((tail_window, rowset_refs))
+}
+
+fn validate_hnsw_compaction_result(
+    definition: &SearchIndexDefinition,
+    generation_id: u64,
+    removed_artifacts: &[SearchArtifactRef],
+    added_artifacts: &[SearchArtifactRef],
+) -> Result<()> {
+    if added_artifacts.len() != 1 {
+        return Err(paro_error::data_corrupted(format!(
+            "HNSW generation compaction produced {} artifacts instead of one",
+            added_artifacts.len()
+        )));
+    }
+    let coverage_rows = |artifacts: &[SearchArtifactRef]| -> Result<BTreeMap<_, _>> {
+        let mut rows = BTreeMap::new();
+        for artifact in artifacts {
+            artifact.validate()?;
+            if artifact.definition_id != definition.definition_id
+                || artifact.generation_id != generation_id
+                || artifact.kind != SearchIndexKind::Hnsw
+            {
+                return Err(paro_error::data_corrupted(
+                    "HNSW compaction artifact identity mismatch",
+                ));
+            }
+            for span in artifact.coverage.segments() {
+                if rows.insert(span.segment, span.row_count).is_some() {
+                    return Err(paro_error::data_corrupted(
+                        "HNSW compaction artifact coverage overlaps",
+                    ));
+                }
+            }
+        }
+        Ok(rows)
+    };
+    if coverage_rows(removed_artifacts)? != coverage_rows(added_artifacts)? {
+        return Err(paro_error::data_corrupted(
+            "HNSW generation compaction changed physical segment coverage",
+        ));
+    }
+    Ok(())
 }
 
 fn validate_staged_artifact_coverage(
@@ -6452,6 +6990,16 @@ mod tests {
             )]))
             .unwrap();
 
+        {
+            let admission = table.search_registry().ingest_admission.lock().unwrap();
+            let blocker = table
+                .search_registry()
+                .hnsw_ingest_admission_blocker(16_383, 0, &admission)
+                .expect("committed rowsets must consume freshness capacity before refresh");
+            assert_eq!(blocker.pending_rows, 2);
+            assert_eq!(blocker.row_limit, 16_384);
+        }
+
         // Deferred HNSW rowsets are not serialized into the foreground
         // transaction. The background reconciliation owns the coalesced
         // manifest revision.
@@ -6495,33 +7043,137 @@ mod tests {
                 ..
             }
         ));
+        let admission_state = table.search_registry().ingest_admission.lock().unwrap();
+        assert!(admission_state.unmanifested_hnsw.is_empty());
         let blocker = table
             .search_registry()
-            .hnsw_ingest_admission_blocker(4_095, 0, 0, 0)
+            .hnsw_ingest_admission_blocker(16_383, 0, &admission_state)
             .expect("row high watermark");
         assert_eq!(blocker.definition_id, 88);
         assert_eq!(blocker.pending_rows, 2);
-        assert_eq!(blocker.row_limit, 4_096);
+        assert_eq!(blocker.row_limit, 16_384);
+        drop(admission_state);
 
         let admission = table
             .tablet()
-            .acquire_search_rowset_publish_admission(2_000, 1_234)
+            .acquire_search_rowset_publish_admission(8_000, 1_234)
             .unwrap()
             .expect("search registry is bound");
-        let (reserved_rows, reserved_bytes) = {
-            let reserved = table.search_registry().ingest_admission.lock().unwrap();
-            (reserved.reserved_rows, reserved.reserved_bytes)
-        };
-        assert_eq!((reserved_rows, reserved_bytes), (2_000, 1_234));
+        let reserved = table.search_registry().ingest_admission.lock().unwrap();
+        let (reserved_rows, reserved_bytes) = (reserved.reserved_rows, reserved.reserved_bytes);
+        assert_eq!((reserved_rows, reserved_bytes), (8_000, 1_234));
         assert!(table
             .search_registry()
-            .hnsw_ingest_admission_blocker(2_095, 0, reserved_rows, reserved_bytes)
+            .hnsw_ingest_admission_blocker(8_383, 0, &reserved)
             .is_some(),
             "prepared transactions must reserve capacity instead of racing on a check-only watermark");
+        drop(reserved);
         drop(admission);
         let released = table.search_registry().ingest_admission.lock().unwrap();
         assert_eq!(released.reserved_rows, 0);
         assert_eq!(released.reserved_bytes, 0);
+    }
+
+    #[test]
+    fn hnsw_generation_compaction_coalesces_graphs_without_rewriting_rowsets() {
+        let root = TempDir::new().unwrap();
+        let table = create_table_without_default_indexes(
+            root.path(),
+            &[LogicalType::Array(Box::new(LogicalType::Float), 1)],
+        );
+        table.bind_search_task_scheduler(Some(Arc::new(TaskScheduler::new())));
+        let provider_config = test_hnsw_provider_config(1, 16, 64, 0);
+        let definition = SearchIndexDefinition {
+            definition_id: 188,
+            table_id: table.tablet_id(),
+            name: "coalesced_vec_hnsw".to_string(),
+            kind: SearchIndexKind::Hnsw,
+            column_ids: vec![0],
+            expression: None,
+            freshness_policy: SearchFreshnessPolicy::default_for_kind(SearchIndexKind::Hnsw),
+            config_fingerprint: SearchIndexDefinition::compute_config_fingerprint(
+                SearchIndexKind::Hnsw,
+                &[0],
+                None,
+                &provider_config,
+            ),
+            provider_config,
+        };
+        table.register_search_definition(definition).unwrap();
+
+        for value in [10.0, 20.0] {
+            table
+                .append(&test_chunk_from_vectors(vec![test_embedding_vector(
+                    &[vec![value]],
+                    1,
+                )]))
+                .unwrap();
+            table.search_registry().ensure_fresh();
+            assert_eq!(table.search_registry().catch_up_definition(188).unwrap(), 1);
+        }
+        let rowsets_before = table
+            .tablet()
+            .capture_consistent_rowsets(table.max_version())
+            .unwrap()
+            .into_iter()
+            .map(|rowset| rowset.rowset_id())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            table.search_registry().generation_artifact_count(188),
+            Some(2)
+        );
+
+        let foreground_admission = table
+            .tablet()
+            .acquire_search_rowset_publish_admission(1, 64)
+            .unwrap()
+            .expect("HNSW registry must govern foreground publication");
+        assert!(
+            !table
+                .search_registry()
+                .compact_hnsw_generation(188, false)
+                .unwrap(),
+            "optional generation compaction must yield to admitted ingest"
+        );
+        drop(foreground_admission);
+
+        assert!(
+            crate::compaction::plan::CompactionPlanner::plan(table.tablet().as_ref())
+                .unwrap()
+                .is_some()
+        );
+        assert!(
+            !table
+                .search_registry()
+                .compact_hnsw_generation(188, false)
+                .unwrap(),
+            "optional generation compaction must not duplicate an eligible physical rewrite"
+        );
+        assert!(table
+            .search_registry()
+            .compact_hnsw_generation(188, true)
+            .unwrap());
+
+        let rowsets_after = table
+            .tablet()
+            .capture_consistent_rowsets(table.max_version())
+            .unwrap()
+            .into_iter()
+            .map(|rowset| rowset.rowset_id())
+            .collect::<Vec<_>>();
+        assert_eq!(rowsets_after, rowsets_before);
+        assert_eq!(
+            table.search_registry().generation_artifact_count(188),
+            Some(1)
+        );
+        let current = table.search_registry().view.load();
+        let manifest = current
+            .definitions
+            .get(&188)
+            .and_then(|state| state.manifest.as_ref())
+            .unwrap();
+        assert_eq!(manifest.artifacts.artifacts[0].coverage.segments().len(), 2);
+        assert!(manifest.tail_pending_entries.is_empty());
     }
 
     #[test]

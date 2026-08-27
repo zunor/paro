@@ -219,12 +219,11 @@ impl TableHandle {
     }
 
     pub fn search_maintenance_sweep(&self) -> Result<SearchMaintenanceReport> {
-        let mut report = self.search_derived_maintenance_sweep()?;
-        if report.compaction_requested && self.optimize_compact()? {
-            self.search_registry.ensure_fresh();
-            report = self.search_derived_maintenance_sweep()?;
-        }
-        Ok(report)
+        // Search artifact GC and base-table rowset compaction are independent
+        // lifecycle domains. A large or fragmented graph must be coalesced in
+        // its generation without rewriting immutable table data; the table
+        // compaction manager owns rowset layout changes separately.
+        self.search_derived_maintenance_sweep()
     }
 
     pub fn vector_capability(

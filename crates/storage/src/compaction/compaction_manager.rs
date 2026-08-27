@@ -950,7 +950,6 @@ fn duration_ns(duration: Duration) -> u64 {
 
 fn policy_priority(kind: PolicyKind) -> u8 {
     match kind {
-        PolicyKind::PrimaryKeyFull => 4,
         PolicyKind::SizeTiered => 3,
         PolicyKind::Cumulative => 2,
         PolicyKind::Base => 1,

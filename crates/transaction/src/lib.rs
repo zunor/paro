@@ -81,9 +81,9 @@ pub use committed_txn_summary::{
 };
 pub use error::{RegistryError, Result};
 pub use lock_manager::{
-    LockAcquireError, LockEscalationFailureAction, LockEscalationPolicy, LockManagerStats,
-    LockMode, LockNamespace, LockRequest, LockResource, ShardedLockManager,
-    ShardedLockManagerOptions, TxnLockSet,
+    LockAcquireError, LockEscalationFailureAction, LockEscalationPolicy,
+    LockManagerContentionStats, LockManagerStats, LockMode, LockNamespace, LockRequest,
+    LockResource, ShardedLockManager, ShardedLockManagerOptions, TxnLockSet,
 };
 pub use participant_state::{ParticipantStateRef, ParticipantStateSet, TxnParticipantState};
 pub use predicate::{
@@ -93,8 +93,9 @@ pub use predicate::{
 pub use read_dependency_index::{
     ActiveReadConflict, ActiveWriteConflictEffects, IndexedReadTracker, ReadDependencyIndex,
     ReadDependencyIndexMark, ReadDependencyIndexOptions, ReadDependencyIndexStats,
-    ReadDependencyRollback, SsiTxnState, DEFAULT_GLOBAL_READ_SET_BUDGET_BYTES,
-    DEFAULT_PER_TXN_READ_SET_BUDGET_BYTES, DEFAULT_READ_DEPENDENCY_SHARDS,
+    ReadDependencyRollback, ReadDependencyTelemetryCounters, SsiTxnState,
+    DEFAULT_GLOBAL_READ_SET_BUDGET_BYTES, DEFAULT_PER_TXN_READ_SET_BUDGET_BYTES,
+    DEFAULT_READ_DEPENDENCY_SHARDS,
 };
 pub use retention::{
     BackfillLease, CheckpointLease, DerivedLagLease, LayoutEpochLease, ReadSnapshotLease,

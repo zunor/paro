@@ -35,6 +35,7 @@ use paro_storage::compaction::compaction_manager::CompactionObservability;
 use paro_storage::index::hnsw::HnswIntegrityScheduler;
 use paro_storage::meta::TabletMetaManager;
 use paro_storage::search::SearchMaintenanceUrgency;
+use paro_storage::table::table_handle::TableHandle;
 use paro_storage::transaction::manager::TransactionManager;
 use paro_transaction::{
     CommitBatchPolicy, CommitDrainWakePool, CommitDrainWakePoolOptions, CommitJournal,
@@ -1606,20 +1607,6 @@ impl DatabaseHandle {
     }
 
     fn bind_tablet_runtime_services(&self) {
-        let observer = self.checkpoint_coordinator.compaction_publish_observer();
-        let journal = self.journal_coordinator();
-        let apply_runtime = self.journal_apply_runtime();
-        let task_scheduler = self.task_scheduler.read().clone();
-        let hnsw_integrity_scheduler = self.hnsw_integrity_scheduler.read().clone();
-        let search_maintenance_notifier = {
-            let weak = self.self_weak.read().clone();
-            Some(Arc::new(move |urgency| {
-                if let Some(database) = weak.upgrade() {
-                    database.schedule_search_maintenance(urgency);
-                }
-            })
-                as Arc<dyn Fn(SearchMaintenanceUrgency) + Send + Sync>)
-        };
         let txn = CatalogSnapshot::read_only(u64::MAX);
         for schema_entry in self
             .catalog
@@ -1638,24 +1625,38 @@ impl DatabaseHandle {
                     continue;
                 };
                 if let Some(storage) = table.get_storage() {
-                    storage
-                        .tablet()
-                        .bind_checkpoint_publish_observer(observer.clone());
-                    storage.bind_journal_coordinator(Some(Arc::clone(&journal)));
-                    storage.bind_journal_apply_runtime(Some(Arc::clone(&apply_runtime)));
-                    storage.bind_search_task_scheduler(task_scheduler.clone());
-                    storage.bind_search_maintenance_notifier(search_maintenance_notifier.clone());
-                    if let Err(error) =
-                        storage.bind_hnsw_integrity_scheduler(hnsw_integrity_scheduler.clone())
-                    {
-                        tracing::error!(
-                            target: targets::INSTANCE,
-                            error = %error,
-                            "failed to bind HNSW integrity scheduler"
-                        );
-                    }
+                    self.bind_table_runtime_services(storage.as_ref());
                 }
             }
+        }
+    }
+
+    /// Bind the database-owned runtimes to one table at the moment that table
+    /// enters the catalog. Startup/recovery scans call the same entry point for
+    /// restored tables. This lifecycle boundary prevents newly-created tables
+    /// from silently missing search maintenance and durability services merely
+    /// because they did not exist during the database-wide binding scan.
+    pub fn bind_table_runtime_services(&self, storage: &TableHandle) {
+        storage.tablet().bind_checkpoint_publish_observer(
+            self.checkpoint_coordinator.compaction_publish_observer(),
+        );
+        storage.bind_journal_coordinator(Some(self.journal_coordinator()));
+        storage.bind_journal_apply_runtime(Some(self.journal_apply_runtime()));
+        storage.bind_search_task_scheduler(self.task_scheduler.read().clone());
+        let weak = self.self_weak.read().clone();
+        storage.bind_search_maintenance_notifier(Some(Arc::new(move |urgency| {
+            if let Some(database) = weak.upgrade() {
+                database.schedule_search_maintenance(urgency);
+            }
+        })));
+        if let Err(error) =
+            storage.bind_hnsw_integrity_scheduler(self.hnsw_integrity_scheduler.read().clone())
+        {
+            tracing::error!(
+                target: targets::INSTANCE,
+                error = %error,
+                "failed to bind HNSW integrity scheduler"
+            );
         }
     }
 }

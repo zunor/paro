@@ -323,6 +323,19 @@ impl LockMode {
         )
     }
 
+    /// Whether this lock identifies a resource actually modified by commit.
+    ///
+    /// `IX` is deliberately excluded: it is an ancestor routing declaration,
+    /// not evidence that the ancestor object itself changed. Treating it as a
+    /// commit write serializes independent row/key writers with maintenance
+    /// publications which only share the same table intent.
+    pub const fn is_commit_write(self) -> bool {
+        matches!(
+            self,
+            Self::X | Self::RangeX | Self::PredicateX | Self::SchemaModification
+        )
+    }
+
     fn strength(self) -> u8 {
         match self {
             Self::IS => 1,
@@ -467,6 +480,20 @@ pub struct LockManagerStats {
     pub shard_count: usize,
     pub lock_count: usize,
     pub granted_count: usize,
+    pub lock_wait_count: u64,
+    pub lock_wait_duration_us: u64,
+    pub lock_wound_wait_abort_count: u64,
+    pub lock_deadlock_abort_count: u64,
+}
+
+/// Lock-free counters suitable for statement-path telemetry snapshots.
+///
+/// `LockManagerStats` intentionally includes the exact number of live lock
+/// resources and holders, which requires visiting every shard.  Most runtime
+/// observers only need contention counters and must not serialize foreground
+/// statements on the lock table merely to collect them.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct LockManagerContentionStats {
     pub lock_wait_count: u64,
     pub lock_wait_duration_us: u64,
     pub lock_wound_wait_abort_count: u64,
@@ -665,6 +692,19 @@ impl ShardedLockManager {
             shard_count: self.inner.shards.len(),
             lock_count,
             granted_count,
+            lock_wait_count: self.inner.lock_wait_count.load(Ordering::Acquire),
+            lock_wait_duration_us: self.inner.lock_wait_duration_us.load(Ordering::Acquire),
+            lock_wound_wait_abort_count: self
+                .inner
+                .lock_wound_wait_abort_count
+                .load(Ordering::Acquire),
+            lock_deadlock_abort_count: self.inner.lock_deadlock_abort_count.load(Ordering::Acquire),
+        }
+    }
+
+    #[inline]
+    pub fn contention_stats(&self) -> LockManagerContentionStats {
+        LockManagerContentionStats {
             lock_wait_count: self.inner.lock_wait_count.load(Ordering::Acquire),
             lock_wait_duration_us: self.inner.lock_wait_duration_us.load(Ordering::Acquire),
             lock_wound_wait_abort_count: self

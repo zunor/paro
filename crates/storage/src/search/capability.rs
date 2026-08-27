@@ -423,7 +423,12 @@ impl SearchFreshnessPolicy {
 
     pub const fn default_for_kind(kind: SearchIndexKind) -> Self {
         match kind {
-            SearchIndexKind::Hnsw => Self::bounded_by_tail_rows(4_096),
+            // Maintenance becomes elevated at the provider's 4K soft tail
+            // watermark, while admission retains enough headroom for the
+            // foreground writer and catch-up builder to overlap.  Using the
+            // soft watermark as the hard freshness bound turns every 4K rows
+            // into a global publication barrier under sustained ingest.
+            SearchIndexKind::Hnsw => Self::bounded_by_tail_rows(16_384),
             SearchIndexKind::Sparse => Self::bounded_by_tail_rows(32_768),
             SearchIndexKind::FullText => Self::bounded_by_tail_rows(16_384),
         }
@@ -503,8 +508,12 @@ impl CapabilityToken {
         }
     }
 
-    pub const fn is_generation_stale(&self, current_generation_id: SearchGenerationId) -> bool {
-        self.generation_id != current_generation_id
+    pub const fn is_stale(
+        &self,
+        current_generation_id: SearchGenerationId,
+        current_root_version: u64,
+    ) -> bool {
+        self.generation_id != current_generation_id || self.root_version != current_root_version
     }
 
     pub const fn is_queryable(&self) -> bool {
@@ -842,7 +851,7 @@ mod tests {
     }
 
     #[test]
-    fn capability_token_tracks_generation_staleness_not_root_version_churn() {
+    fn capability_token_tracks_generation_and_revision_staleness() {
         let capability = SearchCapability {
             definition_id: 7,
             table_id: 11,
@@ -882,8 +891,9 @@ mod tests {
         assert_eq!(token.generation_id, 13);
         assert_eq!(token.root_version, 5);
         assert!(capability.tail_summary.has_pending_rows());
-        assert!(!token.is_generation_stale(13));
-        assert!(token.is_generation_stale(14));
+        assert!(!token.is_stale(13, 5));
+        assert!(token.is_stale(14, 5));
+        assert!(token.is_stale(13, 6));
         assert_eq!(
             token.capability_state,
             SearchCapabilityState::NotQueryable {
