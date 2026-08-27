@@ -1020,12 +1020,12 @@ impl ManifestStore {
         &self,
         definition_id: u64,
         root: &mut GenerationManifestRoot,
-    ) -> Result<bool> {
+    ) -> Result<Option<PathBuf>> {
         let definition_dir = self.generation_dir(definition_id, root.generation_id);
         let delta_bytes = root.delta_window_bytes(&definition_dir);
         let delta_count = root.recent_delta_files.len();
         if delta_count <= DELTA_COUNT_SOFT_LIMIT && delta_bytes <= DELTA_BYTES_SOFT_LIMIT {
-            return Ok(false);
+            return Ok(None);
         }
 
         let mut root_for_replay = root.clone();
@@ -1042,14 +1042,14 @@ impl ManifestStore {
         root.shard_files = vec![shard_name];
         root.recent_delta_files.clear();
         root.materialized_state_file = None;
-        root.recompute_checksum()?;
-        if let Err(err) = self.write_root(definition_id, root) {
+        if let Err(error) = root.recompute_checksum() {
             self.remove_paths(&[shard_path]);
-            return Err(err);
+            return Err(error);
         }
         // Old fragments remain reachable by the current durable head until
-        // the new root revision is WAL-published. Retirement is owned by the
-        // post-publication generation GC, never by manifest construction.
+        // the caller publishes the new root revision. Root publication has
+        // exactly one owner; callers remove this prepared shard if writing the
+        // immutable root fails.
 
         if delta_count > DELTA_COUNT_HARD_LIMIT || delta_bytes > DELTA_BYTES_HARD_LIMIT {
             tracing::warn!(
@@ -1059,7 +1059,7 @@ impl ManifestStore {
                 "search manifest delta window exceeded hard threshold before compaction"
             );
         }
-        Ok(true)
+        Ok(Some(shard_path))
     }
 
     fn write_root_fragment(
@@ -1807,7 +1807,19 @@ mod tests {
 
         store
             .maybe_compact_deltas(definition_id, &mut root)
-            .expect("compact deltas");
+            .expect("compact deltas")
+            .expect("compaction should prepare a shard");
+        let prepared_head = store.head_for_root(&root);
+        let prepared_root_path = store.root_path_for_file(
+            definition_id,
+            root.generation_id,
+            &prepared_head.root_file_name,
+        );
+        assert!(
+            !prepared_root_path.exists(),
+            "delta compaction must prepare fragments without publishing its root"
+        );
+        store.write_root(definition_id, &root).unwrap();
 
         assert_eq!(root.recent_delta_files.len(), 0);
         assert_eq!(root.shard_files.len(), 1);

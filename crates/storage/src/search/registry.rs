@@ -1140,11 +1140,15 @@ impl SearchIndexRegistry {
             return Ok(false);
         };
         let mut root = manifest.root.clone();
-        if !self
+        let Some(compacted_shard_path) = self
             .manifests
             .maybe_compact_deltas(definition_id, &mut root)?
-        {
+        else {
             return Ok(false);
+        };
+        if let Err(error) = self.manifests.write_root(definition_id, &root) {
+            self.manifests.remove_paths(&[compacted_shard_path]);
+            return Err(error);
         }
         let head = self.manifests.head_for_root(&root);
         let Some(loaded) = self.manifests.load_manifest_for_head(&head)? else {
@@ -1570,6 +1574,32 @@ impl SearchIndexRegistry {
         self.publish_full_snapshot(state, visible_version, visible_rowsets)
     }
 
+    /// Prepare optional delta compaction and publish one immutable root.
+    ///
+    /// Manifest construction may create a delta and a replacement shard before
+    /// the root is durable. Keep those paths in one rollback set, and keep root
+    /// creation owned by this single call so threshold-triggered compaction
+    /// cannot publish the same immutable revision twice.
+    fn write_root_after_optional_compaction(
+        &self,
+        definition_id: u64,
+        root: &mut GenerationManifestRoot,
+        mut unpublished_paths: Vec<PathBuf>,
+    ) -> Result<()> {
+        match self.manifests.maybe_compact_deltas(definition_id, root) {
+            Ok(compacted_shard_path) => unpublished_paths.extend(compacted_shard_path),
+            Err(error) => {
+                self.manifests.remove_paths(&unpublished_paths);
+                return Err(error);
+            }
+        }
+        if let Err(error) = self.manifests.write_root(definition_id, root) {
+            self.manifests.remove_paths(&unpublished_paths);
+            return Err(error);
+        }
+        Ok(())
+    }
+
     fn publish_full_snapshot(
         &self,
         state: &SearchDefinitionState,
@@ -1778,17 +1808,7 @@ impl SearchIndexRegistry {
             .join(&delta_name.file_name);
         root.recent_delta_files.push(delta_name);
         root.recompute_checksum()?;
-        if let Err(err) = self
-            .manifests
-            .maybe_compact_deltas(definition_id, &mut root)
-        {
-            self.manifests.remove_paths(&[delta_path]);
-            return Err(err);
-        }
-        if let Err(err) = self.manifests.write_root(definition_id, &root) {
-            self.manifests.remove_paths(&[delta_path]);
-            return Err(err);
-        }
+        self.write_root_after_optional_compaction(definition_id, &mut root, vec![delta_path])?;
         let mut artifacts = (*current_manifest.artifacts).clone();
         artifacts.artifacts.extend(added_artifacts);
         let loaded = self.manifests.materialize_loaded_manifest(
@@ -1962,17 +1982,7 @@ impl SearchIndexRegistry {
             .join(&delta_name.file_name);
         root.recent_delta_files.push(delta_name);
         root.recompute_checksum()?;
-        if let Err(err) = self
-            .manifests
-            .maybe_compact_deltas(definition_id, &mut root)
-        {
-            self.manifests.remove_paths(&[delta_path]);
-            return Err(err);
-        }
-        if let Err(err) = self.manifests.write_root(definition_id, &root) {
-            self.manifests.remove_paths(&[delta_path]);
-            return Err(err);
-        }
+        self.write_root_after_optional_compaction(definition_id, &mut root, vec![delta_path])?;
 
         let loaded = self.manifests.materialize_loaded_manifest(
             definition_id,
@@ -2097,17 +2107,7 @@ impl SearchIndexRegistry {
             .join(&delta_name.file_name);
         root.recent_delta_files.push(delta_name);
         root.recompute_checksum()?;
-        if let Err(err) = self
-            .manifests
-            .maybe_compact_deltas(definition_id, &mut root)
-        {
-            self.manifests.remove_paths(&[delta_path]);
-            return Err(err);
-        }
-        if let Err(err) = self.manifests.write_root(definition_id, &root) {
-            self.manifests.remove_paths(&[delta_path]);
-            return Err(err);
-        }
+        self.write_root_after_optional_compaction(definition_id, &mut root, vec![delta_path])?;
 
         let mut artifacts = (*current_manifest.artifacts).clone();
         artifacts.artifacts.extend(added_artifacts);
@@ -2173,17 +2173,7 @@ impl SearchIndexRegistry {
             .join(&delta_name.file_name);
         root.recent_delta_files.push(delta_name);
         root.recompute_checksum()?;
-        if let Err(err) = self
-            .manifests
-            .maybe_compact_deltas(definition_id, &mut root)
-        {
-            self.manifests.remove_paths(&[delta_path]);
-            return Err(err);
-        }
-        if let Err(err) = self.manifests.write_root(definition_id, &root) {
-            self.manifests.remove_paths(&[delta_path]);
-            return Err(err);
-        }
+        self.write_root_after_optional_compaction(definition_id, &mut root, vec![delta_path])?;
 
         let artifacts =
             replace_artifacts(&current_manifest.artifacts, repacked_artifacts.into_iter());
@@ -2382,17 +2372,7 @@ impl SearchIndexRegistry {
             .join(&delta_name.file_name);
         root.recent_delta_files.push(delta_name);
         root.recompute_checksum()?;
-        if let Err(err) = self
-            .manifests
-            .maybe_compact_deltas(definition_id, &mut root)
-        {
-            self.manifests.remove_paths(&[delta_path]);
-            return Err(err);
-        }
-        if let Err(err) = self.manifests.write_root(definition_id, &root) {
-            self.manifests.remove_paths(&[delta_path]);
-            return Err(err);
-        }
+        self.write_root_after_optional_compaction(definition_id, &mut root, vec![delta_path])?;
 
         let mut artifacts = (*current_manifest.artifacts).clone();
         artifacts.artifacts.extend(added_artifacts);
