@@ -245,7 +245,6 @@ mod tests {
             checksum: 0,
             shard_files: vec![shard],
             recent_delta_files: Vec::new(),
-            materialized_state_file: None,
         };
         root.recompute_checksum().unwrap();
         manifests.write_root(definition_id, &root).unwrap();

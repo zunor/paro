@@ -37,7 +37,7 @@ use crate::rowset::segment::{Segment, SegmentOptions, SegmentSharedPtr};
 use crate::rowset::{
     PhysicalRowRef, Rowset, RowsetMeta, RowsetSharedPtr, RowsetState, SegmentRowId, SegmentsOverlap,
 };
-use crate::search::manifest::ManifestStore;
+use crate::search::manifest::{ManifestStore, SearchManifestRevisionLease};
 use crate::search::SearchInlineBuilderSet;
 use paro_common::durability::PrepareToken;
 use paro_common::effect::{
@@ -155,7 +155,17 @@ pub trait CheckpointPublishObserver: Send + Sync + std::fmt::Debug {
 #[derive(Debug, Default)]
 pub struct SearchGenerationHeadUpdates {
     pub heads: Vec<SearchGenerationHeadMeta>,
-    pub disabled_definition_ids: Vec<u64>,
+    pub(crate) revision_leases: Vec<(u64, SearchManifestRevisionLease)>,
+}
+
+impl SearchGenerationHeadUpdates {
+    fn mark_published(&self, advanced_definition_ids: &HashSet<u64>) {
+        for (definition_id, lease) in &self.revision_leases {
+            if advanced_definition_ids.contains(definition_id) {
+                lease.mark_published();
+            }
+        }
+    }
 }
 
 pub trait RowsetPublishObserver: Send + Sync + std::fmt::Debug {
@@ -773,20 +783,12 @@ impl Tablet {
         match observer.prepare_rowset_publish(self.tablet_id(), version, visible_rowsets) {
             Ok(updates) => updates,
             Err(error) => {
-                let disabled_definition_ids = self
-                    .search_generation_heads()
-                    .into_iter()
-                    .map(|head| head.definition_id)
-                    .collect();
                 tracing::error!(
                     tablet_id = self.tablet_id(),
                     error = %error,
-                    "disabled search generations after derived manifest preparation failed"
+                    "kept prior search generation heads after derived manifest preparation failed"
                 );
-                SearchGenerationHeadUpdates {
-                    heads: Vec::new(),
-                    disabled_definition_ids,
-                }
+                SearchGenerationHeadUpdates::default()
             }
         }
     }
@@ -808,10 +810,14 @@ impl Tablet {
         Ok(rowsets)
     }
 
-    fn apply_search_generation_heads_locked(&self, updates: SearchGenerationHeadUpdates) {
-        if updates.heads.is_empty() && updates.disabled_definition_ids.is_empty() {
-            return;
+    fn apply_search_generation_heads_locked(
+        &self,
+        updates: &SearchGenerationHeadUpdates,
+    ) -> HashSet<u64> {
+        if updates.heads.is_empty() {
+            return HashSet::new();
         }
+        let mut advanced_definition_ids = HashSet::new();
         let mut meta = self.meta.write().unwrap_or_else(|poisoned| {
             tracing::error!(
                 tablet_id = self.tablet_id(),
@@ -819,25 +825,24 @@ impl Tablet {
             );
             poisoned.into_inner()
         });
-        for definition_id in updates.disabled_definition_ids {
-            let _ = meta.remove_search_generation_head(definition_id);
-        }
-        for head in updates.heads {
+        for head in updates.heads.iter().cloned() {
             let definition_id = head.definition_id;
             if let Err(error) = meta.advance_search_generation_head(head) {
                 // Search metadata is derived from the just-published base
                 // rowsets. A conflicting index revision must make that index
                 // unavailable, never roll back or poison an already-durable
                 // base-table write.
-                let _ = meta.remove_search_generation_head(definition_id);
                 tracing::error!(
                     tablet_id = self.tablet_id(),
                     definition_id,
                     error = %error,
-                    "disabled inconsistent search generation during rowset publication"
+                    "kept prior search generation head after inconsistent derived revision"
                 );
+            } else {
+                advanced_definition_ids.insert(definition_id);
             }
         }
+        advanced_definition_ids
     }
 
     pub(crate) fn search_generation_head(
@@ -1960,8 +1965,9 @@ impl Tablet {
         let search_heads = self.prepare_search_rowset_publish(version, &visible_rowsets);
         rowset.make_visible()?;
         self.register_rowset_locked(rowset)?;
-        self.apply_search_generation_heads_locked(search_heads);
+        let advanced_search_heads = self.apply_search_generation_heads_locked(&search_heads);
         self.save_meta()?;
+        search_heads.mark_published(&advanced_search_heads);
 
         self.validate_version_graph()?;
         Ok(true)
@@ -2030,8 +2036,9 @@ impl Tablet {
         self.register_rowset_locked(rowset)?;
         self.reconcile_primary_index_row_count()?;
         self.maybe_flush_primary_index()?;
-        self.apply_search_generation_heads_locked(search_heads);
+        let advanced_search_heads = self.apply_search_generation_heads_locked(&search_heads);
         self.save_meta()?;
+        search_heads.mark_published(&advanced_search_heads);
         self.validate_version_graph()?;
         Ok(true)
     }
@@ -3918,7 +3925,6 @@ mod tests {
             checksum: 0,
             shard_files: vec![shard],
             recent_delta_files: Vec::new(),
-            materialized_state_file: None,
         };
         root.recompute_checksum().unwrap();
         staged_manifests.write_root(definition_id, &root).unwrap();
@@ -4234,10 +4240,10 @@ mod tests {
     }
 
     #[test]
-    fn search_manifest_failure_disables_index_without_rolling_back_rowset() {
+    fn search_manifest_failure_preserves_last_head_without_rolling_back_rowset() {
         let schema = create_test_schema();
         let tablet = Tablet::new(1, 100, 1000, schema, test_data_dir(), None).unwrap();
-        tablet.apply_search_generation_heads_locked(SearchGenerationHeadUpdates {
+        tablet.apply_search_generation_heads_locked(&SearchGenerationHeadUpdates {
             heads: vec![SearchGenerationHeadMeta {
                 definition_id: 77,
                 generation_id: 1,
@@ -4245,7 +4251,7 @@ mod tests {
                 config_fingerprint: 99,
                 root_file_name: "manifest_root_g1_v1_f99.json".to_string(),
             }],
-            disabled_definition_ids: Vec::new(),
+            revision_leases: Vec::new(),
         });
         assert!(tablet.search_generation_head(77).is_some());
 
@@ -4257,7 +4263,7 @@ mod tests {
             .expect("derived search failure must not roll back base-table DML");
 
         assert_eq!(tablet.max_version(), 0);
-        assert!(tablet.search_generation_head(77).is_none());
+        assert_eq!(tablet.search_generation_head(77).unwrap().root_version, 1);
     }
 
     #[test]

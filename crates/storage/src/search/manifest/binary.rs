@@ -4,7 +4,7 @@
 //! Compact binary codec for search manifest fragments.
 //!
 //! This codec is intentionally explicit instead of serde-driven. Manifest open is
-//! on the search query hot path, so binary-v2 keeps stable field order, small
+//! on the search query hot path, so binary-v3 keeps stable field order, small
 //! enum tags, and little-endian scalar encoding without reflection-style map
 //! dispatch. Binary-v2 stores generation-owned multi-segment partition
 //! coverage for every artifact.
@@ -32,7 +32,7 @@ use super::{
     ManifestDeltaEntry, ManifestFileRef, ManifestShard,
 };
 
-const MAGIC: &[u8; 4] = b"PMB2";
+const MAGIC: &[u8; 4] = b"PMB3";
 const ROOT_FRAGMENT: u8 = 1;
 const SHARD_FRAGMENT: u8 = 2;
 const DELTA_FRAGMENT: u8 = 3;
@@ -70,46 +70,6 @@ pub(crate) fn decode_binary_manifest_fragment<T: BinaryManifestFragment>(
     let decoded = T::decode_binary(&mut reader)?;
     reader.finish()?;
     Ok(decoded)
-}
-
-pub(crate) fn encode_binary_root_fragment(
-    root: &GenerationManifestRoot,
-    materialized_state: Option<&ManifestShard>,
-) -> Result<Vec<u8>> {
-    let mut writer = BinaryWriter::new();
-    writer.bytes(MAGIC);
-    writer.u8(ROOT_FRAGMENT);
-    root.encode_binary(&mut writer)?;
-    match materialized_state {
-        Some(state) => {
-            writer.bool(true);
-            state.encode_binary(&mut writer)?;
-        }
-        None => writer.bool(false),
-    }
-    Ok(writer.finish())
-}
-
-pub(crate) fn decode_binary_root_fragment(
-    bytes: &[u8],
-) -> Result<(GenerationManifestRoot, Option<ManifestShard>)> {
-    let mut reader = BinaryReader::new(bytes);
-    reader.expect_magic(MAGIC)?;
-    let fragment_tag = reader.u8()?;
-    if fragment_tag != ROOT_FRAGMENT {
-        return Err(paro_error::serialization_error(format!(
-            "decode binary search manifest root: expected tag {}, got {}",
-            ROOT_FRAGMENT, fragment_tag
-        )));
-    }
-    let root = GenerationManifestRoot::decode_binary(&mut reader)?;
-    let materialized_state = if reader.bool()? {
-        Some(ManifestShard::decode_binary(&mut reader)?)
-    } else {
-        None
-    };
-    reader.finish()?;
-    Ok((root, materialized_state))
 }
 
 pub(crate) struct BinaryWriter {
@@ -199,7 +159,7 @@ impl<'a> BinaryReader<'a> {
         let actual = self.take(magic.len())?;
         if actual != magic {
             return Err(paro_error::serialization_error(
-                "decode binary search manifest fragment: missing PMB2 magic",
+                "decode binary search manifest fragment: missing PMB3 magic",
             ));
         }
         Ok(())
@@ -305,8 +265,7 @@ impl BinaryManifestFragment for GenerationManifestRoot {
         writer.u64(self.root_version);
         writer.u64(self.checksum);
         encode_vec(writer, &self.shard_files, encode_manifest_file_ref)?;
-        encode_vec(writer, &self.recent_delta_files, encode_manifest_file_ref)?;
-        encode_manifest_file_ref_option(writer, self.materialized_state_file.as_ref())
+        encode_vec(writer, &self.recent_delta_files, encode_manifest_file_ref)
     }
 
     fn decode_binary(reader: &mut BinaryReader<'_>) -> Result<Self> {
@@ -326,7 +285,6 @@ impl BinaryManifestFragment for GenerationManifestRoot {
             checksum: reader.u64()?,
             shard_files: decode_vec(reader, decode_manifest_file_ref)?,
             recent_delta_files: decode_vec(reader, decode_manifest_file_ref)?,
-            materialized_state_file: decode_manifest_file_ref_option(reader)?,
         })
     }
 }
@@ -396,32 +354,6 @@ fn decode_manifest_file_ref(reader: &mut BinaryReader<'_>) -> Result<ManifestFil
         file_name: reader.string()?,
         codec: decode_codec_kind(reader)?,
     })
-}
-
-fn encode_manifest_file_ref_option(
-    writer: &mut BinaryWriter,
-    file: Option<&ManifestFileRef>,
-) -> Result<()> {
-    match file {
-        Some(file) => {
-            writer.bool(true);
-            encode_manifest_file_ref(writer, file)
-        }
-        None => {
-            writer.bool(false);
-            Ok(())
-        }
-    }
-}
-
-fn decode_manifest_file_ref_option(
-    reader: &mut BinaryReader<'_>,
-) -> Result<Option<ManifestFileRef>> {
-    if reader.bool()? {
-        Ok(Some(decode_manifest_file_ref(reader)?))
-    } else {
-        Ok(None)
-    }
 }
 
 fn encode_codec_kind(writer: &mut BinaryWriter, codec: ManifestCodecKind) {

@@ -24,8 +24,7 @@ use super::inline_sink::SearchStatsDelta;
 mod binary;
 
 use self::binary::{
-    decode_binary_manifest_fragment, decode_binary_root_fragment, encode_binary_manifest_fragment,
-    encode_binary_root_fragment, BinaryManifestFragment,
+    decode_binary_manifest_fragment, encode_binary_manifest_fragment, BinaryManifestFragment,
 };
 use super::sidecar::SidecarArtifactStore;
 use super::stats::{
@@ -53,20 +52,20 @@ pub(crate) struct ManifestCodecKind {
 }
 
 impl ManifestCodecKind {
-    pub(crate) const JSON_DEBUG_V2: Self = Self {
+    pub(crate) const JSON_DEBUG_V3: Self = Self {
         family: ManifestCodecFamily::JsonDebug,
-        version: 2,
+        version: 3,
     };
 
-    pub(crate) const BINARY_V2: Self = Self {
+    pub(crate) const BINARY_V3: Self = Self {
         family: ManifestCodecFamily::Binary,
-        version: 2,
+        version: 3,
     };
 
     pub(crate) const fn metric_label(self) -> &'static str {
         match (self.family, self.version) {
-            (ManifestCodecFamily::JsonDebug, 2) => "json-debug-v2",
-            (ManifestCodecFamily::Binary, 2) => "binary-v2",
+            (ManifestCodecFamily::JsonDebug, 3) => "json-debug-v3",
+            (ManifestCodecFamily::Binary, 3) => "binary-v3",
             _ => "unknown",
         }
     }
@@ -101,38 +100,16 @@ pub(crate) struct GenerationManifestRoot {
     pub checksum: u64,
     pub shard_files: Vec<ManifestFileRef>,
     pub recent_delta_files: Vec<ManifestFileRef>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub materialized_state_file: Option<ManifestFileRef>,
 }
 
 impl GenerationManifestRoot {
     pub(crate) fn recompute_checksum(&mut self) -> Result<()> {
-        self.recompute_checksum_for_codec_and_state(ManifestCodecKind::JSON_DEBUG_V2, None)
-    }
-
-    fn recompute_checksum_for_codec_and_state(
-        &mut self,
-        codec: ManifestCodecKind,
-        materialized_state: Option<&ManifestShard>,
-    ) -> Result<()> {
         self.checksum = 0;
-        let bytes = match codec {
-            ManifestCodecKind::JSON_DEBUG_V2 => serde_json::to_vec(self).map_err(|err| {
-                paro_error::serialization_error(format!(
-                    "serialize generation manifest root: {err}"
-                ))
-            })?,
-            ManifestCodecKind {
-                family: ManifestCodecFamily::Binary,
-                version: 2,
-            } => encode_binary_root_fragment(self, materialized_state)?,
-            other => {
-                return Err(paro_error::not_supported(format!(
-                    "unsupported search manifest checksum codec {:?}",
-                    other
-                )))
-            }
-        };
+        // The logical checksum is codec-independent. Physical encodings may
+        // change without changing the root identity or its integrity proof.
+        let bytes = serde_json::to_vec(self).map_err(|err| {
+            paro_error::serialization_error(format!("serialize generation manifest root: {err}"))
+        })?;
         self.checksum = checksum_bytes(&bytes);
         Ok(())
     }
@@ -195,8 +172,8 @@ pub(crate) struct LoadedManifest {
     pub root_path: PathBuf,
     pub shard_paths: Vec<PathBuf>,
     pub delta_paths: Vec<PathBuf>,
-    pub materialized_state_path: Option<PathBuf>,
-    pub embedded_materialized_state: bool,
+    pub next_tail_entry_id: TailEntryId,
+    pub(crate) publication_lease: Option<SearchManifestRevisionLease>,
     /// Shared by immutable registry snapshots, query leases, and the retirement queue.
     /// Keeping one ownership token makes artifact reclamation wait for every reader and
     /// keeps copy-on-write view publication from cloning the complete artifact list.
@@ -206,42 +183,42 @@ pub(crate) struct LoadedManifest {
 
 impl LoadedManifest {
     pub(crate) fn all_paths(&self) -> Vec<PathBuf> {
-        let mut paths = Vec::with_capacity(
-            1 + self.shard_paths.len()
-                + self.delta_paths.len()
-                + usize::from(self.materialized_state_path.is_some()),
-        );
+        let mut paths = Vec::with_capacity(1 + self.shard_paths.len() + self.delta_paths.len());
         paths.push(self.root_path.clone());
         paths.extend(self.shard_paths.iter().cloned());
         paths.extend(self.delta_paths.iter().cloned());
-        paths.extend(self.materialized_state_path.iter().cloned());
         paths
     }
 
     pub(crate) fn opened_paths(&self) -> Vec<PathBuf> {
-        if self.embedded_materialized_state {
-            return vec![self.root_path.clone()];
-        }
-        let mut paths = Vec::with_capacity(1 + usize::from(self.materialized_state_path.is_some()));
+        let mut paths = Vec::with_capacity(1 + self.shard_paths.len() + self.delta_paths.len());
         paths.push(self.root_path.clone());
-        if let Some(path) = &self.materialized_state_path {
-            paths.push(path.clone());
-            return paths;
-        }
         paths.extend(self.shard_paths.iter().cloned());
         paths.extend(self.delta_paths.iter().cloned());
         paths
     }
+
+    pub(crate) fn revision_lease(&self) -> Option<SearchManifestRevisionLease> {
+        self.publication_lease.clone()
+    }
+
+    pub(crate) fn mark_revision_published(&self) {
+        if let Some(lease) = &self.publication_lease {
+            lease.mark_published();
+        }
+    }
 }
 
+#[derive(Clone)]
 struct MaterializedManifestState {
-    artifacts: GenerationArtifactSet,
+    artifacts: Arc<GenerationArtifactSet>,
     tail_pending_entries: Vec<TailPendingEntry>,
     next_tail_entry_id: TailEntryId,
 }
 
 type ArtifactManifestKey = (SearchPartitionCoverage, u32, SearchIndexKind, u32);
 
+#[derive(Clone)]
 pub(crate) struct ManifestStore {
     table_data_dir: PathBuf,
     codec_kind: ManifestCodecKind,
@@ -251,21 +228,68 @@ pub(crate) struct ManifestStore {
 ///
 /// A revision number is allocated once from both durable state and the
 /// installed namespace. Every fragment remains rollback-owned until the root
-/// has been written and read back through the normal open path. This keeps
-/// version allocation, optional compaction, validation, and cleanup in one
-/// layer instead of relying on publisher-specific call discipline.
+/// has been installed and acknowledged by the durable head publication. The
+/// materialized view is updated from the same typed delta that is persisted;
+/// commit only reads back the bounded root fragment. Recovery replay remains
+/// the sole path that replays the shard and delta window or repairs missing
+/// sidecars.
 pub(crate) struct StagedManifestRevision<'a> {
     store: &'a ManifestStore,
     definition_id: u64,
     root: GenerationManifestRoot,
+    materialized: MaterializedManifestState,
     unpublished_paths: Vec<PathBuf>,
     absorbed_created_paths: Vec<PathBuf>,
     compaction_checked: bool,
+    layout_replaced: bool,
     committed: bool,
+}
+
+#[derive(Clone)]
+pub(crate) struct SearchManifestRevisionLease {
+    inner: Arc<SearchManifestRevisionLeaseInner>,
+}
+
+impl std::fmt::Debug for SearchManifestRevisionLease {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("SearchManifestRevisionLease")
+            .field("created_path_count", &self.inner.created_paths.len())
+            .finish_non_exhaustive()
+    }
+}
+
+struct SearchManifestRevisionLeaseInner {
+    store: ManifestStore,
+    created_paths: Vec<PathBuf>,
+    published: std::sync::atomic::AtomicBool,
+}
+
+impl SearchManifestRevisionLease {
+    pub(crate) fn mark_published(&self) {
+        self.inner
+            .published
+            .store(true, std::sync::atomic::Ordering::Release);
+    }
+}
+
+impl Drop for SearchManifestRevisionLeaseInner {
+    fn drop(&mut self) {
+        if !self.published.load(std::sync::atomic::Ordering::Acquire) {
+            self.store.remove_paths(&self.created_paths);
+        }
+    }
 }
 
 impl StagedManifestRevision<'_> {
     pub(crate) fn append_delta(&mut self, delta: &ManifestDelta) -> Result<()> {
+        if self.compaction_checked || self.layout_replaced {
+            return Err(paro_error::internal(
+                "cannot append a search manifest delta after revision layout was finalized",
+            ));
+        }
+        let materialized =
+            apply_manifest_delta(self.definition_id, &self.root, &self.materialized, delta)?;
         let delta_ref = self.store.write_delta(
             self.definition_id,
             self.root.generation_id,
@@ -279,10 +303,18 @@ impl StagedManifestRevision<'_> {
             .join(&delta_ref.file_name);
         self.unpublished_paths.push(path);
         self.root.recent_delta_files.push(delta_ref);
+        self.materialized = materialized;
         Ok(())
     }
 
     pub(crate) fn replace_with_shard(&mut self, shard: &ManifestShard) -> Result<()> {
+        if self.layout_replaced {
+            return Err(paro_error::internal(
+                "search manifest revision layout may only be replaced once",
+            ));
+        }
+        let materialized =
+            materialized_state_from_published_shard(self.definition_id, &self.root, shard)?;
         let shard_ref = self.store.write_shard(
             self.definition_id,
             self.root.generation_id,
@@ -296,7 +328,8 @@ impl StagedManifestRevision<'_> {
         self.unpublished_paths.push(path);
         self.root.shard_files = vec![shard_ref];
         self.root.recent_delta_files.clear();
-        self.root.materialized_state_file = None;
+        self.materialized = materialized;
+        self.layout_replaced = true;
         Ok(())
     }
 
@@ -311,13 +344,6 @@ impl StagedManifestRevision<'_> {
             return Ok(false);
         }
 
-        let mut replay_root = self.root.clone();
-        replay_root.materialized_state_file.take();
-        let materialized =
-            self.store
-                .load_materialized_state(self.definition_id, &replay_root, false)?;
-        self.root.next_tail_entry_id = materialized.next_tail_entry_id;
-
         let absorbed_delta_paths = self
             .root
             .recent_delta_files
@@ -330,10 +356,11 @@ impl StagedManifestRevision<'_> {
                 .filter(|path| absorbed_delta_paths.contains(*path))
                 .cloned(),
         );
-        self.replace_with_shard(&ManifestShard {
-            artifact_refs: materialized.artifacts.artifacts,
-            tail_pending_entries: materialized.tail_pending_entries,
-        })?;
+        let shard = ManifestShard {
+            artifact_refs: self.materialized.artifacts.artifacts.clone(),
+            tail_pending_entries: self.materialized.tail_pending_entries.clone(),
+        };
+        self.replace_with_shard(&shard)?;
 
         if delta_count > DELTA_COUNT_HARD_LIMIT || delta_bytes > DELTA_BYTES_HARD_LIMIT {
             tracing::warn!(
@@ -352,29 +379,113 @@ impl StagedManifestRevision<'_> {
         }
         self.root.recompute_checksum()?;
         let root_path = self.store.write_root(self.definition_id, &self.root)?;
-        self.unpublished_paths.push(root_path);
-        let head = self.store.head_for_root(&self.root);
-        let loaded = self.store.load_manifest_for_head(&head)?.ok_or_else(|| {
-            paro_error::data_corrupted(format!(
-                "newly committed search manifest root for definition {} cannot be reopened",
-                self.definition_id
-            ))
-        })?;
-        if loaded.root.definition_id != self.root.definition_id
-            || loaded.root.generation_id != self.root.generation_id
-            || loaded.root.root_version != self.root.root_version
-            || loaded.root.config_fingerprint != self.root.config_fingerprint
-        {
+        self.unpublished_paths.push(root_path.clone());
+        let persisted_root = self.store.read_root_fragment(&root_path)?;
+        if persisted_root != self.root {
             return Err(paro_error::data_corrupted(format!(
-                "newly committed search manifest root for definition {} changed identity during reopen",
+                "newly committed search manifest root for definition {} changed during verification",
                 self.definition_id
             )));
         }
 
-        self.committed = true;
         self.store.remove_paths(&self.absorbed_created_paths);
+        let lease = SearchManifestRevisionLease {
+            inner: Arc::new(SearchManifestRevisionLeaseInner {
+                store: self.store.clone(),
+                created_paths: self.unpublished_paths.clone(),
+                published: std::sync::atomic::AtomicBool::new(false),
+            }),
+        };
+        let definition_dir = self
+            .store
+            .generation_dir(self.definition_id, self.root.generation_id);
+        let loaded = LoadedManifest {
+            root: self.root.clone(),
+            root_path,
+            shard_paths: self
+                .root
+                .shard_files
+                .iter()
+                .map(|file| definition_dir.join(&file.file_name))
+                .collect(),
+            delta_paths: self
+                .root
+                .recent_delta_files
+                .iter()
+                .map(|file| definition_dir.join(&file.file_name))
+                .collect(),
+            next_tail_entry_id: self.materialized.next_tail_entry_id,
+            publication_lease: Some(lease),
+            artifacts: self.materialized.artifacts.clone(),
+            tail_pending_entries: self.materialized.tail_pending_entries.clone(),
+        };
+        self.committed = true;
         Ok(loaded)
     }
+}
+
+fn materialized_state_from_published_shard(
+    definition_id: u64,
+    root: &GenerationManifestRoot,
+    shard: &ManifestShard,
+) -> Result<MaterializedManifestState> {
+    let artifacts = GenerationArtifactSet::try_new(shard.artifact_refs.clone())?;
+    artifacts.validate_for_generation(definition_id, root.generation_id)?;
+    let mut tail_map = BTreeMap::new();
+    for entry in shard.tail_pending_entries.iter().cloned() {
+        upsert_tail_entry(definition_id, &mut tail_map, entry)?;
+    }
+    Ok(MaterializedManifestState {
+        artifacts: Arc::new(artifacts),
+        tail_pending_entries: tail_map.into_values().collect(),
+        next_tail_entry_id: root.next_tail_entry_id,
+    })
+}
+
+fn apply_manifest_delta(
+    definition_id: u64,
+    root: &GenerationManifestRoot,
+    current: &MaterializedManifestState,
+    delta: &ManifestDelta,
+) -> Result<MaterializedManifestState> {
+    let mut artifact_map = current
+        .artifacts
+        .artifacts
+        .iter()
+        .cloned()
+        .map(|artifact| (artifact_key(&artifact), artifact))
+        .collect::<BTreeMap<_, _>>();
+    let mut tail_map = current
+        .tail_pending_entries
+        .iter()
+        .cloned()
+        .map(|entry| (entry.entry_id, entry))
+        .collect::<BTreeMap<_, _>>();
+    for entry in &delta.entries {
+        match entry {
+            ManifestDeltaEntry::AddArtifact(artifact) => {
+                artifact.validate()?;
+                artifact_map.insert(artifact_key(artifact), artifact.clone());
+            }
+            ManifestDeltaEntry::RemoveArtifact(removed) => {
+                artifact_map.retain(|(coverage, _, _, _), _| coverage != removed);
+            }
+            ManifestDeltaEntry::UpsertTail(tail_entry) => {
+                upsert_tail_entry(definition_id, &mut tail_map, tail_entry.clone())?;
+            }
+            ManifestDeltaEntry::CoverTail(entry_id) => {
+                tail_map.remove(entry_id);
+            }
+            ManifestDeltaEntry::StatsDelta(_) => {}
+        }
+    }
+    let artifacts = GenerationArtifactSet::try_new(artifact_map.into_values().collect())?;
+    artifacts.validate_for_generation(definition_id, root.generation_id)?;
+    Ok(MaterializedManifestState {
+        artifacts: Arc::new(artifacts),
+        tail_pending_entries: tail_map.into_values().collect(),
+        next_tail_entry_id: root.next_tail_entry_id,
+    })
 }
 
 impl Drop for StagedManifestRevision<'_> {
@@ -387,7 +498,7 @@ impl Drop for StagedManifestRevision<'_> {
 
 impl ManifestStore {
     pub(crate) fn new(table_data_dir: impl Into<PathBuf>) -> Self {
-        Self::new_with_codec(table_data_dir, ManifestCodecKind::JSON_DEBUG_V2)
+        Self::new_with_codec(table_data_dir, ManifestCodecKind::JSON_DEBUG_V3)
     }
 
     pub(crate) fn new_with_codec(
@@ -501,10 +612,44 @@ impl ManifestStore {
         }
     }
 
-    pub(crate) fn begin_revision(
+    pub(crate) fn begin_empty_revision(
+        &self,
+        definition_id: u64,
+        root: GenerationManifestRoot,
+    ) -> Result<StagedManifestRevision<'_>> {
+        self.begin_revision_with_state(
+            definition_id,
+            root,
+            MaterializedManifestState {
+                artifacts: Arc::new(GenerationArtifactSet::default()),
+                tail_pending_entries: Vec::new(),
+                next_tail_entry_id: TailEntryId(1),
+            },
+        )
+    }
+
+    pub(crate) fn begin_revision_from_manifest(
+        &self,
+        definition_id: u64,
+        root: GenerationManifestRoot,
+        manifest: &LoadedManifest,
+    ) -> Result<StagedManifestRevision<'_>> {
+        self.begin_revision_with_state(
+            definition_id,
+            root,
+            MaterializedManifestState {
+                artifacts: manifest.artifacts.clone(),
+                tail_pending_entries: manifest.tail_pending_entries.clone(),
+                next_tail_entry_id: manifest.next_tail_entry_id,
+            },
+        )
+    }
+
+    fn begin_revision_with_state(
         &self,
         definition_id: u64,
         mut root: GenerationManifestRoot,
+        materialized: MaterializedManifestState,
     ) -> Result<StagedManifestRevision<'_>> {
         if root.definition_id != definition_id {
             return Err(paro_error::data_corrupted(format!(
@@ -513,7 +658,7 @@ impl ManifestStore {
             )));
         }
         let installed_max = self
-            .greatest_root_version_in_generation(definition_id, root.generation_id)?
+            .greatest_fragment_version_in_generation(definition_id, root.generation_id)?
             .unwrap_or(0);
         root.root_version = root
             .root_version
@@ -529,21 +674,31 @@ impl ManifestStore {
             store: self,
             definition_id,
             root,
+            materialized,
             unpublished_paths: Vec::new(),
             absorbed_created_paths: Vec::new(),
             compaction_checked: false,
+            layout_replaced: false,
             committed: false,
         })
     }
 
-    fn greatest_root_version_in_generation(
+    fn greatest_fragment_version_in_generation(
         &self,
         definition_id: u64,
         generation_id: SearchGenerationId,
     ) -> Result<Option<u64>> {
         let generation_dir = self.generation_dir(definition_id, generation_id);
-        let Ok(entries) = fs::read_dir(&generation_dir) else {
-            return Ok(None);
+        let entries = match fs::read_dir(&generation_dir) {
+            Ok(entries) => entries,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(error) => {
+                return Err(paro_error::io_error(format!(
+                    "scan search manifest generation {}: {}",
+                    generation_dir.display(),
+                    error
+                )))
+            }
         };
         let mut greatest = None;
         for entry in entries {
@@ -553,7 +708,7 @@ impl ManifestStore {
             }
             let name = entry.file_name();
             let Some((file_generation_id, root_version)) =
-                name.to_str().and_then(parse_manifest_root_file_name)
+                name.to_str().and_then(parse_manifest_fragment_version)
             else {
                 continue;
             };
@@ -573,22 +728,10 @@ impl ManifestStore {
         definition_id: u64,
         root: &GenerationManifestRoot,
     ) -> Result<PathBuf> {
-        let mut root_to_write = root.clone();
-        let mut embedded_state = None;
-        if matches!(self.codec_kind.family, ManifestCodecFamily::Binary) {
-            root_to_write.materialized_state_file = None;
-            let materialized =
-                self.load_materialized_state(definition_id, &root_to_write, false)?;
-            embedded_state = Some(ManifestShard {
-                artifact_refs: query_open_artifact_refs(materialized.artifacts.artifacts),
-                tail_pending_entries: materialized.tail_pending_entries,
-            });
-            root_to_write.recompute_checksum_for_codec_and_state(self.codec_kind, None)?;
-        }
         let path = self
-            .generation_dir(definition_id, root_to_write.generation_id)
-            .join(Self::root_file_name(&root_to_write));
-        self.write_root_fragment(&path, &root_to_write, embedded_state.as_ref())?;
+            .generation_dir(definition_id, root.generation_id)
+            .join(Self::root_file_name(root));
+        self.write_root_fragment(&path, root)?;
         Ok(path)
     }
 
@@ -727,33 +870,24 @@ impl ManifestStore {
         root_path: PathBuf,
     ) -> Result<Option<LoadedManifest>> {
         let started_at = Instant::now();
-        let (mut root, embedded_state) = self.read_root_fragment(&root_path)?;
+        let root = self.read_root_fragment(&root_path)?;
         if root.definition_id != definition_id {
             return Err(paro_error::data_corrupted(format!(
                 "search manifest root definition {} does not match directory {definition_id}",
                 root.definition_id
             )));
         }
-        if self.codec_kind == ManifestCodecKind::JSON_DEBUG_V2 {
-            let mut verified = root.clone();
-            let expected_checksum = verified.checksum;
-            verified.recompute_checksum_for_codec_and_state(self.codec_kind, None)?;
-            if verified.checksum != expected_checksum {
-                return Err(paro_error::invalid_input(format!(
-                    "search manifest checksum mismatch for definition {}",
-                    definition_id
-                )));
-            }
+        let mut verified = root.clone();
+        let expected_checksum = verified.checksum;
+        verified.recompute_checksum()?;
+        if verified.checksum != expected_checksum {
+            return Err(paro_error::invalid_input(format!(
+                "search manifest checksum mismatch for definition {}",
+                definition_id
+            )));
         }
 
-        let embedded_materialized_state = embedded_state.is_some();
-        let materialized = if let Some(state) = embedded_state {
-            self.enforce_materialized_state_open_budget(definition_id, &root)?;
-            self.materialized_state_from_shard(definition_id, &root, state)?
-        } else {
-            self.load_materialized_state(definition_id, &root, true)?
-        };
-        root.next_tail_entry_id = materialized.next_tail_entry_id;
+        let materialized = self.load_materialized_state(definition_id, &root, true)?;
         let definition_dir = self.generation_dir(definition_id, root.generation_id);
         let shard_paths = root
             .shard_files
@@ -765,18 +899,14 @@ impl ManifestStore {
             .iter()
             .map(|file| definition_dir.join(&file.file_name))
             .collect::<Vec<_>>();
-        let materialized_state_path = root
-            .materialized_state_file
-            .as_ref()
-            .map(|file| definition_dir.join(&file.file_name));
         let loaded = LoadedManifest {
             root,
             root_path,
             shard_paths,
             delta_paths,
-            materialized_state_path,
-            embedded_materialized_state,
-            artifacts: Arc::new(materialized.artifacts),
+            next_tail_entry_id: materialized.next_tail_entry_id,
+            publication_lease: None,
+            artifacts: materialized.artifacts,
             tail_pending_entries: materialized.tail_pending_entries,
         };
         storage_metrics()
@@ -796,18 +926,7 @@ impl ManifestStore {
     ) -> Result<MaterializedManifestState> {
         let definition_dir = self.generation_dir(definition_id, root.generation_id);
         if enforce_open_budget {
-            if root.materialized_state_file.is_some() {
-                self.enforce_materialized_state_open_budget(definition_id, root)?;
-            } else {
-                self.enforce_delta_open_budget(definition_id, root, &definition_dir)?;
-            }
-        }
-        if let Some(state_file) = &root.materialized_state_file {
-            let state = self.read_typed_fragment::<ManifestShard>(
-                &definition_dir.join(&state_file.file_name),
-                state_file.codec,
-            )?;
-            return self.materialized_state_from_shard(definition_id, root, state);
+            self.enforce_delta_open_budget(definition_id, root, &definition_dir)?;
         }
         let mut artifact_map = BTreeMap::<ArtifactManifestKey, SearchArtifactRef>::new();
         let mut tail_map = BTreeMap::<TailEntryId, TailPendingEntry>::new();
@@ -861,53 +980,7 @@ impl ManifestStore {
         let artifacts = GenerationArtifactSet::try_new(artifact_map.into_values().collect())?;
         artifacts.validate_for_generation(root.definition_id, root.generation_id)?;
         Ok(MaterializedManifestState {
-            artifacts,
-            tail_pending_entries: tail_map.into_values().collect(),
-            next_tail_entry_id,
-        })
-    }
-
-    fn materialized_state_from_shard(
-        &self,
-        definition_id: u64,
-        root: &GenerationManifestRoot,
-        state: ManifestShard,
-    ) -> Result<MaterializedManifestState> {
-        for artifact in &state.artifact_refs {
-            artifact.validate()?;
-        }
-        if state.artifact_refs.iter().all(|artifact| {
-            !matches!(
-                artifact.location,
-                ArtifactLocation::SidecarArtifactFile { .. }
-            )
-        }) {
-            let artifacts = GenerationArtifactSet::try_new(state.artifact_refs)?;
-            artifacts.validate_for_generation(root.definition_id, root.generation_id)?;
-            return Ok(MaterializedManifestState {
-                artifacts,
-                tail_pending_entries: state.tail_pending_entries,
-                next_tail_entry_id: root.next_tail_entry_id,
-            });
-        }
-        let mut artifact_map = BTreeMap::<ArtifactManifestKey, SearchArtifactRef>::new();
-        let mut tail_map = BTreeMap::<TailEntryId, TailPendingEntry>::new();
-        for artifact in state.artifact_refs {
-            artifact_map.insert(artifact_key(&artifact), artifact);
-        }
-        for entry in state.tail_pending_entries {
-            upsert_tail_entry(definition_id, &mut tail_map, entry)?;
-        }
-        let (artifact_map, next_tail_entry_id) = self.filter_missing_sidecar_artifacts(
-            definition_id,
-            root,
-            artifact_map,
-            &mut tail_map,
-        )?;
-        let artifacts = GenerationArtifactSet::try_new(artifact_map.into_values().collect())?;
-        artifacts.validate_for_generation(root.definition_id, root.generation_id)?;
-        Ok(MaterializedManifestState {
-            artifacts,
+            artifacts: Arc::new(artifacts),
             tail_pending_entries: tail_map.into_values().collect(),
             next_tail_entry_id,
         })
@@ -926,7 +999,7 @@ impl ManifestStore {
         let mut next_recovery_tail_id = root.next_tail_entry_id.0.max(1);
         let mut retained = BTreeMap::new();
         for (key, artifact) in artifact_map {
-            if self.sidecar_artifact_range_exists(&artifact.location) {
+            if self.sidecar_artifact_range_exists(&artifact.location)? {
                 retained.insert(key, artifact);
                 continue;
             }
@@ -980,7 +1053,7 @@ impl ManifestStore {
         Ok((retained, TailEntryId(next_recovery_tail_id)))
     }
 
-    fn sidecar_artifact_range_exists(&self, location: &ArtifactLocation) -> bool {
+    fn sidecar_artifact_range_exists(&self, location: &ArtifactLocation) -> Result<bool> {
         let ArtifactLocation::SidecarArtifactFile {
             file_id,
             offset,
@@ -988,17 +1061,23 @@ impl ManifestStore {
             ..
         } = location
         else {
-            return true;
+            return Ok(true);
         };
         let Some(end) = offset.checked_add(*len) else {
-            return false;
+            return Ok(false);
         };
-        fs::metadata(
-            self.table_data_dir
-                .join(SidecarArtifactStore::package_relative_path(*file_id)),
-        )
-        .map(|metadata| metadata.len() >= end)
-        .unwrap_or(false)
+        let path = self
+            .table_data_dir
+            .join(SidecarArtifactStore::package_relative_path(*file_id));
+        match fs::metadata(&path) {
+            Ok(metadata) => Ok(metadata.len() >= end),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
+            Err(error) => Err(paro_error::io_error(format!(
+                "inspect search sidecar artifact {}: {}",
+                path.display(),
+                error
+            ))),
+        }
     }
 
     fn enforce_delta_open_budget(
@@ -1017,21 +1096,6 @@ impl ManifestStore {
                 delta_bytes,
                 DELTA_COUNT_HARD_LIMIT,
                 DELTA_BYTES_HARD_LIMIT
-            )));
-        }
-        Ok(())
-    }
-
-    fn enforce_materialized_state_open_budget(
-        &self,
-        definition_id: u64,
-        root: &GenerationManifestRoot,
-    ) -> Result<()> {
-        let delta_count = root.recent_delta_files.len();
-        if delta_count > DELTA_COUNT_HARD_LIMIT {
-            return Err(paro_error::invalid_input(format!(
-                "search manifest delta window for definition {} exceeds open hard budget: count={} limit={}",
-                definition_id, delta_count, DELTA_COUNT_HARD_LIMIT
             )));
         }
         Ok(())
@@ -1168,16 +1232,10 @@ impl ManifestStore {
         &self,
         heads: &[SearchGenerationHeadMeta],
     ) -> Result<usize> {
-        let mut keep_by_definition = BTreeMap::<u64, std::collections::BTreeSet<PathBuf>>::new();
-        for head in heads {
-            let loaded = self.load_manifest_for_head(head)?.ok_or_else(|| {
-                paro_error::data_corrupted(format!(
-                    "durable search generation head for definition {} has no manifest during orphan sweep",
-                    head.definition_id
-                ))
-            })?;
-            keep_by_definition.insert(head.definition_id, loaded.all_paths().into_iter().collect());
-        }
+        let heads_by_definition = heads
+            .iter()
+            .map(|head| (head.definition_id, head))
+            .collect::<BTreeMap<_, _>>();
 
         let definitions_dir = self
             .table_data_dir
@@ -1199,23 +1257,44 @@ impl ManifestStore {
             else {
                 continue;
             };
-            let keep = keep_by_definition.get(&definition_id);
-            let generations_dir = definition.path().join("generations");
-            let Ok(generations) = fs::read_dir(&generations_dir) else {
+            let Some(head) = heads_by_definition.get(&definition_id) else {
+                // Absence of a head does not prove retirement. Definitions are
+                // reclaimed only by the explicit retirement path.
                 continue;
+            };
+            let generations_dir = definition.path().join("generations");
+            let generations = match fs::read_dir(&generations_dir) {
+                Ok(generations) => generations,
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+                Err(error) => return Err(paro_error::io(error)),
             };
             for generation in generations {
                 let generation = generation.map_err(paro_error::io)?;
                 if !generation.file_type().map_err(paro_error::io)?.is_dir() {
                     continue;
                 }
+                let generation_id = generation
+                    .file_name()
+                    .to_str()
+                    .and_then(|name| name.strip_prefix('g'))
+                    .and_then(|value| value.parse::<u64>().ok());
+                if generation_id != Some(head.generation_id) {
+                    continue;
+                }
                 for entry in fs::read_dir(generation.path()).map_err(paro_error::io)? {
                     let entry = entry.map_err(paro_error::io)?;
                     let path = entry.path();
-                    if !entry.file_type().map_err(paro_error::io)?.is_file()
-                        || !is_manifest_fragment_path(&path)
-                        || keep.is_some_and(|paths| paths.contains(&path))
-                    {
+                    if !entry.file_type().map_err(paro_error::io)?.is_file() {
+                        continue;
+                    }
+                    let Some((_, root_version)) = path
+                        .file_name()
+                        .and_then(|name| name.to_str())
+                        .and_then(parse_manifest_fragment_version)
+                    else {
+                        continue;
+                    };
+                    if root_version <= head.root_version {
                         continue;
                     }
                     fs::remove_file(&path).map_err(|error| {
@@ -1274,12 +1353,7 @@ impl ManifestStore {
         paths
     }
 
-    fn write_root_fragment(
-        &self,
-        path: &Path,
-        root: &GenerationManifestRoot,
-        embedded_state: Option<&ManifestShard>,
-    ) -> Result<()> {
+    fn write_root_fragment(&self, path: &Path, root: &GenerationManifestRoot) -> Result<()> {
         if let Some(parent) = path.parent() {
             fs::create_dir_all(parent).map_err(|err| {
                 paro_error::internal(format!(
@@ -1290,15 +1364,15 @@ impl ManifestStore {
             })?;
         }
         let bytes = match self.codec_kind {
-            ManifestCodecKind::JSON_DEBUG_V2 => serde_json::to_vec_pretty(root).map_err(|err| {
+            ManifestCodecKind::JSON_DEBUG_V3 => serde_json::to_vec_pretty(root).map_err(|err| {
                 paro_error::serialization_error(format!(
                     "serialize search manifest root fragment: {err}"
                 ))
             })?,
             ManifestCodecKind {
                 family: ManifestCodecFamily::Binary,
-                version: 2,
-            } => encode_binary_root_fragment(root, embedded_state)?,
+                version: 3,
+            } => encode_binary_manifest_fragment(root)?,
             other => {
                 return Err(paro_error::not_supported(format!(
                     "unsupported search manifest codec {:?}",
@@ -1328,27 +1402,24 @@ impl ManifestStore {
         write_durable_manifest_fragment(path, &bytes)
     }
 
-    fn read_root_fragment(
-        &self,
-        path: &Path,
-    ) -> Result<(GenerationManifestRoot, Option<ManifestShard>)> {
+    fn read_root_fragment(&self, path: &Path) -> Result<GenerationManifestRoot> {
         let bytes = fs::read(path).map_err(|err| {
             paro_error::internal(format!("read search manifest {}: {}", path.display(), err))
         })?;
         storage_metrics().add_search_manifest_open_bytes(self.codec_label(), bytes.len() as u64);
         match self.codec_kind {
-            ManifestCodecKind::JSON_DEBUG_V2 => {
+            ManifestCodecKind::JSON_DEBUG_V3 => {
                 let root = serde_json::from_slice(&bytes).map_err(|err| {
                     paro_error::serialization_error(format!(
                         "deserialize search manifest root fragment: {err}"
                     ))
                 })?;
-                Ok((root, None))
+                Ok(root)
             }
             ManifestCodecKind {
                 family: ManifestCodecFamily::Binary,
-                version: 2,
-            } => decode_binary_root_fragment(&bytes),
+                version: 3,
+            } => decode_binary_manifest_fragment(&bytes),
             other => Err(paro_error::not_supported(format!(
                 "unsupported search manifest codec {:?}",
                 other
@@ -1374,12 +1445,12 @@ fn encode_manifest_fragment<T: Serialize + BinaryManifestFragment>(
     value: &T,
 ) -> Result<Vec<u8>> {
     match codec {
-        ManifestCodecKind::JSON_DEBUG_V2 => serde_json::to_vec_pretty(value).map_err(|err| {
+        ManifestCodecKind::JSON_DEBUG_V3 => serde_json::to_vec_pretty(value).map_err(|err| {
             paro_error::serialization_error(format!("serialize search manifest fragment: {err}"))
         }),
         ManifestCodecKind {
             family: ManifestCodecFamily::Binary,
-            version: 2,
+            version: 3,
         } => encode_binary_manifest_fragment(value),
         other => Err(paro_error::not_supported(format!(
             "unsupported search manifest codec {:?}",
@@ -1439,6 +1510,12 @@ fn write_durable_manifest_fragment(path: &Path, bytes: &[u8]) -> Result<()> {
                 path.display().to_string(),
             ));
         }
+        if err.kind() == std::io::ErrorKind::Unsupported {
+            return Err(paro_error::not_supported(format!(
+                "filesystem does not support create-exclusive hard-link publication for immutable search manifests: {}",
+                path.display()
+            )));
+        }
         return Err(paro_error::internal(format!(
             "commit immutable search manifest fragment {} -> {}: {}",
             staging_path.display(),
@@ -1488,17 +1565,6 @@ fn is_manifest_staging_path(path: &Path) -> bool {
         .is_some_and(|name| name.starts_with('.') && name.contains(".staging-"))
 }
 
-fn is_manifest_fragment_path(path: &Path) -> bool {
-    path.file_name()
-        .and_then(|name| name.to_str())
-        .is_some_and(|name| {
-            name.starts_with("manifest_root_")
-                || name.starts_with("shard_")
-                || name.starts_with("delta_")
-                || name.starts_with("materialized_")
-        })
-}
-
 fn parse_manifest_root_file_name(name: &str) -> Option<(SearchGenerationId, u64)> {
     let body = name
         .strip_prefix("manifest_root_g")?
@@ -1506,6 +1572,19 @@ fn parse_manifest_root_file_name(name: &str) -> Option<(SearchGenerationId, u64)
     let (generation, revision) = body.split_once("_v")?;
     let (version, fingerprint) = revision.split_once("_f")?;
     fingerprint.parse::<u64>().ok()?;
+    Some((generation.parse().ok()?, version.parse().ok()?))
+}
+
+fn parse_manifest_fragment_version(name: &str) -> Option<(SearchGenerationId, u64)> {
+    if let Some(identity) = parse_manifest_root_file_name(name) {
+        return Some(identity);
+    }
+    let body = name.strip_suffix(".json")?;
+    let body = body
+        .strip_prefix("shard_g")
+        .or_else(|| body.strip_prefix("delta_g"))?;
+    let (generation, revision) = body.split_once("_v")?;
+    let version = revision.split('_').next()?;
     Some((generation.parse().ok()?, version.parse().ok()?))
 }
 
@@ -1531,12 +1610,12 @@ fn decode_manifest_fragment<T: for<'de> Deserialize<'de> + BinaryManifestFragmen
     bytes: &[u8],
 ) -> Result<T> {
     match codec {
-        ManifestCodecKind::JSON_DEBUG_V2 => serde_json::from_slice(bytes).map_err(|err| {
+        ManifestCodecKind::JSON_DEBUG_V3 => serde_json::from_slice(bytes).map_err(|err| {
             paro_error::serialization_error(format!("deserialize search manifest fragment: {err}"))
         }),
         ManifestCodecKind {
             family: ManifestCodecFamily::Binary,
-            version: 2,
+            version: 3,
         } => decode_binary_manifest_fragment(bytes),
         other => Err(paro_error::not_supported(format!(
             "unsupported search manifest codec {:?}",
@@ -1557,13 +1636,6 @@ fn artifact_key(artifact: &SearchArtifactRef) -> ArtifactManifestKey {
         artifact.kind,
         artifact.provider_variant,
     )
-}
-
-fn query_open_artifact_refs(mut artifacts: Vec<SearchArtifactRef>) -> Vec<SearchArtifactRef> {
-    for artifact in &mut artifacts {
-        artifact.stats.provider_stats = None;
-    }
-    artifacts
 }
 
 fn checksum_bytes(bytes: &[u8]) -> u64 {
@@ -1707,24 +1779,24 @@ mod tests {
     }
 
     #[test]
-    fn manifest_codec_dispatch_round_trips_json_and_binary_v2() {
+    fn manifest_codec_dispatch_round_trips_json_and_binary_v3() {
         let delta = ManifestDelta::new(vec![
             ManifestDeltaEntry::AddArtifact(sample_artifact(10, 0)),
             ManifestDeltaEntry::UpsertTail(sample_tail_entry(1, 10, 0)),
         ]);
         let json_bytes =
-            encode_manifest_fragment(ManifestCodecKind::JSON_DEBUG_V2, &delta).unwrap();
+            encode_manifest_fragment(ManifestCodecKind::JSON_DEBUG_V3, &delta).unwrap();
         let decoded_json: ManifestDelta =
-            decode_manifest_fragment(ManifestCodecKind::JSON_DEBUG_V2, &json_bytes).unwrap();
+            decode_manifest_fragment(ManifestCodecKind::JSON_DEBUG_V3, &json_bytes).unwrap();
         assert_eq!(decoded_json, delta);
 
-        let binary_v2 = ManifestCodecKind::BINARY_V2;
-        let binary_bytes = encode_manifest_fragment(binary_v2, &delta).unwrap();
+        let binary_v3 = ManifestCodecKind::BINARY_V3;
+        let binary_bytes = encode_manifest_fragment(binary_v3, &delta).unwrap();
         assert!(!binary_bytes.starts_with(b"{"));
         let decoded_binary: ManifestDelta =
-            decode_manifest_fragment(binary_v2, &binary_bytes).unwrap();
+            decode_manifest_fragment(binary_v3, &binary_bytes).unwrap();
         assert_eq!(decoded_binary, delta);
-        assert_eq!(binary_v2.metric_label(), "binary-v2");
+        assert_eq!(binary_v3.metric_label(), "binary-v3");
     }
 
     #[test]
@@ -1771,7 +1843,7 @@ mod tests {
             root_json["shard_files"][0]["codec"]["family"],
             serde_json::Value::String("json_debug".to_string())
         );
-        assert_eq!(root_json["shard_files"][0]["codec"]["version"], 2);
+        assert_eq!(root_json["shard_files"][0]["codec"]["version"], 3);
         assert_eq!(
             root_json["recent_delta_files"][0]["codec"]["family"],
             serde_json::Value::String("json_debug".to_string())
@@ -1779,9 +1851,9 @@ mod tests {
     }
 
     #[test]
-    fn binary_manifest_root_embeds_query_open_state() {
+    fn binary_manifest_root_keeps_fragment_graph_explicit() {
         let temp_dir = TempDir::new().expect("temp dir");
-        let store = ManifestStore::new_with_codec(temp_dir.path(), ManifestCodecKind::BINARY_V2);
+        let store = ManifestStore::new_with_codec(temp_dir.path(), ManifestCodecKind::BINARY_V3);
         let definition_id = 88;
         let shard_ref = store
             .write_shard(
@@ -1810,20 +1882,15 @@ mod tests {
         let root_path = store.write_root(definition_id, &root).unwrap();
 
         let bytes = std::fs::read(&root_path).unwrap();
-        assert!(bytes.starts_with(b"PMB2"));
+        assert!(bytes.starts_with(b"PMB3"));
         let loaded = store
             .load_latest_manifest_for_private_workspace(definition_id)
             .unwrap()
             .expect("binary manifest should load");
-        assert!(loaded.embedded_materialized_state);
-        assert_eq!(loaded.opened_paths(), vec![root_path]);
+        assert_eq!(loaded.opened_paths().len(), 3);
+        assert_eq!(loaded.opened_paths()[0], root_path);
         assert_eq!(loaded.artifacts.artifacts.len(), 1);
         assert_eq!(loaded.tail_pending_entries.len(), 2);
-        assert!(loaded
-            .artifacts
-            .artifacts
-            .iter()
-            .all(|artifact| artifact.stats.provider_stats.is_none()));
     }
 
     #[test]
@@ -2042,11 +2109,15 @@ mod tests {
         let old_head = store.head_for_root(&root);
 
         let prepared_root_path = store.generation_dir(definition_id, 1).join(format!(
-            "manifest_root_g1_v2_f{}.json",
+            "manifest_root_g1_v3_f{}.json",
             root.config_fingerprint
         ));
+        let current = store
+            .load_manifest_for_head(&old_head)
+            .unwrap()
+            .expect("load current manifest");
         let mut revision = store
-            .begin_revision(definition_id, root)
+            .begin_revision_from_manifest(definition_id, root, &current)
             .expect("begin compacted revision");
         assert!(
             revision.compact_if_needed().expect("compact deltas"),
@@ -2060,7 +2131,7 @@ mod tests {
 
         assert_eq!(loaded.root.recent_delta_files.len(), 0);
         assert_eq!(loaded.root.shard_files.len(), 1);
-        assert_eq!(loaded.root.root_version, 2);
+        assert_eq!(loaded.root.root_version, 3);
         assert!(
             old_delta_paths.iter().all(|path| path.exists()),
             "manifest construction must not retire files still reachable by the durable head"
@@ -2093,22 +2164,129 @@ mod tests {
         abandoned.root_version = 2;
         abandoned.recompute_checksum().unwrap();
         let abandoned_path = store.write_root(definition_id, &abandoned).unwrap();
+        let abandoned_shard = store
+            .write_shard(
+                definition_id,
+                durable.generation_id,
+                4,
+                &ManifestShard::default(),
+            )
+            .expect("write rootless abandoned shard");
 
         let committed = store
-            .begin_revision(definition_id, durable.clone())
+            .begin_empty_revision(definition_id, durable.clone())
             .expect("allocate past abandoned root")
             .commit()
             .expect("commit non-reused revision");
-        assert_eq!(committed.root.root_version, 3);
+        assert_eq!(committed.root.root_version, 5);
         assert!(committed.root_path.exists());
 
         let removed = store
             .sweep_unpublished_installed_revisions(&[durable_head])
             .expect("sweep revisions newer than durable head");
-        assert_eq!(removed, 2);
+        assert_eq!(removed, 3);
         assert!(durable_path.exists());
         assert!(!abandoned_path.exists());
         assert!(!committed.root_path.exists());
+        assert!(!store
+            .generation_dir(definition_id, durable.generation_id)
+            .join(abandoned_shard.file_name)
+            .exists());
+    }
+
+    #[test]
+    fn orphan_sweep_never_interprets_missing_head_as_retirement() {
+        let temp_dir = TempDir::new().expect("temp dir");
+        let store = ManifestStore::new(temp_dir.path());
+        let definition_id = 92;
+        let mut root = sample_root(definition_id, Vec::new(), Vec::new());
+        root.recompute_checksum().unwrap();
+        let root_path = store.write_root(definition_id, &root).unwrap();
+
+        assert_eq!(
+            store
+                .sweep_unpublished_installed_revisions(&[])
+                .expect("sweep without head"),
+            0
+        );
+        assert!(root_path.exists());
+    }
+
+    #[test]
+    fn revision_commit_does_not_apply_recovery_sidecar_repair() {
+        let temp_dir = TempDir::new().expect("temp dir");
+        let store = ManifestStore::new(temp_dir.path());
+        let definition_id = 93;
+        let file_id = super::super::artifact::ArtifactFileId {
+            definition_id,
+            generation_id: 1,
+            package_index: 0,
+        };
+        let package_path = store
+            .table_data_dir
+            .join(super::SidecarArtifactStore::package_relative_path(file_id));
+        std::fs::create_dir_all(package_path.parent().unwrap()).unwrap();
+        std::fs::write(&package_path, [0u8; 16]).unwrap();
+        let mut artifact = sample_artifact_for_generation(definition_id, 1, 1, 0);
+        artifact.location = ArtifactLocation::SidecarArtifactFile {
+            file_id,
+            offset: 0,
+            len: 16,
+            checksum: 0,
+        };
+        let shard = ManifestShard {
+            artifact_refs: vec![artifact],
+            tail_pending_entries: Vec::new(),
+        };
+        let shard_ref = store.write_shard(definition_id, 1, 1, &shard).unwrap();
+        let mut root = sample_root(definition_id, vec![shard_ref], Vec::new());
+        root.recompute_checksum().unwrap();
+        store.write_root(definition_id, &root).unwrap();
+        let current = store
+            .load_manifest_for_head(&store.head_for_root(&root))
+            .unwrap()
+            .unwrap();
+        std::fs::remove_file(package_path).unwrap();
+
+        let mut revision = store
+            .begin_revision_from_manifest(definition_id, root, &current)
+            .unwrap();
+        revision
+            .append_delta(&ManifestDelta::new(vec![ManifestDeltaEntry::StatsDelta(
+                SearchStatsDelta::FullText(FullTextStatsDelta {
+                    stats: sample_fulltext_stats(),
+                }),
+            )]))
+            .unwrap();
+        let committed = revision.commit().unwrap();
+
+        assert_eq!(committed.artifacts.artifacts.len(), 1);
+        assert!(committed.tail_pending_entries.is_empty());
+    }
+
+    #[test]
+    fn revision_lease_cleans_unacknowledged_fragments_and_preserves_acknowledged_ones() {
+        let temp_dir = TempDir::new().expect("temp dir");
+        let store = ManifestStore::new(temp_dir.path());
+
+        let unacknowledged = store
+            .begin_empty_revision(94, sample_root(94, Vec::new(), Vec::new()))
+            .unwrap()
+            .commit()
+            .unwrap();
+        let unacknowledged_path = unacknowledged.root_path.clone();
+        drop(unacknowledged);
+        assert!(!unacknowledged_path.exists());
+
+        let acknowledged = store
+            .begin_empty_revision(95, sample_root(95, Vec::new(), Vec::new()))
+            .unwrap()
+            .commit()
+            .unwrap();
+        let acknowledged_path = acknowledged.root_path.clone();
+        acknowledged.mark_revision_published();
+        drop(acknowledged);
+        assert!(acknowledged_path.exists());
     }
 
     #[test]
@@ -2284,7 +2462,6 @@ mod tests {
             checksum: 0,
             shard_files,
             recent_delta_files,
-            materialized_state_file: None,
         }
     }
 }

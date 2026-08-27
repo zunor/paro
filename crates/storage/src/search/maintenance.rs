@@ -221,16 +221,15 @@ mod tests {
                 recent_delta_files: (0..recent_delta_count)
                     .map(|ordinal| ManifestFileRef {
                         file_name: format!("delta_{ordinal}.json"),
-                        codec: ManifestCodecKind::JSON_DEBUG_V2,
+                        codec: ManifestCodecKind::JSON_DEBUG_V3,
                     })
                     .collect(),
-                materialized_state_file: None,
             },
             root_path: PathBuf::new(),
             shard_paths: Vec::new(),
             delta_paths: Vec::new(),
-            materialized_state_path: None,
-            embedded_materialized_state: false,
+            next_tail_entry_id: TailEntryId(2),
+            publication_lease: None,
             artifacts: Arc::new(GenerationArtifactSet::default()),
             tail_pending_entries,
         }

@@ -64,7 +64,7 @@ impl ManifestOpenBenchConfig {
             entries_per_delta: 1,
             shard_count: 1,
             entries_per_shard: 0,
-            codec: ManifestBenchCodec::JsonDebugV2,
+            codec: ManifestBenchCodec::JsonDebugV3,
         }
     }
 
@@ -82,22 +82,22 @@ impl ManifestOpenBenchConfig {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ManifestBenchCodec {
-    JsonDebugV2,
-    BinaryV2,
+    JsonDebugV3,
+    BinaryV3,
 }
 
 impl ManifestBenchCodec {
     pub const fn label(self) -> &'static str {
         match self {
-            Self::JsonDebugV2 => "json-debug-v2",
-            Self::BinaryV2 => "binary-v2",
+            Self::JsonDebugV3 => "json-debug-v3",
+            Self::BinaryV3 => "binary-v3",
         }
     }
 
     const fn manifest_codec(self) -> ManifestCodecKind {
         match self {
-            Self::JsonDebugV2 => ManifestCodecKind::JSON_DEBUG_V2,
-            Self::BinaryV2 => ManifestCodecKind::BINARY_V2,
+            Self::JsonDebugV3 => ManifestCodecKind::JSON_DEBUG_V3,
+            Self::BinaryV3 => ManifestCodecKind::BINARY_V3,
         }
     }
 }
@@ -179,7 +179,6 @@ pub fn prepare_manifest_open_bench_fixture(
         checksum: 0,
         shard_files: shard_refs,
         recent_delta_files: delta_refs,
-        materialized_state_file: None,
     };
     root.recompute_checksum()?;
     store.write_root(config.definition_id, &root)?;

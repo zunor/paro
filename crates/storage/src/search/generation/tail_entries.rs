@@ -58,7 +58,6 @@ pub(crate) fn assign_tail_entry_ids_for_full_snapshot(
     let mut next_id = 1;
     if let Some(manifest) = current_manifest {
         next_id = manifest
-            .root
             .next_tail_entry_id
             .0
             .max(next_tail_entry_id(&manifest.tail_pending_entries));
