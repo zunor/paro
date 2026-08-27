@@ -237,6 +237,7 @@ impl LoadedManifest {
 struct MaterializedManifestState {
     artifacts: GenerationArtifactSet,
     tail_pending_entries: Vec<TailPendingEntry>,
+    next_tail_entry_id: TailEntryId,
 }
 
 type ArtifactManifestKey = (SearchPartitionCoverage, u32, SearchIndexKind, u32);
@@ -244,6 +245,144 @@ type ArtifactManifestKey = (SearchPartitionCoverage, u32, SearchIndexKind, u32);
 pub(crate) struct ManifestStore {
     table_data_dir: PathBuf,
     codec_kind: ManifestCodecKind,
+}
+
+/// Owns every immutable fragment prepared for one manifest revision.
+///
+/// A revision number is allocated once from both durable state and the
+/// installed namespace. Every fragment remains rollback-owned until the root
+/// has been written and read back through the normal open path. This keeps
+/// version allocation, optional compaction, validation, and cleanup in one
+/// layer instead of relying on publisher-specific call discipline.
+pub(crate) struct StagedManifestRevision<'a> {
+    store: &'a ManifestStore,
+    definition_id: u64,
+    root: GenerationManifestRoot,
+    unpublished_paths: Vec<PathBuf>,
+    absorbed_created_paths: Vec<PathBuf>,
+    compaction_checked: bool,
+    committed: bool,
+}
+
+impl StagedManifestRevision<'_> {
+    pub(crate) fn append_delta(&mut self, delta: &ManifestDelta) -> Result<()> {
+        let delta_ref = self.store.write_delta(
+            self.definition_id,
+            self.root.generation_id,
+            self.root.root_version,
+            self.root.recent_delta_files.len(),
+            delta,
+        )?;
+        let path = self
+            .store
+            .generation_dir(self.definition_id, self.root.generation_id)
+            .join(&delta_ref.file_name);
+        self.unpublished_paths.push(path);
+        self.root.recent_delta_files.push(delta_ref);
+        Ok(())
+    }
+
+    pub(crate) fn replace_with_shard(&mut self, shard: &ManifestShard) -> Result<()> {
+        let shard_ref = self.store.write_shard(
+            self.definition_id,
+            self.root.generation_id,
+            self.root.root_version,
+            shard,
+        )?;
+        let path = self
+            .store
+            .generation_dir(self.definition_id, self.root.generation_id)
+            .join(&shard_ref.file_name);
+        self.unpublished_paths.push(path);
+        self.root.shard_files = vec![shard_ref];
+        self.root.recent_delta_files.clear();
+        self.root.materialized_state_file = None;
+        Ok(())
+    }
+
+    pub(crate) fn compact_if_needed(&mut self) -> Result<bool> {
+        self.compaction_checked = true;
+        let definition_dir = self
+            .store
+            .generation_dir(self.definition_id, self.root.generation_id);
+        let delta_bytes = self.root.delta_window_bytes(&definition_dir);
+        let delta_count = self.root.recent_delta_files.len();
+        if delta_count <= DELTA_COUNT_SOFT_LIMIT && delta_bytes <= DELTA_BYTES_SOFT_LIMIT {
+            return Ok(false);
+        }
+
+        let mut replay_root = self.root.clone();
+        replay_root.materialized_state_file.take();
+        let materialized =
+            self.store
+                .load_materialized_state(self.definition_id, &replay_root, false)?;
+        self.root.next_tail_entry_id = materialized.next_tail_entry_id;
+
+        let absorbed_delta_paths = self
+            .root
+            .recent_delta_files
+            .iter()
+            .map(|file| definition_dir.join(&file.file_name))
+            .collect::<std::collections::BTreeSet<_>>();
+        self.absorbed_created_paths.extend(
+            self.unpublished_paths
+                .iter()
+                .filter(|path| absorbed_delta_paths.contains(*path))
+                .cloned(),
+        );
+        self.replace_with_shard(&ManifestShard {
+            artifact_refs: materialized.artifacts.artifacts,
+            tail_pending_entries: materialized.tail_pending_entries,
+        })?;
+
+        if delta_count > DELTA_COUNT_HARD_LIMIT || delta_bytes > DELTA_BYTES_HARD_LIMIT {
+            tracing::warn!(
+                definition_id = self.definition_id,
+                delta_count,
+                delta_bytes,
+                "search manifest delta window exceeded hard threshold before compaction"
+            );
+        }
+        Ok(true)
+    }
+
+    pub(crate) fn commit(mut self) -> Result<LoadedManifest> {
+        if !self.compaction_checked {
+            self.compact_if_needed()?;
+        }
+        self.root.recompute_checksum()?;
+        let root_path = self.store.write_root(self.definition_id, &self.root)?;
+        self.unpublished_paths.push(root_path);
+        let head = self.store.head_for_root(&self.root);
+        let loaded = self.store.load_manifest_for_head(&head)?.ok_or_else(|| {
+            paro_error::data_corrupted(format!(
+                "newly committed search manifest root for definition {} cannot be reopened",
+                self.definition_id
+            ))
+        })?;
+        if loaded.root.definition_id != self.root.definition_id
+            || loaded.root.generation_id != self.root.generation_id
+            || loaded.root.root_version != self.root.root_version
+            || loaded.root.config_fingerprint != self.root.config_fingerprint
+        {
+            return Err(paro_error::data_corrupted(format!(
+                "newly committed search manifest root for definition {} changed identity during reopen",
+                self.definition_id
+            )));
+        }
+
+        self.committed = true;
+        self.store.remove_paths(&self.absorbed_created_paths);
+        Ok(loaded)
+    }
+}
+
+impl Drop for StagedManifestRevision<'_> {
+    fn drop(&mut self) {
+        if !self.committed {
+            self.store.remove_paths(&self.unpublished_paths);
+        }
+    }
 }
 
 impl ManifestStore {
@@ -362,6 +501,73 @@ impl ManifestStore {
         }
     }
 
+    pub(crate) fn begin_revision(
+        &self,
+        definition_id: u64,
+        mut root: GenerationManifestRoot,
+    ) -> Result<StagedManifestRevision<'_>> {
+        if root.definition_id != definition_id {
+            return Err(paro_error::data_corrupted(format!(
+                "search manifest root definition {} does not match revision owner {definition_id}",
+                root.definition_id
+            )));
+        }
+        let installed_max = self
+            .greatest_root_version_in_generation(definition_id, root.generation_id)?
+            .unwrap_or(0);
+        root.root_version = root
+            .root_version
+            .max(installed_max)
+            .checked_add(1)
+            .ok_or_else(|| {
+                paro_error::invalid_input(format!(
+                    "search manifest root version exhausted for definition {definition_id} generation {}",
+                    root.generation_id
+                ))
+            })?;
+        Ok(StagedManifestRevision {
+            store: self,
+            definition_id,
+            root,
+            unpublished_paths: Vec::new(),
+            absorbed_created_paths: Vec::new(),
+            compaction_checked: false,
+            committed: false,
+        })
+    }
+
+    fn greatest_root_version_in_generation(
+        &self,
+        definition_id: u64,
+        generation_id: SearchGenerationId,
+    ) -> Result<Option<u64>> {
+        let generation_dir = self.generation_dir(definition_id, generation_id);
+        let Ok(entries) = fs::read_dir(&generation_dir) else {
+            return Ok(None);
+        };
+        let mut greatest = None;
+        for entry in entries {
+            let entry = entry.map_err(paro_error::io)?;
+            if !entry.file_type().map_err(paro_error::io)?.is_file() {
+                continue;
+            }
+            let name = entry.file_name();
+            let Some((file_generation_id, root_version)) =
+                name.to_str().and_then(parse_manifest_root_file_name)
+            else {
+                continue;
+            };
+            if file_generation_id != generation_id {
+                return Err(paro_error::data_corrupted(format!(
+                    "search manifest root {} disagrees with generation directory g{generation_id}",
+                    entry.path().display()
+                )));
+            }
+            greatest = Some(greatest.map_or(root_version, |value: u64| value.max(root_version)));
+        }
+        Ok(greatest)
+    }
+
     pub(crate) fn write_root(
         &self,
         definition_id: u64,
@@ -382,12 +588,6 @@ impl ManifestStore {
         let path = self
             .generation_dir(definition_id, root_to_write.generation_id)
             .join(Self::root_file_name(&root_to_write));
-        if path.exists() {
-            return Err(paro_error::object_exists(
-                "immutable search manifest root",
-                path.display().to_string(),
-            ));
-        }
         self.write_root_fragment(&path, &root_to_write, embedded_state.as_ref())?;
         Ok(path)
     }
@@ -527,7 +727,7 @@ impl ManifestStore {
         root_path: PathBuf,
     ) -> Result<Option<LoadedManifest>> {
         let started_at = Instant::now();
-        let (root, embedded_state) = self.read_root_fragment(&root_path)?;
+        let (mut root, embedded_state) = self.read_root_fragment(&root_path)?;
         if root.definition_id != definition_id {
             return Err(paro_error::data_corrupted(format!(
                 "search manifest root definition {} does not match directory {definition_id}",
@@ -553,6 +753,7 @@ impl ManifestStore {
         } else {
             self.load_materialized_state(definition_id, &root, true)?
         };
+        root.next_tail_entry_id = materialized.next_tail_entry_id;
         let definition_dir = self.generation_dir(definition_id, root.generation_id);
         let shard_paths = root
             .shard_files
@@ -585,49 +786,6 @@ impl ManifestStore {
             loaded.root.recent_delta_files.len(),
         );
         Ok(Some(loaded))
-    }
-
-    pub(crate) fn materialize_loaded_manifest(
-        &self,
-        definition_id: u64,
-        root: GenerationManifestRoot,
-        artifacts: GenerationArtifactSet,
-        tail_pending_entries: Vec<TailPendingEntry>,
-    ) -> Result<LoadedManifest> {
-        if root.definition_id != definition_id {
-            return Err(paro_error::data_corrupted(format!(
-                "search manifest root definition {} does not match directory {definition_id}",
-                root.definition_id
-            )));
-        }
-        artifacts.validate_for_generation(root.definition_id, root.generation_id)?;
-        let definition_dir = self.generation_dir(definition_id, root.generation_id);
-        let root_path = self.root_path_for_file(
-            definition_id,
-            root.generation_id,
-            &Self::root_file_name(&root),
-        );
-        Ok(LoadedManifest {
-            root_path,
-            shard_paths: root
-                .shard_files
-                .iter()
-                .map(|file| definition_dir.join(&file.file_name))
-                .collect(),
-            delta_paths: root
-                .recent_delta_files
-                .iter()
-                .map(|file| definition_dir.join(&file.file_name))
-                .collect(),
-            materialized_state_path: root
-                .materialized_state_file
-                .as_ref()
-                .map(|file| definition_dir.join(&file.file_name)),
-            embedded_materialized_state: false,
-            root,
-            artifacts: Arc::new(artifacts),
-            tail_pending_entries,
-        })
     }
 
     fn load_materialized_state(
@@ -693,14 +851,19 @@ impl ManifestStore {
             }
         }
 
-        let artifact_map =
-            self.filter_missing_sidecar_artifacts(definition_id, root, artifact_map, &mut tail_map);
+        let (artifact_map, next_tail_entry_id) = self.filter_missing_sidecar_artifacts(
+            definition_id,
+            root,
+            artifact_map,
+            &mut tail_map,
+        )?;
 
         let artifacts = GenerationArtifactSet::try_new(artifact_map.into_values().collect())?;
         artifacts.validate_for_generation(root.definition_id, root.generation_id)?;
         Ok(MaterializedManifestState {
             artifacts,
             tail_pending_entries: tail_map.into_values().collect(),
+            next_tail_entry_id,
         })
     }
 
@@ -724,6 +887,7 @@ impl ManifestStore {
             return Ok(MaterializedManifestState {
                 artifacts,
                 tail_pending_entries: state.tail_pending_entries,
+                next_tail_entry_id: root.next_tail_entry_id,
             });
         }
         let mut artifact_map = BTreeMap::<ArtifactManifestKey, SearchArtifactRef>::new();
@@ -734,13 +898,18 @@ impl ManifestStore {
         for entry in state.tail_pending_entries {
             upsert_tail_entry(definition_id, &mut tail_map, entry)?;
         }
-        let artifact_map =
-            self.filter_missing_sidecar_artifacts(definition_id, root, artifact_map, &mut tail_map);
+        let (artifact_map, next_tail_entry_id) = self.filter_missing_sidecar_artifacts(
+            definition_id,
+            root,
+            artifact_map,
+            &mut tail_map,
+        )?;
         let artifacts = GenerationArtifactSet::try_new(artifact_map.into_values().collect())?;
         artifacts.validate_for_generation(root.definition_id, root.generation_id)?;
         Ok(MaterializedManifestState {
             artifacts,
             tail_pending_entries: tail_map.into_values().collect(),
+            next_tail_entry_id,
         })
     }
 
@@ -750,7 +919,10 @@ impl ManifestStore {
         root: &GenerationManifestRoot,
         artifact_map: BTreeMap<ArtifactManifestKey, SearchArtifactRef>,
         tail_map: &mut BTreeMap<TailEntryId, TailPendingEntry>,
-    ) -> BTreeMap<ArtifactManifestKey, SearchArtifactRef> {
+    ) -> Result<(
+        BTreeMap<ArtifactManifestKey, SearchArtifactRef>,
+        TailEntryId,
+    )> {
         let mut next_recovery_tail_id = root.next_tail_entry_id.0.max(1);
         let mut retained = BTreeMap::new();
         for (key, artifact) in artifact_map {
@@ -776,7 +948,12 @@ impl ManifestStore {
             for (rowset_id, (segment_ids, row_count)) in recovery_by_rowset {
                 let entry_id = loop {
                     let candidate = TailEntryId(next_recovery_tail_id);
-                    next_recovery_tail_id = next_recovery_tail_id.saturating_add(1);
+                    next_recovery_tail_id =
+                        next_recovery_tail_id.checked_add(1).ok_or_else(|| {
+                            paro_error::invalid_input(format!(
+                                "search recovery tail id exhausted for definition {definition_id}"
+                            ))
+                        })?;
                     if !tail_map.contains_key(&candidate) {
                         break candidate;
                     }
@@ -800,7 +977,7 @@ impl ManifestStore {
                 );
             }
         }
-        retained
+        Ok((retained, TailEntryId(next_recovery_tail_id)))
     }
 
     fn sidecar_artifact_range_exists(&self, location: &ArtifactLocation) -> bool {
@@ -862,7 +1039,15 @@ impl ManifestStore {
 
     pub(crate) fn remove_paths(&self, paths: &[PathBuf]) {
         for path in paths {
-            let _ = fs::remove_file(path);
+            match fs::remove_file(path) {
+                Ok(()) => {}
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => tracing::warn!(
+                    path = %path.display(),
+                    error = %error,
+                    "failed to remove unpublished search manifest fragment"
+                ),
+            }
         }
     }
 
@@ -975,6 +1160,79 @@ impl ManifestStore {
         Ok(removed)
     }
 
+    /// Reclaim immutable manifest revisions that are not reachable from the
+    /// tablet's durable heads. This runs only after WAL replay, when the head
+    /// set is the complete visibility boundary and no unapplied publish can
+    /// still make a newer installed root live.
+    pub(crate) fn sweep_unpublished_installed_revisions(
+        &self,
+        heads: &[SearchGenerationHeadMeta],
+    ) -> Result<usize> {
+        let mut keep_by_definition = BTreeMap::<u64, std::collections::BTreeSet<PathBuf>>::new();
+        for head in heads {
+            let loaded = self.load_manifest_for_head(head)?.ok_or_else(|| {
+                paro_error::data_corrupted(format!(
+                    "durable search generation head for definition {} has no manifest during orphan sweep",
+                    head.definition_id
+                ))
+            })?;
+            keep_by_definition.insert(head.definition_id, loaded.all_paths().into_iter().collect());
+        }
+
+        let definitions_dir = self
+            .table_data_dir
+            .join("search_registry")
+            .join("definitions");
+        let Ok(definitions) = fs::read_dir(&definitions_dir) else {
+            return Ok(0);
+        };
+        let mut removed = 0usize;
+        for definition in definitions {
+            let definition = definition.map_err(paro_error::io)?;
+            if !definition.file_type().map_err(paro_error::io)?.is_dir() {
+                continue;
+            }
+            let Some(definition_id) = definition
+                .file_name()
+                .to_str()
+                .and_then(|name| name.parse::<u64>().ok())
+            else {
+                continue;
+            };
+            let keep = keep_by_definition.get(&definition_id);
+            let generations_dir = definition.path().join("generations");
+            let Ok(generations) = fs::read_dir(&generations_dir) else {
+                continue;
+            };
+            for generation in generations {
+                let generation = generation.map_err(paro_error::io)?;
+                if !generation.file_type().map_err(paro_error::io)?.is_dir() {
+                    continue;
+                }
+                for entry in fs::read_dir(generation.path()).map_err(paro_error::io)? {
+                    let entry = entry.map_err(paro_error::io)?;
+                    let path = entry.path();
+                    if !entry.file_type().map_err(paro_error::io)?.is_file()
+                        || !is_manifest_fragment_path(&path)
+                        || keep.is_some_and(|paths| paths.contains(&path))
+                    {
+                        continue;
+                    }
+                    fs::remove_file(&path).map_err(|error| {
+                        paro_error::io_error(format!(
+                            "remove unpublished search manifest fragment {}: {}",
+                            path.display(),
+                            error
+                        ))
+                    })?;
+                    removed = removed.saturating_add(1);
+                }
+            }
+            self.prune_empty_definition_dirs(definition_id);
+        }
+        Ok(removed)
+    }
+
     fn sweep_orphan_staging_fragments_in_dir(&self, dir: &Path) -> Result<usize> {
         let Ok(entries) = fs::read_dir(dir) else {
             return Ok(0);
@@ -1014,52 +1272,6 @@ impl ManifestStore {
         }
         paths.sort();
         paths
-    }
-
-    pub(crate) fn maybe_compact_deltas(
-        &self,
-        definition_id: u64,
-        root: &mut GenerationManifestRoot,
-    ) -> Result<Option<PathBuf>> {
-        let definition_dir = self.generation_dir(definition_id, root.generation_id);
-        let delta_bytes = root.delta_window_bytes(&definition_dir);
-        let delta_count = root.recent_delta_files.len();
-        if delta_count <= DELTA_COUNT_SOFT_LIMIT && delta_bytes <= DELTA_BYTES_SOFT_LIMIT {
-            return Ok(None);
-        }
-
-        let mut root_for_replay = root.clone();
-        root_for_replay.materialized_state_file.take();
-        let materialized = self.load_materialized_state(definition_id, &root_for_replay, false)?;
-        root.root_version = root.root_version.saturating_add(1);
-        let shard = ManifestShard {
-            artifact_refs: materialized.artifacts.artifacts,
-            tail_pending_entries: materialized.tail_pending_entries,
-        };
-        let shard_name =
-            self.write_shard(definition_id, root.generation_id, root.root_version, &shard)?;
-        let shard_path = definition_dir.join(&shard_name.file_name);
-        root.shard_files = vec![shard_name];
-        root.recent_delta_files.clear();
-        root.materialized_state_file = None;
-        if let Err(error) = root.recompute_checksum() {
-            self.remove_paths(&[shard_path]);
-            return Err(error);
-        }
-        // Old fragments remain reachable by the current durable head until
-        // the caller publishes the new root revision. Root publication has
-        // exactly one owner; callers remove this prepared shard if writing the
-        // immutable root fails.
-
-        if delta_count > DELTA_COUNT_HARD_LIMIT || delta_bytes > DELTA_BYTES_HARD_LIMIT {
-            tracing::warn!(
-                definition_id,
-                delta_count,
-                delta_bytes,
-                "search manifest delta window exceeded hard threshold before compaction"
-            );
-        }
-        Ok(Some(shard_path))
     }
 
     fn write_root_fragment(
@@ -1219,15 +1431,28 @@ fn write_durable_manifest_fragment(path: &Path, bytes: &[u8]) -> Result<()> {
         return Err(err);
     }
 
-    fs::rename(&staging_path, path).map_err(|err| {
+    if let Err(err) = fs::hard_link(&staging_path, path) {
         let _ = fs::remove_file(&staging_path);
-        paro_error::internal(format!(
-            "commit search manifest staging fragment {} -> {}: {}",
+        if err.kind() == std::io::ErrorKind::AlreadyExists {
+            return Err(paro_error::object_exists(
+                "immutable search manifest fragment",
+                path.display().to_string(),
+            ));
+        }
+        return Err(paro_error::internal(format!(
+            "commit immutable search manifest fragment {} -> {}: {}",
             staging_path.display(),
             path.display(),
             err
-        ))
-    })?;
+        )));
+    }
+    if let Err(err) = fs::remove_file(&staging_path) {
+        tracing::warn!(
+            path = %staging_path.display(),
+            error = %err,
+            "failed to remove linked search manifest staging fragment"
+        );
+    }
     if let Some(parent) = path.parent() {
         sync_manifest_parent_dir(parent)?;
     }
@@ -1261,6 +1486,17 @@ fn is_manifest_staging_path(path: &Path) -> bool {
     path.file_name()
         .and_then(|name| name.to_str())
         .is_some_and(|name| name.starts_with('.') && name.contains(".staging-"))
+}
+
+fn is_manifest_fragment_path(path: &Path) -> bool {
+    path.file_name()
+        .and_then(|name| name.to_str())
+        .is_some_and(|name| {
+            name.starts_with("manifest_root_")
+                || name.starts_with("shard_")
+                || name.starts_with("delta_")
+                || name.starts_with("materialized_")
+        })
 }
 
 fn parse_manifest_root_file_name(name: &str) -> Option<(SearchGenerationId, u64)> {
@@ -1805,35 +2041,32 @@ mod tests {
         store.write_root(definition_id, &root).unwrap();
         let old_head = store.head_for_root(&root);
 
-        store
-            .maybe_compact_deltas(definition_id, &mut root)
-            .expect("compact deltas")
-            .expect("compaction should prepare a shard");
-        let prepared_head = store.head_for_root(&root);
-        let prepared_root_path = store.root_path_for_file(
-            definition_id,
-            root.generation_id,
-            &prepared_head.root_file_name,
+        let prepared_root_path = store.generation_dir(definition_id, 1).join(format!(
+            "manifest_root_g1_v2_f{}.json",
+            root.config_fingerprint
+        ));
+        let mut revision = store
+            .begin_revision(definition_id, root)
+            .expect("begin compacted revision");
+        assert!(
+            revision.compact_if_needed().expect("compact deltas"),
+            "compaction should prepare a shard"
         );
         assert!(
             !prepared_root_path.exists(),
             "delta compaction must prepare fragments without publishing its root"
         );
-        store.write_root(definition_id, &root).unwrap();
+        let loaded = revision.commit().expect("commit compacted revision");
 
-        assert_eq!(root.recent_delta_files.len(), 0);
-        assert_eq!(root.shard_files.len(), 1);
-        assert_eq!(root.root_version, 2);
+        assert_eq!(loaded.root.recent_delta_files.len(), 0);
+        assert_eq!(loaded.root.shard_files.len(), 1);
+        assert_eq!(loaded.root.root_version, 2);
         assert!(
             old_delta_paths.iter().all(|path| path.exists()),
             "manifest construction must not retire files still reachable by the durable head"
         );
         assert!(store.load_manifest_for_head(&old_head).unwrap().is_some());
 
-        let loaded = store
-            .load_latest_manifest_for_private_workspace(definition_id)
-            .expect("load compacted manifest")
-            .expect("manifest exists");
         assert_eq!(loaded.root.recent_delta_files.len(), 0);
         assert_eq!(
             loaded.artifacts.artifacts.len(),
@@ -1843,6 +2076,39 @@ mod tests {
             loaded.tail_pending_entries.len(),
             1 + DELTA_COUNT_SOFT_LIMIT + 1
         );
+    }
+
+    #[test]
+    fn abandoned_root_cannot_poison_revision_allocation_and_is_swept_by_durable_head() {
+        let temp_dir = TempDir::new().expect("temp dir");
+        let store = ManifestStore::new(temp_dir.path());
+        let definition_id = 91;
+
+        let mut durable = sample_root(definition_id, Vec::new(), Vec::new());
+        durable.recompute_checksum().unwrap();
+        let durable_path = store.write_root(definition_id, &durable).unwrap();
+        let durable_head = store.head_for_root(&durable);
+
+        let mut abandoned = durable.clone();
+        abandoned.root_version = 2;
+        abandoned.recompute_checksum().unwrap();
+        let abandoned_path = store.write_root(definition_id, &abandoned).unwrap();
+
+        let committed = store
+            .begin_revision(definition_id, durable.clone())
+            .expect("allocate past abandoned root")
+            .commit()
+            .expect("commit non-reused revision");
+        assert_eq!(committed.root.root_version, 3);
+        assert!(committed.root_path.exists());
+
+        let removed = store
+            .sweep_unpublished_installed_revisions(&[durable_head])
+            .expect("sweep revisions newer than durable head");
+        assert_eq!(removed, 2);
+        assert!(durable_path.exists());
+        assert!(!abandoned_path.exists());
+        assert!(!committed.root_path.exists());
     }
 
     #[test]

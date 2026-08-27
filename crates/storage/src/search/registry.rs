@@ -12,7 +12,9 @@ use paro_scheduler::scheduler::TaskScheduler;
 
 use crate::metrics::storage_metrics;
 use crate::rowset::{RowsetId, RowsetSharedPtr};
-use crate::tablet::{ColumnId, RowsetPublishObserver, TabletId, TabletRef};
+use crate::tablet::{
+    ColumnId, RowsetPublishObserver, SearchGenerationHeadUpdates, TabletId, TabletRef,
+};
 use paro_common::effect::ArtifactRef;
 use paro_common::error::{self as paro_error, Result};
 
@@ -54,8 +56,8 @@ use super::lifecycle::bootstrap::SearchBootstrapReport;
 use super::lifecycle::gc::gc_policy_for_kind;
 use super::lifecycle::maintenance_request::provider_maintenance_request_for_definition;
 use super::lifecycle::publisher::{
-    assign_generation_id, remove_sidecar_packages, replace_artifacts, retire_paths_for_manifest,
-    search_artifact_key, sidecar_file_ids_for_artifacts,
+    assign_generation_id, remove_sidecar_packages, retire_paths_for_manifest, search_artifact_key,
+    sidecar_file_ids_for_artifacts,
 };
 use super::maintenance::{
     CatchUpPlanner, DefinitionMaintenanceReport, InlineSearchAdmission, MaintenanceScheduler,
@@ -127,9 +129,9 @@ impl RowsetPublishObserver for SearchIndexRegistry {
         tablet_id: TabletId,
         version: i64,
         visible_rowsets: &[RowsetSharedPtr],
-    ) -> Result<Vec<crate::tablet::SearchGenerationHeadMeta>> {
+    ) -> Result<SearchGenerationHeadUpdates> {
         if tablet_id != self.tablet.tablet_id() {
-            return Ok(Vec::new());
+            return Ok(SearchGenerationHeadUpdates::default());
         }
         self.prepare_heads_for_visible_rowsets(version, visible_rowsets)
     }
@@ -209,8 +211,15 @@ impl SearchIndexRegistry {
     /// Sweep pre-commit workspaces only after WAL replay has consumed every
     /// committed `PublishSearchGeneration` mutation. Running this during table
     /// construction could delete the sole source directory needed by replay.
-    pub(crate) fn sweep_orphan_generation_workspaces(&self) -> Result<usize> {
-        self.manifests.sweep_orphan_generation_workspaces()
+    pub(crate) fn sweep_orphan_generation_state(
+        &self,
+    ) -> Result<super::SearchGenerationOrphanSweepReport> {
+        Ok(super::SearchGenerationOrphanSweepReport {
+            staging_workspaces: self.manifests.sweep_orphan_generation_workspaces()?,
+            manifest_fragments: self
+                .manifests
+                .sweep_unpublished_installed_revisions(&self.tablet.search_generation_heads())?,
+        })
     }
 
     pub(crate) fn bind_task_scheduler(&self, scheduler: Option<Arc<TaskScheduler>>) {
@@ -1139,34 +1148,38 @@ impl SearchIndexRegistry {
         let Some(manifest) = state.manifest.as_ref() else {
             return Ok(false);
         };
-        let mut root = manifest.root.clone();
-        let Some(compacted_shard_path) = self
+        let mut revision = self
             .manifests
-            .maybe_compact_deltas(definition_id, &mut root)?
-        else {
+            .begin_revision(definition_id, manifest.root.clone())?;
+        if !revision.compact_if_needed()? {
             return Ok(false);
-        };
-        if let Err(error) = self.manifests.write_root(definition_id, &root) {
-            self.manifests.remove_paths(&[compacted_shard_path]);
-            return Err(error);
         }
-        let head = self.manifests.head_for_root(&root);
-        let Some(loaded) = self.manifests.load_manifest_for_head(&head)? else {
-            return Ok(false);
-        };
+        let loaded = revision.commit()?;
         let next_state = state.clone().with_manifest(loaded);
-        let completion = publish_head_for_state(
+        let completion = match publish_head_for_state(
             &self.tablet,
             &self.manifests,
             &next_state,
             &publication_guard,
-        )?;
+        ) {
+            Ok(completion) => completion,
+            Err(error) => {
+                self.retire_unpublished_revision(&state, &next_state);
+                return Err(error);
+            }
+        };
         let view_result =
             self.publish_durable_revision_state(&state, next_state.clone(), &completion);
         drop(_guard);
         drop(publication_guard);
-        completion.finish()?;
-        view_result?;
+        if let Err(error) = completion.finish() {
+            self.retire_unpublished_revision(&state, &next_state);
+            return Err(error);
+        }
+        if let Err(error) = view_result {
+            self.retire_unpublished_revision(&state, &next_state);
+            return Err(error);
+        }
         record_tail_metrics_for_state(&next_state);
         Ok(true)
     }
@@ -1346,7 +1359,7 @@ impl SearchIndexRegistry {
         &self,
         visible_version: i64,
         visible_rowsets: &[RowsetSharedPtr],
-    ) -> Result<Vec<crate::tablet::SearchGenerationHeadMeta>> {
+    ) -> Result<SearchGenerationHeadUpdates> {
         let definition_ids = self
             .view
             .load()
@@ -1355,6 +1368,7 @@ impl SearchIndexRegistry {
             .copied()
             .collect::<Vec<_>>();
         let mut heads = Vec::new();
+        let mut disabled_definition_ids = Vec::new();
         for definition_id in definition_ids {
             let definition_lock = self.definition_lock(definition_id);
             let _guard = definition_lock
@@ -1365,13 +1379,33 @@ impl SearchIndexRegistry {
             let Some(state) = current.definitions.get(&definition_id).cloned() else {
                 continue;
             };
-            let next_state =
-                self.refresh_state_from_snapshot(&state, visible_version, visible_rowsets, false)?;
+            let next_state = match self.refresh_state_from_snapshot(
+                &state,
+                visible_version,
+                visible_rowsets,
+                false,
+            ) {
+                Ok(next_state) => next_state,
+                Err(error) => {
+                    tracing::error!(
+                        tablet_id = self.tablet.tablet_id(),
+                        definition_id,
+                        visible_version,
+                        error = %error,
+                        "disabled search generation after rowset manifest preparation failed"
+                    );
+                    disabled_definition_ids.push(definition_id);
+                    continue;
+                }
+            };
             if let Some(head) = head_for_state(&self.manifests, &next_state) {
                 heads.push(head);
             }
         }
-        Ok(heads)
+        Ok(SearchGenerationHeadUpdates {
+            heads,
+            disabled_definition_ids,
+        })
     }
 
     pub(crate) fn ensure_fresh(&self) {
@@ -1574,32 +1608,6 @@ impl SearchIndexRegistry {
         self.publish_full_snapshot(state, visible_version, visible_rowsets)
     }
 
-    /// Prepare optional delta compaction and publish one immutable root.
-    ///
-    /// Manifest construction may create a delta and a replacement shard before
-    /// the root is durable. Keep those paths in one rollback set, and keep root
-    /// creation owned by this single call so threshold-triggered compaction
-    /// cannot publish the same immutable revision twice.
-    fn write_root_after_optional_compaction(
-        &self,
-        definition_id: u64,
-        root: &mut GenerationManifestRoot,
-        mut unpublished_paths: Vec<PathBuf>,
-    ) -> Result<()> {
-        match self.manifests.maybe_compact_deltas(definition_id, root) {
-            Ok(compacted_shard_path) => unpublished_paths.extend(compacted_shard_path),
-            Err(error) => {
-                self.manifests.remove_paths(&unpublished_paths);
-                return Err(error);
-            }
-        }
-        if let Err(error) = self.manifests.write_root(definition_id, root) {
-            self.manifests.remove_paths(&unpublished_paths);
-            return Err(error);
-        }
-        Ok(())
-    }
-
     fn publish_full_snapshot(
         &self,
         state: &SearchDefinitionState,
@@ -1620,13 +1628,13 @@ impl SearchIndexRegistry {
         let root_version = state
             .manifest
             .as_ref()
-            .map_or(1, |manifest| manifest.root.root_version.saturating_add(1));
+            .map_or(0, |manifest| manifest.root.root_version);
         let definition_id = state.definition.definition_id;
         let next_tail_entry_id = assign_tail_entry_ids_for_full_snapshot(
             &mut snapshot.tail_pending.entries,
             state.manifest.as_ref(),
         );
-        let mut root = GenerationManifestRoot {
+        let root = GenerationManifestRoot {
             definition_id,
             generation_id,
             build_epoch,
@@ -1671,46 +1679,12 @@ impl SearchIndexRegistry {
             snapshot.artifacts.clone(),
             generation_id,
         ))?;
-        let shard_name = self.manifests.write_shard(
-            definition_id,
-            generation_id,
-            root.root_version,
-            &ManifestShard {
-                artifact_refs: generation_artifacts.artifacts.clone(),
-                tail_pending_entries: snapshot.tail_pending.entries.clone(),
-            },
-        )?;
-        let shard_path = self
-            .manifests
-            .generation_dir(definition_id, generation_id)
-            .join(&shard_name.file_name);
-        root.shard_files.push(shard_name);
-        root.recompute_checksum()?;
-        let root_path = match self.manifests.write_root(definition_id, &root) {
-            Ok(root_path) => root_path,
-            Err(err) => {
-                self.manifests.remove_paths(&[shard_path]);
-                return Err(err);
-            }
-        };
-        let loaded = LoadedManifest {
-            root: root.clone(),
-            root_path,
-            shard_paths: root
-                .shard_files
-                .iter()
-                .map(|file| {
-                    self.manifests
-                        .generation_dir(definition_id, generation_id)
-                        .join(&file.file_name)
-                })
-                .collect(),
-            delta_paths: Vec::new(),
-            materialized_state_path: None,
-            embedded_materialized_state: false,
-            artifacts: Arc::new(generation_artifacts),
+        let mut revision = self.manifests.begin_revision(definition_id, root)?;
+        revision.replace_with_shard(&ManifestShard {
+            artifact_refs: generation_artifacts.artifacts,
             tail_pending_entries: snapshot.tail_pending.entries,
-        };
+        })?;
+        let loaded = revision.commit()?;
 
         let mut next_state = state.clone();
         next_state = next_state.with_manifest(loaded);
@@ -1759,7 +1733,6 @@ impl SearchIndexRegistry {
             .ok_or_else(|| paro_error::internal("delta publish requires existing generation"))?;
         added_artifacts = assign_generation_id(added_artifacts, generation.generation_id);
         let mut root = current_manifest.root.clone();
-        root.root_version = root.root_version.saturating_add(1);
         root.build_epoch = state.next_build_epoch;
         root.build_snapshot_version = visible_version;
         root.indexed_through_ts = indexed_through_ts(root.build_snapshot_version);
@@ -1791,32 +1764,13 @@ impl SearchIndexRegistry {
                 .clone(),
         );
 
-        let delta_name = self.manifests.write_delta(
-            definition_id,
-            generation.generation_id,
-            root.root_version,
-            root.recent_delta_files.len(),
-            &ManifestDelta::publish_changes(
-                added_artifacts.clone(),
-                added_tail_entries,
-                stats_deltas_from_generation_stats(&delta_generation_stats),
-            ),
-        )?;
-        let delta_path = self
-            .manifests
-            .generation_dir(definition_id, generation.generation_id)
-            .join(&delta_name.file_name);
-        root.recent_delta_files.push(delta_name);
-        root.recompute_checksum()?;
-        self.write_root_after_optional_compaction(definition_id, &mut root, vec![delta_path])?;
-        let mut artifacts = (*current_manifest.artifacts).clone();
-        artifacts.artifacts.extend(added_artifacts);
-        let loaded = self.manifests.materialize_loaded_manifest(
-            definition_id,
-            root,
-            artifacts,
-            tail_pending_entries,
-        )?;
+        let mut revision = self.manifests.begin_revision(definition_id, root)?;
+        revision.append_delta(&ManifestDelta::publish_changes(
+            added_artifacts.clone(),
+            added_tail_entries,
+            stats_deltas_from_generation_stats(&delta_generation_stats),
+        ))?;
+        let loaded = revision.commit()?;
         let mut next_state = state.clone();
         next_state = next_state.with_manifest(loaded);
         storage_metrics().record_search_manifest_publish(
@@ -1885,7 +1839,6 @@ impl SearchIndexRegistry {
         ));
 
         let mut root = current_manifest.root.clone();
-        root.root_version = root.root_version.saturating_add(1);
         root.build_epoch = state.next_build_epoch;
         root.build_snapshot_version = visible_version;
         root.indexed_through_ts = indexed_through_ts(root.build_snapshot_version);
@@ -1969,27 +1922,9 @@ impl SearchIndexRegistry {
         );
 
         let definition_id = state.definition.definition_id;
-        let delta_name = self.manifests.write_delta(
-            definition_id,
-            generation.generation_id,
-            root.root_version,
-            root.recent_delta_files.len(),
-            &ManifestDelta::new(delta_entries),
-        )?;
-        let delta_path = self
-            .manifests
-            .generation_dir(definition_id, generation.generation_id)
-            .join(&delta_name.file_name);
-        root.recent_delta_files.push(delta_name);
-        root.recompute_checksum()?;
-        self.write_root_after_optional_compaction(definition_id, &mut root, vec![delta_path])?;
-
-        let loaded = self.manifests.materialize_loaded_manifest(
-            definition_id,
-            root,
-            artifacts,
-            tail_pending_entries,
-        )?;
+        let mut revision = self.manifests.begin_revision(definition_id, root)?;
+        revision.append_delta(&ManifestDelta::new(delta_entries))?;
+        let loaded = revision.commit()?;
         let mut next_state = state.clone();
         next_state = next_state.with_manifest(loaded);
         storage_metrics().record_search_manifest_publish(
@@ -2041,12 +1976,11 @@ impl SearchIndexRegistry {
             .collect::<BTreeSet<_>>();
 
         let mut root = current_manifest.root.clone();
-        root.root_version = root.root_version.saturating_add(1);
         root.build_epoch = state.next_build_epoch;
         root.build_snapshot_version = self.tablet.max_version();
         root.indexed_through_ts = indexed_through_ts(root.build_snapshot_version);
 
-        let mut tail_pending_entries = current_manifest
+        let tail_pending_entries = current_manifest
             .tail_pending_entries
             .iter()
             .filter(|entry| !covered_tail_ids.contains(&entry.entry_id))
@@ -2094,29 +2028,9 @@ impl SearchIndexRegistry {
                 .into_iter()
                 .map(ManifestDeltaEntry::StatsDelta),
         );
-        let delta_name = self.manifests.write_delta(
-            definition_id,
-            generation.generation_id,
-            root.root_version,
-            root.recent_delta_files.len(),
-            &ManifestDelta::new(delta_entries),
-        )?;
-        let delta_path = self
-            .manifests
-            .generation_dir(definition_id, generation.generation_id)
-            .join(&delta_name.file_name);
-        root.recent_delta_files.push(delta_name);
-        root.recompute_checksum()?;
-        self.write_root_after_optional_compaction(definition_id, &mut root, vec![delta_path])?;
-
-        let mut artifacts = (*current_manifest.artifacts).clone();
-        artifacts.artifacts.extend(added_artifacts);
-        let loaded = self.manifests.materialize_loaded_manifest(
-            definition_id,
-            root,
-            artifacts,
-            std::mem::take(&mut tail_pending_entries),
-        )?;
+        let mut revision = self.manifests.begin_revision(definition_id, root)?;
+        revision.append_delta(&ManifestDelta::new(delta_entries))?;
+        let loaded = revision.commit()?;
         let mut next_state = state.clone();
         next_state = next_state.with_manifest(loaded);
         storage_metrics().record_search_manifest_publish(
@@ -2148,41 +2062,20 @@ impl SearchIndexRegistry {
         let definition_id = state.definition.definition_id;
 
         let mut root = current_manifest.root.clone();
-        root.root_version = root.root_version.saturating_add(1);
         root.build_epoch = state.next_build_epoch;
         root.build_snapshot_version = self.tablet.max_version();
         root.indexed_through_ts = indexed_through_ts(root.build_snapshot_version);
 
         let repacked_artifacts = assign_generation_id(repacked_artifacts, generation.generation_id);
-        let delta_name = self.manifests.write_delta(
-            definition_id,
-            generation.generation_id,
-            root.root_version,
-            root.recent_delta_files.len(),
-            &ManifestDelta::new(
-                repacked_artifacts
-                    .iter()
-                    .cloned()
-                    .map(ManifestDeltaEntry::AddArtifact)
-                    .collect(),
-            ),
-        )?;
-        let delta_path = self
-            .manifests
-            .generation_dir(definition_id, generation.generation_id)
-            .join(&delta_name.file_name);
-        root.recent_delta_files.push(delta_name);
-        root.recompute_checksum()?;
-        self.write_root_after_optional_compaction(definition_id, &mut root, vec![delta_path])?;
-
-        let artifacts =
-            replace_artifacts(&current_manifest.artifacts, repacked_artifacts.into_iter());
-        let loaded = self.manifests.materialize_loaded_manifest(
-            definition_id,
-            root,
-            artifacts,
-            current_manifest.tail_pending_entries.clone(),
-        )?;
+        let mut revision = self.manifests.begin_revision(definition_id, root)?;
+        revision.append_delta(&ManifestDelta::new(
+            repacked_artifacts
+                .iter()
+                .cloned()
+                .map(ManifestDeltaEntry::AddArtifact)
+                .collect(),
+        ))?;
+        let loaded = revision.commit()?;
         let mut next_state = state.clone();
         next_state = next_state.with_manifest(loaded);
         storage_metrics().record_search_manifest_publish(
@@ -2291,7 +2184,6 @@ impl SearchIndexRegistry {
         let started_at = Instant::now();
         let definition_id = state.definition.definition_id;
         let mut root = current_manifest.root.clone();
-        root.root_version = root.root_version.saturating_add(1);
         root.build_epoch = state.next_build_epoch;
         root.build_snapshot_version = visible_version;
         root.indexed_through_ts = indexed_through_ts(root.build_snapshot_version);
@@ -2359,29 +2251,9 @@ impl SearchIndexRegistry {
                 .map(ManifestDeltaEntry::StatsDelta),
         );
 
-        let delta_name = self.manifests.write_delta(
-            definition_id,
-            generation.generation_id,
-            root.root_version,
-            root.recent_delta_files.len(),
-            &ManifestDelta::new(delta_entries),
-        )?;
-        let delta_path = self
-            .manifests
-            .generation_dir(definition_id, generation.generation_id)
-            .join(&delta_name.file_name);
-        root.recent_delta_files.push(delta_name);
-        root.recompute_checksum()?;
-        self.write_root_after_optional_compaction(definition_id, &mut root, vec![delta_path])?;
-
-        let mut artifacts = (*current_manifest.artifacts).clone();
-        artifacts.artifacts.extend(added_artifacts);
-        let loaded = self.manifests.materialize_loaded_manifest(
-            definition_id,
-            root,
-            artifacts,
-            tail_pending_entries,
-        )?;
+        let mut revision = self.manifests.begin_revision(definition_id, root)?;
+        revision.append_delta(&ManifestDelta::new(delta_entries))?;
+        let loaded = revision.commit()?;
         let mut next_state = state.clone();
         next_state = next_state.with_manifest(loaded);
         storage_metrics().record_search_manifest_publish(
@@ -4609,7 +4481,7 @@ mod tests {
     }
 
     #[test]
-    fn rowset_publish_failure_does_not_advance_prepared_search_head() {
+    fn rowset_publish_failure_disables_only_failed_index_and_commits_base_rowset() {
         let root = TempDir::new().unwrap();
         let table = create_table_with_root(root.path(), &[LogicalType::Varchar, LogicalType::Blob]);
         let fulltext = SearchIndexDefinition {
@@ -4665,20 +4537,21 @@ mod tests {
             ));
         std::fs::create_dir(&failing_sparse_root).unwrap();
 
-        let err = table.append(&test_chunk_from_vectors(vec![
-            test_string_vector(&["first definition prepares a candidate"]),
-            test_sparse_blob_vector(&[SparseVector::new(vec![1], vec![1.0]).unwrap()]),
-        ]));
-        assert!(err.is_err());
-        assert_eq!(table.max_version(), -1);
+        table
+            .append(&test_chunk_from_vectors(vec![
+                test_string_vector(&["first definition prepares a candidate"]),
+                test_sparse_blob_vector(&[SparseVector::new(vec![1], vec![1.0]).unwrap()]),
+            ]))
+            .expect("derived sparse manifest failure must not roll back base rowset");
+        assert_eq!(table.max_version(), 0);
 
         let current = table.search_registry().view.load();
         let fulltext_manifest = current
             .definitions
             .get(&200)
             .and_then(|state| state.manifest.as_ref())
-            .expect("fulltext manifest after failed publish");
-        assert_eq!(fulltext_manifest.root.root_version, initial_fulltext_root);
+            .expect("fulltext manifest after partial search publish");
+        assert!(fulltext_manifest.root.root_version > initial_fulltext_root);
         drop(current);
 
         let meta = meta_manager(root.path())
@@ -4690,7 +4563,13 @@ mod tests {
             .iter()
             .find(|head| head.definition_id == 200)
             .expect("durable fulltext head");
-        assert_eq!(durable_head.root_version, initial_fulltext_root);
+        assert!(durable_head.root_version > initial_fulltext_root);
+        assert!(
+            meta.search_generation_heads()
+                .iter()
+                .all(|head| head.definition_id != 201),
+            "the failed sparse definition must be disabled"
+        );
     }
 
     #[test]
@@ -4903,22 +4782,25 @@ mod tests {
         };
         table.register_search_definition(definition).unwrap();
 
+        let current = table.search_registry().view.load();
+        let state = current.definitions.get(&144).unwrap();
+        let failing_root_version = state
+            .manifest
+            .as_ref()
+            .unwrap()
+            .root
+            .root_version
+            .checked_add(1)
+            .unwrap();
         let root_path = table
             .search_registry()
             .manifests
             .generation_dir(144, 1)
             .join(format!(
-                "manifest_root_g1_v2_f{}.json",
-                table
-                    .search_registry()
-                    .view
-                    .load()
-                    .definitions
-                    .get(&144)
-                    .unwrap()
-                    .definition
-                    .config_fingerprint
+                "manifest_root_g1_v{}_f{}.json",
+                failing_root_version, state.definition.config_fingerprint
             ));
+        drop(current);
         std::fs::create_dir(&root_path).unwrap();
 
         let store = SidecarArtifactStore::new(table.tablet().data_dir().clone());
@@ -4927,14 +4809,15 @@ mod tests {
             .search_registry()
             .manifests
             .generation_dir(144, 1)
-            .join("delta_g1_v2_0.json");
+            .join(format!("delta_g1_v{failing_root_version}_0.json"));
 
         let err = table
             .search_registry()
             .catch_up_definition(144)
             .expect_err("root path directory must make manifest root publish fail");
         assert!(
-            err.to_string().contains("immutable search manifest root"),
+            err.to_string()
+                .contains("immutable search manifest fragment"),
             "{err}"
         );
         assert!(
@@ -5464,6 +5347,132 @@ mod tests {
         assert!(manifest.root.recent_delta_files.is_empty());
         let compacted = table.search_registry().compact_manifest_deltas().unwrap();
         assert_eq!(compacted, 0);
+    }
+
+    #[test]
+    fn rowset_publish_compacts_delta_window_without_leaking_transient_delta() {
+        let root = TempDir::new().unwrap();
+        let table = create_table_with_root(root.path(), &[LogicalType::Varchar]);
+        let provider_config = json!({"version": 1, "config": "simple"});
+        let definition = SearchIndexDefinition {
+            definition_id: 48,
+            table_id: table.tablet_id(),
+            name: "docs_fts".to_string(),
+            kind: SearchIndexKind::FullText,
+            column_ids: vec![0],
+            expression: Some("to_tsvector('simple', col_0)".to_string()),
+            freshness_policy: SearchFreshnessPolicy::default_for_kind(SearchIndexKind::FullText),
+            config_fingerprint: SearchIndexDefinition::compute_config_fingerprint(
+                SearchIndexKind::FullText,
+                &[0],
+                Some("to_tsvector('simple', col_0)"),
+                &provider_config,
+            ),
+            provider_config,
+        };
+        table.register_search_definition(definition).unwrap();
+        table
+            .append(&test_chunk_from_vectors(vec![test_string_vector(&[
+                "manifest base",
+            ])]))
+            .unwrap();
+
+        let synthetic_head = {
+            let current = table.search_registry().view.load();
+            let state = current.definitions.get(&48).expect("definition state");
+            let manifest = state.manifest.as_ref().expect("manifest");
+            let mut root = manifest.root.clone();
+            root.root_version = root.root_version.checked_add(1).unwrap();
+            let store = &table.search_registry().manifests;
+            for ordinal in 0..=DELTA_COUNT_SOFT_LIMIT {
+                let delta_ref = store
+                    .write_delta(
+                        48,
+                        root.generation_id,
+                        root.root_version,
+                        ordinal,
+                        &ManifestDelta::default(),
+                    )
+                    .expect("write synthetic delta");
+                root.recent_delta_files.push(delta_ref);
+            }
+            root.recompute_checksum().unwrap();
+            store.write_root(48, &root).unwrap();
+            store.head_for_root(&root)
+        };
+        table
+            .tablet()
+            .apply_search_generation_publish(&TabletMutation::PublishSearchGeneration {
+                publication: SearchGenerationPublication::AdvanceInstalled,
+                generation_ref: table
+                    .search_registry()
+                    .manifests
+                    .generation_ref(48, synthetic_head.generation_id)
+                    .unwrap(),
+                head: synthetic_head.clone(),
+            })
+            .unwrap();
+        {
+            let loaded = table
+                .search_registry()
+                .manifests
+                .load_manifest_for_head(&synthetic_head)
+                .unwrap()
+                .unwrap();
+            table
+                .search_registry()
+                .mutate_view(|view| {
+                    let state = view
+                        .definitions
+                        .get(&48)
+                        .unwrap()
+                        .clone()
+                        .with_manifest(loaded);
+                    view.definitions.insert(48, state);
+                    Ok((true, ()))
+                })
+                .unwrap();
+        }
+
+        table
+            .append(&test_chunk_from_vectors(vec![test_string_vector(&[
+                "manifest delta compaction",
+            ])]))
+            .expect("base-table append must survive threshold-triggered compaction");
+
+        let durable_head = table.tablet().search_generation_head(48).unwrap();
+        assert_eq!(
+            durable_head.root_version,
+            synthetic_head.root_version + 1,
+            "one rowset publish must consume exactly one manifest revision"
+        );
+        let loaded = table
+            .search_registry()
+            .manifests
+            .load_manifest_for_head(&durable_head)
+            .unwrap()
+            .unwrap();
+        assert!(loaded.root.recent_delta_files.is_empty());
+        assert_eq!(loaded.root.shard_files.len(), 1);
+
+        let transient_prefix = format!(
+            "delta_g{}_v{}_",
+            durable_head.generation_id, durable_head.root_version
+        );
+        let generation_dir = table
+            .search_registry()
+            .manifests
+            .generation_dir(48, durable_head.generation_id);
+        assert!(
+            fs::read_dir(generation_dir)
+                .unwrap()
+                .flatten()
+                .all(|entry| !entry
+                    .file_name()
+                    .to_string_lossy()
+                    .starts_with(&transient_prefix)),
+            "delta absorbed into the committed shard must not leak"
+        );
     }
 
     #[test]

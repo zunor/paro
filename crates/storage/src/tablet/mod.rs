@@ -76,8 +76,8 @@ pub use tablet_rowid_lookup::TabletRowIdReader;
 pub use tablet_runtime::{
     CheckpointMaintenanceTicket, CheckpointPublishObserver, CheckpointTabletFreezeMode,
     CheckpointTabletSnapshot, PrimaryIndexUpdate, RetiredGcBarrier, RetiredPendingGcStatus,
-    RowsetPublishObserver, Tablet, TabletId, TabletIdentity, TabletReadGuard, TabletRef,
-    TabletSnapshotMaterialization, TabletState, Version, VersionGap,
+    RowsetPublishObserver, SearchGenerationHeadUpdates, Tablet, TabletId, TabletIdentity,
+    TabletReadGuard, TabletRef, TabletSnapshotMaterialization, TabletState, Version, VersionGap,
 };
 pub(crate) use tablet_runtime::{SearchGenerationPublishGuard, SearchGenerationPublishOutcome};
 pub use tablet_schema::{ColumnId, KeysType, TabletColumn, TabletSchema, TabletSchemaRef};

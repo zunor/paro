@@ -1079,6 +1079,7 @@ mod tests {
                 "m": 8,
                 "ef_construct": 64,
                 "ef_search": 64,
+                "rerank_policy": "top_k",
                 "distance_cost": {
                     "source": {
                         "kind": "built_in",

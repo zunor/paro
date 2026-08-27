@@ -116,19 +116,20 @@ pub(crate) fn sweep_orphan_search_generation_workspaces(catalog: &Arc<ParoCatalo
             let Some(storage) = table.get_storage() else {
                 continue;
             };
-            match storage.sweep_orphan_search_generation_workspaces() {
-                Ok(removed) if removed > 0 => tracing::info!(
+            match storage.sweep_orphan_search_generation_state() {
+                Ok(report) if report.total_removed() > 0 => tracing::info!(
                     target: targets::INSTANCE,
                     tablet_id = storage.tablet_id(),
-                    removed,
-                    "removed crash-orphaned search-generation workspaces after replay"
+                    staging_workspaces = report.staging_workspaces,
+                    manifest_fragments = report.manifest_fragments,
+                    "reclaimed unreachable search-generation state after replay"
                 ),
                 Ok(_) => {}
                 Err(error) => tracing::warn!(
                     target: targets::INSTANCE,
                     tablet_id = storage.tablet_id(),
                     error = %error,
-                    "failed to sweep crash-orphaned search-generation workspaces"
+                    "failed to reclaim unreachable search-generation state"
                 ),
             }
         }

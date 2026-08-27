@@ -54,6 +54,25 @@ pub use cursor::{
     TableReadSnapshot,
 };
 pub use generation::coverage::SearchGenerationCoverage;
+
+/// Search-generation objects reclaimed after durable recovery replay.
+///
+/// Workspaces are private pre-commit build directories. Manifest fragments
+/// are immutable installed revisions that are not reachable from any durable
+/// generation head. Keeping the counts separate makes recovery telemetry
+/// distinguish abandoned work from normal revision reclamation.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct SearchGenerationOrphanSweepReport {
+    pub staging_workspaces: usize,
+    pub manifest_fragments: usize,
+}
+
+impl SearchGenerationOrphanSweepReport {
+    pub fn total_removed(self) -> usize {
+        self.staging_workspaces
+            .saturating_add(self.manifest_fragments)
+    }
+}
 pub use hnsw_config::{
     HnswInlineConfig, HnswProviderConfig, DEFAULT_HNSW_BUILD_SEED, DEFAULT_HNSW_EF_CONSTRUCT,
     DEFAULT_HNSW_EF_SEARCH, DEFAULT_HNSW_EXACT_F32_DIMENSION_COST_UNITS,

@@ -152,14 +152,20 @@ pub trait CheckpointPublishObserver: Send + Sync + std::fmt::Debug {
     fn finish_compaction_publish(&self, ticket: CheckpointMaintenanceTicket);
 }
 
+#[derive(Debug, Default)]
+pub struct SearchGenerationHeadUpdates {
+    pub heads: Vec<SearchGenerationHeadMeta>,
+    pub disabled_definition_ids: Vec<u64>,
+}
+
 pub trait RowsetPublishObserver: Send + Sync + std::fmt::Debug {
     fn prepare_rowset_publish(
         &self,
         _tablet_id: TabletId,
         _version: i64,
         _visible_rowsets: &[RowsetSharedPtr],
-    ) -> Result<Vec<SearchGenerationHeadMeta>> {
-        Ok(Vec::new())
+    ) -> Result<SearchGenerationHeadUpdates> {
+        Ok(SearchGenerationHeadUpdates::default())
     }
 
     fn rowset_published(&self, tablet_id: TabletId, version: i64, rowset: RowsetSharedPtr);
@@ -754,7 +760,7 @@ impl Tablet {
         &self,
         version: i64,
         visible_rowsets: &[RowsetSharedPtr],
-    ) -> Result<Vec<SearchGenerationHeadMeta>> {
+    ) -> SearchGenerationHeadUpdates {
         let observer = self
             .rowset_publish_observer
             .read()
@@ -762,9 +768,27 @@ impl Tablet {
             .as_ref()
             .and_then(std::sync::Weak::upgrade);
         let Some(observer) = observer else {
-            return Ok(Vec::new());
+            return SearchGenerationHeadUpdates::default();
         };
-        observer.prepare_rowset_publish(self.tablet_id(), version, visible_rowsets)
+        match observer.prepare_rowset_publish(self.tablet_id(), version, visible_rowsets) {
+            Ok(updates) => updates,
+            Err(error) => {
+                let disabled_definition_ids = self
+                    .search_generation_heads()
+                    .into_iter()
+                    .map(|head| head.definition_id)
+                    .collect();
+                tracing::error!(
+                    tablet_id = self.tablet_id(),
+                    error = %error,
+                    "disabled search generations after derived manifest preparation failed"
+                );
+                SearchGenerationHeadUpdates {
+                    heads: Vec::new(),
+                    disabled_definition_ids,
+                }
+            }
+        }
     }
 
     fn rowsets_with_pending_publish(
@@ -784,8 +808,8 @@ impl Tablet {
         Ok(rowsets)
     }
 
-    fn apply_search_generation_heads_locked(&self, heads: Vec<SearchGenerationHeadMeta>) {
-        if heads.is_empty() {
+    fn apply_search_generation_heads_locked(&self, updates: SearchGenerationHeadUpdates) {
+        if updates.heads.is_empty() && updates.disabled_definition_ids.is_empty() {
             return;
         }
         let mut meta = self.meta.write().unwrap_or_else(|poisoned| {
@@ -795,7 +819,10 @@ impl Tablet {
             );
             poisoned.into_inner()
         });
-        for head in heads {
+        for definition_id in updates.disabled_definition_ids {
+            let _ = meta.remove_search_generation_head(definition_id);
+        }
+        for head in updates.heads {
             let definition_id = head.definition_id;
             if let Err(error) = meta.advance_search_generation_head(head) {
                 // Search metadata is derived from the just-published base
@@ -1930,7 +1957,7 @@ impl Tablet {
 
         let visible_rowsets = self.rowsets_with_pending_publish(current_max, version, &rowset)?;
         self.validate_rowset_registration_locked(&rowset)?;
-        let search_heads = self.prepare_search_rowset_publish(version, &visible_rowsets)?;
+        let search_heads = self.prepare_search_rowset_publish(version, &visible_rowsets);
         rowset.make_visible()?;
         self.register_rowset_locked(rowset)?;
         self.apply_search_generation_heads_locked(search_heads);
@@ -1997,7 +2024,7 @@ impl Tablet {
         self.align_next_rowset_id(rowset.rowset_id());
         self.validate_rowset_registration_locked(&rowset)?;
         let prepared = self.prepare_primary_index_publish(&rowset, update)?;
-        let search_heads = self.prepare_search_rowset_publish(version, &visible_rowsets)?;
+        let search_heads = self.prepare_search_rowset_publish(version, &visible_rowsets);
         self.apply_prepared_primary_index_publish(version, &rowset, prepared)?;
         rowset.make_visible()?;
         self.register_rowset_locked(rowset)?;
@@ -3817,6 +3844,22 @@ mod tests {
     use std::time::Duration;
     use tempfile::TempDir;
 
+    #[derive(Debug)]
+    struct FailingSearchPublishObserver;
+
+    impl RowsetPublishObserver for FailingSearchPublishObserver {
+        fn prepare_rowset_publish(
+            &self,
+            _tablet_id: TabletId,
+            _version: i64,
+            _visible_rowsets: &[RowsetSharedPtr],
+        ) -> Result<SearchGenerationHeadUpdates> {
+            Err(paro_error::internal("injected search manifest failure"))
+        }
+
+        fn rowset_published(&self, _tablet_id: TabletId, _version: i64, _rowset: RowsetSharedPtr) {}
+    }
+
     fn create_test_schema() -> TabletSchemaRef {
         let columns = vec![
             TabletColumn::key(0, "id", LogicalType::BigInt),
@@ -4188,6 +4231,33 @@ mod tests {
 
         assert_eq!(tablet.num_rowsets(), 2);
         assert_eq!(tablet.max_version(), 1);
+    }
+
+    #[test]
+    fn search_manifest_failure_disables_index_without_rolling_back_rowset() {
+        let schema = create_test_schema();
+        let tablet = Tablet::new(1, 100, 1000, schema, test_data_dir(), None).unwrap();
+        tablet.apply_search_generation_heads_locked(SearchGenerationHeadUpdates {
+            heads: vec![SearchGenerationHeadMeta {
+                definition_id: 77,
+                generation_id: 1,
+                root_version: 1,
+                config_fingerprint: 99,
+                root_file_name: "manifest_root_g1_v1_f99.json".to_string(),
+            }],
+            disabled_definition_ids: Vec::new(),
+        });
+        assert!(tablet.search_generation_head(77).is_some());
+
+        let observer: Arc<dyn RowsetPublishObserver> = Arc::new(FailingSearchPublishObserver);
+        tablet.bind_rowset_publish_observer(Arc::downgrade(&observer));
+        let rowset = create_test_rowset(1, Version::singleton(0), 1);
+        tablet
+            .rowset_commit_auto(rowset)
+            .expect("derived search failure must not roll back base-table DML");
+
+        assert_eq!(tablet.max_version(), 0);
+        assert!(tablet.search_generation_head(77).is_none());
     }
 
     #[test]
