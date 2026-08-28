@@ -211,16 +211,20 @@ impl RowsetPublishObserver for SearchIndexRegistry {
                 self.foreground_ingest_epoch.fetch_add(1, Ordering::Release);
                 return Ok(());
             };
-            if blocker.pending_rows == 0
+            let isolated_oversized_write = blocker.pending_rows == 0
                 && blocker.pending_bytes == 0
                 && admission.reserved_rows == 0
                 && admission.reserved_bytes == 0
-                && (incoming_rows > blocker.row_limit || incoming_bytes > blocker.byte_limit)
-            {
-                return Err(paro_error::invalid_input(format!(
-                    "rowset with {incoming_rows} rows/{incoming_bytes} bytes exceeds HNSW definition {} freshness window {}/{}; split the write into bounded rowsets",
-                    blocker.definition_id, blocker.row_limit, blocker.byte_limit
-                )));
+                && (incoming_rows > blocker.row_limit || incoming_bytes > blocker.byte_limit);
+            if isolated_oversized_write {
+                // A rebuildable secondary index cannot constrain transaction
+                // atomicity. Admit one oversized transaction as an exclusive
+                // freshness epoch; its publication raises critical urgency and
+                // queries retain the streaming exact-tail fallback meanwhile.
+                admission.reserved_rows = incoming_rows;
+                admission.reserved_bytes = incoming_bytes;
+                self.foreground_ingest_epoch.fetch_add(1, Ordering::Release);
+                return Ok(());
             }
 
             if let Some(notifier) = self.maintenance_notifier.read().unwrap().as_ref() {
@@ -229,16 +233,23 @@ impl RowsetPublishObserver for SearchIndexRegistry {
 
             let now = Instant::now();
             if now >= deadline {
-                return Err(paro_error::artifact_not_ready(format!(
-                    "HNSW definition {} tail backpressure timed out: pending={}/{}, reserved={}/{}, admission_limit={}/{}",
-                    blocker.definition_id,
-                    blocker.pending_rows,
-                    blocker.pending_bytes,
-                    admission.reserved_rows,
-                    admission.reserved_bytes,
-                    blocker.row_limit,
-                    blocker.byte_limit
-                )));
+                // Backpressure is a latency control, never a transaction
+                // validity rule. Preserve progress if maintenance is slow;
+                // level-triggered catch-up and exact query fallback continue
+                // to own the resulting debt.
+                admission.reserved_rows = admission.reserved_rows.saturating_add(incoming_rows);
+                admission.reserved_bytes = admission.reserved_bytes.saturating_add(incoming_bytes);
+                self.foreground_ingest_epoch.fetch_add(1, Ordering::Release);
+                tracing::warn!(
+                    tablet_id,
+                    definition_id = blocker.definition_id,
+                    pending_rows = blocker.pending_rows,
+                    pending_bytes = blocker.pending_bytes,
+                    incoming_rows,
+                    incoming_bytes,
+                    "search freshness backpressure timed out; admitting transaction with critical maintenance debt"
+                );
+                return Ok(());
             }
             let observed_epoch = admission.progress_epoch;
             let wait = deadline.saturating_duration_since(now);
@@ -248,16 +259,7 @@ impl RowsetPublishObserver for SearchIndexRegistry {
                 .map_err(|_| paro_error::internal("wait for search maintenance progress"))?;
             admission = next;
             if admission.progress_epoch == observed_epoch && Instant::now() >= deadline {
-                return Err(paro_error::artifact_not_ready(format!(
-                    "HNSW definition {} tail backpressure timed out: pending={}/{}, reserved={}/{}, admission_limit={}/{}",
-                    blocker.definition_id,
-                    blocker.pending_rows,
-                    blocker.pending_bytes,
-                    admission.reserved_rows,
-                    admission.reserved_bytes,
-                    blocker.row_limit,
-                    blocker.byte_limit
-                )));
+                continue;
             }
         }
     }
@@ -1099,6 +1101,11 @@ impl SearchIndexRegistry {
 
     pub(crate) fn catch_up_definition(&self, definition_id: u64) -> Result<usize> {
         self.ensure_fresh();
+        // Foreground OPTIMIZE and the background coordinator share the same
+        // provider build lane. Re-read immutable input only after acquiring
+        // ownership so a waiter observes the winner's published revision
+        // instead of rebuilding and discarding the same tail.
+        let _build_guard = self.lock_definition_build(definition_id);
         let current = self.view.load_full();
         let Some(state) = current.definitions.get(&definition_id).cloned() else {
             return Ok(0);
@@ -6977,6 +6984,16 @@ mod tests {
         };
 
         table.register_search_definition(definition).unwrap();
+        let oversized = table
+            .tablet()
+            .acquire_search_rowset_publish_admission(32_768, 8 * 1024 * 1024)
+            .unwrap()
+            .expect("an isolated large transaction must not be rejected by a derived index");
+        {
+            let admission = table.search_registry().ingest_admission.lock().unwrap();
+            assert_eq!(admission.reserved_rows, 32_768);
+        }
+        drop(oversized);
         table
             .append(&test_chunk_from_vectors(vec![test_embedding_vector(
                 &[vec![10.0]],

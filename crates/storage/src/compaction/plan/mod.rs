@@ -10,7 +10,7 @@ pub use policy::{
     BaseCompactionPolicy, CompactionPolicy, CumulativeCompactionPolicy, SizeTieredCompactionPolicy,
 };
 pub use types::{
-    CompactionInput, CompactionJobId, CompactionLifecycleState, CompactionPlan, CompactionPlanId,
-    CompactionReason, CumulativePointAction, ExecutionLayout, MergeSemantics, PkDeltaGuard,
-    PolicyKind, ReadSnapshot,
+    CompactionGoal, CompactionInput, CompactionJobId, CompactionLifecycleState, CompactionPlan,
+    CompactionPlanId, CompactionReason, CumulativePointAction, ExecutionLayout, MergeSemantics,
+    PkDeltaGuard, PolicyKind, PrimaryIndexPublishPlan, ReadSnapshot,
 };

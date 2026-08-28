@@ -292,6 +292,11 @@ pub const SEARCH_METRIC_DESCRIPTORS: &[SearchMetricDescriptor] = &[
         PROVIDER,
     ),
     SearchMetricDescriptor::counter(
+        "search_tail_exact_merge_over_budget_total",
+        SearchMetricUnit::Count,
+        PROVIDER,
+    ),
+    SearchMetricDescriptor::counter(
         "search_tail_exact_merge_rejected_total",
         SearchMetricUnit::Count,
         PROVIDER_REASON,

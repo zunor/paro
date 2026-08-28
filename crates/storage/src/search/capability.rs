@@ -558,20 +558,16 @@ impl SearchCapability {
         if self.coverage.is_complete() {
             return true;
         }
-        if !self.coverage.supports_exact_tail_merge()
-            || !self
-                .execution_modes
-                .contains(super::stats::SearchExecutionMode::ExactTailMerge)
-        {
+        if matches!(self.freshness_policy, SearchFreshnessPolicy::Required) {
+            // REQUIRED promises a materialized artifact rather than a hybrid
+            // execution path. It remains a semantic policy; the bounded and
+            // opportunistic row watermarks below are only maintenance goals.
             return false;
         }
-        match self.freshness_policy {
-            SearchFreshnessPolicy::Required => false,
-            SearchFreshnessPolicy::BoundedLag { max_tail_rows, .. } => {
-                self.tail_summary.pending_rows <= max_tail_rows
-            }
-            SearchFreshnessPolicy::Opportunistic => false,
-        }
+        self.coverage.supports_exact_tail_merge()
+            && self
+                .execution_modes
+                .contains(super::stats::SearchExecutionMode::ExactTailMerge)
     }
 
     pub fn capability_state(&self) -> SearchCapabilityState {
@@ -583,14 +579,7 @@ impl SearchCapability {
             SearchCapabilityState::NotQueryable {
                 reason: SearchNotQueryableReason::FreshnessRequired,
             }
-        } else if self.tail_summary.has_pending_rows()
-            && (!self.tail_summary.exact_tail_merge
-                || matches!(
-                    self.freshness_policy,
-                    SearchFreshnessPolicy::BoundedLag { max_tail_rows, .. }
-                        if self.tail_summary.pending_rows > max_tail_rows
-                ))
-        {
+        } else if self.tail_summary.has_pending_rows() && !self.tail_summary.exact_tail_merge {
             SearchCapabilityState::NotQueryable {
                 reason: SearchNotQueryableReason::TailOverBudget,
             }

@@ -36,6 +36,7 @@ pub enum PolicyKind {
     Base,
     Cumulative,
     SizeTiered,
+    Goal,
 }
 
 impl fmt::Display for PolicyKind {
@@ -44,6 +45,7 @@ impl fmt::Display for PolicyKind {
             PolicyKind::Base => write!(f, "BASE"),
             PolicyKind::Cumulative => write!(f, "CUMULATIVE"),
             PolicyKind::SizeTiered => write!(f, "SIZE_TIERED"),
+            PolicyKind::Goal => write!(f, "GOAL"),
         }
     }
 }
@@ -73,6 +75,16 @@ pub enum CompactionReason {
     BasePolicy,
     CumulativePolicy,
     SizeTieredPolicy,
+    ExplicitCoalesce,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum CompactionGoal {
+    /// Background policy reduces debt only when the rewrite benefit clears
+    /// its write-amplification threshold.
+    ReduceDebt,
+    /// Foreground maintenance must leave no more than this many rowsets.
+    CoalesceTo { max_rowsets: usize },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -116,6 +128,15 @@ pub struct PkDeltaGuard {
     pub max_bytes: u64,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PrimaryIndexPublishPlan {
+    /// Apply a bounded in-memory delta in the ordered publication lane.
+    Incremental(PkDeltaGuard),
+    /// Publish the rowset and rebuild the primary index from durable visible
+    /// rowsets. Used when no legal rowset-level plan fits the delta envelope.
+    RebuildFromVisibleRowsets,
+}
+
 impl PkDeltaGuard {
     pub fn within_limits(&self) -> bool {
         self.estimated_rows <= self.max_rows && self.estimated_bytes <= self.max_bytes
@@ -136,7 +157,8 @@ pub struct CompactionPlan {
     pub output_rowset_id: RowsetId,
     pub score: f64,
     pub reason: CompactionReason,
-    pub pk_delta_guard: Option<PkDeltaGuard>,
+    pub goal: CompactionGoal,
+    pub primary_index_publish: Option<PrimaryIndexPublishPlan>,
 }
 
 impl CompactionPlan {

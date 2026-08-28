@@ -135,9 +135,13 @@ impl CompactionPublisher {
                 ),
         })?;
 
-        let pk_delta = match &output {
-            CompactionBuildOutput::Rowset(_) => None,
-            CompactionBuildOutput::PrimaryKey { pk_delta, .. } => Some(pk_delta.clone()),
+        // Split the workspace owner from the ephemeral PK acceleration delta.
+        // The latter can be hundreds of MiB and must move exactly once into
+        // the ordered apply closure; cloning it here doubles compaction peak
+        // memory while the original output remains alive for atomic rename.
+        let (artifact_owner, pk_delta) = match output {
+            CompactionBuildOutput::Rowset(artifact) => (artifact, None),
+            CompactionBuildOutput::PrimaryKey { artifact, pk_delta } => (artifact, Some(pk_delta)),
         };
         let coordinator = tablet.journal_coordinator();
         let runtime = coordinator
@@ -187,7 +191,7 @@ impl CompactionPublisher {
 
         // Keep the staged workspace owner alive until the ordered closure has
         // atomically renamed its rowset directory.
-        drop(output);
+        drop(artifact_owner);
         Ok(())
     }
 }

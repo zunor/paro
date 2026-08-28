@@ -21,7 +21,7 @@ use crate::search::providers::fulltext::search::FullTextTopKProvider;
 use crate::search::{
     ArtifactLocation, CoverageState, OpenedSearchCursor, ResourceBudget, SearchBatchConfig,
     SearchBatchState, SearchCapabilityState, SearchFreshnessPolicy, SearchIndexDefinition,
-    SearchIndexKind, SearchMaintenanceAction, SearchNotQueryableReason, SearchProviderStats,
+    SearchIndexKind, SearchMaintenanceAction, SearchProviderStats,
 };
 use crate::statistics::IndexType;
 use crate::table::storage_descriptor::TableStorageDescriptor;
@@ -3136,7 +3136,7 @@ fn fulltext_late_definition_exact_tail_merge_resolves_partial_rows() {
 }
 
 #[test]
-fn fulltext_tail_over_budget_rejects_before_provider_open() {
+fn fulltext_tail_watermark_does_not_disable_exact_fallback() {
     let table = create_table(&[LogicalType::Integer, LogicalType::Varchar]);
     table
         .append(&test_chunk_from_vectors(vec![
@@ -3160,13 +3160,11 @@ fn fulltext_tail_over_budget_rejects_before_provider_open() {
         .expect("fulltext capability");
     assert_eq!(
         capability.capability_state(),
-        SearchCapabilityState::NotQueryable {
-            reason: SearchNotQueryableReason::TailOverBudget,
-        }
+        SearchCapabilityState::Queryable
     );
 
     let query = FullTextIndex::new_default().parse_query("vector").unwrap();
-    let err = table
+    table
         .open_fulltext_search_cursor(
             1,
             &query,
@@ -3178,11 +3176,7 @@ fn fulltext_tail_over_budget_rejects_before_provider_open() {
             table.max_version(),
             &crate::search::SearchReadOptions::ungoverned(),
         )
-        .unwrap_err();
-    assert!(
-        err.to_string().contains("not queryable"),
-        "tail over budget should reject before provider open, got {err}"
-    );
+        .expect("exact tail fallback remains executable beyond its maintenance watermark");
 }
 
 #[test]

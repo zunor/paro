@@ -319,8 +319,7 @@ impl Tablet {
         };
 
         if let Err(first_error) = validate_once() {
-            self.rebuild_primary_index_from_visible_rowsets()?;
-            self.persist_primary_index_snapshot()?;
+            self.rebuild_primary_index_after_compaction(output)?;
             validate_once().map_err(|second_error| {
                 paro_error::internal(format!(
                     "failed to validate/rebuild primary index after compaction: first={}, second={}",
@@ -329,6 +328,18 @@ impl Tablet {
             })?;
         }
         Ok(())
+    }
+
+    /// Rebuild the primary index from the post-publication durable rowset
+    /// graph. Compaction WAL deliberately does not retain an unbounded key
+    /// delta, so replay and large compactions use this as the authoritative
+    /// publication path rather than trying to infer correctness from index
+    /// cardinality or samples.
+    pub(crate) fn rebuild_primary_index_after_compaction(&self, output: &Rowset) -> Result<()> {
+        self.rebuild_primary_index_from_visible_rowsets()?;
+        self.persist_primary_index_snapshot()?;
+        self.reconcile_primary_index_row_count()?;
+        self.validate_primary_index_rowid_samples(output, output.end_version())
     }
 
     pub(crate) fn apply_compaction_publish_delta(

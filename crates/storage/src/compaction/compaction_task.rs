@@ -267,7 +267,8 @@ mod tests {
             output_rowset_id: 10,
             score: 1.0,
             reason: CompactionReason::CumulativePolicy,
-            pk_delta_guard: None,
+            goal: crate::compaction::plan::types::CompactionGoal::ReduceDebt,
+            primary_index_publish: None,
         }
     }
 

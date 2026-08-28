@@ -950,6 +950,7 @@ fn duration_ns(duration: Duration) -> u64 {
 
 fn policy_priority(kind: PolicyKind) -> u8 {
     match kind {
+        PolicyKind::Goal => 4,
         PolicyKind::SizeTiered => 3,
         PolicyKind::Cumulative => 2,
         PolicyKind::Base => 1,
@@ -1000,7 +1001,8 @@ mod tests {
             output_rowset_id: tablet_id + 10_000,
             score: 1.0,
             reason: CompactionReason::CumulativePolicy,
-            pk_delta_guard: None,
+            goal: crate::compaction::plan::types::CompactionGoal::ReduceDebt,
+            primary_index_publish: None,
         }
     }
 

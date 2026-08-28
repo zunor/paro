@@ -85,6 +85,7 @@ pub struct SearchTailMetricCounters {
     pub tail_bytes: u64,
     pub tail_backlog_tier: u64,
     pub exact_merge_rows_total: u64,
+    pub exact_merge_over_budget_total: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -887,6 +888,17 @@ impl StorageMetrics {
             .expect("search tail metrics lock poisoned");
         let counters = metrics.entry(SearchTailMetricKey { provider }).or_default();
         counters.exact_merge_rows_total = counters.exact_merge_rows_total.saturating_add(rows);
+    }
+
+    /// Record that correctness fallback crossed its preferred latency budget.
+    pub fn record_search_tail_exact_merge_over_budget(&self, provider: SearchIndexKind) {
+        let mut metrics = self
+            .search_tail_by_key
+            .lock()
+            .expect("search tail metrics lock poisoned");
+        let counters = metrics.entry(SearchTailMetricKey { provider }).or_default();
+        counters.exact_merge_over_budget_total =
+            counters.exact_merge_over_budget_total.saturating_add(1);
     }
 
     /// Record a query-time exact tail merge rejection.

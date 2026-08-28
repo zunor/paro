@@ -17,7 +17,7 @@ use super::schema_adapter::TabletSchemaAdaptationPlan;
 use super::shutdown_sweep;
 use super::statistics::TabletStatistics;
 use super::tablet_meta::{AppliedMutationMeta, SearchGenerationHeadMeta, TabletMeta};
-use super::tablet_schema::{ColumnId, TabletSchemaRef};
+use super::tablet_schema::{ColumnId, KeysType, TabletSchemaRef};
 use super::versioned_rowset_catalog::{
     RowsetCatalogCheckpointSlice, RowsetCatalogDescriptor, RowsetCatalogFlags,
     VersionedRowsetCatalog,
@@ -3589,7 +3589,18 @@ impl Tablet {
             .filter_map(|rowset_id| self.find_rowset_by_id(*rowset_id))
             .collect();
 
-        if maybe_output.is_some() && live_inputs.is_empty() {
+        if let Some(output) = maybe_output.as_ref().filter(|_| live_inputs.is_empty()) {
+            if self
+                .schema()
+                .is_some_and(|schema| schema.keys_type() == KeysType::PrimaryKeys)
+            {
+                // A crash can occur after the rowset/meta publication but
+                // before the derived primary-index snapshot is rebuilt. An
+                // idempotent replay must complete that derived-state step,
+                // not treat the visible output directory as sufficient.
+                self.rebuild_primary_index_after_compaction(output.as_ref())?;
+                self.maybe_flush_primary_index()?;
+            }
             return Ok(());
         }
 
@@ -3621,6 +3632,13 @@ impl Tablet {
             )
         })?;
         self.save_meta()?;
+        if self
+            .schema()
+            .is_some_and(|schema| schema.keys_type() == KeysType::PrimaryKeys)
+        {
+            self.rebuild_primary_index_after_compaction(output.as_ref())?;
+            self.maybe_flush_primary_index()?;
+        }
         Ok(())
     }
 
@@ -3670,7 +3688,19 @@ impl Tablet {
             .filter_map(|rowset_id| self.find_rowset_by_id(*rowset_id))
             .collect();
 
-        if maybe_output.is_some() && live_inputs.is_empty() {
+        if let Some(output) = maybe_output.as_ref().filter(|_| live_inputs.is_empty()) {
+            if pk_delta.is_none()
+                && self
+                    .schema()
+                    .is_some_and(|schema| schema.keys_type() == KeysType::PrimaryKeys)
+            {
+                // A crash can occur after the rowset/meta publication but
+                // before the derived primary-index snapshot is rebuilt. An
+                // idempotent replay must complete that derived-state step,
+                // not treat the visible output directory as sufficient.
+                self.rebuild_primary_index_after_compaction(output.as_ref())?;
+                self.maybe_flush_primary_index()?;
+            }
             return Ok(());
         }
 
@@ -3757,7 +3787,19 @@ impl Tablet {
             self.finish_checkpoint_compaction_publish(ticket);
         }
         self.save_meta()?;
-        self.validate_primary_index_consistency_after_compaction(output.as_ref())?;
+        let primary_key_without_ephemeral_delta = pk_delta.is_none()
+            && self
+                .schema()
+                .is_some_and(|schema| schema.keys_type() == KeysType::PrimaryKeys);
+        if primary_key_without_ephemeral_delta {
+            // Replay never has the in-memory acceleration delta, and an
+            // oversized online compaction deliberately omits it. Rebuild from
+            // durable truth unconditionally; cardinality equality is not a
+            // proof that encoded keys still point at the right physical rows.
+            self.rebuild_primary_index_after_compaction(output.as_ref())?;
+        } else {
+            self.validate_primary_index_consistency_after_compaction(output.as_ref())?;
+        }
         self.maybe_flush_primary_index()?;
         Ok(())
     }

@@ -4,7 +4,7 @@
 use super::table_handle::TableHandle;
 use crate::compaction::compaction_manager::allocate_compaction_job_id;
 use crate::compaction::execution::job_orchestrator::run_job_with_search_inline_builders;
-use crate::compaction::plan::CompactionPlanner;
+use crate::compaction::plan::{CompactionGoal, CompactionPlanner};
 use crate::compaction::publish::record::CompactionPublishRecord;
 use crate::table::runtime_indexes::RuntimeIndexes;
 use crate::table::storage_descriptor::TableStorageDescriptor;
@@ -12,7 +12,7 @@ use paro_common::allocator::default_allocator;
 use paro_common::effect::TabletMutation;
 use paro_common::error::{self as paro_error, Result};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 const TABLE_SHUTDOWN_DRAIN_TIMEOUT: Duration = Duration::from_secs(30);
 const FOREGROUND_OPTIMIZE_DRAIN_TIMEOUT: Duration = Duration::from_secs(10 * 60);
@@ -185,7 +185,11 @@ impl TableHandle {
     ///
     /// Returns `true` when a compacted output rowset was produced and published.
     pub fn optimize_compact(&self) -> Result<bool> {
-        let Some(plan) = CompactionPlanner::plan(&self.tablet())? else {
+        self.optimize_compact_for_goal(CompactionGoal::ReduceDebt)
+    }
+
+    fn optimize_compact_for_goal(&self, goal: CompactionGoal) -> Result<bool> {
+        let Some(plan) = CompactionPlanner::plan_for_goal(&self.tablet(), goal)? else {
             return Ok(false);
         };
         let search_inline_builders = self.search_write_context()?.inline_builders;
@@ -226,8 +230,31 @@ impl TableHandle {
         };
 
         let limit = max_compactions.unwrap_or(usize::MAX);
+        let deadline = Instant::now() + FOREGROUND_OPTIMIZE_DRAIN_TIMEOUT;
         let mut completed = 0usize;
-        while completed < limit && self.optimize_compact()? {
+        loop {
+            let rowset_count = self
+                .tablet()
+                .capture_consistent_rowsets(self.tablet().max_version())?
+                .len();
+            if rowset_count <= 1 {
+                break;
+            }
+            if completed >= limit {
+                return Err(paro_error::artifact_not_ready(format!(
+                    "OPTIMIZE TABLE reached its compaction limit with {rowset_count} rowsets remaining"
+                )));
+            }
+            if Instant::now() >= deadline {
+                return Err(paro_error::artifact_not_ready(format!(
+                    "OPTIMIZE TABLE timed out before reaching one rowset ({rowset_count} remaining)"
+                )));
+            }
+            if !self.optimize_compact_for_goal(CompactionGoal::CoalesceTo { max_rowsets: 1 })? {
+                return Err(paro_error::artifact_not_ready(format!(
+                    "OPTIMIZE TABLE made no progress toward one rowset ({rowset_count} remaining)"
+                )));
+            }
             completed = completed.saturating_add(1);
         }
 
@@ -235,15 +262,17 @@ impl TableHandle {
         // artifact for the output rowset. Run provider maintenance to drain a
         // remaining tail or manifest delta before reporting the explicit
         // optimization complete; each sweep is one fair definition quantum.
-        for _ in 0..64 {
+        loop {
             let report = self.search_derived_maintenance_sweep()?;
             if !report.has_pending_work() {
                 return Ok(completed);
             }
+            if Instant::now() >= deadline {
+                return Err(paro_error::artifact_not_ready(
+                    "OPTIMIZE TABLE timed out while reconciling derived-search state",
+                ));
+            }
         }
-        Err(paro_error::artifact_not_ready(
-            "OPTIMIZE TABLE exhausted its derived-search maintenance quanta",
-        ))
     }
 
     /// Validate that the committed rowset version graph is internally legal.

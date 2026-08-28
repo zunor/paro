@@ -5,7 +5,7 @@ use crate::codec::chunk_encoder::encode_chunk;
 use crate::compaction::execution::workspace::{
     CompactionBuildOutput, CompactionWorkspace, StagedArtifact,
 };
-use crate::compaction::plan::types::CompactionPlan;
+use crate::compaction::plan::types::{CompactionPlan, PrimaryIndexPublishPlan};
 use crate::compaction::publish::record::{
     PkIndexUpsertCandidate, PkPublishDelta, SegmentDeleteDelta,
 };
@@ -80,6 +80,10 @@ impl PrimaryKeyMerger {
             .map(|rowset| (rowset.rowset_id(), rowset))
             .collect();
 
+        let durable_rebuild = matches!(
+            plan.primary_index_publish,
+            Some(PrimaryIndexPublishPlan::RebuildFromVisibleRowsets)
+        );
         let mut keys: Vec<Vec<u8>> = Vec::new();
         let mut source_locations: Vec<PhysicalRowRef> = Vec::new();
 
@@ -157,19 +161,25 @@ impl PrimaryKeyMerger {
                         continue;
                     }
 
-                    let encoded_keys = serializer.encode_chunk(&chunk)?;
+                    let encoded_keys = if durable_rebuild {
+                        None
+                    } else {
+                        Some(serializer.encode_chunk(&chunk)?)
+                    };
                     writer.add_chunk(&columns)?;
-                    for (key, &row_id) in encoded_keys
-                        .into_iter()
-                        .zip(rowids.iter())
-                        .take(chunk.size())
-                    {
-                        keys.push(key);
-                        source_locations.push(PhysicalRowRef::new(
-                            rowset.rowset_id(),
-                            segment.segment_id(),
-                            row_id,
-                        ));
+                    if let Some(encoded_keys) = encoded_keys {
+                        for (key, &row_id) in encoded_keys
+                            .into_iter()
+                            .zip(rowids.iter())
+                            .take(chunk.size())
+                        {
+                            keys.push(key);
+                            source_locations.push(PhysicalRowRef::new(
+                                rowset.rowset_id(),
+                                segment.segment_id(),
+                                row_id,
+                            ));
+                        }
                     }
                 }
             }
@@ -182,6 +192,18 @@ impl PrimaryKeyMerger {
                 .map(|input| input.rowset.rowset_id())
                 .collect(),
         );
+
+        if durable_rebuild {
+            // SegmentIterator has already applied every input delete-vector at
+            // the plan snapshot, so PRIMARY_KEYS visibility guarantees at
+            // most one emitted version per key. Stream those visible rows
+            // directly instead of retaining an O(rows) key map merely to
+            // rediscover the MVCC invariant. Publication rebuilds the derived
+            // primary index from the installed durable rowset graph.
+            return Ok(Some(CompactionBuildOutput::Rowset(
+                StagedArtifact::from_rowset(plan, workspace, rowset)?,
+            )));
+        }
 
         let row_locations = row_locations_for_rowset(&rowset)?;
         if row_locations.len() != keys.len() {
@@ -203,6 +225,15 @@ impl PrimaryKeyMerger {
                 let entry = delete_vectors.entry(prev_out.segment_id).or_default();
                 entry.mark_deleted(prev_out.row_offset);
             }
+        }
+
+        if !matches!(
+            plan.primary_index_publish,
+            Some(PrimaryIndexPublishPlan::Incremental(_))
+        ) {
+            return Err(paro_error::internal(
+                "primary-key compaction is missing its publication strategy",
+            ));
         }
 
         let pk_delta = PkPublishDelta {

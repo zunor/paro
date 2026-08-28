@@ -3,13 +3,11 @@
 
 //! Query-time exact tail merge admission for deferred derived search state.
 
-use crate::search::capability::{ArtifactSegmentRef, CoverageState, SearchIndexKind};
+use crate::search::capability::{ArtifactSegmentRef, SearchIndexKind};
 use crate::search::cursor::{PhysicalRowRef, SearchReadSnapshot, VisibleSegment};
 use paro_common::error::{self as paro_error, Result};
 
 use crate::metrics::storage_metrics;
-
-use super::provider_tail_exact_merge_policy;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct TailWindow {
@@ -203,10 +201,17 @@ pub(crate) fn ensure_tail_exact_merge_budget(
     storage_metrics().record_tail_exact_merge_cost(cost.latency_weight);
     let budget = TailExactMergeBudget::for_search_kind(kind);
     if let Some((field, actual, limit)) = budget.first_violation(cost) {
-        storage_metrics().record_search_tail_exact_merge_rejected(kind, field);
-        return Err(paro_error::not_supported(format!(
-            "{kind:?} exact tail merge exceeds {field} budget ({actual} > {limit}); keep the derived state required or run catch-up maintenance"
-        )));
+        storage_metrics().record_search_tail_exact_merge_over_budget(kind);
+        // This is a maintenance/latency signal, not an execution admission
+        // gate. Query memory and cancellation remain governed by the normal
+        // ResourceBudget while the streaming exact path preserves correctness.
+        tracing::debug!(
+            ?kind,
+            field,
+            actual,
+            limit,
+            "search tail crossed its preferred exact-merge budget"
+        );
     }
     storage_metrics().add_search_tail_exact_merge_rows(kind, cost.tail_rows);
     Ok(cost)
@@ -222,20 +227,11 @@ pub(crate) fn estimate_tail_exact_merge_cost(
     if window.is_empty() {
         return Ok(TailExactMergeCost::default());
     }
-    if !coverage_allows_tail_exact_merge(&snapshot.generation.coverage) {
-        storage_metrics().record_search_tail_exact_merge_rejected(kind, "coverage");
-        return Err(paro_error::not_supported(format!(
-            "{kind:?} generation coverage does not expose exact tail merge; keep it required"
+    if !snapshot.generation.coverage.supports_exact_tail_merge() {
+        return Err(paro_error::data_corrupted(format!(
+            "{kind:?} generation exposed a tail without an exact-merge coverage contract"
         )));
     }
-    if !provider_tail_exact_merge_policy(kind).exact_tail_merge_enabled(window.total_rows()) {
-        storage_metrics().record_search_tail_exact_merge_rejected(kind, "hard_limit");
-        return Err(paro_error::not_supported(format!(
-            "{kind:?} tail rows {} exceed exact merge hard limit",
-            window.total_rows()
-        )));
-    }
-
     let mut exact_rows = 0u64;
     let mut indexed_rows = 0u64;
     for segment in snapshot.table_lease.visible_segments() {
@@ -275,15 +271,7 @@ pub(crate) fn estimate_tail_exact_merge_cost(
             dimension,
             ef,
             top_k,
-        } => {
-            let top_k = top_k.max(1) as u64;
-            let probe = ef.unwrap_or_else(|| top_k.max(64) as usize).max(1) as u64;
-            let exact_probe_factor = (probe / top_k).max(1);
-            exact_rows
-                .saturating_mul(dimension.max(1) as u64)
-                .saturating_mul(exact_probe_factor)
-                .saturating_add(indexed_rows.saturating_mul(probe))
-        }
+        } => estimate_hnsw_cpu_ops(exact_rows, indexed_rows, dimension, ef, top_k),
     };
 
     let row_ref_bytes = std::mem::size_of::<PhysicalRowRef>() as u64;
@@ -304,8 +292,21 @@ pub(crate) fn estimate_tail_exact_merge_cost(
     })
 }
 
-fn coverage_allows_tail_exact_merge(coverage: &CoverageState) -> bool {
-    coverage.supports_exact_tail_merge()
+fn estimate_hnsw_cpu_ops(
+    exact_rows: u64,
+    indexed_rows: u64,
+    dimension: usize,
+    ef: Option<usize>,
+    top_k: usize,
+) -> u64 {
+    let top_k = top_k.max(1) as u64;
+    let probe = ef.unwrap_or_else(|| top_k.max(64) as usize).max(1) as u64;
+    // Every exact-tail vector is scored once. `ef` controls graph traversal
+    // over indexed tail artifacts; multiplying exact scan work by ef/top-k
+    // overstates high-ef queries by orders of magnitude.
+    exact_rows
+        .saturating_mul(dimension.max(1) as u64)
+        .saturating_add(indexed_rows.saturating_mul(probe))
 }
 
 #[cfg(test)]
@@ -354,5 +355,15 @@ mod tests {
                 ..TailExactMergeCost::default()
             })
             .is_none());
+    }
+
+    #[test]
+    fn hnsw_exact_tail_work_is_independent_of_ef_and_top_k() {
+        let expected = 16_384 * 768;
+        assert_eq!(estimate_hnsw_cpu_ops(16_384, 0, 768, Some(64), 1), expected);
+        assert_eq!(
+            estimate_hnsw_cpu_ops(16_384, 0, 768, Some(2_048), 100),
+            expected
+        );
     }
 }
