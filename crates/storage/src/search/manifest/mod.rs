@@ -1218,10 +1218,17 @@ impl ManifestStore {
     /// Once replay has completed, every remaining entry is necessarily
     /// unreferenced by the durable prefix and may be removed.
     pub(crate) fn sweep_orphan_generation_workspaces(&self) -> Result<usize> {
-        let staging_root = self
-            .table_data_dir
-            .join("_staged")
-            .join("search-generation");
+        let staging_base = self.table_data_dir.join("_staged");
+        let mut removed = 0usize;
+        for namespace in ["search-generation", "search-sidecar"] {
+            removed = removed.saturating_add(Self::sweep_workspace_namespace(
+                &staging_base.join(namespace),
+            )?);
+        }
+        Ok(removed)
+    }
+
+    fn sweep_workspace_namespace(staging_root: &Path) -> Result<usize> {
         let Ok(entries) = fs::read_dir(&staging_root) else {
             return Ok(0);
         };
@@ -2055,6 +2062,24 @@ mod tests {
             .join("txn-9-def-44-gen-1");
         std::fs::create_dir_all(&workspace).unwrap();
         std::fs::write(workspace.join("partial"), b"staged").unwrap();
+
+        assert_eq!(store.sweep_orphan_generation_workspaces().unwrap(), 1);
+        assert!(!workspace.exists());
+    }
+
+    #[test]
+    fn generation_workspace_sweep_removes_crashed_sidecar_builds() {
+        let temp_dir = TempDir::new().expect("temp dir");
+        let store = ManifestStore::new(temp_dir.path());
+        let workspace = temp_dir
+            .path()
+            .join("_staged")
+            .join("search-sidecar")
+            .join("44")
+            .join("g1")
+            .join("package-0-process-7-1");
+        std::fs::create_dir_all(&workspace).unwrap();
+        std::fs::write(workspace.join("package.scar"), b"partial").unwrap();
 
         assert_eq!(store.sweep_orphan_generation_workspaces().unwrap(), 1);
         assert!(!workspace.exists());

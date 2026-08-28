@@ -241,6 +241,7 @@ impl SidecarMappedPackage {
 pub struct SidecarPackageWriter {
     file_id: ArtifactFileId,
     final_path: PathBuf,
+    workspace_dir: PathBuf,
     staging_path: PathBuf,
     file: Option<File>,
     offset: u64,
@@ -251,9 +252,7 @@ impl SidecarPackageWriter {
     const ARTIFACT_ALIGNMENT: u64 = 64;
 
     pub(crate) fn workspace_dir(&self) -> &Path {
-        self.staging_path
-            .parent()
-            .expect("sidecar staging path always has a parent")
+        &self.workspace_dir
     }
 
     fn create(table_data_dir: PathBuf, file_id: ArtifactFileId) -> Result<Self> {
@@ -278,7 +277,20 @@ impl SidecarPackageWriter {
             ))
         })?;
 
-        let staging_path = staging_path_for(&final_path);
+        let staging_root = table_data_dir
+            .join("_staged")
+            .join("search-sidecar")
+            .join(file_id.definition_id.to_string())
+            .join(format!("g{}", file_id.generation_id));
+        fs::create_dir_all(&staging_root).map_err(|err| {
+            paro_error::io_error(format!(
+                "create search sidecar staging root {}: {}",
+                staging_root.display(),
+                err
+            ))
+        })?;
+        let workspace_dir = create_sidecar_workspace(&staging_root, file_id.package_index)?;
+        let staging_path = workspace_dir.join("package.scar");
         let file = OpenOptions::new()
             .read(true)
             .write(true)
@@ -295,6 +307,7 @@ impl SidecarPackageWriter {
         Ok(Self {
             file_id,
             final_path,
+            workspace_dir,
             staging_path,
             file: Some(file),
             offset: 0,
@@ -437,7 +450,7 @@ impl SidecarPackageWriter {
             })?;
         }
         fs::rename(&self.staging_path, &self.final_path).map_err(|err| {
-            let _ = fs::remove_file(&self.staging_path);
+            let _ = fs::remove_dir_all(&self.workspace_dir);
             paro_error::io_error(format!(
                 "commit search sidecar package {} -> {}: {}",
                 self.staging_path.display(),
@@ -445,13 +458,14 @@ impl SidecarPackageWriter {
                 err
             ))
         })?;
+        let _ = fs::remove_dir_all(&self.workspace_dir);
         self.committed = true;
         Ok(self.final_path.clone())
     }
 
     pub fn abort(mut self) {
         self.file.take();
-        let _ = fs::remove_file(&self.staging_path);
+        let _ = fs::remove_dir_all(&self.workspace_dir);
         self.committed = true;
     }
 
@@ -464,7 +478,7 @@ impl Drop for SidecarPackageWriter {
     fn drop(&mut self) {
         if !self.committed {
             let _ = self.file.take();
-            let _ = fs::remove_file(&self.staging_path);
+            let _ = fs::remove_dir_all(&self.workspace_dir);
         }
     }
 }
@@ -882,13 +896,25 @@ impl SearchReaderRuntime {
     }
 }
 
-fn staging_path_for(final_path: &Path) -> PathBuf {
-    let sequence = SIDECAR_STAGING_SEQUENCE.fetch_add(1, Ordering::Relaxed);
-    let file_name = final_path
-        .file_name()
-        .and_then(|name| name.to_str())
-        .unwrap_or("package.scar");
-    final_path.with_file_name(format!("{file_name}.staging-{sequence}"))
+fn create_sidecar_workspace(staging_root: &Path, package_index: u32) -> Result<PathBuf> {
+    loop {
+        let sequence = SIDECAR_STAGING_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+        let workspace = staging_root.join(format!(
+            "package-{package_index}-process-{}-{sequence}",
+            std::process::id()
+        ));
+        match fs::create_dir(&workspace) {
+            Ok(()) => return Ok(workspace),
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(error) => {
+                return Err(paro_error::io_error(format!(
+                    "create search sidecar workspace {}: {}",
+                    workspace.display(),
+                    error
+                )));
+            }
+        }
+    }
 }
 
 fn sidecar_reader_cache_key(
@@ -1086,15 +1112,18 @@ mod tests {
         };
         let final_path;
         let staging_path;
+        let workspace_dir;
         {
             let mut writer = store.create_package_writer(file_id).unwrap();
             writer.append_artifact(b"orphan").unwrap();
             final_path = writer.final_path().to_path_buf();
             staging_path = writer.staging_path().to_path_buf();
+            workspace_dir = writer.workspace_dir().to_path_buf();
             assert!(staging_path.exists());
         }
 
         assert!(!staging_path.exists());
+        assert!(!workspace_dir.exists());
         assert!(!final_path.exists());
     }
 
