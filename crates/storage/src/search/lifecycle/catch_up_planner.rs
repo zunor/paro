@@ -21,6 +21,10 @@ pub(crate) struct CatchUpWorkItem {
 #[derive(Debug, Clone, Default)]
 pub(crate) struct CatchUpPlan {
     pub(crate) items: Vec<CatchUpWorkItem>,
+    /// Canonical vector rows admitted into this immutable build quantum.
+    /// Carry compaction uses the exact planned cardinality to select the
+    /// destination size level before provider work starts.
+    pub(crate) planned_rows: u64,
 }
 
 impl CatchUpPlan {
@@ -77,7 +81,10 @@ impl CatchUpPlanner {
             });
         }
 
-        Ok(CatchUpPlan { items })
+        Ok(CatchUpPlan {
+            items,
+            planned_rows,
+        })
     }
 }
 

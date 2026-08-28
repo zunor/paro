@@ -12,7 +12,7 @@ use paro_common::allocator::default_allocator;
 use paro_common::effect::TabletMutation;
 use paro_common::error::{self as paro_error, Result};
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 const TABLE_SHUTDOWN_DRAIN_TIMEOUT: Duration = Duration::from_secs(30);
 const FOREGROUND_OPTIMIZE_DRAIN_TIMEOUT: Duration = Duration::from_secs(10 * 60);
@@ -214,6 +214,11 @@ impl TableHandle {
     /// admission and drains any already accepted job, preventing two plans
     /// from rebuilding the same immutable inputs. Planning is repeated after
     /// every publication because each result changes the version graph.
+    /// The storage layer deliberately has no fixed wall-clock cutoff: legal
+    /// compactions scale with table and vector-index size, so an internal ten
+    /// minute limit turns progress into a spurious failure. Callers own their
+    /// execution deadline/cancellation policy; `LIMIT` remains the explicit
+    /// bound on the number of physical compactions.
     pub fn optimize_all(&self, max_compactions: Option<usize>) -> Result<usize> {
         let _registration = if let Some(manager) = self.bound_compaction_manager() {
             manager.drain_tablet(
@@ -230,7 +235,6 @@ impl TableHandle {
         };
 
         let limit = max_compactions.unwrap_or(usize::MAX);
-        let deadline = Instant::now() + FOREGROUND_OPTIMIZE_DRAIN_TIMEOUT;
         let mut completed = 0usize;
         loop {
             let rowset_count = self
@@ -243,11 +247,6 @@ impl TableHandle {
             if completed >= limit {
                 return Err(paro_error::artifact_not_ready(format!(
                     "OPTIMIZE TABLE reached its compaction limit with {rowset_count} rowsets remaining"
-                )));
-            }
-            if Instant::now() >= deadline {
-                return Err(paro_error::artifact_not_ready(format!(
-                    "OPTIMIZE TABLE timed out before reaching one rowset ({rowset_count} remaining)"
                 )));
             }
             if !self.optimize_compact_for_goal(CompactionGoal::CoalesceTo { max_rowsets: 1 })? {
@@ -266,11 +265,6 @@ impl TableHandle {
             let report = self.search_derived_maintenance_sweep()?;
             if !report.has_pending_work() {
                 return Ok(completed);
-            }
-            if Instant::now() >= deadline {
-                return Err(paro_error::artifact_not_ready(
-                    "OPTIMIZE TABLE timed out while reconciling derived-search state",
-                ));
             }
         }
     }

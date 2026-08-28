@@ -1133,22 +1133,60 @@ impl SearchIndexRegistry {
             .collect::<BTreeMap<_, _>>();
 
         let catch_up_plan = CatchUpPlanner.plan(&state.definition, manifest, &visible_by_id)?;
-        let touched = catch_up_plan.len();
-        if touched == 0 {
+        let newly_materialized_rowsets = catch_up_plan.len();
+        if newly_materialized_rowsets == 0 {
             return Ok(0);
         }
+
+        let carry_artifacts = if state.definition.kind == SearchIndexKind::Hnsw {
+            let provider = state.hnsw_provider_config.as_ref().ok_or_else(|| {
+                paro_error::internal("HNSW catch-up requires decoded provider config")
+            })?;
+            select_hnsw_carry_artifacts(
+                &manifest.artifacts.artifacts,
+                provider,
+                catch_up_plan.planned_rows,
+            )
+        } else {
+            Vec::new()
+        };
+        let (carry_tail, carry_rowsets) = if carry_artifacts.is_empty() {
+            (Vec::new(), Vec::new())
+        } else {
+            hnsw_compaction_build_input(&carry_artifacts, &visible_by_id)?
+        };
+        if !carry_artifacts.is_empty() && carry_tail.is_empty() {
+            // A physical-layout publication replaced one of the selected
+            // carry inputs. Retry from the next level-triggered pass rather
+            // than building a graph from a partial radix digit.
+            return Ok(0);
+        }
+
+        let mut rowset_refs = catch_up_plan
+            .items
+            .iter()
+            .map(|item| item.rowset.clone())
+            .chain(carry_rowsets)
+            .map(|rowset| (rowset.rowset_id(), rowset))
+            .collect::<BTreeMap<_, _>>()
+            .into_values()
+            .collect::<Vec<_>>();
+        rowset_refs.sort_by_key(|rowset| rowset.rowset_id());
+        let mut tail_window = manifest.tail_pending_entries.clone();
+        tail_window.extend(carry_tail);
+        tail_window.sort_by(|left, right| {
+            left.rowset_id
+                .cmp(&right.rowset_id)
+                .then_with(|| left.segment_ids.cmp(&right.segment_ids))
+        });
 
         let sidecar_store = SidecarArtifactStore::new(self.tablet.data_dir().clone());
         let builder = ProviderSidecarArtifactBuilder::for_maintenance(sidecar_store.clone());
         let input = super::inline_sink::SidecarBuildInput {
             definition: state.definition.clone(),
             generation_id: manifest.root.generation_id,
-            tail_window: manifest.tail_pending_entries.clone(),
-            rowset_refs: catch_up_plan
-                .items
-                .iter()
-                .map(|item| item.rowset.clone())
-                .collect(),
+            tail_window,
+            rowset_refs,
             snapshot_version: self.tablet.max_version(),
             stop_check: None,
         };
@@ -1164,18 +1202,14 @@ impl SearchIndexRegistry {
         if result.artifact_refs.is_empty() {
             return Ok(0);
         }
-        let touched = result
-            .artifact_refs
-            .iter()
-            .flat_map(|artifact| {
-                artifact
-                    .coverage
-                    .segments()
-                    .iter()
-                    .map(|span| span.segment.rowset_id)
-            })
-            .collect::<BTreeSet<_>>()
-            .len();
+        if !carry_artifacts.is_empty() {
+            validate_hnsw_carry_result(
+                &state.definition,
+                manifest.root.generation_id,
+                &carry_artifacts,
+                &result.artifact_refs,
+            )?;
+        }
         let sidecar_file_ids = sidecar_file_ids_for_artifacts(&result.artifact_refs);
         // Expensive provider work intentionally runs without publication or
         // definition locks. Re-enter the ordered publication critical section
@@ -1194,20 +1228,27 @@ impl SearchIndexRegistry {
         drop(latest);
         if latest_state.definition != state.definition
             || latest_state.origin != state.origin
-            || !Self::catch_up_artifacts_rebaseable(&latest_state, &result.artifact_refs)
+            || !Self::catch_up_artifacts_rebaseable(
+                &latest_state,
+                &carry_artifacts,
+                &result.artifact_refs,
+            )
         {
             remove_sidecar_packages(&sidecar_store, &sidecar_file_ids);
             return Ok(0);
         }
 
-        let next_state =
-            match self.publish_sidecar_catch_up_delta(&latest_state, result.artifact_refs) {
-                Ok(next_state) => next_state,
-                Err(err) => {
-                    remove_sidecar_packages(&sidecar_store, &sidecar_file_ids);
-                    return Err(err);
-                }
-            };
+        let next_state = match self.publish_sidecar_catch_up_delta(
+            &latest_state,
+            &carry_artifacts,
+            result.artifact_refs,
+        ) {
+            Ok(next_state) => next_state,
+            Err(err) => {
+                remove_sidecar_packages(&sidecar_store, &sidecar_file_ids);
+                return Err(err);
+            }
+        };
         let completion = publish_head_for_state(
             &self.tablet,
             &self.manifests,
@@ -1225,7 +1266,7 @@ impl SearchIndexRegistry {
         self.sweep_retired();
         record_tail_metrics_for_state(&next_state);
         self.signal_maintenance_progress()?;
-        Ok(touched)
+        Ok(newly_materialized_rowsets)
     }
 
     /// Coalesce an immutable HNSW artifact prefix without rewriting table
@@ -1422,7 +1463,8 @@ impl SearchIndexRegistry {
     /// publication covering any built segment is not safe and rejects rebase.
     fn catch_up_artifacts_rebaseable(
         latest_state: &SearchDefinitionState,
-        artifacts: &[SearchArtifactRef],
+        removed_artifacts: &[SearchArtifactRef],
+        added_artifacts: &[SearchArtifactRef],
     ) -> bool {
         let (Some(manifest), Some(generation)) = (
             latest_state.manifest.as_ref(),
@@ -1441,15 +1483,46 @@ impl SearchIndexRegistry {
                     .map(move |segment_id| (entry.rowset_id, *segment_id))
             })
             .collect::<BTreeSet<_>>();
-        !artifacts.is_empty()
-            && artifacts.iter().all(|artifact| {
+        let removed_segments = removed_artifacts
+            .iter()
+            .flat_map(|artifact| {
+                artifact
+                    .coverage
+                    .segments()
+                    .iter()
+                    .map(|span| (span.segment.rowset_id, span.segment.segment_id))
+            })
+            .collect::<BTreeSet<_>>();
+        let removed_still_live = removed_artifacts.iter().all(|removed| {
+            manifest
+                .artifacts
+                .artifacts
+                .iter()
+                .any(|current| current == removed)
+        });
+        removed_still_live
+            && !added_artifacts.is_empty()
+            && added_artifacts.iter().all(|artifact| {
                 artifact.definition_id == latest_state.definition.definition_id
                     && artifact.kind == latest_state.definition.kind
                     && artifact.generation_id == generation.generation_id
                     && artifact.coverage.segments().iter().all(|span| {
                         pending_segments
                             .contains(&(span.segment.rowset_id, span.segment.segment_id))
+                            || removed_segments
+                                .contains(&(span.segment.rowset_id, span.segment.segment_id))
                     })
+            })
+            && removed_artifacts.iter().all(|removed| {
+                removed.coverage.segments().iter().all(|removed_span| {
+                    added_artifacts.iter().any(|added| {
+                        added.coverage.segments().iter().any(|added_span| {
+                            added.column_id == removed.column_id
+                                && added_span.segment == removed_span.segment
+                                && added_span.row_count == removed_span.row_count
+                        })
+                    })
+                })
             })
     }
 
@@ -2678,6 +2751,7 @@ impl SearchIndexRegistry {
     fn publish_sidecar_catch_up_delta(
         &self,
         state: &SearchDefinitionState,
+        removed_artifacts: &[SearchArtifactRef],
         mut added_artifacts: Vec<SearchArtifactRef>,
     ) -> Result<SearchDefinitionState> {
         let started_at = Instant::now();
@@ -2693,9 +2767,22 @@ impl SearchIndexRegistry {
         let definition_id = state.definition.definition_id;
 
         added_artifacts = assign_generation_id(added_artifacts, generation.generation_id);
-        let current_artifact_keys =
-            artifact_segment_column_keys(current_manifest.artifacts.artifacts.iter());
-        let added_artifact_keys = artifact_segment_column_keys(added_artifacts.iter());
+        let removed_keys = removed_artifacts
+            .iter()
+            .map(search_artifact_key)
+            .collect::<BTreeSet<_>>();
+        let mut materialized_artifacts = current_manifest
+            .artifacts
+            .artifacts
+            .iter()
+            .filter(|artifact| !removed_keys.contains(&search_artifact_key(artifact)))
+            .cloned()
+            .collect::<Vec<_>>();
+        materialized_artifacts.extend(added_artifacts.iter().cloned());
+        let materialized = GenerationArtifactSet::try_new(materialized_artifacts)?;
+        let materialized_artifact_keys =
+            artifact_segment_column_keys(materialized.artifacts.iter());
+        let no_additional_artifact_keys = BTreeSet::new();
         let covered_tail_ids = current_manifest
             .tail_pending_entries
             .iter()
@@ -2704,8 +2791,8 @@ impl SearchIndexRegistry {
                     && tail_entry_is_covered_by_artifacts(
                         &state.definition,
                         entry,
-                        &current_artifact_keys,
-                        &added_artifact_keys,
+                        &materialized_artifact_keys,
+                        &no_additional_artifact_keys,
                     )
             })
             .map(|entry| entry.entry_id)
@@ -2722,9 +2809,8 @@ impl SearchIndexRegistry {
             .filter(|entry| !covered_tail_ids.contains(&entry.entry_id))
             .cloned()
             .collect::<Vec<_>>();
-        let delta_generation_stats =
-            generation_stats_from_artifacts(&state.definition, &added_artifacts)?;
-        root.generation_stats.merge_assign(&delta_generation_stats);
+        root.generation_stats =
+            generation_stats_from_artifacts(&state.definition, &materialized.artifacts)?;
         let tail_pending = TailPendingSet {
             entries: tail_pending_entries.clone(),
         };
@@ -2749,6 +2835,11 @@ impl SearchIndexRegistry {
 
         let mut delta_entries = Vec::new();
         delta_entries.extend(
+            removed_artifacts
+                .iter()
+                .map(|artifact| ManifestDeltaEntry::RemoveArtifact(artifact.coverage.clone())),
+        );
+        delta_entries.extend(
             added_artifacts
                 .iter()
                 .cloned()
@@ -2760,11 +2851,14 @@ impl SearchIndexRegistry {
                 .copied()
                 .map(ManifestDeltaEntry::CoverTail),
         );
-        delta_entries.extend(
-            stats_deltas_from_generation_stats(&delta_generation_stats)
-                .into_iter()
-                .map(ManifestDeltaEntry::StatsDelta),
-        );
+        if removed_artifacts.is_empty() {
+            let added_stats = generation_stats_from_artifacts(&state.definition, &added_artifacts)?;
+            delta_entries.extend(
+                stats_deltas_from_generation_stats(&added_stats)
+                    .into_iter()
+                    .map(ManifestDeltaEntry::StatsDelta),
+            );
+        }
         let mut revision =
             self.manifests
                 .begin_revision_from_manifest(definition_id, root, current_manifest)?;
@@ -3485,6 +3579,59 @@ fn select_hnsw_compaction_artifacts(
     selected
 }
 
+/// Select deterministic same-level inputs to carry an admitted tail quantum
+/// directly into the next HNSW size tier.
+///
+/// A separate compaction action cannot keep fan-out bounded under sustained
+/// ingest because freshness work always has priority. Folding the carry into
+/// the catch-up build gives the manifest the same radix invariant while tail
+/// rows are still arriving: fewer than `fanout` artifacts remain in every
+/// level, and a full digit is replaced atomically with its promoted graph.
+fn select_hnsw_carry_artifacts(
+    artifacts: &[SearchArtifactRef],
+    provider: &crate::search::HnswProviderConfig,
+    incoming_rows: u64,
+) -> Vec<SearchArtifactRef> {
+    if incoming_rows == 0 {
+        return Vec::new();
+    }
+    let target_rows = provider.maintenance.target_rows(provider.dimension);
+    let fanout = provider.maintenance.compaction_fanout.max(2);
+    let carry_width = usize::try_from(fanout.saturating_sub(1)).unwrap_or(usize::MAX);
+    let mut promoted_rows = incoming_rows;
+    let mut selected_keys = BTreeSet::new();
+    let mut selected = Vec::new();
+
+    loop {
+        let level = hnsw_artifact_compaction_level(promoted_rows, target_rows, fanout);
+        let mut candidates = artifacts
+            .iter()
+            .filter(|artifact| {
+                !selected_keys.contains(&search_artifact_key(artifact))
+                    && hnsw_artifact_compaction_level(artifact.stats.row_count, target_rows, fanout)
+                        == level
+            })
+            .cloned()
+            .collect::<Vec<_>>();
+        candidates.sort_by_key(|artifact| {
+            artifact
+                .coverage
+                .segments()
+                .first()
+                .map(|span| span.segment)
+        });
+        if candidates.len() < carry_width {
+            break;
+        }
+        for artifact in candidates.into_iter().take(carry_width) {
+            promoted_rows = promoted_rows.saturating_add(artifact.stats.row_count);
+            selected_keys.insert(search_artifact_key(&artifact));
+            selected.push(artifact);
+        }
+    }
+    selected
+}
+
 fn hnsw_compaction_build_input(
     selected_artifacts: &[SearchArtifactRef],
     visible_rowsets: &BTreeMap<RowsetId, RowsetSharedPtr>,
@@ -3583,6 +3730,53 @@ fn validate_hnsw_compaction_result(
         return Err(paro_error::data_corrupted(
             "HNSW generation compaction changed physical segment coverage",
         ));
+    }
+    Ok(())
+}
+
+fn validate_hnsw_carry_result(
+    definition: &SearchIndexDefinition,
+    generation_id: u64,
+    removed_artifacts: &[SearchArtifactRef],
+    added_artifacts: &[SearchArtifactRef],
+) -> Result<()> {
+    if added_artifacts.len() != 1 {
+        return Err(paro_error::data_corrupted(format!(
+            "HNSW catch-up carry produced {} artifacts instead of one",
+            added_artifacts.len()
+        )));
+    }
+    let output = &added_artifacts[0];
+    output.validate()?;
+    if output.definition_id != definition.definition_id
+        || output.generation_id != generation_id
+        || output.kind != SearchIndexKind::Hnsw
+    {
+        return Err(paro_error::data_corrupted(
+            "HNSW catch-up carry artifact identity mismatch",
+        ));
+    }
+    for removed in removed_artifacts {
+        removed.validate()?;
+        if removed.definition_id != definition.definition_id
+            || removed.generation_id != generation_id
+            || removed.kind != SearchIndexKind::Hnsw
+            || removed.column_id != output.column_id
+        {
+            return Err(paro_error::data_corrupted(
+                "HNSW catch-up carry input identity mismatch",
+            ));
+        }
+        for removed_span in removed.coverage.segments() {
+            if !output.coverage.segments().iter().any(|output_span| {
+                output_span.segment == removed_span.segment
+                    && output_span.row_count == removed_span.row_count
+            }) {
+                return Err(paro_error::data_corrupted(
+                    "HNSW catch-up carry omitted selected artifact coverage",
+                ));
+            }
+        }
     }
     Ok(())
 }
@@ -4464,6 +4658,38 @@ mod tests {
     }
 
     #[test]
+    fn hnsw_catch_up_carry_promotes_full_radix_digits_in_one_build() {
+        let definition = hnsw_test_definition(94);
+        let provider =
+            crate::search::HnswProviderConfig::from_value(&definition.provider_config).unwrap();
+        let target = provider.maintenance.target_rows(provider.dimension);
+        let fanout = u64::from(provider.maintenance.compaction_fanout);
+        let mut artifacts = Vec::new();
+        for ordinal in 0..(fanout - 1) {
+            artifacts.push(hnsw_test_artifact(94, 100 + ordinal, target, 2, 32));
+        }
+        for ordinal in 0..(fanout - 1) {
+            artifacts.push(hnsw_test_artifact(
+                94,
+                200 + ordinal,
+                target * fanout,
+                3,
+                32,
+            ));
+        }
+
+        let selected = select_hnsw_carry_artifacts(&artifacts, &provider, target);
+        assert_eq!(selected.len(), usize::try_from((fanout - 1) * 2).unwrap());
+        assert!(selected.iter().all(|artifact| {
+            artifact.stats.row_count == target || artifact.stats.row_count == target * fanout
+        }));
+
+        artifacts.pop();
+        let selected = select_hnsw_carry_artifacts(&artifacts, &provider, target);
+        assert_eq!(selected.len(), usize::try_from(fanout - 1).unwrap());
+    }
+
+    #[test]
     fn full_snapshot_tail_id_assignment_reuses_existing_ids_and_root_cursor() {
         let existing_tail = TailPendingEntry {
             entry_id: TailEntryId(7),
@@ -4589,6 +4815,7 @@ mod tests {
 
         assert!(SearchIndexRegistry::catch_up_artifacts_rebaseable(
             &state,
+            &[],
             std::slice::from_ref(&built_prefix)
         ));
 
@@ -4601,6 +4828,7 @@ mod tests {
             .remove(0);
         assert!(!SearchIndexRegistry::catch_up_artifacts_rebaseable(
             &compacted,
+            &[],
             std::slice::from_ref(&built_prefix)
         ));
 
@@ -4608,6 +4836,7 @@ mod tests {
         wrong_generation.generation_id = 2;
         assert!(!SearchIndexRegistry::catch_up_artifacts_rebaseable(
             &state,
+            &[],
             &[wrong_generation]
         ));
     }
@@ -7154,7 +7383,10 @@ mod tests {
         let mut provider =
             crate::search::HnswProviderConfig::from_value(&test_hnsw_provider_config(1, 16, 64, 0))
                 .unwrap();
-        provider.maintenance.compaction_fanout = 2;
+        // Keep two level-zero artifacts live so this test exercises the
+        // explicit full-generation compaction path rather than the normal
+        // catch-up carry (which would merge immediately at fanout two).
+        provider.maintenance.compaction_fanout = 3;
         let provider_config = provider.to_value().unwrap();
         let definition = SearchIndexDefinition {
             definition_id: 188,
@@ -7219,7 +7451,7 @@ mod tests {
         assert!(
             !table
                 .search_registry()
-                .compact_hnsw_generation(188, false)
+                .compact_hnsw_generation(188, true)
                 .unwrap(),
             "optional generation compaction must yield to admitted ingest"
         );
@@ -7233,7 +7465,7 @@ mod tests {
         assert!(
             table
                 .search_registry()
-                .compact_hnsw_generation(188, false)
+                .compact_hnsw_generation(188, true)
                 .unwrap(),
             "derived graph compaction must not be permanently suppressed merely because a physical rewrite is eligible"
         );

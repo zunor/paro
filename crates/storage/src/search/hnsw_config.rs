@@ -29,22 +29,18 @@ use super::provider_config::{
     decode_provider_config, encode_provider_config, StrictProviderConfig,
 };
 
-/// Version 21 separates dimension-aware maintenance batching and ingest
-/// backpressure from the query executor's exact-tail merge budget. A query
-/// policy is not a valid build quantum: coupling them produced thousands of
-/// tiny graphs during sustained ingest.
-/// Version 21 makes incremental graph build quanta, backpressure, and
-/// levelled-compaction fan-out a dimension-aware durable policy. Version 20
-/// makes the exact rerank window an explicit search policy rather
-/// than inferring it from the graph encoding and ef. Version 19 makes compact
-/// encoding and its non-zero routing dimension an
-/// atomic sum type and replaces reference-dimension cost ratios with direct,
-/// encoding-aware physical work units. Version 18 upgrades compact routing to
-/// symmetric i16 so ordered geometry cannot collapse into an i8 codebook.
-/// Version 17 makes the construction
-/// routing-vector encoding an explicit,
-/// durable definition choice. Version 16 pins the dimension-aware distance
-/// cost model and its provenance to the definition.
+/// Version 22 makes sustained-ingest maintenance use 64 MiB build quanta and
+/// four-way radix carry. Combined catch-up/carry publication keeps query
+/// fan-out bounded while amortizing graph reconstruction; the old 8 MiB,
+/// eight-way policy created many tiny graphs before optional compaction could
+/// run. Version 21 separates dimension-aware maintenance batching and ingest
+/// backpressure from the query executor's exact-tail merge budget. Version 20
+/// makes the exact rerank window an explicit search policy. Version 19 makes
+/// compact encoding and its non-zero routing dimension atomic and replaces
+/// reference-dimension ratios with encoding-aware work units. Version 18
+/// upgrades compact routing to symmetric i16. Version 17 makes the construction
+/// routing-vector encoding an explicit durable choice. Version 16 pins the
+/// dimension-aware distance cost model and its provenance to the definition.
 /// Version 15 binds construction to canonical unordered point-pair scoring so
 /// cosine topology cannot vary with heuristic operand order.
 /// Version 14 removes cardinality thresholds from search policy. Exact versus
@@ -63,11 +59,11 @@ use super::provider_config::{
 /// generation. Artifact-envelope compatibility is versioned independently;
 /// provider-config versions describe the definition and build contract rather
 /// than the physical checksum hierarchy used by a particular binary.
-pub const HNSW_PROVIDER_CONFIG_VERSION: u32 = 21;
+pub const HNSW_PROVIDER_CONFIG_VERSION: u32 = 22;
 
-pub const DEFAULT_HNSW_MAINTENANCE_TARGET_VECTOR_BYTES: u64 = 8 * 1024 * 1024;
+pub const DEFAULT_HNSW_MAINTENANCE_TARGET_VECTOR_BYTES: u64 = 64 * 1024 * 1024;
 pub const DEFAULT_HNSW_MAINTENANCE_MAX_PENDING_VECTOR_BYTES: u64 = 256 * 1024 * 1024;
-pub const DEFAULT_HNSW_MAINTENANCE_COMPACTION_FANOUT: u32 = 8;
+pub const DEFAULT_HNSW_MAINTENANCE_COMPACTION_FANOUT: u32 = 4;
 
 /// Definition-pinned batching policy for derived HNSW maintenance.
 ///
@@ -505,11 +501,14 @@ mod tests {
     #[test]
     fn maintenance_rows_are_dimension_aware_and_reproducible() {
         let policy = HnswMaintenancePolicy::default();
-        assert_eq!(policy.target_rows(128), 16_384);
+        assert_eq!(policy.target_rows(128), 131_072);
         assert_eq!(policy.max_pending_rows(128), 524_288);
-        assert_eq!(policy.target_rows(768), 2_731);
+        assert_eq!(policy.target_rows(768), 21_846);
         assert_eq!(policy.max_pending_rows(768), 87_382);
-        assert_eq!(policy.vector_bytes(768, policy.target_rows(768)), 8_389_632);
+        assert_eq!(
+            policy.vector_bytes(768, policy.target_rows(768)),
+            67_110_912
+        );
     }
 
     #[test]
