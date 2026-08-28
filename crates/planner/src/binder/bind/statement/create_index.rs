@@ -545,14 +545,12 @@ fn hnsw_provider_config(
         paro_error::invalid_input(format!("HNSW vector dimension exceeds {}", u32::MAX))
     })?;
     let build_routing_dimensions = if compact_build_vectors {
-        let default_encoding =
-            paro_storage::index::hnsw::HnswBuildVectorEncoding::default_for_dimension(dimension)?;
         parse_u64_index_option(
             options,
             "build_routing_dimensions",
-            u64::from(default_encoding.routing_dimensions().ok_or_else(|| {
-                paro_error::internal("compact HNSW default encoding has no routing dimension")
-            })?),
+            u64::from(
+                dimension.min(paro_storage::index::hnsw::DEFAULT_HNSW_BUILD_ROUTING_DIMENSIONS),
+            ),
         )?
     } else {
         parse_u64_index_option(options, "build_routing_dimensions", 0)?
@@ -1133,6 +1131,30 @@ mod tests {
         assert!(unidentified
             .to_string()
             .contains("non-zero distance_cost_calibration_id"));
+    }
+
+    #[test]
+    fn explicit_compact_encoding_defaults_to_the_available_routing_dimensions() {
+        let vector_type = LogicalType::Array(Box::new(LogicalType::Float), 128);
+        let mut binder = test_binder_with_public_table("items", &[("embedding", vector_type)]);
+
+        let bound = bind_create_index(
+            &mut binder,
+            parse_create_index_stmt(
+                "CREATE VECTOR INDEX idx_compact ON items (embedding) \
+                 build_vector_encoding = symmetric_i16",
+            ),
+        )
+        .expect("explicit compact encoding should bind at the auto-encoding boundary");
+        let BoundStatementKind::CreateIndex(bound) = bound else {
+            panic!("expected bound CREATE INDEX");
+        };
+        assert_eq!(
+            bound.info.provider_config["build_vector_encoding"]["symmetric_i16"]
+                ["routing_dimensions"],
+            128
+        );
+        assert_eq!(bound.info.provider_config["rerank_policy"], "ef");
     }
 
     #[test]
