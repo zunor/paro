@@ -320,6 +320,9 @@ fn hnsw_provider_config(
         "symmetric_i16_dimension_cost_units",
         "graph_scored_points_per_ef",
         "distance_cost_calibration_id",
+        "maintenance_target_vector_bytes",
+        "maintenance_max_pending_vector_bytes",
+        "maintenance_compaction_fanout",
         "filter_columns",
         "filter_block_rows",
         "filter_m",
@@ -367,20 +370,19 @@ fn hnsw_provider_config(
             "HNSW index option distance must be one of l2, cosine, ip, or l1, got '{distance_name}'"
         ))
     })?;
-    let compact_build_vectors = match options
-        .get("build_vector_encoding")
-        .map(String::as_str)
-        .unwrap_or("symmetric_i16")
-        .to_ascii_lowercase()
-        .as_str()
-    {
+    let compact_build_vectors = match options.get("build_vector_encoding").map(String::as_str) {
+        None => *dimension
+            > usize::try_from(paro_storage::index::hnsw::DEFAULT_HNSW_BUILD_ROUTING_DIMENSIONS)
+                .unwrap_or(usize::MAX),
+        Some(value) => match value.to_ascii_lowercase().as_str() {
         "exact_f32" | "f32" => false,
         "symmetric_i16" | "i16" => true,
         value => {
             return Err(paro_error::invalid_input(format!(
                 "HNSW index option build_vector_encoding must be exact_f32 or symmetric_i16, got '{value}'"
             )))
-        }
+        },
+        },
     };
     let build_seed = parse_u64_index_option(options, "build_seed", DEFAULT_HNSW_BUILD_SEED)?;
     let cost_option_names = [
@@ -584,6 +586,24 @@ fn hnsw_provider_config(
             }
         }
     };
+    let maintenance = paro_storage::search::HnswMaintenancePolicy {
+        target_vector_bytes: parse_u64_index_option(
+            options,
+            "maintenance_target_vector_bytes",
+            paro_storage::search::DEFAULT_HNSW_MAINTENANCE_TARGET_VECTOR_BYTES,
+        )?,
+        max_pending_vector_bytes: parse_u64_index_option(
+            options,
+            "maintenance_max_pending_vector_bytes",
+            paro_storage::search::DEFAULT_HNSW_MAINTENANCE_MAX_PENDING_VECTOR_BYTES,
+        )?,
+        compaction_fanout: u32::try_from(parse_u64_index_option(
+            options,
+            "maintenance_compaction_fanout",
+            u64::from(paro_storage::search::DEFAULT_HNSW_MAINTENANCE_COMPACTION_FANOUT),
+        )?)
+        .map_err(|_| paro_error::out_of_range("HNSW maintenance_compaction_fanout"))?,
+    };
     HnswProviderConfig {
         version: paro_storage::search::HNSW_PROVIDER_CONFIG_VERSION,
         dimension,
@@ -596,6 +616,7 @@ fn hnsw_provider_config(
             .map_err(|_| paro_error::out_of_range("HNSW ef_search"))?,
         rerank_policy,
         distance_cost,
+        maintenance,
         build_seed,
         proposal_wave_size: DEFAULT_HNSW_PROPOSAL_WAVE_SIZE,
         warmup_point_count: DEFAULT_HNSW_WARMUP_POINT_COUNT,
@@ -1038,9 +1059,8 @@ mod tests {
         assert_eq!(bound.info.provider_config["rerank_policy"], "top_k");
         assert_eq!(bound.info.provider_config["distance"], "cosine");
         assert_eq!(
-            bound.info.provider_config["build_vector_encoding"]["symmetric_i16"]
-                ["routing_dimensions"],
-            100
+            bound.info.provider_config["build_vector_encoding"],
+            "exact_f32"
         );
         assert_eq!(bound.info.provider_config["build_seed"], 42);
         assert_eq!(

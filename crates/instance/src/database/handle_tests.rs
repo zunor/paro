@@ -848,7 +848,7 @@ fn continuous_search_maintenance_requests_cannot_extend_max_delay() {
         // Model a writer that reset the trailing edge immediately before this
         // decision. The anchored first request still makes the pass runnable.
         last_request: Some(now),
-        immediate: false,
+        urgency: SearchMaintenanceUrgency::Deadline,
     };
     assert_eq!(pending.wait_before_run(now), None);
 }
@@ -861,7 +861,23 @@ fn elevated_search_maintenance_bypasses_debounce() {
         completed_epoch: 0,
         first_request: Some(now),
         last_request: Some(now),
-        immediate: true,
+        urgency: SearchMaintenanceUrgency::Immediate,
     };
     assert_eq!(pending.wait_before_run(now), None);
+}
+
+#[test]
+fn opportunistic_search_maintenance_waits_for_quiescence_without_deadline_fragmentation() {
+    let now = Instant::now();
+    let pending = SearchMaintenancePending {
+        requested_epoch: 10_000,
+        completed_epoch: 0,
+        first_request: Some(now - SEARCH_MAINTENANCE_MAX_DELAY * 4),
+        last_request: Some(now),
+        urgency: SearchMaintenanceUrgency::Quiescent,
+    };
+    assert_eq!(
+        pending.wait_before_run(now),
+        Some(SEARCH_MAINTENANCE_QUIESCENCE)
+    );
 }

@@ -52,6 +52,7 @@ pub(crate) fn schema_seed_definition(
             build_vector_encoding,
         ),
         distance_cost: defaults.distance_cost,
+        maintenance: crate::search::HnswMaintenancePolicy::default(),
         build_seed: DEFAULT_HNSW_BUILD_SEED,
         proposal_wave_size: crate::index::hnsw::DEFAULT_HNSW_PROPOSAL_WAVE_SIZE,
         warmup_point_count: crate::index::hnsw::DEFAULT_HNSW_WARMUP_POINT_COUNT,

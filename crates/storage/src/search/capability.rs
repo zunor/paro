@@ -423,12 +423,11 @@ impl SearchFreshnessPolicy {
 
     pub const fn default_for_kind(kind: SearchIndexKind) -> Self {
         match kind {
-            // Maintenance becomes elevated at the provider's 4K soft tail
-            // watermark, while admission retains enough headroom for the
-            // foreground writer and catch-up builder to overlap.  Using the
-            // soft watermark as the hard freshness bound turns every 4K rows
-            // into a global publication barrier under sustained ingest.
-            SearchIndexKind::Hnsw => Self::bounded_by_tail_rows(16_384),
+            // HNSW queries merge the durable tail exactly, so the default is
+            // semantically fresh without promising a tiny physical lag. The
+            // provider's dimension-aware maintenance policy independently
+            // bounds build batches and sustained-ingest debt.
+            SearchIndexKind::Hnsw => Self::Opportunistic,
             SearchIndexKind::Sparse => Self::bounded_by_tail_rows(32_768),
             SearchIndexKind::FullText => Self::bounded_by_tail_rows(16_384),
         }
@@ -905,6 +904,7 @@ mod tests {
             ef_search: 64,
             rerank_policy: crate::index::hnsw::HnswRerankPolicy::Ef,
             distance_cost: crate::index::hnsw::HnswDistanceCostProfile::default(),
+            maintenance: crate::search::HnswMaintenancePolicy::default(),
             build_seed: 7,
             proposal_wave_size: crate::search::DEFAULT_HNSW_PROPOSAL_WAVE_SIZE,
             warmup_point_count: crate::search::DEFAULT_HNSW_WARMUP_POINT_COUNT,

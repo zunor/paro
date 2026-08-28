@@ -19,7 +19,9 @@ use crate::tablet::{
 use paro_common::effect::ArtifactRef;
 use paro_common::error::{self as paro_error, Result};
 
-use super::artifact::{ArtifactFileId, ArtifactGcContext, ArtifactLocation, GcDecision};
+use super::artifact::{
+    ArtifactCompactionLayout, ArtifactFileId, ArtifactGcContext, ArtifactLocation, GcDecision,
+};
 use super::capability::{
     ArtifactSegmentRef, CapabilityToken, SearchArtifactRef, SearchCapability,
     SearchDefinitionOrigin, SearchFreshnessPolicy, SearchIndexDefinition, SearchIndexKind,
@@ -54,7 +56,9 @@ use super::inline_sink::{
     SidecarArtifactBuilder, SidecarBuildInput,
 };
 use super::lifecycle::bootstrap::SearchBootstrapReport;
-use super::lifecycle::gc::gc_policy_for_kind;
+use super::lifecycle::gc::{
+    gc_policy_for_kind, hnsw_artifact_compaction_level, hnsw_compaction_level,
+};
 use super::lifecycle::maintenance_request::provider_maintenance_request_for_definition;
 use super::lifecycle::publisher::{
     assign_generation_id, remove_sidecar_packages, retire_paths_for_manifest, search_artifact_key,
@@ -74,8 +78,7 @@ use super::sidecar_builder::ProviderSidecarArtifactBuilder;
 use super::staged_generation::{StagedSearchGeneration, StagedSearchGenerationInit};
 use super::stats::MaintenancePriority;
 use super::tail::{
-    exact_merge::TailExactMergeBudget, provider_tail_exact_merge_policy, TailEntryId,
-    TailMutationKind, TailPendingEntry, TailPendingSet, TailRowImageRef,
+    TailEntryId, TailMutationKind, TailPendingEntry, TailPendingSet, TailRowImageRef,
 };
 use super::write_path::SearchWriteContext;
 
@@ -114,7 +117,6 @@ struct SearchIngestAdmissionState {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct SearchIngestDebt {
     rows: u64,
-    bytes: u64,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -203,8 +205,7 @@ impl RowsetPublishObserver for SearchIndexRegistry {
             .lock()
             .map_err(|_| paro_error::internal("lock search ingest admission"))?;
         loop {
-            let blocked =
-                self.hnsw_ingest_admission_blocker(incoming_rows, incoming_bytes, &admission);
+            let blocked = self.hnsw_ingest_admission_blocker(incoming_rows, &admission);
             let Some(blocker) = blocked else {
                 admission.reserved_rows = admission.reserved_rows.saturating_add(incoming_rows);
                 admission.reserved_bytes = admission.reserved_bytes.saturating_add(incoming_bytes);
@@ -215,7 +216,7 @@ impl RowsetPublishObserver for SearchIndexRegistry {
                 && blocker.pending_bytes == 0
                 && admission.reserved_rows == 0
                 && admission.reserved_bytes == 0
-                && (incoming_rows > blocker.row_limit || incoming_bytes > blocker.byte_limit);
+                && incoming_rows > blocker.row_limit;
             if isolated_oversized_write {
                 // A rebuildable secondary index cannot constrain transaction
                 // atomicity. Admit one oversized transaction as an exclusive
@@ -387,18 +388,23 @@ impl RowsetPublishObserver for SearchIndexRegistry {
         self.sweep_retired();
         if maintenance_needed {
             if let Some(notifier) = self.maintenance_notifier.read().unwrap().as_ref() {
-                let urgency = if self.view.load().definitions.values().any(|state| {
-                    state.manifest.as_ref().is_some_and(|manifest| {
-                        matches!(
-                            manifest.root.maintenance_state.recovery.priority,
-                            MaintenancePriority::Elevated | MaintenancePriority::Critical
-                        )
-                    })
-                }) {
-                    SearchMaintenanceUrgency::Immediate
-                } else {
-                    SearchMaintenanceUrgency::Debounced
-                };
+                let urgency = self
+                    .view
+                    .load()
+                    .definitions
+                    .values()
+                    .filter_map(|state| state.manifest.as_ref())
+                    .map(
+                        |manifest| match manifest.root.maintenance_state.recovery.priority {
+                            MaintenancePriority::Idle | MaintenancePriority::Opportunistic => {
+                                SearchMaintenanceUrgency::Quiescent
+                            }
+                            MaintenancePriority::Elevated => SearchMaintenanceUrgency::Deadline,
+                            MaintenancePriority::Critical => SearchMaintenanceUrgency::Immediate,
+                        },
+                    )
+                    .max()
+                    .unwrap_or_default();
                 notifier(urgency);
             }
         }
@@ -426,55 +432,42 @@ impl SearchIndexRegistry {
     fn hnsw_ingest_admission_blocker(
         &self,
         incoming_rows: u64,
-        incoming_bytes: u64,
         admission: &SearchIngestAdmissionState,
     ) -> Option<HnswIngestAdmissionBlocker> {
         self.view.load().definitions.values().find_map(|state| {
             if state.definition.kind != SearchIndexKind::Hnsw {
                 return None;
             }
+            let provider = state.hnsw_provider_config.as_ref()?;
             let manifest = state.manifest.as_ref()?;
             let manifest_pending_rows = manifest.root.maintenance_state.recovery.tail_pending_rows;
-            let manifest_pending_bytes = manifest
-                .tail_pending_entries
-                .iter()
-                .filter(|entry| entry.mutation != TailMutationKind::Delete)
-                .map(|entry| entry.byte_count)
-                .sum::<u64>();
             let accounted_rowsets = manifest_accounted_rowsets(manifest);
-            let (unmanifested_rows, unmanifested_bytes) = admission
+            let unmanifested_rows = admission
                 .unmanifested_hnsw
                 .get(&state.definition.definition_id)
                 .into_iter()
                 .flat_map(|rowsets| rowsets.iter())
                 .filter(|(rowset_id, _)| !accounted_rowsets.contains(rowset_id))
-                .fold((0u64, 0u64), |(rows, bytes), (_, debt)| {
-                    (
-                        rows.saturating_add(debt.rows),
-                        bytes.saturating_add(debt.bytes),
-                    )
-                });
+                .fold(0u64, |rows, (_, debt)| rows.saturating_add(debt.rows));
             let pending_rows = manifest_pending_rows.saturating_add(unmanifested_rows);
-            let pending_bytes = manifest_pending_bytes.saturating_add(unmanifested_bytes);
-            let exact_limit =
-                provider_tail_exact_merge_policy(SearchIndexKind::Hnsw).hard_row_limit;
+            let pending_bytes = provider
+                .maintenance
+                .vector_bytes(provider.dimension, pending_rows);
+            let maintenance_row_limit = provider.maintenance.max_pending_rows(provider.dimension);
             let row_limit = match state.definition.freshness_policy {
                 SearchFreshnessPolicy::Required => return None,
                 SearchFreshnessPolicy::BoundedLag { max_tail_rows, .. } => {
-                    max_tail_rows.min(exact_limit)
+                    max_tail_rows.min(maintenance_row_limit)
                 }
-                SearchFreshnessPolicy::Opportunistic => exact_limit,
+                SearchFreshnessPolicy::Opportunistic => maintenance_row_limit,
             };
-            let byte_limit = TailExactMergeBudget::for_search_kind(SearchIndexKind::Hnsw)
-                .max_tail_exact_merge_bytes;
+            let byte_limit = provider
+                .maintenance
+                .vector_bytes(provider.dimension, row_limit);
             (pending_rows
                 .saturating_add(admission.reserved_rows)
                 .saturating_add(incoming_rows)
-                > row_limit
-                || pending_bytes
-                    .saturating_add(admission.reserved_bytes)
-                    .saturating_add(incoming_bytes)
-                    > byte_limit)
+                > row_limit)
                 .then_some(HnswIngestAdmissionBlocker {
                     definition_id: state.definition.definition_id,
                     pending_rows,
@@ -504,10 +497,6 @@ impl SearchIndexRegistry {
             return;
         }
         let rows = rowset.num_rows();
-        let bytes = match rowset.total_disk_size() {
-            0 => rows.saturating_mul(64),
-            bytes => bytes,
-        };
         let mut admission = self
             .ingest_admission
             .lock()
@@ -517,7 +506,7 @@ impl SearchIndexRegistry {
                 .unmanifested_hnsw
                 .entry(definition_id)
                 .or_default()
-                .insert(rowset.rowset_id(), SearchIngestDebt { rows, bytes });
+                .insert(rowset.rowset_id(), SearchIngestDebt { rows });
         }
         admission.progress_epoch = admission.progress_epoch.saturating_add(1);
         self.maintenance_progress_changed.notify_all();
@@ -665,6 +654,11 @@ impl SearchIndexRegistry {
         let staged_manifests = ManifestStore::new(staging_root.clone());
         let sidecar_store = SidecarArtifactStore::new(staging_root.clone());
         let builder = ProviderSidecarArtifactBuilder::new(sidecar_store);
+        let hnsw_provider = if definition.kind == SearchIndexKind::Hnsw {
+            Some(definition.hnsw_provider_config()?)
+        } else {
+            None
+        };
         let input = SidecarBuildInput {
             definition: definition.clone(),
             generation_id,
@@ -721,6 +715,7 @@ impl SearchIndexRegistry {
                 execution_modes,
                 maintenance_state: build_maintenance_state(
                     &definition,
+                    hnsw_provider.as_ref(),
                     snapshot_version,
                     1,
                     generation_stats.indexed_rows,
@@ -728,7 +723,7 @@ impl SearchIndexRegistry {
                     tail_pending.delete_rows(),
                     None,
                     Vec::new(),
-                ),
+                )?,
                 root_version: 1,
                 checksum: 0,
                 shard_files: Vec::new(),
@@ -1255,20 +1250,16 @@ impl SearchIndexRegistry {
         let Some(manifest) = state.manifest.as_ref() else {
             return Ok(false);
         };
-        let selected_artifacts = manifest.artifacts.artifacts.clone();
+        let selected_artifacts = if force_rebuild {
+            manifest.artifacts.artifacts.clone()
+        } else {
+            let provider = state
+                .hnsw_provider_config
+                .as_ref()
+                .ok_or_else(|| paro_error::internal("HNSW compaction requires provider config"))?;
+            select_hnsw_compaction_artifacts(&manifest.artifacts.artifacts, provider)
+        };
         if selected_artifacts.is_empty() || (!force_rebuild && selected_artifacts.len() <= 1) {
-            return Ok(false);
-        }
-        if !force_rebuild
-            && crate::compaction::plan::CompactionPlanner::plan(self.tablet.as_ref())?.is_some()
-        {
-            // A physical rowset compaction rebuilds the HNSW coverage for its
-            // output and publishes that coverage with the rowset mutation.
-            // Coalescing the current generation while that rewrite is
-            // eligible would build the same logical graph twice: once over
-            // soon-to-be-retired rowset identities and once over the compacted
-            // output.  Prefer the physical rewrite and let the next
-            // level-triggered sweep observe its published generation.
             return Ok(false);
         }
         {
@@ -1538,6 +1529,18 @@ impl SearchIndexRegistry {
                     .map(|artifact| artifact.stats.row_count)
                     .max()
                     .unwrap_or_default(),
+                compaction_layout: state.hnsw_provider_config.as_ref().map(|config| {
+                    ArtifactCompactionLayout::HnswLevelled {
+                        artifact_row_counts: manifest
+                            .artifacts
+                            .artifacts
+                            .iter()
+                            .map(|artifact| artifact.stats.row_count)
+                            .collect(),
+                        target_rows: config.maintenance.target_rows(config.dimension),
+                        fanout: config.maintenance.compaction_fanout,
+                    }
+                }),
                 tombstone_ratio: Some(
                     manifest.root.maintenance_state.tombstone_ratio_millis as f32 / 1000.0,
                 ),
@@ -2374,6 +2377,7 @@ impl SearchIndexRegistry {
             execution_modes: snapshot.execution_modes.clone(),
             maintenance_state: build_maintenance_state(
                 &state.definition,
+                state.hnsw_provider_config.as_deref(),
                 snapshot.visible_version,
                 build_epoch,
                 snapshot.generation_stats.indexed_rows,
@@ -2395,7 +2399,7 @@ impl SearchIndexRegistry {
                             .clone()
                     })
                     .unwrap_or_default(),
-            ),
+            )?,
             root_version,
             checksum: 0,
             shard_files: Vec::new(),
@@ -2476,6 +2480,7 @@ impl SearchIndexRegistry {
         root.execution_modes = execution_modes_for_definition(&state.definition, &root.coverage);
         root.maintenance_state = build_maintenance_state(
             &state.definition,
+            state.hnsw_provider_config.as_deref(),
             root.build_snapshot_version,
             root.build_epoch,
             root.generation_stats.indexed_rows,
@@ -2488,7 +2493,7 @@ impl SearchIndexRegistry {
                 .recovery
                 .superseded_build_epochs
                 .clone(),
-        );
+        )?;
 
         let mut revision =
             self.manifests
@@ -2609,6 +2614,7 @@ impl SearchIndexRegistry {
         root.execution_modes = execution_modes_for_definition(&state.definition, &root.coverage);
         root.maintenance_state = build_maintenance_state(
             &state.definition,
+            state.hnsw_provider_config.as_deref(),
             root.build_snapshot_version,
             root.build_epoch,
             root.generation_stats.indexed_rows,
@@ -2621,7 +2627,7 @@ impl SearchIndexRegistry {
                 .recovery
                 .superseded_build_epochs
                 .clone(),
-        );
+        )?;
 
         let mut delta_entries = Vec::new();
         delta_entries.extend(
@@ -2726,6 +2732,7 @@ impl SearchIndexRegistry {
         root.execution_modes = execution_modes_for_definition(&state.definition, &root.coverage);
         root.maintenance_state = build_maintenance_state(
             &state.definition,
+            state.hnsw_provider_config.as_deref(),
             root.build_snapshot_version,
             root.build_epoch,
             root.generation_stats.indexed_rows,
@@ -2738,7 +2745,7 @@ impl SearchIndexRegistry {
                 .recovery
                 .superseded_build_epochs
                 .clone(),
-        );
+        )?;
 
         let mut delta_entries = Vec::new();
         delta_entries.extend(
@@ -2820,6 +2827,7 @@ impl SearchIndexRegistry {
         root.execution_modes = execution_modes_for_definition(&state.definition, &root.coverage);
         root.maintenance_state = build_maintenance_state(
             &state.definition,
+            state.hnsw_provider_config.as_deref(),
             root.build_snapshot_version,
             root.build_epoch,
             root.generation_stats.indexed_rows,
@@ -2832,7 +2840,7 @@ impl SearchIndexRegistry {
                 .recovery
                 .superseded_build_epochs
                 .clone(),
-        );
+        )?;
 
         let mut entries = removed_artifacts
             .iter()
@@ -3033,6 +3041,7 @@ impl SearchIndexRegistry {
         root.execution_modes = execution_modes_for_definition(&state.definition, &root.coverage);
         root.maintenance_state = build_maintenance_state(
             &state.definition,
+            state.hnsw_provider_config.as_deref(),
             root.build_snapshot_version,
             root.build_epoch,
             root.generation_stats.indexed_rows,
@@ -3045,7 +3054,7 @@ impl SearchIndexRegistry {
                 .recovery
                 .superseded_build_epochs
                 .clone(),
-        );
+        )?;
 
         let mut delta_entries = Vec::new();
         delta_entries.extend(
@@ -3443,6 +3452,37 @@ fn expected_segment_rows(
         }
     }
     Ok(expected)
+}
+
+fn select_hnsw_compaction_artifacts(
+    artifacts: &[SearchArtifactRef],
+    provider: &crate::search::HnswProviderConfig,
+) -> Vec<SearchArtifactRef> {
+    let target_rows = provider.maintenance.target_rows(provider.dimension);
+    let fanout = provider.maintenance.compaction_fanout;
+    let row_counts = artifacts
+        .iter()
+        .map(|artifact| artifact.stats.row_count)
+        .collect::<Vec<_>>();
+    let Some(level) = hnsw_compaction_level(&row_counts, target_rows, fanout) else {
+        return Vec::new();
+    };
+    let mut selected = artifacts
+        .iter()
+        .filter(|artifact| {
+            hnsw_artifact_compaction_level(artifact.stats.row_count, target_rows, fanout) == level
+        })
+        .cloned()
+        .collect::<Vec<_>>();
+    selected.sort_by_key(|artifact| {
+        artifact
+            .coverage
+            .segments()
+            .first()
+            .map(|span| span.segment)
+    });
+    selected.truncate(usize::try_from(fanout).unwrap_or(usize::MAX));
+    selected
 }
 
 fn hnsw_compaction_build_input(
@@ -4030,17 +4070,19 @@ mod tests {
             version: crate::search::HNSW_PROVIDER_CONFIG_VERSION,
             dimension,
             distance: DistanceMetric::Euclidean,
-            build_vector_encoding:
-                crate::index::hnsw::HnswBuildVectorEncoding::default_for_dimension(dimension)
-                    .unwrap(),
+            build_vector_encoding: crate::index::hnsw::HnswBuildVectorEncoding::symmetric_i16(
+                dimension.min(128),
+            )
+            .unwrap(),
             m: m as u32,
             ef_construct: ef_construct as u32,
             ef_search: ef_construct as u32,
             rerank_policy: crate::index::hnsw::HnswRerankPolicy::default_for_encoding(
-                crate::index::hnsw::HnswBuildVectorEncoding::default_for_dimension(dimension)
+                crate::index::hnsw::HnswBuildVectorEncoding::symmetric_i16(dimension.min(128))
                     .unwrap(),
             ),
             distance_cost: crate::index::hnsw::HnswDistanceCostProfile::default(),
+            maintenance: crate::search::HnswMaintenancePolicy::default(),
             build_seed: 1,
             proposal_wave_size: crate::search::DEFAULT_HNSW_PROPOSAL_WAVE_SIZE,
             warmup_point_count: crate::search::DEFAULT_HNSW_WARMUP_POINT_COUNT,
@@ -6967,7 +7009,15 @@ mod tests {
             root.path(),
             &[LogicalType::Array(Box::new(LogicalType::Float), 1)],
         );
-        let provider_config = test_hnsw_provider_config(1, 16, 64, 0);
+        let mut provider =
+            crate::search::HnswProviderConfig::from_value(&test_hnsw_provider_config(1, 16, 64, 0))
+                .unwrap();
+        provider.maintenance = crate::search::HnswMaintenancePolicy {
+            target_vector_bytes: 16_384 * 4,
+            max_pending_vector_bytes: 16_384 * 4,
+            compaction_fanout: 8,
+        };
+        let provider_config = provider.to_value().unwrap();
         let definition = SearchIndexDefinition {
             definition_id: 88,
             table_id: table.tablet_id(),
@@ -7013,7 +7063,7 @@ mod tests {
             let admission = table.search_registry().ingest_admission.lock().unwrap();
             let blocker = table
                 .search_registry()
-                .hnsw_ingest_admission_blocker(16_383, 0, &admission)
+                .hnsw_ingest_admission_blocker(16_383, &admission)
                 .expect("committed rowsets must consume freshness capacity before refresh");
             assert_eq!(blocker.pending_rows, 2);
             assert_eq!(blocker.row_limit, 16_384);
@@ -7066,7 +7116,7 @@ mod tests {
         assert!(admission_state.unmanifested_hnsw.is_empty());
         let blocker = table
             .search_registry()
-            .hnsw_ingest_admission_blocker(16_383, 0, &admission_state)
+            .hnsw_ingest_admission_blocker(16_383, &admission_state)
             .expect("row high watermark");
         assert_eq!(blocker.definition_id, 88);
         assert_eq!(blocker.pending_rows, 2);
@@ -7083,7 +7133,7 @@ mod tests {
         assert_eq!((reserved_rows, reserved_bytes), (8_000, 1_234));
         assert!(table
             .search_registry()
-            .hnsw_ingest_admission_blocker(8_383, 0, &reserved)
+            .hnsw_ingest_admission_blocker(8_383, &reserved)
             .is_some(),
             "prepared transactions must reserve capacity instead of racing on a check-only watermark");
         drop(reserved);
@@ -7101,7 +7151,11 @@ mod tests {
             &[LogicalType::Array(Box::new(LogicalType::Float), 1)],
         );
         table.bind_search_task_scheduler(Some(Arc::new(TaskScheduler::new())));
-        let provider_config = test_hnsw_provider_config(1, 16, 64, 0);
+        let mut provider =
+            crate::search::HnswProviderConfig::from_value(&test_hnsw_provider_config(1, 16, 64, 0))
+                .unwrap();
+        provider.maintenance.compaction_fanout = 2;
+        let provider_config = provider.to_value().unwrap();
         let definition = SearchIndexDefinition {
             definition_id: 188,
             table_id: table.tablet_id(),
@@ -7177,17 +7231,12 @@ mod tests {
                 .is_some()
         );
         assert!(
-            !table
+            table
                 .search_registry()
                 .compact_hnsw_generation(188, false)
                 .unwrap(),
-            "optional generation compaction must not duplicate an eligible physical rewrite"
+            "derived graph compaction must not be permanently suppressed merely because a physical rewrite is eligible"
         );
-        assert!(table
-            .search_registry()
-            .compact_hnsw_generation(188, true)
-            .unwrap());
-
         let rowsets_after = table
             .tablet()
             .capture_consistent_rowsets(table.max_version())

@@ -1035,6 +1035,7 @@ mod tests {
             ef_search: 16,
             rerank_policy: crate::index::hnsw::HnswRerankPolicy::Ef,
             distance_cost: crate::index::hnsw::HnswDistanceCostProfile::default(),
+            maintenance: crate::search::HnswMaintenancePolicy::default(),
             build_seed: 17,
             proposal_wave_size: 4,
             warmup_point_count: 4,

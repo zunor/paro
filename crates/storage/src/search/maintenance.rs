@@ -34,10 +34,17 @@ pub enum SearchMaintenanceAction {
 /// How quickly the database coordinator should service newly visible search
 /// debt. Notifications accelerate discovery; durable manifest state remains
 /// the level-triggered source of truth.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, PartialOrd, Ord)]
 pub enum SearchMaintenanceUrgency {
+    /// Run after the write stream reaches a quiet boundary. Opportunistic
+    /// maintenance must not fragment one sustained ingest into time slices.
     #[default]
-    Debounced,
+    Quiescent,
+    /// Run after quiescence or an anchored maximum delay. This is used once a
+    /// definition-owned build quantum has accumulated.
+    Deadline,
+    /// Run without debounce because the definition's high watermark or an
+    /// explicit lifecycle boundary requires immediate progress.
     Immediate,
 }
 
@@ -1100,6 +1107,7 @@ mod tests {
             ef_search: 100,
             rerank_policy: crate::index::hnsw::HnswRerankPolicy::Ef,
             distance_cost: crate::index::hnsw::HnswDistanceCostProfile::default(),
+            maintenance: crate::search::HnswMaintenancePolicy::default(),
             build_seed: crate::search::DEFAULT_HNSW_BUILD_SEED,
             proposal_wave_size: crate::search::DEFAULT_HNSW_PROPOSAL_WAVE_SIZE,
             warmup_point_count: crate::search::DEFAULT_HNSW_WARMUP_POINT_COUNT,

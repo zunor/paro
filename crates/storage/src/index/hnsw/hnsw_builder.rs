@@ -44,6 +44,59 @@ struct HnswBuildPool {
 
 static HNSW_BUILD_THREADS: AtomicUsize = AtomicUsize::new(0);
 static HNSW_BUILD_POOL: OnceLock<std::result::Result<HnswBuildPool, String>> = OnceLock::new();
+static HNSW_ACTIVE_FOREGROUND_QUERIES: AtomicUsize = AtomicUsize::new(0);
+static HNSW_ACTIVE_MAINTENANCE_BUILDS: AtomicUsize = AtomicUsize::new(0);
+const HNSW_MAINTENANCE_FOREGROUND_WORKERS: usize = 1;
+
+/// Process-level cooperative HNSW workload governor.
+///
+/// Construction advances through deterministic proposal waves. Each barrier
+/// is a natural preemption point: background builds use their complete grant
+/// while idle and shrink to one worker as soon as a foreground query appears.
+/// Small delta graphs bound the duration of that serial progress share; query
+/// latency remains the priority while the immutable wave barriers guarantee
+/// graph bytes are independent of execution width.
+pub(crate) struct HnswForegroundQueryGuard;
+
+impl HnswForegroundQueryGuard {
+    pub(crate) fn enter() -> Self {
+        HNSW_ACTIVE_FOREGROUND_QUERIES.fetch_add(1, Ordering::AcqRel);
+        Self
+    }
+}
+
+impl Drop for HnswForegroundQueryGuard {
+    fn drop(&mut self) {
+        HNSW_ACTIVE_FOREGROUND_QUERIES.fetch_sub(1, Ordering::AcqRel);
+    }
+}
+
+struct HnswMaintenanceBuildGuard;
+
+impl HnswMaintenanceBuildGuard {
+    fn enter(policy: HnswBuildExecutionPolicy) -> Option<Self> {
+        (policy == HnswBuildExecutionPolicy::Maintenance).then(|| {
+            HNSW_ACTIVE_MAINTENANCE_BUILDS.fetch_add(1, Ordering::AcqRel);
+            Self
+        })
+    }
+}
+
+impl Drop for HnswMaintenanceBuildGuard {
+    fn drop(&mut self) {
+        HNSW_ACTIVE_MAINTENANCE_BUILDS.fetch_sub(1, Ordering::AcqRel);
+    }
+}
+
+pub(crate) fn hnsw_current_build_parallelism(granted: usize) -> usize {
+    if HNSW_ACTIVE_MAINTENANCE_BUILDS.load(Ordering::Acquire) != 0
+        && HNSW_ACTIVE_FOREGROUND_QUERIES.load(Ordering::Acquire) != 0
+    {
+        granted.clamp(1, HNSW_MAINTENANCE_FOREGROUND_WORKERS)
+    } else {
+        granted.max(1)
+    }
+}
 
 fn create_build_pool(threads: usize) -> std::result::Result<HnswBuildPool, String> {
     let threads = threads.max(1);
@@ -187,6 +240,7 @@ impl HnswBuilder {
         build_contract: HnswBuildContract,
     ) -> Result<HnswIndex> {
         let (pool, pool_width) = hnsw_build_pool()?;
+        let _maintenance_guard = HnswMaintenanceBuildGuard::enter(self.execution_policy);
         HnswIndex::build_with_controls_and_filter_blocks_in_workspace_with_parallelism(
             storage,
             build_contract,
@@ -205,6 +259,7 @@ impl HnswBuilder {
         filter_blocks: HnswFilterBlocks,
     ) -> Result<HnswIndex> {
         let (pool, pool_width) = hnsw_build_pool()?;
+        let _maintenance_guard = HnswMaintenanceBuildGuard::enter(self.execution_policy);
         HnswIndex::build_with_controls_and_filter_blocks_in_workspace_with_parallelism(
             storage,
             build_contract,
@@ -222,6 +277,18 @@ mod tests {
     use super::*;
     use crate::index::hnsw::{DistanceMetric, HnswConfig, InMemoryVectorStorage};
     use std::sync::atomic::{AtomicUsize, Ordering};
+
+    #[test]
+    #[serial_test::serial]
+    fn maintenance_parallelism_yields_at_wave_boundaries_to_foreground_queries() {
+        let maintenance =
+            HnswMaintenanceBuildGuard::enter(HnswBuildExecutionPolicy::Maintenance).unwrap();
+        {
+            let _query = HnswForegroundQueryGuard::enter();
+            assert_eq!(hnsw_current_build_parallelism(8), 1);
+        }
+        drop(maintenance);
+    }
 
     #[test]
     fn builder_stop_check_can_cancel_build() {

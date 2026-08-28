@@ -11,7 +11,6 @@ use std::time::Instant;
 /// parallel because its random navigation latency is not proportional to the
 /// number of predicate matches.
 const MIN_PARALLEL_EXACT_VECTOR_BYTES: u64 = 2 * 1024 * 1024;
-
 use crate::index::hnsw::types::SearchParams;
 use crate::index::hnsw::{
     hnsw_artifact_compatibility, DistanceMetric, HnswArtifactCompatibility, HnswBuildContract,
@@ -34,7 +33,9 @@ use crate::search::sidecar::{
     SIDECAR_PACKAGE_CODEC,
 };
 use crate::search::tail::exact_merge::{ensure_tail_exact_merge_budget, TailExactMergeQueryShape};
-use crate::search::tail_merge::{resolve_logical_rows, visible_row_ids};
+use crate::search::tail_merge::{
+    resolve_logical_rows_with_allocator, resolve_segment_rows_direct, visible_row_ids,
+};
 use crate::search::telemetry::{
     GenerationTelemetryEvent, NoopSearchTelemetryCollector, QueryTelemetryEvent,
     SearchTelemetryCollector,
@@ -42,8 +43,8 @@ use crate::search::telemetry::{
 use crate::search::topk_merge::{ranked_rows_to_batch, RankedRow, TopKCollector};
 use crate::tablet::TabletRef;
 use paro_common::error::{self as paro_error, Result};
-use paro_common::runtime_value::Value;
 use paro_common::types::LogicalType;
+use paro_common::vector::ArrayVector;
 
 use crate::search::budget::{ResourceBudget, SearchBatchConfig, SearchMemoryReservation};
 use crate::search::cursor::PhysicalRowRef;
@@ -413,6 +414,93 @@ impl VectorSearchCursor {
         Ok(ranked_rows)
     }
 
+    fn score_exact_tail_chunk(
+        &self,
+        resolved: &paro_common::chunk::Chunk,
+        physical_rows: &[PhysicalRowRef],
+        budget: &ResourceBudget,
+    ) -> Result<Vec<RankedRow>> {
+        if resolved.size() != physical_rows.len() {
+            return Err(paro_error::internal(
+                "resolved exact tail rows and physical identities disagree",
+            ));
+        }
+        budget.work.check_and_consume(physical_rows.len())?;
+        let column = resolved
+            .column(0)
+            .ok_or_else(|| paro_error::internal("resolved vector tail chunk missing column"))?;
+        let array_view = column.try_to_array_view(physical_rows.len())?;
+        if array_view.array_size() != self.vector_dim
+            || !matches!(
+                column.logical_type(),
+                LogicalType::Array(child, size)
+                    if child.as_ref() == &LogicalType::Float && *size == self.vector_dim
+            )
+        {
+            return Err(paro_error::data_corrupted(
+                "resolved HNSW tail column does not match its VECTOR dimension",
+            ));
+        }
+        let child = ArrayVector::get_entry(column);
+        let child_values = child.as_slice::<f32>();
+        let child_all_valid = array_view.child().validity().all_valid();
+        let parent_all_valid = array_view.parent().validity().all_valid();
+        let contiguous_start = (!physical_rows.is_empty() && parent_all_valid && child_all_valid)
+            .then(|| array_view.physical_child_index(0, 0));
+        let is_contiguous = contiguous_start.is_some_and(|start| {
+            physical_rows.iter().enumerate().all(|(row, _)| {
+                array_view.physical_child_index(row, 0)
+                    == start.saturating_add(row.saturating_mul(self.vector_dim))
+            })
+        });
+
+        let mut collector = TopKCollector::new(self.k);
+        if let Some(start) = contiguous_start.filter(|_| is_contiguous) {
+            let value_count = physical_rows.len().saturating_mul(self.vector_dim);
+            let values = child_values
+                .get(start..start + value_count)
+                .ok_or_else(|| {
+                    paro_error::data_corrupted("resolved HNSW tail child range is out of bounds")
+                })?;
+            let mut scores = vec![0.0; physical_rows.len()];
+            self.distance.similarity_unindexed_batch_contiguous(
+                self.prepared_query.as_slice(),
+                values,
+                self.vector_dim,
+                &mut scores,
+            );
+            for (&row, score) in physical_rows.iter().zip(scores) {
+                collector.push(RankedRow::new(row, score));
+            }
+            return Ok(collector.into_sorted_rows());
+        }
+
+        for (offset, &row) in physical_rows.iter().enumerate() {
+            if !array_view.is_valid(offset) {
+                continue;
+            }
+            let start = array_view.physical_child_index(offset, 0);
+            let last = array_view.physical_child_index(offset, self.vector_dim - 1);
+            if last != start.saturating_add(self.vector_dim - 1)
+                || (!child_all_valid
+                    && (0..self.vector_dim).any(|index| !array_view.child_is_valid(offset, index)))
+            {
+                continue;
+            }
+            let values = child_values
+                .get(start..start + self.vector_dim)
+                .ok_or_else(|| {
+                    paro_error::data_corrupted("resolved HNSW tail child range is out of bounds")
+                })?;
+            collector.push(RankedRow::new(
+                row,
+                self.distance
+                    .similarity_unindexed(self.prepared_query.as_slice(), values),
+            ));
+        }
+        Ok(collector.into_sorted_rows())
+    }
+
     fn dispatch_segment_search(
         &self,
         segment: &VisibleSegment,
@@ -722,53 +810,46 @@ impl VectorSearchCursor {
         if row_ids.is_empty() {
             return Ok((Vec::new(), true));
         }
-        let resolved = resolve_logical_rows(
-            &self.tablet,
-            &self.snapshot,
+        let retained_per_row = self
+            .vector_dim
+            .saturating_mul(std::mem::size_of::<f32>())
+            .saturating_add(32);
+        let retained_bytes = row_ids
+            .len()
+            .checked_mul(retained_per_row)
+            .ok_or_else(|| paro_error::out_of_range("exact tail working set overflow"))?;
+        let _tail_reservation = budget.try_reserve_memory(retained_bytes)?;
+        let resolved = match resolve_segment_rows_direct(
             visible_segment,
             &row_ids,
             self.storage_col_id,
-        )?;
-        let column = resolved
-            .column(0)
-            .ok_or_else(|| paro_error::internal("resolved vector tail chunk missing column"))?;
-        let mut collector = TopKCollector::new(self.k);
-        let mut decoded = vec![0.0_f32; self.vector_dim];
-        for (offset, row_id) in row_ids.iter().copied().enumerate() {
-            let value = column.get_value(offset);
-            let Value::Array(values, _, _) = value else {
-                continue;
-            };
-            if values.len() != self.vector_dim {
-                continue;
-            }
-            for (idx, value) in values.into_iter().enumerate() {
-                decoded[idx] = match value {
-                    Value::Float(v) => v,
-                    Value::Double(v) => v as f32,
-                    Value::TinyInt(v) => v as f32,
-                    Value::SmallInt(v) => v as f32,
-                    Value::Integer(v) => v as f32,
-                    Value::BigInt(v) => v as f32,
-                    Value::UTinyInt(v) => v as f32,
-                    Value::USmallInt(v) => v as f32,
-                    Value::UInteger(v) => v as f32,
-                    Value::UBigInt(v) => v as f32,
-                    _ => continue,
-                };
-            }
-            collector.push(RankedRow::new(
+            Arc::clone(&budget.materialization_allocator),
+        )? {
+            Some(resolved) => resolved,
+            None => resolve_logical_rows_with_allocator(
+                &self.tablet,
+                &self.snapshot,
+                visible_segment,
+                &row_ids,
+                self.storage_col_id,
+                Arc::clone(&budget.materialization_allocator),
+            )?,
+        };
+        let physical_rows = row_ids
+            .iter()
+            .copied()
+            .map(|row_id| {
                 PhysicalRowRef::new(
                     visible_segment.rowset_id,
                     visible_segment.segment_id,
                     crate::rowset::SegmentRowId::from_raw(row_id),
-                ),
-                self.distance
-                    .similarity_unindexed(self.prepared_query.as_slice(), &decoded),
-            ));
-        }
-
-        Ok((collector.into_sorted_rows(), true))
+                )
+            })
+            .collect::<Vec<_>>();
+        Ok((
+            self.score_exact_tail_chunk(&resolved, &physical_rows, budget)?,
+            true,
+        ))
     }
 }
 

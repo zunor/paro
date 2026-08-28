@@ -29,7 +29,13 @@ use super::provider_config::{
     decode_provider_config, encode_provider_config, StrictProviderConfig,
 };
 
-/// Version 20 makes the exact rerank window an explicit search policy rather
+/// Version 21 separates dimension-aware maintenance batching and ingest
+/// backpressure from the query executor's exact-tail merge budget. A query
+/// policy is not a valid build quantum: coupling them produced thousands of
+/// tiny graphs during sustained ingest.
+/// Version 21 makes incremental graph build quanta, backpressure, and
+/// levelled-compaction fan-out a dimension-aware durable policy. Version 20
+/// makes the exact rerank window an explicit search policy rather
 /// than inferring it from the graph encoding and ef. Version 19 makes compact
 /// encoding and its non-zero routing dimension an
 /// atomic sum type and replaces reference-dimension cost ratios with direct,
@@ -57,7 +63,56 @@ use super::provider_config::{
 /// generation. Artifact-envelope compatibility is versioned independently;
 /// provider-config versions describe the definition and build contract rather
 /// than the physical checksum hierarchy used by a particular binary.
-pub const HNSW_PROVIDER_CONFIG_VERSION: u32 = 20;
+pub const HNSW_PROVIDER_CONFIG_VERSION: u32 = 21;
+
+pub const DEFAULT_HNSW_MAINTENANCE_TARGET_VECTOR_BYTES: u64 = 8 * 1024 * 1024;
+pub const DEFAULT_HNSW_MAINTENANCE_MAX_PENDING_VECTOR_BYTES: u64 = 256 * 1024 * 1024;
+pub const DEFAULT_HNSW_MAINTENANCE_COMPACTION_FANOUT: u32 = 8;
+
+/// Definition-pinned batching policy for derived HNSW maintenance.
+///
+/// Values are expressed in canonical vector bytes rather than rows so one
+/// policy has comparable build-memory and publication meaning for 32d and
+/// 768d vectors. Runtime derives row watermarks from the durable dimension.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct HnswMaintenancePolicy {
+    pub target_vector_bytes: u64,
+    pub max_pending_vector_bytes: u64,
+    pub compaction_fanout: u32,
+}
+
+impl Default for HnswMaintenancePolicy {
+    fn default() -> Self {
+        Self {
+            target_vector_bytes: DEFAULT_HNSW_MAINTENANCE_TARGET_VECTOR_BYTES,
+            max_pending_vector_bytes: DEFAULT_HNSW_MAINTENANCE_MAX_PENDING_VECTOR_BYTES,
+            compaction_fanout: DEFAULT_HNSW_MAINTENANCE_COMPACTION_FANOUT,
+        }
+    }
+}
+
+impl HnswMaintenancePolicy {
+    fn bytes_per_vector(dimension: u32) -> u64 {
+        u64::from(dimension.max(1)).saturating_mul(std::mem::size_of::<f32>() as u64)
+    }
+
+    pub fn target_rows(self, dimension: u32) -> u64 {
+        self.target_vector_bytes
+            .div_ceil(Self::bytes_per_vector(dimension))
+            .max(1)
+    }
+
+    pub fn max_pending_rows(self, dimension: u32) -> u64 {
+        self.max_pending_vector_bytes
+            .div_ceil(Self::bytes_per_vector(dimension))
+            .max(self.target_rows(dimension))
+    }
+
+    pub fn vector_bytes(self, dimension: u32, rows: u64) -> u64 {
+        rows.saturating_mul(Self::bytes_per_vector(dimension))
+    }
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -82,6 +137,7 @@ pub struct HnswProviderConfig {
     pub ef_search: u32,
     pub rerank_policy: HnswRerankPolicy,
     pub distance_cost: HnswDistanceCostProfile,
+    pub maintenance: HnswMaintenancePolicy,
     pub build_seed: u64,
     pub proposal_wave_size: u32,
     pub warmup_point_count: u32,
@@ -210,6 +266,21 @@ impl HnswProviderConfig {
                 }
             }
         }
+        if self.maintenance.target_vector_bytes == 0 {
+            return Err(paro_error::invalid_input(
+                "HNSW maintenance target_vector_bytes must be greater than zero",
+            ));
+        }
+        if self.maintenance.max_pending_vector_bytes < self.maintenance.target_vector_bytes {
+            return Err(paro_error::invalid_input(
+                "HNSW maintenance max_pending_vector_bytes must be at least target_vector_bytes",
+            ));
+        }
+        if self.maintenance.compaction_fanout < 2 {
+            return Err(paro_error::invalid_input(
+                "HNSW maintenance compaction_fanout must be at least 2",
+            ));
+        }
         if self.filter_columns.len() > MAX_HNSW_FILTER_COLUMNS {
             return Err(paro_error::invalid_input(format!(
                 "HNSW filter_columns supports at most {MAX_HNSW_FILTER_COLUMNS} columns"
@@ -325,6 +396,7 @@ mod tests {
             ef_search: 100,
             rerank_policy: HnswRerankPolicy::Ef,
             distance_cost: HnswDistanceCostProfile::default(),
+            maintenance: HnswMaintenancePolicy::default(),
             build_seed: DEFAULT_HNSW_BUILD_SEED,
             proposal_wave_size: DEFAULT_HNSW_PROPOSAL_WAVE_SIZE,
             warmup_point_count: DEFAULT_HNSW_WARMUP_POINT_COUNT,
@@ -428,5 +500,30 @@ mod tests {
             max_dimension: 0,
         };
         invalid.validate().unwrap();
+    }
+
+    #[test]
+    fn maintenance_rows_are_dimension_aware_and_reproducible() {
+        let policy = HnswMaintenancePolicy::default();
+        assert_eq!(policy.target_rows(128), 16_384);
+        assert_eq!(policy.max_pending_rows(128), 524_288);
+        assert_eq!(policy.target_rows(768), 2_731);
+        assert_eq!(policy.max_pending_rows(768), 87_382);
+        assert_eq!(policy.vector_bytes(768, policy.target_rows(768)), 8_389_632);
+    }
+
+    #[test]
+    fn maintenance_high_watermark_cannot_precede_the_build_quantum() {
+        let mut invalid = valid_config();
+        invalid.maintenance = HnswMaintenancePolicy {
+            target_vector_bytes: 1024,
+            max_pending_vector_bytes: 512,
+            compaction_fanout: 8,
+        };
+        assert!(invalid
+            .validate()
+            .unwrap_err()
+            .to_string()
+            .contains("must be at least target_vector_bytes"));
     }
 }

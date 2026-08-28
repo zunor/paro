@@ -12,7 +12,9 @@ use super::artifact_integrity::{
 use super::entry_points::EntryPoints;
 use super::graph::{GraphLayers, GraphSearchLimits, PredicatePartitionSeeds};
 use super::graph_links::GraphLinks;
-use super::hnsw_builder::hnsw_build_pool;
+use super::hnsw_builder::{
+    hnsw_build_pool, hnsw_current_build_parallelism, HnswForegroundQueryGuard,
+};
 use super::predicate_scan::{
     PredicateScanBuildBlock, PredicateScanBuildColumn, PredicateScanLayout,
 };
@@ -1205,7 +1207,8 @@ impl HnswIndex {
                 let entry_points = builder.snapshot_entry_points();
                 let proposals = if let Some(pool) = pool {
                     let positions = (wave_start..wave_end).collect::<Vec<_>>();
-                    let chunk_size = positions.len().div_ceil(parallelism).max(1);
+                    let wave_parallelism = hnsw_current_build_parallelism(parallelism);
+                    let chunk_size = positions.len().div_ceil(wave_parallelism).max(1);
                     pool.install(|| {
                         positions
                             .par_chunks(chunk_size)
@@ -1243,7 +1246,7 @@ impl HnswIndex {
                             proposals,
                             storage.as_ref(),
                             distance,
-                            parallelism,
+                            hnsw_current_build_parallelism(parallelism),
                         )
                     });
                 } else {
@@ -1506,21 +1509,21 @@ impl HnswIndex {
     where
         F: FnMut(BuiltPredicateBlock) -> Result<()>,
     {
-        let worker_count = parallelism
-            .min(pool.map_or(1, rayon::ThreadPool::current_num_threads))
-            .max(1);
         let oversized_rows = usize::try_from(target_block_rows)
             .unwrap_or(usize::MAX)
             .saturating_mul(2);
         let mut remaining = prepared_blocks.into_iter().peekable();
         while let Some(next) = remaining.peek() {
+            let worker_count = hnsw_current_build_parallelism(parallelism)
+                .min(pool.map_or(1, rayon::ThreadPool::current_num_threads))
+                .max(1);
             if worker_count == 1 || next.graph_point_ids.len() > oversized_rows {
                 let block = remaining.next().expect("peeked predicate block exists");
                 visit(Self::build_predicate_block(
                     storage,
                     block,
                     pool,
-                    parallelism,
+                    worker_count,
                     stop_check,
                 )?)?;
                 continue;
@@ -1546,7 +1549,7 @@ impl HnswIndex {
                     storage,
                     wave.pop().expect("single predicate block exists"),
                     pool,
-                    parallelism,
+                    worker_count,
                     stop_check,
                 )?)?;
             } else if let Some(pool) = pool {
@@ -2404,6 +2407,7 @@ impl HnswIndex {
             });
         }
 
+        let _foreground_query = HnswForegroundQueryGuard::enter();
         let start = Instant::now();
         let pre_filter_count = self.graph.num_points() as u64;
         let filter_row_set = filter.row_set();
@@ -2576,6 +2580,7 @@ impl HnswIndex {
 
         self.validate_prepared_queries(queries)?;
 
+        let _foreground_query = HnswForegroundQueryGuard::enter();
         let start = Instant::now();
         let mut exact_scorers: Vec<_> = queries
             .iter()
@@ -3766,7 +3771,7 @@ mod tests {
             let mut contract = HnswConfig::new(12, 72)
                 .with_build_seed(0x0fed_cba9_8765_4321)
                 .build_contract(distance);
-            contract.vector_encoding = HnswBuildVectorEncoding::default_for_dimension(24).unwrap();
+            contract.vector_encoding = HnswBuildVectorEncoding::symmetric_i16(24).unwrap();
             let build = |width| {
                 let pool = rayon::ThreadPoolBuilder::new()
                     .num_threads(width)
@@ -3815,7 +3820,7 @@ mod tests {
         let mut contract = HnswConfig::new(12, 72)
             .with_build_seed(0x6d91_e31a_472b_850f)
             .build_contract(DistanceMetric::Euclidean);
-        contract.vector_encoding = HnswBuildVectorEncoding::default_for_dimension(24).unwrap();
+        contract.vector_encoding = HnswBuildVectorEncoding::symmetric_i16(24).unwrap();
         contract.filter_topology =
             HnswFilterTopologyContract::from_columns(&[7], BLOCK_ROWS as u32, 4).unwrap();
         let make_blocks = || HnswFilterBlocks {
@@ -3870,7 +3875,7 @@ mod tests {
         let queries = make_sift_like_queries(0x456, &vectors, 64, 0.02);
         let config = HnswConfig::new(16, 96).with_ef(96);
         let mut contract = config.build_contract(DistanceMetric::Euclidean);
-        contract.vector_encoding = HnswBuildVectorEncoding::default_for_dimension(32).unwrap();
+        contract.vector_encoding = HnswBuildVectorEncoding::symmetric_i16(32).unwrap();
         let index = HnswBuilder::new()
             .build(make_storage(&vectors), contract)
             .unwrap();

@@ -304,12 +304,12 @@ struct SearchMaintenancePending {
     completed_epoch: u64,
     first_request: Option<Instant>,
     last_request: Option<Instant>,
-    immediate: bool,
+    urgency: SearchMaintenanceUrgency,
 }
 
 impl SearchMaintenancePending {
     fn wait_before_run(&self, now: Instant) -> Option<Duration> {
-        if self.immediate {
+        if self.urgency == SearchMaintenanceUrgency::Immediate {
             return None;
         }
         let quiet_for = self
@@ -320,15 +320,22 @@ impl SearchMaintenancePending {
             .first_request
             .map(|requested_at| now.saturating_duration_since(requested_at))
             .unwrap_or(SEARCH_MAINTENANCE_MAX_DELAY);
-        if quiet_for >= SEARCH_MAINTENANCE_QUIESCENCE
-            || outstanding_for >= SEARCH_MAINTENANCE_MAX_DELAY
+        if quiet_for >= SEARCH_MAINTENANCE_QUIESCENCE {
+            return None;
+        }
+        if self.urgency == SearchMaintenanceUrgency::Deadline
+            && outstanding_for >= SEARCH_MAINTENANCE_MAX_DELAY
         {
             return None;
         }
-        Some(
-            (SEARCH_MAINTENANCE_QUIESCENCE - quiet_for)
-                .min(SEARCH_MAINTENANCE_MAX_DELAY - outstanding_for),
-        )
+        let quiet_wait = SEARCH_MAINTENANCE_QUIESCENCE - quiet_for;
+        match self.urgency {
+            SearchMaintenanceUrgency::Quiescent => Some(quiet_wait),
+            SearchMaintenanceUrgency::Deadline => {
+                Some(quiet_wait.min(SEARCH_MAINTENANCE_MAX_DELAY - outstanding_for))
+            }
+            SearchMaintenanceUrgency::Immediate => None,
+        }
     }
 }
 
@@ -1188,7 +1195,7 @@ impl DatabaseHandle {
             pending.requested_epoch = pending.requested_epoch.saturating_add(1);
             pending.first_request.get_or_insert(now);
             pending.last_request = Some(now);
-            pending.immediate |= matches!(urgency, SearchMaintenanceUrgency::Immediate);
+            pending.urgency = pending.urgency.max(urgency);
             tracing::trace!(
                 target: targets::INSTANCE,
                 db = %self.name(),
@@ -1294,7 +1301,7 @@ impl DatabaseHandle {
                         pending.requested_epoch = pending.requested_epoch.saturating_add(1);
                         pending.first_request = Some(now);
                         pending.last_request = Some(now);
-                        pending.immediate = true;
+                        pending.urgency = SearchMaintenanceUrgency::Immediate;
                     } else {
                         continue;
                     }
@@ -1323,13 +1330,17 @@ impl DatabaseHandle {
                         let now = Instant::now();
                         pending.first_request = Some(now);
                         pending.last_request = Some(now);
-                        pending.immediate = more_work.immediate;
+                        pending.urgency = if more_work.immediate {
+                            SearchMaintenanceUrgency::Immediate
+                        } else {
+                            SearchMaintenanceUrgency::Quiescent
+                        };
                     } else {
                         pending.completed_epoch = pending.completed_epoch.max(target_epoch);
                         if pending.completed_epoch == pending.requested_epoch {
                             pending.first_request = None;
                             pending.last_request = None;
-                            pending.immediate = false;
+                            pending.urgency = SearchMaintenanceUrgency::Quiescent;
                         }
                     }
                     tracing::trace!(
@@ -1346,7 +1357,7 @@ impl DatabaseHandle {
                     let now = Instant::now();
                     pending.first_request = Some(now);
                     pending.last_request = Some(now);
-                    pending.immediate = false;
+                    pending.urgency = SearchMaintenanceUrgency::Quiescent;
                     tracing::warn!(
                         target: targets::INSTANCE,
                         db = %db.name(),

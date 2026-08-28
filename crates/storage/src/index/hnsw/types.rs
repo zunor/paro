@@ -122,7 +122,15 @@ impl HnswBuildVectorEncoding {
     }
 
     pub fn default_for_dimension(dimension: u32) -> paro_common::error::Result<Self> {
-        Self::symmetric_i16(dimension.min(DEFAULT_HNSW_BUILD_ROUTING_DIMENSIONS))
+        if dimension <= DEFAULT_HNSW_BUILD_ROUTING_DIMENSIONS {
+            // Compact routing would retain every source coordinate here while
+            // adding a second lossy image and an exact-rerank pass beside the
+            // already-authoritative f32 artifact. Exact routing is both
+            // smaller in total resident state and faster at this boundary.
+            Ok(Self::ExactF32)
+        } else {
+            Self::symmetric_i16(DEFAULT_HNSW_BUILD_ROUTING_DIMENSIONS)
+        }
     }
 
     pub const fn routing_dimensions(self) -> Option<u16> {
@@ -141,6 +149,27 @@ impl std::fmt::Display for HnswBuildVectorEncoding {
                 write!(f, "symmetric_i16({routing_dimensions})")
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod build_vector_encoding_tests {
+    use super::*;
+
+    #[test]
+    fn default_encoding_avoids_a_redundant_lossy_image_at_low_dimension() {
+        assert_eq!(
+            HnswBuildVectorEncoding::default_for_dimension(128).unwrap(),
+            HnswBuildVectorEncoding::ExactF32
+        );
+        assert_eq!(
+            HnswBuildVectorEncoding::default_for_dimension(129).unwrap(),
+            HnswBuildVectorEncoding::symmetric_i16(128).unwrap()
+        );
+        assert_eq!(
+            HnswBuildVectorEncoding::default_for_dimension(768).unwrap(),
+            HnswBuildVectorEncoding::symmetric_i16(128).unwrap()
+        );
     }
 }
 

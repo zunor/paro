@@ -134,6 +134,47 @@ impl DistanceMetric {
         distance::dot_product(prepared_query, vector) * distance::inverse_norm(vector)
     }
 
+    /// Score one contiguous row-major base-vector batch.
+    ///
+    /// Exact tail and covering scans are sequential workloads, unlike graph
+    /// traversal. Keeping this kernel at the metric boundary lets Euclidean
+    /// queries use the shared cross-row SIMD implementation without teaching
+    /// storage readers about distance semantics.
+    pub fn similarity_unindexed_batch_contiguous(
+        &self,
+        prepared_query: &[f32],
+        vectors: &[f32],
+        dimension: usize,
+        scores: &mut [ScoreType],
+    ) {
+        assert_eq!(prepared_query.len(), dimension);
+        assert_eq!(vectors.len(), scores.len().saturating_mul(dimension));
+        match self {
+            Self::Euclidean => {
+                distance::l2_squared_batch_contiguous(prepared_query, vectors, dimension, scores);
+                for score in scores {
+                    *score = -*score;
+                }
+            }
+            Self::Cosine => {
+                for (score, vector) in scores.iter_mut().zip(vectors.chunks_exact(dimension)) {
+                    *score = distance::dot_product(prepared_query, vector)
+                        * distance::inverse_norm(vector);
+                }
+            }
+            Self::DotProduct => {
+                for (score, vector) in scores.iter_mut().zip(vectors.chunks_exact(dimension)) {
+                    *score = distance::dot_product(prepared_query, vector);
+                }
+            }
+            Self::Manhattan => {
+                for (score, vector) in scores.iter_mut().zip(vectors.chunks_exact(dimension)) {
+                    *score = -distance::l1_distance(prepared_query, vector);
+                }
+            }
+        }
+    }
+
     /// Score a prepared query against an indexed point. Cosine indexes persist
     /// `inverse_norm` once per point, eliminating a second vector pass and
     /// square root from every graph visit.
@@ -260,6 +301,41 @@ mod tests {
         assert_eq!(prepared.metric(), DistanceMetric::Cosine);
         assert!(approx_eq(prepared.as_slice()[0], 0.6));
         assert!(approx_eq(prepared.as_slice()[1], 0.8));
+    }
+
+    #[test]
+    fn unindexed_contiguous_batch_matches_scalar_metric_semantics() {
+        let vectors = [
+            1.0, 2.0, 3.0, 4.0, // row 0
+            -2.0, 0.5, 1.0, 8.0, // row 1
+            0.25, -1.0, 5.0, 2.0, // row 2
+        ];
+        for metric in [
+            DistanceMetric::Euclidean,
+            DistanceMetric::Cosine,
+            DistanceMetric::DotProduct,
+            DistanceMetric::Manhattan,
+        ] {
+            let prepared = metric.prepare(&[0.5, 1.0, -2.0, 3.0]);
+            let expected = vectors
+                .chunks_exact(4)
+                .map(|vector| metric.similarity_unindexed(prepared.as_slice(), vector))
+                .collect::<Vec<_>>();
+            let mut actual = vec![0.0; expected.len()];
+            metric.similarity_unindexed_batch_contiguous(
+                prepared.as_slice(),
+                &vectors,
+                4,
+                &mut actual,
+            );
+            assert!(
+                expected
+                    .iter()
+                    .zip(actual.iter())
+                    .all(|(&expected, &actual)| approx_eq(expected, actual)),
+                "{metric:?}: expected {expected:?}, got {actual:?}"
+            );
+        }
     }
 
     #[test]

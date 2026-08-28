@@ -266,6 +266,7 @@ fn create_search_driver(
         heap_budget_items.max(1),
         ctx.query.session.number_of_threads().max(1),
         ctx.query.memory.clone(),
+        ctx.query.session.allocator(MemoryTag::VectorIndex),
     )
     .with_work_controls(
         None,

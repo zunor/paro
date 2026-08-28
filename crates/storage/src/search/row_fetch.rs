@@ -863,17 +863,19 @@ mod tests {
             version: HNSW_PROVIDER_CONFIG_VERSION,
             dimension,
             distance: DistanceMetric::Euclidean,
-            build_vector_encoding:
-                crate::index::hnsw::HnswBuildVectorEncoding::default_for_dimension(dimension)
-                    .unwrap(),
+            build_vector_encoding: crate::index::hnsw::HnswBuildVectorEncoding::symmetric_i16(
+                dimension.min(128),
+            )
+            .unwrap(),
             m: 8,
             ef_construct: 64,
             ef_search: 64,
             rerank_policy: crate::index::hnsw::HnswRerankPolicy::default_for_encoding(
-                crate::index::hnsw::HnswBuildVectorEncoding::default_for_dimension(dimension)
+                crate::index::hnsw::HnswBuildVectorEncoding::symmetric_i16(dimension.min(128))
                     .unwrap(),
             ),
             distance_cost: crate::index::hnsw::HnswDistanceCostProfile::default(),
+            maintenance: crate::search::HnswMaintenancePolicy::default(),
             build_seed: crate::index::hnsw::DEFAULT_HNSW_BUILD_SEED,
             proposal_wave_size: crate::search::DEFAULT_HNSW_PROPOSAL_WAVE_SIZE,
             warmup_point_count: crate::search::DEFAULT_HNSW_WARMUP_POINT_COUNT,

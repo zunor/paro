@@ -5,6 +5,7 @@ use std::fmt::Debug;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 
+use paro_common::allocator::{default_allocator, Allocator};
 use paro_common::error::{self as paro_error, Result};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -146,13 +147,32 @@ impl SearchMemoryAccountant for BoundedSearchMemoryAccountant {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct ResourceBudget {
     pub heap_budget_items: usize,
     pub parallelism_slots: usize,
     pub context: Option<ResourceContext>,
     pub memory_accountant: Arc<dyn SearchMemoryAccountant>,
+    /// Allocator used for provider materialization that must participate in
+    /// the engine's physical memory runtime. The logical accountant above
+    /// owns query admission; this allocator owns the corresponding buffers.
+    pub materialization_allocator: Arc<dyn Allocator>,
     pub work: Arc<SearchWorkBudget>,
+}
+
+impl Debug for ResourceBudget {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ResourceBudget")
+            .field("heap_budget_items", &self.heap_budget_items)
+            .field("parallelism_slots", &self.parallelism_slots)
+            .field("context", &self.context)
+            .field(
+                "materialization_allocator",
+                &self.materialization_allocator.name(),
+            )
+            .field("work", &self.work)
+            .finish_non_exhaustive()
+    }
 }
 
 impl ResourceBudget {
@@ -166,6 +186,7 @@ impl ResourceBudget {
             parallelism_slots,
             context: None,
             memory_accountant: Arc::new(BoundedSearchMemoryAccountant::new(memory_limit_bytes)),
+            materialization_allocator: Arc::new(default_allocator()),
             work: Arc::new(SearchWorkBudget::new(
                 None,
                 Arc::new(NoopSearchCancellation),
@@ -177,12 +198,14 @@ impl ResourceBudget {
         heap_budget_items: usize,
         parallelism_slots: usize,
         memory_accountant: Arc<dyn SearchMemoryAccountant>,
+        materialization_allocator: Arc<dyn Allocator>,
     ) -> Self {
         Self {
             heap_budget_items,
             parallelism_slots,
             context: None,
             memory_accountant,
+            materialization_allocator,
             work: Arc::new(SearchWorkBudget::new(
                 None,
                 Arc::new(NoopSearchCancellation),
@@ -252,7 +275,8 @@ mod tests {
     #[test]
     fn reservation_enforces_local_limit_without_accountant() {
         let accountant = Arc::new(BoundedSearchMemoryAccountant::new(4096));
-        let budget = ResourceBudget::managed(1024, 1, accountant.clone());
+        let budget =
+            ResourceBudget::managed(1024, 1, accountant.clone(), Arc::new(default_allocator()));
         let reservation = budget.try_reserve_memory(4096).unwrap();
         assert!(budget.try_reserve_memory(1).is_err());
         drop(reservation);

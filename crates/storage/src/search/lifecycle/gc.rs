@@ -1,7 +1,9 @@
 // Copyright 2024-2026 Zunor
 // SPDX-License-Identifier: Apache-2.0
 
-use crate::search::artifact::{ArtifactGcContext, ArtifactGcPolicy, GcDecision};
+use crate::search::artifact::{
+    ArtifactCompactionLayout, ArtifactGcContext, ArtifactGcPolicy, GcDecision,
+};
 use crate::search::capability::SearchIndexKind;
 
 struct HnswGcPolicy;
@@ -57,15 +59,50 @@ impl ArtifactGcPolicy for FullTextGcPolicy {
 /// partitions form a meaningful next level, or when fan-out itself reaches a
 /// hard ceiling.
 fn hnsw_generation_needs_compaction(context: &ArtifactGcContext) -> bool {
-    if context.artifact_count <= 1 {
+    let Some(ArtifactCompactionLayout::HnswLevelled {
+        artifact_row_counts,
+        target_rows,
+        fanout,
+    }) = &context.compaction_layout
+    else {
         return false;
+    };
+    hnsw_compaction_level(artifact_row_counts, *target_rows, *fanout).is_some()
+}
+
+/// Return the lowest size tier containing one complete deterministic merge
+/// quantum. A tier covers `[target * fanout^level, target * fanout^(level+1))`;
+/// every merge therefore promotes one artifact and keeps query fan-out
+/// logarithmically bounded without rewriting an unrelated large base graph.
+pub(crate) fn hnsw_compaction_level(
+    artifact_rows: &[u64],
+    target_rows: u64,
+    fanout: u32,
+) -> Option<u32> {
+    if target_rows == 0 || fanout < 2 {
+        return None;
     }
-    let rows_outside_largest = context
-        .indexed_rows
-        .saturating_sub(context.largest_artifact_rows);
-    let level_target = context.largest_artifact_rows.div_ceil(4).max(32_768);
-    context.artifact_count >= 32
-        || (context.artifact_count >= 8 && rows_outside_largest >= level_target)
+    let mut counts = std::collections::BTreeMap::<u32, usize>::new();
+    for &rows in artifact_rows {
+        let level = hnsw_artifact_compaction_level(rows, target_rows, fanout);
+        let count = counts.entry(level).or_default();
+        *count = count.saturating_add(1);
+    }
+    let merge_width = usize::try_from(fanout).unwrap_or(usize::MAX);
+    counts
+        .into_iter()
+        .find_map(|(level, count)| (count >= merge_width).then_some(level))
+}
+
+pub(crate) fn hnsw_artifact_compaction_level(rows: u64, target_rows: u64, fanout: u32) -> u32 {
+    let mut units = rows.div_ceil(target_rows.max(1)).max(1);
+    let fanout = u64::from(fanout.max(2));
+    let mut level = 0u32;
+    while units >= fanout {
+        units = units.div_ceil(fanout);
+        level = level.saturating_add(1);
+    }
+    level
 }
 
 pub(crate) fn gc_policy_for_kind(kind: SearchIndexKind) -> &'static dyn ArtifactGcPolicy {
@@ -124,12 +161,39 @@ mod tests {
         );
         assert_eq!(
             policy.should_gc(&ArtifactGcContext {
-                artifact_count: 26,
+                artifact_count: 5,
                 indexed_rows: 500_000,
                 largest_artifact_rows: 400_000,
+                compaction_layout: Some(ArtifactCompactionLayout::HnswLevelled {
+                    artifact_row_counts: vec![400_000, 25_000, 25_000, 25_000, 25_000],
+                    target_rows: 50_000,
+                    fanout: 4,
+                }),
                 ..ArtifactGcContext::default()
             }),
             GcDecision::CompactOnly
         );
+        assert_eq!(
+            policy.should_gc(&ArtifactGcContext {
+                artifact_count: 2,
+                indexed_rows: 500_000,
+                largest_artifact_rows: 400_000,
+                compaction_layout: Some(ArtifactCompactionLayout::HnswLevelled {
+                    artifact_row_counts: vec![400_000, 100_000],
+                    target_rows: 50_000,
+                    fanout: 4,
+                }),
+                ..ArtifactGcContext::default()
+            }),
+            GcDecision::Skip
+        );
+    }
+
+    #[test]
+    fn hnsw_compaction_selects_the_lowest_eligible_tier_independent_of_input_order() {
+        let rows = [
+            400_000, 400_000, 400_000, 400_000, 25_000, 25_000, 25_000, 25_000,
+        ];
+        assert_eq!(hnsw_compaction_level(&rows, 50_000, 4), Some(0));
     }
 }
