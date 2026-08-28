@@ -13,7 +13,7 @@ use paro_common::error::Result;
 use std::fs::File;
 use std::io::{Read, Seek, SeekFrom};
 use std::path::Path;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use crate::index::partition_directory::PartitionDirectory;
 use crate::rowset::column::OrdinalIndexReader;
@@ -185,6 +185,23 @@ pub trait VectorStorage: Send + Sync {
         false
     }
 
+    /// Describe a bounded sequential construction scan to physical storage.
+    ///
+    /// Compact routing encoders make full ordered passes over canonical base
+    /// vectors. Mmap sources normally advertise random access for HNSW beam
+    /// search; temporarily switching them to sequential access lets the kernel
+    /// use bounded readahead and reclaim pages behind the scan. This is a safe
+    /// access-pattern hint, not `MADV_DONTNEED`: the latter conceptually
+    /// mutates mapped pages and is unsound on a shared `VectorStorage` while a
+    /// concurrent exact reader may hold a slice into the same mapping.
+    fn begin_construction_sequential_scan(&self) {}
+
+    /// Release one sequential construction-scan lease.
+    ///
+    /// Implementations must support nesting because multiple immutable HNSW
+    /// definitions can build over the same physical vector source at once.
+    fn end_construction_sequential_scan(&self) {}
+
     /// Compact immutable routing image used only by graph navigation. Exact
     /// scans and SQL-visible scores continue to use the canonical f32 matrix.
     fn i16_routing_view(&self) -> Option<I16RoutingView<'_>> {
@@ -254,6 +271,24 @@ pub trait VectorStorage: Send + Sync {
     }
 }
 
+/// Restores the physical source's random-access policy on every exit path.
+struct ConstructionSequentialScan<'a> {
+    storage: &'a dyn VectorStorage,
+}
+
+impl<'a> ConstructionSequentialScan<'a> {
+    fn begin(storage: &'a dyn VectorStorage) -> Self {
+        storage.begin_construction_sequential_scan();
+        Self { storage }
+    }
+}
+
+impl Drop for ConstructionSequentialScan<'_> {
+    fn drop(&mut self) {
+        self.storage.end_construction_sequential_scan();
+    }
+}
+
 const I16_BUILD_ALIGNMENT: usize = 16;
 const MAX_OWNED_I16_BUILD_BYTES: usize = 64 * 1024 * 1024;
 
@@ -282,7 +317,11 @@ impl ExactF32BuildVectorStorage {
     fn prepare(
         base: Arc<dyn VectorStorage>,
         workspace_dir: Option<&Path>,
+        stop_check: Option<&super::HnswBuildStopCheck>,
     ) -> Result<Arc<dyn VectorStorage>> {
+        if stop_check.is_some_and(super::HnswBuildStopCheck::should_stop) {
+            return Err(paro_common::error::query_canceled());
+        }
         if base.contiguous_vectors().is_some() {
             let dimension = base.vector_dim();
             let count = base.num_vectors();
@@ -336,7 +375,11 @@ impl ExactF32BuildVectorStorage {
         let output =
             unsafe { std::slice::from_raw_parts_mut(mmap.as_mut_ptr().cast::<f32>(), value_count) };
         let mut written = 0usize;
-        base.try_for_each_contiguous_chunk(&mut |values| {
+        let sequential_scan = ConstructionSequentialScan::begin(base.as_ref());
+        let copy_result = base.try_for_each_contiguous_chunk(&mut |values| {
+            if stop_check.is_some_and(super::HnswBuildStopCheck::should_stop) {
+                return Err(paro_common::error::query_canceled());
+            }
             let end = written.checked_add(values.len()).ok_or_else(|| {
                 paro_common::error::out_of_range("HNSW exact-f32 build copy overflow")
             })?;
@@ -348,7 +391,9 @@ impl ExactF32BuildVectorStorage {
             destination.copy_from_slice(values);
             written = end;
             Ok(())
-        })?;
+        });
+        copy_result?;
+        drop(sequential_scan);
         if written != value_count {
             return Err(paro_common::error::data_corrupted(format!(
                 "HNSW exact-f32 build copied {written} values, expected {value_count}"
@@ -516,7 +561,11 @@ impl SymmetricI16BuildVectorStorage {
         routing_dimensions: usize,
         build_seed: u64,
         workspace_dir: Option<&Path>,
+        stop_check: Option<&super::HnswBuildStopCheck>,
     ) -> Result<Arc<dyn VectorStorage>> {
+        if stop_check.is_some_and(super::HnswBuildStopCheck::should_stop) {
+            return Err(paro_common::error::query_canceled());
+        }
         let dimension = base.vector_dim();
         if dimension == 0 {
             return Err(paro_common::error::invalid_input(
@@ -530,7 +579,11 @@ impl SymmetricI16BuildVectorStorage {
         }
         let mut minima = vec![f32::INFINITY; dimension];
         let mut maxima = vec![f32::NEG_INFINITY; dimension];
-        base.try_for_each_contiguous_chunk(&mut |values| {
+        let sequential_scan = ConstructionSequentialScan::begin(base.as_ref());
+        let extrema_result = base.try_for_each_contiguous_chunk(&mut |values| {
+            if stop_check.is_some_and(super::HnswBuildStopCheck::should_stop) {
+                return Err(paro_common::error::query_canceled());
+            }
             if values.len() % dimension != 0 {
                 return Err(paro_common::error::data_corrupted(
                     "HNSW build vector chunk contains a partial row",
@@ -548,7 +601,9 @@ impl SymmetricI16BuildVectorStorage {
                 }
             }
             Ok(())
-        })?;
+        });
+        extrema_result?;
+        drop(sequential_scan);
         let selected_dimensions =
             multiscale_routing_dimensions(&minima, &maxima, routing_dimensions, build_seed);
         let scales = selected_dimensions
@@ -617,7 +672,11 @@ impl SymmetricI16BuildVectorStorage {
             .cosine_inverse_norms()
             .map(|_| vec![0.0; base.num_vectors()]);
         let mut encoded_row = 0usize;
-        base.try_for_each_contiguous_chunk(&mut |values| {
+        let sequential_scan = ConstructionSequentialScan::begin(base.as_ref());
+        let encode_result = base.try_for_each_contiguous_chunk(&mut |values| {
+            if stop_check.is_some_and(super::HnswBuildStopCheck::should_stop) {
+                return Err(paro_common::error::query_canceled());
+            }
             if values.len() % dimension != 0 {
                 return Err(paro_common::error::data_corrupted(
                     "HNSW build vector chunk contains a partial row",
@@ -663,7 +722,9 @@ impl SymmetricI16BuildVectorStorage {
                 encoded_row += 1;
             }
             Ok(())
-        })?;
+        });
+        encode_result?;
+        drop(sequential_scan);
         if encoded_row != base.num_vectors() {
             return Err(paro_common::error::data_corrupted(format!(
                 "HNSW i16 build encoded {encoded_row} rows, expected {}",
@@ -809,6 +870,14 @@ impl VectorStorage for SymmetricI16BuildVectorStorage {
         self.base.is_mmap_backed()
     }
 
+    fn begin_construction_sequential_scan(&self) {
+        self.base.begin_construction_sequential_scan();
+    }
+
+    fn end_construction_sequential_scan(&self) {
+        self.base.end_construction_sequential_scan();
+    }
+
     fn i16_routing_view(&self) -> Option<I16RoutingView<'_>> {
         Some(I16RoutingView {
             codes: self.codes.as_slice(),
@@ -860,10 +929,11 @@ pub(crate) fn prepare_build_vector_storage(
     encoding: super::HnswBuildVectorEncoding,
     build_seed: u64,
     workspace_dir: Option<&Path>,
+    stop_check: Option<&super::HnswBuildStopCheck>,
 ) -> Result<Arc<dyn VectorStorage>> {
     match encoding {
         super::HnswBuildVectorEncoding::ExactF32 => {
-            ExactF32BuildVectorStorage::prepare(base, workspace_dir)
+            ExactF32BuildVectorStorage::prepare(base, workspace_dir, stop_check)
         }
         super::HnswBuildVectorEncoding::SymmetricI16 { routing_dimensions } => {
             SymmetricI16BuildVectorStorage::prepare(
@@ -871,6 +941,7 @@ pub(crate) fn prepare_build_vector_storage(
                 usize::from(routing_dimensions.get()),
                 build_seed,
                 workspace_dir,
+                stop_check,
             )
         }
     }
@@ -950,6 +1021,14 @@ impl VectorStorage for PointRemappedBuildVectorStorage {
 
     fn is_mmap_backed(&self) -> bool {
         self.base.is_mmap_backed()
+    }
+
+    fn begin_construction_sequential_scan(&self) {
+        self.base.begin_construction_sequential_scan();
+    }
+
+    fn end_construction_sequential_scan(&self) {
+        self.base.end_construction_sequential_scan();
     }
 
     #[inline]
@@ -1574,6 +1653,14 @@ impl VectorStorage for IndexedVectorStorage {
     fn is_mmap_backed(&self) -> bool {
         self.base.is_mmap_backed()
     }
+
+    fn begin_construction_sequential_scan(&self) {
+        self.base.begin_construction_sequential_scan();
+    }
+
+    fn end_construction_sequential_scan(&self) {
+        self.base.end_construction_sequential_scan();
+    }
 }
 
 /// In-memory vector storage, primarily for testing and small datasets.
@@ -1778,6 +1865,7 @@ pub struct MmapVectorStorage {
     mmap: Mmap,
     dim: usize,
     count: usize,
+    construction_sequential_scans: Mutex<usize>,
 }
 
 impl MmapVectorStorage {
@@ -1826,7 +1914,12 @@ impl MmapVectorStorage {
 
         let count = size / vector_bytes;
 
-        Ok(Self { mmap, dim, count })
+        Ok(Self {
+            mmap,
+            dim,
+            count,
+            construction_sequential_scans: Mutex::new(0),
+        })
     }
 }
 
@@ -1858,6 +1951,38 @@ impl VectorStorage for MmapVectorStorage {
 
     fn is_mmap_backed(&self) -> bool {
         true
+    }
+
+    fn begin_construction_sequential_scan(&self) {
+        let mut scans = self
+            .construction_sequential_scans
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if *scans == 0 {
+            #[cfg(unix)]
+            {
+                let _ = self.mmap.advise(memmap2::Advice::Sequential);
+            }
+        }
+        *scans = scans
+            .checked_add(1)
+            .expect("HNSW sequential-scan lease count overflow");
+    }
+
+    fn end_construction_sequential_scan(&self) {
+        let mut scans = self
+            .construction_sequential_scans
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        assert!(*scans > 0, "unbalanced HNSW sequential-scan lease");
+        *scans -= 1;
+        if *scans != 0 {
+            return;
+        }
+        #[cfg(unix)]
+        {
+            let _ = self.mmap.advise(memmap2::Advice::Random);
+        }
     }
 }
 
@@ -1970,6 +2095,18 @@ impl VectorStorage for PartitionedVectorStorage {
 
     fn is_mmap_backed(&self) -> bool {
         self.parts.iter().all(|part| part.storage.is_mmap_backed())
+    }
+
+    fn begin_construction_sequential_scan(&self) {
+        for part in &self.parts {
+            part.storage.begin_construction_sequential_scan();
+        }
+    }
+
+    fn end_construction_sequential_scan(&self) {
+        for part in &self.parts {
+            part.storage.end_construction_sequential_scan();
+        }
     }
 }
 
@@ -2169,6 +2306,38 @@ mod tests {
     use crate::rowset::column::{ColumnWriter, ColumnWriterOptions, ScalarColumnWriter};
     use paro_common::types::LogicalType;
     use std::io::Write;
+    use std::sync::Mutex;
+
+    struct AccessPatternRecordingStorage {
+        inner: InMemoryVectorStorage,
+        sequential_transitions: Arc<Mutex<Vec<bool>>>,
+    }
+
+    impl VectorStorage for AccessPatternRecordingStorage {
+        fn get_vector(&self, idx: PointOffset) -> &[f32] {
+            self.inner.get_vector(idx)
+        }
+
+        fn contiguous_vectors(&self) -> Option<&[f32]> {
+            self.inner.contiguous_vectors()
+        }
+
+        fn num_vectors(&self) -> usize {
+            self.inner.num_vectors()
+        }
+
+        fn vector_dim(&self) -> usize {
+            self.inner.vector_dim()
+        }
+
+        fn begin_construction_sequential_scan(&self) {
+            self.sequential_transitions.lock().unwrap().push(true);
+        }
+
+        fn end_construction_sequential_scan(&self) {
+            self.sequential_transitions.lock().unwrap().push(false);
+        }
+    }
 
     #[test]
     fn partitioned_storage_resolves_vectors_across_physical_boundaries() {
@@ -2215,6 +2384,7 @@ mod tests {
             super::super::HnswBuildVectorEncoding::ExactF32,
             17,
             Some(workspace.path()),
+            None,
         )
         .unwrap();
         drop(partitioned);
@@ -2247,6 +2417,7 @@ mod tests {
             raw,
             super::super::HnswBuildVectorEncoding::ExactF32,
             17,
+            None,
             None,
         )
         .unwrap();
@@ -2282,6 +2453,7 @@ mod tests {
                 super::super::HnswBuildVectorEncoding::symmetric_i16(3).unwrap(),
                 17,
                 None,
+                None,
             )
             .unwrap();
 
@@ -2301,6 +2473,46 @@ mod tests {
     }
 
     #[test]
+    fn symmetric_i16_scans_exact_source_with_bounded_sequential_advice() {
+        let sequential_transitions = Arc::new(Mutex::new(Vec::new()));
+        let raw: Arc<dyn VectorStorage> = Arc::new(AccessPatternRecordingStorage {
+            inner: InMemoryVectorStorage::new(vec![1.0, 2.0, 3.0, 4.0], 2),
+            sequential_transitions: Arc::clone(&sequential_transitions),
+        });
+
+        let encoded = prepare_build_vector_storage(
+            raw,
+            super::super::HnswBuildVectorEncoding::symmetric_i16(2).unwrap(),
+            17,
+            None,
+            None,
+        )
+        .unwrap();
+
+        assert_eq!(
+            *sequential_transitions.lock().unwrap(),
+            [true, false, true, false]
+        );
+        assert_eq!(encoded.get_vector(1), &[3.0, 4.0]);
+    }
+
+    #[test]
+    fn build_vector_preparation_honors_immediate_cancellation() {
+        for encoding in [
+            super::super::HnswBuildVectorEncoding::ExactF32,
+            super::super::HnswBuildVectorEncoding::symmetric_i16(2).unwrap(),
+        ] {
+            let raw: Arc<dyn VectorStorage> =
+                Arc::new(InMemoryVectorStorage::new(vec![1.0, 2.0, 3.0, 4.0], 2));
+            let stop = super::super::HnswBuildStopCheck::new(|| true);
+            let error = prepare_build_vector_storage(raw, encoding, 17, None, Some(&stop))
+                .err()
+                .expect("cancelled build preparation must fail");
+            assert!(error.is_query_canceled());
+        }
+    }
+
+    #[test]
     fn symmetric_i16_rejects_scales_that_cannot_be_squared_stably() {
         for value in [f32::from_bits(1), f32::MAX] {
             let raw: Arc<dyn VectorStorage> =
@@ -2309,6 +2521,7 @@ mod tests {
                 raw,
                 super::super::HnswBuildVectorEncoding::symmetric_i16(1).unwrap(),
                 17,
+                None,
                 None,
             )
             .err()
@@ -2327,6 +2540,7 @@ mod tests {
             raw,
             super::super::HnswBuildVectorEncoding::symmetric_i16(2).unwrap(),
             19,
+            None,
             None,
         )
         .unwrap();

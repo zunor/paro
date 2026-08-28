@@ -1314,6 +1314,7 @@ impl HnswIndex {
             build_contract.vector_encoding,
             build_contract.build_seed,
             workspace_dir,
+            stop_check,
         )?;
         Self::build_prepared_with_controls_and_filter_blocks(
             storage,

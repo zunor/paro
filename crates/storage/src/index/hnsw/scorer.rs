@@ -85,6 +85,7 @@ mod tests {
             HnswBuildVectorEncoding::symmetric_i16(1).unwrap(),
             7,
             None,
+            None,
         )
         .unwrap();
         let query = DistanceMetric::Euclidean.prepare(&[-100.0]);

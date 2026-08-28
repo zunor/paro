@@ -248,6 +248,7 @@ impl HnswIndexRebuilder {
             indexed_col.build_contract.vector_encoding,
             indexed_col.build_contract.build_seed,
             Some(workspace_dir),
+            None,
         )?;
         let Some((best_old_index, signature_overlap)) = Self::select_best_old_index(
             output_storage.as_ref(),

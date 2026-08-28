@@ -4,7 +4,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard, RwLock};
 use std::time::{Duration, Instant};
 
@@ -102,6 +102,38 @@ struct MaintenanceFailureBackoff {
     retry_after: Instant,
 }
 
+/// Definition-scoped cancellation shared by lifecycle and provider work.
+///
+/// Expensive provider builds deliberately run without publication locks. A
+/// lifecycle operation must therefore be able to invalidate their immutable
+/// snapshot before waiting for the single-flight build lane. `retiring`
+/// prevents a queued maintenance task from starting in the cancellation-to-
+/// tombstone window; `generation` makes an already-running builder observe
+/// the invalidation at its next deterministic stop-check barrier.
+#[derive(Debug, Default)]
+struct DefinitionBuildSignal {
+    generation: AtomicU64,
+    retiring: AtomicBool,
+}
+
+#[derive(Clone, Debug)]
+struct DefinitionBuildToken {
+    signal: Arc<DefinitionBuildSignal>,
+    generation: u64,
+}
+
+impl DefinitionBuildToken {
+    fn should_stop(&self) -> bool {
+        self.signal.retiring.load(Ordering::Acquire)
+            || self.signal.generation.load(Ordering::Acquire) != self.generation
+    }
+
+    fn stop_check(&self) -> SearchBuildStopCheck {
+        let token = self.clone();
+        SearchBuildStopCheck::new(move || token.should_stop())
+    }
+}
+
 #[derive(Debug, Default)]
 struct SearchIngestAdmissionState {
     reserved_rows: u64,
@@ -161,6 +193,10 @@ pub(crate) struct SearchIndexRegistry {
     /// from publication locks so DML can continue while provider work runs.
     /// No path acquires this lock after a publication lock.
     definition_build_locks: [Mutex<()>; DEFINITION_LOCK_SHARDS],
+    /// Cancellation is keyed by the durable definition id rather than the
+    /// bounded lock shard. A collision may serialize two builds, but must
+    /// never let dropping one definition cancel an unrelated one.
+    definition_build_signals: Mutex<BTreeMap<u64, Arc<DefinitionBuildSignal>>>,
     retired: Mutex<Vec<RetiredManifest>>,
     /// Long-lived mmap and decoded-reader owner. Query cursors borrow this
     /// runtime; generation retirement performs lease-safe physical eviction.
@@ -575,6 +611,7 @@ impl SearchIndexRegistry {
             lifecycle_lock: Mutex::new(()),
             definition_locks: std::array::from_fn(|_| Mutex::new(())),
             definition_build_locks: std::array::from_fn(|_| Mutex::new(())),
+            definition_build_signals: Mutex::new(BTreeMap::new()),
             retired: Mutex::new(Vec::new()),
             reader_runtime,
             maintenance_scheduler: Arc::new(MaintenanceScheduler::default()),
@@ -841,10 +878,29 @@ impl SearchIndexRegistry {
     }
 
     pub(crate) fn drop_definition(&self, definition_id: u64) -> Result<()> {
-        // Drain any snapshot rebuild that captured this definition before the
-        // durable retirement mutation. The tombstone rejects its publication;
-        // holding the same single-flight lock until view removal guarantees no
-        // live task can outlast the detach transition.
+        // Signal first, then drain the single-flight lane. Waiting on the lane
+        // before publishing cancellation makes DROP depend on the wall-clock
+        // duration of a multi-million-row provider build and leaves no
+        // operational escape hatch for a bad build contract.
+        self.retire_definition_builds(definition_id)?;
+        let result = self.drop_definition_after_build_retirement(definition_id);
+        if result.is_err() && self.view.load().definitions.contains_key(&definition_id) {
+            // A failed lifecycle mutation left the definition visible. Give
+            // future maintenance a fresh generation while every token issued
+            // before the attempted DROP remains invalidated.
+            if let Err(error) = self.activate_definition_builds(definition_id) {
+                tracing::error!(
+                    tablet_id = self.tablet.tablet_id(),
+                    definition_id,
+                    error = %error,
+                    "failed to reactivate search builds after aborted definition drop"
+                );
+            }
+        }
+        result
+    }
+
+    fn drop_definition_after_build_retirement(&self, definition_id: u64) -> Result<()> {
         let _build_guard = self.lock_definition_build(definition_id);
         let publication_guard = self.tablet.acquire_search_generation_publish_guard()?;
         let lifecycle_guard = self
@@ -853,6 +909,7 @@ impl SearchIndexRegistry {
             .map_err(|_| paro_error::internal("lock search definition lifecycle"))?;
         let initial = self.view.load_full();
         let Some(initial_state) = initial.definitions.get(&definition_id).cloned() else {
+            self.forget_definition_build_signal(definition_id)?;
             return Ok(());
         };
         let restored_seed = if initial_state.origin.is_catalog_index()
@@ -890,11 +947,17 @@ impl SearchIndexRegistry {
             }
             Ok((true, ()))
         })?;
+        // The single-flight guard proves that no provider token for this
+        // retired definition remains live. Do not retain one cancellation
+        // cell for every definition id ever created by a long-running
+        // database; a future reuse installs a fresh signal generation.
+        self.forget_definition_build_signal(definition_id)?;
         drop(state);
         drop(definition_guards);
         drop(lifecycle_guard);
         drop(publication_guard);
         if let Some(seed_definition_id) = restored_seed_definition_id {
+            self.activate_definition_builds(seed_definition_id)?;
             self.refresh_definition(seed_definition_id)?;
         }
         self.sweep_retired();
@@ -1140,6 +1203,9 @@ impl SearchIndexRegistry {
         // ownership so a waiter observes the winner's published revision
         // instead of rebuilding and discarding the same tail.
         let _build_guard = self.lock_definition_build(definition_id);
+        let Some(build_token) = self.begin_definition_build(definition_id)? else {
+            return Ok(0);
+        };
         let current = self.view.load_full();
         let Some(state) = current.definitions.get(&definition_id).cloned() else {
             return Ok(0);
@@ -1227,17 +1293,21 @@ impl SearchIndexRegistry {
             tail_window,
             rowset_refs,
             snapshot_version: self.tablet.max_version(),
-            stop_check: None,
+            stop_check: Some(build_token.stop_check()),
         };
         let estimate = builder.estimate_cost(&input)?;
-        let result = builder.build(
+        let result = match builder.build(
             input,
             &BuildBudget {
                 cost_envelope: estimate.cost,
                 deadline: None,
                 grant_id: None,
             },
-        )?;
+        ) {
+            Ok(result) => result,
+            Err(error) if error.is_query_canceled() && build_token.should_stop() => return Ok(0),
+            Err(error) => return Err(error),
+        };
         if result.artifact_refs.is_empty() {
             return Ok(0);
         }
@@ -1319,6 +1389,9 @@ impl SearchIndexRegistry {
     ) -> Result<bool> {
         self.ensure_fresh();
         let _build_guard = self.lock_definition_build(definition_id);
+        let Some(build_token) = self.begin_definition_build(definition_id)? else {
+            return Ok(false);
+        };
         let current = self.view.load_full();
         let Some(state) = current.definitions.get(&definition_id).cloned() else {
             return Ok(false);
@@ -1384,8 +1457,10 @@ impl SearchIndexRegistry {
         let builder = ProviderSidecarArtifactBuilder::for_maintenance(sidecar_store.clone());
         let build_epoch = self.foreground_ingest_epoch.load(Ordering::Acquire);
         let foreground_epoch = Arc::clone(&self.foreground_ingest_epoch);
+        let definition_token = build_token.clone();
         let stop_check = SearchBuildStopCheck::new(move || {
             foreground_epoch.load(Ordering::Acquire) != build_epoch
+                || definition_token.should_stop()
         });
         let input = SidecarBuildInput {
             definition: state.definition.clone(),
@@ -1407,7 +1482,8 @@ impl SearchIndexRegistry {
             Ok(result) => result,
             Err(error)
                 if error.is_query_canceled()
-                    && self.foreground_ingest_epoch.load(Ordering::Acquire) != build_epoch =>
+                    && (self.foreground_ingest_epoch.load(Ordering::Acquire) != build_epoch
+                        || build_token.should_stop()) =>
             {
                 // Foreground freshness debt preempts optional graph
                 // coalescing. The level-triggered scheduler will select
@@ -2326,6 +2402,9 @@ impl SearchIndexRegistry {
         let definition_guards = self.lock_definitions(
             std::iter::once(definition.definition_id).chain(duplicate_seed_ids.iter().copied()),
         )?;
+        for duplicate_seed_id in &duplicate_seed_ids {
+            self.retire_definition_builds(*duplicate_seed_id)?;
+        }
 
         // A catalog definition replacing a schema seed also replaces the
         // seed's durable head. Remove those heads before retiring any files so
@@ -2344,6 +2423,7 @@ impl SearchIndexRegistry {
                     state.with_generation_floor(loaded.root.generation_id, loaded.root.build_epoch);
             }
         }
+        let definition_id = definition.definition_id;
         let removed_seed_states = self.mutate_view(|view| {
             let mut removed = Vec::new();
             for duplicate_seed_id in &duplicate_seed_ids {
@@ -2351,9 +2431,14 @@ impl SearchIndexRegistry {
                     removed.push((*duplicate_seed_id, seed_state));
                 }
             }
-            view.definitions.insert(definition.definition_id, state);
+            view.definitions.insert(definition_id, state);
             Ok((true, removed))
         })?;
+        // Installation may legitimately reuse a durable definition id after
+        // a prior retirement. Advancing the signal generation before clearing
+        // `retiring` keeps all old work cancelled while admitting only tokens
+        // captured for the newly visible definition state.
+        self.activate_definition_builds(definition_id)?;
         for (duplicate_seed_id, seed_state) in removed_seed_states {
             self.retire_definition(
                 seed_state.definition.kind,
@@ -2365,7 +2450,7 @@ impl SearchIndexRegistry {
         drop(lifecycle_guard);
         drop(publication_guard);
         self.sweep_retired();
-        self.refresh_definition(definition.definition_id)?;
+        self.refresh_definition(definition_id)?;
         Ok(())
     }
 
@@ -3330,6 +3415,54 @@ impl SearchIndexRegistry {
         }
     }
 
+    fn definition_build_signal(&self, definition_id: u64) -> Result<Arc<DefinitionBuildSignal>> {
+        let mut signals = self
+            .definition_build_signals
+            .lock()
+            .map_err(|_| paro_error::internal("lock search definition build signals"))?;
+        Ok(Arc::clone(signals.entry(definition_id).or_default()))
+    }
+
+    /// Capture a build token after acquiring the single-flight lane.
+    ///
+    /// A retiring definition is not a retryable provider failure: its durable
+    /// lifecycle owner has already invalidated this work and is waiting to
+    /// publish the tombstone.
+    fn begin_definition_build(&self, definition_id: u64) -> Result<Option<DefinitionBuildToken>> {
+        let signal = self.definition_build_signal(definition_id)?;
+        if signal.retiring.load(Ordering::Acquire) {
+            return Ok(None);
+        }
+        Ok(Some(DefinitionBuildToken {
+            generation: signal.generation.load(Ordering::Acquire),
+            signal,
+        }))
+    }
+
+    /// Invalidate running and queued provider work before waiting for its lane.
+    fn retire_definition_builds(&self, definition_id: u64) -> Result<()> {
+        let signal = self.definition_build_signal(definition_id)?;
+        signal.retiring.store(true, Ordering::Release);
+        signal.generation.fetch_add(1, Ordering::AcqRel);
+        Ok(())
+    }
+
+    fn activate_definition_builds(&self, definition_id: u64) -> Result<()> {
+        let signal = self.definition_build_signal(definition_id)?;
+        signal.generation.fetch_add(1, Ordering::AcqRel);
+        signal.retiring.store(false, Ordering::Release);
+        Ok(())
+    }
+
+    fn forget_definition_build_signal(&self, definition_id: u64) -> Result<()> {
+        let mut signals = self
+            .definition_build_signals
+            .lock()
+            .map_err(|_| paro_error::internal("lock search definition build signals"))?;
+        signals.remove(&definition_id);
+        Ok(())
+    }
+
     fn lock_definitions(
         &self,
         definition_ids: impl IntoIterator<Item = u64>,
@@ -3999,6 +4132,35 @@ mod tests {
         let tablet = Tablet::new(10_001, 10_001, 0, schema, root.join("tablet"), None).unwrap();
         tablet.init().unwrap();
         TableHandle::from_runtime_tablet(tablet, types.to_vec())
+    }
+
+    #[test]
+    fn retiring_definition_invalidates_running_and_queued_builds() {
+        let temp = TempDir::new().unwrap();
+        let table = create_table_without_default_indexes(
+            temp.path(),
+            &[LogicalType::Integer, LogicalType::embedding(2)],
+        );
+        let registry = table.search_registry();
+        let token = registry
+            .begin_definition_build(77)
+            .unwrap()
+            .expect("active definition accepts provider work");
+        assert!(!token.should_stop());
+
+        registry.retire_definition_builds(77).unwrap();
+
+        assert!(token.should_stop());
+        assert!(registry.begin_definition_build(77).unwrap().is_none());
+        assert!(registry.begin_definition_build(78).unwrap().is_some());
+
+        registry.activate_definition_builds(77).unwrap();
+        let replacement = registry
+            .begin_definition_build(77)
+            .unwrap()
+            .expect("replacement definition accepts fresh provider work");
+        assert!(!replacement.should_stop());
+        assert!(token.should_stop(), "reactivation must not revive old work");
     }
 
     fn singleton_artifact_segment(artifact: &SearchArtifactRef) -> ArtifactSegmentRef {
