@@ -186,6 +186,9 @@ pub(crate) fn publish_head_for_state(
                     .clone(),
                 context.lsn,
                 context.durable_batch_lsn,
+                paro_common::journal::JournalPublicationWatermarks::maintenance(
+                    context.maintenance_id,
+                ),
                 tablet_id,
                 move || tablet.note_applied_lsn(lsn),
             );

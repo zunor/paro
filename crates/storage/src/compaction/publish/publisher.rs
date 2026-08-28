@@ -172,6 +172,7 @@ impl CompactionPublisher {
                 .clone(),
             context.lsn,
             context.durable_batch_lsn,
+            paro_common::journal::JournalPublicationWatermarks::maintenance(context.maintenance_id),
             tablet.tablet_id(),
             move || {
                 tablet_for_apply.apply_compaction_publish_online(

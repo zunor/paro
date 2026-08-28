@@ -472,6 +472,43 @@ pub struct RecoverySummary {
     pub max_seen_object_id: u64,
 }
 
+/// Per-record durable watermarks folded into a checkpoint only after the
+/// ordered journal apply runtime has published the record at its real LSN.
+///
+/// This is deliberately separate from [`RecoverySummary`]: a summary is a
+/// prefix aggregate, while this value describes exactly one journal record.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct JournalPublicationWatermarks {
+    pub commit_id: u64,
+    pub maintenance_id: u64,
+    pub catalog_commit_id: u64,
+    pub max_seen_object_id: u64,
+}
+
+impl JournalPublicationWatermarks {
+    pub const fn transaction(
+        commit_id: u64,
+        catalog_commit_id: u64,
+        max_seen_object_id: u64,
+    ) -> Self {
+        Self {
+            commit_id,
+            maintenance_id: 0,
+            catalog_commit_id,
+            max_seen_object_id,
+        }
+    }
+
+    pub const fn maintenance(maintenance_id: u64) -> Self {
+        Self {
+            commit_id: 0,
+            maintenance_id,
+            catalog_commit_id: 0,
+            max_seen_object_id: 0,
+        }
+    }
+}
+
 fn storage_mutation_count(storage_ops: &[StorageCommitOp]) -> u32 {
     let count = storage_ops
         .iter()

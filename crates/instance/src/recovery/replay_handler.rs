@@ -717,6 +717,15 @@ impl<'a> CatalogReplayHandler<'a> {
             frontier: Arc::clone(commit_runtime.frontier()),
             apply_targets: Arc::from([]),
             catalog_serial: false,
+            publication_watermarks: paro_common::journal::JournalPublicationWatermarks::transaction(
+                record.commit_id,
+                if record.catalog_ops.is_empty() {
+                    0
+                } else {
+                    record.commit_id
+                },
+                self.max_seen_object_id,
+            ),
             catalog_pre: Box::new(|| Ok(())),
             tablet_parts,
             descriptor_phase,

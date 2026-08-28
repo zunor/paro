@@ -10,8 +10,8 @@ use paro_common::journal::{CommitRecord, CommittedRecord, MaintenanceRecord};
 pub use crate::apply_queue::{
     ApplyCompletion, ApplyCompletionFallbackAck, ApplyErrorSource, ApplyFatalSink, ApplyPhase,
     ApplyRequest, ApplyRuntimeError, ApplySubmitResult, JournalApplyError,
-    JournalApplyMetricsSnapshot, JournalApplyRuntime, RecoveryPlaceholderRecordKind,
-    TabletApplyPart,
+    JournalApplyMetricsSnapshot, JournalApplyRuntime, JournalPublicationObserver,
+    RecoveryPlaceholderRecordKind, TabletApplyPart,
 };
 pub use crate::waiter::WaitMode;
 

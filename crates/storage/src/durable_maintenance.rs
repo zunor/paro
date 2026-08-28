@@ -4,6 +4,7 @@
 //! Ordered completion for maintenance records that are applied inline.
 
 use paro_common::error::{self as paro_error, Result};
+use paro_common::journal::JournalPublicationWatermarks;
 use paro_journal::{ApplyRequest, JournalApplyRuntime, TabletApplyPart, WaitMode};
 use std::sync::{Arc, Mutex};
 
@@ -25,6 +26,7 @@ impl DurableMaintenanceApplyCompletion {
         runtime: Arc<JournalApplyRuntime>,
         lsn: u64,
         durable_batch_lsn: u64,
+        publication_watermarks: JournalPublicationWatermarks,
         tablet_id: u64,
         after_inline_apply: impl FnOnce() -> Result<()> + Send + 'static,
     ) -> Self {
@@ -34,6 +36,7 @@ impl DurableMaintenanceApplyCompletion {
             lsn,
             durable_batch_lsn,
             commit_id: None,
+            publication_watermarks,
             wait_mode: WaitMode::Published,
             catalog_serial: false,
             catalog_pre: Box::new(|| Ok(())),
@@ -121,6 +124,7 @@ mod tests {
             lsn,
             durable_batch_lsn: lsn,
             commit_id: None,
+            publication_watermarks: JournalPublicationWatermarks::default(),
             wait_mode: WaitMode::Published,
             catalog_serial: false,
             catalog_pre: Box::new(|| Ok(())),
@@ -135,13 +139,20 @@ mod tests {
     fn dropped_successful_completion_cannot_leave_an_lsn_gap() {
         let runtime = Arc::new(JournalApplyRuntime::new());
         let observed = Arc::new(AtomicBool::new(false));
-        let completion = DurableMaintenanceApplyCompletion::arm(Arc::clone(&runtime), 1, 1, 7, {
-            let observed = Arc::clone(&observed);
-            move || {
-                observed.store(true, Ordering::Release);
-                Ok(())
-            }
-        });
+        let completion = DurableMaintenanceApplyCompletion::arm(
+            Arc::clone(&runtime),
+            1,
+            1,
+            JournalPublicationWatermarks::maintenance(1),
+            7,
+            {
+                let observed = Arc::clone(&observed);
+                move || {
+                    observed.store(true, Ordering::Release);
+                    Ok(())
+                }
+            },
+        );
         completion.record_terminal_result(Ok(())).unwrap();
         drop(completion);
 
@@ -153,8 +164,14 @@ mod tests {
     #[test]
     fn dropped_unfinished_completion_poison_is_explicit_not_an_lsn_gap() {
         let runtime = Arc::new(JournalApplyRuntime::new());
-        let completion =
-            DurableMaintenanceApplyCompletion::arm(Arc::clone(&runtime), 1, 1, 7, || Ok(()));
+        let completion = DurableMaintenanceApplyCompletion::arm(
+            Arc::clone(&runtime),
+            1,
+            1,
+            JournalPublicationWatermarks::maintenance(1),
+            7,
+            || Ok(()),
+        );
         drop(completion);
 
         let error = runtime.submit(empty_request(2)).unwrap_err();

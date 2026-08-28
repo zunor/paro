@@ -6,17 +6,26 @@ use crate::runtime::JournalFrontierSnapshot;
 use crate::waiter::WaitMode;
 use paro_common::error as paro_error;
 use paro_common::error::{ParoError, Result};
-use paro_common::journal::RecoverySummary;
+use paro_common::journal::{JournalPublicationWatermarks, RecoverySummary};
 use std::any::Any;
 use std::collections::{HashMap, VecDeque};
 use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Condvar, Mutex, Weak};
+use std::sync::{Arc, Condvar, Mutex, RwLock, Weak};
 use std::thread;
 use std::time::Instant;
 
 type ApplyWork = Box<dyn FnOnce() -> Result<()> + Send + 'static>;
 type PublishedHook = Box<dyn FnOnce() -> Result<()> + Send + 'static>;
+
+/// Database-owned observer for the exact prefix published by the ordered
+/// journal apply runtime. Checkpointing must consume this source rather than
+/// independently reconstructing LSN order from transaction callbacks.
+pub trait JournalPublicationObserver: Send + Sync + std::fmt::Debug + 'static {
+    fn record_durable(&self, durable_lsn: u64);
+
+    fn record_published(&self, lsn: u64, watermarks: JournalPublicationWatermarks) -> Result<()>;
+}
 
 pub type ApplyCompletion =
     Box<dyn FnOnce(std::result::Result<(), JournalApplyError>) + Send + 'static>;
@@ -248,6 +257,7 @@ pub struct ApplyRequest<R> {
     pub lsn: u64,
     pub durable_batch_lsn: u64,
     pub commit_id: Option<u64>,
+    pub publication_watermarks: JournalPublicationWatermarks,
     pub wait_mode: WaitMode,
     pub catalog_serial: bool,
     pub catalog_pre: ApplyWork,
@@ -255,6 +265,14 @@ pub struct ApplyRequest<R> {
     pub descriptor_phase: ApplyWork,
     pub catalog_post: Box<dyn FnOnce() -> Result<R> + Send + 'static>,
     pub on_published: PublishedHook,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct ApplyRecordMetadata {
+    raw_lsn: u64,
+    durable_batch_lsn: u64,
+    commit_id: Option<u64>,
+    publication_watermarks: JournalPublicationWatermarks,
 }
 
 pub struct JournalApplyRuntime {
@@ -286,6 +304,7 @@ impl JournalApplyRuntime {
             tablet_dispatch: Mutex::new(TabletDispatchState::default()),
             tablet_wake: Condvar::new(),
             metrics: ApplyRuntimeMetrics::default(),
+            publication_observer: RwLock::new(None),
         });
         let runtime = Self {
             inner: Arc::clone(&inner),
@@ -307,6 +326,10 @@ impl JournalApplyRuntime {
 
     pub fn frontiers(&self) -> JournalFrontierSnapshot {
         self.inner.state.lock().unwrap().frontiers
+    }
+
+    pub fn bind_publication_observer(&self, observer: Arc<dyn JournalPublicationObserver>) {
+        *self.inner.publication_observer.write().unwrap() = Some(observer);
     }
 
     pub fn metrics(&self) -> JournalApplyMetricsSnapshot {
@@ -391,6 +414,7 @@ impl JournalApplyRuntime {
             lsn,
             durable_batch_lsn,
             commit_id,
+            publication_watermarks,
             wait_mode,
             catalog_serial,
             catalog_pre,
@@ -401,9 +425,12 @@ impl JournalApplyRuntime {
         } = request;
 
         let ticket = self.inner.register_record(
-            lsn,
-            durable_batch_lsn,
-            commit_id,
+            ApplyRecordMetadata {
+                raw_lsn: lsn,
+                durable_batch_lsn,
+                commit_id,
+                publication_watermarks,
+            },
             tablet_parts.len(),
             on_published,
             failure.clone(),
@@ -542,6 +569,7 @@ struct JournalApplyRuntimeInner {
     tablet_dispatch: Mutex<TabletDispatchState>,
     tablet_wake: Condvar,
     metrics: ApplyRuntimeMetrics,
+    publication_observer: RwLock<Option<Arc<dyn JournalPublicationObserver>>>,
 }
 
 impl JournalApplyRuntimeInner {
@@ -579,13 +607,17 @@ impl JournalApplyRuntimeInner {
 
     fn register_record(
         &self,
-        raw_lsn: u64,
-        durable_batch_lsn: u64,
-        commit_id: Option<u64>,
+        metadata: ApplyRecordMetadata,
         tablet_parts: usize,
         on_published: PublishedHook,
         failure: Option<SharedApplyFailure>,
     ) -> Result<Arc<RecordTicket>> {
+        let ApplyRecordMetadata {
+            raw_lsn,
+            durable_batch_lsn,
+            commit_id,
+            publication_watermarks,
+        } = metadata;
         let mut state = self.state.lock().unwrap();
         if let Some(err) = state.poisoned.clone() {
             return Err(err);
@@ -607,6 +639,7 @@ impl JournalApplyRuntimeInner {
         let ticket = Arc::new(RecordTicket::new(
             lsn,
             commit_id,
+            publication_watermarks,
             tablet_parts as u32,
             on_published,
             failure,
@@ -884,6 +917,23 @@ impl JournalApplyRuntimeInner {
                     published_lsn, err
                 )));
             }
+            if let Some(observer) = self.publication_observer.read().unwrap().as_ref() {
+                if let Err(err) =
+                    observer.record_published(published_lsn, record.publication_watermarks)
+                {
+                    self.fail_record(
+                        &record,
+                        paro_error::internal(format!(
+                            "journal publication observer failed at lsn {}: {}",
+                            published_lsn, err
+                        )),
+                    );
+                    return Err(paro_error::internal(format!(
+                        "journal publication observer failed at lsn {}: {}",
+                        published_lsn, err
+                    )));
+                }
+            }
             record.mark_published();
         }
 
@@ -1049,6 +1099,7 @@ fn advance_publish_frontiers_locked(
 struct RecordTicket {
     lsn: u64,
     commit_id: Option<u64>,
+    publication_watermarks: JournalPublicationWatermarks,
     on_published: Mutex<Option<PublishedHook>>,
     failure: Option<SharedApplyFailure>,
     progress: Mutex<RecordProgress>,
@@ -1067,6 +1118,7 @@ impl RecordTicket {
     fn new(
         lsn: u64,
         commit_id: Option<u64>,
+        publication_watermarks: JournalPublicationWatermarks,
         remaining_tablet_parts: u32,
         on_published: PublishedHook,
         failure: Option<SharedApplyFailure>,
@@ -1074,6 +1126,7 @@ impl RecordTicket {
         Self {
             lsn,
             commit_id,
+            publication_watermarks,
             on_published: Mutex::new(Some(on_published)),
             failure,
             progress: Mutex::new(RecordProgress {
@@ -1426,6 +1479,7 @@ mod tests {
             lsn,
             durable_batch_lsn: lsn,
             commit_id,
+            publication_watermarks: JournalPublicationWatermarks::default(),
             wait_mode,
             catalog_serial: false,
             catalog_pre: Box::new(|| Ok(())),
@@ -1758,6 +1812,7 @@ mod tests {
                     lsn: 1,
                     durable_batch_lsn: 1,
                     commit_id: Some(1),
+                    publication_watermarks: JournalPublicationWatermarks::default(),
                     wait_mode: WaitMode::Published,
                     catalog_serial: false,
                     catalog_pre: Box::new(|| Ok(())),
@@ -1863,6 +1918,7 @@ mod tests {
                     lsn: 1,
                     durable_batch_lsn: 1,
                     commit_id: Some(1),
+                    publication_watermarks: JournalPublicationWatermarks::default(),
                     wait_mode: WaitMode::Applied,
                     catalog_serial: false,
                     catalog_pre: Box::new(|| Ok(())),
@@ -1939,6 +1995,7 @@ mod tests {
                 lsn: 1,
                 durable_batch_lsn: 1,
                 commit_id: Some(1),
+                publication_watermarks: JournalPublicationWatermarks::default(),
                 wait_mode: WaitMode::Published,
                 catalog_serial: false,
                 catalog_pre: Box::new(|| Ok(())),
@@ -1984,6 +2041,7 @@ mod tests {
                     lsn: 1,
                     durable_batch_lsn: 5,
                     commit_id: Some(8),
+                    publication_watermarks: JournalPublicationWatermarks::default(),
                     wait_mode: WaitMode::Published,
                     catalog_serial: false,
                     catalog_pre: Box::new(|| Ok(())),

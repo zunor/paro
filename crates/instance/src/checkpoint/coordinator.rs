@@ -3,10 +3,7 @@
 
 use super::manifest_store::ManifestStore;
 use super::retention::RetentionCoordinator;
-use super::runtime::{
-    frontier_from_summary, ApplyRequest, ExactPrefixTimeout, PublishedPrefixTracker,
-    RecordWatermarks,
-};
+use super::runtime::{frontier_from_summary, ExactPrefixTimeout, PublishedPrefixTracker};
 use super::view::CheckpointView;
 use super::writers::{CatalogWriter, DerivedProgressWriter, RouteRegistryWriter, TabletWriter};
 use crate::config::CheckpointConfigOptions;
@@ -20,7 +17,6 @@ use paro_common::checkpoint::{
     ROUTE_REGISTRY_BUNDLE_FORMAT_VERSION, TABLET_SHARD_BUNDLE_FORMAT_VERSION,
 };
 use paro_common::logging::targets;
-use paro_storage::tablet::{CheckpointMaintenanceTicket, CheckpointPublishObserver};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::thread;
@@ -56,34 +52,6 @@ pub enum CheckpointTriggerReason {
 struct SerializedTabletShardBundle {
     shard_id: u32,
     payload: Vec<u8>,
-}
-
-#[derive(Debug)]
-struct CoordinatorCompactionPublishObserver {
-    published_prefix: Arc<PublishedPrefixTracker>,
-}
-
-impl CheckpointPublishObserver for CoordinatorCompactionPublishObserver {
-    fn begin_compaction_publish(
-        &self,
-        _tablet_id: paro_storage::tablet::TabletId,
-    ) -> CheckpointMaintenanceTicket {
-        let request = self.published_prefix.begin_maintenance_apply();
-        CheckpointMaintenanceTicket {
-            lsn: request.lsn,
-            maintenance_id: request.watermarks.maintenance_id,
-        }
-    }
-
-    fn finish_compaction_publish(&self, ticket: CheckpointMaintenanceTicket) {
-        self.published_prefix.publish_completed(ApplyRequest {
-            lsn: ticket.lsn,
-            watermarks: RecordWatermarks {
-                maintenance_id: ticket.maintenance_id,
-                ..RecordWatermarks::default()
-            },
-        });
-    }
 }
 
 impl Drop for CheckpointInFlightGuard<'_> {
@@ -227,32 +195,8 @@ impl CheckpointCoordinator {
         Arc::clone(&self.published_prefix)
     }
 
-    pub fn compaction_publish_observer(&self) -> Arc<dyn CheckpointPublishObserver> {
-        Arc::new(CoordinatorCompactionPublishObserver {
-            published_prefix: Arc::clone(&self.published_prefix),
-        })
-    }
-
     pub fn bootstrap_runtime(&self, summary: paro_common::checkpoint::RecoverySummary) {
         self.published_prefix.bootstrap(summary);
-    }
-
-    pub fn publish_transaction(
-        &self,
-        commit_id: u64,
-        catalog_commit_id: u64,
-        max_seen_object_id: u64,
-    ) -> (paro_common::checkpoint::RecoverySummary, u64) {
-        let request = self
-            .published_prefix
-            .begin_apply(RecordWatermarks::transaction(
-                commit_id,
-                catalog_commit_id,
-                max_seen_object_id,
-            ));
-        let lsn = request.lsn;
-        let summary = self.published_prefix.publish_completed(request);
-        (summary, lsn)
     }
 
     pub fn try_acquire_in_progress(&self) -> Option<CheckpointInFlightGuard<'_>> {
@@ -477,7 +421,7 @@ impl CheckpointCoordinator {
             durable_lsn = timeout.durable_lsn,
             timeout_ms = drain_timeout.as_millis() as u64,
             reason = "published_prefix_timeout",
-            "Checkpoint drain timed out before exact prefix became available"
+            "Checkpoint drain timed out before exact journal prefix became available"
         );
         anyhow::anyhow!(
             "checkpoint drain timed out waiting for published prefix {} (published={}, durable={})",

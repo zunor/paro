@@ -141,17 +141,6 @@ impl std::fmt::Debug for TabletSnapshotMaterialization {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct CheckpointMaintenanceTicket {
-    pub lsn: u64,
-    pub maintenance_id: u64,
-}
-
-pub trait CheckpointPublishObserver: Send + Sync + std::fmt::Debug {
-    fn begin_compaction_publish(&self, tablet_id: TabletId) -> CheckpointMaintenanceTicket;
-    fn finish_compaction_publish(&self, ticket: CheckpointMaintenanceTicket);
-}
-
 #[derive(Debug)]
 pub(crate) struct PreparedSearchGenerationHeadUpdate {
     head: SearchGenerationHeadMeta,
@@ -588,7 +577,6 @@ pub struct Tablet {
     checkpoint_capture_epoch: AtomicU64,
 
     /// Bound checkpoint observer for compaction publish sequencing.
-    checkpoint_publish_observer: RwLock<Option<Arc<dyn CheckpointPublishObserver>>>,
 
     /// Best-effort observer for derived-state refresh after rowset publish.
     rowset_publish_observer: RwLock<Option<std::sync::Weak<dyn RowsetPublishObserver>>>,
@@ -723,7 +711,6 @@ impl Tablet {
             rssid_manager,
             meta_lock: RwLock::new(()),
             checkpoint_capture_epoch: AtomicU64::new(0),
-            checkpoint_publish_observer: RwLock::new(None),
             rowset_publish_observer: RwLock::new(None),
             rowset_maintenance_ids: RwLock::new(HashMap::new()),
             applied_mutations: RwLock::new(applied_mutations),
@@ -883,10 +870,6 @@ impl Tablet {
 
     pub fn journal_apply_runtime(&self) -> Option<Arc<JournalApplyRuntime>> {
         self.journal_apply_runtime.read().unwrap().clone()
-    }
-
-    pub fn bind_checkpoint_publish_observer(&self, observer: Arc<dyn CheckpointPublishObserver>) {
-        *self.checkpoint_publish_observer.write().unwrap() = Some(observer);
     }
 
     pub(crate) fn bind_rowset_publish_observer(
@@ -1109,20 +1092,6 @@ impl Tablet {
             .and_then(std::sync::Weak::upgrade)
             .map(|observer| observer.search_inline_builders_for_compaction(self.tablet_id()))
             .unwrap_or_default()
-    }
-
-    pub fn begin_checkpoint_compaction_publish(&self) -> Option<CheckpointMaintenanceTicket> {
-        self.checkpoint_publish_observer
-            .read()
-            .unwrap()
-            .as_ref()
-            .map(|observer| observer.begin_compaction_publish(self.tablet_id()))
-    }
-
-    pub fn finish_checkpoint_compaction_publish(&self, ticket: CheckpointMaintenanceTicket) {
-        if let Some(observer) = self.checkpoint_publish_observer.read().unwrap().as_ref() {
-            observer.finish_compaction_publish(ticket);
-        }
     }
 
     pub fn rowsets_dir(&self) -> PathBuf {
@@ -3802,22 +3771,7 @@ impl Tablet {
         };
 
         output.make_visible()?;
-        let checkpoint_ticket = self
-            .begin_checkpoint_compaction_publish()
-            .map(|mut ticket| {
-                if maintenance_id != 0 {
-                    ticket.maintenance_id = maintenance_id;
-                }
-                ticket
-            });
-        let output_maintenance_id = if maintenance_id != 0 {
-            maintenance_id
-        } else {
-            checkpoint_ticket
-                .as_ref()
-                .map(|ticket| ticket.maintenance_id)
-                .unwrap_or(0)
-        };
+        let output_maintenance_id = maintenance_id;
         self.with_meta_lock("apply compaction publish", || {
             self.install_compaction_publish_locked(
                 &live_inputs,
@@ -3844,9 +3798,6 @@ impl Tablet {
             }
             Ok(())
         })?;
-        if let Some(ticket) = checkpoint_ticket {
-            self.finish_checkpoint_compaction_publish(ticket);
-        }
         self.save_meta()?;
         let primary_key_without_ephemeral_delta = pk_delta.is_none()
             && self

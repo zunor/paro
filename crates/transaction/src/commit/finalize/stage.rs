@@ -614,6 +614,8 @@ mod tests {
                         lsn: handle.durable_lsn(),
                         durable_batch_lsn: handle.durable_batch_lsn(),
                         commit_id: Some(handle.commit_ts().into_raw()),
+                        publication_watermarks:
+                            paro_common::journal::JournalPublicationWatermarks::default(),
                         wait_mode: WaitMode::Published,
                         catalog_serial: false,
                         catalog_pre: Box::new(|| Ok(())),
@@ -698,6 +700,8 @@ mod tests {
                                 lsn: handle.durable_lsn(),
                                 durable_batch_lsn: handle.durable_batch_lsn(),
                                 commit_id: Some(handle.commit_ts().into_raw()),
+                                publication_watermarks:
+                                    paro_common::journal::JournalPublicationWatermarks::default(),
                                 wait_mode: WaitMode::Published,
                                 catalog_serial: false,
                                 catalog_pre: Box::new(|| Ok(())),

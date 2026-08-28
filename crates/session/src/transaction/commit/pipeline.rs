@@ -420,7 +420,7 @@ impl<'a> CommitPipeline<'a> {
         }
         let catalog_post_request = request.clone();
         let publish_database = Arc::clone(&database);
-        let catalog_post = Box::new(move |commit_id| {
+        let catalog_post = Box::new(move |commit_id, journal_lsn| {
             let committed_record =
                 catalog_post_request.committed_record(paro_transaction::CommitTs::new(commit_id));
             if let Some((catalog_descriptor, catalog_applier)) = catalog_publish {
@@ -429,12 +429,6 @@ impl<'a> CommitPipeline<'a> {
             for task in index_publish_tasks {
                 task.execute(commit_id)?;
             }
-            let catalog_commit_id = if has_catalog_publish { commit_id } else { 0 };
-            let (_summary, journal_lsn) = publish_database.publish_checkpoint_transaction(
-                commit_id,
-                catalog_commit_id,
-                max_seen_catalog_object_id,
-            );
             if let Some(wal) = publish_database.wal() {
                 if let Err(error) = wal.note_flushed_lsn(journal_lsn) {
                     tracing::warn!(
@@ -463,6 +457,8 @@ impl<'a> CommitPipeline<'a> {
             participants: publish_participants,
             apply_targets: Arc::<[ApplyTargetDescriptor]>::from([]),
             catalog_serial,
+            has_catalog_publish,
+            max_seen_object_id: max_seen_catalog_object_id,
             catalog_pre: Box::new(|| Ok(())),
             on_commit_id_assigned: Box::new(move |commit_id| {
                 publish_commit_id.store(commit_id, Ordering::Release);

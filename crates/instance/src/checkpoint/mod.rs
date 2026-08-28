@@ -19,7 +19,6 @@ pub use coordinator::{CheckpointCoordinator, CheckpointExecutionContext};
 pub use recovery::CheckpointRecovery;
 pub use retention::RetentionCoordinator;
 pub use runtime::{
-    frontier_from_summary, ApplyRequest, ExactPrefixTimeout, PublishedPrefixTracker,
-    RecordWatermarks,
+    frontier_from_summary, ExactPrefixTimeout, PublishedPrefixTracker, RecordWatermarks,
 };
 pub use view::{CheckpointCut, CheckpointView};

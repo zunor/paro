@@ -4,6 +4,7 @@
 //! Recovery commit publish-plan construction.
 
 use paro_common::error::Result;
+use paro_common::journal::JournalPublicationWatermarks;
 use paro_journal::{ApplyRequest, TabletApplyPart, WaitMode};
 use paro_transaction::{ApplyTargetSet, CommitFrontier, RequiredPublishPlan};
 use std::sync::Arc;
@@ -14,6 +15,7 @@ pub struct RecoveryPublishPlanInput {
     pub frontier: Arc<CommitFrontier>,
     pub apply_targets: ApplyTargetSet,
     pub catalog_serial: bool,
+    pub publication_watermarks: JournalPublicationWatermarks,
     pub catalog_pre: ApplyWork,
     pub tablet_parts: Vec<TabletApplyPart>,
     pub descriptor_phase: ApplyWork,
@@ -27,6 +29,7 @@ pub fn build_recovery_required_publish_plan(
         frontier,
         apply_targets,
         catalog_serial,
+        publication_watermarks,
         catalog_pre,
         tablet_parts,
         descriptor_phase,
@@ -40,6 +43,7 @@ pub fn build_recovery_required_publish_plan(
                 lsn: handle.durable_lsn(),
                 durable_batch_lsn: handle.durable_batch_lsn(),
                 commit_id: Some(handle.commit_ts().into_raw()),
+                publication_watermarks,
                 wait_mode: WaitMode::Published,
                 catalog_serial,
                 catalog_pre,

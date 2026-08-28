@@ -840,6 +840,9 @@ impl DatabaseHandle {
         let runtime = self.journal_apply_runtime();
         if let Some(coordinator) = self.journal_coordinator.lock().as_ref().cloned() {
             coordinator.bind_apply_runtime(runtime);
+            let observer: Arc<dyn paro_journal::JournalPublicationObserver> =
+                self.checkpoint_coordinator.published_prefix();
+            coordinator.bind_publication_observer(observer);
             return coordinator;
         }
 
@@ -852,6 +855,9 @@ impl DatabaseHandle {
         });
         let coordinator = Arc::new(JournalCoordinator::new(appender));
         coordinator.bind_apply_runtime(runtime);
+        let observer: Arc<dyn paro_journal::JournalPublicationObserver> =
+            self.checkpoint_coordinator.published_prefix();
+        coordinator.bind_publication_observer(observer);
         let mut guard = self.journal_coordinator.lock();
         if let Some(existing) = guard.as_ref().cloned() {
             existing.bind_apply_runtime(self.journal_apply_runtime());
@@ -1214,19 +1220,16 @@ impl DatabaseHandle {
         *self.journal_coordinator.lock() = None;
         *self.commit_runtime.lock() = None;
         self.bind_tablet_runtime_services();
+        let observer: Arc<dyn paro_journal::JournalPublicationObserver> =
+            self.checkpoint_coordinator.published_prefix();
+        self.journal_apply_runtime()
+            .bind_publication_observer(observer);
     }
 
-    pub fn publish_checkpoint_transaction(
-        &self,
-        commit_id: u64,
-        catalog_commit_id: u64,
-        max_seen_object_id: u64,
-    ) -> (RecoverySummary, u64) {
-        self.checkpoint_coordinator.publish_transaction(
-            commit_id,
-            catalog_commit_id,
-            max_seen_object_id,
-        )
+    pub fn checkpoint_published_summary(&self) -> RecoverySummary {
+        self.checkpoint_coordinator
+            .published_prefix()
+            .published_summary()
     }
 
     fn ensure_checkpoint_background_runner(self: &Arc<Self>) {
@@ -1648,9 +1651,6 @@ impl DatabaseHandle {
     /// from silently missing search maintenance and durability services merely
     /// because they did not exist during the database-wide binding scan.
     pub fn bind_table_runtime_services(&self, storage: &TableHandle) {
-        storage.tablet().bind_checkpoint_publish_observer(
-            self.checkpoint_coordinator.compaction_publish_observer(),
-        );
         storage.bind_journal_coordinator(Some(self.journal_coordinator()));
         storage.bind_journal_apply_runtime(Some(self.journal_apply_runtime()));
         storage.bind_search_task_scheduler(self.task_scheduler.read().clone());

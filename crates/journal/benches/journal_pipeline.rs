@@ -216,6 +216,8 @@ fn run_apply_executor_round(tablet_count: usize) -> u64 {
                     lsn: idx as u64 + 1,
                     durable_batch_lsn: idx as u64 + 1,
                     commit_id: Some(idx as u64 + 1),
+                    publication_watermarks:
+                        paro_common::journal::JournalPublicationWatermarks::default(),
                     wait_mode: WaitMode::Published,
                     catalog_serial: false,
                     catalog_pre: Box::new(|| Ok(())),
