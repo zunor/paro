@@ -4,6 +4,7 @@
 use std::sync::Arc;
 
 use crate::index::PredicateTree;
+use crate::rowset::column::ColumnBatch;
 use crate::rowset::SegmentRowId;
 use crate::search::cursor::{
     PhysicalRowRef as SearchPhysicalRowRef, SearchReadSnapshot, VisibleSegment,
@@ -94,28 +95,22 @@ pub(crate) fn resolve_logical_rows_with_allocator(
 /// column and row ids are already in strict segment order. Search prepares
 /// those ids from an exact MVCC/predicate proof. Partial-update segments and
 /// arbitrary row order return `None` and retain the logical resolver path.
-pub(crate) fn resolve_segment_rows_direct(
+pub(crate) fn read_segment_column_batch_direct(
     segment: &VisibleSegment,
     row_ids: &[u32],
     column_id: ColumnId,
-    allocator: Arc<dyn Allocator>,
-) -> Result<Option<Chunk>> {
+) -> Result<Option<ColumnBatch>> {
     if row_ids.is_empty()
         || row_ids.windows(2).any(|rows| rows[0] >= rows[1])
         || segment.segment.get_column_meta(column_id).is_none()
     {
         return Ok(None);
     }
-    let logical_type = segment
-        .segment
-        .schema()
-        .column_by_id(column_id)
-        .map(|column| &column.logical_type)
-        .ok_or_else(|| {
-            paro_common::error::column_not_found(format!(
-                "column {column_id} not found in exact tail segment schema"
-            ))
-        })?;
+    if segment.segment.schema().column_by_id(column_id).is_none() {
+        return Err(paro_common::error::column_not_found(format!(
+            "column {column_id} not found in exact tail segment schema"
+        )));
+    }
     let mut batches = segment.segment.read_by_rowids(&[column_id], row_ids)?;
     if batches.len() != 1 || batches[0].0 != column_id {
         return Err(paro_common::error::data_corrupted(
@@ -123,17 +118,7 @@ pub(crate) fn resolve_segment_rows_direct(
         ));
     }
     let (_, batch) = batches.pop().expect("one exact tail column batch");
-    let decoded = crate::codec::vector_decoder::decode_sparse_column_batch(
-        logical_type,
-        &batch,
-        row_ids.len(),
-        allocator.clone(),
-    )?;
-    Ok(Some(Chunk::try_from_arc_vectors_with_cardinality(
-        vec![Arc::new(decoded)],
-        row_ids.len(),
-        allocator,
-    )?))
+    Ok(Some(batch))
 }
 
 #[inline]

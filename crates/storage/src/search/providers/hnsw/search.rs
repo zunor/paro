@@ -34,7 +34,7 @@ use crate::search::sidecar::{
 };
 use crate::search::tail::exact_merge::{ensure_tail_exact_merge_budget, TailExactMergeQueryShape};
 use crate::search::tail_merge::{
-    resolve_logical_rows_with_allocator, resolve_segment_rows_direct, visible_row_ids,
+    read_segment_column_batch_direct, resolve_logical_rows_with_allocator, visible_row_ids,
 };
 use crate::search::telemetry::{
     GenerationTelemetryEvent, NoopSearchTelemetryCollector, QueryTelemetryEvent,
@@ -501,6 +501,206 @@ impl VectorSearchCursor {
         Ok(collector.into_sorted_rows())
     }
 
+    fn score_exact_tail_storage_batch(
+        &self,
+        batch: &crate::rowset::column::ColumnBatch,
+        visible_segment: &VisibleSegment,
+        row_ids: &[u32],
+        budget: &ResourceBudget,
+    ) -> Result<Vec<RankedRow>> {
+        budget.work.check_and_consume(row_ids.len())?;
+        let logical_type = visible_segment
+            .segment
+            .schema()
+            .column_by_id(self.storage_col_id)
+            .map(|column| &column.logical_type)
+            .ok_or_else(|| {
+                paro_error::column_not_found(format!(
+                    "column {} not found in exact tail segment schema",
+                    self.storage_col_id
+                ))
+            })?;
+        let vectors = crate::codec::vector_decoder::FloatArrayBatchView::try_new(
+            logical_type,
+            batch,
+            row_ids.len(),
+        )?;
+        if vectors.rows() != row_ids.len() || vectors.dimension() != self.vector_dim {
+            return Err(paro_error::data_corrupted(
+                "stored HNSW tail batch does not match its vector dimension",
+            ));
+        }
+
+        let mut collector = TopKCollector::new(self.k);
+        if vectors.all_valid() {
+            let mut scores = vec![0.0; row_ids.len()];
+            self.distance.similarity_unindexed_batch_contiguous(
+                self.prepared_query.as_slice(),
+                vectors.values(),
+                self.vector_dim,
+                &mut scores,
+            );
+            for (&row_id, score) in row_ids.iter().zip(scores) {
+                collector.push(RankedRow::new(
+                    PhysicalRowRef::new(
+                        visible_segment.rowset_id,
+                        visible_segment.segment_id,
+                        crate::rowset::SegmentRowId::from_raw(row_id),
+                    ),
+                    score,
+                ));
+            }
+            return Ok(collector.into_sorted_rows());
+        }
+
+        for (offset, &row_id) in row_ids.iter().enumerate() {
+            if !vectors.is_valid(offset) {
+                continue;
+            }
+            let start = offset.saturating_mul(self.vector_dim);
+            let values = vectors
+                .values()
+                .get(start..start + self.vector_dim)
+                .ok_or_else(|| {
+                    paro_error::data_corrupted("stored HNSW tail vector is out of bounds")
+                })?;
+            collector.push(RankedRow::new(
+                PhysicalRowRef::new(
+                    visible_segment.rowset_id,
+                    visible_segment.segment_id,
+                    crate::rowset::SegmentRowId::from_raw(row_id),
+                ),
+                self.distance
+                    .similarity_unindexed(self.prepared_query.as_slice(), values),
+            ));
+        }
+        Ok(collector.into_sorted_rows())
+    }
+
+    /// Score one complete immutable segment a physical page at a time.
+    ///
+    /// The storage reader owns plain/mmap pages and any decoded page-cache
+    /// entries. Borrowing those pages here avoids copying the same vectors
+    /// into a query batch on every exact-tail query. Sparse predicates and
+    /// delete masks deliberately do not enter this path: their ordered gather
+    /// remains proportional to the accepted row set rather than to the span
+    /// between matches.
+    fn score_dense_exact_tail_pages(
+        &self,
+        visible_segment: &VisibleSegment,
+        row_ids: &[u32],
+        budget: &ResourceBudget,
+    ) -> Result<Option<Vec<RankedRow>>> {
+        if u64::try_from(row_ids.len()).ok() != Some(visible_segment.segment.num_rows())
+            || row_ids
+                .iter()
+                .enumerate()
+                .any(|(ordinal, row_id)| *row_id as usize != ordinal)
+            || visible_segment
+                .segment
+                .get_column_meta(self.storage_col_id)
+                .is_none()
+        {
+            return Ok(None);
+        }
+        let logical_type = visible_segment
+            .segment
+            .schema()
+            .column_by_id(self.storage_col_id)
+            .map(|column| &column.logical_type)
+            .ok_or_else(|| {
+                paro_error::column_not_found(format!(
+                    "column {} not found in exact tail segment schema",
+                    self.storage_col_id
+                ))
+            })?;
+        let mut iterator = visible_segment
+            .segment
+            .new_column_iterator(self.storage_col_id)?;
+        let row_id_bytes = row_ids
+            .len()
+            .checked_mul(std::mem::size_of::<u32>())
+            .ok_or_else(|| paro_error::out_of_range("tail row-id memory overflow"))?;
+        let _row_id_reservation = budget.try_reserve_memory(row_id_bytes)?;
+        let mut collector = TopKCollector::new(self.k);
+        let mut row_base = 0usize;
+        loop {
+            let (rows, batch) = iterator.next_physical_page_batch()?;
+            if rows == 0 {
+                break;
+            }
+            budget.work.check_and_consume(rows)?;
+            let vectors = crate::codec::vector_decoder::FloatArrayBatchView::try_new(
+                logical_type,
+                &batch,
+                rows,
+            )?;
+            if vectors.dimension() != self.vector_dim {
+                return Err(paro_error::data_corrupted(
+                    "stored HNSW tail page does not match its vector dimension",
+                ));
+            }
+            let batch_working_bytes = rows
+                .checked_mul(std::mem::size_of::<crate::index::hnsw::ScoreType>())
+                .and_then(|scores| scores.checked_add(vectors.owned_bytes()))
+                .ok_or_else(|| paro_error::out_of_range("tail page memory overflow"))?;
+            let _batch_reservation = budget.try_reserve_memory(batch_working_bytes)?;
+            if vectors.all_valid() {
+                let mut scores = vec![0.0; rows];
+                self.distance.similarity_unindexed_batch_contiguous(
+                    self.prepared_query.as_slice(),
+                    vectors.values(),
+                    self.vector_dim,
+                    &mut scores,
+                );
+                for (offset, score) in scores.into_iter().enumerate() {
+                    collector.push(RankedRow::new(
+                        PhysicalRowRef::new(
+                            visible_segment.rowset_id,
+                            visible_segment.segment_id,
+                            crate::rowset::SegmentRowId::from_raw(row_ids[row_base + offset]),
+                        ),
+                        score,
+                    ));
+                }
+            } else {
+                for offset in 0..rows {
+                    if !vectors.is_valid(offset) {
+                        continue;
+                    }
+                    let start = offset.saturating_mul(self.vector_dim);
+                    let values = vectors
+                        .values()
+                        .get(start..start + self.vector_dim)
+                        .ok_or_else(|| {
+                            paro_error::data_corrupted(
+                                "stored HNSW tail page vector is out of bounds",
+                            )
+                        })?;
+                    collector.push(RankedRow::new(
+                        PhysicalRowRef::new(
+                            visible_segment.rowset_id,
+                            visible_segment.segment_id,
+                            crate::rowset::SegmentRowId::from_raw(row_ids[row_base + offset]),
+                        ),
+                        self.distance
+                            .similarity_unindexed(self.prepared_query.as_slice(), values),
+                    ));
+                }
+            }
+            row_base = row_base
+                .checked_add(rows)
+                .ok_or_else(|| paro_error::data_corrupted("tail page row count overflow"))?;
+        }
+        if row_base != row_ids.len() {
+            return Err(paro_error::data_corrupted(format!(
+                "tail page scan returned {row_base} rows for {} visible rows",
+                row_ids.len()
+            )));
+        }
+        Ok(Some(collector.into_sorted_rows()))
+    }
+
     fn dispatch_segment_search(
         &self,
         segment: &VisibleSegment,
@@ -810,6 +1010,9 @@ impl VectorSearchCursor {
         if row_ids.is_empty() {
             return Ok((Vec::new(), true));
         }
+        if let Some(rows) = self.score_dense_exact_tail_pages(visible_segment, &row_ids, budget)? {
+            return Ok((rows, true));
+        }
         let retained_per_row = self
             .vector_dim
             .saturating_mul(std::mem::size_of::<f32>())
@@ -819,22 +1022,22 @@ impl VectorSearchCursor {
             .checked_mul(retained_per_row)
             .ok_or_else(|| paro_error::out_of_range("exact tail working set overflow"))?;
         let _tail_reservation = budget.try_reserve_memory(retained_bytes)?;
-        let resolved = match resolve_segment_rows_direct(
+        if let Some(batch) =
+            read_segment_column_batch_direct(visible_segment, &row_ids, self.storage_col_id)?
+        {
+            return Ok((
+                self.score_exact_tail_storage_batch(&batch, visible_segment, &row_ids, budget)?,
+                true,
+            ));
+        }
+        let resolved = resolve_logical_rows_with_allocator(
+            &self.tablet,
+            &self.snapshot,
             visible_segment,
             &row_ids,
             self.storage_col_id,
             Arc::clone(&budget.materialization_allocator),
-        )? {
-            Some(resolved) => resolved,
-            None => resolve_logical_rows_with_allocator(
-                &self.tablet,
-                &self.snapshot,
-                visible_segment,
-                &row_ids,
-                self.storage_col_id,
-                Arc::clone(&budget.materialization_allocator),
-            )?,
-        };
+        )?;
         let physical_rows = row_ids
             .iter()
             .copied()
