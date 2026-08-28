@@ -427,7 +427,11 @@ impl LockRequest {
 #[derive(Debug, Clone, Copy)]
 pub struct ShardedLockManagerOptions {
     pub shard_count: usize,
-    pub lock_escalation_threshold: usize,
+    /// Number of physical row-id locks on one tablet which may be replaced by
+    /// a tablet lock. Exact primary-key locks deliberately never escalate:
+    /// replacing a large disjoint key set with one tablet X lock serializes
+    /// concurrent COPY/INSERT batches which cannot conflict.
+    pub row_id_escalation_threshold: usize,
     pub lock_escalation_failure_action: LockEscalationFailureAction,
 }
 
@@ -435,7 +439,7 @@ impl Default for ShardedLockManagerOptions {
     fn default() -> Self {
         Self {
             shard_count: 64,
-            lock_escalation_threshold: 1024,
+            row_id_escalation_threshold: 1024,
             lock_escalation_failure_action: LockEscalationFailureAction::KeepFineGrained,
         }
     }
@@ -620,7 +624,7 @@ impl ShardedLockManager {
                 lock_wound_wait_abort_count: AtomicU64::new(0),
                 lock_deadlock_abort_count: AtomicU64::new(0),
                 escalation_policy: LockEscalationPolicy {
-                    threshold: options.lock_escalation_threshold,
+                    threshold: options.row_id_escalation_threshold,
                     failure_action: options.lock_escalation_failure_action,
                 },
             }),
@@ -715,7 +719,7 @@ impl ShardedLockManager {
         }
     }
 
-    pub fn lock_escalation_threshold(&self) -> usize {
+    pub fn row_id_escalation_threshold(&self) -> usize {
         self.inner.escalation_policy.threshold
     }
 
@@ -966,7 +970,7 @@ impl ShardedLockManagerInner {
 
         let mut counts: HashMap<(LockNamespace, TableId, u64), usize> = HashMap::new();
         for lock in &lock_set.locks {
-            if let Some(identity) = fine_tablet_identity(&lock.resource) {
+            if let Some(identity) = row_id_escalation_identity(&lock.resource) {
                 *counts.entry(identity).or_default() += 1;
             }
         }
@@ -1017,6 +1021,22 @@ fn fine_tablet_identity(resource: &LockResource) -> Option<(LockNamespace, Table
             ..
         }
         | LockResource::RowId {
+            namespace,
+            table_id,
+            tablet_id,
+            ..
+        } => Some((*namespace, *table_id, *tablet_id)),
+        _ => None,
+    }
+}
+
+/// Only physical row identities have a sound coarse replacement. A tablet X
+/// lock preserves delete/update exclusion for a large row-id set. Primary-key
+/// sets are different: their exact disjointness is the concurrency contract,
+/// so widening one batch to the whole tablet is not an optimization.
+fn row_id_escalation_identity(resource: &LockResource) -> Option<(LockNamespace, TableId, u64)> {
+    match resource {
+        LockResource::RowId {
             namespace,
             table_id,
             tablet_id,
@@ -1509,13 +1529,13 @@ mod tests {
     }
 
     #[test]
-    fn fine_grained_locks_escalate_to_tablet_lock() {
+    fn row_id_locks_escalate_without_widening_primary_key_batches() {
         let manager = ShardedLockManager::new(ShardedLockManagerOptions {
             shard_count: 4,
-            lock_escalation_threshold: 2,
+            row_id_escalation_threshold: 2,
             ..ShardedLockManagerOptions::default()
         });
-        let locks = manager
+        let first_key_batch = manager
             .lock_many(
                 TxnId::new(10),
                 [
@@ -1524,13 +1544,38 @@ mod tests {
                 ],
             )
             .unwrap();
+        assert!(!first_key_batch
+            .locks
+            .iter()
+            .any(|lock| matches!(lock.resource, LockResource::Tablet { .. })));
+        let _disjoint_key_batch = manager
+            .lock_many(
+                TxnId::new(11),
+                [
+                    LockRequest::new(pk(3), LockMode::X),
+                    LockRequest::new(pk(4), LockMode::X),
+                ],
+            )
+            .unwrap();
+        drop(_disjoint_key_batch);
+        drop(first_key_batch);
 
-        assert!(locks
+        let row = |offset| LockResource::row_id(ns(), TableId::new(10), 20, 30, 0, offset);
+        let row_locks = manager
+            .lock_many(
+                TxnId::new(12),
+                [
+                    LockRequest::new(row(1), LockMode::X),
+                    LockRequest::new(row(2), LockMode::X),
+                ],
+            )
+            .unwrap();
+        assert!(row_locks
             .locks
             .iter()
             .any(|lock| matches!(lock.resource, LockResource::Tablet { .. })));
         let err = manager
-            .lock_one(TxnId::new(11), pk(3), LockMode::X)
+            .lock_one(TxnId::new(13), row(3), LockMode::X)
             .unwrap_err();
         assert!(matches!(err, LockAcquireError::WouldWait { .. }));
     }
