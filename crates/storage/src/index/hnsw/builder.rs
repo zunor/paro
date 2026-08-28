@@ -343,19 +343,30 @@ impl GraphLayersBuilder {
         let mut current_point = entry_point.point_id;
         let mut current_score = Self::score_indexed(storage, distance, point_id, current_point);
         let mut current_level = entry_point.level;
+        let mut neighbor_buffer = Vec::with_capacity(self.hnsw_m.m0);
 
         while current_level > target_level {
             let mut changed = true;
             while changed {
                 changed = false;
+                neighbor_buffer.clear();
                 self.for_each_link(current_point, current_level, |neighbor| {
+                    neighbor_buffer.push(neighbor);
+                });
+                // Release the adjacency read guard before touching random
+                // vector pages. Prefetch the whole bounded neighbor row first
+                // so distance scoring can overlap independent cache misses.
+                for &neighbor in &neighbor_buffer {
+                    storage.prefetch_construction_point(neighbor);
+                }
+                for &neighbor in &neighbor_buffer {
                     let neighbor_score = Self::score_indexed(storage, distance, point_id, neighbor);
                     if neighbor_score > current_score {
                         current_score = neighbor_score;
                         current_point = neighbor;
                         changed = true;
                     }
-                });
+                }
             }
             current_level -= 1;
         }
@@ -577,6 +588,7 @@ impl GraphLayersBuilder {
         visited: &mut BuildVisitedListHandle<'_>,
     ) -> Vec<ScoredPoint> {
         let mut search_context = SearchContext::new(entry_points[0], ef);
+        let mut neighbors = Vec::with_capacity(self.hnsw_m.get_m(level));
 
         visited.check_and_update_visited(entry_points[0].idx);
         for ep in entry_points.iter().skip(1) {
@@ -590,15 +602,22 @@ impl GraphLayersBuilder {
                 break;
             }
 
+            neighbors.clear();
             self.for_each_link(candidate.idx, level, |neighbor| {
                 if !visited.check_and_update_visited(neighbor) {
-                    let score = Self::score_indexed(storage, distance, query_point, neighbor);
-                    search_context.process_candidate(ScoredPoint {
-                        idx: neighbor,
-                        score,
-                    });
+                    neighbors.push(neighbor);
                 }
             });
+            for &neighbor in &neighbors {
+                storage.prefetch_construction_point(neighbor);
+            }
+            for &neighbor in &neighbors {
+                let score = Self::score_indexed(storage, distance, query_point, neighbor);
+                search_context.process_candidate(ScoredPoint {
+                    idx: neighbor,
+                    score,
+                });
+            }
         }
 
         search_context.nearest.into_sorted_vec()

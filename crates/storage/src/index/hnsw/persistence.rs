@@ -1208,26 +1208,53 @@ impl HnswIndex {
                 let proposals = if let Some(pool) = pool {
                     let positions = (wave_start..wave_end).collect::<Vec<_>>();
                     let wave_parallelism = hnsw_current_build_parallelism(parallelism);
-                    let chunk_size = positions.len().div_ceil(wave_parallelism).max(1);
-                    pool.install(|| {
-                        positions
-                            .par_chunks(chunk_size)
-                            .map(|chunk| {
-                                chunk
-                                    .iter()
-                                    .map(|&position| {
-                                        builder.propose_new_point(
-                                            point_order.point_at(position),
-                                            &entry_points,
-                                            storage.as_ref(),
-                                            distance,
-                                        )
-                                    })
-                                    .collect::<Result<Vec<_>>>()
-                            })
-                            .collect::<Result<Vec<Vec<_>>>>()
-                            .map(|chunks| chunks.into_iter().flatten().collect())
-                    })
+                    if wave_parallelism >= pool.current_num_threads() {
+                        // A proposal's cost varies with its assigned level and
+                        // graph path. Static one-chunk-per-worker partitioning
+                        // leaves early finishers idle at every wave barrier.
+                        // Indexed parallel collection preserves position order
+                        // while allowing Rayon to steal individual proposals;
+                        // the subsequent publish phase still sorts by point id,
+                        // so execution width cannot affect durable topology.
+                        pool.install(|| {
+                            positions
+                                .par_iter()
+                                .map(|&position| {
+                                    builder.propose_new_point(
+                                        point_order.point_at(position),
+                                        &entry_points,
+                                        storage.as_ref(),
+                                        distance,
+                                    )
+                                })
+                                .collect::<Result<Vec<_>>>()
+                        })
+                    } else {
+                        // A maintenance grant may deliberately be narrower
+                        // than the process pool. Keep exactly one lane per
+                        // granted worker so background work cannot borrow the
+                        // foreground reserve.
+                        let chunk_size = positions.len().div_ceil(wave_parallelism).max(1);
+                        pool.install(|| {
+                            positions
+                                .par_chunks(chunk_size)
+                                .map(|chunk| {
+                                    chunk
+                                        .iter()
+                                        .map(|&position| {
+                                            builder.propose_new_point(
+                                                point_order.point_at(position),
+                                                &entry_points,
+                                                storage.as_ref(),
+                                                distance,
+                                            )
+                                        })
+                                        .collect::<Result<Vec<_>>>()
+                                })
+                                .collect::<Result<Vec<Vec<_>>>>()
+                                .map(|chunks| chunks.into_iter().flatten().collect())
+                        })
+                    }
                 } else {
                     (wave_start..wave_end)
                         .map(|position| {

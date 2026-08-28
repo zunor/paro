@@ -192,6 +192,18 @@ pub trait VectorStorage: Send + Sync {
         None
     }
 
+    /// Hint that a construction-time point will be scored shortly.
+    ///
+    /// Build wrappers own the physical routing representation, so the
+    /// prefetch boundary belongs here rather than in the graph builder. Exact
+    /// builds fetch the canonical f32 row; compact builds override this to
+    /// fetch their encoded routing row. The hint has no semantic effect and
+    /// callers still score points in durable link order.
+    #[inline]
+    fn prefetch_construction_point(&self, idx: PointOffset) {
+        paro_common::distance::prefetch_vector_read(self.get_vector(idx));
+    }
+
     /// Score two stored points for durable graph construction.
     ///
     /// The default is the canonical f32 metric. Build-only wrappers may
@@ -222,6 +234,136 @@ pub trait VectorStorage: Send + Sync {
 
 const I16_BUILD_ALIGNMENT: usize = 16;
 const MAX_OWNED_I16_BUILD_BYTES: usize = 64 * 1024 * 1024;
+
+/// Build-only contiguous image for exact f32 construction.
+///
+/// Generation builds commonly read many immutable segment mappings through a
+/// [`PartitionedVectorStorage`]. Resolving that partition on every graph score
+/// puts storage indirection in the multi-billion-call distance loop and also
+/// prevents indexed batch kernels from seeing one row-major matrix. Materialize
+/// the canonical values once into a private, file-backed staging mapping. The
+/// base storage remains retained for metric metadata, while graph construction
+/// and later artifact serialization consume this exact bitwise image.
+struct ExactF32BuildVectorStorage {
+    base: Arc<dyn VectorStorage>,
+    vectors: Mmap,
+    dimension: usize,
+    count: usize,
+}
+
+impl ExactF32BuildVectorStorage {
+    fn prepare(
+        base: Arc<dyn VectorStorage>,
+        workspace_dir: Option<&Path>,
+    ) -> Result<Arc<dyn VectorStorage>> {
+        if base.contiguous_vectors().is_some() {
+            return Ok(base);
+        }
+        let Some(workspace_dir) = workspace_dir else {
+            // Low-level and bounded inline callers may deliberately operate
+            // without a staging directory. They retain the correct partitioned
+            // path; production sidecar generations always provide one.
+            return Ok(base);
+        };
+        let dimension = base.vector_dim();
+        let count = base.num_vectors();
+        let value_count = count.checked_mul(dimension).ok_or_else(|| {
+            paro_common::error::out_of_range("HNSW exact-f32 build workspace shape overflow")
+        })?;
+        let byte_len = value_count
+            .checked_mul(std::mem::size_of::<f32>())
+            .ok_or_else(|| {
+                paro_common::error::out_of_range("HNSW exact-f32 build workspace byte overflow")
+            })?;
+        if byte_len == 0 {
+            return Err(paro_common::error::invalid_input(
+                "HNSW exact-f32 build workspace must not be empty",
+            ));
+        }
+
+        std::fs::create_dir_all(workspace_dir)?;
+        let file = tempfile::tempfile_in(workspace_dir)?;
+        file.set_len(u64::try_from(byte_len).map_err(|_| {
+            paro_common::error::out_of_range("HNSW exact-f32 build workspace exceeds u64")
+        })?)?;
+        // SAFETY: the private temporary file has the exact validated length
+        // and is never concurrently resized or mapped by another writer.
+        let mut mmap = unsafe { MmapMut::map_mut(&file)? };
+        if (mmap.as_ptr() as usize) % std::mem::align_of::<f32>() != 0 {
+            return Err(paro_common::error::internal(
+                "HNSW exact-f32 build workspace is not f32-aligned",
+            ));
+        }
+        // SAFETY: mmap alignment was checked above, its length is exactly
+        // `value_count * size_of::<f32>()`, and this mutable slice is confined
+        // to the preparation phase before the mapping becomes read-only.
+        let output =
+            unsafe { std::slice::from_raw_parts_mut(mmap.as_mut_ptr().cast::<f32>(), value_count) };
+        let mut written = 0usize;
+        base.try_for_each_contiguous_chunk(&mut |values| {
+            let end = written.checked_add(values.len()).ok_or_else(|| {
+                paro_common::error::out_of_range("HNSW exact-f32 build copy overflow")
+            })?;
+            let destination = output.get_mut(written..end).ok_or_else(|| {
+                paro_common::error::data_corrupted(
+                    "HNSW exact-f32 build input exceeds declared cardinality",
+                )
+            })?;
+            destination.copy_from_slice(values);
+            written = end;
+            Ok(())
+        })?;
+        if written != value_count {
+            return Err(paro_common::error::data_corrupted(format!(
+                "HNSW exact-f32 build copied {written} values, expected {value_count}"
+            )));
+        }
+
+        Ok(Arc::new(Self {
+            base,
+            vectors: mmap.make_read_only()?,
+            dimension,
+            count,
+        }))
+    }
+}
+
+impl VectorStorage for ExactF32BuildVectorStorage {
+    #[inline]
+    fn get_vector(&self, idx: PointOffset) -> &[f32] {
+        let start = idx as usize * self.dimension;
+        &self
+            .contiguous_vectors()
+            .expect("exact-f32 build storage is contiguous")[start..start + self.dimension]
+    }
+
+    fn contiguous_vectors(&self) -> Option<&[f32]> {
+        // SAFETY: `prepare` proves page alignment and exact f32 row-major
+        // length before converting the private mapping to read-only.
+        Some(unsafe {
+            std::slice::from_raw_parts(
+                self.vectors.as_ptr().cast::<f32>(),
+                self.count * self.dimension,
+            )
+        })
+    }
+
+    fn num_vectors(&self) -> usize {
+        self.count
+    }
+
+    fn vector_dim(&self) -> usize {
+        self.dimension
+    }
+
+    fn cosine_inverse_norms(&self) -> Option<&CosineInverseNorms> {
+        self.base.cosine_inverse_norms()
+    }
+
+    fn is_mmap_backed(&self) -> bool {
+        true
+    }
+}
 
 enum WritableI16BuildBacking {
     Owned(Vec<u8>),
@@ -604,6 +746,11 @@ impl VectorStorage for SymmetricI16BuildVectorStorage {
     }
 
     #[inline]
+    fn prefetch_construction_point(&self, idx: PointOffset) {
+        paro_common::distance::prefetch_bytes_read(self.code(idx));
+    }
+
+    #[inline]
     fn construction_similarity(
         &self,
         distance: DistanceMetric,
@@ -640,7 +787,9 @@ pub(crate) fn prepare_build_vector_storage(
     workspace_dir: Option<&Path>,
 ) -> Result<Arc<dyn VectorStorage>> {
     match encoding {
-        super::HnswBuildVectorEncoding::ExactF32 => Ok(base),
+        super::HnswBuildVectorEncoding::ExactF32 => {
+            ExactF32BuildVectorStorage::prepare(base, workspace_dir)
+        }
         super::HnswBuildVectorEncoding::SymmetricI16 { routing_dimensions } => {
             SymmetricI16BuildVectorStorage::prepare(
                 base,
@@ -1612,6 +1761,46 @@ mod tests {
         assert_eq!(storage.get_vector(1), &[3.0, 4.0]);
         assert_eq!(storage.get_vector(2), &[5.0, 6.0]);
         assert_eq!(storage.get_vector(4), &[9.0, 10.0]);
+    }
+
+    #[test]
+    fn exact_f32_build_stages_partitioned_input_as_one_bitwise_image() {
+        let first: Arc<dyn VectorStorage> = Arc::new(InMemoryVectorStorage::new(
+            vec![1.0, -0.0, f32::from_bits(0x7fc0_1234), 4.0],
+            2,
+        ));
+        let second: Arc<dyn VectorStorage> =
+            Arc::new(InMemoryVectorStorage::new(vec![5.0, 6.0, -7.0, 8.0], 2));
+        let partitioned: Arc<dyn VectorStorage> =
+            Arc::new(PartitionedVectorStorage::try_new(vec![first, second], 2).unwrap());
+        assert!(partitioned.contiguous_vectors().is_none());
+        let workspace = tempfile::tempdir().unwrap();
+
+        let prepared = prepare_build_vector_storage(
+            Arc::clone(&partitioned),
+            super::super::HnswBuildVectorEncoding::ExactF32,
+            17,
+            Some(workspace.path()),
+        )
+        .unwrap();
+
+        assert!(prepared.is_mmap_backed());
+        let expected = (0..partitioned.num_vectors() as PointOffset)
+            .flat_map(|point| {
+                partitioned
+                    .get_vector(point)
+                    .iter()
+                    .map(|value| value.to_bits())
+            })
+            .collect::<Vec<_>>();
+        let actual = prepared
+            .contiguous_vectors()
+            .unwrap()
+            .iter()
+            .map(|value| value.to_bits())
+            .collect::<Vec<_>>();
+        assert_eq!(actual, expected);
+        assert_eq!(prepared.get_vector(3), partitioned.get_vector(3));
     }
 
     #[test]
