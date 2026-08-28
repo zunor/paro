@@ -13,9 +13,11 @@ use std::time::Instant;
 const MIN_PARALLEL_EXACT_VECTOR_BYTES: u64 = 2 * 1024 * 1024;
 use crate::index::hnsw::types::SearchParams;
 use crate::index::hnsw::{
-    hnsw_artifact_compatibility, DistanceMetric, HnswArtifactCompatibility, HnswBuildContract,
-    HnswFilterKind, HnswIndex, HnswSearchFilter, HnswSearchPolicy, HnswSearchStrategy,
-    HnswSegmentSearchInput, PreparedQuery,
+    hnsw_artifact_compatibility, hnsw_artifact_uses_external_vectors,
+    open_plain_vector_column_pages, DistanceMetric, HnswArtifactCompatibility, HnswBuildContract,
+    HnswExternalVectorBinding, HnswExternalVectorSource, HnswExternalVectorSpan, HnswFilterKind,
+    HnswIndex, HnswSearchFilter, HnswSearchPolicy, HnswSearchStrategy, HnswSegmentSearchInput,
+    PartitionedVectorStorage, PreparedQuery, VectorStorage,
 };
 use crate::index::PredicateTree;
 use crate::index::{DenseRowSet, ExactRowSet, PartitionExactRowSet};
@@ -301,6 +303,19 @@ impl VectorSearchCursor {
                 self.reader_runtime.as_ref(),
                 artifact,
                 self.vector_dim,
+                || {
+                    build_external_vector_binding(
+                        artifact,
+                        self.storage_col_id,
+                        self.vector_dim,
+                        |segment_ref| {
+                            visible_by_ref
+                                .get(segment_ref)
+                                .and_then(|index| visible_segments.get(*index))
+                        },
+                    )
+                    .map(Some)
+                },
             )?
             else {
                 // An unsupported generation artifact is recoverable. Keep its
@@ -1104,14 +1119,25 @@ fn open_sidecar_hnsw_index(
         return Ok(None);
     }
 
-    open_sidecar_hnsw_artifact(runtime, artifact, vector_dim)
+    open_sidecar_hnsw_artifact(runtime, artifact, vector_dim, || {
+        build_external_vector_binding(artifact, column_id, vector_dim, |segment_ref| {
+            (segment_ref.rowset_id == visible_segment.rowset_id
+                && segment_ref.segment_id == visible_segment.segment_id)
+                .then_some(visible_segment)
+        })
+        .map(Some)
+    })
 }
 
-fn open_sidecar_hnsw_artifact(
+fn open_sidecar_hnsw_artifact<F>(
     runtime: &SearchReaderRuntime,
     artifact: &SearchArtifactRef,
     vector_dim: usize,
-) -> Result<Option<Arc<HnswIndex>>> {
+    external_binding: F,
+) -> Result<Option<Arc<HnswIndex>>>
+where
+    F: FnOnce() -> Result<Option<HnswExternalVectorBinding>>,
+{
     let request = DecodedSidecarReaderRequest {
         sidecar: SidecarReaderRequest {
             location: &artifact.location,
@@ -1129,7 +1155,20 @@ fn open_sidecar_hnsw_artifact(
             return Ok(None);
         }
         let (mmap, offset, len) = cached.mmap_range();
-        let index = HnswIndex::deserialize_mmap_range(mmap, offset, len)?;
+        let index = if hnsw_artifact_uses_external_vectors(cached.bytes())? {
+            HnswIndex::deserialize_mmap_range_with_external_vectors(
+                mmap,
+                offset,
+                len,
+                external_binding()?.ok_or_else(|| {
+                    paro_error::artifact_not_ready(
+                        "external HNSW sidecar has no immutable base-page binding",
+                    )
+                })?,
+            )?
+        } else {
+            HnswIndex::deserialize_mmap_range(mmap, offset, len)?
+        };
         if index.vector_storage.vector_dim() != vector_dim {
             return Err(paro_error::data_corrupted(format!(
                 "HNSW artifact dimension mismatch: expected {vector_dim}, got {}",
@@ -1149,6 +1188,68 @@ fn open_sidecar_hnsw_artifact(
         bind_hnsw_search_workspace(index, runtime)?;
     }
     Ok(index)
+}
+
+fn build_external_vector_binding<'a, F>(
+    artifact: &SearchArtifactRef,
+    column_id: u32,
+    vector_dim: usize,
+    mut resolve_visible: F,
+) -> Result<HnswExternalVectorBinding>
+where
+    F: FnMut(&ArtifactSegmentRef) -> Option<&'a VisibleSegment>,
+{
+    if artifact.column_id != column_id {
+        return Err(paro_error::data_corrupted(format!(
+            "external HNSW artifact column {} does not match query column {column_id}",
+            artifact.column_id
+        )));
+    }
+    let mut source_spans = Vec::with_capacity(artifact.coverage.segments().len());
+    let mut vector_parts = Vec::<Arc<dyn VectorStorage>>::new();
+    for span in artifact.coverage.segments() {
+        let visible = resolve_visible(&span.segment).ok_or_else(|| {
+            paro_error::data_corrupted(format!(
+                "external HNSW source references invisible segment {}/{}",
+                span.segment.rowset_id, span.segment.segment_id
+            ))
+        })?;
+        if visible.segment.num_rows() != span.row_count {
+            return Err(paro_error::data_corrupted(format!(
+                "external HNSW source segment {}/{} has {} rows, expected {}",
+                span.segment.rowset_id,
+                span.segment.segment_id,
+                visible.segment.num_rows(),
+                span.row_count
+            )));
+        }
+        let column = visible.segment.get_column_meta(column_id).ok_or_else(|| {
+            paro_error::column_not_found(format!(
+                "external HNSW source segment {} has no column {column_id}",
+                span.segment.segment_id
+            ))
+        })?;
+        if column.num_rows != span.row_count {
+            return Err(paro_error::data_corrupted(format!(
+                "external HNSW source column {column_id} has {} rows, expected {}",
+                column.num_rows, span.row_count
+            )));
+        }
+        vector_parts.extend(open_plain_vector_column_pages(
+            visible.segment.file_path(),
+            column,
+            vector_dim,
+        )?);
+        source_spans.push(HnswExternalVectorSpan {
+            rowset_id: span.segment.rowset_id,
+            segment_id: span.segment.segment_id,
+            row_count: span.row_count,
+        });
+    }
+    let source = HnswExternalVectorSource::try_new(column_id, source_spans)?;
+    let storage: Arc<dyn VectorStorage> =
+        Arc::new(PartitionedVectorStorage::try_new(vector_parts, vector_dim)?);
+    Ok(HnswExternalVectorBinding { source, storage })
 }
 
 fn bind_hnsw_search_workspace(index: &Arc<HnswIndex>, runtime: &SearchReaderRuntime) -> Result<()> {

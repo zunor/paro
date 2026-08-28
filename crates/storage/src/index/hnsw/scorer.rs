@@ -34,7 +34,8 @@ enum ScoringKernel<'a> {
 #[derive(Clone, Copy)]
 pub(crate) struct PreparedVectorScoring<'a> {
     query: &'a PreparedQuery,
-    vectors: &'a [f32],
+    storage: &'a dyn VectorStorage,
+    vectors: Option<&'a [f32]>,
     dimension: usize,
     point_count: usize,
     kernel: ScoringKernel<'a>,
@@ -44,6 +45,7 @@ impl<'a> PreparedVectorScoring<'a> {
     pub(crate) fn scorer(self) -> VectorScorer<'a> {
         VectorScorer {
             query: self.query,
+            storage: self.storage,
             vectors: self.vectors,
             dimension: self.dimension,
             point_count: self.point_count,
@@ -58,7 +60,9 @@ impl<'a> PreparedVectorScoring<'a> {
 mod tests {
     use super::super::vector_storage::prepare_build_vector_storage;
     use super::*;
-    use crate::index::hnsw::{HnswBuildVectorEncoding, InMemoryVectorStorage};
+    use crate::index::hnsw::{
+        HnswBuildVectorEncoding, InMemoryVectorStorage, PartitionedVectorStorage,
+    };
     use std::sync::Arc;
 
     #[test]
@@ -89,12 +93,37 @@ mod tests {
         assert_eq!(scorer.score_point(0), -10_000.0);
         assert_eq!(scorer.score_point(1), -10_201.0);
     }
+
+    #[test]
+    fn exact_query_scorers_accept_partitioned_base_page_storage() {
+        let first: Arc<dyn VectorStorage> =
+            Arc::new(InMemoryVectorStorage::new(vec![0.0, 0.0, 1.0, 1.0], 2));
+        let second: Arc<dyn VectorStorage> =
+            Arc::new(InMemoryVectorStorage::new(vec![2.0, 2.0, 3.0, 3.0], 2));
+        let storage = PartitionedVectorStorage::try_new(vec![first, second], 2).unwrap();
+        assert!(storage.contiguous_vectors().is_none());
+        let query = DistanceMetric::Euclidean.prepare(&[3.0, 3.0]);
+
+        let scorer = VectorScorer::new(&query, &storage).unwrap();
+        assert_eq!(scorer.score_point(3), 0.0);
+        assert_eq!(scorer.score_point(2), -2.0);
+        assert_eq!(scorer.prepared_scoring().scorer().score_point(1), -8.0);
+
+        let mut graph_scorer = GraphVectorScorer::new(&query, &storage).unwrap();
+        let scored = graph_scorer
+            .score_points_unfiltered(&[0, 3, 2])
+            .collect::<Vec<_>>();
+        assert_eq!(scored[0].score, -18.0);
+        assert_eq!(scored[1].score, 0.0);
+        assert_eq!(scored[2].score, -2.0);
+    }
 }
 
 /// Vector scorer responsible for calculating distances during search and build.
 pub struct VectorScorer<'a> {
     query: &'a PreparedQuery,
-    vectors: &'a [f32],
+    storage: &'a dyn VectorStorage,
+    vectors: Option<&'a [f32]>,
     dimension: usize,
     point_count: usize,
     kernel: ScoringKernel<'a>,
@@ -244,14 +273,25 @@ impl<'a> GraphVectorScorer<'a> {
                 *score = routing.score_point(self.exact.query.metric(), point_id);
             }
         } else {
-            VectorScorer::fill_scores_untracked(
-                self.exact.query,
-                self.exact.kernel,
-                self.exact.vectors,
-                self.exact.dimension,
-                points,
-                &mut self.scores_buffer,
-            );
+            if let Some(vectors) = self.exact.vectors {
+                VectorScorer::fill_scores_untracked(
+                    self.exact.query,
+                    self.exact.kernel,
+                    vectors,
+                    self.exact.dimension,
+                    points,
+                    &mut self.scores_buffer,
+                );
+            } else {
+                for (score, &point_id) in self.scores_buffer.iter_mut().zip(points) {
+                    *score = VectorScorer::score_cached_untracked(
+                        self.exact.query,
+                        self.exact.kernel,
+                        point_id,
+                        self.exact.storage.get_vector(point_id),
+                    );
+                }
+            }
         }
         points
             .iter()
@@ -301,25 +341,22 @@ impl<'a> VectorScorer<'a> {
             DistanceMetric::Manhattan => ScoringKernel::Manhattan,
         };
         let dimension = vector_storage.vector_dim();
-        let vectors = vector_storage.contiguous_vectors().ok_or_else(|| {
-            paro_common::error::data_corrupted(
-                "HNSW query artifact does not expose a contiguous vector layout",
-            )
-        })?;
+        let vectors = vector_storage.contiguous_vectors();
         let expected_values = vector_storage
             .num_vectors()
             .checked_mul(dimension)
             .ok_or_else(|| {
                 paro_common::error::data_corrupted("HNSW vector artifact cardinality overflow")
             })?;
-        if vectors.len() != expected_values {
+        if vectors.is_some_and(|vectors| vectors.len() != expected_values) {
             return Err(paro_common::error::data_corrupted(format!(
                 "HNSW vector artifact length mismatch: expected {expected_values} values, got {}",
-                vectors.len()
+                vectors.map_or(0, <[f32]>::len)
             )));
         }
         Ok(Self {
             query,
+            storage: vector_storage,
             vectors,
             dimension,
             point_count: vector_storage.num_vectors(),
@@ -338,13 +375,18 @@ impl<'a> VectorScorer<'a> {
 
     #[inline]
     pub(crate) fn vector(&self, point_id: PointOffset) -> &[f32] {
-        let start = point_id as usize * self.dimension;
-        &self.vectors[start..start + self.dimension]
+        self.vectors.map_or_else(
+            || self.storage.get_vector(point_id),
+            |vectors| {
+                let start = point_id as usize * self.dimension;
+                &vectors[start..start + self.dimension]
+            },
+        )
     }
 
     #[inline]
-    pub(crate) fn vector_layout(&self) -> (&'a [f32], usize) {
-        (self.vectors, self.dimension)
+    pub(crate) fn vector_storage(&self) -> &'a dyn VectorStorage {
+        self.storage
     }
 
     pub(crate) fn point_count(&self) -> usize {
@@ -359,14 +401,7 @@ impl<'a> VectorScorer<'a> {
     /// checked vector slice solely to issue non-dereferencing prefetch hints.
     #[inline(always)]
     pub(crate) fn prefetch_graph_point(&self, point: GraphPoint) {
-        let start = point.index() * self.dimension;
-        // SAFETY: HnswIndex validates graph/vector cardinality at construction,
-        // and `GraphLinks::search_view` repeats that proof at the search
-        // boundary before it can yield `GraphPoint`. The immutable vector
-        // matrix therefore contains this complete row.
-        let vector =
-            unsafe { std::slice::from_raw_parts(self.vectors.as_ptr().add(start), self.dimension) };
-        distance::prefetch_vector_read(vector);
+        distance::prefetch_vector_read(self.vector(point.offset()));
     }
 
     pub fn scored_point_count(&self) -> u64 {
@@ -376,6 +411,7 @@ impl<'a> VectorScorer<'a> {
     pub(crate) fn prepared_scoring(&self) -> PreparedVectorScoring<'a> {
         PreparedVectorScoring {
             query: self.query,
+            storage: self.storage,
             vectors: self.vectors,
             dimension: self.dimension,
             point_count: self.point_count,
@@ -392,15 +428,24 @@ impl<'a> VectorScorer<'a> {
 
     /// Score an indexed point whose vector has already been fetched.
     pub fn score_cached_point(&self, point_id: PointOffset, vector: &[f32]) -> ScoreType {
-        match self.kernel {
-            ScoringKernel::Cosine(norms) => self.query.metric().similarity_prepared_with_norm(
-                self.query.as_slice(),
+        Self::score_cached_untracked(self.query, self.kernel, point_id, vector)
+    }
+
+    fn score_cached_untracked(
+        query: &PreparedQuery,
+        kernel: ScoringKernel<'_>,
+        point_id: PointOffset,
+        vector: &[f32],
+    ) -> ScoreType {
+        match kernel {
+            ScoringKernel::Cosine(norms) => query.metric().similarity_prepared_with_norm(
+                query.as_slice(),
                 vector,
                 norms.value(point_id),
             ),
-            ScoringKernel::Euclidean => -distance::l2_squared(self.query.as_slice(), vector),
-            ScoringKernel::DotProduct => distance::dot_product(self.query.as_slice(), vector),
-            ScoringKernel::Manhattan => -distance::l1_distance(self.query.as_slice(), vector),
+            ScoringKernel::Euclidean => -distance::l2_squared(query.as_slice(), vector),
+            ScoringKernel::DotProduct => distance::dot_product(query.as_slice(), vector),
+            ScoringKernel::Manhattan => -distance::l1_distance(query.as_slice(), vector),
         }
     }
 
@@ -423,14 +468,25 @@ impl<'a> VectorScorer<'a> {
         self.scores_buffer.resize(points.len(), 0.0);
         self.scored_points
             .set(self.scored_points.get().saturating_add(points.len() as u64));
-        Self::fill_scores_untracked(
-            self.query,
-            self.kernel,
-            self.vectors,
-            self.dimension,
-            points,
-            &mut self.scores_buffer,
-        );
+        if let Some(vectors) = self.vectors {
+            Self::fill_scores_untracked(
+                self.query,
+                self.kernel,
+                vectors,
+                self.dimension,
+                points,
+                &mut self.scores_buffer,
+            );
+        } else {
+            for (score, &point_id) in self.scores_buffer.iter_mut().zip(points) {
+                *score = Self::score_cached_untracked(
+                    self.query,
+                    self.kernel,
+                    point_id,
+                    self.storage.get_vector(point_id),
+                );
+            }
+        }
         let scores = &self.scores_buffer;
         points
             .iter()

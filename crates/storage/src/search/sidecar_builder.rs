@@ -28,8 +28,8 @@ use super::tail::{TailMutationKind, TailPendingEntry};
 use crate::index::bitmap::BitmapIndexWriter;
 use crate::index::hnsw::{
     open_plain_vector_column_pages, HnswBuildExecutionPolicy, HnswBuildStopCheck, HnswBuilder,
-    HnswFilterBlock, HnswFilterBlocks, HnswFilterColumnBlocks, HnswFilterTopologyContract,
-    PartitionedVectorStorage, VectorStorage,
+    HnswExternalVectorSource, HnswExternalVectorSpan, HnswFilterBlock, HnswFilterBlocks,
+    HnswFilterColumnBlocks, HnswFilterTopologyContract, PartitionedVectorStorage, VectorStorage,
 };
 use crate::metrics::{storage_metrics, SearchSidecarBuildMetricKey};
 use crate::rowset::column::ColumnBatch;
@@ -79,9 +79,10 @@ impl SidecarArtifactBuilder for ProviderSidecarArtifactBuilder {
             SearchIndexKind::Hnsw => {
                 let provider = input.definition.hnsw_provider_config()?;
                 let contract = provider.build_contract();
-                let vector_bytes = rows
-                    .saturating_mul(u64::from(provider.dimension))
-                    .saturating_mul(std::mem::size_of::<f32>() as u64);
+                // Generation sidecars bind exact vectors to the immutable
+                // base pages named by their coverage contract. Inline
+                // envelopes remain self-contained.
+                let vector_bytes = 0u64;
                 let metric_bytes =
                     if provider.distance == crate::index::hnsw::DistanceMetric::Cosine {
                         rows.saturating_mul(std::mem::size_of::<f32>() as u64)
@@ -186,9 +187,10 @@ impl SidecarArtifactBuilder for ProviderSidecarArtifactBuilder {
                 self.hnsw_execution_policy,
             )? {
                 let location = writer.append_streamed_artifact(|file, offset| {
+                    let source = external_vector_source(partition.column_id, &partition.coverage)?;
                     partition
                         .index
-                        .serialize_into_seekable(file, offset)
+                        .serialize_into_seekable_external_vectors(file, offset, &source)
                         .map(|_| ())
                 })?;
                 artifact_refs.push(sidecar_ref_from_hnsw_partition(
@@ -267,6 +269,24 @@ impl SidecarArtifactBuilder for ProviderSidecarArtifactBuilder {
             bytes_written,
         })
     }
+}
+
+fn external_vector_source(
+    column_id: u32,
+    coverage: &SearchPartitionCoverage,
+) -> Result<HnswExternalVectorSource> {
+    HnswExternalVectorSource::try_new(
+        column_id,
+        coverage
+            .segments()
+            .iter()
+            .map(|span| HnswExternalVectorSpan {
+                rowset_id: span.segment.rowset_id,
+                segment_id: span.segment.segment_id,
+                row_count: span.row_count,
+            })
+            .collect(),
+    )
 }
 
 fn sidecar_input_rows(input: &SidecarBuildInput) -> u64 {

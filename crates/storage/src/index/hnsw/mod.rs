@@ -53,7 +53,10 @@ pub use hnsw_builder::{
 };
 pub use integrity_scheduler::HnswIntegrityScheduler;
 pub use links_container::{ItemsBuffer, LinksContainer};
-pub(crate) use persistence::{hnsw_artifact_build_contract, HNSW_ARTIFACT_HEADER_LEN};
+pub(crate) use persistence::{
+    hnsw_artifact_build_contract, hnsw_artifact_uses_external_vectors, HnswExternalVectorBinding,
+    HnswExternalVectorSource, HnswExternalVectorSpan, HNSW_ARTIFACT_HEADER_LEN,
+};
 pub use persistence::{
     hnsw_artifact_compatibility, HnswArtifactCompatibility, HnswFilterBlock, HnswFilterBlocks,
     HnswFilterColumnBlocks, HnswIndex, HNSW_ARTIFACT_ALIGNMENT, HNSW_ARTIFACT_FORMAT_VERSION,

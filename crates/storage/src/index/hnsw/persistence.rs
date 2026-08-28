@@ -57,6 +57,10 @@ use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
 const HNSW_ARTIFACT_MAGIC: [u8; 4] = *b"HNSW";
+/// Version 20 lets generation-owned sidecars bind their exact vectors
+/// to immutable base-segment pages instead of persisting a second f32 matrix.
+/// The complete ordered segment-span descriptor is stored in the artifact, so
+/// opening is a structural identity check rather than a probabilistic hash.
 /// Version 19 aligns compact routing-code rows to a cache-line boundary inside
 /// every envelope. Version 18 adds the chunk-authenticated integrity hierarchy.
 /// Version 17 persists compact routing codes beside canonical f32 vectors so
@@ -72,21 +76,162 @@ const HNSW_ARTIFACT_MAGIC: [u8; 4] = *b"HNSW";
 /// longer pays an independent random offset-table lookup. Version 11's
 /// canonical predicate dictionary keys remain part of the format. Earlier
 /// graph layouts are intentionally rejected rather than translated at open.
-pub const HNSW_ARTIFACT_FORMAT_VERSION: u32 = 19;
+pub const HNSW_ARTIFACT_FORMAT_VERSION: u32 = 20;
 const HNSW_ARTIFACT_VERSION: u32 = HNSW_ARTIFACT_FORMAT_VERSION;
-pub(crate) const HNSW_ARTIFACT_HEADER_LEN: usize = 208;
+pub(crate) const HNSW_ARTIFACT_HEADER_LEN: usize = 216;
 const HNSW_NORM_COUNT_FIELD: usize = 48;
 const HNSW_VECTOR_COUNT_FIELD: usize = 56;
 const HNSW_VECTOR_DIM_FIELD: usize = 64;
 const HNSW_VECTOR_ENCODING_FIELD: usize = 68;
 const HNSW_PRIMARY_COUNT_FIELD: usize = 72;
 const HNSW_EXTRA_COUNT_FIELD: usize = 76;
-const HNSW_INTEGRITY_OFFSET_FIELD: usize = 176;
-const HNSW_INTEGRITY_LEN_FIELD: usize = 184;
-const HNSW_ARTIFACT_LEN_FIELD: usize = 192;
-const HNSW_INTEGRITY_CHECKSUM_FIELD: usize = 200;
-const HNSW_HEADER_CHECKSUM_FIELD: usize = 204;
+const HNSW_EXTERNAL_SOURCE_LEN_FIELD: usize = 176;
+const HNSW_INTEGRITY_OFFSET_FIELD: usize = 184;
+const HNSW_INTEGRITY_LEN_FIELD: usize = 192;
+const HNSW_ARTIFACT_LEN_FIELD: usize = 200;
+const HNSW_INTEGRITY_CHECKSUM_FIELD: usize = 208;
+const HNSW_HEADER_CHECKSUM_FIELD: usize = 212;
 const HNSW_VECTOR_ENCODING_F32_LE: u32 = 1;
+const HNSW_VECTOR_ENCODING_EXTERNAL_BASE: u32 = 2;
+const HNSW_EXTERNAL_SOURCE_MAGIC: [u8; 4] = *b"HVEC";
+const HNSW_EXTERNAL_SOURCE_VERSION: u32 = 1;
+
+/// One immutable table segment in an externally bound vector domain.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct HnswExternalVectorSpan {
+    pub(crate) rowset_id: u64,
+    pub(crate) segment_id: u32,
+    pub(crate) row_count: u64,
+}
+
+/// Durable structural identity of base pages used by a generation sidecar.
+///
+/// The descriptor deliberately carries every ordered segment identity rather
+/// than a checksum. Exact reranking may only bind pages whose complete image
+/// equals this artifact-owned source contract.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct HnswExternalVectorSource {
+    pub(crate) column_id: u32,
+    pub(crate) spans: Box<[HnswExternalVectorSpan]>,
+}
+
+impl HnswExternalVectorSource {
+    pub(crate) fn try_new(column_id: u32, spans: Vec<HnswExternalVectorSpan>) -> Result<Self> {
+        if spans.is_empty() {
+            return Err(error::invalid_input(
+                "external HNSW vector source requires at least one segment",
+            ));
+        }
+        let mut previous = None;
+        let mut rows = 0u64;
+        for span in &spans {
+            if span.row_count == 0 {
+                return Err(error::invalid_input(
+                    "external HNSW vector source contains an empty segment",
+                ));
+            }
+            let identity = (span.rowset_id, span.segment_id);
+            if previous.is_some_and(|previous| previous >= identity) {
+                return Err(error::invalid_input(
+                    "external HNSW vector source segments must be strictly ordered",
+                ));
+            }
+            previous = Some(identity);
+            rows = rows.checked_add(span.row_count).ok_or_else(|| {
+                error::out_of_range("external HNSW vector source row count overflow")
+            })?;
+        }
+        if rows > u64::from(u32::MAX) {
+            return Err(error::configuration_limit_exceeded(
+                "external HNSW vector source exceeds the u32 point-id domain",
+            ));
+        }
+        Ok(Self {
+            column_id,
+            spans: spans.into_boxed_slice(),
+        })
+    }
+
+    fn row_count(&self) -> u64 {
+        self.spans.iter().map(|span| span.row_count).sum()
+    }
+
+    fn encode(&self) -> Result<Vec<u8>> {
+        let mut bytes = Vec::with_capacity(16usize.saturating_add(self.spans.len() * 24));
+        bytes.extend_from_slice(&HNSW_EXTERNAL_SOURCE_MAGIC);
+        bytes.extend_from_slice(&HNSW_EXTERNAL_SOURCE_VERSION.to_le_bytes());
+        bytes.extend_from_slice(&self.column_id.to_le_bytes());
+        bytes.extend_from_slice(
+            &u32::try_from(self.spans.len())
+                .map_err(|_| error::out_of_range("too many external HNSW vector spans"))?
+                .to_le_bytes(),
+        );
+        for span in &self.spans {
+            bytes.extend_from_slice(&span.rowset_id.to_le_bytes());
+            bytes.extend_from_slice(&span.segment_id.to_le_bytes());
+            bytes.extend_from_slice(&0u32.to_le_bytes());
+            bytes.extend_from_slice(&span.row_count.to_le_bytes());
+        }
+        Ok(bytes)
+    }
+
+    fn decode(bytes: &[u8]) -> Result<Self> {
+        if bytes.len() < 16 || bytes[..4] != HNSW_EXTERNAL_SOURCE_MAGIC {
+            return Err(error::data_corrupted(
+                "invalid external HNSW vector source descriptor",
+            ));
+        }
+        let version = u32::from_le_bytes(bytes[4..8].try_into().expect("u32 width"));
+        if version != HNSW_EXTERNAL_SOURCE_VERSION {
+            return Err(error::data_corrupted(format!(
+                "unsupported external HNSW vector source version {version}"
+            )));
+        }
+        let column_id = u32::from_le_bytes(bytes[8..12].try_into().expect("u32 width"));
+        let span_count = usize::try_from(u32::from_le_bytes(
+            bytes[12..16].try_into().expect("u32 width"),
+        ))
+        .map_err(|_| error::data_corrupted("external HNSW span count exceeds usize"))?;
+        let expected_len = 16usize
+            .checked_add(span_count.checked_mul(24).ok_or_else(|| {
+                error::data_corrupted("external HNSW source descriptor length overflow")
+            })?)
+            .ok_or_else(|| {
+                error::data_corrupted("external HNSW source descriptor length overflow")
+            })?;
+        if bytes.len() != expected_len {
+            return Err(error::data_corrupted(format!(
+                "external HNSW source descriptor has {} bytes, expected {expected_len}",
+                bytes.len()
+            )));
+        }
+        let mut spans = Vec::with_capacity(span_count);
+        for chunk in bytes[16..].chunks_exact(24) {
+            if chunk[12..16].iter().any(|byte| *byte != 0) {
+                return Err(error::data_corrupted(
+                    "external HNSW source descriptor reserved bytes are non-zero",
+                ));
+            }
+            spans.push(HnswExternalVectorSpan {
+                rowset_id: u64::from_le_bytes(chunk[..8].try_into().expect("u64 width")),
+                segment_id: u32::from_le_bytes(chunk[8..12].try_into().expect("u32 width")),
+                row_count: u64::from_le_bytes(chunk[16..24].try_into().expect("u64 width")),
+            });
+        }
+        Self::try_new(column_id, spans).map_err(|err| error::data_corrupted(err.to_string()))
+    }
+}
+
+pub(crate) struct HnswExternalVectorBinding {
+    pub(crate) source: HnswExternalVectorSource,
+    pub(crate) storage: Arc<dyn VectorStorage>,
+}
+
+enum ExternalVectorOpen {
+    None,
+    Query(HnswExternalVectorBinding),
+    Diagnostics,
+}
 
 fn build_vector_encoding_tag(encoding: HnswBuildVectorEncoding) -> u8 {
     match encoding {
@@ -365,6 +510,22 @@ pub fn hnsw_artifact_compatibility(data: &[u8]) -> Result<HnswArtifactCompatibil
         ));
     }
     Ok(HnswArtifactCompatibility::Current)
+}
+
+pub(crate) fn hnsw_artifact_uses_external_vectors(data: &[u8]) -> Result<bool> {
+    let header = current_artifact_header(data)?;
+    let encoding = u32::from_le_bytes(
+        header[HNSW_VECTOR_ENCODING_FIELD..HNSW_VECTOR_ENCODING_FIELD + 4]
+            .try_into()
+            .expect("u32 width"),
+    );
+    match encoding {
+        HNSW_VECTOR_ENCODING_F32_LE => Ok(false),
+        HNSW_VECTOR_ENCODING_EXTERNAL_BASE => Ok(true),
+        _ => Err(error::data_corrupted(format!(
+            "unsupported HNSW vector encoding {encoding}"
+        ))),
+    }
 }
 
 fn current_artifact_header(data: &[u8]) -> Result<&[u8]> {
@@ -831,6 +992,15 @@ impl HnswArtifactBacking {
             ),
         }
     }
+}
+
+struct DecodedHnswArtifact {
+    build_contract: HnswBuildContract,
+    graph: GraphLayers,
+    vector_storage: Option<Arc<dyn VectorStorage>>,
+    predicate_scan: Option<PredicateScanLayout>,
+    persisted_statistics: HnswIndexStatistics,
+    integrity: Arc<ArtifactIntegrity>,
 }
 
 /// A high-level HNSW index structure that combines graph and storage.
@@ -1774,6 +1944,27 @@ impl HnswIndex {
         writer: &mut RW,
         artifact_start: u64,
     ) -> Result<u64> {
+        self.serialize_into_seekable_with_source(writer, artifact_start, None)
+    }
+
+    /// Persist a generation-owned graph without duplicating its
+    /// canonical f32 table pages. The exact source descriptor is part of the
+    /// envelope and is checked structurally when the artifact is opened.
+    pub(crate) fn serialize_into_seekable_external_vectors<RW: Read + Write + Seek>(
+        &self,
+        writer: &mut RW,
+        artifact_start: u64,
+        source: &HnswExternalVectorSource,
+    ) -> Result<u64> {
+        self.serialize_into_seekable_with_source(writer, artifact_start, Some(source))
+    }
+
+    fn serialize_into_seekable_with_source<RW: Read + Write + Seek>(
+        &self,
+        writer: &mut RW,
+        artifact_start: u64,
+        external_source: Option<&HnswExternalVectorSource>,
+    ) -> Result<u64> {
         // Inline and sidecar generations are published from this envelope.
         // Run the expensive semantic verifier here, while the freshly built
         // graph is hot, instead of imposing O(E) work on every open.
@@ -1832,7 +2023,18 @@ impl HnswIndex {
             .map_err(|_| error::out_of_range("HNSW vector dimension exceeds u32"))?;
         header.extend_from_slice(&vector_count.to_le_bytes());
         header.extend_from_slice(&vector_dim.to_le_bytes());
-        header.extend_from_slice(&HNSW_VECTOR_ENCODING_F32_LE.to_le_bytes());
+        let physical_vector_encoding = if let Some(source) = external_source {
+            if source.row_count() != vector_count {
+                return Err(error::invalid_input(format!(
+                    "external HNSW vector source covers {} rows, index contains {vector_count}",
+                    source.row_count()
+                )));
+            }
+            HNSW_VECTOR_ENCODING_EXTERNAL_BASE
+        } else {
+            HNSW_VECTOR_ENCODING_F32_LE
+        };
+        header.extend_from_slice(&physical_vector_encoding.to_le_bytes());
         let primary_count = u32::try_from(self.graph.entry_points.entry_points.len())
             .map_err(|_| error::out_of_range("too many HNSW primary entry points"))?;
         let extra_count = u32::try_from(self.graph.entry_points.extra_entry_points.len())
@@ -1880,6 +2082,15 @@ impl HnswIndex {
                 .map_err(|_| error::out_of_range("HNSW predicate scan length exceeds u64"))?
                 .to_le_bytes(),
         );
+        let external_source_bytes = external_source
+            .map(HnswExternalVectorSource::encode)
+            .transpose()?
+            .unwrap_or_default();
+        header.extend_from_slice(
+            &u64::try_from(external_source_bytes.len())
+                .map_err(|_| error::out_of_range("HNSW external source length exceeds u64"))?
+                .to_le_bytes(),
+        );
         header.extend_from_slice(&[0; 32]);
         debug_assert_eq!(header.len(), HNSW_ARTIFACT_HEADER_LEN);
 
@@ -1887,11 +2098,14 @@ impl HnswIndex {
         writer.write_all(&header)?;
         let vector_padding = alignment_padding(HNSW_ARTIFACT_HEADER_LEN, HNSW_ARTIFACT_ALIGNMENT)?;
         writer.write_all(&[0; HNSW_ARTIFACT_ALIGNMENT][..vector_padding])?;
-        self.vector_storage
-            .try_for_each_contiguous_chunk(&mut |vectors| write_f32_slice(writer, vectors))?;
+        if external_source.is_none() {
+            self.vector_storage
+                .try_for_each_contiguous_chunk(&mut |vectors| write_f32_slice(writer, vectors))?;
+        }
         if let Some(norms) = norms {
             write_f32_iter(writer, norms.iter())?;
         }
+        writer.write_all(&external_source_bytes)?;
         if let Some(routing) = routing {
             for &source_dimension in routing.selected_dimensions {
                 writer.write_all(
@@ -1996,7 +2210,7 @@ impl HnswIndex {
     /// Graph links and cosine norms become immutable slices of that backing,
     /// so open does not allocate memory proportional to the graph size.
     pub fn deserialize_bytes(data: Bytes) -> Result<Self> {
-        Self::deserialize_backing(HnswArtifactBacking::Bytes(data))
+        Self::deserialize_backing(HnswArtifactBacking::Bytes(data), ExternalVectorOpen::None)
     }
 
     /// Deserialize a sidecar artifact directly over its package mmap.
@@ -2013,14 +2227,96 @@ impl HnswIndex {
                 "HNSW artifact mmap range exceeds package length",
             ));
         }
-        Self::deserialize_backing(HnswArtifactBacking::Mmap {
-            mmap,
-            offset: artifact_offset,
-            len: artifact_len,
-        })
+        Self::deserialize_backing(
+            HnswArtifactBacking::Mmap {
+                mmap,
+                offset: artifact_offset,
+                len: artifact_len,
+            },
+            ExternalVectorOpen::None,
+        )
     }
 
-    fn deserialize_backing(backing: HnswArtifactBacking) -> Result<Self> {
+    pub(crate) fn deserialize_mmap_range_with_external_vectors(
+        mmap: Arc<Mmap>,
+        artifact_offset: usize,
+        artifact_len: usize,
+        binding: HnswExternalVectorBinding,
+    ) -> Result<Self> {
+        let end = artifact_offset
+            .checked_add(artifact_len)
+            .ok_or_else(|| error::data_corrupted("HNSW artifact mmap range overflow"))?;
+        if end > mmap.len() {
+            return Err(error::data_corrupted(
+                "HNSW artifact mmap range exceeds package length",
+            ));
+        }
+        Self::deserialize_backing(
+            HnswArtifactBacking::Mmap {
+                mmap,
+                offset: artifact_offset,
+                len: artifact_len,
+            },
+            ExternalVectorOpen::Query(binding),
+        )
+    }
+
+    /// Open only the artifact-owned graph image for offline diagnostics.
+    /// External exact-vector pages are intentionally not resolved because
+    /// reachability and degree analysis never score a vector. The shape-only
+    /// storage is contained inside this call and cannot escape into search.
+    pub(crate) fn graph_diagnostics_mmap_range(
+        mmap: Arc<Mmap>,
+        artifact_offset: usize,
+        artifact_len: usize,
+        budget: &ResourceBudget,
+    ) -> Result<super::HnswGraphDiagnostics> {
+        let end = artifact_offset
+            .checked_add(artifact_len)
+            .ok_or_else(|| error::data_corrupted("HNSW artifact mmap range overflow"))?;
+        if end > mmap.len() {
+            return Err(error::data_corrupted(
+                "HNSW artifact mmap range exceeds package length",
+            ));
+        }
+        let decoded = Self::decode_backing(
+            HnswArtifactBacking::Mmap {
+                mmap,
+                offset: artifact_offset,
+                len: artifact_len,
+            },
+            ExternalVectorOpen::Diagnostics,
+        )?;
+        super::HnswGraphDiagnostics::analyze(
+            &decoded.graph.links,
+            &decoded.graph.entry_points,
+            budget,
+        )
+    }
+
+    fn deserialize_backing(
+        backing: HnswArtifactBacking,
+        external_open: ExternalVectorOpen,
+    ) -> Result<Self> {
+        let decoded = Self::decode_backing(backing, external_open)?;
+        let vector_storage = decoded.vector_storage.ok_or_else(|| {
+            error::internal("graph-only HNSW artifact cannot escape into query execution")
+        })?;
+        let mut index = Self::try_new_with_predicate_scan(
+            decoded.build_contract,
+            decoded.graph,
+            vector_storage,
+            decoded.predicate_scan,
+        )?;
+        index.persisted_statistics = Some(decoded.persisted_statistics);
+        index._artifact_integrity = Some(decoded.integrity);
+        Ok(index)
+    }
+
+    fn decode_backing(
+        backing: HnswArtifactBacking,
+        external_open: ExternalVectorOpen,
+    ) -> Result<DecodedHnswArtifact> {
         let data = backing.as_bytes();
         let header = current_artifact_header(data)?;
         let expected_header_checksum = u32::from_le_bytes(
@@ -2059,11 +2355,6 @@ impl HnswIndex {
                 .try_into()
                 .expect("u32 width"),
         );
-        if vector_encoding != HNSW_VECTOR_ENCODING_F32_LE {
-            return Err(error::data_corrupted(format!(
-                "unsupported HNSW vector encoding {vector_encoding}"
-            )));
-        }
         let primary_count = u32::from_le_bytes(
             header[HNSW_PRIMARY_COUNT_FIELD..HNSW_PRIMARY_COUNT_FIELD + 4]
                 .try_into()
@@ -2110,6 +2401,13 @@ impl HnswIndex {
                 .expect("u64 width"),
         ))
         .map_err(|_| error::data_corrupted("HNSW predicate scan length exceeds usize"))?;
+        debug_assert_eq!(offset, HNSW_EXTERNAL_SOURCE_LEN_FIELD);
+        let external_source_len = usize::try_from(u64::from_le_bytes(
+            take_artifact_bytes(data, &mut offset, 8, "external vector source length")?
+                .try_into()
+                .expect("u64 width"),
+        ))
+        .map_err(|_| error::data_corrupted("HNSW external source length exceeds usize"))?;
         let integrity_offset = usize::try_from(u64::from_le_bytes(
             take_artifact_bytes(data, &mut offset, 8, "integrity table offset")?
                 .try_into()
@@ -2162,10 +2460,32 @@ impl HnswIndex {
             ));
         }
         let distance = build_contract.distance;
-        let vector_bytes = vector_count
-            .checked_mul(vector_dim)
-            .and_then(|values| values.checked_mul(std::mem::size_of::<f32>()))
-            .ok_or_else(|| error::data_corrupted("HNSW vector byte length overflow"))?;
+        let vector_bytes = match vector_encoding {
+            HNSW_VECTOR_ENCODING_F32_LE => {
+                if external_source_len != 0 {
+                    return Err(error::data_corrupted(
+                        "embedded HNSW vectors cannot declare an external source",
+                    ));
+                }
+                vector_count
+                    .checked_mul(vector_dim)
+                    .and_then(|values| values.checked_mul(std::mem::size_of::<f32>()))
+                    .ok_or_else(|| error::data_corrupted("HNSW vector byte length overflow"))?
+            }
+            HNSW_VECTOR_ENCODING_EXTERNAL_BASE => {
+                if external_source_len == 0 {
+                    return Err(error::data_corrupted(
+                        "external HNSW vectors are missing their source descriptor",
+                    ));
+                }
+                0
+            }
+            encoding => {
+                return Err(error::data_corrupted(format!(
+                    "unsupported HNSW vector encoding {encoding}"
+                )))
+            }
+        };
         let norm_bytes = norm_count
             .checked_mul(std::mem::size_of::<f32>())
             .ok_or_else(|| error::data_corrupted("HNSW inverse norm byte length overflow"))?;
@@ -2228,6 +2548,7 @@ impl HnswIndex {
                     .checked_add(vector_padding)
                     .and_then(|bytes| bytes.checked_add(vector_bytes))
                     .and_then(|bytes| bytes.checked_add(norm_bytes))
+                    .and_then(|bytes| bytes.checked_add(external_source_len))
                     .and_then(|bytes| bytes.checked_add(routing_metadata_len))
                     .ok_or_else(|| error::data_corrupted("HNSW routing-code offset overflow"))?,
                 HNSW_ARTIFACT_ALIGNMENT,
@@ -2238,6 +2559,7 @@ impl HnswIndex {
             vector_padding
                 .checked_add(vector_bytes)
                 .and_then(|bytes| bytes.checked_add(norm_bytes))
+                .and_then(|bytes| bytes.checked_add(external_source_len))
                 .and_then(|bytes| bytes.checked_add(routing_metadata_len))
                 .and_then(|bytes| bytes.checked_add(routing_code_padding))
                 .and_then(|bytes| bytes.checked_add(routing_code_len))
@@ -2254,16 +2576,73 @@ impl HnswIndex {
         }
         let vector_start = offset;
         take_artifact_bytes(data, &mut offset, vector_bytes, "embedded vectors")?;
-        let vector_storage =
-            backing.vector_storage(vector_start, vector_bytes, vector_dim, vector_count)?;
         let norm_start = offset;
         take_artifact_bytes(data, &mut offset, norm_bytes, "inverse norms")?;
         let inverse_norms = backing.inverse_norms(norm_start, norm_bytes)?;
-        let mut vector_storage = match distance {
-            DistanceMetric::Cosine => {
-                IndexedVectorStorage::from_persisted_cosine_norms(vector_storage, inverse_norms)?
+        let source_bytes = take_artifact_bytes(
+            data,
+            &mut offset,
+            external_source_len,
+            "external vector source",
+        )?;
+        let vector_storage = match vector_encoding {
+            HNSW_VECTOR_ENCODING_F32_LE => {
+                if matches!(&external_open, ExternalVectorOpen::Query(_)) {
+                    return Err(error::data_corrupted(
+                        "embedded HNSW artifact received an external vector binding",
+                    ));
+                }
+                Some(backing.vector_storage(
+                    vector_start,
+                    vector_bytes,
+                    vector_dim,
+                    vector_count,
+                )?)
             }
-            _ if norm_count == 0 => vector_storage,
+            HNSW_VECTOR_ENCODING_EXTERNAL_BASE => {
+                let persisted_source = HnswExternalVectorSource::decode(source_bytes)?;
+                match external_open {
+                    ExternalVectorOpen::Query(binding) => {
+                        if binding.source != persisted_source {
+                            return Err(error::data_corrupted(format!(
+                                "external HNSW vector source mismatch: artifact={persisted_source:?}, binding={:?}",
+                                binding.source
+                            )));
+                        }
+                        if binding.storage.num_vectors() != vector_count
+                            || binding.storage.vector_dim() != vector_dim
+                        {
+                            return Err(error::data_corrupted(format!(
+                                "external HNSW vector shape mismatch: artifact={vector_count}x{vector_dim}, binding={}x{}",
+                                binding.storage.num_vectors(),
+                                binding.storage.vector_dim()
+                            )));
+                        }
+                        Some(binding.storage)
+                    }
+                    ExternalVectorOpen::Diagnostics => None,
+                    ExternalVectorOpen::None => {
+                        return Err(error::artifact_not_ready(
+                            "external HNSW artifact requires immutable base-page binding",
+                        ))
+                    }
+                }
+            }
+            _ => unreachable!("physical vector encoding validated above"),
+        };
+        let mut vector_storage = match (distance, vector_storage) {
+            (DistanceMetric::Cosine, Some(storage)) => Some(
+                IndexedVectorStorage::from_persisted_cosine_norms(storage, inverse_norms)?,
+            ),
+            (DistanceMetric::Cosine, None) => {
+                if norm_count != vector_count {
+                    return Err(error::data_corrupted(
+                        "cosine HNSW artifact is missing per-point inverse norms",
+                    ));
+                }
+                None
+            }
+            (_, storage) if norm_count == 0 => storage,
             _ => {
                 return Err(error::data_corrupted(
                     "non-cosine HNSW artifact contains cosine inverse norms",
@@ -2314,19 +2693,24 @@ impl HnswIndex {
             build_contract.vector_encoding,
             HnswBuildVectorEncoding::SymmetricI16 { .. }
         ) {
-            vector_storage = SymmetricI16BuildVectorStorage::from_persisted(
-                vector_storage,
-                routing_codes,
-                selected_dimensions,
-                routing_scales,
-                routing_inverse_norms,
-            )?;
+            vector_storage = vector_storage
+                .map(|storage| {
+                    SymmetricI16BuildVectorStorage::from_persisted(
+                        storage,
+                        routing_codes,
+                        selected_dimensions,
+                        routing_scales,
+                        routing_inverse_norms,
+                    )
+                })
+                .transpose()?;
         }
 
         /*
-         * Vector and metric metadata are now entirely artifact-owned. Keep
-         * entry-point parsing after that ownership boundary so no caller can
-         * accidentally pair a graph with unrelated base-segment vectors.
+         * Routing and metric metadata remain artifact-owned. Compact
+         * generation sidecars additionally prove the exact ordered base-page
+         * source before reaching this boundary, so a graph cannot be paired
+         * with unrelated table vectors.
          */
         let entry_points = EntryPoints {
             entry_points: read_entry_points(data, &mut offset, primary_count)?,
@@ -2402,15 +2786,14 @@ impl HnswIndex {
             None => GraphLayers::new(links, entry_points, (&build_contract).into()),
         };
 
-        let mut index = Self::try_new_with_predicate_scan(
+        Ok(DecodedHnswArtifact {
             build_contract,
             graph,
             vector_storage,
             predicate_scan,
-        )?;
-        index.persisted_statistics = Some(persisted_statistics);
-        index._artifact_integrity = Some(integrity);
-        Ok(index)
+            persisted_statistics,
+            integrity,
+        })
     }
 
     /// Perform a vector search under the caller's active query policy.
@@ -4587,6 +4970,122 @@ mod tests {
         };
         let result = restored.search_one(&vectors[37], 1, &params, None).unwrap();
         assert_eq!(result[0].idx, 37);
+        assert_eq!(result[0].score, 0.0);
+    }
+
+    #[test]
+    fn compact_sidecar_binds_external_vectors_by_structural_source_identity() {
+        let vectors = make_sift_like_vectors(92, 256, 24, 16);
+        let storage = make_storage(&vectors);
+        let mut contract = HnswConfig::new(16, 96)
+            .with_ef(96)
+            .build_contract(DistanceMetric::Euclidean);
+        contract.vector_encoding = HnswBuildVectorEncoding::symmetric_i16(8).unwrap();
+        let index = HnswIndex::build_with_controls(storage.clone(), contract, None, None).unwrap();
+        let source = HnswExternalVectorSource::try_new(
+            7,
+            vec![
+                HnswExternalVectorSpan {
+                    rowset_id: 10,
+                    segment_id: 1,
+                    row_count: 128,
+                },
+                HnswExternalVectorSpan {
+                    rowset_id: 11,
+                    segment_id: 0,
+                    row_count: 128,
+                },
+            ],
+        )
+        .unwrap();
+        let mut file = tempfile::tempfile().unwrap();
+        let artifact_len = index
+            .serialize_into_seekable_external_vectors(&mut file, 0, &source)
+            .unwrap() as usize;
+        assert!(artifact_len < index.serialize().unwrap().len());
+        let mmap = Arc::new(unsafe { MmapOptions::new().map(&file).unwrap() });
+        let diagnostics = HnswIndex::graph_diagnostics_mmap_range(
+            Arc::clone(&mmap),
+            0,
+            artifact_len,
+            &ResourceBudget::default(),
+        )
+        .unwrap();
+        assert_eq!(diagnostics.report().point_count, 256);
+        let restored = HnswIndex::deserialize_mmap_range_with_external_vectors(
+            Arc::clone(&mmap),
+            0,
+            artifact_len,
+            HnswExternalVectorBinding {
+                source: source.clone(),
+                storage: storage.clone(),
+            },
+        )
+        .unwrap();
+        let result = restored
+            .search_one(&vectors[37], 1, &SearchParams::default(), None)
+            .unwrap();
+        assert_eq!(result[0].idx, 37);
+        assert_eq!(result[0].score, 0.0);
+
+        let wrong_source = HnswExternalVectorSource::try_new(
+            7,
+            vec![HnswExternalVectorSpan {
+                rowset_id: 10,
+                segment_id: 1,
+                row_count: 256,
+            }],
+        )
+        .unwrap();
+        let error = HnswIndex::deserialize_mmap_range_with_external_vectors(
+            mmap,
+            0,
+            artifact_len,
+            HnswExternalVectorBinding {
+                source: wrong_source,
+                storage,
+            },
+        )
+        .err()
+        .expect("mismatched external source must fail");
+        assert!(error.to_string().contains("source mismatch"));
+    }
+
+    #[test]
+    fn exact_f32_sidecar_binds_external_vectors_without_routing_payload() {
+        let vectors = make_sift_like_vectors(37, 96, 12, 8);
+        let storage = make_storage(&vectors);
+        let contract = HnswConfig::new(12, 64)
+            .with_ef(64)
+            .build_contract(DistanceMetric::Euclidean);
+        let index = HnswIndex::build_with_controls(storage.clone(), contract, None, None).unwrap();
+        let source = HnswExternalVectorSource::try_new(
+            9,
+            vec![HnswExternalVectorSpan {
+                rowset_id: 22,
+                segment_id: 3,
+                row_count: 96,
+            }],
+        )
+        .unwrap();
+        let mut file = tempfile::tempfile().unwrap();
+        let artifact_len = index
+            .serialize_into_seekable_external_vectors(&mut file, 0, &source)
+            .unwrap() as usize;
+        assert!(artifact_len < index.serialize().unwrap().len());
+        let mmap = Arc::new(unsafe { MmapOptions::new().map(&file).unwrap() });
+        let restored = HnswIndex::deserialize_mmap_range_with_external_vectors(
+            mmap,
+            0,
+            artifact_len,
+            HnswExternalVectorBinding { source, storage },
+        )
+        .unwrap();
+        assert!(restored.vector_storage.i16_routing_view().is_none());
+        let result = restored
+            .search_one(&vectors[51], 1, &SearchParams::default(), None)
+            .unwrap();
+        assert_eq!(result[0].idx, 51);
         assert_eq!(result[0].score, 0.0);
     }
 

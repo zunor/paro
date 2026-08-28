@@ -45,7 +45,7 @@ struct OpenedHnswGeneration {
     column_id: u32,
     artifact_format_version: u32,
     coverage: SearchPartitionCoverage,
-    index: HnswIndex,
+    diagnostics: HnswGraphDiagnostics,
 }
 
 /// Qualify the current durable generation for one HNSW definition.
@@ -59,8 +59,7 @@ pub fn qualify_hnsw_generation(
     head: &SearchGenerationHeadMeta,
     budget: &ResourceBudget,
 ) -> Result<HnswGenerationQualification> {
-    let opened = open_hnsw_generation(table_data_dir, head)?;
-    let diagnostics = opened.index.graph_diagnostics(budget)?;
+    let opened = open_hnsw_generation(table_data_dir, head, budget)?;
 
     Ok(HnswGenerationQualification {
         definition_id: opened.definition_id,
@@ -68,13 +67,14 @@ pub fn qualify_hnsw_generation(
         column_id: opened.column_id,
         artifact_format_version: opened.artifact_format_version,
         coverage: opened.coverage,
-        diagnostics,
+        diagnostics: opened.diagnostics,
     })
 }
 
 fn open_hnsw_generation(
     table_data_dir: &Path,
     head: &SearchGenerationHeadMeta,
+    budget: &ResourceBudget,
 ) -> Result<OpenedHnswGeneration> {
     let definition_id = head.definition_id;
     let manifest = ManifestStore::new(table_data_dir)
@@ -136,7 +136,7 @@ fn open_hnsw_generation(
         ));
     }
     let (mmap, offset, len) = cached.mmap_range();
-    let index = HnswIndex::deserialize_mmap_range(mmap, offset, len)?;
+    let diagnostics = HnswIndex::graph_diagnostics_mmap_range(mmap, offset, len, budget)?;
 
     Ok(OpenedHnswGeneration {
         definition_id,
@@ -144,7 +144,7 @@ fn open_hnsw_generation(
         column_id: artifact.column_id,
         artifact_format_version: artifact.artifact_format_version,
         coverage: artifact.coverage.clone(),
-        index,
+        diagnostics,
     })
 }
 

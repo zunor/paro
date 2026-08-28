@@ -150,9 +150,8 @@ pub trait VectorStorage: Send + Sync {
     fn get_vector(&self, idx: PointOffset) -> &[f32];
 
     /// Whole dense row-major vector artifact when the physical backing is
-    /// contiguous. Query artifacts require this shape so their scorer can
-    /// resolve dynamic storage once; construction inputs may be partitioned
-    /// over several immutable base-segment mappings and return `None`.
+    /// contiguous. Scorers use this as a SIMD fast path; generation-owned
+    /// artifacts may instead remain partitioned over immutable base pages.
     fn contiguous_vectors(&self) -> Option<&[f32]> {
         None
     }
@@ -1796,9 +1795,9 @@ struct PartitionedVectorStoragePart {
 /// Generation-owned HNSW partitions must not first concatenate every input
 /// vector into heap memory. The builder addresses this view with one global
 /// point-id domain, while each lookup resolves to the owning segment mapping.
-/// Published artifacts still serialize one contiguous vector region and open
-/// through [`ArtifactVectorStorage`], so query scoring keeps its hot flat
-/// layout.
+/// Generation sidecars bind this same ordered partition image and never
+/// serialize another f32 matrix. Compact artifacts additionally persist graph
+/// routing codes; inline artifacts remain self-contained.
 pub(crate) struct PartitionedVectorStorage {
     parts: Box<[PartitionedVectorStoragePart]>,
     part_directory: PartitionDirectory,
