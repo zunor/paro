@@ -9,16 +9,18 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, LazyLock, Mutex, Weak};
 
 pub const IMMUTABLE_INDEX_MAGIC: [u8; 4] = *b"PIIX";
-pub const IMMUTABLE_INDEX_FORMAT_VERSION: u32 = 2;
+pub const IMMUTABLE_INDEX_FORMAT_VERSION: u32 = 3;
 pub const DEFAULT_IMMUTABLE_PAGE_SIZE: usize = 4096;
 pub const DEFAULT_TARGET_BUCKET_ENTRIES: usize = 64;
 pub const DEFAULT_BLOOM_WORDS: usize = 4;
+pub const DEFAULT_FILE_BLOOM_BITS_PER_KEY: usize = 10;
 
 const FILE_HEADER_LEN: usize = 32;
 const BUCKET_DIRECTORY_ENTRY_LEN: usize = 8;
 const PAGE_HEADER_LEN: usize = 8 + DEFAULT_BLOOM_WORDS * 8;
 const PAGE_HEADER_RESERVED: u16 = 0;
 const BLOOM_HASH_ROUNDS: usize = 4;
+const FILE_BLOOM_HASH_ROUNDS: usize = 7;
 
 static IMMUTABLE_INDEX_CACHE: LazyLock<Mutex<HashMap<PathBuf, Weak<ImmutableIndexReader>>>> =
     LazyLock::new(|| Mutex::new(HashMap::new()));
@@ -79,6 +81,10 @@ impl ImmutableIndexWriter {
         }
 
         let entries = normalize_entries(entries);
+        let mut file_bloom = FileBloom::for_entry_count(entries.len())?;
+        for (key, _) in &entries {
+            file_bloom.add(key);
+        }
         let bucket_count = choose_bucket_count(entries.len(), self.options.target_bucket_entries);
         let mut buckets = vec![Vec::new(); bucket_count];
         for (key, version) in &entries {
@@ -112,22 +118,47 @@ impl ImmutableIndexWriter {
             });
         }
 
-        let mut file_data =
-            Vec::with_capacity(FILE_HEADER_LEN + directory.len() * BUCKET_DIRECTORY_ENTRY_LEN);
+        let page_size = u32::try_from(self.options.page_size)
+            .map_err(|_| paro_error::out_of_range("immutable index page size exceeds u32"))?;
+        let durable_bucket_count = u32::try_from(bucket_count)
+            .map_err(|_| paro_error::out_of_range("immutable index bucket count exceeds u32"))?;
+        let page_count = u32::try_from(pages.len())
+            .map_err(|_| paro_error::out_of_range("immutable index page count exceeds u32"))?;
+        let file_bloom_words = u32::try_from(file_bloom.words.len()).map_err(|_| {
+            paro_error::out_of_range("immutable index file bloom word count exceeds u32")
+        })?;
+        let directory_bytes = directory
+            .len()
+            .checked_mul(BUCKET_DIRECTORY_ENTRY_LEN)
+            .ok_or_else(|| paro_error::out_of_range("immutable index directory is too large"))?;
+        let bloom_bytes = file_bloom
+            .words
+            .len()
+            .checked_mul(std::mem::size_of::<u64>())
+            .ok_or_else(|| paro_error::out_of_range("immutable index file bloom is too large"))?;
+        let initial_capacity = FILE_HEADER_LEN
+            .checked_add(directory_bytes)
+            .and_then(|bytes| bytes.checked_add(bloom_bytes))
+            .ok_or_else(|| paro_error::out_of_range("immutable index header is too large"))?;
+        let mut file_data = Vec::with_capacity(initial_capacity);
         file_data.extend_from_slice(&IMMUTABLE_INDEX_MAGIC);
         file_data.extend_from_slice(&IMMUTABLE_INDEX_FORMAT_VERSION.to_le_bytes());
-        file_data.extend_from_slice(&(self.options.page_size as u32).to_le_bytes());
-        file_data.extend_from_slice(&(bucket_count as u32).to_le_bytes());
-        file_data.extend_from_slice(&(pages.len() as u32).to_le_bytes());
+        file_data.extend_from_slice(&page_size.to_le_bytes());
+        file_data.extend_from_slice(&durable_bucket_count.to_le_bytes());
+        file_data.extend_from_slice(&page_count.to_le_bytes());
         file_data.extend_from_slice(&(DEFAULT_BLOOM_WORDS as u32).to_le_bytes());
-        file_data.extend_from_slice(&0u32.to_le_bytes());
-        file_data.extend_from_slice(&0u32.to_le_bytes());
+        file_data.extend_from_slice(&file_bloom_words.to_le_bytes());
+        file_data.extend_from_slice(&(FILE_BLOOM_HASH_ROUNDS as u32).to_le_bytes());
 
         for entry in &directory {
             file_data.extend_from_slice(&entry.start_page.to_le_bytes());
             file_data.extend_from_slice(&entry.page_count.to_le_bytes());
         }
+        for word in &file_bloom.words {
+            file_data.extend_from_slice(&word.to_le_bytes());
+        }
 
+        let page_count = pages.len();
         for page in pages {
             file_data.extend_from_slice(&page);
         }
@@ -146,10 +177,7 @@ impl ImmutableIndexWriter {
 
         Ok(ImmutableIndexStats {
             bucket_count,
-            page_count: (file_data.len()
-                - FILE_HEADER_LEN
-                - directory.len() * BUCKET_DIRECTORY_ENTRY_LEN)
-                / self.options.page_size,
+            page_count,
             entry_count: entries.len(),
         })
     }
@@ -161,6 +189,7 @@ pub struct ImmutableIndexReader {
     bytes: Arc<[u8]>,
     page_size: usize,
     bucket_directory: Vec<BucketDirectoryEntry>,
+    file_bloom: FileBloom,
     pages_offset: usize,
 }
 
@@ -218,6 +247,8 @@ impl ImmutableIndexReader {
         let bucket_count = u32::from_le_bytes(bytes[12..16].try_into().unwrap()) as usize;
         let page_count = u32::from_le_bytes(bytes[16..20].try_into().unwrap()) as usize;
         let bloom_words = u32::from_le_bytes(bytes[20..24].try_into().unwrap()) as usize;
+        let file_bloom_words = u32::from_le_bytes(bytes[24..28].try_into().unwrap()) as usize;
+        let file_bloom_rounds = u32::from_le_bytes(bytes[28..32].try_into().unwrap()) as usize;
         if page_size <= PAGE_HEADER_LEN {
             return Err(paro_error::data_corrupted(
                 "immutable index page size too small",
@@ -229,10 +260,31 @@ impl ImmutableIndexReader {
                 bloom_words
             )));
         }
+        if file_bloom_words == 0 || file_bloom_rounds != FILE_BLOOM_HASH_ROUNDS {
+            return Err(paro_error::data_corrupted(format!(
+                "unsupported immutable index file bloom layout: words={}, rounds={}",
+                file_bloom_words, file_bloom_rounds
+            )));
+        }
 
-        let directory_len = bucket_count * BUCKET_DIRECTORY_ENTRY_LEN;
-        let pages_offset = FILE_HEADER_LEN + directory_len;
-        let expected_len = pages_offset + page_count * page_size;
+        let directory_len = bucket_count
+            .checked_mul(BUCKET_DIRECTORY_ENTRY_LEN)
+            .ok_or_else(|| paro_error::data_corrupted("immutable index directory too large"))?;
+        let file_bloom_len = file_bloom_words
+            .checked_mul(std::mem::size_of::<u64>())
+            .ok_or_else(|| paro_error::data_corrupted("immutable index file bloom too large"))?;
+        let file_bloom_offset = FILE_HEADER_LEN
+            .checked_add(directory_len)
+            .ok_or_else(|| paro_error::data_corrupted("immutable index layout overflow"))?;
+        let pages_offset = file_bloom_offset
+            .checked_add(file_bloom_len)
+            .ok_or_else(|| paro_error::data_corrupted("immutable index layout overflow"))?;
+        let pages_len = page_count
+            .checked_mul(page_size)
+            .ok_or_else(|| paro_error::data_corrupted("immutable index pages too large"))?;
+        let expected_len = pages_offset
+            .checked_add(pages_len)
+            .ok_or_else(|| paro_error::data_corrupted("immutable index layout overflow"))?;
         if bytes.len() != expected_len {
             return Err(paro_error::data_corrupted(format!(
                 "immutable index {:?} length mismatch: expected {}, got {}",
@@ -243,19 +295,26 @@ impl ImmutableIndexReader {
         }
 
         let mut bucket_directory = Vec::with_capacity(bucket_count);
-        let directory = &bytes[FILE_HEADER_LEN..pages_offset];
+        let directory = bytes
+            .get(FILE_HEADER_LEN..file_bloom_offset)
+            .ok_or_else(|| paro_error::data_corrupted("immutable index directory truncated"))?;
         for chunk in directory.chunks_exact(BUCKET_DIRECTORY_ENTRY_LEN) {
             bucket_directory.push(BucketDirectoryEntry {
                 start_page: u32::from_le_bytes(chunk[0..4].try_into().unwrap()),
                 page_count: u32::from_le_bytes(chunk[4..8].try_into().unwrap()),
             });
         }
+        let file_bloom =
+            FileBloom::from_bytes(bytes.get(file_bloom_offset..pages_offset).ok_or_else(
+                || paro_error::data_corrupted("immutable index file bloom truncated"),
+            )?)?;
 
         Ok(Self {
             path,
             bytes,
             page_size,
             bucket_directory,
+            file_bloom,
             pages_offset,
         })
     }
@@ -267,7 +326,7 @@ impl ImmutableIndexReader {
     }
 
     pub fn get_version_at(&self, key: &[u8], read_ts: u64) -> Result<Option<PrimaryIndexVersion>> {
-        if self.bucket_directory.is_empty() {
+        if self.bucket_directory.is_empty() || !self.file_bloom.may_contain(key) {
             return Ok(None);
         }
 
@@ -302,7 +361,10 @@ impl ImmutableIndexReader {
         read_ts: u64,
         commit_ts: u64,
     ) -> Result<Option<PrimaryKeyWriteConflict>> {
-        if self.bucket_directory.is_empty() || read_ts >= commit_ts {
+        if self.bucket_directory.is_empty()
+            || read_ts >= commit_ts
+            || !self.file_bloom.may_contain(key)
+        {
             return Ok(None);
         }
 
@@ -621,6 +683,60 @@ impl PageBloom {
     }
 }
 
+/// Immutable-file membership summary used to reject negative primary-key
+/// lookups before touching a bucket page.
+///
+/// Page blooms remain authoritative for locating a key inside a hash bucket.
+/// This wider filter has a different ownership boundary: it summarizes the
+/// complete immutable file and is therefore built and published atomically
+/// with that file. Pure append workloads probe mostly absent keys, so the
+/// extra level prevents one page parse per key without weakening exact upsert
+/// or write-conflict semantics.
+#[derive(Debug)]
+struct FileBloom {
+    words: Box<[u64]>,
+}
+
+impl FileBloom {
+    fn for_entry_count(entry_count: usize) -> Result<Self> {
+        let bit_count = entry_count
+            .checked_mul(DEFAULT_FILE_BLOOM_BITS_PER_KEY)
+            .ok_or_else(|| paro_error::invalid_input("immutable index file bloom is too large"))?
+            .max(64);
+        let word_count = bit_count.div_ceil(64);
+        Ok(Self {
+            words: vec![0; word_count].into_boxed_slice(),
+        })
+    }
+
+    fn from_bytes(bytes: &[u8]) -> Result<Self> {
+        if bytes.is_empty() || !bytes.len().is_multiple_of(std::mem::size_of::<u64>()) {
+            return Err(paro_error::data_corrupted(
+                "immutable index file bloom has invalid length",
+            ));
+        }
+        let mut words = Vec::with_capacity(bytes.len() / std::mem::size_of::<u64>());
+        for word in bytes.chunks_exact(std::mem::size_of::<u64>()) {
+            words.push(u64::from_le_bytes(word.try_into().unwrap()));
+        }
+        Ok(Self {
+            words: words.into_boxed_slice(),
+        })
+    }
+
+    fn add(&mut self, key: &[u8]) {
+        for bit in file_bloom_bits_for_key(key, self.words.len() * 64) {
+            self.words[bit / 64] |= 1_u64 << (bit % 64);
+        }
+    }
+
+    fn may_contain(&self, key: &[u8]) -> bool {
+        file_bloom_bits_for_key(key, self.words.len() * 64)
+            .into_iter()
+            .all(|bit| self.words[bit / 64] & (1_u64 << (bit % 64)) != 0)
+    }
+}
+
 fn normalize_entries(
     entries: &[(Vec<u8>, PrimaryIndexVersion)],
 ) -> Vec<(Vec<u8>, PrimaryIndexVersion)> {
@@ -652,6 +768,22 @@ fn bloom_bits_for_key(key: &[u8]) -> [usize; BLOOM_HASH_ROUNDS] {
     for (idx, slot) in out.iter_mut().enumerate() {
         let rotated = hash.rotate_left((idx as u32) * 13);
         *slot = ((rotated ^ (rotated >> 17)) as usize) % (DEFAULT_BLOOM_WORDS * 64);
+    }
+    out
+}
+
+fn file_bloom_bits_for_key(key: &[u8], bit_count: usize) -> [usize; FILE_BLOOM_HASH_ROUNDS] {
+    debug_assert!(bit_count > 0);
+    let first = seahash::hash(key);
+    // Double hashing produces the required independent-looking locations from
+    // one durable hash evaluation. Keeping the second step odd prevents short
+    // cycles when the filter size is a power of two.
+    let step = first.rotate_left(32) | 1;
+    let mut out = [0; FILE_BLOOM_HASH_ROUNDS];
+    for (round, bit) in out.iter_mut().enumerate() {
+        *bit = first
+            .wrapping_add((round as u64).wrapping_mul(step))
+            .wrapping_rem(bit_count as u64) as usize;
     }
     out
 }
@@ -951,6 +1083,39 @@ mod tests {
         let missing = find_bloom_negative(&page);
         assert!(!page.bloom.may_contain(&missing));
         assert_eq!(page.get_version_at(&missing, u64::MAX).unwrap(), None);
+    }
+
+    #[test]
+    fn immutable_index_file_bloom_has_no_false_negatives_and_rejects_absent_keys() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("index.idx");
+        let entries = (0..1_000_u32)
+            .map(|id| {
+                (
+                    format!("key-{id:04}").into_bytes(),
+                    v(RowID::new(1, crate::rowset::SegmentRowId::from_raw(id)), 1),
+                )
+            })
+            .collect::<Vec<_>>();
+        ImmutableIndexWriter::default()
+            .write_entries(&path, &entries)
+            .unwrap();
+
+        let reader = ImmutableIndexReader::open(&path).unwrap();
+        for (key, _) in &entries {
+            assert!(reader.file_bloom.may_contain(key));
+        }
+        let rejected = (0..1_000_u32)
+            .filter(|id| {
+                !reader
+                    .file_bloom
+                    .may_contain(format!("absent-{id:04}").as_bytes())
+            })
+            .count();
+        assert!(
+            rejected > 900,
+            "file bloom rejected only {rejected}/1000 misses"
+        );
     }
 
     #[test]
