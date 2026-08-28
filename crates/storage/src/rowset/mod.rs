@@ -72,7 +72,7 @@ pub use rowset_meta::{
 };
 
 // Re-export rowset types.
-pub use rowset::{Rowset, RowsetBuilder, RowsetIterator, RowsetSharedPtr};
+pub use rowset::{Rowset, RowsetBuilder, RowsetIterator, RowsetRetentionLease, RowsetSharedPtr};
 
 // Re-export segment types.
 pub use segment::{

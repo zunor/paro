@@ -59,14 +59,14 @@ impl CompactionPlanner {
         let Some(schema) = tablet.schema() else {
             return Ok(None);
         };
-        let rowsets = CompactionRowsetSet::capture(tablet)?;
+        let captured = CompactionRowsetSet::capture(tablet)?;
 
         if let CompactionGoal::CoalesceTo { max_rowsets } = goal {
-            return Self::plan_coalesce(tablet, &rowsets, max_rowsets.max(1));
+            return Self::plan_coalesce(tablet, &captured, max_rowsets.max(1));
         }
 
         if schema.keys_type() == KeysType::PrimaryKeys {
-            return Self::plan_primary_key(tablet, &rowsets, goal);
+            return Self::plan_primary_key(tablet, &captured, goal);
         }
 
         let size_tiered = SizeTieredCompactionPolicy::new();
@@ -75,7 +75,7 @@ impl CompactionPlanner {
         let policies: [&dyn CompactionPolicy; 3] = [&size_tiered, &cumulative, &base];
         let mut selected = None;
         for policy in policies {
-            if let Some(selection) = Self::select(&rowsets, policy)? {
+            if let Some(selection) = Self::select(&captured, policy)? {
                 selected = Some(selection);
                 break;
             }
@@ -106,8 +106,7 @@ impl CompactionPlanner {
                 .map(|rowset| rowset.end_version())
                 .unwrap_or_default(),
         );
-        let input_rowsets: Vec<CompactionInput> =
-            rowsets.into_iter().map(CompactionInput::new).collect();
+        let input_rowsets = captured.compaction_inputs(rowsets)?;
         let execution_layout = match merge_semantics {
             MergeSemantics::Deduplicate | MergeSemantics::UniqueLatest => {
                 ExecutionLayout::Horizontal
@@ -191,8 +190,7 @@ impl CompactionPlanner {
             };
 
         let output_version = output_version_for(&rowsets)?;
-        let input_rowsets: Vec<CompactionInput> =
-            rowsets.into_iter().map(CompactionInput::new).collect();
+        let input_rowsets = captured.compaction_inputs(rowsets)?;
 
         Ok(Some(CompactionPlan {
             plan_id: next_plan_id(),
@@ -260,7 +258,7 @@ impl CompactionPlanner {
         let crosses_cumulative = rowsets
             .last()
             .is_some_and(|rowset| rowset.end_version() >= captured.cumulative_point());
-        let input_rowsets = rowsets.into_iter().map(CompactionInput::new).collect();
+        let input_rowsets = captured.compaction_inputs(rowsets)?;
         Ok(Some(CompactionPlan {
             plan_id: next_plan_id(),
             tablet_id: tablet.tablet_id(),
@@ -300,12 +298,12 @@ impl CompactionPlanner {
         let Some(schema) = tablet.schema() else {
             return Ok(None);
         };
-        let rowsets = CompactionRowsetSet::capture(tablet)?;
+        let captured = CompactionRowsetSet::capture(tablet)?;
         if schema.keys_type() == KeysType::PrimaryKeys {
-            return Self::plan_primary_key(tablet, &rowsets, CompactionGoal::ReduceDebt);
+            return Self::plan_primary_key(tablet, &captured, CompactionGoal::ReduceDebt);
         }
 
-        let Some(CompactionSelection { decision, rowsets }) = Self::select(&rowsets, policy)?
+        let Some(CompactionSelection { decision, rowsets }) = Self::select(&captured, policy)?
         else {
             return Ok(None);
         };
@@ -322,8 +320,7 @@ impl CompactionPlanner {
         };
 
         let output_version = output_version_for(&rowsets)?;
-        let input_rowsets: Vec<CompactionInput> =
-            rowsets.into_iter().map(CompactionInput::new).collect();
+        let input_rowsets = captured.compaction_inputs(rowsets)?;
         let execution_layout = if schema.columns().len() > 10 {
             ExecutionLayout::Vertical
         } else {

@@ -1,7 +1,7 @@
 // Copyright 2024-2026 Zunor
 // SPDX-License-Identifier: Apache-2.0
 
-use crate::rowset::{RowsetId, RowsetSharedPtr};
+use crate::rowset::{RowsetId, RowsetRetentionLease, RowsetSharedPtr};
 use crate::tablet::Version;
 use std::fmt;
 
@@ -108,14 +108,27 @@ pub struct CompactionInput {
     pub rowset: RowsetSharedPtr,
     pub num_rows: u64,
     pub size_bytes: u64,
+    /// Keeps the rowset files and RSSID mappings alive from planning through
+    /// execution and publication. `Arc<Rowset>` alone is not a GC barrier.
+    _retention: RowsetRetentionLease,
 }
 
 impl CompactionInput {
     pub fn new(rowset: RowsetSharedPtr) -> Self {
+        let retention = RowsetRetentionLease::acquire(rowset.clone());
+        Self::from_retention(rowset, retention)
+    }
+
+    pub(crate) fn from_retention(rowset: RowsetSharedPtr, retention: RowsetRetentionLease) -> Self {
+        assert!(
+            retention.retains(&rowset),
+            "compaction input retention lease belongs to another rowset"
+        );
         Self {
             num_rows: rowset.num_rows(),
             size_bytes: rowset.total_disk_size(),
             rowset,
+            _retention: retention,
         }
     }
 }

@@ -1,10 +1,13 @@
 // Copyright 2024-2026 Zunor
 // SPDX-License-Identifier: Apache-2.0
 
-use crate::compaction::plan::types::{CompactionReason, CumulativePointAction, PolicyKind};
-use crate::rowset::RowsetSharedPtr;
+use crate::compaction::plan::types::{
+    CompactionInput, CompactionReason, CumulativePointAction, PolicyKind,
+};
+use crate::rowset::{RowsetRetentionLease, RowsetSharedPtr};
 use crate::tablet::Tablet;
 use paro_common::error::{self as paro_error, Result};
+use std::collections::BTreeMap;
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct CompactionDecision {
@@ -28,13 +31,23 @@ pub struct CompactionSelection {
 /// silently disagreeing about the same tablet state.
 pub struct CompactionRowsetSet {
     rowsets: Vec<RowsetSharedPtr>,
+    retentions: BTreeMap<u64, RowsetRetentionLease>,
     cumulative_point: i64,
 }
 
 impl CompactionRowsetSet {
     pub fn capture(tablet: &Tablet) -> Result<Self> {
-        let mut rowsets = tablet.capture_consistent_rowsets(tablet.max_version())?;
-        rowsets.sort_by_key(|rowset| rowset.start_version());
+        let mut retained_rowsets =
+            tablet.capture_retained_rowsets_for_maintenance(tablet.max_version())?;
+        retained_rowsets.sort_by_key(|retention| retention.rowset().start_version());
+        let rowsets = retained_rowsets
+            .iter()
+            .map(|retention| retention.rowset().clone())
+            .collect::<Vec<_>>();
+        let retentions = retained_rowsets
+            .into_iter()
+            .map(|retention| (retention.rowset().rowset_id(), retention))
+            .collect();
         let cumulative_point = tablet.cumulative_point();
 
         let mut previous_end = None;
@@ -63,6 +76,7 @@ impl CompactionRowsetSet {
 
         Ok(Self {
             rowsets,
+            retentions,
             cumulative_point,
         })
     }
@@ -73,6 +87,26 @@ impl CompactionRowsetSet {
 
     pub const fn cumulative_point(&self) -> i64 {
         self.cumulative_point
+    }
+
+    pub fn compaction_inputs(&self, rowsets: Vec<RowsetSharedPtr>) -> Result<Vec<CompactionInput>> {
+        rowsets
+            .into_iter()
+            .map(|rowset| {
+                let retention = self
+                    .retentions
+                    .get(&rowset.rowset_id())
+                    .filter(|retention| retention.retains(&rowset))
+                    .cloned()
+                    .ok_or_else(|| {
+                        paro_error::internal(format!(
+                            "compaction selection references uncaptured rowset {}",
+                            rowset.rowset_id()
+                        ))
+                    })?;
+                Ok(CompactionInput::from_retention(rowset, retention))
+            })
+            .collect()
     }
 }
 

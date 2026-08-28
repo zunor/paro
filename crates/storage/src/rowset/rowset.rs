@@ -152,6 +152,48 @@ pub struct Rowset {
     statistics_cache: RwLock<Option<RowsetStatistics>>,
 }
 
+/// An owning lease that keeps a rowset's physical identity valid.
+///
+/// Holding an [`Arc<Rowset>`] only keeps the Rust object alive. It does not
+/// prevent tablet retirement from removing the rowset's files and RSSID
+/// mappings. Long-lived runtime work such as compaction plans must therefore
+/// hold this lease for every physical rowset they may dereference.
+///
+/// Clones share one acquisition so a plan can be moved through execution and
+/// publication without multiplying the rowset's runtime reference count.
+#[derive(Debug, Clone)]
+pub struct RowsetRetentionLease {
+    inner: Arc<RowsetRetentionLeaseInner>,
+}
+
+#[derive(Debug)]
+struct RowsetRetentionLeaseInner {
+    rowset: RowsetSharedPtr,
+}
+
+impl RowsetRetentionLease {
+    pub fn acquire(rowset: RowsetSharedPtr) -> Self {
+        rowset.acquire();
+        Self {
+            inner: Arc::new(RowsetRetentionLeaseInner { rowset }),
+        }
+    }
+
+    pub fn rowset(&self) -> &RowsetSharedPtr {
+        &self.inner.rowset
+    }
+
+    pub fn retains(&self, rowset: &RowsetSharedPtr) -> bool {
+        Arc::ptr_eq(&self.inner.rowset, rowset)
+    }
+}
+
+impl Drop for RowsetRetentionLeaseInner {
+    fn drop(&mut self) {
+        self.rowset.release();
+    }
+}
+
 impl Rowset {
     /// Create a new Rowset
     ///

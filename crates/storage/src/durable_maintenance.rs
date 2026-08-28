@@ -159,15 +159,16 @@ mod tests {
 
         let error = runtime.submit(empty_request(2)).unwrap_err();
         let message = error.to_string();
-        assert_eq!(message, "journal apply failed after durable append");
+        assert!(message.starts_with("journal apply failed after durable append:"));
         // LSN 2 may register before the asynchronously submitted poison from
         // LSN 1 becomes visible, or may be rejected at registration after the
         // poison wins. The durable invariant is explicit terminal failure,
         // not a particular poisoned frontier value.
         assert!((2..=3).contains(&runtime.next_dispatch_lsn()));
-        assert_eq!(
-            runtime.submit(empty_request(3)).unwrap_err().to_string(),
-            "journal apply failed after durable append"
-        );
+        assert!(runtime
+            .submit(empty_request(3))
+            .unwrap_err()
+            .to_string()
+            .starts_with("journal apply failed after durable append:"));
     }
 }

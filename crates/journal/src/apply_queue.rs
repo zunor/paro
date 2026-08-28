@@ -720,6 +720,13 @@ impl JournalApplyRuntimeInner {
     }
 
     fn fail_record(&self, ticket: &Arc<RecordTicket>, err: ParoError) {
+        tracing::error!(
+            lsn = ticket.lsn,
+            commit_id = ?ticket.commit_id,
+            error = %err,
+            error_class = %err.error_class(),
+            "journal apply runtime entered fail-stop after durable apply failure"
+        );
         let normalized = normalize_durable_apply_failure(&err);
         let waiters = {
             let mut state = self.state.lock().unwrap();
@@ -1012,7 +1019,7 @@ impl ApplyRuntimeMetrics {
 }
 
 fn normalize_durable_apply_failure(err: &ParoError) -> ParoError {
-    paro_error::internal("journal apply failed after durable append")
+    paro_error::internal(format!("journal apply failed after durable append: {err}"))
         .detail(err.to_string())
         .context(format!(
             "original durable apply failure class: {}",

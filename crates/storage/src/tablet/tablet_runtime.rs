@@ -2779,6 +2779,25 @@ impl Tablet {
         self.capture_consistent_rowsets_at_layout(visible_version, self.layout_epoch())
     }
 
+    /// Capture the visible physical rowsets and pin their files/RSSID mappings
+    /// atomically with respect to layout publication.
+    ///
+    /// Maintenance planning must use this entry point. A plain `Arc<Rowset>`
+    /// keeps the object alive but is intentionally not a retired-rowset GC
+    /// barrier.
+    pub(crate) fn capture_retained_rowsets_for_maintenance(
+        &self,
+        visible_version: i64,
+    ) -> Result<Vec<crate::rowset::RowsetRetentionLease>> {
+        let _layout_guard = self.meta_lock.read().unwrap();
+        let rowsets =
+            self.capture_consistent_rowsets_at_layout(visible_version, self.layout_epoch())?;
+        Ok(rowsets
+            .into_iter()
+            .map(crate::rowset::RowsetRetentionLease::acquire)
+            .collect())
+    }
+
     pub fn capture_consistent_rowsets_at_layout(
         &self,
         visible_version: i64,
@@ -4143,7 +4162,7 @@ pub type TabletRef = Arc<Tablet>;
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::compaction::plan::types::CumulativePointAction;
+    use crate::compaction::plan::types::{CompactionInput, CumulativePointAction};
     use crate::meta::{FileMetadataStore, MetadataStore, TabletMetaManager};
     use crate::metrics::storage_metrics;
     use crate::primary_key::{PersistentIndex, PrimaryKeySerializer, RowID};
@@ -5099,6 +5118,14 @@ mod tests {
         tablet.add_rowset(input_a.clone()).unwrap();
         tablet.add_rowset(input_b.clone()).unwrap();
 
+        // A compaction plan is a physical reader even before it constructs a
+        // RowsetIterator. Its inputs must keep both files and RSSID mappings
+        // alive while another compaction is allowed to retire them.
+        let planned_inputs = vec![
+            CompactionInput::new(input_a.clone()),
+            CompactionInput::new(input_b.clone()),
+        ];
+
         let read_guard = TabletReadGuard::pin(&tablet, 1).unwrap();
         let materialized = tablet.materialize_storage_snapshot(1).unwrap();
 
@@ -5126,6 +5153,16 @@ mod tests {
 
         drop(materialized);
         drop(read_guard);
+        tablet.sweep_retired_inputs();
+
+        assert!(tablet
+            .retired_pending_gc_statuses()
+            .iter()
+            .all(|status| status.barrier == RetiredGcBarrier::PendingRuntimeHandles));
+        assert!(tablet.find_retained_rowset_by_id(10).is_some());
+        assert!(tablet.find_retained_rowset_by_id(11).is_some());
+
+        drop(planned_inputs);
         tablet.sweep_retired_inputs();
 
         assert!(tablet.retired_pending_gc_statuses().is_empty());
