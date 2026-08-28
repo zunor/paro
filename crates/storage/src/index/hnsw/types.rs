@@ -52,6 +52,12 @@ pub const DEFAULT_HNSW_GRAPH_SCORED_POINTS_PER_EF: u32 = 24;
 pub const HNSW_BUILT_IN_DISTANCE_COST_REVISION: u32 = 5;
 pub const MAX_HNSW_FILTER_COLUMNS: usize = 8;
 pub const HNSW_FILTER_TOPOLOGY_VERSION: u32 = 4;
+/// Version 15 gives symmetric-i16 construction and query scoring one portable
+/// four-lane arithmetic contract with an AArch64 SIMD implementation. The
+/// reduction order is durable topology semantics because last-bit score
+/// changes may change heuristic edge selection; scalar and SIMD hosts must
+/// therefore produce the same score bits rather than architecture-specific
+/// graph families under one version.
 /// Version 14 makes compact encoding and its non-zero routing dimension a
 /// single sum type, so an invalid encoding/dimension pair cannot exist in a
 /// catalog, build contract, compaction job, or in-memory plan. Version 13
@@ -85,7 +91,7 @@ pub const HNSW_FILTER_TOPOLOGY_VERSION: u32 = 4;
 /// followed by cycle walking. One-point warm-up waves and deterministic frozen
 /// proposal waves remain durable topology fields; changing point ordering or
 /// publication semantics requires a new contract version.
-pub const HNSW_BUILD_CONTRACT_VERSION: u32 = 14;
+pub const HNSW_BUILD_CONTRACT_VERSION: u32 = 15;
 /// Maximum number of deterministic source coordinates retained by the
 /// compact construction routing space. The original f32 dimension remains
 /// authoritative for SQL scoring and exact re-ranking.

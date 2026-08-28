@@ -975,42 +975,72 @@ fn splitmix64(mut value: u64) -> u64 {
 
 #[inline]
 pub(crate) fn weighted_i16_dot_product(left: &[u8], right: &[u8], scale_squares: &[f32]) -> f32 {
-    left.chunks_exact(std::mem::size_of::<i16>())
-        .zip(right.chunks_exact(std::mem::size_of::<i16>()))
-        .zip(scale_squares)
-        .map(|((left, right), &scale_square)| {
-            let left = i16::from_le_bytes(left.try_into().expect("i16 width"));
-            let right = i16::from_le_bytes(right.try_into().expect("i16 width"));
-            f32::from(left) * f32::from(right) * scale_square
-        })
-        .sum()
+    #[cfg(all(target_arch = "aarch64", target_endian = "little"))]
+    {
+        i16_neon::weighted_dot(left, right, scale_squares)
+    }
+    #[cfg(not(all(target_arch = "aarch64", target_endian = "little")))]
+    weighted_i16_dot_product_scalar(left, right, scale_squares)
+}
+
+#[inline]
+#[cfg_attr(
+    all(target_arch = "aarch64", target_endian = "little"),
+    allow(dead_code)
+)]
+fn weighted_i16_dot_product_scalar(left: &[u8], right: &[u8], scale_squares: &[f32]) -> f32 {
+    let len = scale_squares.len().min(left.len() / 2).min(right.len() / 2);
+    deterministic_four_lane_reduce(len, |index, accumulator| {
+        let product = f32::from(read_i16_le(left, index)) * f32::from(read_i16_le(right, index));
+        product.mul_add(scale_squares[index], accumulator)
+    })
 }
 
 #[inline]
 pub(crate) fn weighted_i16_l2_squared(left: &[u8], right: &[u8], scale_squares: &[f32]) -> f32 {
-    left.chunks_exact(std::mem::size_of::<i16>())
-        .zip(right.chunks_exact(std::mem::size_of::<i16>()))
-        .zip(scale_squares)
-        .map(|((left, right), &scale_square)| {
-            let left = i16::from_le_bytes(left.try_into().expect("i16 width"));
-            let right = i16::from_le_bytes(right.try_into().expect("i16 width"));
-            let delta = f32::from(left) - f32::from(right);
-            delta * delta * scale_square
-        })
-        .sum()
+    #[cfg(all(target_arch = "aarch64", target_endian = "little"))]
+    {
+        i16_neon::weighted_l2(left, right, scale_squares)
+    }
+    #[cfg(not(all(target_arch = "aarch64", target_endian = "little")))]
+    weighted_i16_l2_squared_scalar(left, right, scale_squares)
+}
+
+#[inline]
+#[cfg_attr(
+    all(target_arch = "aarch64", target_endian = "little"),
+    allow(dead_code)
+)]
+fn weighted_i16_l2_squared_scalar(left: &[u8], right: &[u8], scale_squares: &[f32]) -> f32 {
+    let len = scale_squares.len().min(left.len() / 2).min(right.len() / 2);
+    deterministic_four_lane_reduce(len, |index, accumulator| {
+        let delta = f32::from(read_i16_le(left, index)) - f32::from(read_i16_le(right, index));
+        (delta * delta).mul_add(scale_squares[index], accumulator)
+    })
 }
 
 #[inline]
 pub(crate) fn weighted_i16_l1_distance(left: &[u8], right: &[u8], scales: &[f32]) -> f32 {
-    left.chunks_exact(std::mem::size_of::<i16>())
-        .zip(right.chunks_exact(std::mem::size_of::<i16>()))
-        .zip(scales)
-        .map(|((left, right), &scale)| {
-            let left = i16::from_le_bytes(left.try_into().expect("i16 width"));
-            let right = i16::from_le_bytes(right.try_into().expect("i16 width"));
-            (i32::from(left) - i32::from(right)).unsigned_abs() as f32 * scale
-        })
-        .sum()
+    #[cfg(all(target_arch = "aarch64", target_endian = "little"))]
+    {
+        i16_neon::weighted_l1(left, right, scales)
+    }
+    #[cfg(not(all(target_arch = "aarch64", target_endian = "little")))]
+    weighted_i16_l1_distance_scalar(left, right, scales)
+}
+
+#[inline]
+#[cfg_attr(
+    all(target_arch = "aarch64", target_endian = "little"),
+    allow(dead_code)
+)]
+fn weighted_i16_l1_distance_scalar(left: &[u8], right: &[u8], scales: &[f32]) -> f32 {
+    let len = scales.len().min(left.len() / 2).min(right.len() / 2);
+    deterministic_four_lane_reduce(len, |index, accumulator| {
+        let delta = (i32::from(read_i16_le(left, index)) - i32::from(read_i16_le(right, index)))
+            .unsigned_abs() as f32;
+        delta.mul_add(scales[index], accumulator)
+    })
 }
 
 /// Score an unquantized query against one persisted symmetric-i16 routing row.
@@ -1020,42 +1050,361 @@ pub(crate) fn weighted_i16_l1_distance(left: &[u8], right: &[u8], scales: &[f32]
 /// inputs and change their geometry; only the immutable point image is lossy.
 #[inline]
 pub(crate) fn f32_query_i16_dot_product(query: &[f32], code: &[u8], scales: &[f32]) -> f32 {
-    query
-        .iter()
-        .zip(code.chunks_exact(std::mem::size_of::<i16>()))
-        .zip(scales)
-        .map(|((&query, code), &scale)| {
-            let code = i16::from_le_bytes(code.try_into().expect("i16 width"));
-            query * f32::from(code) * scale
-        })
-        .sum()
+    #[cfg(all(target_arch = "aarch64", target_endian = "little"))]
+    {
+        i16_neon::query_dot(query, code, scales)
+    }
+    #[cfg(not(all(target_arch = "aarch64", target_endian = "little")))]
+    f32_query_i16_dot_product_scalar(query, code, scales)
+}
+
+#[inline]
+#[cfg_attr(
+    all(target_arch = "aarch64", target_endian = "little"),
+    allow(dead_code)
+)]
+fn f32_query_i16_dot_product_scalar(query: &[f32], code: &[u8], scales: &[f32]) -> f32 {
+    let len = query.len().min(scales.len()).min(code.len() / 2);
+    deterministic_four_lane_reduce(len, |index, accumulator| {
+        let value = f32::from(read_i16_le(code, index)) * scales[index];
+        query[index].mul_add(value, accumulator)
+    })
 }
 
 #[inline]
 pub(crate) fn f32_query_i16_l2_squared(query: &[f32], code: &[u8], scales: &[f32]) -> f32 {
-    query
-        .iter()
-        .zip(code.chunks_exact(std::mem::size_of::<i16>()))
-        .zip(scales)
-        .map(|((&query, code), &scale)| {
-            let code = i16::from_le_bytes(code.try_into().expect("i16 width"));
-            let delta = query - f32::from(code) * scale;
-            delta * delta
-        })
-        .sum()
+    #[cfg(all(target_arch = "aarch64", target_endian = "little"))]
+    {
+        i16_neon::query_l2(query, code, scales)
+    }
+    #[cfg(not(all(target_arch = "aarch64", target_endian = "little")))]
+    f32_query_i16_l2_squared_scalar(query, code, scales)
+}
+
+#[inline]
+#[cfg_attr(
+    all(target_arch = "aarch64", target_endian = "little"),
+    allow(dead_code)
+)]
+fn f32_query_i16_l2_squared_scalar(query: &[f32], code: &[u8], scales: &[f32]) -> f32 {
+    let len = query.len().min(scales.len()).min(code.len() / 2);
+    deterministic_four_lane_reduce(len, |index, accumulator| {
+        let value = f32::from(read_i16_le(code, index)) * scales[index];
+        let delta = query[index] - value;
+        delta.mul_add(delta, accumulator)
+    })
 }
 
 #[inline]
 pub(crate) fn f32_query_i16_l1_distance(query: &[f32], code: &[u8], scales: &[f32]) -> f32 {
-    query
-        .iter()
-        .zip(code.chunks_exact(std::mem::size_of::<i16>()))
-        .zip(scales)
-        .map(|((&query, code), &scale)| {
-            let code = i16::from_le_bytes(code.try_into().expect("i16 width"));
-            (query - f32::from(code) * scale).abs()
-        })
-        .sum()
+    #[cfg(all(target_arch = "aarch64", target_endian = "little"))]
+    {
+        i16_neon::query_l1(query, code, scales)
+    }
+    #[cfg(not(all(target_arch = "aarch64", target_endian = "little")))]
+    f32_query_i16_l1_distance_scalar(query, code, scales)
+}
+
+#[inline]
+#[cfg_attr(
+    all(target_arch = "aarch64", target_endian = "little"),
+    allow(dead_code)
+)]
+fn f32_query_i16_l1_distance_scalar(query: &[f32], code: &[u8], scales: &[f32]) -> f32 {
+    let len = query.len().min(scales.len()).min(code.len() / 2);
+    deterministic_four_lane_reduce(len, |index, accumulator| {
+        let value = f32::from(read_i16_le(code, index)) * scales[index];
+        accumulator + (query[index] - value).abs()
+    })
+}
+
+/// Portable arithmetic contract shared by scalar and SIMD compact scoring.
+///
+/// Four independent accumulators consume two four-lane groups per iteration,
+/// followed by a fixed pairwise reduction. Keeping this order independent of
+/// the host ISA makes build-contract version 15 describe one topology rather
+/// than an architecture-dependent family of graphs.
+#[inline]
+fn deterministic_four_lane_reduce(
+    len: usize,
+    mut accumulate: impl FnMut(usize, f32) -> f32,
+) -> f32 {
+    let mut lanes = [0.0_f32; 4];
+    let mut offset = 0usize;
+    while offset + 8 <= len {
+        for lane in 0..4 {
+            lanes[lane] = accumulate(offset + lane, lanes[lane]);
+        }
+        for lane in 0..4 {
+            lanes[lane] = accumulate(offset + 4 + lane, lanes[lane]);
+        }
+        offset += 8;
+    }
+    let mut scalar = (lanes[0] + lanes[1]) + (lanes[2] + lanes[3]);
+    while offset < len {
+        scalar = accumulate(offset, scalar);
+        offset += 1;
+    }
+    scalar
+}
+
+#[inline]
+fn read_i16_le(bytes: &[u8], index: usize) -> i16 {
+    let start = index * std::mem::size_of::<i16>();
+    i16::from_le_bytes([bytes[start], bytes[start + 1]])
+}
+
+#[cfg(all(target_arch = "aarch64", target_endian = "little"))]
+mod i16_neon {
+    use std::arch::aarch64::*;
+
+    #[inline]
+    pub(super) fn weighted_dot(left: &[u8], right: &[u8], scales: &[f32]) -> f32 {
+        // SAFETY: AArch64 guarantees NEON, byte rows are little-endian on this
+        // target, and the kernel bounds every unaligned load by the shortest
+        // logical input.
+        unsafe { weighted_dot_inner(left, right, scales) }
+    }
+
+    #[target_feature(enable = "neon")]
+    unsafe fn weighted_dot_inner(left: &[u8], right: &[u8], scales: &[f32]) -> f32 {
+        let len = scales.len().min(left.len() / 2).min(right.len() / 2);
+        let mut offset = 0usize;
+        let mut sum = vdupq_n_f32(0.0);
+        while offset + 8 <= len {
+            // SAFETY: the loop condition proves eight i16 values and the
+            // corresponding eight scales remain in every input.
+            let (left_codes, right_codes, low_scales, high_scales) = unsafe {
+                (
+                    vld1q_s16(left.as_ptr().add(offset * 2).cast()),
+                    vld1q_s16(right.as_ptr().add(offset * 2).cast()),
+                    vld1q_f32(scales.as_ptr().add(offset)),
+                    vld1q_f32(scales.as_ptr().add(offset + 4)),
+                )
+            };
+            let left_low = vcvtq_f32_s32(vmovl_s16(vget_low_s16(left_codes)));
+            let left_high = vcvtq_f32_s32(vmovl_high_s16(left_codes));
+            let right_low = vcvtq_f32_s32(vmovl_s16(vget_low_s16(right_codes)));
+            let right_high = vcvtq_f32_s32(vmovl_high_s16(right_codes));
+            sum = vfmaq_f32(sum, vmulq_f32(left_low, right_low), low_scales);
+            sum = vfmaq_f32(sum, vmulq_f32(left_high, right_high), high_scales);
+            offset += 8;
+        }
+        // SAFETY: `sum` is a fully initialized four-lane accumulator.
+        let mut scalar = unsafe { reduce_sum(sum) };
+        while offset < len {
+            let left = i16::from_le_bytes([left[offset * 2], left[offset * 2 + 1]]);
+            let right = i16::from_le_bytes([right[offset * 2], right[offset * 2 + 1]]);
+            let product = f32::from(left) * f32::from(right);
+            scalar = product.mul_add(scales[offset], scalar);
+            offset += 1;
+        }
+        scalar
+    }
+
+    #[inline]
+    pub(super) fn weighted_l2(left: &[u8], right: &[u8], scales: &[f32]) -> f32 {
+        // SAFETY: see `weighted_dot`; this kernel uses the same bounded rows.
+        unsafe { weighted_l2_inner(left, right, scales) }
+    }
+
+    #[target_feature(enable = "neon")]
+    unsafe fn weighted_l2_inner(left: &[u8], right: &[u8], scales: &[f32]) -> f32 {
+        let len = scales.len().min(left.len() / 2).min(right.len() / 2);
+        let mut offset = 0usize;
+        let mut sum = vdupq_n_f32(0.0);
+        while offset + 8 <= len {
+            // SAFETY: the loop condition proves every unaligned load range.
+            let (left_codes, right_codes, low_scales, high_scales) = unsafe {
+                (
+                    vld1q_s16(left.as_ptr().add(offset * 2).cast()),
+                    vld1q_s16(right.as_ptr().add(offset * 2).cast()),
+                    vld1q_f32(scales.as_ptr().add(offset)),
+                    vld1q_f32(scales.as_ptr().add(offset + 4)),
+                )
+            };
+            let low_delta = vsubq_f32(
+                vcvtq_f32_s32(vmovl_s16(vget_low_s16(left_codes))),
+                vcvtq_f32_s32(vmovl_s16(vget_low_s16(right_codes))),
+            );
+            let high_delta = vsubq_f32(
+                vcvtq_f32_s32(vmovl_high_s16(left_codes)),
+                vcvtq_f32_s32(vmovl_high_s16(right_codes)),
+            );
+            sum = vfmaq_f32(sum, vmulq_f32(low_delta, low_delta), low_scales);
+            sum = vfmaq_f32(sum, vmulq_f32(high_delta, high_delta), high_scales);
+            offset += 8;
+        }
+        // SAFETY: `sum` is a fully initialized four-lane accumulator.
+        let mut scalar = unsafe { reduce_sum(sum) };
+        while offset < len {
+            let left = i16::from_le_bytes([left[offset * 2], left[offset * 2 + 1]]);
+            let right = i16::from_le_bytes([right[offset * 2], right[offset * 2 + 1]]);
+            let delta = f32::from(left) - f32::from(right);
+            scalar = (delta * delta).mul_add(scales[offset], scalar);
+            offset += 1;
+        }
+        scalar
+    }
+
+    #[inline]
+    pub(super) fn weighted_l1(left: &[u8], right: &[u8], scales: &[f32]) -> f32 {
+        // SAFETY: see `weighted_dot`; this kernel uses the same bounded rows.
+        unsafe { weighted_l1_inner(left, right, scales) }
+    }
+
+    #[target_feature(enable = "neon")]
+    unsafe fn weighted_l1_inner(left: &[u8], right: &[u8], scales: &[f32]) -> f32 {
+        let len = scales.len().min(left.len() / 2).min(right.len() / 2);
+        let mut offset = 0usize;
+        let mut sum = vdupq_n_f32(0.0);
+        while offset + 8 <= len {
+            // SAFETY: the loop condition proves every unaligned load range.
+            let (left_codes, right_codes, low_scales, high_scales) = unsafe {
+                (
+                    vld1q_s16(left.as_ptr().add(offset * 2).cast()),
+                    vld1q_s16(right.as_ptr().add(offset * 2).cast()),
+                    vld1q_f32(scales.as_ptr().add(offset)),
+                    vld1q_f32(scales.as_ptr().add(offset + 4)),
+                )
+            };
+            let low_delta = vabsq_f32(vsubq_f32(
+                vcvtq_f32_s32(vmovl_s16(vget_low_s16(left_codes))),
+                vcvtq_f32_s32(vmovl_s16(vget_low_s16(right_codes))),
+            ));
+            let high_delta = vabsq_f32(vsubq_f32(
+                vcvtq_f32_s32(vmovl_high_s16(left_codes)),
+                vcvtq_f32_s32(vmovl_high_s16(right_codes)),
+            ));
+            sum = vfmaq_f32(sum, low_delta, low_scales);
+            sum = vfmaq_f32(sum, high_delta, high_scales);
+            offset += 8;
+        }
+        // SAFETY: `sum` is a fully initialized four-lane accumulator.
+        let mut scalar = unsafe { reduce_sum(sum) };
+        while offset < len {
+            let left = i16::from_le_bytes([left[offset * 2], left[offset * 2 + 1]]);
+            let right = i16::from_le_bytes([right[offset * 2], right[offset * 2 + 1]]);
+            let delta = (i32::from(left) - i32::from(right)).unsigned_abs() as f32;
+            scalar = delta.mul_add(scales[offset], scalar);
+            offset += 1;
+        }
+        scalar
+    }
+
+    #[inline]
+    pub(super) fn query_dot(query: &[f32], code: &[u8], scales: &[f32]) -> f32 {
+        // SAFETY: AArch64 guarantees NEON and the inner kernel bounds every
+        // load by the shortest logical input.
+        unsafe { query_dot_inner(query, code, scales) }
+    }
+
+    #[target_feature(enable = "neon")]
+    unsafe fn query_dot_inner(query: &[f32], code: &[u8], scales: &[f32]) -> f32 {
+        // SAFETY: this function carries the same target feature and forwards
+        // the bounded slices unchanged.
+        unsafe { query_reduce(query, code, scales, QueryMetric::Dot) }
+    }
+
+    #[inline]
+    pub(super) fn query_l2(query: &[f32], code: &[u8], scales: &[f32]) -> f32 {
+        // SAFETY: see `query_dot`; this kernel uses the same bounded rows.
+        unsafe { query_l2_inner(query, code, scales) }
+    }
+
+    #[target_feature(enable = "neon")]
+    unsafe fn query_l2_inner(query: &[f32], code: &[u8], scales: &[f32]) -> f32 {
+        // SAFETY: see `query_dot_inner`.
+        unsafe { query_reduce(query, code, scales, QueryMetric::L2) }
+    }
+
+    #[inline]
+    pub(super) fn query_l1(query: &[f32], code: &[u8], scales: &[f32]) -> f32 {
+        // SAFETY: see `query_dot`; this kernel uses the same bounded rows.
+        unsafe { query_l1_inner(query, code, scales) }
+    }
+
+    #[target_feature(enable = "neon")]
+    unsafe fn query_l1_inner(query: &[f32], code: &[u8], scales: &[f32]) -> f32 {
+        // SAFETY: see `query_dot_inner`.
+        unsafe { query_reduce(query, code, scales, QueryMetric::L1) }
+    }
+
+    #[derive(Clone, Copy)]
+    enum QueryMetric {
+        Dot,
+        L2,
+        L1,
+    }
+
+    #[target_feature(enable = "neon")]
+    unsafe fn query_reduce(query: &[f32], code: &[u8], scales: &[f32], metric: QueryMetric) -> f32 {
+        let len = query.len().min(scales.len()).min(code.len() / 2);
+        let mut offset = 0usize;
+        let mut sum = vdupq_n_f32(0.0);
+        while offset + 8 <= len {
+            // SAFETY: the loop condition proves eight codes, query values,
+            // and scales remain. Durable code rows are little-endian and this
+            // module only compiles for little-endian AArch64.
+            let (codes, query_low, query_high, scale_low, scale_high) = unsafe {
+                (
+                    vld1q_s16(code.as_ptr().add(offset * 2).cast()),
+                    vld1q_f32(query.as_ptr().add(offset)),
+                    vld1q_f32(query.as_ptr().add(offset + 4)),
+                    vld1q_f32(scales.as_ptr().add(offset)),
+                    vld1q_f32(scales.as_ptr().add(offset + 4)),
+                )
+            };
+            let code_low = vcvtq_f32_s32(vmovl_s16(vget_low_s16(codes)));
+            let code_high = vcvtq_f32_s32(vmovl_high_s16(codes));
+            let value_low = vmulq_f32(code_low, scale_low);
+            let value_high = vmulq_f32(code_high, scale_high);
+            match metric {
+                QueryMetric::Dot => {
+                    sum = vfmaq_f32(sum, query_low, value_low);
+                    sum = vfmaq_f32(sum, query_high, value_high);
+                }
+                QueryMetric::L2 => {
+                    let low_delta = vsubq_f32(query_low, value_low);
+                    let high_delta = vsubq_f32(query_high, value_high);
+                    sum = vfmaq_f32(sum, low_delta, low_delta);
+                    sum = vfmaq_f32(sum, high_delta, high_delta);
+                }
+                QueryMetric::L1 => {
+                    sum = vaddq_f32(sum, vabsq_f32(vsubq_f32(query_low, value_low)));
+                    sum = vaddq_f32(sum, vabsq_f32(vsubq_f32(query_high, value_high)));
+                }
+            }
+            offset += 8;
+        }
+        // SAFETY: `sum` is a fully initialized four-lane accumulator.
+        let mut scalar = unsafe { reduce_sum(sum) };
+        while offset < len {
+            let code = i16::from_le_bytes([code[offset * 2], code[offset * 2 + 1]]);
+            let value = f32::from(code) * scales[offset];
+            scalar = match metric {
+                QueryMetric::Dot => query[offset].mul_add(value, scalar),
+                QueryMetric::L2 => {
+                    let delta = query[offset] - value;
+                    delta.mul_add(delta, scalar)
+                }
+                QueryMetric::L1 => scalar + (query[offset] - value).abs(),
+            };
+            offset += 1;
+        }
+        scalar
+    }
+
+    /// Match the portable build-contract reduction order exactly instead of
+    /// delegating horizontal addition order to a target intrinsic.
+    #[inline]
+    #[target_feature(enable = "neon")]
+    unsafe fn reduce_sum(sum: float32x4_t) -> f32 {
+        let mut lanes = [0.0_f32; 4];
+        // SAFETY: `lanes` owns space for exactly four f32 values.
+        unsafe { vst1q_f32(lanes.as_mut_ptr(), sum) };
+        (lanes[0] + lanes[1]) + (lanes[2] + lanes[3])
+    }
 }
 
 /// Raw table vectors plus HNSW-private metric preprocessing. The wrapper never
@@ -1910,6 +2259,65 @@ mod tests {
         assert_eq!(
             multiscale_routing_dimensions(&minima[..4], &maxima[..4], 4, 42).as_ref(),
             &[0, 1, 2, 3]
+        );
+    }
+
+    #[test]
+    fn symmetric_i16_vector_kernels_match_the_scalar_metric() {
+        let left_values = (0..131)
+            .map(|idx| ((idx * 977) % 65_535) as i32 - 32_767)
+            .map(|value| value as i16)
+            .collect::<Vec<_>>();
+        let right_values = (0..131)
+            .map(|idx| ((idx * 313 + 17) % 65_535) as i32 - 32_767)
+            .map(|value| value as i16)
+            .collect::<Vec<_>>();
+        let left = left_values
+            .iter()
+            .flat_map(|value| value.to_le_bytes())
+            .collect::<Vec<_>>();
+        let right = right_values
+            .iter()
+            .flat_map(|value| value.to_le_bytes())
+            .collect::<Vec<_>>();
+        let scales = (0..131)
+            .map(|idx| 0.000_1 + idx as f32 * 0.000_003)
+            .collect::<Vec<_>>();
+        let scale_squares = scales.iter().map(|scale| scale * scale).collect::<Vec<_>>();
+        let query = (0..131)
+            .map(|idx| (idx as f32 * 0.17).sin() * 3.0)
+            .collect::<Vec<_>>();
+
+        let same_contract_value = |actual: f32, expected: f32| {
+            assert_eq!(
+                actual.to_bits(),
+                expected.to_bits(),
+                "SIMD and portable compact-score contracts diverged: actual={actual}, expected={expected}"
+            );
+        };
+        same_contract_value(
+            weighted_i16_dot_product(&left, &right, &scale_squares),
+            weighted_i16_dot_product_scalar(&left, &right, &scale_squares),
+        );
+        same_contract_value(
+            weighted_i16_l2_squared(&left, &right, &scale_squares),
+            weighted_i16_l2_squared_scalar(&left, &right, &scale_squares),
+        );
+        same_contract_value(
+            weighted_i16_l1_distance(&left, &right, &scales),
+            weighted_i16_l1_distance_scalar(&left, &right, &scales),
+        );
+        same_contract_value(
+            f32_query_i16_dot_product(&query, &left, &scales),
+            f32_query_i16_dot_product_scalar(&query, &left, &scales),
+        );
+        same_contract_value(
+            f32_query_i16_l2_squared(&query, &left, &scales),
+            f32_query_i16_l2_squared_scalar(&query, &left, &scales),
+        );
+        same_contract_value(
+            f32_query_i16_l1_distance(&query, &left, &scales),
+            f32_query_i16_l1_distance_scalar(&query, &left, &scales),
         );
     }
 
