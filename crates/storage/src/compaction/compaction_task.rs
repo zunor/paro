@@ -238,6 +238,30 @@ mod tests {
         }
     }
 
+    #[derive(Debug)]
+    struct GenerationReplacementSearchObserver;
+
+    impl RowsetPublishObserver for GenerationReplacementSearchObserver {
+        fn rowset_published(
+            &self,
+            _tablet_id: crate::tablet::TabletId,
+            _version: i64,
+            _rowset: RowsetSharedPtr,
+            _search_updates: crate::tablet::SearchGenerationHeadUpdates,
+        ) {
+        }
+
+        fn compaction_requirement(
+            &self,
+            _tablet_id: crate::tablet::TabletId,
+            _replaced_rowset_ids: &[u64],
+        ) -> crate::tablet::SearchCompactionRequirement {
+            crate::tablet::SearchCompactionRequirement::GenerationReplacement {
+                definition_ids: vec![9].into_boxed_slice(),
+            }
+        }
+    }
+
     fn test_schema() -> TabletSchemaRef {
         Arc::new(
             TabletSchema::new(
@@ -295,5 +319,32 @@ mod tests {
 
         assert_eq!(calls.load(AtomicOrdering::SeqCst), 1);
         assert_eq!(task.state(), CompactionTaskState::Success);
+    }
+
+    #[test]
+    fn compaction_does_not_publish_without_required_generation_replacement() {
+        let dir = tempfile::tempdir().unwrap();
+        let tablet = Tablet::new(8, 101, 0, test_schema(), dir.path(), None).unwrap();
+        tablet.init().unwrap();
+        let tablet = Arc::new(tablet);
+        let observer: Arc<dyn RowsetPublishObserver> =
+            Arc::new(GenerationReplacementSearchObserver);
+        tablet.bind_rowset_publish_observer(Arc::downgrade(&observer));
+        let lifecycle = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let observed = Arc::clone(&lifecycle);
+        let mut task = HorizontalCompactionTask::new_with_job_id(
+            Arc::clone(&tablet),
+            empty_plan(tablet.tablet_id()),
+            Arc::new(default_allocator()),
+            CompactionJobId(100),
+        )
+        .with_lifecycle_notifier(Arc::new(move |state| {
+            observed.lock().unwrap().push(state);
+        }));
+
+        task.run().unwrap();
+
+        assert_eq!(task.state(), CompactionTaskState::Success);
+        assert!(lifecycle.lock().unwrap().is_empty());
     }
 }

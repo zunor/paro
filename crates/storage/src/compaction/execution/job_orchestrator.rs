@@ -117,6 +117,29 @@ where
         storage_metrics().inc_compaction_layout_gate_skips();
         return Ok(false);
     };
+    let replaced_rowset_ids = plan
+        .input_rowsets
+        .iter()
+        .map(|input| input.rowset.rowset_id())
+        .collect::<Vec<_>>();
+    if let crate::tablet::SearchCompactionRequirement::GenerationReplacement { definition_ids } =
+        tablet.search_compaction_requirement(&replaced_rowset_ids)
+    {
+        // A generation-owned graph embeds physical rowset/segment identities.
+        // Publishing only the base rowset would invalidate that graph and turn
+        // the complete compaction output into an unbounded exact tail.  A
+        // future co-planned job may proceed by carrying the replacement graph
+        // and head in the same durable mutation; an unpaired layout rewrite is
+        // never an admissible fallback.
+        tracing::debug!(
+            tablet_id = tablet.tablet_id(),
+            plan_id = plan.plan_id.0,
+            input_count = replaced_rowset_ids.len(),
+            definition_ids = ?definition_ids,
+            "deferred compaction until a replacement search generation is co-planned"
+        );
+        return Ok(false);
+    }
     on_state(CompactionLifecycleState::Building);
     let workspace =
         crate::compaction::execution::workspace::CompactionWorkspace::create_with_cancel_token(

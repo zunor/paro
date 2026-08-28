@@ -216,6 +216,17 @@ pub(crate) struct SearchIngestAdmissionLease {
     reserved_bytes: u64,
 }
 
+/// Search artifact work that must be co-published with a table compaction.
+///
+/// This is a planning dependency, not a best-effort callback. A generation
+/// replacement embeds the compacted rowset's new physical identities and must
+/// be part of the same durable cutover before the base layout may change.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum SearchCompactionRequirement {
+    Independent,
+    GenerationReplacement { definition_ids: Box<[u64]> },
+}
+
 impl std::fmt::Debug for SearchIngestAdmissionLease {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("SearchIngestAdmissionLease")
@@ -280,6 +291,21 @@ pub(crate) trait RowsetPublishObserver: Send + Sync + std::fmt::Debug {
         _tablet_id: TabletId,
     ) -> SearchInlineBuilderSet {
         SearchInlineBuilderSet::default()
+    }
+
+    /// Whether publishing this physical rowset replacement would invalidate
+    /// an installed generation-owned search artifact.
+    ///
+    /// Compaction may only cross this boundary when its durable mutation also
+    /// carries a replacement generation.  Keeping the decision on the search
+    /// owner prevents a table-layout optimizer from silently converting a
+    /// bounded ANN query into a full-output exact tail.
+    fn compaction_requirement(
+        &self,
+        _tablet_id: TabletId,
+        _replaced_rowset_ids: &[u64],
+    ) -> SearchCompactionRequirement {
+        SearchCompactionRequirement::Independent
     }
 }
 
@@ -912,6 +938,20 @@ impl Tablet {
             }));
         }
         Ok(None)
+    }
+
+    pub(crate) fn search_compaction_requirement(
+        &self,
+        replaced_rowset_ids: &[u64],
+    ) -> SearchCompactionRequirement {
+        self.rowset_publish_observer
+            .read()
+            .unwrap()
+            .as_ref()
+            .and_then(std::sync::Weak::upgrade)
+            .map_or(SearchCompactionRequirement::Independent, |observer| {
+                observer.compaction_requirement(self.tablet_id(), replaced_rowset_ids)
+            })
     }
 
     fn prepare_search_rowset_publish(

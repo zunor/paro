@@ -426,6 +426,45 @@ impl RowsetPublishObserver for SearchIndexRegistry {
             }
         }
     }
+
+    fn compaction_requirement(
+        &self,
+        tablet_id: TabletId,
+        replaced_rowset_ids: &[u64],
+    ) -> crate::tablet::SearchCompactionRequirement {
+        if tablet_id != self.tablet.tablet_id() || replaced_rowset_ids.is_empty() {
+            return crate::tablet::SearchCompactionRequirement::Independent;
+        }
+        let replaced = replaced_rowset_ids.iter().copied().collect::<BTreeSet<_>>();
+        let definition_ids = self
+            .view
+            .load()
+            .definitions
+            .values()
+            .filter(|state| {
+                state.definition.kind == SearchIndexKind::Hnsw
+                    && !matches!(
+                        state.definition.freshness_policy,
+                        SearchFreshnessPolicy::Required
+                    )
+                    && state.manifest.as_ref().is_some_and(|manifest| {
+                        manifest
+                            .artifacts
+                            .artifacts
+                            .iter()
+                            .any(|artifact| artifact.coverage.intersects_rowsets(&replaced))
+                    })
+            })
+            .map(|state| state.definition.definition_id)
+            .collect::<Vec<_>>();
+        if definition_ids.is_empty() {
+            crate::tablet::SearchCompactionRequirement::Independent
+        } else {
+            crate::tablet::SearchCompactionRequirement::GenerationReplacement {
+                definition_ids: definition_ids.into_boxed_slice(),
+            }
+        }
+    }
 }
 
 impl SearchIndexRegistry {

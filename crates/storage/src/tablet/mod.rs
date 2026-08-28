@@ -82,8 +82,8 @@ pub use tablet_runtime::{
     TabletState, Version, VersionGap,
 };
 pub(crate) use tablet_runtime::{
-    RowsetPublishObserver, SearchGenerationHeadUpdates, SearchGenerationPublishGuard,
-    SearchGenerationPublishOutcome, SearchIngestAdmissionLease,
+    RowsetPublishObserver, SearchCompactionRequirement, SearchGenerationHeadUpdates,
+    SearchGenerationPublishGuard, SearchGenerationPublishOutcome, SearchIngestAdmissionLease,
 };
 pub use tablet_schema::{ColumnId, KeysType, TabletColumn, TabletSchema, TabletSchemaRef};
 
