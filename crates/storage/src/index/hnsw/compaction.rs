@@ -16,7 +16,7 @@ use crate::index::hnsw::{DistanceMetric, HnswConfig};
 use crate::rowset::page::{IndexPageFooter, IndexPageType, PageFooter, PageIO, PagePointer};
 use crate::rowset::segment::{Segment, SegmentFooter, SegmentOptions};
 use crate::rowset::RowsetSharedPtr;
-use crate::search::SearchIndexKind;
+use crate::search::{SearchFreshnessPolicy, SearchIndexDefinition, SearchIndexKind};
 use crate::statistics::HnswIndexStatistics;
 use crate::tablet::Tablet;
 use paro_common::error::{self as paro_error, Result};
@@ -59,7 +59,7 @@ impl HnswIndexRebuilder {
         for definition in generation_context
             .search_definitions
             .iter()
-            .filter(|definition| definition.kind == SearchIndexKind::Hnsw)
+            .filter(|definition| compaction_requires_inline_hnsw(definition))
         {
             let [column_id] = definition.column_ids.as_slice() else {
                 return Err(paro_error::data_corrupted(format!(
@@ -514,6 +514,18 @@ impl HnswIndexRebuilder {
     }
 }
 
+/// Rowset compaction may only rebuild HNSW inside the rowset when the
+/// definition promises synchronous physical freshness. Opportunistic and
+/// bounded-lag definitions are owned by the search generation: rebuilding an
+/// inline graph here creates a second artifact lifecycle, duplicates graph
+/// construction, and multiplies query-time beam work after every table
+/// compaction. Those definitions deliberately expose the compacted rowset as
+/// an exact tail until generation maintenance publishes its replacement.
+fn compaction_requires_inline_hnsw(definition: &SearchIndexDefinition) -> bool {
+    definition.kind == SearchIndexKind::Hnsw
+        && definition.freshness_policy == SearchFreshnessPolicy::Required
+}
+
 impl CompactionIndexRebuilder for HnswIndexRebuilder {
     fn name(&self) -> &'static str {
         "HNSW"
@@ -529,7 +541,7 @@ impl CompactionIndexRebuilder for HnswIndexRebuilder {
         generation_context
             .search_definitions
             .iter()
-            .any(|definition| definition.kind == SearchIndexKind::Hnsw)
+            .any(compaction_requires_inline_hnsw)
     }
 
     fn rebuild(
@@ -578,6 +590,46 @@ mod tests {
     use crate::tablet::tablet_schema::{KeysType, TabletColumn, TabletSchema};
     use std::path::Path;
     use tempfile::TempDir;
+
+    fn definition(
+        kind: SearchIndexKind,
+        freshness_policy: SearchFreshnessPolicy,
+    ) -> SearchIndexDefinition {
+        SearchIndexDefinition {
+            definition_id: 7,
+            table_id: 11,
+            name: "test_index".to_string(),
+            kind,
+            column_ids: vec![1],
+            expression: None,
+            provider_config: serde_json::Value::Null,
+            freshness_policy,
+            config_fingerprint: 13,
+        }
+    }
+
+    #[test]
+    fn rowset_compaction_rebuilds_only_required_hnsw_inline_artifacts() {
+        assert!(compaction_requires_inline_hnsw(&definition(
+            SearchIndexKind::Hnsw,
+            SearchFreshnessPolicy::Required,
+        )));
+        assert!(!compaction_requires_inline_hnsw(&definition(
+            SearchIndexKind::Hnsw,
+            SearchFreshnessPolicy::Opportunistic,
+        )));
+        assert!(!compaction_requires_inline_hnsw(&definition(
+            SearchIndexKind::Hnsw,
+            SearchFreshnessPolicy::BoundedLag {
+                max_tail_rows: 4_096,
+                max_lag_millis: 1_000,
+            },
+        )));
+        assert!(!compaction_requires_inline_hnsw(&definition(
+            SearchIndexKind::FullText,
+            SearchFreshnessPolicy::Required,
+        )));
+    }
 
     fn storage(vectors: &[Vec<f32>]) -> InMemoryVectorStorage {
         let dim = vectors[0].len();
