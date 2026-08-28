@@ -2987,6 +2987,7 @@ impl Tablet {
             meta.delete_rowset_meta(rowset_id);
         }
         meta.set_cumulative_layer_point(snapshot.cumulative_point);
+        meta.set_max_version(snapshot.max_version);
         for rowset in &snapshot.rowsets {
             let mut rowset_meta = rowset.rowset_meta();
             rowset_meta.set_rowset_path(rowset.rowset_path().to_string_lossy().to_string());
@@ -3050,7 +3051,7 @@ impl Tablet {
             },
             schema,
             cumulative_point: self.cumulative_point(),
-            max_version: self.max_version(),
+            max_version: self.max_version().min(visible_version),
             visible_version,
             layout_epoch_cut,
             rowset_catalog_slice,
@@ -3258,6 +3259,7 @@ impl Tablet {
     }
 
     fn sync_runtime_meta_fields(&self, meta: &mut TabletMeta) -> Result<()> {
+        meta.set_max_version(self.max_version());
         meta.set_rssid_mappings(self.rssid_manager.snapshot_entries());
         meta.set_row_id_format_version(CURRENT_ROW_ID_FORMAT_VERSION);
         meta.set_layout_epoch(self.layout_epoch());

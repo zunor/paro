@@ -167,6 +167,14 @@ pub struct TabletMeta {
     /// Cumulative layer point (version boundary for compaction)
     cumulative_layer_point: i64,
 
+    /// Highest table-local publication version represented by this snapshot.
+    ///
+    /// This cannot be derived from rowset end versions: delete-only commits
+    /// advance visibility without creating a rowset. Persisting it separately
+    /// keeps delete-vector selection and derived-index provenance monotonic
+    /// across checkpoint recovery.
+    published_version: i64,
+
     /// Current tablet state
     tablet_state: TabletState,
 
@@ -247,6 +255,7 @@ impl TabletMeta {
             shard_id: 0,
             creation_time: current_timestamp(),
             cumulative_layer_point: -1,
+            published_version: -1,
             tablet_state: TabletState::NotReady,
             schema: Some(schema),
             schema_bytes,
@@ -397,6 +406,10 @@ impl TabletMeta {
     /// Set cumulative layer point
     pub fn set_cumulative_layer_point(&mut self, point: i64) {
         self.cumulative_layer_point = point;
+    }
+
+    pub fn set_max_version(&mut self, version: i64) {
+        self.published_version = version;
     }
 
     /// Set tablet state
@@ -592,6 +605,7 @@ impl TabletMeta {
 
     /// Add a rowset metadata reference
     pub fn add_rowset_meta(&mut self, meta: RowsetMeta) {
+        self.published_version = self.published_version.max(meta.end_version());
         if meta.start_version() > self.cumulative_layer_point {
             self.inc_rowset_metas.push(meta);
         } else {
@@ -642,14 +656,9 @@ impl TabletMeta {
             })
     }
 
-    /// Get max rowset version
+    /// Get the highest table-local publication version.
     pub fn max_version(&self) -> i64 {
-        self.rowset_metas
-            .iter()
-            .chain(self.inc_rowset_metas.iter())
-            .map(|m| m.end_version())
-            .max()
-            .unwrap_or(-1)
+        self.published_version
     }
 
     // ==================== Serialization ====================
@@ -735,6 +744,7 @@ impl TabletMeta {
         for definition_id in &self.retired_search_definition_ids {
             data.extend_from_slice(&definition_id.to_le_bytes());
         }
+        data.extend_from_slice(&self.published_version.to_le_bytes());
 
         Ok(data)
     }
@@ -1036,6 +1046,23 @@ impl TabletMeta {
             Vec::new()
         };
 
+        // Tablet metadata is a strict physical format. Delete-only visibility
+        // requires this durable field, so artifacts without it must be
+        // rebuilt instead of silently inferring a lower rowset-only version.
+        let published_version = read_i64(data, &mut offset)?;
+
+        let max_rowset_version = rowset_metas
+            .iter()
+            .chain(inc_rowset_metas.iter())
+            .map(|meta| meta.end_version())
+            .max()
+            .unwrap_or(-1);
+        if published_version < max_rowset_version {
+            return Err(paro_error::internal(format!(
+                "TabletMeta: published version {published_version} precedes rowset version {max_rowset_version}"
+            )));
+        }
+
         if offset != data.len() {
             return Err(paro_error::internal(
                 "TabletMeta: unexpected trailing bytes",
@@ -1050,6 +1077,7 @@ impl TabletMeta {
             shard_id,
             creation_time,
             cumulative_layer_point,
+            published_version,
             tablet_state,
             schema,
             schema_bytes,
@@ -1243,6 +1271,7 @@ mod tests {
         meta.set_tablet_state(TabletState::Running);
         meta.set_cumulative_layer_point(5);
         meta.add_rowset_meta(RowsetMeta::new(1, 1, Version::singleton(0)));
+        meta.set_max_version(6);
         meta.set_rssid_mappings(vec![RssidMappingEntry {
             rssid: 7,
             rowset_id: 1,
@@ -1295,6 +1324,7 @@ mod tests {
         assert_eq!(restored.tablet_id(), 1);
         assert_eq!(restored.tablet_state(), TabletState::Running);
         assert_eq!(restored.cumulative_layer_point(), 5);
+        assert_eq!(restored.max_version(), 6);
         assert_eq!(restored.num_rowsets(), 1);
         assert_eq!(
             restored.rssid_mappings(),
@@ -1342,6 +1372,20 @@ mod tests {
         );
         assert_eq!(restored.retired_search_definition_ids(), &[76, 77]);
         assert!(restored.schema().is_some());
+    }
+
+    #[test]
+    fn tablet_meta_requires_a_durable_delete_only_publication_version() {
+        let schema = create_test_schema();
+        let mut meta = TabletMeta::new(1, 100, 1000, schema, "/data").unwrap();
+        meta.add_rowset_meta(RowsetMeta::new(1, 1, Version::singleton(3)));
+        meta.set_max_version(7);
+
+        let mut bytes = meta.serialize().unwrap();
+        assert_eq!(TabletMeta::deserialize(&bytes).unwrap().max_version(), 7);
+
+        bytes.truncate(bytes.len() - std::mem::size_of::<i64>());
+        assert!(TabletMeta::deserialize(&bytes).is_err());
     }
 
     #[test]
