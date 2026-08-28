@@ -1038,10 +1038,25 @@ impl PrimaryIndex {
 
         let limit = self.memory_limit.load(Ordering::Acquire);
         if usage > limit {
-            if let Some(cb) = self.on_exceed.lock().as_mut() {
-                cb(usage);
+            // Backpressure is only sound when a bound owner can make
+            // progress by flushing this index. Detached indexes are used to
+            // reconstruct a durable base before publication; waiting on
+            // their soft watermark cannot release memory and turns every
+            // rebuild batch into a fixed timeout. They still account memory,
+            // but admission becomes governed only after the tablet binds its
+            // flush callback.
+            let has_progress_handler = {
+                let mut on_exceed = self.on_exceed.lock();
+                if let Some(callback) = on_exceed.as_mut() {
+                    callback(usage);
+                    true
+                } else {
+                    false
+                }
+            };
+            if has_progress_handler {
+                self.apply_backpressure();
             }
-            self.apply_backpressure();
         }
     }
 
@@ -1417,6 +1432,7 @@ mod tests {
     #[test]
     fn bounded_backpressure_waits_for_memory_relief() {
         let idx = Arc::new(PrimaryIndex::with_options(1, 32));
+        idx.register_mem_exceed_callback(|_| {});
         let key = vec![9u8; 64];
         let idx_writer = idx.clone();
         let key_writer = key.clone();
@@ -1437,6 +1453,23 @@ mod tests {
 
         let elapsed = handle.join().unwrap();
         assert!(elapsed >= Duration::from_millis(10));
+    }
+
+    #[test]
+    fn detached_rebuild_index_does_not_wait_on_unactionable_soft_limit() {
+        let idx = PrimaryIndex::with_options(1, 32);
+        let started = Instant::now();
+
+        for point in 0..128u32 {
+            idx.upsert(
+                make_long_key(point),
+                RowID::new(3, crate::rowset::SegmentRowId::from_raw(point)),
+            );
+        }
+
+        assert_eq!(idx.len(), 128);
+        assert!(idx.memory_usage_bytes() > 32);
+        assert!(started.elapsed() < BACKPRESSURE_MAX_WAIT);
     }
 
     #[test]

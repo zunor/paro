@@ -1748,7 +1748,7 @@ impl SearchIndexRegistry {
         let Some(manifest) = state.manifest.as_ref() else {
             return Ok(0);
         };
-        if !super::maintenance::sidecar_repack_needed(manifest) {
+        if !super::maintenance::sidecar_repack_needed(state.definition.kind, manifest) {
             return Ok(0);
         }
         let generation = state
@@ -6196,6 +6196,7 @@ mod tests {
             .and_then(|state| state.manifest.as_ref())
             .expect("manifest before sidecar repack");
         assert!(super::super::maintenance::sidecar_repack_needed(
+            SearchIndexKind::FullText,
             before_manifest
         ));
         drop(before);
@@ -6221,6 +6222,7 @@ mod tests {
             .expect("manifest after sidecar repack");
         assert_eq!(after_manifest.artifacts.artifacts.len(), 2);
         assert!(!super::super::maintenance::sidecar_repack_needed(
+            SearchIndexKind::FullText,
             after_manifest
         ));
         let package_ids = after_manifest
@@ -7139,6 +7141,21 @@ mod tests {
             table.search_registry().generation_artifact_count(188),
             Some(2)
         );
+        {
+            let current = table.search_registry().view.load();
+            let manifest = current
+                .definitions
+                .get(&188)
+                .and_then(|state| state.manifest.as_ref())
+                .unwrap();
+            assert!(
+                !super::super::maintenance::sidecar_repack_needed(
+                    SearchIndexKind::Hnsw,
+                    manifest
+                ),
+                "HNSW graph fan-out must be reduced by graph compaction, not by copying live graph bytes into another package"
+            );
+        }
 
         let foreground_admission = table
             .tablet()

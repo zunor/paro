@@ -322,7 +322,7 @@ impl MaintenanceScheduler {
         if manifest_delta_compaction_requested && matches!(action, SearchMaintenanceAction::Skip) {
             action = SearchMaintenanceAction::CompactManifestDelta;
         }
-        let sidecar_repack_requested = sidecar_repack_needed(manifest);
+        let sidecar_repack_requested = sidecar_repack_needed(definition.kind, manifest);
         if sidecar_repack_requested && matches!(action, SearchMaintenanceAction::Skip) {
             action = SearchMaintenanceAction::RepackSidecar;
         }
@@ -995,7 +995,16 @@ fn estimate_maintenance_cost_benefit(
     estimate
 }
 
-pub(crate) fn sidecar_repack_needed(manifest: &LoadedManifest) -> bool {
+pub(crate) fn sidecar_repack_needed(kind: SearchIndexKind, manifest: &LoadedManifest) -> bool {
+    // HNSW artifacts are complete immutable graphs, not small postings that
+    // benefit from sharing a package. Repacking a newly appended catch-up
+    // graph would copy the multi-gigabyte base graph merely to save one file
+    // open, while blocking the only maintenance lane needed to keep ingest
+    // fresh. Graph fan-out is reduced by generation compaction, which also
+    // improves query execution; byte-for-byte package consolidation does not.
+    if kind == SearchIndexKind::Hnsw {
+        return false;
+    }
     let stats = sidecar_package_stats(manifest);
     stats.package_count > sidecar_package_target(stats.artifact_count)
 }
