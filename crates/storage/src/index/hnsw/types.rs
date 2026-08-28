@@ -23,7 +23,7 @@ pub const DEFAULT_HNSW_BUILD_SEED: u64 = 0x5041_524f_484e_5357;
 pub const DEFAULT_HNSW_M: u32 = 24;
 pub const DEFAULT_HNSW_EF_CONSTRUCT: u32 = 100;
 pub const DEFAULT_HNSW_EF_SEARCH: u32 = 100;
-pub const DEFAULT_HNSW_PROPOSAL_WAVE_SIZE: u32 = 64;
+pub const DEFAULT_HNSW_PROPOSAL_WAVE_MAX_SIZE: u32 = 512;
 pub const DEFAULT_HNSW_WARMUP_POINT_COUNT: u32 = 4_096;
 pub const DEFAULT_HNSW_FILTER_BLOCK_ROWS: u32 = 20_000;
 pub const DEFAULT_HNSW_FILTER_M: u32 = 8;
@@ -52,6 +52,13 @@ pub const DEFAULT_HNSW_GRAPH_SCORED_POINTS_PER_EF: u32 = 24;
 pub const HNSW_BUILT_IN_DISTANCE_COST_REVISION: u32 = 5;
 pub const MAX_HNSW_FILTER_COLUMNS: usize = 8;
 pub const HNSW_FILTER_TOPOLOGY_VERSION: u32 = 4;
+/// Version 16 makes bounded construction-neighbor batches part of the exact
+/// f32 topology algorithm. Batched L2 scoring shares query loads and exposes
+/// independent random rows to the architecture kernel; its reduction order is
+/// therefore versioned durable topology semantics rather than a runtime-only
+/// execution choice. It also replaces one fixed proposal-wave width with a
+/// persisted maximum and deterministic power-of-two growth based only on the
+/// published prefix. Worker count can change execution speed, never topology.
 /// Version 15 gives symmetric-i16 construction and query scoring one portable
 /// four-lane arithmetic contract with an AArch64 SIMD implementation. The
 /// reduction order is durable topology semantics because last-bit score
@@ -91,7 +98,7 @@ pub const HNSW_FILTER_TOPOLOGY_VERSION: u32 = 4;
 /// followed by cycle walking. One-point warm-up waves and deterministic frozen
 /// proposal waves remain durable topology fields; changing point ordering or
 /// publication semantics requires a new contract version.
-pub const HNSW_BUILD_CONTRACT_VERSION: u32 = 15;
+pub const HNSW_BUILD_CONTRACT_VERSION: u32 = 16;
 /// Maximum number of deterministic source coordinates retained by the
 /// compact construction routing space. The original f32 dimension remains
 /// authoritative for SQL scoring and exact re-ranking.
@@ -1162,8 +1169,9 @@ pub struct HnswBuildContract {
     pub distance: super::DistanceMetric,
     pub vector_encoding: HnswBuildVectorEncoding,
     pub build_seed: u64,
-    /// Number of point proposals computed against one frozen topology.
-    pub proposal_wave_size: u32,
+    /// Maximum point proposals computed against one frozen topology. The
+    /// versioned builder grows toward this bound from the published prefix.
+    pub proposal_wave_max_size: u32,
     /// Number of points published as one-point waves before batched waves.
     pub warmup_point_count: u32,
     /// Predicate-local topology built from explicitly named scalar columns.
@@ -1190,10 +1198,10 @@ impl HnswBuildContract {
                 self.ef_construct, self.m
             )));
         }
-        if !(1..=4_096).contains(&self.proposal_wave_size) {
+        if !(1..=4_096).contains(&self.proposal_wave_max_size) {
             return Err(paro_common::error::data_corrupted(format!(
-                "invalid HNSW proposal_wave_size {}, expected 1..=4096",
-                self.proposal_wave_size
+                "invalid HNSW proposal_wave_max_size {}, expected 1..=4096",
+                self.proposal_wave_max_size
             )));
         }
         if self.warmup_point_count > 1_000_000_000 {
@@ -1320,7 +1328,7 @@ impl HnswConfig {
             distance,
             vector_encoding: HnswBuildVectorEncoding::ExactF32,
             build_seed: self.build_seed,
-            proposal_wave_size: DEFAULT_HNSW_PROPOSAL_WAVE_SIZE,
+            proposal_wave_max_size: DEFAULT_HNSW_PROPOSAL_WAVE_MAX_SIZE,
             warmup_point_count: DEFAULT_HNSW_WARMUP_POINT_COUNT,
             filter_topology: HnswFilterTopologyContract::default(),
         };

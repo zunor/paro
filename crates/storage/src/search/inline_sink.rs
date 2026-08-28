@@ -1098,7 +1098,7 @@ mod tests {
                     "graph_scored_points_per_ef": crate::search::DEFAULT_HNSW_GRAPH_SCORED_POINTS_PER_EF
                 },
                 "build_seed": 1,
-                "proposal_wave_size": crate::search::DEFAULT_HNSW_PROPOSAL_WAVE_SIZE,
+                "proposal_wave_max_size": crate::search::DEFAULT_HNSW_PROPOSAL_WAVE_MAX_SIZE,
                 "warmup_point_count": crate::search::DEFAULT_HNSW_WARMUP_POINT_COUNT,
                 "filter_columns": [],
                 "filter_block_rows": crate::search::DEFAULT_HNSW_FILTER_BLOCK_ROWS,

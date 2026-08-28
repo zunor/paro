@@ -229,6 +229,29 @@ pub trait VectorStorage: Send + Sync {
             distance.similarity(self.get_vector(left), self.get_vector(right))
         }
     }
+
+    /// Score one construction point against a bounded neighbor row.
+    ///
+    /// This is a storage capability rather than a builder-side representation
+    /// check: exact f32 and compact routing artifacts own different physical
+    /// arithmetic, and only the storage that defines that arithmetic may batch
+    /// it. The default preserves the scalar contract for representations that
+    /// do not yet expose a batch kernel.
+    fn construction_similarities(
+        &self,
+        distance: DistanceMetric,
+        left: PointOffset,
+        rights: &[PointOffset],
+        scores: &mut [f32],
+    ) {
+        assert!(
+            scores.len() >= rights.len(),
+            "construction score buffer is shorter than point batch"
+        );
+        for (&right, score) in rights.iter().zip(scores.iter_mut()) {
+            *score = self.construction_similarity(distance, left, right);
+        }
+    }
 }
 
 const I16_BUILD_ALIGNMENT: usize = 16;
@@ -244,8 +267,13 @@ const MAX_OWNED_I16_BUILD_BYTES: usize = 64 * 1024 * 1024;
 /// base storage remains retained for metric metadata, while graph construction
 /// and later artifact serialization consume this exact bitwise image.
 struct ExactF32BuildVectorStorage {
-    base: Arc<dyn VectorStorage>,
-    vectors: Mmap,
+    /// Retained only when the source was already one contiguous image. A
+    /// materialized generation workspace deliberately drops all source page
+    /// mappings after the bitwise copy so the OS cannot keep both complete
+    /// f32 images resident during the graph build.
+    base: Option<Arc<dyn VectorStorage>>,
+    materialized_vectors: Option<Mmap>,
+    cosine_inverse_norms: Option<CosineInverseNorms>,
     dimension: usize,
     count: usize,
 }
@@ -256,7 +284,16 @@ impl ExactF32BuildVectorStorage {
         workspace_dir: Option<&Path>,
     ) -> Result<Arc<dyn VectorStorage>> {
         if base.contiguous_vectors().is_some() {
-            return Ok(base);
+            let dimension = base.vector_dim();
+            let count = base.num_vectors();
+            let cosine_inverse_norms = base.cosine_inverse_norms().cloned();
+            return Ok(Arc::new(Self {
+                base: Some(base),
+                materialized_vectors: None,
+                cosine_inverse_norms,
+                dimension,
+                count,
+            }));
         }
         let Some(workspace_dir) = workspace_dir else {
             // Low-level and bounded inline callers may deliberately operate
@@ -317,10 +354,12 @@ impl ExactF32BuildVectorStorage {
                 "HNSW exact-f32 build copied {written} values, expected {value_count}"
             )));
         }
+        let cosine_inverse_norms = base.cosine_inverse_norms().cloned();
 
         Ok(Arc::new(Self {
-            base,
-            vectors: mmap.make_read_only()?,
+            base: None,
+            materialized_vectors: Some(mmap.make_read_only()?),
+            cosine_inverse_norms,
             dimension,
             count,
         }))
@@ -337,13 +376,16 @@ impl VectorStorage for ExactF32BuildVectorStorage {
     }
 
     fn contiguous_vectors(&self) -> Option<&[f32]> {
+        let Some(vectors) = self.materialized_vectors.as_ref() else {
+            return self
+                .base
+                .as_ref()
+                .and_then(|base| base.contiguous_vectors());
+        };
         // SAFETY: `prepare` proves page alignment and exact f32 row-major
         // length before converting the private mapping to read-only.
         Some(unsafe {
-            std::slice::from_raw_parts(
-                self.vectors.as_ptr().cast::<f32>(),
-                self.count * self.dimension,
-            )
+            std::slice::from_raw_parts(vectors.as_ptr().cast::<f32>(), self.count * self.dimension)
         })
     }
 
@@ -356,11 +398,45 @@ impl VectorStorage for ExactF32BuildVectorStorage {
     }
 
     fn cosine_inverse_norms(&self) -> Option<&CosineInverseNorms> {
-        self.base.cosine_inverse_norms()
+        self.cosine_inverse_norms.as_ref()
     }
 
     fn is_mmap_backed(&self) -> bool {
-        true
+        self.materialized_vectors.is_some()
+            || self.base.as_ref().is_some_and(|base| base.is_mmap_backed())
+    }
+
+    fn construction_similarities(
+        &self,
+        distance: DistanceMetric,
+        left: PointOffset,
+        rights: &[PointOffset],
+        scores: &mut [f32],
+    ) {
+        assert!(
+            scores.len() >= rights.len(),
+            "construction score buffer is shorter than point batch"
+        );
+        if distance != DistanceMetric::Euclidean {
+            for (&right, score) in rights.iter().zip(scores.iter_mut()) {
+                *score = self.construction_similarity(distance, left, right);
+            }
+            return;
+        }
+
+        let vectors = self
+            .contiguous_vectors()
+            .unwrap_or_else(|| unreachable!("exact-f32 build storage is contiguous"));
+        paro_common::distance::l2_squared_batch_indexed(
+            self.get_vector(left),
+            vectors,
+            self.dimension,
+            rights,
+            scores,
+        );
+        for score in scores.iter_mut().take(rights.len()) {
+            *score = -*score;
+        }
     }
 }
 
@@ -2123,16 +2199,6 @@ mod tests {
             Arc::new(PartitionedVectorStorage::try_new(vec![first, second], 2).unwrap());
         assert!(partitioned.contiguous_vectors().is_none());
         let workspace = tempfile::tempdir().unwrap();
-
-        let prepared = prepare_build_vector_storage(
-            Arc::clone(&partitioned),
-            super::super::HnswBuildVectorEncoding::ExactF32,
-            17,
-            Some(workspace.path()),
-        )
-        .unwrap();
-
-        assert!(prepared.is_mmap_backed());
         let expected = (0..partitioned.num_vectors() as PointOffset)
             .flat_map(|point| {
                 partitioned
@@ -2141,6 +2207,23 @@ mod tests {
                     .map(|value| value.to_bits())
             })
             .collect::<Vec<_>>();
+        let expected_point_3 = partitioned.get_vector(3).to_vec();
+        let source = Arc::downgrade(&partitioned);
+
+        let prepared = prepare_build_vector_storage(
+            Arc::clone(&partitioned),
+            super::super::HnswBuildVectorEncoding::ExactF32,
+            17,
+            Some(workspace.path()),
+        )
+        .unwrap();
+        drop(partitioned);
+
+        assert!(prepared.is_mmap_backed());
+        assert!(
+            source.upgrade().is_none(),
+            "materialized exact-f32 builds must release source page mappings"
+        );
         let actual = prepared
             .contiguous_vectors()
             .unwrap()
@@ -2148,7 +2231,34 @@ mod tests {
             .map(|value| value.to_bits())
             .collect::<Vec<_>>();
         assert_eq!(actual, expected);
-        assert_eq!(prepared.get_vector(3), partitioned.get_vector(3));
+        assert_eq!(prepared.get_vector(3), expected_point_3);
+    }
+
+    #[test]
+    fn exact_f32_build_batches_euclidean_construction_scores() {
+        let vectors = vec![
+            1.0_f32, 2.0, 3.0, 4.0, // point 0
+            2.0, 4.0, 6.0, 8.0, // point 1
+            -1.0, -2.0, -3.0, -4.0, // point 2
+            0.5, 1.5, 2.5, 3.5, // point 3
+        ];
+        let raw: Arc<dyn VectorStorage> = Arc::new(InMemoryVectorStorage::new(vectors, 4));
+        let prepared = prepare_build_vector_storage(
+            raw,
+            super::super::HnswBuildVectorEncoding::ExactF32,
+            17,
+            None,
+        )
+        .unwrap();
+        let rights = [1, 2, 3];
+        let mut scores = [0.0; 3];
+
+        prepared.construction_similarities(DistanceMetric::Euclidean, 0, &rights, &mut scores);
+
+        for (&right, &score) in rights.iter().zip(scores.iter()) {
+            let expected = prepared.construction_similarity(DistanceMetric::Euclidean, 0, right);
+            assert!((score - expected).abs() <= f32::EPSILON * expected.abs().max(1.0));
+        }
     }
 
     #[test]

@@ -14,7 +14,7 @@ pub use crate::index::hnsw::types::{
     DEFAULT_HNSW_BUILD_SEED, DEFAULT_HNSW_EF_CONSTRUCT, DEFAULT_HNSW_EF_SEARCH,
     DEFAULT_HNSW_EXACT_F32_DIMENSION_COST_UNITS, DEFAULT_HNSW_FILTER_BLOCK_ROWS,
     DEFAULT_HNSW_FILTER_M, DEFAULT_HNSW_GRAPH_SCORED_POINTS_PER_EF, DEFAULT_HNSW_M,
-    DEFAULT_HNSW_PROPOSAL_WAVE_SIZE, DEFAULT_HNSW_RANDOM_ACCESS_COST_UNITS,
+    DEFAULT_HNSW_PROPOSAL_WAVE_MAX_SIZE, DEFAULT_HNSW_RANDOM_ACCESS_COST_UNITS,
     DEFAULT_HNSW_SEQUENTIAL_DIMENSION_COST_UNITS, DEFAULT_HNSW_SYMMETRIC_I16_DIMENSION_COST_UNITS,
     DEFAULT_HNSW_WARMUP_POINT_COUNT, HNSW_BUILT_IN_DISTANCE_COST_REVISION,
 };
@@ -29,6 +29,10 @@ use super::provider_config::{
     decode_provider_config, encode_provider_config, StrictProviderConfig,
 };
 
+/// Version 23 makes `proposal_wave_max_size` an explicit topology bound and
+/// grows deterministic frozen waves with the published graph. This preserves
+/// fresh early topology while giving mature generations enough independent
+/// proposals to keep the shared build pool occupied.
 /// Version 22 makes sustained-ingest maintenance use 64 MiB build quanta and
 /// four-way radix carry. Combined catch-up/carry publication keeps query
 /// fan-out bounded while amortizing graph reconstruction; the old 8 MiB,
@@ -59,7 +63,7 @@ use super::provider_config::{
 /// generation. Artifact-envelope compatibility is versioned independently;
 /// provider-config versions describe the definition and build contract rather
 /// than the physical checksum hierarchy used by a particular binary.
-pub const HNSW_PROVIDER_CONFIG_VERSION: u32 = 22;
+pub const HNSW_PROVIDER_CONFIG_VERSION: u32 = 23;
 
 pub const DEFAULT_HNSW_MAINTENANCE_TARGET_VECTOR_BYTES: u64 = 64 * 1024 * 1024;
 pub const DEFAULT_HNSW_MAINTENANCE_MAX_PENDING_VECTOR_BYTES: u64 = 256 * 1024 * 1024;
@@ -135,7 +139,7 @@ pub struct HnswProviderConfig {
     pub distance_cost: HnswDistanceCostProfile,
     pub maintenance: HnswMaintenancePolicy,
     pub build_seed: u64,
-    pub proposal_wave_size: u32,
+    pub proposal_wave_max_size: u32,
     pub warmup_point_count: u32,
     pub filter_columns: Vec<u32>,
     pub filter_block_rows: u32,
@@ -190,10 +194,10 @@ impl HnswProviderConfig {
                 self.m, self.ef_construct
             )));
         }
-        if !(1..=4_096).contains(&self.proposal_wave_size) {
+        if !(1..=4_096).contains(&self.proposal_wave_max_size) {
             return Err(paro_error::invalid_input(format!(
-                "HNSW proposal_wave_size must be between 1 and 4096, got {}",
-                self.proposal_wave_size
+                "HNSW proposal_wave_max_size must be between 1 and 4096, got {}",
+                self.proposal_wave_max_size
             )));
         }
         if self.warmup_point_count > 1_000_000_000 {
@@ -342,7 +346,7 @@ impl HnswProviderConfig {
             distance: self.distance,
             vector_encoding: self.build_vector_encoding,
             build_seed: self.build_seed,
-            proposal_wave_size: self.proposal_wave_size,
+            proposal_wave_max_size: self.proposal_wave_max_size,
             warmup_point_count: self.warmup_point_count,
             filter_topology: HnswFilterTopologyContract::from_columns(
                 &self.filter_columns,
@@ -394,7 +398,7 @@ mod tests {
             distance_cost: HnswDistanceCostProfile::default(),
             maintenance: HnswMaintenancePolicy::default(),
             build_seed: DEFAULT_HNSW_BUILD_SEED,
-            proposal_wave_size: DEFAULT_HNSW_PROPOSAL_WAVE_SIZE,
+            proposal_wave_max_size: DEFAULT_HNSW_PROPOSAL_WAVE_MAX_SIZE,
             warmup_point_count: DEFAULT_HNSW_WARMUP_POINT_COUNT,
             filter_columns: Vec::new(),
             filter_block_rows: DEFAULT_HNSW_FILTER_BLOCK_ROWS,

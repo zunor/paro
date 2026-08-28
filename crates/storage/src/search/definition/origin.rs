@@ -54,7 +54,7 @@ pub(crate) fn schema_seed_definition(
         distance_cost: defaults.distance_cost,
         maintenance: crate::search::HnswMaintenancePolicy::default(),
         build_seed: DEFAULT_HNSW_BUILD_SEED,
-        proposal_wave_size: crate::index::hnsw::DEFAULT_HNSW_PROPOSAL_WAVE_SIZE,
+        proposal_wave_max_size: crate::index::hnsw::DEFAULT_HNSW_PROPOSAL_WAVE_MAX_SIZE,
         warmup_point_count: crate::index::hnsw::DEFAULT_HNSW_WARMUP_POINT_COUNT,
         filter_columns: Vec::new(),
         filter_block_rows: crate::index::hnsw::DEFAULT_HNSW_FILTER_BLOCK_ROWS,

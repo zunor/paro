@@ -444,6 +444,22 @@ impl DeterministicPointOrder {
     }
 }
 
+/// Choose a topology-defined frozen-wave width from the already published
+/// prefix. The schedule is deliberately independent of the worker grant: two
+/// replicas with different CPU counts must publish identical wave boundaries.
+/// Power-of-two growth keeps early insertion topology fresh, then amortizes
+/// barriers and straggler variance once the missing same-wave fraction is
+/// negligible relative to the mature graph.
+fn deterministic_proposal_wave_size(published_points: usize, max_size: usize) -> usize {
+    const PUBLISHED_POINTS_PER_WAVE_SLOT: usize = 64;
+    let target = published_points
+        .checked_div(PUBLISHED_POINTS_PER_WAVE_SLOT)
+        .unwrap_or(0)
+        .max(1);
+    let rounded = 1usize << target.ilog2();
+    rounded.min(max_size.max(1))
+}
+
 fn splitmix64(mut value: u64) -> u64 {
     value = value.wrapping_add(0x9e37_79b9_7f4a_7c15);
     value = (value ^ (value >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
@@ -590,7 +606,7 @@ fn decode_build_contract(header: &[u8]) -> Result<(HnswBuildContract, usize)> {
                     .expect("u64 width"),
             )
         },
-        proposal_wave_size: read_u32(&mut offset, "proposal wave size")?,
+        proposal_wave_max_size: read_u32(&mut offset, "proposal wave max size")?,
         warmup_point_count: read_u32(&mut offset, "warm-up point count")?,
         filter_topology: HnswFilterTopologyContract::default(),
     };
@@ -1368,11 +1384,13 @@ impl HnswIndex {
         }
 
         if warmup_end < num_vectors {
-            let wave_size = build_contract.proposal_wave_size as usize;
-            for wave_start in (warmup_end..num_vectors).step_by(wave_size) {
+            let wave_max_size = build_contract.proposal_wave_max_size as usize;
+            let mut wave_start = warmup_end;
+            while wave_start < num_vectors {
                 if stop_check.is_some_and(|check| check.should_stop()) {
                     return Err(error::query_canceled());
                 }
+                let wave_size = deterministic_proposal_wave_size(wave_start, wave_max_size);
                 let wave_end = wave_start.saturating_add(wave_size).min(num_vectors);
                 let entry_points = builder.snapshot_entry_points();
                 let proposals = if let Some(pool) = pool {
@@ -1449,6 +1467,7 @@ impl HnswIndex {
                 } else {
                     builder.publish_frozen_wave(proposals, storage.as_ref(), distance, 1);
                 }
+                wave_start = wave_end;
             }
         }
 
@@ -2009,7 +2028,7 @@ impl HnswIndex {
                 .to_le_bytes(),
         );
         header.extend_from_slice(&self.build_contract.build_seed.to_le_bytes());
-        header.extend_from_slice(&self.build_contract.proposal_wave_size.to_le_bytes());
+        header.extend_from_slice(&self.build_contract.proposal_wave_max_size.to_le_bytes());
         header.extend_from_slice(&self.build_contract.warmup_point_count.to_le_bytes());
         let norm_count = self
             .vector_storage
@@ -4175,6 +4194,17 @@ mod tests {
     }
 
     #[test]
+    fn proposal_wave_growth_is_deterministic_and_bounded() {
+        assert_eq!(deterministic_proposal_wave_size(4_096, 512), 64);
+        assert_eq!(deterministic_proposal_wave_size(8_191, 512), 64);
+        assert_eq!(deterministic_proposal_wave_size(8_192, 512), 128);
+        assert_eq!(deterministic_proposal_wave_size(16_384, 512), 256);
+        assert_eq!(deterministic_proposal_wave_size(32_768, 512), 512);
+        assert_eq!(deterministic_proposal_wave_size(1_000_000, 100), 100);
+        assert_eq!(deterministic_proposal_wave_size(0, 1), 1);
+    }
+
+    #[test]
     fn frozen_wave_build_is_byte_deterministic_across_pool_widths() {
         let vectors = make_sift_like_vectors(0xdef, 4_352, 24, 16);
         for distance in [DistanceMetric::Euclidean, DistanceMetric::Cosine] {
@@ -4220,6 +4250,28 @@ mod tests {
             assert_eq!(width_1, build_with_grant(2), "distance={distance:?}");
             assert_eq!(width_1, build_with_grant(5), "distance={distance:?}");
         }
+    }
+
+    #[test]
+    fn exact_f32_batched_build_is_byte_deterministic_across_pool_widths() {
+        let vectors = make_sift_like_vectors(0x7a11, 2_048, 128, 16);
+        let contract = HnswConfig::new(12, 72)
+            .with_build_seed(0x36a1_c750_93de_2b84)
+            .build_contract(DistanceMetric::Euclidean);
+        let build = |width| {
+            let pool = rayon::ThreadPoolBuilder::new()
+                .num_threads(width)
+                .build()
+                .unwrap();
+            HnswIndex::build_with_controls(make_storage(&vectors), contract, Some(&pool), None)
+                .unwrap()
+                .serialize()
+                .unwrap()
+        };
+
+        let width_1 = build(1);
+        assert_eq!(width_1, build(2));
+        assert_eq!(width_1, build(8));
     }
 
     #[test]

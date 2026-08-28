@@ -11,8 +11,9 @@ use paro_storage::compaction::execution::statistics_merge::merge_rowset_statisti
 use paro_storage::compaction::plan::CompactionPlanner;
 use paro_storage::index::fulltext::text_index::FullTextIndex;
 use paro_storage::index::hnsw::{
-    DistanceMetric, HnswBuildContract, DEFAULT_HNSW_BUILD_SEED, DEFAULT_HNSW_PROPOSAL_WAVE_SIZE,
-    DEFAULT_HNSW_WARMUP_POINT_COUNT, HNSW_BUILD_CONTRACT_VERSION,
+    DistanceMetric, HnswBuildContract, DEFAULT_HNSW_BUILD_SEED,
+    DEFAULT_HNSW_PROPOSAL_WAVE_MAX_SIZE, DEFAULT_HNSW_WARMUP_POINT_COUNT,
+    HNSW_BUILD_CONTRACT_VERSION,
 };
 use paro_storage::primary_key::DeleteVector;
 use paro_storage::rowset::{
@@ -191,7 +192,7 @@ fn test_index_statistics() {
                 distance: DistanceMetric::Cosine,
                 vector_encoding: paro_storage::index::hnsw::HnswBuildVectorEncoding::ExactF32,
                 build_seed: DEFAULT_HNSW_BUILD_SEED,
-                proposal_wave_size: DEFAULT_HNSW_PROPOSAL_WAVE_SIZE,
+                proposal_wave_max_size: DEFAULT_HNSW_PROPOSAL_WAVE_MAX_SIZE,
                 warmup_point_count: DEFAULT_HNSW_WARMUP_POINT_COUNT,
                 filter_topology: Default::default(),
             },

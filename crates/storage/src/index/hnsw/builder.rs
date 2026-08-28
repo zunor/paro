@@ -344,6 +344,7 @@ impl GraphLayersBuilder {
         let mut current_score = Self::score_indexed(storage, distance, point_id, current_point);
         let mut current_level = entry_point.level;
         let mut neighbor_buffer = Vec::with_capacity(self.hnsw_m.m0);
+        let mut neighbor_scores = Vec::with_capacity(self.hnsw_m.m0);
 
         while current_level > target_level {
             let mut changed = true;
@@ -359,8 +360,16 @@ impl GraphLayersBuilder {
                 for &neighbor in &neighbor_buffer {
                     storage.prefetch_construction_point(neighbor);
                 }
-                for &neighbor in &neighbor_buffer {
-                    let neighbor_score = Self::score_indexed(storage, distance, point_id, neighbor);
+                neighbor_scores.resize(neighbor_buffer.len(), 0.0);
+                storage.construction_similarities(
+                    distance,
+                    point_id,
+                    &neighbor_buffer,
+                    &mut neighbor_scores,
+                );
+                for (&neighbor, &neighbor_score) in
+                    neighbor_buffer.iter().zip(neighbor_scores.iter())
+                {
                     if neighbor_score > current_score {
                         current_score = neighbor_score;
                         current_point = neighbor;
@@ -589,6 +598,7 @@ impl GraphLayersBuilder {
     ) -> Vec<ScoredPoint> {
         let mut search_context = SearchContext::new(entry_points[0], ef);
         let mut neighbors = Vec::with_capacity(self.hnsw_m.get_m(level));
+        let mut neighbor_scores = Vec::with_capacity(self.hnsw_m.get_m(level));
 
         visited.check_and_update_visited(entry_points[0].idx);
         for ep in entry_points.iter().skip(1) {
@@ -611,8 +621,14 @@ impl GraphLayersBuilder {
             for &neighbor in &neighbors {
                 storage.prefetch_construction_point(neighbor);
             }
-            for &neighbor in &neighbors {
-                let score = Self::score_indexed(storage, distance, query_point, neighbor);
+            neighbor_scores.resize(neighbors.len(), 0.0);
+            storage.construction_similarities(
+                distance,
+                query_point,
+                &neighbors,
+                &mut neighbor_scores,
+            );
+            for (&neighbor, &score) in neighbors.iter().zip(neighbor_scores.iter()) {
                 search_context.process_candidate(ScoredPoint {
                     idx: neighbor,
                     score,

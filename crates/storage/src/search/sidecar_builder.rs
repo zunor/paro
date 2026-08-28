@@ -1057,7 +1057,7 @@ mod tests {
             distance_cost: crate::index::hnsw::HnswDistanceCostProfile::default(),
             maintenance: crate::search::HnswMaintenancePolicy::default(),
             build_seed: 17,
-            proposal_wave_size: 4,
+            proposal_wave_max_size: 4,
             warmup_point_count: 4,
             filter_columns: vec![0],
             filter_block_rows: 4,
