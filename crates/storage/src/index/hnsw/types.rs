@@ -122,14 +122,17 @@ impl HnswBuildVectorEncoding {
     }
 
     pub fn default_for_dimension(dimension: u32) -> paro_common::error::Result<Self> {
-        if dimension <= DEFAULT_HNSW_BUILD_ROUTING_DIMENSIONS {
-            // Compact routing would retain every source coordinate here while
-            // adding a second lossy image and an exact-rerank pass beside the
-            // already-authoritative f32 artifact. Exact routing is both
-            // smaller in total resident state and faster at this boundary.
+        if dimension < DEFAULT_HNSW_BUILD_ROUTING_DIMENSIONS {
+            // Below one full compact routing row, the second physical image
+            // and exact-rerank pass do not reliably repay their fixed cost.
             Ok(Self::ExactF32)
         } else {
-            Self::symmetric_i16(DEFAULT_HNSW_BUILD_ROUTING_DIMENSIONS)
+            // At and above 128 dimensions, random graph traversal is governed
+            // by routing-row residency rather than total artifact bytes. A
+            // symmetric i16 image halves that hot row at the 128d boundary,
+            // while the canonical f32 matrix remains authoritative for exact
+            // reranking and SQL-visible scores.
+            Self::symmetric_i16(dimension.min(DEFAULT_HNSW_BUILD_ROUTING_DIMENSIONS))
         }
     }
 
@@ -157,13 +160,13 @@ mod build_vector_encoding_tests {
     use super::*;
 
     #[test]
-    fn default_encoding_avoids_a_redundant_lossy_image_at_low_dimension() {
+    fn default_encoding_uses_compact_routing_at_the_random_access_boundary() {
         assert_eq!(
-            HnswBuildVectorEncoding::default_for_dimension(128).unwrap(),
+            HnswBuildVectorEncoding::default_for_dimension(127).unwrap(),
             HnswBuildVectorEncoding::ExactF32
         );
         assert_eq!(
-            HnswBuildVectorEncoding::default_for_dimension(129).unwrap(),
+            HnswBuildVectorEncoding::default_for_dimension(128).unwrap(),
             HnswBuildVectorEncoding::symmetric_i16(128).unwrap()
         );
         assert_eq!(

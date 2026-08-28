@@ -371,12 +371,10 @@ fn hnsw_provider_config(
         ))
     })?;
     let compact_build_vectors = match options.get("build_vector_encoding").map(String::as_str) {
-        None => *dimension
-            > usize::try_from(paro_storage::index::hnsw::DEFAULT_HNSW_BUILD_ROUTING_DIMENSIONS)
-                .unwrap_or(usize::MAX),
+        None => None,
         Some(value) => match value.to_ascii_lowercase().as_str() {
-        "exact_f32" | "f32" => false,
-        "symmetric_i16" | "i16" => true,
+        "exact_f32" | "f32" => Some(false),
+        "symmetric_i16" | "i16" => Some(true),
         value => {
             return Err(paro_error::invalid_input(format!(
                 "HNSW index option build_vector_encoding must be exact_f32 or symmetric_i16, got '{value}'"
@@ -544,12 +542,22 @@ fn hnsw_provider_config(
     let dimension = u32::try_from(*dimension).map_err(|_| {
         paro_error::invalid_input(format!("HNSW vector dimension exceeds {}", u32::MAX))
     })?;
+    let default_build_vector_encoding =
+        paro_storage::index::hnsw::HnswBuildVectorEncoding::default_for_dimension(dimension)?;
+    let compact_build_vectors = compact_build_vectors
+        .unwrap_or_else(|| default_build_vector_encoding.routing_dimensions().is_some());
     let build_routing_dimensions = if compact_build_vectors {
         parse_u64_index_option(
             options,
             "build_routing_dimensions",
             u64::from(
-                dimension.min(paro_storage::index::hnsw::DEFAULT_HNSW_BUILD_ROUTING_DIMENSIONS),
+                default_build_vector_encoding
+                    .routing_dimensions()
+                    .unwrap_or_else(|| {
+                        dimension
+                            .min(paro_storage::index::hnsw::DEFAULT_HNSW_BUILD_ROUTING_DIMENSIONS)
+                            as u16
+                    }),
             ),
         )?
     } else {
@@ -1155,6 +1163,20 @@ mod tests {
             128
         );
         assert_eq!(bound.info.provider_config["rerank_policy"], "ef");
+
+        let auto = bind_create_index(
+            &mut binder,
+            parse_create_index_stmt("CREATE VECTOR INDEX idx_auto ON items (embedding)"),
+        )
+        .expect("128d auto encoding should use the storage-owned default");
+        let BoundStatementKind::CreateIndex(auto) = auto else {
+            panic!("expected bound CREATE INDEX");
+        };
+        assert_eq!(
+            auto.info.provider_config["build_vector_encoding"],
+            bound.info.provider_config["build_vector_encoding"]
+        );
+        assert_eq!(auto.info.provider_config["rerank_policy"], "ef");
     }
 
     #[test]
