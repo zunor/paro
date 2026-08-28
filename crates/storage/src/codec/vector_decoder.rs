@@ -134,13 +134,6 @@ impl<'a> FloatArrayBatchView<'a> {
         row < self.rows && self.nulls.is_none_or(|nulls| nulls[row] == 0)
     }
 
-    pub(crate) fn owned_bytes(&self) -> usize {
-        match &self.values {
-            Cow::Borrowed(_) => 0,
-            Cow::Owned(values) => values.len().saturating_mul(std::mem::size_of::<f32>()),
-        }
-    }
-
     #[cfg(test)]
     fn is_borrowed(&self) -> bool {
         matches!(self.values, Cow::Borrowed(_))

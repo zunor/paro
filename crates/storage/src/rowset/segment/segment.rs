@@ -11,6 +11,7 @@ use super::segment_indexes::{SegmentIndexStats, SegmentIndexes};
 use super::segment_iterator::SegmentIterator;
 use crate::buffer::{PageCache, Prefetcher};
 use crate::codec::physical_layout::fixed_row_width;
+use crate::index::hnsw::{open_plain_vector_column, VectorStorage};
 use crate::index::short_key::ShortKeyIndexDecoder;
 use crate::metrics::storage_metrics;
 use crate::rowset::column::{
@@ -164,6 +165,15 @@ pub struct Segment {
     pub(super) meta: SegmentMeta,
     pub(super) statistics: Option<SegmentStatistics>,
     pub(super) column_readers: RwLock<HashMap<ColumnId, Arc<SharedColumnReader<PositionedFile>>>>,
+    /// Immutable mmap views over plain vector pages.
+    ///
+    /// These views belong to the structural segment rather than a query
+    /// runtime view.  A sparse rerank or an exact HNSW tail scan must never
+    /// admit a multi-gigabyte plain page into the decoded page cache merely to
+    /// read a handful of rows.  The first opener validates the page envelope
+    /// and checksum; every later query reuses the same read-only mapping.
+    pub(super) plain_vector_storages:
+        Arc<RwLock<HashMap<(ColumnId, usize), Arc<dyn VectorStorage>>>>,
     /// One immutable file handle per loaded segment. Column iterators own only
     /// a logical cursor and use positioned reads, so independent scan morsels
     /// neither reopen the file nor share a mutable OS seek position.
@@ -292,6 +302,7 @@ impl Segment {
             meta: self.meta.clone(),
             statistics: self.statistics.clone(),
             column_readers: RwLock::new(HashMap::new()),
+            plain_vector_storages: Arc::clone(&self.plain_vector_storages),
             shared_file: Arc::clone(&self.shared_file),
             short_key_index_decoder: Arc::clone(&self.short_key_index_decoder),
             indexes: Arc::clone(&self.indexes),
@@ -449,6 +460,45 @@ impl Segment {
             .column_metas
             .iter()
             .find(|m| m.column_id == column_id)
+    }
+
+    /// Open a reusable immutable vector-page view when the physical column is
+    /// directly addressable.  Encoded/compressed columns deliberately return
+    /// `None` and retain the ordinary governed decoder path.
+    pub(crate) fn open_plain_vector_storage(
+        &self,
+        column_id: ColumnId,
+        dimension: usize,
+    ) -> Result<Option<Arc<dyn VectorStorage>>> {
+        let Some(column) = self.get_column_meta(column_id) else {
+            return Ok(None);
+        };
+        if column.field_type != crate::rowset::encoding::FieldType::Vector
+            || column.encoding != crate::rowset::page::EncodingType::Plain
+            || column.compression != CompressionType::None
+            || column.num_rows == 0
+        {
+            return Ok(None);
+        }
+
+        let key = (column_id, dimension);
+        let mut storages = self.plain_vector_storages.write().map_err(|_| {
+            paro_error::internal(format!(
+                "segment {} plain vector storage lock is poisoned",
+                self.segment_id
+            ))
+        })?;
+        if let Some(storage) = storages.get(&key) {
+            return Ok(Some(Arc::clone(storage)));
+        }
+
+        // Hold the structural lock while validating and mapping.  Opening is
+        // intentionally a once-per-segment operation, and duplicate checksum
+        // scans of a multi-gigabyte page are worse than briefly serializing
+        // concurrent first readers.
+        let storage = open_plain_vector_column(&self.file_path, column, dimension)?;
+        storages.insert(key, Arc::clone(&storage));
+        Ok(Some(storage))
     }
 
     pub fn column_metas(&self) -> &[ColumnMeta] {

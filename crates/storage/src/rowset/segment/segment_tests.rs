@@ -252,6 +252,72 @@ fn inline_hnsw_opens_from_mmap_without_page_cache_admission() {
 }
 
 #[test]
+fn plain_vector_page_view_is_structural_and_bypasses_page_cache() {
+    let temp_dir = TempDir::new().unwrap();
+    let file_path = temp_dir.path().join("mmap-vector-pages.seg");
+    let schema = Arc::new(
+        TabletSchema::new(
+            1,
+            vec![
+                TabletColumn::key(0, "id", LogicalType::Integer),
+                TabletColumn::new(
+                    1,
+                    "embedding",
+                    LogicalType::Array(Box::new(LogicalType::Float), 2),
+                ),
+            ],
+            KeysType::PrimaryKeys,
+        )
+        .unwrap(),
+    );
+    let options = SegmentWriterOptions::new(0)
+        .with_compression(CompressionType::None)
+        .with_page_size(4 * 2 * std::mem::size_of::<f32>());
+    let mut writer = SegmentWriter::create(schema.clone(), &file_path, options).unwrap();
+    let ids = (0_i32..12).flat_map(i32::to_le_bytes).collect::<Vec<_>>();
+    let vectors = (0_i32..12)
+        .flat_map(|value| [value as f32, -(value as f32)])
+        .flat_map(f32::to_le_bytes)
+        .collect::<Vec<_>>();
+    writer
+        .append_chunk(&[ColumnData::new(ids, 12), ColumnData::new(vectors, 12)])
+        .unwrap();
+    writer.finalize().unwrap();
+
+    let pool = BufferPool::new_arc(1);
+    let cache = Arc::new(PageCache::new(Arc::clone(&pool)));
+    let segment = Segment::open(
+        0,
+        &file_path,
+        schema,
+        SegmentOptions::default().with_page_cache(cache),
+        1,
+        1,
+        1,
+    )
+    .unwrap();
+    let first = segment
+        .open_plain_vector_storage(1, 2)
+        .unwrap()
+        .expect("plain vector mmap view");
+    let second = segment
+        .open_plain_vector_storage(1, 2)
+        .unwrap()
+        .expect("cached plain vector mmap view");
+    assert!(Arc::ptr_eq(&first, &second));
+    assert_eq!(first.num_vectors(), 12);
+    assert_eq!(first.get_vector(7), &[7.0, -7.0]);
+    assert_eq!(pool.get_tag_usage(MemoryTag::PageCache), 0);
+
+    let runtime = segment.runtime_view(SegmentOptions::default());
+    let runtime_storage = runtime
+        .open_plain_vector_storage(1, 2)
+        .unwrap()
+        .expect("runtime view shares structural mapping");
+    assert!(Arc::ptr_eq(&first, &runtime_storage));
+}
+
+#[test]
 fn segment_varlen_column_keeps_rows_across_pages_and_appends() {
     let temp_dir = TempDir::new().unwrap();
     let file_path = temp_dir.path().join("varlen-multipage.seg");

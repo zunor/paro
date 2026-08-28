@@ -132,6 +132,7 @@ impl Segment {
             meta,
             statistics,
             column_readers: RwLock::new(HashMap::new()),
+            plain_vector_storages: Arc::new(RwLock::new(HashMap::new())),
             shared_file: Arc::new(Mutex::new(Some(Arc::new(file)))),
             short_key_index_decoder: Arc::new(RwLock::new(None)),
             indexes: Arc::new(SegmentIndexes {
@@ -200,6 +201,7 @@ impl Segment {
             footer,
             meta,
             column_readers: RwLock::new(HashMap::new()),
+            plain_vector_storages: Arc::new(RwLock::new(HashMap::new())),
             shared_file: Arc::new(Mutex::new(None)),
             short_key_index_decoder: Arc::new(RwLock::new(None)),
             indexes: Arc::new(SegmentIndexes::default()),
