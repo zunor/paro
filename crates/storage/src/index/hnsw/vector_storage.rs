@@ -1569,6 +1569,45 @@ pub(crate) fn f32_query_i16_l1_distance(query: &[f32], code: &[u8], scales: &[f3
     f32_query_i16_l1_distance_scalar(query, code, scales)
 }
 
+/// Score four independent compact-routing rows while sharing query and scale
+/// loads. Graph expansion naturally exposes small batches of unrelated rows;
+/// interleaving them gives the CPU independent accumulator chains without
+/// changing the per-row reduction order used by the scalar contract.
+#[inline]
+pub(crate) fn f32_query_i16_scores_four(
+    metric: DistanceMetric,
+    query: &[f32],
+    codes: [&[u8]; 4],
+    scales: &[f32],
+) -> [f32; 4] {
+    #[cfg(all(target_arch = "aarch64", target_endian = "little"))]
+    {
+        let operation = match metric {
+            DistanceMetric::Euclidean => i16_neon::QueryMetric::L2,
+            DistanceMetric::DotProduct | DistanceMetric::Cosine => i16_neon::QueryMetric::Dot,
+            DistanceMetric::Manhattan => i16_neon::QueryMetric::L1,
+        };
+        let mut scores = i16_neon::query_four(query, codes, scales, operation);
+        if matches!(
+            metric,
+            DistanceMetric::Euclidean | DistanceMetric::Manhattan
+        ) {
+            for score in &mut scores {
+                *score = -*score;
+            }
+        }
+        scores
+    }
+    #[cfg(not(all(target_arch = "aarch64", target_endian = "little")))]
+    std::array::from_fn(|row| match metric {
+        DistanceMetric::Euclidean => -f32_query_i16_l2_squared_scalar(query, codes[row], scales),
+        DistanceMetric::DotProduct | DistanceMetric::Cosine => {
+            f32_query_i16_dot_product_scalar(query, codes[row], scales)
+        }
+        DistanceMetric::Manhattan => -f32_query_i16_l1_distance_scalar(query, codes[row], scales),
+    })
+}
+
 #[inline]
 #[cfg_attr(
     all(target_arch = "aarch64", target_endian = "little"),
@@ -1795,10 +1834,93 @@ mod i16_neon {
     }
 
     #[derive(Clone, Copy)]
-    enum QueryMetric {
+    pub(super) enum QueryMetric {
         Dot,
         L2,
         L1,
+    }
+
+    #[inline]
+    pub(super) fn query_four(
+        query: &[f32],
+        codes: [&[u8]; 4],
+        scales: &[f32],
+        metric: QueryMetric,
+    ) -> [f32; 4] {
+        // SAFETY: AArch64 guarantees NEON and the inner kernel bounds every
+        // load by the shortest logical input row.
+        unsafe { query_four_inner(query, codes, scales, metric) }
+    }
+
+    #[target_feature(enable = "neon")]
+    unsafe fn query_four_inner(
+        query: &[f32],
+        codes: [&[u8]; 4],
+        scales: &[f32],
+        metric: QueryMetric,
+    ) -> [f32; 4] {
+        let len = codes
+            .iter()
+            .fold(query.len().min(scales.len()), |len, code| {
+                len.min(code.len() / 2)
+            });
+        let mut offset = 0usize;
+        let mut sums = [vdupq_n_f32(0.0); 4];
+        while offset + 8 <= len {
+            // SAFETY: the loop condition proves the shared query/scale range
+            // and eight i16 values in each of the four rows.
+            let (query_low, query_high, scale_low, scale_high) = unsafe {
+                (
+                    vld1q_f32(query.as_ptr().add(offset)),
+                    vld1q_f32(query.as_ptr().add(offset + 4)),
+                    vld1q_f32(scales.as_ptr().add(offset)),
+                    vld1q_f32(scales.as_ptr().add(offset + 4)),
+                )
+            };
+            for row in 0..4 {
+                // SAFETY: `len` includes the shortest compact row.
+                let encoded = unsafe { vld1q_s16(codes[row].as_ptr().add(offset * 2).cast()) };
+                let code_low = vcvtq_f32_s32(vmovl_s16(vget_low_s16(encoded)));
+                let code_high = vcvtq_f32_s32(vmovl_high_s16(encoded));
+                let value_low = vmulq_f32(code_low, scale_low);
+                let value_high = vmulq_f32(code_high, scale_high);
+                sums[row] = match metric {
+                    QueryMetric::Dot => {
+                        let sum = vfmaq_f32(sums[row], query_low, value_low);
+                        vfmaq_f32(sum, query_high, value_high)
+                    }
+                    QueryMetric::L2 => {
+                        let low_delta = vsubq_f32(query_low, value_low);
+                        let high_delta = vsubq_f32(query_high, value_high);
+                        let sum = vfmaq_f32(sums[row], low_delta, low_delta);
+                        vfmaq_f32(sum, high_delta, high_delta)
+                    }
+                    QueryMetric::L1 => {
+                        let sum = vaddq_f32(sums[row], vabsq_f32(vsubq_f32(query_low, value_low)));
+                        vaddq_f32(sum, vabsq_f32(vsubq_f32(query_high, value_high)))
+                    }
+                };
+            }
+            offset += 8;
+        }
+        // SAFETY: every lane accumulator is fully initialized.
+        let mut reduced = std::array::from_fn(|row| unsafe { reduce_sum(sums[row]) });
+        while offset < len {
+            for row in 0..4 {
+                let code = i16::from_le_bytes([codes[row][offset * 2], codes[row][offset * 2 + 1]]);
+                let value = f32::from(code) * scales[offset];
+                reduced[row] = match metric {
+                    QueryMetric::Dot => query[offset].mul_add(value, reduced[row]),
+                    QueryMetric::L2 => {
+                        let delta = query[offset] - value;
+                        delta.mul_add(delta, reduced[row])
+                    }
+                    QueryMetric::L1 => reduced[row] + (query[offset] - value).abs(),
+                };
+            }
+            offset += 1;
+        }
+        reduced
     }
 
     #[target_feature(enable = "neon")]
@@ -3051,6 +3173,30 @@ mod tests {
             f32_query_i16_l1_distance(&query, &left, &scales),
             f32_query_i16_l1_distance_scalar(&query, &left, &scales),
         );
+        let codes = [
+            left.as_slice(),
+            right.as_slice(),
+            left.as_slice(),
+            right.as_slice(),
+        ];
+        for metric in [
+            DistanceMetric::Euclidean,
+            DistanceMetric::DotProduct,
+            DistanceMetric::Cosine,
+            DistanceMetric::Manhattan,
+        ] {
+            let batch = f32_query_i16_scores_four(metric, &query, codes, &scales);
+            for (row, code) in codes.iter().enumerate() {
+                let expected = match metric {
+                    DistanceMetric::Euclidean => -f32_query_i16_l2_squared(&query, code, &scales),
+                    DistanceMetric::DotProduct | DistanceMetric::Cosine => {
+                        f32_query_i16_dot_product(&query, code, &scales)
+                    }
+                    DistanceMetric::Manhattan => -f32_query_i16_l1_distance(&query, code, &scales),
+                };
+                same_contract_value(batch[row], expected);
+            }
+        }
     }
 
     #[test]

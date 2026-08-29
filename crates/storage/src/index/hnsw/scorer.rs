@@ -13,7 +13,7 @@ use super::graph_links::GraphPoint;
 use super::types::{PointOffset, ScoreType, ScoredPoint};
 use super::vector_storage::{
     f32_query_i16_dot_product, f32_query_i16_l1_distance, f32_query_i16_l2_squared,
-    CosineInverseNorms, I16RoutingView,
+    f32_query_i16_scores_four, CosineInverseNorms, I16RoutingView,
 };
 use super::{DistanceMetric, PreparedQuery, VectorStorage};
 
@@ -140,9 +140,14 @@ struct I16RoutingScoring<'a> {
 
 impl I16RoutingScoring<'_> {
     #[inline]
-    fn score_point(&self, metric: DistanceMetric, point_id: PointOffset) -> ScoreType {
+    fn code(&self, point_id: PointOffset) -> &[u8] {
         let start = point_id as usize * self.view.row_stride_bytes;
-        let code = &self.view.codes[start..start + self.view.row_stride_bytes];
+        &self.view.codes[start..start + self.view.row_stride_bytes]
+    }
+
+    #[inline]
+    fn score_point(&self, metric: DistanceMetric, point_id: PointOffset) -> ScoreType {
+        let code = self.code(point_id);
         match metric {
             DistanceMetric::Euclidean => {
                 -f32_query_i16_l2_squared(&self.query, code, self.view.scales)
@@ -160,6 +165,35 @@ impl I16RoutingScoring<'_> {
             DistanceMetric::Manhattan => {
                 -f32_query_i16_l1_distance(&self.query, code, self.view.scales)
             }
+        }
+    }
+
+    fn score_points(
+        &self,
+        metric: DistanceMetric,
+        point_ids: &[PointOffset],
+        scores: &mut [ScoreType],
+    ) {
+        assert!(scores.len() >= point_ids.len());
+        let mut point_batches = point_ids.chunks_exact(4);
+        let mut score_batches = scores.chunks_exact_mut(4);
+        for (points, output) in point_batches.by_ref().zip(score_batches.by_ref()) {
+            let codes = std::array::from_fn(|row| self.code(points[row]));
+            let mut batch = f32_query_i16_scores_four(metric, &self.query, codes, self.view.scales);
+            if metric == DistanceMetric::Cosine {
+                let inverse_norms = self.view.inverse_norms.unwrap_or_else(|| {
+                    unreachable!("cosine routing image is validated at artifact open")
+                });
+                for row in 0..4 {
+                    batch[row] *= self.query_inverse_norm * inverse_norms.value(points[row]);
+                }
+            }
+            output.copy_from_slice(&batch);
+        }
+        let remaining_points = point_batches.remainder();
+        let remaining_scores = score_batches.into_remainder();
+        for (&point_id, score) in remaining_points.iter().zip(remaining_scores) {
+            *score = self.score_point(metric, point_id);
         }
     }
 
@@ -270,9 +304,7 @@ impl<'a> GraphVectorScorer<'a> {
         self.scored_points
             .set(self.scored_points.get().saturating_add(points.len() as u64));
         if let Some(routing) = &self.routing {
-            for (score, &point_id) in self.scores_buffer.iter_mut().zip(points) {
-                *score = routing.score_point(self.exact.query.metric(), point_id);
-            }
+            routing.score_points(self.exact.query.metric(), points, &mut self.scores_buffer);
         } else {
             if let Some(vectors) = self.exact.vectors {
                 VectorScorer::fill_scores_untracked(

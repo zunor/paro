@@ -19,11 +19,33 @@ use crate::index::{ExactRowAdmission, ExactRowSet};
 use crate::search::{ResourceBudget, SearchMemoryReservation, SearchWorkBudget};
 use paro_common::error::{self as paro_error, Result};
 use rand::{thread_rng, Rng};
+use std::cmp::Ordering;
 
 /// Maximum ordinary-graph beam used to discover predicate-topology entry
 /// seeds.  Filtered result quality is owned by the independent predicate beam;
 /// routing wider than this only repeats distance work on the base graph.
 const PREDICATE_ROUTING_EF: usize = 32;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct PredicateRoutingCandidate {
+    entry: PredicateEntryPoint,
+    point: ScoredPoint,
+}
+
+impl PartialOrd for PredicateRoutingCandidate {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl Ord for PredicateRoutingCandidate {
+    fn cmp(&self, other: &Self) -> Ordering {
+        self.point
+            .cmp(&other.point)
+            .then_with(|| self.entry.column_id.cmp(&other.entry.column_id))
+            .then_with(|| self.entry.level.cmp(&other.entry.level))
+    }
+}
 
 /// Read-only HNSW graph layers.
 pub struct GraphLayers {
@@ -731,6 +753,7 @@ impl GraphLayers {
                 partition_seeds,
                 predicate_columns,
                 ef,
+                routing_ef,
                 scorer,
                 &admits,
                 budget,
@@ -869,6 +892,7 @@ impl GraphLayers {
         partition_seeds: &[PointOffset],
         predicate_columns: &[u32],
         ef: usize,
+        entry_descent_width: usize,
         scorer: &mut GraphVectorScorer<'_>,
         admits: &F,
         budget: &ResourceBudget,
@@ -902,17 +926,41 @@ impl GraphLayers {
                 direct_seed_count = direct_seed_count.saturating_add(1);
             }
         }
+        // Score every admitted scalar-block entry so every block can compete
+        // directly for the level-0 seed beam. Only the bounded predicate
+        // routing frontier performs hierarchical descent: direct reachability
+        // remains complete while broad-filter work no longer grows as
+        // `block_count * hierarchy_depth`.
+        let mut entry_frontier = FixedLengthPriorityQueue::new(entry_descent_width);
         for entry in &self.predicate_entry_points {
             if !predicate_columns.contains(&entry.column_id) || !admits(entry.point_id) {
                 continue;
             }
-            if let Some(seed) =
-                self.descend_predicate_entry(*entry, predicate_links_view, scorer, admits, work)?
-            {
-                if !visited.check_and_update_visited(seed.idx) {
-                    initial.push(seed);
-                    direct_seed_count = direct_seed_count.saturating_add(1);
-                }
+            if visited.check_and_update_visited(entry.point_id) {
+                continue;
+            }
+            let point = ScoredPoint {
+                idx: entry.point_id,
+                score: scorer.score_point(entry.point_id),
+            };
+            initial.push(point);
+            entry_frontier.push(PredicateRoutingCandidate {
+                entry: *entry,
+                point,
+            });
+            direct_seed_count = direct_seed_count.saturating_add(1);
+        }
+        for candidate in entry_frontier.into_unsorted_vec() {
+            let seed = self.descend_predicate_entry(
+                candidate.entry,
+                candidate.point,
+                predicate_links_view,
+                scorer,
+                admits,
+                work,
+            )?;
+            if !visited.check_and_update_visited(seed.idx) {
+                initial.push(seed);
             }
         }
         work.consume(direct_seed_count)?;
@@ -962,21 +1010,17 @@ impl GraphLayers {
     fn descend_predicate_entry<F>(
         &self,
         entry: PredicateEntryPoint,
+        mut current: ScoredPoint,
         predicate_links_view: GraphLinksReadView<'_>,
         scorer: &mut GraphVectorScorer<'_>,
         admits: &F,
         work: &SearchWorkBudget,
-    ) -> Result<Option<ScoredPoint>>
+    ) -> Result<ScoredPoint>
     where
         F: Fn(PointOffset) -> bool,
     {
-        if !admits(entry.point_id) {
-            return Ok(None);
-        }
-        let mut current = ScoredPoint {
-            idx: entry.point_id,
-            score: scorer.score_point(entry.point_id),
-        };
+        debug_assert_eq!(entry.point_id, current.idx);
+        debug_assert!(admits(entry.point_id));
         let mut neighbors = Vec::with_capacity(self.hnsw_m.get_m(0));
         for level in (1..=entry.level).rev() {
             let mut changed = true;
@@ -1002,7 +1046,7 @@ impl GraphLayers {
                 }
             }
         }
-        Ok(Some(current))
+        Ok(current)
     }
 
     pub fn num_points(&self) -> usize {
@@ -1186,6 +1230,7 @@ mod tests {
                 &[],
                 &[],
                 3,
+                PREDICATE_ROUTING_EF,
                 &mut scorer,
                 &|point| point <= 2,
                 &budget,
@@ -1194,5 +1239,63 @@ mod tests {
 
         assert!(full);
         assert_eq!(points[0].idx, 2);
+    }
+
+    #[test]
+    fn predicate_topology_bounds_hierarchical_entry_descents() {
+        let point_count = 16usize;
+        let base =
+            GraphLinks::new_from_edges((0..point_count).map(|_| vec![vec![]]).collect::<Vec<_>>());
+        let predicate = GraphLinks::new_from_edges(
+            (0..point_count)
+                .map(|point| {
+                    if point < 8 {
+                        vec![vec![], vec![(point + 8) as PointOffset]]
+                    } else {
+                        vec![vec![], vec![]]
+                    }
+                })
+                .collect::<Vec<_>>(),
+        );
+        let entries = (0..8)
+            .map(|point_id| PredicateEntryPoint {
+                column_id: 7,
+                point_id,
+                level: 1,
+            })
+            .collect::<Vec<_>>()
+            .into_boxed_slice();
+        let graph = GraphLayers::new_with_predicate_links(
+            base,
+            predicate,
+            entries,
+            EntryPoints::default(),
+            HnswM::new(8),
+        );
+        let storage =
+            InMemoryVectorStorage::new((0..point_count).map(|point| point as f32).collect(), 1);
+        let query = DistanceMetric::Euclidean.prepare(&[15.0]);
+        let mut scorer = GraphVectorScorer::new(&query, &storage).unwrap();
+        let budget = crate::search::ResourceBudget::default();
+        let links_view = graph.links.search_view(scorer.point_count()).unwrap();
+
+        let (points, _) = graph
+            .search_predicate_topology(
+                links_view,
+                Vec::new(),
+                &[],
+                &[7],
+                4,
+                2,
+                &mut scorer,
+                &|_| true,
+                &budget,
+            )
+            .unwrap();
+
+        assert_eq!(points[0].idx, 15);
+        // Eight entries are scored once to preserve direct reachability; only
+        // the two best entries pay one upper-level neighbor score each.
+        assert_eq!(scorer.scored_point_count(), 10);
     }
 }
