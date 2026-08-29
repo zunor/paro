@@ -477,6 +477,7 @@ mod tests {
             maintenance_state: GenerationMaintenanceState::default(),
             provider_config: Arc::new(serde_json::Value::Null),
             hnsw_provider_config: None,
+            hnsw_query_activity: None,
             artifacts: Arc::new(GenerationArtifactSet {
                 artifacts: vec![artifact],
             }),
@@ -563,6 +564,7 @@ mod tests {
             maintenance_state: GenerationMaintenanceState::default(),
             provider_config: Arc::new(serde_json::Value::Null),
             hnsw_provider_config: None,
+            hnsw_query_activity: None,
             artifacts: Arc::new(GenerationArtifactSet {
                 artifacts: Vec::new(),
             }),

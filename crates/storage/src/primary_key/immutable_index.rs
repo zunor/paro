@@ -169,12 +169,22 @@ impl ImmutableIndexWriter {
         fs::write(&tmp_path, &file_data).map_err(|e| {
             paro_error::io_error(format!("write immutable index {:?}: {}", tmp_path, e))
         })?;
+        // The process-wide reader cache is keyed by the durable path. Hold
+        // the same lock used by `open_cached` across path replacement and
+        // invalidation so a racing opener can observe either the old inode or
+        // the new inode, but can never publish an old mmap under the new
+        // path identity. This also makes rebuild/reset safe when file ids are
+        // deliberately restarted from a clean manifest.
+        let mut cache = IMMUTABLE_INDEX_CACHE
+            .lock()
+            .map_err(|_| paro_error::internal("immutable index cache lock poisoned"))?;
         fs::rename(&tmp_path, path).map_err(|e| {
             paro_error::io_error(format!(
                 "rename immutable index {:?} -> {:?}: {}",
                 tmp_path, path, e
             ))
         })?;
+        cache.remove(path);
 
         Ok(ImmutableIndexStats {
             bucket_count,
@@ -217,20 +227,18 @@ impl ImmutableIndexReader {
 
     pub fn open_cached(path: impl AsRef<Path>) -> Result<Arc<Self>> {
         let path = path.as_ref().to_path_buf();
-        if let Some(reader) = IMMUTABLE_INDEX_CACHE
+        let mut cache = IMMUTABLE_INDEX_CACHE
             .lock()
-            .map_err(|_| paro_error::internal("immutable index cache lock poisoned"))?
-            .get(&path)
-            .and_then(Weak::upgrade)
-        {
+            .map_err(|_| paro_error::internal("immutable index cache lock poisoned"))?;
+        if let Some(reader) = cache.get(&path).and_then(Weak::upgrade) {
             return Ok(reader);
         }
 
+        // Keep the cache lock while opening. Publication takes the same lock
+        // around rename + invalidation; releasing it between lookup and mmap
+        // would allow an old inode to be inserted after its path was replaced.
         let reader = Arc::new(Self::open(&path)?);
-        IMMUTABLE_INDEX_CACHE
-            .lock()
-            .map_err(|_| paro_error::internal("immutable index cache lock poisoned"))?
-            .insert(path, Arc::downgrade(&reader));
+        cache.insert(path, Arc::downgrade(&reader));
         Ok(reader)
     }
 
@@ -1148,5 +1156,26 @@ mod tests {
         let first = ImmutableIndexReader::open_cached(&path).unwrap();
         let second = ImmutableIndexReader::open_cached(&path).unwrap();
         assert!(Arc::ptr_eq(&first, &second));
+    }
+
+    #[test]
+    fn immutable_index_cache_never_reuses_a_replaced_path() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("index.idx");
+        let old_row = RowID::new(1, crate::rowset::SegmentRowId::from_raw(1));
+        let new_row = RowID::new(2, crate::rowset::SegmentRowId::from_raw(2));
+        ImmutableIndexWriter::default()
+            .write_entries(&path, &[(b"k".to_vec(), v(old_row, 1))])
+            .unwrap();
+        let old_reader = ImmutableIndexReader::open_cached(&path).unwrap();
+
+        ImmutableIndexWriter::default()
+            .write_entries(&path, &[(b"k".to_vec(), v(new_row, 2))])
+            .unwrap();
+        let new_reader = ImmutableIndexReader::open_cached(&path).unwrap();
+
+        assert!(!Arc::ptr_eq(&old_reader, &new_reader));
+        assert_eq!(old_reader.get(b"k").unwrap(), Some(old_row));
+        assert_eq!(new_reader.get(b"k").unwrap(), Some(new_row));
     }
 }

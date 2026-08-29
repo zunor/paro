@@ -29,6 +29,10 @@ use super::provider_config::{
     decode_provider_config, encode_provider_config, StrictProviderConfig,
 };
 
+/// Version 26 separates optional graph-compaction admission from required
+/// freshness progress. A definition-pinned idle interval prevents a cold
+/// replacement generation from being published between bursts of foreground
+/// ANN traffic; tail catch-up continues to use its bounded-lag policy.
 /// Version 25 makes the maintenance radix closed under the generation graph
 /// bound. The base catch-up digit is the smaller of the byte-derived quantum
 /// and `target_graph_rows / compaction_fanout`, so a complete digit can always
@@ -71,11 +75,12 @@ use super::provider_config::{
 /// generation. Artifact-envelope compatibility is versioned independently;
 /// provider-config versions describe the definition and build contract rather
 /// than the physical checksum hierarchy used by a particular binary.
-pub const HNSW_PROVIDER_CONFIG_VERSION: u32 = 25;
+pub const HNSW_PROVIDER_CONFIG_VERSION: u32 = 26;
 
 pub const DEFAULT_HNSW_MAINTENANCE_TARGET_VECTOR_BYTES: u64 = 64 * 1024 * 1024;
 pub const DEFAULT_HNSW_MAINTENANCE_MAX_PENDING_VECTOR_BYTES: u64 = 256 * 1024 * 1024;
 pub const DEFAULT_HNSW_MAINTENANCE_COMPACTION_FANOUT: u32 = 4;
+pub const DEFAULT_HNSW_MAINTENANCE_COMPACTION_MIN_IDLE_MS: u64 = 30_000;
 pub const DEFAULT_HNSW_GENERATION_TARGET_GRAPH_ROWS: u64 = 2_000_000;
 
 /// Definition-pinned graph layout for one immutable search generation.
@@ -109,6 +114,7 @@ pub struct HnswMaintenancePolicy {
     pub target_vector_bytes: u64,
     pub max_pending_vector_bytes: u64,
     pub compaction_fanout: u32,
+    pub compaction_min_idle_ms: u64,
 }
 
 impl Default for HnswMaintenancePolicy {
@@ -117,6 +123,7 @@ impl Default for HnswMaintenancePolicy {
             target_vector_bytes: DEFAULT_HNSW_MAINTENANCE_TARGET_VECTOR_BYTES,
             max_pending_vector_bytes: DEFAULT_HNSW_MAINTENANCE_MAX_PENDING_VECTOR_BYTES,
             compaction_fanout: DEFAULT_HNSW_MAINTENANCE_COMPACTION_FANOUT,
+            compaction_min_idle_ms: DEFAULT_HNSW_MAINTENANCE_COMPACTION_MIN_IDLE_MS,
         }
     }
 }
@@ -338,6 +345,11 @@ impl HnswProviderConfig {
         if self.maintenance.compaction_fanout < 2 {
             return Err(paro_error::invalid_input(
                 "HNSW maintenance compaction_fanout must be at least 2",
+            ));
+        }
+        if self.maintenance.compaction_min_idle_ms == 0 {
+            return Err(paro_error::invalid_input(
+                "HNSW maintenance compaction_min_idle_ms must be greater than zero",
             ));
         }
         if self.generation_layout.target_graph_rows < u64::from(self.maintenance.compaction_fanout)
@@ -589,6 +601,7 @@ mod tests {
             target_vector_bytes: 200 * 1024 * 1024,
             max_pending_vector_bytes: 800 * 1024 * 1024,
             compaction_fanout: 4,
+            compaction_min_idle_ms: DEFAULT_HNSW_MAINTENANCE_COMPACTION_MIN_IDLE_MS,
         };
         config.generation_layout.target_graph_rows = 1_000_000;
         config.validate().unwrap();
@@ -617,11 +630,23 @@ mod tests {
             target_vector_bytes: 1024,
             max_pending_vector_bytes: 512,
             compaction_fanout: 8,
+            compaction_min_idle_ms: DEFAULT_HNSW_MAINTENANCE_COMPACTION_MIN_IDLE_MS,
         };
         assert!(invalid
             .validate()
             .unwrap_err()
             .to_string()
             .contains("must be at least target_vector_bytes"));
+    }
+
+    #[test]
+    fn optional_compaction_idle_window_must_be_nonzero() {
+        let mut invalid = valid_config();
+        invalid.maintenance.compaction_min_idle_ms = 0;
+        assert!(invalid
+            .validate()
+            .unwrap_err()
+            .to_string()
+            .contains("compaction_min_idle_ms must be greater than zero"));
     }
 }

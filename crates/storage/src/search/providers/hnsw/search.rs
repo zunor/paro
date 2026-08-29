@@ -234,6 +234,12 @@ impl VectorSearchCursor {
         // leave gaps between generation partitions where maintenance can
         // regain the full build pool.
         let _foreground_query = HnswForegroundQueryGuard::enter();
+        let _definition_query = self
+            .snapshot
+            .generation
+            .hnsw_query_activity
+            .as_ref()
+            .map(|activity| activity.enter());
         let started_at = Instant::now();
         self.telemetry.record_generation(GenerationTelemetryEvent {
             kind: SearchIndexKind::Hnsw,

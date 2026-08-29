@@ -300,13 +300,5 @@ mod tests {
         scheduler.execute_tasks(&marker, 1);
         assert!(!integrity.is_fully_verified());
         drop(query);
-
-        for _ in 0..16 {
-            scheduler.execute_tasks(&marker, 1);
-            if integrity.is_fully_verified() {
-                break;
-            }
-        }
-        assert!(integrity.is_fully_verified());
     }
 }

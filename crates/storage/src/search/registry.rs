@@ -1564,11 +1564,23 @@ impl SearchIndexRegistry {
                 return Ok(false);
             }
         }
-        if hnsw_foreground_pressure_active() {
+        let compaction_idle = Duration::from_millis(
+            state
+                .hnsw_provider_config
+                .as_ref()
+                .expect("validated HNSW state has provider config")
+                .maintenance
+                .compaction_min_idle_ms,
+        );
+        let query_activity = state
+            .hnsw_query_activity
+            .as_ref()
+            .ok_or_else(|| paro_error::internal("HNSW definition is missing query activity"))?;
+        if !force_rebuild && !query_activity.quiet_for(compaction_idle) {
             // Coalescing changes neither freshness nor correctness. Do not
-            // enter vector preparation while a foreground reservation is
-            // already active; the stop check below covers queries that arrive
-            // after admission.
+            // replace a hot serving generation between foreground bursts.
+            // Required tail catch-up has a separate bounded-lag path and is
+            // intentionally unaffected by this definition-pinned idle gate.
             return Ok(false);
         }
         let generation_id = state
@@ -1600,7 +1612,7 @@ impl SearchIndexRegistry {
         let foreground_preempted = Arc::new(AtomicBool::new(false));
         let stop_for_foreground = Arc::clone(&foreground_preempted);
         let stop_check = SearchBuildStopCheck::new(move || {
-            let foreground_active = hnsw_foreground_pressure_active();
+            let foreground_active = !force_rebuild && hnsw_foreground_pressure_active();
             if foreground_active {
                 stop_for_foreground.store(true, Ordering::Release);
             }
@@ -1640,6 +1652,14 @@ impl SearchIndexRegistry {
             }
             Err(error) => return Err(error),
         };
+        if !force_rebuild && !query_activity.quiet_for(compaction_idle) {
+            // A query may enter after the builder's final cooperative stop
+            // point. Discard the unpublished candidate rather than atomically
+            // replacing the serving generation with a cold reader image.
+            let sidecar_file_ids = sidecar_file_ids_for_artifacts(&result.artifact_refs);
+            self.discard_unpublished_sidecars(&sidecar_store, &sidecar_file_ids);
+            return Ok(false);
+        }
         let sidecar_file_ids = sidecar_file_ids_for_artifacts(&result.artifact_refs);
         if let Err(error) = validate_hnsw_compaction_result(
             &state.definition,
@@ -7593,6 +7613,7 @@ mod tests {
             target_vector_bytes: 16_384 * 4,
             max_pending_vector_bytes: 16_384 * 4,
             compaction_fanout: 8,
+            compaction_min_idle_ms: crate::search::DEFAULT_HNSW_MAINTENANCE_COMPACTION_MIN_IDLE_MS,
         };
         let provider_config = provider.to_value().unwrap();
         let definition = SearchIndexDefinition {

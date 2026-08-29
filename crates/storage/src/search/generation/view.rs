@@ -5,7 +5,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 
 use crate::index::fulltext::tokenizer::TokenizerKind;
-use crate::index::hnsw::DistanceMetric;
+use crate::index::hnsw::{DistanceMetric, HnswQueryActivity};
 use crate::metrics::storage_metrics;
 use crate::rowset::RowsetId;
 use crate::tablet::ColumnId;
@@ -41,6 +41,9 @@ pub(crate) struct SearchDefinitionState {
     pub(crate) hnsw_provider_config: Option<Arc<super::super::HnswProviderConfig>>,
     pub(crate) fulltext_provider_config: Option<Arc<super::super::FullTextProviderConfig>>,
     pub(crate) sparse_provider_config: Option<Arc<super::super::SparseProviderConfig>>,
+    /// Runtime-only query activity shared by every immutable state image of
+    /// one HNSW definition. This is admission state, not durable semantics.
+    pub(crate) hnsw_query_activity: Option<Arc<HnswQueryActivity>>,
     pub(crate) origin: SearchDefinitionOrigin,
     pub(crate) generation: Option<SearchGeneration>,
     pub(crate) capability: Option<SearchCapability>,
@@ -69,11 +72,14 @@ impl SearchDefinitionState {
         } else {
             None
         };
+        let hnsw_query_activity = (definition.kind == SearchIndexKind::Hnsw)
+            .then(|| Arc::new(HnswQueryActivity::default()));
         Ok(Self {
             definition,
             hnsw_provider_config,
             fulltext_provider_config,
             sparse_provider_config,
+            hnsw_query_activity,
             origin,
             generation: None,
             capability: None,
@@ -443,6 +449,7 @@ pub(crate) fn generation_read_snapshot(
             .unwrap_or_default(),
         provider_config: Arc::new(state.definition.provider_config.clone()),
         hnsw_provider_config: state.hnsw_provider_config.clone(),
+        hnsw_query_activity: state.hnsw_query_activity.clone(),
         artifacts,
         tail_pending_entries: Arc::from(
             state

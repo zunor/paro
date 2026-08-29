@@ -71,6 +71,31 @@ pub struct TabletIdentity {
     pub schema_version: u32,
 }
 
+/// Atomic semantic state of the tablet's mutable primary-key layer.
+///
+/// `Complete` exists only while rebuilding an authoritative base from rowsets.
+/// Normal serving uses a bounded `Overlay` in front of the immutable
+/// [`PersistentIndex`]. Keeping the mode and its index in one lock prevents a
+/// reader from observing an overlay with the old "complete" flag (or the
+/// reverse), which previously made a flush/recovery transition tearable.
+#[derive(Debug)]
+pub(super) enum PrimaryIndexMemoryState {
+    Complete(Arc<PrimaryIndex>),
+    Overlay(Arc<PrimaryIndex>),
+}
+
+impl PrimaryIndexMemoryState {
+    pub(super) fn index(&self) -> &Arc<PrimaryIndex> {
+        match self {
+            Self::Complete(index) | Self::Overlay(index) => index,
+        }
+    }
+
+    pub(super) const fn is_complete(&self) -> bool {
+        matches!(self, Self::Complete(_))
+    }
+}
+
 impl From<PhysicalRowRef> for (u64, u32, SegmentRowId) {
     fn from(value: PhysicalRowRef) -> Self {
         (value.rowset_id, value.segment_id, value.row_offset)
@@ -587,19 +612,24 @@ pub struct Tablet {
     /// Durable mutation identities already reflected by this tablet.
     applied_mutations: RwLock<HashSet<AppliedMutationMeta>>,
 
-    /// In-memory primary index (L0) for PRIMARY_KEYS model.
-    pub(super) primary_index: RwLock<Arc<PrimaryIndex>>,
+    /// Typed mutable primary-index layer. Recovery installs a bounded overlay
+    /// over the provenance-matched persistent base instead of copying every
+    /// durable key back into memory.
+    pub(super) primary_index: RwLock<PrimaryIndexMemoryState>,
 
     /// Tablet-owned persistent primary-index view. Its immutable readers and
     /// format proof live for the tablet lifetime instead of being rebuilt for
     /// every missing-key probe.
     pub(super) persistent_primary_index: RwLock<PersistentIndex>,
 
+    /// Table-scoped background owner for immutable primary-index merge work.
+    /// Foreground commits publish only bounded L1 runs; full-base rewrites are
+    /// admitted through the shared instance scheduler.
+    pub(super) primary_index_maintenance_scheduler:
+        RwLock<Option<super::primary_index::PrimaryIndexMaintenanceScheduler>>,
+
     /// Flush request flag for L0→L1 persistent index.
     pub(super) primary_index_flush_requested: Arc<AtomicBool>,
-
-    /// Whether L0 currently contains a full keyset (vs. partial overlay).
-    pub(super) primary_index_full: AtomicBool,
 
     /// Cached tablet statistics (lazy).
     statistics_cache: RwLock<Option<TabletStatistics>>,
@@ -714,10 +744,10 @@ impl Tablet {
             rowset_publish_observer: RwLock::new(None),
             rowset_maintenance_ids: RwLock::new(HashMap::new()),
             applied_mutations: RwLock::new(applied_mutations),
-            primary_index: RwLock::new(primary_index),
+            primary_index: RwLock::new(PrimaryIndexMemoryState::Complete(primary_index)),
             persistent_primary_index: RwLock::new(persistent_primary_index),
+            primary_index_maintenance_scheduler: RwLock::new(None),
             primary_index_flush_requested,
-            primary_index_full: AtomicBool::new(true),
             statistics_cache: RwLock::new(None),
             statistics_dirty: AtomicBool::new(true),
             retention_registry: Arc::new(RetentionRegistry::default()),

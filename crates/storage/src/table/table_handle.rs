@@ -62,6 +62,8 @@ impl TableHandle {
     }
 
     pub fn bind_search_task_scheduler(&self, scheduler: Option<Arc<TaskScheduler>>) {
+        self.runtime_tablet
+            .bind_primary_index_task_scheduler(scheduler.clone());
         self.search_registry.bind_task_scheduler(scheduler);
     }
 

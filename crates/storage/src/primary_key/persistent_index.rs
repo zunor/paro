@@ -130,6 +130,10 @@ pub struct PersistentIndex {
     provenance: Option<PrimaryIndexProvenance>,
     l1_files: Vec<ImmutableFileMeta>,
     l2_file: Option<ImmutableFileMeta>,
+    /// Single-flight owner for a prepared L1/L2 merge. Preparation reserves
+    /// an output id while the expensive immutable-file merge runs without the
+    /// tablet's PersistentIndex write lock.
+    compaction_in_progress: bool,
     /// The manifest-defined mutable tier, parsed once at open and updated in
     /// the same critical section as its WAL append. Point and batch lookups
     /// must never rediscover this state by scanning or rereading the directory.
@@ -139,6 +143,22 @@ pub struct PersistentIndex {
     /// Replaced only while the tablet owns the outer PersistentIndex write
     /// guard, so query lookups are filesystem-free after open/publication.
     immutable_readers: Vec<Arc<ImmutableIndexReader>>,
+}
+
+/// Immutable primary-index compaction input captured under the tablet's short
+/// publication lock. The readers pin the exact source generation while the
+/// merge performs filesystem I/O outside foreground lookup and flush locks.
+pub(crate) struct PersistentIndexCompactionPlan {
+    selected_l1_file_ids: Vec<u64>,
+    expected_l2_file_id: Option<u64>,
+    readers: Vec<Arc<ImmutableIndexReader>>,
+    output_file_id: u64,
+    staging_path: PathBuf,
+    final_path: PathBuf,
+}
+
+pub(crate) struct PersistentIndexCompactionOutput {
+    stats: ImmutableIndexStats,
 }
 
 impl PersistentIndex {
@@ -245,12 +265,14 @@ impl PersistentIndex {
             provenance: manifest.provenance,
             l1_files: manifest.l1_files,
             l2_file: manifest.l2_file,
+            compaction_in_progress: false,
             active_wal_index,
             wal_writer: Mutex::new(wal_writer),
             immutable_readers: Vec::new(),
         };
         index.validate_current_format()?;
         index.refresh_immutable_readers()?;
+        index.cleanup_obsolete_files()?;
         Ok(index)
     }
 
@@ -518,10 +540,6 @@ impl PersistentIndex {
             wrote_l1 = true;
         }
 
-        if next.l1_files.len() > MINOR_COMPACTION_THRESHOLD {
-            self.minor_compact_manifest(&mut next)?;
-        }
-
         let next_wal_writer = if truncate_wal {
             next.active_wal_id += 1;
             Some(self.create_empty_wal_writer(next.active_wal_id)?)
@@ -577,6 +595,7 @@ impl PersistentIndex {
         self.provenance = None;
         self.l1_files.clear();
         self.l2_file = None;
+        self.compaction_in_progress = false;
         self.immutable_readers.clear();
         self.active_wal_index = Arc::new(PrimaryIndex::new());
         let wal_path = self.active_wal_path();
@@ -622,54 +641,154 @@ impl PersistentIndex {
         Ok(())
     }
 
-    fn minor_compact_manifest(&self, manifest: &mut Manifest) -> Result<()> {
-        let mut merged = HashMap::<(Vec<u8>, u64), PrimaryIndexVersion>::new();
+    /// Whether immutable read amplification has crossed the point at which a
+    /// background merge should be admitted. Foreground L0 flushes never run
+    /// this merge inline: a small delta must not inherit a full-base rewrite.
+    pub(crate) fn compaction_needed(&self) -> bool {
+        self.l1_files.len() > MINOR_COMPACTION_THRESHOLD
+    }
 
-        if let Some(l2_file) = &manifest.l2_file {
-            for (key, version) in self.read_immutable_entries(l2_file)? {
-                merged.insert((key, version.commit_ts), version);
-            }
+    /// Reserve one exact immutable generation for background compaction.
+    ///
+    /// File-id allocation is advanced before releasing the lock, so a
+    /// concurrent foreground L0 flush cannot collide with this output. The
+    /// staging name is intentionally outside the `l2_` namespace: foreground
+    /// obsolete-file cleanup may run while this plan is being written.
+    pub(crate) fn prepare_compaction(&mut self) -> Result<Option<PersistentIndexCompactionPlan>> {
+        if self.compaction_in_progress || !self.compaction_needed() {
+            return Ok(None);
         }
 
-        let mut l1_files = manifest.l1_files.clone();
+        let selected_l1_file_ids = self
+            .l1_files
+            .iter()
+            .map(|meta| meta.file_id)
+            .collect::<Vec<_>>();
+        let expected_l2_file_id = self.l2_file.as_ref().map(|meta| meta.file_id);
+        let mut readers = Vec::with_capacity(
+            selected_l1_file_ids
+                .len()
+                .saturating_add(usize::from(expected_l2_file_id.is_some())),
+        );
+        if let Some(meta) = &self.l2_file {
+            readers.push(ImmutableIndexReader::open_cached(
+                self.immutable_meta_path(meta),
+            )?);
+        }
+        let mut l1_files = self.l1_files.clone();
         l1_files.sort_by_key(|meta| meta.edit_version);
-        for meta in l1_files {
-            for (key, version) in self.read_immutable_entries(&meta)? {
+        for meta in &l1_files {
+            readers.push(ImmutableIndexReader::open_cached(
+                self.immutable_meta_path(meta),
+            )?);
+        }
+
+        let output_file_id = self.next_file_id;
+        self.next_file_id = self.next_file_id.saturating_add(1);
+        self.compaction_in_progress = true;
+        Ok(Some(PersistentIndexCompactionPlan {
+            selected_l1_file_ids,
+            expected_l2_file_id,
+            readers,
+            output_file_id,
+            staging_path: self
+                .root_dir
+                .join(format!("compaction_{output_file_id}.tmp")),
+            final_path: self.immutable_path(ImmutableIndexLevel::L2, output_file_id),
+        }))
+    }
+
+    /// Merge a prepared immutable generation without holding any tablet lock.
+    pub(crate) fn execute_compaction(
+        plan: &PersistentIndexCompactionPlan,
+    ) -> Result<PersistentIndexCompactionOutput> {
+        let mut merged = HashMap::<(Vec<u8>, u64), PrimaryIndexVersion>::new();
+        for reader in &plan.readers {
+            for (key, version) in reader.entries()? {
                 merged.insert((key, version.commit_ts), version);
             }
         }
-
-        manifest.l1_files.clear();
-
-        if merged.is_empty() {
-            manifest.l2_file = None;
-            return Ok(());
-        }
-
         let mut entries: Vec<_> = merged
             .into_iter()
             .map(|((key, _), version)| (key, version))
             .collect();
         entries.sort_by(|a, b| a.0.cmp(&b.0).then(a.1.commit_ts.cmp(&b.1.commit_ts)));
-
-        let file_id = manifest.next_file_id;
-        let stats = self.write_immutable_level_file(ImmutableIndexLevel::L2, file_id, &entries)?;
-        manifest.edit_version += 1;
-        manifest.l2_file = Some(ImmutableFileMeta {
-            file_id,
-            level: ImmutableIndexLevel::L2,
-            edit_version: manifest.edit_version,
-            entry_count: stats.entry_count as u64,
-        });
-        manifest.next_file_id += 1;
-        Ok(())
+        let stats = ImmutableIndexWriter::default().write_entries(&plan.staging_path, &entries)?;
+        Ok(PersistentIndexCompactionOutput { stats })
     }
 
-    fn read_immutable_entries(
-        &self,
-        meta: &ImmutableFileMeta,
-    ) -> Result<Vec<(Vec<u8>, PrimaryIndexVersion)>> {
-        ImmutableIndexReader::open_cached(self.immutable_meta_path(meta))?.entries()
+    /// Atomically replace only the immutable inputs captured by `plan`.
+    /// Foreground flushes published while the merge ran remain as newer L1
+    /// members and are never folded into an output that did not read them.
+    pub(crate) fn publish_compaction(
+        &mut self,
+        plan: PersistentIndexCompactionPlan,
+        output: PersistentIndexCompactionOutput,
+    ) -> Result<bool> {
+        let selected = plan
+            .selected_l1_file_ids
+            .iter()
+            .copied()
+            .collect::<std::collections::HashSet<_>>();
+        let sources_still_current = self.l2_file.as_ref().map(|meta| meta.file_id)
+            == plan.expected_l2_file_id
+            && selected
+                .iter()
+                .all(|file_id| self.l1_files.iter().any(|meta| meta.file_id == *file_id));
+        if !sources_still_current {
+            self.compaction_in_progress = false;
+            let _ = fs::remove_file(&plan.staging_path);
+            return Ok(false);
+        }
+
+        fs::rename(&plan.staging_path, &plan.final_path).map_err(|error| {
+            self.compaction_in_progress = false;
+            paro_error::io_error(format!(
+                "publish primary-index compaction {:?} -> {:?}: {}",
+                plan.staging_path, plan.final_path, error
+            ))
+        })?;
+
+        let mut next = self.manifest_snapshot();
+        next.l1_files
+            .retain(|meta| !selected.contains(&meta.file_id));
+        next.edit_version = next.edit_version.saturating_add(1);
+        next.l2_file = Some(ImmutableFileMeta {
+            file_id: plan.output_file_id,
+            level: ImmutableIndexLevel::L2,
+            edit_version: next.edit_version,
+            entry_count: output.stats.entry_count as u64,
+        });
+        let next_readers = match self.open_immutable_readers(&next.l1_files, next.l2_file.as_ref())
+        {
+            Ok(readers) => readers,
+            Err(error) => {
+                self.compaction_in_progress = false;
+                let _ = fs::remove_file(&plan.final_path);
+                return Err(error);
+            }
+        };
+        if let Err(error) = self.write_manifest_value(&next) {
+            self.compaction_in_progress = false;
+            let _ = fs::remove_file(&plan.final_path);
+            return Err(error);
+        }
+        self.install_manifest(next);
+        self.immutable_readers = next_readers;
+        self.compaction_in_progress = false;
+        if let Err(error) = self.cleanup_obsolete_files() {
+            tracing::warn!(
+                path = %self.root_dir.display(),
+                error = %error,
+                "primary-index compaction published but obsolete-file cleanup failed"
+            );
+        }
+        Ok(true)
+    }
+
+    pub(crate) fn abort_compaction(&mut self, plan: &PersistentIndexCompactionPlan) {
+        self.compaction_in_progress = false;
+        let _ = fs::remove_file(&plan.staging_path);
     }
 
     /// Build the query read view exactly once per manifest publication.
@@ -860,6 +979,14 @@ impl PersistentIndex {
 
         for (_, path) in self.list_files_with_prefix("sst_")? {
             let _ = fs::remove_file(&path);
+        }
+        // A foreground L0 publication may run while a prepared background
+        // compaction is still writing its staging file. Only startup/reset
+        // cleanup, where no plan can be live, may reclaim this namespace.
+        if !self.compaction_in_progress {
+            for (_, path) in self.list_files_with_prefix("compaction_")? {
+                let _ = fs::remove_file(&path);
+            }
         }
 
         Ok(())
@@ -1146,7 +1273,7 @@ mod tests {
     }
 
     #[test]
-    fn minor_compaction_merges_l1_and_cleans_tombstones() {
+    fn background_compaction_merges_l1_and_preserves_tombstones() {
         storage_metrics().reset_for_tests();
         let dir = tempdir().unwrap();
         let mut pi = PersistentIndex::new(dir.path()).unwrap();
@@ -1163,12 +1290,54 @@ mod tests {
         pi.apply_deletes(&[b"k1".to_vec()]).unwrap();
         pi.flush_l0(&empty, true).unwrap();
 
+        assert!(pi.compaction_needed());
+        assert!(pi.l2_file.is_none());
+        let plan = pi.prepare_compaction().unwrap().unwrap();
+        let output = PersistentIndex::execute_compaction(&plan).unwrap();
+        assert!(pi.publish_compaction(plan, output).unwrap());
+
         let reopened = PersistentIndex::new(dir.path()).unwrap();
         assert!(reopened.l2_file.is_some());
-        assert!(reopened.l1_files.len() <= 1);
+        assert!(reopened.l1_files.is_empty());
         assert_eq!(reopened.get(b"k1").unwrap(), None);
         assert_eq!(
             reopened.get(b"k4").unwrap(),
+            Some(RowID::new(1, crate::rowset::SegmentRowId::from_raw(4)))
+        );
+    }
+
+    #[test]
+    fn background_compaction_preserves_l1_published_after_prepare() {
+        storage_metrics().reset_for_tests();
+        let dir = tempdir().unwrap();
+        let mut pi = PersistentIndex::new(dir.path()).unwrap();
+        let empty = PrimaryIndex::new();
+
+        for i in 0..6u32 {
+            pi.apply_upserts_at(
+                &[(
+                    format!("old-{i}").into_bytes(),
+                    RowID::new(1, crate::rowset::SegmentRowId::from_raw(i)),
+                )],
+                u64::from(i + 1),
+            )
+            .unwrap();
+            pi.flush_l0(&empty, true).unwrap();
+        }
+        let plan = pi.prepare_compaction().unwrap().unwrap();
+        let output = PersistentIndex::execute_compaction(&plan).unwrap();
+
+        let new_row = RowID::new(2, crate::rowset::SegmentRowId::from_raw(77));
+        pi.apply_upserts_at(&[(b"new".to_vec(), new_row)], 77)
+            .unwrap();
+        pi.flush_l0(&empty, true).unwrap();
+        assert_eq!(pi.l1_files.len(), 7);
+
+        assert!(pi.publish_compaction(plan, output).unwrap());
+        assert_eq!(pi.l1_files.len(), 1);
+        assert_eq!(pi.get(b"new").unwrap(), Some(new_row));
+        assert_eq!(
+            pi.get(b"old-4").unwrap(),
             Some(RowID::new(1, crate::rowset::SegmentRowId::from_raw(4)))
         );
     }

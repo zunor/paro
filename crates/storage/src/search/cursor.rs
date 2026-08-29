@@ -365,7 +365,7 @@ impl PartialEq for GenerationReadLease {
 
 impl Eq for GenerationReadLease {}
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone)]
 pub struct GenerationReadSnapshot {
     pub definition_id: SearchDefinitionId,
     pub generation_id: SearchGenerationId,
@@ -380,11 +380,31 @@ pub struct GenerationReadSnapshot {
     pub provider_config: Arc<serde_json::Value>,
     /// Prevalidated HNSW contract. Present iff the generation provider is HNSW.
     pub hnsw_provider_config: Option<Arc<super::HnswProviderConfig>>,
+    /// Runtime-only, definition-owned activity used to gate optional graph
+    /// replacement without coupling unrelated tables through a process global.
+    pub(crate) hnsw_query_activity: Option<Arc<crate::index::hnsw::HnswQueryActivity>>,
     pub artifacts: Arc<GenerationArtifactSet>,
     /// Exact physical tail identity published with the generation manifest.
     /// Counts in `coverage` are observability/admission summaries; query
     /// correctness and resource governance use these immutable entries.
     pub tail_pending_entries: Arc<[TailPendingEntry]>,
+}
+
+impl PartialEq for GenerationReadSnapshot {
+    fn eq(&self, other: &Self) -> bool {
+        self.definition_id == other.definition_id
+            && self.generation_id == other.generation_id
+            && self.build_epoch == other.build_epoch
+            && self.build_snapshot_version == other.build_snapshot_version
+            && self.indexed_through_ts == other.indexed_through_ts
+            && self.coverage == other.coverage
+            && self.generation_stats == other.generation_stats
+            && self.maintenance_state == other.maintenance_state
+            && self.provider_config == other.provider_config
+            && self.hnsw_provider_config == other.hnsw_provider_config
+            && self.artifacts == other.artifacts
+            && self.tail_pending_entries == other.tail_pending_entries
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -725,6 +745,7 @@ mod tests {
             maintenance_state: GenerationMaintenanceState::default(),
             provider_config: Arc::new(serde_json::Value::Null),
             hnsw_provider_config: None,
+            hnsw_query_activity: None,
             artifacts: Arc::new(GenerationArtifactSet::default()),
             tail_pending_entries: Arc::from([]),
         };

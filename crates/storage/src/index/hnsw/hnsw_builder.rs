@@ -6,7 +6,7 @@ use paro_common::error::{self as paro_error, Result};
 use rayon::ThreadPool;
 use std::fmt;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
@@ -105,6 +105,58 @@ pub(crate) fn hnsw_foreground_pressure_active() -> bool {
         HNSW_ACTIVE_FOREGROUND_QUERIES.load(Ordering::Acquire),
         HNSW_FOREGROUND_PRESSURE_UNTIL_MICROS.load(Ordering::Acquire),
     )
+}
+
+/// Whether no HNSW query has entered the provider for `minimum_idle`.
+///
+/// Required tail catch-up uses the short foreground reservation above because
+/// it must make bounded progress. Optional generation compaction is different:
+/// publishing a replacement graph invalidates the serving generation's hot
+/// mmap working set. Its definition-pinned idle window therefore gates
+/// admission separately and is never allowed to delay freshness work.
+#[derive(Debug, Default)]
+pub(crate) struct HnswQueryActivity {
+    active_queries: AtomicUsize,
+    last_query_micros_plus_one: AtomicU64,
+}
+
+impl HnswQueryActivity {
+    pub(crate) fn enter(self: &Arc<Self>) -> HnswQueryActivityGuard {
+        self.last_query_micros_plus_one
+            .store(scheduler_micros().saturating_add(1), Ordering::Release);
+        self.active_queries.fetch_add(1, Ordering::AcqRel);
+        HnswQueryActivityGuard {
+            activity: Arc::clone(self),
+        }
+    }
+
+    /// Optional generation compaction is admitted per definition. A hot
+    /// tenant or table must not prevent unrelated definitions from retiring
+    /// their own graph fan-out.
+    pub(crate) fn quiet_for(&self, minimum_idle: Duration) -> bool {
+        if self.active_queries.load(Ordering::Acquire) != 0 {
+            return false;
+        }
+        let last_plus_one = self.last_query_micros_plus_one.load(Ordering::Acquire);
+        if last_plus_one == 0 {
+            return true;
+        }
+        scheduler_micros().saturating_sub(last_plus_one - 1)
+            >= minimum_idle.as_micros().min(u128::from(u64::MAX)) as u64
+    }
+}
+
+pub(crate) struct HnswQueryActivityGuard {
+    activity: Arc<HnswQueryActivity>,
+}
+
+impl Drop for HnswQueryActivityGuard {
+    fn drop(&mut self) {
+        self.activity
+            .last_query_micros_plus_one
+            .store(scheduler_micros().saturating_add(1), Ordering::Release);
+        self.activity.active_queries.fetch_sub(1, Ordering::AcqRel);
+    }
 }
 
 /// Number of foreground HNSW queries currently inside provider execution.
@@ -427,6 +479,20 @@ mod tests {
             hnsw_current_build_parallelism(HnswBuildExecutionPolicy::Maintenance, 10),
             1
         );
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn optional_compaction_idle_window_tracks_query_exit() {
+        let activity = Arc::new(HnswQueryActivity::default());
+        let unrelated_definition = Arc::new(HnswQueryActivity::default());
+        assert!(activity.quiet_for(Duration::ZERO));
+        {
+            let _query = activity.enter();
+            assert!(!activity.quiet_for(Duration::from_secs(1)));
+            assert!(unrelated_definition.quiet_for(Duration::from_secs(1)));
+        }
+        assert!(!activity.quiet_for(Duration::from_secs(1)));
     }
 
     #[test]
