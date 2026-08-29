@@ -3303,52 +3303,6 @@ impl HnswIndex {
         Ok(())
     }
 
-    /// Authenticate the complete persisted byte image before online
-    /// publication.
-    ///
-    /// This is intentionally narrower than [`Self::verify_integrity`]. The
-    /// builder establishes graph, norm, and predicate-layout invariants before
-    /// serialization; publication must prove that the immutable bytes read
-    /// back from storage are exactly the bytes covered by the durable checksum
-    /// hierarchy. Re-running the O(N + E) fsck scan for every catch-up artifact
-    /// duplicates builder work and competes with foreground traversal.
-    pub(crate) fn authenticate_persisted_payload(&self) -> Result<()> {
-        if let Some(integrity) = &self._artifact_integrity {
-            integrity.verify_all()?;
-        }
-        Ok(())
-    }
-
-    /// Authenticate persisted bytes in bounded slices.
-    ///
-    /// `before_slice` is a scheduling boundary, not part of the integrity
-    /// proof. Background publication uses it to yield memory bandwidth to
-    /// foreground queries while still making bounded progress under sustained
-    /// traffic. A successfully completed pass publishes the same
-    /// `CHUNK_VALID` state as [`Self::authenticate_persisted_payload`].
-    pub(crate) fn authenticate_persisted_payload_in_slices<F>(
-        &self,
-        chunks_per_slice: usize,
-        mut before_slice: F,
-    ) -> Result<()>
-    where
-        F: FnMut(),
-    {
-        let Some(integrity) = &self._artifact_integrity else {
-            return Ok(());
-        };
-        let mut cursor = 0usize;
-        loop {
-            before_slice();
-            if integrity
-                .verify_batch(&mut cursor, chunks_per_slice.max(1))?
-                .complete
-            {
-                return Ok(());
-            }
-        }
-    }
-
     /// Run an explicit O(N + E) structural qualification scan.
     ///
     /// This is deliberately not part of artifact open or ordinary search.
@@ -5100,30 +5054,6 @@ mod tests {
         let after = loaded.search_one(&[5.0], 1, &params, None).unwrap();
 
         assert_eq!(before[0].idx, after[0].idx);
-    }
-
-    #[test]
-    fn persisted_payload_authentication_is_sliceable_and_idempotent() {
-        let vectors = make_sift_like_vectors(9_201, 512, 24, 16);
-        let storage = make_storage(&vectors);
-        let index = HnswIndex::build(storage, HnswConfig::new(16, 96), DistanceMetric::Euclidean);
-        let artifact = index.serialize().unwrap();
-        let restored = HnswIndex::deserialize(&artifact).unwrap();
-
-        let mut slices = 0usize;
-        restored
-            .authenticate_persisted_payload_in_slices(1, || slices += 1)
-            .unwrap();
-        assert!(
-            slices > 1,
-            "test artifact must span multiple authentication chunks"
-        );
-
-        let mut repeated_slices = 0usize;
-        restored
-            .authenticate_persisted_payload_in_slices(1, || repeated_slices += 1)
-            .unwrap();
-        assert_eq!(repeated_slices, 1, "completed proof must be O(1) to reuse");
     }
 
     #[test]

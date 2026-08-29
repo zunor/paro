@@ -75,7 +75,7 @@ use super::manifest::{
     GenerationManifestRoot, LoadedManifest, ManifestDelta, ManifestDeltaEntry, ManifestShard,
     ManifestStore,
 };
-use super::providers::hnsw::search::{prewarm_hnsw_generation_readers, HnswReaderActivation};
+use super::providers::hnsw::search::{prewarm_hnsw_generation_readers, HnswReaderActivationPolicy};
 use super::sidecar::{SearchReaderRuntime, SidecarArtifactStore};
 use super::sidecar_builder::ProviderSidecarArtifactBuilder;
 use super::staged_generation::{StagedSearchGeneration, StagedSearchGenerationInit};
@@ -769,7 +769,9 @@ impl SearchIndexRegistry {
         &self,
         notifier: Option<Arc<dyn Fn(SearchMaintenanceUrgency) + Send + Sync>>,
     ) {
-        *self.maintenance_notifier.write().unwrap() = notifier;
+        *self.maintenance_notifier.write().unwrap() = notifier.clone();
+        self.reader_runtime
+            .bind_hnsw_integrity_failure_notifier(notifier);
     }
 
     pub(crate) fn bind_hnsw_integrity_scheduler(
@@ -805,7 +807,7 @@ impl SearchIndexRegistry {
         self.update_definition(
             definition.clone(),
             SearchDefinitionOrigin::catalog(definition.definition_id),
-            HnswReaderActivation::Recovery,
+            HnswReaderActivationPolicy::RECOVERY,
         )
     }
 
@@ -814,10 +816,9 @@ impl SearchIndexRegistry {
     ///
     /// The durable tablet mutation installs the directory and head before the
     /// catalog definition enters the queryable registry view. This online-only
-    /// boundary performs full HNSW payload authentication while no foreground
-    /// cursor can observe the generation. Recovery deliberately uses
-    /// [`Self::install_definition`] and retains lazy authentication so startup
-    /// scales with the working set.
+    /// boundary opens typed readers and requests governed authentication; it
+    /// never scans a multi-gigabyte mmap while holding the publication guard.
+    /// Lazy per-range checks remain the correctness boundary after restart.
     pub(crate) fn install_published_definition(
         &self,
         definition: SearchIndexDefinition,
@@ -825,7 +826,7 @@ impl SearchIndexRegistry {
         self.update_definition(
             definition.clone(),
             SearchDefinitionOrigin::catalog(definition.definition_id),
-            HnswReaderActivation::ForegroundPublication,
+            HnswReaderActivationPolicy::PUBLICATION,
         )
     }
 
@@ -1481,7 +1482,7 @@ impl SearchIndexRegistry {
         if let Err(error) = self.prepare_artifact_readers(
             &state,
             &result.artifact_refs,
-            HnswReaderActivation::MaintenancePublication,
+            HnswReaderActivationPolicy::PUBLICATION,
         ) {
             self.discard_unpublished_sidecars(&sidecar_store, &sidecar_file_ids);
             return Err(error);
@@ -1517,7 +1518,14 @@ impl SearchIndexRegistry {
                     return Err(err);
                 }
             };
-        let completion = self.publish_prepared_head_for_state(&next_state, &publication_guard)?;
+        let completion = match self.publish_prepared_head_for_state(&next_state, &publication_guard)
+        {
+            Ok(completion) => completion,
+            Err(error) => {
+                self.retire_unpublished_revision(&latest_state, &next_state);
+                return Err(error);
+            }
+        };
         let view_result =
             self.publish_durable_revision_state(&latest_state, next_state.clone(), &completion);
         drop(latest_state);
@@ -1698,7 +1706,7 @@ impl SearchIndexRegistry {
         if let Err(error) = self.prepare_artifact_readers(
             &state,
             &result.artifact_refs,
-            HnswReaderActivation::MaintenancePublication,
+            HnswReaderActivationPolicy::PUBLICATION,
         ) {
             self.discard_unpublished_sidecars(&sidecar_store, &sidecar_file_ids);
             return Err(error);
@@ -1849,6 +1857,16 @@ impl SearchIndexRegistry {
         };
 
         drop(current);
+
+        // Integrity failures are durable derived-state transitions, not
+        // retryable verification jobs. Remove each failed secondary artifact
+        // from the manifest and restore its immutable base coverage as exact
+        // tail before ordinary optimization work is planned. Recovery then
+        // observes the same degraded-but-correct state instead of reattaching
+        // a reader that this process already proved corrupt.
+        report.definitions_updated = report
+            .definitions_updated
+            .saturating_add(self.quarantine_failed_hnsw_artifacts()?);
 
         let mut planned = Vec::new();
         for definition_id in definition_ids {
@@ -2035,6 +2053,191 @@ impl SearchIndexRegistry {
         Ok(report)
     }
 
+    fn quarantine_failed_hnsw_artifacts(&self) -> Result<usize> {
+        let failures = self.reader_runtime.drain_hnsw_integrity_failures();
+        if failures.is_empty() {
+            return Ok(0);
+        }
+        let mut by_definition = BTreeMap::<u64, Vec<SearchArtifactRef>>::new();
+        for artifact in failures {
+            by_definition
+                .entry(artifact.definition_id)
+                .or_default()
+                .push(artifact);
+        }
+
+        let mut updated = 0usize;
+        let mut first_error = None;
+        for (definition_id, artifacts) in by_definition {
+            match self.quarantine_failed_hnsw_definition(definition_id, &artifacts) {
+                Ok(changed) => updated = updated.saturating_add(usize::from(changed)),
+                Err(error) => {
+                    self.reader_runtime
+                        .restore_hnsw_integrity_failures(artifacts);
+                    first_error.get_or_insert(error);
+                }
+            }
+        }
+        match first_error {
+            Some(error) => Err(error),
+            None => Ok(updated),
+        }
+    }
+
+    fn quarantine_failed_hnsw_definition(
+        &self,
+        definition_id: u64,
+        failed: &[SearchArtifactRef],
+    ) -> Result<bool> {
+        let _build_guard = self.lock_definition_build(definition_id);
+        let publication_guard = self.tablet.acquire_search_generation_publish_guard()?;
+        let definition_lock = self.definition_lock(definition_id);
+        let _definition_guard = definition_lock
+            .lock()
+            .map_err(|_| paro_error::internal("lock search definition publish lock"))?;
+
+        let current = self.view.load_full();
+        let Some(state) = current.definitions.get(&definition_id).cloned() else {
+            return Ok(false);
+        };
+        drop(current);
+        let Some(manifest) = state.manifest.as_ref() else {
+            return Ok(false);
+        };
+        let removed = manifest
+            .artifacts
+            .artifacts
+            .iter()
+            .filter(|artifact| {
+                artifact.kind == SearchIndexKind::Hnsw
+                    && failed.iter().any(|failed| failed == *artifact)
+            })
+            .cloned()
+            .collect::<Vec<_>>();
+        if removed.is_empty() {
+            return Ok(false);
+        }
+
+        let retained = manifest
+            .artifacts
+            .artifacts
+            .iter()
+            .filter(|artifact| !removed.iter().any(|removed| removed == *artifact))
+            .cloned()
+            .collect::<Vec<_>>();
+
+        let mut recovery_by_rowset = BTreeMap::<u64, (Vec<u32>, u64, u64)>::new();
+        for artifact in &removed {
+            for span in artifact.coverage.segments() {
+                let entry = recovery_by_rowset
+                    .entry(span.segment.rowset_id)
+                    .or_default();
+                entry.0.push(span.segment.segment_id);
+                entry.1 = entry.1.saturating_add(span.row_count);
+                entry.2 = entry.2.saturating_add(
+                    artifact
+                        .stats
+                        .bytes_on_disk
+                        .saturating_mul(span.row_count)
+                        .div_ceil(artifact.stats.row_count.max(1)),
+                );
+            }
+        }
+        let mut added_tail = recovery_by_rowset
+            .into_iter()
+            .map(|(rowset_id, (mut segment_ids, row_count, byte_count))| {
+                segment_ids.sort_unstable();
+                segment_ids.dedup();
+                TailPendingEntry {
+                    entry_id: TailEntryId::UNASSIGNED,
+                    rowset_id,
+                    segment_ids,
+                    mutation: TailMutationKind::Append,
+                    row_count,
+                    byte_count,
+                    row_image_ref: Some(TailRowImageRef::WholeRowset),
+                }
+            })
+            .filter(|entry| !tail_entry_already_live(&manifest.tail_pending_entries, entry))
+            .collect::<Vec<_>>();
+        let mut next_tail_entry_id = manifest.next_tail_entry_id().0;
+        assign_tail_entry_ids(&mut added_tail, &mut next_tail_entry_id);
+
+        let mut root = manifest.root.clone();
+        root.build_epoch = state.next_build_epoch;
+        root.persisted_tail_entry_id_seed = TailEntryId(next_tail_entry_id);
+        root.generation_stats = generation_stats_after_artifact_replacement(
+            &state.definition,
+            &manifest.root.generation_stats,
+            &removed,
+            &[],
+            &retained,
+        )?;
+        let mut tail_entries = manifest.tail_pending_entries.clone();
+        tail_entries.extend(added_tail.iter().cloned());
+        let tail_pending = TailPendingSet {
+            entries: tail_entries,
+        };
+        root.coverage = coverage_for_definition(&state.definition, &tail_pending);
+        root.execution_modes = execution_modes_for_definition(&state.definition, &root.coverage);
+        root.maintenance_state = build_maintenance_state(
+            &state.definition,
+            state.hnsw_provider_config.as_deref(),
+            root.build_snapshot_version,
+            root.build_epoch,
+            root.generation_stats.indexed_rows,
+            &tail_pending,
+            tail_pending.delete_rows(),
+            Some(manifest.root.build_epoch),
+            manifest
+                .root
+                .maintenance_state
+                .recovery
+                .superseded_build_epochs
+                .clone(),
+        )?;
+
+        let mut entries = removed
+            .iter()
+            .map(|artifact| ManifestDeltaEntry::RemoveArtifact(artifact.coverage.clone()))
+            .collect::<Vec<_>>();
+        entries.extend(
+            added_tail
+                .iter()
+                .cloned()
+                .map(ManifestDeltaEntry::UpsertTail),
+        );
+        let mut revision =
+            self.manifests
+                .begin_revision_from_manifest(definition_id, root, manifest)?;
+        revision.append_delta(&ManifestDelta::new(entries))?;
+        let loaded = revision.commit()?;
+        let next_state = state.clone().with_manifest(loaded);
+        let completion = match self.publish_prepared_head_for_state(&next_state, &publication_guard)
+        {
+            Ok(completion) => completion,
+            Err(error) => {
+                self.retire_unpublished_revision(&state, &next_state);
+                return Err(error);
+            }
+        };
+        let view_result =
+            self.publish_durable_revision_state(&state, next_state.clone(), &completion);
+        drop(_definition_guard);
+        drop(publication_guard);
+        completion.finish()?;
+        view_result?;
+        record_tail_metrics_for_state(&next_state);
+        self.signal_maintenance_progress()?;
+        tracing::error!(
+            tablet_id = self.tablet.tablet_id(),
+            definition_id,
+            quarantined_artifacts = removed.len(),
+            "HNSW checksum failure persisted as exact-tail recovery work"
+        );
+        Ok(true)
+    }
+
     fn record_maintenance_failure(&self, definition_id: u64) -> Result<()> {
         let mut failures = self
             .maintenance_failures
@@ -2168,7 +2371,7 @@ impl SearchIndexRegistry {
         if let Err(error) = self.prepare_artifact_readers(
             &state,
             &repacked_artifacts,
-            HnswReaderActivation::MaintenancePublication,
+            HnswReaderActivationPolicy::PUBLICATION,
         ) {
             self.discard_unpublished_sidecars(&store, &sidecar_file_ids);
             return Err(error);
@@ -2200,7 +2403,14 @@ impl SearchIndexRegistry {
                 return Err(err);
             }
         };
-        let completion = self.publish_prepared_head_for_state(&next_state, &publication_guard)?;
+        let completion = match self.publish_prepared_head_for_state(&next_state, &publication_guard)
+        {
+            Ok(completion) => completion,
+            Err(error) => {
+                self.retire_unpublished_revision(&latest_state, &next_state);
+                return Err(error);
+            }
+        };
         let view_result =
             self.publish_durable_revision_state(&latest_state, next_state.clone(), &completion);
         drop(latest_state);
@@ -2410,7 +2620,14 @@ impl SearchIndexRegistry {
             return Ok(capability);
         }
 
-        let completion = self.publish_prepared_head_for_state(&next_state, &publication_guard)?;
+        let completion = match self.publish_prepared_head_for_state(&next_state, &publication_guard)
+        {
+            Ok(completion) => completion,
+            Err(error) => {
+                self.retire_unpublished_revision(&latest_state, &next_state);
+                return Err(error);
+            }
+        };
         let view_result =
             self.publish_durable_revision_state(&latest_state, next_state.clone(), &completion);
         drop(latest_state);
@@ -2515,7 +2732,7 @@ impl SearchIndexRegistry {
         &self,
         definition: SearchIndexDefinition,
         origin: SearchDefinitionOrigin,
-        activation: HnswReaderActivation,
+        activation: HnswReaderActivationPolicy,
     ) -> Result<()> {
         validate_definition(&definition, &self.tablet)?;
         let publication_guard = self.tablet.acquire_search_generation_publish_guard()?;
@@ -3551,7 +3768,6 @@ impl SearchIndexRegistry {
         next_state: &SearchDefinitionState,
         publication_guard: &crate::tablet::SearchGenerationPublishGuard<'_>,
     ) -> Result<SearchGenerationPublishCompletion> {
-        self.prepare_generation_readers(next_state, HnswReaderActivation::MaintenancePublication)?;
         publish_head_for_state(&self.tablet, &self.manifests, next_state, publication_guard)
     }
 
@@ -3565,7 +3781,7 @@ impl SearchIndexRegistry {
     fn prepare_generation_readers(
         &self,
         state: &SearchDefinitionState,
-        activation: HnswReaderActivation,
+        activation: HnswReaderActivationPolicy,
     ) -> Result<()> {
         if state.definition.kind != SearchIndexKind::Hnsw {
             return Ok(());
@@ -3586,7 +3802,7 @@ impl SearchIndexRegistry {
         &self,
         state: &SearchDefinitionState,
         artifacts: &[SearchArtifactRef],
-        activation: HnswReaderActivation,
+        activation: HnswReaderActivationPolicy,
     ) -> Result<()> {
         if state.definition.kind != SearchIndexKind::Hnsw || artifacts.is_empty() {
             return Ok(());
@@ -3607,6 +3823,7 @@ impl SearchIndexRegistry {
             column_id,
             provider.dimension as usize,
             &provider.build_contract(),
+            state.hnsw_query_activity.clone(),
             activation,
         )?;
         Ok(())
@@ -3892,7 +4109,7 @@ impl SearchIndexRegistry {
                     let _ = self.update_definition(
                         definition,
                         SearchDefinitionOrigin::schema_seed(column_id),
-                        HnswReaderActivation::Recovery,
+                        HnswReaderActivationPolicy::RECOVERY,
                     );
                 }
                 Err(err) => {
@@ -5428,11 +5645,11 @@ mod tests {
     }
 
     #[test]
-    fn online_definition_attach_authenticates_staged_hnsw_before_visibility() {
+    fn corrupt_hnsw_authentication_is_persisted_as_exact_tail_recovery() {
         use std::io::{Read, Seek, SeekFrom, Write};
 
         let root = TempDir::new().unwrap();
-        let table = create_table_without_default_indexes(
+        let table = create_table_with_root(
             root.path(),
             &[LogicalType::Array(Box::new(LogicalType::Float), 4)],
         );
@@ -5466,6 +5683,12 @@ mod tests {
             ),
             provider_config,
         };
+        let scheduler = Arc::new(TaskScheduler::new());
+        table
+            .bind_hnsw_integrity_scheduler(Some(Arc::new(
+                crate::index::hnsw::HnswIntegrityScheduler::new(Arc::clone(&scheduler)),
+            )))
+            .unwrap();
         let staged = table
             .stage_search_definition_generation(
                 definition.clone(),
@@ -5493,13 +5716,14 @@ mod tests {
             .artifacts
             .artifacts
             .first()
-            .expect("published HNSW artifact");
+            .expect("published HNSW artifact")
+            .clone();
         let ArtifactLocation::SidecarArtifactFile {
             file_id,
             offset,
             len,
             ..
-        } = artifact.location
+        } = artifact.location.clone()
         else {
             panic!("staged HNSW generation must use a sidecar artifact");
         };
@@ -5519,16 +5743,75 @@ mod tests {
         file.write_all(&byte).unwrap();
         file.sync_all().unwrap();
 
-        let error = table
-            .register_published_search_definition(definition)
-            .expect_err("online attach must reject corrupt durable HNSW payload");
-        assert!(error.to_string().contains("checksum mismatch"), "{error}");
+        table
+            .register_published_search_definition(definition.clone())
+            .expect("reader activation must not synchronously scan the artifact");
         assert!(
             table
                 .vector_capability(0, DistanceMetric::Euclidean)
-                .is_none(),
-            "failed publication activation must not expose a capability"
+                .is_some(),
+            "lazy checksum validation keeps the exact fallback queryable"
         );
+
+        let marker = std::sync::atomic::AtomicBool::new(true);
+        for _ in 0..32 {
+            scheduler.execute_tasks(&marker, 1);
+        }
+        assert_eq!(
+            table
+                .search_registry()
+                .quarantine_failed_hnsw_artifacts()
+                .unwrap(),
+            1
+        );
+
+        let next_head = table
+            .tablet()
+            .search_generation_head(definition.definition_id)
+            .expect("quarantine revision head");
+        assert!(next_head.root_version > head.root_version);
+        let next = table
+            .search_registry()
+            .manifests
+            .load_manifest_for_head(&next_head)
+            .unwrap()
+            .expect("quarantine manifest");
+        assert!(
+            next.artifacts
+                .artifacts
+                .iter()
+                .all(|current| current != &artifact),
+            "a checksum-failed artifact must not survive in durable recovery state"
+        );
+        assert!(
+            !next.tail_pending_entries.is_empty(),
+            "failed secondary coverage must remain queryable through exact tail"
+        );
+
+        table.tablet().save_meta().unwrap();
+        let descriptor = table.to_descriptor().expect("table descriptor");
+        drop(manifest);
+        drop(table);
+        let reopened = reopen_table_with_root(
+            root.path(),
+            &[LogicalType::Array(Box::new(LogicalType::Float), 4)],
+            &descriptor,
+        );
+        reopened
+            .register_search_definition(definition)
+            .expect("recovery must attach the durable exact-tail revision");
+        let recovered = reopened.search_registry().view.load();
+        let recovered_manifest = recovered
+            .definitions
+            .get(&92)
+            .and_then(|state| state.manifest.as_ref())
+            .expect("recovered quarantine manifest");
+        assert_eq!(recovered_manifest.root.root_version, next_head.root_version);
+        assert!(recovered_manifest
+            .artifacts
+            .artifacts
+            .iter()
+            .all(|current| current != &artifact));
     }
 
     #[test]

@@ -118,6 +118,8 @@ pub(crate) fn hnsw_foreground_pressure_active() -> bool {
 pub(crate) struct HnswQueryActivity {
     active_queries: AtomicUsize,
     last_query_micros_plus_one: AtomicU64,
+    changed_state: Mutex<()>,
+    changed: Condvar,
 }
 
 impl HnswQueryActivity {
@@ -125,6 +127,7 @@ impl HnswQueryActivity {
         self.last_query_micros_plus_one
             .store(scheduler_micros().saturating_add(1), Ordering::Release);
         self.active_queries.fetch_add(1, Ordering::AcqRel);
+        self.changed.notify_all();
         HnswQueryActivityGuard {
             activity: Arc::clone(self),
         }
@@ -144,6 +147,35 @@ impl HnswQueryActivity {
         scheduler_micros().saturating_sub(last_plus_one - 1)
             >= minimum_idle.as_micros().min(u128::from(u64::MAX)) as u64
     }
+
+    /// Wait on this definition only. Instance-wide integrity work can rotate
+    /// past a hot definition, while the single-job case parks without polling
+    /// or coupling unrelated tenants through the global HNSW query census.
+    pub(crate) fn wait_for_quiet(&self, minimum_idle: Duration, max_wait: Duration) -> bool {
+        if self.quiet_for(minimum_idle) {
+            return true;
+        }
+        let deadline = Instant::now() + max_wait;
+        let mut state = self
+            .changed_state
+            .lock()
+            .expect("HNSW definition activity lock poisoned");
+        while !self.quiet_for(minimum_idle) {
+            let now = Instant::now();
+            if now >= deadline {
+                return false;
+            }
+            let (next, timeout) = self
+                .changed
+                .wait_timeout(state, deadline.saturating_duration_since(now))
+                .expect("HNSW definition activity lock poisoned");
+            state = next;
+            if timeout.timed_out() && !self.quiet_for(minimum_idle) {
+                return false;
+            }
+        }
+        true
+    }
 }
 
 pub(crate) struct HnswQueryActivityGuard {
@@ -156,6 +188,7 @@ impl Drop for HnswQueryActivityGuard {
             .last_query_micros_plus_one
             .store(scheduler_micros().saturating_add(1), Ordering::Release);
         self.activity.active_queries.fetch_sub(1, Ordering::AcqRel);
+        self.activity.changed.notify_all();
     }
 }
 

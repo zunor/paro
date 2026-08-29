@@ -8,7 +8,7 @@ use std::hash::Hasher;
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Condvar, Mutex, OnceLock};
+use std::sync::{Arc, Condvar, Mutex, OnceLock, RwLock, Weak};
 
 use arc_swap::ArcSwap;
 use memmap2::Mmap;
@@ -17,7 +17,8 @@ use paro_common::error::{self as paro_error, Result};
 use crate::metrics::storage_metrics;
 
 use super::artifact::{ArtifactFileId, ArtifactLocation};
-use super::capability::SearchIndexKind;
+use super::capability::{SearchArtifactRef, SearchIndexKind};
+use super::maintenance::SearchMaintenanceUrgency;
 use super::stats::{SearchDefinitionId, SearchGenerationId};
 
 static SIDECAR_STAGING_SEQUENCE: AtomicU64 = AtomicU64::new(1);
@@ -539,6 +540,19 @@ impl DecodedSidecarReaderRequest<'_> {
     }
 }
 
+fn hnsw_decoded_artifact_key(artifact: &SearchArtifactRef) -> Result<DecodedSidecarArtifactKey> {
+    DecodedSidecarReaderRequest {
+        sidecar: SidecarReaderRequest {
+            location: &artifact.location,
+            artifact_format_version: artifact.artifact_format_version,
+            provider: SearchIndexKind::Hnsw,
+            codec: SIDECAR_PACKAGE_CODEC,
+            integrity: SidecarIntegrityPolicy::SelfValidatingArtifact,
+        },
+    }
+    .key()
+}
+
 #[derive(Debug, Clone, Copy)]
 pub struct SidecarReaderRequest<'a> {
     pub location: &'a ArtifactLocation,
@@ -722,6 +736,62 @@ pub struct SearchReaderRuntime {
     decoded_inflight: Mutex<BTreeMap<DecodedSidecarArtifactKey, Arc<DecodedOpenGate>>>,
     buffer_pool: OnceLock<Arc<crate::buffer::BufferPool>>,
     hnsw_integrity_scheduler: OnceLock<Arc<crate::index::hnsw::HnswIntegrityScheduler>>,
+    hnsw_integrity_failures: Arc<HnswIntegrityFailureQueue>,
+}
+
+pub(crate) type IntegrityFailureNotifier = Arc<dyn Fn(SearchMaintenanceUrgency) + Send + Sync>;
+
+#[derive(Default)]
+struct HnswIntegrityFailureQueue {
+    failed: Mutex<BTreeMap<DecodedSidecarArtifactKey, SearchArtifactRef>>,
+    notifier: RwLock<Option<IntegrityFailureNotifier>>,
+}
+
+impl HnswIntegrityFailureQueue {
+    fn record(&self, key: DecodedSidecarArtifactKey, artifact: SearchArtifactRef) {
+        self.failed
+            .lock()
+            .expect("HNSW integrity failure queue poisoned")
+            .insert(key, artifact);
+        if let Some(notifier) = self
+            .notifier
+            .read()
+            .expect("HNSW integrity failure notifier poisoned")
+            .as_ref()
+        {
+            notifier(SearchMaintenanceUrgency::Immediate);
+        }
+    }
+
+    fn drain(&self) -> Vec<SearchArtifactRef> {
+        std::mem::take(
+            &mut *self
+                .failed
+                .lock()
+                .expect("HNSW integrity failure queue poisoned"),
+        )
+        .into_values()
+        .collect()
+    }
+
+    fn restore(&self, artifacts: impl IntoIterator<Item = SearchArtifactRef>) {
+        let mut failed = self
+            .failed
+            .lock()
+            .expect("HNSW integrity failure queue poisoned");
+        for artifact in artifacts {
+            if let Ok(key) = hnsw_decoded_artifact_key(&artifact) {
+                failed.insert(key, artifact);
+            }
+        }
+    }
+
+    fn is_empty(&self) -> bool {
+        self.failed
+            .lock()
+            .expect("HNSW integrity failure queue poisoned")
+            .is_empty()
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -790,6 +860,7 @@ impl SearchReaderRuntime {
             decoded_inflight: Mutex::new(BTreeMap::new()),
             buffer_pool: OnceLock::new(),
             hnsw_integrity_scheduler: OnceLock::new(),
+            hnsw_integrity_failures: Arc::new(HnswIntegrityFailureQueue::default()),
         }
     }
 
@@ -860,12 +931,63 @@ impl SearchReaderRuntime {
         Ok(())
     }
 
+    pub(crate) fn bind_hnsw_integrity_failure_notifier(
+        &self,
+        notifier: Option<IntegrityFailureNotifier>,
+    ) {
+        *self
+            .hnsw_integrity_failures
+            .notifier
+            .write()
+            .expect("HNSW integrity failure notifier poisoned") = notifier.clone();
+        if !self.hnsw_integrity_failures.is_empty() {
+            if let Some(notifier) = notifier {
+                notifier(SearchMaintenanceUrgency::Immediate);
+            }
+        }
+    }
+
+    pub(crate) fn drain_hnsw_integrity_failures(&self) -> Vec<SearchArtifactRef> {
+        self.hnsw_integrity_failures.drain()
+    }
+
+    pub(crate) fn restore_hnsw_integrity_failures(
+        &self,
+        artifacts: impl IntoIterator<Item = SearchArtifactRef>,
+    ) {
+        self.hnsw_integrity_failures.restore(artifacts);
+    }
+
+    pub(crate) fn record_hnsw_integrity_failure(&self, artifact: &SearchArtifactRef) {
+        if let Ok(key) = hnsw_decoded_artifact_key(artifact) {
+            self.hnsw_integrity_failures.record(key, artifact.clone());
+        }
+    }
+
     pub(crate) fn schedule_hnsw_integrity_verification(
         &self,
         index: &Arc<crate::index::hnsw::HnswIndex>,
+        artifact: &SearchArtifactRef,
+        query_activity: Option<Arc<crate::index::hnsw::HnswQueryActivity>>,
     ) {
+        let Ok(key) = hnsw_decoded_artifact_key(artifact) else {
+            return;
+        };
         if let Some(scheduler) = self.hnsw_integrity_scheduler.get() {
-            scheduler.schedule(index);
+            let failures: Weak<HnswIntegrityFailureQueue> =
+                Arc::downgrade(&self.hnsw_integrity_failures);
+            let artifact = artifact.clone();
+            scheduler.schedule(
+                index,
+                query_activity,
+                Arc::new(move || {
+                    if let Some(failures) = failures.upgrade() {
+                        failures.record(key, artifact.clone());
+                    }
+                }),
+            );
+        } else if index.integrity_failed() {
+            self.hnsw_integrity_failures.record(key, artifact.clone());
         }
     }
 

@@ -80,6 +80,7 @@ impl RuntimeResources {
                 object_cache: self.object_cache,
                 db_file_system: self.db_file_system,
                 python_runtime: self.python_runtime,
+                hnsw_integrity: boot_config.hnsw_integrity,
             },
             RuntimeTuning::from_options(&config.options),
         )

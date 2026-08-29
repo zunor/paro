@@ -9,7 +9,7 @@ use paro_external::runtime::host::{ExternalRuntimeHost, PythonRuntimeStatus};
 use paro_function::scalar::cast::CastFunctionSet;
 use paro_scheduler::scheduler::TaskScheduler;
 use paro_storage::buffer::{BufferManager, BufferPool, PageCache};
-use paro_storage::index::hnsw::HnswIntegrityScheduler;
+use paro_storage::index::hnsw::{HnswIntegrityScheduler, HnswIntegritySchedulerConfig};
 use paro_transaction::{CommitDrainWakePool, CommitDrainWakePoolOptions};
 use std::sync::Arc;
 
@@ -57,6 +57,7 @@ pub(crate) struct InstanceRuntimeResources {
     pub(crate) object_cache: Arc<ObjectCache>,
     pub(crate) db_file_system: Arc<DatabaseFileSystem>,
     pub(crate) python_runtime: Arc<ExternalRuntimeHost>,
+    pub(crate) hnsw_integrity: HnswIntegritySchedulerConfig,
 }
 
 impl InstanceRuntime {
@@ -72,10 +73,13 @@ impl InstanceRuntime {
             object_cache,
             db_file_system,
             python_runtime,
+            hnsw_integrity,
         } = resources;
         let page_cache = Arc::new(PageCache::new(Arc::clone(&buffer_pool)));
-        let hnsw_integrity_scheduler =
-            Arc::new(HnswIntegrityScheduler::new(Arc::clone(&scheduler)));
+        let hnsw_integrity_scheduler = Arc::new(HnswIntegrityScheduler::with_config(
+            Arc::clone(&scheduler),
+            hnsw_integrity,
+        ));
         Self {
             buffer_pool,
             page_cache,

@@ -53,7 +53,7 @@ pub use hnsw_builder::{
 pub(crate) use hnsw_builder::{
     hnsw_build_thread_count, hnsw_foreground_pressure_active, HnswQueryActivity,
 };
-pub use integrity_scheduler::HnswIntegrityScheduler;
+pub use integrity_scheduler::{HnswIntegrityScheduler, HnswIntegritySchedulerConfig};
 pub use links_container::{ItemsBuffer, LinksContainer};
 pub(crate) use persistence::{
     hnsw_artifact_build_contract, hnsw_artifact_uses_external_vectors, HnswExternalVectorBinding,
