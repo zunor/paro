@@ -2,9 +2,10 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use crate::primary_key::{PrimaryIndexVersion, PrimaryKeyWriteConflict, RowID};
+use memmap2::{Advice, Mmap, MmapOptions};
 use paro_common::error::{self as paro_error, Result};
 use std::collections::{BTreeMap, HashMap};
-use std::fs;
+use std::fs::{self, File};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, LazyLock, Mutex, Weak};
 
@@ -186,7 +187,10 @@ impl ImmutableIndexWriter {
 #[derive(Debug)]
 pub struct ImmutableIndexReader {
     path: PathBuf,
-    bytes: Arc<[u8]>,
+    /// Immutable primary-index levels are query-time random-access structures.
+    /// Keep the durable file as the only byte copy and let the OS page cache
+    /// govern residency instead of eagerly duplicating every level on heap.
+    bytes: Arc<Mmap>,
     page_size: usize,
     bucket_directory: Vec<BucketDirectoryEntry>,
     file_bloom: FileBloom,
@@ -196,10 +200,19 @@ pub struct ImmutableIndexReader {
 impl ImmutableIndexReader {
     pub fn open(path: impl AsRef<Path>) -> Result<Self> {
         let path = path.as_ref().to_path_buf();
-        let bytes: Arc<[u8]> = fs::read(&path)
-            .map(Arc::<[u8]>::from)
-            .map_err(|e| paro_error::io_error(format!("read immutable index {:?}: {}", path, e)))?;
-        Self::from_bytes(path, bytes)
+        let file = File::open(&path)
+            .map_err(|e| paro_error::io_error(format!("open immutable index {:?}: {}", path, e)))?;
+        // SAFETY: the reader owns an Arc<Mmap> for its complete lifetime and
+        // immutable index files are never modified in place. Publication uses
+        // a new file name plus manifest replacement; obsolete files are only
+        // unlinked after readers have pinned this mapping.
+        let bytes = Arc::new(unsafe {
+            MmapOptions::new().map(&file).map_err(|e| {
+                paro_error::io_error(format!("map immutable index {:?}: {}", path, e))
+            })?
+        });
+        let _ = bytes.advise(Advice::Random);
+        Self::from_mmap(path, bytes)
     }
 
     pub fn open_cached(path: impl AsRef<Path>) -> Result<Arc<Self>> {
@@ -221,7 +234,7 @@ impl ImmutableIndexReader {
         Ok(reader)
     }
 
-    fn from_bytes(path: PathBuf, bytes: Arc<[u8]>) -> Result<Self> {
+    fn from_mmap(path: PathBuf, bytes: Arc<Mmap>) -> Result<Self> {
         if bytes.len() < FILE_HEADER_LEN {
             return Err(paro_error::data_corrupted(format!(
                 "immutable index {:?} too small",

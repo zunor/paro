@@ -14,10 +14,9 @@ use std::collections::HashMap;
 use std::fs::{self, File, OpenOptions};
 use std::io::Write;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
-pub const PERSISTENT_INDEX_FORMAT_VERSION: u32 = 5;
+pub const PERSISTENT_INDEX_FORMAT_VERSION: u32 = 6;
 
 const WAL_MAGIC: [u8; 4] = *b"PIWL";
 const FILE_HEADER_LEN: usize = 8;
@@ -31,9 +30,26 @@ enum FileHeaderStatus {
     Legacy,
 }
 
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+enum ImmutableIndexLevel {
+    L1,
+    L2,
+}
+
+impl ImmutableIndexLevel {
+    const fn file_prefix(self) -> &'static str {
+        match self {
+            Self::L1 => "l1",
+            Self::L2 => "l2",
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 struct ImmutableFileMeta {
     file_id: u64,
+    level: ImmutableIndexLevel,
     edit_version: u64,
     entry_count: u64,
 }
@@ -67,7 +83,7 @@ pub struct PrimaryIndexRowsetRoot {
     pub effective_rows: u64,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct Manifest {
     format_version: u32,
@@ -114,8 +130,15 @@ pub struct PersistentIndex {
     provenance: Option<PrimaryIndexProvenance>,
     l1_files: Vec<ImmutableFileMeta>,
     l2_file: Option<ImmutableFileMeta>,
-    format_validated: AtomicBool,
-    immutable_readers: Mutex<HashMap<PathBuf, Arc<ImmutableIndexReader>>>,
+    /// The manifest-defined mutable tier, parsed once at open and updated in
+    /// the same critical section as its WAL append. Point and batch lookups
+    /// must never rediscover this state by scanning or rereading the directory.
+    active_wal_index: Arc<PrimaryIndex>,
+    wal_writer: Mutex<File>,
+    /// Immutable readers pinned for exactly the current manifest generation.
+    /// Replaced only while the tablet owns the outer PersistentIndex write
+    /// guard, so query lookups are filesystem-free after open/publication.
+    immutable_readers: Vec<Arc<ImmutableIndexReader>>,
 }
 
 impl PersistentIndex {
@@ -152,6 +175,25 @@ impl PersistentIndex {
         })?;
         let manifest_path = root_dir.join("primary_index.manifest");
         let manifest = Self::read_manifest(&manifest_path)?.unwrap_or_default();
+        if manifest.format_version != PERSISTENT_INDEX_FORMAT_VERSION {
+            return Err(paro_error::data_corrupted(format!(
+                "unsupported persistent index manifest version {}",
+                manifest.format_version
+            )));
+        }
+        if manifest
+            .l1_files
+            .iter()
+            .any(|meta| meta.level != ImmutableIndexLevel::L1)
+            || manifest
+                .l2_file
+                .iter()
+                .any(|meta| meta.level != ImmutableIndexLevel::L2)
+        {
+            return Err(paro_error::data_corrupted(
+                "persistent index manifest level metadata is inconsistent",
+            ));
+        }
 
         let max_known_file_id = manifest
             .l1_files
@@ -161,7 +203,20 @@ impl PersistentIndex {
             .max()
             .unwrap_or(0);
 
-        Ok(Self {
+        let active_wal_path = root_dir.join(format!("wal_{}.wal", manifest.active_wal_id));
+        let mut wal_writer = OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&active_wal_path)
+            .map_err(|e| paro_error::io_error(format!("open wal {:?}: {}", active_wal_path, e)))?;
+        Self::ensure_file_header(&mut wal_writer)?;
+        wal_writer
+            .flush()
+            .map_err(|e| paro_error::io_error(format!("flush wal {:?}: {}", active_wal_path, e)))?;
+        let active_wal_index = Arc::new(PrimaryIndex::new());
+        active_wal_index.batch_apply_versions(Self::read_wal_records_path(&active_wal_path)?);
+
+        let mut index = Self {
             root_dir,
             manifest_path,
             active_wal_id: manifest.active_wal_id,
@@ -190,9 +245,13 @@ impl PersistentIndex {
             provenance: manifest.provenance,
             l1_files: manifest.l1_files,
             l2_file: manifest.l2_file,
-            format_validated: AtomicBool::new(false),
-            immutable_readers: Mutex::new(HashMap::new()),
-        })
+            active_wal_index,
+            wal_writer: Mutex::new(wal_writer),
+            immutable_readers: Vec::new(),
+        };
+        index.validate_current_format()?;
+        index.refresh_immutable_readers()?;
+        Ok(index)
     }
 
     pub fn applied_lsn(&self) -> u64 {
@@ -204,28 +263,14 @@ impl PersistentIndex {
     }
 
     pub fn load(&self) -> Result<PrimaryIndex> {
-        self.validate_current_format()?;
-
         let index = PrimaryIndex::new();
-
-        if let Some(l2_file) = &self.l2_file {
-            self.apply_immutable_file_to_index(l2_file, &index)?;
+        // The read view is stored newest-first for point lookups. Rebuild the
+        // complete hash index oldest-first so equal-timestamp replacements
+        // preserve durable edit order, then apply the active WAL last.
+        for reader in self.immutable_readers.iter().rev() {
+            index.batch_apply_versions(reader.entries()?);
         }
-
-        let mut l1_files = self.l1_files.clone();
-        l1_files.sort_by_key(|meta| meta.edit_version);
-        for meta in l1_files {
-            self.apply_immutable_file_to_index(&meta, &index)?;
-        }
-
-        let mut wal_files = self.list_wal_files()?;
-        wal_files.sort_by_key(|(id, _)| *id);
-        for (id, path) in wal_files {
-            if id < self.active_wal_id {
-                continue;
-            }
-            index.batch_apply_versions(self.read_wal_records(&path)?);
-        }
+        index.batch_apply_versions(self.active_wal_index.snapshot_versions());
 
         Ok(index)
     }
@@ -239,31 +284,25 @@ impl PersistentIndex {
             return Ok(());
         }
         let wal_path = self.active_wal_path();
-        let mut file = OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(&wal_path)
-            .map_err(|e| paro_error::io_error(format!("open wal {:?}: {}", wal_path, e)))?;
-        Self::ensure_file_header(&mut file)?;
-
+        let mut file = self
+            .wal_writer
+            .lock()
+            .map_err(|_| paro_error::internal("lock persistent index WAL writer"))?;
+        let mut encoded = Vec::new();
         for (key, row_id) in pairs {
             let key_len = key.len() as u32;
-            file.write_all(&key_len.to_le_bytes()).map_err(|e| {
-                paro_error::io_error(format!("write wal len to {:?}: {}", wal_path, e))
-            })?;
-            file.write_all(key).map_err(|e| {
-                paro_error::io_error(format!("write wal key to {:?}: {}", wal_path, e))
-            })?;
-            file.write_all(&u64::from(*row_id).to_le_bytes())
-                .map_err(|e| {
-                    paro_error::io_error(format!("write wal row id to {:?}: {}", wal_path, e))
-                })?;
-            file.write_all(&commit_ts.to_le_bytes()).map_err(|e| {
-                paro_error::io_error(format!("write wal commit ts to {:?}: {}", wal_path, e))
-            })?;
+            encoded.extend_from_slice(&key_len.to_le_bytes());
+            encoded.extend_from_slice(key);
+            encoded.extend_from_slice(&u64::from(*row_id).to_le_bytes());
+            encoded.extend_from_slice(&commit_ts.to_le_bytes());
         }
+        file.write_all(&encoded).map_err(|e| {
+            paro_error::io_error(format!("write WAL batch to {:?}: {}", wal_path, e))
+        })?;
         file.flush()
             .map_err(|e| paro_error::io_error(format!("flush wal {:?}: {}", wal_path, e)))?;
+        self.active_wal_index
+            .batch_upsert_at(pairs.iter().cloned(), commit_ts);
         Ok(())
     }
 
@@ -276,31 +315,27 @@ impl PersistentIndex {
             return Ok(());
         }
         let wal_path = self.active_wal_path();
-        let mut file = OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(&wal_path)
-            .map_err(|e| paro_error::io_error(format!("open wal {:?}: {}", wal_path, e)))?;
-        Self::ensure_file_header(&mut file)?;
-
+        let mut file = self
+            .wal_writer
+            .lock()
+            .map_err(|_| paro_error::internal("lock persistent index WAL writer"))?;
         let tombstone = NULL_ROW_ID.to_le_bytes();
+        let mut encoded = Vec::new();
         for key in keys {
             let key_len = key.len() as u32;
-            file.write_all(&key_len.to_le_bytes()).map_err(|e| {
-                paro_error::io_error(format!("write wal len to {:?}: {}", wal_path, e))
-            })?;
-            file.write_all(key).map_err(|e| {
-                paro_error::io_error(format!("write wal key to {:?}: {}", wal_path, e))
-            })?;
-            file.write_all(&tombstone).map_err(|e| {
-                paro_error::io_error(format!("write wal tombstone to {:?}: {}", wal_path, e))
-            })?;
-            file.write_all(&commit_ts.to_le_bytes()).map_err(|e| {
-                paro_error::io_error(format!("write wal commit ts to {:?}: {}", wal_path, e))
-            })?;
+            encoded.extend_from_slice(&key_len.to_le_bytes());
+            encoded.extend_from_slice(key);
+            encoded.extend_from_slice(&tombstone);
+            encoded.extend_from_slice(&commit_ts.to_le_bytes());
         }
+        file.write_all(&encoded).map_err(|e| {
+            paro_error::io_error(format!("write WAL batch to {:?}: {}", wal_path, e))
+        })?;
         file.flush()
             .map_err(|e| paro_error::io_error(format!("flush wal {:?}: {}", wal_path, e)))?;
+        for key in keys {
+            self.active_wal_index.remove_at(key, commit_ts);
+        }
         Ok(())
     }
 
@@ -311,30 +346,9 @@ impl PersistentIndex {
     }
 
     pub fn get_version_at(&self, key: &[u8], read_ts: u64) -> Result<Option<PrimaryIndexVersion>> {
-        self.validate_current_format()?;
-
-        let mut best = None;
-        let mut wal_files = self.list_wal_files()?;
-        wal_files.retain(|(id, _)| *id >= self.active_wal_id);
-        wal_files.sort_by_key(|(id, _)| *id);
-        for (_, path) in wal_files {
-            Self::select_newer_visible(&mut best, self.search_wal_for_key_at(&path, key, read_ts)?);
-        }
-
-        let mut l1_files = self.l1_files.clone();
-        l1_files.sort_by_key(|meta| meta.edit_version);
-        for meta in l1_files {
-            Self::select_newer_visible(
-                &mut best,
-                self.search_immutable_file_for_key_at(&meta, key, read_ts)?,
-            );
-        }
-
-        if let Some(l2_file) = &self.l2_file {
-            Self::select_newer_visible(
-                &mut best,
-                self.search_immutable_file_for_key_at(l2_file, key, read_ts)?,
-            );
+        let mut best = self.active_wal_index.get_version_at(key, read_ts);
+        for reader in &self.immutable_readers {
+            Self::select_newer_visible(&mut best, reader.get_version_at(key, read_ts)?);
         }
 
         Ok(best)
@@ -377,13 +391,10 @@ impl PersistentIndex {
             return Ok(vec![self.get_version_at(&keys[0], read_ts)?]);
         }
 
-        self.validate_current_format()?;
-        let wal = self.load_active_wal_index()?;
-        let immutable_readers = self.immutable_readers_for_lookup()?;
         let mut results = Vec::with_capacity(keys.len());
         for key in keys {
-            let mut best = wal.get_version_at(key, read_ts);
-            for reader in &immutable_readers {
+            let mut best = self.active_wal_index.get_version_at(key, read_ts);
+            for reader in &self.immutable_readers {
                 Self::select_newer_visible(&mut best, reader.get_version_at(key, read_ts)?);
             }
             results.push(best);
@@ -403,37 +414,15 @@ impl PersistentIndex {
         read_ts: u64,
         commit_ts: u64,
     ) -> Result<Option<PrimaryKeyWriteConflict>> {
-        self.validate_current_format()?;
         if read_ts >= commit_ts {
             return Ok(None);
         }
 
-        let mut best = None;
-        let mut wal_files = self.list_wal_files()?;
-        wal_files.retain(|(id, _)| *id >= self.active_wal_id);
-        wal_files.sort_by_key(|(id, _)| *id);
-        for (_, path) in wal_files {
-            if let Some(conflict) =
-                self.search_wal_for_write_in_range(&path, key, read_ts, commit_ts)?
-            {
-                select_earlier_conflict(&mut best, conflict);
-            }
-        }
-
-        let mut l1_files = self.l1_files.clone();
-        l1_files.sort_by_key(|meta| meta.edit_version);
-        for meta in l1_files {
-            if let Some(conflict) =
-                self.search_immutable_file_for_write_in_range(&meta, key, read_ts, commit_ts)?
-            {
-                select_earlier_conflict(&mut best, conflict);
-            }
-        }
-
-        if let Some(l2_file) = &self.l2_file {
-            if let Some(conflict) =
-                self.search_immutable_file_for_write_in_range(l2_file, key, read_ts, commit_ts)?
-            {
+        let mut best = self
+            .active_wal_index
+            .first_write_in_range(key, read_ts, commit_ts);
+        for reader in &self.immutable_readers {
+            if let Some(conflict) = reader.first_write_in_range(key, read_ts, commit_ts)? {
                 select_earlier_conflict(&mut best, conflict);
             }
         }
@@ -454,15 +443,11 @@ impl PersistentIndex {
             return self.first_write_in_range(&keys[0], read_ts, commit_ts);
         }
 
-        self.validate_current_format()?;
-        let wal = self.load_active_wal_index()?;
-        let immutable_readers = self.immutable_readers_for_lookup()?;
-        let mut best = None;
+        let mut best = self
+            .active_wal_index
+            .first_write_for_keys_in_range(keys, read_ts, commit_ts);
         for key in keys {
-            if let Some(conflict) = wal.first_write_in_range(key, read_ts, commit_ts) {
-                select_earlier_conflict(&mut best, conflict);
-            }
-            for reader in &immutable_readers {
+            for reader in &self.immutable_readers {
                 if let Some(conflict) = reader.first_write_in_range(key, read_ts, commit_ts)? {
                     select_earlier_conflict(&mut best, conflict);
                 }
@@ -478,38 +463,16 @@ impl PersistentIndex {
         read_ts: u64,
         commit_ts: u64,
     ) -> Result<Option<PrimaryKeyWriteConflict>> {
-        self.validate_current_format()?;
         if read_ts >= commit_ts {
             return Ok(None);
         }
 
-        let mut best = None;
-        let mut wal_files = self.list_wal_files()?;
-        wal_files.retain(|(id, _)| *id >= self.active_wal_id);
-        wal_files.sort_by_key(|(id, _)| *id);
-        for (_, path) in wal_files {
-            if let Some(conflict) = self
-                .search_wal_for_key_range_write_in_range(&path, lower, upper, read_ts, commit_ts)?
-            {
-                select_earlier_conflict(&mut best, conflict);
-            }
-        }
-
-        let mut l1_files = self.l1_files.clone();
-        l1_files.sort_by_key(|meta| meta.edit_version);
-        for meta in l1_files {
-            if let Some(conflict) = self
-                .immutable_reader(self.resolve_immutable_meta_path(&meta))?
-                .first_key_range_write_in_range(lower, upper, read_ts, commit_ts)?
-            {
-                select_earlier_conflict(&mut best, conflict);
-            }
-        }
-
-        if let Some(l2_file) = &self.l2_file {
-            if let Some(conflict) = self
-                .immutable_reader(self.resolve_immutable_meta_path(l2_file))?
-                .first_key_range_write_in_range(lower, upper, read_ts, commit_ts)?
+        let mut best = self
+            .active_wal_index
+            .first_key_range_write_in_range(lower, upper, read_ts, commit_ts);
+        for reader in &self.immutable_readers {
+            if let Some(conflict) =
+                reader.first_key_range_write_in_range(lower, upper, read_ts, commit_ts)?
             {
                 select_earlier_conflict(&mut best, conflict);
             }
@@ -535,35 +498,60 @@ impl PersistentIndex {
         truncate_wal: bool,
         provenance: Option<PrimaryIndexProvenance>,
     ) -> Result<()> {
-        let wal_path = self.active_wal_path();
-        let mut records = self.read_wal_records(&wal_path)?;
+        let mut next = self.manifest_snapshot();
+        let mut records = self.active_wal_index.snapshot_versions();
         records.extend(idx.snapshot_versions());
+        let mut wrote_l1 = false;
 
         if !records.is_empty() {
-            let file_id = self.next_file_id;
-            let stats = self.write_immutable_level_file("l1", file_id, &records)?;
-            self.edit_version += 1;
-            self.l1_files.push(ImmutableFileMeta {
+            let file_id = next.next_file_id;
+            let stats =
+                self.write_immutable_level_file(ImmutableIndexLevel::L1, file_id, &records)?;
+            next.edit_version += 1;
+            next.l1_files.push(ImmutableFileMeta {
                 file_id,
-                edit_version: self.edit_version,
+                level: ImmutableIndexLevel::L1,
+                edit_version: next.edit_version,
                 entry_count: stats.entry_count as u64,
             });
-            self.next_file_id += 1;
+            next.next_file_id += 1;
+            wrote_l1 = true;
+        }
+
+        if next.l1_files.len() > MINOR_COMPACTION_THRESHOLD {
+            self.minor_compact_manifest(&mut next)?;
+        }
+
+        let next_wal_writer = if truncate_wal {
+            next.active_wal_id += 1;
+            Some(self.create_empty_wal_writer(next.active_wal_id)?)
+        } else {
+            None
+        };
+
+        next.provenance = provenance;
+        // Open every immutable member before publishing its manifest. Once
+        // the manifest rename succeeds, installing the in-process read view
+        // is infallible and cannot strand queries between generations.
+        let next_readers = self.open_immutable_readers(&next.l1_files, next.l2_file.as_ref())?;
+        self.write_manifest_value(&next)?;
+
+        self.install_manifest(next);
+        self.immutable_readers = next_readers;
+        if let Some(writer) = next_wal_writer {
+            self.active_wal_index = Arc::new(PrimaryIndex::new());
+            self.wal_writer = Mutex::new(writer);
+        }
+        if wrote_l1 {
             storage_metrics().inc_persistent_index_flushes();
         }
-
-        if self.l1_files.len() > MINOR_COMPACTION_THRESHOLD {
-            self.minor_compact()?;
+        if let Err(error) = self.cleanup_obsolete_files() {
+            tracing::warn!(
+                path = %self.root_dir.display(),
+                error = %error,
+                "persistent primary-index publication succeeded but obsolete-file cleanup failed"
+            );
         }
-
-        if truncate_wal {
-            self.active_wal_id += 1;
-            self.create_empty_wal(self.active_wal_id)?;
-        }
-
-        self.provenance = provenance;
-        self.write_manifest()?;
-        self.cleanup_obsolete_files()?;
         Ok(())
     }
 
@@ -582,10 +570,6 @@ impl PersistentIndex {
                 self.root_dir, e
             ))
         })?;
-        self.immutable_readers
-            .lock()
-            .map_err(|_| paro_error::internal("lock persistent index immutable readers"))?
-            .clear();
         self.active_wal_id = 0;
         self.next_file_id = 1;
         self.edit_version = 0;
@@ -593,37 +577,39 @@ impl PersistentIndex {
         self.provenance = None;
         self.l1_files.clear();
         self.l2_file = None;
-        self.format_validated.store(true, Ordering::Release);
+        self.immutable_readers.clear();
+        self.active_wal_index = Arc::new(PrimaryIndex::new());
+        let wal_path = self.active_wal_path();
+        let mut writer = OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .open(&wal_path)
+            .map_err(|e| paro_error::io_error(format!("create wal {:?}: {}", wal_path, e)))?;
+        Self::write_file_header(&mut writer)?;
+        writer
+            .flush()
+            .map_err(|e| paro_error::io_error(format!("flush wal {:?}: {}", wal_path, e)))?;
+        self.wal_writer = Mutex::new(writer);
         Ok(())
     }
 
     pub fn set_applied_lsn(&mut self, applied_lsn: u64) -> Result<()> {
-        self.applied_lsn = applied_lsn;
-        self.write_manifest()
+        let mut next = self.manifest_snapshot();
+        next.applied_lsn = applied_lsn;
+        self.write_manifest_value(&next)?;
+        self.install_manifest(next);
+        Ok(())
     }
 
     fn validate_current_format(&self) -> Result<()> {
-        if self.format_validated.load(Ordering::Acquire) {
-            return Ok(());
-        }
-        let manifest = Self::read_manifest(&self.manifest_path)?;
-        if let Some(manifest) = manifest {
-            if manifest.format_version != PERSISTENT_INDEX_FORMAT_VERSION {
-                return Err(paro_error::data_corrupted(format!(
-                    "unsupported persistent index manifest version {}",
-                    manifest.format_version
-                )));
-            }
-        }
-
-        for (_, path) in self.list_wal_files()? {
-            let status = Self::path_header_status(&path)?;
-            if !matches!(status, FileHeaderStatus::Current | FileHeaderStatus::Empty) {
-                return Err(paro_error::data_corrupted(format!(
-                    "unsupported persistent index WAL format at {:?}",
-                    path
-                )));
-            }
+        let wal_path = self.active_wal_path();
+        let status = Self::path_header_status(&wal_path)?;
+        if !matches!(status, FileHeaderStatus::Current | FileHeaderStatus::Empty) {
+            return Err(paro_error::data_corrupted(format!(
+                "unsupported persistent index WAL format at {:?}",
+                wal_path
+            )));
         }
 
         if let Some((_, path)) = self.list_files_with_prefix("sst_")?.into_iter().next() {
@@ -633,23 +619,19 @@ impl PersistentIndex {
             )));
         }
 
-        for path in self.current_immutable_paths() {
-            let _ = self.immutable_reader(path)?;
-        }
-        self.format_validated.store(true, Ordering::Release);
         Ok(())
     }
 
-    fn minor_compact(&mut self) -> Result<()> {
+    fn minor_compact_manifest(&self, manifest: &mut Manifest) -> Result<()> {
         let mut merged = HashMap::<(Vec<u8>, u64), PrimaryIndexVersion>::new();
 
-        if let Some(l2_file) = &self.l2_file {
+        if let Some(l2_file) = &manifest.l2_file {
             for (key, version) in self.read_immutable_entries(l2_file)? {
                 merged.insert((key, version.commit_ts), version);
             }
         }
 
-        let mut l1_files = self.l1_files.clone();
+        let mut l1_files = manifest.l1_files.clone();
         l1_files.sort_by_key(|meta| meta.edit_version);
         for meta in l1_files {
             for (key, version) in self.read_immutable_entries(&meta)? {
@@ -657,10 +639,10 @@ impl PersistentIndex {
             }
         }
 
-        self.l1_files.clear();
+        manifest.l1_files.clear();
 
         if merged.is_empty() {
-            self.l2_file = None;
+            manifest.l2_file = None;
             return Ok(());
         }
 
@@ -670,127 +652,68 @@ impl PersistentIndex {
             .collect();
         entries.sort_by(|a, b| a.0.cmp(&b.0).then(a.1.commit_ts.cmp(&b.1.commit_ts)));
 
-        let file_id = self.next_file_id;
-        let stats = self.write_immutable_level_file("l2", file_id, &entries)?;
-        self.edit_version += 1;
-        self.l2_file = Some(ImmutableFileMeta {
+        let file_id = manifest.next_file_id;
+        let stats = self.write_immutable_level_file(ImmutableIndexLevel::L2, file_id, &entries)?;
+        manifest.edit_version += 1;
+        manifest.l2_file = Some(ImmutableFileMeta {
             file_id,
-            edit_version: self.edit_version,
+            level: ImmutableIndexLevel::L2,
+            edit_version: manifest.edit_version,
             entry_count: stats.entry_count as u64,
         });
-        self.next_file_id += 1;
+        manifest.next_file_id += 1;
         Ok(())
-    }
-
-    fn apply_immutable_file_to_index(
-        &self,
-        meta: &ImmutableFileMeta,
-        index: &PrimaryIndex,
-    ) -> Result<()> {
-        index.batch_apply_versions(self.read_immutable_entries(meta)?);
-        Ok(())
-    }
-
-    fn search_immutable_file_for_key_at(
-        &self,
-        meta: &ImmutableFileMeta,
-        key: &[u8],
-        read_ts: u64,
-    ) -> Result<Option<PrimaryIndexVersion>> {
-        self.immutable_reader(self.resolve_immutable_meta_path(meta))?
-            .get_version_at(key, read_ts)
-    }
-
-    fn search_immutable_file_for_write_in_range(
-        &self,
-        meta: &ImmutableFileMeta,
-        key: &[u8],
-        read_ts: u64,
-        commit_ts: u64,
-    ) -> Result<Option<PrimaryKeyWriteConflict>> {
-        self.immutable_reader(self.resolve_immutable_meta_path(meta))?
-            .first_write_in_range(key, read_ts, commit_ts)
     }
 
     fn read_immutable_entries(
         &self,
         meta: &ImmutableFileMeta,
     ) -> Result<Vec<(Vec<u8>, PrimaryIndexVersion)>> {
-        self.immutable_reader(self.resolve_immutable_meta_path(meta))?
-            .entries()
+        ImmutableIndexReader::open_cached(self.immutable_meta_path(meta))?.entries()
     }
 
-    fn immutable_reader(&self, path: PathBuf) -> Result<Arc<ImmutableIndexReader>> {
-        if let Some(reader) = self
-            .immutable_readers
-            .lock()
-            .map_err(|_| paro_error::internal("lock persistent index immutable readers"))?
-            .get(&path)
-            .cloned()
-        {
-            return Ok(reader);
-        }
-        let reader = ImmutableIndexReader::open_cached(&path)?;
-        self.immutable_readers
-            .lock()
-            .map_err(|_| paro_error::internal("lock persistent index immutable readers"))?
-            .insert(path, Arc::clone(&reader));
-        Ok(reader)
+    /// Build the query read view exactly once per manifest publication.
+    /// Readers are newest-first: active WAL lookups are consulted before this
+    /// slice, then newer L1 edits before older L1/L2 data. That ordering is the
+    /// deterministic tie-break when low-level callers use equal commit times.
+    fn refresh_immutable_readers(&mut self) -> Result<()> {
+        self.immutable_readers =
+            self.open_immutable_readers(&self.l1_files, self.l2_file.as_ref())?;
+        Ok(())
     }
 
-    /// Materialize only the mutable WAL tier. Immutable levels remain point-
-    /// queried through their bucket directories, so a batch miss never turns
-    /// into an O(table rows) reconstruction of the complete primary index.
-    fn load_active_wal_index(&self) -> Result<PrimaryIndex> {
-        let index = PrimaryIndex::new();
-        let mut wal_files = self.list_wal_files()?;
-        wal_files.retain(|(id, _)| *id >= self.active_wal_id);
-        wal_files.sort_by_key(|(id, _)| *id);
-        for (_, path) in wal_files {
-            index.batch_apply_versions(self.read_wal_records(&path)?);
-        }
-        Ok(index)
-    }
-
-    /// Resolve and pin immutable readers once per operation. PersistentIndex
-    /// itself owns strong reader references for the tablet lifetime; this
-    /// returned list only fixes the metadata snapshot used by the operation.
-    fn immutable_readers_for_lookup(&self) -> Result<Vec<Arc<ImmutableIndexReader>>> {
-        let mut l1_files = self.l1_files.clone();
-        l1_files.sort_by_key(|meta| meta.edit_version);
-        let mut readers = Vec::with_capacity(l1_files.len() + usize::from(self.l2_file.is_some()));
+    fn open_immutable_readers(
+        &self,
+        l1_files: &[ImmutableFileMeta],
+        l2_file: Option<&ImmutableFileMeta>,
+    ) -> Result<Vec<Arc<ImmutableIndexReader>>> {
+        let mut readers = Vec::with_capacity(
+            l1_files
+                .len()
+                .saturating_add(usize::from(l2_file.is_some())),
+        );
+        let mut l1_files = l1_files.to_vec();
+        l1_files.sort_by_key(|meta| std::cmp::Reverse(meta.edit_version));
         for meta in l1_files {
-            readers.push(self.immutable_reader(self.resolve_immutable_meta_path(&meta))?);
+            readers.push(ImmutableIndexReader::open_cached(
+                self.immutable_meta_path(&meta),
+            )?);
         }
-        if let Some(l2_file) = &self.l2_file {
-            readers.push(self.immutable_reader(self.resolve_immutable_meta_path(l2_file))?);
+        if let Some(meta) = l2_file {
+            readers.push(ImmutableIndexReader::open_cached(
+                self.immutable_meta_path(meta),
+            )?);
         }
         Ok(readers)
     }
 
-    fn resolve_immutable_meta_path(&self, meta: &ImmutableFileMeta) -> PathBuf {
-        let preferred_l1 = self.immutable_path("l1", meta.file_id);
-        if preferred_l1.exists() {
-            return preferred_l1;
-        }
-        self.immutable_path("l2", meta.file_id)
-    }
-
-    fn current_immutable_paths(&self) -> Vec<PathBuf> {
-        self.l1_files
-            .iter()
-            .map(|meta| self.resolve_immutable_meta_path(meta))
-            .chain(
-                self.l2_file
-                    .iter()
-                    .map(|meta| self.resolve_immutable_meta_path(meta)),
-            )
-            .collect()
+    fn immutable_meta_path(&self, meta: &ImmutableFileMeta) -> PathBuf {
+        self.immutable_path(meta.level, meta.file_id)
     }
 
     fn write_immutable_level_file(
         &self,
-        level: &str,
+        level: ImmutableIndexLevel,
         file_id: u64,
         entries: &[(Vec<u8>, PrimaryIndexVersion)],
     ) -> Result<ImmutableIndexStats> {
@@ -802,89 +725,33 @@ impl PersistentIndex {
             .join(format!("wal_{}.wal", self.active_wal_id))
     }
 
-    fn immutable_path(&self, level: &str, file_id: u64) -> PathBuf {
-        self.root_dir.join(format!("{}_{}.idx", level, file_id))
-    }
-
-    fn create_empty_wal(&self, wal_id: u64) -> Result<()> {
-        let path = self.root_dir.join(format!("wal_{}.wal", wal_id));
-        let mut file = OpenOptions::new()
+    fn create_empty_wal_writer(&self, wal_id: u64) -> Result<File> {
+        let wal_path = self.root_dir.join(format!("wal_{wal_id}.wal"));
+        let mut writer = OpenOptions::new()
             .write(true)
             .create(true)
             .truncate(true)
-            .open(&path)
-            .map_err(|e| paro_error::io_error(format!("create wal {:?}: {}", path, e)))?;
-        Self::write_file_header(&mut file)?;
-        file.flush()
-            .map_err(|e| paro_error::io_error(format!("flush wal {:?}: {}", path, e)))
+            .open(&wal_path)
+            .map_err(|e| paro_error::io_error(format!("create wal {:?}: {}", wal_path, e)))?;
+        Self::write_file_header(&mut writer)?;
+        writer
+            .flush()
+            .map_err(|e| paro_error::io_error(format!("flush wal {:?}: {}", wal_path, e)))?;
+        Ok(writer)
     }
 
-    fn read_wal_records(&self, path: &Path) -> Result<Vec<(Vec<u8>, PrimaryIndexVersion)>> {
+    fn immutable_path(&self, level: ImmutableIndexLevel, file_id: u64) -> PathBuf {
+        self.root_dir
+            .join(format!("{}_{}.idx", level.file_prefix(), file_id))
+    }
+
+    fn read_wal_records_path(path: &Path) -> Result<Vec<(Vec<u8>, PrimaryIndexVersion)>> {
         if !path.exists() {
             return Ok(Vec::new());
         }
         let data = fs::read(path)
             .map_err(|e| paro_error::io_error(format!("read wal {:?}: {}", path, e)))?;
         parse_records(&data)
-    }
-
-    fn search_wal_for_key_at(
-        &self,
-        path: &Path,
-        key: &[u8],
-        read_ts: u64,
-    ) -> Result<Option<PrimaryIndexVersion>> {
-        let mut found = None;
-        for (current_key, version) in self.read_wal_records(path)? {
-            if current_key == key && version.commit_ts <= read_ts {
-                if found
-                    .map(|current: PrimaryIndexVersion| version.commit_ts >= current.commit_ts)
-                    .unwrap_or(true)
-                {
-                    found = Some(version);
-                }
-            }
-        }
-        Ok(found)
-    }
-
-    fn search_wal_for_write_in_range(
-        &self,
-        path: &Path,
-        key: &[u8],
-        read_ts: u64,
-        commit_ts: u64,
-    ) -> Result<Option<PrimaryKeyWriteConflict>> {
-        let mut best = None;
-        for (current_key, version) in self.read_wal_records(path)? {
-            if current_key == key && version_in_window(version, read_ts, commit_ts) {
-                select_earlier_conflict(
-                    &mut best,
-                    PrimaryKeyWriteConflict {
-                        key: current_key,
-                        version,
-                    },
-                );
-            }
-        }
-        Ok(best)
-    }
-
-    fn search_wal_for_key_range_write_in_range(
-        &self,
-        path: &Path,
-        lower: Option<&[u8]>,
-        upper: Option<&[u8]>,
-        read_ts: u64,
-        commit_ts: u64,
-    ) -> Result<Option<PrimaryKeyWriteConflict>> {
-        let mut best = None;
-        for (key, version) in self.read_wal_records(path)? {
-            if key_in_bounds(&key, lower, upper) && version_in_window(version, read_ts, commit_ts) {
-                select_earlier_conflict(&mut best, PrimaryKeyWriteConflict { key, version });
-            }
-        }
-        Ok(best)
     }
 
     fn select_newer_visible(
@@ -921,8 +788,8 @@ impl PersistentIndex {
         Ok(out)
     }
 
-    fn write_manifest(&self) -> Result<()> {
-        let manifest = Manifest {
+    fn manifest_snapshot(&self) -> Manifest {
+        Manifest {
             format_version: PERSISTENT_INDEX_FORMAT_VERSION,
             active_wal_id: self.active_wal_id,
             next_file_id: self.next_file_id,
@@ -931,8 +798,21 @@ impl PersistentIndex {
             provenance: self.provenance.clone(),
             l1_files: self.l1_files.clone(),
             l2_file: self.l2_file.clone(),
-        };
-        let data = serde_json::to_vec_pretty(&manifest)
+        }
+    }
+
+    fn install_manifest(&mut self, manifest: Manifest) {
+        self.active_wal_id = manifest.active_wal_id;
+        self.next_file_id = manifest.next_file_id;
+        self.edit_version = manifest.edit_version;
+        self.applied_lsn = manifest.applied_lsn;
+        self.provenance = manifest.provenance;
+        self.l1_files = manifest.l1_files;
+        self.l2_file = manifest.l2_file;
+    }
+
+    fn write_manifest_value(&self, manifest: &Manifest) -> Result<()> {
+        let data = serde_json::to_vec_pretty(manifest)
             .map_err(|e| paro_error::serialization_error(e.to_string()))?;
         let tmp_path = self.manifest_path.with_extension("tmp");
         fs::write(&tmp_path, data)
@@ -981,15 +861,6 @@ impl PersistentIndex {
         for (_, path) in self.list_files_with_prefix("sst_")? {
             let _ = fs::remove_file(&path);
         }
-
-        let current_paths = self
-            .current_immutable_paths()
-            .into_iter()
-            .collect::<std::collections::HashSet<_>>();
-        self.immutable_readers
-            .lock()
-            .map_err(|_| paro_error::internal("lock persistent index immutable readers"))?
-            .retain(|path, _| current_paths.contains(path));
 
         Ok(())
     }
@@ -1052,7 +923,9 @@ fn parse_records(data: &[u8]) -> Result<Vec<(Vec<u8>, PrimaryIndexVersion)>> {
         let key_len = u32::from_le_bytes(data[offset..offset + 4].try_into().unwrap()) as usize;
         offset += 4;
         if offset + key_len + VALUE_LEN > data.len() {
-            break;
+            return Err(paro_error::data_corrupted(
+                "truncated persistent index WAL record",
+            ));
         }
         let key = data[offset..offset + key_len].to_vec();
         offset += key_len;
@@ -1064,15 +937,12 @@ fn parse_records(data: &[u8]) -> Result<Vec<(Vec<u8>, PrimaryIndexVersion)>> {
         offset += VALUE_LEN;
         out.push((key, PrimaryIndexVersion::live(row_id, commit_ts)));
     }
+    if offset != data.len() {
+        return Err(paro_error::data_corrupted(
+            "trailing bytes in persistent index WAL",
+        ));
+    }
     Ok(out)
-}
-
-fn version_in_window(version: PrimaryIndexVersion, read_ts: u64, commit_ts: u64) -> bool {
-    version.commit_ts > read_ts && version.commit_ts <= commit_ts
-}
-
-fn key_in_bounds(key: &[u8], lower: Option<&[u8]>, upper: Option<&[u8]>) -> bool {
-    lower.map_or(true, |lower| key >= lower) && upper.map_or(true, |upper| key <= upper)
 }
 
 fn select_earlier_conflict(
@@ -1308,8 +1178,7 @@ mod tests {
         let dir = tempdir().unwrap();
         fs::write(dir.path().join("sst_1.sst"), b"legacy").unwrap();
 
-        let pi = PersistentIndex::new(dir.path()).unwrap();
-        assert!(pi.load().is_err());
+        assert!(PersistentIndex::new(dir.path()).is_err());
     }
 
     #[test]
@@ -1322,21 +1191,110 @@ mod tests {
             .unwrap();
         file.flush().unwrap();
 
-        let pi = PersistentIndex::new(dir.path()).unwrap();
-        assert!(pi.load().is_err());
+        assert!(PersistentIndex::new(dir.path()).is_err());
+    }
+
+    #[test]
+    fn rejects_truncated_current_wal() {
+        let dir = tempdir().unwrap();
+        let wal_path = dir.path().join("wal_0.wal");
+        let mut file = File::create(&wal_path).unwrap();
+        PersistentIndex::write_file_header(&mut file).unwrap();
+        file.write_all(&4u32.to_le_bytes()).unwrap();
+        file.write_all(b"ab").unwrap();
+        file.flush().unwrap();
+
+        assert!(PersistentIndex::new(dir.path()).is_err());
+    }
+
+    #[test]
+    fn manifest_read_view_ignores_orphan_files() {
+        let dir = tempdir().unwrap();
+        let mut pi = PersistentIndex::new(dir.path()).unwrap();
+        let original = RowID::new(1, crate::rowset::SegmentRowId::from_raw(1));
+        pi.apply_upserts_at(&[(b"k".to_vec(), original)], 10)
+            .unwrap();
+        pi.flush_l0(&PrimaryIndex::new(), true).unwrap();
+        drop(pi);
+
+        let orphan_row = RowID::new(99, crate::rowset::SegmentRowId::from_raw(99));
+        let orphan_wal = dir.path().join("wal_999.wal");
+        let mut file = File::create(&orphan_wal).unwrap();
+        PersistentIndex::write_file_header(&mut file).unwrap();
+        file.write_all(&1u32.to_le_bytes()).unwrap();
+        file.write_all(b"k").unwrap();
+        file.write_all(&u64::from(orphan_row).to_le_bytes())
+            .unwrap();
+        file.write_all(&100u64.to_le_bytes()).unwrap();
+        file.flush().unwrap();
+        ImmutableIndexWriter::default()
+            .write_entries(
+                dir.path().join("l1_999.idx"),
+                &[(b"k".to_vec(), PrimaryIndexVersion::live(orphan_row, 200))],
+            )
+            .unwrap();
+
+        let reopened = PersistentIndex::new(dir.path()).unwrap();
+        assert_eq!(reopened.get(b"k").unwrap(), Some(original));
+    }
+
+    #[test]
+    fn concurrent_batches_append_complete_wal_records() {
+        let dir = tempdir().unwrap();
+        let pi = Arc::new(PersistentIndex::new(dir.path()).unwrap());
+        std::thread::scope(|scope| {
+            for worker in 0..4u32 {
+                let pi = Arc::clone(&pi);
+                scope.spawn(move || {
+                    let pairs = (0..64u32)
+                        .map(|row| {
+                            (
+                                format!("k-{worker}-{row}").into_bytes(),
+                                RowID::new(worker, crate::rowset::SegmentRowId::from_raw(row)),
+                            )
+                        })
+                        .collect::<Vec<_>>();
+                    pi.apply_upserts_at(&pairs, u64::from(worker) + 1).unwrap();
+                });
+            }
+        });
+        drop(pi);
+
+        let reopened = PersistentIndex::new(dir.path()).unwrap();
+        for worker in 0..4u32 {
+            for row in 0..64u32 {
+                assert_eq!(
+                    reopened
+                        .get(format!("k-{worker}-{row}").as_bytes())
+                        .unwrap(),
+                    Some(RowID::new(
+                        worker,
+                        crate::rowset::SegmentRowId::from_raw(row),
+                    ))
+                );
+            }
+        }
     }
 
     #[test]
     fn reset_clears_obsolete_files() {
         let dir = tempdir().unwrap();
-        fs::write(dir.path().join("wal_0.wal"), b"legacy").unwrap();
+        let mut pi = PersistentIndex::new(dir.path()).unwrap();
+        fs::write(dir.path().join("wal_99.wal"), b"orphan").unwrap();
         fs::write(dir.path().join("sst_1.sst"), b"legacy").unwrap();
 
-        let mut pi = PersistentIndex::new(dir.path()).unwrap();
         pi.reset().unwrap();
 
         assert!(dir.path().exists());
-        assert!(fs::read_dir(dir.path()).unwrap().next().is_none());
+        let files = fs::read_dir(dir.path())
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+            .collect::<Vec<_>>();
+        assert_eq!(files, vec!["wal_0.wal"]);
+        assert_eq!(
+            PersistentIndex::path_header_status(&dir.path().join("wal_0.wal")).unwrap(),
+            FileHeaderStatus::Current
+        );
     }
 
     #[test]
