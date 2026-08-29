@@ -107,6 +107,19 @@ pub(crate) fn hnsw_foreground_pressure_active() -> bool {
     )
 }
 
+/// Number of foreground HNSW queries currently inside provider execution.
+///
+/// Search and maintenance use the same process-width contract but execute in
+/// separate fixed worker pools. Exposing the query census lets mixed
+/// graph+exact-tail searches divide the search pool by actual demand: one
+/// query can use the idle machine, while concurrent queries receive a fair
+/// share without baking a benchmark-specific lane count into the provider.
+pub(crate) fn hnsw_active_foreground_queries() -> usize {
+    HNSW_ACTIVE_FOREGROUND_QUERIES
+        .load(Ordering::Acquire)
+        .max(1)
+}
+
 fn foreground_pressure_active_at(
     now_micros: u64,
     active_queries: usize,

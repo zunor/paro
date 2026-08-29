@@ -308,12 +308,14 @@ impl MaintenanceScheduler {
             GcDecision::Heal => SearchMaintenanceAction::CatchUp,
             GcDecision::Rebuild => SearchMaintenanceAction::Rebuild,
         };
-        // Freshness debt is the write-admission liveness boundary. Drain the
-        // immutable tail before optional GC/repack work, regardless of the GC
-        // recommendation for the older artifact set. Otherwise a large base
-        // that qualifies for compaction can permanently starve catch-up and
-        // leave every foreground writer blocked at the tail high watermark.
-        if manifest.root.maintenance_state.recovery.tail_pending_rows > 0 {
+        // A complete L0 digit is the write-admission liveness boundary. Drain
+        // it before optional GC/repack work, regardless of the recommendation
+        // for older artifacts. A sub-target exact L0 is intentionally idle:
+        // sealing it would create tiny immutable graphs and permanent query
+        // fan-out, while its bounded exact scan is already queryable.
+        if manifest.root.maintenance_state.recovery.tail_pending_rows > 0
+            && manifest.root.maintenance_state.recovery.priority != MaintenancePriority::Idle
+        {
             action = SearchMaintenanceAction::CatchUp;
         }
         let manifest_delta_pressure = manifest_delta_pressure(manifest, delta_window_bytes);

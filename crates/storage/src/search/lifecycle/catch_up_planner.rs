@@ -86,6 +86,43 @@ impl CatchUpPlanner {
             planned_rows,
         })
     }
+
+    /// Plan every currently materializable tail rowset for an explicit
+    /// foreground materialization request.
+    ///
+    /// Background catch-up obeys the levelled L0 digit encoded in manifest
+    /// rate limits. CREATE INDEX / explicit OPTIMIZE instead asks for complete
+    /// physical coverage and must not turn a sub-target tail into one graph
+    /// per rowset merely because its background rate limit is zero.
+    pub(crate) fn plan_all(
+        &self,
+        definition: &SearchIndexDefinition,
+        manifest: &LoadedManifest,
+        visible_by_id: &BTreeMap<RowsetId, RowsetSharedPtr>,
+    ) -> Result<CatchUpPlan> {
+        let mut items = Vec::new();
+        let mut planned_rows = 0u64;
+        for entry in &manifest.tail_pending_entries {
+            if matches!(entry.mutation, TailMutationKind::Delete) {
+                continue;
+            }
+            let Some(rowset) = visible_by_id.get(&entry.rowset_id) else {
+                continue;
+            };
+            rowset.load()?;
+            if !rowset_can_materialize_definition(definition, rowset) {
+                continue;
+            }
+            planned_rows = planned_rows.saturating_add(entry.row_count);
+            items.push(CatchUpWorkItem {
+                rowset: rowset.clone(),
+            });
+        }
+        Ok(CatchUpPlan {
+            items,
+            planned_rows,
+        })
+    }
 }
 
 fn rowset_can_materialize_definition(

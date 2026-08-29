@@ -5,7 +5,7 @@ use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
 use std::time::Instant;
 
-use crate::index::hnsw::hnsw_builder::HnswForegroundQueryGuard;
+use crate::index::hnsw::hnsw_builder::{hnsw_active_foreground_queries, HnswForegroundQueryGuard};
 use crate::index::hnsw::types::SearchParams;
 use crate::index::hnsw::{
     hnsw_artifact_compatibility, hnsw_artifact_uses_external_vectors, DistanceMetric,
@@ -21,16 +21,20 @@ use crate::index::hnsw::{
 /// parallel because its random navigation latency is not proportional to the
 /// number of predicate matches.
 const MIN_PARALLEL_EXACT_VECTOR_BYTES: u64 = 2 * 1024 * 1024;
-/// Sequential exact scans saturate memory bandwidth with only a fraction of
-/// the process search pool. Letting one mixed graph+tail query acquire every
-/// lane serializes concurrent clients behind a bandwidth-bound phase and
-/// turns FIFO fairness into head-of-line latency. Reserve five concurrent
-/// quanta at the process width; pure graph queries retain work-conserving
-/// access to every otherwise idle lane.
-const EXACT_TAIL_CONCURRENT_QUANTA: usize = 5;
-
-fn mixed_tail_query_lane_limit(process_width: usize) -> usize {
-    process_width.max(1).div_ceil(EXACT_TAIL_CONCURRENT_QUANTA)
+/// Fair share of the process search executor for a mixed graph+exact-tail
+/// query.
+///
+/// A static narrow grant protects throughput but strands workers for a lone
+/// query; a static wide grant serializes concurrent readers. The provider
+/// guard is entered before predicate preparation, so by dispatch time it is a
+/// process-wide census of runnable HNSW queries. Divide the fixed executor by
+/// that demand and let the admission layer enforce the physical bound.
+fn mixed_tail_query_lane_limit(process_width: usize, active_queries: usize) -> usize {
+    process_width
+        .max(1)
+        .checked_div(active_queries.max(1))
+        .unwrap_or(1)
+        .max(1)
 }
 use crate::index::PredicateTree;
 use crate::index::{DenseRowSet, ExactRowSet, PartitionExactRowSet};
@@ -389,7 +393,10 @@ impl VectorSearchCursor {
         let requested_search_lanes = if tail_segment_indices.is_empty() {
             search_parallelism_slots
         } else {
-            search_parallelism_slots.min(mixed_tail_query_lane_limit(parallelism_slots))
+            search_parallelism_slots.min(mixed_tail_query_lane_limit(
+                parallelism_slots,
+                hnsw_active_foreground_queries(),
+            ))
         };
         let search_lease = acquire_search_dispatch_lanes(
             requested_search_lanes,
@@ -1537,10 +1544,11 @@ mod tests {
     }
 
     #[test]
-    fn mixed_exact_tail_reserves_concurrent_query_quanta() {
-        assert_eq!(mixed_tail_query_lane_limit(1), 1);
-        assert_eq!(mixed_tail_query_lane_limit(4), 1);
-        assert_eq!(mixed_tail_query_lane_limit(10), 2);
-        assert_eq!(mixed_tail_query_lane_limit(16), 4);
+    fn mixed_exact_tail_divides_the_process_width_by_runnable_queries() {
+        assert_eq!(mixed_tail_query_lane_limit(1, 1), 1);
+        assert_eq!(mixed_tail_query_lane_limit(10, 1), 10);
+        assert_eq!(mixed_tail_query_lane_limit(10, 2), 5);
+        assert_eq!(mixed_tail_query_lane_limit(10, 8), 1);
+        assert_eq!(mixed_tail_query_lane_limit(16, 5), 3);
     }
 }

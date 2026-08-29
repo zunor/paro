@@ -1274,33 +1274,27 @@ impl SearchIndexRegistry {
         &self,
         definition_id: u64,
     ) -> Result<SearchGenerationCoverage> {
+        // Foreground DDL/OPTIMIZE must plan against the latest durable rowset
+        // graph. A stale in-memory generation can otherwise look vacuously
+        // complete (zero visible segments) and let explicit materialization
+        // return without indexing rows committed immediately beforehand.
+        self.ensure_fresh();
         let mut previous = self.generation_coverage(definition_id)?.ok_or_else(|| {
             paro_error::artifact_not_ready(format!(
                 "search definition {definition_id} has no materialized generation"
             ))
         })?;
         while !previous.is_complete() {
-            let report = self.maintenance_sweep()?;
+            let updated = self.catch_up_definition_with_mode(definition_id, true)?;
             let next = self.generation_coverage(definition_id)?.ok_or_else(|| {
                 paro_error::artifact_not_ready(format!(
                     "search definition {definition_id} disappeared while materializing"
                 ))
             })?;
             if next == previous {
-                let decision = report
-                    .definitions
-                    .iter()
-                    .find(|definition| definition.definition_id == definition_id)
-                    .map(|definition| {
-                        format!(
-                            "action={:?}, admission={:?}",
-                            definition.action, definition.admission
-                        )
-                    })
-                    .unwrap_or_else(|| "no maintenance decision".to_string());
                 return Err(paro_error::artifact_not_ready(format!(
-                    "search definition {definition_id} made no materialization progress ({}/{}, {decision})",
-                    next.indexed_segment_count, next.visible_segment_count
+                    "search definition {definition_id} made no foreground materialization progress ({}/{}, updated={updated})",
+                    next.indexed_segment_count, next.visible_segment_count,
                 )));
             }
             previous = next;
@@ -1309,6 +1303,14 @@ impl SearchIndexRegistry {
     }
 
     pub(crate) fn catch_up_definition(&self, definition_id: u64) -> Result<usize> {
+        self.catch_up_definition_with_mode(definition_id, false)
+    }
+
+    fn catch_up_definition_with_mode(
+        &self,
+        definition_id: u64,
+        force_complete: bool,
+    ) -> Result<usize> {
         self.ensure_fresh();
         // Foreground OPTIMIZE and the background coordinator share the same
         // provider build lane. Re-read immutable input only after acquiring
@@ -1349,7 +1351,11 @@ impl SearchIndexRegistry {
             .map(|rowset| (rowset.rowset_id(), rowset))
             .collect::<BTreeMap<_, _>>();
 
-        let catch_up_plan = CatchUpPlanner.plan(&state.definition, manifest, &visible_by_id)?;
+        let catch_up_plan = if force_complete {
+            CatchUpPlanner.plan_all(&state.definition, manifest, &visible_by_id)?
+        } else {
+            CatchUpPlanner.plan(&state.definition, manifest, &visible_by_id)?
+        };
         let newly_materialized_rowsets = catch_up_plan.len();
         if newly_materialized_rowsets == 0 {
             return Ok(0);
@@ -1398,10 +1404,14 @@ impl SearchIndexRegistry {
         });
 
         let sidecar_store = SidecarArtifactStore::new(self.tablet.data_dir().clone());
-        let builder = ProviderSidecarArtifactBuilder::for_maintenance(
-            sidecar_store.clone(),
-            manifest.root.maintenance_state.recovery.priority,
-        );
+        let builder = if force_complete {
+            ProviderSidecarArtifactBuilder::new(sidecar_store.clone())
+        } else {
+            ProviderSidecarArtifactBuilder::for_maintenance(
+                sidecar_store.clone(),
+                manifest.root.maintenance_state.recovery.priority,
+            )
+        };
         let input = super::inline_sink::SidecarBuildInput {
             definition: state.definition.clone(),
             generation_id: manifest.root.generation_id,
@@ -5585,9 +5595,11 @@ mod tests {
                 test_embedding_vector(&[vec![1.0, 0.0, 0.0, 0.0], vec![0.0, 1.0, 0.0, 0.0]], 4),
             ]))
             .unwrap();
-        table.search_registry().maintenance_sweep().unwrap();
-
         let seed_definition_id = SCHEMA_SEED_BIT | 1;
+        table
+            .search_registry()
+            .materialize_definition(seed_definition_id)
+            .unwrap();
         {
             let current = table.search_registry().view.load();
             let seed_state = current
@@ -8123,18 +8135,19 @@ mod tests {
         assert_eq!(tail_rows, 4);
 
         let report = table.search_registry().maintenance_sweep().unwrap();
-        assert_eq!(report.definitions_updated, 1);
-        assert_eq!(report.catch_up_rowsets, 2);
+        assert_eq!(report.definitions_updated, 0);
+        assert_eq!(report.catch_up_rowsets, 0);
         let definition_report = report
             .definitions
             .iter()
             .find(|definition| definition.definition_id == 94)
             .expect("hnsw definition report");
-        assert!(definition_report
-            .provider_request
-            .as_ref()
-            .and_then(ProviderMaintenanceRequest::as_hnsw)
-            .is_some());
+        assert_eq!(definition_report.action, SearchMaintenanceAction::Skip);
+
+        // Sub-target HNSW rows remain the exact L0 during background
+        // maintenance. An explicit materialization request is the policy
+        // boundary that seals the final partial digit into one graph.
+        table.search_registry().materialize_definition(94).unwrap();
 
         let current = table.search_registry().view.load();
         let manifest = current

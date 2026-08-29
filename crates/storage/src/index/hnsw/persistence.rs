@@ -1400,9 +1400,9 @@ impl HnswIndex {
                 storage.as_ref(),
                 distance,
             )?;
-            if (position + 1).is_multiple_of(PROPOSAL_EXECUTION_QUANTUM) {
-                hnsw_yield_maintenance_to_foreground(execution_policy);
-            }
+        }
+        if warmup_end > 0 {
+            hnsw_yield_maintenance_to_foreground(execution_policy);
         }
 
         if warmup_end < num_vectors {
@@ -1472,7 +1472,6 @@ impl HnswIndex {
                                 })?
                             };
                         proposals.append(&mut quantum_proposals);
-                        hnsw_yield_maintenance_to_foreground(execution_policy);
                     }
                     Ok(proposals)
                 } else {

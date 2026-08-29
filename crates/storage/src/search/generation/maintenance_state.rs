@@ -62,9 +62,15 @@ pub(crate) fn build_maintenance_state(
     } else {
         CatchUpBacklogTier::Degraded
     };
-    let priority = if pending_rows == 0 {
+    // HNSW tail is the exact L0 of a levelled search index. Building a graph
+    // for every quiet sub-target fragment creates tiny immutable shards and
+    // permanently multiplies query-wide `ef` work. Keep a sub-target L0 exact
+    // and materialize only complete radix digits; explicit maintenance can
+    // still force a final partial digit when an operator needs a fully indexed
+    // snapshot.
+    let priority = if pending_rows < maintenance.target_rows {
         MaintenancePriority::Idle
-    } else if pending_rows <= maintenance.target_rows {
+    } else if pending_rows == maintenance.target_rows {
         MaintenancePriority::Opportunistic
     } else if pending_rows <= maintenance.max_pending_rows {
         MaintenancePriority::Elevated
@@ -153,5 +159,22 @@ mod tests {
         let (_, critical_rows) = catch_up_limits(maintenance, MaintenancePriority::Critical);
         assert_eq!(critical_rows, elevated_rows);
         assert_eq!(critical_rows, 524_288);
+    }
+
+    #[test]
+    fn sub_target_tail_remains_an_exact_l0_instead_of_becoming_a_tiny_graph() {
+        let maintenance = ProviderMaintenanceWatermarks {
+            target_rows: 500_000,
+            max_pending_rows: 2_000_000,
+        };
+
+        assert_eq!(
+            catch_up_limits(maintenance, MaintenancePriority::Idle),
+            (0, 0)
+        );
+        assert_eq!(
+            catch_up_limits(maintenance, MaintenancePriority::Opportunistic),
+            (500_000, 500_000)
+        );
     }
 }
