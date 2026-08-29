@@ -8,7 +8,7 @@ use std::hash::Hasher;
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::{Arc, Condvar, Mutex, OnceLock};
 
 use arc_swap::ArcSwap;
 use memmap2::Mmap;
@@ -719,8 +719,56 @@ pub struct SearchReaderRuntime {
     sidecars: SidecarReaderCache,
     decoded: ArcSwap<BTreeMap<DecodedSidecarArtifactKey, Arc<dyn Any + Send + Sync>>>,
     decoded_update: Mutex<()>,
+    decoded_inflight: Mutex<BTreeMap<DecodedSidecarArtifactKey, Arc<DecodedOpenGate>>>,
     buffer_pool: OnceLock<Arc<crate::buffer::BufferPool>>,
     hnsw_integrity_scheduler: OnceLock<Arc<crate::index::hnsw::HnswIntegrityScheduler>>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DecodedOpenOutcome {
+    Opening,
+    Ready,
+    Empty,
+    Retry,
+}
+
+#[derive(Debug)]
+struct DecodedOpenGate {
+    outcome: Mutex<DecodedOpenOutcome>,
+    changed: Condvar,
+}
+
+impl DecodedOpenGate {
+    fn new() -> Self {
+        Self {
+            outcome: Mutex::new(DecodedOpenOutcome::Opening),
+            changed: Condvar::new(),
+        }
+    }
+
+    fn wait(&self) -> Result<DecodedOpenOutcome> {
+        let mut outcome = self
+            .outcome
+            .lock()
+            .map_err(|_| paro_error::internal("search decoded-reader gate lock poisoned"))?;
+        while *outcome == DecodedOpenOutcome::Opening {
+            outcome = self
+                .changed
+                .wait(outcome)
+                .map_err(|_| paro_error::internal("search decoded-reader gate lock poisoned"))?;
+        }
+        Ok(*outcome)
+    }
+
+    fn finish(&self, outcome: DecodedOpenOutcome) -> Result<()> {
+        *self
+            .outcome
+            .lock()
+            .map_err(|_| paro_error::internal("search decoded-reader gate lock poisoned"))? =
+            outcome;
+        self.changed.notify_all();
+        Ok(())
+    }
 }
 
 impl std::fmt::Debug for SearchReaderRuntime {
@@ -739,6 +787,7 @@ impl SearchReaderRuntime {
             sidecars: SidecarReaderCache::new(store),
             decoded: ArcSwap::from_pointee(BTreeMap::new()),
             decoded_update: Mutex::new(()),
+            decoded_inflight: Mutex::new(BTreeMap::new()),
             buffer_pool: OnceLock::new(),
             hnsw_integrity_scheduler: OnceLock::new(),
         }
@@ -845,24 +894,75 @@ impl SearchReaderRuntime {
             return Ok(Some(existing));
         }
 
-        let cached = self.sidecars.open(request.sidecar)?;
-        let Some(candidate) = build(cached.as_ref())? else {
-            return Ok(None);
+        let (gate, owns_open) = {
+            let mut inflight = self
+                .decoded_inflight
+                .lock()
+                .map_err(|_| paro_error::internal("search decoded-reader gate map poisoned"))?;
+            match inflight.get(&key) {
+                Some(gate) => (Arc::clone(gate), false),
+                None => {
+                    let gate = Arc::new(DecodedOpenGate::new());
+                    inflight.insert(key, Arc::clone(&gate));
+                    (gate, true)
+                }
+            }
         };
-        let candidate = Arc::new(candidate);
-        let erased_candidate: Arc<dyn Any + Send + Sync> = candidate.clone();
-        let _update = self
-            .decoded_update
-            .lock()
-            .map_err(|_| paro_error::internal("search decoded-reader update lock poisoned"))?;
-        if let Some(existing) = self.lookup_decoded::<T>(key)? {
-            return Ok(Some(existing));
+        if !owns_open {
+            return match gate.wait()? {
+                DecodedOpenOutcome::Ready => self
+                    .lookup_decoded::<T>(key)?
+                    .ok_or_else(|| {
+                        paro_error::internal(
+                            "completed search decoded-reader open did not publish its reader",
+                        )
+                    })
+                    .map(Some),
+                DecodedOpenOutcome::Empty => Ok(None),
+                DecodedOpenOutcome::Retry => self.get_or_try_open_decoded(request, build),
+                DecodedOpenOutcome::Opening => unreachable!("decoded open waiter returned early"),
+            };
         }
-        let current = self.decoded.load_full();
-        let mut updated = (*current).clone();
-        updated.insert(key, erased_candidate);
-        self.decoded.store(Arc::new(updated));
-        Ok(Some(candidate))
+
+        let opened = (|| {
+            let cached = self.sidecars.open(request.sidecar)?;
+            let Some(candidate) = build(cached.as_ref())? else {
+                return Ok(None);
+            };
+            let candidate = Arc::new(candidate);
+            let erased_candidate: Arc<dyn Any + Send + Sync> = candidate.clone();
+            let _update = self
+                .decoded_update
+                .lock()
+                .map_err(|_| paro_error::internal("search decoded-reader update lock poisoned"))?;
+            if let Some(existing) = self.lookup_decoded::<T>(key)? {
+                return Ok(Some(existing));
+            }
+            let current = self.decoded.load_full();
+            let mut updated = (*current).clone();
+            updated.insert(key, erased_candidate);
+            self.decoded.store(Arc::new(updated));
+            Ok(Some(candidate))
+        })();
+        let outcome = match &opened {
+            Ok(Some(_)) => DecodedOpenOutcome::Ready,
+            Ok(None) => DecodedOpenOutcome::Empty,
+            Err(_) => DecodedOpenOutcome::Retry,
+        };
+        {
+            let mut inflight = self
+                .decoded_inflight
+                .lock()
+                .map_err(|_| paro_error::internal("search decoded-reader gate map poisoned"))?;
+            if inflight
+                .get(&key)
+                .is_some_and(|current| Arc::ptr_eq(current, &gate))
+            {
+                inflight.remove(&key);
+            }
+        }
+        gate.finish(outcome)?;
+        opened
     }
 
     fn lookup_decoded<T>(&self, key: DecodedSidecarArtifactKey) -> Result<Option<Arc<T>>>
@@ -1283,6 +1383,61 @@ mod tests {
         assert!(runtime.sidecars.is_empty());
         assert_eq!(runtime.sidecars.package_count(), 0);
         assert_eq!(first.as_str(), "decoded");
+    }
+
+    #[test]
+    fn concurrent_typed_reader_miss_is_single_flight() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::Barrier;
+        use std::time::Duration;
+
+        let temp_dir = tempfile::TempDir::new().unwrap();
+        let store = SidecarArtifactStore::new(temp_dir.path());
+        let file_id = SidecarArtifactStore::default_shard_file_id(32, 8);
+        let mut writer = store.create_package_writer(file_id).unwrap();
+        let location = writer.append_artifact(b"single-flight").unwrap();
+        writer.finalize().unwrap();
+
+        let runtime = SearchReaderRuntime::new(store);
+        let builds = AtomicUsize::new(0);
+        let start = Barrier::new(9);
+        std::thread::scope(|scope| {
+            let handles = (0..8)
+                .map(|_| {
+                    scope.spawn(|| {
+                        start.wait();
+                        runtime
+                            .get_or_try_open_decoded(
+                                DecodedSidecarReaderRequest {
+                                    sidecar: SidecarReaderRequest {
+                                        location: &location,
+                                        artifact_format_version: 3,
+                                        provider: SearchIndexKind::Hnsw,
+                                        codec: "test-single-flight",
+                                        integrity: SidecarIntegrityPolicy::SelfValidatingArtifact,
+                                    },
+                                },
+                                |_| {
+                                    builds.fetch_add(1, Ordering::AcqRel);
+                                    std::thread::sleep(Duration::from_millis(25));
+                                    Ok(Some(String::from("decoded")))
+                                },
+                            )
+                            .unwrap()
+                            .unwrap()
+                    })
+                })
+                .collect::<Vec<_>>();
+            start.wait();
+            let readers = handles
+                .into_iter()
+                .map(|handle| handle.join().unwrap())
+                .collect::<Vec<_>>();
+            for reader in readers.iter().skip(1) {
+                assert!(Arc::ptr_eq(&readers[0], reader));
+            }
+        });
+        assert_eq!(builds.load(Ordering::Acquire), 1);
     }
 
     #[test]

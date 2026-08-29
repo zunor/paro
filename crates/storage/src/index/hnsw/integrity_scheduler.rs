@@ -20,11 +20,24 @@ use paro_scheduler::task::{ProducerToken, Task, TaskExecutionMode, TaskExecution
 
 use crate::metrics::storage_metrics;
 
+use super::hnsw_builder::hnsw_wait_for_foreground_quiet;
 use super::HnswIndex;
 
 const INTEGRITY_TASK_PRIORITY: i32 = -20;
 const MAX_PENDING_ARTIFACTS: usize = 8;
 const VERIFY_CHUNKS_PER_SLICE: usize = 256;
+/// Automatic sweeping is a latency optimization, not the correctness
+/// boundary: foreground reads authenticate every immutable range before use.
+/// Scanning a multi-gigabyte mmap can evict the external vector working set
+/// and make the optimization net-negative. Keep automatic residency work
+/// bounded; large artifacts remain demand-verified and can be exhaustively
+/// checked through the explicit integrity tooling.
+const MAX_AUTOMATIC_VERIFY_BYTES: usize = 32 * 1024 * 1024;
+const FOREGROUND_QUIET_WAIT: std::time::Duration = std::time::Duration::from_millis(25);
+
+fn should_automatically_verify(protected_len: usize) -> bool {
+    protected_len <= MAX_AUTOMATIC_VERIFY_BYTES
+}
 
 struct IntegrityJob {
     index: Weak<HnswIndex>,
@@ -36,6 +49,7 @@ struct IntegritySchedulerState {
     queue: Mutex<VecDeque<IntegrityJob>>,
     outstanding: AtomicUsize,
     worker_scheduled: AtomicBool,
+    respect_foreground_pressure: bool,
 }
 
 /// One instance-owned integrity service shared by every database and table in
@@ -65,11 +79,34 @@ impl HnswIntegrityScheduler {
                 queue: Mutex::new(VecDeque::new()),
                 outstanding: AtomicUsize::new(0),
                 worker_scheduled: AtomicBool::new(false),
+                respect_foreground_pressure: true,
+            }),
+        }
+    }
+
+    #[cfg(test)]
+    fn new_without_foreground_governor(scheduler: Arc<TaskScheduler>) -> Self {
+        Self {
+            state: Arc::new(IntegritySchedulerState {
+                producer: scheduler.create_producer_with_priority(INTEGRITY_TASK_PRIORITY),
+                queue: Mutex::new(VecDeque::new()),
+                outstanding: AtomicUsize::new(0),
+                worker_scheduled: AtomicBool::new(false),
+                // Completion/lifetime tests need a deterministic scheduler
+                // seam: unrelated parallel HNSW tests legitimately hold the
+                // process-wide foreground reservation.
+                respect_foreground_pressure: false,
             }),
         }
     }
 
     pub(crate) fn schedule(&self, index: &Arc<HnswIndex>) {
+        let Some(integrity) = index.artifact_integrity() else {
+            return;
+        };
+        if !should_automatically_verify(integrity.protected_len()) {
+            return;
+        }
         if !index.try_mark_integrity_scheduled() {
             return;
         }
@@ -133,6 +170,11 @@ impl IntegritySweepTask {
 
 impl Task for IntegritySweepTask {
     fn execute(&mut self, _mode: TaskExecutionMode) -> Result<TaskExecutionResult> {
+        if self.state.respect_foreground_pressure
+            && !hnsw_wait_for_foreground_quiet(FOREGROUND_QUIET_WAIT)
+        {
+            return Ok(TaskExecutionResult::NotFinished);
+        }
         loop {
             if !self.take_next_job() {
                 return Ok(TaskExecutionResult::Finished);
@@ -199,9 +241,17 @@ mod tests {
     }
 
     #[test]
+    fn automatic_verification_has_a_bounded_residency_budget() {
+        assert!(should_automatically_verify(MAX_AUTOMATIC_VERIFY_BYTES));
+        assert!(!should_automatically_verify(MAX_AUTOMATIC_VERIFY_BYTES + 1));
+    }
+
+    #[test]
+    #[serial_test::serial]
     fn governed_sweep_completes_without_retaining_retired_artifacts() {
         let scheduler = Arc::new(TaskScheduler::new());
-        let service = HnswIntegrityScheduler::new(Arc::clone(&scheduler));
+        let service =
+            HnswIntegrityScheduler::new_without_foreground_governor(Arc::clone(&scheduler));
         let marker = AtomicBool::new(true);
         let before = storage_metrics().snapshot();
 
@@ -234,5 +284,29 @@ mod tests {
             after.search_hnsw_integrity_stale_total,
             before.search_hnsw_integrity_stale_total + 1
         );
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn governed_sweep_parks_while_a_foreground_query_is_reserved() {
+        let scheduler = Arc::new(TaskScheduler::new());
+        let service = HnswIntegrityScheduler::new(Arc::clone(&scheduler));
+        let marker = AtomicBool::new(true);
+        let index = loaded_index();
+        let integrity = index.artifact_integrity().unwrap();
+        service.schedule(&index);
+
+        let query = super::super::hnsw_builder::HnswForegroundQueryGuard::enter();
+        scheduler.execute_tasks(&marker, 1);
+        assert!(!integrity.is_fully_verified());
+        drop(query);
+
+        for _ in 0..16 {
+            scheduler.execute_tasks(&marker, 1);
+            if integrity.is_fully_verified() {
+                break;
+            }
+        }
+        assert!(integrity.is_fully_verified());
     }
 }

@@ -11,6 +11,7 @@ use std::time::{Duration, Instant};
 use arc_swap::ArcSwap;
 use paro_scheduler::scheduler::TaskScheduler;
 
+use crate::index::hnsw::hnsw_foreground_pressure_active;
 use crate::metrics::storage_metrics;
 use crate::rowset::{RowsetId, RowsetSharedPtr};
 use crate::tablet::{
@@ -73,6 +74,7 @@ use super::manifest::{
     GenerationManifestRoot, LoadedManifest, ManifestDelta, ManifestDeltaEntry, ManifestShard,
     ManifestStore,
 };
+use super::providers::hnsw::search::prewarm_hnsw_generation_readers;
 use super::sidecar::{SearchReaderRuntime, SidecarArtifactStore};
 use super::sidecar_builder::ProviderSidecarArtifactBuilder;
 use super::staged_generation::{StagedSearchGeneration, StagedSearchGenerationInit};
@@ -1433,10 +1435,14 @@ impl SearchIndexRegistry {
             )?;
         }
         let sidecar_file_ids = sidecar_file_ids_for_artifacts(&result.artifact_refs);
+        if let Err(error) = self.prepare_artifact_readers(&state, &result.artifact_refs) {
+            self.discard_unpublished_sidecars(&sidecar_store, &sidecar_file_ids);
+            return Err(error);
+        }
         // Expensive provider work intentionally runs without publication or
-        // definition locks. Re-enter the ordered publication critical section
-        // only for the immutable manifest append, WAL record, head CAS, and
-        // in-memory view CAS.
+        // definition locks, including immutable reader activation. Re-enter
+        // the ordered publication critical section only for the manifest
+        // append, WAL record, head CAS, and in-memory view CAS.
         let publication_guard = self.tablet.acquire_search_generation_publish_guard()?;
         let definition_lock = self.definition_lock(definition_id);
         let _guard = definition_lock
@@ -1444,7 +1450,7 @@ impl SearchIndexRegistry {
             .map_err(|_| paro_error::internal("lock search definition publish lock"))?;
         let latest = self.view.load_full();
         let Some(latest_state) = latest.definitions.get(&definition_id).cloned() else {
-            remove_sidecar_packages(&sidecar_store, &sidecar_file_ids);
+            self.discard_unpublished_sidecars(&sidecar_store, &sidecar_file_ids);
             return Ok(0);
         };
         drop(latest);
@@ -1456,7 +1462,7 @@ impl SearchIndexRegistry {
                 &result.artifact_refs,
             )
         {
-            remove_sidecar_packages(&sidecar_store, &sidecar_file_ids);
+            self.discard_unpublished_sidecars(&sidecar_store, &sidecar_file_ids);
             return Ok(0);
         }
 
@@ -1467,16 +1473,11 @@ impl SearchIndexRegistry {
         ) {
             Ok(next_state) => next_state,
             Err(err) => {
-                remove_sidecar_packages(&sidecar_store, &sidecar_file_ids);
+                self.discard_unpublished_sidecars(&sidecar_store, &sidecar_file_ids);
                 return Err(err);
             }
         };
-        let completion = publish_head_for_state(
-            &self.tablet,
-            &self.manifests,
-            &next_state,
-            &publication_guard,
-        )?;
+        let completion = self.publish_prepared_head_for_state(&next_state, &publication_guard)?;
         let view_result =
             self.publish_durable_revision_state(&latest_state, next_state.clone(), &completion);
         drop(latest_state);
@@ -1548,6 +1549,13 @@ impl SearchIndexRegistry {
                 return Ok(false);
             }
         }
+        if hnsw_foreground_pressure_active() {
+            // Coalescing changes neither freshness nor correctness. Do not
+            // enter vector preparation while a foreground reservation is
+            // already active; the stop check below covers queries that arrive
+            // after admission.
+            return Ok(false);
+        }
         let generation_id = state
             .generation
             .as_ref()
@@ -1574,8 +1582,15 @@ impl SearchIndexRegistry {
         let build_epoch = self.foreground_ingest_epoch.load(Ordering::Acquire);
         let foreground_epoch = Arc::clone(&self.foreground_ingest_epoch);
         let definition_token = build_token.clone();
+        let foreground_preempted = Arc::new(AtomicBool::new(false));
+        let stop_for_foreground = Arc::clone(&foreground_preempted);
         let stop_check = SearchBuildStopCheck::new(move || {
-            foreground_epoch.load(Ordering::Acquire) != build_epoch
+            let foreground_active = hnsw_foreground_pressure_active();
+            if foreground_active {
+                stop_for_foreground.store(true, Ordering::Release);
+            }
+            foreground_active
+                || foreground_epoch.load(Ordering::Acquire) != build_epoch
                 || definition_token.should_stop()
         });
         let input = SidecarBuildInput {
@@ -1599,12 +1614,13 @@ impl SearchIndexRegistry {
             Err(error)
                 if error.is_query_canceled()
                     && (self.foreground_ingest_epoch.load(Ordering::Acquire) != build_epoch
-                        || build_token.should_stop()) =>
+                        || build_token.should_stop()
+                        || foreground_preempted.load(Ordering::Acquire)) =>
             {
-                // Foreground freshness debt preempts optional graph
-                // coalescing. The level-triggered scheduler will select
-                // CatchUp on the next pass, while this compaction remains
-                // eligible after the table becomes quiet.
+                // Foreground reads and freshness debt preempt optional graph
+                // coalescing. The level-triggered scheduler retries it after
+                // the table becomes quiet; required catch-up uses a separate
+                // build path and retains its one-lane progress guarantee.
                 return Ok(false);
             }
             Err(error) => return Err(error),
@@ -1616,13 +1632,18 @@ impl SearchIndexRegistry {
             &selected_artifacts,
             &result.artifact_refs,
         ) {
-            remove_sidecar_packages(&sidecar_store, &sidecar_file_ids);
+            self.discard_unpublished_sidecars(&sidecar_store, &sidecar_file_ids);
+            return Err(error);
+        }
+        if let Err(error) = self.prepare_artifact_readers(&state, &result.artifact_refs) {
+            self.discard_unpublished_sidecars(&sidecar_store, &sidecar_file_ids);
             return Err(error);
         }
 
         // Re-enter the ordered publication section only after the graph has
-        // been built. Every selected artifact must still be present verbatim;
-        // otherwise rowset replacement or another compaction won the race.
+        // been built and its readers activated. Every selected artifact must
+        // still be present verbatim; otherwise rowset replacement or another
+        // compaction won the race.
         let publication_guard = self.tablet.acquire_search_generation_publish_guard()?;
         let definition_lock = self.definition_lock(definition_id);
         let _guard = definition_lock
@@ -1630,7 +1651,7 @@ impl SearchIndexRegistry {
             .map_err(|_| paro_error::internal("lock search definition publish lock"))?;
         let latest = self.view.load_full();
         let Some(latest_state) = latest.definitions.get(&definition_id).cloned() else {
-            remove_sidecar_packages(&sidecar_store, &sidecar_file_ids);
+            self.discard_unpublished_sidecars(&sidecar_store, &sidecar_file_ids);
             return Ok(false);
         };
         drop(latest);
@@ -1650,7 +1671,7 @@ impl SearchIndexRegistry {
                 })
             });
         if !selected_still_live {
-            remove_sidecar_packages(&sidecar_store, &sidecar_file_ids);
+            self.discard_unpublished_sidecars(&sidecar_store, &sidecar_file_ids);
             return Ok(false);
         }
 
@@ -1661,16 +1682,12 @@ impl SearchIndexRegistry {
         ) {
             Ok(next_state) => next_state,
             Err(error) => {
-                remove_sidecar_packages(&sidecar_store, &sidecar_file_ids);
+                self.discard_unpublished_sidecars(&sidecar_store, &sidecar_file_ids);
                 return Err(error);
             }
         };
-        let completion = match publish_head_for_state(
-            &self.tablet,
-            &self.manifests,
-            &next_state,
-            &publication_guard,
-        ) {
+        let completion = match self.publish_prepared_head_for_state(&next_state, &publication_guard)
+        {
             Ok(completion) => completion,
             Err(error) => {
                 self.retire_unpublished_revision(&latest_state, &next_state);
@@ -2110,6 +2127,10 @@ impl SearchIndexRegistry {
 
         let repacked_count = repacked_artifacts.len();
         let sidecar_file_ids = sidecar_file_ids_for_artifacts(&repacked_artifacts);
+        if let Err(error) = self.prepare_artifact_readers(&state, &repacked_artifacts) {
+            self.discard_unpublished_sidecars(&store, &sidecar_file_ids);
+            return Err(error);
+        }
         let publication_guard = self.tablet.acquire_search_generation_publish_guard()?;
         let definition_lock = self.definition_lock(definition_id);
         let _guard = definition_lock
@@ -2117,7 +2138,7 @@ impl SearchIndexRegistry {
             .map_err(|_| paro_error::internal("lock search definition publish lock"))?;
         let latest = self.view.load_full();
         let Some(latest_state) = latest.definitions.get(&definition_id).cloned() else {
-            remove_sidecar_packages(&store, &sidecar_file_ids);
+            self.discard_unpublished_sidecars(&store, &sidecar_file_ids);
             return Ok(0);
         };
         drop(latest);
@@ -2125,7 +2146,7 @@ impl SearchIndexRegistry {
             || latest_state.definition != state.definition
             || latest_state.origin != state.origin
         {
-            remove_sidecar_packages(&store, &sidecar_file_ids);
+            self.discard_unpublished_sidecars(&store, &sidecar_file_ids);
             return Ok(0);
         }
 
@@ -2133,16 +2154,11 @@ impl SearchIndexRegistry {
         {
             Ok(next_state) => next_state,
             Err(err) => {
-                remove_sidecar_packages(&store, &sidecar_file_ids);
+                self.discard_unpublished_sidecars(&store, &sidecar_file_ids);
                 return Err(err);
             }
         };
-        let completion = publish_head_for_state(
-            &self.tablet,
-            &self.manifests,
-            &next_state,
-            &publication_guard,
-        )?;
+        let completion = self.publish_prepared_head_for_state(&next_state, &publication_guard)?;
         let view_result =
             self.publish_durable_revision_state(&latest_state, next_state.clone(), &completion);
         drop(latest_state);
@@ -2181,12 +2197,8 @@ impl SearchIndexRegistry {
         }
         let loaded = revision.commit()?;
         let next_state = state.clone().with_manifest(loaded);
-        let completion = match publish_head_for_state(
-            &self.tablet,
-            &self.manifests,
-            &next_state,
-            &publication_guard,
-        ) {
+        let completion = match self.publish_prepared_head_for_state(&next_state, &publication_guard)
+        {
             Ok(completion) => completion,
             Err(error) => {
                 self.retire_unpublished_revision(&state, &next_state);
@@ -2356,12 +2368,7 @@ impl SearchIndexRegistry {
             return Ok(capability);
         }
 
-        let completion = publish_head_for_state(
-            &self.tablet,
-            &self.manifests,
-            &next_state,
-            &publication_guard,
-        )?;
+        let completion = self.publish_prepared_head_for_state(&next_state, &publication_guard)?;
         let view_result =
             self.publish_durable_revision_state(&latest_state, next_state.clone(), &completion);
         drop(latest_state);
@@ -2539,6 +2546,7 @@ impl SearchIndexRegistry {
                     state.with_generation_floor(loaded.root.generation_id, loaded.root.build_epoch);
             }
         }
+        self.prepare_generation_readers(&state)?;
         let definition_id = definition.definition_id;
         let removed_seed_states = self.mutate_view(|view| {
             let mut removed = Vec::new();
@@ -3506,6 +3514,79 @@ impl SearchIndexRegistry {
             );
         }
         Ok(())
+    }
+
+    fn publish_prepared_head_for_state(
+        &self,
+        next_state: &SearchDefinitionState,
+        publication_guard: &crate::tablet::SearchGenerationPublishGuard<'_>,
+    ) -> Result<SearchGenerationPublishCompletion> {
+        self.prepare_generation_readers(next_state)?;
+        publish_head_for_state(&self.tablet, &self.manifests, next_state, publication_guard)
+    }
+
+    /// Activate immutable provider readers before the manifest head or
+    /// in-memory definition can expose them to a foreground query.
+    ///
+    /// HNSW sidecars use external base-vector pages. Reconstructing that
+    /// binding and parsing the graph is generation lifecycle work; doing it
+    /// lazily in the first query creates a multi-second latency cliff and a
+    /// thundering herd after recovery or catch-up publication.
+    fn prepare_generation_readers(&self, state: &SearchDefinitionState) -> Result<()> {
+        if state.definition.kind != SearchIndexKind::Hnsw {
+            return Ok(());
+        }
+        let Some(manifest) = state.manifest.as_ref() else {
+            return Ok(());
+        };
+        self.prepare_artifact_readers(state, &manifest.artifacts.artifacts)
+    }
+
+    /// Complete the expensive half of generation activation before entering
+    /// the publication critical section. The resulting readers are keyed by
+    /// immutable artifact identity, so a failed CAS may leave harmless cache
+    /// entries that ordinary retirement evicts; a successful CAS performs no
+    /// mmap, graph decode, or external-vector binding while holding the head
+    /// and definition locks.
+    fn prepare_artifact_readers(
+        &self,
+        state: &SearchDefinitionState,
+        artifacts: &[SearchArtifactRef],
+    ) -> Result<()> {
+        if state.definition.kind != SearchIndexKind::Hnsw || artifacts.is_empty() {
+            return Ok(());
+        }
+        let provider = state.hnsw_provider_config.as_ref().ok_or_else(|| {
+            paro_error::internal("HNSW generation activation requires a provider contract")
+        })?;
+        let column_id = *state.definition.column_ids.first().ok_or_else(|| {
+            paro_error::internal("HNSW generation activation requires one vector column")
+        })?;
+        let visible_rowsets = self
+            .tablet
+            .capture_consistent_rowsets(self.tablet.max_version())?;
+        prewarm_hnsw_generation_readers(
+            self.reader_runtime.as_ref(),
+            artifacts,
+            &visible_rowsets,
+            column_id,
+            provider.dimension as usize,
+            &provider.build_contract(),
+        )?;
+        Ok(())
+    }
+
+    fn discard_unpublished_sidecars(
+        &self,
+        store: &SidecarArtifactStore,
+        file_ids: &BTreeSet<ArtifactFileId>,
+    ) {
+        // Prepared readers may already own decoded indexes and package mmaps.
+        // Evict those identities before unlinking a revision that lost its
+        // publish CAS; otherwise an unpublished artifact remains resident and
+        // can outlive the file that supplied it.
+        self.reader_runtime.evict_packages(file_ids);
+        remove_sidecar_packages(store, file_ids);
     }
 
     fn definition_lock(&self, definition_id: u64) -> &Mutex<()> {

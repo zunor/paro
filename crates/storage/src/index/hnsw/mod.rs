@@ -47,10 +47,10 @@ pub use entry_points::{EntryPoint, EntryPoints, PredicateEntryPoint};
 pub use graph::GraphLayers;
 pub use graph_links::{GraphLinks, GraphLinksData};
 pub use healer::GraphLayersHealer;
-pub(crate) use hnsw_builder::hnsw_build_thread_count;
 pub use hnsw_builder::{
     configure_hnsw_build_threads, HnswBuildExecutionPolicy, HnswBuildStopCheck, HnswBuilder,
 };
+pub(crate) use hnsw_builder::{hnsw_build_thread_count, hnsw_foreground_pressure_active};
 pub use integrity_scheduler::HnswIntegrityScheduler;
 pub use links_container::{ItemsBuffer, LinksContainer};
 pub(crate) use persistence::{

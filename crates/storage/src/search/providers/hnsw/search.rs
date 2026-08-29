@@ -1,16 +1,11 @@
 // Copyright 2024-2026 Zunor
 // SPDX-License-Identifier: Apache-2.0
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
 use std::time::Instant;
 
-/// Minimum exact vector payload needed to amortize a cross-thread segment
-/// phase. This is expressed as physical bytes rather than rows so the same
-/// scheduling rule scales with vector dimension. Graph traversal remains
-/// parallel because its random navigation latency is not proportional to the
-/// number of predicate matches.
-const MIN_PARALLEL_EXACT_VECTOR_BYTES: u64 = 2 * 1024 * 1024;
+use crate::index::hnsw::hnsw_builder::HnswForegroundQueryGuard;
 use crate::index::hnsw::types::SearchParams;
 use crate::index::hnsw::{
     hnsw_artifact_compatibility, hnsw_artifact_uses_external_vectors, DistanceMetric,
@@ -19,8 +14,16 @@ use crate::index::hnsw::{
     HnswSearchPolicy, HnswSearchStrategy, HnswSegmentSearchInput, PartitionedVectorStorage,
     PreparedQuery, VectorStorage,
 };
+
+/// Minimum exact vector payload needed to amortize a cross-thread segment
+/// phase. This is expressed as physical bytes rather than rows so the same
+/// scheduling rule scales with vector dimension. Graph traversal remains
+/// parallel because its random navigation latency is not proportional to the
+/// number of predicate matches.
+const MIN_PARALLEL_EXACT_VECTOR_BYTES: u64 = 2 * 1024 * 1024;
 use crate::index::PredicateTree;
 use crate::index::{DenseRowSet, ExactRowSet, PartitionExactRowSet};
+use crate::rowset::RowsetSharedPtr;
 use crate::search::artifact::ArtifactLocation;
 use crate::search::capability::{ArtifactSegmentRef, SearchArtifactRef, SearchIndexKind};
 use crate::search::cursor::{
@@ -209,6 +212,13 @@ impl std::fmt::Debug for VectorSearchCursor {
 
 impl VectorSearchCursor {
     fn build_ranked_rows(&self, budget: &ResourceBudget) -> Result<Vec<RankedRow>> {
+        // Reserve foreground HNSW capacity for the complete physical query,
+        // including predicate preparation, exact-tail scans, sidecar opens,
+        // graph traversal, and the final merge. Guards inside an individual
+        // artifact search cannot protect the exact tail that precedes it and
+        // leave gaps between generation partitions where maintenance can
+        // regain the full build pool.
+        let _foreground_query = HnswForegroundQueryGuard::enter();
         let started_at = Instant::now();
         self.telemetry.record_generation(GenerationTelemetryEvent {
             kind: SearchIndexKind::Hnsw,
@@ -317,6 +327,7 @@ impl VectorSearchCursor {
                 self.reader_runtime.as_ref(),
                 artifact,
                 self.vector_dim,
+                HnswIntegrityActivation::QueryUse,
                 || {
                     build_external_vector_binding(
                         artifact,
@@ -744,7 +755,11 @@ impl VectorSearchCursor {
             .open_hnsw_index(self.storage_col_id)?
             .filter(|index| !index.integrity_failed());
         if let Some(index) = inline_index.as_ref() {
-            bind_hnsw_search_workspace(index, self.reader_runtime.as_ref())?;
+            bind_hnsw_search_workspace(
+                index,
+                self.reader_runtime.as_ref(),
+                HnswIntegrityActivation::QueryUse,
+            )?;
         }
         let exact_scan_workload = inline_index.as_ref().map_or_else(
             || filter.exact_scan_workload(segment.segment.num_rows(), |_| false),
@@ -954,7 +969,11 @@ impl VectorSearchCursor {
             .open_hnsw_index(self.storage_col_id)?
             .filter(|index| !index.integrity_failed())
         {
-            bind_hnsw_search_workspace(&index, self.reader_runtime.as_ref())?;
+            bind_hnsw_search_workspace(
+                &index,
+                self.reader_runtime.as_ref(),
+                HnswIntegrityActivation::QueryUse,
+            )?;
             validate_hnsw_index_contract(index.as_ref(), &self.expected_build_contract)?;
             return visible_segment
                 .segment
@@ -1133,20 +1152,27 @@ fn open_sidecar_hnsw_index(
         return Ok(None);
     }
 
-    open_sidecar_hnsw_artifact(runtime, artifact, vector_dim, || {
-        build_external_vector_binding(artifact, column_id, vector_dim, |segment_ref| {
-            (segment_ref.rowset_id == visible_segment.rowset_id
-                && segment_ref.segment_id == visible_segment.segment_id)
-                .then_some(visible_segment)
-        })
-        .map(Some)
-    })
+    open_sidecar_hnsw_artifact(
+        runtime,
+        artifact,
+        vector_dim,
+        HnswIntegrityActivation::QueryUse,
+        || {
+            build_external_vector_binding(artifact, column_id, vector_dim, |segment_ref| {
+                (segment_ref.rowset_id == visible_segment.rowset_id
+                    && segment_ref.segment_id == visible_segment.segment_id)
+                    .then_some(visible_segment)
+            })
+            .map(Some)
+        },
+    )
 }
 
 fn open_sidecar_hnsw_artifact<F>(
     runtime: &SearchReaderRuntime,
     artifact: &SearchArtifactRef,
     vector_dim: usize,
+    integrity_activation: HnswIntegrityActivation,
     external_binding: F,
 ) -> Result<Option<Arc<HnswIndex>>>
 where
@@ -1199,7 +1225,7 @@ where
             // or emitting the same data-corruption error on every query.
             return Ok(None);
         }
-        bind_hnsw_search_workspace(index, runtime)?;
+        bind_hnsw_search_workspace(index, runtime, integrity_activation)?;
     }
     Ok(index)
 }
@@ -1213,6 +1239,26 @@ fn build_external_vector_binding<'a, F>(
 where
     F: FnMut(&ArtifactSegmentRef) -> Option<&'a VisibleSegment>,
 {
+    build_external_vector_binding_from_storage(artifact, column_id, vector_dim, |segment_ref| {
+        let visible = resolve_visible(segment_ref).ok_or_else(|| {
+            paro_error::data_corrupted(format!(
+                "external HNSW source references invisible segment {}/{}",
+                segment_ref.rowset_id, segment_ref.segment_id
+            ))
+        })?;
+        Ok(Some((visible.segment.clone(), visible.segment.num_rows())))
+    })
+}
+
+fn build_external_vector_binding_from_storage<F>(
+    artifact: &SearchArtifactRef,
+    column_id: u32,
+    vector_dim: usize,
+    mut resolve_segment: F,
+) -> Result<HnswExternalVectorBinding>
+where
+    F: FnMut(&ArtifactSegmentRef) -> Result<Option<(crate::rowset::SegmentSharedPtr, u64)>>,
+{
     if artifact.column_id != column_id {
         return Err(paro_error::data_corrupted(format!(
             "external HNSW artifact column {} does not match query column {column_id}",
@@ -1222,22 +1268,19 @@ where
     let mut source_spans = Vec::with_capacity(artifact.coverage.segments().len());
     let mut vector_parts = Vec::<Arc<dyn VectorStorage>>::new();
     for span in artifact.coverage.segments() {
-        let visible = resolve_visible(&span.segment).ok_or_else(|| {
+        let (segment, segment_rows) = resolve_segment(&span.segment)?.ok_or_else(|| {
             paro_error::data_corrupted(format!(
                 "external HNSW source references invisible segment {}/{}",
                 span.segment.rowset_id, span.segment.segment_id
             ))
         })?;
-        if visible.segment.num_rows() != span.row_count {
+        if segment_rows != span.row_count {
             return Err(paro_error::data_corrupted(format!(
                 "external HNSW source segment {}/{} has {} rows, expected {}",
-                span.segment.rowset_id,
-                span.segment.segment_id,
-                visible.segment.num_rows(),
-                span.row_count
+                span.segment.rowset_id, span.segment.segment_id, segment_rows, span.row_count
             )));
         }
-        let column = visible.segment.get_column_meta(column_id).ok_or_else(|| {
+        let column = segment.get_column_meta(column_id).ok_or_else(|| {
             paro_error::column_not_found(format!(
                 "external HNSW source segment {} has no column {column_id}",
                 span.segment.segment_id
@@ -1249,8 +1292,7 @@ where
                 column.num_rows, span.row_count
             )));
         }
-        let storage = visible
-            .segment
+        let storage = segment
             .open_plain_vector_storage(column_id, vector_dim)?
             .ok_or_else(|| {
                 paro_error::data_corrupted(format!(
@@ -1271,11 +1313,97 @@ where
     Ok(HnswExternalVectorBinding { source, storage })
 }
 
-fn bind_hnsw_search_workspace(index: &Arc<HnswIndex>, runtime: &SearchReaderRuntime) -> Result<()> {
+/// Materialize every typed HNSW reader before a recovered or newly published
+/// generation becomes query-visible.
+///
+/// The manifest is immutable and sidecar artifacts are self-validating, so
+/// reader construction is generation activation work rather than query work.
+/// Keeping it on this boundary also reuses the segment-owned vector readers
+/// already populated by catch-up construction.
+pub(crate) fn prewarm_hnsw_generation_readers(
+    runtime: &SearchReaderRuntime,
+    artifacts: &[SearchArtifactRef],
+    visible_rowsets: &[RowsetSharedPtr],
+    column_id: u32,
+    vector_dim: usize,
+    expected_contract: &HnswBuildContract,
+) -> Result<usize> {
+    let rowsets = visible_rowsets
+        .iter()
+        .map(|rowset| (rowset.rowset_id(), rowset))
+        .collect::<BTreeMap<_, _>>();
+    let mut warmed = 0usize;
+    for artifact in artifacts.iter().filter(|artifact| {
+        artifact.kind == SearchIndexKind::Hnsw
+            && artifact.column_id == column_id
+            && matches!(
+                artifact.location,
+                ArtifactLocation::SidecarArtifactFile { .. }
+            )
+    }) {
+        let index = open_sidecar_hnsw_artifact(
+            runtime,
+            artifact,
+            vector_dim,
+            HnswIntegrityActivation::OnFirstQuery,
+            || {
+                build_external_vector_binding_from_storage(
+                    artifact,
+                    column_id,
+                    vector_dim,
+                    |segment_ref| {
+                        let Some(rowset) = rowsets.get(&segment_ref.rowset_id) else {
+                            return Ok(None);
+                        };
+                        rowset.load()?;
+                        Ok(rowset
+                            .segments()
+                            .iter()
+                            .find(|segment| segment.segment_id() == segment_ref.segment_id)
+                            .cloned()
+                            .map(|segment| {
+                                let rows = segment.num_rows();
+                                (segment, rows)
+                            }))
+                    },
+                )
+                .map(Some)
+            },
+        )?;
+        let Some(index) = index else {
+            return Err(paro_error::artifact_not_ready(format!(
+                "HNSW artifact for generation {} is not queryable during reader activation",
+                artifact.generation_id
+            )));
+        };
+        validate_hnsw_index_contract(index.as_ref(), expected_contract)?;
+        warmed = warmed.saturating_add(1);
+    }
+    Ok(warmed)
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum HnswIntegrityActivation {
+    /// Generation activation constructs and binds immutable readers before
+    /// they become visible, but must not initiate a full-payload scan. The
+    /// first real query activates optional sweeping while holding the
+    /// foreground reservation, so low-priority I/O cannot race service
+    /// readiness or make an unused generation resident.
+    OnFirstQuery,
+    QueryUse,
+}
+
+fn bind_hnsw_search_workspace(
+    index: &Arc<HnswIndex>,
+    runtime: &SearchReaderRuntime,
+    integrity_activation: HnswIntegrityActivation,
+) -> Result<()> {
     if let Some(buffer_pool) = runtime.buffer_pool() {
         index.bind_search_buffer_pool(buffer_pool)?;
     }
-    runtime.schedule_hnsw_integrity_verification(index);
+    if integrity_activation == HnswIntegrityActivation::QueryUse {
+        runtime.schedule_hnsw_integrity_verification(index);
+    }
     Ok(())
 }
 

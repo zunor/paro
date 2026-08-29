@@ -13,7 +13,8 @@ use super::entry_points::EntryPoints;
 use super::graph::{GraphLayers, GraphSearchLimits, PredicatePartitionSeeds};
 use super::graph_links::GraphLinks;
 use super::hnsw_builder::{
-    hnsw_build_pool, hnsw_current_build_parallelism, HnswForegroundQueryGuard,
+    hnsw_build_pool, hnsw_current_build_parallelism, HnswBuildExecutionPolicy,
+    HnswForegroundQueryGuard,
 };
 use super::predicate_scan::{
     PredicateScanBuildBlock, PredicateScanBuildColumn, PredicateScanLayout,
@@ -1297,6 +1298,7 @@ impl HnswIndex {
             pool,
             parallelism,
             parallelism,
+            HnswBuildExecutionPolicy::Foreground,
             stop_check,
             workspace_dir,
         )
@@ -1309,6 +1311,7 @@ impl HnswIndex {
         pool: Option<&rayon::ThreadPool>,
         parallelism: usize,
         preparation_parallelism: usize,
+        execution_policy: HnswBuildExecutionPolicy,
         stop_check: Option<&HnswBuildStopCheck>,
         workspace_dir: Option<&Path>,
     ) -> Result<Self> {
@@ -1335,6 +1338,7 @@ impl HnswIndex {
             filter_blocks,
             pool,
             parallelism,
+            execution_policy,
             stop_check,
         )
     }
@@ -1352,6 +1356,7 @@ impl HnswIndex {
         filter_blocks: HnswFilterBlocks,
         pool: Option<&rayon::ThreadPool>,
         parallelism: usize,
+        execution_policy: HnswBuildExecutionPolicy,
         stop_check: Option<&HnswBuildStopCheck>,
     ) -> Result<Self> {
         let distance = build_contract.distance;
@@ -1414,7 +1419,8 @@ impl HnswIndex {
                         if stop_check.is_some_and(|check| check.should_stop()) {
                             return Err(error::query_canceled());
                         }
-                        let execution_parallelism = hnsw_current_build_parallelism(parallelism);
+                        let execution_parallelism =
+                            hnsw_current_build_parallelism(execution_policy, parallelism);
                         let mut quantum_proposals =
                             if execution_parallelism >= pool.current_num_threads() {
                                 // A proposal's cost varies with its assigned level
@@ -1478,12 +1484,19 @@ impl HnswIndex {
                         .collect::<Result<Vec<_>>>()
                 }?;
                 if let Some(pool) = pool {
+                    // Read the admitted build policy on the coordinator
+                    // thread. Rayon workers must not rediscover scheduling
+                    // policy through thread-local state: the worker executing
+                    // `install` is intentionally unrelated to the transaction
+                    // or maintenance thread that admitted this build.
+                    let publish_parallelism =
+                        hnsw_current_build_parallelism(execution_policy, parallelism);
                     pool.install(|| {
                         builder.publish_frozen_wave(
                             proposals,
                             storage.as_ref(),
                             distance,
-                            hnsw_current_build_parallelism(parallelism),
+                            publish_parallelism,
                         )
                     });
                 } else {
@@ -1502,6 +1515,7 @@ impl HnswIndex {
                 filter_blocks,
                 pool,
                 parallelism,
+                execution_policy,
                 stop_check,
             )?)
         } else {
@@ -1533,6 +1547,7 @@ impl HnswIndex {
         filter_blocks: HnswFilterBlocks,
         pool: Option<&rayon::ThreadPool>,
         parallelism: usize,
+        execution_policy: HnswBuildExecutionPolicy,
         stop_check: Option<&HnswBuildStopCheck>,
     ) -> Result<BuiltPredicateGraph> {
         let mut merged = vec![Vec::<Vec<PointOffset>>::new(); storage.num_vectors()];
@@ -1630,6 +1645,7 @@ impl HnswIndex {
                 build_contract.filter_topology.target_block_rows,
                 pool,
                 parallelism,
+                execution_policy,
                 stop_check,
                 |built| {
                     let BuiltPredicateBlock {
@@ -1741,6 +1757,7 @@ impl HnswIndex {
         target_block_rows: u32,
         pool: Option<&rayon::ThreadPool>,
         parallelism: usize,
+        execution_policy: HnswBuildExecutionPolicy,
         stop_check: Option<&HnswBuildStopCheck>,
         mut visit: F,
     ) -> Result<()>
@@ -1752,7 +1769,7 @@ impl HnswIndex {
             .saturating_mul(2);
         let mut remaining = prepared_blocks.into_iter().peekable();
         while let Some(next) = remaining.peek() {
-            let worker_count = hnsw_current_build_parallelism(parallelism)
+            let worker_count = hnsw_current_build_parallelism(execution_policy, parallelism)
                 .min(pool.map_or(1, rayon::ThreadPool::current_num_threads))
                 .max(1);
             if worker_count == 1 || next.graph_point_ids.len() > oversized_rows {
@@ -1762,6 +1779,7 @@ impl HnswIndex {
                     block,
                     pool,
                     worker_count,
+                    execution_policy,
                     stop_check,
                 )?)?;
                 continue;
@@ -1788,13 +1806,21 @@ impl HnswIndex {
                     wave.pop().expect("single predicate block exists"),
                     pool,
                     worker_count,
+                    execution_policy,
                     stop_check,
                 )?)?;
             } else if let Some(pool) = pool {
                 let wave_results = pool.install(|| {
                     wave.into_par_iter()
                         .map(|block| {
-                            Self::build_predicate_block(storage, block, None, 1, stop_check)
+                            Self::build_predicate_block(
+                                storage,
+                                block,
+                                None,
+                                1,
+                                execution_policy,
+                                stop_check,
+                            )
                         })
                         .collect::<Result<Vec<_>>>()
                 })?;
@@ -1815,6 +1841,7 @@ impl HnswIndex {
         prepared: PreparedPredicateBlock,
         pool: Option<&rayon::ThreadPool>,
         parallelism: usize,
+        execution_policy: HnswBuildExecutionPolicy,
         stop_check: Option<&HnswBuildStopCheck>,
     ) -> Result<BuiltPredicateBlock> {
         if stop_check.is_some_and(HnswBuildStopCheck::should_stop) {
@@ -1829,6 +1856,7 @@ impl HnswIndex {
             HnswFilterBlocks::default(),
             pool,
             parallelism,
+            execution_policy,
             stop_check,
         )?;
         Ok(BuiltPredicateBlock {
@@ -4263,6 +4291,7 @@ mod tests {
                     Some(&shared_pool),
                     parallelism,
                     parallelism,
+                    HnswBuildExecutionPolicy::Foreground,
                     None,
                     None,
                 )

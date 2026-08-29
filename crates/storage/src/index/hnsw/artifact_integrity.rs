@@ -182,6 +182,10 @@ pub(crate) struct IntegrityVerifyProgress {
 }
 
 impl ArtifactIntegrity {
+    pub(crate) fn protected_len(&self) -> usize {
+        self.protected_len
+    }
+
     #[inline(always)]
     pub(crate) fn is_fully_verified(&self) -> bool {
         self.full_payload_state.load(Ordering::Acquire) == CHUNK_VALID

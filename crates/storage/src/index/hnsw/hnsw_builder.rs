@@ -4,11 +4,10 @@
 use super::{HnswBuildContract, HnswFilterBlocks, HnswIndex, VectorStorage};
 use paro_common::error::{self as paro_error, Result};
 use rayon::ThreadPool;
-use std::cell::Cell;
 use std::fmt;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::{Arc, OnceLock};
+use std::sync::{Arc, Condvar, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
 /// Runtime scheduling policy for an HNSW build.
@@ -76,15 +75,7 @@ static HNSW_ACTIVE_FOREGROUND_QUERIES: AtomicUsize = AtomicUsize::new(0);
 static HNSW_SCHEDULER_EPOCH: OnceLock<Instant> = OnceLock::new();
 static HNSW_FOREGROUND_PRESSURE_UNTIL_MICROS: std::sync::atomic::AtomicU64 =
     std::sync::atomic::AtomicU64::new(0);
-thread_local! {
-    /// Build policy belongs to the admitted build, not to the process. A
-    /// process-global "some maintenance exists" bit incorrectly throttles an
-    /// unrelated foreground CREATE INDEX and cannot distinguish backlog
-    /// urgency. The proposal-wave coordinator reads this value before it
-    /// publishes work to the shared Rayon pool.
-    static HNSW_ACTIVE_BUILD_POLICY: Cell<HnswBuildExecutionPolicy> =
-        const { Cell::new(HnswBuildExecutionPolicy::Foreground) };
-}
+static HNSW_FOREGROUND_PRESSURE_CHANGED: OnceLock<(Mutex<()>, Condvar)> = OnceLock::new();
 /// Hold the foreground reservation across protocol, planning, and artifact
 /// fan-out gaps between consecutive queries. Maintenance still receives one
 /// lane, so sustained read traffic bounds interference without starving
@@ -107,7 +98,7 @@ fn extend_foreground_pressure() {
     );
 }
 
-fn foreground_pressure_active() -> bool {
+pub(crate) fn hnsw_foreground_pressure_active() -> bool {
     foreground_pressure_active_at(
         scheduler_micros(),
         HNSW_ACTIVE_FOREGROUND_QUERIES.load(Ordering::Acquire),
@@ -135,46 +126,75 @@ pub(crate) struct HnswForegroundQueryGuard;
 
 impl HnswForegroundQueryGuard {
     pub(crate) fn enter() -> Self {
+        let (state, changed) =
+            HNSW_FOREGROUND_PRESSURE_CHANGED.get_or_init(|| (Mutex::new(()), Condvar::new()));
+        let _state = state
+            .lock()
+            .expect("HNSW foreground-pressure lock poisoned");
         extend_foreground_pressure();
         HNSW_ACTIVE_FOREGROUND_QUERIES.fetch_add(1, Ordering::AcqRel);
+        changed.notify_all();
         Self
     }
 }
 
 impl Drop for HnswForegroundQueryGuard {
     fn drop(&mut self) {
+        let (state, changed) =
+            HNSW_FOREGROUND_PRESSURE_CHANGED.get_or_init(|| (Mutex::new(()), Condvar::new()));
+        let _state = state
+            .lock()
+            .expect("HNSW foreground-pressure lock poisoned");
         // Publish the trailing reservation before removing the active count;
         // a build wave can therefore never observe an unreserved gap between
         // the two states.
         extend_foreground_pressure();
         HNSW_ACTIVE_FOREGROUND_QUERIES.fetch_sub(1, Ordering::AcqRel);
+        changed.notify_all();
     }
 }
 
-struct HnswBuildExecutionGuard {
-    previous: HnswBuildExecutionPolicy,
-}
-
-impl HnswBuildExecutionGuard {
-    fn enter(policy: HnswBuildExecutionPolicy) -> Self {
-        let previous = HNSW_ACTIVE_BUILD_POLICY.replace(policy);
-        Self { previous }
+/// Wait for the HNSW foreground reservation without consuming scheduler CPU.
+///
+/// Integrity verification is optional background work and shares memory
+/// bandwidth with graph traversal. A condition variable lets its one
+/// low-priority task park while queries are active; the bounded wait also
+/// observes expiry of the trailing cooldown when no guard transition remains
+/// to send another notification.
+pub(crate) fn hnsw_wait_for_foreground_quiet(max_wait: Duration) -> bool {
+    if !hnsw_foreground_pressure_active() {
+        return true;
     }
-}
-
-impl Drop for HnswBuildExecutionGuard {
-    fn drop(&mut self) {
-        HNSW_ACTIVE_BUILD_POLICY.set(self.previous);
+    let (state, changed) =
+        HNSW_FOREGROUND_PRESSURE_CHANGED.get_or_init(|| (Mutex::new(()), Condvar::new()));
+    let deadline = Instant::now() + max_wait;
+    let mut state = state
+        .lock()
+        .expect("HNSW foreground-pressure lock poisoned");
+    while hnsw_foreground_pressure_active() {
+        let now = Instant::now();
+        if now >= deadline {
+            return false;
+        }
+        let (next, timeout) = changed
+            .wait_timeout(state, deadline.saturating_duration_since(now))
+            .expect("HNSW foreground-pressure lock poisoned");
+        state = next;
+        if timeout.timed_out() && hnsw_foreground_pressure_active() {
+            return false;
+        }
     }
+    true
 }
 
-pub(crate) fn hnsw_current_build_parallelism(granted: usize) -> usize {
-    if !foreground_pressure_active() {
+pub(crate) fn hnsw_current_build_parallelism(
+    policy: HnswBuildExecutionPolicy,
+    granted: usize,
+) -> usize {
+    if !hnsw_foreground_pressure_active() {
         return granted.max(1);
     }
-    HNSW_ACTIVE_BUILD_POLICY
-        .get()
-        .parallelism_under_foreground_pressure(granted)
+    policy.parallelism_under_foreground_pressure(granted)
 }
 
 fn create_build_pool(threads: usize) -> std::result::Result<HnswBuildPool, String> {
@@ -319,7 +339,6 @@ impl HnswBuilder {
         build_contract: HnswBuildContract,
     ) -> Result<HnswIndex> {
         let (pool, pool_width) = hnsw_build_pool()?;
-        let _execution_guard = HnswBuildExecutionGuard::enter(self.execution_policy);
         HnswIndex::build_with_controls_and_filter_blocks_in_workspace_with_parallelism(
             storage,
             build_contract,
@@ -327,6 +346,7 @@ impl HnswBuilder {
             Some(pool),
             self.execution_policy.granted_parallelism(pool_width),
             self.execution_policy.preparation_parallelism(pool_width),
+            self.execution_policy,
             self.stop_check.as_ref(),
             self.workspace_dir.as_deref(),
         )
@@ -339,7 +359,6 @@ impl HnswBuilder {
         filter_blocks: HnswFilterBlocks,
     ) -> Result<HnswIndex> {
         let (pool, pool_width) = hnsw_build_pool()?;
-        let _execution_guard = HnswBuildExecutionGuard::enter(self.execution_policy);
         HnswIndex::build_with_controls_and_filter_blocks_in_workspace_with_parallelism(
             storage,
             build_contract,
@@ -347,6 +366,7 @@ impl HnswBuilder {
             Some(pool),
             self.execution_policy.granted_parallelism(pool_width),
             self.execution_policy.preparation_parallelism(pool_width),
+            self.execution_policy,
             self.stop_check.as_ref(),
             self.workspace_dir.as_deref(),
         )
@@ -362,21 +382,27 @@ mod tests {
     #[test]
     #[serial_test::serial]
     fn maintenance_parallelism_holds_foreground_reservation_across_query_gaps() {
-        let maintenance = HnswBuildExecutionGuard::enter(HnswBuildExecutionPolicy::Maintenance);
         {
             let _query = HnswForegroundQueryGuard::enter();
-            assert_eq!(hnsw_current_build_parallelism(8), 1);
+            assert_eq!(
+                hnsw_current_build_parallelism(HnswBuildExecutionPolicy::Maintenance, 8),
+                1
+            );
         }
-        assert_eq!(hnsw_current_build_parallelism(8), 1);
-        drop(maintenance);
+        assert_eq!(
+            hnsw_current_build_parallelism(HnswBuildExecutionPolicy::Maintenance, 8),
+            1
+        );
     }
 
     #[test]
     #[serial_test::serial]
     fn maintenance_priority_cannot_oversubscribe_foreground_queries() {
         let _query = HnswForegroundQueryGuard::enter();
-        let _maintenance = HnswBuildExecutionGuard::enter(HnswBuildExecutionPolicy::Maintenance);
-        assert_eq!(hnsw_current_build_parallelism(10), 1);
+        assert_eq!(
+            hnsw_current_build_parallelism(HnswBuildExecutionPolicy::Maintenance, 10),
+            1
+        );
     }
 
     #[test]
