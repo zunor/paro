@@ -77,6 +77,7 @@ use super::sidecar::{SearchReaderRuntime, SidecarArtifactStore};
 use super::sidecar_builder::ProviderSidecarArtifactBuilder;
 use super::staged_generation::{StagedSearchGeneration, StagedSearchGenerationInit};
 use super::stats::MaintenancePriority;
+use super::tail::reader_warmup::HnswTailReaderWarmupScheduler;
 use super::tail::{
     TailEntryId, TailMutationKind, TailPendingEntry, TailPendingSet, TailRowImageRef,
 };
@@ -203,6 +204,7 @@ pub(crate) struct SearchIndexRegistry {
     reader_runtime: Arc<SearchReaderRuntime>,
     maintenance_scheduler: Arc<MaintenanceScheduler>,
     hnsw_task_scheduler: RwLock<Option<Arc<TaskScheduler>>>,
+    hnsw_tail_reader_warmup: RwLock<Option<HnswTailReaderWarmupScheduler>>,
     maintenance_notifier: RwLock<Option<Arc<dyn Fn(SearchMaintenanceUrgency) + Send + Sync>>>,
     maintenance_failures: Mutex<BTreeMap<u64, MaintenanceFailureBackoff>>,
     active_maintenance_tasks: AtomicUsize,
@@ -421,6 +423,11 @@ impl RowsetPublishObserver for SearchIndexRegistry {
                 );
             }
         }
+        // Only prepare readers for rowsets that the accepted generation
+        // actually exposes as exact tail. Compaction outputs may already own
+        // an inline/sidecar artifact; warming their base vector pages would
+        // consume I/O without serving the query path.
+        self.schedule_hnsw_tail_reader_warmup(&rowset);
         self.sweep_retired();
         if maintenance_needed {
             if let Some(notifier) = self.maintenance_notifier.read().unwrap().as_ref() {
@@ -587,6 +594,105 @@ impl SearchIndexRegistry {
         self.maintenance_progress_changed.notify_all();
     }
 
+    fn schedule_hnsw_tail_reader_warmup(&self, rowset: &RowsetSharedPtr) {
+        let Some(scheduler) = self
+            .hnsw_tail_reader_warmup
+            .read()
+            .unwrap()
+            .as_ref()
+            .cloned()
+        else {
+            return;
+        };
+        let rowset_id = rowset.rowset_id();
+        let specifications = self
+            .view
+            .load()
+            .definitions
+            .values()
+            .filter_map(|state| {
+                let provider = state.hnsw_provider_config.as_ref()?;
+                let manifest = state.manifest.as_ref()?;
+                if !manifest.tail_pending_entries.iter().any(|entry| {
+                    entry.rowset_id == rowset_id && entry.mutation != TailMutationKind::Delete
+                }) {
+                    return None;
+                }
+                state
+                    .definition
+                    .column_ids
+                    .first()
+                    .copied()
+                    .map(|column_id| (column_id, provider.dimension as usize))
+            })
+            .collect::<BTreeSet<_>>();
+        for (column_id, dimension) in specifications {
+            scheduler.schedule(rowset, column_id, dimension);
+        }
+    }
+
+    /// Reconstruct reader-preparation work from durable tail identity.
+    ///
+    /// Publication callbacks are only acceleration hints and do not survive a
+    /// crash. Binding the instance scheduler (and installing a restored
+    /// definition) therefore derives the queue from the final manifest and
+    /// visible rowset graph, exactly like level-triggered index maintenance.
+    fn schedule_pending_hnsw_tail_reader_warmup(&self) {
+        let Some(scheduler) = self
+            .hnsw_tail_reader_warmup
+            .read()
+            .unwrap()
+            .as_ref()
+            .cloned()
+        else {
+            return;
+        };
+        let mut by_rowset = BTreeMap::<RowsetId, BTreeSet<(ColumnId, usize)>>::new();
+        for state in self.view.load().definitions.values() {
+            let Some(provider) = state.hnsw_provider_config.as_ref() else {
+                continue;
+            };
+            let Some(column_id) = state.definition.column_ids.first().copied() else {
+                continue;
+            };
+            let Some(manifest) = state.manifest.as_ref() else {
+                continue;
+            };
+            for entry in &manifest.tail_pending_entries {
+                if entry.mutation == TailMutationKind::Delete {
+                    continue;
+                }
+                by_rowset
+                    .entry(entry.rowset_id)
+                    .or_default()
+                    .insert((column_id, provider.dimension as usize));
+            }
+        }
+        if by_rowset.is_empty() {
+            return;
+        }
+        let visible_version = self.tablet.max_version();
+        let rowsets = match self.tablet.capture_consistent_rowsets(visible_version) {
+            Ok(rowsets) => rowsets,
+            Err(error) => {
+                tracing::warn!(
+                    tablet_id = self.tablet.tablet_id(),
+                    error = %error,
+                    "failed to reconstruct HNSW exact-tail reader warmup"
+                );
+                return;
+            }
+        };
+        for rowset in rowsets {
+            let Some(specifications) = by_rowset.get(&rowset.rowset_id()) else {
+                continue;
+            };
+            for &(column_id, dimension) in specifications {
+                scheduler.schedule(&rowset, column_id, dimension);
+            }
+        }
+    }
+
     fn disable_definition_capability(&self, definition_id: u64) -> Result<()> {
         self.mutate_view(|view| {
             let Some(state) = view.definitions.get_mut(&definition_id) else {
@@ -616,6 +722,7 @@ impl SearchIndexRegistry {
             reader_runtime,
             maintenance_scheduler: Arc::new(MaintenanceScheduler::default()),
             hnsw_task_scheduler: RwLock::new(None),
+            hnsw_tail_reader_warmup: RwLock::new(None),
             maintenance_notifier: RwLock::new(None),
             maintenance_failures: Mutex::new(BTreeMap::new()),
             active_maintenance_tasks: AtomicUsize::new(0),
@@ -649,7 +756,10 @@ impl SearchIndexRegistry {
     }
 
     pub(crate) fn bind_task_scheduler(&self, scheduler: Option<Arc<TaskScheduler>>) {
-        *self.hnsw_task_scheduler.write().unwrap() = scheduler;
+        *self.hnsw_task_scheduler.write().unwrap() = scheduler.clone();
+        *self.hnsw_tail_reader_warmup.write().unwrap() =
+            scheduler.map(HnswTailReaderWarmupScheduler::new);
+        self.schedule_pending_hnsw_tail_reader_warmup();
     }
 
     pub(crate) fn bind_maintenance_notifier(
@@ -2457,6 +2567,7 @@ impl SearchIndexRegistry {
         drop(publication_guard);
         self.sweep_retired();
         self.refresh_definition(definition_id)?;
+        self.schedule_pending_hnsw_tail_reader_warmup();
         Ok(())
     }
 

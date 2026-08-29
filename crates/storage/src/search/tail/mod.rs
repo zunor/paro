@@ -12,6 +12,7 @@ use super::capability::SearchIndexKind;
 use super::stats::SegmentId;
 
 pub mod exact_merge;
+pub(crate) mod reader_warmup;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 pub struct TailEntryId(pub u64);

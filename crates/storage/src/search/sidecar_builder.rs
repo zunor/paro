@@ -29,10 +29,9 @@ use super::stats::{
 use super::tail::{TailMutationKind, TailPendingEntry};
 use crate::index::bitmap::BitmapIndexWriter;
 use crate::index::hnsw::{
-    open_plain_vector_column_pages, HnswBuildExecutionPolicy, HnswBuildStopCheck, HnswBuilder,
-    HnswExternalVectorSource, HnswExternalVectorSpan, HnswFilterBlock, HnswFilterBlocks,
-    HnswFilterColumnBlocks, HnswFilterTopologyContract, HnswMaintenanceBuildPriority,
-    PartitionedVectorStorage, VectorStorage,
+    HnswBuildExecutionPolicy, HnswBuildStopCheck, HnswBuilder, HnswExternalVectorSource,
+    HnswExternalVectorSpan, HnswFilterBlock, HnswFilterBlocks, HnswFilterColumnBlocks,
+    HnswFilterTopologyContract, PartitionedVectorStorage, VectorStorage,
 };
 use crate::metrics::{storage_metrics, SearchSidecarBuildMetricKey};
 use crate::rowset::column::ColumnBatch;
@@ -58,18 +57,14 @@ impl ProviderSidecarArtifactBuilder {
 
     pub(crate) fn for_maintenance(
         store: SidecarArtifactStore,
-        priority: MaintenancePriority,
+        _priority: MaintenancePriority,
     ) -> Self {
-        let priority = match priority {
-            MaintenancePriority::Idle | MaintenancePriority::Opportunistic => {
-                HnswMaintenanceBuildPriority::Opportunistic
-            }
-            MaintenancePriority::Elevated => HnswMaintenanceBuildPriority::Elevated,
-            MaintenancePriority::Critical => HnswMaintenanceBuildPriority::Critical,
-        };
+        // The scheduler has already used priority to order and admit this
+        // task. Once admitted, every background build shares the same
+        // preemptible CPU contract; priority cannot mint extra process lanes.
         Self {
             store,
-            hnsw_execution_policy: HnswBuildExecutionPolicy::Maintenance(priority),
+            hnsw_execution_policy: HnswBuildExecutionPolicy::Maintenance,
         }
     }
 }
@@ -481,8 +476,14 @@ fn build_hnsw_partition_sidecar_artifact(
             )));
         }
         let point_base = point_count;
-        let segment_vectors =
-            open_plain_vector_column_pages(segment.file_path(), column_meta, dimension)?;
+        let segment_vectors = segment
+            .open_plain_vector_storage(column_id, dimension)?
+            .ok_or_else(|| {
+                paro_error::data_corrupted(format!(
+                    "HNSW partition source segment {}/{} is not a plain vector column",
+                    segment_ref.rowset_id, segment_ref.segment_id
+                ))
+            })?;
         let total_points = u64::from(point_base)
             .checked_add(column_meta.num_rows)
             .ok_or_else(|| paro_error::out_of_range("HNSW partition point count overflow"))?;
@@ -496,7 +497,10 @@ fn build_hnsw_partition_sidecar_artifact(
                 "HNSW partition exceeds the u32 point-id domain",
             )
         })?;
-        vector_partitions.extend(segment_vectors);
+        // The structural segment owns page authentication and mmap lifetime.
+        // Build, exact-tail search, and later sidecar rebinding all reuse this
+        // reader instead of checksumming the same immutable pages again.
+        vector_partitions.push(segment_vectors);
         coverage.push(ArtifactSegmentSpan {
             segment: segment_ref,
             row_count: column_meta.num_rows,
@@ -1234,6 +1238,11 @@ mod tests {
         )
         .unwrap()
         .expect("partition artifact");
+
+        assert!(rowset
+            .segments()
+            .iter()
+            .all(|segment| segment.has_plain_vector_storage(1, 2)));
 
         assert_eq!(partition.coverage.segments().len(), 2);
         assert_eq!(partition.coverage.row_count(), 8);

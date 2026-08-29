@@ -50,7 +50,6 @@ pub use healer::GraphLayersHealer;
 pub(crate) use hnsw_builder::hnsw_build_thread_count;
 pub use hnsw_builder::{
     configure_hnsw_build_threads, HnswBuildExecutionPolicy, HnswBuildStopCheck, HnswBuilder,
-    HnswMaintenanceBuildPriority,
 };
 pub use integrity_scheduler::HnswIntegrityScheduler;
 pub use links_container::{ItemsBuffer, LinksContainer};
@@ -68,9 +67,7 @@ pub(crate) use scorer::GraphVectorScorer;
 pub use scorer::VectorScorer;
 pub use search_context::{FixedLengthPriorityQueue, SearchContext};
 pub use types::*;
-pub(crate) use vector_storage::{
-    open_plain_vector_column, open_plain_vector_column_pages, PartitionedVectorStorage,
-};
+pub(crate) use vector_storage::{open_plain_vector_column, PartitionedVectorStorage};
 pub use vector_storage::{
     InMemoryVectorStorage, IndexedVectorStorage, MmapVectorStorage, SharedVectorStorage,
     VectorStorage,

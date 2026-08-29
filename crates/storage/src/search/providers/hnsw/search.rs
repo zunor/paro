@@ -13,11 +13,11 @@ use std::time::Instant;
 const MIN_PARALLEL_EXACT_VECTOR_BYTES: u64 = 2 * 1024 * 1024;
 use crate::index::hnsw::types::SearchParams;
 use crate::index::hnsw::{
-    hnsw_artifact_compatibility, hnsw_artifact_uses_external_vectors,
-    open_plain_vector_column_pages, DistanceMetric, HnswArtifactCompatibility, HnswBuildContract,
-    HnswExternalVectorBinding, HnswExternalVectorSource, HnswExternalVectorSpan, HnswFilterKind,
-    HnswIndex, HnswSearchFilter, HnswSearchPolicy, HnswSearchStrategy, HnswSegmentSearchInput,
-    PartitionedVectorStorage, PreparedQuery, VectorStorage,
+    hnsw_artifact_compatibility, hnsw_artifact_uses_external_vectors, DistanceMetric,
+    HnswArtifactCompatibility, HnswBuildContract, HnswExternalVectorBinding,
+    HnswExternalVectorSource, HnswExternalVectorSpan, HnswFilterKind, HnswIndex, HnswSearchFilter,
+    HnswSearchPolicy, HnswSearchStrategy, HnswSegmentSearchInput, PartitionedVectorStorage,
+    PreparedQuery, VectorStorage,
 };
 use crate::index::PredicateTree;
 use crate::index::{DenseRowSet, ExactRowSet, PartitionExactRowSet};
@@ -1249,11 +1249,16 @@ where
                 column.num_rows, span.row_count
             )));
         }
-        vector_parts.extend(open_plain_vector_column_pages(
-            visible.segment.file_path(),
-            column,
-            vector_dim,
-        )?);
+        let storage = visible
+            .segment
+            .open_plain_vector_storage(column_id, vector_dim)?
+            .ok_or_else(|| {
+                paro_error::data_corrupted(format!(
+                    "external HNSW source segment {}/{} is not a plain vector column",
+                    span.segment.rowset_id, span.segment.segment_id
+                ))
+            })?;
+        vector_parts.push(storage);
         source_spans.push(HnswExternalVectorSpan {
             rowset_id: span.segment.rowset_id,
             segment_id: span.segment.segment_id,

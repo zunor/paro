@@ -18,20 +18,12 @@ use std::time::{Duration, Instant};
 /// wave membership or durable topology. The frozen-wave builder is required
 /// to produce identical bytes for every granted width.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub enum HnswMaintenanceBuildPriority {
-    #[default]
-    Opportunistic,
-    Elevated,
-    Critical,
-}
-
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum HnswBuildExecutionPolicy {
     /// User-requested index construction may consume the complete shared pool.
     #[default]
     Foreground,
     /// Background catch-up and generation compaction preserve foreground CPU.
-    Maintenance(HnswMaintenanceBuildPriority),
+    Maintenance,
 }
 
 impl HnswBuildExecutionPolicy {
@@ -43,7 +35,7 @@ impl HnswBuildExecutionPolicy {
             // proposal-wave barriers below; imposing a permanent half-width
             // cap makes sustained ingest converge at only half the builder's
             // service rate even when no query exists.
-            Self::Maintenance(_) => pool_width.max(1),
+            Self::Maintenance => pool_width.max(1),
         }
     }
 
@@ -55,21 +47,20 @@ impl HnswBuildExecutionPolicy {
             // Keep maintenance preparation preemptible by making those passes
             // serial; foreground CREATE INDEX may use the complete shared
             // pool. Graph construction remains dynamically governed per wave.
-            Self::Maintenance(_) => 1,
+            Self::Maintenance => 1,
         }
     }
 
     fn parallelism_under_foreground_pressure(self, granted: usize) -> usize {
         match self {
             Self::Foreground => granted.max(1),
-            Self::Maintenance(HnswMaintenanceBuildPriority::Opportunistic) => 1,
-            // Once freshness debt is visible in the durable generation
-            // state, maintenance must retain enough service to converge under
-            // sustained reads. Otherwise exact-tail work makes queries slow,
-            // the reads keep the builder at one lane, and the tail can never
-            // drain: a priority inversion rather than resource governance.
-            Self::Maintenance(HnswMaintenanceBuildPriority::Elevated) => granted.div_ceil(3).max(1),
-            Self::Maintenance(HnswMaintenanceBuildPriority::Critical) => granted.div_ceil(2).max(1),
+            // Maintenance priority belongs to admission, retry, and write
+            // backpressure. It must not grant a second, oversubscribing CPU
+            // budget after a job has entered the process-owned build pool.
+            // One lane guarantees progress under sustained reads; immutable
+            // wave barriers restore the complete grant as soon as the
+            // foreground reservation expires.
+            Self::Maintenance => 1,
         }
     }
 }
@@ -371,9 +362,7 @@ mod tests {
     #[test]
     #[serial_test::serial]
     fn maintenance_parallelism_holds_foreground_reservation_across_query_gaps() {
-        let maintenance = HnswBuildExecutionGuard::enter(HnswBuildExecutionPolicy::Maintenance(
-            HnswMaintenanceBuildPriority::Opportunistic,
-        ));
+        let maintenance = HnswBuildExecutionGuard::enter(HnswBuildExecutionPolicy::Maintenance);
         {
             let _query = HnswForegroundQueryGuard::enter();
             assert_eq!(hnsw_current_build_parallelism(8), 1);
@@ -384,20 +373,10 @@ mod tests {
 
     #[test]
     #[serial_test::serial]
-    fn urgent_maintenance_retains_progress_under_sustained_queries() {
+    fn maintenance_priority_cannot_oversubscribe_foreground_queries() {
         let _query = HnswForegroundQueryGuard::enter();
-        {
-            let _maintenance = HnswBuildExecutionGuard::enter(
-                HnswBuildExecutionPolicy::Maintenance(HnswMaintenanceBuildPriority::Elevated),
-            );
-            assert_eq!(hnsw_current_build_parallelism(10), 4);
-        }
-        {
-            let _maintenance = HnswBuildExecutionGuard::enter(
-                HnswBuildExecutionPolicy::Maintenance(HnswMaintenanceBuildPriority::Critical),
-            );
-            assert_eq!(hnsw_current_build_parallelism(10), 5);
-        }
+        let _maintenance = HnswBuildExecutionGuard::enter(HnswBuildExecutionPolicy::Maintenance);
+        assert_eq!(hnsw_current_build_parallelism(10), 1);
     }
 
     #[test]

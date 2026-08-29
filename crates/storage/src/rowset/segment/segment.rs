@@ -501,6 +501,13 @@ impl Segment {
         Ok(Some(storage))
     }
 
+    #[cfg(test)]
+    pub(crate) fn has_plain_vector_storage(&self, column_id: ColumnId, dimension: usize) -> bool {
+        self.plain_vector_storages
+            .read()
+            .is_ok_and(|storages| storages.contains_key(&(column_id, dimension)))
+    }
+
     pub fn column_metas(&self) -> &[ColumnMeta] {
         &self.footer.column_metas
     }

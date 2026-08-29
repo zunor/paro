@@ -460,6 +460,15 @@ fn deterministic_proposal_wave_size(published_points: usize, max_size: usize) ->
     rounded.min(max_size.max(1))
 }
 
+/// Maximum number of immutable point proposals submitted before the build
+/// coordinator observes foreground pressure again.
+///
+/// This is deliberately an execution constant, not part of
+/// [`HnswBuildContract`]. Every quantum in a topology wave reads the same
+/// entry-point snapshot and no proposal is published until the complete wave
+/// finishes, so changing the quantum cannot change durable graph bytes.
+const PROPOSAL_EXECUTION_QUANTUM: usize = 32;
+
 fn splitmix64(mut value: u64) -> u64 {
     value = value.wrapping_add(0x9e37_79b9_7f4a_7c15);
     value = (value ^ (value >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
@@ -1400,40 +1409,20 @@ impl HnswIndex {
                 let entry_points = builder.snapshot_entry_points();
                 let proposals = if let Some(pool) = pool {
                     let positions = (wave_start..wave_end).collect::<Vec<_>>();
-                    let wave_parallelism = hnsw_current_build_parallelism(parallelism);
-                    if wave_parallelism >= pool.current_num_threads() {
-                        // A proposal's cost varies with its assigned level and
-                        // graph path. Static one-chunk-per-worker partitioning
-                        // leaves early finishers idle at every wave barrier.
-                        // Indexed parallel collection preserves position order
-                        // while allowing Rayon to steal individual proposals;
-                        // the subsequent publish phase still sorts by point id,
-                        // so execution width cannot affect durable topology.
-                        pool.install(|| {
-                            positions
-                                .par_iter()
-                                .map(|&position| {
-                                    builder.propose_new_point(
-                                        point_order.point_at(position),
-                                        &entry_points,
-                                        storage.as_ref(),
-                                        distance,
-                                    )
-                                })
-                                .collect::<Result<Vec<_>>>()
-                        })
-                    } else {
-                        // A maintenance grant may deliberately be narrower
-                        // than the process pool. Keep exactly one lane per
-                        // granted worker so background work cannot borrow the
-                        // foreground reserve.
-                        let chunk_size = positions.len().div_ceil(wave_parallelism).max(1);
-                        pool.install(|| {
-                            positions
-                                .par_chunks(chunk_size)
-                                .map(|chunk| {
-                                    chunk
-                                        .iter()
+                    let mut proposals = Vec::with_capacity(positions.len());
+                    for execution_quantum in positions.chunks(PROPOSAL_EXECUTION_QUANTUM) {
+                        if stop_check.is_some_and(|check| check.should_stop()) {
+                            return Err(error::query_canceled());
+                        }
+                        let execution_parallelism = hnsw_current_build_parallelism(parallelism);
+                        let mut quantum_proposals =
+                            if execution_parallelism >= pool.current_num_threads() {
+                                // A proposal's cost varies with its assigned level
+                                // and graph path. Indexed collection preserves
+                                // position order while allowing work stealing.
+                                pool.install(|| {
+                                    execution_quantum
+                                        .par_iter()
                                         .map(|&position| {
                                             builder.propose_new_point(
                                                 point_order.point_at(position),
@@ -1443,11 +1432,39 @@ impl HnswIndex {
                                             )
                                         })
                                         .collect::<Result<Vec<_>>>()
-                                })
-                                .collect::<Result<Vec<Vec<_>>>>()
-                                .map(|chunks| chunks.into_iter().flatten().collect())
-                        })
+                                })?
+                            } else {
+                                // Bound the number of runnable Rayon jobs to the
+                                // current grant. A later quantum re-reads pressure,
+                                // while every proposal still observes this wave's
+                                // one frozen topology snapshot.
+                                let chunk_size = execution_quantum
+                                    .len()
+                                    .div_ceil(execution_parallelism)
+                                    .max(1);
+                                pool.install(|| {
+                                    execution_quantum
+                                        .par_chunks(chunk_size)
+                                        .map(|chunk| {
+                                            chunk
+                                                .iter()
+                                                .map(|&position| {
+                                                    builder.propose_new_point(
+                                                        point_order.point_at(position),
+                                                        &entry_points,
+                                                        storage.as_ref(),
+                                                        distance,
+                                                    )
+                                                })
+                                                .collect::<Result<Vec<_>>>()
+                                        })
+                                        .collect::<Result<Vec<Vec<_>>>>()
+                                        .map(|chunks| chunks.into_iter().flatten().collect())
+                                })?
+                            };
+                        proposals.append(&mut quantum_proposals);
                     }
+                    Ok(proposals)
                 } else {
                     (wave_start..wave_end)
                         .map(|position| {
