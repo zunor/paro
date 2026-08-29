@@ -8,6 +8,7 @@ use std::fmt;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, OnceLock};
+use std::time::{Duration, Instant};
 
 /// Runtime scheduling policy for an HNSW build.
 ///
@@ -35,6 +36,18 @@ impl HnswBuildExecutionPolicy {
             Self::Maintenance => pool_width.div_ceil(2).max(1),
         }
     }
+
+    fn preparation_parallelism(self, pool_width: usize) -> usize {
+        match self {
+            Self::Foreground => pool_width.max(1),
+            // Vector preparation currently has two long immutable passes and
+            // no wave boundary at which its active Rayon job set can shrink.
+            // Keep maintenance preparation preemptible by making those passes
+            // serial; foreground CREATE INDEX may use the complete shared
+            // pool. Graph construction remains dynamically governed per wave.
+            Self::Maintenance => 1,
+        }
+    }
 }
 
 struct HnswBuildPool {
@@ -45,8 +58,48 @@ struct HnswBuildPool {
 static HNSW_BUILD_THREADS: AtomicUsize = AtomicUsize::new(0);
 static HNSW_BUILD_POOL: OnceLock<std::result::Result<HnswBuildPool, String>> = OnceLock::new();
 static HNSW_ACTIVE_FOREGROUND_QUERIES: AtomicUsize = AtomicUsize::new(0);
+static HNSW_SCHEDULER_EPOCH: OnceLock<Instant> = OnceLock::new();
+static HNSW_FOREGROUND_PRESSURE_UNTIL_MICROS: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
 static HNSW_ACTIVE_MAINTENANCE_BUILDS: AtomicUsize = AtomicUsize::new(0);
 const HNSW_MAINTENANCE_FOREGROUND_WORKERS: usize = 1;
+/// Hold the foreground reservation across protocol, planning, and artifact
+/// fan-out gaps between consecutive queries. Maintenance still receives one
+/// lane, so sustained read traffic bounds interference without starving
+/// bounded-lag catch-up.
+const HNSW_FOREGROUND_PRESSURE_COOLDOWN: Duration = Duration::from_millis(250);
+
+fn scheduler_micros() -> u64 {
+    let micros = HNSW_SCHEDULER_EPOCH
+        .get_or_init(Instant::now)
+        .elapsed()
+        .as_micros();
+    micros.min(u128::from(u64::MAX)) as u64
+}
+
+fn extend_foreground_pressure() {
+    let cooldown = HNSW_FOREGROUND_PRESSURE_COOLDOWN.as_micros() as u64;
+    HNSW_FOREGROUND_PRESSURE_UNTIL_MICROS.fetch_max(
+        scheduler_micros().saturating_add(cooldown),
+        Ordering::AcqRel,
+    );
+}
+
+fn foreground_pressure_active() -> bool {
+    foreground_pressure_active_at(
+        scheduler_micros(),
+        HNSW_ACTIVE_FOREGROUND_QUERIES.load(Ordering::Acquire),
+        HNSW_FOREGROUND_PRESSURE_UNTIL_MICROS.load(Ordering::Acquire),
+    )
+}
+
+fn foreground_pressure_active_at(
+    now_micros: u64,
+    active_queries: usize,
+    until_micros: u64,
+) -> bool {
+    active_queries != 0 || now_micros < until_micros
+}
 
 /// Process-level cooperative HNSW workload governor.
 ///
@@ -60,6 +113,7 @@ pub(crate) struct HnswForegroundQueryGuard;
 
 impl HnswForegroundQueryGuard {
     pub(crate) fn enter() -> Self {
+        extend_foreground_pressure();
         HNSW_ACTIVE_FOREGROUND_QUERIES.fetch_add(1, Ordering::AcqRel);
         Self
     }
@@ -67,6 +121,10 @@ impl HnswForegroundQueryGuard {
 
 impl Drop for HnswForegroundQueryGuard {
     fn drop(&mut self) {
+        // Publish the trailing reservation before removing the active count;
+        // a build wave can therefore never observe an unreserved gap between
+        // the two states.
+        extend_foreground_pressure();
         HNSW_ACTIVE_FOREGROUND_QUERIES.fetch_sub(1, Ordering::AcqRel);
     }
 }
@@ -89,9 +147,7 @@ impl Drop for HnswMaintenanceBuildGuard {
 }
 
 pub(crate) fn hnsw_current_build_parallelism(granted: usize) -> usize {
-    if HNSW_ACTIVE_MAINTENANCE_BUILDS.load(Ordering::Acquire) != 0
-        && HNSW_ACTIVE_FOREGROUND_QUERIES.load(Ordering::Acquire) != 0
-    {
+    if HNSW_ACTIVE_MAINTENANCE_BUILDS.load(Ordering::Acquire) != 0 && foreground_pressure_active() {
         granted.clamp(1, HNSW_MAINTENANCE_FOREGROUND_WORKERS)
     } else {
         granted.max(1)
@@ -247,6 +303,7 @@ impl HnswBuilder {
             HnswFilterBlocks::default(),
             Some(pool),
             self.execution_policy.granted_parallelism(pool_width),
+            self.execution_policy.preparation_parallelism(pool_width),
             self.stop_check.as_ref(),
             self.workspace_dir.as_deref(),
         )
@@ -266,6 +323,7 @@ impl HnswBuilder {
             filter_blocks,
             Some(pool),
             self.execution_policy.granted_parallelism(pool_width),
+            self.execution_policy.preparation_parallelism(pool_width),
             self.stop_check.as_ref(),
             self.workspace_dir.as_deref(),
         )
@@ -280,14 +338,22 @@ mod tests {
 
     #[test]
     #[serial_test::serial]
-    fn maintenance_parallelism_yields_at_wave_boundaries_to_foreground_queries() {
+    fn maintenance_parallelism_holds_foreground_reservation_across_query_gaps() {
         let maintenance =
             HnswMaintenanceBuildGuard::enter(HnswBuildExecutionPolicy::Maintenance).unwrap();
         {
             let _query = HnswForegroundQueryGuard::enter();
             assert_eq!(hnsw_current_build_parallelism(8), 1);
         }
+        assert_eq!(hnsw_current_build_parallelism(8), 1);
         drop(maintenance);
+    }
+
+    #[test]
+    fn foreground_pressure_deadline_has_a_precise_trailing_edge() {
+        assert!(foreground_pressure_active_at(10, 1, 0));
+        assert!(foreground_pressure_active_at(10, 0, 11));
+        assert!(!foreground_pressure_active_at(11, 0, 11));
     }
 
     #[test]

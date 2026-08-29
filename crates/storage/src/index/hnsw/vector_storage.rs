@@ -10,6 +10,8 @@ use super::DistanceMetric;
 use bytes::Bytes;
 use memmap2::{Mmap, MmapMut};
 use paro_common::error::Result;
+use rayon::prelude::*;
+use rayon::ThreadPool;
 use std::fs::File;
 use std::io::{Read, Seek, SeekFrom};
 use std::path::Path;
@@ -156,6 +158,17 @@ pub trait VectorStorage: Send + Sync {
         None
     }
 
+    /// Ordered immutable row-major regions backing this construction space.
+    ///
+    /// Unlike the visitor API below, this view lets build preparation divide
+    /// one immutable input into disjoint deterministic lanes and execute them
+    /// on the governed HNSW pool. Implementations must return regions in point
+    /// id order and may return `None` when their logical ids are remapped or
+    /// otherwise cannot be represented as physical contiguous slices.
+    fn contiguous_vector_chunks(&self) -> Option<Vec<&[f32]>> {
+        self.contiguous_vectors().map(|vectors| vec![vectors])
+    }
+
     /// Visit the largest physically contiguous row-major regions available.
     /// Construction-time partition views forward one region per base segment;
     /// artifact and in-memory storage forward one region for the whole index.
@@ -271,6 +284,95 @@ pub trait VectorStorage: Send + Sync {
     }
 }
 
+struct ContiguousVectorLane<'a> {
+    chunks: Vec<&'a [f32]>,
+    rows: usize,
+}
+
+/// Split immutable physical chunks into at most `parallelism` point-ordered
+/// lanes. Lane boundaries are derived only from the declared cardinality, so
+/// worker scheduling cannot affect extrema, code bytes, or norm placement.
+fn construction_vector_lanes(
+    storage: &dyn VectorStorage,
+    parallelism: usize,
+) -> Result<Option<Vec<ContiguousVectorLane<'_>>>> {
+    let Some(chunks) = storage.contiguous_vector_chunks() else {
+        return Ok(None);
+    };
+    let dimension = storage.vector_dim();
+    if dimension == 0 {
+        return Err(paro_common::error::data_corrupted(
+            "HNSW construction vector storage has zero dimension",
+        ));
+    }
+    let mut total_rows = 0usize;
+    for values in &chunks {
+        if values.len() % dimension != 0 {
+            return Err(paro_common::error::data_corrupted(
+                "HNSW construction vector chunk contains a partial row",
+            ));
+        }
+        total_rows = total_rows
+            .checked_add(values.len() / dimension)
+            .ok_or_else(|| {
+                paro_common::error::out_of_range(
+                    "HNSW construction vector chunk cardinality overflow",
+                )
+            })?;
+    }
+    if total_rows != storage.num_vectors() {
+        return Err(paro_common::error::data_corrupted(format!(
+            "HNSW construction chunks contain {total_rows} rows, expected {}",
+            storage.num_vectors()
+        )));
+    }
+    if total_rows == 0 {
+        return Ok(Some(Vec::new()));
+    }
+
+    let lane_count = parallelism.max(1).min(total_rows);
+    let base_lane_rows = total_rows / lane_count;
+    let wider_lanes = total_rows % lane_count;
+    let lane_target = |lane: usize| base_lane_rows + usize::from(lane < wider_lanes);
+    let mut lanes = Vec::with_capacity(lane_count);
+    let mut lane_chunks = Vec::new();
+    let mut lane_rows = 0usize;
+    for mut values in chunks {
+        while !values.is_empty() {
+            let target_rows = lane_target(lanes.len());
+            let remaining_rows = target_rows.saturating_sub(lane_rows);
+            let available_rows = values.len() / dimension;
+            let take_rows = remaining_rows.min(available_rows);
+            let take_values = take_rows.checked_mul(dimension).ok_or_else(|| {
+                paro_common::error::out_of_range("HNSW construction vector lane length overflow")
+            })?;
+            let (head, tail) = values.split_at(take_values);
+            lane_chunks.push(head);
+            lane_rows += take_rows;
+            values = tail;
+            if lane_rows == target_rows {
+                lanes.push(ContiguousVectorLane {
+                    chunks: std::mem::take(&mut lane_chunks),
+                    rows: lane_rows,
+                });
+                lane_rows = 0;
+            }
+        }
+    }
+    if lane_rows != 0 || !lane_chunks.is_empty() {
+        lanes.push(ContiguousVectorLane {
+            chunks: lane_chunks,
+            rows: lane_rows,
+        });
+    }
+    if lanes.len() > lane_count || lanes.iter().map(|lane| lane.rows).sum::<usize>() != total_rows {
+        return Err(paro_common::error::internal(
+            "HNSW construction vector lane partition is inconsistent",
+        ));
+    }
+    Ok(Some(lanes))
+}
+
 /// Restores the physical source's random-access policy on every exit path.
 struct ConstructionSequentialScan<'a> {
     storage: &'a dyn VectorStorage,
@@ -318,6 +420,8 @@ impl ExactF32BuildVectorStorage {
         base: Arc<dyn VectorStorage>,
         workspace_dir: Option<&Path>,
         stop_check: Option<&super::HnswBuildStopCheck>,
+        pool: Option<&ThreadPool>,
+        parallelism: usize,
     ) -> Result<Arc<dyn VectorStorage>> {
         if stop_check.is_some_and(super::HnswBuildStopCheck::should_stop) {
             return Err(paro_common::error::query_canceled());
@@ -376,23 +480,64 @@ impl ExactF32BuildVectorStorage {
             unsafe { std::slice::from_raw_parts_mut(mmap.as_mut_ptr().cast::<f32>(), value_count) };
         let mut written = 0usize;
         let sequential_scan = ConstructionSequentialScan::begin(base.as_ref());
-        let copy_result = base.try_for_each_contiguous_chunk(&mut |values| {
-            if stop_check.is_some_and(super::HnswBuildStopCheck::should_stop) {
-                return Err(paro_common::error::query_canceled());
+        let parallel_lanes = if pool.is_some() && parallelism > 1 {
+            construction_vector_lanes(base.as_ref(), parallelism)?
+        } else {
+            None
+        };
+        if let (Some(pool), Some(lanes)) = (pool, parallel_lanes) {
+            let mut remaining = output;
+            let mut jobs = Vec::with_capacity(lanes.len());
+            for lane in lanes {
+                let lane_values = lane.rows.checked_mul(dimension).ok_or_else(|| {
+                    paro_common::error::out_of_range("HNSW exact-f32 build lane length overflow")
+                })?;
+                let (destination, tail) = remaining.split_at_mut(lane_values);
+                remaining = tail;
+                jobs.push((lane, destination));
             }
-            let end = written.checked_add(values.len()).ok_or_else(|| {
-                paro_common::error::out_of_range("HNSW exact-f32 build copy overflow")
+            pool.install(|| {
+                jobs.into_par_iter().try_for_each(|(lane, destination)| {
+                    let mut lane_offset = 0usize;
+                    for values in lane.chunks {
+                        if stop_check.is_some_and(super::HnswBuildStopCheck::should_stop) {
+                            return Err(paro_common::error::query_canceled());
+                        }
+                        let end = lane_offset.checked_add(values.len()).ok_or_else(|| {
+                            paro_common::error::out_of_range(
+                                "HNSW exact-f32 build lane copy overflow",
+                            )
+                        })?;
+                        destination[lane_offset..end].copy_from_slice(values);
+                        lane_offset = end;
+                    }
+                    if lane_offset != destination.len() {
+                        return Err(paro_common::error::data_corrupted(
+                            "HNSW exact-f32 build lane cardinality mismatch",
+                        ));
+                    }
+                    Ok(())
+                })
             })?;
-            let destination = output.get_mut(written..end).ok_or_else(|| {
-                paro_common::error::data_corrupted(
-                    "HNSW exact-f32 build input exceeds declared cardinality",
-                )
+            written = value_count;
+        } else {
+            base.try_for_each_contiguous_chunk(&mut |values| {
+                if stop_check.is_some_and(super::HnswBuildStopCheck::should_stop) {
+                    return Err(paro_common::error::query_canceled());
+                }
+                let end = written.checked_add(values.len()).ok_or_else(|| {
+                    paro_common::error::out_of_range("HNSW exact-f32 build copy overflow")
+                })?;
+                let destination = output.get_mut(written..end).ok_or_else(|| {
+                    paro_common::error::data_corrupted(
+                        "HNSW exact-f32 build input exceeds declared cardinality",
+                    )
+                })?;
+                destination.copy_from_slice(values);
+                written = end;
+                Ok(())
             })?;
-            destination.copy_from_slice(values);
-            written = end;
-            Ok(())
-        });
-        copy_result?;
+        }
         drop(sequential_scan);
         if written != value_count {
             return Err(paro_common::error::data_corrupted(format!(
@@ -555,6 +700,73 @@ pub(crate) struct SymmetricI16BuildVectorStorage {
     routing_inverse_norms: Option<CosineInverseNorms>,
 }
 
+#[allow(clippy::too_many_arguments)]
+fn encode_symmetric_i16_lane(
+    lane: ContiguousVectorLane<'_>,
+    output: &mut [u8],
+    mut inverse_norms: Option<&mut [f32]>,
+    dimension: usize,
+    routing_dimensions: usize,
+    row_stride_bytes: usize,
+    selected_dimensions: &[usize],
+    scales: &[f32],
+    stop_check: Option<&super::HnswBuildStopCheck>,
+) -> Result<()> {
+    let mut lane_row = 0usize;
+    for values in lane.chunks {
+        if stop_check.is_some_and(super::HnswBuildStopCheck::should_stop) {
+            return Err(paro_common::error::query_canceled());
+        }
+        for vector in values.chunks_exact(dimension) {
+            let start = lane_row
+                .checked_mul(row_stride_bytes)
+                .ok_or_else(|| paro_common::error::out_of_range("HNSW i16 lane row overflow"))?;
+            let row = &mut output[start..start + row_stride_bytes];
+            if let Some(norms) = inverse_norms.as_deref_mut() {
+                let mut squared_norm = 0.0f32;
+                for ((encoded, &source_dimension), &scale) in row
+                    .chunks_exact_mut(std::mem::size_of::<i16>())
+                    .take(routing_dimensions)
+                    .zip(selected_dimensions.iter())
+                    .zip(scales.iter())
+                {
+                    let quantized = (vector[source_dimension] / scale)
+                        .round()
+                        .clamp(-32_767.0, 32_767.0) as i16;
+                    encoded.copy_from_slice(&quantized.to_le_bytes());
+                    let reconstructed = f32::from(quantized) * scale;
+                    squared_norm += reconstructed * reconstructed;
+                }
+                norms[lane_row] = if squared_norm < f32::EPSILON {
+                    0.0
+                } else {
+                    squared_norm.sqrt().recip()
+                };
+            } else {
+                for ((encoded, &source_dimension), &scale) in row
+                    .chunks_exact_mut(std::mem::size_of::<i16>())
+                    .take(routing_dimensions)
+                    .zip(selected_dimensions.iter())
+                    .zip(scales.iter())
+                {
+                    let quantized = (vector[source_dimension] / scale)
+                        .round()
+                        .clamp(-32_767.0, 32_767.0) as i16;
+                    encoded.copy_from_slice(&quantized.to_le_bytes());
+                }
+            }
+            row[routing_dimensions * std::mem::size_of::<i16>()..].fill(0);
+            lane_row += 1;
+        }
+    }
+    if lane_row != lane.rows {
+        return Err(paro_common::error::data_corrupted(
+            "HNSW i16 build lane cardinality mismatch",
+        ));
+    }
+    Ok(())
+}
+
 impl SymmetricI16BuildVectorStorage {
     fn prepare(
         base: Arc<dyn VectorStorage>,
@@ -562,6 +774,8 @@ impl SymmetricI16BuildVectorStorage {
         build_seed: u64,
         workspace_dir: Option<&Path>,
         stop_check: Option<&super::HnswBuildStopCheck>,
+        pool: Option<&ThreadPool>,
+        parallelism: usize,
     ) -> Result<Arc<dyn VectorStorage>> {
         if stop_check.is_some_and(super::HnswBuildStopCheck::should_stop) {
             return Err(paro_common::error::query_canceled());
@@ -579,30 +793,75 @@ impl SymmetricI16BuildVectorStorage {
         }
         let mut minima = vec![f32::INFINITY; dimension];
         let mut maxima = vec![f32::NEG_INFINITY; dimension];
+        let parallel_lanes = if pool.is_some() && parallelism > 1 {
+            construction_vector_lanes(base.as_ref(), parallelism)?
+        } else {
+            None
+        };
         let sequential_scan = ConstructionSequentialScan::begin(base.as_ref());
-        let extrema_result = base.try_for_each_contiguous_chunk(&mut |values| {
-            if stop_check.is_some_and(super::HnswBuildStopCheck::should_stop) {
-                return Err(paro_common::error::query_canceled());
-            }
-            if values.len() % dimension != 0 {
-                return Err(paro_common::error::data_corrupted(
-                    "HNSW build vector chunk contains a partial row",
-                ));
-            }
-            for vector in values.chunks_exact(dimension) {
-                for (source_dimension, &value) in vector.iter().enumerate() {
-                    if !value.is_finite() {
-                        return Err(paro_common::error::invalid_input(
-                            "symmetric-i16 HNSW construction requires finite vector values",
-                        ));
-                    }
-                    minima[source_dimension] = minima[source_dimension].min(value);
-                    maxima[source_dimension] = maxima[source_dimension].max(value);
+        if let (Some(pool), Some(lanes)) = (pool, parallel_lanes.as_ref()) {
+            let partial_extrema = pool.install(|| {
+                lanes
+                    .par_iter()
+                    .map(|lane| {
+                        let mut lane_minima = vec![f32::INFINITY; dimension];
+                        let mut lane_maxima = vec![f32::NEG_INFINITY; dimension];
+                        for values in &lane.chunks {
+                            if stop_check
+                                .is_some_and(super::HnswBuildStopCheck::should_stop)
+                            {
+                                return Err(paro_common::error::query_canceled());
+                            }
+                            for vector in values.chunks_exact(dimension) {
+                                for (source_dimension, &value) in vector.iter().enumerate() {
+                                    if !value.is_finite() {
+                                        return Err(paro_common::error::invalid_input(
+                                            "symmetric-i16 HNSW construction requires finite vector values",
+                                        ));
+                                    }
+                                    lane_minima[source_dimension] =
+                                        lane_minima[source_dimension].min(value);
+                                    lane_maxima[source_dimension] =
+                                        lane_maxima[source_dimension].max(value);
+                                }
+                            }
+                        }
+                        Ok((lane_minima, lane_maxima))
+                    })
+                    .collect::<Result<Vec<_>>>()
+            })?;
+            for (lane_minima, lane_maxima) in partial_extrema {
+                for source_dimension in 0..dimension {
+                    minima[source_dimension] =
+                        minima[source_dimension].min(lane_minima[source_dimension]);
+                    maxima[source_dimension] =
+                        maxima[source_dimension].max(lane_maxima[source_dimension]);
                 }
             }
-            Ok(())
-        });
-        extrema_result?;
+        } else {
+            base.try_for_each_contiguous_chunk(&mut |values| {
+                if stop_check.is_some_and(super::HnswBuildStopCheck::should_stop) {
+                    return Err(paro_common::error::query_canceled());
+                }
+                if values.len() % dimension != 0 {
+                    return Err(paro_common::error::data_corrupted(
+                        "HNSW build vector chunk contains a partial row",
+                    ));
+                }
+                for vector in values.chunks_exact(dimension) {
+                    for (source_dimension, &value) in vector.iter().enumerate() {
+                        if !value.is_finite() {
+                            return Err(paro_common::error::invalid_input(
+                                "symmetric-i16 HNSW construction requires finite vector values",
+                            ));
+                        }
+                        minima[source_dimension] = minima[source_dimension].min(value);
+                        maxima[source_dimension] = maxima[source_dimension].max(value);
+                    }
+                }
+                Ok(())
+            })?;
+        }
         drop(sequential_scan);
         let selected_dimensions =
             multiscale_routing_dimensions(&minima, &maxima, routing_dimensions, build_seed);
@@ -673,57 +932,82 @@ impl SymmetricI16BuildVectorStorage {
             .map(|_| vec![0.0; base.num_vectors()]);
         let mut encoded_row = 0usize;
         let sequential_scan = ConstructionSequentialScan::begin(base.as_ref());
-        let encode_result = base.try_for_each_contiguous_chunk(&mut |values| {
-            if stop_check.is_some_and(super::HnswBuildStopCheck::should_stop) {
-                return Err(paro_common::error::query_canceled());
+        if let (Some(pool), Some(lanes)) = (pool, parallel_lanes) {
+            let mut output_tail = output;
+            let mut norms_tail = routing_inverse_norms.as_deref_mut();
+            let mut jobs = Vec::with_capacity(lanes.len());
+            for lane in lanes {
+                let lane_bytes = lane.rows.checked_mul(row_stride_bytes).ok_or_else(|| {
+                    paro_common::error::out_of_range("HNSW i16 lane length overflow")
+                })?;
+                let (lane_output, remaining_output) = output_tail.split_at_mut(lane_bytes);
+                output_tail = remaining_output;
+                let lane_norms = if let Some(remaining_norms) = norms_tail.take() {
+                    let (head, tail) = remaining_norms.split_at_mut(lane.rows);
+                    norms_tail = Some(tail);
+                    Some(head)
+                } else {
+                    None
+                };
+                jobs.push((lane, lane_output, lane_norms));
             }
-            if values.len() % dimension != 0 {
-                return Err(paro_common::error::data_corrupted(
-                    "HNSW build vector chunk contains a partial row",
-                ));
-            }
-            for vector in values.chunks_exact(dimension) {
-                let start = encoded_row.checked_mul(row_stride_bytes).ok_or_else(|| {
+            pool.install(|| {
+                jobs.into_par_iter()
+                    .try_for_each(|(lane, lane_output, lane_norms)| {
+                        encode_symmetric_i16_lane(
+                            lane,
+                            lane_output,
+                            lane_norms,
+                            dimension,
+                            routing_dimensions,
+                            row_stride_bytes,
+                            &selected_dimensions,
+                            &scales,
+                            stop_check,
+                        )
+                    })
+            })?;
+            encoded_row = base.num_vectors();
+        } else {
+            base.try_for_each_contiguous_chunk(&mut |values| {
+                if stop_check.is_some_and(super::HnswBuildStopCheck::should_stop) {
+                    return Err(paro_common::error::query_canceled());
+                }
+                if values.len() % dimension != 0 {
+                    return Err(paro_common::error::data_corrupted(
+                        "HNSW build vector chunk contains a partial row",
+                    ));
+                }
+                let lane = ContiguousVectorLane {
+                    chunks: vec![values],
+                    rows: values.len() / dimension,
+                };
+                let lane_start = encoded_row.checked_mul(row_stride_bytes).ok_or_else(|| {
                     paro_common::error::out_of_range("HNSW i16 row offset overflow")
                 })?;
-                let row = &mut output[start..start + row_stride_bytes];
-                if let Some(norms) = routing_inverse_norms.as_mut() {
-                    let mut squared_norm = 0.0f32;
-                    for ((encoded, &source_dimension), &scale) in row
-                        .chunks_exact_mut(std::mem::size_of::<i16>())
-                        .take(routing_dimensions)
-                        .zip(selected_dimensions.iter())
-                        .zip(scales.iter())
-                    {
-                        let value = vector[source_dimension];
-                        let quantized = (value / scale).round().clamp(-32_767.0, 32_767.0) as i16;
-                        encoded.copy_from_slice(&quantized.to_le_bytes());
-                        let reconstructed = f32::from(quantized) * scale;
-                        squared_norm += reconstructed * reconstructed;
-                    }
-                    norms[encoded_row] = if squared_norm < f32::EPSILON {
-                        0.0
-                    } else {
-                        squared_norm.sqrt().recip()
-                    };
-                } else {
-                    for ((encoded, &source_dimension), &scale) in row
-                        .chunks_exact_mut(std::mem::size_of::<i16>())
-                        .take(routing_dimensions)
-                        .zip(selected_dimensions.iter())
-                        .zip(scales.iter())
-                    {
-                        let value = vector[source_dimension];
-                        let quantized = (value / scale).round().clamp(-32_767.0, 32_767.0) as i16;
-                        encoded.copy_from_slice(&quantized.to_le_bytes());
-                    }
-                }
-                row[routing_dimensions * std::mem::size_of::<i16>()..].fill(0);
-                encoded_row += 1;
-            }
-            Ok(())
-        });
-        encode_result?;
+                let lane_end = lane_start
+                    .checked_add(lane.rows * row_stride_bytes)
+                    .ok_or_else(|| {
+                        paro_common::error::out_of_range("HNSW i16 row range overflow")
+                    })?;
+                let lane_norms = routing_inverse_norms
+                    .as_mut()
+                    .map(|norms| &mut norms[encoded_row..encoded_row + lane.rows]);
+                encode_symmetric_i16_lane(
+                    lane,
+                    &mut output[lane_start..lane_end],
+                    lane_norms,
+                    dimension,
+                    routing_dimensions,
+                    row_stride_bytes,
+                    &selected_dimensions,
+                    &scales,
+                    stop_check,
+                )?;
+                encoded_row += values.len() / dimension;
+                Ok(())
+            })?;
+        }
         drop(sequential_scan);
         if encoded_row != base.num_vectors() {
             return Err(paro_common::error::data_corrupted(format!(
@@ -847,6 +1131,10 @@ impl VectorStorage for SymmetricI16BuildVectorStorage {
         self.base.contiguous_vectors()
     }
 
+    fn contiguous_vector_chunks(&self) -> Option<Vec<&[f32]>> {
+        self.base.contiguous_vector_chunks()
+    }
+
     fn try_for_each_contiguous_chunk(
         &self,
         visitor: &mut dyn FnMut(&[f32]) -> Result<()>,
@@ -931,9 +1219,29 @@ pub(crate) fn prepare_build_vector_storage(
     workspace_dir: Option<&Path>,
     stop_check: Option<&super::HnswBuildStopCheck>,
 ) -> Result<Arc<dyn VectorStorage>> {
+    prepare_build_vector_storage_with_parallelism(
+        base,
+        encoding,
+        build_seed,
+        workspace_dir,
+        stop_check,
+        None,
+        1,
+    )
+}
+
+pub(crate) fn prepare_build_vector_storage_with_parallelism(
+    base: Arc<dyn VectorStorage>,
+    encoding: super::HnswBuildVectorEncoding,
+    build_seed: u64,
+    workspace_dir: Option<&Path>,
+    stop_check: Option<&super::HnswBuildStopCheck>,
+    pool: Option<&ThreadPool>,
+    parallelism: usize,
+) -> Result<Arc<dyn VectorStorage>> {
     match encoding {
         super::HnswBuildVectorEncoding::ExactF32 => {
-            ExactF32BuildVectorStorage::prepare(base, workspace_dir, stop_check)
+            ExactF32BuildVectorStorage::prepare(base, workspace_dir, stop_check, pool, parallelism)
         }
         super::HnswBuildVectorEncoding::SymmetricI16 { routing_dimensions } => {
             SymmetricI16BuildVectorStorage::prepare(
@@ -942,6 +1250,8 @@ pub(crate) fn prepare_build_vector_storage(
                 build_seed,
                 workspace_dir,
                 stop_check,
+                pool,
+                parallelism,
             )
         }
     }
@@ -1631,6 +1941,10 @@ impl VectorStorage for IndexedVectorStorage {
         self.base.contiguous_vectors()
     }
 
+    fn contiguous_vector_chunks(&self) -> Option<Vec<&[f32]>> {
+        self.base.contiguous_vector_chunks()
+    }
+
     fn try_for_each_contiguous_chunk(
         &self,
         visitor: &mut dyn FnMut(&[f32]) -> Result<()>,
@@ -2083,6 +2397,14 @@ impl VectorStorage for PartitionedVectorStorage {
         self.dim
     }
 
+    fn contiguous_vector_chunks(&self) -> Option<Vec<&[f32]>> {
+        let mut chunks = Vec::new();
+        for part in &self.parts {
+            chunks.extend(part.storage.contiguous_vector_chunks()?);
+        }
+        Some(chunks)
+    }
+
     fn try_for_each_contiguous_chunk(
         &self,
         visitor: &mut dyn FnMut(&[f32]) -> Result<()>,
@@ -2354,6 +2676,93 @@ mod tests {
         assert_eq!(storage.get_vector(1), &[3.0, 4.0]);
         assert_eq!(storage.get_vector(2), &[5.0, 6.0]);
         assert_eq!(storage.get_vector(4), &[9.0, 10.0]);
+    }
+
+    #[test]
+    fn parallel_build_preparation_is_byte_deterministic_across_partition_boundaries() {
+        fn input() -> Arc<dyn VectorStorage> {
+            let first: Arc<dyn VectorStorage> = Arc::new(InMemoryVectorStorage::new(
+                vec![0.25, -1.0, 2.0, 3.0, 4.0, -5.0],
+                3,
+            ));
+            let second: Arc<dyn VectorStorage> = Arc::new(InMemoryVectorStorage::new(
+                vec![6.0, 7.0, 8.0, -9.0, 10.0, 11.0, 12.0, -13.0, 14.0],
+                3,
+            ));
+            let third: Arc<dyn VectorStorage> = Arc::new(InMemoryVectorStorage::new(
+                vec![
+                    15.0, 16.0, -17.0, 18.0, 19.0, 20.0, -21.0, 22.0, 23.0, 24.0, -25.0, 26.0,
+                ],
+                3,
+            ));
+            Arc::new(PartitionedVectorStorage::try_new(vec![first, second, third], 3).unwrap())
+        }
+
+        let pool = rayon::ThreadPoolBuilder::new()
+            .num_threads(5)
+            .build()
+            .unwrap();
+        for encoding in [
+            super::super::HnswBuildVectorEncoding::ExactF32,
+            super::super::HnswBuildVectorEncoding::symmetric_i16(3).unwrap(),
+        ] {
+            let serial_workspace = tempfile::tempdir().unwrap();
+            let parallel_workspace = tempfile::tempdir().unwrap();
+            let serial = prepare_build_vector_storage(
+                input(),
+                encoding,
+                41,
+                Some(serial_workspace.path()),
+                None,
+            )
+            .unwrap();
+            let parallel = prepare_build_vector_storage_with_parallelism(
+                input(),
+                encoding,
+                41,
+                Some(parallel_workspace.path()),
+                None,
+                Some(&pool),
+                5,
+            )
+            .unwrap();
+
+            match encoding {
+                super::super::HnswBuildVectorEncoding::ExactF32 => {
+                    let serial_bits = serial
+                        .contiguous_vectors()
+                        .unwrap()
+                        .iter()
+                        .map(|value| value.to_bits())
+                        .collect::<Vec<_>>();
+                    let parallel_bits = parallel
+                        .contiguous_vectors()
+                        .unwrap()
+                        .iter()
+                        .map(|value| value.to_bits())
+                        .collect::<Vec<_>>();
+                    assert_eq!(parallel_bits, serial_bits);
+                }
+                super::super::HnswBuildVectorEncoding::SymmetricI16 { .. } => {
+                    let serial = serial.i16_routing_view().unwrap();
+                    let parallel = parallel.i16_routing_view().unwrap();
+                    assert_eq!(parallel.codes, serial.codes);
+                    assert_eq!(parallel.selected_dimensions, serial.selected_dimensions);
+                    assert_eq!(
+                        parallel
+                            .scales
+                            .iter()
+                            .map(|value| value.to_bits())
+                            .collect::<Vec<_>>(),
+                        serial
+                            .scales
+                            .iter()
+                            .map(|value| value.to_bits())
+                            .collect::<Vec<_>>()
+                    );
+                }
+            }
+        }
     }
 
     #[test]

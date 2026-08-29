@@ -20,9 +20,9 @@ use super::predicate_scan::{
 };
 use super::search_context::ScanTopK;
 use super::vector_storage::{
-    prepare_build_vector_storage, ArtifactVectorStorage, CosineInverseNorms, I16BuildBacking,
-    IndexedVectorStorage, PointRemappedBuildVectorStorage, SymmetricI16BuildVectorStorage,
-    VectorStorage,
+    prepare_build_vector_storage_with_parallelism, ArtifactVectorStorage, CosineInverseNorms,
+    I16BuildBacking, IndexedVectorStorage, PointRemappedBuildVectorStorage,
+    SymmetricI16BuildVectorStorage, VectorStorage,
 };
 use super::{
     BatchScorer, DistanceMetric, GraphLayersBuilder, GraphVectorScorer, HnswBuildContract,
@@ -1287,6 +1287,7 @@ impl HnswIndex {
             filter_blocks,
             pool,
             parallelism,
+            parallelism,
             stop_check,
             workspace_dir,
         )
@@ -1298,6 +1299,7 @@ impl HnswIndex {
         filter_blocks: HnswFilterBlocks,
         pool: Option<&rayon::ThreadPool>,
         parallelism: usize,
+        preparation_parallelism: usize,
         stop_check: Option<&HnswBuildStopCheck>,
         workspace_dir: Option<&Path>,
     ) -> Result<Self> {
@@ -1309,12 +1311,14 @@ impl HnswIndex {
         }
         let distance = build_contract.distance;
         let storage = IndexedVectorStorage::prepare(storage, distance);
-        let storage = prepare_build_vector_storage(
+        let storage = prepare_build_vector_storage_with_parallelism(
             storage,
             build_contract.vector_encoding,
             build_contract.build_seed,
             workspace_dir,
             stop_check,
+            pool,
+            preparation_parallelism,
         )?;
         Self::build_prepared_with_controls_and_filter_blocks(
             storage,
@@ -4240,6 +4244,7 @@ mod tests {
                     contract,
                     HnswFilterBlocks::default(),
                     Some(&shared_pool),
+                    parallelism,
                     parallelism,
                     None,
                     None,
