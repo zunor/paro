@@ -194,6 +194,16 @@ impl TableHandle {
         self.search_registry.materialize_definition(definition_id)
     }
 
+    /// Bring one catalog-owned search generation to the current table version
+    /// without compacting immutable table data.
+    pub fn materialize_search_generation_by_name(
+        &self,
+        definition_name: &str,
+    ) -> Result<SearchGenerationCoverage> {
+        self.search_registry
+            .materialize_catalog_definition_by_name(definition_name)
+    }
+
     pub fn bootstrap_search_generations(&self) -> Result<SearchBootstrapReport> {
         self.search_registry.bootstrap_migration()
     }

@@ -6,7 +6,10 @@ use crate::result::sink::ResultSink;
 use crate::Session;
 use paro_common::error::{self as paro_error, Result};
 use paro_common::logging::targets;
-use paro_parser::ast::{CompactTarget, OptimizeTableAction, OptimizeTableStmt};
+use paro_parser::ast::{
+    CompactTarget, Identifier, IndexKind, OptimizeTableAction, OptimizeTableStmt,
+    RefreshIndexOnTableStmt,
+};
 use paro_storage::table::table_handle::TableHandle;
 use std::sync::Arc;
 
@@ -82,8 +85,67 @@ pub(crate) async fn execute_optimize_table<S: ResultSink>(
     Ok(())
 }
 
+pub(crate) async fn execute_refresh_index_on_table<S: ResultSink>(
+    session: &mut Session,
+    stmt: &RefreshIndexOnTableStmt,
+    sink: &mut S,
+) -> Result<()> {
+    if session.has_active_transaction() && !session.is_auto_commit() {
+        return Err(paro_error::invalid_transaction_state(
+            "REFRESH VECTOR INDEX cannot run inside a transaction block",
+        ));
+    }
+    if stmt.index_kind != IndexKind::Vector {
+        return Err(paro_error::not_supported(
+            "only REFRESH VECTOR INDEX is implemented for table indexes",
+        ));
+    }
+    if stmt.limit.is_some() {
+        return Err(paro_error::invalid_parameter(
+            "REFRESH VECTOR INDEX does not accept LIMIT",
+        ));
+    }
+
+    let table = resolve_named_table(
+        session,
+        stmt.database.as_ref(),
+        stmt.schema.as_ref(),
+        &stmt.table,
+    )?;
+    let index_name = stmt.index_name.name.clone();
+    let log_index_name = index_name.clone();
+    tokio::task::spawn_blocking(move || table.materialize_search_generation_by_name(&index_name))
+        .await
+        .map_err(|error| {
+            paro_error::internal(format!("REFRESH VECTOR INDEX worker failed: {error}"))
+        })??;
+    tracing::info!(
+        target: targets::STORAGE,
+        session_id = session.id,
+        index = %log_index_name,
+        "REFRESH VECTOR INDEX completed"
+    );
+    sink.finish_result(&StatementCompletion::Custom("REFRESH INDEX".to_string()))
+        .await?;
+    Ok(())
+}
+
 fn resolve_table(session: &Session, stmt: &OptimizeTableStmt) -> Result<Arc<TableHandle>> {
-    if let Some(database) = stmt.database.as_ref() {
+    resolve_named_table(
+        session,
+        stmt.database.as_ref(),
+        stmt.schema.as_ref(),
+        &stmt.table,
+    )
+}
+
+fn resolve_named_table(
+    session: &Session,
+    database: Option<&Identifier>,
+    schema: Option<&Identifier>,
+    table: &Identifier,
+) -> Result<Arc<TableHandle>> {
+    if let Some(database) = database {
         if !database
             .name
             .eq_ignore_ascii_case(session.current_database.name())
@@ -95,8 +157,8 @@ fn resolve_table(session: &Session, stmt: &OptimizeTableStmt) -> Result<Arc<Tabl
     }
 
     let snapshot = session.catalog_txn_view();
-    let table_name = &stmt.table.name;
-    let entry = if let Some(schema) = stmt.schema.as_ref() {
+    let table_name = &table.name;
+    let entry = if let Some(schema) = schema {
         session
             .current_database
             .catalog()

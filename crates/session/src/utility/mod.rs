@@ -34,6 +34,9 @@ pub(crate) async fn execute_utility_command<S: ResultSink>(
         UtilityCommand::OptimizeTable(stmt) => {
             maintenance::execute_optimize_table(session, &stmt, sink).await
         }
+        UtilityCommand::RefreshIndexOnTable(stmt) => {
+            maintenance::execute_refresh_index_on_table(session, &stmt, sink).await
+        }
         UtilityCommand::CreateDatabase(stmt) => {
             database_ddl::execute_create_database(session, &stmt, sink).await
         }

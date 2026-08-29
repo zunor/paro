@@ -1302,6 +1302,38 @@ impl SearchIndexRegistry {
         Ok(previous)
     }
 
+    /// Materialize one catalog-owned search definition by its durable name.
+    /// Search generations and rowset compaction are independent physical
+    /// lifecycles, so REFRESH VECTOR INDEX never rewrites base table data.
+    pub(crate) fn materialize_catalog_definition_by_name(
+        &self,
+        definition_name: &str,
+    ) -> Result<SearchGenerationCoverage> {
+        self.ensure_fresh();
+        let definition_ids = self
+            .view
+            .load()
+            .definitions
+            .iter()
+            .filter_map(|(definition_id, state)| {
+                (state.origin.is_catalog_index() && state.definition.name == definition_name)
+                    .then_some(*definition_id)
+            })
+            .collect::<Vec<_>>();
+        let [definition_id] = definition_ids.as_slice() else {
+            return match definition_ids.len() {
+                0 => Err(paro_error::object_not_found(
+                    "search index",
+                    definition_name,
+                )),
+                count => Err(paro_error::data_corrupted(format!(
+                    "catalog search index {definition_name} resolves to {count} definitions"
+                ))),
+            };
+        };
+        self.materialize_definition(*definition_id)
+    }
+
     pub(crate) fn catch_up_definition(&self, definition_id: u64) -> Result<usize> {
         self.catch_up_definition_with_mode(definition_id, false)
     }
@@ -5979,7 +6011,10 @@ mod tests {
             .expect("coverage before materialization")
             .is_complete());
 
-        let coverage = table.search_registry().materialize_definition(49).unwrap();
+        let coverage = table
+            .search_registry()
+            .materialize_catalog_definition_by_name("docs_fts_materialized")
+            .unwrap();
         assert!(coverage.is_complete());
         assert_eq!(
             coverage.indexed_segment_count,
