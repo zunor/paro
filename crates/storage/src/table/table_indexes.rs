@@ -225,27 +225,19 @@ impl TableHandle {
     /// catch-up, manifest compaction, and sidecar repacking share the search
     /// scheduler's admission policy while table compaction remains owned by
     /// the compaction manager.
-    pub fn search_derived_maintenance_sweep(&self) -> Result<SearchMaintenanceReport> {
-        let mut report = self.search_registry.maintenance_sweep()?;
+    pub fn run_search_maintenance_pass(&self) -> Result<SearchMaintenanceReport> {
+        let mut report = self.search_registry.run_maintenance_pass()?;
         if report.manifest_delta_compaction_requested
             && self.search_registry.compact_manifest_deltas()? > 0
         {
-            self.search_registry.ensure_fresh();
-            report = self.search_registry.maintenance_sweep()?;
+            self.search_registry.refresh_all_definitions();
+            report = self.search_registry.run_maintenance_pass()?;
         }
         if report.sidecar_repack_requested {
-            self.search_registry.ensure_fresh();
-            report = self.search_registry.maintenance_sweep()?;
+            self.search_registry.refresh_all_definitions();
+            report = self.search_registry.run_maintenance_pass()?;
         }
         Ok(report)
-    }
-
-    pub fn search_maintenance_sweep(&self) -> Result<SearchMaintenanceReport> {
-        // Search artifact GC and base-table rowset compaction are independent
-        // lifecycle domains. A large or fragmented graph must be coalesced in
-        // its generation without rewriting immutable table data; the table
-        // compaction manager owns rowset layout changes separately.
-        self.search_derived_maintenance_sweep()
     }
 
     pub fn vector_capability(

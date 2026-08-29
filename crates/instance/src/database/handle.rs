@@ -1397,7 +1397,7 @@ impl DatabaseHandle {
                 let Some(storage) = table.get_storage() else {
                     continue;
                 };
-                match storage.search_derived_maintenance_sweep() {
+                match storage.run_search_maintenance_pass() {
                     Ok(report) => {
                         pass.more_work |= report.has_pending_work();
                         pass.immediate |= report.requires_immediate_follow_up();

@@ -260,9 +260,9 @@ impl TableHandle {
         // Physical publication normally installs one directly usable search
         // artifact for the output rowset. Run provider maintenance to drain a
         // remaining tail or manifest delta before reporting the explicit
-        // optimization complete; each sweep is one fair definition quantum.
+        // optimization complete; each pass is one fair definition quantum.
         loop {
-            let report = self.search_derived_maintenance_sweep()?;
+            let report = self.run_search_maintenance_pass()?;
             if !report.has_pending_work() {
                 return Ok(completed);
             }

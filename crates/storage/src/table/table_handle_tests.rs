@@ -2614,7 +2614,7 @@ fn fulltext_capability_exposes_generation_level_provider_stats() {
 }
 
 #[test]
-fn search_maintenance_sweep_reports_tombstone_pressure() {
+fn search_maintenance_pass_reports_tombstone_pressure() {
     let table = create_table(&[LogicalType::Integer, LogicalType::Varchar]);
     register_fulltext_definition(&table, 1, "simple");
 
@@ -2633,7 +2633,7 @@ fn search_maintenance_sweep_reports_tombstone_pressure() {
         .delete_direct(&read_view(&table), &[row_ids[&2]])
         .unwrap();
 
-    let report = table.search_maintenance_sweep().unwrap();
+    let report = table.run_search_maintenance_pass().unwrap();
     assert!(report.compaction_requested);
     assert!(report.definitions.iter().any(|definition| {
         matches!(definition.action, SearchMaintenanceAction::Rebuild)
