@@ -91,6 +91,7 @@ impl VectorScanCostModel {
     /// row-set workload with the graph passes implied by deferred admission.
     pub fn estimate_hnsw_cost(
         stats: &HnswIndexStatistics,
+        graph_shards: usize,
         k: usize,
         filter_selectivity: f64,
         options: HnswQueryOptions,
@@ -105,6 +106,8 @@ impl VectorScanCostModel {
         } else {
             n
         };
+        let graph_shards = graph_shards.max(1);
+        let rows_per_shard = stats.num_indexed_vectors.max(1).div_ceil(graph_shards);
         let log_n = n.ln().max(1.0);
         let widths = policy.effective_widths(k, options.ef, options.rerank_window);
         let effective_ef = widths.ef;
@@ -136,14 +139,15 @@ impl VectorScanCostModel {
             f64::from(policy.distance_cost.sequential_dimension_cost_units.max(1))
                 / canonical_random_score_units;
         let graph_cost = HnswDistanceCostModel::graph_work(
-            stats.num_indexed_vectors as u64,
+            rows_per_shard as u64,
             effective_ef,
             widths.rerank_window,
             vector_dimension,
             policy.vector_encoding,
             policy.distance_cost,
         ) as f64
-            / canonical_random_score_units;
+            / canonical_random_score_units
+            * graph_shards as f64;
         let bitmap_cost = match filter_materialization {
             None => 0.0,
             Some(ExactFilterMaterialization::ScalarIndex) => {
@@ -181,8 +185,8 @@ impl VectorScanCostModel {
 
         if filtered {
             let decision = estimate_filtered_search_strategy(
-                candidate_rows as u64,
-                stats.num_indexed_vectors as u64,
+                (candidate_rows as u64).div_ceil(graph_shards as u64),
+                rows_per_shard as u64,
                 k,
                 effective_ef,
                 vector_dimension,
@@ -335,6 +339,7 @@ mod tests {
         };
         let cost = VectorScanCostModel::estimate_hnsw_cost(
             &hnsw_stats(20_000, 100),
+            1,
             10,
             0.001,
             hnsw_options(40),
@@ -362,6 +367,7 @@ mod tests {
         let stats = hnsw_stats(1_000_000, 128);
         let unfiltered = VectorScanCostModel::estimate_hnsw_cost(
             &stats,
+            1,
             10,
             1.0,
             hnsw_options(40),
@@ -370,6 +376,7 @@ mod tests {
         );
         let filtered = VectorScanCostModel::estimate_hnsw_cost(
             &stats,
+            1,
             10,
             0.75,
             hnsw_options(40),
@@ -389,6 +396,7 @@ mod tests {
         let stats = hnsw_stats(1_000_000, 128);
         let postings = VectorScanCostModel::estimate_hnsw_cost(
             &stats,
+            1,
             10,
             0.01,
             hnsw_options(80),
@@ -397,6 +405,7 @@ mod tests {
         );
         let scan = VectorScanCostModel::estimate_hnsw_cost(
             &stats,
+            1,
             10,
             0.01,
             hnsw_options(80),
@@ -426,6 +435,7 @@ mod tests {
         let stats = hnsw_stats(1_000_000, 128);
         let at_threshold = VectorScanCostModel::estimate_hnsw_cost(
             &stats,
+            1,
             10,
             20_000.0 / 1_000_000.0,
             hnsw_options(160),
@@ -434,6 +444,7 @@ mod tests {
         );
         let above_threshold = VectorScanCostModel::estimate_hnsw_cost(
             &stats,
+            1,
             10,
             20_001.0 / 1_000_000.0,
             hnsw_options(160),
@@ -451,6 +462,7 @@ mod tests {
         };
         let low = VectorScanCostModel::estimate_hnsw_cost(
             &hnsw_stats(10_000_000, 128),
+            1,
             10,
             1.0,
             hnsw_options(80),
@@ -459,6 +471,7 @@ mod tests {
         );
         let high = VectorScanCostModel::estimate_hnsw_cost(
             &hnsw_stats(10_000_000, 128),
+            1,
             10,
             1.0,
             hnsw_options(320),
@@ -469,11 +482,40 @@ mod tests {
     }
 
     #[test]
+    fn graph_cost_accounts_for_generation_shard_fanout() {
+        let policy = HnswSearchPolicy {
+            ef_search: 320,
+            ..HnswSearchPolicy::default()
+        };
+        let stats = hnsw_stats(10_000_000, 128);
+        let one = VectorScanCostModel::estimate_hnsw_cost(
+            &stats,
+            1,
+            10,
+            1.0,
+            hnsw_options(320),
+            policy,
+            None,
+        );
+        let five = VectorScanCostModel::estimate_hnsw_cost(
+            &stats,
+            5,
+            10,
+            1.0,
+            hnsw_options(320),
+            policy,
+            None,
+        );
+        assert!(five > one * 4.0, "one={one}, five={five}");
+    }
+
+    #[test]
     fn exact_objective_costs_the_exact_path_instead_of_the_graph_minimum() {
         let stats = hnsw_stats(10_000_000, 32);
         let policy = HnswSearchPolicy::default();
         let approximate = VectorScanCostModel::estimate_hnsw_cost(
             &stats,
+            1,
             10,
             0.5,
             hnsw_options(160),
@@ -482,6 +524,7 @@ mod tests {
         );
         let exact = VectorScanCostModel::estimate_hnsw_cost(
             &stats,
+            1,
             10,
             0.5,
             HnswQueryOptions {

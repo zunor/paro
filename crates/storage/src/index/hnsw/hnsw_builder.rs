@@ -4,6 +4,7 @@
 use super::{HnswBuildContract, HnswFilterBlocks, HnswIndex, VectorStorage};
 use paro_common::error::{self as paro_error, Result};
 use rayon::ThreadPool;
+use std::cell::Cell;
 use std::fmt;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -17,23 +18,32 @@ use std::time::{Duration, Instant};
 /// wave membership or durable topology. The frozen-wave builder is required
 /// to produce identical bytes for every granted width.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum HnswMaintenanceBuildPriority {
+    #[default]
+    Opportunistic,
+    Elevated,
+    Critical,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum HnswBuildExecutionPolicy {
     /// User-requested index construction may consume the complete shared pool.
     #[default]
     Foreground,
     /// Background catch-up and generation compaction preserve foreground CPU.
-    Maintenance,
+    Maintenance(HnswMaintenanceBuildPriority),
 }
 
 impl HnswBuildExecutionPolicy {
     fn granted_parallelism(self, pool_width: usize) -> usize {
         match self {
             Self::Foreground => pool_width.max(1),
-            // A maintenance build must make progress without monopolizing the
-            // process. Reserve half of the shared pool for foreground work;
-            // no private pool or extra OS thread is made. This also keeps a
-            // large catch-up inside the bounded-lag maintenance envelope.
-            Self::Maintenance => pool_width.div_ceil(2).max(1),
+            // An idle process should retire freshness debt at full speed.
+            // Foreground reservations are applied dynamically at immutable
+            // proposal-wave barriers below; imposing a permanent half-width
+            // cap makes sustained ingest converge at only half the builder's
+            // service rate even when no query exists.
+            Self::Maintenance(_) => pool_width.max(1),
         }
     }
 
@@ -45,7 +55,21 @@ impl HnswBuildExecutionPolicy {
             // Keep maintenance preparation preemptible by making those passes
             // serial; foreground CREATE INDEX may use the complete shared
             // pool. Graph construction remains dynamically governed per wave.
-            Self::Maintenance => 1,
+            Self::Maintenance(_) => 1,
+        }
+    }
+
+    fn parallelism_under_foreground_pressure(self, granted: usize) -> usize {
+        match self {
+            Self::Foreground => granted.max(1),
+            Self::Maintenance(HnswMaintenanceBuildPriority::Opportunistic) => 1,
+            // Once freshness debt is visible in the durable generation
+            // state, maintenance must retain enough service to converge under
+            // sustained reads. Otherwise exact-tail work makes queries slow,
+            // the reads keep the builder at one lane, and the tail can never
+            // drain: a priority inversion rather than resource governance.
+            Self::Maintenance(HnswMaintenanceBuildPriority::Elevated) => granted.div_ceil(3).max(1),
+            Self::Maintenance(HnswMaintenanceBuildPriority::Critical) => granted.div_ceil(2).max(1),
         }
     }
 }
@@ -61,8 +85,15 @@ static HNSW_ACTIVE_FOREGROUND_QUERIES: AtomicUsize = AtomicUsize::new(0);
 static HNSW_SCHEDULER_EPOCH: OnceLock<Instant> = OnceLock::new();
 static HNSW_FOREGROUND_PRESSURE_UNTIL_MICROS: std::sync::atomic::AtomicU64 =
     std::sync::atomic::AtomicU64::new(0);
-static HNSW_ACTIVE_MAINTENANCE_BUILDS: AtomicUsize = AtomicUsize::new(0);
-const HNSW_MAINTENANCE_FOREGROUND_WORKERS: usize = 1;
+thread_local! {
+    /// Build policy belongs to the admitted build, not to the process. A
+    /// process-global "some maintenance exists" bit incorrectly throttles an
+    /// unrelated foreground CREATE INDEX and cannot distinguish backlog
+    /// urgency. The proposal-wave coordinator reads this value before it
+    /// publishes work to the shared Rayon pool.
+    static HNSW_ACTIVE_BUILD_POLICY: Cell<HnswBuildExecutionPolicy> =
+        const { Cell::new(HnswBuildExecutionPolicy::Foreground) };
+}
 /// Hold the foreground reservation across protocol, planning, and artifact
 /// fan-out gaps between consecutive queries. Maintenance still receives one
 /// lane, so sustained read traffic bounds interference without starving
@@ -129,29 +160,30 @@ impl Drop for HnswForegroundQueryGuard {
     }
 }
 
-struct HnswMaintenanceBuildGuard;
+struct HnswBuildExecutionGuard {
+    previous: HnswBuildExecutionPolicy,
+}
 
-impl HnswMaintenanceBuildGuard {
-    fn enter(policy: HnswBuildExecutionPolicy) -> Option<Self> {
-        (policy == HnswBuildExecutionPolicy::Maintenance).then(|| {
-            HNSW_ACTIVE_MAINTENANCE_BUILDS.fetch_add(1, Ordering::AcqRel);
-            Self
-        })
+impl HnswBuildExecutionGuard {
+    fn enter(policy: HnswBuildExecutionPolicy) -> Self {
+        let previous = HNSW_ACTIVE_BUILD_POLICY.replace(policy);
+        Self { previous }
     }
 }
 
-impl Drop for HnswMaintenanceBuildGuard {
+impl Drop for HnswBuildExecutionGuard {
     fn drop(&mut self) {
-        HNSW_ACTIVE_MAINTENANCE_BUILDS.fetch_sub(1, Ordering::AcqRel);
+        HNSW_ACTIVE_BUILD_POLICY.set(self.previous);
     }
 }
 
 pub(crate) fn hnsw_current_build_parallelism(granted: usize) -> usize {
-    if HNSW_ACTIVE_MAINTENANCE_BUILDS.load(Ordering::Acquire) != 0 && foreground_pressure_active() {
-        granted.clamp(1, HNSW_MAINTENANCE_FOREGROUND_WORKERS)
-    } else {
-        granted.max(1)
+    if !foreground_pressure_active() {
+        return granted.max(1);
     }
+    HNSW_ACTIVE_BUILD_POLICY
+        .get()
+        .parallelism_under_foreground_pressure(granted)
 }
 
 fn create_build_pool(threads: usize) -> std::result::Result<HnswBuildPool, String> {
@@ -296,7 +328,7 @@ impl HnswBuilder {
         build_contract: HnswBuildContract,
     ) -> Result<HnswIndex> {
         let (pool, pool_width) = hnsw_build_pool()?;
-        let _maintenance_guard = HnswMaintenanceBuildGuard::enter(self.execution_policy);
+        let _execution_guard = HnswBuildExecutionGuard::enter(self.execution_policy);
         HnswIndex::build_with_controls_and_filter_blocks_in_workspace_with_parallelism(
             storage,
             build_contract,
@@ -316,7 +348,7 @@ impl HnswBuilder {
         filter_blocks: HnswFilterBlocks,
     ) -> Result<HnswIndex> {
         let (pool, pool_width) = hnsw_build_pool()?;
-        let _maintenance_guard = HnswMaintenanceBuildGuard::enter(self.execution_policy);
+        let _execution_guard = HnswBuildExecutionGuard::enter(self.execution_policy);
         HnswIndex::build_with_controls_and_filter_blocks_in_workspace_with_parallelism(
             storage,
             build_contract,
@@ -339,14 +371,33 @@ mod tests {
     #[test]
     #[serial_test::serial]
     fn maintenance_parallelism_holds_foreground_reservation_across_query_gaps() {
-        let maintenance =
-            HnswMaintenanceBuildGuard::enter(HnswBuildExecutionPolicy::Maintenance).unwrap();
+        let maintenance = HnswBuildExecutionGuard::enter(HnswBuildExecutionPolicy::Maintenance(
+            HnswMaintenanceBuildPriority::Opportunistic,
+        ));
         {
             let _query = HnswForegroundQueryGuard::enter();
             assert_eq!(hnsw_current_build_parallelism(8), 1);
         }
         assert_eq!(hnsw_current_build_parallelism(8), 1);
         drop(maintenance);
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn urgent_maintenance_retains_progress_under_sustained_queries() {
+        let _query = HnswForegroundQueryGuard::enter();
+        {
+            let _maintenance = HnswBuildExecutionGuard::enter(
+                HnswBuildExecutionPolicy::Maintenance(HnswMaintenanceBuildPriority::Elevated),
+            );
+            assert_eq!(hnsw_current_build_parallelism(10), 4);
+        }
+        {
+            let _maintenance = HnswBuildExecutionGuard::enter(
+                HnswBuildExecutionPolicy::Maintenance(HnswMaintenanceBuildPriority::Critical),
+            );
+            assert_eq!(hnsw_current_build_parallelism(10), 5);
+        }
     }
 
     #[test]

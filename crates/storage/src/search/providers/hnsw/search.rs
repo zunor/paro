@@ -1,7 +1,7 @@
 // Copyright 2024-2026 Zunor
 // SPDX-License-Identifier: Apache-2.0
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Instant;
 
@@ -28,7 +28,8 @@ use crate::search::cursor::{
 };
 use crate::search::row_fetch::snapshot_epoch;
 use crate::search::segment_dispatch::{
-    dispatch_segments, map_search_tasks, map_segments, SegmentDispatchResult,
+    acquire_search_dispatch_lanes, dispatch_segment_indices, map_search_tasks, map_segments,
+    SegmentDispatchResult,
 };
 use crate::search::sidecar::{
     DecodedSidecarReaderRequest, SearchReaderRuntime, SidecarIntegrityPolicy, SidecarReaderRequest,
@@ -236,28 +237,41 @@ impl VectorSearchCursor {
         // boundary. Both singleton and generation-owned partition artifacts
         // borrow the same proof objects, so changing the physical partition
         // envelope cannot change predicate semantics.
-        let prepared_filters = map_segments(
-            visible_segments,
-            parallelism_slots,
-            |(_, segment)| -> Result<PreparedSegmentFilter> {
-                let row_set = segment
-                    .segment
-                    .build_hnsw_filter_with_epoch(snapshot_version, predicate)?;
-                if predicate.is_some() && row_set.is_none() {
-                    return Err(paro_error::internal(
-                        "filtered vector search did not prepare an exact segment row set",
-                    ));
-                }
-                let reservation = row_set
-                    .as_ref()
-                    .map(|row_set| budget.try_reserve_memory(row_set.query_retained_bytes()))
-                    .transpose()?;
-                Ok(PreparedSegmentFilter {
-                    row_set,
-                    _reservation: reservation,
+        let requires_segment_filters = predicate.is_some()
+            || visible_segments
+                .iter()
+                .any(|segment| segment.has_persistent_deletes);
+        let prepared_filters = if requires_segment_filters {
+            map_segments(
+                visible_segments,
+                parallelism_slots,
+                |(_, segment)| -> Result<PreparedSegmentFilter> {
+                    let row_set = segment
+                        .segment
+                        .build_hnsw_filter_with_epoch(snapshot_version, predicate)?;
+                    if predicate.is_some() && row_set.is_none() {
+                        return Err(paro_error::internal(
+                            "filtered vector search did not prepare an exact segment row set",
+                        ));
+                    }
+                    let reservation = row_set
+                        .as_ref()
+                        .map(|row_set| budget.try_reserve_memory(row_set.query_retained_bytes()))
+                        .transpose()?;
+                    Ok(PreparedSegmentFilter {
+                        row_set,
+                        _reservation: reservation,
+                    })
+                },
+            )?
+        } else {
+            (0..visible_segments.len())
+                .map(|_| PreparedSegmentFilter {
+                    row_set: None,
+                    _reservation: None,
                 })
-            },
-        )?;
+                .collect()
+        };
         let predicate_matching_rows = predicate.map(|_| {
             prepared_filters.iter().fold(0u64, |rows, filter| {
                 rows.saturating_add(filter.row_set.as_ref().map_or(0, |row_set| row_set.len()))
@@ -281,7 +295,7 @@ impl VectorSearchCursor {
                     index,
                 )
             })
-            .collect::<BTreeMap<_, _>>();
+            .collect::<HashMap<_, _>>();
         let mut partition_artifacts = Vec::<(&SearchArtifactRef, Arc<HnswIndex>)>::new();
         for artifact in &self.snapshot.generation.artifacts.artifacts {
             if artifact.kind != SearchIndexKind::Hnsw
@@ -334,27 +348,37 @@ impl VectorSearchCursor {
             }
             partition_artifacts.push((artifact, index));
         }
-        let partition_segments = partition_artifacts
+        let mut covered_segments = vec![false; visible_segments.len()];
+        for (artifact, _) in &partition_artifacts {
+            for span in artifact.coverage.segments() {
+                let visible_index = visible_by_ref.get(&span.segment).ok_or_else(|| {
+                    paro_error::data_corrupted(
+                        "HNSW artifact coverage references a missing segment",
+                    )
+                })?;
+                covered_segments[*visible_index] = true;
+            }
+        }
+        let tail_segment_indices = covered_segments
             .iter()
-            .flat_map(|(artifact, _)| artifact.coverage.segments().iter().map(|span| span.segment))
-            .collect::<BTreeSet<_>>();
+            .enumerate()
+            .filter_map(|(index, covered)| (!covered).then_some(index))
+            .collect::<Vec<_>>();
+        let search_lease = acquire_search_dispatch_lanes(
+            search_parallelism_slots,
+            tail_segment_indices
+                .len()
+                .saturating_add(partition_artifacts.len()),
+        )?;
+        let admitted_search_lanes = search_lease.lanes();
 
-        let per_segment = dispatch_segments(
+        let per_segment = dispatch_segment_indices(
             SearchIndexKind::Hnsw,
             visible_segments,
-            search_parallelism_slots,
+            &tail_segment_indices,
+            admitted_search_lanes,
             self.telemetry.as_ref(),
             |index, segment| {
-                if partition_segments.contains(&ArtifactSegmentRef {
-                    rowset_id: segment.rowset_id,
-                    segment_id: segment.segment_id,
-                }) {
-                    return Ok(SegmentDispatchResult {
-                        candidates_produced: 0,
-                        degraded: false,
-                        output: (Vec::new(), false, None),
-                    });
-                }
                 let row_set = prepared_filters[index].row_set.as_deref();
                 let filter = match (predicate.is_some(), row_set) {
                     (true, Some(row_set)) => {
@@ -380,7 +404,7 @@ impl VectorSearchCursor {
 
         let per_partition = map_search_tasks(
             &partition_artifacts,
-            search_parallelism_slots,
+            admitted_search_lanes,
             |_, (artifact, index)| {
                 self.search_partition_artifact(
                     artifact,
@@ -758,7 +782,7 @@ impl VectorSearchCursor {
         &self,
         artifact: &SearchArtifactRef,
         index: &HnswIndex,
-        visible_by_ref: &BTreeMap<ArtifactSegmentRef, usize>,
+        visible_by_ref: &HashMap<ArtifactSegmentRef, usize>,
         prepared_filters: &[PreparedSegmentFilter],
         has_predicate: bool,
         predicate_columns: &[u32],

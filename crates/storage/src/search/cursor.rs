@@ -83,6 +83,11 @@ pub(crate) struct VisibleSegment {
     pub(crate) rowset_id: RowsetId,
     pub(crate) segment_id: SegmentId,
     pub(crate) segment: SegmentSharedPtr,
+    /// Durable rowset metadata proves whether opening a snapshot delete vector
+    /// can possibly change admission. Keeping the proof on the read lease lets
+    /// unfiltered, append-only generations bypass per-segment delete-vector
+    /// probes without weakening snapshot semantics.
+    pub(crate) has_persistent_deletes: bool,
 }
 
 impl VisibleSegment {
@@ -163,6 +168,7 @@ impl TableReadLease {
         let segment_options = options.segment_options();
         for rowset in rowsets {
             let rowset_id = rowset.rowset_id();
+            let has_persistent_deletes = rowset.rowset_meta().num_deleted_rows() != 0;
             for segment in rowset.open_segment_view(segment_options.clone())? {
                 let segment_id = segment.segment_id();
                 let entry = VisibleSegment {
@@ -170,6 +176,7 @@ impl TableReadLease {
                     rowset_id,
                     segment_id,
                     segment,
+                    has_persistent_deletes,
                 };
                 segment_index.insert(entry.key(), entry.segment.clone());
                 visible_segments.push(entry);

@@ -130,6 +130,7 @@ impl SearchOptimizer {
             };
             let estimated_cost = VectorScanCostModel::estimate_hnsw_cost(
                 &stats,
+                capability.generation_stats.artifact_count,
                 topn.limit,
                 filter_selectivity,
                 topn.hnsw_options,

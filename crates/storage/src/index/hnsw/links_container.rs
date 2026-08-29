@@ -53,14 +53,19 @@ impl LinksContainer {
         self.links
     }
 
-    /// Fill links with candidates selected by the HNSW heuristic.
+    /// Fill links with a diversity-selected prefix followed by the nearest
+    /// remaining candidates up to `level_m`.
     ///
     /// Candidates must be sorted by score in descending order (higher is better).
-    /// For each candidate, if it's closer to any already-selected point than to the target,
-    /// the candidate is discarded.
+    /// For each candidate, if it is closer to any already-selected point than
+    /// to the target, it is excluded from the diversity prefix. Unused durable
+    /// degree capacity is then filled in original distance order. The suffix
+    /// is deliberately not marked as heuristic-processed: a later reciprocal
+    /// insertion must reconsider those edges rather than treating them as a
+    /// proven mutually diverse set.
     pub fn fill_from_sorted_with_heuristic(
         &mut self,
-        candidates: impl Iterator<Item = ScoredPoint>,
+        candidates: impl Iterator<Item = ScoredPoint> + Clone,
         level_m: usize,
         mut score: impl FnMut(PointOffset, PointOffset) -> ScoreType,
     ) {
@@ -70,6 +75,7 @@ impl LinksContainer {
             return;
         }
 
+        let capacity_fill = candidates.clone();
         'outer: for candidate in candidates {
             for &existing in &self.links {
                 if score(candidate.idx, existing) > candidate.score {
@@ -81,7 +87,26 @@ impl LinksContainer {
                 break;
             }
         }
-        self.processed_by_heuristic = self.links.len() as u32;
+        let diverse_len = self.links.len();
+        if diverse_len < level_m {
+            // The diversity prefix is a subsequence of the original sorted
+            // candidate stream. Walk both sequences once instead of probing
+            // the prefix for every candidate: at ef_construct=100 and M0=32,
+            // repeated `contains` checks add billions of point-id comparisons
+            // to a multi-million-row build without changing topology.
+            let mut next_diverse = 0usize;
+            for candidate in capacity_fill {
+                if next_diverse < diverse_len && self.links[next_diverse] == candidate.idx {
+                    next_diverse += 1;
+                    continue;
+                }
+                self.links.push(candidate.idx);
+                if self.links.len() >= level_m {
+                    break;
+                }
+            }
+        }
+        self.processed_by_heuristic = diverse_len as u32;
     }
 
     /// Connect a new point and keep at most `level_m` closest points to `target_point_id`.
@@ -140,10 +165,11 @@ impl LinksContainer {
             return;
         }
 
-        items.0.clear();
+        items.candidates.clear();
+        items.pruned.clear();
         items.reserve(level_m + 1);
         for (order, &link) in self.links.iter().enumerate() {
-            items.0.push(Item {
+            items.candidates.push(Item {
                 idx: link,
                 score: Cell::new(None),
                 order: if order < self.processed_by_heuristic as usize {
@@ -153,13 +179,13 @@ impl LinksContainer {
                 },
             });
         }
-        items.0.push(Item {
+        items.candidates.push(Item {
             idx: new_point_id,
             score: Cell::new(None),
             order: None,
         });
 
-        items.0.sort_unstable_by(|a, b| {
+        items.candidates.sort_unstable_by(|a, b| {
             if let (Some(a_order), Some(b_order)) = (a.order, b.order) {
                 return a_order.cmp(&b_order);
             }
@@ -173,27 +199,35 @@ impl LinksContainer {
         // - items[read] is next candidate
         // - items[0..write] are selected neighbors
         let mut write = 0;
-        'outer: for read in 0..items.0.len() {
-            let candidate = items.0[read].clone();
-            for existing in &items.0[0..write] {
+        'outer: for read in 0..items.candidates.len() {
+            let candidate = items.candidates[read].clone();
+            for existing in &items.candidates[0..write] {
                 if candidate.order.is_some() && existing.order.is_some() {
                     continue;
                 }
                 if score(candidate.idx, existing.idx)
                     > candidate.cached_score(target_point_id, &mut score)
                 {
+                    items.pruned.push(candidate.idx);
                     continue 'outer;
                 }
             }
 
             self.links.push(candidate.idx);
-            items.0[write] = candidate;
+            items.candidates[write] = candidate;
             write += 1;
             if write >= level_m {
                 break;
             }
         }
-        self.processed_by_heuristic = self.links.len() as u32;
+        let diverse_len = self.links.len();
+        for candidate in items.pruned.iter().copied() {
+            if self.links.len() >= level_m {
+                break;
+            }
+            self.links.push(candidate);
+        }
+        self.processed_by_heuristic = diverse_len as u32;
     }
 
     #[cfg(test)]
@@ -226,12 +260,19 @@ impl LinksContainer {
 
 /// Internal reusable buffer for heuristic selection.
 #[derive(Debug, Default)]
-pub struct ItemsBuffer(Vec<Item>);
+pub struct ItemsBuffer {
+    candidates: Vec<Item>,
+    pruned: Vec<PointOffset>,
+}
 
 impl ItemsBuffer {
     fn reserve(&mut self, capacity: usize) {
-        if self.0.capacity() < capacity {
-            self.0.reserve_exact(capacity - self.0.capacity());
+        if self.candidates.capacity() < capacity {
+            self.candidates
+                .reserve_exact(capacity - self.candidates.capacity());
+        }
+        if self.pruned.capacity() < capacity {
+            self.pruned.reserve_exact(capacity - self.pruned.capacity());
         }
     }
 }
@@ -357,11 +398,11 @@ mod tests {
 
         let mut links = LinksContainer::with_capacity(6);
         links.fill_from_sorted_with_heuristic(candidates.into_iter(), 6, scorer);
-        assert_eq!(links.as_slice(), &[1, 3, 6]);
+        assert_eq!(links.as_slice(), &[1, 3, 6, 2, 4, 5]);
     }
 
     #[test]
-    fn test_heuristic_eliminates_dominated_neighbors_vs_brutal_truncation() {
+    fn test_heuristic_preserves_diverse_prefix_before_capacity_fill() {
         let points: [[f32; 2]; 11] = [
             [21.79, 7.18],  // Target
             [20.58, 5.46],  // 1
@@ -395,28 +436,9 @@ mod tests {
         let mut heuristic = LinksContainer::with_capacity(6);
         heuristic.fill_from_sorted_with_heuristic(candidates.into_iter(), 6, scorer);
 
-        let count_dominated = |neighbors: &[PointOffset]| -> usize {
-            let mut dominated = 0usize;
-            'candidate: for (candidate_pos, &candidate) in neighbors.iter().enumerate() {
-                for (other_pos, &other) in neighbors.iter().enumerate() {
-                    if candidate_pos == other_pos {
-                        continue;
-                    }
-                    if scorer(candidate, other) > scorer(0, candidate) {
-                        dominated += 1;
-                        continue 'candidate;
-                    }
-                }
-            }
-            dominated
-        };
-
-        let brute_dominated = count_dominated(&brute_force);
-        let heuristic_dominated = count_dominated(heuristic.as_slice());
-
-        assert_eq!(heuristic.as_slice(), &[1, 3, 6]);
-        assert!(brute_dominated > 0);
-        assert_eq!(heuristic_dominated, 0);
+        assert_eq!(brute_force, vec![1, 2, 3, 4, 5, 6]);
+        assert_eq!(heuristic.as_slice(), &[1, 3, 6, 2, 4, 5]);
+        assert_eq!(&heuristic.as_slice()[..3], &[1, 3, 6]);
     }
 
     #[test]

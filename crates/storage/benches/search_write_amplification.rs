@@ -321,6 +321,7 @@ fn search_definition(
                 .unwrap(),
             ),
             distance_cost: paro_storage::index::hnsw::HnswDistanceCostProfile::default(),
+            generation_layout: paro_storage::search::HnswGenerationLayout::default(),
             maintenance: paro_storage::search::HnswMaintenancePolicy::default(),
             build_seed: paro_storage::search::DEFAULT_HNSW_BUILD_SEED,
             proposal_wave_max_size: paro_storage::search::DEFAULT_HNSW_PROPOSAL_WAVE_MAX_SIZE,

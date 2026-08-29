@@ -29,6 +29,10 @@ use super::provider_config::{
     decode_provider_config, encode_provider_config, StrictProviderConfig,
 };
 
+/// Version 24 makes the generation graph-shard target an explicit physical
+/// layout contract. Full builds and incremental radix carry now preserve the
+/// same upper bound despite rowset and maintenance history; indivisible base
+/// segments may still produce smaller shards or one oversized singleton.
 /// Version 23 makes `proposal_wave_max_size` an explicit topology bound and
 /// grows deterministic frozen waves with the published graph. This preserves
 /// fresh early topology while giving mature generations enough independent
@@ -63,11 +67,32 @@ use super::provider_config::{
 /// generation. Artifact-envelope compatibility is versioned independently;
 /// provider-config versions describe the definition and build contract rather
 /// than the physical checksum hierarchy used by a particular binary.
-pub const HNSW_PROVIDER_CONFIG_VERSION: u32 = 23;
+pub const HNSW_PROVIDER_CONFIG_VERSION: u32 = 24;
 
 pub const DEFAULT_HNSW_MAINTENANCE_TARGET_VECTOR_BYTES: u64 = 64 * 1024 * 1024;
 pub const DEFAULT_HNSW_MAINTENANCE_MAX_PENDING_VECTOR_BYTES: u64 = 256 * 1024 * 1024;
 pub const DEFAULT_HNSW_MAINTENANCE_COMPACTION_FANOUT: u32 = 4;
+pub const DEFAULT_HNSW_GENERATION_TARGET_GRAPH_ROWS: u64 = 2_000_000;
+
+/// Definition-pinned graph layout for one immutable search generation.
+///
+/// The target is expressed in graph points rather than base-vector bytes:
+/// sidecar HNSW artifacts reference canonical table pages and persist a
+/// bounded routing representation, so graph cardinality is the stable unit
+/// that controls navigation quality, query fan-out, and build parallelism.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct HnswGenerationLayout {
+    pub target_graph_rows: u64,
+}
+
+impl Default for HnswGenerationLayout {
+    fn default() -> Self {
+        Self {
+            target_graph_rows: DEFAULT_HNSW_GENERATION_TARGET_GRAPH_ROWS,
+        }
+    }
+}
 
 /// Definition-pinned batching policy for derived HNSW maintenance.
 ///
@@ -137,6 +162,7 @@ pub struct HnswProviderConfig {
     pub ef_search: u32,
     pub rerank_policy: HnswRerankPolicy,
     pub distance_cost: HnswDistanceCostProfile,
+    pub generation_layout: HnswGenerationLayout,
     pub maintenance: HnswMaintenancePolicy,
     pub build_seed: u64,
     pub proposal_wave_max_size: u32,
@@ -265,6 +291,15 @@ impl HnswProviderConfig {
                     ));
                 }
             }
+        }
+        if self.generation_layout.target_graph_rows == 0
+            || self.generation_layout.target_graph_rows > u64::from(u32::MAX)
+        {
+            return Err(paro_error::invalid_input(format!(
+                "HNSW generation target_graph_rows must be between 1 and {}, got {}",
+                u32::MAX,
+                self.generation_layout.target_graph_rows
+            )));
         }
         if self.maintenance.target_vector_bytes == 0 {
             return Err(paro_error::invalid_input(
@@ -396,6 +431,7 @@ mod tests {
             ef_search: 100,
             rerank_policy: HnswRerankPolicy::Ef,
             distance_cost: HnswDistanceCostProfile::default(),
+            generation_layout: HnswGenerationLayout::default(),
             maintenance: HnswMaintenancePolicy::default(),
             build_seed: DEFAULT_HNSW_BUILD_SEED,
             proposal_wave_max_size: DEFAULT_HNSW_PROPOSAL_WAVE_MAX_SIZE,

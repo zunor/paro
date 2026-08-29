@@ -45,6 +45,7 @@ impl RuntimeResources {
         let runtime_threads = boot_config.effective_max_threads();
         let _ = scheduler.set_threads(runtime_threads);
         paro_storage::index::hnsw::configure_hnsw_build_threads(runtime_threads);
+        paro_storage::search::configure_search_dispatch_threads(runtime_threads);
 
         let memory_arbitrator = Arc::new(MemoryArbitrator::new(boot_config.initial_maximum_memory));
         let system_reserve = Arc::new(SystemReserve::new(memory_arbitrator.clone()));

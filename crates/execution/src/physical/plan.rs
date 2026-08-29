@@ -1067,11 +1067,20 @@ fn push_vector_search_properties(
         properties,
         "Search Ef",
         format!(
-            "{} (effective {})",
+            "{} (effective {} per graph shard)",
             spec.params
                 .ef
                 .map_or_else(|| "default".to_string(), |ef| ef.to_string()),
             widths.ef
+        ),
+    );
+    push_string_property(
+        properties,
+        "Graph Shards",
+        format!(
+            "{} (estimated aggregate beam width {})",
+            spec.graph_shard_count,
+            widths.ef.saturating_mul(spec.graph_shard_count),
         ),
     );
     push_string_property(

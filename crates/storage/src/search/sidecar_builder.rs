@@ -23,13 +23,16 @@ use super::inline_sink::{
 use super::providers::fulltext::inline::FullTextInlineArtifactBuilder;
 use super::providers::sparse::inline::SparseInlineArtifactBuilder;
 use super::sidecar::SidecarArtifactStore;
-use super::stats::{HnswProviderStats, SearchArtifactStats, SearchProviderStats};
+use super::stats::{
+    HnswProviderStats, MaintenancePriority, SearchArtifactStats, SearchProviderStats,
+};
 use super::tail::{TailMutationKind, TailPendingEntry};
 use crate::index::bitmap::BitmapIndexWriter;
 use crate::index::hnsw::{
     open_plain_vector_column_pages, HnswBuildExecutionPolicy, HnswBuildStopCheck, HnswBuilder,
     HnswExternalVectorSource, HnswExternalVectorSpan, HnswFilterBlock, HnswFilterBlocks,
-    HnswFilterColumnBlocks, HnswFilterTopologyContract, PartitionedVectorStorage, VectorStorage,
+    HnswFilterColumnBlocks, HnswFilterTopologyContract, HnswMaintenanceBuildPriority,
+    PartitionedVectorStorage, VectorStorage,
 };
 use crate::metrics::{storage_metrics, SearchSidecarBuildMetricKey};
 use crate::rowset::column::ColumnBatch;
@@ -53,10 +56,20 @@ impl ProviderSidecarArtifactBuilder {
         }
     }
 
-    pub(crate) fn for_maintenance(store: SidecarArtifactStore) -> Self {
+    pub(crate) fn for_maintenance(
+        store: SidecarArtifactStore,
+        priority: MaintenancePriority,
+    ) -> Self {
+        let priority = match priority {
+            MaintenancePriority::Idle | MaintenancePriority::Opportunistic => {
+                HnswMaintenanceBuildPriority::Opportunistic
+            }
+            MaintenancePriority::Elevated => HnswMaintenanceBuildPriority::Elevated,
+            MaintenancePriority::Critical => HnswMaintenanceBuildPriority::Critical,
+        };
         Self {
             store,
-            hnsw_execution_policy: HnswBuildExecutionPolicy::Maintenance,
+            hnsw_execution_policy: HnswBuildExecutionPolicy::Maintenance(priority),
         }
     }
 }
@@ -177,30 +190,39 @@ impl SidecarArtifactBuilder for ProviderSidecarArtifactBuilder {
             .create_next_package_writer(input.definition.definition_id, input.generation_id)?;
         let mut artifact_refs = Vec::new();
         if input.definition.kind == SearchIndexKind::Hnsw {
-            if let Some(partition) = build_hnsw_partition_sidecar_artifact(
-                &input.definition,
+            let provider = input.definition.hnsw_provider_config()?;
+            let groups = hnsw_partition_build_groups(
                 &rowsets,
                 &input.tail_window,
-                budget,
-                input.stop_check.as_ref(),
-                writer.workspace_dir(),
-                self.hnsw_execution_policy,
-            )? {
-                let location = writer.append_streamed_artifact(|file, offset| {
-                    let source = external_vector_source(partition.column_id, &partition.coverage)?;
-                    partition
-                        .index
-                        .serialize_into_seekable_external_vectors(file, offset, &source)
-                        .map(|_| ())
-                })?;
-                artifact_refs.push(sidecar_ref_from_hnsw_partition(
+                provider.generation_layout.target_graph_rows,
+            )?;
+            for requested_segments in groups {
+                if let Some(partition) = build_hnsw_partition_sidecar_artifact(
                     &input.definition,
-                    input.generation_id,
-                    partition.coverage,
-                    partition.column_id,
-                    partition.provider_stats,
-                    location,
-                )?);
+                    &rowsets,
+                    &requested_segments,
+                    budget,
+                    input.stop_check.as_ref(),
+                    writer.workspace_dir(),
+                    self.hnsw_execution_policy,
+                )? {
+                    let location = writer.append_streamed_artifact(|file, offset| {
+                        let source =
+                            external_vector_source(partition.column_id, &partition.coverage)?;
+                        partition
+                            .index
+                            .serialize_into_seekable_external_vectors(file, offset, &source)
+                            .map(|_| ())
+                    })?;
+                    artifact_refs.push(sidecar_ref_from_hnsw_partition(
+                        &input.definition,
+                        input.generation_id,
+                        partition.coverage,
+                        partition.column_id,
+                        partition.provider_stats,
+                        location,
+                    )?);
+                }
             }
         } else {
             let mut built_segments = BTreeSet::new();
@@ -328,22 +350,21 @@ struct HnswPartitionArtifact {
     provider_stats: HnswProviderStats,
 }
 
-fn build_hnsw_partition_sidecar_artifact(
-    definition: &super::capability::SearchIndexDefinition,
+/// Deterministically group physical segments into generation-owned graph
+/// shards. Segment identity order, not rowset publication timing or worker
+/// scheduling, defines the layout. A segment larger than the target remains a
+/// valid singleton because segment rows cannot be split without introducing a
+/// second durable point-to-row mapping contract.
+fn hnsw_partition_build_groups(
     rowsets: &BTreeMap<u64, RowsetSharedPtr>,
     tail_window: &[TailPendingEntry],
-    budget: &BuildBudget,
-    stop_check: Option<&super::inline_sink::SearchBuildStopCheck>,
-    workspace_dir: &Path,
-    execution_policy: HnswBuildExecutionPolicy,
-) -> Result<Option<HnswPartitionArtifact>> {
-    let column_id = definition
-        .column_ids
-        .first()
-        .copied()
-        .ok_or_else(|| paro_error::invalid_input("HNSW sidecar definition has no column"))?;
-    let provider = definition.hnsw_provider_config()?;
-    let dimension = provider.dimension as usize;
+    target_graph_rows: u64,
+) -> Result<Vec<Vec<ArtifactSegmentRef>>> {
+    if target_graph_rows == 0 {
+        return Err(paro_error::internal(
+            "validated HNSW generation layout has a zero graph target",
+        ));
+    }
     let requested_segments = tail_window
         .iter()
         .filter(|entry| entry.mutation != TailMutationKind::Delete)
@@ -357,12 +378,71 @@ fn build_hnsw_partition_sidecar_artifact(
                 })
         })
         .collect::<BTreeSet<_>>();
+    let mut groups = Vec::new();
+    let mut current = Vec::new();
+    let mut current_rows = 0u64;
+    for segment_ref in requested_segments {
+        let Some(rowset) = rowsets.get(&segment_ref.rowset_id) else {
+            // A durable tail manifest may still name a rowset that table
+            // compaction replaced before this catch-up snapshot was captured.
+            // `rowsets` is the stable physical input owned by this build, so
+            // stale manifest identities are outside the requested generation
+            // shard rather than evidence that its input is corrupt. Publish
+            // rebasing later proves that every live input selected here is
+            // represented exactly once.
+            continue;
+        };
+        rowset.load()?;
+        let row_count = rowset
+            .segments()
+            .iter()
+            .find(|segment| segment.segment_id() == segment_ref.segment_id)
+            .map(|segment| segment.num_rows() as u64)
+            .ok_or_else(|| {
+                paro_error::data_corrupted(format!(
+                    "HNSW shard layout is missing segment {}/{}",
+                    segment_ref.rowset_id, segment_ref.segment_id
+                ))
+            })?;
+        if row_count == 0 {
+            continue;
+        }
+        if !current.is_empty() && current_rows.saturating_add(row_count) > target_graph_rows {
+            groups.push(std::mem::take(&mut current));
+            current_rows = 0;
+        }
+        current.push(segment_ref);
+        current_rows = current_rows
+            .checked_add(row_count)
+            .ok_or_else(|| paro_error::out_of_range("HNSW generation shard row count overflow"))?;
+    }
+    if !current.is_empty() {
+        groups.push(current);
+    }
+    Ok(groups)
+}
 
+fn build_hnsw_partition_sidecar_artifact(
+    definition: &super::capability::SearchIndexDefinition,
+    rowsets: &BTreeMap<u64, RowsetSharedPtr>,
+    requested_segments: &[ArtifactSegmentRef],
+    budget: &BuildBudget,
+    stop_check: Option<&super::inline_sink::SearchBuildStopCheck>,
+    workspace_dir: &Path,
+    execution_policy: HnswBuildExecutionPolicy,
+) -> Result<Option<HnswPartitionArtifact>> {
+    let column_id = definition
+        .column_ids
+        .first()
+        .copied()
+        .ok_or_else(|| paro_error::invalid_input("HNSW sidecar definition has no column"))?;
+    let provider = definition.hnsw_provider_config()?;
+    let dimension = provider.dimension as usize;
     let mut vector_partitions = Vec::<std::sync::Arc<dyn VectorStorage>>::new();
     let mut point_count = 0u32;
     let mut coverage = Vec::new();
     let mut partition_segments = Vec::new();
-    for segment_ref in requested_segments {
+    for &segment_ref in requested_segments {
         if let Some(stop_check) = stop_check {
             stop_check.check()?;
         }
@@ -999,7 +1079,7 @@ mod tests {
     }
 
     #[test]
-    fn hnsw_sidecar_builds_one_self_contained_partition_for_multiple_segments() {
+    fn hnsw_sidecar_uses_stable_generation_shards_over_multi_segment_partitions() {
         let temp_dir = TempDir::new().unwrap();
         let rowset_path = temp_dir.path().join("rowset_42");
         let schema = Arc::new(
@@ -1055,6 +1135,9 @@ mod tests {
             ef_search: 16,
             rerank_policy: crate::index::hnsw::HnswRerankPolicy::Ef,
             distance_cost: crate::index::hnsw::HnswDistanceCostProfile::default(),
+            generation_layout: crate::search::HnswGenerationLayout {
+                target_graph_rows: 4,
+            },
             maintenance: crate::search::HnswMaintenancePolicy::default(),
             build_seed: 17,
             proposal_wave_max_size: 4,
@@ -1098,10 +1181,48 @@ mod tests {
             byte_count: 0,
             row_image_ref: Some(TailRowImageRef::WholeRowset),
         }];
+        let groups = hnsw_partition_build_groups(&rowsets, &tail, 4).unwrap();
+        assert_eq!(
+            groups,
+            vec![
+                vec![ArtifactSegmentRef {
+                    rowset_id: 42,
+                    segment_id: 0,
+                }],
+                vec![ArtifactSegmentRef {
+                    rowset_id: 42,
+                    segment_id: 1,
+                }],
+            ]
+        );
+        let mut tail_with_replaced_rowset = tail.to_vec();
+        tail_with_replaced_rowset.push(TailPendingEntry {
+            entry_id: TailEntryId::UNASSIGNED,
+            rowset_id: 99,
+            segment_ids: vec![0],
+            mutation: TailMutationKind::Append,
+            row_count: 4,
+            byte_count: 0,
+            row_image_ref: Some(TailRowImageRef::WholeRowset),
+        });
+        assert_eq!(
+            hnsw_partition_build_groups(&rowsets, &tail_with_replaced_rowset, 4).unwrap(),
+            groups,
+            "a manifest tail replaced before the build snapshot must not poison live shard input"
+        );
         let partition = build_hnsw_partition_sidecar_artifact(
             &definition,
             &rowsets,
-            &tail,
+            &[
+                ArtifactSegmentRef {
+                    rowset_id: 42,
+                    segment_id: 0,
+                },
+                ArtifactSegmentRef {
+                    rowset_id: 42,
+                    segment_id: 1,
+                },
+            ],
             &BuildBudget {
                 cost_envelope: MaintenanceCost::default(),
                 deadline: None,
@@ -1166,5 +1287,33 @@ mod tests {
             .collect::<Vec<_>>();
         point_ids.sort_unstable();
         assert_eq!(point_ids, vec![1, 5]);
+
+        let builder = ProviderSidecarArtifactBuilder::new(SidecarArtifactStore::new(
+            temp_dir.path().join("stable-shards"),
+        ));
+        let input = SidecarBuildInput {
+            definition,
+            generation_id: 1,
+            tail_window: tail.to_vec(),
+            rowset_refs: vec![rowset],
+            snapshot_version: 0,
+            stop_check: None,
+        };
+        let estimate = builder.estimate_cost(&input).unwrap();
+        let built = builder
+            .build(
+                input,
+                &BuildBudget {
+                    cost_envelope: estimate.cost,
+                    deadline: None,
+                    grant_id: None,
+                },
+            )
+            .unwrap();
+        assert_eq!(built.artifact_refs.len(), 2);
+        assert!(built
+            .artifact_refs
+            .iter()
+            .all(|artifact| artifact.stats.row_count == 4));
     }
 }

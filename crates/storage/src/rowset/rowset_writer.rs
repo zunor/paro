@@ -2030,6 +2030,14 @@ mod tests {
                     "graph_scored_points_per_ef":
                         crate::search::DEFAULT_HNSW_GRAPH_SCORED_POINTS_PER_EF
                 },
+                "generation_layout": {
+                    "target_graph_rows": crate::search::DEFAULT_HNSW_GENERATION_TARGET_GRAPH_ROWS
+                },
+                "maintenance": {
+                    "target_vector_bytes": crate::search::DEFAULT_HNSW_MAINTENANCE_TARGET_VECTOR_BYTES,
+                    "max_pending_vector_bytes": crate::search::DEFAULT_HNSW_MAINTENANCE_MAX_PENDING_VECTOR_BYTES,
+                    "compaction_fanout": crate::search::DEFAULT_HNSW_MAINTENANCE_COMPACTION_FANOUT
+                },
                 "build_seed": 1,
                 "proposal_wave_max_size": crate::search::DEFAULT_HNSW_PROPOSAL_WAVE_MAX_SIZE,
                 "warmup_point_count": crate::search::DEFAULT_HNSW_WARMUP_POINT_COUNT,

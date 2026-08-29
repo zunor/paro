@@ -645,9 +645,34 @@ impl ShardedLockManager {
     ) -> std::result::Result<TxnLockSet, LockAcquireError> {
         let requests = normalize_requests(requests);
         let mut granted = Vec::with_capacity(requests.len());
+        let mut fine_batches = (0..self.inner.shards.len())
+            .map(|_| Vec::new())
+            .collect::<Vec<_>>();
 
         for request in requests {
-            match self.inner.try_grant(txn_id, &request) {
+            if !ShardedLockManagerInner::is_coarse_resource(&request.resource) {
+                let shard_index = self.inner.shard_index(&request.resource);
+                fine_batches[shard_index].push(request);
+                continue;
+            }
+            match self.inner.try_grant_coarse(txn_id, &request) {
+                Ok(mut locks) => granted.append(&mut locks),
+                Err(err) => {
+                    self.inner.release_locks(txn_id, &granted);
+                    self.inner.record_acquire_error(&err);
+                    return Err(err);
+                }
+            }
+        }
+
+        for (shard_index, requests) in fine_batches.iter().enumerate() {
+            if requests.is_empty() {
+                continue;
+            }
+            match self
+                .inner
+                .try_grant_fine_batch(txn_id, shard_index, requests)
+            {
                 Ok(mut locks) => granted.append(&mut locks),
                 Err(err) => {
                     self.inner.release_locks(txn_id, &granted);
@@ -830,38 +855,70 @@ impl ShardedLockManagerInner {
         txn_id: TxnId,
         request: &LockRequest,
     ) -> std::result::Result<Vec<GrantedLock>, LockAcquireError> {
+        let shard_index = self.shard_index(&request.resource);
+        self.try_grant_fine_batch(txn_id, shard_index, std::slice::from_ref(request))
+    }
+
+    /// Grants exact fine-grained resources while acquiring their shard mutex
+    /// once. The coarse epoch protocol remains the serialization boundary for
+    /// table/tablet/range/predicate locks; grouping exact resources must not
+    /// weaken that cross-level exclusion.
+    fn try_grant_fine_batch(
+        &self,
+        txn_id: TxnId,
+        shard_index: usize,
+        requests: &[LockRequest],
+    ) -> std::result::Result<Vec<GrantedLock>, LockAcquireError> {
+        debug_assert!(!requests.is_empty());
+        debug_assert!(requests.iter().all(|request| {
+            !Self::is_coarse_resource(&request.resource)
+                && self.shard_index(&request.resource) == shard_index
+        }));
+
         let coarse_epoch = self.coarse_epoch.load(Ordering::Acquire);
         if self.coarse_active_count.load(Ordering::Acquire) > 0 {
-            let blockers = self.coarse_blockers(txn_id, request);
+            let blockers = self.coarse_blockers_many(txn_id, requests);
             if !blockers.is_empty() {
                 return Err(classify_wound_wait(txn_id, blockers));
             }
         }
 
-        let shard_index = self.shard_index(&request.resource);
         let mut shard = self.shards[shard_index].lock();
 
         if self.coarse_epoch.load(Ordering::Acquire) != coarse_epoch
             || self.coarse_active_count.load(Ordering::Acquire) > 0
         {
-            let blockers = self.coarse_blockers(txn_id, request);
+            let blockers = self.coarse_blockers_many(txn_id, requests);
             if !blockers.is_empty() {
                 return Err(classify_wound_wait(txn_id, blockers));
             }
         }
 
-        let blockers = shard.blockers(txn_id, request);
+        // Fine resources are exact physical/key identities. Cross-resource
+        // conflicts (table/tablet/range/predicate) live in the coarse table
+        // and were checked above under the epoch protocol. Scanning every
+        // unrelated key in this shard turns one batched primary-key insert
+        // into O(keys^2 / shards) work without finding additional blockers.
+        let mut blockers = Vec::new();
+        for request in requests {
+            shard.append_exact_blockers(txn_id, request, &mut blockers);
+        }
+        normalize_txn_ids(&mut blockers);
         if !blockers.is_empty() {
             return Err(classify_wound_wait(txn_id, blockers));
         }
 
-        let outcome = shard.grant(txn_id, request);
-        Ok(vec![GrantedLock {
-            resource: request.resource.clone(),
-            mode: request.mode,
-            location: LockLocation::FineShard(shard_index),
-            previous_mode: outcome.previous_mode,
-        }])
+        let mut granted = Vec::with_capacity(requests.len());
+        for request in requests {
+            let outcome = shard.grant(txn_id, request);
+            granted.push(GrantedLock {
+                resource: request.resource.clone(),
+                mode: request.mode,
+                location: LockLocation::FineShard(shard_index),
+                previous_mode: outcome.previous_mode,
+            });
+        }
+        Ok(granted)
     }
 
     fn try_grant_coarse(
@@ -897,12 +954,17 @@ impl ShardedLockManagerInner {
         }])
     }
 
-    fn coarse_blockers(&self, txn_id: TxnId, request: &LockRequest) -> Vec<TxnId> {
+    fn coarse_blockers_many(&self, txn_id: TxnId, requests: &[LockRequest]) -> Vec<TxnId> {
         if self.coarse_active_count.load(Ordering::Acquire) == 0 {
             return Vec::new();
         }
         let coarse = self.coarse.lock();
-        coarse.blockers(txn_id, request)
+        let mut blockers = Vec::new();
+        for request in requests {
+            blockers.extend(coarse.blockers(txn_id, request));
+        }
+        normalize_txn_ids(&mut blockers);
+        blockers
     }
 
     fn fine_blockers(&self, txn_id: TxnId, request: &LockRequest) -> Vec<TxnId> {
@@ -953,7 +1015,7 @@ impl ShardedLockManagerInner {
 
         if !Self::is_coarse_resource(resource) {
             let shard = self.shards[self.shard_index(resource)].lock();
-            return shard.has_conflicting(resource);
+            return shard.has_exact(resource);
         }
 
         self.shards.iter().any(|shard| {
@@ -1093,6 +1155,31 @@ impl LockTableShard {
         blockers
     }
 
+    fn append_exact_blockers(
+        &self,
+        txn_id: TxnId,
+        request: &LockRequest,
+        blockers: &mut Vec<TxnId>,
+    ) {
+        let Some(state) = self.locks.get(&request.resource) else {
+            return;
+        };
+        blockers.extend(state.granted.iter().filter_map(|holder| {
+            if holder.txn_id != txn_id
+                && lock_grants_conflict(
+                    &request.resource,
+                    holder.mode,
+                    &request.resource,
+                    request.mode,
+                )
+            {
+                Some(holder.txn_id)
+            } else {
+                None
+            }
+        }));
+    }
+
     fn grant(&mut self, txn_id: TxnId, request: &LockRequest) -> GrantOutcome {
         let state = self.locks.entry(request.resource.clone()).or_default();
         if let Some(holder) = state
@@ -1150,6 +1237,12 @@ impl LockTableShard {
         self.locks
             .iter()
             .any(|(held, state)| held.conflicts_with(resource) && !state.granted.is_empty())
+    }
+
+    fn has_exact(&self, resource: &LockResource) -> bool {
+        self.locks
+            .get(resource)
+            .is_some_and(|state| !state.granted.is_empty())
     }
 }
 

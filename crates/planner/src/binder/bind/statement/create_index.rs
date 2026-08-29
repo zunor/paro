@@ -320,6 +320,7 @@ fn hnsw_provider_config(
         "symmetric_i16_dimension_cost_units",
         "graph_scored_points_per_ef",
         "distance_cost_calibration_id",
+        "generation_target_graph_rows",
         "maintenance_target_vector_bytes",
         "maintenance_max_pending_vector_bytes",
         "maintenance_compaction_fanout",
@@ -610,6 +611,13 @@ fn hnsw_provider_config(
         )?)
         .map_err(|_| paro_error::out_of_range("HNSW maintenance_compaction_fanout"))?,
     };
+    let generation_layout = paro_storage::search::HnswGenerationLayout {
+        target_graph_rows: parse_u64_index_option(
+            options,
+            "generation_target_graph_rows",
+            paro_storage::search::DEFAULT_HNSW_GENERATION_TARGET_GRAPH_ROWS,
+        )?,
+    };
     HnswProviderConfig {
         version: paro_storage::search::HNSW_PROVIDER_CONFIG_VERSION,
         dimension,
@@ -622,6 +630,7 @@ fn hnsw_provider_config(
             .map_err(|_| paro_error::out_of_range("HNSW ef_search"))?,
         rerank_policy,
         distance_cost,
+        generation_layout,
         maintenance,
         build_seed,
         proposal_wave_max_size: DEFAULT_HNSW_PROPOSAL_WAVE_MAX_SIZE,
@@ -1047,6 +1056,7 @@ mod tests {
                  symmetric_i16_dimension_cost_units = 1 \
                  graph_scored_points_per_ef = 20 distance_cost_calibration_id = 42 \
                  rerank_window = top_k \
+                 generation_target_graph_rows = 1500000 \
                  filter_columns = 'bucket' filter_block_rows = 4096 filter_m = 12 \
                  inline_max_vector_count = 90000 \
                  inline_max_graph_memory_bytes = 268435456 \
@@ -1089,6 +1099,10 @@ mod tests {
         assert_eq!(
             bound.info.provider_config["distance_cost"]["random_access_cost_units"],
             416
+        );
+        assert_eq!(
+            bound.info.provider_config["generation_layout"]["target_graph_rows"],
+            1_500_000
         );
         assert_eq!(
             bound.info.provider_config["filter_columns"],

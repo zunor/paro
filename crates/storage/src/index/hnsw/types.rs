@@ -52,6 +52,13 @@ pub const DEFAULT_HNSW_GRAPH_SCORED_POINTS_PER_EF: u32 = 24;
 pub const HNSW_BUILT_IN_DISTANCE_COST_REVISION: u32 = 5;
 pub const MAX_HNSW_FILTER_COLUMNS: usize = 8;
 pub const HNSW_FILTER_TOPOLOGY_VERSION: u32 = 4;
+/// Version 17 keeps the diversity-selected prefix produced by the HNSW
+/// neighbor heuristic, then deterministically fills unused degree capacity
+/// from the remaining distance-ordered construction candidates. The durable
+/// fixed-stride level-0 record is already paid for up to M0; leaving most of
+/// those slots empty weakens navigation without saving storage. Only the
+/// diversity prefix is marked as heuristic-processed so later reciprocal
+/// updates continue to reconsider the capacity-fill suffix.
 /// Version 16 makes bounded construction-neighbor batches part of the exact
 /// f32 topology algorithm. Batched L2 scoring shares query loads and exposes
 /// independent random rows to the architecture kernel; its reduction order is
@@ -98,7 +105,7 @@ pub const HNSW_FILTER_TOPOLOGY_VERSION: u32 = 4;
 /// followed by cycle walking. One-point warm-up waves and deterministic frozen
 /// proposal waves remain durable topology fields; changing point ordering or
 /// publication semantics requires a new contract version.
-pub const HNSW_BUILD_CONTRACT_VERSION: u32 = 16;
+pub const HNSW_BUILD_CONTRACT_VERSION: u32 = 17;
 /// Maximum number of deterministic source coordinates retained by the
 /// compact construction routing space. The original f32 dimension remains
 /// authoritative for SQL scoring and exact re-ranking.

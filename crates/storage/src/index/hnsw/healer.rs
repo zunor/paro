@@ -159,7 +159,12 @@ impl<'a> GraphLayersHealer<'a> {
                 let score = score_indexed(storage, distance, offset, idx);
                 if self.point_deleted(idx) {
                     pending.push(ScoredPoint { idx, score });
-                } else {
+                } else if !visited.check_and_update_visited(idx) {
+                    // A surviving border point may be reachable through more
+                    // than one deleted branch. Mark it when it enters the
+                    // candidate set, not only when the branch is expanded, so
+                    // the healer preserves the builder's unique-neighbor
+                    // contract before capacity-fill appends its suffix.
                     nearest.push(ScoredPoint { idx, score });
                 }
             }

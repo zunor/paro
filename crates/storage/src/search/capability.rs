@@ -904,6 +904,7 @@ mod tests {
             ef_search: 64,
             rerank_policy: crate::index::hnsw::HnswRerankPolicy::Ef,
             distance_cost: crate::index::hnsw::HnswDistanceCostProfile::default(),
+            generation_layout: crate::search::HnswGenerationLayout::default(),
             maintenance: crate::search::HnswMaintenancePolicy::default(),
             build_seed: 7,
             proposal_wave_max_size: crate::search::DEFAULT_HNSW_PROPOSAL_WAVE_MAX_SIZE,
@@ -931,6 +932,7 @@ mod tests {
             ..crate::index::hnsw::HnswDistanceCostProfile::default()
         };
         policy_tuned.inline_threshold.max_vector_count = 8_192;
+        policy_tuned.generation_layout.target_graph_rows = 1_000_000;
 
         let fingerprint = |config: &HnswProviderConfig| {
             SearchIndexDefinition::compute_config_fingerprint(

@@ -1107,6 +1107,7 @@ mod tests {
             ef_search: 100,
             rerank_policy: crate::index::hnsw::HnswRerankPolicy::Ef,
             distance_cost: crate::index::hnsw::HnswDistanceCostProfile::default(),
+            generation_layout: crate::search::HnswGenerationLayout::default(),
             maintenance: crate::search::HnswMaintenancePolicy::default(),
             build_seed: crate::search::DEFAULT_HNSW_BUILD_SEED,
             proposal_wave_max_size: crate::search::DEFAULT_HNSW_PROPOSAL_WAVE_MAX_SIZE,

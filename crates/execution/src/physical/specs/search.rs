@@ -127,6 +127,11 @@ pub struct VectorSearchSpec {
     /// adaptive filtered-search phase in costing and EXPLAIN. Runtime observes
     /// actual admissions and does not trust this estimate.
     pub avg_level0_degree: f32,
+    /// Immutable graph shards in the selected generation. `ef_search` is a
+    /// per-shard navigation width, matching the provider execution contract;
+    /// keeping this count in the physical spec makes total graph work visible
+    /// in EXPLAIN instead of hiding it behind artifact fan-out.
+    pub graph_shard_count: usize,
     pub predicate: Option<SearchPredicateTemplate>,
     pub filter_contract: SearchFilterContract,
     pub filter_materialization: Option<ExactFilterMaterialization>,

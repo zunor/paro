@@ -729,6 +729,13 @@ fn search_source_spec_for_candidate(
                     .map_or(0.0, |stats| stats.avg_level0_degree),
                 None => 0.0,
             };
+            let graph_shard_count = table
+                .storage
+                .as_ref()
+                .and_then(|storage| {
+                    storage.search_generation_artifact_count(candidate.token.definition_id)
+                })
+                .unwrap_or_default();
             let filter_topology = table
                 .storage
                 .as_ref()
@@ -756,6 +763,7 @@ fn search_source_spec_for_candidate(
                 search_policy,
                 filter_topology,
                 avg_level0_degree,
+                graph_shard_count,
                 predicate,
                 filter_contract,
                 filter_materialization,

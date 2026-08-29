@@ -1286,7 +1286,10 @@ impl SearchIndexRegistry {
         });
 
         let sidecar_store = SidecarArtifactStore::new(self.tablet.data_dir().clone());
-        let builder = ProviderSidecarArtifactBuilder::for_maintenance(sidecar_store.clone());
+        let builder = ProviderSidecarArtifactBuilder::for_maintenance(
+            sidecar_store.clone(),
+            manifest.root.maintenance_state.recovery.priority,
+        );
         let input = super::inline_sink::SidecarBuildInput {
             definition: state.definition.clone(),
             generation_id: manifest.root.generation_id,
@@ -1454,7 +1457,10 @@ impl SearchIndexRegistry {
         }
 
         let sidecar_store = SidecarArtifactStore::new(self.tablet.data_dir().clone());
-        let builder = ProviderSidecarArtifactBuilder::for_maintenance(sidecar_store.clone());
+        let builder = ProviderSidecarArtifactBuilder::for_maintenance(
+            sidecar_store.clone(),
+            manifest.root.maintenance_state.recovery.priority,
+        );
         let build_epoch = self.foreground_ingest_epoch.load(Ordering::Acquire);
         let foreground_epoch = Arc::clone(&self.foreground_ingest_epoch);
         let definition_token = build_token.clone();
@@ -3748,7 +3754,19 @@ fn select_hnsw_compaction_artifacts(
             .map(|span| span.segment)
     });
     selected.truncate(usize::try_from(fanout).unwrap_or(usize::MAX));
-    selected
+    let shard_limit = provider.generation_layout.target_graph_rows;
+    while selected.len() > 1
+        && selected.iter().fold(0u64, |rows, artifact| {
+            rows.saturating_add(artifact.stats.row_count)
+        }) > shard_limit
+    {
+        selected.pop();
+    }
+    if selected.len() > 1 {
+        selected
+    } else {
+        Vec::new()
+    }
 }
 
 /// Select deterministic same-level inputs to carry an admitted tail quantum
@@ -3769,6 +3787,7 @@ fn select_hnsw_carry_artifacts(
     }
     let target_rows = provider.maintenance.target_rows(provider.dimension);
     let fanout = provider.maintenance.compaction_fanout.max(2);
+    let shard_limit = provider.generation_layout.target_graph_rows;
     let carry_width = usize::try_from(fanout.saturating_sub(1)).unwrap_or(usize::MAX);
     let mut promoted_rows = incoming_rows;
     let mut selected_keys = BTreeSet::new();
@@ -3793,6 +3812,15 @@ fn select_hnsw_carry_artifacts(
                 .map(|span| span.segment)
         });
         if candidates.len() < carry_width {
+            break;
+        }
+        let carry_rows = candidates
+            .iter()
+            .take(carry_width)
+            .fold(0u64, |rows, artifact| {
+                rows.saturating_add(artifact.stats.row_count)
+            });
+        if promoted_rows.saturating_add(carry_rows) > shard_limit {
             break;
         }
         for artifact in candidates.into_iter().take(carry_width) {
@@ -3870,11 +3898,10 @@ fn validate_hnsw_compaction_result(
     removed_artifacts: &[SearchArtifactRef],
     added_artifacts: &[SearchArtifactRef],
 ) -> Result<()> {
-    if added_artifacts.len() != 1 {
-        return Err(paro_error::data_corrupted(format!(
-            "HNSW generation compaction produced {} artifacts instead of one",
-            added_artifacts.len()
-        )));
+    if added_artifacts.is_empty() {
+        return Err(paro_error::data_corrupted(
+            "HNSW generation compaction produced no artifacts",
+        ));
     }
     let coverage_rows = |artifacts: &[SearchArtifactRef]| -> Result<BTreeMap<_, _>> {
         let mut rows = BTreeMap::new();
@@ -3903,6 +3930,17 @@ fn validate_hnsw_compaction_result(
             "HNSW generation compaction changed physical segment coverage",
         ));
     }
+    let shard_limit = definition
+        .hnsw_provider_config()?
+        .generation_layout
+        .target_graph_rows;
+    if added_artifacts.iter().any(|artifact| {
+        artifact.stats.row_count > shard_limit && artifact.coverage.segments().len() != 1
+    }) {
+        return Err(paro_error::data_corrupted(format!(
+            "HNSW generation compaction exceeded its {shard_limit}-row graph-shard contract"
+        )));
+    }
     Ok(())
 }
 
@@ -3912,38 +3950,49 @@ fn validate_hnsw_carry_result(
     removed_artifacts: &[SearchArtifactRef],
     added_artifacts: &[SearchArtifactRef],
 ) -> Result<()> {
-    if added_artifacts.len() != 1 {
-        return Err(paro_error::data_corrupted(format!(
-            "HNSW catch-up carry produced {} artifacts instead of one",
-            added_artifacts.len()
-        )));
-    }
-    let output = &added_artifacts[0];
-    output.validate()?;
-    if output.definition_id != definition.definition_id
-        || output.generation_id != generation_id
-        || output.kind != SearchIndexKind::Hnsw
-    {
+    if added_artifacts.is_empty() {
         return Err(paro_error::data_corrupted(
-            "HNSW catch-up carry artifact identity mismatch",
+            "HNSW catch-up carry produced no artifacts",
         ));
+    }
+    let mut output_coverage = BTreeMap::new();
+    let mut output_column = None;
+    for output in added_artifacts {
+        output.validate()?;
+        if output.definition_id != definition.definition_id
+            || output.generation_id != generation_id
+            || output.kind != SearchIndexKind::Hnsw
+            || output_column.is_some_and(|column| column != output.column_id)
+        {
+            return Err(paro_error::data_corrupted(
+                "HNSW catch-up carry artifact identity mismatch",
+            ));
+        }
+        output_column = Some(output.column_id);
+        for span in output.coverage.segments() {
+            if output_coverage
+                .insert(span.segment, span.row_count)
+                .is_some()
+            {
+                return Err(paro_error::data_corrupted(
+                    "HNSW catch-up carry output coverage overlaps",
+                ));
+            }
+        }
     }
     for removed in removed_artifacts {
         removed.validate()?;
         if removed.definition_id != definition.definition_id
             || removed.generation_id != generation_id
             || removed.kind != SearchIndexKind::Hnsw
-            || removed.column_id != output.column_id
+            || Some(removed.column_id) != output_column
         {
             return Err(paro_error::data_corrupted(
                 "HNSW catch-up carry input identity mismatch",
             ));
         }
         for removed_span in removed.coverage.segments() {
-            if !output.coverage.segments().iter().any(|output_span| {
-                output_span.segment == removed_span.segment
-                    && output_span.row_count == removed_span.row_count
-            }) {
+            if output_coverage.get(&removed_span.segment) != Some(&removed_span.row_count) {
                 return Err(paro_error::data_corrupted(
                     "HNSW catch-up carry omitted selected artifact coverage",
                 ));
@@ -4477,6 +4526,7 @@ mod tests {
                     .unwrap(),
             ),
             distance_cost: crate::index::hnsw::HnswDistanceCostProfile::default(),
+            generation_layout: crate::search::HnswGenerationLayout::default(),
             maintenance: crate::search::HnswMaintenancePolicy::default(),
             build_seed: 1,
             proposal_wave_max_size: crate::search::DEFAULT_HNSW_PROPOSAL_WAVE_MAX_SIZE,
@@ -4861,10 +4911,14 @@ mod tests {
     #[test]
     fn hnsw_catch_up_carry_promotes_full_radix_digits_in_one_build() {
         let definition = hnsw_test_definition(94);
-        let provider =
+        let mut provider =
             crate::search::HnswProviderConfig::from_value(&definition.provider_config).unwrap();
         let target = provider.maintenance.target_rows(provider.dimension);
         let fanout = u64::from(provider.maintenance.compaction_fanout);
+        provider.generation_layout.target_graph_rows = target
+            .saturating_mul(fanout)
+            .saturating_mul(fanout)
+            .saturating_add(1);
         let mut artifacts = Vec::new();
         for ordinal in 0..(fanout - 1) {
             artifacts.push(hnsw_test_artifact(94, 100 + ordinal, target, 2, 32));
@@ -4888,6 +4942,28 @@ mod tests {
         artifacts.pop();
         let selected = select_hnsw_carry_artifacts(&artifacts, &provider, target);
         assert_eq!(selected.len(), usize::try_from(fanout - 1).unwrap());
+    }
+
+    #[test]
+    fn hnsw_carry_never_promotes_past_generation_graph_target() {
+        let definition = hnsw_test_definition(95);
+        let mut provider =
+            crate::search::HnswProviderConfig::from_value(&definition.provider_config).unwrap();
+        let target = provider.maintenance.target_rows(provider.dimension);
+        let fanout = u64::from(provider.maintenance.compaction_fanout);
+        provider.generation_layout.target_graph_rows = target.saturating_mul(fanout);
+        let artifacts = (0..fanout - 1)
+            .map(|ordinal| hnsw_test_artifact(95, 300 + ordinal, target, 2, 32))
+            .collect::<Vec<_>>();
+
+        let selected = select_hnsw_carry_artifacts(&artifacts, &provider, target);
+        assert_eq!(selected.len(), usize::try_from(fanout - 1).unwrap());
+
+        let promoted = (0..fanout - 1)
+            .map(|ordinal| hnsw_test_artifact(95, 400 + ordinal, target * fanout, 3, 32))
+            .collect::<Vec<_>>();
+        let selected = select_hnsw_carry_artifacts(&promoted, &provider, target);
+        assert!(selected.is_empty());
     }
 
     #[test]
