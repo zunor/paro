@@ -1858,7 +1858,7 @@ impl SearchIndexRegistry {
                             .iter()
                             .map(|artifact| artifact.stats.row_count)
                             .collect(),
-                        target_rows: config.maintenance.target_rows(config.dimension),
+                        target_rows: config.maintenance_target_rows(),
                         fanout: config.maintenance.compaction_fanout,
                     }
                 }),
@@ -3922,7 +3922,7 @@ fn select_hnsw_compaction_artifacts(
     artifacts: &[SearchArtifactRef],
     provider: &crate::search::HnswProviderConfig,
 ) -> Vec<SearchArtifactRef> {
-    let target_rows = provider.maintenance.target_rows(provider.dimension);
+    let target_rows = provider.maintenance_target_rows();
     let fanout = provider.maintenance.compaction_fanout;
     let row_counts = artifacts
         .iter()
@@ -3977,7 +3977,7 @@ fn select_hnsw_carry_artifacts(
     if incoming_rows == 0 {
         return Vec::new();
     }
-    let target_rows = provider.maintenance.target_rows(provider.dimension);
+    let target_rows = provider.maintenance_target_rows();
     let fanout = provider.maintenance.compaction_fanout.max(2);
     let shard_limit = provider.generation_layout.target_graph_rows;
     let carry_width = usize::try_from(fanout.saturating_sub(1)).unwrap_or(usize::MAX);
@@ -5105,7 +5105,7 @@ mod tests {
         let definition = hnsw_test_definition(94);
         let mut provider =
             crate::search::HnswProviderConfig::from_value(&definition.provider_config).unwrap();
-        let target = provider.maintenance.target_rows(provider.dimension);
+        let target = provider.maintenance_target_rows();
         let fanout = u64::from(provider.maintenance.compaction_fanout);
         provider.generation_layout.target_graph_rows = target
             .saturating_mul(fanout)
@@ -5137,11 +5137,38 @@ mod tests {
     }
 
     #[test]
+    fn hnsw_carry_closes_when_byte_quantum_exceeds_graph_digit() {
+        let definition = hnsw_test_definition(941);
+        let mut provider =
+            crate::search::HnswProviderConfig::from_value(&definition.provider_config).unwrap();
+        provider.dimension = 128;
+        provider.maintenance.target_vector_bytes = 256 * 1024 * 1024;
+        provider.maintenance.max_pending_vector_bytes = 1024 * 1024 * 1024;
+        provider.maintenance.compaction_fanout = 4;
+        provider.generation_layout.target_graph_rows = 2_000_000;
+        let target = provider.maintenance_target_rows();
+        assert_eq!(target, 500_000);
+
+        let artifacts = (0..3)
+            .map(|ordinal| hnsw_test_artifact(941, 500 + ordinal, target, 2, 32))
+            .collect::<Vec<_>>();
+        let selected = select_hnsw_carry_artifacts(&artifacts, &provider, target);
+
+        assert_eq!(selected.len(), 3);
+        assert_eq!(
+            selected
+                .iter()
+                .fold(target, |rows, artifact| rows + artifact.stats.row_count),
+            provider.generation_layout.target_graph_rows
+        );
+    }
+
+    #[test]
     fn hnsw_carry_never_promotes_past_generation_graph_target() {
         let definition = hnsw_test_definition(95);
         let mut provider =
             crate::search::HnswProviderConfig::from_value(&definition.provider_config).unwrap();
-        let target = provider.maintenance.target_rows(provider.dimension);
+        let target = provider.maintenance_target_rows();
         let fanout = u64::from(provider.maintenance.compaction_fanout);
         provider.generation_layout.target_graph_rows = target.saturating_mul(fanout);
         let artifacts = (0..fanout - 1)

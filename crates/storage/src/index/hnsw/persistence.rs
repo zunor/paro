@@ -13,8 +13,8 @@ use super::entry_points::EntryPoints;
 use super::graph::{GraphLayers, GraphSearchLimits, PredicatePartitionSeeds};
 use super::graph_links::GraphLinks;
 use super::hnsw_builder::{
-    hnsw_build_pool, hnsw_current_build_parallelism, HnswBuildExecutionPolicy,
-    HnswForegroundQueryGuard,
+    hnsw_build_pool, hnsw_current_build_parallelism, hnsw_yield_maintenance_to_foreground,
+    HnswBuildExecutionPolicy, HnswForegroundQueryGuard,
 };
 use super::predicate_scan::{
     PredicateScanBuildBlock, PredicateScanBuildColumn, PredicateScanLayout,
@@ -1400,6 +1400,9 @@ impl HnswIndex {
                 storage.as_ref(),
                 distance,
             )?;
+            if (position + 1).is_multiple_of(PROPOSAL_EXECUTION_QUANTUM) {
+                hnsw_yield_maintenance_to_foreground(execution_policy);
+            }
         }
 
         if warmup_end < num_vectors {
@@ -1469,6 +1472,7 @@ impl HnswIndex {
                                 })?
                             };
                         proposals.append(&mut quantum_proposals);
+                        hnsw_yield_maintenance_to_foreground(execution_policy);
                     }
                     Ok(proposals)
                 } else {
@@ -1502,6 +1506,12 @@ impl HnswIndex {
                 } else {
                     builder.publish_frozen_wave(proposals, storage.as_ref(), distance, 1);
                 }
+                // Reciprocal-link reduction is deterministic but has the same
+                // random-memory profile as proposal search. Make the wave
+                // barrier a complete scheduling boundary: required catch-up
+                // advances one published wave under sustained reads, then
+                // yields before starting the next immutable topology epoch.
+                hnsw_yield_maintenance_to_foreground(execution_policy);
                 wave_start = wave_end;
             }
         }

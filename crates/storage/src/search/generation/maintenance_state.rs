@@ -11,7 +11,7 @@ use crate::search::stats::{
 use paro_common::error::Result;
 
 use crate::search::tail::{provider_tail_exact_merge_policy, TailPendingSet};
-use crate::search::{HnswMaintenancePolicy, HnswProviderConfig, SearchIndexKind};
+use crate::search::{HnswProviderConfig, SearchIndexKind};
 
 #[derive(Debug, Clone, Copy)]
 struct ProviderMaintenanceWatermarks {
@@ -29,10 +29,9 @@ fn provider_maintenance_watermarks(
                 "HNSW maintenance state requires the registry-decoded provider contract",
             )
         })?;
-        let policy: HnswMaintenancePolicy = config.maintenance;
         return Ok(ProviderMaintenanceWatermarks {
-            target_rows: policy.target_rows(config.dimension),
-            max_pending_rows: policy.max_pending_rows(config.dimension),
+            target_rows: config.maintenance_target_rows(),
+            max_pending_rows: config.maintenance.max_pending_rows(config.dimension),
         });
     }
     let exact_tail = provider_tail_exact_merge_policy(definition.kind);

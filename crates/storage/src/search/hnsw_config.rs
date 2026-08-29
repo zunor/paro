@@ -29,6 +29,10 @@ use super::provider_config::{
     decode_provider_config, encode_provider_config, StrictProviderConfig,
 };
 
+/// Version 25 makes the maintenance radix closed under the generation graph
+/// bound. The base catch-up digit is the smaller of the byte-derived quantum
+/// and `target_graph_rows / compaction_fanout`, so a complete digit can always
+/// be promoted instead of accumulating an unbounded query fan-out.
 /// Version 24 makes the generation graph-shard target an explicit physical
 /// layout contract. Full builds and incremental radix carry now preserve the
 /// same upper bound despite rowset and maintenance history; indivisible base
@@ -67,7 +71,7 @@ use super::provider_config::{
 /// generation. Artifact-envelope compatibility is versioned independently;
 /// provider-config versions describe the definition and build contract rather
 /// than the physical checksum hierarchy used by a particular binary.
-pub const HNSW_PROVIDER_CONFIG_VERSION: u32 = 24;
+pub const HNSW_PROVIDER_CONFIG_VERSION: u32 = 25;
 
 pub const DEFAULT_HNSW_MAINTENANCE_TARGET_VECTOR_BYTES: u64 = 64 * 1024 * 1024;
 pub const DEFAULT_HNSW_MAINTENANCE_MAX_PENDING_VECTOR_BYTES: u64 = 256 * 1024 * 1024;
@@ -174,6 +178,26 @@ pub struct HnswProviderConfig {
 }
 
 impl HnswProviderConfig {
+    /// Base radix digit used by catch-up and generation compaction.
+    ///
+    /// `target_vector_bytes` bounds one ordinary maintenance build, while
+    /// `target_graph_rows` bounds the promoted graph. Treating them as
+    /// independent limits can make a radix carry mathematically impossible:
+    /// `fanout * target_rows` no longer fits in one generation graph, so every
+    /// catch-up appends another query shard forever. Coordinate the two
+    /// physical limits here so every admitted definition has a closed,
+    /// fanout-bounded compaction hierarchy.
+    pub fn maintenance_target_rows(&self) -> u64 {
+        let byte_target = self.maintenance.target_rows(self.dimension);
+        let graph_digit = self
+            .generation_layout
+            .target_graph_rows
+            .checked_div(u64::from(self.maintenance.compaction_fanout.max(2)))
+            .unwrap_or_default()
+            .max(1);
+        byte_target.min(graph_digit)
+    }
+
     pub fn validated(self) -> Result<Self> {
         self.validate()?;
         Ok(self)
@@ -315,6 +339,13 @@ impl HnswProviderConfig {
             return Err(paro_error::invalid_input(
                 "HNSW maintenance compaction_fanout must be at least 2",
             ));
+        }
+        if self.generation_layout.target_graph_rows < u64::from(self.maintenance.compaction_fanout)
+        {
+            return Err(paro_error::invalid_input(format!(
+                "HNSW generation target_graph_rows must be at least compaction_fanout ({}), got {}",
+                self.maintenance.compaction_fanout, self.generation_layout.target_graph_rows
+            )));
         }
         if self.filter_columns.len() > MAX_HNSW_FILTER_COLUMNS {
             return Err(paro_error::invalid_input(format!(
@@ -549,6 +580,34 @@ mod tests {
             policy.vector_bytes(768, policy.target_rows(768)),
             67_110_912
         );
+    }
+
+    #[test]
+    fn maintenance_digit_is_bounded_by_promoted_graph_capacity() {
+        let mut config = valid_config();
+        config.maintenance = HnswMaintenancePolicy {
+            target_vector_bytes: 200 * 1024 * 1024,
+            max_pending_vector_bytes: 800 * 1024 * 1024,
+            compaction_fanout: 4,
+        };
+        config.generation_layout.target_graph_rows = 1_000_000;
+        config.validate().unwrap();
+
+        assert!(config.maintenance.target_rows(config.dimension) > 250_000);
+        assert_eq!(config.maintenance_target_rows(), 250_000);
+    }
+
+    #[test]
+    fn generation_graph_must_hold_one_complete_radix_digit() {
+        let mut invalid = valid_config();
+        invalid.maintenance.compaction_fanout = 4;
+        invalid.generation_layout.target_graph_rows = 3;
+
+        assert!(invalid
+            .validate()
+            .unwrap_err()
+            .to_string()
+            .contains("must be at least compaction_fanout"));
     }
 
     #[test]

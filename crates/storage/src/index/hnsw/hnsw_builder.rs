@@ -81,6 +81,7 @@ static HNSW_FOREGROUND_PRESSURE_CHANGED: OnceLock<(Mutex<()>, Condvar)> = OnceLo
 /// lane, so sustained read traffic bounds interference without starving
 /// bounded-lag catch-up.
 const HNSW_FOREGROUND_PRESSURE_COOLDOWN: Duration = Duration::from_millis(250);
+const HNSW_MAINTENANCE_FOREGROUND_BACKOFF: Duration = Duration::from_millis(25);
 
 fn scheduler_micros() -> u64 {
     let micros = HNSW_SCHEDULER_EPOCH
@@ -185,6 +186,16 @@ pub(crate) fn hnsw_wait_for_foreground_quiet(max_wait: Duration) -> bool {
         }
     }
     true
+}
+
+/// Bound the memory-bandwidth share of required catch-up under sustained
+/// reads. Maintenance still completes one deterministic proposal quantum
+/// before reaching this point, so progress is guaranteed; the timed park
+/// prevents that one lane from becoming a continuous random-memory stream.
+pub(crate) fn hnsw_yield_maintenance_to_foreground(policy: HnswBuildExecutionPolicy) {
+    if policy == HnswBuildExecutionPolicy::Maintenance {
+        let _ = hnsw_wait_for_foreground_quiet(HNSW_MAINTENANCE_FOREGROUND_BACKOFF);
+    }
 }
 
 pub(crate) fn hnsw_current_build_parallelism(

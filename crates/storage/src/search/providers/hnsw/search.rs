@@ -21,6 +21,17 @@ use crate::index::hnsw::{
 /// parallel because its random navigation latency is not proportional to the
 /// number of predicate matches.
 const MIN_PARALLEL_EXACT_VECTOR_BYTES: u64 = 2 * 1024 * 1024;
+/// Sequential exact scans saturate memory bandwidth with only a fraction of
+/// the process search pool. Letting one mixed graph+tail query acquire every
+/// lane serializes concurrent clients behind a bandwidth-bound phase and
+/// turns FIFO fairness into head-of-line latency. Reserve five concurrent
+/// quanta at the process width; pure graph queries retain work-conserving
+/// access to every otherwise idle lane.
+const EXACT_TAIL_CONCURRENT_QUANTA: usize = 5;
+
+fn mixed_tail_query_lane_limit(process_width: usize) -> usize {
+    process_width.max(1).div_ceil(EXACT_TAIL_CONCURRENT_QUANTA)
+}
 use crate::index::PredicateTree;
 use crate::index::{DenseRowSet, ExactRowSet, PartitionExactRowSet};
 use crate::rowset::RowsetSharedPtr;
@@ -375,8 +386,13 @@ impl VectorSearchCursor {
             .enumerate()
             .filter_map(|(index, covered)| (!covered).then_some(index))
             .collect::<Vec<_>>();
+        let requested_search_lanes = if tail_segment_indices.is_empty() {
+            search_parallelism_slots
+        } else {
+            search_parallelism_slots.min(mixed_tail_query_lane_limit(parallelism_slots))
+        };
         let search_lease = acquire_search_dispatch_lanes(
-            search_parallelism_slots,
+            requested_search_lanes,
             tail_segment_indices
                 .len()
                 .saturating_add(partition_artifacts.len()),
@@ -1518,5 +1534,13 @@ mod tests {
             exact_search_parallelism_slots(8, rows_below_two_mib_at_32d + 1, 32,),
             8
         );
+    }
+
+    #[test]
+    fn mixed_exact_tail_reserves_concurrent_query_quanta() {
+        assert_eq!(mixed_tail_query_lane_limit(1), 1);
+        assert_eq!(mixed_tail_query_lane_limit(4), 1);
+        assert_eq!(mixed_tail_query_lane_limit(10), 2);
+        assert_eq!(mixed_tail_query_lane_limit(16), 4);
     }
 }
