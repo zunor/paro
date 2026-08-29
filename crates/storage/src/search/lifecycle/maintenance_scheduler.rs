@@ -11,7 +11,7 @@ use std::time::Instant;
 use paro_common::error::Result;
 
 use crate::search::artifact::{ArtifactGcContext, ArtifactLocation, GcDecision};
-use crate::search::capability::{SearchIndexDefinition, SearchIndexKind};
+use crate::search::capability::{SearchFreshnessPolicy, SearchIndexDefinition, SearchIndexKind};
 use crate::search::inline_sink::{
     AdmissionDecision, AdmissionGrant, AdmissionRejectReason, AdmissionWaitReason, CostEstimate,
     FlushSearchMode, InlineAdmissionRequest, MaintenanceBenefit, MaintenanceCost, SearchAdmission,
@@ -308,13 +308,16 @@ impl MaintenanceScheduler {
             GcDecision::Heal => SearchMaintenanceAction::CatchUp,
             GcDecision::Rebuild => SearchMaintenanceAction::Rebuild,
         };
-        // A complete L0 digit is the write-admission liveness boundary. Drain
-        // it before optional GC/repack work, regardless of the recommendation
-        // for older artifacts. A sub-target exact L0 is intentionally idle:
-        // sealing it would create tiny immutable graphs and permanent query
-        // fan-out, while its bounded exact scan is already queryable.
+        // A complete HNSW L0 digit is the write-admission liveness boundary.
+        // Drain it before optional GC/repack work. Only HNSW may leave a
+        // sub-target exact L0 idle: sealing it would create tiny immutable
+        // graphs and permanent query fan-out. Full-text and sparse artifacts
+        // are segment-local postings and have no graph-size reason to defer;
+        // Required freshness likewise admits no tail delay.
         if manifest.root.maintenance_state.recovery.tail_pending_rows > 0
-            && manifest.root.maintenance_state.recovery.priority != MaintenancePriority::Idle
+            && (definition.kind != SearchIndexKind::Hnsw
+                || definition.freshness_policy == SearchFreshnessPolicy::Required
+                || manifest.root.maintenance_state.recovery.priority != MaintenancePriority::Idle)
         {
             action = SearchMaintenanceAction::CatchUp;
         }

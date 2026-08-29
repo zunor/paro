@@ -11,20 +11,22 @@ use crate::rowset::{RowsetId, RowsetSharedPtr};
 
 use crate::search::capability::SearchIndexDefinition;
 use crate::search::manifest::LoadedManifest;
-use crate::search::tail::TailMutationKind;
+use crate::search::tail::{TailMutationKind, TailPendingEntry};
 
 #[derive(Debug, Clone)]
 pub(crate) struct CatchUpWorkItem {
+    /// Exact immutable tail identity admitted into this build quantum.
+    ///
+    /// Keeping the manifest entry beside its retained rowset prevents the
+    /// provider from accidentally observing tail appended after planning or
+    /// materializing more work than the scheduler admitted.
+    pub(crate) tail_entry: TailPendingEntry,
     pub(crate) rowset: RowsetSharedPtr,
 }
 
 #[derive(Debug, Clone, Default)]
 pub(crate) struct CatchUpPlan {
     pub(crate) items: Vec<CatchUpWorkItem>,
-    /// Canonical vector rows admitted into this immutable build quantum.
-    /// Carry compaction uses the exact planned cardinality to select the
-    /// destination size level before provider work starts.
-    pub(crate) planned_rows: u64,
 }
 
 impl CatchUpPlan {
@@ -77,23 +79,20 @@ impl CatchUpPlanner {
             }
             planned_rows = planned_rows.saturating_add(entry.row_count);
             items.push(CatchUpWorkItem {
+                tail_entry: entry.clone(),
                 rowset: rowset.clone(),
             });
         }
 
-        Ok(CatchUpPlan {
-            items,
-            planned_rows,
-        })
+        Ok(CatchUpPlan { items })
     }
 
     /// Plan every currently materializable tail rowset for an explicit
     /// foreground materialization request.
     ///
-    /// Background catch-up obeys the levelled L0 digit encoded in manifest
-    /// rate limits. CREATE INDEX / explicit OPTIMIZE instead asks for complete
-    /// physical coverage and must not turn a sub-target tail into one graph
-    /// per rowset merely because its background rate limit is zero.
+    /// Background catch-up obeys the immutable L0 build quantum encoded in
+    /// manifest rate limits. CREATE INDEX / explicit OPTIMIZE instead asks for
+    /// complete physical coverage and seals the remaining tail in one request.
     pub(crate) fn plan_all(
         &self,
         definition: &SearchIndexDefinition,
@@ -101,7 +100,6 @@ impl CatchUpPlanner {
         visible_by_id: &BTreeMap<RowsetId, RowsetSharedPtr>,
     ) -> Result<CatchUpPlan> {
         let mut items = Vec::new();
-        let mut planned_rows = 0u64;
         for entry in &manifest.tail_pending_entries {
             if matches!(entry.mutation, TailMutationKind::Delete) {
                 continue;
@@ -113,15 +111,12 @@ impl CatchUpPlanner {
             if !rowset_can_materialize_definition(definition, rowset) {
                 continue;
             }
-            planned_rows = planned_rows.saturating_add(entry.row_count);
             items.push(CatchUpWorkItem {
+                tail_entry: entry.clone(),
                 rowset: rowset.clone(),
             });
         }
-        Ok(CatchUpPlan {
-            items,
-            planned_rows,
-        })
+        Ok(CatchUpPlan { items })
     }
 }
 
