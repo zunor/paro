@@ -3,9 +3,12 @@
 
 use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
-use crate::index::hnsw::hnsw_builder::{hnsw_active_foreground_queries, HnswForegroundQueryGuard};
+use crate::index::hnsw::hnsw_builder::{
+    hnsw_active_foreground_queries, hnsw_foreground_pressure_active,
+    hnsw_wait_for_foreground_quiet, HnswForegroundQueryGuard,
+};
 use crate::index::hnsw::types::SearchParams;
 use crate::index::hnsw::{
     hnsw_artifact_compatibility, hnsw_artifact_uses_external_vectors, DistanceMetric,
@@ -21,6 +24,12 @@ use crate::index::hnsw::{
 /// parallel because its random navigation latency is not proportional to the
 /// number of predicate matches.
 const MIN_PARALLEL_EXACT_VECTOR_BYTES: u64 = 2 * 1024 * 1024;
+/// One MiB of checksum-covered payload per required-maintenance quantum.
+/// Quiet systems authenticate continuously; sustained readers still leave a
+/// bounded 10 MiB/s lane so catch-up publication cannot starve indefinitely.
+const MAINTENANCE_AUTH_CHUNKS_PER_SLICE: usize = 256;
+const MAINTENANCE_AUTH_QUIET_WAIT: Duration = Duration::from_millis(25);
+const MAINTENANCE_AUTH_MAX_DEFERRAL: Duration = Duration::from_millis(100);
 /// Fair share of the process search executor for a mixed graph+exact-tail
 /// query.
 ///
@@ -348,7 +357,7 @@ impl VectorSearchCursor {
                 self.reader_runtime.as_ref(),
                 artifact,
                 self.vector_dim,
-                HnswIntegrityActivation::QueryUse,
+                HnswReaderActivation::QueryUse,
                 || {
                     build_external_vector_binding(
                         artifact,
@@ -787,7 +796,7 @@ impl VectorSearchCursor {
             bind_hnsw_search_workspace(
                 index,
                 self.reader_runtime.as_ref(),
-                HnswIntegrityActivation::QueryUse,
+                HnswReaderActivation::QueryUse,
             )?;
         }
         let exact_scan_workload = inline_index.as_ref().map_or_else(
@@ -1001,7 +1010,7 @@ impl VectorSearchCursor {
             bind_hnsw_search_workspace(
                 &index,
                 self.reader_runtime.as_ref(),
-                HnswIntegrityActivation::QueryUse,
+                HnswReaderActivation::QueryUse,
             )?;
             validate_hnsw_index_contract(index.as_ref(), &self.expected_build_contract)?;
             return visible_segment
@@ -1185,7 +1194,7 @@ fn open_sidecar_hnsw_index(
         runtime,
         artifact,
         vector_dim,
-        HnswIntegrityActivation::QueryUse,
+        HnswReaderActivation::QueryUse,
         || {
             build_external_vector_binding(artifact, column_id, vector_dim, |segment_ref| {
                 (segment_ref.rowset_id == visible_segment.rowset_id
@@ -1201,7 +1210,7 @@ fn open_sidecar_hnsw_artifact<F>(
     runtime: &SearchReaderRuntime,
     artifact: &SearchArtifactRef,
     vector_dim: usize,
-    integrity_activation: HnswIntegrityActivation,
+    activation: HnswReaderActivation,
     external_binding: F,
 ) -> Result<Option<Arc<HnswIndex>>>
 where
@@ -1254,7 +1263,20 @@ where
             // or emitting the same data-corruption error on every query.
             return Ok(None);
         }
-        bind_hnsw_search_workspace(index, runtime, integrity_activation)?;
+        match activation {
+            HnswReaderActivation::ForegroundPublication => {
+                // The writer has finished, the bytes are immutable, and this
+                // definition is not query-visible yet. Authenticate the
+                // persisted payload continuously so the first query never
+                // becomes an implicit storage-validation job.
+                index.authenticate_persisted_payload()?;
+            }
+            HnswReaderActivation::MaintenancePublication => {
+                authenticate_maintenance_payload(index)?;
+            }
+            HnswReaderActivation::Recovery | HnswReaderActivation::QueryUse => {}
+        }
+        bind_hnsw_search_workspace(index, runtime, activation)?;
     }
     Ok(index)
 }
@@ -1356,6 +1378,7 @@ pub(crate) fn prewarm_hnsw_generation_readers(
     column_id: u32,
     vector_dim: usize,
     expected_contract: &HnswBuildContract,
+    activation: HnswReaderActivation,
 ) -> Result<usize> {
     let rowsets = visible_rowsets
         .iter()
@@ -1370,35 +1393,29 @@ pub(crate) fn prewarm_hnsw_generation_readers(
                 ArtifactLocation::SidecarArtifactFile { .. }
             )
     }) {
-        let index = open_sidecar_hnsw_artifact(
-            runtime,
-            artifact,
-            vector_dim,
-            HnswIntegrityActivation::OnFirstQuery,
-            || {
-                build_external_vector_binding_from_storage(
-                    artifact,
-                    column_id,
-                    vector_dim,
-                    |segment_ref| {
-                        let Some(rowset) = rowsets.get(&segment_ref.rowset_id) else {
-                            return Ok(None);
-                        };
-                        rowset.load()?;
-                        Ok(rowset
-                            .segments()
-                            .iter()
-                            .find(|segment| segment.segment_id() == segment_ref.segment_id)
-                            .cloned()
-                            .map(|segment| {
-                                let rows = segment.num_rows();
-                                (segment, rows)
-                            }))
-                    },
-                )
-                .map(Some)
-            },
-        )?;
+        let index = open_sidecar_hnsw_artifact(runtime, artifact, vector_dim, activation, || {
+            build_external_vector_binding_from_storage(
+                artifact,
+                column_id,
+                vector_dim,
+                |segment_ref| {
+                    let Some(rowset) = rowsets.get(&segment_ref.rowset_id) else {
+                        return Ok(None);
+                    };
+                    rowset.load()?;
+                    Ok(rowset
+                        .segments()
+                        .iter()
+                        .find(|segment| segment.segment_id() == segment_ref.segment_id)
+                        .cloned()
+                        .map(|segment| {
+                            let rows = segment.num_rows();
+                            (segment, rows)
+                        }))
+                },
+            )
+            .map(Some)
+        })?;
         let Some(index) = index else {
             return Err(paro_error::artifact_not_ready(format!(
                 "HNSW artifact for generation {} is not queryable during reader activation",
@@ -1412,25 +1429,42 @@ pub(crate) fn prewarm_hnsw_generation_readers(
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum HnswIntegrityActivation {
-    /// Generation activation constructs and binds immutable readers before
-    /// they become visible, but must not initiate a full-payload scan. The
-    /// first real query activates optional sweeping while holding the
-    /// foreground reservation, so low-priority I/O cannot race service
-    /// readiness or make an unused generation resident.
-    OnFirstQuery,
+pub(crate) enum HnswReaderActivation {
+    /// Recovery reconstructs immutable typed readers but preserves lazy mmap
+    /// residency. Bootstrapping many definitions must not create a process-wide
+    /// I/O storm or evict the subset that actually receives traffic.
+    Recovery,
+    /// Foreground CREATE INDEX is about to expose its first generation. There
+    /// is no serving capability to protect, so authenticate continuously.
+    ForegroundPublication,
+    /// Background catch-up is about to publish an immutable delta. Required
+    /// authentication yields in bounded slices to an already-serving index.
+    MaintenancePublication,
+    /// A real query activates optional background authentication while holding
+    /// the foreground reservation. It does not issue whole-artifact residency
+    /// hints from the latency-sensitive path.
     QueryUse,
+}
+
+fn authenticate_maintenance_payload(index: &Arc<HnswIndex>) -> Result<()> {
+    let mut forced_progress_at = Instant::now() + MAINTENANCE_AUTH_MAX_DEFERRAL;
+    index.authenticate_persisted_payload_in_slices(MAINTENANCE_AUTH_CHUNKS_PER_SLICE, || {
+        while hnsw_foreground_pressure_active() && Instant::now() < forced_progress_at {
+            let _ = hnsw_wait_for_foreground_quiet(MAINTENANCE_AUTH_QUIET_WAIT);
+        }
+        forced_progress_at = Instant::now() + MAINTENANCE_AUTH_MAX_DEFERRAL;
+    })
 }
 
 fn bind_hnsw_search_workspace(
     index: &Arc<HnswIndex>,
     runtime: &SearchReaderRuntime,
-    integrity_activation: HnswIntegrityActivation,
+    activation: HnswReaderActivation,
 ) -> Result<()> {
     if let Some(buffer_pool) = runtime.buffer_pool() {
         index.bind_search_buffer_pool(buffer_pool)?;
     }
-    if integrity_activation == HnswIntegrityActivation::QueryUse {
+    if activation == HnswReaderActivation::QueryUse {
         runtime.schedule_hnsw_integrity_verification(index);
     }
     Ok(())

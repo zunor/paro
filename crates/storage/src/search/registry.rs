@@ -75,7 +75,7 @@ use super::manifest::{
     GenerationManifestRoot, LoadedManifest, ManifestDelta, ManifestDeltaEntry, ManifestShard,
     ManifestStore,
 };
-use super::providers::hnsw::search::prewarm_hnsw_generation_readers;
+use super::providers::hnsw::search::{prewarm_hnsw_generation_readers, HnswReaderActivation};
 use super::sidecar::{SearchReaderRuntime, SidecarArtifactStore};
 use super::sidecar_builder::ProviderSidecarArtifactBuilder;
 use super::staged_generation::{StagedSearchGeneration, StagedSearchGenerationInit};
@@ -805,6 +805,27 @@ impl SearchIndexRegistry {
         self.update_definition(
             definition.clone(),
             SearchDefinitionOrigin::catalog(definition.definition_id),
+            HnswReaderActivation::Recovery,
+        )
+    }
+
+    /// Attach a definition whose complete immutable generation was installed
+    /// by the current online commit.
+    ///
+    /// The durable tablet mutation installs the directory and head before the
+    /// catalog definition enters the queryable registry view. This online-only
+    /// boundary performs full HNSW payload authentication while no foreground
+    /// cursor can observe the generation. Recovery deliberately uses
+    /// [`Self::install_definition`] and retains lazy authentication so startup
+    /// scales with the working set.
+    pub(crate) fn install_published_definition(
+        &self,
+        definition: SearchIndexDefinition,
+    ) -> Result<()> {
+        self.update_definition(
+            definition.clone(),
+            SearchDefinitionOrigin::catalog(definition.definition_id),
+            HnswReaderActivation::ForegroundPublication,
         )
     }
 
@@ -1457,7 +1478,11 @@ impl SearchIndexRegistry {
             self.discard_unpublished_sidecars(&sidecar_store, &sidecar_file_ids);
             return Err(error);
         }
-        if let Err(error) = self.prepare_artifact_readers(&state, &result.artifact_refs) {
+        if let Err(error) = self.prepare_artifact_readers(
+            &state,
+            &result.artifact_refs,
+            HnswReaderActivation::MaintenancePublication,
+        ) {
             self.discard_unpublished_sidecars(&sidecar_store, &sidecar_file_ids);
             return Err(error);
         }
@@ -1670,7 +1695,11 @@ impl SearchIndexRegistry {
             self.discard_unpublished_sidecars(&sidecar_store, &sidecar_file_ids);
             return Err(error);
         }
-        if let Err(error) = self.prepare_artifact_readers(&state, &result.artifact_refs) {
+        if let Err(error) = self.prepare_artifact_readers(
+            &state,
+            &result.artifact_refs,
+            HnswReaderActivation::MaintenancePublication,
+        ) {
             self.discard_unpublished_sidecars(&sidecar_store, &sidecar_file_ids);
             return Err(error);
         }
@@ -2136,7 +2165,11 @@ impl SearchIndexRegistry {
 
         let repacked_count = repacked_artifacts.len();
         let sidecar_file_ids = sidecar_file_ids_for_artifacts(&repacked_artifacts);
-        if let Err(error) = self.prepare_artifact_readers(&state, &repacked_artifacts) {
+        if let Err(error) = self.prepare_artifact_readers(
+            &state,
+            &repacked_artifacts,
+            HnswReaderActivation::MaintenancePublication,
+        ) {
             self.discard_unpublished_sidecars(&store, &sidecar_file_ids);
             return Err(error);
         }
@@ -2482,6 +2515,7 @@ impl SearchIndexRegistry {
         &self,
         definition: SearchIndexDefinition,
         origin: SearchDefinitionOrigin,
+        activation: HnswReaderActivation,
     ) -> Result<()> {
         validate_definition(&definition, &self.tablet)?;
         let publication_guard = self.tablet.acquire_search_generation_publish_guard()?;
@@ -2555,7 +2589,7 @@ impl SearchIndexRegistry {
                     state.with_generation_floor(loaded.root.generation_id, loaded.root.build_epoch);
             }
         }
-        self.prepare_generation_readers(&state)?;
+        self.prepare_generation_readers(&state, activation)?;
         let definition_id = definition.definition_id;
         let removed_seed_states = self.mutate_view(|view| {
             let mut removed = Vec::new();
@@ -3517,7 +3551,7 @@ impl SearchIndexRegistry {
         next_state: &SearchDefinitionState,
         publication_guard: &crate::tablet::SearchGenerationPublishGuard<'_>,
     ) -> Result<SearchGenerationPublishCompletion> {
-        self.prepare_generation_readers(next_state)?;
+        self.prepare_generation_readers(next_state, HnswReaderActivation::MaintenancePublication)?;
         publish_head_for_state(&self.tablet, &self.manifests, next_state, publication_guard)
     }
 
@@ -3528,14 +3562,18 @@ impl SearchIndexRegistry {
     /// binding and parsing the graph is generation lifecycle work; doing it
     /// lazily in the first query creates a multi-second latency cliff and a
     /// thundering herd after recovery or catch-up publication.
-    fn prepare_generation_readers(&self, state: &SearchDefinitionState) -> Result<()> {
+    fn prepare_generation_readers(
+        &self,
+        state: &SearchDefinitionState,
+        activation: HnswReaderActivation,
+    ) -> Result<()> {
         if state.definition.kind != SearchIndexKind::Hnsw {
             return Ok(());
         }
         let Some(manifest) = state.manifest.as_ref() else {
             return Ok(());
         };
-        self.prepare_artifact_readers(state, &manifest.artifacts.artifacts)
+        self.prepare_artifact_readers(state, &manifest.artifacts.artifacts, activation)
     }
 
     /// Complete the expensive half of generation activation before entering
@@ -3548,6 +3586,7 @@ impl SearchIndexRegistry {
         &self,
         state: &SearchDefinitionState,
         artifacts: &[SearchArtifactRef],
+        activation: HnswReaderActivation,
     ) -> Result<()> {
         if state.definition.kind != SearchIndexKind::Hnsw || artifacts.is_empty() {
             return Ok(());
@@ -3568,6 +3607,7 @@ impl SearchIndexRegistry {
             column_id,
             provider.dimension as usize,
             &provider.build_contract(),
+            activation,
         )?;
         Ok(())
     }
@@ -3852,6 +3892,7 @@ impl SearchIndexRegistry {
                     let _ = self.update_definition(
                         definition,
                         SearchDefinitionOrigin::schema_seed(column_id),
+                        HnswReaderActivation::Recovery,
                     );
                 }
                 Err(err) => {
@@ -5384,6 +5425,110 @@ mod tests {
             .try_acquire_compaction_layout_lease()
             .unwrap()
             .is_some());
+    }
+
+    #[test]
+    fn online_definition_attach_authenticates_staged_hnsw_before_visibility() {
+        use std::io::{Read, Seek, SeekFrom, Write};
+
+        let root = TempDir::new().unwrap();
+        let table = create_table_without_default_indexes(
+            root.path(),
+            &[LogicalType::Array(Box::new(LogicalType::Float), 4)],
+        );
+        let embeddings = (0..1_024)
+            .map(|row| {
+                let row = row as f32;
+                vec![row, row + 0.25, row + 0.5, row + 0.75]
+            })
+            .collect::<Vec<_>>();
+        table
+            .append(&test_chunk_from_vectors(vec![test_embedding_vector(
+                &embeddings,
+                4,
+            )]))
+            .unwrap();
+
+        let provider_config = test_hnsw_provider_config(4, 16, 64, 4_096);
+        let definition = SearchIndexDefinition {
+            definition_id: 92,
+            table_id: table.tablet_id(),
+            name: "published_vec_hnsw".to_string(),
+            kind: SearchIndexKind::Hnsw,
+            column_ids: vec![0],
+            expression: None,
+            freshness_policy: SearchFreshnessPolicy::default_for_kind(SearchIndexKind::Hnsw),
+            config_fingerprint: SearchIndexDefinition::compute_config_fingerprint(
+                SearchIndexKind::Hnsw,
+                &[0],
+                None,
+                &provider_config,
+            ),
+            provider_config,
+        };
+        let staged = table
+            .stage_search_definition_generation(
+                definition.clone(),
+                8_001,
+                SearchBuildStopCheck::new(|| false),
+            )
+            .unwrap();
+        staged.prepare_durable_handoff().unwrap();
+        table
+            .apply_search_generation_publish(&staged.mutation())
+            .unwrap();
+        staged.mark_published().unwrap();
+
+        let head = table
+            .tablet()
+            .search_generation_head(definition.definition_id)
+            .expect("published generation head");
+        let manifest = table
+            .search_registry()
+            .manifests
+            .load_manifest_for_head(&head)
+            .unwrap()
+            .expect("published generation manifest");
+        let artifact = manifest
+            .artifacts
+            .artifacts
+            .first()
+            .expect("published HNSW artifact");
+        let ArtifactLocation::SidecarArtifactFile {
+            file_id,
+            offset,
+            len,
+            ..
+        } = artifact.location
+        else {
+            panic!("staged HNSW generation must use a sidecar artifact");
+        };
+        let corrupt_offset = offset + len / 2;
+        let package =
+            SidecarArtifactStore::new(table.tablet().data_dir().clone()).package_path(file_id);
+        let mut file = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(package)
+            .unwrap();
+        file.seek(SeekFrom::Start(corrupt_offset)).unwrap();
+        let mut byte = [0u8; 1];
+        file.read_exact(&mut byte).unwrap();
+        byte[0] ^= 0x5a;
+        file.seek(SeekFrom::Start(corrupt_offset)).unwrap();
+        file.write_all(&byte).unwrap();
+        file.sync_all().unwrap();
+
+        let error = table
+            .register_published_search_definition(definition)
+            .expect_err("online attach must reject corrupt durable HNSW payload");
+        assert!(error.to_string().contains("checksum mismatch"), "{error}");
+        assert!(
+            table
+                .vector_capability(0, DistanceMetric::Euclidean)
+                .is_none(),
+            "failed publication activation must not expose a capability"
+        );
     }
 
     #[test]

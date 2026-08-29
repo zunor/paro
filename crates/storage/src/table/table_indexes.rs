@@ -84,6 +84,18 @@ impl TableHandle {
         self.search_registry.install_definition(definition)
     }
 
+    /// Register a definition immediately after this process installed its
+    /// complete durable generation. Publication verification finishes before
+    /// the capability enters the registry view; recovery registration remains
+    /// lazy through [`Self::register_search_definition`].
+    pub fn register_published_search_definition(
+        &self,
+        definition: SearchIndexDefinition,
+    ) -> Result<()> {
+        self.search_registry
+            .install_published_definition(definition)
+    }
+
     pub fn stage_search_definition_generation(
         &self,
         definition: SearchIndexDefinition,

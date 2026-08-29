@@ -460,7 +460,7 @@ impl IndexBackfillPublishTask {
             )?,
             ..definition
         };
-        storage.register_search_definition(definition)
+        storage.register_published_search_definition(definition)
     }
 
     fn search_kind(index_type: CatalogIndexType) -> Option<SearchIndexKind> {
