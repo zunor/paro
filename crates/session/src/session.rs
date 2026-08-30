@@ -499,6 +499,7 @@ impl Session {
             time: paro_context::StatementTimeContext::capture(
                 self.transaction.transaction_started_at(),
             ),
+            random: self.state.random_engine.clone(),
             databases: Arc::new(AttachedDatabaseDirectory::new(
                 self.instance.database_registry().visible_generation(),
                 Some(self.current_database.name().to_string()),

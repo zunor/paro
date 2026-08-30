@@ -288,6 +288,10 @@ impl FunctionExecContext for QueryRuntimeContext {
         self.session.time.transaction_timestamp_micros()
     }
 
+    fn next_random(&self) -> Option<f64> {
+        Some(self.session.random.next_f64())
+    }
+
     fn is_interrupted(&self) -> bool {
         self.cancellation.is_cancelled()
     }

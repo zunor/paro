@@ -227,12 +227,20 @@ a	1	5
 a	2	5
 b	4	5
 
+EXPLAIN
 SELECT
     first_value(random()) OVER () = first_value(random()) OVER ()
         AS volatile_inputs_are_independent
 FROM (VALUES (1)) AS volatile_window_input(x);
-volatile_inputs_are_independent
-false
+QUERY PLAN
+PROJECTION  (rows=1)
+  Output: volatile_inputs_are_independent
+  ->  WINDOW  (rows=1)
+    ->  PROJECTION  (rows=1)
+      Output: expression_1, random(), random()
+      ->  PROJECTION  (rows=1)
+        Output: 42
+        ->  VALUES  (rows=1)
 
 SELECT
     x,

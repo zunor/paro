@@ -6,10 +6,9 @@
 use std::sync::Arc;
 
 use super::file_opener::FileOpener;
-use super::random::RandomEngine;
 use crate::prepared::store::{PortalEntry, PreparedState, PreparedStatementEntry};
 use paro_catalog::search_path::CatalogSearchPath;
-use paro_context::CompileEnvironmentKey;
+use paro_context::{CompileEnvironmentKey, SessionRandom};
 use paro_execution::query_executor::compiled::CompiledStatement;
 use paro_parser::ast::Statement;
 
@@ -33,7 +32,7 @@ pub struct SessionState {
     pub prepared: PreparedState,
     pub user_name: String,
     pub application_name: String,
-    pub random_engine: RandomEngine,
+    pub random_engine: Arc<SessionRandom>,
     pub file_search_path: String,
     pub file_opener: Option<Arc<dyn FileOpener>>,
     simple_query_plan: Option<SimpleQueryPlanCacheEntry>,
@@ -47,7 +46,7 @@ impl SessionState {
             prepared: PreparedState::default(),
             user_name: user_name.into(),
             application_name: String::new(),
-            random_engine: RandomEngine::new(),
+            random_engine: Arc::new(SessionRandom::new()),
             file_search_path: String::new(),
             file_opener: None,
             simple_query_plan: None,
@@ -221,13 +220,13 @@ impl SessionState {
     }
 
     #[inline]
-    pub fn random_engine(&self) -> &RandomEngine {
+    pub fn random_engine(&self) -> &SessionRandom {
         &self.random_engine
     }
 
     #[inline]
     pub fn random(&self) -> f64 {
-        self.random_engine.next_random()
+        self.random_engine.next_f64()
     }
 
     #[inline]

@@ -34,6 +34,7 @@ pub(crate) fn test_session(search_path: Vec<CatalogSearchEntry>) -> Arc<Statemen
         options: base.options.clone(),
         input: base.input.clone(),
         time: base.time,
+        random: base.random.clone(),
         databases: base.databases.clone(),
         limits: base.limits.clone(),
         cancellation: base.cancellation.clone(),
