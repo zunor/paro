@@ -18,7 +18,6 @@ use std::time::{Duration, Instant};
 use arc_swap::ArcSwap;
 use paro_scheduler::scheduler::TaskScheduler;
 
-use crate::index::hnsw::hnsw_foreground_pressure_active;
 use crate::metrics::storage_metrics;
 use crate::rowset::{RowsetId, RowsetSharedPtr};
 use crate::tablet::{
@@ -350,7 +349,7 @@ impl SearchIndexRegistry {
         self.install_definition_with_origin(
             definition.clone(),
             SearchDefinitionOrigin::catalog(definition.definition_id),
-            HnswReaderActivationPolicy::PUBLICATION,
+            HnswReaderActivationPolicy::ATTACH_PUBLISHED,
         )
     }
 
@@ -388,7 +387,7 @@ impl SearchIndexRegistry {
 
         let staged_manifests = ManifestStore::new(staging_root.clone());
         let sidecar_store = SidecarArtifactStore::new(staging_root.clone());
-        let builder = ProviderSidecarArtifactBuilder::new(sidecar_store);
+        let builder = ProviderSidecarArtifactBuilder::new(sidecar_store.clone());
         let hnsw_provider = if definition.kind == SearchIndexKind::Hnsw {
             Some(definition.hnsw_provider_config()?)
         } else {
@@ -419,6 +418,21 @@ impl SearchIndexRegistry {
                 &visible_rowsets,
                 &result.artifact_refs,
             )?;
+            if let Some(provider) = hnsw_provider.as_ref() {
+                let staged_runtime = SearchReaderRuntime::new(sidecar_store.clone());
+                prewarm_hnsw_generation_readers(
+                    &staged_runtime,
+                    &result.artifact_refs,
+                    &visible_rowsets,
+                    *definition.column_ids.first().ok_or_else(|| {
+                        paro_error::internal("HNSW staged generation requires one vector column")
+                    })?,
+                    provider.dimension as usize,
+                    &provider.build_contract(),
+                    None,
+                    HnswReaderActivationPolicy::PREPARED_PUBLICATION,
+                )?;
+            }
 
             let visible_snapshot =
                 collect_visible_snapshot(&definition, snapshot_version, &visible_rowsets)?;

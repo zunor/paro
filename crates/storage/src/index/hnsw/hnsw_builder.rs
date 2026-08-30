@@ -107,13 +107,12 @@ pub(crate) fn hnsw_foreground_pressure_active() -> bool {
     )
 }
 
-/// Whether no HNSW query has entered the provider for `minimum_idle`.
+/// Per-definition foreground activity used by optional residency work.
 ///
-/// Required tail catch-up uses the short foreground reservation above because
-/// it must make bounded progress. Optional generation compaction is different:
-/// publishing a replacement graph invalidates the serving generation's hot
-/// mmap working set. Its definition-pinned idle window therefore gates
-/// admission separately and is never allowed to delay freshness work.
+/// Integrity authentication may rotate past a hot definition without coupling
+/// unrelated tenants through the process-wide query census. Required freshness
+/// and levelled graph compaction do not wait for an idle window: their HNSW
+/// execution policy instead shrinks at deterministic wave barriers.
 #[derive(Debug, Default)]
 pub(crate) struct HnswQueryActivity {
     active_queries: AtomicUsize,
@@ -133,9 +132,9 @@ impl HnswQueryActivity {
         }
     }
 
-    /// Optional generation compaction is admitted per definition. A hot
-    /// tenant or table must not prevent unrelated definitions from retiring
-    /// their own graph fan-out.
+    /// Optional residency work is admitted per definition. A hot tenant or
+    /// table must not prevent unrelated definitions from authenticating their
+    /// immutable artifacts.
     pub(crate) fn quiet_for(&self, minimum_idle: Duration) -> bool {
         if self.active_queries.load(Ordering::Acquire) != 0 {
             return false;
@@ -195,10 +194,10 @@ impl Drop for HnswQueryActivityGuard {
 /// Number of foreground HNSW queries currently inside provider execution.
 ///
 /// Search and maintenance use the same process-width contract but execute in
-/// separate fixed worker pools. Exposing the query census lets mixed
-/// graph+exact-tail searches divide the search pool by actual demand: one
-/// query can use the idle machine, while concurrent queries receive a fair
-/// share without baking a benchmark-specific lane count into the provider.
+/// separate fixed worker pools. Exposing the query census lets every HNSW
+/// query divide the search pool by actual demand: one query can use the idle
+/// machine, while concurrent queries receive a fair share without baking a
+/// benchmark-specific lane count into the provider.
 pub(crate) fn hnsw_active_foreground_queries() -> usize {
     HNSW_ACTIVE_FOREGROUND_QUERIES
         .load(Ordering::Acquire)

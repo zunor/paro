@@ -324,7 +324,6 @@ fn hnsw_provider_config(
         "maintenance_target_vector_bytes",
         "maintenance_max_pending_vector_bytes",
         "maintenance_compaction_fanout",
-        "maintenance_compaction_min_idle_ms",
         "filter_columns",
         "filter_block_rows",
         "filter_m",
@@ -611,11 +610,6 @@ fn hnsw_provider_config(
             u64::from(paro_storage::search::DEFAULT_HNSW_MAINTENANCE_COMPACTION_FANOUT),
         )?)
         .map_err(|_| paro_error::out_of_range("HNSW maintenance_compaction_fanout"))?,
-        compaction_min_idle_ms: parse_u64_index_option(
-            options,
-            "maintenance_compaction_min_idle_ms",
-            paro_storage::search::DEFAULT_HNSW_MAINTENANCE_COMPACTION_MIN_IDLE_MS,
-        )?,
     };
     let generation_layout = paro_storage::search::HnswGenerationLayout {
         target_graph_rows: parse_u64_index_option(

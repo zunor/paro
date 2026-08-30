@@ -2037,7 +2037,6 @@ mod tests {
                     "target_vector_bytes": crate::search::DEFAULT_HNSW_MAINTENANCE_TARGET_VECTOR_BYTES,
                     "max_pending_vector_bytes": crate::search::DEFAULT_HNSW_MAINTENANCE_MAX_PENDING_VECTOR_BYTES,
                     "compaction_fanout": crate::search::DEFAULT_HNSW_MAINTENANCE_COMPACTION_FANOUT,
-                    "compaction_min_idle_ms": crate::search::DEFAULT_HNSW_MAINTENANCE_COMPACTION_MIN_IDLE_MS
                 },
                 "build_seed": 1,
                 "proposal_wave_max_size": crate::search::DEFAULT_HNSW_PROPOSAL_WAVE_MAX_SIZE,

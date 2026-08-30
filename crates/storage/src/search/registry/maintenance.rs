@@ -132,7 +132,7 @@ impl SearchIndexRegistry {
         if let Err(error) = self.activate_artifact_readers(
             &state,
             &result.artifact_refs,
-            HnswReaderActivationPolicy::PUBLICATION,
+            HnswReaderActivationPolicy::PREPARED_PUBLICATION,
         ) {
             self.discard_unpublished_sidecars(&sidecar_store, &sidecar_file_ids);
             return Err(error);
@@ -236,35 +236,16 @@ impl SearchIndexRegistry {
                 .unmanifested_hnsw
                 .get(&definition_id)
                 .is_some_and(|rowsets| !rowsets.is_empty());
-            if admission.reserved_rows > 0
-                || admission.reserved_bytes > 0
-                || has_unmanifested_debt
-                || manifest.root.maintenance_state.recovery.tail_pending_rows > 0
+            if admission.reserved_rows > 0 || admission.reserved_bytes > 0 || has_unmanifested_debt
             {
                 // Generation compaction is optional and must never enter the
                 // build executor ahead of freshness work already admitted by
-                // foreground writers.
+                // foreground writers. A sub-quantum immutable tail is not an
+                // admitted build: compaction preserves it verbatim and must be
+                // allowed to reduce existing graph fan-out while it waits for
+                // the next complete L0 digit.
                 return Ok(false);
             }
-        }
-        let compaction_idle = Duration::from_millis(
-            state
-                .hnsw_provider_config
-                .as_ref()
-                .expect("validated HNSW state has provider config")
-                .maintenance
-                .compaction_min_idle_ms,
-        );
-        let query_activity = state
-            .hnsw_query_activity
-            .as_ref()
-            .ok_or_else(|| paro_error::internal("HNSW definition is missing query activity"))?;
-        if !force_rebuild && !query_activity.quiet_for(compaction_idle) {
-            // Coalescing changes neither freshness nor correctness. Do not
-            // replace a hot serving generation between foreground bursts.
-            // Required tail catch-up has a separate bounded-lag path and is
-            // intentionally unaffected by this definition-pinned idle gate.
-            return Ok(false);
         }
         let generation_id = state
             .generation
@@ -292,15 +273,8 @@ impl SearchIndexRegistry {
         let build_epoch = self.foreground_ingest_epoch.load(Ordering::Acquire);
         let foreground_epoch = Arc::clone(&self.foreground_ingest_epoch);
         let definition_token = build_token.clone();
-        let foreground_preempted = Arc::new(AtomicBool::new(false));
-        let stop_for_foreground = Arc::clone(&foreground_preempted);
         let stop_check = SearchBuildStopCheck::new(move || {
-            let foreground_active = !force_rebuild && hnsw_foreground_pressure_active();
-            if foreground_active {
-                stop_for_foreground.store(true, Ordering::Release);
-            }
-            foreground_active
-                || foreground_epoch.load(Ordering::Acquire) != build_epoch
+            foreground_epoch.load(Ordering::Acquire) != build_epoch
                 || definition_token.should_stop()
         });
         let input = SidecarBuildInput {
@@ -324,25 +298,16 @@ impl SearchIndexRegistry {
             Err(error)
                 if error.is_query_canceled()
                     && (self.foreground_ingest_epoch.load(Ordering::Acquire) != build_epoch
-                        || build_token.should_stop()
-                        || foreground_preempted.load(Ordering::Acquire)) =>
+                        || build_token.should_stop()) =>
             {
-                // Foreground reads and freshness debt preempt optional graph
-                // coalescing. The level-triggered scheduler retries it after
-                // the table becomes quiet; required catch-up uses a separate
-                // build path and retains its one-lane progress guarantee.
+                // Foreground ingest and definition replacement preempt graph
+                // coalescing because they change its immutable input. Reads
+                // do not: the maintenance build policy already shrinks to one
+                // lane at deterministic wave barriers while queries are live.
                 return Ok(false);
             }
             Err(error) => return Err(error),
         };
-        if !force_rebuild && !query_activity.quiet_for(compaction_idle) {
-            // A query may enter after the builder's final cooperative stop
-            // point. Discard the unpublished candidate rather than atomically
-            // replacing the serving generation with a cold reader image.
-            let sidecar_file_ids = sidecar_file_ids_for_artifacts(&result.artifact_refs);
-            self.discard_unpublished_sidecars(&sidecar_store, &sidecar_file_ids);
-            return Ok(false);
-        }
         let sidecar_file_ids = sidecar_file_ids_for_artifacts(&result.artifact_refs);
         if let Err(error) = validate_hnsw_compaction_result(
             &state.definition,
@@ -356,7 +321,7 @@ impl SearchIndexRegistry {
         if let Err(error) = self.activate_artifact_readers(
             &state,
             &result.artifact_refs,
-            HnswReaderActivationPolicy::PUBLICATION,
+            HnswReaderActivationPolicy::PREPARED_PUBLICATION,
         ) {
             self.discard_unpublished_sidecars(&sidecar_store, &sidecar_file_ids);
             return Err(error);
@@ -1021,7 +986,7 @@ impl SearchIndexRegistry {
         if let Err(error) = self.activate_artifact_readers(
             &state,
             &repacked_artifacts,
-            HnswReaderActivationPolicy::PUBLICATION,
+            HnswReaderActivationPolicy::PREPARED_PUBLICATION,
         ) {
             self.discard_unpublished_sidecars(&store, &sidecar_file_ids);
             return Err(error);

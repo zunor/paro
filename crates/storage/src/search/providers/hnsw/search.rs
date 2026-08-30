@@ -23,15 +23,14 @@ use crate::index::hnsw::{
 /// parallel because its random navigation latency is not proportional to the
 /// number of predicate matches.
 const MIN_PARALLEL_EXACT_VECTOR_BYTES: u64 = 2 * 1024 * 1024;
-/// Fair share of the process search executor for a mixed graph+exact-tail
-/// query.
+/// Fair share of the process search executor for one HNSW query.
 ///
 /// A static narrow grant protects throughput but strands workers for a lone
 /// query; a static wide grant serializes concurrent readers. The provider
 /// guard is entered before predicate preparation, so by dispatch time it is a
 /// process-wide census of runnable HNSW queries. Divide the fixed executor by
 /// that demand and let the admission layer enforce the physical bound.
-fn mixed_tail_query_lane_limit(process_width: usize, active_queries: usize) -> usize {
+fn hnsw_query_lane_limit(process_width: usize, active_queries: usize) -> usize {
     process_width
         .max(1)
         .checked_div(active_queries.max(1))
@@ -399,14 +398,10 @@ impl VectorSearchCursor {
             .enumerate()
             .filter_map(|(index, covered)| (!covered).then_some(index))
             .collect::<Vec<_>>();
-        let requested_search_lanes = if tail_segment_indices.is_empty() {
-            search_parallelism_slots
-        } else {
-            search_parallelism_slots.min(mixed_tail_query_lane_limit(
-                parallelism_slots,
-                hnsw_active_foreground_queries(),
-            ))
-        };
+        let requested_search_lanes = search_parallelism_slots.min(hnsw_query_lane_limit(
+            parallelism_slots,
+            hnsw_active_foreground_queries(),
+        ));
         let search_lease = acquire_search_dispatch_lanes(
             requested_search_lanes,
             tail_segment_indices
@@ -1452,12 +1447,14 @@ pub(crate) fn prewarm_hnsw_generation_readers(
 /// Orthogonal reader-activation policy.
 ///
 /// Opening a typed reader and authenticating its complete byte image are
-/// deliberately separate lifecycle operations. Foreground reads always retain
-/// lazy per-range checksum validation as the correctness boundary; optional
-/// whole-artifact authentication is only a governed residency optimization.
-/// It must therefore never delay a generation head publication.
+/// deliberately separate lifecycle operations. A private build output is
+/// authenticated before a durable head can name it, outside the publication
+/// critical section. Once a generation is durable, foreground reads retain
+/// lazy per-range checksum validation as the correctness boundary and complete
+/// payload authentication becomes governed, asynchronous residency work.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct HnswReaderActivationPolicy {
+    authenticate_complete_payload: bool,
     schedule_background_authentication: bool,
 }
 
@@ -1465,18 +1462,31 @@ impl HnswReaderActivationPolicy {
     /// Recovery opens immutable reader metadata without making every restored
     /// mmap resident. The first real use may request background authentication.
     pub(crate) const RECOVERY: Self = Self {
+        authenticate_complete_payload: false,
         schedule_background_authentication: false,
     };
 
-    /// Publication prepares only newly-created readers outside the head lock.
-    /// Authentication is optional background work and never a visibility gate.
-    pub(crate) const PUBLICATION: Self = Self {
+    /// Authenticate a newly-created immutable artifact before any durable head
+    /// can name it. Callers must use this only while they still own the private
+    /// build output and before entering the publication critical section.
+    pub(crate) const PREPARED_PUBLICATION: Self = Self {
+        authenticate_complete_payload: true,
+        schedule_background_authentication: false,
+    };
+
+    /// Attach a generation whose directory and head are already durable.
+    /// Rejecting it synchronously here would split catalog and storage state;
+    /// governed authentication instead quarantines a bad secondary artifact
+    /// and leaves its immutable base rows available to exact fallback.
+    pub(crate) const ATTACH_PUBLISHED: Self = Self {
+        authenticate_complete_payload: false,
         schedule_background_authentication: true,
     };
 
     /// A query may opportunistically enqueue the same idempotent work. The
     /// scheduler deduplicates by immutable reader identity.
     pub(crate) const QUERY: Self = Self {
+        authenticate_complete_payload: false,
         schedule_background_authentication: true,
     };
 }
@@ -1490,6 +1500,16 @@ fn bind_hnsw_search_workspace(
 ) -> Result<()> {
     if let Some(buffer_pool) = runtime.buffer_pool() {
         index.bind_search_buffer_pool(buffer_pool)?;
+    }
+    if activation.authenticate_complete_payload {
+        index
+            .artifact_integrity()
+            .ok_or_else(|| {
+                paro_error::data_corrupted(
+                    "durable HNSW publication is missing its checksum hierarchy",
+                )
+            })?
+            .verify_all()?;
     }
     if activation.schedule_background_authentication {
         if let Some(artifact) = artifact {
@@ -1613,11 +1633,11 @@ mod tests {
     }
 
     #[test]
-    fn mixed_exact_tail_divides_the_process_width_by_runnable_queries() {
-        assert_eq!(mixed_tail_query_lane_limit(1, 1), 1);
-        assert_eq!(mixed_tail_query_lane_limit(10, 1), 10);
-        assert_eq!(mixed_tail_query_lane_limit(10, 2), 5);
-        assert_eq!(mixed_tail_query_lane_limit(10, 8), 1);
-        assert_eq!(mixed_tail_query_lane_limit(16, 5), 3);
+    fn hnsw_queries_divide_the_process_width_by_runnable_demand() {
+        assert_eq!(hnsw_query_lane_limit(1, 1), 1);
+        assert_eq!(hnsw_query_lane_limit(10, 1), 10);
+        assert_eq!(hnsw_query_lane_limit(10, 2), 5);
+        assert_eq!(hnsw_query_lane_limit(10, 8), 1);
+        assert_eq!(hnsw_query_lane_limit(16, 5), 3);
     }
 }

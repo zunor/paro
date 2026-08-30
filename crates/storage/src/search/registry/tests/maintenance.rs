@@ -1312,7 +1312,6 @@ fn hnsw_tail_pending_delta_records_upsert_tail_entry() {
         target_vector_bytes: 16_384 * 4,
         max_pending_vector_bytes: 16_384 * 4,
         compaction_fanout: 8,
-        compaction_min_idle_ms: crate::search::DEFAULT_HNSW_MAINTENANCE_COMPACTION_MIN_IDLE_MS,
     };
     let provider_config = provider.to_value().unwrap();
     let definition = SearchIndexDefinition {
@@ -1486,6 +1485,13 @@ fn hnsw_generation_compaction_coalesces_graphs_without_rewriting_rowsets() {
         table.search_registry().refresh_all_definitions();
         assert_eq!(table.search_registry().catch_up_definition(188).unwrap(), 1);
     }
+    table
+        .append(&test_chunk_from_vectors(vec![test_embedding_vector(
+            &[vec![30.0]],
+            1,
+        )]))
+        .unwrap();
+    table.search_registry().refresh_all_definitions();
     let rowsets_before = table
         .tablet()
         .capture_consistent_rowsets(table.max_version())
@@ -1532,13 +1538,14 @@ fn hnsw_generation_compaction_coalesces_graphs_without_rewriting_rowsets() {
             .unwrap()
             .is_some()
     );
+    let _foreground_query = crate::index::hnsw::HnswForegroundQueryGuard::enter();
     assert!(
-            table
-                .search_registry()
-                .compact_hnsw_generation(188, true)
-                .unwrap(),
-            "derived graph compaction must not be permanently suppressed merely because a physical rewrite is eligible"
-        );
+        table
+            .search_registry()
+            .compact_hnsw_generation(188, true)
+            .unwrap(),
+        "derived graph compaction must make governed progress while foreground reads remain active"
+    );
     let rowsets_after = table
         .tablet()
         .capture_consistent_rowsets(table.max_version())
@@ -1558,7 +1565,8 @@ fn hnsw_generation_compaction_coalesces_graphs_without_rewriting_rowsets() {
         .and_then(|state| state.manifest.as_ref())
         .unwrap();
     assert_eq!(manifest.artifacts.artifacts[0].coverage.segments().len(), 2);
-    assert!(manifest.tail_pending_entries.is_empty());
+    assert_eq!(manifest.tail_pending_entries.len(), 1);
+    assert_eq!(manifest.tail_pending_entries[0].row_count, 1);
 }
 
 #[test]
