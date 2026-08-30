@@ -7,37 +7,42 @@ previous artifacts. Recreate every HNSW/vector index from its
 The rebuild is required because the durable contract now:
 
 - stores only immutable graph-construction fields, separate from search policy;
-- uses the fixed-width, self-contained HNSW artifact envelope version 15. The
-  artifact owns its canonical dense-vector region as well as its graph,
-  predicate covering layout, metric preprocessing and statistics, so one
-  generation partition may cover several base segments without borrowing any
-  segment-local vector storage. Distance remains owned solely by the build
-  contract; there is no JSON in the open path. An authenticated hierarchy of
-  4 KiB payload checksums, 4 KiB checksum pages, and a compact root directory
-  protects lazy random access;
+- uses HNSW artifact envelope version 20. A generation-owned sidecar owns its
+  graph, compact routing codes, predicate covering layout, metric
+  preprocessing and statistics, while its exact f32 rows are structurally
+  bound to an ordered set of immutable base-segment vector pages. This avoids
+  persisting a second canonical vector matrix without weakening row identity:
+  opening validates the complete segment-span descriptor. Distance remains
+  owned solely by the build contract; there is no JSON in the open path. An
+  authenticated hierarchy of 4 KiB payload checksums, 4 KiB checksum pages,
+  and a compact root directory protects lazy random access;
 - uses the version-5 graph layout: every hot level-0 adjacency is one
   sentinel-terminated, contract-sized fixed-stride link record, while sparse
   upper levels remain delta-varint encoded. Observed degree can no longer
   change the artifact width. With the standard M0=32 contract the record is
   exactly two cache lines, removing both the random CSR-offset read and the
   cache-line drift of a separate degree word without decoding at open;
-- uses search manifest v2 (`json-debug-v2` and `binary-v2`), where every
+- uses search manifest v4 (`json-debug-v4` and `binary-v4`), where every
   artifact carries canonical, generation-owned multi-segment coverage and its
-  deterministic local point-id mapping; old single-segment manifest images
-  are rejected;
-- requires HNSW provider-config version 15 and build-contract version 11, which
+  deterministic local point-id mapping. Manifest roots also persist derived
+  publication state needed by transactional incremental maintenance; old
+  manifest images are rejected;
+- requires HNSW provider-config version 27 and build-contract version 17, which
   select deterministic frozen-wave construction, keyed Feistel point ordering,
   barrier publication, canonical unordered point-pair scoring (so cosine
   topology cannot vary with inverse-norm operand order), exact predicate-local
-  covering runs, and the full configured construction beam on every graph
-  layer. Exact/graph costing is
+  covering runs, the full configured construction beam on every graph layer,
+  deterministic batched construction scoring, and capacity-filled fixed-width
+  neighborhoods. The provider contract also makes generation graph size,
+  dimension-aware maintenance quanta, bounded radix carry and freshness
+  progress explicit. Exact/graph costing is
   definition-pinned for sequential covering scores, indexed gathers, and
-  unique graph scores per `ef`. The three coefficients form one atomic profile
+  unique graph scores per `ef`. The five coefficients form one atomic profile
   with either a built-in revision or a non-zero offline-calibration id; partial
   and unlabeled overrides are rejected. The graph coefficient is consumed
   directly: average level-0 degree is descriptive rather than an upper bound
   on the number of unique scores produced per beam slot. Built-in
-  distance-cost revision 3 also charges the eager-admission retry when a
+  distance-cost revision 5 also charges the eager-admission retry when a
   predicate is not expected to populate the final unfiltered `ef` beam with
   Top-K headroom; all costing inputs therefore describe executable physical
   work rather than a cardinality cutoff. The former
@@ -90,8 +95,8 @@ vectors while integrity failure telemetry identifies the required rebuild.
 Paro does not infer missing fields, translate the previous graph format, or
 silently rebuild an index during a foreground query.
 
-Search manifest v2 is shared by every search provider. FullText and Sparse
-search definitions must also be recreated before starting the new binary;
+Search manifest v4 is shared by every search provider. FullText and Sparse
+search definitions must also be recreated after upgrading;
 their provider artifacts may be unchanged internally, but their old manifest
 images do not encode generation-owned partition coverage.
 
