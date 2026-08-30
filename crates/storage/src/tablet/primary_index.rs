@@ -457,8 +457,15 @@ impl Tablet {
     }
 
     #[doc(hidden)]
-    pub fn remove_primary_index_entry_for_test(&self, key: &[u8]) {
-        self.mutate_primary_index(|index| index.remove(key));
+    pub fn remove_primary_index_entry_for_test(&self, key: &[u8]) -> Result<()> {
+        // Tests that exercise consistency repair need to corrupt the complete
+        // logical view. Removing a key only from the mutable overlay is not a
+        // corruption when the immutable base still contains that key.
+        let complete = Arc::new(self.materialize_complete_primary_index()?);
+        complete.remove(key);
+        self.register_primary_index_callbacks(&complete);
+        *self.primary_index.write().unwrap() = PrimaryIndexMemoryState::Complete(complete);
+        Ok(())
     }
 
     /// Reconcile primary index cardinality with effective rows recorded in RowsetMeta.

@@ -11,7 +11,6 @@ use paro_storage::meta::{FileMetadataStore, MetadataStore, TabletMetaManager};
 use paro_storage::{
     compaction::compaction_task::{CompactionTask, HorizontalCompactionTask},
     compaction::plan::CompactionPlanner,
-    index::hnsw::{HnswSearchPolicy, SearchParams},
     primary_key::{DeleteVector, PersistentIndex, PrimaryIndex, PrimaryKeySerializer},
     tablet::{
         tablet_schema::{KeysType, TabletColumn, TabletSchema},
@@ -61,8 +60,7 @@ fn create_vector_test_schema() -> Arc<TabletSchema> {
             1,
             "vec",
             LogicalType::Array(Box::new(LogicalType::Float), 2),
-        )
-        .with_hnsw_index(8, 64, 1), // cosine
+        ),
     ];
     Arc::new(TabletSchema::new(2, cols, KeysType::PrimaryKeys).unwrap())
 }
@@ -231,7 +229,7 @@ fn compaction_execute_merges_rowsets_and_updates_index() {
 }
 
 #[test]
-fn compaction_rebuilds_hnsw_index_and_preserves_cosine_semantics() {
+fn compaction_preserves_vector_sql_values_without_implicit_search_artifacts() {
     let (tablet, _tmp) = create_vector_test_tablet();
 
     let mut w1 = DeltaWriter::open(tablet.clone(), 40).unwrap();
@@ -258,11 +256,7 @@ fn compaction_rebuilds_hnsw_index_and_preserves_cosine_semantics() {
     rowset.reload().unwrap();
 
     let segment = rowset.get_segment(0).expect("compaction output segment");
-    let hnsw = segment
-        .open_hnsw_index(1)
-        .expect("HNSW artifact should open")
-        .expect("HNSW index should exist");
-    assert_eq!(hnsw.graph.links.num_points(), rowset.num_rows() as usize);
+    assert!(segment.open_hnsw_index(1).unwrap().is_none());
 
     let stored = segment
         .read_by_rowids(&[1], &[0])
@@ -271,25 +265,6 @@ fn compaction_rebuilds_hnsw_index_and_preserves_cosine_semantics() {
     assert_eq!(bytes.len(), 2 * std::mem::size_of::<f32>());
     assert_eq!(f32::from_le_bytes(bytes[0..4].try_into().unwrap()), 100.0);
     assert_eq!(f32::from_le_bytes(bytes[4..8].try_into().unwrap()), 0.0);
-
-    // Cosine query [1,1]: best match should be row idx=1 ([1,1]),
-    // not row idx=0 ([100,0]) which would win under plain dot product.
-    let params = SearchParams {
-        ef: Some(128),
-        ..Default::default()
-    };
-    let results = rowset
-        .vector_search(
-            1,
-            &[1.0, 1.0],
-            2,
-            &params,
-            &HnswSearchPolicy::default(),
-            None,
-        )
-        .unwrap();
-    assert!(!results.is_empty());
-    assert_eq!(results[0].idx, 1);
 }
 
 #[test]
@@ -367,7 +342,7 @@ fn compaction_validation_repairs_primary_index_and_persistent_index() {
     let key_chunk = key_chunk_i32(&[7]);
     let key = serializer.encode_row(&key_chunk, 0).unwrap();
 
-    tablet.remove_primary_index_entry_for_test(&key);
+    tablet.remove_primary_index_entry_for_test(&key).unwrap();
     let persistent = PersistentIndex::new(tablet.data_dir().join("primary_index")).unwrap();
     persistent
         .apply_deletes(std::slice::from_ref(&key))

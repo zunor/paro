@@ -92,14 +92,21 @@ impl HorizontalCompactionTask {
 
 impl CompactionTask for HorizontalCompactionTask {
     fn run(&mut self) -> Result<()> {
+        if self.state != CompactionTaskState::Init {
+            return Err(paro_error::invalid_input(
+                "compaction tasks are single-use and cannot be run after they leave Init",
+            ));
+        }
         if self.cancel_token.is_cancelled() {
+            self.state = CompactionTaskState::Failed;
+            self.plan.release_input_retentions();
             return Err(paro_error::query_canceled());
         }
 
         self.state = CompactionTaskState::Running;
         let notifier = self.lifecycle_notifier.clone();
         let search_inline_builders = self.tablet.search_inline_builders_for_compaction();
-        run_job_with_lifecycle_and_search_inline_builders(
+        let result = run_job_with_lifecycle_and_search_inline_builders(
             &self.tablet,
             Arc::new(self.plan.clone()),
             self.job_id,
@@ -111,9 +118,18 @@ impl CompactionTask for HorizontalCompactionTask {
                     notifier(state);
                 }
             },
-        )?;
-        self.state = CompactionTaskState::Success;
-        Ok(())
+        );
+        self.plan.release_input_retentions();
+        match result {
+            Ok(_) => {
+                self.state = CompactionTaskState::Success;
+                Ok(())
+            }
+            Err(error) => {
+                self.state = CompactionTaskState::Failed;
+                Err(error)
+            }
+        }
     }
 
     fn stop(&mut self) {

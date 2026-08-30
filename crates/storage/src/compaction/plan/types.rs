@@ -110,7 +110,7 @@ pub struct CompactionInput {
     pub size_bytes: u64,
     /// Keeps the rowset files and RSSID mappings alive from planning through
     /// execution and publication. `Arc<Rowset>` alone is not a GC barrier.
-    _retention: RowsetRetentionLease,
+    retention: Option<RowsetRetentionLease>,
 }
 
 impl CompactionInput {
@@ -128,8 +128,12 @@ impl CompactionInput {
             num_rows: rowset.num_rows(),
             size_bytes: rowset.total_disk_size(),
             rowset,
-            _retention: retention,
+            retention: Some(retention),
         }
+    }
+
+    fn release_retention(&mut self) {
+        self.retention.take();
     }
 }
 
@@ -175,6 +179,18 @@ pub struct CompactionPlan {
 }
 
 impl CompactionPlan {
+    /// Release planning-time physical rowset leases after the task reaches a
+    /// terminal state.
+    ///
+    /// The plan keeps rowset identities for diagnostics, but completed work
+    /// must not delay retirement merely because an executor or caller retains
+    /// the task object after `run` returns.
+    pub(crate) fn release_input_retentions(&mut self) {
+        for input in &mut self.input_rowsets {
+            input.release_retention();
+        }
+    }
+
     pub fn planned_input_rows(&self) -> u64 {
         self.input_rowsets.iter().map(|input| input.num_rows).sum()
     }

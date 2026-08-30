@@ -532,12 +532,12 @@ fn test_compaction_crash_before_replace_restarts_from_persisted_meta() {
     let dir = TempDir::new().unwrap();
     let (tablet, manager) = create_managed_duplicate_tablet(&dir, 202);
 
-    // Persist an initial meta snapshot; an unpublished staged output must not
-    // become visible after restart.
-    tablet.save_meta().unwrap();
-
     append_range(&tablet, 401, 0, 200, 0);
     append_range(&tablet, 402, 200, 400, 100);
+    // Direct Tablet tests do not have a database journal. Persist the same
+    // committed prefix a checkpoint would capture before simulating a crash;
+    // the unpublished staged output must not become part of that snapshot.
+    tablet.persist_meta_snapshot().unwrap();
 
     let before = read_rows(tablet.clone());
 
@@ -639,9 +639,11 @@ fn test_compaction_final_dir_without_publish_record_is_not_recovered_visible() {
     let dir = TempDir::new().unwrap();
     let (tablet, manager) = create_managed_duplicate_tablet(&dir, 204);
 
-    tablet.save_meta().unwrap();
     append_range(&tablet, 601, 0, 500, 0);
     append_range(&tablet, 602, 500, 1_000, 100);
+    // Direct Tablet tests do not replay the database journal, so establish a
+    // durable checkpoint baseline before installing an unreferenced output.
+    tablet.persist_meta_snapshot().unwrap();
     let before = read_rows(tablet.clone());
 
     let plan = CompactionPlanner::plan(&tablet)
