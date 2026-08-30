@@ -1331,6 +1331,7 @@ impl HnswIndex {
             stop_check,
             pool,
             preparation_parallelism,
+            execution_policy,
         )?;
         Self::build_prepared_with_controls_and_filter_blocks(
             storage,

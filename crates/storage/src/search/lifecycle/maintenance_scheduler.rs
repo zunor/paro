@@ -991,6 +991,16 @@ fn estimate_maintenance_cost_benefit(
             }
         }
     };
+    if kind == SearchIndexKind::Hnsw {
+        // Every newly-written HNSW payload is read back through its checksum
+        // hierarchy before a durable generation head can name it. This is a
+        // required publication cost, not optional background residency work,
+        // and must therefore consume the same I/O envelope as construction.
+        estimate.cost.io_read_bytes = estimate
+            .cost
+            .io_read_bytes
+            .saturating_add(estimate.cost.io_write_bytes);
+    }
     if manifest_delta_compaction_requested {
         add_manifest_delta_compaction_estimate(&mut estimate, manifest, delta_window_bytes);
     }

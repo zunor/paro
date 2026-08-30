@@ -2,7 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::{Condvar, Mutex, OnceLock};
+use std::sync::{Mutex, OnceLock};
 use std::time::Instant;
 
 use paro_common::error::{self as paro_error, Result};
@@ -15,55 +15,6 @@ use super::telemetry::{SearchTelemetryCollector, SegmentTelemetryEvent};
 struct SearchDispatchRuntime {
     threads: usize,
     pool: ThreadPool,
-    admission: SearchDispatchAdmission,
-}
-
-#[derive(Debug)]
-struct SearchDispatchAdmission {
-    state: Mutex<SearchDispatchAdmissionState>,
-    changed: Condvar,
-}
-
-#[derive(Debug)]
-struct SearchDispatchAdmissionState {
-    available_lanes: usize,
-    next_ticket: u64,
-    serving_ticket: u64,
-}
-
-/// Query-wide ownership of a subset of the process search lanes.
-///
-/// A fixed worker pool bounds physical threads, but without admission every
-/// concurrent query can still construct a full-width scoped fork. Those roots
-/// occupy workers while their children wait, producing severe head-of-line
-/// latency once `queries * graph_shards` exceeds the process width. A fair
-/// ticketed lease makes the resource contract explicit and lets each admitted
-/// query size its shard fan-out to the lanes it actually owns.
-pub(crate) struct SearchDispatchLease<'runtime> {
-    runtime: &'runtime SearchDispatchRuntime,
-    lanes: usize,
-}
-
-impl SearchDispatchLease<'_> {
-    pub(crate) const fn lanes(&self) -> usize {
-        self.lanes
-    }
-}
-
-impl Drop for SearchDispatchLease<'_> {
-    fn drop(&mut self) {
-        let mut state = self
-            .runtime
-            .admission
-            .state
-            .lock()
-            .expect("search dispatch admission lock poisoned");
-        state.available_lanes = state
-            .available_lanes
-            .saturating_add(self.lanes)
-            .min(self.runtime.threads);
-        self.runtime.admission.changed.notify_all();
-    }
 }
 
 static SEARCH_DISPATCH_THREADS: AtomicUsize = AtomicUsize::new(0);
@@ -113,26 +64,10 @@ fn create_search_dispatch_runtime(
         // and turns wide exact-tail scans into a memory-bandwidth storm.
         .num_threads(threads)
         .build()
-        .map(|pool| SearchDispatchRuntime {
-            threads,
-            pool,
-            admission: SearchDispatchAdmission {
-                state: Mutex::new(SearchDispatchAdmissionState {
-                    available_lanes: threads,
-                    next_ticket: 0,
-                    serving_ticket: 0,
-                }),
-                changed: Condvar::new(),
-            },
-        })
+        .map(|pool| SearchDispatchRuntime { threads, pool })
         .map_err(|error| format!("create process search dispatch executor: {error}"))
 }
 
-/// Fairly acquire process search lanes for one complete provider query.
-///
-/// The head waiter accepts the currently available width instead of waiting
-/// for its ideal width. This keeps every physical worker useful while FIFO
-/// tickets prevent a stream of narrow queries from starving a wide one.
 fn search_dispatch_runtime(requested_slots: usize) -> Result<&'static SearchDispatchRuntime> {
     let configured = SEARCH_DISPATCH_THREADS.load(Ordering::Acquire);
     let threads = if configured == 0 {
@@ -147,49 +82,6 @@ fn search_dispatch_runtime(requested_slots: usize) -> Result<&'static SearchDisp
         .get_or_init(|| create_search_dispatch_runtime(threads))
         .as_ref()
         .map_err(|error| paro_error::internal(error.clone()))
-}
-
-impl SearchDispatchRuntime {
-    fn acquire_lanes(
-        &self,
-        requested_slots: usize,
-        task_count: usize,
-    ) -> Result<SearchDispatchLease<'_>> {
-        let requested = requested_slots
-            .max(1)
-            .min(task_count.max(1))
-            .min(self.threads);
-        let mut state = self
-            .admission
-            .state
-            .lock()
-            .map_err(|_| paro_error::internal("search dispatch admission lock poisoned"))?;
-        let ticket = state.next_ticket;
-        state.next_ticket = state.next_ticket.wrapping_add(1);
-        while ticket != state.serving_ticket || state.available_lanes == 0 {
-            state = self
-                .admission
-                .changed
-                .wait(state)
-                .map_err(|_| paro_error::internal("search dispatch admission lock poisoned"))?;
-        }
-        let lanes = requested.min(state.available_lanes).max(1);
-        state.available_lanes -= lanes;
-        state.serving_ticket = state.serving_ticket.wrapping_add(1);
-        self.admission.changed.notify_all();
-        drop(state);
-        Ok(SearchDispatchLease {
-            runtime: self,
-            lanes,
-        })
-    }
-}
-
-pub(crate) fn acquire_search_dispatch_lanes(
-    requested_slots: usize,
-    task_count: usize,
-) -> Result<SearchDispatchLease<'static>> {
-    search_dispatch_runtime(requested_slots)?.acquire_lanes(requested_slots, task_count)
 }
 
 #[derive(Debug)]
@@ -356,7 +248,6 @@ where
         });
     }
 
-    let next = AtomicUsize::new(0);
     let results = (0..items.len())
         .map(|_| Mutex::new(None))
         .collect::<Vec<Mutex<Option<Result<T>>>>>();
@@ -366,22 +257,21 @@ where
             .lock()
             .expect("search task result lock poisoned") = Some(result);
     };
-    let run_lane = || loop {
-        let index = next.fetch_add(1, Ordering::Relaxed);
-        if index >= items.len() {
-            break;
-        }
-        execute_index(index);
-    };
-    runtime.pool.install(|| {
-        rayon::scope(|scope| {
-            for _ in 1..lane_count {
-                let run_lane = &run_lane;
-                scope.spawn(move |_| run_lane());
+    // Submit leaf shards rather than one long-lived worker loop per granted
+    // lane. The fixed Rayon pool then owns the only runnable queue and can
+    // interleave HNSW, sparse, and full-text requests without a provider-side
+    // census or a query-wide lease that cannot be rebalanced. Batching retains
+    // the caller's explicit parallelism ceiling while every batch remains
+    // globally work-conserving.
+    for batch_start in (0..items.len()).step_by(lane_count) {
+        let batch_end = batch_start.saturating_add(lane_count).min(items.len());
+        runtime.pool.scope_fifo(|scope| {
+            for index in batch_start..batch_end {
+                let execute_index = &execute_index;
+                scope.spawn_fifo(move |_| execute_index(index));
             }
-            run_lane();
-        })
-    });
+        });
+    }
 
     results
         .into_iter()
@@ -410,35 +300,6 @@ mod tests {
         let runtime = create_search_dispatch_runtime(3).expect("search runtime");
         assert_eq!(runtime.threads, 3);
         assert_eq!(runtime.pool.current_num_threads(), 3);
-    }
-
-    #[test]
-    fn admission_conserves_the_process_lane_budget() {
-        let runtime = create_search_dispatch_runtime(3).expect("search runtime");
-        let wide = runtime.acquire_lanes(3, 2).expect("wide lease");
-        let remainder = runtime.acquire_lanes(3, 2).expect("remainder lease");
-        assert_eq!(wide.lanes(), 2);
-        assert_eq!(remainder.lanes(), 1);
-        assert_eq!(
-            runtime
-                .admission
-                .state
-                .lock()
-                .expect("admission state")
-                .available_lanes,
-            0
-        );
-        drop(wide);
-        drop(remainder);
-        assert_eq!(
-            runtime
-                .admission
-                .state
-                .lock()
-                .expect("admission state")
-                .available_lanes,
-            3
-        );
     }
 
     #[test]

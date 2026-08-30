@@ -672,6 +672,23 @@ fn corrupt_hnsw_authentication_is_persisted_as_exact_tail_recovery() {
         .apply_search_generation_publish(&staged.mutation())
         .unwrap();
     staged.mark_published().unwrap();
+    let adopted_runtime =
+        SearchReaderRuntime::new(SidecarArtifactStore::new(table.tablet().data_dir().clone()));
+    assert_eq!(
+        staged
+            .adopt_prepared_readers_into(&adopted_runtime)
+            .unwrap(),
+        1,
+        "durable publication must inherit the authenticated staged reader"
+    );
+    assert_eq!(
+        staged
+            .adopt_prepared_readers_into(&adopted_runtime)
+            .unwrap(),
+        0,
+        "reader adoption must be idempotent"
+    );
+    drop(adopted_runtime);
 
     let head = table
         .tablet()
@@ -713,6 +730,29 @@ fn corrupt_hnsw_authentication_is_persisted_as_exact_tail_recovery() {
     file.seek(SeekFrom::Start(corrupt_offset)).unwrap();
     file.write_all(&byte).unwrap();
     file.sync_all().unwrap();
+
+    let prepared_runtime =
+        SearchReaderRuntime::new(SidecarArtifactStore::new(table.tablet().data_dir().clone()));
+    let provider = definition.hnsw_provider_config().unwrap();
+    let visible_rowsets = table
+        .tablet()
+        .capture_consistent_rowsets(table.tablet().max_version())
+        .unwrap();
+    let prepared_error = prewarm_hnsw_generation_readers(
+        &prepared_runtime,
+        std::slice::from_ref(&artifact),
+        &visible_rowsets,
+        0,
+        provider.dimension as usize,
+        &provider.build_contract(),
+        None,
+        HnswReaderActivationPolicy::prepared_publication(
+            crate::index::hnsw::HnswBuildExecutionPolicy::Foreground,
+        ),
+        None,
+    )
+    .expect_err("a private corrupt artifact must fail before publication");
+    assert!(prepared_error.is(paro_common::error::codes::internal::DATA_CORRUPTED));
 
     table
         .register_published_search_definition(definition.clone())

@@ -6,6 +6,7 @@
 use std::fs;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU8, Ordering};
+use std::sync::Arc;
 
 use paro_common::ddl::DdlObjectKey;
 use paro_common::effect::{
@@ -166,6 +167,8 @@ pub struct StagedSearchGeneration {
     build_snapshot_version: i64,
     config_fingerprint: u64,
     coverage: SearchGenerationCoverage,
+    prepared_reader_runtime: Option<Arc<super::sidecar::SearchReaderRuntime>>,
+    prepared_artifacts: Arc<[super::capability::SearchArtifactRef]>,
     _layout_lease: LayoutMaintenanceLease,
 }
 
@@ -179,6 +182,8 @@ pub(crate) struct StagedSearchGenerationInit {
     pub build_snapshot_version: i64,
     pub config_fingerprint: u64,
     pub coverage: SearchGenerationCoverage,
+    pub prepared_reader_runtime: Option<Arc<super::sidecar::SearchReaderRuntime>>,
+    pub prepared_artifacts: Arc<[super::capability::SearchArtifactRef]>,
     pub layout_lease: LayoutMaintenanceLease,
 }
 
@@ -194,12 +199,24 @@ impl StagedSearchGeneration {
             build_snapshot_version: init.build_snapshot_version,
             config_fingerprint: init.config_fingerprint,
             coverage: init.coverage,
+            prepared_reader_runtime: init.prepared_reader_runtime,
+            prepared_artifacts: init.prepared_artifacts,
             _layout_lease: init.layout_lease,
         }
     }
 
     pub fn coverage(&self) -> &SearchGenerationCoverage {
         &self.coverage
+    }
+
+    pub(crate) fn adopt_prepared_readers_into(
+        &self,
+        target: &super::sidecar::SearchReaderRuntime,
+    ) -> Result<usize> {
+        let Some(source) = self.prepared_reader_runtime.as_ref() else {
+            return Ok(0);
+        };
+        target.adopt_decoded_readers_from(source.as_ref(), &self.prepared_artifacts)
     }
 
     pub fn storage_op(&self, tablet_id: u64) -> StorageCommitOp {

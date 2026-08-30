@@ -95,13 +95,14 @@ impl SearchIndexRegistry {
                 manifest.root.maintenance_state.recovery.priority,
             )
         };
+        let build_stop_check = build_token.stop_check();
         let input = SidecarBuildInput {
             definition: state.definition.clone(),
             generation_id: manifest.root.generation_id,
             tail_window,
             rowset_refs,
             snapshot_version: self.tablet.max_version(),
-            stop_check: Some(build_token.stop_check()),
+            stop_check: Some(build_stop_check.clone()),
         };
         let estimate = builder.estimate_cost(&input)?;
         let result = match builder.build(
@@ -132,7 +133,10 @@ impl SearchIndexRegistry {
         if let Err(error) = self.activate_artifact_readers(
             &state,
             &result.artifact_refs,
-            HnswReaderActivationPolicy::PREPARED_PUBLICATION,
+            HnswReaderActivationPolicy::prepared_publication(
+                crate::index::hnsw::HnswBuildExecutionPolicy::Maintenance,
+            ),
+            Some(&build_stop_check),
         ) {
             self.discard_unpublished_sidecars(&sidecar_store, &sidecar_file_ids);
             return Err(error);
@@ -270,20 +274,15 @@ impl SearchIndexRegistry {
             sidecar_store.clone(),
             manifest.root.maintenance_state.recovery.priority,
         );
-        let build_epoch = self.foreground_ingest_epoch.load(Ordering::Acquire);
-        let foreground_epoch = Arc::clone(&self.foreground_ingest_epoch);
         let definition_token = build_token.clone();
-        let stop_check = SearchBuildStopCheck::new(move || {
-            foreground_epoch.load(Ordering::Acquire) != build_epoch
-                || definition_token.should_stop()
-        });
+        let stop_check = SearchBuildStopCheck::new(move || definition_token.should_stop());
         let input = SidecarBuildInput {
             definition: state.definition.clone(),
             generation_id,
             tail_window,
             rowset_refs,
             snapshot_version,
-            stop_check: Some(stop_check),
+            stop_check: Some(stop_check.clone()),
         };
         let estimate = builder.estimate_cost(&input)?;
         let result = match builder.build(
@@ -295,16 +294,8 @@ impl SearchIndexRegistry {
             },
         ) {
             Ok(result) => result,
-            Err(error)
-                if error.is_query_canceled()
-                    && (self.foreground_ingest_epoch.load(Ordering::Acquire) != build_epoch
-                        || build_token.should_stop()) =>
-            {
-                // Foreground ingest and definition replacement preempt graph
-                // coalescing because they change its immutable input. Reads
-                // do not: the maintenance build policy already shrinks to one
-                // lane at deterministic wave barriers while queries are live.
-                return Ok(false);
+            Err(error) if error.is_query_canceled() && build_token.should_stop() => {
+                return Ok(false)
             }
             Err(error) => return Err(error),
         };
@@ -321,7 +312,10 @@ impl SearchIndexRegistry {
         if let Err(error) = self.activate_artifact_readers(
             &state,
             &result.artifact_refs,
-            HnswReaderActivationPolicy::PREPARED_PUBLICATION,
+            HnswReaderActivationPolicy::prepared_publication(
+                crate::index::hnsw::HnswBuildExecutionPolicy::Maintenance,
+            ),
+            Some(&stop_check),
         ) {
             self.discard_unpublished_sidecars(&sidecar_store, &sidecar_file_ids);
             return Err(error);
@@ -986,7 +980,10 @@ impl SearchIndexRegistry {
         if let Err(error) = self.activate_artifact_readers(
             &state,
             &repacked_artifacts,
-            HnswReaderActivationPolicy::PREPARED_PUBLICATION,
+            HnswReaderActivationPolicy::prepared_publication(
+                crate::index::hnsw::HnswBuildExecutionPolicy::Maintenance,
+            ),
+            None,
         ) {
             self.discard_unpublished_sidecars(&store, &sidecar_file_ids);
             return Err(error);

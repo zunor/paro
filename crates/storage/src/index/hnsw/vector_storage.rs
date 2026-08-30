@@ -12,6 +12,7 @@ use memmap2::{Mmap, MmapMut};
 use paro_common::error::Result;
 use rayon::prelude::*;
 use rayon::ThreadPool;
+use std::collections::VecDeque;
 use std::fs::File;
 use std::io::{Read, Seek, SeekFrom};
 use std::path::Path;
@@ -289,6 +290,73 @@ struct ContiguousVectorLane<'a> {
     rows: usize,
 }
 
+/// Maximum immutable input represented by one governed preparation quantum.
+///
+/// The block boundary is derived solely from the durable vector shape. It is
+/// therefore deterministic across machines and worker counts, while remaining
+/// short enough for maintenance to surrender build lanes promptly when a
+/// foreground query appears.
+const HNSW_PREPARATION_BLOCK_BYTES: usize = 16 * 1024 * 1024;
+
+fn construction_vector_block_count(
+    storage: &dyn VectorStorage,
+    granted_parallelism: usize,
+) -> Result<usize> {
+    let row_bytes = storage
+        .vector_dim()
+        .checked_mul(std::mem::size_of::<f32>())
+        .ok_or_else(|| {
+            paro_common::error::out_of_range("HNSW construction vector row size overflow")
+        })?;
+    let total_bytes = storage
+        .num_vectors()
+        .checked_mul(row_bytes)
+        .ok_or_else(|| {
+            paro_common::error::out_of_range("HNSW construction vector byte size overflow")
+        })?;
+    let byte_blocks =
+        total_bytes.saturating_add(HNSW_PREPARATION_BLOCK_BYTES - 1) / HNSW_PREPARATION_BLOCK_BYTES;
+    Ok(byte_blocks
+        .max(granted_parallelism.max(1))
+        .min(storage.num_vectors().max(1)))
+}
+
+fn run_governed_preparation_jobs<J, R, F>(
+    pool: &ThreadPool,
+    jobs: Vec<J>,
+    execution_policy: super::HnswBuildExecutionPolicy,
+    granted_parallelism: usize,
+    run: F,
+) -> Result<Vec<R>>
+where
+    J: Send,
+    R: Send,
+    F: Fn(J) -> Result<R> + Sync,
+{
+    let mut pending = VecDeque::from(jobs);
+    let mut output = Vec::with_capacity(pending.len());
+    while !pending.is_empty() {
+        let width = super::hnsw_builder::hnsw_current_build_parallelism(
+            execution_policy,
+            granted_parallelism,
+        )
+        .min(pending.len())
+        .max(1);
+        let batch = pending.drain(..width).collect::<Vec<_>>();
+        if width == 1 {
+            output.push(run(batch.into_iter().next().expect("one preparation job"))?);
+        } else {
+            let mut batch_output =
+                pool.install(|| batch.into_par_iter().map(&run).collect::<Result<Vec<_>>>())?;
+            output.append(&mut batch_output);
+        }
+        if !pending.is_empty() {
+            super::hnsw_builder::hnsw_yield_maintenance_to_foreground(execution_policy);
+        }
+    }
+    Ok(output)
+}
+
 /// Split immutable physical chunks into at most `parallelism` point-ordered
 /// lanes. Lane boundaries are derived only from the declared cardinality, so
 /// worker scheduling cannot affect extrema, code bytes, or norm placement.
@@ -422,6 +490,7 @@ impl ExactF32BuildVectorStorage {
         stop_check: Option<&super::HnswBuildStopCheck>,
         pool: Option<&ThreadPool>,
         parallelism: usize,
+        execution_policy: super::HnswBuildExecutionPolicy,
     ) -> Result<Arc<dyn VectorStorage>> {
         if stop_check.is_some_and(super::HnswBuildStopCheck::should_stop) {
             return Err(paro_common::error::query_canceled());
@@ -481,7 +550,10 @@ impl ExactF32BuildVectorStorage {
         let mut written = 0usize;
         let sequential_scan = ConstructionSequentialScan::begin(base.as_ref());
         let parallel_lanes = if pool.is_some() && parallelism > 1 {
-            construction_vector_lanes(base.as_ref(), parallelism)?
+            construction_vector_lanes(
+                base.as_ref(),
+                construction_vector_block_count(base.as_ref(), parallelism)?,
+            )?
         } else {
             None
         };
@@ -496,8 +568,12 @@ impl ExactF32BuildVectorStorage {
                 remaining = tail;
                 jobs.push((lane, destination));
             }
-            pool.install(|| {
-                jobs.into_par_iter().try_for_each(|(lane, destination)| {
+            run_governed_preparation_jobs(
+                pool,
+                jobs,
+                execution_policy,
+                parallelism,
+                |(lane, destination)| {
                     let mut lane_offset = 0usize;
                     for values in lane.chunks {
                         if stop_check.is_some_and(super::HnswBuildStopCheck::should_stop) {
@@ -517,8 +593,8 @@ impl ExactF32BuildVectorStorage {
                         ));
                     }
                     Ok(())
-                })
-            })?;
+                },
+            )?;
             written = value_count;
         } else {
             base.try_for_each_contiguous_chunk(&mut |values| {
@@ -776,6 +852,7 @@ impl SymmetricI16BuildVectorStorage {
         stop_check: Option<&super::HnswBuildStopCheck>,
         pool: Option<&ThreadPool>,
         parallelism: usize,
+        execution_policy: super::HnswBuildExecutionPolicy,
     ) -> Result<Arc<dyn VectorStorage>> {
         if stop_check.is_some_and(super::HnswBuildStopCheck::should_stop) {
             return Err(paro_common::error::query_canceled());
@@ -794,42 +871,44 @@ impl SymmetricI16BuildVectorStorage {
         let mut minima = vec![f32::INFINITY; dimension];
         let mut maxima = vec![f32::NEG_INFINITY; dimension];
         let parallel_lanes = if pool.is_some() && parallelism > 1 {
-            construction_vector_lanes(base.as_ref(), parallelism)?
+            construction_vector_lanes(
+                base.as_ref(),
+                construction_vector_block_count(base.as_ref(), parallelism)?,
+            )?
         } else {
             None
         };
         let sequential_scan = ConstructionSequentialScan::begin(base.as_ref());
         if let (Some(pool), Some(lanes)) = (pool, parallel_lanes.as_ref()) {
-            let partial_extrema = pool.install(|| {
-                lanes
-                    .par_iter()
-                    .map(|lane| {
-                        let mut lane_minima = vec![f32::INFINITY; dimension];
-                        let mut lane_maxima = vec![f32::NEG_INFINITY; dimension];
-                        for values in &lane.chunks {
-                            if stop_check
-                                .is_some_and(super::HnswBuildStopCheck::should_stop)
-                            {
-                                return Err(paro_common::error::query_canceled());
-                            }
-                            for vector in values.chunks_exact(dimension) {
-                                for (source_dimension, &value) in vector.iter().enumerate() {
-                                    if !value.is_finite() {
-                                        return Err(paro_common::error::invalid_input(
+            let partial_extrema = run_governed_preparation_jobs(
+                pool,
+                lanes.iter().collect(),
+                execution_policy,
+                parallelism,
+                |lane| {
+                    let mut lane_minima = vec![f32::INFINITY; dimension];
+                    let mut lane_maxima = vec![f32::NEG_INFINITY; dimension];
+                    for values in &lane.chunks {
+                        if stop_check.is_some_and(super::HnswBuildStopCheck::should_stop) {
+                            return Err(paro_common::error::query_canceled());
+                        }
+                        for vector in values.chunks_exact(dimension) {
+                            for (source_dimension, &value) in vector.iter().enumerate() {
+                                if !value.is_finite() {
+                                    return Err(paro_common::error::invalid_input(
                                             "symmetric-i16 HNSW construction requires finite vector values",
                                         ));
-                                    }
-                                    lane_minima[source_dimension] =
-                                        lane_minima[source_dimension].min(value);
-                                    lane_maxima[source_dimension] =
-                                        lane_maxima[source_dimension].max(value);
                                 }
+                                lane_minima[source_dimension] =
+                                    lane_minima[source_dimension].min(value);
+                                lane_maxima[source_dimension] =
+                                    lane_maxima[source_dimension].max(value);
                             }
                         }
-                        Ok((lane_minima, lane_maxima))
-                    })
-                    .collect::<Result<Vec<_>>>()
-            })?;
+                    }
+                    Ok((lane_minima, lane_maxima))
+                },
+            )?;
             for (lane_minima, lane_maxima) in partial_extrema {
                 for source_dimension in 0..dimension {
                     minima[source_dimension] =
@@ -863,6 +942,7 @@ impl SymmetricI16BuildVectorStorage {
             })?;
         }
         drop(sequential_scan);
+        super::hnsw_builder::hnsw_yield_maintenance_to_foreground(execution_policy);
         let selected_dimensions =
             multiscale_routing_dimensions(&minima, &maxima, routing_dimensions, build_seed);
         let scales = selected_dimensions
@@ -951,22 +1031,20 @@ impl SymmetricI16BuildVectorStorage {
                 };
                 jobs.push((lane, lane_output, lane_norms));
             }
-            pool.install(|| {
-                jobs.into_par_iter()
-                    .try_for_each(|(lane, lane_output, lane_norms)| {
-                        encode_symmetric_i16_lane(
-                            lane,
-                            lane_output,
-                            lane_norms,
-                            dimension,
-                            routing_dimensions,
-                            row_stride_bytes,
-                            &selected_dimensions,
-                            &scales,
-                            stop_check,
-                        )
-                    })
-            })?;
+            let encode_job = |(lane, lane_output, lane_norms)| {
+                encode_symmetric_i16_lane(
+                    lane,
+                    lane_output,
+                    lane_norms,
+                    dimension,
+                    routing_dimensions,
+                    row_stride_bytes,
+                    &selected_dimensions,
+                    &scales,
+                    stop_check,
+                )
+            };
+            run_governed_preparation_jobs(pool, jobs, execution_policy, parallelism, encode_job)?;
             encoded_row = base.num_vectors();
         } else {
             base.try_for_each_contiguous_chunk(&mut |values| {
@@ -1227,6 +1305,7 @@ pub(crate) fn prepare_build_vector_storage(
         stop_check,
         None,
         1,
+        super::HnswBuildExecutionPolicy::Foreground,
     )
 }
 
@@ -1238,11 +1317,17 @@ pub(crate) fn prepare_build_vector_storage_with_parallelism(
     stop_check: Option<&super::HnswBuildStopCheck>,
     pool: Option<&ThreadPool>,
     parallelism: usize,
+    execution_policy: super::HnswBuildExecutionPolicy,
 ) -> Result<Arc<dyn VectorStorage>> {
     match encoding {
-        super::HnswBuildVectorEncoding::ExactF32 => {
-            ExactF32BuildVectorStorage::prepare(base, workspace_dir, stop_check, pool, parallelism)
-        }
+        super::HnswBuildVectorEncoding::ExactF32 => ExactF32BuildVectorStorage::prepare(
+            base,
+            workspace_dir,
+            stop_check,
+            pool,
+            parallelism,
+            execution_policy,
+        ),
         super::HnswBuildVectorEncoding::SymmetricI16 { routing_dimensions } => {
             SymmetricI16BuildVectorStorage::prepare(
                 base,
@@ -1252,6 +1337,7 @@ pub(crate) fn prepare_build_vector_storage_with_parallelism(
                 stop_check,
                 pool,
                 parallelism,
+                execution_policy,
             )
         }
     }
@@ -2846,6 +2932,7 @@ mod tests {
                 None,
                 Some(&pool),
                 5,
+                super::super::HnswBuildExecutionPolicy::Foreground,
             )
             .unwrap();
 

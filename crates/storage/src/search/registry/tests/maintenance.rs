@@ -1527,7 +1527,7 @@ fn hnsw_generation_compaction_coalesces_graphs_without_rewriting_rowsets() {
     assert!(
         !table
             .search_registry()
-            .compact_hnsw_generation(188, true)
+            .compact_hnsw_generation(188, false)
             .unwrap(),
         "optional generation compaction must yield to admitted ingest"
     );

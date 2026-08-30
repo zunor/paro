@@ -147,10 +147,14 @@ impl SidecarArtifactBuilder for ProviderSidecarArtifactBuilder {
                 (rows.saturating_mul(64), rows.saturating_mul(128))
             }
         };
+        let source_read_bytes: u64 = input.tail_window.iter().map(|entry| entry.byte_count).sum();
+        let publication_authentication_bytes =
+            u64::from(input.definition.kind == SearchIndexKind::Hnsw)
+                .saturating_mul(io_write_bytes);
         Ok(CostEstimate {
             cost: MaintenanceCost {
                 cpu_ns: rows.saturating_mul(cpu_per_row),
-                io_read_bytes: input.tail_window.iter().map(|entry| entry.byte_count).sum(),
+                io_read_bytes: source_read_bytes.saturating_add(publication_authentication_bytes),
                 io_write_bytes,
                 memory_peak_bytes,
                 publish_bytes: io_write_bytes,

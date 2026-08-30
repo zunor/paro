@@ -199,11 +199,6 @@ pub(crate) struct SearchIndexRegistry {
     maintenance_notifier: RwLock<Option<Arc<dyn Fn(SearchMaintenanceUrgency) + Send + Sync>>>,
     maintenance_failures: Mutex<BTreeMap<u64, MaintenanceFailureBackoff>>,
     active_maintenance_tasks: AtomicUsize,
-    /// Monotonic foreground-ingest epoch used to preempt optional
-    /// whole-generation work as soon as a writer reserves publication
-    /// capacity. Waiting for `rowset_published` is too late: enough admitted
-    /// commits can fill the bounded tail before any ordered apply completes.
-    foreground_ingest_epoch: Arc<AtomicU64>,
     ingest_admission: Mutex<SearchIngestAdmissionState>,
     maintenance_progress_changed: Condvar,
 }
@@ -252,7 +247,6 @@ impl SearchIndexRegistry {
             maintenance_notifier: RwLock::new(None),
             maintenance_failures: Mutex::new(BTreeMap::new()),
             active_maintenance_tasks: AtomicUsize::new(0),
-            foreground_ingest_epoch: Arc::new(AtomicU64::new(0)),
             ingest_admission: Mutex::new(SearchIngestAdmissionState::default()),
             maintenance_progress_changed: Condvar::new(),
         };
@@ -353,6 +347,16 @@ impl SearchIndexRegistry {
         )
     }
 
+    /// Install the authenticated reader image retained by a transaction-owned
+    /// generation after its directory rename and before the catalog definition
+    /// becomes query-visible.
+    pub(crate) fn adopt_staged_generation_readers(
+        &self,
+        staged: &StagedSearchGeneration,
+    ) -> Result<usize> {
+        staged.adopt_prepared_readers_into(self.reader_runtime.as_ref())
+    }
+
     /// Build a complete immutable generation without making its definition
     /// visible. The returned owner retains an exclusive physical-layout lease
     /// until transaction publish or abort.
@@ -418,10 +422,13 @@ impl SearchIndexRegistry {
                 &visible_rowsets,
                 &result.artifact_refs,
             )?;
-            if let Some(provider) = hnsw_provider.as_ref() {
-                let staged_runtime = SearchReaderRuntime::new(sidecar_store.clone());
+            let prepared_artifacts: Arc<[SearchArtifactRef]> =
+                Arc::from(result.artifact_refs.clone());
+            let prepared_reader_runtime = if let Some(provider) = hnsw_provider.as_ref() {
+                let staged_runtime = Arc::new(SearchReaderRuntime::new(sidecar_store.clone()));
+                staged_runtime.bind_buffer_pool(self.reader_runtime.buffer_pool())?;
                 prewarm_hnsw_generation_readers(
-                    &staged_runtime,
+                    staged_runtime.as_ref(),
                     &result.artifact_refs,
                     &visible_rowsets,
                     *definition.column_ids.first().ok_or_else(|| {
@@ -430,9 +437,15 @@ impl SearchIndexRegistry {
                     provider.dimension as usize,
                     &provider.build_contract(),
                     None,
-                    HnswReaderActivationPolicy::PREPARED_PUBLICATION,
+                    HnswReaderActivationPolicy::prepared_publication(
+                        crate::index::hnsw::HnswBuildExecutionPolicy::Foreground,
+                    ),
+                    Some(&stop_check),
                 )?;
-            }
+                Some(staged_runtime)
+            } else {
+                None
+            };
 
             let visible_snapshot =
                 collect_visible_snapshot(&definition, snapshot_version, &visible_rowsets)?;
@@ -508,10 +521,12 @@ impl SearchIndexRegistry {
                     coverage,
                 },
                 staged_manifests.head_for_root(&root),
+                prepared_reader_runtime,
+                prepared_artifacts,
             ))
         })();
 
-        let (coverage, head) = match build_result {
+        let (coverage, head, prepared_reader_runtime, prepared_artifacts) = match build_result {
             Ok(result) => result,
             Err(error) => {
                 match fs::remove_dir_all(&staging_root) {
@@ -546,6 +561,8 @@ impl SearchIndexRegistry {
             build_snapshot_version: snapshot_version,
             config_fingerprint: definition.config_fingerprint,
             coverage,
+            prepared_reader_runtime,
+            prepared_artifacts,
             layout_lease,
         }))
     }

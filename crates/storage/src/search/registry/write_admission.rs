@@ -51,7 +51,6 @@ impl RowsetPublishObserver for SearchIndexRegistry {
             let Some(blocker) = blocked else {
                 admission.reserved_rows = admission.reserved_rows.saturating_add(incoming_rows);
                 admission.reserved_bytes = admission.reserved_bytes.saturating_add(incoming_bytes);
-                self.foreground_ingest_epoch.fetch_add(1, Ordering::Release);
                 return Ok(());
             };
             let isolated_oversized_write = blocker.pending_rows == 0
@@ -66,7 +65,6 @@ impl RowsetPublishObserver for SearchIndexRegistry {
                 // queries retain the streaming exact-tail fallback meanwhile.
                 admission.reserved_rows = incoming_rows;
                 admission.reserved_bytes = incoming_bytes;
-                self.foreground_ingest_epoch.fetch_add(1, Ordering::Release);
                 return Ok(());
             }
 
@@ -82,7 +80,6 @@ impl RowsetPublishObserver for SearchIndexRegistry {
                 // to own the resulting debt.
                 admission.reserved_rows = admission.reserved_rows.saturating_add(incoming_rows);
                 admission.reserved_bytes = admission.reserved_bytes.saturating_add(incoming_bytes);
-                self.foreground_ingest_epoch.fetch_add(1, Ordering::Release);
                 tracing::warn!(
                     tablet_id,
                     definition_id = blocker.definition_id,

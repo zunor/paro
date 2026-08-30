@@ -38,18 +38,6 @@ impl HnswBuildExecutionPolicy {
         }
     }
 
-    fn preparation_parallelism(self, pool_width: usize) -> usize {
-        match self {
-            Self::Foreground => pool_width.max(1),
-            // Vector preparation currently has two long immutable passes and
-            // no wave boundary at which its active Rayon job set can shrink.
-            // Keep maintenance preparation preemptible by making those passes
-            // serial; foreground CREATE INDEX may use the complete shared
-            // pool. Graph construction remains dynamically governed per wave.
-            Self::Maintenance => 1,
-        }
-    }
-
     fn parallelism_under_foreground_pressure(self, granted: usize) -> usize {
         match self {
             Self::Foreground => granted.max(1),
@@ -191,19 +179,6 @@ impl Drop for HnswQueryActivityGuard {
     }
 }
 
-/// Number of foreground HNSW queries currently inside provider execution.
-///
-/// Search and maintenance use the same process-width contract but execute in
-/// separate fixed worker pools. Exposing the query census lets every HNSW
-/// query divide the search pool by actual demand: one query can use the idle
-/// machine, while concurrent queries receive a fair share without baking a
-/// benchmark-specific lane count into the provider.
-pub(crate) fn hnsw_active_foreground_queries() -> usize {
-    HNSW_ACTIVE_FOREGROUND_QUERIES
-        .load(Ordering::Acquire)
-        .max(1)
-}
-
 fn foreground_pressure_active_at(
     now_micros: u64,
     active_queries: usize,
@@ -224,31 +199,32 @@ pub(crate) struct HnswForegroundQueryGuard;
 
 impl HnswForegroundQueryGuard {
     pub(crate) fn enter() -> Self {
-        let (state, changed) =
-            HNSW_FOREGROUND_PRESSURE_CHANGED.get_or_init(|| (Mutex::new(()), Condvar::new()));
-        let _state = state
-            .lock()
-            .expect("HNSW foreground-pressure lock poisoned");
         extend_foreground_pressure();
-        HNSW_ACTIVE_FOREGROUND_QUERIES.fetch_add(1, Ordering::AcqRel);
-        changed.notify_all();
+        let previous = HNSW_ACTIVE_FOREGROUND_QUERIES.fetch_add(1, Ordering::AcqRel);
+        if previous == 0 {
+            HNSW_FOREGROUND_PRESSURE_CHANGED
+                .get_or_init(|| (Mutex::new(()), Condvar::new()))
+                .1
+                .notify_all();
+        }
         Self
     }
 }
 
 impl Drop for HnswForegroundQueryGuard {
     fn drop(&mut self) {
-        let (state, changed) =
-            HNSW_FOREGROUND_PRESSURE_CHANGED.get_or_init(|| (Mutex::new(()), Condvar::new()));
-        let _state = state
-            .lock()
-            .expect("HNSW foreground-pressure lock poisoned");
         // Publish the trailing reservation before removing the active count;
         // a build wave can therefore never observe an unreserved gap between
         // the two states.
         extend_foreground_pressure();
-        HNSW_ACTIVE_FOREGROUND_QUERIES.fetch_sub(1, Ordering::AcqRel);
-        changed.notify_all();
+        let previous = HNSW_ACTIVE_FOREGROUND_QUERIES.fetch_sub(1, Ordering::AcqRel);
+        debug_assert!(previous > 0, "HNSW foreground query count underflow");
+        if previous == 1 {
+            HNSW_FOREGROUND_PRESSURE_CHANGED
+                .get_or_init(|| (Mutex::new(()), Condvar::new()))
+                .1
+                .notify_all();
+        }
     }
 }
 
@@ -447,13 +423,14 @@ impl HnswBuilder {
         build_contract: HnswBuildContract,
     ) -> Result<HnswIndex> {
         let (pool, pool_width) = hnsw_build_pool()?;
+        let granted = self.execution_policy.granted_parallelism(pool_width);
         HnswIndex::build_with_controls_and_filter_blocks_in_workspace_with_parallelism(
             storage,
             build_contract,
             HnswFilterBlocks::default(),
             Some(pool),
-            self.execution_policy.granted_parallelism(pool_width),
-            self.execution_policy.preparation_parallelism(pool_width),
+            granted,
+            granted,
             self.execution_policy,
             self.stop_check.as_ref(),
             self.workspace_dir.as_deref(),
@@ -467,13 +444,14 @@ impl HnswBuilder {
         filter_blocks: HnswFilterBlocks,
     ) -> Result<HnswIndex> {
         let (pool, pool_width) = hnsw_build_pool()?;
+        let granted = self.execution_policy.granted_parallelism(pool_width);
         HnswIndex::build_with_controls_and_filter_blocks_in_workspace_with_parallelism(
             storage,
             build_contract,
             filter_blocks,
             Some(pool),
-            self.execution_policy.granted_parallelism(pool_width),
-            self.execution_policy.preparation_parallelism(pool_width),
+            granted,
+            granted,
             self.execution_policy,
             self.stop_check.as_ref(),
             self.workspace_dir.as_deref(),
@@ -515,7 +493,7 @@ mod tests {
 
     #[test]
     #[serial_test::serial]
-    fn optional_compaction_idle_window_tracks_query_exit() {
+    fn definition_integrity_idle_window_tracks_query_exit() {
         let activity = Arc::new(HnswQueryActivity::default());
         let unrelated_definition = Arc::new(HnswQueryActivity::default());
         assert!(activity.quiet_for(Duration::ZERO));

@@ -964,6 +964,60 @@ impl SearchReaderRuntime {
         }
     }
 
+    /// Transfer already-open immutable readers from a private generation
+    /// workspace into the table-owned runtime after the workspace directory
+    /// has been atomically installed.
+    ///
+    /// Decoded reader identity is independent of the containing root path:
+    /// the durable file id, byte range, checksum, format, and provider form
+    /// the complete key. The mmap held by the reader remains valid across the
+    /// same-filesystem directory rename, so publication can preserve both the
+    /// pre-publication authentication state and the external-vector binding
+    /// without reading the complete artifact a second time.
+    pub(crate) fn adopt_decoded_readers_from(
+        &self,
+        source: &SearchReaderRuntime,
+        artifacts: &[SearchArtifactRef],
+    ) -> Result<usize> {
+        let keys = artifacts
+            .iter()
+            .filter(|artifact| artifact.kind == SearchIndexKind::Hnsw)
+            .map(hnsw_decoded_artifact_key)
+            .collect::<Result<BTreeSet<_>>>()?;
+        if keys.is_empty() {
+            return Ok(0);
+        }
+        let source_readers = source.decoded.load_full();
+        for key in &keys {
+            if !source_readers.contains_key(key) {
+                return Err(paro_error::data_corrupted(
+                    "prepared HNSW reader disappeared before durable publication",
+                ));
+            }
+        }
+        let _update = self
+            .decoded_update
+            .lock()
+            .map_err(|_| paro_error::internal("search decoded-reader update lock poisoned"))?;
+        let current = self.decoded.load_full();
+        let mut updated = (*current).clone();
+        let mut adopted = 0usize;
+        for key in keys {
+            if updated.contains_key(&key) {
+                continue;
+            }
+            let reader = source_readers.get(&key).cloned().ok_or_else(|| {
+                paro_error::data_corrupted(
+                    "prepared HNSW reader disappeared during durable publication",
+                )
+            })?;
+            updated.insert(key, reader);
+            adopted = adopted.saturating_add(1);
+        }
+        self.decoded.store(Arc::new(updated));
+        Ok(adopted)
+    }
+
     pub(crate) fn schedule_hnsw_integrity_verification(
         &self,
         index: &Arc<crate::index::hnsw::HnswIndex>,

@@ -25,7 +25,7 @@ use super::HnswIndex;
 
 const DEFAULT_INTEGRITY_TASK_PRIORITY: i32 = -20;
 const DEFAULT_MAX_PENDING_ARTIFACTS: usize = 8;
-const DEFAULT_VERIFY_CHUNKS_PER_SLICE: usize = 256;
+pub(crate) const HNSW_INTEGRITY_CHUNKS_PER_SLICE: usize = 256;
 /// Automatic sweeping is a latency optimization, not the correctness
 /// boundary: foreground reads authenticate every immutable range before use.
 /// Scanning a multi-gigabyte mmap can evict the external vector working set
@@ -54,7 +54,7 @@ impl Default for HnswIntegritySchedulerConfig {
         Self {
             task_priority: DEFAULT_INTEGRITY_TASK_PRIORITY,
             max_pending_artifacts: DEFAULT_MAX_PENDING_ARTIFACTS,
-            chunks_per_slice: DEFAULT_VERIFY_CHUNKS_PER_SLICE,
+            chunks_per_slice: HNSW_INTEGRITY_CHUNKS_PER_SLICE,
             max_automatic_verify_bytes: DEFAULT_MAX_AUTOMATIC_VERIFY_BYTES,
             definition_idle: DEFAULT_DEFINITION_IDLE,
         }
@@ -144,6 +144,9 @@ impl HnswIntegrityScheduler {
         let Some(integrity) = index.artifact_integrity() else {
             return;
         };
+        if integrity.is_fully_verified() {
+            return;
+        }
         if integrity.is_corrupt() {
             if index.try_mark_integrity_scheduled() {
                 storage_metrics().record_hnsw_integrity_failed();

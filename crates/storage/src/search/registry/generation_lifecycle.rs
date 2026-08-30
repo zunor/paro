@@ -1291,7 +1291,7 @@ impl SearchIndexRegistry {
         let Some(manifest) = state.manifest.as_ref() else {
             return Ok(());
         };
-        self.activate_artifact_readers(state, &manifest.artifacts.artifacts, activation)
+        self.activate_artifact_readers(state, &manifest.artifacts.artifacts, activation, None)
     }
 
     /// Complete the expensive half of generation activation before entering
@@ -1305,6 +1305,7 @@ impl SearchIndexRegistry {
         state: &SearchDefinitionState,
         artifacts: &[SearchArtifactRef],
         activation: HnswReaderActivationPolicy,
+        stop_check: Option<&SearchBuildStopCheck>,
     ) -> Result<()> {
         if state.definition.kind != SearchIndexKind::Hnsw || artifacts.is_empty() {
             return Ok(());
@@ -1327,6 +1328,7 @@ impl SearchIndexRegistry {
             &provider.build_contract(),
             state.hnsw_query_activity.clone(),
             activation,
+            stop_check,
         )?;
         Ok(())
     }
