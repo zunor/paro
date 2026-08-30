@@ -4,7 +4,7 @@
 use super::table_handle::TableHandle;
 use crate::compaction::compaction_manager::allocate_compaction_job_id;
 use crate::compaction::execution::job_orchestrator::run_job_with_search_inline_builders;
-use crate::compaction::plan::CompactionPlanner;
+use crate::compaction::plan::{CompactionGoal, CompactionPlanner};
 use crate::compaction::publish::record::CompactionPublishRecord;
 use crate::table::runtime_indexes::RuntimeIndexes;
 use crate::table::storage_descriptor::TableStorageDescriptor;
@@ -15,6 +15,21 @@ use std::sync::Arc;
 use std::time::Duration;
 
 const TABLE_SHUTDOWN_DRAIN_TIMEOUT: Duration = Duration::from_secs(30);
+const FOREGROUND_OPTIMIZE_DRAIN_TIMEOUT: Duration = Duration::from_secs(10 * 60);
+
+struct ForegroundCompactionRegistration {
+    manager: Arc<crate::compaction::compaction_manager::CompactionManager>,
+    tablet: Arc<crate::tablet::Tablet>,
+}
+
+impl Drop for ForegroundCompactionRegistration {
+    fn drop(&mut self) {
+        // `drain_tablet` keeps the tablet out of background admission. Restore
+        // that registration on every success/error exit from foreground
+        // OPTIMIZE so subsequent level-triggered maintenance remains live.
+        self.manager.register_tablet(Arc::clone(&self.tablet));
+    }
+}
 
 impl TableHandle {
     fn restore_runtime_indexes_for_rowset(&self, rowset_id: u64) -> Result<()> {
@@ -84,7 +99,8 @@ impl TableHandle {
         self.tablet()
             .replay_rowset_commit(rowset_id, start_version, end_version, rowset_path)?;
         self.restore_runtime_indexes_for_rowset(rowset_id)?;
-        self.tablet().repair_primary_index_after_replay()?;
+        self.tablet()
+            .apply_replayed_rowset_to_primary_index(rowset_id)?;
         Ok(())
     }
 
@@ -100,14 +116,12 @@ impl TableHandle {
     ) -> Result<()> {
         self.tablet()
             .apply_row_id_delete_locations_idempotent_at_version(locations, delete_version)?;
-        self.tablet().repair_primary_index_after_replay()?;
         Ok(())
     }
 
     pub fn replay_primary_delete(&self, keys: &[Vec<u8>]) -> Result<()> {
         self.tablet()
             .replay_primary_delete_idempotent(keys.to_vec())?;
-        self.tablet().repair_primary_index_after_replay()?;
         Ok(())
     }
 
@@ -118,14 +132,12 @@ impl TableHandle {
     ) -> Result<()> {
         self.tablet()
             .replay_primary_delete_idempotent_at_version(keys.to_vec(), delete_version)?;
-        self.tablet().repair_primary_index_after_replay()?;
         Ok(())
     }
 
     pub fn replay_compaction_publish(&self, record: &CompactionPublishRecord) -> Result<()> {
         self.tablet().replay_compaction_publish(record)?;
         self.restore_runtime_indexes_for_rowset(record.output_rowset_id)?;
-        self.tablet().repair_primary_index_after_replay()?;
         Ok(())
     }
 
@@ -137,8 +149,29 @@ impl TableHandle {
         {
             self.restore_runtime_indexes_for_rowset(*output_rowset_id)?;
         }
-        self.tablet().repair_primary_index_after_replay()?;
         Ok(())
+    }
+
+    /// Reconcile derived structures once after the complete durable replay
+    /// prefix is installed.
+    ///
+    /// Per-record repair would repeatedly rescan every visible rowset when a
+    /// reconstructible primary-index cache trails the journal, making crash
+    /// recovery quadratic in the number of incremental commits.
+    pub fn finalize_replayed_derived_state(&self) -> Result<()> {
+        self.tablet().repair_primary_index_after_replay()
+    }
+
+    pub fn apply_search_generation_publish(&self, op: &TabletMutation) -> Result<()> {
+        self.tablet().apply_search_generation_publish(op)
+    }
+
+    pub fn replay_search_generation_publish(&self, op: &TabletMutation) -> Result<()> {
+        self.tablet().replay_search_generation_publish(op)
+    }
+
+    pub fn apply_search_generation_retirement(&self, op: &TabletMutation) -> Result<()> {
+        self.tablet().apply_search_generation_retirement(op)
     }
 
     /// Replay table-level DELETE row IDs from WAL.
@@ -152,7 +185,11 @@ impl TableHandle {
     ///
     /// Returns `true` when a compacted output rowset was produced and published.
     pub fn optimize_compact(&self) -> Result<bool> {
-        let Some(plan) = CompactionPlanner::plan(&self.tablet())? else {
+        self.optimize_compact_for_goal(CompactionGoal::ReduceDebt)
+    }
+
+    fn optimize_compact_for_goal(&self, goal: CompactionGoal) -> Result<bool> {
+        let Some(plan) = CompactionPlanner::plan_for_goal(&self.tablet(), goal)? else {
             return Ok(false);
         };
         let search_inline_builders = self.search_write_context()?.inline_builders;
@@ -167,6 +204,69 @@ impl TableHandle {
             self.search_registry.refresh_after_rowset_replacement()?;
         }
         Ok(compacted)
+    }
+
+    /// Own compaction for this tablet until its current physical debt is
+    /// drained, then reconcile provider-owned derived state.
+    ///
+    /// An explicit OPTIMIZE is a foreground maintenance boundary, not a hint
+    /// for the periodic scheduler. It first removes the tablet from background
+    /// admission and drains any already accepted job, preventing two plans
+    /// from rebuilding the same immutable inputs. Planning is repeated after
+    /// every publication because each result changes the version graph.
+    /// The storage layer deliberately has no fixed wall-clock cutoff: legal
+    /// compactions scale with table and vector-index size, so an internal ten
+    /// minute limit turns progress into a spurious failure. Callers own their
+    /// execution deadline/cancellation policy; `LIMIT` remains the explicit
+    /// bound on the number of physical compactions.
+    pub fn optimize_all(&self, max_compactions: Option<usize>) -> Result<usize> {
+        let _registration = if let Some(manager) = self.bound_compaction_manager() {
+            manager.drain_tablet(
+                self.tablet_id(),
+                "foreground OPTIMIZE TABLE",
+                FOREGROUND_OPTIMIZE_DRAIN_TIMEOUT,
+            )?;
+            Some(ForegroundCompactionRegistration {
+                manager,
+                tablet: self.tablet(),
+            })
+        } else {
+            None
+        };
+
+        let limit = max_compactions.unwrap_or(usize::MAX);
+        let mut completed = 0usize;
+        loop {
+            let rowset_count = self
+                .tablet()
+                .capture_consistent_rowsets(self.tablet().max_version())?
+                .len();
+            if rowset_count <= 1 {
+                break;
+            }
+            if completed >= limit {
+                return Err(paro_error::artifact_not_ready(format!(
+                    "OPTIMIZE TABLE reached its compaction limit with {rowset_count} rowsets remaining"
+                )));
+            }
+            if !self.optimize_compact_for_goal(CompactionGoal::CoalesceTo { max_rowsets: 1 })? {
+                return Err(paro_error::artifact_not_ready(format!(
+                    "OPTIMIZE TABLE made no progress toward one rowset ({rowset_count} remaining)"
+                )));
+            }
+            completed = completed.saturating_add(1);
+        }
+
+        // Physical publication normally installs one directly usable search
+        // artifact for the output rowset. Run provider maintenance to drain a
+        // remaining tail or manifest delta before reporting the explicit
+        // optimization complete; each pass is one fair definition quantum.
+        loop {
+            let report = self.run_search_maintenance_pass()?;
+            if !report.has_pending_work() {
+                return Ok(completed);
+            }
+        }
     }
 
     /// Validate that the committed rowset version graph is internally legal.

@@ -39,12 +39,8 @@ pub trait CopyToLocalState: Send + Sync {
     fn as_any_mut(&mut self) -> &mut dyn Any;
 }
 
-/// Format-driven CopyFunction.
-#[derive(Clone)]
-pub struct CopyFunction {
-    pub name: String,
-
-    // COPY TO callback
+#[derive(Clone, Debug)]
+pub struct CopyToFunction {
     pub copy_to_bind:
         fn(&CopyOptions, &[String], &[LogicalType]) -> Result<Box<dyn CopyFunctionBindData>>,
     pub copy_to_initialize_global:
@@ -63,8 +59,10 @@ pub struct CopyFunction {
         &mut dyn CopyToLocalState,
     ) -> Result<()>,
     pub copy_to_finalize: fn(&dyn CopyFunctionBindData, &mut dyn CopyToGlobalState) -> Result<()>,
+}
 
-    // COPY FROM: Corresponding TableFunction
+#[derive(Clone, Debug)]
+pub struct CopyFromFunction {
     pub copy_from_bind: fn(
         CopyFromSource,
         &CopyOptions,
@@ -72,6 +70,15 @@ pub struct CopyFunction {
         &[LogicalType],
     ) -> Result<Box<dyn TableFunctionBindData>>,
     pub copy_from_function: TableFunction,
+}
+
+/// Format-driven COPY capabilities. A format advertises each direction
+/// explicitly; unsupported operations cannot carry unrelated callback tables.
+#[derive(Clone)]
+pub struct CopyFunction {
+    pub name: String,
+    pub copy_to: Option<CopyToFunction>,
+    pub copy_from: Option<CopyFromFunction>,
 
     pub extension: String,
 }
@@ -80,6 +87,8 @@ impl std::fmt::Debug for CopyFunction {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("CopyFunction")
             .field("name", &self.name)
+            .field("supports_copy_to", &self.copy_to.is_some())
+            .field("supports_copy_from", &self.copy_from.is_some())
             .field("extension", &self.extension)
             .finish()
     }

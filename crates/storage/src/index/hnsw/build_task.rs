@@ -2,16 +2,13 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use super::{
-    DistanceMetric, HnswBuildConcurrencyBudget, HnswBuildStopCheck, HnswBuilder, HnswConfig,
-    MmapVectorStorage,
+    open_plain_vector_column, HnswBuildContract, HnswBuildStopCheck, HnswBuilder,
+    HNSW_ARTIFACT_ALIGNMENT,
 };
-use crate::rowset::encoding::PLAIN_PAGE_HEADER_SIZE;
-use crate::rowset::page::{
-    BlockCompressionCodec, CompressionType, IndexPageFooter, IndexPageType, Lz4Codec, PageFooter,
-    PageIO, PagePointer, ZstdCodec, DEFAULT_MIN_SPACE_SAVING,
-};
+use crate::rowset::page::{IndexPageFooter, IndexPageType, PageFooter, PageIO, PagePointer};
 use crate::rowset::segment::{SegmentFooter, SegmentSharedPtr};
 use crate::rowset::RowsetSharedPtr;
+use crate::statistics::HnswIndexStatistics;
 use crate::tablet::ColumnId;
 use parking_lot::Mutex;
 use paro_common::error::{self as paro_error, ParoError, Result};
@@ -20,7 +17,6 @@ use paro_scheduler::scheduler::TaskScheduler;
 use paro_scheduler::task::Task;
 use paro_scheduler::task::TaskExecutionMode;
 use paro_scheduler::task::TaskExecutionResult;
-use rayon::current_num_threads;
 use std::fs::{File, OpenOptions};
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::PathBuf;
@@ -31,16 +27,14 @@ use std::sync::Arc;
 #[derive(Debug, Clone)]
 pub struct HnswColumnBuildConfig {
     pub column_id: ColumnId,
-    pub config: HnswConfig,
-    pub distance: DistanceMetric,
+    pub build_contract: HnswBuildContract,
 }
 
 impl HnswColumnBuildConfig {
-    pub fn new(column_id: ColumnId, config: HnswConfig, distance: DistanceMetric) -> Self {
+    pub fn new(column_id: ColumnId, build_contract: HnswBuildContract) -> Self {
         Self {
             column_id,
-            config,
-            distance,
+            build_contract,
         }
     }
 }
@@ -62,8 +56,7 @@ pub struct HnswBuildSummary {
 struct SegmentColumnJob {
     column_id: ColumnId,
     dim: usize,
-    config: HnswConfig,
-    distance: DistanceMetric,
+    build_contract: HnswBuildContract,
 }
 
 #[derive(Debug, Clone)]
@@ -82,9 +75,9 @@ struct HnswBuildResult {
 #[derive(Debug)]
 struct PendingHnswPage {
     column_id: ColumnId,
-    compression: CompressionType,
     num_entries: u32,
     index_data: Vec<u8>,
+    statistics: HnswIndexStatistics,
 }
 
 struct SharedBuildState {
@@ -95,15 +88,10 @@ struct SharedBuildState {
     first_error: Mutex<Option<ParoError>>,
     stop_requested: AtomicBool,
     stop_check: Option<HnswBuildStopCheck>,
-    parallel_build_budget: Arc<HnswBuildConcurrencyBudget>,
 }
 
 impl SharedBuildState {
-    fn new(
-        total_tasks: usize,
-        parallel_build_budget: Arc<HnswBuildConcurrencyBudget>,
-        stop_check: Option<HnswBuildStopCheck>,
-    ) -> Self {
+    fn new(total_tasks: usize, stop_check: Option<HnswBuildStopCheck>) -> Self {
         Self {
             total_tasks,
             completed_tasks: AtomicUsize::new(0),
@@ -112,7 +100,6 @@ impl SharedBuildState {
             first_error: Mutex::new(None),
             stop_requested: AtomicBool::new(false),
             stop_check,
-            parallel_build_budget,
         }
     }
 
@@ -170,9 +157,7 @@ impl SharedBuildState {
 
     fn create_builder(self: &Arc<Self>) -> HnswBuilder {
         let state = Arc::clone(self);
-        HnswBuilder::new()
-            .with_concurrency_budget(Arc::clone(&self.parallel_build_budget))
-            .with_stop_check(HnswBuildStopCheck::new(move || state.should_stop()))
+        HnswBuilder::new().with_stop_check(HnswBuildStopCheck::new(move || state.should_stop()))
     }
 }
 
@@ -261,12 +246,7 @@ impl HnswBuildTask {
 
             let mut built_columns = 0usize;
             for page in pending_pages {
-                let ptr = append_hnsw_page(
-                    &mut file,
-                    page.compression,
-                    &page.index_data,
-                    page.num_entries,
-                )?;
+                let ptr = append_hnsw_page(&mut file, &page.index_data, page.num_entries)?;
 
                 let target = footer
                     .column_metas
@@ -279,6 +259,7 @@ impl HnswBuildTask {
                         ))
                     })?;
                 target.hnsw_index_pointer = Some(ptr);
+                target.hnsw_index_statistics = Some(page.statistics);
                 target.total_mem_footprint =
                     target.total_mem_footprint.saturating_add(ptr.size as u64);
                 built_columns += 1;
@@ -378,49 +359,34 @@ fn build_hnsw_page_data(
         return Ok(None);
     }
 
-    let vector_storage = Arc::new(MmapVectorStorage::open_range(
-        segment_path,
-        col_meta.data_page_pointer.offset + PLAIN_PAGE_HEADER_SIZE as u64,
-        col_meta.num_rows * job.dim as u64 * std::mem::size_of::<f32>() as u64,
-        job.dim,
-    )?);
-    let index = hnsw_builder.build(vector_storage, job.config, job.distance)?;
+    let vector_storage = open_plain_vector_column(segment_path, col_meta, job.dim)?;
+    let workspace_dir = segment_path.parent().ok_or_else(|| {
+        paro_error::internal(format!(
+            "segment path {} has no parent for HNSW build workspace",
+            segment_path.display()
+        ))
+    })?;
+    let index = hnsw_builder
+        .clone()
+        .with_workspace_dir(workspace_dir)
+        .build(vector_storage, job.build_contract)?;
+    let statistics = HnswIndexStatistics::collect(&index)?;
     let index_data = index.serialize()?;
     Ok(Some(PendingHnswPage {
         column_id: job.column_id,
-        compression: col_meta.compression,
         num_entries: index.graph.links.num_points() as u32,
         index_data,
+        statistics,
     }))
 }
 
-fn append_hnsw_page(
-    file: &mut File,
-    compression: CompressionType,
-    index_data: &[u8],
-    num_entries: u32,
-) -> Result<PagePointer> {
+fn append_hnsw_page(file: &mut File, index_data: &[u8], num_entries: u32) -> Result<PagePointer> {
     let footer = PageFooter::Index(IndexPageFooter {
         num_entries,
         page_type: IndexPageType::Leaf,
     });
     file.seek(SeekFrom::End(0)).map_err(paro_error::io)?;
-    let codec = compression_codec(compression);
-    PageIO::compress_and_write_page(
-        codec.as_deref(),
-        DEFAULT_MIN_SPACE_SAVING,
-        file,
-        index_data,
-        &footer,
-    )
-}
-
-fn compression_codec(compression: CompressionType) -> Option<Box<dyn BlockCompressionCodec>> {
-    match compression {
-        CompressionType::None => None,
-        CompressionType::Lz4 => Some(Box::new(Lz4Codec)),
-        CompressionType::Zstd => Some(Box::new(ZstdCodec::default())),
-    }
+    PageIO::write_mmap_page(file, index_data, &footer, HNSW_ARTIFACT_ALIGNMENT)
 }
 
 fn collect_segment_job(
@@ -461,8 +427,7 @@ fn collect_segment_job(
         target_columns.push(SegmentColumnJob {
             column_id: config.column_id,
             dim,
-            config: config.config,
-            distance: config.distance,
+            build_contract: config.build_contract,
         });
     }
 
@@ -499,14 +464,6 @@ fn collect_jobs(
     Ok(jobs)
 }
 
-fn derive_parallel_build_budget(scheduler: &TaskScheduler) -> Arc<HnswBuildConcurrencyBudget> {
-    let scheduler_workers = scheduler.number_of_threads().max(0) as usize;
-    let scheduler_concurrency = scheduler_workers.saturating_add(1).max(1);
-    let rayon_workers = current_num_threads().max(1);
-    let parallel_slots = (rayon_workers / scheduler_concurrency).max(1);
-    Arc::new(HnswBuildConcurrencyBudget::new(parallel_slots))
-}
-
 /// Build missing HNSW segment indexes in parallel via TaskScheduler.
 ///
 /// This is used by `CREATE INDEX ... USING HNSW` metadata-only flow to materialize
@@ -531,11 +488,7 @@ pub fn build_missing_hnsw_indexes_with_scheduler_and_stop_check(
         return Ok(HnswBuildSummary::default());
     }
 
-    let state = Arc::new(SharedBuildState::new(
-        jobs.len(),
-        derive_parallel_build_budget(scheduler.as_ref()),
-        stop_check,
-    ));
+    let state = Arc::new(SharedBuildState::new(jobs.len(), stop_check));
     let producer = scheduler.create_producer();
 
     let tasks: Vec<Arc<Mutex<dyn Task>>> = jobs
@@ -571,7 +524,9 @@ pub fn build_missing_hnsw_indexes_with_scheduler_and_stop_check(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::index::hnsw::{HnswIndex, InMemoryVectorStorage, SearchParams};
+    use crate::index::hnsw::{
+        DistanceMetric, HnswConfig, HnswIndex, InMemoryVectorStorage, SearchParams,
+    };
     use crate::rowset::segment::{
         ColumnData, Segment, SegmentOptions, SegmentWriter, SegmentWriterOptions,
     };
@@ -655,8 +610,9 @@ mod tests {
             &[rowset.clone()],
             &[HnswColumnBuildConfig::new(
                 1,
-                HnswConfig::new(8, 50),
-                DistanceMetric::Euclidean,
+                HnswConfig::new(8, 50)
+                    .try_build_contract(DistanceMetric::Euclidean)
+                    .unwrap(),
             )],
             scheduler,
         )
@@ -791,8 +747,9 @@ mod tests {
             &[rowset.clone()],
             &[HnswColumnBuildConfig::new(
                 1,
-                HnswConfig::new(8, 50),
-                DistanceMetric::Euclidean,
+                HnswConfig::new(8, 50)
+                    .try_build_contract(DistanceMetric::Euclidean)
+                    .unwrap(),
             )],
             scheduler,
             Some(stop_check),

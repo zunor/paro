@@ -24,6 +24,7 @@ mod codec;
 pub mod column;
 pub mod compaction;
 pub mod compression;
+mod durable_maintenance;
 pub mod index;
 pub mod meta;
 pub mod metrics;

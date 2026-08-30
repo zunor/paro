@@ -30,10 +30,12 @@
 
 use crate::codec::physical_layout::fixed_row_width;
 use crate::index::hnsw::{
-    DistanceMetric, HnswBuildStopCheck, HnswBuilder, HnswConfig, InMemoryVectorStorage,
-    VectorStorage,
+    HnswBuildContract, HnswBuildStopCheck, HnswBuilder, HnswFilterBlocks, InMemoryVectorStorage,
+    VectorStorage, HNSW_ARTIFACT_ALIGNMENT,
 };
-use crate::index::{BitmapIndexWriter, BloomFilterIndexWriter, BloomFilterOptions};
+use crate::index::{
+    BitmapIndexWriter, BloomFilterIndexWriter, BloomFilterOptions, OrderedBitmapBlock,
+};
 use crate::rowset::encoding::{
     get_encoding_registry, BinaryDictPageBuilder, BinaryPlainPageBuilder, BitShufflePageBuilder,
     FieldType, PlainPageBuilder, RlePageBuilder,
@@ -42,7 +44,7 @@ use crate::rowset::page::{
     CompressionType, DataPageFooter, EncodingType, IndexPageFooter, IndexPageType, NullEncoding,
     PageFooter, PageIO, PagePointer, CURRENT_DATA_PAGE_FORMAT_VERSION,
 };
-use crate::statistics::{BaseStatistics, ColumnStatistics};
+use crate::statistics::{BaseStatistics, ColumnStatistics, HnswIndexStatistics};
 use bytes::{BufMut, Bytes, BytesMut};
 use paro_common::error::{self as paro_error, Result};
 use paro_common::runtime_value::Value;
@@ -98,16 +100,14 @@ pub struct ColumnWriterOptions {
     pub build_bloom_filter: bool,
     /// Whether to build a bitmap index
     pub build_bitmap_index: bool,
+    /// Retain a build-only scalar dictionary for an HNSW predicate topology.
+    pub collect_hnsw_filter_values: bool,
     /// Fixed length for types like Vector
     pub fixed_len: usize,
     /// Whether to build an HNSW index (for Vector type)
     pub build_hnsw: bool,
-    /// Whether vector values should be normalized for HNSW distance semantics.
-    pub normalize_vector_for_hnsw: bool,
-    /// HNSW configuration
-    pub hnsw_config: Option<HnswConfig>,
-    /// Distance metric for HNSW
-    pub hnsw_distance: Option<DistanceMetric>,
+    /// Immutable HNSW physical build contract.
+    pub hnsw_build_contract: Option<HnswBuildContract>,
     /// Optional cooperative stop-check for HNSW build.
     pub hnsw_stop_check: Option<HnswBuildStopCheck>,
 }
@@ -127,11 +127,10 @@ impl ColumnWriterOptions {
             format_version: CURRENT_DATA_PAGE_FORMAT_VERSION,
             build_bloom_filter: false,
             build_bitmap_index: false,
+            collect_hnsw_filter_values: false,
             fixed_len: 0,
             build_hnsw: false,
-            normalize_vector_for_hnsw: false,
-            hnsw_config: None,
-            hnsw_distance: None,
+            hnsw_build_contract: None,
             hnsw_stop_check: None,
         }
     }
@@ -171,22 +170,19 @@ impl ColumnWriterOptions {
         self
     }
 
+    pub fn with_hnsw_filter_values(mut self, collect: bool) -> Self {
+        self.collect_hnsw_filter_values = collect;
+        self
+    }
+
     pub fn with_fixed_len(mut self, len: usize) -> Self {
         self.fixed_len = len;
         self
     }
 
-    pub fn with_hnsw(
-        mut self,
-        build: bool,
-        normalize: bool,
-        config: Option<HnswConfig>,
-        distance: Option<DistanceMetric>,
-    ) -> Self {
+    pub fn with_hnsw(mut self, build: bool, build_contract: Option<HnswBuildContract>) -> Self {
         self.build_hnsw = build;
-        self.normalize_vector_for_hnsw = normalize;
-        self.hnsw_config = config;
-        self.hnsw_distance = distance;
+        self.hnsw_build_contract = build_contract;
         self
     }
 
@@ -363,6 +359,8 @@ pub struct ColumnWriterMeta {
     pub bitmap_index_pointer: Option<PagePointer>,
     /// HNSW index pointer (optional)
     pub hnsw_index_pointer: Option<PagePointer>,
+    /// HNSW summary persisted in the segment footer.
+    pub hnsw_index_statistics: Option<HnswIndexStatistics>,
     /// Total data size in bytes
     pub data_size: u64,
     /// Total index size in bytes
@@ -403,6 +401,25 @@ pub trait ColumnWriter: Send {
 
     /// Get the buffered data bytes (if in-memory).
     fn get_data(&self) -> Bytes;
+
+    /// Snapshot ordered scalar blocks for a predicate-local HNSW topology.
+    /// Non-scalar writers and columns not admitted by the HNSW contract return
+    /// `None`.
+    fn hnsw_filter_blocks(&self, _target_rows: usize) -> Result<Option<Vec<OrderedBitmapBlock>>> {
+        Ok(None)
+    }
+
+    /// Install the cross-column filter blocks consumed when this vector
+    /// writer builds its HNSW artifact.
+    fn set_hnsw_filter_blocks(&mut self, blocks: HnswFilterBlocks) -> Result<()> {
+        if blocks.columns.is_empty() {
+            Ok(())
+        } else {
+            Err(paro_error::internal(
+                "column writer does not accept HNSW filter blocks",
+            ))
+        }
+    }
 }
 
 /// Page builder wrapper for different encoding types.
@@ -569,6 +586,10 @@ pub struct ScalarColumnWriter<W: DataWriter> {
     bloom_filter_index: Option<BloomFilterIndexWriter>,
     /// Bitmap index writer (optional)
     bitmap_index: Option<BitmapIndexWriter>,
+    /// Build-only scalar dictionary used when a vector index explicitly names
+    /// this column as predicate topology input. It is omitted when the durable
+    /// bitmap writer already owns the same complete postings.
+    hnsw_filter_value_index: Option<BitmapIndexWriter>,
     /// Current page first ordinal
     first_ordinal: u64,
     /// Total rows written
@@ -589,6 +610,9 @@ pub struct ScalarColumnWriter<W: DataWriter> {
     data_size: u64,
     /// HNSW vector storage (in-memory during building)
     hnsw_storage: Option<InMemoryVectorStorage>,
+    /// Cross-column scalar blocks supplied by `SegmentWriter` immediately
+    /// before finalization.
+    hnsw_filter_blocks: Option<HnswFilterBlocks>,
     /// Column statistics collected during write
     column_stats: ColumnStatistics,
     /// Number of NULL values
@@ -600,6 +624,11 @@ pub struct ScalarColumnWriter<W: DataWriter> {
 impl<W: DataWriter> ScalarColumnWriter<W> {
     /// Create a new scalar column writer.
     pub fn new(opts: ColumnWriterOptions, writer: W) -> Result<Self> {
+        if opts.field_type == FieldType::Vector && opts.compression != CompressionType::None {
+            return Err(paro_error::invalid_input(
+                "vector data pages are mmap-backed and cannot be compressed",
+            ));
+        }
         let registry = get_encoding_registry();
         let encoding = if opts.encoding == EncodingType::Default {
             registry.get_default_encoding(opts.field_type, false)
@@ -609,6 +638,7 @@ impl<W: DataWriter> ScalarColumnWriter<W> {
 
         let build_bloom_filter = opts.build_bloom_filter;
         let build_bitmap_index = opts.build_bitmap_index;
+        let collect_hnsw_filter_values = opts.collect_hnsw_filter_values;
 
         let page_builder = Self::create_page_builder(&opts, encoding)?;
         let null_builder = if opts.is_nullable {
@@ -656,6 +686,11 @@ impl<W: DataWriter> ScalarColumnWriter<W> {
             } else {
                 None
             },
+            hnsw_filter_value_index: if collect_hnsw_filter_values && !build_bitmap_index {
+                Some(BitmapIndexWriter::new())
+            } else {
+                None
+            },
             first_ordinal: 0,
             num_rows: 0,
             page_has_null: false,
@@ -666,6 +701,7 @@ impl<W: DataWriter> ScalarColumnWriter<W> {
             first_data_page: None,
             data_size: 0,
             hnsw_storage,
+            hnsw_filter_blocks: None,
             column_stats,
             null_count: 0,
             stats_logical_type,
@@ -726,22 +762,6 @@ impl<W: DataWriter> ScalarColumnWriter<W> {
 }
 
 impl<W: DataWriter> ScalarColumnWriter<W> {
-    fn normalize_vector_bytes(data: &[u8], count: usize, dim: usize) -> Vec<u8> {
-        let bytes_per_vec = dim * std::mem::size_of::<f32>();
-        let mut out = Vec::with_capacity(count * bytes_per_vec);
-        for i in 0..count {
-            let start = i * bytes_per_vec;
-            let vec_bytes = &data[start..start + bytes_per_vec];
-            let vec_f32 =
-                unsafe { std::slice::from_raw_parts(vec_bytes.as_ptr() as *const f32, dim) };
-            let normalized = DistanceMetric::Cosine.preprocess(vec_f32.to_vec());
-            for v in normalized {
-                out.extend_from_slice(&v.to_le_bytes());
-            }
-        }
-        out
-    }
-
     /// Add fixed-width values to the page builder.
     fn add_fixed_values(&mut self, data: &[u8], count: u32) -> u32 {
         let fixed_width = fixed_type_size(&self.opts);
@@ -791,6 +811,13 @@ impl<W: DataWriter> ScalarColumnWriter<W> {
                 bitmap.add_value(value);
             }
         }
+        if let Some(ref mut bitmap) = self.hnsw_filter_value_index {
+            if is_null {
+                bitmap.add_nulls(1);
+            } else {
+                bitmap.add_value(value);
+            }
+        }
         if let Some(ref mut bloom) = self.bloom_filter_index {
             if is_null {
                 bloom.add_nulls(1);
@@ -808,7 +835,10 @@ impl<W: DataWriter> ScalarColumnWriter<W> {
         count: u32,
         type_size: usize,
     ) {
-        if self.bloom_filter_index.is_none() && self.bitmap_index.is_none() {
+        if self.bloom_filter_index.is_none()
+            && self.bitmap_index.is_none()
+            && self.hnsw_filter_value_index.is_none()
+        {
             return;
         }
         let total_bytes = count as usize * type_size;
@@ -1046,15 +1076,28 @@ impl<W: DataWriter> ScalarColumnWriter<W> {
             null_encoding: NullEncoding::BitShuffle,
         });
 
-        // Write page with compression
-        let codec_ref = self.codec.as_deref();
-        let ptr = PageIO::compress_and_write_page(
-            codec_ref,
-            self.opts.min_space_saving,
-            &mut self.writer,
-            &page_body,
-            &footer,
-        )?;
+        // Every vector data page is an independently addressable typed mmap
+        // region. Align each page, not merely the start of the containing
+        // column: page footers make adjacent page bodies non-contiguous and
+        // do not preserve the next page's alignment by accident.
+        let ptr = if self.opts.field_type == FieldType::Vector {
+            PageIO::write_mmap_page_with_aligned_body_offset(
+                &mut self.writer,
+                &page_body,
+                &footer,
+                crate::index::hnsw::HNSW_ARTIFACT_ALIGNMENT,
+                crate::rowset::encoding::PLAIN_PAGE_HEADER_SIZE,
+            )?
+        } else {
+            let codec_ref = self.codec.as_deref();
+            PageIO::compress_and_write_page(
+                codec_ref,
+                self.opts.min_space_saving,
+                &mut self.writer,
+                &page_body,
+                &footer,
+            )?
+        };
 
         // Update indexes
         self.ordinal_index.add(self.first_ordinal, ptr);
@@ -1201,17 +1244,6 @@ impl<W: DataWriter + 'static> ScalarColumnWriter<W> {
         }
 
         let type_size = fixed_type_size(&self.opts);
-        let normalize_vectors = self.opts.field_type == FieldType::Vector
-            && self.opts.normalize_vector_for_hnsw
-            && matches!(
-                self.opts.hnsw_distance.unwrap_or(DistanceMetric::Cosine),
-                DistanceMetric::Cosine
-            );
-        let vector_dim = if normalize_vectors {
-            self.opts.fixed_len / std::mem::size_of::<f32>()
-        } else {
-            0
-        };
         let mut offset = 0usize;
         let mut row_offset = 0usize;
         let mut remaining = count;
@@ -1231,28 +1263,13 @@ impl<W: DataWriter + 'static> ScalarColumnWriter<W> {
                 let max_values = (available_bytes / bytes_per_value) as u32;
                 let to_add = std::cmp::min(remaining, max_values);
 
-                let mut normalized_buf: Option<Vec<u8>> = None;
-                let input_slice = if normalize_vectors && to_add > 0 {
-                    let total_len = to_add as usize * bytes_per_value;
-                    let raw_slice = &data[offset..offset + total_len];
-                    normalized_buf = Some(Self::normalize_vector_bytes(
-                        raw_slice,
-                        to_add as usize,
-                        vector_dim,
-                    ));
-                    normalized_buf.as_ref().unwrap().as_slice()
-                } else {
-                    &data[offset..]
-                };
-
-                let added = self.add_fixed_values(input_slice, to_add);
+                // Base column pages, statistics, and predicate indexes retain
+                // the SQL value exactly as supplied. Metric preprocessing is
+                // an HNSW artifact concern and must never rewrite table data.
+                let added = self.add_fixed_values(&data[offset..], to_add);
                 let data_slice_len = added as usize * bytes_per_value;
                 if data_slice_len > 0 && offset + data_slice_len <= data.len() {
-                    let slice = if let Some(buf) = &normalized_buf {
-                        &buf[..data_slice_len]
-                    } else {
-                        &data[offset..offset + data_slice_len]
-                    };
+                    let slice = &data[offset..offset + data_slice_len];
                     self.update_secondary_indexes_fixed(
                         slice,
                         null_flags,
@@ -1329,7 +1346,9 @@ impl<W: DataWriter + 'static> ScalarColumnWriter<W> {
         let zonemap_index_pointer = self.write_zone_map()?;
         let bloom_filter_pointer = self.write_bloom_filter_index()?;
         let bitmap_index_pointer = self.write_bitmap_index()?;
-        let hnsw_index_pointer = self.write_hnsw_index()?;
+        let hnsw = self.write_hnsw_index()?;
+        let hnsw_index_pointer = hnsw.as_ref().map(|(pointer, _)| *pointer);
+        let hnsw_index_statistics = hnsw.map(|(_, statistics)| statistics);
 
         let dict_size = self.dict_page_pointer.map(|p| p.size as u64).unwrap_or(0);
         let mut index_size =
@@ -1371,6 +1390,7 @@ impl<W: DataWriter + 'static> ScalarColumnWriter<W> {
                 .map(|p| PagePointer::new(meta_base_offset + p.offset, p.size)),
             hnsw_index_pointer: hnsw_index_pointer
                 .map(|p| PagePointer::new(meta_base_offset + p.offset, p.size)),
+            hnsw_index_statistics,
             data_size: self.data_size,
             index_size,
             total_mem_footprint,
@@ -1403,6 +1423,40 @@ impl<W: DataWriter + 'static> ColumnWriter for ScalarColumnWriter<W> {
 
     fn get_data(&self) -> Bytes {
         self.writer.get_data()
+    }
+
+    fn hnsw_filter_blocks(&self, target_rows: usize) -> Result<Option<Vec<OrderedBitmapBlock>>> {
+        let Some(index) = self
+            .bitmap_index
+            .as_ref()
+            .or(self.hnsw_filter_value_index.as_ref())
+        else {
+            return Ok(None);
+        };
+        let logical_type = self.opts.logical_type.as_ref().ok_or_else(|| {
+            paro_error::internal("HNSW filter-value collector is missing its logical type")
+        })?;
+        index
+            .ordered_hnsw_filter_blocks(logical_type, target_rows)
+            .map(Some)
+    }
+
+    fn set_hnsw_filter_blocks(&mut self, blocks: HnswFilterBlocks) -> Result<()> {
+        if self.hnsw_storage.is_none() {
+            return if blocks.columns.is_empty() {
+                Ok(())
+            } else {
+                Err(paro_error::internal(
+                    "non-HNSW scalar writer received HNSW filter blocks",
+                ))
+            };
+        }
+        if self.hnsw_filter_blocks.replace(blocks).is_some() {
+            return Err(paro_error::internal(
+                "HNSW filter blocks were installed more than once",
+            ));
+        }
+        Ok(())
     }
 }
 
@@ -1496,7 +1550,7 @@ impl<W: DataWriter> ScalarColumnWriter<W> {
     }
 
     /// Write HNSW index to file (optional).
-    fn write_hnsw_index(&mut self) -> Result<Option<PagePointer>> {
+    fn write_hnsw_index(&mut self) -> Result<Option<(PagePointer, HnswIndexStatistics)>> {
         let Some(storage) = self.hnsw_storage.take() else {
             return Ok(None);
         };
@@ -1505,30 +1559,42 @@ impl<W: DataWriter> ScalarColumnWriter<W> {
             return Ok(None);
         }
 
-        let config = self.opts.hnsw_config.unwrap_or_default();
-        let distance = self.opts.hnsw_distance.unwrap_or(DistanceMetric::Cosine);
+        let build_contract = self.opts.hnsw_build_contract.ok_or_else(|| {
+            paro_error::internal("HNSW vector storage is missing its build contract")
+        })?;
         let mut hnsw_builder = HnswBuilder::new();
         if let Some(stop_check) = self.opts.hnsw_stop_check.clone() {
             hnsw_builder = hnsw_builder.with_stop_check(stop_check);
         }
-        let index = hnsw_builder.build(Arc::new(storage), config, distance)?;
+        let filter_blocks = self.hnsw_filter_blocks.take().unwrap_or_default();
+        let index = if build_contract.filter_topology.is_enabled() {
+            hnsw_builder.build_with_filter_blocks(
+                Arc::new(storage),
+                build_contract,
+                filter_blocks,
+            )?
+        } else {
+            hnsw_builder.build(Arc::new(storage), build_contract)?
+        };
 
+        let statistics = HnswIndexStatistics::collect(&index)?;
         let index_data = index.serialize()?;
         let footer = PageFooter::Index(IndexPageFooter {
             num_entries: index.graph.links.num_points() as u32,
             page_type: IndexPageType::Leaf,
         });
 
-        let codec_ref = self.codec.as_deref();
-        let ptr = PageIO::compress_and_write_page(
-            codec_ref,
-            self.opts.min_space_saving,
+        // The artifact contains typed mmap regions whose relative alignment is
+        // guaranteed by its encoder. Preserve that alignment in the segment
+        // and keep the envelope plain so its bytes remain directly addressable.
+        let ptr = PageIO::write_mmap_page(
             &mut self.writer,
             &index_data,
             &footer,
+            HNSW_ARTIFACT_ALIGNMENT,
         )?;
 
-        Ok(Some(ptr))
+        Ok(Some((ptr, statistics)))
     }
 
     /// Consume the writer and return the underlying writer.
@@ -1579,6 +1645,17 @@ mod tests {
         assert!(!opts.is_nullable);
         assert_eq!(opts.compression, CompressionType::Zstd);
         assert_eq!(opts.page_size, 128 * 1024);
+    }
+
+    #[test]
+    fn vector_compression_is_rejected_when_the_writer_is_created() {
+        let opts = ColumnWriterOptions::new(FieldType::Vector, 1)
+            .with_fixed_len(4 * std::mem::size_of::<f32>())
+            .with_compression(CompressionType::Lz4);
+        let error = ScalarColumnWriter::new(opts, Cursor::new(Vec::new()))
+            .err()
+            .expect("compressed vector writer must be rejected");
+        assert!(error.to_string().contains("cannot be compressed"));
     }
 
     #[test]

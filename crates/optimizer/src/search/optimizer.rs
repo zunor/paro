@@ -1,12 +1,14 @@
 // Copyright 2024-2026 Zunor
 // SPDX-License-Identifier: Apache-2.0
 
-use paro_common::error::Result;
+use paro_common::error::{self as paro_error, Result};
 use paro_common::runtime_value::Value;
 use paro_common::types::LogicalType;
 use paro_external::routine::identity::BuiltinIntrinsicId;
 use paro_planner::binder::deep_copy::deep_copy_plan;
-use paro_planner::expression::{Expression, OperatorType};
+use paro_planner::expression::{
+    Expression, ExpressionIterator, ExpressionVisitDecision, OperatorType,
+};
 use paro_planner::operator::{
     build_fulltext_query_stats, normalize_fulltext_config, Confidence, Filter, FullTextFilterScan,
     FullTextQueryKind, FullTextScoreMode, Get, LogicalOperator, Projection, SearchCandidate,
@@ -14,9 +16,9 @@ use paro_planner::operator::{
 };
 use paro_planner::plan::LogicalPlan;
 use paro_storage::search::{
-    FullTextIntent, HnswIntent, NormalizedSearchRequest, ProjectionSpec,
-    SearchCostEstimate as PlannedSearchCostEstimate, SearchIntent, SearchRequestMode,
-    SequentialCapability, SparseIntent,
+    DenseVectorQuery, ExactFilterMaterialization, FullTextIntent, HnswIntent,
+    NormalizedSearchRequest, ProjectionSpec, SearchCostEstimate as PlannedSearchCostEstimate,
+    SearchIntent, SearchRequestMode, SequentialCapability, SparseIntent,
 };
 
 use crate::context::OptimizationContext;
@@ -81,6 +83,17 @@ impl SearchOptimizer {
         let Some(pattern) = extract_topn_pattern(topn) else {
             return Ok(None);
         };
+        let vector_intent = extract_vector_intent(
+            pattern.order_expr,
+            pattern.get,
+            topn.hnsw_options,
+            pattern.topn.orders[0].ascending,
+        )?;
+        if topn.hnsw_options != Default::default() && vector_intent.is_none() {
+            return Err(paro_error::invalid_input(
+                "HNSW_EF and VECTOR_SEARCH_MODE apply only to ascending dense-vector distance ORDER BY ... LIMIT queries",
+            ));
+        }
         let Some((table_id, storage)) = get_search_storage(pattern.get) else {
             return Ok(None);
         };
@@ -93,9 +106,13 @@ impl SearchOptimizer {
             &ctx.column_stats,
         );
         let filter_selectivity = estimate_selectivity(base_rows, filtered.expected);
-        let sequential = build_sequential_capability(table_id, filtered.expected);
+        let filter_materialization =
+            exact_filter_materialization(&candidate_filters, pattern.get, storage.as_ref());
+        // A generic filtered Top-K must inspect the base rows before it knows
+        // which vectors survive. Output cardinality is not scan work.
+        let sequential = build_sequential_capability(table_id, base_rows);
 
-        if let Some(intent) = extract_vector_intent(pattern.order_expr, pattern.get)? {
+        if let Some(intent) = vector_intent {
             let search_intent = SearchIntent::Hnsw(intent.clone());
             let Some(capability) = storage.search_capability(&search_intent) else {
                 return Ok(None);
@@ -103,14 +120,22 @@ impl SearchOptimizer {
             if !capability.is_queryable() {
                 return Ok(None);
             }
-            let Some(stats) = storage.hnsw_index_statistics(intent.column_id) else {
+            let Some(stats) = capability.generation_stats.hnsw_index_statistics()? else {
+                return Ok(None);
+            };
+            let Some(search_policy) =
+                storage.vector_search_policy(intent.column_id, intent.distance)
+            else {
                 return Ok(None);
             };
             let estimated_cost = VectorScanCostModel::estimate_hnsw_cost(
                 &stats,
+                capability.generation_stats.artifact_count,
                 topn.limit,
                 filter_selectivity,
-                topn.hnsw_ef_hint,
+                topn.hnsw_options,
+                search_policy,
+                filter_materialization,
             );
             let Some(request) =
                 build_topk_request(table_id, pattern.get, topn.limit, search_intent.clone())?
@@ -122,6 +147,8 @@ impl SearchOptimizer {
                 capability,
                 estimated_cost,
                 filtered.expected,
+                base_rows,
+                filter_materialization,
             );
             let Some(decision) = select_search_decision(candidate, sequential.clone()) else {
                 return Ok(None);
@@ -161,6 +188,8 @@ impl SearchOptimizer {
                 capability,
                 estimated_cost,
                 filtered.expected,
+                base_rows,
+                filter_materialization,
             );
             let Some(decision) = select_search_decision(candidate, sequential.clone()) else {
                 return Ok(None);
@@ -201,6 +230,8 @@ impl SearchOptimizer {
                 capability,
                 estimated_cost,
                 filtered.expected,
+                base_rows,
+                filter_materialization,
             );
             let Some(decision) = select_search_decision(candidate, sequential) else {
                 return Ok(None);
@@ -247,6 +278,8 @@ impl SearchOptimizer {
 
             let base_rows = base_rows(filter.child.as_ref(), get);
             let candidate_filters = candidate_filters(&filter.expressions, get);
+            let filter_materialization =
+                exact_filter_materialization(&candidate_filters, get, storage.as_ref());
             let filtered = ctx.cost_model.estimate_filter_cardinality(
                 base_rows,
                 &candidate_filters,
@@ -262,8 +295,10 @@ impl SearchOptimizer {
                 capability,
                 estimated_cost,
                 filtered.expected,
+                base_rows,
+                filter_materialization,
             );
-            let sequential = build_sequential_capability(table_id, filtered.expected);
+            let sequential = build_sequential_capability(table_id, base_rows);
             let Some(decision) = select_search_decision(candidate, sequential) else {
                 continue;
             };
@@ -325,13 +360,18 @@ fn build_search_candidate(
     capability: paro_storage::search::SearchCapability,
     estimated_cost: f64,
     estimated_rows: u64,
+    estimated_total_rows: u64,
+    exact_filter_materialization: Option<ExactFilterMaterialization>,
 ) -> SearchCandidate {
-    let estimated_cost = PlannedSearchCostEstimate::new(estimated_cost).with_rows(estimated_rows);
+    let estimated_cost = PlannedSearchCostEstimate::new(estimated_cost)
+        .with_rows(estimated_rows)
+        .with_total_rows(estimated_total_rows);
     SearchCandidate {
         intent,
         token: capability.capability_token(),
         kind: capability.kind,
         estimated_cost: Some(estimated_cost),
+        exact_filter_materialization,
     }
 }
 
@@ -467,6 +507,56 @@ fn candidate_filters(filters: &[Expression], get: &Get) -> Vec<Expression> {
     all
 }
 
+fn exact_filter_materialization(
+    filters: &[Expression],
+    get: &Get,
+    storage: &paro_storage::table::table_handle::TableHandle,
+) -> Option<ExactFilterMaterialization> {
+    if filters.is_empty() {
+        return None;
+    }
+
+    let mut stored_columns = Vec::new();
+    let mut has_unmapped_column = false;
+    for filter in filters {
+        ExpressionIterator::visit(filter, &mut |expression| {
+            if let Expression::ColumnRef(column) = expression {
+                let stored = (column.depth == 0 && column.binding.table_index == get.table_index)
+                    .then(|| get.stored_column(column.binding.column_index))
+                    .flatten();
+                match stored {
+                    Some(column_id) => {
+                        if !stored_columns.contains(&(column_id as u32)) {
+                            stored_columns.push(column_id as u32);
+                        }
+                    }
+                    None => has_unmapped_column = true,
+                }
+            }
+            ExpressionVisitDecision::Descend
+        });
+    }
+
+    if stored_columns.is_empty() || has_unmapped_column {
+        return Some(ExactFilterMaterialization::ColumnScan);
+    }
+    let Ok((indexed_rows, total_rows)) =
+        storage.complete_scalar_index_row_coverage(&stored_columns)
+    else {
+        return Some(ExactFilterMaterialization::ColumnScan);
+    };
+    Some(if total_rows > 0 && indexed_rows == total_rows {
+        ExactFilterMaterialization::ScalarIndex
+    } else if indexed_rows == 0 {
+        ExactFilterMaterialization::ColumnScan
+    } else {
+        ExactFilterMaterialization::Mixed {
+            indexed_rows,
+            scanned_rows: total_rows.saturating_sub(indexed_rows),
+        }
+    })
+}
+
 struct TopNPattern<'a> {
     topn: &'a TopN,
     projection: &'a Projection,
@@ -526,22 +616,36 @@ fn find_filters_and_get_plan(mut plan: &LogicalPlan) -> Option<(Vec<Expression>,
     }
 }
 
-fn extract_vector_intent(expr: &Expression, get: &Get) -> Result<Option<HnswIntent>> {
+fn extract_vector_intent(
+    expr: &Expression,
+    get: &Get,
+    options: paro_storage::index::hnsw::HnswQueryOptions,
+    ascending: bool,
+) -> Result<Option<HnswIntent>> {
+    if !ascending {
+        return Ok(None);
+    }
     let expr = strip_casts(expr);
     let func = match expr {
         Expression::Function(function) => function,
         _ => return Ok(None),
     };
-    if !matches!(
-        func.builtin_intrinsic(),
-        Some(
-            BuiltinIntrinsicId::L2Distance
-                | BuiltinIntrinsicId::L1Distance
-                | BuiltinIntrinsicId::CosineDistance
-                | BuiltinIntrinsicId::NegativeInnerProduct
-        )
-    ) || func.children.len() != 2
-    {
+    let distance = match func.builtin_intrinsic() {
+        Some(BuiltinIntrinsicId::L2Distance) => {
+            paro_storage::index::hnsw::DistanceMetric::Euclidean
+        }
+        Some(BuiltinIntrinsicId::L1Distance) => {
+            paro_storage::index::hnsw::DistanceMetric::Manhattan
+        }
+        Some(BuiltinIntrinsicId::CosineDistance) => {
+            paro_storage::index::hnsw::DistanceMetric::Cosine
+        }
+        Some(BuiltinIntrinsicId::NegativeInnerProduct) => {
+            paro_storage::index::hnsw::DistanceMetric::DotProduct
+        }
+        _ => return Ok(None),
+    };
+    if func.children.len() != 2 {
         return Ok(None);
     }
 
@@ -551,7 +655,9 @@ fn extract_vector_intent(expr: &Expression, get: &Get) -> Result<Option<HnswInte
             return Ok(
                 resolve_vector_column(get, column_idx).map(|column_id| HnswIntent {
                     column_id,
-                    query_vector,
+                    query: query_vector,
+                    distance,
+                    options,
                 }),
             );
         }
@@ -561,7 +667,9 @@ fn extract_vector_intent(expr: &Expression, get: &Get) -> Result<Option<HnswInte
             return Ok(
                 resolve_vector_column(get, column_idx).map(|column_id| HnswIntent {
                     column_id,
-                    query_vector,
+                    query: query_vector,
+                    distance,
+                    options,
                 }),
             );
         }
@@ -582,9 +690,11 @@ fn resolve_vector_column(get: &Get, column_idx: usize) -> Option<u32> {
     Some(get.stored_column(column_idx)? as u32)
 }
 
-fn extract_query_vector(expr: &Expression) -> Result<Option<Vec<f32>>> {
+fn extract_query_vector(expr: &Expression) -> Result<Option<DenseVectorQuery>> {
     match expr {
-        Expression::Constant(constant) => value_to_vec(&constant.value),
+        Expression::Constant(constant) => {
+            Ok(value_to_vec(&constant.value)?.map(DenseVectorQuery::Literal))
+        }
         Expression::Operator(operator)
             if matches!(operator.operator_type, OperatorType::ArrayConstructor) =>
         {
@@ -598,16 +708,39 @@ fn extract_query_vector(expr: &Expression) -> Result<Option<Vec<f32>>> {
                 };
                 values.push(value);
             }
-            Ok(Some(values))
+            Ok(Some(DenseVectorQuery::Literal(values)))
         }
         Expression::Cast(cast) => {
+            if let Expression::Parameter(parameter) = cast.child.as_ref() {
+                if let LogicalType::Array(child, dimension) = &cast.target_type {
+                    if matches!(child.as_ref(), LogicalType::Float) {
+                        return Ok(Some(DenseVectorQuery::RuntimeParameter {
+                            slot: parameter.slot.clone(),
+                            dimension: *dimension,
+                        }));
+                    }
+                }
+            }
             if let Expression::Constant(constant) = cast.child.as_ref() {
                 if let Value::Varchar(value) = &constant.value {
-                    return Ok(Some(parse_vector_literal(value)?));
+                    return Ok(Some(DenseVectorQuery::Literal(parse_vector_literal(
+                        value,
+                    )?)));
                 }
             }
             extract_query_vector(cast.child.as_ref())
         }
+        Expression::Parameter(parameter) => match &parameter.slot.ty {
+            LogicalType::Array(child, dimension)
+                if matches!(child.as_ref(), LogicalType::Float) =>
+            {
+                Ok(Some(DenseVectorQuery::RuntimeParameter {
+                    slot: parameter.slot.clone(),
+                    dimension: *dimension,
+                }))
+            }
+            _ => Ok(None),
+        },
         _ => Ok(None),
     }
 }
@@ -1043,7 +1176,9 @@ mod tests {
             SearchCandidate {
                 intent: SearchIntent::Hnsw(HnswIntent {
                     column_id: 1,
-                    query_vector: vec![1.0, 2.0],
+                    query: DenseVectorQuery::Literal(vec![1.0, 2.0]),
+                    distance: paro_storage::index::hnsw::DistanceMetric::Euclidean,
+                    options: Default::default(),
                 }),
                 token: paro_storage::search::CapabilityToken {
                     definition_id: 1,
@@ -1053,6 +1188,7 @@ mod tests {
                 },
                 kind: paro_storage::search::SearchIndexKind::Hnsw,
                 estimated_cost: Some(PlannedSearchCostEstimate::new(95.0)),
+                exact_filter_materialization: None,
             },
             build_sequential_capability(7, 100),
         );
@@ -1175,6 +1311,7 @@ mod tests {
                     },
                     kind: paro_storage::search::SearchIndexKind::FullText,
                     estimated_cost: Some(PlannedSearchCostEstimate::new(1.0)),
+                    exact_filter_materialization: None,
                 },
                 confidence: Confidence::High,
             },

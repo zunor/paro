@@ -31,32 +31,53 @@ pub struct HnswIndexStatistics {
 impl HnswIndexStatistics {
     pub const BYTE_LEN: usize = 8 * 9 + 4 * 2;
 
-    pub fn collect(index: &HnswIndex) -> Self {
+    pub fn collect(index: &HnswIndex) -> Result<Self> {
         let num_vectors = index.vector_storage.num_vectors();
         let dim = index.vector_storage.vector_dim();
-        let degree_summary = index.graph.links.degree_summary();
-        let graph_links_size = index.graph.links.serialized_size_bytes();
+        let degree_summary = index.graph.links.degree_summary()?;
+        let graph_links_size = index.graph.predicate_links.as_ref().map_or(
+            index.graph.links.serialized_size_bytes(),
+            |predicate| {
+                index
+                    .graph
+                    .links
+                    .serialized_size_bytes()
+                    .saturating_add(predicate.serialized_size_bytes())
+            },
+        );
         let entry_points_size = (index.graph.entry_points.entry_points.len()
             + index.graph.entry_points.extra_entry_points.len())
             as u64
-            * std::mem::size_of::<crate::index::hnsw::EntryPoint>() as u64;
-        let graph_size_bytes = graph_links_size + entry_points_size;
+            * std::mem::size_of::<crate::index::hnsw::EntryPoint>() as u64
+            + index.graph.predicate_entry_points.len() as u64
+                * std::mem::size_of::<crate::index::hnsw::PredicateEntryPoint>() as u64;
+        let metric_preprocessing_size = index
+            .vector_storage
+            .cosine_inverse_norms()
+            .map(|norms| norms.len() as u64 * std::mem::size_of::<f32>() as u64)
+            .unwrap_or(0);
+        let predicate_scan_size = index
+            .predicate_scan
+            .as_ref()
+            .map_or(0, |layout| layout.serialized_size_bytes() as u64);
+        let graph_size_bytes =
+            graph_links_size + entry_points_size + metric_preprocessing_size + predicate_scan_size;
         let storage_size_bytes =
             num_vectors as u64 * dim as u64 * std::mem::size_of::<f32>() as u64;
 
-        Self {
+        Ok(Self {
             num_indexed_vectors: num_vectors,
             dimension: dim,
             max_level: index.graph.entry_points.max_level(),
-            m: index.config.m,
-            ef_construction: index.config.ef_construct,
+            m: index.build_contract.m as usize,
+            ef_construction: index.build_contract.ef_construct as usize,
             graph_size_bytes,
             storage_size_bytes,
             total_graph_links: degree_summary.total_links,
             level0_graph_links: degree_summary.level0_links,
             max_level0_degree: degree_summary.max_level0_degree,
             avg_level0_degree: degree_summary.avg_level0_degree,
-        }
+        })
     }
 
     pub fn to_bytes(&self) -> Vec<u8> {
@@ -282,7 +303,7 @@ mod tests {
         ));
         let index = HnswIndex::build(storage, HnswConfig::new(4, 16), DistanceMetric::Euclidean);
 
-        let stats = HnswIndexStatistics::collect(&index);
+        let stats = HnswIndexStatistics::collect(&index).unwrap();
         assert_eq!(stats.num_indexed_vectors, 5);
         assert_eq!(stats.dimension, 2);
         assert!(stats.graph_size_bytes > 0);

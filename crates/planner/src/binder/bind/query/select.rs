@@ -36,6 +36,7 @@ use paro_parser::ast::{
     Expr as AstExpr, GroupBy, Hint, Literal as AstLiteral, OrderByExpr, SelectStmt, SelectTarget,
     TableReference,
 };
+use paro_storage::index::hnsw::{HnswQueryOptions, HnswSearchObjective};
 
 impl Binder {
     /// Bind a BoundSelect (the body of a SELECT statement).
@@ -59,7 +60,7 @@ impl Binder {
         offset: &Option<paro_parser::ast::Expr>,
     ) -> Result<BoundQuery> {
         let mut aggregates = Vec::new();
-        let hnsw_ef_hint = Self::extract_hnsw_ef_hint(select.hints.as_ref())?;
+        let hnsw_options = Self::extract_hnsw_query_options(select.hints.as_ref())?;
         let projection_index = self.bind_context.generate_table_index();
         let group_index = self.bind_context.generate_table_index();
         let aggregate_index = self.bind_context.generate_table_index();
@@ -308,25 +309,69 @@ impl Binder {
         Ok(BoundQuery::Select(Box::new(bound_node)).with_modifiers(
             bound_order_by,
             bound_limit,
-            hnsw_ef_hint,
+            hnsw_options,
             need_prune.then_some(prune_index),
         ))
     }
 
-    fn extract_hnsw_ef_hint(hints: Option<&Hint>) -> Result<Option<usize>> {
+    fn extract_hnsw_query_options(hints: Option<&Hint>) -> Result<HnswQueryOptions> {
         let Some(hints) = hints else {
-            return Ok(None);
+            return Ok(HnswQueryOptions::default());
         };
 
-        let mut ef = None;
+        let mut options = HnswQueryOptions::default();
+        let mut saw_ef = false;
+        let mut saw_rerank_window = false;
+        let mut saw_objective = false;
         for hint in &hints.hints_list {
-            if !hint.name.name.eq_ignore_ascii_case("hnsw_ef") {
-                continue;
+            if hint.name.name.eq_ignore_ascii_case("hnsw_ef") {
+                if saw_ef {
+                    return Err(paro_error::invalid_input(
+                        "HNSW_EF hint may be specified only once",
+                    ));
+                }
+                options.ef = Some(Self::parse_positive_hint_usize(&hint.expr, "HNSW_EF")?);
+                saw_ef = true;
+            } else if hint.name.name.eq_ignore_ascii_case("hnsw_rerank") {
+                if saw_rerank_window {
+                    return Err(paro_error::invalid_input(
+                        "HNSW_RERANK hint may be specified only once",
+                    ));
+                }
+                options.rerank_window =
+                    Some(Self::parse_positive_hint_usize(&hint.expr, "HNSW_RERANK")?);
+                saw_rerank_window = true;
+            } else if hint.name.name.eq_ignore_ascii_case("vector_search_mode") {
+                if saw_objective {
+                    return Err(paro_error::invalid_input(
+                        "VECTOR_SEARCH_MODE directive may be specified only once",
+                    ));
+                }
+                options.objective = Self::parse_vector_search_objective(&hint.expr)?;
+                saw_objective = true;
             }
-            let value = Self::parse_positive_hint_usize(&hint.expr, "HNSW_EF")?;
-            ef = Some(value);
         }
-        Ok(ef)
+        Ok(options)
+    }
+
+    fn parse_vector_search_objective(expr: &AstExpr) -> Result<HnswSearchObjective> {
+        let AstExpr::Literal {
+            value: AstLiteral::String(value),
+            ..
+        } = expr
+        else {
+            return Err(paro_error::invalid_input(
+                "VECTOR_SEARCH_MODE expects 'cost_optimized' or 'exact', e.g. /*+ VECTOR_SEARCH_MODE('exact') */",
+            ));
+        };
+        match value.to_ascii_lowercase().as_str() {
+            "cost_optimized" => Ok(HnswSearchObjective::CostOptimized),
+            "exact" => Ok(HnswSearchObjective::Exact),
+            _ => Err(paro_error::invalid_input(format!(
+                "unknown VECTOR_SEARCH_MODE '{}'; expected 'cost_optimized' or 'exact'",
+                value
+            ))),
+        }
     }
 
     fn parse_positive_hint_usize(expr: &AstExpr, hint_name: &str) -> Result<usize> {
@@ -972,6 +1017,8 @@ mod tests {
     use crate::operator::ColumnBinding;
     use paro_common::types::LogicalType;
     use paro_function::window::WindowFunction;
+    use paro_parser::ast::{Expr as AstExpr, Literal as AstLiteral};
+    use paro_storage::index::hnsw::HnswSearchObjective;
 
     fn row_number(partition_column: usize) -> Expression {
         Expression::Window(WindowExpression::native(
@@ -1077,5 +1124,22 @@ mod tests {
             panic!("expected column reference");
         };
         assert_eq!(column.binding, ColumnBinding::new(30, 0));
+    }
+
+    #[test]
+    fn vector_search_mode_is_a_typed_exact_objective() {
+        let exact = Binder::parse_vector_search_objective(&AstExpr::Literal {
+            span: None,
+            value: AstLiteral::String("ExAcT".to_string()),
+        })
+        .unwrap();
+        assert_eq!(exact, HnswSearchObjective::Exact);
+
+        let error = Binder::parse_vector_search_objective(&AstExpr::Literal {
+            span: None,
+            value: AstLiteral::String("recall_099".to_string()),
+        })
+        .unwrap_err();
+        assert!(error.to_string().contains("unknown VECTOR_SEARCH_MODE"));
     }
 }

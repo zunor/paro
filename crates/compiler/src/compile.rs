@@ -6,12 +6,10 @@ use paro_common::logging::targets;
 use paro_common::types::LogicalType;
 use paro_context::StatementContext;
 use paro_execution::query_executor::compiled::{CompiledStatement, ResultColumnDesc};
-use paro_parser::ast::{Expr, Statement};
-use paro_parser::{Range, StatementVisitor};
+use paro_parser::ast::Statement;
 use paro_planner::operator::{ExplainMode, LogicalOperator};
 use paro_planner::planner::Planner;
 use paro_planner::verify::verify_physical_planner_invariants;
-use std::collections::BTreeMap;
 use std::sync::Arc;
 use std::time::Instant;
 use tracing::{debug, error};
@@ -36,11 +34,7 @@ pub fn compile_statement_with_parameter_types(
     let mut planner = if parameter_types.is_empty() {
         Planner::new(ctx.clone())
     } else {
-        Planner::new_with_parameters(
-            ctx.clone(),
-            parameter_types.to_vec(),
-            build_placeholder_indexes(&stmt)?,
-        )
+        Planner::new_with_parameters(ctx.clone(), parameter_types.to_vec())
     };
     if let Err(error) = planner.create_plan(stmt) {
         error!(
@@ -204,33 +198,4 @@ fn generate_typed_physical_plan(
         },
     );
     generator.generate(logical_plan)
-}
-
-fn build_placeholder_indexes(stmt: &Statement) -> Result<BTreeMap<Range, usize>> {
-    let mut next_index = 0usize;
-    let mut placeholders = BTreeMap::new();
-    let mut visitor = StatementVisitor::new(
-        |expr| {
-            if let Expr::Placeholder { span } = expr {
-                let Some(span) = span else {
-                    return;
-                };
-                placeholders.entry(*span).or_insert_with(|| {
-                    let current = next_index;
-                    next_index += 1;
-                    current
-                });
-            }
-        },
-        |_| {},
-    );
-    visitor.visit(stmt);
-
-    if placeholders.len() != next_index {
-        return Err(paro_common::error::protocol_violation(
-            "duplicate placeholder spans detected during parameterized compilation".to_string(),
-        ));
-    }
-
-    Ok(placeholders)
 }

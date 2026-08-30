@@ -32,7 +32,6 @@ use paro_common::types::LogicalType;
 use paro_context::StatementContext;
 use paro_function::scalar::cast::CastFunctionSet;
 use paro_parser::ast::{Statement as AstStatement, TableReference};
-use paro_parser::{Range, Span};
 use std::collections::{BTreeMap, HashSet};
 use std::sync::{Arc, Mutex};
 
@@ -92,8 +91,6 @@ pub struct Binder {
     dependency_collector: Option<Arc<Mutex<BTreeMap<CatalogObjectId, Dependency>>>>,
     /// Optional type signature for protocol placeholders.
     parameter_types: Option<Arc<[LogicalType]>>,
-    /// Stable placeholder ordering keyed by parser span.
-    placeholder_indexes: Option<Arc<BTreeMap<Range, usize>>>,
 }
 
 impl Binder {
@@ -111,14 +108,12 @@ impl Binder {
             delayed_subquery_planning_enabled: true,
             dependency_collector: None,
             parameter_types: None,
-            placeholder_indexes: None,
         }
     }
 
     pub fn with_parameters(
         session_context: Arc<StatementContext>,
         parameter_types: Vec<LogicalType>,
-        placeholder_indexes: BTreeMap<Range, usize>,
     ) -> Self {
         let cast_functions = session_context.cast_functions();
 
@@ -132,7 +127,6 @@ impl Binder {
             delayed_subquery_planning_enabled: true,
             dependency_collector: None,
             parameter_types: Some(Arc::from(parameter_types.into_boxed_slice())),
-            placeholder_indexes: Some(Arc::new(placeholder_indexes)),
         }
     }
 
@@ -172,7 +166,6 @@ impl Binder {
             delayed_subquery_planning_enabled: self.delayed_subquery_planning_enabled,
             dependency_collector: self.dependency_collector.clone(),
             parameter_types: self.parameter_types.clone(),
-            placeholder_indexes: self.placeholder_indexes.clone(),
         }
     }
 
@@ -257,28 +250,13 @@ impl Binder {
         self.row_id_bindings.contains(&table_index)
     }
 
-    fn protocol_parameter_at_span(&self, span: Span) -> Result<(usize, &LogicalType)> {
-        let span = span.ok_or_else(|| {
-            paro_error::protocol_violation(
-                "parameterized placeholder is missing parser span metadata".to_string(),
-            )
-        })?;
-        let placeholder_indexes = self.placeholder_indexes.as_ref().ok_or_else(|| {
-            paro_error::protocol_violation(
-                "placeholder index map is not available for parameterized compilation".to_string(),
-            )
-        })?;
+    fn protocol_parameter(&self, index: usize) -> Result<(usize, &LogicalType)> {
         let parameter_types = self.parameter_types.as_ref().ok_or_else(|| {
             paro_error::protocol_violation(
                 "parameter type signature is not available for parameterized compilation"
                     .to_string(),
             )
         })?;
-        let Some(index) = placeholder_indexes.get(&span).copied() else {
-            return Err(paro_error::protocol_violation(format!(
-                "unbound placeholder at span {span}",
-            )));
-        };
         parameter_types
             .get(index)
             .map(|logical_type| (index, logical_type))
@@ -291,13 +269,8 @@ impl Binder {
             })
     }
 
-    pub fn bind_protocol_parameter(&self, span: Span) -> Result<Expression> {
-        let span = span.ok_or_else(|| {
-            paro_error::protocol_violation(
-                "parameterized placeholder is missing parser span metadata".to_string(),
-            )
-        })?;
-        let (index, logical_type) = self.protocol_parameter_at_span(Some(span))?;
+    pub fn bind_protocol_parameter(&self, index: usize) -> Result<Expression> {
+        let (index, logical_type) = self.protocol_parameter(index)?;
         Ok(Expression::Parameter(ParameterExpression::new(
             ParameterSlot::new(RuntimeParamId::new(index), logical_type.clone()),
         )))

@@ -32,7 +32,7 @@ use super::rowset_meta::{RowsetId, RowsetMeta, RowsetState, SegmentsOverlap};
 use super::rowset_statistics::RowsetStatistics;
 use super::segment::{Segment, SegmentIterator, SegmentOptions, SegmentSharedPtr};
 use crate::index::{
-    hnsw::{ScoredPoint, SearchParams},
+    hnsw::{HnswSearchPolicy, ScoredPoint, SearchParams},
     PredicateTree,
 };
 use crate::primary_key::DeleteVector;
@@ -42,6 +42,8 @@ use paro_common::error::{self as paro_error, Result};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, RwLock};
+
+const MAX_RETAINED_SEGMENT_READ_VIEWS: usize = 8;
 
 /// Rowset state machine for lifecycle management
 ///
@@ -53,6 +55,12 @@ use std::sync::{Arc, RwLock};
 #[derive(Debug)]
 struct RowsetStateMachine {
     state: RwLock<RowsetState>,
+}
+
+#[derive(Debug)]
+struct SegmentReadView {
+    options: SegmentOptions,
+    segments: Vec<SegmentSharedPtr>,
 }
 
 impl RowsetStateMachine {
@@ -136,11 +144,54 @@ pub struct Rowset {
     /// Whether segments are loaded into memory
     segments_loaded: RwLock<bool>,
 
+    /// Stable, coexisting read runtimes keyed by their governed resources.
+    /// A query never replaces another runtime or rebuilds its column readers.
+    segment_read_views: RwLock<Vec<SegmentReadView>>,
+
     /// Cached rowset statistics (lazy)
     statistics_cache: RwLock<Option<RowsetStatistics>>,
+}
 
-    /// Segment options used when loading segments
-    segment_options: RwLock<SegmentOptions>,
+/// An owning lease that keeps a rowset's physical identity valid.
+///
+/// Holding an [`Arc<Rowset>`] only keeps the Rust object alive. It does not
+/// prevent tablet retirement from removing the rowset's files and RSSID
+/// mappings. Long-lived runtime work such as compaction plans must therefore
+/// hold this lease for every physical rowset they may dereference.
+///
+/// Clones share one acquisition so a plan can be moved through execution and
+/// publication without multiplying the rowset's runtime reference count.
+#[derive(Debug, Clone)]
+pub struct RowsetRetentionLease {
+    inner: Arc<RowsetRetentionLeaseInner>,
+}
+
+#[derive(Debug)]
+struct RowsetRetentionLeaseInner {
+    rowset: RowsetSharedPtr,
+}
+
+impl RowsetRetentionLease {
+    pub fn acquire(rowset: RowsetSharedPtr) -> Self {
+        rowset.acquire();
+        Self {
+            inner: Arc::new(RowsetRetentionLeaseInner { rowset }),
+        }
+    }
+
+    pub fn rowset(&self) -> &RowsetSharedPtr {
+        &self.inner.rowset
+    }
+
+    pub fn retains(&self, rowset: &RowsetSharedPtr) -> bool {
+        Arc::ptr_eq(&self.inner.rowset, rowset)
+    }
+}
+
+impl Drop for RowsetRetentionLeaseInner {
+    fn drop(&mut self) {
+        self.rowset.release();
+    }
 }
 
 impl Rowset {
@@ -172,8 +223,8 @@ impl Rowset {
             state_machine: RowsetStateMachine::new(initial_state),
             refs_by_reader: AtomicU64::new(0),
             segments_loaded: RwLock::new(false),
+            segment_read_views: RwLock::new(Vec::new()),
             statistics_cache: RwLock::new(None),
-            segment_options: RwLock::new(SegmentOptions::default()),
         })
     }
 
@@ -186,10 +237,13 @@ impl Rowset {
     /// * `segments` - Pre-created segments
     pub fn create_with_segments(
         schema: TabletSchemaRef,
-        rowset_meta: RowsetMeta,
+        mut rowset_meta: RowsetMeta,
         rowset_path: impl Into<PathBuf>,
         segments: Vec<SegmentSharedPtr>,
     ) -> Result<Self> {
+        rowset_meta.set_num_segments(u32::try_from(segments.len()).map_err(|_| {
+            paro_error::configuration_limit_exceeded("rowset segment count exceeds u32")
+        })?);
         let rowset_path = rowset_path.into();
         let initial_state = rowset_meta.rowset_state();
 
@@ -201,8 +255,8 @@ impl Rowset {
             state_machine: RowsetStateMachine::new(initial_state),
             refs_by_reader: AtomicU64::new(0),
             segments_loaded: RwLock::new(true),
+            segment_read_views: RwLock::new(Vec::new()),
             statistics_cache: RwLock::new(None),
-            segment_options: RwLock::new(SegmentOptions::default()),
         })
     }
 
@@ -245,12 +299,63 @@ impl Rowset {
 
     /// Get number of segments
     pub fn num_segments(&self) -> u32 {
-        self.segments.read().unwrap().len() as u32
+        self.rowset_meta.read().unwrap().num_segments()
     }
 
     /// Get total disk size
     pub fn total_disk_size(&self) -> u64 {
         self.rowset_meta.read().unwrap().total_disk_size()
+    }
+
+    /// Memory retained directly by this immutable rowset handle.
+    ///
+    /// Durable segment bytes deliberately do not belong in this value. They
+    /// are already owned by the rowset directory and can be reopened lazily;
+    /// transaction memory governance is concerned with loaded structural
+    /// views and column readers that this handle keeps alive. Provider-owned
+    /// index memory has its own admission/runtime accounting.
+    pub fn retained_memory_bytes(&self) -> u64 {
+        fn segment_bytes(segments: &[SegmentSharedPtr]) -> u64 {
+            segments.iter().fold(0_u64, |total, segment| {
+                total.saturating_add(u64::try_from(segment.mem_usage()).unwrap_or(u64::MAX))
+            })
+        }
+
+        let fixed = u64::try_from(std::mem::size_of::<Self>())
+            .unwrap_or(u64::MAX)
+            .saturating_add(u64::try_from(self.rowset_path.capacity()).unwrap_or(u64::MAX));
+        let segments = self.segments.read().unwrap();
+        let base = u64::try_from(segments.capacity())
+            .unwrap_or(u64::MAX)
+            .saturating_mul(
+                u64::try_from(std::mem::size_of::<SegmentSharedPtr>()).unwrap_or(u64::MAX),
+            )
+            .saturating_add(segment_bytes(&segments));
+        drop(segments);
+
+        let views = self.segment_read_views.read().unwrap();
+        let runtime_views = views.iter().fold(0_u64, |total, view| {
+            total
+                .saturating_add(
+                    u64::try_from(std::mem::size_of::<SegmentReadView>()).unwrap_or(u64::MAX),
+                )
+                .saturating_add(
+                    u64::try_from(view.segments.capacity())
+                        .unwrap_or(u64::MAX)
+                        .saturating_mul(
+                            u64::try_from(std::mem::size_of::<SegmentSharedPtr>())
+                                .unwrap_or(u64::MAX),
+                        ),
+                )
+                .saturating_add(segment_bytes(&view.segments))
+        });
+        fixed.saturating_add(base).saturating_add(runtime_views)
+    }
+
+    #[inline]
+    #[cfg(test)]
+    pub(crate) fn has_loaded_segments(&self) -> bool {
+        *self.segments_loaded.read().unwrap()
     }
 
     /// Get data disk size
@@ -369,6 +474,9 @@ impl Rowset {
     /// This loads segment metadata and prepares them for reading.
     /// Actual column data is loaded lazily when accessed.
     pub fn load(&self) -> Result<()> {
+        if *self.segments_loaded.read().unwrap() {
+            return Ok(());
+        }
         let mut loaded = self.segments_loaded.write().unwrap();
         self.load_segments_locked(&mut loaded)
     }
@@ -383,10 +491,11 @@ impl Rowset {
         let rowset_id = meta.rowset_id();
         let tablet_id = meta.tablet_id();
         let rowset_gen = meta.rowset_gen();
-        let options = self.segment_options.read().unwrap().clone();
+        let options = SegmentOptions::default();
 
         let mut segments = self.segments.write().unwrap();
         segments.clear();
+        self.segment_read_views.write().unwrap().clear();
 
         for seg_id in 0..num_segments {
             let segment_path = self.segment_path(seg_id);
@@ -406,22 +515,56 @@ impl Rowset {
         Ok(())
     }
 
-    /// Return segment handles configured with the requested runtime resources.
+    /// Open an immutable segment view configured with the requested runtime
+    /// resources.
     ///
-    /// Loading and cloning the handles share the same configuration lock, so
-    /// a concurrent caller cannot replace the cached Segment instances between
-    /// those operations. Existing readers remain valid through their Arc pins.
-    pub fn segments_with_options(&self, options: SegmentOptions) -> Result<Vec<SegmentSharedPtr>> {
-        let mut loaded = self.segments_loaded.write().unwrap();
+    /// The rowset owns one structural view and retains one stable read view per
+    /// runtime-equivalent resource set. Governed and maintenance readers can
+    /// coexist; neither invalidates the other, and repeated queries reuse the
+    /// same PageReader and column-reader cache.
+    pub fn open_segment_view(&self, options: SegmentOptions) -> Result<Vec<SegmentSharedPtr>> {
+        self.load()?;
+        let base_segments = self.segments.read().unwrap().clone();
+        if options.runtime_equivalent(&SegmentOptions::default()) {
+            return Ok(base_segments);
+        }
+        if let Some(view) = self
+            .segment_read_views
+            .read()
+            .unwrap()
+            .iter()
+            .find(|view| view.options.runtime_equivalent(&options))
         {
-            let mut current = self.segment_options.write().unwrap();
-            if !current.runtime_equivalent(&options) {
-                *current = options;
-                *loaded = false;
+            return Ok(view.segments.clone());
+        }
+
+        let mut views = self.segment_read_views.write().unwrap();
+        if let Some(view) = views
+            .iter()
+            .find(|view| view.options.runtime_equivalent(&options))
+        {
+            return Ok(view.segments.clone());
+        }
+        let segments: Vec<SegmentSharedPtr> = base_segments
+            .iter()
+            .map(|segment| Arc::new(segment.runtime_view(options.clone())))
+            .collect();
+        if views.len() >= MAX_RETAINED_SEGMENT_READ_VIEWS {
+            if let Some(inactive) = views.iter().position(|view| {
+                view.segments
+                    .iter()
+                    .all(|segment| Arc::strong_count(segment) == 1)
+            }) {
+                views.remove(inactive);
             }
         }
-        self.load_segments_locked(&mut loaded)?;
-        Ok(self.segments.read().unwrap().clone())
+        if views.len() < MAX_RETAINED_SEGMENT_READ_VIEWS {
+            views.push(SegmentReadView {
+                options,
+                segments: segments.clone(),
+            });
+        }
+        Ok(segments)
     }
 
     /// Reload segments (force reload from disk)
@@ -434,6 +577,7 @@ impl Rowset {
             }
         }
         *loaded = false;
+        self.segment_read_views.write().unwrap().clear();
         self.invalidate_statistics();
         self.load_segments_locked(&mut loaded)
     }
@@ -456,6 +600,7 @@ impl Rowset {
         query: &[f32],
         top_k: usize,
         params: &SearchParams,
+        policy: &HnswSearchPolicy,
         predicate_tree: Option<&PredicateTree>,
     ) -> Result<Vec<ScoredPoint>> {
         self.load()?;
@@ -466,7 +611,7 @@ impl Rowset {
 
         for segment in segments.iter() {
             let seg_results =
-                segment.vector_search(column_id, query, top_k, params, predicate_tree)?;
+                segment.vector_search(column_id, query, top_k, params, policy, predicate_tree)?;
             for mut p in seg_results {
                 p.idx += current_row_offset as u32;
                 all_results.push(p);
@@ -492,12 +637,16 @@ impl Rowset {
             ));
         }
 
-        let mut segments = self.segments.write().unwrap();
-        segments.push(segment);
+        let segment_count = {
+            let mut segments = self.segments.write().unwrap();
+            segments.push(segment);
+            segments.len()
+        };
+        self.segment_read_views.write().unwrap().clear();
 
         // Update metadata
         let mut meta = self.rowset_meta.write().unwrap();
-        meta.set_num_segments(segments.len() as u32);
+        meta.set_num_segments(segment_count as u32);
 
         self.invalidate_statistics();
 
@@ -627,6 +776,7 @@ impl Rowset {
     /// This unloads segments from memory but does not delete files.
     pub fn close(&self) -> Result<()> {
         let mut loaded = self.segments_loaded.write().unwrap();
+        self.segment_read_views.write().unwrap().clear();
         let mut segments = self.segments.write().unwrap();
         segments.clear();
         *loaded = false;
@@ -1197,7 +1347,7 @@ mod tests {
     }
 
     #[test]
-    fn segments_with_runtime_options_reopen_and_reuse_loaded_segments() {
+    fn runtime_equivalent_segment_views_are_stable_and_coexist() {
         let schema = create_test_schema();
         let tmp = tempfile::tempdir().unwrap();
         let rowset_dir = tmp.path().join("rowset");
@@ -1214,16 +1364,71 @@ mod tests {
         let original = rowset.get_segment(0).unwrap();
 
         let cache = Arc::new(PageCache::new(BufferPool::new_arc(1024 * 1024)));
-        let options = SegmentOptions::default()
+        let first_options = SegmentOptions::default()
             .with_verify_checksum(false)
             .with_page_cache(cache.clone())
             .with_cache_decoded(true);
-        let reopened_segments = rowset.segments_with_options(options.clone()).unwrap();
+        let reopened_segments = rowset.open_segment_view(first_options.clone()).unwrap();
 
         let reopened = reopened_segments[0].clone();
+        let reopened_weak = Arc::downgrade(&reopened);
         assert!(!Arc::ptr_eq(&original, &reopened));
-        let reused = rowset.segments_with_options(options).unwrap();
-        assert!(Arc::ptr_eq(&reopened, &reused[0]));
+        assert!(original.shares_structural_state_with(&reopened));
+        assert!(original.uses_page_cache(None));
+        assert!(reopened.uses_page_cache(Some(&cache)));
+        let independently_opened = rowset.open_segment_view(first_options).unwrap();
+        assert!(Arc::ptr_eq(&reopened, &independently_opened[0]));
+
+        let second_cache = Arc::new(PageCache::new(BufferPool::new_arc(1024 * 1024)));
+        let second_options = SegmentOptions::default()
+            .with_page_cache(second_cache)
+            .with_cache_decoded(true);
+        let second_view = rowset.open_segment_view(second_options).unwrap();
+        assert!(!Arc::ptr_eq(&reopened, &second_view[0]));
+
+        assert!(Arc::ptr_eq(&original, &rowset.get_segment(0).unwrap()));
+        drop(reopened);
+        drop(reopened_segments);
+        assert!(
+            reopened_weak.upgrade().is_some(),
+            "the rowset retains each governed runtime so readers and caches survive across queries"
+        );
+    }
+
+    #[test]
+    fn close_evicts_owned_segment_views_and_reopens_from_durable_state() {
+        let schema = create_test_schema();
+        let tmp = tempfile::tempdir().unwrap();
+        let rowset_dir = tmp.path().join("rowset");
+        std::fs::create_dir_all(&rowset_dir).unwrap();
+        create_segment_with_path(&schema, 0, 3, rowset_dir.join("0.dat"));
+
+        let meta = RowsetMetaBuilder::with_id(1, 100, Version::singleton(0))
+            .num_rows(3)
+            .num_segments(1)
+            .state(RowsetState::Committed)
+            .build();
+        let rowset = Rowset::create(schema, meta, rowset_dir).unwrap();
+        let cache = Arc::new(PageCache::new(BufferPool::new_arc(1024 * 1024)));
+        rowset
+            .open_segment_view(
+                SegmentOptions::default()
+                    .with_page_cache(cache)
+                    .with_cache_decoded(true),
+            )
+            .unwrap();
+        let loaded_bytes = rowset.retained_memory_bytes();
+        assert!(rowset.has_loaded_segments());
+
+        rowset.close().unwrap();
+        assert!(!rowset.has_loaded_segments());
+        assert!(rowset.segments().is_empty());
+        assert!(rowset.retained_memory_bytes() < loaded_bytes);
+
+        let reopened = rowset.open_segment_view(SegmentOptions::default()).unwrap();
+        assert_eq!(reopened.len(), 1);
+        assert_eq!(reopened[0].num_rows(), 3);
+        assert!(rowset.has_loaded_segments());
     }
 
     #[test]

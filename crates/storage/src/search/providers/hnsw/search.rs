@@ -1,37 +1,60 @@
 // Copyright 2024-2026 Zunor
 // SPDX-License-Identifier: Apache-2.0
 
+use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
 use std::time::Instant;
 
 use crate::index::hnsw::types::SearchParams;
-use crate::index::hnsw::{DistanceMetric, HnswIndex, PreparedQuery};
-use crate::index::MmapVectorStorage;
+use crate::index::hnsw::{
+    hnsw_artifact_compatibility, hnsw_artifact_uses_external_vectors,
+    hnsw_yield_maintenance_to_foreground, DistanceMetric, HnswArtifactCompatibility,
+    HnswBuildContract, HnswBuildExecutionPolicy, HnswExternalVectorBinding,
+    HnswExternalVectorSource, HnswExternalVectorSpan, HnswFilterKind, HnswForegroundQueryGuard,
+    HnswIndex, HnswQueryActivity, HnswSearchFilter, HnswSearchPolicy, HnswSearchStrategy,
+    HnswSegmentSearchInput, PartitionedVectorStorage, PreparedQuery, VectorStorage,
+    HNSW_INTEGRITY_CHUNKS_PER_SLICE,
+};
+
+/// Minimum exact vector payload needed to amortize a cross-thread segment
+/// phase. This is expressed as physical bytes rather than rows so the same
+/// scheduling rule scales with vector dimension. Graph traversal remains
+/// parallel because its random navigation latency is not proportional to the
+/// number of predicate matches.
+const MIN_PARALLEL_EXACT_VECTOR_BYTES: u64 = 2 * 1024 * 1024;
 use crate::index::PredicateTree;
-use crate::rowset::encoding::PLAIN_PAGE_HEADER_SIZE;
+use crate::index::{DenseRowSet, ExactRowSet, PartitionExactRowSet};
+use crate::metrics::storage_metrics;
+use crate::rowset::RowsetSharedPtr;
 use crate::search::artifact::ArtifactLocation;
-use crate::search::capability::SearchIndexKind;
+use crate::search::capability::{ArtifactSegmentRef, SearchArtifactRef, SearchIndexKind};
 use crate::search::cursor::{
     OpenedSearchCursor, SearchBatchState, SearchCursor, SearchReadSnapshot, VisibleSegment,
 };
 use crate::search::row_fetch::snapshot_epoch;
-use crate::search::segment_dispatch::{dispatch_segments, SegmentDispatchResult};
+use crate::search::segment_dispatch::{
+    dispatch_segment_indices, map_search_tasks, map_segments, SegmentDispatchResult,
+};
 use crate::search::sidecar::{
-    SidecarArtifactStore, SidecarReaderCache, SidecarReaderRequest, SIDECAR_PACKAGE_CODEC,
+    is_decoded_hnsw_sidecar_artifact, DecodedReaderBinding, DecodedSidecarReaderRequest,
+    SearchReaderRuntime, SidecarIntegrityPolicy, SidecarReaderRequest, SIDECAR_PACKAGE_CODEC,
 };
 use crate::search::tail::exact_merge::{ensure_tail_exact_merge_budget, TailExactMergeQueryShape};
-use crate::search::tail_merge::{resolve_logical_rows, visible_row_ids};
+use crate::search::tail_merge::{
+    read_segment_column_batch_direct, resolve_logical_rows_with_allocator, visible_row_ids,
+};
 use crate::search::telemetry::{
     GenerationTelemetryEvent, NoopSearchTelemetryCollector, QueryTelemetryEvent,
     SearchTelemetryCollector,
 };
 use crate::search::topk_merge::{ranked_rows_to_batch, RankedRow, TopKCollector};
-use crate::tablet::{ColumnId, TabletRef};
+use crate::search::SearchBuildStopCheck;
+use crate::tablet::TabletRef;
 use paro_common::error::{self as paro_error, Result};
-use paro_common::runtime_value::Value;
 use paro_common::types::LogicalType;
+use paro_common::vector::ArrayVector;
 
-use crate::search::budget::{ResourceBudget, SearchBatchConfig};
+use crate::search::budget::{ResourceBudget, SearchBatchConfig, SearchMemoryReservation};
 use crate::search::cursor::PhysicalRowRef;
 
 pub(crate) struct VectorSearchProvider {
@@ -39,10 +62,16 @@ pub(crate) struct VectorSearchProvider {
     column_types: Vec<LogicalType>,
     column_id: usize,
     query: Vec<f32>,
+    distance: DistanceMetric,
     k: usize,
     params: SearchParams,
     predicate: Option<PredicateTree>,
     telemetry: Arc<dyn SearchTelemetryCollector>,
+}
+
+struct PreparedSegmentFilter {
+    row_set: Option<Arc<dyn ExactRowSet>>,
+    _reservation: Option<SearchMemoryReservation>,
 }
 
 impl VectorSearchProvider {
@@ -51,6 +80,7 @@ impl VectorSearchProvider {
         column_types: &[LogicalType],
         column_id: usize,
         query: &[f32],
+        distance: DistanceMetric,
         k: usize,
         params: SearchParams,
         predicate: Option<PredicateTree>,
@@ -60,6 +90,7 @@ impl VectorSearchProvider {
             column_types: column_types.to_vec(),
             column_id,
             query: query.to_vec(),
+            distance,
             k,
             params,
             predicate,
@@ -87,12 +118,29 @@ impl VectorSearchProvider {
                 top_k: self.k,
             },
         )?;
-        let distance = resolve_distance_metric(&self.tablet, self.column_id);
+        let provider_config = snapshot
+            .generation
+            .hnsw_provider_config
+            .clone()
+            .ok_or_else(|| {
+                paro_error::data_corrupted(
+                    "HNSW generation is missing its validated provider contract",
+                )
+            })?;
+        if provider_config.distance != self.distance {
+            return Err(paro_error::invalid_input(format!(
+                "HNSW distance mismatch: query uses {}, index uses {}",
+                self.distance.durable_name(),
+                provider_config.distance.durable_name()
+            )));
+        }
+        let distance = self.distance;
         let prepared_query = distance.prepare(&self.query);
+        let expected_build_contract = provider_config.build_contract();
+        let search_policy = provider_config.search_policy();
+        let reader_runtime = Arc::clone(&snapshot.reader_runtime);
         let cursor = VectorSearchCursor {
-            sidecar_cache: Arc::new(SidecarReaderCache::new(SidecarArtifactStore::new(
-                self.tablet.data_dir().clone(),
-            ))),
+            reader_runtime,
             snapshot: snapshot.clone(),
             tablet: self.tablet,
             query: self.query,
@@ -101,6 +149,8 @@ impl VectorSearchProvider {
             storage_col_id: self.column_id as u32,
             vector_dim,
             distance,
+            expected_build_contract,
+            search_policy,
             params: self.params,
             predicate: self.predicate,
             telemetry: self.telemetry,
@@ -134,7 +184,7 @@ enum VectorCursorState {
 }
 
 struct VectorSearchCursor {
-    sidecar_cache: Arc<SidecarReaderCache>,
+    reader_runtime: Arc<SearchReaderRuntime>,
     snapshot: SearchReadSnapshot,
     tablet: TabletRef,
     query: Vec<f32>,
@@ -143,6 +193,8 @@ struct VectorSearchCursor {
     storage_col_id: u32,
     vector_dim: usize,
     distance: DistanceMetric,
+    expected_build_contract: HnswBuildContract,
+    search_policy: HnswSearchPolicy,
     params: SearchParams,
     predicate: Option<PredicateTree>,
     telemetry: Arc<dyn SearchTelemetryCollector>,
@@ -162,6 +214,19 @@ impl std::fmt::Debug for VectorSearchCursor {
 
 impl VectorSearchCursor {
     fn build_ranked_rows(&self, budget: &ResourceBudget) -> Result<Vec<RankedRow>> {
+        // Reserve foreground HNSW capacity for the complete physical query,
+        // including predicate preparation, exact-tail scans, sidecar opens,
+        // graph traversal, and the final merge. Guards inside an individual
+        // artifact search cannot protect the exact tail that precedes it and
+        // leave gaps between generation partitions where maintenance can
+        // regain the full build pool.
+        let _foreground_query = HnswForegroundQueryGuard::enter();
+        let _definition_query = self
+            .snapshot
+            .generation
+            .hnsw_query_activity
+            .as_ref()
+            .map(|activity| activity.enter());
         let started_at = Instant::now();
         self.telemetry.record_generation(GenerationTelemetryEvent {
             kind: SearchIndexKind::Hnsw,
@@ -171,27 +236,219 @@ impl VectorSearchCursor {
             coverage: self.snapshot.generation.coverage.clone(),
             artifact_count: self.snapshot.generation.artifacts.artifacts.len(),
         });
-        let per_segment = dispatch_segments(
-            SearchIndexKind::Hnsw,
-            self.snapshot.table_lease.visible_segments(),
-            budget.parallelism_slots.max(1),
-            self.telemetry.as_ref(),
-            |segment| {
-                let (rows, degraded) = self.search_segment(segment)?;
-                Ok(SegmentDispatchResult {
-                    candidates_produced: rows.len(),
-                    degraded,
-                    output: (rows, degraded),
+        let predicate = self.predicate.as_ref();
+        let predicate_columns = predicate
+            .map(crate::index::collect_predicate_columns)
+            .unwrap_or_default();
+        let snapshot_version = snapshot_epoch(self.snapshot.table.visible_version);
+        let visible_segments = self.snapshot.table_lease.visible_segments();
+        let total_rows = visible_segments.iter().fold(0u64, |rows, segment| {
+            rows.saturating_add(segment.segment.num_rows())
+        });
+        let parallelism_slots = budget.parallelism_slots.max(1);
+        let widths =
+            self.search_policy
+                .effective_widths(self.k, self.params.ef, self.params.rerank_window);
+        let effective_ef = widths.ef;
+
+        // Exact segment row sets are prepared once and retained at the query
+        // boundary. Both singleton and generation-owned partition artifacts
+        // borrow the same proof objects, so changing the physical partition
+        // envelope cannot change predicate semantics.
+        let requires_segment_filters = predicate.is_some()
+            || visible_segments
+                .iter()
+                .any(|segment| segment.has_persistent_deletes);
+        let prepared_filters = if requires_segment_filters {
+            map_segments(
+                visible_segments,
+                parallelism_slots,
+                |(_, segment)| -> Result<PreparedSegmentFilter> {
+                    let row_set = segment
+                        .segment
+                        .build_hnsw_filter_with_epoch(snapshot_version, predicate)?;
+                    if predicate.is_some() && row_set.is_none() {
+                        return Err(paro_error::internal(
+                            "filtered vector search did not prepare an exact segment row set",
+                        ));
+                    }
+                    let reservation = row_set
+                        .as_ref()
+                        .map(|row_set| budget.try_reserve_memory(row_set.query_retained_bytes()))
+                        .transpose()?;
+                    Ok(PreparedSegmentFilter {
+                        row_set,
+                        _reservation: reservation,
+                    })
+                },
+            )?
+        } else {
+            (0..visible_segments.len())
+                .map(|_| PreparedSegmentFilter {
+                    row_set: None,
+                    _reservation: None,
                 })
+                .collect()
+        };
+        let predicate_matching_rows = predicate.map(|_| {
+            prepared_filters.iter().fold(0u64, |rows, filter| {
+                rows.saturating_add(filter.row_set.as_ref().map_or(0, |row_set| row_set.len()))
+            })
+        });
+        let search_parallelism_slots = exact_search_parallelism_slots(
+            parallelism_slots,
+            predicate_matching_rows.unwrap_or(total_rows),
+            self.vector_dim,
+        );
+
+        let visible_by_ref = visible_segments
+            .iter()
+            .enumerate()
+            .map(|(index, segment)| {
+                (
+                    ArtifactSegmentRef {
+                        rowset_id: segment.rowset_id,
+                        segment_id: segment.segment_id,
+                    },
+                    index,
+                )
+            })
+            .collect::<HashMap<_, _>>();
+        let mut partition_artifacts = Vec::<(&SearchArtifactRef, Arc<HnswIndex>)>::new();
+        for artifact in &self.snapshot.generation.artifacts.artifacts {
+            if artifact.kind != SearchIndexKind::Hnsw
+                || artifact.column_id != self.storage_col_id
+                || artifact.coverage.segments().len() <= 1
+                || !matches!(
+                    artifact.location,
+                    ArtifactLocation::SidecarArtifactFile { .. }
+                )
+                || !artifact
+                    .coverage
+                    .segments()
+                    .iter()
+                    .all(|span| visible_by_ref.contains_key(&span.segment))
+            {
+                continue;
+            }
+            let Some(index) = open_sidecar_hnsw_artifact(
+                self.reader_runtime.as_ref(),
+                artifact,
+                self.vector_dim,
+                self.snapshot.generation.hnsw_query_activity.clone(),
+                HnswReaderActivationPolicy::QUERY,
+                None,
+                || {
+                    build_external_vector_binding(
+                        artifact,
+                        self.storage_col_id,
+                        self.vector_dim,
+                        |segment_ref| {
+                            visible_by_ref
+                                .get(segment_ref)
+                                .and_then(|index| visible_segments.get(*index))
+                        },
+                    )
+                    .map(Some)
+                },
+            )?
+            else {
+                // An unsupported generation artifact is recoverable. Keep its
+                // base segments on the exact tail path rather than making the
+                // table unreadable or silently omitting their rows.
+                continue;
+            };
+            validate_hnsw_index_contract(index.as_ref(), &self.expected_build_contract)?;
+            let indexed_rows = u64::try_from(index.vector_storage.num_vectors())
+                .map_err(|_| paro_error::out_of_range("HNSW vector count exceeds u64"))?;
+            if indexed_rows != artifact.coverage.row_count() {
+                return Err(paro_error::data_corrupted(format!(
+                    "HNSW partition coverage has {} rows but artifact contains {indexed_rows} vectors",
+                    artifact.coverage.row_count()
+                )));
+            }
+            partition_artifacts.push((artifact, index));
+        }
+        let mut covered_segments = vec![false; visible_segments.len()];
+        for (artifact, _) in &partition_artifacts {
+            for span in artifact.coverage.segments() {
+                let visible_index = visible_by_ref.get(&span.segment).ok_or_else(|| {
+                    paro_error::data_corrupted(
+                        "HNSW artifact coverage references a missing segment",
+                    )
+                })?;
+                covered_segments[*visible_index] = true;
+            }
+        }
+        let tail_segment_indices = covered_segments
+            .iter()
+            .enumerate()
+            .filter_map(|(index, covered)| (!covered).then_some(index))
+            .collect::<Vec<_>>();
+        let per_segment = dispatch_segment_indices(
+            SearchIndexKind::Hnsw,
+            visible_segments,
+            &tail_segment_indices,
+            search_parallelism_slots,
+            self.telemetry.as_ref(),
+            |index, segment| {
+                let row_set = prepared_filters[index].row_set.as_deref();
+                let filter = match (predicate.is_some(), row_set) {
+                    (true, Some(row_set)) => {
+                        HnswSearchFilter::predicate(row_set, &predicate_columns)
+                    }
+                    (false, Some(row_set)) => HnswSearchFilter::Visibility(row_set),
+                    (false, None) => HnswSearchFilter::None,
+                    (true, None) => {
+                        return Err(paro_error::internal(
+                            "predicate filter disappeared after preparation",
+                        ))
+                    }
+                };
+                self.dispatch_segment_search(
+                    segment,
+                    filter,
+                    effective_ef,
+                    widths.rerank_window,
+                    budget,
+                )
+            },
+        )?;
+
+        let per_partition = map_search_tasks(
+            &partition_artifacts,
+            parallelism_slots,
+            |_, (artifact, index)| {
+                self.search_partition_artifact(
+                    artifact,
+                    index.as_ref(),
+                    &visible_by_ref,
+                    &prepared_filters,
+                    predicate.is_some(),
+                    &predicate_columns,
+                    effective_ef,
+                    widths.rerank_window,
+                    budget,
+                )
             },
         )?;
 
         let mut collector = TopKCollector::new(self.k);
         let mut candidates_produced = 0usize;
         let mut degraded_segments = 0usize;
-        for (rows, degraded) in per_segment {
+        let mut degraded_score_reasons = Vec::new();
+        for (rows, degraded, degraded_reason) in per_segment {
             candidates_produced += rows.len();
             degraded_segments += usize::from(degraded);
+            if let Some(reason) = degraded_reason {
+                if !degraded_score_reasons.contains(&reason) {
+                    degraded_score_reasons.push(reason);
+                }
+            }
+            collector.extend(rows);
+        }
+        for rows in per_partition {
+            candidates_produced += rows.len();
             collector.extend(rows);
         }
         let peak_heap_items = collector.len();
@@ -203,30 +460,543 @@ impl VectorSearchCursor {
             rows_returned: ranked_rows.len(),
             peak_heap_items,
             degraded_segments,
-            degraded_score_reasons: Vec::new(),
+            degraded_score_reasons,
             elapsed: started_at.elapsed(),
         });
         Ok(ranked_rows)
     }
 
-    fn search_segment(&self, visible_segment: &VisibleSegment) -> Result<(Vec<RankedRow>, bool)> {
-        let snapshot_version = snapshot_epoch(self.snapshot.table.visible_version);
-        if visible_segment
-            .segment
-            .hnsw_index(self.storage_col_id)
-            .is_some()
+    fn score_exact_tail_chunk(
+        &self,
+        resolved: &paro_common::chunk::Chunk,
+        physical_rows: &[PhysicalRowRef],
+        budget: &ResourceBudget,
+    ) -> Result<Vec<RankedRow>> {
+        if resolved.size() != physical_rows.len() {
+            return Err(paro_error::internal(
+                "resolved exact tail rows and physical identities disagree",
+            ));
+        }
+        budget.work.check_and_consume(physical_rows.len())?;
+        let column = resolved
+            .column(0)
+            .ok_or_else(|| paro_error::internal("resolved vector tail chunk missing column"))?;
+        let array_view = column.try_to_array_view(physical_rows.len())?;
+        if array_view.array_size() != self.vector_dim
+            || !matches!(
+                column.logical_type(),
+                LogicalType::Array(child, size)
+                    if child.as_ref() == &LogicalType::Float && *size == self.vector_dim
+            )
         {
+            return Err(paro_error::data_corrupted(
+                "resolved HNSW tail column does not match its VECTOR dimension",
+            ));
+        }
+        let child = ArrayVector::get_entry(column);
+        let child_values = child.as_slice::<f32>();
+        let child_all_valid = array_view.child().validity().all_valid();
+        let parent_all_valid = array_view.parent().validity().all_valid();
+        let contiguous_start = (!physical_rows.is_empty() && parent_all_valid && child_all_valid)
+            .then(|| array_view.physical_child_index(0, 0));
+        let is_contiguous = contiguous_start.is_some_and(|start| {
+            physical_rows.iter().enumerate().all(|(row, _)| {
+                array_view.physical_child_index(row, 0)
+                    == start.saturating_add(row.saturating_mul(self.vector_dim))
+            })
+        });
+
+        let mut collector = TopKCollector::new(self.k);
+        if let Some(start) = contiguous_start.filter(|_| is_contiguous) {
+            let value_count = physical_rows.len().saturating_mul(self.vector_dim);
+            let values = child_values
+                .get(start..start + value_count)
+                .ok_or_else(|| {
+                    paro_error::data_corrupted("resolved HNSW tail child range is out of bounds")
+                })?;
+            let mut scores = vec![0.0; physical_rows.len()];
+            self.distance.similarity_unindexed_batch_contiguous(
+                self.prepared_query.as_slice(),
+                values,
+                self.vector_dim,
+                &mut scores,
+            );
+            for (&row, score) in physical_rows.iter().zip(scores) {
+                collector.push(RankedRow::new(row, score));
+            }
+            return Ok(collector.into_sorted_rows());
+        }
+
+        for (offset, &row) in physical_rows.iter().enumerate() {
+            if !array_view.is_valid(offset) {
+                continue;
+            }
+            let start = array_view.physical_child_index(offset, 0);
+            let last = array_view.physical_child_index(offset, self.vector_dim - 1);
+            if last != start.saturating_add(self.vector_dim - 1)
+                || (!child_all_valid
+                    && (0..self.vector_dim).any(|index| !array_view.child_is_valid(offset, index)))
+            {
+                continue;
+            }
+            let values = child_values
+                .get(start..start + self.vector_dim)
+                .ok_or_else(|| {
+                    paro_error::data_corrupted("resolved HNSW tail child range is out of bounds")
+                })?;
+            collector.push(RankedRow::new(
+                row,
+                self.distance
+                    .similarity_unindexed(self.prepared_query.as_slice(), values),
+            ));
+        }
+        Ok(collector.into_sorted_rows())
+    }
+
+    fn score_exact_tail_storage_batch(
+        &self,
+        batch: &crate::rowset::column::ColumnBatch,
+        visible_segment: &VisibleSegment,
+        row_ids: &[u32],
+        budget: &ResourceBudget,
+    ) -> Result<Vec<RankedRow>> {
+        budget.work.check_and_consume(row_ids.len())?;
+        let logical_type = visible_segment
+            .segment
+            .schema()
+            .column_by_id(self.storage_col_id)
+            .map(|column| &column.logical_type)
+            .ok_or_else(|| {
+                paro_error::column_not_found(format!(
+                    "column {} not found in exact tail segment schema",
+                    self.storage_col_id
+                ))
+            })?;
+        let vectors = crate::codec::vector_decoder::FloatArrayBatchView::try_new(
+            logical_type,
+            batch,
+            row_ids.len(),
+        )?;
+        if vectors.rows() != row_ids.len() || vectors.dimension() != self.vector_dim {
+            return Err(paro_error::data_corrupted(
+                "stored HNSW tail batch does not match its vector dimension",
+            ));
+        }
+
+        let mut collector = TopKCollector::new(self.k);
+        if vectors.all_valid() {
+            let mut scores = vec![0.0; row_ids.len()];
+            self.distance.similarity_unindexed_batch_contiguous(
+                self.prepared_query.as_slice(),
+                vectors.values(),
+                self.vector_dim,
+                &mut scores,
+            );
+            for (&row_id, score) in row_ids.iter().zip(scores) {
+                collector.push(RankedRow::new(
+                    PhysicalRowRef::new(
+                        visible_segment.rowset_id,
+                        visible_segment.segment_id,
+                        crate::rowset::SegmentRowId::from_raw(row_id),
+                    ),
+                    score,
+                ));
+            }
+            return Ok(collector.into_sorted_rows());
+        }
+
+        for (offset, &row_id) in row_ids.iter().enumerate() {
+            if !vectors.is_valid(offset) {
+                continue;
+            }
+            let start = offset.saturating_mul(self.vector_dim);
+            let values = vectors
+                .values()
+                .get(start..start + self.vector_dim)
+                .ok_or_else(|| {
+                    paro_error::data_corrupted("stored HNSW tail vector is out of bounds")
+                })?;
+            collector.push(RankedRow::new(
+                PhysicalRowRef::new(
+                    visible_segment.rowset_id,
+                    visible_segment.segment_id,
+                    crate::rowset::SegmentRowId::from_raw(row_id),
+                ),
+                self.distance
+                    .similarity_unindexed(self.prepared_query.as_slice(), values),
+            ));
+        }
+        Ok(collector.into_sorted_rows())
+    }
+
+    /// Score immutable plain vector pages directly from their mmap views.
+    ///
+    /// This is both the dense exact-tail path and the sparse gather path.  A
+    /// plain uncompressed vector page can approach the u32 page-size ceiling;
+    /// routing either shape through `ColumnIterator` would admit the whole
+    /// page into `PageCache` before selecting rows.  The segment instead owns
+    /// one checksum-validated mapping and queries retain only bounded score
+    /// scratch.
+    fn score_exact_tail_plain_vectors(
+        &self,
+        visible_segment: &VisibleSegment,
+        row_ids: &[u32],
+        budget: &ResourceBudget,
+    ) -> Result<Option<Vec<RankedRow>>> {
+        let Some(storage) = visible_segment
+            .segment
+            .open_plain_vector_storage(self.storage_col_id, self.vector_dim)?
+        else {
+            return Ok(None);
+        };
+        let segment_rows = usize::try_from(visible_segment.segment.num_rows())
+            .map_err(|_| paro_error::out_of_range("exact tail segment exceeds usize"))?;
+        if storage.num_vectors() != segment_rows || storage.vector_dim() != self.vector_dim {
+            return Err(paro_error::data_corrupted(format!(
+                "plain vector storage shape {}x{} does not match exact tail {}x{}",
+                storage.num_vectors(),
+                storage.vector_dim(),
+                segment_rows,
+                self.vector_dim
+            )));
+        }
+
+        let batch_rows = paro_common::vector::VECTOR_SIZE;
+        let _score_reservation = budget.try_reserve_memory(
+            batch_rows.saturating_mul(std::mem::size_of::<crate::index::hnsw::ScoreType>()),
+        )?;
+        let mut collector = TopKCollector::new(self.k);
+        let is_dense = row_ids.len() == segment_rows
+            && row_ids
+                .iter()
+                .enumerate()
+                .all(|(ordinal, row_id)| *row_id as usize == ordinal);
+        if is_dense {
+            let mut point_base = 0usize;
+            let mut scores = Vec::with_capacity(batch_rows);
+            storage.try_for_each_contiguous_chunk(&mut |vectors| {
+                if vectors.len() % self.vector_dim != 0 {
+                    return Err(paro_error::data_corrupted(
+                        "plain exact-tail vector chunk is not row aligned",
+                    ));
+                }
+                for vector_batch in vectors.chunks(batch_rows.saturating_mul(self.vector_dim)) {
+                    let rows = vector_batch.len() / self.vector_dim;
+                    budget.work.check_and_consume(rows)?;
+                    scores.resize(rows, 0.0);
+                    self.distance.similarity_unindexed_batch_contiguous(
+                        self.prepared_query.as_slice(),
+                        vector_batch,
+                        self.vector_dim,
+                        &mut scores,
+                    );
+                    for (offset, &score) in scores.iter().enumerate() {
+                        let row_id = point_base.checked_add(offset).ok_or_else(|| {
+                            paro_error::data_corrupted("exact tail point id overflow")
+                        })?;
+                        collector.push(RankedRow::new(
+                            PhysicalRowRef::new(
+                                visible_segment.rowset_id,
+                                visible_segment.segment_id,
+                                crate::rowset::SegmentRowId::from_raw(row_id as u32),
+                            ),
+                            score,
+                        ));
+                    }
+                    point_base = point_base.checked_add(rows).ok_or_else(|| {
+                        paro_error::data_corrupted("exact tail point count overflow")
+                    })?;
+                }
+                Ok(())
+            })?;
+            if point_base != segment_rows {
+                return Err(paro_error::data_corrupted(format!(
+                    "plain exact-tail scan returned {point_base} rows for {segment_rows} vectors"
+                )));
+            }
+        } else {
+            for row_batch in row_ids.chunks(batch_rows) {
+                budget.work.check_and_consume(row_batch.len())?;
+                for &row_id in row_batch {
+                    if row_id as usize >= segment_rows {
+                        return Err(paro_error::data_corrupted(format!(
+                            "exact tail row {row_id} exceeds segment cardinality {segment_rows}"
+                        )));
+                    }
+                    let vector = storage.get_vector(row_id);
+                    let score = self
+                        .distance
+                        .similarity_unindexed(self.prepared_query.as_slice(), vector);
+                    collector.push(RankedRow::new(
+                        PhysicalRowRef::new(
+                            visible_segment.rowset_id,
+                            visible_segment.segment_id,
+                            crate::rowset::SegmentRowId::from_raw(row_id),
+                        ),
+                        score,
+                    ));
+                }
+            }
+        }
+        Ok(Some(collector.into_sorted_rows()))
+    }
+
+    fn dispatch_segment_search(
+        &self,
+        segment: &VisibleSegment,
+        filter: HnswSearchFilter<'_>,
+        effective_ef: usize,
+        rerank_window: usize,
+        budget: &ResourceBudget,
+    ) -> Result<SegmentDispatchResult<(Vec<RankedRow>, bool, Option<String>)>> {
+        let matching_rows = filter
+            .row_set()
+            .map_or(segment.segment.num_rows(), ExactRowSet::len);
+        let inline_index = segment
+            .segment
+            .open_hnsw_index(self.storage_col_id)?
+            .filter(|index| !index.integrity_failed());
+        if let Some(index) = inline_index.as_ref() {
+            bind_hnsw_search_workspace(
+                index,
+                self.reader_runtime.as_ref(),
+                None,
+                None,
+                HnswReaderActivationPolicy::QUERY,
+                None,
+            )?;
+        }
+        let exact_scan_workload = inline_index.as_ref().map_or_else(
+            || filter.exact_scan_workload(segment.segment.num_rows(), |_| false),
+            |index| index.exact_scan_workload(filter),
+        );
+        let search_strategy = HnswSearchStrategy::choose(HnswSegmentSearchInput {
+            objective: self.params.objective,
+            filter_kind: filter.kind(),
+            matching_rows,
+            total_rows: segment.segment.num_rows(),
+            top_k: self.k,
+            effective_ef,
+            rerank_window,
+            vector_dimension: u32::try_from(self.vector_dim)
+                .map_err(|_| paro_error::out_of_range("HNSW vector dimension exceeds u32"))?,
+            vector_encoding: inline_index.as_ref().map_or(
+                crate::index::hnsw::HnswBuildVectorEncoding::ExactF32,
+                |index| index.build_contract.vector_encoding,
+            ),
+            exact_scan_workload,
+            cost_profile: self.search_policy.distance_cost,
+        });
+        let (rows, degraded) = self.search_segment(segment, search_strategy, filter, budget)?;
+        let degraded_reason = degraded
+            .then(|| segment.segment.hnsw_rebuild_reason(self.storage_col_id))
+            .flatten();
+        Ok(SegmentDispatchResult {
+            candidates_produced: rows.len(),
+            degraded,
+            output: (rows, degraded, degraded_reason),
+        })
+    }
+
+    fn search_partition_artifact(
+        &self,
+        artifact: &SearchArtifactRef,
+        index: &HnswIndex,
+        visible_by_ref: &HashMap<ArtifactSegmentRef, usize>,
+        prepared_filters: &[PreparedSegmentFilter],
+        has_predicate: bool,
+        predicate_columns: &[u32],
+        effective_ef: usize,
+        rerank_window: usize,
+        budget: &ResourceBudget,
+    ) -> Result<Vec<RankedRow>> {
+        let visible_segments = self.snapshot.table_lease.visible_segments();
+        let has_visibility_filter = artifact.coverage.segments().iter().any(|span| {
+            visible_by_ref
+                .get(&span.segment)
+                .and_then(|index| prepared_filters.get(*index))
+                .is_some_and(|filter| filter.row_set.is_some())
+        });
+        let filter_kind = if has_predicate {
+            HnswFilterKind::Predicate
+        } else if has_visibility_filter {
+            HnswFilterKind::Visibility
+        } else {
+            HnswFilterKind::None
+        };
+
+        let partition_row_set = if filter_kind == HnswFilterKind::None {
+            None
+        } else {
+            let mut parts = Vec::<(std::ops::Range<u32>, Arc<dyn ExactRowSet>)>::with_capacity(
+                artifact.coverage.segments().len(),
+            );
+            let mut point_base = 0u32;
+            for span in artifact.coverage.segments() {
+                let visible_index = *visible_by_ref.get(&span.segment).ok_or_else(|| {
+                    paro_error::data_corrupted(format!(
+                        "HNSW partition references invisible segment {}/{}",
+                        span.segment.rowset_id, span.segment.segment_id
+                    ))
+                })?;
+                let visible_segment = visible_segments.get(visible_index).ok_or_else(|| {
+                    paro_error::internal("visible HNSW segment index is out of bounds")
+                })?;
+                if visible_segment.segment.num_rows() != span.row_count {
+                    return Err(paro_error::data_corrupted(format!(
+                        "HNSW partition segment {}/{} coverage has {} rows, visible segment has {}",
+                        span.segment.rowset_id,
+                        span.segment.segment_id,
+                        span.row_count,
+                        visible_segment.segment.num_rows()
+                    )));
+                }
+                let span_rows = u32::try_from(span.row_count).map_err(|_| {
+                    paro_error::out_of_range("HNSW partition span exceeds u32 row-id domain")
+                })?;
+                let point_end = point_base.checked_add(span_rows).ok_or_else(|| {
+                    paro_error::out_of_range("HNSW partition point-id range overflow")
+                })?;
+                let row_set = match &prepared_filters[visible_index].row_set {
+                    Some(row_set) => Arc::clone(row_set),
+                    None if has_predicate => {
+                        return Err(paro_error::internal(
+                            "predicate filter disappeared while composing HNSW partition",
+                        ))
+                    }
+                    None => Arc::new(DenseRowSet::new(span_rows)),
+                };
+                parts.push((point_base..point_end, row_set));
+                point_base = point_end;
+            }
+            let row_set: Arc<dyn ExactRowSet> =
+                Arc::new(PartitionExactRowSet::try_new_with_directory(
+                    parts,
+                    artifact.coverage.partition_directory(),
+                )?);
+            Some(row_set)
+        };
+        let _partition_reservation = partition_row_set
+            .as_ref()
+            .map(|row_set| budget.try_reserve_memory(row_set.query_retained_bytes()))
+            .transpose()?;
+        let filter = match (filter_kind, partition_row_set.as_deref()) {
+            (HnswFilterKind::None, None) => HnswSearchFilter::None,
+            (HnswFilterKind::Visibility, Some(row_set)) => HnswSearchFilter::Visibility(row_set),
+            (HnswFilterKind::Predicate, Some(row_set)) => {
+                HnswSearchFilter::predicate(row_set, predicate_columns)
+            }
+            _ => {
+                return Err(paro_error::internal(
+                    "HNSW partition filter kind and exact row set disagree",
+                ))
+            }
+        };
+        if filter.row_set().is_some_and(ExactRowSet::is_empty) {
+            return Ok(Vec::new());
+        }
+        let matching_rows = filter
+            .row_set()
+            .map_or(artifact.coverage.row_count(), ExactRowSet::len);
+        let strategy = HnswSearchStrategy::choose(HnswSegmentSearchInput {
+            objective: self.params.objective,
+            filter_kind,
+            matching_rows,
+            total_rows: artifact.coverage.row_count(),
+            top_k: self.k,
+            effective_ef,
+            rerank_window,
+            vector_dimension: u32::try_from(self.vector_dim)
+                .map_err(|_| paro_error::out_of_range("HNSW vector dimension exceeds u32"))?,
+            vector_encoding: index.build_contract.vector_encoding,
+            exact_scan_workload: index.exact_scan_workload(filter),
+            cost_profile: self.search_policy.distance_cost,
+        });
+        let points = index
+            .search_one_with_policy_strategy(
+                &self.query,
+                self.k,
+                &self.params,
+                filter,
+                &self.search_policy,
+                strategy,
+                budget,
+            )?
+            .points;
+        points
+            .into_iter()
+            .filter_map(|point| {
+                let Some(point_ref) = artifact.coverage.resolve_point(point.idx) else {
+                    return Some(Err(paro_error::data_corrupted(format!(
+                        "HNSW point {} exceeds partition coverage",
+                        point.idx
+                    ))));
+                };
+                let Some(&visible_index) = visible_by_ref.get(&point_ref.segment) else {
+                    return Some(Err(paro_error::data_corrupted(
+                        "HNSW result references an invisible segment",
+                    )));
+                };
+                let Some(visible_segment) = visible_segments.get(visible_index) else {
+                    return Some(Err(paro_error::internal(
+                        "visible HNSW result segment index is out of bounds",
+                    )));
+                };
+                if u64::from(point_ref.row_offset) >= visible_segment.segment.num_rows() {
+                    return Some(Err(paro_error::data_corrupted(format!(
+                        "HNSW result row {} exceeds segment {}/{} cardinality {}",
+                        point_ref.row_offset,
+                        point_ref.segment.rowset_id,
+                        point_ref.segment.segment_id,
+                        visible_segment.segment.num_rows()
+                    ))));
+                }
+                let row = PhysicalRowRef::new(
+                    point_ref.segment.rowset_id,
+                    point_ref.segment.segment_id,
+                    crate::rowset::SegmentRowId::from_raw(point_ref.row_offset),
+                );
+                (!self.snapshot.is_overlay_deleted(row))
+                    .then(|| Ok(RankedRow::new(row, point.score)))
+            })
+            .collect()
+    }
+
+    fn search_segment(
+        &self,
+        visible_segment: &VisibleSegment,
+        search_strategy: HnswSearchStrategy,
+        filter: HnswSearchFilter<'_>,
+        budget: &ResourceBudget,
+    ) -> Result<(Vec<RankedRow>, bool)> {
+        if let Some(index) = visible_segment
+            .segment
+            .open_hnsw_index(self.storage_col_id)?
+            .filter(|index| !index.integrity_failed())
+        {
+            bind_hnsw_search_workspace(
+                &index,
+                self.reader_runtime.as_ref(),
+                None,
+                None,
+                HnswReaderActivationPolicy::QUERY,
+                None,
+            )?;
+            validate_hnsw_index_contract(index.as_ref(), &self.expected_build_contract)?;
             return visible_segment
                 .segment
-                .vector_search_with_epoch(
+                .vector_search_with_filter_strategy(
                     self.storage_col_id,
                     &self.query,
                     self.k,
                     &self.params,
-                    snapshot_version,
-                    self.predicate.as_ref(),
+                    filter,
+                    &self.search_policy,
+                    search_strategy,
+                    budget,
                 )
-                .map(|rows| {
+                .map(|result| {
+                    let rows = result.points;
                     let ranked_rows = if self.snapshot.has_overlay_delete_vectors() {
                         rows.into_iter()
                             .filter_map(|point| {
@@ -259,25 +1029,33 @@ impl VectorSearchCursor {
 
         if let Some(index) = open_sidecar_hnsw_index(
             &self.snapshot,
-            self.sidecar_cache.as_ref(),
+            self.reader_runtime.as_ref(),
             visible_segment,
             self.storage_col_id,
             self.vector_dim,
+            self.snapshot.generation.hnsw_query_activity.clone(),
         )? {
-            let filter_bitmap = visible_segment
-                .segment
-                .build_filter_bitmap_with_epoch(snapshot_version, self.predicate.as_ref())?;
-            if filter_bitmap
-                .as_ref()
-                .is_some_and(|bitmap| bitmap.is_empty())
-            {
+            validate_hnsw_index_contract(index.as_ref(), &self.expected_build_contract)?;
+            if filter.row_set().is_some_and(ExactRowSet::is_empty) {
                 return Ok((Vec::new(), false));
             }
             return index
-                .search_one(&self.query, self.k, &self.params, filter_bitmap.as_ref())
-                .map(|points| {
+                .search_one_with_policy_strategy(
+                    &self.query,
+                    self.k,
+                    &self.params,
+                    filter,
+                    &self.search_policy,
+                    search_strategy,
+                    budget,
+                )
+                .map(|result| {
                     (
-                        hnsw_ranked_rows_from_points(&self.snapshot, visible_segment, points),
+                        hnsw_ranked_rows_from_points(
+                            &self.snapshot,
+                            visible_segment,
+                            result.points,
+                        ),
                         false,
                     )
                 });
@@ -287,63 +1065,91 @@ impl VectorSearchCursor {
         if row_ids.is_empty() {
             return Ok((Vec::new(), true));
         }
-        let resolved = resolve_logical_rows(
+        if let Some(rows) =
+            self.score_exact_tail_plain_vectors(visible_segment, &row_ids, budget)?
+        {
+            return Ok((rows, true));
+        }
+        let retained_per_row = self
+            .vector_dim
+            .saturating_mul(std::mem::size_of::<f32>())
+            .saturating_add(32);
+        let retained_bytes = row_ids
+            .len()
+            .checked_mul(retained_per_row)
+            .ok_or_else(|| paro_error::out_of_range("exact tail working set overflow"))?;
+        let _tail_reservation = budget.try_reserve_memory(retained_bytes)?;
+        if let Some(batch) =
+            read_segment_column_batch_direct(visible_segment, &row_ids, self.storage_col_id)?
+        {
+            return Ok((
+                self.score_exact_tail_storage_batch(&batch, visible_segment, &row_ids, budget)?,
+                true,
+            ));
+        }
+        let resolved = resolve_logical_rows_with_allocator(
             &self.tablet,
             &self.snapshot,
             visible_segment,
             &row_ids,
             self.storage_col_id,
+            Arc::clone(&budget.materialization_allocator),
         )?;
-        let column = resolved
-            .column(0)
-            .ok_or_else(|| paro_error::internal("resolved vector tail chunk missing column"))?;
-        let mut collector = TopKCollector::new(self.k);
-        let mut decoded = vec![0.0_f32; self.vector_dim];
-        for (offset, row_id) in row_ids.iter().copied().enumerate() {
-            let value = column.get_value(offset);
-            let Value::Array(values, _, _) = value else {
-                continue;
-            };
-            if values.len() != self.vector_dim {
-                continue;
-            }
-            for (idx, value) in values.into_iter().enumerate() {
-                decoded[idx] = match value {
-                    Value::Float(v) => v,
-                    Value::Double(v) => v as f32,
-                    Value::TinyInt(v) => v as f32,
-                    Value::SmallInt(v) => v as f32,
-                    Value::Integer(v) => v as f32,
-                    Value::BigInt(v) => v as f32,
-                    Value::UTinyInt(v) => v as f32,
-                    Value::USmallInt(v) => v as f32,
-                    Value::UInteger(v) => v as f32,
-                    Value::UBigInt(v) => v as f32,
-                    _ => continue,
-                };
-            }
-            collector.push(RankedRow::new(
+        let physical_rows = row_ids
+            .iter()
+            .copied()
+            .map(|row_id| {
                 PhysicalRowRef::new(
                     visible_segment.rowset_id,
                     visible_segment.segment_id,
                     crate::rowset::SegmentRowId::from_raw(row_id),
-                ),
-                self.distance
-                    .similarity(self.prepared_query.as_slice(), &decoded),
-            ));
-        }
-
-        Ok((collector.into_sorted_rows(), true))
+                )
+            })
+            .collect::<Vec<_>>();
+        Ok((
+            self.score_exact_tail_chunk(&resolved, &physical_rows, budget)?,
+            true,
+        ))
     }
+}
+
+fn exact_search_parallelism_slots(
+    granted_slots: usize,
+    matching_rows: u64,
+    vector_dim: usize,
+) -> usize {
+    let granted_slots = granted_slots.max(1);
+    if granted_slots == 1 {
+        return granted_slots;
+    }
+    let vector_bytes = matching_rows
+        .saturating_mul(vector_dim as u64)
+        .saturating_mul(std::mem::size_of::<f32>() as u64);
+    if vector_bytes < MIN_PARALLEL_EXACT_VECTOR_BYTES {
+        1
+    } else {
+        granted_slots
+    }
+}
+
+fn validate_hnsw_index_contract(index: &HnswIndex, expected: &HnswBuildContract) -> Result<()> {
+    if index.build_contract != *expected {
+        return Err(paro_error::data_corrupted(format!(
+            "HNSW artifact build contract mismatch: artifact={:?}, definition={:?}",
+            index.build_contract, expected
+        )));
+    }
+    Ok(())
 }
 
 fn open_sidecar_hnsw_index(
     snapshot: &SearchReadSnapshot,
-    cache: &SidecarReaderCache,
+    runtime: &SearchReaderRuntime,
     visible_segment: &VisibleSegment,
     column_id: u32,
     vector_dim: usize,
-) -> Result<Option<HnswIndex>> {
+    query_activity: Option<Arc<HnswQueryActivity>>,
+) -> Result<Option<Arc<HnswIndex>>> {
     let Some(artifact) =
         snapshot.artifact_for_segment(SearchIndexKind::Hnsw, column_id, visible_segment)
     else {
@@ -356,28 +1162,391 @@ fn open_sidecar_hnsw_index(
         return Ok(None);
     }
 
-    let column_meta = visible_segment
-        .segment
-        .get_column_meta(column_id)
-        .ok_or_else(|| {
-            paro_error::column_not_found(format!(
-                "column {} not found in segment {}",
-                column_id, visible_segment.segment_id
+    open_sidecar_hnsw_artifact(
+        runtime,
+        artifact,
+        vector_dim,
+        query_activity,
+        HnswReaderActivationPolicy::QUERY,
+        None,
+        || {
+            build_external_vector_binding(artifact, column_id, vector_dim, |segment_ref| {
+                (segment_ref.rowset_id == visible_segment.rowset_id
+                    && segment_ref.segment_id == visible_segment.segment_id)
+                    .then_some(visible_segment)
+            })
+            .map(Some)
+        },
+    )
+}
+
+fn open_sidecar_hnsw_artifact<F>(
+    runtime: &SearchReaderRuntime,
+    artifact: &SearchArtifactRef,
+    vector_dim: usize,
+    query_activity: Option<Arc<HnswQueryActivity>>,
+    activation: HnswReaderActivationPolicy,
+    stop_check: Option<&SearchBuildStopCheck>,
+    external_binding: F,
+) -> Result<Option<Arc<HnswIndex>>>
+where
+    F: FnOnce() -> Result<Option<HnswExternalVectorBinding>>,
+{
+    let request = DecodedSidecarReaderRequest {
+        sidecar: SidecarReaderRequest {
+            location: &artifact.location,
+            artifact_format_version: artifact.artifact_format_version,
+            provider: SearchIndexKind::Hnsw,
+            codec: SIDECAR_PACKAGE_CODEC,
+            integrity: SidecarIntegrityPolicy::SelfValidatingArtifact,
+        },
+        binding: DecodedReaderBinding::GenerationExternalVectors {
+            definition_id: artifact.definition_id,
+            generation_id: artifact.generation_id,
+            column_id: artifact.column_id,
+        },
+    };
+    let index = match runtime.get_or_try_open_decoded(request, |cached| {
+        if !matches!(
+            hnsw_artifact_compatibility(cached.bytes())?,
+            HnswArtifactCompatibility::Current
+        ) {
+            if activation.require_current_artifact {
+                return Err(paro_error::data_corrupted(
+                    "prepared HNSW artifact is not compatible with the current format",
+                ));
+            }
+            runtime.record_hnsw_integrity_failure(artifact);
+            return Ok(None);
+        }
+        let (mmap, offset, len) = cached.mmap_range();
+        let index = if hnsw_artifact_uses_external_vectors(cached.bytes())? {
+            HnswIndex::deserialize_mmap_range_with_external_vectors(
+                mmap,
+                offset,
+                len,
+                external_binding()?.ok_or_else(|| {
+                    paro_error::artifact_not_ready(
+                        "external HNSW sidecar has no immutable base-page binding",
+                    )
+                })?,
+            )?
+        } else {
+            HnswIndex::deserialize_mmap_range(mmap, offset, len)?
+        };
+        if index.vector_storage.vector_dim() != vector_dim {
+            return Err(paro_error::data_corrupted(format!(
+                "HNSW artifact dimension mismatch: expected {vector_dim}, got {}",
+                index.vector_storage.vector_dim()
+            )));
+        }
+        Ok(Some(index))
+    }) {
+        Ok(index) => index,
+        Err(error)
+            if error.is(paro_common::error::codes::internal::DATA_CORRUPTED)
+                || error.is(paro_common::error::codes::internal::INDEX_CORRUPTED) =>
+        {
+            if activation.require_current_artifact {
+                return Err(error);
+            }
+            runtime.record_hnsw_integrity_failure(artifact);
+            tracing::error!(
+                definition_id = artifact.definition_id,
+                generation_id = artifact.generation_id,
+                error = %error,
+                "HNSW reader open failed integrity checks; using exact fallback"
+            );
+            return Ok(None);
+        }
+        Err(error) => return Err(error),
+    };
+    if let Some(index) = index.as_ref() {
+        if index.integrity_failed() {
+            if activation.require_current_artifact {
+                return Err(paro_error::data_corrupted(
+                    "prepared HNSW artifact already failed integrity verification",
+                ));
+            }
+            // Integrity failure quarantines only this rebuildable secondary
+            // artifact. The caller retains the covered base segments and can
+            // execute an exact fallback instead of making the table unreadable
+            // or emitting the same data-corruption error on every query.
+            runtime.schedule_hnsw_integrity_verification(index, artifact, query_activity.clone());
+            return Ok(None);
+        }
+        if index.artifact_integrity().is_none() {
+            return Err(paro_error::data_corrupted(
+                "durable HNSW sidecar is missing its checksum hierarchy",
+            ));
+        }
+        bind_hnsw_search_workspace(
+            index,
+            runtime,
+            Some(artifact),
+            query_activity,
+            activation,
+            stop_check,
+        )?;
+    }
+    Ok(index)
+}
+
+fn build_external_vector_binding<'a, F>(
+    artifact: &SearchArtifactRef,
+    column_id: u32,
+    vector_dim: usize,
+    mut resolve_visible: F,
+) -> Result<HnswExternalVectorBinding>
+where
+    F: FnMut(&ArtifactSegmentRef) -> Option<&'a VisibleSegment>,
+{
+    build_external_vector_binding_from_storage(artifact, column_id, vector_dim, |segment_ref| {
+        let visible = resolve_visible(segment_ref).ok_or_else(|| {
+            paro_error::data_corrupted(format!(
+                "external HNSW source references invisible segment {}/{}",
+                segment_ref.rowset_id, segment_ref.segment_id
             ))
         })?;
-    let vector_storage = Arc::new(MmapVectorStorage::open_range(
-        visible_segment.segment.file_path(),
-        column_meta.data_page_pointer.offset + PLAIN_PAGE_HEADER_SIZE as u64,
-        column_meta.num_rows * vector_dim as u64 * std::mem::size_of::<f32>() as u64,
-        vector_dim,
-    )?);
-    let cached = cache.open(SidecarReaderRequest {
-        location: &artifact.location,
-        artifact_format_version: artifact.artifact_format_version,
-        provider: SearchIndexKind::Hnsw,
-        codec: SIDECAR_PACKAGE_CODEC,
-    })?;
-    HnswIndex::deserialize(cached.bytes(), vector_storage).map(Some)
+        Ok(Some((visible.segment.clone(), visible.segment.num_rows())))
+    })
+}
+
+fn build_external_vector_binding_from_storage<F>(
+    artifact: &SearchArtifactRef,
+    column_id: u32,
+    vector_dim: usize,
+    mut resolve_segment: F,
+) -> Result<HnswExternalVectorBinding>
+where
+    F: FnMut(&ArtifactSegmentRef) -> Result<Option<(crate::rowset::SegmentSharedPtr, u64)>>,
+{
+    if artifact.column_id != column_id {
+        return Err(paro_error::data_corrupted(format!(
+            "external HNSW artifact column {} does not match query column {column_id}",
+            artifact.column_id
+        )));
+    }
+    let mut source_spans = Vec::with_capacity(artifact.coverage.segments().len());
+    let mut vector_parts = Vec::<Arc<dyn VectorStorage>>::new();
+    for span in artifact.coverage.segments() {
+        let (segment, segment_rows) = resolve_segment(&span.segment)?.ok_or_else(|| {
+            paro_error::data_corrupted(format!(
+                "external HNSW source references invisible segment {}/{}",
+                span.segment.rowset_id, span.segment.segment_id
+            ))
+        })?;
+        if segment_rows != span.row_count {
+            return Err(paro_error::data_corrupted(format!(
+                "external HNSW source segment {}/{} has {} rows, expected {}",
+                span.segment.rowset_id, span.segment.segment_id, segment_rows, span.row_count
+            )));
+        }
+        let column = segment.get_column_meta(column_id).ok_or_else(|| {
+            paro_error::column_not_found(format!(
+                "external HNSW source segment {} has no column {column_id}",
+                span.segment.segment_id
+            ))
+        })?;
+        if column.num_rows != span.row_count {
+            return Err(paro_error::data_corrupted(format!(
+                "external HNSW source column {column_id} has {} rows, expected {}",
+                column.num_rows, span.row_count
+            )));
+        }
+        let storage = segment
+            .open_plain_vector_storage(column_id, vector_dim)?
+            .ok_or_else(|| {
+                paro_error::data_corrupted(format!(
+                    "external HNSW source segment {}/{} is not a plain vector column",
+                    span.segment.rowset_id, span.segment.segment_id
+                ))
+            })?;
+        vector_parts.push(storage);
+        source_spans.push(HnswExternalVectorSpan {
+            rowset_id: span.segment.rowset_id,
+            segment_id: span.segment.segment_id,
+            row_count: span.row_count,
+        });
+    }
+    let source = HnswExternalVectorSource::try_new(column_id, source_spans)?;
+    let storage: Arc<dyn VectorStorage> =
+        Arc::new(PartitionedVectorStorage::try_new(vector_parts, vector_dim)?);
+    Ok(HnswExternalVectorBinding { source, storage })
+}
+
+/// Materialize every typed HNSW reader before a recovered or newly published
+/// generation becomes query-visible.
+///
+/// The manifest is immutable and sidecar artifacts are self-validating, so
+/// reader construction is generation activation work rather than query work.
+/// Keeping it on this boundary also reuses the segment-owned vector readers
+/// already populated by catch-up construction.
+pub(crate) fn prewarm_hnsw_generation_readers(
+    runtime: &SearchReaderRuntime,
+    artifacts: &[SearchArtifactRef],
+    visible_rowsets: &[RowsetSharedPtr],
+    column_id: u32,
+    vector_dim: usize,
+    expected_contract: &HnswBuildContract,
+    query_activity: Option<Arc<HnswQueryActivity>>,
+    activation: HnswReaderActivationPolicy,
+    stop_check: Option<&SearchBuildStopCheck>,
+) -> Result<usize> {
+    let rowsets = visible_rowsets
+        .iter()
+        .map(|rowset| (rowset.rowset_id(), rowset))
+        .collect::<BTreeMap<_, _>>();
+    let mut warmed = 0usize;
+    for artifact in artifacts.iter().filter(|artifact| {
+        artifact.column_id == column_id && is_decoded_hnsw_sidecar_artifact(artifact)
+    }) {
+        let index = open_sidecar_hnsw_artifact(
+            runtime,
+            artifact,
+            vector_dim,
+            query_activity.clone(),
+            activation,
+            stop_check,
+            || {
+                build_external_vector_binding_from_storage(
+                    artifact,
+                    column_id,
+                    vector_dim,
+                    |segment_ref| {
+                        let Some(rowset) = rowsets.get(&segment_ref.rowset_id) else {
+                            return Ok(None);
+                        };
+                        rowset.load()?;
+                        Ok(rowset
+                            .segments()
+                            .iter()
+                            .find(|segment| segment.segment_id() == segment_ref.segment_id)
+                            .cloned()
+                            .map(|segment| {
+                                let rows = segment.num_rows();
+                                (segment, rows)
+                            }))
+                    },
+                )
+                .map(Some)
+            },
+        )?;
+        let Some(index) = index else {
+            if activation.require_current_artifact {
+                return Err(paro_error::data_corrupted(format!(
+                    "prepared HNSW artifact {:?} could not be activated",
+                    artifact.location
+                )));
+            }
+            // A rebuildable secondary artifact that fails integrity checks is
+            // durably removed by the maintenance failure queue. Keeping the
+            // definition visible lets its immutable base partition execute via
+            // exact fallback until the replacement generation is published.
+            continue;
+        };
+        validate_hnsw_index_contract(index.as_ref(), expected_contract)?;
+        warmed = warmed.saturating_add(1);
+    }
+    Ok(warmed)
+}
+
+/// Orthogonal reader-activation policy.
+///
+/// Opening a typed reader and authenticating its complete byte image are
+/// deliberately separate lifecycle operations. A private build output is
+/// authenticated before a durable head can name it, outside the publication
+/// critical section. Once a generation is durable, foreground reads retain
+/// lazy per-range checksum validation as the correctness boundary and complete
+/// payload authentication becomes governed, asynchronous residency work.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct HnswReaderActivationPolicy {
+    authentication: Option<HnswBuildExecutionPolicy>,
+    require_current_artifact: bool,
+    schedule_background_authentication: bool,
+}
+
+impl HnswReaderActivationPolicy {
+    /// Recovery opens immutable reader metadata without making every restored
+    /// mmap resident. The first real use may request background authentication.
+    pub(crate) const RECOVERY: Self = Self {
+        authentication: None,
+        require_current_artifact: false,
+        schedule_background_authentication: false,
+    };
+
+    /// Authenticate a newly-created immutable artifact before any durable head
+    /// can name it. Callers must use this only while they still own the private
+    /// build output and before entering the publication critical section.
+    pub(crate) const fn prepared_publication(execution: HnswBuildExecutionPolicy) -> Self {
+        Self {
+            authentication: Some(execution),
+            require_current_artifact: true,
+            schedule_background_authentication: false,
+        }
+    }
+
+    /// Attach a generation whose directory and head are already durable.
+    /// Rejecting it synchronously here would split catalog and storage state;
+    /// governed authentication instead quarantines a bad secondary artifact
+    /// and leaves its immutable base rows available to exact fallback.
+    pub(crate) const ATTACH_PUBLISHED: Self = Self {
+        authentication: None,
+        require_current_artifact: false,
+        schedule_background_authentication: true,
+    };
+
+    /// A query may opportunistically enqueue the same idempotent work. The
+    /// scheduler deduplicates by immutable reader identity.
+    pub(crate) const QUERY: Self = Self {
+        authentication: None,
+        require_current_artifact: false,
+        schedule_background_authentication: true,
+    };
+}
+
+fn bind_hnsw_search_workspace(
+    index: &Arc<HnswIndex>,
+    runtime: &SearchReaderRuntime,
+    artifact: Option<&SearchArtifactRef>,
+    query_activity: Option<Arc<HnswQueryActivity>>,
+    activation: HnswReaderActivationPolicy,
+    stop_check: Option<&SearchBuildStopCheck>,
+) -> Result<()> {
+    if let Some(buffer_pool) = runtime.buffer_pool() {
+        index.bind_search_buffer_pool(buffer_pool)?;
+    }
+    if let Some(execution) = activation.authentication {
+        let integrity = index.artifact_integrity().ok_or_else(|| {
+            paro_error::data_corrupted("durable HNSW publication is missing its checksum hierarchy")
+        })?;
+        let mut cursor = 0usize;
+        loop {
+            if stop_check.is_some_and(SearchBuildStopCheck::should_stop) {
+                return Err(paro_error::query_canceled());
+            }
+            let progress =
+                match integrity.verify_batch(&mut cursor, HNSW_INTEGRITY_CHUNKS_PER_SLICE) {
+                    Ok(progress) => progress,
+                    Err(error) => {
+                        storage_metrics().record_hnsw_integrity_failed();
+                        return Err(error);
+                    }
+                };
+            storage_metrics().record_hnsw_integrity_verified_bytes(progress.bytes_covered as u64);
+            if progress.complete {
+                storage_metrics().record_hnsw_integrity_completed();
+                break;
+            }
+            hnsw_yield_maintenance_to_foreground(execution);
+        }
+    }
+    if activation.schedule_background_authentication {
+        if let Some(artifact) = artifact {
+            runtime.schedule_hnsw_integrity_verification(index, artifact, query_activity);
+        }
+    }
+    Ok(())
 }
 
 fn hnsw_ranked_rows_from_points(
@@ -440,7 +1609,10 @@ impl SearchCursor for VectorSearchCursor {
             VectorCursorState::Ready { rows, offset } => {
                 let row_limit = batch.row_limit.max(1);
                 let end = (*offset + row_limit).min(rows.len());
-                let candidate_batch = ranked_rows_to_batch(rows[*offset..end].to_vec());
+                let mut candidate_batch = ranked_rows_to_batch(rows[*offset..end].to_vec());
+                for score in &mut candidate_batch.scores {
+                    *score = self.distance.postprocess(*score);
+                }
                 *offset = end;
                 if *offset >= rows.len() {
                     self.state = VectorCursorState::Exhausted;
@@ -472,13 +1644,21 @@ fn validate_query_dim(query: &[f32], vector_dim: usize) -> Result<()> {
     Ok(())
 }
 
-fn resolve_distance_metric(tablet: &TabletRef, column_id: usize) -> DistanceMetric {
-    tablet
-        .schema()
-        .and_then(|schema| {
-            schema
-                .column_by_id(column_id as ColumnId)
-                .map(|column| DistanceMetric::from_u8(column.hnsw_distance))
-        })
-        .unwrap_or(DistanceMetric::Euclidean)
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn exact_segment_dispatch_requires_enough_vector_work() {
+        let rows_below_two_mib_at_32d =
+            MIN_PARALLEL_EXACT_VECTOR_BYTES / (32 * std::mem::size_of::<f32>() as u64) - 1;
+        assert_eq!(
+            exact_search_parallelism_slots(8, rows_below_two_mib_at_32d, 32,),
+            1
+        );
+        assert_eq!(
+            exact_search_parallelism_slots(8, rows_below_two_mib_at_32d + 1, 32,),
+            8
+        );
+    }
 }

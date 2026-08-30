@@ -11,6 +11,7 @@ use paro_function::scalar::cast::CastFunctionSet;
 use paro_scheduler::scheduler::ThreadAffinityMode;
 use paro_storage::buffer::{BufferManager, BufferPool};
 use paro_storage::compaction::compaction_manager::CompactionAdmissionPolicy;
+use paro_storage::index::hnsw::HnswIntegritySchedulerConfig;
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -173,6 +174,7 @@ pub struct BootConfig {
     pub pin_threads: ThreadAffinityMode,
     pub checkpoint: CheckpointConfigOptions,
     pub compaction: CompactionConfigOptions,
+    pub hnsw_integrity: HnswIntegritySchedulerConfig,
     pub initial_temporary_directory: String,
     pub initial_use_temporary_directory: bool,
     pub initial_max_temp_directory_size: Option<usize>,
@@ -215,6 +217,7 @@ impl BootConfig {
             pin_threads: config.options.pin_threads,
             checkpoint: config.options.checkpoint,
             compaction: config.options.compaction,
+            hnsw_integrity: config.options.hnsw_integrity,
             initial_temporary_directory: config.options.temporary_directory.clone(),
             initial_use_temporary_directory: config.options.use_temporary_directory,
             initial_max_temp_directory_size: config.options.max_temp_directory_size,
@@ -236,6 +239,11 @@ pub struct InstanceConfigOptions {
     pub checkpoint: CheckpointConfigOptions,
     /// Background compaction scheduling and debt relief policy.
     pub compaction: CompactionConfigOptions,
+    /// Optional whole-artifact HNSW authentication policy.
+    ///
+    /// Lazy range checks remain mandatory and are not controlled by this
+    /// setting. This policy only governs background residency work.
+    pub hnsw_integrity: HnswIntegritySchedulerConfig,
     /// Maximum memory used by the database system (in bytes).
     pub maximum_memory: usize,
     /// Maximum threads used by the database system.
@@ -286,6 +294,7 @@ impl Default for InstanceConfigOptions {
             access_mode: AccessMode::ReadWrite,
             checkpoint: CheckpointConfigOptions::default(),
             compaction: CompactionConfigOptions::default(),
+            hnsw_integrity: HnswIntegritySchedulerConfig::default(),
             maximum_memory: 1024 * 1024 * 1024, // 1GB
             // None means "use system default" which is resolved in effective_max_threads()
             maximum_threads: None,
@@ -422,6 +431,12 @@ impl InstanceConfig {
         self
     }
 
+    /// Set the instance-owned HNSW background authentication policy.
+    pub fn with_hnsw_integrity_scheduler(mut self, policy: HnswIntegritySchedulerConfig) -> Self {
+        self.options.hnsw_integrity = policy;
+        self
+    }
+
     /// Set worker thread affinity mode.
     pub fn with_thread_affinity_mode(mut self, mode: ThreadAffinityMode) -> Self {
         self.options.pin_threads = mode;
@@ -530,6 +545,7 @@ impl From<&paro_common::config::ClusterConfig> for InstanceConfig {
             access_mode: config.access_mode.into(),
             checkpoint: CheckpointConfigOptions::default(),
             compaction: CompactionConfigOptions::default(),
+            hnsw_integrity: HnswIntegritySchedulerConfig::default(),
             maximum_memory: config.max_memory,
             maximum_threads: config.num_threads,
             pin_threads: match config.pin_threads {

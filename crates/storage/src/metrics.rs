@@ -15,6 +15,9 @@ use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicI64, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Mutex, OnceLock};
 
+use crate::index::hnsw::{
+    HnswExactScanKind, HnswPredicateAdmissionMode, HnswSearchOutcome, HnswSearchPath,
+};
 use crate::search::{SearchIndexKind, SEARCH_BUILD_LATENCY_BUCKETS_US, SEARCH_LATENCY_BUCKETS_US};
 
 pub const SEARCH_ROW_FETCH_LATENCY_BUCKET_COUNT: usize = SEARCH_LATENCY_BUCKETS_US.len() + 1;
@@ -82,6 +85,7 @@ pub struct SearchTailMetricCounters {
     pub tail_bytes: u64,
     pub tail_backlog_tier: u64,
     pub exact_merge_rows_total: u64,
+    pub exact_merge_over_budget_total: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -367,6 +371,7 @@ pub struct StorageMetricsSnapshot {
     pub compaction_output_bytes: u64,
     pub compaction_queue_len: usize,
     pub compaction_running_tablets: usize,
+    pub compaction_layout_gate_skips: u64,
     pub prefetch_hits: u64,
     pub prefetch_waits: u64,
     pub prefetch_wastes: u64,
@@ -408,6 +413,22 @@ pub struct StorageMetricsSnapshot {
     pub search_row_fetch_latency_us_total: u64,
     pub search_row_fetch_latency_us_buckets: [u64; SEARCH_ROW_FETCH_LATENCY_BUCKET_COUNT],
     pub search_row_fetch_by_key: Vec<SearchRowFetchMetricsByKey>,
+    pub search_hnsw_scored_points_total: u64,
+    pub search_hnsw_exact_segment_searches_total: u64,
+    pub search_hnsw_predicate_covering_segment_scans_total: u64,
+    pub search_hnsw_deferred_beam_admission_segment_searches_total: u64,
+    pub search_hnsw_unfiltered_graph_segment_searches_total: u64,
+    pub search_hnsw_masked_graph_segment_searches_total: u64,
+    pub search_hnsw_adaptive_graph_segment_searches_total: u64,
+    pub search_hnsw_predicate_topology_segment_searches_total: u64,
+    pub search_hnsw_predicate_refined_segment_searches_total: u64,
+    pub search_hnsw_exact_fallback_segment_searches_total: u64,
+    pub search_hnsw_integrity_scheduled_total: u64,
+    pub search_hnsw_integrity_completed_total: u64,
+    pub search_hnsw_integrity_failed_total: u64,
+    pub search_hnsw_integrity_stale_total: u64,
+    pub search_hnsw_integrity_deferred_total: u64,
+    pub search_hnsw_integrity_verified_bytes_total: u64,
     pub column_read_by_rowids_page_run_seeks_total: u64,
     pub txn_spill_bytes: u64,
     pub txn_spill_artifacts: u64,
@@ -464,6 +485,7 @@ pub struct StorageMetrics {
     compaction_output_bytes: AtomicU64,
     compaction_queue_len: AtomicUsize,
     compaction_running_tablets: AtomicUsize,
+    compaction_layout_gate_skips: AtomicU64,
     prefetch_hits: AtomicU64,
     prefetch_waits: AtomicU64,
     prefetch_wastes: AtomicU64,
@@ -511,6 +533,22 @@ pub struct StorageMetrics {
     search_row_fetch_latency_us_total: AtomicU64,
     search_row_fetch_latency_us_buckets: [AtomicU64; SEARCH_ROW_FETCH_LATENCY_BUCKET_COUNT],
     search_row_fetch_by_key: Mutex<BTreeMap<SearchRowFetchMetricKey, SearchRowFetchMetricCounters>>,
+    search_hnsw_scored_points_total: AtomicU64,
+    search_hnsw_exact_segment_searches_total: AtomicU64,
+    search_hnsw_predicate_covering_segment_scans_total: AtomicU64,
+    search_hnsw_deferred_beam_admission_segment_searches_total: AtomicU64,
+    search_hnsw_unfiltered_graph_segment_searches_total: AtomicU64,
+    search_hnsw_masked_graph_segment_searches_total: AtomicU64,
+    search_hnsw_adaptive_graph_segment_searches_total: AtomicU64,
+    search_hnsw_predicate_topology_segment_searches_total: AtomicU64,
+    search_hnsw_predicate_refined_segment_searches_total: AtomicU64,
+    search_hnsw_exact_fallback_segment_searches_total: AtomicU64,
+    search_hnsw_integrity_scheduled_total: AtomicU64,
+    search_hnsw_integrity_completed_total: AtomicU64,
+    search_hnsw_integrity_failed_total: AtomicU64,
+    search_hnsw_integrity_stale_total: AtomicU64,
+    search_hnsw_integrity_deferred_total: AtomicU64,
+    search_hnsw_integrity_verified_bytes_total: AtomicU64,
     column_read_by_rowids_page_run_seeks_total: AtomicU64,
     txn_spill_bytes: AtomicU64,
     txn_spill_artifacts: AtomicU64,
@@ -659,6 +697,12 @@ impl StorageMetrics {
     pub fn set_compaction_running_tablets(&self, count: usize) {
         self.compaction_running_tablets
             .store(count, Ordering::Relaxed);
+    }
+
+    /// Record a background compaction yielding to a stable-layout build.
+    pub fn inc_compaction_layout_gate_skips(&self) {
+        self.compaction_layout_gate_skips
+            .fetch_add(1, Ordering::Relaxed);
     }
 
     /// Record a prefetch hit (page consumed after prefetch ready).
@@ -844,6 +888,17 @@ impl StorageMetrics {
             .expect("search tail metrics lock poisoned");
         let counters = metrics.entry(SearchTailMetricKey { provider }).or_default();
         counters.exact_merge_rows_total = counters.exact_merge_rows_total.saturating_add(rows);
+    }
+
+    /// Record that correctness fallback crossed its preferred latency budget.
+    pub fn record_search_tail_exact_merge_over_budget(&self, provider: SearchIndexKind) {
+        let mut metrics = self
+            .search_tail_by_key
+            .lock()
+            .expect("search tail metrics lock poisoned");
+        let counters = metrics.entry(SearchTailMetricKey { provider }).or_default();
+        counters.exact_merge_over_budget_total =
+            counters.exact_merge_over_budget_total.saturating_add(1);
     }
 
     /// Record a query-time exact tail merge rejection.
@@ -1160,6 +1215,90 @@ impl StorageMetrics {
             );
     }
 
+    /// Record the path actually executed by one HNSW segment search. These
+    /// counters are runtime evidence exposed through `paro_search_metrics()`;
+    /// they deliberately do not reuse EXPLAIN's planning-time estimate.
+    pub fn record_search_hnsw_work(&self, scored_points: u64, outcome: HnswSearchOutcome) {
+        self.search_hnsw_scored_points_total
+            .fetch_add(scored_points, Ordering::Relaxed);
+        let graph_counter = match outcome.path {
+            HnswSearchPath::ExactScan(kind) => {
+                self.search_hnsw_exact_segment_searches_total
+                    .fetch_add(1, Ordering::Relaxed);
+                if kind.uses_predicate_covering() {
+                    self.search_hnsw_predicate_covering_segment_scans_total
+                        .fetch_add(1, Ordering::Relaxed);
+                }
+                None
+            }
+            HnswSearchPath::UnfilteredGraph => {
+                Some(&self.search_hnsw_unfiltered_graph_segment_searches_total)
+            }
+            HnswSearchPath::MaskedGraph => {
+                Some(&self.search_hnsw_masked_graph_segment_searches_total)
+            }
+            HnswSearchPath::AdaptiveGraph => {
+                Some(&self.search_hnsw_adaptive_graph_segment_searches_total)
+            }
+        };
+        if let Some(counter) = graph_counter {
+            counter.fetch_add(1, Ordering::Relaxed);
+        }
+        if outcome.predicate_admission == HnswPredicateAdmissionMode::DeferredGlobalBeam {
+            self.search_hnsw_deferred_beam_admission_segment_searches_total
+                .fetch_add(1, Ordering::Relaxed);
+        }
+        if outcome.predicate_refined {
+            self.search_hnsw_predicate_refined_segment_searches_total
+                .fetch_add(1, Ordering::Relaxed);
+        }
+        if outcome.predicate_topology_used {
+            self.search_hnsw_predicate_topology_segment_searches_total
+                .fetch_add(1, Ordering::Relaxed);
+        }
+        if outcome
+            .exact_fallback
+            .is_some_and(HnswExactScanKind::uses_predicate_covering)
+        {
+            self.search_hnsw_predicate_covering_segment_scans_total
+                .fetch_add(1, Ordering::Relaxed);
+        }
+        if outcome.exact_fallback.is_some() {
+            self.search_hnsw_exact_fallback_segment_searches_total
+                .fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    pub fn record_hnsw_integrity_scheduled(&self) {
+        self.search_hnsw_integrity_scheduled_total
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub fn record_hnsw_integrity_completed(&self) {
+        self.search_hnsw_integrity_completed_total
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub fn record_hnsw_integrity_failed(&self) {
+        self.search_hnsw_integrity_failed_total
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub fn record_hnsw_integrity_stale(&self) {
+        self.search_hnsw_integrity_stale_total
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub fn record_hnsw_integrity_deferred(&self) {
+        self.search_hnsw_integrity_deferred_total
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub fn record_hnsw_integrity_verified_bytes(&self, bytes: u64) {
+        self.search_hnsw_integrity_verified_bytes_total
+            .fetch_add(bytes, Ordering::Relaxed);
+    }
+
     /// Record page-local span seeks performed by the column-layer random rowid path.
     pub fn add_column_read_by_rowids_page_run_seeks(&self, delta: usize) {
         add_usize_counter(&self.column_read_by_rowids_page_run_seeks_total, delta);
@@ -1343,6 +1482,7 @@ impl StorageMetrics {
             compaction_output_bytes: self.compaction_output_bytes.load(Ordering::Relaxed),
             compaction_queue_len: self.compaction_queue_len.load(Ordering::Relaxed),
             compaction_running_tablets: self.compaction_running_tablets.load(Ordering::Relaxed),
+            compaction_layout_gate_skips: self.compaction_layout_gate_skips.load(Ordering::Relaxed),
             prefetch_hits: self.prefetch_hits.load(Ordering::Relaxed),
             prefetch_waits: self.prefetch_waits.load(Ordering::Relaxed),
             prefetch_wastes: self.prefetch_wastes.load(Ordering::Relaxed),
@@ -1406,6 +1546,54 @@ impl StorageMetrics {
                 .load(Ordering::Relaxed),
             search_row_fetch_latency_us_buckets,
             search_row_fetch_by_key,
+            search_hnsw_scored_points_total: self
+                .search_hnsw_scored_points_total
+                .load(Ordering::Relaxed),
+            search_hnsw_exact_segment_searches_total: self
+                .search_hnsw_exact_segment_searches_total
+                .load(Ordering::Relaxed),
+            search_hnsw_predicate_covering_segment_scans_total: self
+                .search_hnsw_predicate_covering_segment_scans_total
+                .load(Ordering::Relaxed),
+            search_hnsw_deferred_beam_admission_segment_searches_total: self
+                .search_hnsw_deferred_beam_admission_segment_searches_total
+                .load(Ordering::Relaxed),
+            search_hnsw_unfiltered_graph_segment_searches_total: self
+                .search_hnsw_unfiltered_graph_segment_searches_total
+                .load(Ordering::Relaxed),
+            search_hnsw_masked_graph_segment_searches_total: self
+                .search_hnsw_masked_graph_segment_searches_total
+                .load(Ordering::Relaxed),
+            search_hnsw_adaptive_graph_segment_searches_total: self
+                .search_hnsw_adaptive_graph_segment_searches_total
+                .load(Ordering::Relaxed),
+            search_hnsw_predicate_topology_segment_searches_total: self
+                .search_hnsw_predicate_topology_segment_searches_total
+                .load(Ordering::Relaxed),
+            search_hnsw_predicate_refined_segment_searches_total: self
+                .search_hnsw_predicate_refined_segment_searches_total
+                .load(Ordering::Relaxed),
+            search_hnsw_exact_fallback_segment_searches_total: self
+                .search_hnsw_exact_fallback_segment_searches_total
+                .load(Ordering::Relaxed),
+            search_hnsw_integrity_scheduled_total: self
+                .search_hnsw_integrity_scheduled_total
+                .load(Ordering::Relaxed),
+            search_hnsw_integrity_completed_total: self
+                .search_hnsw_integrity_completed_total
+                .load(Ordering::Relaxed),
+            search_hnsw_integrity_failed_total: self
+                .search_hnsw_integrity_failed_total
+                .load(Ordering::Relaxed),
+            search_hnsw_integrity_stale_total: self
+                .search_hnsw_integrity_stale_total
+                .load(Ordering::Relaxed),
+            search_hnsw_integrity_deferred_total: self
+                .search_hnsw_integrity_deferred_total
+                .load(Ordering::Relaxed),
+            search_hnsw_integrity_verified_bytes_total: self
+                .search_hnsw_integrity_verified_bytes_total
+                .load(Ordering::Relaxed),
             column_read_by_rowids_page_run_seeks_total: self
                 .column_read_by_rowids_page_run_seeks_total
                 .load(Ordering::Relaxed),
@@ -1451,6 +1639,8 @@ impl StorageMetrics {
         self.compaction_output_bytes.store(0, Ordering::Relaxed);
         self.compaction_queue_len.store(0, Ordering::Relaxed);
         self.compaction_running_tablets.store(0, Ordering::Relaxed);
+        self.compaction_layout_gate_skips
+            .store(0, Ordering::Relaxed);
         self.prefetch_hits.store(0, Ordering::Relaxed);
         self.prefetch_waits.store(0, Ordering::Relaxed);
         self.prefetch_wastes.store(0, Ordering::Relaxed);
@@ -1537,6 +1727,38 @@ impl StorageMetrics {
             .lock()
             .expect("search row fetch metrics lock poisoned")
             .clear();
+        self.search_hnsw_scored_points_total
+            .store(0, Ordering::Relaxed);
+        self.search_hnsw_exact_segment_searches_total
+            .store(0, Ordering::Relaxed);
+        self.search_hnsw_predicate_covering_segment_scans_total
+            .store(0, Ordering::Relaxed);
+        self.search_hnsw_deferred_beam_admission_segment_searches_total
+            .store(0, Ordering::Relaxed);
+        self.search_hnsw_unfiltered_graph_segment_searches_total
+            .store(0, Ordering::Relaxed);
+        self.search_hnsw_masked_graph_segment_searches_total
+            .store(0, Ordering::Relaxed);
+        self.search_hnsw_adaptive_graph_segment_searches_total
+            .store(0, Ordering::Relaxed);
+        self.search_hnsw_predicate_topology_segment_searches_total
+            .store(0, Ordering::Relaxed);
+        self.search_hnsw_predicate_refined_segment_searches_total
+            .store(0, Ordering::Relaxed);
+        self.search_hnsw_exact_fallback_segment_searches_total
+            .store(0, Ordering::Relaxed);
+        self.search_hnsw_integrity_scheduled_total
+            .store(0, Ordering::Relaxed);
+        self.search_hnsw_integrity_completed_total
+            .store(0, Ordering::Relaxed);
+        self.search_hnsw_integrity_failed_total
+            .store(0, Ordering::Relaxed);
+        self.search_hnsw_integrity_stale_total
+            .store(0, Ordering::Relaxed);
+        self.search_hnsw_integrity_deferred_total
+            .store(0, Ordering::Relaxed);
+        self.search_hnsw_integrity_verified_bytes_total
+            .store(0, Ordering::Relaxed);
         self.column_read_by_rowids_page_run_seeks_total
             .store(0, Ordering::Relaxed);
         self.txn_spill_bytes.store(0, Ordering::Relaxed);
@@ -1653,6 +1875,14 @@ mod tests {
             provider: SearchIndexKind::FullText,
         };
         m.record_search_row_fetch(row_fetch_key, 3, 2, 1, 2, 1, 1, 96, 4, 7);
+        m.record_search_hnsw_work(
+            123,
+            HnswSearchOutcome::new(HnswSearchPath::AdaptiveGraph)
+                .with_predicate_admission(HnswPredicateAdmissionMode::DeferredGlobalBeam)
+                .with_predicate_topology(true)
+                .with_predicate_refinement(true)
+                .with_exact_fallback(HnswExactScanKind::PredicateCovering),
+        );
         m.add_column_read_by_rowids_page_run_seeks(3);
 
         let snap = m.snapshot();
@@ -1672,6 +1902,19 @@ mod tests {
         assert_eq!(snap.memtable_backpressure_count, 1);
         assert_eq!(snap.memtable_backpressure_ns, 30);
         assert_eq!(snap.delta_writer_commit_ns, 10);
+        assert_eq!(snap.search_hnsw_scored_points_total, 123);
+        assert_eq!(snap.search_hnsw_adaptive_graph_segment_searches_total, 1);
+        assert_eq!(snap.search_hnsw_predicate_covering_segment_scans_total, 1);
+        assert_eq!(
+            snap.search_hnsw_deferred_beam_admission_segment_searches_total,
+            1
+        );
+        assert_eq!(
+            snap.search_hnsw_predicate_topology_segment_searches_total,
+            1
+        );
+        assert_eq!(snap.search_hnsw_predicate_refined_segment_searches_total, 1);
+        assert_eq!(snap.search_hnsw_exact_fallback_segment_searches_total, 1);
         assert_eq!(snap.delta_writer_commit_count, 1);
         assert_eq!(snap.delta_writer_flush_ns, 20);
         assert_eq!(snap.delta_writer_flush_count, 1);

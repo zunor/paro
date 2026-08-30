@@ -15,7 +15,9 @@ use paro_execution::query_executor::compiled::{
     CompiledStatement, ExecutionRequest, ResultColumnDesc,
 };
 use paro_execution::query_executor::executor::Executor;
-use paro_parser::ast::{Statement, VariableShowStmt};
+use paro_parser::ast::{Expr, Statement, VariableShowStmt};
+use paro_parser::StatementVisitor;
+use paro_planner::binder::bind::type_name::bind_logical_type;
 use std::sync::Arc;
 use tracing::{debug, error};
 
@@ -205,8 +207,8 @@ async fn execute_parse<R: ExtendedQueryResponder>(
 
     let entry = PreparedStatementEntry {
         name: message.name.clone().unwrap_or_default(),
-        source_sql: message.query,
-        raw_stmt,
+        source_sql: message.query.into(),
+        raw_stmt: Arc::new(raw_stmt),
         parameter_types,
         result_schema,
         generic_plan,
@@ -214,6 +216,7 @@ async fn execute_parse<R: ExtendedQueryResponder>(
         source: PreparedStatementSource::Protocol,
     };
 
+    let is_named_statement = message.name.is_some();
     match message.name {
         Some(name) => {
             if session.state.has_prepared_statement(&name) {
@@ -228,7 +231,9 @@ async fn execute_parse<R: ExtendedQueryResponder>(
         }
     }
 
-    session.refresh_session_metadata();
+    if is_named_statement {
+        session.refresh_prepared_statement_metadata();
+    }
     responder.send_parse_complete().await
 }
 
@@ -248,8 +253,8 @@ fn reusable_unnamed_parse_artifacts(
 ) -> Option<(Vec<ResultColumnDesc>, Option<CompiledStatement>)> {
     let previous = session.state.unnamed_prepared_statement()?;
     if previous.source != PreparedStatementSource::Protocol
-        || previous.source_sql != sql
-        || previous.raw_stmt != *stmt
+        || previous.source_sql.as_ref() != sql
+        || previous.raw_stmt.as_ref() != stmt
         || previous.parameter_types != parameter_types
     {
         return None;
@@ -270,6 +275,8 @@ async fn execute_bind<R: ExtendedQueryResponder>(
     message: BindMessage,
     responder: &mut R,
 ) -> Result<()> {
+    let is_named_statement = message.statement_name.is_some();
+    let is_named_portal = message.portal_name.is_some();
     let statement = statement_entry(session, message.statement_name.as_deref())?.clone();
     let parameter_env = decode_bind_parameters(
         &statement.parameter_types,
@@ -293,7 +300,7 @@ async fn execute_bind<R: ExtendedQueryResponder>(
             PortalKind::Utility(Box::new(utility_command_from_statement(bound_stmt)))
         }
         StatementClass::Query if is_client_copy(&statement.raw_stmt) => PortalKind::ClientCopy {
-            stmt: Box::new(statement.raw_stmt.clone()),
+            stmt: Box::new(statement.raw_stmt.as_ref().clone()),
             parameter_env: parameter_env.clone(),
         },
         StatementClass::Query => {
@@ -328,9 +335,11 @@ async fn execute_bind<R: ExtendedQueryResponder>(
         source_sql: statement.source_sql.clone(),
         raw_stmt: statement.raw_stmt.clone(),
         holdability: CursorHoldability::WithoutHold,
-        scroll_mode: ScrollMode::Scroll,
-        result_formats,
-        result_schema: portal_result_schema,
+        // Protocol portals are forward-only. SQL DECLARE CURSOR is the path that
+        // opts into scrollability and materialization.
+        scroll_mode: ScrollMode::NoScroll,
+        result_formats: result_formats.into(),
+        result_schema: portal_result_schema.into(),
         kind,
         execution_state: PortalExecutionState::Ready,
         snapshot_retention: None,
@@ -359,7 +368,12 @@ async fn execute_bind<R: ExtendedQueryResponder>(
         }
     }
 
-    session.refresh_session_metadata();
+    if is_named_statement {
+        session.refresh_prepared_statement_metadata();
+    }
+    if is_named_portal {
+        session.refresh_cursor_metadata();
+    }
     responder.send_bind_complete().await
 }
 
@@ -447,14 +461,16 @@ async fn execute_portal<R: ExtendedQueryResponder>(
             if !completion.is_transaction_control() {
                 session.command_counter_increment();
             }
-            overwrite_portal_entry(session, message.name.as_deref(), portal);
-            session.refresh_session_metadata();
         }
-        Ok(PortalProgress::Suspended) => {
-            overwrite_portal_entry(session, message.name.as_deref(), portal);
-            session.refresh_session_metadata();
-        }
+        Ok(PortalProgress::Suspended) => {}
         Err(_) => {}
+    }
+
+    if result.is_ok() {
+        overwrite_portal_entry(session, message.name.as_deref(), portal);
+    }
+    if message.name.is_some() && result.is_ok() {
+        session.refresh_cursor_metadata();
     }
 
     result.map(|_| ())
@@ -465,10 +481,14 @@ async fn execute_close<R: ExtendedQueryResponder>(
     target: CloseTarget,
     responder: &mut R,
 ) -> Result<()> {
+    let mut refresh_prepared = false;
+    let mut refresh_cursors = false;
     match target {
         CloseTarget::Statement(name) => match name.as_deref() {
             Some(name) => {
                 let _ = session.state.remove_prepared_statement(name);
+                refresh_prepared = true;
+                refresh_cursors = true;
             }
             None => {
                 let _ = session.state.remove_unnamed_prepared_statement();
@@ -477,6 +497,7 @@ async fn execute_close<R: ExtendedQueryResponder>(
         CloseTarget::Portal(name) => match name.as_deref() {
             Some(name) => {
                 let _ = session.state.remove_portal(name);
+                refresh_cursors = true;
             }
             None => {
                 let _ = session.state.remove_unnamed_portal();
@@ -484,7 +505,12 @@ async fn execute_close<R: ExtendedQueryResponder>(
         },
     }
 
-    session.refresh_session_metadata();
+    if refresh_prepared {
+        session.refresh_prepared_statement_metadata();
+    }
+    if refresh_cursors {
+        session.refresh_cursor_metadata();
+    }
     responder.send_close_complete().await
 }
 
@@ -569,7 +595,11 @@ fn select_protocol_query_plan(
         },
         session.compile_scope_cancellation(),
     );
-    build_query_plan(snapshot, statement.raw_stmt.clone(), &parameter_types)
+    build_query_plan(
+        snapshot,
+        statement.raw_stmt.as_ref().clone(),
+        &parameter_types,
+    )
 }
 
 fn resolve_parse_parameter_types(
@@ -588,7 +618,61 @@ fn resolve_parse_parameter_types(
     for (index, oid) in type_oids.iter().enumerate() {
         parameter_types[index] = logical_type_from_pg_oid(*oid)?;
     }
+    for (index, inferred) in infer_cast_parameter_types(stmt, placeholder_count)?
+        .into_iter()
+        .enumerate()
+    {
+        if parameter_types[index].is_none() {
+            parameter_types[index] = inferred;
+        }
+    }
     Ok(parameter_types)
+}
+
+fn infer_cast_parameter_types(
+    stmt: &Statement,
+    parameter_count: usize,
+) -> Result<Vec<Option<LogicalType>>> {
+    let mut hints = Vec::new();
+    let mut visitor = StatementVisitor::new(
+        |expr| match expr {
+            Expr::Cast {
+                expr, target_type, ..
+            }
+            | Expr::TryCast {
+                expr, target_type, ..
+            } => {
+                if let Expr::Parameter { index, .. } = expr.as_ref() {
+                    hints.push((*index, target_type.clone()));
+                }
+            }
+            _ => {}
+        },
+        |_| {},
+    );
+    visitor.visit(stmt);
+
+    let mut inferred = vec![None; parameter_count];
+    for (index, target_type) in hints {
+        let logical_type = bind_logical_type(&target_type)?;
+        let Some(slot) = inferred.get_mut(index) else {
+            return Err(paro_error::protocol_violation(format!(
+                "parameter ${} exceeds the statement parameter signature",
+                index + 1
+            )));
+        };
+        if slot
+            .as_ref()
+            .is_some_and(|existing| existing != &logical_type)
+        {
+            return Err(paro_error::type_mismatch(format!(
+                "parameter ${} has conflicting cast targets",
+                index + 1
+            )));
+        }
+        *slot = Some(logical_type);
+    }
+    Ok(inferred)
 }
 
 fn decode_bind_parameters(
@@ -687,6 +771,25 @@ async fn execute_query_portal<R: ExtendedQueryResponder>(
             )
             .await;
         }
+        if message.max_rows <= 0 && matches!(portal.scroll_mode, ScrollMode::NoScroll) {
+            let executor = Executor::new(snapshot);
+            session.set_executor(executor);
+            let mut stream = session.get_executor().execute(execution)?;
+            let mut row_count = 0usize;
+            while let Some(chunk) = stream.fetch()? {
+                row_count = row_count.saturating_add(chunk.size());
+                responder
+                    .send_data_chunk(chunk, &portal.result_schema, &portal.result_formats)
+                    .await?;
+            }
+            portal.execution_state = PortalExecutionState::Exhausted {
+                position: row_count as i64,
+            };
+            portal.snapshot_retention = None;
+            let completion = infer_statement_completion(&portal.raw_stmt, row_count);
+            responder.send_command_complete(&completion).await?;
+            return Ok(PortalProgress::Complete(completion));
+        }
         let materialized =
             materialize_compiled_statement(session, snapshot.clone(), execution).await?;
         portal.execution_state = PortalExecutionState::Active(PortalCursor {
@@ -753,8 +856,8 @@ fn revalidate_portal_execution(
     }
 
     let parameter_types = execution.statement().parameter_types().to_vec();
-    let plan = build_query_plan(snapshot, portal.raw_stmt.clone(), &parameter_types)?;
-    if plan.result_schema() != portal.result_schema {
+    let plan = build_query_plan(snapshot, portal.raw_stmt.as_ref().clone(), &parameter_types)?;
+    if plan.result_schema() != portal.result_schema.as_ref() {
         return Err(ParoError::new(paro_error::ErrorData::new(
             paro_error::Severity::Error,
             paro_error::codes::feature::FEATURE_NOT_SUPPORTED,
@@ -1255,6 +1358,11 @@ mod tests {
             }
             Ok(Some(self.responder.copy_in_payload.remove(0)))
         }
+
+        async fn abort(&mut self) -> Result<()> {
+            self.responder.copy_in_payload.clear();
+            Ok(())
+        }
     }
 
     async fn exec_simple_ok(session: &mut Session, sink: &mut CollectingSink, sql: &str) {
@@ -1384,12 +1492,49 @@ mod tests {
         assert_eq!(
             statement.result_schema,
             utility_result_schema(&UtilityCommand::VariableShow(
-                match statement.raw_stmt.clone() {
+                match statement.raw_stmt.as_ref().clone() {
                     Statement::VariableShow(stmt) => stmt,
                     other => panic!("expected show statement, got {other:?}"),
                 }
             ))
         );
+    }
+
+    #[tokio::test]
+    async fn portal_progress_cannot_resurrect_a_removed_portal() {
+        let instance = paro_instance::Instance::new_in_memory();
+        let mut session = Session::new(1, instance);
+        let mut responder = TestResponder::default();
+
+        execute_extended_query_message(
+            &mut session,
+            ExtendedQueryMessage::Parse(ParseMessage {
+                name: Some("s1".to_string()),
+                query: "SELECT 1".to_string(),
+                type_oids: Vec::new(),
+            }),
+            &mut responder,
+        )
+        .await
+        .unwrap();
+        execute_extended_query_message(
+            &mut session,
+            ExtendedQueryMessage::Bind(BindMessage {
+                portal_name: Some("p1".to_string()),
+                statement_name: Some("s1".to_string()),
+                parameter_format_codes: Vec::new(),
+                parameters: Vec::new(),
+                result_column_format_codes: Vec::new(),
+            }),
+            &mut responder,
+        )
+        .await
+        .unwrap();
+
+        let detached_progress = portal_entry(&session, Some("p1")).unwrap().clone();
+        session.state.remove_portal("p1");
+        overwrite_portal_entry(&mut session, Some("p1"), detached_progress);
+        assert!(session.state.get_portal("p1").is_none());
     }
 
     #[tokio::test]
@@ -1402,7 +1547,7 @@ mod tests {
             &mut session,
             ExtendedQueryMessage::Parse(ParseMessage {
                 name: Some("s1".to_string()),
-                query: "SELECT ? + 1".to_string(),
+                query: "SELECT $1 + 1".to_string(),
                 type_oids: vec![INT4OID],
             }),
             &mut responder,
@@ -1540,7 +1685,7 @@ mod tests {
             &mut session,
             ExtendedQueryMessage::Parse(ParseMessage {
                 name: Some("s1".to_string()),
-                query: "INSERT INTO portal_insert_t VALUES (?)".to_string(),
+                query: "INSERT INTO portal_insert_t VALUES ($1)".to_string(),
                 type_oids: vec![INT4OID],
             }),
             &mut responder,
@@ -1900,7 +2045,7 @@ mod tests {
             &mut session,
             ExtendedQueryMessage::Parse(ParseMessage {
                 name: Some("s1".to_string()),
-                query: "SELECT ? + 1".to_string(),
+                query: "SELECT $1 + 1".to_string(),
                 type_oids: vec![INT4OID],
             }),
             &mut responder,
@@ -1952,7 +2097,7 @@ mod tests {
             &mut session,
             ExtendedQueryMessage::Parse(ParseMessage {
                 name: Some("s1".to_string()),
-                query: "SELECT ?".to_string(),
+                query: "SELECT $1".to_string(),
                 type_oids: Vec::new(),
             }),
             &mut responder,
@@ -2014,7 +2159,7 @@ mod tests {
             &mut session,
             ExtendedQueryMessage::Parse(ParseMessage {
                 name: Some("s1".to_string()),
-                query: "SELECT ? + 1".to_string(),
+                query: "SELECT $1 + 1".to_string(),
                 type_oids: vec![INT4OID],
             }),
             &mut responder,
@@ -2060,7 +2205,7 @@ mod tests {
             &mut session,
             ExtendedQueryMessage::Parse(ParseMessage {
                 name: Some("s1".to_string()),
-                query: "SELECT ?".to_string(),
+                query: "SELECT $1".to_string(),
                 type_oids: vec![INT4OID],
             }),
             &mut responder,
@@ -2103,7 +2248,7 @@ mod tests {
             &mut session,
             ExtendedQueryMessage::Parse(ParseMessage {
                 name: Some("s1".to_string()),
-                query: "SELECT ? + 1".to_string(),
+                query: "SELECT $1 + 1".to_string(),
                 type_oids: vec![INT4OID],
             }),
             &mut responder,
@@ -2246,7 +2391,7 @@ mod tests {
             &mut session,
             ExtendedQueryMessage::Parse(ParseMessage {
                 name: Some("s1".to_string()),
-                query: "SELECT ?".to_string(),
+                query: "SELECT $1".to_string(),
                 type_oids: vec![NUMERICOID],
             }),
             &mut responder,

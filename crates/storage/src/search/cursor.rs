@@ -1,9 +1,11 @@
 // Copyright 2024-2026 Zunor
 // SPDX-License-Identifier: Apache-2.0
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::sync::Arc;
 
+use crate::buffer::PageCache;
+use crate::rowset::SegmentOptions;
 use crate::rowset::{RowsetId, RowsetSharedPtr, SegmentSharedPtr};
 use crate::tablet::{TabletReadGuard, TabletRef};
 use crate::transaction::overlay_reader::OverlayDeleteVectorMap;
@@ -11,13 +13,15 @@ use paro_common::error::{self as paro_error, Result};
 use paro_transaction::{DerivedLagLease, RetentionLeaseInfo};
 
 use super::budget::{ResourceBudget, SearchBatchConfig};
-use super::capability::{CoverageState, SearchArtifactRef, SearchIndexKind};
+use super::capability::{ArtifactSegmentRef, CoverageState, SearchArtifactRef, SearchIndexKind};
 use super::request::NormalizedSearchRequest;
+use super::sidecar::SearchReaderRuntime;
 use super::stats::{
     BuildEpoch, GenerationMaintenanceState, GenerationStats, SearchDefinitionId,
     SearchGenerationId, SearchSourceId, SegmentId, TableId,
 };
 use super::tail::exact_merge::TailWindow;
+use super::tail::{TailMutationKind, TailPendingEntry};
 
 pub use crate::rowset::PhysicalRowRef;
 
@@ -28,12 +32,62 @@ pub struct TableReadSnapshot {
     pub visible_version: i64,
 }
 
+/// Runtime resources used while opening a search read snapshot.
+///
+/// Search candidates and their late-materialized projection must resolve
+/// through the same governed storage cache as ordinary scans. Keeping this
+/// contract explicit prevents a search provider from silently reopening
+/// segments with ungoverned/default readers.
+#[derive(Debug, Clone)]
+pub struct SearchReadOptions {
+    page_cache: Option<Arc<PageCache>>,
+    cache_decoded: bool,
+}
+
+impl SearchReadOptions {
+    /// Explicitly opt out of governed page caching. Intended for tests,
+    /// maintenance utilities, and benchmarks that isolate storage behavior.
+    /// Production query paths should use [`Self::with_page_cache`].
+    pub fn ungoverned() -> Self {
+        Self {
+            page_cache: None,
+            cache_decoded: false,
+        }
+    }
+
+    /// Use the instance page cache for physical and codec-decoded pages.
+    /// Decoded admission is globally budgeted and evicted by `PageCache`.
+    pub fn with_page_cache(page_cache: Arc<PageCache>) -> Self {
+        Self {
+            page_cache: Some(page_cache),
+            cache_decoded: true,
+        }
+    }
+
+    pub(crate) fn buffer_pool(&self) -> Option<Arc<crate::buffer::BufferPool>> {
+        self.page_cache.as_ref().map(|cache| cache.buffer_pool())
+    }
+
+    fn segment_options(&self) -> SegmentOptions {
+        let mut options = SegmentOptions::default().with_cache_decoded(self.cache_decoded);
+        if let Some(page_cache) = &self.page_cache {
+            options = options.with_page_cache(page_cache.clone());
+        }
+        options
+    }
+}
+
 #[derive(Debug, Clone)]
 pub(crate) struct VisibleSegment {
     pub(crate) rowset: RowsetSharedPtr,
     pub(crate) rowset_id: RowsetId,
     pub(crate) segment_id: SegmentId,
     pub(crate) segment: SegmentSharedPtr,
+    /// Durable rowset metadata proves whether opening a snapshot delete vector
+    /// can possibly change admission. Keeping the proof on the read lease lets
+    /// unfiltered, append-only generations bypass per-segment delete-vector
+    /// probes without weakening snapshot semantics.
+    pub(crate) has_persistent_deletes: bool,
 }
 
 impl VisibleSegment {
@@ -58,6 +112,7 @@ impl TableReadLease {
         tablet: &TabletRef,
         table_id: TableId,
         visible_version: i64,
+        options: &SearchReadOptions,
     ) -> Result<(TableReadSnapshot, Arc<Self>)> {
         let guard = Arc::new(TabletReadGuard::pin(tablet, visible_version)?);
         let rowsets = tablet.capture_consistent_rowsets(visible_version)?;
@@ -68,6 +123,7 @@ impl TableReadLease {
             guard,
             rowsets,
             Vec::new(),
+            options,
         )
     }
 
@@ -76,6 +132,7 @@ impl TableReadLease {
         table_id: TableId,
         visible_version: i64,
         overlay_rowsets: Vec<RowsetSharedPtr>,
+        options: &SearchReadOptions,
     ) -> Result<(TableReadSnapshot, Arc<Self>)> {
         let guard = Arc::new(TabletReadGuard::pin(tablet, visible_version)?);
         let mut rowsets = tablet.capture_consistent_rowsets(visible_version)?;
@@ -93,6 +150,7 @@ impl TableReadLease {
             guard,
             rowsets,
             overlay_rowset_ids,
+            options,
         )
     }
 
@@ -103,19 +161,22 @@ impl TableReadLease {
         guard: Arc<TabletReadGuard>,
         rowsets: Vec<RowsetSharedPtr>,
         overlay_rowset_ids: Vec<RowsetId>,
+        options: &SearchReadOptions,
     ) -> Result<(TableReadSnapshot, Arc<Self>)> {
         let mut visible_segments = Vec::new();
         let mut segment_index = HashMap::new();
+        let segment_options = options.segment_options();
         for rowset in rowsets {
-            rowset.load()?;
             let rowset_id = rowset.rowset_id();
-            for segment in rowset.segments() {
+            let has_persistent_deletes = rowset.rowset_meta().num_deleted_rows() != 0;
+            for segment in rowset.open_segment_view(segment_options.clone())? {
                 let segment_id = segment.segment_id();
                 let entry = VisibleSegment {
                     rowset: rowset.clone(),
                     rowset_id,
                     segment_id,
                     segment,
+                    has_persistent_deletes,
                 };
                 segment_index.insert(entry.key(), entry.segment.clone());
                 visible_segments.push(entry);
@@ -197,6 +258,68 @@ pub struct GenerationArtifactSet {
     pub artifacts: Vec<SearchArtifactRef>,
 }
 
+impl GenerationArtifactSet {
+    pub fn try_new(artifacts: Vec<SearchArtifactRef>) -> Result<Self> {
+        let set = Self { artifacts };
+        set.validate()?;
+        Ok(set)
+    }
+
+    /// Prove that one generation exposes a non-overlapping partition cover for
+    /// each physical search column. Overlap is rejected at publication/open,
+    /// rather than left for providers to resolve with iteration order.
+    pub fn validate(&self) -> Result<()> {
+        let mut generation_identity = None;
+        let mut covered = BTreeMap::<(SearchIndexKind, u32), BTreeSet<_>>::new();
+        for artifact in &self.artifacts {
+            artifact.validate()?;
+            let identity = (
+                artifact.definition_id,
+                artifact.generation_id,
+                artifact.kind,
+                artifact.provider_variant,
+            );
+            if generation_identity.is_some_and(|current| current != identity) {
+                return Err(paro_error::data_corrupted(
+                    "search artifact set mixes definition, generation, provider kind, or provider variant identities",
+                ));
+            }
+            generation_identity = Some(identity);
+            let segments = covered
+                .entry((artifact.kind, artifact.column_id))
+                .or_default();
+            for span in artifact.coverage.segments() {
+                if !segments.insert(span.segment) {
+                    return Err(paro_error::data_corrupted(format!(
+                        "search generation has overlapping partitions for {:?} column {} at segment {}/{}",
+                        artifact.kind,
+                        artifact.column_id,
+                        span.segment.rowset_id,
+                        span.segment.segment_id
+                    )));
+                }
+            }
+        }
+        Ok(())
+    }
+
+    pub fn validate_for_generation(
+        &self,
+        definition_id: SearchDefinitionId,
+        generation_id: SearchGenerationId,
+    ) -> Result<()> {
+        self.validate()?;
+        if self.artifacts.iter().any(|artifact| {
+            artifact.definition_id != definition_id || artifact.generation_id != generation_id
+        }) {
+            return Err(paro_error::data_corrupted(format!(
+                "search artifact set does not belong to definition {definition_id} generation {generation_id}"
+            )));
+        }
+        Ok(())
+    }
+}
+
 #[derive(Clone)]
 pub struct GenerationReadLease {
     pub definition_id: SearchDefinitionId,
@@ -242,7 +365,7 @@ impl PartialEq for GenerationReadLease {
 
 impl Eq for GenerationReadLease {}
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone)]
 pub struct GenerationReadSnapshot {
     pub definition_id: SearchDefinitionId,
     pub generation_id: SearchGenerationId,
@@ -252,7 +375,36 @@ pub struct GenerationReadSnapshot {
     pub coverage: CoverageState,
     pub generation_stats: GenerationStats,
     pub maintenance_state: GenerationMaintenanceState,
+    /// Immutable provider configuration used to make query-wide execution
+    /// decisions at the same generation boundary as the artifacts.
+    pub provider_config: Arc<serde_json::Value>,
+    /// Prevalidated HNSW contract. Present iff the generation provider is HNSW.
+    pub hnsw_provider_config: Option<Arc<super::HnswProviderConfig>>,
+    /// Runtime-only, definition-owned activity used to gate optional graph
+    /// replacement without coupling unrelated tables through a process global.
+    pub(crate) hnsw_query_activity: Option<Arc<crate::index::hnsw::HnswQueryActivity>>,
     pub artifacts: Arc<GenerationArtifactSet>,
+    /// Exact physical tail identity published with the generation manifest.
+    /// Counts in `coverage` are observability/admission summaries; query
+    /// correctness and resource governance use these immutable entries.
+    pub tail_pending_entries: Arc<[TailPendingEntry]>,
+}
+
+impl PartialEq for GenerationReadSnapshot {
+    fn eq(&self, other: &Self) -> bool {
+        self.definition_id == other.definition_id
+            && self.generation_id == other.generation_id
+            && self.build_epoch == other.build_epoch
+            && self.build_snapshot_version == other.build_snapshot_version
+            && self.indexed_through_ts == other.indexed_through_ts
+            && self.coverage == other.coverage
+            && self.generation_stats == other.generation_stats
+            && self.maintenance_state == other.maintenance_state
+            && self.provider_config == other.provider_config
+            && self.hnsw_provider_config == other.hnsw_provider_config
+            && self.artifacts == other.artifacts
+            && self.tail_pending_entries == other.tail_pending_entries
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -262,8 +414,12 @@ pub struct SearchReadSnapshot {
     pub generation: GenerationReadSnapshot,
     pub table_lease: Arc<TableReadLease>,
     pub generation_lease: Arc<GenerationReadLease>,
+    /// Table-scoped owner for immutable provider readers. Cursors borrow this
+    /// runtime so mmap/decoder state survives individual query lifetimes.
+    pub reader_runtime: Arc<SearchReaderRuntime>,
     derived_lag_lease: Option<Arc<DerivedLagLease>>,
     overlay_delete_vectors: Option<Arc<OverlayDeleteVectorMap>>,
+    tail_segments: BTreeSet<ArtifactSegmentRef>,
     tail_window: TailWindow,
 }
 
@@ -274,11 +430,27 @@ impl SearchReadSnapshot {
         generation: GenerationReadSnapshot,
         table_lease: Arc<TableReadLease>,
         generation_lease: Arc<GenerationReadLease>,
+        reader_runtime: Arc<SearchReaderRuntime>,
     ) -> Self {
+        let tail_segments = generation
+            .tail_pending_entries
+            .iter()
+            .filter(|entry| entry.mutation != TailMutationKind::Delete)
+            .flat_map(|entry| {
+                entry
+                    .segment_ids
+                    .iter()
+                    .map(|segment_id| ArtifactSegmentRef {
+                        rowset_id: entry.rowset_id,
+                        segment_id: *segment_id,
+                    })
+            })
+            .collect::<BTreeSet<_>>();
         let tail_window = TailWindow::from_segments(
             generation.indexed_through_ts,
             table.visible_version,
             table_lease.visible_segments(),
+            &tail_segments,
             |rowset_id| table_lease.is_overlay_rowset(rowset_id),
         );
         Self {
@@ -287,8 +459,10 @@ impl SearchReadSnapshot {
             generation,
             table_lease,
             generation_lease,
+            reader_runtime,
             derived_lag_lease: None,
             overlay_delete_vectors: None,
+            tail_segments,
             tail_window,
         }
     }
@@ -332,13 +506,22 @@ impl SearchReadSnapshot {
         self.generation.artifacts.artifacts.iter().find(|artifact| {
             artifact.kind == kind
                 && artifact.column_id == column_id
-                && artifact.segment.rowset_id == segment.rowset_id
-                && artifact.segment.segment_id == segment.segment_id
+                && artifact.coverage.singleton_segment()
+                    == Some(super::capability::ArtifactSegmentRef {
+                        rowset_id: segment.rowset_id,
+                        segment_id: segment.segment_id,
+                    })
         })
     }
 
     pub(crate) fn is_tail_segment(&self, segment: &VisibleSegment) -> bool {
         if self.table_lease.is_overlay_rowset(segment.rowset_id) {
+            return true;
+        }
+        if self.tail_segments.contains(&ArtifactSegmentRef {
+            rowset_id: segment.rowset_id,
+            segment_id: segment.segment_id,
+        }) {
             return true;
         }
         let rowset_end = segment.rowset.end_version();
@@ -424,6 +607,60 @@ pub trait SearchCursor: Send {
     ) -> Result<SearchBatchState>;
 }
 
+#[cfg(test)]
+mod read_options_tests {
+    use super::*;
+    use crate::buffer::BufferPool;
+    use crate::table::table_factory::TableFactory;
+    use crate::test_utils::{test_chunk_from_vectors, test_i32_vector};
+    use paro_common::types::LogicalType;
+
+    #[test]
+    fn search_read_options_retain_sparse_projection_in_governed_cache() {
+        let table = TableFactory::default()
+            .create_table(&[LogicalType::Integer])
+            .expect("create table");
+        let values = (0..4096).collect::<Vec<i32>>();
+        table
+            .append(&test_chunk_from_vectors(vec![test_i32_vector(&values)]))
+            .expect("append rows");
+
+        let pool = BufferPool::new_arc(4 * 1024 * 1024);
+        let cache = Arc::new(PageCache::new(pool.clone()));
+        let options = SearchReadOptions::with_page_cache(cache.clone());
+        let (_, lease) = TableReadLease::open(
+            &table.tablet(),
+            table.table_id(),
+            table.max_version(),
+            &options,
+        )
+        .expect("open search read lease");
+        let segment = lease
+            .visible_segments()
+            .first()
+            .expect("visible segment")
+            .segment
+            .clone();
+
+        // The first sparse access establishes probation; the second promotes
+        // the decoded BitShuffle page into the globally governed cache.
+        segment
+            .read_by_rowids(&[0], &[3, 97])
+            .expect("first sparse projection");
+        assert_eq!(cache.stats().decoded_entries, 0);
+        segment
+            .read_by_rowids(&[0], &[3, 97])
+            .expect("repeated sparse projection");
+        let stats = cache.stats();
+        assert!(stats.decoded_entries > 0);
+        assert!(stats.decoded_bytes > 0);
+        assert!(
+            pool.get_tag_usage(paro_common::allocator::MemoryTag::DecodedPageCache) > 0,
+            "decoded page must be charged to the buffer pool"
+        );
+    }
+}
+
 pub trait SearchProvider: Send + Sync {
     fn open_cursor(
         &self,
@@ -438,10 +675,11 @@ mod tests {
 
     use super::{
         CandidateBatch, GenerationArtifactSet, GenerationReadLease, GenerationReadSnapshot,
-        PhysicalRowRef, SearchReadSnapshot, TableReadLease,
+        PhysicalRowRef, SearchReadOptions, SearchReadSnapshot, TableReadLease,
     };
     use crate::search::capability::{CoverageState, SearchIndexKind};
     use crate::search::stats::{GenerationMaintenanceState, GenerationStats};
+    use crate::search::{SearchReaderRuntime, SidecarArtifactStore};
     use crate::table::table_factory::TableFactory;
     use paro_common::types::LogicalType;
     use paro_transaction::{CommitTs, RetentionLeaseKind, RetentionRegistry};
@@ -489,9 +727,13 @@ mod tests {
             .create_table(&[LogicalType::Integer])
             .expect("create table");
         let visible_version = table.max_version();
-        let (table_snapshot, table_lease) =
-            TableReadLease::open(&table.tablet(), table.tablet_id(), visible_version)
-                .expect("open table lease");
+        let (table_snapshot, table_lease) = TableReadLease::open(
+            &table.tablet(),
+            table.tablet_id(),
+            visible_version,
+            &SearchReadOptions::ungoverned(),
+        )
+        .expect("open table lease");
         let generation = GenerationReadSnapshot {
             definition_id: 5,
             generation_id: 6,
@@ -501,7 +743,11 @@ mod tests {
             coverage: CoverageState::Complete,
             generation_stats: GenerationStats::default(),
             maintenance_state: GenerationMaintenanceState::default(),
+            provider_config: Arc::new(serde_json::Value::Null),
+            hnsw_provider_config: None,
+            hnsw_query_activity: None,
             artifacts: Arc::new(GenerationArtifactSet::default()),
+            tail_pending_entries: Arc::from([]),
         };
         let generation_lease = GenerationReadLease::from_snapshot(&generation);
 
@@ -518,6 +764,9 @@ mod tests {
             generation,
             table_lease,
             generation_lease,
+            Arc::new(SearchReaderRuntime::new(SidecarArtifactStore::new(
+                table.tablet().data_dir().clone(),
+            ))),
         )
         .with_derived_lag_lease(Some(derived_lag_lease));
         assert_eq!(snapshot.table_lease.table_id, table.tablet_id());

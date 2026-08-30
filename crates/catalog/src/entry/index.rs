@@ -14,6 +14,7 @@ use super::catalog_entry::{
 use paro_common::error::{self as paro_error, Result};
 use paro_common::types::LogicalType;
 use paro_storage::index::IndexConstraintType;
+use serde_json::Value;
 use std::collections::HashMap;
 use std::io::{Cursor, Read, Write};
 use std::sync::{Arc, LazyLock, RwLock, Weak};
@@ -226,6 +227,11 @@ pub struct CreateIndexInfo {
     pub failure_reason: Option<String>,
     /// Optional full-text metadata used by planner/runtime matching.
     pub fulltext: Option<FullTextIndexBinding>,
+    /// Provider-owned, persistent index configuration.
+    ///
+    /// This is the single source of truth for physical build and query policy.
+    /// Runtime registration must not reconstruct it from table-column defaults.
+    pub provider_config: Value,
     /// Optional coverage snapshot used to guard optimizer pushdown.
     pub coverage: Option<IndexCoverage>,
 }
@@ -254,6 +260,7 @@ impl CreateIndexInfo {
             build_state: IndexBuildState::Building,
             failure_reason: None,
             fulltext: None,
+            provider_config: Value::Object(Default::default()),
             coverage: None,
         }
     }
@@ -317,6 +324,11 @@ impl CreateIndexInfo {
         self
     }
 
+    pub fn with_provider_config(mut self, provider_config: Value) -> Self {
+        self.provider_config = provider_config;
+        self
+    }
+
     pub fn with_coverage(mut self, coverage: IndexCoverage) -> Self {
         self.coverage = Some(coverage);
         self
@@ -366,6 +378,8 @@ pub struct IndexCatalogEntry {
     pub failure_reason: RwLock<Option<String>>,
     /// Optional full-text metadata (config + source column).
     pub fulltext: Option<FullTextIndexBinding>,
+    /// Provider-owned, persistent index configuration.
+    pub provider_config: Value,
     /// Optional runtime coverage snapshot.
     pub coverage: RwLock<Option<IndexCoverage>>,
 }
@@ -426,6 +440,7 @@ impl IndexCatalogEntry {
             build_state: RwLock::new(info.build_state),
             failure_reason: RwLock::new(info.failure_reason),
             fulltext: info.fulltext,
+            provider_config: info.provider_config,
             coverage: RwLock::new(info.coverage),
         }
     }
@@ -601,6 +616,14 @@ impl IndexCatalogEntry {
             buffer.write_all(&[0u8])?;
         }
 
+        let provider_config = serde_json::to_vec(&self.provider_config).map_err(|err| {
+            paro_error::serialization_error(format!(
+                "Failed to serialize index provider config: {err}"
+            ))
+        })?;
+        buffer.write_all(&(provider_config.len() as u32).to_le_bytes())?;
+        buffer.write_all(&provider_config)?;
+
         Ok(buffer)
     }
 
@@ -720,27 +743,41 @@ impl IndexCatalogEntry {
             None
         };
 
-        let coverage = if (cursor.position() as usize) < bytes.len() {
-            cursor.read_exact(&mut byte_buf)?;
-            if byte_buf[0] == 1 {
-                let mut version_buf = [0u8; 8];
-                cursor.read_exact(&mut version_buf)?;
-                let visible_version = i64::from_le_bytes(version_buf);
-                cursor.read_exact(&mut len_buf)?;
-                let visible_segment_count = u32::from_le_bytes(len_buf);
-                cursor.read_exact(&mut len_buf)?;
-                let indexed_segment_count = u32::from_le_bytes(len_buf);
-                Some(IndexCoverage {
-                    visible_version,
-                    visible_segment_count,
-                    indexed_segment_count,
-                })
-            } else {
-                None
-            }
-        } else {
+        cursor.read_exact(&mut byte_buf)?;
+        let coverage = if byte_buf[0] == 1 {
+            let mut version_buf = [0u8; 8];
+            cursor.read_exact(&mut version_buf)?;
+            let visible_version = i64::from_le_bytes(version_buf);
+            cursor.read_exact(&mut len_buf)?;
+            let visible_segment_count = u32::from_le_bytes(len_buf);
+            cursor.read_exact(&mut len_buf)?;
+            let indexed_segment_count = u32::from_le_bytes(len_buf);
+            Some(IndexCoverage {
+                visible_version,
+                visible_segment_count,
+                indexed_segment_count,
+            })
+        } else if byte_buf[0] == 0 {
             None
+        } else {
+            return Err(paro_error::serialization_error(format!(
+                "Invalid index coverage tag: {}",
+                byte_buf[0]
+            )));
         };
+
+        cursor.read_exact(&mut len_buf)?;
+        let config_len = u32::from_le_bytes(len_buf) as usize;
+        let mut config_bytes = vec![0u8; config_len];
+        cursor.read_exact(&mut config_bytes)?;
+        let provider_config = serde_json::from_slice(&config_bytes).map_err(|err| {
+            paro_error::serialization_error(format!("Invalid index provider config: {err}"))
+        })?;
+        if cursor.position() as usize != bytes.len() {
+            return Err(paro_error::serialization_error(
+                "Trailing bytes in index catalog entry",
+            ));
+        }
 
         let mut deps = DependencyList::new();
         deps.add_dependency(
@@ -777,6 +814,7 @@ impl IndexCatalogEntry {
             build_state: RwLock::new(build_state),
             failure_reason: RwLock::new(failure_reason),
             fulltext,
+            provider_config,
             coverage: RwLock::new(coverage),
         })
     }
@@ -1034,6 +1072,21 @@ mod tests {
             vec![LogicalType::Varchar],
         )
         .with_index_type(IndexType::HNSW)
+        .with_provider_config(serde_json::json!({
+            "version": 1,
+            "dimension": 100,
+            "distance": "cosine",
+            "m": 24,
+            "ef_construct": 100,
+            "ef_search": 80,
+            "build_seed": 42,
+            "inline_threshold": {
+                "enabled": true,
+                "max_vector_count": 90_000,
+                "max_graph_memory_bytes": 268_435_456_u64,
+                "max_dimension": 100
+            }
+        }))
         .with_failure_reason("needs rebuild");
 
         let entry = IndexCatalogEntry::new(
@@ -1049,8 +1102,13 @@ mod tests {
         assert_eq!(restored.base.base.name, "idx_users_roundtrip");
         assert_eq!(restored.object_id(), entry.object_id());
         assert_eq!(restored.index_type, IndexType::HNSW);
+        assert_eq!(restored.provider_config, entry.provider_config);
         assert_eq!(restored.build_state(), IndexBuildState::Failed);
         assert_eq!(restored.failure_reason(), Some("needs rebuild".to_string()));
+
+        let mut with_trailing_bytes = bytes;
+        with_trailing_bytes.extend_from_slice(&[0xde, 0xad]);
+        assert!(IndexCatalogEntry::deserialize(&with_trailing_bytes, "main".to_string()).is_err());
     }
 
     #[test]

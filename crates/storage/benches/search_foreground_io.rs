@@ -13,8 +13,8 @@ use std::time::Instant;
 use divan::{black_box, Bencher};
 use paro_storage::search::bench_support::run_foreground_io_admission_bench;
 use paro_storage::search::{
-    ArtifactFileId, ArtifactLocation, SearchIndexKind, SidecarArtifactStore, SidecarReaderCache,
-    SidecarReaderRequest, SIDECAR_PACKAGE_CODEC,
+    ArtifactFileId, ArtifactLocation, SearchIndexKind, SidecarArtifactStore,
+    SidecarIntegrityPolicy, SidecarReaderCache, SidecarReaderRequest, SIDECAR_PACKAGE_CODEC,
 };
 use tempfile::TempDir;
 
@@ -250,6 +250,7 @@ fn touch_foreground_artifacts(cache: &SidecarReaderCache, artifacts: &[ArtifactL
                 artifact_format_version: 1,
                 provider: SearchIndexKind::FullText,
                 codec: SIDECAR_PACKAGE_CODEC,
+                integrity: SidecarIntegrityPolicy::EnvelopeChecksum,
             })
             .expect("open foreground sidecar artifact");
         for byte in artifact.bytes().iter().step_by(64) {

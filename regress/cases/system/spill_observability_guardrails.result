@@ -67,7 +67,7 @@ PROJECTION  (rows=1000)
   ->  HASH_JOIN  (rows=1000)
     Join Type: SEMI
     Build Index: integer_build_time
-    Join Condition: #0 = #0
+    Join Condition: l.id = r.id
     ->  ROWSET_SCAN on public.spill_h_join_l l  (rows=1000)
       Columns: id
     ->  ROWSET_SCAN on public.spill_h_join_r r  (rows=1000)

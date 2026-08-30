@@ -30,6 +30,11 @@ pub trait FunctionExecContext: Send + Sync {
         None
     }
 
+    /// Draw from the session-owned SQL random sequence.
+    fn next_random(&self) -> Option<f64> {
+        None
+    }
+
     fn is_interrupted(&self) -> bool {
         false
     }

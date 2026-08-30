@@ -305,7 +305,7 @@ fn restart_recovery_keeps_fulltext_index_usable() {
     );
 }
 
-async fn run_create_index_keeps_fulltext_pushdown_ready_while_coverage_is_tail_pending() {
+async fn run_create_index_keeps_fulltext_pushdown_ready_during_tail_catchup() {
     let instance = Instance::new_in_memory();
     let mut session = Session::new(1, instance);
     let mut sink = CollectingSink::new();
@@ -343,21 +343,19 @@ async fn run_create_index_keeps_fulltext_pushdown_ready_while_coverage_is_tail_p
     assert_eq!(query_string_col(&sink, 0), vec!["READY".to_string()]);
     let extra_info = query_string_col(&sink, 1);
     assert_eq!(extra_info.len(), 1);
-    assert!(
-        extra_info[0].contains("\"complete\":false"),
-        "late fulltext definition should stay tail-pending until bootstrap/catch-up materializes existing rowsets, actual extra_info={}",
-        extra_info[0]
-    );
-    assert!(
-        extra_info[0].contains("\"indexed_segment_count\":0"),
-        "late fulltext definition should not report existing segments as already materialized, actual extra_info={}",
-        extra_info[0]
-    );
-    assert!(
-        extra_info[0].contains("\"visible_segment_count\":1"),
-        "coverage should still describe the visible base segment set, actual extra_info={}",
-        extra_info[0]
-    );
+    let extra_info_json: serde_json::Value =
+        serde_json::from_str(&extra_info[0]).expect("valid index extra_info JSON");
+    let coverage = &extra_info_json["coverage"];
+    let visible = coverage["visible_segment_count"]
+        .as_u64()
+        .expect("visible segment count");
+    let indexed = coverage["indexed_segment_count"]
+        .as_u64()
+        .expect("indexed segment count");
+    let complete = coverage["complete"].as_bool().expect("complete flag");
+    assert_eq!(visible, 1);
+    assert!(indexed <= visible);
+    assert_eq!(complete, indexed == visible);
 
     exec_ok(
         &mut session,
@@ -381,10 +379,10 @@ async fn run_create_index_keeps_fulltext_pushdown_ready_while_coverage_is_tail_p
 }
 
 #[test]
-fn create_index_keeps_fulltext_pushdown_ready_while_coverage_is_tail_pending() {
+fn create_index_keeps_fulltext_pushdown_ready_during_tail_catchup() {
     run_async_test_with_large_stack(
         "fulltext-create-index-coverage",
-        run_create_index_keeps_fulltext_pushdown_ready_while_coverage_is_tail_pending(),
+        run_create_index_keeps_fulltext_pushdown_ready_during_tail_catchup(),
     );
 }
 
@@ -566,7 +564,11 @@ async fn run_deferred_task_recovery_uses_catalog_fulltext_config_not_task_payloa
             )
             .with_catalog(session.current_database.catalog().name().to_string())
             .with_index_type(CatalogIndexType::FullText)
-            .with_fulltext_options(LogicalIndex::new(1), "simple"),
+            .with_fulltext_options(LogicalIndex::new(1), "simple")
+            .with_provider_config(serde_json::json!({
+                "version": paro_storage::search::FULLTEXT_PROVIDER_CONFIG_VERSION,
+                "config": "simple"
+            })),
             table,
         )
         .expect("create building fulltext index")

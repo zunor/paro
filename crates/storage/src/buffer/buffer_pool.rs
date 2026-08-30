@@ -105,8 +105,11 @@ pub struct EvictionResult {
 pub struct BufferPool {
     /// Maximum memory limit in bytes
     max_memory: AtomicUsize,
-    /// Serializes memory limit updates.
-    limit_lock: Mutex<()>,
+    /// Serializes physical admission, reload, and memory-limit changes. The
+    /// limit check and resident-byte publication must be one operation: a
+    /// check-then-fetch_add sequence lets parallel cold-page loads all observe
+    /// the same headroom and oversubscribe the process-wide ceiling.
+    admission_lock: Mutex<()>,
     /// Current memory usage in bytes
     used_memory: AtomicUsize,
     /// Next block ID to assign
@@ -169,7 +172,7 @@ impl BufferPool {
 
         Self {
             max_memory: AtomicUsize::new(max_memory),
-            limit_lock: Mutex::new(()),
+            admission_lock: Mutex::new(()),
             used_memory: AtomicUsize::new(0),
             next_block_id: AtomicI64::new(1),
             blocks: RwLock::new(HashMap::new()),
@@ -216,7 +219,7 @@ impl BufferPool {
     /// Map FileBufferType to eviction queue type index.
     fn file_buffer_type_to_eviction_queue_type_idx(buffer_type: FileBufferType) -> usize {
         match buffer_type {
-            FileBufferType::Block | FileBufferType::ExternalFile => 0, // Evict these first (cheap, just free)
+            FileBufferType::Block | FileBufferType::ExternalFile | FileBufferType::Scratch => 0, // Evict these first (cheap, just free)
             FileBufferType::ManagedBuffer => 1, // Then these (have to write to storage)
             FileBufferType::TinyBuffer => 2,    // Evict tiny buffers last (last resort)
         }
@@ -225,7 +228,11 @@ impl BufferPool {
     /// Map eviction queue type index to FileBufferTypes.
     fn eviction_queue_type_idx_to_file_buffer_types(queue_type_idx: usize) -> Vec<FileBufferType> {
         match queue_type_idx {
-            0 => vec![FileBufferType::Block, FileBufferType::ExternalFile],
+            0 => vec![
+                FileBufferType::Block,
+                FileBufferType::ExternalFile,
+                FileBufferType::Scratch,
+            ],
             1 => vec![FileBufferType::ManagedBuffer],
             2 => vec![FileBufferType::TinyBuffer],
             _ => panic!("Unknown queue type index: {}", queue_type_idx),
@@ -396,7 +403,7 @@ impl BufferPool {
     ///
     /// Follows an "evict + set + verify + rollback" pattern.
     pub fn set_memory_limit(&self, limit: usize) -> Result<()> {
-        let _limit_guard = self.limit_lock.lock().unwrap();
+        let _admission_guard = self.admission_lock.lock().unwrap();
 
         if limit != 0 {
             let precheck = self.evict_blocks(MemoryTag::Extension, 0, limit, None);
@@ -516,6 +523,10 @@ impl BufferPool {
         let block_id = block.block_id();
         let size = block.size();
 
+        if block.buffer_type().is_reconstructible() {
+            block.reconstruct_zeroed()?;
+            return Ok(());
+        }
         if !block.must_write_to_disk() {
             return Err(paro_error::internal(format!(
                 "Block {} cannot be reloaded without temporary spill data",
@@ -659,10 +670,11 @@ impl BufferPool {
         can_destroy: bool,
     ) -> Result<BufferHandle> {
         let size = if size == 0 { DEFAULT_BLOCK_SIZE } else { size };
+        let _admission_guard = self.admission_lock.lock().unwrap();
 
         // Check memory limit and try eviction if needed
         // EvictBlocksOrThrow is called before allocation
-        self.ensure_memory_available(size)?;
+        self.ensure_memory_available(tag, size)?;
 
         // Generate new block ID
         let block_id = self.next_block_id.fetch_add(1, Ordering::Relaxed);
@@ -723,13 +735,14 @@ impl BufferPool {
             }
         };
 
-        // Fast path: block is already loaded
-        if block.is_loaded() {
+        // Fast path: atomically publish the pin against the loaded allocation.
+        // `is_loaded()` followed by `pin()` is not sufficient here: eviction
+        // may detach the buffer between those two independent observations.
+        if block.try_pin().is_some() {
             // Remove from eviction queue if present
             self.remove_from_eviction_queue(block_id);
 
-            // Pin the block and update LRU timestamp
-            block.pin();
+            // Update LRU timestamp
             block.set_lru_timestamp(current_timestamp_ms());
             self.stats.pins.fetch_add(1, Ordering::Relaxed);
 
@@ -737,7 +750,15 @@ impl BufferPool {
             return Ok(BufferHandle::with_pool(block, pool_weak));
         }
 
-        // Slow path: block needs to be loaded
+        // Slow-path admission and publication are serialized with new block
+        // allocation and memory-limit changes.
+        let _admission_guard = self.admission_lock.lock().unwrap();
+        if block.try_pin().is_some() {
+            block.set_lru_timestamp(current_timestamp_ms());
+            self.stats.pins.fetch_add(1, Ordering::Relaxed);
+            let pool_weak = self.weak_self.read().unwrap().clone();
+            return Ok(BufferHandle::with_pool(block, pool_weak));
+        }
 
         // Get required memory for loading
         let required_memory = block.size();
@@ -759,9 +780,8 @@ impl BufferPool {
         }
 
         // Double-check locking: check if another thread loaded the block
-        if block.is_loaded() {
+        if block.try_pin().is_some() {
             // Block was loaded by another thread, just pin it
-            block.pin();
             block.set_lru_timestamp(current_timestamp_ms());
             self.stats.pins.fetch_add(1, Ordering::Relaxed);
             let pool_weak = self.weak_self.read().unwrap().clone();
@@ -934,15 +954,9 @@ impl BufferPool {
                     let block_id = handle.block_id();
                     let blocks = self.blocks.write().unwrap();
                     if let Some(block) = blocks.get(&block_id) {
-                        // Create a temporary mutable reference
-                        // SAFETY: We have exclusive access via the write lock
-                        let block_ptr =
-                            std::sync::Arc::<BlockHandle>::as_ptr(block) as *mut BlockHandle;
-                        let block_mut = unsafe { &mut *block_ptr };
-
                         let block_size = block.size();
                         let block_tag = block.tag();
-                        if let Ok(Some(taken_buffer)) = block_mut
+                        if let Ok(Some(taken_buffer)) = block
                             .unload_and_take_block(has_temp_dir, |bid, data| {
                                 self.write_to_temporary_file(bid, block_tag, data)
                             })
@@ -978,16 +992,14 @@ impl BufferPool {
 
             let blocks = self.blocks.write().unwrap();
             if let Some(block) = blocks.get(&block_id) {
-                let block_ptr = std::sync::Arc::<BlockHandle>::as_ptr(block) as *mut BlockHandle;
-                let block_mut = unsafe { &mut *block_ptr };
-
                 // Unload the block (releases buffer but keeps BlockHandle)
-                let unload_result = block_mut.unload(has_temp_dir, |bid, data| {
+                let was_loaded = block.is_loaded();
+                let unload_result = block.unload(has_temp_dir, |bid, data| {
                     self.write_to_temporary_file(bid, block_tag, data)
                 });
 
                 // Update memory statistics (decrease used_memory)
-                if unload_result.is_ok() && !block.is_loaded() {
+                if was_loaded && unload_result.is_ok() && !block.is_loaded() {
                     self.update_used_memory(block_tag, -(block_size as i64));
                 }
             }
@@ -1087,7 +1099,7 @@ impl BufferPool {
     ///
     /// # Returns
     /// Ok(()) if memory is available or eviction succeeded, Err otherwise
-    fn ensure_memory_available(&self, required: usize) -> Result<()> {
+    fn ensure_memory_available(&self, tag: MemoryTag, required: usize) -> Result<()> {
         let max_memory = self.max_memory();
         if max_memory == 0 {
             return Ok(()); // Unlimited memory
@@ -1118,8 +1130,12 @@ impl BufferPool {
 
         // Eviction failed or didn't free enough memory
         Err(paro_error::out_of_memory(format!(
-            "Failed to allocate {} bytes (used: {}/{}, need to free: {})",
-            required, current_used, max_memory, memory_to_free
+            "Failed to allocate {} bytes for {} (used: {}/{}, need to free: {})",
+            required,
+            tag.name(),
+            current_used,
+            max_memory,
+            memory_to_free
         )))
     }
 

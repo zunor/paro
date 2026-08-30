@@ -164,7 +164,7 @@ async fn execute_accepts_expressions_and_returns_underlying_completion() {
     exec_ok(
         &mut session,
         &mut sink,
-        "PREPARE stmt_expr(INT) AS SELECT ? + 1",
+        "PREPARE stmt_expr(INT) AS SELECT $1 + 1",
     )
     .await;
     exec_ok(&mut session, &mut sink, "EXECUTE stmt_expr(1 + 2)").await;
@@ -185,7 +185,7 @@ async fn explain_execute_accepts_parameters() {
     exec_ok(
         &mut session,
         &mut sink,
-        "PREPARE stmt_explain(INT) AS SELECT ? + 1",
+        "PREPARE stmt_explain(INT) AS SELECT $1 + 1",
     )
     .await;
     exec_ok(

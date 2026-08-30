@@ -28,18 +28,15 @@ id	dist
 3	1.000000
 4	1.732051
 
-SELECT index_name, index_type FROM paro_indexes();
-index_name	index_type
-
 EXPLAIN SELECT id FROM items ORDER BY emb <-> '[1.0, 1.0, 1.0]' LIMIT 2;
 QUERY PLAN
 PROJECTION  (rows=2)
   Output: id
   ->  TOP_N  (rows=2)
-    Sort Key: #1 ASC NULLS LAST
+    Sort Key: l2_distance(public.items.emb, [1, 1, 1]) ASC NULLS LAST
     Limit: 2
     ->  PROJECTION  (rows=4)
-      Output: id, __paro_hidden_1
+      Output: id, l2_distance(public.items.emb, [1, 1, 1])
       ->  ROWSET_SCAN on public.items  (rows=4)
         Columns: id, emb
 
@@ -47,6 +44,322 @@ SELECT id FROM items ORDER BY emb <-> '[1.0, 1.0, 1.0]' LIMIT 2;
 id
 1
 3
+
+CREATE TABLE indexed_items (id INT, bucket SMALLINT, emb VECTOR(3));
+CREATE TABLE
+
+CREATE INDEX idx_indexed_items_id ON indexed_items (id);
+CREATE INDEX
+
+CREATE INDEX idx_indexed_items_bucket ON indexed_items (bucket);
+CREATE INDEX
+
+CREATE VECTOR INDEX idx_indexed_items_emb ON indexed_items (emb)
+    distance = l2
+    m = 8
+    ef_construct = 32
+    ef_search = 24
+    build_seed = 7
+    random_access_cost_units = 1
+    exact_f32_dimension_cost_units = 1
+    sequential_dimension_cost_units = 1
+    symmetric_i16_dimension_cost_units = 1
+    graph_scored_points_per_ef = 1
+    distance_cost_calibration_id = 1
+    filter_columns = 'id,bucket'
+    inline_max_vector_count = 4096
+    inline_max_graph_memory_bytes = 1048576
+    inline_max_dimension = 3;
+CREATE INDEX
+
+INSERT INTO indexed_items
+SELECT i, i % 10, '[1.0,1.0,1.0]'::VECTOR(3)
+FROM generate_series(1, 2048) AS generated(i);
+INSERT 0 2048
+
+REFRESH VECTOR INDEX idx_indexed_items_emb ON indexed_items;
+REFRESH INDEX
+
+SELECT index_name, index_type FROM paro_indexes()
+WHERE index_name = 'idx_indexed_items_emb';
+index_name	index_type
+idx_indexed_items_emb	HNSW
+
+-- @normalize explain_search_ids
+EXPLAIN SELECT id FROM indexed_items
+ORDER BY emb <-> '[1.0, 1.0, 1.0]' LIMIT 2;
+QUERY PLAN
+PROJECTION  (rows=2)
+  Output: id
+  ->  VECTOR_SEARCH on public.indexed_items  (rows=2)
+    Search Definition: <search-definition-id>
+    Search Generation: <search-generation-id>
+    Search Root: <search-root-id>
+    Search Capability: Queryable
+    Search Candidate: dense vector
+    Column: emb
+    Limit: 2
+    Search Objective: cost_optimized: definition-pinned cost selects exact scoring or graph traversal
+    Search Ef: default (effective 24 per graph shard)
+    Graph Shards: 1 (estimated aggregate beam width 24)
+    Exact Rerank Window: default (effective 2, definition policy top_k)
+    Exact/Graph Cost Profile: random-access=1 units, exact-f32=1 units/dimension, sequential=1 units/dimension, symmetric-i16=1 units/dimension, graph=1 unique scores/ef, routing=exact_f32 (source=offline-calibration-1, definition-pinned); observed generation average level-0 degree=16.00 is descriptive, not a cost cap
+
+-- @normalize explain_search_ids
+EXPLAIN SELECT id FROM indexed_items
+WHERE bucket = 3
+ORDER BY emb <-> '[1.0, 1.0, 1.0]' LIMIT 2;
+QUERY PLAN
+PROJECTION  (rows=2)
+  Output: id
+  ->  VECTOR_SEARCH on public.indexed_items  (rows=2)
+    Search Definition: <search-definition-id>
+    Search Generation: <search-generation-id>
+    Search Root: <search-root-id>
+    Search Capability: Queryable
+    Search Candidate: dense vector
+    Column: emb
+    Limit: 2
+    Search Objective: cost_optimized: definition-pinned cost selects exact scoring or graph traversal
+    Search Ef: default (effective 24 per graph shard)
+    Graph Shards: 1 (estimated aggregate beam width 24)
+    Exact Rerank Window: default (effective 2, definition policy top_k)
+    Exact/Graph Cost Profile: random-access=1 units, exact-f32=1 units/dimension, sequential=1 units/dimension, symmetric-i16=1 units/dimension, graph=1 unique scores/ef, routing=exact_f32 (source=offline-calibration-1, definition-pinned); observed generation average level-0 degree=16.00 is descriptive, not a cost cap
+    Pushed Predicate: bucket = 3
+    Filter Pushdown: exact segment row set from scalar index; ordinal admission and posting scan; no residual filter
+    Filter Rows (estimated): 205
+    Filtered Strategy: runtime cost choice per immutable artifact: exact row-set distance scan using scalar-block covering vector ranges for compatible ordinal predicates is compared with graph work using definition-pinned physical cost coefficients, effective ef, and exact covering/base row counts; graph execution uses predicate-agnostic HNSW navigation with deferred global-beam admission for broad predicates, exact eager admission and hierarchical scalar-block topology for selective predicates, observed two-hop repair, and exact fallback
+    Exact Filter Scan: covering scalar-block vector ranges available for compatible single-column ordinal predicates on bucket; base vector pages are not gathered
+    Predicate Topology: available on bucket: tagged hierarchical scalar-block HNSW plus bounded vector-aware cross-block routing; every admitted block has a durable entry point and exact row-set admission
+
+-- @normalize explain_search_ids
+EXPLAIN SELECT id FROM indexed_items
+WHERE id = 1
+ORDER BY emb <-> '[1.0, 1.0, 1.0]' LIMIT 2;
+QUERY PLAN
+PROJECTION  (rows=2)
+  Output: id
+  ->  VECTOR_SEARCH on public.indexed_items  (rows=2)
+    Search Definition: <search-definition-id>
+    Search Generation: <search-generation-id>
+    Search Root: <search-root-id>
+    Search Capability: Queryable
+    Search Candidate: dense vector
+    Column: emb
+    Limit: 2
+    Search Objective: cost_optimized: definition-pinned cost selects exact scoring or graph traversal
+    Search Ef: default (effective 24 per graph shard)
+    Graph Shards: 1 (estimated aggregate beam width 24)
+    Exact Rerank Window: default (effective 2, definition policy top_k)
+    Exact/Graph Cost Profile: random-access=1 units, exact-f32=1 units/dimension, sequential=1 units/dimension, symmetric-i16=1 units/dimension, graph=1 unique scores/ef, routing=exact_f32 (source=offline-calibration-1, definition-pinned); observed generation average level-0 degree=16.00 is descriptive, not a cost cap
+    Pushed Predicate: id = 1
+    Filter Pushdown: exact segment row set from scalar index; ordinal admission and posting scan; no residual filter
+    Filter Rows (estimated): 1
+    Filtered Strategy: runtime cost choice per immutable artifact: exact row-set distance scan using scalar-block covering vector ranges for compatible ordinal predicates is compared with graph work using definition-pinned physical cost coefficients, effective ef, and exact covering/base row counts; graph execution uses predicate-agnostic HNSW navigation with deferred global-beam admission for broad predicates, exact eager admission and hierarchical scalar-block topology for selective predicates, observed two-hop repair, and exact fallback
+    Exact Filter Scan: covering scalar-block vector ranges available for compatible single-column ordinal predicates on id; base vector pages are not gathered
+    Predicate Topology: available on id: tagged hierarchical scalar-block HNSW plus bounded vector-aware cross-block routing; every admitted block has a durable entry point and exact row-set admission
+
+-- @normalize explain_search_ids
+EXPLAIN SELECT id FROM indexed_items
+WHERE id <= 1024
+ORDER BY emb <-> '[1.0, 1.0, 1.0]' LIMIT 2;
+QUERY PLAN
+PROJECTION  (rows=2)
+  Output: id
+  ->  VECTOR_SEARCH on public.indexed_items  (rows=2)
+    Search Definition: <search-definition-id>
+    Search Generation: <search-generation-id>
+    Search Root: <search-root-id>
+    Search Capability: Queryable
+    Search Candidate: dense vector
+    Column: emb
+    Limit: 2
+    Search Objective: cost_optimized: definition-pinned cost selects exact scoring or graph traversal
+    Search Ef: default (effective 24 per graph shard)
+    Graph Shards: 1 (estimated aggregate beam width 24)
+    Exact Rerank Window: default (effective 2, definition policy top_k)
+    Exact/Graph Cost Profile: random-access=1 units, exact-f32=1 units/dimension, sequential=1 units/dimension, symmetric-i16=1 units/dimension, graph=1 unique scores/ef, routing=exact_f32 (source=offline-calibration-1, definition-pinned); observed generation average level-0 degree=16.00 is descriptive, not a cost cap
+    Pushed Predicate: id <= 1024
+    Filter Pushdown: exact segment row set from scalar index; ordinal admission and posting scan; no residual filter
+    Filter Rows (estimated): 1024
+    Filtered Strategy: runtime cost choice per immutable artifact: exact row-set distance scan using scalar-block covering vector ranges for compatible ordinal predicates is compared with graph work using definition-pinned physical cost coefficients, effective ef, and exact covering/base row counts; graph execution uses predicate-agnostic HNSW navigation with deferred global-beam admission for broad predicates, exact eager admission and hierarchical scalar-block topology for selective predicates, observed two-hop repair, and exact fallback
+    Exact Filter Scan: covering scalar-block vector ranges available for compatible single-column ordinal predicates on id; base vector pages are not gathered
+    Predicate Topology: available on id: tagged hierarchical scalar-block HNSW plus bounded vector-aware cross-block routing; every admitted block has a durable entry point and exact row-set admission
+
+SELECT id FROM indexed_items
+WHERE id <= 1024
+ORDER BY emb <-> '[1.0, 1.0, 1.0]' LIMIT 2;
+id
+840
+687
+
+-- @normalize explain_search_ids
+EXPLAIN SELECT id FROM indexed_items
+ORDER BY emb <=> '[1.0, 0.0, 0.0]' LIMIT 2;
+QUERY PLAN
+PROJECTION  (rows=2)
+  Output: id
+  ->  TOP_N  (rows=2)
+    Sort Key: cosine_distance(public.indexed_items.emb, [1, 0, 0]) ASC NULLS LAST
+    Limit: 2
+    ->  PROJECTION  (rows=2048)
+      Output: id, cosine_distance(public.indexed_items.emb, [1, 0, 0])
+      ->  ROWSET_SCAN on public.indexed_items  (rows=2048)
+        Columns: id, emb
+
+SELECT id FROM indexed_items
+ORDER BY emb <=> '[1.0, 0.0, 0.0]', id LIMIT 2;
+id
+1
+2
+
+PREPARE vector_topk(VECTOR(3)) AS
+    SELECT emb <-> $1 AS dist
+    FROM indexed_items
+    ORDER BY emb <-> $1
+    LIMIT 2;
+PREPARE
+
+EXECUTE vector_topk('[1.0, 1.0, 1.0]');
+dist
+0.000000
+0.000000
+
+EXECUTE vector_topk('[2.0, 2.0, 2.0]');
+dist
+1.732051
+1.732051
+
+DEALLOCATE vector_topk;
+DEALLOCATE
+
+PREPARE filtered_vector_topk(INT, VECTOR(3)) AS
+    SELECT bucket FROM indexed_items
+    WHERE bucket = $1
+    ORDER BY emb <-> $2 LIMIT 2;
+PREPARE
+
+EXECUTE filtered_vector_topk(3, '[1.0, 1.0, 1.0]');
+bucket
+3
+3
+
+EXECUTE filtered_vector_topk(7, '[1.0, 1.0, 1.0]');
+bucket
+7
+7
+
+EXECUTE filtered_vector_topk(100000, '[1.0, 1.0, 1.0]');
+bucket
+
+-- @normalize explain_search_ids
+EXPLAIN EXECUTE filtered_vector_topk(3, '[1.0, 1.0, 1.0]');
+QUERY PLAN
+PROJECTION  (rows=2)
+  Output: bucket
+  ->  VECTOR_SEARCH on public.indexed_items  (rows=2)
+    Search Definition: <search-definition-id>
+    Search Generation: <search-generation-id>
+    Search Root: <search-root-id>
+    Search Capability: Queryable
+    Search Candidate: dense vector
+    Column: emb
+    Limit: 2
+    Search Objective: cost_optimized: definition-pinned cost selects exact scoring or graph traversal
+    Search Ef: default (effective 24 per graph shard)
+    Graph Shards: 1 (estimated aggregate beam width 24)
+    Exact Rerank Window: default (effective 2, definition policy top_k)
+    Exact/Graph Cost Profile: random-access=1 units, exact-f32=1 units/dimension, sequential=1 units/dimension, symmetric-i16=1 units/dimension, graph=1 unique scores/ef, routing=exact_f32 (source=offline-calibration-1, definition-pinned); observed generation average level-0 degree=16.00 is descriptive, not a cost cap
+    Pushed Predicate: bucket = 3
+    Filter Pushdown: exact segment row set from scalar index; ordinal admission and posting scan; no residual filter
+    Filter Rows (estimated): 205
+    Filtered Strategy: runtime cost choice per immutable artifact: exact row-set distance scan using scalar-block covering vector ranges for compatible ordinal predicates is compared with graph work using definition-pinned physical cost coefficients, effective ef, and exact covering/base row counts; graph execution uses predicate-agnostic HNSW navigation with deferred global-beam admission for broad predicates, exact eager admission and hierarchical scalar-block topology for selective predicates, observed two-hop repair, and exact fallback
+    Exact Filter Scan: covering scalar-block vector ranges available for compatible single-column ordinal predicates on bucket; base vector pages are not gathered
+    Predicate Topology: available on bucket: tagged hierarchical scalar-block HNSW plus bounded vector-aware cross-block routing; every admitted block has a durable entry point and exact row-set admission
+
+DEALLOCATE filtered_vector_topk;
+DEALLOCATE
+
+-- @normalize explain_search_ids
+EXPLAIN SELECT /*+ HNSW_EF(37) */ id
+FROM indexed_items
+ORDER BY emb <-> '[1.0, 1.0, 1.0]'
+LIMIT 2;
+QUERY PLAN
+PROJECTION  (rows=2)
+  Output: id
+  ->  VECTOR_SEARCH on public.indexed_items  (rows=2)
+    Search Definition: <search-definition-id>
+    Search Generation: <search-generation-id>
+    Search Root: <search-root-id>
+    Search Capability: Queryable
+    Search Candidate: dense vector
+    Column: emb
+    Limit: 2
+    Search Objective: cost_optimized: definition-pinned cost selects exact scoring or graph traversal
+    Search Ef: 37 (effective 37 per graph shard)
+    Graph Shards: 1 (estimated aggregate beam width 37)
+    Exact Rerank Window: default (effective 2, definition policy top_k)
+    Exact/Graph Cost Profile: random-access=1 units, exact-f32=1 units/dimension, sequential=1 units/dimension, symmetric-i16=1 units/dimension, graph=1 unique scores/ef, routing=exact_f32 (source=offline-calibration-1, definition-pinned); observed generation average level-0 degree=16.00 is descriptive, not a cost cap
+
+-- @normalize explain_search_ids
+EXPLAIN SELECT /*+ HNSW_EF(37) HNSW_RERANK(7) */ id
+FROM indexed_items
+ORDER BY emb <-> '[1.0, 1.0, 1.0]'
+LIMIT 2;
+QUERY PLAN
+PROJECTION  (rows=2)
+  Output: id
+  ->  VECTOR_SEARCH on public.indexed_items  (rows=2)
+    Search Definition: <search-definition-id>
+    Search Generation: <search-generation-id>
+    Search Root: <search-root-id>
+    Search Capability: Queryable
+    Search Candidate: dense vector
+    Column: emb
+    Limit: 2
+    Search Objective: cost_optimized: definition-pinned cost selects exact scoring or graph traversal
+    Search Ef: 37 (effective 37 per graph shard)
+    Graph Shards: 1 (estimated aggregate beam width 37)
+    Exact Rerank Window: 7 (effective 7, definition policy top_k)
+    Exact/Graph Cost Profile: random-access=1 units, exact-f32=1 units/dimension, sequential=1 units/dimension, symmetric-i16=1 units/dimension, graph=1 unique scores/ef, routing=exact_f32 (source=offline-calibration-1, definition-pinned); observed generation average level-0 degree=16.00 is descriptive, not a cost cap
+
+-- @normalize explain_search_ids
+EXPLAIN SELECT /*+ VECTOR_SEARCH_MODE('exact') */ id
+FROM indexed_items
+WHERE id <= 1024
+ORDER BY emb <-> '[1.0, 1.0, 1.0]'
+LIMIT 2;
+QUERY PLAN
+PROJECTION  (rows=2)
+  Output: id
+  ->  VECTOR_SEARCH on public.indexed_items  (rows=2)
+    Search Definition: <search-definition-id>
+    Search Generation: <search-generation-id>
+    Search Root: <search-root-id>
+    Search Capability: Queryable
+    Search Candidate: dense vector
+    Column: emb
+    Limit: 2
+    Search Objective: exact: score every admitted vector; graph traversal disabled
+    Search Ef: default (effective 24 per graph shard)
+    Graph Shards: 1 (estimated aggregate beam width 24)
+    Exact Rerank Window: default (effective 2, definition policy top_k)
+    Exact/Graph Cost Profile: random-access=1 units, exact-f32=1 units/dimension, sequential=1 units/dimension, symmetric-i16=1 units/dimension, graph=1 unique scores/ef, routing=exact_f32 (source=offline-calibration-1, definition-pinned); observed generation average level-0 degree=16.00 is descriptive, not a cost cap
+    Pushed Predicate: id <= 1024
+    Filter Pushdown: exact segment row set from scalar index; ordinal admission and posting scan; no residual filter
+    Filtered Strategy: query objective forces exact row-set distance scan; HNSW navigation, predicate topology, and adaptive refinement are disabled
+
+SELECT count(*) AS exact_rows
+FROM (
+    SELECT /*+ VECTOR_SEARCH_MODE('exact') */ id
+    FROM indexed_items
+    WHERE id <= 1024
+    ORDER BY emb <-> '[1.0, 1.0, 1.0]'
+    LIMIT 2
+) AS forced_exact;
+exact_rows
+2
 
 SELECT id FROM items ORDER BY emb <-> '[2.0, 2.0, 2.0]' LIMIT 2;
 id
@@ -59,6 +372,9 @@ id	dist
 3	1.000000
 2	1.732051
 4	1.732051
+
+DROP TABLE indexed_items;
+DROP TABLE
 
 DROP TABLE items;
 DROP TABLE

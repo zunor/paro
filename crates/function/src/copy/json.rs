@@ -11,8 +11,8 @@ use paro_common::types::LogicalType;
 use serde_json::{Map as JsonMap, Number as JsonNumber, Value as JsonValue};
 
 use super::{
-    CopyFormat, CopyFromSource, CopyFunction, CopyFunctionBindData, CopyOptions, CopyToGlobalState,
-    CopyToLocalState,
+    CopyFormat, CopyFromFunction, CopyFromSource, CopyFunction, CopyFunctionBindData, CopyOptions,
+    CopyToFunction, CopyToGlobalState, CopyToLocalState,
 };
 use crate::table::read_ndjson::{bind_copy_from, create_read_ndjson_function};
 use crate::table::{TableFunction, TableFunctionBindData};
@@ -62,14 +62,18 @@ pub fn register_copy_functions() -> Vec<CopyFunction> {
 pub fn register_ndjson_copy_function() -> CopyFunction {
     CopyFunction {
         name: "ndjson".to_string(),
-        copy_to_bind: ndjson_copy_to_bind,
-        copy_to_initialize_global: ndjson_copy_to_initialize_global,
-        copy_to_initialize_local: ndjson_copy_to_initialize_local,
-        copy_to_sink: ndjson_copy_to_sink,
-        copy_to_combine: ndjson_copy_to_combine,
-        copy_to_finalize: ndjson_copy_to_finalize,
-        copy_from_bind: ndjson_copy_from_bind,
-        copy_from_function: read_ndjson_table_function(),
+        copy_to: Some(CopyToFunction {
+            copy_to_bind: ndjson_copy_to_bind,
+            copy_to_initialize_global: ndjson_copy_to_initialize_global,
+            copy_to_initialize_local: ndjson_copy_to_initialize_local,
+            copy_to_sink: ndjson_copy_to_sink,
+            copy_to_combine: ndjson_copy_to_combine,
+            copy_to_finalize: ndjson_copy_to_finalize,
+        }),
+        copy_from: Some(CopyFromFunction {
+            copy_from_bind: ndjson_copy_from_bind,
+            copy_from_function: read_ndjson_table_function(),
+        }),
         extension: "json".to_string(),
     }
 }

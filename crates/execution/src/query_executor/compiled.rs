@@ -5,13 +5,12 @@
 
 use std::sync::Arc;
 
+use crate::pipeline::StatementProgram;
+use crate::runtime::{ParameterBindingEpoch, ParameterBindings};
 use paro_common::error::{self as paro_error, Result};
 use paro_common::typed_parameters::TypedParameterEnv;
 use paro_common::types::LogicalType;
 use paro_context::CompileEnvironmentKey;
-
-use crate::pipeline::StatementProgram;
-use crate::runtime::{ParameterBindingEpoch, ParameterBindings};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ResultColumnDesc {
@@ -39,15 +38,10 @@ pub struct CompiledStatement {
 
 #[derive(Debug)]
 struct CompiledStatementImage {
-    executable: CompiledExecutable,
+    program: StatementProgram,
     result_schema: Box<[ResultColumnDesc]>,
     parameter_types: Box<[LogicalType]>,
     compile_environment: CompileEnvironmentKey,
-}
-
-#[derive(Debug)]
-pub enum CompiledExecutable {
-    Program(StatementProgram),
 }
 
 impl CompiledStatement {
@@ -59,7 +53,7 @@ impl CompiledStatement {
     ) -> Self {
         Self {
             image: Arc::new(CompiledStatementImage {
-                executable: CompiledExecutable::Program(program),
+                program,
                 result_schema: result_schema.into_boxed_slice(),
                 parameter_types: parameter_types.into_boxed_slice(),
                 compile_environment,
@@ -68,8 +62,8 @@ impl CompiledStatement {
     }
 
     #[inline]
-    pub fn executable(&self) -> &CompiledExecutable {
-        &self.image.executable
+    pub fn program(&self) -> &StatementProgram {
+        &self.image.program
     }
 
     #[inline]

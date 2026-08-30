@@ -555,8 +555,8 @@ mod tests {
         });
         assert!(matches!(outcome.candidates, PredicateResult::AllMatch));
         assert_eq!(
-            outcome.guaranteed,
-            PredicateResult::PageRanges(vec![PageRange::new(0, 3)])
+            outcome.guaranteed(),
+            &PredicateResult::PageRanges(vec![PageRange::new(0, 3)])
         );
     }
 
@@ -584,7 +584,7 @@ mod tests {
             value: Value::Integer(15),
         });
         assert!(matches!(outcome.candidates, PredicateResult::Unknown));
-        assert!(matches!(outcome.guaranteed, PredicateResult::NoneMatch));
+        assert!(matches!(outcome.guaranteed(), PredicateResult::NoneMatch));
     }
 
     #[test]
@@ -612,6 +612,6 @@ mod tests {
             upper: Value::Integer(20),
         });
         assert!(matches!(outcome.candidates, PredicateResult::AllMatch));
-        assert!(matches!(outcome.guaranteed, PredicateResult::NoneMatch));
+        assert!(matches!(outcome.guaranteed(), PredicateResult::NoneMatch));
     }
 }

@@ -5,7 +5,7 @@ use std::sync::Arc;
 
 use paro_catalog::entry::{CreateIndexInfo, TableCatalogEntry};
 use paro_common::types::LogicalType;
-use paro_function::copy::{CopyFunction, CopyFunctionBindData};
+use paro_function::copy::{CopyFunctionBindData, CopyToFunction};
 use paro_planner::binder::ir::statement::{
     BoundAlterEntryInfo, BoundCreatePropertyGraphInfo, BoundCreateRoutineInfo,
     BoundCreateSchemaInfo, BoundCreateSequenceInfo, BoundCreateTableInfo, BoundCreateViewInfo,
@@ -37,6 +37,7 @@ pub struct RecursiveCteSpec {
 pub struct CteScanSpec {
     pub cte_index: usize,
     pub table_index: usize,
+    pub relation_alias: String,
     pub output_names: Box<[String]>,
     pub output_types: Box<[LogicalType]>,
 }
@@ -58,7 +59,7 @@ pub enum SetOperationInputSide {
 
 #[derive(Clone)]
 pub struct CopyToFileSpec {
-    pub copy_function: CopyFunction,
+    pub copy_function: CopyToFunction,
     pub bind_data: Arc<dyn CopyFunctionBindData>,
     pub file_path: String,
     pub per_thread_output: bool,
@@ -68,7 +69,7 @@ pub struct CopyToFileSpec {
 impl std::fmt::Debug for CopyToFileSpec {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("CopyToFileSpec")
-            .field("copy_function", &self.copy_function.name)
+            .field("copy_function", &"copy_to")
             .field("file_path", &self.file_path)
             .field("per_thread_output", &self.per_thread_output)
             .field("output_types", &self.output_types)

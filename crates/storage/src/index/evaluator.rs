@@ -8,47 +8,52 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use crate::index::bound_index::{BoundIndex, IndexPredicateEvaluation};
-use crate::index::page_layout::PageLayout;
+use crate::index::bound_index::{BoundIndex, IndexPredicateEvaluation, PredicateIndexBinding};
 use crate::index::predicate::{Predicate, PredicateTree};
-use crate::index::predicate_result::{
-    intersect, intersect_with_layout, union, union_with_layout, PredicateResult,
-};
+use crate::index::predicate_result::{intersect, union, PredicateResult};
 use crate::index::ColumnId;
+use crate::index::ExactRowSet;
 
 /// Index evaluator that combines multiple indexes.
 pub struct IndexEvaluator {
     /// Column -> indexes (sorted by priority)
-    indexes: HashMap<ColumnId, Vec<Arc<dyn BoundIndex>>>,
-    /// Optional page layout for precise PageRanges ↔ Bitmap conversion.
-    page_layout: Option<PageLayout>,
+    indexes: HashMap<ColumnId, Vec<PredicateIndexBinding>>,
+    /// Segment-local row domain against which completeness credentials are
+    /// checked. Generic/index-unit evaluators intentionally have no domain and
+    /// therefore cannot turn a scalar posting answer into an exact proof.
+    segment_rows: Option<u64>,
 }
 
 impl IndexEvaluator {
     /// Create a new evaluator from a list of indexes.
     pub fn new(indexes: Vec<Arc<dyn BoundIndex>>) -> Self {
-        Self::with_layout(indexes, None)
+        Self::with_bindings(
+            indexes
+                .into_iter()
+                .map(PredicateIndexBinding::candidate)
+                .collect(),
+            None,
+        )
     }
 
-    /// Create a new evaluator with an optional page layout.
-    ///
-    /// When a `PageLayout` is provided, `PageRanges × Bitmap` intersections
-    /// are computed precisely by converting page ranges to row ranges first.
-    pub fn with_layout(indexes: Vec<Arc<dyn BoundIndex>>, page_layout: Option<PageLayout>) -> Self {
-        let mut map: HashMap<ColumnId, Vec<Arc<dyn BoundIndex>>> = HashMap::new();
+    /// Build an evaluator for one immutable segment. Only bindings carrying a
+    /// matching [`SegmentLocalComplete`](crate::index::SegmentLocalComplete)
+    /// credential may suppress row verification.
+    pub(crate) fn for_segment(indexes: Vec<PredicateIndexBinding>, segment_rows: u64) -> Self {
+        Self::with_bindings(indexes, Some(segment_rows))
+    }
+
+    fn with_bindings(indexes: Vec<PredicateIndexBinding>, segment_rows: Option<u64>) -> Self {
+        let mut map: HashMap<ColumnId, Vec<PredicateIndexBinding>> = HashMap::new();
         for index in indexes {
-            for &column_id in index.column_ids() {
+            for &column_id in index.index().column_ids() {
                 map.entry(column_id).or_default().push(index.clone());
             }
         }
 
-        for indexes in map.values_mut() {
-            indexes.sort_by_key(|idx| index_priority(idx.index_type()));
-        }
-
         IndexEvaluator {
             indexes: map,
-            page_layout,
+            segment_rows,
         }
     }
 
@@ -64,54 +69,97 @@ impl IndexEvaluator {
             PredicateTree::And(children) => {
                 let mut candidates = PredicateResult::AllMatch;
                 let mut guaranteed = PredicateResult::AllMatch;
+                let mut exact = true;
                 for child in children {
                     let child = self.evaluate_with_proof(child);
-                    candidates = match &self.page_layout {
-                        Some(layout) => {
-                            intersect_with_layout(&candidates, &child.candidates, layout)
-                        }
-                        None => intersect(&candidates, &child.candidates),
-                    };
+                    exact &= child.is_exact();
+                    candidates = intersect(&candidates, &child.candidates);
                     if matches!(candidates, PredicateResult::NoneMatch) {
                         // `guaranteed ⊆ candidates` makes the proof empty too;
                         // no remaining child can make an AND row eligible.
-                        return IndexPredicateEvaluation::candidates_only(
-                            PredicateResult::NoneMatch,
-                        );
+                        return IndexPredicateEvaluation::exact(PredicateResult::NoneMatch);
                     }
-                    guaranteed = match &self.page_layout {
-                        Some(layout) => {
-                            intersect_with_layout(&guaranteed, &child.guaranteed, layout)
-                        }
-                        None => intersect(&guaranteed, &child.guaranteed),
-                    };
+                    guaranteed = intersect(&guaranteed, child.guaranteed());
                 }
-                IndexPredicateEvaluation::new(candidates, guaranteed)
+                if exact {
+                    IndexPredicateEvaluation::exact(candidates)
+                } else {
+                    IndexPredicateEvaluation::new(candidates, guaranteed)
+                }
             }
             PredicateTree::Or(children) => {
                 let mut candidates = PredicateResult::NoneMatch;
                 let mut guaranteed = PredicateResult::NoneMatch;
+                let mut exact = true;
                 for child in children {
                     let child = self.evaluate_with_proof(child);
-                    candidates = match &self.page_layout {
-                        Some(layout) => union_with_layout(&candidates, &child.candidates, layout),
-                        None => union(&candidates, &child.candidates),
-                    };
-                    guaranteed = match &self.page_layout {
-                        Some(layout) => union_with_layout(&guaranteed, &child.guaranteed, layout),
-                        None => union(&guaranteed, &child.guaranteed),
-                    };
+                    exact &= child.is_exact();
+                    candidates = union(&candidates, &child.candidates);
+                    guaranteed = union(&guaranteed, child.guaranteed());
                 }
-                IndexPredicateEvaluation::new(candidates, guaranteed)
+                if exact {
+                    IndexPredicateEvaluation::exact(candidates)
+                } else {
+                    IndexPredicateEvaluation::new(candidates, guaranteed)
+                }
             }
         }
     }
 
+    /// Compile an exact index-native row set when one complete access path can
+    /// represent the whole predicate without materialization. Composite trees
+    /// continue through the generic bitmap algebra until their physical set
+    /// representation is made composable.
+    pub(crate) fn compile_exact_row_set(
+        &self,
+        predicate_tree: &PredicateTree,
+    ) -> Option<Arc<dyn ExactRowSet>> {
+        let PredicateTree::Leaf(predicate) = predicate_tree else {
+            return None;
+        };
+        let column_id = predicate.index_column_id()?;
+        let indexes = self.indexes.get(&column_id)?;
+        for binding in IndexPriority::ORDERED.into_iter().flat_map(|priority| {
+            indexes.iter().filter(move |binding| {
+                index_priority(binding.index().index_type(), predicate) == priority
+            })
+        }) {
+            if !self
+                .segment_rows
+                .is_some_and(|rows| binding.is_complete_for(rows))
+            {
+                continue;
+            }
+            if let Some(row_set) = binding.index().compile_exact_row_set(predicate) {
+                return Some(row_set);
+            }
+        }
+        None
+    }
+
     /// Evaluate a single predicate using the best available index.
     ///
-    /// Indexes are pre-filtered by column_id (stored in the HashMap)
-    /// and sorted by priority (ART > Bitmap > Bloom > ZoneMap).
+    /// Indexes are pre-filtered by column_id (stored in the HashMap) and
+    /// ordered by the predicate-aware access-path policy below.
     fn evaluate_single(&self, predicate: &Predicate) -> IndexPredicateEvaluation {
+        // Empty membership is an algebraic contradiction, independent of
+        // which access paths exist for the column. Prove it here so callers do
+        // not reopen/decode a column merely to discover that no row can pass.
+        // This is also the canonical representation used when binding an
+        // out-of-domain runtime parameter (for example SMALLINT = 100000).
+        if matches!(
+            predicate,
+            Predicate::In { values, .. } if values.is_empty()
+        ) || matches!(
+            predicate,
+            Predicate::FixedIn { values, .. } if values.is_empty()
+        ) || matches!(
+            predicate,
+            Predicate::StringPrefixIn { prefixes, .. } if prefixes.is_empty()
+        ) {
+            return IndexPredicateEvaluation::exact(PredicateResult::NoneMatch);
+        }
+
         let Some(column_id) = predicate.index_column_id() else {
             return IndexPredicateEvaluation::candidates_only(PredicateResult::Unknown);
         };
@@ -121,33 +169,86 @@ impl IndexEvaluator {
 
         let mut candidates = PredicateResult::Unknown;
         let mut guaranteed = PredicateResult::NoneMatch;
-        for index in indexes {
-            if !matches!(candidates, PredicateResult::Unknown) && !index.provides_predicate_proof()
+        for binding in IndexPriority::ORDERED.into_iter().flat_map(|priority| {
+            indexes.iter().filter(move |binding| {
+                index_priority(binding.index().index_type(), predicate) == priority
+            })
+        }) {
+            let complete_scalar = self
+                .segment_rows
+                .is_some_and(|rows| binding.is_complete_for(rows));
+            if !matches!(candidates, PredicateResult::Unknown)
+                && !complete_scalar
+                && !binding.index().provides_predicate_proof()
             {
                 continue;
             }
-            let result = index.evaluate_predicate_with_proof(predicate);
+            let result = if complete_scalar {
+                let candidates = binding.index().evaluate_predicate(predicate);
+                if matches!(candidates, PredicateResult::Unknown) {
+                    IndexPredicateEvaluation::candidates_only(candidates)
+                } else {
+                    IndexPredicateEvaluation::exact(candidates)
+                }
+            } else {
+                binding.index().evaluate_predicate_with_proof(predicate)
+            };
+            if result.is_exact() {
+                // An exact representation has completely answered this leaf.
+                // Consulting a second exact index can only reproduce the same
+                // set and is particularly expensive when that representation
+                // is an ART duplicate-key subtree.
+                return result;
+            }
+            let next_guaranteed = union(&guaranteed, result.guaranteed());
             if matches!(candidates, PredicateResult::Unknown)
                 && !matches!(result.candidates, PredicateResult::Unknown)
             {
                 candidates = result.candidates;
             }
-            guaranteed = match &self.page_layout {
-                Some(layout) => union_with_layout(&guaranteed, &result.guaranteed, layout),
-                None => union(&guaranteed, &result.guaranteed),
-            };
+            guaranteed = next_guaranteed;
         }
         IndexPredicateEvaluation::new(candidates, guaranteed)
     }
 }
 
-fn index_priority(index_type: &str) -> u8 {
-    match index_type {
-        "ART" => 0,
-        "BITMAP" => 1,
-        "BLOOM" => 2,
-        "ZONEMAP" => 3,
-        _ => 10,
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum IndexPriority {
+    PreferredScalar,
+    AlternateScalar,
+    Bloom,
+    ZoneMap,
+    Fallback,
+}
+
+impl IndexPriority {
+    const ORDERED: [Self; 5] = [
+        Self::PreferredScalar,
+        Self::AlternateScalar,
+        Self::Bloom,
+        Self::ZoneMap,
+        Self::Fallback,
+    ];
+}
+
+fn index_priority(index_type: &str, predicate: &Predicate) -> IndexPriority {
+    let ordered = matches!(
+        predicate,
+        Predicate::Lt { .. }
+            | Predicate::Le { .. }
+            | Predicate::Gt { .. }
+            | Predicate::Ge { .. }
+            | Predicate::Range { .. }
+    );
+    match (ordered, index_type) {
+        // ART performs an ordered cursor walk for ordinary range evaluation.
+        // Search-specific row-set compilation still reaches the bitmap path
+        // when ART cannot expose index-native membership.
+        (true, "ART") | (false, "BITMAP") => IndexPriority::PreferredScalar,
+        (true, "BITMAP") | (false, "ART") => IndexPriority::AlternateScalar,
+        (_, "BLOOM") => IndexPriority::Bloom,
+        (_, "ZONEMAP") => IndexPriority::ZoneMap,
+        _ => IndexPriority::Fallback,
     }
 }
 
@@ -156,6 +257,7 @@ mod tests {
     use super::*;
     use crate::index::predicate::{Predicate, PredicateTree};
     use crate::index::predicate_result::PageRange;
+    use crate::index::SegmentLocalComplete;
     use crate::index::{IndexConstraintType, IndexStorageInfo};
     use paro_common::chunk::Chunk;
     use paro_common::error::Result;
@@ -254,7 +356,7 @@ mod tests {
     }
 
     #[test]
-    fn test_priority_order() {
+    fn low_cardinality_bitmap_precedes_art() {
         let art = Arc::new(MockIndex::new(
             "ART",
             PredicateResult::Bitmap(RoaringBitmap::from_iter([1])),
@@ -277,11 +379,69 @@ mod tests {
 
         match result {
             PredicateResult::Bitmap(bitmap) => {
-                assert!(bitmap.contains(1));
-                assert!(!bitmap.contains(2));
+                assert!(bitmap.contains(2));
+                assert!(!bitmap.contains(1));
             }
-            _ => panic!("expected bitmap from ART"),
+            _ => panic!("expected posting bitmap"),
         }
+    }
+
+    #[test]
+    fn ordered_range_prefers_art_over_bitmap() {
+        let art = Arc::new(MockIndex::new(
+            "ART",
+            PredicateResult::Bitmap(RoaringBitmap::from_iter([1])),
+        ));
+        let bitmap = Arc::new(MockIndex::new(
+            "BITMAP",
+            PredicateResult::Bitmap(RoaringBitmap::from_iter([2])),
+        ));
+        let evaluator = IndexEvaluator::new(vec![bitmap.clone(), art.clone()]);
+        let result = evaluator.evaluate(&PredicateTree::leaf(Predicate::Range {
+            column_id: 0,
+            lower: paro_common::runtime_value::Value::Integer(1),
+            upper: paro_common::runtime_value::Value::Integer(3),
+        }));
+
+        assert!(matches!(result, PredicateResult::Bitmap(ref rows) if rows.contains(1)));
+        assert_eq!(art.evaluations.load(Ordering::Relaxed), 1);
+        assert_eq!(bitmap.evaluations.load(Ordering::Relaxed), 0);
+    }
+
+    #[test]
+    fn exactness_requires_matching_segment_completeness_credential() {
+        let index = Arc::new(MockIndex::new(
+            "BITMAP",
+            PredicateResult::Bitmap(RoaringBitmap::from_iter([1])),
+        ));
+        let predicate = PredicateTree::leaf(Predicate::Eq {
+            column_id: 0,
+            value: paro_common::runtime_value::Value::Integer(1),
+        });
+
+        let candidate_only = IndexEvaluator::new(vec![index.clone()]);
+        assert!(!candidate_only.evaluate_with_proof(&predicate).is_exact());
+
+        let completeness = SegmentLocalComplete::prove(4, 4).expect("complete segment");
+        let exact = IndexEvaluator::for_segment(
+            vec![PredicateIndexBinding::complete_scalar(index, completeness)],
+            4,
+        );
+        assert!(exact.evaluate_with_proof(&predicate).is_exact());
+        assert!(SegmentLocalComplete::prove(3, 4).is_err());
+    }
+
+    #[test]
+    fn empty_membership_is_exact_without_an_index_or_segment_credential() {
+        let evaluator = IndexEvaluator::new(Vec::new());
+        let result = evaluator.evaluate_with_proof(&PredicateTree::leaf(Predicate::In {
+            column_id: 0,
+            values: Vec::new(),
+        }));
+
+        assert!(result.is_exact());
+        assert!(matches!(result.candidates, PredicateResult::NoneMatch));
+        assert!(matches!(result.guaranteed(), PredicateResult::NoneMatch));
     }
 
     #[test]
@@ -329,7 +489,7 @@ mod tests {
         let result = evaluator.evaluate_with_proof(&PredicateTree::And(vec![leaf(1), leaf(2)]));
 
         assert!(matches!(result.candidates, PredicateResult::NoneMatch));
-        assert!(matches!(result.guaranteed, PredicateResult::NoneMatch));
+        assert!(matches!(result.guaranteed(), PredicateResult::NoneMatch));
         assert_eq!(rejecting.evaluations.load(Ordering::Relaxed), 1);
     }
 

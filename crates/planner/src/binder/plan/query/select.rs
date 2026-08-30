@@ -315,7 +315,8 @@ impl Binder {
 
     /// Plan a VALUES node.
     pub(crate) fn plan_values(&mut self, node: BoundValues) -> Result<LogicalOperator> {
-        let op = ExpressionGet::new(node.projection_index, node.values, node.names, node.types);
+        let op = ExpressionGet::new(node.projection_index, node.values, node.names, node.types)
+            .with_relation_alias(node.relation_alias);
         Ok(LogicalOperator::ExpressionGet(op))
     }
 }

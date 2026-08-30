@@ -16,6 +16,8 @@ pub struct ExpressionGet {
     pub names: Vec<String>,
     /// Column types
     pub types: Vec<LogicalType>,
+    /// Optional SQL relation namespace for derived VALUES producers.
+    pub relation_alias: Option<String>,
 }
 
 impl ExpressionGet {
@@ -30,6 +32,12 @@ impl ExpressionGet {
             expressions,
             names,
             types,
+            relation_alias: None,
         }
+    }
+
+    pub fn with_relation_alias(mut self, relation_alias: Option<String>) -> Self {
+        self.relation_alias = relation_alias;
+        self
     }
 }

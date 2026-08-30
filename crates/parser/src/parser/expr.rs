@@ -109,12 +109,6 @@ pub fn subexpr(min_precedence: u32) -> impl FnMut(Input) -> IResult<Expr> {
                                 value: literal(span)?.1,
                             };
                         }
-                        // replace json operator `?` to placeholder.
-                        ExprElement::JsonOp { op } => {
-                            if *op == JsonOperator::Question {
-                                *elem = ExprElement::Placeholder;
-                            }
-                        }
                         _ => {}
                     }
                 }
@@ -345,7 +339,9 @@ pub enum ExprElement {
     Hole {
         name: String,
     },
-    Placeholder,
+    Parameter {
+        index: usize,
+    },
     StageLocation {
         location: String,
     },
@@ -474,7 +470,7 @@ impl ExprElement {
             ExprElement::PreviousDay { .. } => Affix::Nilfix,
             ExprElement::NextDay { .. } => Affix::Nilfix,
             ExprElement::Hole { .. } => Affix::Nilfix,
-            ExprElement::Placeholder => Affix::Nilfix,
+            ExprElement::Parameter { .. } => Affix::Nilfix,
             ExprElement::VariableAccess { .. } => Affix::Nilfix,
             ExprElement::StageLocation { .. } => Affix::Nilfix,
         }
@@ -527,7 +523,7 @@ impl Expr {
             Expr::PreviousDay { .. } => Affix::Nilfix,
             Expr::NextDay { .. } => Affix::Nilfix,
             Expr::Hole { .. } => Affix::Nilfix,
-            Expr::Placeholder { .. } => Affix::Nilfix,
+            Expr::Parameter { .. } => Affix::Nilfix,
             Expr::StageLocation { .. } => Affix::Nilfix,
         }
     }
@@ -774,8 +770,9 @@ impl<'a, I: Iterator<Item = WithSpan<'a, ExprElement>>> PrattParser<I> for ExprP
                 span: transform_span(elem.span.tokens),
                 name,
             },
-            ExprElement::Placeholder => Expr::Placeholder {
+            ExprElement::Parameter { index } => Expr::Parameter {
                 span: transform_span(elem.span.tokens),
+                index,
             },
             ExprElement::VariableAccess(name) => {
                 let span = transform_span(elem.span.tokens);
@@ -1652,12 +1649,13 @@ pub fn expr_element(i: Input) -> IResult<WithSpan<ExprElement>> {
             })
         },
     );
-    let column_position = map(column_position, |column| ExprElement::ColumnRef {
-        column: ColumnRef {
-            schema: None,
-            table: None,
-            column,
-        },
+    let parameter = map_res(column_position, |column| match column {
+        ColumnID::Position(position) => Ok(ExprElement::Parameter {
+            index: position.pos - 1,
+        }),
+        ColumnID::Name(_) => Err(nom::Err::Failure(ErrorKind::Other(
+            "PostgreSQL parameter must use $n syntax",
+        ))),
     });
     let column_row = map(column_row, |column| ExprElement::ColumnRef {
         column: ColumnRef {
@@ -1675,7 +1673,7 @@ pub fn expr_element(i: Input) -> IResult<WithSpan<ExprElement>> {
     });
 
     if i.tokens.first().map(|token| token.kind) == Some(ColumnPosition) {
-        return with_span!(column_position).parse(i);
+        return with_span!(parameter).parse(i);
     }
 
     try_dispatch!(i, true,

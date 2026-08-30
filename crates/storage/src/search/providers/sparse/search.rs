@@ -17,7 +17,8 @@ use crate::search::providers::sparse::row_image::decode_sparse_runtime_value;
 use crate::search::row_fetch::snapshot_epoch;
 use crate::search::segment_dispatch::{dispatch_segments, SegmentDispatchResult};
 use crate::search::sidecar::{
-    SidecarArtifactStore, SidecarReaderCache, SidecarReaderRequest, SIDECAR_PACKAGE_CODEC,
+    DecodedReaderBinding, DecodedSidecarReaderRequest, SearchReaderRuntime, SidecarIntegrityPolicy,
+    SidecarReaderRequest, SIDECAR_PACKAGE_CODEC,
 };
 use crate::search::tail::exact_merge::{ensure_tail_exact_merge_budget, TailExactMergeQueryShape};
 use crate::search::tail_merge::{resolve_logical_rows, visible_row_ids};
@@ -77,12 +78,11 @@ impl SparseSearchProvider {
             },
         )?;
 
+        let reader_runtime = Arc::clone(&snapshot.reader_runtime);
         Ok(OpenedSearchCursor {
             snapshot: snapshot.clone(),
             cursor: Box::new(SparseSearchCursor {
-                sidecar_cache: Arc::new(SidecarReaderCache::new(SidecarArtifactStore::new(
-                    self.tablet.data_dir().clone(),
-                ))),
+                reader_runtime,
                 snapshot,
                 tablet: self.tablet,
                 storage_col_id: self.column_id as u32,
@@ -117,7 +117,7 @@ enum SparseCursorState {
 }
 
 struct SparseSearchCursor {
-    sidecar_cache: Arc<SidecarReaderCache>,
+    reader_runtime: Arc<SearchReaderRuntime>,
     snapshot: SearchReadSnapshot,
     tablet: TabletRef,
     storage_col_id: u32,
@@ -140,10 +140,10 @@ impl std::fmt::Debug for SparseSearchCursor {
 
 fn open_sidecar_sparse_index(
     snapshot: &SearchReadSnapshot,
-    cache: &SidecarReaderCache,
+    runtime: &SearchReaderRuntime,
     visible_segment: &VisibleSegment,
     column_id: u32,
-) -> Result<Option<SparseVectorIndex>> {
+) -> Result<Option<Arc<SparseVectorIndex>>> {
     let Some(artifact) =
         snapshot.artifact_for_segment(SearchIndexKind::Sparse, column_id, visible_segment)
     else {
@@ -156,13 +156,19 @@ fn open_sidecar_sparse_index(
         return Ok(None);
     }
 
-    let cached = cache.open(SidecarReaderRequest {
-        location: &artifact.location,
-        artifact_format_version: artifact.artifact_format_version,
-        provider: SearchIndexKind::Sparse,
-        codec: SIDECAR_PACKAGE_CODEC,
-    })?;
-    SparseVectorIndex::deserialize(cached.bytes()).map(Some)
+    let request = DecodedSidecarReaderRequest {
+        sidecar: SidecarReaderRequest {
+            location: &artifact.location,
+            artifact_format_version: artifact.artifact_format_version,
+            provider: SearchIndexKind::Sparse,
+            codec: SIDECAR_PACKAGE_CODEC,
+            integrity: SidecarIntegrityPolicy::EnvelopeChecksum,
+        },
+        binding: DecodedReaderBinding::SelfContained,
+    };
+    runtime.get_or_try_open_decoded(request, |cached| {
+        SparseVectorIndex::deserialize(cached.bytes()).map(Some)
+    })
 }
 
 fn sparse_ranked_rows_from_points(
@@ -215,7 +221,7 @@ impl SparseSearchCursor {
             self.snapshot.table_lease.visible_segments(),
             budget.parallelism_slots.max(1),
             self.telemetry.as_ref(),
-            |segment| {
+            |_, segment| {
                 let (rows, degraded) = self.search_segment(segment)?;
                 Ok(SegmentDispatchResult {
                     candidates_produced: rows.len(),
@@ -272,7 +278,7 @@ impl SparseSearchCursor {
         }
         if let Some(index) = open_sidecar_sparse_index(
             &self.snapshot,
-            self.sidecar_cache.as_ref(),
+            self.reader_runtime.as_ref(),
             visible_segment,
             self.storage_col_id,
         )? {
@@ -375,6 +381,7 @@ mod tests {
     };
     use crate::search::providers::sparse::row_image::encode_sparse_row_image;
     use crate::search::stats::{GenerationMaintenanceState, GenerationStats, SearchArtifactStats};
+    use crate::search::{SearchReaderRuntime, SidecarArtifactStore};
     use crate::table::table_factory::TableFactory;
     use crate::test_utils::{test_allocator, test_chunk_from_vectors};
     use paro_common::runtime_value::Value;
@@ -411,9 +418,13 @@ mod tests {
             ])]))
             .expect("append rows");
 
-        let (table_snapshot, table_lease) =
-            TableReadLease::open(&table.tablet(), table.tablet_id(), table.max_version())
-                .expect("open table lease");
+        let (table_snapshot, table_lease) = TableReadLease::open(
+            &table.tablet(),
+            table.tablet_id(),
+            table.max_version(),
+            &crate::search::SearchReadOptions::ungoverned(),
+        )
+        .expect("open table lease");
         let visible_segment = table_lease
             .visible_segments()
             .first()
@@ -436,10 +447,14 @@ mod tests {
         let artifact = SearchArtifactRef {
             definition_id: 8,
             generation_id: 1,
-            segment: ArtifactSegmentRef {
-                rowset_id: visible_segment.rowset_id,
-                segment_id: visible_segment.segment_id,
-            },
+            coverage: crate::search::SearchPartitionCoverage::singleton(
+                ArtifactSegmentRef {
+                    rowset_id: visible_segment.rowset_id,
+                    segment_id: visible_segment.segment_id,
+                },
+                2,
+            )
+            .unwrap(),
             column_id: 0,
             kind: SearchIndexKind::Sparse,
             provider_variant: 1,
@@ -461,9 +476,13 @@ mod tests {
             coverage: CoverageState::Complete,
             generation_stats: GenerationStats::default(),
             maintenance_state: GenerationMaintenanceState::default(),
+            provider_config: Arc::new(serde_json::Value::Null),
+            hnsw_provider_config: None,
+            hnsw_query_activity: None,
             artifacts: Arc::new(GenerationArtifactSet {
                 artifacts: vec![artifact],
             }),
+            tail_pending_entries: Arc::from([]),
         };
         let generation_lease = GenerationReadLease::from_snapshot(&generation);
         let snapshot = SearchReadSnapshot::new(
@@ -472,6 +491,9 @@ mod tests {
             generation,
             table_lease,
             generation_lease,
+            Arc::new(SearchReaderRuntime::new(SidecarArtifactStore::new(
+                table.tablet().data_dir().clone(),
+            ))),
         );
 
         let opened = SparseSearchProvider::new(table.tablet(), 0, &query, 10, None)
@@ -516,9 +538,17 @@ mod tests {
             ])]))
             .expect("append rows");
 
-        let (table_snapshot, table_lease) =
-            TableReadLease::open(&table.tablet(), table.tablet_id(), table.max_version())
-                .expect("open table lease");
+        let (table_snapshot, table_lease) = TableReadLease::open(
+            &table.tablet(),
+            table.tablet_id(),
+            table.max_version(),
+            &crate::search::SearchReadOptions::ungoverned(),
+        )
+        .expect("open table lease");
+        let visible_segment = table_lease
+            .visible_segments()
+            .first()
+            .expect("visible segment");
         let generation = GenerationReadSnapshot {
             definition_id: 9,
             generation_id: 1,
@@ -533,9 +563,21 @@ mod tests {
             },
             generation_stats: GenerationStats::default(),
             maintenance_state: GenerationMaintenanceState::default(),
+            provider_config: Arc::new(serde_json::Value::Null),
+            hnsw_provider_config: None,
+            hnsw_query_activity: None,
             artifacts: Arc::new(GenerationArtifactSet {
                 artifacts: Vec::new(),
             }),
+            tail_pending_entries: Arc::from([crate::search::TailPendingEntry {
+                entry_id: crate::search::TailEntryId(1),
+                rowset_id: visible_segment.rowset_id,
+                segment_ids: vec![visible_segment.segment_id],
+                mutation: crate::search::TailMutationKind::Append,
+                row_count: 2,
+                byte_count: visible_segment.segment.file_size(),
+                row_image_ref: Some(crate::search::TailRowImageRef::WholeRowset),
+            }]),
         };
         let generation_lease = GenerationReadLease::from_snapshot(&generation);
         let snapshot = SearchReadSnapshot::new(
@@ -544,7 +586,11 @@ mod tests {
             generation,
             table_lease,
             generation_lease,
+            Arc::new(SearchReaderRuntime::new(SidecarArtifactStore::new(
+                table.tablet().data_dir().clone(),
+            ))),
         );
+        assert_eq!(snapshot.tail_window().committed_rows, 2);
         let query = SparseVector::new(vec![1], vec![1.0]).unwrap();
         let opened = SparseSearchProvider::new(table.tablet(), 0, &query, 10, None)
             .open(snapshot)

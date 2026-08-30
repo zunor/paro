@@ -9,7 +9,7 @@ fn streaming_topn_guard_rejects_missing_order() {
         orders: Box::new([]),
         limit: 10,
         offset: 0,
-        hnsw_ef_hint: None,
+        hnsw_options: Default::default(),
         output_names: vec!["a".to_string()].into_boxed_slice(),
         output_types: vec![LogicalType::Integer].into_boxed_slice(),
     };

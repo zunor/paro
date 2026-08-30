@@ -43,6 +43,7 @@ use paro_execution::operators::graph::refresh_property_graph::{
 use paro_execution::query_executor::executor::Executor;
 use paro_instance::{DatabaseHandle, Instance};
 use paro_storage::metrics::storage_metrics;
+use paro_storage::transaction::write_buffer::transaction_write_buffer_memory_budget;
 use paro_transaction::{CommitAckPolicy, DatabaseId, IsolationLevel, ReadTrackingPolicy};
 use std::collections::HashMap;
 use std::ops::AsyncFnOnce;
@@ -91,8 +92,8 @@ pub struct Session {
     active_query: Option<ActiveQueryContext>,
     /// Registered state manager for extensible session state
     registered_state: RegisteredStateManager,
-    /// Buffered COPY FROM STDIN payload limit used by the transitional bridge.
-    copy_stdin_memory_limit: usize,
+    /// In-flight COPY FROM STDIN payload and queue-metadata memory waterline.
+    copy_stdin_inflight_memory_limit: usize,
     /// Session-owned retained result budget for holdable portals/cursors.
     session_memory_budget: Arc<SessionMemoryBudget>,
 }
@@ -498,6 +499,7 @@ impl Session {
             time: paro_context::StatementTimeContext::capture(
                 self.transaction.transaction_started_at(),
             ),
+            random: self.state.random_engine.clone(),
             databases: Arc::new(AttachedDatabaseDirectory::new(
                 self.instance.database_registry().visible_generation(),
                 Some(self.current_database.name().to_string()),
@@ -569,8 +571,9 @@ impl Session {
             .default_database()
             .expect("Default database must exist");
         let default_db_name = current_database.name().to_string();
-        let default_copy_stdin_memory_limit =
-            default_copy_stdin_memory_limit(instance.runtime_tuning().snapshot().maximum_memory);
+        let default_copy_stdin_inflight_memory_limit = default_copy_stdin_inflight_memory_limit(
+            instance.runtime_tuning().snapshot().maximum_memory,
+        );
 
         let user_name = user_name.into();
         let mut session = Self {
@@ -589,7 +592,7 @@ impl Session {
             current_database,
             active_query: None,
             registered_state: RegisteredStateManager::new(),
-            copy_stdin_memory_limit: default_copy_stdin_memory_limit,
+            copy_stdin_inflight_memory_limit: default_copy_stdin_inflight_memory_limit,
             session_memory_budget: Arc::new(SessionMemoryBudget::new(
                 instance.runtime_tuning().snapshot().maximum_memory,
                 instance.get_memory_arbitrator().clone(),
@@ -719,12 +722,12 @@ impl Session {
         &self.execution_control
     }
 
-    pub fn copy_stdin_memory_limit(&self) -> usize {
-        self.copy_stdin_memory_limit
+    pub fn copy_stdin_inflight_memory_limit(&self) -> usize {
+        self.copy_stdin_inflight_memory_limit
     }
 
-    pub fn set_copy_stdin_memory_limit(&mut self, limit: usize) {
-        self.copy_stdin_memory_limit = limit;
+    pub fn set_copy_stdin_inflight_memory_limit(&mut self, limit: usize) {
+        self.copy_stdin_inflight_memory_limit = limit;
     }
 
     pub fn session_memory_budget(&self) -> Arc<SessionMemoryBudget> {
@@ -737,14 +740,34 @@ impl Session {
 
     pub fn refresh_session_metadata(&mut self) {
         let settings = collect_setting_rows(self);
+        let prepared_statements = self.collect_prepared_statement_metadata();
+        let cursors = self.collect_cursor_metadata();
 
-        let mut prepared_statements = self
+        self.session_metadata.replace(SessionMetadataRows {
+            settings,
+            prepared_statements,
+            cursors,
+        });
+    }
+
+    pub(crate) fn refresh_prepared_statement_metadata(&self) {
+        self.session_metadata
+            .replace_prepared_statements(self.collect_prepared_statement_metadata());
+    }
+
+    pub(crate) fn refresh_cursor_metadata(&self) {
+        self.session_metadata
+            .replace_cursors(self.collect_cursor_metadata());
+    }
+
+    fn collect_prepared_statement_metadata(&self) -> Vec<PreparedStatementSummary> {
+        let mut rows = self
             .state
             .prepared
             .statements()
             .map(|entry| PreparedStatementSummary {
                 name: entry.name.clone(),
-                statement: entry.source_sql.clone(),
+                statement: entry.source_sql.to_string(),
                 parameter_types: parameter_types_to_pg_array(&entry.parameter_types),
                 from_sql: matches!(
                     entry.source,
@@ -755,9 +778,12 @@ impl Session {
                 custom_plans: 0,
             })
             .collect::<Vec<_>>();
-        prepared_statements.sort_by(|a, b| a.name.cmp(&b.name));
+        rows.sort_by(|a, b| a.name.cmp(&b.name));
+        rows
+    }
 
-        let mut cursors = self
+    fn collect_cursor_metadata(&self) -> Vec<CursorSummary> {
+        let mut rows = self
             .state
             .prepared
             .portals()
@@ -766,7 +792,7 @@ impl Session {
                 let owner = retention.and_then(|retention| retention.owner());
                 CursorSummary {
                     name: entry.name.clone(),
-                    statement: entry.source_sql.clone(),
+                    statement: entry.source_sql.to_string(),
                     is_holdable: matches!(
                         entry.holdability,
                         crate::prepared::portal::CursorHoldability::WithHold
@@ -793,13 +819,8 @@ impl Session {
                 }
             })
             .collect::<Vec<_>>();
-        cursors.sort_by(|a, b| a.name.cmp(&b.name));
-
-        self.session_metadata.replace(SessionMetadataRows {
-            settings,
-            prepared_statements,
-            cursors,
-        });
+        rows.sort_by(|a, b| a.name.cmp(&b.name));
+        rows
     }
 
     pub(crate) fn clear_protocol_unnamed_objects(&mut self) {
@@ -1492,12 +1513,19 @@ impl Session {
     /// This is used by `execute.rs` for automatic transaction management.
     pub(crate) fn begin_transaction_internal(&mut self) -> Result<()> {
         self.wait_for_async_commit_floor_published()?;
-        self.transaction.begin_transaction_for_database(
+        let transaction = self.transaction.begin_transaction_for_database(
             self.current_database.transaction_manager(),
             DatabaseId::new(self.current_database.id()),
             self.current_database.name(),
             ReadTrackingPolicy::SafeSnapshotPreferred,
         )?;
+        let settings = EffectiveSettings::new(self.effective_settings.clone());
+        let session_memory_limit = settings
+            .memory_limit()
+            .unwrap_or_else(|| self.instance.runtime_tuning().snapshot().maximum_memory);
+        transaction.set_write_buffer_memory_budget_bytes(transaction_write_buffer_memory_budget(
+            session_memory_limit,
+        ));
         self.registered_state.notify_transaction_begin();
         Ok(())
     }
@@ -1671,7 +1699,7 @@ impl Session {
     }
 }
 
-fn default_copy_stdin_memory_limit(cluster_max_memory: usize) -> usize {
+fn default_copy_stdin_inflight_memory_limit(cluster_max_memory: usize) -> usize {
     (cluster_max_memory / 4).min(MAX_COPY_STDIN_MEMORY_LIMIT)
 }
 

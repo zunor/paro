@@ -218,7 +218,7 @@ pub fn bind_graph_table(
         .unwrap_or_else(|| graph_name.clone());
 
     binder.bind_context.add_binding(
-        binding_alias,
+        binding_alias.clone(),
         table_index,
         output_names.clone(),
         output_types.clone(),
@@ -229,6 +229,7 @@ pub fn bind_graph_table(
         bound_pattern,
         bound_columns,
         table_index,
+        relation_alias: binding_alias,
         output_names,
         output_types,
         path_mode: graph_table_ref.match_clause.path_mode.clone(),

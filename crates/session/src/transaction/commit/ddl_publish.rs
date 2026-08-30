@@ -3,7 +3,7 @@
 
 //! DDL publish helpers used by the SQL commit pipeline.
 
-use super::super::ddl_changes::IndexPostCommitAction;
+use super::super::ddl_changes::{IndexPostCommitAction, SearchGenerationRetirementAction};
 use super::super::index_backfill::IndexBackfillPlan;
 use paro_catalog::entry::{
     IndexCatalogEntry, IndexCoverage, IndexType as CatalogIndexType, TableCatalogEntry,
@@ -11,33 +11,27 @@ use paro_catalog::entry::{
 use paro_catalog::mvcc::CatalogSnapshot;
 use paro_common::effect::{
     ApplyDescriptor, CleanupDescriptor, RuntimeTransitionDescriptor, StagedArtifactDescriptor,
+    TabletMutation,
 };
 use paro_common::error::Result;
 use paro_common::identity::GraphId;
 use paro_common::logging::targets;
-use paro_common::types::LogicalType;
 use paro_instance::{DatabaseHandle, Instance};
 use paro_storage::{
     index::{
         graph::{lock_graph_artifact_io, GraphProjectionIndex, GraphStorageGeneration},
         BoundIndex,
     },
-    search::{SearchFreshnessPolicy, SearchIndexDefinition, SearchIndexKind},
+    search::{
+        SearchFreshnessPolicy, SearchIndexDefinition, SearchIndexKind, StagedSearchGeneration,
+    },
     table::table_handle::TableHandle,
     transaction::descriptor_cleanup::apply_cleanup_descriptor as run_cleanup_descriptor,
 };
-use serde_json::{json, Value};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 type CommitApplyWork = Box<dyn FnOnce(u64) -> Result<()> + Send + 'static>;
-
-fn vector_dimension(logical_type: &LogicalType) -> u64 {
-    match logical_type {
-        LogicalType::Array(_, dimension) => *dimension as u64,
-        _ => 0,
-    }
-}
 
 pub(super) fn build_apply_descriptor_phase(
     instance: Arc<Instance>,
@@ -130,6 +124,7 @@ fn publish_staged_artifact(
             })
         }
         StagedArtifactDescriptor::BulkLoadRowset(_artifact) => Ok(()),
+        StagedArtifactDescriptor::SearchGenerationBuild(_artifact) => Ok(()),
     }
 }
 
@@ -223,8 +218,7 @@ fn detach_index_state(
     match CatalogIndexType::from_str(index_type) {
         CatalogIndexType::ART => {
             for column_id in column_ids {
-                storage.forget_art_index(*column_id);
-                storage.drop_art_index(*column_id)?;
+                storage.release_art_index(index_name, *column_id)?;
             }
         }
         CatalogIndexType::HNSW | CatalogIndexType::Sparse | CatalogIndexType::FullText => {
@@ -259,6 +253,59 @@ pub(super) struct IndexBackfillPublishTask {
     built_index: Option<Arc<dyn BoundIndex>>,
     coverage: Option<IndexCoverage>,
     backfill: Option<IndexBackfillPlan>,
+    staged_search_generation: Option<Arc<StagedSearchGeneration>>,
+}
+
+#[derive(Clone)]
+pub(super) struct StagedGenerationPublishTask {
+    tablet_id: u64,
+    storage: Arc<TableHandle>,
+    mutation: TabletMutation,
+    owner: Arc<StagedSearchGeneration>,
+}
+
+#[derive(Clone)]
+pub(super) struct SearchGenerationRetirementTask {
+    tablet_id: u64,
+    storage: Arc<TableHandle>,
+    mutation: TabletMutation,
+}
+
+impl SearchGenerationRetirementTask {
+    pub(super) fn from_action(action: &SearchGenerationRetirementAction) -> Self {
+        let tablet_id = action.storage.tablet_id();
+        Self {
+            tablet_id,
+            storage: Arc::clone(&action.storage),
+            mutation: TabletMutation::RetireSearchGeneration {
+                definition_id: action.definition_id,
+            },
+        }
+    }
+
+    pub(super) fn tablet_id(&self) -> u64 {
+        self.tablet_id
+    }
+
+    pub(super) fn apply(&self) -> Result<()> {
+        self.storage
+            .apply_search_generation_retirement(&self.mutation)
+    }
+}
+
+impl StagedGenerationPublishTask {
+    pub(super) fn tablet_id(&self) -> u64 {
+        self.tablet_id
+    }
+
+    pub(super) fn apply(&self) -> Result<()> {
+        self.storage
+            .apply_search_generation_publish(&self.mutation)?;
+        // Once the immutable directory and tablet head are durable, recovery
+        // no longer needs the private staging workspace as a source.
+        self.owner.mark_published()?;
+        Ok(())
+    }
 }
 
 impl IndexBackfillPublishTask {
@@ -270,25 +317,55 @@ impl IndexBackfillPublishTask {
             built_index: action.built_index.clone(),
             coverage: action.coverage.clone(),
             backfill: action.backfill.clone(),
+            staged_search_generation: action.staged_search_generation.clone(),
         }
     }
 
+    pub(super) fn staged_generation_publish_task(
+        &self,
+    ) -> Result<Option<StagedGenerationPublishTask>> {
+        let Some(staged) = self.staged_search_generation.as_ref() else {
+            return Ok(None);
+        };
+        let storage = self.table.get_storage().cloned().ok_or_else(|| {
+            paro_common::error::internal("staged search generation lost table storage")
+        })?;
+        let mutation = staged.mutation();
+        if !matches!(mutation, TabletMutation::PublishSearchGeneration { .. }) {
+            return Err(paro_common::error::internal(
+                "staged search generation produced the wrong mutation kind",
+            ));
+        }
+        Ok(Some(StagedGenerationPublishTask {
+            tablet_id: storage.tablet_id(),
+            storage,
+            mutation,
+            owner: Arc::clone(staged),
+        }))
+    }
+
+    pub(super) fn staged_search_generation(&self) -> Option<Arc<StagedSearchGeneration>> {
+        self.staged_search_generation.clone()
+    }
+
     pub(super) fn execute(&self, publish_ts: u64) -> Result<()> {
-        if let Some(backfill) = &self.backfill {
-            let report = backfill.bounded_final_catch_up(
-                publish_ts,
-                self.table.as_ref(),
-                self.entry.as_ref(),
-            )?;
-            tracing::debug!(
-                target: targets::TRANSACTION,
-                index = %self.info.name,
-                table = %self.info.table_name,
-                from_ts = report.from_ts,
-                to_ts = report.to_ts,
-                consumed_commits = report.consumed_commits,
-                "CREATE INDEX bounded final catch-up completed"
-            );
+        if self.staged_search_generation.is_none() {
+            if let Some(backfill) = &self.backfill {
+                let report = backfill.bounded_final_catch_up(
+                    publish_ts,
+                    self.table.as_ref(),
+                    self.entry.as_ref(),
+                )?;
+                tracing::debug!(
+                    target: targets::TRANSACTION,
+                    index = %self.info.name,
+                    table = %self.info.table_name,
+                    from_ts = report.from_ts,
+                    to_ts = report.to_ts,
+                    consumed_commits = report.consumed_commits,
+                    "CREATE INDEX bounded final catch-up completed"
+                );
+            }
         }
 
         let Some(storage) = self.table.get_storage() else {
@@ -319,10 +396,20 @@ impl IndexBackfillPublishTask {
                     "ART indexes currently require exactly one column",
                 ));
             };
-            storage.rebuild_art_index(column_id.index)?;
+            storage.install_art_index(&self.info.name, column_id.index)?;
         }
 
+        if let Some(staged) = self.staged_search_generation.as_ref() {
+            storage.adopt_staged_search_generation_readers(staged.as_ref());
+        }
         Self::register_search_definition(storage.as_ref(), self.entry.as_ref())?;
+        if Self::search_kind(self.info.index_type).is_some()
+            && self.staged_search_generation.is_none()
+        {
+            return Err(paro_common::error::internal(
+                "search index reached required publish without a staged generation",
+            ));
+        }
         let coverage = self.recompute_coverage(storage.as_ref())?;
         self.entry.mark_ready_with_coverage(coverage);
         Ok(())
@@ -361,22 +448,22 @@ impl IndexBackfillPublishTask {
                 .collect(),
             expression: Self::search_expression(entry),
             freshness_policy: SearchFreshnessPolicy::default_for_kind(kind),
-            provider_config: Self::search_provider_config(storage, entry)?,
+            provider_config: entry.provider_config.clone(),
             config_fingerprint: 0,
         };
         let expression = definition.expression.clone();
         let provider_config = definition.provider_config.clone();
         let column_ids = definition.column_ids.clone();
         let definition = SearchIndexDefinition {
-            config_fingerprint: SearchIndexDefinition::compute_config_fingerprint(
+            config_fingerprint: SearchIndexDefinition::try_compute_config_fingerprint(
                 kind,
                 &column_ids,
                 expression.as_deref(),
                 &provider_config,
-            ),
+            )?,
             ..definition
         };
-        storage.register_search_definition(definition)
+        storage.register_published_search_definition(definition)
     }
 
     fn search_kind(index_type: CatalogIndexType) -> Option<SearchIndexKind> {
@@ -397,41 +484,5 @@ impl IndexBackfillPublishTask {
             "to_tsvector('{}', col_{})",
             binding.config, binding.column_id.index
         ))
-    }
-
-    fn search_provider_config(storage: &TableHandle, entry: &IndexCatalogEntry) -> Result<Value> {
-        match entry.index_type {
-            CatalogIndexType::HNSW => {
-                let [column] = entry.get_column_ids() else {
-                    return Err(paro_common::error::not_supported(
-                        "HNSW search definition requires exactly one indexed column",
-                    ));
-                };
-                let schema = storage.tablet().schema().ok_or_else(|| {
-                    paro_common::error::internal("table schema missing for HNSW config")
-                })?;
-                let column = schema.column_by_id(column.index).ok_or_else(|| {
-                    paro_common::error::column_not_found(format!(
-                        "HNSW index column {} not found in schema",
-                        column.index
-                    ))
-                })?;
-                Ok(json!({
-                    "m": column.hnsw_m,
-                    "ef_construct": column.hnsw_ef_construct,
-                    "distance": column.hnsw_distance,
-                    "dimension": vector_dimension(&column.logical_type),
-                }))
-            }
-            CatalogIndexType::Sparse => Ok(json!({ "physical_encoding": "binary-v1" })),
-            CatalogIndexType::FullText => {
-                let config = entry
-                    .fulltext_binding()
-                    .map(|binding| binding.config.clone())
-                    .unwrap_or_else(|| "simple".to_string());
-                Ok(json!({ "config": config }))
-            }
-            _ => Ok(json!({})),
-        }
     }
 }

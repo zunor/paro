@@ -30,6 +30,28 @@ pub(super) fn commit_runtime_error_to_paro(error: CommitRuntimeError) -> ParoErr
     }
 }
 
+/// Whether the runtime has proved that no durable commit record exists.
+///
+/// Callers may destroy pre-commit artifact sources only for these outcomes.
+/// Apply failures, ambiguous outcomes, and unknown completion slots retain
+/// their sources for recovery even when that means a temporary disk orphan.
+pub(super) fn commit_runtime_error_is_definitely_nondurable(error: &CommitRuntimeError) -> bool {
+    match error {
+        CommitRuntimeError::AdmissionClosed
+        | CommitRuntimeError::Queue(_)
+        | CommitRuntimeError::Poisoned(_) => true,
+        CommitRuntimeError::Completion(CommitCompletionError::Rejected(_)) => true,
+        CommitRuntimeError::Completion(CommitCompletionError::Failed(
+            CommitRuntimeFailure::Append(_) | CommitRuntimeFailure::AppendCleanup(_),
+        )) => true,
+        CommitRuntimeError::Completion(
+            CommitCompletionError::Failed(_)
+            | CommitCompletionError::AmbiguousCommitted(_)
+            | CommitCompletionError::UnknownSlot(_),
+        ) => false,
+    }
+}
+
 fn commit_completion_error_to_paro(error: CommitCompletionError) -> ParoError {
     match error {
         CommitCompletionError::Rejected(CommitRuntimeRejection::Fence(reason)) => {

@@ -31,6 +31,29 @@ pub enum SearchMaintenanceAction {
     Rebuild,
 }
 
+/// How quickly the database coordinator should service newly visible search
+/// debt. Notifications accelerate discovery; durable manifest state remains
+/// the level-triggered source of truth.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, PartialOrd, Ord)]
+pub enum SearchMaintenanceUrgency {
+    /// Run after the write stream reaches a quiet boundary. Opportunistic
+    /// maintenance must not fragment one sustained ingest into time slices.
+    #[default]
+    Quiescent,
+    /// Run after quiescence or an anchored maximum delay. This is used once a
+    /// definition-owned build quantum has accumulated.
+    Deadline,
+    /// Run without debounce because the definition's high watermark or an
+    /// explicit lifecycle boundary requires immediate progress.
+    Immediate,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SearchMaintenanceFailure {
+    pub definition_id: Option<u64>,
+    pub message: String,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DefinitionMaintenanceReport {
     pub definition_id: u64,
@@ -56,6 +79,28 @@ pub struct SearchMaintenanceReport {
     pub manifest_delta_compaction_requested: bool,
     pub sidecar_repack_requested: bool,
     pub definitions: Vec<DefinitionMaintenanceReport>,
+    pub failures: Vec<SearchMaintenanceFailure>,
+    pub retry_deferred_definitions: usize,
+}
+
+impl SearchMaintenanceReport {
+    pub fn has_pending_work(&self) -> bool {
+        self.retry_deferred_definitions > 0
+            || !self.failures.is_empty()
+            || self.definitions.iter().any(|definition| {
+                !matches!(definition.action, SearchMaintenanceAction::Skip)
+                    || definition.tail_pending_rows > 0
+            })
+    }
+
+    pub fn requires_immediate_follow_up(&self) -> bool {
+        self.definitions.iter().any(|definition| {
+            matches!(
+                definition.priority,
+                MaintenancePriority::Elevated | MaintenancePriority::Critical
+            )
+        })
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -77,7 +122,7 @@ pub struct HnswMaintenanceRequest {
     pub generation_id: u64,
     pub tail_window: Vec<TailPendingEntry>,
     pub rowset_refs: Vec<HnswMaintenanceRowsetRef>,
-    pub estimated_graph_memory_bytes: u64,
+    pub estimated_build_peak_memory_bytes: u64,
     pub dimension: u32,
     pub freshness_priority: MaintenancePriority,
 }
@@ -85,9 +130,9 @@ pub struct HnswMaintenanceRequest {
 impl HnswMaintenanceRequest {
     pub fn new(
         definition: &SearchIndexDefinition,
+        provider: &super::HnswProviderConfig,
         generation_id: u64,
         tail_window: Vec<TailPendingEntry>,
-        dimension: u32,
         freshness_priority: MaintenancePriority,
     ) -> Option<Self> {
         if definition.kind != SearchIndexKind::Hnsw || tail_window.is_empty() {
@@ -95,23 +140,19 @@ impl HnswMaintenanceRequest {
         }
         let rowset_refs = hnsw_rowset_refs(&tail_window);
         let vector_count = rowset_refs.iter().map(|rowset| rowset.row_count).sum();
-        let m = definition
-            .provider_config
-            .get("m")
-            .and_then(|value| value.as_u64().or_else(|| value.as_str()?.parse().ok()))
-            .and_then(|value| u32::try_from(value).ok())
-            .unwrap_or(16);
         Some(Self {
             definition_id: definition.definition_id,
             generation_id,
             tail_window,
             rowset_refs,
-            estimated_graph_memory_bytes: HnswInlineThreshold::estimate_graph_memory_bytes(
-                vector_count,
-                dimension,
-                m,
-            ),
-            dimension,
+            estimated_build_peak_memory_bytes:
+                HnswInlineThreshold::estimate_contract_build_peak_memory_bytes(
+                    vector_count,
+                    provider.dimension,
+                    &provider.build_contract(),
+                    crate::index::hnsw::hnsw_build_thread_count(),
+                ),
+            dimension: provider.dimension,
             freshness_priority,
         })
     }
@@ -207,7 +248,7 @@ mod tests {
                     }
                 },
                 generation_stats: GenerationStats::default(),
-                next_tail_entry_id: TailEntryId(2),
+                persisted_tail_entry_id_seed: TailEntryId(2),
                 execution_modes: ExecutionModes::default(),
                 maintenance_state: GenerationMaintenanceState {
                     build_watermarks: BuildWatermarks::default(),
@@ -225,16 +266,15 @@ mod tests {
                 recent_delta_files: (0..recent_delta_count)
                     .map(|ordinal| ManifestFileRef {
                         file_name: format!("delta_{ordinal}.json"),
-                        codec: ManifestCodecKind::JSON_DEBUG_V1,
+                        codec: ManifestCodecKind::JSON_DEBUG_V4,
                     })
                     .collect(),
-                materialized_state_file: None,
             },
             root_path: PathBuf::new(),
             shard_paths: Vec::new(),
             delta_paths: Vec::new(),
-            materialized_state_path: None,
-            embedded_materialized_state: false,
+            tail_entry_id_allocator: TailEntryId(2),
+            publication_lease: None,
             artifacts: Arc::new(GenerationArtifactSet::default()),
             tail_pending_entries,
         }
@@ -252,7 +292,7 @@ mod tests {
                 kind: SearchIndexKind::FullText,
                 column_ids: vec![0],
                 expression: None,
-                provider_config: serde_json::json!({"config": "simple"}),
+                provider_config: serde_json::json!({"version": 1, "config": "simple"}),
                 freshness_policy: SearchFreshnessPolicy::default_for_kind(
                     SearchIndexKind::FullText,
                 ),
@@ -272,6 +312,37 @@ mod tests {
     }
 
     #[test]
+    fn maintenance_scheduler_drains_tail_before_large_artifact_compaction() {
+        let manifest = sample_loaded_manifest(2, 0);
+        let definition = SearchIndexDefinition {
+            definition_id: 7,
+            table_id: 11,
+            name: "docs_fts".to_string(),
+            kind: SearchIndexKind::FullText,
+            column_ids: vec![0],
+            expression: None,
+            provider_config: serde_json::json!({"version": 1, "config": "simple"}),
+            freshness_policy: SearchFreshnessPolicy::default_for_kind(SearchIndexKind::FullText),
+            config_fingerprint: 99,
+        };
+
+        let decision = MaintenanceScheduler::default().decide_definition(
+            &definition,
+            &manifest,
+            GcDecision::CompactOnly,
+            &ArtifactGcContext {
+                bytes_on_disk: 256 * 1024 * 1024,
+                ..Default::default()
+            },
+            0,
+        );
+
+        assert_eq!(decision.gc_decision, GcDecision::CompactOnly);
+        assert_eq!(decision.action, SearchMaintenanceAction::CatchUp);
+        assert_eq!(decision.estimate.benefit.expected_tail_rows_drained, 2);
+    }
+
+    #[test]
     fn maintenance_scheduler_requests_manifest_delta_compaction_over_soft_window() {
         let manifest = sample_loaded_manifest(0, DELTA_COUNT_SOFT_LIMIT + 1);
 
@@ -283,7 +354,7 @@ mod tests {
                 kind: SearchIndexKind::FullText,
                 column_ids: vec![0],
                 expression: None,
-                provider_config: serde_json::json!({"config": "simple"}),
+                provider_config: serde_json::json!({"version": 1, "config": "simple"}),
                 freshness_policy: SearchFreshnessPolicy::default_for_kind(
                     SearchIndexKind::FullText,
                 ),
@@ -319,7 +390,7 @@ mod tests {
             kind: SearchIndexKind::FullText,
             column_ids: vec![0],
             expression: None,
-            provider_config: serde_json::json!({"config": "simple"}),
+            provider_config: serde_json::json!({"version": 1, "config": "simple"}),
             freshness_policy: SearchFreshnessPolicy::default_for_kind(SearchIndexKind::FullText),
             config_fingerprint: 99,
         };
@@ -434,6 +505,58 @@ mod tests {
             scheduler.admit_requests(&[follow_up])[0].is_admitted(),
             "queued task leases must release active provider slots after execution"
         );
+    }
+
+    #[test]
+    fn maintenance_scheduler_single_quantum_does_not_leak_unexecuted_grants() {
+        let scheduler = Arc::new(MaintenanceScheduler::with_policy(
+            MaintenanceAdmissionPolicy {
+                fulltext_concurrency: 2,
+                table_concurrency: 2,
+                ..MaintenanceAdmissionPolicy::default()
+            },
+        ));
+        let requests = [
+            admission_request(
+                8,
+                SearchIndexKind::FullText,
+                MaintenancePriority::Opportunistic,
+                CatchUpBacklogTier::Healthy,
+                CostEstimate::default(),
+            ),
+            admission_request(
+                7,
+                SearchIndexKind::FullText,
+                MaintenancePriority::Critical,
+                CatchUpBacklogTier::Degraded,
+                CostEstimate::default(),
+            ),
+        ];
+
+        let decisions = scheduler.schedule_next_request(&requests);
+        assert_eq!(
+            decisions
+                .iter()
+                .filter(|decision| decision.is_admitted())
+                .count(),
+            1
+        );
+        assert_eq!(scheduler.queued_task_count(), 1);
+        let task = scheduler.pop_next_task().expect("one fairness quantum");
+        assert_eq!(task.request.definition_id, 7);
+        drop(scheduler.scoped_task_lease(&task));
+        assert_eq!(scheduler.queued_task_count(), 0);
+
+        let follow_up = scheduler.schedule_next_request(&requests);
+        assert_eq!(
+            follow_up
+                .iter()
+                .filter(|decision| decision.is_admitted())
+                .count(),
+            1
+        );
+        let task = scheduler.pop_next_task().expect("next fairness quantum");
+        drop(scheduler.scoped_task_lease(&task));
     }
 
     #[test]
@@ -953,6 +1076,7 @@ mod tests {
                     vector_count: 10,
                     dimension: 8,
                     estimated_graph_memory_bytes: 1024,
+                    estimated_build_peak_memory_bytes: 2048,
                     threshold: HnswInlineThreshold {
                         max_vector_count: 10,
                         max_graph_memory_bytes: 512,
@@ -972,6 +1096,36 @@ mod tests {
 
     #[test]
     fn hnsw_maintenance_request_groups_tail_rowset_refs() {
+        let provider_config = crate::search::HnswProviderConfig {
+            version: crate::search::HNSW_PROVIDER_CONFIG_VERSION,
+            dimension: 16,
+            distance: crate::index::hnsw::DistanceMetric::Euclidean,
+            build_vector_encoding: crate::index::hnsw::HnswBuildVectorEncoding::symmetric_i16(16)
+                .unwrap(),
+            m: 8,
+            ef_construct: 64,
+            ef_search: 100,
+            rerank_policy: crate::index::hnsw::HnswRerankPolicy::Ef,
+            distance_cost: crate::index::hnsw::HnswDistanceCostProfile::default(),
+            generation_layout: crate::search::HnswGenerationLayout::default(),
+            maintenance: crate::search::HnswMaintenancePolicy::default(),
+            build_seed: crate::search::DEFAULT_HNSW_BUILD_SEED,
+            proposal_wave_max_size: crate::search::DEFAULT_HNSW_PROPOSAL_WAVE_MAX_SIZE,
+            warmup_point_count: crate::search::DEFAULT_HNSW_WARMUP_POINT_COUNT,
+            filter_columns: Vec::new(),
+            filter_block_rows: crate::search::DEFAULT_HNSW_FILTER_BLOCK_ROWS,
+            filter_m: crate::search::DEFAULT_HNSW_FILTER_M,
+            inline_threshold: crate::search::HnswInlineConfig {
+                enabled: true,
+                max_vector_count: 4_096,
+                max_graph_memory_bytes: 64 * 1024 * 1024,
+                max_dimension: 1_536,
+            },
+        }
+        .validated()
+        .unwrap()
+        .to_value()
+        .unwrap();
         let definition = SearchIndexDefinition {
             definition_id: 9,
             table_id: 42,
@@ -979,11 +1133,7 @@ mod tests {
             kind: SearchIndexKind::Hnsw,
             column_ids: vec![1],
             expression: None,
-            provider_config: serde_json::json!({
-                "m": 8,
-                "ef_construct": 64,
-                "dimension": 16,
-            }),
+            provider_config,
             freshness_policy: SearchFreshnessPolicy::default_for_kind(SearchIndexKind::Hnsw),
             config_fingerprint: 77,
         };
@@ -1019,9 +1169,9 @@ mod tests {
 
         let request = HnswMaintenanceRequest::new(
             &definition,
+            &definition.hnsw_provider_config().unwrap(),
             17,
             tail_window.clone(),
-            16,
             MaintenancePriority::Elevated,
         )
         .expect("hnsw request");
@@ -1040,7 +1190,7 @@ mod tests {
                 byte_count: 600,
             }]
         );
-        assert!(request.estimated_graph_memory_bytes > 0);
+        assert!(request.estimated_build_peak_memory_bytes > 0);
     }
 
     fn admission_request(

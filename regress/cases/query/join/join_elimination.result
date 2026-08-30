@@ -27,7 +27,7 @@ PROJECTION  (rows=3)
   ->  HASH_JOIN  (rows=3)
     Join Type: LEFT
     Build Index: integer_build_time
-    Join Condition: #0 = #0
+    Join Condition: l.id = r.id
     ->  ROWSET_SCAN on public.join_elim_left l  (rows=3)
       Columns: id
     ->  ROWSET_SCAN on public.join_elim_right_unique r  (rows=2)
@@ -71,7 +71,7 @@ PROJECTION  (rows=3)
   ->  HASH_JOIN  (rows=3)
     Join Type: LEFT
     Build Index: integer_build_time
-    Join Condition: #0 = #0
+    Join Condition: l.id = r.id
     ->  ROWSET_SCAN on public.join_elim_left l  (rows=3)
       Columns: id
     ->  ROWSET_SCAN on public.join_elim_right_nonunique r  (rows=2)

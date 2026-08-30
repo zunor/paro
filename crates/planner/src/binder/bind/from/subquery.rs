@@ -38,7 +38,7 @@ pub fn bind_subquery_ref(
     let mut child_binder = binder.create_child();
 
     // 2. Bind the subquery
-    let bound_subquery = child_binder.bind_query(subquery)?;
+    let mut bound_subquery = child_binder.bind_query(subquery)?;
     let correlated_columns_from_child = mem::take(&mut child_binder.correlated_columns);
 
     let split = split_child_correlated_columns(
@@ -64,6 +64,14 @@ pub fn bind_subquery_ref(
         alias,
         binder.bind_context.unnamed_subquery_count(),
     )?;
+
+    // A direct VALUES clause is the producer at this relation boundary. Give
+    // it the bound SQL identity so predicate pushdown cannot expose generated
+    // `colN` names after moving below the wrapper projection.
+    if let BoundQuery::Values(values) = &mut bound_subquery {
+        values.names.clone_from(&column_names);
+        values.relation_alias = Some(subquery_alias.clone());
+    }
 
     // Update unnamed subquery counter
     if subquery_alias.starts_with("unnamed_subquery") {

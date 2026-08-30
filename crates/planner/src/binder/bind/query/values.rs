@@ -64,6 +64,7 @@ impl Binder {
             values: bound_values,
             names,
             types: types.clone(),
+            relation_alias: None,
         };
         bound.cast_rows_to_types(&types, &self.cast_functions)?;
         Ok(bound)

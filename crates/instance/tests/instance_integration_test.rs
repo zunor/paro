@@ -8,7 +8,8 @@ use paro_common::checkpoint::BundleKind;
 use paro_common::ddl::{DdlObjectKey, DdlObjectKind};
 use paro_common::effect::{ApplyDescriptor, StagedArtifactDescriptor, StagingArtifactId};
 use paro_common::journal::{
-    CommitRecord, JournalRecord, JournalRecordMetadata, COMMIT_RECORD_VERSION,
+    CommitRecord, JournalPublicationWatermarks, JournalRecord, JournalRecordMetadata,
+    MaintenanceKind, MaintenanceRecord, COMMIT_RECORD_VERSION, MAINTENANCE_RECORD_VERSION,
 };
 use paro_common::types::LogicalType;
 use paro_instance::checkpoint::manifest_store::testing::arm_manifest_rename_failure_for_path_on_nth_call;
@@ -29,6 +30,7 @@ use paro_journal::wal::test_support::{
 };
 use paro_journal::wal::wal_entry::{WalEntry, WalHeaderMetadata};
 use paro_journal::wal::write_ahead_log::WriteAheadLog;
+use paro_journal::{ApplyRequest, WaitMode};
 use paro_storage::buffer::StandardBufferManager;
 use paro_storage::meta::metadata_store::testing::{
     arm_metadata_parent_sync_failure_for_path_on_nth_call,
@@ -63,6 +65,90 @@ fn default_db(instance: &Arc<Instance>) -> Arc<DatabaseHandle> {
         .database_registry()
         .get_database("postgres")
         .expect("default database should exist")
+}
+
+fn publish_checkpoint_test_record(
+    db: &Arc<DatabaseHandle>,
+    commit_id: u64,
+    catalog_commit_id: u64,
+    max_seen_object_id: u64,
+) -> u64 {
+    let record = CommitRecord {
+        record_version: COMMIT_RECORD_VERSION,
+        metadata: JournalRecordMetadata::transaction(&[], &[], &[], &[]),
+        txn_id: commit_id,
+        start_time: 0,
+        commit_id,
+        catalog_ops: Vec::new(),
+        storage_ops: Vec::new(),
+        apply_descriptors: Vec::new(),
+        deferred_tasks: Vec::new(),
+    };
+    let append = db
+        .journal_coordinator()
+        .append_records(&[JournalRecord::Commit(record)])
+        .expect("append checkpoint test record")[0];
+    db.journal_apply_runtime()
+        .submit(ApplyRequest {
+            lsn: append.lsn,
+            durable_batch_lsn: append.durable_batch_lsn,
+            commit_id: Some(commit_id),
+            publication_watermarks: JournalPublicationWatermarks::transaction(
+                commit_id,
+                catalog_commit_id,
+                max_seen_object_id,
+            ),
+            wait_mode: WaitMode::Published,
+            catalog_serial: false,
+            catalog_pre: Box::new(|| Ok(())),
+            tablet_parts: Vec::new(),
+            descriptor_phase: Box::new(|| Ok(())),
+            catalog_post: Box::new(|| Ok(())),
+            on_published: Box::new(|| Ok(())),
+        })
+        .expect("publish checkpoint test record");
+    if let Some(wal) = db.wal() {
+        wal.note_flushed_lsn(append.lsn)
+            .expect("checkpoint test record lsn should flush");
+    }
+    append.lsn
+}
+
+fn publish_checkpoint_test_maintenance(db: &Arc<DatabaseHandle>, maintenance_id: u64) -> u64 {
+    let record = MaintenanceRecord {
+        record_version: MAINTENANCE_RECORD_VERSION,
+        metadata: JournalRecordMetadata::maintenance(&[], &[], &[], &[]),
+        maintenance_id,
+        kind: MaintenanceKind::SearchGenerationMaintenance,
+        catalog_ops: Vec::new(),
+        storage_ops: Vec::new(),
+        apply_descriptors: Vec::new(),
+        deferred_tasks: Vec::new(),
+    };
+    let append = db
+        .journal_coordinator()
+        .append_records(&[JournalRecord::Maintenance(record)])
+        .expect("append checkpoint test maintenance")[0];
+    db.journal_apply_runtime()
+        .submit(ApplyRequest {
+            lsn: append.lsn,
+            durable_batch_lsn: append.durable_batch_lsn,
+            commit_id: None,
+            publication_watermarks: JournalPublicationWatermarks::maintenance(maintenance_id),
+            wait_mode: WaitMode::Published,
+            catalog_serial: false,
+            catalog_pre: Box::new(|| Ok(())),
+            tablet_parts: Vec::new(),
+            descriptor_phase: Box::new(|| Ok(())),
+            catalog_post: Box::new(|| Ok(())),
+            on_published: Box::new(|| Ok(())),
+        })
+        .expect("publish checkpoint test maintenance");
+    if let Some(wal) = db.wal() {
+        wal.note_flushed_lsn(append.lsn)
+            .expect("checkpoint test maintenance lsn should flush");
+    }
+    append.lsn
 }
 
 fn load_instance_catalog(base_dir: &Path) -> paro_instance::InstanceCatalog {
@@ -566,11 +652,7 @@ fn automatic_checkpoint_bytes_trigger_coalesces_into_committed_manifest_publish(
     let instance = open_instance_with_config(config);
     let db = default_db(&instance);
 
-    let (_summary, lsn) = db.publish_checkpoint_transaction(1, 0, 0);
-    if let Some(wal) = db.wal() {
-        wal.note_flushed_lsn(lsn)
-            .expect("checkpoint transaction lsn should flush");
-    }
+    publish_checkpoint_test_record(&db, 1, 0, 0);
     {
         let storage = db
             .storage_manager()
@@ -610,11 +692,7 @@ fn automatic_checkpoint_interval_trigger_runs_after_elapsed_interval() {
     let instance = open_instance_with_config(config);
     let db = default_db(&instance);
 
-    let (_summary, lsn) = db.publish_checkpoint_transaction(1, 0, 0);
-    if let Some(wal) = db.wal() {
-        wal.note_flushed_lsn(lsn)
-            .expect("checkpoint transaction lsn should flush");
-    }
+    publish_checkpoint_test_record(&db, 1, 0, 0);
     {
         let storage = db
             .storage_manager()
@@ -649,21 +727,14 @@ fn checkpoint_manifest_bootstrap_restores_allocator_and_frontier_watermarks() {
     let instance = open_instance(dir.path());
     let db = default_db(&instance);
 
-    let (_summary, lsn) = db.publish_checkpoint_transaction(7, 7, 99);
-    if let Some(wal) = db.wal() {
-        wal.note_flushed_lsn(lsn)
-            .expect("checkpoint transaction lsn should flush");
-    }
+    publish_checkpoint_test_record(&db, 7, 7, 99);
     db.force_checkpoint().expect("checkpoint should succeed");
     drop(instance);
 
     let reopened = open_instance(dir.path());
     let db = default_db(&reopened);
-    let (summary, lsn) = db.publish_checkpoint_transaction(8, 0, 0);
-    if let Some(wal) = db.wal() {
-        wal.note_flushed_lsn(lsn)
-            .expect("checkpoint transaction lsn should flush after restart");
-    }
+    publish_checkpoint_test_record(&db, 8, 0, 0);
+    let summary = db.checkpoint_published_summary();
 
     assert_eq!(summary.max_lsn, 2);
     assert_eq!(summary.max_commit_id, 8);
@@ -675,6 +746,35 @@ fn checkpoint_manifest_bootstrap_restores_allocator_and_frontier_watermarks() {
         summary.max_seen_object_id, 99,
         "manifest bootstrap should restore object-id allocator floor"
     );
+}
+
+#[test]
+fn checkpoint_replay_boundary_counts_interleaved_maintenance_at_real_wal_lsn() {
+    let dir = tempdir().expect("tempdir");
+    let instance = open_instance(dir.path());
+    let db = default_db(&instance);
+
+    assert_eq!(publish_checkpoint_test_record(&db, 1, 0, 0), 1);
+    assert_eq!(publish_checkpoint_test_maintenance(&db, 1), 2);
+    assert_eq!(publish_checkpoint_test_record(&db, 2, 0, 0), 3);
+    db.force_checkpoint().expect("checkpoint should succeed");
+
+    let manifest_store = ManifestStore::open_database_root(db.path()).expect("open manifest store");
+    let manifest = manifest_store
+        .read_current_manifest()
+        .expect("read manifest")
+        .expect("checkpoint manifest should exist");
+    assert_eq!(manifest.frontier.checkpoint_lsn, 3);
+    assert_eq!(manifest.frontier.checkpoint_commit_id, 2);
+    assert_eq!(manifest.frontier.checkpoint_maintenance_id, 1);
+    assert_eq!(manifest.journal.replay_from_lsn, 4);
+    drop(instance);
+
+    let reopened = open_instance(dir.path());
+    let summary = default_db(&reopened).checkpoint_published_summary();
+    assert_eq!(summary.max_lsn, 3);
+    assert_eq!(summary.max_commit_id, 2);
+    assert_eq!(summary.max_maintenance_id, 1);
 }
 
 #[test]

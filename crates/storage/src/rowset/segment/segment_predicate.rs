@@ -274,7 +274,10 @@ impl PredicateEvaluator {
         tree: PredicateTree,
         evaluator: &IndexEvaluator,
     ) -> Option<PredicateTree> {
-        if matches!(evaluator.evaluate(&tree), PredicateResult::AllMatch) {
+        if matches!(
+            evaluator.evaluate_with_proof(&tree).guaranteed(),
+            PredicateResult::AllMatch
+        ) {
             return None;
         }
         let PredicateTree::And(children) = tree else {
@@ -282,7 +285,12 @@ impl PredicateEvaluator {
         };
         let residual = children
             .into_iter()
-            .filter(|child| !matches!(evaluator.evaluate(child), PredicateResult::AllMatch))
+            .filter(|child| {
+                !matches!(
+                    evaluator.evaluate_with_proof(child).guaranteed(),
+                    PredicateResult::AllMatch
+                )
+            })
             .collect::<Vec<_>>();
         match residual.len() {
             0 => None,
@@ -298,18 +306,8 @@ impl PredicateEvaluator {
         match predicate_tree {
             PredicateTree::Leaf(predicate) => {
                 let leaf = PredicateTree::Leaf(predicate.clone());
-                if predicate.requires_row_level_verification() {
-                    return !matches!(
-                        evaluator.evaluate(&leaf),
-                        PredicateResult::NoneMatch | PredicateResult::AllMatch
-                    );
-                }
-                !matches!(
-                    evaluator.evaluate(&leaf),
-                    PredicateResult::Bitmap(_)
-                        | PredicateResult::NoneMatch
-                        | PredicateResult::AllMatch
-                )
+                let evaluation = evaluator.evaluate_with_proof(&leaf);
+                matches!(evaluation.candidates, PredicateResult::Unknown) || !evaluation.is_exact()
             }
             PredicateTree::And(children) | PredicateTree::Or(children) => children
                 .iter()

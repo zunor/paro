@@ -11,6 +11,7 @@ mod memory_governance;
 mod query_resources;
 mod runtime_limits;
 mod session_metadata;
+mod session_random;
 mod statement_cancellation;
 mod statement_context;
 mod statement_environment;
@@ -53,6 +54,7 @@ pub use session_metadata::{
     CursorSummary, PreparedStatementSummary, SessionMetadataProvider, SessionMetadataRows,
     SettingRow,
 };
+pub use session_random::SessionRandom;
 pub use statement_cancellation::{
     NoopStatementTimeoutDriver, StatementCancelReason, StatementCancellation,
     StatementTimeoutDriver,

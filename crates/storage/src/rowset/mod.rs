@@ -46,6 +46,7 @@ pub use page::{
 pub use page_reader::{PageReader, PageReaderContext, PageReaderOptions};
 pub use partial_row::{load_base_rowids, load_base_rowids_for_offsets, save_base_rowids};
 pub use row_id::{BatchRowOrdinal, PhysicalRowRef, SegmentRowId};
+pub(crate) use segment::RuntimeScalarIndex;
 
 // Re-export encoding types
 pub use encoding::{
@@ -71,7 +72,7 @@ pub use rowset_meta::{
 };
 
 // Re-export rowset types.
-pub use rowset::{Rowset, RowsetBuilder, RowsetIterator, RowsetSharedPtr};
+pub use rowset::{Rowset, RowsetBuilder, RowsetIterator, RowsetRetentionLease, RowsetSharedPtr};
 
 // Re-export segment types.
 pub use segment::{
@@ -84,7 +85,9 @@ pub use rowset_statistics::{RowsetColumnStatistics, RowsetStatistics};
 pub use segment_statistics::{ColumnSegmentStatistics, SegmentStatistics};
 
 // Re-export segment_writer types.
-pub use segment::{ColumnData, SegmentWriter, SegmentWriterBuilder, SegmentWriterOptions};
+pub use segment::{
+    ColumnData, HnswColumnBuildOptions, SegmentWriter, SegmentWriterBuilder, SegmentWriterOptions,
+};
 
 // Re-export rowset_writer types.
 pub use rowset_writer::{RowsetWriter, RowsetWriterBuilder, RowsetWriterContext};

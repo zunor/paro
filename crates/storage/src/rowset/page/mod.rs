@@ -35,6 +35,6 @@ pub use page::{
 pub use page_builder::{PageBuilder, PageBuilderOptions};
 pub use page_decoder::{EncodingType, PageDecoder, PageDecoderOptions};
 pub use page_io::{
-    BlockCompressionCodec, CompressionType, Lz4Codec, NoCompressionCodec, PageIO, PageReadOptions,
-    ZstdCodec, DEFAULT_MIN_SPACE_SAVING,
+    BlockCompressionCodec, CompressionType, Lz4Codec, NoCompressionCodec, PageIO, PageLayout,
+    PageReadOptions, ZstdCodec, DEFAULT_MIN_SPACE_SAVING,
 };

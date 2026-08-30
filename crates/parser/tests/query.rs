@@ -17,7 +17,7 @@ fn test_query() {
     let mut mint = Mint::new(GOLDEN_ROOT);
     let file = &mut mint.new_goldenfile("query.txt").unwrap();
     let cases = &[
-        r#"select ?"#,
+        r#"select $1"#,
         r#"select * exclude c1, b.* exclude (c2, c3, c4) from customer inner join orders on a = b limit 1"#,
         r#"select columns('abc'), columns(a -> length(a) = 3) from t"#,
         r#"select count(t.*) from t"#,

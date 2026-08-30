@@ -19,6 +19,7 @@ use super::node::{GateStatus, NType, Node, ALLOCATOR_COUNT};
 use super::prefix::{Prefix, ROW_ID_SIZE};
 use super::ARTKey;
 use crate::index::fixed_size_allocator::FixedSizeAllocator;
+use roaring::RoaringBitmap;
 
 /// Entry in the iterator stack.
 #[derive(Debug, Clone, Copy)]
@@ -233,6 +234,53 @@ impl<'a> Iterator<'a> {
                     // Invalid leaf type
                     return false;
                 }
+            }
+
+            self.entered_nested_leaf = false;
+            if !self.next() {
+                return true;
+            }
+        }
+    }
+
+    /// Scan segment-local row IDs directly into their execution bitmap.
+    /// Predicate evaluation is the dominant non-unique ART consumer; avoiding
+    /// an intermediate `BTreeSet<i64>` removes one allocation per match and a
+    /// second ordered traversal for selective Top-K queries.
+    pub fn scan_bitmap(&mut self, max_count: usize, row_ids: &mut RoaringBitmap) -> bool {
+        loop {
+            match self.last_leaf.get_type() {
+                NType::LeafInlined => {
+                    let row_id = self.last_leaf.get_row_id();
+                    let Ok(row_id) = u32::try_from(row_id) else {
+                        return false;
+                    };
+                    if row_ids.len() as usize >= max_count && !row_ids.contains(row_id) {
+                        return false;
+                    }
+                    row_ids.insert(row_id);
+                }
+                NType::Node7Leaf | NType::Node15Leaf | NType::Node256Leaf => {
+                    let mut byte = 0u8;
+                    while self.get_next_byte_from_leaf(&self.last_leaf, &mut byte) {
+                        self.row_id[ROW_ID_SIZE - 1] = byte;
+                        let key = ARTKey::from_bytes_raw(&self.row_id);
+                        let Ok(row_id) = u32::try_from(key.get_row_id()) else {
+                            return false;
+                        };
+                        if row_ids.len() as usize >= max_count && !row_ids.contains(row_id) {
+                            return false;
+                        }
+                        row_ids.insert(row_id);
+                        if byte == u8::MAX {
+                            break;
+                        }
+                        byte += 1;
+                    }
+                }
+                // Legacy linked leaves are deliberately unsupported by the
+                // new exact-bitmap ABI. Current ARTs never create them.
+                _ => return false,
             }
 
             self.entered_nested_leaf = false;

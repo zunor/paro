@@ -69,13 +69,12 @@ HAVING sum(x) >= 3
 ORDER BY grp;
 QUERY PLAN
 ORDER_BY  (rows=1)
-  Sort Key: #0 ASC NULLS LAST
+  Sort Key: grp ASC NULLS LAST
   ->  PROJECTION  (rows=1)
     Output: grp, sum_x
     ->  AGGREGATE  (rows=1)
-      Group Key: #0
-      Aggregates: sum(#1)
-      Output: aggr_0, aggr_1
+      Group Key: agg_h_values.grp
+      Aggregates: sum(agg_h_values.x)
       ->  PROJECTION  (rows=5)
         Output: grp, x
         ->  VALUES  (rows=5)

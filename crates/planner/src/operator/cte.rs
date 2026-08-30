@@ -28,9 +28,13 @@ impl MaterializedCTE {
         column_names: Vec<String>,
         column_types: Vec<LogicalType>,
         materialized: CTEMaterialize,
-        cte_query: LogicalPlan,
+        mut cte_query: LogicalPlan,
         child: LogicalPlan,
     ) -> Self {
+        if let crate::operator::LogicalOperator::ExpressionGet(values) = &mut cte_query.operator {
+            values.names.clone_from(&column_names);
+            values.relation_alias = Some(cte_name.clone());
+        }
         Self {
             cte_index,
             cte_name,
@@ -76,6 +80,7 @@ impl RecursiveCTE {
 pub struct CTERef {
     pub cte_index: usize,
     pub table_index: usize,
+    pub relation_alias: String,
     pub column_names: Vec<String>,
     pub column_types: Vec<LogicalType>,
 }
@@ -84,12 +89,14 @@ impl CTERef {
     pub fn new(
         cte_index: usize,
         table_index: usize,
+        relation_alias: String,
         column_names: Vec<String>,
         column_types: Vec<LogicalType>,
     ) -> Self {
         Self {
             cte_index,
             table_index,
+            relation_alias,
             column_names,
             column_types,
         }

@@ -18,8 +18,8 @@ pub use apply::{
     mutation_identities, mutation_identity_for_tablet, publish_committed_record, ApplyCompletion,
     ApplyCompletionFallbackAck, ApplyErrorSource, ApplyFatalSink, ApplyPhase, ApplyRequest,
     ApplyRuntimeError, ApplySubmitResult, JournalApplyError, JournalApplyMetricsSnapshot,
-    JournalApplyRuntime, MaintenanceApplyHandler, MutationIdentity, MutationKind,
-    RecoveryPlaceholderRecordKind, TabletApplyPart, VisibilityPublisher, WaitMode,
+    JournalApplyRuntime, JournalPublicationObserver, MaintenanceApplyHandler, MutationIdentity,
+    MutationKind, RecoveryPlaceholderRecordKind, TabletApplyPart, VisibilityPublisher, WaitMode,
 };
 pub use codec::{
     codec_size_calibration_sample_for_plan, codec_size_calibration_sample_for_record, decode_frame,

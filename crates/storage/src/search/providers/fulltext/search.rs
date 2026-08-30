@@ -27,7 +27,8 @@ use crate::search::request::analyze_fulltext_query_stats;
 use crate::search::row_fetch::snapshot_epoch;
 use crate::search::segment_dispatch::{dispatch_segments, SegmentDispatchResult};
 use crate::search::sidecar::{
-    SidecarArtifactStore, SidecarReaderCache, SidecarReaderRequest, SIDECAR_PACKAGE_CODEC,
+    DecodedReaderBinding, DecodedSidecarReaderRequest, SearchReaderRuntime, SidecarIntegrityPolicy,
+    SidecarReaderRequest, SIDECAR_PACKAGE_CODEC,
 };
 use crate::search::tail::exact_merge::{ensure_tail_exact_merge_budget, TailExactMergeQueryShape};
 use crate::search::tail_merge::{resolve_logical_rows, visible_row_ids};
@@ -98,12 +99,11 @@ impl FullTextTopKProvider {
             },
         )?;
 
+        let reader_runtime = Arc::clone(&snapshot.reader_runtime);
         Ok(OpenedSearchCursor {
             snapshot: snapshot.clone(),
             cursor: Box::new(FullTextTopKCursor {
-                sidecar_cache: Arc::new(SidecarReaderCache::new(SidecarArtifactStore::new(
-                    self.tablet.data_dir().clone(),
-                ))),
+                reader_runtime,
                 snapshot,
                 tablet: self.tablet,
                 storage_col_id: self.column_id as u32,
@@ -159,12 +159,11 @@ impl FullTextFilterProvider {
             },
         )?;
 
+        let reader_runtime = Arc::clone(&snapshot.reader_runtime);
         Ok(OpenedSearchCursor {
             snapshot: snapshot.clone(),
             cursor: Box::new(FullTextFilterCursor {
-                sidecar_cache: Arc::new(SidecarReaderCache::new(SidecarArtifactStore::new(
-                    self.tablet.data_dir().clone(),
-                ))),
+                reader_runtime,
                 snapshot,
                 tablet: self.tablet,
                 storage_col_id: self.column_id as u32,
@@ -204,7 +203,7 @@ enum FullTextTopKState {
 }
 
 struct FullTextTopKCursor {
-    sidecar_cache: Arc<SidecarReaderCache>,
+    reader_runtime: Arc<SearchReaderRuntime>,
     snapshot: SearchReadSnapshot,
     tablet: TabletRef,
     storage_col_id: u32,
@@ -353,10 +352,10 @@ struct FullTextScoringSnapshot {
 
 fn open_sidecar_fulltext_index(
     snapshot: &SearchReadSnapshot,
-    cache: &SidecarReaderCache,
+    runtime: &SearchReaderRuntime,
     visible_segment: &VisibleSegment,
     column_id: u32,
-) -> Result<Option<FullTextIndex>> {
+) -> Result<Option<Arc<FullTextIndex>>> {
     let Some(artifact) =
         snapshot.artifact_for_segment(SearchIndexKind::FullText, column_id, visible_segment)
     else {
@@ -369,13 +368,19 @@ fn open_sidecar_fulltext_index(
         return Ok(None);
     }
 
-    let cached = cache.open(SidecarReaderRequest {
-        location: &artifact.location,
-        artifact_format_version: artifact.artifact_format_version,
-        provider: SearchIndexKind::FullText,
-        codec: SIDECAR_PACKAGE_CODEC,
-    })?;
-    FullTextIndex::deserialize(cached.bytes()).map(Some)
+    let request = DecodedSidecarReaderRequest {
+        sidecar: SidecarReaderRequest {
+            location: &artifact.location,
+            artifact_format_version: artifact.artifact_format_version,
+            provider: SearchIndexKind::FullText,
+            codec: SIDECAR_PACKAGE_CODEC,
+            integrity: SidecarIntegrityPolicy::EnvelopeChecksum,
+        },
+        binding: DecodedReaderBinding::SelfContained,
+    };
+    runtime.get_or_try_open_decoded(request, |cached| {
+        FullTextIndex::deserialize(cached.bytes()).map(Some)
+    })
 }
 
 fn fulltext_ranked_rows_from_points(
@@ -462,7 +467,7 @@ impl FullTextTopKCursor {
             self.snapshot.table_lease.visible_segments(),
             budget.parallelism_slots.max(1),
             self.telemetry.as_ref(),
-            |segment| {
+            |_, segment| {
                 let (rows, degraded) = self.search_segment(segment, &scoring_snapshot.stats)?;
                 Ok(SegmentDispatchResult {
                     candidates_produced: rows.len(),
@@ -510,7 +515,7 @@ impl FullTextTopKCursor {
             }
             if let Some(index) = open_sidecar_fulltext_index(
                 &self.snapshot,
-                self.sidecar_cache.as_ref(),
+                self.reader_runtime.as_ref(),
                 visible_segment,
                 self.storage_col_id,
             )? {
@@ -573,7 +578,7 @@ impl FullTextTopKCursor {
         }
         if let Some(index) = open_sidecar_fulltext_index(
             &self.snapshot,
-            self.sidecar_cache.as_ref(),
+            self.reader_runtime.as_ref(),
             visible_segment,
             self.storage_col_id,
         )? {
@@ -681,7 +686,7 @@ impl SearchCursor for FullTextTopKCursor {
 }
 
 struct FullTextFilterCursor {
-    sidecar_cache: Arc<SidecarReaderCache>,
+    reader_runtime: Arc<SearchReaderRuntime>,
     snapshot: SearchReadSnapshot,
     tablet: TabletRef,
     storage_col_id: u32,
@@ -726,7 +731,7 @@ impl FullTextFilterCursor {
             window,
             window_width,
             self.telemetry.as_ref(),
-            |segment| {
+            |_, segment| {
                 let (rows, degraded) = self.search_segment_rows(segment)?;
                 Ok(SegmentDispatchResult {
                     candidates_produced: rows.len(),
@@ -763,7 +768,7 @@ impl FullTextFilterCursor {
         }
         if let Some(index) = open_sidecar_fulltext_index(
             &self.snapshot,
-            self.sidecar_cache.as_ref(),
+            self.reader_runtime.as_ref(),
             segment,
             self.storage_col_id,
         )? {
@@ -904,7 +909,7 @@ mod tests {
         GenerationArtifactSet, GenerationReadLease, GenerationReadSnapshot, TableReadLease,
     };
     use crate::search::stats::{GenerationMaintenanceState, GenerationStats, SearchArtifactStats};
-    use crate::search::CoverageState;
+    use crate::search::{CoverageState, SearchReaderRuntime, SidecarArtifactStore};
     use crate::table::table_factory::TableFactory;
     use crate::test_utils::{test_chunk_from_vectors, test_string_vector};
     use paro_common::types::LogicalType;
@@ -924,9 +929,13 @@ mod tests {
             ])]))
             .expect("append rows");
 
-        let (table_snapshot, table_lease) =
-            TableReadLease::open(&table.tablet(), table.tablet_id(), table.max_version())
-                .expect("open table lease");
+        let (table_snapshot, table_lease) = TableReadLease::open(
+            &table.tablet(),
+            table.tablet_id(),
+            table.max_version(),
+            &crate::search::SearchReadOptions::ungoverned(),
+        )
+        .expect("open table lease");
         let visible_segment = table_lease
             .visible_segments()
             .first()
@@ -951,10 +960,14 @@ mod tests {
         let artifact = SearchArtifactRef {
             definition_id: 7,
             generation_id: 1,
-            segment: ArtifactSegmentRef {
-                rowset_id: visible_segment.rowset_id,
-                segment_id: visible_segment.segment_id,
-            },
+            coverage: crate::search::SearchPartitionCoverage::singleton(
+                ArtifactSegmentRef {
+                    rowset_id: visible_segment.rowset_id,
+                    segment_id: visible_segment.segment_id,
+                },
+                2,
+            )
+            .unwrap(),
             column_id: 0,
             kind: SearchIndexKind::FullText,
             provider_variant: 1,
@@ -976,9 +989,13 @@ mod tests {
             coverage: CoverageState::Complete,
             generation_stats: GenerationStats::default(),
             maintenance_state: GenerationMaintenanceState::default(),
+            provider_config: Arc::new(serde_json::Value::Null),
+            hnsw_provider_config: None,
+            hnsw_query_activity: None,
             artifacts: Arc::new(GenerationArtifactSet {
                 artifacts: vec![artifact],
             }),
+            tail_pending_entries: Arc::from([]),
         };
         let generation_lease = GenerationReadLease::from_snapshot(&generation);
         let snapshot = SearchReadSnapshot::new(
@@ -987,6 +1004,9 @@ mod tests {
             generation,
             table_lease,
             generation_lease,
+            Arc::new(SearchReaderRuntime::new(SidecarArtifactStore::new(
+                table.tablet().data_dir().clone(),
+            ))),
         );
 
         let opened = FullTextTopKProvider::new(

@@ -285,8 +285,10 @@ pub enum Expr {
         span: Span,
         name: String,
     },
-    Placeholder {
+    Parameter {
         span: Span,
+        /// Zero-based PostgreSQL parameter index (`$1` maps to zero).
+        index: usize,
     },
     StageLocation {
         span: Span,
@@ -337,7 +339,7 @@ impl Expr {
             | Expr::PreviousDay { span, .. }
             | Expr::NextDay { span, .. }
             | Expr::Hole { span, .. }
-            | Expr::Placeholder { span }
+            | Expr::Parameter { span, .. }
             | Expr::StageLocation { span, .. } => *span,
         }
     }
@@ -506,7 +508,7 @@ impl Expr {
             Expr::PreviousDay { span, date, .. } => merge_span(*span, date.whole_span()),
             Expr::NextDay { span, date, .. } => merge_span(*span, date.whole_span()),
             Expr::Hole { span, .. } => *span,
-            Expr::Placeholder { span } => *span,
+            Expr::Parameter { span, .. } => *span,
             Expr::StageLocation { span, .. } => *span,
         }
     }
@@ -901,8 +903,8 @@ impl Display for Expr {
                 Expr::Hole { name, .. } => {
                     write!(f, ":{name}")?;
                 }
-                Expr::Placeholder { .. } => {
-                    write!(f, "?")?;
+                Expr::Parameter { index, .. } => {
+                    write!(f, "${}", index + 1)?;
                 }
                 Expr::StageLocation { location, .. } => {
                     write!(f, "@{location}")?;

@@ -25,6 +25,7 @@ use paro_compiler::{compile_statement, compile_statement_with_parameter_types};
 use paro_context::{StatementCancellation, StatementInput, StatementOptions, StatementSource};
 use paro_execution::query_executor::compiled::ExecutionRequest;
 use paro_execution::query_executor::executor::Executor;
+use paro_execution::query_executor::stream::FetchState;
 use paro_function::table::CopyStdinSource;
 use paro_instance::{CopyStdinMetrics, CopyStdinRejectReason};
 use paro_parser::ast::{
@@ -35,8 +36,12 @@ use paro_transaction::{
     IsolationLevel, LockMode, LockRequest, LockResource, ReadTrackingPolicy, ReadWritePromotion,
     TableId,
 };
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
+use std::sync::Mutex;
 use std::time::Instant;
+use tokio::sync::{mpsc, OwnedSemaphorePermit, Semaphore};
+use tokio_util::bytes::Bytes;
 use tracing::{debug, error};
 
 #[derive(Default)]
@@ -476,19 +481,37 @@ impl Session {
                 if emits_rows {
                     sink.start_result(&result_names, &result_types).await?;
 
-                    while let Some(chunk) = stream.fetch()? {
-                        rows += chunk.len();
-                        sink.push_chunk(chunk).await?;
+                    loop {
+                        match stream.fetch_state()? {
+                            FetchState::Ready(chunk) => {
+                                rows += chunk.len();
+                                sink.push_chunk(chunk).await?;
+                            }
+                            FetchState::Pending => {
+                                stream.wait_for_progress().await?;
+                            }
+                            FetchState::Exhausted => break,
+                        }
                     }
                 } else {
-                    while let Some(chunk) = stream.fetch()? {
-                        if chunk.len() > 0 && chunk.column_count() > 0 {
-                            if let Some(col) = chunk.column(0) {
-                                let value = col.get_value(0);
-                                if let paro_common::runtime_value::Value::BigInt(count) = value {
-                                    rows = count as usize;
+                    loop {
+                        match stream.fetch_state()? {
+                            FetchState::Ready(chunk) => {
+                                if chunk.len() > 0 && chunk.column_count() > 0 {
+                                    if let Some(col) = chunk.column(0) {
+                                        let value = col.get_value(0);
+                                        if let paro_common::runtime_value::Value::BigInt(count) =
+                                            value
+                                        {
+                                            rows = count as usize;
+                                        }
+                                    }
                                 }
                             }
+                            FetchState::Pending => {
+                                stream.wait_for_progress().await?;
+                            }
+                            FetchState::Exhausted => break,
                         }
                     }
                 }
@@ -712,9 +735,17 @@ impl Session {
             .start_copy_out(&output_names, &result_types)
             .await?;
 
-        while let Some(chunk) = stream.fetch()? {
-            rows += chunk.len();
-            protocol_sink.push_copy_rows(chunk).await?;
+        loop {
+            match stream.fetch_state()? {
+                FetchState::Ready(chunk) => {
+                    rows += chunk.len();
+                    protocol_sink.push_copy_rows(chunk).await?;
+                }
+                FetchState::Pending => {
+                    stream.wait_for_progress().await?;
+                }
+                FetchState::Exhausted => break,
+            }
         }
 
         protocol_sink.finish_copy_out().await?;
@@ -740,39 +771,63 @@ impl Session {
         cancellation: StatementCancellation,
         protocol_source: &mut dyn CopyProtocolSource,
     ) -> Result<StatementCompletion> {
-        validate_copy_from_options(copy_stmt)?;
+        let copy_format = validate_copy_from_options(copy_stmt)?;
         let column_count = resolve_copy_from_target_columns(self, copy_stmt)?.len();
+        let wire_format = i8::from(matches!(
+            copy_format,
+            paro_function::copy::CopyFormat::Binary
+        ));
         let spec = CopyInSpec {
-            overall_format: 0,
-            column_formats: vec![0; column_count],
+            overall_format: wire_format,
+            column_formats: vec![i16::from(wire_format); column_count],
         };
         protocol_source.begin_copy_in(&spec).await?;
 
-        let payload = FramedCopySourceBridge::new(
-            self.copy_stdin_memory_limit(),
+        let (bridge, payload) = FramedCopySourceBridge::new(
+            self.copy_stdin_inflight_memory_limit(),
             self.instance.copy_stdin_metrics().clone(),
-        )
-        .collect(protocol_source, cancellation)
-        .await?;
-        let input = StatementInput::copy_from_stdin(Arc::new(payload));
+        );
+        let input = StatementInput::copy_from_stdin(payload);
 
         let mut sink = CompletionCaptureSink::default();
-        let result = self
-            .execute_query_pipeline_with_parameters(
-                Statement::Copy(copy_stmt.clone()),
-                parameter_env,
-                QueryPipelineOptions {
-                    statement_format,
-                    source,
-                    input,
-                    completion_override: None,
-                    reuse_simple_query_plan: false,
-                },
-                &mut sink,
-            )
-            .await;
-
-        result?;
+        let mut forward = Box::pin(bridge.forward(protocol_source, cancellation.clone()));
+        let mut execute = Box::pin(self.execute_query_pipeline_with_parameters(
+            Statement::Copy(copy_stmt.clone()),
+            parameter_env,
+            QueryPipelineOptions {
+                statement_format,
+                source,
+                input,
+                completion_override: None,
+                reuse_simple_query_plan: false,
+            },
+            &mut sink,
+        ));
+        let (result, copy_terminated): (Result<()>, bool) = tokio::select! {
+            result = &mut forward => match result {
+                Ok(()) => (execute.as_mut().await, true),
+                Err(error) => (Err(error), false),
+            },
+            result = &mut execute => match result {
+                Ok(()) => {
+                    let forwarded = forward.as_mut().await;
+                    let terminated = forwarded.is_ok();
+                    (forwarded, terminated)
+                }
+                Err(error) => (Err(error), false),
+            },
+        };
+        // The producer owns the last sender. Drop it before the execution
+        // future: an early protocol error must turn a blocked COPY reader into
+        // EOF before ResultHandler cleanup joins the worker thread.
+        drop(forward);
+        let abort_result = if copy_terminated {
+            Ok(())
+        } else {
+            protocol_source.abort().await
+        };
+        drop(execute);
+        result.and(abort_result)?;
         sink.into_completion()
     }
 
@@ -1310,15 +1365,13 @@ fn resolve_for_update_table_id(
     Ok(TableId::new(storage.table_id()))
 }
 
-fn validate_copy_from_options(copy_stmt: &CopyStmt) -> Result<()> {
+fn validate_copy_from_options(copy_stmt: &CopyStmt) -> Result<paro_function::copy::CopyFormat> {
     let options = paro_function::copy::CopyOptions::from_ast(&copy_stmt.options)?;
     match options.format {
-        paro_function::copy::CopyFormat::Binary => Err(paro_error::not_implemented(
-            "COPY FROM STDIN BINARY is not supported yet",
-        )),
-        paro_function::copy::CopyFormat::Csv
+        paro_function::copy::CopyFormat::Binary
+        | paro_function::copy::CopyFormat::Csv
         | paro_function::copy::CopyFormat::Text
-        | paro_function::copy::CopyFormat::Ndjson => Ok(()),
+        | paro_function::copy::CopyFormat::Ndjson => Ok(options.format),
     }
 }
 
@@ -1403,44 +1456,120 @@ impl ResultSink for CompletionCaptureSink {
 
 impl ProtocolResultSink for CompletionCaptureSink {}
 
+const COPY_STDIN_QUEUE_NODE_BYTES: usize =
+    std::mem::size_of::<QueuedCopyChunk>() + 2 * std::mem::size_of::<usize>();
+
 struct FramedCopySourceBridge {
-    buffer: Vec<u8>,
+    sender: mpsc::UnboundedSender<QueuedCopyChunk>,
+    permits: Arc<Semaphore>,
     limit: usize,
-    memory: CopyStdinPayloadMemoryTracker,
+    memory: Arc<StreamingCopyMemoryTracker>,
 }
 
 #[derive(Debug)]
-struct BufferedCopyStdinPayload {
-    data: Vec<u8>,
-    _memory: CopyStdinPayloadMemoryTracker,
+struct StreamingCopyStdinSource {
+    receiver: Mutex<Option<mpsc::UnboundedReceiver<QueuedCopyChunk>>>,
 }
 
-impl CopyStdinSource for BufferedCopyStdinPayload {
-    fn as_bytes(&self) -> &[u8] {
-        self.data.as_slice()
+impl CopyStdinSource for StreamingCopyStdinSource {
+    fn take_reader(self: Arc<Self>) -> Result<Box<dyn std::io::Read + Send>> {
+        let receiver = self
+            .receiver
+            .lock()
+            .map_err(|_| paro_error::internal("COPY source receiver lock poisoned"))?
+            .take()
+            .ok_or_else(|| {
+                paro_error::invalid_input(
+                    "COPY FROM STDIN is a non-replayable stream and was already consumed",
+                )
+            })?;
+        Ok(Box::new(StreamingCopyChunkReader {
+            receiver,
+            current: None,
+            current_offset: 0,
+        }))
+    }
+
+    fn requires_background_execution(&self) -> bool {
+        true
+    }
+}
+
+#[derive(Debug)]
+struct QueuedCopyChunk {
+    bytes: Bytes,
+    charged_bytes: usize,
+    _permit: OwnedSemaphorePermit,
+    memory: Arc<StreamingCopyMemoryTracker>,
+}
+
+impl Drop for QueuedCopyChunk {
+    fn drop(&mut self) {
+        self.memory.release(self.charged_bytes);
+    }
+}
+
+struct StreamingCopyChunkReader {
+    receiver: mpsc::UnboundedReceiver<QueuedCopyChunk>,
+    current: Option<QueuedCopyChunk>,
+    current_offset: usize,
+}
+
+impl std::io::Read for StreamingCopyChunkReader {
+    fn read(&mut self, output: &mut [u8]) -> std::io::Result<usize> {
+        if output.is_empty() {
+            return Ok(0);
+        }
+        let mut written = 0;
+        while written < output.len() {
+            if self.current.is_none() {
+                self.current = self.receiver.blocking_recv();
+                self.current_offset = 0;
+            }
+            let Some(chunk) = self.current.as_ref() else {
+                break;
+            };
+            if self.current_offset >= chunk.bytes.len() {
+                self.current = None;
+                continue;
+            }
+            let available = &chunk.bytes[self.current_offset..];
+            let count = available.len().min(output.len() - written);
+            output[written..written + count].copy_from_slice(&available[..count]);
+            self.current_offset += count;
+            written += count;
+        }
+        Ok(written)
     }
 }
 
 #[derive(Debug)]
 /// Keeps resident-memory accounting attached to the COPY payload as ownership
 /// moves from socket collection into the statement execution context.
-struct CopyStdinPayloadMemoryTracker {
-    tracked_bytes: usize,
+struct StreamingCopyMemoryTracker {
+    buffered_bytes: AtomicUsize,
     metrics: Arc<CopyStdinMetrics>,
 }
 
-impl CopyStdinPayloadMemoryTracker {
+impl StreamingCopyMemoryTracker {
     fn new(metrics: Arc<CopyStdinMetrics>) -> Self {
         Self {
-            tracked_bytes: 0,
+            buffered_bytes: AtomicUsize::new(0),
             metrics,
         }
     }
 
-    fn observe(&mut self, new_bytes: usize) {
+    fn retain(&self, bytes: usize) {
+        let previous = self.buffered_bytes.fetch_add(bytes, Ordering::Relaxed);
         self.metrics
-            .observe_buffer_bytes(self.tracked_bytes, new_bytes);
-        self.tracked_bytes = new_bytes;
+            .observe_buffer_bytes(previous, previous.saturating_add(bytes));
+    }
+
+    fn release(&self, bytes: usize) {
+        let previous = self.buffered_bytes.fetch_sub(bytes, Ordering::Relaxed);
+        debug_assert!(previous >= bytes);
+        self.metrics
+            .observe_buffer_bytes(previous, previous.saturating_sub(bytes));
     }
 
     fn record_rejection(&self, reason: CopyStdinRejectReason) {
@@ -1448,58 +1577,79 @@ impl CopyStdinPayloadMemoryTracker {
     }
 }
 
-impl Drop for CopyStdinPayloadMemoryTracker {
+impl Drop for StreamingCopyMemoryTracker {
     fn drop(&mut self) {
-        self.metrics.finish_buffering(self.tracked_bytes);
+        self.metrics
+            .finish_buffering(self.buffered_bytes.swap(0, Ordering::Relaxed));
     }
 }
 
 impl FramedCopySourceBridge {
-    fn new(limit: usize, metrics: Arc<CopyStdinMetrics>) -> Self {
-        Self {
-            buffer: Vec::new(),
-            limit,
-            memory: CopyStdinPayloadMemoryTracker::new(metrics),
-        }
+    fn new(limit: usize, metrics: Arc<CopyStdinMetrics>) -> (Self, Arc<StreamingCopyStdinSource>) {
+        let limit = limit.max(1).min(u32::MAX as usize);
+        let (sender, receiver) = mpsc::unbounded_channel();
+        let memory = Arc::new(StreamingCopyMemoryTracker::new(metrics));
+        (
+            Self {
+                sender,
+                permits: Arc::new(Semaphore::new(limit)),
+                limit,
+                memory,
+            },
+            Arc::new(StreamingCopyStdinSource {
+                receiver: Mutex::new(Some(receiver)),
+            }),
+        )
     }
 
-    async fn collect(
-        mut self,
+    async fn forward(
+        self,
         source: &mut dyn CopyProtocolSource,
         cancellation: StatementCancellation,
-    ) -> Result<BufferedCopyStdinPayload> {
+    ) -> Result<()> {
         while let Some(chunk) = source.next_chunk().await? {
             cancellation.check()?;
-            let new_len = self.buffer.len().checked_add(chunk.len()).ok_or_else(|| {
+            if chunk.is_empty() {
+                continue;
+            }
+            let charged_bytes = chunk.len().saturating_add(COPY_STDIN_QUEUE_NODE_BYTES);
+            if charged_bytes > self.limit {
                 self.memory
-                    .record_rejection(CopyStdinRejectReason::TotalLimit);
-                paro_error::configuration_limit_exceeded("COPY FROM STDIN payload overflow")
-            })?;
-            if new_len > self.limit {
-                self.memory
-                    .record_rejection(CopyStdinRejectReason::TotalLimit);
+                    .record_rejection(CopyStdinRejectReason::FrameLimit);
                 return Err(paro_error::configuration_limit_exceeded(
-                    "COPY FROM STDIN payload exceeds memory limit",
+                    "COPY FROM STDIN frame exceeds the streaming buffer waterline",
                 ));
             }
-            self.buffer.try_reserve(chunk.len()).map_err(|_| {
-                paro_error::out_of_memory("COPY FROM STDIN payload allocation failed")
-            })?;
-            self.buffer.extend_from_slice(&chunk);
-            self.memory.observe(new_len);
+            let permits = u32::try_from(charged_bytes)
+                .expect("COPY streaming buffer is bounded to u32 permits");
+            let permit = tokio::select! {
+                result = Arc::clone(&self.permits).acquire_many_owned(permits) => {
+                    result.map_err(|_| paro_error::internal("COPY FROM STDIN buffer was closed"))?
+                }
+                _ = cancellation.cancelled() => {
+                    cancellation.check()?;
+                    return Err(paro_error::query_canceled());
+                }
+            };
+            self.memory.retain(charged_bytes);
+            let queued = QueuedCopyChunk {
+                bytes: chunk,
+                charged_bytes,
+                _permit: permit,
+                memory: Arc::clone(&self.memory),
+            };
+            self.sender
+                .send(queued)
+                .map_err(|_| paro_error::query_canceled())?;
             cancellation.check()?;
         }
-        Ok(BufferedCopyStdinPayload {
-            data: self.buffer,
-            _memory: self.memory,
-        })
+        Ok(())
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use tokio_util::bytes::Bytes;
 
     fn parse_one(sql: &str) -> Statement {
         paro_parser::parse(sql)
@@ -1561,58 +1711,72 @@ mod tests {
                 Ok(Some(self.chunks.remove(0)))
             }
         }
+
+        async fn abort(&mut self) -> Result<()> {
+            self.chunks.clear();
+            Ok(())
+        }
     }
 
     #[tokio::test]
-    async fn copy_stdin_payload_metrics_span_collection_and_execution() {
+    async fn copy_stdin_stream_releases_accounting_as_chunks_are_consumed() {
         let metrics = Arc::new(CopyStdinMetrics::default());
         let mut source = TestCopySource {
             chunks: vec![Bytes::from_static(b"12"), Bytes::from_static(b"345")],
         };
 
-        let payload = FramedCopySourceBridge::new(16, metrics.clone())
-            .collect(
+        let (bridge, payload) = FramedCopySourceBridge::new(1024, metrics.clone());
+        let input = StatementInput::copy_from_stdin(payload.clone());
+        let reader_task = tokio::task::spawn_blocking(move || {
+            let mut reader = payload.take_reader().unwrap();
+            let mut bytes = Vec::new();
+            std::io::Read::read_to_end(&mut reader, &mut bytes).unwrap();
+            bytes
+        });
+        bridge
+            .forward(
                 &mut source,
                 StatementCancellation::new(tokio_util::sync::CancellationToken::new(), None),
             )
             .await
             .unwrap();
-        assert_eq!(payload.data, b"12345");
+        let bytes = reader_task.await.unwrap();
+        assert_eq!(bytes, b"12345");
 
         let snapshot = metrics.snapshot();
-        assert_eq!(snapshot.current_buffer_bytes, 5);
-        assert_eq!(snapshot.peak_buffer_bytes, 5);
+        assert_eq!(snapshot.current_buffer_bytes, 0);
+        assert!(snapshot.peak_buffer_bytes <= 2 * COPY_STDIN_QUEUE_NODE_BYTES + 5);
         assert_eq!(snapshot.rejected_total, 0);
 
-        let input = StatementInput::copy_from_stdin(Arc::new(payload));
-        assert_eq!(metrics.snapshot().current_buffer_bytes, 5);
         drop(input);
         assert_eq!(metrics.snapshot().current_buffer_bytes, 0);
     }
 
     #[tokio::test]
-    async fn framed_copy_source_bridge_records_total_limit_rejections() {
+    async fn framed_copy_source_bridge_rejects_a_frame_larger_than_the_waterline() {
         let metrics = Arc::new(CopyStdinMetrics::default());
         let mut source = TestCopySource {
-            chunks: vec![Bytes::from_static(b"12"), Bytes::from_static(b"345")],
+            chunks: vec![Bytes::from_static(b"12345")],
         };
 
-        let err = FramedCopySourceBridge::new(4, metrics.clone())
-            .collect(
+        let (bridge, payload) = FramedCopySourceBridge::new(4, metrics.clone());
+        let err = bridge
+            .forward(
                 &mut source,
                 StatementCancellation::new(tokio_util::sync::CancellationToken::new(), None),
             )
             .await
-            .expect_err("payload should exceed limit");
+            .expect_err("frame should exceed waterline");
         assert!(err
             .message()
-            .contains("COPY FROM STDIN payload exceeds memory limit"));
+            .contains("COPY FROM STDIN frame exceeds the streaming buffer waterline"));
+        drop(payload);
 
         let snapshot = metrics.snapshot();
         assert_eq!(snapshot.current_buffer_bytes, 0);
-        assert_eq!(snapshot.peak_buffer_bytes, 2);
+        assert_eq!(snapshot.peak_buffer_bytes, 0);
         assert_eq!(snapshot.rejected_total, 1);
-        assert_eq!(snapshot.rejected_total_limit, 1);
-        assert_eq!(snapshot.rejected_frame_limit, 0);
+        assert_eq!(snapshot.rejected_total_limit, 0);
+        assert_eq!(snapshot.rejected_frame_limit, 1);
     }
 }

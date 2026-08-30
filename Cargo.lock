@@ -1569,6 +1569,7 @@ dependencies = [
  "paro-storage",
  "paro-transaction",
  "serde",
+ "serde_json",
 ]
 
 [[package]]
@@ -1641,6 +1642,7 @@ dependencies = [
  "paro-transaction",
  "serde_json",
  "smallvec",
+ "tokio",
  "tokio-util",
  "tracing",
 ]
@@ -1779,6 +1781,7 @@ dependencies = [
  "paro-instance",
  "paro-parser",
  "paro-storage",
+ "serde_json",
  "stacker",
  "tracing",
 ]
@@ -1852,6 +1855,7 @@ version = "0.1.0"
 dependencies = [
  "arc-swap",
  "bitvec",
+ "bytemuck",
  "bytes",
  "crc32c",
  "crossbeam",

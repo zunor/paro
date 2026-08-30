@@ -131,59 +131,6 @@ pub fn union(a: &PredicateResult, b: &PredicateResult) -> PredicateResult {
     }
 }
 
-/// Intersect (AND) with layout-aware PageRanges → Bitmap conversion.
-///
-/// When intersecting a `Bitmap` with `PageRanges`, the `PageLayout` is used
-/// to convert the page ranges into a precise `RoaringBitmap` of row IDs,
-/// enabling exact row-level intersection.
-pub fn intersect_with_layout(
-    a: &PredicateResult,
-    b: &PredicateResult,
-    layout: &super::page_layout::PageLayout,
-) -> PredicateResult {
-    use PredicateResult::*;
-
-    match (a, b) {
-        (Bitmap(bitmap), PageRanges(ranges)) | (PageRanges(ranges), Bitmap(bitmap)) => {
-            let range_bitmap = layout.page_ranges_to_bitmap(ranges);
-            let mut result = bitmap.clone();
-            result &= range_bitmap;
-            if result.is_empty() {
-                NoneMatch
-            } else {
-                Bitmap(result)
-            }
-        }
-        _ => intersect(a, b),
-    }
-}
-
-/// Union (OR) with layout-aware PageRanges → Bitmap conversion.
-///
-/// When union-ing a `Bitmap` with `PageRanges`, the `PageLayout` is used
-/// to convert page ranges into exact row bitmaps, producing a precise bitmap result.
-pub fn union_with_layout(
-    a: &PredicateResult,
-    b: &PredicateResult,
-    layout: &super::page_layout::PageLayout,
-) -> PredicateResult {
-    use PredicateResult::*;
-
-    match (a, b) {
-        (Bitmap(bitmap), PageRanges(ranges)) | (PageRanges(ranges), Bitmap(bitmap)) => {
-            let range_bitmap = layout.page_ranges_to_bitmap(ranges);
-            let mut result = bitmap.clone();
-            result |= range_bitmap;
-            if result.is_empty() {
-                NoneMatch
-            } else {
-                Bitmap(result)
-            }
-        }
-        _ => union(a, b),
-    }
-}
-
 /// Convert a predicate result into row ranges if possible.
 ///
 /// Returns None for AllMatch or Unknown, as a total row count is required

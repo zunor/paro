@@ -41,18 +41,76 @@ impl TableHandle {
     }
 
     /// Record that a column declares an ART predicate index in table metadata.
-    pub fn declare_art_index(&self, column_id: ColumnId) {
+    pub fn declare_art_index(&self, owner: &str, column_id: ColumnId) -> bool {
         self.runtime_indexes
-            .declare_art_index(&self.tablet(), column_id);
+            .declare_art_index(&self.tablet(), owner, column_id)
     }
 
-    pub fn forget_art_index(&self, column_id: ColumnId) {
+    /// Activate the durable ART maintenance contract and backfill all visible
+    /// segments. The declaration is installed first so concurrent future
+    /// writes are covered; readers still require each segment's completeness
+    /// credential. A failed backfill rolls the declaration and artifacts back.
+    pub fn install_art_index(&self, owner: &str, column_id: ColumnId) -> Result<()> {
+        if !self.declare_art_index(owner, column_id) {
+            return Ok(());
+        }
+        if let Err(error) = self.rebuild_art_index(column_id) {
+            let cleanup = self.release_art_index(owner, column_id);
+            if let Err(cleanup_error) = cleanup {
+                return Err(cleanup_error.context(format!(
+                    "ART backfill failed before rollback cleanup: {error}"
+                )));
+            }
+            return Err(error);
+        }
+        Ok(())
+    }
+
+    pub fn forget_art_index(&self, owner: &str, column_id: ColumnId) -> bool {
         self.runtime_indexes
-            .forget_art_index(&self.tablet(), column_id);
+            .forget_art_index(&self.tablet(), owner, column_id)
+    }
+
+    /// Release one catalog owner and remove physical access paths only after
+    /// the last declaration disappears.
+    pub fn release_art_index(&self, owner: &str, column_id: ColumnId) -> Result<()> {
+        if self.forget_art_index(owner, column_id) {
+            self.drop_art_index(column_id)?;
+        }
+        Ok(())
     }
 
     pub fn register_search_definition(&self, definition: SearchIndexDefinition) -> Result<()> {
         self.search_registry.install_definition(definition)
+    }
+
+    /// Register a definition immediately after this process installed its
+    /// complete durable generation. Publication verification finishes before
+    /// the capability enters the registry view; recovery registration remains
+    /// lazy through [`Self::register_search_definition`].
+    pub fn register_published_search_definition(
+        &self,
+        definition: SearchIndexDefinition,
+    ) -> Result<()> {
+        self.search_registry
+            .install_published_definition(definition)
+    }
+
+    pub fn adopt_staged_search_generation_readers(
+        &self,
+        staged: &crate::search::StagedSearchGeneration,
+    ) {
+        self.search_registry.adopt_staged_generation_readers(staged);
+    }
+
+    pub fn stage_search_definition_generation(
+        &self,
+        definition: SearchIndexDefinition,
+        txn_id: u64,
+        stop_check: crate::search::SearchBuildStopCheck,
+    ) -> Result<crate::search::StagedSearchGeneration> {
+        self.search_registry
+            .stage_definition_generation(definition, txn_id, stop_check)
     }
 
     pub fn unregister_search_definition(&self, definition_id: u64) -> Result<()> {
@@ -83,6 +141,37 @@ impl TableHandle {
 
     pub(crate) fn declared_art_columns(&self) -> Vec<ColumnId> {
         self.runtime_indexes.declared_art_columns()
+    }
+
+    /// Whether the table has a declared scalar-index maintenance contract for
+    /// this column. Segment evaluation independently validates its row-count
+    /// completeness credential before treating postings as exact.
+    pub fn has_declared_art_index(&self, column_id: ColumnId) -> bool {
+        self.runtime_indexes.has_declared_art_index(column_id)
+    }
+
+    /// Runtime row coverage for an exact predicate that needs every listed
+    /// scalar column. A partially backfilled table is explicitly represented
+    /// instead of being costed from a table-level declaration bit.
+    pub fn complete_scalar_index_row_coverage(
+        &self,
+        column_ids: &[ColumnId],
+    ) -> Result<(u64, u64)> {
+        let segments = self.collect_segments(self.max_version())?;
+        let mut covered_rows = 0u64;
+        let mut total_rows = 0u64;
+        for (_, segment) in segments {
+            let rows = segment.num_rows();
+            total_rows = total_rows.saturating_add(rows);
+            if !column_ids.is_empty()
+                && column_ids
+                    .iter()
+                    .all(|column_id| segment.has_complete_scalar_index(*column_id))
+            {
+                covered_rows = covered_rows.saturating_add(rows);
+            }
+        }
+        Ok((covered_rows, total_rows))
     }
 
     /// Count runtime-visible secondary indexes across table-global and segment-local state.
@@ -117,32 +206,73 @@ impl TableHandle {
         self.search_registry.generation_coverage(definition_id)
     }
 
+    pub fn materialize_search_generation(
+        &self,
+        definition_id: u64,
+    ) -> Result<SearchGenerationCoverage> {
+        self.search_registry.materialize_definition(definition_id)
+    }
+
+    /// Bring one catalog-owned search generation to the current table version
+    /// without compacting immutable table data.
+    pub fn materialize_search_generation_by_name(
+        &self,
+        definition_name: &str,
+    ) -> Result<SearchGenerationCoverage> {
+        self.search_registry
+            .materialize_catalog_definition_by_name(definition_name)
+    }
+
     pub fn bootstrap_search_generations(&self) -> Result<SearchBootstrapReport> {
         self.search_registry.bootstrap_migration()
     }
 
-    pub fn search_maintenance_sweep(&self) -> Result<SearchMaintenanceReport> {
-        let mut report = self.search_registry.maintenance_sweep()?;
+    /// Run provider-owned derived-state maintenance without rewriting base
+    /// rowsets. Instance background maintenance uses this entry point so tail
+    /// catch-up, manifest compaction, and sidecar repacking share the search
+    /// scheduler's admission policy while table compaction remains owned by
+    /// the compaction manager.
+    pub fn run_search_maintenance_pass(&self) -> Result<SearchMaintenanceReport> {
+        let mut report = self.search_registry.run_maintenance_pass()?;
         if report.manifest_delta_compaction_requested
             && self.search_registry.compact_manifest_deltas()? > 0
         {
-            self.search_registry.ensure_fresh();
-            report = self.search_registry.maintenance_sweep()?;
+            self.search_registry.refresh_all_definitions();
+            report = self.search_registry.run_maintenance_pass()?;
         }
         if report.sidecar_repack_requested {
-            self.search_registry.ensure_fresh();
-            report = self.search_registry.maintenance_sweep()?;
-        }
-        if report.compaction_requested && self.optimize_compact()? {
-            self.search_registry.ensure_fresh();
-            report = self.search_registry.maintenance_sweep()?;
+            self.search_registry.refresh_all_definitions();
+            report = self.search_registry.run_maintenance_pass()?;
         }
         Ok(report)
     }
 
-    pub fn vector_capability(&self, column_id: ColumnId) -> Option<SearchCapability> {
+    pub fn vector_capability(
+        &self,
+        column_id: ColumnId,
+        distance: crate::index::hnsw::DistanceMetric,
+    ) -> Option<SearchCapability> {
+        self.search_registry.hnsw_capability(column_id, distance)
+    }
+
+    /// Return the mutable query policy associated with the active HNSW
+    /// definition. The policy is deliberately separate from artifact
+    /// statistics and the immutable build contract.
+    pub fn vector_search_policy(
+        &self,
+        column_id: ColumnId,
+        distance: crate::index::hnsw::DistanceMetric,
+    ) -> Option<crate::index::hnsw::HnswSearchPolicy> {
+        self.search_registry.hnsw_search_policy(column_id, distance)
+    }
+
+    pub fn vector_filter_topology(
+        &self,
+        column_id: ColumnId,
+        distance: crate::index::hnsw::DistanceMetric,
+    ) -> Option<crate::index::hnsw::HnswFilterTopologyContract> {
         self.search_registry
-            .capability(SearchIndexKind::Hnsw, column_id, None)
+            .hnsw_filter_topology(column_id, distance)
     }
 
     pub fn sparse_capability(&self, column_id: ColumnId) -> Option<SearchCapability> {
@@ -160,7 +290,7 @@ impl TableHandle {
 
     pub fn search_capability(&self, intent: &SearchIntent) -> Option<SearchCapability> {
         match intent {
-            SearchIntent::Hnsw(intent) => self.vector_capability(intent.column_id),
+            SearchIntent::Hnsw(intent) => self.vector_capability(intent.column_id, intent.distance),
             SearchIntent::Sparse(intent) => self.sparse_capability(intent.column_id),
             SearchIntent::FullText(FullTextIntent {
                 column_id, config, ..

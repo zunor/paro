@@ -8,6 +8,7 @@ use crate::expression::Expression;
 use paro_common::error::{self as paro_error, Result};
 use paro_common::types::LogicalType;
 use paro_function::scalar::cast::CastFunctionSet;
+use paro_storage::index::hnsw::HnswQueryOptions;
 
 use super::cte::WithCTE;
 use super::from::BoundFromItem;
@@ -62,7 +63,7 @@ impl BoundQuery {
         self,
         mut order_by: Option<Vec<OrderByNode>>,
         limit: Option<LimitModifier>,
-        hnsw_ef_hint: Option<usize>,
+        hnsw_options: HnswQueryOptions,
         prune_index: Option<usize>,
     ) -> Self {
         if order_by.as_ref().is_some_and(Vec::is_empty) {
@@ -75,7 +76,7 @@ impl BoundQuery {
             child: Box::new(self),
             order_by,
             limit,
-            hnsw_ef_hint,
+            hnsw_options,
             prune_index,
         }))
     }
@@ -145,7 +146,7 @@ pub struct BoundQueryModifiers {
     pub child: Box<BoundQuery>,
     pub order_by: Option<Vec<OrderByNode>>,
     pub limit: Option<LimitModifier>,
-    pub hnsw_ef_hint: Option<usize>,
+    pub hnsw_options: HnswQueryOptions,
     pub prune_index: Option<usize>,
 }
 
@@ -253,6 +254,9 @@ pub struct BoundValues {
     pub values: Vec<Vec<Expression>>,
     pub names: Vec<String>,
     pub types: Vec<LogicalType>,
+    /// Relation namespace assigned when this VALUES clause is used directly
+    /// as a derived table.
+    pub relation_alias: Option<String>,
 }
 
 impl BoundValues {

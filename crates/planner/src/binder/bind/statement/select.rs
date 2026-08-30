@@ -114,7 +114,7 @@ impl Binder {
     ) -> Result<BoundQuery> {
         let bound_order_by = self.bind_output_order_by(&query, order_by)?;
         let bound_limit = self.bind_limit(limit, offset)?;
-        Ok(query.with_modifiers(bound_order_by, bound_limit, None, None))
+        Ok(query.with_modifiers(bound_order_by, bound_limit, Default::default(), None))
     }
 
     fn bind_output_order_by(

@@ -12,13 +12,13 @@ QUERY PLAN
 PROJECTION  (rows=3)
   Output: id
   ->  TOP_N  (rows=3)
-    Sort Key: #1 DESC NULLS FIRST
+    Sort Key: public.topn_fallback_spill_case.score DESC NULLS FIRST
     Limit: 3
     ->  PROJECTION  (rows=7000)
-      Output: id, __paro_hidden_1
+      Output: id, score
       ->  ROWSET_SCAN on public.topn_fallback_spill_case  (rows=7000)
         Columns: id, score
-        Scan Order: col#1 DESC by max LIMIT 3
+        Scan Order: score DESC by max LIMIT 3
 
 SELECT id
 FROM topn_fallback_spill_case
@@ -36,13 +36,13 @@ ORDER BY id
 LIMIT 5 OFFSET 6000;
 QUERY PLAN
 TOP_N  (rows=5)
-  Sort Key: #0 ASC NULLS LAST
+  Sort Key: id ASC NULLS LAST
   Limit: 5
   ->  PROJECTION  (rows=7000)
     Output: id
     ->  ROWSET_SCAN on public.topn_fallback_spill_case  (rows=7000)
       Columns: id
-      Scan Order: col#0 ASC by min LIMIT 5 OFFSET 6000
+      Scan Order: id ASC by min LIMIT 5 OFFSET 6000
 
 SELECT id
 FROM topn_fallback_spill_case

@@ -1,30 +1,144 @@
 // Copyright 2024-2026 Zunor
 // SPDX-License-Identifier: Apache-2.0
 
-use super::tablet_runtime::{PrimaryIndexUpdate, Tablet};
+use super::tablet_runtime::{PrimaryIndexMemoryState, PrimaryIndexUpdate, Tablet};
 use crate::codec::vector_decoder;
 use crate::compaction::publish::record::PkPublishDelta;
 use crate::primary_key::{
-    DeleteVector, PersistentIndex, PrimaryIndex, PrimaryIndexVersion, PrimaryKeyWriteConflict,
-    RowID,
+    DeleteVector, PersistentIndex, PrimaryIndex, PrimaryIndexProvenance, PrimaryIndexRowsetRoot,
+    PrimaryIndexVersion, PrimaryKeyWriteConflict, RowID,
 };
 use crate::rowset::column::ColumnBatch;
 use crate::rowset::PhysicalRowRef;
 use crate::rowset::{Rowset, RowsetSharedPtr};
 use crate::tablet::tablet_schema::KeysType;
 use crate::tablet::ColumnId;
+use parking_lot::Mutex as ParkingMutex;
 use paro_common::allocator::{default_allocator, Allocator};
 use paro_common::chunk::Chunk;
 use paro_common::error::{self as paro_error, Result};
 use paro_common::types::LogicalType;
 use paro_common::vector::Vector;
+use paro_scheduler::scheduler::TaskScheduler;
+use paro_scheduler::task::{ProducerToken, Task, TaskExecutionMode, TaskExecutionResult};
 use paro_transaction::CommitTs;
 use std::collections::{HashMap, HashSet};
 use std::hash::{Hash, Hasher};
 use std::path::PathBuf;
-use std::sync::atomic::Ordering;
-use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, RwLockReadGuard, RwLockWriteGuard, Weak};
 use tracing::warn;
+
+const PRIMARY_INDEX_COMPACTION_PRIORITY: i32 = -15;
+
+struct PrimaryIndexMaintenanceState {
+    producer: ProducerToken,
+    tablet: Weak<Tablet>,
+    pending: AtomicBool,
+}
+
+/// Table-scoped admission point for primary-index immutable compaction.
+///
+/// The scheduler owns at most one task per tablet. Each turn performs one
+/// snapshot/merge/CAS-publish quantum, allowing the shared instance scheduler
+/// to remain fair across tables while foreground commits continue publishing
+/// newer L1 runs.
+#[derive(Clone)]
+pub(super) struct PrimaryIndexMaintenanceScheduler {
+    state: Arc<PrimaryIndexMaintenanceState>,
+}
+
+impl std::fmt::Debug for PrimaryIndexMaintenanceScheduler {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PrimaryIndexMaintenanceScheduler")
+            .field("pending", &self.state.pending.load(Ordering::Acquire))
+            .finish()
+    }
+}
+
+impl PrimaryIndexMaintenanceScheduler {
+    fn new(scheduler: Arc<TaskScheduler>, tablet: Weak<Tablet>) -> Self {
+        Self {
+            state: Arc::new(PrimaryIndexMaintenanceState {
+                producer: scheduler
+                    .create_producer_with_priority(PRIMARY_INDEX_COMPACTION_PRIORITY),
+                tablet,
+                pending: AtomicBool::new(false),
+            }),
+        }
+    }
+
+    fn schedule(&self) {
+        if self
+            .state
+            .pending
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .is_err()
+        {
+            return;
+        }
+        let task: Arc<ParkingMutex<dyn Task>> =
+            Arc::new(ParkingMutex::new(PrimaryIndexCompactionTask {
+                state: Arc::clone(&self.state),
+            }));
+        self.state.producer.schedule_task(task);
+    }
+}
+
+struct PrimaryIndexCompactionTask {
+    state: Arc<PrimaryIndexMaintenanceState>,
+}
+
+impl PrimaryIndexCompactionTask {
+    fn finish(&self) -> TaskExecutionResult {
+        self.state.pending.store(false, Ordering::Release);
+        TaskExecutionResult::Finished
+    }
+
+    /// Clear ownership, then re-read the level-triggered predicate. A flush
+    /// racing with the task's final `compaction_needed` observation either
+    /// schedules a new task after seeing `pending = false`, or is observed
+    /// here and keeps this task alive. No trailing L1 publication can be lost
+    /// in the edge between the last merge and task completion.
+    fn finish_or_continue(&self, tablet: &Tablet) -> Result<TaskExecutionResult> {
+        self.state.pending.store(false, Ordering::Release);
+        let compaction_needed = tablet.persistent_index()?.compaction_needed();
+        if compaction_needed
+            && self
+                .state
+                .pending
+                .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+                .is_ok()
+        {
+            return Ok(TaskExecutionResult::NotFinished);
+        }
+        Ok(TaskExecutionResult::Finished)
+    }
+}
+
+impl Task for PrimaryIndexCompactionTask {
+    fn execute(&mut self, _mode: TaskExecutionMode) -> Result<TaskExecutionResult> {
+        let Some(tablet) = self.state.tablet.upgrade() else {
+            return Ok(self.finish());
+        };
+        match tablet.compact_primary_index_once() {
+            Ok(true) => Ok(TaskExecutionResult::NotFinished),
+            Ok(false) => self.finish_or_continue(&tablet),
+            Err(error) => {
+                warn!(
+                    tablet_id = tablet.tablet_id(),
+                    error = %error,
+                    "background primary-index compaction failed"
+                );
+                Ok(self.finish())
+            }
+        }
+    }
+
+    fn task_type(&self) -> &str {
+        "PrimaryIndexCompactionTask"
+    }
+}
 
 #[derive(Debug)]
 pub(crate) struct PreparedPrimaryIndexPublish {
@@ -72,16 +186,97 @@ fn select_earlier_primary_key_conflict(
 }
 
 impl Tablet {
+    pub fn bind_primary_index_task_scheduler(
+        self: &Arc<Self>,
+        scheduler: Option<Arc<TaskScheduler>>,
+    ) {
+        let maintenance = scheduler.map(|scheduler| {
+            PrimaryIndexMaintenanceScheduler::new(scheduler, Arc::downgrade(self))
+        });
+        let should_schedule = maintenance.is_some()
+            && self
+                .persistent_index()
+                .map(|index| index.compaction_needed())
+                .unwrap_or(false);
+        *self.primary_index_maintenance_scheduler.write().unwrap() = maintenance;
+        if should_schedule {
+            self.schedule_primary_index_compaction();
+        }
+    }
+
+    fn schedule_primary_index_compaction(&self) {
+        if let Some(scheduler) = self
+            .primary_index_maintenance_scheduler
+            .read()
+            .unwrap()
+            .as_ref()
+            .cloned()
+        {
+            scheduler.schedule();
+        }
+    }
+
+    /// Execute one immutable primary-index merge quantum. Preparation and
+    /// publication briefly own the tablet lock; the O(base) merge itself runs
+    /// lock-free against pinned immutable readers.
+    fn compact_primary_index_once(&self) -> Result<bool> {
+        let plan = {
+            let mut persistent = self.persistent_index_mut()?;
+            persistent.prepare_compaction()?
+        };
+        let Some(plan) = plan else {
+            return Ok(false);
+        };
+
+        let output = match PersistentIndex::execute_compaction(&plan) {
+            Ok(output) => output,
+            Err(error) => {
+                self.persistent_index_mut()?.abort_compaction(&plan);
+                return Err(error);
+            }
+        };
+        let mut persistent = self.persistent_index_mut()?;
+        let published = persistent.publish_compaction(plan, output)?;
+        Ok(published && persistent.compaction_needed())
+    }
+
     fn primary_index_handle(&self) -> Arc<PrimaryIndex> {
-        self.primary_index.read().unwrap().clone()
+        self.primary_index.read().unwrap().index().clone()
+    }
+
+    fn primary_index_is_complete(&self) -> bool {
+        self.primary_index.read().unwrap().is_complete()
+    }
+
+    fn new_primary_index_overlay(&self) -> Arc<PrimaryIndex> {
+        let index = Arc::new(PrimaryIndex::new());
+        self.register_primary_index_callbacks(index.as_ref());
+        index
+    }
+
+    /// Hold the semantic-state read lock across every mutation. A flush owns
+    /// the write lock while publishing the captured layer and swapping in a
+    /// new overlay, so no writer can retain an old Arc and append after that
+    /// layer has become immutable.
+    fn mutate_primary_index<T>(&self, mutation: impl FnOnce(&PrimaryIndex) -> T) -> T {
+        let state = self.primary_index.read().unwrap();
+        mutation(state.index().as_ref())
     }
 
     fn persistent_index_dir(&self) -> PathBuf {
         self.data_dir().join("primary_index")
     }
 
-    fn persistent_index(&self) -> Result<PersistentIndex> {
-        PersistentIndex::new(self.persistent_index_dir())
+    fn persistent_index(&self) -> Result<RwLockReadGuard<'_, PersistentIndex>> {
+        self.persistent_primary_index
+            .read()
+            .map_err(|_| paro_error::internal("lock persistent primary index for read"))
+    }
+
+    fn persistent_index_mut(&self) -> Result<RwLockWriteGuard<'_, PersistentIndex>> {
+        self.persistent_primary_index
+            .write()
+            .map_err(|_| paro_error::internal("lock persistent primary index for write"))
     }
 
     pub fn lookup_primary_key(&self, key: &[u8]) -> Result<Option<RowID>> {
@@ -258,16 +453,19 @@ impl Tablet {
             return Ok(Vec::new());
         }
 
-        if self.primary_index_full.load(Ordering::Acquire) {
-            return Ok(self.primary_index_handle().snapshot());
-        }
-
-        Ok(self.persistent_index()?.load()?.snapshot())
+        Ok(self.materialize_complete_primary_index()?.snapshot())
     }
 
     #[doc(hidden)]
-    pub fn remove_primary_index_entry_for_test(&self, key: &[u8]) {
-        self.primary_index_handle().remove(key);
+    pub fn remove_primary_index_entry_for_test(&self, key: &[u8]) -> Result<()> {
+        // Tests that exercise consistency repair need to corrupt the complete
+        // logical view. Removing a key only from the mutable overlay is not a
+        // corruption when the immutable base still contains that key.
+        let complete = Arc::new(self.materialize_complete_primary_index()?);
+        complete.remove(key);
+        self.register_primary_index_callbacks(&complete);
+        *self.primary_index.write().unwrap() = PrimaryIndexMemoryState::Complete(complete);
+        Ok(())
     }
 
     /// Reconcile primary index cardinality with effective rows recorded in RowsetMeta.
@@ -283,7 +481,7 @@ impl Tablet {
         if self.has_pending_delete_locks() {
             return Ok(());
         }
-        if !self.primary_index_full.load(Ordering::Acquire) {
+        if !self.primary_index_is_complete() {
             return Ok(());
         }
 
@@ -315,8 +513,7 @@ impl Tablet {
         };
 
         if let Err(first_error) = validate_once() {
-            self.rebuild_primary_index_from_visible_rowsets()?;
-            self.persist_primary_index_snapshot()?;
+            self.rebuild_primary_index_after_compaction(output)?;
             validate_once().map_err(|second_error| {
                 paro_error::internal(format!(
                     "failed to validate/rebuild primary index after compaction: first={}, second={}",
@@ -325,6 +522,18 @@ impl Tablet {
             })?;
         }
         Ok(())
+    }
+
+    /// Rebuild the primary index from the post-publication durable rowset
+    /// graph. Compaction WAL deliberately does not retain an unbounded key
+    /// delta, so replay and large compactions use this as the authoritative
+    /// publication path rather than trying to infer correctness from index
+    /// cardinality or samples.
+    pub(crate) fn rebuild_primary_index_after_compaction(&self, output: &Rowset) -> Result<()> {
+        self.rebuild_primary_index_from_visible_rowsets()?;
+        self.persist_primary_index_snapshot()?;
+        self.reconcile_primary_index_row_count()?;
+        self.validate_primary_index_rowid_samples(output, output.end_version())
     }
 
     pub(crate) fn apply_compaction_publish_delta(
@@ -378,9 +587,7 @@ impl Tablet {
         if !pairs.is_empty() {
             let commit_ts = u64::try_from(output_version)
                 .map_err(|_| paro_error::invalid_input("negative primary index version"))?;
-            self.persist_primary_index_upserts_at(&pairs, commit_ts)?;
-            self.primary_index_handle()
-                .batch_upsert_at(pairs, commit_ts);
+            self.mutate_primary_index(|index| index.batch_upsert_at(pairs, commit_ts));
         }
 
         if !pending_delete_vectors.is_empty() {
@@ -484,14 +691,6 @@ impl Tablet {
         Ok(())
     }
 
-    pub(crate) fn persist_primary_index_upserts_at(
-        &self,
-        pairs: &[(Vec<u8>, RowID)],
-        commit_ts: u64,
-    ) -> Result<()> {
-        self.persistent_index()?.apply_upserts_at(pairs, commit_ts)
-    }
-
     pub(super) fn prepare_primary_index_publish(
         &self,
         rowset: &Rowset,
@@ -581,23 +780,23 @@ impl Tablet {
         rowset: &RowsetSharedPtr,
         prepared: PreparedPrimaryIndexPublish,
     ) -> Result<()> {
-        if !prepared.tombstones.is_empty() {
+        // The database journal plus immutable rowsets are the durable truth.
+        // Keep the mutable primary index in the transaction's in-memory
+        // publication boundary; its persistent levels are a derived cache
+        // flushed only when the memory watermark requests it. Writing a
+        // second WAL here would serialize every group-committed transaction
+        // and still require rowset reconciliation after a crash.
+        if !prepared.tombstones.is_empty() || !prepared.pairs.is_empty() {
             let commit_ts = u64::try_from(version)
                 .map_err(|_| paro_error::invalid_input("negative primary index version"))?;
-            let idx = self.primary_index_handle();
-            for key in &prepared.tombstones {
-                idx.remove_at(key, commit_ts);
-            }
-            self.persistent_index()?
-                .apply_deletes_at(&prepared.tombstones, commit_ts)?;
-        }
-
-        if !prepared.pairs.is_empty() {
-            let commit_ts = u64::try_from(version)
-                .map_err(|_| paro_error::invalid_input("negative primary index version"))?;
-            self.primary_index_handle()
-                .batch_upsert_at(prepared.pairs.clone(), commit_ts);
-            self.persist_primary_index_upserts_at(&prepared.pairs, commit_ts)?;
+            self.mutate_primary_index(|index| {
+                for key in &prepared.tombstones {
+                    index.remove_at(key, commit_ts);
+                }
+                if !prepared.pairs.is_empty() {
+                    index.batch_upsert_at(prepared.pairs.clone(), commit_ts);
+                }
+            });
         }
 
         self.persist_delete_vectors_for_rowset_publish(
@@ -630,9 +829,6 @@ impl Tablet {
         }
 
         let resolved = self.lookup_primary_keys(&unique_keys)?;
-        let idx = self.primary_index_handle();
-        let persistent = self.persistent_index()?;
-
         let mut resolved_locations = Vec::with_capacity(unique_keys.len());
         let mut existing_keys = Vec::with_capacity(unique_keys.len());
         for (key, current) in unique_keys.into_iter().zip(resolved.into_iter()) {
@@ -654,10 +850,11 @@ impl Tablet {
         let version = delete_version.unwrap_or_else(|| self.max_version().saturating_add(1));
         let commit_ts = u64::try_from(version)
             .map_err(|_| paro_error::invalid_input("negative primary delete version"))?;
-        for key in &existing_keys {
-            idx.remove_at(key, commit_ts);
-        }
-        persistent.apply_deletes_at(&existing_keys, commit_ts)?;
+        self.mutate_primary_index(|index| {
+            for key in &existing_keys {
+                index.remove_at(key, commit_ts);
+            }
+        });
 
         let mut pending: HashMap<(u64, u32), DeleteVector> = HashMap::new();
         for loc in resolved_locations {
@@ -720,8 +917,6 @@ impl Tablet {
             }
         }
 
-        let idx = self.primary_index_handle();
-        let persistent = self.persistent_index()?;
         let version = self.max_version();
         let mut pending: HashMap<(u64, u32), DeleteVector> = HashMap::new();
         let mut tombstones = Vec::new();
@@ -749,9 +944,12 @@ impl Tablet {
             tombstones.push(key);
         }
 
-        for key in &tombstones {
-            idx.remove_at(key, u64::try_from(version).unwrap_or(0));
-        }
+        self.mutate_primary_index(|index| {
+            for key in &tombstones {
+                index.remove_at(key, u64::try_from(version).unwrap_or(0));
+            }
+        });
+        let persistent = self.persistent_index()?;
         persistent.apply_deletes_at(&tombstones, u64::try_from(version).unwrap_or(0))?;
         if !pending.is_empty() {
             self.persist_delete_vectors(version, pending)?;
@@ -856,25 +1054,27 @@ impl Tablet {
     }
 
     pub(super) fn rebuild_primary_index_from_persistent(&self) -> Result<bool> {
-        let persistent = self.persistent_index()?;
-        match persistent.load() {
-            Ok(index) => {
-                let index = Arc::new(index);
-                self.register_primary_index_callbacks(&index);
-                *self.primary_index.write().unwrap() = index;
-                self.primary_index_full.store(true, Ordering::Release);
-                if self.reconcile_primary_index_row_count().is_ok() {
-                    return Ok(false);
-                }
-
-                warn!(
-                    tablet_id = self.tablet_id(),
-                    persistent_index_dir = %self.persistent_index_dir().display(),
-                    "persistent primary index is inconsistent with visible rowsets; rebuilding"
-                );
-                self.rebuild_primary_index_from_visible_rowsets()?;
-                self.persist_primary_index_snapshot()?;
-                Ok(true)
+        let expected_provenance = self.primary_index_provenance()?;
+        let validated = (|| {
+            let persistent = self.persistent_index()?;
+            if persistent.provenance() != Some(&expected_provenance) {
+                return Err(paro_error::data_corrupted(format!(
+                    "persistent primary-index provenance does not match tablet {} durable state",
+                    self.tablet_id()
+                )));
+            }
+            Ok(())
+        })();
+        match validated {
+            Ok(()) => {
+                // Provenance is the structural proof. Keep the immutable base
+                // in its mmap-backed LSM and start with a bounded empty L0;
+                // loading every key into a second hash table makes recovery
+                // O(table cardinality) and causes the first tiny post-restart
+                // write to rewrite the complete base again.
+                *self.primary_index.write().unwrap() =
+                    PrimaryIndexMemoryState::Overlay(self.new_primary_index_overlay());
+                Ok(false)
             }
             Err(error) => {
                 warn!(
@@ -905,19 +1105,43 @@ impl Tablet {
             return Ok(());
         }
 
-        let idx = self.primary_index_handle();
-        if idx.is_empty() {
-            return Ok(());
-        }
-
-        let mut persistent = self.persistent_index()?;
-        if let Err(err) = persistent.flush_l0(&idx, true) {
+        if let Err(err) = self.flush_primary_index_memory_state(false) {
             self.primary_index_flush_requested
                 .store(true, Ordering::Release);
             return Err(err);
         }
-        idx.clear();
-        self.primary_index_full.store(false, Ordering::Release);
+        Ok(())
+    }
+
+    /// Publish one stable mutable layer and atomically replace it with an
+    /// empty overlay. The state write lock is deliberately held through the
+    /// immutable-file publication: primary-index mutations hold the matching
+    /// read lock, so no writer can append to an Arc after it has been sealed.
+    fn flush_primary_index_memory_state(&self, force: bool) -> Result<()> {
+        let mut state = self.primary_index.write().unwrap();
+        let index = state.index().clone();
+        if index.is_empty() && !state.is_complete() {
+            return Ok(());
+        }
+        if !force && index.is_empty() {
+            return Ok(());
+        }
+
+        let provenance = self.primary_index_provenance()?;
+        let mut persistent = self.persistent_index_mut()?;
+        if state.is_complete() {
+            persistent.reset()?;
+        }
+        persistent.flush_l0_with_provenance(index.as_ref(), true, Some(provenance))?;
+        let needs_compaction = persistent.compaction_needed();
+        *state = PrimaryIndexMemoryState::Overlay(self.new_primary_index_overlay());
+        drop(persistent);
+        drop(state);
+        self.primary_index_flush_requested
+            .store(false, Ordering::Release);
+        if needs_compaction {
+            self.schedule_primary_index_compaction();
+        }
         Ok(())
     }
 
@@ -930,31 +1154,53 @@ impl Tablet {
             return Ok(());
         }
 
-        if self.reconcile_primary_index_row_count().is_ok() {
-            return Ok(());
+        // Recovery starts from either a provenance-matched base or a strict
+        // rowset rebuild.  Replayed rowsets/deletes then advance that base.
+        // Cardinality remains a diagnostic only; it is never used to accept an
+        // unproven persistent cache.
+        if self.primary_index_is_complete() {
+            if let Err(error) = self.reconcile_primary_index_row_count() {
+                warn!(
+                    tablet_id = self.tablet_id(),
+                    error = %error,
+                    "replayed primary index failed diagnostics; rebuilding from durable rowsets"
+                );
+                self.rebuild_primary_index_from_visible_rowsets()?;
+                self.reconcile_primary_index_row_count()?;
+            }
         }
-
-        self.rebuild_primary_index_from_visible_rowsets()?;
-        self.reconcile_primary_index_row_count()?;
-        self.persist_primary_index_snapshot()?;
+        self.flush_primary_index_memory_state(true)?;
         Ok(())
     }
 
-    fn rebuild_primary_index_from_visible_rowsets(&self) -> Result<()> {
-        let schema = match self.schema() {
-            Some(schema) => schema,
-            None => return Ok(()),
+    pub(crate) fn apply_replayed_rowset_to_primary_index(&self, rowset_id: u64) -> Result<()> {
+        let Some(schema) = self.schema() else {
+            return Ok(());
         };
         if schema.keys_type() != KeysType::PrimaryKeys {
             return Ok(());
         }
-
-        let visible_rowsets = self.capture_consistent_rowsets(self.max_version())?;
-        if visible_rowsets.is_empty() {
+        let Some(rowset) = self.find_rowset_by_id(rowset_id) else {
             return Ok(());
-        }
+        };
+        self.mutate_primary_index(|index| {
+            self.upsert_visible_rowset_into_primary_index(
+                index,
+                &rowset,
+                &schema,
+                self.max_version(),
+            )
+        })
+    }
 
-        let serializer = crate::primary_key::PrimaryKeySerializer::from_schema_ref(&schema)?;
+    fn upsert_visible_rowset_into_primary_index(
+        &self,
+        target: &PrimaryIndex,
+        rowset: &RowsetSharedPtr,
+        schema: &crate::tablet::TabletSchemaRef,
+        visible_version: i64,
+    ) -> Result<()> {
+        let serializer = crate::primary_key::PrimaryKeySerializer::from_schema_ref(schema)?;
         let key_projection: Vec<crate::tablet::ColumnId> = schema
             .columns()
             .iter()
@@ -969,83 +1215,116 @@ impl Tablet {
             .collect();
         let allocator = Arc::new(default_allocator());
 
-        let repaired = PrimaryIndex::new();
-        let snapshot = self.primary_index_handle().snapshot();
-        if !snapshot.is_empty() {
-            repaired.batch_upsert(snapshot);
+        rowset.load()?;
+        for segment in rowset.segments() {
+            let delete_vector = DeleteVector::load_from_dir_at_version(
+                rowset.rowset_path(),
+                segment.segment_id(),
+                visible_version,
+            )?;
+            let mut iter = crate::rowset::SegmentIterator::new_with_delete_vector(
+                &segment,
+                key_projection.clone(),
+                delete_vector,
+            )?;
+
+            while iter.has_next() {
+                let (row_ids, batch) = iter.next_batch(4096)?;
+                if row_ids.is_empty() || batch.is_empty() {
+                    continue;
+                }
+                let rows =
+                    infer_row_count_for_keys(&key_projection, &key_types, &batch, row_ids.len())?;
+                if rows == 0 {
+                    continue;
+                }
+                let chunk =
+                    build_key_chunk(&key_projection, &key_types, &batch, rows, allocator.clone())?;
+                let mut pairs = Vec::with_capacity(chunk.size());
+                for (row_idx, &row_id) in row_ids.iter().enumerate().take(chunk.size()) {
+                    let key = serializer.encode_row(&chunk, row_idx)?;
+                    let row_id = self.encode_row_location(PhysicalRowRef::new(
+                        rowset.rowset_id(),
+                        segment.segment_id(),
+                        row_id,
+                    ))?;
+                    pairs.push((key, row_id));
+                }
+                target.batch_upsert_at(pairs, u64::try_from(rowset.end_version()).unwrap_or(0));
+            }
+        }
+        Ok(())
+    }
+
+    fn rebuild_primary_index_from_visible_rowsets(&self) -> Result<()> {
+        let schema = match self.schema() {
+            Some(schema) => schema,
+            None => return Ok(()),
+        };
+        if schema.keys_type() != KeysType::PrimaryKeys {
+            return Ok(());
         }
 
+        let visible_rowsets = self.capture_consistent_rowsets(self.max_version())?;
+        let repaired = PrimaryIndex::new();
         for rowset in visible_rowsets {
-            rowset.load()?;
-            let segments = rowset.segments();
-            for segment in segments {
-                let delete_vector = DeleteVector::load_from_dir_at_version(
-                    rowset.rowset_path(),
-                    segment.segment_id(),
-                    self.max_version(),
-                )?;
-                let mut iter = crate::rowset::SegmentIterator::new_with_delete_vector(
-                    &segment,
-                    key_projection.clone(),
-                    delete_vector,
-                )?;
-
-                while iter.has_next() {
-                    let (row_ids, batch) = iter.next_batch(4096)?;
-                    if row_ids.is_empty() || batch.is_empty() {
-                        continue;
-                    }
-                    let rows = infer_row_count_for_keys(
-                        &key_projection,
-                        &key_types,
-                        &batch,
-                        row_ids.len(),
-                    )?;
-                    if rows == 0 {
-                        continue;
-                    }
-                    let chunk = build_key_chunk(
-                        &key_projection,
-                        &key_types,
-                        &batch,
-                        rows,
-                        allocator.clone(),
-                    )?;
-                    let mut pairs = Vec::with_capacity(chunk.size());
-                    for (row_idx, &row_id) in row_ids.iter().enumerate().take(chunk.size()) {
-                        let key = serializer.encode_row(&chunk, row_idx)?;
-                        let row_id = self.encode_row_location(PhysicalRowRef::new(
-                            rowset.rowset_id(),
-                            segment.segment_id(),
-                            row_id,
-                        ))?;
-                        pairs.push((key, row_id));
-                    }
-                    repaired
-                        .batch_upsert_at(pairs, u64::try_from(rowset.end_version()).unwrap_or(0));
-                }
-            }
+            self.upsert_visible_rowset_into_primary_index(
+                &repaired,
+                &rowset,
+                &schema,
+                self.max_version(),
+            )?;
         }
 
         let repaired = Arc::new(repaired);
         self.register_primary_index_callbacks(&repaired);
-        *self.primary_index.write().unwrap() = repaired;
-        self.primary_index_full.store(true, Ordering::Release);
+        *self.primary_index.write().unwrap() = PrimaryIndexMemoryState::Complete(repaired);
         Ok(())
     }
 
     pub(super) fn persist_primary_index_snapshot(&self) -> Result<()> {
-        let snapshot = self.primary_index_handle().snapshot();
-        let persistent = self.persistent_index()?;
-        persistent.reset()?;
-        let mut persistent = self.persistent_index()?;
-        if !snapshot.is_empty() {
-            let commit_ts = u64::try_from(self.max_version()).unwrap_or(0);
-            persistent.apply_upserts_at(&snapshot, commit_ts)?;
-            let idx = self.primary_index_handle();
-            persistent.flush_l0(&idx, true)?;
+        self.flush_primary_index_memory_state(true)
+    }
+
+    fn materialize_complete_primary_index(&self) -> Result<PrimaryIndex> {
+        let state = self.primary_index.read().unwrap();
+        let in_memory = state.index().clone();
+        if state.is_complete() {
+            let complete = PrimaryIndex::new();
+            complete.batch_apply_versions(in_memory.snapshot_versions());
+            return Ok(complete);
         }
-        Ok(())
+        drop(state);
+        let complete = self.persistent_index()?.load()?;
+        complete.batch_apply_versions(in_memory.snapshot_versions());
+        Ok(complete)
+    }
+
+    fn primary_index_provenance(&self) -> Result<PrimaryIndexProvenance> {
+        let indexed_through_version = self.max_version();
+        let mut rowset_root = self
+            .capture_consistent_rowsets(indexed_through_version)?
+            .into_iter()
+            .map(|rowset| {
+                let meta = rowset.rowset_meta();
+                PrimaryIndexRowsetRoot {
+                    rowset_id: rowset.rowset_id(),
+                    start_version: rowset.start_version(),
+                    end_version: rowset.end_version(),
+                    num_segments: rowset.num_segments(),
+                    effective_rows: meta.effective_rows(),
+                }
+            })
+            .collect::<Vec<_>>();
+        rowset_root.sort_by_key(|rowset| (rowset.start_version, rowset.rowset_id));
+        Ok(PrimaryIndexProvenance {
+            tablet_id: self.tablet_id(),
+            indexed_through_version,
+            layout_epoch: self.layout_epoch(),
+            schema_epoch: self.schema_epoch(),
+            schema_hash: self.schema_hash(),
+            rowset_root,
+        })
     }
 }
 

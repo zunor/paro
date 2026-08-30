@@ -9,6 +9,7 @@ use crate::{
     InstanceShutdownMode,
 };
 use paro_catalog::mvcc::CatalogSnapshot;
+use paro_storage::index::hnsw::HnswIntegritySchedulerConfig;
 use std::collections::HashSet;
 use std::sync::mpsc;
 use std::sync::Arc;
@@ -31,6 +32,22 @@ fn test_instance_with_custom_config() {
     let instance = Instance::new_in_memory_with_config(config).unwrap();
     assert_eq!(instance.number_of_threads(), 4);
     assert!(instance.is_in_memory());
+}
+
+#[test]
+fn hnsw_integrity_policy_is_instance_owned_boot_configuration() {
+    let policy = HnswIntegritySchedulerConfig {
+        max_pending_artifacts: 3,
+        chunks_per_slice: 17,
+        max_automatic_verify_bytes: 4 * 1024 * 1024,
+        definition_idle: Duration::from_millis(7),
+        ..HnswIntegritySchedulerConfig::default()
+    };
+    let config = InstanceConfig::in_memory().with_hnsw_integrity_scheduler(policy);
+
+    let instance = Instance::new_in_memory_with_config(config).unwrap();
+    assert_eq!(instance.boot_config().hnsw_integrity, policy);
+    assert_eq!(instance.runtime.hnsw_integrity_scheduler().config(), policy);
 }
 
 #[test]

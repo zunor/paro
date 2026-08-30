@@ -9,10 +9,11 @@ use paro_catalog::entry::{CreateIndexInfo, IndexCatalogEntry, IndexCoverage, Tab
 use paro_common::ddl::{DdlChangeRecord, DdlObjectKey};
 use paro_common::effect::{
     CleanupDescriptor, PostCommitHookDescriptor, RuntimeTransitionDescriptor,
-    StagedArtifactDescriptor,
+    StagedArtifactDescriptor, StorageCommitOp,
 };
 use paro_context::DdlExecutionProfile;
 use paro_storage::index::BoundIndex;
+use paro_storage::search::StagedSearchGeneration;
 use paro_storage::table::table_handle::TableHandle;
 
 use super::index_backfill::IndexBackfillPlan;
@@ -24,6 +25,7 @@ pub struct IndexPostCommitAction {
     pub built_index: Option<Arc<dyn BoundIndex>>,
     pub coverage: Option<IndexCoverage>,
     pub(crate) backfill: Option<IndexBackfillPlan>,
+    pub(crate) staged_search_generation: Option<Arc<StagedSearchGeneration>>,
 }
 
 pub struct TableDropCleanupAction {
@@ -31,10 +33,16 @@ pub struct TableDropCleanupAction {
     pub move_to_trash: bool,
 }
 
+pub struct SearchGenerationRetirementAction {
+    pub storage: Arc<TableHandle>,
+    pub definition_id: u64,
+}
+
 #[allow(clippy::large_enum_variant)]
 pub enum TransientCatalogRuntime {
     CreateIndex(IndexPostCommitAction),
     DropTable(TableDropCleanupAction),
+    RetireSearchGeneration(SearchGenerationRetirementAction),
 }
 
 pub struct PreparedCatalogOp {
@@ -44,6 +52,7 @@ pub struct PreparedCatalogOp {
     pub dependencies: Option<DependencyDelta>,
     pub dml_targets: Vec<DdlObjectKey>,
     pub staged_artifacts: Vec<StagedArtifactDescriptor>,
+    pub storage_ops: Vec<StorageCommitOp>,
     pub runtime_transitions: Vec<RuntimeTransitionDescriptor>,
     pub cleanups: Vec<CleanupDescriptor>,
     pub post_commit_hooks: Vec<PostCommitHookDescriptor>,
@@ -59,6 +68,7 @@ impl std::fmt::Debug for PreparedCatalogOp {
             .field("has_dependencies", &self.dependencies.is_some())
             .field("dml_targets", &self.dml_targets)
             .field("staged_artifacts", &self.staged_artifacts)
+            .field("storage_ops", &self.storage_ops)
             .field("runtime_transitions", &self.runtime_transitions)
             .field("cleanups", &self.cleanups)
             .field("post_commit_hooks", &self.post_commit_hooks)

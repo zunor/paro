@@ -327,7 +327,7 @@ fn hash_join_merges_optional_branches_before_stateful_transforms() {
                     LogicalType::Integer,
                 ))),
                 offset: None,
-                hnsw_ef_hint: None,
+                hnsw_options: Default::default(),
             })],
             SinkSpec::ClientResult(ClientResultSpec::default()),
             SinkSharing::Exclusive,
@@ -515,7 +515,7 @@ fn hash_join_merges_optional_branches_directly_into_topn_heap() {
         .into_boxed_slice(),
         limit: 1,
         offset: 0,
-        hnsw_ef_hint: None,
+        hnsw_options: Default::default(),
         output_names: output.names.clone(),
         output_types: output.types.clone(),
     };

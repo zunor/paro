@@ -204,13 +204,21 @@ pub fn ddl_lock_requests(
                 LockMode::X,
             ));
             for target in dml_targets {
+                let table_mode = if profile.runtime == RuntimeEffect::AttachIndexState {
+                    // Non-concurrent CREATE INDEX takes a stable physical
+                    // snapshot and therefore admits readers but blocks every
+                    // writer until transaction publish or abort.
+                    LockMode::S
+                } else {
+                    LockMode::SchemaStability
+                };
                 requests.push(LockRequest::new(
                     schema_resource(namespace, target),
                     LockMode::SchemaStability,
                 ));
                 requests.push(LockRequest::new(
                     table_resource(namespace, target),
-                    LockMode::SchemaStability,
+                    table_mode,
                 ));
             }
         }
@@ -564,14 +572,16 @@ mod tests {
     }
 
     #[test]
-    fn attach_index_profile_derives_table_schema_stability_lock() {
+    fn attach_index_profile_blocks_writers_but_admits_readers() {
         let index = DdlObjectKey::new("main", Some("public"), "idx_t1", DdlObjectKind::Index);
         let requests =
             DdlExecutionProfile::attach_index_state().lock_requests(ns(), &index, &[table("t1")]);
 
         assert!(requests.iter().any(|request| request.resource
             == table_resource(ns(), &table("t1"))
-            && request.mode == LockMode::SchemaStability));
+            && request.mode == LockMode::S));
+        assert!(LockMode::S.compatible_with(LockMode::IS));
+        assert!(!LockMode::S.compatible_with(LockMode::IX));
         assert!(requests.iter().any(|request| matches!(
             request.resource,
             LockResource::CatalogObject { .. }

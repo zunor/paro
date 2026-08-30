@@ -6,7 +6,6 @@
 use std::collections::BTreeSet;
 
 use paro_common::error::{self as paro_error, Result};
-use serde_json::Value;
 
 use crate::rowset::{load_base_rowids, RowsetSharedPtr};
 use crate::tablet::ColumnId;
@@ -16,6 +15,7 @@ use super::view::{coverage_for_definition, execution_modes_for_definition};
 use crate::search::artifact::{ArtifactLocation, SegmentPagePointer};
 use crate::search::capability::{
     ArtifactSegmentRef, CoverageState, SearchArtifactRef, SearchIndexDefinition, SearchIndexKind,
+    SearchPartitionCoverage,
 };
 use crate::search::lifecycle::publisher::inline_artifact_checksum;
 use crate::search::stats::{
@@ -48,7 +48,7 @@ pub(crate) fn collect_visible_snapshot(
     visible_version: i64,
     visible_rowsets: &[RowsetSharedPtr],
 ) -> Result<VisibleSearchSnapshot> {
-    let mut generation_stats = empty_generation_stats_for_definition(definition);
+    let mut generation_stats = empty_generation_stats_for_definition(definition)?;
     let mut artifacts = Vec::new();
     let mut tail_entries = Vec::new();
 
@@ -89,13 +89,39 @@ pub(crate) fn collect_visible_snapshot(
     })
 }
 
+/// Build input covering every physical segment in one stable tablet layout.
+///
+/// Unlike `collect_visible_snapshot`, this deliberately ignores any inline
+/// provider artifact already embedded in a segment. A staged catalog index is
+/// generation-owned and must produce one self-contained sidecar generation,
+/// not inherit accidental per-segment fan-out from earlier write policy.
+pub(crate) fn collect_full_rebuild_tail(
+    visible_version: i64,
+    visible_rowsets: &[RowsetSharedPtr],
+) -> Result<Vec<TailPendingEntry>> {
+    let mut entries = Vec::with_capacity(visible_rowsets.len());
+    for rowset in visible_rowsets {
+        rowset.load()?;
+        let segment_ids = rowset
+            .segments()
+            .iter()
+            .map(|segment| segment.segment_id())
+            .collect::<Vec<_>>();
+        if segment_ids.is_empty() {
+            continue;
+        }
+        entries.push(rowset_tail_entry(rowset, &segment_ids, visible_version)?);
+    }
+    Ok(entries)
+}
+
 pub(crate) fn collect_rowset_snapshot(
     definition: &SearchIndexDefinition,
     rowset: &RowsetSharedPtr,
     visible_version: i64,
 ) -> Result<RowsetSearchSnapshot> {
     let mut artifacts = Vec::new();
-    let mut generation_stats = empty_generation_stats_for_definition(definition);
+    let mut generation_stats = empty_generation_stats_for_definition(definition)?;
     let mut delete_entries = Vec::new();
     let mut missing_segments = Vec::new();
 
@@ -184,7 +210,8 @@ fn segment_artifact(
 
     let pointer = match definition.kind {
         SearchIndexKind::Hnsw => {
-            if segment.hnsw_index(column_id).is_none() {
+            let expected = definition.hnsw_provider_config()?.build_contract();
+            if !segment.hnsw_artifact_matches_contract(column_id, &expected)? {
                 return Ok(None);
             }
             segment
@@ -203,13 +230,9 @@ fn segment_artifact(
             let Some(index) = segment.fulltext_index(column_id) else {
                 return Ok(None);
             };
-            let expected_config = definition
-                .provider_config
-                .get("config")
-                .and_then(Value::as_str)
-                .unwrap_or("simple");
+            let expected_config = definition.fulltext_provider_config()?.config;
             let actual = index.tokenizer().kind().config_name();
-            if !actual.eq_ignore_ascii_case(expected_config) {
+            if !actual.eq_ignore_ascii_case(&expected_config) {
                 return Ok(None);
             }
             segment
@@ -234,17 +257,23 @@ fn segment_artifact(
         pointer.size,
     );
 
-    Ok(Some(SearchArtifactRef {
+    let artifact = SearchArtifactRef {
         definition_id: definition.definition_id,
         generation_id: 0,
-        segment: ArtifactSegmentRef {
-            rowset_id,
-            segment_id,
-        },
+        coverage: SearchPartitionCoverage::singleton(
+            ArtifactSegmentRef {
+                rowset_id,
+                segment_id,
+            },
+            segment.num_rows(),
+        )?,
         column_id,
         kind: definition.kind,
         provider_variant: definition.config_fingerprint as u32,
-        artifact_format_version: 1,
+        artifact_format_version: match definition.kind {
+            SearchIndexKind::Hnsw => crate::index::hnsw::HNSW_ARTIFACT_FORMAT_VERSION,
+            SearchIndexKind::Sparse | SearchIndexKind::FullText => 1,
+        },
         location: ArtifactLocation::Inline {
             page: SegmentPagePointer {
                 rowset_id,
@@ -261,7 +290,9 @@ fn segment_artifact(
             provider_stats,
         },
         checksum,
-    }))
+    };
+    artifact.validate()?;
+    Ok(Some(artifact))
 }
 
 fn rowset_tail_entry(
@@ -339,7 +370,7 @@ fn search_artifact_metadata(
             .map(|stats| SearchProviderStats::Sparse(stats.into())),
         SearchIndexKind::Hnsw => segment
             .hnsw_index_statistics(column_id)
-            .map(|stats| SearchProviderStats::Hnsw(stats.into())),
+            .map(|stats| SearchProviderStats::Hnsw((&stats).into())),
     };
     (bytes_on_disk, provider_stats)
 }

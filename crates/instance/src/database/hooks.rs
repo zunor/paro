@@ -303,8 +303,7 @@ fn replay_finalize_index_state_task(
                 ));
             };
             if let Err(err) = storage.rebuild_art_index(*column_id) {
-                storage.forget_art_index(*column_id);
-                let _ = storage.drop_art_index(*column_id);
+                let _ = storage.release_art_index(&index.name, *column_id);
                 mark_index_state_failed(
                     index_entry.as_ref(),
                     format!("ART runtime restore failed: {}", err),

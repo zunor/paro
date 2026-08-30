@@ -12,6 +12,7 @@ use super::capability::SearchIndexKind;
 use super::stats::SegmentId;
 
 pub mod exact_merge;
+pub(crate) mod reader_warmup;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 pub struct TailEntryId(pub u64);
@@ -129,8 +130,14 @@ pub struct TailExactMergePolicy {
 }
 
 impl TailExactMergePolicy {
-    pub const fn exact_tail_merge_enabled(self, tail_rows: u64) -> bool {
-        self.supported && tail_rows <= self.hard_row_limit
+    /// Whether this provider has a correctness-preserving exact tail path.
+    ///
+    /// Row watermarks drive maintenance urgency and write backpressure only;
+    /// they must never make an otherwise legal query unexecutable. The exact
+    /// path is streaming and remains the final correctness fallback after a
+    /// large atomic transaction crosses the critical maintenance watermark.
+    pub const fn exact_tail_merge_enabled(self, _tail_rows: u64) -> bool {
+        self.supported
     }
 }
 
@@ -210,13 +217,13 @@ mod tests {
     fn provider_policies_encode_tail_merge_thresholds() {
         let hnsw = provider_tail_exact_merge_policy(SearchIndexKind::Hnsw);
         assert!(hnsw.exact_tail_merge_enabled(2_048));
-        assert!(!hnsw.exact_tail_merge_enabled(32_768));
+        assert!(hnsw.exact_tail_merge_enabled(32_768));
 
         let sparse = provider_tail_exact_merge_policy(SearchIndexKind::Sparse);
         assert!(sparse.exact_tail_merge_enabled(65_536));
 
         let fulltext = provider_tail_exact_merge_policy(SearchIndexKind::FullText);
         assert!(fulltext.exact_tail_merge_enabled(8_192));
-        assert!(!fulltext.exact_tail_merge_enabled(100_000));
+        assert!(fulltext.exact_tail_merge_enabled(100_000));
     }
 }

@@ -11,7 +11,10 @@ use crate::primary_key::RowID;
 use crate::rowset::RowsetSharedPtr;
 use crate::search::write_path::SearchWriteContext;
 use crate::table::runtime_indexes::RuntimeIndexes;
-use crate::tablet::{PhysicalRowRef, PrimaryIndexUpdate, TabletRef, TabletState};
+use crate::tablet::{
+    LayoutMaintenanceLease, PhysicalRowRef, PrimaryIndexUpdate, SearchIngestAdmissionLease,
+    TabletRef, TabletState,
+};
 use crate::transaction::spill::{
     StagedDeleteVectorArtifact, StagedRowsetArtifact, TxnSpillMark, TxnSpillState,
 };
@@ -28,7 +31,33 @@ use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 pub const DEFAULT_TXN_WRITE_BUFFER_MEMORY_BUDGET: u64 = 256 * 1024 * 1024;
+const MIN_TXN_WRITE_BUFFER_MEMORY_BUDGET: u64 = 64 * 1024 * 1024;
+const MAX_TXN_WRITE_BUFFER_MEMORY_BUDGET: u64 = 2 * 1024 * 1024 * 1024;
+const TXN_WRITE_BUFFER_MEMORY_FRACTION: u64 = 8;
 const SPILLED_WRITER_HANDLE_BYTES: u64 = 64 * 1024;
+
+/// Derive one transaction's write working-set waterline from the session
+/// memory contract.
+///
+/// A fixed process-wide default fragments large inline search artifacts even
+/// when a session has been admitted with substantially more memory. The
+/// transaction waterline remains only a local spill/flush threshold: global
+/// buffer reservations and provider build admission still arbitrate actual
+/// concurrent memory. Keeping the derivation here gives every protocol and
+/// embedded session the same storage-owned policy.
+pub fn transaction_write_buffer_memory_budget(session_memory_limit: usize) -> u64 {
+    if session_memory_limit == 0 {
+        return DEFAULT_TXN_WRITE_BUFFER_MEMORY_BUDGET;
+    }
+    let session_memory_limit = u64::try_from(session_memory_limit).unwrap_or(u64::MAX);
+    session_memory_limit
+        .div_ceil(TXN_WRITE_BUFFER_MEMORY_FRACTION)
+        .clamp(
+            MIN_TXN_WRITE_BUFFER_MEMORY_BUDGET,
+            MAX_TXN_WRITE_BUFFER_MEMORY_BUDGET,
+        )
+        .min(session_memory_limit)
+}
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct GraphTableDmlDelta {
@@ -36,6 +65,38 @@ pub struct GraphTableDmlDelta {
     pub deleted: u64,
     pub updated: u64,
     pub updated_columns: BTreeSet<u32>,
+}
+
+fn estimated_primary_update_memory_bytes(update: &PrimaryIndexUpdate) -> u64 {
+    let written = u64::try_from(update.written.capacity())
+        .unwrap_or(u64::MAX)
+        .saturating_mul(
+            u64::try_from(std::mem::size_of::<(Vec<u8>, Option<RowID>)>()).unwrap_or(u64::MAX),
+        )
+        .saturating_add(update.written.iter().fold(0_u64, |total, (key, _)| {
+            total.saturating_add(u64::try_from(key.capacity()).unwrap_or(u64::MAX))
+        }));
+    let delete_vectors = u64::try_from(update.pending_delete_vectors.capacity())
+        .unwrap_or(u64::MAX)
+        .saturating_mul(
+            u64::try_from(std::mem::size_of::<(
+                (u64, u32),
+                crate::primary_key::DeleteVector,
+            )>())
+            .unwrap_or(u64::MAX),
+        )
+        .saturating_add(update.pending_delete_vectors.values().fold(
+            0_u64,
+            |total, delete_vector| {
+                total.saturating_add(
+                    u64::try_from(delete_vector.bitmap().serialized_size()).unwrap_or(u64::MAX),
+                )
+            },
+        ));
+    u64::try_from(std::mem::size_of::<PrimaryIndexUpdate>())
+        .unwrap_or(u64::MAX)
+        .saturating_add(written)
+        .saturating_add(delete_vectors)
 }
 
 /// A storage mutation staged by a transaction.
@@ -68,12 +129,18 @@ impl PendingMutation {
                         .saturating_add(std::mem::size_of::<PendingPrimaryKeyEntry>() as u64)
                         },
                     ))
+                    .saturating_add(pending.rowset.retained_memory_bytes())
                     .saturating_add(
                         pending
-                            .spilled_artifact
+                            .staged_artifact
                             .as_ref()
-                            .map(StagedRowsetArtifact::estimated_handle_bytes)
-                            .unwrap_or_else(|| pending.rowset.total_disk_size()),
+                            .map_or(0, StagedRowsetArtifact::estimated_handle_bytes),
+                    )
+                    .saturating_add(
+                        pending
+                            .primary_update
+                            .as_ref()
+                            .map_or(0, estimated_primary_update_memory_bytes),
                     )
             }
             Self::PrimaryDelete(pending) => pending
@@ -115,7 +182,10 @@ pub struct PendingRowset {
     pub(crate) primary_key_overlay: Vec<(Vec<u8>, PendingPrimaryKeyEntry)>,
     pub(crate) rowset_path: PathBuf,
     pub(crate) created_at_command_id: CommandId,
-    pub(crate) spilled_artifact: Option<StagedRowsetArtifact>,
+    /// Recovery descriptor for an evicted immutable rowset. This metadata is
+    /// orthogonal to overlay execution: readers always use the same lazy
+    /// `Rowset` handle regardless of whether its segment state is resident.
+    pub(crate) staged_artifact: Option<StagedRowsetArtifact>,
 }
 
 impl PendingRowset {
@@ -248,6 +318,13 @@ pub(crate) struct PreparedStorageState {
     pub(crate) rowsets: Vec<PendingRowset>,
     pub(crate) primary_deletes: Vec<PendingPrimaryDelete>,
     pub(crate) row_id_deletes: Vec<PendingRowIdDelete>,
+    /// Shared physical-layout leases acquired before SQL transaction locks are
+    /// released and retained through required tablet publication.
+    pub(crate) _layout_leases: Vec<LayoutMaintenanceLease>,
+    /// Capacity reservations acquired before durable append and released by
+    /// required apply or abort. This closes the check-then-publish race among
+    /// concurrently prepared transactions targeting the same HNSW tail.
+    pub(crate) _search_ingest_admissions: Vec<SearchIngestAdmissionLease>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -328,7 +405,6 @@ impl TxnWriteBufferInner {
 #[derive(Debug, Default)]
 pub(crate) struct TxnOverlaySnapshot {
     pub(crate) rowsets: Vec<RowsetSharedPtr>,
-    pub(crate) spilled_rowsets: Vec<(RowsetSharedPtr, StagedRowsetArtifact)>,
     pub(crate) row_id_deletes: Vec<PhysicalRowRef>,
     pub(crate) primary_keys: HashMap<Vec<u8>, PendingPrimaryKeyEntry>,
 }
@@ -534,7 +610,7 @@ impl TxnWriteBuffer {
             .lock()
             .map_err(|e| paro_error::internal(format!("failed to lock txn write buffer: {e}")))?;
         self.ensure_mutable()?;
-        let mutation = self.rowset_mutation_with_spill(
+        let mutation = self.rowset_mutation_with_governance(
             txn_id,
             command_id,
             tablet,
@@ -712,11 +788,11 @@ impl TxnWriteBuffer {
             )));
         }
 
-        let projected = self
-            .estimated_memory_bytes_locked(&inner)
-            .saturating_add(estimated_new_bytes);
-        let force_flush_after_write = self.is_over_budget(projected);
-        if force_flush_after_write {
+        let estimated_before = self.estimated_memory_bytes_locked(&inner);
+        let prior_writer_bytes = inner.writer_bytes.get(&key).copied().unwrap_or(0);
+        let retained_elsewhere = estimated_before.saturating_sub(prior_writer_bytes);
+        let estimated_projected = estimated_before.saturating_add(estimated_new_bytes);
+        if self.is_over_budget(estimated_projected) {
             let current_spilled_bytes = Self::spilled_bytes_locked(&inner);
             inner
                 .spill
@@ -743,21 +819,24 @@ impl TxnWriteBuffer {
             entry.insert(writer);
         }
 
-        let writer = inner
-            .writers
-            .get_mut(&key)
-            .ok_or_else(|| paro_error::internal("failed to get pending writer"))?;
-        writer.ensure_search_write_context(&search_write_context)?;
-        let result = f(writer)?;
-        if force_flush_after_write {
-            writer.flush_memtable()?;
-        }
-        let entry = inner.writer_bytes.entry(key).or_default();
-        *entry = if force_flush_after_write {
-            SPILLED_WRITER_HANDLE_BYTES
-        } else {
-            entry.saturating_add(estimated_new_bytes)
+        let (result, retained_writer_bytes) = {
+            let writer = inner
+                .writers
+                .get_mut(&key)
+                .ok_or_else(|| paro_error::internal("failed to get pending writer"))?;
+            writer.ensure_search_write_context(&search_write_context)?;
+            let result = f(writer)?;
+            let mut retained = writer.retained_memory_bytes();
+            let actual_projected = retained_elsewhere.saturating_add(retained);
+            if self.is_over_budget(actual_projected) {
+                writer.relieve_memory_pressure()?;
+                retained = writer
+                    .retained_memory_bytes()
+                    .max(SPILLED_WRITER_HANDLE_BYTES);
+            }
+            (result, retained)
         };
+        inner.writer_bytes.insert(key, retained_writer_bytes);
         self.republish_stats_locked(&inner);
         Ok(result)
     }
@@ -844,7 +923,7 @@ impl TxnWriteBuffer {
                 paro_error::internal(format!("failed to lock txn write buffer: {e}"))
             })?;
             inner.writer_bytes.remove(&key);
-            let mutation = self.rowset_mutation_with_spill(
+            let mutation = self.rowset_mutation_with_governance(
                 txn_id,
                 key.command_id(),
                 tablet,
@@ -881,13 +960,7 @@ impl TxnWriteBuffer {
                     for (key, entry) in &pending.primary_key_overlay {
                         snapshot.primary_keys.insert(key.clone(), *entry);
                     }
-                    if let Some(artifact) = &pending.spilled_artifact {
-                        snapshot
-                            .spilled_rowsets
-                            .push((pending.rowset.clone(), artifact.clone()));
-                    } else {
-                        snapshot.rowsets.push(pending.rowset.clone());
-                    }
+                    snapshot.rowsets.push(pending.rowset.clone());
                 }
                 PendingMutation::PrimaryDelete(pending)
                     if pending.tablet.tablet_id() == tablet_id
@@ -969,6 +1042,38 @@ impl TxnWriteBuffer {
         Ok(mutations)
     }
 
+    /// Return the physical rowset volume that will be published per tablet.
+    ///
+    /// Commit admission runs before the durable journal append. Keeping this
+    /// read-only snapshot on the write buffer avoids moving pending artifacts
+    /// out of rollback ownership while a level-triggered search-maintenance
+    /// gate may wait or reject the transaction.
+    pub(crate) fn pending_rowset_volume_by_tablet(&self) -> Result<Vec<(TabletRef, u64, u64)>> {
+        let inner = self
+            .inner
+            .lock()
+            .map_err(|e| paro_error::internal(format!("failed to lock txn write buffer: {e}")))?;
+        let mut volume_by_tablet = BTreeMap::<u64, (TabletRef, u64, u64)>::new();
+        for mutation in &inner.mutations {
+            let PendingMutation::Rowset(pending) = mutation else {
+                continue;
+            };
+            let entry = volume_by_tablet
+                .entry(pending.tablet.tablet_id())
+                .or_insert_with(|| (Arc::clone(&pending.tablet), 0, 0));
+            let rows = pending.rowset.num_rows();
+            let on_disk = pending.rowset.total_disk_size();
+            let bytes = if on_disk > 0 {
+                on_disk
+            } else {
+                rows.saturating_mul(64)
+            };
+            entry.1 = entry.1.saturating_add(rows);
+            entry.2 = entry.2.saturating_add(bytes);
+        }
+        Ok(volume_by_tablet.into_values().collect())
+    }
+
     pub(crate) fn set_prepared(&self, prepared: PreparedStorageState) -> Result<()> {
         let mut inner = self
             .inner
@@ -1034,7 +1139,7 @@ impl TxnWriteBuffer {
             return;
         };
         for rowset in prepared.rowsets.into_iter().rev() {
-            if let Some(artifact) = &rowset.spilled_artifact {
+            if let Some(artifact) = &rowset.staged_artifact {
                 artifact.abandon_and_remove();
                 continue;
             }
@@ -1083,7 +1188,7 @@ impl TxnWriteBuffer {
         Ok(())
     }
 
-    fn rowset_mutation_with_spill(
+    fn rowset_mutation_with_governance(
         &self,
         txn_id: u64,
         command_id: CommandId,
@@ -1091,7 +1196,7 @@ impl TxnWriteBuffer {
         rowset: RowsetSharedPtr,
         primary_update: Option<PrimaryIndexUpdate>,
         inner: &mut TxnWriteBufferInner,
-        preserve_on_spill_error: bool,
+        preserve_on_stage_error: bool,
     ) -> Result<PendingMutation> {
         let mut mutation =
             Self::rowset_mutation(command_id, tablet.clone(), rowset, primary_update)?;
@@ -1108,19 +1213,43 @@ impl TxnWriteBuffer {
                     &pending.rowset,
                     current_spilled_bytes,
                 ) {
-                    Ok(artifact) => pending.spilled_artifact = Some(artifact),
+                    Ok(artifact) => {
+                        pending.rowset.close()?;
+                        pending.staged_artifact = Some(artifact);
+                    }
                     Err(err) => {
-                        if !preserve_on_spill_error {
+                        if !preserve_on_stage_error {
+                            Self::rollback_mutation(mutation);
                             return Err(err);
                         }
                         tracing::warn!(
                             error = %err,
                             tablet_id = tablet.tablet_id(),
                             command_id = command_id.into_raw(),
-                            "transaction rowset spill admission failed; keeping rowset in memory"
+                            "transaction rowset recovery staging failed; retaining loaded rowset state"
                         );
                     }
                 }
+            }
+            let projected_after_eviction = self
+                .estimated_memory_bytes_locked(inner)
+                .saturating_add(mutation.estimated_memory_bytes());
+            if self.is_over_budget(projected_after_eviction) {
+                if !preserve_on_stage_error {
+                    Self::rollback_mutation(mutation);
+                    return Err(paro_error::out_of_memory(format!(
+                        "transaction write buffer budget exceeded after rowset eviction: projected={} bytes budget={} bytes",
+                        projected_after_eviction,
+                        self.memory_budget_bytes()
+                    )));
+                }
+                tracing::warn!(
+                    projected_bytes = projected_after_eviction,
+                    budget_bytes = self.memory_budget_bytes(),
+                    tablet_id = tablet.tablet_id(),
+                    command_id = command_id.into_raw(),
+                    "transaction write buffer retains irreducible rowset commit metadata above its waterline"
+                );
             }
             return Ok(mutation);
         }
@@ -1215,7 +1344,7 @@ impl TxnWriteBuffer {
             primary_update,
             primary_key_overlay,
             created_at_command_id: command_id,
-            spilled_artifact: None,
+            staged_artifact: None,
         }))
     }
 
@@ -1267,7 +1396,7 @@ impl TxnWriteBuffer {
     fn rollback_mutation(mutation: PendingMutation) {
         match mutation {
             PendingMutation::Rowset(rowset) => {
-                if let Some(artifact) = &rowset.spilled_artifact {
+                if let Some(artifact) = &rowset.staged_artifact {
                     artifact.abandon_and_remove();
                     return;
                 }
@@ -1331,19 +1460,19 @@ impl TxnWriteBuffer {
         let mutation_bytes = inner.mutations.iter().fold(0_u64, |acc, mutation| {
             acc.saturating_add(match mutation {
                 PendingMutation::Rowset(pending) => pending
-                    .spilled_artifact
+                    .staged_artifact
                     .as_ref()
-                    .map(StagedRowsetArtifact::bytes)
+                    .map(StagedRowsetArtifact::admitted_bytes)
                     .unwrap_or(0),
                 PendingMutation::PrimaryDelete(pending) => pending
                     .spilled_delete_vector
                     .as_ref()
-                    .map(StagedDeleteVectorArtifact::bytes)
+                    .map(StagedDeleteVectorArtifact::admitted_bytes)
                     .unwrap_or(0),
                 PendingMutation::RowIdDelete(pending) => pending
                     .spilled_delete_vector
                     .as_ref()
-                    .map(StagedDeleteVectorArtifact::bytes)
+                    .map(StagedDeleteVectorArtifact::admitted_bytes)
                     .unwrap_or(0),
             })
         });
@@ -1351,9 +1480,9 @@ impl TxnWriteBuffer {
             let rowset_bytes = prepared.rowsets.iter().fold(0_u64, |acc, pending| {
                 acc.saturating_add(
                     pending
-                        .spilled_artifact
+                        .staged_artifact
                         .as_ref()
-                        .map(StagedRowsetArtifact::bytes)
+                        .map(StagedRowsetArtifact::admitted_bytes)
                         .unwrap_or(0),
                 )
             });
@@ -1362,7 +1491,7 @@ impl TxnWriteBuffer {
                     pending
                         .spilled_delete_vector
                         .as_ref()
-                        .map(StagedDeleteVectorArtifact::bytes)
+                        .map(StagedDeleteVectorArtifact::admitted_bytes)
                         .unwrap_or(0),
                 )
             });
@@ -1371,7 +1500,7 @@ impl TxnWriteBuffer {
                     pending
                         .spilled_delete_vector
                         .as_ref()
-                        .map(StagedDeleteVectorArtifact::bytes)
+                        .map(StagedDeleteVectorArtifact::admitted_bytes)
                         .unwrap_or(0),
                 )
             });
@@ -1449,5 +1578,30 @@ impl TxnParticipantState for StorageTxnState {
 
     fn as_any(&self) -> &dyn std::any::Any {
         self
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn transaction_budget_is_derived_from_session_contract() {
+        assert_eq!(
+            transaction_write_buffer_memory_budget(0),
+            DEFAULT_TXN_WRITE_BUFFER_MEMORY_BUDGET
+        );
+        assert_eq!(
+            transaction_write_buffer_memory_budget(32 * 1024 * 1024),
+            32 * 1024 * 1024
+        );
+        assert_eq!(
+            transaction_write_buffer_memory_budget(8 * 1024 * 1024 * 1024),
+            1024 * 1024 * 1024
+        );
+        assert_eq!(
+            transaction_write_buffer_memory_budget(usize::MAX),
+            MAX_TXN_WRITE_BUFFER_MEMORY_BUDGET
+        );
     }
 }

@@ -56,6 +56,7 @@ lz4_flex = "0.11"
 crc32c = "0.6"
 roaring = "0.10"
 bitvec = "1.0"
+bytemuck = "1"
 rayon = "1"
 arc-swap = "1.7"
 seahash = "4"
@@ -68,10 +69,10 @@ memmap2 = "0.9.9"
 smallvec = "1.13"
 paro-scheduler = { workspace = true }
 libc = "0.2"
+tempfile = "3.8"
 
 [dev-dependencies]
 paro-common = { workspace = true, features = ["test-support"] }
-tempfile = "3.8"
 divan = { workspace = true }
 serial_test = { workspace = true }
 

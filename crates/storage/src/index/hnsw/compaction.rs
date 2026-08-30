@@ -5,17 +5,19 @@ use crate::compaction::execution::index_rebuild::{
     CompactionGenerationContext, CompactionIndexRebuilder,
 };
 use crate::compaction::plan::types::CompactionPlan;
+use crate::index::hnsw::vector_storage::prepare_build_vector_storage;
 use crate::index::hnsw::{
-    DistanceMetric, GraphLayers, GraphLayersBuilder, GraphLayersHealer, HnswConfig, HnswIndex,
-    MmapVectorStorage, PointOffset, VectorStorage, VisitedPool,
+    open_plain_vector_column, GraphLayers, GraphLayersBuilder, GraphLayersHealer,
+    HnswBuildContract, HnswIndex, IndexedVectorStorage, PointOffset, VectorStorage,
+    HNSW_ARTIFACT_ALIGNMENT,
 };
-use crate::rowset::encoding::PLAIN_PAGE_HEADER_SIZE;
-use crate::rowset::page::{
-    BlockCompressionCodec, CompressionType, IndexPageFooter, IndexPageType, Lz4Codec, PageFooter,
-    PageIO, PagePointer, ZstdCodec, DEFAULT_MIN_SPACE_SAVING,
-};
+#[cfg(test)]
+use crate::index::hnsw::{DistanceMetric, HnswConfig};
+use crate::rowset::page::{IndexPageFooter, IndexPageType, PageFooter, PageIO, PagePointer};
 use crate::rowset::segment::{Segment, SegmentFooter, SegmentOptions};
 use crate::rowset::RowsetSharedPtr;
+use crate::search::{SearchFreshnessPolicy, SearchIndexDefinition, SearchIndexKind};
+use crate::statistics::HnswIndexStatistics;
 use crate::tablet::Tablet;
 use paro_common::error::{self as paro_error, Result};
 use paro_common::types::LogicalType;
@@ -28,8 +30,7 @@ use std::sync::Arc;
 struct HnswIndexedColumn {
     column_id: u32,
     dim: usize,
-    config: HnswConfig,
-    distance: DistanceMetric,
+    build_contract: HnswBuildContract,
 }
 
 // Reuse the old graph only when most output points still map back to it.
@@ -47,30 +48,73 @@ impl HnswIndexRebuilder {
         Self
     }
 
-    fn collect_indexed_columns(tablet: &Tablet) -> Result<Vec<HnswIndexedColumn>> {
+    fn collect_indexed_columns(
+        generation_context: &CompactionGenerationContext,
+        tablet: &Tablet,
+    ) -> Result<Vec<HnswIndexedColumn>> {
         let schema = tablet
             .schema()
             .ok_or_else(|| paro_error::internal("Tablet schema not available for HNSW rebuild"))?;
-
-        schema
-            .columns()
+        let mut indexed_columns = Vec::new();
+        for definition in generation_context
+            .search_definitions
             .iter()
-            .filter(|c| c.index_hnsw)
-            .map(|c| match c.logical_type {
-                LogicalType::Array(ref inner, dim) if matches!(**inner, LogicalType::Float) => {
-                    Ok(HnswIndexedColumn {
-                        column_id: c.id,
-                        dim,
-                        config: HnswConfig::new(c.hnsw_m, c.hnsw_ef_construct),
-                        distance: DistanceMetric::from_u8(c.hnsw_distance),
-                    })
-                }
-                _ => Err(paro_error::not_supported(format!(
-                    "HNSW compaction rebuild only supports Array(Float, N), got {:?} for column {}",
-                    c.logical_type, c.id
-                ))),
-            })
-            .collect()
+            .filter(|definition| compaction_requires_inline_hnsw(definition))
+        {
+            let [column_id] = definition.column_ids.as_slice() else {
+                return Err(paro_error::data_corrupted(format!(
+                    "HNSW definition {} must reference exactly one column",
+                    definition.definition_id
+                )));
+            };
+            if indexed_columns
+                .iter()
+                .any(|column: &HnswIndexedColumn| column.column_id == *column_id)
+            {
+                return Err(paro_error::invalid_input(format!(
+                    "compaction cannot materialize multiple active HNSW definitions for column {}",
+                    column_id
+                )));
+            }
+            let column = schema
+                .columns()
+                .iter()
+                .find(|column| column.id == *column_id)
+                .ok_or_else(|| {
+                    paro_error::data_corrupted(format!(
+                        "HNSW definition {} references missing column {}",
+                        definition.definition_id, column_id
+                    ))
+                })?;
+            let LogicalType::Array(inner, dim) = &column.logical_type else {
+                return Err(paro_error::data_corrupted(format!(
+                    "HNSW definition {} column {} must be VECTOR(Float, N), got {:?}",
+                    definition.definition_id, column_id, column.logical_type
+                )));
+            };
+            if !matches!(inner.as_ref(), LogicalType::Float) {
+                return Err(paro_error::data_corrupted(format!(
+                    "HNSW definition {} column {} must be VECTOR(Float, N), got {:?}",
+                    definition.definition_id, column_id, column.logical_type
+                )));
+            }
+            let provider = definition.hnsw_provider_config()?;
+            if provider.dimension as usize != *dim {
+                return Err(paro_error::data_corrupted(format!(
+                    "HNSW definition {} dimension {} does not match column {} dimension {}",
+                    definition.definition_id, provider.dimension, column_id, dim
+                )));
+            }
+            let build_contract = provider.build_contract();
+            build_contract.validate()?;
+            indexed_columns.push(HnswIndexedColumn {
+                column_id: *column_id,
+                dim: *dim,
+                build_contract,
+            });
+        }
+        indexed_columns.sort_by_key(|column| column.column_id);
+        Ok(indexed_columns)
     }
 
     fn collect_old_indexes(
@@ -81,16 +125,16 @@ impl HnswIndexRebuilder {
         for rowset in input_rowsets {
             rowset.load()?;
             for segment in rowset.segments() {
-                let Some(index) = segment.hnsw_index(indexed_col.column_id) else {
+                let Some(index) = segment.open_hnsw_index(indexed_col.column_id)? else {
                     continue;
                 };
-                if index.distance != indexed_col.distance {
-                    continue;
-                }
                 if index.vector_storage.vector_dim() != indexed_col.dim {
                     continue;
                 }
                 if index.graph.links.num_points() == 0 {
+                    continue;
+                }
+                if index.build_contract != indexed_col.build_contract {
                     continue;
                 }
                 candidates.push(index);
@@ -132,32 +176,22 @@ impl HnswIndexRebuilder {
                 continue;
             }
 
-            let byte_len = col_meta
-                .num_rows
-                .checked_mul(indexed_col.dim as u64)
-                .and_then(|v| v.checked_mul(std::mem::size_of::<f32>() as u64))
-                .ok_or_else(|| {
-                    paro_error::invalid_input(format!(
-                        "HNSW compaction rebuild vector byte length overflow: segment={} column={}",
-                        segment.segment_id(),
-                        indexed_col.column_id
-                    ))
-                })?;
-
-            let output_storage: Arc<dyn VectorStorage> = Arc::new(MmapVectorStorage::open_range(
-                segment.file_path(),
-                col_meta.data_page_pointer.offset + PLAIN_PAGE_HEADER_SIZE as u64,
-                byte_len,
-                indexed_col.dim,
-            )?);
+            let output_storage: Arc<dyn VectorStorage> =
+                open_plain_vector_column(segment.file_path(), &col_meta, indexed_col.dim)?;
 
             let old_candidates = old_indexes_by_col
                 .get(&indexed_col.column_id)
                 .map(Vec::as_slice)
                 .unwrap_or(&[]);
-            let rebuilt_index =
-                Self::build_segment_index(output_storage, *indexed_col, old_candidates)?;
-            let ptr = Self::write_hnsw_page(&mut file, &rebuilt_index, col_meta.compression)?;
+            let rebuilt_index = Self::build_segment_index(
+                output_storage,
+                *indexed_col,
+                old_candidates,
+                segment.file_path().parent().ok_or_else(|| {
+                    paro_error::internal("compaction segment path has no parent directory")
+                })?,
+            )?;
+            let ptr = Self::write_hnsw_page(&mut file, &rebuilt_index)?;
 
             let target = &mut footer.column_metas[meta_idx];
             let previous_size = target
@@ -165,6 +199,7 @@ impl HnswIndexRebuilder {
                 .map(|p| p.size as u64)
                 .unwrap_or_default();
             target.hnsw_index_pointer = Some(ptr);
+            target.hnsw_index_statistics = Some(HnswIndexStatistics::collect(&rebuilt_index)?);
             target.total_mem_footprint = target
                 .total_mem_footprint
                 .saturating_sub(previous_size)
@@ -186,28 +221,40 @@ impl HnswIndexRebuilder {
         output_storage: Arc<dyn VectorStorage>,
         indexed_col: HnswIndexedColumn,
         old_candidates: &[Arc<HnswIndex>],
+        workspace_dir: &std::path::Path,
     ) -> Result<HnswIndex> {
-        if let Some(index) =
-            Self::build_index_with_healer(output_storage.clone(), indexed_col, old_candidates)?
-        {
+        if let Some(index) = Self::build_index_with_healer(
+            output_storage.clone(),
+            indexed_col,
+            old_candidates,
+            workspace_dir,
+        )? {
             return Ok(index);
         }
 
-        Ok(HnswIndex::build(
-            output_storage,
-            indexed_col.config,
-            indexed_col.distance,
-        ))
+        HnswIndex::try_build_in_workspace(output_storage, indexed_col.build_contract, workspace_dir)
     }
 
     fn build_index_with_healer(
         output_storage: Arc<dyn VectorStorage>,
         indexed_col: HnswIndexedColumn,
         old_candidates: &[Arc<HnswIndex>],
+        workspace_dir: &std::path::Path,
     ) -> Result<Option<HnswIndex>> {
-        let Some((best_old_index, signature_overlap)) =
-            Self::select_best_old_index(output_storage.as_ref(), old_candidates)
-        else {
+        let output_storage =
+            IndexedVectorStorage::prepare(output_storage, indexed_col.build_contract.distance);
+        let output_storage = prepare_build_vector_storage(
+            output_storage,
+            indexed_col.build_contract.vector_encoding,
+            indexed_col.build_contract.build_seed,
+            Some(workspace_dir),
+            None,
+        )?;
+        let Some((best_old_index, signature_overlap)) = Self::select_best_old_index(
+            output_storage.as_ref(),
+            old_candidates,
+            indexed_col.build_contract,
+        ) else {
             return Ok(None);
         };
         let overlap_ratio = signature_overlap as f64 / output_storage.num_vectors().max(1) as f64;
@@ -223,26 +270,31 @@ impl HnswIndexRebuilder {
             return Ok(None);
         }
 
-        let mut builder = GraphLayersBuilder::new_parallel(
+        let build_contract = indexed_col.build_contract;
+        let mut builder = GraphLayersBuilder::new_from_contract(
             output_storage.num_vectors(),
-            &indexed_col.config,
+            &build_contract,
             true,
         );
 
         for (new_id, old_id_opt) in new_to_old.iter().enumerate() {
             let point_id = new_id as PointOffset;
-            let level = old_id_opt
-                .map(|old_id| best_old_index.graph.links.point_level(old_id))
-                .unwrap_or_else(|| builder.get_random_layer());
+            let level = match old_id_opt {
+                Some(old_id) => best_old_index.graph.links.point_level(*old_id)?,
+                None => builder.random_layer_for_point(point_id),
+            };
             builder.set_levels(point_id, level);
         }
 
         let mut healer = GraphLayersHealer::new(
             &best_old_index.graph,
             &old_to_new,
-            indexed_col.config.ef_construct,
-        );
-        healer.heal(best_old_index.vector_storage.as_ref(), indexed_col.distance);
+            indexed_col.build_contract.ef_construct as usize,
+        )?;
+        healer.heal(
+            best_old_index.vector_storage.as_ref(),
+            indexed_col.build_contract.distance,
+        )?;
         healer.save_into_builder(&builder);
 
         for (new_id, old_id_opt) in new_to_old.iter().enumerate() {
@@ -250,32 +302,26 @@ impl HnswIndexRebuilder {
                 continue;
             }
             let point_id = new_id as PointOffset;
-            builder.link_new_point(
+            builder.insert_single_point(
                 point_id,
-                output_storage.get_vector(point_id),
                 output_storage.as_ref(),
-                indexed_col.distance,
-            );
+                indexed_col.build_contract.distance,
+            )?;
         }
 
-        let (links, entry_points) = builder.into_graph_data();
-        let graph = GraphLayers::new(
-            links,
-            entry_points,
-            VisitedPool::new(),
-            (&indexed_col.config).into(),
-        );
-        Ok(Some(HnswIndex::new(
-            indexed_col.config,
+        let (links, entry_points) = builder.into_graph_data()?;
+        let graph = GraphLayers::new(links, entry_points, (&build_contract).into());
+        Ok(Some(HnswIndex::try_new(
+            build_contract,
             graph,
             output_storage,
-            indexed_col.distance,
-        )))
+        )?))
     }
 
     fn select_best_old_index(
         output_storage: &dyn VectorStorage,
         old_candidates: &[Arc<HnswIndex>],
+        expected_contract: HnswBuildContract,
     ) -> Option<(Arc<HnswIndex>, usize)> {
         if old_candidates.is_empty() || output_storage.num_vectors() == 0 {
             return None;
@@ -283,7 +329,10 @@ impl HnswIndexRebuilder {
 
         let output_counts = Self::build_signature_count_map(output_storage);
         let mut best: Option<(Arc<HnswIndex>, usize)> = None;
-        for candidate in old_candidates {
+        for candidate in old_candidates
+            .iter()
+            .filter(|candidate| candidate.build_contract == expected_contract)
+        {
             let overlap =
                 Self::count_signature_overlap(candidate.vector_storage.as_ref(), &output_counts);
             match best {
@@ -398,11 +447,7 @@ impl HnswIndexRebuilder {
         SegmentFooter::deserialize(&footer_bytes)
     }
 
-    fn write_hnsw_page(
-        file: &mut File,
-        index: &HnswIndex,
-        compression: CompressionType,
-    ) -> Result<PagePointer> {
+    fn write_hnsw_page(file: &mut File, index: &HnswIndex) -> Result<PagePointer> {
         let index_data = index.serialize()?;
         let footer = PageFooter::Index(IndexPageFooter {
             num_entries: index.graph.links.num_points() as u32,
@@ -410,22 +455,7 @@ impl HnswIndexRebuilder {
         });
 
         file.seek(SeekFrom::End(0)).map_err(paro_error::io)?;
-        let codec = Self::compression_codec(compression);
-        PageIO::compress_and_write_page(
-            codec.as_deref(),
-            DEFAULT_MIN_SPACE_SAVING,
-            file,
-            &index_data,
-            &footer,
-        )
-    }
-
-    fn compression_codec(compression: CompressionType) -> Option<Box<dyn BlockCompressionCodec>> {
-        match compression {
-            CompressionType::None => None,
-            CompressionType::Lz4 => Some(Box::new(Lz4Codec)),
-            CompressionType::Zstd => Some(Box::new(ZstdCodec::default())),
-        }
+        PageIO::write_mmap_page(file, &index_data, &footer, HNSW_ARTIFACT_ALIGNMENT)
     }
 
     fn validate_compaction_indexes(
@@ -459,13 +489,15 @@ impl HnswIndexRebuilder {
                     continue;
                 }
 
-                let index = persisted.hnsw_index(indexed_col.column_id).ok_or_else(|| {
-                    paro_error::data_corrupted(format!(
-                        "Missing HNSW index after compaction: segment={} column={}",
-                        persisted.segment_id(),
-                        indexed_col.column_id
-                    ))
-                })?;
+                let index = persisted
+                    .open_hnsw_index(indexed_col.column_id)?
+                    .ok_or_else(|| {
+                        paro_error::data_corrupted(format!(
+                            "Missing HNSW index after compaction: segment={} column={}",
+                            persisted.segment_id(),
+                            indexed_col.column_id
+                        ))
+                    })?;
 
                 let points = index.graph.links.num_points();
                 if points != segment_rows {
@@ -483,6 +515,18 @@ impl HnswIndexRebuilder {
     }
 }
 
+/// Rowset compaction may only rebuild HNSW inside the rowset when the
+/// definition promises synchronous physical freshness. Opportunistic and
+/// bounded-lag definitions are owned by the search generation: rebuilding an
+/// inline graph here creates a second artifact lifecycle, duplicates graph
+/// construction, and multiplies query-time beam work after every table
+/// compaction. Those definitions deliberately expose the compacted rowset as
+/// an exact tail until generation maintenance publishes its replacement.
+fn compaction_requires_inline_hnsw(definition: &SearchIndexDefinition) -> bool {
+    definition.kind == SearchIndexKind::Hnsw
+        && definition.freshness_policy == SearchFreshnessPolicy::Required
+}
+
 impl CompactionIndexRebuilder for HnswIndexRebuilder {
     fn name(&self) -> &'static str {
         "HNSW"
@@ -490,24 +534,26 @@ impl CompactionIndexRebuilder for HnswIndexRebuilder {
 
     fn is_applicable(
         &self,
-        tablet: &Tablet,
+        generation_context: &CompactionGenerationContext,
+        _tablet: &Tablet,
         _rowset: &RowsetSharedPtr,
         _plan: &CompactionPlan,
     ) -> bool {
-        tablet
-            .schema()
-            .is_some_and(|schema| schema.columns().iter().any(|c| c.index_hnsw))
+        generation_context
+            .search_definitions
+            .iter()
+            .any(compaction_requires_inline_hnsw)
     }
 
     fn rebuild(
         &self,
-        _generation_context: &CompactionGenerationContext,
+        generation_context: &CompactionGenerationContext,
         tablet: &Tablet,
         rowset: &RowsetSharedPtr,
         plan: &CompactionPlan,
     ) -> Result<()> {
         rowset.load()?;
-        let indexed_columns = Self::collect_indexed_columns(tablet)?;
+        let indexed_columns = Self::collect_indexed_columns(generation_context, tablet)?;
         if indexed_columns.is_empty() {
             return Ok(());
         }
@@ -546,6 +592,46 @@ mod tests {
     use std::path::Path;
     use tempfile::TempDir;
 
+    fn definition(
+        kind: SearchIndexKind,
+        freshness_policy: SearchFreshnessPolicy,
+    ) -> SearchIndexDefinition {
+        SearchIndexDefinition {
+            definition_id: 7,
+            table_id: 11,
+            name: "test_index".to_string(),
+            kind,
+            column_ids: vec![1],
+            expression: None,
+            provider_config: serde_json::Value::Null,
+            freshness_policy,
+            config_fingerprint: 13,
+        }
+    }
+
+    #[test]
+    fn rowset_compaction_rebuilds_only_required_hnsw_inline_artifacts() {
+        assert!(compaction_requires_inline_hnsw(&definition(
+            SearchIndexKind::Hnsw,
+            SearchFreshnessPolicy::Required,
+        )));
+        assert!(!compaction_requires_inline_hnsw(&definition(
+            SearchIndexKind::Hnsw,
+            SearchFreshnessPolicy::Opportunistic,
+        )));
+        assert!(!compaction_requires_inline_hnsw(&definition(
+            SearchIndexKind::Hnsw,
+            SearchFreshnessPolicy::BoundedLag {
+                max_tail_rows: 4_096,
+                max_lag_millis: 1_000,
+            },
+        )));
+        assert!(!compaction_requires_inline_hnsw(&definition(
+            SearchIndexKind::FullText,
+            SearchFreshnessPolicy::Required,
+        )));
+    }
+
     fn storage(vectors: &[Vec<f32>]) -> InMemoryVectorStorage {
         let dim = vectors[0].len();
         let mut flat = Vec::with_capacity(vectors.len() * dim);
@@ -579,8 +665,7 @@ mod tests {
         let indexed_col = HnswIndexedColumn {
             column_id: 1,
             dim: 4,
-            config,
-            distance,
+            build_contract: config.try_build_contract(distance).unwrap(),
         };
 
         let old_vectors = storage(&[
@@ -597,15 +682,56 @@ mod tests {
         ]);
 
         let old_index = Arc::new(HnswIndex::build(Arc::new(old_vectors), config, distance));
+        let workspace = TempDir::new().unwrap();
         let healed = HnswIndexRebuilder::build_index_with_healer(
             Arc::new(output_vectors),
             indexed_col,
             &[old_index],
+            workspace.path(),
         )
         .unwrap();
         assert!(
             healed.is_none(),
             "low-overlap compaction should fallback to full rebuild"
+        );
+    }
+
+    #[test]
+    fn healer_ignores_source_artifacts_from_a_different_definition_contract() {
+        let config = HnswConfig::new(8, 32);
+        let distance = DistanceMetric::Euclidean;
+        let mut compact_contract = config.try_build_contract(distance).unwrap();
+        compact_contract.vector_encoding =
+            crate::index::hnsw::HnswBuildVectorEncoding::symmetric_i16(4).unwrap();
+        let indexed_col = HnswIndexedColumn {
+            column_id: 1,
+            dim: 4,
+            build_contract: compact_contract,
+        };
+        let vectors = vec![
+            vec![1.0, 1.0, 1.0, 1.0],
+            vec![2.0, 2.0, 2.0, 2.0],
+            vec![3.0, 3.0, 3.0, 3.0],
+            vec![4.0, 4.0, 4.0, 4.0],
+        ];
+        let old_index = Arc::new(HnswIndex::build(
+            Arc::new(storage(&vectors)),
+            config,
+            distance,
+        ));
+        let workspace = TempDir::new().unwrap();
+
+        let healed = HnswIndexRebuilder::build_index_with_healer(
+            Arc::new(storage(&vectors)),
+            indexed_col,
+            &[old_index],
+            workspace.path(),
+        )
+        .unwrap();
+
+        assert!(
+            healed.is_none(),
+            "definition-owned build contracts must not be inferred from heterogeneous inputs"
         );
     }
 
@@ -618,10 +744,8 @@ mod tests {
         distance: DistanceMetric,
     ) {
         let opts = SegmentWriterOptions::new(0)
-            .with_hnsw_index_columns(vec![1])
             .with_build_hnsw_indexes(build_hnsw)
-            .with_hnsw_config(config)
-            .with_hnsw_distance(distance);
+            .with_hnsw_index(1, config, distance);
         let mut writer = SegmentWriter::create(schema, path, opts).unwrap();
 
         let mut ids = Vec::with_capacity(vectors.len() * std::mem::size_of::<i64>());
@@ -639,7 +763,18 @@ mod tests {
                 ColumnData::new(vec_bytes, vectors.len() as u32),
             ])
             .unwrap();
-        writer.finalize().unwrap();
+        let segment = writer.finalize().unwrap();
+        if build_hnsw {
+            let pointer = segment
+                .get_column_meta(1)
+                .and_then(|meta| meta.hnsw_index_pointer)
+                .expect("test fixture HNSW page");
+            assert_eq!(
+                pointer.offset % HNSW_ARTIFACT_ALIGNMENT as u64,
+                0,
+                "test fixture must publish an aligned HNSW envelope"
+            );
+        }
     }
 
     #[test]
@@ -702,7 +837,10 @@ mod tests {
             0,
         )
         .unwrap();
-        let old_index = old_segment.hnsw_index(1).expect("old hnsw index");
+        let old_index = old_segment
+            .open_hnsw_index(1)
+            .unwrap()
+            .expect("old hnsw index");
 
         let new_segment = Segment::open(
             0,
@@ -715,15 +853,14 @@ mod tests {
         )
         .unwrap();
         assert!(
-            new_segment.hnsw_index(1).is_none(),
+            new_segment.open_hnsw_index(1).unwrap().is_none(),
             "new segment should not have HNSW index before compaction rebuild"
         );
 
         let indexed_col = HnswIndexedColumn {
             column_id: 1,
             dim,
-            config,
-            distance,
+            build_contract: config.try_build_contract(distance).unwrap(),
         };
         let mut old_indexes_by_col = HashMap::new();
         old_indexes_by_col.insert(1, vec![old_index]);
@@ -737,7 +874,8 @@ mod tests {
         let rebuilt =
             Segment::open(0, &new_path, schema, SegmentOptions::default(), 0, 1, 0).unwrap();
         let rebuilt_index = rebuilt
-            .hnsw_index(1)
+            .open_hnsw_index(1)
+            .unwrap()
             .expect("rebuilt segment should contain HNSW index");
         assert_eq!(rebuilt_index.graph.links.num_points(), new_vectors.len());
     }

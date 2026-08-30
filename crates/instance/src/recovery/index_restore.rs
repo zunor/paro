@@ -8,6 +8,7 @@ use paro_catalog::entry::{
 };
 use paro_catalog::mvcc::CatalogSnapshot;
 use paro_common::error;
+use paro_common::logging::targets;
 use paro_storage::table::table_handle::TableHandle;
 use std::sync::Arc;
 
@@ -90,7 +91,52 @@ pub(crate) fn restore_search_registry_definitions(catalog: &Arc<ParoCatalog>) {
     }
 }
 
-fn runtime_art_index_coverage(
+/// Remove generation workspaces only after the entire durable WAL prefix has
+/// been replayed (or startup proved that no WAL needs replay).
+///
+/// Keeping this separate from runtime restoration prevents a partial recovery
+/// from deleting the source named by a later, not-yet-applied mutation.
+pub(crate) fn sweep_orphan_search_generation_workspaces(catalog: &Arc<ParoCatalog>) {
+    let txn = CatalogSnapshot::read_only(u64::MAX);
+    let schemas = catalog
+        .get_schema_collection()
+        .scan(txn.transaction_id, txn.start_time);
+    for schema_entry in schemas {
+        let CatalogEntryEnum::Schema(schema) = schema_entry.as_ref() else {
+            continue;
+        };
+        for table_entry in schema
+            .collection(CatalogType::Table)
+            .expect("table collection")
+            .scan(txn.transaction_id, txn.start_time)
+        {
+            let CatalogEntryEnum::Table(table) = table_entry.as_ref() else {
+                continue;
+            };
+            let Some(storage) = table.get_storage() else {
+                continue;
+            };
+            match storage.sweep_orphan_search_generation_state() {
+                Ok(report) if report.total_removed() > 0 => tracing::info!(
+                    target: targets::INSTANCE,
+                    tablet_id = storage.tablet_id(),
+                    staging_workspaces = report.staging_workspaces,
+                    manifest_fragments = report.manifest_fragments,
+                    "reclaimed unreachable search-generation state after replay"
+                ),
+                Ok(_) => {}
+                Err(error) => tracing::warn!(
+                    target: targets::INSTANCE,
+                    tablet_id = storage.tablet_id(),
+                    error = %error,
+                    "failed to reclaim unreachable search-generation state"
+                ),
+            }
+        }
+    }
+}
+
+fn runtime_scalar_index_coverage(
     storage: &TableHandle,
     column_id: u32,
 ) -> error::Result<IndexCoverage> {
@@ -99,7 +145,7 @@ fn runtime_art_index_coverage(
     let visible_segment_count = segments.len();
     let indexed_segment_count = segments
         .iter()
-        .filter(|(_, segment)| segment.art_index(column_id).is_some())
+        .filter(|(_, segment)| segment.has_complete_scalar_index(column_id))
         .count();
 
     Ok(IndexCoverage::from_counts(
@@ -166,26 +212,21 @@ pub(crate) fn restore_runtime_art_indexes(catalog: &Arc<ParoCatalog>) {
             let column_id = column_id.index;
 
             if index.build_state() == IndexBuildState::Failed {
-                storage.forget_art_index(column_id);
-                let _ = storage.drop_art_index(column_id);
+                let _ = storage.release_art_index(&index.base.base.name, column_id);
                 continue;
             }
 
-            storage.declare_art_index(column_id);
-            if let Err(err) = storage.rebuild_art_index(column_id) {
-                storage.forget_art_index(column_id);
-                let _ = storage.drop_art_index(column_id);
+            if let Err(err) = storage.install_art_index(&index.base.base.name, column_id) {
                 index.mark_failed(Some(format!("ART runtime restore failed: {}", err)));
                 continue;
             }
 
-            match runtime_art_index_coverage(storage.as_ref(), column_id) {
+            match runtime_scalar_index_coverage(storage.as_ref(), column_id) {
                 Ok(coverage) if coverage.is_complete() => {
                     index.mark_ready_with_coverage(Some(coverage));
                 }
                 Ok(coverage) => {
-                    storage.forget_art_index(column_id);
-                    let _ = storage.drop_art_index(column_id);
+                    let _ = storage.release_art_index(&index.base.base.name, column_id);
                     index.mark_failed(Some(format!(
                         "ART coverage incomplete after recovery: indexed={}/visible={} (version={})",
                         coverage.indexed_segment_count,
@@ -194,8 +235,7 @@ pub(crate) fn restore_runtime_art_indexes(catalog: &Arc<ParoCatalog>) {
                     )));
                 }
                 Err(err) => {
-                    storage.forget_art_index(column_id);
-                    let _ = storage.drop_art_index(column_id);
+                    let _ = storage.release_art_index(&index.base.base.name, column_id);
                     index.mark_failed(Some(format!("ART coverage validation failed: {}", err)));
                 }
             }

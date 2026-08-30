@@ -68,6 +68,16 @@ pub struct WriteConflictIndex {
     shards: Box<[Mutex<ConflictShard>]>,
     durable_ts: AtomicU64,
     conflict_horizon: AtomicU64,
+    // Operational metrics must never inspect shard contents on a statement
+    // path.  Statement contexts snapshot these counters for system-table
+    // observability, while the conflict index shards are part of commit-time
+    // synchronization.  Maintaining exact counts at the mutation boundary
+    // keeps telemetry O(1) and prevents read-only queries from contending on
+    // every conflict shard.
+    entry_count: AtomicU64,
+    fine_entry_count: AtomicU64,
+    fine_summary_entry_count: AtomicU64,
+    coarse_entry_count: AtomicU64,
 }
 
 #[derive(Debug)]
@@ -118,6 +128,10 @@ impl WriteConflictIndex {
             shards,
             durable_ts: AtomicU64::new(0),
             conflict_horizon: AtomicU64::new(0),
+            entry_count: AtomicU64::new(0),
+            fine_entry_count: AtomicU64::new(0),
+            fine_summary_entry_count: AtomicU64::new(0),
+            coarse_entry_count: AtomicU64::new(0),
         }
     }
 
@@ -157,6 +171,7 @@ impl WriteConflictIndex {
         for placement in placements {
             let mut shard = self.shards[placement.shard_index].lock();
             shard.push(commit_ts, placement.resource, placement.kind)?;
+            self.record_entry_added(placement.kind);
         }
         bump_atomic_max(&self.durable_ts, commit_ts.into_raw());
         Ok(writes.len())
@@ -220,32 +235,49 @@ impl WriteConflictIndex {
         let advanced = bump_atomic_max(&self.conflict_horizon, target.into_raw());
         let horizon = CommitTs::new(advanced);
         for shard in self.shards.iter() {
-            shard.lock().gc(horizon);
+            let mut shard = shard.lock();
+            let removed = shard.gc(horizon);
+            self.record_entries_removed(removed);
         }
         horizon
     }
 
     pub fn stats(&self) -> ConflictIndexStats {
-        let mut entry_count = 0;
-        let mut fine_entry_count = 0;
-        let mut fine_summary_entry_count = 0;
-        let mut coarse_entry_count = 0;
-        for shard in self.shards.iter() {
-            let shard = shard.lock();
-            entry_count += shard.entries.len();
-            let (fine, summary, coarse) = shard.kind_counts();
-            fine_entry_count += fine;
-            fine_summary_entry_count += summary;
-            coarse_entry_count += coarse;
-        }
         ConflictIndexStats {
             shard_count: self.shards.len(),
-            entry_count,
-            fine_entry_count,
-            fine_summary_entry_count,
-            coarse_entry_count,
+            entry_count: self.entry_count.load(Ordering::Acquire) as usize,
+            fine_entry_count: self.fine_entry_count.load(Ordering::Acquire) as usize,
+            fine_summary_entry_count: self.fine_summary_entry_count.load(Ordering::Acquire)
+                as usize,
+            coarse_entry_count: self.coarse_entry_count.load(Ordering::Acquire) as usize,
             durable_ts: CommitTs::new(self.durable_ts.load(Ordering::Acquire)),
             conflict_horizon: CommitTs::new(self.conflict_horizon.load(Ordering::Acquire)),
+        }
+    }
+
+    fn record_entry_added(&self, kind: ConflictEntryKind) {
+        self.entry_count.fetch_add(1, Ordering::Release);
+        self.kind_counter(kind).fetch_add(1, Ordering::Release);
+    }
+
+    fn record_entries_removed(&self, removed: ConflictEntryCounts) {
+        if removed.total == 0 {
+            return;
+        }
+        self.entry_count.fetch_sub(removed.total, Ordering::Release);
+        self.fine_entry_count
+            .fetch_sub(removed.fine, Ordering::Release);
+        self.fine_summary_entry_count
+            .fetch_sub(removed.fine_summary, Ordering::Release);
+        self.coarse_entry_count
+            .fetch_sub(removed.coarse, Ordering::Release);
+    }
+
+    fn kind_counter(&self, kind: ConflictEntryKind) -> &AtomicU64 {
+        match kind {
+            ConflictEntryKind::Fine => &self.fine_entry_count,
+            ConflictEntryKind::FineSummary => &self.fine_summary_entry_count,
+            ConflictEntryKind::Coarse => &self.coarse_entry_count,
         }
     }
 
@@ -515,28 +547,36 @@ impl ConflictShard {
         })
     }
 
-    fn gc(&mut self, horizon: CommitTs) {
+    fn gc(&mut self, horizon: CommitTs) -> ConflictEntryCounts {
+        let mut removed = ConflictEntryCounts::default();
         while self
             .entries
             .front()
             .is_some_and(|entry| entry.commit_ts <= horizon)
         {
-            self.entries.pop_front();
+            let entry = self.entries.pop_front().expect("front entry exists");
+            removed.record(entry.kind);
         }
+        removed
     }
+}
 
-    fn kind_counts(&self) -> (usize, usize, usize) {
-        let mut fine = 0;
-        let mut summary = 0;
-        let mut coarse = 0;
-        for entry in &self.entries {
-            match entry.kind {
-                ConflictEntryKind::Fine => fine += 1,
-                ConflictEntryKind::FineSummary => summary += 1,
-                ConflictEntryKind::Coarse => coarse += 1,
-            }
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+struct ConflictEntryCounts {
+    total: u64,
+    fine: u64,
+    fine_summary: u64,
+    coarse: u64,
+}
+
+impl ConflictEntryCounts {
+    fn record(&mut self, kind: ConflictEntryKind) {
+        self.total += 1;
+        match kind {
+            ConflictEntryKind::Fine => self.fine += 1,
+            ConflictEntryKind::FineSummary => self.fine_summary += 1,
+            ConflictEntryKind::Coarse => self.coarse += 1,
         }
-        (fine, summary, coarse)
     }
 }
 

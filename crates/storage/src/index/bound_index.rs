@@ -20,11 +20,11 @@
 use std::sync::Arc;
 
 use paro_common::chunk::Chunk;
-use paro_common::error::Result;
+use paro_common::error::{self as paro_error, Result};
 use paro_common::types::LogicalType;
 use paro_common::vector::Vector;
 
-use super::{Index, IndexStorageInfo};
+use super::{ExactRowSet, Index, IndexStorageInfo};
 use crate::index::predicate::Predicate;
 use crate::index::predicate_result::{intersect, PredicateResult};
 
@@ -66,7 +66,78 @@ pub struct IndexAppendInfo {
 #[derive(Debug, Clone)]
 pub struct IndexPredicateEvaluation {
     pub candidates: PredicateResult,
-    pub guaranteed: PredicateResult,
+    /// `None` encodes the strongest proof: the candidate set itself is exact.
+    /// Keeping that state structural avoids cloning a large bitmap merely to
+    /// store the same set twice.
+    guaranteed: Option<PredicateResult>,
+}
+
+/// Proof that one immutable scalar access path was built from every row in a
+/// segment-local row-id domain. Construction is fallible so callers cannot
+/// turn an observed prefix into a completeness claim with a boolean flag.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct SegmentLocalComplete {
+    row_count: u64,
+}
+
+impl SegmentLocalComplete {
+    pub(crate) fn prove(indexed_rows: u64, segment_rows: u64) -> Result<Self> {
+        if indexed_rows != segment_rows {
+            return Err(paro_error::data_corrupted(format!(
+                "scalar index row coverage mismatch: indexed={indexed_rows}, segment={segment_rows}"
+            )));
+        }
+        Ok(Self {
+            row_count: indexed_rows,
+        })
+    }
+
+    pub(crate) const fn covers(self, segment_rows: u64) -> bool {
+        self.row_count == segment_rows
+    }
+
+    pub(crate) const fn row_count(self) -> u64 {
+        self.row_count
+    }
+}
+
+/// One predicate access path together with the scope in which its row IDs are
+/// valid. Exactness is granted by the segment build/loader boundary, never by
+/// an index implementation reporting a global boolean capability.
+#[derive(Clone)]
+pub(crate) struct PredicateIndexBinding {
+    index: Arc<dyn BoundIndex>,
+    complete_scalar: Option<SegmentLocalComplete>,
+}
+
+impl PredicateIndexBinding {
+    pub(crate) fn candidate(index: Arc<dyn BoundIndex>) -> Self {
+        Self {
+            index,
+            complete_scalar: None,
+        }
+    }
+
+    pub(crate) fn complete_scalar(
+        index: Arc<dyn BoundIndex>,
+        completeness: SegmentLocalComplete,
+    ) -> Self {
+        Self {
+            index,
+            complete_scalar: Some(completeness),
+        }
+    }
+
+    pub(crate) fn index(&self) -> &Arc<dyn BoundIndex> {
+        &self.index
+    }
+
+    pub(crate) const fn is_complete_for(&self, segment_rows: u64) -> bool {
+        match self.complete_scalar {
+            Some(completeness) => completeness.covers(segment_rows),
+            None => false,
+        }
+    }
 }
 
 impl IndexPredicateEvaluation {
@@ -81,7 +152,38 @@ impl IndexPredicateEvaluation {
         };
         Self {
             candidates,
-            guaranteed,
+            guaranteed: Some(guaranteed),
+        }
+    }
+
+    /// Construct an exact predicate answer. Exactness is proof metadata, not
+    /// something consumers should rediscover by comparing two potentially
+    /// large bitmaps.
+    pub fn exact(candidates: PredicateResult) -> Self {
+        if matches!(candidates, PredicateResult::Unknown) {
+            return Self::candidates_only(candidates);
+        }
+        Self {
+            candidates,
+            guaranteed: None,
+        }
+    }
+
+    pub const fn is_exact(&self) -> bool {
+        self.guaranteed.is_none()
+    }
+
+    pub fn guaranteed(&self) -> &PredicateResult {
+        self.guaranteed.as_ref().unwrap_or(&self.candidates)
+    }
+
+    pub fn into_parts(self) -> (PredicateResult, PredicateResult) {
+        match self.guaranteed {
+            Some(guaranteed) => (self.candidates, guaranteed),
+            None => {
+                let guaranteed = self.candidates.clone();
+                (self.candidates, guaranteed)
+            }
         }
     }
 
@@ -165,6 +267,12 @@ pub trait BoundIndex: Index {
     /// proof semantics inherit a candidate-only result.
     fn evaluate_predicate_with_proof(&self, predicate: &Predicate) -> IndexPredicateEvaluation {
         IndexPredicateEvaluation::candidates_only(self.evaluate_predicate(predicate))
+    }
+
+    /// Compile an exact index-native membership representation. The evaluator
+    /// only accepts this result from a complete segment-local binding.
+    fn compile_exact_row_set(&self, _predicate: &Predicate) -> Option<Arc<dyn ExactRowSet>> {
+        None
     }
 
     /// Whether this index can establish guaranteed-true rows in addition to
@@ -394,6 +502,13 @@ mod tests {
     fn unknown_proof_is_normalized_to_no_proof() {
         let evaluation =
             IndexPredicateEvaluation::new(PredicateResult::AllMatch, PredicateResult::Unknown);
-        assert!(matches!(evaluation.guaranteed, PredicateResult::NoneMatch));
+        assert!(matches!(
+            evaluation.guaranteed(),
+            PredicateResult::NoneMatch
+        ));
+
+        let unknown = IndexPredicateEvaluation::exact(PredicateResult::Unknown);
+        assert!(!unknown.is_exact());
+        assert!(matches!(unknown.guaranteed(), PredicateResult::NoneMatch));
     }
 }

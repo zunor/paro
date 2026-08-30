@@ -3,6 +3,7 @@
 
 //! Arena-backed immutable physical plan.
 
+use std::cell::Cell;
 use std::fmt::Write;
 
 use super::children::{PlanChildren, PlanChildrenArena};
@@ -10,12 +11,17 @@ use super::ids::PhysicalPlanNodeId;
 use super::node::PhysicalPlanNode;
 use super::properties::PlanPropertyMap;
 use super::specs::{AggregateSpec, NestedLoopJoinSpec, PhysicalNodeKind, SearchSourceSpec};
-use crate::explain::types::{ExplainDoc, ExplainNode, ExplainProperty, ExplainValue};
-use paro_catalog::entry::StandardEntry;
-use paro_planner::expression::{AggregateType, Expression};
+use crate::explain::types::{
+    ExplainDoc, ExplainNode, ExplainProperty, ExplainValue, EXPLAIN_FORMAT_VERSION,
+};
+use paro_catalog::entry::{StandardEntry, TableCatalogEntry};
+use paro_planner::expression::{
+    AggregateExpression, AggregateType, Expression, OperatorType, WindowFrameBound, WindowFrameType,
+};
 use paro_planner::operator::join::{JoinComparisonType, JoinCondition};
 use paro_planner::operator::ExplainSpec;
 use paro_planner::plan::CardinalityEstimate;
+use paro_storage::index::{Predicate, PredicateTree};
 use paro_storage::search::CapabilityToken;
 use paro_storage::table::segment_reorderer::{
     OrderByStatistics, SegmentOrderOptions, SegmentOrderType,
@@ -88,6 +94,56 @@ impl PhysicalPlan {
         children.as_slice(&self.children)
     }
 
+    /// Remove nodes made unreachable by physical rewrites and reassign dense
+    /// ids. A physical plan arena is part of the observable plan contract; it
+    /// must not retain folded operators that can be mistaken for consumers.
+    pub(crate) fn compact_reachable(&mut self) {
+        let mut reachable = vec![false; self.nodes.len()];
+        let mut stack = vec![self.root];
+        while let Some(id) = stack.pop() {
+            if std::mem::replace(&mut reachable[id.index()], true) {
+                continue;
+            }
+            stack.extend_from_slice(self.child_ids(&self.node(id).children));
+        }
+
+        if reachable.iter().all(|reachable| *reachable) {
+            return;
+        }
+
+        let mut remap = vec![PhysicalPlanNodeId::INVALID; reachable.len()];
+        let mut next_index = 0;
+        for (old_index, is_reachable) in reachable.iter().copied().enumerate() {
+            if is_reachable {
+                remap[old_index] = PhysicalPlanNodeId::new(next_index);
+                next_index += 1;
+            }
+        }
+
+        let old_children = std::mem::take(&mut self.children);
+        let old_nodes = std::mem::take(&mut self.nodes.nodes);
+        let mut nodes = PhysicalPlanNodeArena::default();
+        let mut children = PlanChildrenArena::default();
+        for mut node in old_nodes
+            .into_iter()
+            .filter(|node| reachable[node.id.index()])
+        {
+            let remapped_children = node
+                .children
+                .as_slice(&old_children)
+                .iter()
+                .map(|child| remap[child.index()])
+                .collect();
+            node.children = children.pack(remapped_children);
+            node.id = PhysicalPlanNodeId::INVALID;
+            nodes.push(node);
+        }
+
+        self.root = remap[self.root.index()];
+        self.nodes = nodes;
+        self.children = children;
+    }
+
     /// Return a structural one-row guarantee, independent of optimizer
     /// cardinality estimates. Consumers may use this as a semantic proof.
     pub fn guarantees_exactly_one_row(&self, id: PhysicalPlanNodeId) -> bool {
@@ -127,7 +183,7 @@ impl PhysicalPlan {
 
     fn to_explain_doc(&self, spec: ExplainSpec) -> ExplainDoc {
         ExplainDoc {
-            format_version: 1,
+            format_version: EXPLAIN_FORMAT_VERSION,
             spec,
             root: self.explain_node(self.root),
             summary: Vec::new(),
@@ -217,10 +273,18 @@ impl PhysicalPlan {
             operator_name: explain_operator_name(&node.kind).to_string(),
             relation_name: explain_relation_name(&node.kind),
             relation_alias: explain_relation_alias(&node.kind),
-            output_names: node.output.names.to_vec(),
+            output_names: node.output.explain_names(matches!(
+                &node.kind,
+                PhysicalNodeKind::HashJoin(_)
+                    | PhysicalNodeKind::NestedLoopJoin(_)
+                    | PhysicalNodeKind::SortRangeJoin(_)
+                    | PhysicalNodeKind::ClassicIeJoin(_)
+                    | PhysicalNodeKind::CrossProduct(_)
+                    | PhysicalNodeKind::DelimJoin(_)
+            )),
             estimated_cardinality: explain_cardinality(&node.kind, node.cardinality),
             actual: None,
-            properties: collect_explain_properties(node),
+            properties: collect_explain_properties(self, id, node),
             children: self
                 .child_ids(&node.children)
                 .iter()
@@ -228,21 +292,244 @@ impl PhysicalPlan {
                 .collect(),
         }
     }
+
+    fn input_names(&self, id: PhysicalPlanNodeId, child_index: usize) -> Vec<String> {
+        self.child_ids(&self.node(id).children)
+            .get(child_index)
+            .map(|child| self.expression_scope_names(*child))
+            .unwrap_or_default()
+    }
+
+    /// Names used only while rendering expressions consumed by `id`'s
+    /// parent. Internal definitions are expanded at most one producer hop;
+    /// they never become the producer's schema or feed another definition.
+    fn expression_scope_names(&self, id: PhysicalPlanNodeId) -> Vec<String> {
+        let node = self.node(id);
+        let mut names = node.output.explain_names(true);
+        match &node.kind {
+            PhysicalNodeKind::Project(spec) => {
+                let stable_input_names = self
+                    .child_ids(&node.children)
+                    .first()
+                    .map(|child| self.node(*child).output.explain_names(true))
+                    .unwrap_or_default();
+                let formatter = ExplainExpressionFormatter::new(&stable_input_names);
+                for (index, expression) in spec.expressions.iter().enumerate() {
+                    if node
+                        .output
+                        .identities
+                        .get(index)
+                        .is_some_and(super::row_type::ColumnIdentity::is_internal)
+                    {
+                        names[index] = formatter.format(expression);
+                    }
+                }
+            }
+            PhysicalNodeKind::Window(spec) => {
+                let stable_input_names = self
+                    .child_ids(&node.children)
+                    .first()
+                    .map(|child| self.node(*child).output.explain_names(true))
+                    .unwrap_or_default();
+                let formatter = ExplainExpressionFormatter::new(&stable_input_names);
+                for (offset, expression) in spec.expressions.iter().enumerate() {
+                    let index = spec.input_width + offset;
+                    if let Some(name) = names.get_mut(index) {
+                        *name = formatter.format(&Expression::Window(expression.clone()));
+                    }
+                }
+            }
+            PhysicalNodeKind::Aggregate(spec) => {
+                let stable_input_names = self
+                    .child_ids(&node.children)
+                    .first()
+                    .map(|child| self.node(*child).output.explain_names(true))
+                    .unwrap_or_default();
+                if let Some(scope_names) = aggregate_scope_names(spec, &stable_input_names) {
+                    for (index, scope_name) in scope_names.into_iter().enumerate() {
+                        if node
+                            .output
+                            .identities
+                            .get(index)
+                            .is_some_and(super::row_type::ColumnIdentity::is_internal)
+                        {
+                            names[index] = scope_name;
+                        }
+                    }
+                }
+            }
+            PhysicalNodeKind::Filter(spec) => {
+                if let Some(child) = self.child_ids(&node.children).first() {
+                    let child_names = self.expression_scope_names(*child);
+                    names = spec
+                        .projection_map
+                        .iter()
+                        .filter_map(|index| child_names.get(*index).cloned())
+                        .collect();
+                }
+            }
+            PhysicalNodeKind::Sort(spec) => {
+                if let Some(child) = self.child_ids(&node.children).first() {
+                    let child_names = self.expression_scope_names(*child);
+                    names = spec
+                        .projection_map
+                        .iter()
+                        .filter_map(|index| child_names.get(*index).cloned())
+                        .collect();
+                }
+            }
+            PhysicalNodeKind::Limit(_)
+            | PhysicalNodeKind::TopN(_)
+            | PhysicalNodeKind::EmptyResult(_) => {
+                if let Some(child) = self.child_ids(&node.children).first() {
+                    let child_names = self.expression_scope_names(*child);
+                    if child_names.len() == names.len() {
+                        names = child_names;
+                    }
+                }
+            }
+            PhysicalNodeKind::HashJoin(spec) => {
+                let children = self.child_ids(&node.children);
+                if let [left, right] = children {
+                    let left_names = self.expression_scope_names(*left);
+                    let right_names = self.expression_scope_names(*right);
+                    names = spec
+                        .left_projection
+                        .iter()
+                        .filter_map(|index| left_names.get(*index).cloned())
+                        .chain(
+                            spec.build_input_projection
+                                .iter()
+                                .take(spec.build_output_count)
+                                .filter_map(|index| right_names.get(*index).cloned()),
+                        )
+                        .collect();
+                }
+            }
+            PhysicalNodeKind::NestedLoopJoin(spec) => {
+                names = self.join_expression_scope_names(
+                    node,
+                    &spec.left_projection,
+                    &spec.right_projection,
+                );
+            }
+            PhysicalNodeKind::SortRangeJoin(spec) => {
+                names = self.join_expression_scope_names(
+                    node,
+                    &spec.left_projection,
+                    &spec.right_projection,
+                );
+            }
+            PhysicalNodeKind::ClassicIeJoin(spec) => {
+                names = self.join_expression_scope_names(
+                    node,
+                    &spec.left_projection,
+                    &spec.right_projection,
+                );
+            }
+            PhysicalNodeKind::CrossProduct(_) => {
+                let children = self.child_ids(&node.children);
+                if let [left, right] = children {
+                    names = self
+                        .expression_scope_names(*left)
+                        .into_iter()
+                        .chain(self.expression_scope_names(*right))
+                        .collect();
+                }
+            }
+            PhysicalNodeKind::DelimJoin(_) => {
+                if let Some(consumer) = self.child_ids(&node.children).get(1) {
+                    let consumer_names = self.expression_scope_names(*consumer);
+                    if consumer_names.len() == names.len() {
+                        names = consumer_names;
+                    }
+                }
+            }
+            _ => {}
+        }
+        names
+    }
+
+    fn join_expression_scope_names(
+        &self,
+        node: &PhysicalPlanNode,
+        left_projection: &[usize],
+        right_projection: &[usize],
+    ) -> Vec<String> {
+        let children = self.child_ids(&node.children);
+        let [left, right] = children else {
+            return node.output.explain_names(true);
+        };
+        let left_names = self.expression_scope_names(*left);
+        let right_names = self.expression_scope_names(*right);
+        left_projection
+            .iter()
+            .filter_map(|index| left_names.get(*index).cloned())
+            .chain(
+                right_projection
+                    .iter()
+                    .filter_map(|index| right_names.get(*index).cloned()),
+            )
+            .collect()
+    }
+
+    fn join_input_names(&self, id: PhysicalPlanNodeId, child_index: usize) -> Vec<String> {
+        let Some(child_id) = self
+            .child_ids(&self.node(id).children)
+            .get(child_index)
+            .copied()
+        else {
+            return Vec::new();
+        };
+        self.node(child_id).output.explain_names(true)
+    }
 }
 
-fn collect_explain_properties(node: &PhysicalPlanNode) -> Vec<ExplainProperty> {
+fn collect_explain_properties(
+    plan: &PhysicalPlan,
+    id: PhysicalPlanNodeId,
+    node: &PhysicalPlanNode,
+) -> Vec<ExplainProperty> {
     let mut properties = Vec::new();
+    let input_names = plan.input_names(id, 0);
+    let output_names = node.output.explain_names(false);
+    let input_formatter = ExplainExpressionFormatter::new(&input_names);
 
     match &node.kind {
         PhysicalNodeKind::Project(spec) => {
-            push_list_property(&mut properties, "Output", &spec.output_names);
+            if !spec.output_names.is_empty() {
+                let scope_names = plan.expression_scope_names(id);
+                let outputs = output_names
+                    .iter()
+                    .enumerate()
+                    .map(|(index, name)| {
+                        if node
+                            .output
+                            .identities
+                            .get(index)
+                            .is_some_and(super::row_type::ColumnIdentity::is_internal)
+                            && scope_names.get(index).is_some_and(|scope| scope != name)
+                        {
+                            scope_names[index].clone()
+                        } else {
+                            name.clone()
+                        }
+                    })
+                    .collect::<Vec<_>>();
+                push_list_property(&mut properties, "Output", &outputs);
+            }
         }
         PhysicalNodeKind::RowsetScan(spec) => {
-            if !spec.output_names.is_empty() {
-                push_list_property(&mut properties, "Columns", &spec.output_names);
+            let scan_formatter = ExplainExpressionFormatter::new(&output_names);
+            if !output_names.is_empty() {
+                push_list_property(&mut properties, "Columns", &output_names);
             }
             if let Some(predicate) = &spec.predicate {
-                push_string_property(&mut properties, "Pushed Predicate", predicate.to_string());
+                push_string_property(
+                    &mut properties,
+                    "Pushed Predicate",
+                    format_predicate_tree(predicate, spec.table.as_ref()),
+                );
             }
             if spec.planned_materialization().is_late() {
                 push_string_property(&mut properties, "Late Materialize", "auto".to_string());
@@ -253,7 +540,7 @@ fn collect_explain_properties(node: &PhysicalPlanNode) -> Vec<ExplainProperty> {
                     "Residual Predicate",
                     spec.residual_predicates
                         .iter()
-                        .map(format_expr)
+                        .map(|expression| scan_formatter.format(expression))
                         .collect::<Vec<_>>()
                         .join(" AND "),
                 );
@@ -264,23 +551,28 @@ fn collect_explain_properties(node: &PhysicalPlanNode) -> Vec<ExplainProperty> {
                     "Runtime Filter",
                     spec.runtime_filter_expressions
                         .iter()
-                        .map(format_expr)
+                        .map(|expression| scan_formatter.format(expression))
                         .collect::<Vec<_>>()
                         .join(" AND "),
                 );
             }
             if let Some(order) = &spec.scan_order {
-                push_string_property(&mut properties, "Scan Order", format_segment_order(order));
+                push_string_property(
+                    &mut properties,
+                    "Scan Order",
+                    format_segment_order(order, spec.table.as_ref()),
+                );
             }
         }
         PhysicalNodeKind::Filter(spec) => {
+            let filter_formatter = ExplainExpressionFormatter::new(&input_names);
             if !spec.expressions.is_empty() {
                 push_string_property(
                     &mut properties,
                     "Filter",
                     spec.expressions
                         .iter()
-                        .map(format_expr)
+                        .map(|expression| filter_formatter.format(expression))
                         .collect::<Vec<_>>()
                         .join(" AND "),
                 );
@@ -288,29 +580,34 @@ fn collect_explain_properties(node: &PhysicalPlanNode) -> Vec<ExplainProperty> {
         }
         PhysicalNodeKind::Sort(spec) => {
             if !spec.orders.is_empty() {
-                push_string_property(&mut properties, "Sort Key", format_order_by(&spec.orders));
+                push_string_property(
+                    &mut properties,
+                    "Sort Key",
+                    input_formatter.format_order_by(&spec.orders),
+                );
             }
         }
         PhysicalNodeKind::TopN(spec) => {
             if !spec.orders.is_empty() {
-                push_string_property(&mut properties, "Sort Key", format_order_by(&spec.orders));
+                push_string_property(
+                    &mut properties,
+                    "Sort Key",
+                    input_formatter.format_order_by(&spec.orders),
+                );
             }
             push_string_property(&mut properties, "Limit", spec.limit.to_string());
         }
         PhysicalNodeKind::VectorSearch(spec) => {
             push_search_token_properties(&mut properties, &spec.capability_token);
-            push_string_property(&mut properties, "Column", spec.column_id.to_string());
-            push_string_property(&mut properties, "Limit", spec.k.to_string());
+            push_vector_search_properties(&mut properties, spec);
         }
         PhysicalNodeKind::SparseVectorSearch(spec) => {
             push_search_token_properties(&mut properties, &spec.capability_token);
-            push_string_property(&mut properties, "Column", spec.column_id.to_string());
-            push_string_property(&mut properties, "Limit", spec.k.to_string());
+            push_sparse_search_properties(&mut properties, spec);
         }
         PhysicalNodeKind::FullTextSearch(spec) => {
             push_search_token_properties(&mut properties, &spec.capability_token);
-            push_string_property(&mut properties, "Column", spec.column_id.to_string());
-            push_string_property(&mut properties, "Mode", format!("{:?}", spec.mode));
+            push_fulltext_search_properties(&mut properties, spec);
         }
         PhysicalNodeKind::AdaptiveSearch(spec) => {
             push_string_property(&mut properties, "Strategy", "adaptive".to_string());
@@ -318,13 +615,14 @@ fn collect_explain_properties(node: &PhysicalPlanNode) -> Vec<ExplainProperty> {
                 &mut properties,
                 search_source_token(spec.selected.as_ref()),
             );
+            push_search_source_properties(&mut properties, spec.selected.as_ref());
         }
         PhysicalNodeKind::Limit(spec) => {
             if let Some(limit) = &spec.limit {
-                push_string_property(&mut properties, "Limit", format_expr(limit));
+                push_string_property(&mut properties, "Limit", input_formatter.format(limit));
             }
             if let Some(offset) = &spec.offset {
-                push_string_property(&mut properties, "Offset", format_expr(offset));
+                push_string_property(&mut properties, "Offset", input_formatter.format(offset));
             }
         }
         PhysicalNodeKind::HashJoin(spec) => {
@@ -336,28 +634,55 @@ fn collect_explain_properties(node: &PhysicalPlanNode) -> Vec<ExplainProperty> {
                     "integer_build_time".to_string(),
                 );
             }
-            push_join_conditions(&mut properties, &spec.key_conditions);
-            push_join_conditions(&mut properties, &spec.build_residual_conditions);
+            let left_names = plan.join_input_names(id, 0);
+            let right_names = plan.join_input_names(id, 1);
+            push_join_conditions(
+                &mut properties,
+                &spec.key_conditions,
+                &left_names,
+                &right_names,
+            );
+            push_join_conditions(
+                &mut properties,
+                &spec.build_residual_conditions,
+                &left_names,
+                &right_names,
+            );
         }
         PhysicalNodeKind::NestedLoopJoin(spec) => {
             push_string_property(&mut properties, "Join Type", spec.join_type.to_string());
             if let Some(strategy) = nested_loop_strategy(spec) {
                 push_string_property(&mut properties, "Strategy", strategy.to_string());
             }
-            push_join_conditions(&mut properties, &spec.conditions);
+            let left_names = plan.join_input_names(id, 0);
+            let right_names = plan.join_input_names(id, 1);
+            push_join_conditions(&mut properties, &spec.conditions, &left_names, &right_names);
             if let Some(condition) = &spec.arbitrary_condition {
-                push_string_property(&mut properties, "Join Filter", format_expr(condition));
+                let combined_names = left_names
+                    .iter()
+                    .chain(right_names.iter())
+                    .cloned()
+                    .collect::<Vec<_>>();
+                push_string_property(
+                    &mut properties,
+                    "Join Filter",
+                    ExplainExpressionFormatter::new(&combined_names).format(condition),
+                );
             }
         }
         PhysicalNodeKind::SortRangeJoin(spec) => {
             push_string_property(&mut properties, "Join Type", spec.join_type.to_string());
             push_string_property(&mut properties, "Strategy", "sort_range".to_string());
-            push_join_conditions(&mut properties, &spec.conditions);
+            let left_names = plan.join_input_names(id, 0);
+            let right_names = plan.join_input_names(id, 1);
+            push_join_conditions(&mut properties, &spec.conditions, &left_names, &right_names);
         }
         PhysicalNodeKind::ClassicIeJoin(spec) => {
             push_string_property(&mut properties, "Join Type", spec.join_type.to_string());
             push_string_property(&mut properties, "Strategy", "classic_ie_join".to_string());
-            push_join_conditions(&mut properties, &spec.conditions);
+            let left_names = plan.join_input_names(id, 0);
+            let right_names = plan.join_input_names(id, 1);
+            push_join_conditions(&mut properties, &spec.conditions, &left_names, &right_names);
         }
         PhysicalNodeKind::GraphScan(spec) => {
             push_string_property(&mut properties, "Graph", spec.graph_name.clone());
@@ -402,36 +727,31 @@ fn collect_explain_properties(node: &PhysicalPlanNode) -> Vec<ExplainProperty> {
             );
         }
         PhysicalNodeKind::GraphProject(spec) => {
-            push_list_property(&mut properties, "Output", &spec.output_names);
+            if !spec.output_names.is_empty() {
+                push_list_property(&mut properties, "Output", &output_names);
+            }
             if !spec.filters.is_empty() {
                 push_string_property(&mut properties, "Filter", "<pushed down>".to_string());
             }
         }
         PhysicalNodeKind::RowFetch(spec) => {
-            let output_names = spec
-                .projection
-                .as_ref()
-                .map_or(spec.raw_output_names.as_ref(), |projection| {
-                    projection.output_names.as_ref()
-                });
-            push_list_property(&mut properties, "Output", output_names);
+            if !output_names.is_empty() {
+                push_list_property(&mut properties, "Output", &output_names);
+            }
             push_string_property(&mut properties, "Sources", spec.mappings.len().to_string());
         }
         PhysicalNodeKind::Aggregate(spec) => {
-            push_aggregate_properties(&mut properties, spec);
-            if !spec.output_names.is_empty() {
-                push_list_property(&mut properties, "Output", &spec.output_names);
-            }
+            push_aggregate_properties(&mut properties, spec, &input_names);
         }
         PhysicalNodeKind::PartitionAggregateWindow(spec) => {
-            push_aggregate_properties(&mut properties, &spec.aggregate);
+            push_aggregate_properties(&mut properties, &spec.aggregate, &input_names);
             push_string_property(
                 &mut properties,
                 "Retained Detail Columns",
                 spec.detail_columns.len().to_string(),
             );
-            if !spec.output_names.is_empty() {
-                push_list_property(&mut properties, "Output", &spec.output_names);
+            if !output_names.is_empty() {
+                push_list_property(&mut properties, "Output", &output_names);
             }
         }
         PhysicalNodeKind::MaterializedCte(spec) => {
@@ -491,14 +811,19 @@ fn collect_explain_properties(node: &PhysicalPlanNode) -> Vec<ExplainProperty> {
     properties
 }
 
-fn push_aggregate_properties(properties: &mut Vec<ExplainProperty>, spec: &AggregateSpec) {
+fn push_aggregate_properties(
+    properties: &mut Vec<ExplainProperty>,
+    spec: &AggregateSpec,
+    input_names: &[String],
+) {
+    let formatter = ExplainExpressionFormatter::new(input_names);
     if spec.grouping_key_count > 0 {
         push_string_property(
             properties,
             "Group Key",
             spec.groups
                 .iter()
-                .map(|expr| format_payload_expr(expr, spec))
+                .map(|expression| format_payload_expr(expression, spec, &formatter))
                 .collect::<Vec<_>>()
                 .join(", "),
         );
@@ -509,26 +834,32 @@ fn push_aggregate_properties(properties: &mut Vec<ExplainProperty>, spec: &Aggre
             "Aggregates",
             spec.aggregates
                 .iter()
-                .map(|expr| format_aggregate_expr(expr, spec))
+                .map(|expression| format_aggregate_expr(expression, spec, &formatter))
                 .collect::<Vec<_>>()
                 .join(", "),
         );
     }
     if let Some(reduction) = &spec.post_reduction {
+        let aggregate_names = spec
+            .aggregates
+            .iter()
+            .map(|expression| format_aggregate_expr(expression, spec, &formatter))
+            .collect::<Vec<_>>();
+        let reduction_formatter = ExplainExpressionFormatter::new(&aggregate_names);
         push_string_property(
             properties,
             "Post Reduction",
             reduction
                 .reducers
                 .iter()
-                .map(format_expr)
+                .map(|expression| reduction_formatter.format(expression))
                 .collect::<Vec<_>>()
                 .join(", "),
         );
         push_string_property(
             properties,
             "Post Predicate",
-            format_expr(&reduction.predicate),
+            reduction_formatter.format(&reduction.predicate),
         );
     }
     if !spec.grouping_sets.is_empty() {
@@ -541,7 +872,12 @@ fn push_aggregate_properties(properties: &mut Vec<ExplainProperty>, spec: &Aggre
                     format!(
                         "({})",
                         set.iter()
-                            .map(|idx| idx.to_string())
+                            .map(|index| {
+                                spec.groups.get(*index).map_or_else(
+                                    || format!("<group {index}>"),
+                                    |expression| format_payload_expr(expression, spec, &formatter),
+                                )
+                            })
                             .collect::<Vec<_>>()
                             .join(", ")
                     )
@@ -571,6 +907,260 @@ fn push_search_token_properties(properties: &mut Vec<ExplainProperty>, token: &C
     );
 }
 
+fn push_search_filter_properties(
+    properties: &mut Vec<ExplainProperty>,
+    predicate: Option<&crate::physical::specs::SearchPredicateTemplate>,
+    contract: crate::physical::specs::SearchFilterContract,
+    materialization: Option<paro_storage::search::ExactFilterMaterialization>,
+    table: &TableCatalogEntry,
+) {
+    let Some(predicate) = predicate else {
+        return;
+    };
+    push_string_property(
+        properties,
+        "Pushed Predicate",
+        format_search_predicate(predicate, table),
+    );
+    let contract = match (contract, materialization) {
+        (
+            crate::physical::specs::SearchFilterContract::ExactSegmentRowSetNoResidual,
+            Some(paro_storage::search::ExactFilterMaterialization::ScalarIndex),
+        ) => "exact segment row set from scalar index; ordinal admission and posting scan; no residual filter",
+        (
+            crate::physical::specs::SearchFilterContract::ExactSegmentRowSetNoResidual,
+            Some(paro_storage::search::ExactFilterMaterialization::ColumnScan),
+        ) => "exact segment row set materialized by column scan; no residual filter",
+        (
+            crate::physical::specs::SearchFilterContract::ExactSegmentRowSetNoResidual,
+            Some(paro_storage::search::ExactFilterMaterialization::Mixed {
+                indexed_rows,
+                scanned_rows,
+            }),
+        ) => {
+            push_string_property(
+                properties,
+                "Filter Row-Set Coverage",
+                format!("indexed rows {indexed_rows}; column-scan rows {scanned_rows}"),
+            );
+            "exact segment row set from mixed scalar indexes and column scans; no residual filter"
+        }
+        (crate::physical::specs::SearchFilterContract::ExactSegmentRowSetNoResidual, None) => {
+            "exact segment row set; materialization unknown; no residual filter"
+        }
+        (crate::physical::specs::SearchFilterContract::None, _) => "unproven",
+    };
+    push_string_property(properties, "Filter Pushdown", contract.to_string());
+}
+
+fn push_dense_search_filter_properties(
+    properties: &mut Vec<ExplainProperty>,
+    spec: &crate::physical::specs::VectorSearchSpec,
+) {
+    push_search_filter_properties(
+        properties,
+        spec.predicate.as_ref(),
+        spec.filter_contract,
+        spec.filter_materialization,
+        spec.table.as_ref(),
+    );
+    if spec.params.objective == paro_storage::index::hnsw::HnswSearchObjective::Exact {
+        if spec.predicate.is_some() {
+            push_string_property(
+                properties,
+                "Filtered Strategy",
+                "query objective forces exact row-set distance scan; HNSW navigation, predicate topology, and adaptive refinement are disabled"
+                    .to_string(),
+            );
+        }
+        return;
+    }
+    if spec.predicate.is_none() {
+        return;
+    }
+
+    let has_runtime_parameters = spec
+        .predicate
+        .as_ref()
+        .is_some_and(|predicate| predicate.has_runtime_parameters());
+    if !has_runtime_parameters {
+        if let Some(rows) = spec.estimated_filter_rows {
+            push_string_property(properties, "Filter Rows (estimated)", rows.to_string());
+        }
+    }
+
+    let predicate_columns = paro_storage::index::collect_predicate_columns(
+        spec.predicate
+            .as_ref()
+            .expect("predicate checked above")
+            .tree(),
+    );
+    let accelerated_columns = spec
+        .filter_topology
+        .columns()
+        .iter()
+        .copied()
+        .filter(|column| predicate_columns.contains(column))
+        .map(|column| table_column_name(spec.table.as_ref(), column as usize))
+        .collect::<Vec<_>>();
+    // Runtime prepares exact segment row sets and lowers every immutable
+    // artifact from its actual physical scan workload. EXPLAIN describes that
+    // contract rather than pretending a plan-time selectivity estimate fixes
+    // the executed path.
+    let exact_scan = if accelerated_columns.is_empty() {
+        "exact row-set distance scan"
+    } else {
+        "exact row-set distance scan using scalar-block covering vector ranges for compatible ordinal predicates"
+    };
+    let strategy = format!(
+        "runtime cost choice per immutable artifact: {exact_scan} is compared with graph work using definition-pinned physical cost coefficients, effective ef, and exact covering/base row counts; graph execution uses predicate-agnostic HNSW navigation with deferred global-beam admission for broad predicates, exact eager admission and hierarchical scalar-block topology for selective predicates, observed two-hop repair, and exact fallback"
+    );
+    push_string_property(properties, "Filtered Strategy", strategy);
+    if !accelerated_columns.is_empty() {
+        push_string_property(
+            properties,
+            "Exact Filter Scan",
+            format!(
+                "covering scalar-block vector ranges available for compatible single-column ordinal predicates on {}; base vector pages are not gathered",
+                accelerated_columns.join(", ")
+            ),
+        );
+        push_string_property(
+            properties,
+            "Predicate Topology",
+            format!(
+                "available on {}: tagged hierarchical scalar-block HNSW plus bounded vector-aware cross-block routing; every admitted block has a durable entry point and exact row-set admission",
+                accelerated_columns.join(", ")
+            ),
+        );
+    }
+}
+
+fn push_vector_search_properties(
+    properties: &mut Vec<ExplainProperty>,
+    spec: &crate::physical::specs::VectorSearchSpec,
+) {
+    let widths =
+        spec.search_policy
+            .effective_widths(spec.k, spec.params.ef, spec.params.rerank_window);
+    push_string_property(properties, "Search Candidate", "dense vector".to_string());
+    push_string_property(
+        properties,
+        "Column",
+        table_column_name(spec.table.as_ref(), spec.column_id),
+    );
+    push_string_property(properties, "Limit", spec.k.to_string());
+    push_string_property(
+        properties,
+        "Search Objective",
+        match spec.params.objective {
+            paro_storage::index::hnsw::HnswSearchObjective::CostOptimized => {
+                "cost_optimized: definition-pinned cost selects exact scoring or graph traversal"
+                    .to_string()
+            }
+            paro_storage::index::hnsw::HnswSearchObjective::Exact => {
+                "exact: score every admitted vector; graph traversal disabled".to_string()
+            }
+        },
+    );
+    push_string_property(
+        properties,
+        "Search Ef",
+        format!(
+            "{} (effective {} per graph shard)",
+            spec.params
+                .ef
+                .map_or_else(|| "default".to_string(), |ef| ef.to_string()),
+            widths.ef
+        ),
+    );
+    push_string_property(
+        properties,
+        "Graph Shards",
+        format!(
+            "{} (estimated aggregate beam width {})",
+            spec.graph_shard_count,
+            widths.ef.saturating_mul(spec.graph_shard_count),
+        ),
+    );
+    push_string_property(
+        properties,
+        "Exact Rerank Window",
+        format!(
+            "{} (effective {}, definition policy {})",
+            spec.params
+                .rerank_window
+                .map_or_else(|| "default".to_string(), |window| window.to_string()),
+            widths.rerank_window,
+            spec.search_policy.rerank_policy,
+        ),
+    );
+    push_string_property(
+        properties,
+        "Exact/Graph Cost Profile",
+        format!(
+            "random-access={} units, exact-f32={} units/dimension, sequential={} units/dimension, symmetric-i16={} units/dimension, graph={} unique scores/ef, routing={} (source={}, definition-pinned); observed generation average level-0 degree={:.2} is descriptive, not a cost cap",
+            spec.search_policy.distance_cost.random_access_cost_units,
+            spec.search_policy.distance_cost.exact_f32_dimension_cost_units,
+            spec.search_policy.distance_cost.sequential_dimension_cost_units,
+            spec.search_policy.distance_cost.symmetric_i16_dimension_cost_units,
+            spec.search_policy.distance_cost.graph_scored_points_per_ef,
+            spec.search_policy.vector_encoding,
+            spec.search_policy.distance_cost.source,
+            spec.avg_level0_degree,
+        ),
+    );
+    push_dense_search_filter_properties(properties, spec);
+}
+
+fn push_sparse_search_properties(
+    properties: &mut Vec<ExplainProperty>,
+    spec: &crate::physical::specs::SparseVectorSearchSpec,
+) {
+    push_string_property(properties, "Search Candidate", "sparse vector".to_string());
+    push_string_property(
+        properties,
+        "Column",
+        table_column_name(spec.table.as_ref(), spec.column_id),
+    );
+    push_string_property(properties, "Limit", spec.k.to_string());
+    push_search_filter_properties(
+        properties,
+        spec.predicate.as_ref(),
+        spec.filter_contract,
+        spec.filter_materialization,
+        spec.table.as_ref(),
+    );
+}
+
+fn push_fulltext_search_properties(
+    properties: &mut Vec<ExplainProperty>,
+    spec: &crate::physical::specs::FullTextSearchSpec,
+) {
+    push_string_property(properties, "Search Candidate", "full text".to_string());
+    push_string_property(
+        properties,
+        "Column",
+        table_column_name(spec.table.as_ref(), spec.column_id),
+    );
+    push_string_property(properties, "Mode", format!("{:?}", spec.mode));
+    push_search_filter_properties(
+        properties,
+        spec.predicate.as_ref(),
+        spec.filter_contract,
+        spec.filter_materialization,
+        spec.table.as_ref(),
+    );
+}
+
+fn push_search_source_properties(properties: &mut Vec<ExplainProperty>, source: &SearchSourceSpec) {
+    match source {
+        SearchSourceSpec::Vector(spec) => push_vector_search_properties(properties, spec),
+        SearchSourceSpec::Sparse(spec) => push_sparse_search_properties(properties, spec),
+        SearchSourceSpec::FullText(spec) => push_fulltext_search_properties(properties, spec),
+    }
+}
+
 fn search_source_token(source: &SearchSourceSpec) -> &CapabilityToken {
     match source {
         SearchSourceSpec::Vector(spec) => &spec.capability_token,
@@ -580,7 +1170,10 @@ fn search_source_token(source: &SearchSourceSpec) -> &CapabilityToken {
 }
 
 fn push_string_property(properties: &mut Vec<ExplainProperty>, label: &'static str, value: String) {
-    properties.push(ExplainProperty::new(label, ExplainValue::String(value)));
+    properties.push(ExplainProperty::new(
+        label,
+        ExplainValue::String(bound_explain_text(value)),
+    ));
 }
 
 fn push_list_property(
@@ -588,13 +1181,25 @@ fn push_list_property(
     label: &'static str,
     values: &[String],
 ) {
-    properties.push(ExplainProperty::new(
-        label,
-        ExplainValue::List(values.iter().cloned().map(ExplainValue::String).collect()),
-    ));
+    let mut bounded = values
+        .iter()
+        .take(EXPLAIN_EXPRESSION_MAX_NODES)
+        .cloned()
+        .map(bound_explain_text)
+        .map(ExplainValue::String)
+        .collect::<Vec<_>>();
+    if values.len() > EXPLAIN_EXPRESSION_MAX_NODES {
+        bounded.push(ExplainValue::String("…".to_string()));
+    }
+    properties.push(ExplainProperty::new(label, ExplainValue::List(bounded)));
 }
 
-fn push_join_conditions(properties: &mut Vec<ExplainProperty>, conditions: &[JoinCondition]) {
+fn push_join_conditions(
+    properties: &mut Vec<ExplainProperty>,
+    conditions: &[JoinCondition],
+    left_names: &[String],
+    right_names: &[String],
+) {
     if conditions.is_empty() {
         return;
     }
@@ -603,7 +1208,9 @@ fn push_join_conditions(properties: &mut Vec<ExplainProperty>, conditions: &[Joi
         ExplainValue::List(
             conditions
                 .iter()
-                .map(|condition| ExplainValue::String(format_join_condition(condition)))
+                .map(|condition| {
+                    ExplainValue::String(format_join_condition(condition, left_names, right_names))
+                })
                 .collect(),
         ),
     ));
@@ -634,6 +1241,7 @@ fn explain_relation_name(kind: &PhysicalNodeKind) -> Option<String> {
 fn explain_relation_alias(kind: &PhysicalNodeKind) -> Option<String> {
     match kind {
         PhysicalNodeKind::RowsetScan(spec) => spec.relation_alias.clone(),
+        PhysicalNodeKind::Values(spec) => spec.relation_alias.clone(),
         _ => None,
     }
 }
@@ -667,11 +1275,7 @@ fn is_search_scan(kind: &PhysicalNodeKind) -> bool {
 fn fallback_cardinality(kind: &PhysicalNodeKind) -> Option<CardinalityEstimate> {
     let rows = match kind {
         PhysicalNodeKind::VectorSearch(spec) => spec
-            .table
-            .storage
-            .as_ref()
-            .and_then(|table| table.hnsw_index_statistics(spec.column_id as u32))
-            .map(|stats| stats.num_indexed_vectors as u64)
+            .estimated_total_rows
             .filter(|rows| *rows > 0)
             .or_else(|| table_row_count(spec.table.as_ref())),
         PhysicalNodeKind::SparseVectorSearch(spec) => spec
@@ -714,22 +1318,7 @@ fn qualified_table_name(table: &paro_catalog::entry::TableCatalogEntry) -> Strin
     format!("{}.{}", table.schema_name(), table.name())
 }
 
-fn format_order_by(orders: &[paro_planner::binder::ir::OrderByNode]) -> String {
-    orders
-        .iter()
-        .map(|order| {
-            format!(
-                "{} {} NULLS {}",
-                format_expr(&order.expression),
-                if order.ascending { "ASC" } else { "DESC" },
-                if order.nulls_first { "FIRST" } else { "LAST" }
-            )
-        })
-        .collect::<Vec<_>>()
-        .join(", ")
-}
-
-fn format_segment_order(order: &SegmentOrderOptions) -> String {
+fn format_segment_order(order: &SegmentOrderOptions, table: &TableCatalogEntry) -> String {
     let stat = match order.order_by {
         OrderByStatistics::Min => "min",
         OrderByStatistics::Max => "max",
@@ -747,10 +1336,8 @@ fn format_segment_order(order: &SegmentOrderOptions) -> String {
     } else {
         format!(" OFFSET {}", order.row_offset)
     };
-    format!(
-        "col#{} {direction} by {stat}{limit}{offset}",
-        order.column_idx
-    )
+    let column = table_column_name(table, order.column_idx);
+    format!("{column} {direction} by {stat}{limit}{offset}")
 }
 
 fn format_hops(min_hops: u64, max_hops: u64) -> String {
@@ -766,20 +1353,62 @@ fn format_output_schema(node: &PhysicalPlanNode) -> String {
         return "(none)".to_string();
     }
     node.output
-        .names
+        .identities
         .iter()
+        .enumerate()
         .zip(node.output.types.iter())
-        .map(|(name, ty)| format!("{name} {ty}"))
+        .map(|((ordinal, identity), ty)| {
+            let name = match identity {
+                super::row_type::ColumnIdentity::Visible {
+                    name,
+                    qualifier: Some(qualifier),
+                } => qualifier
+                    .iter()
+                    .map(|part| format_schema_identifier(part))
+                    .chain(std::iter::once(format_schema_identifier(name)))
+                    .collect::<Vec<_>>()
+                    .join("."),
+                super::row_type::ColumnIdentity::Visible {
+                    name,
+                    qualifier: None,
+                } => format_schema_identifier(name),
+                super::row_type::ColumnIdentity::Internal => {
+                    format_schema_identifier(&format!("__internal_{}", ordinal + 1))
+                }
+                super::row_type::ColumnIdentity::InternalNamed(name) => {
+                    format_schema_identifier(name)
+                }
+            };
+            format!("{name} {ty}")
+        })
         .collect::<Vec<_>>()
         .join(", ")
 }
 
-fn format_join_condition(condition: &JoinCondition) -> String {
+fn format_schema_identifier(name: &str) -> String {
+    if !name.is_empty()
+        && name.chars().enumerate().all(|(index, character)| {
+            character == '_'
+                || character.is_ascii_alphanumeric() && (index > 0 || !character.is_ascii_digit())
+        })
+    {
+        return name.to_string();
+    }
+    format!("\"{}\"", name.replace('"', "\"\""))
+}
+
+fn format_join_condition(
+    condition: &JoinCondition,
+    left_names: &[String],
+    right_names: &[String],
+) -> String {
+    let left = ExplainExpressionFormatter::new(left_names).format(&condition.left);
+    let right = ExplainExpressionFormatter::new(right_names).format(&condition.right);
     format!(
         "{} {} {}",
-        format_expr(&condition.left),
+        left,
         join_comparison_symbol(condition.comparison),
-        format_expr(&condition.right)
+        right
     )
 }
 
@@ -827,19 +1456,67 @@ fn format_cte_materialization(
     }
 }
 
-fn format_payload_expr(expr: &Expression, spec: &AggregateSpec) -> String {
-    if let Expression::Reference(reference) = expr {
-        if let Some(payload) = spec.projection_exprs.get(reference.index) {
-            return format_expr(payload);
-        }
+fn aggregate_scope_names(spec: &AggregateSpec, input_names: &[String]) -> Option<Vec<String>> {
+    let formatter = ExplainExpressionFormatter::new(input_names);
+    let mut state_names = spec
+        .groups
+        .iter()
+        .map(|expression| format_payload_expr(expression, spec, &formatter))
+        .chain(
+            spec.aggregates
+                .iter()
+                .map(|expression| format_aggregate_expr(expression, spec, &formatter)),
+        )
+        .collect::<Vec<_>>();
+    state_names.extend(spec.grouping_functions.iter().map(|grouping| {
+        let arguments = grouping
+            .iter()
+            .filter_map(|index| spec.groups.get(*index))
+            .map(|expression| format_payload_expr(expression, spec, &formatter))
+            .collect::<Vec<_>>()
+            .join(", ");
+        bound_explain_text(format!("grouping({arguments})"))
+    }));
+
+    if spec.state_output_projection.is_empty() {
+        return Some(state_names);
     }
-    format_expr(expr)
+    spec.state_output_projection
+        .iter()
+        .map(|index| state_names.get(*index).cloned())
+        .collect()
 }
 
-fn format_aggregate_expr(expr: &Expression, spec: &AggregateSpec) -> String {
-    let Expression::Aggregate(aggregate) = expr else {
-        return format_expr(expr);
+fn format_payload_expr(
+    expression: &Expression,
+    spec: &AggregateSpec,
+    formatter: &ExplainExpressionFormatter<'_>,
+) -> String {
+    if let Expression::Reference(reference) = expression {
+        if let Some(payload) = spec.projection_exprs.get(reference.index) {
+            return formatter.format(payload);
+        }
+    }
+    formatter.format(expression)
+}
+
+fn format_aggregate_expr(
+    expression: &Expression,
+    spec: &AggregateSpec,
+    formatter: &ExplainExpressionFormatter<'_>,
+) -> String {
+    let Expression::Aggregate(aggregate) = expression else {
+        return formatter.format(expression);
     };
+    format_bound_aggregate(aggregate, &|child| {
+        format_payload_expr(child, spec, formatter)
+    })
+}
+
+fn format_bound_aggregate(
+    aggregate: &AggregateExpression,
+    format_child: &impl Fn(&Expression) -> String,
+) -> String {
     let distinct = if aggregate.aggr_type == AggregateType::Distinct {
         "DISTINCT "
     } else {
@@ -851,14 +1528,14 @@ fn format_aggregate_expr(expr: &Expression, spec: &AggregateSpec) -> String {
         aggregate
             .children
             .iter()
-            .map(|child| format_payload_expr(child, spec))
+            .map(format_child)
             .collect::<Vec<_>>()
             .join(", ")
     };
     let mut rendered = format!("{}({distinct}{args})", aggregate.function.name);
     if let Some(filter) = aggregate.filter.as_ref() {
         rendered.push_str(" FILTER (WHERE ");
-        rendered.push_str(&format_payload_expr(filter, spec));
+        rendered.push_str(&format_child(filter));
         rendered.push(')');
     }
     if !aggregate.order_bys.is_empty() {
@@ -870,7 +1547,7 @@ fn format_aggregate_expr(expr: &Expression, spec: &AggregateSpec) -> String {
                 .map(|order| {
                     format!(
                         "{} {} NULLS {}",
-                        format_payload_expr(&order.expression, spec),
+                        format_child(&order.expression),
                         if order.ascending { "ASC" } else { "DESC" },
                         if order.nulls_first { "FIRST" } else { "LAST" }
                     )
@@ -883,85 +1560,639 @@ fn format_aggregate_expr(expr: &Expression, spec: &AggregateSpec) -> String {
     rendered
 }
 
-fn format_expr(expr: &Expression) -> String {
-    match expr {
-        Expression::Reference(reference) => format!("#{}", reference.index),
-        Expression::ColumnRef(column_ref) => format!("#{}", column_ref.binding.column_index),
-        Expression::Constant(constant) => constant.value.to_string(),
-        Expression::Comparison(comparison) => format!(
-            "{} {} {}",
-            format_expr(&comparison.left),
-            comparison.comparison_type,
-            format_expr(&comparison.right)
-        ),
-        Expression::Conjunction(conjunction) => {
-            let separator = match conjunction.conjunction_type {
-                paro_planner::expression::ConjunctionType::And => " AND ",
-                paro_planner::expression::ConjunctionType::Or => " OR ",
-            };
-            conjunction
-                .children
+struct ExplainExpressionFormatter<'a> {
+    columns: &'a [String],
+}
+
+const EXPLAIN_EXPRESSION_MAX_NODES: usize = 1_024;
+const EXPLAIN_EXPRESSION_MAX_DEPTH: usize = 64;
+const EXPLAIN_EXPRESSION_MAX_BYTES: usize = 16 * 1_024;
+
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+enum ExplainPrecedence {
+    Lowest,
+    Or,
+    And,
+    Not,
+    Comparison,
+    Primary,
+}
+
+struct ExplainFormatBudget {
+    remaining_nodes: Cell<usize>,
+}
+
+impl ExplainFormatBudget {
+    fn new() -> Self {
+        Self {
+            remaining_nodes: Cell::new(EXPLAIN_EXPRESSION_MAX_NODES),
+        }
+    }
+
+    fn enter(&self, depth: usize) -> bool {
+        let remaining = self.remaining_nodes.get();
+        if depth >= EXPLAIN_EXPRESSION_MAX_DEPTH || remaining == 0 {
+            return false;
+        }
+        self.remaining_nodes.set(remaining - 1);
+        true
+    }
+}
+
+impl<'a> ExplainExpressionFormatter<'a> {
+    fn new(columns: &'a [String]) -> Self {
+        Self { columns }
+    }
+
+    fn column(&self, index: usize) -> String {
+        self.columns
+            .get(index)
+            .cloned()
+            .unwrap_or_else(|| format!("<column {index}>"))
+    }
+
+    fn format_order_by(&self, orders: &[paro_planner::binder::ir::OrderByNode]) -> String {
+        bound_explain_text(
+            orders
                 .iter()
-                .map(format_expr)
+                .map(|order| {
+                    format!(
+                        "{} {} NULLS {}",
+                        self.format(&order.expression),
+                        if order.ascending { "ASC" } else { "DESC" },
+                        if order.nulls_first { "FIRST" } else { "LAST" }
+                    )
+                })
                 .collect::<Vec<_>>()
-                .join(separator)
+                .join(", "),
+        )
+    }
+
+    fn format(&self, expression: &Expression) -> String {
+        let budget = ExplainFormatBudget::new();
+        bound_explain_text(self.format_expression(
+            expression,
+            ExplainPrecedence::Lowest,
+            0,
+            &budget,
+        ))
+    }
+
+    fn format_expression(
+        &self,
+        expression: &Expression,
+        parent_precedence: ExplainPrecedence,
+        depth: usize,
+        budget: &ExplainFormatBudget,
+    ) -> String {
+        if !budget.enter(depth) {
+            return "…".to_string();
         }
-        Expression::Cast(cast) => {
-            let cast_name = if cast.try_cast { "TRY_CAST" } else { "CAST" };
-            format!(
-                "{cast_name}({} AS {})",
-                format_expr(&cast.child),
-                cast.target_type
-            )
-        }
-        Expression::Function(function) => {
-            format!(
-                "{}({})",
-                function.function.name.as_str(),
-                function
-                    .children
-                    .iter()
-                    .map(format_expr)
-                    .collect::<Vec<_>>()
-                    .join(", ")
-            )
-        }
-        Expression::Aggregate(aggregate) => {
-            format!(
-                "{}({})",
-                aggregate.function.name,
-                aggregate
-                    .children
-                    .iter()
-                    .map(format_expr)
-                    .collect::<Vec<_>>()
-                    .join(", ")
-            )
-        }
-        Expression::Operator(operator) => match operator.operator_type {
-            paro_planner::expression::OperatorType::IsNull => operator
-                .children
-                .first()
-                .map(|child| format!("{} IS NULL", format_expr(child)))
-                .unwrap_or_else(|| "IS NULL".to_string()),
-            paro_planner::expression::OperatorType::IsNotNull => operator
-                .children
-                .first()
-                .map(|child| format!("{} IS NOT NULL", format_expr(child)))
-                .unwrap_or_else(|| "IS NOT NULL".to_string()),
-            paro_planner::expression::OperatorType::In if operator.children.len() >= 2 => {
+        let next_depth = depth + 1;
+        let (rendered, precedence) = match expression {
+            Expression::Reference(reference) => {
+                (self.column(reference.index), ExplainPrecedence::Primary)
+            }
+            Expression::ColumnRef(column) => (
+                self.column(column.binding.column_index),
+                ExplainPrecedence::Primary,
+            ),
+            Expression::Constant(constant) => {
+                (constant.value.to_string(), ExplainPrecedence::Primary)
+            }
+            Expression::Parameter(parameter) => (
+                format!("${}", parameter.slot.index.index() + 1),
+                ExplainPrecedence::Primary,
+            ),
+            Expression::Comparison(comparison) => (
                 format!(
-                    "{} IN ({})",
-                    format_expr(&operator.children[0]),
-                    operator.children[1..]
+                    "{} {} {}",
+                    self.format_expression(
+                        &comparison.left,
+                        ExplainPrecedence::Comparison,
+                        next_depth,
+                        budget,
+                    ),
+                    comparison.comparison_type,
+                    self.format_expression(
+                        &comparison.right,
+                        ExplainPrecedence::Comparison,
+                        next_depth,
+                        budget,
+                    )
+                ),
+                ExplainPrecedence::Comparison,
+            ),
+            Expression::Conjunction(conjunction) => {
+                let (separator, precedence) = match conjunction.conjunction_type {
+                    paro_planner::expression::ConjunctionType::And => {
+                        (" AND ", ExplainPrecedence::And)
+                    }
+                    paro_planner::expression::ConjunctionType::Or => {
+                        (" OR ", ExplainPrecedence::Or)
+                    }
+                };
+                (
+                    conjunction
+                        .children
                         .iter()
-                        .map(format_expr)
+                        .map(|child| self.format_expression(child, precedence, next_depth, budget))
                         .collect::<Vec<_>>()
-                        .join(", ")
+                        .join(separator),
+                    precedence,
                 )
             }
-            _ => format!("{expr:?}"),
-        },
-        _ => format!("{expr:?}"),
+            Expression::Cast(cast) => {
+                let cast_name = if cast.try_cast { "TRY_CAST" } else { "CAST" };
+                (
+                    format!(
+                        "{cast_name}({} AS {})",
+                        self.format_expression(
+                            &cast.child,
+                            ExplainPrecedence::Lowest,
+                            next_depth,
+                            budget,
+                        ),
+                        cast.target_type
+                    ),
+                    ExplainPrecedence::Primary,
+                )
+            }
+            Expression::Function(function) => (
+                format!(
+                    "{}({})",
+                    function.function.name.as_str(),
+                    function
+                        .children
+                        .iter()
+                        .map(|child| self.format_expression(
+                            child,
+                            ExplainPrecedence::Lowest,
+                            next_depth,
+                            budget,
+                        ))
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                ),
+                ExplainPrecedence::Primary,
+            ),
+            Expression::Aggregate(aggregate) => (
+                format_bound_aggregate(aggregate, &|child| {
+                    self.format_expression(child, ExplainPrecedence::Lowest, next_depth, budget)
+                }),
+                ExplainPrecedence::Primary,
+            ),
+            Expression::Case(case_expression) => (
+                format!(
+                    "CASE WHEN {} THEN {} ELSE {} END",
+                    self.format_expression(
+                        &case_expression.check,
+                        ExplainPrecedence::Lowest,
+                        next_depth,
+                        budget,
+                    ),
+                    self.format_expression(
+                        &case_expression.result_if_true,
+                        ExplainPrecedence::Lowest,
+                        next_depth,
+                        budget,
+                    ),
+                    self.format_expression(
+                        &case_expression.result_if_false,
+                        ExplainPrecedence::Lowest,
+                        next_depth,
+                        budget,
+                    )
+                ),
+                ExplainPrecedence::Primary,
+            ),
+            Expression::Operator(operator) => self.format_operator(operator, next_depth, budget),
+            Expression::Subquery(subquery) => {
+                let kind = match subquery.subquery_type {
+                    paro_planner::expression::SubqueryType::Scalar => "SUBQUERY",
+                    paro_planner::expression::SubqueryType::Exists => "EXISTS SUBQUERY",
+                    paro_planner::expression::SubqueryType::NotExists => "NOT EXISTS SUBQUERY",
+                    paro_planner::expression::SubqueryType::Any => "ANY SUBQUERY",
+                    paro_planner::expression::SubqueryType::All => "ALL SUBQUERY",
+                };
+                if subquery.children.is_empty() {
+                    (format!("<{kind}>"), ExplainPrecedence::Primary)
+                } else {
+                    (
+                        format!(
+                            "{} {} <{kind}>",
+                            subquery
+                                .children
+                                .iter()
+                                .map(|child| self.format_expression(
+                                    child,
+                                    ExplainPrecedence::Lowest,
+                                    next_depth,
+                                    budget,
+                                ))
+                                .collect::<Vec<_>>()
+                                .join(", "),
+                            subquery.comparison_type
+                        ),
+                        ExplainPrecedence::Comparison,
+                    )
+                }
+            }
+            Expression::Window(window) => (
+                self.format_window(window, next_depth, budget),
+                ExplainPrecedence::Primary,
+            ),
+        };
+        let rendered = bound_explain_text(rendered);
+        if precedence < parent_precedence {
+            bound_explain_text(format!("({rendered})"))
+        } else {
+            rendered
+        }
     }
+
+    fn format_operator(
+        &self,
+        operator: &paro_planner::expression::OperatorExpression,
+        depth: usize,
+        budget: &ExplainFormatBudget,
+    ) -> (String, ExplainPrecedence) {
+        let child = |index: usize, precedence: ExplainPrecedence| {
+            operator
+                .children
+                .get(index)
+                .map(|child| self.format_expression(child, precedence, depth, budget))
+        };
+        let children = || {
+            operator
+                .children
+                .iter()
+                .map(|child| {
+                    self.format_expression(child, ExplainPrecedence::Lowest, depth, budget)
+                })
+                .collect::<Vec<_>>()
+        };
+        match operator.operator_type {
+            OperatorType::In | OperatorType::NotIn => (
+                child(0, ExplainPrecedence::Comparison).map_or_else(
+                    || "<invalid IN>".to_string(),
+                    |left| {
+                        format!(
+                            "{} {}IN ({})",
+                            left,
+                            if operator.operator_type == OperatorType::NotIn {
+                                "NOT "
+                            } else {
+                                ""
+                            },
+                            operator.children[1..]
+                                .iter()
+                                .map(|child| self.format_expression(
+                                    child,
+                                    ExplainPrecedence::Lowest,
+                                    depth,
+                                    budget,
+                                ))
+                                .collect::<Vec<_>>()
+                                .join(", ")
+                        )
+                    },
+                ),
+                ExplainPrecedence::Comparison,
+            ),
+            OperatorType::Not => (
+                child(0, ExplainPrecedence::Not)
+                    .map(|child| format!("NOT {child}"))
+                    .unwrap_or_else(|| "<invalid NOT>".to_string()),
+                ExplainPrecedence::Not,
+            ),
+            OperatorType::IsNull => (
+                child(0, ExplainPrecedence::Comparison)
+                    .map(|child| format!("{child} IS NULL"))
+                    .unwrap_or_else(|| "<invalid IS NULL>".to_string()),
+                ExplainPrecedence::Comparison,
+            ),
+            OperatorType::IsNotNull => (
+                child(0, ExplainPrecedence::Comparison)
+                    .map(|child| format!("{child} IS NOT NULL"))
+                    .unwrap_or_else(|| "<invalid IS NOT NULL>".to_string()),
+                ExplainPrecedence::Comparison,
+            ),
+            OperatorType::Coalesce => (
+                format!("COALESCE({})", children().join(", ")),
+                ExplainPrecedence::Primary,
+            ),
+            OperatorType::Like | OperatorType::ILike => (
+                match (
+                    child(0, ExplainPrecedence::Comparison),
+                    child(1, ExplainPrecedence::Comparison),
+                ) {
+                    (Some(left), Some(right)) => format!(
+                        "{} {} {}",
+                        left,
+                        if operator.operator_type == OperatorType::Like {
+                            "LIKE"
+                        } else {
+                            "ILIKE"
+                        },
+                        right
+                    ),
+                    _ => "<invalid LIKE>".to_string(),
+                },
+                ExplainPrecedence::Comparison,
+            ),
+            OperatorType::ArrayConstructor => (
+                format!("[{}]", children().join(", ")),
+                ExplainPrecedence::Primary,
+            ),
+            OperatorType::StructConstructor => (
+                format!("({})", children().join(", ")),
+                ExplainPrecedence::Primary,
+            ),
+            OperatorType::ArrayExtract => (
+                match (
+                    child(0, ExplainPrecedence::Primary),
+                    child(1, ExplainPrecedence::Lowest),
+                ) {
+                    (Some(array), Some(index)) => format!("{array}[{index}]"),
+                    _ => "<invalid array extract>".to_string(),
+                },
+                ExplainPrecedence::Primary,
+            ),
+            OperatorType::ErrorIfMultipleRows => (
+                format!("error_if_multiple_rows({})", children().join(", ")),
+                ExplainPrecedence::Primary,
+            ),
+        }
+    }
+
+    fn format_window(
+        &self,
+        window: &paro_planner::expression::WindowExpression,
+        depth: usize,
+        budget: &ExplainFormatBudget,
+    ) -> String {
+        let mut rendered = format!(
+            "{}({}) OVER (",
+            window.function_name(),
+            window
+                .arguments()
+                .iter()
+                .map(|argument| self.format_expression(
+                    argument,
+                    ExplainPrecedence::Lowest,
+                    depth,
+                    budget,
+                ))
+                .collect::<Vec<_>>()
+                .join(", ")
+        );
+        if !window.partitions.is_empty() {
+            rendered.push_str("PARTITION BY ");
+            rendered.push_str(
+                &window
+                    .partitions
+                    .iter()
+                    .map(|partition| {
+                        self.format_expression(partition, ExplainPrecedence::Lowest, depth, budget)
+                    })
+                    .collect::<Vec<_>>()
+                    .join(", "),
+            );
+        }
+        if !window.orders.is_empty() {
+            if !window.partitions.is_empty() {
+                rendered.push(' ');
+            }
+            rendered.push_str("ORDER BY ");
+            rendered.push_str(
+                &window
+                    .orders
+                    .iter()
+                    .map(|order| {
+                        format!(
+                            "{} {} NULLS {}",
+                            self.format_expression(
+                                &order.expression,
+                                ExplainPrecedence::Lowest,
+                                depth,
+                                budget,
+                            ),
+                            if order.ascending { "ASC" } else { "DESC" },
+                            if order.nulls_first { "FIRST" } else { "LAST" }
+                        )
+                    })
+                    .collect::<Vec<_>>()
+                    .join(", "),
+            );
+        }
+        if !window.partitions.is_empty() || !window.orders.is_empty() {
+            rendered.push(' ');
+        }
+        rendered.push_str(match window.frame.frame_type {
+            WindowFrameType::Rows => "ROWS BETWEEN ",
+            WindowFrameType::Range => "RANGE BETWEEN ",
+        });
+        rendered.push_str(&self.format_window_bound(
+            &window.frame.start_bound,
+            window.frame.start_is_preceding,
+            depth,
+            budget,
+        ));
+        rendered.push_str(" AND ");
+        rendered.push_str(&self.format_window_bound(
+            &window.frame.end_bound,
+            window.frame.end_is_preceding,
+            depth,
+            budget,
+        ));
+        rendered.push(')');
+        bound_explain_text(rendered)
+    }
+
+    fn format_window_bound(
+        &self,
+        bound: &WindowFrameBound,
+        preceding: bool,
+        depth: usize,
+        budget: &ExplainFormatBudget,
+    ) -> String {
+        match bound {
+            WindowFrameBound::Unbounded => format!(
+                "UNBOUNDED {}",
+                if preceding { "PRECEDING" } else { "FOLLOWING" }
+            ),
+            WindowFrameBound::CurrentRow => "CURRENT ROW".to_string(),
+            WindowFrameBound::Offset(offset) => format!(
+                "{} {}",
+                self.format_expression(offset, ExplainPrecedence::Lowest, depth, budget),
+                if preceding { "PRECEDING" } else { "FOLLOWING" }
+            ),
+        }
+    }
+}
+
+fn bound_explain_text(mut text: String) -> String {
+    if text.len() <= EXPLAIN_EXPRESSION_MAX_BYTES {
+        return text;
+    }
+    let mut boundary = EXPLAIN_EXPRESSION_MAX_BYTES.saturating_sub('…'.len_utf8());
+    while !text.is_char_boundary(boundary) {
+        boundary -= 1;
+    }
+    text.truncate(boundary);
+    text.push('…');
+    text
+}
+
+fn table_column_name(table: &TableCatalogEntry, column_id: usize) -> String {
+    table
+        .columns
+        .get(column_id)
+        .map(|column| column.name.clone())
+        .unwrap_or_else(|| format!("<column {column_id}>"))
+}
+
+fn format_predicate_tree<V: std::fmt::Display>(
+    predicate: &PredicateTree<V>,
+    table: &TableCatalogEntry,
+) -> String {
+    let budget = ExplainFormatBudget::new();
+    format_predicate_tree_with_precedence(predicate, table, ExplainPrecedence::Lowest, 0, &budget)
+}
+
+fn format_predicate_tree_with_precedence<V: std::fmt::Display>(
+    predicate: &PredicateTree<V>,
+    table: &TableCatalogEntry,
+    parent_precedence: ExplainPrecedence,
+    depth: usize,
+    budget: &ExplainFormatBudget,
+) -> String {
+    if !budget.enter(depth) {
+        return "…".to_string();
+    }
+    let next_depth = depth + 1;
+    let (rendered, precedence) = match predicate {
+        PredicateTree::Leaf(predicate) => (
+            format_predicate(predicate, table),
+            ExplainPrecedence::Primary,
+        ),
+        PredicateTree::And(children) => (
+            children
+                .iter()
+                .map(|child| {
+                    format_predicate_tree_with_precedence(
+                        child,
+                        table,
+                        ExplainPrecedence::And,
+                        next_depth,
+                        budget,
+                    )
+                })
+                .collect::<Vec<_>>()
+                .join(" AND "),
+            ExplainPrecedence::And,
+        ),
+        PredicateTree::Or(children) => (
+            children
+                .iter()
+                .map(|child| {
+                    format_predicate_tree_with_precedence(
+                        child,
+                        table,
+                        ExplainPrecedence::Or,
+                        next_depth,
+                        budget,
+                    )
+                })
+                .collect::<Vec<_>>()
+                .join(" OR "),
+            ExplainPrecedence::Or,
+        ),
+    };
+    if precedence < parent_precedence {
+        bound_explain_text(format!("({rendered})"))
+    } else {
+        bound_explain_text(rendered)
+    }
+}
+
+fn format_predicate<V: std::fmt::Display>(
+    predicate: &Predicate<V>,
+    table: &TableCatalogEntry,
+) -> String {
+    let name = |column_id: u32| table_column_name(table, column_id as usize);
+    match predicate {
+        Predicate::Eq { column_id, value } => format!("{} = {value}", name(*column_id)),
+        Predicate::NotEq { column_id, value } => format!("{} != {value}", name(*column_id)),
+        Predicate::Lt { column_id, value } => format!("{} < {value}", name(*column_id)),
+        Predicate::Le { column_id, value } => format!("{} <= {value}", name(*column_id)),
+        Predicate::Gt { column_id, value } => format!("{} > {value}", name(*column_id)),
+        Predicate::Ge { column_id, value } => format!("{} >= {value}", name(*column_id)),
+        Predicate::In { column_id, values } => format!(
+            "{} IN ({})",
+            name(*column_id),
+            values
+                .iter()
+                .map(ToString::to_string)
+                .collect::<Vec<_>>()
+                .join(", ")
+        ),
+        Predicate::FixedIn { column_id, values } => {
+            format!("{} IN ({} fixed values)", name(*column_id), values.len())
+        }
+        Predicate::Range {
+            column_id,
+            lower,
+            upper,
+        } => format!("{} BETWEEN {lower} AND {upper}", name(*column_id)),
+        Predicate::IsNull { column_id } => format!("{} IS NULL", name(*column_id)),
+        Predicate::IsNotNull { column_id } => format!("{} IS NOT NULL", name(*column_id)),
+        Predicate::StringPrefix {
+            column_id,
+            prefix,
+            negated,
+        } => format!(
+            "{} {} PREFIX {prefix:?}",
+            name(*column_id),
+            if *negated { "NOT" } else { "HAS" }
+        ),
+        Predicate::StringPrefixIn {
+            column_id,
+            prefixes,
+        } => format!(
+            "{} HAS PREFIX IN ({})",
+            name(*column_id),
+            prefixes
+                .iter()
+                .map(|prefix| format!("{prefix:?}"))
+                .collect::<Vec<_>>()
+                .join(", ")
+        ),
+        Predicate::StringLike {
+            column_id,
+            pattern,
+            negated,
+        } => format!(
+            "{} {} {pattern:?}",
+            name(*column_id),
+            if *negated { "NOT LIKE" } else { "LIKE" }
+        ),
+        Predicate::ColumnComparison {
+            left_column_id,
+            right_column_id,
+            comparison,
+        } => format!(
+            "{} {comparison} {}",
+            name(*left_column_id),
+            name(*right_column_id)
+        ),
+    }
+}
+
+fn format_search_predicate(
+    predicate: &crate::physical::specs::SearchPredicateTemplate,
+    table: &TableCatalogEntry,
+) -> String {
+    format_predicate_tree(predicate.tree(), table)
 }

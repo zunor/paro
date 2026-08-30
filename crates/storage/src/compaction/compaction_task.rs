@@ -92,14 +92,21 @@ impl HorizontalCompactionTask {
 
 impl CompactionTask for HorizontalCompactionTask {
     fn run(&mut self) -> Result<()> {
+        if self.state != CompactionTaskState::Init {
+            return Err(paro_error::invalid_input(
+                "compaction tasks are single-use and cannot be run after they leave Init",
+            ));
+        }
         if self.cancel_token.is_cancelled() {
+            self.state = CompactionTaskState::Failed;
+            self.plan.release_input_retentions();
             return Err(paro_error::query_canceled());
         }
 
         self.state = CompactionTaskState::Running;
         let notifier = self.lifecycle_notifier.clone();
         let search_inline_builders = self.tablet.search_inline_builders_for_compaction();
-        run_job_with_lifecycle_and_search_inline_builders(
+        let result = run_job_with_lifecycle_and_search_inline_builders(
             &self.tablet,
             Arc::new(self.plan.clone()),
             self.job_id,
@@ -111,9 +118,18 @@ impl CompactionTask for HorizontalCompactionTask {
                     notifier(state);
                 }
             },
-        )?;
-        self.state = CompactionTaskState::Success;
-        Ok(())
+        );
+        self.plan.release_input_retentions();
+        match result {
+            Ok(_) => {
+                self.state = CompactionTaskState::Success;
+                Ok(())
+            }
+            Err(error) => {
+                self.state = CompactionTaskState::Failed;
+                Err(error)
+            }
+        }
     }
 
     fn stop(&mut self) {
@@ -225,6 +241,7 @@ mod tests {
             _tablet_id: crate::tablet::TabletId,
             _version: i64,
             _rowset: RowsetSharedPtr,
+            _search_updates: crate::tablet::SearchGenerationHeadUpdates,
         ) {
         }
 
@@ -234,6 +251,30 @@ mod tests {
         ) -> SearchInlineBuilderSet {
             self.calls.fetch_add(1, AtomicOrdering::SeqCst);
             SearchInlineBuilderSet::default()
+        }
+    }
+
+    #[derive(Debug)]
+    struct GenerationReplacementSearchObserver;
+
+    impl RowsetPublishObserver for GenerationReplacementSearchObserver {
+        fn rowset_published(
+            &self,
+            _tablet_id: crate::tablet::TabletId,
+            _version: i64,
+            _rowset: RowsetSharedPtr,
+            _search_updates: crate::tablet::SearchGenerationHeadUpdates,
+        ) {
+        }
+
+        fn compaction_requirement(
+            &self,
+            _tablet_id: crate::tablet::TabletId,
+            _replaced_rowset_ids: &[u64],
+        ) -> crate::tablet::SearchCompactionRequirement {
+            crate::tablet::SearchCompactionRequirement::GenerationReplacement {
+                definition_ids: vec![9].into_boxed_slice(),
+            }
         }
     }
 
@@ -266,7 +307,8 @@ mod tests {
             output_rowset_id: 10,
             score: 1.0,
             reason: CompactionReason::CumulativePolicy,
-            pk_delta_guard: None,
+            goal: crate::compaction::plan::types::CompactionGoal::ReduceDebt,
+            primary_index_publish: None,
         }
     }
 
@@ -293,5 +335,32 @@ mod tests {
 
         assert_eq!(calls.load(AtomicOrdering::SeqCst), 1);
         assert_eq!(task.state(), CompactionTaskState::Success);
+    }
+
+    #[test]
+    fn compaction_does_not_publish_without_required_generation_replacement() {
+        let dir = tempfile::tempdir().unwrap();
+        let tablet = Tablet::new(8, 101, 0, test_schema(), dir.path(), None).unwrap();
+        tablet.init().unwrap();
+        let tablet = Arc::new(tablet);
+        let observer: Arc<dyn RowsetPublishObserver> =
+            Arc::new(GenerationReplacementSearchObserver);
+        tablet.bind_rowset_publish_observer(Arc::downgrade(&observer));
+        let lifecycle = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let observed = Arc::clone(&lifecycle);
+        let mut task = HorizontalCompactionTask::new_with_job_id(
+            Arc::clone(&tablet),
+            empty_plan(tablet.tablet_id()),
+            Arc::new(default_allocator()),
+            CompactionJobId(100),
+        )
+        .with_lifecycle_notifier(Arc::new(move |state| {
+            observed.lock().unwrap().push(state);
+        }));
+
+        task.run().unwrap();
+
+        assert_eq!(task.state(), CompactionTaskState::Success);
+        assert!(lifecycle.lock().unwrap().is_empty());
     }
 }

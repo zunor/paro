@@ -3,8 +3,6 @@
 
 use std::collections::BTreeSet;
 
-use serde_json::Value;
-
 use super::super::capability::{SearchArtifactRef, SearchIndexDefinition, SearchIndexKind};
 use super::super::inline_sink::{
     FullTextStatsDelta, HnswStatsDelta, SearchStatsDelta, SparseStatsDelta,
@@ -17,19 +15,22 @@ use super::super::stats::{
 pub(crate) fn generation_stats_from_artifacts(
     definition: &SearchIndexDefinition,
     artifacts: &[SearchArtifactRef],
-) -> GenerationStats {
-    let mut stats = empty_generation_stats_for_definition(definition);
+) -> paro_common::error::Result<GenerationStats> {
+    let mut stats = empty_generation_stats_for_definition(definition)?;
     let mut indexed_segments = BTreeSet::new();
     for artifact in artifacts {
-        if indexed_segments.insert((artifact.segment.rowset_id, artifact.segment.segment_id)) {
-            stats.indexed_rows = stats.indexed_rows.saturating_add(artifact.stats.row_count);
+        artifact.validate()?;
+        for span in artifact.coverage.segments() {
+            if indexed_segments.insert(span.segment) {
+                stats.indexed_rows = stats.indexed_rows.saturating_add(span.row_count);
+            }
         }
         stats.artifact_count = stats.artifact_count.saturating_add(1);
         if let Some(provider_stats) = artifact.stats.provider_stats.as_ref().cloned() {
             merge_provider_stats_into_generation(&mut stats, std::iter::once(provider_stats));
         }
     }
-    stats
+    Ok(stats)
 }
 
 pub(crate) fn generation_stats_after_artifact_replacement(
@@ -40,45 +41,39 @@ pub(crate) fn generation_stats_after_artifact_replacement(
     materialized_artifacts: &[SearchArtifactRef],
 ) -> paro_common::error::Result<GenerationStats> {
     let mut next = current.clone();
-    let removed_stats = generation_stats_from_artifacts(definition, removed_artifacts);
+    let removed_stats = generation_stats_from_artifacts(definition, removed_artifacts)?;
     let subtract_outcome = next.try_subtract_assign(&removed_stats)?;
-    let added_stats = generation_stats_from_artifacts(definition, added_artifacts);
+    let added_stats = generation_stats_from_artifacts(definition, added_artifacts)?;
     next.merge_assign(&added_stats);
     if matches!(
         subtract_outcome,
         StatsSubtractOutcome::NeedsShardSummaryRebuild
     ) {
-        return Ok(generation_stats_from_artifacts(
-            definition,
-            materialized_artifacts,
-        ));
+        return generation_stats_from_artifacts(definition, materialized_artifacts);
     }
     Ok(next)
 }
 
 pub(crate) fn empty_generation_stats_for_definition(
     definition: &SearchIndexDefinition,
-) -> GenerationStats {
+) -> paro_common::error::Result<GenerationStats> {
     let provider_stats = match definition.kind {
-        SearchIndexKind::FullText => Some(SearchProviderStats::FullText(
-            FullTextProviderStats::empty_for_config(
-                definition
-                    .provider_config
-                    .get("config")
-                    .and_then(Value::as_str)
-                    .unwrap_or("simple"),
-            ),
-        )),
+        SearchIndexKind::FullText => {
+            let config = definition.fulltext_provider_config()?;
+            Some(SearchProviderStats::FullText(
+                FullTextProviderStats::empty_for_config(&config.config),
+            ))
+        }
         SearchIndexKind::Sparse => {
             Some(SearchProviderStats::Sparse(SparseProviderStats::default()))
         }
         SearchIndexKind::Hnsw => Some(SearchProviderStats::Hnsw(HnswProviderStats::default())),
     };
-    GenerationStats {
+    Ok(GenerationStats {
         indexed_rows: 0,
         artifact_count: 0,
         provider_stats,
-    }
+    })
 }
 
 pub(crate) fn merge_provider_stats_into_generation<I>(

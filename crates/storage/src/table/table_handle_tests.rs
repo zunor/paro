@@ -12,7 +12,7 @@ use crate::index::fulltext::query_parser::ParsedQuery;
 use crate::index::fulltext::scoring::FullTextScoreMode;
 use crate::index::fulltext::text_index::{FullTextIndex, FullTextIndexConfig};
 use crate::index::fulltext::tokenizer::TokenizerKind;
-use crate::index::hnsw::SearchParams;
+use crate::index::hnsw::{DistanceMetric, SearchParams};
 use crate::index::{BoundIndex, Predicate, PredicateResult, PredicateTree};
 use crate::meta::{FileMetadataStore, GlobalSchemaMap, MetadataStore, TabletMetaManager};
 use crate::metrics::storage_metrics;
@@ -21,7 +21,7 @@ use crate::search::providers::fulltext::search::FullTextTopKProvider;
 use crate::search::{
     ArtifactLocation, CoverageState, OpenedSearchCursor, ResourceBudget, SearchBatchConfig,
     SearchBatchState, SearchCapabilityState, SearchFreshnessPolicy, SearchIndexDefinition,
-    SearchIndexKind, SearchMaintenanceAction, SearchNotQueryableReason, SearchProviderStats,
+    SearchIndexKind, SearchMaintenanceAction, SearchProviderStats,
 };
 use crate::statistics::IndexType;
 use crate::table::storage_descriptor::TableStorageDescriptor;
@@ -30,10 +30,12 @@ use crate::tablet::tablet_reader::TabletReaderParams;
 use crate::tablet::{KeysType, TabletColumn, TabletSchema};
 use crate::test_utils::*;
 use crate::transaction::txn::Transaction;
+use paro_common::allocator::default_allocator;
 use paro_common::chunk::Chunk;
 use paro_common::runtime_value::Value;
 use paro_common::types::LogicalType;
 use paro_common::vector::Vector;
+use paro_scheduler::scheduler::TaskScheduler;
 use paro_transaction::{
     CommandId, CommitTs, IsolationLevel, ParticipantStateSet, ReadSnapshot, ReadTs,
     RetentionLeaseKind, TransactionView,
@@ -151,7 +153,7 @@ fn register_fulltext_definition_with_freshness(
     freshness_policy: SearchFreshnessPolicy,
 ) -> u64 {
     let definition_id = NEXT_TEST_SEARCH_DEFINITION_ID.fetch_add(1, AtomicOrdering::Relaxed);
-    let provider_config = json!({ "config": config });
+    let provider_config = json!({"version": 1, "config": config });
     let expression = format!("to_tsvector('{}', col_{})", config, column_id);
     let definition = SearchIndexDefinition {
         definition_id,
@@ -178,7 +180,7 @@ fn register_fulltext_definition_with_freshness(
 fn register_sparse_definition(table: &TableHandle, column_id: u32) -> u64 {
     let definition_id = NEXT_TEST_SEARCH_DEFINITION_ID.fetch_add(1, AtomicOrdering::Relaxed);
     let expression = format!("sparse_vector(col_{})", column_id);
-    let provider_config = json!({ "physical_encoding": "binary-v1" });
+    let provider_config = json!({"version": 1, "physical_encoding": "binary-v1" });
     let definition = SearchIndexDefinition {
         definition_id,
         table_id: table.tablet().table_id(),
@@ -342,13 +344,11 @@ fn drain_search_cursor(
         row_limit: row_limit.max(1),
         preferred_bytes: 1 << 20,
     };
-    let mut budget = ResourceBudget {
-        memory_limit_bytes: 64 * 1024 * 1024,
-        heap_budget_items: row_limit.max(1024),
-        parallelism_slots: parallelism_slots.max(1),
-        cpu_step_budget: None,
-        context: None,
-    };
+    let mut budget = ResourceBudget::standalone(
+        64 * 1024 * 1024,
+        row_limit.max(1024),
+        parallelism_slots.max(1),
+    );
 
     loop {
         match cursor.next_batch(&batch_config, &mut budget)? {
@@ -358,6 +358,7 @@ fn drain_search_cursor(
                 batch,
                 projected_columns,
                 emit_score,
+                Arc::new(default_allocator()),
             )?),
             SearchBatchState::Exhausted => return Ok(chunks),
         }
@@ -377,10 +378,12 @@ fn run_vector_cursor_with_slots(
     let opened = table.open_vector_search_cursor(
         column_id,
         query,
+        DistanceMetric::Euclidean,
         k,
         params,
         predicate.cloned(),
         table.max_version(),
+        &crate::search::SearchReadOptions::ungoverned(),
     )?;
     drain_search_cursor(
         table,
@@ -410,8 +413,14 @@ fn sparse_search(
     k: usize,
     projected_columns: &[usize],
 ) -> paro_common::error::Result<Vec<Chunk>> {
-    let opened =
-        table.open_sparse_vector_search_cursor(column_id, query, k, None, table.max_version())?;
+    let opened = table.open_sparse_vector_search_cursor(
+        column_id,
+        query,
+        k,
+        None,
+        table.max_version(),
+        &crate::search::SearchReadOptions::ungoverned(),
+    )?;
     drain_search_cursor(table, opened, projected_columns, false, k.clamp(1, 1024), 4)
 }
 
@@ -507,6 +516,7 @@ impl SearchCursorTestExt for TableHandle {
             &config,
             predicate.cloned(),
             self.max_version(),
+            &crate::search::SearchReadOptions::ungoverned(),
         )?;
         drain_search_cursor(self, opened, projected_columns, false, 1024, 4)
     }
@@ -516,6 +526,24 @@ fn chunk_with_i32_range(start: i32, end: i32, offset: i32) -> Chunk {
     let ids: Vec<i32> = (start..end).collect();
     let values: Vec<i32> = ids.iter().map(|id| *id + offset).collect();
     test_chunk_from_vectors(vec![test_i32_vector(&ids), test_i32_vector(&values)])
+}
+
+#[test]
+fn compaction_does_not_rewrite_a_single_fresh_rowset() {
+    let table = create_table(&[LogicalType::Integer]);
+    table
+        .append(&test_chunk_from_vectors(vec![test_i32_vector(
+            &(0..4_096).collect::<Vec<_>>(),
+        )]))
+        .unwrap();
+
+    assert_eq!(table.tablet().num_rowsets(), 1);
+    assert!(
+        CompactionPlanner::plan(table.tablet().as_ref())
+            .unwrap()
+            .is_none(),
+        "one fresh rowset is already a canonical publish unit"
+    );
 }
 
 fn build_duplicate_key_compaction_output(
@@ -1256,6 +1284,10 @@ fn partial_update_restart_with_meta_manager_rebuilds_primary_key_row_visibility(
         .unwrap();
     assert_eq!(updated, 1);
 
+    // The metadata manager represents a checkpoint image. Direct test writes
+    // bypass the database journal, so publish the checkpoint explicitly before
+    // exercising provenance-gated primary-index recovery.
+    table.tablet().persist_meta_snapshot().unwrap();
     let descriptor = table.to_descriptor().unwrap();
     let restored =
         open_table_from_descriptor_with_meta_manager(table.types(), &descriptor, Some(manager));
@@ -1398,8 +1430,14 @@ fn hnsw_capability_exposes_generation_level_provider_stats() {
             2,
         ))
         .unwrap();
+    table.bind_search_task_scheduler(Some(Arc::new(TaskScheduler::new())));
+    table
+        .bootstrap_search_generations()
+        .expect("materialize deferred HNSW generation");
 
-    let capability = table.vector_capability(1).expect("hnsw capability");
+    let capability = table
+        .vector_capability(1, DistanceMetric::Euclidean)
+        .expect("hnsw capability");
     let SearchProviderStats::Hnsw(provider_stats) = capability
         .generation_stats
         .provider_stats
@@ -1657,7 +1695,16 @@ fn vector_search_for_view_filters_overlay_deleted_rows() {
     let view = transaction_view_for_command(&txn, 1);
 
     let opened = table
-        .open_vector_search_cursor_for_view(1, &[10.0, 0.0], 3, params, None, &view)
+        .open_vector_search_cursor_for_view(
+            1,
+            &[10.0, 0.0],
+            DistanceMetric::Euclidean,
+            3,
+            params,
+            None,
+            &view,
+            &crate::search::SearchReadOptions::ungoverned(),
+        )
         .expect("open vector search cursor for txn view");
     let chunks = drain_search_cursor(&table, opened, &[0], false, 3, 1)
         .expect("drain txn view search cursor");
@@ -1714,7 +1761,7 @@ fn vector_search_keeps_delete_vector_touches_bounded_per_segment() {
 }
 
 #[test]
-fn vector_column_from_specs_builds_hnsw_index() {
+fn vector_column_from_specs_requires_an_explicit_search_definition() {
     let specs = vec![
         TableColumnSpec {
             name: "id".to_string(),
@@ -1731,10 +1778,7 @@ fn vector_column_from_specs_builds_hnsw_index() {
     ];
     let table = create_table_from_specs(&specs);
     let schema = table.tablet().schema().unwrap();
-    assert!(
-        schema.column_by_id(1).unwrap().index_hnsw,
-        "vector column should enable hnsw in schema"
-    );
+    assert!(!schema.column_by_id(1).unwrap().index_hnsw);
     let chunk = chunk_with_embeddings(
         &[1, 2, 3],
         &[vec![1.0_f32, 0.0], vec![2.0_f32, 0.0], vec![3.0_f32, 0.0]],
@@ -1746,16 +1790,12 @@ fn vector_column_from_specs_builds_hnsw_index() {
     let rowsets = table.tablet().capture_consistent_rowsets(visible).unwrap();
     assert!(!rowsets.is_empty(), "expected at least one rowset");
 
-    let mut has_hnsw = false;
     for rowset in rowsets {
         rowset.load().unwrap();
         for segment in rowset.segments() {
-            if segment.hnsw_index(1).is_some() {
-                has_hnsw = true;
-            }
+            assert!(segment.hnsw_index(1).is_none());
         }
     }
-    assert!(has_hnsw, "expected auto-built HNSW index on vector column");
 }
 
 #[test]
@@ -2115,7 +2155,7 @@ fn art_index_build_and_remove_tracks_visible_segments() {
         .iter()
         .all(|(_, segment)| segment.art_index(0).is_none()));
 
-    table.declare_art_index(0);
+    table.declare_art_index("test_idx", 0);
     assert_eq!(table.declared_art_columns(), vec![0]);
     assert_eq!(table.tablet().declared_art_columns(), vec![0]);
     table.rebuild_art_index(0).unwrap();
@@ -2124,9 +2164,11 @@ fn art_index_build_and_remove_tracks_visible_segments() {
     assert!(after_build
         .iter()
         .all(|(_, segment)| segment.art_index(0).is_some()));
+    assert!(after_build
+        .iter()
+        .all(|(_, segment)| segment.bitmap_index(0).is_none()));
 
-    table.drop_art_index(0).unwrap();
-    table.forget_art_index(0);
+    table.release_art_index("test_idx", 0).unwrap();
     assert!(table.declared_art_columns().is_empty());
     assert!(table.tablet().declared_art_columns().is_empty());
 
@@ -2134,12 +2176,80 @@ fn art_index_build_and_remove_tracks_visible_segments() {
     assert!(after_remove
         .iter()
         .all(|(_, segment)| segment.art_index(0).is_none()));
+    assert!(after_remove
+        .iter()
+        .all(|(_, segment)| segment.bitmap_index(0).is_none()));
+}
+
+#[test]
+fn declared_scalar_index_selects_one_dense_posting_representation() {
+    let table = create_table(&[LogicalType::Integer]);
+    let values = (0..128).map(|value| value % 2).collect::<Vec<i32>>();
+    table
+        .append(&test_chunk_from_vectors(vec![test_i32_vector(&values)]))
+        .unwrap();
+
+    table.install_art_index("dense_idx", 0).unwrap();
+    let segments = table.collect_segments(table.max_version()).unwrap();
+    assert!(segments
+        .iter()
+        .all(|(_, segment)| segment.art_index(0).is_none()));
+    assert!(segments
+        .iter()
+        .all(|(_, segment)| segment.bitmap_index(0).is_some()));
+
+    for (_, segment) in segments {
+        let result = segment
+            .bitmap_index(0)
+            .unwrap()
+            .evaluate_predicate(&Predicate::Eq {
+                column_id: 0,
+                value: Value::Integer(1),
+            });
+        let PredicateResult::Bitmap(rows) = result else {
+            panic!("dense scalar access path must return an exact posting bitmap");
+        };
+        assert_eq!(rows.len(), segment.num_rows() / 2);
+    }
+}
+
+#[test]
+fn duplicate_art_declarations_release_only_the_last_physical_owner() {
+    let table = create_table(&[LogicalType::Integer]);
+    table
+        .append(&test_chunk_from_vectors(vec![test_i32_vector(&[
+            1, 2, 3, 4,
+        ])]))
+        .unwrap();
+
+    table.install_art_index("idx_a", 0).unwrap();
+    table.install_art_index("idx_a", 0).unwrap();
+    table.install_art_index("idx_b", 0).unwrap();
+    table.release_art_index("idx_a", 0).unwrap();
+
+    assert!(table.has_declared_art_index(0));
+    assert!(table
+        .collect_segments(table.max_version())
+        .unwrap()
+        .iter()
+        .all(|(_, segment)| segment.art_index(0).is_some()));
+
+    // A retry for the same owner is idempotent and cannot consume idx_b.
+    table.release_art_index("idx_a", 0).unwrap();
+    assert!(table.has_declared_art_index(0));
+    table.release_art_index("idx_b", 0).unwrap();
+    assert!(!table.has_declared_art_index(0));
+    assert!(table
+        .collect_segments(table.max_version())
+        .unwrap()
+        .iter()
+        .all(|(_, segment)| segment.art_index(0).is_none()));
 }
 
 #[test]
 fn art_declared_index_auto_builds_for_inserts() {
     let table = create_table(&[LogicalType::Integer, LogicalType::Integer]);
-    table.declare_art_index(0);
+    table.declare_art_index("test_idx", 0);
 
     table.append(&chunk_with_i32_range(0, 4, 100)).unwrap();
     table.append(&chunk_with_i32_range(10, 14, 100)).unwrap();
@@ -2202,7 +2312,7 @@ fn runtime_art_predicate_returns_all_duplicate_matches() {
         LogicalType::Integer,
         LogicalType::Integer,
     ]);
-    table.declare_art_index(1);
+    table.declare_art_index("test_idx", 1);
 
     let chunk = test_chunk_from_vectors(vec![
         test_i32_vector(&[1, 2, 3, 4]),
@@ -2265,7 +2375,7 @@ fn runtime_art_predicate_returns_all_duplicate_matches() {
 #[test]
 fn art_declared_index_auto_builds_on_transaction_commit() {
     let table = create_table(&[LogicalType::Integer, LogicalType::Integer]);
-    table.declare_art_index(0);
+    table.declare_art_index("test_idx", 0);
 
     let txn = Arc::new(Transaction::new(9101, 9101));
     table
@@ -2337,7 +2447,7 @@ fn art_declared_index_auto_builds_on_transaction_commit() {
 #[test]
 fn art_backfill_failure_does_not_block_insert_or_scan_fallback() {
     let table = create_table(&[LogicalType::Integer, LogicalType::Integer]);
-    table.declare_art_index(99);
+    table.declare_art_index("test_idx", 99);
 
     table.append(&chunk_with_i32_range(0, 4, 100)).unwrap();
 
@@ -2457,7 +2567,11 @@ fn search_snapshot_pins_derived_delta_when_generation_lags_read_ts() {
     assert_eq!(capability.definition_id, definition_id);
 
     let snapshot = table
-        .open_search_snapshot(&capability, target_version)
+        .open_search_snapshot(
+            &capability,
+            target_version,
+            &crate::search::SearchReadOptions::ungoverned(),
+        )
         .expect("open lagging search snapshot");
     let lease_info = snapshot
         .derived_lag_lease_info()
@@ -2500,7 +2614,7 @@ fn fulltext_capability_exposes_generation_level_provider_stats() {
 }
 
 #[test]
-fn search_maintenance_sweep_reports_tombstone_pressure() {
+fn search_maintenance_pass_reports_tombstone_pressure() {
     let table = create_table(&[LogicalType::Integer, LogicalType::Varchar]);
     register_fulltext_definition(&table, 1, "simple");
 
@@ -2519,7 +2633,7 @@ fn search_maintenance_sweep_reports_tombstone_pressure() {
         .delete_direct(&read_view(&table), &[row_ids[&2]])
         .unwrap();
 
-    let report = table.search_maintenance_sweep().unwrap();
+    let report = table.run_search_maintenance_pass().unwrap();
     assert!(report.compaction_requested);
     assert!(report.definitions.iter().any(|definition| {
         matches!(definition.action, SearchMaintenanceAction::Rebuild)
@@ -2729,7 +2843,10 @@ fn sparse_registry_definition_auto_builds_for_inserts() {
 fn sparse_registry_rejects_varchar_sparse_input() {
     let table = create_table(&[LogicalType::Varchar]);
     let definition_id = NEXT_TEST_SEARCH_DEFINITION_ID.fetch_add(1, AtomicOrdering::Relaxed);
-    let provider_config = json!({});
+    let provider_config = json!({
+        "version": 1,
+        "physical_encoding": "binary-v1",
+    });
     let expression = "sparse_vector(col_0)".to_string();
     let definition = SearchIndexDefinition {
         definition_id,
@@ -3019,7 +3136,7 @@ fn fulltext_late_definition_exact_tail_merge_resolves_partial_rows() {
 }
 
 #[test]
-fn fulltext_tail_over_budget_rejects_before_provider_open() {
+fn fulltext_tail_watermark_does_not_disable_exact_fallback() {
     let table = create_table(&[LogicalType::Integer, LogicalType::Varchar]);
     table
         .append(&test_chunk_from_vectors(vec![
@@ -3043,13 +3160,11 @@ fn fulltext_tail_over_budget_rejects_before_provider_open() {
         .expect("fulltext capability");
     assert_eq!(
         capability.capability_state(),
-        SearchCapabilityState::NotQueryable {
-            reason: SearchNotQueryableReason::TailOverBudget,
-        }
+        SearchCapabilityState::Queryable
     );
 
     let query = FullTextIndex::new_default().parse_query("vector").unwrap();
-    let err = table
+    table
         .open_fulltext_search_cursor(
             1,
             &query,
@@ -3059,12 +3174,9 @@ fn fulltext_tail_over_budget_rejects_before_provider_open() {
             None,
             FullTextScoreMode::Bm25,
             table.max_version(),
+            &crate::search::SearchReadOptions::ungoverned(),
         )
-        .unwrap_err();
-    assert!(
-        err.to_string().contains("not queryable"),
-        "tail over budget should reject before provider open, got {err}"
-    );
+        .expect("exact tail fallback remains executable beyond its maintenance watermark");
 }
 
 #[test]
@@ -3128,6 +3240,7 @@ fn fulltext_topk_mixed_artifact_tail_uses_unified_generation_stats() {
             None,
             FullTextScoreMode::Bm25,
             table.max_version(),
+            &crate::search::SearchReadOptions::ungoverned(),
         )
         .unwrap();
     let chunks = drain_search_cursor(&table, opened, &[0], true, 2, 4).unwrap();
@@ -3159,7 +3272,11 @@ fn fulltext_topk_missing_generation_stats_records_degraded_metric() {
         .fulltext_capability(1, "simple")
         .expect("fulltext capability");
     let snapshot = table
-        .open_search_snapshot(&capability, table.max_version())
+        .open_search_snapshot(
+            &capability,
+            table.max_version(),
+            &crate::search::SearchReadOptions::ungoverned(),
+        )
         .expect("search snapshot");
     let table_id = table.table_id();
     let reason = "missing_generation_stats";
@@ -3296,7 +3413,7 @@ fn fulltext_update_delete_respect_delete_bitmap() {
 #[test]
 fn art_compaction_rebuild_preserves_predicate_results() {
     let table = create_table(&[LogicalType::Integer, LogicalType::Integer]);
-    table.declare_art_index(0);
+    table.declare_art_index("test_idx", 0);
 
     table.append(&chunk_with_i32_range(1, 3, 100)).unwrap();
     table.append(&chunk_with_i32_range(3, 6, 100)).unwrap();
@@ -3316,6 +3433,7 @@ fn art_compaction_rebuild_preserves_predicate_results() {
         table.tablet().as_ref(),
         output_rowset.clone(),
         &artifact.plan,
+        &crate::search::SearchInlineBuilderSet::default(),
     )
     .unwrap();
 

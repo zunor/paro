@@ -4,30 +4,31 @@
 use super::segment::{Segment, SegmentMeta, SegmentOptions};
 use super::segment_format::{ColumnMeta, SegmentFooter};
 use super::segment_indexes::{
-    SegmentIndexStats, SegmentIndexes, SegmentPredicateIndexes, SegmentSearchIndexes,
+    DeferredHnswIndex, DeferredHnswState, SegmentIndexStats, SegmentIndexes,
+    SegmentPredicateIndexes, SegmentSearchIndexes,
 };
 use crate::index::fulltext::text_index::FullTextIndex;
-use crate::index::hnsw::HnswIndex;
-use crate::index::sparse::SparseVectorIndex;
-use crate::index::{
-    BitmapIndex, BloomFilterIndex, IndexConstraintType, MmapVectorStorage, PageRange,
+use crate::index::hnsw::{
+    hnsw_artifact_compatibility, HnswArtifactCompatibility, HnswIndex, HNSW_ARTIFACT_ALIGNMENT,
 };
+use crate::index::sparse::SparseVectorIndex;
+use crate::index::{BitmapIndex, BloomFilterIndex, IndexConstraintType, PageRange};
 use crate::metrics::storage_metrics;
 use crate::rowset::column::OrdinalIndexReader;
-use crate::rowset::encoding::PLAIN_PAGE_HEADER_SIZE;
-use crate::rowset::page::{CompressionType, PagePointer, PageReadOptions};
+use crate::rowset::page::{CompressionType, PageFooter, PageIO, PagePointer, PageReadOptions};
 use crate::rowset::page_reader::{PageReader, PageReaderContext, PageReaderOptions};
 use crate::rowset::segment_statistics::SegmentStatistics;
 use crate::statistics::{
     split_stats_trailer, FullTextIndexStatistics, HnswIndexStatistics, SparseIndexStatistics,
 };
 use crate::tablet::{ColumnId, TabletSchemaRef};
+use memmap2::MmapOptions;
 use paro_common::error::{self as paro_error, Result};
 use paro_common::types::LogicalType;
 use std::collections::HashMap;
 use std::fs::File;
 use std::io::{Read, Seek, SeekFrom};
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::sync::{Arc, Mutex, RwLock};
 
 impl Segment {
@@ -103,18 +104,20 @@ impl Segment {
             &schema,
             &options,
         )?;
-        let (hnsw_indexes, hnsw_stats) = Self::load_hnsw_indexes(
-            &mut file,
-            &page_reader,
-            &file_path,
-            &footer,
-            &schema,
-            &options,
-        )?;
+        let hnsw_indexes = Self::collect_hnsw_indexes(&footer, &schema)?;
         let (sparse_indexes, sparse_stats) =
             Self::load_sparse_indexes(&mut file, &page_reader, &footer, &options)?;
         let (fulltext_indexes, fulltext_stats) =
             Self::load_fulltext_indexes(&mut file, &page_reader, &footer, &options)?;
+        let hnsw_stats = footer
+            .column_metas
+            .iter()
+            .filter_map(|meta| {
+                meta.hnsw_index_statistics
+                    .clone()
+                    .map(|statistics| (meta.column_id, statistics))
+            })
+            .collect();
         let statistics =
             SegmentStatistics::from_column_metas(&footer.column_metas, footer.num_rows);
 
@@ -129,13 +132,14 @@ impl Segment {
             meta,
             statistics,
             column_readers: RwLock::new(HashMap::new()),
-            shared_file: Mutex::new(Some(Arc::new(file))),
-            short_key_index_decoder: RwLock::new(None),
-            indexes: SegmentIndexes {
+            plain_vector_storages: Arc::new(RwLock::new(HashMap::new())),
+            shared_file: Arc::new(Mutex::new(Some(Arc::new(file)))),
+            short_key_index_decoder: Arc::new(RwLock::new(None)),
+            indexes: Arc::new(SegmentIndexes {
                 predicate: SegmentPredicateIndexes {
                     bloom_filters,
                     bitmap_indexes,
-                    runtime_art_indexes: RwLock::new(HashMap::new()),
+                    runtime_scalar_indexes: RwLock::new(HashMap::new()),
                 },
                 search: SegmentSearchIndexes {
                     hnsw_indexes,
@@ -143,16 +147,16 @@ impl Segment {
                     fulltext_indexes,
                     runtime_fulltext_indexes: RwLock::new(HashMap::new()),
                 },
-            },
-            index_stats: SegmentIndexStats {
+            }),
+            index_stats: Arc::new(SegmentIndexStats {
                 hnsw_stats,
                 sparse_stats,
                 fulltext_stats,
                 runtime_fulltext_stats: RwLock::new(HashMap::new()),
-            },
+            }),
             options,
             page_reader,
-            delete_vector_cache: arc_swap::ArcSwapOption::empty(),
+            delete_vector_cache: Arc::new(arc_swap::ArcSwapOption::empty()),
             #[cfg(test)]
             delete_vector_load_requests: std::sync::atomic::AtomicU64::new(0),
         })
@@ -197,13 +201,14 @@ impl Segment {
             footer,
             meta,
             column_readers: RwLock::new(HashMap::new()),
-            shared_file: Mutex::new(None),
-            short_key_index_decoder: RwLock::new(None),
-            indexes: SegmentIndexes::default(),
-            index_stats: SegmentIndexStats::default(),
+            plain_vector_storages: Arc::new(RwLock::new(HashMap::new())),
+            shared_file: Arc::new(Mutex::new(None)),
+            short_key_index_decoder: Arc::new(RwLock::new(None)),
+            indexes: Arc::new(SegmentIndexes::default()),
+            index_stats: Arc::new(SegmentIndexStats::default()),
             options,
             page_reader,
-            delete_vector_cache: arc_swap::ArcSwapOption::empty(),
+            delete_vector_cache: Arc::new(arc_swap::ArcSwapOption::empty()),
             #[cfg(test)]
             delete_vector_load_requests: std::sync::atomic::AtomicU64::new(0),
         }
@@ -385,51 +390,29 @@ impl Segment {
                 vec![column.logical_type.clone()],
                 body,
             )?;
+            if index.indexed_row_count() != footer.num_rows {
+                return Err(paro_error::data_corrupted(format!(
+                    "bitmap index row coverage mismatch for segment {segment_id} column {}: index={} segment={}",
+                    meta.column_id,
+                    index.indexed_row_count(),
+                    footer.num_rows
+                )));
+            }
             indexes.insert(meta.column_id, std::sync::Arc::new(index));
         }
         Ok(indexes)
     }
 
-    fn load_hnsw_indexes<R: Read + Seek>(
-        reader: &mut R,
-        page_reader: &PageReader,
-        file_path: &Path,
+    fn collect_hnsw_indexes(
         footer: &SegmentFooter,
         schema: &TabletSchemaRef,
-        options: &SegmentOptions,
-    ) -> Result<(
-        HashMap<ColumnId, std::sync::Arc<HnswIndex>>,
-        HashMap<ColumnId, HnswIndexStatistics>,
-    )> {
+    ) -> Result<HashMap<ColumnId, Arc<DeferredHnswIndex>>> {
         let mut indexes = HashMap::new();
-        let mut stats_map = HashMap::new();
-        let hnsw_metas: Vec<&ColumnMeta> = footer
+        for meta in footer
             .column_metas
             .iter()
             .filter(|meta| meta.hnsw_index_pointer.is_some())
-            .collect();
-        if hnsw_metas.is_empty() {
-            return Ok((indexes, stats_map));
-        }
-
-        let hnsw_pages: Vec<(PagePointer, CompressionType)> = hnsw_metas
-            .iter()
-            .map(|meta| {
-                (
-                    meta.hnsw_index_pointer
-                        .expect("hnsw pointer checked by filter"),
-                    meta.compression,
-                )
-            })
-            .collect();
-        let hnsw_bodies = Self::load_index_page_bodies_parallel(
-            reader,
-            page_reader,
-            &hnsw_pages,
-            options.verify_checksum,
-        )?;
-
-        for (meta, body) in hnsw_metas.into_iter().zip(hnsw_bodies.into_iter()) {
+        {
             let col = schema.column_by_id(meta.column_id).ok_or_else(|| {
                 paro_error::column_not_found(format!(
                     "Column {} not found in schema",
@@ -437,34 +420,114 @@ impl Segment {
                 ))
             })?;
 
-            let dim = if let LogicalType::Array(_, d) = col.logical_type {
-                d
-            } else {
+            if !matches!(col.logical_type, LogicalType::Array(_, _)) {
                 return Err(paro_error::data_corrupted(format!(
                     "HNSW index on non-vector column {} with type {:?}",
                     meta.column_id, col.logical_type
                 )));
-            };
+            }
 
-            let vector_storage = std::sync::Arc::new(MmapVectorStorage::open_range(
-                file_path,
-                meta.data_page_pointer.offset + PLAIN_PAGE_HEADER_SIZE as u64,
-                meta.num_rows * dim as u64 * 4,
-                dim,
-            )?);
-
-            let (stats_bytes, _) = split_stats_trailer(body.as_ref());
-            let index = HnswIndex::deserialize(body.as_ref(), vector_storage)?;
-            let stats = if let Some(bytes) = stats_bytes {
-                HnswIndexStatistics::from_bytes(bytes)
-                    .unwrap_or_else(|_| HnswIndexStatistics::collect(&index))
-            } else {
-                HnswIndexStatistics::collect(&index)
-            };
-            stats_map.insert(meta.column_id, stats);
-            indexes.insert(meta.column_id, std::sync::Arc::new(index));
+            indexes.insert(
+                meta.column_id,
+                Arc::new(DeferredHnswIndex {
+                    page_pointer: meta
+                        .hnsw_index_pointer
+                        .expect("HNSW pointer checked by filter"),
+                    state: Mutex::new(DeferredHnswState::Unloaded),
+                }),
+            );
         }
-        Ok((indexes, stats_map))
+        Ok(indexes)
+    }
+
+    pub(super) fn materialize_hnsw_index(
+        &self,
+        deferred: &DeferredHnswIndex,
+    ) -> Result<Option<Arc<HnswIndex>>> {
+        let mut state = deferred.state.lock().map_err(|_| {
+            paro_error::internal(format!(
+                "segment {} HNSW lazy state lock is poisoned",
+                self.segment_id
+            ))
+        })?;
+        match &*state {
+            DeferredHnswState::Ready { index, .. } => return Ok(Some(Arc::clone(index))),
+            DeferredHnswState::Unsupported { .. } => return Ok(None),
+            DeferredHnswState::Failed(error) => return Err(error.clone()),
+            DeferredHnswState::Unloaded => {}
+        }
+
+        let mut load = || -> Result<Option<(Arc<HnswIndex>, HnswIndexStatistics)>> {
+            let file = File::open(&self.file_path).map_err(paro_error::io)?;
+            // SAFETY: the segment file is immutable after publication and the
+            // mapping is retained by every view derived from the HNSW index.
+            let mmap = Arc::new(unsafe { MmapOptions::new().map(&file).map_err(paro_error::io)? });
+            let page_start = usize::try_from(deferred.page_pointer.offset)
+                .map_err(|_| paro_error::data_corrupted("inline HNSW page offset exceeds usize"))?;
+            if page_start % HNSW_ARTIFACT_ALIGNMENT != 0 {
+                return Err(paro_error::data_corrupted(format!(
+                    "inline HNSW page offset {page_start} is not aligned to {HNSW_ARTIFACT_ALIGNMENT} bytes"
+                )));
+            }
+            let page_end = page_start
+                .checked_add(deferred.page_pointer.size as usize)
+                .ok_or_else(|| paro_error::data_corrupted("inline HNSW page range overflow"))?;
+            let page = mmap.get(page_start..page_end).ok_or_else(|| {
+                paro_error::data_corrupted("inline HNSW page exceeds segment file")
+            })?;
+            // HNSW v10 authenticates its fixed header and compact checksum
+            // directory at open, then authenticates checksum pages and graph
+            // chunks immediately before use.
+            // Re-running the generic whole-page CRC here would fault every
+            // page of a multi-gigabyte random-access artifact and defeat mmap.
+            let (footer, uncompressed_size, artifact_len) = PageIO::parse_page_footer(page, false)?;
+            if !matches!(footer, PageFooter::Index(_)) {
+                return Err(paro_error::data_corrupted(
+                    "inline HNSW artifact is not stored in an index page",
+                ));
+            }
+            if artifact_len != uncompressed_size as usize {
+                return Err(paro_error::artifact_not_ready(
+                    "compressed inline HNSW artifacts are unsupported; rebuild the vector index",
+                ));
+            }
+            let artifact = &mmap[page_start..page_start + artifact_len];
+            match hnsw_artifact_compatibility(artifact)? {
+                HnswArtifactCompatibility::Current => {}
+                compatibility => {
+                    *state = DeferredHnswState::Unsupported {
+                        reason: compatibility
+                            .rebuild_reason()
+                            .expect("non-current compatibility has a reason"),
+                    };
+                    return Ok(None);
+                }
+            }
+            let index = Arc::new(HnswIndex::deserialize_mmap_range(
+                mmap,
+                page_start,
+                artifact_len,
+            )?);
+            let statistics = index.persisted_statistics().cloned().ok_or_else(|| {
+                paro_error::data_corrupted("HNSW artifact is missing persisted statistics")
+            })?;
+            Ok(Some((index, statistics)))
+        };
+
+        match load() {
+            Ok(Some((index, statistics))) => {
+                *state = DeferredHnswState::Ready {
+                    index: Arc::clone(&index),
+                    statistics,
+                };
+                Ok(Some(index))
+            }
+            Ok(None) => Ok(None),
+            Err(error) => {
+                *state = DeferredHnswState::Failed(error.clone());
+                Err(error)
+            }
+        }
     }
 
     fn load_sparse_indexes<R: Read + Seek>(

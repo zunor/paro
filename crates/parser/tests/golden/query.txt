@@ -1,27 +1,28 @@
 ---------- Input ----------
-select ?
+select $1
 ---------- Output ---------
-SELECT ?
+SELECT $1
 ---------- AST ------------
 Query {
     span: Some(
-        0..8,
+        0..9,
     ),
     with: None,
     body: Select(
         SelectStmt {
             span: Some(
-                0..8,
+                0..9,
             ),
             hints: None,
             distinct: false,
             top_n: None,
             select_list: [
                 AliasedExpr {
-                    expr: Placeholder {
+                    expr: Parameter {
                         span: Some(
-                            7..8,
+                            7..9,
                         ),
+                        index: 0,
                     },
                     alias: None,
                 },

@@ -11,6 +11,23 @@ use std::mem::size_of;
 use crate::error::{self as paro_error};
 use crate::types::{ArrayType, LogicalType};
 
+/// Position of an integral runtime value relative to one integral SQL type's
+/// representable domain. Predicate binders use this to fold out-of-domain
+/// comparisons without performing a lossy cast or turning a valid comparison
+/// into an execution error.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum IntegralDomainPosition {
+    Below,
+    Within,
+    Above,
+}
+
+#[derive(Debug, Clone, Copy)]
+enum IntegralRepr {
+    Signed(i128),
+    Unsigned(u128),
+}
+
 /// A single value of a specific logical type.
 ///
 /// Nested types (List, Array, Struct) store their children in a `Vec<Value>`.
@@ -378,6 +395,65 @@ impl Value {
             return Ok(self.clone());
         }
 
+        // Prepared-protocol integer parameters may arrive as INT2, INT4, or
+        // INT8 according to the client's smallest lossless wire type. Keep
+        // scalar Value casts aligned with the vector cast registry so a
+        // parameter can be bound once into an indexed predicate without
+        // allocating a one-row vector merely to widen an integer.
+        if let Some(value) = self.as_integral_i128() {
+            let out_of_range =
+                || paro_error::out_of_range(format!("cannot cast {self} to {target_type}"));
+            match target_type {
+                LogicalType::TinyInt => {
+                    return i8::try_from(value)
+                        .map(Value::TinyInt)
+                        .map_err(|_| out_of_range());
+                }
+                LogicalType::SmallInt => {
+                    return i16::try_from(value)
+                        .map(Value::SmallInt)
+                        .map_err(|_| out_of_range());
+                }
+                LogicalType::Integer => {
+                    return i32::try_from(value)
+                        .map(Value::Integer)
+                        .map_err(|_| out_of_range());
+                }
+                LogicalType::BigInt => {
+                    return i64::try_from(value)
+                        .map(Value::BigInt)
+                        .map_err(|_| out_of_range());
+                }
+                LogicalType::HugeInt => return Ok(Value::HugeInt(value)),
+                LogicalType::UTinyInt
+                | LogicalType::USmallInt
+                | LogicalType::UInteger
+                | LogicalType::UBigInt
+                | LogicalType::UHugeInt => {
+                    let unsigned = u128::try_from(value).map_err(|_| out_of_range())?;
+                    return match target_type {
+                        LogicalType::UTinyInt => u8::try_from(unsigned)
+                            .map(Value::UTinyInt)
+                            .map_err(|_| out_of_range()),
+                        LogicalType::USmallInt => u16::try_from(unsigned)
+                            .map(Value::USmallInt)
+                            .map_err(|_| out_of_range()),
+                        LogicalType::UInteger => u32::try_from(unsigned)
+                            .map(Value::UInteger)
+                            .map_err(|_| out_of_range()),
+                        LogicalType::UBigInt => u64::try_from(unsigned)
+                            .map(Value::UBigInt)
+                            .map_err(|_| out_of_range()),
+                        LogicalType::UHugeInt => Ok(Value::UHugeInt(unsigned)),
+                        _ => unreachable!("unsigned integral targets are exhaustive"),
+                    };
+                }
+                LogicalType::Float => return Ok(Value::Float(value as f32)),
+                LogicalType::Double => return Ok(Value::Double(value as f64)),
+                _ => {}
+            }
+        }
+
         match (self, target_type) {
             // Numeric casts
             (Value::Integer(v), LogicalType::BigInt) => Ok(Value::BigInt(*v as i64)),
@@ -424,6 +500,79 @@ impl Value {
                 "Cast value {} to {} not implemented",
                 self, target_type
             ))),
+        }
+    }
+
+    /// Classify an integral value against an integral target domain.
+    /// Returns `None` when either side is non-integral.
+    pub fn integral_domain_position(
+        &self,
+        target_type: &LogicalType,
+    ) -> Option<IntegralDomainPosition> {
+        use IntegralDomainPosition::{Above, Below, Within};
+
+        let value = match self {
+            Value::TinyInt(value) => IntegralRepr::Signed(i128::from(*value)),
+            Value::SmallInt(value) => IntegralRepr::Signed(i128::from(*value)),
+            Value::Integer(value) => IntegralRepr::Signed(i128::from(*value)),
+            Value::BigInt(value) => IntegralRepr::Signed(i128::from(*value)),
+            Value::HugeInt(value) => IntegralRepr::Signed(*value),
+            Value::UTinyInt(value) => IntegralRepr::Unsigned(u128::from(*value)),
+            Value::USmallInt(value) => IntegralRepr::Unsigned(u128::from(*value)),
+            Value::UInteger(value) => IntegralRepr::Unsigned(u128::from(*value)),
+            Value::UBigInt(value) => IntegralRepr::Unsigned(u128::from(*value)),
+            Value::UHugeInt(value) => IntegralRepr::Unsigned(*value),
+            _ => return None,
+        };
+
+        let signed_bounds = match target_type {
+            LogicalType::TinyInt => Some((i128::from(i8::MIN), i128::from(i8::MAX))),
+            LogicalType::SmallInt => Some((i128::from(i16::MIN), i128::from(i16::MAX))),
+            LogicalType::Integer => Some((i128::from(i32::MIN), i128::from(i32::MAX))),
+            LogicalType::BigInt => Some((i128::from(i64::MIN), i128::from(i64::MAX))),
+            LogicalType::HugeInt => Some((i128::MIN, i128::MAX)),
+            _ => None,
+        };
+        if let Some((minimum, maximum)) = signed_bounds {
+            return Some(match value {
+                IntegralRepr::Signed(value) if value < minimum => Below,
+                IntegralRepr::Signed(value) if value > maximum => Above,
+                IntegralRepr::Signed(_) => Within,
+                IntegralRepr::Unsigned(value) if value > maximum as u128 => Above,
+                IntegralRepr::Unsigned(_) => Within,
+            });
+        }
+
+        let unsigned_maximum = match target_type {
+            LogicalType::UTinyInt => u128::from(u8::MAX),
+            LogicalType::USmallInt => u128::from(u16::MAX),
+            LogicalType::UInteger => u128::from(u32::MAX),
+            LogicalType::UBigInt => u128::from(u64::MAX),
+            LogicalType::UHugeInt => u128::MAX,
+            _ => return None,
+        };
+        Some(match value {
+            IntegralRepr::Signed(value) if value < 0 => Below,
+            IntegralRepr::Signed(value) if value as u128 > unsigned_maximum => Above,
+            IntegralRepr::Signed(_) => Within,
+            IntegralRepr::Unsigned(value) if value > unsigned_maximum => Above,
+            IntegralRepr::Unsigned(_) => Within,
+        })
+    }
+
+    fn as_integral_i128(&self) -> Option<i128> {
+        match self {
+            Value::TinyInt(value) => Some(i128::from(*value)),
+            Value::SmallInt(value) => Some(i128::from(*value)),
+            Value::Integer(value) => Some(i128::from(*value)),
+            Value::BigInt(value) => Some(i128::from(*value)),
+            Value::HugeInt(value) => Some(*value),
+            Value::UTinyInt(value) => Some(i128::from(*value)),
+            Value::USmallInt(value) => Some(i128::from(*value)),
+            Value::UInteger(value) => Some(i128::from(*value)),
+            Value::UBigInt(value) => Some(i128::from(*value)),
+            Value::UHugeInt(value) => i128::try_from(*value).ok(),
+            _ => None,
         }
     }
 
@@ -1179,5 +1328,31 @@ mod tests {
         a.hash(&mut ha);
         b.hash(&mut hb);
         assert_eq!(ha.finish(), hb.finish());
+    }
+
+    #[test]
+    fn integral_domain_position_handles_signed_and_unsigned_edges() {
+        use IntegralDomainPosition::{Above, Below, Within};
+
+        assert_eq!(
+            Value::Integer(100_000).integral_domain_position(&LogicalType::SmallInt),
+            Some(Above)
+        );
+        assert_eq!(
+            Value::Integer(-1).integral_domain_position(&LogicalType::UInteger),
+            Some(Below)
+        );
+        assert_eq!(
+            Value::UHugeInt(u128::MAX).integral_domain_position(&LogicalType::HugeInt),
+            Some(Above)
+        );
+        assert_eq!(
+            Value::USmallInt(7).integral_domain_position(&LogicalType::SmallInt),
+            Some(Within)
+        );
+        assert_eq!(
+            Value::Double(7.0).integral_domain_position(&LogicalType::SmallInt),
+            None
+        );
     }
 }

@@ -40,7 +40,7 @@ use super::ids::PhysicalPlanNodeId;
 use super::node::{OperatorLabel, PhysicalPlanNode};
 use super::plan::{PhysicalPlan, PhysicalPlanNodeArena};
 use super::properties::PlanPropertyMap;
-use super::row_type::RowType;
+use super::row_type::{ColumnIdentity, RowType};
 use super::specs::{
     AdaptiveSearchSpec, AggregateSpec, BuildTimeIntegerJoinIndexSpec, ClassicIeJoinSpec,
     CopyToFileSpec, CreateIndexUtilitySpec, CrossProductSpec, CteScanSpec, DeleteSpec,
@@ -125,6 +125,7 @@ impl PhysicalPlanGenerator {
             PlanPropertyMap::default(),
         );
         super::rewrite::rewrite_projection_chains(&mut plan);
+        plan.compact_reachable();
         Ok(plan)
     }
 
@@ -150,7 +151,7 @@ impl PhysicalPlanGenerator {
             LogicalOperator::Limit(limit) => self.lower_limit(limit)?,
             LogicalOperator::Order(order) => self.lower_order(order)?,
             LogicalOperator::TopN(topn) => self.lower_topn(topn)?,
-            LogicalOperator::SearchScan(scan) => self.lower_search_scan(scan)?,
+            LogicalOperator::SearchScan(scan) => self.lower_search_scan(scan, logical)?,
             LogicalOperator::Aggregate(aggregate) => self.lower_aggregate(aggregate)?,
             LogicalOperator::Distinct(distinct) => self.lower_distinct(distinct)?,
             LogicalOperator::Join(join) => {
@@ -219,7 +220,17 @@ impl PhysicalPlanGenerator {
             other => self.lower_unsupported(other)?,
         };
 
-        let output = physical_output_row_type_for_kind(logical, &kind)?;
+        let child_outputs = children
+            .iter()
+            .map(|child| {
+                &self
+                    .arena
+                    .get(*child)
+                    .expect("generated child must remain in the physical arena")
+                    .output
+            })
+            .collect::<Vec<_>>();
+        let output = physical_output_row_type_for_kind(logical, &kind, &child_outputs)?;
         let display_name = match &kind {
             PhysicalNodeKind::Unsupported(spec) => {
                 format!("UNSUPPORTED[{}]: {}", spec.logical_name, spec.reason)

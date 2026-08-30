@@ -14,7 +14,7 @@ use crate::explain::profiler::{
 };
 use crate::explain::types::{
     ExplainActualStats, ExplainControlRegionStats, ExplainNodeId, ExplainRecursiveCteStats,
-    ExplainRuntimeStats,
+    ExplainRuntimeStats, EXPLAIN_FORMAT_VERSION,
 };
 use crate::memory_runtime::MemoryRuntimeStats;
 use crate::pipeline::StatementProgram;
@@ -144,7 +144,7 @@ fn render_explain_analyze_json(
         }
     };
     let mut output = serde_json::json!({
-        "format_version": 1,
+        "format_version": EXPLAIN_FORMAT_VERSION,
         "mode": "analyze",
         "profile_schema_version": PROFILE_SCHEMA_VERSION,
         "query_id": snapshot.query_id,

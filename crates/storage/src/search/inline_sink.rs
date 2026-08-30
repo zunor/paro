@@ -103,7 +103,13 @@ impl SearchInlineBuilderEntry {
     }
 
     pub const fn flush_mode(&self) -> FlushSearchMode {
-        self.freshness_policy.default_flush_mode()
+        match (self.definition.kind, self.freshness_policy) {
+            (
+                SearchIndexKind::Hnsw,
+                SearchFreshnessPolicy::BoundedLag { .. } | SearchFreshnessPolicy::Opportunistic,
+            ) => FlushSearchMode::TailOnly,
+            _ => self.freshness_policy.default_flush_mode(),
+        }
     }
 }
 
@@ -174,13 +180,45 @@ impl fmt::Debug for SearchInlineBuilderSet {
 }
 
 pub trait SidecarArtifactBuilder: Send + Sync {
-    fn estimate_cost(&self, input: &SidecarBuildInput) -> CostEstimate;
+    fn estimate_cost(&self, input: &SidecarBuildInput) -> Result<CostEstimate>;
 
     fn build(
         &self,
         input: SidecarBuildInput,
         budget: &BuildBudget,
     ) -> Result<SidecarArtifactBuildResult>;
+}
+
+/// Provider-neutral cooperative stop signal for pre-commit artifact builds.
+///
+/// Search maintenance normally owns its work after admission. A foreground
+/// CREATE INDEX build is different: until WAL append it remains statement
+/// work and must stop when that statement is cancelled.
+#[derive(Clone)]
+pub struct SearchBuildStopCheck(Arc<dyn Fn() -> bool + Send + Sync + 'static>);
+
+impl SearchBuildStopCheck {
+    pub fn new(check: impl Fn() -> bool + Send + Sync + 'static) -> Self {
+        Self(Arc::new(check))
+    }
+
+    pub fn should_stop(&self) -> bool {
+        (self.0)()
+    }
+
+    pub fn check(&self) -> Result<()> {
+        if self.should_stop() {
+            Err(paro_error::query_canceled())
+        } else {
+            Ok(())
+        }
+    }
+}
+
+impl fmt::Debug for SearchBuildStopCheck {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("SearchBuildStopCheck(..)")
+    }
 }
 
 pub struct SegmentFlushCtx<'a> {
@@ -200,6 +238,7 @@ pub struct SidecarBuildInput {
     pub tail_window: Vec<TailPendingEntry>,
     pub rowset_refs: Vec<RowsetSharedPtr>,
     pub snapshot_version: i64,
+    pub stop_check: Option<SearchBuildStopCheck>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -465,36 +504,293 @@ impl HnswInlineThreshold {
             && dimension <= self.max_dimension
     }
 
-    pub fn from_provider_config_value(provider_config: &Value) -> Self {
-        let threshold = provider_config
-            .get("inline_threshold")
-            .unwrap_or(provider_config);
-        Self {
-            max_vector_count: read_u64_config(threshold, "max_vector_count")
-                .unwrap_or(Self::DEFAULT.max_vector_count),
-            max_graph_memory_bytes: read_u64_config(threshold, "max_graph_memory_bytes")
-                .unwrap_or(Self::DEFAULT.max_graph_memory_bytes),
-            max_dimension: read_u64_config(threshold, "max_dimension")
-                .and_then(|value| u32::try_from(value).ok())
-                .unwrap_or(Self::DEFAULT.max_dimension),
-        }
+    /// Machine-independent resident graph estimate used by the durable inline
+    /// threshold. This models the published fixed-record artifact, not the
+    /// mutable builder object graph. Mixing builder containers into this
+    /// estimate makes storage segmentation depend on transient implementation
+    /// details and multiplies query-time graph work. Runtime worker width must
+    /// never affect this value: identical definitions and segment contents
+    /// must make the same inline/sidecar placement decision on every node.
+    pub fn estimate_graph_memory_bytes(vector_count: u64, m: u32) -> u64 {
+        let m = u64::from(m.max(1));
+        let point_bytes = std::mem::size_of::<u32>() as u64;
+        let offset_bytes = std::mem::size_of::<u64>() as u64;
+        let header_bytes = 64_u64;
+        let upper_offsets = vector_count.saturating_add(1).saturating_mul(offset_bytes);
+        let level0_records = vector_count
+            .saturating_mul(m.saturating_mul(2))
+            .saturating_mul(point_bytes);
+        // Upper levels are delta-varint encoded. The standard level
+        // distribution has 1/(m-1) upper point-levels per point. Five bytes
+        // per u32 target plus level/count tags is a conservative durable bound
+        // without importing mutable builder container sizes.
+        let upper_denominator = m.max(2) - 1;
+        let upper_payload_per_point = 1_u64.saturating_add(
+            m.saturating_mul(5)
+                .saturating_add(1)
+                .div_ceil(upper_denominator),
+        );
+        header_bytes
+            .saturating_add(upper_offsets)
+            .saturating_add(level0_records)
+            .saturating_add(vector_count.saturating_mul(upper_payload_per_point))
     }
 
-    pub fn estimate_graph_memory_bytes(vector_count: u64, dimension: u32, m: u32) -> u64 {
+    /// Durable footprint of the predicate-local hierarchical topology. Each
+    /// configured scalar column independently partitions the full point
+    /// domain and contributes at most `2 * filter_m` local links plus
+    /// `filter_m` cross-block routing links per point. The published graph
+    /// merges those links but remains separate from the base graph so
+    /// unfiltered queries never pay this degree.
+    pub fn estimate_filter_graph_memory_bytes(
+        vector_count: u64,
+        filter_columns: usize,
+        target_block_rows: u32,
+        filter_m: u32,
+    ) -> u64 {
+        if filter_columns == 0 {
+            return 0;
+        }
+        let columns = filter_columns as u64;
+        let upper_offsets = vector_count
+            .saturating_add(1)
+            .saturating_mul(std::mem::size_of::<u64>() as u64);
+        let level0_records = vector_count
+            .saturating_mul(columns.saturating_mul(u64::from(filter_m).saturating_mul(3)))
+            .saturating_mul(std::mem::size_of::<u32>() as u64);
+        let m = u64::from(filter_m.max(2));
+        let upper_payload_per_point = 1_u64.saturating_add(
+            m.saturating_mul(5)
+                .saturating_add(1)
+                .div_ceil(m - 1)
+                .saturating_mul(columns),
+        );
+        let block_count = vector_count
+            .div_ceil(u64::from(target_block_rows.max(1)))
+            .saturating_add(1)
+            .saturating_mul(columns);
+        let entry_points = block_count.saturating_mul(12);
+        64_u64
+            .saturating_add(upper_offsets)
+            .saturating_add(level0_records)
+            .saturating_add(vector_count.saturating_mul(upper_payload_per_point))
+            .saturating_add(entry_points)
+    }
+
+    /// Durable covering layout for exact filtered distance scans. Each
+    /// configured filter column stores one row-id and one vector copy per
+    /// point in scalar-block order; ordinal/block metadata is bounded by one
+    /// additional u32 per point.
+    pub fn estimate_filter_scan_layout_bytes(
+        vector_count: u64,
+        dimension: u32,
+        filter_columns: usize,
+    ) -> u64 {
+        let columns = filter_columns as u64;
+        if columns == 0 {
+            return 0;
+        }
+        let vector_bytes = vector_count
+            .saturating_mul(u64::from(dimension.max(1)))
+            .saturating_mul(std::mem::size_of::<f32>() as u64);
+        let row_and_ordinal_bytes = vector_count
+            .saturating_mul(2)
+            .saturating_mul(std::mem::size_of::<u32>() as u64);
+        columns.saturating_mul(
+            vector_bytes
+                .saturating_add(row_and_ordinal_bytes)
+                .saturating_add(64),
+        )
+    }
+
+    /// Durable compact-routing payload owned by one HNSW artifact. Canonical
+    /// f32 vectors are accounted separately; this covers the aligned i16 code
+    /// matrix, coordinate/scale metadata, optional routing cosine norms, and
+    /// bounded alignment padding introduced by the envelope format.
+    pub fn estimate_routing_artifact_bytes(
+        vector_count: u64,
+        contract: &crate::index::hnsw::HnswBuildContract,
+    ) -> u64 {
+        let crate::index::hnsw::HnswBuildVectorEncoding::SymmetricI16 { routing_dimensions } =
+            contract.vector_encoding
+        else {
+            return 0;
+        };
+        let routing_dimensions = u64::from(routing_dimensions.get());
+        let padded_dimensions = routing_dimensions.saturating_add(15) / 16 * 16;
+        let codes = vector_count
+            .saturating_mul(padded_dimensions)
+            .saturating_mul(std::mem::size_of::<i16>() as u64);
+        let metadata = routing_dimensions
+            .saturating_mul((std::mem::size_of::<u32>() + std::mem::size_of::<f32>()) as u64);
+        let routing_norms = if contract.distance == crate::index::hnsw::DistanceMetric::Cosine {
+            vector_count.saturating_mul(std::mem::size_of::<f32>() as u64)
+        } else {
+            0
+        };
+        codes
+            .saturating_add(metadata)
+            .saturating_add(routing_norms)
+            .saturating_add((crate::index::hnsw::HNSW_ARTIFACT_ALIGNMENT * 2) as u64)
+    }
+
+    /// Mutable graph-builder resident estimate. This belongs only to runtime
+    /// admission/accounting and must not determine the durable segment shape.
+    fn estimate_builder_graph_memory_bytes(vector_count: u64, m: u32) -> u64 {
         let m = u64::from(m.max(1));
         let link_bytes = std::mem::size_of::<u32>() as u64;
-        let level0_links = m.saturating_mul(2);
-        let upper_level_links = m;
         let graph_links = vector_count
-            .saturating_mul(level0_links.saturating_add(upper_level_links))
+            .saturating_mul(m.saturating_mul(3))
             .saturating_mul(link_bytes);
-        let entry_overhead = vector_count.saturating_mul(16);
+        let outer_point_vectors =
+            vector_count.saturating_mul(std::mem::size_of::<Vec<()>>() as u64);
+        // With the standard HNSW level distribution, the expected number of
+        // materialized levels is m/(m-1), including level zero.
+        let expected_level_numerator = m.max(2);
+        let expected_level_denominator = expected_level_numerator - 1;
+        let expected_level_count = vector_count
+            .saturating_mul(expected_level_numerator)
+            .div_ceil(expected_level_denominator);
+        let level_container_bytes =
+            (std::mem::size_of::<std::sync::RwLock<crate::index::hnsw::LinksContainer>>() as u64)
+                .saturating_add(16);
+        let level_containers = expected_level_count.saturating_mul(level_container_bytes);
+        graph_links
+            .saturating_add(outer_point_vectors)
+            .saturating_add(level_containers)
+    }
+
+    /// Runtime peak estimate used by admission and write-buffer governance.
+    /// Unlike the placement estimate, this intentionally includes the actual
+    /// process build width and transient decoded-vector frontier.
+    pub fn estimate_build_peak_memory_bytes(
+        vector_count: u64,
+        dimension: u32,
+        m: u32,
+        ef_construct: u32,
+        build_width: usize,
+    ) -> u64 {
+        let expected_visits =
+            u64::from(ef_construct).saturating_mul(u64::from(m).saturating_mul(2));
+        let visited_lists =
+            crate::index::hnsw::build_visited_workspace_bytes(vector_count, expected_visits)
+                .saturating_mul(build_width.max(1) as u64);
         let build_frontier = vector_count
             .saturating_mul(u64::from(dimension.max(1)))
             .saturating_mul(std::mem::size_of::<f32>() as u64);
-        graph_links
-            .saturating_add(entry_overhead)
+        Self::estimate_builder_graph_memory_bytes(vector_count, m)
+            .saturating_add(visited_lists)
             .saturating_add(build_frontier)
+    }
+
+    /// Complete runtime peak for one durable HNSW build contract.
+    ///
+    /// Admission and write-buffer pressure relief must call this shared
+    /// function. Reconstructing only the base-graph estimate at either call
+    /// site silently drops metric preprocessing and predicate-topology state.
+    pub fn estimate_contract_build_peak_memory_bytes(
+        vector_count: u64,
+        dimension: u32,
+        contract: &crate::index::hnsw::HnswBuildContract,
+        build_width: usize,
+    ) -> u64 {
+        let base_metric_preprocessing_bytes =
+            if contract.distance == crate::index::hnsw::DistanceMetric::Cosine {
+                vector_count.saturating_mul(std::mem::size_of::<f32>() as u64)
+            } else {
+                0
+            };
+        let routing_workspace_bytes = match contract.vector_encoding {
+            crate::index::hnsw::HnswBuildVectorEncoding::ExactF32 => 0,
+            crate::index::hnsw::HnswBuildVectorEncoding::SymmetricI16 { routing_dimensions } => {
+                // The encoded row is padded to the construction kernel's
+                // 16-element boundary. File-backed workspaces still count:
+                // graph construction touches them randomly, so their resident
+                // set competes for the same query/build memory budget.
+                let routing_dimensions = u64::from(routing_dimensions.get());
+                let padded_dimensions = routing_dimensions.saturating_add(15) / 16 * 16;
+                let codes = vector_count
+                    .saturating_mul(padded_dimensions)
+                    .saturating_mul(std::mem::size_of::<i16>() as u64);
+                let coordinate_metadata = u64::from(dimension.max(1))
+                    .saturating_mul(2)
+                    .saturating_mul(std::mem::size_of::<f32>() as u64)
+                    .saturating_add(routing_dimensions.saturating_mul(
+                        (std::mem::size_of::<usize>() + 2 * std::mem::size_of::<f32>()) as u64,
+                    ));
+                let routing_norms =
+                    if contract.distance == crate::index::hnsw::DistanceMetric::Cosine {
+                        vector_count.saturating_mul(std::mem::size_of::<f32>() as u64)
+                    } else {
+                        0
+                    };
+                codes
+                    .saturating_add(coordinate_metadata)
+                    .saturating_add(routing_norms)
+            }
+        };
+        Self::estimate_build_peak_memory_bytes(
+            vector_count,
+            dimension,
+            contract.m,
+            contract.ef_construct,
+            build_width,
+        )
+        .saturating_add(Self::estimate_filter_build_peak_memory_bytes(
+            vector_count,
+            contract.filter_topology.columns().len(),
+            contract.filter_topology.m,
+            contract.ef_construct,
+            build_width,
+        ))
+        .saturating_add(base_metric_preprocessing_bytes)
+        .saturating_add(routing_workspace_bytes)
+    }
+
+    fn estimate_filter_build_peak_memory_bytes(
+        vector_count: u64,
+        filter_columns: usize,
+        filter_m: u32,
+        ef_construct: u32,
+        build_width: usize,
+    ) -> u64 {
+        if filter_columns == 0 {
+            return 0;
+        }
+        // A single equality posting may be larger than the target block size,
+        // because equal values are never split. Use the full segment as the
+        // local-builder upper bound; runtime admission must remain safe for a
+        // constant-valued filter column.
+        let max_block_rows = vector_count;
+        let merged_containers = vector_count.saturating_mul(std::mem::size_of::<Vec<u32>>() as u64);
+        let merged_links = vector_count
+            .saturating_mul(filter_columns as u64)
+            .saturating_mul(u64::from(filter_m).saturating_mul(3))
+            .saturating_mul(std::mem::size_of::<u32>() as u64);
+        let upper_level_containers = vector_count
+            .saturating_mul(filter_columns as u64)
+            .div_ceil(u64::from(filter_m.max(2)) - 1)
+            .saturating_mul(std::mem::size_of::<Vec<u32>>() as u64);
+        let block_membership = vector_count.saturating_mul(std::mem::size_of::<u32>() as u64);
+        let expected_visits =
+            u64::from(ef_construct).saturating_mul(u64::from(filter_m).saturating_mul(2));
+        let local_visited =
+            crate::index::hnsw::build_visited_workspace_bytes(max_block_rows, expected_visits)
+                .saturating_mul(build_width.max(1) as u64);
+        merged_containers
+            .saturating_add(merged_links)
+            .saturating_add(upper_level_containers)
+            .saturating_add(block_membership)
+            .saturating_add(Self::estimate_builder_graph_memory_bytes(
+                max_block_rows,
+                filter_m,
+            ))
+            // Covering vectors are streamed directly from the canonical
+            // generation image. Only one bounded encoder batch is resident;
+            // the durable full-size layout is an I/O/storage cost, not build
+            // memory.
+            .saturating_add(crate::index::hnsw::PREDICATE_SCAN_BUILD_STREAM_BYTES as u64)
+            .saturating_add(local_visited)
     }
 }
 
@@ -503,6 +799,7 @@ pub struct HnswInlineBuildEstimate {
     pub vector_count: u64,
     pub dimension: u32,
     pub estimated_graph_memory_bytes: u64,
+    pub estimated_build_peak_memory_bytes: u64,
     pub threshold: HnswInlineThreshold,
 }
 
@@ -511,32 +808,56 @@ impl HnswInlineBuildEstimate {
         definition: &SearchIndexDefinition,
         vector_count: u64,
         dimension: u32,
-    ) -> Option<Self> {
+    ) -> Result<Option<Self>> {
         if definition.kind != SearchIndexKind::Hnsw {
-            return None;
+            return Ok(None);
         }
-        let threshold =
-            HnswInlineThreshold::from_provider_config_value(&definition.provider_config);
-        let dimension = if dimension == 0 {
-            read_u64_config(&definition.provider_config, "dimension")
-                .and_then(|value| u32::try_from(value).ok())
-                .unwrap_or_default()
-        } else {
-            dimension
+        let config = definition.hnsw_provider_config()?;
+        if dimension != config.dimension {
+            return Err(paro_error::invalid_input(format!(
+                "HNSW inline dimension mismatch: definition={}, segment={dimension}",
+                config.dimension
+            )));
+        }
+        let threshold = HnswInlineThreshold {
+            max_vector_count: config.inline_threshold.max_vector_count,
+            max_graph_memory_bytes: config.inline_threshold.max_graph_memory_bytes,
+            max_dimension: config.inline_threshold.max_dimension,
         };
-        let m = read_u64_config(&definition.provider_config, "m")
-            .and_then(|value| u32::try_from(value).ok())
-            .unwrap_or(16);
-        Some(Self {
-            vector_count,
-            dimension,
-            estimated_graph_memory_bytes: HnswInlineThreshold::estimate_graph_memory_bytes(
+        let metric_preprocessing_bytes =
+            if config.distance == crate::index::hnsw::DistanceMetric::Cosine {
+                vector_count.saturating_mul(std::mem::size_of::<f32>() as u64)
+            } else {
+                0
+            };
+        let estimated_graph_memory_bytes =
+            HnswInlineThreshold::estimate_graph_memory_bytes(vector_count, config.m)
+                .saturating_add(HnswInlineThreshold::estimate_filter_graph_memory_bytes(
+                    vector_count,
+                    config.filter_columns.len(),
+                    config.filter_block_rows,
+                    config.filter_m,
+                ))
+                .saturating_add(HnswInlineThreshold::estimate_filter_scan_layout_bytes(
+                    vector_count,
+                    dimension,
+                    config.filter_columns.len(),
+                ))
+                .saturating_add(metric_preprocessing_bytes);
+        let estimated_build_peak_memory_bytes =
+            HnswInlineThreshold::estimate_contract_build_peak_memory_bytes(
                 vector_count,
                 dimension,
-                m,
-            ),
+                &config.build_contract(),
+                crate::index::hnsw::hnsw_build_thread_count(),
+            );
+        Ok(Some(Self {
+            vector_count,
+            dimension,
+            estimated_graph_memory_bytes,
+            estimated_build_peak_memory_bytes,
             threshold,
-        })
+        }))
     }
 
     pub const fn allows_inline(self) -> bool {
@@ -545,6 +866,30 @@ impl HnswInlineBuildEstimate {
             self.estimated_graph_memory_bytes,
             self.dimension,
         )
+    }
+
+    /// Largest safe segment envelope for this vector shape.
+    ///
+    /// HNSW query quality and latency depend on graph locality, so the writer
+    /// should not inherit the executor's 4K chunk size as a graph boundary.
+    /// Derive a segment limit from both the configured vector-count ceiling
+    /// and the graph-memory ceiling instead.
+    pub fn max_segment_vector_count(self) -> u64 {
+        // Scale the complete estimate instead of first rounding it to a
+        // per-row byte count. The latter can make an estimate reject its own
+        // cardinality when fixed headers leave a remainder (for example,
+        // `estimate(N) / ceil(estimate(N) / N) == N - 1`). Treating fixed
+        // metadata as proportional is conservative for smaller segments and
+        // preserves the important identity at the measured cardinality.
+        let memory_bound = if self.estimated_graph_memory_bytes == 0 {
+            self.threshold.max_vector_count
+        } else {
+            (u128::from(self.threshold.max_graph_memory_bytes)
+                .saturating_mul(u128::from(self.vector_count))
+                / u128::from(self.estimated_graph_memory_bytes))
+            .min(u128::from(u64::MAX)) as u64
+        };
+        self.threshold.max_vector_count.min(memory_bound).max(1)
     }
 }
 
@@ -556,12 +901,6 @@ pub struct SidecarArtifactLocation {
     pub offset: u64,
     pub len: u64,
     pub checksum: u64,
-}
-
-fn read_u64_config(config: &Value, key: &str) -> Option<u64> {
-    config
-        .get(key)
-        .and_then(|value| value.as_u64().or_else(|| value.as_str()?.parse().ok()))
 }
 
 #[cfg(test)]
@@ -580,7 +919,7 @@ mod tests {
         SearchInlineBuilderEntry, SearchInlineBuilderSet, SearchStatsDelta, SegmentChunkSink,
         SegmentFlushCtx, SparseStatsDelta,
     };
-    use crate::search::{SearchIndexDefinition, SearchIndexKind};
+    use crate::search::{SearchIndexDefinition, SearchIndexKind, HNSW_PROVIDER_CONFIG_VERSION};
 
     struct NoopInlineBuilder;
 
@@ -622,6 +961,112 @@ mod tests {
     }
 
     #[test]
+    fn hnsw_runtime_peak_accounts_for_workers_without_changing_graph_placement() {
+        let points = 1_000;
+        let graph = HnswInlineThreshold::estimate_graph_memory_bytes(points, 16);
+        let builder_graph = HnswInlineThreshold::estimate_builder_graph_memory_bytes(points, 16);
+        let serial = HnswInlineThreshold::estimate_build_peak_memory_bytes(points, 128, 16, 100, 1);
+        let width_32 =
+            HnswInlineThreshold::estimate_build_peak_memory_bytes(points, 128, 16, 100, 32);
+
+        assert_eq!(
+            width_32 - serial,
+            points * 31 * std::mem::size_of::<u8>() as u64
+        );
+        assert!(builder_graph > graph);
+        assert_eq!(
+            serial - builder_graph,
+            points * std::mem::size_of::<u8>() as u64
+                + points * 128 * std::mem::size_of::<f32>() as u64
+        );
+    }
+
+    #[test]
+    fn predicate_covering_vectors_are_streamed_instead_of_retained_at_build_time() {
+        const POINTS: u64 = 10_000_000;
+        const DIMENSION: u64 = 768;
+        let predicate_peak =
+            HnswInlineThreshold::estimate_filter_build_peak_memory_bytes(POINTS, 1, 16, 100, 10);
+        let former_covering_copy = POINTS
+            .saturating_mul(DIMENSION)
+            .saturating_mul(std::mem::size_of::<f32>() as u64);
+
+        assert!(
+            predicate_peak < former_covering_copy,
+            "predicate build estimate must not contain a full f32 covering copy"
+        );
+        assert!(
+            predicate_peak >= crate::index::hnsw::PREDICATE_SCAN_BUILD_STREAM_BYTES as u64,
+            "predicate build estimate must retain the bounded publication stream buffer"
+        );
+    }
+
+    #[test]
+    fn compact_routing_and_both_cosine_norm_images_are_admission_accounted() {
+        const POINTS: u64 = 10_000;
+        const DIMENSION: u32 = 768;
+        const ROUTING_DIMENSIONS: u32 = 128;
+        let exact = crate::index::hnsw::HnswConfig::new(16, 100)
+            .build_contract(crate::index::hnsw::DistanceMetric::Euclidean);
+        let mut compact = exact;
+        compact.vector_encoding =
+            crate::index::hnsw::HnswBuildVectorEncoding::symmetric_i16(ROUTING_DIMENSIONS).unwrap();
+        let exact_peak = HnswInlineThreshold::estimate_contract_build_peak_memory_bytes(
+            POINTS, DIMENSION, &exact, 4,
+        );
+        let compact_peak = HnswInlineThreshold::estimate_contract_build_peak_memory_bytes(
+            POINTS, DIMENSION, &compact, 4,
+        );
+        let expected_code_bytes =
+            POINTS * u64::from(ROUTING_DIMENSIONS) * std::mem::size_of::<i16>() as u64;
+        assert!(compact_peak >= exact_peak.saturating_add(expected_code_bytes));
+        assert!(
+            HnswInlineThreshold::estimate_routing_artifact_bytes(POINTS, &compact)
+                >= expected_code_bytes
+        );
+
+        compact.distance = crate::index::hnsw::DistanceMetric::Cosine;
+        let cosine_peak = HnswInlineThreshold::estimate_contract_build_peak_memory_bytes(
+            POINTS, DIMENSION, &compact, 4,
+        );
+        assert_eq!(
+            cosine_peak - compact_peak,
+            POINTS * 2 * std::mem::size_of::<f32>() as u64,
+            "cosine compact builds own base and routing inverse-norm images"
+        );
+    }
+
+    #[test]
+    fn persisted_fixed_record_budget_does_not_inherit_builder_container_overhead() {
+        let points = 1_000_000;
+        let resident = HnswInlineThreshold::estimate_graph_memory_bytes(points, 16);
+        let builder = HnswInlineThreshold::estimate_build_peak_memory_bytes(
+            points,
+            32,
+            16,
+            100,
+            crate::index::hnsw::hnsw_build_thread_count(),
+        );
+        let estimate = HnswInlineBuildEstimate {
+            vector_count: 8_192,
+            dimension: 32,
+            estimated_graph_memory_bytes: HnswInlineThreshold::estimate_graph_memory_bytes(
+                8_192, 16,
+            ),
+            estimated_build_peak_memory_bytes: 0,
+            threshold: HnswInlineThreshold {
+                max_vector_count: points,
+                max_graph_memory_bytes: 512 * 1024 * 1024,
+                max_dimension: 32,
+            },
+        };
+
+        assert!(resident < 512 * 1024 * 1024);
+        assert!(builder > resident);
+        assert_eq!(estimate.max_segment_vector_count(), points);
+    }
+
+    #[test]
     fn hnsw_inline_threshold_comes_from_provider_config() {
         let definition = SearchIndexDefinition {
             definition_id: 1,
@@ -631,9 +1076,43 @@ mod tests {
             column_ids: vec![3],
             expression: None,
             provider_config: json!({
+                "version": HNSW_PROVIDER_CONFIG_VERSION,
+                "dimension": 4,
+                "distance": "euclidean",
+                "build_vector_encoding": {
+                    "symmetric_i16": { "routing_dimensions": 4 }
+                },
                 "m": 8,
                 "ef_construct": 64,
+                "ef_search": 64,
+                "rerank_policy": "top_k",
+                "distance_cost": {
+                    "source": {
+                        "kind": "built_in",
+                        "revision": crate::index::hnsw::HNSW_BUILT_IN_DISTANCE_COST_REVISION
+                    },
+                    "random_access_cost_units": crate::search::DEFAULT_HNSW_RANDOM_ACCESS_COST_UNITS,
+                    "exact_f32_dimension_cost_units": crate::search::DEFAULT_HNSW_EXACT_F32_DIMENSION_COST_UNITS,
+                    "sequential_dimension_cost_units": crate::search::DEFAULT_HNSW_SEQUENTIAL_DIMENSION_COST_UNITS,
+                    "symmetric_i16_dimension_cost_units": crate::search::DEFAULT_HNSW_SYMMETRIC_I16_DIMENSION_COST_UNITS,
+                    "graph_scored_points_per_ef": crate::search::DEFAULT_HNSW_GRAPH_SCORED_POINTS_PER_EF
+                },
+                "generation_layout": {
+                    "target_graph_rows": crate::search::DEFAULT_HNSW_GENERATION_TARGET_GRAPH_ROWS
+                },
+                "maintenance": {
+                    "target_vector_bytes": crate::search::DEFAULT_HNSW_MAINTENANCE_TARGET_VECTOR_BYTES,
+                    "max_pending_vector_bytes": crate::search::DEFAULT_HNSW_MAINTENANCE_MAX_PENDING_VECTOR_BYTES,
+                    "compaction_fanout": crate::search::DEFAULT_HNSW_MAINTENANCE_COMPACTION_FANOUT,
+                },
+                "build_seed": 1,
+                "proposal_wave_max_size": crate::search::DEFAULT_HNSW_PROPOSAL_WAVE_MAX_SIZE,
+                "warmup_point_count": crate::search::DEFAULT_HNSW_WARMUP_POINT_COUNT,
+                "filter_columns": [],
+                "filter_block_rows": crate::search::DEFAULT_HNSW_FILTER_BLOCK_ROWS,
+                "filter_m": crate::search::DEFAULT_HNSW_FILTER_M,
                 "inline_threshold": {
+                    "enabled": true,
                     "max_vector_count": 128,
                     "max_graph_memory_bytes": 64,
                     "max_dimension": 4
@@ -643,16 +1122,47 @@ mod tests {
             config_fingerprint: 99,
         };
 
-        let threshold =
-            HnswInlineThreshold::from_provider_config_value(&definition.provider_config);
+        let provider = definition.hnsw_provider_config().unwrap();
+        let threshold = HnswInlineThreshold {
+            max_vector_count: provider.inline_threshold.max_vector_count,
+            max_graph_memory_bytes: provider.inline_threshold.max_graph_memory_bytes,
+            max_dimension: provider.inline_threshold.max_dimension,
+        };
         assert_eq!(threshold.max_vector_count, 128);
         assert_eq!(threshold.max_graph_memory_bytes, 64);
         assert_eq!(threshold.max_dimension, 4);
 
-        let estimate =
-            HnswInlineBuildEstimate::from_definition(&definition, 16, 4).expect("hnsw estimate");
+        let estimate = HnswInlineBuildEstimate::from_definition(&definition, 16, 4)
+            .expect("valid hnsw config")
+            .expect("hnsw estimate");
         assert_eq!(estimate.threshold, threshold);
         assert!(!estimate.allows_inline());
+        assert_eq!(
+            estimate.estimated_build_peak_memory_bytes,
+            HnswInlineThreshold::estimate_contract_build_peak_memory_bytes(
+                16,
+                4,
+                &provider.build_contract(),
+                crate::index::hnsw::hnsw_build_thread_count(),
+            )
+        );
+        let mut filtered_contract = provider.build_contract();
+        filtered_contract.filter_topology =
+            crate::index::hnsw::HnswFilterTopologyContract::from_columns(
+                &[7],
+                crate::search::DEFAULT_HNSW_FILTER_BLOCK_ROWS,
+                crate::search::DEFAULT_HNSW_FILTER_M,
+            )
+            .unwrap();
+        assert!(
+            HnswInlineThreshold::estimate_contract_build_peak_memory_bytes(
+                16,
+                4,
+                &filtered_contract,
+                crate::index::hnsw::hnsw_build_thread_count(),
+            ) > estimate.estimated_build_peak_memory_bytes,
+            "predicate topology must be present in the shared build peak"
+        );
 
         let roomy = HnswInlineBuildEstimate {
             threshold: HnswInlineThreshold {
@@ -663,6 +1173,12 @@ mod tests {
             ..estimate
         };
         assert!(roomy.allows_inline());
+        assert_eq!(roomy.max_segment_vector_count(), 16);
+        assert!(HnswInlineBuildEstimate {
+            estimated_build_peak_memory_bytes: u64::MAX,
+            ..roomy
+        }
+        .allows_inline());
     }
 
     #[test]
@@ -674,7 +1190,7 @@ mod tests {
             kind: SearchIndexKind::FullText,
             column_ids: vec![3],
             expression: None,
-            provider_config: json!({"config": "simple"}),
+            provider_config: json!({"version": 1, "config": "simple"}),
             freshness_policy: SearchFreshnessPolicy::BoundedLag {
                 max_tail_rows: 64,
                 max_lag_millis: 250,

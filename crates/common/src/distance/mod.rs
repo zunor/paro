@@ -39,6 +39,68 @@ const MIN_DIM_AVX: usize = 32;
 /// Minimum vector dimension to use SSE/NEON (128-bit, processes 16 f32 per iteration)
 const MIN_DIM_SIMD: usize = 16;
 
+/// Hint that the leading cache lines of a vector will be read soon.
+///
+/// HNSW discovers point ids while traversing a separate adjacency region.
+/// Issuing these hints at discovery time overlaps the random vector fetch with
+/// visited-set and link processing before the distance kernel consumes it.
+/// At most 256 bytes are requested: enough to cover common 32/64-dimensional
+/// vectors without flooding caches for high-dimensional batches.
+#[inline]
+pub fn prefetch_vector_read(vector: &[f32]) {
+    const FLOATS_PER_CACHE_LINE: usize = 16;
+    const MAX_PREFETCH_FLOATS: usize = 64;
+
+    for offset in (0..vector.len().min(MAX_PREFETCH_FLOATS)).step_by(FLOATS_PER_CACHE_LINE) {
+        let address = unsafe { vector.as_ptr().add(offset) };
+        #[cfg(target_arch = "aarch64")]
+        unsafe {
+            simd_neon::prefetch_l1(address);
+        }
+        #[cfg(target_arch = "x86_64")]
+        unsafe {
+            std::arch::x86_64::_mm_prefetch(address.cast::<i8>(), std::arch::x86_64::_MM_HINT_T0);
+        }
+        #[cfg(target_arch = "x86")]
+        unsafe {
+            std::arch::x86::_mm_prefetch(address.cast::<i8>(), std::arch::x86::_MM_HINT_T0);
+        }
+        #[cfg(not(any(target_arch = "aarch64", target_arch = "x86", target_arch = "x86_64")))]
+        {
+            let _ = address;
+        }
+    }
+}
+
+/// Hint that the leading cache lines of an encoded routing row will be read
+/// soon. Unlike `prefetch_vector_read`, this accepts byte-aligned persistent
+/// regions and therefore does not manufacture an aligned typed slice.
+#[inline]
+pub fn prefetch_bytes_read(bytes: &[u8]) {
+    const CACHE_LINE_BYTES: usize = 64;
+    const MAX_PREFETCH_BYTES: usize = 256;
+
+    for offset in (0..bytes.len().min(MAX_PREFETCH_BYTES)).step_by(CACHE_LINE_BYTES) {
+        let address = unsafe { bytes.as_ptr().add(offset) };
+        #[cfg(target_arch = "aarch64")]
+        unsafe {
+            simd_neon::prefetch_l1(address.cast::<f32>());
+        }
+        #[cfg(target_arch = "x86_64")]
+        unsafe {
+            std::arch::x86_64::_mm_prefetch(address.cast::<i8>(), std::arch::x86_64::_MM_HINT_T0);
+        }
+        #[cfg(target_arch = "x86")]
+        unsafe {
+            std::arch::x86::_mm_prefetch(address.cast::<i8>(), std::arch::x86::_MM_HINT_T0);
+        }
+        #[cfg(not(any(target_arch = "aarch64", target_arch = "x86", target_arch = "x86_64")))]
+        {
+            let _ = address;
+        }
+    }
+}
+
 /// Compute L2 squared distance (sum of squared differences).
 ///
 /// Automatically selects the best SIMD implementation available.
@@ -69,6 +131,104 @@ pub fn l2_squared(v1: &[f32], v2: &[f32]) -> f32 {
     }
 
     scalar::l2_squared(v1, v2)
+}
+
+/// Compute squared L2 distances for vectors selected from one flat row-major
+/// matrix. The query and CPU-feature dispatch are shared by the whole batch;
+/// architecture kernels may score several rows in parallel to avoid reloading
+/// the query for every candidate.
+///
+/// # Panics
+///
+/// Panics when `query.len() != dimension`, `scores` is shorter than
+/// `point_ids`, or a point id falls outside `vectors`.
+#[inline]
+pub fn l2_squared_batch_indexed(
+    query: &[f32],
+    vectors: &[f32],
+    dimension: usize,
+    point_ids: &[u32],
+    scores: &mut [f32],
+) {
+    assert_eq!(query.len(), dimension, "query dimension mismatch");
+    assert!(
+        scores.len() >= point_ids.len(),
+        "score buffer is shorter than point batch"
+    );
+    if point_ids.is_empty() {
+        return;
+    }
+    let max_point = point_ids.iter().copied().max().unwrap_or(0) as usize;
+    let required = max_point
+        .checked_add(1)
+        .and_then(|rows| rows.checked_mul(dimension))
+        .expect("indexed distance matrix shape overflow");
+    assert!(
+        required <= vectors.len(),
+        "indexed distance point exceeds vector matrix"
+    );
+
+    #[cfg(target_arch = "aarch64")]
+    if dimension >= MIN_DIM_SIMD {
+        // AArch64 requires NEON as part of the base architecture. All slice
+        // bounds and row offsets were validated above.
+        return unsafe {
+            simd_neon::l2_squared_batch_indexed_neon(query, vectors, dimension, point_ids, scores)
+        };
+    }
+
+    for (&point_id, score) in point_ids.iter().zip(scores.iter_mut()) {
+        let start = point_id as usize * dimension;
+        *score = l2_squared(query, &vectors[start..start + dimension]);
+    }
+}
+
+/// Compute squared L2 distances for one contiguous row-major matrix.
+///
+/// Unlike [`l2_squared_batch_indexed`], this contract has no point-id gather:
+/// row `i` begins at `i * dimension`. Exact covering scans use this shape to
+/// avoid manufacturing an identity index and to expose sequential memory
+/// access directly to architecture kernels.
+///
+/// # Panics
+///
+/// Panics when `query.len() != dimension`, `vectors` is not an exact row-major
+/// matrix, or `scores` is shorter than the matrix row count.
+#[inline]
+pub fn l2_squared_batch_contiguous(
+    query: &[f32],
+    vectors: &[f32],
+    dimension: usize,
+    scores: &mut [f32],
+) {
+    assert_eq!(query.len(), dimension, "query dimension mismatch");
+    assert!(dimension != 0, "distance matrix dimension must be non-zero");
+    assert_eq!(
+        vectors.len() % dimension,
+        0,
+        "distance matrix has a partial row"
+    );
+    let rows = vectors.len() / dimension;
+    assert!(scores.len() >= rows, "score buffer is shorter than matrix");
+    if rows == 0 {
+        return;
+    }
+
+    #[cfg(target_arch = "aarch64")]
+    if dimension >= MIN_DIM_SIMD {
+        // AArch64 requires NEON as part of the base architecture. Matrix shape
+        // and output bounds were validated above.
+        return unsafe {
+            simd_neon::l2_squared_batch_contiguous_neon(query, vectors, dimension, scores)
+        };
+    }
+
+    for (vector, score) in vectors
+        .chunks_exact(dimension)
+        .zip(scores.iter_mut().take(rows))
+    {
+        *score = l2_squared(query, vector);
+    }
 }
 
 /// Compute L2 distance (Euclidean distance).
@@ -143,6 +303,18 @@ pub fn dot_product(v1: &[f32], v2: &[f32]) -> f32 {
     scalar::dot_product(v1, v2)
 }
 
+/// Return the multiplicative inverse of a vector norm, or zero for the
+/// engine's canonical near-zero vector domain.
+#[inline]
+pub fn inverse_norm(vector: &[f32]) -> f32 {
+    let squared = dot_product(vector, vector);
+    if squared < f32::EPSILON {
+        0.0
+    } else {
+        squared.sqrt().recip()
+    }
+}
+
 /// Normalize a vector to unit length.
 ///
 /// Automatically selects the best SIMD implementation available.
@@ -185,17 +357,12 @@ pub fn normalize(vector: Vec<f32>) -> Vec<f32> {
 #[inline]
 pub fn cosine_distance(v1: &[f32], v2: &[f32]) -> f32 {
     let dot = dot_product(v1, v2);
-
-    // Compute norms using dot_product with self (benefits from SIMD)
-    let norm1_sq = dot_product(v1, v1);
-    let norm2_sq = dot_product(v2, v2);
-    let norm_product = (norm1_sq * norm2_sq).sqrt();
-
-    if norm_product < f32::EPSILON {
+    let inverse_norm_1 = inverse_norm(v1);
+    let inverse_norm_2 = inverse_norm(v2);
+    if inverse_norm_1 == 0.0 || inverse_norm_2 == 0.0 {
         return 1.0; // If either vector is zero, distance is maximum
     }
-
-    1.0 - (dot / norm_product)
+    1.0 - dot * inverse_norm_1 * inverse_norm_2
 }
 
 #[cfg(test)]

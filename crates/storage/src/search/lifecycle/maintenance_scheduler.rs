@@ -11,7 +11,7 @@ use std::time::Instant;
 use paro_common::error::Result;
 
 use crate::search::artifact::{ArtifactGcContext, ArtifactLocation, GcDecision};
-use crate::search::capability::{SearchIndexDefinition, SearchIndexKind};
+use crate::search::capability::{SearchFreshnessPolicy, SearchIndexDefinition, SearchIndexKind};
 use crate::search::inline_sink::{
     AdmissionDecision, AdmissionGrant, AdmissionRejectReason, AdmissionWaitReason, CostEstimate,
     FlushSearchMode, InlineAdmissionRequest, MaintenanceBenefit, MaintenanceCost, SearchAdmission,
@@ -21,6 +21,7 @@ use crate::search::manifest::{
     LoadedManifest, DELTA_BYTES_HARD_LIMIT, DELTA_BYTES_SOFT_LIMIT, DELTA_COUNT_HARD_LIMIT,
     DELTA_COUNT_SOFT_LIMIT,
 };
+use crate::search::sidecar_builder::publication_authentication_read_bytes;
 use crate::search::stats::{CatchUpBacklogTier, MaintenancePriority, SearchDefinitionId, TableId};
 use crate::search::tail::TailMutationKind;
 
@@ -308,8 +309,16 @@ impl MaintenanceScheduler {
             GcDecision::Heal => SearchMaintenanceAction::CatchUp,
             GcDecision::Rebuild => SearchMaintenanceAction::Rebuild,
         };
+        // A complete HNSW L0 digit is the write-admission liveness boundary.
+        // Drain it before optional GC/repack work. Only HNSW may leave a
+        // sub-target exact L0 idle: sealing it would create tiny immutable
+        // graphs and permanent query fan-out. Full-text and sparse artifacts
+        // are segment-local postings and have no graph-size reason to defer;
+        // Required freshness likewise admits no tail delay.
         if manifest.root.maintenance_state.recovery.tail_pending_rows > 0
-            && matches!(action, SearchMaintenanceAction::Skip)
+            && (definition.kind != SearchIndexKind::Hnsw
+                || definition.freshness_policy == SearchFreshnessPolicy::Required
+                || manifest.root.maintenance_state.recovery.priority != MaintenancePriority::Idle)
         {
             action = SearchMaintenanceAction::CatchUp;
         }
@@ -319,7 +328,7 @@ impl MaintenanceScheduler {
         if manifest_delta_compaction_requested && matches!(action, SearchMaintenanceAction::Skip) {
             action = SearchMaintenanceAction::CompactManifestDelta;
         }
-        let sidecar_repack_requested = sidecar_repack_needed(manifest);
+        let sidecar_repack_requested = sidecar_repack_needed(definition.kind, manifest);
         if sidecar_repack_requested && matches!(action, SearchMaintenanceAction::Skip) {
             action = SearchMaintenanceAction::RepackSidecar;
         }
@@ -368,14 +377,28 @@ impl MaintenanceScheduler {
         &self,
         requests: &[MaintenanceAdmissionRequest],
     ) -> Vec<MaintenanceAdmissionDecision> {
-        self.admit_requests_inner(requests, false)
+        self.admit_requests_inner(requests, false, None)
     }
 
     pub(crate) fn schedule_requests(
         &self,
         requests: &[MaintenanceAdmissionRequest],
     ) -> Vec<MaintenanceAdmissionDecision> {
-        self.admit_requests_inner(requests, true)
+        self.admit_requests_inner(requests, true, None)
+    }
+
+    /// Admit and enqueue at most one request from this scheduling quantum.
+    ///
+    /// Callers that execute one unit of work per fairness turn must not use
+    /// [`Self::schedule_requests`]: every admitted request owns an active grant
+    /// until its queued task is executed. Limiting admission here makes queue
+    /// ownership match execution ownership instead of leaving unconsumed
+    /// grants behind to throttle later turns.
+    pub(crate) fn schedule_next_request(
+        &self,
+        requests: &[MaintenanceAdmissionRequest],
+    ) -> Vec<MaintenanceAdmissionDecision> {
+        self.admit_requests_inner(requests, true, Some(1))
     }
 
     pub(crate) fn pop_next_task(&self) -> Option<MaintenanceQueuedTask> {
@@ -394,6 +417,7 @@ impl MaintenanceScheduler {
         &self,
         requests: &[MaintenanceAdmissionRequest],
         queue_admitted: bool,
+        max_new_grants: Option<usize>,
     ) -> Vec<MaintenanceAdmissionDecision> {
         let Ok(mut state) = self.state.lock() else {
             return requests
@@ -445,10 +469,17 @@ impl MaintenanceScheduler {
                 })
         });
 
+        let mut new_grants = 0usize;
         for index in order {
             let request = &requests[index];
             if matches!(request.action, SearchMaintenanceAction::Skip) {
                 decisions[index] = MaintenanceAdmissionDecision::NotRequired;
+                continue;
+            }
+            if max_new_grants.is_some_and(|limit| new_grants >= limit) {
+                decisions[index] = MaintenanceAdmissionDecision::Deferred {
+                    reason: MaintenanceAdmissionReason::TableFairness,
+                };
                 continue;
             }
             if state
@@ -505,6 +536,7 @@ impl MaintenanceScheduler {
                     budget: request.estimate.cost,
                 },
             );
+            new_grants = new_grants.saturating_add(1);
             if queue_admitted {
                 let task_id = state.next_task_id.fetch_add(1, Ordering::Relaxed);
                 state.queued_tasks.insert(
@@ -960,6 +992,14 @@ fn estimate_maintenance_cost_benefit(
             }
         }
     };
+    estimate.cost.io_read_bytes =
+        estimate
+            .cost
+            .io_read_bytes
+            .saturating_add(publication_authentication_read_bytes(
+                kind,
+                estimate.cost.io_write_bytes,
+            ));
     if manifest_delta_compaction_requested {
         add_manifest_delta_compaction_estimate(&mut estimate, manifest, delta_window_bytes);
     }
@@ -969,7 +1009,16 @@ fn estimate_maintenance_cost_benefit(
     estimate
 }
 
-pub(crate) fn sidecar_repack_needed(manifest: &LoadedManifest) -> bool {
+pub(crate) fn sidecar_repack_needed(kind: SearchIndexKind, manifest: &LoadedManifest) -> bool {
+    // HNSW artifacts are complete immutable graphs, not small postings that
+    // benefit from sharing a package. Repacking a newly appended catch-up
+    // graph would copy the multi-gigabyte base graph merely to save one file
+    // open, while blocking the only maintenance lane needed to keep ingest
+    // fresh. Graph fan-out is reduced by generation compaction, which also
+    // improves query execution; byte-for-byte package consolidation does not.
+    if kind == SearchIndexKind::Hnsw {
+        return false;
+    }
     let stats = sidecar_package_stats(manifest);
     stats.package_count > sidecar_package_target(stats.artifact_count)
 }

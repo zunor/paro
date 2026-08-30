@@ -25,7 +25,7 @@ pub const DEFAULT_TXN_SPILL_BYTES_LIMIT: u64 = 4 * 1024 * 1024 * 1024;
 pub const DEFAULT_GLOBAL_TXN_SPILL_BYTES_LIMIT: u64 = 64 * 1024 * 1024 * 1024;
 pub const DEFAULT_TXN_SPILL_FOREGROUND_WAIT_BUDGET_US: u64 = 0;
 
-const MANIFEST_RECORD_VERSION: u16 = 1;
+const MANIFEST_RECORD_VERSION: u16 = 2;
 const ROW_REF_MAGIC: &[u8; 8] = b"PTXNDV1\n";
 
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
@@ -70,7 +70,12 @@ struct TxnSpillManifestRecord {
     rowset_id: Option<u64>,
     path: String,
     row_count: u64,
-    bytes: u64,
+    /// Durable bytes referenced by this descriptor. Rowsets were already
+    /// written by the normal write path; delete vectors are spill-owned.
+    artifact_bytes: u64,
+    /// Additional storage reserved by transaction spill itself, including
+    /// the lifecycle manifest records.
+    admitted_bytes: u64,
 }
 
 impl TxnSpillManifestRecord {
@@ -92,7 +97,8 @@ impl TxnSpillManifestRecord {
             rowset_id: artifact.rowset_id,
             path: artifact.path.to_string_lossy().to_string(),
             row_count: artifact.row_count,
-            bytes: artifact.bytes,
+            artifact_bytes: artifact.artifact_bytes,
+            admitted_bytes: artifact.admitted_bytes,
         }
     }
 }
@@ -272,7 +278,8 @@ pub(crate) struct TxnSpillArtifactMeta {
     pub(crate) path: PathBuf,
     pub(crate) manifest_path: PathBuf,
     pub(crate) row_count: u64,
-    pub(crate) bytes: u64,
+    pub(crate) artifact_bytes: u64,
+    pub(crate) admitted_bytes: u64,
 }
 
 impl TxnSpillArtifactMeta {
@@ -290,6 +297,44 @@ impl TxnSpillArtifactMeta {
             .saturating_add(self.manifest_path.to_string_lossy().len() as u64)
     }
 
+    /// Finalize the spill reservation after every path and identifier is
+    /// known. Two manifest records are reserved: `staged` plus exactly one
+    /// terminal state (`committed` or `abandoned`). The rowset payload is not
+    /// included because it was durably written before this descriptor exists.
+    fn with_spill_payload_bytes(mut self, spill_payload_bytes: u64) -> Result<Self> {
+        let mut admitted_bytes = spill_payload_bytes;
+        for _ in 0..8 {
+            self.admitted_bytes = admitted_bytes;
+            let encoded_len = |state| -> Result<u64> {
+                Ok(u64::try_from(
+                    serde_json::to_vec(&TxnSpillManifestRecord::with_state(&self, state))
+                        .map_err(|err| {
+                            paro_error::internal(format!(
+                                "serialize transaction spill admission record {}: {}",
+                                self.artifact_id, err
+                            ))
+                        })?
+                        .len(),
+                )
+                .unwrap_or(u64::MAX)
+                .saturating_add(1))
+            };
+            let staged_record_bytes = encoded_len(TxnSpillManifestState::Staged)?;
+            let terminal_record_bytes =
+                encoded_len(TxnSpillManifestState::CommittedDescriptorWritten)?
+                    .max(encoded_len(TxnSpillManifestState::Abandoned)?);
+            let next = spill_payload_bytes
+                .saturating_add(staged_record_bytes)
+                .saturating_add(terminal_record_bytes);
+            if next == admitted_bytes {
+                return Ok(self);
+            }
+            admitted_bytes = next;
+        }
+        self.admitted_bytes = admitted_bytes;
+        Ok(self)
+    }
+
     fn append_state(&self, state: TxnSpillManifestState) -> Result<()> {
         append_manifest_record(
             &self.manifest_path,
@@ -299,12 +344,12 @@ impl TxnSpillArtifactMeta {
 
     pub(crate) fn mark_committed_descriptor_written(&self) {
         let _ = self.append_state(TxnSpillManifestState::CommittedDescriptorWritten);
-        TxnSpillAdmission::global().release_staged(self.bytes);
+        TxnSpillAdmission::global().release_staged(self.admitted_bytes);
     }
 
     pub(crate) fn abandon(&self) {
         let _ = self.append_state(TxnSpillManifestState::Abandoned);
-        TxnSpillAdmission::global().release_staged(self.bytes);
+        TxnSpillAdmission::global().release_staged(self.admitted_bytes);
     }
 }
 
@@ -315,28 +360,8 @@ pub(crate) struct StagedRowsetArtifact {
 
 impl StagedRowsetArtifact {
     #[inline]
-    pub(crate) fn artifact_id(&self) -> u64 {
-        self.meta.artifact_id
-    }
-
-    #[inline]
-    pub(crate) fn sequence(&self) -> u64 {
-        self.meta.sequence
-    }
-
-    #[inline]
-    pub(crate) fn tablet_id(&self) -> u64 {
-        self.meta.tablet_id
-    }
-
-    #[inline]
-    pub(crate) fn command_id(&self) -> CommandId {
-        self.meta.command_id
-    }
-
-    #[inline]
-    pub(crate) fn bytes(&self) -> u64 {
-        self.meta.bytes
+    pub(crate) fn admitted_bytes(&self) -> u64 {
+        self.meta.admitted_bytes
     }
 
     #[inline]
@@ -376,8 +401,8 @@ impl StagedDeleteVectorArtifact {
     }
 
     #[inline]
-    pub(crate) fn bytes(&self) -> u64 {
-        self.meta.bytes
+    pub(crate) fn admitted_bytes(&self) -> u64 {
+        self.meta.admitted_bytes
     }
 
     #[inline]
@@ -451,10 +476,8 @@ impl TxnSpillState {
         rowset: &RowsetSharedPtr,
         current_spilled_bytes: u64,
     ) -> Result<StagedRowsetArtifact> {
-        let bytes = rowset.total_disk_size().max(1);
-        self.preflight_foreground_spill(current_spilled_bytes, bytes)?;
         let sequence = self.allocate_sequence();
-        let manifest_path = manifest_path(tablet, self.database_id, txn_id)?;
+        let manifest_path = manifest_path(tablet, self.database_id, txn_id);
         let meta = TxnSpillArtifactMeta {
             artifact_id: sequence,
             sequence,
@@ -467,10 +490,15 @@ impl TxnSpillState {
             path: rowset.rowset_path().to_path_buf(),
             manifest_path,
             row_count: rowset.num_rows(),
-            bytes,
-        };
-        persist_manifest_stage(&meta)?;
-        storage_metrics().add_txn_spill_bytes(bytes);
+            artifact_bytes: rowset.total_disk_size(),
+            admitted_bytes: 0,
+        }
+        .with_spill_payload_bytes(0)?;
+        self.ensure_per_txn_limit(current_spilled_bytes, meta.admitted_bytes)?;
+        let guard = TxnSpillAdmission::global().begin_foreground_write(meta.admitted_bytes)?;
+        append_manifest_record(&meta.manifest_path, &TxnSpillManifestRecord::staged(&meta))?;
+        guard.finish();
+        storage_metrics().add_txn_spill_bytes(meta.admitted_bytes);
         storage_metrics().inc_txn_spill_artifacts();
         Ok(StagedRowsetArtifact { meta })
     }
@@ -488,10 +516,9 @@ impl TxnSpillState {
                 "cannot stage an empty transaction delete-vector artifact",
             ));
         }
-        let bytes = encoded_row_refs_len(locations.len());
-        self.preflight_foreground_spill(current_spilled_bytes, bytes)?;
+        let artifact_bytes = encoded_row_refs_len(locations.len());
         let sequence = self.allocate_sequence();
-        let manifest_path = manifest_path(tablet, self.database_id, txn_id)?;
+        let manifest_path = manifest_path(tablet, self.database_id, txn_id);
         let path = manifest_path
             .parent()
             .ok_or_else(|| paro_error::internal("spill manifest path has no parent"))?
@@ -501,7 +528,6 @@ impl TxnSpillState {
                 command_id.into_raw(),
                 sequence
             ));
-        write_row_refs(&path, locations)?;
         let meta = TxnSpillArtifactMeta {
             artifact_id: sequence,
             sequence,
@@ -514,10 +540,22 @@ impl TxnSpillState {
             path,
             manifest_path,
             row_count: locations.len() as u64,
-            bytes,
-        };
-        persist_manifest_stage(&meta)?;
-        storage_metrics().add_txn_spill_bytes(bytes);
+            artifact_bytes,
+            admitted_bytes: 0,
+        }
+        .with_spill_payload_bytes(artifact_bytes)?;
+        self.ensure_per_txn_limit(current_spilled_bytes, meta.admitted_bytes)?;
+        let guard = TxnSpillAdmission::global().begin_foreground_write(meta.admitted_bytes)?;
+        let stage_result = (|| {
+            write_row_refs(&meta.path, locations)?;
+            append_manifest_record(&meta.manifest_path, &TxnSpillManifestRecord::staged(&meta))
+        })();
+        if let Err(err) = stage_result {
+            let _ = fs::remove_file(&meta.path);
+            return Err(err);
+        }
+        guard.finish();
+        storage_metrics().add_txn_spill_bytes(meta.admitted_bytes);
         storage_metrics().inc_txn_spill_artifacts();
         Ok(StagedDeleteVectorArtifact { meta })
     }
@@ -541,28 +579,14 @@ impl TxnSpillState {
     }
 }
 
-fn persist_manifest_stage(meta: &TxnSpillArtifactMeta) -> Result<()> {
-    let guard = TxnSpillAdmission::global().begin_foreground_write(meta.bytes)?;
-    append_manifest_record(&meta.manifest_path, &TxnSpillManifestRecord::staged(meta))?;
-    guard.finish();
-    Ok(())
-}
-
-fn manifest_path(tablet: &TabletRef, database_id: DatabaseId, txn_id: u64) -> Result<PathBuf> {
-    let dir = tablet
+fn manifest_path(tablet: &TabletRef, database_id: DatabaseId, txn_id: u64) -> PathBuf {
+    tablet
         .data_dir()
         .join("txn_staging")
         .join(format!("database={}", database_id.into_raw()))
         .join(format!("txn={txn_id}"))
-        .join("storage");
-    fs::create_dir_all(&dir).map_err(|err| {
-        paro_error::io_error(format!(
-            "create transaction spill staging dir {}: {}",
-            dir.display(),
-            err
-        ))
-    })?;
-    Ok(dir.join("manifest.jsonl"))
+        .join("storage")
+        .join("manifest.jsonl")
 }
 
 fn tablet_data_dir_from_manifest_path(manifest_path: &Path) -> Option<&Path> {
@@ -857,7 +881,8 @@ fn remove_spill_artifact_path(
                 path,
                 manifest_path: manifest_path.to_path_buf(),
                 row_count: record.row_count,
-                bytes: record.bytes,
+                artifact_bytes: record.artifact_bytes,
+                admitted_bytes: record.admitted_bytes,
             };
             if !is_safe_rowset_artifact_path(&meta) {
                 tracing::warn!(
@@ -975,7 +1000,8 @@ mod tests {
             path,
             manifest_path,
             row_count: 0,
-            bytes: 1,
+            artifact_bytes: 1,
+            admitted_bytes: 1,
         }
     }
 
@@ -998,6 +1024,28 @@ mod tests {
             manifest,
             Some(123),
         )));
+    }
+
+    #[test]
+    fn rowset_recovery_descriptor_admits_manifest_not_existing_rowset_bytes() {
+        let manifest =
+            PathBuf::from("/data/tablet/txn_staging/database=7/txn=42/storage/manifest.jsonl");
+        let mut meta = artifact_meta(
+            PathBuf::from("/data/tablet/rowsets/rowset_123"),
+            manifest,
+            Some(123),
+        );
+        meta.artifact_bytes = 5 * 1024 * 1024 * 1024;
+        meta.admitted_bytes = 0;
+        let meta = meta
+            .with_spill_payload_bytes(0)
+            .expect("derive rowset descriptor admission");
+
+        assert!(meta.artifact_bytes > DEFAULT_TXN_SPILL_BYTES_LIMIT);
+        assert!(meta.admitted_bytes < 4096);
+        TxnSpillState::new(DatabaseId::new(7))
+            .ensure_per_txn_limit(0, meta.admitted_bytes)
+            .expect("existing rowset bytes must not consume spill-write quota");
     }
 
     #[test]
@@ -1046,7 +1094,8 @@ mod tests {
             path: delete_path.clone(),
             manifest_path: manifest.clone(),
             row_count: 1,
-            bytes: 32,
+            artifact_bytes: 32,
+            admitted_bytes: 32,
         };
         append_manifest_record(&manifest, &TxnSpillManifestRecord::staged(&delete_meta))
             .expect("append delete stage");

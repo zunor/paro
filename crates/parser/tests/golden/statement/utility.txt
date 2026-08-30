@@ -105,44 +105,20 @@ Prepare(
                         top_n: None,
                         select_list: [
                             AliasedExpr {
-                                expr: ColumnRef {
+                                expr: Parameter {
                                     span: Some(
                                         38..40,
                                     ),
-                                    column: ColumnRef {
-                                        schema: None,
-                                        table: None,
-                                        column: Position(
-                                            ColumnPosition {
-                                                span: Some(
-                                                    38..40,
-                                                ),
-                                                pos: 1,
-                                                name: "$1",
-                                            },
-                                        ),
-                                    },
+                                    index: 0,
                                 },
                                 alias: None,
                             },
                             AliasedExpr {
-                                expr: ColumnRef {
+                                expr: Parameter {
                                     span: Some(
                                         42..44,
                                     ),
-                                    column: ColumnRef {
-                                        schema: None,
-                                        table: None,
-                                        column: Position(
-                                            ColumnPosition {
-                                                span: Some(
-                                                    42..44,
-                                                ),
-                                                pos: 2,
-                                                name: "$2",
-                                            },
-                                        ),
-                                    },
+                                    index: 1,
                                 },
                                 alias: None,
                             },

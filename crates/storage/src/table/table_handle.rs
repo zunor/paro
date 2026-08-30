@@ -62,7 +62,31 @@ impl TableHandle {
     }
 
     pub fn bind_search_task_scheduler(&self, scheduler: Option<Arc<TaskScheduler>>) {
+        self.runtime_tablet
+            .bind_primary_index_task_scheduler(scheduler.clone());
         self.search_registry.bind_task_scheduler(scheduler);
+    }
+
+    pub fn bind_search_maintenance_notifier(
+        &self,
+        notifier: Option<Arc<dyn Fn(crate::search::SearchMaintenanceUrgency) + Send + Sync>>,
+    ) {
+        self.search_registry.bind_maintenance_notifier(notifier);
+    }
+
+    pub fn bind_hnsw_integrity_scheduler(
+        &self,
+        scheduler: Option<Arc<crate::index::hnsw::HnswIntegrityScheduler>>,
+    ) -> paro_common::error::Result<()> {
+        self.search_registry
+            .bind_hnsw_integrity_scheduler(scheduler)
+    }
+
+    /// Reclaim search-generation state unreachable after recovery replay.
+    pub fn sweep_orphan_search_generation_state(
+        &self,
+    ) -> paro_common::error::Result<crate::search::SearchGenerationOrphanSweepReport> {
+        self.search_registry.sweep_orphan_generation_state()
     }
 
     pub fn bound_compaction_manager(&self) -> Option<Arc<CompactionManager>> {

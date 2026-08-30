@@ -3,7 +3,7 @@
 
 use crate::{
     AttachedDatabaseDirectory, AttachedDatabaseSnapshot, DdlApplyContext, EffectiveSettings,
-    QueryResources, RuntimeLimits, SessionMetadataProvider, StatementAuthContext,
+    QueryResources, RuntimeLimits, SessionMetadataProvider, SessionRandom, StatementAuthContext,
     StatementCancellation, StatementEnvironment, StatementInput, StatementOptions,
     StatementTimeContext, StatementView, TransactionView, TxnAdmissionState, WriteGuard,
 };
@@ -37,6 +37,8 @@ pub struct StatementContext {
     pub options: StatementOptions,
     pub input: StatementInput,
     pub time: StatementTimeContext,
+    /// Mutable session state shared by every immutable statement snapshot.
+    pub random: Arc<SessionRandom>,
     pub databases: Arc<AttachedDatabaseDirectory>,
     pub limits: RuntimeLimits,
     pub cancellation: StatementCancellation,

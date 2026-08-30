@@ -3,6 +3,7 @@
 
 use paro_common::error::{self as paro_error, Result};
 use paro_parser::ast::CopyOptionValue;
+use std::collections::BTreeSet;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CopyOptions {
@@ -46,10 +47,47 @@ impl Default for CopyOptions {
 impl CopyOptions {
     pub fn from_ast(options: &[(String, CopyOptionValue)]) -> Result<Self> {
         let mut result = CopyOptions::default();
+        let mut specified = BTreeSet::new();
         for (key, value) in options {
+            let normalized = key.to_ascii_lowercase();
+            if !specified.insert(normalized.clone()) {
+                return Err(paro_error::invalid_parameter(format!(
+                    "COPY option {normalized} was specified more than once"
+                )));
+            }
             result.apply_option(key, value)?;
         }
+        result.validate_format_contract(&specified)?;
         Ok(result)
+    }
+
+    fn validate_format_contract(&self, specified: &BTreeSet<String>) -> Result<()> {
+        if !matches!(self.format, CopyFormat::Binary) {
+            return Ok(());
+        }
+        let invalid = [
+            "delimiter",
+            "null",
+            "null_string",
+            "header",
+            "quote",
+            "escape",
+            "force_quote",
+            "force_not_null",
+            "force_null",
+            "encoding",
+        ]
+        .into_iter()
+        .filter(|key| specified.contains(*key))
+        .collect::<Vec<_>>();
+        if invalid.is_empty() {
+            return Ok(());
+        }
+        Err(paro_error::invalid_parameter(format!(
+            "COPY BINARY does not accept option{} {}",
+            if invalid.len() == 1 { "" } else { "s" },
+            invalid.join(", ")
+        )))
     }
 
     /// Return the explicit delimiter, or the selected format's default when
@@ -353,6 +391,36 @@ mod tests {
     }
 
     #[test]
+    fn binary_rejects_text_format_options_regardless_of_option_order() {
+        for options in [
+            vec![
+                (
+                    "format".to_string(),
+                    CopyOptionValue::String("binary".to_string()),
+                ),
+                (
+                    "delimiter".to_string(),
+                    CopyOptionValue::String(",".to_string()),
+                ),
+            ],
+            vec![
+                (
+                    "delimiter".to_string(),
+                    CopyOptionValue::String(",".to_string()),
+                ),
+                (
+                    "format".to_string(),
+                    CopyOptionValue::String("binary".to_string()),
+                ),
+            ],
+        ] {
+            let error = CopyOptions::from_ast(&options).unwrap_err();
+            assert!(error.to_string().contains("COPY BINARY"));
+            assert!(error.to_string().contains("delimiter"));
+        }
+    }
+
+    #[test]
     fn default_options_resolve_text_defaults() {
         let options = CopyOptions::default();
 
@@ -361,5 +429,12 @@ mod tests {
         assert!(!options.header());
         assert_eq!(options.quote(), None);
         assert_eq!(options.escape(), None);
+    }
+
+    #[test]
+    fn explicit_defaults_do_not_change_semantic_option_equality() {
+        let parsed =
+            CopyOptions::from_ast(&[("format".to_string(), CopyOptionValue::Default)]).unwrap();
+        assert_eq!(parsed, CopyOptions::default());
     }
 }

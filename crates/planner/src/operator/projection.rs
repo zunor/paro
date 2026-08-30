@@ -18,12 +18,19 @@ pub struct Projection {
     /// append unnamed execution columns for ORDER BY/window evaluation; those
     /// columns are pruned before the client result boundary.
     pub visible_names: Vec<String>,
+    /// Number of leading expressions that own a SQL-visible identity. The
+    /// remaining names describe optimizer carrier slots only.
+    pub visible_count: usize,
+    /// Optional relation namespace owned by the visible output prefix. This
+    /// survives CTE inlining so physical plans can qualify self-join inputs.
+    pub visible_qualifier: Option<String>,
     pub child: Box<LogicalPlan>,
     pub returned_types: Vec<LogicalType>, // Cached types of expressions
 }
 
 impl Projection {
     pub fn new(table_index: usize, child: LogicalPlan, expressions: Vec<Expression>) -> Self {
+        let visible_count = expressions.len();
         let returned_types = expressions.iter().map(|e| e.return_type()).collect();
         let visible_names = (0..expressions.len())
             .map(|idx| format!("expr_{}", idx + 1))
@@ -32,6 +39,8 @@ impl Projection {
             table_index,
             expressions,
             visible_names,
+            visible_count,
+            visible_qualifier: None,
             child: Box::new(child),
             returned_types,
         }
@@ -40,7 +49,18 @@ impl Projection {
     /// Replace the visible-name prefix without pretending hidden execution
     /// columns have user-facing names.
     pub fn with_visible_names(mut self, visible_names: Vec<String>) -> Self {
+        self.visible_count = visible_names.len();
         self.visible_names = visible_names;
+        self
+    }
+
+    pub fn with_internal_outputs(mut self) -> Self {
+        self.visible_count = 0;
+        self
+    }
+
+    pub fn with_visible_qualifier(mut self, qualifier: impl Into<String>) -> Self {
+        self.visible_qualifier = Some(qualifier.into());
         self
     }
 

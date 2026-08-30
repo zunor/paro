@@ -10,7 +10,11 @@ use paro_storage::compaction::compaction_task::{CompactionTask, HorizontalCompac
 use paro_storage::compaction::execution::statistics_merge::merge_rowset_statistics;
 use paro_storage::compaction::plan::CompactionPlanner;
 use paro_storage::index::fulltext::text_index::FullTextIndex;
-use paro_storage::index::hnsw::{DistanceMetric, HnswConfig};
+use paro_storage::index::hnsw::{
+    DistanceMetric, HnswBuildContract, DEFAULT_HNSW_BUILD_SEED,
+    DEFAULT_HNSW_PROPOSAL_WAVE_MAX_SIZE, DEFAULT_HNSW_WARMUP_POINT_COUNT,
+    HNSW_BUILD_CONTRACT_VERSION,
+};
 use paro_storage::primary_key::DeleteVector;
 use paro_storage::rowset::{
     ColumnData, Segment, SegmentOptions, SegmentWriter, SegmentWriterOptions,
@@ -178,9 +182,21 @@ fn test_index_statistics() {
 
     let opts = SegmentWriterOptions::new(0)
         .with_short_key_index(false)
-        .with_hnsw_index_columns(vec![1])
-        .with_hnsw_config(HnswConfig::new(8, 50))
-        .with_hnsw_distance(DistanceMetric::Cosine);
+        .with_hnsw_build_contract(
+            1,
+            HnswBuildContract {
+                version: HNSW_BUILD_CONTRACT_VERSION,
+                m: 8,
+                m0: 16,
+                ef_construct: 50,
+                distance: DistanceMetric::Cosine,
+                vector_encoding: paro_storage::index::hnsw::HnswBuildVectorEncoding::ExactF32,
+                build_seed: DEFAULT_HNSW_BUILD_SEED,
+                proposal_wave_max_size: DEFAULT_HNSW_PROPOSAL_WAVE_MAX_SIZE,
+                warmup_point_count: DEFAULT_HNSW_WARMUP_POINT_COUNT,
+                filter_topology: Default::default(),
+            },
+        );
     let mut writer = SegmentWriter::create(schema.clone(), &segment_path, opts).unwrap();
 
     let ids = [0_i64, 1, 2, 3];

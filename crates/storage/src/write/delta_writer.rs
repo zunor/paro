@@ -432,13 +432,30 @@ impl DeltaWriter {
         Ok(())
     }
 
-    /// Flush current memtable/segment.
-    pub fn flush_memtable(&mut self) -> Result<()> {
+    /// Release retained write memory by draining the memtable and sealing the
+    /// active segment. Transaction governance calls this only after measuring
+    /// the writer's actual retained bytes.
+    pub(crate) fn relieve_memory_pressure(&mut self) -> Result<()> {
         self.flush_memtable_to_rowset()?;
         if let Some(writer) = self.rowset_writer.as_mut() {
             writer.flush_segment()?;
         }
         Ok(())
+    }
+
+    /// Bytes retained by transaction-owned mutable input.
+    ///
+    /// HNSW seal/build memory is deliberately absent: the active segment's
+    /// `AdmissionLease` has already reserved that future peak process-wide.
+    /// Charging the same reservation to this transaction's spill waterline
+    /// would convert a transient build estimate into durable graph boundaries.
+    pub(crate) fn retained_memory_bytes(&self) -> u64 {
+        let memtable_bytes = self.memtable.stats().bytes as u64;
+        let segment_bytes = self
+            .rowset_writer
+            .as_ref()
+            .map_or(0, RowsetWriter::retained_input_bytes);
+        memtable_bytes.saturating_add(segment_bytes)
     }
 
     /// Delete by primary key (in-memory index only; does not create delete vectors yet).
@@ -473,7 +490,7 @@ impl DeltaWriter {
         if self.closed {
             return Ok(());
         }
-        self.flush_memtable()?;
+        self.relieve_memory_pressure()?;
         self.closed = true;
         Ok(())
     }
@@ -861,16 +878,15 @@ impl DeltaWriter {
         };
 
         // Track written keys and prior locations for delete vector + index updates.
-        let mut prior_locs: Vec<Option<RowID>> = Vec::with_capacity(ordered_rows.len());
-
-        for (row_idx, (key, _)) in ordered_rows.iter().enumerate() {
-            let old = if let Some(base_rowids) = partial_base_rowids.as_ref() {
-                Some(base_rowids[row_idx])
-            } else {
-                self.lookup_visible_primary_key(key)?
-            };
-            prior_locs.push(old);
-        }
+        let prior_locs = if let Some(base_rowids) = partial_base_rowids.as_ref() {
+            base_rowids.iter().copied().map(Some).collect::<Vec<_>>()
+        } else {
+            let keys = ordered_rows
+                .iter()
+                .map(|(key, _)| key.clone())
+                .collect::<Vec<_>>();
+            self.lookup_visible_primary_keys(&keys)?
+        };
 
         for row_id in prior_locs.iter().flatten() {
             self.mark_delete(*row_id)?;
@@ -961,14 +977,31 @@ impl DeltaWriter {
         Ok(())
     }
 
-    fn lookup_visible_primary_key(&self, key: &[u8]) -> Result<Option<RowID>> {
-        if let Some(row_id) = self.primary_key_overlay.get(key) {
-            return Ok(*row_id);
+    fn lookup_visible_primary_keys(&self, keys: &[Vec<u8>]) -> Result<Vec<Option<RowID>>> {
+        let mut resolved = vec![None; keys.len()];
+        let mut missing_positions = Vec::new();
+        let mut missing_keys = Vec::new();
+        for (position, key) in keys.iter().enumerate() {
+            if let Some(row_id) = self.primary_key_overlay.get(key) {
+                resolved[position] = *row_id;
+            } else {
+                missing_positions.push(position);
+                missing_keys.push(key.clone());
+            }
         }
-        if let Some(read_ts) = self.read_ts {
-            return self.tablet.lookup_primary_key_at(key, read_ts.into_raw());
+        if missing_keys.is_empty() {
+            return Ok(resolved);
         }
-        self.tablet.lookup_primary_key(key)
+        let persisted = if let Some(read_ts) = self.read_ts {
+            self.tablet
+                .lookup_primary_keys_at(&missing_keys, read_ts.into_raw())?
+        } else {
+            self.tablet.lookup_primary_keys(&missing_keys)?
+        };
+        for (position, row_id) in missing_positions.into_iter().zip(persisted) {
+            resolved[position] = row_id;
+        }
+        Ok(resolved)
     }
 }
 
@@ -1087,7 +1120,7 @@ mod tests {
             kind: SearchIndexKind::FullText,
             column_ids: vec![1],
             expression: None,
-            provider_config: serde_json::json!({"config": "simple"}),
+            provider_config: serde_json::json!({"version": 1, "config": "simple"}),
             freshness_policy: SearchFreshnessPolicy::default_for_kind(SearchIndexKind::FullText),
             config_fingerprint: 1,
         };

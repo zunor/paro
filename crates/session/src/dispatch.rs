@@ -5,8 +5,9 @@
 
 use paro_parser::ast::{
     CheckpointStmt, CloseCursorStmt, CreateDatabaseStmt, DeallocateStmt, DeclareCursorStmt,
-    DiscardStmt, DropDatabaseStmt, ExecuteStmt, FetchStmt, PrepareStmt, Statement, TransactionKind,
-    TransactionStmt, VariableSetStmt, VariableShowStmt,
+    DiscardStmt, DropDatabaseStmt, ExecuteStmt, FetchStmt, OptimizeTableStmt, PrepareStmt,
+    RefreshIndexOnTableStmt, Statement, TransactionKind, TransactionStmt, VariableSetStmt,
+    VariableShowStmt,
 };
 
 #[derive(Debug, Clone)]
@@ -27,6 +28,8 @@ pub enum UtilityCommand {
     VariableShow(VariableShowStmt),
     Discard(DiscardStmt),
     Checkpoint(CheckpointStmt),
+    OptimizeTable(Box<OptimizeTableStmt>),
+    RefreshIndexOnTable(Box<RefreshIndexOnTableStmt>),
     CreateDatabase(CreateDatabaseStmt),
     DropDatabase(DropDatabaseStmt),
 }
@@ -79,6 +82,8 @@ pub fn classify_statement(stmt: &Statement) -> StatementClass {
         | Statement::VariableShow(_)
         | Statement::Discard(_)
         | Statement::Checkpoint(_)
+        | Statement::OptimizeTable(_)
+        | Statement::RefreshIndexOnTable(_)
         | Statement::CreateDatabase(_)
         | Statement::DropDatabase(_)
         | Statement::Begin
@@ -98,6 +103,8 @@ pub fn utility_command_from_statement(stmt: Statement) -> UtilityCommand {
         Statement::VariableShow(stmt) => UtilityCommand::VariableShow(stmt),
         Statement::Discard(stmt) => UtilityCommand::Discard(stmt),
         Statement::Checkpoint(stmt) => UtilityCommand::Checkpoint(stmt),
+        Statement::OptimizeTable(stmt) => UtilityCommand::OptimizeTable(Box::new(stmt)),
+        Statement::RefreshIndexOnTable(stmt) => UtilityCommand::RefreshIndexOnTable(Box::new(stmt)),
         Statement::CreateDatabase(stmt) => UtilityCommand::CreateDatabase(stmt),
         Statement::DropDatabase(stmt) => UtilityCommand::DropDatabase(stmt),
         Statement::Begin => UtilityCommand::Transaction(TransactionStmt {
@@ -221,6 +228,8 @@ mod tests {
             "ROLLBACK",
             "SHOW ALL",
             "SET application_name = 'x'",
+            "OPTIMIZE TABLE t COMPACT",
+            "REFRESH VECTOR INDEX idx ON t",
         ] {
             let stmt = parse_stmt(sql);
             assert_eq!(classify_statement(&stmt), StatementClass::Utility);

@@ -421,7 +421,8 @@ mod tests {
         ApplyDescriptor, ArtifactNamespace, ArtifactRef, CleanupDescriptor,
         CompactionCumulativePointAction, DeferredTask, DeletePatchEncoding, DeletePatchGroup,
         DeletePatchInline, DeletePatchRef, DeletePatchSegment, RetiredRowsetInput,
-        RuntimeTransitionDescriptor, StorageCommitOp, TabletApplyOp, TabletMutation, VersionSpan,
+        RuntimeTransitionDescriptor, SearchGenerationHeadMeta, StorageCommitOp, TabletApplyOp,
+        TabletMutation, VersionSpan,
     };
     use paro_common::journal::{
         CheckpointFence, CommitRecord, JournalRecord, JournalRecordMetadata, MaintenanceKind,
@@ -712,6 +713,7 @@ mod tests {
         prop_oneof![
             Just(MaintenanceKind::Compaction),
             Just(MaintenanceKind::IndexBackfill),
+            Just(MaintenanceKind::SearchGenerationMaintenance),
             Just(MaintenanceKind::MaterializedViewRefresh),
         ]
     }
@@ -797,6 +799,39 @@ mod tests {
                         cumulative_point_action,
                     },
                 ),
+            (
+                arb_artifact_ref(),
+                arb_artifact_ref(),
+                1u64..1_000_000,
+                1u64..1_000_000,
+                1u64..1_000_000,
+                any::<u64>(),
+            )
+                .prop_map(
+                    |(
+                        staged_ref,
+                        generation_ref,
+                        definition_id,
+                        generation_id,
+                        root_version,
+                        config_fingerprint,
+                    )| TabletMutation::PublishSearchGeneration {
+                        publication:
+                            paro_common::effect::SearchGenerationPublication::InstallStaged {
+                                staged_ref,
+                            },
+                        generation_ref,
+                        head: SearchGenerationHeadMeta {
+                            definition_id,
+                            generation_id,
+                            root_version,
+                            config_fingerprint,
+                            root_file_name: format!(
+                                "manifest_g{generation_id}_v{root_version}.json"
+                            ),
+                        },
+                    },
+                ),
         ]
     }
 
@@ -830,6 +865,7 @@ mod tests {
                 Just(ArtifactNamespace::CanonicalRowset),
                 Just(ArtifactNamespace::Staged),
                 Just(ArtifactNamespace::DeletePatch),
+                Just(ArtifactNamespace::SearchGeneration),
             ],
             small_components(0..4),
         )

@@ -590,13 +590,14 @@ impl SegmentIterator {
         self.matched_prefix_widths = matched_prefix_widths;
         if let Some(tree) = predicate_tree {
             let use_late_materialization = explicit_predicate_columns.is_some();
-            let evaluator = IndexEvaluator::new(segment.predicate_indexes());
+            let evaluator =
+                IndexEvaluator::for_segment(segment.predicate_indexes()?, segment.num_rows());
             let needs_row_level_eval =
-                PredicateEvaluator::predicate_tree_requires_row_verification(&tree)
-                    || PredicateEvaluator::requires_row_level_predicate_eval(&evaluator, &tree);
+                PredicateEvaluator::requires_row_level_predicate_eval(&evaluator, &tree);
             let index_evaluation = evaluator.evaluate_with_proof(&tree);
-            self.predicate_guaranteed = index_evaluation.guaranteed;
-            self.evaluated_selection = index_evaluation.candidates;
+            let (candidates, guaranteed) = index_evaluation.into_parts();
+            self.predicate_guaranteed = guaranteed;
+            self.evaluated_selection = candidates;
             if needs_row_level_eval {
                 if !matches!(
                     self.evaluated_selection,

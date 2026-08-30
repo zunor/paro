@@ -1,7 +1,7 @@
 // Copyright 2024-2026 Zunor
 // SPDX-License-Identifier: Apache-2.0
 
-use crate::rowset::{RowsetId, RowsetSharedPtr};
+use crate::rowset::{RowsetId, RowsetRetentionLease, RowsetSharedPtr};
 use crate::tablet::Version;
 use std::fmt;
 
@@ -36,7 +36,7 @@ pub enum PolicyKind {
     Base,
     Cumulative,
     SizeTiered,
-    PrimaryKeyFull,
+    Goal,
 }
 
 impl fmt::Display for PolicyKind {
@@ -45,7 +45,7 @@ impl fmt::Display for PolicyKind {
             PolicyKind::Base => write!(f, "BASE"),
             PolicyKind::Cumulative => write!(f, "CUMULATIVE"),
             PolicyKind::SizeTiered => write!(f, "SIZE_TIERED"),
-            PolicyKind::PrimaryKeyFull => write!(f, "PRIMARY_KEY_FULL"),
+            PolicyKind::Goal => write!(f, "GOAL"),
         }
     }
 }
@@ -75,7 +75,16 @@ pub enum CompactionReason {
     BasePolicy,
     CumulativePolicy,
     SizeTieredPolicy,
-    PrimaryKeyFullDedup,
+    ExplicitCoalesce,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum CompactionGoal {
+    /// Background policy reduces debt only when the rewrite benefit clears
+    /// its write-amplification threshold.
+    ReduceDebt,
+    /// Foreground maintenance must leave no more than this many rowsets.
+    CoalesceTo { max_rowsets: usize },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -99,15 +108,32 @@ pub struct CompactionInput {
     pub rowset: RowsetSharedPtr,
     pub num_rows: u64,
     pub size_bytes: u64,
+    /// Keeps the rowset files and RSSID mappings alive from planning through
+    /// execution and publication. `Arc<Rowset>` alone is not a GC barrier.
+    retention: Option<RowsetRetentionLease>,
 }
 
 impl CompactionInput {
     pub fn new(rowset: RowsetSharedPtr) -> Self {
+        let retention = RowsetRetentionLease::acquire(rowset.clone());
+        Self::from_retention(rowset, retention)
+    }
+
+    pub(crate) fn from_retention(rowset: RowsetSharedPtr, retention: RowsetRetentionLease) -> Self {
+        assert!(
+            retention.retains(&rowset),
+            "compaction input retention lease belongs to another rowset"
+        );
         Self {
             num_rows: rowset.num_rows(),
             size_bytes: rowset.total_disk_size(),
             rowset,
+            retention: Some(retention),
         }
+    }
+
+    fn release_retention(&mut self) {
+        self.retention.take();
     }
 }
 
@@ -117,6 +143,15 @@ pub struct PkDeltaGuard {
     pub estimated_bytes: u64,
     pub max_rows: u64,
     pub max_bytes: u64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PrimaryIndexPublishPlan {
+    /// Apply a bounded in-memory delta in the ordered publication lane.
+    Incremental(PkDeltaGuard),
+    /// Publish the rowset and rebuild the primary index from durable visible
+    /// rowsets. Used when no legal rowset-level plan fits the delta envelope.
+    RebuildFromVisibleRowsets,
 }
 
 impl PkDeltaGuard {
@@ -139,10 +174,23 @@ pub struct CompactionPlan {
     pub output_rowset_id: RowsetId,
     pub score: f64,
     pub reason: CompactionReason,
-    pub pk_delta_guard: Option<PkDeltaGuard>,
+    pub goal: CompactionGoal,
+    pub primary_index_publish: Option<PrimaryIndexPublishPlan>,
 }
 
 impl CompactionPlan {
+    /// Release planning-time physical rowset leases after the task reaches a
+    /// terminal state.
+    ///
+    /// The plan keeps rowset identities for diagnostics, but completed work
+    /// must not delay retirement merely because an executor or caller retains
+    /// the task object after `run` returns.
+    pub(crate) fn release_input_retentions(&mut self) {
+        for input in &mut self.input_rowsets {
+            input.release_retention();
+        }
+    }
+
     pub fn planned_input_rows(&self) -> u64 {
         self.input_rowsets.iter().map(|input| input.num_rows).sum()
     }

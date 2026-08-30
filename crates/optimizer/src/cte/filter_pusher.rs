@@ -222,6 +222,7 @@ mod tests {
             LogicalOperator::CTERef(CTERef::new(
                 10,
                 table_index,
+                "nums".to_string(),
                 vec!["v".to_string()],
                 vec![LogicalType::Integer],
             ))

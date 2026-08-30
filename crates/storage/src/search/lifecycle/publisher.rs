@@ -1,7 +1,7 @@
 // Copyright 2024-2026 Zunor
 // SPDX-License-Identifier: Apache-2.0
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeSet;
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -9,8 +9,7 @@ use crate::rowset::RowsetId;
 use crate::tablet::ColumnId;
 
 use super::super::artifact::{ArtifactFileId, ArtifactLocation};
-use super::super::capability::{SearchArtifactRef, SearchIndexKind};
-use super::super::cursor::GenerationArtifactSet;
+use super::super::capability::{SearchArtifactRef, SearchIndexKind, SearchPartitionCoverage};
 use super::super::manifest::LoadedManifest;
 use super::super::sidecar::SidecarArtifactStore;
 use super::super::stats::SearchGenerationId;
@@ -47,32 +46,14 @@ pub(crate) fn assign_generation_id(
         .collect()
 }
 
-pub(crate) fn replace_artifacts(
-    current: &GenerationArtifactSet,
-    replacements: impl IntoIterator<Item = SearchArtifactRef>,
-) -> GenerationArtifactSet {
-    let mut replacements = replacements
-        .into_iter()
-        .map(|artifact| (search_artifact_key(&artifact), artifact))
-        .collect::<BTreeMap<_, _>>();
-    let mut artifacts = Vec::with_capacity(current.artifacts.len() + replacements.len());
-    for artifact in &current.artifacts {
-        let key = search_artifact_key(artifact);
-        if let Some(replacement) = replacements.remove(&key) {
-            artifacts.push(replacement);
-        } else {
-            artifacts.push(artifact.clone());
-        }
-    }
-    artifacts.extend(replacements.into_values());
-    GenerationArtifactSet { artifacts }
-}
-
-pub(crate) fn search_artifact_key(artifact: &SearchArtifactRef) -> (RowsetId, u32, ColumnId) {
+pub(crate) fn search_artifact_key(
+    artifact: &SearchArtifactRef,
+) -> (SearchPartitionCoverage, ColumnId, SearchIndexKind, u32) {
     (
-        artifact.segment.rowset_id,
-        artifact.segment.segment_id,
+        artifact.coverage.clone(),
         artifact.column_id,
+        artifact.kind,
+        artifact.provider_variant,
     )
 }
 

@@ -10,7 +10,6 @@
 use crate::primary_key::DeleteVector;
 use crate::rowset::{RowsetSharedPtr, SegmentOptions, SegmentSharedPtr};
 use crate::tablet::TabletRef;
-use crate::transaction::spill::StagedRowsetArtifact;
 use crate::transaction::write_buffer::{PendingPrimaryKeyEntry, StorageTxnState};
 use paro_common::error::Result;
 use paro_transaction::{CommandId, TransactionView};
@@ -20,72 +19,11 @@ use std::sync::Arc;
 pub type OverlayDeleteVectorMap = HashMap<(u64, u32), DeleteVector>;
 
 #[derive(Debug, Clone)]
-pub struct SpilledArtifactReader {
-    tablet_id: u64,
-    command_id: CommandId,
-    artifact_id: u64,
-    sequence: u64,
-    bytes: u64,
-    rowset: RowsetSharedPtr,
-}
-
-impl SpilledArtifactReader {
-    pub(crate) fn from_rowset(rowset: RowsetSharedPtr, artifact: StagedRowsetArtifact) -> Self {
-        Self {
-            tablet_id: artifact.tablet_id(),
-            command_id: artifact.command_id(),
-            artifact_id: artifact.artifact_id(),
-            sequence: artifact.sequence(),
-            bytes: artifact.bytes(),
-            rowset,
-        }
-    }
-
-    #[inline]
-    pub fn tablet_id(&self) -> u64 {
-        self.tablet_id
-    }
-
-    #[inline]
-    pub fn command_id(&self) -> CommandId {
-        self.command_id
-    }
-
-    #[inline]
-    pub fn artifact_id(&self) -> u64 {
-        self.artifact_id
-    }
-
-    #[inline]
-    pub fn sequence(&self) -> u64 {
-        self.sequence
-    }
-
-    #[inline]
-    pub fn bytes(&self) -> u64 {
-        self.bytes
-    }
-
-    fn segments_with_options(
-        &self,
-        options: SegmentOptions,
-    ) -> Result<Vec<(RowsetSharedPtr, SegmentSharedPtr)>> {
-        Ok(self
-            .rowset
-            .segments_with_options(options)?
-            .into_iter()
-            .map(|segment| (self.rowset.clone(), segment))
-            .collect())
-    }
-}
-
-#[derive(Debug, Clone)]
 pub struct TxnOverlayReader {
     tablet_id: u64,
     command_id: CommandId,
     rowsets: Vec<RowsetSharedPtr>,
     delete_vectors: Arc<OverlayDeleteVectorMap>,
-    spilled_artifacts: Vec<SpilledArtifactReader>,
     primary_keys: HashMap<Vec<u8>, PendingPrimaryKeyEntry>,
 }
 
@@ -107,14 +45,7 @@ impl TxnOverlayReader {
                 .mark_deleted(location.row_offset);
         }
 
-        let spilled_artifacts = snapshot
-            .spilled_rowsets
-            .into_iter()
-            .map(|(rowset, artifact)| SpilledArtifactReader::from_rowset(rowset, artifact))
-            .collect::<Vec<_>>();
-
         if snapshot.rowsets.is_empty()
-            && spilled_artifacts.is_empty()
             && delete_vectors.is_empty()
             && snapshot.primary_keys.is_empty()
         {
@@ -126,7 +57,6 @@ impl TxnOverlayReader {
             command_id,
             rowsets: snapshot.rowsets,
             delete_vectors: Arc::new(delete_vectors),
-            spilled_artifacts,
             primary_keys: snapshot.primary_keys,
         }))
     }
@@ -147,13 +77,7 @@ impl TxnOverlayReader {
     }
 
     pub fn all_rowsets(&self) -> Vec<RowsetSharedPtr> {
-        let mut rowsets = self.rowsets.clone();
-        rowsets.extend(
-            self.spilled_artifacts
-                .iter()
-                .map(|artifact| artifact.rowset.clone()),
-        );
-        rowsets
+        self.rowsets.clone()
     }
 
     #[inline]
@@ -168,11 +92,6 @@ impl TxnOverlayReader {
         } else {
             Some(Arc::clone(&self.delete_vectors))
         }
-    }
-
-    #[inline]
-    pub fn spilled_artifacts(&self) -> &[SpilledArtifactReader] {
-        &self.spilled_artifacts
     }
 
     pub(crate) fn primary_key_entry(&self, key: &[u8]) -> Option<PendingPrimaryKeyEntry> {
@@ -191,12 +110,9 @@ impl TxnOverlayReader {
     ) -> Result<Vec<(RowsetSharedPtr, SegmentSharedPtr)>> {
         let mut segments = Vec::new();
         for rowset in &self.rowsets {
-            for segment in rowset.segments_with_options(options.clone())? {
+            for segment in rowset.open_segment_view(options.clone())? {
                 segments.push((rowset.clone(), segment));
             }
-        }
-        for artifact in &self.spilled_artifacts {
-            segments.extend(artifact.segments_with_options(options.clone())?);
         }
         Ok(segments)
     }

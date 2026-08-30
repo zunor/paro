@@ -14,7 +14,19 @@ use paro_common::runtime_value::Value;
 use paro_common::types::LogicalType;
 use paro_parser::ast::{ColumnID, ColumnRef, CreateIndexStmt, Expr, IndexKind};
 use paro_storage::index::fulltext::tokenizer::TokenizerKind;
+use paro_storage::index::hnsw::{DistanceMetric, HnswRerankPolicy};
 use paro_storage::index::IndexConstraintType;
+use paro_storage::search::{
+    HnswInlineConfig, HnswInlineThreshold, HnswProviderConfig, DEFAULT_HNSW_BUILD_SEED,
+    DEFAULT_HNSW_EF_CONSTRUCT, DEFAULT_HNSW_EF_SEARCH, DEFAULT_HNSW_EXACT_F32_DIMENSION_COST_UNITS,
+    DEFAULT_HNSW_FILTER_BLOCK_ROWS, DEFAULT_HNSW_FILTER_M, DEFAULT_HNSW_GRAPH_SCORED_POINTS_PER_EF,
+    DEFAULT_HNSW_M, DEFAULT_HNSW_PROPOSAL_WAVE_MAX_SIZE, DEFAULT_HNSW_RANDOM_ACCESS_COST_UNITS,
+    DEFAULT_HNSW_SEQUENTIAL_DIMENSION_COST_UNITS, DEFAULT_HNSW_SYMMETRIC_I16_DIMENSION_COST_UNITS,
+    DEFAULT_HNSW_WARMUP_POINT_COUNT,
+};
+use serde_json::{json, Value as JsonValue};
+use std::collections::BTreeMap;
+use std::num::NonZeroU32;
 use std::sync::Arc;
 
 const SIMPLE_CONFIG: &str = "simple";
@@ -215,6 +227,455 @@ fn validate_sparse_index_definition(column_types: &[LogicalType]) -> Result<()> 
     Ok(())
 }
 
+fn validate_hnsw_index_definition(
+    binder: &Binder,
+    table: &TableCatalogEntry,
+    schema_name: &str,
+    index_name: &str,
+    column_ids: &[LogicalIndex],
+) -> Result<()> {
+    let [column_id] = column_ids else {
+        return Err(paro_error::invalid_input(
+            "HNSW index requires exactly one VECTOR(N) column",
+        ));
+    };
+    let schema = binder
+        .catalog()
+        .get_schema(&binder.catalog_txn_view(), schema_name)?;
+    for existing in schema.indexes_for_table(&binder.catalog_txn_view(), table.base.base.object_id)
+    {
+        if existing.name() == index_name || existing.index_type != IndexType::HNSW {
+            continue;
+        }
+        if existing.column_ids.as_slice() == [*column_id] {
+            return Err(paro_error::invalid_input(format!(
+                "HNSW index '{}' already exists on column {}; one physical HNSW contract per column is supported",
+                existing.name(), column_id.index
+            )));
+        }
+    }
+    Ok(())
+}
+
+fn parse_u64_index_option(
+    options: &BTreeMap<String, String>,
+    name: &str,
+    default: u64,
+) -> Result<u64> {
+    options.get(name).map_or(Ok(default), |value| {
+        value.parse::<u64>().map_err(|_| {
+            paro_error::invalid_input(format!(
+                "HNSW index option {name} must be a non-negative integer, got '{value}'"
+            ))
+        })
+    })
+}
+
+fn parse_bool_index_option(
+    options: &BTreeMap<String, String>,
+    name: &str,
+    default: bool,
+) -> Result<bool> {
+    options.get(name).map_or(Ok(default), |value| {
+        match value.to_ascii_lowercase().as_str() {
+            "true" | "on" | "1" => Ok(true),
+            "false" | "off" | "0" => Ok(false),
+            _ => Err(paro_error::invalid_input(format!(
+                "HNSW index option {name} must be true or false, got '{value}'"
+            ))),
+        }
+    })
+}
+
+fn hnsw_provider_config(
+    options: &BTreeMap<String, String>,
+    column_types: &[LogicalType],
+    column_ids: &[LogicalIndex],
+    table: &TableCatalogEntry,
+) -> Result<JsonValue> {
+    let [LogicalType::Array(inner, dimension)] = column_types else {
+        return Err(paro_error::not_supported(
+            "HNSW index requires exactly one VECTOR(N) column",
+        ));
+    };
+    if !matches!(inner.as_ref(), LogicalType::Float) {
+        return Err(paro_error::not_supported(
+            "HNSW index requires exactly one VECTOR(N) column",
+        ));
+    }
+
+    const TYPE_KEYS: &[&str] = &["mode", "kind", "type", "index_type", "vector_mode"];
+    const HNSW_KEYS: &[&str] = &[
+        "m",
+        "ef_construct",
+        "ef_search",
+        "rerank_window",
+        "distance",
+        "build_vector_encoding",
+        "build_routing_dimensions",
+        "build_seed",
+        "random_access_cost_units",
+        "exact_f32_dimension_cost_units",
+        "sequential_dimension_cost_units",
+        "symmetric_i16_dimension_cost_units",
+        "graph_scored_points_per_ef",
+        "distance_cost_calibration_id",
+        "generation_target_graph_rows",
+        "maintenance_target_vector_bytes",
+        "maintenance_max_pending_vector_bytes",
+        "maintenance_compaction_fanout",
+        "filter_columns",
+        "filter_block_rows",
+        "filter_m",
+        "inline_enabled",
+        "inline_max_vector_count",
+        "inline_max_graph_memory_bytes",
+        "inline_max_dimension",
+    ];
+    if let Some(unknown) = options
+        .keys()
+        .find(|key| !TYPE_KEYS.contains(&key.as_str()) && !HNSW_KEYS.contains(&key.as_str()))
+    {
+        return Err(paro_error::invalid_input(format!(
+            "Unknown HNSW index option '{unknown}'"
+        )));
+    }
+
+    let inline_defaults = HnswInlineThreshold::DEFAULT;
+    let m = parse_u64_index_option(options, "m", u64::from(DEFAULT_HNSW_M))?;
+    if !(2..=1_024).contains(&m) {
+        return Err(paro_error::invalid_input(format!(
+            "HNSW index option m must be between 2 and 1024, got {m}"
+        )));
+    }
+    let ef_construct = parse_u64_index_option(
+        options,
+        "ef_construct",
+        u64::from(DEFAULT_HNSW_EF_CONSTRUCT),
+    )?;
+    if ef_construct < m || ef_construct > 1_000_000 {
+        return Err(paro_error::invalid_input(format!(
+            "HNSW index option ef_construct must be between m ({m}) and 1000000, got {ef_construct}"
+        )));
+    }
+    let ef_search =
+        parse_u64_index_option(options, "ef_search", u64::from(DEFAULT_HNSW_EF_SEARCH))?;
+    if ef_search == 0 || ef_search > 1_000_000 {
+        return Err(paro_error::invalid_input(format!(
+            "HNSW index option ef_search must be between 1 and 1000000, got {ef_search}"
+        )));
+    }
+    let distance_name = options.get("distance").map(String::as_str).unwrap_or("l2");
+    let distance = DistanceMetric::parse_sql_name(distance_name).ok_or_else(|| {
+        paro_error::invalid_input(format!(
+            "HNSW index option distance must be one of l2, cosine, ip, or l1, got '{distance_name}'"
+        ))
+    })?;
+    let compact_build_vectors = match options.get("build_vector_encoding").map(String::as_str) {
+        None => None,
+        Some(value) => match value.to_ascii_lowercase().as_str() {
+        "exact_f32" | "f32" => Some(false),
+        "symmetric_i16" | "i16" => Some(true),
+        value => {
+            return Err(paro_error::invalid_input(format!(
+                "HNSW index option build_vector_encoding must be exact_f32 or symmetric_i16, got '{value}'"
+            )))
+        },
+        },
+    };
+    let build_seed = parse_u64_index_option(options, "build_seed", DEFAULT_HNSW_BUILD_SEED)?;
+    let cost_option_names = [
+        "random_access_cost_units",
+        "exact_f32_dimension_cost_units",
+        "sequential_dimension_cost_units",
+        "symmetric_i16_dimension_cost_units",
+        "graph_scored_points_per_ef",
+    ];
+    let cost_option_count = cost_option_names
+        .iter()
+        .filter(|name| options.contains_key(**name))
+        .count();
+    let calibration_id = options
+        .get("distance_cost_calibration_id")
+        .map(|_| parse_u64_index_option(options, "distance_cost_calibration_id", 0))
+        .transpose()?;
+    let distance_cost = match (cost_option_count, calibration_id) {
+        (0, None) => paro_storage::index::hnsw::HnswDistanceCostProfile::default(),
+        (5, Some(calibration_id)) if calibration_id != 0 => {
+            paro_storage::index::hnsw::HnswDistanceCostProfile {
+                source:
+                    paro_storage::index::hnsw::HnswDistanceCostProfileSource::OfflineCalibration {
+                        calibration_id,
+                    },
+                random_access_cost_units: u32::try_from(parse_u64_index_option(
+                    options,
+                    "random_access_cost_units",
+                    u64::from(DEFAULT_HNSW_RANDOM_ACCESS_COST_UNITS),
+                )?)
+                .map_err(|_| paro_error::out_of_range("HNSW random_access_cost_units"))?,
+                exact_f32_dimension_cost_units: u32::try_from(parse_u64_index_option(
+                    options,
+                    "exact_f32_dimension_cost_units",
+                    u64::from(DEFAULT_HNSW_EXACT_F32_DIMENSION_COST_UNITS),
+                )?)
+                .map_err(|_| paro_error::out_of_range("HNSW exact_f32_dimension_cost_units"))?,
+                sequential_dimension_cost_units: u32::try_from(parse_u64_index_option(
+                    options,
+                    "sequential_dimension_cost_units",
+                    u64::from(DEFAULT_HNSW_SEQUENTIAL_DIMENSION_COST_UNITS),
+                )?)
+                .map_err(|_| paro_error::out_of_range("HNSW sequential_dimension_cost_units"))?,
+                symmetric_i16_dimension_cost_units: u32::try_from(parse_u64_index_option(
+                    options,
+                    "symmetric_i16_dimension_cost_units",
+                    u64::from(DEFAULT_HNSW_SYMMETRIC_I16_DIMENSION_COST_UNITS),
+                )?)
+                .map_err(|_| paro_error::out_of_range("HNSW symmetric_i16_dimension_cost_units"))?,
+                graph_scored_points_per_ef: u32::try_from(parse_u64_index_option(
+                    options,
+                    "graph_scored_points_per_ef",
+                    u64::from(DEFAULT_HNSW_GRAPH_SCORED_POINTS_PER_EF),
+                )?)
+                .map_err(|_| paro_error::out_of_range("HNSW graph_scored_points_per_ef"))?,
+            }
+        }
+        (5, Some(0)) => {
+            return Err(paro_error::invalid_input(
+                "HNSW distance_cost_calibration_id must be non-zero",
+            ));
+        }
+        _ => {
+            return Err(paro_error::invalid_input(
+                "HNSW distance-cost tuning requires all five physical cost coefficients and a non-zero distance_cost_calibration_id",
+            ));
+        }
+    };
+    let mut filter_columns = options
+        .get("filter_columns")
+        .map(|value| {
+            value
+                .split(',')
+                .map(str::trim)
+                .filter(|name| !name.is_empty())
+                .map(|name| {
+                    let index = table.get_column_index(name).ok_or_else(|| {
+                        paro_error::column_not_found(format!(
+                            "HNSW filter column '{name}' not found in table {}",
+                            table.base.base.name
+                        ))
+                    })?;
+                    u32::try_from(index)
+                        .map_err(|_| paro_error::out_of_range("HNSW filter column id"))
+                })
+                .collect::<Result<Vec<_>>>()
+        })
+        .transpose()?
+        .unwrap_or_default();
+    filter_columns.sort_unstable();
+    if filter_columns.windows(2).any(|pair| pair[0] == pair[1]) {
+        return Err(paro_error::invalid_input(
+            "HNSW filter_columns must not contain duplicates",
+        ));
+    }
+    if let [vector_column] = column_ids {
+        let vector_column = u32::try_from(vector_column.index)
+            .map_err(|_| paro_error::out_of_range("HNSW vector column id"))?;
+        if filter_columns.binary_search(&vector_column).is_ok() {
+            return Err(paro_error::invalid_input(
+                "HNSW filter_columns must not include the indexed vector column",
+            ));
+        }
+    }
+    let filter_block_rows = parse_u64_index_option(
+        options,
+        "filter_block_rows",
+        u64::from(DEFAULT_HNSW_FILTER_BLOCK_ROWS),
+    )?;
+    let filter_m = parse_u64_index_option(options, "filter_m", u64::from(DEFAULT_HNSW_FILTER_M))?;
+    let inline_enabled = parse_bool_index_option(options, "inline_enabled", true)?;
+    if !inline_enabled
+        && [
+            "inline_max_vector_count",
+            "inline_max_graph_memory_bytes",
+            "inline_max_dimension",
+        ]
+        .iter()
+        .any(|name| options.contains_key(*name))
+    {
+        return Err(paro_error::invalid_input(
+            "disabled HNSW inline mode cannot specify inline_max_* limits",
+        ));
+    }
+    let inline_max_vector_count = if inline_enabled {
+        parse_u64_index_option(
+            options,
+            "inline_max_vector_count",
+            inline_defaults.max_vector_count,
+        )?
+    } else {
+        0
+    };
+    let inline_max_graph_memory_bytes = if inline_enabled {
+        parse_u64_index_option(
+            options,
+            "inline_max_graph_memory_bytes",
+            inline_defaults.max_graph_memory_bytes,
+        )?
+    } else {
+        0
+    };
+    let inline_max_dimension = if inline_enabled {
+        parse_u64_index_option(
+            options,
+            "inline_max_dimension",
+            u64::from(inline_defaults.max_dimension),
+        )?
+    } else {
+        0
+    };
+    if inline_max_dimension > u64::from(u32::MAX) {
+        return Err(paro_error::invalid_input(format!(
+            "HNSW index option inline_max_dimension exceeds {}, got {inline_max_dimension}",
+            u32::MAX
+        )));
+    }
+
+    let dimension = u32::try_from(*dimension).map_err(|_| {
+        paro_error::invalid_input(format!("HNSW vector dimension exceeds {}", u32::MAX))
+    })?;
+    let default_build_vector_encoding =
+        paro_storage::index::hnsw::HnswBuildVectorEncoding::default_for_dimension(dimension)?;
+    let compact_build_vectors = compact_build_vectors
+        .unwrap_or_else(|| default_build_vector_encoding.routing_dimensions().is_some());
+    let build_routing_dimensions = if compact_build_vectors {
+        parse_u64_index_option(
+            options,
+            "build_routing_dimensions",
+            u64::from(
+                default_build_vector_encoding
+                    .routing_dimensions()
+                    .unwrap_or_else(|| {
+                        dimension
+                            .min(paro_storage::index::hnsw::DEFAULT_HNSW_BUILD_ROUTING_DIMENSIONS)
+                            as u16
+                    }),
+            ),
+        )?
+    } else {
+        parse_u64_index_option(options, "build_routing_dimensions", 0)?
+    };
+    let build_routing_dimensions = u32::try_from(build_routing_dimensions).map_err(|_| {
+        paro_error::invalid_input("HNSW build_routing_dimensions exceeds durable u32 width")
+    })?;
+    let build_vector_encoding = if compact_build_vectors {
+        paro_storage::index::hnsw::HnswBuildVectorEncoding::symmetric_i16(build_routing_dimensions)?
+    } else if build_routing_dimensions == 0 {
+        paro_storage::index::hnsw::HnswBuildVectorEncoding::ExactF32
+    } else {
+        return Err(paro_error::invalid_input(
+            "exact_f32 HNSW construction does not accept build_routing_dimensions",
+        ));
+    };
+    let rerank_policy = match options.get("rerank_window").map(String::as_str) {
+        None => HnswRerankPolicy::default_for_encoding(build_vector_encoding),
+        Some(value) if value.eq_ignore_ascii_case("top_k") => HnswRerankPolicy::TopK,
+        Some(value) if value.eq_ignore_ascii_case("ef") => HnswRerankPolicy::Ef,
+        Some(value) => {
+            let candidates = value.parse::<u32>().map_err(|_| {
+                paro_error::invalid_input(format!(
+                    "HNSW rerank_window must be top_k, ef, or a positive integer, got '{value}'"
+                ))
+            })?;
+            HnswRerankPolicy::Fixed {
+                candidates: NonZeroU32::new(candidates).ok_or_else(|| {
+                    paro_error::invalid_input("HNSW rerank_window must be greater than zero")
+                })?,
+            }
+        }
+    };
+    let maintenance = paro_storage::search::HnswMaintenancePolicy {
+        target_vector_bytes: parse_u64_index_option(
+            options,
+            "maintenance_target_vector_bytes",
+            paro_storage::search::DEFAULT_HNSW_MAINTENANCE_TARGET_VECTOR_BYTES,
+        )?,
+        max_pending_vector_bytes: parse_u64_index_option(
+            options,
+            "maintenance_max_pending_vector_bytes",
+            paro_storage::search::DEFAULT_HNSW_MAINTENANCE_MAX_PENDING_VECTOR_BYTES,
+        )?,
+        compaction_fanout: u32::try_from(parse_u64_index_option(
+            options,
+            "maintenance_compaction_fanout",
+            u64::from(paro_storage::search::DEFAULT_HNSW_MAINTENANCE_COMPACTION_FANOUT),
+        )?)
+        .map_err(|_| paro_error::out_of_range("HNSW maintenance_compaction_fanout"))?,
+    };
+    let generation_layout = paro_storage::search::HnswGenerationLayout {
+        target_graph_rows: parse_u64_index_option(
+            options,
+            "generation_target_graph_rows",
+            paro_storage::search::DEFAULT_HNSW_GENERATION_TARGET_GRAPH_ROWS,
+        )?,
+    };
+    HnswProviderConfig {
+        version: paro_storage::search::HNSW_PROVIDER_CONFIG_VERSION,
+        dimension,
+        distance,
+        build_vector_encoding,
+        m: u32::try_from(m).map_err(|_| paro_error::out_of_range("HNSW m"))?,
+        ef_construct: u32::try_from(ef_construct)
+            .map_err(|_| paro_error::out_of_range("HNSW ef_construct"))?,
+        ef_search: u32::try_from(ef_search)
+            .map_err(|_| paro_error::out_of_range("HNSW ef_search"))?,
+        rerank_policy,
+        distance_cost,
+        generation_layout,
+        maintenance,
+        build_seed,
+        proposal_wave_max_size: DEFAULT_HNSW_PROPOSAL_WAVE_MAX_SIZE,
+        warmup_point_count: DEFAULT_HNSW_WARMUP_POINT_COUNT,
+        filter_columns,
+        filter_block_rows: u32::try_from(filter_block_rows)
+            .map_err(|_| paro_error::out_of_range("HNSW filter_block_rows"))?,
+        filter_m: u32::try_from(filter_m).map_err(|_| paro_error::out_of_range("HNSW filter_m"))?,
+        inline_threshold: HnswInlineConfig {
+            enabled: inline_enabled,
+            max_vector_count: inline_max_vector_count,
+            max_graph_memory_bytes: inline_max_graph_memory_bytes,
+            max_dimension: inline_max_dimension as u32,
+        },
+    }
+    .validated()?
+    .to_value()
+}
+
+fn provider_config_for_index(
+    stmt: &CreateIndexStmt,
+    index_type: IndexType,
+    column_ids: &[LogicalIndex],
+    column_types: &[LogicalType],
+    fulltext_binding: Option<&(LogicalIndex, String)>,
+    table: &TableCatalogEntry,
+) -> Result<JsonValue> {
+    match index_type {
+        IndexType::HNSW => {
+            hnsw_provider_config(&stmt.index_options, column_types, column_ids, table)
+        }
+        IndexType::Sparse => Ok(json!({
+            "version": paro_storage::search::SPARSE_PROVIDER_CONFIG_VERSION,
+            "physical_encoding": "binary-v1"
+        })),
+        IndexType::FullText => Ok(json!({
+            "version": paro_storage::search::FULLTEXT_PROVIDER_CONFIG_VERSION,
+            "config": fulltext_binding
+                .map(|(_, config)| config.as_str())
+                .unwrap_or(SIMPLE_CONFIG)
+        })),
+        _ => Ok(json!({})),
+    }
+}
+
 /// Bind a CREATE INDEX statement
 pub fn bind_create_index(binder: &mut Binder, stmt: CreateIndexStmt) -> Result<BoundStatementKind> {
     // 1. Resolve table name
@@ -329,6 +790,23 @@ pub fn bind_create_index(binder: &mut Binder, stmt: CreateIndexStmt) -> Result<B
     if index_type == IndexType::Sparse {
         validate_sparse_index_definition(&column_types)?;
     }
+    if index_type == IndexType::HNSW {
+        validate_hnsw_index_definition(
+            binder,
+            table.as_ref(),
+            &schema_name,
+            &index_name,
+            &column_ids,
+        )?;
+    }
+    let provider_config = provider_config_for_index(
+        &stmt,
+        index_type,
+        &column_ids,
+        &column_types,
+        fulltext_binding.as_ref(),
+        table.as_ref(),
+    )?;
 
     // 9. Determine constraint type
     let _constraint_type = IndexConstraintType::None; // Default for now
@@ -346,6 +824,7 @@ pub fn bind_create_index(binder: &mut Binder, stmt: CreateIndexStmt) -> Result<B
     )
     .with_catalog(database_name)
     .with_index_type(index_type)
+    .with_provider_config(provider_config)
     .with_sql(sql.clone());
     if let Some((column_id, config)) = fulltext_binding {
         info = info.with_fulltext_options(column_id, config);
@@ -555,6 +1034,233 @@ mod tests {
         assert_eq!(bound.info.index_type, IndexType::Sparse);
         assert_eq!(bound.info.column_ids, vec![LogicalIndex::new(0)]);
         assert_eq!(bound.info.column_types, vec![LogicalType::Blob]);
+    }
+
+    #[test]
+    fn bind_create_hnsw_index_persists_typed_provider_config() {
+        let vector_type = LogicalType::Array(Box::new(LogicalType::Float), 100);
+        let mut binder = test_binder_with_public_table(
+            "items",
+            &[("bucket", LogicalType::Integer), ("embedding", vector_type)],
+        );
+
+        let bound = bind_create_index(
+            &mut binder,
+            parse_create_index_stmt(
+                "CREATE VECTOR INDEX idx_items_embedding ON items (embedding) \
+                 m = 32 ef_construct = 160 ef_search = 96 distance = cosine \
+                 build_seed = 42 \
+                 random_access_cost_units = 416 \
+                 exact_f32_dimension_cost_units = 1 \
+                 sequential_dimension_cost_units = 1 \
+                 symmetric_i16_dimension_cost_units = 1 \
+                 graph_scored_points_per_ef = 20 distance_cost_calibration_id = 42 \
+                 rerank_window = top_k \
+                 generation_target_graph_rows = 1500000 \
+                 filter_columns = 'bucket' filter_block_rows = 4096 filter_m = 12 \
+                 inline_max_vector_count = 90000 \
+                 inline_max_graph_memory_bytes = 268435456 \
+                 inline_max_dimension = 256",
+            ),
+        )
+        .expect("HNSW options should bind");
+
+        let BoundStatementKind::CreateIndex(bound) = bound else {
+            panic!("expected bound CREATE INDEX");
+        };
+        assert_eq!(bound.info.index_type, IndexType::HNSW);
+        assert_eq!(bound.info.provider_config["m"], 32);
+        assert_eq!(bound.info.provider_config["ef_construct"], 160);
+        assert_eq!(bound.info.provider_config["ef_search"], 96);
+        assert_eq!(bound.info.provider_config["rerank_policy"], "top_k");
+        assert_eq!(bound.info.provider_config["distance"], "cosine");
+        assert_eq!(
+            bound.info.provider_config["build_vector_encoding"],
+            "exact_f32"
+        );
+        assert_eq!(bound.info.provider_config["build_seed"], 42);
+        assert_eq!(
+            bound.info.provider_config["version"],
+            paro_storage::search::HNSW_PROVIDER_CONFIG_VERSION
+        );
+        assert_eq!(bound.info.provider_config["dimension"], 100);
+        assert_eq!(
+            bound.info.provider_config["distance_cost"]["source"]["kind"],
+            "offline_calibration"
+        );
+        assert_eq!(
+            bound.info.provider_config["distance_cost"]["source"]["calibration_id"],
+            42
+        );
+        assert_eq!(
+            bound.info.provider_config["distance_cost"]["graph_scored_points_per_ef"],
+            20
+        );
+        assert_eq!(
+            bound.info.provider_config["distance_cost"]["random_access_cost_units"],
+            416
+        );
+        assert_eq!(
+            bound.info.provider_config["generation_layout"]["target_graph_rows"],
+            1_500_000
+        );
+        assert_eq!(
+            bound.info.provider_config["filter_columns"],
+            serde_json::json!([0])
+        );
+        assert_eq!(bound.info.provider_config["filter_block_rows"], 4_096);
+        assert_eq!(bound.info.provider_config["filter_m"], 12);
+        assert_eq!(
+            bound.info.provider_config["inline_threshold"]["enabled"],
+            true
+        );
+        assert_eq!(
+            bound.info.provider_config["inline_threshold"]["max_vector_count"],
+            90_000
+        );
+    }
+
+    #[test]
+    fn bind_create_hnsw_rejects_partial_or_unidentified_cost_tuning() {
+        let vector_type = LogicalType::Array(Box::new(LogicalType::Float), 32);
+        let mut binder =
+            test_binder_with_public_table("items", &[("embedding", vector_type.clone())]);
+        let partial = bind_create_index(
+            &mut binder,
+            parse_create_index_stmt(
+                "CREATE VECTOR INDEX idx_partial ON items (embedding) \
+                 graph_scored_points_per_ef = 20",
+            ),
+        )
+        .unwrap_err();
+        assert!(partial
+            .to_string()
+            .contains("requires all five physical cost coefficients"));
+
+        let mut binder = test_binder_with_public_table("items", &[("embedding", vector_type)]);
+        let unidentified = bind_create_index(
+            &mut binder,
+            parse_create_index_stmt(
+                "CREATE VECTOR INDEX idx_unidentified ON items (embedding) \
+                 random_access_cost_units = 416 \
+                 exact_f32_dimension_cost_units = 1 \
+                 sequential_dimension_cost_units = 1 \
+                 symmetric_i16_dimension_cost_units = 1 \
+                 graph_scored_points_per_ef = 20",
+            ),
+        )
+        .unwrap_err();
+        assert!(unidentified
+            .to_string()
+            .contains("non-zero distance_cost_calibration_id"));
+    }
+
+    #[test]
+    fn explicit_compact_encoding_defaults_to_the_available_routing_dimensions() {
+        let vector_type = LogicalType::Array(Box::new(LogicalType::Float), 128);
+        let mut binder = test_binder_with_public_table("items", &[("embedding", vector_type)]);
+
+        let bound = bind_create_index(
+            &mut binder,
+            parse_create_index_stmt(
+                "CREATE VECTOR INDEX idx_compact ON items (embedding) \
+                 build_vector_encoding = symmetric_i16",
+            ),
+        )
+        .expect("explicit compact encoding should bind at the auto-encoding boundary");
+        let BoundStatementKind::CreateIndex(bound) = bound else {
+            panic!("expected bound CREATE INDEX");
+        };
+        assert_eq!(
+            bound.info.provider_config["build_vector_encoding"]["symmetric_i16"]
+                ["routing_dimensions"],
+            128
+        );
+        assert_eq!(bound.info.provider_config["rerank_policy"], "ef");
+
+        let auto = bind_create_index(
+            &mut binder,
+            parse_create_index_stmt("CREATE VECTOR INDEX idx_auto ON items (embedding)"),
+        )
+        .expect("128d auto encoding should use the storage-owned default");
+        let BoundStatementKind::CreateIndex(auto) = auto else {
+            panic!("expected bound CREATE INDEX");
+        };
+        assert_eq!(
+            auto.info.provider_config["build_vector_encoding"],
+            bound.info.provider_config["build_vector_encoding"]
+        );
+        assert_eq!(auto.info.provider_config["rerank_policy"], "ef");
+    }
+
+    #[test]
+    fn bind_create_hnsw_index_rejects_unknown_or_invalid_options() {
+        let vector_type = LogicalType::Array(Box::new(LogicalType::Float), 8);
+        let mut binder = test_binder_with_public_table("items", &[("embedding", vector_type)]);
+
+        let unknown = bind_create_index(
+            &mut binder,
+            parse_create_index_stmt(
+                "CREATE VECTOR INDEX idx_unknown ON items (embedding) magic = 1",
+            ),
+        )
+        .expect_err("unknown HNSW option should fail");
+        assert!(unknown.to_string().contains("Unknown HNSW index option"));
+
+        let retired_threshold = bind_create_index(
+            &mut binder,
+            parse_create_index_stmt(
+                "CREATE VECTOR INDEX idx_retired_threshold ON items (embedding) \
+                 filtered_plain_scan_threshold = 20000",
+            ),
+        )
+        .expect_err("retired cardinality threshold should fail instead of becoming a no-op");
+        assert!(retired_threshold
+            .to_string()
+            .contains("Unknown HNSW index option"));
+
+        let invalid = bind_create_index(
+            &mut binder,
+            parse_create_index_stmt(
+                "CREATE VECTOR INDEX idx_invalid ON items (embedding) m = 32 ef_construct = 16",
+            ),
+        )
+        .expect_err("ef_construct below m should fail");
+        assert!(invalid.to_string().contains("must be between m (32)"));
+
+        let invalid_distance = bind_create_index(
+            &mut binder,
+            parse_create_index_stmt(
+                "CREATE VECTOR INDEX idx_bad_distance ON items (embedding) distance = hamming",
+            ),
+        )
+        .expect_err("unsupported HNSW distance should fail");
+        assert!(invalid_distance
+            .to_string()
+            .contains("must be one of l2, cosine, ip, or l1"));
+
+        let invalid_inline_dimension = bind_create_index(
+            &mut binder,
+            parse_create_index_stmt(
+                "CREATE VECTOR INDEX idx_bad_inline ON items (embedding) inline_max_dimension = 4",
+            ),
+        )
+        .expect_err("inline dimension below the indexed vector should fail");
+        assert!(invalid_inline_dimension
+            .to_string()
+            .contains("max_dimension"));
+
+        let invalid_exact_routing = bind_create_index(
+            &mut binder,
+            parse_create_index_stmt(
+                "CREATE VECTOR INDEX idx_bad_exact_routing ON items (embedding) \
+                 build_vector_encoding = exact_f32 build_routing_dimensions = 4",
+            ),
+        )
+        .expect_err("exact construction must reject compact routing dimensions");
+        assert!(invalid_exact_routing
+            .to_string()
+            .contains("does not accept build_routing_dimensions"));
     }
 
     #[test]

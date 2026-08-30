@@ -1,14 +1,17 @@
 // Copyright 2024-2026 Zunor
 // SPDX-License-Identifier: Apache-2.0
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, RwLock};
 
 use crate::buffer::{BufferManager, StandardBufferManager};
 use crate::codec::vector_decoder;
 use crate::index::art::{ARTConflictType, ARTKey, ART};
-use crate::index::{BoundIndex, IndexAppendMode, IndexConstraintType};
-use crate::rowset::{RowsetSharedPtr, SegmentSharedPtr};
+use crate::index::{
+    value_to_bytes, BitmapIndex, BitmapIndexWriter, BoundIndex, IndexAppendMode,
+    IndexConstraintType, SegmentLocalComplete,
+};
+use crate::rowset::{RowsetSharedPtr, RuntimeScalarIndex, SegmentSharedPtr};
 use crate::tablet::{ColumnId, TabletRef};
 use paro_common::allocator::{default_allocator, Allocator, ArenaAllocator};
 use paro_common::error::{self as paro_error, Result};
@@ -17,6 +20,13 @@ use paro_common::types::LogicalType;
 use super::index_set::IndexSet;
 
 const ART_BACKFILL_BATCH_SIZE: usize = 1024;
+/// Above this cardinality, per-value posting containers lose their density
+/// advantage and the ordered ART is the sole physical representation.
+const ADAPTIVE_BITMAP_MAX_DISTINCT_VALUES: usize = 4_096;
+/// A posting index wins only when each dictionary value covers enough rows to
+/// amortize its container metadata. Its ordered dictionary also exposes a
+/// compact native row set for HNSW range admission without union materialization.
+const ADAPTIVE_BITMAP_MIN_ROWS_PER_VALUE: u64 = 8;
 
 fn is_art_backfill_supported(logical_type: &LogicalType) -> bool {
     matches!(
@@ -44,14 +54,14 @@ fn is_art_backfill_supported(logical_type: &LogicalType) -> bool {
 #[derive(Debug)]
 pub(crate) struct RuntimeIndexes {
     indexes: IndexSet,
-    declared_art_indexes: RwLock<HashSet<ColumnId>>,
+    declared_art_indexes: RwLock<HashMap<ColumnId, HashSet<String>>>,
 }
 
 impl RuntimeIndexes {
     pub(crate) fn new() -> Self {
         Self {
             indexes: IndexSet::new(),
-            declared_art_indexes: RwLock::new(HashSet::new()),
+            declared_art_indexes: RwLock::new(HashMap::new()),
         }
     }
 
@@ -79,18 +89,52 @@ impl RuntimeIndexes {
         self.indexes.remove_index(name)
     }
 
-    pub(crate) fn declare_art_index(&self, tablet: &TabletRef, column_id: ColumnId) {
-        if let Ok(mut guard) = self.declared_art_indexes.write() {
-            guard.insert(column_id);
+    /// Add one catalog declaration idempotently. Returns true when this is the
+    /// first owner for the column and physical access paths need to be built.
+    pub(crate) fn declare_art_index(
+        &self,
+        tablet: &TabletRef,
+        owner: &str,
+        column_id: ColumnId,
+    ) -> bool {
+        let first = self.declared_art_indexes.write().is_ok_and(|mut guard| {
+            let owners = guard.entry(column_id).or_default();
+            let was_empty = owners.is_empty();
+            owners.insert(owner.to_string());
+            was_empty
+        });
+        if first {
+            tablet.mark_declared_art_column(column_id);
         }
-        tablet.mark_declared_art_column(column_id);
+        first
     }
 
-    pub(crate) fn forget_art_index(&self, tablet: &TabletRef, column_id: ColumnId) {
-        if let Ok(mut guard) = self.declared_art_indexes.write() {
-            guard.remove(&column_id);
+    /// Release one catalog declaration by stable owner identity. Returns true
+    /// only when the last owner was removed and artifacts may be dropped.
+    pub(crate) fn forget_art_index(
+        &self,
+        tablet: &TabletRef,
+        owner: &str,
+        column_id: ColumnId,
+    ) -> bool {
+        let last = self.declared_art_indexes.write().is_ok_and(|mut guard| {
+            let Some(owners) = guard.get_mut(&column_id) else {
+                return false;
+            };
+            if !owners.remove(owner) {
+                return false;
+            }
+            if owners.is_empty() {
+                guard.remove(&column_id);
+                true
+            } else {
+                false
+            }
+        });
+        if last {
+            tablet.unmark_declared_art_column(column_id);
         }
-        tablet.unmark_declared_art_column(column_id);
+        last
     }
 
     pub(crate) fn rebuild_art_index(&self, tablet: &TabletRef, column_id: ColumnId) -> Result<()> {
@@ -109,18 +153,24 @@ impl RuntimeIndexes {
         self.declared_art_indexes
             .read()
             .map(|guard| {
-                let mut columns = guard.iter().copied().collect::<Vec<_>>();
+                let mut columns = guard.keys().copied().collect::<Vec<_>>();
                 columns.sort_unstable();
                 columns
             })
             .unwrap_or_default()
     }
 
+    pub(crate) fn has_declared_art_index(&self, column_id: ColumnId) -> bool {
+        self.declared_art_indexes
+            .read()
+            .is_ok_and(|guard| guard.contains_key(&column_id))
+    }
+
     pub(crate) fn recovery_index_count(&self, tablet: &TabletRef) -> usize {
         let mut art_columns = self
             .declared_art_indexes
             .read()
-            .map(|guard| guard.iter().copied().collect::<HashSet<_>>())
+            .map(|guard| guard.keys().copied().collect::<HashSet<_>>())
             .unwrap_or_default();
 
         let visible = tablet.max_version();
@@ -179,7 +229,7 @@ impl RuntimeIndexes {
         column_id: ColumnId,
         buffer_manager: Arc<dyn BufferManager>,
     ) -> Result<()> {
-        if segment.art_index(column_id).is_some() {
+        if segment.has_complete_scalar_index(column_id) {
             return Ok(());
         }
 
@@ -195,20 +245,13 @@ impl RuntimeIndexes {
             )));
         }
 
-        let mut iter = segment.new_column_iterator(column_id)?;
         let vector_allocator: Arc<dyn Allocator> = Arc::new(default_allocator());
-        let arena_allocator: Arc<dyn Allocator> = Arc::new(default_allocator());
-        let mut arena = ArenaAllocator::new(arena_allocator);
-        let mut art = ART::new(
-            format!("art_segment_{}_col_{}", segment.segment_id(), column_id),
-            IndexConstraintType::None,
-            column_id,
-            logical_type.clone(),
-            buffer_manager,
-        );
+        let mut iter = segment.new_column_iterator(column_id)?;
+        let mut bitmap_writer = BitmapIndexWriter::new();
         let mut row_id_base = 0u64;
+        let mut bitmap_candidate = true;
 
-        loop {
+        while bitmap_candidate {
             let (count, batch) = iter.next_batch(ART_BACKFILL_BATCH_SIZE)?;
             if count == 0 {
                 break;
@@ -221,7 +264,77 @@ impl RuntimeIndexes {
                 Arc::clone(&vector_allocator),
                 None,
             )?;
+            for row_idx in 0..count {
+                if vector.is_null(row_idx) {
+                    bitmap_writer.add_nulls(1);
+                    continue;
+                }
+                let value = vector.get_value(row_idx);
+                match value_to_bytes(&value, &logical_type) {
+                    Ok(bytes) => {
+                        bitmap_writer.add_value_owned(bytes);
+                        if bitmap_writer.num_values() > ADAPTIVE_BITMAP_MAX_DISTINCT_VALUES {
+                            bitmap_candidate = false;
+                            break;
+                        }
+                    }
+                    Err(_) => {
+                        bitmap_candidate = false;
+                        break;
+                    }
+                }
+            }
+            row_id_base = row_id_base
+                .checked_add(count as u64)
+                .ok_or_else(|| paro_error::data_corrupted("scalar batch row count overflow"))?;
+        }
 
+        let distinct_values = bitmap_writer.num_values() as u64;
+        let dense_postings = distinct_values == 0
+            || row_id_base >= distinct_values.saturating_mul(ADAPTIVE_BITMAP_MIN_ROWS_PER_VALUE);
+        if bitmap_candidate && dense_postings {
+            let completeness = SegmentLocalComplete::prove(row_id_base, segment.num_rows())?;
+            let index = BitmapIndex::from_writer(
+                format!("bitmap_segment_{}_col_{}", segment.segment_id(), column_id),
+                IndexConstraintType::None,
+                vec![column_id],
+                vec![logical_type.clone()],
+                &bitmap_writer,
+            )?;
+            SegmentLocalComplete::prove(index.indexed_row_count(), segment.num_rows())?;
+            segment.register_runtime_scalar_index(
+                column_id,
+                RuntimeScalarIndex::Bitmap(Arc::new(index)),
+                completeness,
+            );
+            return Ok(());
+        }
+
+        // Build ART only after ruling out the compact posting representation;
+        // constructing both duplicates every row id and defeats memory governance.
+        let mut iter = segment.new_column_iterator(column_id)?;
+        let arena_allocator: Arc<dyn Allocator> = Arc::new(default_allocator());
+        let mut arena = ArenaAllocator::new(arena_allocator);
+        let mut art = ART::new(
+            format!("art_segment_{}_col_{}", segment.segment_id(), column_id),
+            IndexConstraintType::None,
+            column_id,
+            logical_type.clone(),
+            buffer_manager,
+        );
+        let mut row_id_base = 0u64;
+        loop {
+            let (count, batch) = iter.next_batch(ART_BACKFILL_BATCH_SIZE)?;
+            if count == 0 {
+                break;
+            }
+            let vector = vector_decoder::decode_column_batch(
+                &logical_type,
+                &batch,
+                count,
+                Arc::clone(&vector_allocator),
+                None,
+            )?;
             for row_idx in 0..count {
                 if vector.is_null(row_idx) {
                     continue;
@@ -230,7 +343,10 @@ impl RuntimeIndexes {
                 let row_id = row_id_base
                     .checked_add(row_idx as u64)
                     .ok_or_else(|| paro_error::data_corrupted("ART row id overflow"))?;
-                match art.insert_key(&mut arena, &key, row_id as i64, IndexAppendMode::Default) {
+                let conflict =
+                    art.insert_key(&mut arena, &key, row_id as i64, IndexAppendMode::Default);
+                arena.reset();
+                match conflict {
                     ARTConflictType::NoConflict => {}
                     ARTConflictType::Constraint => {
                         return Err(paro_error::internal(format!(
@@ -245,13 +361,16 @@ impl RuntimeIndexes {
                     }
                 }
             }
-
             row_id_base = row_id_base
                 .checked_add(count as u64)
                 .ok_or_else(|| paro_error::data_corrupted("ART batch row count overflow"))?;
         }
-
-        segment.register_runtime_art_index(column_id, Arc::new(art));
+        let completeness = SegmentLocalComplete::prove(row_id_base, segment.num_rows())?;
+        segment.register_runtime_scalar_index(
+            column_id,
+            RuntimeScalarIndex::Art(Arc::new(art)),
+            completeness,
+        );
         Ok(())
     }
 }

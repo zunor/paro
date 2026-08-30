@@ -25,6 +25,41 @@ fn test_l2_squared_basic() {
 }
 
 #[test]
+fn l2_squared_batch_indexed_matches_individual_rows() {
+    let query = [0.25_f32; 32];
+    let mut vectors = Vec::new();
+    for row in 0..9 {
+        vectors.extend((0..32).map(|lane| row as f32 * 0.5 + lane as f32 * 0.03125));
+    }
+    let point_ids = [8, 1, 5, 0, 7, 3, 2];
+    let mut scores = vec![0.0; point_ids.len()];
+    l2_squared_batch_indexed(&query, &vectors, 32, &point_ids, &mut scores);
+
+    for (&point_id, actual) in point_ids.iter().zip(scores) {
+        let start = point_id as usize * 32;
+        let expected = l2_squared(&query, &vectors[start..start + 32]);
+        assert!((actual - expected).abs() <= 1e-4 * expected.max(1.0));
+    }
+}
+
+#[test]
+fn l2_squared_batch_contiguous_matches_individual_rows() {
+    let query = [0.25_f32; 32];
+    let mut vectors = Vec::new();
+    for row in 0..19 {
+        vectors.extend((0..32).map(|lane| row as f32 * 0.5 + lane as f32 * 0.03125));
+    }
+    let mut scores = vec![0.0; 19];
+    l2_squared_batch_contiguous(&query, &vectors, 32, &mut scores);
+
+    for (row, actual) in scores.into_iter().enumerate() {
+        let start = row * 32;
+        let expected = l2_squared(&query, &vectors[start..start + 32]);
+        assert!((actual - expected).abs() <= 1e-4 * expected.max(1.0));
+    }
+}
+
+#[test]
 fn test_l2_distance_basic() {
     let v1 = vec![0.0, 0.0];
     let v2 = vec![3.0, 4.0];
@@ -46,6 +81,14 @@ fn test_dot_product_basic() {
     let v2 = vec![4.0, 5.0, 6.0];
     // 1*4 + 2*5 + 3*6 = 32
     assert!((dot_product(&v1, &v2) - 32.0).abs() < 1e-5);
+}
+
+#[test]
+fn test_inverse_norm_uses_the_cosine_zero_domain() {
+    assert!((inverse_norm(&[3.0, 4.0]) - 0.2).abs() < 1e-6);
+    let near_zero = [f32::EPSILON.sqrt() * 0.5];
+    assert_eq!(inverse_norm(&near_zero), 0.0);
+    assert_eq!(cosine_distance(&near_zero, &near_zero), 1.0);
 }
 
 #[test]

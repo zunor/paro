@@ -35,17 +35,15 @@ impl InlineArtifactBuilder for SparseInlineArtifactBuilder {
             ctx.definition.column_ids.first().copied().ok_or_else(|| {
                 paro_error::invalid_input("Sparse definition is missing column id")
             })?;
+        let provider_config = ctx.definition.sparse_provider_config()?;
         let full_schema_position = ctx
             .column_schema
             .iter()
             .enumerate()
             .find_map(|(position, column)| (column.id == column_id).then_some((position, column)))
             .map(|(position, column)| {
-                validate_sparse_binary_row_image_column(
-                    &column.logical_type,
-                    &ctx.definition.provider_config,
-                )
-                .map(|()| position)
+                validate_sparse_binary_row_image_column(&column.logical_type, &provider_config)
+                    .map(|()| position)
             })
             .transpose()?
             .ok_or_else(|| {
@@ -297,7 +295,7 @@ mod tests {
             kind: SearchIndexKind::Sparse,
             column_ids: vec![1],
             expression: None,
-            provider_config: json!({}),
+            provider_config: json!({"version": 1, "physical_encoding": "binary-v1"}),
             freshness_policy: SearchFreshnessPolicy::default_for_kind(SearchIndexKind::Sparse),
             config_fingerprint: 99,
         };
@@ -376,7 +374,7 @@ mod tests {
             kind: SearchIndexKind::Sparse,
             column_ids: vec![1],
             expression: None,
-            provider_config: json!({}),
+            provider_config: json!({"version": 1, "physical_encoding": "binary-v1"}),
             freshness_policy: SearchFreshnessPolicy::default_for_kind(SearchIndexKind::Sparse),
             config_fingerprint: 99,
         };
@@ -442,7 +440,7 @@ mod tests {
             kind: SearchIndexKind::Sparse,
             column_ids: vec![1],
             expression: None,
-            provider_config: json!({}),
+            provider_config: json!({"version": 1, "physical_encoding": "binary-v1"}),
             freshness_policy: SearchFreshnessPolicy::default_for_kind(SearchIndexKind::Sparse),
             config_fingerprint: 99,
         };

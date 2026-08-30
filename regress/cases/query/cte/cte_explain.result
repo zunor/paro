@@ -28,19 +28,19 @@ MATERIALIZED_CTE
   Reference Count: 3
   ->  VALUES  (rows=5)
   ->  ORDER_BY
-    Sort Key: #0 ASC NULLS LAST, #1 ASC NULLS LAST
+    Sort Key: p.id ASC NULLS LAST, p.peer_id ASC NULLS LAST
     ->  PROJECTION
       Output: p.id, p.peer_id, a.total
       ->  HASH_JOIN
         Join Type: INNER
-        Join Condition: #2 = #0
+        Join Condition: p.grp = a.grp
         ->  PROJECTION
-          Output: expr_1, expr_2, expr_3
+          Output: id, peer_id, grp
           ->  FILTER
-            Filter: #0 < #2
+            Filter: l.id < r.id
             ->  HASH_JOIN
               Join Type: INNER
-              Join Condition: #1 = #1
+              Join Condition: l.grp = r.grp
               ->  CTE_SCAN
                 CTE Index: 0
                 Table Index: 16
@@ -48,11 +48,10 @@ MATERIALIZED_CTE
                 CTE Index: 0
                 Table Index: 17
         ->  PROJECTION
-          Output: expr_1, expr_2
+          Output: grp, total
           ->  AGGREGATE
-            Group Key: #1
-            Aggregates: sum(#2)
-            Output: aggr_0, aggr_1
+            Group Key: base.grp
+            Aggregates: sum(base.amount)
             ->  CTE_SCAN
               CTE Index: 0
               Table Index: 25

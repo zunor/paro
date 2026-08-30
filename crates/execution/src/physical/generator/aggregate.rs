@@ -437,6 +437,7 @@ impl PhysicalPlanGenerator {
                         .map(|idx| format!("aggr_{idx}"))
                         .collect::<Vec<_>>()
                         .into_boxed_slice(),
+                    visible_count: 0,
                 }),
                 vec![child],
             ));

@@ -1,20 +1,24 @@
 // Copyright 2024-2026 Zunor
 // SPDX-License-Identifier: Apache-2.0
 
-use std::collections::BTreeMap;
+use std::any::Any;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs::{self, File, OpenOptions};
+use std::hash::Hasher;
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Condvar, Mutex, OnceLock, RwLock, Weak};
 
+use arc_swap::ArcSwap;
 use memmap2::Mmap;
 use paro_common::error::{self as paro_error, Result};
 
 use crate::metrics::storage_metrics;
 
 use super::artifact::{ArtifactFileId, ArtifactLocation};
-use super::capability::SearchIndexKind;
+use super::capability::{SearchArtifactRef, SearchIndexKind};
+use super::maintenance::SearchMaintenanceUrgency;
 use super::stats::{SearchDefinitionId, SearchGenerationId};
 
 static SIDECAR_STAGING_SEQUENCE: AtomicU64 = AtomicU64::new(1);
@@ -52,8 +56,9 @@ impl SidecarArtifactStore {
         PathBuf::from("search_registry")
             .join("definitions")
             .join(file_id.definition_id.to_string())
-            .join("sidecars")
+            .join("generations")
             .join(format!("g{}", file_id.generation_id))
+            .join("sidecars")
             .join(format!("package_{}.scar", file_id.package_index))
     }
 
@@ -138,7 +143,12 @@ impl SidecarArtifactStore {
     pub fn mmap_artifact(&self, location: &ArtifactLocation) -> Result<SidecarMappedArtifact> {
         let (file_id, offset, len, checksum) = sidecar_location_parts(location)?;
         let package = self.mmap_package(file_id)?;
-        package.artifact(offset, len, checksum)
+        package.artifact(
+            offset,
+            len,
+            checksum,
+            SidecarIntegrityPolicy::EnvelopeChecksum,
+        )
     }
 
     pub fn mmap_package(&self, file_id: ArtifactFileId) -> Result<SidecarMappedPackage> {
@@ -183,7 +193,13 @@ impl SidecarMappedPackage {
         self.mmap.len()
     }
 
-    pub fn artifact(&self, offset: u64, len: u64, checksum: u64) -> Result<SidecarMappedArtifact> {
+    pub fn artifact(
+        &self,
+        offset: u64,
+        len: u64,
+        checksum: u64,
+        integrity: SidecarIntegrityPolicy,
+    ) -> Result<SidecarMappedArtifact> {
         let offset = usize::try_from(offset).map_err(|_| {
             paro_error::invalid_input(format!(
                 "search sidecar artifact offset {} does not fit in usize",
@@ -211,7 +227,9 @@ impl SidecarMappedPackage {
                 self.file_id
             )));
         }
-        verify_sidecar_checksum(self.file_id, checksum, &self.mmap[offset..end])?;
+        if integrity == SidecarIntegrityPolicy::EnvelopeChecksum {
+            verify_sidecar_checksum(self.file_id, checksum, &self.mmap[offset..end])?;
+        }
         Ok(SidecarMappedArtifact {
             package: Arc::clone(&self.mmap),
             offset,
@@ -224,6 +242,7 @@ impl SidecarMappedPackage {
 pub struct SidecarPackageWriter {
     file_id: ArtifactFileId,
     final_path: PathBuf,
+    workspace_dir: PathBuf,
     staging_path: PathBuf,
     file: Option<File>,
     offset: u64,
@@ -231,6 +250,12 @@ pub struct SidecarPackageWriter {
 }
 
 impl SidecarPackageWriter {
+    const ARTIFACT_ALIGNMENT: u64 = 64;
+
+    pub(crate) fn workspace_dir(&self) -> &Path {
+        &self.workspace_dir
+    }
+
     fn create(table_data_dir: PathBuf, file_id: ArtifactFileId) -> Result<Self> {
         let final_path = table_data_dir.join(SidecarArtifactStore::package_relative_path(file_id));
         if final_path.exists() {
@@ -253,8 +278,22 @@ impl SidecarPackageWriter {
             ))
         })?;
 
-        let staging_path = staging_path_for(&final_path);
+        let staging_root = table_data_dir
+            .join("_staged")
+            .join("search-sidecar")
+            .join(file_id.definition_id.to_string())
+            .join(format!("g{}", file_id.generation_id));
+        fs::create_dir_all(&staging_root).map_err(|err| {
+            paro_error::io_error(format!(
+                "create search sidecar staging root {}: {}",
+                staging_root.display(),
+                err
+            ))
+        })?;
+        let workspace_dir = create_sidecar_workspace(&staging_root, file_id.package_index)?;
+        let staging_path = workspace_dir.join("package.scar");
         let file = OpenOptions::new()
+            .read(true)
             .write(true)
             .create_new(true)
             .open(&staging_path)
@@ -269,6 +308,7 @@ impl SidecarPackageWriter {
         Ok(Self {
             file_id,
             final_path,
+            workspace_dir,
             staging_path,
             file: Some(file),
             offset: 0,
@@ -292,10 +332,30 @@ impl SidecarPackageWriter {
         let len = u64::try_from(bytes.len()).map_err(|_| {
             paro_error::invalid_input("search sidecar artifact length does not fit in u64")
         })?;
-        let offset = self.offset;
         let file = self.file.as_mut().ok_or_else(|| {
             paro_error::internal("cannot append to finalized search sidecar package")
         })?;
+        let offset = self
+            .offset
+            .checked_add(Self::ARTIFACT_ALIGNMENT - 1)
+            .map(|value| value / Self::ARTIFACT_ALIGNMENT * Self::ARTIFACT_ALIGNMENT)
+            .ok_or_else(|| paro_error::out_of_range("search sidecar artifact alignment"))?;
+        let padding = usize::try_from(offset - self.offset).map_err(|_| {
+            paro_error::out_of_range("search sidecar artifact padding exceeds usize")
+        })?;
+        if padding != 0 {
+            const ZEROES: [u8; SidecarPackageWriter::ARTIFACT_ALIGNMENT as usize] =
+                [0; SidecarPackageWriter::ARTIFACT_ALIGNMENT as usize];
+            file.write_all(&ZEROES[..padding]).map_err(|err| {
+                paro_error::io_error(format!(
+                    "align search sidecar artifact {}:{}+{}: {}",
+                    self.staging_path.display(),
+                    self.offset,
+                    padding,
+                    err
+                ))
+            })?;
+        }
         file.write_all(bytes).map_err(|err| {
             paro_error::io_error(format!(
                 "write search sidecar artifact {}:{}+{}: {}",
@@ -305,12 +365,62 @@ impl SidecarPackageWriter {
                 err
             ))
         })?;
-        self.offset = self.offset.saturating_add(len);
+        self.offset = offset.saturating_add(len);
         Ok(ArtifactLocation::SidecarArtifactFile {
             file_id: self.file_id,
             offset,
             len,
             checksum: seahash::hash(bytes),
+        })
+    }
+
+    pub(crate) fn append_streamed_artifact(
+        &mut self,
+        write_artifact: impl FnOnce(&mut File, u64) -> Result<()>,
+    ) -> Result<ArtifactLocation> {
+        let file = self.file.as_mut().ok_or_else(|| {
+            paro_error::internal("cannot append to finalized search sidecar package")
+        })?;
+        let offset = self
+            .offset
+            .checked_add(Self::ARTIFACT_ALIGNMENT - 1)
+            .map(|value| value / Self::ARTIFACT_ALIGNMENT * Self::ARTIFACT_ALIGNMENT)
+            .ok_or_else(|| paro_error::out_of_range("search sidecar artifact alignment"))?;
+        let padding = usize::try_from(offset - self.offset).map_err(|_| {
+            paro_error::out_of_range("search sidecar artifact padding exceeds usize")
+        })?;
+        if padding != 0 {
+            const ZEROES: [u8; SidecarPackageWriter::ARTIFACT_ALIGNMENT as usize] =
+                [0; SidecarPackageWriter::ARTIFACT_ALIGNMENT as usize];
+            file.seek(SeekFrom::Start(self.offset))?;
+            file.write_all(&ZEROES[..padding])?;
+        }
+        file.seek(SeekFrom::Start(offset))?;
+        write_artifact(file, offset)?;
+        let end = file.stream_position()?;
+        let len = end.checked_sub(offset).ok_or_else(|| {
+            paro_error::internal("streamed search sidecar writer moved before artifact start")
+        })?;
+
+        file.seek(SeekFrom::Start(offset))?;
+        let mut remaining = len;
+        let mut hasher = seahash::SeaHasher::new();
+        let mut buffer = vec![0u8; 64 * 1024];
+        while remaining != 0 {
+            let read_len = usize::try_from(remaining.min(buffer.len() as u64))
+                .map_err(|_| paro_error::out_of_range("sidecar hash chunk exceeds usize"))?;
+            file.read_exact(&mut buffer[..read_len])?;
+            hasher.write(&buffer[..read_len]);
+            remaining -= read_len as u64;
+        }
+        let checksum = hasher.finish();
+        file.seek(SeekFrom::Start(end))?;
+        self.offset = end;
+        Ok(ArtifactLocation::SidecarArtifactFile {
+            file_id: self.file_id,
+            offset,
+            len,
+            checksum,
         })
     }
 
@@ -341,7 +451,7 @@ impl SidecarPackageWriter {
             })?;
         }
         fs::rename(&self.staging_path, &self.final_path).map_err(|err| {
-            let _ = fs::remove_file(&self.staging_path);
+            let _ = fs::remove_dir_all(&self.workspace_dir);
             paro_error::io_error(format!(
                 "commit search sidecar package {} -> {}: {}",
                 self.staging_path.display(),
@@ -349,13 +459,14 @@ impl SidecarPackageWriter {
                 err
             ))
         })?;
+        let _ = fs::remove_dir_all(&self.workspace_dir);
         self.committed = true;
         Ok(self.final_path.clone())
     }
 
     pub fn abort(mut self) {
         self.file.take();
-        let _ = fs::remove_file(&self.staging_path);
+        let _ = fs::remove_dir_all(&self.workspace_dir);
         self.committed = true;
     }
 
@@ -368,15 +479,109 @@ impl Drop for SidecarPackageWriter {
     fn drop(&mut self) {
         if !self.committed {
             let _ = self.file.take();
-            let _ = fs::remove_file(&self.staging_path);
+            let _ = fs::remove_dir_all(&self.workspace_dir);
         }
     }
 }
 
+/// Integrity owner for a sidecar artifact.
+///
+/// Most providers rely on the package manifest checksum. Random-access HNSW
+/// artifacts instead authenticate their own fixed header and lazily verify
+/// payload chunks before use; eagerly hashing that entire mmap range would
+/// destroy their cold-open contract.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum SidecarIntegrityPolicy {
+    EnvelopeChecksum,
+    SelfValidatingArtifact,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct SidecarReaderCacheKey {
+    pub file_id: ArtifactFileId,
+    pub offset: u64,
+    pub len: u64,
     pub checksum: u64,
     pub artifact_format_version: u32,
+    pub integrity: SidecarIntegrityPolicy,
+}
+
+/// External storage identity retained by a decoded provider reader.
+///
+/// Self-contained providers depend only on their artifact bytes. HNSW readers
+/// additionally retain segment-owned vector readers; the immutable generation
+/// identity scopes that binding while the stable-layout lease keeps the
+/// referenced physical segments unchanged through publication.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum DecodedReaderBinding {
+    SelfContained,
+    GenerationExternalVectors {
+        definition_id: u64,
+        generation_id: u64,
+        column_id: u32,
+    },
+}
+
+/// Identity for a typed, immutable provider reader derived from one sidecar
+/// artifact. Content identity alone is insufficient for readers that retain
+/// external storage, so their generation-scoped binding is part of the key.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct DecodedSidecarArtifactKey {
+    pub sidecar: SidecarReaderCacheKey,
+    pub provider: SearchIndexKind,
+    pub binding: DecodedReaderBinding,
+}
+
+/// One immutable provider reader lookup.
+///
+/// The physical identity is derivable from the manifest location, so a hot
+/// lookup must not open (or even lock) the lower-level mmap cache merely to
+/// discover its decoded-reader key. Provider readers are the normal query
+/// surface; the sidecar mapping is only a cold-miss construction dependency.
+#[derive(Debug, Clone, Copy)]
+pub struct DecodedSidecarReaderRequest<'a> {
+    pub sidecar: SidecarReaderRequest<'a>,
+    pub binding: DecodedReaderBinding,
+}
+
+impl DecodedSidecarReaderRequest<'_> {
+    fn key(self) -> Result<DecodedSidecarArtifactKey> {
+        Ok(DecodedSidecarArtifactKey {
+            sidecar: sidecar_reader_cache_key(
+                self.sidecar.location,
+                self.sidecar.artifact_format_version,
+                self.sidecar.integrity,
+            )?,
+            provider: self.sidecar.provider,
+            binding: self.binding,
+        })
+    }
+}
+
+pub(crate) fn is_decoded_hnsw_sidecar_artifact(artifact: &SearchArtifactRef) -> bool {
+    artifact.kind == SearchIndexKind::Hnsw
+        && matches!(
+            artifact.location,
+            ArtifactLocation::SidecarArtifactFile { .. }
+        )
+}
+
+fn hnsw_decoded_artifact_key(artifact: &SearchArtifactRef) -> Result<DecodedSidecarArtifactKey> {
+    DecodedSidecarReaderRequest {
+        sidecar: SidecarReaderRequest {
+            location: &artifact.location,
+            artifact_format_version: artifact.artifact_format_version,
+            provider: SearchIndexKind::Hnsw,
+            codec: SIDECAR_PACKAGE_CODEC,
+            integrity: SidecarIntegrityPolicy::SelfValidatingArtifact,
+        },
+        binding: DecodedReaderBinding::GenerationExternalVectors {
+            definition_id: artifact.definition_id,
+            generation_id: artifact.generation_id,
+            column_id: artifact.column_id,
+        },
+    }
+    .key()
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -385,6 +590,7 @@ pub struct SidecarReaderRequest<'a> {
     pub artifact_format_version: u32,
     pub provider: SearchIndexKind,
     pub codec: &'static str,
+    pub integrity: SidecarIntegrityPolicy,
 }
 
 #[derive(Debug)]
@@ -400,6 +606,10 @@ impl SidecarCachedArtifact {
 
     pub fn bytes(&self) -> &[u8] {
         self.mapped.bytes()
+    }
+
+    pub(crate) fn mmap_range(&self) -> (Arc<Mmap>, usize, usize) {
+        self.mapped.mmap_range()
     }
 
     pub fn is_mmap_backed(&self) -> bool {
@@ -421,6 +631,10 @@ pub struct SidecarMappedArtifact {
 impl SidecarMappedArtifact {
     pub fn bytes(&self) -> &[u8] {
         &self.package[self.offset..self.offset + self.len]
+    }
+
+    fn mmap_range(&self) -> (Arc<Mmap>, usize, usize) {
+        (Arc::clone(&self.package), self.offset, self.len)
     }
 
     pub fn artifact_len(&self) -> usize {
@@ -451,7 +665,11 @@ impl SidecarReaderCache {
     pub fn open(&self, request: SidecarReaderRequest<'_>) -> Result<Arc<SidecarCachedArtifact>> {
         storage_metrics()
             .record_search_sidecar_reader_format_dispatch(request.provider, request.codec);
-        let key = sidecar_reader_cache_key(request.location, request.artifact_format_version)?;
+        let key = sidecar_reader_cache_key(
+            request.location,
+            request.artifact_format_version,
+            request.integrity,
+        )?;
 
         if let Some(cached) = self
             .entries
@@ -468,7 +686,7 @@ impl SidecarReaderCache {
         storage_metrics().record_search_sidecar_reader_cache_miss(request.provider, request.codec);
         let (file_id, offset, len, checksum) = sidecar_location_parts(request.location)?;
         let package = self.open_package(file_id, request.provider, request.codec)?;
-        let mapped = package.artifact(offset, len, checksum)?;
+        let mapped = package.artifact(offset, len, checksum, request.integrity)?;
         let cached = Arc::new(SidecarCachedArtifact { key, mapped });
 
         let mut guard = self
@@ -494,6 +712,20 @@ impl SidecarReaderCache {
             .lock()
             .expect("search sidecar package cache lock poisoned")
             .len()
+    }
+
+    fn evict_packages(&self, file_ids: &BTreeSet<ArtifactFileId>) {
+        if file_ids.is_empty() {
+            return;
+        }
+        self.entries
+            .lock()
+            .expect("search sidecar reader cache lock poisoned")
+            .retain(|key, _| !file_ids.contains(&key.file_id));
+        self.packages
+            .lock()
+            .expect("search sidecar package cache lock poisoned")
+            .retain(|file_id, _| !file_ids.contains(file_id));
     }
 
     fn open_package(
@@ -522,27 +754,499 @@ impl SidecarReaderCache {
     }
 }
 
-fn staging_path_for(final_path: &Path) -> PathBuf {
-    let sequence = SIDECAR_STAGING_SEQUENCE.fetch_add(1, Ordering::Relaxed);
-    let file_name = final_path
-        .file_name()
-        .and_then(|name| name.to_str())
-        .unwrap_or("package.scar");
-    final_path.with_file_name(format!("{file_name}.staging-{sequence}"))
+/// Table-scoped owner for immutable sidecar mappings and provider readers.
+///
+/// Query cursors borrow this runtime through an `Arc`; they never create their
+/// own mmap/cache namespace. Generation retirement evicts physical packages
+/// only after read leases are gone, while an in-flight cursor can safely keep
+/// its typed reader alive through its own `Arc`.
+pub struct SearchReaderRuntime {
+    sidecars: SidecarReaderCache,
+    decoded: ArcSwap<BTreeMap<DecodedSidecarArtifactKey, Arc<dyn Any + Send + Sync>>>,
+    decoded_update: Mutex<()>,
+    decoded_inflight: Mutex<BTreeMap<DecodedSidecarArtifactKey, Arc<DecodedOpenGate>>>,
+    buffer_pool: OnceLock<Arc<crate::buffer::BufferPool>>,
+    hnsw_integrity_scheduler: OnceLock<Arc<crate::index::hnsw::HnswIntegrityScheduler>>,
+    hnsw_integrity_failures: Arc<HnswIntegrityFailureQueue>,
+}
+
+pub(crate) type IntegrityFailureNotifier = Arc<dyn Fn(SearchMaintenanceUrgency) + Send + Sync>;
+
+#[derive(Default)]
+struct HnswIntegrityFailureQueue {
+    failed: Mutex<BTreeMap<DecodedSidecarArtifactKey, SearchArtifactRef>>,
+    notifier: RwLock<Option<IntegrityFailureNotifier>>,
+}
+
+impl HnswIntegrityFailureQueue {
+    fn record(&self, key: DecodedSidecarArtifactKey, artifact: SearchArtifactRef) {
+        self.failed
+            .lock()
+            .expect("HNSW integrity failure queue poisoned")
+            .insert(key, artifact);
+        if let Some(notifier) = self
+            .notifier
+            .read()
+            .expect("HNSW integrity failure notifier poisoned")
+            .as_ref()
+        {
+            notifier(SearchMaintenanceUrgency::Immediate);
+        }
+    }
+
+    fn drain(&self) -> Vec<SearchArtifactRef> {
+        std::mem::take(
+            &mut *self
+                .failed
+                .lock()
+                .expect("HNSW integrity failure queue poisoned"),
+        )
+        .into_values()
+        .collect()
+    }
+
+    fn restore(&self, artifacts: impl IntoIterator<Item = SearchArtifactRef>) {
+        let mut failed = self
+            .failed
+            .lock()
+            .expect("HNSW integrity failure queue poisoned");
+        for artifact in artifacts {
+            if let Ok(key) = hnsw_decoded_artifact_key(&artifact) {
+                failed.insert(key, artifact);
+            }
+        }
+    }
+
+    fn is_empty(&self) -> bool {
+        self.failed
+            .lock()
+            .expect("HNSW integrity failure queue poisoned")
+            .is_empty()
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DecodedOpenOutcome {
+    Opening,
+    Ready,
+    Empty,
+    Retry,
+}
+
+#[derive(Debug)]
+struct DecodedOpenGate {
+    outcome: Mutex<DecodedOpenOutcome>,
+    changed: Condvar,
+}
+
+impl DecodedOpenGate {
+    fn new() -> Self {
+        Self {
+            outcome: Mutex::new(DecodedOpenOutcome::Opening),
+            changed: Condvar::new(),
+        }
+    }
+
+    fn wait(&self) -> Result<DecodedOpenOutcome> {
+        let mut outcome = self
+            .outcome
+            .lock()
+            .map_err(|_| paro_error::internal("search decoded-reader gate lock poisoned"))?;
+        while *outcome == DecodedOpenOutcome::Opening {
+            outcome = self
+                .changed
+                .wait(outcome)
+                .map_err(|_| paro_error::internal("search decoded-reader gate lock poisoned"))?;
+        }
+        Ok(*outcome)
+    }
+
+    fn finish(&self, outcome: DecodedOpenOutcome) -> Result<()> {
+        *self
+            .outcome
+            .lock()
+            .map_err(|_| paro_error::internal("search decoded-reader gate lock poisoned"))? =
+            outcome;
+        self.changed.notify_all();
+        Ok(())
+    }
+}
+
+impl std::fmt::Debug for SearchReaderRuntime {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SearchReaderRuntime")
+            .field("sidecar_entries", &self.sidecars.len())
+            .field("sidecar_packages", &self.sidecars.package_count())
+            .field("decoded_entries", &self.decoded.load().len())
+            .finish()
+    }
+}
+
+impl SearchReaderRuntime {
+    pub fn new(store: SidecarArtifactStore) -> Self {
+        Self {
+            sidecars: SidecarReaderCache::new(store),
+            decoded: ArcSwap::from_pointee(BTreeMap::new()),
+            decoded_update: Mutex::new(()),
+            decoded_inflight: Mutex::new(BTreeMap::new()),
+            buffer_pool: OnceLock::new(),
+            hnsw_integrity_scheduler: OnceLock::new(),
+            hnsw_integrity_failures: Arc::new(HnswIntegrityFailureQueue::default()),
+        }
+    }
+
+    /// Bind long-lived provider readers to the same process memory governor
+    /// used by ordinary table reads. A table runtime belongs to one instance;
+    /// accepting a different pool later would silently split its accounting.
+    pub(crate) fn bind_buffer_pool(
+        &self,
+        buffer_pool: Option<Arc<crate::buffer::BufferPool>>,
+    ) -> Result<()> {
+        let Some(buffer_pool) = buffer_pool else {
+            return Ok(());
+        };
+        if let Some(existing) = self.buffer_pool.get() {
+            return if Arc::ptr_eq(existing, &buffer_pool) {
+                Ok(())
+            } else {
+                Err(paro_error::internal(
+                    "search reader runtime cannot move between buffer pools",
+                ))
+            };
+        }
+        if let Err(buffer_pool) = self.buffer_pool.set(buffer_pool) {
+            if !self
+                .buffer_pool
+                .get()
+                .is_some_and(|existing| Arc::ptr_eq(existing, &buffer_pool))
+            {
+                return Err(paro_error::internal(
+                    "concurrent search reader buffer-pool binding",
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    pub(crate) fn buffer_pool(&self) -> Option<Arc<crate::buffer::BufferPool>> {
+        self.buffer_pool.get().cloned()
+    }
+
+    pub(crate) fn bind_hnsw_integrity_scheduler(
+        &self,
+        scheduler: Option<Arc<crate::index::hnsw::HnswIntegrityScheduler>>,
+    ) -> Result<()> {
+        let Some(scheduler) = scheduler else {
+            return Ok(());
+        };
+        if let Some(existing) = self.hnsw_integrity_scheduler.get() {
+            return if Arc::ptr_eq(existing, &scheduler) {
+                Ok(())
+            } else {
+                Err(paro_error::internal(
+                    "search reader runtime cannot move between HNSW integrity schedulers",
+                ))
+            };
+        }
+        if let Err(scheduler) = self.hnsw_integrity_scheduler.set(scheduler) {
+            if !self
+                .hnsw_integrity_scheduler
+                .get()
+                .is_some_and(|existing| Arc::ptr_eq(existing, &scheduler))
+            {
+                return Err(paro_error::internal(
+                    "concurrent HNSW integrity-scheduler binding",
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    pub(crate) fn bind_hnsw_integrity_failure_notifier(
+        &self,
+        notifier: Option<IntegrityFailureNotifier>,
+    ) {
+        *self
+            .hnsw_integrity_failures
+            .notifier
+            .write()
+            .expect("HNSW integrity failure notifier poisoned") = notifier.clone();
+        if !self.hnsw_integrity_failures.is_empty() {
+            if let Some(notifier) = notifier {
+                notifier(SearchMaintenanceUrgency::Immediate);
+            }
+        }
+    }
+
+    pub(crate) fn drain_hnsw_integrity_failures(&self) -> Vec<SearchArtifactRef> {
+        self.hnsw_integrity_failures.drain()
+    }
+
+    pub(crate) fn restore_hnsw_integrity_failures(
+        &self,
+        artifacts: impl IntoIterator<Item = SearchArtifactRef>,
+    ) {
+        self.hnsw_integrity_failures.restore(artifacts);
+    }
+
+    pub(crate) fn record_hnsw_integrity_failure(&self, artifact: &SearchArtifactRef) {
+        if let Ok(key) = hnsw_decoded_artifact_key(artifact) {
+            self.hnsw_integrity_failures.record(key, artifact.clone());
+        }
+    }
+
+    /// Transfer already-open immutable readers from a private generation
+    /// workspace into the table-owned runtime after the workspace directory
+    /// has been atomically installed.
+    ///
+    /// Decoded reader identity is independent of the containing root path:
+    /// the durable file id, byte range, checksum, format, and provider form
+    /// the complete key. The mmap held by the reader remains valid across the
+    /// same-filesystem directory rename, so publication can preserve both the
+    /// pre-publication authentication state and the external-vector binding
+    /// without reading the complete artifact a second time.
+    pub(crate) fn adopt_decoded_readers_from(
+        &self,
+        source: &SearchReaderRuntime,
+        artifacts: &[SearchArtifactRef],
+    ) -> Result<usize> {
+        let keys = artifacts
+            .iter()
+            .filter(|artifact| is_decoded_hnsw_sidecar_artifact(artifact))
+            .map(hnsw_decoded_artifact_key)
+            .collect::<Result<BTreeSet<_>>>()?;
+        if keys.is_empty() {
+            return Ok(0);
+        }
+        let source_readers = source.decoded.load_full();
+        for key in &keys {
+            if !source_readers.contains_key(key) {
+                return Err(paro_error::data_corrupted(
+                    "prepared HNSW reader disappeared before durable publication",
+                ));
+            }
+        }
+        let _update = self
+            .decoded_update
+            .lock()
+            .map_err(|_| paro_error::internal("search decoded-reader update lock poisoned"))?;
+        let current = self.decoded.load_full();
+        let mut updated = (*current).clone();
+        let mut adopted = 0usize;
+        for key in keys {
+            if updated.contains_key(&key) {
+                continue;
+            }
+            let reader = source_readers.get(&key).cloned().ok_or_else(|| {
+                paro_error::data_corrupted(
+                    "prepared HNSW reader disappeared during durable publication",
+                )
+            })?;
+            updated.insert(key, reader);
+            adopted = adopted.saturating_add(1);
+        }
+        self.decoded.store(Arc::new(updated));
+        Ok(adopted)
+    }
+
+    pub(crate) fn schedule_hnsw_integrity_verification(
+        &self,
+        index: &Arc<crate::index::hnsw::HnswIndex>,
+        artifact: &SearchArtifactRef,
+        query_activity: Option<Arc<crate::index::hnsw::HnswQueryActivity>>,
+    ) {
+        let Ok(key) = hnsw_decoded_artifact_key(artifact) else {
+            return;
+        };
+        if let Some(scheduler) = self.hnsw_integrity_scheduler.get() {
+            let failures: Weak<HnswIntegrityFailureQueue> =
+                Arc::downgrade(&self.hnsw_integrity_failures);
+            let artifact = artifact.clone();
+            scheduler.schedule(
+                index,
+                query_activity,
+                Arc::new(move || {
+                    if let Some(failures) = failures.upgrade() {
+                        failures.record(key, artifact.clone());
+                    }
+                }),
+            );
+        } else if index.integrity_failed() {
+            self.hnsw_integrity_failures.record(key, artifact.clone());
+        }
+    }
+
+    pub fn open_sidecar(
+        &self,
+        request: SidecarReaderRequest<'_>,
+    ) -> Result<Arc<SidecarCachedArtifact>> {
+        self.sidecars.open(request)
+    }
+
+    /// Return a typed provider reader without touching the mmap cache on a hot
+    /// lookup. The decoded map is immutable between rare generation changes,
+    /// so readers use an `ArcSwap` snapshot and never contend with one another.
+    /// Cold construction happens outside the publication lock.
+    pub fn get_or_try_open_decoded<T, F>(
+        &self,
+        request: DecodedSidecarReaderRequest<'_>,
+        build: F,
+    ) -> Result<Option<Arc<T>>>
+    where
+        T: Any + Send + Sync,
+        F: FnOnce(&SidecarCachedArtifact) -> Result<Option<T>>,
+    {
+        let key = request.key()?;
+        if let Some(existing) = self.lookup_decoded::<T>(key)? {
+            return Ok(Some(existing));
+        }
+
+        let (gate, owns_open) = {
+            let mut inflight = self
+                .decoded_inflight
+                .lock()
+                .map_err(|_| paro_error::internal("search decoded-reader gate map poisoned"))?;
+            match inflight.get(&key) {
+                Some(gate) => (Arc::clone(gate), false),
+                None => {
+                    let gate = Arc::new(DecodedOpenGate::new());
+                    inflight.insert(key, Arc::clone(&gate));
+                    (gate, true)
+                }
+            }
+        };
+        if !owns_open {
+            return match gate.wait()? {
+                DecodedOpenOutcome::Ready => self
+                    .lookup_decoded::<T>(key)?
+                    .ok_or_else(|| {
+                        paro_error::internal(
+                            "completed search decoded-reader open did not publish its reader",
+                        )
+                    })
+                    .map(Some),
+                DecodedOpenOutcome::Empty => Ok(None),
+                DecodedOpenOutcome::Retry => self.get_or_try_open_decoded(request, build),
+                DecodedOpenOutcome::Opening => unreachable!("decoded open waiter returned early"),
+            };
+        }
+
+        let opened = (|| {
+            let cached = self.sidecars.open(request.sidecar)?;
+            let Some(candidate) = build(cached.as_ref())? else {
+                return Ok(None);
+            };
+            let candidate = Arc::new(candidate);
+            let erased_candidate: Arc<dyn Any + Send + Sync> = candidate.clone();
+            let _update = self
+                .decoded_update
+                .lock()
+                .map_err(|_| paro_error::internal("search decoded-reader update lock poisoned"))?;
+            if let Some(existing) = self.lookup_decoded::<T>(key)? {
+                return Ok(Some(existing));
+            }
+            let current = self.decoded.load_full();
+            let mut updated = (*current).clone();
+            updated.insert(key, erased_candidate);
+            self.decoded.store(Arc::new(updated));
+            Ok(Some(candidate))
+        })();
+        let outcome = match &opened {
+            Ok(Some(_)) => DecodedOpenOutcome::Ready,
+            Ok(None) => DecodedOpenOutcome::Empty,
+            Err(_) => DecodedOpenOutcome::Retry,
+        };
+        {
+            let mut inflight = self
+                .decoded_inflight
+                .lock()
+                .map_err(|_| paro_error::internal("search decoded-reader gate map poisoned"))?;
+            if inflight
+                .get(&key)
+                .is_some_and(|current| Arc::ptr_eq(current, &gate))
+            {
+                inflight.remove(&key);
+            }
+        }
+        gate.finish(outcome)?;
+        opened
+    }
+
+    fn lookup_decoded<T>(&self, key: DecodedSidecarArtifactKey) -> Result<Option<Arc<T>>>
+    where
+        T: Any + Send + Sync,
+    {
+        let Some(existing) = self.decoded.load().get(&key).cloned() else {
+            return Ok(None);
+        };
+        Arc::downcast::<T>(existing).map(Some).map_err(|_| {
+            paro_error::internal("search decoded-reader cache type does not match provider")
+        })
+    }
+
+    pub(crate) fn evict_packages(&self, file_ids: &BTreeSet<ArtifactFileId>) {
+        if file_ids.is_empty() {
+            return;
+        }
+        if let Ok(_update) = self.decoded_update.lock() {
+            let current = self.decoded.load_full();
+            let mut updated = (*current).clone();
+            updated.retain(|key, _| !file_ids.contains(&key.sidecar.file_id));
+            self.decoded.store(Arc::new(updated));
+        }
+        self.sidecars.evict_packages(file_ids);
+    }
+
+    #[cfg(test)]
+    fn decoded_len(&self) -> usize {
+        self.decoded.load().len()
+    }
+}
+
+fn create_sidecar_workspace(staging_root: &Path, package_index: u32) -> Result<PathBuf> {
+    loop {
+        let sequence = SIDECAR_STAGING_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+        let workspace = staging_root.join(format!(
+            "package-{package_index}-process-{}-{sequence}",
+            std::process::id()
+        ));
+        match fs::create_dir(&workspace) {
+            Ok(()) => return Ok(workspace),
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(error) => {
+                return Err(paro_error::io_error(format!(
+                    "create search sidecar workspace {}: {}",
+                    workspace.display(),
+                    error
+                )));
+            }
+        }
+    }
 }
 
 fn sidecar_reader_cache_key(
     location: &ArtifactLocation,
     artifact_format_version: u32,
+    integrity: SidecarIntegrityPolicy,
 ) -> Result<SidecarReaderCacheKey> {
-    let ArtifactLocation::SidecarArtifactFile { checksum, .. } = location else {
+    let ArtifactLocation::SidecarArtifactFile {
+        file_id,
+        offset,
+        len,
+        checksum,
+    } = location
+    else {
         return Err(paro_error::invalid_input(
             "expected sidecar artifact file location",
         ));
     };
     Ok(SidecarReaderCacheKey {
+        file_id: *file_id,
+        offset: *offset,
+        len: *len,
         checksum: *checksum,
         artifact_format_version,
+        integrity,
     })
 }
 
@@ -578,6 +1282,47 @@ mod tests {
     use crate::metrics::storage_metrics;
 
     #[test]
+    fn self_validating_artifact_does_not_share_an_unverified_cache_entry() {
+        let temp_dir = tempfile::TempDir::new().unwrap();
+        let store = SidecarArtifactStore::new(temp_dir.path());
+        let file_id = SidecarArtifactStore::default_shard_file_id(91, 3);
+        let mut writer = store.create_package_writer(file_id).unwrap();
+        let location = writer.append_artifact(b"self-validating").unwrap();
+        let path = writer.final_path().to_path_buf();
+        writer.finalize().unwrap();
+
+        let (_, offset, _, _) = sidecar_location_parts(&location).unwrap();
+        let mut file = OpenOptions::new().write(true).open(path).unwrap();
+        file.seek(SeekFrom::Start(offset)).unwrap();
+        file.write_all(b"S").unwrap();
+        file.sync_all().unwrap();
+
+        let cache = SidecarReaderCache::new(store);
+        let self_validating = cache
+            .open(SidecarReaderRequest {
+                location: &location,
+                artifact_format_version: 8,
+                provider: SearchIndexKind::Hnsw,
+                codec: SIDECAR_PACKAGE_CODEC,
+                integrity: SidecarIntegrityPolicy::SelfValidatingArtifact,
+            })
+            .unwrap();
+        assert_eq!(self_validating.bytes(), b"Self-validating");
+
+        let error = cache
+            .open(SidecarReaderRequest {
+                location: &location,
+                artifact_format_version: 8,
+                provider: SearchIndexKind::Hnsw,
+                codec: SIDECAR_PACKAGE_CODEC,
+                integrity: SidecarIntegrityPolicy::EnvelopeChecksum,
+            })
+            .unwrap_err();
+        assert!(error.to_string().contains("checksum mismatch"));
+        assert_eq!(cache.len(), 1);
+    }
+
+    #[test]
     fn sidecar_package_writer_appends_offsets_and_reads_by_location() {
         let temp_dir = tempfile::TempDir::new().unwrap();
         let store = SidecarArtifactStore::new(temp_dir.path());
@@ -589,7 +1334,7 @@ mod tests {
         let staging_path = writer.staging_path().to_path_buf();
         let final_path = writer.final_path().to_path_buf();
 
-        assert_eq!(writer.bytes_written(), 15);
+        assert_eq!(writer.bytes_written(), 74);
         assert!(staging_path.exists());
         writer.finalize().unwrap();
         assert!(final_path.exists());
@@ -618,12 +1363,49 @@ mod tests {
                 assert_eq!(store.package_path(*first_file), final_path);
                 assert_eq!(*first_offset, 0);
                 assert_eq!(*first_len, 5);
-                assert_eq!(*second_offset, 5);
+                assert_eq!(*second_offset, SidecarPackageWriter::ARTIFACT_ALIGNMENT);
                 assert_eq!(*second_len, 10);
                 assert!(!SidecarArtifactStore::package_relative_path(file_id).is_absolute());
             }
             _ => panic!("expected sidecar locations"),
         }
+    }
+
+    #[test]
+    fn sidecar_package_writer_streams_aligned_artifact_and_derives_its_length() {
+        let temp_dir = tempfile::TempDir::new().unwrap();
+        let store = SidecarArtifactStore::new(temp_dir.path());
+        let file_id = SidecarArtifactStore::default_shard_file_id(8, 4);
+        let mut writer = store.create_package_writer(file_id).unwrap();
+        writer.append_artifact(b"prefix").unwrap();
+        let expected = (0..128 * 1024 + 17)
+            .map(|position| (position % 251) as u8)
+            .collect::<Vec<_>>();
+
+        let location = writer
+            .append_streamed_artifact(|file, offset| {
+                assert_eq!(file.stream_position().unwrap(), offset);
+                for chunk in expected.chunks(4093) {
+                    file.write_all(chunk)?;
+                }
+                Ok(())
+            })
+            .unwrap();
+        writer.finalize().unwrap();
+
+        let ArtifactLocation::SidecarArtifactFile {
+            offset,
+            len,
+            checksum,
+            ..
+        } = location
+        else {
+            panic!("expected streamed sidecar location");
+        };
+        assert_eq!(offset % SidecarPackageWriter::ARTIFACT_ALIGNMENT, 0);
+        assert_eq!(len, expected.len() as u64);
+        assert_eq!(checksum, seahash::hash(&expected));
+        assert_eq!(store.read_artifact(&location).unwrap(), expected);
     }
 
     #[test]
@@ -637,15 +1419,18 @@ mod tests {
         };
         let final_path;
         let staging_path;
+        let workspace_dir;
         {
             let mut writer = store.create_package_writer(file_id).unwrap();
             writer.append_artifact(b"orphan").unwrap();
             final_path = writer.final_path().to_path_buf();
             staging_path = writer.staging_path().to_path_buf();
+            workspace_dir = writer.workspace_dir().to_path_buf();
             assert!(staging_path.exists());
         }
 
         assert!(!staging_path.exists());
+        assert!(!workspace_dir.exists());
         assert!(!final_path.exists());
     }
 
@@ -666,9 +1451,9 @@ mod tests {
 
     #[test]
     #[serial_test::serial]
-    fn sidecar_reader_cache_uses_content_checksum_and_format_version_identity() {
+    fn sidecar_reader_cache_uses_physical_artifact_and_format_identity() {
         let _metrics_guard = crate::metrics::storage_metrics_test_guard();
-        const TEST_CODEC: &str = "test-cache-content-identity";
+        const TEST_CODEC: &str = "test-cache-physical-identity";
         let temp_dir = tempfile::TempDir::new().unwrap();
         let store = SidecarArtifactStore::new(temp_dir.path());
 
@@ -685,9 +1470,7 @@ mod tests {
         };
         let mut second_writer = store.create_package_writer(second_file_id).unwrap();
         let second_location = second_writer.append_artifact(b"cache-me").unwrap();
-        let second_path = second_writer.final_path().to_path_buf();
         second_writer.finalize().unwrap();
-        fs::remove_file(&second_path).unwrap();
 
         let cache = SidecarReaderCache::new(store.clone());
         let first = cache
@@ -696,6 +1479,7 @@ mod tests {
                 artifact_format_version: 1,
                 provider: SearchIndexKind::FullText,
                 codec: TEST_CODEC,
+                integrity: SidecarIntegrityPolicy::EnvelopeChecksum,
             })
             .unwrap();
         let second = cache
@@ -704,22 +1488,26 @@ mod tests {
                 artifact_format_version: 1,
                 provider: SearchIndexKind::FullText,
                 codec: TEST_CODEC,
+                integrity: SidecarIntegrityPolicy::EnvelopeChecksum,
             })
             .unwrap();
 
-        assert!(std::sync::Arc::ptr_eq(&first, &second));
+        assert!(!std::sync::Arc::ptr_eq(&first, &second));
         assert_eq!(first.bytes(), b"cache-me");
-        assert_eq!(cache.len(), 1);
+        assert_eq!(second.bytes(), b"cache-me");
+        assert_eq!(cache.len(), 2);
 
-        let err = cache
+        let second_other_format = cache
             .open(SidecarReaderRequest {
                 location: &second_location,
                 artifact_format_version: 2,
                 provider: SearchIndexKind::FullText,
                 codec: TEST_CODEC,
+                integrity: SidecarIntegrityPolicy::EnvelopeChecksum,
             })
-            .unwrap_err();
-        assert!(err.to_string().contains("open search sidecar package"));
+            .unwrap();
+        assert!(!std::sync::Arc::ptr_eq(&second, &second_other_format));
+        assert_eq!(cache.len(), 3);
 
         let snapshot = storage_metrics().snapshot();
         let series = snapshot
@@ -728,14 +1516,175 @@ mod tests {
             .find(|series| {
                 series.key.provider == SearchIndexKind::FullText && series.key.codec == TEST_CODEC
             })
-            .expect("content identity test sidecar reader metrics");
+            .expect("physical identity test sidecar reader metrics");
         assert_eq!(series.key.provider, SearchIndexKind::FullText);
         assert_eq!(series.key.codec, TEST_CODEC);
         assert_eq!(series.counters.format_dispatch_total, 3);
-        assert_eq!(series.counters.cache_misses_total, 2);
-        assert_eq!(series.counters.cache_hits_total, 1);
+        assert_eq!(series.counters.cache_misses_total, 3);
+        assert_eq!(series.counters.cache_hits_total, 0);
         assert_eq!(series.counters.open_count_total, 2);
-        assert_eq!(series.counters.mmap_bytes, 8);
+        assert_eq!(series.counters.mmap_bytes, 16);
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn reader_runtime_reuses_typed_reader_and_evicts_with_physical_package() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        const TEST_CODEC: &str = "test-typed-reader-cache";
+        let _metrics_guard = crate::metrics::storage_metrics_test_guard();
+        storage_metrics().reset_for_tests();
+        let temp_dir = tempfile::TempDir::new().unwrap();
+        let store = SidecarArtifactStore::new(temp_dir.path());
+        let file_id = SidecarArtifactStore::default_shard_file_id(31, 7);
+        let mut writer = store.create_package_writer(file_id).unwrap();
+        let location = writer.append_artifact(b"typed-reader").unwrap();
+        writer.finalize().unwrap();
+
+        let runtime = SearchReaderRuntime::new(store);
+        let request = DecodedSidecarReaderRequest {
+            sidecar: SidecarReaderRequest {
+                location: &location,
+                artifact_format_version: 3,
+                provider: SearchIndexKind::Hnsw,
+                codec: TEST_CODEC,
+                integrity: SidecarIntegrityPolicy::SelfValidatingArtifact,
+            },
+            binding: DecodedReaderBinding::SelfContained,
+        };
+        let builds = AtomicUsize::new(0);
+        let first = runtime
+            .get_or_try_open_decoded(request, |_| {
+                builds.fetch_add(1, Ordering::Relaxed);
+                Ok(Some(String::from("decoded")))
+            })
+            .unwrap()
+            .unwrap();
+        let second = runtime
+            .get_or_try_open_decoded(request, |_| {
+                builds.fetch_add(1, Ordering::Relaxed);
+                Ok(Some(String::from("must-not-run")))
+            })
+            .unwrap()
+            .unwrap();
+        assert!(Arc::ptr_eq(&first, &second));
+        assert_eq!(builds.load(Ordering::Relaxed), 1);
+        assert_eq!(runtime.decoded_len(), 1);
+        // The typed hit bypasses both locks in the lower-level mmap cache.
+        assert_eq!(runtime.sidecars.len(), 1);
+        assert_eq!(runtime.sidecars.package_count(), 1);
+        let snapshot = storage_metrics().snapshot();
+        let series = snapshot
+            .search_sidecar_reader_by_key
+            .iter()
+            .find(|series| {
+                series.key.provider == SearchIndexKind::Hnsw && series.key.codec == TEST_CODEC
+            })
+            .expect("typed reader physical-cache metrics");
+        assert_eq!(series.counters.format_dispatch_total, 1);
+        assert_eq!(series.counters.cache_misses_total, 1);
+        assert_eq!(series.counters.cache_hits_total, 0);
+        assert_eq!(series.counters.open_count_total, 1);
+
+        runtime.evict_packages(&BTreeSet::from([file_id]));
+        assert_eq!(runtime.decoded_len(), 0);
+        assert!(runtime.sidecars.is_empty());
+        assert_eq!(runtime.sidecars.package_count(), 0);
+        assert_eq!(first.as_str(), "decoded");
+    }
+
+    #[test]
+    fn decoded_reader_cache_separates_external_generation_bindings() {
+        let temp_dir = tempfile::TempDir::new().unwrap();
+        let store = SidecarArtifactStore::new(temp_dir.path());
+        let file_id = SidecarArtifactStore::default_shard_file_id(41, 9);
+        let mut writer = store.create_package_writer(file_id).unwrap();
+        let location = writer.append_artifact(b"binding-scoped-reader").unwrap();
+        writer.finalize().unwrap();
+
+        let runtime = SearchReaderRuntime::new(store);
+        let request = |generation_id| DecodedSidecarReaderRequest {
+            sidecar: SidecarReaderRequest {
+                location: &location,
+                artifact_format_version: 3,
+                provider: SearchIndexKind::Hnsw,
+                codec: "test-binding-scoped-reader",
+                integrity: SidecarIntegrityPolicy::SelfValidatingArtifact,
+            },
+            binding: DecodedReaderBinding::GenerationExternalVectors {
+                definition_id: 41,
+                generation_id,
+                column_id: 7,
+            },
+        };
+        let first = runtime
+            .get_or_try_open_decoded(request(1), |_| Ok(Some(String::from("generation-1"))))
+            .unwrap()
+            .unwrap();
+        let second = runtime
+            .get_or_try_open_decoded(request(2), |_| Ok(Some(String::from("generation-2"))))
+            .unwrap()
+            .unwrap();
+
+        assert!(!Arc::ptr_eq(&first, &second));
+        assert_eq!(runtime.decoded_len(), 2);
+        assert_eq!(runtime.sidecars.len(), 1);
+    }
+
+    #[test]
+    fn concurrent_typed_reader_miss_is_single_flight() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::Barrier;
+        use std::time::Duration;
+
+        let temp_dir = tempfile::TempDir::new().unwrap();
+        let store = SidecarArtifactStore::new(temp_dir.path());
+        let file_id = SidecarArtifactStore::default_shard_file_id(32, 8);
+        let mut writer = store.create_package_writer(file_id).unwrap();
+        let location = writer.append_artifact(b"single-flight").unwrap();
+        writer.finalize().unwrap();
+
+        let runtime = SearchReaderRuntime::new(store);
+        let builds = AtomicUsize::new(0);
+        let start = Barrier::new(9);
+        std::thread::scope(|scope| {
+            let handles = (0..8)
+                .map(|_| {
+                    scope.spawn(|| {
+                        start.wait();
+                        runtime
+                            .get_or_try_open_decoded(
+                                DecodedSidecarReaderRequest {
+                                    sidecar: SidecarReaderRequest {
+                                        location: &location,
+                                        artifact_format_version: 3,
+                                        provider: SearchIndexKind::Hnsw,
+                                        codec: "test-single-flight",
+                                        integrity: SidecarIntegrityPolicy::SelfValidatingArtifact,
+                                    },
+                                    binding: DecodedReaderBinding::SelfContained,
+                                },
+                                |_| {
+                                    builds.fetch_add(1, Ordering::AcqRel);
+                                    std::thread::sleep(Duration::from_millis(25));
+                                    Ok(Some(String::from("decoded")))
+                                },
+                            )
+                            .unwrap()
+                            .unwrap()
+                    })
+                })
+                .collect::<Vec<_>>();
+            start.wait();
+            let readers = handles
+                .into_iter()
+                .map(|handle| handle.join().unwrap())
+                .collect::<Vec<_>>();
+            for reader in readers.iter().skip(1) {
+                assert!(Arc::ptr_eq(&readers[0], reader));
+            }
+        });
+        assert_eq!(builds.load(Ordering::Acquire), 1);
     }
 
     #[test]
@@ -758,6 +1707,7 @@ mod tests {
                 artifact_format_version: 1,
                 provider: SearchIndexKind::Sparse,
                 codec: TEST_CODEC,
+                integrity: SidecarIntegrityPolicy::EnvelopeChecksum,
             })
             .unwrap();
         let second = cache
@@ -766,6 +1716,7 @@ mod tests {
                 artifact_format_version: 1,
                 provider: SearchIndexKind::Sparse,
                 codec: TEST_CODEC,
+                integrity: SidecarIntegrityPolicy::EnvelopeChecksum,
             })
             .unwrap();
         let first_again = cache
@@ -774,6 +1725,7 @@ mod tests {
                 artifact_format_version: 1,
                 provider: SearchIndexKind::Sparse,
                 codec: TEST_CODEC,
+                integrity: SidecarIntegrityPolicy::EnvelopeChecksum,
             })
             .unwrap();
 
@@ -796,6 +1748,6 @@ mod tests {
         assert_eq!(series.counters.cache_misses_total, 2);
         assert_eq!(series.counters.cache_hits_total, 1);
         assert_eq!(series.counters.open_count_total, 1);
-        assert_eq!(series.counters.mmap_bytes, 20);
+        assert_eq!(series.counters.mmap_bytes, 79);
     }
 }

@@ -5,6 +5,7 @@
 
 use crate::binder::ir::OrderByNode;
 use crate::plan::LogicalPlan;
+use paro_storage::index::hnsw::HnswQueryOptions;
 
 /// TopN represents an optimized ORDER BY + LIMIT operation.
 ///
@@ -23,8 +24,8 @@ pub struct TopN {
     pub limit: usize,
     /// The OFFSET value (must be constant, 0 if not specified)
     pub offset: usize,
-    /// Optional SQL hint `/*+ HNSW_EF(N) */` propagated from Limit.
-    pub hnsw_ef_hint: Option<usize>,
+    /// Typed dense-vector query options propagated from Limit.
+    pub hnsw_options: HnswQueryOptions,
     /// The child operator
     pub child: Box<LogicalPlan>,
 }
@@ -36,13 +37,13 @@ impl TopN {
             orders,
             limit,
             offset,
-            hnsw_ef_hint: None,
+            hnsw_options: HnswQueryOptions::default(),
             child: Box::new(child),
         }
     }
 
-    pub fn with_hnsw_ef_hint(mut self, hnsw_ef_hint: Option<usize>) -> Self {
-        self.hnsw_ef_hint = hnsw_ef_hint;
+    pub fn with_hnsw_options(mut self, hnsw_options: HnswQueryOptions) -> Self {
+        self.hnsw_options = hnsw_options;
         self
     }
 

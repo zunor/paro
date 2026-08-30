@@ -432,6 +432,37 @@ impl Default for HnswProviderStats {
 }
 
 impl HnswProviderStats {
+    /// Reconstruct the optimizer/runtime statistics image carried by the
+    /// generation manifest. Sidecar artifacts do not belong to any one base
+    /// segment, so segment-local statistics cannot represent this object.
+    pub fn index_statistics(&self) -> Result<HnswIndexStatistics> {
+        Ok(HnswIndexStatistics {
+            num_indexed_vectors: usize::try_from(self.vector_count).map_err(|_| {
+                paro_error::out_of_range("HNSW vector count exceeds optimizer statistics width")
+            })?,
+            dimension: usize::try_from(self.dimension).map_err(|_| {
+                paro_error::out_of_range("HNSW dimension exceeds optimizer statistics width")
+            })?,
+            max_level: usize::try_from(self.max_level).map_err(|_| {
+                paro_error::out_of_range("HNSW level exceeds optimizer statistics width")
+            })?,
+            m: usize::try_from(self.m).map_err(|_| {
+                paro_error::out_of_range("HNSW degree exceeds optimizer statistics width")
+            })?,
+            ef_construction: usize::try_from(self.ef_construction).map_err(|_| {
+                paro_error::out_of_range(
+                    "HNSW construction beam exceeds optimizer statistics width",
+                )
+            })?,
+            graph_size_bytes: self.graph_memory_bytes,
+            storage_size_bytes: self.vector_storage_bytes,
+            total_graph_links: self.total_graph_links,
+            level0_graph_links: self.level0_graph_links,
+            max_level0_degree: self.max_level0_degree,
+            avg_level0_degree: self.avg_level0_degree,
+        })
+    }
+
     pub fn merge_assign(&mut self, incoming: &Self) {
         if self.dimension == 0 {
             self.dimension = incoming.dimension;
@@ -613,6 +644,12 @@ impl GenerationStats {
         self.provider_stats.as_ref()?.as_hnsw()
     }
 
+    pub fn hnsw_index_statistics(&self) -> Result<Option<HnswIndexStatistics>> {
+        self.hnsw_provider_stats()
+            .map(HnswProviderStats::index_statistics)
+            .transpose()
+    }
+
     pub fn fulltext_global_stats(&self) -> Option<GlobalFullTextStats> {
         Some(self.fulltext_provider_stats()?.global_stats())
     }
@@ -671,6 +708,7 @@ pub struct GenerationMaintenanceState {
 pub struct SearchCostEstimate {
     pub score: f64,
     pub estimated_rows: Option<u64>,
+    pub estimated_total_rows: Option<u64>,
 }
 
 impl SearchCostEstimate {
@@ -678,11 +716,17 @@ impl SearchCostEstimate {
         Self {
             score,
             estimated_rows: None,
+            estimated_total_rows: None,
         }
     }
 
     pub const fn with_rows(mut self, estimated_rows: u64) -> Self {
         self.estimated_rows = Some(estimated_rows);
+        self
+    }
+
+    pub const fn with_total_rows(mut self, estimated_total_rows: u64) -> Self {
+        self.estimated_total_rows = Some(estimated_total_rows);
         self
     }
 }
@@ -1108,6 +1152,15 @@ mod tests {
         assert_eq!(hnsw.vector_count, 5);
         assert_eq!(hnsw.dimension, 64);
         assert_eq!(hnsw.estimated_total_memory_bytes(), 3328);
+        let index = stats
+            .hnsw_index_statistics()
+            .unwrap()
+            .expect("generation HNSW index statistics");
+        assert_eq!(index.num_indexed_vectors, 5);
+        assert_eq!(index.dimension, 64);
+        assert_eq!(index.graph_size_bytes, 2048);
+        assert_eq!(index.storage_size_bytes, 1280);
+        assert!((index.avg_level0_degree - 11.2).abs() < 1e-6);
         assert!(stats.fulltext_provider_stats().is_none());
         assert!(stats.sparse_provider_stats().is_none());
     }

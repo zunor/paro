@@ -215,6 +215,7 @@ impl TestStatementContextBuilder {
             options: StatementOptions::default(),
             input: crate::StatementInput::default(),
             time: crate::StatementTimeContext::capture(None),
+            random: Arc::new(crate::SessionRandom::with_seed(1)),
             databases: Arc::new(AttachedDatabaseDirectory::new(
                 0,
                 Some(self.current_database.clone()),

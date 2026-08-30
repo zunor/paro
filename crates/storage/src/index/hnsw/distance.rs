@@ -16,7 +16,8 @@
 //!   are negated to achieve this.
 //! - **SIMD acceleration**: Automatically inherited from `paro-common`'s
 //!   implementations (AVX/SSE/NEON), no duplicate SIMD code here.
-//! - **Preprocessing**: Cosine metric normalizes vectors before storage.
+//! - **Preprocessing**: Cosine queries are normalized once; table vectors stay
+//!   raw and the HNSW artifact stores per-point inverse norms.
 //! - **Postprocessing**: Converts internal scores back to user-facing distances.
 //!
 //! ## Two-Layer Architecture
@@ -30,13 +31,15 @@
 //! ```
 
 use paro_common::distance;
+use serde::{Deserialize, Serialize};
 
 use super::types::{PreparedQuery, ScoreType};
 
 /// Distance metric type for vector comparison.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum DistanceMetric {
-    /// Cosine similarity (dot product of normalized vectors).
+    /// Cosine similarity (dot product with index-private inverse norms).
     /// Range: [-1, 1], higher is more similar.
     Cosine,
     /// Euclidean distance (L2 norm).
@@ -51,13 +54,34 @@ pub enum DistanceMetric {
 }
 
 impl DistanceMetric {
-    /// Convert u8 byte to DistanceMetric
-    pub fn from_u8(val: u8) -> Self {
+    /// Decode the stable tablet-schema distance tag.
+    pub const fn from_u8(val: u8) -> Option<Self> {
         match val {
-            1 => DistanceMetric::Cosine,
-            2 => DistanceMetric::DotProduct,
-            3 => DistanceMetric::Manhattan,
-            _ => DistanceMetric::Euclidean,
+            0 => Some(DistanceMetric::Euclidean),
+            1 => Some(DistanceMetric::Cosine),
+            2 => Some(DistanceMetric::DotProduct),
+            3 => Some(DistanceMetric::Manhattan),
+            _ => None,
+        }
+    }
+
+    /// Parse a SQL index option and normalize aliases to the durable name.
+    pub fn parse_sql_name(name: &str) -> Option<Self> {
+        match name.to_ascii_lowercase().as_str() {
+            "l2" | "euclidean" => Some(Self::Euclidean),
+            "cos" | "cosine" => Some(Self::Cosine),
+            "dot" | "dot_product" | "inner_product" | "ip" => Some(Self::DotProduct),
+            "l1" | "manhattan" => Some(Self::Manhattan),
+            _ => None,
+        }
+    }
+
+    pub const fn durable_name(self) -> &'static str {
+        match self {
+            Self::Euclidean => "euclidean",
+            Self::Cosine => "cosine",
+            Self::DotProduct => "dot_product",
+            Self::Manhattan => "manhattan",
         }
     }
 
@@ -71,17 +95,18 @@ impl DistanceMetric {
     pub fn similarity(&self, v1: &[f32], v2: &[f32]) -> ScoreType {
         debug_assert_eq!(v1.len(), v2.len(), "Vector dimensions must match");
         match self {
-            DistanceMetric::Cosine | DistanceMetric::DotProduct => distance::dot_product(v1, v2),
+            DistanceMetric::Cosine => 1.0 - distance::cosine_distance(v1, v2),
+            DistanceMetric::DotProduct => distance::dot_product(v1, v2),
             DistanceMetric::Euclidean => -distance::l2_squared(v1, v2),
             DistanceMetric::Manhattan => -distance::l1_distance(v1, v2),
         }
     }
 
-    /// Preprocess a vector before storage.
+    /// Preprocess a query before graph scoring.
     ///
     /// For Cosine, this normalizes the vector to unit length.
     /// For other metrics, vectors are returned as-is.
-    pub fn preprocess(&self, vector: Vec<f32>) -> Vec<f32> {
+    pub fn preprocess_query(&self, vector: Vec<f32>) -> Vec<f32> {
         match self {
             DistanceMetric::Cosine => distance::normalize(vector),
             _ => vector,
@@ -90,35 +115,109 @@ impl DistanceMetric {
 
     /// Preprocess a raw query and record which metric produced it.
     pub fn prepare(&self, raw_query: &[f32]) -> PreparedQuery {
-        PreparedQuery::new(self.preprocess(raw_query.to_vec()), *self)
+        PreparedQuery::new(self.preprocess_query(raw_query.to_vec()), *self)
     }
 
-    /// Convert internal score to user-facing distance.
+    /// Score a vector against a query produced by [`Self::prepare`]. Cosine
+    /// queries are already unit length, so only the stored vector norm remains
+    /// in the hot loop. Stored table values themselves stay byte-for-byte
+    /// unchanged by index construction.
+    pub fn similarity_unindexed(&self, prepared_query: &[f32], vector: &[f32]) -> ScoreType {
+        debug_assert_eq!(
+            prepared_query.len(),
+            vector.len(),
+            "Vector dimensions must match"
+        );
+        if !matches!(self, Self::Cosine) {
+            return self.similarity(prepared_query, vector);
+        }
+        distance::dot_product(prepared_query, vector) * distance::inverse_norm(vector)
+    }
+
+    /// Score one contiguous row-major base-vector batch.
+    ///
+    /// Exact tail and covering scans are sequential workloads, unlike graph
+    /// traversal. Keeping this kernel at the metric boundary lets Euclidean
+    /// queries use the shared cross-row SIMD implementation without teaching
+    /// storage readers about distance semantics.
+    pub fn similarity_unindexed_batch_contiguous(
+        &self,
+        prepared_query: &[f32],
+        vectors: &[f32],
+        dimension: usize,
+        scores: &mut [ScoreType],
+    ) {
+        assert_eq!(prepared_query.len(), dimension);
+        assert_eq!(vectors.len(), scores.len().saturating_mul(dimension));
+        match self {
+            Self::Euclidean => {
+                distance::l2_squared_batch_contiguous(prepared_query, vectors, dimension, scores);
+                for score in scores {
+                    *score = -*score;
+                }
+            }
+            Self::Cosine => {
+                for (score, vector) in scores.iter_mut().zip(vectors.chunks_exact(dimension)) {
+                    *score = distance::dot_product(prepared_query, vector)
+                        * distance::inverse_norm(vector);
+                }
+            }
+            Self::DotProduct => {
+                for (score, vector) in scores.iter_mut().zip(vectors.chunks_exact(dimension)) {
+                    *score = distance::dot_product(prepared_query, vector);
+                }
+            }
+            Self::Manhattan => {
+                for (score, vector) in scores.iter_mut().zip(vectors.chunks_exact(dimension)) {
+                    *score = -distance::l1_distance(prepared_query, vector);
+                }
+            }
+        }
+    }
+
+    /// Score a prepared query against an indexed point. Cosine indexes persist
+    /// `inverse_norm` once per point, eliminating a second vector pass and
+    /// square root from every graph visit.
+    #[inline]
+    pub fn similarity_prepared_with_norm(
+        &self,
+        prepared_query: &[f32],
+        vector: &[f32],
+        cosine_inverse_norm: f32,
+    ) -> ScoreType {
+        match self {
+            Self::Cosine => distance::dot_product(prepared_query, vector) * cosine_inverse_norm,
+            _ => self.similarity(prepared_query, vector),
+        }
+    }
+
+    /// Score two points whose cosine inverse norms are part of the index
+    /// artifact. Other metrics ignore the preprocessing values.
+    #[inline]
+    pub fn similarity_indexed(
+        &self,
+        v1: &[f32],
+        v2: &[f32],
+        cosine_inverse_norm_1: f32,
+        cosine_inverse_norm_2: f32,
+    ) -> ScoreType {
+        match self {
+            Self::Cosine => {
+                distance::dot_product(v1, v2) * cosine_inverse_norm_1 * cosine_inverse_norm_2
+            }
+            _ => self.similarity(v1, v2),
+        }
+    }
+
+    /// Convert the internal larger-is-better score to the corresponding SQL
+    /// distance function result. All currently optimized SQL vector operators
+    /// order this value ascending.
     pub fn postprocess(&self, score: ScoreType) -> ScoreType {
         match self {
-            DistanceMetric::Cosine | DistanceMetric::DotProduct => score,
+            DistanceMetric::Cosine => 1.0 - score,
+            DistanceMetric::DotProduct => -score,
             DistanceMetric::Euclidean => score.abs().sqrt(),
             DistanceMetric::Manhattan => score.abs(),
-        }
-    }
-
-    /// Returns true if larger scores indicate more similar vectors.
-    pub fn is_larger_better(&self) -> bool {
-        match self {
-            DistanceMetric::Cosine | DistanceMetric::DotProduct => true,
-            DistanceMetric::Euclidean | DistanceMetric::Manhattan => false,
-        }
-    }
-
-    /// Check if a score satisfies a threshold condition.
-    ///
-    /// For LargerBetter metrics: score > threshold.
-    /// For SmallerBetter metrics: score < threshold.
-    pub fn check_threshold(&self, score: ScoreType, threshold: ScoreType) -> bool {
-        if self.is_larger_better() {
-            score > threshold
-        } else {
-            score < threshold
         }
     }
 }
@@ -163,7 +262,7 @@ mod tests {
     #[test]
     fn test_cosine_preprocess() {
         let v = vec![3.0, 4.0];
-        let normalized = DistanceMetric::Cosine.preprocess(v);
+        let normalized = DistanceMetric::Cosine.preprocess_query(v);
         // length = 5, normalized = [0.6, 0.8]
         assert!(approx_eq(normalized[0], 0.6));
         assert!(approx_eq(normalized[1], 0.8));
@@ -176,14 +275,14 @@ mod tests {
     #[test]
     fn test_cosine_preprocess_zero_vector() {
         let v = vec![0.0, 0.0, 0.0];
-        let result = DistanceMetric::Cosine.preprocess(v.clone());
+        let result = DistanceMetric::Cosine.preprocess_query(v.clone());
         assert_eq!(result, v);
     }
 
     #[test]
     fn test_cosine_preprocess_already_normalized() {
         let v = vec![1.0, 0.0, 0.0];
-        let result = DistanceMetric::Cosine.preprocess(v.clone());
+        let result = DistanceMetric::Cosine.preprocess_query(v.clone());
         assert_eq!(result, v);
     }
 
@@ -191,8 +290,8 @@ mod tests {
     fn test_cosine_preprocess_stable() {
         // Renormalization should produce the same result
         let v = vec![1.5, 2.5, -0.5, 3.0];
-        let first = DistanceMetric::Cosine.preprocess(v);
-        let second = DistanceMetric::Cosine.preprocess(first.clone());
+        let first = DistanceMetric::Cosine.preprocess_query(v);
+        let second = DistanceMetric::Cosine.preprocess_query(first.clone());
         assert_eq!(first, second);
     }
 
@@ -202,6 +301,41 @@ mod tests {
         assert_eq!(prepared.metric(), DistanceMetric::Cosine);
         assert!(approx_eq(prepared.as_slice()[0], 0.6));
         assert!(approx_eq(prepared.as_slice()[1], 0.8));
+    }
+
+    #[test]
+    fn unindexed_contiguous_batch_matches_scalar_metric_semantics() {
+        let vectors = [
+            1.0, 2.0, 3.0, 4.0, // row 0
+            -2.0, 0.5, 1.0, 8.0, // row 1
+            0.25, -1.0, 5.0, 2.0, // row 2
+        ];
+        for metric in [
+            DistanceMetric::Euclidean,
+            DistanceMetric::Cosine,
+            DistanceMetric::DotProduct,
+            DistanceMetric::Manhattan,
+        ] {
+            let prepared = metric.prepare(&[0.5, 1.0, -2.0, 3.0]);
+            let expected = vectors
+                .chunks_exact(4)
+                .map(|vector| metric.similarity_unindexed(prepared.as_slice(), vector))
+                .collect::<Vec<_>>();
+            let mut actual = vec![0.0; expected.len()];
+            metric.similarity_unindexed_batch_contiguous(
+                prepared.as_slice(),
+                &vectors,
+                4,
+                &mut actual,
+            );
+            assert!(
+                expected
+                    .iter()
+                    .zip(actual.iter())
+                    .all(|(&expected, &actual)| approx_eq(expected, actual)),
+                "{metric:?}: expected {expected:?}, got {actual:?}"
+            );
+        }
     }
 
     #[test]
@@ -224,35 +358,30 @@ mod tests {
         // DotProduct
         let score = DistanceMetric::DotProduct.similarity(&v1, &v2);
         assert!(approx_eq(score, 0.0));
+        assert!(approx_eq(DistanceMetric::DotProduct.postprocess(3.5), -3.5));
+        assert!(approx_eq(DistanceMetric::Cosine.postprocess(0.75), 0.25));
     }
 
     #[test]
     fn test_cosine_similarity() {
         let metric = DistanceMetric::Cosine;
-        // Preprocess (normalize) before similarity
-        let v1 = metric.preprocess(vec![3.0, 4.0]);
-        let v2 = metric.preprocess(vec![4.0, 3.0]);
+        let v1 = vec![3.0, 4.0];
+        let v2 = vec![4.0, 3.0];
         let score = metric.similarity(&v1, &v2);
         // cos(angle) = (3*4 + 4*3) / (5 * 5) = 24/25 = 0.96
         assert!(approx_eq(score, 0.96));
-    }
 
-    #[test]
-    fn test_is_larger_better() {
-        assert!(DistanceMetric::Cosine.is_larger_better());
-        assert!(DistanceMetric::DotProduct.is_larger_better());
-        assert!(!DistanceMetric::Euclidean.is_larger_better());
-        assert!(!DistanceMetric::Manhattan.is_larger_better());
-    }
-
-    #[test]
-    fn test_check_threshold() {
-        // For Cosine (larger better): 0.8 > 0.5 = true
-        assert!(DistanceMetric::Cosine.check_threshold(0.8, 0.5));
-        assert!(!DistanceMetric::Cosine.check_threshold(0.3, 0.5));
-
-        // For Euclidean (smaller better): -0.3 < -0.5 is false
-        assert!(!DistanceMetric::Euclidean.check_threshold(-0.3, -0.5));
+        // Query preparation must preserve the same score against an unmodified
+        // persisted vector. Index construction must not normalize SQL values.
+        let prepared = metric.prepare(&v1);
+        assert!(approx_eq(
+            metric.similarity_unindexed(prepared.as_slice(), &v2),
+            0.96
+        ));
+        assert!(approx_eq(
+            metric.similarity_unindexed(prepared.as_slice(), &[0.0, 0.0]),
+            0.0
+        ));
     }
 
     // ========================================================================
@@ -322,7 +451,7 @@ mod tests {
     #[test]
     fn test_simd_cosine_preprocess_large() {
         let v: Vec<f32> = (1..129).map(|i| i as f32).collect();
-        let normalized = DistanceMetric::Cosine.preprocess(v);
+        let normalized = DistanceMetric::Cosine.preprocess_query(v);
 
         // Verify unit length
         let len_sq: f32 = normalized.iter().map(|x| x * x).sum();
@@ -333,7 +462,7 @@ mod tests {
         );
 
         // Verify stability (renormalization produces same result)
-        let renormalized = DistanceMetric::Cosine.preprocess(normalized.clone());
+        let renormalized = DistanceMetric::Cosine.preprocess_query(normalized.clone());
         assert_eq!(normalized, renormalized);
     }
 }

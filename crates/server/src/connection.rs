@@ -70,13 +70,13 @@ pub struct PgFrontendMessageLimits {
 }
 
 impl PgFrontendMessageLimits {
-    pub fn new(copy_stdin_memory_limit: usize) -> Self {
+    pub fn new(copy_stdin_inflight_memory_limit: usize) -> Self {
         Self {
             startup_packet_bytes: DEFAULT_NORMAL_FRONTEND_MESSAGE_LIMIT,
             normal_message_bytes: DEFAULT_NORMAL_FRONTEND_MESSAGE_LIMIT,
             small_message_bytes: DEFAULT_SMALL_FRONTEND_MESSAGE_LIMIT,
             // Frontend message length includes the 4-byte length header.
-            copy_data_bytes: copy_stdin_memory_limit
+            copy_data_bytes: copy_stdin_inflight_memory_limit
                 .saturating_add(4)
                 .min(MAX_PG_FRONTEND_PACKET_BYTES),
         }
@@ -98,7 +98,7 @@ pub(crate) struct Connection {
     /// Shared limit state needed during pre-auth handshake.
     limits: Arc<ServerLimits>,
     /// Memory cap for transitional COPY FROM STDIN buffering.
-    copy_stdin_memory_limit: usize,
+    copy_stdin_inflight_memory_limit: usize,
     /// Server-side token that asks the connection to drain and stop accepting new work.
     drain_token: CancellationToken,
     /// Server-side token that asks the connection to force-close.
@@ -128,7 +128,7 @@ pub(crate) struct ConnectionInit {
     pub(crate) control: Arc<ServerConnectionControl>,
     pub(crate) limits: Arc<ServerLimits>,
     pub(crate) frontend_message_limits: PgFrontendMessageLimits,
-    pub(crate) copy_stdin_memory_limit: usize,
+    pub(crate) copy_stdin_inflight_memory_limit: usize,
     pub(crate) drain_token: CancellationToken,
     pub(crate) force_close_token: CancellationToken,
 }
@@ -144,7 +144,7 @@ impl Connection {
             control,
             limits,
             frontend_message_limits,
-            copy_stdin_memory_limit,
+            copy_stdin_inflight_memory_limit,
             drain_token,
             force_close_token,
         } = init;
@@ -160,7 +160,7 @@ impl Connection {
             instance,
             control,
             limits,
-            copy_stdin_memory_limit,
+            copy_stdin_inflight_memory_limit,
             drain_token,
             force_close_token,
             pending_frontend_messages: Arc::new(Mutex::new(VecDeque::new())),
@@ -351,7 +351,9 @@ impl Connection {
 
                     // Initialize the session with the startup identity.
                     let mut session = Session::with_user(self.id, self.instance.clone(), user_name);
-                    session.set_copy_stdin_memory_limit(self.copy_stdin_memory_limit);
+                    session.set_copy_stdin_inflight_memory_limit(
+                        self.copy_stdin_inflight_memory_limit,
+                    );
                     // Set the current database context
                     session.set_current_database(db_name)?;
                     if let Some(application_name) = start.parameters.get("application_name") {
@@ -455,6 +457,15 @@ impl Connection {
             .pop_front()
         {
             return Ok(Some(message));
+        }
+
+        // PostgreSQL flushes pending backend messages before it can block for
+        // more frontend input. Extended-query responders deliberately use
+        // `feed` to coalesce messages produced by one dispatch, so this is the
+        // protocol boundary that makes those messages observable even when a
+        // client does not send Sync/Flush next.
+        if !self.socket.write_buffer().is_empty() {
+            self.socket.flush().await?;
         }
 
         tokio::select! {

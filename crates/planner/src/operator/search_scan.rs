@@ -5,8 +5,8 @@
 
 use paro_common::types::LogicalType;
 use paro_storage::search::{
-    CapabilityToken, NormalizedSearchRequest, SearchCostEstimate, SearchIndexKind, SearchIntent,
-    SequentialCapability,
+    CapabilityToken, ExactFilterMaterialization, NormalizedSearchRequest, SearchCostEstimate,
+    SearchIndexKind, SearchIntent, SequentialCapability,
 };
 
 pub use paro_storage::search::{
@@ -32,6 +32,9 @@ pub struct SearchCandidate {
     pub token: CapabilityToken,
     pub kind: SearchIndexKind,
     pub estimated_cost: Option<SearchCostEstimate>,
+    /// Optimizer-owned physical estimate carried unchanged into costing and
+    /// EXPLAIN. This is not part of the exact/no-residual semantic proof.
+    pub exact_filter_materialization: Option<ExactFilterMaterialization>,
 }
 
 impl SearchCandidate {

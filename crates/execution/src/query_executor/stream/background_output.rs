@@ -43,7 +43,7 @@ impl ResultHandler {
     }
 
     #[inline]
-    fn pop_background_output_chunk(&self) -> Result<Option<Chunk>> {
+    pub(super) fn pop_background_output_chunk(&self) -> Result<Option<Chunk>> {
         let ResultOutput::Background { output, .. } = &self.output else {
             return Err(paro_common::error::internal(
                 "background output path selected without output port",
@@ -53,7 +53,7 @@ impl ResultHandler {
     }
 
     #[inline]
-    fn background_driver_finished(&self) -> Result<bool> {
+    pub(super) fn background_driver_finished(&self) -> Result<bool> {
         let ResultOutput::Background { driver, .. } = &self.output else {
             return Err(paro_common::error::internal(
                 "background output path selected without driver",
@@ -72,7 +72,7 @@ impl ResultHandler {
         Ok(())
     }
 
-    fn finish_background_driver(&mut self) -> Result<()> {
+    pub(super) fn finish_background_driver(&mut self) -> Result<()> {
         let output = std::mem::replace(&mut self.output, ResultOutput::Closed);
         match output {
             ResultOutput::Background { mut driver, .. } => driver.join(),

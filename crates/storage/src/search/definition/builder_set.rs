@@ -6,7 +6,6 @@ use std::sync::Arc;
 
 use crate::index::fulltext::tokenizer::TokenizerKind;
 use paro_common::error::Result;
-use serde_json::Value;
 
 use crate::search::capability::{SearchIndexDefinition, SearchIndexKind};
 use crate::search::inline_sink::{
@@ -74,12 +73,8 @@ fn inline_builder_physical_key(
 ) -> Result<InlineBuilderPhysicalKey> {
     let config_key = match definition.kind {
         SearchIndexKind::FullText => {
-            let config = definition
-                .provider_config
-                .get("config")
-                .and_then(Value::as_str)
-                .unwrap_or("simple");
-            TokenizerKind::from_config(config)?
+            let config = definition.fulltext_provider_config()?;
+            TokenizerKind::from_config(&config.config)?
                 .config_name()
                 .to_string()
         }

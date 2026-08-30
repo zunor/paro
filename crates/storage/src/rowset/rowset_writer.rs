@@ -31,8 +31,8 @@
 use super::rowset::{Rowset, RowsetSharedPtr};
 use super::rowset_meta::{generate_rowset_id, RowsetId, RowsetMeta, RowsetState, SegmentsOverlap};
 use super::segment::{
-    ColumnData, Segment, SegmentInlineIndexKind, SegmentInlineIndexPage, SegmentWriter,
-    SegmentWriterOptions,
+    ColumnData, HnswColumnBuildOptions, Segment, SegmentInlineIndexKind, SegmentInlineIndexPage,
+    SegmentWriter, SegmentWriterOptions,
 };
 use crate::metrics::{storage_metrics, SearchInlineBuildMetricKey};
 use crate::search::{
@@ -44,6 +44,7 @@ use crate::search::{
 use crate::tablet::{ColumnId, TabletSchemaRef, Version};
 use paro_common::error::{self as paro_error, Result};
 use paro_common::types::LogicalType;
+use std::collections::BTreeMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -54,6 +55,28 @@ const DEFAULT_SEGMENT_SIZE_THRESHOLD: u64 = 256 * 1024 * 1024;
 
 /// Default maximum rows per segment (1 million)
 const DEFAULT_MAX_ROWS_PER_SEGMENT: u64 = 1_000_000;
+
+/// Source of the physical segment row boundary. The ordinary fallback keeps
+/// non-search tables at a conservative size, while a durable HNSW placement
+/// contract may raise or lower the adaptive boundary. An explicit caller cap
+/// is always an upper bound and is never enlarged by a provider.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SegmentRowLimit {
+    Adaptive { fallback_rows: u64 },
+    Explicit { max_rows: u64 },
+}
+
+impl SegmentRowLimit {
+    fn effective(self, provider_rows: Option<u64>) -> u64 {
+        match self {
+            Self::Adaptive { fallback_rows } => provider_rows.unwrap_or(fallback_rows),
+            Self::Explicit { max_rows } => {
+                provider_rows.map_or(max_rows, |rows| rows.min(max_rows))
+            }
+        }
+        .max(1)
+    }
+}
 
 /// Required freshness must block the current segment instead of silently
 /// falling back to tail-only. Keep the retry bounded so a broken admission
@@ -75,8 +98,8 @@ pub struct RowsetWriterContext {
     pub rowset_path: PathBuf,
     /// Segment size threshold in bytes
     pub segment_size_threshold: u64,
-    /// Maximum rows per segment
-    pub max_rows_per_segment: u64,
+    /// Physical row-boundary policy.
+    pub segment_row_limit: SegmentRowLimit,
     /// Compression type for segments
     pub compression: super::page::CompressionType,
     /// Whether to build short key index
@@ -106,7 +129,9 @@ impl RowsetWriterContext {
             schema,
             rowset_path: rowset_path.into(),
             segment_size_threshold: DEFAULT_SEGMENT_SIZE_THRESHOLD,
-            max_rows_per_segment: DEFAULT_MAX_ROWS_PER_SEGMENT,
+            segment_row_limit: SegmentRowLimit::Adaptive {
+                fallback_rows: DEFAULT_MAX_ROWS_PER_SEGMENT,
+            },
             compression: super::page::CompressionType::Lz4,
             build_short_key_index: true,
             num_short_key_columns: 3,
@@ -130,7 +155,7 @@ impl RowsetWriterContext {
 
     /// Set maximum rows per segment
     pub fn with_max_rows_per_segment(mut self, max_rows: u64) -> Self {
-        self.max_rows_per_segment = max_rows;
+        self.segment_row_limit = SegmentRowLimit::Explicit { max_rows };
         self
     }
 
@@ -341,24 +366,51 @@ fn chunk_row_count(columns: &[ColumnData]) -> u64 {
 
 fn split_hnsw_segment_admissions<'a>(
     admitted: Vec<AdmittedInlineSink<'a>>,
-) -> (
+) -> Result<(
     Vec<AdmittedInlineSink<'a>>,
     Vec<AdmissionLease>,
     Option<u64>,
-) {
-    let mut search_sinks = Vec::new();
-    let mut hnsw_leases = Vec::new();
-    let mut hnsw_inline_row_limit: Option<u64> = None;
-    for mut admitted_sink in admitted {
-        if admitted_sink.entry.definition.kind == SearchIndexKind::Hnsw {
+    BTreeMap<ColumnId, HnswColumnBuildOptions>,
+)> {
+    // Validate the complete physical index set before transferring any raw
+    // admission grant into an RAII lease. A malformed or conflicting catalog
+    // definition must release every grant acquired for this segment.
+    let validated = (|| {
+        let mut hnsw_inline_row_limit: Option<u64> = None;
+        let mut hnsw_indexes = BTreeMap::new();
+        for admitted_sink in &admitted {
+            if admitted_sink.entry.definition.kind != SearchIndexKind::Hnsw {
+                continue;
+            }
             if let Some(estimate) = admitted_sink.hnsw_inline {
-                let limit = u64::from(estimate.threshold.max_vector_count.max(1));
+                let limit = estimate.max_segment_vector_count();
                 hnsw_inline_row_limit = Some(
                     hnsw_inline_row_limit
                         .map(|existing| existing.min(limit))
                         .unwrap_or(limit),
                 );
             }
+            let (column_id, options) = hnsw_column_build_options(&admitted_sink.entry.definition)?;
+            if hnsw_indexes.insert(column_id, options).is_some() {
+                return Err(paro_error::invalid_input(format!(
+                    "multiple active HNSW definitions target column {column_id}"
+                )));
+            }
+        }
+        Ok((hnsw_inline_row_limit, hnsw_indexes))
+    })();
+    let (hnsw_inline_row_limit, hnsw_indexes) = match validated {
+        Ok(validated) => validated,
+        Err(err) => {
+            release_admitted_inline_sinks(admitted);
+            return Err(err);
+        }
+    };
+
+    let mut search_sinks = Vec::new();
+    let mut hnsw_leases = Vec::new();
+    for mut admitted_sink in admitted {
+        if admitted_sink.entry.definition.kind == SearchIndexKind::Hnsw {
             if let (Some(admission), Some(grant)) =
                 (admitted_sink.admission.take(), admitted_sink.grant.take())
             {
@@ -368,7 +420,29 @@ fn split_hnsw_segment_admissions<'a>(
             search_sinks.push(admitted_sink);
         }
     }
-    (search_sinks, hnsw_leases, hnsw_inline_row_limit)
+    Ok((
+        search_sinks,
+        hnsw_leases,
+        hnsw_inline_row_limit,
+        hnsw_indexes,
+    ))
+}
+
+fn hnsw_column_build_options(
+    definition: &crate::search::SearchIndexDefinition,
+) -> Result<(ColumnId, HnswColumnBuildOptions)> {
+    let [column_id] = definition.column_ids.as_slice() else {
+        return Err(paro_error::invalid_input(
+            "HNSW definition requires exactly one vector column",
+        ));
+    };
+    let provider = definition.hnsw_provider_config()?;
+    Ok((
+        *column_id,
+        HnswColumnBuildOptions {
+            build_contract: provider.build_contract(),
+        },
+    ))
 }
 
 fn estimate_inline_build_cost(
@@ -402,11 +476,13 @@ fn hnsw_inline_build_estimate(
     entry: &SearchInlineBuilderEntry,
     max_rows_per_segment: u64,
     column_schema: &[crate::tablet::TabletColumn],
-) -> Option<HnswInlineBuildEstimate> {
+) -> Result<Option<HnswInlineBuildEstimate>> {
     if entry.definition.kind != SearchIndexKind::Hnsw {
-        return None;
+        return Ok(None);
     }
-    let column_id = *entry.definition.column_ids.first()?;
+    let column_id = *entry.definition.column_ids.first().ok_or_else(|| {
+        paro_error::invalid_input("HNSW definition requires exactly one vector column")
+    })?;
     let dimension = column_schema
         .iter()
         .find(|column| column.id == column_id)
@@ -414,7 +490,11 @@ fn hnsw_inline_build_estimate(
             LogicalType::Array(_, dimension) => u32::try_from(*dimension).ok(),
             _ => None,
         })
-        .unwrap_or_default();
+        .ok_or_else(|| {
+            paro_error::invalid_input(format!(
+                "HNSW definition column {column_id} is not a VECTOR(N) column"
+            ))
+        })?;
     HnswInlineBuildEstimate::from_definition(
         &entry.definition,
         max_rows_per_segment.max(1),
@@ -572,8 +652,8 @@ pub struct RowsetWriter {
     current_segment_writer: Option<SegmentWriter>,
     /// Admission leases for SegmentWriter-managed HNSW inline build on the current segment.
     current_hnsw_admission_leases: Vec<AdmissionLease>,
-    /// Whether the current SegmentWriter is allowed to build schema-native HNSW pages.
-    current_hnsw_build_admitted: bool,
+    /// Per-column physical HNSW contract admitted for the current segment.
+    current_hnsw_indexes: BTreeMap<ColumnId, HnswColumnBuildOptions>,
     /// Maximum rows allowed in the current HNSW-admitted segment.
     current_hnsw_inline_row_limit: Option<u64>,
     /// Search sinks consuming the current segment writer stream.
@@ -623,7 +703,7 @@ impl RowsetWriter {
             rowset_meta,
             current_segment_writer: None,
             current_hnsw_admission_leases: Vec::new(),
-            current_hnsw_build_admitted: false,
+            current_hnsw_indexes: BTreeMap::new(),
             current_hnsw_inline_row_limit: None,
             current_search_sinks: Vec::new(),
             current_segment_chunks: Vec::new(),
@@ -678,6 +758,24 @@ impl RowsetWriter {
         self.total_index_size
     }
 
+    /// Input bytes retained to support statement savepoint rollback for the
+    /// active segment. Completed segments do not retain their source batches.
+    pub fn retained_input_bytes(&self) -> u64 {
+        self.current_segment_chunks
+            .iter()
+            .flatten()
+            .fold(0_u64, |bytes, column| {
+                bytes
+                    .saturating_add(column.data.len() as u64)
+                    .saturating_add(
+                        column
+                            .null_flags
+                            .as_ref()
+                            .map_or(0_u64, |nulls| nulls.len() as u64),
+                    )
+            })
+    }
+
     /// Check if the writer has been finalized
     pub fn is_finalized(&self) -> bool {
         self.finalized
@@ -691,12 +789,18 @@ impl RowsetWriter {
             .unwrap_or(0)
     }
 
+    fn effective_segment_row_limit(&self) -> u64 {
+        self.context
+            .segment_row_limit
+            .effective(self.current_hnsw_inline_row_limit)
+    }
+
     /// Check if current segment should be flushed
     fn should_flush_segment(&self) -> bool {
         if let Some(writer) = &self.current_segment_writer {
             let rows = writer.num_rows();
             // Check row count threshold
-            if rows >= self.context.max_rows_per_segment {
+            if rows >= self.effective_segment_row_limit() {
                 return true;
             }
             // Note: Size threshold check would require tracking estimated size
@@ -708,7 +812,7 @@ impl RowsetWriter {
     fn create_raw_segment_writer(
         &self,
         segment_id: u32,
-        build_hnsw_indexes: bool,
+        hnsw_indexes: BTreeMap<ColumnId, HnswColumnBuildOptions>,
     ) -> Result<SegmentWriter> {
         let segment_path = self.segment_path(segment_id);
         let rowset_gen = self.rowset_meta.rowset_gen();
@@ -719,24 +823,9 @@ impl RowsetWriter {
             .with_short_key_index(self.context.build_short_key_index)
             .with_num_short_key_columns(self.context.num_short_key_columns);
 
-        // Collect HNSW columns from schema
-        let mut hnsw_cols = Vec::new();
-        for col in self.context.schema.columns() {
-            if col.index_hnsw {
-                hnsw_cols.push(col.id);
-            }
-        }
-        if !hnsw_cols.is_empty() {
-            options = options
-                .with_hnsw_index_columns(hnsw_cols)
-                .with_build_hnsw_indexes(self.context.build_hnsw_indexes && build_hnsw_indexes);
-            // Use config/distance from the first column for now
-            if let Some(col) = self.context.schema.columns().iter().find(|c| c.index_hnsw) {
-                use crate::index::hnsw::{DistanceMetric, HnswConfig};
-                options = options
-                    .with_hnsw_config(HnswConfig::new(col.hnsw_m, col.hnsw_ef_construct))
-                    .with_hnsw_distance(DistanceMetric::from_u8(col.hnsw_distance));
-            }
+        options = options.with_build_hnsw_indexes(self.context.build_hnsw_indexes);
+        for (column_id, hnsw) in hnsw_indexes {
+            options = options.with_hnsw_build_options(column_id, hnsw);
         }
 
         let mut writer = SegmentWriter::create(self.context.schema.clone(), segment_path, options)?;
@@ -750,10 +839,9 @@ impl RowsetWriter {
     fn create_segment_writer(&mut self, row_count_estimate: u64) -> Result<()> {
         let segment_id = self.current_segment_id;
         let admitted = self.admitted_inline_sinks(row_count_estimate)?;
-        let (admitted_search_sinks, hnsw_admission_leases, hnsw_inline_row_limit) =
-            split_hnsw_segment_admissions(admitted);
-        let build_hnsw_indexes = !hnsw_admission_leases.is_empty();
-        let writer = self.create_raw_segment_writer(segment_id, build_hnsw_indexes)?;
+        let (admitted_search_sinks, hnsw_admission_leases, hnsw_inline_row_limit, hnsw_indexes) =
+            split_hnsw_segment_admissions(admitted)?;
+        let writer = self.create_raw_segment_writer(segment_id, hnsw_indexes.clone())?;
         let search_sinks = match self.open_segment_search_sinks(segment_id, admitted_search_sinks) {
             Ok(search_sinks) => search_sinks,
             Err(err) => {
@@ -766,7 +854,7 @@ impl RowsetWriter {
         };
         self.current_segment_writer = Some(writer);
         self.current_hnsw_admission_leases = hnsw_admission_leases;
-        self.current_hnsw_build_admitted = build_hnsw_indexes;
+        self.current_hnsw_indexes = hnsw_indexes;
         self.current_hnsw_inline_row_limit = hnsw_inline_row_limit;
         self.current_search_sinks = search_sinks;
         self.current_segment_chunks.clear();
@@ -867,20 +955,42 @@ impl RowsetWriter {
 
         let requests = entries
             .iter()
-            .map(|entry| InlineAdmissionRequest {
-                table_id: entry.definition.table_id,
-                definition_id: entry.definition.definition_id,
-                provider: entry.definition.kind,
-                flush_mode: entry.flush_mode(),
-                estimated_cost: estimate_inline_build_cost(entry, row_count_estimate),
-                row_count: row_count_estimate.max(1),
-                hnsw_inline: hnsw_inline_build_estimate(
+            .map(|entry| -> Result<InlineAdmissionRequest> {
+                let initial_hnsw = hnsw_inline_build_estimate(
                     entry,
                     row_count_estimate,
                     self.context.schema.columns(),
-                ),
+                )?;
+                let admitted_rows = initial_hnsw.map_or(row_count_estimate, |estimate| {
+                    // RowsetWriter seals only between chunks; it never splits
+                    // one logical input batch. Admission must therefore cover
+                    // at least the current indivisible chunk even when the
+                    // derived segment target is smaller.
+                    self.context
+                        .segment_row_limit
+                        .effective(Some(estimate.max_segment_vector_count()))
+                        .max(row_count_estimate)
+                });
+                let hnsw_inline = if initial_hnsw.is_some() {
+                    hnsw_inline_build_estimate(entry, admitted_rows, self.context.schema.columns())?
+                } else {
+                    None
+                };
+                let mut estimated_cost = estimate_inline_build_cost(entry, admitted_rows);
+                if let Some(estimate) = hnsw_inline {
+                    estimated_cost.memory_peak_bytes = estimate.estimated_build_peak_memory_bytes;
+                }
+                Ok(InlineAdmissionRequest {
+                    table_id: entry.definition.table_id,
+                    definition_id: entry.definition.definition_id,
+                    provider: entry.definition.kind,
+                    flush_mode: entry.flush_mode(),
+                    estimated_cost,
+                    row_count: admitted_rows.max(1),
+                    hnsw_inline,
+                })
             })
-            .collect::<Vec<_>>();
+            .collect::<Result<Vec<_>>>()?;
         for attempt in 0..REQUIRED_INLINE_ADMISSION_MAX_ATTEMPTS {
             let decisions = admission.request_inline_batch(&requests)?;
             if decisions.len() != entries.len() {
@@ -1011,9 +1121,7 @@ impl RowsetWriter {
     }
 
     fn flush_hnsw_segment_before_limit(&mut self, incoming_rows: u64) -> Result<()> {
-        let Some(limit) = self.current_hnsw_inline_row_limit else {
-            return Ok(());
-        };
+        let limit = self.effective_segment_row_limit();
         let Some(writer) = self.current_segment_writer.as_ref() else {
             return Ok(());
         };
@@ -1060,7 +1168,7 @@ impl RowsetWriter {
 
     fn clear_current_hnsw_admission(&mut self) {
         self.current_hnsw_admission_leases.clear();
-        self.current_hnsw_build_admitted = false;
+        self.current_hnsw_indexes.clear();
         self.current_hnsw_inline_row_limit = None;
     }
 
@@ -1217,8 +1325,10 @@ impl RowsetWriter {
             .collect::<Vec<_>>();
         self.current_segment_writer.take();
         self.remove_segment_outputs_from(mark.current_segment_id)?;
-        let mut writer = self
-            .create_raw_segment_writer(mark.current_segment_id, self.current_hnsw_build_admitted)?;
+        let mut writer = self.create_raw_segment_writer(
+            mark.current_segment_id,
+            self.current_hnsw_indexes.clone(),
+        )?;
         for columns in &retained_chunks {
             writer.append_chunk(columns)?;
         }
@@ -1387,7 +1497,7 @@ impl RowsetWriterBuilder {
 
     /// Set maximum rows per segment
     pub fn max_rows_per_segment(mut self, max_rows: u64) -> Self {
-        self.context.max_rows_per_segment = max_rows;
+        self.context.segment_row_limit = SegmentRowLimit::Explicit { max_rows };
         self
     }
 
@@ -1443,7 +1553,7 @@ mod tests {
         InlineArtifactBuildResult, InlineArtifactBuilder, MaintenanceCost, SearchAdmission,
         SearchFreshnessPolicy, SearchIndexDefinition, SearchIndexKind, SearchInlineBuilderEntry,
         SearchInlineBuilderSet, SegmentChunkInput, SegmentChunkSink, SegmentFlushCtx,
-        SegmentSinkSavepoint, SparseInlineArtifactBuilder,
+        SegmentSinkSavepoint, SparseInlineArtifactBuilder, HNSW_PROVIDER_CONFIG_VERSION,
     };
     use crate::tablet::tablet_schema::{KeysType, TabletColumn, TabletSchema};
     use paro_common::types::LogicalType;
@@ -1746,7 +1856,7 @@ mod tests {
             kind: SearchIndexKind::FullText,
             column_ids: vec![1],
             expression: None,
-            provider_config: json!({"config": "simple"}),
+            provider_config: json!({"version": 1, "config": "simple"}),
             freshness_policy,
             config_fingerprint: 99,
         };
@@ -1770,7 +1880,7 @@ mod tests {
             kind: SearchIndexKind::FullText,
             column_ids: vec![0],
             expression: None,
-            provider_config: json!({"config": "simple"}),
+            provider_config: json!({"version": 1, "config": "simple"}),
             freshness_policy,
             config_fingerprint: 101,
         };
@@ -1796,7 +1906,7 @@ mod tests {
             kind: SearchIndexKind::FullText,
             column_ids: vec![0],
             expression: None,
-            provider_config: json!({"config": "simple"}),
+            provider_config: json!({"version": 1, "config": "simple"}),
             freshness_policy,
             config_fingerprint: 102,
         };
@@ -1807,7 +1917,7 @@ mod tests {
             kind: SearchIndexKind::Sparse,
             column_ids: vec![1],
             expression: None,
-            provider_config: json!({}),
+            provider_config: json!({"version": 1, "physical_encoding": "binary-v1"}),
             freshness_policy,
             config_fingerprint: 103,
         };
@@ -1842,7 +1952,7 @@ mod tests {
             kind: SearchIndexKind::FullText,
             column_ids: vec![0],
             expression: None,
-            provider_config: json!({"config": "simple"}),
+            provider_config: json!({"version": 1, "config": "simple"}),
             freshness_policy,
             config_fingerprint: 121,
         };
@@ -1853,7 +1963,7 @@ mod tests {
             kind: SearchIndexKind::FullText,
             column_ids: vec![1],
             expression: None,
-            provider_config: json!({"config": "simple"}),
+            provider_config: json!({"version": 1, "config": "simple"}),
             freshness_policy,
             config_fingerprint: 122,
         };
@@ -1900,9 +2010,42 @@ mod tests {
             column_ids: vec![1],
             expression: None,
             provider_config: json!({
+                "version": HNSW_PROVIDER_CONFIG_VERSION,
+                "dimension": 2,
+                "distance": "euclidean",
+                "build_vector_encoding": "exact_f32",
                 "m": 8,
                 "ef_construct": 64,
+                "ef_search": 64,
+                "rerank_policy": "top_k",
+                "distance_cost": {
+                    "source": {
+                        "kind": "built_in",
+                        "revision": crate::index::hnsw::HNSW_BUILT_IN_DISTANCE_COST_REVISION
+                    },
+                    "random_access_cost_units": crate::search::DEFAULT_HNSW_RANDOM_ACCESS_COST_UNITS,
+                    "exact_f32_dimension_cost_units": crate::search::DEFAULT_HNSW_EXACT_F32_DIMENSION_COST_UNITS,
+                    "sequential_dimension_cost_units": crate::search::DEFAULT_HNSW_SEQUENTIAL_DIMENSION_COST_UNITS,
+                    "symmetric_i16_dimension_cost_units": crate::search::DEFAULT_HNSW_SYMMETRIC_I16_DIMENSION_COST_UNITS,
+                    "graph_scored_points_per_ef":
+                        crate::search::DEFAULT_HNSW_GRAPH_SCORED_POINTS_PER_EF
+                },
+                "generation_layout": {
+                    "target_graph_rows": crate::search::DEFAULT_HNSW_GENERATION_TARGET_GRAPH_ROWS
+                },
+                "maintenance": {
+                    "target_vector_bytes": crate::search::DEFAULT_HNSW_MAINTENANCE_TARGET_VECTOR_BYTES,
+                    "max_pending_vector_bytes": crate::search::DEFAULT_HNSW_MAINTENANCE_MAX_PENDING_VECTOR_BYTES,
+                    "compaction_fanout": crate::search::DEFAULT_HNSW_MAINTENANCE_COMPACTION_FANOUT,
+                },
+                "build_seed": 1,
+                "proposal_wave_max_size": crate::search::DEFAULT_HNSW_PROPOSAL_WAVE_MAX_SIZE,
+                "warmup_point_count": crate::search::DEFAULT_HNSW_WARMUP_POINT_COUNT,
+                "filter_columns": [],
+                "filter_block_rows": crate::search::DEFAULT_HNSW_FILTER_BLOCK_ROWS,
+                "filter_m": crate::search::DEFAULT_HNSW_FILTER_M,
                 "inline_threshold": {
+                    "enabled": true,
                     "max_vector_count": max_vector_count,
                     "max_graph_memory_bytes": 64 * 1024 * 1024u64,
                     "max_dimension": 128
@@ -2000,7 +2143,10 @@ mod tests {
 
         assert_eq!(context.tablet_id, 100);
         assert_eq!(context.segment_size_threshold, 128 * 1024 * 1024);
-        assert_eq!(context.max_rows_per_segment, 500_000);
+        assert_eq!(
+            context.segment_row_limit,
+            SegmentRowLimit::Explicit { max_rows: 500_000 }
+        );
         assert_eq!(context.compression, CompressionType::Zstd);
         assert!(!context.build_short_key_index);
     }
@@ -2304,10 +2450,7 @@ mod tests {
             .with_compression(CompressionType::None)
             .with_search_inline_builders(hnsw_recording_builder_set(
                 Arc::clone(&events),
-                SearchFreshnessPolicy::BoundedLag {
-                    max_tail_rows: 64,
-                    max_lag_millis: 250,
-                },
+                SearchFreshnessPolicy::Required,
                 Some(admission_trait),
             ));
         let mut writer = RowsetWriter::create(context).unwrap();
@@ -2567,10 +2710,7 @@ mod tests {
             .with_max_rows_per_segment(128)
             .with_search_inline_builders(hnsw_recording_builder_set(
                 Arc::clone(&events),
-                SearchFreshnessPolicy::BoundedLag {
-                    max_tail_rows: 64,
-                    max_lag_millis: 250,
-                },
+                SearchFreshnessPolicy::Required,
                 Some(admission_trait),
             ));
         let mut writer = RowsetWriter::create(context).unwrap();
@@ -2583,13 +2723,15 @@ mod tests {
         let requests = requests.lock().unwrap();
         assert_eq!(requests.len(), 1);
         let estimate = requests[0].hnsw_inline.expect("hnsw inline estimate");
-        assert_eq!(
-            estimate.vector_count, 2,
-            "HNSW admission should estimate the incoming segment rows, not max segment capacity"
-        );
+        assert_eq!(estimate.vector_count, 128);
+        assert_eq!(requests[0].row_count, 128);
         assert_eq!(estimate.dimension, 2);
         assert_eq!(estimate.threshold.max_vector_count, 1024);
         assert!(estimate.allows_inline());
+        assert_eq!(
+            requests[0].estimated_cost.memory_peak_bytes,
+            estimate.estimated_build_peak_memory_bytes
+        );
         assert_eq!(*releases.lock().unwrap(), vec![88]);
     }
 
@@ -2896,7 +3038,7 @@ mod tests {
             kind: SearchIndexKind::FullText,
             column_ids: vec![1],
             expression: None,
-            provider_config: json!({"config": "simple"}),
+            provider_config: json!({"version": 1, "config": "simple"}),
             freshness_policy: SearchFreshnessPolicy::default_for_kind(SearchIndexKind::FullText),
             config_fingerprint: 7,
         };
@@ -2945,7 +3087,7 @@ mod tests {
             kind: SearchIndexKind::Sparse,
             column_ids: vec![1],
             expression: None,
-            provider_config: json!({}),
+            provider_config: json!({"version": 1, "physical_encoding": "binary-v1"}),
             freshness_policy: SearchFreshnessPolicy::default_for_kind(SearchIndexKind::Sparse),
             config_fingerprint: 8,
         };
@@ -3273,5 +3415,19 @@ mod tests {
 
         let rowset = writer.build().unwrap();
         assert_eq!(rowset.num_rows(), 10);
+    }
+
+    #[test]
+    fn adaptive_segment_limit_uses_provider_placement_but_explicit_limit_caps_it() {
+        let adaptive = SegmentRowLimit::Adaptive {
+            fallback_rows: 1_000_000,
+        };
+        assert_eq!(adaptive.effective(None), 1_000_000);
+        assert_eq!(adaptive.effective(Some(2_000_000)), 2_000_000);
+
+        let explicit = SegmentRowLimit::Explicit { max_rows: 500_000 };
+        assert_eq!(explicit.effective(None), 500_000);
+        assert_eq!(explicit.effective(Some(2_000_000)), 500_000);
+        assert_eq!(explicit.effective(Some(250_000)), 250_000);
     }
 }

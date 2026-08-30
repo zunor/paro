@@ -4,174 +4,499 @@
 //! # HNSW Graph Layers
 //!
 //! Read-only HNSW graph structure for efficient searching. Supporting both
-//! standard HNSW and ACORN-1 filtered search algorithms.
+//! standard HNSW and exact-bitmap filtered Top-K search.
 
-use super::entry_points::{EntryPoint, EntryPoints};
-use super::graph_links::GraphLinks;
-use super::search_context::SearchContext;
-use super::types::{HnswM, PointOffset, ScoredPoint, SearchAlgorithm};
+use super::entry_points::{EntryPoint, EntryPoints, PredicateEntryPoint};
+use super::graph_links::{GraphLinks, GraphLinksReadView};
+use super::search_context::{FixedLengthPriorityQueue, SearchContext};
+use super::types::{
+    required_filtered_admissions, HnswM, HnswPredicateAdmissionMode, PointOffset, ScoredPoint,
+    SearchAlgorithm,
+};
 use super::visited_pool::VisitedPool;
-use super::VectorScorer;
+use super::GraphVectorScorer;
+use crate::index::{ExactRowAdmission, ExactRowSet};
+use crate::search::{ResourceBudget, SearchMemoryReservation, SearchWorkBudget};
+use paro_common::error::{self as paro_error, Result};
 use rand::{thread_rng, Rng};
-use roaring::RoaringBitmap;
+use std::cmp::Ordering;
+
+/// Maximum ordinary-graph beam used to discover predicate-topology entry
+/// seeds.  Filtered result quality is owned by the independent predicate beam;
+/// routing wider than this only repeats distance work on the base graph.
+const PREDICATE_ROUTING_EF: usize = 32;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct PredicateRoutingCandidate {
+    entry: PredicateEntryPoint,
+    point: ScoredPoint,
+}
+
+impl PartialOrd for PredicateRoutingCandidate {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl Ord for PredicateRoutingCandidate {
+    fn cmp(&self, other: &Self) -> Ordering {
+        self.point
+            .cmp(&other.point)
+            .then_with(|| self.entry.column_id.cmp(&other.entry.column_id))
+            .then_with(|| self.entry.level.cmp(&other.entry.level))
+    }
+}
 
 /// Read-only HNSW graph layers.
 pub struct GraphLayers {
     pub links: GraphLinks,
+    /// Predicate-local level-0 links. These edges are traversed only from and
+    /// to rows admitted by the exact predicate, so unrelated filters and
+    /// unfiltered searches never pay their degree or distance cost.
+    pub predicate_links: Option<GraphLinks>,
+    /// One tagged hierarchical entry per deterministic scalar block. Unlike
+    /// ordinary HNSW entry points this table is intentionally unbounded by a
+    /// small global constant: every block must remain directly reachable when
+    /// a predicate selects it.
+    pub predicate_entry_points: Box<[PredicateEntryPoint]>,
     pub entry_points: EntryPoints,
     pub visited_pool: VisitedPool,
     pub hnsw_m: HnswM,
 }
 
+/// Result of one graph traversal together with the adaptive work it performed.
+/// Keeping this trace beside the result lets callers distinguish a cheap
+/// masked hit from predicate-aware refinement without inferring it from
+/// cardinality or latency.
+pub(crate) struct GraphSearchResult {
+    pub(crate) points: Vec<ScoredPoint>,
+    pub(crate) predicate_admission: HnswPredicateAdmissionMode,
+    pub(crate) predicate_topology_used: bool,
+    pub(crate) predicate_refined: bool,
+}
+
+/// Independent cardinality limits for one graph search.
+///
+/// `top_k` is the SQL result cardinality and is the only value allowed to
+/// influence adaptive predicate decisions. `rerank_window` is the number of
+/// lossy-routing candidates that cross into exact scoring. Keeping them in a
+/// single validated value prevents a wider rerank window from silently
+/// changing routing-beam width, admission headroom, or locality tests.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct GraphSearchLimits {
+    top_k: usize,
+    rerank_window: usize,
+    ef: usize,
+}
+
+impl GraphSearchLimits {
+    pub(crate) fn try_new(top_k: usize, rerank_window: usize, ef: usize) -> Result<Self> {
+        if rerank_window < top_k || rerank_window > ef {
+            return Err(paro_error::invalid_input(format!(
+                "HNSW rerank window {rerank_window} must be between Top-K {top_k} and ef {ef}"
+            )));
+        }
+        Ok(Self {
+            top_k,
+            rerank_window,
+            ef,
+        })
+    }
+
+    #[cfg(test)]
+    fn top_k(self) -> usize {
+        self.top_k
+    }
+}
+
+/// Lazily materialized witnesses for predicate-topology partitions.
+///
+/// Broad predicates normally finish on the ordinary global beam and never
+/// enter the predicate topology. Building these witnesses eagerly made that
+/// optimistic path traverse every physical posting and allocate a query Vec
+/// for data it could not consume. The source owns its memory grant and caches
+/// the deterministic witnesses so batched queries pay at most once, exactly
+/// when adaptive refinement first requests them.
+pub(crate) struct PredicatePartitionSeeds<'a> {
+    row_set: Option<&'a dyn ExactRowSet>,
+    limit: usize,
+    seeds: Option<Vec<PointOffset>>,
+    _reservation: Option<SearchMemoryReservation>,
+}
+
+impl<'a> PredicatePartitionSeeds<'a> {
+    pub(crate) fn new(row_set: Option<&'a dyn ExactRowSet>, limit: usize) -> Self {
+        Self {
+            row_set,
+            limit,
+            seeds: None,
+            _reservation: None,
+        }
+    }
+
+    fn materialize(&mut self, budget: &ResourceBudget) -> Result<&[PointOffset]> {
+        if self.seeds.is_none() {
+            let capacity = usize::from(self.row_set.is_some()).saturating_mul(self.limit);
+            let reservation = budget
+                .try_reserve_memory(capacity.saturating_mul(std::mem::size_of::<PointOffset>()))?;
+            let mut seeds = Vec::new();
+            seeds.try_reserve_exact(capacity).map_err(|_| {
+                paro_error::out_of_memory(format!(
+                    "allocate {capacity} HNSW predicate partition seeds"
+                ))
+            })?;
+            if let Some(row_set) = self.row_set {
+                row_set.append_partition_seeds(self.limit, &mut seeds);
+            }
+            self._reservation = Some(reservation);
+            self.seeds = Some(seeds);
+        }
+        Ok(self.seeds.as_deref().unwrap_or_default())
+    }
+
+    #[cfg(test)]
+    fn is_materialized(&self) -> bool {
+        self.seeds.is_some()
+    }
+}
+
+fn should_refine_predicate(
+    top: usize,
+    admission_capacity: usize,
+    admission_count: usize,
+    admission_window_full: bool,
+    top_k_floor_score: Option<f32>,
+    phase_one_floor: f32,
+) -> bool {
+    if admission_count == 0 {
+        // Zero admissions are the strongest evidence that ordinary graph
+        // navigation never reached the predicate geometry. The caller may
+        // still have durable partition witnesses that can seed the predicate
+        // topology without a phase-one result. Returning false here used to
+        // bypass that topology and jump directly to an exact full-row-set
+        // fallback for precisely the anti-correlated filters it was built to
+        // serve.
+        return true;
+    }
+    let required = usize::try_from(required_filtered_admissions(top))
+        .unwrap_or(usize::MAX)
+        .min(admission_capacity);
+    let enough_admissions = admission_window_full || admission_count >= required;
+    let top_k_is_local = top_k_floor_score.is_some_and(|score| score >= phase_one_floor);
+    !enough_admissions || !top_k_is_local
+}
+
 impl GraphLayers {
-    pub fn new(
-        links: GraphLinks,
-        entry_points: EntryPoints,
-        visited_pool: VisitedPool,
-        hnsw_m: HnswM,
-    ) -> Self {
+    pub fn new(links: GraphLinks, entry_points: EntryPoints, hnsw_m: HnswM) -> Self {
+        let visited_pool = VisitedPool::new(links.num_points());
         Self {
             links,
+            predicate_links: None,
+            predicate_entry_points: Box::new([]),
             entry_points,
             visited_pool,
             hnsw_m,
         }
     }
 
-    /// Primary search entry point for a single query.
-    pub fn search_one(
+    pub fn new_with_predicate_links(
+        links: GraphLinks,
+        predicate_links: GraphLinks,
+        predicate_entry_points: Box<[PredicateEntryPoint]>,
+        entry_points: EntryPoints,
+        hnsw_m: HnswM,
+    ) -> Self {
+        assert_eq!(
+            links.num_points(),
+            predicate_links.num_points(),
+            "predicate-local graph cardinality must match the base graph"
+        );
+        let visited_pool = VisitedPool::new(links.num_points());
+        Self {
+            links,
+            predicate_links: Some(predicate_links),
+            predicate_entry_points,
+            entry_points,
+            visited_pool,
+            hnsw_m,
+        }
+    }
+
+    /// Route reusable query workspaces through the instance buffer pool. The
+    /// graph topology remains immutable; only the physical owner of scratch
+    /// visited markers is bound here.
+    pub fn bind_search_buffer_pool(
         &self,
-        top: usize,
-        ef: usize,
+        buffer_pool: std::sync::Arc<crate::buffer::BufferPool>,
+    ) -> Result<()> {
+        self.visited_pool.bind_buffer_pool(buffer_pool)
+    }
+
+    /// Primary search entry point for a single query.
+    pub(crate) fn search_one(
+        &self,
+        limits: GraphSearchLimits,
         algorithm: SearchAlgorithm,
-        scorer: &mut VectorScorer<'_>,
-        filter_bitmap: Option<&RoaringBitmap>,
+        scorer: &mut GraphVectorScorer<'_>,
+        filter: Option<&ExactRowAdmission<'_>>,
+        predicate_partition_seeds: &mut PredicatePartitionSeeds<'_>,
+        predicate_columns: &[u32],
+        predicate_topology_available: bool,
         random_entry_point: bool,
-    ) -> Vec<ScoredPoint> {
-        if top == 0 {
-            return Vec::new();
+        budget: &ResourceBudget,
+    ) -> Result<GraphSearchResult> {
+        if limits.top_k == 0 {
+            return Ok(GraphSearchResult {
+                points: Vec::new(),
+                predicate_admission: HnswPredicateAdmissionMode::NotApplicable,
+                predicate_topology_used: false,
+                predicate_refined: false,
+            });
         }
 
-        let Some(entry_point) = self.select_entry_point(filter_bitmap, random_entry_point) else {
-            return Vec::new();
+        let Some(entry_point) = self.select_entry_point(random_entry_point) else {
+            return Ok(GraphSearchResult {
+                points: Vec::new(),
+                predicate_admission: HnswPredicateAdmissionMode::NotApplicable,
+                predicate_topology_used: false,
+                predicate_refined: false,
+            });
         };
 
-        self.search_from_entry_point(entry_point, top, ef, algorithm, scorer, filter_bitmap)
+        self.search_from_entry_point(
+            entry_point,
+            limits,
+            algorithm,
+            scorer,
+            filter,
+            predicate_partition_seeds,
+            predicate_columns,
+            predicate_topology_available,
+            budget,
+        )
     }
 
     /// Batched search entry point for multiple queries sharing one filter bitmap.
-    pub fn search_many(
+    pub(crate) fn search_many(
         &self,
-        top: usize,
-        ef: usize,
+        limits: GraphSearchLimits,
         algorithm: SearchAlgorithm,
-        scorers: &mut [VectorScorer<'_>],
-        filter_bitmap: Option<&RoaringBitmap>,
+        scorers: &mut [GraphVectorScorer<'_>],
+        filter: Option<&ExactRowAdmission<'_>>,
+        predicate_partition_seeds: &mut PredicatePartitionSeeds<'_>,
+        predicate_columns: &[u32],
+        predicate_topology_available: bool,
         random_entry_point: bool,
-    ) -> Vec<Vec<ScoredPoint>> {
+        budget: &ResourceBudget,
+    ) -> Result<Vec<GraphSearchResult>> {
         if scorers.is_empty() {
-            return Vec::new();
+            return Ok(Vec::new());
         }
-        if top == 0 {
-            return vec![Vec::new(); scorers.len()];
+        if limits.top_k == 0 {
+            return Ok((0..scorers.len())
+                .map(|_| GraphSearchResult {
+                    points: Vec::new(),
+                    predicate_admission: HnswPredicateAdmissionMode::NotApplicable,
+                    predicate_topology_used: false,
+                    predicate_refined: false,
+                })
+                .collect());
         }
 
         let mut rng = thread_rng();
-        let entry_points = self.select_entry_points_for_many(
-            scorers.len(),
-            filter_bitmap,
-            random_entry_point,
-            &mut rng,
-        );
+        let entry_points =
+            self.select_entry_points_for_many(scorers.len(), random_entry_point, &mut rng);
 
         let mut results = Vec::with_capacity(scorers.len());
         for (entry_point, scorer) in entry_points.into_iter().zip(scorers.iter_mut()) {
             match entry_point {
                 Some(entry_point) => results.push(self.search_from_entry_point(
                     entry_point,
-                    top,
-                    ef,
+                    limits,
                     algorithm,
                     scorer,
-                    filter_bitmap,
-                )),
-                None => results.push(Vec::new()),
+                    filter,
+                    predicate_partition_seeds,
+                    predicate_columns,
+                    predicate_topology_available,
+                    budget,
+                )?),
+                None => results.push(GraphSearchResult {
+                    points: Vec::new(),
+                    predicate_admission: HnswPredicateAdmissionMode::NotApplicable,
+                    predicate_topology_used: false,
+                    predicate_refined: false,
+                }),
             }
         }
 
-        results
+        Ok(results)
     }
 
-    fn select_entry_point(
-        &self,
-        filter_bitmap: Option<&RoaringBitmap>,
-        random_entry_point: bool,
-    ) -> Option<EntryPoint> {
+    fn select_entry_point(&self, random_entry_point: bool) -> Option<EntryPoint> {
         if random_entry_point {
             let mut rng = thread_rng();
-            self.entry_points
-                .get_random_entry_point(&mut rng, |idx| Self::matches_filter(filter_bitmap, idx))
+            self.entry_points.get_random_entry_point(&mut rng, |_| true)
         } else {
-            self.entry_points
-                .get_entry_point(|idx| Self::matches_filter(filter_bitmap, idx))
+            self.entry_points.get_entry_point(|_| true)
         }
     }
 
     fn select_entry_points_for_many<R: Rng + ?Sized>(
         &self,
         num_queries: usize,
-        filter_bitmap: Option<&RoaringBitmap>,
         random_entry_point: bool,
         rng: &mut R,
     ) -> Vec<Option<EntryPoint>> {
         if random_entry_point {
             (0..num_queries)
-                .map(|_| {
-                    self.entry_points
-                        .get_random_entry_point(rng, |idx| Self::matches_filter(filter_bitmap, idx))
-                })
+                .map(|_| self.entry_points.get_random_entry_point(rng, |_| true))
                 .collect()
         } else {
-            let entry_point = self
-                .entry_points
-                .get_entry_point(|idx| Self::matches_filter(filter_bitmap, idx));
+            let entry_point = self.entry_points.get_entry_point(|_| true);
             vec![entry_point; num_queries]
         }
-    }
-
-    fn matches_filter(filter_bitmap: Option<&RoaringBitmap>, idx: PointOffset) -> bool {
-        filter_bitmap.is_none_or(|bm| bm.contains(idx))
     }
 
     fn search_from_entry_point(
         &self,
         entry_point: EntryPoint,
-        top: usize,
-        ef: usize,
+        limits: GraphSearchLimits,
         algorithm: SearchAlgorithm,
-        scorer: &mut VectorScorer<'_>,
-        filter_bitmap: Option<&RoaringBitmap>,
-    ) -> Vec<ScoredPoint> {
-        let zero_level_entry = self.descend_to_zero_level(entry_point, scorer, filter_bitmap);
-        let mut results = match algorithm {
-            SearchAlgorithm::Hnsw => {
-                self.search_on_level(zero_level_entry, ef, scorer, filter_bitmap)
-            }
-            SearchAlgorithm::Acorn => {
-                self.search_on_level_acorn(zero_level_entry, ef, scorer, filter_bitmap)
-            }
-        };
-        results.truncate(top);
-        results
+        scorer: &mut GraphVectorScorer<'_>,
+        filter: Option<&ExactRowAdmission<'_>>,
+        predicate_partition_seeds: &mut PredicatePartitionSeeds<'_>,
+        predicate_columns: &[u32],
+        predicate_topology_available: bool,
+        budget: &ResourceBudget,
+    ) -> Result<GraphSearchResult> {
+        let GraphSearchLimits {
+            top_k,
+            rerank_window,
+            ef,
+        } = limits;
+        // Authentication state belongs to this complete logical graph read.
+        // Snapshot it once so a fully verified sidecar never reloads integrity
+        // state for every expanded candidate.
+        let links = self.links.search_view(scorer.point_count())?;
+        let zero_level_entry =
+            self.descend_to_zero_level(links, entry_point, scorer, budget.work.as_ref())?;
+        let (mut points, predicate_admission, predicate_topology_used, predicate_refined) =
+            match algorithm {
+                SearchAlgorithm::Hnsw => (
+                    self.search_on_level(links, zero_level_entry, ef, scorer, budget)?
+                        .into_top_sorted_vec(rerank_window),
+                    HnswPredicateAdmissionMode::NotApplicable,
+                    false,
+                    false,
+                ),
+                SearchAlgorithm::MaskedTopK | SearchAlgorithm::AdaptiveFilteredTopK => {
+                    let adaptive = algorithm == SearchAlgorithm::AdaptiveFilteredTopK;
+                    match filter {
+                        None => self.search_masked_topk(
+                            links,
+                            zero_level_entry,
+                            top_k,
+                            rerank_window,
+                            ef,
+                            scorer,
+                            |_| true,
+                            adaptive,
+                            predicate_partition_seeds,
+                            predicate_columns,
+                            predicate_topology_available,
+                            budget,
+                        )?,
+                        Some(ExactRowAdmission::Roaring(bitmap)) => self.search_masked_topk(
+                            links,
+                            zero_level_entry,
+                            top_k,
+                            rerank_window,
+                            ef,
+                            scorer,
+                            |row_id| bitmap.contains(row_id),
+                            adaptive,
+                            predicate_partition_seeds,
+                            predicate_columns,
+                            predicate_topology_available,
+                            budget,
+                        )?,
+                        Some(ExactRowAdmission::Ordinal {
+                            row_ordinals,
+                            accepted_ordinals,
+                            accepts_null,
+                        }) => self.search_masked_topk(
+                            links,
+                            zero_level_entry,
+                            top_k,
+                            rerank_window,
+                            ef,
+                            scorer,
+                            |row_id| {
+                                row_ordinals.get(row_id as usize).is_some_and(|ordinal| {
+                                    if *ordinal == u16::MAX {
+                                        return *accepts_null;
+                                    }
+                                    accepted_ordinals
+                                        .get(*ordinal as usize / 64)
+                                        .is_some_and(|word| word & (1_u64 << (*ordinal % 64)) != 0)
+                                })
+                            },
+                            adaptive,
+                            predicate_partition_seeds,
+                            predicate_columns,
+                            predicate_topology_available,
+                            budget,
+                        )?,
+                        Some(ExactRowAdmission::Dense(domain_len)) => self.search_masked_topk(
+                            links,
+                            zero_level_entry,
+                            top_k,
+                            rerank_window,
+                            ef,
+                            scorer,
+                            |row_id| row_id < *domain_len,
+                            adaptive,
+                            predicate_partition_seeds,
+                            predicate_columns,
+                            predicate_topology_available,
+                            budget,
+                        )?,
+                        Some(ExactRowAdmission::Partitioned(admission)) => self
+                            .search_masked_topk(
+                                links,
+                                zero_level_entry,
+                                top_k,
+                                rerank_window,
+                                ef,
+                                scorer,
+                                |row_id| admission.contains(row_id),
+                                adaptive,
+                                predicate_partition_seeds,
+                                predicate_columns,
+                                predicate_topology_available,
+                                budget,
+                            )?,
+                    }
+                }
+            };
+        points.truncate(rerank_window);
+        Ok(GraphSearchResult {
+            points,
+            predicate_admission,
+            predicate_topology_used,
+            predicate_refined,
+        })
     }
 
     /// Greedy descent from the selected entry point to level 0 for one query.
     fn descend_to_zero_level(
         &self,
+        links_view: GraphLinksReadView<'_>,
         entry_point: EntryPoint,
-        scorer: &mut VectorScorer<'_>,
-        filter_bitmap: Option<&RoaringBitmap>,
-    ) -> ScoredPoint {
+        scorer: &mut GraphVectorScorer<'_>,
+        work: &SearchWorkBudget,
+    ) -> Result<ScoredPoint> {
         let mut current_point = entry_point.point_id;
         let mut current_score = scorer.score_point(current_point);
         let mut current_level = entry_point.level;
@@ -180,15 +505,17 @@ impl GraphLayers {
         while current_level > 0 {
             let mut changed = true;
             while changed {
+                work.check_and_consume(1)?;
                 changed = false;
                 links.clear();
-                self.links
-                    .for_each_link(current_point, current_level, |neighbor| {
-                        links.push(neighbor);
-                    });
+                links_view.for_each_link(current_point, current_level, |neighbor| {
+                    scorer.prefetch_graph_point(neighbor);
+                    links.push(neighbor.offset());
+                })?;
+                work.consume(links.len())?;
 
                 for scored in
-                    scorer.score_points(&mut links, filter_bitmap, self.hnsw_m.get_m(current_level))
+                    scorer.score_points(&mut links, None, self.hnsw_m.get_m(current_level))
                 {
                     if scored.score > current_score {
                         current_score = scored.score;
@@ -200,122 +527,526 @@ impl GraphLayers {
             current_level -= 1;
         }
 
-        ScoredPoint {
+        Ok(ScoredPoint {
             idx: current_point,
             score: current_score,
-        }
+        })
     }
 
-    /// Standard HNSW search on a level with optional filtering.
+    /// Standard connected HNSW search on one level. Admission filters are
+    /// deliberately absent from navigation.
     fn search_on_level(
         &self,
+        links_view: GraphLinksReadView<'_>,
         entry_point: ScoredPoint,
         ef: usize,
-        scorer: &mut VectorScorer,
-        filter_bitmap: Option<&RoaringBitmap>,
-    ) -> Vec<ScoredPoint> {
-        let mut visited = self.visited_pool.get(self.links.num_points());
+        scorer: &mut GraphVectorScorer,
+        budget: &ResourceBudget,
+    ) -> Result<FixedLengthPriorityQueue<ScoredPoint>> {
+        let _visited_reservation =
+            budget.try_reserve_memory(self.visited_pool.workspace_bytes())?;
+        let mut visited = self.visited_pool.get()?;
+        let work = budget.work.as_ref();
         let mut context = SearchContext::new(entry_point, ef);
-        let mut neighbors: Vec<PointOffset> = Vec::new();
+        let mut neighbors = Vec::with_capacity(self.hnsw_m.get_m(0));
 
         visited.check_and_update_visited(entry_point.idx);
 
         while let Some(candidate) = context.candidates.pop() {
+            work.check_and_consume(1)?;
             if candidate.score < context.lower_bound() && context.nearest.len() >= ef {
                 break;
             }
 
             neighbors.clear();
-            self.links.for_each_link(candidate.idx, 0, |neighbor| {
-                if !visited.check_and_update_visited(neighbor) {
-                    neighbors.push(neighbor);
+            links_view.for_each_link(candidate.idx, 0, |neighbor| {
+                if !visited.check_and_update_graph_point(neighbor) {
+                    scorer.prefetch_graph_point(neighbor);
+                    neighbors.push(neighbor.offset());
                 }
-            });
+            })?;
+            work.consume(neighbors.len())?;
 
-            for sp in scorer.score_points(&mut neighbors, filter_bitmap, 0) {
-                context.process_candidate(sp);
+            for sp in scorer.score_points_unfiltered(&neighbors) {
+                if context.process_candidate(sp) {
+                    links_view.prefetch_level0_record(sp.idx);
+                }
             }
         }
 
-        context.nearest.into_sorted_vec()
+        Ok(context.nearest)
     }
 
-    /// ACORN-1 search on level 0.
-    ///
-    /// Improved recall for filtered search by exploring through non-matching points
-    /// as "stepping stones".
-    fn search_on_level_acorn(
+    /// Navigate the ordinary graph exactly as an unfiltered query while
+    /// retaining every scored candidate admitted by the exact filter bitmap.
+    /// This avoids disconnecting the graph and avoids estimating an
+    /// inverse-selectivity oversampling factor.
+    fn search_masked_topk<F>(
         &self,
+        links_view: GraphLinksReadView<'_>,
         entry_point: ScoredPoint,
+        top_k: usize,
+        rerank_window: usize,
         ef: usize,
-        scorer: &mut VectorScorer,
-        filter_bitmap: Option<&RoaringBitmap>,
-    ) -> Vec<ScoredPoint> {
-        let num_points = self.links.num_points();
-        // Use two visited sets:
-        // 1-hop for direct neighbors,
-        // 2-hop for neighbors of neighbors (stepping stones)
-        let mut hop1_visited = self.visited_pool.get(num_points);
-        let mut hop2_visited = self.visited_pool.get(num_points);
+        scorer: &mut GraphVectorScorer,
+        admits: F,
+        adaptive_predicate_refinement: bool,
+        predicate_partition_seeds: &mut PredicatePartitionSeeds<'_>,
+        predicate_columns: &[u32],
+        predicate_topology_available: bool,
+        budget: &ResourceBudget,
+    ) -> Result<(Vec<ScoredPoint>, HnswPredicateAdmissionMode, bool, bool)>
+    where
+        F: Fn(PointOffset) -> bool,
+    {
+        // A predicate-local graph owns filtered result quality.  The base
+        // graph only needs to route into several geometrically useful scalar
+        // blocks, so spending the full predicate beam twice is pure duplicate
+        // work.  Keep a bounded routing beam when the local topology exists;
+        // providers without that topology retain the full ordinary HNSW beam.
+        let routing_ef = if predicate_topology_available {
+            ef.min(PREDICATE_ROUTING_EF.max(top_k))
+        } else {
+            ef
+        };
 
-        let mut context = SearchContext::new(entry_point, ef);
-        hop1_visited.check_and_update_visited(entry_point.idx);
+        // Broad predicates do not need membership checks and a second Top-K
+        // heap for every scored graph neighbor. First navigate a completely
+        // ordinary HNSW beam, then apply exact admission only to the retained
+        // global beam. If it contains the required local Top-K headroom, its
+        // admitted prefix is identical to the best admitted points among
+        // those scored in phase one: every discarded scored point is worse
+        // than the global beam floor. This remains approximate because
+        // unvisited graph regions are not constrained by that floor. The
+        // decision is based on observed results, not a selectivity estimate.
+        //
+        // An underfilled or non-local beam falls through to the existing eager
+        // admission traversal and predicate repair. The retry is deliberate:
+        // it preserves the complete admitted seed window for adversarially
+        // correlated predicates without allocating an ungoverned trace of all
+        // phase-one scores on the optimistic path.
+        if adaptive_predicate_refinement {
+            let beam = self.search_on_level(links_view, entry_point, ef, scorer, budget)?;
+            let phase_one_floor = beam.min_element().map_or(f32::MIN, |point| point.score);
+            let admission_capacity = beam.len();
+            let mut seeds = beam.into_unsorted_vec();
+            seeds.retain(|point| admits(point.idx));
+            let admission_window_full =
+                admission_capacity == ef && seeds.len() == admission_capacity;
+            let kth_score = if top_k != 0 && seeds.len() >= top_k {
+                let (_, kth, _) = seeds.select_nth_unstable_by(top_k - 1, |a, b| b.cmp(a));
+                Some(kth.score)
+            } else {
+                None
+            };
+            let should_retry = should_refine_predicate(
+                top_k,
+                admission_capacity,
+                seeds.len(),
+                admission_window_full,
+                kth_score,
+                phase_one_floor,
+            );
+            if seeds.len() >= top_k && !should_retry {
+                if seeds.len() > rerank_window {
+                    seeds.select_nth_unstable_by(rerank_window - 1, |a, b| b.cmp(a));
+                    seeds.truncate(rerank_window);
+                }
+                seeds.sort_unstable_by(|a, b| b.cmp(a));
+                return Ok((
+                    seeds,
+                    HnswPredicateAdmissionMode::DeferredGlobalBeam,
+                    false,
+                    false,
+                ));
+            }
+        }
 
-        let hop1_limit = self.hnsw_m.get_m(0);
-        let hop2_limit = self.hnsw_m.get_m(0);
-        let mut to_score: Vec<PointOffset> = Vec::with_capacity(hop1_limit * hop2_limit.min(16));
-        let mut to_explore: Vec<PointOffset> = Vec::with_capacity(hop1_limit * hop2_limit.min(16));
+        let _visited_reservation =
+            budget.try_reserve_memory(self.visited_pool.workspace_bytes())?;
+        let mut visited = self.visited_pool.get()?;
+        let work = budget.work.as_ref();
+        let mut context = SearchContext::new(entry_point, routing_ef);
+        // Preserve the routing beam's admitted candidates as diverse local
+        // topology seeds; only the final public result is truncated to K.
+        let admission_capacity = routing_ef.max(rerank_window);
+        let mut filtered = FixedLengthPriorityQueue::new(admission_capacity);
+        let mut neighbors = Vec::with_capacity(self.hnsw_m.get_m(0));
+        visited.check_and_update_visited(entry_point.idx);
+        if admits(entry_point.idx) {
+            filtered.push(entry_point);
+        }
 
         while let Some(candidate) = context.candidates.pop() {
-            if candidate.score < context.lower_bound() && context.nearest.len() >= ef {
+            work.check_and_consume(1)?;
+            if candidate.score < context.lower_bound() && context.nearest.len() >= routing_ef {
                 break;
             }
 
-            to_score.clear();
-            to_explore.clear();
-
-            // ===== 1-hop neighbors =====
-            self.links.for_each_link(candidate.idx, 0, |hop1| {
-                if hop1_visited.check_and_update_visited(hop1) {
-                    return;
+            neighbors.clear();
+            links_view.for_each_link(candidate.idx, 0, |neighbor| {
+                if !visited.check_and_update_graph_point(neighbor) {
+                    scorer.prefetch_graph_point(neighbor);
+                    neighbors.push(neighbor.offset());
                 }
+            })?;
+            work.consume(neighbors.len())?;
 
-                let is_match = filter_bitmap.is_none_or(|bm| bm.contains(hop1));
-                if is_match {
-                    to_score.push(hop1);
-                } else {
-                    to_explore.push(hop1);
+            for point in scorer.score_points_unfiltered(&neighbors) {
+                if admits(point.idx) {
+                    filtered.push(point);
                 }
-            });
-
-            to_score.truncate(hop1_limit);
-
-            // ===== 2-hop neighbors (stepping stones) =====
-            for &hop1 in to_explore.iter() {
-                let total_limit = to_score.len() + hop2_limit;
-                self.links.for_each_link(hop1, 0, |hop2| {
-                    if hop1_visited.check(hop2) || hop2_visited.check_and_update_visited(hop2) {
-                        return;
-                    }
-
-                    if filter_bitmap.is_none_or(|bm| bm.contains(hop2)) {
-                        hop1_visited.check_and_update_visited(hop2);
-                        to_score.push(hop2);
-                    }
-                });
-
-                if to_score.len() >= total_limit {
-                    break;
+                if context.process_candidate(point) {
+                    links_view.prefetch_level0_record(point.idx);
                 }
-            }
-
-            // ===== batch scoring =====
-            for sp in scorer.score_points_unfiltered(to_score.as_slice()) {
-                context.process_candidate(sp);
             }
         }
 
-        context.nearest.into_sorted_vec()
+        let filtered_window_full = filtered.is_full();
+        let phase_one_floor = context.lower_bound();
+        let seeds = filtered.into_sorted_vec();
+        // Quantity and locality answer different questions. A full admission
+        // window proves phase one found enough predicate rows even when K is
+        // close to ef. Requiring the Kth predicate row to be inside the final
+        // unfiltered beam catches geometry/predicate anti-correlation: one
+        // nearby match plus K-1 distant matches must not suppress refinement.
+        if !adaptive_predicate_refinement {
+            return Ok((
+                seeds,
+                HnswPredicateAdmissionMode::EagerPerCandidate,
+                false,
+                false,
+            ));
+        }
+
+        let should_refine = should_refine_predicate(
+            top_k,
+            admission_capacity,
+            seeds.len(),
+            filtered_window_full,
+            seeds
+                .get(top_k.saturating_sub(1).min(seeds.len().saturating_sub(1)))
+                .map(|point| point.score),
+            phase_one_floor,
+        );
+        if !should_refine {
+            return Ok((
+                seeds,
+                HnswPredicateAdmissionMode::EagerPerCandidate,
+                false,
+                false,
+            ));
+        }
+
+        // Availability and use are separate contracts. A persisted scalar
+        // topology is entered only after observed base-graph admissions prove
+        // that quantity or locality is insufficient. This keeps broad,
+        // independent predicates on the ordinary beam while still activating
+        // the topology for a broad but geometrically disconnected predicate—
+        // a case no selectivity threshold can identify.
+        let (seeds, predicate_topology_used, topology_window_full) = if predicate_topology_available
+        {
+            let partition_seeds = predicate_partition_seeds.materialize(budget)?;
+            let (seeds, full) = self.search_predicate_topology(
+                links_view,
+                seeds,
+                partition_seeds,
+                predicate_columns,
+                ef,
+                routing_ef,
+                scorer,
+                &admits,
+                budget,
+            )?;
+            (seeds, true, full)
+        } else {
+            (seeds, false, false)
+        };
+        if topology_window_full {
+            return Ok((
+                seeds,
+                HnswPredicateAdmissionMode::EagerPerCandidate,
+                predicate_topology_used,
+                false,
+            ));
+        }
+
+        let should_refine_after_topology = should_refine_predicate(
+            top_k,
+            admission_capacity,
+            seeds.len(),
+            filtered_window_full,
+            seeds
+                .get(top_k.saturating_sub(1).min(seeds.len().saturating_sub(1)))
+                .map(|point| point.score),
+            phase_one_floor,
+        );
+        if !should_refine_after_topology {
+            return Ok((
+                seeds,
+                HnswPredicateAdmissionMode::EagerPerCandidate,
+                predicate_topology_used,
+                false,
+            ));
+        }
+
+        let Some((&first, remaining)) = seeds.split_first() else {
+            // No refinement was executed. The caller observes underfill and
+            // performs the exact row-set fallback.
+            return Ok((
+                Vec::new(),
+                HnswPredicateAdmissionMode::EagerPerCandidate,
+                predicate_topology_used,
+                false,
+            ));
+        };
+
+        // Phase one already scored every point in `visited`. A matching point
+        // omitted from the `ef` seeds cannot improve their Top-K, so retaining
+        // those marks avoids duplicate distance work without reducing the
+        // reachable result frontier. Non-matching bridge nodes use a second
+        // pooled dense generation set: refinement happens when non-matches are
+        // common, so a fresh Roaring bitmap is both the wrong density and an
+        // ungoverned per-query allocation.
+        let mut context = SearchContext::new(first, ef);
+        for &seed in remaining {
+            context.process_candidate(seed);
+        }
+        let _bridge_reservation = budget.try_reserve_memory(self.visited_pool.workspace_bytes())?;
+        let mut bridge_visited = self.visited_pool.get()?;
+        let level0_degree = self.hnsw_m.get_m(0);
+        let mut matching_neighbors = Vec::with_capacity(level0_degree.saturating_mul(2));
+        let mut bridge_neighbors = Vec::with_capacity(level0_degree);
+
+        while let Some(candidate) = context.candidates.pop() {
+            work.check_and_consume(1)?;
+            if candidate.score < context.lower_bound() && context.nearest.len() >= ef {
+                break;
+            }
+            matching_neighbors.clear();
+            bridge_neighbors.clear();
+            let mut inspected_edges = 0usize;
+            links_view.for_each_link(candidate.idx, 0, |neighbor| {
+                inspected_edges = inspected_edges.saturating_add(1);
+                let neighbor_id = neighbor.offset();
+                if admits(neighbor_id) {
+                    if !visited.check_and_update_graph_point(neighbor) {
+                        scorer.prefetch_graph_point(neighbor);
+                        matching_neighbors.push(neighbor_id);
+                    }
+                } else if !bridge_visited.check_and_update_graph_point(neighbor) {
+                    bridge_neighbors.push(neighbor_id);
+                }
+            })?;
+            work.consume(inspected_edges)?;
+
+            // ACORN-1-style bridge expansion: non-matching direct neighbors
+            // are never scored or admitted, but their matching neighbors can
+            // reconnect a predicate-induced graph whose expected direct degree
+            // is below one. Each bridge contributes at most M0 new candidates.
+            let hop_limit = self.hnsw_m.get_m(0);
+            for bridge in bridge_neighbors.iter().copied() {
+                work.check_and_consume(1)?;
+                let limit = matching_neighbors.len().saturating_add(hop_limit);
+                let mut bridge_edges = 0usize;
+                links_view.for_each_link(bridge, 0, |neighbor| {
+                    bridge_edges = bridge_edges.saturating_add(1);
+                    let neighbor_id = neighbor.offset();
+                    if matching_neighbors.len() < limit
+                        && admits(neighbor_id)
+                        && !visited.check_and_update_graph_point(neighbor)
+                    {
+                        scorer.prefetch_graph_point(neighbor);
+                        matching_neighbors.push(neighbor_id);
+                    }
+                })?;
+                work.consume(bridge_edges)?;
+            }
+
+            work.consume(matching_neighbors.len())?;
+            for point in scorer.score_points_unfiltered(&matching_neighbors) {
+                if context.process_candidate(point) {
+                    links_view.prefetch_level0_record(point.idx);
+                }
+            }
+        }
+
+        Ok((
+            context.nearest.into_sorted_vec(),
+            HnswPredicateAdmissionMode::EagerPerCandidate,
+            predicate_topology_used,
+            true,
+        ))
+    }
+
+    /// Continue from base-graph predicate seeds over a logical union of the
+    /// predicate-local and ordinary level-0 links. The predicate artifact only
+    /// persists links it adds; reusing the base adjacency records at query time gives the
+    /// same merged-topology semantics without duplicating durable edges.
+    /// This beam has its own lower bound and only exact-admitted points are
+    /// scored or expanded.
+    fn search_predicate_topology<F>(
+        &self,
+        links_view: GraphLinksReadView<'_>,
+        seeds: Vec<ScoredPoint>,
+        partition_seeds: &[PointOffset],
+        predicate_columns: &[u32],
+        ef: usize,
+        entry_descent_width: usize,
+        scorer: &mut GraphVectorScorer<'_>,
+        admits: &F,
+        budget: &ResourceBudget,
+    ) -> Result<(Vec<ScoredPoint>, bool)>
+    where
+        F: Fn(PointOffset) -> bool,
+    {
+        let Some(predicate_links) = &self.predicate_links else {
+            return Err(paro_error::data_corrupted(
+                "HNSW filter contract selected missing predicate topology",
+            ));
+        };
+        let predicate_links_view = predicate_links.search_view(scorer.point_count())?;
+        let _visited_reservation =
+            budget.try_reserve_memory(self.visited_pool.workspace_bytes())?;
+        let mut visited = self.visited_pool.get()?;
+        let work = budget.work.as_ref();
+        let mut initial = FixedLengthPriorityQueue::new(ef.max(1));
+        for seed in seeds {
+            if !visited.check_and_update_visited(seed.idx) {
+                initial.push(seed);
+            }
+        }
+        let mut direct_seed_count = 0usize;
+        for &point_id in partition_seeds {
+            if admits(point_id) && !visited.check_and_update_visited(point_id) {
+                initial.push(ScoredPoint {
+                    idx: point_id,
+                    score: scorer.score_point(point_id),
+                });
+                direct_seed_count = direct_seed_count.saturating_add(1);
+            }
+        }
+        // Score every admitted scalar-block entry so every block can compete
+        // directly for the level-0 seed beam. Only the bounded predicate
+        // routing frontier performs hierarchical descent: direct reachability
+        // remains complete while broad-filter work no longer grows as
+        // `block_count * hierarchy_depth`.
+        let mut entry_frontier = FixedLengthPriorityQueue::new(entry_descent_width);
+        for entry in &self.predicate_entry_points {
+            if !predicate_columns.contains(&entry.column_id) || !admits(entry.point_id) {
+                continue;
+            }
+            if visited.check_and_update_visited(entry.point_id) {
+                continue;
+            }
+            let point = ScoredPoint {
+                idx: entry.point_id,
+                score: scorer.score_point(entry.point_id),
+            };
+            initial.push(point);
+            entry_frontier.push(PredicateRoutingCandidate {
+                entry: *entry,
+                point,
+            });
+            direct_seed_count = direct_seed_count.saturating_add(1);
+        }
+        for candidate in entry_frontier.into_unsorted_vec() {
+            let seed = self.descend_predicate_entry(
+                candidate.entry,
+                candidate.point,
+                predicate_links_view,
+                scorer,
+                admits,
+                work,
+            )?;
+            if !visited.check_and_update_visited(seed.idx) {
+                initial.push(seed);
+            }
+        }
+        work.consume(direct_seed_count)?;
+        let initial = initial.into_sorted_vec();
+        let Some((&first, remaining)) = initial.split_first() else {
+            return Ok((Vec::new(), false));
+        };
+        let mut context = SearchContext::new(first, ef);
+        for &seed in remaining {
+            context.process_candidate(seed);
+        }
+        let mut neighbors = Vec::with_capacity(self.hnsw_m.get_m(0).saturating_mul(2));
+        while let Some(candidate) = context.candidates.pop() {
+            work.check_and_consume(1)?;
+            if candidate.score < context.lower_bound() && context.nearest.len() >= ef {
+                break;
+            }
+            neighbors.clear();
+            let mut inspected_edges = 0usize;
+            predicate_links_view.for_each_link(candidate.idx, 0, |neighbor| {
+                inspected_edges = inspected_edges.saturating_add(1);
+                let neighbor_id = neighbor.offset();
+                if admits(neighbor_id) && !visited.check_and_update_graph_point(neighbor) {
+                    scorer.prefetch_graph_point(neighbor);
+                    neighbors.push(neighbor_id);
+                }
+            })?;
+            links_view.for_each_link(candidate.idx, 0, |neighbor| {
+                inspected_edges = inspected_edges.saturating_add(1);
+                let neighbor_id = neighbor.offset();
+                if admits(neighbor_id) && !visited.check_and_update_graph_point(neighbor) {
+                    scorer.prefetch_graph_point(neighbor);
+                    neighbors.push(neighbor_id);
+                }
+            })?;
+            work.consume(inspected_edges)?;
+            for point in scorer.score_points_unfiltered(&neighbors) {
+                if context.process_candidate(point) {
+                    links_view.prefetch_level0_record(point.idx);
+                }
+            }
+        }
+        let full = context.nearest.is_full();
+        Ok((context.nearest.into_sorted_vec(), full))
+    }
+
+    fn descend_predicate_entry<F>(
+        &self,
+        entry: PredicateEntryPoint,
+        mut current: ScoredPoint,
+        predicate_links_view: GraphLinksReadView<'_>,
+        scorer: &mut GraphVectorScorer<'_>,
+        admits: &F,
+        work: &SearchWorkBudget,
+    ) -> Result<ScoredPoint>
+    where
+        F: Fn(PointOffset) -> bool,
+    {
+        debug_assert_eq!(entry.point_id, current.idx);
+        debug_assert!(admits(entry.point_id));
+        let mut neighbors = Vec::with_capacity(self.hnsw_m.get_m(0));
+        for level in (1..=entry.level).rev() {
+            let mut changed = true;
+            while changed {
+                work.check_and_consume(1)?;
+                changed = false;
+                neighbors.clear();
+                let mut inspected_edges = 0usize;
+                predicate_links_view.for_each_link(current.idx, level, |neighbor| {
+                    inspected_edges = inspected_edges.saturating_add(1);
+                    let neighbor_id = neighbor.offset();
+                    if admits(neighbor_id) {
+                        scorer.prefetch_graph_point(neighbor);
+                        neighbors.push(neighbor_id);
+                    }
+                })?;
+                work.consume(inspected_edges)?;
+                for candidate in scorer.score_points_unfiltered(&neighbors) {
+                    if candidate.score > current.score {
+                        current = candidate;
+                        changed = true;
+                    }
+                }
+            }
+        }
+        Ok(current)
     }
 
     pub fn num_points(&self) -> usize {
@@ -326,6 +1057,8 @@ impl GraphLayers {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::index::hnsw::{DistanceMetric, InMemoryVectorStorage};
+    use crate::index::DenseRowSet;
     use rand::{rngs::StdRng, SeedableRng};
 
     fn make_graph(entry_points: EntryPoints) -> GraphLayers {
@@ -337,7 +1070,6 @@ mod tests {
                 vec![vec![]],
             ]),
             entry_points,
-            VisitedPool::new(),
             HnswM::new(8),
         )
     }
@@ -362,7 +1094,7 @@ mod tests {
         });
 
         let mut rng = StdRng::seed_from_u64(7);
-        let selections = graph.select_entry_points_for_many(5, None, false, &mut rng);
+        let selections = graph.select_entry_points_for_many(5, false, &mut rng);
         assert_eq!(
             selections,
             vec![
@@ -410,9 +1142,160 @@ mod tests {
             .collect::<Vec<_>>();
 
         let mut actual_rng = StdRng::seed_from_u64(11);
-        let actual = graph.select_entry_points_for_many(8, None, true, &mut actual_rng);
+        let actual = graph.select_entry_points_for_many(8, true, &mut actual_rng);
 
         assert_eq!(actual, expected);
         assert!(actual.windows(2).any(|pair| pair[0] != pair[1]));
+    }
+
+    #[test]
+    fn adaptive_refinement_respects_a_full_admission_window_when_k_reaches_ef() {
+        assert!(!should_refine_predicate(67, 100, 100, true, Some(1.0), 0.5,));
+        assert!(!should_refine_predicate(
+            100,
+            100,
+            100,
+            true,
+            Some(1.0),
+            0.5,
+        ));
+    }
+
+    #[test]
+    fn rerank_window_does_not_replace_user_top_k() {
+        let limits = GraphSearchLimits::try_new(10, 160, 160).unwrap();
+        assert_eq!(limits.top_k(), 10);
+        assert!(!should_refine_predicate(
+            limits.top_k(),
+            160,
+            15,
+            false,
+            Some(1.0),
+            0.5,
+        ));
+    }
+
+    #[test]
+    fn adaptive_refinement_uses_locality_as_well_as_admission_count() {
+        assert!(should_refine_predicate(10, 160, 20, false, Some(0.4), 0.5,));
+        assert!(should_refine_predicate(10, 160, 0, false, None, 0.5));
+    }
+
+    #[test]
+    fn predicate_partition_seeds_materialize_only_on_demand() {
+        let row_set = DenseRowSet::new(100);
+        let mut seeds = PredicatePartitionSeeds::new(Some(&row_set), 4);
+        assert!(!seeds.is_materialized());
+
+        let budget = ResourceBudget::default();
+        assert_eq!(seeds.materialize(&budget).unwrap().len(), 4);
+        assert!(seeds.is_materialized());
+    }
+
+    #[test]
+    fn predicate_topology_logically_merges_base_level0_links() {
+        let base = GraphLinks::new_from_edges(vec![
+            vec![vec![1]],
+            vec![vec![2]],
+            vec![vec![]],
+            vec![vec![]],
+        ]);
+        let predicate = GraphLinks::new_from_edges(vec![
+            vec![vec![1]],
+            vec![vec![]],
+            vec![vec![]],
+            vec![vec![]],
+        ]);
+        let graph = GraphLayers::new_with_predicate_links(
+            base,
+            predicate,
+            Box::new([]),
+            EntryPoints::default(),
+            HnswM::new(8),
+        );
+        let storage = InMemoryVectorStorage::new(vec![10.0, 5.0, 0.0, 100.0], 1);
+        let query = DistanceMetric::Euclidean.prepare(&[0.0]);
+        let mut scorer = GraphVectorScorer::new(&query, &storage).unwrap();
+        let seed = ScoredPoint {
+            idx: 0,
+            score: scorer.score_point(0),
+        };
+        let budget = crate::search::ResourceBudget::default();
+        let links_view = graph.links.search_view(scorer.point_count()).unwrap();
+
+        let (points, full) = graph
+            .search_predicate_topology(
+                links_view,
+                vec![seed],
+                &[],
+                &[],
+                3,
+                PREDICATE_ROUTING_EF,
+                &mut scorer,
+                &|point| point <= 2,
+                &budget,
+            )
+            .unwrap();
+
+        assert!(full);
+        assert_eq!(points[0].idx, 2);
+    }
+
+    #[test]
+    fn predicate_topology_bounds_hierarchical_entry_descents() {
+        let point_count = 16usize;
+        let base =
+            GraphLinks::new_from_edges((0..point_count).map(|_| vec![vec![]]).collect::<Vec<_>>());
+        let predicate = GraphLinks::new_from_edges(
+            (0..point_count)
+                .map(|point| {
+                    if point < 8 {
+                        vec![vec![], vec![(point + 8) as PointOffset]]
+                    } else {
+                        vec![vec![], vec![]]
+                    }
+                })
+                .collect::<Vec<_>>(),
+        );
+        let entries = (0..8)
+            .map(|point_id| PredicateEntryPoint {
+                column_id: 7,
+                point_id,
+                level: 1,
+            })
+            .collect::<Vec<_>>()
+            .into_boxed_slice();
+        let graph = GraphLayers::new_with_predicate_links(
+            base,
+            predicate,
+            entries,
+            EntryPoints::default(),
+            HnswM::new(8),
+        );
+        let storage =
+            InMemoryVectorStorage::new((0..point_count).map(|point| point as f32).collect(), 1);
+        let query = DistanceMetric::Euclidean.prepare(&[15.0]);
+        let mut scorer = GraphVectorScorer::new(&query, &storage).unwrap();
+        let budget = crate::search::ResourceBudget::default();
+        let links_view = graph.links.search_view(scorer.point_count()).unwrap();
+
+        let (points, _) = graph
+            .search_predicate_topology(
+                links_view,
+                Vec::new(),
+                &[],
+                &[7],
+                4,
+                2,
+                &mut scorer,
+                &|_| true,
+                &budget,
+            )
+            .unwrap();
+
+        assert_eq!(points[0].idx, 15);
+        // Eight entries are scored once to preserve direct reachability; only
+        // the two best entries pay one upper-level neighbor score each.
+        assert_eq!(scorer.scored_point_count(), 10);
     }
 }

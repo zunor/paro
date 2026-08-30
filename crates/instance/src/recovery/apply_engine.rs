@@ -100,6 +100,7 @@ impl<'handler, 'catalog> ApplyEngine<'handler, 'catalog> {
                     version_span.end,
                     &rowset_ref
                         .resolve_for_tablet(route.storage.tablet().data_dir())
+                        ?
                         .to_string_lossy(),
                 )?;
                 self.handler
@@ -179,6 +180,8 @@ impl<'handler, 'catalog> ApplyEngine<'handler, 'catalog> {
                 ..
             } => {
                 route.storage.apply_compaction_publish(mutation)?;
+                let output_path =
+                    output_ref.resolve_for_tablet(route.storage.tablet().data_dir())?;
                 self.handler
                     .registry
                     .note_rowset_owner(*output_rowset_id, route.storage.tablet_id());
@@ -199,10 +202,44 @@ impl<'handler, 'catalog> ApplyEngine<'handler, 'catalog> {
                     commit_id = commit_visibility.unwrap_or_default(),
                     tablet_id,
                     output_rowset_id = *output_rowset_id,
-                    output_path = %output_ref
-                        .resolve_for_tablet(route.storage.tablet().data_dir())
-                        .display(),
+                    output_path = %output_path.display(),
                     "Applied PublishCompaction"
+                );
+            }
+            TabletMutation::PublishSearchGeneration {
+                head,
+                generation_ref,
+                ..
+            } => {
+                route.storage.replay_search_generation_publish(mutation)?;
+                let generation_path =
+                    generation_ref.resolve_for_tablet(route.storage.tablet().data_dir())?;
+                tracing::info!(
+                    target: targets::INSTANCE,
+                    schema = %route.schema_name,
+                    table = %route.table_name,
+                    lsn,
+                    commit_id = commit_visibility.unwrap_or_default(),
+                    tablet_id,
+                    definition_id = head.definition_id,
+                    generation_id = head.generation_id,
+                    generation_path = %generation_path.display(),
+                    "Applied PublishSearchGeneration"
+                );
+            }
+            TabletMutation::RetireSearchGeneration { definition_id } => {
+                route
+                    .storage
+                    .apply_search_generation_retirement(mutation)?;
+                tracing::info!(
+                    target: targets::INSTANCE,
+                    schema = %route.schema_name,
+                    table = %route.table_name,
+                    lsn,
+                    commit_id = commit_visibility.unwrap_or_default(),
+                    tablet_id,
+                    definition_id,
+                    "Applied RetireSearchGeneration"
                 );
             }
         }

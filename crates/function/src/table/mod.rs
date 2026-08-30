@@ -30,6 +30,7 @@
 //!
 
 pub mod range;
+pub mod read_binary;
 pub mod read_csv;
 pub mod read_ndjson;
 pub mod repeat;
@@ -38,10 +39,13 @@ pub mod unnest;
 
 use std::any::Any;
 use std::fmt;
+use std::io::Read;
 use std::sync::Arc;
 
+use paro_common::allocator::MemoryTag;
 use paro_common::chunk::Chunk;
 use paro_common::error::{self as paro_error, Result};
+use paro_common::memory::{MemoryAccountingClass, MemoryAccountingContext};
 use paro_common::runtime_value::Value;
 use paro_common::types::LogicalType;
 use paro_storage::buffer::BufferManager;
@@ -123,16 +127,41 @@ pub trait TableFunctionRuntimeContext: Send + Sync {
     fn copy_stdin_source(&self) -> Option<Arc<dyn CopyStdinSource>> {
         None
     }
+
+    /// Statement memory ceiling used to size table-function-local buffers.
+    fn memory_limit_bytes(&self) -> Option<usize> {
+        None
+    }
+
+    /// Return an accounting target for table-function-owned native buffers.
+    /// The detached default keeps isolated embeddings functional; the query
+    /// executor overrides it with the active `QueryMemoryPool` owner.
+    fn memory_accounting_context(
+        &self,
+        tag: MemoryTag,
+        class: MemoryAccountingClass,
+    ) -> MemoryAccountingContext {
+        MemoryAccountingContext::detached(tag, class)
+    }
 }
 
 /// Query-owned byte source for COPY FROM STDIN table functions.
 ///
 /// The protocol layer implements this trait so it can retain accounting and
 /// cancellation-related ownership for exactly as long as the query needs the
-/// payload. Table functions only see immutable bytes and never consult a
-/// process-wide registry.
+/// payload. The source hands execution an owned reader, allowing its backing
+/// to be protocol chunks, an mmap, or a bounded stream without requiring one
+/// contiguous allocation.
 pub trait CopyStdinSource: Send + Sync {
-    fn as_bytes(&self) -> &[u8];
+    /// Transfers the non-replayable protocol stream to its single consumer.
+    fn take_reader(self: Arc<Self>) -> Result<Box<dyn Read + Send>>;
+
+    /// Whether the consumer must execute off the async protocol worker.
+    /// Streaming protocol sources block while waiting for the next bounded
+    /// chunk; file and fully materialized test sources do not.
+    fn requires_background_execution(&self) -> bool {
+        false
+    }
 }
 
 #[cfg(test)]
@@ -166,6 +195,10 @@ impl TableFunctionRuntimeContext for TestTableFunctionRuntimeContext {
 
     fn copy_stdin_source(&self) -> Option<Arc<dyn CopyStdinSource>> {
         self.copy_stdin_source.clone()
+    }
+
+    fn memory_limit_bytes(&self) -> Option<usize> {
+        Some(64 * 1024 * 1024)
     }
 }
 

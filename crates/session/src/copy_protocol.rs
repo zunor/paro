@@ -30,6 +30,14 @@ pub struct CopyInSpec {
 pub trait CopyProtocolSource: Send {
     async fn begin_copy_in(&mut self, spec: &CopyInSpec) -> Result<()>;
     async fn next_chunk(&mut self) -> Result<Option<Bytes>>;
+    /// Aborts an in-progress COPY exchange and consumes frontend messages
+    /// through its protocol terminator.
+    ///
+    /// The caller must invoke this before leaving COPY data mode whenever
+    /// execution stops before [`Self::next_chunk`] returns `None`. Otherwise
+    /// buffered `CopyData` frames would be decoded as ordinary frontend
+    /// messages and desynchronize the connection.
+    async fn abort(&mut self) -> Result<()>;
 }
 
 /// Result sink extension that optionally exposes COPY protocol adapters.

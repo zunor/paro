@@ -17,7 +17,7 @@ WHERE to_tsvector('simple', content) @@ plainto_tsquery('simple', 'vector')
 ORDER BY id;
 QUERY PLAN
 ORDER_BY  (rows=1)
-  Sort Key: #0 ASC NULLS LAST
+  Sort Key: id ASC NULLS LAST
   ->  PROJECTION  (rows=1)
     Output: id
     ->  FULLTEXT_SCAN on public.ft_coverage_guard  (rows=1)
@@ -25,7 +25,8 @@ ORDER_BY  (rows=1)
       Search Generation: <search-generation-id>
       Search Root: <search-root-id>
       Search Capability: Queryable
-      Column: 1
+      Search Candidate: full text
+      Column: content
       Mode: Filter
 
 -- @normalize explain_search_ids
@@ -42,16 +43,17 @@ QUERY PLAN
 PROJECTION  (rows=1)
   Output: id
   ->  TOP_N  (rows=1)
-    Sort Key: #1 DESC NULLS FIRST
+    Sort Key: ts_rank(to_tsvector('simple', public.ft_coverage_guard.content), 'vector') DESC NULLS FIRST
     Limit: 5
     ->  PROJECTION  (rows=1)
-      Output: id, __paro_hidden_1
+      Output: id, ts_rank(to_tsvector('simple', public.ft_coverage_guard.content), 'vector')
       ->  FULLTEXT_SCAN on public.ft_coverage_guard  (rows=1)
         Search Definition: <search-definition-id>
         Search Generation: <search-generation-id>
         Search Root: <search-root-id>
         Search Capability: Queryable
-        Column: 1
+        Search Candidate: full text
+        Column: content
         Mode: Filter
 
 SELECT id

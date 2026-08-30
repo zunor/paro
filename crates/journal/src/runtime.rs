@@ -2,13 +2,13 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use crate::appender::{AppendResult, JournalAppender};
-use crate::apply::JournalApplyRuntime;
+use crate::apply::{JournalApplyRuntime, JournalPublicationObserver};
 use paro_common::durability::PreparedMaintenancePlan;
 use paro_common::error as paro_error;
 use paro_common::error::Result;
 use paro_common::journal::{JournalRecord, MaintenanceRecord};
 use paro_common::logging::targets;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, RwLock};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MaintenanceAppendContext {
@@ -44,6 +44,7 @@ struct JournalCoordinatorInner {
     appender: Option<Arc<JournalAppender>>,
     apply_runtime: Mutex<Option<Arc<JournalApplyRuntime>>>,
     next_maintenance_id: Mutex<u64>,
+    publication_observer: RwLock<Option<Arc<dyn JournalPublicationObserver>>>,
     state: Mutex<CoordinatorState>,
 }
 
@@ -60,6 +61,7 @@ impl JournalCoordinator {
                 appender,
                 apply_runtime: Mutex::new(None),
                 next_maintenance_id: Mutex::new(1),
+                publication_observer: RwLock::new(None),
                 state: Mutex::new(CoordinatorState::default()),
             }),
         }
@@ -67,6 +69,10 @@ impl JournalCoordinator {
 
     pub fn bind_apply_runtime(&self, runtime: Arc<JournalApplyRuntime>) {
         *self.inner.apply_runtime.lock().unwrap() = Some(runtime);
+    }
+
+    pub fn bind_publication_observer(&self, observer: Arc<dyn JournalPublicationObserver>) {
+        *self.inner.publication_observer.write().unwrap() = Some(observer);
     }
 
     pub fn frontiers(&self) -> JournalFrontierSnapshot {
@@ -108,6 +114,11 @@ impl JournalCoordinator {
 
         if let Some(last) = results.last().copied() {
             update_durable_frontier(&self.inner, last.durable_batch_lsn);
+            if last.durable_batch_lsn != 0 {
+                if let Some(observer) = self.inner.publication_observer.read().unwrap().as_ref() {
+                    observer.record_durable(last.durable_batch_lsn);
+                }
+            }
             tracing::info!(
                 target: targets::WAL,
                 first_lsn = results.first().map(|result| result.lsn).unwrap_or(0),
@@ -339,6 +350,8 @@ mod tests {
                     lsn: first_append.lsn,
                     durable_batch_lsn: first_append.durable_batch_lsn,
                     commit_id: Some(1),
+                    publication_watermarks:
+                        paro_common::journal::JournalPublicationWatermarks::default(),
                     wait_mode: WaitMode::Published,
                     catalog_serial: false,
                     catalog_pre: Box::new(|| Ok(())),
@@ -386,6 +399,8 @@ mod tests {
                 lsn: second_append.lsn,
                 durable_batch_lsn: second_append.durable_batch_lsn,
                 commit_id: Some(2),
+                publication_watermarks: paro_common::journal::JournalPublicationWatermarks::default(
+                ),
                 wait_mode: WaitMode::Published,
                 catalog_serial: false,
                 catalog_pre: Box::new(|| Ok(())),

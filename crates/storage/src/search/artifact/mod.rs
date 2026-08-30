@@ -18,6 +18,20 @@ pub enum GcDecision {
     Rebuild,
 }
 
+/// Immutable physical layout facts used by provider GC policy.
+///
+/// Keeping provider-specific policy in a typed variant prevents the shared
+/// scheduler contract from accumulating unrelated optional fields as new
+/// providers add compaction strategies.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ArtifactCompactionLayout {
+    HnswLevelled {
+        artifact_row_counts: Vec<u64>,
+        target_rows: u64,
+        fanout: u32,
+    },
+}
+
 /// Generic provider GC input carried by the Phase 0 contract.
 ///
 /// Concrete providers can stash richer summaries in `provider_stats` without
@@ -25,6 +39,13 @@ pub enum GcDecision {
 #[derive(Debug, Clone, PartialEq, Default)]
 pub struct ArtifactGcContext {
     pub bytes_on_disk: u64,
+    /// Number of independently searched immutable artifacts in the active
+    /// generation. For graph providers this is query fan-out, not merely a
+    /// storage accounting detail.
+    pub artifact_count: usize,
+    pub indexed_rows: u64,
+    pub largest_artifact_rows: u64,
+    pub compaction_layout: Option<ArtifactCompactionLayout>,
     pub tombstone_ratio: Option<f32>,
     pub query_pressure: Option<f32>,
     pub provider_stats: Option<SearchProviderStats>,

@@ -9,26 +9,7 @@ const PG_EPOCH_UNIX_DAYS: i32 = 10_957;
 const PG_EPOCH_UNIX_MICROS: i64 = 946_684_800_000_000;
 
 pub fn is_binary_recv_supported(ty: &LogicalType) -> bool {
-    matches!(
-        ty,
-        LogicalType::Boolean
-            | LogicalType::TinyInt
-            | LogicalType::UTinyInt
-            | LogicalType::SmallInt
-            | LogicalType::Integer
-            | LogicalType::USmallInt
-            | LogicalType::BigInt
-            | LogicalType::UInteger
-            | LogicalType::Float
-            | LogicalType::Double
-            | LogicalType::Varchar
-            | LogicalType::Json
-            | LogicalType::Blob
-            | LogicalType::Uuid
-            | LogicalType::Date
-            | LogicalType::Timestamp
-            | LogicalType::TimestampTz
-    )
+    paro_common::pg_binary::is_binary_recv_supported(ty)
 }
 
 pub fn is_binary_send_supported(ty: &LogicalType) -> bool {
@@ -56,103 +37,7 @@ pub fn is_binary_send_supported(ty: &LogicalType) -> bool {
 }
 
 pub fn decode_binary_param(bytes: &[u8], ty: &LogicalType) -> Result<Value> {
-    match ty {
-        LogicalType::Boolean => {
-            require_len(bytes, 1, ty)?;
-            Ok(Value::Boolean(bytes[0] != 0))
-        }
-        LogicalType::TinyInt => {
-            require_len(bytes, 2, ty)?;
-            let value = i16::from_be_bytes(bytes.try_into().expect("checked length"));
-            i8::try_from(value)
-                .map(Value::TinyInt)
-                .map_err(|_| paro_error::invalid_value("tinyint", value.to_string()))
-        }
-        LogicalType::UTinyInt => {
-            require_len(bytes, 2, ty)?;
-            let value = i16::from_be_bytes(bytes.try_into().expect("checked length"));
-            u8::try_from(value)
-                .map(Value::UTinyInt)
-                .map_err(|_| paro_error::invalid_value("utinyint", value.to_string()))
-        }
-        LogicalType::SmallInt => {
-            require_len(bytes, 2, ty)?;
-            Ok(Value::SmallInt(i16::from_be_bytes(
-                bytes.try_into().expect("checked length"),
-            )))
-        }
-        LogicalType::Integer => {
-            require_len(bytes, 4, ty)?;
-            Ok(Value::Integer(i32::from_be_bytes(
-                bytes.try_into().expect("checked length"),
-            )))
-        }
-        LogicalType::USmallInt => {
-            require_len(bytes, 4, ty)?;
-            let value = i32::from_be_bytes(bytes.try_into().expect("checked length"));
-            u16::try_from(value)
-                .map(Value::USmallInt)
-                .map_err(|_| paro_error::invalid_value("usmallint", value.to_string()))
-        }
-        LogicalType::BigInt => {
-            require_len(bytes, 8, ty)?;
-            Ok(Value::BigInt(i64::from_be_bytes(
-                bytes.try_into().expect("checked length"),
-            )))
-        }
-        LogicalType::UInteger => {
-            require_len(bytes, 8, ty)?;
-            let value = i64::from_be_bytes(bytes.try_into().expect("checked length"));
-            u32::try_from(value)
-                .map(Value::UInteger)
-                .map_err(|_| paro_error::invalid_value("uinteger", value.to_string()))
-        }
-        LogicalType::Float => {
-            require_len(bytes, 4, ty)?;
-            Ok(Value::Float(f32::from_be_bytes(
-                bytes.try_into().expect("checked length"),
-            )))
-        }
-        LogicalType::Double => {
-            require_len(bytes, 8, ty)?;
-            Ok(Value::Double(f64::from_be_bytes(
-                bytes.try_into().expect("checked length"),
-            )))
-        }
-        LogicalType::Varchar | LogicalType::VarcharCollation(_) | LogicalType::Json => {
-            Ok(Value::Varchar(String::from_utf8(bytes.to_vec()).map_err(
-                |_| paro_error::invalid_value(ty.to_string(), "<binary utf8>"),
-            )?))
-        }
-        LogicalType::Blob => Ok(Value::Blob(bytes.to_vec())),
-        LogicalType::Uuid => {
-            require_len(bytes, 16, ty)?;
-            Ok(Value::Uuid(u128::from_be_bytes(
-                bytes.try_into().expect("checked length"),
-            )))
-        }
-        LogicalType::Date => {
-            require_len(bytes, 4, ty)?;
-            let pg_days = i32::from_be_bytes(bytes.try_into().expect("checked length"));
-            let days = pg_days
-                .checked_add(PG_EPOCH_UNIX_DAYS)
-                .ok_or_else(|| paro_error::invalid_value("date", pg_days.to_string()))?;
-            Ok(Value::Date(days))
-        }
-        LogicalType::Timestamp => {
-            require_len(bytes, 8, ty)?;
-            let pg_micros = i64::from_be_bytes(bytes.try_into().expect("checked length"));
-            Ok(Value::Timestamp(decode_pg_timestamp(pg_micros)?))
-        }
-        LogicalType::TimestampTz => {
-            require_len(bytes, 8, ty)?;
-            let pg_micros = i64::from_be_bytes(bytes.try_into().expect("checked length"));
-            Ok(Value::TimestampTz(decode_pg_timestamp(pg_micros)?))
-        }
-        _ => Err(paro_error::not_implemented(format!(
-            "binary parameter format not supported for type {ty}",
-        ))),
-    }
+    paro_common::pg_binary::decode_binary_value(bytes, ty)
 }
 
 pub fn encode_binary_value(value: &Value, ty: &LogicalType) -> Result<Vec<u8>> {
@@ -234,25 +119,6 @@ pub fn encode_binary_value(value: &Value, ty: &LogicalType) -> Result<Vec<u8>> {
     }
 }
 
-fn require_len(bytes: &[u8], expected: usize, ty: &LogicalType) -> Result<()> {
-    if bytes.len() != expected {
-        return Err(paro_error::protocol_violation(format!(
-            "binary value for type {ty} expected {expected} bytes, got {}",
-            bytes.len(),
-        )));
-    }
-    Ok(())
-}
-
-fn decode_pg_timestamp(pg_micros: i64) -> Result<i64> {
-    if matches!(pg_micros, i64::MAX | i64::MIN) {
-        return Ok(pg_micros);
-    }
-    pg_micros
-        .checked_add(PG_EPOCH_UNIX_MICROS)
-        .ok_or_else(|| paro_error::invalid_value("timestamp", pg_micros.to_string()))
-}
-
 fn encode_pg_timestamp(micros: i64) -> Result<i64> {
     if matches!(micros, i64::MAX | i64::MIN) {
         return Ok(micros);
@@ -268,8 +134,14 @@ mod tests {
 
     #[test]
     fn binary_timestamp_roundtrip_preserves_infinity() {
-        assert_eq!(decode_pg_timestamp(i64::MAX).unwrap(), i64::MAX);
-        assert_eq!(decode_pg_timestamp(i64::MIN).unwrap(), i64::MIN);
+        assert_eq!(
+            decode_binary_param(&i64::MAX.to_be_bytes(), &LogicalType::Timestamp).unwrap(),
+            Value::Timestamp(i64::MAX)
+        );
+        assert_eq!(
+            decode_binary_param(&i64::MIN.to_be_bytes(), &LogicalType::Timestamp).unwrap(),
+            Value::Timestamp(i64::MIN)
+        );
         assert_eq!(encode_pg_timestamp(i64::MAX).unwrap(), i64::MAX);
         assert_eq!(encode_pg_timestamp(i64::MIN).unwrap(), i64::MIN);
     }
@@ -289,6 +161,47 @@ mod tests {
         assert_eq!(
             encode_binary_value(&Value::UInteger(9), &LogicalType::UInteger).unwrap(),
             i64::from(9_u32).to_be_bytes().to_vec()
+        );
+    }
+
+    #[test]
+    fn binary_float_array_decodes_postgres_wire_format() {
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(&1_i32.to_be_bytes());
+        bytes.extend_from_slice(&0_i32.to_be_bytes());
+        bytes.extend_from_slice(&LogicalType::Float.pg_descriptor().oid.to_be_bytes());
+        bytes.extend_from_slice(&3_i32.to_be_bytes());
+        bytes.extend_from_slice(&1_i32.to_be_bytes());
+        for value in [1.25_f32, -2.5, 3.75] {
+            bytes.extend_from_slice(&4_i32.to_be_bytes());
+            bytes.extend_from_slice(&value.to_be_bytes());
+        }
+
+        assert_eq!(
+            decode_binary_param(&bytes, &LogicalType::List(Box::new(LogicalType::Float))).unwrap(),
+            Value::List(
+                vec![Value::Float(1.25), Value::Float(-2.5), Value::Float(3.75)],
+                LogicalType::Float,
+            )
+        );
+    }
+
+    #[test]
+    fn binary_fixed_array_rejects_dimension_mismatch() {
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(&1_i32.to_be_bytes());
+        bytes.extend_from_slice(&0_i32.to_be_bytes());
+        bytes.extend_from_slice(&LogicalType::Float.pg_descriptor().oid.to_be_bytes());
+        bytes.extend_from_slice(&2_i32.to_be_bytes());
+        bytes.extend_from_slice(&1_i32.to_be_bytes());
+        for value in [1.0_f32, 2.0] {
+            bytes.extend_from_slice(&4_i32.to_be_bytes());
+            bytes.extend_from_slice(&value.to_be_bytes());
+        }
+
+        assert!(
+            decode_binary_param(&bytes, &LogicalType::Array(Box::new(LogicalType::Float), 3),)
+                .is_err()
         );
     }
 }

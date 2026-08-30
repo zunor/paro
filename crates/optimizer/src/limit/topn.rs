@@ -7,6 +7,8 @@ use paro_planner::expression::Expression;
 use paro_planner::operator::{LogicalOperator, LogicalOperatorType, Projection, TopN};
 use paro_planner::plan::LogicalPlan;
 
+type ProjectionLayer = (usize, Vec<Expression>, Vec<String>, usize, Option<String>);
+
 pub struct TopNOptimizer;
 
 impl TopNOptimizer {
@@ -108,7 +110,7 @@ impl TopNOptimizer {
             .and_then(Self::extract_constant_value)
             .unwrap_or(0);
 
-        let mut projections: Vec<(usize, Vec<Expression>, Vec<String>)> = Vec::new();
+        let mut projections: Vec<ProjectionLayer> = Vec::new();
         let mut child_lp = *limit.child;
 
         loop {
@@ -121,11 +123,19 @@ impl TopNOptimizer {
                 table_index,
                 expressions,
                 visible_names,
+                visible_count,
+                visible_qualifier,
                 child,
                 ..
             } = proj;
             let inner = *child;
-            projections.push((table_index, expressions, visible_names));
+            projections.push((
+                table_index,
+                expressions,
+                visible_names,
+                visible_count,
+                visible_qualifier,
+            ));
             child_lp = inner;
         }
 
@@ -136,10 +146,16 @@ impl TopNOptimizer {
                 child_lp.operator = other;
                 let mut result =
                     LogicalOperator::Order(paro_planner::operator::Order::new(child_lp, vec![]));
-                while let Some((table_index, expressions, output_names)) = projections.pop() {
-                    let proj =
+                while let Some((table_index, expressions, output_names, visible_count, qualifier)) =
+                    projections.pop()
+                {
+                    let mut proj =
                         Projection::new(table_index, LogicalPlan::synthetic(result), expressions)
                             .with_visible_names(output_names);
+                    proj.visible_count = visible_count;
+                    if let Some(qualifier) = qualifier {
+                        proj = proj.with_visible_qualifier(qualifier);
+                    }
                     result = LogicalOperator::Projection(proj);
                 }
                 return LogicalPlan {
@@ -152,12 +168,19 @@ impl TopNOptimizer {
 
         let order_child = *order.child;
         let topn = TopN::new(order_child, order.orders, limit_val, offset_val)
-            .with_hnsw_ef_hint(limit.hnsw_ef_hint);
+            .with_hnsw_options(limit.hnsw_options);
         let mut result = LogicalOperator::TopN(topn);
 
-        while let Some((table_index, expressions, output_names)) = projections.pop() {
-            let proj = Projection::new(table_index, LogicalPlan::synthetic(result), expressions)
-                .with_visible_names(output_names);
+        while let Some((table_index, expressions, output_names, visible_count, qualifier)) =
+            projections.pop()
+        {
+            let mut proj =
+                Projection::new(table_index, LogicalPlan::synthetic(result), expressions)
+                    .with_visible_names(output_names);
+            proj.visible_count = visible_count;
+            if let Some(qualifier) = qualifier {
+                proj = proj.with_visible_qualifier(qualifier);
+            }
             result = LogicalOperator::Projection(proj);
         }
 
@@ -393,7 +416,7 @@ mod tests {
     }
 
     #[test]
-    fn test_optimize_propagates_hnsw_ef_hint() {
+    fn test_optimize_propagates_typed_hnsw_query_options() {
         let mut optimizer = TopNOptimizer::new();
         let get = create_test_get();
         let order = create_order_by(get);
@@ -403,14 +426,23 @@ mod tests {
                 Some(create_constant_expr(10)),
                 None,
             )
-            .with_hnsw_ef_hint(Some(256)),
+            .with_hnsw_options(paro_storage::index::hnsw::HnswQueryOptions {
+                ef: Some(256),
+                rerank_window: Some(64),
+                objective: paro_storage::index::hnsw::HnswSearchObjective::Exact,
+            }),
         );
 
         let result = optimizer.optimize(limit);
 
         assert_eq!(result.op_type(), LogicalOperatorType::TopN);
         if let LogicalOperator::TopN(topn) = result {
-            assert_eq!(topn.hnsw_ef_hint, Some(256));
+            assert_eq!(topn.hnsw_options.ef, Some(256));
+            assert_eq!(topn.hnsw_options.rerank_window, Some(64));
+            assert_eq!(
+                topn.hnsw_options.objective,
+                paro_storage::index::hnsw::HnswSearchObjective::Exact
+            );
         } else {
             panic!("Expected TopN operator");
         }

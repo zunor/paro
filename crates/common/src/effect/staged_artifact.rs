@@ -75,6 +75,28 @@ pub struct BulkLoadRowsetArtifact {
     pub unique_summary: BulkLoadUniqueSummary,
 }
 
+/// Durable identity for a search generation built before transaction commit.
+///
+/// The descriptor records ownership and cleanup metadata for CDC, diagnostics,
+/// transaction abort, and startup orphan sweeping. Installation is deliberately
+/// *not* performed by the descriptor handler: the corresponding
+/// `PublishSearchGeneration` tablet mutation owns the atomic directory + head
+/// transition in both live publication and recovery.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SearchGenerationBuildArtifact {
+    pub table_object: DdlObjectKey,
+    pub table_id: u64,
+    pub tablet_id: u64,
+    pub definition_id: u64,
+    pub generation_id: u64,
+    pub build_snapshot_version: i64,
+    pub config_fingerprint: u64,
+    /// Private generation directory removed on abort or startup orphan sweep.
+    pub staged_ref: ArtifactRef,
+    /// Immutable generation-qualified destination used by the tablet mutation.
+    pub generation_ref: ArtifactRef,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum StagedArtifactDescriptor {
     PropertyGraphBuild {
@@ -83,4 +105,5 @@ pub enum StagedArtifactDescriptor {
         schema_fingerprint: String,
     },
     BulkLoadRowset(BulkLoadRowsetArtifact),
+    SearchGenerationBuild(SearchGenerationBuildArtifact),
 }

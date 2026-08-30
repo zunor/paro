@@ -8,14 +8,14 @@ EXPLAIN (VERBOSE) SELECT 1;
 QUERY PLAN
 PROJECTION
   Output: 1
-  Output Schema: 1 INTEGER
+  Output Schema: "1" INTEGER
   ->  DUMMY_SCAN
     Output Schema: (none)
 
 -- @query json
 EXPLAIN SELECT 1 FORMAT JSON;
 QUERY PLAN
-{"detail":{"memory":true,"summary":true,"timing":true,"verbose":false},"format":"json","format_version":1,"mode":"plan","plan":{"children":[{"node_id":1,"operator":"DUMMY_SCAN"}],"node_id":2,"operator":"PROJECTION","output_names":["1"],"properties":{"Output":["1"]}}}
+{"detail":{"memory":true,"summary":true,"timing":true,"verbose":false},"format":"json","format_version":2,"mode":"plan","plan":{"children":[{"node_id":1,"operator":"DUMMY_SCAN"}],"node_id":2,"operator":"PROJECTION","output_names":["1"],"properties":{"Output":["1"]}}}
 
 DROP TABLE IF EXISTS explain_topn_rt;
 DROP TABLE
@@ -35,13 +35,13 @@ QUERY PLAN
 PROJECTION  (rows=2)
   Output: id
   ->  TOP_N  (rows=2)
-    Sort Key: #1 DESC NULLS FIRST
+    Sort Key: public.explain_topn_rt.score DESC NULLS FIRST
     Limit: 2
     ->  PROJECTION  (rows=4)
-      Output: id, __paro_hidden_1
+      Output: id, score
       ->  ROWSET_SCAN on public.explain_topn_rt  (rows=4)
         Columns: id, score
-        Scan Order: col#1 DESC by max LIMIT 2
+        Scan Order: score DESC by max LIMIT 2
 
 EXPLAIN
 SELECT id
@@ -52,13 +52,13 @@ QUERY PLAN
 PROJECTION  (rows=0)
   Output: id
   ->  TOP_N  (rows=0)
-    Sort Key: #1 DESC NULLS FIRST
+    Sort Key: public.explain_topn_rt.score DESC NULLS FIRST
     Limit: 5
     ->  PROJECTION  (rows=4)
-      Output: id, __paro_hidden_1
+      Output: id, score
       ->  ROWSET_SCAN on public.explain_topn_rt  (rows=4)
         Columns: id, score
-        Scan Order: col#1 DESC by max LIMIT 5 OFFSET 6000
+        Scan Order: score DESC by max LIMIT 5 OFFSET 6000
 
 DROP TABLE explain_topn_rt;
 DROP TABLE
@@ -91,7 +91,7 @@ PROJECTION  (rows=4)
   ->  NESTED_LOOP_JOIN  (rows=4)
     Join Type: INNER
     Strategy: nl_fallback
-    Join Condition: #0 < #0
+    Join Condition: l.id < r.id
     ->  ROWSET_SCAN on public.explain_piecewise_left l  (rows=3)
       Columns: id
     ->  ROWSET_SCAN on public.explain_piecewise_right r  (rows=3)
@@ -105,21 +105,21 @@ QUERY PLAN
 PROJECTION  (rows=4)
   Output: l.id, r.id
   Cardinality: [4, 4, 4]
-  Output Schema: l.id INTEGER, r.id INTEGER
+  Output Schema: "l.id" INTEGER, "r.id" INTEGER
   ->  NESTED_LOOP_JOIN  (rows=4)
     Join Type: INNER
     Strategy: nl_fallback
-    Join Condition: #0 < #0
+    Join Condition: l.id < r.id
     Cardinality: [4, 4, 4]
-    Output Schema: id INTEGER, id INTEGER
+    Output Schema: l.id INTEGER, r.id INTEGER
     ->  ROWSET_SCAN on public.explain_piecewise_left l  (rows=3)
       Columns: id
       Cardinality: [3, 3, 3]
-      Output Schema: id INTEGER
+      Output Schema: l.id INTEGER
     ->  ROWSET_SCAN on public.explain_piecewise_right r  (rows=3)
       Columns: id
       Cardinality: [3, 3, 3]
-      Output Schema: id INTEGER
+      Output Schema: r.id INTEGER
 
 -- @query json
 EXPLAIN
@@ -128,7 +128,7 @@ FROM explain_piecewise_left AS l
 JOIN explain_piecewise_right AS r ON l.id < r.id
 FORMAT JSON;
 QUERY PLAN
-{"detail":{"memory":true,"summary":true,"timing":true,"verbose":false},"format":"json","format_version":1,"mode":"plan","plan":{"children":[{"children":[{"alias":"l","estimated_cardinality":{"expected":3,"max":3,"min":3},"estimated_rows":3,"node_id":1,"operator":"ROWSET_SCAN","output_names":["id"],"properties":{"Columns":["id"]},"relation":"public.explain_piecewise_left"},{"alias":"r","estimated_cardinality":{"expected":3,"max":3,"min":3},"estimated_rows":3,"node_id":2,"operator":"ROWSET_SCAN","output_names":["id"],"properties":{"Columns":["id"]},"relation":"public.explain_piecewise_right"}],"estimated_cardinality":{"expected":4,"max":4,"min":4},"estimated_rows":4,"node_id":3,"operator":"NESTED_LOOP_JOIN","output_names":["id","id"],"properties":{"Join Condition":["#0 < #0"],"Join Type":"INNER","Strategy":"nl_fallback"}}],"estimated_cardinality":{"expected":4,"max":4,"min":4},"estimated_rows":4,"node_id":4,"operator":"PROJECTION","output_names":["l.id","r.id"],"properties":{"Output":["l.id","r.id"]}}}
+{"detail":{"memory":true,"summary":true,"timing":true,"verbose":false},"format":"json","format_version":2,"mode":"plan","plan":{"children":[{"children":[{"alias":"l","estimated_cardinality":{"expected":3,"max":3,"min":3},"estimated_rows":3,"node_id":1,"operator":"ROWSET_SCAN","output_names":["id"],"properties":{"Columns":["id"]},"relation":"public.explain_piecewise_left"},{"alias":"r","estimated_cardinality":{"expected":3,"max":3,"min":3},"estimated_rows":3,"node_id":2,"operator":"ROWSET_SCAN","output_names":["id"],"properties":{"Columns":["id"]},"relation":"public.explain_piecewise_right"}],"estimated_cardinality":{"expected":4,"max":4,"min":4},"estimated_rows":4,"node_id":3,"operator":"NESTED_LOOP_JOIN","output_names":["l.id","r.id"],"properties":{"Join Condition":["l.id < r.id"],"Join Type":"INNER","Strategy":"nl_fallback"}}],"estimated_cardinality":{"expected":4,"max":4,"min":4},"estimated_rows":4,"node_id":4,"operator":"PROJECTION","output_names":["l.id","r.id"],"properties":{"Output":["l.id","r.id"]}}}
 
 DROP TABLE explain_piecewise_left;
 DROP TABLE
@@ -164,7 +164,7 @@ PROJECTION  (rows=2)
   ->  NESTED_LOOP_JOIN  (rows=2)
     Join Type: INNER
     Strategy: nl_fallback
-    Join Condition: #0 <= #0, #1 >= #0
+    Join Condition: r.lo <= l.x, r.hi >= l.x
     ->  ROWSET_SCAN on public.explain_sort_range_right r  (rows=3)
       Columns: lo, hi
     ->  ROWSET_SCAN on public.explain_sort_range_left l  (rows=3)
@@ -178,21 +178,21 @@ QUERY PLAN
 PROJECTION  (rows=2)
   Output: l.x, r.lo, r.hi
   Cardinality: [2, 2, 2]
-  Output Schema: l.x INTEGER, r.lo INTEGER, r.hi INTEGER
+  Output Schema: "l.x" INTEGER, "r.lo" INTEGER, "r.hi" INTEGER
   ->  NESTED_LOOP_JOIN  (rows=2)
     Join Type: INNER
     Strategy: nl_fallback
-    Join Condition: #0 <= #0, #1 >= #0
+    Join Condition: r.lo <= l.x, r.hi >= l.x
     Cardinality: [2, 2, 2]
-    Output Schema: lo INTEGER, hi INTEGER, x INTEGER
+    Output Schema: r.lo INTEGER, r.hi INTEGER, l.x INTEGER
     ->  ROWSET_SCAN on public.explain_sort_range_right r  (rows=3)
       Columns: lo, hi
       Cardinality: [3, 3, 3]
-      Output Schema: lo INTEGER, hi INTEGER
+      Output Schema: r.lo INTEGER, r.hi INTEGER
     ->  ROWSET_SCAN on public.explain_sort_range_left l  (rows=3)
       Columns: x
       Cardinality: [3, 3, 3]
-      Output Schema: x INTEGER
+      Output Schema: l.x INTEGER
 
 -- @query json
 EXPLAIN
@@ -201,7 +201,7 @@ FROM explain_sort_range_left AS l
 JOIN explain_sort_range_right AS r ON l.x BETWEEN r.lo AND r.hi
 FORMAT JSON;
 QUERY PLAN
-{"detail":{"memory":true,"summary":true,"timing":true,"verbose":false},"format":"json","format_version":1,"mode":"plan","plan":{"children":[{"children":[{"alias":"r","estimated_cardinality":{"expected":3,"max":3,"min":3},"estimated_rows":3,"node_id":1,"operator":"ROWSET_SCAN","output_names":["lo","hi"],"properties":{"Columns":["lo","hi"]},"relation":"public.explain_sort_range_right"},{"alias":"l","estimated_cardinality":{"expected":3,"max":3,"min":3},"estimated_rows":3,"node_id":2,"operator":"ROWSET_SCAN","output_names":["x"],"properties":{"Columns":["x"]},"relation":"public.explain_sort_range_left"}],"estimated_cardinality":{"expected":2,"max":2,"min":2},"estimated_rows":2,"node_id":3,"operator":"NESTED_LOOP_JOIN","output_names":["lo","hi","x"],"properties":{"Join Condition":["#0 <= #0","#1 >= #0"],"Join Type":"INNER","Strategy":"nl_fallback"}}],"estimated_cardinality":{"expected":2,"max":2,"min":2},"estimated_rows":2,"node_id":4,"operator":"PROJECTION","output_names":["l.x","r.lo","r.hi"],"properties":{"Output":["l.x","r.lo","r.hi"]}}}
+{"detail":{"memory":true,"summary":true,"timing":true,"verbose":false},"format":"json","format_version":2,"mode":"plan","plan":{"children":[{"children":[{"alias":"r","estimated_cardinality":{"expected":3,"max":3,"min":3},"estimated_rows":3,"node_id":1,"operator":"ROWSET_SCAN","output_names":["lo","hi"],"properties":{"Columns":["lo","hi"]},"relation":"public.explain_sort_range_right"},{"alias":"l","estimated_cardinality":{"expected":3,"max":3,"min":3},"estimated_rows":3,"node_id":2,"operator":"ROWSET_SCAN","output_names":["x"],"properties":{"Columns":["x"]},"relation":"public.explain_sort_range_left"}],"estimated_cardinality":{"expected":2,"max":2,"min":2},"estimated_rows":2,"node_id":3,"operator":"NESTED_LOOP_JOIN","output_names":["r.lo","r.hi","l.x"],"properties":{"Join Condition":["r.lo <= l.x","r.hi >= l.x"],"Join Type":"INNER","Strategy":"nl_fallback"}}],"estimated_cardinality":{"expected":2,"max":2,"min":2},"estimated_rows":2,"node_id":4,"operator":"PROJECTION","output_names":["l.x","r.lo","r.hi"],"properties":{"Output":["l.x","r.lo","r.hi"]}}}
 
 DROP TABLE explain_sort_range_left;
 DROP TABLE

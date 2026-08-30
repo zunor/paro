@@ -74,8 +74,8 @@ impl CommitRuntime {
         let finalize_hooks = CommitFinalizeStageHooks {
             on_submission: {
                 let completions = Arc::clone(&completions);
-                Arc::new(move |submission, ack_policy| {
-                    completions.mark_publish_submitted(submission.commit_ts, ack_policy);
+                Arc::new(move |submission, _ack_policy| {
+                    completions.mark_publish_submitted(submission.commit_ts);
                 })
             },
             on_registered: {
@@ -173,14 +173,14 @@ impl CommitRuntime {
                                 message.clone(),
                             ),
                         );
-                        completions.mark_ambiguous_commit_ts(
-                            *commit_ts,
-                            CommitRuntimeFailure::Ambiguous(Arc::from(error.to_string())),
-                        );
                         poison_cell.poison(CommitRuntimePoison::FinalizeStage {
                             commit_ts: Some(*commit_ts),
                             message: Arc::from(error.to_string()),
                         });
+                        completions.mark_ambiguous_commit_ts(
+                            *commit_ts,
+                            CommitRuntimeFailure::Ambiguous(Arc::from(error.to_string())),
+                        );
                     }
                     CommitFinalizeStageError::Submit {
                         commit_ts,
@@ -195,14 +195,14 @@ impl CommitRuntime {
                                 submit_error.message(),
                             ),
                         );
-                        completions.mark_ambiguous_commit_ts(
-                            *commit_ts,
-                            CommitRuntimeFailure::Ambiguous(Arc::from(error.to_string())),
-                        );
                         poison_cell.poison(CommitRuntimePoison::Submit {
                             commit_ts: *commit_ts,
                             message: Arc::from(submit_error.to_string()),
                         });
+                        completions.mark_ambiguous_commit_ts(
+                            *commit_ts,
+                            CommitRuntimeFailure::Ambiguous(Arc::from(error.to_string())),
+                        );
                     }
                     CommitFinalizeStageError::DurableHandle { .. } => {
                         poison_cell.poison(CommitRuntimePoison::FinalizeStage {
@@ -654,7 +654,7 @@ impl CommitRuntimeInner {
                 batch.push(candidate);
             }
 
-            self.sequence_append_schedule(batch);
+            self.sequence_append_schedule(owner, batch);
             scheduled_batches = scheduled_batches.saturating_add(1);
         }
         if !local.is_empty() {
@@ -676,7 +676,11 @@ impl CommitRuntimeInner {
         CommitTs::new(self.sequencer.next_commit_ts().into_raw().saturating_sub(1))
     }
 
-    fn sequence_append_schedule(&self, entries: Vec<CommitQueueEntry>) {
+    fn sequence_append_schedule(
+        &self,
+        owner: &super::CommitDrainOwner,
+        entries: Vec<CommitQueueEntry>,
+    ) {
         let ordered = entries
             .into_iter()
             .map(|entry| OrderedCommitPlan {
@@ -720,15 +724,25 @@ impl CommitRuntimeInner {
         );
 
         match result {
-            Ok(batch) => self.handle_append_success(batch),
-            Err(error) => self.handle_sequence_or_append_error(error),
+            Ok(batch) => self.handle_append_success(owner, batch),
+            Err(error) => self.handle_sequence_or_append_error(owner, error),
         }
     }
 
     fn handle_append_success(
         &self,
+        owner: &super::CommitDrainOwner,
         batch: CommitSequencerOrderedBatch<CommitAppendBatch, CommitQueueEntry>,
     ) {
+        if !batch.deferred.is_empty() {
+            owner.defer_entries(
+                batch
+                    .deferred
+                    .into_iter()
+                    .map(|ordered| ordered.payload)
+                    .collect(),
+            );
+        }
         for rejected in batch.rejected {
             self.completions.mark_rejected(
                 rejected.payload.completion,
@@ -769,6 +783,7 @@ impl CommitRuntimeInner {
 
     fn handle_sequence_or_append_error(
         &self,
+        owner: &super::CommitDrainOwner,
         error: CommitSequencerOrderedError<AppendCommitError, SequencedCommitJob, CommitQueueEntry>,
     ) {
         match error {
@@ -777,8 +792,17 @@ impl CommitRuntimeInner {
                 durable_committed,
                 accepted,
                 rejected,
+                deferred,
                 ..
             } => {
+                if !deferred.is_empty() {
+                    owner.defer_entries(
+                        deferred
+                            .into_iter()
+                            .map(|ordered| ordered.payload)
+                            .collect(),
+                    );
+                }
                 for rejected in rejected {
                     self.completions.mark_rejected(
                         rejected.payload.completion,
@@ -1003,6 +1027,8 @@ mod tests {
                     lsn: handle.durable_lsn(),
                     durable_batch_lsn: handle.durable_batch_lsn(),
                     commit_id: Some(handle.commit_ts().into_raw()),
+                    publication_watermarks:
+                        paro_common::journal::JournalPublicationWatermarks::default(),
                     wait_mode: WaitMode::Published,
                     catalog_serial: false,
                     catalog_pre: Box::new(|| Ok(())),
@@ -1064,6 +1090,36 @@ mod tests {
         assert_eq!(journal.appended.lock().unwrap()[0].len(), 1);
         assert_eq!(runtime.inner.completions.slot_count(), 0);
         runtime.finalize_stage().force_shutdown();
+    }
+
+    #[test]
+    fn completion_preserves_durable_only_ack_when_publish_completes_before_submit_hook() {
+        let completions = CommitCompletionRegistry::default();
+        let completion = completions.allocate();
+        let handle = recovery_handle(1, CommitTs::new(1), 64);
+        completions.mark_durable(completion, handle, CommitAckPolicy::DurableOnlyAsync);
+
+        // Some apply runtimes may invoke the completion callback inline from
+        // submit. The submission hook still owns acknowledgement policy.
+        completions.mark_published(CommitTs::new(1));
+        completions.mark_publish_submitted(CommitTs::new(1));
+
+        let outcome = completions.wait(completion).unwrap();
+        assert_eq!(outcome.ack, CommitRuntimeAck::DurableOnly);
+    }
+
+    #[test]
+    fn completion_joins_publish_and_submit_events_in_either_order() {
+        let completions = CommitCompletionRegistry::default();
+        let completion = completions.allocate();
+        let handle = recovery_handle(1, CommitTs::new(1), 64);
+        completions.mark_durable(completion, handle, CommitAckPolicy::RequiredPublished);
+
+        completions.mark_published(CommitTs::new(1));
+        completions.mark_publish_submitted(CommitTs::new(1));
+
+        let outcome = completions.wait(completion).unwrap();
+        assert_eq!(outcome.ack, CommitRuntimeAck::Published);
     }
 
     #[test]

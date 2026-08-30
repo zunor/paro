@@ -16,6 +16,7 @@ use paro_common::types::LogicalType;
 use paro_common::vector::{
     DictionaryInfo, DictionarySource, SelectionVector, ValidatedVectorSelection, Vector,
 };
+use std::borrow::Cow;
 use std::collections::HashMap;
 use std::sync::Arc;
 
@@ -26,6 +27,117 @@ use std::sync::Arc;
 pub enum ColumnValueProjection {
     Stored,
     MatchedUtf8Prefix { byte_width: usize },
+}
+
+/// A validated, row-major view of one stored `ARRAY(FLOAT, N)` batch.
+///
+/// Storage readers already decode fixed-width pages into native row order.
+/// Consumers which only inspect values (notably exact vector scoring) should
+/// not have to materialize a second query-owned [`Vector`] merely to recover
+/// the same floats. This type keeps the physical byte contract inside the
+/// codec layer: callers receive logical `f32` values plus null semantics, and
+/// misaligned or non-native-endian input is normalized into owned storage.
+pub(crate) struct FloatArrayBatchView<'a> {
+    values: Cow<'a, [f32]>,
+    nulls: Option<&'a [u8]>,
+    rows: usize,
+    dimension: usize,
+}
+
+impl<'a> FloatArrayBatchView<'a> {
+    pub(crate) fn try_new(
+        logical_type: &LogicalType,
+        batch: &'a ColumnBatch,
+        rows: usize,
+    ) -> Result<Self> {
+        let dimension = match logical_type {
+            LogicalType::Array(child, dimension) if child.as_ref() == &LogicalType::Float => {
+                *dimension
+            }
+            _ => {
+                return Err(paro_error::data_corrupted(
+                    "exact vector batch is not an ARRAY(FLOAT, N) column",
+                ));
+            }
+        };
+        if dimension == 0 {
+            return Err(paro_error::data_corrupted(
+                "exact vector batch has zero dimension",
+            ));
+        }
+        if batch.storage_dictionary.is_some() || batch.storage_binary_plain.is_some() {
+            return Err(paro_error::data_corrupted(
+                "fixed-width vector batch used a variable-width storage representation",
+            ));
+        }
+        let value_count = rows
+            .checked_mul(dimension)
+            .ok_or_else(|| paro_error::data_corrupted("vector batch element count overflow"))?;
+        let expected_bytes = value_count
+            .checked_mul(std::mem::size_of::<f32>())
+            .ok_or_else(|| paro_error::data_corrupted("vector batch byte count overflow"))?;
+        if batch.data.len() != expected_bytes {
+            return Err(paro_error::data_corrupted(format!(
+                "vector batch byte length mismatch: expected {expected_bytes}, got {}",
+                batch.data.len()
+            )));
+        }
+        let nulls = batch.nulls.as_deref();
+        if nulls.is_some_and(|nulls| nulls.len() != rows) {
+            return Err(paro_error::data_corrupted(
+                "vector batch null map length does not match row count",
+            ));
+        }
+
+        #[cfg(target_endian = "little")]
+        let values = {
+            // SAFETY: every bit pattern is a valid `f32`. The byte length was
+            // proved to be an exact multiple of `size_of::<f32>()`; align_to
+            // reports whether the owning `Bytes` allocation is suitably
+            // aligned. Misaligned owners take the decoding fallback below.
+            let (prefix, values, suffix) = unsafe { batch.data.as_ref().align_to::<f32>() };
+            if prefix.is_empty() && suffix.is_empty() && values.len() == value_count {
+                Cow::Borrowed(values)
+            } else {
+                Cow::Owned(parse_primitive::<f32>(&batch.data, value_count)?)
+            }
+        };
+        #[cfg(not(target_endian = "little"))]
+        let values = Cow::Owned(parse_primitive::<f32>(&batch.data, value_count)?);
+
+        Ok(Self {
+            values,
+            nulls,
+            rows,
+            dimension,
+        })
+    }
+
+    pub(crate) fn values(&self) -> &[f32] {
+        self.values.as_ref()
+    }
+
+    pub(crate) const fn rows(&self) -> usize {
+        self.rows
+    }
+
+    pub(crate) const fn dimension(&self) -> usize {
+        self.dimension
+    }
+
+    pub(crate) fn all_valid(&self) -> bool {
+        self.nulls
+            .is_none_or(|nulls| nulls.iter().all(|flag| *flag == 0))
+    }
+
+    pub(crate) fn is_valid(&self, row: usize) -> bool {
+        row < self.rows && self.nulls.is_none_or(|nulls| nulls[row] == 0)
+    }
+
+    #[cfg(test)]
+    fn is_borrowed(&self) -> bool {
+        matches!(self.values, Cow::Borrowed(_))
+    }
 }
 
 /// One validated selection with both the common vector proof and a typed
@@ -1562,6 +1674,48 @@ mod tests {
             encoded.extend_from_slice(value);
         }
         Bytes::from(encoded)
+    }
+
+    #[test]
+    fn float_array_batch_view_borrows_aligned_native_storage() {
+        let values = vec![1.0_f32, 2.0, 3.0, 4.0, 5.0, 6.0];
+        let bytes = values
+            .iter()
+            .flat_map(|value| value.to_le_bytes())
+            .collect::<Vec<_>>();
+        let batch = ColumnBatch::new(Bytes::from(bytes), None);
+        let logical_type = LogicalType::Array(Box::new(LogicalType::Float), 3);
+
+        let view = FloatArrayBatchView::try_new(&logical_type, &batch, 2).unwrap();
+
+        assert_eq!(view.values(), values);
+        assert_eq!(view.rows(), 2);
+        assert_eq!(view.dimension(), 3);
+        assert!(view.all_valid());
+        #[cfg(target_endian = "little")]
+        assert!(view.is_borrowed());
+    }
+
+    #[test]
+    fn float_array_batch_view_preserves_null_semantics_and_validates_shape() {
+        let values = [1.0_f32, 2.0, 3.0, 4.0];
+        let bytes = values
+            .iter()
+            .flat_map(|value| value.to_le_bytes())
+            .collect::<Vec<_>>();
+        let batch = ColumnBatch::new(Bytes::from(bytes.clone()), Some(Bytes::from(vec![0, 1])));
+        let logical_type = LogicalType::Array(Box::new(LogicalType::Float), 2);
+        let view = FloatArrayBatchView::try_new(&logical_type, &batch, 2).unwrap();
+
+        assert!(view.is_valid(0));
+        assert!(!view.is_valid(1));
+        assert!(!view.all_valid());
+        assert!(FloatArrayBatchView::try_new(
+            &logical_type,
+            &ColumnBatch::new(Bytes::from(bytes), Some(Bytes::from(vec![0]))),
+            2,
+        )
+        .is_err());
     }
 
     #[test]

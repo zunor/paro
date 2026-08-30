@@ -7,4 +7,7 @@ mod index_restore;
 pub mod registry;
 pub mod replay_handler;
 
-pub(crate) use index_restore::{restore_runtime_art_indexes, restore_search_registry_definitions};
+pub(crate) use index_restore::{
+    restore_runtime_art_indexes, restore_search_registry_definitions,
+    sweep_orphan_search_generation_workspaces,
+};

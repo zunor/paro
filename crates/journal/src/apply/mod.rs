@@ -10,8 +10,8 @@ use paro_common::journal::{CommitRecord, CommittedRecord, MaintenanceRecord};
 pub use crate::apply_queue::{
     ApplyCompletion, ApplyCompletionFallbackAck, ApplyErrorSource, ApplyFatalSink, ApplyPhase,
     ApplyRequest, ApplyRuntimeError, ApplySubmitResult, JournalApplyError,
-    JournalApplyMetricsSnapshot, JournalApplyRuntime, RecoveryPlaceholderRecordKind,
-    TabletApplyPart,
+    JournalApplyMetricsSnapshot, JournalApplyRuntime, JournalPublicationObserver,
+    RecoveryPlaceholderRecordKind, TabletApplyPart,
 };
 pub use crate::waiter::WaitMode;
 
@@ -21,6 +21,8 @@ pub enum MutationKind {
     ApplyPrimaryDelete,
     ApplyDeletePatch,
     PublishCompaction,
+    PublishSearchGeneration,
+    RetireSearchGeneration,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -95,6 +97,8 @@ fn mutation_kind(mutation: &TabletMutation) -> MutationKind {
         TabletMutation::ApplyPrimaryDelete { .. } => MutationKind::ApplyPrimaryDelete,
         TabletMutation::ApplyDeletePatch { .. } => MutationKind::ApplyDeletePatch,
         TabletMutation::PublishCompaction { .. } => MutationKind::PublishCompaction,
+        TabletMutation::PublishSearchGeneration { .. } => MutationKind::PublishSearchGeneration,
+        TabletMutation::RetireSearchGeneration { .. } => MutationKind::RetireSearchGeneration,
     }
 }
 

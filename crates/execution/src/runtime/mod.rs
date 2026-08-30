@@ -139,9 +139,9 @@ pub use context::{
     BlockReason, Blocker, FinishTaskId, OperatorCallContext, OperatorCleanupContext,
     OperatorFinishContext, OperatorScratchScope, OperatorWakeScope, PendingWakeRegistration,
     PipelineInitContext, PipelineTaskId, QueryErrorId, QueryErrorRegistry, QueryOutputPort,
-    QueryOutputPortStats, QueryOutputReferenceWrite, QueryOutputWrite, QueryProfilerRegistry,
-    QueryRuntimeContext, RetainedMemorySnapshot, UtilityContext, WakeGeneration, WakeKey,
-    WakeSource, WakeToken,
+    QueryOutputPortStats, QueryOutputReferenceWrite, QueryOutputWaiter, QueryOutputWrite,
+    QueryProfilerRegistry, QueryRuntimeContext, RetainedMemorySnapshot, UtilityContext,
+    WakeGeneration, WakeKey, WakeSource, WakeToken,
 };
 pub use control_region::{
     ControlRegionRuntime, ControlRegionRuntimeSet, CorrelatedSubqueryControllerState,

@@ -68,7 +68,183 @@ impl PageReadOptions {
 /// Page I/O operations.
 pub struct PageIO;
 
+/// Envelope metadata that can be inspected without materializing the page
+/// body. Large fixed-width vector pages are mmap inputs and may be close to
+/// the `u32` page-size ceiling, so opening them must never allocate a buffer
+/// proportional to the page size merely to discover their footer.
+#[derive(Debug, Clone)]
+pub struct PageLayout {
+    pub footer: PageFooter,
+    pub uncompressed_size: u32,
+    pub body_size: usize,
+    pub expected_checksum: u32,
+}
+
 impl PageIO {
+    /// Read the fixed trailer and variable footer of a page without reading
+    /// its body.
+    pub fn read_page_layout<R: Read + Seek>(
+        reader: &mut R,
+        page_pointer: PagePointer,
+    ) -> Result<PageLayout> {
+        let page_size = page_pointer.size as usize;
+        if page_size < 8 {
+            return Err(paro_error::data_corrupted(format!(
+                "Bad page: too small ({page_size})"
+            )));
+        }
+
+        let trailer_offset = page_pointer
+            .offset
+            .checked_add(page_size as u64 - 8)
+            .ok_or_else(|| paro_error::data_corrupted("page trailer offset overflow"))?;
+        reader.seek(SeekFrom::Start(trailer_offset))?;
+        let mut trailer = [0_u8; 8];
+        reader.read_exact(&mut trailer)?;
+        let footer_size = u32::from_le_bytes(trailer[..4].try_into().expect("u32 width")) as usize;
+        let expected_checksum = u32::from_le_bytes(trailer[4..].try_into().expect("u32 width"));
+        let footer_size_offset = page_size - 8;
+        if footer_size > footer_size_offset {
+            return Err(paro_error::data_corrupted(format!(
+                "Bad page: invalid footer size ({footer_size})"
+            )));
+        }
+
+        let body_size = footer_size_offset - footer_size;
+        let footer_offset = page_pointer
+            .offset
+            .checked_add(body_size as u64)
+            .ok_or_else(|| paro_error::data_corrupted("page footer offset overflow"))?;
+        reader.seek(SeekFrom::Start(footer_offset))?;
+        let mut footer_bytes = vec![0_u8; footer_size];
+        reader.read_exact(&mut footer_bytes)?;
+        let (footer, uncompressed_size) = PageFooter::deserialize(&footer_bytes)?;
+
+        Ok(PageLayout {
+            footer,
+            uncompressed_size,
+            body_size,
+            expected_checksum,
+        })
+    }
+
+    /// Verify a page envelope with bounded memory. This is intended for
+    /// immutable mmap consumers: one sequential verification at the open or
+    /// publication boundary establishes the same checksum invariant as a
+    /// normal page read without allocating the potentially multi-gigabyte
+    /// body.
+    pub fn verify_page_checksum_streaming<R: Read + Seek>(
+        reader: &mut R,
+        page_pointer: PagePointer,
+    ) -> Result<()> {
+        if page_pointer.size < 8 {
+            return Err(paro_error::data_corrupted(format!(
+                "Bad page: too small ({})",
+                page_pointer.size
+            )));
+        }
+        let checksum_offset = page_pointer
+            .offset
+            .checked_add(u64::from(page_pointer.size) - 4)
+            .ok_or_else(|| paro_error::data_corrupted("page checksum offset overflow"))?;
+        reader.seek(SeekFrom::Start(checksum_offset))?;
+        let mut expected = [0_u8; 4];
+        reader.read_exact(&mut expected)?;
+        let expected = u32::from_le_bytes(expected);
+
+        reader.seek(SeekFrom::Start(page_pointer.offset))?;
+        let mut remaining = u64::from(page_pointer.size) - 4;
+        let mut checksum = 0_u32;
+        let mut buffer = vec![0_u8; 1024 * 1024];
+        while remaining != 0 {
+            let bytes = usize::try_from(remaining.min(buffer.len() as u64))
+                .expect("bounded checksum chunk fits usize");
+            reader.read_exact(&mut buffer[..bytes])?;
+            checksum = crc32c::crc32c_append(checksum, &buffer[..bytes]);
+            remaining -= bytes as u64;
+        }
+        if checksum != expected {
+            return Err(paro_error::data_corrupted(format!(
+                "Bad page: checksum mismatch (actual={checksum} vs expect={expected})"
+            )));
+        }
+        Ok(())
+    }
+
+    /// Advance `writer` to the next power-of-two byte boundary.
+    ///
+    /// Padding lives outside every page envelope, so callers must invoke this
+    /// before obtaining the [`PagePointer`] for a page whose body is consumed
+    /// through typed mmap views.
+    pub fn write_alignment_padding<W: Write + Seek>(
+        writer: &mut W,
+        alignment: usize,
+    ) -> Result<usize> {
+        if !alignment.is_power_of_two() {
+            return Err(paro_error::invalid_input(format!(
+                "page alignment must be a non-zero power of two, got {alignment}"
+            )));
+        }
+
+        let position = writer.stream_position()?;
+        let alignment = alignment as u64;
+        let padding = ((alignment - position % alignment) % alignment) as usize;
+        if padding != 0 {
+            writer.write_all(&vec![0_u8; padding])?;
+        }
+        Ok(padding)
+    }
+
+    /// Write a plain page whose body remains directly addressable through an
+    /// mmap. This is the only supported writer for durable typed page bodies:
+    /// it couples base alignment and the absence of compression in one API.
+    pub fn write_mmap_page<W: Write + Seek>(
+        writer: &mut W,
+        body: &[u8],
+        footer: &PageFooter,
+        alignment: usize,
+    ) -> Result<PagePointer> {
+        Self::write_mmap_page_with_aligned_body_offset(writer, body, footer, alignment, 0)
+    }
+
+    /// Write a plain mmap page while aligning a typed region inside its body.
+    ///
+    /// Plain fixed-width pages place a small encoding header before the typed
+    /// values. Aligning the page pointer itself therefore does not align the
+    /// vector rows. This API makes the typed offset part of the write contract
+    /// rather than requiring readers to rely on coincidental envelope sizes.
+    pub fn write_mmap_page_with_aligned_body_offset<W: Write + Seek>(
+        writer: &mut W,
+        body: &[u8],
+        footer: &PageFooter,
+        alignment: usize,
+        aligned_body_offset: usize,
+    ) -> Result<PagePointer> {
+        if aligned_body_offset > body.len() {
+            return Err(paro_error::invalid_input(format!(
+                "aligned mmap body offset {aligned_body_offset} exceeds body length {}",
+                body.len()
+            )));
+        }
+        if !alignment.is_power_of_two() {
+            return Err(paro_error::invalid_input(format!(
+                "page alignment must be a non-zero power of two, got {alignment}"
+            )));
+        }
+        let position = writer.stream_position()?;
+        let alignment_u64 = alignment as u64;
+        let aligned_position = position
+            .checked_add(aligned_body_offset as u64)
+            .ok_or_else(|| paro_error::out_of_range("aligned mmap page position overflow"))?;
+        let padding = ((alignment_u64 - aligned_position % alignment_u64) % alignment_u64) as usize;
+        if padding != 0 {
+            writer.write_all(&vec![0_u8; padding])?;
+        }
+        let uncompressed_size = u32::try_from(body.len())
+            .map_err(|_| paro_error::out_of_range("mmap page body exceeds u32 width"))?;
+        Self::write_page(writer, body, footer, uncompressed_size)
+    }
+
     /// Read raw page bytes from file.
     pub fn read_page_bytes<R: Read + Seek>(
         reader: &mut R,
@@ -322,6 +498,52 @@ mod tests {
             format_version: 2,
             null_encoding: NullEncoding::BitShuffle,
         })
+    }
+
+    #[test]
+    fn alignment_padding_preserves_page_pointer_boundary() {
+        let mut buffer = Cursor::new(vec![1_u8, 2, 3]);
+        buffer.set_position(3);
+
+        assert_eq!(PageIO::write_alignment_padding(&mut buffer, 8).unwrap(), 5);
+        let ptr = PageIO::write_page(
+            &mut buffer,
+            b"aligned",
+            &create_test_footer(),
+            b"aligned".len() as u32,
+        )
+        .unwrap();
+
+        assert_eq!(ptr.offset, 8);
+        assert_eq!(&buffer.get_ref()[3..8], &[0_u8; 5]);
+        assert!(PageIO::write_alignment_padding(&mut buffer, 3).is_err());
+    }
+
+    #[test]
+    fn mmap_page_is_plain_and_aligned_by_construction() {
+        let mut buffer = Cursor::new(vec![1_u8, 2, 3]);
+        buffer.set_position(3);
+        let body = b"directly-addressable";
+
+        let ptr = PageIO::write_mmap_page(&mut buffer, body, &create_test_footer(), 8).unwrap();
+        assert_eq!(ptr.offset, 8);
+        let page = &buffer.get_ref()[ptr.offset as usize..][..ptr.size as usize];
+        let (_, uncompressed_size, body_size) = PageIO::parse_page_footer(page, true).unwrap();
+        assert_eq!(uncompressed_size as usize, body.len());
+        assert_eq!(body_size, body.len());
+        assert_eq!(&page[..body_size], body);
+
+        let mut prefixed = Cursor::new(vec![1_u8, 2, 3]);
+        prefixed.set_position(3);
+        let ptr = PageIO::write_mmap_page_with_aligned_body_offset(
+            &mut prefixed,
+            body,
+            &create_test_footer(),
+            8,
+            3,
+        )
+        .unwrap();
+        assert_eq!((ptr.offset + 3) % 8, 0);
     }
 
     #[test]

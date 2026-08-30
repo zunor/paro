@@ -174,6 +174,7 @@ ORDER BY category, x;
 
 -- Equal volatile trees are independent evaluations and must not be CSE'd
 -- while the lowerer materializes direct window inputs.
+EXPLAIN
 SELECT
     first_value(random()) OVER () = first_value(random()) OVER ()
         AS volatile_inputs_are_independent

@@ -8,12 +8,30 @@ use crate::index::fulltext::query_parser::{
 pub use crate::index::fulltext::scoring::FullTextScoreMode;
 use crate::index::fulltext::tokenizer::{tokenizer_from_config, TokenizerKind};
 use crate::index::fulltext::ts_serde::parse_serialized_tsquery;
+use crate::index::hnsw::{DistanceMetric, HnswQueryOptions};
 use crate::index::PredicateTree;
 use crate::rowset::SparseVector;
 use crate::tablet::ColumnId;
 use paro_common::error::{self as paro_error, Result};
+use paro_common::typed_parameters::ParameterSlot;
 
 use super::stats::TableId;
+
+/// Planned source of an exact segment-local predicate row set.
+///
+/// Both variants have identical SQL semantics. The distinction is physical:
+/// scalar postings are proportional to matches, while a column-scan fallback
+/// must inspect every segment row and therefore belongs in costing and
+/// EXPLAIN.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ExactFilterMaterialization {
+    ScalarIndex,
+    Mixed {
+        indexed_rows: u64,
+        scanned_rows: u64,
+    },
+    ColumnScan,
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SearchRequestMode {
@@ -27,10 +45,36 @@ pub struct ProjectionSpec {
     pub include_score: bool,
 }
 
+/// Dense query vector source retained in an immutable search plan.
+///
+/// Runtime parameters keep values out of compiled plan images while carrying
+/// the fixed vector dimension required to validate each execution.
+#[derive(Debug, Clone, PartialEq)]
+pub enum DenseVectorQuery {
+    Literal(Vec<f32>),
+    RuntimeParameter {
+        slot: ParameterSlot,
+        dimension: usize,
+    },
+}
+
+impl DenseVectorQuery {
+    pub fn dimension(&self) -> usize {
+        match self {
+            Self::Literal(values) => values.len(),
+            Self::RuntimeParameter { dimension, .. } => *dimension,
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct HnswIntent {
     pub column_id: ColumnId,
-    pub query_vector: Vec<f32>,
+    pub query: DenseVectorQuery,
+    /// SQL distance function that defines both index compatibility and score
+    /// materialization semantics.
+    pub distance: DistanceMetric,
+    pub options: HnswQueryOptions,
 }
 
 #[derive(Debug, Clone, PartialEq)]

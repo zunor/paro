@@ -323,6 +323,19 @@ impl LockMode {
         )
     }
 
+    /// Whether this lock identifies a resource actually modified by commit.
+    ///
+    /// `IX` is deliberately excluded: it is an ancestor routing declaration,
+    /// not evidence that the ancestor object itself changed. Treating it as a
+    /// commit write serializes independent row/key writers with maintenance
+    /// publications which only share the same table intent.
+    pub const fn is_commit_write(self) -> bool {
+        matches!(
+            self,
+            Self::X | Self::RangeX | Self::PredicateX | Self::SchemaModification
+        )
+    }
+
     fn strength(self) -> u8 {
         match self {
             Self::IS => 1,
@@ -341,6 +354,64 @@ impl LockMode {
     }
 }
 
+/// Return whether two grants conflict after accounting for multi-granularity
+/// intent locks.  `LockMode::compatible_with` is the same-resource matrix; an
+/// intent lock on an ancestor is deliberately compatible with locks on its
+/// descendants.  Treating the ancestor IX as an ordinary peer of a child X
+/// serializes every writer on the table and defeats the purpose of intent
+/// locking.
+fn lock_grants_conflict(
+    held_resource: &LockResource,
+    held_mode: LockMode,
+    requested_resource: &LockResource,
+    requested_mode: LockMode,
+) -> bool {
+    if !held_resource.conflicts_with(requested_resource) {
+        return false;
+    }
+    if held_resource != requested_resource
+        && (proper_ancestor_intent(held_resource, held_mode, requested_resource)
+            || proper_ancestor_intent(requested_resource, requested_mode, held_resource))
+    {
+        return false;
+    }
+    !held_mode.compatible_with(requested_mode) || !requested_mode.compatible_with(held_mode)
+}
+
+fn proper_ancestor_intent(
+    ancestor: &LockResource,
+    mode: LockMode,
+    descendant: &LockResource,
+) -> bool {
+    if !matches!(
+        mode,
+        LockMode::IS | LockMode::IX | LockMode::SchemaStability
+    ) {
+        return false;
+    }
+    match ancestor {
+        LockResource::Database { .. } => ancestor.namespace() == descendant.namespace(),
+        LockResource::Table { table_id, .. } => {
+            descendant.table_id() == Some(*table_id)
+                && !matches!(descendant, LockResource::Table { .. })
+        }
+        LockResource::Tablet {
+            table_id,
+            tablet_id,
+            ..
+        } => {
+            descendant.tablet_identity() == Some((*table_id, *tablet_id))
+                && !matches!(descendant, LockResource::Tablet { .. })
+        }
+        LockResource::Schema { .. }
+        | LockResource::PrimaryKey { .. }
+        | LockResource::RowId { .. }
+        | LockResource::Range { .. }
+        | LockResource::Predicate { .. }
+        | LockResource::CatalogObject { .. } => false,
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LockRequest {
     pub resource: LockResource,
@@ -356,7 +427,11 @@ impl LockRequest {
 #[derive(Debug, Clone, Copy)]
 pub struct ShardedLockManagerOptions {
     pub shard_count: usize,
-    pub lock_escalation_threshold: usize,
+    /// Number of physical row-id locks on one tablet which may be replaced by
+    /// a tablet lock. Exact primary-key locks deliberately never escalate:
+    /// replacing a large disjoint key set with one tablet X lock serializes
+    /// concurrent COPY/INSERT batches which cannot conflict.
+    pub row_id_escalation_threshold: usize,
     pub lock_escalation_failure_action: LockEscalationFailureAction,
 }
 
@@ -364,7 +439,7 @@ impl Default for ShardedLockManagerOptions {
     fn default() -> Self {
         Self {
             shard_count: 64,
-            lock_escalation_threshold: 1024,
+            row_id_escalation_threshold: 1024,
             lock_escalation_failure_action: LockEscalationFailureAction::KeepFineGrained,
         }
     }
@@ -409,6 +484,20 @@ pub struct LockManagerStats {
     pub shard_count: usize,
     pub lock_count: usize,
     pub granted_count: usize,
+    pub lock_wait_count: u64,
+    pub lock_wait_duration_us: u64,
+    pub lock_wound_wait_abort_count: u64,
+    pub lock_deadlock_abort_count: u64,
+}
+
+/// Lock-free counters suitable for statement-path telemetry snapshots.
+///
+/// `LockManagerStats` intentionally includes the exact number of live lock
+/// resources and holders, which requires visiting every shard.  Most runtime
+/// observers only need contention counters and must not serialize foreground
+/// statements on the lock table merely to collect them.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct LockManagerContentionStats {
     pub lock_wait_count: u64,
     pub lock_wait_duration_us: u64,
     pub lock_wound_wait_abort_count: u64,
@@ -535,7 +624,7 @@ impl ShardedLockManager {
                 lock_wound_wait_abort_count: AtomicU64::new(0),
                 lock_deadlock_abort_count: AtomicU64::new(0),
                 escalation_policy: LockEscalationPolicy {
-                    threshold: options.lock_escalation_threshold,
+                    threshold: options.row_id_escalation_threshold,
                     failure_action: options.lock_escalation_failure_action,
                 },
             }),
@@ -556,9 +645,34 @@ impl ShardedLockManager {
     ) -> std::result::Result<TxnLockSet, LockAcquireError> {
         let requests = normalize_requests(requests);
         let mut granted = Vec::with_capacity(requests.len());
+        let mut fine_batches = (0..self.inner.shards.len())
+            .map(|_| Vec::new())
+            .collect::<Vec<_>>();
 
         for request in requests {
-            match self.inner.try_grant(txn_id, &request) {
+            if !ShardedLockManagerInner::is_coarse_resource(&request.resource) {
+                let shard_index = self.inner.shard_index(&request.resource);
+                fine_batches[shard_index].push(request);
+                continue;
+            }
+            match self.inner.try_grant_coarse(txn_id, &request) {
+                Ok(mut locks) => granted.append(&mut locks),
+                Err(err) => {
+                    self.inner.release_locks(txn_id, &granted);
+                    self.inner.record_acquire_error(&err);
+                    return Err(err);
+                }
+            }
+        }
+
+        for (shard_index, requests) in fine_batches.iter().enumerate() {
+            if requests.is_empty() {
+                continue;
+            }
+            match self
+                .inner
+                .try_grant_fine_batch(txn_id, shard_index, requests)
+            {
                 Ok(mut locks) => granted.append(&mut locks),
                 Err(err) => {
                     self.inner.release_locks(txn_id, &granted);
@@ -617,7 +731,20 @@ impl ShardedLockManager {
         }
     }
 
-    pub fn lock_escalation_threshold(&self) -> usize {
+    #[inline]
+    pub fn contention_stats(&self) -> LockManagerContentionStats {
+        LockManagerContentionStats {
+            lock_wait_count: self.inner.lock_wait_count.load(Ordering::Acquire),
+            lock_wait_duration_us: self.inner.lock_wait_duration_us.load(Ordering::Acquire),
+            lock_wound_wait_abort_count: self
+                .inner
+                .lock_wound_wait_abort_count
+                .load(Ordering::Acquire),
+            lock_deadlock_abort_count: self.inner.lock_deadlock_abort_count.load(Ordering::Acquire),
+        }
+    }
+
+    pub fn row_id_escalation_threshold(&self) -> usize {
         self.inner.escalation_policy.threshold
     }
 
@@ -728,38 +855,70 @@ impl ShardedLockManagerInner {
         txn_id: TxnId,
         request: &LockRequest,
     ) -> std::result::Result<Vec<GrantedLock>, LockAcquireError> {
+        let shard_index = self.shard_index(&request.resource);
+        self.try_grant_fine_batch(txn_id, shard_index, std::slice::from_ref(request))
+    }
+
+    /// Grants exact fine-grained resources while acquiring their shard mutex
+    /// once. The coarse epoch protocol remains the serialization boundary for
+    /// table/tablet/range/predicate locks; grouping exact resources must not
+    /// weaken that cross-level exclusion.
+    fn try_grant_fine_batch(
+        &self,
+        txn_id: TxnId,
+        shard_index: usize,
+        requests: &[LockRequest],
+    ) -> std::result::Result<Vec<GrantedLock>, LockAcquireError> {
+        debug_assert!(!requests.is_empty());
+        debug_assert!(requests.iter().all(|request| {
+            !Self::is_coarse_resource(&request.resource)
+                && self.shard_index(&request.resource) == shard_index
+        }));
+
         let coarse_epoch = self.coarse_epoch.load(Ordering::Acquire);
         if self.coarse_active_count.load(Ordering::Acquire) > 0 {
-            let blockers = self.coarse_blockers(txn_id, request);
+            let blockers = self.coarse_blockers_many(txn_id, requests);
             if !blockers.is_empty() {
                 return Err(classify_wound_wait(txn_id, blockers));
             }
         }
 
-        let shard_index = self.shard_index(&request.resource);
         let mut shard = self.shards[shard_index].lock();
 
         if self.coarse_epoch.load(Ordering::Acquire) != coarse_epoch
             || self.coarse_active_count.load(Ordering::Acquire) > 0
         {
-            let blockers = self.coarse_blockers(txn_id, request);
+            let blockers = self.coarse_blockers_many(txn_id, requests);
             if !blockers.is_empty() {
                 return Err(classify_wound_wait(txn_id, blockers));
             }
         }
 
-        let blockers = shard.blockers(txn_id, request);
+        // Fine resources are exact physical/key identities. Cross-resource
+        // conflicts (table/tablet/range/predicate) live in the coarse table
+        // and were checked above under the epoch protocol. Scanning every
+        // unrelated key in this shard turns one batched primary-key insert
+        // into O(keys^2 / shards) work without finding additional blockers.
+        let mut blockers = Vec::new();
+        for request in requests {
+            shard.append_exact_blockers(txn_id, request, &mut blockers);
+        }
+        normalize_txn_ids(&mut blockers);
         if !blockers.is_empty() {
             return Err(classify_wound_wait(txn_id, blockers));
         }
 
-        let outcome = shard.grant(txn_id, request);
-        Ok(vec![GrantedLock {
-            resource: request.resource.clone(),
-            mode: request.mode,
-            location: LockLocation::FineShard(shard_index),
-            previous_mode: outcome.previous_mode,
-        }])
+        let mut granted = Vec::with_capacity(requests.len());
+        for request in requests {
+            let outcome = shard.grant(txn_id, request);
+            granted.push(GrantedLock {
+                resource: request.resource.clone(),
+                mode: request.mode,
+                location: LockLocation::FineShard(shard_index),
+                previous_mode: outcome.previous_mode,
+            });
+        }
+        Ok(granted)
     }
 
     fn try_grant_coarse(
@@ -795,12 +954,17 @@ impl ShardedLockManagerInner {
         }])
     }
 
-    fn coarse_blockers(&self, txn_id: TxnId, request: &LockRequest) -> Vec<TxnId> {
+    fn coarse_blockers_many(&self, txn_id: TxnId, requests: &[LockRequest]) -> Vec<TxnId> {
         if self.coarse_active_count.load(Ordering::Acquire) == 0 {
             return Vec::new();
         }
         let coarse = self.coarse.lock();
-        coarse.blockers(txn_id, request)
+        let mut blockers = Vec::new();
+        for request in requests {
+            blockers.extend(coarse.blockers(txn_id, request));
+        }
+        normalize_txn_ids(&mut blockers);
+        blockers
     }
 
     fn fine_blockers(&self, txn_id: TxnId, request: &LockRequest) -> Vec<TxnId> {
@@ -851,7 +1015,7 @@ impl ShardedLockManagerInner {
 
         if !Self::is_coarse_resource(resource) {
             let shard = self.shards[self.shard_index(resource)].lock();
-            return shard.has_conflicting(resource);
+            return shard.has_exact(resource);
         }
 
         self.shards.iter().any(|shard| {
@@ -868,7 +1032,7 @@ impl ShardedLockManagerInner {
 
         let mut counts: HashMap<(LockNamespace, TableId, u64), usize> = HashMap::new();
         for lock in &lock_set.locks {
-            if let Some(identity) = fine_tablet_identity(&lock.resource) {
+            if let Some(identity) = row_id_escalation_identity(&lock.resource) {
                 *counts.entry(identity).or_default() += 1;
             }
         }
@@ -928,6 +1092,22 @@ fn fine_tablet_identity(resource: &LockResource) -> Option<(LockNamespace, Table
     }
 }
 
+/// Only physical row identities have a sound coarse replacement. A tablet X
+/// lock preserves delete/update exclusion for a large row-id set. Primary-key
+/// sets are different: their exact disjointness is the concurrency contract,
+/// so widening one batch to the whole tablet is not an optimization.
+fn row_id_escalation_identity(resource: &LockResource) -> Option<(LockNamespace, TableId, u64)> {
+    match resource {
+        LockResource::RowId {
+            namespace,
+            table_id,
+            tablet_id,
+            ..
+        } => Some((*namespace, *table_id, *tablet_id)),
+        _ => None,
+    }
+}
+
 fn has_tablet_lock(
     locks: &[GrantedLock],
     namespace: LockNamespace,
@@ -966,15 +1146,38 @@ impl LockTableShard {
                 if holder.txn_id == txn_id {
                     continue;
                 }
-                if !holder.mode.compatible_with(request.mode)
-                    || !request.mode.compatible_with(holder.mode)
-                {
+                if lock_grants_conflict(resource, holder.mode, &request.resource, request.mode) {
                     blockers.push(holder.txn_id);
                 }
             }
         }
         normalize_txn_ids(&mut blockers);
         blockers
+    }
+
+    fn append_exact_blockers(
+        &self,
+        txn_id: TxnId,
+        request: &LockRequest,
+        blockers: &mut Vec<TxnId>,
+    ) {
+        let Some(state) = self.locks.get(&request.resource) else {
+            return;
+        };
+        blockers.extend(state.granted.iter().filter_map(|holder| {
+            if holder.txn_id != txn_id
+                && lock_grants_conflict(
+                    &request.resource,
+                    holder.mode,
+                    &request.resource,
+                    request.mode,
+                )
+            {
+                Some(holder.txn_id)
+            } else {
+                None
+            }
+        }));
     }
 
     fn grant(&mut self, txn_id: TxnId, request: &LockRequest) -> GrantOutcome {
@@ -1034,6 +1237,12 @@ impl LockTableShard {
         self.locks
             .iter()
             .any(|(held, state)| held.conflicts_with(resource) && !state.granted.is_empty())
+    }
+
+    fn has_exact(&self, resource: &LockResource) -> bool {
+        self.locks
+            .get(resource)
+            .is_some_and(|state| !state.granted.is_empty())
     }
 }
 
@@ -1269,6 +1478,50 @@ mod tests {
     }
 
     #[test]
+    fn table_intent_locks_allow_disjoint_child_writers() {
+        let manager = ShardedLockManager::with_shards(8);
+        let table = LockResource::Table {
+            namespace: ns(),
+            table_id: TableId::new(10),
+        };
+        let _first_intent = manager
+            .lock_one(TxnId::new(10), table.clone(), LockMode::IX)
+            .unwrap();
+        let _second_intent = manager
+            .lock_one(TxnId::new(11), table, LockMode::IX)
+            .unwrap();
+
+        let _first_key = manager
+            .lock_one(TxnId::new(10), pk(1), LockMode::X)
+            .unwrap();
+        let _second_key = manager
+            .lock_one(TxnId::new(11), pk(2), LockMode::X)
+            .unwrap();
+
+        let err = manager
+            .lock_one(TxnId::new(11), pk(1), LockMode::X)
+            .unwrap_err();
+        assert!(matches!(err, LockAcquireError::WouldWait { .. }));
+    }
+
+    #[test]
+    fn table_shared_lock_still_blocks_child_writer() {
+        let manager = ShardedLockManager::with_shards(8);
+        let table = LockResource::Table {
+            namespace: ns(),
+            table_id: TableId::new(10),
+        };
+        let _reader = manager
+            .lock_one(TxnId::new(10), table, LockMode::S)
+            .unwrap();
+
+        let err = manager
+            .lock_one(TxnId::new(11), pk(2), LockMode::X)
+            .unwrap_err();
+        assert!(matches!(err, LockAcquireError::WouldWait { .. }));
+    }
+
+    #[test]
     fn coarse_locks_are_not_replicated_to_every_fine_shard() {
         let manager = ShardedLockManager::with_shards(8);
         let table = LockResource::Table {
@@ -1369,13 +1622,13 @@ mod tests {
     }
 
     #[test]
-    fn fine_grained_locks_escalate_to_tablet_lock() {
+    fn row_id_locks_escalate_without_widening_primary_key_batches() {
         let manager = ShardedLockManager::new(ShardedLockManagerOptions {
             shard_count: 4,
-            lock_escalation_threshold: 2,
+            row_id_escalation_threshold: 2,
             ..ShardedLockManagerOptions::default()
         });
-        let locks = manager
+        let first_key_batch = manager
             .lock_many(
                 TxnId::new(10),
                 [
@@ -1384,13 +1637,38 @@ mod tests {
                 ],
             )
             .unwrap();
+        assert!(!first_key_batch
+            .locks
+            .iter()
+            .any(|lock| matches!(lock.resource, LockResource::Tablet { .. })));
+        let _disjoint_key_batch = manager
+            .lock_many(
+                TxnId::new(11),
+                [
+                    LockRequest::new(pk(3), LockMode::X),
+                    LockRequest::new(pk(4), LockMode::X),
+                ],
+            )
+            .unwrap();
+        drop(_disjoint_key_batch);
+        drop(first_key_batch);
 
-        assert!(locks
+        let row = |offset| LockResource::row_id(ns(), TableId::new(10), 20, 30, 0, offset);
+        let row_locks = manager
+            .lock_many(
+                TxnId::new(12),
+                [
+                    LockRequest::new(row(1), LockMode::X),
+                    LockRequest::new(row(2), LockMode::X),
+                ],
+            )
+            .unwrap();
+        assert!(row_locks
             .locks
             .iter()
             .any(|lock| matches!(lock.resource, LockResource::Tablet { .. })));
         let err = manager
-            .lock_one(TxnId::new(11), pk(3), LockMode::X)
+            .lock_one(TxnId::new(13), row(3), LockMode::X)
             .unwrap_err();
         assert!(matches!(err, LockAcquireError::WouldWait { .. }));
     }

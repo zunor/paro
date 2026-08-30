@@ -6,6 +6,7 @@ use paro_planner::plan::CardinalityEstimate;
 use serde_json::{Map, Value as JsonValue};
 
 pub type ExplainNodeId = u64;
+pub const EXPLAIN_FORMAT_VERSION: u32 = 2;
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct ExplainSchema {

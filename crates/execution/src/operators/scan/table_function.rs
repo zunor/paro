@@ -739,16 +739,32 @@ fn populate_paro_indexes(global_state: &mut dyn GlobalTableFunctionState, ctx: &
                                 .unwrap_or(0);
                             let extra_info = match idx.index_type {
                                 IndexType::HNSW => {
-                                    let stats = table_entry
-                                        .and_then(|table| table.get_storage())
-                                        .and_then(|storage| {
-                                            idx.get_column_ids().first().and_then(|column_id| {
-                                                storage.hnsw_index_statistics(column_id.index)
-                                            })
-                                        });
-                                    if let Some(stats) = stats {
+                                    let storage = table_entry.and_then(|table| table.get_storage());
+                                    let stats = storage.map(|storage| {
+                                        storage.hnsw_generation_statistics(
+                                            idx.base.base.object_id.raw(),
+                                        )
+                                    });
+                                    if let Some(Ok(Some(stats))) = stats.as_ref() {
                                         entry_count =
                                             stats.num_indexed_vectors.min(i64::MAX as usize) as i64;
+                                        let artifact_count = storage.and_then(|storage| {
+                                            storage.search_generation_artifact_count(
+                                                idx.base.base.object_id.raw(),
+                                            )
+                                        });
+                                        let maintenance = storage.map(|storage| {
+                                            let tablet = storage.tablet();
+                                            let layout = tablet.layout_maintenance_snapshot();
+                                            json!({
+                                                "active_search_tasks": storage.active_search_maintenance_tasks(),
+                                                "rowset_count": tablet.num_rowsets(),
+                                                "layout_epoch": tablet.layout_epoch(),
+                                                "layout_shared_holders": layout.shared_holders,
+                                                "layout_exclusive_holders": layout.exclusive_holders,
+                                                "layout_exclusive_waiters": layout.exclusive_waiters,
+                                            })
+                                        });
                                         json!({
                                             "column_ids": idx.get_column_ids().iter().map(|column_id| column_id.index).collect::<Vec<_>>(),
                                             "column_names": column_names,
@@ -758,6 +774,9 @@ fn populate_paro_indexes(global_state: &mut dyn GlobalTableFunctionState, ctx: &
                                             "max_level": stats.max_level,
                                             "m": stats.m,
                                             "ef_construction": stats.ef_construction,
+                                            "artifact_count": artifact_count,
+                                            "maintenance": maintenance,
+                                            "provider_config": &idx.provider_config,
                                             "failure_reason": idx.failure_reason(),
                                             "coverage": idx.coverage().map(|coverage| {
                                                 json!({
@@ -768,10 +787,19 @@ fn populate_paro_indexes(global_state: &mut dyn GlobalTableFunctionState, ctx: &
                                                 })
                                             }),
                                         })
+                                    } else if let Some(Err(error)) = stats {
+                                        json!({
+                                            "column_ids": idx.get_column_ids().iter().map(|column_id| column_id.index).collect::<Vec<_>>(),
+                                            "column_names": column_names,
+                                            "provider_config": &idx.provider_config,
+                                            "statistics_error": error.to_string(),
+                                            "failure_reason": idx.failure_reason(),
+                                        })
                                     } else {
                                         json!({
                                             "column_ids": idx.get_column_ids().iter().map(|column_id| column_id.index).collect::<Vec<_>>(),
                                             "column_names": column_names,
+                                            "provider_config": &idx.provider_config,
                                             "failure_reason": idx.failure_reason(),
                                             "coverage": idx.coverage().map(|coverage| {
                                                 json!({
@@ -995,7 +1023,7 @@ fn populate_paro_storage_info(
                     max_value: base_stats
                         .and_then(|stats| stats.max_value())
                         .map(|value| value.to_string()),
-                    has_hnsw_index: segment.hnsw_index(meta.column_id).is_some()
+                    has_hnsw_index: segment.has_hnsw_artifact(meta.column_id)
                         || storage.has_queryable_search_artifact(
                             SearchIndexKind::Hnsw,
                             rowset_id,
@@ -1802,6 +1830,42 @@ fn search_metric_value(
     snapshot: &paro_storage::metrics::StorageMetricsSnapshot,
 ) -> u64 {
     match name {
+        "search_hnsw_scored_points_total" => snapshot.search_hnsw_scored_points_total,
+        "search_hnsw_exact_segment_searches_total" => {
+            snapshot.search_hnsw_exact_segment_searches_total
+        }
+        "search_hnsw_predicate_covering_segment_scans_total" => {
+            snapshot.search_hnsw_predicate_covering_segment_scans_total
+        }
+        "search_hnsw_deferred_beam_admission_segment_searches_total" => {
+            snapshot.search_hnsw_deferred_beam_admission_segment_searches_total
+        }
+        "search_hnsw_unfiltered_graph_segment_searches_total" => {
+            snapshot.search_hnsw_unfiltered_graph_segment_searches_total
+        }
+        "search_hnsw_masked_graph_segment_searches_total" => {
+            snapshot.search_hnsw_masked_graph_segment_searches_total
+        }
+        "search_hnsw_adaptive_graph_segment_searches_total" => {
+            snapshot.search_hnsw_adaptive_graph_segment_searches_total
+        }
+        "search_hnsw_predicate_refined_segment_searches_total" => {
+            snapshot.search_hnsw_predicate_refined_segment_searches_total
+        }
+        "search_hnsw_exact_fallback_segment_searches_total" => {
+            snapshot.search_hnsw_exact_fallback_segment_searches_total
+        }
+        "search_hnsw_predicate_topology_segment_searches_total" => {
+            snapshot.search_hnsw_predicate_topology_segment_searches_total
+        }
+        "search_hnsw_integrity_scheduled_total" => snapshot.search_hnsw_integrity_scheduled_total,
+        "search_hnsw_integrity_completed_total" => snapshot.search_hnsw_integrity_completed_total,
+        "search_hnsw_integrity_failed_total" => snapshot.search_hnsw_integrity_failed_total,
+        "search_hnsw_integrity_stale_total" => snapshot.search_hnsw_integrity_stale_total,
+        "search_hnsw_integrity_deferred_total" => snapshot.search_hnsw_integrity_deferred_total,
+        "search_hnsw_integrity_verified_bytes_total" => {
+            snapshot.search_hnsw_integrity_verified_bytes_total
+        }
         "search_row_fetch_batches_total" => snapshot.search_row_fetch_batches_total,
         "search_row_fetch_rows_total" => snapshot.search_row_fetch_rows_total,
         "search_row_fetch_projected_columns_total" => {
@@ -2525,5 +2589,32 @@ mod tests {
         assert_eq!(state.entries[0].invocation_count, 5);
         assert_eq!(state.entries[1].name, "join_order");
         assert!(!state.entries[1].enabled);
+    }
+
+    #[test]
+    fn hnsw_runtime_metrics_are_mapped_from_the_storage_snapshot() {
+        let mut snapshot = paro_storage::metrics::storage_metrics().snapshot();
+        snapshot.search_hnsw_scored_points_total = 101;
+        snapshot.search_hnsw_adaptive_graph_segment_searches_total = 7;
+        snapshot.search_hnsw_predicate_refined_segment_searches_total = 3;
+
+        assert_eq!(
+            search_metric_value("search_hnsw_scored_points_total", &snapshot),
+            101
+        );
+        assert_eq!(
+            search_metric_value(
+                "search_hnsw_adaptive_graph_segment_searches_total",
+                &snapshot
+            ),
+            7
+        );
+        assert_eq!(
+            search_metric_value(
+                "search_hnsw_predicate_refined_segment_searches_total",
+                &snapshot
+            ),
+            3
+        );
     }
 }

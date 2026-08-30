@@ -18,6 +18,7 @@ use super::versioned_rowset_catalog::{
 };
 use crate::primary_key::RssidMappingEntry;
 use crate::rowset::RowsetMeta;
+pub use paro_common::effect::SearchGenerationHeadMeta;
 use paro_common::error::{self as paro_error, Result};
 use paro_journal::{MutationIdentity, MutationKind};
 use serde::{Deserialize, Serialize};
@@ -40,6 +41,8 @@ pub enum AppliedMutationKind {
     ApplyPrimaryDelete = 2,
     ApplyDeletePatch = 3,
     PublishCompaction = 4,
+    PublishSearchGeneration = 5,
+    RetireSearchGeneration = 6,
 }
 
 impl AppliedMutationKind {
@@ -49,6 +52,8 @@ impl AppliedMutationKind {
             2 => Ok(Self::ApplyPrimaryDelete),
             3 => Ok(Self::ApplyDeletePatch),
             4 => Ok(Self::PublishCompaction),
+            5 => Ok(Self::PublishSearchGeneration),
+            6 => Ok(Self::RetireSearchGeneration),
             _ => Err(paro_error::internal(format!(
                 "TabletMeta: invalid applied mutation kind {raw}"
             ))),
@@ -63,6 +68,8 @@ impl From<MutationKind> for AppliedMutationKind {
             MutationKind::ApplyPrimaryDelete => Self::ApplyPrimaryDelete,
             MutationKind::ApplyDeletePatch => Self::ApplyDeletePatch,
             MutationKind::PublishCompaction => Self::PublishCompaction,
+            MutationKind::PublishSearchGeneration => Self::PublishSearchGeneration,
+            MutationKind::RetireSearchGeneration => Self::RetireSearchGeneration,
         }
     }
 }
@@ -160,6 +167,14 @@ pub struct TabletMeta {
     /// Cumulative layer point (version boundary for compaction)
     cumulative_layer_point: i64,
 
+    /// Highest table-local publication version represented by this snapshot.
+    ///
+    /// This cannot be derived from rowset end versions: delete-only commits
+    /// advance visibility without creating a rowset. Persisting it separately
+    /// keeps delete-vector selection and derived-index provenance monotonic
+    /// across checkpoint recovery.
+    published_version: i64,
+
     /// Current tablet state
     tablet_state: TabletState,
 
@@ -206,15 +221,12 @@ pub struct TabletMeta {
     /// Durable search generation heads whose referenced manifest roots are
     /// visible for this tablet snapshot.
     search_generation_heads: Vec<SearchGenerationHeadMeta>,
-}
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct SearchGenerationHeadMeta {
-    pub definition_id: u64,
-    pub generation_id: u64,
-    pub root_version: u64,
-    pub config_fingerprint: u64,
-    pub root_file_name: String,
+    /// Catalog search definitions permanently retired on this tablet.
+    /// Object ids are never reused. Keeping this fence in the same durable
+    /// snapshot as the heads prevents delayed maintenance WAL from resurrecting
+    /// an index after `DROP INDEX`.
+    retired_search_definition_ids: Vec<u64>,
 }
 
 impl TabletMeta {
@@ -243,6 +255,7 @@ impl TabletMeta {
             shard_id: 0,
             creation_time: current_timestamp(),
             cumulative_layer_point: -1,
+            published_version: -1,
             tablet_state: TabletState::NotReady,
             schema: Some(schema),
             schema_bytes,
@@ -258,6 +271,7 @@ impl TabletMeta {
             rowset_maintenance_ids: Vec::new(),
             applied_mutations: Vec::new(),
             search_generation_heads: Vec::new(),
+            retired_search_definition_ids: Vec::new(),
         })
     }
 
@@ -372,6 +386,16 @@ impl TabletMeta {
         &self.search_generation_heads
     }
 
+    pub fn retired_search_definition_ids(&self) -> &[u64] {
+        &self.retired_search_definition_ids
+    }
+
+    pub fn is_search_definition_retired(&self, definition_id: u64) -> bool {
+        self.retired_search_definition_ids
+            .binary_search(&definition_id)
+            .is_ok()
+    }
+
     // ==================== Setters ====================
 
     /// Set shard ID
@@ -382,6 +406,10 @@ impl TabletMeta {
     /// Set cumulative layer point
     pub fn set_cumulative_layer_point(&mut self, point: i64) {
         self.cumulative_layer_point = point;
+    }
+
+    pub fn set_max_version(&mut self, version: i64) {
+        self.published_version = version;
     }
 
     /// Set tablet state
@@ -438,29 +466,146 @@ impl TabletMeta {
         self.search_generation_heads = heads;
     }
 
-    pub fn upsert_search_generation_head(&mut self, head: SearchGenerationHeadMeta) {
+    pub fn set_retired_search_definition_ids(&mut self, mut definition_ids: Vec<u64>) {
+        definition_ids.sort_unstable();
+        definition_ids.dedup();
+        self.retired_search_definition_ids = definition_ids;
+    }
+
+    /// Retire one catalog definition and atomically remove its visible head.
+    /// Returns `true` only for the first transition.
+    pub fn retire_search_definition(&mut self, definition_id: u64) -> Result<bool> {
+        if definition_id == 0 {
+            return Err(paro_error::invalid_input(
+                "search definition retirement requires a non-zero definition id",
+            ));
+        }
+        let _ = self.remove_search_generation_head(definition_id);
+        match self
+            .retired_search_definition_ids
+            .binary_search(&definition_id)
+        {
+            Ok(_) => Ok(false),
+            Err(index) => {
+                self.retired_search_definition_ids
+                    .insert(index, definition_id);
+                Ok(true)
+            }
+        }
+    }
+
+    pub(crate) fn restore_search_definition_retirement(
+        &mut self,
+        definition_id: u64,
+        previous_head: Option<SearchGenerationHeadMeta>,
+        was_retired: bool,
+    ) {
+        if !was_retired {
+            if let Ok(index) = self
+                .retired_search_definition_ids
+                .binary_search(&definition_id)
+            {
+                self.retired_search_definition_ids.remove(index);
+            }
+        }
+        self.restore_search_generation_head(definition_id, previous_head);
+    }
+
+    /// Advance one definition's durable head without permitting an older or
+    /// conflicting revision to replace newer metadata.
+    ///
+    /// The ordering is `(generation_id, root_version)`. A generation change
+    /// may carry a new physical contract fingerprint; revisions within one
+    /// generation may not.
+    pub fn advance_search_generation_head(
+        &mut self,
+        head: SearchGenerationHeadMeta,
+    ) -> Result<bool> {
+        if head.definition_id == 0 || head.generation_id == 0 || head.root_version == 0 {
+            return Err(paro_error::invalid_input(
+                "search generation head requires non-zero identities and root version",
+            ));
+        }
+        if self.is_search_definition_retired(head.definition_id) {
+            return Err(paro_error::invalid_input(format!(
+                "search definition {} is durably retired",
+                head.definition_id
+            )));
+        }
         match self
             .search_generation_heads
             .binary_search_by_key(&head.definition_id, |existing| existing.definition_id)
         {
-            Ok(index) => self.search_generation_heads[index] = head,
-            Err(index) => self.search_generation_heads.insert(index, head),
+            Ok(index) => {
+                let current = &self.search_generation_heads[index];
+                let current_revision = (current.generation_id, current.root_version);
+                let next_revision = (head.generation_id, head.root_version);
+                match next_revision.cmp(&current_revision) {
+                    std::cmp::Ordering::Less => Ok(false),
+                    std::cmp::Ordering::Equal if *current == head => Ok(false),
+                    std::cmp::Ordering::Equal => Err(paro_error::data_corrupted(format!(
+                        "search definition {} has conflicting metadata for generation {} root {}",
+                        head.definition_id, head.generation_id, head.root_version
+                    ))),
+                    std::cmp::Ordering::Greater => {
+                        if current.generation_id == head.generation_id
+                            && current.config_fingerprint != head.config_fingerprint
+                        {
+                            return Err(paro_error::data_corrupted(format!(
+                                "search definition {} changed config fingerprint within generation {}",
+                                head.definition_id, head.generation_id
+                            )));
+                        }
+                        self.search_generation_heads[index] = head;
+                        Ok(true)
+                    }
+                }
+            }
+            Err(index) => {
+                self.search_generation_heads.insert(index, head);
+                Ok(true)
+            }
         }
     }
 
-    pub fn remove_search_generation_head(&mut self, definition_id: u64) {
+    /// Restore an in-memory value after persistence fails while the tablet
+    /// meta lock is still held. Publication code must use
+    /// `advance_search_generation_head` for every forward transition.
+    pub(crate) fn restore_search_generation_head(
+        &mut self,
+        definition_id: u64,
+        previous: Option<SearchGenerationHeadMeta>,
+    ) {
+        let _ = self.remove_search_generation_head(definition_id);
+        if let Some(previous) = previous {
+            match self
+                .search_generation_heads
+                .binary_search_by_key(&previous.definition_id, |head| head.definition_id)
+            {
+                Ok(index) => self.search_generation_heads[index] = previous,
+                Err(index) => self.search_generation_heads.insert(index, previous),
+            }
+        }
+    }
+
+    pub fn remove_search_generation_head(
+        &mut self,
+        definition_id: u64,
+    ) -> Option<SearchGenerationHeadMeta> {
         if let Ok(index) = self
             .search_generation_heads
             .binary_search_by_key(&definition_id, |head| head.definition_id)
         {
-            self.search_generation_heads.remove(index);
+            return Some(self.search_generation_heads.remove(index));
         }
+        None
     }
 
     // ==================== Rowset Management ====================
 
     /// Add a rowset metadata reference
     pub fn add_rowset_meta(&mut self, meta: RowsetMeta) {
+        self.published_version = self.published_version.max(meta.end_version());
         if meta.start_version() > self.cumulative_layer_point {
             self.inc_rowset_metas.push(meta);
         } else {
@@ -511,14 +656,9 @@ impl TabletMeta {
             })
     }
 
-    /// Get max rowset version
+    /// Get the highest table-local publication version.
     pub fn max_version(&self) -> i64 {
-        self.rowset_metas
-            .iter()
-            .chain(self.inc_rowset_metas.iter())
-            .map(|m| m.end_version())
-            .max()
-            .unwrap_or(-1)
+        self.published_version
     }
 
     // ==================== Serialization ====================
@@ -600,6 +740,11 @@ impl TabletMeta {
             data.extend_from_slice(&(name.len() as u32).to_le_bytes());
             data.extend_from_slice(name);
         }
+        data.extend_from_slice(&(self.retired_search_definition_ids.len() as u32).to_le_bytes());
+        for definition_id in &self.retired_search_definition_ids {
+            data.extend_from_slice(&definition_id.to_le_bytes());
+        }
+        data.extend_from_slice(&self.published_version.to_le_bytes());
 
         Ok(data)
     }
@@ -888,6 +1033,42 @@ impl TabletMeta {
             Vec::new()
         };
 
+        let retired_search_definition_ids = if offset < data.len() {
+            let count = read_u32(data, &mut offset)? as usize;
+            let mut definition_ids = Vec::with_capacity(count);
+            for _ in 0..count {
+                definition_ids.push(read_u64(data, &mut offset)?);
+            }
+            definition_ids.sort_unstable();
+            definition_ids.dedup();
+            definition_ids
+        } else {
+            Vec::new()
+        };
+
+        // Tablet metadata is a strict physical format. Delete-only visibility
+        // requires this durable field, so artifacts without it must be
+        // rebuilt instead of silently inferring a lower rowset-only version.
+        let published_version = read_i64(data, &mut offset)?;
+
+        let max_rowset_version = rowset_metas
+            .iter()
+            .chain(inc_rowset_metas.iter())
+            .map(|meta| meta.end_version())
+            .max()
+            .unwrap_or(-1);
+        if published_version < max_rowset_version {
+            return Err(paro_error::internal(format!(
+                "TabletMeta: published version {published_version} precedes rowset version {max_rowset_version}"
+            )));
+        }
+
+        if offset != data.len() {
+            return Err(paro_error::internal(
+                "TabletMeta: unexpected trailing bytes",
+            ));
+        }
+
         Ok(Self {
             tablet_id,
             table_id,
@@ -896,6 +1077,7 @@ impl TabletMeta {
             shard_id,
             creation_time,
             cumulative_layer_point,
+            published_version,
             tablet_state,
             schema,
             schema_bytes,
@@ -911,6 +1093,7 @@ impl TabletMeta {
             rowset_maintenance_ids,
             applied_mutations,
             search_generation_heads,
+            retired_search_definition_ids,
         })
     }
 
@@ -1088,6 +1271,7 @@ mod tests {
         meta.set_tablet_state(TabletState::Running);
         meta.set_cumulative_layer_point(5);
         meta.add_rowset_meta(RowsetMeta::new(1, 1, Version::singleton(0)));
+        meta.set_max_version(6);
         meta.set_rssid_mappings(vec![RssidMappingEntry {
             rssid: 7,
             rowset_id: 1,
@@ -1130,8 +1314,9 @@ mod tests {
             generation_id: 1,
             root_version: 7,
             config_fingerprint: 99,
-            root_file_name: "manifest_root_g1_v7.json".to_string(),
+            root_file_name: "manifest_root_g1_v7_f99.json".to_string(),
         }]);
+        meta.set_retired_search_definition_ids(vec![77, 76, 77]);
 
         let bytes = meta.serialize().unwrap();
         let restored = TabletMeta::deserialize(&bytes).unwrap();
@@ -1139,6 +1324,7 @@ mod tests {
         assert_eq!(restored.tablet_id(), 1);
         assert_eq!(restored.tablet_state(), TabletState::Running);
         assert_eq!(restored.cumulative_layer_point(), 5);
+        assert_eq!(restored.max_version(), 6);
         assert_eq!(restored.num_rowsets(), 1);
         assert_eq!(
             restored.rssid_mappings(),
@@ -1181,10 +1367,51 @@ mod tests {
                 generation_id: 1,
                 root_version: 7,
                 config_fingerprint: 99,
-                root_file_name: "manifest_root_g1_v7.json".to_string(),
+                root_file_name: "manifest_root_g1_v7_f99.json".to_string(),
             }]
         );
+        assert_eq!(restored.retired_search_definition_ids(), &[76, 77]);
         assert!(restored.schema().is_some());
+    }
+
+    #[test]
+    fn tablet_meta_requires_a_durable_delete_only_publication_version() {
+        let schema = create_test_schema();
+        let mut meta = TabletMeta::new(1, 100, 1000, schema, "/data").unwrap();
+        meta.add_rowset_meta(RowsetMeta::new(1, 1, Version::singleton(3)));
+        meta.set_max_version(7);
+
+        let mut bytes = meta.serialize().unwrap();
+        assert_eq!(TabletMeta::deserialize(&bytes).unwrap().max_version(), 7);
+
+        bytes.truncate(bytes.len() - std::mem::size_of::<i64>());
+        assert!(TabletMeta::deserialize(&bytes).is_err());
+    }
+
+    #[test]
+    fn search_generation_head_advance_is_monotonic_and_contract_safe() {
+        let schema = create_test_schema();
+        let mut meta = TabletMeta::new(1, 100, 1000, schema, "/data").unwrap();
+        let head = |generation_id, root_version, config_fingerprint| SearchGenerationHeadMeta {
+            definition_id: 42,
+            generation_id,
+            root_version,
+            config_fingerprint,
+            root_file_name: format!(
+                "manifest_root_g{generation_id}_v{root_version}_f{config_fingerprint}.json"
+            ),
+        };
+
+        assert!(meta.advance_search_generation_head(head(1, 1, 99)).unwrap());
+        assert!(meta.advance_search_generation_head(head(1, 2, 99)).unwrap());
+        assert!(!meta.advance_search_generation_head(head(1, 1, 99)).unwrap());
+        assert_eq!(meta.search_generation_heads()[0], head(1, 2, 99));
+        assert!(meta
+            .advance_search_generation_head(head(1, 3, 100))
+            .is_err());
+        assert!(meta
+            .advance_search_generation_head(head(2, 1, 100))
+            .unwrap());
     }
 
     #[test]

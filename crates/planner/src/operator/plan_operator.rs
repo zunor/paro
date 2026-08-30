@@ -210,9 +210,7 @@ impl LogicalOperator {
                     }
                 }
             }
-            LogicalOperator::DelimGet(op) => (0..op.chunk_types.len())
-                .map(|idx| format!("delim_{}", idx + 1))
-                .collect(),
+            LogicalOperator::DelimGet(op) => op.chunk_names.clone(),
             LogicalOperator::DependentJoin(op) => op.output_names(),
             LogicalOperator::SetOperation(op) => op.left().output_names(),
             LogicalOperator::Distinct(op) => op.child.output_names(),
@@ -1018,8 +1016,8 @@ mod tests {
     use paro_function::window::WindowFunction;
     use paro_parser::ast::CopySource;
     use paro_storage::search::{
-        HnswIntent, NormalizedSearchRequest, ProjectionSpec, SearchIndexKind, SearchIntent,
-        SearchRequestMode,
+        DenseVectorQuery, HnswIntent, NormalizedSearchRequest, ProjectionSpec, SearchIndexKind,
+        SearchIntent, SearchRequestMode,
     };
     use paro_storage::table::table_factory::TableFactory;
     use paro_storage::table::table_handle::TableHandle;
@@ -1082,7 +1080,9 @@ mod tests {
         let copy_function = register_copy_functions()
             .into_iter()
             .next()
-            .expect("copy function");
+            .expect("copy function")
+            .copy_to
+            .expect("COPY TO function");
         let names = vec!["c1".to_string()];
         let types = vec![LogicalType::Integer];
         let bind_data: Arc<dyn CopyFunctionBindData> = Arc::from(
@@ -1613,7 +1613,9 @@ mod tests {
                 },
                 intents: vec![SearchIntent::Hnsw(HnswIntent {
                     column_id: 1,
-                    query_vector: vec![0.1, 0.2],
+                    query: DenseVectorQuery::Literal(vec![0.1, 0.2]),
+                    distance: paro_storage::index::hnsw::DistanceMetric::Euclidean,
+                    options: Default::default(),
                 })],
                 fusion: None,
             },
@@ -1621,7 +1623,9 @@ mod tests {
                 candidate: SearchCandidate {
                     intent: SearchIntent::Hnsw(HnswIntent {
                         column_id: 1,
-                        query_vector: vec![0.1, 0.2],
+                        query: DenseVectorQuery::Literal(vec![0.1, 0.2]),
+                        distance: paro_storage::index::hnsw::DistanceMetric::Euclidean,
+                        options: Default::default(),
                     }),
                     token: paro_storage::search::CapabilityToken {
                         definition_id: 1,
@@ -1631,6 +1635,7 @@ mod tests {
                     },
                     kind: SearchIndexKind::Hnsw,
                     estimated_cost: None,
+                    exact_filter_materialization: None,
                 },
                 confidence: crate::operator::Confidence::High,
             },

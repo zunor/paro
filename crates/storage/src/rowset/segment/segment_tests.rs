@@ -3,7 +3,9 @@
 
 use super::segment::PositionedFile;
 use super::*;
+use crate::buffer::{BufferPool, PageCache};
 use crate::index::{
+    hnsw::{DistanceMetric, HnswConfig},
     FixedMembership, FixedMembershipBuildPolicy, Predicate, PredicateResult, PredicateTree,
 };
 use crate::rowset::page::CompressionType;
@@ -11,6 +13,7 @@ use crate::rowset::{BatchRowOrdinal, SegmentRowId};
 use crate::table::runtime_indexes::RuntimeIndexes;
 use crate::tablet::tablet_schema::{KeysType, TabletColumn, TabletSchema};
 use crate::tablet::TabletSchemaRef;
+use paro_common::allocator::MemoryTag;
 use paro_common::runtime_value::Value;
 use paro_common::types::LogicalType;
 use std::sync::Arc;
@@ -85,6 +88,233 @@ fn segment_open_and_iterate_roundtrip() {
     assert_eq!(batch[0].0, 0);
     assert_eq!(batch[1].0, 1);
     assert_eq!(batch[0].1.data.len(), 4 * std::mem::size_of::<i32>());
+}
+
+#[test]
+fn stale_hnsw_artifact_does_not_make_base_segment_unreadable() {
+    use std::io::{Read, Seek, SeekFrom, Write};
+
+    let temp_dir = TempDir::new().unwrap();
+    let file_path = temp_dir.path().join("stale-hnsw.seg");
+    let schema = Arc::new(
+        TabletSchema::new(
+            1,
+            vec![
+                TabletColumn::key(0, "id", LogicalType::Integer),
+                TabletColumn::new(
+                    1,
+                    "embedding",
+                    LogicalType::Array(Box::new(LogicalType::Float), 2),
+                )
+                .with_hnsw_index(8, 32, 0),
+            ],
+            KeysType::PrimaryKeys,
+        )
+        .unwrap(),
+    );
+    let options = SegmentWriterOptions::new(0)
+        .with_compression(CompressionType::None)
+        .with_hnsw_index(1, HnswConfig::new(8, 32), DistanceMetric::Euclidean);
+    let mut writer = SegmentWriter::create(schema.clone(), &file_path, options).unwrap();
+    let ids = (0_i32..4).flat_map(i32::to_le_bytes).collect::<Vec<_>>();
+    let vectors = [
+        [0.0_f32, 0.0_f32],
+        [1.0_f32, 1.0_f32],
+        [2.0_f32, 2.0_f32],
+        [3.0_f32, 3.0_f32],
+    ]
+    .into_iter()
+    .flatten()
+    .flat_map(f32::to_le_bytes)
+    .collect::<Vec<_>>();
+    writer
+        .append_chunk(&[ColumnData::new(ids, 4), ColumnData::new(vectors, 4)])
+        .unwrap();
+    let written = writer.finalize().unwrap();
+    let pointer = written
+        .get_column_meta(1)
+        .and_then(|meta| meta.hnsw_index_pointer)
+        .expect("inline HNSW page");
+    drop(written);
+
+    // Re-sign the page after changing only the HNSW envelope version. This
+    // models a valid artifact produced by an older binary rather than disk
+    // corruption (which must remain a hard error at capability open).
+    let mut file = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(&file_path)
+        .unwrap();
+    file.seek(SeekFrom::Start(pointer.offset)).unwrap();
+    let mut page = vec![0u8; pointer.size as usize];
+    file.read_exact(&mut page).unwrap();
+    page[4..8].copy_from_slice(&1_u32.to_le_bytes());
+    let checksum = crc32c::crc32c(&page[..page.len() - 4]);
+    let checksum_offset = page.len() - 4;
+    page[checksum_offset..].copy_from_slice(&checksum.to_le_bytes());
+    file.seek(SeekFrom::Start(pointer.offset)).unwrap();
+    file.write_all(&page).unwrap();
+    file.sync_all().unwrap();
+    drop(file);
+
+    let reopened = Segment::open(0, &file_path, schema, SegmentOptions::default(), 1, 1, 1)
+        .expect("stale search artifact must not fail segment open");
+    let rows = reopened.read_by_rowids(&[0], &[0, 3]).unwrap();
+    assert_eq!(
+        rows[0].1.data.len(),
+        2 * std::mem::size_of::<i32>(),
+        "ordinary base-column reads remain usable"
+    );
+    assert!(reopened.has_hnsw_artifact(1));
+    assert!(!reopened
+        .hnsw_artifact_matches_contract(
+            1,
+            &HnswConfig::new(8, 32).build_contract(DistanceMetric::Euclidean),
+        )
+        .unwrap());
+    assert!(reopened.open_hnsw_index(1).unwrap().is_none());
+    assert!(reopened
+        .hnsw_rebuild_reason(1)
+        .expect("stale artifact reason")
+        .contains("rebuild the vector index"));
+}
+
+#[test]
+fn inline_hnsw_opens_from_mmap_without_page_cache_admission() {
+    let temp_dir = TempDir::new().unwrap();
+    let file_path = temp_dir.path().join("mmap-hnsw.seg");
+    let schema = Arc::new(
+        TabletSchema::new(
+            1,
+            vec![
+                TabletColumn::key(0, "id", LogicalType::Integer),
+                TabletColumn::new(
+                    1,
+                    "embedding",
+                    LogicalType::Array(Box::new(LogicalType::Float), 2),
+                )
+                .with_hnsw_index(8, 32, 0),
+            ],
+            KeysType::PrimaryKeys,
+        )
+        .unwrap(),
+    );
+    let options = SegmentWriterOptions::new(0)
+        .with_compression(CompressionType::Lz4)
+        .with_hnsw_index(1, HnswConfig::new(8, 32), DistanceMetric::Euclidean);
+    let mut writer = SegmentWriter::create(schema.clone(), &file_path, options).unwrap();
+    let ids = (0_i32..32).flat_map(i32::to_le_bytes).collect::<Vec<_>>();
+    let vectors = (0_i32..32)
+        .flat_map(|value| [value as f32, -(value as f32)])
+        .flat_map(f32::to_le_bytes)
+        .collect::<Vec<_>>();
+    writer
+        .append_chunk(&[ColumnData::new(ids, 32), ColumnData::new(vectors, 32)])
+        .unwrap();
+    let written = writer.finalize().unwrap();
+    let pointer = written
+        .get_column_meta(1)
+        .and_then(|meta| meta.hnsw_index_pointer)
+        .expect("inline HNSW page");
+    assert_eq!(
+        pointer.offset % crate::index::hnsw::HNSW_ARTIFACT_ALIGNMENT as u64,
+        0,
+        "mmap HNSW envelope must preserve typed-region alignment"
+    );
+    drop(written);
+
+    // A one-byte cache cannot admit even the page envelope. Successful open
+    // proves the immutable artifact uses the mmap path instead.
+    let pool = BufferPool::new_arc(1);
+    let cache = Arc::new(PageCache::new(Arc::clone(&pool)));
+    let segment = Segment::open(
+        0,
+        &file_path,
+        schema,
+        SegmentOptions::default().with_page_cache(cache),
+        1,
+        1,
+        1,
+    )
+    .unwrap();
+    let index = segment
+        .open_hnsw_index(1)
+        .unwrap()
+        .expect("current mmap HNSW artifact");
+    assert!(segment
+        .hnsw_artifact_matches_contract(
+            1,
+            &HnswConfig::new(8, 32).build_contract(DistanceMetric::Euclidean),
+        )
+        .unwrap());
+    assert_eq!(index.graph.links.num_points(), 32);
+    assert_eq!(pool.get_tag_usage(MemoryTag::PageCache), 0);
+}
+
+#[test]
+fn plain_vector_page_view_is_structural_and_bypasses_page_cache() {
+    let temp_dir = TempDir::new().unwrap();
+    let file_path = temp_dir.path().join("mmap-vector-pages.seg");
+    let schema = Arc::new(
+        TabletSchema::new(
+            1,
+            vec![
+                TabletColumn::key(0, "id", LogicalType::Integer),
+                TabletColumn::new(
+                    1,
+                    "embedding",
+                    LogicalType::Array(Box::new(LogicalType::Float), 2),
+                ),
+            ],
+            KeysType::PrimaryKeys,
+        )
+        .unwrap(),
+    );
+    let options = SegmentWriterOptions::new(0)
+        .with_compression(CompressionType::None)
+        .with_page_size(4 * 2 * std::mem::size_of::<f32>());
+    let mut writer = SegmentWriter::create(schema.clone(), &file_path, options).unwrap();
+    let ids = (0_i32..12).flat_map(i32::to_le_bytes).collect::<Vec<_>>();
+    let vectors = (0_i32..12)
+        .flat_map(|value| [value as f32, -(value as f32)])
+        .flat_map(f32::to_le_bytes)
+        .collect::<Vec<_>>();
+    writer
+        .append_chunk(&[ColumnData::new(ids, 12), ColumnData::new(vectors, 12)])
+        .unwrap();
+    writer.finalize().unwrap();
+
+    let pool = BufferPool::new_arc(1);
+    let cache = Arc::new(PageCache::new(Arc::clone(&pool)));
+    let segment = Segment::open(
+        0,
+        &file_path,
+        schema,
+        SegmentOptions::default().with_page_cache(cache),
+        1,
+        1,
+        1,
+    )
+    .unwrap();
+    let first = segment
+        .open_plain_vector_storage(1, 2)
+        .unwrap()
+        .expect("plain vector mmap view");
+    let second = segment
+        .open_plain_vector_storage(1, 2)
+        .unwrap()
+        .expect("cached plain vector mmap view");
+    assert!(Arc::ptr_eq(&first, &second));
+    assert_eq!(first.num_vectors(), 12);
+    assert_eq!(first.get_vector(7), &[7.0, -7.0]);
+    assert_eq!(pool.get_tag_usage(MemoryTag::PageCache), 0);
+
+    let runtime = segment.runtime_view(SegmentOptions::default());
+    let runtime_storage = runtime
+        .open_plain_vector_storage(1, 2)
+        .unwrap()
+        .expect("runtime view shares structural mapping");
+    assert!(Arc::ptr_eq(&first, &runtime_storage));
 }
 
 #[test]
@@ -849,7 +1079,7 @@ fn segment_bitmap_predicate_skips_late_materialize_even_with_explicit_columns() 
 }
 
 #[test]
-fn segment_bitmap_range_predicate_verifies_rows_after_index_pruning() {
+fn segment_bitmap_range_predicate_is_an_exact_row_selection() {
     let temp_dir = TempDir::new().unwrap();
     let file_path = temp_dir.path().join("bitmap_range_predicate.seg");
     let schema = create_int_schema();
@@ -910,7 +1140,10 @@ fn segment_bitmap_range_predicate_verifies_rows_after_index_pruning() {
         .unwrap();
 
     assert!(iter.uses_late_materialize());
-    assert!(matches!(iter.evaluated_selection, PredicateResult::Unknown));
+    let PredicateResult::Bitmap(selection) = &iter.evaluated_selection else {
+        panic!("bitmap range predicate must produce an exact row selection");
+    };
+    assert_eq!(selection.len(), 1_800);
 
     let mut matched_rowids = Vec::new();
     let mut matched_values = Vec::new();
@@ -999,6 +1232,7 @@ fn segment_runtime_art_predicate_switches_between_bitmap_and_fallback() {
 
     RuntimeIndexes::rebuild_art_index_for_segment(&segment, 0).unwrap();
     assert!(segment.art_index(0).is_some());
+    assert!(segment.bitmap_index(0).is_none());
 
     let mut art_iter =
         SegmentIterator::new_with_delete_vector_predicate_and_prefetcher_late_materialize(
@@ -1023,6 +1257,7 @@ fn segment_runtime_art_predicate_switches_between_bitmap_and_fallback() {
 
     segment.drop_art_index(0);
     assert!(segment.art_index(0).is_none());
+    assert!(segment.bitmap_index(0).is_none());
 
     let removed_iter =
         SegmentIterator::new_with_delete_vector_predicate_and_prefetcher_late_materialize(

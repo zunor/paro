@@ -20,6 +20,12 @@ impl<'a> CatalogReplayHandler<'a> {
         payload: &CreateIndexPayload,
         commit_id: u64,
     ) -> paro_common::error::Result<()> {
+        let provider_config =
+            serde_json::from_str(&payload.provider_config_json).map_err(|err| {
+                paro_common::error::serialization_error(format!(
+                    "CREATE INDEX WAL provider_config is invalid JSON: {err}"
+                ))
+            })?;
         let schema = self.ensure_schema(schema_name, commit_id)?;
 
         let table_entry = match schema.get_table(
@@ -93,7 +99,8 @@ impl<'a> CatalogReplayHandler<'a> {
         )
         .with_catalog(self.catalog.name().to_string())
         .with_index_type(index_type)
-        .with_build_state(build_state);
+        .with_build_state(build_state)
+        .with_provider_config(provider_config);
         if index_type == IndexType::FullText {
             let column_id = payload
                 .column_ids

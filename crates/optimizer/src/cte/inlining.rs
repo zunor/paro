@@ -104,7 +104,20 @@ fn ends_in_aggregate_or_distinct(op: &LogicalOperator) -> bool {
     ends_in_aggregate_or_distinct(&children[0].operator)
 }
 
-fn projection_for_cte_ref(table_index: usize, definition: LogicalPlan) -> LogicalOperator {
+fn projection_for_cte_ref(
+    table_index: usize,
+    relation_alias: String,
+    column_names: Vec<String>,
+    mut definition: LogicalPlan,
+) -> LogicalOperator {
+    // A direct VALUES definition remains the physical producer after filter
+    // pushdown crosses this reference boundary. Attach the CTE reference's
+    // identity to that producer so it cannot fall back to generated colN
+    // names when the wrapper projection moves above the filter.
+    if let LogicalOperator::ExpressionGet(values) = &mut definition.operator {
+        values.names.clone_from(&column_names);
+        values.relation_alias = Some(relation_alias.clone());
+    }
     let bindings = definition.get_column_bindings();
     let types = definition.types();
     let expressions = bindings
@@ -112,7 +125,11 @@ fn projection_for_cte_ref(table_index: usize, definition: LogicalPlan) -> Logica
         .zip(types)
         .map(|(binding, ty)| Expression::ColumnRef(ColumnRefExpression::new(binding, ty)))
         .collect();
-    LogicalOperator::Projection(Projection::new(table_index, definition, expressions))
+    LogicalOperator::Projection(
+        Projection::new(table_index, definition, expressions)
+            .with_visible_names(column_names)
+            .with_visible_qualifier(relation_alias),
+    )
 }
 
 fn inline_single_reference(
@@ -124,6 +141,8 @@ fn inline_single_reference(
         if cte_ref.cte_index == cte_index {
             let replacement = projection_for_cte_ref(
                 cte_ref.table_index,
+                cte_ref.relation_alias.clone(),
+                cte_ref.column_names.clone(),
                 definition
                     .take()
                     .expect("single-reference CTE inlining must have a definition"),
@@ -154,7 +173,12 @@ fn inline_copied_references(
     if let LogicalOperator::CTERef(cte_ref) = op {
         if cte_ref.cte_index == cte_index {
             let copied = deep_copy_plan(definition, bind_context.shared().as_ref());
-            *op = projection_for_cte_ref(cte_ref.table_index, copied);
+            *op = projection_for_cte_ref(
+                cte_ref.table_index,
+                cte_ref.relation_alias.clone(),
+                cte_ref.column_names.clone(),
+                copied,
+            );
             return 1;
         }
     }
@@ -207,6 +231,7 @@ mod tests {
             LogicalOperator::CTERef(CTERef::new(
                 cte_index,
                 table_index,
+                "cte".to_string(),
                 vec!["v".to_string()],
                 vec![LogicalType::Integer],
             )),
@@ -237,6 +262,7 @@ mod tests {
 
         let optimized = CTEInlining::new(&bind_context).optimize_plan(LogicalPlan::synthetic(plan));
         verify_logical_plan(&bind_context, &optimized).expect("plan should verify after inlining");
+        assert_eq!(optimized.operator.output_names(), ["v"]);
         assert!(!matches!(
             optimized.operator,
             LogicalOperator::MaterializedCTE(_)

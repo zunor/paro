@@ -10,17 +10,8 @@ use paro_catalog::entry::{
 use paro_common::effect::{DeferredTask, PostCommitHookDescriptor, RuntimeTransitionDescriptor};
 use paro_common::error::{self as paro_error, Result};
 use paro_common::logging::targets;
-use paro_common::types::LogicalType;
 use paro_storage::metrics::storage_metrics;
 use paro_storage::search::{SearchFreshnessPolicy, SearchIndexDefinition, SearchIndexKind};
-use serde_json::{json, Value};
-
-fn vector_dimension(logical_type: &LogicalType) -> u64 {
-    match logical_type {
-        LogicalType::Array(_, dimension) => *dimension as u64,
-        _ => 0,
-    }
-}
 
 pub struct PostCommitActions;
 
@@ -254,7 +245,7 @@ impl PostCommitActions {
                     "ART indexes currently require exactly one column",
                 ));
             };
-            storage.rebuild_art_index(column_id.index)?;
+            storage.install_art_index(&action.info.name, column_id.index)?;
         }
 
         Self::register_search_definition_from_entry(storage.as_ref(), action.entry.as_ref())?;
@@ -302,12 +293,7 @@ impl PostCommitActions {
                         "ART indexes currently require exactly one column",
                     ));
                 };
-                storage.declare_art_index(*column_id);
-                if let Err(err) = storage.rebuild_art_index(*column_id) {
-                    storage.forget_art_index(*column_id);
-                    let _ = storage.drop_art_index(*column_id);
-                    return Err(err);
-                }
+                storage.install_art_index(&index.name, *column_id)?;
                 return Ok(());
             }
 
@@ -384,8 +370,7 @@ impl PostCommitActions {
         match CatalogIndexType::from_str(index_type) {
             CatalogIndexType::ART => {
                 for column_id in column_ids {
-                    storage.forget_art_index(*column_id);
-                    let _ = storage.drop_art_index(*column_id);
+                    let _ = storage.release_art_index(index_name, *column_id);
                 }
             }
             CatalogIndexType::HNSW => {
@@ -443,7 +428,7 @@ impl PostCommitActions {
                 .collect(),
             expression: Self::search_expression(entry),
             freshness_policy: SearchFreshnessPolicy::default_for_kind(kind),
-            provider_config: Self::search_provider_config(storage, entry)?,
+            provider_config: entry.provider_config.clone(),
             config_fingerprint: 0,
         };
         let expression = definition.expression.clone();
@@ -451,15 +436,15 @@ impl PostCommitActions {
         let column_ids = definition.column_ids.clone();
         let kind = definition.kind;
         let definition = SearchIndexDefinition {
-            config_fingerprint: SearchIndexDefinition::compute_config_fingerprint(
+            config_fingerprint: SearchIndexDefinition::try_compute_config_fingerprint(
                 kind,
                 &column_ids,
                 expression.as_deref(),
                 &provider_config,
-            ),
+            )?,
             ..definition
         };
-        storage.register_search_definition(definition)
+        storage.register_published_search_definition(definition)
     }
 
     fn search_kind(index_type: CatalogIndexType) -> Option<SearchIndexKind> {
@@ -480,45 +465,5 @@ impl PostCommitActions {
             "to_tsvector('{}', col_{})",
             binding.config, binding.column_id.index
         ))
-    }
-
-    fn search_provider_config(
-        storage: &paro_storage::table::table_handle::TableHandle,
-        entry: &IndexCatalogEntry,
-    ) -> Result<Value> {
-        match entry.index_type {
-            CatalogIndexType::HNSW => {
-                let [column] = entry.get_column_ids() else {
-                    return Err(paro_error::not_supported(
-                        "HNSW search definition requires exactly one indexed column",
-                    ));
-                };
-                let schema = storage
-                    .tablet()
-                    .schema()
-                    .ok_or_else(|| paro_error::internal("table schema missing for HNSW config"))?;
-                let column = schema.column_by_id(column.index).ok_or_else(|| {
-                    paro_error::column_not_found(format!(
-                        "HNSW index column {} not found in schema",
-                        column.index
-                    ))
-                })?;
-                Ok(json!({
-                    "m": column.hnsw_m,
-                    "ef_construct": column.hnsw_ef_construct,
-                    "distance": column.hnsw_distance,
-                    "dimension": vector_dimension(&column.logical_type),
-                }))
-            }
-            CatalogIndexType::Sparse => Ok(json!({ "physical_encoding": "binary-v1" })),
-            CatalogIndexType::FullText => {
-                let config = entry
-                    .fulltext_binding()
-                    .map(|binding| binding.config.clone())
-                    .unwrap_or_else(|| "simple".to_string());
-                Ok(json!({ "config": config }))
-            }
-            _ => Ok(json!({})),
-        }
     }
 }

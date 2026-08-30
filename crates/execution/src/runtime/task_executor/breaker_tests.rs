@@ -163,7 +163,7 @@ fn topn_breaker_graph(input_rows: Vec<Vec<Expression>>, limit: usize) -> Pipelin
         orders: vec![order_by_ref(0, LogicalType::Integer)].into_boxed_slice(),
         limit,
         offset: 0,
-        hnsw_ef_hint: None,
+        hnsw_options: Default::default(),
         output_names: Box::new(["v".to_string()]),
         output_types: Box::new([LogicalType::Integer]),
     };

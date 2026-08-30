@@ -19,10 +19,81 @@ use crate::index::bound_index::BoundIndex;
 use crate::index::predicate::{compare_bytes, value_to_bytes, Predicate};
 use crate::index::predicate_result::PredicateResult;
 use crate::index::{
-    ColumnId, Index, IndexAppendInfo, IndexBufferInfo, IndexConstraintType, IndexStorageInfo,
+    ColumnId, ExactOrdinalPosting, ExactRowSet, ExactScalarKey, Index, IndexAppendInfo,
+    IndexBufferInfo, IndexConstraintType, IndexStorageInfo, OrdinalRowSet,
 };
 
 use super::{BitmapIndexReader, BitmapIndexWriter};
+
+#[derive(Debug)]
+struct AcceptedOrdinals {
+    words: Vec<u64>,
+    len: usize,
+}
+
+impl AcceptedOrdinals {
+    fn new(len: usize) -> Self {
+        Self {
+            words: vec![0; len.div_ceil(64)],
+            len,
+        }
+    }
+
+    fn insert(&mut self, ordinal: usize) {
+        if ordinal < self.len {
+            self.words[ordinal / 64] |= 1_u64 << (ordinal % 64);
+        }
+    }
+
+    fn remove(&mut self, ordinal: usize) {
+        if ordinal < self.len {
+            self.words[ordinal / 64] &= !(1_u64 << (ordinal % 64));
+        }
+    }
+
+    fn insert_range(&mut self, start: usize, end: usize) {
+        let start = start.min(self.len);
+        let end = end.min(self.len);
+        if start >= end {
+            return;
+        }
+        let first_word = start / 64;
+        let last_word = (end - 1) / 64;
+        for word_index in first_word..=last_word {
+            let word_start = word_index * 64;
+            let first_bit = start.saturating_sub(word_start).min(64);
+            let last_bit = end.saturating_sub(word_start).min(64);
+            let below_last = if last_bit == 64 {
+                u64::MAX
+            } else {
+                (1_u64 << last_bit) - 1
+            };
+            self.words[word_index] |= below_last & (u64::MAX << first_bit);
+        }
+    }
+
+    fn iter(&self) -> impl Iterator<Item = usize> + '_ {
+        self.words
+            .iter()
+            .copied()
+            .enumerate()
+            .flat_map(move |(word_index, mut word)| {
+                std::iter::from_fn(move || {
+                    if word == 0 {
+                        return None;
+                    }
+                    let bit = word.trailing_zeros() as usize;
+                    word &= word - 1;
+                    let ordinal = word_index * 64 + bit;
+                    (ordinal < self.len).then_some(ordinal)
+                })
+            })
+    }
+
+    fn into_words(self) -> Box<[u64]> {
+        self.words.into_boxed_slice()
+    }
+}
 
 /// Bound Bitmap index.
 pub struct BitmapIndex {
@@ -31,6 +102,14 @@ pub struct BitmapIndex {
     column_ids: Vec<ColumnId>,
     logical_types: Vec<LogicalType>,
     reader: BitmapIndexReader,
+    /// Physical bitmap ordinals sorted by SQL scalar semantics. The durable
+    /// bitmap dictionary is byte-keyed for equality lookup; integer and other
+    /// fixed-width encodings are not lexicographically ordered, so range
+    /// predicates must use this typed access path rather than byte order.
+    ordered_ordinals: Box<[usize]>,
+    /// Complete immutable posting catalog shared by every query-compiled
+    /// ordinal selection. Queries own only their accepted-ordinal bit set.
+    posting_catalog: Arc<[ExactOrdinalPosting]>,
     index_data: Bytes,
 }
 
@@ -47,12 +126,70 @@ impl BitmapIndex {
         index_data: Bytes,
     ) -> Result<Self> {
         let reader = BitmapIndexReader::from_bytes(&index_data)?;
+        let logical_type = logical_types.first().ok_or_else(|| {
+            paro_error::invalid_input("bitmap index requires one logical column type")
+        })?;
+        let mut ordered_ordinals = (0..reader.num_values()).collect::<Vec<_>>();
+        let sort_error = std::cell::RefCell::new(None);
+        ordered_ordinals.sort_by(|&left, &right| {
+            let left = reader
+                .get_dict_value(left)
+                .expect("bitmap dictionary ordinal validated");
+            let right = reader
+                .get_dict_value(right)
+                .expect("bitmap dictionary ordinal validated");
+            match compare_bytes(logical_type, left, right) {
+                Ok(ordering) => ordering,
+                Err(error) => {
+                    let mut first_error = sort_error.borrow_mut();
+                    if first_error.is_none() {
+                        *first_error = Some(error);
+                    }
+                    std::cmp::Ordering::Equal
+                }
+            }
+        });
+        if let Some(error) = sort_error.into_inner() {
+            return Err(error.context("sort bitmap dictionary by SQL scalar semantics"));
+        }
+        let mut posting_catalog = Vec::with_capacity(
+            reader
+                .num_values()
+                .saturating_add(usize::from(reader.has_null())),
+        );
+        for ordinal in 0..reader.num_values() {
+            posting_catalog.push(ExactOrdinalPosting::from_index(
+                u16::try_from(ordinal).map_err(|_| {
+                    paro_error::configuration_limit_exceeded(
+                        "bitmap dictionary exceeds exact ordinal width",
+                    )
+                })?,
+                ExactScalarKey::Value(
+                    reader
+                        .get_dict_value(ordinal)
+                        .expect("bitmap dictionary ordinal validated")
+                        .clone(),
+                ),
+                reader
+                    .bitmap(ordinal)
+                    .expect("bitmap posting ordinal validated"),
+            ));
+        }
+        if let Some(posting) = reader.null_bitmap() {
+            posting_catalog.push(ExactOrdinalPosting::from_index(
+                u16::MAX,
+                ExactScalarKey::Null,
+                posting,
+            ));
+        }
         Ok(Self {
             name: name.into(),
             constraint_type,
             column_ids,
             logical_types,
             reader,
+            ordered_ordinals: ordered_ordinals.into_boxed_slice(),
+            posting_catalog: Arc::from(posting_catalog),
             index_data,
         })
     }
@@ -73,6 +210,13 @@ impl BitmapIndex {
         self.logical_types.first()
     }
 
+    /// Durable cardinality covered by the posting dictionary. A segment
+    /// loader must compare this with its footer before the index can be used
+    /// as an exact predicate proof.
+    pub fn indexed_row_count(&self) -> u64 {
+        u64::from(self.reader.row_count())
+    }
+
     fn storage_info_with_data(&self) -> IndexStorageInfo {
         let mut info = IndexStorageInfo::new(&self.name);
         if !self.index_data.is_empty() {
@@ -82,6 +226,134 @@ impl BitmapIndex {
             }]);
         }
         info
+    }
+
+    fn seek_ordered_dictionary(&self, value: &[u8]) -> Option<(usize, bool)> {
+        let logical_type = self.logical_type()?;
+        let mut left = 0usize;
+        let mut right = self.ordered_ordinals.len();
+        while left < right {
+            let middle = left + (right - left) / 2;
+            let ordinal = self.ordered_ordinals[middle];
+            let candidate = self.reader.get_dict_value(ordinal)?;
+            match compare_bytes(logical_type, candidate, value).ok()? {
+                std::cmp::Ordering::Less => left = middle + 1,
+                std::cmp::Ordering::Equal | std::cmp::Ordering::Greater => right = middle,
+            }
+        }
+        let exact = self
+            .ordered_ordinals
+            .get(left)
+            .and_then(|&ordinal| self.reader.get_dict_value(ordinal))
+            .and_then(|candidate| compare_bytes(logical_type, candidate, value).ok())
+            == Some(std::cmp::Ordering::Equal);
+        Some((left, exact))
+    }
+
+    fn insert_ordered_range(&self, accepted: &mut AcceptedOrdinals, start: usize, end: usize) {
+        for &ordinal in &self.ordered_ordinals
+            [start.min(self.ordered_ordinals.len())..end.min(self.ordered_ordinals.len())]
+        {
+            accepted.insert(ordinal);
+        }
+    }
+
+    fn matching_ordinals(&self, predicate: &Predicate) -> Option<(AcceptedOrdinals, bool)> {
+        if self.column_ids.len() != 1 || predicate.index_column_id() != Some(self.column_ids[0]) {
+            return None;
+        }
+        let logical_type = self.logical_type()?;
+        let mut accepted = AcceptedOrdinals::new(self.reader.num_values());
+        let mut accepts_null = false;
+
+        match predicate {
+            Predicate::Eq { value, .. } => {
+                let bytes = value_to_bytes(value, logical_type).ok()?;
+                let (ordinal, exact) = self.reader.seek_dictionary(&bytes);
+                if exact {
+                    accepted.insert(ordinal);
+                }
+            }
+            Predicate::NotEq { value, .. } => {
+                let bytes = value_to_bytes(value, logical_type).ok()?;
+                accepted.insert_range(0, self.reader.num_values());
+                let (ordinal, exact) = self.reader.seek_dictionary(&bytes);
+                if exact {
+                    accepted.remove(ordinal);
+                }
+            }
+            Predicate::Lt { value, .. } => {
+                let bytes = value_to_bytes(value, logical_type).ok()?;
+                let (end, _) = self.seek_ordered_dictionary(&bytes)?;
+                self.insert_ordered_range(&mut accepted, 0, end);
+            }
+            Predicate::Le { value, .. } => {
+                let bytes = value_to_bytes(value, logical_type).ok()?;
+                let (end, exact) = self.seek_ordered_dictionary(&bytes)?;
+                self.insert_ordered_range(&mut accepted, 0, end + usize::from(exact));
+            }
+            Predicate::Gt { value, .. } => {
+                let bytes = value_to_bytes(value, logical_type).ok()?;
+                let (start, exact) = self.seek_ordered_dictionary(&bytes)?;
+                self.insert_ordered_range(
+                    &mut accepted,
+                    start + usize::from(exact),
+                    self.reader.num_values(),
+                );
+            }
+            Predicate::Ge { value, .. } => {
+                let bytes = value_to_bytes(value, logical_type).ok()?;
+                let (start, _) = self.seek_ordered_dictionary(&bytes)?;
+                self.insert_ordered_range(&mut accepted, start, self.reader.num_values());
+            }
+            Predicate::In { values, .. } => {
+                for value in values {
+                    let bytes = value_to_bytes(value, logical_type).ok()?;
+                    let (ordinal, exact) = self.reader.seek_dictionary(&bytes);
+                    if exact {
+                        accepted.insert(ordinal);
+                    }
+                }
+            }
+            Predicate::Range { lower, upper, .. } => {
+                let lower = value_to_bytes(lower, logical_type).ok()?;
+                let upper = value_to_bytes(upper, logical_type).ok()?;
+                let (start, _) = self.seek_ordered_dictionary(&lower)?;
+                let (end, exact) = self.seek_ordered_dictionary(&upper)?;
+                self.insert_ordered_range(&mut accepted, start, end + usize::from(exact));
+            }
+            Predicate::IsNull { .. } => accepts_null = true,
+            Predicate::IsNotNull { .. } => {
+                accepted.insert_range(0, self.reader.num_values());
+            }
+            Predicate::FixedIn { .. }
+            | Predicate::StringPrefix { .. }
+            | Predicate::StringPrefixIn { .. }
+            | Predicate::StringLike { .. }
+            | Predicate::ColumnComparison { .. } => return None,
+        }
+        Some((accepted, accepts_null))
+    }
+
+    fn compile_ordinal_row_set(&self, predicate: &Predicate) -> Option<Arc<dyn ExactRowSet>> {
+        let row_ordinals = self.reader.row_ordinals()?;
+        let (accepted, accepts_null) = self.matching_ordinals(predicate)?;
+        let mut cardinality = if accepts_null {
+            self.reader.null_cardinality()
+        } else {
+            0
+        };
+        for ordinal in accepted.iter() {
+            cardinality = cardinality.saturating_add(self.reader.bitmap_cardinality(ordinal)?);
+        }
+        Some(Arc::new(OrdinalRowSet::new_shared(
+            self.column_ids[0],
+            row_ordinals,
+            accepted.into_words(),
+            accepts_null,
+            cardinality,
+            Arc::clone(&self.posting_catalog),
+        )))
     }
 
     fn evaluate_eq(&self, value: &Value) -> PredicateResult {
@@ -400,7 +672,9 @@ impl BoundIndex for BitmapIndex {
     fn vacuum(&self) {}
 
     fn get_in_memory_size(&self) -> usize {
-        self.index_data.len()
+        self.index_data
+            .len()
+            .saturating_add(self.reader.mem_usage())
     }
 
     fn serialize_to_disk(&self) -> Result<IndexStorageInfo> {
@@ -432,6 +706,10 @@ impl BoundIndex for BitmapIndex {
             | Predicate::StringLike { .. }
             | Predicate::ColumnComparison { .. } => PredicateResult::Unknown,
         }
+    }
+
+    fn compile_exact_row_set(&self, predicate: &Predicate) -> Option<Arc<dyn ExactRowSet>> {
+        self.compile_ordinal_row_set(predicate)
     }
 }
 
@@ -491,5 +769,42 @@ mod tests {
             }
             _ => panic!("expected bitmap"),
         }
+    }
+
+    #[test]
+    fn integer_range_compiles_exact_ordinal_membership() {
+        let mut writer = BitmapIndexWriter::new();
+        // Little-endian byte order differs from SQL integer order for both
+        // negative values and values crossing a byte boundary.
+        for value in [0_i32, 256, -1, 2, 1] {
+            writer.add_value(&value.to_le_bytes());
+        }
+        writer.add_nulls(1);
+        let index = BitmapIndex::from_writer(
+            "bm",
+            IndexConstraintType::None,
+            vec![0],
+            vec![LogicalType::Integer],
+            &writer,
+        )
+        .unwrap();
+        let row_set = index
+            .compile_ordinal_row_set(&Predicate::Lt {
+                column_id: 0,
+                value: Value::Integer(2),
+            })
+            .expect("low-cardinality range should compile");
+
+        assert_eq!(row_set.len(), 3);
+        assert!(row_set.contains(0));
+        assert!(row_set.contains(2));
+        assert!(row_set.contains(4));
+        assert!(!row_set.contains(1));
+        assert!(!row_set.contains(3));
+        assert!(!row_set.contains(5));
+        assert_eq!(
+            row_set.materialize(),
+            RoaringBitmap::from_iter([0_u32, 2, 4])
+        );
     }
 }

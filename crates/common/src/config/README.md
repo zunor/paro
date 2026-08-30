@@ -64,7 +64,7 @@ host = "0.0.0.0"          # Listen address
 port = 6432               # Listen port
 max_connections = 0       # 0 = unlimited
 allow_plaintext = false   # Require an explicit override before ignoring [server.tls]
-# copy_stdin_memory_limit = "256MiB"  # Optional COPY FROM STDIN buffer cap
+# copy_stdin_inflight_memory_limit = "256MiB"  # In-flight COPY FROM STDIN memory waterline
 
 [server.tls]              # Optional TLS (not yet implemented)
 cert = "/path/to/cert.pem"
@@ -77,7 +77,7 @@ key = "/path/to/key.pem"
 | `port` | u16 | 6432 | Listen port |
 | `max_connections` | usize | 0 | Max connections (0 = unlimited) |
 | `allow_plaintext` | bool | false | Permit plaintext startup when `tls` is configured but unsupported |
-| `copy_stdin_memory_limit` | Option<String/usize> | auto | COPY FROM STDIN buffer cap; defaults to `min(cluster.max_memory / 4, 1GiB)` |
+| `copy_stdin_inflight_memory_limit` | Option<String/usize> | auto | In-flight COPY FROM STDIN memory waterline; total statement input is unbounded and defaults to `min(cluster.max_memory / 4, 1GiB)` |
 | `tls` | Option | None | TLS configuration |
 
 ---

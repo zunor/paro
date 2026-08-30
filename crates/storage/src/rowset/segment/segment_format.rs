@@ -4,7 +4,7 @@
 use crate::index::short_key::ShortKeyFooter;
 use crate::rowset::encoding::FieldType;
 use crate::rowset::page::{CompressionType, EncodingType, PagePointer};
-use crate::statistics::ColumnStatistics;
+use crate::statistics::{ColumnStatistics, HnswIndexStatistics};
 use crate::tablet::ColumnId;
 use paro_common::error::{self as paro_error, Result};
 use paro_common::types::LogicalType;
@@ -34,6 +34,8 @@ pub struct ColumnMeta {
     pub bitmap_index_pointer: Option<PagePointer>,
     /// HNSW index pointer (optional)
     pub hnsw_index_pointer: Option<PagePointer>,
+    /// Small durable HNSW summary used without materializing the graph.
+    pub hnsw_index_statistics: Option<HnswIndexStatistics>,
     /// Sparse index pointer (optional)
     pub sparse_index_pointer: Option<PagePointer>,
     /// Full-text index pointer (optional)
@@ -65,6 +67,7 @@ impl ColumnMeta {
             bloom_filter_pointer: None,
             bitmap_index_pointer: None,
             hnsw_index_pointer: None,
+            hnsw_index_statistics: None,
             sparse_index_pointer: None,
             fulltext_index_pointer: None,
             field_type,
@@ -131,6 +134,13 @@ impl ColumnMeta {
                 .expect("serialize column stats");
             buf.extend_from_slice(&(stats_buf.len() as u32).to_le_bytes());
             buf.extend_from_slice(&stats_buf);
+        } else {
+            buf.push(0);
+        }
+
+        if let Some(stats) = &self.hnsw_index_statistics {
+            buf.push(1);
+            buf.extend_from_slice(&stats.to_bytes());
         } else {
             buf.push(0);
         }
@@ -228,7 +238,12 @@ impl ColumnMeta {
         let total_mem_footprint = u64::from_le_bytes(data[offset..offset + 8].try_into().unwrap());
         offset += 8;
 
-        let (column_stats, null_count) = if offset < data.len() && data[offset] != 0 {
+        if offset >= data.len() {
+            return Err(paro_error::data_corrupted(
+                "ColumnMeta: missing column statistics flag",
+            ));
+        }
+        let (column_stats, null_count) = if data[offset] != 0 {
             offset += 1;
 
             if offset + 8 > data.len() {
@@ -272,10 +287,43 @@ impl ColumnMeta {
             }
             let mut stats_cursor = std::io::Cursor::new(&data[offset..offset + stats_len]);
             let stats = ColumnStatistics::deserialize(&mut stats_cursor, logical_type)?;
+            offset += stats_len;
             (Some(stats), Some(null_count))
         } else {
+            offset += 1;
             (None, None)
         };
+
+        // HNSW graph summaries live in the footer so metadata/planning never
+        // has to read or decompress the graph page. Absence is accepted only
+        // for a pre-summary footer, which remains useful for rebuilding an
+        // unsupported search artifact without making base rows unreadable.
+        let hnsw_index_statistics = if offset == data.len() {
+            None
+        } else {
+            let has_stats = data[offset] != 0;
+            offset += 1;
+            if has_stats {
+                let end = offset
+                    .checked_add(HnswIndexStatistics::BYTE_LEN)
+                    .ok_or_else(|| {
+                        paro_error::data_corrupted("ColumnMeta: HNSW statistics overflow")
+                    })?;
+                let bytes = data.get(offset..end).ok_or_else(|| {
+                    paro_error::data_corrupted("ColumnMeta: HNSW statistics truncated")
+                })?;
+                offset = end;
+                Some(HnswIndexStatistics::from_bytes(bytes)?)
+            } else {
+                None
+            }
+        };
+        if offset != data.len() {
+            return Err(paro_error::data_corrupted(format!(
+                "ColumnMeta: {} unexpected trailing bytes",
+                data.len() - offset
+            )));
+        }
 
         Ok(Self {
             column_id,
@@ -289,6 +337,7 @@ impl ColumnMeta {
             bloom_filter_pointer,
             bitmap_index_pointer,
             hnsw_index_pointer,
+            hnsw_index_statistics,
             sparse_index_pointer,
             fulltext_index_pointer,
             field_type,

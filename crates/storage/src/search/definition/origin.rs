@@ -1,10 +1,12 @@
 // Copyright 2024-2026 Zunor
 // SPDX-License-Identifier: Apache-2.0
 
-use serde_json::json;
-
+use crate::index::hnsw::{DistanceMetric, HnswSearchPolicy};
+use crate::search::{
+    HnswInlineConfig, HnswInlineThreshold, HnswProviderConfig, DEFAULT_HNSW_BUILD_SEED,
+};
 use crate::tablet::{ColumnId, TabletColumn, TabletSchema};
-use paro_common::error::Result;
+use paro_common::error::{self as paro_error, Result};
 use paro_common::types::LogicalType;
 
 use super::super::capability::{SearchFreshnessPolicy, SearchIndexDefinition, SearchIndexKind};
@@ -16,15 +18,57 @@ pub(crate) fn schema_seed_definition(
     column: &TabletColumn,
 ) -> Result<SearchIndexDefinition> {
     let dimension = match &column.logical_type {
-        LogicalType::Array(_, dimension) => *dimension as u64,
-        _ => 0,
+        LogicalType::Array(inner, dimension) if matches!(inner.as_ref(), LogicalType::Float) => {
+            u32::try_from(*dimension)
+                .map_err(|_| paro_error::out_of_range("HNSW vector dimension"))?
+        }
+        other => {
+            return Err(paro_error::not_supported(format!(
+                "schema HNSW column requires VECTOR(N), got {other:?}"
+            )))
+        }
     };
-    let provider_config = json!({
-        "m": column.hnsw_m,
-        "ef_construct": column.hnsw_ef_construct,
-        "distance": column.hnsw_distance,
-        "dimension": dimension,
-    });
+    let distance = DistanceMetric::from_u8(column.hnsw_distance).ok_or_else(|| {
+        paro_error::invalid_input(format!(
+            "invalid HNSW distance tag {} on column {}",
+            column.hnsw_distance, column.id
+        ))
+    })?;
+    let defaults = HnswSearchPolicy::default();
+    let build_vector_encoding =
+        crate::index::hnsw::HnswBuildVectorEncoding::default_for_dimension(dimension)?;
+    let inline = HnswInlineThreshold::DEFAULT;
+    let provider_config = HnswProviderConfig {
+        version: crate::search::HNSW_PROVIDER_CONFIG_VERSION,
+        dimension,
+        distance,
+        build_vector_encoding,
+        m: u32::try_from(column.hnsw_m).map_err(|_| paro_error::out_of_range("HNSW m"))?,
+        ef_construct: u32::try_from(column.hnsw_ef_construct)
+            .map_err(|_| paro_error::out_of_range("HNSW ef_construct"))?,
+        ef_search: u32::try_from(column.hnsw_ef_construct)
+            .map_err(|_| paro_error::out_of_range("HNSW ef_search"))?,
+        rerank_policy: crate::index::hnsw::HnswRerankPolicy::default_for_encoding(
+            build_vector_encoding,
+        ),
+        distance_cost: defaults.distance_cost,
+        generation_layout: crate::search::HnswGenerationLayout::default(),
+        maintenance: crate::search::HnswMaintenancePolicy::default(),
+        build_seed: DEFAULT_HNSW_BUILD_SEED,
+        proposal_wave_max_size: crate::index::hnsw::DEFAULT_HNSW_PROPOSAL_WAVE_MAX_SIZE,
+        warmup_point_count: crate::index::hnsw::DEFAULT_HNSW_WARMUP_POINT_COUNT,
+        filter_columns: Vec::new(),
+        filter_block_rows: crate::index::hnsw::DEFAULT_HNSW_FILTER_BLOCK_ROWS,
+        filter_m: crate::index::hnsw::DEFAULT_HNSW_FILTER_M,
+        inline_threshold: HnswInlineConfig {
+            enabled: true,
+            max_vector_count: inline.max_vector_count,
+            max_graph_memory_bytes: inline.max_graph_memory_bytes,
+            max_dimension: inline.max_dimension,
+        },
+    }
+    .validated()?
+    .to_value()?;
     Ok(SearchIndexDefinition {
         definition_id: SCHEMA_SEED_BIT | column.id as u64,
         table_id,
@@ -33,12 +77,12 @@ pub(crate) fn schema_seed_definition(
         column_ids: vec![column.id],
         expression: None,
         freshness_policy: SearchFreshnessPolicy::default_for_kind(SearchIndexKind::Hnsw),
-        config_fingerprint: SearchIndexDefinition::compute_config_fingerprint(
+        config_fingerprint: SearchIndexDefinition::try_compute_config_fingerprint(
             SearchIndexKind::Hnsw,
             &[column.id],
             None,
             &provider_config,
-        ),
+        )?,
         provider_config,
     })
 }

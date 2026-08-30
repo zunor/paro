@@ -15,7 +15,7 @@ use paro_scheduler::scheduler::TaskScheduler;
 use tracing::debug;
 
 use crate::memory_runtime::QueryMemoryPool;
-use crate::query_executor::compiled::{CompiledExecutable, ExecutionRequest};
+use crate::query_executor::compiled::ExecutionRequest;
 use crate::query_executor::program_executor;
 use crate::runtime::ParameterBindings;
 
@@ -64,9 +64,8 @@ impl Executor {
         )) as Arc<dyn paro_common::allocator::Allocator>;
 
         let query_memory_pool = self.create_query_memory_pool();
-        let CompiledExecutable::Program(program) = compiled.executable();
         let handler = self.execute_program(
-            program,
+            compiled.program(),
             result_names,
             result_types,
             parameter_bindings,
@@ -91,23 +90,24 @@ impl Executor {
         allocator: Arc<dyn paro_common::allocator::Allocator>,
         query_memory_pool: Arc<QueryMemoryPool>,
     ) -> Result<ResultHandler> {
-        let execution = if result_types.is_empty() {
-            program_executor::execute_program(
-                self.session.clone(),
-                program,
-                params,
-                query_memory_pool.clone(),
-                allocator.clone(),
-            )?
-        } else {
-            program_executor::start_program(
-                self.session.clone(),
-                program,
-                params,
-                query_memory_pool.clone(),
-                allocator.clone(),
-            )?
-        };
+        let execution =
+            if result_types.is_empty() && !self.session.input.requires_background_execution() {
+                program_executor::execute_program(
+                    self.session.clone(),
+                    program,
+                    params,
+                    query_memory_pool.clone(),
+                    allocator.clone(),
+                )?
+            } else {
+                program_executor::start_program(
+                    self.session.clone(),
+                    program,
+                    params,
+                    query_memory_pool.clone(),
+                    allocator.clone(),
+                )?
+            };
         ResultHandler::from_program_execution(
             result_names,
             result_types,
@@ -122,17 +122,25 @@ impl Executor {
         // Workload governance and the process buffer pool may tighten a
         // session limit, but neither may loosen the statement-scoped ceiling
         // captured by the front end. A zero physical limit means unbounded.
+        let statement_limit = if self.session.limits.max_memory > 0 {
+            self.session.limits.max_memory
+        } else {
+            usize::MAX
+        };
         let configured_limit = governance
             .memory_quota
-            .map(|quota| quota.min(self.session.limits.max_memory))
-            .unwrap_or(self.session.limits.max_memory);
+            .map(|quota| quota.min(statement_limit))
+            .unwrap_or(statement_limit);
         let physical_limit = self.session.buffer_manager().get_max_memory();
         let hard_limit_bytes = if physical_limit == 0 {
             configured_limit
         } else {
             configured_limit.min(physical_limit)
+        };
+        if hard_limit_bytes == usize::MAX {
+            return Arc::new(QueryMemoryPool::unbounded());
         }
-        .max(1);
+        let hard_limit_bytes = hard_limit_bytes.max(1);
         let Some(coordinator) = self.session.query_memory_coordinator() else {
             return Arc::new(QueryMemoryPool::new(hard_limit_bytes));
         };
@@ -187,6 +195,19 @@ mod tests {
         let pool = Executor::new(context).create_query_memory_pool();
 
         assert_eq!(physical_limit, 64 * 1024 * 1024);
+        assert_eq!(pool.capacity_bytes(), physical_limit);
+    }
+
+    #[test]
+    fn zero_statement_limit_uses_physical_capacity_instead_of_one_byte() {
+        let context = TestStatementContextBuilder::minimal()
+            .with_limits(RuntimeLimits::default())
+            .build();
+        let physical_limit = context.buffer_manager().get_max_memory();
+
+        let pool = Executor::new(context).create_query_memory_pool();
+
+        assert!(physical_limit > 1);
         assert_eq!(pool.capacity_bytes(), physical_limit);
     }
 

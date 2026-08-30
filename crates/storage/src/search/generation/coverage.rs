@@ -36,7 +36,7 @@ pub(crate) fn search_generation_coverage_for_state(
                 .artifacts
                 .artifacts
                 .iter()
-                .map(|artifact| artifact.segment)
+                .flat_map(|artifact| artifact.coverage.segments().iter().map(|span| span.segment))
                 .collect::<BTreeSet<_>>()
                 .len()
         })

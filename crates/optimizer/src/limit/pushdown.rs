@@ -181,6 +181,8 @@ mod tests {
                 }),
             ],
             visible_names: vec!["id".to_string(), "name".to_string()],
+            visible_count: 2,
+            visible_qualifier: None,
             returned_types: vec![LogicalType::Integer, LogicalType::Varchar],
             child: Box::new(LogicalPlan::synthetic(child)),
         })

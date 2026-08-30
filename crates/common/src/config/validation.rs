@@ -53,15 +53,16 @@ impl ParoConfig {
         }
 
         const PG_PACKET_LIMIT: usize = 0x3fffffff - 1;
-        if let Some(limit) = self.server.copy_stdin_memory_limit {
-            if limit == 0 {
-                return Err(ConfigError::Validation(
-                    "server.copy_stdin_memory_limit must be greater than 0".to_string(),
-                ));
+        if let Some(limit) = self.server.copy_stdin_inflight_memory_limit {
+            if limit < super::MIN_COPY_STDIN_INFLIGHT_MEMORY_LIMIT {
+                return Err(ConfigError::Validation(format!(
+                    "server.copy_stdin_inflight_memory_limit must be at least {} bytes",
+                    super::MIN_COPY_STDIN_INFLIGHT_MEMORY_LIMIT
+                )));
             }
             if limit > PG_PACKET_LIMIT {
                 return Err(ConfigError::Validation(format!(
-                    "server.copy_stdin_memory_limit must be <= {} bytes",
+                    "server.copy_stdin_inflight_memory_limit must be <= {} bytes",
                     PG_PACKET_LIMIT
                 )));
             }
@@ -262,12 +263,12 @@ mod tests {
     }
 
     #[test]
-    fn test_invalid_copy_stdin_memory_limit() {
+    fn test_invalid_copy_stdin_inflight_memory_limit() {
         let mut config = ParoConfig::default();
-        config.server.copy_stdin_memory_limit = Some(0);
+        config.server.copy_stdin_inflight_memory_limit = Some(0);
         assert!(config.validate().is_err());
 
-        config.server.copy_stdin_memory_limit = Some(0x3fffffff);
+        config.server.copy_stdin_inflight_memory_limit = Some(0x3fffffff);
         assert!(config.validate().is_err());
     }
 }

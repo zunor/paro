@@ -10,8 +10,11 @@ use paro_common::runtime_value::Value;
 use paro_common::types::LogicalType;
 
 use super::{
-    CopyFormat, CopyFromSource, CopyFunction, CopyFunctionBindData, CopyOptions, CopyToGlobalState,
-    CopyToLocalState, ForceQuoteOption,
+    CopyFormat, CopyFromFunction, CopyFromSource, CopyFunction, CopyFunctionBindData, CopyOptions,
+    CopyToFunction, CopyToGlobalState, CopyToLocalState, ForceQuoteOption,
+};
+use crate::table::read_binary::{
+    bind_copy_from as bind_binary_copy_from, create_read_binary_function,
 };
 use crate::table::read_csv::{bind_copy_from, create_read_csv_function};
 use crate::table::{TableFunction, TableFunctionBindData};
@@ -60,20 +63,28 @@ impl CopyToLocalState for CsvCopyToLocalState {
 }
 
 pub fn register_copy_functions() -> Vec<CopyFunction> {
-    vec![register_csv_copy_function(), register_text_copy_function()]
+    vec![
+        register_csv_copy_function(),
+        register_text_copy_function(),
+        register_binary_copy_function(),
+    ]
 }
 
 pub fn register_csv_copy_function() -> CopyFunction {
     CopyFunction {
         name: "csv".to_string(),
-        copy_to_bind: csv_copy_to_bind,
-        copy_to_initialize_global: csv_copy_to_initialize_global,
-        copy_to_initialize_local: csv_copy_to_initialize_local,
-        copy_to_sink: csv_copy_to_sink,
-        copy_to_combine: csv_copy_to_combine,
-        copy_to_finalize: csv_copy_to_finalize,
-        copy_from_bind: csv_copy_from_bind,
-        copy_from_function: read_csv_table_function(),
+        copy_to: Some(CopyToFunction {
+            copy_to_bind: csv_copy_to_bind,
+            copy_to_initialize_global: csv_copy_to_initialize_global,
+            copy_to_initialize_local: csv_copy_to_initialize_local,
+            copy_to_sink: csv_copy_to_sink,
+            copy_to_combine: csv_copy_to_combine,
+            copy_to_finalize: csv_copy_to_finalize,
+        }),
+        copy_from: Some(CopyFromFunction {
+            copy_from_bind: csv_copy_from_bind,
+            copy_from_function: read_csv_table_function(),
+        }),
         extension: "csv".to_string(),
     }
 }
@@ -83,6 +94,32 @@ pub fn register_text_copy_function() -> CopyFunction {
     func.name = "text".to_string();
     func.extension = "txt".to_string();
     func
+}
+
+pub fn register_binary_copy_function() -> CopyFunction {
+    CopyFunction {
+        name: "binary".to_string(),
+        copy_to: None,
+        copy_from: Some(CopyFromFunction {
+            copy_from_bind: binary_copy_from_bind,
+            copy_from_function: create_read_binary_function(),
+        }),
+        extension: "bin".to_string(),
+    }
+}
+
+fn binary_copy_from_bind(
+    source: CopyFromSource,
+    options: &CopyOptions,
+    names: &[String],
+    types: &[LogicalType],
+) -> Result<Box<dyn TableFunctionBindData>> {
+    if !matches!(options.format, CopyFormat::Binary) {
+        return Err(paro_error::invalid_parameter(
+            "binary copy function requires FORMAT binary",
+        ));
+    }
+    bind_binary_copy_from(source, names, types)
 }
 
 fn read_csv_table_function() -> TableFunction {
@@ -95,11 +132,6 @@ fn csv_copy_from_bind(
     names: &[String],
     types: &[LogicalType],
 ) -> Result<Box<dyn TableFunctionBindData>> {
-    if matches!(options.format, CopyFormat::Binary) {
-        return Err(paro_error::not_implemented(
-            "COPY FROM BINARY is not supported yet",
-        ));
-    }
     if matches!(options.format, CopyFormat::Ndjson) {
         return Err(paro_error::invalid_parameter(
             "CSV/TEXT copy function does not support FORMAT ndjson",
@@ -120,11 +152,6 @@ fn csv_copy_to_bind(
         ));
     }
 
-    if matches!(options.format, CopyFormat::Binary) {
-        return Err(paro_error::not_implemented(
-            "COPY TO BINARY is not supported yet",
-        ));
-    }
     if matches!(options.format, CopyFormat::Ndjson) {
         return Err(paro_error::invalid_parameter(
             "CSV/TEXT copy function does not support FORMAT ndjson",

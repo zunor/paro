@@ -15,7 +15,7 @@ use crate::{
     ExpressionState, FunctionNullHandling, FunctionStability, ScalarFunction, ScalarFunctionSet,
 };
 use paro_common::chunk::Chunk;
-use paro_common::error::Result;
+use paro_common::error::{self as paro_error, Result};
 use paro_common::types::LogicalType;
 use paro_common::vector::Vector;
 
@@ -47,21 +47,10 @@ pub fn get_pi_function() -> ScalarFunctionSet {
 // RANDOM - Random number between 0 and 1
 // ============================================================================
 
-fn random_impl(_input: &Chunk, _state: &dyn ExpressionState, result: &mut Vector) -> Result<()> {
-    use std::time::{SystemTime, UNIX_EPOCH};
-
-    // Simple LCG random number generator
-    // In production, this should use a proper RNG per-thread
-    let seed = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_nanos() as u64)
-        .unwrap_or(12345);
-
-    // Simple hash to get a pseudo-random value
-    let random_val = ((seed
-        .wrapping_mul(6364136223846793005)
-        .wrapping_add(1442695040888963407)) as f64)
-        / (u64::MAX as f64);
+fn random_impl(_input: &Chunk, state: &dyn ExpressionState, result: &mut Vector) -> Result<()> {
+    let random_val = state
+        .next_random()
+        .ok_or_else(|| paro_error::internal("random() requires a session-owned random source"))?;
 
     result.set_count(1);
     result.set_f64(0, random_val);
@@ -283,6 +272,9 @@ mod tests {
         }
         fn current_user(&self) -> Option<&str> {
             None
+        }
+        fn next_random(&self) -> Option<f64> {
+            Some(0.25)
         }
         fn as_any(&self) -> &dyn std::any::Any {
             self

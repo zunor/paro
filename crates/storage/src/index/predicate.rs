@@ -41,26 +41,36 @@ impl fmt::Display for PredicateComparison {
     }
 }
 
+impl PredicateComparison {
+    pub fn with_value<V>(self, column_id: ColumnId, value: V) -> Predicate<V> {
+        match self {
+            Self::Equal => Predicate::Eq { column_id, value },
+            Self::NotEqual => Predicate::NotEq { column_id, value },
+            Self::LessThan => Predicate::Lt { column_id, value },
+            Self::LessThanOrEqual => Predicate::Le { column_id, value },
+            Self::GreaterThan => Predicate::Gt { column_id, value },
+            Self::GreaterThanOrEqual => Predicate::Ge { column_id, value },
+        }
+    }
+}
+
 /// Predicate evaluated by indexes and/or by the storage row verifier.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub enum Predicate {
+pub enum Predicate<V = Value> {
     /// column = value
-    Eq { column_id: ColumnId, value: Value },
+    Eq { column_id: ColumnId, value: V },
     /// column != value
-    NotEq { column_id: ColumnId, value: Value },
+    NotEq { column_id: ColumnId, value: V },
     /// column < value
-    Lt { column_id: ColumnId, value: Value },
+    Lt { column_id: ColumnId, value: V },
     /// column <= value
-    Le { column_id: ColumnId, value: Value },
+    Le { column_id: ColumnId, value: V },
     /// column > value
-    Gt { column_id: ColumnId, value: Value },
+    Gt { column_id: ColumnId, value: V },
     /// column >= value
-    Ge { column_id: ColumnId, value: Value },
+    Ge { column_id: ColumnId, value: V },
     /// column IN (values...)
-    In {
-        column_id: ColumnId,
-        values: Vec<Value>,
-    },
+    In { column_id: ColumnId, values: Vec<V> },
     /// Physical fixed-width membership. Runtime filters use this form to
     /// preserve their frozen dense/sorted representation across scan readers.
     FixedIn {
@@ -70,8 +80,8 @@ pub enum Predicate {
     /// column BETWEEN lower AND upper (inclusive)
     Range {
         column_id: ColumnId,
-        lower: Value,
-        upper: Value,
+        lower: V,
+        upper: V,
     },
     /// column IS NULL
     IsNull { column_id: ColumnId },
@@ -108,7 +118,7 @@ pub enum Predicate {
     },
 }
 
-impl Predicate {
+impl<V> Predicate<V> {
     /// Single column eligible for index lookup, or `None` for a multi-column
     /// row-verification predicate.
     pub fn index_column_id(&self) -> Option<ColumnId> {
@@ -130,9 +140,99 @@ impl Predicate {
             Predicate::ColumnComparison { .. } => None,
         }
     }
+
+    pub fn try_map_values<U, E>(
+        self,
+        map: &mut impl FnMut(V) -> std::result::Result<U, E>,
+    ) -> std::result::Result<Predicate<U>, E> {
+        Ok(match self {
+            Self::Eq { column_id, value } => Predicate::Eq {
+                column_id,
+                value: map(value)?,
+            },
+            Self::NotEq { column_id, value } => Predicate::NotEq {
+                column_id,
+                value: map(value)?,
+            },
+            Self::Lt { column_id, value } => Predicate::Lt {
+                column_id,
+                value: map(value)?,
+            },
+            Self::Le { column_id, value } => Predicate::Le {
+                column_id,
+                value: map(value)?,
+            },
+            Self::Gt { column_id, value } => Predicate::Gt {
+                column_id,
+                value: map(value)?,
+            },
+            Self::Ge { column_id, value } => Predicate::Ge {
+                column_id,
+                value: map(value)?,
+            },
+            Self::In { column_id, values } => Predicate::In {
+                column_id,
+                values: values
+                    .into_iter()
+                    .map(map)
+                    .collect::<std::result::Result<Vec<_>, _>>()?,
+            },
+            Self::FixedIn { column_id, values } => Predicate::FixedIn { column_id, values },
+            Self::Range {
+                column_id,
+                lower,
+                upper,
+            } => Predicate::Range {
+                column_id,
+                lower: map(lower)?,
+                upper: map(upper)?,
+            },
+            Self::IsNull { column_id } => Predicate::IsNull { column_id },
+            Self::IsNotNull { column_id } => Predicate::IsNotNull { column_id },
+            Self::StringPrefix {
+                column_id,
+                prefix,
+                negated,
+            } => Predicate::StringPrefix {
+                column_id,
+                prefix,
+                negated,
+            },
+            Self::StringPrefixIn {
+                column_id,
+                prefixes,
+            } => Predicate::StringPrefixIn {
+                column_id,
+                prefixes,
+            },
+            Self::StringLike {
+                column_id,
+                pattern,
+                negated,
+            } => Predicate::StringLike {
+                column_id,
+                pattern,
+                negated,
+            },
+            Self::ColumnComparison {
+                left_column_id,
+                right_column_id,
+                comparison,
+            } => Predicate::ColumnComparison {
+                left_column_id,
+                right_column_id,
+                comparison,
+            },
+        })
+    }
+
+    pub fn map_values<U>(self, map: &mut impl FnMut(V) -> U) -> Predicate<U> {
+        self.try_map_values(&mut |value| Ok::<U, std::convert::Infallible>(map(value)))
+            .unwrap_or_else(|never| match never {})
+    }
 }
 
-impl fmt::Display for Predicate {
+impl<V: fmt::Display> fmt::Display for Predicate<V> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Predicate::Eq { column_id, value } => write!(f, "col#{column_id} = {value}"),
@@ -200,19 +300,107 @@ impl fmt::Display for Predicate {
 
 /// Predicate tree with AND/OR composition.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub enum PredicateTree {
+pub enum PredicateTree<V = Value> {
     /// Leaf predicate
-    Leaf(Predicate),
+    Leaf(Predicate<V>),
     /// AND of children
-    And(Vec<PredicateTree>),
+    And(Vec<PredicateTree<V>>),
     /// OR of children
-    Or(Vec<PredicateTree>),
+    Or(Vec<PredicateTree<V>>),
 }
 
-impl PredicateTree {
+impl<V> PredicateTree<V> {
     /// Convenience constructor for a leaf.
-    pub fn leaf(predicate: Predicate) -> Self {
+    pub fn leaf(predicate: Predicate<V>) -> Self {
         PredicateTree::Leaf(predicate)
+    }
+
+    /// Flatten one conjunction without introducing a parallel predicate-tree
+    /// representation in reusable plans.
+    pub fn and(children: impl IntoIterator<Item = Self>) -> Option<Self> {
+        combine_predicate_trees(children, true)
+    }
+
+    /// Flatten one disjunction without introducing a parallel predicate-tree
+    /// representation in reusable plans.
+    pub fn or(children: impl IntoIterator<Item = Self>) -> Option<Self> {
+        combine_predicate_trees(children, false)
+    }
+
+    /// Whether any scalar value in the tree satisfies `predicate`.
+    pub fn any_value(&self, predicate: &impl Fn(&V) -> bool) -> bool {
+        match self {
+            Self::Leaf(leaf) => match leaf {
+                Predicate::Eq { value, .. }
+                | Predicate::NotEq { value, .. }
+                | Predicate::Lt { value, .. }
+                | Predicate::Le { value, .. }
+                | Predicate::Gt { value, .. }
+                | Predicate::Ge { value, .. } => predicate(value),
+                Predicate::In { values, .. } => values.iter().any(predicate),
+                Predicate::Range { lower, upper, .. } => predicate(lower) || predicate(upper),
+                Predicate::FixedIn { .. }
+                | Predicate::IsNull { .. }
+                | Predicate::IsNotNull { .. }
+                | Predicate::StringPrefix { .. }
+                | Predicate::StringPrefixIn { .. }
+                | Predicate::StringLike { .. }
+                | Predicate::ColumnComparison { .. } => false,
+            },
+            Self::And(children) | Self::Or(children) => {
+                children.iter().any(|child| child.any_value(predicate))
+            }
+        }
+    }
+
+    pub fn try_map_values<U, E>(
+        self,
+        map: &mut impl FnMut(V) -> std::result::Result<U, E>,
+    ) -> std::result::Result<PredicateTree<U>, E> {
+        Ok(match self {
+            Self::Leaf(predicate) => PredicateTree::Leaf(predicate.try_map_values(map)?),
+            Self::And(children) => PredicateTree::And(
+                children
+                    .into_iter()
+                    .map(|child| child.try_map_values(map))
+                    .collect::<std::result::Result<Vec<_>, _>>()?,
+            ),
+            Self::Or(children) => PredicateTree::Or(
+                children
+                    .into_iter()
+                    .map(|child| child.try_map_values(map))
+                    .collect::<std::result::Result<Vec<_>, _>>()?,
+            ),
+        })
+    }
+
+    /// Transform every leaf while preserving the tree's boolean structure.
+    /// The callback may change the predicate variant (for example, folding an
+    /// out-of-domain comparison into `IN ()` or `IS NOT NULL`).
+    pub fn try_map_predicates<U, E>(
+        self,
+        map: &mut impl FnMut(Predicate<V>) -> std::result::Result<Predicate<U>, E>,
+    ) -> std::result::Result<PredicateTree<U>, E> {
+        Ok(match self {
+            Self::Leaf(predicate) => PredicateTree::Leaf(map(predicate)?),
+            Self::And(children) => PredicateTree::And(
+                children
+                    .into_iter()
+                    .map(|child| child.try_map_predicates(map))
+                    .collect::<std::result::Result<Vec<_>, _>>()?,
+            ),
+            Self::Or(children) => PredicateTree::Or(
+                children
+                    .into_iter()
+                    .map(|child| child.try_map_predicates(map))
+                    .collect::<std::result::Result<Vec<_>, _>>()?,
+            ),
+        })
+    }
+
+    pub fn map_values<U>(self, map: &mut impl FnMut(V) -> U) -> PredicateTree<U> {
+        self.try_map_values(&mut |value| Ok::<U, std::convert::Infallible>(map(value)))
+            .unwrap_or_else(|never| match never {})
     }
 
     /// Prove that every row admitted by this tree has the requested ASCII
@@ -239,7 +427,7 @@ impl PredicateTree {
     }
 }
 
-impl fmt::Display for PredicateTree {
+impl<V: fmt::Display> fmt::Display for PredicateTree<V> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             PredicateTree::Leaf(predicate) => write!(f, "{predicate}"),
@@ -249,9 +437,9 @@ impl fmt::Display for PredicateTree {
     }
 }
 
-fn write_predicate_children(
+fn write_predicate_children<V: fmt::Display>(
     f: &mut fmt::Formatter<'_>,
-    children: &[PredicateTree],
+    children: &[PredicateTree<V>],
     separator: &str,
 ) -> fmt::Result {
     for (idx, child) in children.iter().enumerate() {
@@ -263,12 +451,37 @@ fn write_predicate_children(
     Ok(())
 }
 
+fn combine_predicate_trees<V>(
+    children: impl IntoIterator<Item = PredicateTree<V>>,
+    conjunction: bool,
+) -> Option<PredicateTree<V>> {
+    let mut combined = Vec::new();
+    for child in children {
+        match (conjunction, child) {
+            (true, PredicateTree::And(mut nested)) | (false, PredicateTree::Or(mut nested)) => {
+                combined.append(&mut nested)
+            }
+            (_, child) => combined.push(child),
+        }
+    }
+    match combined.len() {
+        0 => None,
+        1 => combined.pop(),
+        _ if conjunction => Some(PredicateTree::And(combined)),
+        _ => Some(PredicateTree::Or(combined)),
+    }
+}
+
 /// Collect unique column IDs referenced by a predicate tree (in first-seen order).
-pub fn collect_predicate_columns(tree: &PredicateTree) -> Vec<ColumnId> {
+pub fn collect_predicate_columns<V>(tree: &PredicateTree<V>) -> Vec<ColumnId> {
     let mut seen = HashSet::new();
     let mut columns = Vec::new();
 
-    fn visit(tree: &PredicateTree, seen: &mut HashSet<ColumnId>, columns: &mut Vec<ColumnId>) {
+    fn visit<V>(
+        tree: &PredicateTree<V>,
+        seen: &mut HashSet<ColumnId>,
+        columns: &mut Vec<ColumnId>,
+    ) {
         match tree {
             PredicateTree::Leaf(predicate) => match predicate {
                 Predicate::ColumnComparison {
@@ -554,4 +767,35 @@ pub fn compare_bytes(logical_type: &LogicalType, left: &[u8], right: &[u8]) -> R
             logical_type
         ))),
     }
+}
+
+/// Whether the durable scalar encoding has a total ordering understood by
+/// [`compare_bytes`]. Predicate-local graph topology must use exactly this
+/// capability boundary so definition validation and artifact construction
+/// cannot drift.
+pub fn supports_ordered_bytes(logical_type: &LogicalType) -> bool {
+    matches!(
+        logical_type,
+        LogicalType::Boolean
+            | LogicalType::TinyInt
+            | LogicalType::SmallInt
+            | LogicalType::Integer
+            | LogicalType::BigInt
+            | LogicalType::HugeInt
+            | LogicalType::UTinyInt
+            | LogicalType::USmallInt
+            | LogicalType::UInteger
+            | LogicalType::UBigInt
+            | LogicalType::UHugeInt
+            | LogicalType::Uuid
+            | LogicalType::Float
+            | LogicalType::Double
+            | LogicalType::Varchar
+            | LogicalType::VarcharCollation(_)
+            | LogicalType::TsVector
+            | LogicalType::TsQuery
+            | LogicalType::Json
+            | LogicalType::Jsonb
+            | LogicalType::Blob
+    )
 }

@@ -18,6 +18,7 @@ impl PhysicalPlanGenerator {
                 )?;
                 let spec = ValuesSpec {
                     table_index: setop.table_index,
+                    relation_alias: None,
                     expressions: rows.into_boxed_slice(),
                     output_names: output_names.into_boxed_slice(),
                     output_types: setop.types.clone().into_boxed_slice(),
@@ -89,6 +90,7 @@ impl PhysicalPlanGenerator {
         let spec = CteScanSpec {
             cte_index: cte_ref.cte_index,
             table_index: cte_ref.table_index,
+            relation_alias: cte_ref.relation_alias.clone(),
             output_names: cte_ref.column_names.clone().into_boxed_slice(),
             output_types: cte_ref.column_types.clone().into_boxed_slice(),
         };
@@ -124,6 +126,7 @@ impl PhysicalPlanGenerator {
 
         let spec = ValuesSpec {
             table_index: 0,
+            relation_alias: None,
             expressions: rows.into_boxed_slice(),
             output_names: Box::new(["QUERY PLAN".to_string()]),
             output_types: Box::new([paro_common::types::LogicalType::Varchar]),

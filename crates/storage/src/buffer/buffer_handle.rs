@@ -7,6 +7,7 @@
 //! - Move-only: no copy semantics
 //! - Provides safe data access while pinned
 
+use std::ptr::NonNull;
 use std::sync::{Arc, Weak};
 
 use super::block_handle::BlockHandle;
@@ -36,7 +37,18 @@ pub struct BufferHandle {
     block: Option<Arc<BlockHandle>>,
     /// Owning buffer pool used for proper unpin/eviction queue integration
     pool: Option<Weak<BufferPool>>,
+    /// Stable allocation address captured after the pin is published. Block
+    /// eviction cannot detach this allocation until the handle unpins it, so
+    /// hot data access does not need to lock the block lifecycle.
+    ptr: Option<NonNull<u8>>,
 }
+
+// SAFETY: The cached pointer belongs to the pinned BlockHandle allocation.
+// Moving or sharing the handle cannot invalidate it; eviction is excluded until
+// the sole pin owned by this handle is released. Mutable access remains unsafe
+// and requires callers to exclude concurrent readers/writers, as before.
+unsafe impl Send for BufferHandle {}
+unsafe impl Sync for BufferHandle {}
 
 impl BufferHandle {
     /// Create a new buffer handle for a pinned block.
@@ -44,18 +56,30 @@ impl BufferHandle {
     /// The block should already be pinned when this is called.
     pub fn new(block: Arc<BlockHandle>) -> Self {
         debug_assert!(block.is_pinned(), "Block must be pinned");
+        let ptr = NonNull::new(
+            block
+                .data_ptr()
+                .expect("pinned block must retain its allocation"),
+        );
         Self {
             block: Some(block),
             pool: None,
+            ptr,
         }
     }
 
     /// Create a new buffer handle that notifies the pool on drop.
     pub fn with_pool(block: Arc<BlockHandle>, pool: Weak<BufferPool>) -> Self {
         debug_assert!(block.is_pinned(), "Block must be pinned");
+        let ptr = NonNull::new(
+            block
+                .data_ptr()
+                .expect("pinned block must retain its allocation"),
+        );
         Self {
             block: Some(block),
             pool: Some(pool),
+            ptr,
         }
     }
 
@@ -64,10 +88,13 @@ impl BufferHandle {
         Self {
             block: None,
             pool: None,
+            ptr: None,
         }
     }
 
     fn unpin_internal(&mut self) {
+        // Stop exposing the allocation before making it eviction-eligible.
+        self.ptr = None;
         if let Some(block) = self.block.take() {
             if let Some(pool_weak) = self.pool.take() {
                 if let Some(pool) = pool_weak.upgrade() {
@@ -92,7 +119,7 @@ impl BufferHandle {
     /// Returns None if handle is invalid.
     #[inline]
     pub fn ptr(&self) -> Option<*mut u8> {
-        self.block.as_ref().and_then(|b| b.data_ptr())
+        self.ptr.map(NonNull::as_ptr)
     }
 
     /// Get the block's data as a mutable slice.
@@ -102,14 +129,18 @@ impl BufferHandle {
     #[inline]
     #[allow(clippy::mut_from_ref)] // Interior mutability via raw pointer is intentional
     pub unsafe fn data_mut(&self) -> Option<&mut [u8]> {
-        self.block.as_ref().and_then(|b| b.data_mut())
+        self.ptr
+            .map(|ptr| unsafe { std::slice::from_raw_parts_mut(ptr.as_ptr(), self.size()) })
     }
 
     /// Get the block's data as an immutable slice.
     #[inline]
     pub fn data(&self) -> Option<&[u8]> {
-        // SAFETY: Block is pinned via this handle
-        self.block.as_ref().and_then(|b| unsafe { b.data() })
+        self.ptr.map(|ptr| {
+            // SAFETY: The block is pinned for this handle's lifetime and the
+            // cached pointer was captured after pin publication.
+            unsafe { std::slice::from_raw_parts(ptr.as_ptr(), self.size()) }
+        })
     }
 
     /// Get the size of the buffer.

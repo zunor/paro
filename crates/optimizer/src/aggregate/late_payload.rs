@@ -1304,7 +1304,8 @@ fn apply_rewrite(
         operator: LogicalOperator::Aggregate(aggregate),
     };
     let carrier = Projection::new(carrier_table_index, aggregate_plan, carrier_expressions)
-        .with_visible_names(carrier_names);
+        .with_visible_names(carrier_names)
+        .with_internal_outputs();
     topn.child = Box::new(LogicalPlan::synthetic(LogicalOperator::Projection(carrier)));
     let topn_plan = LogicalPlan {
         id: topn_id,
@@ -1454,7 +1455,8 @@ fn apply_row_preserving_rewrite(
         narrow_names.push(format!("__late_rowid_{}", source.source.source_table_index));
     }
     let narrow = Projection::new(narrow_table_index, *output.child, narrow_expressions)
-        .with_visible_names(narrow_names);
+        .with_visible_names(narrow_names)
+        .with_internal_outputs();
 
     // Fetch ordering payload only after the selective child has completed, but
     // before TopN needs those values. Output-only payload remains delayed.
@@ -1552,7 +1554,8 @@ fn apply_row_preserving_rewrite(
         )))
     };
     let topn_carrier = Projection::new(topn_table_index, topn_carrier_child, topn_expressions)
-        .with_visible_names(topn_names);
+        .with_visible_names(topn_names)
+        .with_internal_outputs();
 
     for order in &mut topn.orders {
         let Expression::ColumnRef(column) = &mut order.expression else {
@@ -1787,7 +1790,8 @@ fn apply_selective_projection_rewrite(
     );
     let child_stats = child.stats.clone();
     let carrier = Projection::new(carrier_table_index, child, carrier_expressions)
-        .with_visible_names(carrier_names);
+        .with_visible_names(carrier_names)
+        .with_internal_outputs();
     let mut carrier = LogicalPlan::synthetic(LogicalOperator::Projection(carrier));
     carrier.stats = child_stats;
     let fetch_sources = sources

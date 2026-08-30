@@ -32,23 +32,23 @@ pub struct ServerConfig {
     pub max_connections: usize,
     pub buffer_pool_size: usize,
     pub startup_timeout: Duration,
-    pub copy_stdin_memory_limit: usize,
+    pub copy_stdin_inflight_memory_limit: usize,
     pub frontend_message_limits: PgFrontendMessageLimits,
 }
 
 impl From<&ParoConfig> for ServerConfig {
     fn from(config: &ParoConfig) -> Self {
-        let copy_stdin_memory_limit = config
+        let copy_stdin_inflight_memory_limit = config
             .server
-            .effective_copy_stdin_memory_limit(config.cluster.max_memory);
+            .effective_copy_stdin_inflight_memory_limit(config.cluster.max_memory);
         Self {
             addr: config.server.address(),
             data_dir: config.storage.data_dir.to_string_lossy().to_string(),
             max_connections: config.server.max_connections,
             buffer_pool_size: config.storage.buffer_pool.size,
             startup_timeout: DEFAULT_STARTUP_TIMEOUT,
-            frontend_message_limits: PgFrontendMessageLimits::new(copy_stdin_memory_limit),
-            copy_stdin_memory_limit,
+            frontend_message_limits: PgFrontendMessageLimits::new(copy_stdin_inflight_memory_limit),
+            copy_stdin_inflight_memory_limit,
         }
     }
 }
@@ -141,7 +141,7 @@ impl Server {
             data_dir = %self.config.data_dir,
             max_connections = self.config.max_connections,
             buffer_pool_size = self.config.buffer_pool_size,
-            copy_stdin_memory_limit = self.config.copy_stdin_memory_limit,
+            copy_stdin_inflight_memory_limit = self.config.copy_stdin_inflight_memory_limit,
             "Server listener started"
         );
 
@@ -212,7 +212,7 @@ impl Server {
             let connection_control = Arc::clone(&control);
             let limits = Arc::clone(&self.limits);
             let frontend_message_limits = self.config.frontend_message_limits;
-            let copy_stdin_memory_limit = self.config.copy_stdin_memory_limit;
+            let copy_stdin_inflight_memory_limit = self.config.copy_stdin_inflight_memory_limit;
             let connection_drain_token = drain_token.clone();
             let connection_force_close_token = force_close_token.clone();
 
@@ -229,7 +229,7 @@ impl Server {
                     control: connection_control,
                     limits,
                     frontend_message_limits,
-                    copy_stdin_memory_limit,
+                    copy_stdin_inflight_memory_limit,
                     drain_token: connection_drain_token,
                     force_close_token: connection_force_close_token,
                 });
@@ -467,7 +467,7 @@ mod tests {
     use paro_storage::meta::{FileMetadataStore, MetadataStore};
     use pgwire::messages::cancel::CancelRequest;
     use pgwire::messages::copy::{CopyData, CopyDone};
-    use pgwire::messages::extendedquery::{Bind, Execute, Parse, Sync};
+    use pgwire::messages::extendedquery::{Bind, Execute, Flush, Parse, Sync};
     use pgwire::messages::simplequery::Query;
     use pgwire::messages::startup::SecretKey;
     use pgwire::messages::PgWireFrontendMessage;
@@ -629,6 +629,30 @@ mod tests {
             .and_then(|end| String::from_utf8(payload[..end].to_vec()).ok())
     }
 
+    fn first_text_data_row_value(payload: &[u8]) -> Option<String> {
+        if i16::from_be_bytes(payload.get(0..2)?.try_into().ok()?) != 1 {
+            return None;
+        }
+        let length = i32::from_be_bytes(payload.get(2..6)?.try_into().ok()?);
+        let length = usize::try_from(length).ok()?;
+        String::from_utf8(payload.get(6..6 + length)?.to_vec()).ok()
+    }
+
+    fn binary_float4_array(values: &[f32]) -> Bytes {
+        const FLOAT4_OID: u32 = 700;
+        let mut bytes = Vec::with_capacity(20 + values.len() * 8);
+        bytes.extend_from_slice(&1_i32.to_be_bytes());
+        bytes.extend_from_slice(&0_i32.to_be_bytes());
+        bytes.extend_from_slice(&FLOAT4_OID.to_be_bytes());
+        bytes.extend_from_slice(&(values.len() as i32).to_be_bytes());
+        bytes.extend_from_slice(&1_i32.to_be_bytes());
+        for value in values {
+            bytes.extend_from_slice(&4_i32.to_be_bytes());
+            bytes.extend_from_slice(&value.to_be_bytes());
+        }
+        Bytes::from(bytes)
+    }
+
     fn parameter_status(payload: &[u8]) -> Option<(String, String)> {
         let mut index = 0;
         let name_end = payload[index..]
@@ -684,7 +708,7 @@ mod tests {
                 max_connections: 0,
                 buffer_pool_size: 0,
                 startup_timeout: DEFAULT_STARTUP_TIMEOUT,
-                copy_stdin_memory_limit: 256 * 1024 * 1024,
+                copy_stdin_inflight_memory_limit: 256 * 1024 * 1024,
                 frontend_message_limits: PgFrontendMessageLimits::new(256 * 1024 * 1024),
             },
             instance: Instance::new_in_memory(),
@@ -1024,6 +1048,291 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn extended_query_flushes_before_waiting_for_more_frontend_input() {
+        let (server, run_task, addr) = spawn_test_server(4).await;
+        let mut client = TcpStream::connect(addr).await.expect("client connection");
+        complete_startup(&mut client).await;
+
+        client
+            .write_all(&encode_frontend_message(PgWireFrontendMessage::Parse(
+                Parse::new(
+                    Some("standalone_parse".to_string()),
+                    "SELECT 1".to_string(),
+                    Vec::new(),
+                ),
+            )))
+            .await
+            .expect("write standalone Parse");
+        let parse_complete = read_backend_message_timeout(&mut client, Duration::from_secs(2))
+            .await
+            .expect("ParseComplete must not wait for Sync or Flush");
+        assert_eq!(parse_complete.0, b'1');
+
+        client
+            .write_all(&encode_frontend_message(PgWireFrontendMessage::Execute(
+                Execute::new(Some("missing_portal".to_string()), 0),
+            )))
+            .await
+            .expect("write invalid Execute");
+        let error = read_backend_message_timeout(&mut client, Duration::from_secs(2))
+            .await
+            .expect("ErrorResponse must not wait for Sync or Flush");
+        assert_eq!(error.0, b'E');
+
+        client
+            .write_all(&encode_frontend_message(PgWireFrontendMessage::Sync(
+                Sync::new(),
+            )))
+            .await
+            .expect("write recovery Sync");
+        let recovered = read_messages_until_ready(&mut client).await;
+        assert_eq!(recovered.last().map(|(tag, _)| *tag), Some(b'Z'));
+
+        server
+            .shutdown(Duration::from_secs(5))
+            .await
+            .expect("shutdown server");
+        run_task
+            .await
+            .expect("accept loop join")
+            .expect("accept loop exit");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn binary_vector_parameter_executes_prepared_hnsw_topk() {
+        let (server, run_task, addr) = spawn_test_server(4).await;
+        let mut client = TcpStream::connect(addr).await.expect("client connection");
+        complete_startup(&mut client).await;
+
+        let ddl = run_simple_query_roundtrip(
+            &mut client,
+            "CREATE TABLE binary_vector_t (id INT PRIMARY KEY, emb VECTOR(3)); \
+             CREATE VECTOR INDEX binary_vector_idx ON binary_vector_t (emb) \
+                 distance = l2 m = 8 ef_construct = 32 ef_search = 24 build_seed = 7",
+        )
+        .await;
+        let setup = run_simple_query_roundtrip(
+            &mut client,
+            "INSERT INTO binary_vector_t VALUES \
+             (1, '[1,1,1]'), (2, '[2,2,2]'), (3, '[1,1,2]')",
+        )
+        .await;
+        let setup_errors = ddl
+            .iter()
+            .chain(setup.iter())
+            .filter_map(|(tag, payload)| {
+                (*tag == b'E').then(|| error_field(payload, b'M')).flatten()
+            })
+            .collect::<Vec<_>>();
+        assert!(
+            setup_errors.is_empty(),
+            "vector setup should succeed: {setup_errors:?}"
+        );
+
+        for message in [
+            PgWireFrontendMessage::Parse(Parse::new(
+                Some("binary_vector_topk".to_string()),
+                "SELECT id FROM binary_vector_t \
+                 ORDER BY emb <-> $1::VECTOR(3) LIMIT 2"
+                    .to_string(),
+                Vec::new(),
+            )),
+            PgWireFrontendMessage::Bind(Bind::new(
+                Some("binary_vector_portal".to_string()),
+                Some("binary_vector_topk".to_string()),
+                vec![1],
+                vec![Some(binary_float4_array(&[1.0, 1.0, 1.0]))],
+                Vec::new(),
+            )),
+            PgWireFrontendMessage::Execute(Execute::new(
+                Some("binary_vector_portal".to_string()),
+                0,
+            )),
+            PgWireFrontendMessage::Sync(Sync::new()),
+        ] {
+            client
+                .write_all(&encode_frontend_message(message))
+                .await
+                .expect("write prepared vector message");
+        }
+
+        let messages = read_messages_until_ready(&mut client).await;
+        assert!(
+            !messages.iter().any(|(tag, _)| *tag == b'E'),
+            "prepared binary vector query should succeed"
+        );
+        let ids = messages
+            .iter()
+            .filter_map(|(tag, payload)| {
+                (*tag == b'D')
+                    .then(|| first_text_data_row_value(payload))
+                    .flatten()
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(ids, ["1", "3"]);
+
+        server
+            .shutdown(Duration::from_secs(5))
+            .await
+            .expect("shutdown server");
+        run_task
+            .await
+            .expect("accept loop join")
+            .expect("accept loop exit");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn binary_copy_imports_vector_rows_and_advertises_binary_columns() {
+        let (server, run_task, addr) = spawn_test_server(4).await;
+        let mut client = TcpStream::connect(addr).await.expect("client connection");
+        complete_startup(&mut client).await;
+
+        let ddl = run_simple_query_roundtrip(
+            &mut client,
+            "CREATE TABLE binary_copy_t (id INT PRIMARY KEY, emb VECTOR(3)); \
+             CREATE VECTOR INDEX binary_copy_idx ON binary_copy_t (emb) \
+                 distance = l2 m = 8 ef_construct = 32 ef_search = 24 build_seed = 7",
+        )
+        .await;
+        assert!(!ddl.iter().any(|(tag, _)| *tag == b'E'));
+
+        client
+            .write_all(&encode_frontend_message(PgWireFrontendMessage::Query(
+                Query::new(
+                    "COPY binary_copy_t (id, emb) FROM STDIN WITH (FORMAT binary)".to_string(),
+                ),
+            )))
+            .await
+            .expect("write binary COPY query");
+        let copy_response = read_backend_message_timeout(&mut client, Duration::from_secs(2))
+            .await
+            .expect("binary CopyInResponse");
+        assert_eq!(copy_response.0, b'G');
+        assert_eq!(copy_response.1.first().copied(), Some(1));
+
+        let mut payload = b"PGCOPY\n\xff\r\n\0".to_vec();
+        payload.extend_from_slice(&0_u32.to_be_bytes());
+        payload.extend_from_slice(&0_u32.to_be_bytes());
+        for (id, vector) in [(1_i32, [1.0_f32, 1.0, 1.0]), (2, [3.0, 3.0, 3.0])] {
+            payload.extend_from_slice(&2_i16.to_be_bytes());
+            payload.extend_from_slice(&4_i32.to_be_bytes());
+            payload.extend_from_slice(&id.to_be_bytes());
+            let vector = binary_float4_array(&vector);
+            payload.extend_from_slice(&(vector.len() as i32).to_be_bytes());
+            payload.extend_from_slice(&vector);
+        }
+        payload.extend_from_slice(&(-1_i16).to_be_bytes());
+
+        for chunk in payload.chunks(7) {
+            client
+                .write_all(&encode_frontend_message(PgWireFrontendMessage::CopyData(
+                    CopyData::new(Bytes::copy_from_slice(chunk)),
+                )))
+                .await
+                .expect("write binary COPY payload");
+        }
+        client
+            .write_all(&encode_frontend_message(PgWireFrontendMessage::CopyDone(
+                CopyDone::new(),
+            )))
+            .await
+            .expect("finish binary COPY payload");
+        let copied = read_messages_until_ready(&mut client).await;
+        assert!(
+            !copied.iter().any(|(tag, _)| *tag == b'E'),
+            "binary COPY should succeed: {copied:?}"
+        );
+
+        let selected = run_simple_query_roundtrip(
+            &mut client,
+            "SELECT id FROM binary_copy_t ORDER BY emb <-> '[1,1,1]' LIMIT 2",
+        )
+        .await;
+        let ids = selected
+            .iter()
+            .filter_map(|(tag, payload)| {
+                (*tag == b'D')
+                    .then(|| first_text_data_row_value(payload))
+                    .flatten()
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(ids, ["1", "2"]);
+
+        server
+            .shutdown(Duration::from_secs(5))
+            .await
+            .expect("shutdown server");
+        run_task
+            .await
+            .expect("accept loop join")
+            .expect("accept loop exit");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn copy_execution_error_drains_remaining_frames_before_leaving_copy_mode() {
+        let (server, run_task, addr) = spawn_test_server(4).await;
+        let mut client = TcpStream::connect(addr).await.expect("client connection");
+        complete_startup(&mut client).await;
+        run_simple_query_roundtrip(&mut client, "CREATE TABLE copy_error_t (v INT)").await;
+
+        client
+            .write_all(&encode_frontend_message(PgWireFrontendMessage::Query(
+                Query::new("COPY copy_error_t FROM STDIN WITH (FORMAT csv)".to_string()),
+            )))
+            .await
+            .expect("write COPY query");
+        let copy_response = read_backend_message_timeout(&mut client, Duration::from_secs(2))
+            .await
+            .expect("CopyInResponse");
+        assert_eq!(copy_response.0, b'G');
+
+        client
+            .write_all(&encode_frontend_message(PgWireFrontendMessage::CopyData(
+                CopyData::new(Bytes::from_static(b"not-an-integer\n")),
+            )))
+            .await
+            .expect("write invalid COPY row");
+        let trailing_frame = Bytes::from(vec![b'1'; 8 * 1024]);
+        for _ in 0..512 {
+            client
+                .write_all(&encode_frontend_message(PgWireFrontendMessage::CopyData(
+                    CopyData::new(trailing_frame.clone()),
+                )))
+                .await
+                .expect("write trailing COPY frame");
+        }
+        client
+            .write_all(&encode_frontend_message(PgWireFrontendMessage::CopyDone(
+                CopyDone::new(),
+            )))
+            .await
+            .expect("write CopyDone");
+
+        let failed = read_messages_until_ready(&mut client).await;
+        assert_eq!(
+            failed.iter().filter(|(tag, _)| *tag == b'E').count(),
+            1,
+            "COPY failure must not reinterpret queued CopyData frames: {failed:?}"
+        );
+        assert_eq!(failed.last().map(|(tag, _)| *tag), Some(b'Z'));
+
+        let probe = run_simple_query_roundtrip(&mut client, "SELECT 1").await;
+        assert!(
+            !probe.iter().any(|(tag, _)| *tag == b'E'),
+            "connection must remain synchronized after COPY execution failure"
+        );
+
+        server
+            .shutdown(Duration::from_secs(5))
+            .await
+            .expect("shutdown server");
+        run_task
+            .await
+            .expect("accept loop join")
+            .expect("accept loop exit");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn extended_copy_pipeline_waits_for_sync_before_ready_for_query() {
         let (server, run_task, addr) = spawn_test_server(4).await;
         let mut client = TcpStream::connect(addr).await.expect("client connection");
@@ -1059,6 +1368,7 @@ mod tests {
                 Vec::new(),
             )),
             PgWireFrontendMessage::Execute(Execute::new(Some("select_portal".to_string()), 0)),
+            PgWireFrontendMessage::Flush(Flush::new()),
         ] {
             client
                 .write_all(&encode_frontend_message(message))

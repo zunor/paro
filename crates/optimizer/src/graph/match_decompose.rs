@@ -66,6 +66,7 @@ impl GraphMatchDecompose {
         let elements = gm.bound_pattern.elements;
         let columns = gm.columns;
         let table_index = gm.table_index;
+        let relation_alias = gm.relation_alias;
         let graph_name = gm.graph_entry.info.graph_name.clone();
         let schema_name = gm.graph_entry.info.schema.clone();
         let path_mode = gm.path_mode.clone();
@@ -156,7 +157,10 @@ impl GraphMatchDecompose {
 
         // Output columns are applied in a final `Projection`.
         let expressions: Vec<_> = columns.iter().map(|c| c.expr.clone()).collect();
-        let projection = Projection::new(table_index, current, expressions);
+        let visible_names = columns.iter().map(|column| column.alias.clone()).collect();
+        let projection = Projection::new(table_index, current, expressions)
+            .with_visible_names(visible_names)
+            .with_visible_qualifier(relation_alias);
         LogicalOperator::Projection(projection)
     }
 }
@@ -268,6 +272,7 @@ mod tests {
             BoundGraphPattern { elements },
             columns,
             table_index,
+            "graph_table".to_string(),
             output_types,
             None,
             false,

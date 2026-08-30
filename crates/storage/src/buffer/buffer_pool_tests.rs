@@ -116,6 +116,31 @@ fn test_out_of_memory() {
 }
 
 #[test]
+fn concurrent_pinned_allocations_never_oversubscribe_the_pool() {
+    let pool = BufferPool::new_arc(1024);
+    let start = Arc::new(std::sync::Barrier::new(8));
+    let workers = (0..8)
+        .map(|_| {
+            let pool = Arc::clone(&pool);
+            let start = Arc::clone(&start);
+            std::thread::spawn(move || {
+                start.wait();
+                pool.allocate_persistent(MemoryTag::PageCache, FileBufferType::ExternalFile, 384)
+                    .ok()
+            })
+        })
+        .collect::<Vec<_>>();
+    let handles = workers
+        .into_iter()
+        .filter_map(|worker| worker.join().unwrap())
+        .collect::<Vec<_>>();
+
+    assert_eq!(handles.len(), 2);
+    assert_eq!(pool.used_memory(), 768);
+    assert!(pool.used_memory() <= pool.max_memory());
+}
+
+#[test]
 fn test_set_memory_limit_with_evict_and_rollback() {
     let pool = BufferPool::new_arc(4096);
 

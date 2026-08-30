@@ -4,6 +4,7 @@
 //! Live commit publish-plan construction.
 
 use paro_common::error::Result;
+use paro_common::journal::JournalPublicationWatermarks;
 use paro_journal::{ApplyRequest, TabletApplyPart, WaitMode};
 use paro_transaction::{
     ApplyTargetSet, CommitBackpressureController, CommitFrontier, ParticipantDescriptor,
@@ -14,6 +15,7 @@ use std::sync::Arc;
 type ApplyWork = Box<dyn FnOnce() -> Result<()> + Send + 'static>;
 type CommitIdSink = Box<dyn FnOnce(u64) + Send + 'static>;
 type CommitApplyWork = Box<dyn FnOnce(u64) -> Result<()> + Send + 'static>;
+type CatalogPostWork = Box<dyn FnOnce(u64, u64) -> Result<()> + Send + 'static>;
 
 pub struct LivePublishPlanInput {
     pub post_apply_finalize: PostApplyFinalizePlan,
@@ -22,11 +24,13 @@ pub struct LivePublishPlanInput {
     pub participants: Arc<[ParticipantDescriptor]>,
     pub apply_targets: ApplyTargetSet,
     pub catalog_serial: bool,
+    pub has_catalog_publish: bool,
+    pub max_seen_object_id: u64,
     pub catalog_pre: ApplyWork,
     pub on_commit_id_assigned: CommitIdSink,
     pub tablet_parts: Vec<TabletApplyPart>,
     pub descriptor_phase: CommitApplyWork,
-    pub catalog_post: CommitApplyWork,
+    pub catalog_post: CatalogPostWork,
 }
 
 pub fn build_required_publish_plan(input: LivePublishPlanInput) -> RequiredPublishPlan {
@@ -37,6 +41,8 @@ pub fn build_required_publish_plan(input: LivePublishPlanInput) -> RequiredPubli
         participants,
         apply_targets,
         catalog_serial,
+        has_catalog_publish,
+        max_seen_object_id,
         catalog_pre,
         on_commit_id_assigned,
         tablet_parts,
@@ -47,18 +53,24 @@ pub fn build_required_publish_plan(input: LivePublishPlanInput) -> RequiredPubli
     RequiredPublishPlan::new(
         Box::new(move |handle| {
             let commit_id = handle.commit_ts().into_raw();
+            let publication_watermarks = JournalPublicationWatermarks::transaction(
+                commit_id,
+                if has_catalog_publish { commit_id } else { 0 },
+                max_seen_object_id,
+            );
             on_commit_id_assigned(commit_id);
             let published_handle = handle.clone();
             ApplyRequest {
                 lsn: handle.durable_lsn(),
                 durable_batch_lsn: handle.durable_batch_lsn(),
                 commit_id: Some(handle.commit_ts().into_raw()),
+                publication_watermarks,
                 wait_mode: WaitMode::Published,
                 catalog_serial,
                 catalog_pre,
                 tablet_parts,
                 descriptor_phase: Box::new(move || descriptor_phase(commit_id)),
-                catalog_post: Box::new(move || catalog_post(commit_id)),
+                catalog_post: Box::new(move || catalog_post(commit_id, handle.durable_lsn())),
                 on_published: Box::new(move || {
                     post_apply_finalize
                         .finalize_and_enqueue(&published_handle)
@@ -120,11 +132,13 @@ mod tests {
             participants: Arc::from([]),
             apply_targets: Arc::from([]),
             catalog_serial: false,
+            has_catalog_publish: false,
+            max_seen_object_id: 0,
             catalog_pre: Box::new(|| Ok(())),
             on_commit_id_assigned: Box::new(|_| {}),
             tablet_parts: Vec::new(),
             descriptor_phase: Box::new(|_| Ok(())),
-            catalog_post: Box::new(|_| Ok(())),
+            catalog_post: Box::new(|_, _| Ok(())),
         });
 
         let request = (plan.build_apply_request)(test_handle());

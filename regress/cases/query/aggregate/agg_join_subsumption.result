@@ -50,24 +50,22 @@ GROUP BY p.order_key, p.label
 ORDER BY p.order_key;
 QUERY PLAN
 ORDER_BY  (rows=4)
-  Sort Key: #0 ASC NULLS LAST
+  Sort Key: p.order_key ASC NULLS LAST
   ->  PROJECTION  (rows=4)
     Output: p.order_key, p.label, total_quantity
     ->  AGGREGATE  (rows=4)
-      Group Key: #0, #1
-      Aggregates: sum(#2)
-      Output: aggr_0, aggr_1, aggr_2
+      Group Key: p.order_key, p.label
+      Aggregates: sum(partial_aggregate)
       ->  HASH_JOIN  (rows=4)
         Join Type: INNER
-        Join Condition: #0 = #0
+        Join Condition: p.order_key = order_key
         ->  ROWSET_SCAN on public.agg_sub_preserved p  (rows=6)
           Columns: order_key, label
         ->  PROJECTION  (rows=3)
           Output: order_key, partial_aggregate
           ->  AGGREGATE  (rows=3)
-            Group Key: #0
-            Aggregates: sum(#1)
-            Output: aggr_0, aggr_1
+            Group Key: public.agg_sub_detail.order_key
+            Aggregates: sum(public.agg_sub_detail.quantity)
             ->  ROWSET_SCAN on public.agg_sub_detail  (rows=8)
               Columns: order_key, quantity
 

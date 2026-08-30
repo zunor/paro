@@ -7,13 +7,15 @@ use crate::ddl::{
     DdlChange, DdlChangeRecord, DdlDependencyRef, DdlObjectKey, DdlStorageDescriptor,
 };
 use crate::effect::{
-    ApplyDescriptor, CatalogTxnOp, DeferredTask, StagedArtifactDescriptor, StorageCommitOp,
-    TabletMutation,
+    ApplyDescriptor, CatalogTxnOp, DeferredTask, SearchGenerationHeadMeta,
+    StagedArtifactDescriptor, StorageCommitOp, TabletMutation,
 };
 use serde::{Deserialize, Serialize};
 
 /// Journal frame schema version used by the binary codec.
-pub const JOURNAL_FORMAT_VERSION: u16 = 4;
+/// Version 6 makes search-generation publication mode explicit and identities
+/// every immutable root revision independently.
+pub const JOURNAL_FORMAT_VERSION: u16 = 7;
 pub const COMMIT_RECORD_VERSION: u16 = 2;
 pub const MAINTENANCE_RECORD_VERSION: u16 = 2;
 pub const JOURNAL_RECORD_METADATA_VERSION: u16 = 1;
@@ -105,6 +107,7 @@ impl MaintenanceRecord {
 pub enum MaintenanceKind {
     Compaction,
     IndexBackfill,
+    SearchGenerationMaintenance,
     MaterializedViewRefresh,
 }
 
@@ -351,6 +354,22 @@ impl JournalChangeDescriptor {
                     descriptor_checksum_crc32c: checksum_serialized(descriptor),
                 });
             }
+            ApplyDescriptor::PublishStagedArtifact(
+                StagedArtifactDescriptor::SearchGenerationBuild(artifact),
+            ) => {
+                push_unique(&mut self.catalog_objects, artifact.table_object.clone());
+                push_nonzero_u64(&mut self.object_ids, artifact.table_id);
+                push_nonzero_u64(&mut self.tablet_ids, artifact.tablet_id);
+                self.artifacts.push(JournalArtifactDescriptor {
+                    tablet_id: Some(artifact.tablet_id),
+                    artifact_id: SearchGenerationHeadMeta::stable_artifact_id(
+                        artifact.definition_id,
+                        artifact.generation_id,
+                    ),
+                    kind: JournalArtifactKind::ApplyDescriptor,
+                    descriptor_checksum_crc32c: checksum_serialized(descriptor),
+                });
+            }
             ApplyDescriptor::RuntimeTransition(_) | ApplyDescriptor::Cleanup(_) => {
                 self.artifacts.push(JournalArtifactDescriptor {
                     tablet_id: None,
@@ -369,6 +388,8 @@ pub enum JournalArtifactKind {
     PrimaryDelete,
     DeletePatch,
     CompactionOutput,
+    SearchGeneration,
+    SearchGenerationRetirement,
     ApplyDescriptor,
     BulkLoadRowset,
 }
@@ -380,6 +401,8 @@ impl JournalArtifactKind {
             TabletMutation::ApplyPrimaryDelete { .. } => Self::PrimaryDelete,
             TabletMutation::ApplyDeletePatch { .. } => Self::DeletePatch,
             TabletMutation::PublishCompaction { .. } => Self::CompactionOutput,
+            TabletMutation::PublishSearchGeneration { .. } => Self::SearchGeneration,
+            TabletMutation::RetireSearchGeneration { .. } => Self::SearchGenerationRetirement,
         }
     }
 }
@@ -447,6 +470,43 @@ pub struct RecoverySummary {
     pub max_maintenance_id: u64,
     pub max_catalog_commit_id: u64,
     pub max_seen_object_id: u64,
+}
+
+/// Per-record durable watermarks folded into a checkpoint only after the
+/// ordered journal apply runtime has published the record at its real LSN.
+///
+/// This is deliberately separate from [`RecoverySummary`]: a summary is a
+/// prefix aggregate, while this value describes exactly one journal record.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct JournalPublicationWatermarks {
+    pub commit_id: u64,
+    pub maintenance_id: u64,
+    pub catalog_commit_id: u64,
+    pub max_seen_object_id: u64,
+}
+
+impl JournalPublicationWatermarks {
+    pub const fn transaction(
+        commit_id: u64,
+        catalog_commit_id: u64,
+        max_seen_object_id: u64,
+    ) -> Self {
+        Self {
+            commit_id,
+            maintenance_id: 0,
+            catalog_commit_id,
+            max_seen_object_id,
+        }
+    }
+
+    pub const fn maintenance(maintenance_id: u64) -> Self {
+        Self {
+            commit_id: 0,
+            maintenance_id,
+            catalog_commit_id: 0,
+            max_seen_object_id: 0,
+        }
+    }
 }
 
 fn storage_mutation_count(storage_ops: &[StorageCommitOp]) -> u32 {

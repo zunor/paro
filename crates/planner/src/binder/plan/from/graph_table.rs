@@ -19,6 +19,7 @@ impl Binder {
             graph_ref.bound_pattern,
             graph_ref.bound_columns,
             graph_ref.table_index,
+            graph_ref.relation_alias,
             output_types,
             path_mode,
             has_path_functions,

@@ -47,6 +47,10 @@ impl FunctionExecContext for BoundFunctionContext<'_> {
         self.runtime.transaction_timestamp_micros()
     }
 
+    fn next_random(&self) -> Option<f64> {
+        self.runtime.next_random()
+    }
+
     fn is_interrupted(&self) -> bool {
         self.runtime.is_interrupted()
     }

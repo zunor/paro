@@ -20,8 +20,6 @@ use paro_common::logging::targets;
 use paro_common::types::LogicalType;
 use paro_context::StatementContext;
 use paro_parser::ast::Statement;
-use paro_parser::Range;
-use std::collections::BTreeMap;
 use std::sync::Arc;
 use std::time::Instant;
 use tracing::debug;
@@ -97,10 +95,9 @@ impl Planner {
     pub fn new_with_parameters(
         context: Arc<StatementContext>,
         parameter_types: Vec<LogicalType>,
-        placeholder_indexes: BTreeMap<Range, usize>,
     ) -> Self {
         Self {
-            binder: Binder::with_parameters(context.clone(), parameter_types, placeholder_indexes),
+            binder: Binder::with_parameters(context.clone(), parameter_types),
             context,
             plan: None,
             names: Vec::new(),

@@ -15,7 +15,7 @@ use crate::tablet::{Tablet, TabletId, TabletState};
 use paro_common::allocator::{
     default_allocator, Allocator, BufferAllocator, BufferManager as CommonBufferManager, MemoryTag,
 };
-use paro_common::error::{self as paro_error, Result};
+use paro_common::error::{self as paro_error, codes, Result};
 use paro_scheduler::scheduler::TaskScheduler;
 use std::cmp::Ordering;
 use std::collections::{BinaryHeap, HashMap, HashSet};
@@ -148,6 +148,7 @@ pub struct CompactionObservability {
     pub max_queued_candidate_score: f64,
     pub running_tablets: Vec<TabletId>,
     pub failed_tablets: Vec<(TabletId, String)>,
+    pub quarantined_tablets: Vec<TabletId>,
     pub jobs: Vec<CompactionJobObservability>,
     pub suspended: bool,
     pub foreground_statements: usize,
@@ -161,6 +162,10 @@ pub struct CompactionManager {
     running_tablets: Arc<Mutex<HashSet<TabletId>>>,
     draining_tablets: Arc<Mutex<HashSet<TabletId>>>,
     failed_tablets: Arc<Mutex<HashMap<TabletId, String>>>,
+    /// Tablets with a non-retryable version-graph failure. They remain
+    /// registered and readable but are excluded from background compaction
+    /// until an operator explicitly clears the quarantine after repair.
+    quarantined_tablets: Arc<Mutex<HashSet<TabletId>>>,
     jobs: Arc<Mutex<HashMap<TabletId, CompactionJobObservability>>>,
     cancellation_tokens: Arc<Mutex<HashMap<TabletId, CancellationToken>>>,
     suspension_count: AtomicUsize,
@@ -208,6 +213,7 @@ impl CompactionManager {
             running_tablets: Arc::new(Mutex::new(HashSet::new())),
             draining_tablets: Arc::new(Mutex::new(HashSet::new())),
             failed_tablets: Arc::new(Mutex::new(HashMap::new())),
+            quarantined_tablets: Arc::new(Mutex::new(HashSet::new())),
             jobs: Arc::new(Mutex::new(HashMap::new())),
             cancellation_tokens: Arc::new(Mutex::new(HashMap::new())),
             suspension_count: AtomicUsize::new(0),
@@ -249,6 +255,7 @@ impl CompactionManager {
             running_tablets: Arc::new(Mutex::new(HashSet::new())),
             draining_tablets: Arc::new(Mutex::new(HashSet::new())),
             failed_tablets: Arc::new(Mutex::new(HashMap::new())),
+            quarantined_tablets: Arc::new(Mutex::new(HashSet::new())),
             jobs: Arc::new(Mutex::new(HashMap::new())),
             cancellation_tokens: Arc::new(Mutex::new(HashMap::new())),
             suspension_count: AtomicUsize::new(0),
@@ -325,6 +332,7 @@ impl CompactionManager {
         tablets.insert(tablet_id, tablet);
         drop(tablets);
         self.draining_tablets.lock().unwrap().remove(&tablet_id);
+        self.clear_tablet_quarantine(tablet_id);
         self.refresh_metrics();
     }
 
@@ -336,7 +344,7 @@ impl CompactionManager {
         self.draining_tablets.lock().unwrap().remove(&tablet_id);
         self.cancellation_tokens.lock().unwrap().remove(&tablet_id);
         self.jobs.lock().unwrap().remove(&tablet_id);
-        self.clear_failure(tablet_id);
+        self.clear_tablet_quarantine(tablet_id);
         self.refresh_metrics();
         Ok(())
     }
@@ -392,7 +400,7 @@ impl CompactionManager {
                 jobs.remove(tablet_id);
                 draining.remove(tablet_id);
                 cancellation_tokens.remove(tablet_id);
-                self.clear_failure(*tablet_id);
+                self.clear_tablet_quarantine(*tablet_id);
             }
         }
 
@@ -657,9 +665,11 @@ impl CompactionManager {
         {
             let running = self.running_tablets.lock().unwrap();
             let draining = self.draining_tablets.lock().unwrap();
+            let quarantined = self.quarantined_tablets.lock().unwrap().clone();
             for tablet in tablets_list {
                 if running.contains(&tablet.tablet_id())
                     || draining.contains(&tablet.tablet_id())
+                    || quarantined.contains(&tablet.tablet_id())
                     || tablet.state() == TabletState::Shutdown
                 {
                     continue;
@@ -675,12 +685,22 @@ impl CompactionManager {
                     }
                     Ok(None) => {}
                     Err(err) => {
-                        self.record_failure(tablet.tablet_id(), format!("plan failed: {}", err));
-                        error!(
-                            "Failed to plan compaction for tablet {}: {}",
-                            tablet.tablet_id(),
-                            err
-                        );
+                        let reason = format!("plan failed: {err}");
+                        if err.is(codes::internal::DATA_CORRUPTED) {
+                            self.quarantine_failure(tablet.tablet_id(), reason);
+                            error!(
+                                tablet_id = tablet.tablet_id(),
+                                error = %err,
+                                "Compaction planning found a non-retryable version-graph failure; tablet quarantined from compaction"
+                            );
+                        } else {
+                            self.record_failure(tablet.tablet_id(), reason);
+                            error!(
+                                "Failed to plan compaction for tablet {}: {}",
+                                tablet.tablet_id(),
+                                err
+                            );
+                        }
                     }
                 }
             }
@@ -864,6 +884,15 @@ impl CompactionManager {
             .collect();
         failed_tablets.sort_by_key(|(tablet_id, _)| *tablet_id);
 
+        let mut quarantined_tablets: Vec<TabletId> = self
+            .quarantined_tablets
+            .lock()
+            .unwrap()
+            .iter()
+            .copied()
+            .collect();
+        quarantined_tablets.sort_unstable();
+
         let mut jobs: Vec<CompactionJobObservability> =
             self.jobs.lock().unwrap().values().cloned().collect();
         jobs.sort_by_key(|job| (job.tablet_id, job.job_id));
@@ -875,6 +904,7 @@ impl CompactionManager {
             max_queued_candidate_score: debt.max_candidate_score,
             running_tablets,
             failed_tablets,
+            quarantined_tablets,
             jobs,
             suspended: self.is_suspended(),
             foreground_statements: self.foreground_statements.load(AtomicOrdering::Acquire),
@@ -889,6 +919,18 @@ impl CompactionManager {
             .lock()
             .unwrap()
             .insert(tablet_id, reason);
+    }
+
+    fn quarantine_failure(&self, tablet_id: TabletId, reason: String) {
+        self.record_failure(tablet_id, reason);
+        self.quarantined_tablets.lock().unwrap().insert(tablet_id);
+    }
+
+    /// Re-admit a repaired tablet to compaction. Registration also clears a
+    /// prior quarantine because it establishes a new tablet runtime identity.
+    pub fn clear_tablet_quarantine(&self, tablet_id: TabletId) {
+        self.quarantined_tablets.lock().unwrap().remove(&tablet_id);
+        self.clear_failure(tablet_id);
     }
 
     fn clear_failure(&self, tablet_id: TabletId) {
@@ -908,7 +950,7 @@ fn duration_ns(duration: Duration) -> u64 {
 
 fn policy_priority(kind: PolicyKind) -> u8 {
     match kind {
-        PolicyKind::PrimaryKeyFull => 4,
+        PolicyKind::Goal => 4,
         PolicyKind::SizeTiered => 3,
         PolicyKind::Cumulative => 2,
         PolicyKind::Base => 1,
@@ -934,6 +976,7 @@ mod tests {
         CompactionPlanId, CompactionReason, CumulativePointAction, ExecutionLayout, MergeSemantics,
         ReadSnapshot,
     };
+    use crate::rowset::{Rowset, RowsetMeta};
     use crate::tablet::Version;
     use crate::tablet::{KeysType, TabletColumn, TabletSchema};
     use paro_common::types::LogicalType;
@@ -958,7 +1001,8 @@ mod tests {
             output_rowset_id: tablet_id + 10_000,
             score: 1.0,
             reason: CompactionReason::CumulativePolicy,
-            pk_delta_guard: None,
+            goal: crate::compaction::plan::types::CompactionGoal::ReduceDebt,
+            primary_index_publish: None,
         }
     }
 
@@ -1080,6 +1124,38 @@ mod tests {
         manager.schedule().await;
 
         assert_eq!(manager.running_task_count(), 0);
+    }
+
+    #[tokio::test]
+    async fn data_corrupted_plan_quarantines_tablet_until_explicit_repair() {
+        let dir = tempfile::tempdir().unwrap();
+        let manager = CompactionManager::new(1);
+        let tablet = create_test_tablet(7, dir.path());
+        let rowset = Rowset::create(
+            tablet.schema().expect("test tablet schema"),
+            RowsetMeta::new(1, tablet.tablet_id(), Version::new(0, 2)),
+            tablet.data_dir().join("crossing-rowset"),
+        )
+        .unwrap();
+        tablet.add_rowset(Arc::new(rowset)).unwrap();
+        tablet.set_cumulative_point(1);
+        manager.register_tablet(Arc::clone(&tablet));
+
+        manager.schedule().await;
+        let observation = manager.observability();
+        assert_eq!(observation.quarantined_tablets, vec![7]);
+        assert!(observation.failed_tablets[0]
+            .1
+            .contains("crosses the cumulative point"));
+
+        // A subsequent scheduler round skips the tablet instead of emitting
+        // the same permanent planning failure again.
+        let failure = observation.failed_tablets[0].1.clone();
+        manager.schedule().await;
+        assert_eq!(manager.observability().failed_tablets[0].1, failure);
+
+        manager.clear_tablet_quarantine(7);
+        assert!(manager.observability().quarantined_tablets.is_empty());
     }
 
     #[tokio::test]

@@ -8,6 +8,7 @@ use crate::compaction::plan::types::{
     CompactionJobId, CompactionLifecycleState, CompactionPlan, ExecutionLayout,
 };
 use crate::compaction::publish::{CompactionPublisher, CompactionValidator};
+use crate::metrics::storage_metrics;
 use crate::search::SearchInlineBuilderSet;
 use crate::tablet::Tablet;
 use paro_common::allocator::Allocator;
@@ -108,6 +109,37 @@ fn run_job_inner<F>(
 where
     F: FnMut(CompactionLifecycleState),
 {
+    // A search generation embeds physical rowset/segment identities. Yield
+    // background compaction while a foreground staged build owns that stable
+    // layout, and hold this shared lease through durable compaction publish so
+    // the two artifact lifecycles cannot cross.
+    let Some(_layout_lease) = tablet.try_acquire_compaction_layout_lease()? else {
+        storage_metrics().inc_compaction_layout_gate_skips();
+        return Ok(false);
+    };
+    let replaced_rowset_ids = plan
+        .input_rowsets
+        .iter()
+        .map(|input| input.rowset.rowset_id())
+        .collect::<Vec<_>>();
+    if let crate::tablet::SearchCompactionRequirement::GenerationReplacement { definition_ids } =
+        tablet.search_compaction_requirement(&replaced_rowset_ids)
+    {
+        // A generation-owned graph embeds physical rowset/segment identities.
+        // Publishing only the base rowset would invalidate that graph and turn
+        // the complete compaction output into an unbounded exact tail.  A
+        // future co-planned job may proceed by carrying the replacement graph
+        // and head in the same durable mutation; an unpaired layout rewrite is
+        // never an admissible fallback.
+        tracing::debug!(
+            tablet_id = tablet.tablet_id(),
+            plan_id = plan.plan_id.0,
+            input_count = replaced_rowset_ids.len(),
+            definition_ids = ?definition_ids,
+            "deferred compaction until a replacement search generation is co-planned"
+        );
+        return Ok(false);
+    }
     on_state(CompactionLifecycleState::Building);
     let workspace =
         crate::compaction::execution::workspace::CompactionWorkspace::create_with_cancel_token(
@@ -117,6 +149,7 @@ where
             cancel_token,
         )?;
 
+    let rebuild_search_definitions = search_inline_builders.clone();
     let output = match plan.execution_layout {
         ExecutionLayout::Vertical => VerticalMerger::build_with_search_inline_builders(
             tablet,
@@ -140,13 +173,23 @@ where
     on_state(CompactionLifecycleState::Validated);
     match &output {
         crate::compaction::execution::workspace::CompactionBuildOutput::Rowset(artifact) => {
-            rebuild_compaction_indexes(tablet, artifact.rowset.clone(), plan.as_ref())?;
+            rebuild_compaction_indexes(
+                tablet,
+                artifact.rowset.clone(),
+                plan.as_ref(),
+                &rebuild_search_definitions,
+            )?;
         }
         crate::compaction::execution::workspace::CompactionBuildOutput::PrimaryKey {
             artifact,
             ..
         } => {
-            rebuild_compaction_indexes(tablet, artifact.rowset.clone(), plan.as_ref())?;
+            rebuild_compaction_indexes(
+                tablet,
+                artifact.rowset.clone(),
+                plan.as_ref(),
+                &rebuild_search_definitions,
+            )?;
         }
     }
 

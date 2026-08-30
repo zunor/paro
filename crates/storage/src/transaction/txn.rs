@@ -6,7 +6,7 @@
 //! Coordinates undo tracking, staged writes, commit, rollback, and cleanup.
 
 use crate::search::write_path::SearchWriteContext;
-use crate::tablet::{PhysicalRowRef, PrimaryIndexUpdate, TabletRef};
+use crate::tablet::{LayoutMaintenanceLease, PhysicalRowRef, PrimaryIndexUpdate, TabletRef};
 use crate::transaction::undo_buffer::{ActiveTransactionState, UndoBuffer};
 use crate::transaction::write_buffer::{
     GraphTableDmlDelta, PendingMutation, PendingPrimaryDelete, PendingRowIdDelete, PendingRowset,
@@ -850,7 +850,7 @@ impl Transaction {
     }
 
     fn discard_pending_rowset(pending: PendingRowset) {
-        if let Some(artifact) = &pending.spilled_artifact {
+        if let Some(artifact) = &pending.staged_artifact {
             artifact.abandon_and_remove();
         } else {
             let _ = std::fs::remove_dir_all(&pending.rowset_path);
@@ -930,7 +930,7 @@ impl Transaction {
                         .tablet
                         .rowset_commit(commit_version, pending.rowset.clone())?;
                 }
-                if let Some(artifact) = &pending.spilled_artifact {
+                if let Some(artifact) = &pending.staged_artifact {
                     artifact.mark_committed_descriptor_written();
                 }
             }
@@ -1026,10 +1026,54 @@ impl Transaction {
             .push(mutation);
     }
 
+    fn acquire_storage_publish_layout_leases(
+        &self,
+        pending: &[PendingMutation],
+    ) -> Result<Vec<LayoutMaintenanceLease>> {
+        let mut tablets = BTreeMap::<u64, TabletRef>::new();
+        for mutation in pending {
+            let tablet = match mutation {
+                PendingMutation::Rowset(pending) => &pending.tablet,
+                PendingMutation::PrimaryDelete(pending) => &pending.tablet,
+                PendingMutation::RowIdDelete(pending) => &pending.tablet,
+            };
+            tablets
+                .entry(tablet.tablet_id())
+                .or_insert_with(|| Arc::clone(tablet));
+        }
+        tablets
+            .into_values()
+            .map(|tablet| {
+                tablet.acquire_storage_publish_layout_lease(|| self.is_awaiting_cleanup())
+            })
+            .collect()
+    }
+
     pub fn prepare_commit(&self) -> Result<PreparedStorageCommit> {
         self.write_buffer.materialize_writers()?;
 
+        // Search-tail pressure is commit admission, not rowset publication.
+        // A required apply happens after the database journal is durable and
+        // must therefore never time out or reject because a derived index is
+        // behind. Aggregate all rowsets for a tablet so one transaction cannot
+        // cross the freshness window through several individually-small parts.
+        let mut search_ingest_admissions = Vec::new();
+        for (tablet, incoming_rows, incoming_bytes) in
+            self.write_buffer.pending_rowset_volume_by_tablet()?
+        {
+            if let Some(admission) =
+                tablet.acquire_search_rowset_publish_admission(incoming_rows, incoming_bytes)?
+            {
+                search_ingest_admissions.push(admission);
+            }
+        }
+
         let pending = self.write_buffer.take_mutations()?;
+        // Acquire in tablet-id order while SQL write locks are still held.
+        // These leases bridge the later lock-release -> required-apply window,
+        // preventing a stable-layout index build from snapshotting ahead of an
+        // earlier durable DML commit whose rowset is not published yet.
+        let layout_leases = self.acquire_storage_publish_layout_leases(&pending)?;
         let (primary_deletes, row_id_deletes, rowsets) = self.split_pending_operations(pending)?;
 
         let mut data_ops = Vec::new();
@@ -1143,6 +1187,8 @@ impl Transaction {
             rowsets,
             primary_deletes,
             row_id_deletes,
+            _layout_leases: layout_leases,
+            _search_ingest_admissions: search_ingest_admissions,
         })?;
 
         Ok(PreparedStorageCommit {
@@ -1154,6 +1200,7 @@ impl Transaction {
 
     fn apply_pending_writes(&self, commit_id: u64) -> Result<()> {
         let pending = self.write_buffer.take_mutations()?;
+        let _layout_leases = self.acquire_storage_publish_layout_leases(&pending)?;
         let (primary_deletes, row_id_deletes, rowsets) = self.split_pending_operations(pending)?;
         self.apply_materialized_writes(commit_id, &primary_deletes, &row_id_deletes, rowsets)
     }
@@ -1685,6 +1732,35 @@ mod tests {
     }
 
     #[test]
+    fn primary_key_append_retains_fine_grained_commit_locks() {
+        let table = create_table_with_keys(
+            &[LogicalType::Integer, LogicalType::Integer],
+            KeysType::PrimaryKeys,
+        );
+        let txn = Transaction::new(9203, 9203);
+        txn.append_to_tablet(
+            CommandId::new(0),
+            table.tablet(),
+            &test_chunk_from_vectors(vec![test_i32_vector(&[1, 2]), test_i32_vector(&[10, 20])]),
+            SearchWriteContext::default(),
+        )
+        .expect("append primary-key batch");
+
+        let lock_set = txn.frozen_lock_set();
+        assert_eq!(
+            lock_set
+                .locks()
+                .iter()
+                .filter(|request| matches!(request.resource, LockResource::PrimaryKey { .. }))
+                .count(),
+            2
+        );
+        assert!(lock_set.locks().iter().any(|request| {
+            request.mode == LockMode::IX && matches!(request.resource, LockResource::Table { .. })
+        }));
+    }
+
+    #[test]
     fn test_storage_participant_state_is_resolved_from_transaction_view() {
         let txn = Transaction::new(9001, 9001);
         let states = ParticipantStateSet::from_vec(vec![txn.storage_participant_state()]);
@@ -1784,7 +1860,7 @@ mod tests {
     }
 
     #[test]
-    fn test_txn_overlay_reader_reads_spilled_rowset() {
+    fn test_txn_overlay_reader_reopens_evicted_rowset() {
         let _spill_guard = reset_spill_for_test();
         let table = create_table(&[LogicalType::Integer]);
         let txn = Arc::new(Transaction::new(9605, txn_start_after_table(&table)));
@@ -1805,8 +1881,11 @@ mod tests {
             .expect("build spilled overlay")
             .expect("overlay should exist");
 
-        assert_eq!(overlay.rowsets().len(), 0);
-        assert_eq!(overlay.spilled_artifacts().len(), 1);
+        assert_eq!(overlay.rowsets().len(), 1);
+        assert!(
+            !overlay.rowsets()[0].has_loaded_segments(),
+            "memory governance should evict the rowset read state without changing overlay identity"
+        );
         assert_eq!(
             collect_rows_i32_with_view(&table, &view1),
             vec![11, 12, 13, 14]
@@ -2045,6 +2124,31 @@ mod tests {
             &tablet_op.mutations[2],
             TabletMutation::PublishRowset { rowset_id, .. } if *rowset_id > 0
         ));
+
+        let started = Arc::new(AtomicBool::new(false));
+        let acquired = Arc::new(AtomicBool::new(false));
+        let tablet_for_waiter = tablet.clone();
+        let started_for_waiter = Arc::clone(&started);
+        let acquired_for_waiter = Arc::clone(&acquired);
+        let waiter = thread::spawn(move || {
+            started_for_waiter.store(true, Ordering::Release);
+            let lease = tablet_for_waiter
+                .acquire_stable_layout_lease(77, || false)
+                .unwrap();
+            acquired_for_waiter.store(true, Ordering::Release);
+            lease
+        });
+        while !started.load(Ordering::Acquire) {
+            thread::yield_now();
+        }
+        thread::sleep(std::time::Duration::from_millis(10));
+        assert!(
+            !acquired.load(Ordering::Acquire),
+            "prepared DML must retain its shared layout lease"
+        );
+        txn.rollback_prepared_storage_only();
+        drop(waiter.join().unwrap());
+        assert!(acquired.load(Ordering::Acquire));
     }
 
     #[test]

@@ -116,12 +116,17 @@ fn start_program_with_output(
     completed_output: QueryOutputPort,
     fetch_driven: bool,
 ) -> Result<ProgramExecution> {
+    let requires_background_input = session.input.requires_background_execution();
     let output = match program {
+        StatementProgram::Pipeline { .. } if fetch_driven && requires_background_input => {
+            QueryOutputPort::with_blocking_writes(&streaming_output)
+        }
         StatementProgram::Pipeline { graph, .. }
             if fetch_driven
-                && session.limits.parallel_scheduler
-                && graph.control_regions.is_empty()
-                && session.number_of_threads() > 1 =>
+                && PipelineScheduler::should_use_parallel_scheduler_for_session(
+                    graph,
+                    session.as_ref(),
+                ) =>
         {
             QueryOutputPort::with_blocking_writes(&streaming_output)
         }
@@ -142,6 +147,21 @@ fn start_program_with_output(
         StatementProgram::Utility(utility) => run_utility(utility, &query)?,
         StatementProgram::ExplainAnalyze { target, spec } => {
             run_explain_analyze(target, *spec, &query, allocator)?
+        }
+        StatementProgram::Pipeline {
+            graph, programs, ..
+        } if fetch_driven && requires_background_input => {
+            let background = BackgroundExecutionDriver::spawn(
+                graph.clone(),
+                programs.clone(),
+                query.clone(),
+                allocator,
+            )?;
+            return Ok(ProgramExecution {
+                query,
+                driver: None,
+                background: Some(background),
+            });
         }
         StatementProgram::Pipeline {
             graph, programs, ..
@@ -232,8 +252,8 @@ impl BackgroundExecutionDriver {
                     Ok(result) => result,
                     Err(_) => Err(paro_error::internal("background query driver panicked")),
                 };
-                worker_query.output.close();
                 worker_state.finish(result);
+                worker_query.output.close();
             })
             .map_err(|error| {
                 paro_error::internal(format!("failed to spawn background query driver: {error}"))

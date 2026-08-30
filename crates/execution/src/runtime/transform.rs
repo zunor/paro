@@ -62,7 +62,8 @@ impl TransformExec {
         }
     }
 
-    #[inline]
+    /// Cold lifecycle dispatch; see [`SourceExec::create_global`](super::source::SourceExec::create_global).
+    #[inline(never)]
     pub fn create_global(&self, ctx: &mut PipelineInitContext) -> Result<TransformGlobal> {
         match self {
             Self::Filter(exec) => exec.create_global(ctx),
@@ -83,7 +84,7 @@ impl TransformExec {
         }
     }
 
-    #[inline]
+    #[inline(never)]
     pub fn create_local(
         &self,
         ctx: &mut PipelineInitContext,

@@ -13,6 +13,7 @@ use paro_common::chunk::Chunk;
 use paro_common::test_utils::{test_allocator, test_embeddings_vector, test_string_vector};
 use paro_common::types::LogicalType;
 use paro_common::vector::Vector;
+use paro_storage::index::hnsw::DistanceMetric;
 use paro_storage::metrics::storage_metrics;
 use paro_storage::rowset::SparseVector;
 use paro_storage::search::bench_support::manifest_fragment_bytes;
@@ -265,7 +266,7 @@ fn prepare_definition_and_chunk(
         }
         SearchIndexKind::Hnsw => {
             let capability = table
-                .vector_capability(0)
+                .vector_capability(0, DistanceMetric::Euclidean)
                 .expect("array(float) column should seed HNSW definition");
             Ok((
                 capability.definition_id,
@@ -292,19 +293,54 @@ fn search_definition(
     tokenizer: Option<&str>,
     dimension: Option<u64>,
 ) -> SearchIndexDefinition {
-    let mut provider_config = match provider {
-        SearchIndexKind::FullText => serde_json::json!({"config": tokenizer.unwrap_or("simple")}),
-        SearchIndexKind::Sparse => serde_json::json!({"physical_encoding": "binary-v1"}),
-        SearchIndexKind::Hnsw => serde_json::json!({
-            "m": 16,
-            "ef_construct": 64,
-            "distance": "l2",
-            "dimension": dimension.unwrap_or(HNSW_DIMENSION as u64),
+    let provider_config = match provider {
+        SearchIndexKind::FullText => serde_json::json!({
+            "version": paro_storage::search::FULLTEXT_PROVIDER_CONFIG_VERSION,
+            "config": tokenizer.unwrap_or("simple")
         }),
+        SearchIndexKind::Sparse => serde_json::json!({
+            "version": paro_storage::search::SPARSE_PROVIDER_CONFIG_VERSION,
+            "physical_encoding": "binary-v1"
+        }),
+        SearchIndexKind::Hnsw => paro_storage::search::HnswProviderConfig {
+            version: paro_storage::search::HNSW_PROVIDER_CONFIG_VERSION,
+            dimension: dimension.unwrap_or(HNSW_DIMENSION as u64) as u32,
+            distance: paro_storage::index::hnsw::DistanceMetric::Euclidean,
+            build_vector_encoding:
+                paro_storage::index::hnsw::HnswBuildVectorEncoding::default_for_dimension(
+                    dimension.unwrap_or(HNSW_DIMENSION as u64) as u32,
+                )
+                .unwrap(),
+            m: 16,
+            ef_construct: 64,
+            ef_search: 64,
+            rerank_policy: paro_storage::index::hnsw::HnswRerankPolicy::default_for_encoding(
+                paro_storage::index::hnsw::HnswBuildVectorEncoding::default_for_dimension(
+                    dimension.unwrap_or(HNSW_DIMENSION as u64) as u32,
+                )
+                .unwrap(),
+            ),
+            distance_cost: paro_storage::index::hnsw::HnswDistanceCostProfile::default(),
+            generation_layout: paro_storage::search::HnswGenerationLayout::default(),
+            maintenance: paro_storage::search::HnswMaintenancePolicy::default(),
+            build_seed: paro_storage::search::DEFAULT_HNSW_BUILD_SEED,
+            proposal_wave_max_size: paro_storage::search::DEFAULT_HNSW_PROPOSAL_WAVE_MAX_SIZE,
+            warmup_point_count: paro_storage::search::DEFAULT_HNSW_WARMUP_POINT_COUNT,
+            filter_columns: Vec::new(),
+            filter_block_rows: paro_storage::search::DEFAULT_HNSW_FILTER_BLOCK_ROWS,
+            filter_m: paro_storage::search::DEFAULT_HNSW_FILTER_M,
+            inline_threshold: paro_storage::search::HnswInlineConfig {
+                enabled: true,
+                max_vector_count: 4_096,
+                max_graph_memory_bytes: 64 * 1024 * 1024,
+                max_dimension: 1_536,
+            },
+        }
+        .validated()
+        .expect("valid benchmark HNSW config")
+        .to_value()
+        .expect("serialize benchmark HNSW config"),
     };
-    if provider == SearchIndexKind::FullText {
-        provider_config["tokenizer"] = serde_json::json!(tokenizer.unwrap_or("simple"));
-    }
     let expression = tokenizer.map(|config| format!("to_tsvector('{config}', col_{column_id})"));
     SearchIndexDefinition {
         definition_id,
@@ -314,12 +350,13 @@ fn search_definition(
         column_ids: vec![column_id],
         expression: expression.clone(),
         freshness_policy: SearchFreshnessPolicy::default_for_kind(provider),
-        config_fingerprint: SearchIndexDefinition::compute_config_fingerprint(
+        config_fingerprint: SearchIndexDefinition::try_compute_config_fingerprint(
             provider,
             &[column_id],
             expression.as_deref(),
             &provider_config,
-        ),
+        )
+        .expect("benchmark provider config is valid"),
         provider_config,
     }
 }

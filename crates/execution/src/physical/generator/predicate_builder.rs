@@ -19,6 +19,8 @@ use paro_planner::expression::{ComparisonType, ConjunctionType, Expression, Oper
 use paro_planner::operator::get::Get;
 use paro_storage::index::{Predicate, PredicateComparison, PredicateTree};
 
+use crate::physical::specs::SearchPredicateTemplate;
+
 pub fn build_predicate_tree(
     filters: &[Expression],
     get: &Get,
@@ -39,6 +41,125 @@ pub fn build_predicate_tree(
     }
 
     Ok((combine_with_and(pushed_trees), residual_exprs))
+}
+
+/// Build a reusable search predicate. Unlike a storage `PredicateTree`, this
+/// representation may retain typed parameter slots and binds them once when a
+/// prepared search source opens.
+pub fn build_search_predicate_template(
+    filters: &[Expression],
+    get: &Get,
+) -> Result<(Option<SearchPredicateTemplate>, Vec<Expression>)> {
+    let mut pushed = Vec::new();
+    let mut residual = Vec::new();
+    for expression in filters {
+        let (template, mut expression_residual) = extract_search_predicate(expression, get)?;
+        if let Some(template) = template {
+            pushed.push(template);
+        }
+        residual.append(&mut expression_residual);
+    }
+    Ok((SearchPredicateTemplate::and(pushed), residual))
+}
+
+fn extract_search_predicate(
+    expression: &Expression,
+    get: &Get,
+) -> Result<(Option<SearchPredicateTemplate>, Vec<Expression>)> {
+    if let Some(tree) = build_predicate(expression, get)? {
+        return Ok((Some(SearchPredicateTemplate::bound(tree)), Vec::new()));
+    }
+
+    match expression {
+        Expression::Conjunction(conjunction) => {
+            let mut children = Vec::new();
+            let mut residual = Vec::new();
+            for child in &conjunction.children {
+                let (template, mut child_residual) = extract_search_predicate(child, get)?;
+                if let Some(template) = template {
+                    children.push(template);
+                }
+                residual.append(&mut child_residual);
+            }
+            match conjunction.conjunction_type {
+                ConjunctionType::And => Ok((SearchPredicateTemplate::and(children), residual)),
+                ConjunctionType::Or if residual.is_empty() => {
+                    Ok((SearchPredicateTemplate::or(children), Vec::new()))
+                }
+                ConjunctionType::Or => Ok((None, vec![expression.clone()])),
+            }
+        }
+        Expression::Comparison(comparison) => {
+            match build_parameter_comparison_template(comparison, get) {
+                Some(template) => Ok((Some(template), Vec::new())),
+                None => Ok((None, vec![expression.clone()])),
+            }
+        }
+        _ => Ok((None, vec![expression.clone()])),
+    }
+}
+
+fn build_parameter_comparison_template(
+    comparison: &paro_planner::expression::ComparisonExpression,
+    get: &Get,
+) -> Option<SearchPredicateTemplate> {
+    let left_column = extract_scan_column_operand(&comparison.left);
+    let right_column = extract_scan_column_operand(&comparison.right);
+    let (column, parameter_expression, comparison_type) = match (left_column, right_column) {
+        (Some(column), None) => (column, &comparison.right, comparison.comparison_type),
+        (None, Some(column)) => (
+            column,
+            &comparison.left,
+            flip_comparison(comparison.comparison_type)?,
+        ),
+        _ => return None,
+    };
+    if !matches!(
+        column.transform,
+        ScanColumnTransform::Identity | ScanColumnTransform::IntegralWidening
+    ) {
+        return None;
+    }
+    let column_id = get.stored_column(column.column_idx)? as u32;
+    let target_type = get.column_types.get(column.column_idx)?.clone();
+    if matches!(target_type, LogicalType::Array(..) | LogicalType::Unknown) {
+        return None;
+    }
+    let slot = extract_parameter_slot(parameter_expression, &target_type)?;
+    Some(SearchPredicateTemplate::parameter_comparison(
+        column_id,
+        storage_predicate_comparison(comparison_type)?,
+        slot,
+        target_type,
+    ))
+}
+
+fn extract_parameter_slot(
+    expression: &Expression,
+    target_type: &LogicalType,
+) -> Option<paro_common::typed_parameters::ParameterSlot> {
+    match expression {
+        Expression::Parameter(parameter) => Some(parameter.slot.clone()),
+        Expression::Cast(cast)
+            if cast.cast_info.context_dependency() == CastContextDependency::Independent
+                && &cast.target_type == target_type =>
+        {
+            extract_parameter_slot(cast.child.as_ref(), target_type)
+        }
+        _ => None,
+    }
+}
+
+fn storage_predicate_comparison(comparison: ComparisonType) -> Option<PredicateComparison> {
+    match comparison {
+        ComparisonType::Equal => Some(PredicateComparison::Equal),
+        ComparisonType::NotEqual => Some(PredicateComparison::NotEqual),
+        ComparisonType::LessThan => Some(PredicateComparison::LessThan),
+        ComparisonType::LessThanOrEqual => Some(PredicateComparison::LessThanOrEqual),
+        ComparisonType::GreaterThan => Some(PredicateComparison::GreaterThan),
+        ComparisonType::GreaterThanOrEqual => Some(PredicateComparison::GreaterThanOrEqual),
+        ComparisonType::DistinctFrom | ComparisonType::NotDistinctFrom => None,
+    }
 }
 
 fn extract_predicate(
@@ -182,6 +303,10 @@ struct ScanColumnOperand {
 #[derive(Debug, Clone, Copy)]
 enum ScanColumnTransform {
     Identity,
+    /// An order-preserving, injective integer cast. Runtime values are mapped
+    /// back into the stored column domain at source open; values outside that
+    /// domain fold to an empty or all-non-null predicate.
+    IntegralWidening,
     /// SQL DATE values are represented by midnight timestamps under this
     /// widening cast. A timestamp constant can be mapped back only when it is
     /// exactly representable as a DATE; otherwise the comparison stays in the
@@ -199,16 +324,52 @@ fn extract_scan_column_operand(expr: &Expression) -> Option<ScanColumnOperand> {
     let Expression::Cast(cast) = expr else {
         return None;
     };
-    if cast.cast_info.context_dependency() != CastContextDependency::Independent
-        || cast.child.return_type() != LogicalType::Date
-        || cast.target_type != LogicalType::Timestamp
-    {
+    if cast.cast_info.context_dependency() != CastContextDependency::Independent {
         return None;
     }
+    let source_type = cast.child.return_type();
+    let transform =
+        if source_type == LogicalType::Date && cast.target_type == LogicalType::Timestamp {
+            ScanColumnTransform::DateToTimestamp
+        } else if is_lossless_integral_widening(&source_type, &cast.target_type) {
+            ScanColumnTransform::IntegralWidening
+        } else {
+            return None;
+        };
     Some(ScanColumnOperand {
         column_idx: extract_scan_column_index(cast.child.as_ref())?,
-        transform: ScanColumnTransform::DateToTimestamp,
+        transform,
     })
+}
+
+fn is_lossless_integral_widening(source: &LogicalType, target: &LogicalType) -> bool {
+    fn domain(ty: &LogicalType) -> Option<(bool, u16)> {
+        Some(match ty {
+            LogicalType::TinyInt => (true, 8),
+            LogicalType::SmallInt => (true, 16),
+            LogicalType::Integer => (true, 32),
+            LogicalType::BigInt => (true, 64),
+            LogicalType::HugeInt => (true, 128),
+            LogicalType::UTinyInt => (false, 8),
+            LogicalType::USmallInt => (false, 16),
+            LogicalType::UInteger => (false, 32),
+            LogicalType::UBigInt => (false, 64),
+            LogicalType::UHugeInt => (false, 128),
+            _ => return None,
+        })
+    }
+
+    let Some((source_signed, source_bits)) = domain(source) else {
+        return false;
+    };
+    let Some((target_signed, target_bits)) = domain(target) else {
+        return false;
+    };
+    match (source_signed, target_signed) {
+        (true, true) | (false, false) => target_bits >= source_bits,
+        (false, true) => target_bits > source_bits,
+        (true, false) => false,
+    }
 }
 
 fn extract_comparison_constant(
@@ -218,6 +379,15 @@ fn extract_comparison_constant(
 ) -> Result<Option<Value>> {
     match operand.transform {
         ScanColumnTransform::Identity => extract_constant_value(expr, get, operand.column_idx),
+        ScanColumnTransform::IntegralWidening => {
+            let Some(value) = evaluate_bound_constant(expr)? else {
+                return Ok(None);
+            };
+            let Some(target_type) = get.column_types.get(operand.column_idx) else {
+                return Ok(None);
+            };
+            Ok(value.cast(target_type).ok())
+        }
         ScanColumnTransform::DateToTimestamp => {
             const MICROS_PER_DAY: i64 = 86_400_000_000;
             if get.column_types.get(operand.column_idx) != Some(&LogicalType::Date) {
@@ -577,18 +747,77 @@ pub fn extract_scan_column_index(expr: &Expression) -> Option<usize> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use paro_common::typed_parameters::{ParameterSlot, RuntimeParamId};
     use paro_function::scalar::cast::date_casts::{
         date_to_timestamp, parse_date_text, varchar_to_date,
     };
     use paro_function::scalar::cast::decimal_casts::bind_decimal_casts;
+    use paro_function::scalar::cast::numeric_casts::int16_to_int32;
     use paro_function::scalar::cast::{BindCastInput, BoundCastInfo, CastFunctionSet};
     use paro_function::scalar::string::get_substring_functions;
     use paro_function::scalar::ScalarBindInput;
     use paro_planner::expression::{
         CastExpression, ConstantExpression, FunctionExpression, OperatorExpression,
-        ReferenceExpression,
+        ParameterExpression, ReferenceExpression,
     };
     use paro_planner::operator::Get;
+
+    #[test]
+    fn search_predicate_template_retains_typed_runtime_parameter() {
+        let get = Get::new_without_table(7, vec!["bucket".to_string()], vec![LogicalType::Integer]);
+        let slot = ParameterSlot::new(RuntimeParamId::new(0), LogicalType::Integer);
+        let expression =
+            Expression::Comparison(paro_planner::expression::ComparisonExpression::new(
+                ComparisonType::Equal,
+                Expression::Reference(ReferenceExpression::new(0, LogicalType::Integer)),
+                Expression::Parameter(ParameterExpression::new(slot.clone())),
+            ));
+
+        let (template, residual) =
+            build_search_predicate_template(&[expression], &get).expect("predicate template");
+        assert!(residual.is_empty());
+        assert_eq!(
+            template,
+            Some(SearchPredicateTemplate::parameter_comparison(
+                0,
+                PredicateComparison::Equal,
+                slot,
+                LogicalType::Integer,
+            ))
+        );
+    }
+
+    #[test]
+    fn search_predicate_accepts_lossless_widened_integral_column() {
+        let get =
+            Get::new_without_table(7, vec!["bucket".to_string()], vec![LogicalType::SmallInt]);
+        let slot = ParameterSlot::new(RuntimeParamId::new(0), LogicalType::Integer);
+        let widened_column = Expression::Cast(CastExpression::new(
+            Expression::Reference(ReferenceExpression::new(0, LogicalType::SmallInt)),
+            LogicalType::Integer,
+            BoundCastInfo::fixed(int16_to_int32),
+            false,
+        ));
+        let expression =
+            Expression::Comparison(paro_planner::expression::ComparisonExpression::new(
+                ComparisonType::Equal,
+                widened_column,
+                Expression::Parameter(ParameterExpression::new(slot.clone())),
+            ));
+
+        let (template, residual) =
+            build_search_predicate_template(&[expression], &get).expect("predicate template");
+        assert!(residual.is_empty());
+        assert_eq!(
+            template,
+            Some(SearchPredicateTemplate::parameter_comparison(
+                0,
+                PredicateComparison::Equal,
+                slot,
+                LogicalType::SmallInt,
+            ))
+        );
+    }
 
     #[test]
     fn fixed_width_column_comparison_is_pushed_to_storage() {

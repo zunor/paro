@@ -8,6 +8,9 @@ use crate::checkpoint::recovery::{CheckpointBaseState, CheckpointRecovery};
 use crate::checkpoint::RetentionCoordinator;
 use crate::config::{CheckpointConfigOptions, CompactionConfigOptions};
 use crate::metadata::instance_catalog::DatabaseRecord;
+use crate::recovery::{
+    restore_search_registry_definitions, sweep_orphan_search_generation_workspaces,
+};
 use crate::storage_manager::StorageManager;
 use paro_catalog::catalog::Catalog;
 use paro_catalog::database_catalog::ParoCatalog;
@@ -19,6 +22,7 @@ use paro_common::logging::targets;
 use paro_journal::wal::wal_entry::WalHeaderMetadata;
 use paro_scheduler::scheduler::TaskScheduler;
 use paro_storage::buffer::{BufferManager, BufferPool};
+use paro_storage::index::hnsw::HnswIntegrityScheduler;
 use paro_transaction::CommitDrainWakePool;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -35,6 +39,7 @@ pub struct DatabaseOpenContext {
     pub buffer_pool: Arc<BufferPool>,
     pub buffer_manager: Arc<dyn BufferManager>,
     pub scheduler: Arc<TaskScheduler>,
+    pub hnsw_integrity_scheduler: Arc<HnswIntegrityScheduler>,
     pub commit_drain_wake_pool: Arc<CommitDrainWakePool>,
     pub checkpoint: CheckpointConfigOptions,
     pub compaction: CompactionConfigOptions,
@@ -191,11 +196,21 @@ impl DatabaseOpener {
         apply_runtime.bootstrap_frontiers(Self::journal_recovery_summary(&recovery_summary));
         db.bootstrap_checkpoint_runtime(recovery_summary.clone());
         if !replayed_wal {
+            // With no WAL to replay, every private generation workspace lies
+            // outside the durable checkpoint and is safe to collect now.
+            sweep_orphan_search_generation_workspaces(db.catalog());
             CheckpointRecovery::redeliver_deferred_tasks(
                 db.catalog(),
                 &inputs.checkpoint_base.deferred_tasks,
             );
         }
+        // Bootstrap search runtimes once the final tablet heads are known,
+        // even when the checkpoint had no outstanding deferred task.
+        restore_search_registry_definitions(db.catalog());
+        // Seed level-triggered discovery after recovery. A pending tail must
+        // progress even when the process crashed before its old notification
+        // was serviced and no later write arrives.
+        db.schedule_search_maintenance(paro_storage::search::SearchMaintenanceUrgency::Immediate);
         let report = Self::refresh_recovery_report(db, &inputs.wal_path);
         Self::sweep_checkpoint_artifacts(db, checkpoint)?;
         Self::ensure_recovered_journal_published(&apply_runtime, recovery_summary.max_lsn)?;
@@ -254,6 +269,7 @@ impl DatabaseOpener {
             },
         ));
         db.bind_task_scheduler(context.scheduler.clone());
+        db.bind_hnsw_integrity_scheduler(Arc::clone(&context.hnsw_integrity_scheduler));
 
         Self::initialize_catalog(db.catalog().as_ref())?;
         tracing::debug!(

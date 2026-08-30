@@ -19,12 +19,138 @@ SELECT id FROM items WHERE id > 10 ORDER BY emb <-> '[1.0, 1.0, 1.0]' LIMIT 2;
 -- Check distance with NULL
 SELECT id, emb <-> '[1.0, 1.0, 1.0]' as dist FROM items ORDER BY id;
 
--- Verify index creation
-SELECT index_name, index_type FROM paro_indexes();
-
 -- Basic vector search (exact nearest neighbor)
 EXPLAIN SELECT id FROM items ORDER BY emb <-> '[1.0, 1.0, 1.0]' LIMIT 2;
 SELECT id FROM items ORDER BY emb <-> '[1.0, 1.0, 1.0]' LIMIT 2;
+
+-- Exercise the indexed path on one inline-built rowset. Persist the complete,
+-- versioned HNSW contract instead of relying on provider-local defaults.
+CREATE TABLE indexed_items (id INT, bucket SMALLINT, emb VECTOR(3));
+CREATE INDEX idx_indexed_items_id ON indexed_items (id);
+CREATE INDEX idx_indexed_items_bucket ON indexed_items (bucket);
+CREATE VECTOR INDEX idx_indexed_items_emb ON indexed_items (emb)
+    distance = l2
+    m = 8
+    ef_construct = 32
+    ef_search = 24
+    build_seed = 7
+    random_access_cost_units = 1
+    exact_f32_dimension_cost_units = 1
+    sequential_dimension_cost_units = 1
+    symmetric_i16_dimension_cost_units = 1
+    graph_scored_points_per_ef = 1
+    distance_cost_calibration_id = 1
+    filter_columns = 'id,bucket'
+    inline_max_vector_count = 4096
+    inline_max_graph_memory_bytes = 1048576
+    inline_max_dimension = 3;
+INSERT INTO indexed_items
+SELECT i, i % 10, '[1.0,1.0,1.0]'::VECTOR(3)
+FROM generate_series(1, 2048) AS generated(i);
+-- Incremental writes remain an exact tail until governed maintenance admits
+-- a generation graph. Materialize it explicitly so this regression exercises
+-- graph planning rather than accidentally blessing the pre-maintenance tail.
+REFRESH VECTOR INDEX idx_indexed_items_emb ON indexed_items;
+SELECT index_name, index_type FROM paro_indexes()
+WHERE index_name = 'idx_indexed_items_emb';
+-- @normalize explain_search_ids
+EXPLAIN SELECT id FROM indexed_items
+ORDER BY emb <-> '[1.0, 1.0, 1.0]' LIMIT 2;
+
+-- A scalar predicate must become part of VECTOR_SEARCH, not remain as a
+-- relational FILTER above it. EXPLAIN also exposes the exact-vs-graph policy.
+-- @normalize explain_search_ids
+EXPLAIN SELECT id FROM indexed_items
+WHERE bucket = 3
+ORDER BY emb <-> '[1.0, 1.0, 1.0]' LIMIT 2;
+
+-- Keep SQL-level coverage for all adaptive stages under an explicitly pinned
+-- test calibration. A singleton is an exact bitmap scan, the 10%-selective
+-- bucket predicts two-hop refinement, and a half-table range predicts masked
+-- admission without refinement.
+-- @normalize explain_search_ids
+EXPLAIN SELECT id FROM indexed_items
+WHERE id = 1
+ORDER BY emb <-> '[1.0, 1.0, 1.0]' LIMIT 2;
+-- @normalize explain_search_ids
+EXPLAIN SELECT id FROM indexed_items
+WHERE id <= 1024
+ORDER BY emb <-> '[1.0, 1.0, 1.0]' LIMIT 2;
+SELECT id FROM indexed_items
+WHERE id <= 1024
+ORDER BY emb <-> '[1.0, 1.0, 1.0]' LIMIT 2;
+
+-- A cosine operator must not consume an L2 artifact. Metric mismatch is a
+-- capability miss and falls back to the exact relational plan.
+-- @normalize explain_search_ids
+EXPLAIN SELECT id FROM indexed_items
+ORDER BY emb <=> '[1.0, 0.0, 0.0]' LIMIT 2;
+SELECT id FROM indexed_items
+ORDER BY emb <=> '[1.0, 0.0, 0.0]', id LIMIT 2;
+
+-- Prepared Top-K must preserve PostgreSQL's reusable $n parameter identity.
+PREPARE vector_topk(VECTOR(3)) AS
+    SELECT emb <-> $1 AS dist
+    FROM indexed_items
+    ORDER BY emb <-> $1
+    LIMIT 2;
+-- @query
+EXECUTE vector_topk('[1.0, 1.0, 1.0]');
+-- @query
+EXECUTE vector_topk('[2.0, 2.0, 2.0]');
+DEALLOCATE vector_topk;
+
+-- Reusable plans retain the scalar parameter and choose the filtered search
+-- strategy from the exact bitmap cardinality when the source opens.
+PREPARE filtered_vector_topk(INT, VECTOR(3)) AS
+    SELECT bucket FROM indexed_items
+    WHERE bucket = $1
+    ORDER BY emb <-> $2 LIMIT 2;
+-- Reuse the same prepared plan with two bindings. The returned column makes a
+-- stale, plan-cached bitmap observable without depending on HNSW tie order.
+-- @query
+EXECUTE filtered_vector_topk(3, '[1.0, 1.0, 1.0]');
+-- @query
+EXECUTE filtered_vector_topk(7, '[1.0, 1.0, 1.0]');
+-- An out-of-domain comparison is an empty predicate, not a narrowing-cast
+-- error. This also protects parameter binding from changing global cast rules.
+-- @query
+EXECUTE filtered_vector_topk(100000, '[1.0, 1.0, 1.0]');
+-- @normalize explain_search_ids
+EXPLAIN EXECUTE filtered_vector_topk(3, '[1.0, 1.0, 1.0]');
+DEALLOCATE filtered_vector_topk;
+
+-- The hint must reach the physical vector-search request.
+-- @normalize explain_search_ids
+EXPLAIN SELECT /*+ HNSW_EF(37) */ id
+FROM indexed_items
+ORDER BY emb <-> '[1.0, 1.0, 1.0]'
+LIMIT 2;
+
+-- Navigation beam and canonical rerank window are independent query inputs.
+-- @normalize explain_search_ids
+EXPLAIN SELECT /*+ HNSW_EF(37) HNSW_RERANK(7) */ id
+FROM indexed_items
+ORDER BY emb <-> '[1.0, 1.0, 1.0]'
+LIMIT 2;
+
+-- Exact is a binding query objective rather than an ef convention. The
+-- physical source must expose that graph navigation is disabled, while the
+-- exact scalar row-set pushdown remains available.
+-- @normalize explain_search_ids
+EXPLAIN SELECT /*+ VECTOR_SEARCH_MODE('exact') */ id
+FROM indexed_items
+WHERE id <= 1024
+ORDER BY emb <-> '[1.0, 1.0, 1.0]'
+LIMIT 2;
+SELECT count(*) AS exact_rows
+FROM (
+    SELECT /*+ VECTOR_SEARCH_MODE('exact') */ id
+    FROM indexed_items
+    WHERE id <= 1024
+    ORDER BY emb <-> '[1.0, 1.0, 1.0]'
+    LIMIT 2
+) AS forced_exact;
 
 -- Vector search with different target
 SELECT id FROM items ORDER BY emb <-> '[2.0, 2.0, 2.0]' LIMIT 2;
@@ -33,4 +159,5 @@ SELECT id FROM items ORDER BY emb <-> '[2.0, 2.0, 2.0]' LIMIT 2;
 SELECT id, emb <-> '[1.0, 1.0, 1.0]' as dist FROM items ORDER BY dist, id;
 
 -- Drop table
+DROP TABLE indexed_items;
 DROP TABLE items;

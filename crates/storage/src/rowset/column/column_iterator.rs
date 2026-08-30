@@ -289,6 +289,17 @@ pub trait ColumnIterator: Send + Sync {
     /// Tuple of (values_read, batch)
     fn next_batch(&mut self, n: usize) -> Result<(usize, ColumnBatch)>;
 
+    /// Read the remaining logical rows from the current physical data page.
+    ///
+    /// Fixed-width page decoders can return an owning `Bytes` slice of their
+    /// decoded page instead of concatenating it into a second batch buffer.
+    /// Consumers must finish using the batch before advancing this iterator.
+    /// Implementations without an addressable page boundary retain a bounded
+    /// ordinary-batch fallback.
+    fn next_physical_page_batch(&mut self) -> Result<(usize, ColumnBatch)> {
+        self.next_batch(paro_common::vector::VECTOR_SIZE)
+    }
+
     /// Read a predicate-only batch. Implementations may return a borrowed,
     /// storage-native representation because the batch never crosses the scan
     /// materialization boundary.
@@ -1712,6 +1723,20 @@ impl<R: Read + Seek + Send + Sync> ColumnIterator for ScalarColumnIterator<R> {
         ))
     }
 
+    fn next_physical_page_batch(&mut self) -> Result<(usize, ColumnBatch)> {
+        if self.current_ordinal >= self.meta.num_rows
+            || !self.ensure_page_loaded(DecodedPageAccess::Sequential)?
+        {
+            return Ok((0, ColumnBatch::empty()));
+        }
+        let page_remaining = self
+            .current_decoder
+            .as_ref()
+            .map(|decoder| decoder.count().saturating_sub(decoder.current_index()) as usize)
+            .unwrap_or(0);
+        self.next_batch_within_current_page(page_remaining)
+    }
+
     fn next_predicate_batch(&mut self, n: usize) -> Result<(usize, ColumnBatch)> {
         if let Some(batch) = self.try_next_binary_plain_predicate_batch(n)? {
             return Ok(batch);
@@ -2145,6 +2170,31 @@ mod tests {
             ]);
             assert_eq!(value, i as i32);
         }
+    }
+
+    #[test]
+    fn physical_page_batches_never_concatenate_adjacent_pages() {
+        let mut iterator = create_fixed_i32_iterator(false, 64, 100);
+        let mut observed = Vec::new();
+        let mut batch_sizes = Vec::new();
+
+        loop {
+            let (count, batch) = iterator.next_physical_page_batch().unwrap();
+            if count == 0 {
+                break;
+            }
+            batch_sizes.push(count);
+            observed.extend(
+                batch
+                    .data
+                    .chunks_exact(std::mem::size_of::<i32>())
+                    .map(|bytes| i32::from_le_bytes(bytes.try_into().unwrap())),
+            );
+        }
+
+        assert!(batch_sizes.len() > 1);
+        assert_eq!(batch_sizes.iter().sum::<usize>(), 100);
+        assert_eq!(observed, (0..100).collect::<Vec<_>>());
     }
 
     #[test]

@@ -34,8 +34,8 @@ use super::maintenance::{
     SearchMaintenanceAction,
 };
 use super::manifest::{
-    GenerationManifestRoot, ManifestCodecFamily, ManifestCodecKind, ManifestDelta,
-    ManifestDeltaEntry, ManifestShard, ManifestStore,
+    GenerationManifestRoot, ManifestCodecKind, ManifestDelta, ManifestDeltaEntry, ManifestShard,
+    ManifestStore,
 };
 use super::row_fetch::{RowFetchMode, SearchRowFetcher};
 use super::stats::{
@@ -64,7 +64,7 @@ impl ManifestOpenBenchConfig {
             entries_per_delta: 1,
             shard_count: 1,
             entries_per_shard: 0,
-            codec: ManifestBenchCodec::JsonDebugV1,
+            codec: ManifestBenchCodec::JsonDebugV4,
         }
     }
 
@@ -82,25 +82,22 @@ impl ManifestOpenBenchConfig {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ManifestBenchCodec {
-    JsonDebugV1,
-    BinaryV1,
+    JsonDebugV4,
+    BinaryV4,
 }
 
 impl ManifestBenchCodec {
     pub const fn label(self) -> &'static str {
         match self {
-            Self::JsonDebugV1 => "json-debug-v1",
-            Self::BinaryV1 => "binary-v1",
+            Self::JsonDebugV4 => "json-debug-v4",
+            Self::BinaryV4 => "binary-v4",
         }
     }
 
     const fn manifest_codec(self) -> ManifestCodecKind {
         match self {
-            Self::JsonDebugV1 => ManifestCodecKind::JSON_DEBUG_V1,
-            Self::BinaryV1 => ManifestCodecKind {
-                family: ManifestCodecFamily::Binary,
-                version: 1,
-            },
+            Self::JsonDebugV4 => ManifestCodecKind::JSON_DEBUG_V4,
+            Self::BinaryV4 => ManifestCodecKind::BINARY_V4,
         }
     }
 }
@@ -175,14 +172,15 @@ pub fn prepare_manifest_open_bench_fixture(
         config_fingerprint: 1,
         coverage: CoverageState::Complete,
         generation_stats: GenerationStats::default(),
-        next_tail_entry_id: TailEntryId((config.delta_count * config.entries_per_delta) as u64 + 1),
+        persisted_tail_entry_id_seed: TailEntryId(
+            (config.delta_count * config.entries_per_delta) as u64 + 1,
+        ),
         execution_modes: ExecutionModes::default(),
         maintenance_state: GenerationMaintenanceState::default(),
         root_version: config.delta_count as u64 + 1,
         checksum: 0,
         shard_files: shard_refs,
         recent_delta_files: delta_refs,
-        materialized_state_file: None,
     };
     root.recompute_checksum()?;
     store.write_root(config.definition_id, &root)?;
@@ -204,7 +202,7 @@ pub fn open_manifest_bench_fixture_with_manifest_bytes(
     manifest_bytes: Option<u64>,
 ) -> Result<ManifestOpenBenchSummary> {
     let store = ManifestStore::new_with_codec(table_data_dir, codec.manifest_codec());
-    let Some(manifest) = store.load_manifest(definition_id)? else {
+    let Some(manifest) = store.load_latest_manifest_for_private_workspace(definition_id)? else {
         return Ok(ManifestOpenBenchSummary {
             artifact_count: 0,
             tail_pending_count: 0,
@@ -214,7 +212,7 @@ pub fn open_manifest_bench_fixture_with_manifest_bytes(
         });
     };
     let manifest_bytes =
-        manifest_bytes.unwrap_or_else(|| manifest_path_bytes(&manifest.opened_paths()));
+        manifest_bytes.unwrap_or_else(|| manifest_path_bytes(&manifest.all_paths()));
     Ok(ManifestOpenBenchSummary {
         artifact_count: manifest.artifacts.artifacts.len(),
         tail_pending_count: manifest.tail_pending_entries.len(),
@@ -226,7 +224,7 @@ pub fn open_manifest_bench_fixture_with_manifest_bytes(
 
 pub fn manifest_fragment_bytes(table_data_dir: &Path, definition_id: u64) -> Result<u64> {
     let store = ManifestStore::new(table_data_dir);
-    let Some(manifest) = store.load_manifest(definition_id)? else {
+    let Some(manifest) = store.load_latest_manifest_for_private_workspace(definition_id)? else {
         return Ok(0);
     };
     Ok(manifest_path_bytes(&manifest.all_paths()))
@@ -417,6 +415,7 @@ impl RowFetchBenchFixture {
         let opened = table.open_vector_search_cursor(
             0,
             &[0.0, 0.0],
+            crate::index::hnsw::DistanceMetric::Euclidean,
             config.candidate_count,
             SearchParams {
                 ef: Some(128),
@@ -424,16 +423,11 @@ impl RowFetchBenchFixture {
             },
             None,
             table.max_version(),
+            &crate::search::SearchReadOptions::ungoverned(),
         )?;
         let mut cursor = opened.cursor;
         let snapshot = opened.snapshot;
-        let mut budget = ResourceBudget {
-            memory_limit_bytes: 64 * 1024 * 1024,
-            heap_budget_items: config.candidate_count,
-            parallelism_slots: 1,
-            cpu_step_budget: None,
-            context: None,
-        };
+        let mut budget = ResourceBudget::standalone(64 * 1024 * 1024, config.candidate_count, 1);
         let rows = loop {
             match cursor.next_batch(
                 &SearchBatchConfig {
@@ -508,10 +502,14 @@ fn sample_artifact(rowset_id: u64) -> SearchArtifactRef {
     SearchArtifactRef {
         definition_id: 1,
         generation_id: 1,
-        segment: ArtifactSegmentRef {
-            rowset_id,
-            segment_id: 0,
-        },
+        coverage: super::capability::SearchPartitionCoverage::singleton(
+            ArtifactSegmentRef {
+                rowset_id,
+                segment_id: 0,
+            },
+            1,
+        )
+        .expect("sample partition coverage"),
         column_id: 0,
         kind: SearchIndexKind::FullText,
         provider_variant: 1,

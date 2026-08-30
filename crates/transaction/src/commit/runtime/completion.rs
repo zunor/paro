@@ -17,10 +17,20 @@ use std::sync::Arc;
 #[derive(Debug, Clone)]
 enum CommitCompletionState {
     Queued,
-    Durable { handle: DurableCommitHandle },
-    PublishSubmitted { handle: DurableCommitHandle },
-    DurableOnlyAcked { handle: DurableCommitHandle },
-    Published { handle: DurableCommitHandle },
+    Durable {
+        handle: DurableCommitHandle,
+        ack_policy: CommitAckPolicy,
+        publish_completed: bool,
+    },
+    PublishSubmitted {
+        handle: DurableCommitHandle,
+    },
+    DurableOnlyAcked {
+        handle: DurableCommitHandle,
+    },
+    Published {
+        handle: DurableCommitHandle,
+    },
     Rejected(CommitRuntimeRejection),
     Failed(CommitRuntimeFailure),
     AmbiguousCommitted(CommitRuntimeFailure),
@@ -105,33 +115,45 @@ impl CommitCompletionRegistry {
         &self,
         completion: CommitCompletionHandle,
         handle: DurableCommitHandle,
-        _ack_policy: CommitAckPolicy,
+        ack_policy: CommitAckPolicy,
     ) {
-        let slot = {
-            let mut state = self.state.lock();
-            let slot = state.slots.get(&completion.slot_id).cloned();
-            if slot.is_some() {
-                let commit_ts = handle.commit_ts().into_raw();
-                state.commit_to_slot.insert(commit_ts, completion.slot_id);
-                state.slot_to_commit.insert(completion.slot_id, commit_ts);
-            }
-            slot
-        };
+        let mut state = self.state.lock();
+        let slot = state.slots.get(&completion.slot_id).cloned();
         if let Some(slot) = slot {
-            slot.set(CommitCompletionState::Durable { handle });
+            let commit_ts = handle.commit_ts().into_raw();
+            state.commit_to_slot.insert(commit_ts, completion.slot_id);
+            state.slot_to_commit.insert(completion.slot_id, commit_ts);
+            // Publish the slot state before releasing the registry lock that
+            // makes commit_ts discoverable. mark_published takes the same lock
+            // to resolve a slot, so it can no longer observe a mapped Queued
+            // state and silently discard an early completion callback.
+            slot.set(CommitCompletionState::Durable {
+                handle,
+                ack_policy,
+                publish_completed: false,
+            });
         }
     }
 
-    pub(super) fn mark_publish_submitted(&self, commit_ts: CommitTs, ack_policy: CommitAckPolicy) {
+    pub(super) fn mark_publish_submitted(&self, commit_ts: CommitTs) {
         if let Some(slot) = self.slot_for_commit_ts(commit_ts) {
-            slot.update(|current| match (ack_policy, current) {
-                (CommitAckPolicy::DurableOnlyAsync, CommitCompletionState::Durable { handle }) => {
-                    CommitCompletionState::DurableOnlyAcked { handle }
-                }
-                (CommitAckPolicy::RequiredPublished, CommitCompletionState::Durable { handle }) => {
-                    CommitCompletionState::PublishSubmitted { handle }
-                }
-                (_, current) => current,
+            slot.update(|current| match current {
+                CommitCompletionState::Durable {
+                    handle,
+                    ack_policy,
+                    publish_completed,
+                } => match ack_policy {
+                    CommitAckPolicy::DurableOnlyAsync => {
+                        CommitCompletionState::DurableOnlyAcked { handle }
+                    }
+                    CommitAckPolicy::RequiredPublished if publish_completed => {
+                        CommitCompletionState::Published { handle }
+                    }
+                    CommitAckPolicy::RequiredPublished => {
+                        CommitCompletionState::PublishSubmitted { handle }
+                    }
+                },
+                current => current,
             });
         }
     }
@@ -139,9 +161,18 @@ impl CommitCompletionRegistry {
     pub(super) fn mark_published(&self, commit_ts: CommitTs) {
         if let Some(slot) = self.slot_for_commit_ts(commit_ts) {
             slot.update(|current| match current {
-                CommitCompletionState::PublishSubmitted { handle }
-                | CommitCompletionState::Durable { handle } => {
+                CommitCompletionState::PublishSubmitted { handle } => {
                     CommitCompletionState::Published { handle }
+                }
+                CommitCompletionState::Durable {
+                    handle, ack_policy, ..
+                } => CommitCompletionState::Durable {
+                    handle,
+                    ack_policy,
+                    publish_completed: true,
+                },
+                CommitCompletionState::Queued => {
+                    unreachable!("a published commit must not resolve to a queued completion slot")
                 }
                 current => current,
             });

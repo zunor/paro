@@ -32,16 +32,29 @@ use paro_journal::{
 use paro_scheduler::scheduler::TaskScheduler;
 use paro_storage::buffer::BufferPool;
 use paro_storage::compaction::compaction_manager::CompactionObservability;
+use paro_storage::index::hnsw::HnswIntegrityScheduler;
 use paro_storage::meta::TabletMetaManager;
+use paro_storage::search::SearchMaintenanceUrgency;
+use paro_storage::table::table_handle::TableHandle;
 use paro_storage::transaction::manager::TransactionManager;
 use paro_transaction::{
     CommitBatchPolicy, CommitDrainWakePool, CommitDrainWakePoolOptions, CommitJournal,
     CommitRuntime, CommitRuntimeAssembly, CommitTs,
 };
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Weak};
 use std::thread;
+use std::time::{Duration, Instant};
+
+// The quiet window coalesces bursts, while MAX_DELAY is deliberately anchored
+// at the first unserviced request and cannot be extended by later writes.
+// Durable manifest scans make notifications an acceleration hint rather than
+// the source of truth.
+const SEARCH_MAINTENANCE_QUIESCENCE: Duration = Duration::from_secs(1);
+const SEARCH_MAINTENANCE_MAX_DELAY: Duration = Duration::from_secs(5);
+const SEARCH_MAINTENANCE_RETRY_BACKOFF: Duration = Duration::from_secs(1);
+const SEARCH_MAINTENANCE_DISCOVERY_INTERVAL: Duration = Duration::from_secs(5);
 
 /// State of an attached database.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -260,9 +273,12 @@ pub struct DatabaseHandle {
     buffer_pool: Arc<BufferPool>,
     storage_manager: RwLock<Option<Box<dyn StorageManager>>>,
     task_scheduler: RwLock<Option<Arc<TaskScheduler>>>,
+    hnsw_integrity_scheduler: RwLock<Option<Arc<HnswIntegrityScheduler>>>,
+    self_weak: RwLock<Weak<DatabaseHandle>>,
     compaction: CompactionDriver,
     checkpoint_coordinator: CheckpointCoordinator,
     checkpoint_trigger: CheckpointTriggerState,
+    search_maintenance_trigger: SearchMaintenanceTriggerState,
     wal_observability: WalObservability,
     last_gc_epoch: AtomicU64,
     last_gc_watermark: AtomicU64,
@@ -273,6 +289,61 @@ struct CheckpointTriggerState {
     background_started: std::sync::atomic::AtomicBool,
     pending: Mutex<bool>,
     changed: Condvar,
+}
+
+#[derive(Debug, Default)]
+struct SearchMaintenanceTriggerState {
+    background_started: AtomicBool,
+    pending: Mutex<SearchMaintenancePending>,
+    changed: Condvar,
+}
+
+#[derive(Debug, Default)]
+struct SearchMaintenancePending {
+    requested_epoch: u64,
+    completed_epoch: u64,
+    first_request: Option<Instant>,
+    last_request: Option<Instant>,
+    urgency: SearchMaintenanceUrgency,
+}
+
+impl SearchMaintenancePending {
+    fn wait_before_run(&self, now: Instant) -> Option<Duration> {
+        if self.urgency == SearchMaintenanceUrgency::Immediate {
+            return None;
+        }
+        let quiet_for = self
+            .last_request
+            .map(|requested_at| now.saturating_duration_since(requested_at))
+            .unwrap_or(SEARCH_MAINTENANCE_QUIESCENCE);
+        let outstanding_for = self
+            .first_request
+            .map(|requested_at| now.saturating_duration_since(requested_at))
+            .unwrap_or(SEARCH_MAINTENANCE_MAX_DELAY);
+        if quiet_for >= SEARCH_MAINTENANCE_QUIESCENCE {
+            return None;
+        }
+        if self.urgency == SearchMaintenanceUrgency::Deadline
+            && outstanding_for >= SEARCH_MAINTENANCE_MAX_DELAY
+        {
+            return None;
+        }
+        let quiet_wait = SEARCH_MAINTENANCE_QUIESCENCE - quiet_for;
+        match self.urgency {
+            SearchMaintenanceUrgency::Quiescent => Some(quiet_wait),
+            SearchMaintenanceUrgency::Deadline => {
+                Some(quiet_wait.min(SEARCH_MAINTENANCE_MAX_DELAY - outstanding_for))
+            }
+            SearchMaintenanceUrgency::Immediate => None,
+        }
+    }
+}
+
+#[derive(Debug, Default)]
+struct SearchMaintenancePass {
+    more_work: bool,
+    immediate: bool,
+    failures: usize,
 }
 
 impl std::fmt::Debug for DatabaseHandle {
@@ -337,6 +408,8 @@ impl DatabaseHandle {
             buffer_pool: buffer_pool.clone(),
             storage_manager: RwLock::new(None),
             task_scheduler: RwLock::new(None),
+            hnsw_integrity_scheduler: RwLock::new(None),
+            self_weak: RwLock::new(Weak::new()),
             compaction: CompactionDriver::new(
                 buffer_pool,
                 compaction.max_concurrency,
@@ -344,6 +417,7 @@ impl DatabaseHandle {
             ),
             checkpoint_coordinator: CheckpointCoordinator::new(),
             checkpoint_trigger: CheckpointTriggerState::default(),
+            search_maintenance_trigger: SearchMaintenanceTriggerState::default(),
             wal_observability: WalObservability::new(),
             last_gc_epoch: AtomicU64::new(0),
             last_gc_watermark: AtomicU64::new(0),
@@ -633,10 +707,19 @@ impl DatabaseHandle {
 
     /// Bind the instance task scheduler for background maintenance tasks.
     pub fn bind_task_scheduler(self: &Arc<Self>, scheduler: Arc<TaskScheduler>) {
+        *self.self_weak.write() = Arc::downgrade(self);
         *self.task_scheduler.write() = Some(scheduler.clone());
         self.compaction.bind_scheduler(scheduler);
         self.bind_tablet_runtime_services();
         self.ensure_checkpoint_background_runner();
+        self.ensure_search_maintenance_background_runner();
+        self.schedule_search_maintenance(SearchMaintenanceUrgency::Immediate);
+    }
+
+    pub fn bind_hnsw_integrity_scheduler(self: &Arc<Self>, scheduler: Arc<HnswIntegrityScheduler>) {
+        *self.self_weak.write() = Arc::downgrade(self);
+        *self.hnsw_integrity_scheduler.write() = Some(scheduler);
+        self.bind_tablet_runtime_services();
     }
 
     /// Sync compaction tablet registry with the currently visible catalog tables.
@@ -757,6 +840,9 @@ impl DatabaseHandle {
         let runtime = self.journal_apply_runtime();
         if let Some(coordinator) = self.journal_coordinator.lock().as_ref().cloned() {
             coordinator.bind_apply_runtime(runtime);
+            let observer: Arc<dyn paro_journal::JournalPublicationObserver> =
+                self.checkpoint_coordinator.published_prefix();
+            coordinator.bind_publication_observer(observer);
             return coordinator;
         }
 
@@ -769,6 +855,9 @@ impl DatabaseHandle {
         });
         let coordinator = Arc::new(JournalCoordinator::new(appender));
         coordinator.bind_apply_runtime(runtime);
+        let observer: Arc<dyn paro_journal::JournalPublicationObserver> =
+            self.checkpoint_coordinator.published_prefix();
+        coordinator.bind_publication_observer(observer);
         let mut guard = self.journal_coordinator.lock();
         if let Some(existing) = guard.as_ref().cloned() {
             existing.bind_apply_runtime(self.journal_apply_runtime());
@@ -1090,6 +1179,40 @@ impl DatabaseHandle {
         self.checkpoint_trigger.changed.notify_one();
     }
 
+    /// Coalesce foreground commits into one derived-search maintenance pass.
+    ///
+    /// Search artifacts are rebuildable state. The durable tablet rowset graph
+    /// is the exact tail authority; this database-owned coordinator waits for
+    /// a short quiet period before asking each provider to materialize that
+    /// tail into a derived generation. The quiet period is what prevents a
+    /// COPY stream from producing a graph per input batch.
+    pub fn schedule_search_maintenance(&self, urgency: SearchMaintenanceUrgency) {
+        if self.db_type().is_system()
+            || self.db_type().is_temporary()
+            || self.db_type().is_read_only()
+        {
+            return;
+        }
+
+        self.ensure_search_maintenance_background_runner();
+        {
+            let mut pending = self.search_maintenance_trigger.pending.lock();
+            let now = Instant::now();
+            pending.requested_epoch = pending.requested_epoch.saturating_add(1);
+            pending.first_request.get_or_insert(now);
+            pending.last_request = Some(now);
+            pending.urgency = pending.urgency.max(urgency);
+            tracing::trace!(
+                target: targets::INSTANCE,
+                db = %self.name(),
+                requested_epoch = pending.requested_epoch,
+                completed_epoch = pending.completed_epoch,
+                "Queued coalesced search maintenance"
+            );
+        }
+        self.search_maintenance_trigger.changed.notify_one();
+    }
+
     pub fn bootstrap_checkpoint_runtime(&self, summary: RecoverySummary) {
         self.journal_next_lsn
             .store(summary.max_lsn.saturating_add(1).max(1), Ordering::Release);
@@ -1097,19 +1220,16 @@ impl DatabaseHandle {
         *self.journal_coordinator.lock() = None;
         *self.commit_runtime.lock() = None;
         self.bind_tablet_runtime_services();
+        let observer: Arc<dyn paro_journal::JournalPublicationObserver> =
+            self.checkpoint_coordinator.published_prefix();
+        self.journal_apply_runtime()
+            .bind_publication_observer(observer);
     }
 
-    pub fn publish_checkpoint_transaction(
-        &self,
-        commit_id: u64,
-        catalog_commit_id: u64,
-        max_seen_object_id: u64,
-    ) -> (RecoverySummary, u64) {
-        self.checkpoint_coordinator.publish_transaction(
-            commit_id,
-            catalog_commit_id,
-            max_seen_object_id,
-        )
+    pub fn checkpoint_published_summary(&self) -> RecoverySummary {
+        self.checkpoint_coordinator
+            .published_prefix()
+            .published_summary()
     }
 
     fn ensure_checkpoint_background_runner(self: &Arc<Self>) {
@@ -1131,6 +1251,183 @@ impl DatabaseHandle {
         let _ = thread::Builder::new()
             .name(format!("paro-checkpoint-{db_name}"))
             .spawn(move || Self::checkpoint_background_loop(weak));
+    }
+
+    fn ensure_search_maintenance_background_runner(&self) {
+        let weak = self.self_weak.read().clone();
+        if weak.upgrade().is_none() {
+            // The owner Arc is installed by bind_task_scheduler. Keep any
+            // pending level-triggered request queued until that lifecycle
+            // boundary instead of spawning a thread that cannot own the DB.
+            return;
+        }
+        if self
+            .search_maintenance_trigger
+            .background_started
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .is_err()
+        {
+            return;
+        }
+
+        let db_name = self.name().to_string();
+        if let Err(error) = thread::Builder::new()
+            .name(format!("paro-search-maintenance-{db_name}"))
+            .spawn(move || Self::search_maintenance_background_loop(weak))
+        {
+            self.search_maintenance_trigger
+                .background_started
+                .store(false, Ordering::Release);
+            tracing::error!(
+                target: targets::INSTANCE,
+                db = %self.name(),
+                error = %error,
+                "Failed to start search maintenance coordinator"
+            );
+        }
+    }
+
+    fn search_maintenance_background_loop(weak: Weak<Self>) {
+        loop {
+            let Some(db) = weak.upgrade() else {
+                return;
+            };
+
+            let target_epoch = loop {
+                let mut pending = db.search_maintenance_trigger.pending.lock();
+                if pending.requested_epoch == pending.completed_epoch {
+                    db.search_maintenance_trigger
+                        .changed
+                        .wait_for(&mut pending, SEARCH_MAINTENANCE_DISCOVERY_INTERVAL);
+                    if pending.requested_epoch == pending.completed_epoch {
+                        let now = Instant::now();
+                        pending.requested_epoch = pending.requested_epoch.saturating_add(1);
+                        pending.first_request = Some(now);
+                        pending.last_request = Some(now);
+                        pending.urgency = SearchMaintenanceUrgency::Immediate;
+                    } else {
+                        continue;
+                    }
+                }
+
+                if let Some(wait) = pending.wait_before_run(Instant::now()) {
+                    db.search_maintenance_trigger
+                        .changed
+                        .wait_for(&mut pending, wait);
+                    continue;
+                }
+                break pending.requested_epoch;
+            };
+
+            tracing::trace!(
+                target: targets::INSTANCE,
+                db = %db.name(),
+                target_epoch,
+                "Running coalesced search maintenance"
+            );
+            let result = db.run_search_derived_maintenance();
+            let mut pending = db.search_maintenance_trigger.pending.lock();
+            match result {
+                Ok(more_work) => {
+                    if more_work.more_work {
+                        let now = Instant::now();
+                        pending.first_request = Some(now);
+                        pending.last_request = Some(now);
+                        pending.urgency = if more_work.immediate {
+                            SearchMaintenanceUrgency::Immediate
+                        } else {
+                            SearchMaintenanceUrgency::Quiescent
+                        };
+                    } else {
+                        pending.completed_epoch = pending.completed_epoch.max(target_epoch);
+                        if pending.completed_epoch == pending.requested_epoch {
+                            pending.first_request = None;
+                            pending.last_request = None;
+                            pending.urgency = SearchMaintenanceUrgency::Quiescent;
+                        }
+                    }
+                    tracing::trace!(
+                        target: targets::INSTANCE,
+                        db = %db.name(),
+                        target_epoch,
+                        requested_epoch = pending.requested_epoch,
+                        completed_epoch = pending.completed_epoch,
+                        failures = more_work.failures,
+                        "Completed coalesced search maintenance"
+                    );
+                }
+                Err(error) => {
+                    let now = Instant::now();
+                    pending.first_request = Some(now);
+                    pending.last_request = Some(now);
+                    pending.urgency = SearchMaintenanceUrgency::Quiescent;
+                    tracing::warn!(
+                        target: targets::INSTANCE,
+                        db = %db.name(),
+                        error = %error,
+                        "Background search maintenance failed; retrying after backoff"
+                    );
+                    db.search_maintenance_trigger
+                        .changed
+                        .wait_for(&mut pending, SEARCH_MAINTENANCE_RETRY_BACKOFF);
+                }
+            }
+        }
+    }
+
+    fn run_search_derived_maintenance(&self) -> anyhow::Result<SearchMaintenancePass> {
+        let mut pass = SearchMaintenancePass::default();
+        let txn = CatalogSnapshot::read_only(u64::MAX);
+        for schema_entry in self
+            .catalog
+            .get_schema_collection()
+            .scan(txn.transaction_id, txn.start_time)
+        {
+            let CatalogEntryEnum::Schema(schema) = schema_entry.as_ref() else {
+                continue;
+            };
+            for table_entry in schema
+                .collection(CatalogType::Table)
+                .expect("table collection")
+                .scan(txn.transaction_id, txn.start_time)
+            {
+                let CatalogEntryEnum::Table(table) = table_entry.as_ref() else {
+                    continue;
+                };
+                let Some(storage) = table.get_storage() else {
+                    continue;
+                };
+                match storage.run_search_maintenance_pass() {
+                    Ok(report) => {
+                        pass.more_work |= report.has_pending_work();
+                        pass.immediate |= report.requires_immediate_follow_up();
+                        pass.failures = pass.failures.saturating_add(report.failures.len());
+                        for failure in report.failures {
+                            tracing::warn!(
+                                target: targets::INSTANCE,
+                                db = %self.name(),
+                                table_id = ?table.base.base.object_id,
+                                definition_id = ?failure.definition_id,
+                                error = %failure.message,
+                                "Search maintenance definition failed; other definitions remain eligible"
+                            );
+                        }
+                    }
+                    Err(error) => {
+                        pass.more_work = true;
+                        pass.failures = pass.failures.saturating_add(1);
+                        tracing::warn!(
+                            target: targets::INSTANCE,
+                            db = %self.name(),
+                            table_id = ?table.base.base.object_id,
+                            error = %error,
+                            "Search maintenance table sweep failed; continuing with other tables"
+                        );
+                    }
+                }
+            }
+        }
+        Ok(pass)
     }
 
     fn checkpoint_background_loop(weak: Weak<Self>) {
@@ -1324,10 +1621,6 @@ impl DatabaseHandle {
     }
 
     fn bind_tablet_runtime_services(&self) {
-        let observer = self.checkpoint_coordinator.compaction_publish_observer();
-        let journal = self.journal_coordinator();
-        let apply_runtime = self.journal_apply_runtime();
-        let task_scheduler = self.task_scheduler.read().clone();
         let txn = CatalogSnapshot::read_only(u64::MAX);
         for schema_entry in self
             .catalog
@@ -1346,14 +1639,35 @@ impl DatabaseHandle {
                     continue;
                 };
                 if let Some(storage) = table.get_storage() {
-                    storage
-                        .tablet()
-                        .bind_checkpoint_publish_observer(observer.clone());
-                    storage.bind_journal_coordinator(Some(Arc::clone(&journal)));
-                    storage.bind_journal_apply_runtime(Some(Arc::clone(&apply_runtime)));
-                    storage.bind_search_task_scheduler(task_scheduler.clone());
+                    self.bind_table_runtime_services(storage.as_ref());
                 }
             }
+        }
+    }
+
+    /// Bind the database-owned runtimes to one table at the moment that table
+    /// enters the catalog. Startup/recovery scans call the same entry point for
+    /// restored tables. This lifecycle boundary prevents newly-created tables
+    /// from silently missing search maintenance and durability services merely
+    /// because they did not exist during the database-wide binding scan.
+    pub fn bind_table_runtime_services(&self, storage: &TableHandle) {
+        storage.bind_journal_coordinator(Some(self.journal_coordinator()));
+        storage.bind_journal_apply_runtime(Some(self.journal_apply_runtime()));
+        storage.bind_search_task_scheduler(self.task_scheduler.read().clone());
+        let weak = self.self_weak.read().clone();
+        storage.bind_search_maintenance_notifier(Some(Arc::new(move |urgency| {
+            if let Some(database) = weak.upgrade() {
+                database.schedule_search_maintenance(urgency);
+            }
+        })));
+        if let Err(error) =
+            storage.bind_hnsw_integrity_scheduler(self.hnsw_integrity_scheduler.read().clone())
+        {
+            tracing::error!(
+                target: targets::INSTANCE,
+                error = %error,
+                "failed to bind HNSW integrity scheduler"
+            );
         }
     }
 }

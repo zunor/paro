@@ -11,10 +11,16 @@ use crate::rowset::{RowsetId, RowsetSharedPtr};
 
 use crate::search::capability::SearchIndexDefinition;
 use crate::search::manifest::LoadedManifest;
-use crate::search::tail::TailMutationKind;
+use crate::search::tail::{TailMutationKind, TailPendingEntry};
 
 #[derive(Debug, Clone)]
 pub(crate) struct CatchUpWorkItem {
+    /// Exact immutable tail identity admitted into this build quantum.
+    ///
+    /// Keeping the manifest entry beside its retained rowset prevents the
+    /// provider from accidentally observing tail appended after planning or
+    /// materializing more work than the scheduler admitted.
+    pub(crate) tail_entry: TailPendingEntry,
     pub(crate) rowset: RowsetSharedPtr,
 }
 
@@ -73,10 +79,43 @@ impl CatchUpPlanner {
             }
             planned_rows = planned_rows.saturating_add(entry.row_count);
             items.push(CatchUpWorkItem {
+                tail_entry: entry.clone(),
                 rowset: rowset.clone(),
             });
         }
 
+        Ok(CatchUpPlan { items })
+    }
+
+    /// Plan every currently materializable tail rowset for an explicit
+    /// foreground materialization request.
+    ///
+    /// Background catch-up obeys the immutable L0 build quantum encoded in
+    /// manifest rate limits. CREATE INDEX / explicit OPTIMIZE instead asks for
+    /// complete physical coverage and seals the remaining tail in one request.
+    pub(crate) fn plan_all(
+        &self,
+        definition: &SearchIndexDefinition,
+        manifest: &LoadedManifest,
+        visible_by_id: &BTreeMap<RowsetId, RowsetSharedPtr>,
+    ) -> Result<CatchUpPlan> {
+        let mut items = Vec::new();
+        for entry in &manifest.tail_pending_entries {
+            if matches!(entry.mutation, TailMutationKind::Delete) {
+                continue;
+            }
+            let Some(rowset) = visible_by_id.get(&entry.rowset_id) else {
+                continue;
+            };
+            rowset.load()?;
+            if !rowset_can_materialize_definition(definition, rowset) {
+                continue;
+            }
+            items.push(CatchUpWorkItem {
+                tail_entry: entry.clone(),
+                rowset: rowset.clone(),
+            });
+        }
         Ok(CatchUpPlan { items })
     }
 }

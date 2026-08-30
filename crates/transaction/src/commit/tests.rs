@@ -52,7 +52,7 @@ fn serializable_plan(
 }
 
 #[test]
-fn commit_plan_write_set_drops_shadowed_table_intent() {
+fn commit_plan_write_set_excludes_ancestor_table_intent() {
     let table = table_resource();
     let key = pk_resource(44);
     let request = CommitRequest::new(
@@ -73,7 +73,7 @@ fn commit_plan_write_set_drops_shadowed_table_intent() {
 }
 
 #[test]
-fn commit_plan_write_set_keeps_table_intent_without_finer_write() {
+fn commit_plan_write_set_excludes_bare_table_intent() {
     let table = table_resource();
     let request = CommitRequest::new(
         DatabaseId::new(1),
@@ -86,7 +86,34 @@ fn commit_plan_write_set_keeps_table_intent_without_finer_write() {
 
     let plan = CommitSequencingPlan::from_commit_plan(request.commit_plan());
 
-    assert_eq!(plan.write_set, vec![table]);
+    assert!(plan.write_set.is_empty());
+}
+
+#[test]
+fn table_intent_only_maintenance_does_not_reject_key_writer_in_same_batch() {
+    let table = table_resource();
+    let maintenance = CommitSequencingPlan::from_commit_plan(
+        CommitRequest::new(
+            DatabaseId::new(1),
+            TxnId::new(7),
+            TransactionView::autocommit(ReadTs::new(3)),
+            CommitAckPolicy::RequiredPublished,
+            FrozenLockSet::from_locks(vec![LockRequest::new(table, LockMode::IX)]),
+            Vec::new(),
+        )
+        .commit_plan(),
+    );
+    let writer = plan(8, 3, vec![pk_resource(44)]);
+    let sequencer = CommitSequencer::new(CommitTs::new(4), CommitSequencerOptions::default());
+
+    let batch = sequencer
+        .sequence_batch([maintenance, writer], |accepted| {
+            assert_eq!(accepted.len(), 2);
+            Ok::<_, ()>(())
+        })
+        .unwrap();
+
+    assert!(batch.rejected.is_empty());
 }
 
 #[test]
@@ -354,10 +381,30 @@ fn in_flight_batch_rejects_later_conflicting_write() {
     assert_eq!(batch.rejected.len(), 1);
     assert_eq!(
         batch.rejected[0].reason,
-        CommitFenceRejectReason::InBatchWriteConflict
+        CommitFenceRejectReason::InBatchWriteConflict {
+            scope: CommitWriteConflictScope::PrimaryKey,
+        }
     );
     let metrics = sequencer.metrics_snapshot();
     assert_eq!(metrics.reject_in_batch_write_conflict, 1);
+}
+
+#[test]
+fn in_flight_batch_accepts_disjoint_primary_key_writes() {
+    let sequencer = CommitSequencer::new(CommitTs::new(20), CommitSequencerOptions::default());
+    let first = plan(1, 18, vec![pk_resource(7)]);
+    let second = plan(2, 18, vec![pk_resource(8)]);
+    let batch = sequencer
+        .sequence_batch(vec![first, second], |accepted| {
+            assert_eq!(accepted.len(), 2);
+            Ok::<_, ()>(())
+        })
+        .unwrap();
+
+    assert_eq!(batch.accepted.len(), 2);
+    assert!(batch.rejected.is_empty());
+    assert_eq!(batch.accepted[0].commit_ts, CommitTs::new(20));
+    assert_eq!(batch.accepted[1].commit_ts, CommitTs::new(21));
 }
 
 #[test]
@@ -518,6 +565,43 @@ fn ordered_batch_advances_clock_only_after_append_success() {
 
     assert_eq!(batch.append_output, Some(2));
     assert_eq!(sequencer.next_commit_ts(), CommitTs::new(3));
+}
+
+#[test]
+fn ordered_fence_budget_closes_batch_and_defers_suffix() {
+    let sequencer = CommitSequencer::new(
+        CommitTs::new(1),
+        CommitSequencerOptions {
+            max_group_commit_fence_us: 0,
+            ..CommitSequencerOptions::default()
+        },
+    );
+    let batch = sequencer
+        .sequence_ordered_batch(
+            vec![
+                OrderedCommitPlan {
+                    sequencing_plan: plan(1, 1, Vec::new()),
+                    payload: 10_u64,
+                },
+                OrderedCommitPlan {
+                    sequencing_plan: plan(2, 1, Vec::new()),
+                    payload: 20_u64,
+                },
+            ],
+            |_, _| None,
+            |commit_ts, ordered| (commit_ts, ordered.payload),
+            |accepted| {
+                assert_eq!(accepted, vec![(CommitTs::new(1), 10)]);
+                Ok::<_, CommitSequencerAppendError<&'static str, _>>(accepted.len())
+            },
+        )
+        .unwrap();
+
+    assert_eq!(batch.append_output, Some(1));
+    assert!(batch.rejected.is_empty());
+    assert_eq!(batch.deferred.len(), 1);
+    assert_eq!(batch.deferred[0].payload, 20);
+    assert_eq!(sequencer.next_commit_ts(), CommitTs::new(2));
 }
 
 #[test]

@@ -77,22 +77,21 @@ fn bind_copy_to(binder: &mut Binder, stmt: CopyStmt) -> Result<BoundStatementKin
         CopyFormat::Csv => "csv",
         CopyFormat::Text => "text",
         CopyFormat::Ndjson => "ndjson",
-        CopyFormat::Binary => {
-            return Err(paro_error::not_implemented(
-                "COPY TO BINARY is not supported yet",
-            ))
-        }
+        CopyFormat::Binary => "binary",
     };
 
     let copy_function = lookup_copy_function(binder, format_name)?;
-    let bind_data = (copy_function.copy_to_bind)(&options, &input_names, &input_types)?;
+    let copy_to_function = copy_function.copy_to.clone().ok_or_else(|| {
+        paro_error::not_supported(format!("COPY TO {format_name} is not supported"))
+    })?;
+    let bind_data = (copy_to_function.copy_to_bind)(&options, &input_names, &input_types)?;
     let bind_data: Arc<dyn paro_function::copy::CopyFunctionBindData> = bind_data.into();
 
     let output_names = vec!["count".to_string()];
     let output_types = vec![LogicalType::BigInt];
 
     let copy_to = CopyTo::new(
-        copy_function,
+        copy_to_function,
         bind_data,
         source_path,
         stmt.source,
@@ -194,19 +193,18 @@ fn bind_copy_from(binder: &mut Binder, stmt: CopyStmt) -> Result<BoundStatementK
         CopyFormat::Csv => "csv",
         CopyFormat::Text => "text",
         CopyFormat::Ndjson => "ndjson",
-        CopyFormat::Binary => {
-            return Err(paro_error::not_implemented(
-                "COPY FROM BINARY is not supported yet",
-            ))
-        }
+        CopyFormat::Binary => "binary",
     };
 
     let copy_function = lookup_copy_function(binder, format_name)?;
+    let copy_from_function = copy_function.copy_from.as_ref().ok_or_else(|| {
+        paro_error::not_supported(format!("COPY FROM {format_name} is not supported"))
+    })?;
     let bind_data =
-        (copy_function.copy_from_bind)(source, &options, &column_names, &expected_types)?;
+        (copy_from_function.copy_from_bind)(source, &options, &column_names, &expected_types)?;
 
     let table_index = binder.bind_context.generate_table_index();
-    let table_function = Arc::new(copy_function.copy_from_function.clone());
+    let table_function = Arc::new(copy_from_function.copy_from_function.clone());
 
     let table_function_get = TableFunctionGet::new(
         table_function,

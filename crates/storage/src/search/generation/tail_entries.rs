@@ -6,7 +6,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use crate::rowset::RowsetId;
 use crate::tablet::ColumnId;
 
-use super::super::capability::SearchIndexDefinition;
+use super::super::capability::{SearchArtifactRef, SearchIndexDefinition};
 use super::super::manifest::LoadedManifest;
 use super::super::tail::{TailEntryId, TailMutationKind, TailPendingEntry, TailRowImageRef};
 
@@ -33,6 +33,23 @@ pub(crate) fn tail_entry_is_covered_by_artifacts(
     })
 }
 
+pub(crate) fn artifact_segment_column_keys<'a>(
+    artifacts: impl IntoIterator<Item = &'a SearchArtifactRef>,
+) -> BTreeSet<(RowsetId, u32, ColumnId)> {
+    artifacts
+        .into_iter()
+        .flat_map(|artifact| {
+            artifact.coverage.segments().iter().map(|span| {
+                (
+                    span.segment.rowset_id,
+                    span.segment.segment_id,
+                    artifact.column_id,
+                )
+            })
+        })
+        .collect()
+}
+
 pub(crate) fn assign_tail_entry_ids_for_full_snapshot(
     entries: &mut [TailPendingEntry],
     current_manifest: Option<&LoadedManifest>,
@@ -40,11 +57,7 @@ pub(crate) fn assign_tail_entry_ids_for_full_snapshot(
     let mut reusable_ids = BTreeMap::new();
     let mut next_id = 1;
     if let Some(manifest) = current_manifest {
-        next_id = manifest
-            .root
-            .next_tail_entry_id
-            .0
-            .max(next_tail_entry_id(&manifest.tail_pending_entries));
+        next_id = manifest.next_tail_entry_id().0;
         for entry in &manifest.tail_pending_entries {
             if entry.entry_id.is_assigned() {
                 reusable_ids.insert(tail_entry_logical_key(entry), entry.entry_id);
@@ -84,14 +97,4 @@ fn tail_entry_logical_key(
         entry.mutation,
         entry.row_image_ref.clone(),
     )
-}
-
-fn next_tail_entry_id(entries: &[TailPendingEntry]) -> u64 {
-    entries
-        .iter()
-        .filter(|entry| entry.entry_id.is_assigned())
-        .map(|entry| entry.entry_id.0)
-        .max()
-        .unwrap_or(0)
-        .saturating_add(1)
 }

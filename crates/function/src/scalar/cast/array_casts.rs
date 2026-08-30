@@ -166,7 +166,7 @@ fn append_array_literal_value(out: &mut String, value: &Value) {
 /// # Returns
 /// * `Ok(Vec<f32>)` - The parsed vector elements
 /// * `Err` - If parsing fails
-fn parse_vector_literal(s: &str) -> Result<Vec<f32>> {
+pub fn parse_vector_literal(s: &str) -> Result<Vec<f32>> {
     let trimmed = s.trim();
 
     // Check for brackets
@@ -563,6 +563,92 @@ pub fn array_to_list_cast(
 }
 
 // ============================================================================
+// List -> Array Cast (variable-length list to fixed-size array)
+// ============================================================================
+
+pub fn list_to_array_cast(
+    source: &Vector,
+    result: &mut Vector,
+    count: usize,
+    ctx: &CastExecCtx<'_>,
+) -> Result<bool> {
+    let source_child_type = match source.logical_type() {
+        LogicalType::List(child) => child.as_ref().clone(),
+        _ => {
+            return Err(paro_error::internal(
+                "list_to_array_cast requires LIST source",
+            ))
+        }
+    };
+    let target_size = match result.logical_type() {
+        LogicalType::Array(_, size) => *size,
+        _ => {
+            return Err(paro_error::internal(
+                "list_to_array_cast requires ARRAY target",
+            ))
+        }
+    };
+    let cast_data = ctx
+        .cast_data
+        .and_then(|data| data.as_any().downcast_ref::<ArrayBoundCastData>())
+        .ok_or_else(|| paro_error::internal("list_to_array_cast: missing cast data"))?;
+    let entries = source.try_to_view(count)?;
+    let source_child = list_child_vector(source)?;
+    let child_count = count
+        .checked_mul(target_size)
+        .ok_or_else(|| paro_error::out_of_range("ARRAY child count overflow"))?;
+    let allocator = result.allocator().clone();
+    let mut materialized = Vector::try_new(source_child_type, child_count.max(1), allocator)?;
+    materialized.try_set_count(child_count)?;
+    let mut all_success = true;
+
+    for row in 0..count {
+        let output_offset = row * target_size;
+        if !entries.is_valid(row) {
+            result.set_null(row, true);
+            for idx in output_offset..output_offset + target_size {
+                materialized.try_set_null(idx, true)?;
+            }
+            continue;
+        }
+        let (source_offset, source_len) = read_list_entry(&entries, source_child.len(), row)?;
+        if source_len != target_size {
+            if !ctx.try_cast {
+                return Err(paro_error::invalid_value(
+                    format!("ARRAY({target_size})"),
+                    format!("LIST with {source_len} elements"),
+                ));
+            }
+            all_success = false;
+            result.set_null(row, true);
+            for idx in output_offset..output_offset + target_size {
+                materialized.try_set_null(idx, true)?;
+            }
+            continue;
+        }
+        result.set_null(row, false);
+        materialized.try_copy_range(output_offset, source_child, source_offset, source_len)?;
+    }
+
+    let child_ctx = CastExecCtx {
+        runtime: ctx.runtime,
+        try_cast: ctx.try_cast,
+        cast_data: cast_data
+            .child_cast_info
+            .cast_data
+            .as_ref()
+            .map(AsRef::as_ref),
+    };
+    let target_child = ArrayVector::get_entry_mut(result);
+    let child_success =
+        cast_data
+            .child_cast_info
+            .execute(&materialized, target_child, child_count, &child_ctx)?;
+    result.set_count(count);
+    Ok(all_success && child_success)
+}
+
+// ============================================================================
 // List -> List Cast (variable-length element conversion)
 // ============================================================================
 
@@ -778,6 +864,19 @@ pub fn bind_array_casts(
                 Arc::new(ListBoundCastData {
                     child_cast_info: child_cast,
                 }),
+            )
+            .with_context_dependency(dependency),
+        ));
+    }
+
+    if let (LogicalType::List(source_child), LogicalType::Array(target_child, _)) = (source, target)
+    {
+        let child_cast = input.get_cast_function(source_child, target_child)?;
+        let dependency = child_cast.context_dependency();
+        return Ok(Some(
+            BoundCastInfo::array_with_data(
+                list_to_array_cast,
+                Arc::new(ArrayBoundCastData::new(child_cast)),
             )
             .with_context_dependency(dependency),
         ));
@@ -1090,5 +1189,49 @@ mod tests {
                 LogicalType::Double,
             )
         );
+    }
+
+    #[test]
+    fn list_to_fixed_array_validates_cardinality() {
+        let source_type = LogicalType::List(Box::new(LogicalType::Float));
+        let target_type = LogicalType::Array(Box::new(LogicalType::Float), 3);
+        let allocator = paro_common::test_utils::test_allocator();
+        let mut source = Vector::try_new(source_type.clone(), 2, allocator.clone()).unwrap();
+        source.try_set_count(2).unwrap();
+        source.set_value(
+            0,
+            &Value::List(
+                vec![Value::Float(1.0), Value::Float(2.0), Value::Float(3.0)],
+                LogicalType::Float,
+            ),
+        );
+        source.set_value(
+            1,
+            &Value::List(
+                vec![Value::Float(4.0), Value::Float(5.0)],
+                LogicalType::Float,
+            ),
+        );
+
+        let mut casts = CastFunctionSet::new();
+        casts.register_bind_function(bind_array_casts);
+        let bound = casts.get_cast_function(&source_type, &target_type).unwrap();
+        let mut result = Vector::try_new(target_type.clone(), 2, allocator).unwrap();
+        let ctx = CastExecCtx {
+            runtime: &NOOP_RUNTIME,
+            try_cast: true,
+            cast_data: bound.cast_data.as_deref(),
+        };
+
+        assert!(!bound.execute(&source, &mut result, 2, &ctx).unwrap());
+        assert_eq!(
+            result.get_value(0),
+            Value::Array(
+                vec![Value::Float(1.0), Value::Float(2.0), Value::Float(3.0)],
+                LogicalType::Float,
+                3,
+            )
+        );
+        assert_eq!(result.get_value(1), Value::Null(target_type));
     }
 }

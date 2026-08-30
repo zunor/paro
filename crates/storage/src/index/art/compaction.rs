@@ -30,6 +30,7 @@ impl CompactionIndexRebuilder for ArtIndexRebuilder {
 
     fn is_applicable(
         &self,
+        _generation_context: &CompactionGenerationContext,
         tablet: &Tablet,
         _rowset: &RowsetSharedPtr,
         _plan: &CompactionPlan,

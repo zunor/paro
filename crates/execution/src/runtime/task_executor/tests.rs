@@ -162,6 +162,7 @@ fn runtimes_from_graph(
 
 fn values_spec(rows: Vec<Vec<Expression>>, types: Vec<LogicalType>) -> ValuesSpec {
     ValuesSpec {
+        relation_alias: None,
         table_index: 0,
         expressions: rows
             .into_iter()

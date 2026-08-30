@@ -3,6 +3,7 @@
 
 use std::sync::Arc;
 
+use paro_common::allocator::Allocator;
 use paro_common::chunk::Chunk;
 use paro_common::error::Result;
 use paro_context::StatementCancellation;
@@ -56,6 +57,7 @@ impl SearchOperatorDriver {
     pub(crate) fn next_chunk(
         &mut self,
         cancellation: &StatementCancellation,
+        allocator: Arc<dyn Allocator>,
     ) -> Result<Option<Chunk>> {
         loop {
             cancellation.check()?;
@@ -72,6 +74,7 @@ impl SearchOperatorDriver {
                             batch,
                             &self.projected_columns,
                             self.emit_score,
+                            allocator,
                         )
                         .map(Some)
                 }

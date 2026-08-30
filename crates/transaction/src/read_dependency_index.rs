@@ -49,6 +49,17 @@ pub struct ReadDependencyIndexStats {
     pub state_epoch: u64,
 }
 
+/// Lock-free counters consumed by foreground statement telemetry.
+///
+/// Exact dependency cardinalities remain available through `stats()` for
+/// explicit diagnostics.  They require a full shard walk and therefore do
+/// not belong on the statement-context construction path.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct ReadDependencyTelemetryCounters {
+    pub record_count: u64,
+    pub coarsen_count: u64,
+}
+
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct ReadDependencyIndexMark {
     pub dependency_count: usize,
@@ -389,6 +400,14 @@ impl ReadDependencyIndex {
             coarsen_count: self.coarsen_count.load(Ordering::Acquire),
             global_coarsen_count: self.global_coarsen_count.load(Ordering::Acquire),
             state_epoch: self.state_epoch(),
+        }
+    }
+
+    #[inline]
+    pub fn telemetry_counters(&self) -> ReadDependencyTelemetryCounters {
+        ReadDependencyTelemetryCounters {
+            record_count: self.record_count.load(Ordering::Acquire),
+            coarsen_count: self.coarsen_count.load(Ordering::Acquire),
         }
     }
 

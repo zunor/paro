@@ -80,27 +80,25 @@ GROUP BY c_count
 ORDER BY c_count;
 QUERY PLAN
 ORDER_BY  (rows=2)
-  Sort Key: #0 ASC NULLS LAST
+  Sort Key: c_count ASC NULLS LAST
   ->  PROJECTION  (rows=2)
     Output: c_count, customer_distribution
     ->  AGGREGATE  (rows=2)
-      Group Key: #0
+      Group Key: counts.c_count
       Aggregates: count_star(*)
-      Output: aggr_0, aggr_1
       ->  PROJECTION  (rows=3)
         Output: c_count
         ->  HASH_JOIN  (rows=3)
           Join Type: LEFT
-          Join Condition: #0 = #0
+          Join Condition: c.customer_key = o.customer_key
           ->  ROWSET_SCAN on public.singleton_customer c  (rows=3)
             Columns: customer_key
           ->  AGGREGATE  (rows=2)
-            Group Key: #0
+            Group Key: o.customer_key
             Aggregates: count_star(*)
-            Output: aggr_0, aggr_1
             ->  ROWSET_SCAN on public.singleton_orders_large o  (rows=4050)
               Columns: customer_key
-              Pushed Predicate: col#2 NOT LIKE "%special%requests%"
+              Pushed Predicate: comment NOT LIKE "%special%requests%"
 
 SELECT c_count, count(*) AS customer_distribution
 FROM (

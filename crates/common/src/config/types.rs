@@ -7,6 +7,8 @@ use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 use std::time::Duration;
 
+pub const MIN_COPY_STDIN_INFLIGHT_MEMORY_LIMIT: usize = 64 * 1024;
+
 use super::human_bytes;
 
 /// Paro unified configuration.
@@ -39,9 +41,9 @@ pub struct ServerConfig {
     pub tls: Option<TlsConfig>,
     /// Allow starting in plaintext mode when TLS is configured but not implemented yet.
     pub allow_plaintext: bool,
-    /// Optional upper bound for buffered COPY FROM STDIN payloads.
+    /// Optional memory waterline for in-flight COPY FROM STDIN data and queue metadata.
     #[serde(default, with = "human_bytes::optional")]
-    pub copy_stdin_memory_limit: Option<usize>,
+    pub copy_stdin_inflight_memory_limit: Option<usize>,
 }
 
 impl Default for ServerConfig {
@@ -52,7 +54,7 @@ impl Default for ServerConfig {
             max_connections: 0,
             tls: None,
             allow_plaintext: false,
-            copy_stdin_memory_limit: None,
+            copy_stdin_inflight_memory_limit: None,
         }
     }
 }
@@ -63,11 +65,12 @@ impl ServerConfig {
         format!("{}:{}", self.host, self.port)
     }
 
-    pub fn effective_copy_stdin_memory_limit(&self, cluster_max_memory: usize) -> usize {
+    pub fn effective_copy_stdin_inflight_memory_limit(&self, cluster_max_memory: usize) -> usize {
         const GIB: usize = 1024 * 1024 * 1024;
 
-        self.copy_stdin_memory_limit
+        self.copy_stdin_inflight_memory_limit
             .unwrap_or_else(|| (cluster_max_memory / 4).min(GIB))
+            .max(MIN_COPY_STDIN_INFLIGHT_MEMORY_LIMIT)
     }
 }
 
@@ -420,7 +423,7 @@ mod tests {
             [server]
             host = "127.0.0.1"
             port = 5432
-            copy_stdin_memory_limit = "256MiB"
+            copy_stdin_inflight_memory_limit = "256MiB"
 
             [cluster]
             max_memory = "2GiB"
@@ -436,7 +439,7 @@ mod tests {
         assert_eq!(config.server.host, "127.0.0.1");
         assert_eq!(config.server.port, 5432);
         assert_eq!(
-            config.server.copy_stdin_memory_limit,
+            config.server.copy_stdin_inflight_memory_limit,
             Some(256 * 1024 * 1024)
         );
         // Note: bytesize uses GiB for binary units (2^30), GB for SI units (10^9)
@@ -454,7 +457,7 @@ mod tests {
         assert_eq!(
             config
                 .server
-                .effective_copy_stdin_memory_limit(config.cluster.max_memory),
+                .effective_copy_stdin_inflight_memory_limit(config.cluster.max_memory),
             128 * 1024 * 1024
         );
 
@@ -462,7 +465,7 @@ mod tests {
         assert_eq!(
             config
                 .server
-                .effective_copy_stdin_memory_limit(config.cluster.max_memory),
+                .effective_copy_stdin_inflight_memory_limit(config.cluster.max_memory),
             1024 * 1024 * 1024
         );
     }

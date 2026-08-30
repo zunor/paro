@@ -54,6 +54,7 @@ pub mod zonemap;
 
 mod bound_index;
 mod evaluator;
+mod exact_row_set;
 mod fixed_membership;
 mod fixed_size_allocator;
 mod fixed_size_buffer;
@@ -64,12 +65,18 @@ mod index_pointer;
 mod index_storage_info;
 mod index_type;
 mod index_type_set;
-mod page_layout;
+mod partition_directory;
 mod predicate;
 mod predicate_result;
 
 pub use bound_index::{BoundIndex, DeltaIndexType, IndexAppendInfo, IndexAppendMode};
+pub(crate) use bound_index::{PredicateIndexBinding, SegmentLocalComplete};
 pub use evaluator::IndexEvaluator;
+pub(crate) use exact_row_set::OrdinalRowSet;
+pub use exact_row_set::{
+    DenseRowSet, ExactOrdinalPosting, ExactRowAdmission, ExactRowPartitions, ExactRowSet,
+    ExactScalarKey, PartitionExactRowSet,
+};
 pub use fixed_membership::{FixedMembership, FixedMembershipBuildPolicy};
 pub(crate) use fixed_membership::{
     FixedMembershipKind, FixedMembershipSet, FixedMembershipValue, FixedMembershipView,
@@ -99,10 +106,10 @@ pub use index_type::{
     IndexType, IndexTypeInfo, PlanIndexInput,
 };
 pub use index_type_set::IndexTypeSet;
-pub use page_layout::PageLayout;
+pub(crate) use partition_directory::PartitionDirectory;
 pub use predicate::{
-    collect_predicate_columns, compare_bytes, value_to_bytes, Predicate, PredicateComparison,
-    PredicateTree,
+    collect_predicate_columns, compare_bytes, supports_ordered_bytes, value_to_bytes, Predicate,
+    PredicateComparison, PredicateTree,
 };
 pub use predicate_result::{
     decode_page_ranges, encode_page_ranges, intersect, to_row_ranges, union, PageRange,
@@ -111,7 +118,9 @@ pub use predicate_result::{
 
 // Re-export column indexes
 pub use bitmap::BitmapIndex;
-pub use bitmap::{BitmapIndexIterator, BitmapIndexReader, BitmapIndexWriter, BitmapType};
+pub use bitmap::{
+    BitmapIndexIterator, BitmapIndexReader, BitmapIndexWriter, BitmapType, OrderedBitmapBlock,
+};
 pub use bloom::BloomFilterIndex;
 pub use bloom::{
     BloomFilter, BloomFilterAlgorithm, BloomFilterIndexReader, BloomFilterIndexWriter,

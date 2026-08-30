@@ -36,7 +36,7 @@ fn typed_runtime_entry_has_no_legacy_hot_path() {
 
     let executor = read(&manifest, "src/query_executor/executor.rs");
     assert!(
-        executor.contains("CompiledExecutable::Program(program)"),
+        executor.contains("compiled.program()"),
         "Executor must dispatch typed StatementProgram as the primary path"
     );
     assert!(

@@ -103,7 +103,11 @@ impl SourceExec {
         }
     }
 
-    #[inline]
+    /// Cold lifecycle dispatch stays in one code-generation unit. Rust 1.92 / LLVM 21
+    /// miscompiles the large payload-enum jump table when this function is forced
+    /// inline across release CGUs; keeping one canonical dispatch also avoids code
+    /// growth. The hot data-path dispatch below remains inline.
+    #[inline(never)]
     pub fn create_global(&self, ctx: &mut PipelineInitContext) -> Result<SourceGlobal> {
         match self {
             Self::Rowset(exec) => exec.create_global(ctx),
@@ -139,7 +143,7 @@ impl SourceExec {
         }
     }
 
-    #[inline]
+    #[inline(never)]
     pub fn create_local(
         &self,
         ctx: &mut PipelineInitContext,

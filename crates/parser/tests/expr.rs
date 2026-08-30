@@ -25,7 +25,7 @@ fn test_expr() {
 
     let cases = &[
         r#"a"#,
-        r#"?"#,
+        r#"$1"#,
         r#"'I''m who I\'m.'"#,
         r#"'\776 \n \t \u0053 \xaa'"#,
         r#"char(0xD0, 0xBF, 0xD1)"#,
@@ -141,7 +141,7 @@ fn test_expr() {
         r#"MAP_TRANSFORM_KEYS({1:10,2:20,3:30}, (k, v) -> k + 1)"#,
         r#"MAP_TRANSFORM_VALUES({1:10,2:20,3:30}, (k, v) -> v + 1)"#,
         r#"INTERVAL '1 YEAR'"#,
-        r#"(?, ?)"#,
+        r#"($1, $2)"#,
         r#"@test_stage/input/34"#,
         r#"pg_catalog.pg_get_userbyid(1)"#,
         r#"pg_catalog.pg_encoding_to_char(6)"#,

@@ -5,21 +5,64 @@ use super::segment::Segment;
 use super::segment_format::{ColumnMeta, SegmentFooter};
 use crate::index::art::ART;
 use crate::index::fulltext::text_index::FullTextIndex;
+use crate::index::hnsw::{
+    hnsw_artifact_build_contract, HnswBuildContract, HNSW_ARTIFACT_HEADER_LEN,
+};
 use crate::index::sparse::SparseVectorIndex;
-use crate::index::{BitmapIndex, BloomFilterIndex, BoundIndex, HnswIndex};
+use crate::index::{
+    BitmapIndex, BloomFilterIndex, BoundIndex, HnswIndex, PredicateIndexBinding,
+    SegmentLocalComplete,
+};
+use crate::rowset::page::PagePointer;
 use crate::statistics::{
     FullTextIndexStatistics, HnswIndexStatistics, IndexStatistics, IndexType,
     SegmentIndexStatistics, SparseIndexStatistics,
 };
 use crate::tablet::ColumnId;
 use std::collections::HashMap;
-use std::sync::{Arc, RwLock};
+use std::fs::File;
+use std::io::{Read, Seek, SeekFrom};
+use std::sync::{Arc, Mutex, RwLock};
+
+pub(super) enum DeferredHnswState {
+    Unloaded,
+    Ready {
+        index: Arc<HnswIndex>,
+        statistics: HnswIndexStatistics,
+    },
+    Unsupported {
+        reason: String,
+    },
+    Failed(paro_common::error::ParoError),
+}
+
+/// Structural pointer to an inline HNSW artifact. Its page is read and the
+/// index is materialized only when a vector-search capability asks for it.
+/// Unsupported durable versions are a recoverable capability state; current
+/// format corruption remains an error at that capability boundary.
+pub(super) struct DeferredHnswIndex {
+    pub(super) page_pointer: PagePointer,
+    pub(super) state: Mutex<DeferredHnswState>,
+}
 
 #[derive(Default)]
 pub struct SegmentPredicateIndexes {
     pub(super) bloom_filters: HashMap<ColumnId, Arc<BloomFilterIndex>>,
     pub(super) bitmap_indexes: HashMap<ColumnId, Arc<BitmapIndex>>,
-    pub(super) runtime_art_indexes: RwLock<HashMap<ColumnId, Arc<ART>>>,
+    /// One catalog scalar index selects one physical representation per
+    /// immutable segment. The access path and its completeness credential are
+    /// published/replaced atomically under a single lock.
+    pub(super) runtime_scalar_indexes: RwLock<HashMap<ColumnId, ScalarAccessPaths>>,
+}
+
+pub(crate) enum RuntimeScalarIndex {
+    Art(Arc<ART>),
+    Bitmap(Arc<BitmapIndex>),
+}
+
+pub(super) struct ScalarAccessPaths {
+    index: RuntimeScalarIndex,
+    completeness: SegmentLocalComplete,
 }
 
 impl SegmentPredicateIndexes {
@@ -28,46 +71,85 @@ impl SegmentPredicateIndexes {
     }
 
     pub fn bitmap_index(&self, column_id: ColumnId) -> Option<Arc<BitmapIndex>> {
-        self.bitmap_indexes.get(&column_id).cloned()
+        self.runtime_scalar_indexes
+            .read()
+            .ok()
+            .and_then(|guard| match &guard.get(&column_id)?.index {
+                RuntimeScalarIndex::Bitmap(index) => Some(Arc::clone(index)),
+                RuntimeScalarIndex::Art(_) => None,
+            })
+            .or_else(|| self.bitmap_indexes.get(&column_id).cloned())
     }
 
     pub fn art_index(&self, column_id: ColumnId) -> Option<Arc<ART>> {
-        self.runtime_art_indexes
-            .read()
-            .ok()
-            .and_then(|guard| guard.get(&column_id).cloned())
+        self.runtime_scalar_indexes.read().ok().and_then(|guard| {
+            match &guard.get(&column_id)?.index {
+                RuntimeScalarIndex::Art(index) => Some(Arc::clone(index)),
+                RuntimeScalarIndex::Bitmap(_) => None,
+            }
+        })
     }
 
-    pub fn predicate_indexes(&self) -> Vec<Arc<dyn BoundIndex>> {
+    fn has_complete_scalar_index(&self, column_id: ColumnId, segment_rows: u64) -> bool {
+        self.runtime_scalar_indexes.read().is_ok_and(|guard| {
+            guard
+                .get(&column_id)
+                .is_some_and(|paths| paths.completeness.covers(segment_rows))
+        })
+    }
+
+    pub(crate) fn predicate_indexes(
+        &self,
+        segment_rows: u64,
+    ) -> paro_common::error::Result<Vec<PredicateIndexBinding>> {
         let mut results = Vec::with_capacity(
             self.bloom_filters
                 .len()
                 .saturating_add(self.bitmap_indexes.len())
                 .saturating_add(
-                    self.runtime_art_indexes
+                    self.runtime_scalar_indexes
                         .read()
                         .map(|guard| guard.len())
                         .unwrap_or(0),
                 ),
         );
         for idx in self.bloom_filters.values() {
-            results.push(Arc::clone(idx) as Arc<dyn BoundIndex>);
+            results.push(PredicateIndexBinding::candidate(
+                Arc::clone(idx) as Arc<dyn BoundIndex>
+            ));
         }
         for idx in self.bitmap_indexes.values() {
-            results.push(Arc::clone(idx) as Arc<dyn BoundIndex>);
+            let completeness = SegmentLocalComplete::prove(idx.indexed_row_count(), segment_rows)?;
+            results.push(PredicateIndexBinding::complete_scalar(
+                Arc::clone(idx) as Arc<dyn BoundIndex>,
+                completeness,
+            ));
         }
-        if let Ok(guard) = self.runtime_art_indexes.read() {
-            for idx in guard.values() {
-                results.push(Arc::clone(idx) as Arc<dyn BoundIndex>);
+        if let Ok(guard) = self.runtime_scalar_indexes.read() {
+            for paths in guard.values() {
+                if !paths.completeness.covers(segment_rows) {
+                    return Err(paro_common::error::data_corrupted(format!(
+                        "runtime scalar index coverage {} does not match segment rows {segment_rows}",
+                        paths.completeness.row_count()
+                    )));
+                }
+                let index: Arc<dyn BoundIndex> = match &paths.index {
+                    RuntimeScalarIndex::Art(index) => Arc::clone(index) as Arc<dyn BoundIndex>,
+                    RuntimeScalarIndex::Bitmap(index) => Arc::clone(index) as Arc<dyn BoundIndex>,
+                };
+                results.push(PredicateIndexBinding::complete_scalar(
+                    index,
+                    paths.completeness,
+                ));
             }
         }
-        results
+        Ok(results)
     }
 }
 
 #[derive(Default)]
 pub struct SegmentSearchIndexes {
-    pub(super) hnsw_indexes: HashMap<ColumnId, Arc<HnswIndex>>,
+    pub(super) hnsw_indexes: HashMap<ColumnId, Arc<DeferredHnswIndex>>,
     pub(super) sparse_indexes: HashMap<ColumnId, Arc<SparseVectorIndex>>,
     pub(super) fulltext_indexes: HashMap<ColumnId, Arc<FullTextIndex>>,
     pub(super) runtime_fulltext_indexes: RwLock<HashMap<ColumnId, Arc<FullTextIndex>>>,
@@ -198,14 +280,75 @@ impl SegmentIndexStats {
 }
 
 impl Segment {
-    /// Get HNSW index for a column.
+    /// Whether the segment footer advertises an inline HNSW artifact. This is
+    /// a metadata-only check and never opens the artifact.
+    pub fn has_hnsw_artifact(&self, column_id: ColumnId) -> bool {
+        self.indexes.search.hnsw_indexes.contains_key(&column_id)
+    }
+
+    /// Read only the authenticated fixed header of an inline HNSW artifact.
+    /// This is the physical-identity check used by generation coverage: a
+    /// page pointer alone does not prove that the page belongs to the current
+    /// artifact format or to the definition's build contract.
+    pub(crate) fn hnsw_artifact_matches_contract(
+        &self,
+        column_id: ColumnId,
+        expected: &HnswBuildContract,
+    ) -> paro_common::error::Result<bool> {
+        let Some(deferred) = self.indexes.search.hnsw_indexes.get(&column_id) else {
+            return Ok(false);
+        };
+        if deferred.page_pointer.size as usize <= HNSW_ARTIFACT_HEADER_LEN {
+            return Err(paro_common::error::data_corrupted(
+                "inline HNSW page is too small for its fixed header",
+            ));
+        }
+        let mut file = File::open(self.file_path()).map_err(paro_common::error::io)?;
+        file.seek(SeekFrom::Start(deferred.page_pointer.offset))
+            .map_err(paro_common::error::io)?;
+        let mut header = [0_u8; HNSW_ARTIFACT_HEADER_LEN];
+        file.read_exact(&mut header)
+            .map_err(paro_common::error::io)?;
+        Ok(hnsw_artifact_build_contract(&header)?.is_some_and(|actual| actual == *expected))
+    }
+
+    /// Materialize the HNSW capability on first use.
+    pub fn open_hnsw_index(
+        &self,
+        column_id: ColumnId,
+    ) -> paro_common::error::Result<Option<Arc<HnswIndex>>> {
+        let Some(deferred) = self.indexes.search.hnsw_indexes.get(&column_id) else {
+            return Ok(None);
+        };
+        self.materialize_hnsw_index(deferred)
+    }
+
+    /// Test-only convenience for assertions over freshly written segments.
+    #[cfg(test)]
     pub fn hnsw_index(&self, column_id: ColumnId) -> Option<Arc<HnswIndex>> {
-        self.indexes.search.hnsw_indexes.get(&column_id).cloned()
+        self.open_hnsw_index(column_id).ok().flatten()
     }
 
     /// Get HNSW index statistics for a column.
-    pub fn hnsw_index_statistics(&self, column_id: ColumnId) -> Option<&HnswIndexStatistics> {
-        self.index_stats.hnsw_stats.get(&column_id)
+    pub fn hnsw_index_statistics(&self, column_id: ColumnId) -> Option<HnswIndexStatistics> {
+        if let Some(stats) = self.index_stats.hnsw_stats.get(&column_id) {
+            return Some(stats.clone());
+        }
+        let deferred = self.indexes.search.hnsw_indexes.get(&column_id)?;
+        let state = deferred.state.lock().ok()?;
+        match &*state {
+            DeferredHnswState::Ready { statistics, .. } => Some(statistics.clone()),
+            _ => None,
+        }
+    }
+
+    pub fn hnsw_rebuild_reason(&self, column_id: ColumnId) -> Option<String> {
+        let deferred = self.indexes.search.hnsw_indexes.get(&column_id)?;
+        let state = deferred.state.lock().ok()?;
+        match &*state {
+            DeferredHnswState::Unsupported { reason } => Some(reason.clone()),
+            _ => None,
+        }
     }
 
     /// Get sparse index for a column.
@@ -271,23 +414,46 @@ impl Segment {
         self.indexes.predicate.art_index(column_id)
     }
 
-    /// Register a runtime ART index built after segment open.
-    pub fn register_runtime_art_index(&self, column_id: ColumnId, index: Arc<ART>) {
-        if let Ok(mut guard) = self.indexes.predicate.runtime_art_indexes.write() {
-            guard.insert(column_id, index);
+    /// Whether this immutable segment has one exact scalar access path whose
+    /// completeness credential covers every row. Callers must not infer
+    /// coverage from a concrete ART/bitmap representation: representation is
+    /// selected per segment and may change after recovery or compaction.
+    pub fn has_complete_scalar_index(&self, column_id: ColumnId) -> bool {
+        self.indexes
+            .predicate
+            .has_complete_scalar_index(column_id, self.num_rows())
+    }
+
+    /// Atomically publish one complete segment-local scalar access path.
+    pub(crate) fn register_runtime_scalar_index(
+        &self,
+        column_id: ColumnId,
+        index: RuntimeScalarIndex,
+        completeness: SegmentLocalComplete,
+    ) {
+        if let Ok(mut guard) = self.indexes.predicate.runtime_scalar_indexes.write() {
+            guard.insert(
+                column_id,
+                ScalarAccessPaths {
+                    index,
+                    completeness,
+                },
+            );
         }
     }
 
     /// Remove a runtime ART index previously registered on this segment.
     pub fn drop_art_index(&self, column_id: ColumnId) {
-        if let Ok(mut guard) = self.indexes.predicate.runtime_art_indexes.write() {
+        if let Ok(mut guard) = self.indexes.predicate.runtime_scalar_indexes.write() {
             guard.remove(&column_id);
         }
     }
 
     /// Get predicate indexes for evaluator use.
-    pub fn predicate_indexes(&self) -> Vec<Arc<dyn BoundIndex>> {
-        self.indexes.predicate.predicate_indexes()
+    pub(crate) fn predicate_indexes(
+        &self,
+    ) -> paro_common::error::Result<Vec<PredicateIndexBinding>> {
+        self.indexes.predicate.predicate_indexes(self.num_rows())
     }
 
     /// Get per-column index statistics for this segment.

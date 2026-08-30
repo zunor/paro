@@ -775,9 +775,11 @@ fn source_chunk_layout(source: &SourceSpec, row_type: &RowType) -> ChunkLayout {
         | SourceSpec::RecursiveTableScan(_)
         | SourceSpec::TopNEmit(_)
         | SourceSpec::WindowEmit(_)
-        | SourceSpec::SetOperationEmit(_) => {
-            ChunkLayout::view(row_type.types.to_vec(), VECTOR_SIZE)
-        }
+        | SourceSpec::SetOperationEmit(_)
+        | SourceSpec::VectorSearch(_)
+        | SourceSpec::SparseVectorSearch(_)
+        | SourceSpec::FullTextSearch(_)
+        | SourceSpec::AdaptiveSearch(_) => ChunkLayout::view(row_type.types.to_vec(), VECTOR_SIZE),
         _ => chunk_layout(row_type),
     }
 }
@@ -882,6 +884,7 @@ mod tests {
 
     fn values_source() -> SourceSpec {
         SourceSpec::Values(ValuesSpec {
+            relation_alias: None,
             table_index: 7,
             expressions: Box::new([]),
             output_names: Box::new(["a".to_string(), "b".to_string()]),
@@ -956,7 +959,7 @@ mod tests {
             orders: vec![order_by_first_column()].into_boxed_slice(),
             limit: 2,
             offset: 0,
-            hnsw_ef_hint: None,
+            hnsw_options: Default::default(),
             output_names: Box::new(["a".to_string()]),
             output_types: Box::new([LogicalType::Integer]),
         }
@@ -1082,6 +1085,7 @@ mod tests {
                         LogicalType::Integer,
                     ))]),
                     output_names: Box::new(["a".to_string()]),
+                    visible_count: 1,
                 }),
                 TransformSpec::Limit(LimitSpec {
                     limit: Some(Expression::Constant(ConstantExpression::new(
@@ -1089,7 +1093,7 @@ mod tests {
                         LogicalType::Integer,
                     ))),
                     offset: None,
-                    hnsw_ef_hint: None,
+                    hnsw_options: Default::default(),
                 }),
             ],
             sink: client_sink(),

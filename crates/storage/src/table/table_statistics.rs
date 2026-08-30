@@ -75,56 +75,31 @@ impl TableHandle {
         result
     }
 
-    /// Aggregate HNSW index statistics across visible rowsets.
-    pub fn hnsw_index_statistics(&self, column_id: ColumnId) -> Option<HnswIndexStatistics> {
-        let visible = self.max_version();
-        let rowsets = self.tablet().capture_consistent_rowsets(visible).ok()?;
+    /// Statistics for one explicitly selected immutable HNSW generation.
+    /// Definition identity is required: column id alone is ambiguous when
+    /// multiple metrics or replacement definitions coexist.
+    pub fn hnsw_generation_statistics(
+        &self,
+        definition_id: u64,
+    ) -> paro_common::error::Result<Option<HnswIndexStatistics>> {
+        self.search_registry
+            .hnsw_generation_statistics(definition_id)
+    }
 
-        let mut agg: Option<HnswIndexStatistics> = None;
-        for rowset in rowsets {
-            if rowset.load().is_err() {
-                continue;
-            }
-            for segment in rowset.segments() {
-                let Some(stats) = segment.hnsw_index_statistics(column_id) else {
-                    continue;
-                };
-                agg = Some(match agg {
-                    None => stats.clone(),
-                    Some(mut merged) => {
-                        merged.num_indexed_vectors = merged
-                            .num_indexed_vectors
-                            .saturating_add(stats.num_indexed_vectors);
-                        merged.dimension = merged.dimension.max(stats.dimension);
-                        merged.max_level = merged.max_level.max(stats.max_level);
-                        merged.m = merged.m.max(stats.m);
-                        merged.ef_construction = merged.ef_construction.max(stats.ef_construction);
-                        merged.graph_size_bytes = merged
-                            .graph_size_bytes
-                            .saturating_add(stats.graph_size_bytes);
-                        merged.storage_size_bytes = merged
-                            .storage_size_bytes
-                            .saturating_add(stats.storage_size_bytes);
-                        merged.total_graph_links = merged
-                            .total_graph_links
-                            .saturating_add(stats.total_graph_links);
-                        merged.level0_graph_links = merged
-                            .level0_graph_links
-                            .saturating_add(stats.level0_graph_links);
-                        merged.max_level0_degree =
-                            merged.max_level0_degree.max(stats.max_level0_degree);
-                        merged.avg_level0_degree = if merged.num_indexed_vectors == 0 {
-                            0.0
-                        } else {
-                            merged.level0_graph_links as f32 / merged.num_indexed_vectors as f32
-                        };
-                        merged
-                    }
-                });
-            }
-        }
+    /// Number of independent immutable partitions searched by this
+    /// generation. Exposing fan-out makes background coalescing observable to
+    /// operators and benchmark harnesses instead of inferring it from latency.
+    pub fn search_generation_artifact_count(&self, definition_id: u64) -> Option<usize> {
+        self.search_registry
+            .generation_artifact_count(definition_id)
+    }
 
-        agg
+    /// Provider work currently executing for this table. This is a lifecycle
+    /// signal, not a heuristic: a maintenance fence must not declare a
+    /// generation stable while catch-up or coalescing is still building its
+    /// replacement artifact.
+    pub fn active_search_maintenance_tasks(&self) -> usize {
+        self.search_registry.active_maintenance_tasks()
     }
 
     /// Aggregate sparse vector index statistics across visible rowsets.

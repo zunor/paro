@@ -11,7 +11,7 @@ use super::{
 };
 use crate::sync::Mutex;
 use crate::types::{CommitTs, ReadTs, TxnId};
-use crate::{LockMode, LockRequest, LockResource};
+use crate::LockResource;
 use std::time::Instant;
 
 pub use backpressure::{
@@ -95,30 +95,9 @@ fn write_set_from_lock_set(lock_set: &FrozenLockSet) -> Vec<LockResource> {
     lock_set
         .locks()
         .iter()
-        .filter(|request| request.mode.is_write_intent())
-        .filter(|request| !is_shadowed_table_intent(lock_set, request))
+        .filter(|request| request.mode.is_commit_write())
         .map(|request| request.resource.clone())
         .collect()
-}
-
-fn is_shadowed_table_intent(lock_set: &FrozenLockSet, request: &LockRequest) -> bool {
-    if request.mode != LockMode::IX {
-        return false;
-    }
-    let LockResource::Table {
-        namespace,
-        table_id,
-    } = request.resource
-    else {
-        return false;
-    };
-
-    lock_set.locks().iter().any(|other| {
-        other.mode.is_write_intent()
-            && !matches!(other.resource, LockResource::Table { .. })
-            && other.resource.namespace() == namespace
-            && other.resource.table_id() == Some(table_id)
-    })
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -128,7 +107,9 @@ pub enum CommitFenceRejectReason {
         elapsed_us: u64,
         limit_us: u64,
     },
-    InBatchWriteConflict,
+    InBatchWriteConflict {
+        scope: CommitWriteConflictScope,
+    },
     SsiEpochAdvanced {
         validation_epoch: u64,
         batch_effect_epoch: u64,
@@ -138,6 +119,44 @@ pub enum CommitFenceRejectReason {
         current_epoch: u64,
     },
     CommitTimestampExhausted,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CommitWriteConflictScope {
+    Database,
+    Schema,
+    Table,
+    Tablet,
+    PrimaryKey,
+    RowId,
+    Range,
+    Predicate,
+    CatalogObject,
+    Mixed,
+}
+
+impl CommitWriteConflictScope {
+    fn for_pair(left: &LockResource, right: &LockResource) -> Self {
+        use CommitWriteConflictScope as Scope;
+        let classify = |resource: &LockResource| match resource {
+            LockResource::Database { .. } => Scope::Database,
+            LockResource::Schema { .. } => Scope::Schema,
+            LockResource::Table { .. } => Scope::Table,
+            LockResource::Tablet { .. } => Scope::Tablet,
+            LockResource::PrimaryKey { .. } => Scope::PrimaryKey,
+            LockResource::RowId { .. } => Scope::RowId,
+            LockResource::Range { .. } => Scope::Range,
+            LockResource::Predicate { .. } => Scope::Predicate,
+            LockResource::CatalogObject { .. } => Scope::CatalogObject,
+        };
+        let left = classify(left);
+        let right = classify(right);
+        if left == right {
+            left
+        } else {
+            Scope::Mixed
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -190,18 +209,26 @@ impl InFlightCommitBatch {
                 batch_effect_epoch: self.max_ssi_effect_epoch,
             });
         }
-        if self.conflicts_with_write_set(&plan.write_set) {
-            return Some(CommitFenceRejectReason::InBatchWriteConflict);
+        if let Some(scope) = self.conflict_scope_with_write_set(&plan.write_set) {
+            return Some(CommitFenceRejectReason::InBatchWriteConflict { scope });
         }
         None
     }
 
     #[inline]
     pub fn conflicts_with_write_set(&self, write_set: &[LockResource]) -> bool {
-        write_set.iter().any(|resource| {
-            self.write_set
-                .iter()
-                .any(|seen| seen.conflicts_with(resource))
+        self.conflict_scope_with_write_set(write_set).is_some()
+    }
+
+    fn conflict_scope_with_write_set(
+        &self,
+        write_set: &[LockResource],
+    ) -> Option<CommitWriteConflictScope> {
+        write_set.iter().find_map(|resource| {
+            self.write_set.iter().find_map(|seen| {
+                seen.conflicts_with(resource)
+                    .then(|| CommitWriteConflictScope::for_pair(seen, resource))
+            })
         })
     }
 
@@ -266,6 +293,9 @@ impl<E, T> CommitSequencerAppendError<E, T> {
 pub struct CommitSequencerOrderedBatch<O, R> {
     pub append_output: Option<O>,
     pub rejected: Vec<RejectedOrderedCommit<R>>,
+    /// Suffix which did not enter this batch because a batching resource
+    /// budget closed it. Deferral is scheduling, not transaction rejection.
+    pub deferred: Vec<OrderedCommitPlan<R>>,
     pub fence_duration_us: u64,
 }
 
@@ -290,6 +320,7 @@ pub enum CommitSequencerOrderedError<E, A, R> {
         provisional_count: usize,
         accepted: Vec<A>,
         rejected: Vec<RejectedOrderedCommit<R>>,
+        deferred: Vec<OrderedCommitPlan<R>>,
         fence_duration_us: u64,
     },
 }
@@ -346,7 +377,7 @@ impl CommitSequencerMetrics {
                 self.reject_fence_budget_exceeded =
                     self.reject_fence_budget_exceeded.saturating_add(1)
             }
-            CommitFenceRejectReason::InBatchWriteConflict => {
+            CommitFenceRejectReason::InBatchWriteConflict { .. } => {
                 self.reject_in_batch_write_conflict =
                     self.reject_in_batch_write_conflict.saturating_add(1)
             }
@@ -539,29 +570,22 @@ impl CommitSequencer {
         let mut in_flight = InFlightCommitBatch::default();
         let mut accepted = Vec::new();
         let mut rejected = Vec::new();
+        let mut deferred = Vec::new();
         let max_batch = self.options.effective_batch_size();
 
-        for ordered in plans {
+        let mut plans = plans.into_iter();
+        while let Some(ordered) = plans.next() {
             if accepted.len() >= max_batch {
-                rejected.push(RejectedOrderedCommit {
-                    plan: ordered.sequencing_plan,
-                    payload: ordered.payload,
-                    reason: CommitFenceRejectReason::BatchSizeLimit,
-                });
-                continue;
+                deferred.push(ordered);
+                deferred.extend(plans);
+                break;
             }
 
             let elapsed_us = elapsed_us_since(fence_started_at);
-            if elapsed_us >= self.options.max_group_commit_fence_us {
-                rejected.push(RejectedOrderedCommit {
-                    plan: ordered.sequencing_plan,
-                    payload: ordered.payload,
-                    reason: CommitFenceRejectReason::FenceBudgetExceeded {
-                        elapsed_us,
-                        limit_us: self.options.max_group_commit_fence_us,
-                    },
-                });
-                continue;
+            if !accepted.is_empty() && elapsed_us >= self.options.max_group_commit_fence_us {
+                deferred.push(ordered);
+                deferred.extend(plans);
+                break;
             }
 
             if let Some(reason) = in_flight.reject_reason_for(&ordered.sequencing_plan) {
@@ -604,6 +628,7 @@ impl CommitSequencer {
             return Ok(CommitSequencerOrderedBatch {
                 append_output: None,
                 rejected,
+                deferred,
                 fence_duration_us,
             });
         }
@@ -621,6 +646,7 @@ impl CommitSequencer {
                 Ok(CommitSequencerOrderedBatch {
                     append_output: Some(append_output),
                     rejected,
+                    deferred,
                     fence_duration_us,
                 })
             }
@@ -639,6 +665,7 @@ impl CommitSequencer {
                     provisional_count,
                     accepted,
                     rejected,
+                    deferred,
                     fence_duration_us,
                 })
             }
@@ -658,6 +685,7 @@ impl CommitSequencer {
                     provisional_count,
                     accepted,
                     rejected,
+                    deferred,
                     fence_duration_us,
                 })
             }

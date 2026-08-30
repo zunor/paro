@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use super::*;
+use crate::physical::specs::SearchPredicateTemplate;
 
 impl PhysicalPlanGenerator {
     pub(crate) fn lower_insert(
@@ -117,8 +118,23 @@ impl PhysicalPlanGenerator {
             PhysicalNodeKind::Project(ProjectSpec {
                 expressions: projection_exprs.into_boxed_slice(),
                 output_names: output_names.clone().into_boxed_slice(),
+                visible_count: 0,
             }),
-            RowType::new(output_names, output_types),
+            RowType::with_identities(
+                output_names.clone(),
+                output_types,
+                output_names
+                    .iter()
+                    .enumerate()
+                    .map(|(index, name)| {
+                        if index == table_column_count {
+                            ColumnIdentity::Internal
+                        } else {
+                            ColumnIdentity::visible(name.clone())
+                        }
+                    })
+                    .collect(),
+            ),
             vec![child],
             OperatorLabel::new(update.child.id, "UPDATE_PROJECT"),
             child_cardinality,
@@ -207,12 +223,14 @@ impl PhysicalPlanGenerator {
                 paro_error::internal("Get missing table reference for fulltext scan")
             })?;
         let (predicate_tree, mut residual) =
-            predicate_builder::build_predicate_tree(&scan.other_predicates, &scan.get)?;
-        let (runtime_tree, mut runtime_residual) = predicate_builder::build_predicate_tree(
-            &scan.get.runtime_filter_expressions,
-            &scan.get,
-        )?;
-        let predicate = predicate_builder::combine_predicate_trees(predicate_tree, runtime_tree);
+            predicate_builder::build_search_predicate_template(&scan.other_predicates, &scan.get)?;
+        let (runtime_tree, mut runtime_residual) =
+            predicate_builder::build_search_predicate_template(
+                &scan.get.runtime_filter_expressions,
+                &scan.get,
+            )?;
+        let predicate =
+            SearchPredicateTemplate::and([predicate_tree, runtime_tree].into_iter().flatten());
         residual.append(&mut runtime_residual);
         residual.extend(scan.residual_predicates.clone());
         if !residual.is_empty() {
@@ -225,6 +243,9 @@ impl PhysicalPlanGenerator {
             ));
         }
 
+        // Residual predicates were rejected above, so this is the exact
+        // segment-bitmap proof boundary for the search source.
+        let filter_contract = super::scan::exact_search_filter_contract(predicate.as_ref());
         let spec = FullTextSearchSpec {
             table,
             capability_token: candidate.token.clone(),
@@ -236,6 +257,8 @@ impl PhysicalPlanGenerator {
             score_mode: intent.score_mode,
             mode: SearchRequestMode::Filter,
             predicate,
+            filter_contract,
+            filter_materialization: candidate.exact_filter_materialization,
             projected_columns: (0..scan.get.returned_types.len())
                 .map(|output| {
                     scan.get.stored_column(output).ok_or_else(|| {

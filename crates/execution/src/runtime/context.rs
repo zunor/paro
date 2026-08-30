@@ -5,13 +5,16 @@
 
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, Condvar, Mutex};
+use std::sync::{Arc, Condvar, LockResult, Mutex, MutexGuard, WaitTimeoutResult};
 use std::time::Duration;
 
 use paro_catalog::mvcc::CatalogSnapshot;
 use paro_common::allocator::{Allocator, BufferAllocator, MemoryTag};
 use paro_common::chunk::Chunk;
 use paro_common::error::{self as paro_error, ParoError, Result};
+use paro_common::memory::{
+    MemoryAccountingClass, MemoryAccountingContext, MemoryDomain, MemoryOwner,
+};
 use paro_context::{StatementCancellation, StatementContext, TransactionView};
 use paro_function::scalar::FunctionExecContext;
 use paro_function::table::TableFunctionRuntimeContext;
@@ -285,6 +288,10 @@ impl FunctionExecContext for QueryRuntimeContext {
         self.session.time.transaction_timestamp_micros()
     }
 
+    fn next_random(&self) -> Option<f64> {
+        Some(self.session.random.next_f64())
+    }
+
     fn is_interrupted(&self) -> bool {
         self.cancellation.is_cancelled()
     }
@@ -309,6 +316,19 @@ impl TableFunctionRuntimeContext for QueryRuntimeContext {
 
     fn copy_stdin_source(&self) -> Option<Arc<dyn paro_function::table::CopyStdinSource>> {
         self.session.input.copy_stdin_source()
+    }
+
+    fn memory_limit_bytes(&self) -> Option<usize> {
+        (self.session.limits.max_memory > 0).then(|| self.memory.capacity_bytes())
+    }
+
+    fn memory_accounting_context(
+        &self,
+        tag: MemoryTag,
+        class: MemoryAccountingClass,
+    ) -> MemoryAccountingContext {
+        let owner: Arc<dyn MemoryOwner> = self.memory.clone();
+        MemoryAccountingContext::from_owner(owner, MemoryDomain::Host, tag, class)
     }
 }
 
@@ -384,7 +404,7 @@ impl QueryOutputPort {
                 stats: Mutex::new(QueryOutputPortStats::default()),
                 generation: AtomicU64::new(0),
                 closed: AtomicBool::new(false),
-                cv: Condvar::new(),
+                cv: OutputChangeNotifier::new(),
             }),
         }
     }
@@ -764,6 +784,17 @@ impl QueryOutputPort {
             .expect("query output port condvar poisoned");
     }
 
+    /// Creates an independent async progress subscription.
+    ///
+    /// The receiver must be retained by its consumer across observations;
+    /// watch versions make publications persistent and support any number of
+    /// consumers without lost wakeups.
+    pub fn subscribe(&self) -> QueryOutputWaiter {
+        QueryOutputWaiter {
+            receiver: self.inner.cv.subscribe(),
+        }
+    }
+
     pub fn capacity(&self) -> usize {
         self.inner.capacity
     }
@@ -834,7 +865,63 @@ struct QueryOutputPortInner {
     stats: Mutex<QueryOutputPortStats>,
     generation: AtomicU64,
     closed: AtomicBool,
-    cv: Condvar,
+    cv: OutputChangeNotifier,
+}
+
+#[derive(Debug)]
+struct OutputChangeNotifier {
+    blocking: Condvar,
+    asynchronous: tokio::sync::watch::Sender<u64>,
+}
+
+impl OutputChangeNotifier {
+    fn new() -> Self {
+        let (asynchronous, _) = tokio::sync::watch::channel(0);
+        Self {
+            blocking: Condvar::new(),
+            asynchronous,
+        }
+    }
+
+    fn notify_all(&self) {
+        self.blocking.notify_all();
+        self.asynchronous
+            .send_modify(|generation| *generation = generation.wrapping_add(1));
+    }
+
+    fn wait<'a, T>(&self, guard: MutexGuard<'a, T>) -> LockResult<MutexGuard<'a, T>> {
+        self.blocking.wait(guard)
+    }
+
+    fn wait_timeout<'a, T>(
+        &self,
+        guard: MutexGuard<'a, T>,
+        timeout: Duration,
+    ) -> LockResult<(MutexGuard<'a, T>, WaitTimeoutResult)> {
+        self.blocking.wait_timeout(guard, timeout)
+    }
+
+    fn subscribe(&self) -> tokio::sync::watch::Receiver<u64> {
+        self.asynchronous.subscribe()
+    }
+}
+
+#[derive(Debug)]
+pub struct QueryOutputWaiter {
+    receiver: tokio::sync::watch::Receiver<u64>,
+}
+
+impl QueryOutputWaiter {
+    pub fn mark_observed(&mut self) {
+        self.receiver.borrow_and_update();
+    }
+
+    pub async fn wait_for_change(&mut self) -> Result<()> {
+        self.receiver
+            .changed()
+            .await
+            .map_err(|_| paro_error::internal("query output progress channel closed"))
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1191,6 +1278,25 @@ mod tests {
         let closed_generation = port.wake_generation();
         port.close();
         assert_eq!(port.wake_generation(), closed_generation);
+    }
+
+    #[tokio::test]
+    async fn async_output_waiters_observe_published_state_without_lost_wakeup() {
+        let port = QueryOutputPort::bounded(1);
+        let mut first = port.subscribe();
+        let mut second = port.subscribe();
+        assert!(matches!(
+            port.try_push(paro_common::test_utils::test_chunk(&[])),
+            QueryOutputWrite::Written
+        ));
+        let (first_result, second_result) =
+            tokio::time::timeout(Duration::from_secs(1), async move {
+                tokio::join!(first.wait_for_change(), second.wait_for_change())
+            })
+            .await
+            .expect("all async output waiters must observe the publication");
+        first_result.unwrap();
+        second_result.unwrap();
     }
 
     #[test]
