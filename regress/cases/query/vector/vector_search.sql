@@ -47,6 +47,10 @@ CREATE VECTOR INDEX idx_indexed_items_emb ON indexed_items (emb)
 INSERT INTO indexed_items
 SELECT i, i % 10, '[1.0,1.0,1.0]'::VECTOR(3)
 FROM generate_series(1, 2048) AS generated(i);
+-- Incremental writes remain an exact tail until governed maintenance admits
+-- a generation graph. Materialize it explicitly so this regression exercises
+-- graph planning rather than accidentally blessing the pre-maintenance tail.
+REFRESH VECTOR INDEX idx_indexed_items_emb ON indexed_items;
 SELECT index_name, index_type FROM paro_indexes()
 WHERE index_name = 'idx_indexed_items_emb';
 -- @normalize explain_search_ids
