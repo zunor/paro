@@ -400,6 +400,13 @@ fn run_finalize_worker(inner: Arc<CommitFinalizeStageInner>) {
     while let Some(batch) = inner.pop_batch() {
         if let Err(failure) = process_finalize_batch(&inner, batch) {
             let message = Arc::from(failure.error.to_string());
+            // Publish terminal health before waking any durable waiter. A
+            // caller that observes an ambiguous completion must also observe
+            // a closed/poisoned finalize stage; otherwise it can race a new
+            // admission into a runtime that has already lost ordered publish
+            // progress.
+            inner.poison(failure.error.clone());
+            (inner.hooks.on_stage_error)(&failure.error);
             for completion in failure
                 .ambiguous_jobs
                 .into_iter()
@@ -407,8 +414,6 @@ fn run_finalize_worker(inner: Arc<CommitFinalizeStageInner>) {
             {
                 (inner.hooks.on_durable_ambiguous)(completion, Arc::clone(&message));
             }
-            (inner.hooks.on_stage_error)(&failure.error);
-            inner.poison(failure.error);
             return;
         }
     }

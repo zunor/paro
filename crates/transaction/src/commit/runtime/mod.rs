@@ -173,14 +173,14 @@ impl CommitRuntime {
                                 message.clone(),
                             ),
                         );
-                        completions.mark_ambiguous_commit_ts(
-                            *commit_ts,
-                            CommitRuntimeFailure::Ambiguous(Arc::from(error.to_string())),
-                        );
                         poison_cell.poison(CommitRuntimePoison::FinalizeStage {
                             commit_ts: Some(*commit_ts),
                             message: Arc::from(error.to_string()),
                         });
+                        completions.mark_ambiguous_commit_ts(
+                            *commit_ts,
+                            CommitRuntimeFailure::Ambiguous(Arc::from(error.to_string())),
+                        );
                     }
                     CommitFinalizeStageError::Submit {
                         commit_ts,
@@ -195,14 +195,14 @@ impl CommitRuntime {
                                 submit_error.message(),
                             ),
                         );
-                        completions.mark_ambiguous_commit_ts(
-                            *commit_ts,
-                            CommitRuntimeFailure::Ambiguous(Arc::from(error.to_string())),
-                        );
                         poison_cell.poison(CommitRuntimePoison::Submit {
                             commit_ts: *commit_ts,
                             message: Arc::from(submit_error.to_string()),
                         });
+                        completions.mark_ambiguous_commit_ts(
+                            *commit_ts,
+                            CommitRuntimeFailure::Ambiguous(Arc::from(error.to_string())),
+                        );
                     }
                     CommitFinalizeStageError::DurableHandle { .. } => {
                         poison_cell.poison(CommitRuntimePoison::FinalizeStage {
