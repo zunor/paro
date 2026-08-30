@@ -36,8 +36,8 @@ use crate::search::segment_dispatch::{
     dispatch_segment_indices, map_search_tasks, map_segments, SegmentDispatchResult,
 };
 use crate::search::sidecar::{
-    DecodedSidecarReaderRequest, SearchReaderRuntime, SidecarIntegrityPolicy, SidecarReaderRequest,
-    SIDECAR_PACKAGE_CODEC,
+    is_decoded_hnsw_sidecar_artifact, DecodedReaderBinding, DecodedSidecarReaderRequest,
+    SearchReaderRuntime, SidecarIntegrityPolicy, SidecarReaderRequest, SIDECAR_PACKAGE_CODEC,
 };
 use crate::search::tail::exact_merge::{ensure_tail_exact_merge_budget, TailExactMergeQueryShape};
 use crate::search::tail_merge::{
@@ -1200,6 +1200,11 @@ where
             codec: SIDECAR_PACKAGE_CODEC,
             integrity: SidecarIntegrityPolicy::SelfValidatingArtifact,
         },
+        binding: DecodedReaderBinding::GenerationExternalVectors {
+            definition_id: artifact.definition_id,
+            generation_id: artifact.generation_id,
+            column_id: artifact.column_id,
+        },
     };
     let index = match runtime.get_or_try_open_decoded(request, |cached| {
         if !matches!(
@@ -1394,12 +1399,7 @@ pub(crate) fn prewarm_hnsw_generation_readers(
         .collect::<BTreeMap<_, _>>();
     let mut warmed = 0usize;
     for artifact in artifacts.iter().filter(|artifact| {
-        artifact.kind == SearchIndexKind::Hnsw
-            && artifact.column_id == column_id
-            && matches!(
-                artifact.location,
-                ArtifactLocation::SidecarArtifactFile { .. }
-            )
+        artifact.column_id == column_id && is_decoded_hnsw_sidecar_artifact(artifact)
     }) {
         let index = open_sidecar_hnsw_artifact(
             runtime,

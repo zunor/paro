@@ -1455,7 +1455,7 @@ fn hnsw_generation_compaction_coalesces_graphs_without_rewriting_rowsets() {
     // Keep two level-zero artifacts live so this test exercises the
     // independently admitted generation-compaction path. Freshness
     // catch-up only appends immutable level-zero artifacts.
-    provider.maintenance.compaction_fanout = 3;
+    provider.maintenance.compaction_fanout = 2;
     let provider_config = provider.to_value().unwrap();
     let definition = SearchIndexDefinition {
         definition_id: 188,
@@ -1542,7 +1542,7 @@ fn hnsw_generation_compaction_coalesces_graphs_without_rewriting_rowsets() {
     assert!(
         table
             .search_registry()
-            .compact_hnsw_generation(188, true)
+            .compact_hnsw_generation(188, false)
             .unwrap(),
         "derived graph compaction must make governed progress while foreground reads remain active"
     );

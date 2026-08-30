@@ -223,6 +223,34 @@ where
     map_search_tasks_on_runtime(runtime, items, parallelism_slots, execute)
 }
 
+fn spawn_search_lane_continuation<'scope, I, T, F>(
+    scope: &rayon::ScopeFifo<'scope>,
+    next: &'scope AtomicUsize,
+    items: &'scope [I],
+    results: &'scope [Mutex<Option<Result<T>>>],
+    execute: &'scope F,
+) where
+    I: Sync + 'scope,
+    T: Send + 'scope,
+    F: Fn(usize, &I) -> Result<T> + Sync + 'scope,
+{
+    scope.spawn_fifo(move |scope| {
+        let index = next.fetch_add(1, Ordering::Relaxed);
+        if index >= items.len() {
+            return;
+        }
+        let result = execute(index, &items[index]);
+        *results[index]
+            .lock()
+            .expect("search task result lock poisoned") = Some(result);
+        // Return to the global FIFO after every shard. At most one
+        // continuation per granted lane exists, so this preserves the query's
+        // parallelism ceiling without letting a long-lived lane monopolize a
+        // worker across multiple provider shards.
+        spawn_search_lane_continuation(scope, next, items, results, execute);
+    });
+}
+
 fn map_search_tasks_on_runtime<I, T, F>(
     runtime: &SearchDispatchRuntime,
     items: &[I],
@@ -248,30 +276,20 @@ where
         });
     }
 
+    let next = AtomicUsize::new(0);
     let results = (0..items.len())
         .map(|_| Mutex::new(None))
         .collect::<Vec<Mutex<Option<Result<T>>>>>();
-    let execute_index = |index: usize| {
-        let result = execute(index, &items[index]);
-        *results[index]
-            .lock()
-            .expect("search task result lock poisoned") = Some(result);
-    };
-    // Submit leaf shards rather than one long-lived worker loop per granted
-    // lane. The fixed Rayon pool then owns the only runnable queue and can
-    // interleave HNSW, sparse, and full-text requests without a provider-side
-    // census or a query-wide lease that cannot be rebalanced. Batching retains
-    // the caller's explicit parallelism ceiling while every batch remains
-    // globally work-conserving.
-    for batch_start in (0..items.len()).step_by(lane_count) {
-        let batch_end = batch_start.saturating_add(lane_count).min(items.len());
-        runtime.pool.scope_fifo(|scope| {
-            for index in batch_start..batch_end {
-                let execute_index = &execute_index;
-                scope.spawn_fifo(move |_| execute_index(index));
-            }
-        });
-    }
+    // A continuation per granted lane preserves the caller's parallelism
+    // ceiling without inserting barriers between uneven shards. Completing a
+    // shard requeues that lane behind already-runnable work, so the fixed
+    // Rayon FIFO remains the sole fair scheduler shared by HNSW, sparse, and
+    // full-text queries.
+    runtime.pool.scope_fifo(|scope| {
+        for _ in 0..lane_count {
+            spawn_search_lane_continuation(scope, &next, items, &results, &execute);
+        }
+    });
 
     results
         .into_iter()
@@ -293,7 +311,8 @@ where
 mod tests {
     use super::{create_search_dispatch_runtime, map_search_tasks_on_runtime};
     use paro_common::error as paro_error;
-    use std::sync::{Barrier, Mutex};
+    use std::sync::{Arc, Barrier, Condvar, Mutex};
+    use std::time::Duration;
 
     #[test]
     fn dispatch_runtime_owns_the_complete_process_width() {
@@ -344,6 +363,35 @@ mod tests {
         .expect("nested search phase");
 
         assert_eq!(mapped, vec![1, 5]);
+    }
+
+    #[test]
+    fn completed_lane_pulls_next_uneven_shard_without_a_batch_barrier() {
+        let runtime = create_search_dispatch_runtime(2).expect("search runtime");
+        let third_started = Arc::new((Mutex::new(false), Condvar::new()));
+        let mapped = map_search_tasks_on_runtime(&runtime, &[0usize, 1, 2], 2, |index, _| {
+            match index {
+                1 => {
+                    let (started, changed) = third_started.as_ref();
+                    let observed = started.lock().expect("third-shard state");
+                    let (observed, timeout) = changed
+                        .wait_timeout_while(observed, Duration::from_secs(2), |value| !*value)
+                        .expect("wait for third shard");
+                    assert!(*observed, "third shard remained behind a batch barrier");
+                    assert!(!timeout.timed_out(), "third shard did not start promptly");
+                }
+                2 => {
+                    let (started, changed) = third_started.as_ref();
+                    *started.lock().expect("third-shard state") = true;
+                    changed.notify_all();
+                }
+                _ => {}
+            }
+            Ok(index)
+        })
+        .expect("map uneven search tasks");
+
+        assert_eq!(mapped, vec![0, 1, 2]);
     }
 
     #[test]

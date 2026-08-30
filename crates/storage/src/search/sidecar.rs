@@ -506,14 +506,30 @@ pub struct SidecarReaderCacheKey {
     pub integrity: SidecarIntegrityPolicy,
 }
 
+/// External storage identity retained by a decoded provider reader.
+///
+/// Self-contained providers depend only on their artifact bytes. HNSW readers
+/// additionally retain segment-owned vector readers; the immutable generation
+/// identity scopes that binding while the stable-layout lease keeps the
+/// referenced physical segments unchanged through publication.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum DecodedReaderBinding {
+    SelfContained,
+    GenerationExternalVectors {
+        definition_id: u64,
+        generation_id: u64,
+        column_id: u32,
+    },
+}
+
 /// Identity for a typed, immutable provider reader derived from one sidecar
-/// artifact. The physical segment identity is part of this key because an
-/// HNSW graph can be byte-identical while its external base-vector storage is
-/// not. Content identity alone is therefore insufficient for decoded readers.
+/// artifact. Content identity alone is insufficient for readers that retain
+/// external storage, so their generation-scoped binding is part of the key.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct DecodedSidecarArtifactKey {
     pub sidecar: SidecarReaderCacheKey,
     pub provider: SearchIndexKind,
+    pub binding: DecodedReaderBinding,
 }
 
 /// One immutable provider reader lookup.
@@ -525,6 +541,7 @@ pub struct DecodedSidecarArtifactKey {
 #[derive(Debug, Clone, Copy)]
 pub struct DecodedSidecarReaderRequest<'a> {
     pub sidecar: SidecarReaderRequest<'a>,
+    pub binding: DecodedReaderBinding,
 }
 
 impl DecodedSidecarReaderRequest<'_> {
@@ -536,8 +553,17 @@ impl DecodedSidecarReaderRequest<'_> {
                 self.sidecar.integrity,
             )?,
             provider: self.sidecar.provider,
+            binding: self.binding,
         })
     }
+}
+
+pub(crate) fn is_decoded_hnsw_sidecar_artifact(artifact: &SearchArtifactRef) -> bool {
+    artifact.kind == SearchIndexKind::Hnsw
+        && matches!(
+            artifact.location,
+            ArtifactLocation::SidecarArtifactFile { .. }
+        )
 }
 
 fn hnsw_decoded_artifact_key(artifact: &SearchArtifactRef) -> Result<DecodedSidecarArtifactKey> {
@@ -548,6 +574,11 @@ fn hnsw_decoded_artifact_key(artifact: &SearchArtifactRef) -> Result<DecodedSide
             provider: SearchIndexKind::Hnsw,
             codec: SIDECAR_PACKAGE_CODEC,
             integrity: SidecarIntegrityPolicy::SelfValidatingArtifact,
+        },
+        binding: DecodedReaderBinding::GenerationExternalVectors {
+            definition_id: artifact.definition_id,
+            generation_id: artifact.generation_id,
+            column_id: artifact.column_id,
         },
     }
     .key()
@@ -981,7 +1012,7 @@ impl SearchReaderRuntime {
     ) -> Result<usize> {
         let keys = artifacts
             .iter()
-            .filter(|artifact| artifact.kind == SearchIndexKind::Hnsw)
+            .filter(|artifact| is_decoded_hnsw_sidecar_artifact(artifact))
             .map(hnsw_decoded_artifact_key)
             .collect::<Result<BTreeSet<_>>>()?;
         if keys.is_empty() {
@@ -1519,6 +1550,7 @@ mod tests {
                 codec: TEST_CODEC,
                 integrity: SidecarIntegrityPolicy::SelfValidatingArtifact,
             },
+            binding: DecodedReaderBinding::SelfContained,
         };
         let builds = AtomicUsize::new(0);
         let first = runtime
@@ -1562,6 +1594,44 @@ mod tests {
     }
 
     #[test]
+    fn decoded_reader_cache_separates_external_generation_bindings() {
+        let temp_dir = tempfile::TempDir::new().unwrap();
+        let store = SidecarArtifactStore::new(temp_dir.path());
+        let file_id = SidecarArtifactStore::default_shard_file_id(41, 9);
+        let mut writer = store.create_package_writer(file_id).unwrap();
+        let location = writer.append_artifact(b"binding-scoped-reader").unwrap();
+        writer.finalize().unwrap();
+
+        let runtime = SearchReaderRuntime::new(store);
+        let request = |generation_id| DecodedSidecarReaderRequest {
+            sidecar: SidecarReaderRequest {
+                location: &location,
+                artifact_format_version: 3,
+                provider: SearchIndexKind::Hnsw,
+                codec: "test-binding-scoped-reader",
+                integrity: SidecarIntegrityPolicy::SelfValidatingArtifact,
+            },
+            binding: DecodedReaderBinding::GenerationExternalVectors {
+                definition_id: 41,
+                generation_id,
+                column_id: 7,
+            },
+        };
+        let first = runtime
+            .get_or_try_open_decoded(request(1), |_| Ok(Some(String::from("generation-1"))))
+            .unwrap()
+            .unwrap();
+        let second = runtime
+            .get_or_try_open_decoded(request(2), |_| Ok(Some(String::from("generation-2"))))
+            .unwrap()
+            .unwrap();
+
+        assert!(!Arc::ptr_eq(&first, &second));
+        assert_eq!(runtime.decoded_len(), 2);
+        assert_eq!(runtime.sidecars.len(), 1);
+    }
+
+    #[test]
     fn concurrent_typed_reader_miss_is_single_flight() {
         use std::sync::atomic::{AtomicUsize, Ordering};
         use std::sync::Barrier;
@@ -1592,6 +1662,7 @@ mod tests {
                                         codec: "test-single-flight",
                                         integrity: SidecarIntegrityPolicy::SelfValidatingArtifact,
                                     },
+                                    binding: DecodedReaderBinding::SelfContained,
                                 },
                                 |_| {
                                     builds.fetch_add(1, Ordering::AcqRel);

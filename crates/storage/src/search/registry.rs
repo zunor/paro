@@ -350,11 +350,18 @@ impl SearchIndexRegistry {
     /// Install the authenticated reader image retained by a transaction-owned
     /// generation after its directory rename and before the catalog definition
     /// becomes query-visible.
-    pub(crate) fn adopt_staged_generation_readers(
-        &self,
-        staged: &StagedSearchGeneration,
-    ) -> Result<usize> {
-        staged.adopt_prepared_readers_into(self.reader_runtime.as_ref())
+    pub(crate) fn adopt_staged_generation_readers(&self, staged: &StagedSearchGeneration) {
+        if let Err(error) = staged.adopt_prepared_readers_into(self.reader_runtime.as_ref()) {
+            // Adoption is a warm-cache handoff after the generation head is
+            // durable. Query activation can reconstruct the same immutable
+            // reader, so this optimization must never split storage from the
+            // catalog or make a committed transaction report failure.
+            tracing::warn!(
+                tablet_id = self.tablet.tablet_id(),
+                error = %error,
+                "failed to adopt staged search readers; falling back to durable attach"
+            );
+        }
     }
 
     /// Build a complete immutable generation without making its definition

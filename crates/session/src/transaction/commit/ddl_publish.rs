@@ -400,7 +400,7 @@ impl IndexBackfillPublishTask {
         }
 
         if let Some(staged) = self.staged_search_generation.as_ref() {
-            storage.adopt_staged_search_generation_readers(staged.as_ref())?;
+            storage.adopt_staged_search_generation_readers(staged.as_ref());
         }
         Self::register_search_definition(storage.as_ref(), self.entry.as_ref())?;
         if Self::search_kind(self.info.index_type).is_some()

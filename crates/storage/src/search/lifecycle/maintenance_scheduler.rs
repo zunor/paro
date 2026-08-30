@@ -21,6 +21,7 @@ use crate::search::manifest::{
     LoadedManifest, DELTA_BYTES_HARD_LIMIT, DELTA_BYTES_SOFT_LIMIT, DELTA_COUNT_HARD_LIMIT,
     DELTA_COUNT_SOFT_LIMIT,
 };
+use crate::search::sidecar_builder::publication_authentication_read_bytes;
 use crate::search::stats::{CatchUpBacklogTier, MaintenancePriority, SearchDefinitionId, TableId};
 use crate::search::tail::TailMutationKind;
 
@@ -991,16 +992,14 @@ fn estimate_maintenance_cost_benefit(
             }
         }
     };
-    if kind == SearchIndexKind::Hnsw {
-        // Every newly-written HNSW payload is read back through its checksum
-        // hierarchy before a durable generation head can name it. This is a
-        // required publication cost, not optional background residency work,
-        // and must therefore consume the same I/O envelope as construction.
-        estimate.cost.io_read_bytes = estimate
+    estimate.cost.io_read_bytes =
+        estimate
             .cost
             .io_read_bytes
-            .saturating_add(estimate.cost.io_write_bytes);
-    }
+            .saturating_add(publication_authentication_read_bytes(
+                kind,
+                estimate.cost.io_write_bytes,
+            ));
     if manifest_delta_compaction_requested {
         add_manifest_delta_compaction_estimate(&mut estimate, manifest, delta_window_bytes);
     }

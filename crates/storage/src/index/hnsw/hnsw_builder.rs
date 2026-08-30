@@ -197,15 +197,24 @@ fn foreground_pressure_active_at(
 /// graph bytes are independent of execution width.
 pub(crate) struct HnswForegroundQueryGuard;
 
+fn notify_foreground_pressure_transition() {
+    let (state, changed) =
+        HNSW_FOREGROUND_PRESSURE_CHANGED.get_or_init(|| (Mutex::new(()), Condvar::new()));
+    // The predicate itself is atomic, but serializing its edge notification
+    // with the waiter's check-and-park window prevents a lost wakeup. Only the
+    // 0->1 and 1->0 transitions take this lock, not every query enter/exit.
+    let _state = state
+        .lock()
+        .expect("HNSW foreground-pressure lock poisoned");
+    changed.notify_all();
+}
+
 impl HnswForegroundQueryGuard {
     pub(crate) fn enter() -> Self {
         extend_foreground_pressure();
         let previous = HNSW_ACTIVE_FOREGROUND_QUERIES.fetch_add(1, Ordering::AcqRel);
         if previous == 0 {
-            HNSW_FOREGROUND_PRESSURE_CHANGED
-                .get_or_init(|| (Mutex::new(()), Condvar::new()))
-                .1
-                .notify_all();
+            notify_foreground_pressure_transition();
         }
         Self
     }
@@ -220,10 +229,7 @@ impl Drop for HnswForegroundQueryGuard {
         let previous = HNSW_ACTIVE_FOREGROUND_QUERIES.fetch_sub(1, Ordering::AcqRel);
         debug_assert!(previous > 0, "HNSW foreground query count underflow");
         if previous == 1 {
-            HNSW_FOREGROUND_PRESSURE_CHANGED
-                .get_or_init(|| (Mutex::new(()), Condvar::new()))
-                .1
-                .notify_all();
+            notify_foreground_pressure_transition();
         }
     }
 }

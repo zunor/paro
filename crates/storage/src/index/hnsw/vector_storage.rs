@@ -298,10 +298,7 @@ struct ContiguousVectorLane<'a> {
 /// foreground query appears.
 const HNSW_PREPARATION_BLOCK_BYTES: usize = 16 * 1024 * 1024;
 
-fn construction_vector_block_count(
-    storage: &dyn VectorStorage,
-    granted_parallelism: usize,
-) -> Result<usize> {
+fn construction_vector_block_count(storage: &dyn VectorStorage) -> Result<usize> {
     let row_bytes = storage
         .vector_dim()
         .checked_mul(std::mem::size_of::<f32>())
@@ -316,9 +313,7 @@ fn construction_vector_block_count(
         })?;
     let byte_blocks =
         total_bytes.saturating_add(HNSW_PREPARATION_BLOCK_BYTES - 1) / HNSW_PREPARATION_BLOCK_BYTES;
-    Ok(byte_blocks
-        .max(granted_parallelism.max(1))
-        .min(storage.num_vectors().max(1)))
+    Ok(byte_blocks.max(1).min(storage.num_vectors().max(1)))
 }
 
 fn run_governed_preparation_jobs<J, R, F>(
@@ -350,9 +345,10 @@ where
                 pool.install(|| batch.into_par_iter().map(&run).collect::<Result<Vec<_>>>())?;
             output.append(&mut batch_output);
         }
-        if !pending.is_empty() {
-            super::hnsw_builder::hnsw_yield_maintenance_to_foreground(execution_policy);
-        }
+        // The next iteration re-reads foreground pressure and shrinks a
+        // maintenance batch to one deterministic block. Do not also park for
+        // the graph-wave backoff here: preparation is a sequential bandwidth
+        // workload, and applying both controls would double-throttle it.
     }
     Ok(output)
 }
@@ -552,7 +548,7 @@ impl ExactF32BuildVectorStorage {
         let parallel_lanes = if pool.is_some() && parallelism > 1 {
             construction_vector_lanes(
                 base.as_ref(),
-                construction_vector_block_count(base.as_ref(), parallelism)?,
+                construction_vector_block_count(base.as_ref())?,
             )?
         } else {
             None
@@ -873,7 +869,7 @@ impl SymmetricI16BuildVectorStorage {
         let parallel_lanes = if pool.is_some() && parallelism > 1 {
             construction_vector_lanes(
                 base.as_ref(),
-                construction_vector_block_count(base.as_ref(), parallelism)?,
+                construction_vector_block_count(base.as_ref())?,
             )?
         } else {
             None

@@ -99,8 +99,8 @@ impl TableHandle {
     pub fn adopt_staged_search_generation_readers(
         &self,
         staged: &crate::search::StagedSearchGeneration,
-    ) -> Result<usize> {
-        self.search_registry.adopt_staged_generation_readers(staged)
+    ) {
+        self.search_registry.adopt_staged_generation_readers(staged);
     }
 
     pub fn stage_search_definition_generation(

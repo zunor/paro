@@ -27,8 +27,8 @@ use crate::search::request::analyze_fulltext_query_stats;
 use crate::search::row_fetch::snapshot_epoch;
 use crate::search::segment_dispatch::{dispatch_segments, SegmentDispatchResult};
 use crate::search::sidecar::{
-    DecodedSidecarReaderRequest, SearchReaderRuntime, SidecarIntegrityPolicy, SidecarReaderRequest,
-    SIDECAR_PACKAGE_CODEC,
+    DecodedReaderBinding, DecodedSidecarReaderRequest, SearchReaderRuntime, SidecarIntegrityPolicy,
+    SidecarReaderRequest, SIDECAR_PACKAGE_CODEC,
 };
 use crate::search::tail::exact_merge::{ensure_tail_exact_merge_budget, TailExactMergeQueryShape};
 use crate::search::tail_merge::{resolve_logical_rows, visible_row_ids};
@@ -376,6 +376,7 @@ fn open_sidecar_fulltext_index(
             codec: SIDECAR_PACKAGE_CODEC,
             integrity: SidecarIntegrityPolicy::EnvelopeChecksum,
         },
+        binding: DecodedReaderBinding::SelfContained,
     };
     runtime.get_or_try_open_decoded(request, |cached| {
         FullTextIndex::deserialize(cached.bytes()).map(Some)

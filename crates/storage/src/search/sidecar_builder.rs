@@ -41,6 +41,19 @@ use crate::statistics::HnswIndexStatistics;
 
 const SIDECAR_BUILD_BATCH_ROWS: usize = 8192;
 
+/// Readback required before newly-written provider bytes may become durable
+/// query state. HNSW authenticates its complete checksum hierarchy; the other
+/// providers rely on their sidecar envelope and incur no second payload read.
+pub(crate) const fn publication_authentication_read_bytes(
+    kind: SearchIndexKind,
+    written_bytes: u64,
+) -> u64 {
+    match kind {
+        SearchIndexKind::Hnsw => written_bytes,
+        SearchIndexKind::FullText | SearchIndexKind::Sparse => 0,
+    }
+}
+
 #[derive(Debug, Clone)]
 pub(crate) struct ProviderSidecarArtifactBuilder {
     store: SidecarArtifactStore,
@@ -149,8 +162,7 @@ impl SidecarArtifactBuilder for ProviderSidecarArtifactBuilder {
         };
         let source_read_bytes: u64 = input.tail_window.iter().map(|entry| entry.byte_count).sum();
         let publication_authentication_bytes =
-            u64::from(input.definition.kind == SearchIndexKind::Hnsw)
-                .saturating_mul(io_write_bytes);
+            publication_authentication_read_bytes(input.definition.kind, io_write_bytes);
         Ok(CostEstimate {
             cost: MaintenanceCost {
                 cpu_ns: rows.saturating_mul(cpu_per_row),
@@ -1033,6 +1045,22 @@ mod tests {
     use std::io::Cursor;
     use std::sync::Arc;
     use tempfile::TempDir;
+
+    #[test]
+    fn publication_authentication_readback_is_provider_specific() {
+        assert_eq!(
+            publication_authentication_read_bytes(SearchIndexKind::Hnsw, 4096),
+            4096
+        );
+        assert_eq!(
+            publication_authentication_read_bytes(SearchIndexKind::Sparse, 4096),
+            0
+        );
+        assert_eq!(
+            publication_authentication_read_bytes(SearchIndexKind::FullText, 4096),
+            0
+        );
+    }
 
     #[test]
     fn sidecar_filter_block_scan_covers_the_complete_scalar_column() {
