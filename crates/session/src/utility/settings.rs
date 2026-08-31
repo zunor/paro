@@ -158,10 +158,20 @@ const SETTING_DESCRIPTORS: &[SettingDescriptor] = &[
         apply_effective: apply_noop,
     },
     SettingDescriptor {
+        name: "disabled_optimizer_rules",
+        category: "Developer Options",
+        description: "Comma-separated optimizer transformation names to isolate",
+        vartype: "string",
+        context: "user",
+        unit: None,
+        default_value: |_| Value::Varchar(String::new()),
+        parse_value: parse_string_value,
+        apply_effective: apply_noop,
+    },
+    SettingDescriptor {
         name: "rowset_scan_pushdown",
         category: "Query Tuning",
-        description:
-            "Enable rowset predicate pushdown, late materialization, and scan-order lowering",
+        description: "Enable rowset predicate pushdown and late materialization",
         vartype: "bool",
         context: "user",
         unit: None,

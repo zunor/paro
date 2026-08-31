@@ -150,6 +150,22 @@ impl OptimizationContext {
             invalidations: OptimizerInvalidations::default(),
         }
     }
+
+    /// Create an isolated estimation/search view for one logical candidate.
+    ///
+    /// Candidate generation must not communicate through `column_stats`: the
+    /// set is keyed by plan-local bindings and adding an unrelated alternative
+    /// must never change another alternative's join order or access path.
+    pub(crate) fn fork_for_candidate(
+        &self,
+        column_stats: HashMap<ColumnBinding, Arc<ColumnStatistics>>,
+    ) -> Self {
+        let mut candidate = Self::new(self.session.clone(), self.bind_context.clone());
+        candidate.column_stats = column_stats;
+        candidate.cost_model = self.cost_model.clone();
+        candidate.verify_enabled = self.verify_enabled;
+        candidate
+    }
 }
 
 fn should_verify(ctx: &StatementContext) -> bool {

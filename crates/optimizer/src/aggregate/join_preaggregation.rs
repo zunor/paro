@@ -29,24 +29,29 @@ pub fn optimize_plan(
     plan: LogicalPlan,
     bind_context: &BindContext,
     column_stats: &HashMap<ColumnBinding, Arc<ColumnStatistics>>,
-) -> LogicalPlan {
+) -> (LogicalPlan, bool) {
     fn rewrite(
         plan: LogicalPlan,
         bind_context: &BindContext,
         column_stats: &HashMap<ColumnBinding, Arc<ColumnStatistics>>,
-    ) -> LogicalPlan {
-        let mut plan = plan.map_children(|child| rewrite(child, bind_context, column_stats));
+    ) -> (LogicalPlan, bool) {
+        let mut child_changed = false;
+        let mut plan = plan.map_children(|child| {
+            let (child, changed) = rewrite(child, bind_context, column_stats);
+            child_changed |= changed;
+            child
+        });
         let LogicalOperator::Aggregate(aggregate) = &mut plan.operator else {
-            return plan;
+            return (plan, child_changed);
         };
         let Some(right_key) = JoinPreaggregation::candidate_right_key(aggregate) else {
-            return plan;
+            return (plan, child_changed);
         };
         if !JoinPreaggregation::estimated_to_reduce(aggregate, right_key, column_stats) {
-            return plan;
+            return (plan, child_changed);
         }
-        JoinPreaggregation::rewrite(aggregate, bind_context);
-        plan
+        let changed = JoinPreaggregation::rewrite(aggregate, bind_context);
+        (plan, child_changed || changed)
     }
 
     rewrite(plan, bind_context, column_stats)

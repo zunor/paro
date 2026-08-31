@@ -10,6 +10,7 @@ mod execution_resources;
 mod memory_governance;
 mod query_resources;
 mod runtime_limits;
+mod session_diagnostics;
 mod session_metadata;
 mod session_random;
 mod statement_cancellation;
@@ -50,6 +51,7 @@ pub use query_resources::{
     QueryResourceGovernance, QueryResources,
 };
 pub use runtime_limits::RuntimeLimits;
+pub use session_diagnostics::{OptimizerDiagnostic, SessionDiagnostics};
 pub use session_metadata::{
     CursorSummary, PreparedStatementSummary, SessionMetadataProvider, SessionMetadataRows,
     SettingRow,

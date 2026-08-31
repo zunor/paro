@@ -76,6 +76,8 @@ pub struct Session {
     auth_policy: SessionAuthPolicy,
     /// Shared session-scoped metadata mirror for pg_settings / pg_prepared_statements / pg_cursors.
     pub session_metadata: Arc<SharedSessionMetadataState>,
+    /// Diagnostics visible only to this client session.
+    pub diagnostics: Arc<paro_context::SessionDiagnostics>,
     /// Data for the currently running transaction
     pub transaction: SessionTransaction,
     /// Highest durable-only async commit from this connection that later reads must observe.
@@ -523,6 +525,7 @@ impl Session {
             }),
             graph_registry: self.instance.graph_manager().clone(),
             session_metadata: self.session_metadata.clone(),
+            diagnostics: self.diagnostics.clone(),
         })
     }
 
@@ -584,6 +587,7 @@ impl Session {
             state: SessionState::new(&default_db_name, &user_name),
             auth_policy: SessionAuthPolicy::from_env(),
             session_metadata: Arc::new(SharedSessionMetadataState::default()),
+            diagnostics: Arc::new(paro_context::SessionDiagnostics::default()),
             transaction: SessionTransaction::new(),
             async_commit_floor: AtomicU64::new(0),
             #[cfg(test)]

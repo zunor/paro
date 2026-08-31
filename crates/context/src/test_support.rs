@@ -248,6 +248,7 @@ impl TestStatementContextBuilder {
             }),
             graph_registry: graph_manager,
             session_metadata: Arc::new(StaticSessionMetadata::default()),
+            diagnostics: Arc::new(crate::SessionDiagnostics::default()),
         })
     }
 }

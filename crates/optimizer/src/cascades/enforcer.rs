@@ -352,13 +352,8 @@ impl EnforcementPlanner {
         }
     }
 
-    fn verify_executable(&self, steps: &[EnforcerStep]) -> Result<()> {
-        if steps.iter().all(|step| self.executable.supports(step)) {
-            return Ok(());
-        }
-        Err(paro_error::internal(
-            "property goal requires an enforcer absent from the execution ABI",
-        ))
+    fn executable(&self, steps: &[EnforcerStep]) -> bool {
+        steps.iter().all(|step| self.executable.supports(step))
     }
 
     pub fn register(&mut self, template: EnforcerRecipeTemplate) -> Result<()> {
@@ -377,15 +372,13 @@ impl EnforcementPlanner {
         &self,
         provided: ProvidedProperties,
         required: &RequiredProperties,
-    ) -> Result<EnforcedPlan> {
+    ) -> Result<Option<EnforcedPlan>> {
         required.validate()?;
         if !provided
             .result_guarantee
             .satisfies(required.result_guarantee)
         {
-            return Err(paro_error::internal(
-                "result guarantee has no legal enforcement conversion",
-            ));
+            return Ok(None);
         }
         let mut state = provided;
         let mut steps = Vec::new();
@@ -456,11 +449,13 @@ impl EnforcementPlanner {
                 "canonical enforcer baseline failed to satisfy the goal",
             ));
         }
-        self.verify_executable(&steps)?;
-        Ok(EnforcedPlan {
+        if !self.executable(&steps) {
+            return Ok(None);
+        }
+        Ok(Some(EnforcedPlan {
             steps: steps.into_boxed_slice(),
             provided: state,
-        })
+        }))
     }
 
     pub fn instantiate_optional(
@@ -481,7 +476,9 @@ impl EnforcementPlanner {
                 "enforcer recipe exceeds its registered static bound",
             ));
         }
-        self.verify_executable(&recipe.steps)?;
+        if !self.executable(&recipe.steps) {
+            return Ok(None);
+        }
         let fingerprint = recipe.fingerprint();
         if self.seen_recipes.contains(&fingerprint) {
             return Ok(None);
@@ -588,6 +585,7 @@ mod tests {
         let planner = EnforcementPlanner::with_all_for_test(8, 8);
         let plan = planner
             .canonical_baseline(provided(), &required_global_order())
+            .unwrap()
             .unwrap();
         assert!(plan.provided.satisfies(&required_global_order()));
         assert_eq!(plan.steps.len(), 2);

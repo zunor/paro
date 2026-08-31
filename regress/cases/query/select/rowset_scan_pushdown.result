@@ -140,13 +140,13 @@ PROJECTION  (rows=1)
     Aggregates: count_star(*)
     Cardinality: [1, 1, 1]
     Output Schema: aggregate_state_1 BIGINT
-    ->  HASH_JOIN  (rows=13)
+    ->  HASH_JOIN  (rows=14)
       Join Type: INNER
-      Runtime Filter: wait_complete artifact=d197f1f371553df1c1399483e63efda6
+      Runtime Filter: wait_complete artifact=2062f20226bfea58d9f8126216afaed5
       Build Index: integer_build_time
       Join Condition: c.k = d.k
-      Cardinality: [13, 13, 13]
-      Output Schema: c.k INTEGER, d.k INTEGER
+      Cardinality: [3, 14, 29]
+      Output Schema: (none)
       ->  ROWSET_SCAN on public.rowset_pushdown_case c  (rows=45)
         Columns: k
         Pushed Predicate: k >= 2 AND k <= 8
@@ -266,20 +266,25 @@ PROJECTION  (rows=3)
   Output: phone, wide
   Cardinality: [3, 3, 3]
   Output Schema: phone VARCHAR, wide VARCHAR
-  ->  TOP_N  (rows=3)
-    Sort Key: public.matched_prefix_late_payload_case.id ASC NULLS LAST
-    Limit: 3
+  ->  ROW_FETCH  (rows=3)
+    Output: phone, wide
+    Sources: 1
     Cardinality: [3, 3, 3]
-    Output Schema: phone VARCHAR, wide VARCHAR, public.matched_prefix_late_payload_case.id INTEGER
-    ->  PROJECTION  (rows=3333)
-      Output: phone, wide, id
-      Cardinality: [1666, 3333, 5000]
-      Output Schema: phone VARCHAR, wide VARCHAR, public.matched_prefix_late_payload_case.id INTEGER
-      ->  ROWSET_SCAN on public.matched_prefix_late_payload_case  (rows=3333)
-        Columns: id, phone, wide
-        Pushed Predicate: phone IN ('13x', '31y')
+    Output Schema: phone VARCHAR, wide VARCHAR
+    ->  TOP_N  (rows=3)
+      Sort Key: public.matched_prefix_late_payload_case.id ASC NULLS LAST
+      Limit: 3
+      Cardinality: [3, 3, 3]
+      Output Schema: public.matched_prefix_late_payload_case.id INTEGER, rowid BIGINT
+      ->  PROJECTION  (rows=3333)
+        Output: id, rowid
         Cardinality: [1666, 3333, 5000]
-        Output Schema: public.matched_prefix_late_payload_case.id INTEGER, public.matched_prefix_late_payload_case.phone VARCHAR, public.matched_prefix_late_payload_case.wide VARCHAR
+        Output Schema: public.matched_prefix_late_payload_case.id INTEGER, rowid BIGINT
+        ->  ROWSET_SCAN on public.matched_prefix_late_payload_case  (rows=3333)
+          Columns: id, rowid
+          Pushed Predicate: phone IN ('13x', '31y')
+          Cardinality: [1666, 3333, 5000]
+          Output Schema: public.matched_prefix_late_payload_case.id INTEGER, rowid BIGINT
 
 SELECT phone, wide
 FROM matched_prefix_late_payload_case

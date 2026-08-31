@@ -18,6 +18,63 @@ use super::memo::{
 use super::properties::ProvidedProperties;
 use super::region::RegionCandidateContract;
 
+pub const EXPENSIVE_PREDICATE_PLACEMENT_RULE: RuleId = RuleId(10_006);
+pub const CTE_INLINE_RULE: RuleId = RuleId(10_007);
+pub const CTE_FILTER_PUSHDOWN_RULE: RuleId = RuleId(10_008);
+pub const AGGREGATE_POST_REDUCTION_RULE: RuleId = RuleId(10_009);
+pub const JOIN_ELIMINATION_RULE: RuleId = RuleId(10_011);
+pub const AGGREGATE_JOIN_PREAGGREGATION_RULE: RuleId = RuleId(10_012);
+pub const AGGREGATE_JOIN_SUBSUMPTION_RULE: RuleId = RuleId(10_013);
+pub const AGGREGATE_NON_NULL_INPUT_RULE: RuleId = RuleId(10_014);
+pub const AGGREGATE_DIMENSION_DEFERRAL_RULE: RuleId = RuleId(10_015);
+pub const AGGREGATE_INPUT_MATERIALIZATION_RULE: RuleId = RuleId(10_016);
+pub const LIMIT_PUSHDOWN_RULE: RuleId = RuleId(10_017);
+pub const LATE_PAYLOAD_FETCH_RULE: RuleId = RuleId(10_018);
+pub const SCALAR_AGGREGATE_WINDOW_RULE: RuleId = RuleId(10_019);
+
+const TRANSFORMATION_RULE_NAMES: &[(RuleId, &str)] = &[
+    (
+        EXPENSIVE_PREDICATE_PLACEMENT_RULE,
+        "expensive_predicate_placement",
+    ),
+    (CTE_INLINE_RULE, "cte_inline"),
+    (CTE_FILTER_PUSHDOWN_RULE, "cte_filter_pushdown"),
+    (AGGREGATE_POST_REDUCTION_RULE, "aggregate_post_reduction"),
+    (JOIN_ELIMINATION_RULE, "join_elimination"),
+    (
+        AGGREGATE_JOIN_PREAGGREGATION_RULE,
+        "aggregate_join_preaggregation",
+    ),
+    (
+        AGGREGATE_JOIN_SUBSUMPTION_RULE,
+        "aggregate_join_subsumption",
+    ),
+    (AGGREGATE_NON_NULL_INPUT_RULE, "aggregate_non_null_input"),
+    (
+        AGGREGATE_DIMENSION_DEFERRAL_RULE,
+        "aggregate_dimension_deferral",
+    ),
+    (
+        AGGREGATE_INPUT_MATERIALIZATION_RULE,
+        "aggregate_input_materialization",
+    ),
+    (LIMIT_PUSHDOWN_RULE, "limit_pushdown"),
+    (LATE_PAYLOAD_FETCH_RULE, "late_payload_fetch"),
+    (SCALAR_AGGREGATE_WINDOW_RULE, "scalar_aggregate_window"),
+];
+
+pub fn transformation_rule_name(id: RuleId) -> Option<&'static str> {
+    TRANSFORMATION_RULE_NAMES
+        .iter()
+        .find_map(|(candidate, name)| (*candidate == id).then_some(*name))
+}
+
+pub fn transformation_rule_id(name: &str) -> Option<RuleId> {
+    TRANSFORMATION_RULE_NAMES
+        .iter()
+        .find_map(|(id, candidate)| candidate.eq_ignore_ascii_case(name.trim()).then_some(*id))
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub struct RulePromise {
     pub priority: u16,
@@ -232,5 +289,23 @@ impl ImplementationRegistry {
         self.implementations
             .iter()
             .map(|(id, implementation)| (*id, implementation.as_ref()))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn transformation_rule_names_are_stable_and_bijective() {
+        for &(id, name) in TRANSFORMATION_RULE_NAMES {
+            assert_eq!(transformation_rule_name(id), Some(name));
+            assert_eq!(transformation_rule_id(name), Some(id));
+        }
+        assert_eq!(
+            transformation_rule_id("JOIN_ELIMINATION"),
+            Some(JOIN_ELIMINATION_RULE)
+        );
+        assert!(transformation_rule_id("unknown").is_none());
     }
 }

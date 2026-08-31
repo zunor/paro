@@ -20,11 +20,13 @@ use paro_planner::operator::{
 };
 use paro_planner::plan::LogicalPlan;
 
-pub struct JoinElimination;
+pub struct JoinElimination {
+    changed: bool,
+}
 
 impl JoinElimination {
     pub fn new() -> Self {
-        Self
+        Self { changed: false }
     }
 
     pub fn optimize(&mut self, plan: LogicalPlan) -> LogicalPlan {
@@ -35,6 +37,12 @@ impl JoinElimination {
     pub fn optimize_plan(&mut self, plan: LogicalPlan) -> LogicalPlan {
         let required_bindings = output_bindings(&plan.operator);
         self.optimize_required_plan(plan, &required_bindings)
+    }
+
+    pub fn optimize_plan_with_change(&mut self, plan: LogicalPlan) -> (LogicalPlan, bool) {
+        self.changed = false;
+        let plan = self.optimize_plan(plan);
+        (plan, self.changed)
     }
 
     fn optimize_required_plan(
@@ -274,10 +282,12 @@ impl JoinElimination {
 
                 if self.can_eliminate_right_side(&comparison, required_bindings) {
                     let left = *comparison.left;
+                    self.changed = true;
                     return left.operator;
                 }
                 if self.can_eliminate_left_side(&comparison, required_bindings) {
                     let right = *comparison.right;
+                    self.changed = true;
                     return right.operator;
                 }
 

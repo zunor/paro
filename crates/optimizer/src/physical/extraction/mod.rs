@@ -384,19 +384,17 @@ impl PhysicalPlanExtractor {
                     "runtime-filter hash join must have probe and build children",
                 ));
             };
-            if !matches!(
-                self.arena.get(*probe).map(|node| &node.kind),
-                Some(PhysicalNodeKind::RowsetScan(_))
-            ) {
-                return Err(paro_error::internal(
-                    "runtime-filter candidate has no direct rowset-scan consumer",
-                ));
-            }
+            let consumer = runtime_filter_probe_scan(&self.arena, &self.children, *probe)
+                .ok_or_else(|| {
+                    paro_error::internal(
+                        "runtime-filter candidate has no row-preserving rowset-scan consumer",
+                    )
+                })?;
             spec.runtime_filter = Some(HashJoinRuntimeFilterSpec {
                 artifact,
                 wait_policy: RuntimeFilterWaitPolicy::WaitComplete,
             });
-            Some((*build, *probe, artifact))
+            Some((*build, consumer, artifact))
         } else {
             None
         };
@@ -613,6 +611,26 @@ impl PhysicalPlanExtractor {
             },
         );
         id
+    }
+}
+
+fn runtime_filter_probe_scan(
+    arena: &PhysicalPlanNodeArena,
+    children: &PlanChildrenArena,
+    mut node: PhysicalPlanNodeId,
+) -> Option<PhysicalPlanNodeId> {
+    loop {
+        let current = arena.get(node)?;
+        match &current.kind {
+            PhysicalNodeKind::RowsetScan(_) => return Some(node),
+            PhysicalNodeKind::Project(_) | PhysicalNodeKind::Filter(_) => {
+                let [child] = current.children.as_slice(children) else {
+                    return None;
+                };
+                node = *child;
+            }
+            _ => return None,
+        }
     }
 }
 

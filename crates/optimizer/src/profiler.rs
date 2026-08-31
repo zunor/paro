@@ -5,10 +5,10 @@
 //! phases, never user-toggleable ordered passes.
 
 use std::collections::BTreeMap;
-use std::sync::{LazyLock, RwLock};
 use std::time::Duration;
 
 use crate::cascades::RuleId;
+use paro_context::{OptimizerDiagnostic, SessionDiagnostics};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum OptimizerComponent {
@@ -60,7 +60,7 @@ pub struct OptimizerTimingEntry {
 #[derive(Debug, Default)]
 pub struct OptimizerProfiler {
     entries: BTreeMap<OptimizerComponent, OptimizerTimingEntry>,
-    rule_firings: BTreeMap<RuleId, u64>,
+    rule_insertions: BTreeMap<RuleId, u64>,
 }
 
 #[derive(Debug, Clone)]
@@ -73,11 +73,8 @@ pub struct OptimizerProfileSnapshotEntry {
 #[derive(Debug, Clone, Default)]
 pub struct OptimizerProfileSnapshot {
     pub entries: Vec<OptimizerProfileSnapshotEntry>,
-    pub rule_firings: BTreeMap<RuleId, u64>,
+    pub rule_insertions: BTreeMap<RuleId, u64>,
 }
-
-static LAST_PROFILE_SNAPSHOT: LazyLock<RwLock<OptimizerProfileSnapshot>> =
-    LazyLock::new(|| RwLock::new(OptimizerProfileSnapshot::default()));
 
 impl OptimizerProfiler {
     pub fn record(&mut self, component: impl Into<OptimizerComponent>, elapsed: Duration) {
@@ -100,21 +97,40 @@ impl OptimizerProfiler {
                     }
                 })
                 .collect(),
-            rule_firings: self.rule_firings.clone(),
+            rule_insertions: self.rule_insertions.clone(),
         }
     }
 
-    pub fn record_rule_firings(&mut self, firings: BTreeMap<RuleId, u64>) {
-        self.rule_firings = firings;
+    pub fn record_rule_insertions(&mut self, insertions: BTreeMap<RuleId, u64>) {
+        self.rule_insertions = insertions;
     }
 }
 
-pub fn publish_optimizer_profile_snapshot(snapshot: OptimizerProfileSnapshot) {
-    *LAST_PROFILE_SNAPSHOT.write().unwrap() = snapshot;
-}
-
-pub fn latest_optimizer_profile_snapshot() -> OptimizerProfileSnapshot {
-    LAST_PROFILE_SNAPSHOT.read().unwrap().clone()
+pub fn publish_optimizer_profile_snapshot(
+    diagnostics: &SessionDiagnostics,
+    snapshot: OptimizerProfileSnapshot,
+) {
+    let mut entries = snapshot
+        .entries
+        .into_iter()
+        .map(|entry| OptimizerDiagnostic {
+            name: entry.component.name().to_string(),
+            kind: entry.component.kind().to_string(),
+            last_elapsed_us: entry.last_elapsed.as_micros().min(i64::MAX as u128) as i64,
+            invocation_count: entry.invocation_count.min(i64::MAX as u64) as i64,
+        })
+        .collect::<Vec<_>>();
+    entries.extend(snapshot.rule_insertions.into_iter().map(|(rule, count)| {
+        OptimizerDiagnostic {
+            name: crate::cascades::rules::transformation_rule_name(rule)
+                .map(str::to_string)
+                .unwrap_or_else(|| format!("unknown_rule_{}", rule.0)),
+            kind: "transformation_rule".to_string(),
+            last_elapsed_us: 0,
+            invocation_count: count.min(i64::MAX as u64) as i64,
+        }
+    }));
+    diagnostics.publish_optimizer(entries);
 }
 
 #[cfg(test)]

@@ -4,6 +4,7 @@
 //! Long-term optimizer entry point: semantic normalization, bounded search,
 //! verified extraction. It has no pass-disable compatibility surface.
 
+use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Instant;
 
@@ -25,12 +26,20 @@ use paro_planner::binder::Binder;
 use paro_planner::operator::{Join, JoinType, LogicalOperator};
 use paro_planner::plan::LogicalPlan;
 use paro_planner::verify::verify_physical_planner_invariants;
+use paro_storage::statistics::ColumnStatistics;
 use tracing::debug;
 
 use crate::aggregate::common::CommonAggregateOptimizer;
 use crate::aggregate::{
     dimension_deferral, distinct_decomposition, input_materialization, join_preaggregation,
     join_subsumption, late_payload, non_null_inputs, post_reduction, singleton_groups,
+};
+use crate::cascades::rules::{
+    AGGREGATE_DIMENSION_DEFERRAL_RULE, AGGREGATE_INPUT_MATERIALIZATION_RULE,
+    AGGREGATE_JOIN_PREAGGREGATION_RULE, AGGREGATE_JOIN_SUBSUMPTION_RULE,
+    AGGREGATE_NON_NULL_INPUT_RULE, AGGREGATE_POST_REDUCTION_RULE, CTE_FILTER_PUSHDOWN_RULE,
+    CTE_INLINE_RULE, EXPENSIVE_PREDICATE_PLACEMENT_RULE, JOIN_ELIMINATION_RULE,
+    LATE_PAYLOAD_FETCH_RULE, LIMIT_PUSHDOWN_RULE, SCALAR_AGGREGATE_WINDOW_RULE,
 };
 use crate::cascades::{
     AlternativeOrigin, CompactRange, LocalOperatorWork, LogicalAlternative,
@@ -76,12 +85,23 @@ use crate::verify::verify_logical_plan;
 
 const CORRELATED_AGGREGATE_REGION_RULE: crate::cascades::RuleId = crate::cascades::RuleId(10_004);
 const SCALAR_REUSE_REGION_RULE: crate::cascades::RuleId = crate::cascades::RuleId(10_005);
-const EXPENSIVE_PREDICATE_PLACEMENT_RULE: crate::cascades::RuleId = crate::cascades::RuleId(10_006);
-const CTE_INLINE_REGION_RULE: crate::cascades::RuleId = crate::cascades::RuleId(10_007);
-const CTE_FILTER_REGION_RULE: crate::cascades::RuleId = crate::cascades::RuleId(10_008);
-const RELATIONAL_EQUIVALENCE_RULE: crate::cascades::RuleId = crate::cascades::RuleId(10_009);
 const DISTINCT_AGGREGATE_FEASIBILITY_RULE: crate::cascades::RuleId =
     crate::cascades::RuleId(10_010);
+
+struct CandidatePlan {
+    plan: LogicalPlan,
+    column_stats: Arc<HashMap<paro_planner::operator::ColumnBinding, Arc<ColumnStatistics>>>,
+}
+
+impl CandidatePlan {
+    fn into_alternative(self, source: AlternativeOrigin) -> LogicalAlternative {
+        LogicalAlternative {
+            plan: self.plan,
+            source,
+            column_stats: self.column_stats,
+        }
+    }
+}
 
 pub struct Optimizer {
     binder: Binder,
@@ -134,7 +154,7 @@ impl Optimizer {
     ) -> Result<LogicalPlan> {
         let prepared = self.prepare_correlated_seed(plan);
         let canonical = self.canonicalize_query(prepared)?;
-        self.correlated_aggregate_candidate(canonical)
+        Ok(self.correlated_aggregate_candidate(canonical)?.plan)
     }
 
     #[cfg(test)]
@@ -145,10 +165,13 @@ impl Optimizer {
         let prepared = self.prepare_correlated_seed(plan);
         let canonical = self.canonicalize_query(prepared)?;
         let baseline = self.settle_query_candidate(canonical)?;
-        self.scalar_reuse_candidate(baseline)
+        Ok(self.scalar_reuse_candidate(baseline)?.plan)
     }
 
     pub fn optimize(&mut self, plan: LogicalPlan) -> Result<OptimizedStatement> {
+        self.budget.disable_transformations_by_name(
+            self.ctx.session.settings.disabled_optimizer_rules(),
+        )?;
         let started_at = Instant::now();
         let statement = StatementPlan::split(plan, self.ctx.session.transaction_visible_version())?;
         let grant_classes = resource_grant_classes(
@@ -161,7 +184,10 @@ impl Optimizer {
             StatementBody::Utility(utility) => {
                 let result =
                     OptimizedStatement::Physical(self.extract_utility(*utility, &grant_classes)?);
-                publish_optimizer_profile_snapshot(self.ctx.profiler.snapshot());
+                publish_optimizer_profile_snapshot(
+                    self.ctx.session.diagnostics.as_ref(),
+                    self.ctx.profiler.snapshot(),
+                );
                 debug!(
                     target: targets::OPTIMIZER,
                     elapsed_ms = started_at.elapsed().as_millis(),
@@ -187,94 +213,268 @@ impl Optimizer {
             });
             let canonical = self.canonicalize_query(graph_plan)?;
             let cte_region = contains_cte_region(&canonical);
+            // Semantic rewrites whose proofs inspect unpruned join outputs
+            // receive an estimated pre-projection seed. ABI annotations are
+            // terminal and must not become rewrite preconditions.
+            let semantic_seed =
+                self.estimate_query_candidate(duplicate_plan_preserving_indices(
+                    &canonical,
+                    self.binder.bind_context.shared().as_ref(),
+                ))?;
+            let settled_seed = self.settle_schema_candidate(duplicate_plan_preserving_indices(
+                &canonical,
+                self.binder.bind_context.shared().as_ref(),
+            ))?;
             let baseline = self.settle_query_candidate(duplicate_plan_preserving_indices(
                 &canonical,
                 self.binder.bind_context.shared().as_ref(),
             ))?;
-            let relational_candidate =
-                self.relational_equivalence_candidate(duplicate_plan_preserving_indices(
-                    &baseline,
-                    self.binder.bind_context.shared().as_ref(),
-                ));
             let distinct_feasibility_candidate =
                 self.distinct_aggregate_feasibility_candidate(duplicate_plan_preserving_indices(
-                    &baseline,
+                    &canonical,
                     self.binder.bind_context.shared().as_ref(),
                 ))?;
-            let predicate_candidate = if contains_reorderable_filter_segment(&baseline) {
-                match ReorderFilter::new().rewrite(
-                    duplicate_plan_preserving_indices(
-                        &baseline,
-                        self.binder.bind_context.shared().as_ref(),
-                    ),
-                    &self.ctx,
-                ) {
-                    Ok(candidate) => Some(candidate),
-                    Err(error) => {
-                        debug!(
-                            target: targets::OPTIMIZER,
-                            %error,
-                            "expensive-predicate rule rejected an invalid optional candidate"
-                        );
-                        None
-                    }
-                }
+            alternatives.push(baseline.into_alternative(if index == 0 {
+                AlternativeOrigin::Baseline
             } else {
-                None
-            };
-            alternatives.push(LogicalAlternative {
-                plan: baseline,
-                source: if index == 0 {
-                    AlternativeOrigin::Baseline
-                } else {
-                    AlternativeOrigin::Specialized {
-                        rule: GRAPH_REGION_ENUMERATOR_RULE,
+                AlternativeOrigin::Specialized {
+                    rule: GRAPH_REGION_ENUMERATOR_RULE,
+                }
+            }));
+
+            macro_rules! optional_candidate {
+                ($rule:expr, $candidate:expr, $message:literal) => {
+                    if self.budget.transformation_enabled($rule)
+                        && self.budget.max_rule_firings_per_group > 0
+                        && alternatives.len()
+                            < self.budget.max_optional_logical_exprs_per_group as usize + 1
+                    {
+                        match $candidate {
+                            Ok(candidate) => alternatives.push(candidate.into_alternative(
+                                AlternativeOrigin::Transformation { rule: $rule },
+                            )),
+                            Err(error) => debug!(
+                                target: targets::OPTIMIZER,
+                                %error,
+                                rule = ?$rule,
+                                $message
+                            ),
+                        }
                     }
-                },
-            });
+                };
+            }
+            macro_rules! optional_changed_candidate {
+                ($rule:expr, $candidate:expr, $message:literal) => {
+                    if self.budget.transformation_enabled($rule)
+                        && self.budget.max_rule_firings_per_group > 0
+                        && alternatives.len()
+                            < self.budget.max_optional_logical_exprs_per_group as usize + 1
+                    {
+                        match $candidate {
+                            Ok((plan, true)) => match self.settle_query_candidate(plan) {
+                                Ok(candidate) => alternatives.push(candidate.into_alternative(
+                                    AlternativeOrigin::Transformation { rule: $rule },
+                                )),
+                                Err(error) => debug!(
+                                    target: targets::OPTIMIZER,
+                                    %error,
+                                    rule = ?$rule,
+                                    $message
+                                ),
+                            },
+                            Ok((_plan, false)) => {}
+                            Err(error) => debug!(
+                                target: targets::OPTIMIZER,
+                                %error,
+                                rule = ?$rule,
+                                $message
+                            ),
+                        }
+                    }
+                };
+            }
+            macro_rules! optional_infallible_changed_candidate {
+                ($rule:expr, $candidate:expr, $message:literal) => {
+                    if self.budget.transformation_enabled($rule)
+                        && self.budget.max_rule_firings_per_group > 0
+                        && alternatives.len()
+                            < self.budget.max_optional_logical_exprs_per_group as usize + 1
+                    {
+                        let (plan, changed) = $candidate;
+                        if changed {
+                            match self.settle_query_candidate(plan) {
+                                Ok(candidate) => alternatives.push(candidate.into_alternative(
+                                    AlternativeOrigin::Transformation { rule: $rule },
+                                )),
+                                Err(error) => debug!(
+                                    target: targets::OPTIMIZER,
+                                    %error,
+                                    rule = ?$rule,
+                                    $message
+                                ),
+                            }
+                        }
+                    }
+                };
+            }
+
             if let Some(plan) = distinct_feasibility_candidate {
-                alternatives.push(LogicalAlternative {
-                    plan,
+                alternatives.push(plan.into_alternative(
                     // DISTINCT modifier state is not spillable.  This
                     // equivalent is a mandatory resource-feasibility path,
                     // not optional transformation work: exhausting or
                     // disabling optional rules must not make a valid query
                     // uncompilable under a finite grant.
-                    source: AlternativeOrigin::Specialized {
+                    AlternativeOrigin::Specialized {
                         rule: DISTINCT_AGGREGATE_FEASIBILITY_RULE,
                     },
-                });
+                ));
             }
-            if let Some(plan) = predicate_candidate {
-                if alternatives.len()
-                    < self.budget.max_optional_logical_exprs_per_group as usize + 1
-                {
-                    alternatives.push(LogicalAlternative {
-                        plan,
-                        source: AlternativeOrigin::Transformation {
-                            rule: EXPENSIVE_PREDICATE_PLACEMENT_RULE,
-                        },
-                    });
-                }
+
+            if contains_reorderable_filter_segment(&settled_seed.plan) {
+                let predicate_context = self
+                    .ctx
+                    .fork_for_candidate(Arc::unwrap_or_clone(settled_seed.column_stats.clone()));
+                optional_candidate!(
+                    EXPENSIVE_PREDICATE_PLACEMENT_RULE,
+                    ReorderFilter::new()
+                        .rewrite(
+                            duplicate_plan_preserving_indices(
+                                &settled_seed.plan,
+                                self.binder.bind_context.shared().as_ref(),
+                            ),
+                            &predicate_context,
+                        )
+                        .and_then(|plan| self.settle_query_candidate(plan)),
+                    "expensive-predicate rule rejected an invalid optional candidate"
+                );
             }
-            if alternatives.len() < self.budget.max_optional_logical_exprs_per_group as usize + 1 {
-                match relational_candidate {
-                    Ok(plan) => alternatives.push(LogicalAlternative {
-                        plan,
-                        source: AlternativeOrigin::Transformation {
-                            rule: RELATIONAL_EQUIVALENCE_RULE,
-                        },
-                    }),
-                    Err(error) => debug!(
-                        target: targets::OPTIMIZER,
-                        %error,
-                        "relational equivalence candidate failed validation"
+
+            optional_candidate!(
+                AGGREGATE_POST_REDUCTION_RULE,
+                self.settle_query_candidate(post_reduction::optimize_plan(
+                    duplicate_plan_preserving_indices(
+                        &semantic_seed.plan,
+                        self.binder.bind_context.shared().as_ref(),
                     ),
-                }
+                    &self.ctx.bind_context,
+                )),
+                "aggregate post-reduction rule rejected an invalid optional candidate"
+            );
+            optional_infallible_changed_candidate!(
+                JOIN_ELIMINATION_RULE,
+                JoinElimination::new().optimize_plan_with_change(
+                    duplicate_plan_preserving_indices(
+                        &semantic_seed.plan,
+                        self.binder.bind_context.shared().as_ref(),
+                    ),
+                ),
+                "join-elimination rule rejected an invalid optional candidate"
+            );
+            optional_infallible_changed_candidate!(
+                AGGREGATE_JOIN_PREAGGREGATION_RULE,
+                join_preaggregation::optimize_plan(
+                    duplicate_plan_preserving_indices(
+                        &semantic_seed.plan,
+                        self.binder.bind_context.shared().as_ref(),
+                    ),
+                    &self.ctx.bind_context,
+                    semantic_seed.column_stats.as_ref(),
+                ),
+                "aggregate join-preaggregation rule rejected an invalid optional candidate"
+            );
+            optional_candidate!(
+                AGGREGATE_JOIN_SUBSUMPTION_RULE,
+                self.settle_query_candidate(join_subsumption::optimize_plan(
+                    duplicate_plan_preserving_indices(
+                        &semantic_seed.plan,
+                        self.binder.bind_context.shared().as_ref(),
+                    ),
+                )),
+                "aggregate join-subsumption rule rejected an invalid optional candidate"
+            );
+            optional_candidate!(
+                AGGREGATE_NON_NULL_INPUT_RULE,
+                self.settle_query_candidate(non_null_inputs::optimize_plan(
+                    duplicate_plan_preserving_indices(
+                        &semantic_seed.plan,
+                        self.binder.bind_context.shared().as_ref(),
+                    ),
+                    semantic_seed.column_stats.as_ref(),
+                )),
+                "aggregate non-null-input rule rejected an invalid optional candidate"
+            );
+
+            optional_changed_candidate!(
+                AGGREGATE_DIMENSION_DEFERRAL_RULE,
+                dimension_deferral::optimize_plan(
+                    duplicate_plan_preserving_indices(
+                        &settled_seed.plan,
+                        self.binder.bind_context.shared().as_ref(),
+                    ),
+                    &self.ctx.bind_context,
+                    &self.ctx.cost_model,
+                ),
+                "aggregate dimension-deferral rule rejected an invalid optional candidate"
+            );
+            optional_changed_candidate!(
+                AGGREGATE_INPUT_MATERIALIZATION_RULE,
+                input_materialization::optimize_plan(
+                    duplicate_plan_preserving_indices(
+                        &settled_seed.plan,
+                        self.binder.bind_context.shared().as_ref(),
+                    ),
+                    &self.ctx.bind_context,
+                ),
+                "aggregate input-materialization rule rejected an invalid optional candidate"
+            );
+            optional_candidate!(
+                LIMIT_PUSHDOWN_RULE,
+                self.settle_query_candidate(LimitPushdown::new().optimize_plan(
+                    duplicate_plan_preserving_indices(
+                        &semantic_seed.plan,
+                        self.binder.bind_context.shared().as_ref(),
+                    ),
+                )),
+                "limit-pushdown rule rejected an invalid optional candidate"
+            );
+
+            if self.ctx.session.settings.rowset_scan_pushdown() {
+                optional_changed_candidate!(
+                    LATE_PAYLOAD_FETCH_RULE,
+                    late_payload::optimize_matched_prefix_plan(duplicate_plan_preserving_indices(
+                        &settled_seed.plan,
+                        self.binder.bind_context.shared().as_ref(),
+                    ),)
+                    .and_then(|(plan, prefix_changed)| {
+                        late_payload::optimize_plan(
+                            plan,
+                            &self.ctx.bind_context,
+                            &self.ctx.cost_model,
+                        )
+                        .map(|(plan, payload_changed)| (plan, prefix_changed || payload_changed))
+                    }),
+                    "late-payload rule rejected an invalid optional candidate"
+                );
             }
+            optional_candidate!(
+                SCALAR_AGGREGATE_WINDOW_RULE,
+                scalar_aggregate_window::optimize_plan(
+                    duplicate_plan_preserving_indices(
+                        &settled_seed.plan,
+                        self.binder.bind_context.shared().as_ref(),
+                    ),
+                    &self.ctx.bind_context,
+                )
+                .and_then(|plan| self.settle_query_candidate(plan)),
+                "scalar-aggregate-window rule rejected an invalid optional candidate"
+            );
+
             if cte_region
                 && alternatives.len()
                     < self.budget.max_optional_logical_exprs_per_group as usize + 1
+                && self.budget.transformation_enabled(CTE_INLINE_RULE)
+                && self.budget.max_rule_firings_per_group > 0
             {
                 let inline_seed = CTEInlining::new(&self.ctx.bind_context).optimize_plan(
                     duplicate_plan_preserving_indices(
@@ -283,12 +483,11 @@ impl Optimizer {
                     ),
                 );
                 match self.settle_query_candidate(inline_seed) {
-                    Ok(plan) => alternatives.push(LogicalAlternative {
-                        plan,
-                        source: AlternativeOrigin::Transformation {
-                            rule: CTE_INLINE_REGION_RULE,
+                    Ok(plan) => alternatives.push(plan.into_alternative(
+                        AlternativeOrigin::Transformation {
+                            rule: CTE_INLINE_RULE,
                         },
-                    }),
+                    )),
                     Err(error) => debug!(
                         target: targets::OPTIMIZER,
                         %error,
@@ -299,6 +498,8 @@ impl Optimizer {
             if cte_region
                 && alternatives.len()
                     < self.budget.max_optional_logical_exprs_per_group as usize + 1
+                && self.budget.transformation_enabled(CTE_FILTER_PUSHDOWN_RULE)
+                && self.budget.max_rule_firings_per_group > 0
             {
                 let mut filtered = duplicate_plan_preserving_indices(
                     &canonical,
@@ -308,12 +509,11 @@ impl Optimizer {
                 filtered = FilterPushdown::new().rewrite_plan(filtered);
                 filtered = CTEFilterPusher::new().optimize_plan(filtered);
                 match self.settle_query_candidate(filtered) {
-                    Ok(plan) => alternatives.push(LogicalAlternative {
-                        plan,
-                        source: AlternativeOrigin::Transformation {
-                            rule: CTE_FILTER_REGION_RULE,
+                    Ok(plan) => alternatives.push(plan.into_alternative(
+                        AlternativeOrigin::Transformation {
+                            rule: CTE_FILTER_PUSHDOWN_RULE,
                         },
-                    }),
+                    )),
                     Err(error) => debug!(
                         target: targets::OPTIMIZER,
                         %error,
@@ -342,12 +542,11 @@ impl Optimizer {
                 &correlated_canonical,
                 self.binder.bind_context.shared().as_ref(),
             )) {
-                Ok(plan) => alternatives.push(LogicalAlternative {
-                    plan,
-                    source: AlternativeOrigin::Specialized {
+                Ok(plan) => {
+                    alternatives.push(plan.into_alternative(AlternativeOrigin::Specialized {
                         rule: CORRELATED_AGGREGATE_REGION_RULE,
-                    },
-                }),
+                    }))
+                }
                 Err(error) => debug!(
                     target: targets::OPTIMIZER,
                     %error,
@@ -364,12 +563,11 @@ impl Optimizer {
                 ))
                 .and_then(|plan| self.scalar_reuse_candidate(plan))
             {
-                Ok(plan) => alternatives.push(LogicalAlternative {
-                    plan,
-                    source: AlternativeOrigin::Specialized {
+                Ok(plan) => {
+                    alternatives.push(plan.into_alternative(AlternativeOrigin::Specialized {
                         rule: SCALAR_REUSE_REGION_RULE,
-                    },
-                }),
+                    }))
+                }
                 Err(error) => debug!(
                     target: targets::OPTIMIZER,
                     %error,
@@ -387,22 +585,33 @@ impl Optimizer {
             if !contains_join_region(&alternative.plan) {
                 continue;
             }
+            let mut candidate_context = self
+                .ctx
+                .fork_for_candidate(Arc::unwrap_or_clone(alternative.column_stats.clone()));
             let mut join_candidate = JoinOrderOptimizer::new()
                 .with_search_budget(&self.budget)
                 .optimize_plan(
-                    self.ctx.session.as_ref(),
+                    candidate_context.session.as_ref(),
                     duplicate_plan_preserving_indices(
                         &alternative.plan,
                         self.binder.bind_context.shared().as_ref(),
                     ),
-                    &self.ctx.column_stats,
-                    &self.ctx.bind_context,
+                    &candidate_context.column_stats,
+                    &candidate_context.bind_context,
                 )?;
-            join_candidate = StatisticsGathering::new().gather(join_candidate, &mut self.ctx)?;
+            join_candidate =
+                StatisticsGathering::new().gather(join_candidate, &mut candidate_context)?;
             let mut propagator = StatisticsPropagator::new();
-            join_candidate = propagator.propagate(self.ctx.session.clone(), join_candidate);
-            join_candidate = StatisticsGathering::new().gather(join_candidate, &mut self.ctx)?;
-            if let Err(error) = verify_logical_plan(&self.ctx.bind_context, &join_candidate) {
+            join_candidate =
+                propagator.propagate(candidate_context.session.clone(), join_candidate);
+            candidate_context.column_stats = propagator.take_statistics_map();
+            join_candidate =
+                StatisticsGathering::new().gather(join_candidate, &mut candidate_context)?;
+            let join_candidate = self.finalize_query_candidate(CandidatePlan {
+                plan: join_candidate,
+                column_stats: Arc::new(candidate_context.column_stats),
+            })?;
+            if let Err(error) = verify_logical_plan(&self.ctx.bind_context, &join_candidate.plan) {
                 debug!(
                     target: targets::OPTIMIZER,
                     %error,
@@ -410,12 +619,11 @@ impl Optimizer {
                 );
                 continue;
             }
-            join_alternatives.push(LogicalAlternative {
-                plan: join_candidate,
-                source: AlternativeOrigin::Specialized {
+            join_alternatives.push(join_candidate.into_alternative(
+                AlternativeOrigin::Specialized {
                     rule: JOIN_REGION_ENUMERATOR_RULE,
                 },
-            });
+            ));
             if join_alternatives.len() >= self.budget.max_optional_logical_exprs_per_group as usize
             {
                 break;
@@ -451,7 +659,7 @@ impl Optimizer {
         let extraction = input.optimize(&grant_classes)?;
         self.ctx
             .profiler
-            .record_rule_firings(extraction.rule_firings.clone());
+            .record_rule_insertions(extraction.rule_insertions.clone());
         self.ctx.profiler.record(
             match mode {
                 crate::cascades::SearchMode::Direct => OptimizerComponent::DirectPhysicalSearch,
@@ -493,7 +701,10 @@ impl Optimizer {
             OptimizerComponent::PhysicalExtraction,
             phase_started.elapsed(),
         );
-        publish_optimizer_profile_snapshot(self.ctx.profiler.snapshot());
+        publish_optimizer_profile_snapshot(
+            self.ctx.session.diagnostics.as_ref(),
+            self.ctx.profiler.snapshot(),
+        );
         debug!(
             target: targets::OPTIMIZER,
             ?mode,
@@ -852,71 +1063,51 @@ impl Optimizer {
         Ok(plan)
     }
 
-    fn settle_query_candidate(&mut self, mut plan: LogicalPlan) -> Result<LogicalPlan> {
+    fn estimate_query_candidate(&self, mut plan: LogicalPlan) -> Result<CandidatePlan> {
+        let mut context = self.ctx.fork_for_candidate(HashMap::new());
+
+        plan = StatisticsGathering::new().gather(plan, &mut context)?;
+        let mut propagator = StatisticsPropagator::new();
+        plan = propagator.propagate(context.session.clone(), plan);
+        context.column_stats = propagator.take_statistics_map();
+        plan = StatisticsGathering::new().gather(plan, &mut context)?;
+
+        Ok(CandidatePlan {
+            plan,
+            column_stats: Arc::new(context.column_stats),
+        })
+    }
+
+    fn settle_schema_candidate(&self, mut plan: LogicalPlan) -> Result<CandidatePlan> {
         // Query-IR output contracts are demand driven. Until every planner
         // operator natively exposes ColumnIds, derive the same canonical
         // demand projection once at the Query IR boundary; this is not an
         // optional cost rewrite and never removes an observable evaluation.
         RemoveUnusedColumns::optimize(&mut plan, &self.binder, self.ctx.session.as_ref(), true);
 
-        // Estimation is an input to search, never a post-selection repair.
-        // The current planner-facing estimator stores its immutable snapshot
-        // annotations on LogicalPlan nodes; MemoBuilder immediately
-        // converts them into estimate/cost inputs and clears them from its
-        // extraction skeletons.
-        self.ctx.column_stats.clear();
-        plan = StatisticsGathering::new().gather(plan, &mut self.ctx)?;
-        let mut propagator = StatisticsPropagator::new();
-        plan = propagator.propagate(self.ctx.session.clone(), plan);
-        self.ctx.column_stats = propagator.take_statistics_map();
-        plan = StatisticsGathering::new().gather(plan, &mut self.ctx)?;
-        plan = ColumnLifetimeAnalyzer::new(true).optimize(plan)?;
-
-        if self.ctx.verify_enabled {
-            verify_logical_plan(&self.ctx.bind_context, &plan)?;
-        }
-        Ok(plan)
+        self.estimate_query_candidate(plan)
     }
 
-    /// Derive a proof-driven relational equivalent that can change cost.
-    /// The unchanged expression remains mandatory and this candidate enters
-    /// its group through the bounded transformation agenda.
-    fn relational_equivalence_candidate(&mut self, mut plan: LogicalPlan) -> Result<LogicalPlan> {
-        plan = post_reduction::optimize_plan(plan, &self.ctx.bind_context);
-        plan = JoinElimination::new().optimize_plan(plan);
-        plan = join_preaggregation::optimize_plan(
-            plan,
-            &self.ctx.bind_context,
-            &self.ctx.column_stats,
-        );
-        plan = join_subsumption::optimize_plan(plan);
-        plan = non_null_inputs::optimize_plan(plan, &self.ctx.column_stats);
-
-        (plan, _) =
-            dimension_deferral::optimize_plan(plan, &self.ctx.bind_context, &self.ctx.cost_model)?;
-        (plan, _) = input_materialization::optimize_plan(plan, &self.ctx.bind_context)?;
-        plan = LimitPushdown::new().optimize_plan(plan);
-
-        if self.ctx.session.settings.rowset_scan_pushdown() {
-            (plan, _) = late_payload::optimize_matched_prefix_plan(plan)?;
-            (plan, _) =
-                late_payload::optimize_plan(plan, &self.ctx.bind_context, &self.ctx.cost_model)?;
-        }
-        plan = scalar_aggregate_window::optimize_plan(plan, &self.ctx.bind_context)?;
-        plan = self.settle_query_candidate(plan)?;
-        plan = singleton_groups::optimize_plan(plan, &self.ctx.column_stats);
-        plan = ColumnLifetimeAnalyzer::new(true).optimize(plan)?;
+    fn finalize_query_candidate(&self, mut candidate: CandidatePlan) -> Result<CandidatePlan> {
+        candidate.plan =
+            singleton_groups::optimize_plan(candidate.plan, candidate.column_stats.as_ref());
+        candidate.plan = ColumnLifetimeAnalyzer::new(true).optimize(candidate.plan)?;
 
         if self.ctx.verify_enabled {
-            verify_logical_plan(&self.ctx.bind_context, &plan)?;
+            verify_logical_plan(&self.ctx.bind_context, &candidate.plan)?;
         }
-        Ok(plan)
+        Ok(candidate)
+    }
+
+    fn settle_query_candidate(&self, plan: LogicalPlan) -> Result<CandidatePlan> {
+        let candidate = self.settle_schema_candidate(plan)?;
+        self.finalize_query_candidate(candidate)
     }
 
     fn distinct_aggregate_feasibility_candidate(
-        &mut self,
+        &self,
         plan: LogicalPlan,
-    ) -> Result<Option<LogicalPlan>> {
+    ) -> Result<Option<CandidatePlan>> {
         let (plan, changed) = distinct_decomposition::optimize_plan(plan, &self.ctx.bind_context)?;
         if !changed {
             return Ok(None);
@@ -924,7 +1115,7 @@ impl Optimizer {
         self.settle_query_candidate(plan).map(Some)
     }
 
-    fn correlated_aggregate_candidate(&mut self, plan: LogicalPlan) -> Result<LogicalPlan> {
+    fn correlated_aggregate_candidate(&self, plan: LogicalPlan) -> Result<CandidatePlan> {
         let candidate =
             CorrelatedPartitionAggregate::new(self.ctx.bind_context.clone()).optimize_plan(plan)?;
         self.settle_query_candidate(candidate)
@@ -938,26 +1129,23 @@ impl Optimizer {
         CTEInlining::new(&self.ctx.bind_context).optimize_plan(candidate)
     }
 
-    fn scalar_reuse_candidate(&mut self, plan: LogicalPlan) -> Result<LogicalPlan> {
+    fn scalar_reuse_candidate(&self, candidate: CandidatePlan) -> Result<CandidatePlan> {
+        let context = self
+            .ctx
+            .fork_for_candidate(Arc::unwrap_or_clone(candidate.column_stats));
         let mut candidate = JoinOrderOptimizer::new()
             .with_search_budget(&self.budget)
             .optimize_plan(
-                self.ctx.session.as_ref(),
-                plan,
-                &self.ctx.column_stats,
-                &self.ctx.bind_context,
+                context.session.as_ref(),
+                candidate.plan,
+                &context.column_stats,
+                &context.bind_context,
             )?;
-        candidate = StatisticsGathering::new().gather(candidate, &mut self.ctx)?;
-        candidate = ColumnLifetimeAnalyzer::new(true).optimize(candidate)?;
         candidate = scalar_aggregate_window::optimize_plan(candidate, &self.ctx.bind_context)?;
         if self.ctx.session.settings.rowset_scan_pushdown() {
             (candidate, _) = late_payload::optimize_matched_prefix_plan(candidate)?;
         }
-        candidate = ColumnLifetimeAnalyzer::new(true).optimize(candidate)?;
-        if self.ctx.verify_enabled {
-            verify_logical_plan(&self.ctx.bind_context, &candidate)?;
-        }
-        Ok(candidate)
+        self.settle_query_candidate(candidate)
     }
 }
 

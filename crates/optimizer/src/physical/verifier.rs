@@ -156,22 +156,18 @@ impl PhysicalPlanVerifier {
                         .iter()
                         .filter(|edge| {
                             edge.producer == *build
-                                && edge.consumer == *probe
                                 && edge.kind
                                     == PhysicalEdgeKind::RuntimeFilter(runtime_filter.artifact)
                         })
-                        .count();
-                    if matching_edges != 1 {
+                        .collect::<Vec<_>>();
+                    if matching_edges.len() != 1 {
                         return Err(paro_error::internal(
                             "runtime-filter hash join does not own exactly one matching auxiliary edge",
                         ));
                     }
-                    if !matches!(
-                        &plan.node(*probe).kind,
-                        crate::physical::PhysicalNodeKind::RowsetScan(_)
-                    ) {
+                    if runtime_filter_probe_scan(plan, *probe) != Some(matching_edges[0].consumer) {
                         return Err(paro_error::internal(
-                            "runtime-filter consumer is not a direct rowset scan",
+                            "runtime-filter consumer is not the probe's row-preserving rowset scan",
                         ));
                     }
                 }
@@ -242,7 +238,7 @@ impl PhysicalPlanVerifier {
                             };
                             runtime_filter.artifact == artifact
                                 && *build == edge.producer
-                                && *probe == edge.consumer
+                                && runtime_filter_probe_scan(plan, *probe) == Some(edge.consumer)
                         })
                         .count();
                     if owners != 1
@@ -313,6 +309,26 @@ impl PhysicalPlanVerifier {
             }
         }
         verify_acyclic(&dependencies)
+    }
+}
+
+fn runtime_filter_probe_scan(
+    plan: &PhysicalPlan,
+    mut node: PhysicalPlanNodeId,
+) -> Option<PhysicalPlanNodeId> {
+    loop {
+        let current = plan.nodes.get(node)?;
+        match &current.kind {
+            crate::physical::PhysicalNodeKind::RowsetScan(_) => return Some(node),
+            crate::physical::PhysicalNodeKind::Project(_)
+            | crate::physical::PhysicalNodeKind::Filter(_) => {
+                let [child] = plan.child_ids(&current.children) else {
+                    return None;
+                };
+                node = *child;
+            }
+            _ => return None,
+        }
     }
 }
 

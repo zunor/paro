@@ -3,9 +3,10 @@
 
 use crate::{
     AttachedDatabaseDirectory, AttachedDatabaseSnapshot, DdlApplyContext, EffectiveSettings,
-    QueryResources, RuntimeLimits, SessionMetadataProvider, SessionRandom, StatementAuthContext,
-    StatementCancellation, StatementEnvironment, StatementInput, StatementOptions,
-    StatementTimeContext, StatementView, TransactionView, TxnAdmissionState, WriteGuard,
+    QueryResources, RuntimeLimits, SessionDiagnostics, SessionMetadataProvider, SessionRandom,
+    StatementAuthContext, StatementCancellation, StatementEnvironment, StatementInput,
+    StatementOptions, StatementTimeContext, StatementView, TransactionView, TxnAdmissionState,
+    WriteGuard,
 };
 use paro_catalog::database_catalog::ParoCatalog;
 use paro_catalog::mvcc::CatalogSnapshot;
@@ -45,6 +46,8 @@ pub struct StatementContext {
     pub services: Arc<QueryResources>,
     pub graph_registry: Arc<dyn crate::GraphRegistry>,
     pub session_metadata: Arc<dyn SessionMetadataProvider>,
+    /// Mutable diagnostics owned by this client session, never by the process.
+    pub diagnostics: Arc<SessionDiagnostics>,
 }
 
 impl std::fmt::Debug for StatementContext {

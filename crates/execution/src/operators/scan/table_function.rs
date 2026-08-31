@@ -177,7 +177,7 @@ pub(crate) fn populate_system_table_function_data(
         "paro_pg_settings" => populate_paro_pg_settings(global_state, ctx),
         "paro_pg_prepared_statements" => populate_paro_pg_prepared_statements(global_state, ctx),
         "paro_pg_cursors" => populate_paro_pg_cursors(global_state, ctx),
-        "paro_optimizers" => populate_paro_optimizers(global_state),
+        "paro_optimizers" => populate_paro_optimizers(global_state, ctx),
         "paro_storage_info" => populate_paro_storage_info(global_state, ctx),
         "paro_wal_metrics" => populate_paro_wal_metrics(global_state, ctx),
         "paro_transaction_metrics" => populate_paro_transaction_metrics(global_state, ctx),
@@ -920,7 +920,10 @@ fn populate_paro_indexes(global_state: &mut dyn GlobalTableFunctionState, ctx: &
     }
 }
 
-fn populate_paro_optimizers(global_state: &mut dyn GlobalTableFunctionState) {
+fn populate_paro_optimizers(
+    global_state: &mut dyn GlobalTableFunctionState,
+    ctx: &StatementContext,
+) {
     use paro_function::table::system::paro_optimizers::{
         populate_optimizer_data, OptimizerData, ParoOptimizersGlobalState,
     };
@@ -929,28 +932,17 @@ fn populate_paro_optimizers(global_state: &mut dyn GlobalTableFunctionState) {
         .as_any_mut()
         .downcast_mut::<ParoOptimizersGlobalState>()
     {
-        let snapshot = paro_optimizer::profiler::latest_optimizer_profile_snapshot();
-        let mut entries = snapshot
-            .entries
+        let entries = ctx
+            .diagnostics
+            .optimizer_snapshot()
             .into_iter()
             .map(|entry| OptimizerData {
-                name: entry.component.name().to_string(),
-                kind: entry.component.kind().to_string(),
-                last_elapsed_us: entry.last_elapsed.as_micros().min(i64::MAX as u128) as i64,
-                invocation_count: entry.invocation_count.min(i64::MAX as u64) as i64,
+                name: entry.name,
+                kind: entry.kind,
+                last_elapsed_us: entry.last_elapsed_us,
+                invocation_count: entry.invocation_count,
             })
             .collect::<Vec<_>>();
-        entries.extend(
-            snapshot
-                .rule_firings
-                .into_iter()
-                .map(|(rule, count)| OptimizerData {
-                    name: format!("rule_{}", rule.0),
-                    kind: "transformation_rule".to_string(),
-                    last_elapsed_us: 0,
-                    invocation_count: count.min(i64::MAX as u64) as i64,
-                }),
-        );
         populate_optimizer_data(state, entries);
     }
 }
@@ -2560,6 +2552,7 @@ mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::time::Duration;
 
+    use paro_context::test_support::TestStatementContextBuilder;
     use paro_function::table::system::paro_optimizers::ParoOptimizersGlobalState;
     use paro_optimizer::profiler::{
         publish_optimizer_profile_snapshot, OptimizerComponent, OptimizerProfileSnapshot,
@@ -2567,29 +2560,45 @@ mod tests {
     };
 
     #[test]
-    fn populate_paro_optimizers_reads_latest_snapshot() {
-        publish_optimizer_profile_snapshot(OptimizerProfileSnapshot {
-            entries: vec![
-                OptimizerProfileSnapshotEntry {
-                    component: OptimizerComponent::SemanticNormalization,
-                    last_elapsed: Duration::from_micros(33),
-                    invocation_count: 5,
-                },
-                OptimizerProfileSnapshotEntry {
-                    component: OptimizerComponent::MemoExploration,
-                    last_elapsed: Duration::from_micros(0),
-                    invocation_count: 0,
-                },
-            ],
-            rule_firings: Default::default(),
-        });
+    fn populate_paro_optimizers_reads_the_current_sessions_snapshot() {
+        let ctx = TestStatementContextBuilder::minimal().build();
+        let other = TestStatementContextBuilder::minimal().build();
+        publish_optimizer_profile_snapshot(
+            ctx.diagnostics.as_ref(),
+            OptimizerProfileSnapshot {
+                entries: vec![
+                    OptimizerProfileSnapshotEntry {
+                        component: OptimizerComponent::SemanticNormalization,
+                        last_elapsed: Duration::from_micros(33),
+                        invocation_count: 5,
+                    },
+                    OptimizerProfileSnapshotEntry {
+                        component: OptimizerComponent::MemoExploration,
+                        last_elapsed: Duration::from_micros(0),
+                        invocation_count: 0,
+                    },
+                ],
+                rule_insertions: Default::default(),
+            },
+        );
+        publish_optimizer_profile_snapshot(
+            other.diagnostics.as_ref(),
+            OptimizerProfileSnapshot {
+                entries: vec![OptimizerProfileSnapshotEntry {
+                    component: OptimizerComponent::WinnerVerification,
+                    last_elapsed: Duration::from_micros(999),
+                    invocation_count: 77,
+                }],
+                rule_insertions: Default::default(),
+            },
+        );
 
         let mut state = ParoOptimizersGlobalState {
             entries: Vec::new(),
             offset: AtomicUsize::new(99),
         };
 
-        populate_paro_optimizers(&mut state);
+        populate_paro_optimizers(&mut state, ctx.as_ref());
 
         assert_eq!(state.offset.load(Ordering::Relaxed), 0);
         assert_eq!(state.entries.len(), 2);

@@ -3,7 +3,7 @@
 
 //! Construction of optimizer Query IR and Memo groups from bound plans.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::sync::Arc;
 
 use crate::physical::{ResourceGrantClass, SpillPolicy};
@@ -17,12 +17,13 @@ use paro_planner::expression::{Expression, ReferenceExpression};
 use paro_planner::operator::join::{AntiJoinMode, Join, JoinComparisonType, JoinType};
 use paro_planner::operator::{ColumnBinding, LogicalOperator, LogicalOperatorType};
 use paro_planner::plan::{LogicalPlan, NodeStats};
+use paro_storage::statistics::ColumnStatistics;
 use tracing::debug;
 
 use super::budget::SearchBudget;
 use super::calibration::{
     LocalOperatorWork, MachineCalibrationBundle, OP_RUNTIME_FILTER_APPLY_ROW,
-    OP_RUNTIME_FILTER_BUILD_ROW,
+    OP_RUNTIME_FILTER_BUILD_ROW, OP_TUPLE_BYTE_BLOCK,
 };
 use super::column::{ColumnCatalog, ColumnOrigin, ColumnVisibility, GroupSchema};
 use super::cost::ResourceDimension;
@@ -80,6 +81,9 @@ pub const GRAPH_REGION_ENUMERATOR_RULE: super::ids::RuleId = super::ids::RuleId(
 pub struct LogicalAlternative {
     pub plan: LogicalPlan,
     pub source: AlternativeOrigin,
+    /// Immutable estimator input owned by this alternative. Search providers
+    /// must never observe statistics left behind by a different candidate.
+    pub column_stats: Arc<HashMap<ColumnBinding, Arc<ColumnStatistics>>>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -90,18 +94,25 @@ pub enum AlternativeOrigin {
 }
 
 #[derive(Debug, Clone)]
-struct PreparedEquivalent {
+struct SeededEquivalent {
     key: LogicalExprKey,
     payload: LogicalPayloadId,
 }
 
+/// A query-local transformation substitution compiled from a semantic proof.
+///
+/// Matching is by canonical expression shape, never by allocation identity,
+/// so agenda replay remains deterministic when another rule inserts the same
+/// source expression. This form is reserved for proof witnesses compiled from
+/// query metadata; schema-generic transformations register directly against
+/// the same Memo agenda.
 #[derive(Debug)]
-struct PreparedTransformationRule {
+struct SeededTransformationRule {
     id: RuleId,
-    outputs: BTreeMap<LogicalExprId, Box<[PreparedEquivalent]>>,
+    outputs: BTreeMap<LogicalExprKey, Box<[SeededEquivalent]>>,
 }
 
-impl TransformationRule for PreparedTransformationRule {
+impl TransformationRule for SeededTransformationRule {
     fn id(&self) -> RuleId {
         self.id
     }
@@ -111,7 +122,7 @@ impl TransformationRule for PreparedTransformationRule {
     }
 
     fn matches(&self, expr: &super::memo::LogicalExpr, _ctx: &RuleContext<'_>) -> bool {
-        self.outputs.contains_key(&expr.id)
+        self.outputs.contains_key(&expr.key)
     }
 
     fn apply(
@@ -126,7 +137,7 @@ impl TransformationRule for PreparedTransformationRule {
         let premise = source.key.stable_fingerprint();
         Ok(self
             .outputs
-            .get(&expr)
+            .get(&source.key)
             .into_iter()
             .flatten()
             .map(|output| EquivalentExpression {
@@ -203,6 +214,7 @@ struct PlannerSearchImplementationMetadata {
 struct PlannerCostFacts {
     output_rows: CompactRange,
     child_rows: Box<[CompactRange]>,
+    child_row_widths: Box<[u64]>,
     output_row_width: u64,
     perfect_hash_slots: Option<u64>,
 }
@@ -257,7 +269,7 @@ pub struct OptimizationInput {
     pub presentation: ResultPresentation,
     payloads: PlannerPayloadArena,
     metadata: Arc<BTreeMap<LogicalPayloadId, PlannerOperatorMetadata>>,
-    transformations: Vec<PreparedTransformationRule>,
+    transformations: Vec<SeededTransformationRule>,
     baseline_child_required: PropertySetId,
     bind_context: BindContext,
     calibration: Arc<MachineCalibrationBundle>,
@@ -408,24 +420,10 @@ impl OptimizationInput {
                 cost: winner.cost,
             });
         }
-        let mut rule_firings = BTreeMap::<RuleId, u64>::new();
-        let mut counted_expressions = BTreeSet::new();
-        for group in engine.memo().groups() {
-            for expression in group.logical_exprs() {
-                if !counted_expressions.insert(*expression) {
-                    continue;
-                }
-                let expression = engine.memo().logical_expr(*expression).ok_or_else(|| {
-                    paro_error::internal("Memo group references a missing logical expression")
-                })?;
-                for rule in &expression.applied_rules {
-                    *rule_firings.entry(*rule).or_default() += 1;
-                }
-            }
-        }
+        let rule_insertions = engine.effective_rule_insertions().clone();
         Ok(OptimizationOutput {
             variants: variants.into_boxed_slice(),
-            rule_firings,
+            rule_insertions,
         })
     }
 }
@@ -433,7 +431,10 @@ impl OptimizationInput {
 #[derive(Debug)]
 pub struct OptimizationOutput {
     pub variants: Box<[OptimizedVariant]>,
-    pub rule_firings: BTreeMap<RuleId, u64>,
+    /// Logical expressions actually inserted into an equivalence group by
+    /// each transformation. Matching, scheduling, and duplicate replay do not
+    /// count as an effect.
+    pub rule_insertions: BTreeMap<RuleId, u64>,
 }
 
 #[derive(Debug)]
@@ -473,6 +474,7 @@ impl MemoBuilder {
             vec![LogicalAlternative {
                 plan,
                 source: AlternativeOrigin::Baseline,
+                column_stats: Arc::new(HashMap::new()),
             }],
             bind_context,
             budget,
@@ -506,6 +508,25 @@ impl MemoBuilder {
         budget: SearchBudget,
         search_context: Option<&crate::context::OptimizationContext>,
     ) -> Result<OptimizationInput> {
+        // Query-local transformation templates are materialized before the
+        // agenda runs. Apply the same isolation and rule-fire bounds here so
+        // a disabled or statically unreachable template cannot allocate dead
+        // Memo groups merely by being present in the input list.
+        let mut admitted_rules = BTreeSet::new();
+        let alternatives = alternatives
+            .into_iter()
+            .filter(|alternative| match alternative.source {
+                AlternativeOrigin::Baseline | AlternativeOrigin::Specialized { .. } => true,
+                AlternativeOrigin::Transformation { rule } => {
+                    if !budget.transformation_enabled(rule) {
+                        return false;
+                    }
+                    admitted_rules.contains(&rule)
+                        || (admitted_rules.len() < budget.max_rule_firings_per_group as usize
+                            && admitted_rules.insert(rule))
+                }
+            })
+            .collect::<Vec<_>>();
         if alternatives.is_empty() {
             return Err(paro_error::internal(
                 "Memo builder requires a mandatory baseline plan",
@@ -531,20 +552,26 @@ impl MemoBuilder {
         let mut region_facets = Vec::<RegionFacet>::new();
         let mut pending_region_facets =
             BTreeMap::<LogicalPayloadId, PendingPlannerRegionFacets>::new();
-        let mut prepared_transformations =
-            BTreeMap::<RuleId, BTreeMap<LogicalExprId, Vec<PreparedEquivalent>>>::new();
+        let mut seeded_transformations =
+            BTreeMap::<RuleId, BTreeMap<LogicalExprKey, Vec<SeededEquivalent>>>::new();
         let mut expression_groups =
             BTreeMap::<LogicalExprKey, Vec<(GroupId, super::ids::LogicalExprId)>>::new();
         let bind_shared = bind_context.shared().clone();
         let rowset_scan_pushdown = search_context
             .map(|context| context.session.limits.rowset_scan_pushdown)
             .unwrap_or(true);
+        let scan_access_cost = search_context
+            .map(|context| context.cost_model.scan_access)
+            .unwrap_or_default();
         let mut has_contextual_shape = false;
 
         let mut roots: Vec<(AlternativeOrigin, LogicalPlan, BuildState)> =
             Vec::with_capacity(alternatives.len());
         for alternative in alternatives {
             let source = alternative.source;
+            let candidate_context = search_context.map(|context| {
+                context.fork_for_candidate(Arc::unwrap_or_clone(alternative.column_stats))
+            });
             let (root_plan, root_state) = alternative.plan.try_fold_post_order(
                 |mut plan, child_states: Vec<BuildState>| -> Result<(LogicalPlan, BuildState)> {
                     has_contextual_shape |= is_contextual_operator(&plan.operator);
@@ -649,7 +676,7 @@ impl MemoBuilder {
                             },
                         ));
                     }
-                    let search_candidate = if let Some(search_context) = search_context {
+                    let search_candidate = if let Some(search_context) = &candidate_context {
                         crate::search::optimizer::SearchOptimizer::new()
                             .physical_candidate_for_root(
                                 duplicate_plan_preserving_indices(&plan, bind_shared.as_ref()),
@@ -701,8 +728,8 @@ impl MemoBuilder {
                             replayability: ProvidedReplayability::OnePass,
                             result_guarantee: provided_result_guarantee(&search_plan.operator),
                         };
-                        let local_cost = planner_operator_cost(&search_plan, 0)?;
-                        let cost_facts = planner_cost_facts(&search_plan)?;
+                        let local_cost = planner_operator_cost(&search_plan, 0, scan_access_cost)?;
+                        let cost_facts = planner_cost_facts(&search_plan, scan_access_cost)?;
                         search_plan.stats = NodeStats::default();
                         let payload = PhysicalPayloadId(
                             payloads
@@ -790,11 +817,15 @@ impl MemoBuilder {
                             replayability: ProvidedReplayability::OnePass,
                             result_guarantee: provided_result_guarantee(&plan.operator),
                         },
-                        local_cost: planner_operator_cost(&plan, child_states.len())?,
+                        local_cost: planner_operator_cost(
+                            &plan,
+                            child_states.len(),
+                            scan_access_cost,
+                        )?,
                         implementations,
                         grant_dependency: planner_grant_dependency(&plan.operator),
                         spillable: planner_operator_spillable(&plan.operator),
-                        cost_facts: planner_cost_facts(&plan)?,
+                        cost_facts: planner_cost_facts(&plan, scan_access_cost)?,
                         output_columns: output_columns.clone().into_boxed_slice(),
                         search,
                         required_region_facet: None,
@@ -840,25 +871,31 @@ impl MemoBuilder {
                         .ok_or_else(|| {
                             paro_error::internal("transformation baseline group disappeared")
                         })?;
+                    let source_expression = memo.logical_expr(source).ok_or_else(|| {
+                        paro_error::internal("transformation baseline expression disappeared")
+                    })?;
                     let output_group = memo.group(root_state.group).ok_or_else(|| {
-                        paro_error::internal("prepared transformation group disappeared")
+                        paro_error::internal("seeded transformation group disappeared")
                     })?;
                     if source_group.schema != output_group.schema
                         || source_group.logical_properties != output_group.logical_properties
                     {
-                        return Err(paro_error::internal(
-                            "transformation changed its Memo group output contract",
-                        ));
+                        debug!(
+                            target: targets::OPTIMIZER,
+                            rule = rule.0,
+                            "discarded optional transformation with an incompatible Memo output contract"
+                        );
+                        continue;
                     }
                     let output = memo.logical_expr(root_state.logical).ok_or_else(|| {
-                        paro_error::internal("prepared transformation expression disappeared")
+                        paro_error::internal("seeded transformation expression disappeared")
                     })?;
-                    prepared_transformations
+                    seeded_transformations
                         .entry(rule)
                         .or_default()
-                        .entry(source)
+                        .entry(source_expression.key.clone())
                         .or_default()
-                        .push(PreparedEquivalent {
+                        .push(SeededEquivalent {
                             key: output.key.clone(),
                             payload: output.payload,
                         });
@@ -951,9 +988,9 @@ impl MemoBuilder {
             columns: root_state.columns,
             names: root_plan.output_names().into_boxed_slice(),
         };
-        let transformations = prepared_transformations
+        let transformations = seeded_transformations
             .into_iter()
-            .map(|(id, outputs)| PreparedTransformationRule {
+            .map(|(id, outputs)| SeededTransformationRule {
                 id,
                 outputs: outputs
                     .into_iter()
@@ -2185,10 +2222,6 @@ fn planner_implementation_set(
     }
 }
 
-/// Current AuxiliaryPlanRegion support is intentionally narrow: the probe
-/// must be a direct base rowset so extraction can name one unambiguous
-/// consumer. Broader lineage remains a future implementation registration,
-/// never an execution-time inference.
 fn supports_runtime_filter_auxiliary(
     join: &paro_planner::operator::ComparisonJoin,
     rowset_scan_pushdown: bool,
@@ -2199,58 +2232,84 @@ fn supports_runtime_filter_auxiliary(
     ) {
         return false;
     }
-    let (get, filter_projection) = match &join.left.operator {
-        LogicalOperator::Get(get) => (get, None),
-        LogicalOperator::Filter(filter) if rowset_scan_pushdown => {
-            let LogicalOperator::Get(get) = &filter.child.operator else {
-                return false;
-            };
-            let filter_is_fully_pushable = [
-                filter.expressions.as_slice(),
-                get.runtime_filter_expressions.as_slice(),
-            ]
-            .into_iter()
-            .all(|expressions| {
-                crate::physical::extraction::predicate_builder::build_predicate_tree(
-                    expressions,
-                    get,
-                )
-                .is_ok_and(|(_, residual)| residual.is_empty())
-            });
-            if !filter_is_fully_pushable {
-                return false;
+    fn probe_lineage<'a>(
+        plan: &'a LogicalPlan,
+        rowset_scan_pushdown: bool,
+    ) -> Option<(&'a paro_planner::operator::Get, Vec<Option<usize>>)> {
+        match &plan.operator {
+            LogicalOperator::Get(get) => {
+                Some((get, (0..get.returned_types.len()).map(Some).collect()))
             }
-            (
-                get,
-                Some(filter.projection_map.to_indices(filter.child.types().len())),
-            )
+            LogicalOperator::Filter(filter) if rowset_scan_pushdown => {
+                let (get, child_lineage) = probe_lineage(&filter.child, rowset_scan_pushdown)?;
+                let filter_is_fully_pushable = [
+                    filter.expressions.as_slice(),
+                    get.runtime_filter_expressions.as_slice(),
+                ]
+                .into_iter()
+                .all(|expressions| {
+                    crate::physical::extraction::predicate_builder::build_predicate_tree(
+                        expressions,
+                        get,
+                    )
+                    .is_ok_and(|(_, residual)| residual.is_empty())
+                });
+                if !filter_is_fully_pushable {
+                    return None;
+                }
+                let projection = filter.projection_map.to_indices(filter.child.types().len());
+                Some((
+                    get,
+                    projection
+                        .into_iter()
+                        .map(|index| child_lineage.get(index).copied().flatten())
+                        .collect(),
+                ))
+            }
+            LogicalOperator::Projection(projection) => {
+                let (get, child_lineage) = probe_lineage(&projection.child, rowset_scan_pushdown)?;
+                let child_bindings = projection.child.get_column_bindings();
+                let lineage = projection
+                    .expressions
+                    .iter()
+                    .map(|expression| {
+                        let child_index = match expression {
+                            Expression::ColumnRef(column) if column.depth == 0 => child_bindings
+                                .iter()
+                                .position(|binding| *binding == column.binding),
+                            Expression::Reference(reference) => Some(reference.index),
+                            _ => None,
+                        }?;
+                        child_lineage.get(child_index).copied().flatten()
+                    })
+                    .collect::<Vec<_>>();
+                Some((get, lineage))
+            }
+            _ => None,
         }
-        _ => return false,
+    }
+
+    let Some((get, output_lineage)) = probe_lineage(&join.left, rowset_scan_pushdown) else {
+        return false;
     };
     if get.table.is_none() {
         return false;
     }
+    let probe_bindings = join.left.get_column_bindings();
     join.conditions.iter().any(|condition| {
         if condition.comparison != JoinComparisonType::Equal {
             return false;
         }
-        match &condition.left {
-            Expression::ColumnRef(column) => {
-                column.depth == 0 && column.binding.table_index == get.table_index
-            }
-            // Join ordering and slot binding may already have converted the
-            // direct Get output into its local row position. Accept only a
-            // stored column, never a derived prefix or virtual row id.
-            Expression::Reference(reference) => {
-                let get_index = filter_projection
-                    .as_ref()
-                    .and_then(|projection| projection.get(reference.index))
-                    .copied()
-                    .unwrap_or(reference.index);
-                get_index < get.returned_types.len() && get.stored_column(get_index).is_some()
-            }
-            _ => false,
-        }
+        let output_index = match &condition.left {
+            Expression::ColumnRef(column) if column.depth == 0 => probe_bindings
+                .iter()
+                .position(|binding| *binding == column.binding),
+            Expression::Reference(reference) => Some(reference.index),
+            _ => None,
+        };
+        output_index
+            .and_then(|index| output_lineage.get(index).copied().flatten())
+            .is_some_and(|get_index| get.stored_column(get_index).is_some())
     })
 }
 
@@ -2326,20 +2385,23 @@ const OP_WINDOW_ROW: OpClassId = OpClassId(13);
 const OP_PARTITION_AGGREGATE_WINDOW_ROW: OpClassId = OpClassId(14);
 const OP_SINGLETON_AGGREGATE_PROJECT_ROW: OpClassId = OpClassId(15);
 
-fn planner_cost_facts(plan: &LogicalPlan) -> Result<PlannerCostFacts> {
+fn planner_cost_facts(
+    plan: &LogicalPlan,
+    scan_access_cost: paro_storage::rowset::scan_cost::ScanAccessCostModel,
+) -> Result<PlannerCostFacts> {
     let output_rows = cardinality_work_range(plan.stats.estimated_cardinality)?;
-    let child_rows = plan
-        .children()
-        .into_iter()
+    let children = plan.children();
+    let child_rows = children
+        .iter()
         .map(|child| cardinality_work_range(child.stats.estimated_cardinality))
         .collect::<Result<Vec<_>>>()?
         .into_boxed_slice();
-    let output_row_width = plan
-        .types()
+    let child_row_widths = children
         .iter()
-        .map(|logical_type| logical_type.type_size().max(1) as u64)
-        .sum::<u64>()
-        .saturating_add(32);
+        .map(|child| planner_row_width(child, scan_access_cost))
+        .collect::<Vec<_>>()
+        .into_boxed_slice();
+    let output_row_width = planner_row_width(plan, scan_access_cost);
     let perfect_hash_slots = match &plan.operator {
         LogicalOperator::Aggregate(aggregate) => {
             crate::physical::extraction::helpers::can_use_perfect_hash_aggregate(
@@ -2360,9 +2422,21 @@ fn planner_cost_facts(plan: &LogicalPlan) -> Result<PlannerCostFacts> {
     Ok(PlannerCostFacts {
         output_rows,
         child_rows,
+        child_row_widths,
         output_row_width,
         perfect_hash_slots,
     })
+}
+
+fn planner_row_width(
+    plan: &LogicalPlan,
+    scan_access_cost: paro_storage::rowset::scan_cost::ScanAccessCostModel,
+) -> u64 {
+    plan.types()
+        .iter()
+        .map(|logical_type| scan_access_cost.estimated_width(logical_type) as u64)
+        .sum::<u64>()
+        .saturating_add(std::mem::size_of::<u64>() as u64)
 }
 
 fn cardinality_work_range(
@@ -2415,6 +2489,12 @@ fn implementation_cost(
             return Err(paro_error::internal(
                 "search provider cost must come from its physical payload",
             ));
+        }
+        _ => add_tuple_byte_work(&mut work, facts)?,
+    }
+    match flavor {
+        PhysicalImplementationFlavor::Structural | PhysicalImplementationFlavor::SearchProvider => {
+            unreachable!()
         }
         PhysicalImplementationFlavor::HashAggregate => {
             let input = facts
@@ -2547,6 +2627,27 @@ fn implementation_cost(
     cost.peak_memory_upper = peak_memory_upper;
     cost.validate()?;
     Ok(cost)
+}
+
+fn add_tuple_byte_work(work: &mut LocalOperatorWork, facts: &PlannerCostFacts) -> Result<()> {
+    const BYTE_BLOCK: f64 = 32.0;
+
+    let mut blocks = scaled_work(
+        facts.output_rows,
+        facts.output_row_width as f64 / BYTE_BLOCK,
+    )?;
+    for (rows, width) in facts.child_rows.iter().zip(facts.child_row_widths.iter()) {
+        blocks = blocks.checked_add(scaled_work(*rows, *width as f64 / BYTE_BLOCK)?)?;
+    }
+    work.add(OP_TUPLE_BYTE_BLOCK, blocks)
+}
+
+fn scaled_work(range: CompactRange, factor: f64) -> Result<CompactRange> {
+    CompactRange::new(
+        range.lower * factor,
+        range.expected * factor,
+        range.upper * factor,
+    )
 }
 
 fn runtime_filtered_probe_work(probe: CompactRange, build: CompactRange) -> Result<CompactRange> {
@@ -3531,7 +3632,11 @@ fn operator_tag(operator: LogicalOperatorType) -> u64 {
     }
 }
 
-fn planner_operator_cost(plan: &LogicalPlan, child_count: usize) -> Result<SearchCost> {
+fn planner_operator_cost(
+    plan: &LogicalPlan,
+    child_count: usize,
+    scan_access_cost: paro_storage::rowset::scan_cost::ScanAccessCostModel,
+) -> Result<SearchCost> {
     match &plan.operator {
         LogicalOperator::SearchScan(scan) => return search_decision_cost(&scan.decision),
         LogicalOperator::FullTextFilterScan(scan) => return search_decision_cost(&scan.decision),
@@ -3549,13 +3654,21 @@ fn planner_operator_cost(plan: &LogicalPlan, child_count: usize) -> Result<Searc
         .map(|cardinality| cardinality.expected as f64)
         .unwrap_or(1.0)
         .max(1.0);
-    let expected = expected_rows + child_count as f64;
-    let upper = plan
+    // Structural operators still move their output tuple. Pricing only row
+    // count makes a wide pre-TopN payload indistinguishable from a locator and
+    // systematically rejects a proven late-fetch alternative because RowFetch
+    // adds one node. Use a stable byte-work proxy until machine calibration
+    // publishes operator-specific structural coefficients.
+    let output_row_width = planner_row_width(plan, scan_access_cost);
+    let width_factor = (output_row_width as f64 / 32.0).max(1.0);
+    let expected = expected_rows * width_factor + child_count as f64;
+    let upper_rows = plan
         .stats
         .estimated_cardinality
         .map(|cardinality| cardinality.max as f64)
-        .unwrap_or(expected * 4.0)
-        .max(expected);
+        .unwrap_or(expected_rows * 4.0)
+        .max(expected_rows);
+    let upper = upper_rows * width_factor + child_count as f64;
     let mut cost = SearchCost {
         score: ScoreSummary {
             range: CompactRange::new(1.0, expected, upper)?,
@@ -3573,12 +3686,7 @@ fn planner_operator_cost(plan: &LogicalPlan, child_count: usize) -> Result<Searc
             LogicalOperator::Join(Join::Cross(cross)) => cross.right.as_ref(),
             _ => plan,
         };
-        let row_width = resident_plan
-            .types()
-            .iter()
-            .map(|logical_type| logical_type.type_size().max(1) as u64)
-            .sum::<u64>()
-            .saturating_add(32);
+        let row_width = planner_row_width(resident_plan, scan_access_cost);
         let resident_rows = resident_plan
             .stats
             .estimated_cardinality
@@ -3747,9 +3855,34 @@ mod tests {
         let mut product = LogicalPlan::synthetic(LogicalOperator::Join(Join::cross(left, right)));
         product.stats.estimated_cardinality = Some(CardinalityEstimate::exact(3_000_000_000));
 
-        let cost = planner_operator_cost(&product, 2).expect("cross-product cost");
+        let cost =
+            planner_operator_cost(&product, 2, Default::default()).expect("cross-product cost");
 
-        assert_eq!(cost.peak_memory_upper, 3 * (8 + 32));
+        assert_eq!(cost.peak_memory_upper, 3 * (8 + 8));
+    }
+
+    #[test]
+    fn calibrated_tuple_work_distinguishes_narrow_and_wide_intermediates() {
+        let facts = |width| PlannerCostFacts {
+            output_rows: CompactRange::point(1_000.0).unwrap(),
+            child_rows: vec![CompactRange::point(1_000.0).unwrap()].into_boxed_slice(),
+            child_row_widths: vec![width].into_boxed_slice(),
+            output_row_width: width,
+            perfect_hash_slots: None,
+        };
+        let calibrated_cost = |facts: &PlannerCostFacts| {
+            let mut work = LocalOperatorWork::default();
+            add_tuple_byte_work(&mut work, facts).unwrap();
+            MachineCalibrationBundle::default().fold(&work).unwrap()
+        };
+
+        let narrow = calibrated_cost(&facts(16));
+        let wide = calibrated_cost(&facts(128));
+        assert!(wide.score.risk_adjusted > narrow.score.risk_adjusted);
+        assert!(
+            wide.resources_expected[ResourceDimension::MemoryRead as usize]
+                > narrow.resources_expected[ResourceDimension::MemoryRead as usize]
+        );
     }
 
     #[test]
@@ -3884,7 +4017,7 @@ mod tests {
     }
 
     #[test]
-    fn certified_transformation_alternative_names_its_baseline_source() {
+    fn duplicate_seeded_transformation_does_not_report_an_effective_insertion() {
         let bind_context = BindContext::new();
         let baseline = constant_projection(&bind_context, 7);
         let alternative =
@@ -3895,10 +4028,12 @@ mod tests {
                 LogicalAlternative {
                     plan: baseline,
                     source: AlternativeOrigin::Baseline,
+                    column_stats: Arc::new(HashMap::new()),
                 },
                 LogicalAlternative {
                     plan: alternative,
                     source: AlternativeOrigin::Transformation { rule },
+                    column_stats: Arc::new(HashMap::new()),
                 },
             ],
             bind_context,
@@ -3907,7 +4042,86 @@ mod tests {
         .unwrap();
         assert_eq!(input.transformations.len(), 1);
         let optimized = input.optimize(&test_grant_classes()).unwrap();
-        assert_eq!(optimized.rule_firings.get(&rule), Some(&1));
+        assert_eq!(optimized.rule_insertions.get(&rule), None);
+    }
+
+    #[test]
+    fn incompatible_optional_transformation_cannot_abort_the_baseline() {
+        let bind_context = BindContext::new();
+        let baseline = constant_projection(&bind_context, 7);
+        let incompatible = LogicalPlan::new(
+            &bind_context,
+            LogicalOperator::Projection(Projection::new(
+                10,
+                LogicalPlan::dummy_scan(&bind_context),
+                vec![
+                    Expression::Constant(ConstantExpression::new(
+                        Value::Integer(7),
+                        LogicalType::Integer,
+                    )),
+                    Expression::Constant(ConstantExpression::new(
+                        Value::Integer(8),
+                        LogicalType::Integer,
+                    )),
+                ],
+            )),
+        );
+        let rule = super::super::ids::RuleId(42_002);
+        let optimized = MemoBuilder::build_alternatives(
+            vec![
+                LogicalAlternative {
+                    plan: baseline,
+                    source: AlternativeOrigin::Baseline,
+                    column_stats: Arc::new(HashMap::new()),
+                },
+                LogicalAlternative {
+                    plan: incompatible,
+                    source: AlternativeOrigin::Transformation { rule },
+                    column_stats: Arc::new(HashMap::new()),
+                },
+            ],
+            bind_context,
+            SearchBudget::default(),
+        )
+        .unwrap()
+        .optimize(&test_grant_classes())
+        .unwrap();
+
+        assert_eq!(
+            optimized.variants[0].plan.types(),
+            vec![LogicalType::Integer]
+        );
+        assert_eq!(optimized.rule_insertions.get(&rule), None);
+    }
+
+    #[test]
+    fn disabled_query_transformation_is_not_materialized_as_orphan_groups() {
+        let bind_context = BindContext::new();
+        let baseline = constant_projection(&bind_context, 7);
+        let alternative = constant_projection(&bind_context, 8);
+        let rule = super::super::ids::RuleId(42_003);
+        let mut budget = SearchBudget::default();
+        budget.disable_transformation(rule);
+        let input = MemoBuilder::build_alternatives(
+            vec![
+                LogicalAlternative {
+                    plan: baseline,
+                    source: AlternativeOrigin::Baseline,
+                    column_stats: Arc::new(HashMap::new()),
+                },
+                LogicalAlternative {
+                    plan: alternative,
+                    source: AlternativeOrigin::Transformation { rule },
+                    column_stats: Arc::new(HashMap::new()),
+                },
+            ],
+            bind_context,
+            budget,
+        )
+        .unwrap();
+
+        assert!(input.transformations.is_empty());
+        assert_eq!(input.memo.group_count(), 2);
     }
 
     #[test]
@@ -4147,6 +4361,54 @@ mod tests {
 
         assert!(supports_runtime_filter_auxiliary(&join, true));
         assert!(!supports_runtime_filter_auxiliary(&join, false));
+    }
+
+    #[test]
+    fn passthrough_projection_keeps_the_runtime_filter_consumer_lineage() {
+        let mut left = LogicalPlan::synthetic(LogicalOperator::Projection(Projection::new(
+            2,
+            test_base_get(0, 20_005, "projected_probe"),
+            vec![Expression::Reference(ReferenceExpression::new(
+                0,
+                LogicalType::Integer,
+            ))],
+        )));
+        left.stats.estimated_cardinality = Some(CardinalityEstimate::exact(20_000));
+        let mut right = test_base_get(1, 20_006, "build");
+        right.stats.estimated_cardinality = Some(CardinalityEstimate::exact(20));
+        let join = ComparisonJoin::new(
+            JoinType::Inner,
+            left,
+            right,
+            vec![JoinCondition::equality(
+                Expression::Reference(ReferenceExpression::new(0, LogicalType::Integer)),
+                Expression::Reference(ReferenceExpression::new(0, LogicalType::Integer)),
+            )],
+        );
+        assert!(supports_runtime_filter_auxiliary(&join, true));
+        let mut plan = LogicalPlan::synthetic(LogicalOperator::Join(Join::Comparison(join)));
+        plan.stats.estimated_cardinality = Some(CardinalityEstimate::exact(20));
+
+        let optimized = MemoBuilder::build(plan, BindContext::new(), SearchBudget::default())
+            .unwrap()
+            .optimize(&test_grant_classes())
+            .unwrap()
+            .variants
+            .into_vec()
+            .remove(0);
+        let physical = crate::physical::PhysicalPlanExtractor::new(
+            crate::physical::ExtractionContext::default(),
+        )
+        .with_winner_contracts(optimized.contracts)
+        .with_enforcer_contracts(optimized.enforcers)
+        .requiring_winner_contracts()
+        .extract(&optimized.plan)
+        .unwrap();
+        crate::physical::PhysicalPlanVerifier::verify(&physical).unwrap();
+        assert!(physical.edges.iter().any(|edge| matches!(
+            physical.node(edge.consumer).kind,
+            crate::physical::PhysicalNodeKind::RowsetScan(_)
+        )));
     }
 
     #[test]

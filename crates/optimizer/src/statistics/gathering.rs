@@ -142,10 +142,15 @@ impl StatisticsGathering {
                 }
                 let mut expected = 1u64;
                 let mut saw_known = false;
+                let mut distinct_upper = Some(1u64);
                 for group in &agg.groups {
-                    let distinct = estimate_group_distinct(group, ctx, child.expected);
-                    saw_known |= distinct != fallback_group_distinct(child.expected);
+                    let (distinct, upper) =
+                        estimate_group_distinct(group, ctx, child.expected, child.max);
+                    saw_known |= upper.is_some();
                     expected = saturating_mul_u64(expected, distinct.max(1)).min(child.expected);
+                    distinct_upper = distinct_upper
+                        .zip(upper)
+                        .map(|(current, upper)| saturating_mul_u64(current, upper).min(child.max));
                 }
                 if !saw_known {
                     expected = expected.min(child.expected);
@@ -168,8 +173,8 @@ impl StatisticsGathering {
                 let expected = base_expected
                     .saturating_mul(non_empty_domains)
                     .saturating_add(empty_domains);
-                let max = child
-                    .max
+                let max = distinct_upper
+                    .unwrap_or(child.max)
                     .saturating_mul(non_empty_domains)
                     .saturating_add(empty_domains)
                     .max(expected);
@@ -757,15 +762,32 @@ fn expression_statistics(expr: &Expression, ctx: &impl ColumnStatsView) -> Arc<C
     }
 }
 
-fn estimate_group_distinct(expr: &Expression, ctx: &impl ColumnStatsView, child_rows: u64) -> u64 {
+fn estimate_group_distinct(
+    expr: &Expression,
+    ctx: &impl ColumnStatsView,
+    child_expected_rows: u64,
+    child_max_rows: u64,
+) -> (u64, Option<u64>) {
     match expr {
-        Expression::ColumnRef(col_ref) => ctx
-            .get_stat(&col_ref.binding)
-            .map(|stats| stats.get_distinct_count() as u64)
-            .filter(|count| *count > 0)
-            .unwrap_or_else(|| fallback_group_distinct(child_rows)),
-        Expression::Constant(_) => 1,
-        _ => fallback_group_distinct(child_rows),
+        Expression::ColumnRef(col_ref) => {
+            let distinct = ctx
+                .get_stat(&col_ref.binding)
+                .map(|stats| stats.get_distinct_count() as u64)
+                .filter(|count| *count > 0);
+            match distinct {
+                // HLL is an estimate rather than a semantic bound. A 2x
+                // envelope remains conservative for planning while avoiding
+                // the useless input-cardinality upper bound that made a
+                // proven preaggregation look riskier than its unreduced join.
+                Some(distinct) => (
+                    distinct,
+                    Some(distinct.saturating_mul(2).min(child_max_rows).max(distinct)),
+                ),
+                None => (fallback_group_distinct(child_expected_rows), None),
+            }
+        }
+        Expression::Constant(_) => (1, Some(1)),
+        _ => (fallback_group_distinct(child_expected_rows), None),
     }
 }
 
@@ -1224,6 +1246,23 @@ mod tests {
         assert_eq!(
             gathered.stats.estimated_cardinality,
             Some(CardinalityEstimate::exact(0))
+        );
+    }
+
+    #[test]
+    fn known_group_distinct_count_has_a_finite_uncertainty_envelope() {
+        let bind_context = BindContext::new();
+        let session = make_test_session();
+        let mut ctx = OptimizationContext::new(session, bind_context);
+        let binding = ColumnBinding::new(1, 0);
+        let base = BaseStatistics::new(LogicalType::BigInt);
+        let mut stats = ColumnStatistics::new(base);
+        stats.update_distinct_statistics(&[11, 29], 2);
+        ctx.column_stats.insert(binding, Arc::new(stats));
+
+        assert_eq!(
+            estimate_group_distinct(&column_ref(1, 0), &ctx, 4_096, 4_096),
+            (2, Some(4))
         );
     }
 

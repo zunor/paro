@@ -99,18 +99,24 @@ impl Default for StableFingerprintBuilder {
 }
 
 impl StableFingerprintBuilder {
+    const BYTES_TAG: u8 = 1;
+    const U64_TAG: u8 = 2;
+    const FINGERPRINT_TAG: u8 = 3;
+
     pub fn write_bytes(&mut self, bytes: &[u8]) {
-        self.write_u64(bytes.len() as u64);
+        self.state.update([Self::BYTES_TAG]);
+        self.state.update((bytes.len() as u64).to_le_bytes());
         self.state.update(bytes);
     }
 
     pub fn write_u64(&mut self, value: u64) {
+        self.state.update([Self::U64_TAG]);
         self.state.update(value.to_le_bytes());
     }
 
     pub fn write_fingerprint(&mut self, value: Fingerprint) {
-        self.write_u64(value.0 as u64);
-        self.write_u64((value.0 >> 64) as u64);
+        self.state.update([Self::FINGERPRINT_TAG]);
+        self.state.update(value.0.to_le_bytes());
     }
 
     pub fn finish(self) -> Fingerprint {
@@ -141,5 +147,22 @@ mod tests {
         repeat.write_bytes(b"ab");
         repeat.write_bytes(b"c");
         assert_eq!(left.finish(), repeat.finish());
+    }
+
+    #[test]
+    fn fingerprint_fields_are_type_delimited() {
+        let mut bytes = StableFingerprintBuilder::default();
+        bytes.write_bytes(b"");
+        let mut integer = StableFingerprintBuilder::default();
+        integer.write_u64(0);
+        let mut fingerprint = StableFingerprintBuilder::default();
+        fingerprint.write_fingerprint(Fingerprint(0));
+
+        let bytes = bytes.finish();
+        let integer = integer.finish();
+        let fingerprint = fingerprint.finish();
+        assert_ne!(bytes, integer);
+        assert_ne!(integer, fingerprint);
+        assert_ne!(bytes, fingerprint);
     }
 }

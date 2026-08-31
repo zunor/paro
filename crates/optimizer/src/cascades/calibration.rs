@@ -21,6 +21,10 @@ pub const OP_ENFORCER_RANDOM_FETCH: OpClassId = OpClassId(20_003);
 pub const OP_ENFORCER_SPILL_PAGE: OpClassId = OpClassId(20_004);
 pub const OP_RUNTIME_FILTER_BUILD_ROW: OpClassId = OpClassId(11);
 pub const OP_RUNTIME_FILTER_APPLY_ROW: OpClassId = OpClassId(12);
+/// One 32-byte block read or written by a tuple-processing implementation.
+/// Keeping width in a separate class lets machine calibration vary memory
+/// bandwidth independently of the operator's row-oriented CPU work.
+pub const OP_TUPLE_BYTE_BLOCK: OpClassId = OpClassId(16);
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct WorkUnit {
@@ -210,6 +214,10 @@ impl Default for MachineCalibrationBundle {
         coefficients.insert(
             OP_RUNTIME_FILTER_APPLY_ROW,
             calibrated_dimension(ResourceDimension::Cpu, 0.1, 0.4, 0.1, 0.6),
+        );
+        coefficients.insert(
+            OP_TUPLE_BYTE_BLOCK,
+            calibrated_dimension(ResourceDimension::MemoryRead, 0.25, 1.0, 0.1, 0.5),
         );
         Self {
             revision: CalibrationRevisionId(0),

@@ -100,6 +100,25 @@ impl SearchBudget {
         !self.disabled_transformation_rules.contains(&rule)
     }
 
+    pub fn disable_transformations_by_name(
+        &mut self,
+        names: &str,
+    ) -> paro_common::error::Result<()> {
+        for name in names
+            .split(',')
+            .map(str::trim)
+            .filter(|name| !name.is_empty())
+        {
+            let rule = super::rules::transformation_rule_id(name).ok_or_else(|| {
+                paro_common::error::invalid_input(format!(
+                    "unknown optimizer transformation rule '{name}'"
+                ))
+            })?;
+            self.disable_transformation(rule);
+        }
+        Ok(())
+    }
+
     pub fn optional_limit(&self, dimension: BudgetDimension) -> u32 {
         match dimension {
             BudgetDimension::Group => self.max_optional_groups,
@@ -234,5 +253,17 @@ mod tests {
         right.admit_optional(BudgetDimension::RuleFirePerGroup, Fingerprint(2));
         left.merge_from(&right);
         assert_eq!(left.consumed(BudgetDimension::RuleFirePerGroup), 2);
+    }
+
+    #[test]
+    fn disable_rules_by_public_name_rejects_magic_or_unknown_values() {
+        let mut budget = SearchBudget::default();
+        budget
+            .disable_transformations_by_name("join_elimination, late_payload_fetch")
+            .unwrap();
+        assert!(!budget.transformation_enabled(super::super::rules::JOIN_ELIMINATION_RULE));
+        assert!(!budget.transformation_enabled(super::super::rules::LATE_PAYLOAD_FETCH_RULE));
+        assert!(budget.disable_transformations_by_name("10011").is_err());
+        assert!(budget.disable_transformations_by_name("missing").is_err());
     }
 }

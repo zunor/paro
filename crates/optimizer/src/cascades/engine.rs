@@ -145,6 +145,7 @@ pub struct CascadesEngine {
     active_goals: BTreeSet<(GroupId, OptimizationGoal)>,
     grant_class_sets: BTreeMap<ResourceGrantClassId, AdmissibleGrantSetId>,
     grant_sensitivity: BTreeMap<GroupId, GrantSensitivitySummary>,
+    effective_rule_insertions: BTreeMap<RuleId, u64>,
     region_candidates: BTreeMap<super::ids::RegionId, BTreeSet<Fingerprint>>,
 }
 
@@ -164,6 +165,7 @@ impl CascadesEngine {
             active_goals: BTreeSet::new(),
             grant_class_sets: BTreeMap::new(),
             grant_sensitivity: BTreeMap::new(),
+            effective_rule_insertions: BTreeMap::new(),
             region_candidates: BTreeMap::new(),
         }
     }
@@ -391,6 +393,8 @@ impl CascadesEngine {
                     .insert_logical(target, output.key, output.payload, output.proof)?;
                 let after = self.memo.group(target).unwrap().logical_exprs().len();
                 if after > before {
+                    *self.effective_rule_insertions.entry(rule).or_default() +=
+                        u64::try_from(after - before).unwrap_or(u64::MAX);
                     inserted_groups.insert(target);
                 }
             }
@@ -399,6 +403,10 @@ impl CascadesEngine {
             }
         }
         Ok(())
+    }
+
+    pub fn effective_rule_insertions(&self) -> &BTreeMap<RuleId, u64> {
+        &self.effective_rule_insertions
     }
 
     fn schedule_transformations(&self, group: GroupId, agenda: &mut StableAgenda) -> Result<()> {
@@ -695,9 +703,18 @@ impl CascadesEngine {
             let mut cost =
                 compose_candidate_cost(local_cost, &child_costs, recipe.cost_composition)?;
             let physical_properties = self.memo.physical_expr(physical).unwrap().provided.clone();
-            let enforced = self
+            let Some(enforced) = self
                 .enforcement
-                .canonical_baseline(physical_properties, &required)?;
+                .canonical_baseline(physical_properties, &required)?
+            else {
+                tracing::debug!(
+                    target: "paro::optimizer",
+                    memo_group = group.index(),
+                    physical_expression = physical.index(),
+                    "physical recipe rejected because its required enforcer is absent from the execution ABI"
+                );
+                continue;
+            };
             let Some(enforcer_cost) = enforcer_cost(
                 &enforced.steps,
                 recipe.enforcer_cost_input,

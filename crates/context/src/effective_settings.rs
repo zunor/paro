@@ -35,6 +35,13 @@ impl EffectiveSettings {
         matches!(self.get("optimizer_verify"), Some(Value::Boolean(true)))
     }
 
+    pub fn disabled_optimizer_rules(&self) -> &str {
+        match self.get("disabled_optimizer_rules") {
+            Some(Value::Varchar(value)) => value,
+            _ => "",
+        }
+    }
+
     pub fn force_external(&self) -> bool {
         matches!(self.get("force_external"), Some(Value::Boolean(true)))
     }
