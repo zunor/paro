@@ -346,6 +346,7 @@ impl SearchOptimizer {
                 stats: plan.stats,
                 operator: LogicalOperator::FullTextFilterScan(FullTextFilterScan {
                     get: get.clone(),
+                    projection_map: filter.projection_map.clone(),
                     request,
                     match_expression,
                     other_predicates,
@@ -1402,5 +1403,72 @@ mod tests {
             Get::new_without_table(1, vec!["body".to_string()], vec![LogicalType::Varchar]);
         get.append_matched_utf8_prefix(0, 2, LogicalType::Varchar);
         assert!(projection_spec(&get, false).is_none());
+    }
+
+    #[test]
+    fn fulltext_filter_scan_preserves_absorbed_filter_projection() {
+        let intent = FullTextIntent {
+            column_id: 1,
+            query: "graph".to_string(),
+            query_kind: FullTextQueryKind::Legacy,
+            query_stats: FullTextQueryStats::new(1),
+            config: "simple".to_string(),
+            score_mode: FullTextScoreMode::Bm25,
+        };
+        let scan = FullTextFilterScan {
+            get: Get::new_without_table(
+                7,
+                vec!["id".to_string(), "body".to_string(), "category".to_string()],
+                vec![
+                    LogicalType::Integer,
+                    LogicalType::Varchar,
+                    LogicalType::Varchar,
+                ],
+            ),
+            projection_map: vec![2, 0].into(),
+            request: NormalizedSearchRequest {
+                table_id: 1,
+                mode: SearchRequestMode::Filter,
+                predicate: None,
+                projections: ProjectionSpec {
+                    columns: vec![2, 0],
+                    include_score: false,
+                },
+                intents: vec![SearchIntent::FullText(intent.clone())],
+                fusion: None,
+            },
+            match_expression: Expression::Constant(ConstantExpression::new(
+                Value::Boolean(true),
+                LogicalType::Boolean,
+            )),
+            other_predicates: Vec::new(),
+            residual_predicates: Vec::new(),
+            decision: SearchDecision::IndexScan {
+                candidate: SearchCandidate {
+                    intent: SearchIntent::FullText(intent),
+                    token: paro_storage::search::CapabilityToken {
+                        definition_id: 1,
+                        generation_id: 1,
+                        root_version: 1,
+                        capability_state: paro_storage::search::SearchCapabilityState::Queryable,
+                    },
+                    kind: paro_storage::search::SearchIndexKind::FullText,
+                    estimated_cost: Some(PlannedSearchCostEstimate::new(1.0)),
+                    exact_filter_materialization: None,
+                },
+                confidence: Confidence::High,
+            },
+        };
+        let operator = LogicalOperator::FullTextFilterScan(scan);
+
+        assert_eq!(operator.output_names(), ["category", "id"]);
+        assert_eq!(
+            operator.types(),
+            [LogicalType::Varchar, LogicalType::Integer]
+        );
+        assert_eq!(
+            operator.get_column_bindings(),
+            [ColumnBinding::new(7, 2), ColumnBinding::new(7, 0)]
+        );
     }
 }

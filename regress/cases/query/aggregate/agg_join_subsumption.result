@@ -71,7 +71,7 @@ ORDER_BY  (rows=9)
               Columns: order_key, quantity
           ->  PROJECTION  (rows=3)
             Output: order_key
-            ->  AGGREGATE  (rows=3)
+            ->  AGGREGATE  (rows=4)
               Group Key: public.agg_sub_detail.order_key
               Aggregates: sum(public.agg_sub_detail.quantity)
               ->  ROWSET_SCAN on public.agg_sub_detail  (rows=8)

@@ -75,16 +75,25 @@ PROJECTION  (rows=2)
   Output: d.payload, row_count, total_amount, kept_amount
   ->  AGGREGATE  (rows=2)
     Group Key: d.payload
-    Aggregates: count_star(*), sum(f.amount), sum(f.amount) FILTER (WHERE f.keep)
-    ->  HASH_JOIN  (rows=4266)
+    Aggregates: count_partial_merge(count_star(*)), sum_partial_merge(sum(f.amount)), sum_partial_merge(sum(f.amount) FILTER (WHERE f.keep))
+    ->  HASH_JOIN  (rows=4)
       Join Type: INNER
-      Runtime Filter: wait_complete artifact=83fe4c622a033c4767b0a4e66f576500
       Build Index: integer_build_time
       Join Condition: f.key_a = d.key_a
-      ->  ROWSET_SCAN on public.agg_defer_fact f  (rows=5333)
-        Columns: key_a, amount, keep
-        Pushed Predicate: key_a <= 4
-        Late Materialize: auto
+      ->  AGGREGATE  (rows=5)
+        Group Key: f.key_a
+        Aggregates: count_star(*), sum(f.amount), sum(f.amount) FILTER (WHERE f.keep)
+        ->  HASH_JOIN  (rows=4266)
+          Join Type: INNER
+          Runtime Filter: wait_complete artifact=c4128d2524902da19549e11a809d153d
+          Build Index: integer_build_time
+          Join Condition: f.key_a = d.key_a
+          ->  ROWSET_SCAN on public.agg_defer_fact f  (rows=5333)
+            Columns: key_a, amount, keep
+            Pushed Predicate: key_a <= 4
+            Late Materialize: auto
+          ->  ROWSET_SCAN on public.agg_defer_plan_dimension d  (rows=4)
+            Columns: key_a
       ->  ROWSET_SCAN on public.agg_defer_plan_dimension d  (rows=4)
         Columns: key_a, payload
 

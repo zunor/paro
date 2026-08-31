@@ -228,7 +228,9 @@ impl LogicalOperator {
             LogicalOperator::CTERef(op) => op.column_names.clone(),
             LogicalOperator::TableFunctionGet(op) => op.get_names(),
             LogicalOperator::SearchScan(op) => op.output_names.clone(),
-            LogicalOperator::FullTextFilterScan(op) => op.get.names.clone(),
+            LogicalOperator::FullTextFilterScan(op) => {
+                project_names(&op.get.names, &op.projection_map)
+            }
             LogicalOperator::CopyTo(copy) => copy.names.clone(),
             LogicalOperator::GraphMatch(gm) => {
                 gm.columns.iter().map(|col| col.alias.clone()).collect()
@@ -792,7 +794,15 @@ impl LogicalOperator {
                 search.projections.len(),
             ),
             LogicalOperator::FullTextFilterScan(scan) => {
-                Self::generate_column_bindings(scan.get.table_index, scan.get.returned_types.len())
+                let input = Self::generate_column_bindings(
+                    scan.get.table_index,
+                    scan.get.returned_types.len(),
+                );
+                scan.projection_map
+                    .to_indices(input.len())
+                    .into_iter()
+                    .filter_map(|index| input.get(index).copied())
+                    .collect()
             }
             LogicalOperator::CopyTo(copy) => {
                 // CopyTo returns row count (or other COPY return types)

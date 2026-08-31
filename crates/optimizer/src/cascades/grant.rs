@@ -1,3 +1,6 @@
+// Copyright 2024-2026 Zunor
+// SPDX-License-Identifier: Apache-2.0
+
 //! Conservative grant-sensitivity closure and cross-class goal sharing.
 
 use std::collections::BTreeSet;

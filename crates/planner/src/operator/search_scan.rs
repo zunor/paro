@@ -17,7 +17,7 @@ pub type FullTextQueryStatsKind = FullTextQueryKind;
 
 use crate::expression::Expression;
 
-use super::Get;
+use super::{Get, ProjectionMap};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Confidence {
@@ -123,6 +123,11 @@ impl SearchScan {
 #[derive(Debug, Clone)]
 pub struct FullTextFilterScan {
     pub get: Get,
+    /// Columns retained from the absorbed filter's input layout.
+    ///
+    /// Predicate expressions continue to bind against the complete embedded
+    /// `Get`; only the scan's visible output is projected.
+    pub projection_map: ProjectionMap,
     pub request: NormalizedSearchRequest,
     pub match_expression: Expression,
     pub other_predicates: Vec<Expression>,
@@ -132,6 +137,10 @@ pub struct FullTextFilterScan {
 
 impl FullTextFilterScan {
     pub fn get_types(&self) -> Vec<LogicalType> {
-        self.get.returned_types.clone()
+        self.projection_map
+            .to_indices(self.get.returned_types.len())
+            .into_iter()
+            .filter_map(|index| self.get.returned_types.get(index).cloned())
+            .collect()
     }
 }

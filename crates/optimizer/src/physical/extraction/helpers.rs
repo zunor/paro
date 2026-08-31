@@ -535,7 +535,15 @@ fn physical_column_identities(
                         .unwrap_or(ColumnIdentity::Internal)
                 })
                 .collect(),
-            LogicalOperator::FullTextFilterScan(search) => get_column_identities(&search.get),
+            LogicalOperator::FullTextFilterScan(search) => {
+                let identities = get_column_identities(&search.get);
+                search
+                    .projection_map
+                    .to_indices(search.get.returned_types.len())
+                    .into_iter()
+                    .filter_map(|index| identities.get(index).cloned())
+                    .collect()
+            }
             _ => fallback(),
         },
         PhysicalNodeKind::RowFetch(spec) => {

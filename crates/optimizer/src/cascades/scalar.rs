@@ -1,3 +1,6 @@
+// Copyright 2024-2026 Zunor
+// SPDX-License-Identifier: Apache-2.0
+
 //! Immutable, hash-consed scalar DAG kept outside the relational Memo.
 
 use std::collections::{BTreeMap, BTreeSet};

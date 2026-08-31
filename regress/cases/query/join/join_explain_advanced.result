@@ -193,7 +193,7 @@ PROJECTION  (rows=5)
     Build Index: integer_build_time
     Join Condition: l.k = r.k
     Cardinality: [5, 5, 5]
-    Output Schema: l.k INTEGER, r.k INTEGER, r.payload VARCHAR
+    Output Schema: l.k INTEGER, r.payload VARCHAR
     ->  ROWSET_SCAN on public.join_explain_hash_l l  (rows=5)
       Columns: k
       Cardinality: [5, 5, 5]

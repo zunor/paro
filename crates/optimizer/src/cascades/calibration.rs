@@ -1,3 +1,6 @@
+// Copyright 2024-2026 Zunor
+// SPDX-License-Identifier: Apache-2.0
+
 //! Extensible operator-work registry folded into fixed machine resources.
 
 use std::collections::BTreeMap;

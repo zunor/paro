@@ -74,7 +74,7 @@ PROJECTION  (rows=1)
   ->  FILTER  (rows=1)
     Filter: fulltext_match(public.search_opt_docs.content, 'graph database')
     Cardinality: [0, 1, 1]
-    Output Schema: public.search_opt_docs.id INTEGER, public.search_opt_docs.category VARCHAR, public.search_opt_docs.content VARCHAR
+    Output Schema: public.search_opt_docs.id INTEGER
     ->  ROWSET_SCAN on public.search_opt_docs  (rows=4)
       Columns: id, category, content
       Pushed Predicate: category = 'tech'

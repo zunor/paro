@@ -1,3 +1,6 @@
+// Copyright 2024-2026 Zunor
+// SPDX-License-Identifier: Apache-2.0
+
 //! Immutable resource-grant plan portfolios and deterministic admission.
 
 use std::collections::{BTreeMap, BTreeSet};

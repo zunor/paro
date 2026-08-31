@@ -1,8 +1,11 @@
+// Copyright 2024-2026 Zunor
+// SPDX-License-Identifier: Apache-2.0
+
 //! Deterministic multidimensional search budgets.
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use super::ids::Fingerprint;
+use super::ids::{Fingerprint, RuleId};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum BudgetDimension {
@@ -25,6 +28,10 @@ pub enum BudgetDimension {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SearchBudget {
+    /// Emergency isolation surface for a faulty optional equivalence rule.
+    /// Mandatory normalization and baseline implementations are not rules and
+    /// cannot be disabled through this set.
+    pub disabled_transformation_rules: BTreeSet<RuleId>,
     pub max_optional_groups: u32,
     pub max_optional_logical_exprs_per_group: u32,
     pub max_optional_physical_exprs_per_group: u32,
@@ -53,6 +60,7 @@ pub struct SearchBudget {
 impl Default for SearchBudget {
     fn default() -> Self {
         Self {
+            disabled_transformation_rules: BTreeSet::new(),
             max_optional_groups: 4_096,
             max_optional_logical_exprs_per_group: 64,
             max_optional_physical_exprs_per_group: 64,
@@ -61,7 +69,7 @@ impl Default for SearchBudget {
             max_join_connected_pairs: 65_536,
             max_join_exact_relations: 12,
             join_beam_width: 64,
-            max_graph_frontiers: 4_096,
+            max_graph_frontiers: 8,
             max_factorization_variants: 16,
             max_multiway_join_candidates: 16,
             max_search_candidates: 32,
@@ -75,12 +83,23 @@ impl Default for SearchBudget {
             max_optional_enforcer_depth: 8,
             max_optional_enforcer_chains_per_goal: 8,
             max_pareto_winners_per_goal: 8,
-            max_grant_classes: 3,
+            // CompiledStatement currently stores one admitted runtime program,
+            // not the portfolio. Do not pay for variants that cannot survive
+            // compilation; raise this only when runtime admission owns them.
+            max_grant_classes: 1,
         }
     }
 }
 
 impl SearchBudget {
+    pub fn disable_transformation(&mut self, rule: RuleId) {
+        self.disabled_transformation_rules.insert(rule);
+    }
+
+    pub fn transformation_enabled(&self, rule: RuleId) -> bool {
+        !self.disabled_transformation_rules.contains(&rule)
+    }
+
     pub fn optional_limit(&self, dimension: BudgetDimension) -> u32 {
         match dimension {
             BudgetDimension::Group => self.max_optional_groups,

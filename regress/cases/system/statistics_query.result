@@ -50,7 +50,7 @@ PROJECTION  (rows=0)
     Build Index: integer_build_time
     Join Condition: s.id = b.id
     Cardinality: [0, 0, 1]
-    Output Schema: s.id INTEGER, b.id INTEGER, b.payload VARCHAR
+    Output Schema: s.id INTEGER, b.payload VARCHAR
     ->  ROWSET_SCAN on public.stats_small s  (rows=1)
       Columns: id
       Cardinality: [1, 1, 1]

@@ -61,10 +61,9 @@ PROJECTION  (rows=1)
     Cardinality: [1, 1, 1]
     Output Schema: aggregate_state_1 BIGINT
     ->  ROWSET_SCAN on public.rowset_pushdown_case  (rows=6)
-      Columns: k
       Pushed Predicate: k = 3
       Cardinality: [3, 6, 10]
-      Output Schema: public.rowset_pushdown_case.k INTEGER
+      Output Schema: (none)
 
 EXPLAIN (VERBOSE)
 SELECT payload FROM rowset_pushdown_case WHERE k = 3;
@@ -74,11 +73,11 @@ PROJECTION  (rows=6)
   Cardinality: [3, 6, 10]
   Output Schema: payload VARCHAR
   ->  ROWSET_SCAN on public.rowset_pushdown_case  (rows=6)
-    Columns: k, payload
+    Columns: payload
     Pushed Predicate: k = 3
     Late Materialize: auto
     Cardinality: [3, 6, 10]
-    Output Schema: public.rowset_pushdown_case.k INTEGER, public.rowset_pushdown_case.payload VARCHAR
+    Output Schema: public.rowset_pushdown_case.payload VARCHAR
 
 EXPLAIN (VERBOSE)
 SELECT COUNT(*) FROM rowset_pushdown_case WHERE k >= 2 AND k < 5;
@@ -92,10 +91,9 @@ PROJECTION  (rows=1)
     Cardinality: [1, 1, 1]
     Output Schema: aggregate_state_1 BIGINT
     ->  ROWSET_SCAN on public.rowset_pushdown_case  (rows=19)
-      Columns: k
       Pushed Predicate: k >= 2 AND k < 5
       Cardinality: [9, 19, 29]
-      Output Schema: public.rowset_pushdown_case.k INTEGER
+      Output Schema: (none)
 
 EXPLAIN (VERBOSE)
 SELECT COUNT(*) FROM rowset_pushdown_case WHERE k IN (1, 4, 9);
@@ -109,10 +107,9 @@ PROJECTION  (rows=1)
     Cardinality: [1, 1, 1]
     Output Schema: aggregate_state_1 BIGINT
     ->  ROWSET_SCAN on public.rowset_pushdown_case  (rows=19)
-      Columns: k
       Pushed Predicate: k IN (1, 4, 9)
       Cardinality: [9, 19, 29]
-      Output Schema: public.rowset_pushdown_case.k INTEGER
+      Output Schema: (none)
 
 EXPLAIN (VERBOSE)
 SELECT COUNT(*) FROM rowset_pushdown_case WHERE nullable_k IS NULL;
@@ -126,10 +123,9 @@ PROJECTION  (rows=1)
     Cardinality: [1, 1, 1]
     Output Schema: aggregate_state_1 BIGINT
     ->  ROWSET_SCAN on public.rowset_pushdown_case  (rows=6)
-      Columns: nullable_k
       Pushed Predicate: nullable_k IS NULL
       Cardinality: [3, 6, 10]
-      Output Schema: public.rowset_pushdown_case.nullable_k INTEGER
+      Output Schema: (none)
 
 EXPLAIN (VERBOSE)
 SELECT COUNT(*)
@@ -146,7 +142,7 @@ PROJECTION  (rows=1)
     Output Schema: aggregate_state_1 BIGINT
     ->  HASH_JOIN  (rows=13)
       Join Type: INNER
-      Runtime Filter: wait_complete artifact=c1a19997d4d3544a18bbfedb8968c400
+      Runtime Filter: wait_complete artifact=d197f1f371553df1c1399483e63efda6
       Build Index: integer_build_time
       Join Condition: c.k = d.k
       Cardinality: [13, 13, 13]

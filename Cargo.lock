@@ -1730,6 +1730,7 @@ dependencies = [
  "paro-planner",
  "paro-storage",
  "serde_json",
+ "sha2",
  "tracing",
 ]
 

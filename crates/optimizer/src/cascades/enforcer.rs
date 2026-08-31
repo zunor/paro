@@ -1,3 +1,6 @@
+// Copyright 2024-2026 Zunor
+// SPDX-License-Identifier: Apache-2.0
+
 //! Finite property enforcement: one canonical baseline plus registered recipes.
 
 use std::collections::{BTreeMap, BTreeSet};
@@ -40,6 +43,46 @@ pub enum EnforcerStep {
     Flatten,
     Factorize(super::ids::FactorizationSpecId),
     Spool,
+}
+
+/// Physical conversions implemented by the current execution ABI.
+///
+/// Search owns this capability boundary: an enforcer that cannot be lowered
+/// must never become a costed candidate or winner and fail later in extraction.
+#[derive(Debug, Clone, Copy)]
+struct ExecutableEnforcers {
+    all: bool,
+}
+
+impl ExecutableEnforcers {
+    const LOCAL_RUNTIME: Self = Self { all: false };
+
+    #[cfg(test)]
+    const ALL: Self = Self { all: true };
+
+    fn supports(self, step: &EnforcerStep) -> bool {
+        if self.all {
+            return true;
+        }
+        match step {
+            EnforcerStep::Sort(ordering) => {
+                ordering.scope == OrderingScope::Global
+                    && ordering.keys.iter().all(|key| key.collation.is_none())
+            }
+            EnforcerStep::MutationInputSpool { .. } => true,
+            EnforcerStep::Gather
+            | EnforcerStep::RepartitionHash { .. }
+            | EnforcerStep::RepartitionRange { .. }
+            | EnforcerStep::LocalSort(_)
+            | EnforcerStep::MergeGather(_)
+            | EnforcerStep::PrepareOrderedFetch(_)
+            | EnforcerStep::Fetch { .. }
+            | EnforcerStep::FetchPreservingOrder { .. }
+            | EnforcerStep::Flatten
+            | EnforcerStep::Factorize(_)
+            | EnforcerStep::Spool => false,
+        }
+    }
 }
 
 impl EnforcerStep {
@@ -287,6 +330,7 @@ pub struct EnforcementPlanner {
     max_optional_depth: u8,
     max_optional_chains: u8,
     seen_recipes: BTreeSet<Fingerprint>,
+    executable: ExecutableEnforcers,
 }
 
 impl EnforcementPlanner {
@@ -296,7 +340,25 @@ impl EnforcementPlanner {
             max_optional_depth,
             max_optional_chains,
             seen_recipes: BTreeSet::new(),
+            executable: ExecutableEnforcers::LOCAL_RUNTIME,
         }
+    }
+
+    #[cfg(test)]
+    fn with_all_for_test(max_optional_depth: u8, max_optional_chains: u8) -> Self {
+        Self {
+            executable: ExecutableEnforcers::ALL,
+            ..Self::new(max_optional_depth, max_optional_chains)
+        }
+    }
+
+    fn verify_executable(&self, steps: &[EnforcerStep]) -> Result<()> {
+        if steps.iter().all(|step| self.executable.supports(step)) {
+            return Ok(());
+        }
+        Err(paro_error::internal(
+            "property goal requires an enforcer absent from the execution ABI",
+        ))
     }
 
     pub fn register(&mut self, template: EnforcerRecipeTemplate) -> Result<()> {
@@ -394,6 +456,7 @@ impl EnforcementPlanner {
                 "canonical enforcer baseline failed to satisfy the goal",
             ));
         }
+        self.verify_executable(&steps)?;
         Ok(EnforcedPlan {
             steps: steps.into_boxed_slice(),
             provided: state,
@@ -418,6 +481,7 @@ impl EnforcementPlanner {
                 "enforcer recipe exceeds its registered static bound",
             ));
         }
+        self.verify_executable(&recipe.steps)?;
         let fingerprint = recipe.fingerprint();
         if self.seen_recipes.contains(&fingerprint) {
             return Ok(None);
@@ -521,7 +585,7 @@ mod tests {
 
     #[test]
     fn canonical_baseline_is_finite_and_satisfies_goal() {
-        let planner = EnforcementPlanner::new(8, 8);
+        let planner = EnforcementPlanner::with_all_for_test(8, 8);
         let plan = planner
             .canonical_baseline(provided(), &required_global_order())
             .unwrap();
@@ -531,7 +595,7 @@ mod tests {
 
     #[test]
     fn registered_recipe_may_have_zero_property_progress_first_step() {
-        let mut planner = EnforcementPlanner::new(4, 4);
+        let mut planner = EnforcementPlanner::with_all_for_test(4, 4);
         planner
             .register(EnforcerRecipeTemplate {
                 id: EnforcerRecipeId(1),

@@ -1,6 +1,11 @@
+// Copyright 2024-2026 Zunor
+// SPDX-License-Identifier: Apache-2.0
+
 //! Stable, arena-local optimizer identifiers shared with extracted plans.
 
 use std::fmt;
+
+use sha2::{Digest, Sha256};
 
 macro_rules! id_type {
     ($name:ident) => {
@@ -53,10 +58,6 @@ id_type!(EnforcerRecipeId);
 id_type!(RegionId);
 id_type!(FactorizationSpecId);
 id_type!(QualityPolicyId);
-id_type!(UncertaintySetId);
-id_type!(UncertaintySummaryId);
-id_type!(ErrorFactorId);
-id_type!(ProgressSummaryId);
 id_type!(BaseRelationId);
 id_type!(SnapshotId);
 id_type!(MutationBarrierId);
@@ -64,11 +65,8 @@ id_type!(StableReadProofId);
 id_type!(LocatorKindId);
 id_type!(CollationId);
 id_type!(ExternalWorkerRequirementSetId);
-id_type!(ExternalWorkerPoolClassId);
 id_type!(OpClassId);
-id_type!(RoutineCostProfileId);
 id_type!(CalibrationRevisionId);
-id_type!(StatisticsSnapshotId);
 
 /// Stable structural identity. Construction must use [`StableFingerprintBuilder`]
 /// rather than `DefaultHasher`, whose seed/algorithm is not a plan contract.
@@ -81,43 +79,33 @@ impl fmt::Debug for Fingerprint {
     }
 }
 
-/// Small deterministic FNV-1a based builder. This is an identity hash, not a
-/// cryptographic digest; equality is always confirmed from canonical keys.
+/// Deterministic, domain-delimited structural identity builder.
+///
+/// Logical operator fingerprints are themselves part of Memo equality, so a
+/// collision cannot rely on a later structural comparison to repair it. Use a
+/// cryptographic digest and retain 128 bits rather than composing correlated
+/// non-cryptographic lanes.
 #[derive(Debug, Clone)]
 pub struct StableFingerprintBuilder {
-    high: u64,
-    low: u64,
+    state: Sha256,
 }
 
 impl Default for StableFingerprintBuilder {
     fn default() -> Self {
-        Self {
-            high: 0xcbf29ce484222325,
-            low: 0x84222325cbf29ce4,
-        }
+        let mut state = Sha256::new();
+        state.update(b"paro.stable-fingerprint.v2");
+        Self { state }
     }
 }
 
 impl StableFingerprintBuilder {
-    const PRIME: u64 = 0x100000001b3;
-
     pub fn write_bytes(&mut self, bytes: &[u8]) {
         self.write_u64(bytes.len() as u64);
-        for &byte in bytes {
-            self.high ^= byte as u64;
-            self.high = self.high.wrapping_mul(Self::PRIME);
-            self.low ^= (byte as u64).rotate_left(1);
-            self.low = self.low.wrapping_mul(Self::PRIME.rotate_left(7));
-        }
+        self.state.update(bytes);
     }
 
     pub fn write_u64(&mut self, value: u64) {
-        for byte in value.to_le_bytes() {
-            self.high ^= byte as u64;
-            self.high = self.high.wrapping_mul(Self::PRIME);
-            self.low ^= (byte as u64).rotate_left(1);
-            self.low = self.low.wrapping_mul(Self::PRIME.rotate_left(7));
-        }
+        self.state.update(value.to_le_bytes());
     }
 
     pub fn write_fingerprint(&mut self, value: Fingerprint) {
@@ -126,7 +114,10 @@ impl StableFingerprintBuilder {
     }
 
     pub fn finish(self) -> Fingerprint {
-        Fingerprint(((self.high as u128) << 64) | self.low as u128)
+        let digest = self.state.finalize();
+        let mut bytes = [0_u8; 16];
+        bytes.copy_from_slice(&digest[..16]);
+        Fingerprint(u128::from_le_bytes(bytes))
     }
 }
 

@@ -1,3 +1,6 @@
+// Copyright 2024-2026 Zunor
+// SPDX-License-Identifier: Apache-2.0
+
 //! Crate-local vocabulary for the optimizer-produced immutable physical plan.
 //!
 //! The public owner is `paro_optimizer::physical`; execution keeps this alias

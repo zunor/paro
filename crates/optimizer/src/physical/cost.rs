@@ -1,8 +1,11 @@
+// Copyright 2024-2026 Zunor
+// SPDX-License-Identifier: Apache-2.0
+
 //! Fixed-size search cost used in the Memo hot path and extracted plans.
 
 use paro_common::error::{self as paro_error, Result};
 
-use super::identity::{ExternalWorkerRequirementSetId, ProgressSummaryId, UncertaintySummaryId};
+use super::identity::ExternalWorkerRequirementSetId;
 
 pub const RESOURCE_DIMS: usize = 6;
 
@@ -105,8 +108,6 @@ pub struct SearchCost {
     pub spill_bytes_expected: u64,
     pub external_workers: ExternalWorkerRequirementSetId,
     pub external_worker_slots_upper: u16,
-    pub uncertainty: UncertaintySummaryId,
-    pub progress: ProgressSummaryId,
 }
 
 impl SearchCost {
@@ -122,8 +123,6 @@ impl SearchCost {
         spill_bytes_expected: 0,
         external_workers: ExternalWorkerRequirementSetId(0),
         external_worker_slots_upper: 0,
-        uncertainty: UncertaintySummaryId(0),
-        progress: ProgressSummaryId(0),
     };
 
     pub fn validate(&self) -> Result<()> {
@@ -196,8 +195,6 @@ impl SearchCost {
             external_worker_slots_upper: self
                 .external_worker_slots_upper
                 .max(other.external_worker_slots_upper),
-            uncertainty: other.uncertainty,
-            progress: other.progress,
         };
         result.validate()?;
         Ok(result)

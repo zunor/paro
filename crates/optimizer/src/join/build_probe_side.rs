@@ -1,23 +1,29 @@
 // Copyright 2024-2026 Zunor
 // SPDX-License-Identifier: Apache-2.0
 
-//! Build/probe-side optimizer.
+//! Shared join build-side work model and legality policy.
 //!
-//! estimation to keep delim joins and regular comparison joins on the cheaper
-//! build side, while preserving join semantics when children are swapped.
+//! Production join enumeration consumes the free functions in this module.
+//! The former tree-rewriting optimizer remains test-only so physical
+//! orientation cannot be selected outside Memo.
 
+#[cfg(test)]
 use std::sync::Arc;
 
 use paro_common::types::LogicalType;
 use paro_context::StatementContext;
-use paro_planner::operator::{Join, JoinType, LogicalOperator, ProjectionMap};
+use paro_planner::operator::{Join, LogicalOperator};
+#[cfg(test)]
+use paro_planner::operator::{JoinType, ProjectionMap};
 use paro_planner::plan::LogicalPlan;
 
 /// Choose a cheaper build side for joins.
+#[cfg(test)]
 pub struct BuildProbeSideOptimizer {
     session: Arc<StatementContext>,
 }
 
+#[cfg(test)]
 impl BuildProbeSideOptimizer {
     pub fn new(session: Arc<StatementContext>) -> Self {
         Self { session }
@@ -249,6 +255,7 @@ pub(crate) enum JoinBuildSide {
 
 /// Return the logical filtering input of a reduction join in its current
 /// physical child coordinates.
+#[cfg(test)]
 pub(crate) fn reduction_filtering_side(join_type: JoinType) -> Option<JoinBuildSide> {
     match join_type {
         JoinType::Semi | JoinType::Anti => Some(JoinBuildSide::Right),
@@ -293,6 +300,7 @@ pub(crate) fn choose_join_build_side(
 /// Estimate the bytes carried by one intermediate execution row.
 ///
 /// Used by the final build/probe pass for cross products and tests.
+#[cfg(test)]
 pub(crate) fn estimate_row_width(types: &[LogicalType]) -> usize {
     estimate_row_width_from_payload(estimate_row_payload_width(types))
 }

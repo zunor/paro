@@ -7,5 +7,4 @@ pub(crate) mod aggregate_filter;
 pub mod cost;
 pub mod gathering;
 pub mod propagator;
-pub mod segment_pruner;
 pub(crate) mod unique_keys;

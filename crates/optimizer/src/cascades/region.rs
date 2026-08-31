@@ -1,3 +1,6 @@
+// Copyright 2024-2026 Zunor
+// SPDX-License-Identifier: Apache-2.0
+
 //! Laminar planning-region ownership and optional-facet admission.
 
 use std::collections::BTreeSet;

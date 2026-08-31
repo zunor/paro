@@ -1,3 +1,6 @@
+// Copyright 2024-2026 Zunor
+// SPDX-License-Identifier: Apache-2.0
+
 //! Deterministic mandatory-baseline plus bounded optional Cascades search.
 
 use std::collections::{BTreeMap, BTreeSet};
@@ -138,6 +141,7 @@ pub struct CascadesEngine {
     enforcement: EnforcementPlanner,
     recipes: BTreeMap<(PhysicalExprId, OptimizationGoal, Fingerprint), CostRecipe>,
     implemented_goals: BTreeSet<(GroupId, OptimizationGoal)>,
+    infeasible_goals: BTreeSet<(GroupId, OptimizationGoal)>,
     active_goals: BTreeSet<(GroupId, OptimizationGoal)>,
     grant_class_sets: BTreeMap<ResourceGrantClassId, AdmissibleGrantSetId>,
     grant_sensitivity: BTreeMap<GroupId, GrantSensitivitySummary>,
@@ -156,6 +160,7 @@ impl CascadesEngine {
             ),
             recipes: BTreeMap::new(),
             implemented_goals: BTreeSet::new(),
+            infeasible_goals: BTreeSet::new(),
             active_goals: BTreeSet::new(),
             grant_class_sets: BTreeMap::new(),
             grant_sensitivity: BTreeMap::new(),
@@ -187,7 +192,7 @@ impl CascadesEngine {
             .group(root)
             .and_then(|group| group.winner(goal))
             .cloned()
-            .ok_or_else(|| paro_error::internal("optimizer completed without a root winner"))
+            .ok_or_else(|| self.infeasible_goal_error(root, goal))
     }
 
     /// Optimize a bounded set of grant classes while sharing the complete
@@ -320,6 +325,23 @@ impl CascadesEngine {
             else {
                 unreachable!("transformation agenda contains implementation task")
             };
+            let matches = {
+                let rule_impl = self
+                    .registry
+                    .transformation(rule)
+                    .ok_or_else(|| paro_error::internal("rule disappeared from registry"))?;
+                let expression_ref = self.memo.logical_expr(expression).ok_or_else(|| {
+                    paro_error::internal("rule task references unknown expression")
+                })?;
+                let context = RuleContext {
+                    memo: &self.memo,
+                    group,
+                };
+                rule_impl.matches(expression_ref, &context)
+            };
+            if !matches {
+                continue;
+            }
             if !self.memo.mark_rule_applied(expression, rule)? {
                 continue;
             }
@@ -338,16 +360,10 @@ impl CascadesEngine {
                     .registry
                     .transformation(rule)
                     .ok_or_else(|| paro_error::internal("rule disappeared from registry"))?;
-                let expression_ref = self.memo.logical_expr(expression).ok_or_else(|| {
-                    paro_error::internal("rule task references unknown expression")
-                })?;
                 let context = RuleContext {
                     memo: &self.memo,
                     group,
                 };
-                if !rule_impl.matches(expression_ref, &context) {
-                    continue;
-                }
                 rule_impl.apply(expression, &context)?
             };
             let mut inserted_groups = BTreeSet::new();
@@ -397,6 +413,9 @@ impl CascadesEngine {
                 group,
             };
             for rule in self.registry.transformations() {
+                if !self.memo.budget().transformation_enabled(rule.id()) {
+                    continue;
+                }
                 let promise = rule.promise(expression_ref, &context);
                 let key = TaskKey {
                     priority: promise.priority,
@@ -577,6 +596,7 @@ impl CascadesEngine {
             .group(group)
             .and_then(|group| group.winner(goal))
             .is_some()
+            || self.infeasible_goals.contains(&(group, goal))
         {
             return Ok(());
         }
@@ -587,6 +607,15 @@ impl CascadesEngine {
         }
         let result = self.optimize_group_inner(group, goal);
         self.active_goals.remove(&(group, goal));
+        if result.is_ok()
+            && self
+                .memo
+                .group(group)
+                .and_then(|group| group.winner(goal))
+                .is_none()
+        {
+            self.infeasible_goals.insert((group, goal));
+        }
         result
     }
 
@@ -597,30 +626,52 @@ impl CascadesEngine {
             .required(goal.required)
             .ok_or_else(|| paro_error::internal("optimization goal has unknown properties"))?
             .clone();
-        let recipes: Vec<_> = self
-            .recipes
-            .iter()
-            .filter(|((physical, recipe_goal, _), _)| {
-                *recipe_goal == goal && self.memo.physical_owner(*physical) == Some(group)
-            })
-            .map(|((physical, _, _), recipe)| (*physical, recipe.clone()))
-            .collect();
-        if recipes.is_empty() {
-            return Err(paro_error::internal(
-                "no mandatory physical implementation exists for a Memo group",
-            ));
+        // The recipe key is physical-expression first. Walk only the physical
+        // expressions owned by this group and use bounded BTree ranges instead
+        // of scanning the global recipe table for every (group, goal).
+        let physical_exprs = self
+            .memo
+            .group(group)
+            .ok_or_else(|| paro_error::internal("unknown group during recipe lookup"))?
+            .physical_exprs()
+            .to_vec();
+        let mut recipes = Vec::new();
+        for &physical in &physical_exprs {
+            recipes.extend(
+                self.recipes
+                    .range(
+                        (physical, goal, Fingerprint::default())
+                            ..=(physical, goal, Fingerprint(u128::MAX)),
+                    )
+                    .map(|((physical, _, _), recipe)| (*physical, recipe.clone())),
+            );
         }
         for (physical, recipe) in recipes {
             let mut child_costs = Vec::with_capacity(recipe.child_goals.len());
+            let mut children_feasible = true;
             for (child, child_goal) in recipe.child_goals.iter().copied() {
                 self.optimize_group(child, child_goal)?;
-                let child_cost = self
+                let Some(child_cost) = self
                     .memo
                     .group(child)
                     .and_then(|group| group.winner(child_goal))
-                    .ok_or_else(|| paro_error::internal("child optimization produced no winner"))?
-                    .cost;
+                    .map(|winner| winner.cost)
+                else {
+                    tracing::debug!(
+                        target: "paro::optimizer",
+                        parent_group = group.index(),
+                        physical_expression = physical.index(),
+                        child_group = child.index(),
+                        ?child_goal,
+                        "physical recipe rejected because a child goal is infeasible"
+                    );
+                    children_feasible = false;
+                    break;
+                };
                 child_costs.push(child_cost);
+            }
+            if !children_feasible {
+                continue;
             }
             let Some(local_cost) = fit_local_retained_state_to_grant(
                 recipe.local_cost,
@@ -630,6 +681,15 @@ impl CascadesEngine {
                 recipe.enforcer_cost_input,
             )?
             else {
+                tracing::debug!(
+                    target: "paro::optimizer",
+                    memo_group = group.index(),
+                    physical_expression = physical.index(),
+                    local_peak_memory = recipe.local_cost.peak_memory_upper,
+                    spillable = recipe.spillable,
+                    hard_memory = recipe.enforcer_cost_input.hard_memory_bytes,
+                    "physical recipe rejected by its resource grant"
+                );
                 continue;
             };
             let mut cost =
@@ -644,6 +704,13 @@ impl CascadesEngine {
                 self.memo.calibration(),
             )?
             else {
+                tracing::debug!(
+                    target: "paro::optimizer",
+                    memo_group = group.index(),
+                    physical_expression = physical.index(),
+                    ?enforced.steps,
+                    "physical recipe rejected because its enforcer chain is infeasible"
+                );
                 continue;
             };
             cost = cost.sequential(enforcer_cost)?;
@@ -676,6 +743,23 @@ impl CascadesEngine {
             )?;
         }
         Ok(())
+    }
+
+    fn infeasible_goal_error(
+        &self,
+        group: GroupId,
+        goal: OptimizationGoal,
+    ) -> paro_error::ParoError {
+        let group_ref = self.memo.group(group);
+        let logical = group_ref
+            .map(|group| group.logical_exprs().to_vec())
+            .unwrap_or_default();
+        let physical = group_ref
+            .map(|group| group.physical_exprs().to_vec())
+            .unwrap_or_default();
+        paro_error::internal(format!(
+            "no feasible physical plan exists for Memo group {group:?} with goal {goal:?}; logical={logical:?}, physical={physical:?}"
+        ))
     }
 }
 
@@ -1130,6 +1214,12 @@ mod tests {
     fn engine(optional_rules: u32) -> (CascadesEngine, GroupId, OptimizationGoal) {
         let mut budget = super::super::budget::SearchBudget::default();
         budget.max_rule_firings_per_group = optional_rules;
+        engine_with_budget(budget)
+    }
+
+    fn engine_with_budget(
+        budget: super::super::budget::SearchBudget,
+    ) -> (CascadesEngine, GroupId, OptimizationGoal) {
         let mut memo = Memo::new(budget);
         let group = memo.create_group(schema(), LogicalProperties::default());
         memo.insert_logical(
@@ -1168,6 +1258,15 @@ mod tests {
     }
 
     #[test]
+    fn disabled_transformation_keeps_the_mandatory_baseline() {
+        let mut budget = super::super::budget::SearchBudget::default();
+        budget.disable_transformation(RuleId(5));
+        let (mut engine, group, goal) = engine_with_budget(budget);
+        let winner = engine.optimize(group, goal, SearchMode::Memo).unwrap();
+        assert_eq!(winner.physical_fingerprint, Fingerprint(10));
+    }
+
+    #[test]
     fn exhausted_optional_budget_still_extracts_baseline() {
         let (mut engine, group, goal) = engine(0);
         let winner = engine.optimize(group, goal, SearchMode::Memo).unwrap();
@@ -1184,6 +1283,141 @@ mod tests {
         let (mut memo, group, goal) = engine(8);
         let memo_winner = memo.optimize(group, goal, SearchMode::Memo).unwrap();
         assert_eq!(memo_winner.physical_fingerprint, Fingerprint(11));
+    }
+
+    struct ReplaceInfeasibleBranch;
+
+    impl TransformationRule for ReplaceInfeasibleBranch {
+        fn id(&self) -> RuleId {
+            RuleId(13)
+        }
+
+        fn matches(&self, expr: &super::super::memo::LogicalExpr, _: &RuleContext<'_>) -> bool {
+            expr.key.operator == Fingerprint(30)
+        }
+
+        fn apply(
+            &self,
+            expr: LogicalExprId,
+            ctx: &RuleContext<'_>,
+        ) -> Result<Box<[EquivalentExpression]>> {
+            Ok(vec![EquivalentExpression {
+                target_group: ctx.group,
+                key: LogicalExprKey {
+                    operator: Fingerprint(31),
+                    scalars: Box::new([]),
+                    children: Box::new([]),
+                },
+                payload: LogicalPayloadId(2),
+                proof: EquivalenceProof::Transformation {
+                    rule: self.id(),
+                    source: expr,
+                    premise: Fingerprint(31),
+                },
+            }]
+            .into_boxed_slice())
+        }
+    }
+
+    struct FeasibleAlternativeImplementation;
+
+    impl PhysicalImplementation for FeasibleAlternativeImplementation {
+        fn id(&self) -> ImplementationId {
+            ImplementationId(14)
+        }
+
+        fn matches(
+            &self,
+            expr: &super::super::memo::LogicalExpr,
+            _: OptimizationGoal,
+            _: &ImplementationContext<'_>,
+        ) -> bool {
+            matches!(expr.key.operator, Fingerprint(30) | Fingerprint(31))
+        }
+
+        fn candidates(
+            &self,
+            expr: LogicalExprId,
+            goal: OptimizationGoal,
+            ctx: &ImplementationContext<'_>,
+        ) -> Result<Box<[PhysicalCandidate]>> {
+            let logical = ctx.memo.logical_expr(expr).unwrap();
+            let children = logical.key.children.clone();
+            let child_goals = children
+                .iter()
+                .copied()
+                .map(|child| (child, goal))
+                .collect::<Vec<_>>()
+                .into_boxed_slice();
+            Ok(vec![PhysicalCandidate {
+                key: PhysicalExprKey {
+                    implementation: self.id(),
+                    logical: expr,
+                    children,
+                    payload_fingerprint: logical.key.operator,
+                },
+                payload: PhysicalPayloadId(logical.payload.0),
+                provided: provided(),
+                child_goals,
+                local_cost: cost(1.0),
+                cost_composition: CostComposition::Sequential,
+                spillable: false,
+                enforcer_cost_input: EnforcerCostInput::unbounded(CompactRange::point(1.0)?, 8),
+                physical_fingerprint: logical.key.operator,
+                region: None,
+                mandatory: logical.key.operator == Fingerprint(30),
+            }]
+            .into_boxed_slice())
+        }
+    }
+
+    #[test]
+    fn infeasible_child_rejects_only_its_parent_recipe() {
+        let mut memo = Memo::new(super::super::budget::SearchBudget::default());
+        let child = memo.create_group(schema(), LogicalProperties::default());
+        memo.insert_logical(
+            child,
+            LogicalExprKey {
+                operator: Fingerprint(32),
+                scalars: Box::new([]),
+                children: Box::new([]),
+            },
+            LogicalPayloadId(0),
+            EquivalenceProof::Initial,
+        )
+        .unwrap();
+        let root = memo.create_group(schema(), LogicalProperties::default());
+        memo.insert_logical(
+            root,
+            LogicalExprKey {
+                operator: Fingerprint(30),
+                scalars: Box::new([]),
+                children: Box::new([child]),
+            },
+            LogicalPayloadId(1),
+            EquivalenceProof::Initial,
+        )
+        .unwrap();
+        let required = memo.intern_required(required()).unwrap();
+        let goal = OptimizationGoal {
+            required,
+            row_goal: RowGoal::All,
+            objective: ObjectiveProfileId(0),
+            grant: GrantGoalKey::Invariant(AdmissibleGrantSetId(0)),
+            context: OptimizationContextId(0),
+        };
+        let mut registry = ImplementationRegistry::default();
+        registry
+            .register_transformation(ReplaceInfeasibleBranch)
+            .unwrap();
+        registry
+            .register_implementation(FeasibleAlternativeImplementation)
+            .unwrap();
+        let mut engine = CascadesEngine::new(memo, registry);
+
+        let winner = engine.optimize(root, goal, SearchMode::Memo).unwrap();
+
+        assert_eq!(winner.physical_fingerprint, Fingerprint(31));
     }
 
     #[test]
@@ -1324,7 +1558,9 @@ mod tests {
 
     #[test]
     fn grant_sensitive_parent_reuses_invariant_child_goal_across_classes() {
-        let mut memo = Memo::new(super::super::budget::SearchBudget::default());
+        let mut budget = super::super::budget::SearchBudget::default();
+        budget.max_grant_classes = 2;
+        let mut memo = Memo::new(budget);
         let child = memo.create_group(schema(), LogicalProperties::default());
         memo.insert_logical(
             child,

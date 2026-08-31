@@ -1,3 +1,6 @@
+// Copyright 2024-2026 Zunor
+// SPDX-License-Identifier: Apache-2.0
+
 //! Canonical lowering from bound scalar expressions to optimizer-owned IR.
 //!
 //! The boundary is deliberately one-way: relational Memo expressions keep only

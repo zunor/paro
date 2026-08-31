@@ -1,3 +1,6 @@
+// Copyright 2024-2026 Zunor
+// SPDX-License-Identifier: Apache-2.0
+
 //! Stable rule and implementation registries used by Direct and Memo search.
 
 use std::collections::BTreeMap;

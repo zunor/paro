@@ -293,6 +293,9 @@ impl PhysicalPlanExtractor {
         // Residual predicates were rejected above, so this is the exact
         // segment-bitmap proof boundary for the search source.
         let filter_contract = super::scan::exact_search_filter_contract(predicate.as_ref());
+        let projection = scan
+            .projection_map
+            .to_indices(scan.get.returned_types.len());
         let spec = FullTextSearchSpec {
             table,
             capability_token: candidate.token.clone(),
@@ -306,8 +309,9 @@ impl PhysicalPlanExtractor {
             predicate,
             filter_contract,
             filter_materialization: candidate.exact_filter_materialization,
-            projected_columns: (0..scan.get.returned_types.len())
-                .map(|output| {
+            projected_columns: projection
+                .iter()
+                .map(|&output| {
                     scan.get.stored_column(output).ok_or_else(|| {
                         paro_error::internal(
                             "full-text scan cannot lower a derived output as a stored column",
@@ -317,8 +321,14 @@ impl PhysicalPlanExtractor {
                 .collect::<Result<Vec<_>>>()?
                 .into_boxed_slice(),
             emit_score: false,
-            output_names: scan.get.names.clone().into_boxed_slice(),
-            output_types: scan.get.returned_types.clone().into_boxed_slice(),
+            output_names: projection
+                .iter()
+                .filter_map(|&index| scan.get.names.get(index).cloned())
+                .collect(),
+            output_types: projection
+                .iter()
+                .filter_map(|&index| scan.get.returned_types.get(index).cloned())
+                .collect(),
         };
         Ok((PhysicalNodeKind::FullTextSearch(spec), Vec::new()))
     }

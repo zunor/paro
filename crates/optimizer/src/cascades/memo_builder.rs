@@ -1,3 +1,6 @@
+// Copyright 2024-2026 Zunor
+// SPDX-License-Identifier: Apache-2.0
+
 //! Construction of optimizer Query IR and Memo groups from bound plans.
 
 use std::collections::{BTreeMap, BTreeSet};
@@ -28,7 +31,7 @@ use super::engine::{CascadesEngine, SearchMode};
 use super::ids::{
     AdmissibleGrantSetId, BaseRelationId, ColumnId, Fingerprint, GroupId, ImplementationId,
     LogicalExprId, LogicalPayloadId, ObjectiveProfileId, OpClassId, OptimizationContextId,
-    PhysicalPayloadId, PropertySetId, QualityPolicyId, ScalarExprId, SnapshotId,
+    PhysicalPayloadId, PropertySetId, QualityPolicyId, RuleId, ScalarExprId, SnapshotId,
     StableFingerprintBuilder,
 };
 use super::memo::{
@@ -47,8 +50,9 @@ use super::region::{
     RegionForest, RegionOwnedArtifact,
 };
 use super::rules::{
-    CostComposition, GrantDependencyDescriptor, ImplementationContext, ImplementationRegistry,
-    PhysicalCandidate, PhysicalImplementation,
+    CostComposition, EquivalentExpression, GrantDependencyDescriptor, ImplementationContext,
+    ImplementationRegistry, PhysicalCandidate, PhysicalImplementation, RuleContext, RulePromise,
+    TransformationRule,
 };
 use super::scalar::ScalarArena;
 use super::scalar_lowering::{
@@ -86,6 +90,61 @@ pub enum AlternativeOrigin {
 }
 
 #[derive(Debug, Clone)]
+struct PreparedEquivalent {
+    key: LogicalExprKey,
+    payload: LogicalPayloadId,
+}
+
+#[derive(Debug)]
+struct PreparedTransformationRule {
+    id: RuleId,
+    outputs: BTreeMap<LogicalExprId, Box<[PreparedEquivalent]>>,
+}
+
+impl TransformationRule for PreparedTransformationRule {
+    fn id(&self) -> RuleId {
+        self.id
+    }
+
+    fn promise(&self, _expr: &super::memo::LogicalExpr, _ctx: &RuleContext<'_>) -> RulePromise {
+        RulePromise::HIGH
+    }
+
+    fn matches(&self, expr: &super::memo::LogicalExpr, _ctx: &RuleContext<'_>) -> bool {
+        self.outputs.contains_key(&expr.id)
+    }
+
+    fn apply(
+        &self,
+        expr: LogicalExprId,
+        ctx: &RuleContext<'_>,
+    ) -> Result<Box<[EquivalentExpression]>> {
+        let source = ctx
+            .memo
+            .logical_expr(expr)
+            .ok_or_else(|| paro_error::internal("prepared rule lost its source expression"))?;
+        let premise = source.key.stable_fingerprint();
+        Ok(self
+            .outputs
+            .get(&expr)
+            .into_iter()
+            .flatten()
+            .map(|output| EquivalentExpression {
+                target_group: ctx.group,
+                key: output.key.clone(),
+                payload: output.payload,
+                proof: EquivalenceProof::Transformation {
+                    rule: self.id,
+                    source: expr,
+                    premise,
+                },
+            })
+            .collect::<Vec<_>>()
+            .into_boxed_slice())
+    }
+}
+
+#[derive(Debug, Clone)]
 pub struct ResultPresentation {
     pub columns: Box<[ColumnId]>,
     pub names: Box<[String]>,
@@ -116,6 +175,7 @@ impl PlannerPayloadArena {
 
 #[derive(Debug, Clone)]
 struct PlannerOperatorMetadata {
+    operator_type: LogicalOperatorType,
     operator_fingerprint: Fingerprint,
     provided: ProvidedProperties,
     local_cost: SearchCost,
@@ -196,7 +256,8 @@ pub struct OptimizationInput {
     pub mode: SearchMode,
     pub presentation: ResultPresentation,
     payloads: PlannerPayloadArena,
-    metadata: Arc<Vec<PlannerOperatorMetadata>>,
+    metadata: Arc<BTreeMap<LogicalPayloadId, PlannerOperatorMetadata>>,
+    transformations: Vec<PreparedTransformationRule>,
     baseline_child_required: PropertySetId,
     bind_context: BindContext,
     calibration: Arc<MachineCalibrationBundle>,
@@ -251,6 +312,9 @@ impl OptimizationInput {
                 .collect::<BTreeMap<_, _>>(),
         );
         let mut registry = ImplementationRegistry::default();
+        for transformation in self.transformations {
+            registry.register_transformation(transformation)?;
+        }
         registry.register_implementation(PlannerBaselineImplementation {
             metadata: self.metadata.clone(),
             child_required: self.baseline_child_required,
@@ -344,8 +408,24 @@ impl OptimizationInput {
                 cost: winner.cost,
             });
         }
+        let mut rule_firings = BTreeMap::<RuleId, u64>::new();
+        let mut counted_expressions = BTreeSet::new();
+        for group in engine.memo().groups() {
+            for expression in group.logical_exprs() {
+                if !counted_expressions.insert(*expression) {
+                    continue;
+                }
+                let expression = engine.memo().logical_expr(*expression).ok_or_else(|| {
+                    paro_error::internal("Memo group references a missing logical expression")
+                })?;
+                for rule in &expression.applied_rules {
+                    *rule_firings.entry(*rule).or_default() += 1;
+                }
+            }
+        }
         Ok(OptimizationOutput {
             variants: variants.into_boxed_slice(),
+            rule_firings,
         })
     }
 }
@@ -353,6 +433,7 @@ impl OptimizationInput {
 #[derive(Debug)]
 pub struct OptimizationOutput {
     pub variants: Box<[OptimizedVariant]>,
+    pub rule_firings: BTreeMap<RuleId, u64>,
 }
 
 #[derive(Debug)]
@@ -446,10 +527,12 @@ impl MemoBuilder {
         let mut scalars = ScalarArena::default();
         let mut binding_ids = BTreeMap::<(usize, usize, Fingerprint), ColumnId>::new();
         let mut payloads = PlannerPayloadArena::default();
-        let mut metadata = Vec::new();
+        let mut metadata = BTreeMap::new();
         let mut region_facets = Vec::<RegionFacet>::new();
         let mut pending_region_facets =
-            BTreeMap::<LogicalExprId, PendingPlannerRegionFacets>::new();
+            BTreeMap::<LogicalPayloadId, PendingPlannerRegionFacets>::new();
+        let mut prepared_transformations =
+            BTreeMap::<RuleId, BTreeMap<LogicalExprId, Vec<PreparedEquivalent>>>::new();
         let mut expression_groups =
             BTreeMap::<LogicalExprKey, Vec<(GroupId, super::ids::LogicalExprId)>>::new();
         let bind_shared = bind_context.shared().clone();
@@ -458,7 +541,8 @@ impl MemoBuilder {
             .unwrap_or(true);
         let mut has_contextual_shape = false;
 
-        let mut roots: Vec<(LogicalPlan, BuildState)> = Vec::with_capacity(alternatives.len());
+        let mut roots: Vec<(AlternativeOrigin, LogicalPlan, BuildState)> =
+            Vec::with_capacity(alternatives.len());
         for alternative in alternatives {
             let source = alternative.source;
             let (root_plan, root_state) = alternative.plan.try_fold_post_order(
@@ -638,11 +722,6 @@ impl MemoBuilder {
                     } else {
                         None
                     };
-                    if logical.index() != metadata.len() {
-                        return Err(paro_error::internal(
-                            "planner payload metadata lost logical-expression alignment",
-                        ));
-                    }
                     let implementations = planner_implementation_set(&plan, rowset_scan_pushdown);
                     let mut subtree_groups = BTreeSet::from([group]);
                     for child in &child_states {
@@ -672,7 +751,7 @@ impl MemoBuilder {
                         region_facets.push(facet);
                     }
                     if pending != PendingPlannerRegionFacets::default() {
-                        pending_region_facets.insert(logical, pending);
+                        pending_region_facets.insert(payload, pending);
                     }
                     if matches!(plan.operator, LogicalOperator::Join(Join::Comparison(_))) {
                         let (probe_operator, conditions) = match &plan.operator {
@@ -691,7 +770,8 @@ impl MemoBuilder {
                             "registered physical join implementation set"
                         );
                     }
-                    metadata.push(PlannerOperatorMetadata {
+                    let operator_metadata = PlannerOperatorMetadata {
+                        operator_type: plan.operator.op_type(),
                         operator_fingerprint,
                         provided: ProvidedProperties {
                             ordering: derive_provided_ordering(
@@ -722,7 +802,12 @@ impl MemoBuilder {
                         structural_retained_children: planner_structural_retained_children(
                             &plan.operator,
                         ),
-                    });
+                    };
+                    if metadata.insert(payload, operator_metadata).is_some() {
+                        return Err(paro_error::internal(
+                            "planner payload metadata was assigned more than once",
+                        ));
+                    }
                     expression_groups
                         .entry(key)
                         .or_default()
@@ -741,30 +826,42 @@ impl MemoBuilder {
             match source {
                 AlternativeOrigin::Baseline => {}
                 AlternativeOrigin::Transformation { rule } => {
-                    let source =
-                        roots
-                            .first()
-                            .map(|(_, state)| state.logical)
-                            .ok_or_else(|| {
-                                paro_error::internal(
-                                    "transformation alternative has no baseline source",
-                                )
-                            })?;
-                    let premise = memo
-                        .logical_expr(source)
+                    let source = roots
+                        .first()
+                        .map(|(_, _, state)| state.logical)
                         .ok_or_else(|| {
-                            paro_error::internal("transformation baseline expression disappeared")
-                        })?
-                        .key
-                        .stable_fingerprint();
-                    memo.add_equivalence_proof(
-                        root_state.logical,
-                        EquivalenceProof::Transformation {
-                            rule,
-                            source,
-                            premise,
-                        },
-                    )?;
+                            paro_error::internal(
+                                "transformation alternative has no baseline source",
+                            )
+                        })?;
+                    let source_group = memo
+                        .logical_owner(source)
+                        .and_then(|group| memo.group(group))
+                        .ok_or_else(|| {
+                            paro_error::internal("transformation baseline group disappeared")
+                        })?;
+                    let output_group = memo.group(root_state.group).ok_or_else(|| {
+                        paro_error::internal("prepared transformation group disappeared")
+                    })?;
+                    if source_group.schema != output_group.schema
+                        || source_group.logical_properties != output_group.logical_properties
+                    {
+                        return Err(paro_error::internal(
+                            "transformation changed its Memo group output contract",
+                        ));
+                    }
+                    let output = memo.logical_expr(root_state.logical).ok_or_else(|| {
+                        paro_error::internal("prepared transformation expression disappeared")
+                    })?;
+                    prepared_transformations
+                        .entry(rule)
+                        .or_default()
+                        .entry(source)
+                        .or_default()
+                        .push(PreparedEquivalent {
+                            key: output.key.clone(),
+                            payload: output.payload,
+                        });
                 }
                 AlternativeOrigin::Specialized { rule } => {
                     let region = memo
@@ -780,11 +877,13 @@ impl MemoBuilder {
                     )?;
                 }
             }
-            roots.push((root_plan, root_state));
+            roots.push((source, root_plan, root_state));
         }
-        let (root_plan, mut root_state) = roots.remove(0);
-        for (_, alternative) in roots {
-            root_state.group = memo.merge_groups(root_state.group, alternative.group)?;
+        let (_, root_plan, mut root_state) = roots.remove(0);
+        for (origin, _, alternative) in roots {
+            if !matches!(origin, AlternativeOrigin::Transformation { .. }) {
+                root_state.group = memo.merge_groups(root_state.group, alternative.group)?;
+            }
         }
         root_state.group = memo.canonical_group(root_state.group);
 
@@ -802,8 +901,8 @@ impl MemoBuilder {
         )?;
         let dropped_optional: BTreeSet<_> =
             regions.dropped_optional_facets.iter().copied().collect();
-        for (logical, pending) in pending_region_facets {
-            let operator = metadata.get_mut(logical.index()).ok_or_else(|| {
+        for (payload, pending) in pending_region_facets {
+            let operator = metadata.get_mut(&payload).ok_or_else(|| {
                 paro_error::internal("planning-region binding lost operator metadata")
             })?;
             operator.required_region_facet = pending.required;
@@ -820,7 +919,8 @@ impl MemoBuilder {
         let root_provided = memo
             .group(root_state.group)
             .and_then(|group| group.logical_exprs().first())
-            .and_then(|expr| metadata.get(expr.index()))
+            .and_then(|expr| memo.logical_expr(*expr))
+            .and_then(|expr| metadata.get(&expr.payload))
             .map(|metadata| metadata.provided.clone())
             .ok_or_else(|| paro_error::internal("root Memo group has no baseline properties"))?;
         let root_required = memo.intern_required(RequiredProperties {
@@ -851,8 +951,19 @@ impl MemoBuilder {
             columns: root_state.columns,
             names: root_plan.output_names().into_boxed_slice(),
         };
-        let requires_memo =
-            has_contextual_shape || memo.groups().any(|group| group.logical_exprs().len() > 1);
+        let transformations = prepared_transformations
+            .into_iter()
+            .map(|(id, outputs)| PreparedTransformationRule {
+                id,
+                outputs: outputs
+                    .into_iter()
+                    .map(|(source, outputs)| (source, outputs.into_boxed_slice()))
+                    .collect(),
+            })
+            .collect::<Vec<_>>();
+        let requires_memo = has_contextual_shape
+            || !transformations.is_empty()
+            || memo.groups().any(|group| group.logical_exprs().len() > 1);
         Ok(OptimizationInput {
             memo,
             columns,
@@ -867,6 +978,7 @@ impl MemoBuilder {
             presentation,
             payloads,
             metadata: Arc::new(metadata),
+            transformations,
             baseline_child_required: default_required,
             bind_context,
             calibration: Arc::new(MachineCalibrationBundle::default()),
@@ -877,7 +989,7 @@ impl MemoBuilder {
 
 #[derive(Debug)]
 struct PlannerBaselineImplementation {
-    metadata: Arc<Vec<PlannerOperatorMetadata>>,
+    metadata: Arc<BTreeMap<LogicalPayloadId, PlannerOperatorMetadata>>,
     child_required: PropertySetId,
     grant_classes: Arc<BTreeMap<super::ids::ResourceGrantClassId, ResourceGrantClass>>,
     calibration: Arc<MachineCalibrationBundle>,
@@ -895,7 +1007,7 @@ impl PhysicalImplementation for PlannerBaselineImplementation {
         _ctx: &ImplementationContext<'_>,
     ) -> GrantDependencyDescriptor {
         self.metadata
-            .get(expr.id.index())
+            .get(&expr.payload)
             .map(|metadata| metadata.grant_dependency)
             .unwrap_or(GrantDependencyDescriptor::Sensitive)
     }
@@ -906,7 +1018,7 @@ impl PhysicalImplementation for PlannerBaselineImplementation {
         _goal: OptimizationGoal,
         _ctx: &ImplementationContext<'_>,
     ) -> bool {
-        self.metadata.get(expr.id.index()).is_some()
+        self.metadata.contains_key(&expr.payload)
     }
 
     fn candidates(
@@ -921,7 +1033,7 @@ impl PhysicalImplementation for PlannerBaselineImplementation {
             .ok_or_else(|| paro_error::internal("baseline implementation lost logical expr"))?;
         let metadata = self
             .metadata
-            .get(expr.index())
+            .get(&logical.payload)
             .ok_or_else(|| paro_error::internal("baseline implementation lost metadata"))?;
         let children = logical.key.children.clone();
         let child_goals = children
@@ -953,15 +1065,28 @@ impl PhysicalImplementation for PlannerBaselineImplementation {
             metadata.implementations.baseline,
             self.calibration.as_ref(),
         )?;
+        let spillable = implementation_spillable(metadata, metadata.implementations.baseline);
+        let estimated_peak_memory = local_cost.peak_memory_upper;
         let Some(local_cost) = cost_for_grant(
             local_cost,
             metadata.grant_dependency,
-            implementation_spillable(metadata, metadata.implementations.baseline),
+            spillable,
             goal.grant,
             &self.grant_classes,
             self.force_spill,
         )?
         else {
+            debug!(
+                target: targets::OPTIMIZER,
+                logical_expression = expr.index(),
+                payload = logical.payload.0,
+                operator = ?metadata.operator_type,
+                implementation = ?metadata.implementations.baseline,
+                estimated_peak_memory,
+                spillable,
+                grant = ?goal.grant,
+                "mandatory baseline is infeasible for the resource grant"
+            );
             return Ok(Box::new([]));
         };
         Ok(vec![PhysicalCandidate {
@@ -976,7 +1101,7 @@ impl PhysicalImplementation for PlannerBaselineImplementation {
             child_goals,
             local_cost,
             cost_composition: planner_cost_composition(metadata, metadata.implementations.baseline),
-            spillable: implementation_spillable(metadata, metadata.implementations.baseline),
+            spillable,
             enforcer_cost_input: planner_enforcer_cost_input(
                 metadata,
                 goal.grant,
@@ -994,7 +1119,7 @@ impl PhysicalImplementation for PlannerBaselineImplementation {
 struct AlternativeImplementation {
     id: ImplementationId,
     flavor: PhysicalImplementationFlavor,
-    metadata: Arc<Vec<PlannerOperatorMetadata>>,
+    metadata: Arc<BTreeMap<LogicalPayloadId, PlannerOperatorMetadata>>,
     child_required: PropertySetId,
     grant_classes: Arc<BTreeMap<super::ids::ResourceGrantClassId, ResourceGrantClass>>,
     calibration: Arc<MachineCalibrationBundle>,
@@ -1013,7 +1138,7 @@ impl PhysicalImplementation for AlternativeImplementation {
     ) -> GrantDependencyDescriptor {
         if self
             .metadata
-            .get(expr.id.index())
+            .get(&expr.payload)
             .is_some_and(|metadata| metadata.implementations.supports(self.flavor))
         {
             GrantDependencyDescriptor::Sensitive
@@ -1029,7 +1154,7 @@ impl PhysicalImplementation for AlternativeImplementation {
         _ctx: &ImplementationContext<'_>,
     ) -> bool {
         self.metadata
-            .get(expr.id.index())
+            .get(&expr.payload)
             .is_some_and(|metadata| metadata.implementations.supports(self.flavor))
     }
 
@@ -1045,7 +1170,7 @@ impl PhysicalImplementation for AlternativeImplementation {
             .ok_or_else(|| paro_error::internal("physical implementation lost logical expr"))?;
         let metadata = self
             .metadata
-            .get(expr.index())
+            .get(&logical.payload)
             .ok_or_else(|| paro_error::internal("physical implementation lost metadata"))?;
         if !metadata.implementations.supports(self.flavor) {
             return Ok(Box::new([]));
@@ -1122,7 +1247,7 @@ impl PhysicalImplementation for AlternativeImplementation {
 
 #[derive(Debug)]
 struct PlannerSearchImplementation {
-    metadata: Arc<Vec<PlannerOperatorMetadata>>,
+    metadata: Arc<BTreeMap<LogicalPayloadId, PlannerOperatorMetadata>>,
 }
 
 impl PhysicalImplementation for PlannerSearchImplementation {
@@ -1145,7 +1270,7 @@ impl PhysicalImplementation for PlannerSearchImplementation {
         _ctx: &ImplementationContext<'_>,
     ) -> bool {
         self.metadata
-            .get(expr.id.index())
+            .get(&expr.payload)
             .is_some_and(|metadata| metadata.search.is_some())
     }
 
@@ -1155,14 +1280,13 @@ impl PhysicalImplementation for PlannerSearchImplementation {
         _goal: OptimizationGoal,
         ctx: &ImplementationContext<'_>,
     ) -> Result<Box<[PhysicalCandidate]>> {
-        if ctx.memo.logical_expr(expr).is_none() {
-            return Err(paro_error::internal(
-                "search implementation lost logical expr",
-            ));
-        }
+        let logical = ctx
+            .memo
+            .logical_expr(expr)
+            .ok_or_else(|| paro_error::internal("search implementation lost logical expr"))?;
         let Some(search) = self
             .metadata
-            .get(expr.index())
+            .get(&logical.payload)
             .and_then(|metadata| metadata.search.as_ref())
         else {
             return Ok(Box::new([]));
@@ -1204,7 +1328,7 @@ type ExtractedWinnerTree = (LogicalPlan, WinnerContractMap, WinnerEnforcerMap);
 fn extract_planner_tree(
     memo: &Memo,
     payloads: &PlannerPayloadArena,
-    metadata: &[PlannerOperatorMetadata],
+    metadata: &BTreeMap<LogicalPayloadId, PlannerOperatorMetadata>,
     bind_context: &BindContext,
     root: GroupId,
     goal: OptimizationGoal,
@@ -1241,10 +1365,12 @@ fn extract_planner_tree(
                 let physical = memo.physical_expr(winner.expression).ok_or_else(|| {
                     paro_error::internal("winner physical expression disappeared")
                 })?;
-                let operator_metadata =
-                    metadata.get(physical.key.logical.index()).ok_or_else(|| {
-                        paro_error::internal("winner extraction lost implementation metadata")
-                    })?;
+                let logical = memo.logical_expr(physical.key.logical).ok_or_else(|| {
+                    paro_error::internal("winner extraction lost logical expression")
+                })?;
+                let operator_metadata = metadata.get(&logical.payload).ok_or_else(|| {
+                    paro_error::internal("winner extraction lost implementation metadata")
+                })?;
                 let implementation = selected_implementation_flavor(
                     physical.key.implementation,
                     operator_metadata.implementations,
@@ -1943,6 +2069,7 @@ fn search_payload_fingerprint(
         LogicalOperator::FullTextFilterScan(search) => {
             fingerprint.write_u64(1);
             encode_search_request(&mut fingerprint, &search.request);
+            encode_projection_map(&mut fingerprint, &search.projection_map);
             write_decision(&mut fingerprint, &search.decision);
         }
         _ => fingerprint.write_u64(u64::MAX),
@@ -2418,8 +2545,6 @@ fn implementation_cost(
     }
     let mut cost = calibration.fold(&work)?;
     cost.peak_memory_upper = peak_memory_upper;
-    cost.uncertainty = metadata.local_cost.uncertainty;
-    cost.progress = metadata.local_cost.progress;
     cost.validate()?;
     Ok(cost)
 }
@@ -2662,6 +2787,7 @@ fn query_operator_fingerprint(
         LogicalOperator::FullTextFilterScan(search) => {
             encode_get(&mut fingerprint, &search.get);
             encode_search_request(&mut fingerprint, &search.request);
+            encode_projection_map(&mut fingerprint, &search.projection_map);
         }
         LogicalOperator::GraphMatch(graph) => {
             fingerprint.write_u64(graph.graph_entry.object_id().raw());
@@ -2870,6 +2996,9 @@ fn encode_strings(fingerprint: &mut StableFingerprintBuilder, values: &[String])
 }
 
 fn encode_get(fingerprint: &mut StableFingerprintBuilder, get: &paro_planner::operator::Get) {
+    // The same catalog object may occur more than once in a query. The bound
+    // table index is part of the carrier ABI and distinguishes those aliases.
+    fingerprint.write_u64(get.table_index as u64);
     fingerprint.write_u64(
         get.table
             .as_ref()
@@ -3436,20 +3565,33 @@ fn planner_operator_cost(plan: &LogicalPlan, child_count: usize) -> Result<Searc
         ..SearchCost::ZERO
     };
     if planner_grant_dependency(&plan.operator) == GrantDependencyDescriptor::Sensitive {
-        let row_width = plan
+        // Retained memory belongs to operator state, not to the number of rows
+        // the operator happens to emit.  A cross product materializes only its
+        // right build input; charging the Cartesian output here can reject a
+        // tiny build side by many orders of magnitude under a hard grant.
+        let resident_plan = match &plan.operator {
+            LogicalOperator::Join(Join::Cross(cross)) => cross.right.as_ref(),
+            _ => plan,
+        };
+        let row_width = resident_plan
             .types()
             .iter()
             .map(|logical_type| logical_type.type_size().max(1) as u64)
             .sum::<u64>()
             .saturating_add(32);
-        let resident_rows = plan
+        let resident_rows = resident_plan
             .stats
             .estimated_cardinality
             .map(|cardinality| cardinality.max.max(cardinality.expected))
             .unwrap_or(1);
         cost.peak_memory_upper = resident_rows.saturating_mul(row_width);
+        let resident_expected_rows = resident_plan
+            .stats
+            .estimated_cardinality
+            .map(|cardinality| cardinality.expected as f64)
+            .unwrap_or(1.0);
         cost.resources_expected[ResourceDimension::MemoryWrite as usize] =
-            expected_rows * row_width as f64;
+            resident_expected_rows * row_width as f64;
         cost.resources_risk_upper[ResourceDimension::MemoryWrite as usize] =
             cost.peak_memory_upper as f64;
     }
@@ -3584,6 +3726,30 @@ mod tests {
             spill_policy: crate::physical::SpillPolicy::Allowed,
             concurrency_class: 0,
         }]
+    }
+
+    #[test]
+    fn cross_product_memory_tracks_only_the_materialized_build_side() {
+        let mut left = LogicalPlan::synthetic(LogicalOperator::ExpressionGet(ExpressionGet::new(
+            0,
+            Vec::new(),
+            vec!["left".to_string()],
+            vec![LogicalType::BigInt],
+        )));
+        left.stats.estimated_cardinality = Some(CardinalityEstimate::exact(1_000_000_000));
+        let mut right = LogicalPlan::synthetic(LogicalOperator::ExpressionGet(ExpressionGet::new(
+            1,
+            Vec::new(),
+            vec!["right".to_string()],
+            vec![LogicalType::BigInt],
+        )));
+        right.stats.estimated_cardinality = Some(CardinalityEstimate::exact(3));
+        let mut product = LogicalPlan::synthetic(LogicalOperator::Join(Join::cross(left, right)));
+        product.stats.estimated_cardinality = Some(CardinalityEstimate::exact(3_000_000_000));
+
+        let cost = planner_operator_cost(&product, 2).expect("cross-product cost");
+
+        assert_eq!(cost.peak_memory_upper, 3 * (8 + 32));
     }
 
     #[test]
@@ -3739,24 +3905,9 @@ mod tests {
             SearchBudget::default(),
         )
         .unwrap();
-        let root = input.memo.group(input.root).unwrap();
-        assert!(root.logical_exprs().iter().any(|expression| {
-            input
-                .memo
-                .logical_expr(*expression)
-                .unwrap()
-                .proofs
-                .iter()
-                .any(|proof| {
-                    matches!(
-                        proof,
-                        EquivalenceProof::Transformation { rule: actual, source, premise }
-                            if *actual == rule
-                                && input.memo.logical_expr(*source).is_some()
-                                && *premise != Fingerprint::default()
-                    )
-                })
-        }));
+        assert_eq!(input.transformations.len(), 1);
+        let optimized = input.optimize(&test_grant_classes()).unwrap();
+        assert_eq!(optimized.rule_firings.get(&rule), Some(&1));
     }
 
     #[test]

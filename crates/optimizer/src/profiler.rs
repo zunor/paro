@@ -1,9 +1,14 @@
+// Copyright 2024-2026 Zunor
+// SPDX-License-Identifier: Apache-2.0
+
 //! Query-generation optimizer diagnostics. Components describe architectural
 //! phases, never user-toggleable ordered passes.
 
 use std::collections::BTreeMap;
 use std::sync::{LazyLock, RwLock};
 use std::time::Duration;
+
+use crate::cascades::RuleId;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum OptimizerComponent {
@@ -55,6 +60,7 @@ pub struct OptimizerTimingEntry {
 #[derive(Debug, Default)]
 pub struct OptimizerProfiler {
     entries: BTreeMap<OptimizerComponent, OptimizerTimingEntry>,
+    rule_firings: BTreeMap<RuleId, u64>,
 }
 
 #[derive(Debug, Clone)]
@@ -67,6 +73,7 @@ pub struct OptimizerProfileSnapshotEntry {
 #[derive(Debug, Clone, Default)]
 pub struct OptimizerProfileSnapshot {
     pub entries: Vec<OptimizerProfileSnapshotEntry>,
+    pub rule_firings: BTreeMap<RuleId, u64>,
 }
 
 static LAST_PROFILE_SNAPSHOT: LazyLock<RwLock<OptimizerProfileSnapshot>> =
@@ -93,7 +100,12 @@ impl OptimizerProfiler {
                     }
                 })
                 .collect(),
+            rule_firings: self.rule_firings.clone(),
         }
+    }
+
+    pub fn record_rule_firings(&mut self, firings: BTreeMap<RuleId, u64>) {
+        self.rule_firings = firings;
     }
 }
 

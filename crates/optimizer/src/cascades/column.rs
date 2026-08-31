@@ -1,3 +1,6 @@
+// Copyright 2024-2026 Zunor
+// SPDX-License-Identifier: Apache-2.0
+
 //! Query-scoped immutable column identity and unordered Memo group schemas.
 
 use std::collections::{BTreeMap, BTreeSet};

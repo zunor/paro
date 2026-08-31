@@ -604,6 +604,7 @@ impl LogicalPlanDeepCopy {
                 self.remap_table_index(bind_shared, &mut get.table_index);
                 LogicalOperator::FullTextFilterScan(FtScanNode {
                     get,
+                    projection_map: s.projection_map.clone(),
                     request: s.request.clone(),
                     match_expression: s.match_expression.clone(),
                     other_predicates: s.other_predicates.clone(),

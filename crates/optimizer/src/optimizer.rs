@@ -1,3 +1,6 @@
+// Copyright 2024-2026 Zunor
+// SPDX-License-Identifier: Apache-2.0
+
 //! Long-term optimizer entry point: semantic normalization, bounded search,
 //! verified extraction. It has no pass-disable compatibility surface.
 
@@ -25,7 +28,10 @@ use paro_planner::verify::verify_physical_planner_invariants;
 use tracing::debug;
 
 use crate::aggregate::common::CommonAggregateOptimizer;
-use crate::aggregate::late_payload::optimize_matched_prefix_plan;
+use crate::aggregate::{
+    dimension_deferral, distinct_decomposition, input_materialization, join_preaggregation,
+    join_subsumption, late_payload, non_null_inputs, post_reduction, singleton_groups,
+};
 use crate::cascades::{
     AlternativeOrigin, CompactRange, LocalOperatorWork, LogicalAlternative,
     MachineCalibrationBundle, MemoBuilder, OpClassId, SearchBudget, SearchCost,
@@ -42,11 +48,13 @@ use crate::external::lowering::ExternalRoutineLoweringPass;
 use crate::filter::pullup::FilterPullup;
 use crate::filter::pushdown::FilterPushdown;
 use crate::filter::reorder::ReorderFilter;
+use crate::graph::frontier::GraphFrontierEnumerator;
 use crate::graph::match_decompose::GraphMatchDecompose;
 use crate::graph::predicate_pushdown::GraphPredicatePushdown;
-use crate::graph::start_selection::GraphStartSelection;
+use crate::join::elimination::JoinElimination;
 use crate::join::mixed_predicates::JoinPredicateNormalizer;
 use crate::join_order::optimizer::JoinOrderOptimizer;
+use crate::limit::pushdown::LimitPushdown;
 use crate::limit::topn::TopNOptimizer;
 use crate::physical::{
     ExtractionContext, PhysicalImplementationFlavor, PhysicalPlanExtractor, WinnerPhysicalContract,
@@ -71,6 +79,9 @@ const SCALAR_REUSE_REGION_RULE: crate::cascades::RuleId = crate::cascades::RuleI
 const EXPENSIVE_PREDICATE_PLACEMENT_RULE: crate::cascades::RuleId = crate::cascades::RuleId(10_006);
 const CTE_INLINE_REGION_RULE: crate::cascades::RuleId = crate::cascades::RuleId(10_007);
 const CTE_FILTER_REGION_RULE: crate::cascades::RuleId = crate::cascades::RuleId(10_008);
+const RELATIONAL_EQUIVALENCE_RULE: crate::cascades::RuleId = crate::cascades::RuleId(10_009);
+const DISTINCT_AGGREGATE_FEASIBILITY_RULE: crate::cascades::RuleId =
+    crate::cascades::RuleId(10_010);
 
 pub struct Optimizer {
     binder: Binder,
@@ -180,6 +191,16 @@ impl Optimizer {
                 &canonical,
                 self.binder.bind_context.shared().as_ref(),
             ))?;
+            let relational_candidate =
+                self.relational_equivalence_candidate(duplicate_plan_preserving_indices(
+                    &baseline,
+                    self.binder.bind_context.shared().as_ref(),
+                ));
+            let distinct_feasibility_candidate =
+                self.distinct_aggregate_feasibility_candidate(duplicate_plan_preserving_indices(
+                    &baseline,
+                    self.binder.bind_context.shared().as_ref(),
+                ))?;
             let predicate_candidate = if contains_reorderable_filter_segment(&baseline) {
                 match ReorderFilter::new().rewrite(
                     duplicate_plan_preserving_indices(
@@ -211,6 +232,19 @@ impl Optimizer {
                     }
                 },
             });
+            if let Some(plan) = distinct_feasibility_candidate {
+                alternatives.push(LogicalAlternative {
+                    plan,
+                    // DISTINCT modifier state is not spillable.  This
+                    // equivalent is a mandatory resource-feasibility path,
+                    // not optional transformation work: exhausting or
+                    // disabling optional rules must not make a valid query
+                    // uncompilable under a finite grant.
+                    source: AlternativeOrigin::Specialized {
+                        rule: DISTINCT_AGGREGATE_FEASIBILITY_RULE,
+                    },
+                });
+            }
             if let Some(plan) = predicate_candidate {
                 if alternatives.len()
                     < self.budget.max_optional_logical_exprs_per_group as usize + 1
@@ -221,6 +255,21 @@ impl Optimizer {
                             rule: EXPENSIVE_PREDICATE_PLACEMENT_RULE,
                         },
                     });
+                }
+            }
+            if alternatives.len() < self.budget.max_optional_logical_exprs_per_group as usize + 1 {
+                match relational_candidate {
+                    Ok(plan) => alternatives.push(LogicalAlternative {
+                        plan,
+                        source: AlternativeOrigin::Transformation {
+                            rule: RELATIONAL_EQUIVALENCE_RULE,
+                        },
+                    }),
+                    Err(error) => debug!(
+                        target: targets::OPTIMIZER,
+                        %error,
+                        "relational equivalence candidate failed validation"
+                    ),
                 }
             }
             if cte_region
@@ -400,6 +449,9 @@ impl Optimizer {
         let mode = input.mode;
         let phase_started = Instant::now();
         let extraction = input.optimize(&grant_classes)?;
+        self.ctx
+            .profiler
+            .record_rule_firings(extraction.rule_firings.clone());
         self.ctx.profiler.record(
             match mode {
                 crate::cascades::SearchMode::Direct => OptimizerComponent::DirectPhysicalSearch,
@@ -694,7 +746,20 @@ impl Optimizer {
             estimator_revision: revision(b"paro.estimator-algebra", [1]),
             rule_set_revision: revision(b"paro.rule-set", [4]),
             plan_stability_policy_revision: revision(b"paro.plan-stability-policy", [1]),
-            optimizer_config_fingerprint: revision(b"paro.optimizer-config", config_values),
+            optimizer_config_fingerprint: revision(
+                b"paro.optimizer-config",
+                config_values
+                    .into_iter()
+                    .chain(std::iter::once(
+                        budget.disabled_transformation_rules.len() as u64
+                    ))
+                    .chain(
+                        budget
+                            .disabled_transformation_rules
+                            .iter()
+                            .map(|rule| rule.0 as u64),
+                    ),
+            ),
             physical_abi_revision: revision(b"paro.physical-abi", [4]),
             ..Default::default()
         }
@@ -766,6 +831,15 @@ impl Optimizer {
         plan = EmptyResultPullup::new().optimize_plan(plan);
         plan = JoinPredicateNormalizer::new(&self.ctx.bind_context).optimize_plan(plan)?;
         plan = InClauseRewriter::new().rewrite(plan)?;
+        if contains_mark_filter_over_cross_product(&plan) {
+            // A MARK boundary can sit between an outer filter and its
+            // comma-join probe. Push safe terms through that boundary, then
+            // canonicalize the newly exposed equality predicate. Restricting
+            // this repair to the blocked shape avoids rewriting independent
+            // recursive/control regions in the same normalization phase.
+            plan = FilterPushdown::new().rewrite_plan(plan);
+            plan = JoinPredicateNormalizer::new(&self.ctx.bind_context).optimize_plan(plan)?;
+        }
         plan = ExternalRoutineLoweringPass::lower(plan, &self.ctx.bind_context)?.plan;
         plan = TopNOptimizer::new().optimize_plan(plan);
         plan = CTEInlining::new(&self.ctx.bind_context)
@@ -796,11 +870,58 @@ impl Optimizer {
         plan = propagator.propagate(self.ctx.session.clone(), plan);
         self.ctx.column_stats = propagator.take_statistics_map();
         plan = StatisticsGathering::new().gather(plan, &mut self.ctx)?;
+        plan = ColumnLifetimeAnalyzer::new(true).optimize(plan)?;
 
         if self.ctx.verify_enabled {
             verify_logical_plan(&self.ctx.bind_context, &plan)?;
         }
         Ok(plan)
+    }
+
+    /// Derive a proof-driven relational equivalent that can change cost.
+    /// The unchanged expression remains mandatory and this candidate enters
+    /// its group through the bounded transformation agenda.
+    fn relational_equivalence_candidate(&mut self, mut plan: LogicalPlan) -> Result<LogicalPlan> {
+        plan = post_reduction::optimize_plan(plan, &self.ctx.bind_context);
+        plan = JoinElimination::new().optimize_plan(plan);
+        plan = join_preaggregation::optimize_plan(
+            plan,
+            &self.ctx.bind_context,
+            &self.ctx.column_stats,
+        );
+        plan = join_subsumption::optimize_plan(plan);
+        plan = non_null_inputs::optimize_plan(plan, &self.ctx.column_stats);
+
+        (plan, _) =
+            dimension_deferral::optimize_plan(plan, &self.ctx.bind_context, &self.ctx.cost_model)?;
+        (plan, _) = input_materialization::optimize_plan(plan, &self.ctx.bind_context)?;
+        plan = LimitPushdown::new().optimize_plan(plan);
+
+        if self.ctx.session.settings.rowset_scan_pushdown() {
+            (plan, _) = late_payload::optimize_matched_prefix_plan(plan)?;
+            (plan, _) =
+                late_payload::optimize_plan(plan, &self.ctx.bind_context, &self.ctx.cost_model)?;
+        }
+        plan = scalar_aggregate_window::optimize_plan(plan, &self.ctx.bind_context)?;
+        plan = self.settle_query_candidate(plan)?;
+        plan = singleton_groups::optimize_plan(plan, &self.ctx.column_stats);
+        plan = ColumnLifetimeAnalyzer::new(true).optimize(plan)?;
+
+        if self.ctx.verify_enabled {
+            verify_logical_plan(&self.ctx.bind_context, &plan)?;
+        }
+        Ok(plan)
+    }
+
+    fn distinct_aggregate_feasibility_candidate(
+        &mut self,
+        plan: LogicalPlan,
+    ) -> Result<Option<LogicalPlan>> {
+        let (plan, changed) = distinct_decomposition::optimize_plan(plan, &self.ctx.bind_context)?;
+        if !changed {
+            return Ok(None);
+        }
+        self.settle_query_candidate(plan).map(Some)
     }
 
     fn correlated_aggregate_candidate(&mut self, plan: LogicalPlan) -> Result<LogicalPlan> {
@@ -830,7 +951,7 @@ impl Optimizer {
         candidate = ColumnLifetimeAnalyzer::new(true).optimize(candidate)?;
         candidate = scalar_aggregate_window::optimize_plan(candidate, &self.ctx.bind_context)?;
         if self.ctx.session.settings.rowset_scan_pushdown() {
-            (candidate, _) = optimize_matched_prefix_plan(candidate)?;
+            (candidate, _) = late_payload::optimize_matched_prefix_plan(candidate)?;
         }
         candidate = ColumnLifetimeAnalyzer::new(true).optimize(candidate)?;
         if self.ctx.verify_enabled {
@@ -862,6 +983,29 @@ fn contains_redundant_computation_region(plan: &LogicalPlan) -> bool {
             .children()
             .into_iter()
             .any(contains_redundant_computation_region)
+}
+
+fn contains_mark_filter_over_cross_product(plan: &LogicalPlan) -> bool {
+    fn contains_cross_product(plan: &LogicalPlan) -> bool {
+        matches!(plan.operator, LogicalOperator::Join(Join::Cross(_)))
+            || plan.children().into_iter().any(contains_cross_product)
+    }
+
+    let local = matches!(
+        &plan.operator,
+        LogicalOperator::Filter(filter)
+            if matches!(
+                &filter.child.operator,
+                LogicalOperator::Join(Join::Comparison(join))
+                    if join.join_type == JoinType::Mark
+                        && contains_cross_product(join.left.as_ref())
+            )
+    );
+    local
+        || plan
+            .children()
+            .into_iter()
+            .any(contains_mark_filter_over_cross_product)
 }
 
 fn contains_aggregate(plan: &LogicalPlan) -> bool {
@@ -915,7 +1059,8 @@ fn enumerate_graph_region_plans(
     fn collect(plan: &LogicalPlan, patterns: &mut Vec<Vec<PatternOrder>>, per_pattern_max: usize) {
         if let LogicalOperator::GraphMatch(graph_match) = &plan.operator {
             patterns.push(
-                GraphStartSelection::new().enumerate_pattern_orders(graph_match, per_pattern_max),
+                GraphFrontierEnumerator::new()
+                    .enumerate_pattern_orders(graph_match, per_pattern_max),
             );
         }
         for child in plan.children() {

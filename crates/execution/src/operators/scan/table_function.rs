@@ -930,7 +930,7 @@ fn populate_paro_optimizers(global_state: &mut dyn GlobalTableFunctionState) {
         .downcast_mut::<ParoOptimizersGlobalState>()
     {
         let snapshot = paro_optimizer::profiler::latest_optimizer_profile_snapshot();
-        let entries = snapshot
+        let mut entries = snapshot
             .entries
             .into_iter()
             .map(|entry| OptimizerData {
@@ -939,7 +939,18 @@ fn populate_paro_optimizers(global_state: &mut dyn GlobalTableFunctionState) {
                 last_elapsed_us: entry.last_elapsed.as_micros().min(i64::MAX as u128) as i64,
                 invocation_count: entry.invocation_count.min(i64::MAX as u64) as i64,
             })
-            .collect();
+            .collect::<Vec<_>>();
+        entries.extend(
+            snapshot
+                .rule_firings
+                .into_iter()
+                .map(|(rule, count)| OptimizerData {
+                    name: format!("rule_{}", rule.0),
+                    kind: "transformation_rule".to_string(),
+                    last_elapsed_us: 0,
+                    invocation_count: count.min(i64::MAX as u64) as i64,
+                }),
+        );
         populate_optimizer_data(state, entries);
     }
 }
@@ -2570,6 +2581,7 @@ mod tests {
                     invocation_count: 0,
                 },
             ],
+            rule_firings: Default::default(),
         });
 
         let mut state = ParoOptimizersGlobalState {

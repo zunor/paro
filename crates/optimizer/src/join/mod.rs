@@ -5,5 +5,4 @@
 
 pub mod build_probe_side;
 pub mod elimination;
-pub mod filter_pushdown;
 pub mod mixed_predicates;

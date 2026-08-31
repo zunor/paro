@@ -1,3 +1,6 @@
+// Copyright 2024-2026 Zunor
+// SPDX-License-Identifier: Apache-2.0
+
 //! Versioned dependencies that make an immutable physical plan reusable.
 
 use std::collections::BTreeMap;
