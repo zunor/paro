@@ -23,9 +23,6 @@ use paro_common::vector::VECTOR_SIZE;
 use paro_context::test_support::TestStatementContextBuilder;
 use paro_execution::explain::profiler::{ExplainProfiler, OperatorProfiler};
 use paro_execution::memory_runtime::QueryMemoryPool;
-use paro_execution::physical::properties::PipelineProperties;
-use paro_execution::physical::row_type::RowType;
-use paro_execution::physical::specs::{ChunkScanSpec, FilterSpec, ProjectSpec};
 use paro_execution::pipeline::graph::{
     ClientResultSpec, HashJoinBuildSinkSpec, PipelineGraph, PipelineId, PipelineRoot, PipelineSpec,
     SinkSharing, SinkSpec, SourceSpec, TransformSpec,
@@ -43,6 +40,11 @@ use paro_execution::runtime::{
     SourcePoll, TaskMemoryGrants, TransformGlobal, TransformLocal, TransformPoll, WakeGeneration,
 };
 use paro_execution::thread_context::ThreadContext;
+use paro_optimizer::physical::properties::PipelineProperties;
+use paro_optimizer::physical::row_type::RowType;
+use paro_optimizer::physical::specs::{
+    ChunkScanSpec, FilterSpec, ProjectSpec, SpillExecutionPolicy,
+};
 use paro_planner::expression::{Expression, ReferenceExpression};
 use paro_planner::operator::join::{JoinCondition, JoinType};
 
@@ -698,6 +700,7 @@ impl HashJoinBuildFinishBench {
                     join_type: JoinType::Inner,
                     build_keys_unique: false,
                     build_time_integer_index: None,
+                    runtime_filter: None,
                     key_conditions: vec![JoinCondition::equality(
                         reference(0, LogicalType::Integer),
                         reference(0, LogicalType::Integer),
@@ -708,7 +711,7 @@ impl HashJoinBuildFinishBench {
                     build_projection: vec![1].into_boxed_slice(),
                     build_payload_types: vec![LogicalType::Integer].into_boxed_slice(),
                     build_output_count: 1,
-                    force_external: false,
+                    spill_policy: SpillExecutionPolicy::Forbidden,
                 }),
                 sink_sharing: SinkSharing::Exclusive,
                 properties: PipelineProperties::default(),

@@ -28,7 +28,9 @@ impl<'a> PipelineLowerer<'a> {
         let node = self.plan.node(join_root);
         let breaker = match &node.kind {
             PhysicalNodeKind::HashJoin(spec) => BreakerDispatch::HashJoin(spec.clone()),
-            PhysicalNodeKind::NestedLoopJoin(spec) => BreakerDispatch::NestedLoopJoin(spec.clone()),
+            PhysicalNodeKind::NestedLoopJoin(spec) => {
+                BreakerDispatch::NestedLoopJoin(spec.as_ref().clone())
+            }
             PhysicalNodeKind::SortRangeJoin(spec) => BreakerDispatch::SortRangeJoin(spec.clone()),
             PhysicalNodeKind::ClassicIeJoin(spec) => BreakerDispatch::ClassicIeJoin(spec.clone()),
             PhysicalNodeKind::CrossProduct(spec) => BreakerDispatch::CrossProduct(spec.clone()),

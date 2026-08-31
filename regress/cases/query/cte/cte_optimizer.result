@@ -8,7 +8,9 @@ ORDER_BY  (rows=1)
     Output: v
     ->  FILTER  (rows=1)
       Filter: nums.v > 1
-      ->  VALUES  (rows=3)
+      ->  PROJECTION  (rows=3)
+        Output: v
+        ->  VALUES  (rows=3)
 
 EXPLAIN
 WITH nums(v) AS MATERIALIZED (VALUES (1), (2), (3))
@@ -18,9 +20,7 @@ MATERIALIZED_CTE
   CTE Name: nums
   Materialization: MATERIALIZED
   Reference Count: 1
-  ->  FILTER  (rows=1)
-    Filter: nums.v > 1
-    ->  VALUES  (rows=3)
+  ->  VALUES  (rows=3)
   ->  ORDER_BY
     Sort Key: v ASC NULLS LAST
     ->  PROJECTION

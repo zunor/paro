@@ -6,4 +6,6 @@
 pub mod analyze_render;
 pub mod explain_state;
 pub mod profiler;
-pub mod types;
+pub mod types {
+    pub use paro_optimizer::physical::explain::types::*;
+}

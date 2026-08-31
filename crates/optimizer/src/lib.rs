@@ -3,13 +3,13 @@
 
 //! Query optimizer passes and supporting infrastructure.
 
+pub mod cascades;
 pub mod context;
 pub mod cost_model;
 pub mod optimizer;
-pub mod optimizer_type;
-pub(crate) mod pipeline_passes;
+pub mod physical;
 pub mod profiler;
-pub mod rewriter;
+pub mod statement;
 pub(crate) mod verify;
 
 pub mod aggregate;
@@ -26,3 +26,6 @@ pub mod rules;
 pub mod search;
 pub mod statistics;
 pub mod subquery;
+
+pub use optimizer::{OptimizedStatement, Optimizer};
+pub use statement::{ReturningImageContract, WriteContract};

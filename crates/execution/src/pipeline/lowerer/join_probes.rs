@@ -507,6 +507,7 @@ impl<'a> PipelineLowerer<'a> {
                 join_type: spec.join_type,
                 build_keys_unique: spec.build_keys_unique,
                 build_time_integer_index: spec.build_time_integer_index.clone(),
+                runtime_filter: spec.runtime_filter,
                 key_conditions: spec.key_conditions.clone(),
                 residual_conditions: spec.build_residual_conditions.clone(),
                 build_projection: spec.build_input_projection.clone(),
@@ -517,7 +518,7 @@ impl<'a> PipelineLowerer<'a> {
                     .as_ref()
                     .and_then(|cascade| cascade.grouped_extrema.as_ref())
                     .map(|grouped| grouped.channels.len()),
-                force_external: spec.force_external,
+                spill_policy: spec.spill_policy,
             }),
             SinkSharing::Exclusive,
             self.plan.node(*right).output.clone(),
@@ -689,7 +690,9 @@ impl<'a> PipelineLowerer<'a> {
         let node = self.plan.node(root);
         match &node.kind {
             PhysicalNodeKind::HashJoin(spec) => {
-                if needs_hash_join_unmatched_source(spec.join_type) || spec.force_external {
+                if needs_hash_join_unmatched_source(spec.join_type)
+                    || spec.spill_policy == crate::physical::specs::SpillExecutionPolicy::Forced
+                {
                     return self.collect_probe_roles_source_fallback(root, pipelines, dependencies);
                 }
 
@@ -717,6 +720,7 @@ impl<'a> PipelineLowerer<'a> {
                         join_type: spec.join_type,
                         build_keys_unique: spec.build_keys_unique,
                         build_time_integer_index: spec.build_time_integer_index.clone(),
+                        runtime_filter: spec.runtime_filter,
                         key_conditions: spec.key_conditions.clone(),
                         residual_conditions: spec.build_residual_conditions.clone(),
                         build_projection: spec.build_input_projection.clone(),
@@ -727,7 +731,7 @@ impl<'a> PipelineLowerer<'a> {
                             .as_ref()
                             .and_then(|cascade| cascade.grouped_extrema.as_ref())
                             .map(|grouped| grouped.channels.len()),
-                        force_external: false,
+                        spill_policy: spec.spill_policy,
                     }),
                     SinkSharing::Exclusive,
                     self.plan.node(*right).output.clone(),

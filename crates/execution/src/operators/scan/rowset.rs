@@ -62,6 +62,7 @@ pub struct RowsetSourceDesc {
 #[derive(Debug, Clone)]
 pub struct RowsetDynamicRuntimeFilterDesc {
     pub handle: HandleRef<JoinBuildHandle>,
+    pub artifact: crate::physical::Fingerprint,
     pub build_key_index: usize,
     pub probe_column_id: u32,
 }
@@ -99,6 +100,7 @@ impl RowsetSourceDesc {
             .iter()
             .map(|filter| RowsetDynamicRuntimeFilterDesc {
                 handle: HandleRef::new(filter.handle),
+                artifact: filter.artifact,
                 build_key_index: filter.build_key_index,
                 probe_column_id: filter.probe_column_id,
             })

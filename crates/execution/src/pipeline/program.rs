@@ -193,6 +193,7 @@ impl StatementProgram {
     }
 
     pub fn from_physical_plan(plan: PhysicalPlan) -> Result<Self> {
+        paro_optimizer::physical::PhysicalPlanVerifier::verify(&plan)?;
         if let crate::physical::specs::PhysicalNodeKind::Utility(spec) = &plan.node(plan.root).kind
         {
             return Ok(Self::Utility(UtilityProgram { spec: spec.clone() }));
@@ -205,6 +206,27 @@ impl StatementProgram {
         };
         let programs = PipelineProgramBuilder::default().build_program_set(graph.as_ref())?;
         Ok(Self::pipeline(plan, graph, programs))
+    }
+
+    pub fn from_physical_portfolio(
+        portfolio: paro_optimizer::physical::PhysicalPlanPortfolio,
+        available_memory_bytes: u64,
+        available_external_worker_slots: u16,
+    ) -> Result<Self> {
+        portfolio.verify()?;
+        let mut admitted =
+            portfolio.admit(available_memory_bytes, available_external_worker_slots)?;
+        admitted.plan.reservation = Some(admitted.reservation);
+        admitted
+            .plan
+            .properties
+            .get_mut(admitted.plan.root)
+            .ok_or_else(|| {
+                paro_common::error::internal("admitted physical root lost its property contract")
+            })?
+            .grant_contract =
+            paro_optimizer::physical::PhysicalGrantContract::Class(admitted.reservation.class);
+        Self::from_physical_plan(admitted.plan)
     }
 }
 
@@ -531,7 +553,12 @@ impl OperatorRuntimeRegistry {
                 TransformExec::StreamingWindow(StreamingWindowTransformExec { spec: spec.clone() })
             }
             TransformSpec::ExternalProject(spec) => {
-                TransformExec::ExternalProject(ExternalProjectTransformExec { spec: spec.clone() })
+                TransformExec::ExternalProject(ExternalProjectTransformExec {
+                    spec: spec.clone(),
+                    bridge: std::sync::Arc::new(
+                        crate::operators::external::runtime_bridge::ExternalRuntimeBridge::default_bridge(),
+                    ),
+                })
             }
             TransformSpec::GraphExpand(spec) => {
                 TransformExec::GraphExpand(GraphExpandTransformExec { spec: spec.clone() })
@@ -576,13 +603,14 @@ impl OperatorRuntimeRegistry {
                 join_type: spec.join_type,
                 build_keys_unique: spec.build_keys_unique,
                 build_time_integer_index: spec.build_time_integer_index.clone(),
+                runtime_filter: spec.runtime_filter,
                 key_conditions: spec.key_conditions.clone(),
                 residual_conditions: spec.residual_conditions.clone(),
                 build_projection: spec.build_projection.clone(),
                 build_output_count: spec.build_output_count,
                 grouped_reduction_channels: spec.grouped_reduction_channels,
                 build_payload_types: spec.build_payload_types.clone(),
-                force_external: spec.force_external,
+                spill_policy: spec.spill_policy,
             }),
             SinkSpec::HashAggregateBuild(spec) => {
                 SinkExec::HashAggregateBuild(HashAggregateBuildSinkExec {
@@ -609,7 +637,7 @@ impl OperatorRuntimeRegistry {
                 input_types: spec.input_types.clone(),
                 output_names: spec.output_names.clone(),
                 output_types: spec.output_types.clone(),
-                force_external: spec.force_external,
+                spill_policy: spec.spill_policy,
             }),
             SinkSpec::TopNBuild(spec) => SinkExec::TopNBuild(TopNBuildSinkExec {
                 handle: HandleRef::new(spec.handle),
@@ -648,6 +676,9 @@ impl OperatorRuntimeRegistry {
             SinkSpec::ExternalTable(spec) => SinkExec::ExternalTable(ExternalTableSinkExec {
                 handle: HandleRef::new(spec.handle),
                 spec: spec.spec.clone(),
+                bridge: std::sync::Arc::new(
+                    crate::operators::external::runtime_bridge::ExternalRuntimeBridge::default_bridge(),
+                ),
             }),
             SinkSpec::Insert(spec) => SinkExec::Insert(InsertSinkExec {
                 spec: spec.spec.clone(),
@@ -940,6 +971,7 @@ mod tests {
             aggregate_orders: Box::new([]),
             post_reduction: None,
             having_filter: Box::new([]),
+            spill_policy: crate::physical::specs::SpillExecutionPolicy::Allowed,
             perfect_hash: None,
             output_names: Box::new(["a".to_string()]),
             output_types: Box::new([LogicalType::Integer]),
@@ -1050,6 +1082,16 @@ mod tests {
                     table: test_table(),
                     row_id_index: 1,
                     is_full_table_delete: false,
+                    write: paro_optimizer::physical::WriteContract {
+                        target_relation: paro_optimizer::physical::BaseRelationId(0),
+                        target_object_id: 0,
+                        modified_columns: Default::default(),
+                        modified_key_columns: Default::default(),
+                        snapshot_version: 0,
+                        mutation_safety:
+                            paro_optimizer::physical::requirements::MutationSafetyRequirement::None,
+                        returning: paro_optimizer::physical::ReturningImageContract::CountOnly,
+                    },
                 },
             }),
             sink_sharing: SinkSharing::Exclusive,
@@ -1331,13 +1373,14 @@ mod tests {
                         join_type: JoinType::Inner,
                         build_keys_unique: false,
                         build_time_integer_index: None,
+                        runtime_filter: None,
                         key_conditions: Box::new([join_condition()]),
                         residual_conditions: Box::default(),
                         grouped_reduction_channels: None,
                         build_projection: Box::new([0]),
                         build_payload_types: Box::new([LogicalType::Integer]),
                         build_output_count: 1,
-                        force_external: false,
+                        spill_policy: crate::physical::specs::SpillExecutionPolicy::Forbidden,
                     }),
                     sink_sharing: SinkSharing::Exclusive,
                     properties: PipelineProperties::default(),
@@ -1378,7 +1421,7 @@ mod tests {
                         input_types: Box::new([LogicalType::Integer]),
                         output_names: Box::new(["a".to_string()]),
                         output_types: Box::new([LogicalType::Integer]),
-                        force_external: false,
+                        spill_policy: crate::physical::specs::SpillExecutionPolicy::Forbidden,
                     }),
                     sink_sharing: SinkSharing::Exclusive,
                     properties: PipelineProperties::default(),

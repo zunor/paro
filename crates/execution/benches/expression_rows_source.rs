@@ -13,8 +13,6 @@ use paro_common::types::LogicalType;
 use paro_context::test_support::TestStatementContextBuilder;
 use paro_execution::explain::profiler::OperatorProfiler;
 use paro_execution::memory_runtime::QueryMemoryPool;
-use paro_execution::physical::properties::PipelineProperties;
-use paro_execution::physical::specs::ValuesSpec;
 use paro_execution::pipeline::graph::PipelineId;
 use paro_execution::pipeline::handles::BreakerHandleCatalog;
 use paro_execution::runtime::{
@@ -24,6 +22,8 @@ use paro_execution::runtime::{
     ValuesSourceExec, WakeGeneration,
 };
 use paro_execution::thread_context::ThreadContext;
+use paro_optimizer::physical::properties::PipelineProperties;
+use paro_optimizer::physical::specs::ValuesSpec;
 use paro_planner::expression::{ConstantExpression, Expression};
 
 const ROWS: usize = 2_048;

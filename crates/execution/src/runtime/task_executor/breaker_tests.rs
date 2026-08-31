@@ -126,7 +126,7 @@ fn sort_breaker_graph(input_rows: Vec<Vec<Expression>>) -> PipelineGraph {
                     input_types: Box::new([LogicalType::Integer]),
                     output_names: Box::new(["v".to_string()]),
                     output_types: Box::new([LogicalType::Integer]),
-                    force_external: false,
+                    spill_policy: crate::physical::specs::SpillExecutionPolicy::Allowed,
                 }),
                 sink_sharing: SinkSharing::Exclusive,
                 properties: PipelineProperties::default(),
@@ -586,7 +586,8 @@ fn hash_aggregate_breaker_spills_payload_partitions_when_forced_external() {
             parallel_scheduler: false,
         },
     );
-    let spec = grouped_count_spec(None);
+    let mut spec = grouped_count_spec(None);
+    spec.spill_policy = crate::physical::specs::SpillExecutionPolicy::Forced;
     let graph = aggregate_breaker_graph(
         SinkSpec::HashAggregateBuild(HashAggregateBuildSinkSpec {
             handle: BreakerHandleId::new(0),
@@ -867,6 +868,7 @@ fn perfect_hash_having_rejection_still_validates_every_aggregate_state() {
                 wide_type.clone(),
             )),
         ))]),
+        spill_policy: crate::physical::specs::SpillExecutionPolicy::Forbidden,
         perfect_hash: Some(PerfectHashAggregatePlan {
             group_minima: Box::new([1]),
             group_cardinalities: Box::new([2]),
@@ -1078,7 +1080,8 @@ fn external_hash_post_reduction_filters_against_the_global_spilled_domain() {
             parallel_scheduler: false,
         },
     );
-    let spec = grouped_sum_post_max_spec(LogicalType::Integer, None, Box::new([]));
+    let mut spec = grouped_sum_post_max_spec(LogicalType::Integer, None, Box::new([]));
+    spec.spill_policy = crate::physical::specs::SpillExecutionPolicy::Forced;
     let graph = aggregate_breaker_graph(
         SinkSpec::HashAggregateBuild(HashAggregateBuildSinkSpec {
             handle: BreakerHandleId::new(0),

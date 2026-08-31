@@ -934,8 +934,8 @@ fn populate_paro_optimizers(global_state: &mut dyn GlobalTableFunctionState) {
             .entries
             .into_iter()
             .map(|entry| OptimizerData {
-                name: entry.optimizer_type.as_str().to_string(),
-                enabled: entry.enabled,
+                name: entry.component.name().to_string(),
+                kind: entry.component.kind().to_string(),
                 last_elapsed_us: entry.last_elapsed.as_micros().min(i64::MAX as u128) as i64,
                 invocation_count: entry.invocation_count.min(i64::MAX as u64) as i64,
             })
@@ -2550,9 +2550,9 @@ mod tests {
     use std::time::Duration;
 
     use paro_function::table::system::paro_optimizers::ParoOptimizersGlobalState;
-    use paro_optimizer::optimizer_type::OptimizerType;
     use paro_optimizer::profiler::{
-        publish_optimizer_profile_snapshot, OptimizerProfileSnapshot, OptimizerProfileSnapshotEntry,
+        publish_optimizer_profile_snapshot, OptimizerComponent, OptimizerProfileSnapshot,
+        OptimizerProfileSnapshotEntry,
     };
 
     #[test]
@@ -2560,14 +2560,12 @@ mod tests {
         publish_optimizer_profile_snapshot(OptimizerProfileSnapshot {
             entries: vec![
                 OptimizerProfileSnapshotEntry {
-                    optimizer_type: OptimizerType::FilterPushdown,
-                    enabled: true,
+                    component: OptimizerComponent::SemanticNormalization,
                     last_elapsed: Duration::from_micros(33),
                     invocation_count: 5,
                 },
                 OptimizerProfileSnapshotEntry {
-                    optimizer_type: OptimizerType::JoinOrder,
-                    enabled: false,
+                    component: OptimizerComponent::MemoExploration,
                     last_elapsed: Duration::from_micros(0),
                     invocation_count: 0,
                 },
@@ -2583,12 +2581,12 @@ mod tests {
 
         assert_eq!(state.offset.load(Ordering::Relaxed), 0);
         assert_eq!(state.entries.len(), 2);
-        assert_eq!(state.entries[0].name, "filter_pushdown");
-        assert!(state.entries[0].enabled);
+        assert_eq!(state.entries[0].name, "semantic_normalization");
+        assert_eq!(state.entries[0].kind, "frontend");
         assert_eq!(state.entries[0].last_elapsed_us, 33);
         assert_eq!(state.entries[0].invocation_count, 5);
-        assert_eq!(state.entries[1].name, "join_order");
-        assert!(!state.entries[1].enabled);
+        assert_eq!(state.entries[1].name, "memo_exploration");
+        assert_eq!(state.entries[1].kind, "search");
     }
 
     #[test]

@@ -352,9 +352,9 @@ FROM (
 ) AS agg_values_grouping(grp, x)
 GROUP BY GROUPING SETS ((grp), ());
 QUERY PLAN
-PROJECTION  (rows=6)
+PROJECTION  (rows=4)
   Output: grp_g, grp, sum_x
-  ->  AGGREGATE  (rows=6)
+  ->  AGGREGATE  (rows=4)
     Group Key: agg_values_grouping.grp
     Aggregates: sum(agg_values_grouping.x)
     Grouping Sets: (agg_values_grouping.grp), ()
@@ -646,9 +646,9 @@ FROM (
 ) AS agg_phase3_values(g_tiny, h_tiny, x, flag)
 GROUP BY GROUPING SETS ((g_tiny), ());
 QUERY PLAN
-PROJECTION  (rows=6)
+PROJECTION  (rows=4)
   Output: g_tiny, sum_x
-  ->  AGGREGATE  (rows=6)
+  ->  AGGREGATE  (rows=4)
     Group Key: agg_phase3_values.g_tiny
     Aggregates: sum(agg_phase3_values.x)
     Grouping Sets: (agg_phase3_values.g_tiny), ()
@@ -775,9 +775,9 @@ FROM (
 ) AS agg_phase34(k_big, k_int, v)
 GROUP BY GROUPING SETS ((k_big, k_int), ());
 QUERY PLAN
-PROJECTION  (rows=4)
+PROJECTION  (rows=5)
   Output: k_big, k_int, sum_v
-  ->  AGGREGATE  (rows=4)
+  ->  AGGREGATE  (rows=5)
     Group Key: agg_phase34.k_big, agg_phase34.k_int
     Aggregates: sum(agg_phase34.v)
     Grouping Sets: (agg_phase34.k_big, agg_phase34.k_int), ()
@@ -915,7 +915,10 @@ FROM agg_phase0;
 QUERY PLAN
 PROJECTION  (rows=1)
   Output: cnt_star, min_x, max_x
-  ->  VALUES  (rows=1)
+  ->  AGGREGATE  (rows=1)
+    Aggregates: count_star(*), min(public.agg_phase0.x), max(public.agg_phase0.x)
+    ->  ROWSET_SCAN on public.agg_phase0  (rows=6)
+      Columns: x
 
 SELECT
     count(*) AS cnt_star,
@@ -935,7 +938,12 @@ FROM (
 QUERY PLAN
 PROJECTION  (rows=1)
   Output: min_px, max_px
-  ->  VALUES  (rows=1)
+  ->  AGGREGATE  (rows=1)
+    Aggregates: min(agg_phase42_proj.px), max(agg_phase42_proj.px)
+    ->  PROJECTION  (rows=6)
+      Output: px
+      ->  ROWSET_SCAN on public.agg_phase0  (rows=6)
+        Columns: x
 
 SELECT
     min(px) AS min_px,
@@ -954,7 +962,10 @@ FROM agg_phase0;
 QUERY PLAN
 PROJECTION  (rows=1)
   Output: min_y, max_y
-  ->  VALUES  (rows=1)
+  ->  AGGREGATE  (rows=1)
+    Aggregates: min(public.agg_phase0.y), max(public.agg_phase0.y)
+    ->  ROWSET_SCAN on public.agg_phase0  (rows=6)
+      Columns: y
 
 SELECT
     min(y) AS min_y,

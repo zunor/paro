@@ -36,7 +36,7 @@ impl TableFunctionBindData for ParoOptimizersBindData {
 #[derive(Debug, Clone)]
 pub struct OptimizerData {
     pub name: String,
-    pub enabled: bool,
+    pub kind: String,
     pub last_elapsed_us: i64,
     pub invocation_count: i64,
 }
@@ -76,8 +76,8 @@ fn paro_optimizers_bind(
     names.push("name".to_string());
     return_types.push(LogicalType::Varchar);
 
-    names.push("enabled".to_string());
-    return_types.push(LogicalType::Boolean);
+    names.push("kind".to_string());
+    return_types.push(LogicalType::Varchar);
 
     names.push("last_elapsed_us".to_string());
     return_types.push(LogicalType::BigInt);
@@ -118,13 +118,13 @@ fn paro_optimizers_function(
 
     let batch_size = 2048.min(gstate.entries.len() - offset);
     let mut names = Vec::with_capacity(batch_size);
-    let mut enabled = Vec::with_capacity(batch_size);
+    let mut kinds = Vec::with_capacity(batch_size);
     let mut last_elapsed = Vec::with_capacity(batch_size);
     let mut invocations = Vec::with_capacity(batch_size);
 
     for entry in gstate.entries.iter().skip(offset).take(batch_size) {
         names.push(entry.name.clone());
-        enabled.push(entry.enabled);
+        kinds.push(entry.kind.clone());
         last_elapsed.push(entry.last_elapsed_us);
         invocations.push(entry.invocation_count);
     }
@@ -136,7 +136,8 @@ fn paro_optimizers_function(
         *col = Vector::try_from_strings(&name_refs, output_allocator.clone())?;
     }
     if let Some(col) = output.column_mut(1) {
-        *col = Vector::try_from_bool(&enabled, output_allocator.clone())?;
+        let kind_refs: Vec<&str> = kinds.iter().map(|value| value.as_str()).collect();
+        *col = Vector::try_from_strings(&kind_refs, output_allocator.clone())?;
     }
     if let Some(col) = output.column_mut(2) {
         *col = Vector::try_from_i64(&last_elapsed, output_allocator.clone())?;
@@ -202,13 +203,13 @@ mod tests {
         assert!(bind.is_some());
         assert_eq!(
             names,
-            vec!["name", "enabled", "last_elapsed_us", "invocation_count"]
+            vec!["name", "kind", "last_elapsed_us", "invocation_count"]
         );
         assert_eq!(
             return_types,
             vec![
                 LogicalType::Varchar,
-                LogicalType::Boolean,
+                LogicalType::Varchar,
                 LogicalType::BigInt,
                 LogicalType::BigInt,
             ]
@@ -228,14 +229,14 @@ mod tests {
             state,
             vec![
                 OptimizerData {
-                    name: "filter_pushdown".to_string(),
-                    enabled: true,
+                    name: "semantic_normalization".to_string(),
+                    kind: "frontend".to_string(),
                     last_elapsed_us: 42,
                     invocation_count: 7,
                 },
                 OptimizerData {
-                    name: "join_order".to_string(),
-                    enabled: false,
+                    name: "memo_exploration".to_string(),
+                    kind: "search".to_string(),
                     last_elapsed_us: 0,
                     invocation_count: 0,
                 },
@@ -254,7 +255,7 @@ mod tests {
         let mut chunk = paro_common::test_utils::test_chunk_with_capacity(
             &[
                 LogicalType::Varchar,
-                LogicalType::Boolean,
+                LogicalType::Varchar,
                 LogicalType::BigInt,
                 LogicalType::BigInt,
             ],
@@ -266,14 +267,17 @@ mod tests {
         assert_eq!(chunk.size(), 2);
         assert_eq!(
             chunk.column(0).unwrap().get_value(0),
-            Value::Varchar("filter_pushdown".to_string())
+            Value::Varchar("semantic_normalization".to_string())
         );
-        assert_eq!(chunk.column(1).unwrap().get_value(0), Value::Boolean(true));
+        assert_eq!(
+            chunk.column(1).unwrap().get_value(0),
+            Value::Varchar("frontend".to_string())
+        );
         assert_eq!(chunk.column(2).unwrap().get_value(0), Value::BigInt(42));
         assert_eq!(chunk.column(3).unwrap().get_value(0), Value::BigInt(7));
         assert_eq!(
             chunk.column(0).unwrap().get_value(1),
-            Value::Varchar("join_order".to_string())
+            Value::Varchar("memo_exploration".to_string())
         );
     }
 
@@ -289,8 +293,8 @@ mod tests {
         populate_optimizer_data(
             state,
             vec![OptimizerData {
-                name: "filter_pushdown".to_string(),
-                enabled: true,
+                name: "semantic_normalization".to_string(),
+                kind: "frontend".to_string(),
                 last_elapsed_us: 1,
                 invocation_count: 1,
             }],

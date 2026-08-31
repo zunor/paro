@@ -772,6 +772,7 @@ mod tests {
             aggregate_orders: Box::new([Box::new([])]),
             post_reduction: None,
             having_filter: Box::new([]),
+            spill_policy: crate::physical::specs::SpillExecutionPolicy::Allowed,
             perfect_hash: None,
             output_names: Box::new(["k".to_string(), "count".to_string()]),
             output_types: Box::new([LogicalType::Integer, LogicalType::BigInt]),

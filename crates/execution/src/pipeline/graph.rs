@@ -16,9 +16,10 @@ use crate::physical::specs::{
     ClassicIeJoinSpec, CopyToFileSpec, DeleteSpec, DummyScanSpec, EmptyResultSpec,
     ExpressionScanSpec, ExternalProjectSpec, ExternalTableSpec, FilterSpec, FullTextSearchSpec,
     GraphExpandSpec, GraphProjectSpec, GraphScanSpec, GraphShortestPathSpec,
-    HashReductionCascadeSpec, InsertSpec, LimitSpec, PartitionAggregateWindowSpec, ProjectSpec,
-    RowFetchSpec, RowsetScanSpec, SetOperationInputSide, SetOperationSpec, SparseVectorSearchSpec,
-    TableFunctionScanSpec, TopNSpec, UpdateSpec, ValuesSpec, VectorSearchSpec, WindowSpec,
+    HashJoinRuntimeFilterSpec, HashReductionCascadeSpec, InsertSpec, LimitSpec,
+    PartitionAggregateWindowSpec, ProjectSpec, RowFetchSpec, RowsetScanSpec, SetOperationInputSide,
+    SetOperationSpec, SparseVectorSearchSpec, SpillExecutionPolicy, TableFunctionScanSpec,
+    TopNSpec, UpdateSpec, ValuesSpec, VectorSearchSpec, WindowSpec,
 };
 
 use super::handles::{BreakerHandleCatalog, BreakerHandleId, BreakerHandleKind};
@@ -102,6 +103,7 @@ impl PipelineGraph {
         self.validate_control_regions()?;
         self.handles.validate()?;
         self.validate_pipeline_handles()?;
+        self.validate_runtime_filter_contracts()?;
         Ok(())
     }
 
@@ -327,6 +329,73 @@ impl PipelineGraph {
                     }
                     Ok(())
                 })?;
+        }
+        Ok(())
+    }
+
+    fn validate_runtime_filter_contracts(&self) -> Result<()> {
+        for consumer in &self.pipelines {
+            let SourceSpec::Rowset(source) = &consumer.source else {
+                continue;
+            };
+            for filter in &source.dynamic_runtime_filters {
+                let handle = self.handles.get(filter.handle).ok_or_else(|| {
+                    paro_error::internal("runtime-filter consumer references unknown handle")
+                })?;
+                let producer_id = handle.producer.ok_or_else(|| {
+                    paro_error::internal("runtime-filter artifact has no producer pipeline")
+                })?;
+                let producer = self.pipeline(producer_id).ok_or_else(|| {
+                    paro_error::internal("runtime-filter producer pipeline is invalid")
+                })?;
+                let SinkSpec::HashJoinBuild(build) = &producer.sink else {
+                    return Err(paro_error::internal(
+                        "runtime-filter artifact producer is not a hash-join build",
+                    ));
+                };
+                let contract = build.runtime_filter.ok_or_else(|| {
+                    paro_error::internal(
+                        "rowset consumes a runtime filter absent from the hash-join contract",
+                    )
+                })?;
+                if build.handle != filter.handle || contract.artifact != filter.artifact {
+                    return Err(paro_error::internal(
+                        "runtime-filter producer and consumer artifact identities differ",
+                    ));
+                }
+                if !self.dependencies.iter().any(|dependency| {
+                    dependency.producer == producer_id
+                        && dependency.consumer == consumer.id
+                        && dependency.kind == DependencyKind::BuildBeforeProbe
+                }) {
+                    return Err(paro_error::internal(
+                        "wait-complete runtime filter lacks a build-before-probe dependency",
+                    ));
+                }
+            }
+        }
+
+        for producer in &self.pipelines {
+            let SinkSpec::HashJoinBuild(build) = &producer.sink else {
+                continue;
+            };
+            let Some(contract) = build.runtime_filter else {
+                continue;
+            };
+            let has_consumer = self.pipelines.iter().any(|pipeline| {
+                matches!(
+                    &pipeline.source,
+                    SourceSpec::Rowset(source)
+                        if source.dynamic_runtime_filters.iter().any(|filter| {
+                            filter.handle == build.handle && filter.artifact == contract.artifact
+                        })
+                )
+            });
+            if !has_consumer {
+                return Err(paro_error::internal(
+                    "hash-join runtime-filter contract has no rowset consumer",
+                ));
+            }
         }
         Ok(())
     }
@@ -607,6 +676,7 @@ impl RowsetSourceSpec {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct RowsetDynamicRuntimeFilterSpec {
     pub handle: BreakerHandleId,
+    pub artifact: crate::physical::Fingerprint,
     pub build_key_index: usize,
     pub probe_column_id: u32,
 }
@@ -1012,13 +1082,16 @@ pub struct HashJoinBuildSinkSpec {
     pub join_type: JoinType,
     pub build_keys_unique: bool,
     pub build_time_integer_index: Option<BuildTimeIntegerJoinIndexSpec>,
+    /// Selected AuxiliaryPlanRegion contract. `None` means the mandatory
+    /// baseline and forbids runtime-filter construction and publication.
+    pub runtime_filter: Option<HashJoinRuntimeFilterSpec>,
     pub key_conditions: Box<[JoinCondition]>,
     pub residual_conditions: Box<[JoinCondition]>,
     pub build_projection: Box<[usize]>,
     pub build_payload_types: Box<[LogicalType]>,
     pub build_output_count: usize,
     pub grouped_reduction_channels: Option<usize>,
-    pub force_external: bool,
+    pub spill_policy: SpillExecutionPolicy,
 }
 
 #[derive(Debug, Clone)]
@@ -1047,7 +1120,7 @@ pub struct SortBuildSinkSpec {
     pub input_types: Box<[LogicalType]>,
     pub output_names: Box<[String]>,
     pub output_types: Box<[LogicalType]>,
-    pub force_external: bool,
+    pub spill_policy: SpillExecutionPolicy,
 }
 
 #[derive(Debug, Clone)]

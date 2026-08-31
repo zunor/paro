@@ -39,7 +39,8 @@ impl Binder {
         scan.append_virtual_rowid("rowid");
         let mut root = LogicalOperator::Get(scan);
 
-        if let Some(condition) = info.condition {
+        if let Some(mut condition) = info.condition {
+            self.plan_subqueries(&mut condition, &mut root)?;
             let filter = Filter::new(self.wrap_plan(root), vec![condition]);
             root = LogicalOperator::Filter(filter);
         }
@@ -55,7 +56,7 @@ impl Binder {
         Ok(LogicalOperator::Delete(delete))
     }
 
-    pub(crate) fn plan_update(&mut self, info: BoundUpdateInfo) -> Result<LogicalOperator> {
+    pub(crate) fn plan_update(&mut self, mut info: BoundUpdateInfo) -> Result<LogicalOperator> {
         let column_names: Vec<String> = info.table.columns.iter().map(|c| c.name.clone()).collect();
         let column_types: Vec<_> = info
             .table
@@ -72,9 +73,14 @@ impl Binder {
         scan.append_virtual_rowid("rowid");
         let mut root = LogicalOperator::Get(scan);
 
-        if let Some(condition) = info.condition {
+        if let Some(mut condition) = info.condition {
+            self.plan_subqueries(&mut condition, &mut root)?;
             let filter = Filter::new(self.wrap_plan(root), vec![condition]);
             root = LogicalOperator::Filter(filter);
+        }
+
+        for expression in &mut info.expressions {
+            self.plan_subqueries(expression, &mut root)?;
         }
 
         let update_table_index = self.bind_context.generate_table_index() as u32;

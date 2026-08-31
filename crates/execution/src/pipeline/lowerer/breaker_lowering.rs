@@ -259,7 +259,7 @@ impl<'a> PipelineLowerer<'a> {
                         input_types: input.types.clone(),
                         output_names: output.names.clone(),
                         output_types: output.types.clone(),
-                        force_external: false,
+                        spill_policy: spec.spill_policy,
                     }),
                     SinkSharing::Exclusive,
                     input,
@@ -421,7 +421,8 @@ impl<'a> PipelineLowerer<'a> {
     }
 
     pub(crate) fn is_tail_breaker(kind: &PhysicalNodeKind) -> bool {
-        BreakerRef::from_kind(kind).is_some_and(|breaker| breaker.is_tail_boundary())
+        matches!(kind, PhysicalNodeKind::MutationInputSpool(_))
+            || BreakerRef::from_kind(kind).is_some_and(|breaker| breaker.is_tail_boundary())
     }
 
     pub(crate) fn probe_fusion_candidate_dispatch(

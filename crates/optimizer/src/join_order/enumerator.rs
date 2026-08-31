@@ -15,12 +15,6 @@ use crate::join_order::query_graph::{
 };
 use crate::join_order::relation::{JoinRelationSet, JoinRelationSetManager};
 
-/// Threshold to switch from exact to approximate join order optimization.
-pub const THRESHOLD_TO_SWAP_TO_APPROXIMATE: usize = 12;
-
-/// Maximum number of pairs to consider before switching to greedy algorithm.
-const MAX_PAIRS: usize = 10000;
-
 /// Terminal state of one enumeration strategy.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum EnumerationOutcome {
@@ -52,15 +46,36 @@ pub(crate) struct PlanEnumerator<'a> {
     plans: HashMap<Arc<JoinRelationSet>, DPJoinNode>,
     /// The total number of join pairs considered.
     pairs: usize,
+    exact_relation_limit: usize,
+    max_pairs: usize,
 }
 
 impl<'a> PlanEnumerator<'a> {
     /// Create a new PlanEnumerator.
+    #[cfg(test)]
     pub fn new(
         query_graph: &'a QueryGraphEdges,
         set_manager: &'a mut JoinRelationSetManager,
         cost_model: &'a mut CostModel,
         num_relations: usize,
+    ) -> Self {
+        Self::with_budget(
+            query_graph,
+            set_manager,
+            cost_model,
+            num_relations,
+            12,
+            10_000,
+        )
+    }
+
+    pub fn with_budget(
+        query_graph: &'a QueryGraphEdges,
+        set_manager: &'a mut JoinRelationSetManager,
+        cost_model: &'a mut CostModel,
+        num_relations: usize,
+        exact_relation_limit: usize,
+        max_pairs: usize,
     ) -> Self {
         Self {
             query_graph,
@@ -69,6 +84,8 @@ impl<'a> PlanEnumerator<'a> {
             num_relations,
             plans: HashMap::new(),
             pairs: 0,
+            exact_relation_limit,
+            max_pairs,
         }
     }
 
@@ -91,7 +108,7 @@ impl<'a> PlanEnumerator<'a> {
     ///
     pub fn solve_join_order(&mut self) -> EnumerationOutcome {
         // For small graphs, try exact algorithm first
-        if self.num_relations < THRESHOLD_TO_SWAP_TO_APPROXIMATE {
+        if self.num_relations <= self.exact_relation_limit {
             match self.solve_join_order_exactly() {
                 EnumerationOutcome::Complete => {
                     // Check if we got a final plan
@@ -134,6 +151,7 @@ impl<'a> PlanEnumerator<'a> {
             exact_pairs = self.pairs,
             "Falling back to greedy join-order enumeration"
         );
+        self.pairs = 0;
         self.solve_join_order_approximately()
     }
 
@@ -339,7 +357,7 @@ impl<'a> PlanEnumerator<'a> {
         connections: &[NeighborInfo],
     ) -> EnumerationOutcome {
         self.pairs += 1;
-        if self.pairs >= MAX_PAIRS {
+        if self.pairs > self.max_pairs {
             return EnumerationOutcome::PairBudgetExhausted;
         }
 
@@ -441,6 +459,10 @@ impl<'a> PlanEnumerator<'a> {
             // Find the best pair to join
             for i in 0..join_relations.len() {
                 for j in (i + 1)..join_relations.len() {
+                    self.pairs = self.pairs.saturating_add(1);
+                    if self.pairs > self.max_pairs {
+                        return EnumerationOutcome::PairBudgetExhausted;
+                    }
                     let connections = self
                         .query_graph
                         .get_connections(&join_relations[i], &join_relations[j]);
@@ -917,7 +939,7 @@ mod tests {
         let query_graph = QueryGraphEdges::new();
 
         // Create many relations to trigger approximate algorithm
-        let num_relations = THRESHOLD_TO_SWAP_TO_APPROXIMATE + 1;
+        let num_relations = 13;
         let stats: Vec<_> = (0..num_relations)
             .map(|_| RelationStats::with_cardinality(1000))
             .collect();

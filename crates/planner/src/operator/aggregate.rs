@@ -214,7 +214,7 @@ pub enum GroupInputMultiplicity {
 /// One cached input layout for resolving expressions in either lifecycle domain.
 ///
 /// Optimizer proofs are issued while expressions carry logical
-/// [`ColumnBinding`]s. Before physical generation, `ColumnBindingResolver`
+/// [`ColumnBinding`]s. During winner extraction, the physical slot allocator
 /// replaces those values with positional references local to the expression's
 /// input operator. Revalidation deliberately maps both representations back
 /// to the same binding domain so resolving a plan cannot erase a still-valid

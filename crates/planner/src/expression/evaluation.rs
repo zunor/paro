@@ -3,9 +3,68 @@
 
 //! Evaluation properties used to guard semantics-changing rewrites.
 
-use paro_function::scalar::{FunctionErrorMode, FunctionSideEffects, FunctionStability};
+use std::sync::Arc;
+
+use paro_common::allocator::default_allocator;
+use paro_common::error::Result;
+use paro_common::runtime_value::Value;
+use paro_common::vector::Vector;
+use paro_function::scalar::cast::{CastContextDependency, CastExecCtx};
+use paro_function::scalar::{
+    FunctionErrorMode, FunctionExecContext, FunctionSideEffects, FunctionStability,
+};
 
 use super::{Expression, ExpressionIterator, WindowExpression};
+
+/// Evaluate a bound literal or compile-time cast without consulting session or
+/// runtime state. Expressions with runtime-dependent casts are not constants.
+pub fn evaluate_constant_expression(expression: &Expression) -> Result<Option<Value>> {
+    match expression {
+        Expression::Constant(constant) => Ok(Some(constant.value.clone())),
+        Expression::Cast(cast) => {
+            if cast.cast_info.context_dependency() == CastContextDependency::Runtime {
+                return Ok(None);
+            }
+            let Some(value) = evaluate_constant_expression(cast.child.as_ref())? else {
+                return Ok(None);
+            };
+            if value.is_null() {
+                return Ok(None);
+            }
+
+            let allocator = Arc::new(default_allocator());
+            let mut source = Vector::try_new(value.logical_type(), 1, allocator.clone())?;
+            source.set_count(1);
+            source.set_value(0, &value);
+            let mut result = Vector::try_new(cast.target_type.clone(), 1, allocator)?;
+            let ctx = CastExecCtx {
+                runtime: &ConstantEvaluationContext,
+                try_cast: cast.try_cast,
+                cast_data: cast.cast_info.cast_data.as_deref(),
+            };
+            cast.cast_info.execute(&source, &mut result, 1, &ctx)?;
+            let value = result.get_value(0);
+            Ok((!value.is_null()).then_some(value))
+        }
+        _ => Ok(None),
+    }
+}
+
+struct ConstantEvaluationContext;
+
+impl FunctionExecContext for ConstantEvaluationContext {
+    fn current_database(&self) -> Option<&str> {
+        None
+    }
+
+    fn current_schema(&self) -> Option<&str> {
+        None
+    }
+
+    fn current_user(&self) -> Option<&str> {
+        None
+    }
+}
 
 /// Properties that determine whether an expression may be moved or evaluated once for several
 /// structurally equal uses.

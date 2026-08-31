@@ -807,7 +807,7 @@ mod tests {
     }
 
     #[test]
-    fn fulltext_provider_stats_round_trip_to_search_cost_views() {
+    fn fulltext_provider_stats_round_trip_to_cost_views() {
         let stats = FullTextProviderStats {
             total_docs: 7,
             total_terms: 21,

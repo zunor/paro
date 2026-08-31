@@ -16,6 +16,17 @@ impl<'a> PipelineLowerer<'a> {
         dependencies: &mut Vec<PipelineDependency>,
     ) -> Result<PipelineId> {
         match &self.plan.node(root).kind {
+            PhysicalNodeKind::MutationInputSpool(_) => {
+                return self.lower_mutation_input_spool_to_sink(
+                    root,
+                    Vec::new(),
+                    sink,
+                    sink_sharing,
+                    output,
+                    pipelines,
+                    dependencies,
+                );
+            }
             PhysicalNodeKind::MaterializedCte(spec) => {
                 return self.lower_materialized_cte_to_sink(
                     root,
@@ -97,6 +108,17 @@ impl<'a> PipelineLowerer<'a> {
         dependencies: &mut Vec<PipelineDependency>,
     ) -> Result<PipelineId> {
         match &self.plan.node(tail.breaker).kind {
+            PhysicalNodeKind::MutationInputSpool(_) => {
+                return self.lower_mutation_input_spool_to_sink(
+                    tail.breaker,
+                    tail.transforms,
+                    sink,
+                    sink_sharing,
+                    tail.output,
+                    pipelines,
+                    dependencies,
+                );
+            }
             PhysicalNodeKind::RecursiveCte(spec) => {
                 return self.lower_recursive_cte_to_sink(
                     tail.breaker,

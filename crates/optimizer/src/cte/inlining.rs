@@ -12,11 +12,23 @@ use std::ops::ControlFlow;
 
 pub struct CTEInlining<'a> {
     bind_context: &'a BindContext,
+    inline_default: bool,
 }
 
 impl<'a> CTEInlining<'a> {
     pub fn new(bind_context: &'a BindContext) -> Self {
-        Self { bind_context }
+        Self {
+            bind_context,
+            inline_default: true,
+        }
+    }
+
+    /// Restrict the pass to SQL's mandatory `NOT MATERIALIZED` contract.
+    /// Default CTEs remain available for the SharedSubplanRegion to compare
+    /// inline and shared-materialization alternatives by cost.
+    pub fn only_not_materialized(mut self) -> Self {
+        self.inline_default = false;
+        self
     }
 
     pub fn optimize_plan(&mut self, plan: LogicalPlan) -> LogicalPlan {
@@ -41,6 +53,10 @@ impl<'a> CTEInlining<'a> {
         }
 
         if cte.materialized == CTEMaterialize::Materialized {
+            return LogicalOperator::MaterializedCTE(cte);
+        }
+
+        if cte.materialized == CTEMaterialize::Default && !self.inline_default {
             return LogicalOperator::MaterializedCTE(cte);
         }
 

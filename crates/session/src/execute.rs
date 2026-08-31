@@ -390,7 +390,9 @@ impl Session {
                 &compile_environment,
             )
         });
-        let cached_plan = cached_plan.flatten();
+        let cached_plan = cached_plan
+            .flatten()
+            .filter(|plan| plan.dynamic_dependencies_available(ctx.as_ref()));
         let compile_result = if let Some(plan) = cached_plan.as_ref() {
             debug!(
                 target: targets::QUERY,

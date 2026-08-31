@@ -162,6 +162,7 @@ mod breaker_lowering;
 mod classic_ie_join;
 mod cte;
 mod dispatch;
+mod enforcer;
 mod external;
 mod helpers;
 mod join_breakers;

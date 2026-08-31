@@ -31,7 +31,7 @@ use paro_planner::planner::Planner;
 use paro_storage::table::table_factory::TableFactory;
 
 use super::partition_aggregate::CorrelatedPartitionAggregate;
-use crate::optimizer::Optimizer;
+use crate::optimizer::Optimizer as TestOptimizer;
 
 #[test]
 fn tpch_q02_and_q17_reuse_the_detail_source() {
@@ -59,8 +59,10 @@ fn tpch_q20_pulls_unique_correlated_sum_into_grouped_join() {
             let mut planner = Planner::new(session.clone());
             planner.create_plan(statement).expect("plan q20");
             let planned = planner.take_plan().expect("logical q20");
-            let mut optimizer = Optimizer::new(planner.binder.clone(), session);
-            let optimized = optimizer.optimize(planned).expect("optimize q20");
+            let mut optimizer = TestOptimizer::new(planner.binder.clone(), session);
+            let optimized = optimizer
+                .correlated_frontier_for_test(planned)
+                .expect("enumerate q20 relational frontier");
             let inspection = inspect_plan(&optimized);
 
             assert_eq!(inspection.delim_joins, 0, "{optimized:#?}");
@@ -194,8 +196,10 @@ fn assert_tpch_rewrites() {
         let mut planner = Planner::new(session.clone());
         planner.create_plan(statement).expect("plan");
         let planned = planner.take_plan().expect("logical plan");
-        let mut optimizer = Optimizer::new(planner.binder.clone(), session.clone());
-        let optimized = optimizer.optimize(planned).expect("optimize");
+        let mut optimizer = TestOptimizer::new(planner.binder.clone(), session.clone());
+        let optimized = optimizer
+            .correlated_frontier_for_test(planned)
+            .expect("enumerate relational frontier");
         let inspection = inspect_plan(&optimized);
         assert_eq!(inspection.windows, 1, "{query}: {optimized:#?}");
         assert_eq!(inspection.delim_joins, 0, "{query}: {optimized:#?}");
@@ -662,8 +666,10 @@ fn small_customer_payload_declines_late_fetch_without_losing_bindings() {
     let mut planner = Planner::new(session.clone());
     planner.create_plan(statement).expect("plan q10 shape");
     let planned = planner.take_plan().expect("logical q10 shape");
-    let mut optimizer = Optimizer::new(planner.binder.clone(), session);
-    let optimized = optimizer.optimize(planned).expect("optimize q10 shape");
+    let mut optimizer = TestOptimizer::new(planner.binder.clone(), session);
+    let optimized = optimizer
+        .correlated_frontier_for_test(planned)
+        .expect("enumerate q10 relational frontier");
     assert_eq!(
         inspect_plan(&optimized).late_fetches,
         0,
@@ -728,8 +734,10 @@ fn unique_dimension_key_other_than_partition_key_does_not_rewrite() {
     let mut planner = Planner::new(session.clone());
     planner.create_plan(statement).expect("plan negative case");
     let planned = planner.take_plan().expect("logical negative plan");
-    let mut optimizer = Optimizer::new(planner.binder.clone(), session);
-    let optimized = optimizer.optimize(planned).expect("optimize negative case");
+    let mut optimizer = TestOptimizer::new(planner.binder.clone(), session);
+    let optimized = optimizer
+        .correlated_frontier_for_test(planned)
+        .expect("enumerate negative relational frontier");
     let inspection = inspect_plan(&optimized);
 
     assert_eq!(
@@ -855,6 +863,8 @@ fn optimize_sql(sql: &str) -> paro_planner::plan::LogicalPlan {
     let mut planner = Planner::new(session.clone());
     planner.create_plan(statement).expect("plan negative case");
     let planned = planner.take_plan().expect("logical negative plan");
-    let mut optimizer = Optimizer::new(planner.binder.clone(), session);
-    optimizer.optimize(planned).expect("optimize negative case")
+    let mut optimizer = TestOptimizer::new(planner.binder.clone(), session);
+    optimizer
+        .correlated_frontier_for_test(planned)
+        .expect("enumerate negative relational frontier")
 }

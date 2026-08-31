@@ -26,7 +26,9 @@ use crate::operators::join::hash::payload::{
     build_payload_chunk_ref, build_payload_with_extras_ref,
 };
 use crate::physical::properties::MemoryClass;
-use crate::physical::specs::BuildTimeIntegerJoinIndexSpec;
+use crate::physical::specs::{
+    BuildTimeIntegerJoinIndexSpec, HashJoinRuntimeFilterSpec, SpillExecutionPolicy,
+};
 use crate::runtime::breaker::{
     HandleRef, HashJoinBuildSpillReclaimer, HashJoinLocalBuildSpillReclaimer, JoinBuildHandle,
     JoinRuntimeFilterBuilder,
@@ -48,19 +50,22 @@ pub struct HashJoinBuildSinkExec {
     pub join_type: JoinType,
     pub build_keys_unique: bool,
     pub build_time_integer_index: Option<BuildTimeIntegerJoinIndexSpec>,
+    pub runtime_filter: Option<HashJoinRuntimeFilterSpec>,
     pub key_conditions: Box<[JoinCondition]>,
     pub residual_conditions: Box<[JoinCondition]>,
     pub build_projection: Box<[usize]>,
     pub build_output_count: usize,
     pub grouped_reduction_channels: Option<usize>,
     pub build_payload_types: Box<[LogicalType]>,
-    pub force_external: bool,
+    pub spill_policy: crate::physical::specs::SpillExecutionPolicy,
 }
 
 impl HashJoinBuildSinkExec {
     pub(crate) fn create_global(&self, ctx: &mut PipelineInitContext) -> Result<SinkGlobal> {
         let handle = ctx.handles.get(self.handle)?;
-        if !self.force_external && handle.build_time_integer_builder().is_none() {
+        if self.spill_policy != SpillExecutionPolicy::Forced
+            && handle.build_time_integer_builder().is_none()
+        {
             if let Some(index) = &self.build_time_integer_index {
                 let [condition] = self.key_conditions.as_ref() else {
                     return Err(paro_error::internal(
@@ -94,18 +99,21 @@ impl HashJoinBuildSinkExec {
             self.build_output_count,
             self.join_type,
             self.build_keys_unique,
+            self.runtime_filter.is_some(),
             hash_join_memory_context(ctx.query),
         )?;
         if let Some(channel_count) = self.grouped_reduction_channels {
             table.configure_grouped_reduction_extrema(channel_count)?;
         }
-        ctx.query.memory.register_reclaimer_once_by_name(Arc::new(
-            HashJoinBuildSpillReclaimer::new(
-                handle.clone(),
-                hash_join_spill_memory_context(ctx.query),
-                ctx.query.memory.capacity_bytes(),
-            ),
-        ));
+        if self.spill_policy != SpillExecutionPolicy::Forbidden {
+            ctx.query.memory.register_reclaimer_once_by_name(Arc::new(
+                HashJoinBuildSpillReclaimer::new(
+                    handle.clone(),
+                    hash_join_spill_memory_context(ctx.query),
+                    ctx.query.memory.capacity_bytes(),
+                ),
+            ));
+        }
         Ok(SinkGlobal::HashJoinBuild(Arc::new(BreakerHandleGlobal {
             handle,
         })))
@@ -140,35 +148,39 @@ impl HashJoinBuildSinkExec {
             hash_join_memory_context(ctx.query),
         ));
         let build_spill = Arc::new(parking_lot::Mutex::new(None));
-        let (local_build_spill_reclaimer_name, query_memory) =
-            if !hash_join_local_build_spill_supported(self.join_type) {
-                (None, None)
-            } else {
-                let local_id = HashJoinLocalBuildSpillReclaimer::next_local_id();
-                let name = HashJoinLocalBuildSpillReclaimer::name_for(&handle, local_id);
-                ctx.query.memory.register_reclaimer_once_by_name(Arc::new(
-                    HashJoinLocalBuildSpillReclaimer::new(
-                        handle,
-                        local_id,
-                        Arc::clone(&hash_table),
-                        Arc::clone(&build_spill),
-                        hash_join_spill_memory_context(ctx.query),
-                        ctx.query.memory.capacity_bytes(),
-                    ),
-                ));
-                (Some(name), Some(Arc::clone(&ctx.query.memory)))
-            };
+        let (local_build_spill_reclaimer_name, query_memory) = if self.spill_policy
+            == SpillExecutionPolicy::Forbidden
+            || !hash_join_local_build_spill_supported(self.join_type)
+        {
+            (None, None)
+        } else {
+            let local_id = HashJoinLocalBuildSpillReclaimer::next_local_id();
+            let name = HashJoinLocalBuildSpillReclaimer::name_for(&handle, local_id);
+            ctx.query.memory.register_reclaimer_once_by_name(Arc::new(
+                HashJoinLocalBuildSpillReclaimer::new(
+                    handle,
+                    local_id,
+                    Arc::clone(&hash_table),
+                    Arc::clone(&build_spill),
+                    hash_join_spill_memory_context(ctx.query),
+                    ctx.query.memory.capacity_bytes(),
+                ),
+            ));
+            (Some(name), Some(Arc::clone(&ctx.query.memory)))
+        };
         Ok(SinkLocal::HashJoinBuild(HashJoinBuildSinkLocal {
             hash_table: Some(hash_table),
             build_keys: None,
             build_payload: None,
             build_selection: None,
             build_hashes: Vec::new(),
-            runtime_filter_builder: Some(JoinRuntimeFilterBuilder::empty_with_memory(
-                &build_key_types,
-                hash_join_memory_context(ctx.query)
-                    .with_class(paro_common::memory::MemoryAccountingClass::Metadata),
-            )),
+            runtime_filter_builder: self.runtime_filter.map(|_| {
+                JoinRuntimeFilterBuilder::empty_with_memory(
+                    &build_key_types,
+                    hash_join_memory_context(ctx.query)
+                        .with_class(paro_common::memory::MemoryAccountingClass::Metadata),
+                )
+            }),
             build_spill,
             local_build_spill_reclaimer_name,
             query_memory,
@@ -274,11 +286,9 @@ impl HashJoinBuildSinkExec {
             &mut local.build_hashes,
         )?;
         if appended_count > 0 {
-            local
-                .runtime_filter_builder
-                .as_mut()
-                .ok_or_else(|| paro_error::internal("hash join runtime filter builder missing"))?
-                .add_key_chunk(key_chunk, build_selection, appended_count)?;
+            if let Some(builder) = local.runtime_filter_builder.as_mut() {
+                builder.add_key_chunk(key_chunk, build_selection, appended_count)?;
+            }
         }
         Ok(SinkPoll::NeedMoreInput)
     }
@@ -323,7 +333,9 @@ impl HashJoinBuildSinkExec {
                 "hash join build sink global state mismatch",
             ));
         };
-        global.handle.enable_build_reclaim();
+        if self.spill_policy != SpillExecutionPolicy::Forbidden {
+            global.handle.enable_build_reclaim();
+        }
         Ok(PrepareFinishPoll::Done)
     }
 
@@ -338,16 +350,16 @@ impl HashJoinBuildSinkExec {
             ));
         };
         let handle = global.handle.clone();
-        let force_external = self.force_external;
+        let force_external = self.spill_policy == SpillExecutionPolicy::Forced;
+        let allow_external = self.spill_policy != SpillExecutionPolicy::Forbidden;
         let memory_class = if force_external {
             MemoryClass::External
         } else {
             MemoryClass::Blocking
         };
-        if !force_external
-            && !should_use_memory_triggered_external_join(ctx, handle.as_ref())
-            && !handle.completion.is_complete()
-        {
+        let use_external =
+            allow_external && should_use_memory_triggered_external_join(ctx, handle.as_ref());
+        if !(force_external || use_external || handle.completion.is_complete()) {
             handle.seal_build_reclaim();
             ctx.query
                 .memory
@@ -401,7 +413,8 @@ impl HashJoinBuildSinkExec {
                     return Ok(());
                 }
                 let result = if force_external
-                    || should_use_memory_triggered_external_join(ctx, handle.as_ref())
+                    || (allow_external
+                        && should_use_memory_triggered_external_join(ctx, handle.as_ref()))
                 {
                     discard_build_time_integer_builder(handle.as_ref())?;
                     finish_external_hash_join(ctx, handle.as_ref())
@@ -430,13 +443,16 @@ impl HashJoinBuildSinkExec {
             unregister_hash_join_build_reclaimer(ctx, global.handle.as_ref());
             return Ok(FinishPoll::Done);
         }
-        if (self.force_external
-            || should_use_memory_triggered_external_join(ctx, global.handle.as_ref()))
+        let force_external = self.spill_policy == SpillExecutionPolicy::Forced;
+        let allow_external = self.spill_policy != SpillExecutionPolicy::Forbidden;
+        if (force_external
+            || (allow_external
+                && should_use_memory_triggered_external_join(ctx, global.handle.as_ref())))
             && !global.handle.is_external()
         {
             discard_build_time_integer_builder(global.handle.as_ref())?;
             finish_external_hash_join(ctx, global.handle.as_ref())?;
-        } else if !self.force_external && !global.handle.completion.is_complete() {
+        } else if !force_external && !global.handle.completion.is_complete() {
             finalize_in_memory_hash_join(ctx, global.handle.as_ref())?;
         }
         unregister_hash_join_build_reclaimer(ctx, global.handle.as_ref());

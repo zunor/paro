@@ -14,12 +14,12 @@ use paro_common::error::{self as paro_error, Result};
 use paro_common::runtime_value::Value as RuntimeValue;
 use paro_common::types::LogicalType;
 use paro_external::routine::identity::RoutineCallIdentity;
-use paro_external::routine::spec::RoutineSemantics;
 use paro_external::routine::spec::{
     PythonEntrypointRef, RoutineImplementationRef, RoutineReturn, RoutineSpec,
 };
 use paro_external::runtime::dispatch::policy::ExternalDispatchPolicy;
 use paro_external::runtime::host::default_python_binary;
+use paro_optimizer::physical::ExternalRoutineDescriptor;
 use paro_planner::operator::external_project::ExternalProjectExpression;
 use serde_json::{json, Value as JsonValue};
 
@@ -28,20 +28,6 @@ use crate::memory_runtime::OperatorMemoryScope;
 use crate::runtime::QueryRuntimeContext;
 
 use super::batching::SubmissionBatchPolicy;
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ExternalRoutineDescriptor {
-    pub label: String,
-    pub identity: RoutineCallIdentity,
-    pub semantics: RoutineSemantics,
-    pub spec: Option<RoutineSpec>,
-}
-
-impl ExternalRoutineDescriptor {
-    pub fn identity_label(&self) -> String {
-        format_identity_label(&self.identity, &self.label)
-    }
-}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RuntimeBridgeExplainInfo {

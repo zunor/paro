@@ -3,6 +3,14 @@
 
 use super::*;
 
+fn enable_runtime_filter(mut spec: HashJoinSpec) -> HashJoinSpec {
+    spec.runtime_filter = Some(paro_optimizer::physical::HashJoinRuntimeFilterSpec {
+        artifact: paro_optimizer::physical::identity::Fingerprint(7),
+        wait_policy: paro_optimizer::physical::RuntimeFilterWaitPolicy::WaitComplete,
+    });
+    spec
+}
+
 #[test]
 fn projection_above_hash_join_stays_after_probe() {
     let plan = projection_above_hash_join_plan();
@@ -79,7 +87,7 @@ fn direct_rowset_probe_gets_hash_join_runtime_filter_gate() {
     let plan = hash_join_plan(JoinType::Inner);
     let lowerer = PipelineLowerer::new(&plan);
     let spec = match &plan.node(plan.root).kind {
-        PhysicalNodeKind::HashJoin(spec) => spec.clone(),
+        PhysicalNodeKind::HashJoin(spec) => enable_runtime_filter(spec.clone()),
         _ => panic!("expected hash join plan"),
     };
     let source = SourceSpec::Rowset(RowsetSourceSpec::new(rowset_spec_for_test()));
@@ -96,6 +104,28 @@ fn direct_rowset_probe_gets_hash_join_runtime_filter_gate() {
     );
     assert_eq!(rowset.dynamic_runtime_filters[0].build_key_index, 0);
     assert_eq!(rowset.dynamic_runtime_filters[0].probe_column_id, 0);
+    assert_eq!(
+        rowset.dynamic_runtime_filters[0].artifact,
+        paro_optimizer::physical::identity::Fingerprint(7)
+    );
+}
+
+#[test]
+fn hash_join_without_auxiliary_contract_does_not_install_runtime_filter() {
+    let plan = hash_join_plan(JoinType::Inner);
+    let lowerer = PipelineLowerer::new(&plan);
+    let spec = match &plan.node(plan.root).kind {
+        PhysicalNodeKind::HashJoin(spec) => spec.clone(),
+        _ => panic!("expected hash join plan"),
+    };
+    assert!(spec.runtime_filter.is_none());
+    let source = SourceSpec::Rowset(RowsetSourceSpec::new(rowset_spec_for_test()));
+    let source =
+        lowerer.attach_hash_join_runtime_filters(source, &[], BreakerHandleId::new(3), &spec);
+    let SourceSpec::Rowset(rowset) = source else {
+        panic!("expected rowset source");
+    };
+    assert!(rowset.dynamic_runtime_filters.is_empty());
 }
 
 #[test]
@@ -103,7 +133,7 @@ fn left_deep_probe_traces_runtime_filter_to_rowset_column() {
     let plan = hash_join_plan(JoinType::Inner);
     let lowerer = PipelineLowerer::new(&plan);
     let spec = match &plan.node(plan.root).kind {
-        PhysicalNodeKind::HashJoin(spec) => spec.clone(),
+        PhysicalNodeKind::HashJoin(spec) => enable_runtime_filter(spec.clone()),
         _ => panic!("expected hash join plan"),
     };
     let prior_probe = hash_join_probe_transform(BreakerHandleId::new(2), &spec);
@@ -131,7 +161,7 @@ fn left_deep_probe_does_not_trace_build_payload_to_rowset() {
     let plan = hash_join_plan(JoinType::Inner);
     let lowerer = PipelineLowerer::new(&plan);
     let mut spec = match &plan.node(plan.root).kind {
-        PhysicalNodeKind::HashJoin(spec) => spec.clone(),
+        PhysicalNodeKind::HashJoin(spec) => enable_runtime_filter(spec.clone()),
         _ => panic!("expected hash join plan"),
     };
     let prior_probe = hash_join_probe_transform(BreakerHandleId::new(2), &spec);
@@ -221,9 +251,9 @@ fn rowset_source_properties_keep_morsel_partitioning() {
 #[test]
 fn dummy_and_empty_sources_are_single_task() {
     let ctx = BindContext::new();
-    let mut generator = PhysicalPlanGenerator::new(PlanBuildContext::default());
-    let dummy = generator
-        .generate(&LogicalPlan::new(&ctx, LogicalOperator::DummyScan))
+    let mut extractor = PhysicalPlanExtractor::new(ExtractionContext::default());
+    let dummy = extractor
+        .extract(&LogicalPlan::new(&ctx, LogicalOperator::DummyScan))
         .unwrap();
     let mut dummy_lowerer = PipelineLowerer::new(&dummy);
     let dummy_graph = dummy_lowerer.lower_to_pipeline_graph(dummy.root).unwrap();
@@ -246,9 +276,9 @@ fn dummy_and_empty_sources_are_single_task() {
             vec![LogicalType::Integer],
         )),
     );
-    let mut generator = PhysicalPlanGenerator::new(PlanBuildContext::default());
-    let empty = generator
-        .generate(&LogicalPlan::new(
+    let mut extractor = PhysicalPlanExtractor::new(ExtractionContext::default());
+    let empty = extractor
+        .extract(&LogicalPlan::new(
             &ctx,
             LogicalOperator::EmptyResult(EmptyResult::new(values)),
         ))
@@ -308,7 +338,7 @@ fn graph_validation_rejects_dependency_cycles() {
 }
 
 #[test]
-fn lowerer_rejects_unsupported_nodes_before_runtime() {
+fn physical_extraction_rejects_unimplemented_nodes_before_lowering() {
     let ctx = BindContext::new();
     let values = LogicalPlan::new(
         &ctx,
@@ -329,9 +359,6 @@ fn lowerer_rejects_unsupported_nodes_before_runtime() {
             values,
         )),
     );
-    let mut generator = PhysicalPlanGenerator::new(PlanBuildContext::default());
-    let plan = generator.generate(&distinct).unwrap();
-    let mut lowerer = PipelineLowerer::new(&plan);
-
-    assert!(lowerer.lower_to_pipeline_graph(plan.root).is_err());
+    let mut extractor = PhysicalPlanExtractor::new(ExtractionContext::default());
+    assert!(extractor.extract(&distinct).is_err());
 }

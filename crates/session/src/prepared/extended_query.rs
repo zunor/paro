@@ -851,7 +851,11 @@ fn revalidate_portal_execution(
     portal: &PortalEntry,
     execution: ExecutionRequest,
 ) -> Result<ExecutionRequest> {
-    if execution.statement().compile_environment() == &snapshot.compile_environment_key() {
+    if execution.statement().compile_environment() == &snapshot.compile_environment_key()
+        && execution
+            .statement()
+            .dynamic_dependencies_available(snapshot.as_ref())
+    {
         return Ok(execution);
     }
 

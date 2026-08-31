@@ -50,7 +50,7 @@ use crate::operators::aggregate::post_reduction::PostAggregateReducer;
 use crate::operators::aggregate::radix_partitioned_aggregate_hashtable::AggregateHashTable;
 use crate::operators::aggregate::row_format::AggregateGroupFormat;
 use crate::operators::sort::build::query_has_temporary_directory;
-use crate::physical::specs::AggregateSpec;
+use crate::physical::specs::{AggregateSpec, SpillExecutionPolicy};
 use crate::runtime::breaker::aggregate::AggregateSpilledOutput;
 use crate::runtime::breaker::{
     AggregateBuildCompactionReclaimer, AggregateFinalizedStateReclaimer, AggregateHandle,
@@ -80,12 +80,17 @@ impl HashAggregateBuildSinkExec {
     pub(crate) fn create_global(&self, ctx: &mut PipelineInitContext) -> Result<SinkGlobal> {
         self.spec.verify_post_reduction()?;
         let handle = ctx.handles.get(self.handle)?;
-        if hash_aggregate_external_payload_spill_requested(ctx.query, &self.spec)
-            && !query_has_temporary_directory(ctx.query)
-        {
-            return Err(paro_error::out_of_memory(
-                "force_external hash aggregate requires a temporary directory",
-            ));
+        if hash_aggregate_external_payload_spill_requested(&self.spec) {
+            if !hash_aggregate_payload_spill_supported(&self.spec) {
+                return Err(paro_error::internal(
+                    "optimizer selected forced spill for a hash aggregate without an executable spill path",
+                ));
+            }
+            if !query_has_temporary_directory(ctx.query) {
+                return Err(paro_error::out_of_memory(
+                    "forced-spill hash aggregate requires a temporary directory",
+                ));
+            }
         }
         let group_refs = group_payload_refs(&self.spec)?;
         handle.initialize(AggregateRuntimeState::Hash(HashAggregateRuntimeState {
@@ -157,7 +162,8 @@ impl HashAggregateBuildSinkExec {
             ctx.query.memory.register_reclaimer_once_by_name(Arc::new(
                 AggregateLocalBuildCompactionReclaimer::new(&handle, local_id, Arc::clone(&tables)),
             ));
-            let payload_spill_name = if hash_aggregate_payload_spill_supported(&self.spec)
+            let payload_spill_name = if self.spec.spill_policy != SpillExecutionPolicy::Forbidden
+                && hash_aggregate_payload_spill_supported(&self.spec)
                 && query_has_temporary_directory(ctx.query)
             {
                 let name = AggregateLocalPayloadSpillReclaimer::name_for(&handle, local_id);
@@ -173,32 +179,32 @@ impl HashAggregateBuildSinkExec {
             } else {
                 None
             };
-            let state_spill_name =
-                if hash_aggregate_state_spill_supported(&self.spec, &aggregate_objects)
-                    && query_has_temporary_directory(ctx.query)
-                {
-                    let state_width = AggregateStateLayout::new(&aggregate_objects)?.total_size();
-                    let state_encoding = hash_aggregate_state_spill_encoding(&aggregate_objects);
-                    let name = AggregateLocalStateSpillReclaimer::name_for(&handle, local_id);
-                    ctx.query.memory.register_reclaimer_once_by_name(Arc::new(
-                        AggregateLocalStateSpillReclaimer::new(
-                            &handle,
-                            local_id,
-                            Arc::clone(&tables),
-                            Arc::clone(&state_spill),
-                            Arc::clone(&raw_payload_spill_requested),
-                            ctx.query.session.buffer_pool().clone(),
-                            group_types(&self.spec)?,
-                            state_width,
-                            state_encoding,
-                            aggregate_spill_radix_bits(ctx.query.session.number_of_threads()),
-                            query_hash_table_memory(ctx.query),
-                        ),
-                    ));
-                    Some(name)
-                } else {
-                    None
-                };
+            let state_spill_name = if self.spec.spill_policy != SpillExecutionPolicy::Forbidden
+                && hash_aggregate_state_spill_supported(&self.spec, &aggregate_objects)
+                && query_has_temporary_directory(ctx.query)
+            {
+                let state_width = AggregateStateLayout::new(&aggregate_objects)?.total_size();
+                let state_encoding = hash_aggregate_state_spill_encoding(&aggregate_objects);
+                let name = AggregateLocalStateSpillReclaimer::name_for(&handle, local_id);
+                ctx.query.memory.register_reclaimer_once_by_name(Arc::new(
+                    AggregateLocalStateSpillReclaimer::new(
+                        &handle,
+                        local_id,
+                        Arc::clone(&tables),
+                        Arc::clone(&state_spill),
+                        Arc::clone(&raw_payload_spill_requested),
+                        ctx.query.session.buffer_pool().clone(),
+                        group_types(&self.spec)?,
+                        state_width,
+                        state_encoding,
+                        aggregate_spill_radix_bits(ctx.query.session.number_of_threads()),
+                        query_hash_table_memory(ctx.query),
+                    ),
+                ));
+                Some(name)
+            } else {
+                None
+            };
             (
                 Some(build_name),
                 payload_spill_name,
@@ -639,21 +645,21 @@ fn hash_aggregate_state_spill_encoding(
     }
 }
 
-fn hash_aggregate_external_payload_spill_requested(
-    query: &crate::runtime::context::QueryRuntimeContext,
-    spec: &AggregateSpec,
-) -> bool {
-    query.session.limits.force_external && hash_aggregate_payload_spill_supported(spec)
+fn hash_aggregate_external_payload_spill_requested(spec: &AggregateSpec) -> bool {
+    spec.spill_policy == SpillExecutionPolicy::Forced
 }
 
 fn hash_aggregate_external_payload_spill_enabled(
     query: &crate::runtime::context::QueryRuntimeContext,
     spec: &AggregateSpec,
 ) -> bool {
-    if !hash_aggregate_payload_spill_supported(spec) || !query_has_temporary_directory(query) {
+    if spec.spill_policy == SpillExecutionPolicy::Forbidden
+        || !hash_aggregate_payload_spill_supported(spec)
+        || !query_has_temporary_directory(query)
+    {
         return false;
     }
-    hash_aggregate_external_payload_spill_requested(query, spec)
+    hash_aggregate_external_payload_spill_requested(spec)
         || hash_aggregate_preemptive_payload_spill_enabled(query)
 }
 

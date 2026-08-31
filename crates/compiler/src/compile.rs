@@ -7,9 +7,7 @@ use paro_common::types::LogicalType;
 use paro_context::StatementContext;
 use paro_execution::query_executor::compiled::{CompiledStatement, ResultColumnDesc};
 use paro_parser::ast::Statement;
-use paro_planner::operator::{ExplainMode, LogicalOperator};
 use paro_planner::planner::Planner;
-use paro_planner::verify::verify_physical_planner_invariants;
 use std::sync::Arc;
 use std::time::Instant;
 use tracing::{debug, error};
@@ -60,8 +58,8 @@ pub fn compile_statement_with_parameter_types(
         "Logical plan created"
     );
 
-    let mut optimizer = paro_optimizer::optimizer::Optimizer::new(planner.binder, ctx.clone());
-    let mut optimized_plan = match optimizer.optimize(logical_plan) {
+    let mut optimizer = paro_optimizer::Optimizer::new(planner.binder, ctx.clone());
+    let optimized = match optimizer.optimize(logical_plan) {
         Ok(plan) => plan,
         Err(error) => {
             error!(
@@ -80,44 +78,26 @@ pub fn compile_statement_with_parameter_types(
         "Logical plan optimized"
     );
 
-    let executable = if let LogicalOperator::Explain(explain) = &mut optimized_plan.operator {
-        if explain.spec.mode == ExplainMode::Analyze {
-            let target_plan = match generate_typed_physical_plan(ctx.as_ref(), &mut explain.child) {
-                Ok(plan) => plan,
-                Err(error) => {
-                    error!(
-                        target: targets::EXECUTOR,
-                        statement_tag = %statement_tag,
-                        error = %error,
-                        stage = "physical_plan",
-                        "EXPLAIN ANALYZE target physical plan generation failed"
-                    );
-                    return Err(error);
-                }
-            };
-            let target =
-                match paro_execution::pipeline::StatementProgram::from_physical_plan(target_plan) {
-                    Ok(program) => program,
-                    Err(error) => {
-                        error!(
-                            target: targets::EXECUTOR,
-                            statement_tag = %statement_tag,
-                            error = %error,
-                            stage = "runtime_program",
-                            "EXPLAIN ANALYZE target runtime program generation failed"
-                        );
-                        return Err(error);
-                    }
-                };
+    let plan_dependencies = match &optimized {
+        paro_optimizer::OptimizedStatement::Physical(portfolio) => {
+            portfolio.combined_dependencies()?
+        }
+        paro_optimizer::OptimizedStatement::ExplainAnalyze { target, .. } => {
+            target.combined_dependencies()?
+        }
+    };
+
+    let executable = match optimized {
+        paro_optimizer::OptimizedStatement::Physical(plan) => {
+            lower_runtime_program(plan, ctx.limits.max_memory, &statement_tag)?
+        }
+        paro_optimizer::OptimizedStatement::ExplainAnalyze { target, spec } => {
+            let target = lower_runtime_program(target, ctx.limits.max_memory, &statement_tag)?;
             paro_execution::pipeline::StatementProgram::ExplainAnalyze {
                 target: Box::new(target),
-                spec: explain.spec,
+                spec,
             }
-        } else {
-            compile_regular_statement(ctx.as_ref(), &mut optimized_plan, &statement_tag)?
         }
-    } else {
-        compile_regular_statement(ctx.as_ref(), &mut optimized_plan, &statement_tag)?
     };
     debug!(
         target: targets::EXECUTOR,
@@ -134,6 +114,7 @@ pub fn compile_statement_with_parameter_types(
             .collect(),
         parameter_types.to_vec(),
         ctx.compile_environment_key(),
+        plan_dependencies,
     );
 
     debug!(
@@ -147,25 +128,21 @@ pub fn compile_statement_with_parameter_types(
     Ok(compiled)
 }
 
-fn compile_regular_statement(
-    ctx: &StatementContext,
-    optimized_plan: &mut paro_planner::plan::LogicalPlan,
+fn lower_runtime_program(
+    portfolio: paro_optimizer::physical::PhysicalPlanPortfolio,
+    available_memory_bytes: usize,
     statement_tag: &str,
 ) -> Result<paro_execution::pipeline::StatementProgram> {
-    let arena_plan = match generate_typed_physical_plan(ctx, optimized_plan) {
-        Ok(plan) => plan,
-        Err(error) => {
-            error!(
-                target: targets::EXECUTOR,
-                statement_tag = %statement_tag,
-                error = %error,
-                stage = "physical_plan",
-                "Physical plan generation failed"
-            );
-            return Err(error);
-        }
+    let available_memory_bytes = if available_memory_bytes == 0 {
+        u64::MAX
+    } else {
+        u64::try_from(available_memory_bytes).unwrap_or(u64::MAX)
     };
-    match paro_execution::pipeline::StatementProgram::from_physical_plan(arena_plan) {
+    match paro_execution::pipeline::StatementProgram::from_physical_portfolio(
+        portfolio,
+        available_memory_bytes,
+        u16::MAX,
+    ) {
         Ok(program) => Ok(program),
         Err(error) => {
             error!(
@@ -178,24 +155,4 @@ fn compile_regular_statement(
             Err(error)
         }
     }
-}
-
-fn generate_typed_physical_plan(
-    ctx: &StatementContext,
-    logical_plan: &mut paro_planner::plan::LogicalPlan,
-) -> Result<paro_execution::physical::PhysicalPlan> {
-    verify_physical_planner_invariants(&logical_plan.operator)?;
-    paro_execution::column_binding_resolver::ColumnBindingResolver::resolve(
-        &mut logical_plan.operator,
-    )?;
-    let mut generator = paro_execution::physical::PhysicalPlanGenerator::new(
-        paro_execution::physical::PlanBuildContext {
-            force_external: ctx.limits.force_external,
-            rowset_scan_pushdown: ctx.limits.rowset_scan_pushdown,
-            max_memory: ctx.limits.max_memory,
-            max_threads: ctx.limits.max_threads.max(1),
-            scan_access_cost: Default::default(),
-        },
-    );
-    generator.generate(logical_plan)
 }

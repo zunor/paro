@@ -27,7 +27,6 @@ use paro_planner::plan::LogicalPlan;
 
 use crate::memory_runtime::QueryMemoryPool;
 use crate::physical::children::{PlanChildren, PlanChildrenArena};
-use crate::physical::generator::{PhysicalPlanGenerator, PlanBuildContext};
 use crate::physical::ids::PhysicalPlanNodeId;
 use crate::physical::node::{OperatorLabel, PhysicalPlanNode};
 use crate::physical::plan::{PhysicalPlan, PhysicalPlanNodeArena};
@@ -53,6 +52,7 @@ use crate::runtime::{
     BreakerHandleRegistry, CleanupStatus, ParameterBindingEpoch, ParameterBindings,
     QueryOutputPort, QueryOutputPortStats, QueryRuntimeContext,
 };
+use paro_optimizer::physical::{ExtractionContext, PhysicalPlanExtractor};
 use tokio_util::sync::CancellationToken;
 
 #[test]
@@ -72,8 +72,8 @@ fn execute_program_uses_compiled_parameter_bindings() {
         )),
     );
 
-    let mut generator = PhysicalPlanGenerator::new(PlanBuildContext::default());
-    let plan = Arc::new(generator.generate(&logical).expect("physical plan"));
+    let mut extractor = PhysicalPlanExtractor::new(ExtractionContext::default());
+    let plan = Arc::new(extractor.extract(&logical).expect("physical plan"));
     let mut lowerer = PipelineLowerer::new(plan.as_ref());
     let graph = Arc::new(
         lowerer
@@ -930,8 +930,8 @@ fn assert_pipeline_count_at_least(statement: &StatementProgram, expected: usize)
 }
 
 fn statement_from_logical(logical: LogicalPlan) -> StatementProgram {
-    let mut generator = PhysicalPlanGenerator::new(PlanBuildContext::default());
-    let plan = Arc::new(generator.generate(&logical).expect("physical plan"));
+    let mut extractor = PhysicalPlanExtractor::new(ExtractionContext::default());
+    let plan = Arc::new(extractor.extract(&logical).expect("physical plan"));
     let mut lowerer = PipelineLowerer::new(plan.as_ref());
     let graph = Arc::new(
         lowerer
@@ -1227,5 +1227,10 @@ fn single_node_plan(kind: PhysicalNodeKind, output: RowType) -> PhysicalPlan {
         children: PlanChildren::Empty,
         label: OperatorLabel::new(paro_planner::plan::PlanNodeId::SYNTHETIC, "TEST"),
     });
-    PhysicalPlan::new(root, nodes, PlanChildrenArena::default(), PlanPropertyMap)
+    PhysicalPlan::new(
+        root,
+        nodes,
+        PlanChildrenArena::default(),
+        PlanPropertyMap::default(),
+    )
 }

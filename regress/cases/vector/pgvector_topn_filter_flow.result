@@ -44,7 +44,7 @@ PROJECTION  (rows=2)
     ->  PROJECTION  (rows=2)
       Output: id, l1_distance(public.vector_topn_case.emb, [1, 0, 0])
       ->  ROWSET_SCAN on public.vector_topn_case  (rows=2)
-        Columns: id, emb
+        Columns: id, category, emb
         Pushed Predicate: category = 'x'
         Late Materialize: auto
 

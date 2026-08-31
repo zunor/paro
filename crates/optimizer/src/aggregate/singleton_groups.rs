@@ -91,6 +91,7 @@ mod tests {
     use paro_function::aggregate::distributive::count::{
         get_count_function, get_count_star_function,
     };
+    use paro_planner::binder::context::BindContext;
     use paro_planner::binder::ir::GroupingSet;
     use paro_planner::expression::{AggregateExpression, ColumnRefExpression, ReferenceExpression};
     use paro_planner::operator::{
@@ -223,6 +224,47 @@ mod tests {
         assert!(matches!(
             aggregate.group_input_multiplicity,
             GroupInputMultiplicity::AtMostOne(_)
+        ));
+    }
+
+    #[test]
+    fn proven_singleton_group_is_an_explicit_memo_implementation() {
+        let (plan, statistics) = candidate();
+        let optimized = optimize_plan(plan, &statistics);
+        let input = crate::cascades::memo_builder::MemoBuilder::build(
+            optimized,
+            BindContext::new(),
+            crate::cascades::budget::SearchBudget::default(),
+        )
+        .expect("build Memo from singleton proof");
+        let grants = [crate::physical::ResourceGrantClass {
+            id: crate::cascades::ids::ResourceGrantClassId(0),
+            hard_memory_bytes: u64::MAX,
+            spill_policy: crate::physical::SpillPolicy::Allowed,
+            concurrency_class: 0,
+        }];
+        let extraction = input.optimize(&grants).expect("optimize singleton group");
+        let variant = &extraction.variants[0];
+        let contract = variant
+            .contracts
+            .get(&variant.plan.id)
+            .expect("root winner contract");
+        assert_eq!(
+            contract.implementation,
+            crate::physical::PhysicalImplementationFlavor::SingletonAggregateProjection
+        );
+
+        let physical = crate::physical::PhysicalPlanExtractor::new(
+            crate::physical::ExtractionContext::default(),
+        )
+        .with_winner_contracts(variant.contracts.clone())
+        .with_enforcer_contracts(variant.enforcers.clone())
+        .requiring_winner_contracts()
+        .extract(&variant.plan)
+        .expect("lower selected singleton implementation");
+        assert!(matches!(
+            physical.node(physical.root).kind,
+            crate::physical::PhysicalNodeKind::Project(_)
         ));
     }
 

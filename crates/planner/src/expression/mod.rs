@@ -32,7 +32,7 @@ pub use columnref_expression::ColumnRefExpression;
 pub use comparison_expression::{ComparisonExpression, ComparisonType};
 pub use conjunction_expression::{ConjunctionExpression, ConjunctionType};
 pub use constant_expression::ConstantExpression;
-pub use evaluation::EvaluationProperties;
+pub use evaluation::{evaluate_constant_expression, EvaluationProperties};
 pub use expression_node::Expression;
 pub use function_expression::FunctionExpression;
 pub use iterator::{ExpressionIterator, ExpressionVisitDecision};

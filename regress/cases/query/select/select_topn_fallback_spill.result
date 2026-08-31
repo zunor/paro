@@ -18,7 +18,6 @@ PROJECTION  (rows=3)
       Output: id, score
       ->  ROWSET_SCAN on public.topn_fallback_spill_case  (rows=7000)
         Columns: id, score
-        Scan Order: score DESC by max LIMIT 3
 
 SELECT id
 FROM topn_fallback_spill_case
@@ -42,7 +41,6 @@ TOP_N  (rows=5)
     Output: id
     ->  ROWSET_SCAN on public.topn_fallback_spill_case  (rows=7000)
       Columns: id
-      Scan Order: id ASC by min LIMIT 5 OFFSET 6000
 
 SELECT id
 FROM topn_fallback_spill_case

@@ -3,6 +3,10 @@
 
 use super::*;
 use crate::physical::properties::MemoryClass;
+use crate::physical::{
+    BaseRelationId, MutationBarrierId, MutationInputSpoolSpec, OperatorLabel, PhysicalPlanNode,
+    PhysicalPlanNodeId, SnapshotId,
+};
 
 #[test]
 fn lowerer_builds_source_transform_sink_pipeline() {
@@ -35,6 +39,53 @@ fn lowerer_uses_root_output_schema_after_transforms() {
     assert_eq!(pipeline.output.column_count(), 1);
     assert_eq!(&pipeline.output.names[..], ["b".to_string()]);
     assert_eq!(&pipeline.output.types[..], [LogicalType::Varchar]);
+}
+
+#[test]
+fn streaming_tail_above_mutation_spool_stays_on_consumer_side() {
+    let mut plan = projection_changes_schema_plan();
+    let project = plan.root;
+    let [input] = plan.child_ids(&plan.node(project).children) else {
+        panic!("projection fixture must have one input");
+    };
+    let input = *input;
+    let spool_children = plan.children.pack(vec![input]);
+    let spool = plan.nodes.push(PhysicalPlanNode {
+        id: PhysicalPlanNodeId::INVALID,
+        output: plan.node(input).output.clone(),
+        cardinality: plan.node(input).cardinality,
+        kind: PhysicalNodeKind::MutationInputSpool(MutationInputSpoolSpec {
+            barrier: MutationBarrierId::new(0),
+            targets: [BaseRelationId::new(0)].into_iter().collect(),
+            snapshot: SnapshotId::new(0),
+        }),
+        children: spool_children,
+        label: OperatorLabel::new(
+            plan.node(project).label.logical_plan_node,
+            "MUTATION_INPUT_SPOOL",
+        ),
+    });
+    let project_children = plan.children.pack(vec![spool]);
+    plan.nodes.get_mut(project).unwrap().children = project_children;
+
+    let mut lowerer = PipelineLowerer::new(&plan);
+    let graph = lowerer.lower_to_pipeline_graph(plan.root).unwrap();
+
+    assert_eq!(graph.pipelines.len(), 2);
+    assert!(matches!(graph.pipelines[0].sink, SinkSpec::Materialize(_)));
+    assert!(matches!(
+        graph.pipelines[1].source,
+        SourceSpec::Materialized(_)
+    ));
+    assert!(matches!(
+        graph.pipelines[1].transforms.as_slice(),
+        [TransformSpec::Project(_)]
+    ));
+    assert_eq!(graph.dependencies.len(), 1);
+    assert_eq!(
+        graph.dependencies[0].kind,
+        DependencyKind::MaterializeBeforeRead
+    );
 }
 
 #[test]
@@ -363,10 +414,11 @@ fn hash_join_merges_optional_branches_before_stateful_transforms() {
 fn forced_external_hash_join_keeps_spill_replay_pipeline() {
     let plan = hash_join_plan_with_context(
         JoinType::Inner,
-        PlanBuildContext {
+        ExtractionContext {
             force_external: true,
+            grant_spill_policy: paro_optimizer::physical::SpillPolicy::Allowed,
             rowset_scan_pushdown: true,
-            ..PlanBuildContext::default()
+            ..ExtractionContext::default()
         },
     );
     let mut lowerer = PipelineLowerer::new(&plan);
@@ -378,7 +430,10 @@ fn forced_external_hash_join_keeps_spill_replay_pipeline() {
         SinkSpec::HashJoinBuild(_)
     ));
     if let SinkSpec::HashJoinBuild(spec) = &graph.pipelines[0].sink {
-        assert!(spec.force_external);
+        assert_eq!(
+            spec.spill_policy,
+            crate::physical::specs::SpillExecutionPolicy::Forced
+        );
     }
     assert!(matches!(
         graph.pipelines[2].source,

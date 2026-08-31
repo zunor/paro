@@ -13,6 +13,9 @@ impl PipelineLowerer<'_> {
         handle: BreakerHandleId,
         spec: &HashJoinSpec,
     ) -> SourceSpec {
+        let Some(runtime_filter) = spec.runtime_filter else {
+            return source;
+        };
         if !can_push_hash_join_runtime_filter(spec.join_type) {
             return source;
         }
@@ -39,6 +42,7 @@ impl PipelineLowerer<'_> {
             };
             rowset.add_dynamic_runtime_filter(RowsetDynamicRuntimeFilterSpec {
                 handle,
+                artifact: runtime_filter.artifact,
                 build_key_index,
                 probe_column_id,
             });

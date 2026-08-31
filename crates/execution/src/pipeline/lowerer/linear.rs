@@ -62,7 +62,7 @@ impl<'a> PipelineLowerer<'a> {
                 }
                 PhysicalNodeKind::GraphScan(spec) => {
                     transforms.reverse();
-                    return Ok((SourceSpec::GraphScan(spec.clone()), transforms));
+                    return Ok((SourceSpec::GraphScan(spec.as_ref().clone()), transforms));
                 }
                 PhysicalNodeKind::CteScan(spec) => {
                     if let Some(handle) = self.recursive_cte_handles.get(&spec.cte_index).copied() {
@@ -117,7 +117,7 @@ impl<'a> PipelineLowerer<'a> {
                     current = self.only_child(current)?;
                 }
                 PhysicalNodeKind::Limit(spec) => {
-                    transforms.push(TransformSpec::Limit(spec.clone()));
+                    transforms.push(TransformSpec::Limit(spec.as_ref().clone()));
                     current = self.only_child(current)?;
                 }
                 PhysicalNodeKind::TopN(spec) => {
@@ -128,6 +128,11 @@ impl<'a> PipelineLowerer<'a> {
                 PhysicalNodeKind::Sort(_) => {
                     return Err(paro_error::not_implemented(
                         "blocking sort lowering is only supported when the sort is the pipeline root",
+                    ));
+                }
+                PhysicalNodeKind::MutationInputSpool(_) => {
+                    return Err(paro_error::internal(
+                        "mutation input spool must lower as a materialization boundary",
                     ));
                 }
                 PhysicalNodeKind::SetOperation(_) => {
@@ -165,7 +170,7 @@ impl<'a> PipelineLowerer<'a> {
                     current = self.only_child(current)?;
                 }
                 PhysicalNodeKind::GraphExpand(spec) => {
-                    transforms.push(TransformSpec::GraphExpand(spec.clone()));
+                    transforms.push(TransformSpec::GraphExpand(spec.as_ref().clone()));
                     current = self.only_child(current)?;
                 }
                 PhysicalNodeKind::RowFetch(spec) => {
@@ -177,7 +182,7 @@ impl<'a> PipelineLowerer<'a> {
                     current = self.only_child(current)?;
                 }
                 PhysicalNodeKind::GraphShortestPath(spec) => {
-                    transforms.push(TransformSpec::GraphShortestPath(spec.clone()));
+                    transforms.push(TransformSpec::GraphShortestPath(spec.as_ref().clone()));
                     current = self.only_child(current)?;
                 }
                 PhysicalNodeKind::ExternalProject(spec) => {
@@ -218,12 +223,6 @@ impl<'a> PipelineLowerer<'a> {
                     return Err(paro_error::not_supported(
                         "delim join control region only lowers at a subtree boundary",
                     ));
-                }
-                PhysicalNodeKind::Unsupported(spec) => {
-                    return Err(paro_error::not_implemented(format!(
-                        "pipeline lowering for {} ({})",
-                        spec.logical_name, spec.reason
-                    )));
                 }
                 PhysicalNodeKind::Utility(_) => {
                     return Err(paro_error::not_supported(

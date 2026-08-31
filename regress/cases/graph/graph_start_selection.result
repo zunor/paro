@@ -71,12 +71,12 @@ PROJECTION  (rows=1)
     Output: person_name, company_name, city_name
     ->  GRAPH_EXPAND  (rows=1)
       Graph: start_graph
-      Edge Label: WorksAt
-      Direction: Backward
+      Edge Label: LocatedIn
+      Direction: Forward
       ->  GRAPH_EXPAND  (rows=1)
         Graph: start_graph
-        Edge Label: LocatedIn
-        Direction: Forward
+        Edge Label: WorksAt
+        Direction: Backward
         ->  GRAPH_SCAN  (rows=1)
           Graph: start_graph
           Vertex Label: Company

@@ -323,6 +323,14 @@ pub(crate) enum FixedMembershipKind {
     I128(FixedMembershipSet<i128>),
 }
 
+/// Logical width of a type-erased fixed membership set.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FixedMembershipWidth {
+    I32,
+    I64,
+    I128,
+}
+
 /// Type-erased fixed-width membership used by [`super::Predicate`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FixedMembership {
@@ -398,6 +406,25 @@ impl FixedMembership {
             FixedMembershipKind::I32(values) => values.is_contiguous(),
             FixedMembershipKind::I64(values) => values.is_contiguous(),
             FixedMembershipKind::I128(values) => values.is_contiguous(),
+        }
+    }
+
+    /// Visit the canonical ascending, deduplicated values independently of the
+    /// dense or sorted runtime representation chosen for lookup.
+    pub fn visit_canonical_values(&self, mut visit: impl FnMut(i128)) -> FixedMembershipWidth {
+        match &self.kind {
+            FixedMembershipKind::I32(values) => {
+                values.iter().for_each(|value| visit(i128::from(value)));
+                FixedMembershipWidth::I32
+            }
+            FixedMembershipKind::I64(values) => {
+                values.iter().for_each(|value| visit(i128::from(value)));
+                FixedMembershipWidth::I64
+            }
+            FixedMembershipKind::I128(values) => {
+                values.iter().for_each(&mut visit);
+                FixedMembershipWidth::I128
+            }
         }
     }
 

@@ -7,7 +7,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use super::partition_aggregate_tests::setup_session;
-use crate::optimizer::Optimizer;
+use crate::optimizer::Optimizer as TestOptimizer;
 
 #[test]
 fn subset_filtered_scalar_aggregate_reuses_detail_scan() {
@@ -28,8 +28,10 @@ fn subset_filtered_scalar_aggregate_reuses_detail_scan() {
         .create_plan(statement)
         .expect("plan scalar aggregate sharing shape");
     let plan = planner.take_plan().expect("logical plan");
-    let mut optimizer = Optimizer::new(planner.binder.clone(), session);
-    let optimized = optimizer.optimize(plan).expect("optimize scalar aggregate");
+    let mut optimizer = TestOptimizer::new(planner.binder.clone(), session);
+    let optimized = optimizer
+        .scalar_reuse_frontier_for_test(plan)
+        .expect("enumerate scalar-aggregate relational frontier");
 
     let mut customer_gets = 0usize;
     let mut global_aggregate_windows = 0usize;
@@ -82,8 +84,10 @@ fn matched_prefix_has_an_independent_binding_from_the_stored_value() {
             .create_plan(statement)
             .expect("plan rejected prefix proof shape");
         let plan = planner.take_plan().expect("logical plan");
-        let mut optimizer = Optimizer::new(planner.binder.clone(), session);
-        let optimized = optimizer.optimize(plan).expect("optimize prefix query");
+        let mut optimizer = TestOptimizer::new(planner.binder.clone(), session);
+        let optimized = optimizer
+            .scalar_reuse_frontier_for_test(plan)
+            .expect("enumerate prefix relational frontier");
 
         optimized
             .try_visit_pre_order(|plan| {
@@ -159,8 +163,10 @@ fn matched_prefix_requires_a_direct_pushdown_witness() {
             .create_plan(statement)
             .expect("plan rejected prefix proof shape");
         let plan = planner.take_plan().expect("logical plan");
-        let mut optimizer = Optimizer::new(planner.binder.clone(), session);
-        let optimized = optimizer.optimize(plan).expect("optimize prefix query");
+        let mut optimizer = TestOptimizer::new(planner.binder.clone(), session);
+        let optimized = optimizer
+            .scalar_reuse_frontier_for_test(plan)
+            .expect("enumerate prefix relational frontier");
 
         optimized
             .try_visit_pre_order(|plan| {
@@ -197,8 +203,10 @@ fn tpch_q22_uses_one_customer_scan_inner() {
     let mut planner = Planner::new(session.clone());
     planner.create_plan(statement).expect("plan Q22");
     let plan = planner.take_plan().expect("logical Q22 plan");
-    let mut optimizer = Optimizer::new(planner.binder.clone(), session);
-    let optimized = optimizer.optimize(plan).expect("optimize Q22");
+    let mut optimizer = TestOptimizer::new(planner.binder.clone(), session);
+    let optimized = optimizer
+        .scalar_reuse_frontier_for_test(plan)
+        .expect("enumerate Q22 relational frontier");
 
     let mut customer_gets = 0usize;
     let mut global_aggregate_windows = 0usize;

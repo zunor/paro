@@ -47,10 +47,6 @@ use support::{
     validate_aggregate_inputs, validate_filter,
 };
 
-pub(crate) fn perfect_hash_occupancy_bytes(slots: usize) -> Option<usize> {
-    SlotBitmap::storage_bytes(slots).ok()
-}
-
 /// Scan cursor for a perfect aggregate hash table.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct PerfectHTScanPosition {

@@ -13,7 +13,7 @@ use paro_storage::index::graph::GraphStatistics;
 use paro_storage::statistics::ColumnStatistics;
 
 use crate::cost_model::CostModel;
-use crate::profiler::PipelineProfiler;
+use crate::profiler::OptimizerProfiler;
 
 pub trait GraphStatsLoader: Send + Sync {
     fn load(&self, graph_name: &str) -> Option<Arc<GraphStatistics>>;
@@ -78,7 +78,7 @@ pub struct OptimizationContext {
     pub graph_stats: GraphStatsCache,
     pub cost_model: CostModel,
     pub verify_enabled: bool,
-    pub profiler: PipelineProfiler,
+    pub profiler: OptimizerProfiler,
     pub invalidations: OptimizerInvalidations,
 }
 
@@ -146,7 +146,7 @@ impl OptimizationContext {
             column_stats: HashMap::new(),
             cost_model: CostModel::default(),
             verify_enabled,
-            profiler: PipelineProfiler::default(),
+            profiler: OptimizerProfiler::default(),
             invalidations: OptimizerInvalidations::default(),
         }
     }

@@ -10,7 +10,11 @@ use crate::runtime::{ParameterBindingEpoch, ParameterBindings};
 use paro_common::error::{self as paro_error, Result};
 use paro_common::typed_parameters::TypedParameterEnv;
 use paro_common::types::LogicalType;
-use paro_context::CompileEnvironmentKey;
+use paro_context::{CompileEnvironmentKey, StatementContext};
+use paro_optimizer::physical::{
+    Fingerprint, PhysicalNodeKind, PlanDependencies, SearchSourceSpec, StableFingerprintBuilder,
+};
+use paro_storage::search::OpenSearchCursorResult;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ResultColumnDesc {
@@ -42,6 +46,7 @@ struct CompiledStatementImage {
     result_schema: Box<[ResultColumnDesc]>,
     parameter_types: Box<[LogicalType]>,
     compile_environment: CompileEnvironmentKey,
+    plan_dependencies: PlanDependencies,
 }
 
 impl CompiledStatement {
@@ -50,6 +55,7 @@ impl CompiledStatement {
         result_schema: Vec<ResultColumnDesc>,
         parameter_types: Vec<LogicalType>,
         compile_environment: CompileEnvironmentKey,
+        plan_dependencies: PlanDependencies,
     ) -> Self {
         Self {
             image: Arc::new(CompiledStatementImage {
@@ -57,6 +63,7 @@ impl CompiledStatement {
                 result_schema: result_schema.into_boxed_slice(),
                 parameter_types: parameter_types.into_boxed_slice(),
                 compile_environment,
+                plan_dependencies,
             }),
         }
     }
@@ -79,6 +86,19 @@ impl CompiledStatement {
     #[inline]
     pub fn compile_environment(&self) -> &CompileEnvironmentKey {
         &self.image.compile_environment
+    }
+
+    #[inline]
+    pub fn plan_dependencies(&self) -> &PlanDependencies {
+        &self.image.plan_dependencies
+    }
+
+    /// Validate capabilities whose generation can move without a catalog
+    /// epoch change. Catalog bindings/settings are checked separately by the
+    /// compile-environment key; this closes the search/graph dependency gap
+    /// before a cached immutable image is reused.
+    pub fn dynamic_dependencies_available(&self, ctx: &StatementContext) -> bool {
+        statement_program_dependencies_available(&self.image.program, ctx)
     }
 
     #[inline]
@@ -112,6 +132,93 @@ impl CompiledStatement {
     pub fn shares_image_with(&self, other: &Self) -> bool {
         Arc::ptr_eq(&self.image, &other.image)
     }
+}
+
+fn statement_program_dependencies_available(
+    program: &StatementProgram,
+    ctx: &StatementContext,
+) -> bool {
+    match program {
+        StatementProgram::Pipeline { plan, .. } => physical_plan_dependencies_available(plan, ctx),
+        StatementProgram::ExplainAnalyze { target, .. } => {
+            statement_program_dependencies_available(target, ctx)
+        }
+        StatementProgram::Utility(_) => true,
+    }
+}
+
+fn physical_plan_dependencies_available(
+    plan: &paro_optimizer::physical::PhysicalPlan,
+    ctx: &StatementContext,
+) -> bool {
+    fn search_available(
+        table: &paro_catalog::entry::TableCatalogEntry,
+        token: &paro_storage::search::CapabilityToken,
+    ) -> bool {
+        table.storage.as_ref().is_some_and(|storage| {
+            matches!(
+                storage.open_search_generation_snapshot_with_token(token),
+                Ok(OpenSearchCursorResult::Opened(_))
+            )
+        })
+    }
+
+    fn graph_key(id: &paro_common::identity::GraphId) -> Fingerprint {
+        let mut fingerprint = StableFingerprintBuilder::default();
+        fingerprint.write_bytes(b"paro.graph-generation.v1");
+        fingerprint.write_bytes(id.runtime_key().as_bytes());
+        fingerprint.finish()
+    }
+
+    fn graph_available(
+        plan: &paro_optimizer::physical::PhysicalPlan,
+        ctx: &StatementContext,
+        schema_name: &str,
+        graph_name: &str,
+    ) -> bool {
+        let id =
+            paro_common::identity::GraphId::new(ctx.current_database(), schema_name, graph_name);
+        let Some(expected) = plan.dependencies.graph_generations.get(&graph_key(&id)) else {
+            return false;
+        };
+        ctx.services
+            .graph_index
+            .snapshot(&id)
+            .is_some_and(|snapshot| snapshot.generation_id() == *expected)
+    }
+
+    plan.nodes.iter().all(|node| match &node.kind {
+        PhysicalNodeKind::VectorSearch(spec) => {
+            search_available(&spec.table, &spec.capability_token)
+        }
+        PhysicalNodeKind::SparseVectorSearch(spec) => {
+            search_available(&spec.table, &spec.capability_token)
+        }
+        PhysicalNodeKind::FullTextSearch(spec) => {
+            search_available(&spec.table, &spec.capability_token)
+        }
+        PhysicalNodeKind::AdaptiveSearch(spec) => match spec.selected.as_ref() {
+            SearchSourceSpec::Vector(source) => {
+                search_available(&spec.table, &source.capability_token)
+            }
+            SearchSourceSpec::Sparse(source) => {
+                search_available(&spec.table, &source.capability_token)
+            }
+            SearchSourceSpec::FullText(source) => {
+                search_available(&spec.table, &source.capability_token)
+            }
+        },
+        PhysicalNodeKind::GraphScan(spec) => {
+            graph_available(plan, ctx, &spec.schema_name, &spec.graph_name)
+        }
+        PhysicalNodeKind::GraphExpand(spec) => {
+            graph_available(plan, ctx, &spec.schema_name, &spec.graph_name)
+        }
+        PhysicalNodeKind::GraphShortestPath(spec) => {
+            graph_available(plan, ctx, &spec.schema_name, &spec.graph_name)
+        }
+        _ => true,
+    })
 }
 
 /// A single execution of a compiled statement with query-local bindings.
@@ -202,14 +309,17 @@ mod tests {
     use paro_context::TestStatementContextBuilder;
 
     use super::*;
-    use crate::physical::{UnsupportedUtilitySpec, UtilitySpec};
+    use crate::physical::UtilitySpec;
     use crate::pipeline::{StatementProgram, UtilityProgram};
+    use paro_planner::binder::ir::statement::BoundCreateSchemaInfo;
 
     fn statement(parameter_types: Vec<LogicalType>) -> CompiledStatement {
         CompiledStatement::new(
             StatementProgram::Utility(UtilityProgram {
-                spec: UtilitySpec::Unsupported(UnsupportedUtilitySpec {
-                    name: "test".to_string(),
+                spec: UtilitySpec::CreateSchema(BoundCreateSchemaInfo {
+                    database_name: "test".to_string(),
+                    schema_name: "test".to_string(),
+                    if_not_exists: false,
                 }),
             }),
             Vec::new(),
@@ -217,6 +327,7 @@ mod tests {
             TestStatementContextBuilder::minimal()
                 .build()
                 .compile_environment_key(),
+            PlanDependencies::default(),
         )
     }
 

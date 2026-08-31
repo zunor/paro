@@ -103,6 +103,7 @@ fn decimal_sum_rollup_spec(
         aggregate_orders: Box::new([Box::new([])]),
         post_reduction: Some(post_reduction),
         having_filter: Box::new([]),
+        spill_policy: crate::physical::specs::SpillExecutionPolicy::Forbidden,
         perfect_hash: Some(PerfectHashAggregatePlan {
             group_minima: Box::new([1]),
             group_cardinalities: Box::new([4]),

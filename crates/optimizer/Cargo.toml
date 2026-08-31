@@ -33,6 +33,7 @@ paro-parser = { workspace = true }
 paro-planner = { workspace = true }
 paro-external = { workspace = true }
 paro-storage = { workspace = true }
+serde_json = { workspace = true }
 tracing = { workspace = true }
 
 [dev-dependencies]

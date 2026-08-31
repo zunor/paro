@@ -11,6 +11,7 @@ use paro_common::types::LogicalType;
 
 use crate::explain::types::ExplainRuntimeStats;
 use crate::physical::properties::MemoryClass;
+use crate::physical::specs::SpillExecutionPolicy;
 use crate::runtime::breaker::{HandleRef, SortHandle, SortPendingRunsReclaimer};
 use crate::runtime::context::{
     OperatorCallContext, OperatorFinishContext, PipelineInitContext, QueryRuntimeContext,
@@ -39,13 +40,13 @@ pub struct SortBuildSinkExec {
     pub input_types: Box<[LogicalType]>,
     pub output_names: Box<[String]>,
     pub output_types: Box<[LogicalType]>,
-    pub force_external: bool,
+    pub spill_policy: crate::physical::specs::SpillExecutionPolicy,
 }
 
 impl SortBuildSinkExec {
     pub(crate) fn create_global(&self, ctx: &mut PipelineInitContext) -> Result<SinkGlobal> {
         let handle = ctx.handles.get(self.handle)?;
-        let force_external = self.force_external || ctx.query.session.limits.force_external;
+        let force_external = self.spill_policy == SpillExecutionPolicy::Forced;
         if force_external && !query_has_temporary_directory(ctx.query) {
             return Err(paro_error::out_of_memory(
                 "force_external sort requires a temporary directory",
@@ -58,7 +59,9 @@ impl SortBuildSinkExec {
             false,
         )?);
         handle.initialize(sort, self.output_types.clone(), force_external)?;
-        if query_has_temporary_directory(ctx.query) {
+        if self.spill_policy != SpillExecutionPolicy::Forbidden
+            && query_has_temporary_directory(ctx.query)
+        {
             ctx.query.memory.register_reclaimer_once_by_name(Arc::new(
                 SortPendingRunsReclaimer::for_query(
                     handle.clone(),

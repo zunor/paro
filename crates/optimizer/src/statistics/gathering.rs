@@ -22,6 +22,43 @@ use paro_storage::statistics::{BaseStatistics, ColumnStatistics};
 use crate::context::OptimizationContext;
 use crate::statistics::aggregate_filter::estimate_grouped_sum_filter_selectivity;
 
+fn external_table_cardinality(
+    table: &paro_planner::operator::LogicalExternalTable,
+) -> Option<CardinalityEstimate> {
+    let declared_rows = table.call.spec.as_ref().and_then(|spec| {
+        let paro_external::routine::spec::RoutineExecutionContract::Table(contract) =
+            &spec.execution_contract
+        else {
+            return None;
+        };
+        contract.rows_hint
+    });
+    let per_invocation = match declared_rows {
+        Some(expected) => CardinalityEstimate {
+            min: 0,
+            expected,
+            // ROWS is an estimate, not an unearned hard bound. Keep a broad
+            // finite interval until a versioned routine profile supplies one.
+            max: expected.saturating_mul(16).max(expected),
+        },
+        None => CardinalityEstimate {
+            min: 0,
+            expected: 100,
+            max: 1_000_000_000,
+        },
+    };
+    let invocations = table
+        .child
+        .as_ref()
+        .and_then(|child| child.stats.estimated_cardinality)
+        .unwrap_or_else(|| CardinalityEstimate::exact(1));
+    Some(CardinalityEstimate {
+        min: invocations.min.saturating_mul(per_invocation.min),
+        expected: invocations.expected.saturating_mul(per_invocation.expected),
+        max: invocations.max.saturating_mul(per_invocation.max),
+    })
+}
+
 #[derive(Default)]
 pub struct StatisticsGathering {
     cte_cardinality: HashMap<usize, CardinalityEstimate>,
@@ -65,11 +102,7 @@ impl StatisticsGathering {
             LogicalOperator::Projection(proj) => proj.child.stats.estimated_cardinality,
             LogicalOperator::RowFetch(fetch) => fetch.child.stats.estimated_cardinality,
             LogicalOperator::ExternalProject(project) => project.child.stats.estimated_cardinality,
-            LogicalOperator::ExternalTable(table) => table
-                .child
-                .as_ref()
-                .and_then(|child| child.stats.estimated_cardinality)
-                .or(Some(CardinalityEstimate::exact(100))),
+            LogicalOperator::ExternalTable(table) => external_table_cardinality(table),
             LogicalOperator::Order(order) => order.child.stats.estimated_cardinality,
             LogicalOperator::Window(window) => window.child.stats.estimated_cardinality,
             LogicalOperator::Distinct(distinct) => {
@@ -95,7 +128,17 @@ impl StatisticsGathering {
             LogicalOperator::Aggregate(agg) => {
                 let child = agg.child.stats.estimated_cardinality?;
                 if agg.groups.is_empty() {
-                    return Some(CardinalityEstimate::exact(1));
+                    // A scalar aggregate emits one row per grouping domain,
+                    // including on empty input.  Plain aggregation has one
+                    // implicit domain; explicit GROUPING SETS has one domain
+                    // for each set (duplicates are semantically observable).
+                    return Some(CardinalityEstimate::exact(
+                        if agg.grouping_sets.is_empty() {
+                            1
+                        } else {
+                            agg.grouping_sets.len() as u64
+                        },
+                    ));
                 }
                 let mut expected = 1u64;
                 let mut saw_known = false;
@@ -104,17 +147,41 @@ impl StatisticsGathering {
                     saw_known |= distinct != fallback_group_distinct(child.expected);
                     expected = saturating_mul_u64(expected, distinct.max(1)).min(child.expected);
                 }
-                if !agg.grouping_sets.is_empty() {
-                    expected = saturating_mul_u64(expected, agg.grouping_sets.len() as u64)
-                        .min(child.expected.max(1));
-                }
                 if !saw_known {
-                    expected = expected.min(child.expected.max(1));
+                    expected = expected.min(child.expected);
                 }
+                let base_expected = expected.min(child.expected);
+                let (non_empty_domains, empty_domains) = if agg.grouping_sets.is_empty() {
+                    (1u64, 0u64)
+                } else {
+                    agg.grouping_sets.iter().fold(
+                        (0u64, 0u64),
+                        |(non_empty, empty), grouping_set| {
+                            if grouping_set.expressions.is_empty() {
+                                (non_empty, empty.saturating_add(1))
+                            } else {
+                                (non_empty.saturating_add(1), empty)
+                            }
+                        },
+                    )
+                };
+                let expected = base_expected
+                    .saturating_mul(non_empty_domains)
+                    .saturating_add(empty_domains);
+                let max = child
+                    .max
+                    .saturating_mul(non_empty_domains)
+                    .saturating_add(empty_domains)
+                    .max(expected);
                 let groups = CardinalityEstimate {
-                    min: expected.saturating_div(2).max(1).min(expected),
-                    expected: expected.max(1).min(child.expected.max(1)),
-                    max: expected.saturating_mul(2).min(child.max.max(1)),
+                    min: base_expected
+                        .saturating_div(2)
+                        .min(expected)
+                        .saturating_mul(non_empty_domains)
+                        .saturating_add(empty_domains)
+                        .min(expected),
+                    expected,
+                    max,
                 };
                 if let Some(reduction) = &agg.post_reduction {
                     // The post-reduction predicate is an aggregate-owned
@@ -989,8 +1056,9 @@ mod tests {
     use paro_context::test_support::TestStatementContextBuilder;
     use paro_context::StatementContext;
     use paro_planner::binder::context::BindContext;
+    use paro_planner::binder::ir::GroupingSet;
     use paro_planner::expression::ColumnRefExpression;
-    use paro_planner::operator::{ExpressionGet, Limit, Projection};
+    use paro_planner::operator::{Aggregate, ExpressionGet, Limit, Projection};
 
     use super::*;
     use crate::context::OptimizationContext;
@@ -1128,6 +1196,64 @@ mod tests {
         assert_eq!(
             gathered.stats.cardinality_provenance,
             CardinalityProvenance::JoinGraph
+        );
+    }
+
+    #[test]
+    fn grouped_aggregate_over_proven_empty_input_is_empty() {
+        let bind_context = BindContext::new();
+        let session = make_test_session();
+        let mut ctx = OptimizationContext::new(session, bind_context.clone());
+        let child = values_relation(&bind_context, 1, 0);
+        let aggregate = Aggregate::new(
+            2,
+            3,
+            4,
+            child,
+            vec![column_ref(1, 0)],
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+        );
+        let plan = LogicalPlan::new(&bind_context, LogicalOperator::Aggregate(aggregate));
+
+        let gathered = StatisticsGathering::new()
+            .gather(plan, &mut ctx)
+            .expect("gather should succeed");
+
+        assert_eq!(
+            gathered.stats.estimated_cardinality,
+            Some(CardinalityEstimate::exact(0))
+        );
+    }
+
+    #[test]
+    fn empty_grouping_set_emits_one_row_over_empty_input() {
+        let bind_context = BindContext::new();
+        let session = make_test_session();
+        let mut ctx = OptimizationContext::new(session, bind_context.clone());
+        let child = values_relation(&bind_context, 1, 0);
+        let aggregate = Aggregate::new(
+            2,
+            3,
+            4,
+            child,
+            vec![column_ref(1, 0)],
+            vec![GroupingSet {
+                expressions: Vec::new(),
+            }],
+            Vec::new(),
+            Vec::new(),
+        );
+        let plan = LogicalPlan::new(&bind_context, LogicalOperator::Aggregate(aggregate));
+
+        let gathered = StatisticsGathering::new()
+            .gather(plan, &mut ctx)
+            .expect("gather should succeed");
+
+        assert_eq!(
+            gathered.stats.estimated_cardinality,
+            Some(CardinalityEstimate::exact(1))
         );
     }
 

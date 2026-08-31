@@ -134,6 +134,8 @@ pub struct JoinOrderOptimizer {
     column_stats: HashMap<ColumnBinding, Arc<ColumnStatistics>>,
     /// Original base-relation subplans keyed by relation id for reconstruction.
     relation_plans: Vec<LogicalPlan>,
+    exact_relation_limit: usize,
+    max_pairs: usize,
 }
 
 impl JoinOrderOptimizer {
@@ -148,7 +150,15 @@ impl JoinOrderOptimizer {
             plans: HashMap::new(),
             column_stats: HashMap::new(),
             relation_plans: Vec::new(),
+            exact_relation_limit: 12,
+            max_pairs: 10_000,
         }
+    }
+
+    pub fn with_search_budget(mut self, budget: &crate::cascades::SearchBudget) -> Self {
+        self.exact_relation_limit = usize::from(budget.max_join_exact_relations);
+        self.max_pairs = usize::try_from(budget.max_join_connected_pairs).unwrap_or(usize::MAX);
+        self
     }
 
     /// Optimize the join order of a logical plan.
@@ -322,11 +332,13 @@ impl JoinOrderOptimizer {
             .init_cost_model(&mut self.set_manager, &stats);
 
         // Create plan enumerator
-        let mut enumerator = PlanEnumerator::new(
+        let mut enumerator = PlanEnumerator::with_budget(
             &self.query_graph,
             &mut self.set_manager,
             &mut self.cost_model,
             self.relation_manager.num_relations(),
+            self.exact_relation_limit,
+            self.max_pairs,
         );
 
         // Initialize leaf plans

@@ -96,7 +96,7 @@ mod tests {
     use super::*;
     use crate::context::{EmptyGraphStatsLoader, GraphStatsCache, OptimizationContext};
     use crate::cost_model::CostModel;
-    use crate::profiler::PipelineProfiler;
+    use crate::profiler::OptimizerProfiler;
 
     fn make_test_session() -> Arc<StatementContext> {
         TestStatementContextBuilder::minimal().build()
@@ -174,7 +174,7 @@ mod tests {
             graph_stats: GraphStatsCache::with_loader(Arc::new(EmptyGraphStatsLoader)),
             cost_model: CostModel::default(),
             verify_enabled: true,
-            profiler: PipelineProfiler::default(),
+            profiler: OptimizerProfiler::default(),
             invalidations: crate::context::OptimizerInvalidations::default(),
         };
 
@@ -218,7 +218,7 @@ mod tests {
             graph_stats: GraphStatsCache::with_loader(Arc::new(EmptyGraphStatsLoader)),
             cost_model: CostModel::default(),
             verify_enabled: true,
-            profiler: PipelineProfiler::default(),
+            profiler: OptimizerProfiler::default(),
             invalidations: crate::context::OptimizerInvalidations::default(),
         };
 

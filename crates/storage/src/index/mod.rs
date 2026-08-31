@@ -77,7 +77,7 @@ pub use exact_row_set::{
     DenseRowSet, ExactOrdinalPosting, ExactRowAdmission, ExactRowPartitions, ExactRowSet,
     ExactScalarKey, PartitionExactRowSet,
 };
-pub use fixed_membership::{FixedMembership, FixedMembershipBuildPolicy};
+pub use fixed_membership::{FixedMembership, FixedMembershipBuildPolicy, FixedMembershipWidth};
 pub(crate) use fixed_membership::{
     FixedMembershipKind, FixedMembershipSet, FixedMembershipValue, FixedMembershipView,
 };

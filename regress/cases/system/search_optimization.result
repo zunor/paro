@@ -71,18 +71,17 @@ PROJECTION  (rows=1)
   Output: id
   Cardinality: [0, 1, 1]
   Output Schema: id INTEGER
-  ->  FULLTEXT_SCAN on public.search_opt_docs  (rows=1)
-    Search Definition: <search-definition-id>
-    Search Generation: <search-generation-id>
-    Search Root: <search-root-id>
-    Search Capability: Queryable
-    Search Candidate: full text
-    Column: content
-    Mode: Filter
-    Pushed Predicate: category = 'tech'
-    Filter Pushdown: exact segment row set materialized by column scan; no residual filter
+  ->  FILTER  (rows=1)
+    Filter: fulltext_match(public.search_opt_docs.content, 'graph database')
     Cardinality: [0, 1, 1]
     Output Schema: public.search_opt_docs.id INTEGER, public.search_opt_docs.category VARCHAR, public.search_opt_docs.content VARCHAR
+    ->  ROWSET_SCAN on public.search_opt_docs  (rows=4)
+      Columns: id, category, content
+      Pushed Predicate: category = 'tech'
+      Late Materialize: auto
+      Residual Predicate: fulltext_match(content, 'graph database')
+      Cardinality: [4, 4, 4]
+      Output Schema: public.search_opt_docs.id INTEGER, public.search_opt_docs.category VARCHAR, public.search_opt_docs.content VARCHAR
 
 DROP TABLE search_opt_docs;
 DROP TABLE

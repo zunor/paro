@@ -160,6 +160,7 @@ impl JoinBuildHandle {
         conditions: Vec<JoinCondition>,
         build_types: Vec<LogicalType>,
         join_type: JoinType,
+        runtime_filter_enabled: bool,
         memory: MemoryAccountingContext,
     ) -> Result<Arc<JoinHashTable>> {
         let build_output_count = build_types.len();
@@ -171,6 +172,7 @@ impl JoinBuildHandle {
             build_output_count,
             join_type,
             false,
+            runtime_filter_enabled,
             memory,
         )
     }
@@ -184,16 +186,19 @@ impl JoinBuildHandle {
         build_output_count: usize,
         join_type: JoinType,
         build_keys_unique: bool,
+        runtime_filter_enabled: bool,
         memory: MemoryAccountingContext,
     ) -> Result<Arc<JoinHashTable>> {
-        let runtime_filter_key_types = conditions
-            .iter()
-            .map(|condition| condition.right.return_type())
-            .collect::<Vec<_>>();
-        self.initialize_runtime_filter_builder(
-            &runtime_filter_key_types,
-            memory.with_class(MemoryAccountingClass::Metadata),
-        );
+        if runtime_filter_enabled {
+            let runtime_filter_key_types = conditions
+                .iter()
+                .map(|condition| condition.right.return_type())
+                .collect::<Vec<_>>();
+            self.initialize_runtime_filter_builder(
+                &runtime_filter_key_types,
+                memory.with_class(MemoryAccountingClass::Metadata),
+            );
+        }
         let mut state = self.table.lock();
         match &*state {
             JoinHashTableState::Live(table) => return Ok(Arc::clone(table)),
@@ -295,10 +300,10 @@ impl JoinBuildHandle {
         if self.runtime_filter.get().is_some() {
             return Ok(());
         }
-        let filter = builder
-            .take()
-            .unwrap_or_else(|| JoinRuntimeFilterBuilder::empty(&[]))
-            .freeze();
+        let Some(builder) = builder.take() else {
+            return Ok(());
+        };
+        let filter = builder.freeze();
         // The builder lock serializes concurrent finalize/reclaim publishers,
         // so ownership can move into the immutable filter without cloning it.
         self.runtime_filter.set(filter).map_err(|_| {

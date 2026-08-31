@@ -264,6 +264,11 @@ fn grouped_count_spec(perfect_hash: Option<PerfectHashAggregatePlan>) -> Aggrega
         aggregate_orders: vec![Vec::<usize>::new().into_boxed_slice()].into_boxed_slice(),
         post_reduction: None,
         having_filter: Box::new([]),
+        spill_policy: if perfect_hash.is_some() {
+            crate::physical::specs::SpillExecutionPolicy::Forbidden
+        } else {
+            crate::physical::specs::SpillExecutionPolicy::Allowed
+        },
         perfect_hash,
         output_names: vec!["k".to_string(), "count".to_string()].into_boxed_slice(),
         output_types: vec![LogicalType::Integer, LogicalType::BigInt].into_boxed_slice(),
@@ -322,6 +327,11 @@ fn grouped_sum_post_max_spec(
         aggregate_orders: Box::new([Box::new([])]),
         post_reduction: Some(post_reduction),
         having_filter,
+        spill_policy: if perfect_hash.is_some() {
+            crate::physical::specs::SpillExecutionPolicy::Forbidden
+        } else {
+            crate::physical::specs::SpillExecutionPolicy::Allowed
+        },
         perfect_hash,
         output_names: Box::new(["k".to_string(), "sum".to_string()]),
         output_types: Box::new([key_type, LogicalType::BigInt]),
@@ -345,6 +355,7 @@ fn ungrouped_count_spec() -> AggregateSpec {
         aggregate_orders: vec![Vec::<usize>::new().into_boxed_slice()].into_boxed_slice(),
         post_reduction: None,
         having_filter: Box::new([]),
+        spill_policy: crate::physical::specs::SpillExecutionPolicy::Allowed,
         perfect_hash: None,
         output_names: vec!["count".to_string()].into_boxed_slice(),
         output_types: vec![LogicalType::BigInt].into_boxed_slice(),
@@ -379,6 +390,7 @@ fn ungrouped_distinct_count_spec() -> AggregateSpec {
         aggregate_orders: vec![Vec::<usize>::new().into_boxed_slice()].into_boxed_slice(),
         post_reduction: None,
         having_filter: Box::new([]),
+        spill_policy: crate::physical::specs::SpillExecutionPolicy::Allowed,
         perfect_hash: None,
         output_names: vec!["count".to_string()].into_boxed_slice(),
         output_types: vec![LogicalType::BigInt].into_boxed_slice(),
@@ -412,6 +424,7 @@ fn grouped_distinct_count_spec() -> AggregateSpec {
         aggregate_orders: Box::new([Box::new([])]),
         post_reduction: None,
         having_filter: Box::new([]),
+        spill_policy: crate::physical::specs::SpillExecutionPolicy::Allowed,
         perfect_hash: None,
         output_names: Box::new(["k".to_string(), "count".to_string()]),
         output_types: Box::new([LogicalType::Integer, LogicalType::BigInt]),

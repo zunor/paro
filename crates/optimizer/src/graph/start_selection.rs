@@ -68,6 +68,75 @@ impl GraphStartSelection {
         }))
     }
 
+    /// Enumerate every legal fixed-length frontier for one graph pattern.
+    ///
+    /// The first entry is always the binder order and is the mandatory
+    /// baseline.  Remaining entries are deterministic optional alternatives;
+    /// this routine deliberately does not compare their estimated costs.  The
+    /// graph-region caller inserts them into the Memo and winner selection is
+    /// performed by the shared cost/property engine.
+    pub fn enumerate_pattern_orders(
+        &self,
+        graph_match: &GraphMatch,
+        max_candidates: usize,
+    ) -> Vec<Vec<BoundPatternElement>> {
+        let baseline = graph_match.bound_pattern.elements.clone();
+        let mut candidates = vec![baseline.clone()];
+        if graph_match.has_path_functions || max_candidates <= 1 {
+            return candidates;
+        }
+
+        let pattern = Self::parse_pattern(&baseline);
+        if pattern.vertices.len() <= 1 {
+            return candidates;
+        }
+
+        let mut fingerprints = std::collections::BTreeSet::new();
+        fingerprints.insert(Self::pattern_order_fingerprint(&baseline));
+        for start_idx in 0..pattern.vertices.len() {
+            for branch_order in [BranchOrder::LeftFirst, BranchOrder::RightFirst] {
+                let reordered = Self::reorder_pattern(&pattern, start_idx, branch_order);
+                if fingerprints.insert(Self::pattern_order_fingerprint(&reordered)) {
+                    candidates.push(reordered);
+                    if candidates.len() == max_candidates {
+                        return candidates;
+                    }
+                }
+            }
+        }
+        candidates
+    }
+
+    fn pattern_order_fingerprint(elements: &[BoundPatternElement]) -> String {
+        let mut fingerprint = String::new();
+        for element in elements {
+            match element {
+                BoundPatternElement::Vertex(vertex) => {
+                    fingerprint.push_str("v:");
+                    fingerprint.push_str(&vertex.variable_name);
+                    fingerprint.push(';');
+                }
+                BoundPatternElement::Edge(edge) => {
+                    fingerprint.push_str("e:");
+                    fingerprint.push_str(&edge.variable_name);
+                    fingerprint.push(':');
+                    fingerprint.push_str(&edge.source_variable);
+                    fingerprint.push('>');
+                    fingerprint.push_str(&edge.destination_variable);
+                    fingerprint.push(':');
+                    fingerprint.push_str(match edge.direction {
+                        EdgeDirection::Right => "r",
+                        EdgeDirection::Left => "l",
+                        EdgeDirection::Undirected => "u",
+                        EdgeDirection::LeftRight => "b",
+                    });
+                    fingerprint.push(';');
+                }
+            }
+        }
+        fingerprint
+    }
+
     /// Select the best starting vertex for the pattern and reorder if needed.
     fn select_start(&self, gm: &mut GraphMatch, ctx: &mut OptimizationContext) {
         if gm.has_path_functions {

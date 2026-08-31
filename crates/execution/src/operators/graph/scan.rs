@@ -19,7 +19,6 @@ use paro_storage::transaction::overlay_reader::TxnOverlayReader;
 use paro_transaction::TableId;
 
 use crate::expression_executor::executor::{ExpressionExecutor, VectorKernelInput};
-use crate::operators::sort::build::query_has_temporary_directory;
 use crate::physical::specs::GraphScanSpec;
 use crate::runtime::context::{OperatorCallContext, PipelineInitContext};
 use crate::runtime::source::SourcePoll;
@@ -43,11 +42,6 @@ pub struct GraphScanSourceExec {
 
 impl GraphScanSourceExec {
     pub(crate) fn create_global(&self, ctx: &mut PipelineInitContext) -> Result<SourceGlobal> {
-        if ctx.query.session.limits.force_external && !query_has_temporary_directory(ctx.query) {
-            return Err(paro_error::out_of_memory(
-                "force_external graph scan requires a temporary directory",
-            ));
-        }
         let snapshot = ctx
             .query
             .session

@@ -12,7 +12,6 @@ use paro_planner::operator::graph_expand::ExpandDirection;
 use paro_storage::index::graph::NeighborView;
 
 use crate::operators::graph::state::{graph_path_list_value, GraphExpandRow, GraphPathPayload};
-use crate::operators::sort::build::query_has_temporary_directory;
 use crate::physical::specs::GraphExpandSpec;
 use crate::runtime::context::{OperatorCallContext, OperatorFinishContext, PipelineInitContext};
 use crate::runtime::state::{
@@ -28,11 +27,6 @@ pub struct GraphExpandTransformExec {
 
 impl GraphExpandTransformExec {
     pub(crate) fn create_global(&self, ctx: &mut PipelineInitContext) -> Result<TransformGlobal> {
-        if ctx.query.session.limits.force_external && !query_has_temporary_directory(ctx.query) {
-            return Err(paro_error::out_of_memory(
-                "force_external graph expand requires a temporary directory",
-            ));
-        }
         if self.spec.edge_filter.is_some() || self.spec.target_filter.is_some() {
             return Err(paro_error::not_implemented(
                 "typed GraphExpand path filters require GraphProject hand-off",

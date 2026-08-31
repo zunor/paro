@@ -618,5 +618,10 @@ fn single_node_plan(kind: PhysicalNodeKind, output: RowType) -> PhysicalPlan {
         children: PlanChildren::Empty,
         label: OperatorLabel::new(PlanNodeId::SYNTHETIC, "TEST"),
     });
-    PhysicalPlan::new(root, nodes, PlanChildrenArena::default(), PlanPropertyMap)
+    PhysicalPlan::new(
+        root,
+        nodes,
+        PlanChildrenArena::default(),
+        PlanPropertyMap::default(),
+    )
 }

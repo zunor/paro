@@ -22,7 +22,7 @@ use paro_storage::search::{
 };
 
 use crate::context::OptimizationContext;
-use crate::statistics::search_cost::{FullTextScanCostModel, VectorScanCostModel};
+use crate::statistics::cost::{FullTextScanCostModel, VectorScanCostModel};
 
 #[cfg(test)]
 use paro_planner::binder::ir::OrderByNode;
@@ -41,6 +41,23 @@ impl SearchOptimizer {
     pub fn rewrite(&mut self, plan: LogicalPlan, ctx: &OptimizationContext) -> Result<LogicalPlan> {
         let plan = plan.try_map_children(|child| self.rewrite(child, ctx))?;
         self.rewrite_current(plan, ctx)
+    }
+
+    /// Derive a physical search payload for exactly this logical root.  It is
+    /// intentionally non-recursive: the Memo builder attaches the payload to
+    /// the matching Filter/TopN expression and keeps the logical expression
+    /// itself provider- and capability-free.
+    pub(crate) fn physical_candidate_for_root(
+        &mut self,
+        plan: LogicalPlan,
+        ctx: &OptimizationContext,
+    ) -> Result<Option<LogicalPlan>> {
+        let rewritten = self.rewrite_current(plan, ctx)?;
+        Ok(matches!(
+            rewritten.operator,
+            LogicalOperator::SearchScan(_) | LogicalOperator::FullTextFilterScan(_)
+        )
+        .then_some(rewritten))
     }
 
     fn rewrite_current(
@@ -204,6 +221,22 @@ impl SearchOptimizer {
         }
 
         if let Some(intent) = extract_fulltext_score_intent(pattern.order_expr, pattern.get)? {
+            // A matching full-text predicate is the admission semantics of
+            // this ranked provider, not a residual scalar predicate. Keeping
+            // it in `absorbed_predicates` asks the physical predicate builder
+            // to lower the full-text operator a second time and turns an
+            // otherwise valid search winner into UNSUPPORTED. Only predicates
+            // not represented by the provider remain as exact row-set input.
+            let candidate_filters =
+                residual_fulltext_filters(candidate_filters, pattern.get, &intent)?;
+            let filtered = ctx.cost_model.estimate_filter_cardinality(
+                base_rows,
+                &candidate_filters,
+                &ctx.column_stats,
+            );
+            let filter_selectivity = estimate_selectivity(base_rows, filtered.expected);
+            let filter_materialization =
+                exact_filter_materialization(&candidate_filters, pattern.get, storage.as_ref());
             let search_intent = SearchIntent::FullText(intent.clone());
             let Some(capability) = storage.search_capability(&search_intent) else {
                 return Ok(None);
@@ -326,6 +359,27 @@ impl SearchOptimizer {
     }
 }
 
+fn residual_fulltext_filters(
+    filters: Vec<Expression>,
+    get: &Get,
+    score_intent: &FullTextIntent,
+) -> Result<Vec<Expression>> {
+    let mut residual = Vec::with_capacity(filters.len());
+    for filter in filters {
+        let represented =
+            extract_fulltext_match_intent(&filter, get)?.is_some_and(|predicate_intent| {
+                predicate_intent.column_id == score_intent.column_id
+                    && predicate_intent.query == score_intent.query
+                    && predicate_intent.query_kind == score_intent.query_kind
+                    && predicate_intent.config == score_intent.config
+            });
+        if !represented {
+            residual.push(filter);
+        }
+    }
+    Ok(residual)
+}
+
 fn build_search_scan(
     plan: LogicalPlan,
     pattern: TopNPattern<'_>,
@@ -394,10 +448,6 @@ fn select_search_decision(
     if !candidate_cost.is_finite() || !sequential_cost.is_finite() {
         return None;
     }
-    if candidate_cost >= sequential_cost {
-        return None;
-    }
-
     let ratio = candidate_cost / sequential_cost.max(1.0);
     if ratio <= 0.60 {
         Some(SearchDecision::IndexScan {

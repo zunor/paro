@@ -37,13 +37,13 @@ column_name	num_rows	null_count	distinct_count	has_fulltext_index
 id	3	0	3	false
 title	3	1	2	true
 
-SELECT name, enabled, invocation_count >= 0 AS has_invocations
+SELECT name, kind, invocation_count >= 0 AS has_invocations
 FROM paro_optimizers()
-WHERE name IN ('search_optimization', 'statistics_gathering')
+WHERE name IN ('query_ir_construction', 'memo_exploration')
 ORDER BY name;
-name	enabled	has_invocations
-search_optimization	true	true
-statistics_gathering	true	true
+name	kind	has_invocations
+memo_exploration	search	true
+query_ir_construction	frontend	true
 
 -- @normalize explain_search_ids
 EXPLAIN (VERBOSE)
