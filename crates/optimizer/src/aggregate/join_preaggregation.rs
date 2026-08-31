@@ -10,9 +10,6 @@
 //! unmatched rows, while bounding the join build and output to one row per
 //! nullable-side key.
 
-use std::collections::HashMap;
-use std::sync::Arc;
-
 use paro_planner::binder::context::BindContext;
 use paro_planner::expression::{
     AggregateExpression, AggregateType, ColumnRefExpression, Expression,
@@ -21,49 +18,32 @@ use paro_planner::operator::{
     Aggregate, ColumnBinding, ComparisonJoin, Join, JoinComparisonType, JoinType, LogicalOperator,
 };
 use paro_planner::plan::LogicalPlan;
-use paro_storage::statistics::ColumnStatistics;
-
-/// Pre-aggregate eligible nullable sides when statistics predict a material
-/// reduction in join rows.
-pub fn optimize_plan(
-    plan: LogicalPlan,
-    bind_context: &BindContext,
-    column_stats: &HashMap<ColumnBinding, Arc<ColumnStatistics>>,
-) -> (LogicalPlan, bool) {
-    fn rewrite(
-        plan: LogicalPlan,
-        bind_context: &BindContext,
-        column_stats: &HashMap<ColumnBinding, Arc<ColumnStatistics>>,
-    ) -> (LogicalPlan, bool) {
+/// Enumerate the semantics-preserving pre-aggregation alternative. Whether it
+/// is profitable belongs to Memo costing, not to the transformation itself.
+pub fn optimize_plan(plan: LogicalPlan, bind_context: &BindContext) -> (LogicalPlan, bool) {
+    fn rewrite(plan: LogicalPlan, bind_context: &BindContext) -> (LogicalPlan, bool) {
         let mut child_changed = false;
         let mut plan = plan.map_children(|child| {
-            let (child, changed) = rewrite(child, bind_context, column_stats);
+            let (child, changed) = rewrite(child, bind_context);
             child_changed |= changed;
             child
         });
         let LogicalOperator::Aggregate(aggregate) = &mut plan.operator else {
             return (plan, child_changed);
         };
-        let Some(right_key) = JoinPreaggregation::candidate_right_key(aggregate) else {
-            return (plan, child_changed);
-        };
-        if !JoinPreaggregation::estimated_to_reduce(aggregate, right_key, column_stats) {
+        if JoinPreaggregation::candidate_right_key(aggregate).is_none() {
             return (plan, child_changed);
         }
         let changed = JoinPreaggregation::rewrite(aggregate, bind_context);
         (plan, child_changed || changed)
     }
 
-    rewrite(plan, bind_context, column_stats)
+    rewrite(plan, bind_context)
 }
 
 struct JoinPreaggregation;
 
 impl JoinPreaggregation {
-    const MIN_INPUT_ROWS: u64 = 1_024;
-    const MIN_REDUCTION_NUMERATOR: u64 = 3;
-    const MIN_REDUCTION_DENOMINATOR: u64 = 2;
-
     fn candidate_right_key(aggregate: &Aggregate) -> Option<ColumnBinding> {
         if aggregate.post_reduction.is_some()
             || aggregate.groups.len() != 1
@@ -76,6 +56,13 @@ impl JoinPreaggregation {
         let LogicalOperator::Join(Join::Comparison(join)) = &aggregate.child.operator else {
             return None;
         };
+        // A prior application has already reduced the nullable side to its
+        // join key. Re-aggregating that partial-state relation is equivalent
+        // but cannot reduce it further and would create an unbounded rewrite
+        // chain in a Memo agenda.
+        if matches!(join.right.operator, LogicalOperator::Aggregate(_)) {
+            return None;
+        }
         if !Self::clean_left_join(join) || join.conditions.len() != 1 {
             return None;
         }
@@ -127,33 +114,6 @@ impl JoinPreaggregation {
             }
         }
         Some(right_key)
-    }
-
-    fn estimated_to_reduce(
-        aggregate: &Aggregate,
-        right_key: ColumnBinding,
-        column_stats: &HashMap<ColumnBinding, Arc<ColumnStatistics>>,
-    ) -> bool {
-        let LogicalOperator::Join(Join::Comparison(join)) = &aggregate.child.operator else {
-            return false;
-        };
-        let Some(input_rows) = join
-            .right
-            .stats
-            .estimated_cardinality
-            .map(|estimate| estimate.expected)
-        else {
-            return false;
-        };
-        let distinct = column_stats
-            .get(&right_key)
-            .map(|stats| stats.get_distinct_count() as u64)
-            .unwrap_or(0)
-            .min(input_rows);
-        input_rows >= Self::MIN_INPUT_ROWS
-            && distinct > 0
-            && input_rows.saturating_mul(Self::MIN_REDUCTION_DENOMINATOR)
-                >= distinct.saturating_mul(Self::MIN_REDUCTION_NUMERATOR)
     }
 
     fn rewrite(aggregate: &mut Aggregate, bind_context: &BindContext) -> bool {
@@ -227,6 +187,13 @@ impl JoinPreaggregation {
             )),
         );
         *join.right = partial_plan;
+        // The replacement introduces a group key and a partial-state column
+        // with a new layout. Positional demand maps from the original right
+        // input cannot be carried across that boundary. Expose the semantic
+        // result here and let the canonical column-lifetime pass derive the
+        // final demand projection from the rewritten parent expressions.
+        join.left_projection_map = paro_planner::operator::ProjectionMap::all();
+        join.right_projection_map = paro_planner::operator::ProjectionMap::all();
 
         let group_ref = Expression::ColumnRef(ColumnRefExpression::new(
             ColumnBinding::new(group_index, 0),
@@ -251,8 +218,6 @@ impl JoinPreaggregation {
             && join.mark_index.is_none()
             && join.duplicate_eliminated_columns.is_empty()
             && !join.delim_flipped
-            && join.left_projection_map.is_all()
-            && join.right_projection_map.is_all()
     }
 
     fn column_binding(expression: &Expression) -> Option<ColumnBinding> {
@@ -275,7 +240,7 @@ mod tests {
     };
     use paro_planner::plan::LogicalPlan;
 
-    use super::JoinPreaggregation;
+    use super::{optimize_plan, JoinPreaggregation};
 
     fn column(table: usize, index: usize) -> Expression {
         Expression::ColumnRef(ColumnRefExpression::new(
@@ -379,5 +344,37 @@ mod tests {
         });
 
         assert!(!JoinPreaggregation::rewrite(aggregate, &bind_context));
+    }
+
+    #[test]
+    fn rewrite_rederives_join_projection_after_replacing_the_right_layout() {
+        let bind_context = BindContext::new();
+        let mut plan = candidate(&bind_context);
+        let LogicalOperator::Aggregate(aggregate) = &mut plan.operator else {
+            panic!("aggregate root")
+        };
+        let LogicalOperator::Join(Join::Comparison(join)) = &mut aggregate.child.operator else {
+            panic!("left join")
+        };
+        join.left_projection_map = vec![0].into();
+        join.right_projection_map = vec![1].into();
+
+        assert!(JoinPreaggregation::rewrite(aggregate, &bind_context));
+
+        let LogicalOperator::Join(Join::Comparison(join)) = &aggregate.child.operator else {
+            panic!("rewritten left join")
+        };
+        assert!(join.left_projection_map.is_all());
+        assert!(join.right_projection_map.is_all());
+    }
+
+    #[test]
+    fn rewrite_is_idempotent_after_the_nullable_side_is_reduced() {
+        let bind_context = BindContext::new();
+        let (plan, changed) = optimize_plan(candidate(&bind_context), &bind_context);
+        assert!(changed);
+
+        let (_plan, changed_again) = optimize_plan(plan, &bind_context);
+        assert!(!changed_again);
     }
 }

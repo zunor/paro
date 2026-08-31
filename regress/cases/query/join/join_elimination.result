@@ -77,6 +77,13 @@ PROJECTION  (rows=3)
     ->  ROWSET_SCAN on public.join_elim_right_nonunique r  (rows=2)
       Columns: id
 
+SET disabled_optimizer_rules = 'no_such_rule';
+ERROR: unknown optimizer transformation rule 'no_such_rule' (SQLSTATE=22023)
+
+SHOW disabled_optimizer_rules;
+disabled_optimizer_rules
+(empty)
+
 SET disabled_optimizer_rules = 'join_elimination';
 SET
 
@@ -98,3 +105,28 @@ PROJECTION  (rows=3)
 
 RESET disabled_optimizer_rules;
 RESET
+
+EXPLAIN
+SELECT l.id, l.payload
+FROM join_elim_left AS l
+LEFT JOIN join_elim_right_unique AS r ON l.id = r.id;
+QUERY PLAN
+PROJECTION  (rows=3)
+  Output: l.id, l.payload
+  ->  ROWSET_SCAN on public.join_elim_left l  (rows=3)
+    Columns: id, payload
+
+SELECT name, kind, invocation_count > 0 AS observed
+FROM paro_optimizers()
+WHERE name IN (
+    'join_elimination',
+    'memo_group_count',
+    'memo_logical_expression_count',
+    'memo_physical_expression_count'
+)
+ORDER BY kind, name;
+name	kind	observed
+memo_group_count	search_counter	true
+memo_logical_expression_count	search_counter	true
+memo_physical_expression_count	search_counter	true
+join_elimination	transformation_rule	true

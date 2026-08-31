@@ -556,20 +556,15 @@ fn physical_column_identities(
                     .expressions
                     .iter()
                     .enumerate()
-                    .map(|(index, expression)| {
-                        visible_names
-                            .get(index)
-                            .cloned()
-                            .map(ColumnIdentity::visible)
-                            .or_else(|| {
-                                let Expression::Reference(reference) = expression else {
-                                    return None;
-                                };
-                                child(0)
-                                    .and_then(|input| input.identities.get(reference.index))
-                                    .cloned()
-                            })
-                            .unwrap_or(ColumnIdentity::Internal)
+                    .map(|(index, _expression)| {
+                        if index < projection.visible_count {
+                            return visible_names
+                                .get(index)
+                                .cloned()
+                                .map(ColumnIdentity::visible)
+                                .unwrap_or(ColumnIdentity::Internal);
+                        }
+                        ColumnIdentity::Internal
                     })
                     .collect();
             }

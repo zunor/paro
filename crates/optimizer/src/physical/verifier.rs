@@ -172,6 +172,9 @@ impl PhysicalPlanVerifier {
                     }
                 }
             }
+            if let crate::physical::PhysicalNodeKind::RowFetch(spec) = &node.kind {
+                verify_row_fetch(plan, node.id, spec)?;
+            }
             if !properties
                 .provided
                 .satisfies(&properties.required_from_parent)
@@ -310,6 +313,80 @@ impl PhysicalPlanVerifier {
         }
         verify_acyclic(&dependencies)
     }
+}
+
+fn verify_row_fetch(
+    plan: &PhysicalPlan,
+    node: PhysicalPlanNodeId,
+    spec: &crate::physical::RowFetchSpec,
+) -> Result<()> {
+    let [child] = plan.child_ids(&plan.node(node).children) else {
+        return Err(paro_error::internal(
+            "row fetch must have exactly one carrier child",
+        ));
+    };
+    let child_width = plan.node(*child).output.column_count();
+    if spec.raw_output_names.len() != spec.raw_output_types.len() {
+        return Err(paro_error::internal(
+            "row-fetch raw output names and types are not aligned",
+        ));
+    }
+    let fetched_width = spec.mappings.iter().try_fold(0usize, |width, mapping| {
+        if mapping.rowid_col_idx >= child_width {
+            return Err(paro_error::internal(
+                "row-fetch rowid slot exceeds the carrier width",
+            ));
+        }
+        width
+            .checked_add(mapping.column_ids.len())
+            .ok_or_else(|| paro_error::internal("row-fetch output width overflow"))
+    })?;
+    if spec.raw_output_types.len() != child_width + fetched_width {
+        return Err(paro_error::internal(
+            "row-fetch raw output does not match its carrier and fetched columns",
+        ));
+    }
+
+    let output = &plan.node(node).output;
+    let Some(projection) = &spec.projection else {
+        if output.names.as_ref() != spec.raw_output_names.as_ref()
+            || output.types.as_ref() != spec.raw_output_types.as_ref()
+        {
+            return Err(paro_error::internal(
+                "standalone row-fetch output disagrees with its physical spec",
+            ));
+        }
+        return Ok(());
+    };
+    let width = projection.expressions.len();
+    if projection.output_names.len() != width || projection.output_types.len() != width {
+        return Err(paro_error::internal(
+            "row-fetch projection expressions, names, and types are not aligned",
+        ));
+    }
+    if projection.visible_count > width {
+        return Err(paro_error::internal(
+            "row-fetch visible output prefix exceeds its projection width",
+        ));
+    }
+    if projection
+        .expressions
+        .iter()
+        .zip(projection.output_types.iter())
+        .any(|(expression, output_type)| expression.return_type() != *output_type)
+    {
+        return Err(paro_error::internal(
+            "row-fetch projection expression type disagrees with its output type",
+        ));
+    }
+    if output.names.as_ref() != projection.output_names.as_ref()
+        || output.types.as_ref() != projection.output_types.as_ref()
+    {
+        return Err(paro_error::internal(
+            "fused row-fetch output disagrees with its projection spec",
+        ));
+    }
+    Ok(())
 }
 
 fn runtime_filter_probe_scan(

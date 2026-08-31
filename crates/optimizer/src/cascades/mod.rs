@@ -17,7 +17,7 @@ pub mod cost {
 pub mod enforcer;
 pub mod engine;
 pub mod grant;
-pub mod memo_builder;
+pub mod planner;
 pub mod ids {
     pub use crate::physical::identity::*;
 }
@@ -41,9 +41,9 @@ pub use engine::{CascadesEngine, GrantOptimization, GrantWinner, SearchMode};
 pub use grant::{GrantInvarianceProof, GrantSensitivitySummary};
 pub use ids::*;
 pub use memo::{Memo, OptimizationGoal, Winner};
-pub use memo_builder::{
+pub use planner::{
     AlternativeOrigin, LogicalAlternative, MemoBuilder, OptimizationInput, OptimizationOutput,
-    OptimizedVariant, ResultPresentation, GRAPH_REGION_ENUMERATOR_RULE,
+    OptimizedVariant, ResultPresentation, SearchSummary, GRAPH_REGION_ENUMERATOR_RULE,
     JOIN_REGION_ENUMERATOR_RULE, SEARCH_REGION_ENUMERATOR_RULE,
 };
 pub use properties::{ProvidedProperties, RequiredProperties};

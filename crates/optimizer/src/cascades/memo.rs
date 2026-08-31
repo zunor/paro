@@ -7,7 +7,7 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use paro_common::error::{self as paro_error, Result};
 
-use super::budget::{SearchBudget, SearchLedger};
+use super::budget::{BudgetDimension, SearchBudget, SearchLedger};
 use super::calibration::MachineCalibrationBundle;
 use super::column::GroupSchema;
 use super::cost::SearchCost;
@@ -18,7 +18,7 @@ use super::ids::{
     ResourceGrantClassId, RuleId, StableFingerprintBuilder,
 };
 use super::properties::{PropertyInterner, ProvidedProperties, RequiredProperties};
-use super::region::{JointCostProof, RegionForest};
+use super::region::{JointCostProof, RegionFacet, RegionForest};
 use super::rules::CostComposition;
 use std::sync::Arc;
 
@@ -356,6 +356,13 @@ pub struct Memo {
     regions: RegionForest,
 }
 
+#[derive(Debug)]
+pub(crate) struct TransformationSavepoint {
+    group_count: usize,
+    logical_expression_count: usize,
+    regions: RegionForest,
+}
+
 impl Memo {
     pub fn new(budget: SearchBudget) -> Self {
         Self {
@@ -384,8 +391,91 @@ impl Memo {
         self.regions = regions;
     }
 
+    /// Capture the append-only relational state available to a transformation.
+    /// Physical expressions, winners, and property sets are not writable in
+    /// this search phase and therefore are intentionally absent.
+    pub(crate) fn transformation_savepoint(&self) -> TransformationSavepoint {
+        TransformationSavepoint {
+            group_count: self.groups.len(),
+            logical_expression_count: self.logical_exprs.len(),
+            regions: self.regions.clone(),
+        }
+    }
+
+    pub(crate) fn rollback_transformation(&mut self, savepoint: TransformationSavepoint) {
+        debug_assert!(self.logical_owners[savepoint.logical_expression_count..]
+            .iter()
+            .all(|owner| owner.index() >= savepoint.group_count));
+        self.logical_exprs
+            .truncate(savepoint.logical_expression_count);
+        self.logical_owners
+            .truncate(savepoint.logical_expression_count);
+        self.groups.truncate(savepoint.group_count);
+        self.parents.truncate(savepoint.group_count);
+        self.regions = savepoint.regions;
+    }
+
     pub fn regions(&self) -> &RegionForest {
         &self.regions
+    }
+
+    /// Add a facet, or extend an existing facet, while transformations are
+    /// still in the logical exploration phase. Region ids may be reassigned
+    /// by normalization, so callers attach implementations by stable facet
+    /// fingerprint and must invoke this before physical recipes are built.
+    pub fn upsert_region_facet(
+        &mut self,
+        mut facet: RegionFacet,
+    ) -> Result<Box<[super::ids::Fingerprint]>> {
+        facet.scope = facet
+            .scope
+            .iter()
+            .map(|group| self.canonical_group(*group))
+            .collect();
+        let mut facets = self
+            .regions
+            .nodes
+            .iter()
+            .flat_map(|region| region.facets.iter().cloned())
+            .map(|facet| (facet.fingerprint, facet))
+            .collect::<BTreeMap<_, _>>();
+        match facets.get_mut(&facet.fingerprint) {
+            Some(existing) => {
+                if existing.kind != facet.kind
+                    || existing.criticality != facet.criticality
+                    || existing.priority != facet.priority
+                {
+                    return Err(paro_error::internal(
+                        "planning facet fingerprint changed its contract",
+                    ));
+                }
+                existing.scope.extend(facet.scope);
+            }
+            None => {
+                facets.insert(facet.fingerprint, facet);
+            }
+        }
+        let previously_dropped = self
+            .regions
+            .dropped_optional_facets
+            .iter()
+            .copied()
+            .collect::<BTreeSet<_>>();
+        let mut regions = RegionForest::normalize(
+            facets.into_values(),
+            usize::from(self.budget.max_composite_region_groups),
+            self.budget.max_mandatory_region_groups as usize,
+        )?;
+        let dropped = previously_dropped
+            .into_iter()
+            .chain(regions.dropped_optional_facets.iter().copied())
+            .collect::<BTreeSet<_>>()
+            .into_iter()
+            .collect::<Vec<_>>()
+            .into_boxed_slice();
+        regions.dropped_optional_facets = dropped.clone();
+        self.regions = regions;
+        Ok(dropped)
     }
 
     pub fn create_group(
@@ -432,6 +522,16 @@ impl Memo {
         self.logical_exprs.get(id.index())
     }
 
+    pub(crate) fn logical_expr_for_key(
+        &self,
+        group: GroupId,
+        key: &LogicalExprKey,
+    ) -> Option<&LogicalExpr> {
+        let group = self.canonical_group(group);
+        let expression = self.groups.get(group.index())?.logical_index.get(key)?;
+        self.logical_expr(*expression)
+    }
+
     pub fn logical_owner(&self, id: LogicalExprId) -> Option<GroupId> {
         self.logical_owners
             .get(id.index())
@@ -452,6 +552,28 @@ impl Memo {
 
     pub fn group_count(&self) -> usize {
         self.groups.len()
+    }
+
+    pub fn canonical_group_count(&self) -> usize {
+        self.groups().count()
+    }
+
+    pub fn logical_expr_count(&self) -> usize {
+        self.logical_exprs.len()
+    }
+
+    pub fn physical_expr_count(&self) -> usize {
+        self.physical_exprs.len()
+    }
+
+    pub fn exhaustion_counts(&self) -> BTreeMap<BudgetDimension, u64> {
+        let mut counts = BTreeMap::new();
+        for group in self.groups() {
+            for (dimension, _) in group.ledger.exhaustion_events() {
+                *counts.entry(*dimension).or_default() += 1;
+            }
+        }
+        counts
     }
 
     pub fn groups(&self) -> impl Iterator<Item = &Group> {
@@ -667,9 +789,11 @@ impl Memo {
         } else {
             (right, left)
         };
+        let canonical_facts = &self.groups[canonical.index()].logical_properties;
+        let secondary_facts = &self.groups[secondary.index()].logical_properties;
         if self.groups[canonical.index()].schema != self.groups[secondary.index()].schema
-            || self.groups[canonical.index()].logical_properties
-                != self.groups[secondary.index()].logical_properties
+            || canonical_facts.unique_keys != secondary_facts.unique_keys
+            || canonical_facts.outer_references != secondary_facts.outer_references
         {
             return Err(paro_error::internal(format!(
                 "cannot merge Memo groups with different output contracts or logical facts: \
@@ -685,6 +809,18 @@ impl Memo {
 
         let (canonical_group, secondary_group) =
             two_groups_mut(&mut self.groups, canonical.index(), secondary.index());
+        // Equivalent expressions can establish different conservative row
+        // bounds (for example, a decorrelated plan can prove a tighter cap
+        // than its dependent form). Both proofs describe the same relation,
+        // so their intersection is valid for the complete equivalence class.
+        canonical_group.logical_properties.maximum_cardinality = match (
+            canonical_group.logical_properties.maximum_cardinality,
+            secondary_group.logical_properties.maximum_cardinality,
+        ) {
+            (Some(left), Some(right)) => Some(left.min(right)),
+            (Some(bound), None) | (None, Some(bound)) => Some(bound),
+            (None, None) => None,
+        };
         canonical_group.ledger.merge_from(&secondary_group.ledger);
         canonical_group
             .logical_exprs
@@ -1144,6 +1280,27 @@ mod tests {
         let left = memo.create_group(schema(1), LogicalProperties::default());
         let right = memo.create_group(schema(2), LogicalProperties::default());
         assert!(memo.merge_groups(left, right).is_err());
+    }
+
+    #[test]
+    fn group_merge_intersects_independently_proven_cardinality_bounds() {
+        let mut memo = Memo::new(SearchBudget::default());
+        let mut loose = LogicalProperties::default();
+        loose.maximum_cardinality = Some(16);
+        let mut tight = LogicalProperties::default();
+        tight.maximum_cardinality = Some(4);
+        let left = memo.create_group(schema(1), loose);
+        let right = memo.create_group(schema(1), tight);
+
+        let group = memo.merge_groups(left, right).unwrap();
+
+        assert_eq!(
+            memo.group(group)
+                .unwrap()
+                .logical_properties
+                .maximum_cardinality,
+            Some(4)
+        );
     }
 
     #[test]

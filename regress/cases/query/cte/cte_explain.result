@@ -178,14 +178,11 @@ PIPELINE 4
   SINK #14 RECURSIVE_TABLE_APPEND (actual time=<time-range> rows=0 loops=<loops>)
 PIPELINE 5
   SOURCE #15 RECURSIVE_TABLE_SCAN (actual time=<time-range> rows=5 loops=<loops>)
-  SINK #16 CTE_MATERIALIZE (actual time=<time-range> rows=5 loops=<loops>)
+  TRANSFORM #16 PROJECTION (actual time=<time-range> rows=5 loops=<loops>)
+  SINK #17 SORT_BUILD (actual time=<time-range> rows=5 loops=<loops> peak_memory_bytes=262130)
 PIPELINE 6
-  SOURCE #17 CTE_SCAN (actual time=<time-range> rows=5 loops=<loops>)
-  TRANSFORM #18 PROJECTION (actual time=<time-range> rows=5 loops=<loops>)
-  SINK #19 SORT_BUILD (actual time=<time-range> rows=5 loops=<loops> peak_memory_bytes=262130)
-PIPELINE 7
-  SOURCE #20 SORT_EMIT (actual time=<time-range> rows=5 loops=<loops>)
-  SINK #21 CLIENT_RESULT (actual time=<time-range> rows=5 loops=<loops>)
+  SOURCE #18 SORT_EMIT (actual time=<time-range> rows=5 loops=<loops>)
+  SINK #19 CLIENT_RESULT (actual time=<time-range> rows=5 loops=<loops>)
 CONTROL_REGION 0 RECURSIVE_CTE (iterations=3 termination=empty_delta)
   ITERATION 1 (delta_rows=1 working_rows=1)
   ITERATION 2 (delta_rows=2 working_rows=2)

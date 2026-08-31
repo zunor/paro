@@ -84,6 +84,7 @@ rowset_scan_pushdown	true	Enable rowset predicate pushdown and late materializat
 search_path	"$user", public	Sets the schema search order for names
 statement_timeout	0	Maximum execution time for a single statement
 use_new_agg_spill	true	Enable the newer hash aggregate spill path
+vector_search_objective	exact	Default dense-vector search result objective
 
 SELECT current_setting('temp_directory') <> '(empty)' AS has_default_temp_directory;
 has_default_temp_directory

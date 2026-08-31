@@ -2579,6 +2579,7 @@ mod tests {
                     },
                 ],
                 rule_insertions: Default::default(),
+                counters: Default::default(),
             },
         );
         publish_optimizer_profile_snapshot(
@@ -2590,6 +2591,7 @@ mod tests {
                     invocation_count: 77,
                 }],
                 rule_insertions: Default::default(),
+                counters: Default::default(),
             },
         );
 

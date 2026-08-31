@@ -1,0 +1,423 @@
+// Copyright 2024-2026 Zunor
+// SPDX-License-Identifier: Apache-2.0
+
+//! Physical implementation registry and candidate construction.
+
+use super::*;
+
+pub(super) fn register_implementations(
+    registry: &mut ImplementationRegistry,
+    planner_state: Arc<RwLock<PlannerTransformState>>,
+    child_required: PropertySetId,
+    grant_classes: Arc<BTreeMap<crate::cascades::ids::ResourceGrantClassId, ResourceGrantClass>>,
+    calibration: Arc<MachineCalibrationBundle>,
+    force_spill: bool,
+) -> Result<()> {
+    registry.register_implementation(PlannerBaselineImplementation {
+        planner_state: planner_state.clone(),
+        child_required,
+        grant_classes: grant_classes.clone(),
+        calibration: calibration.clone(),
+        force_spill,
+    })?;
+    for (id, flavor) in [
+        (
+            PLANNER_PERFECT_HASH_AGGREGATE,
+            PhysicalImplementationFlavor::PerfectHashAggregate,
+        ),
+        (
+            PLANNER_SORT_RANGE_JOIN,
+            PhysicalImplementationFlavor::SortRangeJoin,
+        ),
+        (
+            PLANNER_CLASSIC_IE_JOIN,
+            PhysicalImplementationFlavor::ClassicIeJoin,
+        ),
+        (
+            PLANNER_HASH_JOIN_RUNTIME_FILTER,
+            PhysicalImplementationFlavor::HashJoinRuntimeFilter,
+        ),
+        (
+            PLANNER_PARTITION_AGGREGATE_WINDOW,
+            PhysicalImplementationFlavor::PartitionAggregateWindow,
+        ),
+        (
+            PLANNER_SINGLETON_AGGREGATE_PROJECTION,
+            PhysicalImplementationFlavor::SingletonAggregateProjection,
+        ),
+    ] {
+        registry.register_implementation(AlternativeImplementation {
+            id,
+            flavor,
+            planner_state: planner_state.clone(),
+            child_required,
+            grant_classes: grant_classes.clone(),
+            calibration: calibration.clone(),
+            force_spill,
+        })?;
+    }
+    registry.register_implementation(PlannerSearchImplementation { planner_state })?;
+    Ok(())
+}
+
+#[derive(Debug)]
+struct PlannerBaselineImplementation {
+    planner_state: Arc<RwLock<PlannerTransformState>>,
+    child_required: PropertySetId,
+    grant_classes: Arc<BTreeMap<crate::cascades::ids::ResourceGrantClassId, ResourceGrantClass>>,
+    calibration: Arc<MachineCalibrationBundle>,
+    force_spill: bool,
+}
+
+impl PhysicalImplementation for PlannerBaselineImplementation {
+    fn id(&self) -> ImplementationId {
+        PLANNER_BASELINE_IMPLEMENTATION
+    }
+
+    fn grant_dependency_for(
+        &self,
+        expr: &crate::cascades::memo::LogicalExpr,
+        _ctx: &ImplementationContext<'_>,
+    ) -> GrantDependencyDescriptor {
+        self.planner_state
+            .read()
+            .expect("planner transform state poisoned")
+            .metadata
+            .get(&expr.payload)
+            .map(|metadata| metadata.grant_dependency)
+            .unwrap_or(GrantDependencyDescriptor::Sensitive)
+    }
+
+    fn matches(
+        &self,
+        expr: &crate::cascades::memo::LogicalExpr,
+        _goal: OptimizationGoal,
+        _ctx: &ImplementationContext<'_>,
+    ) -> bool {
+        self.planner_state
+            .read()
+            .expect("planner transform state poisoned")
+            .metadata
+            .contains_key(&expr.payload)
+    }
+
+    fn candidates(
+        &self,
+        expr: crate::cascades::ids::LogicalExprId,
+        goal: OptimizationGoal,
+        ctx: &ImplementationContext<'_>,
+    ) -> Result<Box<[PhysicalCandidate]>> {
+        let logical = ctx
+            .memo
+            .logical_expr(expr)
+            .ok_or_else(|| paro_error::internal("baseline implementation lost logical expr"))?;
+        let planner_state = self
+            .planner_state
+            .read()
+            .expect("planner transform state poisoned");
+        let metadata = planner_state
+            .metadata
+            .get(&logical.payload)
+            .ok_or_else(|| paro_error::internal("baseline implementation lost metadata"))?;
+        let children = logical.key.children.clone();
+        let child_goals = children
+            .iter()
+            .copied()
+            .map(|child| {
+                (
+                    child,
+                    OptimizationGoal {
+                        required: self.child_required,
+                        row_goal: RowGoal::All,
+                        ..goal
+                    },
+                )
+            })
+            .collect::<Vec<_>>()
+            .into_boxed_slice();
+        let mut fingerprint = StableFingerprintBuilder::default();
+        fingerprint.write_u64(self.id().0 as u64);
+        fingerprint.write_fingerprint(metadata.operator_fingerprint);
+        append_grant_fingerprint(&mut fingerprint, metadata.grant_dependency, goal.grant);
+        fingerprint.write_u64(
+            (self.force_spill
+                && implementation_spillable(metadata, metadata.implementations.baseline))
+                as u64,
+        );
+        let local_cost = implementation_cost(
+            metadata,
+            metadata.implementations.baseline,
+            self.calibration.as_ref(),
+        )?;
+        let spillable = implementation_spillable(metadata, metadata.implementations.baseline);
+        let estimated_peak_memory = local_cost.peak_memory_upper;
+        let Some(local_cost) = cost_for_grant(
+            local_cost,
+            metadata.grant_dependency,
+            spillable,
+            goal.grant,
+            &self.grant_classes,
+            self.force_spill,
+            true,
+        )?
+        else {
+            debug!(
+                target: targets::OPTIMIZER,
+                logical_expression = expr.index(),
+                payload = logical.payload.0,
+                operator = ?metadata.operator_type,
+                implementation = ?metadata.implementations.baseline,
+                estimated_peak_memory,
+                spillable,
+                grant = ?goal.grant,
+                "mandatory baseline is infeasible for the resource grant"
+            );
+            return Ok(Box::new([]));
+        };
+        Ok(vec![PhysicalCandidate {
+            key: PhysicalExprKey {
+                implementation: self.id(),
+                logical: expr,
+                children,
+                payload_fingerprint: metadata.operator_fingerprint,
+            },
+            payload: PhysicalPayloadId(logical.payload.0),
+            provided: metadata.provided.clone(),
+            child_goals,
+            local_cost,
+            cost_composition: planner_cost_composition(metadata, metadata.implementations.baseline),
+            spillable,
+            enforcer_cost_input: planner_enforcer_cost_input(
+                metadata,
+                goal.grant,
+                &self.grant_classes,
+            )?,
+            physical_fingerprint: fingerprint.finish(),
+            region: planner_region_contract(ctx.memo, metadata.required_region_facet, None)?,
+            mandatory: true,
+        }]
+        .into_boxed_slice())
+    }
+}
+
+#[derive(Debug)]
+struct AlternativeImplementation {
+    id: ImplementationId,
+    flavor: PhysicalImplementationFlavor,
+    planner_state: Arc<RwLock<PlannerTransformState>>,
+    child_required: PropertySetId,
+    grant_classes: Arc<BTreeMap<crate::cascades::ids::ResourceGrantClassId, ResourceGrantClass>>,
+    calibration: Arc<MachineCalibrationBundle>,
+    force_spill: bool,
+}
+
+impl PhysicalImplementation for AlternativeImplementation {
+    fn id(&self) -> ImplementationId {
+        self.id
+    }
+
+    fn grant_dependency_for(
+        &self,
+        expr: &crate::cascades::memo::LogicalExpr,
+        _ctx: &ImplementationContext<'_>,
+    ) -> GrantDependencyDescriptor {
+        if self
+            .planner_state
+            .read()
+            .expect("planner transform state poisoned")
+            .metadata
+            .get(&expr.payload)
+            .is_some_and(|metadata| metadata.implementations.supports(self.flavor))
+        {
+            GrantDependencyDescriptor::Sensitive
+        } else {
+            GrantDependencyDescriptor::Invariant
+        }
+    }
+
+    fn matches(
+        &self,
+        expr: &crate::cascades::memo::LogicalExpr,
+        _goal: OptimizationGoal,
+        _ctx: &ImplementationContext<'_>,
+    ) -> bool {
+        self.planner_state
+            .read()
+            .expect("planner transform state poisoned")
+            .metadata
+            .get(&expr.payload)
+            .is_some_and(|metadata| metadata.implementations.supports(self.flavor))
+    }
+
+    fn candidates(
+        &self,
+        expr: crate::cascades::ids::LogicalExprId,
+        goal: OptimizationGoal,
+        ctx: &ImplementationContext<'_>,
+    ) -> Result<Box<[PhysicalCandidate]>> {
+        let logical = ctx
+            .memo
+            .logical_expr(expr)
+            .ok_or_else(|| paro_error::internal("physical implementation lost logical expr"))?;
+        let planner_state = self
+            .planner_state
+            .read()
+            .expect("planner transform state poisoned");
+        let metadata = planner_state
+            .metadata
+            .get(&logical.payload)
+            .ok_or_else(|| paro_error::internal("physical implementation lost metadata"))?;
+        if !metadata.implementations.supports(self.flavor) {
+            return Ok(Box::new([]));
+        }
+        let children = logical.key.children.clone();
+        let child_goals = children
+            .iter()
+            .copied()
+            .map(|child| {
+                (
+                    child,
+                    OptimizationGoal {
+                        required: self.child_required,
+                        row_goal: RowGoal::All,
+                        ..goal
+                    },
+                )
+            })
+            .collect::<Vec<_>>()
+            .into_boxed_slice();
+        let mut fingerprint = StableFingerprintBuilder::default();
+        fingerprint.write_u64(self.id.0 as u64);
+        fingerprint.write_fingerprint(metadata.operator_fingerprint);
+        append_grant_fingerprint(&mut fingerprint, metadata.grant_dependency, goal.grant);
+        fingerprint.write_u64(
+            (self.force_spill && implementation_spillable(metadata, self.flavor)) as u64,
+        );
+        let implementation_cost =
+            implementation_cost(metadata, self.flavor, self.calibration.as_ref())?;
+        let Some(local_cost) = cost_for_grant(
+            implementation_cost,
+            GrantDependencyDescriptor::Sensitive,
+            implementation_spillable(metadata, self.flavor),
+            goal.grant,
+            &self.grant_classes,
+            self.force_spill,
+            false,
+        )?
+        else {
+            return Ok(Box::new([]));
+        };
+        Ok(vec![PhysicalCandidate {
+            key: PhysicalExprKey {
+                implementation: self.id,
+                logical: expr,
+                children,
+                payload_fingerprint: metadata.operator_fingerprint,
+            },
+            payload: PhysicalPayloadId(logical.payload.0),
+            provided: metadata.provided.clone(),
+            child_goals,
+            local_cost,
+            cost_composition: planner_cost_composition(metadata, self.flavor),
+            spillable: implementation_spillable(metadata, self.flavor),
+            enforcer_cost_input: planner_enforcer_cost_input(
+                metadata,
+                goal.grant,
+                &self.grant_classes,
+            )?,
+            physical_fingerprint: fingerprint.finish(),
+            region: if self.flavor == PhysicalImplementationFlavor::HashJoinRuntimeFilter {
+                planner_region_contract(
+                    ctx.memo,
+                    metadata.runtime_filter_region_facet,
+                    Some(RegionArtifactKind::RuntimeFilter),
+                )?
+            } else {
+                planner_region_contract(ctx.memo, metadata.required_region_facet, None)?
+            },
+            mandatory: false,
+        }]
+        .into_boxed_slice())
+    }
+}
+
+#[derive(Debug)]
+struct PlannerSearchImplementation {
+    planner_state: Arc<RwLock<PlannerTransformState>>,
+}
+
+impl PhysicalImplementation for PlannerSearchImplementation {
+    fn id(&self) -> ImplementationId {
+        PLANNER_SEARCH_PROVIDER
+    }
+
+    fn grant_dependency_for(
+        &self,
+        _expr: &crate::cascades::memo::LogicalExpr,
+        _ctx: &ImplementationContext<'_>,
+    ) -> GrantDependencyDescriptor {
+        GrantDependencyDescriptor::Invariant
+    }
+
+    fn matches(
+        &self,
+        expr: &crate::cascades::memo::LogicalExpr,
+        _goal: OptimizationGoal,
+        _ctx: &ImplementationContext<'_>,
+    ) -> bool {
+        self.planner_state
+            .read()
+            .expect("planner transform state poisoned")
+            .metadata
+            .get(&expr.payload)
+            .is_some_and(|metadata| metadata.search.is_some())
+    }
+
+    fn candidates(
+        &self,
+        expr: crate::cascades::ids::LogicalExprId,
+        _goal: OptimizationGoal,
+        ctx: &ImplementationContext<'_>,
+    ) -> Result<Box<[PhysicalCandidate]>> {
+        let logical = ctx
+            .memo
+            .logical_expr(expr)
+            .ok_or_else(|| paro_error::internal("search implementation lost logical expr"))?;
+        let planner_state = self
+            .planner_state
+            .read()
+            .expect("planner transform state poisoned");
+        let Some(search) = planner_state
+            .metadata
+            .get(&logical.payload)
+            .and_then(|metadata| metadata.search.as_ref())
+        else {
+            return Ok(Box::new([]));
+        };
+        let mut fingerprint = StableFingerprintBuilder::default();
+        fingerprint.write_u64(self.id().0 as u64);
+        fingerprint.write_fingerprint(search.payload_fingerprint);
+        Ok(vec![PhysicalCandidate {
+            key: PhysicalExprKey {
+                implementation: self.id(),
+                logical: expr,
+                children: Box::new([]),
+                payload_fingerprint: search.payload_fingerprint,
+            },
+            payload: search.payload,
+            provided: search.provided.clone(),
+            child_goals: Box::new([]),
+            local_cost: search.local_cost,
+            cost_composition: CostComposition::Sequential,
+            spillable: false,
+            enforcer_cost_input: crate::cascades::engine::EnforcerCostInput::unbounded(
+                search.cost_facts.output_rows,
+                search.cost_facts.output_row_width,
+            ),
+            physical_fingerprint: fingerprint.finish(),
+            region: planner_region_contract(ctx.memo, None, None)?,
+            mandatory: false,
+        }]
+        .into_boxed_slice())
+    }
+}

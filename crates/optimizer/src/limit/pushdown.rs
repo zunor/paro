@@ -22,15 +22,20 @@ impl LimitPushdown {
     }
 
     pub fn optimize_plan(&mut self, plan: LogicalPlan) -> LogicalPlan {
-        self.optimize_recursive_plan(plan)
+        self.optimize_plan_with_change(plan).0
     }
 
-    fn optimize_recursive_plan(&mut self, plan: LogicalPlan) -> LogicalPlan {
-        let plan = plan.map_children(|child| self.optimize_recursive_plan(child));
+    pub fn optimize_plan_with_change(&mut self, plan: LogicalPlan) -> (LogicalPlan, bool) {
+        let mut changed = false;
+        let plan = plan.map_children(|child| {
+            let (child, child_changed) = self.optimize_plan_with_change(child);
+            changed |= child_changed;
+            child
+        });
         if Self::can_optimize(&plan.operator) {
-            self.apply_optimization(plan)
+            (self.apply_optimization(plan), true)
         } else {
-            plan
+            (plan, changed)
         }
     }
 

@@ -26,6 +26,7 @@ use super::region::{
 };
 use super::rules::{
     CostComposition, ImplementationContext, ImplementationRegistry, PhysicalCandidate, RuleContext,
+    TransformContext,
 };
 use crate::physical::SpillPolicy;
 
@@ -104,6 +105,7 @@ struct CostRecipe {
     local_cost: SearchCost,
     cost_composition: CostComposition,
     spillable: bool,
+    mandatory: bool,
     enforcer_cost_input: EnforcerCostInput,
     physical_fingerprint: Fingerprint,
     region: Option<RegionCandidateContract>,
@@ -357,46 +359,151 @@ impl CascadesEngine {
             if admitted == BudgetDecision::Exhausted {
                 continue;
             }
-            let outputs = {
+            // Reserve the single rule output before the rule is allowed to
+            // append payloads or child groups.  TransformContext mutations
+            // are append-only and become reachable through that output, so a
+            // post-apply budget rejection would manufacture orphan Memo
+            // state.  One canonical output per (expression, rule) also makes
+            // rule priority an agenda property instead of source-order
+            // admission hidden in a caller-side candidate list.
+            let output_event = transformation_output_event(group, expression, rule);
+            let admitted = self
+                .memo
+                .group_mut(group)
+                .ok_or_else(|| paro_error::internal("rule task references unknown group"))?
+                .ledger
+                .admit_optional(BudgetDimension::LogicalExprPerGroup, output_event);
+            if admitted == BudgetDecision::Exhausted {
+                continue;
+            }
+            // Optional transformations run against an isolated Memo image.
+            // A faulty rule must neither poison the mandatory baseline nor
+            // leave child groups, payload references, or region facets half
+            // installed. The search bounds make this snapshot finite.
+            let memo_savepoint = self.memo.transformation_savepoint();
+            let outputs_result = {
                 let rule_impl = self
                     .registry
                     .transformation(rule)
                     .ok_or_else(|| paro_error::internal("rule disappeared from registry"))?;
-                let context = RuleContext {
-                    memo: &self.memo,
+                let mut context = TransformContext {
+                    memo: &mut self.memo,
                     group,
                 };
-                rule_impl.apply(expression, &context)?
+                rule_impl.apply(expression, &mut context)
             };
-            let mut inserted_groups = BTreeSet::new();
-            for output in outputs {
-                validate_transformation_proof(rule, expression, &output.proof)?;
-                let target = self.memo.canonical_group(output.target_group);
-                let output_event = output.key.stable_fingerprint();
-                let admitted = self
-                    .memo
-                    .group_mut(target)
-                    .ok_or_else(|| {
-                        paro_error::internal("transformation targets an unknown Memo group")
-                    })?
-                    .ledger
-                    .admit_optional(BudgetDimension::LogicalExprPerGroup, output_event);
-                if admitted == BudgetDecision::Exhausted {
+            let outputs = match outputs_result {
+                Ok(outputs) => outputs,
+                Err(error) => {
+                    self.memo.rollback_transformation(memo_savepoint);
+                    self.memo
+                        .group_mut(group)
+                        .ok_or_else(|| paro_error::internal("rule task references unknown group"))?
+                        .ledger
+                        .release_optional_reservation(
+                            BudgetDimension::LogicalExprPerGroup,
+                            output_event,
+                        );
+                    tracing::debug!(
+                        target: "paro::optimizer",
+                        %error,
+                        rule = rule.0,
+                        group = group.index(),
+                        "discarded failed optional transformation"
+                    );
                     continue;
                 }
-                let before = self
-                    .memo
-                    .group(target)
-                    .map(|group| group.logical_exprs().len())
-                    .unwrap_or(0);
+            };
+            if outputs.is_empty() {
+                self.memo.rollback_transformation(memo_savepoint);
                 self.memo
-                    .insert_logical(target, output.key, output.payload, output.proof)?;
-                let after = self.memo.group(target).unwrap().logical_exprs().len();
-                if after > before {
-                    *self.effective_rule_insertions.entry(rule).or_default() +=
-                        u64::try_from(after - before).unwrap_or(u64::MAX);
-                    inserted_groups.insert(target);
+                    .group_mut(group)
+                    .ok_or_else(|| paro_error::internal("rule task references unknown group"))?
+                    .ledger
+                    .release_optional_reservation(
+                        BudgetDimension::LogicalExprPerGroup,
+                        output_event,
+                    );
+                continue;
+            }
+            if outputs.len() > 1 {
+                self.memo.rollback_transformation(memo_savepoint);
+                self.memo
+                    .group_mut(group)
+                    .ok_or_else(|| paro_error::internal("rule task references unknown group"))?
+                    .ledger
+                    .release_optional_reservation(
+                        BudgetDimension::LogicalExprPerGroup,
+                        output_event,
+                    );
+                tracing::debug!(
+                    target: "paro::optimizer",
+                    rule = rule.0,
+                    group = group.index(),
+                    output_count = outputs.len(),
+                    "discarded optional transformation with a non-canonical output set"
+                );
+                continue;
+            }
+            let insertion = (|| -> Result<BTreeSet<GroupId>> {
+                let mut inserted_groups = BTreeSet::new();
+                for output in outputs {
+                    validate_transformation_proof(rule, expression, &output.proof)?;
+                    let target = self.memo.canonical_group(output.target_group);
+                    if target != self.memo.canonical_group(group) {
+                        return Err(paro_error::internal(
+                            "a local transformation must target its source equivalence group",
+                        ));
+                    }
+                    let before = self
+                        .memo
+                        .group(target)
+                        .map(|group| group.logical_exprs().len())
+                        .unwrap_or(0);
+                    self.memo
+                        .insert_logical(target, output.key, output.payload, output.proof)?;
+                    let after = self.memo.group(target).unwrap().logical_exprs().len();
+                    if after > before {
+                        inserted_groups.insert(target);
+                    }
                 }
+                Ok(inserted_groups)
+            })();
+            let inserted_groups = match insertion {
+                Ok(groups) => groups,
+                Err(error) => {
+                    self.memo.rollback_transformation(memo_savepoint);
+                    self.memo
+                        .group_mut(group)
+                        .ok_or_else(|| paro_error::internal("rule task references unknown group"))?
+                        .ledger
+                        .release_optional_reservation(
+                            BudgetDimension::LogicalExprPerGroup,
+                            output_event,
+                        );
+                    tracing::debug!(
+                        target: "paro::optimizer",
+                        %error,
+                        rule = rule.0,
+                        group = group.index(),
+                        "discarded invalid optional transformation output"
+                    );
+                    continue;
+                }
+            };
+            if !inserted_groups.is_empty() {
+                *self.effective_rule_insertions.entry(rule).or_default() +=
+                    u64::try_from(inserted_groups.len()).unwrap_or(u64::MAX);
+            }
+            if inserted_groups.is_empty() {
+                self.memo
+                    .group_mut(group)
+                    .ok_or_else(|| paro_error::internal("rule task references unknown group"))?
+                    .ledger
+                    .release_optional_reservation(
+                        BudgetDimension::LogicalExprPerGroup,
+                        output_event,
+                    );
             }
             for target in inserted_groups {
                 self.schedule_transformations(target, &mut agenda)?;
@@ -590,6 +697,7 @@ impl CascadesEngine {
             local_cost: candidate.local_cost,
             cost_composition: candidate.cost_composition,
             spillable: candidate.spillable,
+            mandatory: candidate.mandatory,
             enforcer_cost_input: candidate.enforcer_cost_input,
             physical_fingerprint: candidate.physical_fingerprint,
             region: candidate.region,
@@ -686,6 +794,7 @@ impl CascadesEngine {
                 &child_costs,
                 recipe.cost_composition,
                 recipe.spillable,
+                recipe.mandatory,
                 recipe.enforcer_cost_input,
             )?
             else {
@@ -772,12 +881,36 @@ impl CascadesEngine {
             .map(|group| group.logical_exprs().to_vec())
             .unwrap_or_default();
         let physical = group_ref
-            .map(|group| group.physical_exprs().to_vec())
+            .map(|group| {
+                group
+                    .physical_exprs()
+                    .iter()
+                    .filter_map(|id| {
+                        self.memo
+                            .physical_expr(*id)
+                            .map(|expr| (*id, expr.provided.clone()))
+                    })
+                    .collect::<Vec<_>>()
+            })
             .unwrap_or_default();
+        let required = self.memo.required(goal.required);
         paro_error::internal(format!(
-            "no feasible physical plan exists for Memo group {group:?} with goal {goal:?}; logical={logical:?}, physical={physical:?}"
+            "no feasible physical plan exists for Memo group {group:?} with goal {goal:?}; required={required:?}, logical={logical:?}, physical={physical:?}"
         ))
     }
+}
+
+fn transformation_output_event(
+    group: GroupId,
+    expression: LogicalExprId,
+    rule: RuleId,
+) -> Fingerprint {
+    let mut event = StableFingerprintBuilder::default();
+    event.write_bytes(b"paro.memo.transformation-output.v1");
+    event.write_u64(group.0 as u64);
+    event.write_u64(expression.0 as u64);
+    event.write_u64(rule.0 as u64);
+    event.finish()
 }
 
 fn build_joint_cost_proof(
@@ -832,36 +965,52 @@ fn fit_local_retained_state_to_grant(
     child_costs: &[SearchCost],
     composition: CostComposition,
     spillable: bool,
+    mandatory: bool,
     grant: EnforcerCostInput,
 ) -> Result<Option<SearchCost>> {
-    let CostComposition::RetainedState {
-        overlapping_children,
-    } = composition
-    else {
-        return Ok(Some(local_cost));
-    };
     if grant.hard_memory_bytes == u64::MAX {
         return Ok(Some(local_cost));
     }
-    let overlapping_peak = child_costs
-        .iter()
-        .enumerate()
-        .filter(|(index, _)| overlapping_children & (1_u64 << index) != 0)
-        .map(|(_, child)| child.peak_memory_upper)
-        .max()
-        .unwrap_or(0);
+    let overlapping_peak = match composition {
+        CostComposition::Sequential => 0,
+        CostComposition::RetainedState {
+            overlapping_children,
+        } => child_costs
+            .iter()
+            .enumerate()
+            .filter(|(index, _)| overlapping_children & (1_u64 << index) != 0)
+            .map(|(_, child)| child.peak_memory_upper)
+            .max()
+            .unwrap_or(0),
+    };
     let available = grant.hard_memory_bytes.saturating_sub(overlapping_peak);
     if local_cost.peak_memory_upper <= available {
         return Ok(Some(local_cost));
     }
-    if !spillable || grant.spill_policy == SpillPolicy::Forbidden {
-        return Ok(None);
+    if mandatory && local_cost.peak_memory_upper == u64::MAX {
+        // UNKNOWN is an absence of a finite hard bound, not a prediction that
+        // u64::MAX bytes will spill. Bind the mandatory implementation to the
+        // shared allocator without manufacturing an astronomic I/O cost.
+        local_cost.peak_memory_upper = available;
+        return Ok(Some(local_cost));
     }
-
-    let spilled = local_cost.peak_memory_upper.saturating_sub(available);
-    local_cost.peak_memory_upper = available;
-    add_composition_spill_cost(&mut local_cost, spilled)?;
-    Ok(Some(local_cost))
+    if spillable && grant.spill_policy == SpillPolicy::Allowed {
+        let spilled = local_cost.peak_memory_upper.saturating_sub(available);
+        local_cost.peak_memory_upper = available;
+        add_composition_spill_cost(&mut local_cost, spilled)?;
+        return Ok(Some(local_cost));
+    }
+    if mandatory {
+        // Mandatory implementations share the query allocator with their
+        // descendants. A descendant whose hard upper is allocator-capped may
+        // already report the entire grant as its peak; cap this operator to
+        // the remaining concurrent allowance instead of adding the same
+        // grant once per tree level. Optional implementations never receive
+        // this fallback and must carry an independently feasible proof.
+        local_cost.peak_memory_upper = available;
+        return Ok(Some(local_cost));
+    }
+    Ok(None)
 }
 
 fn add_composition_spill_cost(cost: &mut SearchCost, spilled: u64) -> Result<()> {
@@ -1158,7 +1307,7 @@ mod tests {
         fn apply(
             &self,
             expr: LogicalExprId,
-            ctx: &RuleContext<'_>,
+            ctx: &mut TransformContext<'_>,
         ) -> Result<Box<[EquivalentExpression]>> {
             Ok(vec![EquivalentExpression {
                 target_group: ctx.group,
@@ -1175,6 +1324,28 @@ mod tests {
                 },
             }]
             .into_boxed_slice())
+        }
+    }
+
+    struct FailAfterMemoWrite;
+
+    impl TransformationRule for FailAfterMemoWrite {
+        fn id(&self) -> RuleId {
+            RuleId(6)
+        }
+
+        fn matches(&self, expr: &super::super::memo::LogicalExpr, _: &RuleContext<'_>) -> bool {
+            expr.key.operator == Fingerprint(10)
+        }
+
+        fn apply(
+            &self,
+            _: LogicalExprId,
+            ctx: &mut TransformContext<'_>,
+        ) -> Result<Box<[EquivalentExpression]>> {
+            ctx.memo
+                .create_group(schema(), LogicalProperties::default());
+            Err(paro_error::internal("injected optional-rule failure"))
         }
     }
 
@@ -1292,6 +1463,32 @@ mod tests {
     }
 
     #[test]
+    fn failed_optional_transformation_rolls_back_and_keeps_baseline() {
+        let mut budget = super::super::budget::SearchBudget::default();
+        budget.disable_transformation(RuleId(5));
+        let (mut engine, group, goal) = engine_with_budget(budget);
+        engine
+            .registry
+            .register_transformation(FailAfterMemoWrite)
+            .unwrap();
+        let groups_before = engine.memo.group_count();
+
+        let winner = engine.optimize(group, goal, SearchMode::Memo).unwrap();
+
+        assert_eq!(winner.physical_fingerprint, Fingerprint(10));
+        assert_eq!(engine.memo.group_count(), groups_before);
+        assert_eq!(
+            engine
+                .memo
+                .group(group)
+                .unwrap()
+                .ledger
+                .consumed(BudgetDimension::LogicalExprPerGroup),
+            0
+        );
+    }
+
+    #[test]
     fn direct_and_memo_share_implementation_registry() {
         let (mut direct, group, goal) = engine(8);
         let direct_winner = direct.optimize(group, goal, SearchMode::Direct).unwrap();
@@ -1316,7 +1513,7 @@ mod tests {
         fn apply(
             &self,
             expr: LogicalExprId,
-            ctx: &RuleContext<'_>,
+            ctx: &mut TransformContext<'_>,
         ) -> Result<Box<[EquivalentExpression]>> {
             Ok(vec![EquivalentExpression {
                 target_group: ctx.group,
@@ -1507,6 +1704,92 @@ mod tests {
         .expect("retained-state composition");
         assert_eq!(sequential.peak_memory_upper, 100);
         assert_eq!(retained.peak_memory_upper, 140);
+    }
+
+    #[test]
+    fn mandatory_unknown_state_is_capped_after_child_winners_are_known() {
+        let local = SearchCost {
+            peak_memory_upper: u64::MAX,
+            ..cost(1.0)
+        };
+        let child = SearchCost {
+            peak_memory_upper: 40,
+            ..cost(1.0)
+        };
+        let grant = EnforcerCostInput {
+            rows: CompactRange::point(1.0).unwrap(),
+            row_width_bytes: 8,
+            hard_memory_bytes: 100,
+            spill_policy: SpillPolicy::Forbidden,
+        };
+
+        let fitted = fit_local_retained_state_to_grant(
+            local,
+            &[child],
+            CostComposition::RetainedState {
+                overlapping_children: 1,
+            },
+            false,
+            true,
+            grant,
+        )
+        .unwrap()
+        .expect("the allocator-capped mandatory implementation remains feasible");
+        let composed = compose_candidate_cost(
+            fitted,
+            &[child],
+            CostComposition::RetainedState {
+                overlapping_children: 1,
+            },
+        )
+        .unwrap();
+
+        assert_eq!(fitted.peak_memory_upper, 60);
+        assert_eq!(fitted.spill_bytes_expected, 0);
+        assert_eq!(fitted.score, local.score);
+        assert_eq!(composed.peak_memory_upper, 100);
+    }
+
+    #[test]
+    fn mandatory_parent_does_not_count_a_child_allocator_cap_twice() {
+        let local = SearchCost {
+            peak_memory_upper: 120,
+            ..cost(1.0)
+        };
+        let child = SearchCost {
+            peak_memory_upper: 1_024,
+            ..cost(1.0)
+        };
+        let grant = EnforcerCostInput {
+            rows: CompactRange::point(1.0).unwrap(),
+            row_width_bytes: 8,
+            hard_memory_bytes: 1_024,
+            spill_policy: SpillPolicy::Forbidden,
+        };
+
+        let fitted = fit_local_retained_state_to_grant(
+            local,
+            &[child],
+            CostComposition::RetainedState {
+                overlapping_children: 1,
+            },
+            false,
+            true,
+            grant,
+        )
+        .unwrap()
+        .expect("mandatory parent shares the child allocator cap");
+        let composed = compose_candidate_cost(
+            fitted,
+            &[child],
+            CostComposition::RetainedState {
+                overlapping_children: 1,
+            },
+        )
+        .unwrap();
+
+        assert_eq!(fitted.peak_memory_upper, 0);
+        assert_eq!(composed.peak_memory_upper, 1_024);
     }
 
     struct GrantTreeImplementation;

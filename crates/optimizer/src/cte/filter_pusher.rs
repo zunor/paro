@@ -4,6 +4,7 @@
 use std::collections::HashMap;
 use std::ops::ControlFlow;
 
+use paro_planner::binder::ir::CTEMaterialize;
 use paro_planner::expression::{ConjunctionExpression, ConjunctionType, Expression};
 use paro_planner::operator::Filter as PlannerFilter;
 use paro_planner::operator::{ColumnBinding, LogicalOperator};
@@ -41,11 +42,15 @@ impl CTEFilterPusher {
         Self
     }
 
-    pub fn optimize_plan(&mut self, mut plan: LogicalPlan) -> LogicalPlan {
+    pub fn optimize_plan(&mut self, plan: LogicalPlan) -> LogicalPlan {
+        self.optimize_plan_with_change(plan).0
+    }
+
+    pub fn optimize_plan_with_change(&mut self, mut plan: LogicalPlan) -> (LogicalPlan, bool) {
         let mut infos = HashMap::new();
         self.find_candidates(&plan.operator, &mut infos);
-        self.push_filters(&mut plan.operator, &infos);
-        plan
+        let changed = self.push_filters(&mut plan.operator, &infos);
+        (plan, changed)
     }
 
     fn find_candidates(
@@ -87,23 +92,39 @@ impl CTEFilterPusher {
         }
     }
 
-    fn push_filters(&self, op: &mut LogicalOperator, infos: &HashMap<usize, MaterializedCTEInfo>) {
+    fn push_filters(
+        &self,
+        op: &mut LogicalOperator,
+        infos: &HashMap<usize, MaterializedCTEInfo>,
+    ) -> bool {
         match op {
             LogicalOperator::MaterializedCTE(cte) => {
-                self.push_filters(&mut cte.cte_query.operator, infos);
-                self.push_filters(&mut cte.child.operator, infos);
+                let mut changed = self.push_filters(&mut cte.cte_query.operator, infos);
+                changed |= self.push_filters(&mut cte.child.operator, infos);
 
+                // Producer-side filtering belongs exclusively to the shared
+                // materialization alternative. Committing a DEFAULT CTE to
+                // this branch prevents a later inlining transformation from
+                // combining the copied producer predicate with the original
+                // consumer predicate. NOT MATERIALIZED is a semantic contract
+                // and must never enter this branch.
+                if cte.materialized == CTEMaterialize::NotMaterialized {
+                    return changed;
+                }
                 let Some(info) = infos.get(&cte.cte_index) else {
-                    return;
+                    return changed;
                 };
                 if !info.all_refs_are_filtered || info.filtered_refs.is_empty() {
-                    return;
+                    return changed;
                 }
 
                 let new_bindings = cte.cte_query.get_column_bindings();
                 let Some(or_expr) = build_or_filter(info, &new_bindings) else {
-                    return;
+                    return changed;
                 };
+                if cte.materialized == CTEMaterialize::Default {
+                    cte.materialized = CTEMaterialize::Materialized;
+                }
 
                 let id = cte.cte_query.id;
                 let stats = cte.cte_query.stats.clone();
@@ -119,12 +140,15 @@ impl CTEFilterPusher {
                     stats,
                     operator: pushed_plan.operator,
                 };
+                true
             }
             _ => {
+                let mut changed = false;
                 let _ = op.visit_children_mut(|child| {
-                    self.push_filters(&mut child.operator, infos);
+                    changed |= self.push_filters(&mut child.operator, infos);
                     ControlFlow::Continue(())
                 });
+                changed
             }
         }
     }
@@ -258,6 +282,7 @@ mod tests {
         let optimized = CTEFilterPusher::new().optimize_plan(LogicalPlan::synthetic(plan));
         match optimized.operator {
             LogicalOperator::MaterializedCTE(cte) => {
+                assert_eq!(cte.materialized, CTEMaterialize::Materialized);
                 assert!(!matches!(
                     cte.cte_query.operator,
                     LogicalOperator::ExpressionGet(_)

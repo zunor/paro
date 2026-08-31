@@ -1,0 +1,28 @@
+[meta]
+name = "optimizer_planning"
+description = "Bounded-Memo planning latency against the mandatory baseline"
+
+[params]
+rows = 1024
+
+[setup]
+file = "sql/setup.sql"
+teardown = "sql/teardown.sql"
+
+[[query]]
+id = "all_rules_disabled"
+file = "sql/q_five_way_aggregate_topn.sql"
+setup = "sql/disable_rules.sql"
+teardown = "sql/reset_rules.sql"
+validate = "text_contains_all"
+expected = ["TOP_N", "AGGREGATE", "HASH_JOIN"]
+
+[[query]]
+id = "bounded_memo"
+file = "sql/q_five_way_aggregate_topn.sql"
+setup = "sql/reset_rules.sql"
+teardown = "sql/reset_rules.sql"
+validate = "text_contains_all"
+expected = ["TOP_N", "AGGREGATE", "HASH_JOIN"]
+max_median_ratio_to = "all_rules_disabled"
+max_median_ratio = 1.20

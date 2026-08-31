@@ -85,6 +85,26 @@ WHERE index_name = 'idx_indexed_items_emb';
 index_name	index_type
 idx_indexed_items_emb	HNSW
 
+SET vector_search_objective = 'cost_optimized';
+SET
+
+-- @normalize explain_search_ids
+EXPLAIN SELECT id FROM indexed_items
+ORDER BY emb <-> '[1.0, 1.0, 1.0]' LIMIT 2;
+QUERY PLAN
+PROJECTION  (rows=2)
+  Output: id
+  ->  TOP_N  (rows=2)
+    Sort Key: l2_distance(public.indexed_items.emb, [1, 1, 1]) ASC NULLS LAST
+    Limit: 2
+    ->  PROJECTION  (rows=2048)
+      Output: id, l2_distance(public.indexed_items.emb, [1, 1, 1])
+      ->  ROWSET_SCAN on public.indexed_items  (rows=2048)
+        Columns: id, emb
+
+RESET vector_search_objective;
+RESET
+
 -- @normalize explain_search_ids
 EXPLAIN SELECT id FROM indexed_items
 ORDER BY emb <-> '[1.0, 1.0, 1.0]' LIMIT 2;

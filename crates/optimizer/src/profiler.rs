@@ -61,6 +61,7 @@ pub struct OptimizerTimingEntry {
 pub struct OptimizerProfiler {
     entries: BTreeMap<OptimizerComponent, OptimizerTimingEntry>,
     rule_insertions: BTreeMap<RuleId, u64>,
+    counters: BTreeMap<String, u64>,
 }
 
 #[derive(Debug, Clone)]
@@ -74,6 +75,7 @@ pub struct OptimizerProfileSnapshotEntry {
 pub struct OptimizerProfileSnapshot {
     pub entries: Vec<OptimizerProfileSnapshotEntry>,
     pub rule_insertions: BTreeMap<RuleId, u64>,
+    pub counters: BTreeMap<String, u64>,
 }
 
 impl OptimizerProfiler {
@@ -98,11 +100,31 @@ impl OptimizerProfiler {
                 })
                 .collect(),
             rule_insertions: self.rule_insertions.clone(),
+            counters: self.counters.clone(),
         }
     }
 
     pub fn record_rule_insertions(&mut self, insertions: BTreeMap<RuleId, u64>) {
         self.rule_insertions = insertions;
+    }
+
+    pub fn record_search_summary(&mut self, summary: &crate::cascades::SearchSummary) {
+        self.counters
+            .insert("memo_group_count".to_string(), summary.groups);
+        self.counters.insert(
+            "memo_logical_expression_count".to_string(),
+            summary.logical_expressions,
+        );
+        self.counters.insert(
+            "memo_physical_expression_count".to_string(),
+            summary.physical_expressions,
+        );
+        for (dimension, count) in &summary.exhaustion_events {
+            self.counters.insert(
+                format!("budget_exhaustion_{}", dimension.stable_name()),
+                *count,
+            );
+        }
     }
 }
 
@@ -130,6 +152,17 @@ pub fn publish_optimizer_profile_snapshot(
             invocation_count: count.min(i64::MAX as u64) as i64,
         }
     }));
+    entries.extend(
+        snapshot
+            .counters
+            .into_iter()
+            .map(|(name, count)| OptimizerDiagnostic {
+                name,
+                kind: "search_counter".to_string(),
+                last_elapsed_us: 0,
+                invocation_count: count.min(i64::MAX as u64) as i64,
+            }),
+    );
     diagnostics.publish_optimizer(entries);
 }
 

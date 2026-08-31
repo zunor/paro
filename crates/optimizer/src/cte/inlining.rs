@@ -32,38 +32,60 @@ impl<'a> CTEInlining<'a> {
     }
 
     pub fn optimize_plan(&mut self, plan: LogicalPlan) -> LogicalPlan {
+        self.optimize_plan_with_change(plan).0
+    }
+
+    pub fn optimize_plan_with_change(&mut self, plan: LogicalPlan) -> (LogicalPlan, bool) {
         self.rewrite_plan(plan)
     }
 
-    fn rewrite_plan(&mut self, plan: LogicalPlan) -> LogicalPlan {
+    fn rewrite_plan(&mut self, plan: LogicalPlan) -> (LogicalPlan, bool) {
+        let mut child_changed = false;
         let plan = plan
-            .try_map_children(|child| Ok(self.rewrite_plan(child)))
+            .try_map_children(|child| {
+                let (child, changed) = self.rewrite_plan(child);
+                child_changed |= changed;
+                Ok(child)
+            })
             .expect("CTE inlining child rewrite cannot fail");
-        plan.map_operator(|operator| self.try_inline(operator))
+        let LogicalPlan {
+            id,
+            stats,
+            operator,
+        } = plan;
+        let (operator, local_changed) = self.try_inline(operator);
+        (
+            LogicalPlan {
+                id,
+                stats,
+                operator,
+            },
+            child_changed || local_changed,
+        )
     }
 
-    fn try_inline(&mut self, op: LogicalOperator) -> LogicalOperator {
+    fn try_inline(&mut self, op: LogicalOperator) -> (LogicalOperator, bool) {
         let LogicalOperator::MaterializedCTE(mut cte) = op else {
-            return op;
+            return (op, false);
         };
 
         let ref_count = count_cte_references(&cte.child.operator, cte.cte_index);
         if ref_count == 0 {
-            return cte.child.operator;
+            return (cte.child.operator, true);
         }
 
         if cte.materialized == CTEMaterialize::Materialized {
-            return LogicalOperator::MaterializedCTE(cte);
+            return (LogicalOperator::MaterializedCTE(cte), false);
         }
 
         if cte.materialized == CTEMaterialize::Default && !self.inline_default {
-            return LogicalOperator::MaterializedCTE(cte);
+            return (LogicalOperator::MaterializedCTE(cte), false);
         }
 
         if ref_count == 1 {
             let mut definition = Some(*cte.cte_query);
             inline_single_reference(&mut cte.child.operator, cte.cte_index, &mut definition);
-            return cte.child.operator;
+            return (cte.child.operator, true);
         }
 
         if cte.materialized == CTEMaterialize::NotMaterialized
@@ -78,10 +100,10 @@ impl<'a> CTEInlining<'a> {
                 cte.cte_index,
                 definition,
             );
-            return cte.child.operator;
+            return (cte.child.operator, true);
         }
 
-        LogicalOperator::MaterializedCTE(cte)
+        (LogicalOperator::MaterializedCTE(cte), false)
     }
 }
 

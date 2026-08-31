@@ -53,6 +53,13 @@ impl EffectiveSettings {
         )
     }
 
+    pub fn vector_search_objective(&self) -> &str {
+        match self.get("vector_search_objective") {
+            Some(Value::Varchar(value)) => value,
+            _ => "exact",
+        }
+    }
+
     pub fn parallel_scheduler(&self) -> bool {
         matches!(self.get("parallel_scheduler"), Some(Value::Boolean(true)))
     }

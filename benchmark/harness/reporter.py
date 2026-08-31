@@ -93,6 +93,11 @@ class BenchmarkReporter:
                     "rss": rss,
                     "memory_tags": memory_tags,
                     "spill_metrics": spill_metrics,
+                    "relative_median": {
+                        "baseline": query.relative_median_baseline,
+                        "ratio": query.relative_median_ratio,
+                        "limit": query.relative_median_limit,
+                    },
                     "validation": {
                         "result": query.validation_result,
                         "detail": query.validation_detail,

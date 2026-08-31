@@ -768,8 +768,13 @@ fn collect_explain_properties(
             }
         }
         PhysicalNodeKind::RowFetch(spec) => {
-            if !output_names.is_empty() {
-                push_list_property(&mut properties, "Output", &output_names);
+            let visible_output_count = spec
+                .projection
+                .as_ref()
+                .map_or(output_names.len(), |projection| projection.visible_count);
+            let visible_outputs = &output_names[..visible_output_count.min(output_names.len())];
+            if !visible_outputs.is_empty() {
+                push_list_property(&mut properties, "Output", visible_outputs);
             }
             push_string_property(&mut properties, "Sources", spec.mappings.len().to_string());
         }
@@ -1385,11 +1390,21 @@ fn format_output_schema(node: &PhysicalPlanNode) -> String {
     if node.output.column_count() == 0 {
         return "(none)".to_string();
     }
+    let visible_width = match &node.kind {
+        PhysicalNodeKind::RowFetch(spec) => spec
+            .projection
+            .as_ref()
+            .map_or(node.output.column_count(), |projection| {
+                projection.visible_count
+            }),
+        _ => node.output.column_count(),
+    };
     node.output
         .identities
         .iter()
         .enumerate()
         .zip(node.output.types.iter())
+        .take(visible_width)
         .map(|((ordinal, identity), ty)| {
             let name = match identity {
                 super::row_type::ColumnIdentity::Visible {

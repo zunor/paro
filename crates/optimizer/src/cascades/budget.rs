@@ -26,6 +26,28 @@ pub enum BudgetDimension {
     EnforcerChain,
 }
 
+impl BudgetDimension {
+    pub const fn stable_name(self) -> &'static str {
+        match self {
+            Self::Group => "group",
+            Self::LogicalExprPerGroup => "logical_expr_per_group",
+            Self::PhysicalExprPerGroup => "physical_expr_per_group",
+            Self::InterestingGoalPerGroup => "interesting_goal_per_group",
+            Self::RuleFirePerGroup => "rule_fire_per_group",
+            Self::JoinConnectedPair => "join_connected_pair",
+            Self::GraphFrontier => "graph_frontier",
+            Self::FactorizationVariant => "factorization_variant",
+            Self::MultiwayJoinCandidate => "multiway_join_candidate",
+            Self::SearchCandidate => "search_candidate",
+            Self::SearchFusion => "search_fusion",
+            Self::ParameterContext => "parameter_context",
+            Self::CompositeRegionCandidate => "composite_region_candidate",
+            Self::RecursiveCandidate => "recursive_candidate",
+            Self::EnforcerChain => "enforcer_chain",
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SearchBudget {
     /// Emergency isolation surface for a faulty optional equivalence rule.
@@ -104,16 +126,14 @@ impl SearchBudget {
         &mut self,
         names: &str,
     ) -> paro_common::error::Result<()> {
+        super::rules::validate_transformation_rule_names(names)?;
         for name in names
             .split(',')
             .map(str::trim)
             .filter(|name| !name.is_empty())
         {
-            let rule = super::rules::transformation_rule_id(name).ok_or_else(|| {
-                paro_common::error::invalid_input(format!(
-                    "unknown optimizer transformation rule '{name}'"
-                ))
-            })?;
+            let rule = super::rules::transformation_rule_id(name)
+                .expect("validated optimizer transformation name disappeared");
             self.disable_transformation(rule);
         }
         Ok(())
@@ -195,6 +215,20 @@ impl SearchLedger {
         self.consumed.get(&dimension).map_or(0, BTreeSet::len)
     }
 
+    /// Release a provisional optional admission that did not make any Memo
+    /// state reachable.  Transformations reserve their output slot before
+    /// running because their context is append-only; a no-op firing must not
+    /// permanently consume that slot.
+    pub fn release_optional_reservation(
+        &mut self,
+        dimension: BudgetDimension,
+        event: Fingerprint,
+    ) -> bool {
+        self.consumed
+            .get_mut(&dimension)
+            .is_some_and(|events| events.remove(&event))
+    }
+
     pub fn merge_from(&mut self, other: &Self) {
         for (&dimension, events) in &other.consumed {
             self.consumed
@@ -253,6 +287,24 @@ mod tests {
         right.admit_optional(BudgetDimension::RuleFirePerGroup, Fingerprint(2));
         left.merge_from(&right);
         assert_eq!(left.consumed(BudgetDimension::RuleFirePerGroup), 2);
+    }
+
+    #[test]
+    fn unused_reservation_returns_optional_credit() {
+        let mut budget = SearchBudget::default();
+        budget.max_optional_logical_exprs_per_group = 1;
+        let mut ledger = SearchLedger::new(budget);
+        let first = Fingerprint(1);
+        let second = Fingerprint(2);
+        assert_eq!(
+            ledger.admit_optional(BudgetDimension::LogicalExprPerGroup, first),
+            BudgetDecision::Allowed
+        );
+        assert!(ledger.release_optional_reservation(BudgetDimension::LogicalExprPerGroup, first));
+        assert_eq!(
+            ledger.admit_optional(BudgetDimension::LogicalExprPerGroup, second),
+            BudgetDecision::Allowed
+        );
     }
 
     #[test]

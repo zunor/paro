@@ -56,6 +56,9 @@ class QueryExecutionResult:
     rss_before_kb: int | None = None
     rss_after_kb: int | None = None
     rss_peak_kb: int | None = None
+    relative_median_baseline: str | None = None
+    relative_median_ratio: float | None = None
+    relative_median_limit: float | None = None
     error: str | None = None
 
 
@@ -151,6 +154,7 @@ class BenchmarkExecutor:
                     # Timeout closes connection. Remaining queries are skipped for this workload.
                     conn = None
                     break
+            self._apply_relative_latency_guards(workload, result)
         else:
             for query in workload.queries:
                 result.queries.append(
@@ -177,6 +181,46 @@ class BenchmarkExecutor:
                 _safe_close(teardown_conn)
 
         return result
+
+    def _apply_relative_latency_guards(
+        self,
+        workload: WorkloadDef,
+        result: WorkloadExecutionResult,
+    ) -> None:
+        definitions = {query.id: query for query in workload.queries}
+        measurements = {query.id: query for query in result.queries}
+        for query_id, query_result in measurements.items():
+            definition = definitions[query_id]
+            baseline_id = definition.max_median_ratio_to
+            limit = definition.max_median_ratio
+            if baseline_id is None or limit is None:
+                continue
+            query_result.relative_median_baseline = baseline_id
+            query_result.relative_median_limit = limit
+            baseline = measurements.get(baseline_id)
+            current_median = _median(query_result.samples_ms)
+            baseline_median = _median(baseline.samples_ms) if baseline is not None else None
+            if (
+                baseline is None
+                or baseline.error is not None
+                or baseline.validation_result != "PASS"
+                or current_median is None
+                or baseline_median is None
+                or baseline_median <= 0.0
+            ):
+                query_result.validation_result = "FAIL"
+                query_result.validation_detail = (
+                    f"relative median baseline '{baseline_id}' is unavailable"
+                )
+                continue
+            ratio = current_median / baseline_median
+            query_result.relative_median_ratio = ratio
+            if ratio > limit:
+                query_result.validation_result = "FAIL"
+                query_result.validation_detail = (
+                    f"median ratio {ratio:.3f} exceeds {limit:.3f} "
+                    f"relative to '{baseline_id}'"
+                )
 
     def _validate_workload_requirements(self, conn: Any, workload: WorkloadDef) -> None:
         required = workload.minimum_server_buffer_pool_bytes

@@ -75,6 +75,21 @@ pub fn transformation_rule_id(name: &str) -> Option<RuleId> {
         .find_map(|(id, candidate)| candidate.eq_ignore_ascii_case(name.trim()).then_some(*id))
 }
 
+pub fn validate_transformation_rule_names(names: &str) -> Result<()> {
+    for name in names
+        .split(',')
+        .map(str::trim)
+        .filter(|name| !name.is_empty())
+    {
+        if transformation_rule_id(name).is_none() {
+            return Err(paro_error::invalid_input(format!(
+                "unknown optimizer transformation rule '{name}'"
+            )));
+        }
+    }
+    Ok(())
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub struct RulePromise {
     pub priority: u16,
@@ -99,6 +114,15 @@ pub struct RuleContext<'a> {
     pub group: GroupId,
 }
 
+pub struct TransformContext<'a> {
+    /// Transformations may append child groups/expressions and update region
+    /// facets, but must not mutate pre-existing group membership or physical
+    /// search state. The engine relies on that write-set contract for its
+    /// bounded incremental rollback savepoint.
+    pub memo: &'a mut Memo,
+    pub group: GroupId,
+}
+
 pub trait TransformationRule: Send + Sync {
     fn id(&self) -> RuleId;
 
@@ -111,7 +135,7 @@ pub trait TransformationRule: Send + Sync {
     fn apply(
         &self,
         expr: LogicalExprId,
-        ctx: &RuleContext<'_>,
+        ctx: &mut TransformContext<'_>,
     ) -> Result<Box<[EquivalentExpression]>>;
 }
 

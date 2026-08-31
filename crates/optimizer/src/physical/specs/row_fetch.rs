@@ -36,6 +36,9 @@ pub struct RowFetchProjectionSpec {
     pub expressions: Box<[Expression]>,
     pub output_names: Box<[String]>,
     pub output_types: Box<[LogicalType]>,
+    /// SQL-visible prefix. Remaining expressions are internal carriers used
+    /// by the enclosing statement layer and must not leak into EXPLAIN.
+    pub visible_count: usize,
 }
 
 #[derive(Debug, Clone)]

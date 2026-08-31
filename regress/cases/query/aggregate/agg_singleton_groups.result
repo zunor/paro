@@ -95,9 +95,9 @@ ORDER_BY  (rows=2)
             Columns: customer_key
           ->  AGGREGATE  (rows=2)
             Group Key: o.customer_key
-            Aggregates: count(o.order_key)
+            Aggregates: count_star(*)
             ->  ROWSET_SCAN on public.singleton_orders_large o  (rows=4050)
-              Columns: order_key, customer_key
+              Columns: customer_key
               Pushed Predicate: comment NOT LIKE "%special%requests%"
 
 SELECT c_count, count(*) AS customer_distribution

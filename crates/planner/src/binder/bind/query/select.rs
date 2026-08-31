@@ -60,7 +60,7 @@ impl Binder {
         offset: &Option<paro_parser::ast::Expr>,
     ) -> Result<BoundQuery> {
         let mut aggregates = Vec::new();
-        let hnsw_options = Self::extract_hnsw_query_options(select.hints.as_ref())?;
+        let hnsw_options = self.extract_hnsw_query_options(select.hints.as_ref())?;
         let projection_index = self.bind_context.generate_table_index();
         let group_index = self.bind_context.generate_table_index();
         let aggregate_index = self.bind_context.generate_table_index();
@@ -314,12 +314,18 @@ impl Binder {
         ))
     }
 
-    fn extract_hnsw_query_options(hints: Option<&Hint>) -> Result<HnswQueryOptions> {
-        let Some(hints) = hints else {
-            return Ok(HnswQueryOptions::default());
+    fn extract_hnsw_query_options(&self, hints: Option<&Hint>) -> Result<HnswQueryOptions> {
+        let objective = match self.session_context().settings.vector_search_objective() {
+            "cost_optimized" => HnswSearchObjective::CostOptimized,
+            _ => HnswSearchObjective::Exact,
         };
-
-        let mut options = HnswQueryOptions::default();
+        let mut options = HnswQueryOptions {
+            objective,
+            ..HnswQueryOptions::default()
+        };
+        let Some(hints) = hints else {
+            return Ok(options);
+        };
         let mut saw_ef = false;
         let mut saw_rerank_window = false;
         let mut saw_objective = false;

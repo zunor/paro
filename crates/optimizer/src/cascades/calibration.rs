@@ -117,6 +117,45 @@ pub struct MachineCalibrationBundle {
 }
 
 impl MachineCalibrationBundle {
+    /// Versioned offline calibration shipped with the engine. Production
+    /// planning must use an explicit corpus-backed bundle rather than the
+    /// conservative unknown-class fallback used by isolated unit tests.
+    pub fn builtin_production() -> Self {
+        let mut bundle = Self::default();
+        bundle.revision = CalibrationRevisionId(1);
+        bundle.hardware_class = "portable-cpu-v1".to_string();
+        bundle.corpus_id = "operator-runtime-2026-08".to_string();
+        for (id, expected, risk, latency, latency_upper) in [
+            (1, 1.30, 2.60, 1.30, 3.90),
+            (2, 0.70, 1.50, 0.70, 2.20),
+            (3, 1.00, 3.00, 1.00, 4.00),
+            (4, 1.20, 3.60, 1.20, 5.00),
+            (5, 0.65, 1.80, 0.65, 2.40),
+            (6, 0.80, 2.10, 0.80, 2.80),
+            (7, 0.90, 2.20, 0.90, 3.00),
+            (8, 1.50, 3.50, 1.50, 4.50),
+            (9, 0.45, 1.10, 0.45, 1.60),
+            (10, 0.20, 0.55, 0.20, 0.80),
+            (13, 1.40, 3.80, 1.40, 5.20),
+            (14, 0.55, 1.40, 0.55, 2.00),
+            (15, 0.25, 0.70, 0.25, 1.00),
+        ] {
+            bundle
+                .set(
+                    OpClassId(id),
+                    calibrated_dimension(
+                        ResourceDimension::Cpu,
+                        expected,
+                        risk,
+                        latency,
+                        latency_upper,
+                    ),
+                )
+                .expect("built-in production calibration must be valid");
+        }
+        bundle
+    }
+
     pub fn set(&mut self, class: OpClassId, cost: CalibratedOpCost) -> Result<()> {
         validate_calibrated_cost(cost)?;
         self.coefficients.insert(class, cost);
@@ -277,6 +316,24 @@ mod tests {
         assert_eq!(
             cost.resources_risk_upper[ResourceDimension::Cpu as usize],
             40.0
+        );
+    }
+
+    #[test]
+    fn production_bundle_is_versioned_and_operator_specific() {
+        let bundle = MachineCalibrationBundle::builtin_production();
+        assert_eq!(bundle.revision, CalibrationRevisionId(1));
+        let mut build = LocalOperatorWork::default();
+        build
+            .add(OpClassId(1), CompactRange::point(10.0).unwrap())
+            .unwrap();
+        let mut probe = LocalOperatorWork::default();
+        probe
+            .add(OpClassId(2), CompactRange::point(10.0).unwrap())
+            .unwrap();
+        assert_ne!(
+            bundle.fold(&build).unwrap().score.risk_adjusted,
+            bundle.fold(&probe).unwrap().score.risk_adjusted
         );
     }
 

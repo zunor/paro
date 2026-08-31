@@ -16,28 +16,55 @@ impl ReorderFilter {
     }
 
     pub fn rewrite(&mut self, plan: LogicalPlan, ctx: &OptimizationContext) -> Result<LogicalPlan> {
-        let plan = plan.try_map_children(|child| self.rewrite(child, ctx))?;
-        Ok(self.rewrite_current(plan, ctx))
+        self.rewrite_with_change(plan, ctx).map(|(plan, _)| plan)
     }
 
-    fn rewrite_current(&mut self, plan: LogicalPlan, ctx: &OptimizationContext) -> LogicalPlan {
+    pub fn rewrite_with_change(
+        &mut self,
+        plan: LogicalPlan,
+        ctx: &OptimizationContext,
+    ) -> Result<(LogicalPlan, bool)> {
+        let mut changed = false;
+        let plan = plan.try_map_children(|child| {
+            let (child, child_changed) = self.rewrite_with_change(child, ctx)?;
+            changed |= child_changed;
+            Ok(child)
+        })?;
+        let (plan, node_changed) = self.rewrite_current(plan, ctx);
+        Ok((plan, changed || node_changed))
+    }
+
+    fn rewrite_current(
+        &mut self,
+        plan: LogicalPlan,
+        ctx: &OptimizationContext,
+    ) -> (LogicalPlan, bool) {
         let LogicalPlan {
             id,
             stats,
             operator,
         } = plan;
-        let operator = match operator {
+        let (operator, changed) = match operator {
             LogicalOperator::Filter(mut filter) => {
-                filter.expressions = reorder_with_evaluation_fences(filter.expressions, ctx);
-                LogicalOperator::Filter(filter)
+                let original = filter.expressions;
+                let reordered = reorder_with_evaluation_fences(original.clone(), ctx);
+                let changed = original
+                    .iter()
+                    .zip(&reordered)
+                    .any(|(left, right)| !left.equals(right));
+                filter.expressions = reordered;
+                (LogicalOperator::Filter(filter), changed)
             }
-            other => other,
+            other => (other, false),
         };
-        LogicalPlan {
-            id,
-            stats,
-            operator,
-        }
+        (
+            LogicalPlan {
+                id,
+                stats,
+                operator,
+            },
+            changed,
+        )
     }
 }
 

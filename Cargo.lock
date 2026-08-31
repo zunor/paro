@@ -1840,6 +1840,7 @@ dependencies = [
  "paro-function",
  "paro-instance",
  "paro-journal",
+ "paro-optimizer",
  "paro-parser",
  "paro-planner",
  "paro-scheduler",

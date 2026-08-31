@@ -55,6 +55,7 @@ impl PhysicalPlanExtractor {
                             .map(Expression::return_type)
                             .collect::<Vec<_>>()
                             .into_boxed_slice(),
+                        visible_count: project.visible_names.len(),
                     },
                 )
             })

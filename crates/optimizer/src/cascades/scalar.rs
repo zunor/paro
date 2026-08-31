@@ -134,7 +134,7 @@ pub struct ScalarSpec {
     pub local_properties: ScalarLocalProperties,
 }
 
-#[derive(Debug, Default)]
+#[derive(Debug, Clone, Default)]
 pub struct ScalarArena {
     nodes: Vec<ScalarNode>,
     by_fingerprint: BTreeMap<Fingerprint, Vec<ScalarExprId>>,

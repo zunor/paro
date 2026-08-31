@@ -85,7 +85,6 @@ PROJECTION  (rows=2)
         Aggregates: count_star(*), sum(f.amount), sum(f.amount) FILTER (WHERE f.keep)
         ->  HASH_JOIN  (rows=4266)
           Join Type: INNER
-          Runtime Filter: wait_complete artifact=5cf2272f3f308573b6087a5a451db1a7
           Build Index: integer_build_time
           Join Condition: f.key_a = d.key_a
           ->  ROWSET_SCAN on public.agg_defer_fact f  (rows=5333)

@@ -59,8 +59,12 @@ struct ReductionExposure {
 
 /// Eliminate redundant detail scans covered by a filtered partial aggregate.
 pub fn optimize_plan(plan: LogicalPlan) -> LogicalPlan {
-    fn rewrite(plan: LogicalPlan) -> LogicalPlan {
-        let mut plan = plan.map_children(rewrite);
+    optimize_plan_with_change(plan).0
+}
+
+pub fn optimize_plan_with_change(plan: LogicalPlan) -> (LogicalPlan, bool) {
+    fn rewrite(plan: LogicalPlan, changed: &mut bool) -> LogicalPlan {
+        let mut plan = plan.map_children(|child| rewrite(child, changed));
         let LogicalOperator::Aggregate(aggregate) = &mut plan.operator else {
             return plan;
         };
@@ -75,10 +79,13 @@ pub fn optimize_plan(plan: LogicalPlan) -> LogicalPlan {
 
         aggregate.aggregates[0] = replacement;
         aggregate.recompute_returned_types();
+        *changed = true;
         plan
     }
 
-    rewrite(plan)
+    let mut changed = false;
+    let plan = rewrite(plan, &mut changed);
+    (plan, changed)
 }
 
 struct AggregateJoinSubsumption;

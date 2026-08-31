@@ -64,7 +64,7 @@ fn lowers_late_row_fetch_with_resolved_carrier_rowid() {
         .expect("late row-fetch bindings resolve");
 
     let mut extractor = PhysicalPlanExtractor::new(ExtractionContext::default());
-    let physical = extractor
+    let mut physical = extractor
         .extract(&logical)
         .expect("late row-fetch should lower");
 
@@ -80,7 +80,15 @@ fn lowers_late_row_fetch_with_resolved_carrier_rowid() {
         projection.output_types.as_ref(),
         [LogicalType::Integer, LogicalType::Varchar]
     );
+    assert_eq!(projection.visible_count, 2);
     assert!(crate::physical::PhysicalPlanVerifier::verify(&physical).is_ok());
+
+    let root = physical.root;
+    let PhysicalNodeKind::RowFetch(spec) = &mut physical.nodes.get_mut(root).unwrap().kind else {
+        unreachable!();
+    };
+    spec.projection.as_mut().unwrap().visible_count = 3;
+    assert!(crate::physical::PhysicalPlanVerifier::verify(&physical).is_err());
 }
 
 #[test]

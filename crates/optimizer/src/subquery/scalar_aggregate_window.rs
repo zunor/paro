@@ -36,13 +36,23 @@ use crate::subquery::output_contract::{
 };
 
 pub fn optimize_plan(plan: LogicalPlan, bind_context: &BindContext) -> Result<LogicalPlan> {
-    optimize_node(plan, None, bind_context)
+    optimize_plan_with_change(plan, bind_context).map(|(plan, _)| plan)
+}
+
+pub fn optimize_plan_with_change(
+    plan: LogicalPlan,
+    bind_context: &BindContext,
+) -> Result<(LogicalPlan, bool)> {
+    let mut changed = false;
+    let plan = optimize_node(plan, None, bind_context, &mut changed)?;
+    Ok((plan, changed))
 }
 
 fn optimize_node(
     plan: LogicalPlan,
     output_contract: Option<OutputContract>,
     bind_context: &BindContext,
+    changed: &mut bool,
 ) -> Result<LogicalPlan> {
     let child_contracts = child_output_contracts(
         &plan.operator,
@@ -53,11 +63,12 @@ fn optimize_node(
     let plan = plan.try_map_children(|child| {
         let contract = child_contracts.get(child_ordinal).cloned().flatten();
         child_ordinal += 1;
-        optimize_node(child, contract, bind_context)
+        optimize_node(child, contract, bind_context, changed)
     })?;
     let Some(rewrite) = recognize(&plan, output_contract.as_ref()) else {
         return Ok(plan);
     };
+    *changed = true;
     apply_rewrite(plan, rewrite, bind_context)
 }
 

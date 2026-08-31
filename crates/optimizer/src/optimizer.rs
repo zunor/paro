@@ -30,17 +30,7 @@ use paro_storage::statistics::ColumnStatistics;
 use tracing::debug;
 
 use crate::aggregate::common::CommonAggregateOptimizer;
-use crate::aggregate::{
-    dimension_deferral, distinct_decomposition, input_materialization, join_preaggregation,
-    join_subsumption, late_payload, non_null_inputs, post_reduction, singleton_groups,
-};
-use crate::cascades::rules::{
-    AGGREGATE_DIMENSION_DEFERRAL_RULE, AGGREGATE_INPUT_MATERIALIZATION_RULE,
-    AGGREGATE_JOIN_PREAGGREGATION_RULE, AGGREGATE_JOIN_SUBSUMPTION_RULE,
-    AGGREGATE_NON_NULL_INPUT_RULE, AGGREGATE_POST_REDUCTION_RULE, CTE_FILTER_PUSHDOWN_RULE,
-    CTE_INLINE_RULE, EXPENSIVE_PREDICATE_PLACEMENT_RULE, JOIN_ELIMINATION_RULE,
-    LATE_PAYLOAD_FETCH_RULE, LIMIT_PUSHDOWN_RULE, SCALAR_AGGREGATE_WINDOW_RULE,
-};
+use crate::aggregate::{distinct_decomposition, late_payload, singleton_groups};
 use crate::cascades::{
     AlternativeOrigin, CompactRange, LocalOperatorWork, LogicalAlternative,
     MachineCalibrationBundle, MemoBuilder, OpClassId, SearchBudget, SearchCost,
@@ -56,14 +46,11 @@ use crate::expression::rewriter::ExpressionRewriter;
 use crate::external::lowering::ExternalRoutineLoweringPass;
 use crate::filter::pullup::FilterPullup;
 use crate::filter::pushdown::FilterPushdown;
-use crate::filter::reorder::ReorderFilter;
 use crate::graph::frontier::GraphFrontierEnumerator;
 use crate::graph::match_decompose::GraphMatchDecompose;
 use crate::graph::predicate_pushdown::GraphPredicatePushdown;
-use crate::join::elimination::JoinElimination;
 use crate::join::mixed_predicates::JoinPredicateNormalizer;
 use crate::join_order::optimizer::JoinOrderOptimizer;
-use crate::limit::pushdown::LimitPushdown;
 use crate::limit::topn::TopNOptimizer;
 use crate::physical::{
     ExtractionContext, PhysicalImplementationFlavor, PhysicalPlanExtractor, WinnerPhysicalContract,
@@ -127,7 +114,7 @@ impl Optimizer {
             ctx: OptimizationContext::new(session, binder.bind_context.clone()),
             binder,
             budget: SearchBudget::default(),
-            calibration: Arc::new(MachineCalibrationBundle::default()),
+            calibration: Arc::new(MachineCalibrationBundle::builtin_production()),
         }
     }
 
@@ -196,6 +183,7 @@ impl Optimizer {
                 return Ok(result);
             }
         };
+        let observes_optimizer_diagnostics = observes_optimizer_diagnostics(&query);
         let explain = statement.explain;
         let phase_started = Instant::now();
         let graph_plans = enumerate_graph_region_plans(
@@ -212,19 +200,6 @@ impl Optimizer {
                 ))
             });
             let canonical = self.canonicalize_query(graph_plan)?;
-            let cte_region = contains_cte_region(&canonical);
-            // Semantic rewrites whose proofs inspect unpruned join outputs
-            // receive an estimated pre-projection seed. ABI annotations are
-            // terminal and must not become rewrite preconditions.
-            let semantic_seed =
-                self.estimate_query_candidate(duplicate_plan_preserving_indices(
-                    &canonical,
-                    self.binder.bind_context.shared().as_ref(),
-                ))?;
-            let settled_seed = self.settle_schema_candidate(duplicate_plan_preserving_indices(
-                &canonical,
-                self.binder.bind_context.shared().as_ref(),
-            ))?;
             let baseline = self.settle_query_candidate(duplicate_plan_preserving_indices(
                 &canonical,
                 self.binder.bind_context.shared().as_ref(),
@@ -242,82 +217,6 @@ impl Optimizer {
                 }
             }));
 
-            macro_rules! optional_candidate {
-                ($rule:expr, $candidate:expr, $message:literal) => {
-                    if self.budget.transformation_enabled($rule)
-                        && self.budget.max_rule_firings_per_group > 0
-                        && alternatives.len()
-                            < self.budget.max_optional_logical_exprs_per_group as usize + 1
-                    {
-                        match $candidate {
-                            Ok(candidate) => alternatives.push(candidate.into_alternative(
-                                AlternativeOrigin::Transformation { rule: $rule },
-                            )),
-                            Err(error) => debug!(
-                                target: targets::OPTIMIZER,
-                                %error,
-                                rule = ?$rule,
-                                $message
-                            ),
-                        }
-                    }
-                };
-            }
-            macro_rules! optional_changed_candidate {
-                ($rule:expr, $candidate:expr, $message:literal) => {
-                    if self.budget.transformation_enabled($rule)
-                        && self.budget.max_rule_firings_per_group > 0
-                        && alternatives.len()
-                            < self.budget.max_optional_logical_exprs_per_group as usize + 1
-                    {
-                        match $candidate {
-                            Ok((plan, true)) => match self.settle_query_candidate(plan) {
-                                Ok(candidate) => alternatives.push(candidate.into_alternative(
-                                    AlternativeOrigin::Transformation { rule: $rule },
-                                )),
-                                Err(error) => debug!(
-                                    target: targets::OPTIMIZER,
-                                    %error,
-                                    rule = ?$rule,
-                                    $message
-                                ),
-                            },
-                            Ok((_plan, false)) => {}
-                            Err(error) => debug!(
-                                target: targets::OPTIMIZER,
-                                %error,
-                                rule = ?$rule,
-                                $message
-                            ),
-                        }
-                    }
-                };
-            }
-            macro_rules! optional_infallible_changed_candidate {
-                ($rule:expr, $candidate:expr, $message:literal) => {
-                    if self.budget.transformation_enabled($rule)
-                        && self.budget.max_rule_firings_per_group > 0
-                        && alternatives.len()
-                            < self.budget.max_optional_logical_exprs_per_group as usize + 1
-                    {
-                        let (plan, changed) = $candidate;
-                        if changed {
-                            match self.settle_query_candidate(plan) {
-                                Ok(candidate) => alternatives.push(candidate.into_alternative(
-                                    AlternativeOrigin::Transformation { rule: $rule },
-                                )),
-                                Err(error) => debug!(
-                                    target: targets::OPTIMIZER,
-                                    %error,
-                                    rule = ?$rule,
-                                    $message
-                                ),
-                            }
-                        }
-                    }
-                };
-            }
-
             if let Some(plan) = distinct_feasibility_candidate {
                 alternatives.push(plan.into_alternative(
                     // DISTINCT modifier state is not spillable.  This
@@ -329,197 +228,6 @@ impl Optimizer {
                         rule: DISTINCT_AGGREGATE_FEASIBILITY_RULE,
                     },
                 ));
-            }
-
-            if contains_reorderable_filter_segment(&settled_seed.plan) {
-                let predicate_context = self
-                    .ctx
-                    .fork_for_candidate(Arc::unwrap_or_clone(settled_seed.column_stats.clone()));
-                optional_candidate!(
-                    EXPENSIVE_PREDICATE_PLACEMENT_RULE,
-                    ReorderFilter::new()
-                        .rewrite(
-                            duplicate_plan_preserving_indices(
-                                &settled_seed.plan,
-                                self.binder.bind_context.shared().as_ref(),
-                            ),
-                            &predicate_context,
-                        )
-                        .and_then(|plan| self.settle_query_candidate(plan)),
-                    "expensive-predicate rule rejected an invalid optional candidate"
-                );
-            }
-
-            optional_candidate!(
-                AGGREGATE_POST_REDUCTION_RULE,
-                self.settle_query_candidate(post_reduction::optimize_plan(
-                    duplicate_plan_preserving_indices(
-                        &semantic_seed.plan,
-                        self.binder.bind_context.shared().as_ref(),
-                    ),
-                    &self.ctx.bind_context,
-                )),
-                "aggregate post-reduction rule rejected an invalid optional candidate"
-            );
-            optional_infallible_changed_candidate!(
-                JOIN_ELIMINATION_RULE,
-                JoinElimination::new().optimize_plan_with_change(
-                    duplicate_plan_preserving_indices(
-                        &semantic_seed.plan,
-                        self.binder.bind_context.shared().as_ref(),
-                    ),
-                ),
-                "join-elimination rule rejected an invalid optional candidate"
-            );
-            optional_infallible_changed_candidate!(
-                AGGREGATE_JOIN_PREAGGREGATION_RULE,
-                join_preaggregation::optimize_plan(
-                    duplicate_plan_preserving_indices(
-                        &semantic_seed.plan,
-                        self.binder.bind_context.shared().as_ref(),
-                    ),
-                    &self.ctx.bind_context,
-                    semantic_seed.column_stats.as_ref(),
-                ),
-                "aggregate join-preaggregation rule rejected an invalid optional candidate"
-            );
-            optional_candidate!(
-                AGGREGATE_JOIN_SUBSUMPTION_RULE,
-                self.settle_query_candidate(join_subsumption::optimize_plan(
-                    duplicate_plan_preserving_indices(
-                        &semantic_seed.plan,
-                        self.binder.bind_context.shared().as_ref(),
-                    ),
-                )),
-                "aggregate join-subsumption rule rejected an invalid optional candidate"
-            );
-            optional_candidate!(
-                AGGREGATE_NON_NULL_INPUT_RULE,
-                self.settle_query_candidate(non_null_inputs::optimize_plan(
-                    duplicate_plan_preserving_indices(
-                        &semantic_seed.plan,
-                        self.binder.bind_context.shared().as_ref(),
-                    ),
-                    semantic_seed.column_stats.as_ref(),
-                )),
-                "aggregate non-null-input rule rejected an invalid optional candidate"
-            );
-
-            optional_changed_candidate!(
-                AGGREGATE_DIMENSION_DEFERRAL_RULE,
-                dimension_deferral::optimize_plan(
-                    duplicate_plan_preserving_indices(
-                        &settled_seed.plan,
-                        self.binder.bind_context.shared().as_ref(),
-                    ),
-                    &self.ctx.bind_context,
-                    &self.ctx.cost_model,
-                ),
-                "aggregate dimension-deferral rule rejected an invalid optional candidate"
-            );
-            optional_changed_candidate!(
-                AGGREGATE_INPUT_MATERIALIZATION_RULE,
-                input_materialization::optimize_plan(
-                    duplicate_plan_preserving_indices(
-                        &settled_seed.plan,
-                        self.binder.bind_context.shared().as_ref(),
-                    ),
-                    &self.ctx.bind_context,
-                ),
-                "aggregate input-materialization rule rejected an invalid optional candidate"
-            );
-            optional_candidate!(
-                LIMIT_PUSHDOWN_RULE,
-                self.settle_query_candidate(LimitPushdown::new().optimize_plan(
-                    duplicate_plan_preserving_indices(
-                        &semantic_seed.plan,
-                        self.binder.bind_context.shared().as_ref(),
-                    ),
-                )),
-                "limit-pushdown rule rejected an invalid optional candidate"
-            );
-
-            if self.ctx.session.settings.rowset_scan_pushdown() {
-                optional_changed_candidate!(
-                    LATE_PAYLOAD_FETCH_RULE,
-                    late_payload::optimize_matched_prefix_plan(duplicate_plan_preserving_indices(
-                        &settled_seed.plan,
-                        self.binder.bind_context.shared().as_ref(),
-                    ),)
-                    .and_then(|(plan, prefix_changed)| {
-                        late_payload::optimize_plan(
-                            plan,
-                            &self.ctx.bind_context,
-                            &self.ctx.cost_model,
-                        )
-                        .map(|(plan, payload_changed)| (plan, prefix_changed || payload_changed))
-                    }),
-                    "late-payload rule rejected an invalid optional candidate"
-                );
-            }
-            optional_candidate!(
-                SCALAR_AGGREGATE_WINDOW_RULE,
-                scalar_aggregate_window::optimize_plan(
-                    duplicate_plan_preserving_indices(
-                        &settled_seed.plan,
-                        self.binder.bind_context.shared().as_ref(),
-                    ),
-                    &self.ctx.bind_context,
-                )
-                .and_then(|plan| self.settle_query_candidate(plan)),
-                "scalar-aggregate-window rule rejected an invalid optional candidate"
-            );
-
-            if cte_region
-                && alternatives.len()
-                    < self.budget.max_optional_logical_exprs_per_group as usize + 1
-                && self.budget.transformation_enabled(CTE_INLINE_RULE)
-                && self.budget.max_rule_firings_per_group > 0
-            {
-                let inline_seed = CTEInlining::new(&self.ctx.bind_context).optimize_plan(
-                    duplicate_plan_preserving_indices(
-                        &canonical,
-                        self.binder.bind_context.shared().as_ref(),
-                    ),
-                );
-                match self.settle_query_candidate(inline_seed) {
-                    Ok(plan) => alternatives.push(plan.into_alternative(
-                        AlternativeOrigin::Transformation {
-                            rule: CTE_INLINE_RULE,
-                        },
-                    )),
-                    Err(error) => debug!(
-                        target: targets::OPTIMIZER,
-                        %error,
-                        "CTE-inline rule rejected an invalid optional candidate"
-                    ),
-                }
-            }
-            if cte_region
-                && alternatives.len()
-                    < self.budget.max_optional_logical_exprs_per_group as usize + 1
-                && self.budget.transformation_enabled(CTE_FILTER_PUSHDOWN_RULE)
-                && self.budget.max_rule_firings_per_group > 0
-            {
-                let mut filtered = duplicate_plan_preserving_indices(
-                    &canonical,
-                    self.binder.bind_context.shared().as_ref(),
-                );
-                filtered = FilterPullup::new().rewrite_plan(filtered);
-                filtered = FilterPushdown::new().rewrite_plan(filtered);
-                filtered = CTEFilterPusher::new().optimize_plan(filtered);
-                match self.settle_query_candidate(filtered) {
-                    Ok(plan) => alternatives.push(plan.into_alternative(
-                        AlternativeOrigin::Transformation {
-                            rule: CTE_FILTER_PUSHDOWN_RULE,
-                        },
-                    )),
-                    Err(error) => debug!(
-                        target: targets::OPTIMIZER,
-                        %error,
-                        "CTE-filter rule rejected an invalid optional candidate"
-                    ),
-                }
             }
             let Some(correlated_seed) = correlated_seed else {
                 continue;
@@ -635,7 +343,7 @@ impl Optimizer {
         }
         let mut input = MemoBuilder::build_with_search(
             alternatives,
-            self.binder.bind_context.clone(),
+            &self.binder,
             self.budget.clone(),
             &self.ctx,
         )?
@@ -660,6 +368,9 @@ impl Optimizer {
         self.ctx
             .profiler
             .record_rule_insertions(extraction.rule_insertions.clone());
+        self.ctx
+            .profiler
+            .record_search_summary(&extraction.search_summary);
         self.ctx.profiler.record(
             match mode {
                 crate::cascades::SearchMode::Direct => OptimizerComponent::DirectPhysicalSearch,
@@ -701,10 +412,12 @@ impl Optimizer {
             OptimizerComponent::PhysicalExtraction,
             phase_started.elapsed(),
         );
-        publish_optimizer_profile_snapshot(
-            self.ctx.session.diagnostics.as_ref(),
-            self.ctx.profiler.snapshot(),
-        );
+        if !observes_optimizer_diagnostics {
+            publish_optimizer_profile_snapshot(
+                self.ctx.session.diagnostics.as_ref(),
+                self.ctx.profiler.snapshot(),
+            );
+        }
         debug!(
             target: targets::OPTIMIZER,
             ?mode,
@@ -1149,6 +862,17 @@ impl Optimizer {
     }
 }
 
+fn observes_optimizer_diagnostics(plan: &LogicalPlan) -> bool {
+    matches!(
+        &plan.operator,
+        LogicalOperator::TableFunctionGet(function)
+            if function.function_name().eq_ignore_ascii_case("paro_optimizers")
+    ) || plan
+        .children()
+        .into_iter()
+        .any(observes_optimizer_diagnostics)
+}
+
 fn contains_redundant_computation_region(plan: &LogicalPlan) -> bool {
     let local_candidate = match &plan.operator {
         LogicalOperator::Join(Join::Comparison(join)) if join.join_type == JoinType::Single => {
@@ -1199,39 +923,6 @@ fn contains_mark_filter_over_cross_product(plan: &LogicalPlan) -> bool {
 fn contains_aggregate(plan: &LogicalPlan) -> bool {
     matches!(plan.operator, LogicalOperator::Aggregate(_))
         || plan.children().into_iter().any(contains_aggregate)
-}
-
-fn contains_cte_region(plan: &LogicalPlan) -> bool {
-    matches!(
-        plan.operator,
-        LogicalOperator::MaterializedCTE(_)
-            | LogicalOperator::RecursiveCTE(_)
-            | LogicalOperator::CTERef(_)
-    ) || plan.children().into_iter().any(contains_cte_region)
-}
-
-fn contains_reorderable_filter_segment(plan: &LogicalPlan) -> bool {
-    let local_candidate = match &plan.operator {
-        LogicalOperator::Filter(filter) => {
-            let mut segment_len = 0usize;
-            let mut found = false;
-            for expression in &filter.expressions {
-                if expression.evaluation_properties().is_reorder_fence() {
-                    found |= segment_len > 1;
-                    segment_len = 0;
-                } else {
-                    segment_len += 1;
-                }
-            }
-            found || segment_len > 1
-        }
-        _ => false,
-    };
-    local_candidate
-        || plan
-            .children()
-            .into_iter()
-            .any(contains_reorderable_filter_segment)
 }
 
 /// Build the bounded GraphPatternRegion candidate product before mandatory

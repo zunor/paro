@@ -231,7 +231,7 @@ mod tests {
     fn proven_singleton_group_is_an_explicit_memo_implementation() {
         let (plan, statistics) = candidate();
         let optimized = optimize_plan(plan, &statistics);
-        let input = crate::cascades::memo_builder::MemoBuilder::build(
+        let input = crate::cascades::planner::MemoBuilder::build(
             optimized,
             BindContext::new(),
             crate::cascades::budget::SearchBudget::default(),

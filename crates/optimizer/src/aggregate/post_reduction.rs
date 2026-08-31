@@ -38,27 +38,50 @@ use alpha::AlphaBindings;
 /// Replace eligible grouped/scalar sibling plans with one grouped aggregate
 /// carrying a hidden post-aggregate reduction.
 pub fn optimize_plan(plan: LogicalPlan, bind_context: &BindContext) -> LogicalPlan {
-    let cte_rewrite = match &plan.operator {
-        LogicalOperator::MaterializedCTE(cte) => recognize_cte_max_reduction(cte, bind_context),
-        _ => None,
-    };
-    if let Some(rewrite) = cte_rewrite {
-        // Recognition and mutation stay separately defensive. Preserve a
-        // binding-identical fallback so future plan-shape drift declines
-        // without turning an optimizer opportunity into a query failure.
-        let fallback = paro_planner::binder::deep_copy::duplicate_plan_preserving_indices(
-            &plan,
-            bind_context.shared().as_ref(),
-        );
-        let LogicalOperator::MaterializedCTE(cte) = plan.operator else {
-            return fallback;
+    optimize_plan_with_change(plan, bind_context).0
+}
+
+pub fn optimize_plan_with_change(
+    plan: LogicalPlan,
+    bind_context: &BindContext,
+) -> (LogicalPlan, bool) {
+    fn optimize_node(
+        plan: LogicalPlan,
+        bind_context: &BindContext,
+        changed: &mut bool,
+    ) -> LogicalPlan {
+        let cte_rewrite = match &plan.operator {
+            LogicalOperator::MaterializedCTE(cte) => recognize_cte_max_reduction(cte, bind_context),
+            _ => None,
         };
-        return rewrite_cte_max_reduction(cte, rewrite)
-            .map(|rewritten| optimize_plan(rewritten, bind_context))
-            .unwrap_or(fallback);
+        if let Some(rewrite) = cte_rewrite {
+            // Recognition and mutation stay separately defensive. Preserve a
+            // binding-identical fallback so future plan-shape drift declines
+            // without turning an optimizer opportunity into a query failure.
+            let fallback = paro_planner::binder::deep_copy::duplicate_plan_preserving_indices(
+                &plan,
+                bind_context.shared().as_ref(),
+            );
+            let LogicalOperator::MaterializedCTE(cte) = plan.operator else {
+                return fallback;
+            };
+            return match rewrite_cte_max_reduction(cte, rewrite) {
+                Some(rewritten) => {
+                    *changed = true;
+                    optimize_node(rewritten, bind_context, changed)
+                }
+                None => fallback,
+            };
+        }
+        let plan = plan.map_children(|child| optimize_node(child, bind_context, changed));
+        let (plan, node_changed) = rewrite_projection_with_change(plan, bind_context);
+        *changed |= node_changed;
+        plan
     }
-    let plan = plan.map_children(|child| optimize_plan(child, bind_context));
-    rewrite_projection(plan, bind_context)
+
+    let mut changed = false;
+    let plan = optimize_node(plan, bind_context, &mut changed);
+    (plan, changed)
 }
 
 fn rewrite_cte_max_reduction(cte: MaterializedCTE, rewrite: CteMaxRewrite) -> Option<LogicalPlan> {
@@ -749,9 +772,12 @@ struct Rewrite {
     reduction: PostAggregateReduction,
 }
 
-fn rewrite_projection(plan: LogicalPlan, bind_context: &BindContext) -> LogicalPlan {
+fn rewrite_projection_with_change(
+    plan: LogicalPlan,
+    bind_context: &BindContext,
+) -> (LogicalPlan, bool) {
     let Some(rewrite) = recognize(&plan, bind_context) else {
-        return plan;
+        return (plan, false);
     };
 
     // Recognition and mutation remain separately defensive.  If another
@@ -760,7 +786,7 @@ fn rewrite_projection(plan: LogicalPlan, bind_context: &BindContext) -> LogicalP
     let mut plan = plan;
     let output = match &mut plan.operator {
         LogicalOperator::Projection(output) => output,
-        _ => return plan,
+        _ => return (plan, false),
     };
     let grouped_slot = match &mut output.child.operator {
         LogicalOperator::Filter(filter) => match &mut filter.child.operator {
@@ -768,12 +794,12 @@ fn rewrite_projection(plan: LogicalPlan, bind_context: &BindContext) -> LogicalP
                 GroupedSide::Left => &mut cross.left,
                 GroupedSide::Right => &mut cross.right,
             },
-            _ => return plan,
+            _ => return (plan, false),
         },
-        _ => return plan,
+        _ => return (plan, false),
     };
     if !matches!(grouped_slot.operator, LogicalOperator::Aggregate(_)) {
-        return plan;
+        return (plan, false);
     }
     let mut grouped_plan = std::mem::replace(
         grouped_slot,
@@ -781,11 +807,11 @@ fn rewrite_projection(plan: LogicalPlan, bind_context: &BindContext) -> LogicalP
     );
     let LogicalOperator::Aggregate(grouped) = &mut grouped_plan.operator else {
         *grouped_slot = grouped_plan;
-        return plan;
+        return (plan, false);
     };
     grouped.post_reduction = Some(rewrite.reduction);
     output.child = grouped_plan;
-    plan
+    (plan, true)
 }
 
 fn recognize(plan: &LogicalPlan, bind_context: &BindContext) -> Option<Rewrite> {

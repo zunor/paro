@@ -19,37 +19,50 @@ pub fn optimize_plan(
     plan: LogicalPlan,
     column_stats: &HashMap<ColumnBinding, Arc<ColumnStatistics>>,
 ) -> LogicalPlan {
-    plan.map_children(|child| optimize_plan(child, column_stats))
-        .map_operator(|operator| match operator {
-            LogicalOperator::Aggregate(mut aggregate) => {
-                for expression in &mut aggregate.aggregates {
-                    rewrite_aggregate(expression, aggregate.child.as_ref(), column_stats);
-                }
-                LogicalOperator::Aggregate(aggregate)
+    optimize_plan_with_change(plan, column_stats).0
+}
+
+pub fn optimize_plan_with_change(
+    plan: LogicalPlan,
+    column_stats: &HashMap<ColumnBinding, Arc<ColumnStatistics>>,
+) -> (LogicalPlan, bool) {
+    let mut changed = false;
+    let plan = plan.map_children(|child| {
+        let (child, child_changed) = optimize_plan_with_change(child, column_stats);
+        changed |= child_changed;
+        child
+    });
+    let plan = plan.map_operator(|operator| match operator {
+        LogicalOperator::Aggregate(mut aggregate) => {
+            for expression in &mut aggregate.aggregates {
+                changed |= rewrite_aggregate(expression, aggregate.child.as_ref(), column_stats);
             }
-            operator => operator,
-        })
+            LogicalOperator::Aggregate(aggregate)
+        }
+        operator => operator,
+    });
+    (plan, changed)
 }
 
 fn rewrite_aggregate(
     expression: &mut Expression,
     child: &LogicalPlan,
     column_stats: &HashMap<ColumnBinding, Arc<ColumnStatistics>>,
-) {
+) -> bool {
     let Expression::Aggregate(aggregate) = expression else {
-        return;
+        return false;
     };
     if aggregate.aggr_type != AggregateType::NonDistinct || aggregate.children.len() != 1 {
-        return;
+        return false;
     }
     let Expression::ColumnRef(input) = &aggregate.children[0] else {
-        return;
+        return false;
     };
     if input.depth != 0 || !binding_is_non_null_at(child, input.binding, column_stats) {
-        return;
+        return false;
     }
     let Some(replacement) = aggregate.function.non_null_input_function() else {
-        return;
+        return false;
     };
     if replacement.return_type != aggregate.function.return_type
         || replacement.return_type != aggregate.return_type
@@ -57,10 +70,11 @@ fn rewrite_aggregate(
         || !replacement.arguments.is_empty()
         || replacement.varargs.is_some()
     {
-        return;
+        return false;
     }
     aggregate.function = replacement;
     aggregate.children.clear();
+    true
 }
 
 /// Prove non-NULL at the aggregate input, not merely at the base binding.

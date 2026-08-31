@@ -53,6 +53,15 @@ FROM generate_series(1, 2048) AS generated(i);
 REFRESH VECTOR INDEX idx_indexed_items_emb ON indexed_items;
 SELECT index_name, index_type FROM paro_indexes()
 WHERE index_name = 'idx_indexed_items_emb';
+
+-- A session can opt the database workload into cost-optimized vector search;
+-- an explicit query hint remains the narrower override.
+SET vector_search_objective = 'cost_optimized';
+-- @normalize explain_search_ids
+EXPLAIN SELECT id FROM indexed_items
+ORDER BY emb <-> '[1.0, 1.0, 1.0]' LIMIT 2;
+RESET vector_search_objective;
+
 -- @normalize explain_search_ids
 EXPLAIN SELECT id FROM indexed_items
 ORDER BY emb <-> '[1.0, 1.0, 1.0]' LIMIT 2;

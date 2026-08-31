@@ -165,7 +165,7 @@ const SETTING_DESCRIPTORS: &[SettingDescriptor] = &[
         context: "user",
         unit: None,
         default_value: |_| Value::Varchar(String::new()),
-        parse_value: parse_string_value,
+        parse_value: parse_disabled_optimizer_rules,
         apply_effective: apply_noop,
     },
     SettingDescriptor {
@@ -177,6 +177,17 @@ const SETTING_DESCRIPTORS: &[SettingDescriptor] = &[
         unit: None,
         default_value: |_| Value::Boolean(true),
         parse_value: parse_bool_value,
+        apply_effective: apply_noop,
+    },
+    SettingDescriptor {
+        name: "vector_search_objective",
+        category: "Query Tuning",
+        description: "Default dense-vector search result objective",
+        vartype: "enum",
+        context: "user",
+        unit: None,
+        default_value: |_| Value::Varchar("exact".to_string()),
+        parse_value: parse_vector_search_objective,
         apply_effective: apply_noop,
     },
     SettingDescriptor {
@@ -555,6 +566,29 @@ fn parse_string_value(_session: &Session, values: &[String]) -> Result<Value> {
         ));
     }
     Ok(Value::Varchar(values[0].clone()))
+}
+
+fn parse_disabled_optimizer_rules(_session: &Session, values: &[String]) -> Result<Value> {
+    let Value::Varchar(value) = parse_string_value(_session, values)? else {
+        unreachable!("string parser returned a non-string setting value")
+    };
+    paro_optimizer::cascades::rules::validate_transformation_rule_names(&value)?;
+    Ok(Value::Varchar(value))
+}
+
+fn parse_vector_search_objective(_session: &Session, values: &[String]) -> Result<Value> {
+    if values.len() != 1 {
+        return Err(paro_error::invalid_input(
+            "vector_search_objective expects exact or cost_optimized".to_string(),
+        ));
+    }
+    match values[0].trim().to_ascii_lowercase().as_str() {
+        "exact" => Ok(Value::Varchar("exact".to_string())),
+        "cost_optimized" => Ok(Value::Varchar("cost_optimized".to_string())),
+        value => Err(paro_error::invalid_input(format!(
+            "invalid vector_search_objective '{value}'; expected exact or cost_optimized"
+        ))),
+    }
 }
 
 fn parse_positive_integer_value(_session: &Session, values: &[String]) -> Result<Value> {
@@ -945,6 +979,60 @@ mod tests {
             .unwrap_err();
 
         assert!(err.to_string().contains("SET LOCAL"));
+    }
+
+    #[tokio::test]
+    async fn optimizer_rule_isolation_is_validated_before_session_state_changes() {
+        let instance = paro_instance::Instance::new_in_memory();
+        let mut session = crate::Session::new(1, instance);
+        let mut sink = CollectingSink::new();
+        let stmt = match paro_parser::parse("SET disabled_optimizer_rules = 'missing_rule'")
+            .unwrap()
+            .remove(0)
+            .stmt
+        {
+            paro_parser::ast::Statement::VariableSet(stmt) => stmt,
+            other => panic!("expected variable set statement, got {other:?}"),
+        };
+
+        let error = execute_variable_set(&mut session, &stmt, &mut sink)
+            .await
+            .unwrap_err();
+
+        assert!(error
+            .to_string()
+            .contains("unknown optimizer transformation"));
+        assert_eq!(
+            session.effective_setting("disabled_optimizer_rules"),
+            Some(&Value::Varchar(String::new()))
+        );
+    }
+
+    #[tokio::test]
+    async fn vector_search_objective_rejects_unknown_policy_immediately() {
+        let instance = paro_instance::Instance::new_in_memory();
+        let mut session = crate::Session::new(1, instance);
+        let mut sink = CollectingSink::new();
+        let stmt = match paro_parser::parse("SET vector_search_objective = 'approximate'")
+            .unwrap()
+            .remove(0)
+            .stmt
+        {
+            paro_parser::ast::Statement::VariableSet(stmt) => stmt,
+            other => panic!("expected variable set statement, got {other:?}"),
+        };
+
+        let error = execute_variable_set(&mut session, &stmt, &mut sink)
+            .await
+            .unwrap_err();
+
+        assert!(error
+            .to_string()
+            .contains("expected exact or cost_optimized"));
+        assert_eq!(
+            session.effective_setting("vector_search_objective"),
+            Some(&Value::Varchar("exact".to_string()))
+        );
     }
 
     #[test]
