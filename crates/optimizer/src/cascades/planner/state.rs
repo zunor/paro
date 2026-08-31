@@ -7,27 +7,48 @@ use super::*;
 
 #[derive(Debug)]
 pub(super) struct PlannerLogicalPayload {
-    /// Positional planner ABI retained only as an extraction recipe. Memo
-    /// identity comes from semantic operator/scalar keys and group contracts.
-    pub(super) extraction_template: LogicalPlan,
-    pub(super) output_estimate: Option<paro_planner::plan::CardinalityEstimate>,
+    /// Binding-based operator semantics. Positional projection maps and input
+    /// slots are derived only after winner selection.
+    pub(super) semantic_template: LogicalPlan,
     pub(super) column_stats: Arc<HashMap<ColumnBinding, Arc<ColumnStatistics>>>,
+}
+
+#[derive(Debug)]
+pub(super) enum PlannerPhysicalTemplate {
+    Logical(LogicalPayloadId),
+    Executable(Box<LogicalPlan>),
+}
+
+#[derive(Debug)]
+pub(super) struct PlannerPhysicalPayload {
+    pub(super) template: PlannerPhysicalTemplate,
 }
 
 #[derive(Debug, Default)]
 pub(super) struct PlannerPayloadArena {
     pub(super) logical: Vec<PlannerLogicalPayload>,
+    pub(super) physical: Vec<PlannerPhysicalPayload>,
 }
 
 impl PlannerPayloadArena {
-    pub(super) fn push(&mut self, payload: PlannerLogicalPayload) -> LogicalPayloadId {
+    pub(super) fn push_logical(
+        &mut self,
+        payload: PlannerLogicalPayload,
+    ) -> (LogicalPayloadId, PhysicalPayloadId) {
         let id = LogicalPayloadId::new(self.logical.len());
         self.logical.push(payload);
+        let physical = self.push_physical(PlannerPhysicalTemplate::Logical(id));
+        (id, physical)
+    }
+
+    pub(super) fn push_physical(&mut self, template: PlannerPhysicalTemplate) -> PhysicalPayloadId {
+        let id = PhysicalPayloadId::new(self.physical.len());
+        self.physical.push(PlannerPhysicalPayload { template });
         id
     }
 
-    pub(super) fn get_physical(&self, id: PhysicalPayloadId) -> Option<&PlannerLogicalPayload> {
-        self.logical.get(id.index())
+    pub(super) fn get_physical(&self, id: PhysicalPayloadId) -> Option<&PlannerPhysicalPayload> {
+        self.physical.get(id.index())
     }
 }
 
@@ -53,7 +74,8 @@ pub(super) struct PlannerTransformSavepoint {
     column_count: usize,
     scalar_count: usize,
     binding_checkpoint: usize,
-    payload_count: usize,
+    logical_payload_count: usize,
+    physical_payload_count: usize,
     expression_group_insertion_count: usize,
     metadata_runtime_filter_change_count: usize,
 }
@@ -64,7 +86,8 @@ impl PlannerTransformState {
             column_count: self.columns.len(),
             scalar_count: self.scalars.len(),
             binding_checkpoint: self.binding_ids.checkpoint(),
-            payload_count: self.payloads.logical.len(),
+            logical_payload_count: self.payloads.logical.len(),
+            physical_payload_count: self.payloads.physical.len(),
             expression_group_insertion_count: self.expression_group_insertions.len(),
             metadata_runtime_filter_change_count: self.metadata_runtime_filter_changes.len(),
         }
@@ -74,9 +97,14 @@ impl PlannerTransformState {
         self.columns.truncate(savepoint.column_count)?;
         self.scalars.truncate(savepoint.scalar_count)?;
         self.binding_ids.rollback_to(savepoint.binding_checkpoint)?;
-        self.payloads.logical.truncate(savepoint.payload_count);
+        self.payloads
+            .logical
+            .truncate(savepoint.logical_payload_count);
+        self.payloads
+            .physical
+            .truncate(savepoint.physical_payload_count);
         self.metadata
-            .retain(|payload, _| payload.index() < savepoint.payload_count);
+            .retain(|payload, _| payload.index() < savepoint.logical_payload_count);
 
         if savepoint.metadata_runtime_filter_change_count
             > self.metadata_runtime_filter_changes.len()
@@ -191,6 +219,7 @@ pub(super) struct PlannerOperatorMetadata {
     pub(super) required_region_facet: Option<Fingerprint>,
     pub(super) runtime_filter_region_facet: Option<Fingerprint>,
     pub(super) structural_retained_children: u64,
+    pub(super) baseline_payload: PhysicalPayloadId,
 }
 
 #[derive(Debug, Clone)]
@@ -204,6 +233,13 @@ pub(super) struct PlannerSearchImplementationMetadata {
 
 #[derive(Debug, Clone)]
 pub(super) struct PlannerCostFacts {
+    pub(super) child_row_widths: Box<[u64]>,
+    pub(super) output_row_width: u64,
+    pub(super) perfect_hash_slots: Option<u64>,
+}
+
+#[derive(Debug, Clone)]
+pub(super) struct ResolvedPlannerCostFacts {
     pub(super) output_rows: CompactRange,
     pub(super) child_rows: Box<[CompactRange]>,
     pub(super) output_rows_hard_upper: Option<u64>,

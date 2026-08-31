@@ -7,8 +7,7 @@ use super::*;
 
 pub(super) fn extract_planner_tree(
     memo: &Memo,
-    payloads: &PlannerPayloadArena,
-    metadata: &BTreeMap<LogicalPayloadId, PlannerOperatorMetadata>,
+    state: &PlannerTransformState,
     bind_context: &BindContext,
     root: GroupId,
     goal: OptimizationGoal,
@@ -23,6 +22,7 @@ pub(super) fn extract_planner_tree(
         enforcer_cost_input: crate::cascades::engine::EnforcerCostInput,
         base_contract: WinnerPhysicalContract,
         final_contract: WinnerPhysicalContract,
+        output_estimate: Option<paro_planner::plan::CardinalityEstimate>,
     }
 
     #[derive(Debug)]
@@ -48,7 +48,7 @@ pub(super) fn extract_planner_tree(
                 let logical = memo.logical_expr(physical.key.logical).ok_or_else(|| {
                     paro_error::internal("winner extraction lost logical expression")
                 })?;
-                let operator_metadata = metadata.get(&logical.payload).ok_or_else(|| {
+                let operator_metadata = state.metadata.get(&logical.payload).ok_or_else(|| {
                     paro_error::internal("winner extraction lost implementation metadata")
                 })?;
                 let implementation = selected_implementation_flavor(
@@ -148,6 +148,13 @@ pub(super) fn extract_planner_tree(
                     enforcer_cost_input: winner.enforcer_cost_input,
                     base_contract,
                     final_contract,
+                    output_estimate: memo.cardinality_estimate(group).map(
+                        |(min, expected, max)| paro_planner::plan::CardinalityEstimate {
+                            min,
+                            expected,
+                            max,
+                        },
+                    ),
                 })));
                 for (child, child_goal) in winner.child_goals.iter().rev() {
                     tasks.push(Task::Visit(*child, *child_goal));
@@ -162,6 +169,7 @@ pub(super) fn extract_planner_tree(
                     enforcer_cost_input,
                     base_contract,
                     final_contract,
+                    output_estimate,
                 } = *task;
                 if plans.len() < child_count {
                     return Err(paro_error::internal(
@@ -169,25 +177,40 @@ pub(super) fn extract_planner_tree(
                     ));
                 }
                 let children = plans.split_off(plans.len() - child_count);
-                let payload = payloads
+                let payload = state
+                    .payloads
                     .get_physical(payload)
                     .ok_or_else(|| paro_error::internal("unknown planner physical payload"))?;
                 let mut children = children.into_iter();
-                let mut plan = duplicate_plan_preserving_indices(
-                    &payload.extraction_template,
-                    bind_context.shared().as_ref(),
-                )
-                .try_map_children(|_| {
-                    children.next().ok_or_else(|| {
-                        paro_error::internal("physical extraction lost a child plan")
-                    })
-                })?;
+                let template = match &payload.template {
+                    PlannerPhysicalTemplate::Logical(logical) => {
+                        &state
+                            .payloads
+                            .logical
+                            .get(logical.index())
+                            .ok_or_else(|| {
+                                paro_error::internal("physical payload lost its logical semantics")
+                            })?
+                            .semantic_template
+                    }
+                    PlannerPhysicalTemplate::Executable(template) => template.as_ref(),
+                };
+                let mut plan =
+                    duplicate_plan_preserving_indices(template, bind_context.shared().as_ref())
+                        .try_map_children(|_| {
+                            children.next().ok_or_else(|| {
+                                paro_error::internal("physical extraction lost a child plan")
+                            })
+                        })?;
                 if children.next().is_some() {
                     return Err(paro_error::internal(
                         "physical extraction produced excess child plans",
                     ));
                 }
-                plan.stats.estimated_cardinality = payload.output_estimate;
+                if matches!(&payload.template, PlannerPhysicalTemplate::Logical(_)) {
+                    plan = semantic_plan::freeze_extraction_layout(plan, &output_columns, state)?;
+                }
+                anchor_output_cardinality(&mut plan, output_estimate);
                 contracts.insert(plan.id, base_contract.clone());
                 let mut provided = base_contract.provided;
                 let mut cumulative_cost = base_contract.cost;
@@ -271,6 +294,40 @@ pub(super) fn extract_planner_tree(
         ));
     }
     Ok((plans.pop().unwrap(), contracts, extracted_enforcers))
+}
+
+/// A physical winner may use a different equivalent child expression from
+/// the one named by the group's canonical estimation recipe. Anchor the
+/// selected row-preserving chain to the group estimate so EXPLAIN and later
+/// physical lowering cannot publish contradictory cardinalities for nodes
+/// that provably emit the same row domain.
+fn anchor_output_cardinality(
+    plan: &mut LogicalPlan,
+    estimate: Option<paro_planner::plan::CardinalityEstimate>,
+) {
+    plan.stats.estimated_cardinality = estimate;
+    let passthrough_child = match &plan.operator {
+        LogicalOperator::Projection(_)
+        | LogicalOperator::RowFetch(_)
+        | LogicalOperator::ExternalProject(_)
+        | LogicalOperator::Order(_)
+        | LogicalOperator::Window(_) => Some(0),
+        LogicalOperator::MaterializedCTE(_) => Some(1),
+        _ => None,
+    };
+    let Some(target) = passthrough_child else {
+        return;
+    };
+    let mut ordinal = 0;
+    let _ = plan.visit_children_mut(|child| {
+        if ordinal == target {
+            anchor_output_cardinality(child, estimate);
+            std::ops::ControlFlow::Break(())
+        } else {
+            ordinal += 1;
+            std::ops::ControlFlow::Continue(())
+        }
+    });
 }
 
 pub(super) fn extract_physical_enforcer(

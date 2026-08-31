@@ -10,8 +10,8 @@ use paro_common::runtime_value::Value;
 use paro_common::types::LogicalType;
 use paro_function::aggregate::distributive::count::get_count_star_function;
 use paro_planner::expression::{
-    AggregateExpression, ConstantExpression, Expression, ReferenceExpression, WindowExpression,
-    WindowFrame,
+    AggregateExpression, ColumnRefExpression, ConstantExpression, Expression, ReferenceExpression,
+    WindowExpression, WindowFrame,
 };
 use paro_planner::operator::join::{Join, JoinCondition, JoinType};
 use paro_planner::operator::{
@@ -65,7 +65,7 @@ fn cross_product_memory_tracks_only_the_materialized_build_side() {
 
 #[test]
 fn calibrated_tuple_work_distinguishes_narrow_and_wide_intermediates() {
-    let facts = |width| PlannerCostFacts {
+    let facts = |width| ResolvedPlannerCostFacts {
         output_rows: CompactRange::point(1_000.0).unwrap(),
         child_rows: vec![CompactRange::point(1_000.0).unwrap()].into_boxed_slice(),
         output_rows_hard_upper: Some(1_000),
@@ -74,7 +74,7 @@ fn calibrated_tuple_work_distinguishes_narrow_and_wide_intermediates() {
         output_row_width: width,
         perfect_hash_slots: None,
     };
-    let calibrated_cost = |facts: &PlannerCostFacts| {
+    let calibrated_cost = |facts: &ResolvedPlannerCostFacts| {
         let mut work = LocalOperatorWork::default();
         add_tuple_byte_work(&mut work, facts).unwrap();
         MachineCalibrationBundle::default().fold(&work).unwrap()
@@ -87,6 +87,51 @@ fn calibrated_tuple_work_distinguishes_narrow_and_wide_intermediates() {
         wide.resources_expected[ResourceDimension::MemoryRead as usize]
             > narrow.resources_expected[ResourceDimension::MemoryRead as usize]
     );
+}
+
+#[test]
+fn expression_cost_facts_read_current_group_cardinality() {
+    let schema = GroupSchema::new([super::super::column::ColumnDesc {
+        id: ColumnId::new(0),
+        logical_type: LogicalType::BigInt,
+        nullable: false,
+        origin: ColumnOrigin::Derived {
+            key: Fingerprint(1),
+        },
+        visibility: ColumnVisibility::Visible,
+        name_hint: None,
+    }])
+    .unwrap();
+    let mut memo = Memo::new(SearchBudget::default());
+    let child = memo.create_group(
+        schema.clone(),
+        LogicalProperties::default(),
+        GroupCardinality::new(
+            Fingerprint(1),
+            CardinalityAuthority::Statistics,
+            80,
+            100,
+            120,
+        ),
+    );
+    let parent = memo.create_group(
+        schema,
+        LogicalProperties::default(),
+        GroupCardinality::new(Fingerprint(2), CardinalityAuthority::Statistics, 8, 10, 12),
+    );
+    let template = PlannerCostFacts {
+        child_row_widths: vec![16].into_boxed_slice(),
+        output_row_width: 16,
+        perfect_hash_slots: None,
+    };
+
+    let initial = expression_cost_facts(&memo, parent, &[child], &template).unwrap();
+    assert_eq!(initial.child_rows[0].expected, 100.0);
+
+    memo.group_mut(child).unwrap().cardinality =
+        GroupCardinality::new(Fingerprint(3), CardinalityAuthority::JoinRegion, 4, 5, 6);
+    let refined = expression_cost_facts(&memo, parent, &[child], &template).unwrap();
+    assert_eq!(refined.child_rows[0].expected, 5.0);
 }
 
 #[test]
@@ -200,7 +245,7 @@ fn cte_owner_is_part_of_the_query_ir_fingerprint() {
 }
 
 #[test]
-fn memo_round_trip_preserves_tree_shape_without_positional_repair() {
+fn memo_round_trip_derives_layout_after_winner_selection() {
     let bind_context = BindContext::new();
     let leaf = LogicalPlan::dummy_scan(&bind_context);
     let wrapped = LogicalPlan::new(
@@ -285,7 +330,7 @@ fn calibration_revision_can_change_the_selected_physical_algorithm() {
             &bind_context,
             LogicalOperator::ExpressionGet(ExpressionGet::new(
                 0,
-                vec![],
+                integer_value_rows(512, 2),
                 vec!["lower".to_string(), "upper".to_string()],
                 vec![LogicalType::Integer, LogicalType::Integer],
             )),
@@ -295,7 +340,7 @@ fn calibration_revision_can_change_the_selected_physical_algorithm() {
             &bind_context,
             LogicalOperator::ExpressionGet(ExpressionGet::new(
                 1,
-                vec![],
+                integer_value_rows(512, 1),
                 vec!["point".to_string()],
                 vec![LogicalType::Integer],
             )),
@@ -367,7 +412,7 @@ fn memo_window_winner_is_the_node_lowered_by_the_physical_extractor() {
         &bind_context,
         LogicalOperator::ExpressionGet(ExpressionGet::new(
             0,
-            vec![],
+            integer_value_rows(1_024, 2),
             vec!["grp".to_string(), "value".to_string()],
             vec![LogicalType::Integer, LogicalType::Integer],
         )),
@@ -415,12 +460,143 @@ fn memo_window_winner_is_the_node_lowered_by_the_physical_extractor() {
     ));
 }
 
-fn test_base_get(table_index: usize, oid: u64, name: &str) -> LogicalPlan {
+#[test]
+fn mark_join_to_semi_is_an_explicit_isolatable_transformation() {
+    fn plan(bind_context: &BindContext) -> LogicalPlan {
+        let left = LogicalPlan::new(
+            bind_context,
+            LogicalOperator::ExpressionGet(ExpressionGet::new(
+                0,
+                integer_value_rows(1, 1),
+                vec!["left".to_string()],
+                vec![LogicalType::Integer],
+            )),
+        );
+        let right = LogicalPlan::new(
+            bind_context,
+            LogicalOperator::ExpressionGet(ExpressionGet::new(
+                1,
+                integer_value_rows(1, 1),
+                vec!["right".to_string()],
+                vec![LogicalType::Integer],
+            )),
+        );
+        let column = |table_index, logical_type| {
+            Expression::ColumnRef(ColumnRefExpression::new(
+                ColumnBinding::new(table_index, 0),
+                logical_type,
+            ))
+        };
+        let mut join = ComparisonJoin::new(
+            JoinType::Mark,
+            left,
+            right,
+            vec![JoinCondition::equality(
+                column(0, LogicalType::Integer),
+                column(1, LogicalType::Integer),
+            )],
+        );
+        let mark_index = 90;
+        join.mark_index = Some(mark_index);
+        let filter = LogicalPlan::new(
+            bind_context,
+            LogicalOperator::Filter(Filter::new(
+                LogicalPlan::new(bind_context, LogicalOperator::Join(Join::Comparison(join))),
+                vec![column(mark_index, LogicalType::Boolean)],
+            )),
+        );
+        LogicalPlan::new(
+            bind_context,
+            LogicalOperator::Projection(Projection::new(
+                91,
+                filter,
+                vec![column(0, LogicalType::Integer)],
+            )),
+        )
+    }
+
+    fn optimize(budget: SearchBudget) -> OptimizationOutput {
+        let session = crate::subquery::partition_aggregate_tests::setup_session();
+        let binder = Binder::new(session.clone());
+        let context =
+            crate::context::OptimizationContext::new(session, binder.bind_context.clone());
+        MemoBuilder::build_with_search(
+            vec![LogicalAlternative {
+                plan: plan(&binder.bind_context),
+                source: AlternativeOrigin::Baseline,
+                column_stats: Arc::new(HashMap::new()),
+            }],
+            &binder,
+            budget,
+            &context,
+        )
+        .unwrap()
+        .optimize(&test_grant_classes())
+        .unwrap()
+    }
+
+    fn selected_join_type(output: &OptimizationOutput) -> JoinType {
+        fn find(plan: &LogicalPlan) -> Option<JoinType> {
+            if let LogicalOperator::Join(Join::Comparison(join)) = &plan.operator {
+                return Some(join.join_type);
+            }
+            plan.children().into_iter().find_map(find)
+        }
+        find(&output.variants[0].plan).expect("optimized plan must retain the comparison join")
+    }
+
+    let enabled = optimize(SearchBudget::default());
+    assert_eq!(selected_join_type(&enabled), JoinType::Semi);
+    assert!(enabled
+        .rule_attempts
+        .get(&MARK_JOIN_TO_SEMI_RULE)
+        .is_some_and(|attempts| *attempts > 0));
+    assert!(enabled
+        .rule_insertions
+        .get(&MARK_JOIN_TO_SEMI_RULE)
+        .is_some_and(|insertions| *insertions > 0));
+
+    let mut disabled_budget = SearchBudget::default();
+    disabled_budget.disable_transformation(MARK_JOIN_TO_SEMI_RULE);
+    let disabled = optimize(disabled_budget);
+    assert_eq!(selected_join_type(&disabled), JoinType::Mark);
+    assert!(!disabled.rule_attempts.contains_key(&MARK_JOIN_TO_SEMI_RULE));
+    assert!(!disabled
+        .rule_insertions
+        .contains_key(&MARK_JOIN_TO_SEMI_RULE));
+}
+
+fn integer_value_rows(rows: usize, columns: usize) -> Vec<Vec<Expression>> {
+    (0..rows)
+        .map(|_| {
+            (0..columns)
+                .map(|_| {
+                    Expression::Constant(ConstantExpression::new(
+                        Value::Integer(0),
+                        LogicalType::Integer,
+                    ))
+                })
+                .collect()
+        })
+        .collect()
+}
+
+fn test_base_get(table_index: usize, oid: u64, name: &str, rows: usize) -> LogicalPlan {
     let storage = Arc::new(
         TableFactory::default()
             .create_table(&[LogicalType::Integer])
             .expect("table storage"),
     );
+    let mut remaining = rows;
+    while remaining > 0 {
+        let chunk_rows = remaining.min(paro_common::vector::VECTOR_SIZE);
+        storage
+            .append(&paro_common::test_utils::test_chunk_from_vectors(vec![
+                paro_common::test_utils::test_i32_vector(&vec![0; chunk_rows]),
+            ]))
+            .expect("populate test table");
+        remaining -= chunk_rows;
+    }
     let table = Arc::new(TableCatalogEntry::new(
         "paro".to_string(),
         "public".to_string(),
@@ -443,9 +619,9 @@ fn test_base_get(table_index: usize, oid: u64, name: &str) -> LogicalPlan {
 
 #[test]
 fn direct_rowset_reference_admits_and_selects_runtime_filter_region() {
-    let mut left = test_base_get(0, 20_001, "probe");
+    let mut left = test_base_get(0, 20_001, "probe", 20_000);
     left.stats.estimated_cardinality = Some(CardinalityEstimate::exact(20_000));
-    let mut right = test_base_get(1, 20_002, "build");
+    let mut right = test_base_get(1, 20_002, "build", 20);
     right.stats.estimated_cardinality = Some(CardinalityEstimate::exact(20));
     let condition = JoinCondition::equality(
         Expression::Reference(ReferenceExpression::new(0, LogicalType::Integer)),
@@ -497,9 +673,9 @@ fn direct_rowset_reference_admits_and_selects_runtime_filter_region() {
 
 #[test]
 fn oversized_optional_runtime_filter_facet_yields_to_the_baseline() {
-    let mut left = test_base_get(0, 20_011, "probe");
+    let mut left = test_base_get(0, 20_011, "probe", 20_000);
     left.stats.estimated_cardinality = Some(CardinalityEstimate::exact(20_000));
-    let mut right = test_base_get(1, 20_012, "build");
+    let mut right = test_base_get(1, 20_012, "build", 20);
     right.stats.estimated_cardinality = Some(CardinalityEstimate::exact(20));
     let mut plan = LogicalPlan::synthetic(LogicalOperator::Join(Join::Comparison(
         ComparisonJoin::new(
@@ -533,10 +709,10 @@ fn oversized_optional_runtime_filter_facet_yields_to_the_baseline() {
 #[test]
 fn fully_pushable_filter_probe_requires_the_pushdown_compile_capability() {
     let left = LogicalPlan::synthetic(LogicalOperator::Filter(Filter::new(
-        test_base_get(0, 20_003, "filtered_probe"),
+        test_base_get(0, 20_003, "filtered_probe", 0),
         Vec::new(),
     )));
-    let right = test_base_get(1, 20_004, "build");
+    let right = test_base_get(1, 20_004, "build", 0);
     let join = ComparisonJoin::new(
         JoinType::Inner,
         left,
@@ -553,16 +729,18 @@ fn fully_pushable_filter_probe_requires_the_pushdown_compile_capability() {
 
 #[test]
 fn passthrough_projection_keeps_the_runtime_filter_consumer_lineage() {
+    let mut probe = test_base_get(0, 20_005, "projected_probe", 20_000);
+    probe.stats.estimated_cardinality = Some(CardinalityEstimate::exact(20_000));
     let mut left = LogicalPlan::synthetic(LogicalOperator::Projection(Projection::new(
         2,
-        test_base_get(0, 20_005, "projected_probe"),
+        probe,
         vec![Expression::Reference(ReferenceExpression::new(
             0,
             LogicalType::Integer,
         ))],
     )));
     left.stats.estimated_cardinality = Some(CardinalityEstimate::exact(20_000));
-    let mut right = test_base_get(1, 20_006, "build");
+    let mut right = test_base_get(1, 20_006, "build", 20);
     right.stats.estimated_cardinality = Some(CardinalityEstimate::exact(20));
     let join = ComparisonJoin::new(
         JoinType::Inner,
@@ -577,13 +755,29 @@ fn passthrough_projection_keeps_the_runtime_filter_consumer_lineage() {
     let mut plan = LogicalPlan::synthetic(LogicalOperator::Join(Join::Comparison(join)));
     plan.stats.estimated_cardinality = Some(CardinalityEstimate::exact(20));
 
-    let optimized = MemoBuilder::build(plan, BindContext::new(), SearchBudget::default())
-        .unwrap()
+    let mut budget = SearchBudget::default();
+    budget.max_composite_region_groups = 4;
+    let input = MemoBuilder::build(plan, BindContext::new(), budget).unwrap();
+    assert!(input.memo.regions().nodes.iter().any(|region| {
+        region
+            .facets
+            .iter()
+            .any(|facet| facet.kind == RegionFacetKind::RuntimeFilter)
+    }));
+    let optimized = input
         .optimize(&test_grant_classes())
         .unwrap()
         .variants
         .into_vec()
         .remove(0);
+    assert_eq!(
+        optimized
+            .contracts
+            .get(&optimized.plan.id)
+            .unwrap()
+            .implementation,
+        PhysicalImplementationFlavor::HashJoinRuntimeFilter
+    );
     let physical =
         crate::physical::PhysicalPlanExtractor::new(crate::physical::ExtractionContext::default())
             .with_winner_contracts(optimized.contracts)

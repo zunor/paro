@@ -32,6 +32,11 @@ pub(super) fn matches_transformation(
                 || (matches!(operator, Op::Projection | Op::Filter)
                     && canonical_subtree_operator_count(expr, memo, state, Op::Aggregate) >= 2)
         }
+        PlannerTransformation::MarkJoinToSemi => {
+            canonical_subtree_expression_any(expr, memo, |candidate| {
+                is_positive_consumed_mark_filter(candidate, memo, state)
+            })
+        }
         PlannerTransformation::JoinElimination => {
             matches!(
                 operator,
@@ -97,6 +102,34 @@ pub(super) fn matches_transformation(
                 && canonical_subtree_has_scalar_aggregate_join(expr, memo, state)
         }
     }
+}
+
+fn is_positive_consumed_mark_filter(
+    expr: &crate::cascades::memo::LogicalExpr,
+    memo: &Memo,
+    state: &PlannerTransformState,
+) -> bool {
+    let Some(LogicalOperator::Filter(filter)) = payload_operator(expr, state) else {
+        return false;
+    };
+    let [Expression::ColumnRef(marker)] = filter.expressions.as_slice() else {
+        return false;
+    };
+    let Some(child) = expr
+        .key
+        .children
+        .first()
+        .and_then(|child| canonical_expression(*child, memo))
+    else {
+        return false;
+    };
+    matches!(payload_operator(child, state),
+    Some(LogicalOperator::Join(Join::Comparison(join)))
+        if join.join_type == JoinType::Mark
+            && marker.depth == 0
+            && join.mark_index.is_some_and(|index| {
+                marker.binding == ColumnBinding::new(index, 0)
+            }))
 }
 
 fn canonical_subtree_has_late_payload_shape(
@@ -201,7 +234,7 @@ fn payload_operator<'a>(
         .payloads
         .logical
         .get(expr.payload.index())
-        .map(|payload| &payload.extraction_template.operator)
+        .map(|payload| &payload.semantic_template.operator)
 }
 
 fn canonical_expression(

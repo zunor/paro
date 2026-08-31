@@ -6,6 +6,7 @@
 from __future__ import annotations
 
 import argparse
+import re
 from pathlib import Path
 import sys
 import tomllib
@@ -56,10 +57,19 @@ def _validate(payload: dict) -> None:
     artifact = payload["artifact"]
     if artifact["provenance"] not in {"bootstrap", "measured"}:
         raise ValueError("calibration provenance must be bootstrap or measured")
-    workload_name = artifact["source_workload"]
+    workload_name = artifact["validation_workload"]
     workload_path = REPO_ROOT / f"benchmark/workloads/{workload_name}/workload.toml"
     workload = tomllib.loads(workload_path.read_text())
     query_ids = {query["id"] for query in workload.get("query", [])}
+    if artifact["provenance"] == "measured":
+        measurement = payload.get("measurement")
+        if not isinstance(measurement, dict):
+            raise ValueError("measured calibration requires a measurement record")
+        if not re.fullmatch(r"[0-9a-f]{64}", measurement.get("result_sha256", "")):
+            raise ValueError("measurement result_sha256 must be a lowercase SHA-256")
+        for field in ("observed_at", "git_commit", "result_file"):
+            if not measurement.get(field):
+                raise ValueError(f"measurement record is missing {field}")
 
     coefficients = payload.get("coefficient", [])
     ids = [int(coefficient["id"]) for coefficient in coefficients]
@@ -86,7 +96,11 @@ def _validate(payload: dict) -> None:
             raise ValueError(
                 f"invalid risk/latency envelope for class {coefficient['id']}"
             )
-        unknown_queries = set(coefficient.get("source_queries", [])) - query_ids
+        if "source_queries" in coefficient:
+            raise ValueError(
+                "source_queries falsely implies measured provenance; use validation_queries"
+            )
+        unknown_queries = set(coefficient.get("validation_queries", [])) - query_ids
         if unknown_queries:
             raise ValueError(
                 f"class {coefficient['id']} references unknown corpus queries: "
@@ -117,10 +131,10 @@ def _render(payload: dict) -> str:
         "pub(super) const COEFFICIENTS: &[BuiltinCoefficient] = &[",
     ]
     for coefficient in coefficients:
-        sources = ", ".join(coefficient.get("source_queries", []))
+        validations = ", ".join(coefficient.get("validation_queries", []))
         lines.extend(
             [
-                f"    // {coefficient['name']}: {sources}",
+                f"    // {coefficient['name']}; coverage queries: {validations}",
                 "    BuiltinCoefficient {",
                 f"        class: OpClassId({int(coefficient['id'])}),",
                 f"        dimension: ResourceDimension::{coefficient['dimension']},",

@@ -4,6 +4,7 @@
 //! Stable rule and implementation registries used by Direct and Memo search.
 
 use std::collections::BTreeMap;
+use std::sync::{Arc, RwLock};
 
 use paro_common::error::{self as paro_error, Result};
 
@@ -22,6 +23,7 @@ pub const EXPENSIVE_PREDICATE_PLACEMENT_RULE: RuleId = RuleId(10_006);
 pub const CTE_INLINE_RULE: RuleId = RuleId(10_007);
 pub const CTE_FILTER_PUSHDOWN_RULE: RuleId = RuleId(10_008);
 pub const AGGREGATE_POST_REDUCTION_RULE: RuleId = RuleId(10_009);
+pub const MARK_JOIN_TO_SEMI_RULE: RuleId = RuleId(10_010);
 pub const JOIN_ELIMINATION_RULE: RuleId = RuleId(10_011);
 pub const AGGREGATE_JOIN_PREAGGREGATION_RULE: RuleId = RuleId(10_012);
 pub const AGGREGATE_JOIN_SUBSUMPTION_RULE: RuleId = RuleId(10_013);
@@ -40,6 +42,7 @@ const TRANSFORMATION_RULE_NAMES: &[(RuleId, &str)] = &[
     (CTE_INLINE_RULE, "cte_inline"),
     (CTE_FILTER_PUSHDOWN_RULE, "cte_filter_pushdown"),
     (AGGREGATE_POST_REDUCTION_RULE, "aggregate_post_reduction"),
+    (MARK_JOIN_TO_SEMI_RULE, "mark_join_to_semi"),
     (JOIN_ELIMINATION_RULE, "join_elimination"),
     (
         AGGREGATE_JOIN_PREAGGREGATION_RULE,
@@ -106,6 +109,8 @@ pub struct EquivalentExpression {
     pub target_group: GroupId,
     pub key: LogicalExprKey,
     pub payload: LogicalPayloadId,
+    pub logical_properties: super::memo::LogicalProperties,
+    pub cardinality: super::memo::GroupCardinality,
     pub proof: EquivalenceProof,
 }
 
@@ -159,23 +164,58 @@ impl<'a> TransformContext<'a> {
         self.sidecar_rollbacks.push(Box::new(rollback));
     }
 
+    /// Mutate Memo and one optimizer-owned sidecar under a single attempt.
+    /// The sidecar rollback is registered before either state can be written,
+    /// and the mutation closure receives the write guard directly so it never
+    /// needs to re-enter the same lock.
+    pub fn with_sidecar_transaction<S, Savepoint, Output>(
+        &mut self,
+        sidecar: Arc<RwLock<S>>,
+        savepoint: impl FnOnce(&S) -> Savepoint,
+        rollback: impl FnOnce(&mut S, Savepoint) -> Result<()> + Send + 'static,
+        mutate: impl FnOnce(&mut Memo, &mut S) -> Result<Output>,
+    ) -> Result<Output>
+    where
+        S: Send + Sync + 'static,
+        Savepoint: Send + 'static,
+    {
+        let mut state = sidecar
+            .write()
+            .map_err(|_| paro_error::internal("transformation sidecar state poisoned"))?;
+        let checkpoint = savepoint(&state);
+        let rollback_state = sidecar.clone();
+        self.enlist_rollback(move || {
+            let mut state = rollback_state.write().map_err(|_| {
+                paro_error::internal("transformation sidecar state poisoned during rollback")
+            })?;
+            rollback(&mut state, checkpoint)
+        });
+        if self.memo_savepoint.is_none() {
+            self.memo_savepoint = Some(self.memo.transformation_savepoint());
+        }
+        mutate(self.memo, &mut state)
+    }
+
     pub(crate) fn rollback(mut self) -> Result<()> {
-        let mut first_error = None;
+        let mut failures = Vec::new();
         while let Some(rollback) = self.sidecar_rollbacks.pop() {
             if let Err(error) = rollback() {
-                if first_error.is_none() {
-                    first_error = Some(error);
-                }
+                failures.push(format!("sidecar rollback failed: {error}"));
             }
         }
         if let Some(savepoint) = self.memo_savepoint.take() {
             if let Err(error) = self.memo.rollback_transformation(savepoint) {
-                if first_error.is_none() {
-                    first_error = Some(error);
-                }
+                failures.push(format!("Memo rollback failed: {error}"));
             }
         }
-        first_error.map_or(Ok(()), Err)
+        if failures.is_empty() {
+            Ok(())
+        } else {
+            Err(paro_error::internal(format!(
+                "transformation transaction rollback left inconsistent state: {}",
+                failures.join("; ")
+            )))
+        }
     }
 
     pub(crate) fn commit(mut self) -> Result<Box<[GroupId]>> {

@@ -123,7 +123,8 @@ mod tests {
     use crate::cascades::column::{ColumnDesc, ColumnOrigin, ColumnVisibility, GroupSchema};
     use crate::cascades::ids::{ColumnId, LogicalExprId, LogicalPayloadId};
     use crate::cascades::memo::{
-        EquivalenceProof, LogicalExpr, LogicalExprKey, LogicalProperties, OptimizationGoal,
+        EquivalenceProof, GroupCardinality, LogicalExpr, LogicalExprKey, LogicalProperties,
+        OptimizationGoal,
     };
     use crate::cascades::rules::{PhysicalCandidate, PhysicalImplementation};
 
@@ -142,6 +143,7 @@ mod tests {
             }])
             .unwrap(),
             LogicalProperties::default(),
+            GroupCardinality::default(),
         );
         memo.insert_logical(
             group,

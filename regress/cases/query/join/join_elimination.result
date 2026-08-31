@@ -130,3 +130,4 @@ memo_group_count	search_counter	true
 memo_logical_expression_count	search_counter	true
 memo_physical_expression_count	search_counter	true
 join_elimination	transformation_rule	true
+join_elimination	transformation_rule_attempt	true

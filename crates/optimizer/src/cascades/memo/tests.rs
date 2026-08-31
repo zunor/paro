@@ -60,7 +60,11 @@ fn required() -> RequiredProperties {
 #[test]
 fn rule_history_is_expression_local_and_duplicate_expr_is_deduped() {
     let mut memo = Memo::new(SearchBudget::default());
-    let group = memo.create_group(schema(1), LogicalProperties::default());
+    let group = memo.create_group(
+        schema(1),
+        LogicalProperties::default(),
+        GroupCardinality::default(),
+    );
     let key = LogicalExprKey {
         operator: Fingerprint(10),
         scalars: Box::new([]),
@@ -90,7 +94,11 @@ fn rule_history_is_expression_local_and_duplicate_expr_is_deduped() {
 #[test]
 fn winner_is_keyed_by_goal_and_uses_stable_tie_break() {
     let mut memo = Memo::new(SearchBudget::default());
-    let group = memo.create_group(schema(1), LogicalProperties::default());
+    let group = memo.create_group(
+        schema(1),
+        LogicalProperties::default(),
+        GroupCardinality::default(),
+    );
     let logical = memo
         .insert_logical(
             group,
@@ -179,7 +187,11 @@ fn winner_is_keyed_by_goal_and_uses_stable_tie_break() {
 #[test]
 fn exact_tie_keeps_the_mandatory_expression_ahead_of_ephemeral_fingerprints() {
     let mut memo = Memo::new(SearchBudget::default());
-    let group = memo.create_group(schema(1), LogicalProperties::default());
+    let group = memo.create_group(
+        schema(1),
+        LogicalProperties::default(),
+        GroupCardinality::default(),
+    );
     let baseline_logical = memo
         .insert_logical(
             group,
@@ -282,7 +294,11 @@ fn winner_frontier_retains_non_dominated_resource_tradeoffs() {
     let mut budget = SearchBudget::default();
     budget.max_pareto_winners_per_goal = 4;
     let mut memo = Memo::new(budget);
-    let group = memo.create_group(schema(1), LogicalProperties::default());
+    let group = memo.create_group(
+        schema(1),
+        LogicalProperties::default(),
+        GroupCardinality::default(),
+    );
     let logical = memo
         .insert_logical(
             group,
@@ -355,8 +371,16 @@ fn winner_frontier_retains_non_dominated_resource_tradeoffs() {
 #[test]
 fn group_merge_rejects_output_contract_change() {
     let mut memo = Memo::new(SearchBudget::default());
-    let left = memo.create_group(schema(1), LogicalProperties::default());
-    let right = memo.create_group(schema(2), LogicalProperties::default());
+    let left = memo.create_group(
+        schema(1),
+        LogicalProperties::default(),
+        GroupCardinality::default(),
+    );
+    let right = memo.create_group(
+        schema(2),
+        LogicalProperties::default(),
+        GroupCardinality::default(),
+    );
     assert!(memo.merge_groups(left, right).is_err());
 }
 
@@ -367,8 +391,8 @@ fn group_merge_intersects_independently_proven_cardinality_bounds() {
     loose.maximum_cardinality = Some(16);
     let mut tight = LogicalProperties::default();
     tight.maximum_cardinality = Some(4);
-    let left = memo.create_group(schema(1), loose);
-    let right = memo.create_group(schema(1), tight);
+    let left = memo.create_group(schema(1), loose, GroupCardinality::default());
+    let right = memo.create_group(schema(1), tight, GroupCardinality::default());
 
     let group = memo.merge_groups(left, right).unwrap();
 
@@ -382,9 +406,65 @@ fn group_merge_intersects_independently_proven_cardinality_bounds() {
 }
 
 #[test]
+fn canonical_cardinality_recipe_is_order_independent_and_authority_aware() {
+    let statistics_a =
+        GroupCardinality::new(Fingerprint(20), CardinalityAuthority::Statistics, 4, 9, 14);
+    let statistics_b =
+        GroupCardinality::new(Fingerprint(10), CardinalityAuthority::Statistics, 5, 5, 8);
+    let forward = statistics_a.canonical_with(statistics_b);
+    let reverse = statistics_b.canonical_with(statistics_a);
+    assert_eq!(forward, reverse);
+    assert_eq!(forward.representative(), Some((5, 5, 8)));
+
+    let region = GroupCardinality::new(Fingerprint(30), CardinalityAuthority::JoinRegion, 5, 6, 7);
+    assert_eq!(forward.canonical_with(region), region);
+    assert_eq!(region.canonical_with(forward), region);
+
+    let inherited = GroupCardinality::inherit(Fingerprint(40), GroupId::new(1));
+    let mut refined = GroupCardinality::inherit(Fingerprint(50), GroupId::new(2));
+    refined.authority = CardinalityAuthority::ConstraintRefined;
+    assert_eq!(inherited.canonical_with(refined), refined);
+    assert_eq!(refined.canonical_with(inherited), refined);
+}
+
+#[test]
+fn inherited_cardinality_tracks_child_and_respects_group_hard_bound() {
+    let mut memo = Memo::new(SearchBudget::default());
+    let child = memo.create_group(
+        schema(1),
+        LogicalProperties::default(),
+        GroupCardinality::new(
+            Fingerprint(1),
+            CardinalityAuthority::Statistics,
+            80,
+            100,
+            120,
+        ),
+    );
+    let parent = memo.create_group(
+        schema(1),
+        LogicalProperties {
+            maximum_cardinality: Some(90),
+            ..LogicalProperties::default()
+        },
+        GroupCardinality::inherit(Fingerprint(2), child),
+    );
+
+    assert_eq!(memo.cardinality_estimate(parent), Some((80, 90, 90)));
+
+    memo.group_mut(child).unwrap().cardinality =
+        GroupCardinality::new(Fingerprint(3), CardinalityAuthority::JoinRegion, 4, 5, 6);
+    assert_eq!(memo.cardinality_estimate(parent), Some((4, 5, 6)));
+}
+
+#[test]
 fn winner_recording_recomputes_local_cost_instead_of_trusting_total() {
     let mut memo = Memo::new(SearchBudget::default());
-    let group = memo.create_group(schema(1), LogicalProperties::default());
+    let group = memo.create_group(
+        schema(1),
+        LogicalProperties::default(),
+        GroupCardinality::default(),
+    );
     let logical = memo
         .insert_logical(
             group,

@@ -16,7 +16,7 @@ use crate::cascades::ids::{
     PhysicalPayloadId,
 };
 use crate::cascades::memo::{
-    GrantGoalKey, LogicalExprKey, LogicalProperties, PhysicalExprKey, RowGoal,
+    GrantGoalKey, GroupCardinality, LogicalExprKey, LogicalProperties, PhysicalExprKey, RowGoal,
 };
 use crate::cascades::properties::{
     MutationSafetyRequirement, OrderingRequirement, PartitioningRequirement,
@@ -106,6 +106,8 @@ impl TransformationRule for AddEquivalent {
                 children: Box::new([]),
             },
             payload: LogicalPayloadId(1),
+            logical_properties: LogicalProperties::default(),
+            cardinality: GroupCardinality::default(),
             proof: EquivalenceProof::Transformation {
                 rule: self.id(),
                 source: expr,
@@ -132,8 +134,11 @@ impl TransformationRule for FailAfterMemoWrite {
         _: LogicalExprId,
         ctx: &mut TransformContext<'_>,
     ) -> Result<Box<[EquivalentExpression]>> {
-        ctx.memo_mut()
-            .create_group(schema(), LogicalProperties::default());
+        ctx.memo_mut().create_group(
+            schema(),
+            LogicalProperties::default(),
+            GroupCardinality::default(),
+        );
         Err(paro_error::internal("injected optional-rule failure"))
     }
 }
@@ -158,6 +163,8 @@ impl TransformationRule for DuplicateEquivalent {
             target_group: ctx.group(),
             key: ctx.memo().logical_expr(expr).unwrap().key.clone(),
             payload: LogicalPayloadId(0),
+            logical_properties: LogicalProperties::default(),
+            cardinality: GroupCardinality::default(),
             proof: EquivalenceProof::Transformation {
                 rule: self.id(),
                 source: expr,
@@ -184,9 +191,11 @@ impl TransformationRule for AddEquivalentWithNewChild {
         expr: LogicalExprId,
         ctx: &mut TransformContext<'_>,
     ) -> Result<Box<[EquivalentExpression]>> {
-        let child = ctx
-            .memo_mut()
-            .create_group(schema(), LogicalProperties::default());
+        let child = ctx.memo_mut().create_group(
+            schema(),
+            LogicalProperties::default(),
+            GroupCardinality::default(),
+        );
         ctx.memo_mut().insert_logical(
             child,
             LogicalExprKey {
@@ -205,6 +214,8 @@ impl TransformationRule for AddEquivalentWithNewChild {
                 children: Box::new([child]),
             },
             payload: LogicalPayloadId(4),
+            logical_properties: LogicalProperties::default(),
+            cardinality: GroupCardinality::default(),
             proof: EquivalenceProof::Transformation {
                 rule: self.id(),
                 source: expr,
@@ -239,6 +250,8 @@ impl TransformationRule for RewriteNewChild {
                 children: Box::new([]),
             },
             payload: LogicalPayloadId(5),
+            logical_properties: LogicalProperties::default(),
+            cardinality: GroupCardinality::default(),
             proof: EquivalenceProof::Transformation {
                 rule: self.id(),
                 source: expr,
@@ -267,9 +280,11 @@ impl TransformationRule for RejectAfterSidecarWrite {
         expr: LogicalExprId,
         ctx: &mut TransformContext<'_>,
     ) -> Result<Box<[EquivalentExpression]>> {
-        let target = ctx
-            .memo_mut()
-            .create_group(schema(), LogicalProperties::default());
+        let target = ctx.memo_mut().create_group(
+            schema(),
+            LogicalProperties::default(),
+            GroupCardinality::default(),
+        );
         self.sidecar.fetch_add(1, Ordering::SeqCst);
         let sidecar = self.sidecar.clone();
         ctx.enlist_rollback(move || {
@@ -284,6 +299,8 @@ impl TransformationRule for RejectAfterSidecarWrite {
                 children: Box::new([]),
             },
             payload: LogicalPayloadId(2),
+            logical_properties: LogicalProperties::default(),
+            cardinality: GroupCardinality::default(),
             proof: EquivalenceProof::Transformation {
                 rule: self.id(),
                 source: expr,
@@ -354,7 +371,11 @@ fn engine_with_budget(
     budget: super::super::budget::SearchBudget,
 ) -> (CascadesEngine, GroupId, OptimizationGoal) {
     let mut memo = Memo::new(budget);
-    let group = memo.create_group(schema(), LogicalProperties::default());
+    let group = memo.create_group(
+        schema(),
+        LogicalProperties::default(),
+        GroupCardinality::default(),
+    );
     memo.insert_logical(
         group,
         LogicalExprKey {
@@ -482,6 +503,8 @@ fn duplicate_transformation_does_not_mutate_existing_proofs() {
         engine.memo.logical_expr(expression).unwrap().proofs,
         proofs_before
     );
+    assert_eq!(engine.rule_attempts().get(&RuleId(8)), Some(&1));
+    assert!(!engine.effective_rule_insertions().contains_key(&RuleId(8)));
 }
 
 #[test]
@@ -510,6 +533,8 @@ fn committed_child_groups_are_scheduled_for_exploration() {
         engine.effective_rule_insertions().get(&RuleId(21)),
         Some(&1)
     );
+    assert_eq!(engine.rule_attempts().get(&RuleId(20)), Some(&1));
+    assert_eq!(engine.rule_attempts().get(&RuleId(21)), Some(&1));
 }
 
 #[test]
@@ -547,6 +572,8 @@ impl TransformationRule for ReplaceInfeasibleBranch {
                 children: Box::new([]),
             },
             payload: LogicalPayloadId(2),
+            logical_properties: LogicalProperties::default(),
+            cardinality: GroupCardinality::default(),
             proof: EquivalenceProof::Transformation {
                 rule: self.id(),
                 source: expr,
@@ -612,7 +639,11 @@ impl PhysicalImplementation for FeasibleAlternativeImplementation {
 #[test]
 fn infeasible_child_rejects_only_its_parent_recipe() {
     let mut memo = Memo::new(super::super::budget::SearchBudget::default());
-    let child = memo.create_group(schema(), LogicalProperties::default());
+    let child = memo.create_group(
+        schema(),
+        LogicalProperties::default(),
+        GroupCardinality::default(),
+    );
     memo.insert_logical(
         child,
         LogicalExprKey {
@@ -624,7 +655,11 @@ fn infeasible_child_rejects_only_its_parent_recipe() {
         EquivalenceProof::Initial,
     )
     .unwrap();
-    let root = memo.create_group(schema(), LogicalProperties::default());
+    let root = memo.create_group(
+        schema(),
+        LogicalProperties::default(),
+        GroupCardinality::default(),
+    );
     memo.insert_logical(
         root,
         LogicalExprKey {
@@ -884,7 +919,11 @@ fn grant_sensitive_parent_reuses_invariant_child_goal_across_classes() {
     let mut budget = super::super::budget::SearchBudget::default();
     budget.max_grant_classes = 2;
     let mut memo = Memo::new(budget);
-    let child = memo.create_group(schema(), LogicalProperties::default());
+    let child = memo.create_group(
+        schema(),
+        LogicalProperties::default(),
+        GroupCardinality::default(),
+    );
     memo.insert_logical(
         child,
         LogicalExprKey {
@@ -896,7 +935,11 @@ fn grant_sensitive_parent_reuses_invariant_child_goal_across_classes() {
         EquivalenceProof::Initial,
     )
     .unwrap();
-    let root = memo.create_group(schema(), LogicalProperties::default());
+    let root = memo.create_group(
+        schema(),
+        LogicalProperties::default(),
+        GroupCardinality::default(),
+    );
     memo.insert_logical(
         root,
         LogicalExprKey {

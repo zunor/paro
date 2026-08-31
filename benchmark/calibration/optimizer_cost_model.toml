@@ -5,8 +5,9 @@
 revision = 1
 hardware_class = "portable-cpu-v1"
 corpus_id = "optimizer-cost-bootstrap-2026-08"
-source_workload = "operator_runtime_baseline"
+validation_workload = "operator_runtime_baseline"
 provenance = "bootstrap"
+derivation = "hand-authored bootstrap; validation queries provide coverage, not fitted coefficients"
 risk_weight = 0.5
 
 [[coefficient]]
@@ -17,7 +18,7 @@ expected = 1.30
 risk = 2.60
 latency_expected = 1.30
 latency_upper = 3.90
-source_queries = ["integer_hash_join"]
+validation_queries = ["integer_hash_join"]
 
 [[coefficient]]
 id = 2
@@ -27,7 +28,7 @@ expected = 0.70
 risk = 1.50
 latency_expected = 0.70
 latency_upper = 2.20
-source_queries = ["integer_hash_join"]
+validation_queries = ["integer_hash_join"]
 
 [[coefficient]]
 id = 3
@@ -37,7 +38,7 @@ expected = 1.00
 risk = 3.00
 latency_expected = 1.00
 latency_upper = 4.00
-source_queries = ["integer_hash_join"]
+validation_queries = ["integer_hash_join"]
 
 [[coefficient]]
 id = 4
@@ -47,7 +48,7 @@ expected = 1.20
 risk = 3.60
 latency_expected = 1.20
 latency_upper = 5.00
-source_queries = ["large_sort"]
+validation_queries = ["large_sort"]
 
 [[coefficient]]
 id = 5
@@ -57,7 +58,7 @@ expected = 0.65
 risk = 1.80
 latency_expected = 0.65
 latency_upper = 2.40
-source_queries = ["sort_range_join_full"]
+validation_queries = ["sort_range_join_full"]
 
 [[coefficient]]
 id = 6
@@ -67,7 +68,7 @@ expected = 0.80
 risk = 2.10
 latency_expected = 0.80
 latency_upper = 2.80
-source_queries = ["classic_ie_join_selective"]
+validation_queries = ["classic_ie_join_selective"]
 
 [[coefficient]]
 id = 7
@@ -77,7 +78,7 @@ expected = 0.90
 risk = 2.20
 latency_expected = 0.90
 latency_upper = 3.00
-source_queries = ["high_cardinality_aggregate"]
+validation_queries = ["high_cardinality_aggregate"]
 
 [[coefficient]]
 id = 8
@@ -87,7 +88,7 @@ expected = 1.50
 risk = 3.50
 latency_expected = 1.50
 latency_upper = 4.50
-source_queries = ["high_cardinality_aggregate"]
+validation_queries = ["high_cardinality_aggregate"]
 
 [[coefficient]]
 id = 9
@@ -97,7 +98,7 @@ expected = 0.45
 risk = 1.10
 latency_expected = 0.45
 latency_upper = 1.60
-source_queries = ["high_cardinality_aggregate"]
+validation_queries = ["high_cardinality_aggregate"]
 
 [[coefficient]]
 id = 10
@@ -107,7 +108,7 @@ expected = 0.20
 risk = 0.55
 latency_expected = 0.20
 latency_upper = 0.80
-source_queries = ["high_cardinality_aggregate"]
+validation_queries = ["high_cardinality_aggregate"]
 
 [[coefficient]]
 id = 11
@@ -117,7 +118,7 @@ expected = 0.15
 risk = 0.60
 latency_expected = 0.15
 latency_upper = 0.80
-source_queries = ["expr_runtime_filter"]
+validation_queries = ["expr_runtime_filter"]
 
 [[coefficient]]
 id = 12
@@ -127,7 +128,7 @@ expected = 0.10
 risk = 0.40
 latency_expected = 0.10
 latency_upper = 0.60
-source_queries = ["expr_runtime_filter"]
+validation_queries = ["expr_runtime_filter"]
 
 [[coefficient]]
 id = 13
@@ -137,7 +138,7 @@ expected = 1.40
 risk = 3.80
 latency_expected = 1.40
 latency_upper = 5.20
-source_queries = ["ordered_aggregate"]
+validation_queries = ["ordered_aggregate"]
 
 [[coefficient]]
 id = 14
@@ -147,7 +148,7 @@ expected = 0.55
 risk = 1.40
 latency_expected = 0.55
 latency_upper = 2.00
-source_queries = ["ordered_aggregate"]
+validation_queries = ["ordered_aggregate"]
 
 [[coefficient]]
 id = 15
@@ -157,7 +158,7 @@ expected = 0.25
 risk = 0.70
 latency_expected = 0.25
 latency_upper = 1.00
-source_queries = ["grouping_sets_aggregate"]
+validation_queries = ["grouping_sets_aggregate"]
 
 [[coefficient]]
 id = 16
@@ -167,7 +168,7 @@ expected = 0.25
 risk = 1.00
 latency_expected = 0.10
 latency_upper = 0.50
-source_queries = ["string_hash_join"]
+validation_queries = ["string_hash_join"]
 
 [[coefficient]]
 id = 20001
@@ -177,7 +178,7 @@ expected = 0.25
 risk = 1.00
 latency_expected = 0.25
 latency_upper = 1.00
-source_queries = ["count_filter"]
+validation_queries = ["count_filter"]
 
 [[coefficient]]
 id = 20002
@@ -187,7 +188,7 @@ expected = 1.00
 risk = 4.00
 latency_expected = 1.00
 latency_upper = 6.00
-source_queries = ["large_sort"]
+validation_queries = ["large_sort"]
 
 [[coefficient]]
 id = 20003
@@ -197,7 +198,7 @@ expected = 1.00
 risk = 6.00
 latency_expected = 2.00
 latency_upper = 12.00
-source_queries = ["selective_rowset_scan"]
+validation_queries = ["selective_rowset_scan"]
 
 [[coefficient]]
 id = 20004
@@ -207,4 +208,4 @@ expected = 2.00
 risk = 8.00
 latency_expected = 2.00
 latency_upper = 10.00
-source_queries = ["forced_external_hash_join"]
+validation_queries = ["forced_external_hash_join"]

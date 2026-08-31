@@ -44,3 +44,21 @@ validate = "text_contains_all"
 expected = ["TOP_N", "AGGREGATE", "SET_OPERATION"]
 max_median_ratio_to = "union_rules_disabled"
 max_median_ratio = 1.50
+
+[[query]]
+id = "aggregate_dense_rules_disabled"
+file = "sql/q_aggregate_dense_union.sql"
+setup = "sql/disable_rules.sql"
+teardown = "sql/reset_rules.sql"
+validate = "text_contains_all"
+expected = ["AGGREGATE", "SET_OPERATION"]
+
+[[query]]
+id = "aggregate_dense_bounded_memo"
+file = "sql/q_aggregate_dense_union.sql"
+setup = "sql/reset_rules.sql"
+teardown = "sql/reset_rules.sql"
+validate = "text_contains_all"
+expected = ["AGGREGATE", "SET_OPERATION"]
+max_median_ratio_to = "aggregate_dense_rules_disabled"
+max_median_ratio = 1.30

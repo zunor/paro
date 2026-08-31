@@ -102,11 +102,11 @@ EXPLAIN SELECT * FROM GRAPH_TABLE(social_network
     COLUMNS (p.name AS person_name, c.name AS company_name)
 ) gt;
 QUERY PLAN
-PROJECTION  (rows=2)
+PROJECTION  (rows=3)
   Output: gt.person_name, gt.company_name
-  ->  GRAPH_PROJECT  (rows=2)
+  ->  GRAPH_PROJECT  (rows=3)
     Output: person_name, company_name
-    ->  GRAPH_EXPAND  (rows=2)
+    ->  GRAPH_EXPAND  (rows=3)
       Graph: social_network
       Edge Label: WorksAt
       Direction: Backward

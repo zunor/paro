@@ -130,11 +130,19 @@ pub(super) fn derive_logical_properties(
         | LogicalOperator::Distinct(_)
         | LogicalOperator::Window(_) => unary_bound(),
         LogicalOperator::Aggregate(aggregate)
-            if aggregate.groups.is_empty()
-                && aggregate.grouping_sets.is_empty()
-                && aggregate.grouping_functions.is_empty() =>
+            if aggregate.groups.is_empty() && aggregate.grouping_sets.is_empty() =>
         {
             Some(1)
+        }
+        LogicalOperator::Aggregate(aggregate) if !aggregate.grouping_sets.is_empty() => {
+            unary_bound().and_then(|input| {
+                aggregate
+                    .grouping_sets
+                    .iter()
+                    .try_fold(0_u64, |bound, set| {
+                        bound.checked_add(if set.expressions.is_empty() { 1 } else { input })
+                    })
+            })
         }
         LogicalOperator::Aggregate(_) => unary_bound(),
         LogicalOperator::TopN(topn) => {
@@ -205,6 +213,47 @@ pub(super) fn derive_logical_properties(
         maximum_cardinality,
         ..Default::default()
     }
+}
+
+pub(super) fn derive_group_cardinality(
+    operator: &LogicalOperator,
+    children: &[GroupId],
+    stats: &NodeStats,
+    recipe: Fingerprint,
+) -> GroupCardinality {
+    let inherited_child = match operator {
+        LogicalOperator::Projection(_)
+        | LogicalOperator::RowFetch(_)
+        | LogicalOperator::ExternalProject(_)
+        | LogicalOperator::Order(_)
+        | LogicalOperator::Window(_) => children.first().copied(),
+        LogicalOperator::MaterializedCTE(_) => children.get(1).copied(),
+        _ => None,
+    };
+    if let Some(input) = inherited_child {
+        return GroupCardinality::inherit(recipe, input);
+    }
+    let authority = match stats.cardinality_provenance {
+        paro_planner::plan::CardinalityProvenance::Statistics => CardinalityAuthority::Statistics,
+        paro_planner::plan::CardinalityProvenance::JoinGraph => CardinalityAuthority::JoinRegion,
+    };
+    stats.estimated_cardinality.map_or(
+        GroupCardinality {
+            recipe,
+            authority,
+            range: None,
+            input: None,
+        },
+        |estimate| {
+            GroupCardinality::new(
+                recipe,
+                authority,
+                estimate.min,
+                estimate.expected,
+                estimate.max,
+            )
+        },
+    )
 }
 
 pub(super) fn planner_grant_dependency(operator: &LogicalOperator) -> GrantDependencyDescriptor {
@@ -384,13 +433,13 @@ pub(super) fn cost_for_grant(
 }
 
 pub(super) fn planner_enforcer_cost_input(
-    metadata: &PlannerOperatorMetadata,
+    facts: &ResolvedPlannerCostFacts,
     grant: GrantGoalKey,
     classes: &BTreeMap<crate::cascades::ids::ResourceGrantClassId, ResourceGrantClass>,
 ) -> Result<crate::cascades::engine::EnforcerCostInput> {
     let mut input = crate::cascades::engine::EnforcerCostInput::unbounded(
-        metadata.cost_facts.output_rows,
-        metadata.cost_facts.output_row_width,
+        facts.output_rows,
+        facts.output_row_width,
     );
     if let GrantGoalKey::Class(class) = grant {
         let class = classes.get(&class).ok_or_else(|| {

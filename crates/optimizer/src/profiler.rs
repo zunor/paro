@@ -60,6 +60,7 @@ pub struct OptimizerTimingEntry {
 #[derive(Debug, Default)]
 pub struct OptimizerProfiler {
     entries: BTreeMap<OptimizerComponent, OptimizerTimingEntry>,
+    rule_attempts: BTreeMap<RuleId, u64>,
     rule_insertions: BTreeMap<RuleId, u64>,
     counters: BTreeMap<String, u64>,
 }
@@ -74,6 +75,7 @@ pub struct OptimizerProfileSnapshotEntry {
 #[derive(Debug, Clone, Default)]
 pub struct OptimizerProfileSnapshot {
     pub entries: Vec<OptimizerProfileSnapshotEntry>,
+    pub rule_attempts: BTreeMap<RuleId, u64>,
     pub rule_insertions: BTreeMap<RuleId, u64>,
     pub counters: BTreeMap<String, u64>,
 }
@@ -100,12 +102,17 @@ impl OptimizerProfiler {
                 })
                 .collect(),
             rule_insertions: self.rule_insertions.clone(),
+            rule_attempts: self.rule_attempts.clone(),
             counters: self.counters.clone(),
         }
     }
 
     pub fn record_rule_insertions(&mut self, insertions: BTreeMap<RuleId, u64>) {
         self.rule_insertions = insertions;
+    }
+
+    pub fn record_rule_attempts(&mut self, attempts: BTreeMap<RuleId, u64>) {
+        self.rule_attempts = attempts;
     }
 
     pub fn record_search_summary(&mut self, summary: &crate::cascades::SearchSummary) {
@@ -148,6 +155,16 @@ pub fn publish_optimizer_profile_snapshot(
                 .map(str::to_string)
                 .unwrap_or_else(|| format!("unknown_rule_{}", rule.0)),
             kind: "transformation_rule".to_string(),
+            last_elapsed_us: 0,
+            invocation_count: count.min(i64::MAX as u64) as i64,
+        }
+    }));
+    entries.extend(snapshot.rule_attempts.into_iter().map(|(rule, count)| {
+        OptimizerDiagnostic {
+            name: crate::cascades::rules::transformation_rule_name(rule)
+                .map(str::to_string)
+                .unwrap_or_else(|| format!("unknown_rule_{}", rule.0)),
+            kind: "transformation_rule_attempt".to_string(),
             last_elapsed_us: 0,
             invocation_count: count.min(i64::MAX as u64) as i64,
         }

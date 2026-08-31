@@ -49,9 +49,9 @@ WHERE p.order_key IN (
 GROUP BY p.order_key, p.label
 ORDER BY p.order_key;
 QUERY PLAN
-ORDER_BY  (rows=9)
+ORDER_BY  (rows=5)
   Sort Key: p.order_key ASC NULLS LAST
-  ->  PROJECTION  (rows=9)
+  ->  PROJECTION  (rows=5)
     Output: p.order_key, p.label, total_quantity
     ->  AGGREGATE  (rows=5)
       Group Key: p.order_key, p.label

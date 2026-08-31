@@ -13,7 +13,7 @@ pub(super) const PROVENANCE: &str = "bootstrap";
 pub(super) const RISK_WEIGHT: f64 = 0.500000;
 
 pub(super) const COEFFICIENTS: &[BuiltinCoefficient] = &[
-    // hash_build_row: integer_hash_join
+    // hash_build_row; coverage queries: integer_hash_join
     BuiltinCoefficient {
         class: OpClassId(1),
         dimension: ResourceDimension::Cpu,
@@ -22,7 +22,7 @@ pub(super) const COEFFICIENTS: &[BuiltinCoefficient] = &[
         latency_expected: 1.300000,
         latency_upper: 3.900000,
     },
-    // hash_probe_row: integer_hash_join
+    // hash_probe_row; coverage queries: integer_hash_join
     BuiltinCoefficient {
         class: OpClassId(2),
         dimension: ResourceDimension::Cpu,
@@ -31,7 +31,7 @@ pub(super) const COEFFICIENTS: &[BuiltinCoefficient] = &[
         latency_expected: 0.700000,
         latency_upper: 2.200000,
     },
-    // nested_loop_pair: integer_hash_join
+    // nested_loop_pair; coverage queries: integer_hash_join
     BuiltinCoefficient {
         class: OpClassId(3),
         dimension: ResourceDimension::Cpu,
@@ -40,7 +40,7 @@ pub(super) const COEFFICIENTS: &[BuiltinCoefficient] = &[
         latency_expected: 1.000000,
         latency_upper: 4.000000,
     },
-    // sort_compare: large_sort
+    // sort_compare; coverage queries: large_sort
     BuiltinCoefficient {
         class: OpClassId(4),
         dimension: ResourceDimension::Cpu,
@@ -49,7 +49,7 @@ pub(super) const COEFFICIENTS: &[BuiltinCoefficient] = &[
         latency_expected: 1.200000,
         latency_upper: 5.000000,
     },
-    // range_join_row: sort_range_join_full
+    // range_join_row; coverage queries: sort_range_join_full
     BuiltinCoefficient {
         class: OpClassId(5),
         dimension: ResourceDimension::Cpu,
@@ -58,7 +58,7 @@ pub(super) const COEFFICIENTS: &[BuiltinCoefficient] = &[
         latency_expected: 0.650000,
         latency_upper: 2.400000,
     },
-    // ie_join_row: classic_ie_join_selective
+    // ie_join_row; coverage queries: classic_ie_join_selective
     BuiltinCoefficient {
         class: OpClassId(6),
         dimension: ResourceDimension::Cpu,
@@ -67,7 +67,7 @@ pub(super) const COEFFICIENTS: &[BuiltinCoefficient] = &[
         latency_expected: 0.800000,
         latency_upper: 2.800000,
     },
-    // hash_aggregate_row: high_cardinality_aggregate
+    // hash_aggregate_row; coverage queries: high_cardinality_aggregate
     BuiltinCoefficient {
         class: OpClassId(7),
         dimension: ResourceDimension::Cpu,
@@ -76,7 +76,7 @@ pub(super) const COEFFICIENTS: &[BuiltinCoefficient] = &[
         latency_expected: 0.900000,
         latency_upper: 3.000000,
     },
-    // hash_aggregate_group: high_cardinality_aggregate
+    // hash_aggregate_group; coverage queries: high_cardinality_aggregate
     BuiltinCoefficient {
         class: OpClassId(8),
         dimension: ResourceDimension::Cpu,
@@ -85,7 +85,7 @@ pub(super) const COEFFICIENTS: &[BuiltinCoefficient] = &[
         latency_expected: 1.500000,
         latency_upper: 4.500000,
     },
-    // perfect_aggregate_row: high_cardinality_aggregate
+    // perfect_aggregate_row; coverage queries: high_cardinality_aggregate
     BuiltinCoefficient {
         class: OpClassId(9),
         dimension: ResourceDimension::Cpu,
@@ -94,7 +94,7 @@ pub(super) const COEFFICIENTS: &[BuiltinCoefficient] = &[
         latency_expected: 0.450000,
         latency_upper: 1.600000,
     },
-    // perfect_aggregate_slot: high_cardinality_aggregate
+    // perfect_aggregate_slot; coverage queries: high_cardinality_aggregate
     BuiltinCoefficient {
         class: OpClassId(10),
         dimension: ResourceDimension::Cpu,
@@ -103,7 +103,7 @@ pub(super) const COEFFICIENTS: &[BuiltinCoefficient] = &[
         latency_expected: 0.200000,
         latency_upper: 0.800000,
     },
-    // runtime_filter_build_row: expr_runtime_filter
+    // runtime_filter_build_row; coverage queries: expr_runtime_filter
     BuiltinCoefficient {
         class: OpClassId(11),
         dimension: ResourceDimension::Cpu,
@@ -112,7 +112,7 @@ pub(super) const COEFFICIENTS: &[BuiltinCoefficient] = &[
         latency_expected: 0.150000,
         latency_upper: 0.800000,
     },
-    // runtime_filter_apply_row: expr_runtime_filter
+    // runtime_filter_apply_row; coverage queries: expr_runtime_filter
     BuiltinCoefficient {
         class: OpClassId(12),
         dimension: ResourceDimension::Cpu,
@@ -121,7 +121,7 @@ pub(super) const COEFFICIENTS: &[BuiltinCoefficient] = &[
         latency_expected: 0.100000,
         latency_upper: 0.600000,
     },
-    // window_row: ordered_aggregate
+    // window_row; coverage queries: ordered_aggregate
     BuiltinCoefficient {
         class: OpClassId(13),
         dimension: ResourceDimension::Cpu,
@@ -130,7 +130,7 @@ pub(super) const COEFFICIENTS: &[BuiltinCoefficient] = &[
         latency_expected: 1.400000,
         latency_upper: 5.200000,
     },
-    // partition_aggregate_window_row: ordered_aggregate
+    // partition_aggregate_window_row; coverage queries: ordered_aggregate
     BuiltinCoefficient {
         class: OpClassId(14),
         dimension: ResourceDimension::Cpu,
@@ -139,7 +139,7 @@ pub(super) const COEFFICIENTS: &[BuiltinCoefficient] = &[
         latency_expected: 0.550000,
         latency_upper: 2.000000,
     },
-    // singleton_aggregate_project_row: grouping_sets_aggregate
+    // singleton_aggregate_project_row; coverage queries: grouping_sets_aggregate
     BuiltinCoefficient {
         class: OpClassId(15),
         dimension: ResourceDimension::Cpu,
@@ -148,7 +148,7 @@ pub(super) const COEFFICIENTS: &[BuiltinCoefficient] = &[
         latency_expected: 0.250000,
         latency_upper: 1.000000,
     },
-    // tuple_byte_block: string_hash_join
+    // tuple_byte_block; coverage queries: string_hash_join
     BuiltinCoefficient {
         class: OpClassId(16),
         dimension: ResourceDimension::MemoryRead,
@@ -157,7 +157,7 @@ pub(super) const COEFFICIENTS: &[BuiltinCoefficient] = &[
         latency_expected: 0.100000,
         latency_upper: 0.500000,
     },
-    // enforcer_stream_row: count_filter
+    // enforcer_stream_row; coverage queries: count_filter
     BuiltinCoefficient {
         class: OpClassId(20001),
         dimension: ResourceDimension::Cpu,
@@ -166,7 +166,7 @@ pub(super) const COEFFICIENTS: &[BuiltinCoefficient] = &[
         latency_expected: 0.250000,
         latency_upper: 1.000000,
     },
-    // enforcer_sort_compare: large_sort
+    // enforcer_sort_compare; coverage queries: large_sort
     BuiltinCoefficient {
         class: OpClassId(20002),
         dimension: ResourceDimension::Cpu,
@@ -175,7 +175,7 @@ pub(super) const COEFFICIENTS: &[BuiltinCoefficient] = &[
         latency_expected: 1.000000,
         latency_upper: 6.000000,
     },
-    // enforcer_random_fetch: selective_rowset_scan
+    // enforcer_random_fetch; coverage queries: selective_rowset_scan
     BuiltinCoefficient {
         class: OpClassId(20003),
         dimension: ResourceDimension::RandomIo,
@@ -184,7 +184,7 @@ pub(super) const COEFFICIENTS: &[BuiltinCoefficient] = &[
         latency_expected: 2.000000,
         latency_upper: 12.000000,
     },
-    // enforcer_spill_page: forced_external_hash_join
+    // enforcer_spill_page; coverage queries: forced_external_hash_join
     BuiltinCoefficient {
         class: OpClassId(20004),
         dimension: ResourceDimension::SequentialIo,

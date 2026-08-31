@@ -19,7 +19,10 @@ use super::ids::{
     AdmissibleGrantSetId, Fingerprint, GroupId, ImplementationId, LogicalExprId, PhysicalExprId,
     ResourceGrantClassId, RuleId, StableFingerprintBuilder,
 };
-use super::memo::{EquivalenceProof, GrantGoalKey, Memo, OptimizationGoal, Winner};
+use super::memo::{
+    EquivalenceProof, GrantGoalKey, GroupCardinality, LogicalProperties, Memo, OptimizationGoal,
+    Winner,
+};
 use super::region::{
     JointCostProof, RegionArtifactKind, RegionCandidateContract, RegionDependencyEdge,
     RegionDependencyKind,
@@ -66,6 +69,11 @@ struct TaskKey {
     group: GroupId,
     expression: LogicalExprId,
     goal: Option<OptimizationGoal>,
+}
+
+struct TransformationInsertion {
+    groups: BTreeSet<GroupId>,
+    properties: Vec<(GroupId, LogicalProperties, GroupCardinality)>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -147,6 +155,7 @@ pub struct CascadesEngine {
     active_goals: BTreeSet<(GroupId, OptimizationGoal)>,
     grant_class_sets: BTreeMap<ResourceGrantClassId, AdmissibleGrantSetId>,
     grant_sensitivity: BTreeMap<GroupId, GrantSensitivitySummary>,
+    rule_attempts: BTreeMap<RuleId, u64>,
     effective_rule_insertions: BTreeMap<RuleId, u64>,
     region_candidates: BTreeMap<super::ids::RegionId, BTreeSet<Fingerprint>>,
 }
@@ -167,6 +176,7 @@ impl CascadesEngine {
             active_goals: BTreeSet::new(),
             grant_class_sets: BTreeMap::new(),
             grant_sensitivity: BTreeMap::new(),
+            rule_attempts: BTreeMap::new(),
             effective_rule_insertions: BTreeMap::new(),
             region_candidates: BTreeMap::new(),
         }
@@ -376,6 +386,7 @@ impl CascadesEngine {
             if admitted == BudgetDecision::Exhausted {
                 continue;
             }
+            *self.rule_attempts.entry(rule).or_default() += 1;
             // The context owns the complete attempt. Its Memo snapshot is
             // lazy, and rule-specific side state enlists in the same rollback
             // domain before its first write.
@@ -440,8 +451,9 @@ impl CascadesEngine {
                 );
                 continue;
             }
-            let insertion = (|| -> Result<BTreeSet<GroupId>> {
+            let insertion = (|| -> Result<TransformationInsertion> {
                 let mut inserted_groups = BTreeSet::new();
+                let mut inserted_properties = Vec::new();
                 for output in outputs {
                     validate_transformation_proof(rule, expression, &output.proof)?;
                     let target = context.memo().canonical_group(output.target_group);
@@ -480,12 +492,23 @@ impl CascadesEngine {
                         .len();
                     if after > before {
                         inserted_groups.insert(target);
+                        inserted_properties.push((
+                            target,
+                            output.logical_properties,
+                            output.cardinality,
+                        ));
                     }
                 }
-                Ok(inserted_groups)
+                Ok(TransformationInsertion {
+                    groups: inserted_groups,
+                    properties: inserted_properties,
+                })
             })();
-            let mut inserted_groups = match insertion {
-                Ok(groups) => groups,
+            let TransformationInsertion {
+                groups: mut inserted_groups,
+                properties: inserted_properties,
+            } = match insertion {
+                Ok(result) => result,
                 Err(error) => {
                     context.rollback()?;
                     self.memo
@@ -520,6 +543,13 @@ impl CascadesEngine {
                     );
             } else {
                 let appended_groups = context.commit()?;
+                for (target, properties, cardinality) in inserted_properties {
+                    let group = self.memo.group_mut(target).ok_or_else(|| {
+                        paro_error::internal("committed transformation lost its target group")
+                    })?;
+                    group.logical_properties.merge_equivalent_facts(&properties);
+                    group.cardinality = group.cardinality.canonical_with(cardinality);
+                }
                 *self.effective_rule_insertions.entry(rule).or_default() +=
                     u64::try_from(inserted_groups.len()).unwrap_or(u64::MAX);
                 inserted_groups.extend(appended_groups);
@@ -533,6 +563,10 @@ impl CascadesEngine {
 
     pub fn effective_rule_insertions(&self) -> &BTreeMap<RuleId, u64> {
         &self.effective_rule_insertions
+    }
+
+    pub fn rule_attempts(&self) -> &BTreeMap<RuleId, u64> {
+        &self.rule_attempts
     }
 
     fn schedule_transformations(&self, group: GroupId, agenda: &mut StableAgenda) -> Result<()> {
@@ -870,6 +904,24 @@ impl CascadesEngine {
                 }),
             );
             let joint_cost_proof = build_joint_cost_proof(group, &recipe, local_cost)?;
+            if self
+                .memo
+                .group(group)
+                .is_some_and(|group| group.logical_exprs().len() > 1)
+            {
+                tracing::debug!(
+                    target: "paro::optimizer",
+                    memo_group = group.index(),
+                    logical_expression = self
+                        .memo
+                        .physical_expr(physical)
+                        .map(|physical| physical.key.logical.index()),
+                    physical_expression = physical.index(),
+                    risk_adjusted_cost = cost.score.risk_adjusted,
+                    upper_cost = cost.score.range.upper,
+                    "costed an equivalent physical candidate"
+                );
+            }
             self.memo.record_winner(
                 group,
                 goal,

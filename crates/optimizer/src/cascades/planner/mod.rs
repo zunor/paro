@@ -14,7 +14,7 @@ use paro_planner::binder::context::BindContext;
 use paro_planner::binder::deep_copy::duplicate_plan_preserving_indices;
 use paro_planner::binder::ir::OrderByNode;
 use paro_planner::binder::Binder;
-use paro_planner::expression::{ColumnRefExpression, Expression, ReferenceExpression};
+use paro_planner::expression::{Expression, ReferenceExpression};
 use paro_planner::operator::join::{AntiJoinMode, Join, JoinComparisonType, JoinType};
 use paro_planner::operator::{ColumnBinding, LogicalOperator, LogicalOperatorType};
 use paro_planner::plan::{LogicalPlan, NodeStats};
@@ -55,8 +55,8 @@ use super::ids::{
     StableFingerprintBuilder,
 };
 use super::memo::{
-    EquivalenceProof, GrantGoalKey, LogicalExprKey, LogicalProperties, Memo, OptimizationGoal,
-    PhysicalExprKey, RowGoal,
+    CardinalityAuthority, CardinalityEnvelope, EquivalenceProof, GrantGoalKey, GroupCardinality,
+    LogicalExprKey, LogicalProperties, Memo, OptimizationGoal, PhysicalExprKey, RowGoal,
 };
 use super::properties::{
     MutationSafetyRequirement, NullOrder, OrderingKey, OrderingRequirement, OrderingScope,
@@ -76,7 +76,7 @@ use super::rules::{
     AGGREGATE_INPUT_MATERIALIZATION_RULE, AGGREGATE_JOIN_PREAGGREGATION_RULE,
     AGGREGATE_JOIN_SUBSUMPTION_RULE, AGGREGATE_NON_NULL_INPUT_RULE, AGGREGATE_POST_REDUCTION_RULE,
     CTE_FILTER_PUSHDOWN_RULE, CTE_INLINE_RULE, EXPENSIVE_PREDICATE_PLACEMENT_RULE,
-    JOIN_ELIMINATION_RULE, LATE_PAYLOAD_FETCH_RULE, LIMIT_PUSHDOWN_RULE,
+    JOIN_ELIMINATION_RULE, LATE_PAYLOAD_FETCH_RULE, LIMIT_PUSHDOWN_RULE, MARK_JOIN_TO_SEMI_RULE,
     SCALAR_AGGREGATE_WINDOW_RULE,
 };
 use super::scalar::ScalarArena;
@@ -93,7 +93,7 @@ mod costing;
 mod extraction;
 mod identity;
 mod implementation;
-mod semantic_view;
+mod semantic_plan;
 mod state;
 mod transformation;
 
@@ -248,8 +248,7 @@ impl OptimizationInput {
                 let planner_state = self.planner_state.read().unwrap();
                 extract_planner_tree(
                     engine.memo(),
-                    &planner_state.payloads,
-                    &planner_state.metadata,
+                    &planner_state,
                     &self.bind_context,
                     self.root,
                     grant_winner.goal,
@@ -267,6 +266,7 @@ impl OptimizationInput {
             });
         }
         let rule_insertions = engine.effective_rule_insertions().clone();
+        let rule_attempts = engine.rule_attempts().clone();
         let search_summary = SearchSummary {
             groups: u64::try_from(engine.memo().canonical_group_count()).unwrap_or(u64::MAX),
             logical_expressions: u64::try_from(engine.memo().logical_expr_count())
@@ -277,6 +277,7 @@ impl OptimizationInput {
         };
         Ok(OptimizationOutput {
             variants: variants.into_boxed_slice(),
+            rule_attempts,
             rule_insertions,
             search_summary,
         })
@@ -286,6 +287,9 @@ impl OptimizationInput {
 #[derive(Debug)]
 pub struct OptimizationOutput {
     pub variants: Box<[OptimizedVariant]>,
+    /// Rule applications that passed structural matching and budget admission.
+    /// Comparing this with `rule_insertions` measures pre-match precision.
+    pub rule_attempts: BTreeMap<RuleId, u64>,
     /// Logical expressions actually inserted into an equivalence group by
     /// each transformation. Matching, scheduling, and duplicate replay do not
     /// count as an effect.
@@ -484,6 +488,23 @@ impl MemoBuilder {
                     let logical_properties =
                         derive_logical_properties(&plan.operator, &child_maximum_cardinalities);
                     let output_rows_hard_upper = logical_properties.maximum_cardinality;
+                    // Capture binding semantics before Query IR interning
+                    // replaces operator expressions with positional arena
+                    // references. The Memo key owns the interned scalars;
+                    // rule payloads never do.
+                    let semantic_template = semantic_plan::detach_template(
+                        duplicate_plan_preserving_indices(&plan, bind_shared.as_ref()),
+                    )
+                    .map_children(|_| LogicalPlan::synthetic(LogicalOperator::DummyScan));
+                    let search_candidate = if let Some(search_context) = &candidate_context {
+                        crate::search::optimizer::SearchOptimizer::new()
+                            .physical_candidate_for_root(
+                                duplicate_plan_preserving_indices(&plan, bind_shared.as_ref()),
+                                search_context,
+                            )?
+                    } else {
+                        None
+                    };
                     let scalar_roots = intern_operator_scalars(
                         &mut plan.operator,
                         &output_columns,
@@ -510,11 +531,17 @@ impl MemoBuilder {
                         candidates.iter().copied().find(|(group, _)| {
                             memo.group(*group).is_some_and(|existing| {
                                 existing.schema == schema
-                                    && existing.logical_properties == logical_properties
+                                    && existing
+                                        .logical_properties
+                                        .same_contract(&logical_properties)
                             })
                         })
                     });
                     if let Some((group, logical)) = reusable {
+                        memo.group_mut(group)
+                            .expect("reusable group was validated")
+                            .logical_properties
+                            .merge_equivalent_facts(&logical_properties);
                         let mut subtree_groups = BTreeSet::from([group]);
                         for child in &child_states {
                             subtree_groups.extend(child.subtree_groups.iter().copied());
@@ -529,26 +556,18 @@ impl MemoBuilder {
                             },
                         ));
                     }
-                    let search_candidate = if let Some(search_context) = &candidate_context {
-                        crate::search::optimizer::SearchOptimizer::new()
-                            .physical_candidate_for_root(
-                                duplicate_plan_preserving_indices(&plan, bind_shared.as_ref()),
-                                search_context,
-                            )?
-                    } else {
-                        None
-                    };
-                    let group = memo.create_group(schema, logical_properties);
-                    let output_estimate = plan.stats.estimated_cardinality;
-                    let mut extraction_template =
-                        duplicate_plan_preserving_indices(&plan, bind_shared.as_ref())
-                            .map_children(|_| LogicalPlan::synthetic(LogicalOperator::DummyScan));
-                    extraction_template.stats = NodeStats::default();
-                    let payload = payloads.push(PlannerLogicalPayload {
-                        extraction_template,
-                        output_estimate,
-                        column_stats: candidate_stats.clone(),
-                    });
+                    let cardinality = derive_group_cardinality(
+                        &plan.operator,
+                        &key.children,
+                        &plan.stats,
+                        key.stable_fingerprint(),
+                    );
+                    let group = memo.create_group(schema, logical_properties, cardinality);
+                    let (payload, baseline_payload) =
+                        payloads.push_logical(PlannerLogicalPayload {
+                            semantic_template,
+                            column_stats: candidate_stats.clone(),
+                        });
                     let logical = memo.insert_logical(
                         group,
                         key.clone(),
@@ -589,22 +608,11 @@ impl MemoBuilder {
                             &child_maximum_cardinalities,
                             scan_access_cost,
                         )?;
-                        let cost_facts = planner_cost_facts(
-                            &search_plan,
-                            output_rows_hard_upper,
-                            &child_maximum_cardinalities,
-                            scan_access_cost,
-                        )?;
+                        let cost_facts = planner_cost_facts(&search_plan, scan_access_cost)?;
                         search_plan.stats = NodeStats::default();
-                        let payload = PhysicalPayloadId(
-                            payloads
-                                .push(PlannerLogicalPayload {
-                                    extraction_template: search_plan,
-                                    output_estimate,
-                                    column_stats: candidate_stats.clone(),
-                                })
-                                .0,
-                        );
+                        let payload = payloads.push_physical(PlannerPhysicalTemplate::Executable(
+                            Box::new(search_plan),
+                        ));
                         Some(PlannerSearchImplementationMetadata {
                             payload,
                             payload_fingerprint: search_fingerprint,
@@ -693,12 +701,7 @@ impl MemoBuilder {
                         implementations,
                         grant_dependency: planner_grant_dependency(&plan.operator),
                         spillable: planner_operator_spillable(&plan.operator),
-                        cost_facts: planner_cost_facts(
-                            &plan,
-                            output_rows_hard_upper,
-                            &child_maximum_cardinalities,
-                            scan_access_cost,
-                        )?,
+                        cost_facts: planner_cost_facts(&plan, scan_access_cost)?,
                         output_columns: output_columns.clone().into_boxed_slice(),
                         search,
                         required_region_facet: None,
@@ -706,6 +709,7 @@ impl MemoBuilder {
                         structural_retained_children: planner_structural_retained_children(
                             &plan.operator,
                         ),
+                        baseline_payload,
                     };
                     if metadata.insert(payload, operator_metadata).is_some() {
                         return Err(paro_error::internal(

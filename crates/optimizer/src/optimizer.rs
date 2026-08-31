@@ -73,7 +73,7 @@ use crate::verify::verify_logical_plan;
 const CORRELATED_AGGREGATE_REGION_RULE: crate::cascades::RuleId = crate::cascades::RuleId(10_004);
 const SCALAR_REUSE_REGION_RULE: crate::cascades::RuleId = crate::cascades::RuleId(10_005);
 const DISTINCT_AGGREGATE_FEASIBILITY_RULE: crate::cascades::RuleId =
-    crate::cascades::RuleId(10_010);
+    crate::cascades::RuleId(10_020);
 
 struct CandidatePlan {
     plan: LogicalPlan,
@@ -365,6 +365,9 @@ impl Optimizer {
         let mode = input.mode;
         let phase_started = Instant::now();
         let extraction = input.optimize(&grant_classes)?;
+        self.ctx
+            .profiler
+            .record_rule_attempts(extraction.rule_attempts.clone());
         self.ctx
             .profiler
             .record_rule_insertions(extraction.rule_insertions.clone());

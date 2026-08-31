@@ -65,11 +65,11 @@ EXPLAIN SELECT * FROM GRAPH_TABLE(start_graph
     COLUMNS (p.name AS person_name, c.name AS company_name, city.name AS city_name)
 ) gt;
 QUERY PLAN
-PROJECTION  (rows=1)
+PROJECTION  (rows=2)
   Output: gt.person_name, gt.company_name, gt.city_name
-  ->  GRAPH_PROJECT  (rows=1)
+  ->  GRAPH_PROJECT  (rows=2)
     Output: person_name, company_name, city_name
-    ->  GRAPH_EXPAND  (rows=1)
+    ->  GRAPH_EXPAND  (rows=2)
       Graph: start_graph
       Edge Label: WorksAt
       Direction: Backward

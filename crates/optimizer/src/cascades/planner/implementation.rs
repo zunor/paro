@@ -120,6 +120,8 @@ impl PhysicalImplementation for PlannerBaselineImplementation {
             .get(&logical.payload)
             .ok_or_else(|| paro_error::internal("baseline implementation lost metadata"))?;
         let children = logical.key.children.clone();
+        let cost_facts =
+            expression_cost_facts(ctx.memo, ctx.group, &children, &metadata.cost_facts)?;
         let child_goals = children
             .iter()
             .copied()
@@ -146,6 +148,7 @@ impl PhysicalImplementation for PlannerBaselineImplementation {
         );
         let local_cost = implementation_cost(
             metadata,
+            &cost_facts,
             metadata.implementations.baseline,
             self.calibration.as_ref(),
         )?;
@@ -181,14 +184,14 @@ impl PhysicalImplementation for PlannerBaselineImplementation {
                 children,
                 payload_fingerprint: metadata.operator_fingerprint,
             },
-            payload: PhysicalPayloadId(logical.payload.0),
+            payload: metadata.baseline_payload,
             provided: metadata.provided.clone(),
             child_goals,
             local_cost,
             cost_composition: planner_cost_composition(metadata, metadata.implementations.baseline),
             spillable,
             enforcer_cost_input: planner_enforcer_cost_input(
-                metadata,
+                &cost_facts,
                 goal.grant,
                 &self.grant_classes,
             )?,
@@ -271,6 +274,8 @@ impl PhysicalImplementation for AlternativeImplementation {
             return Ok(Box::new([]));
         }
         let children = logical.key.children.clone();
+        let cost_facts =
+            expression_cost_facts(ctx.memo, ctx.group, &children, &metadata.cost_facts)?;
         let child_goals = children
             .iter()
             .copied()
@@ -293,8 +298,12 @@ impl PhysicalImplementation for AlternativeImplementation {
         fingerprint.write_u64(
             (self.force_spill && implementation_spillable(metadata, self.flavor)) as u64,
         );
-        let implementation_cost =
-            implementation_cost(metadata, self.flavor, self.calibration.as_ref())?;
+        let implementation_cost = implementation_cost(
+            metadata,
+            &cost_facts,
+            self.flavor,
+            self.calibration.as_ref(),
+        )?;
         let Some(local_cost) = cost_for_grant(
             implementation_cost,
             GrantDependencyDescriptor::Sensitive,
@@ -314,14 +323,14 @@ impl PhysicalImplementation for AlternativeImplementation {
                 children,
                 payload_fingerprint: metadata.operator_fingerprint,
             },
-            payload: PhysicalPayloadId(logical.payload.0),
+            payload: metadata.baseline_payload,
             provided: metadata.provided.clone(),
             child_goals,
             local_cost,
             cost_composition: planner_cost_composition(metadata, self.flavor),
             spillable: implementation_spillable(metadata, self.flavor),
             enforcer_cost_input: planner_enforcer_cost_input(
-                metadata,
+                &cost_facts,
                 goal.grant,
                 &self.grant_classes,
             )?,
@@ -394,6 +403,7 @@ impl PhysicalImplementation for PlannerSearchImplementation {
         else {
             return Ok(Box::new([]));
         };
+        let cost_facts = expression_cost_facts(ctx.memo, ctx.group, &[], &search.cost_facts)?;
         let mut fingerprint = StableFingerprintBuilder::default();
         fingerprint.write_u64(self.id().0 as u64);
         fingerprint.write_fingerprint(search.payload_fingerprint);
@@ -411,8 +421,8 @@ impl PhysicalImplementation for PlannerSearchImplementation {
             cost_composition: CostComposition::Sequential,
             spillable: false,
             enforcer_cost_input: crate::cascades::engine::EnforcerCostInput::unbounded(
-                search.cost_facts.output_rows,
-                search.cost_facts.output_row_width,
+                cost_facts.output_rows,
+                cost_facts.output_row_width,
             ),
             physical_fingerprint: fingerprint.finish(),
             region: planner_region_contract(ctx.memo, None, None)?,

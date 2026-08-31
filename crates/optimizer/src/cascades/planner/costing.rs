@@ -5,6 +5,10 @@
 
 use super::*;
 
+mod facts;
+
+pub(super) use facts::{expression_cost_facts, planner_cost_facts, planner_row_width};
+
 pub(super) fn planner_implementation_set(
     plan: &LogicalPlan,
     rowset_scan_pushdown: bool,
@@ -260,77 +264,6 @@ const OP_WINDOW_ROW: OpClassId = OpClassId(13);
 const OP_PARTITION_AGGREGATE_WINDOW_ROW: OpClassId = OpClassId(14);
 const OP_SINGLETON_AGGREGATE_PROJECT_ROW: OpClassId = OpClassId(15);
 
-pub(super) fn planner_cost_facts(
-    plan: &LogicalPlan,
-    output_rows_hard_upper: Option<u64>,
-    child_rows_hard_upper: &[Option<u64>],
-    scan_access_cost: paro_storage::rowset::scan_cost::ScanAccessCostModel,
-) -> Result<PlannerCostFacts> {
-    let output_rows = cardinality_work_range(plan.stats.estimated_cardinality)?;
-    let children = plan.children();
-    let child_rows = children
-        .iter()
-        .map(|child| cardinality_work_range(child.stats.estimated_cardinality))
-        .collect::<Result<Vec<_>>>()?
-        .into_boxed_slice();
-    let child_row_widths = children
-        .iter()
-        .map(|child| planner_row_width(child, scan_access_cost))
-        .collect::<Vec<_>>()
-        .into_boxed_slice();
-    let output_row_width = planner_row_width(plan, scan_access_cost);
-    let perfect_hash_slots = match &plan.operator {
-        LogicalOperator::Aggregate(aggregate) => {
-            crate::physical::extraction::helpers::can_use_perfect_hash_aggregate(
-                aggregate,
-                &aggregate.groups,
-                &aggregate.aggregates,
-            )
-            .and_then(|info| {
-                info.group_cardinalities
-                    .into_iter()
-                    .try_fold(1u64, |slots, cardinality| {
-                        slots.checked_mul(u64::try_from(cardinality).ok()?)
-                    })
-            })
-        }
-        _ => None,
-    };
-    Ok(PlannerCostFacts {
-        output_rows,
-        child_rows,
-        output_rows_hard_upper,
-        child_rows_hard_upper: child_rows_hard_upper.to_vec().into_boxed_slice(),
-        child_row_widths,
-        output_row_width,
-        perfect_hash_slots,
-    })
-}
-
-pub(super) fn planner_row_width(
-    plan: &LogicalPlan,
-    scan_access_cost: paro_storage::rowset::scan_cost::ScanAccessCostModel,
-) -> u64 {
-    plan.types()
-        .iter()
-        .map(|logical_type| scan_access_cost.estimated_width(logical_type) as u64)
-        .sum::<u64>()
-        .saturating_add(std::mem::size_of::<u64>() as u64)
-}
-
-pub(super) fn cardinality_work_range(
-    estimate: Option<paro_planner::plan::CardinalityEstimate>,
-) -> Result<CompactRange> {
-    match estimate {
-        Some(estimate) => CompactRange::new(
-            estimate.min as f64,
-            estimate.expected as f64,
-            estimate.max as f64,
-        ),
-        None => CompactRange::new(0.0, 1.0, 4.0),
-    }
-}
-
 pub(super) fn multiply_work(left: CompactRange, right: CompactRange) -> Result<CompactRange> {
     CompactRange::new(
         left.lower * right.lower,
@@ -356,14 +289,16 @@ pub(super) fn sort_work(rows: CompactRange) -> Result<CompactRange> {
 
 pub(super) fn implementation_cost(
     metadata: &PlannerOperatorMetadata,
+    facts: &ResolvedPlannerCostFacts,
     flavor: PhysicalImplementationFlavor,
     calibration: &MachineCalibrationBundle,
 ) -> Result<SearchCost> {
-    let facts = &metadata.cost_facts;
     let mut work = LocalOperatorWork::default();
     let mut peak_memory_upper;
     match flavor {
-        PhysicalImplementationFlavor::Structural => return Ok(metadata.local_cost),
+        PhysicalImplementationFlavor::Structural => {
+            return refreshed_structural_cost(metadata, facts)
+        }
         PhysicalImplementationFlavor::SearchProvider => {
             return Err(paro_error::internal(
                 "search provider cost must come from its physical payload",
@@ -543,9 +478,77 @@ pub(super) fn implementation_cost(
     Ok(cost)
 }
 
+fn refreshed_structural_cost(
+    metadata: &PlannerOperatorMetadata,
+    facts: &ResolvedPlannerCostFacts,
+) -> Result<SearchCost> {
+    if matches!(
+        metadata.operator_type,
+        LogicalOperatorType::SearchScan
+            | LogicalOperatorType::FullTextFilterScan
+            | LogicalOperatorType::ExternalProject
+            | LogicalOperatorType::ExternalTable
+    ) {
+        return Ok(metadata.local_cost);
+    }
+    let width_factor = (facts.output_row_width as f64 / 32.0).max(1.0);
+    let child_count = facts.child_rows.len() as f64;
+    let expected = facts.output_rows.expected.max(1.0) * width_factor + child_count;
+    let upper =
+        facts.output_rows.upper.max(facts.output_rows.expected) * width_factor + child_count;
+    let range = CompactRange::new(1.0_f64.min(expected), expected, upper.max(expected))?;
+    let mut cost = SearchCost {
+        score: ScoreSummary {
+            range,
+            risk_adjusted: expected + (upper - expected) * 0.5,
+        },
+        critical_path: range,
+        ..SearchCost::ZERO
+    };
+    if metadata.grant_dependency == GrantDependencyDescriptor::Sensitive {
+        let (rows, width) = if metadata.operator_type == LogicalOperatorType::CrossProduct {
+            (
+                facts
+                    .child_rows_hard_upper
+                    .get(1)
+                    .copied()
+                    .flatten()
+                    .unwrap_or(u64::MAX),
+                facts
+                    .child_row_widths
+                    .get(1)
+                    .copied()
+                    .unwrap_or(facts.output_row_width),
+            )
+        } else {
+            (
+                facts.output_rows_hard_upper.unwrap_or(u64::MAX),
+                facts.output_row_width,
+            )
+        };
+        cost.peak_memory_upper = rows.saturating_mul(width);
+        let resident_expected = if metadata.operator_type == LogicalOperatorType::CrossProduct {
+            facts
+                .child_rows
+                .get(1)
+                .copied()
+                .unwrap_or(CompactRange::ZERO)
+                .expected
+        } else {
+            facts.output_rows.expected
+        };
+        cost.resources_expected[ResourceDimension::MemoryWrite as usize] =
+            resident_expected * width as f64;
+        cost.resources_risk_upper[ResourceDimension::MemoryWrite as usize] =
+            cost.peak_memory_upper as f64;
+    }
+    cost.validate()?;
+    Ok(cost)
+}
+
 pub(super) fn add_tuple_byte_work(
     work: &mut LocalOperatorWork,
-    facts: &PlannerCostFacts,
+    facts: &ResolvedPlannerCostFacts,
 ) -> Result<()> {
     const BYTE_BLOCK: f64 = 32.0;
 
