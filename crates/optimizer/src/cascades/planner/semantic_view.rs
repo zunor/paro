@@ -1,15 +1,72 @@
 // Copyright 2024-2026 Zunor
 // SPDX-License-Identifier: Apache-2.0
 
-//! Input normalization local to aggregate join-subsumption proof attempts.
+//! Stable semantic planner view materialized from Memo expressions.
+//!
+//! Planner payloads retain an executable extraction recipe, including its
+//! positional ABI. Rules never inspect that recipe directly: this module
+//! restores semantic bindings and canonical output maps after choosing the
+//! group's initial expression as its deterministic representative.
 
 use super::*;
 
-pub(super) fn normalize_input(plan: LogicalPlan) -> LogicalPlan {
+pub(super) fn materialize(
+    memo: &Memo,
+    state: &PlannerTransformState,
+    expr: LogicalExprId,
+) -> Result<LogicalPlan> {
+    // Rebuild the tree first, then normalize it exactly once. Normalizing at
+    // every recursive return revisits each descendant once per ancestor and
+    // turns a linear materialization into quadratic work on UNION chains.
+    let plan = materialize_raw(memo, state, expr)?;
+    Ok(normalize_semantic_view(plan))
+}
+
+fn materialize_raw(
+    memo: &Memo,
+    state: &PlannerTransformState,
+    expr: LogicalExprId,
+) -> Result<LogicalPlan> {
+    let logical = memo
+        .logical_expr(expr)
+        .ok_or_else(|| paro_error::internal("planner rule references unknown expression"))?;
+    let payload = state
+        .payloads
+        .logical
+        .get(logical.payload.index())
+        .ok_or_else(|| paro_error::internal("planner rule references unknown payload"))?;
+    let mut children = Vec::with_capacity(logical.key.children.len());
+    for child in logical.key.children.iter().copied() {
+        let child_expr = memo
+            .group(child)
+            .and_then(|group| group.logical_exprs().first())
+            .copied()
+            .ok_or_else(|| paro_error::internal("planner rule found an empty child group"))?;
+        children.push(materialize_raw(memo, state, child_expr)?);
+    }
+    let mut children = children.into_iter();
+    let mut plan = duplicate_plan_preserving_indices(
+        &payload.extraction_template,
+        state.bind_context.shared().as_ref(),
+    )
+    .try_map_children(|_| {
+        children
+            .next()
+            .ok_or_else(|| paro_error::internal("planner payload lost a child expression"))
+    })?;
+    if children.next().is_some() {
+        return Err(paro_error::internal(
+            "planner payload child arity disagrees with Memo expression",
+        ));
+    }
+    plan.stats.estimated_cardinality = payload.output_estimate;
+    Ok(plan)
+}
+
+fn normalize_semantic_view(plan: LogicalPlan) -> LogicalPlan {
     let plan = restore_direct_filter_bindings(plan);
-    let plan = restore_semantic_projection_maps(plan);
-    let plan = lower_positive_consumed_mark_filter(plan);
-    FilterPushdown::new().rewrite_plan(plan)
+    let plan = restore_canonical_projection_maps(plan);
+    lower_positive_consumed_mark_filter(plan)
 }
 
 fn restore_direct_filter_bindings(plan: LogicalPlan) -> LogicalPlan {
@@ -35,18 +92,18 @@ fn restore_direct_filter_bindings(plan: LogicalPlan) -> LogicalPlan {
         })
 }
 
-fn restore_semantic_projection_maps(plan: LogicalPlan) -> LogicalPlan {
-    plan.map_children(restore_semantic_projection_maps)
+fn restore_canonical_projection_maps(plan: LogicalPlan) -> LogicalPlan {
+    plan.map_children(restore_canonical_projection_maps)
         .map_operator(|operator| match operator {
             LogicalOperator::Filter(mut filter) => {
                 filter.projection_map = paro_planner::operator::ProjectionMap::all();
                 LogicalOperator::Filter(filter)
             }
-            LogicalOperator::Join(Join::Comparison(mut join)) => {
-                if join.join_type == JoinType::Inner {
-                    join.left_projection_map = paro_planner::operator::ProjectionMap::all();
-                    join.right_projection_map = paro_planner::operator::ProjectionMap::all();
-                }
+            LogicalOperator::Join(Join::Comparison(mut join))
+                if join.join_type == JoinType::Inner =>
+            {
+                join.left_projection_map = paro_planner::operator::ProjectionMap::all();
+                join.right_projection_map = paro_planner::operator::ProjectionMap::all();
                 LogicalOperator::Join(Join::Comparison(join))
             }
             operator => operator,

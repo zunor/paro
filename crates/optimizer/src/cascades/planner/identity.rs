@@ -36,14 +36,9 @@ pub(super) fn query_operator_fingerprint(
             .ok_or_else(|| paro_error::internal("operator references an unknown scalar root"))?;
         fingerprint.write_fingerprint(scalar.fingerprint);
     }
-    for ty in plan.types() {
-        crate::cascades::scalar::encode_logical_type(&mut fingerprint, &ty);
-    }
     match &plan.operator {
         LogicalOperator::Get(get) => encode_get(&mut fingerprint, get),
-        LogicalOperator::Filter(filter) => {
-            encode_projection_map(&mut fingerprint, &filter.projection_map)
-        }
+        LogicalOperator::Filter(_) => {}
         LogicalOperator::Projection(projection) => {
             fingerprint.write_u64(projection.visible_count as u64);
             encode_optional_string(&mut fingerprint, projection.visible_qualifier.as_deref());
@@ -70,7 +65,6 @@ pub(super) fn query_operator_fingerprint(
             encode_hnsw_options(&mut fingerprint, limit.hnsw_options);
         }
         LogicalOperator::Order(order) => {
-            encode_projection_map(&mut fingerprint, &order.projection_map);
             encode_orders(&mut fingerprint, &order.orders);
         }
         LogicalOperator::TopN(topn) => {
@@ -102,15 +96,11 @@ pub(super) fn query_operator_fingerprint(
                         fingerprint.write_u64(index as u64);
                     }
                 }
-                encode_projection_map(&mut fingerprint, &join.left_projection_map);
-                encode_projection_map(&mut fingerprint, &join.right_projection_map);
             }
             Join::Any(join) => {
                 fingerprint.write_u64(1);
                 fingerprint.write_u64(join.join_type as u64);
                 encode_optional_usize(&mut fingerprint, join.mark_index);
-                encode_projection_map(&mut fingerprint, &join.left_projection_map);
-                encode_projection_map(&mut fingerprint, &join.right_projection_map);
             }
             Join::Cross(_) => fingerprint.write_u64(2),
         },
@@ -183,7 +173,6 @@ pub(super) fn query_operator_fingerprint(
         LogicalOperator::FullTextFilterScan(search) => {
             encode_get(&mut fingerprint, &search.get);
             encode_search_request(&mut fingerprint, &search.request);
-            encode_projection_map(&mut fingerprint, &search.projection_map);
         }
         LogicalOperator::GraphMatch(graph) => {
             fingerprint.write_u64(graph.graph_entry.object_id().raw());
@@ -868,6 +857,8 @@ pub(super) fn encode_u32s(fingerprint: &mut StableFingerprintBuilder, values: &[
     }
 }
 
+/// Encode an extraction-layout map for physical payload identity. Logical
+/// expression identity deliberately does not call this helper.
 pub(super) fn encode_projection_map(
     fingerprint: &mut StableFingerprintBuilder,
     projection: &paro_planner::operator::ProjectionMap,

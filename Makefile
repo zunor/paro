@@ -1,7 +1,7 @@
 # Copyright 2024-2026 Zunor
 # SPDX-License-Identifier: Apache-2.0
 
-.PHONY: build release run test check header fmt fmt-check clippy actionlint memory-guards static clean qa ci-local ci-local-stop regress regress-setup regress-update regress-ci regress-unit bench bench-ci bench-check bench-bless bench-calibrate bench-bisect bench-archive-manifest bench-archive-recompute-calibration bench-archive-finalize-calibration bench-test bench-setup bench-clean bench-ping test-benchmark performance-gate performance-gate-sql performance-gate-divan performance-gate-bless python-udf-setup python-udf-unit python-udf-regress python-udf-startup-smoke python-udf-ci
+.PHONY: build release run test check header fmt fmt-check clippy actionlint memory-guards optimizer-calibration static clean qa ci-local ci-local-stop regress regress-setup regress-update regress-ci regress-unit bench bench-ci bench-check bench-bless bench-calibrate bench-bisect bench-archive-manifest bench-archive-recompute-calibration bench-archive-finalize-calibration bench-test bench-setup bench-clean bench-ping test-benchmark performance-gate performance-gate-sql performance-gate-divan performance-gate-bless python-udf-setup python-udf-unit python-udf-regress python-udf-startup-smoke python-udf-ci
 
 # Build the project
 build:
@@ -54,17 +54,24 @@ memory-guards:
 	python3 tools/ci/check_memory_runtime_api.py
 	python3 tools/ci/check_vector_copy_fallible_api.py
 
+# Ensure the production cost table is a complete, reproducible artifact of
+# its declared benchmark corpus rather than an independently edited literal.
+optimizer-calibration:
+	python3 tools/ci/generate_optimizer_calibration.py --check
+
 # Run the static checks used at the front of CI
 static:
-	@echo "══════ [1/5] header ══════"
+	@echo "══════ [1/6] header ══════"
 	$(MAKE) header
-	@echo "══════ [2/5] rustfmt ══════"
+	@echo "══════ [2/6] rustfmt ══════"
 	$(MAKE) fmt-check
-	@echo "══════ [3/5] memory guards ══════"
+	@echo "══════ [3/6] memory guards ══════"
 	$(MAKE) memory-guards
-	@echo "══════ [4/5] clippy ══════"
+	@echo "══════ [4/6] optimizer calibration ══════"
+	$(MAKE) optimizer-calibration
+	@echo "══════ [5/6] clippy ══════"
 	$(MAKE) clippy
-	@echo "══════ [5/5] actionlint ══════"
+	@echo "══════ [6/6] actionlint ══════"
 	$(MAKE) actionlint
 
 # Clean build artifacts

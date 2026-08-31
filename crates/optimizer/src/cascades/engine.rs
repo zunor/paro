@@ -376,26 +376,21 @@ impl CascadesEngine {
             if admitted == BudgetDecision::Exhausted {
                 continue;
             }
-            // Optional transformations run against an isolated Memo image.
-            // A faulty rule must neither poison the mandatory baseline nor
-            // leave child groups, payload references, or region facets half
-            // installed. The search bounds make this snapshot finite.
-            let memo_savepoint = self.memo.transformation_savepoint();
+            // The context owns the complete attempt. Its Memo snapshot is
+            // lazy, and rule-specific side state enlists in the same rollback
+            // domain before its first write.
+            let mut context = TransformContext::new(&mut self.memo, group);
             let outputs_result = {
                 let rule_impl = self
                     .registry
                     .transformation(rule)
                     .ok_or_else(|| paro_error::internal("rule disappeared from registry"))?;
-                let mut context = TransformContext {
-                    memo: &mut self.memo,
-                    group,
-                };
                 rule_impl.apply(expression, &mut context)
             };
             let outputs = match outputs_result {
                 Ok(outputs) => outputs,
                 Err(error) => {
-                    self.memo.rollback_transformation(memo_savepoint);
+                    context.rollback()?;
                     self.memo
                         .group_mut(group)
                         .ok_or_else(|| paro_error::internal("rule task references unknown group"))?
@@ -415,7 +410,7 @@ impl CascadesEngine {
                 }
             };
             if outputs.is_empty() {
-                self.memo.rollback_transformation(memo_savepoint);
+                context.rollback()?;
                 self.memo
                     .group_mut(group)
                     .ok_or_else(|| paro_error::internal("rule task references unknown group"))?
@@ -427,7 +422,7 @@ impl CascadesEngine {
                 continue;
             }
             if outputs.len() > 1 {
-                self.memo.rollback_transformation(memo_savepoint);
+                context.rollback()?;
                 self.memo
                     .group_mut(group)
                     .ok_or_else(|| paro_error::internal("rule task references unknown group"))?
@@ -449,30 +444,50 @@ impl CascadesEngine {
                 let mut inserted_groups = BTreeSet::new();
                 for output in outputs {
                     validate_transformation_proof(rule, expression, &output.proof)?;
-                    let target = self.memo.canonical_group(output.target_group);
-                    if target != self.memo.canonical_group(group) {
+                    let target = context.memo().canonical_group(output.target_group);
+                    if target != context.memo().canonical_group(group) {
                         return Err(paro_error::internal(
                             "a local transformation must target its source equivalence group",
                         ));
                     }
-                    let before = self
-                        .memo
+                    // A duplicate output is an ineffective transformation.
+                    // Do not call `insert_logical`: that method is allowed to
+                    // enrich the proof set of an existing expression, while
+                    // this attempt must remain completely side-effect free.
+                    if context
+                        .memo()
+                        .logical_expr_for_key(target, &output.key)
+                        .is_some()
+                    {
+                        continue;
+                    }
+                    let before = context
+                        .memo()
                         .group(target)
                         .map(|group| group.logical_exprs().len())
                         .unwrap_or(0);
-                    self.memo
-                        .insert_logical(target, output.key, output.payload, output.proof)?;
-                    let after = self.memo.group(target).unwrap().logical_exprs().len();
+                    context.memo_mut().insert_logical(
+                        target,
+                        output.key,
+                        output.payload,
+                        output.proof,
+                    )?;
+                    let after = context
+                        .memo()
+                        .group(target)
+                        .expect("target group was validated")
+                        .logical_exprs()
+                        .len();
                     if after > before {
                         inserted_groups.insert(target);
                     }
                 }
                 Ok(inserted_groups)
             })();
-            let inserted_groups = match insertion {
+            let mut inserted_groups = match insertion {
                 Ok(groups) => groups,
                 Err(error) => {
-                    self.memo.rollback_transformation(memo_savepoint);
+                    context.rollback()?;
                     self.memo
                         .group_mut(group)
                         .ok_or_else(|| paro_error::internal("rule task references unknown group"))?
@@ -491,11 +506,10 @@ impl CascadesEngine {
                     continue;
                 }
             };
-            if !inserted_groups.is_empty() {
-                *self.effective_rule_insertions.entry(rule).or_default() +=
-                    u64::try_from(inserted_groups.len()).unwrap_or(u64::MAX);
-            }
             if inserted_groups.is_empty() {
+                // A duplicate root is not an effective transformation. Drop
+                // any staged child groups and planner payloads with it.
+                context.rollback()?;
                 self.memo
                     .group_mut(group)
                     .ok_or_else(|| paro_error::internal("rule task references unknown group"))?
@@ -504,6 +518,11 @@ impl CascadesEngine {
                         BudgetDimension::LogicalExprPerGroup,
                         output_event,
                     );
+            } else {
+                let appended_groups = context.commit()?;
+                *self.effective_rule_insertions.entry(rule).or_default() +=
+                    u64::try_from(inserted_groups.len()).unwrap_or(u64::MAX);
+                inserted_groups.extend(appended_groups);
             }
             for target in inserted_groups {
                 self.schedule_transformations(target, &mut agenda)?;
@@ -1216,722 +1235,5 @@ fn enforced_fingerprint(
 }
 
 #[cfg(test)]
-mod tests {
-    use paro_common::types::LogicalType;
-
-    use super::*;
-    use crate::cascades::column::{ColumnDesc, ColumnOrigin, ColumnVisibility, GroupSchema};
-    use crate::cascades::cost::{CompactRange, ScoreSummary};
-    use crate::cascades::ids::{
-        AdmissibleGrantSetId, ColumnId, LogicalPayloadId, ObjectiveProfileId,
-        OptimizationContextId, PhysicalPayloadId,
-    };
-    use crate::cascades::memo::{
-        GrantGoalKey, LogicalExprKey, LogicalProperties, PhysicalExprKey, RowGoal,
-    };
-    use crate::cascades::properties::{
-        MutationSafetyRequirement, OrderingRequirement, PartitioningRequirement,
-        ProvidedMaterialization, ProvidedMutationSafety, ProvidedOrdering, ProvidedPartitioning,
-        ProvidedReplayability, ProvidedRepresentation, ReplayabilityRequirement,
-        RepresentationRequirement, RequiredProperties, ResultGuarantee,
-    };
-    use crate::cascades::rules::{
-        EquivalentExpression, GrantDependencyDescriptor, PhysicalImplementation, RulePromise,
-        TransformationRule,
-    };
-
-    fn schema() -> GroupSchema {
-        GroupSchema::new([ColumnDesc {
-            id: ColumnId(0),
-            logical_type: LogicalType::BigInt,
-            nullable: false,
-            origin: ColumnOrigin::Derived {
-                key: Fingerprint(1),
-            },
-            visibility: ColumnVisibility::Visible,
-            name_hint: None,
-        }])
-        .unwrap()
-    }
-
-    fn required() -> RequiredProperties {
-        RequiredProperties {
-            ordering: OrderingRequirement::Any,
-            partitioning: PartitioningRequirement::Any,
-            materialization: Default::default(),
-            mutation_safety: MutationSafetyRequirement::None,
-            representation: RepresentationRequirement::Flat,
-            replayability: ReplayabilityRequirement::Any,
-            result_guarantee: ResultGuarantee::Exact,
-        }
-    }
-
-    fn provided() -> super::super::properties::ProvidedProperties {
-        super::super::properties::ProvidedProperties {
-            ordering: ProvidedOrdering::Unordered,
-            partitioning: ProvidedPartitioning::Singleton,
-            materialization: ProvidedMaterialization::default(),
-            mutation_safety: ProvidedMutationSafety::NotApplicable,
-            representation: ProvidedRepresentation::Flat,
-            replayability: ProvidedReplayability::OnePass,
-            result_guarantee: ResultGuarantee::Exact,
-        }
-    }
-
-    fn cost(score: f64) -> SearchCost {
-        SearchCost {
-            score: ScoreSummary {
-                range: CompactRange::point(score).unwrap(),
-                risk_adjusted: score,
-            },
-            critical_path: CompactRange::point(score).unwrap(),
-            ..SearchCost::ZERO
-        }
-    }
-
-    struct AddEquivalent;
-
-    impl TransformationRule for AddEquivalent {
-        fn id(&self) -> RuleId {
-            RuleId(5)
-        }
-
-        fn promise(&self, _: &super::super::memo::LogicalExpr, _: &RuleContext<'_>) -> RulePromise {
-            RulePromise::HIGH
-        }
-
-        fn matches(&self, expr: &super::super::memo::LogicalExpr, _: &RuleContext<'_>) -> bool {
-            expr.key.operator == Fingerprint(10)
-        }
-
-        fn apply(
-            &self,
-            expr: LogicalExprId,
-            ctx: &mut TransformContext<'_>,
-        ) -> Result<Box<[EquivalentExpression]>> {
-            Ok(vec![EquivalentExpression {
-                target_group: ctx.group,
-                key: LogicalExprKey {
-                    operator: Fingerprint(11),
-                    scalars: Box::new([]),
-                    children: Box::new([]),
-                },
-                payload: LogicalPayloadId(1),
-                proof: EquivalenceProof::Transformation {
-                    rule: self.id(),
-                    source: expr,
-                    premise: Fingerprint(77),
-                },
-            }]
-            .into_boxed_slice())
-        }
-    }
-
-    struct FailAfterMemoWrite;
-
-    impl TransformationRule for FailAfterMemoWrite {
-        fn id(&self) -> RuleId {
-            RuleId(6)
-        }
-
-        fn matches(&self, expr: &super::super::memo::LogicalExpr, _: &RuleContext<'_>) -> bool {
-            expr.key.operator == Fingerprint(10)
-        }
-
-        fn apply(
-            &self,
-            _: LogicalExprId,
-            ctx: &mut TransformContext<'_>,
-        ) -> Result<Box<[EquivalentExpression]>> {
-            ctx.memo
-                .create_group(schema(), LogicalProperties::default());
-            Err(paro_error::internal("injected optional-rule failure"))
-        }
-    }
-
-    struct LeafImplementation;
-
-    impl PhysicalImplementation for LeafImplementation {
-        fn id(&self) -> ImplementationId {
-            ImplementationId(3)
-        }
-
-        fn matches(
-            &self,
-            _: &super::super::memo::LogicalExpr,
-            _: OptimizationGoal,
-            _: &ImplementationContext<'_>,
-        ) -> bool {
-            true
-        }
-
-        fn candidates(
-            &self,
-            expr: LogicalExprId,
-            _: OptimizationGoal,
-            ctx: &ImplementationContext<'_>,
-        ) -> Result<Box<[PhysicalCandidate]>> {
-            let logical = ctx.memo.logical_expr(expr).unwrap();
-            let score = if logical.key.operator == Fingerprint(11) {
-                1.0
-            } else {
-                5.0
-            };
-            Ok(vec![PhysicalCandidate {
-                key: PhysicalExprKey {
-                    implementation: self.id(),
-                    logical: expr,
-                    children: Box::new([]),
-                    payload_fingerprint: logical.key.operator,
-                },
-                payload: PhysicalPayloadId(expr.0),
-                provided: provided(),
-                child_goals: Box::new([]),
-                local_cost: cost(score),
-                cost_composition: CostComposition::Sequential,
-                spillable: false,
-                enforcer_cost_input: EnforcerCostInput::unbounded(CompactRange::point(1.0)?, 8),
-                physical_fingerprint: logical.key.operator,
-                region: None,
-                mandatory: logical.key.operator == Fingerprint(10),
-            }]
-            .into_boxed_slice())
-        }
-    }
-
-    fn engine(optional_rules: u32) -> (CascadesEngine, GroupId, OptimizationGoal) {
-        let mut budget = super::super::budget::SearchBudget::default();
-        budget.max_rule_firings_per_group = optional_rules;
-        engine_with_budget(budget)
-    }
-
-    fn engine_with_budget(
-        budget: super::super::budget::SearchBudget,
-    ) -> (CascadesEngine, GroupId, OptimizationGoal) {
-        let mut memo = Memo::new(budget);
-        let group = memo.create_group(schema(), LogicalProperties::default());
-        memo.insert_logical(
-            group,
-            LogicalExprKey {
-                operator: Fingerprint(10),
-                scalars: Box::new([]),
-                children: Box::new([]),
-            },
-            LogicalPayloadId(0),
-            EquivalenceProof::Initial,
-        )
-        .unwrap();
-        let required = memo.intern_required(required()).unwrap();
-        let goal = OptimizationGoal {
-            required,
-            row_goal: RowGoal::All,
-            objective: ObjectiveProfileId(0),
-            grant: GrantGoalKey::Invariant(AdmissibleGrantSetId(0)),
-            context: OptimizationContextId(0),
-        };
-        let mut registry = ImplementationRegistry::default();
-        registry.register_transformation(AddEquivalent).unwrap();
-        registry
-            .register_implementation(LeafImplementation)
-            .unwrap();
-        (CascadesEngine::new(memo, registry), group, goal)
-    }
-
-    #[test]
-    fn optional_transformation_can_improve_mandatory_baseline() {
-        let (mut engine, group, goal) = engine(8);
-        let winner = engine.optimize(group, goal, SearchMode::Memo).unwrap();
-        assert!(winner.cost.score.risk_adjusted < 5.0);
-        assert_eq!(winner.physical_fingerprint, Fingerprint(11));
-    }
-
-    #[test]
-    fn disabled_transformation_keeps_the_mandatory_baseline() {
-        let mut budget = super::super::budget::SearchBudget::default();
-        budget.disable_transformation(RuleId(5));
-        let (mut engine, group, goal) = engine_with_budget(budget);
-        let winner = engine.optimize(group, goal, SearchMode::Memo).unwrap();
-        assert_eq!(winner.physical_fingerprint, Fingerprint(10));
-    }
-
-    #[test]
-    fn exhausted_optional_budget_still_extracts_baseline() {
-        let (mut engine, group, goal) = engine(0);
-        let winner = engine.optimize(group, goal, SearchMode::Memo).unwrap();
-        assert_eq!(winner.cost.score.risk_adjusted, 5.0);
-        assert_eq!(winner.physical_fingerprint, Fingerprint(10));
-    }
-
-    #[test]
-    fn failed_optional_transformation_rolls_back_and_keeps_baseline() {
-        let mut budget = super::super::budget::SearchBudget::default();
-        budget.disable_transformation(RuleId(5));
-        let (mut engine, group, goal) = engine_with_budget(budget);
-        engine
-            .registry
-            .register_transformation(FailAfterMemoWrite)
-            .unwrap();
-        let groups_before = engine.memo.group_count();
-
-        let winner = engine.optimize(group, goal, SearchMode::Memo).unwrap();
-
-        assert_eq!(winner.physical_fingerprint, Fingerprint(10));
-        assert_eq!(engine.memo.group_count(), groups_before);
-        assert_eq!(
-            engine
-                .memo
-                .group(group)
-                .unwrap()
-                .ledger
-                .consumed(BudgetDimension::LogicalExprPerGroup),
-            0
-        );
-    }
-
-    #[test]
-    fn direct_and_memo_share_implementation_registry() {
-        let (mut direct, group, goal) = engine(8);
-        let direct_winner = direct.optimize(group, goal, SearchMode::Direct).unwrap();
-        assert_eq!(direct_winner.physical_fingerprint, Fingerprint(10));
-
-        let (mut memo, group, goal) = engine(8);
-        let memo_winner = memo.optimize(group, goal, SearchMode::Memo).unwrap();
-        assert_eq!(memo_winner.physical_fingerprint, Fingerprint(11));
-    }
-
-    struct ReplaceInfeasibleBranch;
-
-    impl TransformationRule for ReplaceInfeasibleBranch {
-        fn id(&self) -> RuleId {
-            RuleId(13)
-        }
-
-        fn matches(&self, expr: &super::super::memo::LogicalExpr, _: &RuleContext<'_>) -> bool {
-            expr.key.operator == Fingerprint(30)
-        }
-
-        fn apply(
-            &self,
-            expr: LogicalExprId,
-            ctx: &mut TransformContext<'_>,
-        ) -> Result<Box<[EquivalentExpression]>> {
-            Ok(vec![EquivalentExpression {
-                target_group: ctx.group,
-                key: LogicalExprKey {
-                    operator: Fingerprint(31),
-                    scalars: Box::new([]),
-                    children: Box::new([]),
-                },
-                payload: LogicalPayloadId(2),
-                proof: EquivalenceProof::Transformation {
-                    rule: self.id(),
-                    source: expr,
-                    premise: Fingerprint(31),
-                },
-            }]
-            .into_boxed_slice())
-        }
-    }
-
-    struct FeasibleAlternativeImplementation;
-
-    impl PhysicalImplementation for FeasibleAlternativeImplementation {
-        fn id(&self) -> ImplementationId {
-            ImplementationId(14)
-        }
-
-        fn matches(
-            &self,
-            expr: &super::super::memo::LogicalExpr,
-            _: OptimizationGoal,
-            _: &ImplementationContext<'_>,
-        ) -> bool {
-            matches!(expr.key.operator, Fingerprint(30) | Fingerprint(31))
-        }
-
-        fn candidates(
-            &self,
-            expr: LogicalExprId,
-            goal: OptimizationGoal,
-            ctx: &ImplementationContext<'_>,
-        ) -> Result<Box<[PhysicalCandidate]>> {
-            let logical = ctx.memo.logical_expr(expr).unwrap();
-            let children = logical.key.children.clone();
-            let child_goals = children
-                .iter()
-                .copied()
-                .map(|child| (child, goal))
-                .collect::<Vec<_>>()
-                .into_boxed_slice();
-            Ok(vec![PhysicalCandidate {
-                key: PhysicalExprKey {
-                    implementation: self.id(),
-                    logical: expr,
-                    children,
-                    payload_fingerprint: logical.key.operator,
-                },
-                payload: PhysicalPayloadId(logical.payload.0),
-                provided: provided(),
-                child_goals,
-                local_cost: cost(1.0),
-                cost_composition: CostComposition::Sequential,
-                spillable: false,
-                enforcer_cost_input: EnforcerCostInput::unbounded(CompactRange::point(1.0)?, 8),
-                physical_fingerprint: logical.key.operator,
-                region: None,
-                mandatory: logical.key.operator == Fingerprint(30),
-            }]
-            .into_boxed_slice())
-        }
-    }
-
-    #[test]
-    fn infeasible_child_rejects_only_its_parent_recipe() {
-        let mut memo = Memo::new(super::super::budget::SearchBudget::default());
-        let child = memo.create_group(schema(), LogicalProperties::default());
-        memo.insert_logical(
-            child,
-            LogicalExprKey {
-                operator: Fingerprint(32),
-                scalars: Box::new([]),
-                children: Box::new([]),
-            },
-            LogicalPayloadId(0),
-            EquivalenceProof::Initial,
-        )
-        .unwrap();
-        let root = memo.create_group(schema(), LogicalProperties::default());
-        memo.insert_logical(
-            root,
-            LogicalExprKey {
-                operator: Fingerprint(30),
-                scalars: Box::new([]),
-                children: Box::new([child]),
-            },
-            LogicalPayloadId(1),
-            EquivalenceProof::Initial,
-        )
-        .unwrap();
-        let required = memo.intern_required(required()).unwrap();
-        let goal = OptimizationGoal {
-            required,
-            row_goal: RowGoal::All,
-            objective: ObjectiveProfileId(0),
-            grant: GrantGoalKey::Invariant(AdmissibleGrantSetId(0)),
-            context: OptimizationContextId(0),
-        };
-        let mut registry = ImplementationRegistry::default();
-        registry
-            .register_transformation(ReplaceInfeasibleBranch)
-            .unwrap();
-        registry
-            .register_implementation(FeasibleAlternativeImplementation)
-            .unwrap();
-        let mut engine = CascadesEngine::new(memo, registry);
-
-        let winner = engine.optimize(root, goal, SearchMode::Memo).unwrap();
-
-        assert_eq!(winner.physical_fingerprint, Fingerprint(31));
-    }
-
-    #[test]
-    fn blocking_enforcers_participate_in_grant_feasibility() {
-        let rows = CompactRange::point(1_000.0).unwrap();
-        let too_small = EnforcerCostInput {
-            rows,
-            row_width_bytes: 16,
-            hard_memory_bytes: 1_024,
-            spill_policy: SpillPolicy::Forbidden,
-        };
-        assert!(enforcer_cost(
-            &[EnforcerStep::MutationInputSpool {
-                barrier: super::super::ids::MutationBarrierId(0),
-            }],
-            too_small,
-            &MachineCalibrationBundle::default(),
-        )
-        .unwrap()
-        .is_none());
-
-        let spillable = EnforcerCostInput {
-            spill_policy: SpillPolicy::Allowed,
-            ..too_small
-        };
-        let ordering = super::super::properties::RequiredOrdering {
-            keys: vec![super::super::properties::OrderingKey {
-                column: ColumnId(0),
-                direction: super::super::properties::SortDirection::Asc,
-                nulls: super::super::properties::NullOrder::Last,
-                collation: None,
-            }]
-            .into_boxed_slice(),
-            scope: super::super::properties::OrderingScope::Global,
-        };
-        let cost = enforcer_cost(
-            &[EnforcerStep::Sort(ordering)],
-            spillable,
-            &MachineCalibrationBundle::default(),
-        )
-        .unwrap()
-        .expect("sort may spill under an allowed grant");
-        assert_eq!(cost.peak_memory_upper, 1_024);
-        assert!(cost.spill_bytes_expected > 0);
-        assert!(
-            cost.resources_expected[super::super::cost::ResourceDimension::SequentialIo as usize]
-                > 0.0
-        );
-    }
-
-    #[test]
-    fn retained_operator_state_overlaps_child_pipeline_memory() {
-        let local = SearchCost {
-            peak_memory_upper: 100,
-            ..cost(1.0)
-        };
-        let child = SearchCost {
-            peak_memory_upper: 40,
-            ..cost(1.0)
-        };
-        let sequential = compose_candidate_cost(local, &[child], CostComposition::Sequential)
-            .expect("sequential composition");
-        let retained = compose_candidate_cost(
-            local,
-            &[child],
-            CostComposition::RetainedState {
-                overlapping_children: 1,
-            },
-        )
-        .expect("retained-state composition");
-        assert_eq!(sequential.peak_memory_upper, 100);
-        assert_eq!(retained.peak_memory_upper, 140);
-    }
-
-    #[test]
-    fn mandatory_unknown_state_is_capped_after_child_winners_are_known() {
-        let local = SearchCost {
-            peak_memory_upper: u64::MAX,
-            ..cost(1.0)
-        };
-        let child = SearchCost {
-            peak_memory_upper: 40,
-            ..cost(1.0)
-        };
-        let grant = EnforcerCostInput {
-            rows: CompactRange::point(1.0).unwrap(),
-            row_width_bytes: 8,
-            hard_memory_bytes: 100,
-            spill_policy: SpillPolicy::Forbidden,
-        };
-
-        let fitted = fit_local_retained_state_to_grant(
-            local,
-            &[child],
-            CostComposition::RetainedState {
-                overlapping_children: 1,
-            },
-            false,
-            true,
-            grant,
-        )
-        .unwrap()
-        .expect("the allocator-capped mandatory implementation remains feasible");
-        let composed = compose_candidate_cost(
-            fitted,
-            &[child],
-            CostComposition::RetainedState {
-                overlapping_children: 1,
-            },
-        )
-        .unwrap();
-
-        assert_eq!(fitted.peak_memory_upper, 60);
-        assert_eq!(fitted.spill_bytes_expected, 0);
-        assert_eq!(fitted.score, local.score);
-        assert_eq!(composed.peak_memory_upper, 100);
-    }
-
-    #[test]
-    fn mandatory_parent_does_not_count_a_child_allocator_cap_twice() {
-        let local = SearchCost {
-            peak_memory_upper: 120,
-            ..cost(1.0)
-        };
-        let child = SearchCost {
-            peak_memory_upper: 1_024,
-            ..cost(1.0)
-        };
-        let grant = EnforcerCostInput {
-            rows: CompactRange::point(1.0).unwrap(),
-            row_width_bytes: 8,
-            hard_memory_bytes: 1_024,
-            spill_policy: SpillPolicy::Forbidden,
-        };
-
-        let fitted = fit_local_retained_state_to_grant(
-            local,
-            &[child],
-            CostComposition::RetainedState {
-                overlapping_children: 1,
-            },
-            false,
-            true,
-            grant,
-        )
-        .unwrap()
-        .expect("mandatory parent shares the child allocator cap");
-        let composed = compose_candidate_cost(
-            fitted,
-            &[child],
-            CostComposition::RetainedState {
-                overlapping_children: 1,
-            },
-        )
-        .unwrap();
-
-        assert_eq!(fitted.peak_memory_upper, 0);
-        assert_eq!(composed.peak_memory_upper, 1_024);
-    }
-
-    struct GrantTreeImplementation;
-
-    impl PhysicalImplementation for GrantTreeImplementation {
-        fn id(&self) -> ImplementationId {
-            ImplementationId(12)
-        }
-
-        fn grant_dependency_for(
-            &self,
-            expr: &super::super::memo::LogicalExpr,
-            _: &ImplementationContext<'_>,
-        ) -> GrantDependencyDescriptor {
-            if expr.key.operator == Fingerprint(20) {
-                GrantDependencyDescriptor::Sensitive
-            } else {
-                GrantDependencyDescriptor::Invariant
-            }
-        }
-
-        fn matches(
-            &self,
-            _: &super::super::memo::LogicalExpr,
-            _: OptimizationGoal,
-            _: &ImplementationContext<'_>,
-        ) -> bool {
-            true
-        }
-
-        fn candidates(
-            &self,
-            expr: LogicalExprId,
-            goal: OptimizationGoal,
-            ctx: &ImplementationContext<'_>,
-        ) -> Result<Box<[PhysicalCandidate]>> {
-            let logical = ctx.memo.logical_expr(expr).unwrap();
-            let children = logical.key.children.clone();
-            let child_goals = children
-                .iter()
-                .copied()
-                .map(|child| (child, goal))
-                .collect::<Vec<_>>()
-                .into_boxed_slice();
-            Ok(vec![PhysicalCandidate {
-                key: PhysicalExprKey {
-                    implementation: self.id(),
-                    logical: expr,
-                    children,
-                    payload_fingerprint: logical.key.operator,
-                },
-                payload: PhysicalPayloadId(expr.0),
-                provided: provided(),
-                child_goals,
-                local_cost: cost(1.0),
-                cost_composition: CostComposition::Sequential,
-                spillable: false,
-                enforcer_cost_input: EnforcerCostInput::unbounded(CompactRange::point(1.0)?, 8),
-                physical_fingerprint: logical.key.operator,
-                region: None,
-                mandatory: true,
-            }]
-            .into_boxed_slice())
-        }
-    }
-
-    #[test]
-    fn grant_sensitive_parent_reuses_invariant_child_goal_across_classes() {
-        let mut budget = super::super::budget::SearchBudget::default();
-        budget.max_grant_classes = 2;
-        let mut memo = Memo::new(budget);
-        let child = memo.create_group(schema(), LogicalProperties::default());
-        memo.insert_logical(
-            child,
-            LogicalExprKey {
-                operator: Fingerprint(21),
-                scalars: Box::new([]),
-                children: Box::new([]),
-            },
-            LogicalPayloadId(0),
-            EquivalenceProof::Initial,
-        )
-        .unwrap();
-        let root = memo.create_group(schema(), LogicalProperties::default());
-        memo.insert_logical(
-            root,
-            LogicalExprKey {
-                operator: Fingerprint(20),
-                scalars: Box::new([]),
-                children: vec![child].into_boxed_slice(),
-            },
-            LogicalPayloadId(1),
-            EquivalenceProof::Initial,
-        )
-        .unwrap();
-        let required = memo.intern_required(required()).unwrap();
-        let goal = OptimizationGoal {
-            required,
-            row_goal: RowGoal::All,
-            objective: ObjectiveProfileId(0),
-            grant: GrantGoalKey::Invariant(AdmissibleGrantSetId(0)),
-            context: OptimizationContextId(0),
-        };
-        let mut registry = ImplementationRegistry::default();
-        registry
-            .register_implementation(GrantTreeImplementation)
-            .unwrap();
-        let mut engine = CascadesEngine::new(memo, registry);
-        let optimized = engine
-            .optimize_for_grants(
-                root,
-                goal,
-                AdmissibleGrantSetId(9),
-                [ResourceGrantClassId(1), ResourceGrantClassId(2)],
-                SearchMode::Direct,
-            )
-            .unwrap();
-        assert!(optimized.sensitivity.is_sensitive());
-        let child_goals = engine
-            .memo()
-            .group(child)
-            .unwrap()
-            .winners()
-            .map(|(goal, _)| goal.grant)
-            .collect::<Vec<_>>();
-        assert_eq!(
-            child_goals,
-            vec![GrantGoalKey::Invariant(AdmissibleGrantSetId(9))]
-        );
-        let root_goals = engine
-            .memo()
-            .group(root)
-            .unwrap()
-            .winners()
-            .map(|(goal, _)| goal.grant)
-            .collect::<Vec<_>>();
-        assert_eq!(
-            root_goals,
-            vec![
-                GrantGoalKey::Class(ResourceGrantClassId(1)),
-                GrantGoalKey::Class(ResourceGrantClassId(2)),
-            ]
-        );
-    }
-}
+#[path = "engine/tests.rs"]
+mod tests;

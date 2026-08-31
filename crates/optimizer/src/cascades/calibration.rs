@@ -10,6 +10,9 @@ use paro_common::error::{self as paro_error, Result};
 use super::cost::{CompactRange, ResourceDimension, ScoreSummary, SearchCost, RESOURCE_DIMS};
 use super::ids::{CalibrationRevisionId, OpClassId};
 
+#[path = "calibration/generated.rs"]
+mod generated;
+
 pub const MAX_LOCAL_OP_CLASSES: usize = 16;
 
 // Stable built-in classes used by the property-enforcement cost model. They
@@ -111,44 +114,36 @@ pub struct MachineCalibrationBundle {
     pub revision: CalibrationRevisionId,
     pub hardware_class: String,
     pub corpus_id: String,
+    /// `bootstrap` is an explicitly provisional checked-in model; measured
+    /// artifacts carry their immutable generation provenance here.
+    pub provenance: String,
     coefficients: BTreeMap<OpClassId, CalibratedOpCost>,
     pub conservative_fallback: CalibratedOpCost,
     pub risk_weight: f64,
 }
 
 impl MachineCalibrationBundle {
-    /// Versioned offline calibration shipped with the engine. Production
-    /// planning must use an explicit corpus-backed bundle rather than the
-    /// conservative unknown-class fallback used by isolated unit tests.
+    /// Versioned, generated calibration shipped with the engine. The source
+    /// manifest records whether the coefficients are bootstrap or measured;
+    /// production never silently presents provisional numbers as corpus-fit.
     pub fn builtin_production() -> Self {
         let mut bundle = Self::default();
-        bundle.revision = CalibrationRevisionId(1);
-        bundle.hardware_class = "portable-cpu-v1".to_string();
-        bundle.corpus_id = "operator-runtime-2026-08".to_string();
-        for (id, expected, risk, latency, latency_upper) in [
-            (1, 1.30, 2.60, 1.30, 3.90),
-            (2, 0.70, 1.50, 0.70, 2.20),
-            (3, 1.00, 3.00, 1.00, 4.00),
-            (4, 1.20, 3.60, 1.20, 5.00),
-            (5, 0.65, 1.80, 0.65, 2.40),
-            (6, 0.80, 2.10, 0.80, 2.80),
-            (7, 0.90, 2.20, 0.90, 3.00),
-            (8, 1.50, 3.50, 1.50, 4.50),
-            (9, 0.45, 1.10, 0.45, 1.60),
-            (10, 0.20, 0.55, 0.20, 0.80),
-            (13, 1.40, 3.80, 1.40, 5.20),
-            (14, 0.55, 1.40, 0.55, 2.00),
-            (15, 0.25, 0.70, 0.25, 1.00),
-        ] {
+        bundle.revision = CalibrationRevisionId(generated::REVISION);
+        bundle.hardware_class = generated::HARDWARE_CLASS.to_string();
+        bundle.corpus_id = generated::CORPUS_ID.to_string();
+        bundle.provenance = generated::PROVENANCE.to_string();
+        bundle.risk_weight = generated::RISK_WEIGHT;
+        bundle.coefficients.clear();
+        for coefficient in generated::COEFFICIENTS {
             bundle
                 .set(
-                    OpClassId(id),
+                    coefficient.class,
                     calibrated_dimension(
-                        ResourceDimension::Cpu,
-                        expected,
-                        risk,
-                        latency,
-                        latency_upper,
+                        coefficient.dimension,
+                        coefficient.expected,
+                        coefficient.risk,
+                        coefficient.latency_expected,
+                        coefficient.latency_upper,
                     ),
                 )
                 .expect("built-in production calibration must be valid");
@@ -262,6 +257,7 @@ impl Default for MachineCalibrationBundle {
             revision: CalibrationRevisionId(0),
             hardware_class: "conservative-fallback".into(),
             corpus_id: "builtin".into(),
+            provenance: "conservative-fallback".into(),
             coefficients,
             conservative_fallback: CalibratedOpCost {
                 expected_resources_per_unit: expected,
@@ -275,6 +271,16 @@ impl Default for MachineCalibrationBundle {
             risk_weight: 0.5,
         }
     }
+}
+
+#[derive(Debug, Clone, Copy)]
+struct BuiltinCoefficient {
+    class: OpClassId,
+    dimension: ResourceDimension,
+    expected: f64,
+    risk: f64,
+    latency_expected: f64,
+    latency_upper: f64,
 }
 
 fn calibrated_dimension(
@@ -323,6 +329,14 @@ mod tests {
     fn production_bundle_is_versioned_and_operator_specific() {
         let bundle = MachineCalibrationBundle::builtin_production();
         assert_eq!(bundle.revision, CalibrationRevisionId(1));
+        assert_eq!(bundle.provenance, "bootstrap");
+        for class in [
+            OP_RUNTIME_FILTER_BUILD_ROW,
+            OP_RUNTIME_FILTER_APPLY_ROW,
+            OP_TUPLE_BYTE_BLOCK,
+        ] {
+            assert!(bundle.coefficients.contains_key(&class));
+        }
         let mut build = LocalOperatorWork::default();
         build
             .add(OpClassId(1), CompactRange::point(10.0).unwrap())

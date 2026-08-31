@@ -29,13 +29,63 @@ use super::scalar::{
     ComparisonOp, ScalarArena, ScalarKind, ScalarLocalProperties, ScalarSpec, Volatility,
 };
 
-type BindingMap = BTreeMap<(usize, usize, Fingerprint), ColumnId>;
+type BindingKey = (usize, usize, Fingerprint);
+
+/// Stable planner binding to optimizer column identities with an append-only
+/// insertion journal. Transformations can therefore roll back the delta
+/// instead of cloning the complete query binding map for every rule attempt.
+#[derive(Debug, Clone, Default)]
+pub(crate) struct BindingCatalog {
+    entries: BTreeMap<BindingKey, ColumnId>,
+    insertions: Vec<BindingKey>,
+}
+
+impl BindingCatalog {
+    pub(crate) fn get(&self, key: &BindingKey) -> Option<&ColumnId> {
+        self.entries.get(key)
+    }
+
+    pub(crate) fn insert(&mut self, key: BindingKey, column: ColumnId) -> Result<()> {
+        if let Some(existing) = self.entries.get(&key) {
+            if *existing != column {
+                return Err(paro_error::internal(
+                    "planner binding changed its optimizer column identity",
+                ));
+            }
+            return Ok(());
+        }
+        self.entries.insert(key, column);
+        self.insertions.push(key);
+        Ok(())
+    }
+
+    pub(crate) fn checkpoint(&self) -> usize {
+        self.insertions.len()
+    }
+
+    pub(crate) fn rollback_to(&mut self, checkpoint: usize) -> Result<()> {
+        if checkpoint > self.insertions.len() {
+            return Err(paro_error::internal(
+                "binding catalog rollback exceeds its insertion journal",
+            ));
+        }
+        while self.insertions.len() > checkpoint {
+            let key = self.insertions.pop().expect("journal length was checked");
+            if self.entries.remove(&key).is_none() {
+                return Err(paro_error::internal(
+                    "binding catalog insertion journal disagrees with its index",
+                ));
+            }
+        }
+        Ok(())
+    }
+}
 
 pub(crate) fn intern_operator_scalars(
     operator: &mut LogicalOperator,
     output_columns: &[ColumnId],
     child_columns: &[Box<[ColumnId]>],
-    binding_ids: &mut BindingMap,
+    binding_ids: &mut BindingCatalog,
     columns: &mut ColumnCatalog,
     arena: &mut ScalarArena,
 ) -> Result<Box<[ScalarExprId]>> {
@@ -189,7 +239,7 @@ pub(crate) fn intern_operator_scalars(
 
 fn get_reference_columns(
     get: &paro_planner::operator::Get,
-    binding_ids: &mut BindingMap,
+    binding_ids: &mut BindingCatalog,
     columns: &mut ColumnCatalog,
 ) -> Result<Vec<ColumnId>> {
     get.returned_types
@@ -210,7 +260,7 @@ fn get_reference_columns(
 fn intern_expression(
     expression: &Expression,
     reference_columns: &[ColumnId],
-    binding_ids: &mut BindingMap,
+    binding_ids: &mut BindingCatalog,
     columns: &mut ColumnCatalog,
     arena: &mut ScalarArena,
 ) -> Result<ScalarExprId> {
@@ -365,7 +415,7 @@ fn intern_comparison(
 fn intern_column_binding(
     binding: ColumnBinding,
     logical_type: LogicalType,
-    binding_ids: &mut BindingMap,
+    binding_ids: &mut BindingCatalog,
     columns: &mut ColumnCatalog,
 ) -> Result<ColumnId> {
     let type_domain = logical_type_fingerprint(&logical_type);
@@ -382,7 +432,7 @@ fn intern_column_binding(
         ColumnVisibility::Hidden,
         None,
     )?;
-    binding_ids.insert(key, column);
+    binding_ids.insert(key, column)?;
     Ok(column)
 }
 

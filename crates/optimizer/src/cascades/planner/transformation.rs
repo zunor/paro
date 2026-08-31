@@ -5,6 +5,8 @@
 
 use super::*;
 
+mod matching;
+
 pub(super) fn register_transformations(
     registry: &mut ImplementationRegistry,
     planner_state: Arc<RwLock<PlannerTransformState>>,
@@ -69,37 +71,6 @@ impl PlannerTransformation {
             Self::ScalarAggregateWindow => SCALAR_AGGREGATE_WINDOW_RULE,
         }
     }
-
-    fn matches(self, operator: LogicalOperatorType, rowset_scan_pushdown: bool) -> bool {
-        use LogicalOperatorType as Op;
-        match self {
-            Self::ExpensivePredicatePlacement => operator == Op::Filter,
-            Self::CteInline | Self::CteFilterPushdown => matches!(
-                operator,
-                Op::MaterializedCTE | Op::RecursiveCTE | Op::CTERef
-            ),
-            Self::AggregatePostReduction => {
-                matches!(operator, Op::MaterializedCTE | Op::Projection | Op::Filter)
-            }
-            Self::JoinElimination => matches!(
-                operator,
-                Op::Projection | Op::Filter | Op::Aggregate | Op::Limit | Op::Order | Op::TopN
-            ),
-            Self::AggregateJoinPreaggregation
-            | Self::AggregateJoinSubsumption
-            | Self::AggregateNonNullInput
-            | Self::AggregateDimensionDeferral
-            | Self::AggregateInputMaterialization => operator == Op::Aggregate,
-            Self::LimitPushdown => operator == Op::Limit,
-            Self::LatePayloadFetch => {
-                rowset_scan_pushdown
-                    && matches!(operator, Op::Projection | Op::Aggregate | Op::TopN)
-            }
-            Self::ScalarAggregateWindow => {
-                matches!(operator, Op::ComparisonJoin | Op::Projection | Op::Filter)
-            }
-        }
-    }
 }
 
 #[derive(Debug)]
@@ -127,10 +98,7 @@ impl TransformationRule for PlannerTransformationRule {
             .read()
             .expect("planner transform state poisoned");
         state.binder.is_some()
-            && state.metadata.get(&expr.payload).is_some_and(|metadata| {
-                self.transformation
-                    .matches(metadata.operator_type, state.rowset_scan_pushdown)
-            })
+            && matching::matches_transformation(self.transformation, expr, _ctx.memo, &state)
     }
 
     fn apply(
@@ -138,14 +106,15 @@ impl TransformationRule for PlannerTransformationRule {
         expr: LogicalExprId,
         ctx: &mut TransformContext<'_>,
     ) -> Result<Box<[EquivalentExpression]>> {
+        let target_group = ctx.group();
         let (plan, source_stats, source_region, environment) =
             {
                 let state = self
                     .planner_state
                     .read()
                     .expect("planner transform state poisoned");
-                let plan = materialize_memo_expression(ctx.memo, &state, expr)?;
-                let logical = ctx.memo.logical_expr(expr).ok_or_else(|| {
+                let plan = semantic_view::materialize(ctx.memo(), &state, expr)?;
+                let logical = ctx.memo().logical_expr(expr).ok_or_else(|| {
                     paro_error::internal("planner rule lost its source expression")
                 })?;
                 let metadata = state
@@ -190,7 +159,7 @@ impl TransformationRule for PlannerTransformationRule {
         let mut preserved_region_facet = None;
         if let Some((facet, source_operator)) = source_region {
             let kind = ctx
-                .memo
+                .memo()
                 .regions()
                 .nodes
                 .iter()
@@ -215,7 +184,7 @@ impl TransformationRule for PlannerTransformationRule {
                 debug!(
                     target: targets::OPTIMIZER,
                     rule = self.id().0,
-                    group = ctx.group.index(),
+                    group = target_group.index(),
                     ?kind,
                     "discarded local transformation that cannot preserve a required region"
                 );
@@ -226,42 +195,42 @@ impl TransformationRule for PlannerTransformationRule {
             .planner_state
             .write()
             .expect("planner transform state poisoned");
-        if !transformed_plan_matches_group_contract(&plan, ctx.group, ctx.memo, &state)? {
+        if !transformed_plan_matches_group_contract(&plan, target_group, ctx.memo(), &state)? {
             debug!(
                 target: targets::OPTIMIZER,
                 rule = self.id().0,
-                group = ctx.group.index(),
+                group = target_group.index(),
                 "discarded optional transformation before staging an incompatible root contract"
             );
             return Ok(Box::new([]));
         }
-        // Memo mutations are rolled back by the search engine when staging
-        // fails. Keep the parallel payload/metadata state transactional too.
-        // The payload arena is append-only, so its savepoint stores a length
-        // rather than copying every non-Clone LogicalPlan skeleton.
+        // Enlist planner-owned arenas and indexes in the engine's attempt
+        // before the first staging write. The savepoint is only fixed-size
+        // counts into append-only arenas and mutation journals.
         let savepoint = state.savepoint();
+        let rollback_state = self.planner_state.clone();
+        ctx.enlist_rollback(move || {
+            let mut state = rollback_state.write().map_err(|_| {
+                paro_error::internal("planner transform state poisoned during rollback")
+            })?;
+            state.rollback_to(savepoint)
+        });
         let staged = stage_transformed_expression(
             plan,
             Arc::new(column_stats),
-            ctx.group,
+            target_group,
             self.id(),
-            ctx.memo,
+            ctx.memo_mut(),
             &mut state,
             preserved_region_facet,
-        );
-        let staged = match staged {
-            Ok(staged) => staged,
-            Err(error) => {
-                state.rollback_to(savepoint);
-                return Err(error);
-            }
-        };
+        )?;
+        drop(state);
         let source = ctx
-            .memo
+            .memo()
             .logical_expr(expr)
             .ok_or_else(|| paro_error::internal("planner rule lost its source expression"))?;
         Ok(vec![EquivalentExpression {
-            target_group: ctx.group,
+            target_group,
             key: staged.key,
             payload: staged.payload,
             proof: EquivalenceProof::Transformation {
@@ -383,11 +352,8 @@ fn rewrite_planner_expression(
             plan
         }
         PlannerTransformation::AggregateJoinSubsumption => {
-            // Consumed IN/EXISTS MARK joins are normalized only inside this
-            // proof attempt.  If subsumption does not fire, the normalized
-            // tree is discarded rather than being mislabeled as this rule.
-            let normalized = subsumption::normalize_input(plan);
-            let (plan, changed) = join_subsumption::optimize_plan_with_change(normalized);
+            let plan = FilterPushdown::new().rewrite_plan(plan);
+            let (plan, changed) = join_subsumption::optimize_plan_with_change(plan);
             if !changed {
                 return Ok(None);
             }
@@ -481,45 +447,6 @@ fn settle_transformed_expression(
     Ok((plan, context.column_stats))
 }
 
-fn materialize_memo_expression(
-    memo: &Memo,
-    state: &PlannerTransformState,
-    expr: LogicalExprId,
-) -> Result<LogicalPlan> {
-    let logical = memo
-        .logical_expr(expr)
-        .ok_or_else(|| paro_error::internal("planner rule references unknown expression"))?;
-    let payload = state
-        .payloads
-        .logical
-        .get(logical.payload.index())
-        .ok_or_else(|| paro_error::internal("planner rule references unknown payload"))?;
-    let mut children = Vec::with_capacity(logical.key.children.len());
-    for child in logical.key.children.iter().copied() {
-        let child_expr = memo
-            .group(child)
-            .and_then(|group| group.logical_exprs().last())
-            .copied()
-            .ok_or_else(|| paro_error::internal("planner rule found an empty child group"))?;
-        children.push(materialize_memo_expression(memo, state, child_expr)?);
-    }
-    let mut children = children.into_iter();
-    let mut plan =
-        duplicate_plan_preserving_indices(&payload.skeleton, state.bind_context.shared().as_ref())
-            .try_map_children(|_| {
-                children
-                    .next()
-                    .ok_or_else(|| paro_error::internal("planner payload lost a child expression"))
-            })?;
-    if children.next().is_some() {
-        return Err(paro_error::internal(
-            "planner payload child arity disagrees with Memo expression",
-        ));
-    }
-    plan.stats.estimated_cardinality = payload.output_estimate;
-    Ok(plan)
-}
-
 struct StagedEquivalent {
     key: LogicalExprKey,
     payload: LogicalPayloadId,
@@ -604,7 +531,7 @@ fn stage_transformed_expression(
                     ColumnVisibility::Visible,
                     output_names.get(index).cloned(),
                 )?;
-                state.binding_ids.insert(binding_key, id);
+                state.binding_ids.insert(binding_key, id)?;
                 id
             };
             output_columns.push(id);
@@ -727,7 +654,7 @@ fn stage_transformed_expression(
                 .map_children(|_| LogicalPlan::synthetic(LogicalOperator::DummyScan));
         payload_skeleton.stats = NodeStats::default();
         let payload = state.payloads.push(PlannerLogicalPayload {
-            skeleton: payload_skeleton,
+            extraction_template: payload_skeleton,
             output_estimate,
             column_stats: column_stats.clone(),
         });
@@ -789,11 +716,7 @@ fn stage_transformed_expression(
         } else {
             let logical =
                 memo.insert_logical(group, key.clone(), payload, EquivalenceProof::Initial)?;
-            state
-                .expression_groups
-                .entry(key)
-                .or_default()
-                .push((group, logical));
+            state.record_expression_group(key, group, logical);
             if runtime_filter_candidate {
                 let mut facet = planner_region_facet(
                     RegionFacetKind::RuntimeFilter,
@@ -808,7 +731,7 @@ fn stage_transformed_expression(
                 facet.priority = 2_000 + RegionFacetKind::RuntimeFilter as u16;
                 let fingerprint = facet.fingerprint;
                 let dropped = memo.upsert_region_facet(facet)?;
-                disable_dropped_runtime_filter_facets(state, &dropped);
+                disable_dropped_runtime_filter_facets(state, &dropped)?;
                 if !dropped.contains(&fingerprint) {
                     state
                         .metadata
@@ -852,7 +775,7 @@ fn stage_transformed_expression(
             .ok_or_else(|| paro_error::internal("preserved planning facet disappeared"))?;
         facet.scope.extend(root.subtree_groups);
         let dropped = memo.upsert_region_facet(facet)?;
-        disable_dropped_runtime_filter_facets(state, &dropped);
+        disable_dropped_runtime_filter_facets(state, &dropped)?;
     }
     staged.ok_or_else(|| paro_error::internal("transformation failed to stage its root"))
 }
@@ -860,15 +783,20 @@ fn stage_transformed_expression(
 fn disable_dropped_runtime_filter_facets(
     state: &mut PlannerTransformState,
     dropped: &[Fingerprint],
-) {
+) -> Result<()> {
     let dropped = dropped.iter().copied().collect::<BTreeSet<_>>();
-    for metadata in state.metadata.values_mut() {
-        if metadata
-            .runtime_filter_region_facet
-            .is_some_and(|facet| dropped.contains(&facet))
-        {
-            metadata.runtime_filter_region_facet = None;
-            metadata.implementations.hash_join_runtime_filter = false;
-        }
+    let payloads = state
+        .metadata
+        .iter()
+        .filter_map(|(payload, metadata)| {
+            metadata
+                .runtime_filter_region_facet
+                .is_some_and(|facet| dropped.contains(&facet))
+                .then_some(*payload)
+        })
+        .collect::<Vec<_>>();
+    for payload in payloads {
+        state.disable_runtime_filter(payload)?;
     }
+    Ok(())
 }

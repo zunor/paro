@@ -174,7 +174,7 @@ pub(super) fn extract_planner_tree(
                     .ok_or_else(|| paro_error::internal("unknown planner physical payload"))?;
                 let mut children = children.into_iter();
                 let mut plan = duplicate_plan_preserving_indices(
-                    &payload.skeleton,
+                    &payload.extraction_template,
                     bind_context.shared().as_ref(),
                 )
                 .try_map_children(|_| {

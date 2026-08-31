@@ -81,7 +81,7 @@ use super::rules::{
 };
 use super::scalar::ScalarArena;
 use super::scalar_lowering::{
-    encode_routine_identity, intern_operator_scalars, logical_type_fingerprint,
+    encode_routine_identity, intern_operator_scalars, logical_type_fingerprint, BindingCatalog,
 };
 use crate::physical::{
     ExtractedEnforcerContract, ExtractedEnforcerContracts, ExtractedPhysicalEnforcer,
@@ -93,8 +93,8 @@ mod costing;
 mod extraction;
 mod identity;
 mod implementation;
+mod semantic_view;
 mod state;
-mod subsumption;
 mod transformation;
 
 use contracts::*;
@@ -399,7 +399,7 @@ impl MemoBuilder {
         let mut memo = Memo::new(budget);
         let mut columns = ColumnCatalog::default();
         let mut scalars = ScalarArena::default();
-        let mut binding_ids = BTreeMap::<(usize, usize, Fingerprint), ColumnId>::new();
+        let mut binding_ids = BindingCatalog::default();
         let mut payloads = PlannerPayloadArena::default();
         let mut metadata = BTreeMap::new();
         let mut region_facets = Vec::<RegionFacet>::new();
@@ -463,7 +463,7 @@ impl MemoBuilder {
                                 ColumnVisibility::Visible,
                                 output_names.get(index).cloned(),
                             )?;
-                            binding_ids.insert(key, id);
+                            binding_ids.insert(key, id)?;
                             id
                         };
                         output_columns.push(id);
@@ -540,12 +540,12 @@ impl MemoBuilder {
                     };
                     let group = memo.create_group(schema, logical_properties);
                     let output_estimate = plan.stats.estimated_cardinality;
-                    let mut skeleton =
+                    let mut extraction_template =
                         duplicate_plan_preserving_indices(&plan, bind_shared.as_ref())
                             .map_children(|_| LogicalPlan::synthetic(LogicalOperator::DummyScan));
-                    skeleton.stats = NodeStats::default();
+                    extraction_template.stats = NodeStats::default();
                     let payload = payloads.push(PlannerLogicalPayload {
-                        skeleton,
+                        extraction_template,
                         output_estimate,
                         column_stats: candidate_stats.clone(),
                     });
@@ -599,7 +599,7 @@ impl MemoBuilder {
                         let payload = PhysicalPayloadId(
                             payloads
                                 .push(PlannerLogicalPayload {
-                                    skeleton: search_plan,
+                                    extraction_template: search_plan,
                                     output_estimate,
                                     column_stats: candidate_stats.clone(),
                                 })
@@ -825,6 +825,8 @@ impl MemoBuilder {
             payloads,
             metadata,
             expression_groups,
+            expression_group_insertions: Vec::new(),
+            metadata_runtime_filter_changes: Vec::new(),
             binder: planner_binder,
             bind_context: bind_context.clone(),
             session: search_context.map(|context| context.session.clone()),

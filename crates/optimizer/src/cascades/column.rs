@@ -93,6 +93,26 @@ impl ColumnCatalog {
     pub fn is_empty(&self) -> bool {
         self.columns.is_empty()
     }
+
+    /// Roll an append-only query generation back to a previously observed
+    /// length. Column ids are arena ordinals, so removing the tail also
+    /// removes exactly the origin-index entries introduced by that tail.
+    pub(crate) fn truncate(&mut self, len: usize) -> Result<()> {
+        if len > self.columns.len() {
+            return Err(paro_error::internal(
+                "column catalog rollback exceeds the current generation",
+            ));
+        }
+        for column in self.columns[len..].iter().rev() {
+            if self.by_origin.remove(&column.origin) != Some(column.id) {
+                return Err(paro_error::internal(
+                    "column catalog origin index disagrees with its arena",
+                ));
+            }
+        }
+        self.columns.truncate(len);
+        Ok(())
+    }
 }
 
 /// Memo identity is a set/map keyed by immutable `ColumnId`; presentation

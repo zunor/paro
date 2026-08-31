@@ -26,3 +26,21 @@ validate = "text_contains_all"
 expected = ["TOP_N", "AGGREGATE", "HASH_JOIN"]
 max_median_ratio_to = "all_rules_disabled"
 max_median_ratio = 1.20
+
+[[query]]
+id = "union_rules_disabled"
+file = "sql/q_union_aggregate.sql"
+setup = "sql/disable_rules.sql"
+teardown = "sql/reset_rules.sql"
+validate = "text_contains_all"
+expected = ["TOP_N", "AGGREGATE", "SET_OPERATION"]
+
+[[query]]
+id = "union_bounded_memo"
+file = "sql/q_union_aggregate.sql"
+setup = "sql/reset_rules.sql"
+teardown = "sql/reset_rules.sql"
+validate = "text_contains_all"
+expected = ["TOP_N", "AGGREGATE", "SET_OPERATION"]
+max_median_ratio_to = "union_rules_disabled"
+max_median_ratio = 1.50

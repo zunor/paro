@@ -1,0 +1,210 @@
+# Copyright 2024-2026 Zunor
+# SPDX-License-Identifier: Apache-2.0
+
+[artifact]
+revision = 1
+hardware_class = "portable-cpu-v1"
+corpus_id = "optimizer-cost-bootstrap-2026-08"
+source_workload = "operator_runtime_baseline"
+provenance = "bootstrap"
+risk_weight = 0.5
+
+[[coefficient]]
+id = 1
+name = "hash_build_row"
+dimension = "Cpu"
+expected = 1.30
+risk = 2.60
+latency_expected = 1.30
+latency_upper = 3.90
+source_queries = ["integer_hash_join"]
+
+[[coefficient]]
+id = 2
+name = "hash_probe_row"
+dimension = "Cpu"
+expected = 0.70
+risk = 1.50
+latency_expected = 0.70
+latency_upper = 2.20
+source_queries = ["integer_hash_join"]
+
+[[coefficient]]
+id = 3
+name = "nested_loop_pair"
+dimension = "Cpu"
+expected = 1.00
+risk = 3.00
+latency_expected = 1.00
+latency_upper = 4.00
+source_queries = ["integer_hash_join"]
+
+[[coefficient]]
+id = 4
+name = "sort_compare"
+dimension = "Cpu"
+expected = 1.20
+risk = 3.60
+latency_expected = 1.20
+latency_upper = 5.00
+source_queries = ["large_sort"]
+
+[[coefficient]]
+id = 5
+name = "range_join_row"
+dimension = "Cpu"
+expected = 0.65
+risk = 1.80
+latency_expected = 0.65
+latency_upper = 2.40
+source_queries = ["sort_range_join_full"]
+
+[[coefficient]]
+id = 6
+name = "ie_join_row"
+dimension = "Cpu"
+expected = 0.80
+risk = 2.10
+latency_expected = 0.80
+latency_upper = 2.80
+source_queries = ["classic_ie_join_selective"]
+
+[[coefficient]]
+id = 7
+name = "hash_aggregate_row"
+dimension = "Cpu"
+expected = 0.90
+risk = 2.20
+latency_expected = 0.90
+latency_upper = 3.00
+source_queries = ["high_cardinality_aggregate"]
+
+[[coefficient]]
+id = 8
+name = "hash_aggregate_group"
+dimension = "Cpu"
+expected = 1.50
+risk = 3.50
+latency_expected = 1.50
+latency_upper = 4.50
+source_queries = ["high_cardinality_aggregate"]
+
+[[coefficient]]
+id = 9
+name = "perfect_aggregate_row"
+dimension = "Cpu"
+expected = 0.45
+risk = 1.10
+latency_expected = 0.45
+latency_upper = 1.60
+source_queries = ["high_cardinality_aggregate"]
+
+[[coefficient]]
+id = 10
+name = "perfect_aggregate_slot"
+dimension = "Cpu"
+expected = 0.20
+risk = 0.55
+latency_expected = 0.20
+latency_upper = 0.80
+source_queries = ["high_cardinality_aggregate"]
+
+[[coefficient]]
+id = 11
+name = "runtime_filter_build_row"
+dimension = "Cpu"
+expected = 0.15
+risk = 0.60
+latency_expected = 0.15
+latency_upper = 0.80
+source_queries = ["expr_runtime_filter"]
+
+[[coefficient]]
+id = 12
+name = "runtime_filter_apply_row"
+dimension = "Cpu"
+expected = 0.10
+risk = 0.40
+latency_expected = 0.10
+latency_upper = 0.60
+source_queries = ["expr_runtime_filter"]
+
+[[coefficient]]
+id = 13
+name = "window_row"
+dimension = "Cpu"
+expected = 1.40
+risk = 3.80
+latency_expected = 1.40
+latency_upper = 5.20
+source_queries = ["ordered_aggregate"]
+
+[[coefficient]]
+id = 14
+name = "partition_aggregate_window_row"
+dimension = "Cpu"
+expected = 0.55
+risk = 1.40
+latency_expected = 0.55
+latency_upper = 2.00
+source_queries = ["ordered_aggregate"]
+
+[[coefficient]]
+id = 15
+name = "singleton_aggregate_project_row"
+dimension = "Cpu"
+expected = 0.25
+risk = 0.70
+latency_expected = 0.25
+latency_upper = 1.00
+source_queries = ["grouping_sets_aggregate"]
+
+[[coefficient]]
+id = 16
+name = "tuple_byte_block"
+dimension = "MemoryRead"
+expected = 0.25
+risk = 1.00
+latency_expected = 0.10
+latency_upper = 0.50
+source_queries = ["string_hash_join"]
+
+[[coefficient]]
+id = 20001
+name = "enforcer_stream_row"
+dimension = "Cpu"
+expected = 0.25
+risk = 1.00
+latency_expected = 0.25
+latency_upper = 1.00
+source_queries = ["count_filter"]
+
+[[coefficient]]
+id = 20002
+name = "enforcer_sort_compare"
+dimension = "Cpu"
+expected = 1.00
+risk = 4.00
+latency_expected = 1.00
+latency_upper = 6.00
+source_queries = ["large_sort"]
+
+[[coefficient]]
+id = 20003
+name = "enforcer_random_fetch"
+dimension = "RandomIo"
+expected = 1.00
+risk = 6.00
+latency_expected = 2.00
+latency_upper = 12.00
+source_queries = ["selective_rowset_scan"]
+
+[[coefficient]]
+id = 20004
+name = "enforcer_spill_page"
+dimension = "SequentialIo"
+expected = 2.00
+risk = 8.00
+latency_expected = 2.00
+latency_upper = 10.00
+source_queries = ["forced_external_hash_join"]

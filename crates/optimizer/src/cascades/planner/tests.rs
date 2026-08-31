@@ -164,7 +164,7 @@ fn graph_filter_is_part_of_the_query_ir_fingerprint() {
         )))
     };
     let fingerprint = |mut plan: LogicalPlan| {
-        let mut binding_ids = BTreeMap::new();
+        let mut binding_ids = BindingCatalog::default();
         let mut columns = ColumnCatalog::default();
         let mut scalars = ScalarArena::default();
         let roots = intern_operator_scalars(
@@ -734,6 +734,38 @@ fn query_ir_identity_uses_scalar_semantics_not_planner_node_id() {
             .len(),
         1
     );
+}
+
+#[test]
+fn query_ir_identity_excludes_positional_projection_layout() {
+    let child = || {
+        LogicalPlan::synthetic(LogicalOperator::ExpressionGet(ExpressionGet::new(
+            41,
+            Vec::new(),
+            vec!["a".to_string(), "b".to_string()],
+            vec![LogicalType::Integer, LogicalType::BigInt],
+        )))
+    };
+    let mut identity = Filter::new(child(), Vec::new());
+    identity.projection_map = vec![0, 1].into();
+    let mut permuted = Filter::new(child(), Vec::new());
+    permuted.projection_map = vec![1, 0].into();
+    let scalars = ScalarArena::default();
+
+    let identity = query_operator_fingerprint(
+        &LogicalPlan::synthetic(LogicalOperator::Filter(identity)),
+        &[],
+        &scalars,
+    )
+    .unwrap();
+    let permuted = query_operator_fingerprint(
+        &LogicalPlan::synthetic(LogicalOperator::Filter(permuted)),
+        &[],
+        &scalars,
+    )
+    .unwrap();
+
+    assert_eq!(identity, permuted);
 }
 
 #[test]

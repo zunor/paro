@@ -114,13 +114,76 @@ pub struct RuleContext<'a> {
     pub group: GroupId,
 }
 
+type TransformationRollback = Box<dyn FnOnce() -> Result<()> + 'static>;
+
 pub struct TransformContext<'a> {
-    /// Transformations may append child groups/expressions and update region
-    /// facets, but must not mutate pre-existing group membership or physical
-    /// search state. The engine relies on that write-set contract for its
-    /// bounded incremental rollback savepoint.
-    pub memo: &'a mut Memo,
-    pub group: GroupId,
+    memo: &'a mut Memo,
+    group: GroupId,
+    memo_savepoint: Option<super::memo::TransformationSavepoint>,
+    sidecar_rollbacks: Vec<TransformationRollback>,
+}
+
+impl<'a> TransformContext<'a> {
+    pub(crate) fn new(memo: &'a mut Memo, group: GroupId) -> Self {
+        Self {
+            memo,
+            group,
+            memo_savepoint: None,
+            sidecar_rollbacks: Vec::new(),
+        }
+    }
+
+    pub fn memo(&self) -> &Memo {
+        self.memo
+    }
+
+    pub fn group(&self) -> GroupId {
+        self.group
+    }
+
+    /// Obtain the bounded transformation writer. The Memo snapshot is created
+    /// only at the first write, so failed shape checks do not clone the region
+    /// forest. Transformations may append groups/expressions and update region
+    /// facets, but must not mutate physical search state.
+    pub fn memo_mut(&mut self) -> &mut Memo {
+        if self.memo_savepoint.is_none() {
+            self.memo_savepoint = Some(self.memo.transformation_savepoint());
+        }
+        self.memo
+    }
+
+    /// Enlist optimizer-owned side state in the same attempt as Memo writes.
+    /// The action is registered immediately before the first side-state write
+    /// and runs in reverse registration order on every rejected output path.
+    pub fn enlist_rollback(&mut self, rollback: impl FnOnce() -> Result<()> + 'static) {
+        self.sidecar_rollbacks.push(Box::new(rollback));
+    }
+
+    pub(crate) fn rollback(mut self) -> Result<()> {
+        let mut first_error = None;
+        while let Some(rollback) = self.sidecar_rollbacks.pop() {
+            if let Err(error) = rollback() {
+                if first_error.is_none() {
+                    first_error = Some(error);
+                }
+            }
+        }
+        if let Some(savepoint) = self.memo_savepoint.take() {
+            if let Err(error) = self.memo.rollback_transformation(savepoint) {
+                if first_error.is_none() {
+                    first_error = Some(error);
+                }
+            }
+        }
+        first_error.map_or(Ok(()), Err)
+    }
+
+    pub(crate) fn commit(mut self) -> Result<Box<[GroupId]>> {
+        let Some(savepoint) = self.memo_savepoint.take() else {
+            return Ok(Box::new([]));
+        };
+        self.memo.appended_groups_since(&savepoint)
+    }
 }
 
 pub trait TransformationRule: Send + Sync {

@@ -153,6 +153,36 @@ impl ScalarArena {
         self.nodes.is_empty()
     }
 
+    /// Roll an append-only scalar generation back without cloning the DAG.
+    /// Fingerprint buckets may contain collisions, so remove ids rather than
+    /// assuming one bucket entry per node.
+    pub(crate) fn truncate(&mut self, len: usize) -> Result<()> {
+        if len > self.nodes.len() {
+            return Err(paro_error::internal(
+                "scalar arena rollback exceeds the current generation",
+            ));
+        }
+        for index in (len..self.nodes.len()).rev() {
+            let id = ScalarExprId::new(index);
+            let fingerprint = self.nodes[index].fingerprint;
+            let bucket = self.by_fingerprint.get_mut(&fingerprint).ok_or_else(|| {
+                paro_error::internal("scalar fingerprint index lost an arena node")
+            })?;
+            let position = bucket
+                .iter()
+                .position(|candidate| *candidate == id)
+                .ok_or_else(|| {
+                    paro_error::internal("scalar fingerprint bucket lost an arena node")
+                })?;
+            bucket.remove(position);
+            if bucket.is_empty() {
+                self.by_fingerprint.remove(&fingerprint);
+            }
+        }
+        self.nodes.truncate(len);
+        Ok(())
+    }
+
     pub fn intern(&mut self, spec: ScalarSpec) -> Result<ScalarExprId> {
         self.validate_shape(&spec)?;
         let properties = self.derive_properties(&spec)?;

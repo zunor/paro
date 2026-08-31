@@ -634,6 +634,7 @@ impl Optimizer {
         calibration.write_u64(self.calibration.revision.0 as u64);
         calibration.write_bytes(self.calibration.hardware_class.as_bytes());
         calibration.write_bytes(self.calibration.corpus_id.as_bytes());
+        calibration.write_bytes(self.calibration.provenance.as_bytes());
 
         let budget = &self.budget;
         let config_values = [

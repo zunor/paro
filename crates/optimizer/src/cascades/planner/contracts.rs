@@ -19,7 +19,7 @@ pub(super) fn derive_provided_ordering(
     operator: &LogicalOperator,
     output_columns: &[ColumnId],
     child_columns: Option<&[ColumnId]>,
-    binding_ids: &BTreeMap<(usize, usize, Fingerprint), ColumnId>,
+    binding_ids: &BindingCatalog,
 ) -> ProvidedOrdering {
     if let LogicalOperator::SearchScan(search) = operator {
         return output_columns

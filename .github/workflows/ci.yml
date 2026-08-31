@@ -87,6 +87,7 @@ jobs:
               - '.cargo/**'
               - 'tools/ci/check_memory_runtime_api.py'
               - 'tools/ci/check_operator_runtime_baseline.py'
+              - 'tools/ci/generate_optimizer_calibration.py'
               - 'tools/ci/check_policy_evolution.py'
               - 'tools/ci/check_vector_copy_fallible_api.py'
 
@@ -146,6 +147,22 @@ jobs:
       - run: python3 tools/ci/check_memory_runtime_api.py
       - run: python3 tools/ci/check_vector_copy_fallible_api.py
       - run: python3 tools/ci/check_operator_runtime_baseline.py
+
+  optimizer_calibration:
+    name: optimizer calibration artifact
+    needs: changes
+    if: |
+      needs.changes.outputs.rust == 'true' ||
+      needs.changes.outputs.benchmark == 'true' ||
+      needs.changes.outputs.ci == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - run: python3 tools/ci/generate_optimizer_calibration.py --check
 
   clippy:
     name: clippy
