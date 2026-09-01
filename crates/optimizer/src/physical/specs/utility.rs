@@ -22,6 +22,7 @@ pub struct MaterializedCteSpec {
     pub ref_count: usize,
     pub column_names: Box<[String]>,
     pub column_types: Box<[LogicalType]>,
+    pub spill_policy: super::SpillExecutionPolicy,
 }
 
 #[derive(Debug, Clone)]

@@ -720,6 +720,7 @@ impl OperatorRuntimeRegistry {
             }
             SinkSpec::CteMaterialize(spec) => SinkExec::CteMaterialize(CteMaterializeSinkExec {
                 handle: HandleRef::new(spec.handle),
+                spill_policy: spec.spill_policy,
             }),
             SinkSpec::DelimCapture(spec) => SinkExec::DelimCapture(DelimCaptureSinkExec {
                 handle: HandleRef::new(spec.handle),
@@ -1523,6 +1524,7 @@ mod tests {
                     transforms: Vec::new(),
                     sink: SinkSpec::CteMaterialize(super::super::graph::CteMaterializeSinkSpec {
                         handle: cte,
+                        spill_policy: crate::physical::specs::SpillExecutionPolicy::Adaptive,
                     }),
                     sink_sharing: SinkSharing::Exclusive,
                     properties: PipelineProperties::default(),

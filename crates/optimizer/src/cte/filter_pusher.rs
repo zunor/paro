@@ -1,7 +1,7 @@
 // Copyright 2024-2026 Zunor
 // SPDX-License-Identifier: Apache-2.0
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::ops::ControlFlow;
 
 use paro_planner::binder::ir::CTEMaterialize;
@@ -59,6 +59,7 @@ impl CTEFilterPusher {
     /// the mutation to that group's root prevents nested CTE choices from
     /// being multiplied into the ancestor expression, and changing DEFAULT
     /// to MATERIALIZED makes the transformation structurally idempotent.
+    #[cfg(test)]
     pub(crate) fn optimize_default_root_with_change(
         &mut self,
         mut plan: LogicalPlan,
@@ -205,6 +206,24 @@ fn build_or_filter(
         if filtered_ref.old_bindings.len() != new_bindings.len() {
             continue;
         }
+        let old_bindings = filtered_ref
+            .old_bindings
+            .iter()
+            .copied()
+            .collect::<HashSet<_>>();
+        let mut referenced = Vec::new();
+        for filter in &filtered_ref.filters {
+            crate::column::lifetime::ColumnLifetimeAnalyzer::extract_column_bindings(
+                filter,
+                &mut referenced,
+            );
+        }
+        if referenced
+            .iter()
+            .any(|binding| !old_bindings.contains(binding))
+        {
+            return None;
+        }
 
         let mut replacer = ColumnBindingReplacer::new();
         for (old_binding, new_binding) in filtered_ref.old_bindings.iter().zip(new_bindings.iter())
@@ -217,6 +236,20 @@ fn build_or_filter(
         let mut rewritten_filters = filtered_ref.filters.clone();
         for filter in &mut rewritten_filters {
             replacer.visit_expression(filter);
+        }
+        let new_bindings = new_bindings.iter().copied().collect::<HashSet<_>>();
+        let mut rewritten_references = Vec::new();
+        for filter in &rewritten_filters {
+            crate::column::lifetime::ColumnLifetimeAnalyzer::extract_column_bindings(
+                filter,
+                &mut rewritten_references,
+            );
+        }
+        if rewritten_references
+            .iter()
+            .any(|binding| !new_bindings.contains(binding))
+        {
+            return None;
         }
 
         let and_expr = if rewritten_filters.len() == 1 {

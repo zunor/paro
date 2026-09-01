@@ -3,100 +3,71 @@
 
 //! Runtime CTE materialization handle.
 //!
-//! CTE producers append task-local chunks during `merge_local()` and seal an
-//! immutable chunk array at finish. Each `CteScanSource` keeps its own
-//! source-local cursor over the sealed array, so multiple CTE consumers can
-//! rescan the same materialized rows without contending on a shared cursor.
+//! CTE producers publish the same immutable, spill-capable snapshot used by
+//! generic materialization. Each CTE reference creates an independent reader,
+//! while tasks belonging to that reader claim disjoint chunks or row stores.
 
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, OnceLock};
+use std::sync::Arc;
 
-use parking_lot::Mutex;
 use paro_common::chunk::Chunk;
-use paro_common::error::{self as paro_error, Result};
+use paro_common::error::Result;
+use paro_storage::row::RowStore;
 
 use crate::runtime::context::OperatorCleanupContext;
 
 use super::cleanup::{CleanupReason, CleanupState, CleanupStatus, RuntimeCleanup};
+use super::materialized::MaterializedHandle;
 use super::registry::BreakerHandleMetadata;
 
 #[derive(Debug)]
 pub struct CteHandle {
-    metadata: BreakerHandleMetadata,
-    pending_chunks: Mutex<Vec<Chunk>>,
-    sealed_chunks: OnceLock<Arc<[Chunk]>>,
-    sealed: AtomicBool,
+    materialized: Arc<MaterializedHandle>,
     cleanup: CleanupState,
 }
 
 impl CteHandle {
     pub fn new(metadata: BreakerHandleMetadata) -> Self {
         Self {
-            metadata,
-            pending_chunks: Mutex::new(Vec::new()),
-            sealed_chunks: OnceLock::new(),
-            sealed: AtomicBool::new(false),
+            materialized: Arc::new(MaterializedHandle::new(metadata)),
             cleanup: CleanupState::default(),
         }
     }
 
     #[inline]
     pub fn metadata(&self) -> &BreakerHandleMetadata {
-        &self.metadata
+        self.materialized.metadata()
+    }
+
+    #[inline]
+    pub fn materialized(&self) -> Arc<MaterializedHandle> {
+        Arc::clone(&self.materialized)
     }
 
     pub fn append_chunks(&self, chunks: &mut Vec<Chunk>) -> Result<()> {
-        if chunks.is_empty() {
-            return Ok(());
-        }
-        if self.is_sealed() {
-            return Err(paro_error::internal(
-                "cannot append to a sealed CTE breaker handle",
-            ));
-        }
-        self.pending_chunks.lock().extend(chunks.drain(..));
-        Ok(())
+        self.materialized.append_chunks(chunks)
+    }
+
+    pub fn append_row_store(&self, store: RowStore) -> Result<()> {
+        self.materialized.append_row_store(store)
     }
 
     pub fn seal(&self) -> Result<()> {
-        if self.is_sealed() {
-            return Ok(());
-        }
-
-        let chunks = {
-            let mut pending = self.pending_chunks.lock();
-            std::mem::take(&mut *pending)
-        };
-        self.sealed_chunks
-            .set(Arc::from(chunks.into_boxed_slice()))
-            .map_err(|_| paro_error::internal("CTE handle was sealed twice"))?;
-        self.sealed.store(true, Ordering::Release);
-        Ok(())
+        self.materialized.seal()
     }
 
     #[inline]
     pub fn is_sealed(&self) -> bool {
-        self.sealed.load(Ordering::Acquire)
-    }
-
-    pub fn sealed_chunks(&self) -> Result<Arc<[Chunk]>> {
-        self.sealed_chunks
-            .get()
-            .map(Arc::clone)
-            .ok_or_else(|| paro_error::internal("CTE scan source polled before handle was sealed"))
+        self.materialized.is_sealed()
     }
 
     #[inline]
     pub fn pending_chunk_count(&self) -> usize {
-        self.pending_chunks.lock().len()
+        self.materialized.pending_chunk_count()
     }
 
     #[inline]
     pub fn sealed_chunk_count(&self) -> usize {
-        self.sealed_chunks
-            .get()
-            .map(|chunks| chunks.len())
-            .unwrap_or(0)
+        self.materialized.sealed_chunk_count()
     }
 
     #[inline]
@@ -106,8 +77,8 @@ impl CteHandle {
 }
 
 impl RuntimeCleanup for CteHandle {
-    fn cleanup(&self, _ctx: &mut OperatorCleanupContext, reason: CleanupReason) -> Result<()> {
-        self.pending_chunks.lock().clear();
+    fn cleanup(&self, ctx: &mut OperatorCleanupContext, reason: CleanupReason) -> Result<()> {
+        self.materialized.cleanup(ctx, reason)?;
         self.cleanup.mark(reason);
         Ok(())
     }
@@ -141,8 +112,10 @@ mod tests {
         assert_eq!(handle.pending_chunk_count(), 1);
 
         handle.seal().expect("seal");
-        let first_reader = handle.sealed_chunks().expect("first reader");
-        let second_reader = handle.sealed_chunks().expect("second reader");
+        let first = super::super::MaterializedReader::new(handle.materialized(), "first reader");
+        let second = super::super::MaterializedReader::new(handle.materialized(), "second reader");
+        let first_reader = first.sealed_chunks().expect("first reader");
+        let second_reader = second.sealed_chunks().expect("second reader");
 
         assert_eq!(first_reader.len(), 1);
         assert_eq!(second_reader.len(), 1);

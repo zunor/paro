@@ -31,7 +31,10 @@ impl<'a> PipelineLowerer<'a> {
                 .register(BreakerHandleKind::Cte, cte_row_type, Default::default());
         let producer = self.lower_subtree_to_sink(
             *producer_root,
-            SinkSpec::CteMaterialize(CteMaterializeSinkSpec { handle }),
+            SinkSpec::CteMaterialize(CteMaterializeSinkSpec {
+                handle,
+                spill_policy: spec.spill_policy,
+            }),
             SinkSharing::Exclusive,
             self.plan.node(*producer_root).output.clone(),
             pipelines,

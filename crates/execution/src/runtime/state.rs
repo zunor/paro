@@ -14,8 +14,8 @@ use std::sync::Arc;
 use paro_common::error::{self as paro_error, Result};
 
 use super::breaker::{
-    AggregateHandle, CteHandle, DelimHandle, JoinBuildHandle, MaterializedReader,
-    RecursiveTableHandle, SetOperationHandle, SortHandle, TopNHandle, WindowHandle,
+    AggregateHandle, DelimHandle, JoinBuildHandle, MaterializedReader, RecursiveTableHandle,
+    SetOperationHandle, SortHandle, TopNHandle, WindowHandle,
 };
 pub use super::breaker::{
     MaterializeSinkGlobal, MaterializeSinkLocal, MaterializedSourceGlobal, MaterializedSourceLocal,
@@ -55,9 +55,12 @@ pub use crate::operators::scan::state::{
 };
 pub use crate::operators::search::state::{SearchSourceGlobal, SearchSourceLocal};
 pub use crate::operators::set::state::{
-    CteMaterializeSinkLocal, CteScanSourceLocal, DelimCaptureSinkGlobal, DelimCaptureSinkLocal,
-    DelimScanSourceLocal, RecursiveTableAppendSinkGlobal, RecursiveTableAppendSinkLocal,
-    RecursiveTableScanSourceLocal, SetOperationEmitSourceLocal, SetOperationInputSinkLocal,
+    DelimCaptureSinkGlobal, DelimCaptureSinkLocal, DelimScanSourceLocal,
+    RecursiveTableAppendSinkGlobal, RecursiveTableAppendSinkLocal, RecursiveTableScanSourceLocal,
+    SetOperationEmitSourceLocal, SetOperationInputSinkLocal,
+};
+pub use crate::operators::set::{
+    CteMaterializeSinkGlobal, CteMaterializeSinkLocal, CteScanSourceGlobal, CteScanSourceLocal,
 };
 pub use crate::operators::sort::state::{
     SortBuildSinkLocal, SortEmitSourceLocal, StreamingTopNTransformGlobal,
@@ -147,7 +150,7 @@ pub enum SourceGlobal {
     WindowEmit(Arc<BreakerHandleGlobal<WindowHandle>>),
     PartitionAggregateWindowEmit(Arc<PartitionAggregateEmitGlobal>),
     SetOperationEmit(Arc<BreakerHandleGlobal<SetOperationHandle>>),
-    CteScan(Arc<BreakerHandleGlobal<CteHandle>>),
+    CteScan(Arc<CteScanSourceGlobal>),
     DelimScan(Arc<BreakerHandleGlobal<DelimHandle>>),
     RecursiveTableScan(Arc<BreakerHandleGlobal<RecursiveTableHandle>>),
     Search(Arc<SearchSourceGlobal>),
@@ -403,7 +406,7 @@ pub enum SinkGlobal {
     TopNBuild(Arc<BreakerHandleGlobal<TopNHandle>>),
     WindowBuild(Arc<BreakerHandleGlobal<WindowHandle>>),
     SetOperationInput(Arc<BreakerHandleGlobal<SetOperationHandle>>),
-    CteMaterialize(Arc<BreakerHandleGlobal<CteHandle>>),
+    CteMaterialize(Arc<CteMaterializeSinkGlobal>),
     DelimCapture(Arc<DelimCaptureSinkGlobal>),
     RecursiveTableAppend(Arc<RecursiveTableAppendSinkGlobal>),
     Dml(Arc<DmlSinkGlobal>),

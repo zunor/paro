@@ -25,14 +25,6 @@ pub(super) fn matches_transformation(
                 })
         }
         PlannerTransformation::CteInline => operator == Op::MaterializedCTE,
-        PlannerTransformation::CteFilterPushdown => {
-            operator == Op::MaterializedCTE
-                && payload_operator(expr, state).is_some_and(|operator| {
-                    matches!(operator,
-                        LogicalOperator::MaterializedCTE(cte)
-                            if cte.materialized == CTEMaterialize::Default)
-                })
-        }
         PlannerTransformation::AggregatePostReduction => {
             operator == Op::MaterializedCTE
                 || (matches!(operator, Op::Projection | Op::Filter)

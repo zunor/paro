@@ -278,6 +278,7 @@ pub(super) fn planner_operator_spillable(operator: &LogicalOperator) -> bool {
         // advertises the external one; the in-memory implementation remains a
         // separate non-spillable candidate.
         LogicalOperator::Join(Join::Cross(_)) => true,
+        LogicalOperator::MaterializedCTE(_) => true,
         _ => false,
     }
 }

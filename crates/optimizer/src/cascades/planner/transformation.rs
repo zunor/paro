@@ -28,7 +28,6 @@ pub(super) fn register_transformations(
 enum PlannerTransformation {
     ExpensivePredicatePlacement,
     CteInline,
-    CteFilterPushdown,
     AggregatePostReduction,
     MarkJoinToSemi,
     JoinElimination,
@@ -44,10 +43,9 @@ enum PlannerTransformation {
 }
 
 impl PlannerTransformation {
-    const ALL: [Self; 15] = [
+    const ALL: [Self; 14] = [
         Self::ExpensivePredicatePlacement,
         Self::CteInline,
-        Self::CteFilterPushdown,
         Self::AggregatePostReduction,
         Self::MarkJoinToSemi,
         Self::JoinElimination,
@@ -66,7 +64,6 @@ impl PlannerTransformation {
         match self {
             Self::ExpensivePredicatePlacement => EXPENSIVE_PREDICATE_PLACEMENT_RULE,
             Self::CteInline => CTE_INLINE_RULE,
-            Self::CteFilterPushdown => CTE_FILTER_PUSHDOWN_RULE,
             Self::AggregatePostReduction => AGGREGATE_POST_REDUCTION_RULE,
             Self::MarkJoinToSemi => MARK_JOIN_TO_SEMI_RULE,
             Self::JoinElimination => JOIN_ELIMINATION_RULE,
@@ -87,10 +84,9 @@ impl PlannerTransformation {
     /// so enumeration cannot vote estimates up or down.
     const fn cardinality_recipe_kind(self) -> Option<CardinalityRecipeKind> {
         match self {
-            Self::CteInline
-            | Self::CteFilterPushdown
-            | Self::AggregateJoinSubsumption
-            | Self::JoinElimination => Some(CardinalityRecipeKind::ConstraintRefined),
+            Self::CteInline | Self::AggregateJoinSubsumption | Self::JoinElimination => {
+                Some(CardinalityRecipeKind::ConstraintRefined)
+            }
             _ => None,
         }
     }
@@ -256,10 +252,8 @@ impl TransformationRule for PlannerTransformationRule {
                 matches!(self.transformation, PlannerTransformation::CteInline)
                     && kind == RegionFacetKind::Sharing
                     && plan.operator.op_type() != source_operator;
-            let preserves_sharing = matches!(
-                self.transformation,
-                PlannerTransformation::CteInline | PlannerTransformation::CteFilterPushdown
-            ) && kind == RegionFacetKind::Sharing
+            let preserves_sharing = matches!(self.transformation, PlannerTransformation::CteInline)
+                && kind == RegionFacetKind::Sharing
                 && plan.operator.op_type() == source_operator;
             if preserves_sharing {
                 preserved_region_facet = Some(facet);
@@ -402,15 +396,6 @@ fn rewrite_planner_expression(
         PlannerTransformation::CteInline => {
             let (plan, changed) =
                 CTEInlining::new(&environment.bind_context).optimize_plan_with_change(plan);
-            if !changed {
-                return Ok(None);
-            }
-            plan
-        }
-        PlannerTransformation::CteFilterPushdown => {
-            let plan = FilterPullup::new().rewrite_plan(plan);
-            let plan = FilterPushdown::new().rewrite_plan(plan);
-            let (plan, changed) = CTEFilterPusher::new().optimize_default_root_with_change(plan);
             if !changed {
                 return Ok(None);
             }

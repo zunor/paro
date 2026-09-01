@@ -333,9 +333,21 @@ fn materialized_breaker_moves_chunks_through_typed_handle() {
 }
 
 #[test]
-fn cte_materialize_scan_gives_each_consumer_independent_cursor() {
+fn forced_external_cte_gives_each_consumer_independent_cursor() {
     let output = QueryOutputPort::unbounded();
-    let query = query_context(output.clone());
+    let query = query_context_with_limits(
+        output.clone(),
+        RuntimeLimits {
+            max_threads: 1,
+            max_memory: 64 * 1024 * 1024,
+            use_temporary_directory: true,
+            temporary_directory: unique_temp_dir("paro_cte_spill"),
+            max_temp_directory_size: None,
+            force_external: true,
+            rowset_scan_pushdown: true,
+            parallel_scheduler: false,
+        },
+    );
     let row_type = RowType::new(vec!["v".to_string()], vec![LogicalType::Integer]);
 
     let mut handles = BreakerHandleCatalogBuilder::default();
@@ -356,7 +368,10 @@ fn cte_materialize_scan_gives_each_consumer_independent_cursor() {
                     vec![LogicalType::Integer],
                 )),
                 transforms: Vec::new(),
-                sink: SinkSpec::CteMaterialize(CteMaterializeSinkSpec { handle }),
+                sink: SinkSpec::CteMaterialize(CteMaterializeSinkSpec {
+                    handle,
+                    spill_policy: crate::physical::specs::SpillExecutionPolicy::ForcedExternal,
+                }),
                 sink_sharing: SinkSharing::Exclusive,
                 properties: PipelineProperties::default(),
                 output: row_type.clone(),

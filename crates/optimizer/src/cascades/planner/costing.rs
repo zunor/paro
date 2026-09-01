@@ -668,37 +668,43 @@ fn refreshed_structural_cost(
         ..SearchCost::ZERO
     };
     if metadata.grant_dependency == GrantDependencyDescriptor::Sensitive {
-        let (rows, width) = if metadata.operator_type == LogicalOperatorType::CrossProduct {
-            (
-                facts
-                    .child_rows_hard_upper
-                    .get(1)
-                    .copied()
-                    .flatten()
-                    .unwrap_or(u64::MAX),
-                facts
-                    .child_row_widths
-                    .get(1)
-                    .copied()
-                    .unwrap_or(facts.output_row_width),
-            )
-        } else {
-            (
-                facts.output_rows_hard_upper.unwrap_or(u64::MAX),
-                facts.output_row_width,
-            )
+        let retained_child = match metadata.operator_type {
+            LogicalOperatorType::CrossProduct => Some(1),
+            LogicalOperatorType::MaterializedCTE => Some(0),
+            _ => None,
         };
+        let (rows, width) = retained_child.map_or_else(
+            || {
+                (
+                    facts.output_rows_hard_upper.unwrap_or(u64::MAX),
+                    facts.output_row_width,
+                )
+            },
+            |child| {
+                (
+                    facts
+                        .child_rows_hard_upper
+                        .get(child)
+                        .copied()
+                        .flatten()
+                        .unwrap_or(u64::MAX),
+                    facts
+                        .child_row_widths
+                        .get(child)
+                        .copied()
+                        .unwrap_or(facts.output_row_width),
+                )
+            },
+        );
         cost.peak_memory_upper = rows.saturating_mul(width);
-        let resident_expected = if metadata.operator_type == LogicalOperatorType::CrossProduct {
+        let resident_expected = retained_child.map_or(facts.output_rows.expected, |child| {
             facts
                 .child_rows
-                .get(1)
+                .get(child)
                 .copied()
                 .unwrap_or(CompactRange::ZERO)
                 .expected
-        } else {
-            facts.output_rows.expected
-        };
+        });
         cost.resources_expected[ResourceDimension::MemoryWrite as usize] =
             resident_expected * width as f64;
         cost.resources_risk_upper[ResourceDimension::MemoryWrite as usize] =

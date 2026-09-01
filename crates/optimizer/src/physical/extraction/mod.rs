@@ -558,6 +558,10 @@ impl PhysicalPlanExtractor {
                 &kind,
                 PhysicalNodeKind::Sort(spec)
                     if spec.spill_policy != SpillExecutionPolicy::InMemory
+            ) || matches!(
+                &kind,
+                PhysicalNodeKind::MaterializedCte(spec)
+                    if spec.spill_policy != SpillExecutionPolicy::InMemory
             ),
             parallel: self.ctx.max_threads > 1,
             supports_early_stop: matches!(

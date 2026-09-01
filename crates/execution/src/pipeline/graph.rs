@@ -1152,6 +1152,7 @@ pub struct SetOperationInputSinkSpec {
 #[derive(Debug, Clone)]
 pub struct CteMaterializeSinkSpec {
     pub handle: BreakerHandleId,
+    pub spill_policy: SpillExecutionPolicy,
 }
 
 #[derive(Debug, Clone)]

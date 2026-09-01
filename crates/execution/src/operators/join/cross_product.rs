@@ -93,6 +93,10 @@ impl CrossProductProbeTransformExec {
                 "cross product probe output type count does not match input and build columns",
             ));
         }
+        if let Some(build) = singleton_build_chunk(build_chunks.as_ref()) {
+            emit_scalar_build_batch(input, build, self.left_column_count, output)?;
+            return Ok(TransformPoll::Output);
+        }
 
         if !local.probe_in_progress {
             local.probe_row = 0;
@@ -233,6 +237,12 @@ fn transform_external_cross_product(
         }
 
         let count = build.size();
+        if count == 1 {
+            emit_scalar_build_batch(input, build, left_column_count, output)?;
+            local.external_chunk_ready = false;
+            local.probe_row = 0;
+            return Ok(TransformPoll::OutputMore);
+        }
         emit_cross_product_batch(
             input,
             build,
@@ -253,6 +263,43 @@ fn transform_external_cross_product(
         }
         return Ok(TransformPoll::OutputMore);
     }
+}
+
+fn singleton_build_chunk(build_chunks: &[Chunk]) -> Option<&Chunk> {
+    let mut singleton = None;
+    for chunk in build_chunks.iter().filter(|chunk| !chunk.is_empty()) {
+        if chunk.size() != 1 || singleton.is_some() {
+            return None;
+        }
+        singleton = Some(chunk);
+    }
+    singleton
+}
+
+fn emit_scalar_build_batch(
+    input: &Chunk,
+    build: &Chunk,
+    left_column_count: usize,
+    output: &mut Chunk,
+) -> Result<()> {
+    if build.size() != 1 {
+        return Err(paro_error::internal(
+            "scalar cross product build must contain exactly one row",
+        ));
+    }
+    let allocator = input.allocator().clone();
+    let scalar_selection = SelectionVector::try_repeated(0, input.size(), allocator.clone())?;
+    let mut vectors = Vec::with_capacity(left_column_count + build.column_count());
+    vectors.extend(input.data.iter().take(left_column_count).cloned());
+    for column in 0..build.column_count() {
+        vectors.push(Arc::new(Vector::try_dictionary(
+            Arc::clone(&build.data[column]),
+            scalar_selection.clone(),
+        )?));
+    }
+    *output = Chunk::from_arc_vectors(vectors, allocator);
+    output.try_set_cardinality(input.size())?;
+    Ok(())
 }
 
 fn right_build_column_count(build_chunks: &[Chunk]) -> usize {
@@ -293,4 +340,37 @@ fn emit_cross_product_batch(
     *output = Chunk::from_arc_vectors(vectors, allocator);
     output.try_set_cardinality(count)?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use paro_common::test_utils::{test_allocator, test_chunk_from_vectors};
+
+    fn integers(values: &[i32]) -> Chunk {
+        test_chunk_from_vectors(vec![
+            Vector::try_from_i32(values, test_allocator()).expect("integer vector")
+        ])
+    }
+
+    #[test]
+    fn singleton_build_is_broadcast_over_the_probe_vector() {
+        let input = integers(&[10, 20, 30]);
+        let build = integers(&[7]);
+        let mut output = Chunk::try_new(test_allocator()).expect("output chunk");
+
+        emit_scalar_build_batch(&input, &build, 1, &mut output).expect("scalar broadcast");
+
+        assert_eq!(output.size(), 3);
+        assert_eq!(output.column(0).unwrap().get_i32(0), Some(10));
+        assert_eq!(output.column(0).unwrap().get_i32(2), Some(30));
+        assert_eq!(output.column(1).unwrap().get_i32(0), Some(7));
+        assert_eq!(output.column(1).unwrap().get_i32(2), Some(7));
+    }
+
+    #[test]
+    fn singleton_detection_rejects_multiple_nonempty_chunks() {
+        let chunks = vec![integers(&[1]), integers(&[2])];
+        assert!(singleton_build_chunk(&chunks).is_none());
+    }
 }

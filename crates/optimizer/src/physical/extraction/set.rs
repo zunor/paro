@@ -57,6 +57,7 @@ impl PhysicalPlanExtractor {
             ref_count: cte.ref_count,
             column_names: cte.column_names.clone().into_boxed_slice(),
             column_types: cte.column_types.clone().into_boxed_slice(),
+            spill_policy: self.ctx.spill_execution_policy(true),
         };
         Ok((
             PhysicalNodeKind::MaterializedCte(spec),
