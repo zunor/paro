@@ -38,7 +38,10 @@ impl GroupedAggregateHashTable {
         // until the batch's combine callbacks have consumed them.
         self.reserve_for_insertions(incoming_rows)?;
         let has_aggregates = !self.aggregate_objects.is_empty();
-        let direct_program = self.direct_update_program.clone();
+        let direct_program = self
+            .direct_update_program
+            .clone()
+            .filter(DirectGroupedAggregateProgram::supports_trivial_state_copy);
         let uses_generic_combine = has_aggregates && direct_program.is_none();
         let address_capacity = largest_source.min(VECTOR_SIZE);
         let mut source_addresses = uses_generic_combine

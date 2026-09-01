@@ -101,13 +101,14 @@ fn direct_decimal_program_fuses_shared_group_and_input_updates() {
     let average_offset = std::mem::size_of::<DecimalNarrowState>();
     let count_offset = average_offset + std::mem::size_of::<DecimalAverageState>();
     let mut program = crate::aggregate::DirectGroupedAggregateProgram::new(3);
-    assert!(program.try_add(0, sum.direct_update, sum_offset, Some(0), true));
+    assert!(program.try_add_filtered(0, sum.direct_update, sum_offset, Some(0), Some(1), true,));
     assert!(program.try_add(1, average.direct_update, average_offset, Some(0), true,));
-    assert!(program.try_add(
+    assert!(program.try_add_filtered(
         2,
         Some(AggregateDirectUpdate::CountStar),
         count_offset,
         None,
+        Some(1),
         true,
     ));
     assert!(program.has_updates());
@@ -121,21 +122,24 @@ fn direct_decimal_program_fuses_shared_group_and_input_updates() {
         *base.add(count_offset).cast::<i64>() = 0;
     }
     let mut addresses = paro_common::test_utils::test_vector(LogicalType::BigInt);
-    addresses.set_count(2);
+    addresses.set_count(3);
     unsafe {
         let values = addresses.flat_data_mut::<*mut u8>();
         *values = base;
         *values.add(1) = base;
+        *values.add(2) = base;
     }
     let mut values = paro_common::test_utils::test_vector(input_type);
-    values.set_count(2);
+    values.set_count(3);
     values.set_i64(0, 100);
     values.set_i64(1, 200);
-    let payload = paro_common::test_utils::test_chunk_from_vectors(vec![values]);
-    assert!(unsafe { program.execute(&payload, &addresses, 2) }.unwrap());
+    values.set_null(2, true);
+    let filters = paro_common::test_utils::test_bool_vector(&[true, false, true]);
+    let payload = paro_common::test_utils::test_chunk_from_vectors(vec![values, filters]);
+    assert!(unsafe { program.execute(&payload, &addresses, 3) }.unwrap());
     let sum = unsafe { &*base.add(sum_offset).cast::<DecimalNarrowState>() };
     let average = unsafe { &*base.add(average_offset).cast::<DecimalAverageState>() };
-    assert_eq!(sum.value(), 300);
+    assert_eq!(sum.value(), 100);
     assert_eq!(average.value(), i256::from(300));
     assert_eq!(average.count, 2);
     assert_eq!(unsafe { *base.add(count_offset).cast::<i64>() }, 2);

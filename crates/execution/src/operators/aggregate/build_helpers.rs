@@ -623,23 +623,9 @@ pub(crate) fn update_hash_aggregate_tables_with_scratch(
     let has_ordered = aggregate_objects
         .iter()
         .any(|object| !object.order_bys.is_empty());
-    let use_per_filter = has_aggregate_filters(spec) || has_distinct || has_ordered;
-    let filters = if use_per_filter {
-        let mut filters = build_per_aggregate_filters(spec, payload)?;
-        if has_distinct || has_ordered {
-            for (idx, obj) in aggregate_objects.iter().enumerate() {
-                if obj.is_distinct() || !obj.order_bys.is_empty() {
-                    filters[idx] = Some(SelectionVector::try_from_indices(
-                        vec![],
-                        payload.allocator().clone(),
-                    )?);
-                }
-            }
-        }
-        Some(filters)
-    } else {
-        None
-    };
+    let has_filters = has_aggregate_filters(spec);
+    let use_per_filter = has_filters || has_distinct || has_ordered;
+    let mut filters = None;
     for (table, grouping_set) in tables.iter_mut().zip(grouping_sets.iter()) {
         let groups =
             build_groups_chunk_for_set(all_groups, grouping_set.as_ref(), spec.grouping_key_count)?;
@@ -651,7 +637,28 @@ pub(crate) fn update_hash_aggregate_tables_with_scratch(
             payload.allocator().clone(),
         )?;
         table.find_or_create_groups(&groups, &hashes, addresses, new_groups)?;
-        if let Some(filters) = &filters {
+        if has_filters
+            && !has_distinct
+            && !has_ordered
+            && table.try_update_direct_aggregates(payload, addresses)?
+        {
+            continue;
+        }
+        if use_per_filter && filters.is_none() {
+            let mut prepared = build_per_aggregate_filters(spec, payload)?;
+            if has_distinct || has_ordered {
+                for (idx, obj) in aggregate_objects.iter().enumerate() {
+                    if obj.is_distinct() || !obj.order_bys.is_empty() {
+                        prepared[idx] = Some(SelectionVector::try_from_indices(
+                            vec![],
+                            payload.allocator().clone(),
+                        )?);
+                    }
+                }
+            }
+            filters = Some(prepared);
+        }
+        if let Some(filters) = filters.as_ref() {
             table.update_aggregates_per_filter(payload, addresses, filters)?;
         } else {
             table.update_aggregates(payload, Some(&hashes), addresses, None)?;

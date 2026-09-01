@@ -361,7 +361,7 @@ impl GroupedAggregateHashTable {
         let direct_update_program = {
             let program =
                 compile_direct_update_program(&aggregate_objects, &aggregate_inputs, &state_layout);
-            program.supports_trivial_state_copy().then_some(program)
+            program.handles_all().then_some(program)
         };
         let aggregate_return_types = aggregate_objects
             .iter()
@@ -686,6 +686,14 @@ impl GroupedAggregateHashTable {
         #[cfg(debug_assertions)]
         self.validate_state_addresses(addresses, payload.size())?;
 
+        if filter.is_none() {
+            if let Some(program) = self.direct_update_program.as_ref() {
+                if unsafe { program.execute(payload, addresses, payload.size())? } {
+                    return Ok(());
+                }
+            }
+        }
+
         let payload_desc = AggregatePayload {
             chunk: payload,
             aggregate_inputs: &self.aggregate_inputs,
@@ -716,6 +724,34 @@ impl GroupedAggregateHashTable {
         Ok(())
     }
 
+    /// Execute the complete precompiled update program without constructing
+    /// per-aggregate dictionary inputs or FILTER selections.
+    ///
+    /// `false` is a no-mutation decline: callers may safely fall back to the
+    /// generic aggregate ABI for unsupported functions or vector shapes.
+    pub(crate) fn try_update_direct_aggregates(
+        &mut self,
+        payload: &Chunk,
+        addresses: &Vector,
+    ) -> Result<bool> {
+        if payload.size() == 0 || self.aggregate_objects.is_empty() {
+            return Ok(true);
+        }
+        if addresses.len() < payload.size() {
+            return Err(paro_error::internal(format!(
+                "Address vector too small for direct aggregate update: addresses={} payload_rows={}",
+                addresses.len(),
+                payload.size()
+            )));
+        }
+        #[cfg(debug_assertions)]
+        self.validate_state_addresses(addresses, payload.size())?;
+        let Some(program) = self.direct_update_program.as_ref() else {
+            return Ok(false);
+        };
+        unsafe { program.execute(payload, addresses, payload.size()) }
+    }
+
     pub fn update_aggregates_per_filter(
         &mut self,
         payload: &Chunk,
@@ -727,6 +763,12 @@ impl GroupedAggregateHashTable {
         }
         #[cfg(debug_assertions)]
         self.validate_state_addresses(addresses, payload.size())?;
+
+        if let Some(program) = self.direct_update_program.as_ref() {
+            if unsafe { program.execute(payload, addresses, payload.size())? } {
+                return Ok(());
+            }
+        }
 
         for (agg_idx, (object, filter)) in self
             .aggregate_objects

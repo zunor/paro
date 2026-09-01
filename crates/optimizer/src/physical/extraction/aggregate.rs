@@ -7,7 +7,7 @@ use crate::physical::aggregate_planning::{
 };
 use crate::physical::specs::{GroupKeyEncoding, SpillExecutionPolicy};
 use paro_function::aggregate::distributive::first_last::get_first_function;
-use paro_function::aggregate::{AggregateFunction, AggregateSingletonMerge};
+use paro_function::aggregate::{AggregateDirectUpdate, AggregateFunction, AggregateSingletonMerge};
 use paro_function::scalar::function_data_equals;
 use paro_planner::expression::{OperatorExpression, OperatorType};
 use paro_planner::operator::{DistinctType, GroupInputMultiplicity};
@@ -348,9 +348,23 @@ pub(crate) fn plan_aggregate_payload_with_prefix(
             )));
         };
 
+        let conditional_input = bound.children.len() == 1
+            && bound.filter.is_none()
+            && matches!(
+                bound.function.direct_update,
+                Some(AggregateDirectUpdate::Decimal(_))
+            );
+        let mut derived_filter = None;
         let mut inputs = Vec::with_capacity(bound.children.len());
         let mut children = Vec::with_capacity(bound.children.len());
         for child_expr in std::mem::take(&mut bound.children) {
+            let child_expr = if conditional_input {
+                let (input, filter) = split_strict_conditional_input(child_expr);
+                derived_filter = filter;
+                input
+            } else {
+                child_expr
+            };
             let reference =
                 extract_payload_expression(child_expr, &mut projection_exprs, &mut payload_types);
             let Expression::Reference(reference_expr) = &reference else {
@@ -361,9 +375,10 @@ pub(crate) fn plan_aggregate_payload_with_prefix(
         }
         bound.children = children;
 
-        let filter_index = if let Some(filter) = bound.filter.take() {
+        let filter = bound.filter.take().map(|filter| *filter).or(derived_filter);
+        let filter_index = if let Some(filter) = filter {
             let reference =
-                extract_payload_expression(*filter, &mut projection_exprs, &mut payload_types);
+                extract_payload_expression(filter, &mut projection_exprs, &mut payload_types);
             let Expression::Reference(reference_expr) = &reference else {
                 unreachable!("extract_payload_expression returns a reference");
             };
@@ -406,6 +421,25 @@ pub(crate) fn plan_aggregate_payload_with_prefix(
         aggregate_filters,
         aggregate_orders,
     })
+}
+
+/// Lower `AGG(CASE WHEN predicate THEN passive_value ELSE NULL END)` into the
+/// aggregate FILTER representation. The value restriction is deliberate:
+/// the payload projection evaluates aggregate inputs before applying filters,
+/// so moving a fallible or effectful expression out of CASE would expose work
+/// that SQL short-circuiting previously suppressed.
+fn split_strict_conditional_input(expression: Expression) -> (Expression, Option<Expression>) {
+    let Expression::Case(case) = expression else {
+        return (expression, None);
+    };
+    let false_is_null = matches!(
+        case.result_if_false.as_ref(),
+        Expression::Constant(constant) if constant.value.is_null()
+    );
+    if !false_is_null || !case.result_if_true.is_passive_value() {
+        return (Expression::Case(case), None);
+    }
+    (*case.result_if_true, Some(*case.check))
 }
 
 impl PhysicalPlanExtractor {
@@ -1023,3 +1057,7 @@ fn can_execute_post_input_rollup(spec: &AggregateSpec) -> bool {
     };
     program.supports_direct_combine() && program.supports_trivial_state_copy()
 }
+
+#[cfg(test)]
+#[path = "aggregate_payload_tests.rs"]
+mod payload_tests;

@@ -155,7 +155,7 @@ pub(crate) fn compile_direct_update_program(
         let Some(inputs) = aggregate_inputs.get(aggregate_index) else {
             continue;
         };
-        if object.is_distinct() || object.filter.is_some() || !object.order_bys.is_empty() {
+        if object.is_distinct() || !object.order_bys.is_empty() {
             continue;
         }
         let input = if object.function.direct_update == Some(AggregateDirectUpdate::CountStar) {
@@ -163,11 +163,12 @@ pub(crate) fn compile_direct_update_program(
         } else {
             inputs.first().copied()
         };
-        program.try_add(
+        program.try_add_filtered(
             aggregate_index,
             object.function.direct_update,
             state_layout.state_offset(aggregate_index),
             input,
+            object.filter,
             object.function.state_is_trivially_copyable(),
         );
     }

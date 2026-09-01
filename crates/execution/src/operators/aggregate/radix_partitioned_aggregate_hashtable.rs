@@ -428,6 +428,20 @@ impl AggregateHashTable {
         }
     }
 
+    pub(crate) fn try_update_direct_aggregates(
+        &mut self,
+        payload: &Chunk,
+        addresses: &Vector,
+    ) -> Result<bool> {
+        match self {
+            Self::Flat(table) => table.try_update_direct_aggregates(payload, addresses),
+            // A radix table owns one state domain per partition. Its routed
+            // direct path needs a partition-aware program rather than
+            // borrowing an arbitrary child program.
+            Self::Radix(_) => Ok(false),
+        }
+    }
+
     pub fn combine(&mut self, other: &mut Self) -> Result<()> {
         match (self, other) {
             (Self::Flat(left), Self::Flat(right)) => left.combine(right),
