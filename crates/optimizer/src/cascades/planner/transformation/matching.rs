@@ -25,6 +25,7 @@ pub(super) fn matches_transformation(
                 })
         }
         PlannerTransformation::CteInline => operator == Op::MaterializedCTE,
+        PlannerTransformation::CteDemandPushdown => operator == Op::MaterializedCTE,
         PlannerTransformation::AggregatePostReduction => {
             operator == Op::MaterializedCTE
                 || (matches!(operator, Op::Projection | Op::Filter)

@@ -59,7 +59,6 @@ impl CTEFilterPusher {
     /// the mutation to that group's root prevents nested CTE choices from
     /// being multiplied into the ancestor expression, and changing DEFAULT
     /// to MATERIALIZED makes the transformation structurally idempotent.
-    #[cfg(test)]
     pub(crate) fn optimize_default_root_with_change(
         &mut self,
         mut plan: LogicalPlan,

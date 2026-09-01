@@ -28,6 +28,7 @@ use crate::aggregate::{
 use crate::column::lifetime::ColumnLifetimeAnalyzer;
 use crate::column::remove_unused::RemoveUnusedColumns;
 use crate::cte::inlining::CTEInlining;
+use crate::cte::{demand_pushdown::CTEDemandPusher, filter_pusher::CTEFilterPusher};
 use crate::filter::pushdown::FilterPushdown;
 use crate::filter::reorder::ReorderFilter;
 use crate::join::elimination::JoinElimination;
@@ -75,8 +76,8 @@ use super::rules::{
     TransformContext, TransformationRule, AGGREGATE_DIMENSION_DEFERRAL_RULE,
     AGGREGATE_INPUT_MATERIALIZATION_RULE, AGGREGATE_JOIN_PREAGGREGATION_RULE,
     AGGREGATE_JOIN_SUBSUMPTION_RULE, AGGREGATE_NON_NULL_INPUT_RULE, AGGREGATE_POST_REDUCTION_RULE,
-    CTE_INLINE_RULE, EXPENSIVE_PREDICATE_PLACEMENT_RULE, JOIN_ELIMINATION_RULE,
-    LATE_PAYLOAD_FETCH_RULE, LIMIT_PUSHDOWN_RULE, MARK_JOIN_TO_SEMI_RULE,
+    CTE_DEMAND_PUSHDOWN_RULE, CTE_INLINE_RULE, EXPENSIVE_PREDICATE_PLACEMENT_RULE,
+    JOIN_ELIMINATION_RULE, LATE_PAYLOAD_FETCH_RULE, LIMIT_PUSHDOWN_RULE, MARK_JOIN_TO_SEMI_RULE,
     SCALAR_AGGREGATE_WINDOW_RULE, TOP_N_INTRODUCTION_RULE,
 };
 use super::scalar::ScalarArena;

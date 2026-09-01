@@ -21,7 +21,7 @@ use super::region::RegionCandidateContract;
 
 pub const EXPENSIVE_PREDICATE_PLACEMENT_RULE: RuleId = RuleId(10_006);
 pub const CTE_INLINE_RULE: RuleId = RuleId(10_007);
-pub const CTE_FILTER_PUSHDOWN_RULE: RuleId = RuleId(10_008);
+pub const CTE_DEMAND_PUSHDOWN_RULE: RuleId = RuleId(10_008);
 pub const AGGREGATE_POST_REDUCTION_RULE: RuleId = RuleId(10_009);
 pub const MARK_JOIN_TO_SEMI_RULE: RuleId = RuleId(10_010);
 pub const JOIN_ELIMINATION_RULE: RuleId = RuleId(10_011);
@@ -41,7 +41,7 @@ const TRANSFORMATION_RULE_NAMES: &[(RuleId, &str)] = &[
         "expensive_predicate_placement",
     ),
     (CTE_INLINE_RULE, "cte_inline"),
-    (CTE_FILTER_PUSHDOWN_RULE, "cte_filter_pushdown"),
+    (CTE_DEMAND_PUSHDOWN_RULE, "cte_demand_pushdown"),
     (AGGREGATE_POST_REDUCTION_RULE, "aggregate_post_reduction"),
     (MARK_JOIN_TO_SEMI_RULE, "mark_join_to_semi"),
     (JOIN_ELIMINATION_RULE, "join_elimination"),

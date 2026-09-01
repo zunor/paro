@@ -475,6 +475,16 @@ impl StatisticsGathering {
                 let right = cmp.right.stats.estimated_cardinality?;
                 let left_bindings = cmp.left.get_column_bindings();
                 let right_bindings = cmp.right.get_column_bindings();
+                if let Some(estimate) = estimate_same_domain_semi_join(
+                    cmp,
+                    left,
+                    right,
+                    &left_bindings,
+                    &right_bindings,
+                    ctx,
+                ) {
+                    return Some(estimate);
+                }
                 if let Some(inner) = estimate_unique_dimension_join(
                     cmp,
                     left,
@@ -702,6 +712,62 @@ impl StatisticsGathering {
             .map(|rows| rows.max(1))
             .unwrap_or_else(|| default_table_cardinality(ctx))
     }
+}
+
+/// Estimate a semi join between two filtered views of the same statistical
+/// key domain without charging build-side duplicates as new matches.
+///
+/// Base column statistics intentionally survive relational filters, so two
+/// alpha-renamed scans of the same key retain the same NDV and range. For a
+/// semi join that is exactly the useful signal: rows on the demand side are a
+/// sample of the preserved key distribution, and repeated demand keys do not
+/// multiply the output. The estimate remains deliberately uncertain; this is
+/// a costing interval, never a correctness bound.
+fn estimate_same_domain_semi_join(
+    join: &paro_planner::operator::ComparisonJoin,
+    left: CardinalityEstimate,
+    right: CardinalityEstimate,
+    left_bindings: &[ColumnBinding],
+    right_bindings: &[ColumnBinding],
+    ctx: &OptimizationContext,
+) -> Option<CardinalityEstimate> {
+    let (preserved, demand, preserved_bindings, demand_bindings) = match join.join_type {
+        JoinType::Semi => (left, right, left_bindings, right_bindings),
+        JoinType::RightSemi => (right, left, right_bindings, left_bindings),
+        _ => return None,
+    };
+    let [condition] = join.conditions.as_slice() else {
+        return None;
+    };
+    if condition.comparison != JoinComparisonType::Equal {
+        return None;
+    }
+    let preserved_key = expression_binding(&condition.left, preserved_bindings)
+        .or_else(|| expression_binding(&condition.right, preserved_bindings))?;
+    let demand_key = expression_binding(&condition.right, demand_bindings)
+        .or_else(|| expression_binding(&condition.left, demand_bindings))?;
+    let preserved_stats = ctx.column_stats.get(&preserved_key)?;
+    let demand_stats = ctx.column_stats.get(&demand_key)?;
+    let preserved_distinct = preserved_stats.get_distinct_count();
+    if preserved_distinct == 0
+        || preserved_distinct != demand_stats.get_distinct_count()
+        || preserved_stats.get_type() != demand_stats.get_type()
+        || preserved_stats.statistics().min_value() != demand_stats.statistics().min_value()
+        || preserved_stats.statistics().max_value() != demand_stats.statistics().max_value()
+    {
+        return None;
+    }
+
+    let expected = preserved.expected.min(demand.expected);
+    Some(CardinalityEstimate {
+        min: 0,
+        expected,
+        // `demand.max` already carries the estimator's uncertainty envelope.
+        // Applying another arbitrary factor here double-counts uncertainty
+        // and makes a duplicate-insensitive semi join look riskier than the
+        // unfiltered relation it replaces.
+        max: preserved.max.min(demand.max).max(expected),
+    })
 }
 
 /// Estimate an equality lookup into a declared unique relation against the
@@ -1632,6 +1698,46 @@ mod tests {
             estimate_group_distinct(&column_ref(1, 0), &ctx, 4_096, 4_096),
             (2, Some(4))
         );
+    }
+
+    #[test]
+    fn same_domain_semi_join_does_not_count_duplicate_demand_rows_twice() {
+        let bind_context = BindContext::new();
+        let session = make_test_session();
+        let mut ctx = OptimizationContext::new(session, bind_context.clone());
+        let mut shared = ColumnStatistics::new(BaseStatistics::from_constant(&Value::BigInt(7)));
+        shared.update_distinct_statistics(&[11, 29, 47], 3);
+        let shared = Arc::new(shared);
+        ctx.column_stats
+            .insert(ColumnBinding::new(1, 0), shared.clone());
+        ctx.column_stats.insert(ColumnBinding::new(2, 0), shared);
+
+        let join = paro_planner::operator::ComparisonJoin::new(
+            JoinType::Semi,
+            values_relation(&bind_context, 1, 1),
+            values_relation(&bind_context, 2, 1),
+            vec![equality(1, 0, 2, 0)],
+        );
+        let estimate = estimate_same_domain_semi_join(
+            &join,
+            CardinalityEstimate {
+                min: 36_000,
+                expected: 73_049,
+                max: 90_000,
+            },
+            CardinalityEstimate {
+                min: 362,
+                expected: 724,
+                max: 1_086,
+            },
+            &[ColumnBinding::new(1, 0)],
+            &[ColumnBinding::new(2, 0)],
+            &ctx,
+        )
+        .expect("same-domain semi join estimate");
+
+        assert_eq!(estimate.expected, 724);
+        assert_eq!(estimate.max, 1_086);
     }
 
     #[test]
