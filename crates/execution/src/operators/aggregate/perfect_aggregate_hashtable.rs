@@ -174,6 +174,31 @@ impl PerfectAggregateHashTable {
         allocator: Arc<dyn Allocator>,
         memory: MemoryAccountingContext,
     ) -> Result<Self> {
+        Self::new_with_memory_contract(
+            group_types,
+            aggregate_objects,
+            aggregate_inputs,
+            group_minima,
+            group_cardinalities,
+            allocator,
+            memory,
+            usize::MAX,
+        )
+    }
+
+    /// Materialize a planner-admitted direct-addressing table. The runtime
+    /// computes its exact allocator request and proves it stays within the
+    /// immutable planning envelope before reserving memory.
+    pub(crate) fn new_with_memory_contract(
+        group_types: Vec<LogicalType>,
+        aggregate_objects: Vec<AggregateObject>,
+        aggregate_inputs: Vec<Vec<usize>>,
+        group_minima: Vec<i128>,
+        group_cardinalities: Vec<usize>,
+        allocator: Arc<dyn Allocator>,
+        memory: MemoryAccountingContext,
+        planned_bytes_upper: usize,
+    ) -> Result<Self> {
         if group_types.is_empty() {
             return Err(paro_error::internal(
                 "PerfectAggregateHashTable requires at least one group key".to_string(),
@@ -226,6 +251,11 @@ impl PerfectAggregateHashTable {
             .and_then(|bytes| bytes.checked_add(occupancy_bytes))
             .and_then(|bytes| bytes.checked_add(direct_scratch_bytes))
             .ok_or_else(|| paro_error::internal("perfect aggregate reservation overflow"))?;
+        if reserved_bytes > planned_bytes_upper {
+            return Err(paro_error::internal(format!(
+                "perfect aggregate runtime layout exceeds its immutable resource contract: exact={reserved_bytes}, planned_upper={planned_bytes_upper}"
+            )));
+        }
         let reservation = memory.reserve_grant(reserved_bytes)?;
         let direct_update_scratch = match direct_update_program.as_ref() {
             Some(program) => program.try_create_scratch_with_grant(

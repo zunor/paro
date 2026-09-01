@@ -80,6 +80,7 @@ pub fn compile_statement_with_parameter_types(
 
     let plan_dependencies = match &optimized {
         paro_optimizer::OptimizedStatement::Physical(portfolio) => {
+            portfolio.verify_result_types(&result_types)?;
             portfolio.combined_dependencies()?
         }
         paro_optimizer::OptimizedStatement::ExplainAnalyze { target, .. } => {
@@ -89,10 +90,11 @@ pub fn compile_statement_with_parameter_types(
 
     let executable = match optimized {
         paro_optimizer::OptimizedStatement::Physical(plan) => {
-            lower_runtime_program(plan, ctx.limits.max_memory, &statement_tag)?
+            paro_execution::pipeline::StatementProgram::deferred_physical_portfolio(plan)?
         }
         paro_optimizer::OptimizedStatement::ExplainAnalyze { target, spec } => {
-            let target = lower_runtime_program(target, ctx.limits.max_memory, &statement_tag)?;
+            let target =
+                paro_execution::pipeline::StatementProgram::deferred_physical_portfolio(target)?;
             paro_execution::pipeline::StatementProgram::ExplainAnalyze {
                 target: Box::new(target),
                 spec,
@@ -126,33 +128,4 @@ pub fn compile_statement_with_parameter_types(
     );
 
     Ok(compiled)
-}
-
-fn lower_runtime_program(
-    portfolio: paro_optimizer::physical::PhysicalPlanPortfolio,
-    available_memory_bytes: usize,
-    statement_tag: &str,
-) -> Result<paro_execution::pipeline::StatementProgram> {
-    let available_memory_bytes = if available_memory_bytes == 0 {
-        u64::MAX
-    } else {
-        u64::try_from(available_memory_bytes).unwrap_or(u64::MAX)
-    };
-    match paro_execution::pipeline::StatementProgram::from_physical_portfolio(
-        portfolio,
-        available_memory_bytes,
-        u16::MAX,
-    ) {
-        Ok(program) => Ok(program),
-        Err(error) => {
-            error!(
-                target: targets::EXECUTOR,
-                statement_tag = %statement_tag,
-                error = %error,
-                stage = "runtime_program",
-                "Runtime program generation failed"
-            );
-            Err(error)
-        }
-    }
 }

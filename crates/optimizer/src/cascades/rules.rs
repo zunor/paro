@@ -33,6 +33,7 @@ pub const AGGREGATE_INPUT_MATERIALIZATION_RULE: RuleId = RuleId(10_016);
 pub const LIMIT_PUSHDOWN_RULE: RuleId = RuleId(10_017);
 pub const LATE_PAYLOAD_FETCH_RULE: RuleId = RuleId(10_018);
 pub const SCALAR_AGGREGATE_WINDOW_RULE: RuleId = RuleId(10_019);
+pub const TOP_N_INTRODUCTION_RULE: RuleId = RuleId(10_022);
 
 const TRANSFORMATION_RULE_NAMES: &[(RuleId, &str)] = &[
     (
@@ -64,6 +65,7 @@ const TRANSFORMATION_RULE_NAMES: &[(RuleId, &str)] = &[
     (LIMIT_PUSHDOWN_RULE, "limit_pushdown"),
     (LATE_PAYLOAD_FETCH_RULE, "late_payload_fetch"),
     (SCALAR_AGGREGATE_WINDOW_RULE, "scalar_aggregate_window"),
+    (TOP_N_INTRODUCTION_RULE, "top_n_introduction"),
 ];
 
 pub fn transformation_rule_name(id: RuleId) -> Option<&'static str> {

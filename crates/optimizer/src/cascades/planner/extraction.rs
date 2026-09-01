@@ -4,6 +4,21 @@
 //! Winner extraction from Memo expressions into verified planner trees.
 
 use super::*;
+use paro_planner::expression::ReferenceExpression;
+use paro_planner::operator::Projection as LogicalProjection;
+
+use crate::cascades::calibration::{LocalOperatorWork, OP_ENFORCER_STREAM_ROW};
+
+type WinnerContractMap =
+    std::collections::HashMap<paro_planner::plan::PlanNodeId, WinnerPhysicalContract>;
+type WinnerEnforcerMap =
+    std::collections::HashMap<paro_planner::plan::PlanNodeId, Box<[ExtractedEnforcerContract]>>;
+type ExtractedWinnerTree = (
+    LogicalPlan,
+    WinnerContractMap,
+    WinnerEnforcerMap,
+    Box<[ColumnId]>,
+);
 
 pub(super) fn extract_planner_tree(
     memo: &Memo,
@@ -35,6 +50,7 @@ pub(super) fn extract_planner_tree(
     let mut plans = Vec::new();
     let mut contracts = std::collections::HashMap::new();
     let mut extracted_enforcers = std::collections::HashMap::new();
+    let mut root_output_columns = None;
     while let Some(task) = tasks.pop() {
         match task {
             Task::Visit(group, goal) => {
@@ -284,6 +300,9 @@ pub(super) fn extract_planner_tree(
                         "physical extraction assigned two enforcer chains to one plan node",
                     ));
                 }
+                if tasks.is_empty() {
+                    root_output_columns = Some(output_columns);
+                }
                 plans.push(plan);
             }
         }
@@ -293,7 +312,13 @@ pub(super) fn extract_planner_tree(
             "physical extraction did not produce exactly one root",
         ));
     }
-    Ok((plans.pop().unwrap(), contracts, extracted_enforcers))
+    Ok((
+        plans.pop().unwrap(),
+        contracts,
+        extracted_enforcers,
+        root_output_columns
+            .ok_or_else(|| paro_error::internal("physical extraction lost root output columns"))?,
+    ))
 }
 
 /// A physical winner may use a different equivalent child expression from
@@ -432,4 +457,105 @@ pub(super) fn extracted_region_ownership(
         .collect::<Vec<_>>()
         .into_boxed_slice();
     Ok((Some(region.stable_fingerprint()), artifacts))
+}
+
+pub(super) fn enforce_result_presentation(
+    child: LogicalPlan,
+    mut contracts: WinnerContractMap,
+    enforcers: &WinnerEnforcerMap,
+    output_columns: &[ColumnId],
+    presentation: &ResultPresentation,
+    bind_context: &BindContext,
+    calibration: &MachineCalibrationBundle,
+    child_fingerprint: Fingerprint,
+    child_cost: SearchCost,
+) -> Result<(LogicalPlan, WinnerContractMap, Fingerprint, SearchCost)> {
+    if presentation.columns.len() != presentation.names.len() {
+        return Err(paro_error::internal(
+            "result presentation columns and names are not aligned",
+        ));
+    }
+    // Aliases are presentation metadata owned by the compiler result schema;
+    // they do not require a runtime data movement. Equal ColumnId order is a
+    // proved no-op presentation enforcer. A physical projection is mandatory
+    // only when equivalence search changed the executable layout.
+    if output_columns == presentation.columns.as_ref() {
+        return Ok((child, contracts, child_fingerprint, child_cost));
+    }
+    let child_types = child.types();
+    let expressions = presentation
+        .columns
+        .iter()
+        .map(|column| {
+            let ordinal = output_columns
+                .iter()
+                .position(|candidate| candidate == column)
+                .ok_or_else(|| {
+                    paro_error::internal("result presentation references a missing root column")
+                })?;
+            let logical_type = child_types.get(ordinal).cloned().ok_or_else(|| {
+                paro_error::internal("result presentation column lost its physical type")
+            })?;
+            Ok(Expression::Reference(ReferenceExpression::new(
+                ordinal,
+                logical_type,
+            )))
+        })
+        .collect::<Result<Vec<_>>>()?;
+    let child_id = child.id;
+    let projection =
+        LogicalProjection::new(bind_context.generate_table_index(), child, expressions)
+            .with_visible_names(presentation.names.to_vec());
+    let mut plan = LogicalPlan::new(bind_context, LogicalOperator::Projection(projection));
+    plan.stats = plan
+        .children()
+        .first()
+        .map(|child| child.stats.clone())
+        .unwrap_or_default();
+
+    let child_contract = enforcers
+        .get(&child_id)
+        .and_then(|chain| chain.last())
+        .map(|enforcer| enforcer.contract.clone())
+        .or_else(|| contracts.get(&child_id).cloned())
+        .ok_or_else(|| {
+            paro_error::internal("result presentation child lost its winner contract")
+        })?;
+    let rows = match plan.stats.estimated_cardinality {
+        Some(cardinality) => CompactRange::new(
+            cardinality.min as f64,
+            cardinality.expected as f64,
+            cardinality.max as f64,
+        )?,
+        None => CompactRange::new(0.0, 1.0, 4.0)?,
+    };
+    let mut work = LocalOperatorWork::default();
+    work.add(OP_ENFORCER_STREAM_ROW, rows)?;
+    let cost = child_cost.sequential(calibration.fold(&work)?)?;
+    let mut fingerprint = StableFingerprintBuilder::default();
+    fingerprint.write_bytes(b"paro.result-presentation.v1");
+    fingerprint.write_fingerprint(child_fingerprint);
+    for column in presentation.columns.iter().copied() {
+        fingerprint.write_u64(column.0 as u64);
+    }
+    for name in presentation.names.iter() {
+        fingerprint.write_bytes(name.as_bytes());
+    }
+    let physical_fingerprint = fingerprint.finish();
+    contracts.insert(
+        plan.id,
+        WinnerPhysicalContract {
+            required: child_contract.required.clone(),
+            provided: child_contract.provided,
+            cost,
+            grant: child_contract.grant,
+            origin: crate::physical::properties::PlanOrigin::Enforcer(physical_fingerprint),
+            goal_fingerprint: physical_fingerprint,
+            physical_fingerprint,
+            implementation: PhysicalImplementationFlavor::Structural,
+            region_owner: None,
+            owned_artifacts: Box::new([]),
+        },
+    );
+    Ok((plan, contracts, physical_fingerprint, cost))
 }

@@ -108,4 +108,7 @@ pub struct Instance {
     pub(crate) lifecycle: lifecycle::InstanceLifecycle,
     /// Managed database registry and orchestration.
     pub(crate) database_service: ManagedDatabaseService,
+    /// Owns an automatically-created query scratch directory for an in-memory
+    /// instance. Declared last so runtime users release their files first.
+    pub(crate) _ephemeral_workspace: Option<tempfile::TempDir>,
 }

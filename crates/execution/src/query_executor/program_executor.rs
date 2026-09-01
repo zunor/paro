@@ -118,6 +118,11 @@ fn start_program_with_output(
 ) -> Result<ProgramExecution> {
     let requires_background_input = session.input.requires_background_execution();
     let output = match program {
+        StatementProgram::Portfolio(_) => {
+            return Err(paro_error::internal(
+                "physical portfolio reached execution before resource admission",
+            ));
+        }
         StatementProgram::Pipeline { .. } if fetch_driven && requires_background_input => {
             QueryOutputPort::with_blocking_writes(&streaming_output)
         }
@@ -144,6 +149,7 @@ fn start_program_with_output(
     };
     let query = QueryRuntimeContext::new(session, params, memory, output);
     match program {
+        StatementProgram::Portfolio(_) => unreachable!("portfolio was rejected before execution"),
         StatementProgram::Utility(utility) => run_utility(utility, &query)?,
         StatementProgram::ExplainAnalyze { target, spec } => {
             run_explain_analyze(target, *spec, &query, allocator)?
@@ -362,6 +368,11 @@ fn run_explain_analyze(
 
     let started_at = Instant::now();
     match target {
+        StatementProgram::Portfolio(_) => {
+            return Err(paro_error::internal(
+                "EXPLAIN ANALYZE target reached execution before admission",
+            ));
+        }
         StatementProgram::Utility(utility) => run_utility(utility, &target_query)?,
         StatementProgram::Pipeline {
             graph, programs, ..

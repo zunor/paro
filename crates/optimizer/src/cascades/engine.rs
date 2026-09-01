@@ -369,6 +369,9 @@ impl CascadesEngine {
             if admitted == BudgetDecision::Exhausted {
                 continue;
             }
+            if !admit_transformation_work(&mut self.memo, group, expression, rule)? {
+                continue;
+            }
             // Reserve the single rule output before the rule is allowed to
             // append payloads or child groups.  TransformContext mutations
             // are append-only and become reachable through that output, so a
@@ -1043,7 +1046,7 @@ fn fit_local_retained_state_to_grant(
     if grant.hard_memory_bytes == u64::MAX {
         return Ok(Some(local_cost));
     }
-    let overlapping_peak = match composition {
+    let overlapping_non_revocable = match composition {
         CostComposition::Sequential => 0,
         CostComposition::RetainedState {
             overlapping_children,
@@ -1051,37 +1054,36 @@ fn fit_local_retained_state_to_grant(
             .iter()
             .enumerate()
             .filter(|(index, _)| overlapping_children & (1_u64 << index) != 0)
-            .map(|(_, child)| child.peak_memory_upper)
+            .map(|(_, child)| child.non_revocable_memory_upper)
             .max()
             .unwrap_or(0),
     };
-    let available = grant.hard_memory_bytes.saturating_sub(overlapping_peak);
-    if local_cost.peak_memory_upper <= available {
-        return Ok(Some(local_cost));
+    if local_cost
+        .non_revocable_memory_upper
+        .saturating_add(overlapping_non_revocable)
+        > grant.hard_memory_bytes
+    {
+        return Ok(None);
     }
-    if mandatory && local_cost.peak_memory_upper == u64::MAX {
-        // UNKNOWN is an absence of a finite hard bound, not a prediction that
-        // u64::MAX bytes will spill. Bind the mandatory implementation to the
-        // shared allocator without manufacturing an astronomic I/O cost.
-        local_cost.peak_memory_upper = available;
+    if local_cost.peak_memory_upper == u64::MAX {
+        if spillable && grant.spill_policy == SpillPolicy::Allowed {
+            local_cost.peak_memory_upper = grant.hard_memory_bytes;
+            return Ok(Some(local_cost));
+        }
+        return Ok(None);
+    }
+    if local_cost.peak_memory_upper <= grant.hard_memory_bytes {
         return Ok(Some(local_cost));
     }
     if spillable && grant.spill_policy == SpillPolicy::Allowed {
-        let spilled = local_cost.peak_memory_upper.saturating_sub(available);
-        local_cost.peak_memory_upper = available;
+        let spilled = local_cost
+            .peak_memory_upper
+            .saturating_sub(grant.hard_memory_bytes);
+        local_cost.peak_memory_upper = grant.hard_memory_bytes;
         add_composition_spill_cost(&mut local_cost, spilled)?;
         return Ok(Some(local_cost));
     }
-    if mandatory {
-        // Mandatory implementations share the query allocator with their
-        // descendants. A descendant whose hard upper is allocator-capped may
-        // already report the entire grant as its peak; cap this operator to
-        // the remaining concurrent allowance instead of adding the same
-        // grant once per tree level. Optional implementations never receive
-        // this fallback and must carry an independently feasible proof.
-        local_cost.peak_memory_upper = available;
-        return Ok(Some(local_cost));
-    }
+    let _ = mandatory;
     Ok(None)
 }
 
@@ -1126,11 +1128,26 @@ pub(crate) fn compose_candidate_cost(
                 .map(|(_, child)| child.peak_memory_upper)
                 .max()
                 .unwrap_or(0);
-            cost.peak_memory_upper = cost.peak_memory_upper.max(
-                local_cost
-                    .peak_memory_upper
-                    .saturating_add(overlapping_peak),
-            );
+            let overlapping_non_revocable = child_costs
+                .iter()
+                .enumerate()
+                .filter(|(index, _)| overlapping_children & (1_u64 << index) != 0)
+                .map(|(_, child)| child.non_revocable_memory_upper)
+                .max()
+                .unwrap_or(0);
+            let retained_non_revocable = local_cost
+                .non_revocable_memory_upper
+                .saturating_add(overlapping_non_revocable);
+            cost.non_revocable_memory_upper =
+                cost.non_revocable_memory_upper.max(retained_non_revocable);
+            // Revocable operator state is governed by one shared query pool.
+            // Overlapping spillable working sets therefore compose by maximum;
+            // only their non-revocable portions must be added.
+            cost.peak_memory_upper = cost
+                .peak_memory_upper
+                .max(local_cost.peak_memory_upper)
+                .max(overlapping_peak)
+                .max(retained_non_revocable);
         }
     }
     cost.validate()?;
@@ -1143,6 +1160,53 @@ fn transformation_event(group: GroupId, expression: LogicalExprId, rule: RuleId)
     builder.write_u64(expression.0 as u64);
     builder.write_u64(rule.0 as u64);
     builder.finish()
+}
+
+fn admit_transformation_work(
+    memo: &mut Memo,
+    target: GroupId,
+    source: LogicalExprId,
+    rule: RuleId,
+) -> Result<bool> {
+    let mut pending = vec![source];
+    let mut visited = BTreeSet::new();
+    while let Some(expression) = pending.pop() {
+        let logical = memo.logical_expr(expression).ok_or_else(|| {
+            paro_error::internal("rule work accounting references a missing expression")
+        })?;
+        for child in logical.key.children.iter().copied() {
+            let child = memo.canonical_group(child);
+            if !visited.insert(child) {
+                continue;
+            }
+            let child_expression = memo
+                .group(child)
+                .and_then(|group| group.logical_exprs().first())
+                .copied()
+                .ok_or_else(|| {
+                    paro_error::internal("rule work accounting found an empty child group")
+                })?;
+            pending.push(child_expression);
+        }
+    }
+    let ledger = &mut memo
+        .group_mut(target)
+        .ok_or_else(|| paro_error::internal("rule work target group disappeared"))?
+        .ledger;
+    for group in visited {
+        let mut event = StableFingerprintBuilder::default();
+        event.write_bytes(b"paro.rule-work.v1");
+        event.write_u64(target.0 as u64);
+        event.write_u64(source.0 as u64);
+        event.write_u64(rule.0 as u64);
+        event.write_u64(group.0 as u64);
+        if ledger.admit_optional(BudgetDimension::RuleWorkPerGroup, event.finish())
+            == BudgetDecision::Exhausted
+        {
+            return Ok(false);
+        }
+    }
+    Ok(true)
 }
 
 fn validate_transformation_proof(

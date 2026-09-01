@@ -94,7 +94,7 @@ fn integer_sum_candidate_without_direct_state_predicate_uses_preserving_fallback
     let ctx = BindContext::new();
     let aggregate = integer_sum_reduction(&ctx);
     let spec = lower_aggregate(&ctx, aggregate, parallel_context(), false);
-    assert_eq!(spec.perfect_hash.as_ref().unwrap().max_local_tables, 4);
+    assert!(spec.perfect_hash.is_none());
     assert!(spec
         .post_reduction
         .as_ref()
@@ -104,12 +104,13 @@ fn integer_sum_candidate_without_direct_state_predicate_uses_preserving_fallback
 }
 
 #[test]
-fn q11_decimal_cast_admits_parallel_perfect_input_rollup() {
+fn q11_snapshot_bounds_do_not_admit_a_cacheable_perfect_domain() {
     let ctx = BindContext::new();
     let aggregate = decimal_sum_reduction(&ctx, false);
     let spec = lower_aggregate(&ctx, aggregate, parallel_context(), false);
     let post = spec.post_reduction.as_ref().unwrap();
-    assert_eq!(post.input_rollup_sources.as_deref(), Some([0].as_slice()));
+    assert!(spec.perfect_hash.is_none());
+    assert!(post.input_rollup_sources.is_none());
     assert_eq!(
         post.state_filter_plan(),
         Some(crate::physical::specs::PostAggregateStateFilterPlan {
@@ -153,7 +154,7 @@ fn single_local_table_keeps_preserving_post_reduction() {
     let ctx = BindContext::new();
     let aggregate = decimal_sum_reduction(&ctx, false);
     let spec = lower_aggregate(&ctx, aggregate, ExtractionContext::default(), false);
-    assert_eq!(spec.perfect_hash.as_ref().unwrap().max_local_tables, 1);
+    assert!(spec.perfect_hash.is_none());
     assert!(spec
         .post_reduction
         .as_ref()
@@ -198,6 +199,7 @@ fn physical_input_rollup_verifier_rejects_stale_payload_contract() {
         parallel_context(),
         false,
     );
+    force_input_rollup(&mut spec);
     spec.payload_types[1] = LogicalType::BigInt;
     let error = spec.verify_post_reduction().unwrap_err();
     assert!(error.to_string().contains("argument 0 type mismatch"));
@@ -208,6 +210,7 @@ fn physical_input_rollup_verifier_rejects_stale_payload_contract() {
         parallel_context(),
         false,
     );
+    force_input_rollup(&mut spec);
     spec.aggregate_inputs[0] = Box::new([usize::MAX]);
     let error = spec.verify_post_reduction().unwrap_err();
     assert!(error.to_string().contains("missing payload column"));
@@ -217,16 +220,22 @@ fn physical_input_rollup_verifier_rejects_stale_payload_contract() {
 fn physical_input_rollup_verifier_rejects_unexecutable_strategy() {
     let ctx = BindContext::new();
     let admitted = || {
-        lower_aggregate(
+        let mut spec = lower_aggregate(
             &ctx,
             decimal_sum_reduction(&ctx, false),
             parallel_context(),
             false,
-        )
+        );
+        force_input_rollup(&mut spec);
+        spec
     };
 
     let mut spec = admitted();
-    spec.perfect_hash.as_mut().unwrap().max_local_tables = 1;
+    spec.perfect_hash
+        .as_mut()
+        .unwrap()
+        .resource
+        .max_local_tables = 1;
     assert!(spec
         .verify_post_reduction()
         .unwrap_err()
@@ -255,6 +264,22 @@ fn physical_input_rollup_verifier_rejects_unexecutable_strategy() {
         .unwrap_err()
         .to_string()
         .contains("must be non-distinct"));
+}
+
+fn force_input_rollup(spec: &mut crate::physical::specs::AggregateSpec) {
+    spec.perfect_hash = Some(crate::physical::specs::PerfectHashAggregatePlan {
+        group_minima: Box::new([i128::from(i32::MIN)]),
+        group_cardinalities: Box::new([4]),
+        resource: crate::physical::specs::PerfectHashResourceContract {
+            slots: 4,
+            bytes_per_table_upper: usize::MAX,
+            max_local_tables: 2,
+        },
+    });
+    spec.post_reduction
+        .as_mut()
+        .expect("post reduction")
+        .input_rollup_sources = Some(Box::new([0]));
 }
 
 #[test]

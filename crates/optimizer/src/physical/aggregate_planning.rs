@@ -12,11 +12,15 @@ use std::mem::size_of;
 
 use crate::physical::AggregateSpec;
 use paro_common::error::{self as paro_error, Result};
-use paro_common::runtime_value::Value;
 use paro_common::types::LogicalType;
-use paro_function::aggregate::{AggregateDirectUpdate, DirectGroupedAggregateProgram};
+use paro_common::vector::VECTOR_SIZE;
+use paro_function::aggregate::{
+    AggregateDirectUpdate, DecimalDirectUpdate, DirectGroupedAggregateProgram,
+};
 use paro_planner::expression::Expression;
-use paro_storage::statistics::{BaseStatistics, StringStats};
+use paro_planner::operator::Aggregate as LogicalAggregate;
+
+use super::specs::aggregate::{PerfectHashAggregatePlan, PerfectHashResourceContract};
 
 const MIN_ALIGNMENT: usize = 8;
 const VARLEN_REF_WIDTH: usize = 16;
@@ -24,7 +28,6 @@ const VARLEN_REF_WIDTH: usize = 16;
 #[derive(Debug, Clone)]
 pub(crate) struct AggregateStateLayout {
     offsets: Box<[usize]>,
-    total_size: usize,
 }
 
 impl AggregateStateLayout {
@@ -47,12 +50,7 @@ impl AggregateStateLayout {
         }
         Ok(Self {
             offsets: offsets.into_boxed_slice(),
-            total_size: current,
         })
-    }
-
-    pub(crate) fn total_size(&self) -> usize {
-        self.total_size
     }
 
     fn offset(&self, index: usize) -> Option<usize> {
@@ -190,43 +188,14 @@ impl PerfectHashPlanningDomain {
         })
     }
 
-    pub(crate) fn min_max_from_stats(
-        &self,
-        stats: Option<&BaseStatistics>,
-    ) -> Option<(i128, i128)> {
+    /// Return only a domain that is invariant for every value of the SQL
+    /// type. Table statistics are estimates for a particular snapshot and
+    /// must never define the addressable range of a cacheable physical plan.
+    pub(crate) fn invariant_bounds(&self) -> Option<(i128, i128)> {
         if self.varchar {
-            let stats = StringStats::get_data(stats?)?;
-            if stats.max_string_length()? > 1 {
-                return None;
-            }
-            let min = encode_single_byte_varchar(stats.min_bytes())?;
-            let max = encode_single_byte_varchar(stats.max_bytes())?;
-            return (min <= max).then_some((min, max));
+            return None;
         }
-        stats
-            .and_then(|stats| {
-                Some((
-                    integer_value(&stats.min_value()?)?,
-                    integer_value(&stats.max_value()?)?,
-                ))
-            })
-            .or_else(|| integer_type_bounds(&self.logical_type))
-    }
-}
-
-fn integer_value(value: &Value) -> Option<i128> {
-    match value {
-        Value::TinyInt(value) => Some(i128::from(*value)),
-        Value::SmallInt(value) => Some(i128::from(*value)),
-        Value::Integer(value) => Some(i128::from(*value)),
-        Value::BigInt(value) => Some(i128::from(*value)),
-        Value::HugeInt(value) => Some(*value),
-        Value::UTinyInt(value) => Some(i128::from(*value)),
-        Value::USmallInt(value) => Some(i128::from(*value)),
-        Value::UInteger(value) => Some(i128::from(*value)),
-        Value::UBigInt(value) => Some(i128::from(*value)),
-        Value::UHugeInt(value) => i128::try_from(*value).ok(),
-        _ => None,
+        integer_type_bounds(&self.logical_type)
     }
 }
 
@@ -244,12 +213,108 @@ fn integer_type_bounds(logical_type: &LogicalType) -> Option<(i128, i128)> {
     }
 }
 
-fn encode_single_byte_varchar(value: &[u8]) -> Option<i128> {
-    match value {
-        [] => Some(0),
-        [byte] => Some(i128::from(*byte) + 1),
-        _ => None,
+const PERFECT_HASH_RANGE_LIMIT: u128 = 1u128 << 32;
+
+/// Build the complete immutable perfect-hash contract used by enumeration,
+/// costing, extraction, and execution. The key domain comes only from schema
+/// invariants. `bytes_per_table_upper` deliberately over-accounts direct
+/// update scratch so the executor can validate its exact allocation against
+/// one contract without rediscovering feasibility.
+pub(crate) fn plan_perfect_hash_aggregate(
+    aggregate: &LogicalAggregate,
+    groups: &[Expression],
+    aggregate_exprs: &[Expression],
+) -> Option<PerfectHashAggregatePlan> {
+    if groups.is_empty()
+        || aggregate.grouping_sets.len() > 1
+        || !aggregate.grouping_functions.is_empty()
+        || aggregate.groups.len() != groups.len()
+    {
+        return None;
     }
+
+    let mut state_row_bytes = 0usize;
+    let mut direct_scratch_per_slot = 0usize;
+    let mut all_direct = true;
+    for expression in aggregate_exprs {
+        let Expression::Aggregate(function) = expression else {
+            return None;
+        };
+        if function.is_distinct() || !function.order_bys.is_empty() {
+            return None;
+        }
+        state_row_bytes = align_to(state_row_bytes, MIN_ALIGNMENT).ok()?;
+        state_row_bytes = state_row_bytes
+            .checked_add(align_to(function.function.state_size, MIN_ALIGNMENT).ok()?)?;
+        match function.function.direct_update {
+            Some(AggregateDirectUpdate::CountStar) => {}
+            Some(AggregateDirectUpdate::Decimal(kind)) => {
+                // Treat every aggregate as a distinct input source. The
+                // executor may share sources, so this is an upper bound.
+                let source_bytes = match kind {
+                    DecimalDirectUpdate::NarrowSumI64 | DecimalDirectUpdate::AverageI64 => {
+                        std::mem::size_of::<i64>() + std::mem::size_of::<i128>()
+                    }
+                    DecimalDirectUpdate::WideSumI128 | DecimalDirectUpdate::AverageI128 => {
+                        // i256 is represented by four 64-bit limbs.
+                        std::mem::size_of::<i128>() + 4 * std::mem::size_of::<u64>()
+                    }
+                };
+                direct_scratch_per_slot = direct_scratch_per_slot.checked_add(source_bytes)?;
+            }
+            None => all_direct = false,
+        }
+    }
+    state_row_bytes = state_row_bytes.max(1);
+
+    let mut group_minima = Vec::with_capacity(aggregate.groups.len());
+    let mut group_cardinalities = Vec::with_capacity(aggregate.groups.len());
+    let mut slots = 1usize;
+    for group in &aggregate.groups {
+        let domain = PerfectHashPlanningDomain::try_new(group.return_type())?;
+        let (minimum, maximum) = domain.invariant_bounds()?;
+        let range = u128::try_from(maximum.checked_sub(minimum)?).ok()?;
+        if range >= PERFECT_HASH_RANGE_LIMIT {
+            return None;
+        }
+        let cardinality = usize::try_from(range.checked_add(2)?).ok()?;
+        slots = slots.checked_mul(cardinality)?;
+        group_minima.push(minimum);
+        group_cardinalities.push(cardinality);
+    }
+
+    let state_bytes = state_row_bytes.checked_mul(slots)?;
+    let state_storage_bytes = state_bytes
+        .div_ceil(std::mem::size_of::<u64>())
+        .checked_mul(std::mem::size_of::<u64>())?;
+    let occupancy_bytes = perfect_hash_occupancy_bytes(slots)?;
+    let scratch_slots = slots.min(VECTOR_SIZE);
+    let scratch_bytes = if direct_scratch_per_slot == 0 {
+        0
+    } else {
+        direct_scratch_per_slot
+            .checked_add(std::mem::size_of::<usize>())?
+            .checked_mul(scratch_slots)?
+            .checked_add(scratch_slots.checked_mul(std::mem::size_of::<usize>())?)?
+    };
+    let materialized_slots = all_direct
+        .then(|| VECTOR_SIZE.checked_mul(std::mem::size_of::<usize>()))
+        .flatten()
+        .unwrap_or(0);
+    let bytes_per_table_upper = state_storage_bytes
+        .checked_add(occupancy_bytes)?
+        .checked_add(scratch_bytes)?
+        .checked_add(materialized_slots)?;
+
+    Some(PerfectHashAggregatePlan {
+        group_minima: group_minima.into_boxed_slice(),
+        group_cardinalities: group_cardinalities.into_boxed_slice(),
+        resource: PerfectHashResourceContract {
+            slots,
+            bytes_per_table_upper,
+            max_local_tables: 1,
+        },
+    })
 }
 
 #[cfg(test)]

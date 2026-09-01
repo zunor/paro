@@ -596,6 +596,7 @@ fn hash_join_output_more_drains_cross_product_before_reusing_input() {
                 transforms: Vec::new(),
                 sink: SinkSpec::CrossProductBuild(CrossProductBuildSinkSpec {
                     handle: cross_handle,
+                    spill_policy: crate::physical::specs::SpillExecutionPolicy::Allowed,
                 }),
                 sink_sharing: SinkSharing::Exclusive,
                 properties: PipelineProperties::default(),

@@ -52,7 +52,6 @@ use crate::graph::match_decompose::GraphMatchDecompose;
 use crate::graph::predicate_pushdown::GraphPredicatePushdown;
 use crate::join::mixed_predicates::JoinPredicateNormalizer;
 use crate::join_order::optimizer::JoinOrderOptimizer;
-use crate::limit::topn::TopNOptimizer;
 use crate::physical::{
     ExtractionContext, PhysicalImplementationFlavor, PhysicalPlanExtractor, WinnerPhysicalContract,
 };
@@ -75,6 +74,7 @@ const CORRELATED_AGGREGATE_REGION_RULE: crate::cascades::RuleId = crate::cascade
 const SCALAR_REUSE_REGION_RULE: crate::cascades::RuleId = crate::cascades::RuleId(10_005);
 const DISTINCT_AGGREGATE_FEASIBILITY_RULE: crate::cascades::RuleId =
     crate::cascades::RuleId(10_020);
+const JOIN_REGION_ENUMERATOR_RULE: crate::cascades::RuleId = crate::cascades::RuleId(10_021);
 
 struct CandidatePlan {
     plan: LogicalPlan,
@@ -289,18 +289,15 @@ impl Optimizer {
             phase_started.elapsed(),
         );
         let phase_started = Instant::now();
-        // Join enumeration canonicalizes every semantic alternative in place.
-        // The enumerator is itself bounded and retains its input when it
-        // cannot produce a legal complete plan. Treating its successful result
-        // as an optional sibling lets the original SQL FROM order win a cost
-        // tie even when that tree contains avoidable Cartesian products.
-        // Semantic alternatives still compete in Memo; accidental input join
-        // order does not.
-        for alternative in &mut alternatives {
+        // A whole-region enumerator may propose a bounded join tree, but it is
+        // never allowed to select the tree before Memo. Keep the canonical SQL
+        // tree and add the enumerated tree as an equivalent sibling so the
+        // grant-aware physical cost model jointly chooses order and algorithm.
+        let mut join_region_alternatives = Vec::new();
+        for alternative in &alternatives {
             if !contains_join_region(&alternative.plan) {
                 continue;
             }
-            let source = alternative.source;
             let mut candidate_context = self
                 .ctx
                 .fork_for_candidate(Arc::unwrap_or_clone(alternative.column_stats.clone()));
@@ -337,8 +334,20 @@ impl Optimizer {
                 );
                 continue;
             }
-            *alternative = join_candidate.into_alternative(source);
+            join_region_alternatives.push(join_candidate.into_alternative(
+                AlternativeOrigin::Specialized {
+                    rule: JOIN_REGION_ENUMERATOR_RULE,
+                },
+            ));
+            if alternatives
+                .len()
+                .saturating_add(join_region_alternatives.len())
+                >= self.budget.max_optional_logical_exprs_per_group as usize + 1
+            {
+                break;
+            }
         }
+        alternatives.extend(join_region_alternatives);
         for alternative in &alternatives {
             verify_physical_planner_invariants(&alternative.plan.operator)?;
         }
@@ -647,6 +656,7 @@ impl Optimizer {
             u64::from(budget.max_optional_physical_exprs_per_group),
             u64::from(budget.max_optional_interesting_goals_per_group),
             u64::from(budget.max_rule_firings_per_group),
+            u64::from(budget.max_rule_work_units_per_group),
             u64::from(budget.max_join_connected_pairs),
             u64::from(budget.max_join_exact_relations),
             u64::from(budget.join_beam_width),
@@ -768,7 +778,6 @@ impl Optimizer {
         plan = FilterPushdown::new().rewrite_plan(plan);
         plan = JoinPredicateNormalizer::new(&self.ctx.bind_context).optimize_plan(plan)?;
         plan = ExternalRoutineLoweringPass::lower(plan, &self.ctx.bind_context)?.plan;
-        plan = TopNOptimizer::new().optimize_plan(plan);
         plan = CTEInlining::new(&self.ctx.bind_context)
             .only_not_materialized()
             .optimize_plan(plan);
@@ -838,8 +847,18 @@ impl Optimizer {
     }
 
     fn correlated_aggregate_candidate(&self, plan: LogicalPlan) -> Result<CandidatePlan> {
+        let input_shape = tracing::enabled!(target: targets::OPTIMIZER, tracing::Level::DEBUG)
+            .then(|| logical_plan_shape(&plan));
         let candidate =
             CorrelatedPartitionAggregate::new(self.ctx.bind_context.clone()).optimize_plan(plan)?;
+        if let Some(input_shape) = input_shape {
+            debug!(
+                target: targets::OPTIMIZER,
+                %input_shape,
+                output_shape = %logical_plan_shape(&candidate),
+                "enumerated correlated aggregate region"
+            );
+        }
         self.settle_query_candidate(candidate)
     }
 
@@ -909,6 +928,43 @@ fn contains_redundant_computation_region(plan: &LogicalPlan) -> bool {
 fn contains_aggregate(plan: &LogicalPlan) -> bool {
     matches!(plan.operator, LogicalOperator::Aggregate(_))
         || plan.children().into_iter().any(contains_aggregate)
+}
+
+fn logical_plan_shape(plan: &LogicalPlan) -> String {
+    use std::fmt::Write;
+
+    fn append(plan: &LogicalPlan, output: &mut String) {
+        match &plan.operator {
+            LogicalOperator::Join(Join::Comparison(join)) => {
+                let _ = write!(
+                    output,
+                    "Join({:?},delim={},flipped={})",
+                    join.join_type,
+                    join.duplicate_eliminated_columns.len(),
+                    join.delim_flipped
+                );
+            }
+            operator => {
+                let _ = write!(output, "{:?}", operator.op_type());
+            }
+        }
+        let children = plan.children();
+        if children.is_empty() {
+            return;
+        }
+        output.push('[');
+        for (index, child) in children.into_iter().enumerate() {
+            if index > 0 {
+                output.push(',');
+            }
+            append(child, output);
+        }
+        output.push(']');
+    }
+
+    let mut output = String::new();
+    append(plan, &mut output);
+    output
 }
 
 /// Build the bounded GraphPatternRegion candidate product before mandatory

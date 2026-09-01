@@ -34,7 +34,7 @@ impl TopNOptimizer {
         }
     }
 
-    fn can_optimize(plan: &LogicalOperator) -> bool {
+    pub(crate) fn can_optimize(plan: &LogicalOperator) -> bool {
         let LogicalOperator::Limit(limit) = plan else {
             return false;
         };

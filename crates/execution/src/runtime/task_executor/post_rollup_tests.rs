@@ -107,7 +107,11 @@ fn decimal_sum_rollup_spec(
         perfect_hash: Some(PerfectHashAggregatePlan {
             group_minima: Box::new([1]),
             group_cardinalities: Box::new([4]),
-            max_local_tables,
+            resource: paro_optimizer::physical::PerfectHashResourceContract {
+                slots: 4,
+                bytes_per_table_upper: usize::MAX,
+                max_local_tables,
+            },
         }),
         output_names: Box::new(["key".to_string(), "sum".to_string()]),
         output_types: Box::new([LogicalType::Integer, output_type]),

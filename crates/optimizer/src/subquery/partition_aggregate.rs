@@ -34,6 +34,10 @@ use crate::subquery::output_contract::{
     child_output_contracts, OutputContract, RewriteOutputShape,
 };
 
+mod full_partition;
+
+use full_partition::{apply_full_partition_join, recognize_full_partition_join};
+
 /// Rewrite eligible correlated scalar aggregates into partition windows or
 /// keyed grouped joins.
 pub struct CorrelatedPartitionAggregate {
@@ -78,6 +82,9 @@ impl CorrelatedPartitionAggregate {
         }
         if let Some(rewrite) = recognize_grouped_join_filter(&plan, output_contract) {
             return apply_grouped_join_rewrite(plan, rewrite, &self.bind_context);
+        }
+        if let Some(rewrite) = recognize_full_partition_join(&plan, output_contract) {
+            return apply_full_partition_join(plan, rewrite, &self.bind_context);
         }
         Ok(plan)
     }

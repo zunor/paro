@@ -86,8 +86,8 @@ fn render_explain_analyze_text(
             lines.push(format!("UTILITY {:?}", utility.spec));
             render_profile_summary_text(snapshot, elapsed_ms, &mut lines);
         }
-        StatementProgram::ExplainAnalyze { .. } => {
-            unreachable!("nested EXPLAIN ANALYZE is rejected before rendering");
+        StatementProgram::Portfolio(_) | StatementProgram::ExplainAnalyze { .. } => {
+            unreachable!("unadmitted or nested EXPLAIN ANALYZE target reached rendering");
         }
     }
     lines
@@ -139,8 +139,8 @@ fn render_explain_analyze_json(
             "role": "utility",
             "operator": format!("{:?}", utility.spec),
         })],
-        StatementProgram::ExplainAnalyze { .. } => {
-            unreachable!("nested EXPLAIN ANALYZE is rejected before rendering");
+        StatementProgram::Portfolio(_) | StatementProgram::ExplainAnalyze { .. } => {
+            unreachable!("unadmitted or nested EXPLAIN ANALYZE target reached rendering");
         }
     };
     let mut output = serde_json::json!({

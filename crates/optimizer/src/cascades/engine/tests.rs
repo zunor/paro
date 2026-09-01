@@ -743,10 +743,12 @@ fn blocking_enforcers_participate_in_grant_feasibility() {
 #[test]
 fn retained_operator_state_overlaps_child_pipeline_memory() {
     let local = SearchCost {
+        non_revocable_memory_upper: 100,
         peak_memory_upper: 100,
         ..cost(1.0)
     };
     let child = SearchCost {
+        non_revocable_memory_upper: 40,
         peak_memory_upper: 40,
         ..cost(1.0)
     };
@@ -765,7 +767,29 @@ fn retained_operator_state_overlaps_child_pipeline_memory() {
 }
 
 #[test]
-fn mandatory_unknown_state_is_capped_after_child_winners_are_known() {
+fn revocable_retained_state_shares_one_query_pool() {
+    let local = SearchCost {
+        peak_memory_upper: 100,
+        ..cost(1.0)
+    };
+    let child = SearchCost {
+        peak_memory_upper: 40,
+        ..cost(1.0)
+    };
+    let retained = compose_candidate_cost(
+        local,
+        &[child],
+        CostComposition::RetainedState {
+            overlapping_children: 1,
+        },
+    )
+    .expect("revocable retained-state composition");
+    assert_eq!(retained.non_revocable_memory_upper, 0);
+    assert_eq!(retained.peak_memory_upper, 100);
+}
+
+#[test]
+fn mandatory_unknown_nonspill_state_is_not_a_hard_memory_proof() {
     let local = SearchCost {
         peak_memory_upper: u64::MAX,
         ..cost(1.0)
@@ -791,26 +815,14 @@ fn mandatory_unknown_state_is_capped_after_child_winners_are_known() {
         true,
         grant,
     )
-    .unwrap()
-    .expect("the allocator-capped mandatory implementation remains feasible");
-    let composed = compose_candidate_cost(
-        fitted,
-        &[child],
-        CostComposition::RetainedState {
-            overlapping_children: 1,
-        },
-    )
     .unwrap();
-
-    assert_eq!(fitted.peak_memory_upper, 60);
-    assert_eq!(fitted.spill_bytes_expected, 0);
-    assert_eq!(fitted.score, local.score);
-    assert_eq!(composed.peak_memory_upper, 100);
+    assert!(fitted.is_none());
 }
 
 #[test]
-fn mandatory_parent_does_not_count_a_child_allocator_cap_twice() {
+fn mandatory_nonspill_parent_can_coexist_with_a_revocable_child() {
     let local = SearchCost {
+        non_revocable_memory_upper: 120,
         peak_memory_upper: 120,
         ..cost(1.0)
     };
@@ -835,19 +847,41 @@ fn mandatory_parent_does_not_count_a_child_allocator_cap_twice() {
         true,
         grant,
     )
-    .unwrap()
-    .expect("mandatory parent shares the child allocator cap");
-    let composed = compose_candidate_cost(
-        fitted,
+    .unwrap();
+    assert!(fitted.is_some());
+}
+
+#[test]
+fn overlapping_non_revocable_state_must_fit_the_grant() {
+    let local = SearchCost {
+        non_revocable_memory_upper: 120,
+        peak_memory_upper: 120,
+        ..cost(1.0)
+    };
+    let child = SearchCost {
+        non_revocable_memory_upper: 1_024,
+        peak_memory_upper: 1_024,
+        ..cost(1.0)
+    };
+    let grant = EnforcerCostInput {
+        rows: CompactRange::point(1.0).unwrap(),
+        row_width_bytes: 8,
+        hard_memory_bytes: 1_024,
+        spill_policy: SpillPolicy::Allowed,
+    };
+
+    let fitted = fit_local_retained_state_to_grant(
+        local,
         &[child],
         CostComposition::RetainedState {
             overlapping_children: 1,
         },
+        false,
+        true,
+        grant,
     )
     .unwrap();
-
-    assert_eq!(fitted.peak_memory_upper, 0);
-    assert_eq!(composed.peak_memory_upper, 1_024);
+    assert!(fitted.is_none());
 }
 
 struct GrantTreeImplementation;

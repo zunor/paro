@@ -42,6 +42,9 @@ use super::handles::{BreakerHandleCatalog, BreakerHandleKind};
 
 #[derive(Debug, Clone)]
 pub enum StatementProgram {
+    /// Immutable physical alternatives retained until a query has entered
+    /// workload admission and owns its actual memory capacity.
+    Portfolio(paro_optimizer::physical::PhysicalPlanPortfolio),
     Pipeline {
         plan: Arc<PhysicalPlan>,
         graph: Arc<PipelineGraph>,
@@ -227,6 +230,38 @@ impl StatementProgram {
             .grant_contract =
             paro_optimizer::physical::PhysicalGrantContract::Class(admitted.reservation.class);
         Self::from_physical_plan(admitted.plan)
+    }
+
+    pub fn deferred_physical_portfolio(
+        portfolio: paro_optimizer::physical::PhysicalPlanPortfolio,
+    ) -> Result<Self> {
+        portfolio.verify()?;
+        Ok(Self::Portfolio(portfolio))
+    }
+
+    /// Resolve an immutable compiled image against execution-time resources.
+    /// Selection is deterministic and algorithms remain exactly those proved
+    /// by the optimizer; only lowering of the admitted variant happens here.
+    pub fn admit_for_execution(
+        &self,
+        available_memory_bytes: u64,
+        available_external_worker_slots: u16,
+    ) -> Result<Self> {
+        match self {
+            Self::Portfolio(portfolio) => Self::from_physical_portfolio(
+                portfolio.clone(),
+                available_memory_bytes,
+                available_external_worker_slots,
+            ),
+            Self::ExplainAnalyze { target, spec } => Ok(Self::ExplainAnalyze {
+                target: Box::new(target.admit_for_execution(
+                    available_memory_bytes,
+                    available_external_worker_slots,
+                )?),
+                spec: *spec,
+            }),
+            Self::Pipeline { .. } | Self::Utility(_) => Ok(self.clone()),
+        }
     }
 }
 
@@ -594,9 +629,11 @@ impl OperatorRuntimeRegistry {
             }
             SinkSpec::Materialize(spec) => SinkExec::Materialize(MaterializeSinkExec {
                 handle: HandleRef::new(spec.handle),
+                spill_policy: crate::physical::specs::SpillExecutionPolicy::Forbidden,
             }),
             SinkSpec::CrossProductBuild(spec) => SinkExec::Materialize(MaterializeSinkExec {
                 handle: HandleRef::new(spec.handle),
+                spill_policy: spec.spill_policy,
             }),
             SinkSpec::HashJoinBuild(spec) => SinkExec::HashJoinBuild(HashJoinBuildSinkExec {
                 handle: HandleRef::new(spec.handle),

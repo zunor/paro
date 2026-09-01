@@ -64,8 +64,20 @@ impl Executor {
         )) as Arc<dyn paro_common::allocator::Allocator>;
 
         let query_memory_pool = self.create_query_memory_pool();
+        let available_memory =
+            u64::try_from(query_memory_pool.capacity_bytes()).unwrap_or(u64::MAX);
+        let external_worker_slots = if self.session.python_runtime_status().is_some_and(|status| {
+            status.availability == paro_external::runtime::host::PythonRuntimeAvailability::Ready
+        }) {
+            1
+        } else {
+            0
+        };
+        let program = compiled
+            .program()
+            .admit_for_execution(available_memory, external_worker_slots)?;
         let handler = self.execute_program(
-            compiled.program(),
+            &program,
             result_names,
             result_types,
             parameter_bindings,

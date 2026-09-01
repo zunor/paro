@@ -773,7 +773,11 @@ fn perfect_hash_aggregate_breaker_groups_and_emits_counts() {
     let spec = grouped_count_spec(Some(PerfectHashAggregatePlan {
         group_minima: vec![1].into_boxed_slice(),
         group_cardinalities: vec![4].into_boxed_slice(),
-        max_local_tables: 1,
+        resource: paro_optimizer::physical::PerfectHashResourceContract {
+            slots: 4,
+            bytes_per_table_upper: usize::MAX,
+            max_local_tables: 1,
+        },
     }));
     let graph = aggregate_breaker_graph(
         SinkSpec::PerfectHashAggregate(PerfectHashAggregateSinkSpec {
@@ -872,7 +876,11 @@ fn perfect_hash_having_rejection_still_validates_every_aggregate_state() {
         perfect_hash: Some(PerfectHashAggregatePlan {
             group_minima: Box::new([1]),
             group_cardinalities: Box::new([2]),
-            max_local_tables: 1,
+            resource: paro_optimizer::physical::PerfectHashResourceContract {
+                slots: 2,
+                bytes_per_table_upper: usize::MAX,
+                max_local_tables: 1,
+            },
         }),
         output_names: Box::new([
             "k".to_string(),
@@ -969,7 +977,11 @@ fn perfect_hash_post_reduction_retains_every_global_maximum_tie() {
         Some(PerfectHashAggregatePlan {
             group_minima: Box::new([1]),
             group_cardinalities: Box::new([4]),
-            max_local_tables: 1,
+            resource: paro_optimizer::physical::PerfectHashResourceContract {
+                slots: 4,
+                bytes_per_table_upper: usize::MAX,
+                max_local_tables: 1,
+            },
         }),
         Box::new([]),
     );

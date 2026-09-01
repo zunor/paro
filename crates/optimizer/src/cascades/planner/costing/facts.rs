@@ -16,27 +16,21 @@ pub(in crate::cascades::planner) fn planner_cost_facts(
         .collect::<Vec<_>>()
         .into_boxed_slice();
     let output_row_width = planner_row_width(plan, scan_access_cost);
-    let perfect_hash_slots = match &plan.operator {
+    let perfect_hash = match &plan.operator {
         LogicalOperator::Aggregate(aggregate) => {
-            crate::physical::extraction::helpers::can_use_perfect_hash_aggregate(
+            crate::physical::aggregate_planning::plan_perfect_hash_aggregate(
                 aggregate,
                 &aggregate.groups,
                 &aggregate.aggregates,
             )
-            .and_then(|info| {
-                info.group_cardinalities
-                    .into_iter()
-                    .try_fold(1u64, |slots, cardinality| {
-                        slots.checked_mul(u64::try_from(cardinality).ok()?)
-                    })
-            })
+            .map(|plan| plan.resource)
         }
         _ => None,
     };
     Ok(PlannerCostFacts {
         child_row_widths,
         output_row_width,
-        perfect_hash_slots,
+        perfect_hash,
     })
 }
 
@@ -86,7 +80,7 @@ pub(in crate::cascades::planner) fn expression_cost_facts(
         child_rows_hard_upper,
         child_row_widths: template.child_row_widths.clone(),
         output_row_width: template.output_row_width,
-        perfect_hash_slots: template.perfect_hash_slots,
+        perfect_hash: template.perfect_hash,
     })
 }
 

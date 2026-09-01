@@ -174,6 +174,7 @@ pub struct CrossProductSpec {
     pub right_output_types: Box<[LogicalType]>,
     pub output_names: Box<[String]>,
     pub output_types: Box<[LogicalType]>,
+    pub spill_policy: SpillExecutionPolicy,
 }
 
 #[derive(Debug, Clone)]

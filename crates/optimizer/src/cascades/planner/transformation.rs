@@ -37,13 +37,14 @@ enum PlannerTransformation {
     AggregateNonNullInput,
     AggregateDimensionDeferral,
     AggregateInputMaterialization,
+    TopNIntroduction,
     LimitPushdown,
     LatePayloadFetch,
     ScalarAggregateWindow,
 }
 
 impl PlannerTransformation {
-    const ALL: [Self; 14] = [
+    const ALL: [Self; 15] = [
         Self::ExpensivePredicatePlacement,
         Self::CteInline,
         Self::CteFilterPushdown,
@@ -55,6 +56,7 @@ impl PlannerTransformation {
         Self::AggregateNonNullInput,
         Self::AggregateDimensionDeferral,
         Self::AggregateInputMaterialization,
+        Self::TopNIntroduction,
         Self::LimitPushdown,
         Self::LatePayloadFetch,
         Self::ScalarAggregateWindow,
@@ -73,6 +75,7 @@ impl PlannerTransformation {
             Self::AggregateNonNullInput => AGGREGATE_NON_NULL_INPUT_RULE,
             Self::AggregateDimensionDeferral => AGGREGATE_DIMENSION_DEFERRAL_RULE,
             Self::AggregateInputMaterialization => AGGREGATE_INPUT_MATERIALIZATION_RULE,
+            Self::TopNIntroduction => TOP_N_INTRODUCTION_RULE,
             Self::LimitPushdown => LIMIT_PUSHDOWN_RULE,
             Self::LatePayloadFetch => LATE_PAYLOAD_FETCH_RULE,
             Self::ScalarAggregateWindow => SCALAR_AGGREGATE_WINDOW_RULE,
@@ -475,6 +478,12 @@ fn rewrite_planner_expression(
                 return Ok(None);
             }
             plan
+        }
+        PlannerTransformation::TopNIntroduction => {
+            if !TopNOptimizer::can_optimize(&plan.operator) {
+                return Ok(None);
+            }
+            TopNOptimizer::new().optimize_plan(plan)
         }
         PlannerTransformation::LimitPushdown => {
             let (plan, changed) = LimitPushdown::new().optimize_plan_with_change(plan);

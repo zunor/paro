@@ -3,8 +3,7 @@
 
 use super::*;
 use crate::physical::aggregate_planning::{
-    compile_direct_update_program, group_storage_width, perfect_hash_occupancy_bytes,
-    AggregateStateLayout,
+    compile_direct_update_program, group_storage_width, AggregateStateLayout,
 };
 use crate::physical::specs::{GroupKeyEncoding, SpillExecutionPolicy};
 use paro_function::aggregate::distributive::first_last::get_first_function;
@@ -500,11 +499,6 @@ impl PhysicalPlanExtractor {
             (dependent_layout.is_none())
                 .then(|| can_use_perfect_hash_aggregate(aggregate, &groups, &aggregates))
                 .flatten()
-                .map(|info| PerfectHashAggregatePlan {
-                    group_minima: info.group_minima.into_boxed_slice(),
-                    group_cardinalities: info.group_cardinalities.into_boxed_slice(),
-                    max_local_tables: 1,
-                })
         };
         let perfect_hash = match implementation {
             crate::physical::PhysicalImplementationFlavor::PerfectHashAggregate => {
@@ -520,10 +514,7 @@ impl PhysicalPlanExtractor {
                     "singleton aggregate projection reached hash aggregate lowering",
                 ));
             }
-            // Standalone physical-extractor tests and structural fused
-            // lowering do not carry a Memo winner. Production Aggregate nodes
-            // always receive one of the two explicit variants above.
-            crate::physical::PhysicalImplementationFlavor::Structural => admitted_perfect_hash(),
+            crate::physical::PhysicalImplementationFlavor::Structural => None,
             _ => {
                 return Err(paro_error::internal(
                     "Memo selected a non-aggregate implementation for Aggregate",
@@ -596,23 +587,6 @@ impl PhysicalPlanExtractor {
                 .ctx
                 .spill_execution_policy(hash_aggregate_spill_supported(&spec));
         }
-        if spec.perfect_hash.is_some() {
-            match perfect_hash_max_local_tables(&spec, self.ctx.max_memory, self.ctx.max_threads) {
-                Some(max_local_tables) => {
-                    if let Some(plan) = spec.perfect_hash.as_mut() {
-                        plan.max_local_tables = max_local_tables;
-                    }
-                }
-                None if implementation
-                    == crate::physical::PhysicalImplementationFlavor::PerfectHashAggregate =>
-                {
-                    return Err(paro_error::internal(
-                        "Memo selected a perfect-hash aggregate that exceeds its resource grant",
-                    ));
-                }
-                None => spec.perfect_hash = None,
-            }
-        }
         finalize_post_aggregate_strategy(&mut spec);
         spec.verify_post_reduction()?;
         Ok((PhysicalNodeKind::Aggregate(Box::new(spec)), vec![child]))
@@ -681,8 +655,6 @@ impl PhysicalPlanExtractor {
 
 fn hash_aggregate_spill_supported(spec: &AggregateSpec) -> bool {
     spec.grouping_key_count > 0
-        && spec.grouping_sets.is_empty()
-        && spec.grouping_functions.is_empty()
         && spec.aggregates.iter().all(|expression| {
             matches!(
                 expression,
@@ -961,38 +933,6 @@ fn rebase_post_reduction_predicate(
     }
 }
 
-const CONSERVATIVE_PERFECT_HASH_MAX_SLOTS: usize = 1 << 20;
-const PERFECT_HASH_MEMORY_BUDGET_DIVISOR: usize = 4;
-
-fn perfect_hash_max_local_tables(
-    spec: &AggregateSpec,
-    max_memory: usize,
-    parallelism: usize,
-) -> Option<usize> {
-    let plan = spec.perfect_hash.as_ref()?;
-    let slots = plan
-        .group_cardinalities
-        .iter()
-        .try_fold(1usize, |total, cardinality| total.checked_mul(*cardinality))?;
-    if max_memory == 0 {
-        return (slots <= CONSERVATIVE_PERFECT_HASH_MAX_SLOTS).then_some(parallelism.max(1));
-    }
-    let layout = AggregateStateLayout::from_spec(spec).ok()?;
-    let state_bytes = layout.total_size().max(1).checked_mul(slots)?;
-    let state_storage_bytes = state_bytes
-        .div_ceil(std::mem::size_of::<u64>())
-        .checked_mul(std::mem::size_of::<u64>())?;
-    let storage_bytes = state_storage_bytes.checked_add(perfect_hash_occupancy_bytes(slots)?)?;
-    let direct_program = compile_direct_update_program(spec, &layout).ok()?;
-    let aggregate_scratch_bytes = direct_program.scratch_bytes(slots)?;
-    let scratch_bytes =
-        aggregate_scratch_bytes.checked_add(direct_program.materialized_slot_bytes()?)?;
-    let bytes_per_table = storage_bytes.checked_add(scratch_bytes)?;
-    let table_budget = max_memory / PERFECT_HASH_MEMORY_BUDGET_DIVISOR;
-    let admitted_tables = table_budget / bytes_per_table;
-    (admitted_tables > 0).then_some(admitted_tables.min(parallelism.max(1)))
-}
-
 /// Resolve a proof-level input-rollup candidate into a concrete execution
 /// strategy only after the complete aggregate representation and memory
 /// admission are known. Unsupported shapes retain the preserving finalized-
@@ -1021,7 +961,7 @@ fn can_execute_post_input_rollup(spec: &AggregateSpec) -> bool {
     let Some(perfect) = &spec.perfect_hash else {
         return false;
     };
-    if perfect.max_local_tables <= 1
+    if perfect.resource.max_local_tables <= 1
         || !spec.having_filter.is_empty()
         || !spec.has_plain_grouping_domain()
         || spec.aggregates.len() != 1

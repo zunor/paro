@@ -62,7 +62,7 @@ impl PipelinePropertyAccumulator {
                     self.capabilities.parallelism = self
                         .capabilities
                         .parallelism
-                        .merge(Parallelism::bounded(plan.max_local_tables));
+                        .merge(Parallelism::bounded(plan.resource.max_local_tables));
                 }
             }
             SinkSpec::TopNBuild(_) => {

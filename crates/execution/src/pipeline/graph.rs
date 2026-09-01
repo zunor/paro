@@ -1074,6 +1074,7 @@ pub struct MaterializeSinkSpec {
 #[derive(Debug, Clone)]
 pub struct CrossProductBuildSinkSpec {
     pub handle: BreakerHandleId,
+    pub spill_policy: SpillExecutionPolicy,
 }
 
 #[derive(Debug, Clone)]

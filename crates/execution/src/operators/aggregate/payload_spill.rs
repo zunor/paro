@@ -125,7 +125,15 @@ impl AggregatePayloadSpillBuffer {
     }
 
     pub(crate) fn seal(self) -> AggregateSpilledPayload {
+        self.seal_for_grouping(0)
+    }
+
+    /// Seal one payload stream whose radix hash belongs to a specific
+    /// grouping domain. Ordinary aggregates use domain zero; grouping-set
+    /// fallback writes one independently hashed stream per domain.
+    pub(crate) fn seal_for_grouping(self, grouping_idx: usize) -> AggregateSpilledPayload {
         AggregateSpilledPayload {
+            grouping_idx,
             format: self.format,
             rows: self.builder.seal(),
         }
@@ -206,6 +214,7 @@ impl AggregateStateSpillBuffer {
 
 #[derive(Debug)]
 pub(crate) struct AggregateSpilledPayload {
+    grouping_idx: usize,
     format: AggregatePayloadFormat,
     rows: RadixPartitionedRows,
 }
@@ -218,6 +227,11 @@ pub(crate) struct AggregateSpilledState {
 }
 
 impl AggregateSpilledPayload {
+    #[inline]
+    pub(crate) fn grouping_idx(&self) -> usize {
+        self.grouping_idx
+    }
+
     #[inline]
     pub(crate) fn partition_count(&self) -> usize {
         self.rows.partition_count()
@@ -240,6 +254,7 @@ impl AggregateSpilledPayload {
     /// atomic: a failed repartition leaves no second live directory published.
     pub(crate) fn into_repartitioned(self, radix_bits: usize) -> Result<Self> {
         Ok(Self {
+            grouping_idx: self.grouping_idx,
             format: self.format,
             rows: self.rows.into_repartitioned(radix_bits)?,
         })

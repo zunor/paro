@@ -8,14 +8,12 @@ use super::*;
 pub(super) fn register_implementations(
     registry: &mut ImplementationRegistry,
     planner_state: Arc<RwLock<PlannerTransformState>>,
-    child_required: PropertySetId,
     grant_classes: Arc<BTreeMap<crate::cascades::ids::ResourceGrantClassId, ResourceGrantClass>>,
     calibration: Arc<MachineCalibrationBundle>,
     force_spill: bool,
 ) -> Result<()> {
     registry.register_implementation(PlannerBaselineImplementation {
         planner_state: planner_state.clone(),
-        child_required,
         grant_classes: grant_classes.clone(),
         calibration: calibration.clone(),
         force_spill,
@@ -50,7 +48,6 @@ pub(super) fn register_implementations(
             id,
             flavor,
             planner_state: planner_state.clone(),
-            child_required,
             grant_classes: grant_classes.clone(),
             calibration: calibration.clone(),
             force_spill,
@@ -63,7 +60,6 @@ pub(super) fn register_implementations(
 #[derive(Debug)]
 struct PlannerBaselineImplementation {
     planner_state: Arc<RwLock<PlannerTransformState>>,
-    child_required: PropertySetId,
     grant_classes: Arc<BTreeMap<crate::cascades::ids::ResourceGrantClassId, ResourceGrantClass>>,
     calibration: Arc<MachineCalibrationBundle>,
     force_spill: bool,
@@ -125,12 +121,17 @@ impl PhysicalImplementation for PlannerBaselineImplementation {
         let child_goals = children
             .iter()
             .copied()
-            .map(|child| {
+            .zip(metadata.child_required.iter().copied())
+            .zip(metadata.child_row_goals.iter().copied())
+            .map(|((child, required), row_goal)| {
                 (
                     child,
                     OptimizationGoal {
-                        required: self.child_required,
-                        row_goal: RowGoal::All,
+                        required,
+                        row_goal: match row_goal {
+                            PlannerChildRowGoal::All => RowGoal::All,
+                            PlannerChildRowGoal::Parent => goal.row_goal,
+                        },
                         ..goal
                     },
                 )
@@ -208,7 +209,6 @@ struct AlternativeImplementation {
     id: ImplementationId,
     flavor: PhysicalImplementationFlavor,
     planner_state: Arc<RwLock<PlannerTransformState>>,
-    child_required: PropertySetId,
     grant_classes: Arc<BTreeMap<crate::cascades::ids::ResourceGrantClassId, ResourceGrantClass>>,
     calibration: Arc<MachineCalibrationBundle>,
     force_spill: bool,
@@ -279,12 +279,17 @@ impl PhysicalImplementation for AlternativeImplementation {
         let child_goals = children
             .iter()
             .copied()
-            .map(|child| {
+            .zip(metadata.child_required.iter().copied())
+            .zip(metadata.child_row_goals.iter().copied())
+            .map(|((child, required), row_goal)| {
                 (
                     child,
                     OptimizationGoal {
-                        required: self.child_required,
-                        row_goal: RowGoal::All,
+                        required,
+                        row_goal: match row_goal {
+                            PlannerChildRowGoal::All => RowGoal::All,
+                            PlannerChildRowGoal::Parent => goal.row_goal,
+                        },
                         ..goal
                     },
                 )

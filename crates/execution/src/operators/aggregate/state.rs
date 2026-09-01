@@ -128,7 +128,10 @@ pub struct HashAggregateBuildSinkLocal {
     pub(crate) query_memory: Option<Arc<QueryMemoryPool>>,
     pub(crate) raw_payload_spill_enabled: bool,
     pub(crate) raw_payload_spill_requested: Arc<AtomicBool>,
-    pub(crate) payload_spill: Option<AggregatePayloadSpillBuffer>,
+    /// One independently partitioned raw-input stream per grouping domain.
+    /// A plain aggregate owns one entry; grouping sets cannot share a stream
+    /// because each domain hashes a different subset of the group columns.
+    pub(crate) payload_spills: Vec<Option<AggregatePayloadSpillBuffer>>,
     pub(crate) state_spill: Arc<Mutex<Option<AggregateStateSpillBuffer>>>,
     pub(crate) ordered_collectors: Vec<OrderedAggregateCollector>,
     pub(crate) modifier_memory: MemoryAccountingContext,

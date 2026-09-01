@@ -14,7 +14,7 @@ use paro_planner::binder::context::BindContext;
 use paro_planner::binder::deep_copy::duplicate_plan_preserving_indices;
 use paro_planner::binder::ir::{CTEMaterialize, OrderByNode};
 use paro_planner::binder::Binder;
-use paro_planner::expression::{Expression, ReferenceExpression};
+use paro_planner::expression::Expression;
 use paro_planner::operator::join::{AntiJoinMode, Join, JoinComparisonType, JoinType};
 use paro_planner::operator::{ColumnBinding, LogicalOperator, LogicalOperatorType};
 use paro_planner::plan::{LogicalPlan, NodeStats};
@@ -35,6 +35,7 @@ use crate::filter::reorder::ReorderFilter;
 use crate::join::elimination::JoinElimination;
 use crate::join::mixed_predicates::JoinPredicateNormalizer;
 use crate::limit::pushdown::LimitPushdown;
+use crate::limit::topn::TopNOptimizer;
 use crate::statistics::gathering::StatisticsGathering;
 use crate::statistics::propagator::StatisticsPropagator;
 use crate::subquery::scalar_aggregate_window;
@@ -78,7 +79,7 @@ use super::rules::{
     AGGREGATE_JOIN_SUBSUMPTION_RULE, AGGREGATE_NON_NULL_INPUT_RULE, AGGREGATE_POST_REDUCTION_RULE,
     CTE_FILTER_PUSHDOWN_RULE, CTE_INLINE_RULE, EXPENSIVE_PREDICATE_PLACEMENT_RULE,
     JOIN_ELIMINATION_RULE, LATE_PAYLOAD_FETCH_RULE, LIMIT_PUSHDOWN_RULE, MARK_JOIN_TO_SEMI_RULE,
-    SCALAR_AGGREGATE_WINDOW_RULE,
+    SCALAR_AGGREGATE_WINDOW_RULE, TOP_N_INTRODUCTION_RULE,
 };
 use super::scalar::ScalarArena;
 use super::scalar_lowering::{
@@ -145,7 +146,6 @@ pub struct OptimizationInput {
     pub mode: SearchMode,
     pub presentation: ResultPresentation,
     planner_state: Arc<RwLock<PlannerTransformState>>,
-    baseline_child_required: PropertySetId,
     bind_context: BindContext,
     calibration: Arc<MachineCalibrationBundle>,
     force_spill: bool,
@@ -211,7 +211,6 @@ impl OptimizationInput {
         implementation::register_implementations(
             &mut registry,
             self.planner_state.clone(),
-            self.baseline_child_required,
             grant_classes.clone(),
             self.calibration.clone(),
             self.force_spill,
@@ -244,7 +243,7 @@ impl OptimizationInput {
                     ));
                 }
             }
-            let (plan, contracts, enforcers) = {
+            let (plan, contracts, enforcers, output_columns) = {
                 let planner_state = self.planner_state.read().unwrap();
                 extract_planner_tree(
                     engine.memo(),
@@ -255,14 +254,25 @@ impl OptimizationInput {
                     mode,
                 )?
             };
+            let (plan, contracts, physical_fingerprint, cost) = enforce_result_presentation(
+                plan,
+                contracts,
+                &enforcers,
+                output_columns.as_ref(),
+                &self.presentation,
+                &self.bind_context,
+                self.calibration.as_ref(),
+                winner.physical_fingerprint,
+                winner.cost,
+            )?;
             variants.push(OptimizedVariant {
                 class: grant_winner.class,
                 plan,
                 contracts: Arc::new(contracts),
                 enforcers: Arc::new(enforcers),
                 write_contracts: Arc::new(std::collections::HashMap::new()),
-                physical_fingerprint: winner.physical_fingerprint,
-                cost: winner.cost,
+                physical_fingerprint,
+                cost,
             });
         }
         let rule_insertions = engine.effective_rule_insertions().clone();
@@ -429,7 +439,7 @@ impl MemoBuilder {
                 context.fork_for_candidate(Arc::unwrap_or_clone(alternative.column_stats))
             });
             let (root_plan, root_state) = alternative.plan.try_fold_post_order(
-                |mut plan, child_states: Vec<BuildState>| -> Result<(LogicalPlan, BuildState)> {
+                |plan, child_states: Vec<BuildState>| -> Result<(LogicalPlan, BuildState)> {
                     has_contextual_shape |= is_contextual_operator(&plan.operator);
                     let output_bindings = plan.get_column_bindings();
                     let output_types = plan.types();
@@ -492,11 +502,38 @@ impl MemoBuilder {
                     // replaces operator expressions with positional arena
                     // references. The Memo key owns the interned scalars;
                     // rule payloads never do.
+                    // Clone only the current operator shell. Duplicating `plan`
+                    // here used to recopy the complete subtree at every
+                    // post-order node, turning Memo construction into O(N²).
+                    let mut detached_children = Vec::with_capacity(child_states.len());
+                    let shell = plan.try_map_children(|child| {
+                        detached_children.push(child);
+                        Ok::<_, paro_common::error::ParoError>(LogicalPlan::synthetic(
+                            LogicalOperator::DummyScan,
+                        ))
+                    })?;
                     let semantic_template = semantic_plan::detach_template(
-                        duplicate_plan_preserving_indices(&plan, bind_shared.as_ref()),
-                    )
-                    .map_children(|_| LogicalPlan::synthetic(LogicalOperator::DummyScan));
-                    let search_candidate = if let Some(search_context) = &candidate_context {
+                        duplicate_plan_preserving_indices(&shell, bind_shared.as_ref()),
+                    );
+                    let mut detached_children = detached_children.into_iter();
+                    let mut plan = shell.try_map_children(|_| {
+                        detached_children
+                            .next()
+                            .ok_or_else(|| paro_error::internal("Memo shell lost a detached child"))
+                    })?;
+                    if detached_children.next().is_some() {
+                        return Err(paro_error::internal(
+                            "Memo shell retained excess detached children",
+                        ));
+                    }
+                    let search_candidate = if candidate_context.is_some()
+                        && matches!(
+                            plan.operator,
+                            LogicalOperator::TopN(_) | LogicalOperator::Filter(_)
+                        ) {
+                        let search_context = candidate_context
+                            .as_ref()
+                            .expect("candidate context was checked");
                         crate::search::optimizer::SearchOptimizer::new()
                             .physical_candidate_for_root(
                                 duplicate_plan_preserving_indices(&plan, bind_shared.as_ref()),
@@ -655,16 +692,19 @@ impl MemoBuilder {
                         pending_region_facets.insert(payload, pending);
                     }
                     if matches!(plan.operator, LogicalOperator::Join(Join::Comparison(_))) {
-                        let (probe_operator, conditions) = match &plan.operator {
-                            LogicalOperator::Join(Join::Comparison(join)) => {
-                                (join.left.operator.op_type(), Some(&join.conditions))
-                            }
+                        let (join_type, probe_operator, conditions) = match &plan.operator {
+                            LogicalOperator::Join(Join::Comparison(join)) => (
+                                join.join_type,
+                                join.left.operator.op_type(),
+                                Some(&join.conditions),
+                            ),
                             _ => unreachable!(),
                         };
                         debug!(
                             target: targets::OPTIMIZER,
                             logical_expression = logical.index(),
                             baseline = ?implementations.baseline,
+                            ?join_type,
                             runtime_filter_candidate = implementations.hash_join_runtime_filter,
                             probe_operator = ?probe_operator,
                             conditions = ?conditions,
@@ -703,6 +743,11 @@ impl MemoBuilder {
                         spillable: planner_operator_spillable(&plan.operator),
                         cost_facts: planner_cost_facts(&plan, scan_access_cost)?,
                         output_columns: output_columns.clone().into_boxed_slice(),
+                        child_required: intern_child_requirements(
+                            &mut memo,
+                            child_states.iter().map(|state| state.columns.as_ref()),
+                        )?,
+                        child_row_goals: child_row_goals(&plan.operator, child_states.len()),
                         search,
                         required_region_facet: None,
                         runtime_filter_region_facet: None,
@@ -783,7 +828,6 @@ impl MemoBuilder {
         }
         memo.set_regions(regions);
 
-        let default_required = memo.intern_required(RequiredProperties::default())?;
         let root_provided = memo
             .group(root_state.group)
             .and_then(|group| group.logical_exprs().first())
@@ -852,7 +896,6 @@ impl MemoBuilder {
             },
             presentation,
             planner_state,
-            baseline_child_required: default_required,
             bind_context,
             calibration: Arc::new(MachineCalibrationBundle::default()),
             force_spill: false,
@@ -860,11 +903,35 @@ impl MemoBuilder {
     }
 }
 
-type WinnerContractMap =
-    std::collections::HashMap<paro_planner::plan::PlanNodeId, WinnerPhysicalContract>;
-type WinnerEnforcerMap =
-    std::collections::HashMap<paro_planner::plan::PlanNodeId, Box<[ExtractedEnforcerContract]>>;
-type ExtractedWinnerTree = (LogicalPlan, WinnerContractMap, WinnerEnforcerMap);
+fn intern_child_requirements<'a>(
+    memo: &mut Memo,
+    children: impl IntoIterator<Item = &'a [ColumnId]>,
+) -> Result<Box<[PropertySetId]>> {
+    children
+        .into_iter()
+        .map(|columns| {
+            memo.intern_required(RequiredProperties {
+                materialization: super::properties::MaterializationRequirement {
+                    values: columns.iter().copied().collect(),
+                    locators: BTreeMap::new(),
+                },
+                representation: RepresentationRequirement::Flat,
+                ..RequiredProperties::default()
+            })
+        })
+        .collect::<Result<Vec<_>>>()
+        .map(Vec::into_boxed_slice)
+}
+
+fn child_row_goals(operator: &LogicalOperator, child_count: usize) -> Box<[PlannerChildRowGoal]> {
+    let policy = match operator {
+        LogicalOperator::Projection(_)
+        | LogicalOperator::RowFetch(_)
+        | LogicalOperator::ExternalProject(_) => PlannerChildRowGoal::Parent,
+        _ => PlannerChildRowGoal::All,
+    };
+    vec![policy; child_count].into_boxed_slice()
+}
 
 #[cfg(test)]
 mod tests;

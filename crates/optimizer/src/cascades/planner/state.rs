@@ -215,11 +215,19 @@ pub(super) struct PlannerOperatorMetadata {
     pub(super) spillable: bool,
     pub(super) cost_facts: PlannerCostFacts,
     pub(super) output_columns: Box<[ColumnId]>,
+    pub(super) child_required: Box<[PropertySetId]>,
+    pub(super) child_row_goals: Box<[PlannerChildRowGoal]>,
     pub(super) search: Option<PlannerSearchImplementationMetadata>,
     pub(super) required_region_facet: Option<Fingerprint>,
     pub(super) runtime_filter_region_facet: Option<Fingerprint>,
     pub(super) structural_retained_children: u64,
     pub(super) baseline_payload: PhysicalPayloadId,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum PlannerChildRowGoal {
+    All,
+    Parent,
 }
 
 #[derive(Debug, Clone)]
@@ -235,7 +243,7 @@ pub(super) struct PlannerSearchImplementationMetadata {
 pub(super) struct PlannerCostFacts {
     pub(super) child_row_widths: Box<[u64]>,
     pub(super) output_row_width: u64,
-    pub(super) perfect_hash_slots: Option<u64>,
+    pub(super) perfect_hash: Option<crate::physical::PerfectHashResourceContract>,
 }
 
 #[derive(Debug, Clone)]
@@ -246,7 +254,7 @@ pub(super) struct ResolvedPlannerCostFacts {
     pub(super) child_rows_hard_upper: Box<[Option<u64>]>,
     pub(super) child_row_widths: Box<[u64]>,
     pub(super) output_row_width: u64,
-    pub(super) perfect_hash_slots: Option<u64>,
+    pub(super) perfect_hash: Option<crate::physical::PerfectHashResourceContract>,
 }
 
 #[derive(Debug, Clone, Copy)]

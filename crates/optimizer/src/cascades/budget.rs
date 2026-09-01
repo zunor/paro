@@ -14,6 +14,7 @@ pub enum BudgetDimension {
     PhysicalExprPerGroup,
     InterestingGoalPerGroup,
     RuleFirePerGroup,
+    RuleWorkPerGroup,
     JoinConnectedPair,
     GraphFrontier,
     FactorizationVariant,
@@ -34,6 +35,7 @@ impl BudgetDimension {
             Self::PhysicalExprPerGroup => "physical_expr_per_group",
             Self::InterestingGoalPerGroup => "interesting_goal_per_group",
             Self::RuleFirePerGroup => "rule_fire_per_group",
+            Self::RuleWorkPerGroup => "rule_work_per_group",
             Self::JoinConnectedPair => "join_connected_pair",
             Self::GraphFrontier => "graph_frontier",
             Self::FactorizationVariant => "factorization_variant",
@@ -59,6 +61,10 @@ pub struct SearchBudget {
     pub max_optional_physical_exprs_per_group: u32,
     pub max_optional_interesting_goals_per_group: u32,
     pub max_rule_firings_per_group: u32,
+    /// Maximum number of logical group visits performed by optional rule
+    /// materialization for one target group. This bounds legacy whole-region
+    /// rules until each is expressed entirely as local Memo operands.
+    pub max_rule_work_units_per_group: u32,
     pub max_join_connected_pairs: u32,
     pub max_join_exact_relations: u16,
     pub join_beam_width: u16,
@@ -88,6 +94,7 @@ impl Default for SearchBudget {
             max_optional_physical_exprs_per_group: 64,
             max_optional_interesting_goals_per_group: 16,
             max_rule_firings_per_group: 256,
+            max_rule_work_units_per_group: 65_536,
             max_join_connected_pairs: 65_536,
             max_join_exact_relations: 12,
             join_beam_width: 64,
@@ -105,10 +112,7 @@ impl Default for SearchBudget {
             max_optional_enforcer_depth: 8,
             max_optional_enforcer_chains_per_goal: 8,
             max_pareto_winners_per_goal: 8,
-            // CompiledStatement currently stores one admitted runtime program,
-            // not the portfolio. Do not pay for variants that cannot survive
-            // compilation; raise this only when runtime admission owns them.
-            max_grant_classes: 1,
+            max_grant_classes: 3,
         }
     }
 }
@@ -148,6 +152,7 @@ impl SearchBudget {
                 self.max_optional_interesting_goals_per_group
             }
             BudgetDimension::RuleFirePerGroup => self.max_rule_firings_per_group,
+            BudgetDimension::RuleWorkPerGroup => self.max_rule_work_units_per_group,
             BudgetDimension::JoinConnectedPair => self.max_join_connected_pairs,
             BudgetDimension::GraphFrontier => self.max_graph_frontiers,
             BudgetDimension::FactorizationVariant => self.max_factorization_variants as u32,

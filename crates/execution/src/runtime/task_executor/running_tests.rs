@@ -779,9 +779,21 @@ fn hash_join_build_and_probe_use_typed_handle_without_sink_state() {
 }
 
 #[test]
-fn cross_product_probe_reuses_materialized_build_vectors() {
+fn cross_product_probe_streams_external_build_rows() {
     let output = QueryOutputPort::unbounded();
-    let query = query_context(output.clone());
+    let query = query_context_with_limits(
+        output.clone(),
+        RuntimeLimits {
+            max_threads: 1,
+            max_memory: 64 * 1024 * 1024,
+            use_temporary_directory: true,
+            temporary_directory: unique_temp_dir("paro_cross_product_spill"),
+            max_temp_directory_size: None,
+            force_external: true,
+            rowset_scan_pushdown: true,
+            parallel_scheduler: false,
+        },
+    );
     let build_row_type = RowType::new(vec!["r".to_string()], vec![LogicalType::Integer]);
     let output_row_type = RowType::new(
         vec!["l".to_string(), "r".to_string()],
@@ -807,7 +819,10 @@ fn cross_product_probe_reuses_materialized_build_vectors() {
                     vec![LogicalType::Integer],
                 )),
                 transforms: Vec::new(),
-                sink: SinkSpec::CrossProductBuild(CrossProductBuildSinkSpec { handle }),
+                sink: SinkSpec::CrossProductBuild(CrossProductBuildSinkSpec {
+                    handle,
+                    spill_policy: crate::physical::specs::SpillExecutionPolicy::Forced,
+                }),
                 sink_sharing: SinkSharing::Exclusive,
                 properties: PipelineProperties::default(),
                 output: build_row_type,

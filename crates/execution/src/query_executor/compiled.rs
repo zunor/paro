@@ -139,6 +139,10 @@ fn statement_program_dependencies_available(
     ctx: &StatementContext,
 ) -> bool {
     match program {
+        StatementProgram::Portfolio(portfolio) => portfolio
+            .variants
+            .iter()
+            .all(|variant| physical_plan_dependencies_available(&variant.plan, ctx)),
         StatementProgram::Pipeline { plan, .. } => physical_plan_dependencies_available(plan, ctx),
         StatementProgram::ExplainAnalyze { target, .. } => {
             statement_program_dependencies_available(target, ctx)

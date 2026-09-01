@@ -99,6 +99,30 @@ fn int_payload(values: &[i32], allocator: Arc<dyn paro_common::allocator::Alloca
     payload
 }
 
+fn pair_payload(
+    values: &[(i32, i32)],
+    allocator: Arc<dyn paro_common::allocator::Allocator>,
+) -> Chunk {
+    let mut payload = Chunk::try_initialize(
+        &[LogicalType::Integer, LogicalType::Integer],
+        values.len(),
+        allocator,
+    )
+    .expect("payload");
+    payload.set_cardinality(values.len());
+    for (row_idx, (left, right)) in values.iter().enumerate() {
+        payload
+            .column_mut(0)
+            .expect("left group")
+            .set_value(row_idx, &Value::Integer(*left));
+        payload
+            .column_mut(1)
+            .expect("right group")
+            .set_value(row_idx, &Value::Integer(*right));
+    }
+    payload
+}
+
 fn string_agg_payload(
     rows: &[(i32, &str)],
     allocator: Arc<dyn paro_common::allocator::Allocator>,
@@ -130,6 +154,133 @@ fn query_context() -> QueryRuntimeContext {
         Arc::new(QueryMemoryPool::unbounded()),
         QueryOutputPort::unbounded(),
     )
+}
+
+#[test]
+fn grouping_set_spill_partitions_each_domain_by_its_own_keys() {
+    let allocator = paro_common::test_utils::test_allocator();
+    let query = query_context();
+    let thread = ThreadContext::single_threaded();
+    let memory = TaskMemoryGrants::detached(allocator.clone());
+    let wake = OperatorWakeScope {
+        task_id: PipelineTaskId(41),
+        generation: WakeGeneration(0),
+    };
+    let mut profiler = OperatorProfiler::disabled();
+    let mut ctx = OperatorFinishContext {
+        query: &query,
+        pipeline: PipelineId::new(0),
+        operator: RuntimeOperatorId::new(0),
+        finish_task: None,
+        thread: &thread,
+        memory: memory.call_scope(),
+        cancel: &query.cancellation,
+        wake: &wake,
+        profiler: &mut profiler,
+    };
+    let mut spec = grouped_count_spec();
+    spec.grouping_key_count = 2;
+    spec.payload_types = Box::new([LogicalType::Integer, LogicalType::Integer]);
+    spec.groups = Box::new([
+        reference(0, LogicalType::Integer),
+        reference(1, LogicalType::Integer),
+    ]);
+    spec.group_key_encodings = Box::new([GroupKeyEncoding::Identity, GroupKeyEncoding::Identity]);
+    spec.grouping_sets = Box::new([Box::new([0]), Box::new([1]), Box::new([])]);
+    spec.output_names = Box::new(["a".into(), "b".into(), "count".into()]);
+    spec.output_types = Box::new([
+        LogicalType::Integer,
+        LogicalType::Integer,
+        LogicalType::BigInt,
+    ]);
+
+    let payload = pair_payload(&[(1, 10), (1, 20), (2, 10)], allocator.clone());
+    let group_refs = group_payload_refs(&spec).expect("group refs");
+    let all_groups = build_groups_chunk(&payload, &group_refs).expect("all groups");
+    let grouping_sets = normalized_grouping_sets(&spec)
+        .expect("grouping sets")
+        .into_iter()
+        .map(Vec::into_boxed_slice)
+        .collect::<Vec<_>>();
+    let table_memory =
+        MemoryAccountingContext::detached(MemoryTag::HashTable, MemoryAccountingClass::Revocable);
+    let mut spilled_payloads = Vec::new();
+    for (grouping_idx, grouping_set) in grouping_sets.iter().enumerate() {
+        let groups =
+            build_groups_chunk_for_set(&all_groups, grouping_set, 2).expect("domain groups");
+        let hashes = hash_group_columns(&groups).expect("domain hashes");
+        let mut spill = AggregatePayloadSpillBuffer::new(
+            query.session.buffer_pool().clone(),
+            payload.types(),
+            aggregate_spill_radix_bits(1),
+            table_memory.clone(),
+        )
+        .expect("payload spill");
+        spill.append_payload(&payload, &hashes).expect("spill rows");
+        spilled_payloads.push(spill.seal_for_grouping(grouping_idx));
+    }
+
+    let aggregate_objects = aggregate_objects(&spec).expect("aggregate objects");
+    let mut state = HashAggregateRuntimeState {
+        tables: Vec::new(),
+        pending_radix_merges: Vec::new(),
+        distinct: Default::default(),
+        spilled_payloads: Vec::new(),
+        spilled_states: Vec::new(),
+        spilled_outputs: None,
+        ordered_collectors: Vec::new(),
+    };
+    spill_payload_partitions_to_outputs(
+        &mut ctx,
+        &spec,
+        &aggregate_objects,
+        &group_refs,
+        &grouping_sets,
+        &mut state,
+        &spilled_payloads,
+        &[],
+        None,
+    )
+    .expect("grouping-set spill replay");
+
+    let mut actual = Vec::new();
+    for (grouping_idx, output) in state
+        .spilled_outputs
+        .take()
+        .expect("spilled outputs")
+        .into_iter()
+        .enumerate()
+    {
+        let mut reader = output.expect("domain output").into_reader();
+        let mut chunk =
+            Chunk::try_initialize(&spec.output_types, 8, allocator.clone()).expect("output chunk");
+        while reader.read_next(&mut chunk).expect("read domain output") > 0 {
+            actual.extend((0..chunk.size()).map(|row| {
+                (
+                    grouping_idx,
+                    chunk.column(0).unwrap().get_value(row),
+                    chunk.column(1).unwrap().get_value(row),
+                    chunk.column(2).unwrap().get_i64(row).unwrap(),
+                )
+            }));
+        }
+    }
+    actual.sort_by_key(|row| (row.0, row.1.to_string(), row.2.to_string()));
+    assert_eq!(
+        actual,
+        vec![
+            (0, Value::Integer(1), Value::Null(LogicalType::Integer), 2),
+            (0, Value::Integer(2), Value::Null(LogicalType::Integer), 1),
+            (1, Value::Null(LogicalType::Integer), Value::Integer(10), 2),
+            (1, Value::Null(LogicalType::Integer), Value::Integer(20), 1),
+            (
+                2,
+                Value::Null(LogicalType::Integer),
+                Value::Null(LogicalType::Integer),
+                3,
+            ),
+        ]
+    );
 }
 
 #[test]

@@ -94,6 +94,7 @@ pub(super) fn matches_transformation(
         PlannerTransformation::AggregateDimensionDeferral => {
             operator == Op::Aggregate && aggregate_over_dimension_join(expr, memo, state)
         }
+        PlannerTransformation::TopNIntroduction => operator == Op::Limit,
         PlannerTransformation::LimitPushdown => {
             operator == Op::Limit
                 && canonical_child_operator(expr, 0, memo, state) == Some(Op::Projection)

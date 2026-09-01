@@ -100,7 +100,7 @@ impl AggregateSpec {
                     "post-aggregate input rollup requires a perfect aggregate plan",
                 ));
             };
-            if perfect_hash.max_local_tables <= 1 {
+            if perfect_hash.resource.max_local_tables <= 1 {
                 return Err(paro_error::internal(
                     "post-aggregate input rollup requires multiple local perfect tables",
                 ));
@@ -870,7 +870,15 @@ fn verify_operator_types(
 pub struct PerfectHashAggregatePlan {
     pub group_minima: Box<[i128]>,
     pub group_cardinalities: Box<[usize]>,
-    /// Maximum number of concurrent local direct-addressing tables admitted by
-    /// the aggregate memory budget.
+    pub resource: PerfectHashResourceContract,
+}
+
+/// Immutable proof and resource envelope for one perfect-hash aggregate
+/// implementation. Every planning and execution stage consumes this value;
+/// no later stage may re-admit the implementation with a different formula.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PerfectHashResourceContract {
+    pub slots: usize,
+    pub bytes_per_table_upper: usize,
     pub max_local_tables: usize,
 }

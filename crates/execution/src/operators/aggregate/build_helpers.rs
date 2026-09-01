@@ -552,7 +552,18 @@ pub(crate) fn create_perfect_aggregate_table(
             "perfect aggregate sink requires perfect hash planning metadata",
         ));
     };
-    PerfectAggregateHashTable::new_with_memory(
+    let planned_slots = perfect
+        .group_cardinalities
+        .iter()
+        .try_fold(1usize, |slots, cardinality| slots.checked_mul(*cardinality))
+        .ok_or_else(|| paro_error::internal("perfect aggregate planned slot count overflow"))?;
+    if planned_slots != perfect.resource.slots {
+        return Err(paro_error::internal(format!(
+            "perfect aggregate domain disagrees with its resource contract: domain_slots={planned_slots}, contract_slots={}",
+            perfect.resource.slots
+        )));
+    }
+    PerfectAggregateHashTable::new_with_memory_contract(
         logical_group_types(spec),
         aggregate_objects(spec)?,
         aggregate_inputs(spec),
@@ -560,6 +571,7 @@ pub(crate) fn create_perfect_aggregate_table(
         perfect.group_cardinalities.to_vec(),
         allocator,
         memory,
+        perfect.resource.bytes_per_table_upper,
     )
 }
 

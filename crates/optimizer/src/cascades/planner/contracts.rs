@@ -109,17 +109,10 @@ pub(super) fn derive_logical_properties(
     let maximum_cardinality = match operator {
         LogicalOperator::DummyScan => Some(1),
         LogicalOperator::EmptyResult(_) => Some(0),
-        // Tablet row count includes every currently resident row version and
-        // is therefore a conservative upper bound for the statement
-        // snapshot, unlike catalog/NDV statistics which are estimates.  This
-        // is the leaf proof that lets blocking operators participate in hard
-        // grant admission without treating an estimate as a bound.
-        LogicalOperator::Get(get) => get
-            .table
-            .as_ref()
-            .and_then(|table| table.storage.as_ref())
-            .and_then(|storage| storage.total_rows().ok())
-            .and_then(|rows| u64::try_from(rows).ok()),
+        // A table's resident row count is local to the compilation snapshot.
+        // Prepared plans survive DML, so it is an estimate rather than a
+        // schema invariant and cannot participate in a correctness proof.
+        LogicalOperator::Get(_) => None,
         LogicalOperator::ExpressionGet(values) => u64::try_from(values.expressions.len()).ok(),
         LogicalOperator::Projection(_)
         | LogicalOperator::Filter(_)
@@ -267,8 +260,6 @@ pub(super) fn planner_operator_spillable(operator: &LogicalOperator) -> bool {
     match operator {
         LogicalOperator::Aggregate(aggregate) => {
             !aggregate.groups.is_empty()
-                && aggregate.grouping_sets.is_empty()
-                && aggregate.grouping_functions.is_empty()
                 && aggregate.aggregates.iter().all(|expression| {
                     matches!(
                         expression,
@@ -283,6 +274,10 @@ pub(super) fn planner_operator_spillable(operator: &LogicalOperator) -> bool {
         LogicalOperator::Join(Join::Comparison(join)) => {
             crate::physical::extraction::helpers::supports_external_hash_join_type(join.join_type)
         }
+        // The build side is an immutable row store and the probe streams it
+        // one vector at a time. Feasibility therefore does not depend on a
+        // snapshot-local build cardinality estimate.
+        LogicalOperator::Join(Join::Cross(_)) => true,
         _ => false,
     }
 }
@@ -295,12 +290,12 @@ pub(super) fn implementation_spillable(
         PhysicalImplementationFlavor::HashJoin
         | PhysicalImplementationFlavor::HashJoinRuntimeFilter
         | PhysicalImplementationFlavor::HashAggregate
-        | PhysicalImplementationFlavor::PartitionAggregateWindow => metadata.spillable,
+        | PhysicalImplementationFlavor::PartitionAggregateWindow
+        | PhysicalImplementationFlavor::Window => metadata.spillable,
         PhysicalImplementationFlavor::Structural => metadata.spillable,
         PhysicalImplementationFlavor::NestedLoopJoin
         | PhysicalImplementationFlavor::PerfectHashAggregate
         | PhysicalImplementationFlavor::SingletonAggregateProjection
-        | PhysicalImplementationFlavor::Window
         | PhysicalImplementationFlavor::SortRangeJoin
         | PhysicalImplementationFlavor::ClassicIeJoin
         | PhysicalImplementationFlavor::SearchProvider => false,
@@ -367,7 +362,9 @@ pub(super) fn cost_for_grant(
     force_spill: bool,
     mandatory: bool,
 ) -> Result<Option<SearchCost>> {
+    cost.non_revocable_memory_upper = if spillable { 0 } else { cost.peak_memory_upper };
     if dependency == GrantDependencyDescriptor::Invariant {
+        cost.validate()?;
         return Ok(Some(cost));
     }
     let GrantGoalKey::Class(class_id) = grant else {
@@ -378,17 +375,16 @@ pub(super) fn cost_for_grant(
     let class = classes.get(&class_id).ok_or_else(|| {
         paro_error::internal("physical implementation references an unknown grant class")
     })?;
-    if cost.peak_memory_upper == u64::MAX && mandatory {
-        // Unknown input cardinality is not a license to turn an estimate into
-        // a hard bound. The mandatory implementation runs under the query
-        // allocator's grant, so its operational peak is capped even when
-        // successful completion cannot be proven from catalog facts alone.
-        // This is independent of spill policy: an unknown bound cannot prove
-        // a finite spill volume, and a mandatory non-spillable operator must
-        // remain executable under the same allocator contract.
-        // Optional implementations still require a finite proof or a spill
-        // contract and are rejected through the ordinary path below.
-        return Ok(Some(cost));
+    if cost.peak_memory_upper == u64::MAX {
+        if spillable && class.spill_policy == SpillPolicy::Allowed {
+            // The allocator/spill protocol, not a cardinality estimate,
+            // proves the finite operational peak. Spill volume stays an
+            // estimate and must not be fabricated from UNKNOWN.
+            cost.peak_memory_upper = class.hard_memory_bytes;
+            cost.validate()?;
+            return Ok(Some(cost));
+        }
+        return Ok(None);
     }
     if force_spill && spillable {
         if class.spill_policy == SpillPolicy::Forbidden {
@@ -399,6 +395,7 @@ pub(super) fn cost_for_grant(
             let spilled = cost.peak_memory_upper.max(1);
             cost.peak_memory_upper = cost.peak_memory_upper.min(class.hard_memory_bytes);
             add_spill_cost(&mut cost, spilled)?;
+            cost.validate()?;
             return Ok(Some(cost));
         }
     }
@@ -411,12 +408,10 @@ pub(super) fn cost_for_grant(
             .saturating_sub(class.hard_memory_bytes);
         cost.peak_memory_upper = class.hard_memory_bytes;
         add_spill_cost(&mut cost, spilled)?;
+        cost.validate()?;
         return Ok(Some(cost));
     }
-    if mandatory {
-        // Defer the exact cap until overlapping child winners are known.
-        return Ok(Some(cost));
-    }
+    let _ = mandatory;
     Ok(None)
 }
 

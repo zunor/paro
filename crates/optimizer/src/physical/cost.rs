@@ -104,6 +104,12 @@ pub struct SearchCost {
     pub resources_expected: [f64; RESOURCE_DIMS],
     pub resources_risk_upper: [f64; RESOURCE_DIMS],
     pub critical_path: CompactRange,
+    /// Memory that cannot be reclaimed or spilled while this operator is
+    /// active. This is the hard quantity that composes additively across
+    /// overlapping retained-state pipelines.
+    pub non_revocable_memory_upper: u64,
+    /// Query-local peak after applying the shared allocator/revocation
+    /// protocol. Revocable working sets compose by maximum, not by addition.
     pub peak_memory_upper: u64,
     pub spill_bytes_expected: u64,
     pub external_workers: ExternalWorkerRequirementSetId,
@@ -119,6 +125,7 @@ impl SearchCost {
         resources_expected: [0.0; RESOURCE_DIMS],
         resources_risk_upper: [0.0; RESOURCE_DIMS],
         critical_path: CompactRange::ZERO,
+        non_revocable_memory_upper: 0,
         peak_memory_upper: 0,
         spill_bytes_expected: 0,
         external_workers: ExternalWorkerRequirementSetId(0),
@@ -155,6 +162,11 @@ impl SearchCost {
         {
             return Err(paro_error::internal("search cost interval is inverted"));
         }
+        if self.non_revocable_memory_upper > self.peak_memory_upper {
+            return Err(paro_error::internal(
+                "non-revocable memory exceeds the total peak memory contract",
+            ));
+        }
         Ok(())
     }
 
@@ -183,6 +195,9 @@ impl SearchCost {
             resources_expected,
             resources_risk_upper,
             critical_path: self.critical_path.checked_add(other.critical_path)?,
+            non_revocable_memory_upper: self
+                .non_revocable_memory_upper
+                .max(other.non_revocable_memory_upper),
             peak_memory_upper: self.peak_memory_upper.max(other.peak_memory_upper),
             spill_bytes_expected: self
                 .spill_bytes_expected
@@ -204,6 +219,7 @@ impl SearchCost {
         let no_worse = self.score.risk_adjusted <= other.score.risk_adjusted
             && self.score.range.upper <= other.score.range.upper
             && self.critical_path.upper <= other.critical_path.upper
+            && self.non_revocable_memory_upper <= other.non_revocable_memory_upper
             && self.peak_memory_upper <= other.peak_memory_upper
             && self.spill_bytes_expected <= other.spill_bytes_expected
             && self.external_worker_slots_upper <= other.external_worker_slots_upper
@@ -220,6 +236,7 @@ impl SearchCost {
         let strictly_better = self.score.risk_adjusted < other.score.risk_adjusted
             || self.score.range.upper < other.score.range.upper
             || self.critical_path.upper < other.critical_path.upper
+            || self.non_revocable_memory_upper < other.non_revocable_memory_upper
             || self.peak_memory_upper < other.peak_memory_upper
             || self.spill_bytes_expected < other.spill_bytes_expected
             || self.external_worker_slots_upper < other.external_worker_slots_upper

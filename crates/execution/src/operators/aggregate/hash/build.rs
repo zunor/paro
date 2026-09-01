@@ -27,10 +27,11 @@ use crate::operators::aggregate::aggregate_state::AggregateStateLayout;
 #[cfg(test)]
 use crate::operators::aggregate::build_helpers::build_groups_chunk;
 use crate::operators::aggregate::build_helpers::{
-    aggregate_objects, can_skip_regular_aggregate_sink, create_hash_aggregate_tables,
-    group_payload_refs, group_types, has_aggregate_distinct, has_aggregate_ordered,
-    normalized_grouping_sets, projected_payload_chunk, query_hash_table_memory,
-    query_modifier_memory, update_hash_aggregate_tables, update_hash_aggregate_tables_with_scratch,
+    aggregate_objects, build_groups_chunk_for_set, can_skip_regular_aggregate_sink,
+    create_hash_aggregate_tables, group_payload_refs, group_types, has_aggregate_distinct,
+    has_aggregate_ordered, normalized_grouping_sets, projected_payload_chunk,
+    query_hash_table_memory, query_modifier_memory, update_hash_aggregate_tables,
+    update_hash_aggregate_tables_with_scratch,
 };
 use crate::operators::aggregate::distinct_helpers::{
     collect_distinct_rows, finalize_distinct_into_tables,
@@ -63,6 +64,10 @@ use crate::runtime::state::{
     BreakerHandleGlobal, HashAggregateBuildSinkLocal, SinkGlobal, SinkLocal,
 };
 
+mod grouping_set_spill;
+
+use grouping_set_spill::{append_payload_to_local_spills, spill_grouping_set_payloads_to_outputs};
+
 use super::distinct_finalize::prepare_parallel_distinct_finalize;
 use super::merge_finalize::prepare_parallel_radix_merge;
 
@@ -80,7 +85,9 @@ impl HashAggregateBuildSinkExec {
     pub(crate) fn create_global(&self, ctx: &mut PipelineInitContext) -> Result<SinkGlobal> {
         self.spec.verify_post_reduction()?;
         let handle = ctx.handles.get(self.handle)?;
-        if hash_aggregate_external_payload_spill_requested(&self.spec) {
+        if hash_aggregate_external_payload_spill_requested(&self.spec)
+            || self.spec.grouping_sets.len() > 1
+        {
             if !hash_aggregate_payload_spill_supported(&self.spec) {
                 return Err(paro_error::internal(
                     "optimizer selected forced spill for a hash aggregate without an executable spill path",
@@ -260,7 +267,9 @@ impl HashAggregateBuildSinkExec {
             query_memory,
             raw_payload_spill_enabled,
             raw_payload_spill_requested,
-            payload_spill: None,
+            payload_spills: (0..normalized_grouping_sets(&self.spec)?.len())
+                .map(|_| None)
+                .collect(),
             state_spill,
             ordered_collectors: empty_ordered_collectors_with_memory(
                 &self.spec,
@@ -306,7 +315,13 @@ impl HashAggregateBuildSinkExec {
         if local.raw_payload_spill_enabled
             || local.raw_payload_spill_requested.load(Ordering::Acquire)
         {
-            append_payload_to_local_spill(ctx, payload, groups, &mut local.payload_spill)?;
+            append_payload_to_local_spills(
+                ctx,
+                payload,
+                groups,
+                &local.grouping_sets,
+                &mut local.payload_spills,
+            )?;
             local.activate_raw_payload_spill_if_requested();
             return Ok(SinkPoll::NeedMoreInput);
         }
@@ -340,7 +355,13 @@ impl HashAggregateBuildSinkExec {
             || local.raw_payload_spill_requested.load(Ordering::Acquire)
         {
             drop(tables);
-            append_payload_to_local_spill(ctx, payload, groups, &mut local.payload_spill)?;
+            append_payload_to_local_spills(
+                ctx,
+                payload,
+                groups,
+                &local.grouping_sets,
+                &mut local.payload_spills,
+            )?;
             local.activate_raw_payload_spill_if_requested();
             return Ok(SinkPoll::NeedMoreInput);
         }
@@ -382,8 +403,12 @@ impl HashAggregateBuildSinkExec {
                         "aggregate handle does not contain hash aggregate state",
                     ));
                 };
-                if let Some(spill) = local.payload_spill.take() {
-                    global.spilled_payloads.push(spill.seal());
+                for (grouping_idx, spill) in local.payload_spills.iter_mut().enumerate() {
+                    if let Some(spill) = spill.take() {
+                        global
+                            .spilled_payloads
+                            .push(spill.seal_for_grouping(grouping_idx));
+                    }
                 }
                 if let Some(spill) = local.state_spill.lock().take() {
                     global.spilled_states.push(spill.seal());
@@ -415,8 +440,12 @@ impl HashAggregateBuildSinkExec {
                 merge_pending_radix_tables(global)?;
                 merge_local_tables(&mut global.tables, &mut local_tables)?;
             }
-            if let Some(spill) = local.payload_spill.take() {
-                global.spilled_payloads.push(spill.seal());
+            for (grouping_idx, spill) in local.payload_spills.iter_mut().enumerate() {
+                if let Some(spill) = spill.take() {
+                    global
+                        .spilled_payloads
+                        .push(spill.seal_for_grouping(grouping_idx));
+                }
             }
             if let Some(spill) = local.state_spill.lock().take() {
                 global.spilled_states.push(spill.seal());
@@ -620,11 +649,7 @@ fn merge_pending_radix_tables(state: &mut HashAggregateRuntimeState) -> Result<(
 }
 
 fn hash_aggregate_payload_spill_supported(spec: &AggregateSpec) -> bool {
-    spec.grouping_key_count > 0
-        && spec.grouping_sets.is_empty()
-        && spec.grouping_functions.is_empty()
-        && !has_aggregate_distinct(spec)
-        && !has_aggregate_ordered(spec)
+    spec.grouping_key_count > 0 && !has_aggregate_distinct(spec) && !has_aggregate_ordered(spec)
 }
 
 fn hash_aggregate_state_spill_supported(
@@ -632,6 +657,7 @@ fn hash_aggregate_state_spill_supported(
     aggregate_objects: &[crate::operators::aggregate::aggregate_object::AggregateObject],
 ) -> bool {
     hash_aggregate_payload_spill_supported(spec)
+        && spec.grouping_sets.len() <= 1
         && aggregate_state_spill_supported(aggregate_objects)
 }
 
@@ -659,7 +685,8 @@ fn hash_aggregate_external_payload_spill_enabled(
     {
         return false;
     }
-    hash_aggregate_external_payload_spill_requested(spec)
+    spec.grouping_sets.len() > 1
+        || hash_aggregate_external_payload_spill_requested(spec)
         || hash_aggregate_preemptive_payload_spill_enabled(query)
 }
 
@@ -680,27 +707,6 @@ fn hash_aggregate_preemptive_payload_spill_enabled(
     let threshold = HASH_AGGREGATE_PREEMPTIVE_SPILL_CAP_PER_THREAD
         .saturating_mul(query.session.number_of_threads().max(1));
     capacity <= threshold
-}
-
-fn append_payload_to_local_spill(
-    ctx: &mut OperatorCallContext,
-    payload: &Chunk,
-    groups: &Chunk,
-    payload_spill: &mut Option<AggregatePayloadSpillBuffer>,
-) -> Result<()> {
-    let hashes = hash_group_columns(groups)?;
-    if payload_spill.is_none() {
-        *payload_spill = Some(AggregatePayloadSpillBuffer::new(
-            ctx.query.session.buffer_pool().clone(),
-            payload.types(),
-            aggregate_spill_radix_bits(ctx.query.session.number_of_threads()),
-            query_hash_table_memory(ctx.query),
-        )?);
-    }
-    payload_spill
-        .as_mut()
-        .expect("aggregate payload spill initialized above")
-        .append_payload(payload, &hashes)
 }
 
 fn replay_spilled_states(
@@ -1001,9 +1007,30 @@ fn spill_payload_partitions_to_outputs(
     spilled_states: &[crate::operators::aggregate::payload_spill::AggregateSpilledState],
     mut post_reducer: Option<&mut PostAggregateReducer>,
 ) -> Result<usize> {
+    if grouping_sets.len() > 1 {
+        return spill_grouping_set_payloads_to_outputs(
+            ctx,
+            spec,
+            aggregate_objects,
+            group_refs,
+            grouping_sets,
+            state,
+            spilled_payloads,
+            spilled_states,
+            post_reducer,
+        );
+    }
     let Some(first_payload) = spilled_payloads.first() else {
         return Ok(0);
     };
+    if spilled_payloads
+        .iter()
+        .any(|payload| payload.grouping_idx() != 0)
+    {
+        return Err(paro_error::internal(
+            "plain aggregate spill contains a nonzero grouping domain",
+        ));
+    }
     let partition_count = first_payload.partition_count();
     if partition_count == 0 {
         return Ok(0);

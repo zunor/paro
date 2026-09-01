@@ -96,7 +96,7 @@ fn grouped_join_uses_empty_input_contract_instead_of_function_name() {
 }
 
 #[test]
-fn grouped_join_rejects_count_empty_input_contract() {
+fn full_partition_join_preserves_count_empty_input_contract() {
     let optimized = optimize_sql(
         "SELECT ps.ps_partkey \
          FROM partsupp AS ps \
@@ -108,11 +108,13 @@ fn grouped_join_rejects_count_empty_input_contract() {
     );
     let inspection = inspect_plan(&optimized);
 
-    assert_eq!(inspection.delim_joins, 1, "{optimized:#?}");
+    assert_eq!(inspection.delim_joins, 0, "{optimized:#?}");
+    assert_eq!(inspection.gets_named("partsupp"), 1, "{optimized:#?}");
+    assert_eq!(inspection.gets_named("lineitem"), 1, "{optimized:#?}");
 }
 
 #[test]
-fn grouped_join_rejects_non_null_rejecting_scalar_predicate() {
+fn full_partition_join_preserves_non_null_rejecting_scalar_predicate() {
     let optimized = optimize_sql(
         "SELECT ps.ps_partkey \
          FROM partsupp AS ps \
@@ -124,11 +126,11 @@ fn grouped_join_rejects_non_null_rejecting_scalar_predicate() {
     );
     let inspection = inspect_plan(&optimized);
 
-    assert_eq!(inspection.delim_joins, 1, "{optimized:#?}");
+    assert_eq!(inspection.delim_joins, 0, "{optimized:#?}");
 }
 
 #[test]
-fn grouped_join_rejects_correlation_that_does_not_cover_outer_unique_key() {
+fn full_partition_join_does_not_require_outer_key_uniqueness() {
     let optimized = optimize_sql(
         "SELECT l.l_orderkey \
          FROM lineitem AS l \
@@ -139,7 +141,9 @@ fn grouped_join_rejects_correlation_that_does_not_cover_outer_unique_key() {
     );
     let inspection = inspect_plan(&optimized);
 
-    assert_eq!(inspection.delim_joins, 1, "{optimized:#?}");
+    assert_eq!(inspection.delim_joins, 0, "{optimized:#?}");
+    assert_eq!(inspection.gets_named("lineitem"), 1, "{optimized:#?}");
+    assert_eq!(inspection.gets_named("partsupp"), 1, "{optimized:#?}");
 }
 
 #[test]

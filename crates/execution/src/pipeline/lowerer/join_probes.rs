@@ -65,7 +65,10 @@ impl<'a> PipelineLowerer<'a> {
         );
         let producer = self.lower_subtree_to_sink(
             right,
-            SinkSpec::CrossProductBuild(CrossProductBuildSinkSpec { handle }),
+            SinkSpec::CrossProductBuild(CrossProductBuildSinkSpec {
+                handle,
+                spill_policy: spec.spill_policy,
+            }),
             SinkSharing::Exclusive,
             self.plan.node(right).output.clone(),
             pipelines,

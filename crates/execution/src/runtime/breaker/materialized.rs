@@ -16,6 +16,7 @@ use std::sync::{Arc, OnceLock};
 use parking_lot::Mutex;
 use paro_common::chunk::Chunk;
 use paro_common::error::{self as paro_error, Result};
+use paro_storage::row::RowStore;
 
 use crate::runtime::context::OperatorCleanupContext;
 
@@ -54,13 +55,27 @@ impl FoundBits {
 #[derive(Debug)]
 pub struct MaterializedHandle {
     metadata: BreakerHandleMetadata,
-    pending_chunks: Mutex<Vec<Chunk>>,
-    sealed_chunks: Mutex<Option<Arc<[Chunk]>>>,
+    pending: Mutex<MaterializedPending>,
+    sealed_snapshot: Mutex<Option<Arc<MaterializedSnapshot>>>,
     #[cfg(test)]
     sealed_chunk_reads: AtomicUsize,
     sealed: AtomicBool,
     cleanup: CleanupState,
     found_bits: Mutex<Option<FoundBits>>,
+}
+
+#[derive(Debug, Default)]
+enum MaterializedPending {
+    #[default]
+    Empty,
+    Chunks(Vec<Chunk>),
+    RowStores(Vec<Arc<RowStore>>),
+}
+
+#[derive(Debug)]
+enum MaterializedSnapshot {
+    Chunks(Arc<[Chunk]>),
+    RowStores(Arc<[Arc<RowStore>]>),
 }
 
 /// Runtime-scoped reader for one immutable materialized-handle snapshot.
@@ -73,7 +88,7 @@ pub struct MaterializedHandle {
 pub struct MaterializedReader {
     handle: Arc<MaterializedHandle>,
     consumer: &'static str,
-    chunks: OnceLock<Arc<[Chunk]>>,
+    snapshot: OnceLock<Arc<MaterializedSnapshot>>,
 }
 
 impl MaterializedReader {
@@ -81,7 +96,7 @@ impl MaterializedReader {
         Self {
             handle,
             consumer,
-            chunks: OnceLock::new(),
+            snapshot: OnceLock::new(),
         }
     }
 
@@ -100,8 +115,28 @@ impl MaterializedReader {
     /// to `sealed`, and readers acquire-load that flag here. Recursive resets
     /// are scheduled only after the prior runtime has stopped polling.
     pub fn sealed_chunks(&self) -> Result<&Arc<[Chunk]>> {
-        if let Some(chunks) = self.chunks.get() {
-            return Ok(chunks);
+        match self.sealed_snapshot()?.as_ref() {
+            MaterializedSnapshot::Chunks(chunks) => Ok(chunks),
+            MaterializedSnapshot::RowStores(_) => Err(paro_error::internal(format!(
+                "{} requires in-memory chunks but producer published an external row store",
+                self.consumer
+            ))),
+        }
+    }
+
+    /// Returns the external snapshot when the producer selected the bounded
+    /// row-store representation. Ordinary materialized consumers deliberately
+    /// do not accept this representation; cross product owns its replay rules.
+    pub fn external_row_stores(&self) -> Result<Option<&Arc<[Arc<RowStore>]>>> {
+        match self.sealed_snapshot()?.as_ref() {
+            MaterializedSnapshot::Chunks(_) => Ok(None),
+            MaterializedSnapshot::RowStores(stores) => Ok(Some(stores)),
+        }
+    }
+
+    fn sealed_snapshot(&self) -> Result<&Arc<MaterializedSnapshot>> {
+        if let Some(snapshot) = self.snapshot.get() {
+            return Ok(snapshot);
         }
         if !self.handle.is_sealed() {
             return Err(paro_error::internal(format!(
@@ -109,12 +144,12 @@ impl MaterializedReader {
                 self.consumer
             )));
         }
-        let chunks = self.handle.sealed_chunks().ok_or_else(|| {
-            paro_error::internal(format!("sealed {} chunks are missing", self.consumer))
+        let snapshot = self.handle.sealed_snapshot().ok_or_else(|| {
+            paro_error::internal(format!("sealed {} snapshot is missing", self.consumer))
         })?;
-        let _ = self.chunks.set(chunks);
+        let _ = self.snapshot.set(snapshot);
         Ok(self
-            .chunks
+            .snapshot
             .get()
             .expect("materialized reader snapshot initialized above"))
     }
@@ -124,8 +159,8 @@ impl MaterializedHandle {
     pub fn new(metadata: BreakerHandleMetadata) -> Self {
         Self {
             metadata,
-            pending_chunks: Mutex::new(Vec::new()),
-            sealed_chunks: Mutex::new(None),
+            pending: Mutex::new(MaterializedPending::Empty),
+            sealed_snapshot: Mutex::new(None),
             #[cfg(test)]
             sealed_chunk_reads: AtomicUsize::new(0),
             sealed: AtomicBool::new(false),
@@ -165,7 +200,41 @@ impl MaterializedHandle {
                 "cannot append to a sealed materialized breaker handle",
             ));
         }
-        self.pending_chunks.lock().extend(chunks.drain(..));
+        let mut pending = self.pending.lock();
+        match &mut *pending {
+            MaterializedPending::Empty => {
+                *pending = MaterializedPending::Chunks(std::mem::take(chunks));
+            }
+            MaterializedPending::Chunks(pending_chunks) => {
+                pending_chunks.extend(chunks.drain(..));
+            }
+            MaterializedPending::RowStores(_) => {
+                return Err(paro_error::internal(
+                    "materialized breaker cannot mix chunks and external row stores",
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    pub fn append_row_store(&self, store: RowStore) -> Result<()> {
+        if self.is_sealed() {
+            return Err(paro_error::internal(
+                "cannot append to a sealed materialized breaker handle",
+            ));
+        }
+        let mut pending = self.pending.lock();
+        match &mut *pending {
+            MaterializedPending::Empty => {
+                *pending = MaterializedPending::RowStores(vec![Arc::new(store)]);
+            }
+            MaterializedPending::RowStores(stores) => stores.push(Arc::new(store)),
+            MaterializedPending::Chunks(_) => {
+                return Err(paro_error::internal(
+                    "materialized breaker cannot mix external row stores and chunks",
+                ));
+            }
+        }
         Ok(())
     }
 
@@ -174,11 +243,18 @@ impl MaterializedHandle {
             return Ok(());
         }
 
-        let chunks = {
-            let mut pending = self.pending_chunks.lock();
-            std::mem::take(&mut *pending)
+        let snapshot = match std::mem::take(&mut *self.pending.lock()) {
+            MaterializedPending::Empty => {
+                MaterializedSnapshot::Chunks(Arc::from(Vec::new().into_boxed_slice()))
+            }
+            MaterializedPending::Chunks(chunks) => {
+                MaterializedSnapshot::Chunks(Arc::from(chunks.into_boxed_slice()))
+            }
+            MaterializedPending::RowStores(stores) => {
+                MaterializedSnapshot::RowStores(Arc::from(stores.into_boxed_slice()))
+            }
         };
-        *self.sealed_chunks.lock() = Some(Arc::from(chunks.into_boxed_slice()));
+        *self.sealed_snapshot.lock() = Some(Arc::new(snapshot));
         self.sealed.store(true, Ordering::Release);
         Ok(())
     }
@@ -189,10 +265,18 @@ impl MaterializedHandle {
     }
 
     #[inline]
-    pub fn sealed_chunks(&self) -> Option<Arc<[Chunk]>> {
+    fn sealed_snapshot(&self) -> Option<Arc<MaterializedSnapshot>> {
         #[cfg(test)]
         self.sealed_chunk_reads.fetch_add(1, Ordering::Relaxed);
-        self.sealed_chunks.lock().clone()
+        self.sealed_snapshot.lock().clone()
+    }
+
+    #[inline]
+    pub fn sealed_chunks(&self) -> Option<Arc<[Chunk]>> {
+        match self.sealed_snapshot()?.as_ref() {
+            MaterializedSnapshot::Chunks(chunks) => Some(Arc::clone(chunks)),
+            MaterializedSnapshot::RowStores(_) => None,
+        }
     }
 
     #[cfg(test)]
@@ -205,24 +289,26 @@ impl MaterializedHandle {
             !self.cleanup.is_cleaned(),
             "cannot reset a cleaned materialized breaker handle"
         );
-        self.pending_chunks.lock().clear();
-        *self.sealed_chunks.lock() = None;
+        *self.pending.lock() = MaterializedPending::Empty;
+        *self.sealed_snapshot.lock() = None;
         *self.found_bits.lock() = None;
         self.sealed.store(false, Ordering::Release);
     }
 
     #[inline]
     pub fn pending_chunk_count(&self) -> usize {
-        self.pending_chunks.lock().len()
+        match &*self.pending.lock() {
+            MaterializedPending::Chunks(chunks) => chunks.len(),
+            MaterializedPending::Empty | MaterializedPending::RowStores(_) => 0,
+        }
     }
 
     #[inline]
     pub fn sealed_chunk_count(&self) -> usize {
-        self.sealed_chunks
-            .lock()
-            .as_ref()
-            .map(|chunks| chunks.len())
-            .unwrap_or(0)
+        match self.sealed_snapshot.lock().as_deref() {
+            Some(MaterializedSnapshot::Chunks(chunks)) => chunks.len(),
+            Some(MaterializedSnapshot::RowStores(_)) | None => 0,
+        }
     }
 
     #[inline]
@@ -243,7 +329,8 @@ fn allocate_found_bits(total_rows: usize) -> Arc<[AtomicU8]> {
 
 impl RuntimeCleanup for MaterializedHandle {
     fn cleanup(&self, _ctx: &mut OperatorCleanupContext, reason: CleanupReason) -> Result<()> {
-        self.pending_chunks.lock().clear();
+        *self.pending.lock() = MaterializedPending::Empty;
+        *self.sealed_snapshot.lock() = None;
         self.cleanup.mark(reason);
         Ok(())
     }

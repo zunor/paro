@@ -329,15 +329,17 @@ pub(super) fn implementation_cost(
                 .first()
                 .copied()
                 .unwrap_or(facts.output_rows);
-            let slots = facts.perfect_hash_slots.ok_or_else(|| {
+            let resource = facts.perfect_hash.ok_or_else(|| {
                 paro_error::internal("perfect-hash candidate lost its proven key domain")
             })?;
             work.add(OP_PERFECT_AGGREGATE_ROW, input)?;
             work.add(
                 OP_PERFECT_AGGREGATE_SLOT,
-                CompactRange::point(slots as f64)?,
+                CompactRange::point(resource.slots as f64)?,
             )?;
-            peak_memory_upper = slots.saturating_mul(facts.output_row_width.saturating_add(16));
+            peak_memory_upper = u64::try_from(resource.bytes_per_table_upper)
+                .unwrap_or(u64::MAX)
+                .saturating_mul(resource.max_local_tables as u64);
         }
         PhysicalImplementationFlavor::SingletonAggregateProjection => {
             let input = facts

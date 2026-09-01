@@ -89,9 +89,7 @@ impl<'a> CTEInlining<'a> {
         }
 
         if cte.materialized == CTEMaterialize::NotMaterialized
-            || (cte.materialized == CTEMaterialize::Default
-                && contains_limit(&cte.child.operator)
-                && !ends_in_aggregate_or_distinct(&cte.cte_query.operator))
+            || cte.materialized == CTEMaterialize::Default
         {
             let definition = cte.cte_query.as_ref();
             inline_copied_references(
@@ -117,29 +115,6 @@ fn count_cte_references(op: &LogicalOperator, cte_index: usize) -> usize {
             .into_iter()
             .map(|child| count_cte_references(&child.operator, cte_index))
             .sum::<usize>()
-}
-
-fn contains_limit(op: &LogicalOperator) -> bool {
-    if matches!(op, LogicalOperator::Limit(_) | LogicalOperator::TopN(_)) {
-        return true;
-    }
-    op.children()
-        .into_iter()
-        .any(|c| contains_limit(&c.operator))
-}
-
-fn ends_in_aggregate_or_distinct(op: &LogicalOperator) -> bool {
-    if matches!(
-        op,
-        LogicalOperator::Aggregate(_) | LogicalOperator::Distinct(_) | LogicalOperator::Window(_)
-    ) {
-        return true;
-    }
-    let children = op.children();
-    if children.len() != 1 {
-        return false;
-    }
-    ends_in_aggregate_or_distinct(&children[0].operator)
 }
 
 fn projection_for_cte_ref(

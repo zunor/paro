@@ -318,6 +318,7 @@ impl PhysicalPlanExtractor {
             right_output_types: cross.right.types().into_boxed_slice(),
             output_names: output_names.into_boxed_slice(),
             output_types: output_types.into_boxed_slice(),
+            spill_policy: self.ctx.spill_execution_policy(true),
         };
         Ok((PhysicalNodeKind::CrossProduct(spec), vec![left, right]))
     }

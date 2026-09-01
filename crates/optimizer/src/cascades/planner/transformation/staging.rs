@@ -320,6 +320,11 @@ pub(super) fn stage_transformed_expression(
             spillable: planner_operator_spillable(&plan.operator),
             cost_facts: planner_cost_facts(&plan, state.scan_access_cost)?,
             output_columns: output_columns.clone().into_boxed_slice(),
+            child_required: intern_child_requirements(
+                memo,
+                child_states.iter().map(|child| child.columns.as_ref()),
+            )?,
+            child_row_goals: child_row_goals(&plan.operator, child_states.len()),
             search: None,
             required_region_facet: target.and(required_region_facet),
             runtime_filter_region_facet: None,

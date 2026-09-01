@@ -2,7 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use super::*;
-use crate::physical::aggregate_planning::PerfectHashPlanningDomain;
+use crate::physical::aggregate_planning::plan_perfect_hash_aggregate;
 use paro_catalog::entry::CatalogEntry;
 use paro_catalog::entry::StandardEntry;
 use paro_planner::operator::graph_expand::graph_path_element_list_type;
@@ -27,64 +27,12 @@ pub(crate) fn extract_payload_expression(
     Expression::Reference(ReferenceExpression::new(reference_index, return_type))
 }
 
-#[derive(Debug, Clone)]
-pub(crate) struct PerfectHashPlanInfo {
-    pub(crate) group_minima: Vec<i128>,
-    pub(crate) group_cardinalities: Vec<usize>,
-}
-
-const PERFECT_HASH_RANGE_LIMIT: u128 = 1u128 << 32;
 pub(crate) fn can_use_perfect_hash_aggregate(
     aggregate: &LogicalAggregate,
     groups: &[Expression],
     aggregate_exprs: &[Expression],
-) -> Option<PerfectHashPlanInfo> {
-    if groups.is_empty()
-        || aggregate.grouping_sets.len() > 1
-        || !aggregate.grouping_functions.is_empty()
-        || aggregate.groups.len() != groups.len()
-    {
-        return None;
-    }
-
-    for aggregate_expr in aggregate_exprs {
-        let Expression::Aggregate(aggregate) = aggregate_expr else {
-            return None;
-        };
-        if aggregate.is_distinct() || !aggregate.order_bys.is_empty() {
-            return None;
-        }
-    }
-
-    let mut group_minima = Vec::with_capacity(aggregate.groups.len());
-    let mut group_cardinalities = Vec::with_capacity(aggregate.groups.len());
-
-    for group_idx in 0..aggregate.groups.len() {
-        let group_type = aggregate.groups[group_idx].return_type();
-        let group_stats = aggregate
-            .group_stats
-            .get(group_idx)
-            .and_then(|stats| stats.as_ref());
-        let domain = PerfectHashPlanningDomain::try_new(group_type)?;
-        let (min_value, max_value) = domain.min_max_from_stats(group_stats)?;
-        let range = max_value.checked_sub(min_value)?;
-        let range_u128 = u128::try_from(range).ok()?;
-        if range_u128 >= PERFECT_HASH_RANGE_LIMIT {
-            return None;
-        }
-        // One code for NULL and one-based codes for every value in the
-        // inclusive range. Mixed-radix indexing consumes exactly this domain;
-        // rounding each key to a power of two wastes a material fraction of a
-        // large direct-addressing table.
-        let cardinality = usize::try_from(range_u128.checked_add(2)?).ok()?;
-        group_minima.push(min_value);
-        group_cardinalities.push(cardinality);
-    }
-
-    Some(PerfectHashPlanInfo {
-        group_minima,
-        group_cardinalities,
-    })
+) -> Option<PerfectHashAggregatePlan> {
+    plan_perfect_hash_aggregate(aggregate, groups, aggregate_exprs)
 }
 
 pub(crate) fn logical_name(op: &LogicalOperator) -> &'static str {
@@ -809,10 +757,12 @@ pub(crate) fn supports_typed_hash_join_type(join_type: JoinType) -> bool {
 }
 
 pub(crate) fn supports_external_hash_join_type(join_type: JoinType) -> bool {
-    matches!(
-        join_type,
-        JoinType::Inner | JoinType::Left | JoinType::Semi | JoinType::Anti
-    )
+    // Spill replay partitions both sides by the complete equality-key tuple,
+    // carries the build-wide NULL-key bit for MARK semantics, and scans build
+    // match bits per partition for right/full preservation. SINGLE duplicate
+    // detection is also local to one complete-key partition. Consequently
+    // every typed hash-join contract has an exact external counterpart.
+    supports_typed_hash_join_type(join_type)
 }
 
 pub(crate) fn is_hash_join_comparison(comparison: JoinComparisonType) -> bool {

@@ -141,16 +141,19 @@ impl<P> PhysicalPlanPortfolio<P> {
     /// Select only among optimizer-proved variants. Admission never changes
     /// algorithms or weakens the result guarantee.
     pub fn admit(
-        self,
+        &self,
         available_memory_bytes: u64,
         available_external_worker_slots: u16,
-    ) -> Result<AdmittedPlan<P>> {
+    ) -> Result<AdmittedPlan<P>>
+    where
+        P: Clone,
+    {
         let classes = self
             .grant_classes
             .iter()
             .map(|class| (class.id, *class))
             .collect::<BTreeMap<_, _>>();
-        let variants = self.variants.into_vec();
+        let variants = &self.variants;
         let selected = variants
             .iter()
             .enumerate()
@@ -192,8 +195,7 @@ impl<P> PhysicalPlanPortfolio<P> {
             })?;
         let (selected_index, selected_class) = selected;
         let selected = variants
-            .into_iter()
-            .nth(selected_index)
+            .get(selected_index)
             .expect("selected portfolio index must remain valid");
         Ok(AdmittedPlan {
             reservation: ReservationToken {
@@ -202,12 +204,32 @@ impl<P> PhysicalPlanPortfolio<P> {
                 external_worker_slots: selected.cost.external_worker_slots_upper,
             },
             physical_fingerprint: selected.physical_fingerprint,
-            plan: selected.plan,
+            plan: selected.plan.clone(),
         })
     }
 }
 
 impl PhysicalPlanPortfolio<PhysicalPlan> {
+    pub fn verify_result_types(&self, expected: &[paro_common::types::LogicalType]) -> Result<()> {
+        // Statements without a client-visible row schema may still expose an
+        // internal completion row to the execution protocol (for example a
+        // mutation count). RETURNING and ordinary queries have a non-empty
+        // expected schema and remain subject to exact root verification.
+        if expected.is_empty() {
+            return Ok(());
+        }
+        for variant in self.variants.iter() {
+            let actual = &variant.plan.node(variant.plan.root).output.types;
+            if actual.as_ref() != expected {
+                return Err(paro_error::internal(format!(
+                    "physical root violates the compiled result presentation: expected={expected:?}, actual={actual:?}, fingerprint={:?}",
+                    variant.physical_fingerprint
+                )));
+            }
+        }
+        Ok(())
+    }
+
     pub fn combined_dependencies(&self) -> Result<crate::physical::PlanDependencies> {
         let mut variants = self.variants.iter();
         let first = variants
