@@ -629,14 +629,21 @@ pub(crate) fn update_hash_aggregate_tables_with_scratch(
     for (table, grouping_set) in tables.iter_mut().zip(grouping_sets.iter()) {
         let groups =
             build_groups_chunk_for_set(all_groups, grouping_set.as_ref(), spec.grouping_key_count)?;
-        let hashes = hash_scratch.hash(&groups)?;
         ensure_group_update_scratch(
             addresses,
             new_groups,
             payload.size(),
             payload.allocator().clone(),
         )?;
-        table.find_or_create_groups(&groups, &hashes, addresses, new_groups)?;
+        let used_adaptive_index =
+            table.try_find_or_create_adaptive_integer_groups(&groups, addresses, new_groups)?;
+        let hashes = if used_adaptive_index {
+            None
+        } else {
+            let hashes = hash_scratch.hash(&groups)?;
+            table.find_or_create_groups(&groups, hashes, addresses, new_groups)?;
+            Some(hashes)
+        };
         if has_filters
             && !has_distinct
             && !has_ordered
@@ -661,7 +668,7 @@ pub(crate) fn update_hash_aggregate_tables_with_scratch(
         if let Some(filters) = filters.as_ref() {
             table.update_aggregates_per_filter(payload, addresses, filters)?;
         } else {
-            table.update_aggregates(payload, Some(&hashes), addresses, None)?;
+            table.update_aggregates(payload, hashes, addresses, None)?;
         }
     }
     Ok(())

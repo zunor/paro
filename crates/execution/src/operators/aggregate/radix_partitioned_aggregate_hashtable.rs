@@ -338,6 +338,22 @@ impl AggregateHashTable {
         }
     }
 
+    /// Try a runtime-observed exact index for a compact integer group domain.
+    /// Radix ownership still requires hashes, so only flat tables participate.
+    pub(crate) fn try_find_or_create_adaptive_integer_groups(
+        &mut self,
+        groups: &Chunk,
+        addresses: &mut Vector,
+        new_groups: &mut SelectionVector,
+    ) -> Result<bool> {
+        match self {
+            Self::Flat(table) => {
+                table.try_find_or_create_adaptive_integer_groups(groups, addresses, new_groups)
+            }
+            Self::Radix(_) => Ok(false),
+        }
+    }
+
     pub fn find_or_create_groups(
         &mut self,
         groups: &Chunk,

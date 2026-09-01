@@ -367,6 +367,106 @@ fn grouped_hash_table_find_create_and_update() {
 }
 
 #[test]
+fn adaptive_integer_groups_preserve_canonical_fallback() {
+    let allocator = paro_common::test_utils::test_allocator();
+    let mut table = GroupedAggregateHashTable::new(
+        vec![LogicalType::Integer],
+        vec![make_sum_object()],
+        vec![vec![0]],
+        allocator.clone(),
+    )
+    .expect("adaptive integer table");
+
+    let update_batch = |table: &mut GroupedAggregateHashTable,
+                        group_values: &[i32],
+                        payload_values: &[i64],
+                        expect_adaptive: bool| {
+        let groups = Chunk::from_vectors(
+            vec![paro_common::test_utils::test_i32_vector_with_allocator(
+                group_values,
+                allocator.clone(),
+            )],
+            allocator.clone(),
+        );
+        let payload = Chunk::from_vectors(
+            vec![paro_common::test_utils::test_i64_vector_with_allocator(
+                payload_values,
+                allocator.clone(),
+            )],
+            allocator.clone(),
+        );
+        let mut addresses =
+            paro_common::test_utils::test_vector_with_capacity(LogicalType::BigInt, groups.size());
+        let mut new_groups = paro_common::test_utils::test_selection_with_capacity(groups.size());
+        let used_adaptive = table
+            .try_find_or_create_adaptive_integer_groups(&groups, &mut addresses, &mut new_groups)
+            .expect("adaptive lookup");
+        assert_eq!(used_adaptive, expect_adaptive);
+        if !used_adaptive {
+            let hashes = table.hash_groups(&groups).expect("fallback hashes");
+            table
+                .find_or_create_groups(&groups, &hashes, &mut addresses, &mut new_groups)
+                .expect("canonical fallback");
+        }
+        table
+            .update_aggregates(&payload, &addresses, None)
+            .expect("aggregate update");
+    };
+
+    update_batch(&mut table, &[1, 2, 1, 3], &[10, 20, 5, 7], true);
+    assert!(matches!(
+        table.adaptive_integer_index,
+        AdaptiveIntegerGroupIndexState::Active(_)
+    ));
+    update_batch(&mut table, &[2, 10_000, 1], &[8, 11, 4], false);
+    assert!(matches!(
+        table.adaptive_integer_index,
+        AdaptiveIntegerGroupIndexState::Disabled
+    ));
+    update_batch(&mut table, &[10_000, 2], &[9, 3], false);
+
+    let actual = build_map_from_scan(collect_scan_rows(&mut table));
+    let expected = HashMap::from([(1, 19), (2, 31), (3, 7), (10_000, 20)]);
+    assert_eq!(actual, expected);
+}
+
+#[test]
+fn adaptive_integer_groups_expand_and_reuse_null_slot() {
+    let allocator = paro_common::test_utils::test_allocator();
+    let mut table = GroupedAggregateHashTable::new(
+        vec![LogicalType::Integer],
+        Vec::new(),
+        Vec::new(),
+        allocator.clone(),
+    )
+    .expect("adaptive nullable table");
+
+    let mut first_values =
+        paro_common::test_utils::test_i32_vector_with_allocator(&[0, 5, 6], allocator.clone());
+    first_values.set_null(0, true);
+    let first = Chunk::from_vectors(vec![first_values], allocator.clone());
+    let mut first_addresses =
+        paro_common::test_utils::test_vector_with_capacity(LogicalType::BigInt, first.size());
+    let mut new_groups = paro_common::test_utils::test_selection_with_capacity(first.size());
+    assert!(table
+        .try_find_or_create_adaptive_integer_groups(&first, &mut first_addresses, &mut new_groups)
+        .expect("first adaptive lookup"));
+    assert_eq!(table.count(), 3);
+
+    let mut second_values =
+        paro_common::test_utils::test_i32_vector_with_allocator(&[4, 0, 8], allocator.clone());
+    second_values.set_null(1, true);
+    let second = Chunk::from_vectors(vec![second_values], allocator);
+    let mut second_addresses =
+        paro_common::test_utils::test_vector_with_capacity(LogicalType::BigInt, second.size());
+    assert!(table
+        .try_find_or_create_adaptive_integer_groups(&second, &mut second_addresses, &mut new_groups)
+        .expect("expanded adaptive lookup"));
+    assert_eq!(table.count(), 5);
+    assert_eq!(second_addresses.get_i64(1), Some(table.state_ptr(0) as i64));
+}
+
+#[test]
 fn grouped_hash_table_update_with_filter() {
     let mut table = GroupedAggregateHashTable::new(
         vec![LogicalType::Integer],

@@ -26,6 +26,7 @@ use super::aggregate_object::{compile_direct_update_program, AggregateObject};
 use super::aggregate_state::AggregateStateLayout;
 use super::group_hash::hash_group_columns;
 use super::tuple_layout::{TupleLayout, TupleScatterSource, VarlenHeap};
+use adaptive_integer_index::AdaptiveIntegerGroupIndexState;
 
 const MIN_CAPACITY: usize = 8;
 const LOAD_FACTOR_NUMERATOR: usize = 3; // 0.6
@@ -262,6 +263,7 @@ pub struct GroupedAggregateHashTable {
     varlen_heap: VarlenHeap,
     aggregate_allocator: ArenaAllocator,
     inline_key_layout: Option<InlineKeyLayout>,
+    adaptive_integer_index: AdaptiveIntegerGroupIndexState,
     count: usize,
     capacity: usize,
     bitmask: usize,
@@ -419,6 +421,7 @@ impl GroupedAggregateHashTable {
             ),
             aggregate_allocator: ArenaAllocator::new(allocator),
             inline_key_layout,
+            adaptive_integer_index: AdaptiveIntegerGroupIndexState::Candidate,
             count: 0,
             capacity,
             bitmask,
@@ -532,6 +535,10 @@ impl GroupedAggregateHashTable {
         addresses: &mut Vector,
         new_groups: &mut SelectionVector,
     ) -> Result<usize> {
+        // A generic insertion may introduce keys outside the observed dense
+        // domain. The canonical hash table remains complete; discard only the
+        // optional acceleration sidecar before mutating it through this path.
+        self.adaptive_integer_index = AdaptiveIntegerGroupIndexState::Disabled;
         validate_addresses_vector(addresses, groups.size())?;
         addresses.try_set_count(groups.size())?;
         if input_row_count == 0 {
@@ -1198,6 +1205,7 @@ impl GroupedAggregateHashTable {
 
         self.data.clear();
         self.data.shrink_to_fit_and_refund();
+        self.adaptive_integer_index = AdaptiveIntegerGroupIndexState::Disabled;
         self.entries.clear();
         self.entries.shrink_to_fit_and_refund();
         if let Some(inline_keys) = &mut self.inline_keys {
@@ -1224,6 +1232,7 @@ impl GroupedAggregateHashTable {
                 .inline_keys
                 .as_ref()
                 .map_or(0, |keys| keys.capacity() * size_of::<InlineKey>())
+            + self.adaptive_integer_index.memory_usage()
     }
 
     pub fn external_accounted_memory_usage(&self) -> usize {
@@ -1577,6 +1586,7 @@ row_width {}/{} agg_state_offset {}/{}",
     }
 
     fn release_finalized_lookup_storage(&mut self) {
+        self.adaptive_integer_index = AdaptiveIntegerGroupIndexState::Disabled;
         self.entries.clear();
         self.entries.shrink_to_fit_and_refund();
         if let Some(inline_keys) = &mut self.inline_keys {
@@ -1952,6 +1962,9 @@ fn fixed_allocation_bytes(
 
 #[path = "grouped_aggregate_hashtable_merge.rs"]
 mod merge;
+
+#[path = "grouped_aggregate_hashtable_integer_index.rs"]
+mod adaptive_integer_index;
 
 #[path = "grouped_aggregate_hashtable_lookup.rs"]
 mod lookup;
