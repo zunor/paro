@@ -51,6 +51,13 @@ impl MaterializedSourceGlobal {
         self.reader.sealed_chunks()
     }
 
+    /// Number of immutable chunks available to independently scheduled source
+    /// workers. The producer dependency guarantees the handle is sealed before
+    /// this is queried by the scheduler.
+    pub(crate) fn work_count(&self) -> Result<usize> {
+        Ok(self.sealed_chunks()?.len())
+    }
+
     #[inline]
     pub(crate) fn found_bits(&self) -> Option<FoundBits> {
         self.reader.found_bits()
@@ -351,6 +358,8 @@ mod tests {
         assert_eq!(second.next_chunk_index(), 0);
         assert_eq!(first.sealed_chunks().unwrap().len(), 2);
         assert_eq!(second.sealed_chunks().unwrap().len(), 2);
+        assert_eq!(first.work_count().unwrap(), 2);
+        assert_eq!(second.work_count().unwrap(), 2);
     }
 
     #[test]

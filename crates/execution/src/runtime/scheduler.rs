@@ -646,6 +646,7 @@ struct WorkUnitId(u64);
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum SharedSourceWorker {
     RowsetScan,
+    Materialized,
     HashAggregateEmit,
     HashJoinUnmatched,
     SortEmit,
@@ -1349,6 +1350,10 @@ fn source_work(source: &SourceGlobal) -> Result<Option<SourceWork>> {
         SourceGlobal::Chunk(global) => Some(SourceWork::Chunks {
             count: global.chunks.len(),
         }),
+        SourceGlobal::Materialized(global) => Some(SourceWork::SharedWorkers {
+            count: global.work_count()?,
+            worker: SharedSourceWorker::Materialized,
+        }),
         SourceGlobal::HashAggregateEmit(global) if global.work_count() > 1 => {
             Some(SourceWork::SharedWorkers {
                 count: global.work_count(),
@@ -1395,6 +1400,10 @@ fn prepare_source_task(source: &mut SourceLocal, assignment: SourceTaskAssignmen
         (
             SourceLocal::HashAggregateEmit(_),
             SourceTaskAssignment::SharedWorker(SharedSourceWorker::HashAggregateEmit),
+        )
+        | (
+            SourceLocal::Materialized(_),
+            SourceTaskAssignment::SharedWorker(SharedSourceWorker::Materialized),
         )
         | (
             SourceLocal::HashJoinUnmatched(_),
@@ -1527,6 +1536,17 @@ mod tests {
         assert_eq!(assignments.len(), 4);
         assert!(assignments.iter().all(|assignment| {
             *assignment == SourceTaskAssignment::SharedWorker(SharedSourceWorker::HashAggregateEmit)
+                && assignment.morsel_count().is_none()
+        }));
+
+        let materialized = SourceWork::SharedWorkers {
+            count: 64,
+            worker: SharedSourceWorker::Materialized,
+        }
+        .into_task_assignments(4);
+        assert_eq!(materialized.len(), 4);
+        assert!(materialized.iter().all(|assignment| {
+            *assignment == SourceTaskAssignment::SharedWorker(SharedSourceWorker::Materialized)
                 && assignment.morsel_count().is_none()
         }));
 
