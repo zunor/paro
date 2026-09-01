@@ -86,6 +86,29 @@ impl<'a> SelectBinder<'a> {
         }
 
         let column_name = colref.column.name().to_lowercase();
+        // Relation columns belong to the SELECT input scope and take
+        // precedence over names introduced by the same SELECT list.  Looking
+        // up aliases first makes `SELECT x FROM (...) AS t(x)` appear to be a
+        // self-reference whenever the inferred output name is also `x`.
+        // Preserve lookup errors here as well: an ambiguous input column must
+        // not be silently captured by a SELECT alias.
+        if self
+            .base
+            .base
+            .binder
+            .bind_context
+            .lookup_local_column(None, &column_name)?
+            .is_some()
+            || self
+                .base
+                .base
+                .binder
+                .bind_context
+                .lookup_outer_column(None, &column_name)?
+                .is_some()
+        {
+            return Ok(None);
+        }
         let original_expr = match self
             .base
             .bind_state

@@ -8,6 +8,7 @@ pub mod cost_model;
 pub mod enumerator;
 mod equality_graph;
 pub mod optimizer;
+mod predicate_inference;
 pub mod query_graph;
 pub mod relation;
 pub mod relation_manager;

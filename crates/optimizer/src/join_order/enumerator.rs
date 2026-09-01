@@ -94,10 +94,12 @@ impl<'a> PlanEnumerator<'a> {
         for i in 0..self.num_relations {
             let set = self.set_manager.get_relation(i);
             let cardinality = self.cost_model.get_cardinality(&set);
+            let risk_cardinality = self.cost_model.get_risk_cardinality(&set);
             let node = DPJoinNode::leaf(
                 set.clone(),
                 self.cost_model.payload_width(set.as_ref()),
                 cardinality,
+                risk_cardinality,
             );
 
             self.plans.insert(set, node);
@@ -819,9 +821,7 @@ mod tests {
 
         // Create join filter
         let filter = create_equality_filter(&mut set_manager, 0, 0, 1, 0, 0);
-        cost_model
-            .cardinality_estimator
-            .init_equivalent_relations(&[filter.clone()]);
+        cost_model.init_equivalent_relations(&[filter.clone()]);
 
         // Add edge to query graph
         let left = set_manager.get_relation(0);
@@ -862,9 +862,7 @@ mod tests {
         let filter_ab = create_equality_filter(&mut set_manager, 0, 0, 1, 0, 0);
         let filter_bc = create_equality_filter(&mut set_manager, 1, 1, 2, 0, 1);
 
-        cost_model
-            .cardinality_estimator
-            .init_equivalent_relations(&[filter_ab.clone(), filter_bc.clone()]);
+        cost_model.init_equivalent_relations(&[filter_ab.clone(), filter_bc.clone()]);
 
         // Add edges
         let r0 = set_manager.get_relation(0);

@@ -306,13 +306,13 @@ async fn pinned_snapshot_stays_stable_across_concurrent_edge_commit() {
         .expect("graph snapshot before concurrent DML");
     let alice_local = snapshot_before
         .base()
-        .vertex_map("Person")
+        .vertex_map("person")
         .expect("person label")
         .key_to_local(&VertexKey::Int64(1))
         .expect("Alice local id");
     let mut old_scratch = Vec::new();
     let old_view = snapshot_before
-        .neighbors_forward("Knows", alice_local, &mut old_scratch)
+        .neighbors_forward("knows", alice_local, &mut old_scratch)
         .expect("old neighbor view should exist");
     assert_eq!(
         old_view.len(),
@@ -340,7 +340,7 @@ async fn pinned_snapshot_stays_stable_across_concurrent_edge_commit() {
 
     let mut new_scratch = Vec::new();
     let new_view = snapshot_after
-        .neighbors_forward("Knows", alice_local, &mut new_scratch)
+        .neighbors_forward("knows", alice_local, &mut new_scratch)
         .expect("new neighbor view should exist");
     assert_eq!(
         new_view.len(),
@@ -350,7 +350,7 @@ async fn pinned_snapshot_stays_stable_across_concurrent_edge_commit() {
 
     let mut old_scratch_after = Vec::new();
     let old_view_after = snapshot_before
-        .neighbors_forward("Knows", alice_local, &mut old_scratch_after)
+        .neighbors_forward("knows", alice_local, &mut old_scratch_after)
         .expect("old pinned snapshot should still be usable");
     assert_eq!(
         old_view_after.len(),

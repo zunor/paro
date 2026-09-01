@@ -32,134 +32,10 @@ pub fn convert_join_type(binder_type: BinderJoinType) -> JoinType {
 }
 
 pub fn collect_table_bindings(op: &LogicalOperator) -> HashSet<usize> {
-    let mut bindings = HashSet::new();
-    collect_table_bindings_recursive(op, &mut bindings);
-    bindings
-}
-
-fn collect_table_bindings_recursive(op: &LogicalOperator, bindings: &mut HashSet<usize>) {
-    match op {
-        LogicalOperator::Get(get) => {
-            bindings.insert(get.table_index);
-        }
-        LogicalOperator::Filter(filter) => {
-            collect_table_bindings_recursive(&filter.child.operator, bindings);
-        }
-        LogicalOperator::Projection(proj) => {
-            collect_table_bindings_recursive(&proj.child.operator, bindings);
-        }
-        LogicalOperator::RowFetch(fetch) => {
-            bindings.extend(
-                fetch
-                    .sources
-                    .iter()
-                    .map(|source| source.materialized_table_index),
-            );
-            collect_table_bindings_recursive(&fetch.child.operator, bindings);
-        }
-        LogicalOperator::ExternalProject(project) => {
-            bindings.insert(project.project_index);
-            collect_table_bindings_recursive(&project.child.operator, bindings);
-        }
-        LogicalOperator::ExternalTable(table) => {
-            bindings.insert(table.table_index);
-            if let Some(child) = &table.child {
-                collect_table_bindings_recursive(&child.operator, bindings);
-            }
-        }
-        LogicalOperator::Limit(limit) => {
-            collect_table_bindings_recursive(&limit.child.operator, bindings);
-        }
-        LogicalOperator::Order(order) => {
-            collect_table_bindings_recursive(&order.child.operator, bindings);
-        }
-        LogicalOperator::TopN(topn) => {
-            collect_table_bindings_recursive(&topn.child.operator, bindings);
-        }
-        LogicalOperator::Aggregate(agg) => {
-            collect_table_bindings_recursive(&agg.child.operator, bindings);
-        }
-        LogicalOperator::Insert(insert) => {
-            collect_table_bindings_recursive(&insert.child.operator, bindings);
-        }
-        LogicalOperator::Delete(delete) => {
-            collect_table_bindings_recursive(&delete.child.operator, bindings);
-        }
-        LogicalOperator::Update(update) => {
-            collect_table_bindings_recursive(&update.child.operator, bindings);
-        }
-        LogicalOperator::CopyTo(copy) => {
-            collect_table_bindings_recursive(&copy.child.operator, bindings);
-        }
-        LogicalOperator::Join(join) => {
-            collect_table_bindings_recursive(&join.left().operator, bindings);
-            collect_table_bindings_recursive(&join.right().operator, bindings);
-        }
-        LogicalOperator::SetOperation(setop) => {
-            collect_table_bindings_recursive(&setop.left().operator, bindings);
-            collect_table_bindings_recursive(&setop.right().operator, bindings);
-        }
-        LogicalOperator::ExpressionGet(expr_get) => {
-            bindings.insert(expr_get.table_index);
-        }
-        LogicalOperator::DelimGet(delim_get) => {
-            bindings.insert(delim_get.table_index);
-        }
-        LogicalOperator::Distinct(distinct) => {
-            collect_table_bindings_recursive(&distinct.child.operator, bindings);
-        }
-        LogicalOperator::Window(window) => {
-            collect_table_bindings_recursive(&window.child.operator, bindings);
-        }
-        LogicalOperator::Explain(explain) => {
-            collect_table_bindings_recursive(&explain.child.operator, bindings);
-        }
-        LogicalOperator::EmptyResult(empty) => {
-            collect_table_bindings_recursive(&empty.child.operator, bindings);
-        }
-        LogicalOperator::MaterializedCTE(cte) => {
-            collect_table_bindings_recursive(&cte.cte_query.operator, bindings);
-            collect_table_bindings_recursive(&cte.child.operator, bindings);
-        }
-        LogicalOperator::RecursiveCTE(cte) => {
-            collect_table_bindings_recursive(&cte.anchor.operator, bindings);
-            collect_table_bindings_recursive(&cte.recursive.operator, bindings);
-        }
-        LogicalOperator::CTERef(cte_ref) => {
-            bindings.insert(cte_ref.table_index);
-        }
-        LogicalOperator::TableFunctionGet(tf) => {
-            bindings.insert(tf.table_index);
-        }
-        LogicalOperator::SearchScan(search) => {
-            bindings.insert(search.get.table_index);
-            bindings.insert(search.projection_table_index);
-        }
-        LogicalOperator::FullTextFilterScan(scan) => {
-            bindings.insert(scan.get.table_index);
-        }
-        LogicalOperator::DependentJoin(dep) => {
-            collect_table_bindings_recursive(&dep.left.operator, bindings);
-            collect_table_bindings_recursive(&dep.right.operator, bindings);
-        }
-        LogicalOperator::Alter(_)
-        | LogicalOperator::CreateTable(_)
-        | LogicalOperator::CreateRoutine(_)
-        | LogicalOperator::CreateSequence(_)
-        | LogicalOperator::CreateSchema(_)
-        | LogicalOperator::CreateIndex(_)
-        | LogicalOperator::CreateView(_)
-        | LogicalOperator::CreatePropertyGraph(_)
-        | LogicalOperator::DropPropertyGraph(_)
-        | LogicalOperator::RefreshPropertyGraph(_)
-        | LogicalOperator::Drop(_)
-        | LogicalOperator::GraphMatch(_)
-        | LogicalOperator::GraphScan(_)
-        | LogicalOperator::DummyScan => {}
-        LogicalOperator::GraphExpand(ge) => {
-            collect_table_bindings_recursive(&ge.child.operator, bindings);
-        }
-    }
+    op.get_column_bindings()
+        .into_iter()
+        .map(|binding| binding.table_index)
+        .collect()
 }
 
 pub fn split_conjunction(expr: Expression) -> Vec<Expression> {
@@ -217,7 +93,27 @@ pub fn get_expression_side(
         Expression::ColumnRef(col) => {
             JoinSide::get_side(col.binding.table_index, left_bindings, right_bindings)
         }
-        Expression::Subquery(_) => JoinSide::Both,
+        Expression::Subquery(subquery) => {
+            // A subquery's internal bindings belong to its own scope. Only the
+            // comparison operands and correlated columns determine which join
+            // input the predicate depends on. Treating every subquery as Both
+            // prevents legal null-supplying-side pushdown for predicates such
+            // as `right.key IN (SELECT ...)` in a LEFT JOIN.
+            let mut side = JoinSide::None;
+            for child in &subquery.children {
+                side = JoinSide::combine(
+                    side,
+                    get_expression_side(child, left_bindings, right_bindings),
+                );
+            }
+            for column in &subquery.correlated_columns {
+                side = JoinSide::combine(
+                    side,
+                    JoinSide::get_side(column.table_index, left_bindings, right_bindings),
+                );
+            }
+            side
+        }
         _ => {
             let mut side = JoinSide::None;
             ExpressionIterator::enumerate_children(expr, |child| {

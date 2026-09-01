@@ -13,6 +13,10 @@ use paro_common::error::Result;
 use paro_common::types::LogicalType;
 use paro_common::vector::Vector;
 
+mod string;
+
+use string::{max_varchar_function, min_varchar_function};
+
 #[repr(C)]
 struct MinMaxState<T> {
     value: T,
@@ -191,6 +195,8 @@ pub fn get_min_function() -> AggregateFunctionSet {
         None,
     ));
 
+    set.add_function(min_varchar_function());
+
     set.with_empty_input(AggregateEmptyInput::Null)
 }
 
@@ -239,6 +245,8 @@ pub fn get_max_function() -> AggregateFunctionSet {
         Some(max_f64::simple_update),
         None,
     ));
+
+    set.add_function(max_varchar_function());
 
     set.with_empty_input(AggregateEmptyInput::Null)
 }
@@ -347,5 +355,64 @@ mod tests {
 
             assert_eq!(result.get_flat::<f64>(0), 3.5);
         }
+    }
+
+    fn evaluate_string_extrema(set: AggregateFunctionSet, values: &[Option<&str>]) -> String {
+        let (func, _) = set.bind(&[LogicalType::Varchar]).unwrap();
+        let mut arena = test_arena();
+        let mut state_buf = vec![0u8; func.state_size];
+        let state_ptr = state_buf.as_mut_ptr();
+
+        unsafe {
+            (func.initialize)(state_ptr);
+        }
+
+        let mut input = paro_common::test_utils::test_vector(LogicalType::Varchar);
+        input.set_count(values.len());
+        for (row, value) in values.iter().enumerate() {
+            match value {
+                Some(value) => input.try_set_string(row, value).unwrap(),
+                None => input.set_null(row, true),
+            }
+        }
+
+        unsafe {
+            let input_data = preserve_input_data(&func, &mut arena);
+            func.simple_update.unwrap()(&[&input], &input_data, state_ptr, values.len());
+        }
+
+        let mut result = paro_common::test_utils::test_vector(LogicalType::Varchar);
+        result.set_count(1);
+        let mut states = paro_common::test_utils::test_vector(LogicalType::BigInt);
+        states.set_count(1);
+        unsafe {
+            *states.flat_data_mut::<*mut u8>() = state_ptr;
+            let input_data = preserve_input_data(&func, &mut arena);
+            (func.finalize)(&states, &input_data, &mut result, 1).unwrap();
+        }
+        let value = result.get_string(0).unwrap().to_string();
+        unsafe {
+            let input_data = preserve_input_data(&func, &mut arena);
+            func.destructor.unwrap()(&states, &input_data, 1);
+        }
+        value
+    }
+
+    #[test]
+    fn test_min_varchar_uses_binary_order_and_skips_nulls() {
+        let value = evaluate_string_extrema(
+            get_min_function(),
+            &[Some("zeta"), None, Some("a long alpha value"), Some("beta")],
+        );
+        assert_eq!(value, "a long alpha value");
+    }
+
+    #[test]
+    fn test_max_varchar_uses_binary_order_and_skips_nulls() {
+        let value = evaluate_string_extrema(
+            get_max_function(),
+            &[Some("alpha"), None, Some("zeta value longer than inline")],
+        );
+        assert_eq!(value, "zeta value longer than inline");
     }
 }

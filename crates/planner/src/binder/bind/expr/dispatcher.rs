@@ -12,6 +12,7 @@ use paro_common::runtime_value::Value;
 use paro_common::types::LogicalType;
 use paro_parser::ast::{
     BinaryOperator, ColumnRef, Expr, IntervalKind, JsonOperator, Literal, SubqueryModifier,
+    TypeName,
 };
 /// Maximum expression depth to prevent stack overflow.
 const DEFAULT_MAX_EXPRESSION_DEPTH: usize = 1000;
@@ -482,9 +483,32 @@ impl<'a> ExpressionBinder<'a> {
                 };
                 bind::bind_comparison(self, left, right, comparison_type)
             }
-            BinaryOperator::Like(None) | BinaryOperator::NotLike(None) => {
-                let not = matches!(op, BinaryOperator::NotLike(None));
-                bind::bind_like(self, left, right, not)
+            BinaryOperator::Like(None)
+            | BinaryOperator::NotLike(None)
+            | BinaryOperator::ILike
+            | BinaryOperator::NotILike => {
+                let case_insensitive =
+                    matches!(op, BinaryOperator::ILike | BinaryOperator::NotILike);
+                let negated =
+                    matches!(op, BinaryOperator::NotLike(None) | BinaryOperator::NotILike);
+                bind::bind_like(self, left, right, case_insensitive, negated)
+            }
+            BinaryOperator::StringConcat => {
+                let cast_to_string = |expr| Expr::Cast {
+                    span: None,
+                    expr: Box::new(expr),
+                    target_type: TypeName::String,
+                    pg_style: false,
+                };
+                bind::bind_function(
+                    self.binder,
+                    None,
+                    &op.to_func_name(),
+                    vec![cast_to_string(left), cast_to_string(right)],
+                    false,
+                    None,
+                    vec![],
+                )
             }
             _ => {
                 let func_name = op.to_func_name();
@@ -827,5 +851,24 @@ mod tests {
         };
         assert_eq!(constant.return_type, LogicalType::Interval);
         assert_eq!(constant.value, Value::Interval(3, 0, 0));
+    }
+
+    #[test]
+    fn in_list_coerces_string_literals_to_the_left_comparison_type() {
+        let mut binder = test_binder();
+        let bound = bind_expression(
+            &mut binder,
+            parse_expr("DATE '2000-06-30' IN ('2000-06-30', '2000-07-01')"),
+        )
+        .expect("bind typed IN list");
+        let Expression::Operator(operator) = bound else {
+            panic!("expected IN operator")
+        };
+
+        assert_eq!(operator.operator_type, crate::expression::OperatorType::In);
+        assert!(operator
+            .children
+            .iter()
+            .all(|child| child.return_type() == LogicalType::Date));
     }
 }

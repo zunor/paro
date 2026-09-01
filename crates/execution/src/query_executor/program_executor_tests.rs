@@ -36,16 +36,17 @@ use crate::physical::{ChunkScanSpec, DummyScanSpec, RowType};
 use crate::pipeline::graph::{
     ClientResultSpec, ControlRegion, CorrelatedSubqueryRegion, DelimJoinSide, DependencyKind,
     MaterializeSinkSpec, MaterializedSourceSpec, PipelineDependency, PipelineGraph, PipelineId,
-    PipelineRoot, PipelineSpec, PipelineSubgraphRoot, SinkSharing, SinkSpec, SourceSpec,
+    PipelineRoot, PipelineSpec, PipelineSubgraphRoot, RecursiveCteDedup, RecursiveCteRegion,
+    RecursiveTermination, SinkSharing, SinkSpec, SourceSpec,
 };
 use crate::pipeline::handles::{BreakerHandleCatalogBuilder, BreakerHandleId, BreakerHandleKind};
 use crate::pipeline::lowerer::PipelineLowerer;
 use crate::pipeline::{PipelineProgramBuilder, StatementProgram};
 use crate::query_executor::pipeline_driver::{PipelineDriveResult, PipelineExecutionDriver};
 use crate::query_executor::program_executor::{
-    control_region_pipeline_members, control_region_root_pipelines, execute_program,
-    run_pipeline_graph_with_registry_for_test, start_program, start_program_with_output_for_test,
-    ProgramExecution,
+    control_region_covered_pipelines, control_region_pipeline_members,
+    control_region_root_pipelines, execute_program, run_pipeline_graph_with_registry_for_test,
+    start_program, start_program_with_output_for_test, ProgramExecution,
 };
 use crate::query_executor::stream::ResultHandler;
 use crate::runtime::{
@@ -852,6 +853,122 @@ fn control_region_members_include_nested_region_root_pipelines() {
             PipelineId::new(3)
         ]
     );
+}
+
+#[test]
+fn control_region_coverage_includes_exclusive_invariant_dependencies() {
+    let row_type = RowType::new(Vec::new(), Vec::new());
+    let pipeline = |id| PipelineSpec {
+        id: PipelineId::new(id),
+        source: SourceSpec::Dummy(DummyScanSpec),
+        transforms: Vec::new(),
+        sink: SinkSpec::ClientResult(ClientResultSpec::default()),
+        sink_sharing: SinkSharing::Exclusive,
+        properties: PipelineProperties::default(),
+        output: row_type.clone(),
+    };
+    let graph = PipelineGraph {
+        pipelines: (0..5).map(pipeline).collect(),
+        dependencies: vec![
+            PipelineDependency {
+                producer: PipelineId::new(1),
+                consumer: PipelineId::new(2),
+                kind: DependencyKind::BuildBeforeProbe,
+            },
+            PipelineDependency {
+                producer: PipelineId::new(2),
+                consumer: PipelineId::new(3),
+                kind: DependencyKind::ProbeBeforeSpillReplay,
+            },
+        ],
+        handles: BreakerHandleCatalogBuilder::default().finish(),
+        control_regions: vec![ControlRegion::RecursiveCte(RecursiveCteRegion {
+            anchor: PipelineId::new(0),
+            recursive: vec![PipelineId::new(2), PipelineId::new(3)],
+            emit: PipelineId::new(4),
+            working: crate::pipeline::handles::BreakerHandleId::new(0),
+            intermediate: crate::pipeline::handles::BreakerHandleId::new(1),
+            accumulated: Some(crate::pipeline::handles::BreakerHandleId::new(2)),
+            termination: RecursiveTermination::UntilEmpty,
+            dedup: RecursiveCteDedup::HashSet,
+        })],
+        root: PipelineRoot::ControlRegion(crate::pipeline::graph::ControlRegionId::new(0)),
+    };
+
+    let roots = control_region_root_pipelines(&graph).expect("region roots");
+    let scheduled = control_region_pipeline_members(&graph, &roots).expect("region members");
+    let members = control_region_covered_pipelines(
+        &graph,
+        crate::pipeline::graph::ControlRegionId::new(0),
+        &scheduled[0],
+        &roots,
+    )
+    .expect("covered pipelines");
+
+    assert_eq!(
+        members,
+        vec![
+            PipelineId::new(0),
+            PipelineId::new(1),
+            PipelineId::new(2),
+            PipelineId::new(3),
+            PipelineId::new(4),
+        ]
+    );
+}
+
+#[test]
+fn control_region_coverage_excludes_shared_invariant_dependencies() {
+    let row_type = RowType::new(Vec::new(), Vec::new());
+    let pipeline = |id| PipelineSpec {
+        id: PipelineId::new(id),
+        source: SourceSpec::Dummy(DummyScanSpec),
+        transforms: Vec::new(),
+        sink: SinkSpec::ClientResult(ClientResultSpec::default()),
+        sink_sharing: SinkSharing::Exclusive,
+        properties: PipelineProperties::default(),
+        output: row_type.clone(),
+    };
+    let graph = PipelineGraph {
+        pipelines: (0..6).map(pipeline).collect(),
+        dependencies: vec![
+            PipelineDependency {
+                producer: PipelineId::new(1),
+                consumer: PipelineId::new(2),
+                kind: DependencyKind::BuildBeforeProbe,
+            },
+            PipelineDependency {
+                producer: PipelineId::new(1),
+                consumer: PipelineId::new(5),
+                kind: DependencyKind::BuildBeforeProbe,
+            },
+        ],
+        handles: BreakerHandleCatalogBuilder::default().finish(),
+        control_regions: vec![ControlRegion::RecursiveCte(RecursiveCteRegion {
+            anchor: PipelineId::new(0),
+            recursive: vec![PipelineId::new(2), PipelineId::new(3)],
+            emit: PipelineId::new(4),
+            working: crate::pipeline::handles::BreakerHandleId::new(0),
+            intermediate: crate::pipeline::handles::BreakerHandleId::new(1),
+            accumulated: Some(crate::pipeline::handles::BreakerHandleId::new(2)),
+            termination: RecursiveTermination::UntilEmpty,
+            dedup: RecursiveCteDedup::HashSet,
+        })],
+        root: PipelineRoot::ControlRegion(crate::pipeline::graph::ControlRegionId::new(0)),
+    };
+
+    let roots = control_region_root_pipelines(&graph).expect("region roots");
+    let scheduled = control_region_pipeline_members(&graph, &roots).expect("region members");
+    let members = control_region_covered_pipelines(
+        &graph,
+        crate::pipeline::graph::ControlRegionId::new(0),
+        &scheduled[0],
+        &roots,
+    )
+    .expect("covered pipelines");
+
+    assert!(!members.contains(&PipelineId::new(1)));
+    assert!(!members.contains(&PipelineId::new(5)));
 }
 
 fn i32_chunk(values: &[i32]) -> paro_common::chunk::Chunk {

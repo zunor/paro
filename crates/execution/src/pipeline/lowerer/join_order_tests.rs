@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use super::*;
+use paro_optimizer::physical::ProjectSpec;
 
 fn enable_runtime_filter(mut spec: HashJoinSpec) -> HashJoinSpec {
     spec.runtime_filter = Some(paro_optimizer::physical::HashJoinRuntimeFilterSpec {
@@ -39,7 +40,7 @@ fn projection_above_hash_join_stays_after_probe() {
 
 #[test]
 fn left_deep_hash_join_chain_stays_in_one_probe_pipeline() {
-    let plan = left_deep_hash_join_plan();
+    let plan = left_deep_hash_join_plan_with_context(ExtractionContext::default());
     let mut lowerer = PipelineLowerer::new(&plan);
     let graph = lowerer.lower_to_pipeline_graph(plan.root).unwrap();
 
@@ -80,6 +81,50 @@ fn left_deep_hash_join_chain_stays_in_one_probe_pipeline() {
             .count(),
         1
     );
+}
+
+#[test]
+fn left_deep_spillable_hash_join_chain_replays_every_fused_join() {
+    let plan = left_deep_hash_join_plan_with_context(ExtractionContext {
+        grant_spill_policy: paro_optimizer::physical::SpillPolicy::Allowed,
+        max_memory: 64 * 1024 * 1024,
+        max_threads: 4,
+        ..ExtractionContext::default()
+    });
+    let mut lowerer = PipelineLowerer::new(&plan);
+    let graph = lowerer.lower_to_pipeline_graph(plan.root).unwrap();
+
+    assert_eq!(graph.pipelines.len(), 5);
+    assert!(matches!(
+        graph.pipelines[2].transforms.as_slice(),
+        [
+            TransformSpec::HashJoinProbe(_),
+            TransformSpec::HashJoinProbe(_)
+        ]
+    ));
+    assert!(matches!(
+        graph.pipelines[3].source,
+        SourceSpec::HashJoinSpillReplay(_)
+    ));
+    assert!(matches!(
+        graph.pipelines[3].transforms.as_slice(),
+        [TransformSpec::HashJoinProbe(_)]
+    ));
+    assert!(matches!(
+        graph.pipelines[4].source,
+        SourceSpec::HashJoinSpillReplay(_)
+    ));
+    assert!(graph.pipelines[4].transforms.is_empty());
+    let replay_edges = graph
+        .dependencies
+        .iter()
+        .filter(|dependency| dependency.kind == DependencyKind::ProbeBeforeSpillReplay)
+        .collect::<Vec<_>>();
+    assert_eq!(replay_edges.len(), 2);
+    assert_eq!(replay_edges[0].producer, PipelineId::new(2));
+    assert_eq!(replay_edges[0].consumer, PipelineId::new(3));
+    assert_eq!(replay_edges[1].producer, PipelineId::new(3));
+    assert_eq!(replay_edges[1].consumer, PipelineId::new(4));
 }
 
 #[test]
@@ -154,6 +199,69 @@ fn left_deep_probe_traces_runtime_filter_to_rowset_column() {
         rowset.dynamic_runtime_filters[0].handle,
         BreakerHandleId::new(3)
     );
+}
+
+#[test]
+fn passthrough_projection_traces_runtime_filter_to_rowset_column() {
+    let plan = hash_join_plan(JoinType::Inner);
+    let lowerer = PipelineLowerer::new(&plan);
+    let spec = match &plan.node(plan.root).kind {
+        PhysicalNodeKind::HashJoin(spec) => enable_runtime_filter(spec.clone()),
+        _ => panic!("expected hash join plan"),
+    };
+    let project = TransformSpec::Project(ProjectSpec {
+        expressions: vec![Expression::Reference(ReferenceExpression::new(
+            0,
+            LogicalType::Integer,
+        ))]
+        .into_boxed_slice(),
+        output_names: vec!["key".to_string()].into_boxed_slice(),
+        visible_count: 1,
+    });
+    let source = SourceSpec::Rowset(RowsetSourceSpec::new(rowset_spec_for_test()));
+    let source = lowerer.attach_hash_join_runtime_filters(
+        source,
+        &[project],
+        BreakerHandleId::new(3),
+        &spec,
+    );
+
+    let SourceSpec::Rowset(rowset) = source else {
+        panic!("expected rowset source");
+    };
+    assert_eq!(rowset.dynamic_runtime_filters.len(), 1);
+    assert_eq!(rowset.dynamic_runtime_filters[0].probe_column_id, 0);
+}
+
+#[test]
+fn derived_projection_is_a_runtime_filter_lineage_barrier() {
+    let plan = hash_join_plan(JoinType::Inner);
+    let lowerer = PipelineLowerer::new(&plan);
+    let spec = match &plan.node(plan.root).kind {
+        PhysicalNodeKind::HashJoin(spec) => enable_runtime_filter(spec.clone()),
+        _ => panic!("expected hash join plan"),
+    };
+    let project = TransformSpec::Project(ProjectSpec {
+        expressions: vec![Expression::Constant(ConstantExpression::new(
+            Value::Integer(7),
+            LogicalType::Integer,
+        ))]
+        .into_boxed_slice(),
+        output_names: vec!["derived".to_string()].into_boxed_slice(),
+        visible_count: 1,
+    });
+    let source = SourceSpec::Rowset(RowsetSourceSpec::new(rowset_spec_for_test()));
+    let source = lowerer.attach_hash_join_runtime_filters(
+        source,
+        &[project],
+        BreakerHandleId::new(3),
+        &spec,
+    );
+
+    let SourceSpec::Rowset(rowset) = source else {
+        panic!("expected rowset source");
+    };
+    assert!(rowset.dynamic_runtime_filters.is_empty());
 }
 
 #[test]

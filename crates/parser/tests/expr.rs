@@ -316,3 +316,17 @@ fn test_quote() {
         };
     }
 }
+
+#[test]
+fn test_ilike_operators() {
+    let Expr::BinaryOp { op, .. } = paro_parser::parse_expr("name ILIKE '%anita%'").unwrap() else {
+        panic!("expected ILIKE binary expression");
+    };
+    assert_eq!(op, paro_parser::ast::BinaryOperator::ILike);
+
+    let Expr::BinaryOp { op, .. } = paro_parser::parse_expr("name NOT ILIKE '%anita%'").unwrap()
+    else {
+        panic!("expected NOT ILIKE binary expression");
+    };
+    assert_eq!(op, paro_parser::ast::BinaryOperator::NotILike);
+}

@@ -329,7 +329,7 @@ fn rewrite_planner_expression(
             context.column_stats = column_stats.clone();
             context.cost_model = environment.cost_model.clone();
             context.verify_enabled = environment.verify_enabled;
-            let (plan, changed) = ReorderFilter::new().rewrite_with_change(plan, &context)?;
+            let (plan, changed) = ReorderFilter::new().reorder_node(plan, &context);
             if !changed {
                 return Ok(None);
             }
@@ -346,7 +346,7 @@ fn rewrite_planner_expression(
         PlannerTransformation::CteFilterPushdown => {
             let plan = FilterPullup::new().rewrite_plan(plan);
             let plan = FilterPushdown::new().rewrite_plan(plan);
-            let (plan, changed) = CTEFilterPusher::new().optimize_plan_with_change(plan);
+            let (plan, changed) = CTEFilterPusher::new().optimize_default_root_with_change(plan);
             if !changed {
                 return Ok(None);
             }
@@ -513,6 +513,11 @@ fn settle_transformed_expression(
     mut plan: LogicalPlan,
     environment: &PlannerRuleEnvironment,
 ) -> Result<(LogicalPlan, HashMap<ColumnBinding, Arc<ColumnStatistics>>)> {
+    // A group-local rewrite such as CTE substitution can expose a fresh
+    // Filter(CrossProduct) boundary after the root canonicalization pass.
+    // Stage only canonical join semantics so the equivalent expression is
+    // never costed as an accidental Cartesian product.
+    plan = JoinPredicateNormalizer::new(&environment.bind_context).optimize_plan(plan)?;
     RemoveUnusedColumns::optimize(
         &mut plan,
         &environment.binder,

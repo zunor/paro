@@ -30,35 +30,19 @@ impl<'a> PipelineLowerer<'a> {
         let (producer, handle) =
             self.lower_cross_product_build(*right, spec, pipelines, dependencies)?;
 
-        let (source, mut transforms, pending_builds) =
-            self.collect_probe_roles(*left, pipelines, dependencies)?;
-        let source_handles = source.clone();
-        transforms.push(cross_product_probe_transform(handle, spec));
-        transforms.extend(consumer_transforms);
-
-        let pushed =
-            self.push_pipeline(source, transforms, sink, sink_sharing, output, pipelines)?;
-        let consumer = pushed.entry;
-        self.add_source_handle_dependencies(&source_handles, consumer, dependencies)?;
-        for pending in &pending_builds {
-            self.handles.add_consumer(pending.handle, consumer)?;
-        }
-        self.handles.add_consumer(handle, consumer)?;
-        dependencies.extend(
-            pending_builds
-                .into_iter()
-                .map(|pending| PipelineDependency {
-                    producer: pending.producer,
-                    consumer,
-                    kind: pending.kind,
-                }),
-        );
-        dependencies.push(PipelineDependency {
+        let mut chain = self.collect_probe_roles(*left, pipelines, dependencies)?;
+        chain
+            .transforms
+            .push(cross_product_probe_transform(handle, spec));
+        chain.transforms.extend(consumer_transforms);
+        chain.pending_builds.push(PendingProbeDependency {
             producer,
-            consumer,
+            handle,
             kind: DependencyKind::BuildBeforeProbe,
         });
-        Ok(pushed.tail)
+        Ok(self
+            .push_collected_probe_chain(chain, sink, sink_sharing, output, pipelines, dependencies)?
+            .tail)
     }
 
     pub(crate) fn lower_cross_product_build(
@@ -142,8 +126,7 @@ impl<'a> PipelineLowerer<'a> {
 
         let (producer, handle) = self.lower_nlj_build(*right, spec, pipelines, dependencies)?;
 
-        let (source, mut transforms, pending_builds) =
-            self.collect_probe_roles(*left, pipelines, dependencies)?;
+        let mut chain = self.collect_probe_roles(*left, pipelines, dependencies)?;
         let exact_single_row = nlj_scalar_filter_can_replace_probe(
             self.plan,
             *left,
@@ -153,51 +136,36 @@ impl<'a> PipelineLowerer<'a> {
             &sink,
         );
         let (source, scalar_filter_replaces_probe) = self.attach_nlj_scalar_runtime_filter(
-            source,
-            &transforms,
+            chain.source,
+            &chain.transforms,
             handle,
             spec,
             exact_single_row,
         );
-        let source_handles = source.clone();
+        chain.source = source;
         if !scalar_filter_replaces_probe {
-            transforms.push(nlj_probe_transform(handle, spec));
+            chain.transforms.push(nlj_probe_transform(handle, spec));
         }
-        transforms.extend(consumer_transforms.iter().cloned());
+        chain.transforms.extend(consumer_transforms.iter().cloned());
+        chain.pending_builds.push(PendingProbeDependency {
+            producer,
+            handle,
+            kind: DependencyKind::BuildBeforeProbe,
+        });
 
         let pipeline_output = if scalar_filter_replaces_probe {
             self.plan.node(*left).output.clone()
         } else {
             output.clone()
         };
-        let pushed = self.push_pipeline(
-            source,
-            transforms,
+        let pushed = self.push_collected_probe_chain(
+            chain,
             sink.clone(),
             branch_sharing,
             pipeline_output,
             pipelines,
+            dependencies,
         )?;
-        let consumer = pushed.entry;
-        self.add_source_handle_dependencies(&source_handles, consumer, dependencies)?;
-        for pending in &pending_builds {
-            self.handles.add_consumer(pending.handle, consumer)?;
-        }
-        self.handles.add_consumer(handle, consumer)?;
-        dependencies.extend(
-            pending_builds
-                .into_iter()
-                .map(|pending| PipelineDependency {
-                    producer: pending.producer,
-                    consumer,
-                    kind: pending.kind,
-                }),
-        );
-        dependencies.push(PipelineDependency {
-            producer,
-            consumer,
-            kind: DependencyKind::BuildBeforeProbe,
-        });
 
         if needs_unmatched {
             let unmatched_source = SourceSpec::NljUnmatched(NljUnmatchedSourceSpec {
@@ -218,7 +186,7 @@ impl<'a> PipelineLowerer<'a> {
             )?;
             self.handles.add_consumer(handle, unmatched.entry)?;
             dependencies.push(PipelineDependency {
-                producer: consumer,
+                producer: pushed.tail,
                 consumer: unmatched.entry,
                 kind: DependencyKind::FinalizeBeforeEmit,
             });
@@ -340,40 +308,25 @@ impl<'a> PipelineLowerer<'a> {
         let (producer, handle) =
             self.lower_sort_range_build(*right, spec, pipelines, dependencies)?;
 
-        let (source, mut transforms, pending_builds) =
-            self.collect_probe_roles(*left, pipelines, dependencies)?;
-        let source_handles = source.clone();
-        transforms.push(sort_range_probe_transform(handle, spec));
-        transforms.extend(consumer_transforms.iter().cloned());
+        let mut chain = self.collect_probe_roles(*left, pipelines, dependencies)?;
+        chain
+            .transforms
+            .push(sort_range_probe_transform(handle, spec));
+        chain.transforms.extend(consumer_transforms.iter().cloned());
+        chain.pending_builds.push(PendingProbeDependency {
+            producer,
+            handle,
+            kind: DependencyKind::BuildBeforeProbe,
+        });
 
-        let pushed = self.push_pipeline(
-            source,
-            transforms,
+        let pushed = self.push_collected_probe_chain(
+            chain,
             sink.clone(),
             branch_sharing,
             output.clone(),
             pipelines,
+            dependencies,
         )?;
-        let consumer = pushed.entry;
-        self.add_source_handle_dependencies(&source_handles, consumer, dependencies)?;
-        for pending in &pending_builds {
-            self.handles.add_consumer(pending.handle, consumer)?;
-        }
-        self.handles.add_consumer(handle, consumer)?;
-        dependencies.extend(
-            pending_builds
-                .into_iter()
-                .map(|pending| PipelineDependency {
-                    producer: pending.producer,
-                    consumer,
-                    kind: pending.kind,
-                }),
-        );
-        dependencies.push(PipelineDependency {
-            producer,
-            consumer,
-            kind: DependencyKind::BuildBeforeProbe,
-        });
 
         if needs_unmatched {
             let unmatched_source = SourceSpec::NljUnmatched(NljUnmatchedSourceSpec {
@@ -394,7 +347,7 @@ impl<'a> PipelineLowerer<'a> {
             )?;
             self.handles.add_consumer(handle, unmatched.entry)?;
             dependencies.push(PipelineDependency {
-                producer: consumer,
+                producer: pushed.tail,
                 consumer: unmatched.entry,
                 kind: DependencyKind::FinalizeBeforeEmit,
             });
@@ -527,61 +480,36 @@ impl<'a> PipelineLowerer<'a> {
         )?;
         self.handles.set_producer(handle, producer)?;
 
-        let (source, mut transforms, pending_builds) =
-            self.collect_probe_roles(*left, pipelines, dependencies)?;
-        let source = self.attach_hash_join_runtime_filters(source, &transforms, handle, spec);
-        let probe_source_handles = source.clone();
-        transforms.push(hash_join_probe_transform(handle, spec));
-        transforms.extend(branch_transforms.iter().cloned());
-        let pushed = self.push_pipeline(
-            source,
-            transforms,
+        let mut chain = self.collect_probe_roles(*left, pipelines, dependencies)?;
+        chain.source =
+            self.attach_hash_join_runtime_filters(chain.source, &chain.transforms, handle, spec);
+        chain
+            .transforms
+            .push(hash_join_probe_transform(handle, spec));
+        chain.transforms.extend(branch_transforms.iter().cloned());
+        chain.pending_builds.push(PendingProbeDependency {
+            producer,
+            handle,
+            kind: DependencyKind::BuildBeforeProbe,
+        });
+        let pushed = self.push_collected_probe_chain(
+            chain,
             branch_sink.clone(),
             branch_sharing,
             branch_output.clone(),
             pipelines,
+            dependencies,
         )?;
-        let consumer = pushed.entry;
-        self.add_source_handle_dependencies(&probe_source_handles, consumer, dependencies)?;
-        for pending in &pending_builds {
-            self.handles.add_consumer(pending.handle, consumer)?;
-        }
-        self.handles.add_consumer(handle, consumer)?;
-
-        dependencies.extend(
-            pending_builds
-                .into_iter()
-                .map(|pending| PipelineDependency {
-                    producer: pending.producer,
-                    consumer,
-                    kind: pending.kind,
-                }),
-        );
-        dependencies.push(PipelineDependency {
-            producer,
-            consumer,
-            kind: DependencyKind::BuildBeforeProbe,
-        });
 
         // Non-forced hash joins can still switch to external mode during build
         // finish under memory pressure. Keep the replay fence in the graph for
         // every hash join; the source exits immediately when the handle stayed
         // in-memory.
-        let replay_source = SourceSpec::HashJoinSpillReplay(HashJoinSpillReplaySourceSpec {
+        let replay_source = SourceSpec::HashJoinSpillReplay(hash_join_spill_replay_source(
             handle,
-            join_type: spec.join_type,
-            anti_join_mode: spec.anti_join_mode,
-            key_conditions: spec.key_conditions.clone(),
-            build_residual_conditions: spec.build_residual_conditions.clone(),
-            probe_residual_count: spec.probe_residual_count,
-            probe_types: self.plan.node(*left).output.types.clone(),
-            build_payload_types: spec.build_payload_types.clone(),
-            build_output_count: spec.build_output_count,
-            left_projection: spec.left_projection.clone(),
-            output_names: spec.output_names.clone(),
-            output_types: spec.output_types.clone(),
-            reduction_cascade: spec.reduction_cascade.clone(),
-        });
+            spec,
+            self.plan.node(*left).output.types.clone(),
+        ));
         let replay = self.push_pipeline(
             replay_source,
             branch_transforms.clone(),
@@ -674,17 +602,91 @@ impl<'a> PipelineLowerer<'a> {
         Ok(merged.tail)
     }
 
+    /// Lower the primary fused probe path and every external-join continuation
+    /// in semantic order. A continuation begins immediately after the join it
+    /// replays, then runs the remaining transforms through the same sink.
+    /// Serial replay fences ensure an upstream external join has finished
+    /// feeding any downstream external join before that join starts replaying.
+    #[allow(clippy::too_many_arguments)]
+    fn push_collected_probe_chain(
+        &mut self,
+        chain: CollectedProbeChain,
+        sink: SinkSpec,
+        sink_sharing: SinkSharing,
+        output: RowType,
+        pipelines: &mut Vec<PipelineSpec>,
+        dependencies: &mut Vec<PipelineDependency>,
+    ) -> Result<PipelineChain> {
+        let source_handles = chain.source.clone();
+        let transforms = chain.transforms;
+        let primary = self.push_pipeline(
+            chain.source,
+            transforms.clone(),
+            sink.clone(),
+            sink_sharing,
+            output.clone(),
+            pipelines,
+        )?;
+        self.add_source_handle_dependencies(&source_handles, primary.entry, dependencies)?;
+        for pending in &chain.pending_builds {
+            self.handles.add_consumer(pending.handle, primary.entry)?;
+            dependencies.push(PipelineDependency {
+                producer: pending.producer,
+                consumer: primary.entry,
+                kind: pending.kind,
+            });
+        }
+
+        let mut tail = primary.tail;
+        for replay in chain.pending_replays {
+            let replay_transforms = transforms
+                .get(replay.transform_offset..)
+                .ok_or_else(|| {
+                    paro_error::internal("hash join replay continuation exceeds probe chain")
+                })?
+                .to_vec();
+            let branch = self.push_pipeline(
+                SourceSpec::HashJoinSpillReplay(replay.source),
+                replay_transforms,
+                sink.clone(),
+                sink_sharing,
+                output.clone(),
+                pipelines,
+            )?;
+            for pending in &chain.pending_builds {
+                self.handles.add_consumer(pending.handle, branch.entry)?;
+            }
+            self.handles.add_consumer(replay.handle, branch.entry)?;
+            dependencies.push(PipelineDependency {
+                producer: tail,
+                consumer: branch.entry,
+                kind: DependencyKind::ProbeBeforeSpillReplay,
+            });
+            tail = branch.tail;
+        }
+
+        Ok(PipelineChain {
+            entry: primary.entry,
+            tail,
+        })
+    }
+
     pub(crate) fn collect_probe_roles(
         &mut self,
         root: PhysicalPlanNodeId,
         pipelines: &mut Vec<PipelineSpec>,
         dependencies: &mut Vec<PipelineDependency>,
-    ) -> Result<(SourceSpec, Vec<TransformSpec>, Vec<PendingProbeDependency>)> {
+    ) -> Result<CollectedProbeChain> {
         if let Some(breaker) = Self::probe_fusion_candidate_dispatch(&self.plan.node(root).kind) {
             if let Some(probe_source) =
                 self.lower_breaker_to_probe_source(root, breaker, pipelines, dependencies)?
             {
-                return Ok((probe_source.source, Vec::new(), probe_source.dependencies));
+                return Ok(CollectedProbeChain {
+                    source: probe_source.source,
+                    transforms: Vec::new(),
+                    pending_builds: probe_source.dependencies,
+                    pending_replays: Vec::new(),
+                });
             }
         }
         let node = self.plan.node(root);
@@ -740,17 +742,33 @@ impl<'a> PipelineLowerer<'a> {
                 )?;
                 self.handles.set_producer(handle, producer)?;
 
-                let (source, mut transforms, mut pending_builds) =
-                    self.collect_probe_roles(*left, pipelines, dependencies)?;
-                let source =
-                    self.attach_hash_join_runtime_filters(source, &transforms, handle, &spec);
-                transforms.push(hash_join_probe_transform(handle, &spec));
-                pending_builds.push(PendingProbeDependency {
+                let mut chain = self.collect_probe_roles(*left, pipelines, dependencies)?;
+                chain.source = self.attach_hash_join_runtime_filters(
+                    chain.source,
+                    &chain.transforms,
+                    handle,
+                    &spec,
+                );
+                chain
+                    .transforms
+                    .push(hash_join_probe_transform(handle, &spec));
+                if spec.spill_policy != crate::physical::specs::SpillExecutionPolicy::Forbidden {
+                    chain.pending_replays.push(PendingHashJoinReplay {
+                        source: hash_join_spill_replay_source(
+                            handle,
+                            &spec,
+                            self.plan.node(*left).output.types.clone(),
+                        ),
+                        handle,
+                        transform_offset: chain.transforms.len(),
+                    });
+                }
+                chain.pending_builds.push(PendingProbeDependency {
                     producer,
                     handle,
                     kind: DependencyKind::BuildBeforeProbe,
                 });
-                Ok((source, transforms, pending_builds))
+                Ok(chain)
             }
             PhysicalNodeKind::NestedLoopJoin(spec) => {
                 if needs_nlj_unmatched_source(spec.join_type) {
@@ -769,25 +787,25 @@ impl<'a> PipelineLowerer<'a> {
                 let (producer, handle) =
                     self.lower_nlj_build(*right, &spec, pipelines, dependencies)?;
 
-                let (source, mut transforms, mut pending_builds) =
-                    self.collect_probe_roles(*left, pipelines, dependencies)?;
+                let mut chain = self.collect_probe_roles(*left, pipelines, dependencies)?;
                 let (source, scalar_filter_replaces_probe) = self.attach_nlj_scalar_runtime_filter(
-                    source,
-                    &transforms,
+                    chain.source,
+                    &chain.transforms,
                     handle,
                     &spec,
                     false,
                 );
+                chain.source = source;
                 debug_assert!(!scalar_filter_replaces_probe);
                 if !scalar_filter_replaces_probe {
-                    transforms.push(nlj_probe_transform(handle, &spec));
+                    chain.transforms.push(nlj_probe_transform(handle, &spec));
                 }
-                pending_builds.push(PendingProbeDependency {
+                chain.pending_builds.push(PendingProbeDependency {
                     producer,
                     handle,
                     kind: DependencyKind::BuildBeforeProbe,
                 });
-                Ok((source, transforms, pending_builds))
+                Ok(chain)
             }
             PhysicalNodeKind::SortRangeJoin(spec) => {
                 if needs_nlj_unmatched_source(spec.join_type) {
@@ -805,15 +823,16 @@ impl<'a> PipelineLowerer<'a> {
                 let (producer, handle) =
                     self.lower_sort_range_build(*right, spec, pipelines, dependencies)?;
 
-                let (source, mut transforms, mut pending_builds) =
-                    self.collect_probe_roles(*left, pipelines, dependencies)?;
-                transforms.push(sort_range_probe_transform(handle, spec));
-                pending_builds.push(PendingProbeDependency {
+                let mut chain = self.collect_probe_roles(*left, pipelines, dependencies)?;
+                chain
+                    .transforms
+                    .push(sort_range_probe_transform(handle, spec));
+                chain.pending_builds.push(PendingProbeDependency {
                     producer,
                     handle,
                     kind: DependencyKind::BuildBeforeProbe,
                 });
-                Ok((source, transforms, pending_builds))
+                Ok(chain)
             }
             PhysicalNodeKind::ClassicIeJoin(_) => {
                 self.collect_probe_roles_source_fallback(root, pipelines, dependencies)
@@ -832,15 +851,16 @@ impl<'a> PipelineLowerer<'a> {
                 let (producer, handle) =
                     self.lower_cross_product_build(*right, &spec, pipelines, dependencies)?;
 
-                let (source, mut transforms, mut pending_builds) =
-                    self.collect_probe_roles(*left, pipelines, dependencies)?;
-                transforms.push(cross_product_probe_transform(handle, &spec));
-                pending_builds.push(PendingProbeDependency {
+                let mut chain = self.collect_probe_roles(*left, pipelines, dependencies)?;
+                chain
+                    .transforms
+                    .push(cross_product_probe_transform(handle, &spec));
+                chain.pending_builds.push(PendingProbeDependency {
                     producer,
                     handle,
                     kind: DependencyKind::BuildBeforeProbe,
                 });
-                Ok((source, transforms, pending_builds))
+                Ok(chain)
             }
             PhysicalNodeKind::ExternalTable(_) => {
                 self.collect_probe_roles_source_fallback(root, pipelines, dependencies)
@@ -867,15 +887,42 @@ impl<'a> PipelineLowerer<'a> {
                     Self::is_tail_breaker(kind)
                         || matches!(kind, PhysicalNodeKind::MaterializedCte(_))
                 })? {
-                    let (source, mut transforms, pending_builds) =
+                    let mut chain =
                         self.collect_probe_roles(tail.breaker, pipelines, dependencies)?;
-                    transforms.extend(tail.transforms);
-                    return Ok((source, transforms, pending_builds));
+                    chain.transforms.extend(tail.transforms);
+                    return Ok(chain);
                 }
                 let (source, transforms) = self.collect_linear_roles(root)?;
-                Ok((source, transforms, Vec::new()))
+                Ok(CollectedProbeChain {
+                    source,
+                    transforms,
+                    pending_builds: Vec::new(),
+                    pending_replays: Vec::new(),
+                })
             }
         }
+    }
+}
+
+fn hash_join_spill_replay_source(
+    handle: BreakerHandleId,
+    spec: &HashJoinSpec,
+    probe_types: Box<[LogicalType]>,
+) -> HashJoinSpillReplaySourceSpec {
+    HashJoinSpillReplaySourceSpec {
+        handle,
+        join_type: spec.join_type,
+        anti_join_mode: spec.anti_join_mode,
+        key_conditions: spec.key_conditions.clone(),
+        build_residual_conditions: spec.build_residual_conditions.clone(),
+        probe_residual_count: spec.probe_residual_count,
+        probe_types,
+        build_payload_types: spec.build_payload_types.clone(),
+        build_output_count: spec.build_output_count,
+        left_projection: spec.left_projection.clone(),
+        output_names: spec.output_names.clone(),
+        output_types: spec.output_types.clone(),
+        reduction_cascade: spec.reduction_cascade.clone(),
     }
 }
 

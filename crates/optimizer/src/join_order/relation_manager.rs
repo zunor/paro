@@ -59,6 +59,11 @@ pub struct RelationStats {
     pub column_distinct_count: HashMap<ColumnBinding, DistinctCount>,
     /// Estimated cardinality (row count).
     pub cardinality: usize,
+    /// Risk-adjusted cardinality used only to rank join orders.
+    ///
+    /// This remains separate from `cardinality`: uncertain predicates must
+    /// not rewrite the expected row estimate merely to obtain a robust plan.
+    pub risk_cardinality: usize,
     /// Estimated schema-dependent bytes carried by one row after projection pruning.
     pub estimated_payload_width: usize,
     /// Whether this atomic relation owns a control-region boundary that cannot
@@ -78,6 +83,7 @@ impl RelationStats {
         Self {
             column_distinct_count: HashMap::new(),
             cardinality: 1,
+            risk_cardinality: 1,
             estimated_payload_width: 1,
             contains_control_region: false,
             unique_keys: Vec::new(),
@@ -90,6 +96,7 @@ impl RelationStats {
     pub fn with_cardinality(cardinality: usize) -> Self {
         Self {
             cardinality,
+            risk_cardinality: cardinality,
             stats_initialized: true,
             ..Self::new()
         }

@@ -71,6 +71,26 @@ pub(crate) struct PendingProbeDependency {
     pub(crate) kind: DependencyKind,
 }
 
+/// An alternate source for a hash join embedded in a fused probe chain.
+///
+/// A spillable join can switch to external execution after the pipeline graph
+/// has been lowered. Its initial probe transform then only partitions input;
+/// the rows resume at `transform_offset` when the replay source runs. Keeping
+/// these continuations explicit makes every runtime branch part of the graph
+/// without giving up left-deep probe fusion in the common in-memory case.
+pub(crate) struct PendingHashJoinReplay {
+    pub(crate) source: HashJoinSpillReplaySourceSpec,
+    pub(crate) handle: super::handles::BreakerHandleId,
+    pub(crate) transform_offset: usize,
+}
+
+pub(crate) struct CollectedProbeChain {
+    pub(crate) source: SourceSpec,
+    pub(crate) transforms: Vec<TransformSpec>,
+    pub(crate) pending_builds: Vec<PendingProbeDependency>,
+    pub(crate) pending_replays: Vec<PendingHashJoinReplay>,
+}
+
 pub(crate) struct BreakerProbeSource {
     pub(crate) source: SourceSpec,
     pub(crate) dependencies: Vec<PendingProbeDependency>,

@@ -508,6 +508,17 @@ impl FilterPushdown {
         let mut remaining_filters = Vec::new();
 
         for filter in self.filters.drain(..) {
+            // A MARK join's marker is produced by the join itself, not by
+            // either child.  Treat it as an output barrier before classifying
+            // child ownership: `inner_mark OR this_mark` otherwise appears to
+            // be left-only and is pushed below the operator that creates
+            // `this_mark`, leaving an invalid (and semantically impossible)
+            // plan.  Bare truth tests have already taken the explicit
+            // semi/anti lowering path in `pushdown_mark_join`.
+            if Self::filter_references_join_marker(&cj, &filter) {
+                remaining_filters.push(filter.filter);
+                continue;
+            }
             let side = Self::get_expression_side(&filter.filter, &left_bindings, &right_bindings);
             match side {
                 JoinSide::Left => {
@@ -546,6 +557,27 @@ impl FilterPushdown {
         right_bindings: HashSet<usize>,
     ) -> LogicalOperator {
         self.lower_consumed_exists_marker(&mut cj);
+
+        // Duplicate-elimination metadata changes correlation execution, not
+        // the join's row-preservation semantics. Only an INNER delim join may
+        // accept predicates on either child. SINGLE, LEFT and MARK preserve
+        // the left row when the correlated side has no match, so a predicate
+        // on a right/marker output must remain above that boundary. SEMI and
+        // ANTI expose only left columns and can route every valid consumer
+        // predicate to the preserved side.
+        match cj.join_type {
+            JoinType::Inner => self.pushdown_inner_delim_join(cj, left_bindings, right_bindings),
+            JoinType::Semi | JoinType::Anti => self.pushdown_semi_anti_join(cj),
+            _ => self.pushdown_left_join(cj, left_bindings, right_bindings),
+        }
+    }
+
+    fn pushdown_inner_delim_join(
+        &mut self,
+        mut cj: ComparisonJoin,
+        left_bindings: HashSet<usize>,
+        right_bindings: HashSet<usize>,
+    ) -> LogicalOperator {
         let mut left_pushdown = FilterPushdown::new();
         let mut right_pushdown = FilterPushdown::new();
         let mut left_unsat = false;
@@ -553,6 +585,14 @@ impl FilterPushdown {
         let mut remaining_filters = Vec::new();
 
         for filter in self.filters.drain(..) {
+            // A delim MARK join still produces its marker at the join
+            // boundary. Correlation metadata changes how the right side is
+            // evaluated; it does not make the marker available to either
+            // child.
+            if Self::filter_references_join_marker(&cj, &filter) {
+                remaining_filters.push(filter.filter);
+                continue;
+            }
             let side = Self::get_expression_side(&filter.filter, &left_bindings, &right_bindings);
             match side {
                 JoinSide::Left => {
@@ -598,6 +638,11 @@ impl FilterPushdown {
                 remaining_filters,
             ))
         }
+    }
+
+    fn filter_references_join_marker(join: &ComparisonJoin, filter: &Filter) -> bool {
+        join.mark_index
+            .is_some_and(|mark_index| filter.bindings.contains(&mark_index))
     }
 
     /// Lower a correlated EXISTS marker as soon as its sole consumer is a

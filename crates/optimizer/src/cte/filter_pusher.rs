@@ -53,6 +53,33 @@ impl CTEFilterPusher {
         (plan, changed)
     }
 
+    /// Build the shared-materialization alternative for the root DEFAULT CTE.
+    ///
+    /// Memo invokes this rule for one equivalence group at a time. Restricting
+    /// the mutation to that group's root prevents nested CTE choices from
+    /// being multiplied into the ancestor expression, and changing DEFAULT
+    /// to MATERIALIZED makes the transformation structurally idempotent.
+    pub(crate) fn optimize_default_root_with_change(
+        &mut self,
+        mut plan: LogicalPlan,
+    ) -> (LogicalPlan, bool) {
+        let is_default_root = matches!(
+            &plan.operator,
+            LogicalOperator::MaterializedCTE(cte)
+                if cte.materialized == CTEMaterialize::Default
+        );
+        if !is_default_root {
+            return (plan, false);
+        }
+        let mut infos = HashMap::new();
+        self.find_candidates(&plan.operator, &mut infos);
+        let changed = match &mut plan.operator {
+            LogicalOperator::MaterializedCTE(cte) => self.push_current_cte(cte, &infos),
+            _ => false,
+        };
+        (plan, changed)
+    }
+
     fn find_candidates(
         &self,
         op: &LogicalOperator,
@@ -101,46 +128,7 @@ impl CTEFilterPusher {
             LogicalOperator::MaterializedCTE(cte) => {
                 let mut changed = self.push_filters(&mut cte.cte_query.operator, infos);
                 changed |= self.push_filters(&mut cte.child.operator, infos);
-
-                // Producer-side filtering belongs exclusively to the shared
-                // materialization alternative. Committing a DEFAULT CTE to
-                // this branch prevents a later inlining transformation from
-                // combining the copied producer predicate with the original
-                // consumer predicate. NOT MATERIALIZED is a semantic contract
-                // and must never enter this branch.
-                if cte.materialized == CTEMaterialize::NotMaterialized {
-                    return changed;
-                }
-                let Some(info) = infos.get(&cte.cte_index) else {
-                    return changed;
-                };
-                if !info.all_refs_are_filtered || info.filtered_refs.is_empty() {
-                    return changed;
-                }
-
-                let new_bindings = cte.cte_query.get_column_bindings();
-                let Some(or_expr) = build_or_filter(info, &new_bindings) else {
-                    return changed;
-                };
-                if cte.materialized == CTEMaterialize::Default {
-                    cte.materialized = CTEMaterialize::Materialized;
-                }
-
-                let id = cte.cte_query.id;
-                let stats = cte.cte_query.stats.clone();
-                let cte_query_plan = std::mem::replace(
-                    &mut *cte.cte_query,
-                    LogicalPlan::synthetic(LogicalOperator::DummyScan),
-                );
-                let pushed_plan = FilterPushdown::new().rewrite_plan(LogicalPlan::synthetic(
-                    LogicalOperator::Filter(PlannerFilter::new(cte_query_plan, vec![or_expr])),
-                ));
-                *cte.cte_query = LogicalPlan {
-                    id,
-                    stats,
-                    operator: pushed_plan.operator,
-                };
-                true
+                changed | self.push_current_cte(cte, infos)
             }
             _ => {
                 let mut changed = false;
@@ -151,6 +139,52 @@ impl CTEFilterPusher {
                 changed
             }
         }
+    }
+
+    fn push_current_cte(
+        &self,
+        cte: &mut paro_planner::operator::MaterializedCTE,
+        infos: &HashMap<usize, MaterializedCTEInfo>,
+    ) -> bool {
+        // Producer-side filtering belongs exclusively to the shared
+        // materialization alternative. Committing a DEFAULT CTE to this
+        // branch prevents a later inlining transformation from combining the
+        // copied producer predicate with the original consumer predicate.
+        // NOT MATERIALIZED is a semantic contract and must never enter this
+        // branch.
+        if cte.materialized == CTEMaterialize::NotMaterialized {
+            return false;
+        }
+        let Some(info) = infos.get(&cte.cte_index) else {
+            return false;
+        };
+        if !info.all_refs_are_filtered || info.filtered_refs.is_empty() {
+            return false;
+        }
+
+        let new_bindings = cte.cte_query.get_column_bindings();
+        let Some(or_expr) = build_or_filter(info, &new_bindings) else {
+            return false;
+        };
+        if cte.materialized == CTEMaterialize::Default {
+            cte.materialized = CTEMaterialize::Materialized;
+        }
+
+        let id = cte.cte_query.id;
+        let stats = cte.cte_query.stats.clone();
+        let cte_query_plan = std::mem::replace(
+            &mut *cte.cte_query,
+            LogicalPlan::synthetic(LogicalOperator::DummyScan),
+        );
+        let pushed_plan = FilterPushdown::new().rewrite_plan(LogicalPlan::synthetic(
+            LogicalOperator::Filter(PlannerFilter::new(cte_query_plan, vec![or_expr])),
+        ));
+        *cte.cte_query = LogicalPlan {
+            id,
+            stats,
+            operator: pushed_plan.operator,
+        };
+        true
     }
 }
 
@@ -279,7 +313,12 @@ mod tests {
             ),
         ));
 
-        let optimized = CTEFilterPusher::new().optimize_plan(LogicalPlan::synthetic(plan));
+        let (optimized, changed) =
+            CTEFilterPusher::new().optimize_default_root_with_change(LogicalPlan::synthetic(plan));
+        assert!(changed);
+        let (optimized, changed_again) =
+            CTEFilterPusher::new().optimize_default_root_with_change(optimized);
+        assert!(!changed_again);
         match optimized.operator {
             LogicalOperator::MaterializedCTE(cte) => {
                 assert_eq!(cte.materialized, CTEMaterialize::Materialized);

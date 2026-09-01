@@ -115,8 +115,30 @@ impl<'a> WhereBinder<'a> {
             return None;
         }
 
+        let column_name = colref.column.name();
+        match self
+            .base
+            .binder
+            .bind_context
+            .lookup_local_column(None, column_name)
+        {
+            Ok(Some(_)) => return None,
+            Ok(None) => {}
+            Err(error) => return Some(Err(error)),
+        }
+        match self
+            .base
+            .binder
+            .bind_context
+            .lookup_outer_column(None, column_name)
+        {
+            Ok(Some(_)) => return None,
+            Ok(None) => {}
+            Err(error) => return Some(Err(error)),
+        }
+
         let alias_lookup = self.alias_lookup.as_ref()?;
-        let alias_name = colref.column.name().to_string();
+        let alias_name = column_name.to_string();
         let (index, mut original_expr) = match alias_lookup.resolve_alias(&alias_name) {
             Ok(Some(value)) => value,
             Ok(None) => return None,

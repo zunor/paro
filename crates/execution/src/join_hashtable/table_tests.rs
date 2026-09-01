@@ -645,6 +645,31 @@ fn bigint_pair_build_uses_exact_index_and_preserves_duplicate_chains() {
 }
 
 #[test]
+fn bigint_pair_index_leaves_outer_join_null_keys_unindexed() {
+    let ht = JoinHashTable::new(
+        create_test_buffer_pool(),
+        paro_common::test_utils::test_allocator(),
+        bigint_pair_equality_conditions(),
+        vec![LogicalType::Integer],
+        JoinType::Outer,
+        JoinHashTableConfig::default(),
+    );
+    let keys =
+        chunk_from_optional_i64_columns(&[&[Some(1), None, Some(3)], &[Some(2), Some(2), None]]);
+    let payload = chunk_from_optional_i32(&[Some(10), Some(20), Some(30)]);
+
+    ht.build(&keys, &payload).expect("build nullable pair keys");
+    ht.finalize().expect("finalize nullable pair index");
+
+    assert!(ht.has_pair_integer_index());
+    let probe = chunk_from_optional_i64_columns(&[&[Some(1)], &[Some(2)]]);
+    let mut scan = ht.create_scan_structure().expect("scan state");
+    ht.probe(&probe, &mut scan, None, probe.size())
+        .expect("probe nullable pair index");
+    assert_eq!(scan.count, 1);
+}
+
+#[test]
 fn bigint_pair_index_adapts_to_clustered_build_keys() {
     let ht = JoinHashTable::new(
         create_test_buffer_pool(),

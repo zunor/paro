@@ -34,13 +34,14 @@ use crate::aggregate::{distinct_decomposition, late_payload, singleton_groups};
 use crate::cascades::{
     AlternativeOrigin, CompactRange, LocalOperatorWork, LogicalAlternative,
     MachineCalibrationBundle, MemoBuilder, OpClassId, SearchBudget, SearchCost,
-    GRAPH_REGION_ENUMERATOR_RULE, JOIN_REGION_ENUMERATOR_RULE,
+    GRAPH_REGION_ENUMERATOR_RULE,
 };
 use crate::column::lifetime::ColumnLifetimeAnalyzer;
 use crate::column::remove_unused::RemoveUnusedColumns;
 use crate::context::OptimizationContext;
 use crate::cte::filter_pusher::CTEFilterPusher;
 use crate::cte::inlining::CTEInlining;
+use crate::cte::iteration::normalize_iteration_ownership;
 use crate::expression::in_clause::InClauseRewriter;
 use crate::expression::rewriter::ExpressionRewriter;
 use crate::external::lowering::ExternalRoutineLoweringPass;
@@ -288,11 +289,18 @@ impl Optimizer {
             phase_started.elapsed(),
         );
         let phase_started = Instant::now();
-        let mut join_alternatives = Vec::new();
-        for alternative in &alternatives {
+        // Join enumeration canonicalizes every semantic alternative in place.
+        // The enumerator is itself bounded and retains its input when it
+        // cannot produce a legal complete plan. Treating its successful result
+        // as an optional sibling lets the original SQL FROM order win a cost
+        // tie even when that tree contains avoidable Cartesian products.
+        // Semantic alternatives still compete in Memo; accidental input join
+        // order does not.
+        for alternative in &mut alternatives {
             if !contains_join_region(&alternative.plan) {
                 continue;
             }
+            let source = alternative.source;
             let mut candidate_context = self
                 .ctx
                 .fork_for_candidate(Arc::unwrap_or_clone(alternative.column_stats.clone()));
@@ -307,6 +315,8 @@ impl Optimizer {
                     &candidate_context.column_stats,
                     &candidate_context.bind_context,
                 )?;
+            join_candidate = JoinPredicateNormalizer::new(&candidate_context.bind_context)
+                .optimize_plan(join_candidate)?;
             join_candidate =
                 StatisticsGathering::new().gather(join_candidate, &mut candidate_context)?;
             let mut propagator = StatisticsPropagator::new();
@@ -327,17 +337,8 @@ impl Optimizer {
                 );
                 continue;
             }
-            join_alternatives.push(join_candidate.into_alternative(
-                AlternativeOrigin::Specialized {
-                    rule: JOIN_REGION_ENUMERATOR_RULE,
-                },
-            ));
-            if join_alternatives.len() >= self.budget.max_optional_logical_exprs_per_group as usize
-            {
-                break;
-            }
+            *alternative = join_candidate.into_alternative(source);
         }
-        alternatives.extend(join_alternatives);
         for alternative in &alternatives {
             verify_physical_planner_invariants(&alternative.plan.operator)?;
         }
@@ -759,15 +760,13 @@ impl Optimizer {
         plan = EmptyResultPullup::new().optimize_plan(plan);
         plan = JoinPredicateNormalizer::new(&self.ctx.bind_context).optimize_plan(plan)?;
         plan = InClauseRewriter::new().rewrite(plan)?;
-        if contains_mark_filter_over_cross_product(&plan) {
-            // A MARK boundary can sit between an outer filter and its
-            // comma-join probe. Push safe terms through that boundary, then
-            // canonicalize the newly exposed equality predicate. Restricting
-            // this repair to the blocked shape avoids rewriting independent
-            // recursive/control regions in the same normalization phase.
-            plan = FilterPushdown::new().rewrite_plan(plan);
-            plan = JoinPredicateNormalizer::new(&self.ctx.bind_context).optimize_plan(plan)?;
-        }
+        // Predicate ownership is part of canonical relational semantics, not
+        // a cost alternative. In particular, side-local predicates above a
+        // delim/MARK boundary must reach that side before join normalization;
+        // otherwise comma joins remain executable cross products with a late
+        // filter and can create unbounded intermediates.
+        plan = FilterPushdown::new().rewrite_plan(plan);
+        plan = JoinPredicateNormalizer::new(&self.ctx.bind_context).optimize_plan(plan)?;
         plan = ExternalRoutineLoweringPass::lower(plan, &self.ctx.bind_context)?.plan;
         plan = TopNOptimizer::new().optimize_plan(plan);
         plan = CTEInlining::new(&self.ctx.bind_context)
@@ -796,6 +795,11 @@ impl Optimizer {
     }
 
     fn settle_schema_candidate(&self, mut plan: LogicalPlan) -> Result<CandidatePlan> {
+        // Optional region rewrites and CTE substitution can expose a new
+        // Filter(CrossProduct) boundary after the initial semantic pass. Keep
+        // the Query-IR boundary canonical so equality edges always reach join
+        // enumeration and physical implementation selection.
+        plan = JoinPredicateNormalizer::new(&self.ctx.bind_context).optimize_plan(plan)?;
         // Query-IR output contracts are demand driven. Until every planner
         // operator natively exposes ColumnIds, derive the same canonical
         // demand projection once at the Query IR boundary; this is not an
@@ -806,6 +810,7 @@ impl Optimizer {
     }
 
     fn finalize_query_candidate(&self, mut candidate: CandidatePlan) -> Result<CandidatePlan> {
+        candidate.plan = normalize_iteration_ownership(candidate.plan)?;
         candidate.plan =
             singleton_groups::optimize_plan(candidate.plan, candidate.column_stats.as_ref());
         candidate.plan = ColumnLifetimeAnalyzer::new(true).optimize(candidate.plan)?;
@@ -899,29 +904,6 @@ fn contains_redundant_computation_region(plan: &LogicalPlan) -> bool {
             .children()
             .into_iter()
             .any(contains_redundant_computation_region)
-}
-
-fn contains_mark_filter_over_cross_product(plan: &LogicalPlan) -> bool {
-    fn contains_cross_product(plan: &LogicalPlan) -> bool {
-        matches!(plan.operator, LogicalOperator::Join(Join::Cross(_)))
-            || plan.children().into_iter().any(contains_cross_product)
-    }
-
-    let local = matches!(
-        &plan.operator,
-        LogicalOperator::Filter(filter)
-            if matches!(
-                &filter.child.operator,
-                LogicalOperator::Join(Join::Comparison(join))
-                    if join.join_type == JoinType::Mark
-                        && contains_cross_product(join.left.as_ref())
-            )
-    );
-    local
-        || plan
-            .children()
-            .into_iter()
-            .any(contains_mark_filter_over_cross_product)
 }
 
 fn contains_aggregate(plan: &LogicalPlan) -> bool {

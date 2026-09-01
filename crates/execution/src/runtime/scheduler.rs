@@ -43,6 +43,11 @@ pub struct PipelineScheduler<'a> {
     allocator: Arc<dyn Allocator>,
     handles: Arc<BreakerHandleRegistry>,
     shared_sinks: SharedSinkRuntimeSet,
+    /// A pipeline runtime owns execution-attempt state and is initialized
+    /// exactly once. Ready-queue wave selection may inspect a candidate more
+    /// than once, so discarding a speculative runtime would also discard any
+    /// source state claimed during initialization.
+    runtimes: Vec<Option<Arc<PipelineRuntime>>>,
     gates: PipelineDependencyGates,
     finished: Vec<bool>,
     finished_count: usize,
@@ -109,6 +114,7 @@ impl<'a> PipelineScheduler<'a> {
             allocator,
             handles,
             shared_sinks,
+            runtimes: vec![None; programs.pipeline_count()],
             gates,
             finished: vec![false; programs.pipeline_count()],
             finished_count: 0,
@@ -139,7 +145,7 @@ impl<'a> PipelineScheduler<'a> {
                     "pipeline scheduler dequeued a pipeline before its gates opened",
                 ));
             }
-            let mut candidates = vec![(entry, self.create_runtime(pipeline)?)];
+            let mut candidates = vec![(entry, self.runtime(pipeline)?)];
             while candidates.len() < self.query.session.number_of_threads().max(1) {
                 let Some(entry) = self.ready.pop() else {
                     break;
@@ -153,7 +159,7 @@ impl<'a> PipelineScheduler<'a> {
                         "pipeline scheduler dequeued a pipeline before its gates opened",
                     ));
                 }
-                candidates.push((entry, self.create_runtime(pipeline)?));
+                candidates.push((entry, self.runtime(pipeline)?));
             }
 
             let mut source_capable = 0usize;
@@ -236,7 +242,14 @@ impl<'a> PipelineScheduler<'a> {
         Ok(())
     }
 
-    fn create_runtime(&self, pipeline: PipelineId) -> Result<Arc<PipelineRuntime>> {
+    fn runtime(&mut self, pipeline: PipelineId) -> Result<Arc<PipelineRuntime>> {
+        let slot = self
+            .runtimes
+            .get(pipeline.index())
+            .ok_or_else(|| paro_error::internal("pipeline runtime id is invalid"))?;
+        if let Some(runtime) = slot {
+            return Ok(runtime.clone());
+        }
         let program = self
             .programs
             .get(pipeline)
@@ -250,13 +263,15 @@ impl<'a> PipelineScheduler<'a> {
             SinkSharing::Exclusive => None,
             SinkSharing::Shared(id) => self.shared_sinks.get(id),
         };
-        Ok(Arc::new(PipelineRuntime::with_registry_and_shared_sink(
+        let runtime = Arc::new(PipelineRuntime::with_registry_and_shared_sink(
             program,
             self.handles.clone(),
             self.query.params.clone(),
             self.query.as_ref(),
             shared_sink,
-        )?))
+        )?);
+        self.runtimes[pipeline.index()] = Some(runtime.clone());
+        Ok(runtime)
     }
 
     fn push_ready_pipeline(&mut self, pipeline: PipelineId, dependency_unblocks: u32) {

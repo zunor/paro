@@ -607,6 +607,31 @@ mod tests {
     }
 
     #[test]
+    fn where_input_column_precedes_same_named_select_alias() {
+        let mut binder = test_binder();
+        let bound = binder
+            .bind_statement_kind(parse_statement_sql(
+                "SELECT x AS x FROM (SELECT 1 AS x) t WHERE x = 1",
+            ))
+            .expect("bind statement");
+
+        let BoundStatementKind::Query(query) = bound else {
+            panic!("expected query statement");
+        };
+        let BoundQuery::Select(select) = *query else {
+            panic!("expected bound select");
+        };
+        let Some(crate::expression::Expression::Comparison(comparison)) = select.where_clause
+        else {
+            panic!("expected comparison predicate");
+        };
+        assert!(matches!(
+            comparison.left.as_ref(),
+            crate::expression::Expression::ColumnRef(_)
+        ));
+    }
+
+    #[test]
     fn where_clause_does_not_lowercase_match_quoted_aliases() {
         let mut binder = test_binder();
         let err = binder
@@ -616,6 +641,18 @@ mod tests {
             .expect_err("quoted alias should require exact spelling");
 
         assert!(err.to_string().contains("Column not found: id"));
+    }
+
+    #[test]
+    fn unquoted_relation_aliases_are_case_folded() {
+        let mut binder = test_binder();
+        binder
+            .bind_statement_kind(parse_statement_sql(
+                "SELECT catalog.return_rank \
+                 FROM (SELECT rank() OVER (ORDER BY x) AS return_rank \
+                       FROM (VALUES (1), (2)) t(x)) CATALOG",
+            ))
+            .expect("unquoted aliases have one case-insensitive SQL identity");
     }
 
     #[test]

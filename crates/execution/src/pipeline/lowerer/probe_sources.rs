@@ -120,7 +120,7 @@ impl PipelineLowerer<'_> {
         root: PhysicalPlanNodeId,
         pipelines: &mut Vec<PipelineSpec>,
         dependencies: &mut Vec<PipelineDependency>,
-    ) -> Result<(SourceSpec, Vec<TransformSpec>, Vec<PendingProbeDependency>)> {
+    ) -> Result<CollectedProbeChain> {
         let output = self.plan.node(root).output.clone();
         let handle = self.handles.register(
             BreakerHandleKind::Materialized,
@@ -137,15 +137,16 @@ impl PipelineLowerer<'_> {
         )?;
         self.handles.set_producer(handle, producer)?;
         let source = SourceSpec::Materialized(MaterializedSourceSpec { handle });
-        Ok((
+        Ok(CollectedProbeChain {
             source,
-            Vec::new(),
-            vec![PendingProbeDependency {
+            transforms: Vec::new(),
+            pending_builds: vec![PendingProbeDependency {
                 producer,
                 handle,
                 kind: DependencyKind::MaterializeBeforeRead,
             }],
-        ))
+            pending_replays: Vec::new(),
+        })
     }
 }
 
@@ -216,22 +217,31 @@ fn can_push_hash_join_runtime_filter(join_type: JoinType) -> bool {
 /// Trace a downstream join-key reference back to the rowset source.
 ///
 /// A chained inner/semi hash probe emits its projected left columns before
-/// any build payload, so a reference inside `left_projection` has exact
-/// lineage to the preceding transform. Other transforms are deliberate
-/// barriers: crossing one would require its own expression-lineage proof and
-/// could move a dynamic predicate across a limit or volatile expression.
+/// any build payload, and a passthrough projection preserves the referenced
+/// source column exactly. Other transforms are deliberate barriers: crossing
+/// one would require its own expression-lineage proof and could move a dynamic
+/// predicate across a limit or volatile expression.
 fn trace_probe_reference_to_source(
     mut reference_index: usize,
     transforms: &[TransformSpec],
 ) -> Option<usize> {
     for transform in transforms.iter().rev() {
-        let TransformSpec::HashJoinProbe(probe) = transform else {
-            return None;
-        };
-        if !matches!(probe.join_type, JoinType::Inner | JoinType::Semi) {
-            return None;
+        match transform {
+            TransformSpec::HashJoinProbe(probe) => {
+                if !matches!(probe.join_type, JoinType::Inner | JoinType::Semi) {
+                    return None;
+                }
+                reference_index = *probe.left_projection.get(reference_index)?;
+            }
+            TransformSpec::Project(project) => {
+                let Expression::Reference(reference) = project.expressions.get(reference_index)?
+                else {
+                    return None;
+                };
+                reference_index = reference.index;
+            }
+            _ => return None,
         }
-        reference_index = *probe.left_projection.get(reference_index)?;
     }
     Some(reference_index)
 }

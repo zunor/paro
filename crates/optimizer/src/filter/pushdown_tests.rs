@@ -554,6 +554,73 @@ fn positive_mark_filter_lowers_mark_join_to_semi_join() {
 }
 
 #[test]
+fn compound_marker_predicate_stays_above_the_join_that_produces_it() {
+    for delim in [false, true] {
+        let ctx = BindContext::new();
+        let inner_mark_index = 90;
+        let mut inner = ComparisonJoin::new(
+            JoinType::Mark,
+            plan(&ctx, make_get(0)),
+            plan(&ctx, make_get(1)),
+            vec![JoinCondition::new(
+                make_column_ref(0, 0),
+                make_column_ref(1, 0),
+                JoinComparisonType::Equal,
+            )],
+        );
+        inner.mark_index = Some(inner_mark_index);
+
+        let outer_mark_index = 91;
+        let mut outer = ComparisonJoin::new(
+            JoinType::Mark,
+            plan(&ctx, LogicalOperator::Join(Join::Comparison(inner))),
+            plan(&ctx, make_get(2)),
+            vec![JoinCondition::new(
+                make_column_ref(0, 0),
+                make_column_ref(2, 0),
+                JoinComparisonType::Equal,
+            )],
+        );
+        outer.mark_index = Some(outer_mark_index);
+        if delim {
+            outer.duplicate_eliminated_columns = vec![make_column_ref(0, 0)];
+        }
+
+        let marker = |table_index| {
+            Expression::ColumnRef(ColumnRefExpression::new(
+                ColumnBinding::new(table_index, 0),
+                LogicalType::Boolean,
+            ))
+        };
+        let predicate = Expression::Conjunction(ConjunctionExpression::new(
+            ConjunctionType::Or,
+            vec![marker(inner_mark_index), marker(outer_mark_index)],
+        ));
+        let filter = PlannerFilter::new(
+            plan(&ctx, LogicalOperator::Join(Join::Comparison(outer))),
+            vec![predicate],
+        );
+
+        let result = FilterPushdown::new().rewrite(LogicalOperator::Filter(filter));
+
+        let LogicalOperator::Filter(filter) = result else {
+            panic!("compound marker predicate must remain above its producer");
+        };
+        let LogicalOperator::Join(Join::Comparison(outer)) = filter.child.operator else {
+            panic!("expected outer MARK join");
+        };
+        assert_eq!(outer.join_type, JoinType::Mark);
+        assert_eq!(outer.mark_index, Some(outer_mark_index));
+        assert!(outer
+            .get_column_bindings(
+                &outer.left.get_column_bindings(),
+                &outer.right.get_column_bindings(),
+            )
+            .contains(&ColumnBinding::new(outer_mark_index, 0)));
+    }
+}
+
+#[test]
 fn negative_scalar_mark_filter_lowers_to_null_aware_anti_join() {
     let ctx = BindContext::new();
     let mut join = ComparisonJoin::new(
@@ -781,7 +848,7 @@ fn test_pushdown_preserves_delim_join_shape() {
 }
 
 #[test]
-fn test_pushdown_rhs_conflict_materializes_empty_result_inside_delim_subtree() {
+fn single_delim_join_keeps_right_output_predicate_above_row_preserving_boundary() {
     let ctx = BindContext::new();
     let left = plan(&ctx, make_get(0));
     let rhs_base = LogicalOperator::Filter(PlannerFilter::new(
@@ -809,7 +876,7 @@ fn test_pushdown_rhs_conflict_materializes_empty_result_inside_delim_subtree() {
         )],
     )));
     let mut join = ComparisonJoin::new(
-        JoinType::Mark,
+        JoinType::Single,
         left,
         plan(&ctx, rhs),
         vec![JoinCondition::new(
@@ -830,12 +897,14 @@ fn test_pushdown_rhs_conflict_materializes_empty_result_inside_delim_subtree() {
     );
     let result = FilterPushdown::new().rewrite(LogicalOperator::Filter(filter));
 
-    match result {
-        LogicalOperator::Join(Join::Comparison(join)) => {
-            assert!(contains_empty_result(&join.right));
-        }
-        _ => panic!("expected join with empty result in rhs subtree"),
-    }
+    let LogicalOperator::Filter(filter) = result else {
+        panic!("right-output predicate must remain above SINGLE delim join");
+    };
+    let LogicalOperator::Join(Join::Comparison(join)) = filter.child.operator else {
+        panic!("expected SINGLE delim join below filter");
+    };
+    assert_eq!(join.join_type, JoinType::Single);
+    assert!(!contains_empty_result(&join.right));
 }
 
 #[test]

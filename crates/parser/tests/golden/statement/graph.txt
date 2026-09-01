@@ -12,7 +12,7 @@ CREATE PROPERTY GRAPH IF NOT EXISTS social_graph
       PROPERTIES NONE
   )
 ---------- Output ---------
-CREATE PROPERTY GRAPH IF NOT EXISTS social_graph VERTEX TABLES (person AS p KEY (id) LABEL Person PROPERTIES (name AS person_name, age), company KEY (id) PROPERTIES ALL) EDGE TABLES (knows AS k KEY (id) SOURCE KEY (src_id) REFERENCES person (id) DESTINATION KEY (dst_id) REFERENCES person (id) LABEL Knows PROPERTIES NONE)
+CREATE PROPERTY GRAPH IF NOT EXISTS social_graph VERTEX TABLES (person AS p KEY (id) LABEL person PROPERTIES (name AS person_name, age), company KEY (id) PROPERTIES ALL) EDGE TABLES (knows AS k KEY (id) SOURCE KEY (src_id) REFERENCES person (id) DESTINATION KEY (dst_id) REFERENCES person (id) LABEL knows PROPERTIES NONE)
 ---------- AST ------------
 CreatePropertyGraph(
     CreatePropertyGraphStmt {
@@ -62,7 +62,7 @@ CreatePropertyGraph(
                         span: Some(
                             98..104,
                         ),
-                        name: "Person",
+                        name: "person",
                         quote: None,
                         ident_type: None,
                     },
@@ -234,7 +234,7 @@ CreatePropertyGraph(
                         span: Some(
                             339..344,
                         ),
-                        name: "Knows",
+                        name: "knows",
                         quote: None,
                         ident_type: None,
                     },

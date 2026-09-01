@@ -523,9 +523,18 @@ fn bind_decimal_arithmetic(
     };
     let left = left.normalize_type();
     let right = right.normalize_type();
-    if !matches!(&left, LogicalType::Decimal { .. })
-        && !matches!(&right, LogicalType::Decimal { .. })
-    {
+    // HUGEINT is the exact accumulator domain of SUM(BIGINT). Keep arithmetic
+    // over that domain in the checked decimal engine instead of falling back
+    // to DOUBLE merely because the fixed numeric registry stops at BIGINT.
+    // This preserves integer exactness for expressions such as
+    // `sum(x) + sum(y)` and lets subsequent decimal factors stay exact.
+    let uses_wide_exact_domain = |ty: &LogicalType| {
+        matches!(
+            ty,
+            LogicalType::Decimal { .. } | LogicalType::HugeInt | LogicalType::UHugeInt
+        )
+    };
+    if !uses_wide_exact_domain(&left) && !uses_wide_exact_domain(&right) {
         return Err(paro_error::function_not_found(format!(
             "decimal arithmetic with arguments {arguments:?}"
         )));
@@ -571,6 +580,23 @@ fn bind_decimal_arithmetic(
                 },
             ),
         };
+        return Ok((function, vec![LogicalType::Double, LogicalType::Double]));
+    }
+
+    if op == DecimalArithmeticOp::Div {
+        // A quotient can require an unbounded fractional expansion. Paro's
+        // fixed DECIMAL(38, s) domain cannot represent that result while also
+        // preserving the operands' full integral range. Bind division to the
+        // approximate numeric domain instead of silently truncating to an
+        // arbitrary fixed scale or manufacturing overflow for valid inputs.
+        let function = ScalarFunction::new(
+            decimal_op_name(op).to_string(),
+            vec![LogicalType::Double, LogicalType::Double],
+            LogicalType::Double,
+            |chunk, _state, result| {
+                execute_nullable_binary_numeric::<f64, DivOperator>(chunk, result)
+            },
+        );
         return Ok((function, vec![LogicalType::Double, LogicalType::Double]));
     }
 
@@ -638,10 +664,7 @@ fn decimal_result_type(
                 scale,
             )
         }
-        DecimalArithmeticOp::Div => {
-            let scale = left_scale.saturating_add(right_scale).max(6).min(18);
-            (38, scale)
-        }
+        DecimalArithmeticOp::Div => unreachable!("decimal division binds to DOUBLE"),
     };
     LogicalType::Decimal {
         precision: precision.max(1),
@@ -1542,6 +1565,50 @@ mod tests {
 
         assert_eq!(target_types, vec![LogicalType::Double, LogicalType::Double]);
         assert_eq!(function.return_type, LogicalType::Double);
+    }
+
+    #[test]
+    fn decimal_division_uses_the_fractional_double_domain() {
+        let mut set = ScalarFunctionSet::new("/".to_string());
+        register_arithmetic_functions(&mut set);
+
+        let (function, target_types) = set
+            .bind(&[
+                LogicalType::Decimal {
+                    precision: 38,
+                    scale: 2,
+                },
+                LogicalType::Decimal {
+                    precision: 38,
+                    scale: 2,
+                },
+            ])
+            .unwrap();
+
+        assert_eq!(target_types, vec![LogicalType::Double, LogicalType::Double]);
+        assert_eq!(function.return_type, LogicalType::Double);
+    }
+
+    #[test]
+    fn hugeint_arithmetic_uses_the_checked_exact_domain() {
+        let mut set = ScalarFunctionSet::new("+".to_string());
+        register_arithmetic_functions(&mut set);
+
+        let (function, target_types) = set
+            .bind(&[LogicalType::HugeInt, LogicalType::HugeInt])
+            .unwrap();
+
+        assert_eq!(
+            target_types,
+            vec![LogicalType::HugeInt, LogicalType::HugeInt]
+        );
+        assert_eq!(
+            function.return_type,
+            LogicalType::Decimal {
+                precision: 38,
+                scale: 0
+            }
+        );
     }
 
     #[test]

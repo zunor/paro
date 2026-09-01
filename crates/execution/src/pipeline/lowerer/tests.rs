@@ -1169,7 +1169,9 @@ fn projection_above_hash_join_plan() -> crate::physical::PhysicalPlan {
     extractor.extract(&project).unwrap()
 }
 
-fn left_deep_hash_join_plan() -> crate::physical::PhysicalPlan {
+fn left_deep_hash_join_plan_with_context(
+    extraction: ExtractionContext,
+) -> crate::physical::PhysicalPlan {
     let ctx = BindContext::new();
     let make_values = |table_index, key: &str, value: &str| {
         LogicalPlan::new(
@@ -1200,7 +1202,7 @@ fn left_deep_hash_join_plan() -> crate::physical::PhysicalPlan {
         LogicalOperator::Join(Join::comparison(JoinType::Inner, ab, c, vec![condition()])),
     );
 
-    let mut extractor = PhysicalPlanExtractor::new(ExtractionContext::default());
+    let mut extractor = PhysicalPlanExtractor::new(extraction);
     extractor.extract(&abc).unwrap()
 }
 

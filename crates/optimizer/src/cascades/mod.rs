@@ -44,7 +44,7 @@ pub use memo::{Memo, OptimizationGoal, Winner};
 pub use planner::{
     AlternativeOrigin, LogicalAlternative, MemoBuilder, OptimizationInput, OptimizationOutput,
     OptimizedVariant, ResultPresentation, SearchSummary, GRAPH_REGION_ENUMERATOR_RULE,
-    JOIN_REGION_ENUMERATOR_RULE, SEARCH_REGION_ENUMERATOR_RULE,
+    SEARCH_REGION_ENUMERATOR_RULE,
 };
 pub use properties::{ProvidedProperties, RequiredProperties};
 pub use region::{

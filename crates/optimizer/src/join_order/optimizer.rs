@@ -8,13 +8,15 @@ use std::sync::Arc;
 
 use paro_catalog::entry::ConstraintType;
 use paro_common::error::Result;
+use paro_common::runtime_value::Value;
 use paro_context::StatementContext;
 use paro_planner::binder::context::BindContext;
 use paro_planner::binder::deep_copy::{
     duplicate_operator_preserving_indices, duplicate_plan_preserving_indices,
 };
 use paro_planner::expression::{
-    ComparisonType, ConjunctionExpression, ConjunctionType, Expression,
+    ComparisonType, ConjunctionExpression, ConjunctionType, Expression, ExpressionIterator,
+    OperatorType,
 };
 use paro_planner::operator::{
     ColumnBinding, ComparisonJoin, CrossProduct, Filter, Join, JoinComparisonType, JoinCondition,
@@ -26,6 +28,7 @@ use paro_storage::statistics::{ColumnStatistics, NumericStats};
 use crate::cost_model::CostModel as LogicalCostModel;
 use crate::join_order::cost_model::{CostModel, DPJoinNode};
 use crate::join_order::enumerator::{EnumerationOutcome, PlanEnumerator};
+use crate::join_order::predicate_inference::infer_equality_constants;
 use crate::join_order::query_graph::{FilterInfo, JoinEdgeOrientation, QueryGraphEdges};
 use crate::join_order::relation::{JoinRelationSet, JoinRelationSetManager};
 use crate::join_order::relation_manager::{
@@ -41,6 +44,34 @@ fn integral_domain_cardinality(stats: &ColumnStatistics) -> Option<usize> {
     let minimum = integral_ordinal(&minimum)?;
     let maximum = integral_ordinal(&maximum)?;
     usize::try_from(maximum.checked_sub(minimum)?.checked_add(1)?).ok()
+}
+
+/// Whether a predicate's selectivity has no bounded frequency model.
+///
+/// A wildcard LIKE/ILIKE estimate describes pattern shape, not the value
+/// distribution of the stored strings. Join enumeration therefore keeps its
+/// point estimate for annotations but prices the predicate with a wider risk
+/// cardinality. Exact patterns remain equality-shaped and do not need this
+/// widening.
+fn has_open_ended_selectivity(expression: &Expression) -> bool {
+    if let Expression::Operator(operator) = expression {
+        if matches!(
+            operator.operator_type,
+            OperatorType::Like | OperatorType::ILike
+        ) {
+            return !matches!(
+                operator.children.get(1),
+                Some(Expression::Constant(constant))
+                    if matches!(&constant.value, Value::Varchar(pattern) if !pattern.contains('%') && !pattern.contains('_') && !pattern.contains('\\'))
+            );
+        }
+    }
+
+    let mut found = false;
+    ExpressionIterator::enumerate_children(expression, |child| {
+        found |= has_open_ended_selectivity(child);
+    });
+    found
 }
 
 fn declared_unique_keys(plan: &LogicalPlan) -> Vec<Vec<ColumnBinding>> {
@@ -189,12 +220,7 @@ impl JoinOrderOptimizer {
         bind_context: &BindContext,
     ) -> Result<LogicalPlan> {
         self.column_stats = column_stats.clone();
-        plan.try_fold_post_order(|plan, child_states: Vec<bool>| {
-            let contains_control_region_reference = child_states.into_iter().any(|state| state)
-                || matches!(plan.operator, LogicalOperator::CTERef(_));
-            self.optimize_current_plan(ctx, bind_context, plan, contains_control_region_reference)
-        })
-        .map(|(plan, _)| plan)
+        plan.try_map_post_order(|plan| self.optimize_current_plan(ctx, bind_context, plan))
     }
 
     /// Keep join-graph extraction and reconstruction isolated from the
@@ -205,34 +231,23 @@ impl JoinOrderOptimizer {
         ctx: &StatementContext,
         bind_context: &BindContext,
         plan: LogicalPlan,
-        contains_control_region_reference: bool,
-    ) -> Result<(LogicalPlan, bool)> {
-        if self.can_optimize_join(&plan.operator, contains_control_region_reference) {
+    ) -> Result<LogicalPlan> {
+        if self.can_optimize_join(&plan.operator) {
             if let Some(mut optimized) = self.optimize_join_tree(
                 ctx,
                 bind_context,
                 duplicate_plan_preserving_indices(&plan, bind_context.shared().as_ref()),
             )? {
                 optimized.id = plan.id;
-                return Ok((optimized, contains_control_region_reference));
+                return Ok(optimized);
             }
         }
 
-        Ok((plan, contains_control_region_reference))
+        Ok(plan)
     }
 
     /// Check if a join can be optimized.
-    fn can_optimize_join(
-        &self,
-        plan: &LogicalOperator,
-        contains_control_region_reference: bool,
-    ) -> bool {
-        // A CTE reference is bound to the control region that owns its runtime
-        // state. It is therefore a join-reordering boundary, not an ordinary
-        // relation leaf.
-        if contains_control_region_reference {
-            return false;
-        }
+    fn can_optimize_join(&self, plan: &LogicalOperator) -> bool {
         match plan {
             LogicalOperator::Join(join) => RelationManager::join_is_reorderable(join),
             // SQL comma joins arrive here as Filter(CrossProduct). The filter
@@ -243,7 +258,7 @@ impl JoinOrderOptimizer {
                     .expressions
                     .iter()
                     .any(|expression| expression.evaluation_properties().is_reorder_fence())
-                    && self.can_optimize_join(&filter.child.operator, false)
+                    && self.can_optimize_join(&filter.child.operator)
             }
             _ => false,
         }
@@ -282,13 +297,17 @@ impl JoinOrderOptimizer {
             return Ok(None);
         };
         let filter_infos = extracted_predicates.graph_filters;
+        let inferred_filters =
+            infer_equality_constants(&filter_infos, &self.relation_manager, &mut self.set_manager);
         self.apply_relation_local_selectivity(&filter_infos);
-        self.filter_infos = filter_infos.clone();
+        self.filter_infos = filter_infos
+            .iter()
+            .cloned()
+            .chain(inferred_filters)
+            .collect();
 
         // Initialize cardinality estimator
-        self.cost_model
-            .cardinality_estimator
-            .init_equivalent_relations(&filter_infos);
+        self.cost_model.init_equivalent_relations(&filter_infos);
 
         // Build query graph
         for filter_info in &filter_infos {
@@ -401,12 +420,33 @@ impl JoinOrderOptimizer {
             let Some(relation) = self.relation_manager.get_relation_mut(relation_id) else {
                 continue;
             };
+            let base_cardinality = relation.stats.cardinality as u64;
             let estimate = cost_model.estimate_filter_cardinality(
-                relation.stats.cardinality as u64,
+                base_cardinality,
                 &expressions,
                 &self.column_stats,
             );
             relation.stats.cardinality = estimate.expected.max(1) as usize;
+            let stable_expressions = expressions
+                .iter()
+                .filter(|expression| !has_open_ended_selectivity(expression))
+                .cloned()
+                .collect::<Vec<_>>();
+            let risk_upper = if stable_expressions.len() == expressions.len() {
+                estimate.expected
+            } else {
+                cost_model
+                    .estimate_filter_cardinality(
+                        base_cardinality,
+                        &stable_expressions,
+                        &self.column_stats,
+                    )
+                    .expected
+            };
+            relation.stats.risk_cardinality = estimate
+                .expected
+                .saturating_add(risk_upper.saturating_sub(estimate.expected) / 2)
+                .max(1) as usize;
             for distinct in relation.stats.column_distinct_count.values_mut() {
                 // Both observed HLL values and synthetic NDV upper bounds are
                 // domains of the filtered relation. Neither can exceed its
@@ -1171,6 +1211,40 @@ mod tests {
     }
 
     #[test]
+    fn wildcard_string_predicates_are_open_ended_for_join_costing() {
+        let string_column = Expression::ColumnRef(ColumnRefExpression::new(
+            ColumnBinding::new(7, 0),
+            LogicalType::Varchar,
+        ));
+        let predicate = |operator_type, pattern: &str| {
+            Expression::Operator(OperatorExpression::new(
+                operator_type,
+                vec![
+                    string_column.clone(),
+                    Expression::Constant(ConstantExpression::new(
+                        Value::Varchar(pattern.to_string()),
+                        LogicalType::Varchar,
+                    )),
+                ],
+                LogicalType::Boolean,
+            ))
+        };
+
+        assert!(has_open_ended_selectivity(&predicate(
+            OperatorType::ILike,
+            "%needle%"
+        )));
+        assert!(has_open_ended_selectivity(&predicate(
+            OperatorType::Like,
+            "prefix%"
+        )));
+        assert!(!has_open_ended_selectivity(&predicate(
+            OperatorType::Like,
+            "exact"
+        )));
+    }
+
+    #[test]
     fn persisted_composite_key_reaches_joint_domain_estimation() {
         static NEXT_META_ROOT: AtomicU64 = AtomicU64::new(0);
         let root = std::env::temp_dir().join(format!(
@@ -1405,7 +1479,7 @@ mod tests {
         let predicate = volatile_boolean();
         let plan =
             LogicalOperator::Filter(Filter::new(cross_product(0, 1), vec![predicate.clone()]));
-        assert!(!JoinOrderOptimizer::new().can_optimize_join(&plan, false));
+        assert!(!JoinOrderOptimizer::new().can_optimize_join(&plan));
 
         let optimized = JoinOrderOptimizer::new()
             .optimize(&make_test_session(), &BindContext::new(), plan)
@@ -1425,7 +1499,7 @@ mod tests {
             LogicalPlan::synthetic(create_scan(1)),
             vec![join_condition(JoinComparisonType::Equal, 0, 1)],
         )));
-        assert!(!JoinOrderOptimizer::new().can_optimize_join(&surrounding_join, false));
+        assert!(!JoinOrderOptimizer::new().can_optimize_join(&surrounding_join));
 
         let volatile_preserved = LogicalPlan::synthetic(LogicalOperator::Filter(Filter::new(
             LogicalPlan::synthetic(create_scan(0)),
@@ -1444,7 +1518,7 @@ mod tests {
     }
 
     #[test]
-    fn filtered_cte_join_is_not_reordered_out_of_its_control_region() {
+    fn filtered_cte_join_is_reordered_as_an_atomic_relation() {
         let cte_ref = LogicalPlan::synthetic(LogicalOperator::CTERef(
             paro_planner::operator::CTERef::new(
                 12,
@@ -1469,7 +1543,15 @@ mod tests {
             )],
         ));
 
-        assert!(!JoinOrderOptimizer::new().can_optimize_join(&plan, true));
+        let session = make_test_session();
+        let bind_context = BindContext::new();
+        let optimized = JoinOrderOptimizer::new()
+            .optimize(&session, &bind_context, plan)
+            .unwrap();
+        assert!(matches!(
+            optimized,
+            LogicalOperator::Join(Join::Comparison(_))
+        ));
     }
 
     #[test]
@@ -1573,7 +1655,7 @@ mod tests {
             vec![join_condition(JoinComparisonType::Equal, 0, 1)],
         )));
 
-        assert!(optimizer.can_optimize_join(&plan, false));
+        assert!(optimizer.can_optimize_join(&plan));
 
         let bind_context = BindContext::new();
         let optimized = optimizer.optimize(&session, &bind_context, plan).unwrap();
@@ -1776,7 +1858,7 @@ mod tests {
         let mut filters = Vec::new();
 
         assert!(
-            !optimizer.can_optimize_join(&plan.operator, false),
+            !optimizer.can_optimize_join(&plan.operator),
             "a role-less root reduction must stop before graph extraction"
         );
 

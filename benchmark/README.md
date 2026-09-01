@@ -44,6 +44,10 @@ make -C benchmark ping
 
 ## Quick Start
 
+For the external optimizer-correctness repositories and the mandatory JOB →
+CEB → TPC-DS → TPC-H → LDBC SNB BI sequence, see
+[`CORPORA.md`](CORPORA.md).
+
 Run all workloads:
 
 ```bash

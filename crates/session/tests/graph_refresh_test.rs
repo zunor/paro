@@ -114,15 +114,15 @@ async fn refresh_property_graph_publishes_edge_delta() {
         snapshot
             .generation()
             .committed_edge_deltas
-            .contains_key("Knows"),
+            .contains_key("knows"),
         "edge-only refresh should publish committed delta"
     );
-    assert_eq!(snapshot.statistics().edge_count("Knows"), Some(6));
-    assert_eq!(snapshot.statistics().vertex_count("Person"), Some(6));
+    assert_eq!(snapshot.statistics().edge_count("knows"), Some(6));
+    assert_eq!(snapshot.statistics().vertex_count("person"), Some(6));
     assert_eq!(
         snapshot
             .statistics()
-            .pattern_step_count("Person", "Knows", "Person"),
+            .pattern_step_count("person", "knows", "person"),
         Some(6)
     );
 
@@ -226,7 +226,7 @@ async fn refresh_property_graph_rebuilds_on_vertex_change() {
     assert_eq!(
         snapshot
             .base()
-            .vertex_map("Person")
+            .vertex_map("person")
             .expect("person vertex map")
             .num_vertices(),
         4
@@ -327,7 +327,7 @@ async fn refresh_property_graph_compacts_large_delta() {
     assert_eq!(
         snapshot
             .base()
-            .forward_csr("Knows")
+            .forward_csr("knows")
             .expect("knows csr")
             .num_edges(),
         7

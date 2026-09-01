@@ -331,14 +331,15 @@ fn reduced_direct_decimal_program_promotes_batch_totals_beyond_i128() {
     assert_eq!(average.count, 3);
 }
 
-unsafe fn finalize_single<T>(state: &mut T, data: &DecimalAggregateBindData) -> Result<Vector> {
+unsafe fn finalize_single<T>(
+    state: &mut T,
+    data: &DecimalAggregateBindData,
+    result_type: LogicalType,
+) -> Result<Vector> {
     let mut states = paro_common::test_utils::test_vector(LogicalType::BigInt);
     states.set_count(1);
     *states.flat_data_mut::<*mut u8>() = state as *mut T as *mut u8;
-    let mut result = paro_common::test_utils::test_vector(LogicalType::Decimal {
-        precision: data.output_precision,
-        scale: data.output_scale,
-    });
+    let mut result = paro_common::test_utils::test_vector(result_type);
     result.set_count(1);
     let mut arena = ArenaAllocator::new(Arc::new(default_allocator()));
     let input_data = AggregateInputData::new(
@@ -394,13 +395,7 @@ fn decimal_aggregate_binding_preserves_exact_result_shapes() {
     );
 
     let (avg, _) = bind_avg(&[input]).unwrap();
-    assert_eq!(
-        avg.return_type,
-        LogicalType::Decimal {
-            precision: 38,
-            scale: 6
-        }
-    );
+    assert_eq!(avg.return_type, LogicalType::Double);
 
     let (wide_sum, _) = bind_sum(&[LogicalType::Decimal {
         precision: 38,
@@ -414,13 +409,7 @@ fn decimal_aggregate_binding_preserves_exact_result_shapes() {
         scale: 0,
     }])
     .unwrap();
-    assert_eq!(
-        wide_avg.return_type,
-        LogicalType::Decimal {
-            precision: 38,
-            scale: 0
-        }
-    );
+    assert_eq!(wide_avg.return_type, LogicalType::Double);
 }
 
 #[test]
@@ -456,7 +445,17 @@ fn decimal_sum_reports_declared_precision_overflow() {
     let mut state = initialized_sum_state();
     state.set_i128(10_i128.pow(38));
 
-    let error = unsafe { finalize_single(&mut state, &data) }.unwrap_err();
+    let error = unsafe {
+        finalize_single(
+            &mut state,
+            &data,
+            LogicalType::Decimal {
+                precision: data.output_precision,
+                scale: data.output_scale,
+            },
+        )
+    }
+    .unwrap_err();
     assert!(error
         .to_string()
         .contains("Decimal SUM result exceeds precision 38"));
@@ -835,6 +834,6 @@ fn decimal_avg_uses_wide_accumulator_before_division() {
     assert!(state.wide);
     assert!(state.value() > i256::from(i128::MAX));
 
-    let result = unsafe { finalize_single(&mut state, &data) }.unwrap();
-    assert_eq!(unsafe { result.get_fixed::<i128>(0) }, input);
+    let result = unsafe { finalize_single(&mut state, &data, LogicalType::Double) }.unwrap();
+    assert_eq!(unsafe { result.get_fixed::<f64>(0) }, input as f64);
 }

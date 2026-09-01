@@ -343,17 +343,21 @@ pub(super) fn stage_transformed_expression(
                 );
                 facet.priority = 2_000 + RegionFacetKind::RuntimeFilter as u16;
                 let fingerprint = facet.fingerprint;
+                // Publish the tentative ownership before normalization.  If
+                // this optional facet makes the forest exceed its structural
+                // bound, the common dropped-facet path can now disable both
+                // the facet and its implementation atomically.  Leaving the
+                // implementation enabled with `None` ownership would admit a
+                // physical artifact that no region can prove.
+                state
+                    .metadata
+                    .get_mut(&payload)
+                    .ok_or_else(|| {
+                        paro_error::internal("dynamic runtime-filter payload disappeared")
+                    })?
+                    .runtime_filter_region_facet = Some(fingerprint);
                 let dropped = memo.upsert_region_facet(facet)?;
                 disable_dropped_runtime_filter_facets(state, &dropped)?;
-                if !dropped.contains(&fingerprint) {
-                    state
-                        .metadata
-                        .get_mut(&payload)
-                        .ok_or_else(|| {
-                            paro_error::internal("dynamic runtime-filter payload disappeared")
-                        })?
-                        .runtime_filter_region_facet = Some(fingerprint);
-                }
             }
             None
         };

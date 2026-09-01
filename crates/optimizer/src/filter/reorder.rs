@@ -30,11 +30,16 @@ impl ReorderFilter {
             changed |= child_changed;
             Ok(child)
         })?;
-        let (plan, node_changed) = self.rewrite_current(plan, ctx);
+        let (plan, node_changed) = self.reorder_node(plan, ctx);
         Ok((plan, changed || node_changed))
     }
 
-    fn rewrite_current(
+    /// Reorder predicates owned by this node without rewriting descendants.
+    ///
+    /// Memo exploration invokes transformations per equivalence group, so a
+    /// rule applied to one Filter must not manufacture the Cartesian product
+    /// of every independently reorderable descendant Filter.
+    pub(crate) fn reorder_node(
         &mut self,
         plan: LogicalPlan,
         ctx: &OptimizationContext,
@@ -214,6 +219,51 @@ mod tests {
         };
         assert!(filter.expressions[0].equals(&equality_predicate));
         assert!(filter.expressions[1].equals(&range_predicate));
+    }
+
+    #[test]
+    fn node_reordering_does_not_rewrite_descendant_filters() {
+        let bind_context = BindContext::new();
+        let range_predicate = comparison(
+            ComparisonType::GreaterThan,
+            int_column(0, 0),
+            int_constant(10),
+        );
+        let equality_predicate =
+            comparison(ComparisonType::Equal, int_column(0, 0), int_constant(42));
+        let child = LogicalPlan::new(
+            &bind_context,
+            LogicalOperator::Filter(Filter::new(
+                integer_get(&bind_context, 0),
+                vec![range_predicate.clone(), equality_predicate.clone()],
+            )),
+        );
+        let plan = LogicalPlan::new(
+            &bind_context,
+            LogicalOperator::Filter(Filter::new(child, vec![equality_predicate.clone()])),
+        );
+        let ctx = OptimizationContext {
+            session: make_test_session(),
+            bind_context: bind_context.clone(),
+            column_stats: Default::default(),
+            graph_stats: GraphStatsCache::with_loader(Arc::new(EmptyGraphStatsLoader)),
+            cost_model: CostModel::default(),
+            verify_enabled: true,
+            profiler: OptimizerProfiler::default(),
+            invalidations: crate::context::OptimizerInvalidations::default(),
+        };
+
+        let (rewritten, changed) = ReorderFilter::new().reorder_node(plan, &ctx);
+
+        assert!(!changed);
+        let LogicalOperator::Filter(parent) = rewritten.operator else {
+            panic!("expected parent filter");
+        };
+        let LogicalOperator::Filter(child) = parent.child.operator else {
+            panic!("expected child filter");
+        };
+        assert!(child.expressions[0].equals(&range_predicate));
+        assert!(child.expressions[1].equals(&equality_predicate));
     }
 
     #[test]

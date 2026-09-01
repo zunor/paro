@@ -2,20 +2,23 @@
 // SPDX-License-Identifier: Apache-2.0
 
 //! Propagate column statistics through the logical plan.
+//!
+//! Statistics are optimizer metadata, never a source of query predicates. In
+//! particular, estimated or storage-derived ranges may refine costing and
+//! cardinality, but must not be materialized back into the logical plan.
 
 use crate::filter::propagate_result::FilterPropagateResult;
-use crate::filter::pushdown::FilterPushdown;
 use crate::statistics::unique_keys::declared_unique_keys;
 use paro_common::runtime_value::Value;
 use paro_common::types::LogicalType;
 use paro_context::StatementContext;
 use paro_function::window::WindowFunctionType;
 use paro_planner::expression::{
-    ColumnRefExpression, ComparisonExpression, ComparisonType, ConstantExpression, Expression,
-    WindowExpression, WindowInvocation,
+    ColumnRefExpression, ComparisonType, ConstantExpression, Expression, WindowExpression,
+    WindowInvocation,
 };
 use paro_planner::operator::{
-    aggregate::GroupDependency, empty_result::EmptyResult, Aggregate, ColumnBinding, Filter, Join,
+    aggregate::GroupDependency, empty_result::EmptyResult, Aggregate, ColumnBinding, Join,
     JoinComparisonType, LogicalOperator,
 };
 use paro_planner::plan::LogicalPlan;
@@ -518,65 +521,24 @@ impl StatisticsPropagator {
             }
             LogicalOperator::DummyScan => LogicalOperator::DummyScan,
             LogicalOperator::Join(join) => match join {
-                Join::Comparison(mut cj) => {
+                Join::Comparison(cj) => {
                     let can_propagate = matches!(
                         cj.join_type,
                         paro_planner::operator::JoinType::Inner
                             | paro_planner::operator::JoinType::Semi
                     );
 
-                    if can_propagate {
-                        let mut left = *cj.left;
-                        let mut right = *cj.right;
-
-                        for condition in &cj.conditions {
-                            let stats_left_before = self.propagate_expression(&condition.left);
-                            let stats_right_before = self.propagate_expression(&condition.right);
+                    for condition in &cj.conditions {
+                        self.propagate_expression(&condition.left);
+                        self.propagate_expression(&condition.right);
+                        if can_propagate {
                             let comparison_type =
                                 Self::join_comparison_to_comparison(condition.comparison);
-
                             self.update_filter_statistics(
                                 &condition.left,
                                 &condition.right,
                                 comparison_type,
                             );
-
-                            let stats_left_after = self.propagate_expression(&condition.left);
-                            let stats_right_after = self.propagate_expression(&condition.right);
-
-                            if let (Some(before), Some(after)) =
-                                (stats_left_before, stats_left_after)
-                            {
-                                if let Expression::ColumnRef(_) = &condition.left {
-                                    left = Self::create_filter_from_join_stats(
-                                        left,
-                                        &condition.left,
-                                        before.as_ref(),
-                                        after.as_ref(),
-                                    );
-                                }
-                            }
-
-                            if let (Some(before), Some(after)) =
-                                (stats_right_before, stats_right_after)
-                            {
-                                if let Expression::ColumnRef(_) = &condition.right {
-                                    right = Self::create_filter_from_join_stats(
-                                        right,
-                                        &condition.right,
-                                        before.as_ref(),
-                                        after.as_ref(),
-                                    );
-                                }
-                            }
-                        }
-
-                        cj.left = Box::new(left);
-                        cj.right = Box::new(right);
-                    } else {
-                        for condition in &cj.conditions {
-                            self.propagate_expression(&condition.left);
-                            self.propagate_expression(&condition.right);
                         }
                     }
 
@@ -903,78 +865,6 @@ impl StatisticsPropagator {
             }
         }
     }
-
-    /// Create a filter from join statistics changes
-    /// If the statistics of a column have been narrowed by the join condition,
-    /// we can push down a filter to the child operator
-    fn create_filter_from_join_stats(
-        plan: LogicalPlan,
-        expr: &Expression,
-        stats_before: &ColumnStatistics,
-        stats_after: &ColumnStatistics,
-    ) -> LogicalPlan {
-        // Only handle column refs with numeric types
-        let col_ref = match expr {
-            Expression::ColumnRef(c) => c,
-            _ => return plan,
-        };
-
-        if !expr.return_type().is_numeric() {
-            return plan;
-        }
-
-        let before = stats_before.statistics();
-        let after = stats_after.statistics();
-        let (min_before, max_before) = match (before.min_value(), before.max_value()) {
-            (Some(lo), Some(hi)) => (lo, hi),
-            _ => return plan,
-        };
-
-        let (min_after, max_after) = match (after.min_value(), after.max_value()) {
-            (Some(lo), Some(hi)) => (lo, hi),
-            _ => return plan,
-        };
-
-        // Create filter expressions if the range has been narrowed
-        let mut filter_exprs = Vec::new();
-
-        // If min increased, add >= filter
-        if min_after > min_before {
-            let left = Expression::ColumnRef(col_ref.clone());
-            let right = Expression::Constant(ConstantExpression {
-                value: min_after.clone(),
-                return_type: expr.return_type(),
-            });
-            filter_exprs.push(Expression::Comparison(ComparisonExpression {
-                left: Box::new(left),
-                right: Box::new(right),
-                comparison_type: ComparisonType::GreaterThanOrEqual,
-            }));
-        }
-
-        // If max decreased, add <= filter
-        if max_after < max_before {
-            let left = Expression::ColumnRef(col_ref.clone());
-            let right = Expression::Constant(ConstantExpression {
-                value: max_after.clone(),
-                return_type: expr.return_type(),
-            });
-            filter_exprs.push(Expression::Comparison(ComparisonExpression {
-                left: Box::new(left),
-                right: Box::new(right),
-                comparison_type: ComparisonType::LessThanOrEqual,
-            }));
-        }
-
-        if filter_exprs.is_empty() {
-            return plan;
-        }
-
-        let filter_plan =
-            LogicalPlan::synthetic(LogicalOperator::Filter(Filter::new(plan, filter_exprs)));
-        let mut pushdown = FilterPushdown::new();
-        pushdown.rewrite_plan(filter_plan)
-    }
 }
 
 impl Default for StatisticsPropagator {
@@ -995,7 +885,7 @@ mod tests {
     use paro_function::window::WindowFunction;
     use paro_planner::binder::context::BindContext;
     use paro_planner::expression::{AggregateExpression, WindowExpression, WindowFrame};
-    use paro_planner::operator::{Aggregate, ExpressionGet, Get, Projection, Window};
+    use paro_planner::operator::{Aggregate, ExpressionGet, Filter, Get, Projection, Window};
     use paro_storage::statistics::StringStats;
     use paro_storage::table::table_factory::TableFactory;
 

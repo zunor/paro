@@ -142,12 +142,13 @@ pub fn bind_not(binder: &mut ExpressionBinder, expr: Expr) -> Result<Expression>
     )))
 }
 
-/// Binds a LIKE or NOT LIKE expression.
+/// Binds a LIKE-family expression.
 pub fn bind_like(
     binder: &mut ExpressionBinder,
     left: Expr,
     right: Expr,
-    not: bool,
+    case_insensitive: bool,
+    negated: bool,
 ) -> Result<Expression> {
     let mut left = binder.bind_child(left)?;
     let mut right = binder.bind_child(right)?;
@@ -168,12 +169,16 @@ pub fn bind_like(
     }
 
     let like = Expression::Operator(OperatorExpression::new(
-        OperatorType::Like,
+        if case_insensitive {
+            OperatorType::ILike
+        } else {
+            OperatorType::Like
+        },
         vec![left, right],
         LogicalType::Boolean,
     ));
 
-    if not {
+    if negated {
         Ok(Expression::Operator(OperatorExpression::new_unary(
             OperatorType::Not,
             like,
@@ -210,6 +215,24 @@ pub fn bind_in_list(
     let mut children = vec![bound_left];
     for item in list {
         children.push(binder.bind_child(item)?);
+    }
+    let mut comparison_type = children[0].get_expression_return_type();
+    for child in children.iter().skip(1) {
+        comparison_type = try_bind_comparison(
+            &comparison_type,
+            &child.get_expression_return_type(),
+            ComparisonType::Equal,
+        )?;
+    }
+    let comparison_type = comparison_type.normalize_type();
+    for child in &mut children {
+        if child.return_type() != comparison_type {
+            *child = CastExpression::add_cast_if_needed(
+                child.clone(),
+                comparison_type.clone(),
+                &binder.binder.cast_functions,
+            )?;
+        }
     }
     let op_type = if not {
         OperatorType::NotIn

@@ -247,6 +247,22 @@ mod tests {
     }
 
     #[test]
+    fn planner_pushes_uncorrelated_subquery_into_outer_join_null_supplying_side() {
+        let mut binder = test_binder();
+        let statement = parse_one(
+            "SELECT * \
+             FROM (VALUES (1), (2)) t(x) \
+             LEFT JOIN (VALUES (1), (3)) s(y) \
+               ON s.y = t.x AND s.y IN (SELECT 1)",
+        )
+        .expect("parse")
+        .stmt;
+        let bound = binder.bind(statement).expect("bind");
+
+        assert!(!contains_dependent_join(&bound.plan.operator));
+    }
+
+    #[test]
     fn planner_flattens_nested_outer_correlated_subquery_inside_lateral_rhs() {
         assert_lateral_probe_succeeds("nested_outer_correlated_subquery_inside_lateral_rhs");
     }

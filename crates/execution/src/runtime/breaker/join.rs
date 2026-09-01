@@ -203,9 +203,10 @@ impl JoinBuildHandle {
         match &*state {
             JoinHashTableState::Live(table) => return Ok(Arc::clone(table)),
             JoinHashTableState::Released => {
-                return Err(paro_error::internal(
-                    "hash join table cannot be reinitialized after its consumers finished",
-                ));
+                return Err(paro_error::internal(format!(
+                    "hash join table {} cannot be reinitialized after its consumers {:?} finished (producer {:?})",
+                    self.metadata.id.index(), self.metadata.consumers, self.metadata.producer
+                )));
             }
             JoinHashTableState::Uninitialized => {}
         }

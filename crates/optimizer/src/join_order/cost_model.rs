@@ -34,6 +34,8 @@ pub(crate) struct DPJoinNode {
     /// throughout DP enumeration; logical plans quantize it only once when the
     /// chosen tree is reconstructed.
     pub cardinality: f64,
+    /// Cardinality used for risk-adjusted work costing.
+    pub risk_cardinality: f64,
     /// Schema-dependent bytes emitted by this node.
     ///
     /// This cannot be recovered from `set`: reduction joins retain filtering
@@ -46,7 +48,12 @@ impl DPJoinNode {
     /// Create a leaf node (single relation).
     ///
     /// Leaf nodes have cost 0 since they represent base tables.
-    pub fn leaf(set: Arc<JoinRelationSet>, output_payload_width: usize, cardinality: f64) -> Self {
+    pub fn leaf(
+        set: Arc<JoinRelationSet>,
+        output_payload_width: usize,
+        cardinality: f64,
+        risk_cardinality: f64,
+    ) -> Self {
         Self {
             set: set.clone(),
             predicates: None,
@@ -55,6 +62,7 @@ impl DPJoinNode {
             right_set: set,
             cost: 0.0,
             cardinality,
+            risk_cardinality,
             output_payload_width,
         }
     }
@@ -67,6 +75,7 @@ impl DPJoinNode {
         right_set: Arc<JoinRelationSet>,
         cost: f64,
         cardinality: f64,
+        risk_cardinality: f64,
         output_payload_width: usize,
     ) -> Self {
         Self {
@@ -77,6 +86,7 @@ impl DPJoinNode {
             right_set,
             cost,
             cardinality,
+            risk_cardinality,
             output_payload_width,
         }
     }
@@ -88,6 +98,7 @@ impl DPJoinNode {
 pub(crate) struct CostModel {
     /// Cardinality estimator used to calculate cost.
     pub cardinality_estimator: CardinalityEstimator,
+    risk_cardinality_estimator: CardinalityEstimator,
     relation_widths: Vec<usize>,
     relation_control_regions: Vec<bool>,
 }
@@ -103,6 +114,7 @@ struct JoinCostBreakdown {
 struct CostedJoin {
     combination: Arc<JoinRelationSet>,
     cardinality: f64,
+    risk_cardinality: f64,
     output_payload_width: usize,
     breakdown: JoinCostBreakdown,
 }
@@ -196,6 +208,7 @@ impl CostModel {
     pub fn new() -> Self {
         Self {
             cardinality_estimator: CardinalityEstimator::new(),
+            risk_cardinality_estimator: CardinalityEstimator::new(),
             relation_widths: Vec::new(),
             relation_control_regions: Vec::new(),
         }
@@ -204,6 +217,7 @@ impl CostModel {
     /// Clear query-local estimates.
     pub fn reset(&mut self) {
         self.cardinality_estimator = CardinalityEstimator::new();
+        self.risk_cardinality_estimator = CardinalityEstimator::new();
         self.relation_widths.clear();
         self.relation_control_regions.clear();
     }
@@ -221,6 +235,10 @@ impl CostModel {
             let set = set_manager.get_relation(i);
             self.cardinality_estimator
                 .init_cardinality_estimator_props(&set, stats);
+            let mut risk_stats = stats.clone();
+            risk_stats.cardinality = stats.risk_cardinality.max(stats.cardinality);
+            self.risk_cardinality_estimator
+                .init_cardinality_estimator_props(&set, &risk_stats);
         }
         self.relation_widths = relation_stats
             .iter()
@@ -230,6 +248,16 @@ impl CostModel {
             .iter()
             .map(|stats| stats.contains_control_region)
             .collect();
+    }
+
+    pub(crate) fn init_equivalent_relations(
+        &mut self,
+        filters: &[Arc<crate::join_order::query_graph::FilterInfo>],
+    ) {
+        self.cardinality_estimator
+            .init_equivalent_relations(filters);
+        self.risk_cardinality_estimator
+            .init_equivalent_relations(filters);
     }
 
     /// Compute the cost of joining two nodes.
@@ -280,17 +308,22 @@ impl CostModel {
         let join_rows = self
             .cardinality_estimator
             .estimate_cardinality(&combination);
+        let risk_join_rows = self
+            .risk_cardinality_estimator
+            .estimate_cardinality(&combination)
+            .max(join_rows);
         let output_payload_width = Self::output_payload_width(left, right, predicates);
         let breakdown = self.cost_breakdown_for_cardinality(
             left,
             right,
             predicates,
-            join_rows,
+            risk_join_rows,
             output_payload_width,
         );
         CostedJoin {
             combination,
             cardinality: join_rows,
+            risk_cardinality: risk_join_rows,
             output_payload_width,
             breakdown,
         }
@@ -304,8 +337,8 @@ impl CostModel {
         join_rows: f64,
         output_payload_width: usize,
     ) -> JoinCostBreakdown {
-        let left_rows = left.cardinality;
-        let right_rows = right.cardinality;
+        let left_rows = left.risk_cardinality;
+        let right_rows = right.risk_cardinality;
         let conditions = Self::condition_profile(predicates);
         let filtering_side = Self::reduction_filtering_side(predicates);
         if !conditions.has_hash_key {
@@ -517,6 +550,7 @@ impl CostModel {
             right.set.clone(),
             estimate.breakdown.total(),
             estimate.cardinality,
+            estimate.risk_cardinality,
             estimate.output_payload_width,
         )
     }
@@ -524,6 +558,12 @@ impl CostModel {
     /// Get the estimated cardinality for a relation set.
     pub fn get_cardinality(&mut self, set: &JoinRelationSet) -> f64 {
         self.cardinality_estimator.estimate_cardinality(set)
+    }
+
+    pub fn get_risk_cardinality(&mut self, set: &JoinRelationSet) -> f64 {
+        self.risk_cardinality_estimator
+            .estimate_cardinality(set)
+            .max(self.get_cardinality(set))
     }
 }
 
@@ -660,7 +700,13 @@ mod tests {
 
     fn leaf(model: &mut CostModel, set: Arc<JoinRelationSet>) -> DPJoinNode {
         let cardinality = model.get_cardinality(set.as_ref());
-        DPJoinNode::leaf(set.clone(), model.payload_width(set.as_ref()), cardinality)
+        let risk_cardinality = model.get_risk_cardinality(set.as_ref());
+        DPJoinNode::leaf(
+            set.clone(),
+            model.payload_width(set.as_ref()),
+            cardinality,
+            risk_cardinality,
+        )
     }
 
     #[test]
@@ -675,7 +721,7 @@ mod tests {
         let mut set_manager = JoinRelationSetManager::new();
         let set = set_manager.get_relation(0);
 
-        let node = DPJoinNode::leaf(set.clone(), 7, 0.0);
+        let node = DPJoinNode::leaf(set.clone(), 7, 0.0, 0.0);
 
         assert!(node.is_leaf);
         assert_eq!(node.cost, 0.0);
@@ -697,6 +743,7 @@ mod tests {
             left.clone(),
             right.clone(),
             100.0,
+            50.0,
             50.0,
             11,
         );
@@ -733,15 +780,26 @@ mod tests {
     }
 
     #[test]
+    fn leaf_risk_cardinality_does_not_replace_its_expected_estimate() {
+        let mut set_manager = JoinRelationSetManager::new();
+        let mut cost_model = CostModel::new();
+        let mut stats = RelationStats::with_cardinality(100);
+        stats.risk_cardinality = 500;
+        cost_model.init_cost_model(&mut set_manager, &[stats]);
+
+        let set = set_manager.get_relation(0);
+        assert_eq!(cost_model.get_cardinality(&set), 100.0);
+        assert_eq!(cost_model.get_risk_cardinality(&set), 500.0);
+    }
+
+    #[test]
     fn test_compute_cost_leaf_nodes() {
         let mut set_manager = JoinRelationSetManager::new();
         let mut cost_model = CostModel::new();
 
         // Initialize with join filter
         let filter = create_equality_filter(&mut set_manager, 0, 0, 1, 0, 0);
-        cost_model
-            .cardinality_estimator
-            .init_equivalent_relations(&[filter]);
+        cost_model.init_equivalent_relations(&[filter]);
 
         // Initialize relation stats
         let mut stats0 = RelationStats::with_cardinality(1000);
@@ -771,9 +829,7 @@ mod tests {
 
         // Initialize with join filter
         let filter = create_equality_filter(&mut set_manager, 0, 0, 1, 0, 0);
-        cost_model
-            .cardinality_estimator
-            .init_equivalent_relations(&[filter]);
+        cost_model.init_equivalent_relations(&[filter]);
 
         // Initialize relation stats
         let mut stats0 = RelationStats::with_cardinality(1000);
@@ -796,6 +852,7 @@ mod tests {
             right_set: left_set.clone(),
             cost: 100.0,
             cardinality: 1000.0,
+            risk_cardinality: 1000.0,
             output_payload_width: cost_model.payload_width(&left_set),
         };
 
@@ -807,6 +864,7 @@ mod tests {
             right_set: right_set.clone(),
             cost: 50.0,
             cardinality: 500.0,
+            risk_cardinality: 500.0,
             output_payload_width: cost_model.payload_width(&right_set),
         };
 
@@ -824,9 +882,7 @@ mod tests {
 
         // Initialize with join filter
         let filter = create_equality_filter(&mut set_manager, 0, 0, 1, 0, 0);
-        cost_model
-            .cardinality_estimator
-            .init_equivalent_relations(&[filter]);
+        cost_model.init_equivalent_relations(&[filter]);
 
         // Initialize relation stats
         let mut stats0 = RelationStats::with_cardinality(1000);
@@ -872,9 +928,7 @@ mod tests {
         // Create filters for A-B and B-C joins
         let filter_ab = create_equality_filter(&mut set_manager, 0, 0, 1, 0, 0);
         let filter_bc = create_equality_filter(&mut set_manager, 1, 1, 2, 0, 1);
-        cost_model
-            .cardinality_estimator
-            .init_equivalent_relations(&[filter_ab, filter_bc]);
+        cost_model.init_equivalent_relations(&[filter_ab, filter_bc]);
 
         // Initialize relation stats
         let mut stats0 = RelationStats::with_cardinality(1000);
@@ -938,9 +992,7 @@ mod tests {
             column_distinct_counts(2, [DistinctCount::new(112, true)]);
 
         let mut model = CostModel::new();
-        model
-            .cardinality_estimator
-            .init_equivalent_relations(&filters);
+        model.init_equivalent_relations(&filters);
         model.init_cost_model(&mut sets, &[partsupp_stats, part_stats, supplier_stats]);
 
         let mut partsupp = leaf(&mut model, sets.get_relation(0));
@@ -1038,9 +1090,7 @@ mod tests {
         probe_stats.column_distinct_count =
             column_distinct_counts(1, [DistinctCount::new(1_000, true)]);
         let mut model = CostModel::new();
-        model
-            .cardinality_estimator
-            .init_equivalent_relations(&[Arc::clone(&filter)]);
+        model.init_equivalent_relations(&[Arc::clone(&filter)]);
         model.init_cost_model(&mut sets, &[build_stats, probe_stats]);
         let build = leaf(&mut model, sets.get_relation(0));
         let probe = leaf(&mut model, sets.get_relation(1));
@@ -1192,9 +1242,7 @@ mod tests {
             },
         ];
         let mut model = CostModel::new();
-        model
-            .cardinality_estimator
-            .init_equivalent_relations(&filters);
+        model.init_equivalent_relations(&filters);
         model.init_cost_model(&mut sets, &stats);
 
         let customer_nation_region = sets.get_relation_from_vec(vec![0, 4, 5]);
@@ -1246,9 +1294,7 @@ mod tests {
             },
         ];
         let mut model = CostModel::new();
-        model
-            .cardinality_estimator
-            .init_equivalent_relations(&filters);
+        model.init_equivalent_relations(&filters);
         model.init_cost_model(&mut sets, &stats);
 
         let full_join = sets.get_relation_from_vec(vec![0, 1, 2]);

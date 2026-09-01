@@ -276,6 +276,18 @@ mod tests {
     }
 
     #[test]
+    fn input_column_precedes_same_named_inferred_select_alias() {
+        let plan = plan("SELECT x FROM (SELECT 1 AS x) AS input");
+        let LogicalOperator::Projection(projection) = plan.operator else {
+            panic!("expected projection");
+        };
+        assert!(matches!(
+            projection.expressions.as_slice(),
+            [crate::expression::Expression::ColumnRef(_)]
+        ));
+    }
+
+    #[test]
     fn distinct_ordering_is_planned_above_distinct() {
         let plan = plan("SELECT DISTINCT n FROM (VALUES (2), (1), (2)) AS t(n) ORDER BY n ASC");
         let LogicalOperator::Order(order) = plan.operator else {

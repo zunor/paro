@@ -29,7 +29,7 @@ fn test_multi_statements_with_format() {
     let stmts = parse(sql).unwrap();
     assert_eq!(stmts.len(), 2);
     let s1 = &stmts[0];
-    assert_eq!(s1.format.as_deref(), Some("JSON"));
+    assert_eq!(s1.format.as_deref(), Some("json"));
     let s2 = &stmts[1];
     assert!(s2.format.is_none());
 }
@@ -40,7 +40,7 @@ fn test_explain_statement_keeps_outer_format() {
     let stmts = parse(sql).unwrap();
     assert_eq!(stmts.len(), 1);
     let s1 = &stmts[0];
-    assert_eq!(s1.format.as_deref(), Some("JSON"));
+    assert_eq!(s1.format.as_deref(), Some("json"));
     assert!(matches!(
         &s1.stmt,
         paro_parser::ast::Statement::Explain { .. }

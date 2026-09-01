@@ -66,6 +66,7 @@ pub fn register_string_functions() -> Vec<ScalarFunctionSet> {
         get_upper_function(),
         // Concatenation
         get_concat_functions(),
+        get_string_concat_functions(),
         get_concat_ws_functions(),
         // Substring
         get_substring_functions(),

@@ -14,10 +14,7 @@ use crate::aggregate::{
     AggregateStateInput, DecimalDirectUpdate, DirectAggregateStateCursor, FunctionData,
     PreparedDirectAggregateStatePredicate,
 };
-use crate::decimal::{
-    cast_i128_decimal, pow10_i128, read_decimal, rescale, rescale_checked, round_divide, to_i128,
-    write_decimal,
-};
+use crate::decimal::{cast_i128_decimal, pow10_i128, read_decimal, rescale_checked, write_decimal};
 use crate::scalar::function_data_fingerprint;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -564,39 +561,30 @@ fn bind(
             "{name} with arguments {arguments:?}"
         )));
     };
-    let return_type = match op {
-        DecimalAggregateOp::Sum => LogicalType::Decimal {
-            precision: 38,
-            scale: *scale,
-        },
-        DecimalAggregateOp::Avg => {
-            let integral_digits = precision - scale;
-            let available_fractional_digits = 38 - integral_digits;
+    let (return_type, output_precision, output_scale) = match op {
+        DecimalAggregateOp::Sum => (
             LogicalType::Decimal {
                 precision: 38,
-                scale: (*scale).max(6).min(available_fractional_digits),
-            }
-        }
+                scale: *scale,
+            },
+            38,
+            *scale,
+        ),
+        // An average can introduce an unbounded fractional expansion. Keep
+        // the exact i256 sum state, but expose its quotient in DOUBLE because
+        // a fixed DECIMAL(38, s) cannot preserve both the input's full
+        // integral range and a useful fractional result.
+        DecimalAggregateOp::Avg => (LogicalType::Double, 38, *scale),
         DecimalAggregateOp::Min
         | DecimalAggregateOp::Max
         | DecimalAggregateOp::First
-        | DecimalAggregateOp::Last => arguments[0].clone(),
-    };
-    let LogicalType::Decimal {
-        precision: output_precision,
-        scale: output_scale,
-    } = return_type
-    else {
-        unreachable!()
+        | DecimalAggregateOp::Last => (arguments[0].clone(), *precision, *scale),
     };
     let wide_sum = op == DecimalAggregateOp::Sum && decimal_sum_requires_wide_state(*precision)?;
     let function = AggregateFunction::new(
         name.to_string(),
         arguments.to_vec(),
-        LogicalType::Decimal {
-            precision: output_precision,
-            scale: output_scale,
-        },
+        return_type,
         match op {
             DecimalAggregateOp::Sum if wide_sum => std::mem::size_of::<DecimalSumState>(),
             DecimalAggregateOp::Sum => std::mem::size_of::<DecimalNarrowState>(),
@@ -1138,18 +1126,9 @@ unsafe fn finalize_average(
         if state.overflowed {
             return Err(paro_error::out_of_range("Decimal AVG aggregate overflow"));
         }
-        let scaled = rescale(state.value(), data.input_scale, data.output_scale)?;
-        let value = to_i128(
-            round_divide(scaled, i256::from(state.count))?,
-            data.output_precision,
-        )
-        .map_err(|_| {
-            paro_error::out_of_range(format!(
-                "Decimal AVG result exceeds precision {}",
-                data.output_precision
-            ))
-        })?;
-        write_decimal(result, row, value)?;
+        let value =
+            state.value().as_f64() / state.count as f64 / 10_f64.powi(i32::from(data.input_scale));
+        *result.flat_data_mut::<f64>().add(row) = value;
     }
     Ok(())
 }
