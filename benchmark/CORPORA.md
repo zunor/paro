@@ -35,6 +35,13 @@ Every Paro connection used by this gate enables `optimizer_verify`. A suite is
 complete only after each query executes and its decoded row multiset matches
 the authoritative result. `EXPLAIN`-only success is not a correctness result.
 
+For a paired TPC-DS SF1 correctness and latency comparison, use
+`corpora/tpcds_compare.py`. It keeps one connection to each engine, applies the
+same thread and memory limits, validates the complete row multiset before
+measurement, alternates measurement order, and records every latency sample
+plus source, corpus, database, and executable digests. Generated SF1 database
+and CSV files belong under the workspace data root, outside source repositories.
+
 CEB targets PostgreSQL semantics. In particular, PostgreSQL widens
 `REAL`/`NUMERIC` comparisons to double precision, while DuckDB narrows the
 numeric operand to `FLOAT`. When DuckDB is used as the CEB execution oracle,
