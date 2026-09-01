@@ -3,7 +3,6 @@
 
 //! Heap implementation used by [`super::topn::TopN`].
 
-use std::cmp::Ordering;
 use std::mem::size_of;
 use std::sync::Mutex;
 
@@ -12,7 +11,7 @@ use paro_common::error::Result;
 use paro_common::memory::{
     AccountedVec, MemoryAccountingClass, MemoryAccountingContext, MemoryGrant,
 };
-use paro_common::sort_key::{compare_keys, encode_column, OrderModifiers};
+use paro_common::sort_key::{encode_column, OrderModifiers};
 use paro_common::types::LogicalType;
 use paro_planner::binder::ir::OrderByNode;
 
@@ -263,21 +262,17 @@ impl TopNHeap {
             return Ok(());
         }
 
-        // Check boundary value first to filter out rows early
-        let (filtered_payload, filtered_sort) = if let Some(boundary_val) = boundary {
-            self.filter_by_boundary_with_sort(payload_chunk, sort_chunk, boundary_val)?
-        } else {
-            (payload_chunk.clone(), sort_chunk.clone())
-        };
-
-        if filtered_payload.is_empty() {
-            return Ok(());
-        }
+        // Snapshot the cross-worker boundary once per batch. Encoding and
+        // boundary rejection happen in the same pass as the local heap check;
+        // materializing filtered payload/sort chunks would encode every
+        // surviving key twice and copy rows that the local boundary may still
+        // reject.
+        let boundary_key = boundary.and_then(TopNBoundaryValue::get_boundary);
 
         if self.heap_size <= SMALL_HEAP_THRESHOLD {
-            self.add_small_heap_with_sort(&filtered_payload, &filtered_sort)?;
+            self.add_small_heap_with_sort(payload_chunk, sort_chunk, boundary_key.as_deref())?;
         } else {
-            self.add_large_heap_with_sort(&filtered_payload, &filtered_sort)?;
+            self.add_large_heap_with_sort(payload_chunk, sort_chunk, boundary_key.as_deref())?;
         }
 
         // Update global boundary if heap is full
@@ -454,60 +449,12 @@ impl TopNHeap {
         Ok(result)
     }
 
-    /// Filter chunks by boundary value (with separate sort chunk).
-    ///
-    /// Returns filtered payload and sort chunks containing only rows that could
-    fn filter_by_boundary_with_sort(
-        &self,
-        payload_chunk: &Chunk,
-        sort_chunk: &Chunk,
-        boundary: &TopNBoundaryValue,
-    ) -> Result<(Chunk, Chunk)> {
-        let boundary_key = match boundary.get_boundary() {
-            Some(key) => key,
-            None => return Ok((payload_chunk.clone(), sort_chunk.clone())), // No boundary yet
-        };
-
-        // The sort chunk materializes ORDER BY expressions densely as [0, 1, 2, ...].
-        let sort_indices: Vec<usize> = (0..sort_chunk.column_count()).collect();
-
-        // Collect indices of rows that pass the boundary check
-        let mut passing_rows = Vec::new();
-        let mut sort_key = Vec::new();
-
-        for row_idx in 0..sort_chunk.size() {
-            self.encode_sort_key_into(sort_chunk, row_idx, &sort_indices, &mut sort_key)?;
-
-            // Row passes if its sort key is less than the boundary
-            if compare_keys(&sort_key, &boundary_key) == Ordering::Less {
-                passing_rows.push(row_idx);
-            }
-        }
-
-        if passing_rows.is_empty() {
-            // No rows pass - return empty chunks
-            return Ok((
-                Chunk::try_new(payload_chunk.allocator().clone())?,
-                Chunk::try_new(sort_chunk.allocator().clone())?,
-            ));
-        }
-
-        if passing_rows.len() == payload_chunk.size() {
-            // All rows pass - return original chunks
-            return Ok((payload_chunk.clone(), sort_chunk.clone()));
-        }
-
-        // Some rows pass - create filtered chunks
-        let filtered_payload = self.copy_rows(payload_chunk, &passing_rows)?;
-        let filtered_sort = self.copy_rows_generic(sort_chunk, &passing_rows)?;
-        Ok((filtered_payload, filtered_sort))
-    }
-
     /// Add entries to a small heap with separate sort chunk (delayed payload copy).
     fn add_small_heap_with_sort(
         &mut self,
         payload_chunk: &Chunk,
         sort_chunk: &Chunk,
+        global_boundary: Option<&[u8]>,
     ) -> Result<()> {
         const BASE_INDEX: usize = u32::MAX as usize;
 
@@ -521,6 +468,9 @@ impl TopNHeap {
         for row_idx in 0..sort_chunk.size() {
             self.encode_sort_key_into(sort_chunk, row_idx, &sort_indices, &mut sort_key)?;
 
+            if global_boundary.is_some_and(|boundary| sort_key.as_slice() >= boundary) {
+                continue;
+            }
             if !self.should_add_entry(&sort_key) {
                 continue;
             }
@@ -578,6 +528,7 @@ impl TopNHeap {
         &mut self,
         payload_chunk: &Chunk,
         sort_chunk: &Chunk,
+        global_boundary: Option<&[u8]>,
     ) -> Result<()> {
         let base_index = self.total_heap_data_size();
         let mut rows_to_copy = Vec::new();
@@ -590,6 +541,9 @@ impl TopNHeap {
         for row_idx in 0..sort_chunk.size() {
             self.encode_sort_key_into(sort_chunk, row_idx, &sort_indices, &mut sort_key)?;
 
+            if global_boundary.is_some_and(|boundary| sort_key.as_slice() >= boundary) {
+                continue;
+            }
             if !self.should_add_entry(&sort_key) {
                 continue;
             }
@@ -610,36 +564,6 @@ impl TopNHeap {
         }
 
         Ok(())
-    }
-
-    /// Copy selected rows from a chunk (generic version for any chunk).
-    fn copy_rows_generic(&self, chunk: &Chunk, row_indices: &[usize]) -> Result<Chunk> {
-        use paro_common::vector::Vector;
-        use std::sync::Arc;
-
-        let mut output_vectors = Vec::with_capacity(chunk.data.len());
-
-        for col_idx in 0..chunk.column_count() {
-            let src_vec = &chunk.data[col_idx];
-            let col_type = src_vec.logical_type().clone();
-            let mut dst_vec =
-                Vector::try_new(col_type, row_indices.len(), chunk.allocator().clone())?;
-
-            for (dst_idx, &src_idx) in row_indices.iter().enumerate() {
-                if src_vec.is_null(src_idx) {
-                    dst_vec.try_set_null(dst_idx, true)?;
-                } else {
-                    dst_vec.try_copy_at(dst_idx, src_vec, src_idx)?;
-                }
-            }
-
-            dst_vec.try_set_count(row_indices.len())?;
-            output_vectors.push(Arc::new(dst_vec));
-        }
-
-        let mut result = Chunk::from_arc_vectors(output_vectors, chunk.allocator().clone());
-        result.try_set_cardinality(row_indices.len())?;
-        Ok(result)
     }
 
     /// Check if an entry should be added to the heap.
@@ -1097,6 +1021,24 @@ mod tests {
         let key3 = vec![0, 1, 2];
         assert!(boundary.update(&key3));
         assert_eq!(boundary.get_boundary(), Some(key3));
+    }
+
+    #[test]
+    fn cross_worker_boundary_filters_in_the_heap_admission_pass() {
+        let boundary = TopNBoundaryValue::new();
+        let seed = make_int_chunk(&[1, 3]);
+        let mut seed_heap = manual_heap(&[], std::iter::empty(), 2);
+        seed_heap
+            .sink_with_sort_chunk(&seed, &seed, Some(&boundary))
+            .unwrap();
+
+        let candidates = make_int_chunk(&[2, 3, 4, 0]);
+        let mut worker_heap = manual_heap(&[], std::iter::empty(), 2);
+        worker_heap
+            .sink_with_sort_chunk(&candidates, &candidates, Some(&boundary))
+            .unwrap();
+
+        assert_eq!(extract_ints(&mut worker_heap), vec![0, 2]);
     }
 
     #[test]
