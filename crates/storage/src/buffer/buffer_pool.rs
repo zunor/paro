@@ -519,12 +519,16 @@ impl BufferPool {
     /// # Arguments
     /// * `block` - The block handle to load
     /// * `reusable_buffer` - Optional buffer to reuse (for memory efficiency)
-    fn load_block(&self, block: Arc<BlockHandle>, _reusable_buffer: Option<Vec<u8>>) -> Result<()> {
+    fn load_block_pinned(
+        &self,
+        block: Arc<BlockHandle>,
+        _reusable_buffer: Option<Vec<u8>>,
+    ) -> Result<()> {
         let block_id = block.block_id();
         let size = block.size();
 
         if block.buffer_type().is_reconstructible() {
-            block.reconstruct_zeroed()?;
+            block.reconstruct_zeroed_pinned()?;
             return Ok(());
         }
         if !block.must_write_to_disk() {
@@ -544,8 +548,8 @@ impl BufferPool {
 
         let buffer = self.read_from_temporary_file(block_id, size)?;
 
-        // Set the buffer and mark as loaded
-        block.set_buffer(buffer)?;
+        // Install the bytes and their first pin as one lifecycle transition.
+        block.set_buffer_pinned(buffer)?;
 
         Ok(())
     }
@@ -774,13 +778,14 @@ impl BufferPool {
             return Ok(handle);
         }
 
-        // Now we can actually load the block
-        self.load_block(block.clone(), reusable_buffer)?;
+        // Loading publishes the first pin in the same lifecycle transition as
+        // the allocation. An evictor can therefore never detach the freshly
+        // installed bytes before this caller receives its handle.
+        self.load_block_pinned(block.clone(), reusable_buffer)?;
         eviction_result.reservation.resize(0);
         self.update_used_memory(block.tag(), required_memory as i64);
 
-        // Pin the block and update LRU timestamp
-        block.pin();
+        // The first pin was already published by `load_block_pinned`.
         block.set_lru_timestamp(current_timestamp_ms());
         self.stats.pins.fetch_add(1, Ordering::Relaxed);
 
