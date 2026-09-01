@@ -413,7 +413,7 @@ fn materialize_row_fetch_input(
         }
         let reader = fetch
             .reader
-            .as_ref()
+            .as_mut()
             .expect("graph project table reader was initialized above");
         let fetched = reader.get_by_rowids(&fetch.rowids, &fetch.column_ids)?;
 

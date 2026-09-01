@@ -1102,7 +1102,7 @@ fn tablet_reader_get_by_rowids_resolves_partial_update_columns() {
     assert_eq!(chunk.column(1).unwrap().get_i32(0), Some(20));
     assert_eq!(chunk.column(2).unwrap().get_i32(0), Some(222));
 
-    let rowid_reader = crate::tablet::TabletRowIdReader::new(
+    let mut rowid_reader = crate::tablet::TabletRowIdReader::new(
         table.tablet(),
         table
             .tablet()

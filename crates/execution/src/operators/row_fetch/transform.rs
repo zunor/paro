@@ -169,7 +169,7 @@ impl RowFetchTransformExec {
             }
             let fetched = fetch
                 .reader
-                .as_ref()
+                .as_mut()
                 .expect("row-fetch reader initialized above")
                 .get_by_rowids(&fetch.rowids, &fetch.column_ids)?;
             local.combined_columns.extend(
