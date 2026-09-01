@@ -114,11 +114,11 @@ impl Default for ExtractionContext {
 impl ExtractionContext {
     fn spill_execution_policy(&self, supported: bool) -> SpillExecutionPolicy {
         if !supported || self.grant_spill_policy == crate::physical::SpillPolicy::Forbidden {
-            SpillExecutionPolicy::Forbidden
+            SpillExecutionPolicy::InMemory
         } else if self.force_external {
-            SpillExecutionPolicy::Forced
+            SpillExecutionPolicy::ForcedExternal
         } else {
-            SpillExecutionPolicy::Allowed
+            SpillExecutionPolicy::Adaptive
         }
     }
 }
@@ -544,15 +544,15 @@ impl PhysicalPlanExtractor {
             ) || matches!(
                 &kind,
                 PhysicalNodeKind::Aggregate(spec)
-                    if spec.spill_policy != SpillExecutionPolicy::Forbidden
+                    if spec.spill_policy != SpillExecutionPolicy::InMemory
             ) || matches!(
                 &kind,
                 PhysicalNodeKind::HashJoin(spec)
-                    if spec.spill_policy != SpillExecutionPolicy::Forbidden
+                    if spec.spill_policy != SpillExecutionPolicy::InMemory
             ) || matches!(
                 &kind,
                 PhysicalNodeKind::Sort(spec)
-                    if spec.spill_policy != SpillExecutionPolicy::Forbidden
+                    if spec.spill_policy != SpillExecutionPolicy::InMemory
             ),
             parallel: self.ctx.max_threads > 1,
             supports_early_stop: matches!(

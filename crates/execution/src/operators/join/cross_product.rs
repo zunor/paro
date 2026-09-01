@@ -198,6 +198,7 @@ fn transform_external_cross_product(
         local.probe_row = 0;
         local.external_store = 0;
         local.external_scan.reset();
+        local.external_chunk_ready = false;
         local.probe_in_progress = true;
     }
     if local.external_chunk.is_none() {
@@ -209,29 +210,29 @@ fn transform_external_cross_product(
     }
 
     loop {
-        if local.probe_row >= input.size() {
-            local.probe_in_progress = false;
-            output.try_set_cardinality(0)?;
-            return Ok(TransformPoll::NeedMoreInput);
-        }
-
-        let Some(store) = stores.get(local.external_store) else {
-            local.probe_row += 1;
-            local.external_store = 0;
-            local.external_scan.reset();
-            continue;
-        };
         let build = local
             .external_chunk
             .as_mut()
             .expect("external cross product scratch initialized above");
-        let count = store.scan_with_state(&mut local.external_scan, build)?;
-        if count == 0 {
-            local.external_store += 1;
-            local.external_scan.reset();
-            continue;
+        if !local.external_chunk_ready {
+            loop {
+                let Some(store) = stores.get(local.external_store) else {
+                    local.probe_in_progress = false;
+                    output.try_set_cardinality(0)?;
+                    return Ok(TransformPoll::NeedMoreInput);
+                };
+                let count = store.scan_with_state(&mut local.external_scan, build)?;
+                if count > 0 {
+                    local.external_chunk_ready = true;
+                    local.probe_row = 0;
+                    break;
+                }
+                local.external_store += 1;
+                local.external_scan.reset();
+            }
         }
 
+        let count = build.size();
         emit_cross_product_batch(
             input,
             build,
@@ -241,9 +242,15 @@ fn transform_external_cross_product(
             count,
             output,
         )?;
-        // A row-store scan is intentionally vector-at-a-time. Returning
-        // OutputMore keeps both the retained working set and the output bounded
-        // without requiring a cardinality estimate.
+        local.probe_row += 1;
+        if local.probe_row >= input.size() {
+            // Reuse each external build block for the whole probe vector
+            // before advancing the disk cursor. This changes external cross
+            // product I/O from one full build scan per probe row to one scan
+            // per probe chunk while retaining vector-bounded output.
+            local.external_chunk_ready = false;
+            local.probe_row = 0;
+        }
         return Ok(TransformPoll::OutputMore);
     }
 }

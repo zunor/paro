@@ -711,7 +711,7 @@ impl HashJoinBuildFinishBench {
                     build_projection: vec![1].into_boxed_slice(),
                     build_payload_types: vec![LogicalType::Integer].into_boxed_slice(),
                     build_output_count: 1,
-                    spill_policy: SpillExecutionPolicy::Forbidden,
+                    spill_policy: SpillExecutionPolicy::InMemory,
                 }),
                 sink_sharing: SinkSharing::Exclusive,
                 properties: PipelineProperties::default(),

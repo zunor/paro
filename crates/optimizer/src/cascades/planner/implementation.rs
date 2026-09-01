@@ -162,7 +162,6 @@ impl PhysicalImplementation for PlannerBaselineImplementation {
             goal.grant,
             &self.grant_classes,
             self.force_spill,
-            true,
         )?
         else {
             debug!(
@@ -316,7 +315,6 @@ impl PhysicalImplementation for AlternativeImplementation {
             goal.grant,
             &self.grant_classes,
             self.force_spill,
-            false,
         )?
         else {
             return Ok(Box::new([]));

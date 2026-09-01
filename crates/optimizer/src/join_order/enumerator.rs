@@ -42,12 +42,13 @@ pub(crate) struct PlanEnumerator<'a> {
     cost_model: &'a mut CostModel,
     /// Number of relations in the query.
     num_relations: usize,
-    /// The optimal plans found for each relation set.
-    plans: HashMap<Arc<JoinRelationSet>, DPJoinNode>,
+    /// Bounded non-dominated work/memory frontier for each relation set.
+    plans: HashMap<Arc<JoinRelationSet>, Vec<DPJoinNode>>,
     /// The total number of join pairs considered.
     pairs: usize,
     exact_relation_limit: usize,
     max_pairs: usize,
+    max_frontier_size: usize,
 }
 
 impl<'a> PlanEnumerator<'a> {
@@ -66,6 +67,7 @@ impl<'a> PlanEnumerator<'a> {
             num_relations,
             12,
             10_000,
+            4,
         )
     }
 
@@ -76,6 +78,7 @@ impl<'a> PlanEnumerator<'a> {
         num_relations: usize,
         exact_relation_limit: usize,
         max_pairs: usize,
+        max_frontier_size: usize,
     ) -> Self {
         Self {
             query_graph,
@@ -86,6 +89,7 @@ impl<'a> PlanEnumerator<'a> {
             pairs: 0,
             exact_relation_limit,
             max_pairs,
+            max_frontier_size: max_frontier_size.max(1),
         }
     }
 
@@ -102,7 +106,7 @@ impl<'a> PlanEnumerator<'a> {
                 risk_cardinality,
             );
 
-            self.plans.insert(set, node);
+            self.plans.insert(set, vec![node]);
         }
     }
 
@@ -120,7 +124,9 @@ impl<'a> PlanEnumerator<'a> {
                     }
                     let total_set = self.set_manager.get_relation_from_set(&all_relations);
 
-                    if let Some(final_plan) = self.plans.get(&total_set) {
+                    if let Some(final_plan) =
+                        self.plans.get(&total_set).and_then(|plans| plans.first())
+                    {
                         debug!(
                             target: targets::OPTIMIZER,
                             relations = self.num_relations,
@@ -158,18 +164,28 @@ impl<'a> PlanEnumerator<'a> {
     }
 
     /// Get the optimal plans.
-    pub fn get_plans(&self) -> &HashMap<Arc<JoinRelationSet>, DPJoinNode> {
+    pub fn get_plans(&self) -> &HashMap<Arc<JoinRelationSet>, Vec<DPJoinNode>> {
         &self.plans
     }
 
     /// Get the final plan for all relations.
+    #[cfg(test)]
     pub fn get_final_plan(&mut self) -> Option<&DPJoinNode> {
         let mut all_relations = HashSet::new();
         for i in 0..self.num_relations {
             all_relations.insert(i);
         }
         let total_set = self.set_manager.get_relation_from_set(&all_relations);
-        self.plans.get(&total_set)
+        self.plans.get(&total_set).and_then(|plans| plans.first())
+    }
+
+    pub fn get_final_plans(&mut self) -> &[DPJoinNode] {
+        let mut all_relations = HashSet::new();
+        for i in 0..self.num_relations {
+            all_relations.insert(i);
+        }
+        let total_set = self.set_manager.get_relation_from_set(&all_relations);
+        self.plans.get(&total_set).map(Vec::as_slice).unwrap_or(&[])
     }
 
     // Private methods
@@ -381,34 +397,74 @@ impl<'a> PlanEnumerator<'a> {
         connections: &[NeighborInfo],
     ) -> PairEmission {
         // Get the left and right plans
-        let left_plan = match self.plans.get(left) {
-            Some(plan) => plan.clone(),
+        let left_plans = match self.plans.get(left) {
+            Some(plans) => plans.clone(),
             None => return PairEmission::MissingInput,
         };
 
-        let right_plan = match self.plans.get(right) {
-            Some(plan) => plan.clone(),
+        let right_plans = match self.plans.get(right) {
+            Some(plans) => plans.clone(),
             None => return PairEmission::MissingInput,
         };
 
-        // Costing owns the canonical union and cardinality estimate for this
-        // pair; reuse its set instead of hashing the same bitset twice.
-        let Some(new_node) = self.create_join_tree(&left_plan, &right_plan, connections) else {
-            return PairEmission::Ineligible;
-        };
-        let new_set = Arc::clone(&new_node.set);
-
-        // Check if this is the best plan for this set
-        let should_update = if let Some(existing) = self.plans.get(&new_set) {
-            new_node.cost < existing.cost
-        } else {
-            true
-        };
-
-        if should_update {
-            self.plans.insert(Arc::clone(&new_set), new_node);
+        let mut new_set = None;
+        for left_plan in &left_plans {
+            for right_plan in &right_plans {
+                // Costing owns the canonical union and cardinality estimate
+                // for this pair; reuse its set instead of hashing the same
+                // bitset twice.
+                let Some(new_node) = self.create_join_tree(left_plan, right_plan, connections)
+                else {
+                    return PairEmission::Ineligible;
+                };
+                let set = Arc::clone(&new_node.set);
+                self.insert_frontier(set.clone(), new_node);
+                new_set = Some(set);
+            }
         }
-        PairEmission::Emitted(new_set)
+        new_set
+            .map(PairEmission::Emitted)
+            .unwrap_or(PairEmission::MissingInput)
+    }
+
+    fn insert_frontier(&mut self, set: Arc<JoinRelationSet>, candidate: DPJoinNode) {
+        let frontier = self.plans.entry(set).or_default();
+        if frontier.iter().any(|existing| {
+            existing.cost <= candidate.cost
+                && existing.peak_build_bytes <= candidate.peak_build_bytes
+        }) {
+            return;
+        }
+        frontier.retain(|existing| {
+            !(candidate.cost <= existing.cost
+                && candidate.peak_build_bytes <= existing.peak_build_bytes)
+        });
+        frontier.push(candidate);
+        frontier.sort_by(|left, right| {
+            left.cost
+                .total_cmp(&right.cost)
+                .then_with(|| left.peak_build_bytes.cmp(&right.peak_build_bytes))
+        });
+        if frontier.len() > self.max_frontier_size {
+            let lowest_memory = frontier
+                .iter()
+                .enumerate()
+                .min_by_key(|(_, plan)| plan.peak_build_bytes)
+                .map(|(index, _)| index)
+                .unwrap_or(0);
+            if lowest_memory >= self.max_frontier_size {
+                let low_memory_plan = frontier.remove(lowest_memory);
+                frontier.truncate(self.max_frontier_size - 1);
+                frontier.push(low_memory_plan);
+            } else {
+                frontier.truncate(self.max_frontier_size);
+            }
+            frontier.sort_by(|left, right| {
+                left.cost
+                    .total_cmp(&right.cost)
+                    .then_with(|| left.peak_build_bytes.cmp(&right.peak_build_bytes))
+            });
+        }
     }
 
     fn create_join_tree(
@@ -481,7 +537,9 @@ impl<'a> PlanEnumerator<'a> {
                             }
                             PairEmission::Ineligible => return EnumerationOutcome::Ineligible,
                         };
-                        if let Some(node) = self.plans.get(&combined) {
+                        if let Some(node) =
+                            self.plans.get(&combined).and_then(|plans| plans.first())
+                        {
                             if node.cost < best_cost {
                                 best_cost = node.cost;
                                 best_left = i;
@@ -785,8 +843,8 @@ mod tests {
         let set0_key = enumerator.set_manager.get_relation(0);
 
         let plan0 = enumerator.plans.get(&set0_key).unwrap();
-        assert!(plan0.is_leaf);
-        assert_eq!(plan0.cardinality, 1000.0);
+        assert!(plan0[0].is_leaf);
+        assert_eq!(plan0[0].cardinality, 1000.0);
     }
 
     #[test]

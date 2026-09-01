@@ -744,11 +744,13 @@ fn blocking_enforcers_participate_in_grant_feasibility() {
 fn retained_operator_state_overlaps_child_pipeline_memory() {
     let local = SearchCost {
         non_revocable_memory_upper: 100,
+        minimum_memory_bytes: 100,
         peak_memory_upper: 100,
         ..cost(1.0)
     };
     let child = SearchCost {
         non_revocable_memory_upper: 40,
+        minimum_memory_bytes: 40,
         peak_memory_upper: 40,
         ..cost(1.0)
     };
@@ -812,7 +814,6 @@ fn mandatory_unknown_nonspill_state_is_not_a_hard_memory_proof() {
             overlapping_children: 1,
         },
         false,
-        true,
         grant,
     )
     .unwrap();
@@ -820,9 +821,30 @@ fn mandatory_unknown_nonspill_state_is_not_a_hard_memory_proof() {
 }
 
 #[test]
+fn spill_capability_does_not_imply_spill_permission() {
+    let local = SearchCost {
+        minimum_memory_bytes: 64,
+        peak_memory_upper: u64::MAX,
+        ..cost(1.0)
+    };
+    let grant = EnforcerCostInput {
+        rows: CompactRange::point(1.0).unwrap(),
+        row_width_bytes: 8,
+        hard_memory_bytes: 100,
+        spill_policy: SpillPolicy::Forbidden,
+    };
+
+    let fitted =
+        fit_local_retained_state_to_grant(local, &[], CostComposition::Sequential, true, grant)
+            .unwrap();
+    assert!(fitted.is_none());
+}
+
+#[test]
 fn mandatory_nonspill_parent_can_coexist_with_a_revocable_child() {
     let local = SearchCost {
         non_revocable_memory_upper: 120,
+        minimum_memory_bytes: 120,
         peak_memory_upper: 120,
         ..cost(1.0)
     };
@@ -844,7 +866,6 @@ fn mandatory_nonspill_parent_can_coexist_with_a_revocable_child() {
             overlapping_children: 1,
         },
         false,
-        true,
         grant,
     )
     .unwrap();
@@ -855,11 +876,13 @@ fn mandatory_nonspill_parent_can_coexist_with_a_revocable_child() {
 fn overlapping_non_revocable_state_must_fit_the_grant() {
     let local = SearchCost {
         non_revocable_memory_upper: 120,
+        minimum_memory_bytes: 120,
         peak_memory_upper: 120,
         ..cost(1.0)
     };
     let child = SearchCost {
         non_revocable_memory_upper: 1_024,
+        minimum_memory_bytes: 1_024,
         peak_memory_upper: 1_024,
         ..cost(1.0)
     };
@@ -877,7 +900,6 @@ fn overlapping_non_revocable_state_must_fit_the_grant() {
             overlapping_children: 1,
         },
         false,
-        true,
         grant,
     )
     .unwrap();

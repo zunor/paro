@@ -113,7 +113,6 @@ struct CostRecipe {
     local_cost: SearchCost,
     cost_composition: CostComposition,
     spillable: bool,
-    mandatory: bool,
     enforcer_cost_input: EnforcerCostInput,
     physical_fingerprint: Fingerprint,
     region: Option<RegionCandidateContract>,
@@ -272,16 +271,33 @@ impl CascadesEngine {
                 }));
             }
             GrantSensitivitySummary::Sensitive { .. } => {
+                let mut last_infeasible = None;
                 for class in classes {
                     let goal = OptimizationGoal {
                         grant: GrantGoalKey::Class(class),
                         ..base_goal
                     };
-                    winners.push(GrantWinner {
-                        class,
-                        goal,
-                        winner: self.optimize(root, goal, SearchMode::Direct)?,
-                    });
+                    self.optimize_group(root, goal)?;
+                    if let Some(winner) = self
+                        .memo
+                        .group(root)
+                        .and_then(|group| group.winner(goal))
+                        .cloned()
+                    {
+                        winners.push(GrantWinner {
+                            class,
+                            goal,
+                            winner,
+                        });
+                    } else {
+                        last_infeasible = Some(goal);
+                    }
+                }
+                super::verifier::MemoVerifier::verify(&self.memo, None)?;
+                if winners.is_empty() {
+                    return Err(
+                        self.infeasible_goal_error(root, last_infeasible.unwrap_or(base_goal))
+                    );
                 }
             }
         }
@@ -754,7 +770,6 @@ impl CascadesEngine {
             local_cost: candidate.local_cost,
             cost_composition: candidate.cost_composition,
             spillable: candidate.spillable,
-            mandatory: candidate.mandatory,
             enforcer_cost_input: candidate.enforcer_cost_input,
             physical_fingerprint: candidate.physical_fingerprint,
             region: candidate.region,
@@ -851,7 +866,6 @@ impl CascadesEngine {
                 &child_costs,
                 recipe.cost_composition,
                 recipe.spillable,
-                recipe.mandatory,
                 recipe.enforcer_cost_input,
             )?
             else {
@@ -866,8 +880,13 @@ impl CascadesEngine {
                 );
                 continue;
             };
-            let mut cost =
-                compose_candidate_cost(local_cost, &child_costs, recipe.cost_composition)?;
+            let Some(mut cost) = constrain_composed_cost_to_grant(
+                compose_candidate_cost(local_cost, &child_costs, recipe.cost_composition)?,
+                recipe.enforcer_cost_input,
+            )?
+            else {
+                continue;
+            };
             let physical_properties = self.memo.physical_expr(physical).unwrap().provided.clone();
             let Some(enforced) = self
                 .enforcement
@@ -896,7 +915,14 @@ impl CascadesEngine {
                 );
                 continue;
             };
-            cost = cost.sequential(enforcer_cost)?;
+            let Some(constrained_cost) = constrain_composed_cost_to_grant(
+                cost.sequential(enforcer_cost)?,
+                recipe.enforcer_cost_input,
+            )?
+            else {
+                continue;
+            };
+            cost = constrained_cost;
             let fingerprint = enforced_fingerprint(
                 recipe.physical_fingerprint,
                 &enforced.steps,
@@ -1040,13 +1066,12 @@ fn fit_local_retained_state_to_grant(
     child_costs: &[SearchCost],
     composition: CostComposition,
     spillable: bool,
-    mandatory: bool,
     grant: EnforcerCostInput,
 ) -> Result<Option<SearchCost>> {
     if grant.hard_memory_bytes == u64::MAX {
         return Ok(Some(local_cost));
     }
-    let overlapping_non_revocable = match composition {
+    let overlapping_minimum = match composition {
         CostComposition::Sequential => 0,
         CostComposition::RetainedState {
             overlapping_children,
@@ -1054,20 +1079,22 @@ fn fit_local_retained_state_to_grant(
             .iter()
             .enumerate()
             .filter(|(index, _)| overlapping_children & (1_u64 << index) != 0)
-            .map(|(_, child)| child.non_revocable_memory_upper)
+            .map(|(_, child)| child.minimum_memory_bytes)
             .max()
             .unwrap_or(0),
     };
-    if local_cost
-        .non_revocable_memory_upper
-        .saturating_add(overlapping_non_revocable)
-        > grant.hard_memory_bytes
-    {
+    let retained_minimum = local_cost
+        .minimum_memory_bytes
+        .saturating_add(overlapping_minimum);
+    if retained_minimum > grant.hard_memory_bytes {
         return Ok(None);
     }
     if local_cost.peak_memory_upper == u64::MAX {
         if spillable && grant.spill_policy == SpillPolicy::Allowed {
             local_cost.peak_memory_upper = grant.hard_memory_bytes;
+            local_cost.revocable_memory_target = local_cost
+                .revocable_memory_target
+                .min(grant.hard_memory_bytes - local_cost.minimum_memory_bytes);
             return Ok(Some(local_cost));
         }
         return Ok(None);
@@ -1080,10 +1107,12 @@ fn fit_local_retained_state_to_grant(
             .peak_memory_upper
             .saturating_sub(grant.hard_memory_bytes);
         local_cost.peak_memory_upper = grant.hard_memory_bytes;
+        local_cost.revocable_memory_target = local_cost
+            .revocable_memory_target
+            .min(grant.hard_memory_bytes - local_cost.minimum_memory_bytes);
         add_composition_spill_cost(&mut local_cost, spilled)?;
         return Ok(Some(local_cost));
     }
-    let _ = mandatory;
     Ok(None)
 }
 
@@ -1097,6 +1126,33 @@ fn add_composition_spill_cost(cost: &mut SearchCost, spilled: u64) -> Result<()>
     cost.resources_expected[ResourceDimension::SequentialIo as usize] += io_work * 2.0;
     cost.resources_risk_upper[ResourceDimension::SequentialIo as usize] += io_work * 6.0;
     cost.validate()
+}
+
+pub(crate) fn constrain_composed_cost_to_grant(
+    mut cost: SearchCost,
+    grant: EnforcerCostInput,
+) -> Result<Option<SearchCost>> {
+    if grant.hard_memory_bytes == u64::MAX {
+        return Ok(Some(cost));
+    }
+    if cost.minimum_memory_bytes > grant.hard_memory_bytes {
+        return Ok(None);
+    }
+    // Every child implementation has already proved its own resident state
+    // against this class. Their revocable targets draw from the same query
+    // pool and are therefore preferences, not additive reservations. Clamp
+    // only that elastic portion after composing the mandatory floors.
+    cost.revocable_memory_target = cost.revocable_memory_target.min(
+        grant
+            .hard_memory_bytes
+            .saturating_sub(cost.minimum_memory_bytes),
+    );
+    cost.peak_memory_upper = cost
+        .peak_memory_upper
+        .min(grant.hard_memory_bytes)
+        .max(cost.minimum_memory_bytes);
+    cost.validate()?;
+    Ok(Some(cost))
 }
 
 pub(crate) fn compose_candidate_cost(
@@ -1140,6 +1196,25 @@ pub(crate) fn compose_candidate_cost(
                 .saturating_add(overlapping_non_revocable);
             cost.non_revocable_memory_upper =
                 cost.non_revocable_memory_upper.max(retained_non_revocable);
+            let overlapping_minimum = child_costs
+                .iter()
+                .enumerate()
+                .filter(|(index, _)| overlapping_children & (1_u64 << index) != 0)
+                .map(|(_, child)| child.minimum_memory_bytes)
+                .max()
+                .unwrap_or(0);
+            // Revocable targets compete inside one query pool, but allocations
+            // required merely to make progress cannot be reclaimed from an
+            // overlapping child. Compose those execution floors additively;
+            // treating them as a shared maximum admitted plans that the
+            // runtime could immediately disprove.
+            let retained_minimum = local_cost
+                .minimum_memory_bytes
+                .saturating_add(overlapping_minimum);
+            cost.minimum_memory_bytes = cost.minimum_memory_bytes.max(retained_minimum);
+            cost.revocable_memory_target = cost
+                .revocable_memory_target
+                .max(local_cost.revocable_memory_target);
             // Revocable operator state is governed by one shared query pool.
             // Overlapping spillable working sets therefore compose by maximum;
             // only their non-revocable portions must be added.
@@ -1147,7 +1222,9 @@ pub(crate) fn compose_candidate_cost(
                 .peak_memory_upper
                 .max(local_cost.peak_memory_upper)
                 .max(overlapping_peak)
-                .max(retained_non_revocable);
+                .max(retained_non_revocable)
+                .max(retained_minimum)
+                .max(retained_minimum.saturating_add(cost.revocable_memory_target));
         }
     }
     cost.validate()?;

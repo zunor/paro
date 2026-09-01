@@ -360,9 +360,7 @@ pub(super) fn cost_for_grant(
     grant: GrantGoalKey,
     classes: &BTreeMap<crate::cascades::ids::ResourceGrantClassId, ResourceGrantClass>,
     force_spill: bool,
-    mandatory: bool,
 ) -> Result<Option<SearchCost>> {
-    cost.non_revocable_memory_upper = if spillable { 0 } else { cost.peak_memory_upper };
     if dependency == GrantDependencyDescriptor::Invariant {
         cost.validate()?;
         return Ok(Some(cost));
@@ -375,12 +373,35 @@ pub(super) fn cost_for_grant(
     let class = classes.get(&class_id).ok_or_else(|| {
         paro_error::internal("physical implementation references an unknown grant class")
     })?;
+    if cost.minimum_memory_bytes > class.hard_memory_bytes {
+        return Ok(None);
+    }
+    if spillable && class.spill_policy == SpillPolicy::Forbidden {
+        // In a no-spill class the entire retained state is required for
+        // forward progress. It is neither revocable nor a soft target, even
+        // when the same implementation can be adaptive in another class.
+        if force_spill
+            || cost.peak_memory_upper == u64::MAX
+            || cost.peak_memory_upper > class.hard_memory_bytes
+        {
+            return Ok(None);
+        }
+        cost.minimum_memory_bytes = cost.minimum_memory_bytes.max(cost.peak_memory_upper);
+        cost.non_revocable_memory_upper =
+            cost.non_revocable_memory_upper.max(cost.peak_memory_upper);
+        cost.revocable_memory_target = 0;
+        cost.validate()?;
+        return Ok(Some(cost));
+    }
     if cost.peak_memory_upper == u64::MAX {
         if spillable && class.spill_policy == SpillPolicy::Allowed {
-            // The allocator/spill protocol, not a cardinality estimate,
-            // proves the finite operational peak. Spill volume stays an
-            // estimate and must not be fabricated from UNKNOWN.
+            // These implementations allocate all retained state through the
+            // query pool. The allocator bounds resident memory and the spill
+            // protocol proves forward progress. Spill volume stays UNKNOWN.
             cost.peak_memory_upper = class.hard_memory_bytes;
+            cost.revocable_memory_target = cost
+                .revocable_memory_target
+                .min(class.hard_memory_bytes - cost.minimum_memory_bytes);
             cost.validate()?;
             return Ok(Some(cost));
         }
@@ -388,12 +409,13 @@ pub(super) fn cost_for_grant(
     }
     if force_spill && spillable {
         if class.spill_policy == SpillPolicy::Forbidden {
-            if !mandatory {
-                return Ok(None);
-            }
+            return Ok(None);
         } else {
             let spilled = cost.peak_memory_upper.max(1);
             cost.peak_memory_upper = cost.peak_memory_upper.min(class.hard_memory_bytes);
+            cost.revocable_memory_target = cost
+                .revocable_memory_target
+                .min(cost.peak_memory_upper - cost.minimum_memory_bytes);
             add_spill_cost(&mut cost, spilled)?;
             cost.validate()?;
             return Ok(Some(cost));
@@ -407,11 +429,13 @@ pub(super) fn cost_for_grant(
             .peak_memory_upper
             .saturating_sub(class.hard_memory_bytes);
         cost.peak_memory_upper = class.hard_memory_bytes;
+        cost.revocable_memory_target = cost
+            .revocable_memory_target
+            .min(class.hard_memory_bytes - cost.minimum_memory_bytes);
         add_spill_cost(&mut cost, spilled)?;
         cost.validate()?;
         return Ok(Some(cost));
     }
-    let _ = mandatory;
     Ok(None)
 }
 
@@ -542,5 +566,94 @@ pub(super) fn required_result_guarantee(plan: &LogicalPlan) -> ResultGuarantee {
             .map(required_result_guarantee)
             .find(|guarantee| matches!(guarantee, ResultGuarantee::ApproximateAllowed(_)))
             .unwrap_or(ResultGuarantee::Exact),
+    }
+}
+
+#[cfg(test)]
+mod resource_contract_tests {
+    use super::*;
+
+    fn class(spill_policy: SpillPolicy) -> ResourceGrantClass {
+        ResourceGrantClass {
+            id: crate::cascades::ids::ResourceGrantClassId(7),
+            hard_memory_bytes: 1024 * 1024,
+            spill_policy,
+            concurrency_class: 1,
+        }
+    }
+
+    fn cost(peak: u64, minimum: u64) -> SearchCost {
+        SearchCost {
+            peak_memory_upper: peak,
+            minimum_memory_bytes: minimum,
+            revocable_memory_target: peak.saturating_sub(minimum),
+            ..SearchCost::ZERO
+        }
+    }
+
+    #[test]
+    fn unknown_state_requires_a_forward_progress_spill_contract() {
+        let no_spill = class(SpillPolicy::Forbidden);
+        let spill = class(SpillPolicy::Allowed);
+        let grant = GrantGoalKey::Class(no_spill.id);
+
+        assert!(cost_for_grant(
+            cost(u64::MAX, 800 * 1024),
+            GrantDependencyDescriptor::Sensitive,
+            true,
+            grant,
+            &BTreeMap::from([(no_spill.id, no_spill)]),
+            false,
+        )
+        .unwrap()
+        .is_none());
+        assert_eq!(
+            cost_for_grant(
+                cost(u64::MAX, 800 * 1024),
+                GrantDependencyDescriptor::Sensitive,
+                true,
+                grant,
+                &BTreeMap::from([(spill.id, spill)]),
+                false,
+            )
+            .unwrap()
+            .unwrap()
+            .peak_memory_upper,
+            spill.hard_memory_bytes
+        );
+    }
+
+    #[test]
+    fn forced_external_representation_is_not_faked_in_a_no_spill_class() {
+        let no_spill = class(SpillPolicy::Forbidden);
+        assert!(cost_for_grant(
+            cost(900 * 1024, 800 * 1024),
+            GrantDependencyDescriptor::Sensitive,
+            true,
+            GrantGoalKey::Class(no_spill.id),
+            &BTreeMap::from([(no_spill.id, no_spill)]),
+            true,
+        )
+        .unwrap()
+        .is_none());
+    }
+
+    #[test]
+    fn finite_adaptive_state_becomes_a_floor_without_spill_permission() {
+        let no_spill = class(SpillPolicy::Forbidden);
+        let admitted = cost_for_grant(
+            cost(900 * 1024, 800 * 1024),
+            GrantDependencyDescriptor::Sensitive,
+            true,
+            GrantGoalKey::Class(no_spill.id),
+            &BTreeMap::from([(no_spill.id, no_spill)]),
+            false,
+        )
+        .unwrap()
+        .expect("finite retained state fits the no-spill grant");
+
+        assert_eq!(admitted.minimum_memory_bytes, 900 * 1024);
+        assert_eq!(admitted.non_revocable_memory_upper, 900 * 1024);
+        assert_eq!(admitted.revocable_memory_target, 0);
     }
 }

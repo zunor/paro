@@ -264,6 +264,7 @@ mod tests {
             crate::plan::LogicalPlan::new(&ctx, expression_get(11)),
             crate::plan::LogicalPlan::new(&ctx, nested_right),
             vec![correlated_column(1)],
+            None,
         ));
 
         assert!(!operator_has_correlated_columns_at_depth(

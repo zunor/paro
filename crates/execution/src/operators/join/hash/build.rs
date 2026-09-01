@@ -63,7 +63,7 @@ pub struct HashJoinBuildSinkExec {
 impl HashJoinBuildSinkExec {
     pub(crate) fn create_global(&self, ctx: &mut PipelineInitContext) -> Result<SinkGlobal> {
         let handle = ctx.handles.get(self.handle)?;
-        if self.spill_policy != SpillExecutionPolicy::Forced
+        if self.spill_policy != SpillExecutionPolicy::ForcedExternal
             && handle.build_time_integer_builder().is_none()
         {
             if let Some(index) = &self.build_time_integer_index {
@@ -105,7 +105,7 @@ impl HashJoinBuildSinkExec {
         if let Some(channel_count) = self.grouped_reduction_channels {
             table.configure_grouped_reduction_extrema(channel_count)?;
         }
-        if self.spill_policy != SpillExecutionPolicy::Forbidden {
+        if self.spill_policy != SpillExecutionPolicy::InMemory {
             ctx.query.memory.register_reclaimer_once_by_name(Arc::new(
                 HashJoinBuildSpillReclaimer::new(
                     handle.clone(),
@@ -149,7 +149,7 @@ impl HashJoinBuildSinkExec {
         ));
         let build_spill = Arc::new(parking_lot::Mutex::new(None));
         let (local_build_spill_reclaimer_name, query_memory) = if self.spill_policy
-            == SpillExecutionPolicy::Forbidden
+            == SpillExecutionPolicy::InMemory
             || !hash_join_local_build_spill_supported(self.join_type)
         {
             (None, None)
@@ -333,7 +333,7 @@ impl HashJoinBuildSinkExec {
                 "hash join build sink global state mismatch",
             ));
         };
-        if self.spill_policy != SpillExecutionPolicy::Forbidden {
+        if self.spill_policy != SpillExecutionPolicy::InMemory {
             global.handle.enable_build_reclaim();
         }
         Ok(PrepareFinishPoll::Done)
@@ -350,8 +350,8 @@ impl HashJoinBuildSinkExec {
             ));
         };
         let handle = global.handle.clone();
-        let force_external = self.spill_policy == SpillExecutionPolicy::Forced;
-        let allow_external = self.spill_policy != SpillExecutionPolicy::Forbidden;
+        let force_external = self.spill_policy == SpillExecutionPolicy::ForcedExternal;
+        let allow_external = self.spill_policy != SpillExecutionPolicy::InMemory;
         let memory_class = if force_external {
             MemoryClass::External
         } else {
@@ -443,8 +443,8 @@ impl HashJoinBuildSinkExec {
             unregister_hash_join_build_reclaimer(ctx, global.handle.as_ref());
             return Ok(FinishPoll::Done);
         }
-        let force_external = self.spill_policy == SpillExecutionPolicy::Forced;
-        let allow_external = self.spill_policy != SpillExecutionPolicy::Forbidden;
+        let force_external = self.spill_policy == SpillExecutionPolicy::ForcedExternal;
+        let allow_external = self.spill_policy != SpillExecutionPolicy::InMemory;
         if (force_external
             || (allow_external
                 && should_use_memory_triggered_external_join(ctx, global.handle.as_ref())))

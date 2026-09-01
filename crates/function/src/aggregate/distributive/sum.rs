@@ -596,7 +596,8 @@ mod tests {
         assert!(!sum.execution_semantics_equal(&without_rollup));
 
         let mut different_empty_input = sum.clone();
-        different_empty_input.empty_input = AggregateEmptyInput::NonNull;
+        different_empty_input.empty_input =
+            AggregateEmptyInput::Exact(paro_common::runtime_value::Value::BigInt(0));
         assert!(!sum.execution_semantics_equal(&different_empty_input));
 
         let reducer = sum.partial_merge_function().unwrap();

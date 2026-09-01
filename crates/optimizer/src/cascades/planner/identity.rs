@@ -493,7 +493,16 @@ pub(super) fn encode_dependent_join(
         fingerprint.write_u64(correlation.depth as u64);
     }
     match &join.kind {
-        DependentJoinKind::Scalar => fingerprint.write_u64(0),
+        DependentJoinKind::Scalar { presence_binding } => {
+            fingerprint.write_u64(0);
+            if let Some(binding) = presence_binding {
+                fingerprint.write_u64(1);
+                fingerprint.write_u64(binding.table_index as u64);
+                fingerprint.write_u64(binding.column_index as u64);
+            } else {
+                fingerprint.write_u64(0);
+            }
+        }
         DependentJoinKind::Mark {
             mark_index,
             subquery,

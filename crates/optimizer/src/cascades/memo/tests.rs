@@ -340,6 +340,7 @@ fn winner_frontier_retains_non_dominated_resource_tradeoffs() {
             },
             critical_path: CompactRange::point(score).unwrap(),
             peak_memory_upper: memory,
+            revocable_memory_target: memory,
             ..SearchCost::ZERO
         };
         memo.record_winner(

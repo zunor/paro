@@ -235,7 +235,8 @@ fn physical_input_rollup_verifier_rejects_unexecutable_strategy() {
         .as_mut()
         .unwrap()
         .resource
-        .max_local_tables = 1;
+        .memory
+        .max_concurrent_tasks = 1;
     assert!(spec
         .verify_post_reduction()
         .unwrap_err()
@@ -272,8 +273,12 @@ fn force_input_rollup(spec: &mut crate::physical::specs::AggregateSpec) {
         group_cardinalities: Box::new([4]),
         resource: crate::physical::specs::PerfectHashResourceContract {
             slots: 4,
-            bytes_per_table_upper: usize::MAX,
-            max_local_tables: 2,
+            table_bytes_upper: usize::MAX,
+            memory: crate::physical::ExecutionMemoryContract {
+                fixed_non_revocable_bytes: u64::MAX,
+                max_concurrent_tasks: 2,
+                ..Default::default()
+            },
         },
     });
     spec.post_reduction

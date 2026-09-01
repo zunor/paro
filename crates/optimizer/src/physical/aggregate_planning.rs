@@ -217,7 +217,7 @@ const PERFECT_HASH_RANGE_LIMIT: u128 = 1u128 << 32;
 
 /// Build the complete immutable perfect-hash contract used by enumeration,
 /// costing, extraction, and execution. The key domain comes only from schema
-/// invariants. `bytes_per_table_upper` deliberately over-accounts direct
+/// invariants. `table_bytes_upper` deliberately over-accounts direct
 /// update scratch so the executor can validate its exact allocation against
 /// one contract without rediscovering feasibility.
 pub(crate) fn plan_perfect_hash_aggregate(
@@ -301,18 +301,41 @@ pub(crate) fn plan_perfect_hash_aggregate(
         .then(|| VECTOR_SIZE.checked_mul(std::mem::size_of::<usize>()))
         .flatten()
         .unwrap_or(0);
-    let bytes_per_table_upper = state_storage_bytes
+    let table_bytes_upper = state_storage_bytes
         .checked_add(occupancy_bytes)?
         .checked_add(scratch_bytes)?
         .checked_add(materialized_slots)?;
+    let per_task_scratch_bytes = groups
+        .iter()
+        .chain(aggregate_exprs.iter().filter_map(|expression| {
+            let Expression::Aggregate(aggregate) = expression else {
+                return None;
+            };
+            aggregate.children.first()
+        }))
+        .try_fold(0usize, |bytes, expression| {
+            let width = expression.return_type().type_size().max(VARLEN_REF_WIDTH);
+            bytes.checked_add(width.checked_mul(VECTOR_SIZE)?)
+        })?
+        .checked_add(VECTOR_SIZE.checked_mul(size_of::<u64>() + size_of::<u32>())?)?;
+    let memory = crate::physical::ExecutionMemoryContract {
+        fixed_non_revocable_bytes: u64::try_from(table_bytes_upper).ok()?,
+        fixed_scratch_bytes: crate::physical::resources::BLOCKING_FIXED_SCRATCH_BYTES,
+        per_task_scratch_bytes: u64::try_from(per_task_scratch_bytes).ok()?,
+        max_concurrent_tasks: 1,
+        revocable_minimum_bytes: 0,
+        revocable_target_bytes: 0,
+        spill_buffer_minimum_bytes: 0,
+    };
+    memory.validate().ok()?;
 
     Some(PerfectHashAggregatePlan {
         group_minima: group_minima.into_boxed_slice(),
         group_cardinalities: group_cardinalities.into_boxed_slice(),
         resource: PerfectHashResourceContract {
             slots,
-            bytes_per_table_upper,
-            max_local_tables: 1,
+            table_bytes_upper,
+            memory,
         },
     })
 }

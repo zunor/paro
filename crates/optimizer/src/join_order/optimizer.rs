@@ -164,13 +164,14 @@ pub struct JoinOrderOptimizer {
     /// Filter metadata extracted from the original join tree.
     filter_infos: Vec<Arc<FilterInfo>>,
     /// DP plans keyed by relation-set string for recursive reconstruction.
-    plans: HashMap<Arc<JoinRelationSet>, DPJoinNode>,
+    plans: HashMap<Arc<JoinRelationSet>, Vec<DPJoinNode>>,
     /// Output-column statistics gathered earlier in the pipeline.
     column_stats: HashMap<ColumnBinding, Arc<ColumnStatistics>>,
     /// Original base-relation subplans keyed by relation id for reconstruction.
     relation_plans: Vec<LogicalPlan>,
     exact_relation_limit: usize,
     max_pairs: usize,
+    max_frontier_size: usize,
 }
 
 impl JoinOrderOptimizer {
@@ -187,12 +188,14 @@ impl JoinOrderOptimizer {
             relation_plans: Vec::new(),
             exact_relation_limit: 12,
             max_pairs: 10_000,
+            max_frontier_size: 4,
         }
     }
 
     pub fn with_search_budget(mut self, budget: &crate::cascades::SearchBudget) -> Self {
         self.exact_relation_limit = usize::from(budget.max_join_exact_relations);
         self.max_pairs = usize::try_from(budget.max_join_connected_pairs).unwrap_or(usize::MAX);
+        self.max_frontier_size = usize::from(budget.max_multiway_join_candidates).max(1);
         self
     }
 
@@ -233,6 +236,99 @@ impl JoinOrderOptimizer {
         plan.try_map_post_order(|plan| self.optimize_current_plan(ctx, bind_context, plan))
     }
 
+    /// Enumerate bounded join-region alternatives without selecting one
+    /// before Memo. Non-join ancestors are rebuilt around the retained child
+    /// frontier so every returned item is a complete logical plan.
+    pub fn enumerate_plan_frontier(
+        &mut self,
+        ctx: &StatementContext,
+        plan: LogicalPlan,
+        column_stats: &HashMap<ColumnBinding, Arc<ColumnStatistics>>,
+        bind_context: &BindContext,
+    ) -> Result<Vec<LogicalPlan>> {
+        self.column_stats = column_stats.clone();
+        let plan = ColumnLifetimeAnalyzer::new(true).optimize(plan)?;
+        self.enumerate_tree_frontier(ctx, bind_context, plan)
+    }
+
+    fn enumerate_tree_frontier(
+        &mut self,
+        ctx: &StatementContext,
+        bind_context: &BindContext,
+        plan: LogicalPlan,
+    ) -> Result<Vec<LogicalPlan>> {
+        let mut detached = Vec::new();
+        let skeleton = plan.try_map_children(|child| {
+            detached.push(child);
+            Ok(LogicalPlan::synthetic(LogicalOperator::DummyScan))
+        })?;
+        let mut child_frontiers = Vec::with_capacity(detached.len());
+        for child in detached {
+            child_frontiers.push(self.enumerate_tree_frontier(ctx, bind_context, child)?);
+        }
+
+        let combinations = child_frontiers
+            .iter()
+            .fold(1usize, |count, frontier| {
+                count.saturating_mul(frontier.len().max(1))
+            })
+            .min(self.max_frontier_size)
+            .max(1);
+        let mut rebuilt = Vec::with_capacity(combinations);
+        for ordinal in 0..combinations {
+            let mut divisor = 1usize;
+            let mut child_index = 0usize;
+            let mut shell =
+                duplicate_plan_preserving_indices(&skeleton, bind_context.shared().as_ref());
+            shell = shell.try_map_children(|_| {
+                let frontier = child_frontiers.get(child_index).ok_or_else(|| {
+                    paro_common::error::internal("join frontier child arity mismatch")
+                })?;
+                if frontier.is_empty() {
+                    return Err(paro_common::error::internal(
+                        "join frontier produced an empty child alternative set",
+                    ));
+                }
+                let selected = (ordinal / divisor) % frontier.len();
+                divisor = divisor.saturating_mul(frontier.len());
+                child_index += 1;
+                Ok(duplicate_plan_preserving_indices(
+                    &frontier[selected],
+                    bind_context.shared().as_ref(),
+                ))
+            })?;
+            rebuilt.push(shell);
+        }
+
+        let mut result = Vec::new();
+        for plan in rebuilt {
+            if self.can_optimize_join(&plan.operator) {
+                let plan_id = plan.id;
+                let mut alternatives = self.optimize_join_tree(
+                    ctx,
+                    bind_context,
+                    duplicate_plan_preserving_indices(&plan, bind_context.shared().as_ref()),
+                )?;
+                for alternative in &mut alternatives {
+                    alternative.id = plan_id;
+                }
+                if !alternatives.is_empty() {
+                    result.extend(alternatives);
+                    if result.len() >= self.max_frontier_size {
+                        result.truncate(self.max_frontier_size);
+                        break;
+                    }
+                    continue;
+                }
+            }
+            result.push(plan);
+            if result.len() >= self.max_frontier_size {
+                break;
+            }
+        }
+        Ok(result)
+    }
+
     /// Keep join-graph extraction and reconstruction isolated from the
     /// explicit traversal state. Those routines own several large planner
     /// values and should not be folded back into the post-order driver.
@@ -243,11 +339,15 @@ impl JoinOrderOptimizer {
         plan: LogicalPlan,
     ) -> Result<LogicalPlan> {
         if self.can_optimize_join(&plan.operator) {
-            if let Some(mut optimized) = self.optimize_join_tree(
-                ctx,
-                bind_context,
-                duplicate_plan_preserving_indices(&plan, bind_context.shared().as_ref()),
-            )? {
+            if let Some(mut optimized) = self
+                .optimize_join_tree(
+                    ctx,
+                    bind_context,
+                    duplicate_plan_preserving_indices(&plan, bind_context.shared().as_ref()),
+                )?
+                .into_iter()
+                .next()
+            {
                 optimized.id = plan.id;
                 return Ok(optimized);
             }
@@ -280,7 +380,7 @@ impl JoinOrderOptimizer {
         ctx: &StatementContext,
         bind_context: &BindContext,
         plan: LogicalPlan,
-    ) -> Result<Option<LogicalPlan>> {
+    ) -> Result<Vec<LogicalPlan>> {
         // Reset state
         self.relation_manager = RelationManager::new();
         self.set_manager = JoinRelationSetManager::new();
@@ -304,7 +404,7 @@ impl JoinOrderOptimizer {
 
         // Check if we have enough relations to optimize
         if self.relation_manager.num_relations() < 2 {
-            return Ok(None);
+            return Ok(Vec::new());
         }
 
         // Extract edges from filters
@@ -312,7 +412,7 @@ impl JoinOrderOptimizer {
             .relation_manager
             .extract_edges(&filters, &mut self.set_manager);
         let Some(extracted_predicates) = extracted_predicates else {
-            return Ok(None);
+            return Ok(Vec::new());
         };
         let filter_infos = extracted_predicates.graph_filters;
         let inferred_filters =
@@ -377,6 +477,7 @@ impl JoinOrderOptimizer {
             self.relation_manager.num_relations(),
             self.exact_relation_limit,
             self.max_pairs,
+            self.max_frontier_size,
         );
 
         // Initialize leaf plans
@@ -386,30 +487,31 @@ impl JoinOrderOptimizer {
         if enumerator.solve_join_order() != EnumerationOutcome::Complete {
             // The original tree remains authoritative when pair enumeration
             // is exhausted or a cut cannot preserve its logical semantics.
-            return Ok(None);
+            return Ok(Vec::new());
         }
 
-        // Get the final plan (clone it to avoid borrow issues)
-        let final_plan = match enumerator.get_final_plan() {
-            Some(plan) => plan.clone(),
-            None => return Ok(None),
-        };
+        let final_plans = enumerator.get_final_plans().to_vec();
+        if final_plans.is_empty() {
+            return Ok(Vec::new());
+        }
         self.plans = enumerator.get_plans().clone();
 
         // Drop enumerator to release mutable borrow
         drop(enumerator);
 
-        // Reconstruct the logical plan
-        let Some(reconstructed) =
-            self.reconstruct_plan(bind_context, &final_plan, &mut HashSet::new())?
-        else {
-            return Ok(None);
-        };
-
-        Ok(Some(self.attach_filter_expressions(
-            reconstructed,
-            extracted_predicates.root_filters,
-        )))
+        let mut result = Vec::with_capacity(final_plans.len());
+        for final_plan in final_plans {
+            let Some(reconstructed) =
+                self.reconstruct_plan(bind_context, &final_plan, &mut HashSet::new())?
+            else {
+                continue;
+            };
+            result.push(self.attach_filter_expressions(
+                reconstructed,
+                extracted_predicates.root_filters.clone(),
+            ));
+        }
+        Ok(result)
     }
 
     /// Fold relation-local predicates into the leaf statistics consumed by DP.
@@ -755,8 +857,12 @@ impl JoinOrderOptimizer {
                 used_filters,
             )))
         } else {
-            let left_node = self.lookup_plan(&node.left_set)?;
-            let right_node = self.lookup_plan(&node.right_set)?;
+            let left_node = node.left_plan.as_deref().ok_or_else(|| {
+                paro_common::error::internal("join frontier member lost its left child")
+            })?;
+            let right_node = node.right_plan.as_deref().ok_or_else(|| {
+                paro_common::error::internal("join frontier member lost its right child")
+            })?;
             let mut left_set = node.left_set.clone();
             let mut right_set = node.right_set.clone();
             let Some(mut left_plan) =
@@ -857,15 +963,6 @@ impl JoinOrderOptimizer {
                 used_filters,
             )))
         }
-    }
-
-    fn lookup_plan(&self, set: &Arc<JoinRelationSet>) -> Result<&DPJoinNode> {
-        self.plans.get(set).ok_or_else(|| {
-            paro_common::error::internal(format!(
-                "Join order optimizer could not find plan for set {}",
-                set
-            ))
-        })
     }
 
     fn join_cardinality_estimate(cardinality: f64) -> CardinalityEstimate {

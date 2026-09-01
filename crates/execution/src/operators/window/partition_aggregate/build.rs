@@ -417,7 +417,7 @@ impl PartitionAggregateWindowBuildSinkExec {
     pub(crate) fn create_global(&self, ctx: &mut PipelineInitContext) -> Result<SinkGlobal> {
         self.spec.verify()?;
         let spill_policy = self.spec.aggregate.spill_policy;
-        if spill_policy == crate::physical::specs::SpillExecutionPolicy::Forced
+        if spill_policy == crate::physical::specs::SpillExecutionPolicy::ForcedExternal
             && !query_has_temporary_directory(ctx.query)
         {
             return Err(paro_error::out_of_memory(
@@ -426,7 +426,7 @@ impl PartitionAggregateWindowBuildSinkExec {
         }
         let handle = ctx.handles.get(self.handle)?;
         if self.spec.domain == PartitionAggregateDomain::Keyed
-            && spill_policy != crate::physical::specs::SpillExecutionPolicy::Forbidden
+            && spill_policy != crate::physical::specs::SpillExecutionPolicy::InMemory
             && query_has_temporary_directory(ctx.query)
         {
             ctx.query.memory.register_reclaimer_once_by_name(Arc::new(
@@ -452,7 +452,7 @@ impl PartitionAggregateWindowBuildSinkExec {
                 external_payloads: Vec::new(),
             }));
             if query_has_temporary_directory(ctx.query)
-                && spill_policy == crate::physical::specs::SpillExecutionPolicy::Allowed
+                && spill_policy == crate::physical::specs::SpillExecutionPolicy::Adaptive
                 && !partition_aggregate_preemptive_spill_enabled(ctx.query)
             {
                 let owner: Arc<dyn paro_common::memory::MemoryOwner> = ctx.query.memory.clone();
@@ -489,12 +489,12 @@ impl PartitionAggregateWindowBuildSinkExec {
         if self.spec.domain == PartitionAggregateDomain::Global {
             let handle = ctx.handles.get(self.handle)?;
             let spillable = self.spec.aggregate.spill_policy
-                != crate::physical::specs::SpillExecutionPolicy::Forbidden
+                != crate::physical::specs::SpillExecutionPolicy::InMemory
                 && query_has_temporary_directory(ctx.query);
             let force_external = self.spec.aggregate.spill_policy
-                == crate::physical::specs::SpillExecutionPolicy::Forced
+                == crate::physical::specs::SpillExecutionPolicy::ForcedExternal
                 || (self.spec.aggregate.spill_policy
-                    == crate::physical::specs::SpillExecutionPolicy::Allowed
+                    == crate::physical::specs::SpillExecutionPolicy::Adaptive
                     && partition_aggregate_preemptive_spill_enabled(ctx.query));
             let payloads = Arc::new(parking_lot::Mutex::new(if spillable && force_external {
                 GlobalAggregatePayloadBacking::External(global_detail_spill_writer(
@@ -552,12 +552,12 @@ impl PartitionAggregateWindowBuildSinkExec {
             )
         });
         let spillable = self.spec.aggregate.spill_policy
-            != crate::physical::specs::SpillExecutionPolicy::Forbidden
+            != crate::physical::specs::SpillExecutionPolicy::InMemory
             && query_has_temporary_directory(ctx.query);
         let force_external = self.spec.aggregate.spill_policy
-            == crate::physical::specs::SpillExecutionPolicy::Forced
+            == crate::physical::specs::SpillExecutionPolicy::ForcedExternal
             || (self.spec.aggregate.spill_policy
-                == crate::physical::specs::SpillExecutionPolicy::Allowed
+                == crate::physical::specs::SpillExecutionPolicy::Adaptive
                 && partition_aggregate_preemptive_spill_enabled(ctx.query));
         let memory = partition_aggregate_table_memory(ctx.query, spillable);
         let radix_bits = aggregate_spill_radix_bits(ctx.query.session.number_of_threads());

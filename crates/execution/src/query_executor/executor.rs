@@ -3,6 +3,7 @@
 
 //! Query executor for typed runtime programs.
 
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Instant;
 
@@ -20,6 +21,8 @@ use crate::query_executor::program_executor;
 use crate::runtime::ParameterBindings;
 
 use super::stream::ResultHandler;
+
+static NEXT_STANDALONE_EXECUTION_ID: AtomicU64 = AtomicU64::new(1_u64 << 63);
 
 /// Executor holds a StatementContext Arc to avoid lifetime pollution.
 pub struct Executor {
@@ -69,13 +72,59 @@ impl Executor {
         let external_worker_slots = if self.session.python_runtime_status().is_some_and(|status| {
             status.availability == paro_external::runtime::host::PythonRuntimeAvailability::Ready
         }) {
-            1
+            self.session.python_execution_slot_limit()
         } else {
             0
         };
-        let program = compiled
-            .program()
-            .admit_for_execution(available_memory, external_worker_slots)?;
+        let mut program = compiled.program().admit_for_execution(
+            available_memory,
+            external_worker_slots,
+            &|plan| super::compiled::physical_plan_dependencies_available(plan, &self.session),
+        )?;
+        let required_external_slots = program
+            .reservation()
+            .map(|reservation| reservation.external_worker_slots)
+            .unwrap_or(0);
+        let external_worker_lease = if required_external_slots == 0 {
+            None
+        } else {
+            let query_id = query_memory_pool
+                .registered_query_id()
+                .unwrap_or_else(|| NEXT_STANDALONE_EXECUTION_ID.fetch_add(1, Ordering::AcqRel));
+            match self
+                .session
+                .try_acquire_python_worker_slots(query_id, required_external_slots)?
+            {
+                Some(lease) => Some(lease),
+                None => {
+                    // The availability snapshot raced with another query.
+                    // Re-admit without external capacity so a non-external
+                    // portfolio variant remains usable when one exists.
+                    program =
+                        compiled
+                            .program()
+                            .admit_for_execution(available_memory, 0, &|plan| {
+                                super::compiled::physical_plan_dependencies_available(
+                                    plan,
+                                    &self.session,
+                                )
+                            })?;
+                    None
+                }
+            }
+        };
+        if let Some(reservation) = program.reservation() {
+            let minimum = usize::try_from(reservation.minimum_memory_bytes).unwrap_or(usize::MAX);
+            if !query_memory_pool.try_reserve_minimum_capacity(minimum)? {
+                return Err(paro_common::error::out_of_memory(format!(
+                    "unable to reserve the admitted plan's {} byte execution floor",
+                    reservation.minimum_memory_bytes
+                )));
+            }
+        }
+        if let Some(lease) = external_worker_lease {
+            query_memory_pool.attach_external_worker_lease(lease);
+        }
         let handler = self.execute_program(
             &program,
             result_names,

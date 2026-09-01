@@ -6,6 +6,8 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
+use paro_common::error::{self as paro_error, Result};
+
 use crate::binder::context::BindShared;
 use crate::binder::CorrelatedColumnInfo;
 use crate::expression::{ColumnRefExpression, Expression, SubqueryExpression};
@@ -61,6 +63,66 @@ pub fn duplicate_plan_preserving_indices(
 ) -> LogicalPlan {
     let mut copier = LogicalPlanDeepCopy::new_preserve_indices();
     copier.duplicate_plan_preserve(bind_shared, plan)
+}
+
+/// Fork an owned optimizer plan without using the native call stack for the
+/// plan-tree traversal.
+///
+/// The original branch keeps its plan-node ids; the sibling receives fresh
+/// ids while preserving table / CTE indices and statistics. Optimizer
+/// frontiers should prefer this operation over repeatedly cloning a borrowed
+/// tree: decorrelation can make otherwise modest SQL plans deep enough that a
+/// recursive `LogicalOperator` copy exhausts an executor thread's stack.
+pub fn fork_plan_preserving_indices(
+    plan: LogicalPlan,
+    bind_shared: &BindShared,
+) -> Result<(LogicalPlan, LogicalPlan)> {
+    let mut copier = LogicalPlanDeepCopy::new_preserve_indices();
+    let (original, duplicate) = plan.try_fold_post_order(|plan, duplicate_children| {
+        let duplicate_stats = plan.stats.clone();
+        let mut original_children = Vec::new();
+        let skeleton = plan.try_map_children(|child| {
+            original_children.push(child);
+            Ok(LogicalPlan::synthetic(LogicalOperator::DummyScan))
+        })?;
+
+        // `skeleton` has at most one level of dummy children, so the legacy
+        // operator copier is used only as a payload copier here and cannot
+        // recurse through the source plan.
+        let duplicate_operator = copier.copy_operator(&skeleton.operator, bind_shared);
+
+        let mut original_children = original_children.into_iter();
+        let original = skeleton.try_map_children(|_| {
+            original_children
+                .next()
+                .ok_or_else(|| paro_error::internal("plan fork lost an original child"))
+        })?;
+        if original_children.next().is_some() {
+            return Err(paro_error::internal(
+                "plan fork produced excess original children",
+            ));
+        }
+
+        let mut duplicate = LogicalPlan {
+            id: bind_shared.next_plan_id(),
+            stats: duplicate_stats,
+            operator: duplicate_operator,
+        };
+        let mut duplicate_children = duplicate_children.into_iter();
+        duplicate = duplicate.try_map_children(|_| {
+            duplicate_children
+                .next()
+                .ok_or_else(|| paro_error::internal("plan fork lost a duplicate child"))
+        })?;
+        if duplicate_children.next().is_some() {
+            return Err(paro_error::internal(
+                "plan fork produced excess duplicate children",
+            ));
+        }
+
+        Ok((original, duplicate))
+    })?;
+    Ok((original, duplicate))
 }
 
 /// Like [`duplicate_plan_preserving_indices`] but copies only the operator tree (no outer wrapper).
@@ -461,8 +523,19 @@ impl LogicalPlanDeepCopy {
                 let left = self.copy_plan(dj.left.as_ref(), bind_shared);
                 let right = self.copy_plan(dj.right.as_ref(), bind_shared);
                 let mut kind = dj.kind.clone();
-                if let crate::operator::DependentJoinKind::Mark { mark_index, .. } = &mut kind {
-                    self.remap_table_index(bind_shared, mark_index);
+                match &mut kind {
+                    crate::operator::DependentJoinKind::Mark { mark_index, .. } => {
+                        self.remap_table_index(bind_shared, mark_index);
+                    }
+                    crate::operator::DependentJoinKind::Scalar {
+                        presence_binding: Some(binding),
+                    } => {
+                        self.remap_table_index(bind_shared, &mut binding.table_index);
+                    }
+                    crate::operator::DependentJoinKind::Scalar {
+                        presence_binding: None,
+                    }
+                    | crate::operator::DependentJoinKind::Lateral { .. } => {}
                 }
                 LogicalOperator::DependentJoin(DepJoinNode {
                     left: Box::new(left),
@@ -833,7 +906,7 @@ impl DeepCopyBindingRewriter {
 mod tests {
     use paro_common::types::LogicalType;
 
-    use super::{deep_copy_plan, duplicate_plan_preserving_indices};
+    use super::{deep_copy_plan, duplicate_plan_preserving_indices, fork_plan_preserving_indices};
     use crate::binder::context::BindContext;
     use crate::binder::ir::CTEMaterialize;
     use crate::expression::{
@@ -841,7 +914,7 @@ mod tests {
         ReferenceExpression, WindowExpression, WindowFrame,
     };
     use crate::operator::{
-        Aggregate, CTERef, ColumnBinding, ExpressionGet, LogicalOperator, MaterializedCTE,
+        Aggregate, CTERef, ColumnBinding, ExpressionGet, Filter, LogicalOperator, MaterializedCTE,
         PostAggregateReduction, Projection, Window,
     };
     use crate::plan::{CardinalityEstimate, LogicalPlan, NodeStats, PlanNodeId};
@@ -899,6 +972,43 @@ mod tests {
             panic!("expected column ref");
         };
         assert_eq!(column_ref.binding.table_index, expr_get.table_index);
+    }
+
+    #[test]
+    fn optimizer_plan_fork_uses_a_bounded_native_stack() {
+        let bind_context = BindContext::new();
+        let mut plan = LogicalPlan::new(&bind_context, expression_get(7));
+        for _ in 0..128 {
+            plan = LogicalPlan::new(
+                &bind_context,
+                LogicalOperator::Filter(Filter::new(plan, Vec::new())),
+            );
+        }
+
+        let (original, duplicate) =
+            fork_plan_preserving_indices(plan, bind_context.shared().as_ref())
+                .expect("bounded-stack optimizer fork");
+        let mut original_ids = Vec::new();
+        original
+            .try_visit_pre_order(|node| {
+                original_ids.push(node.id);
+                Ok(())
+            })
+            .unwrap();
+        let mut duplicate_ids = Vec::new();
+        duplicate
+            .try_visit_pre_order(|node| {
+                duplicate_ids.push(node.id);
+                Ok(())
+            })
+            .unwrap();
+
+        assert_eq!(original_ids.len(), 129);
+        assert_eq!(duplicate_ids.len(), original_ids.len());
+        assert!(original_ids
+            .iter()
+            .zip(duplicate_ids)
+            .all(|(original, duplicate)| *original != duplicate));
     }
 
     #[test]

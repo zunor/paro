@@ -100,7 +100,51 @@ pub(super) fn spill_grouping_set_payloads_to_outputs(
             .iter()
             .filter(|payload| payload.grouping_idx() == grouping_idx)
             .collect::<Vec<_>>();
-        let Some(first_payload) = domain_payloads.first() else {
+        let first_payload = domain_payloads.first();
+        if first_payload.is_none() && !grouping_set.is_empty() {
+            continue;
+        }
+        let mut domain_spec = spec.clone();
+        domain_spec.grouping_sets = vec![grouping_set.clone()].into_boxed_slice();
+        let domain_grouping_sets = [grouping_set.clone()];
+        let mut domain_writers = None;
+        if first_payload.is_none() {
+            let mut identity_tables = create_hash_aggregate_tables(
+                &domain_spec,
+                ctx.query.allocator(MemoryTag::HashTable),
+                query_hash_table_memory(ctx.query),
+                ctx.query.session.number_of_threads(),
+            )?;
+            initialize_empty_grouping_domain_rows(
+                ctx.query,
+                &domain_spec,
+                &domain_grouping_sets,
+                &mut identity_tables,
+            )?;
+            append_partition_tables_to_output_writers(
+                &mut domain_writers,
+                &mut identity_tables,
+                ctx.query.session.buffer_pool().clone(),
+                query_hash_table_memory(ctx.query),
+                post_reducer.as_deref_mut(),
+            )?;
+        }
+        let Some(first_payload) = first_payload else {
+            let mut domain_outputs =
+                finish_output_spill_writers(domain_writers.unwrap_or_default())?;
+            if domain_outputs.len() != 1 {
+                return Err(paro_error::internal(format!(
+                    "empty grouping domain produced {} outputs for domain {grouping_idx}",
+                    domain_outputs.len()
+                )));
+            }
+            let output = domain_outputs.pop().flatten();
+            output_bytes = output_bytes.saturating_add(
+                output
+                    .as_ref()
+                    .map_or(0, AggregateSpilledOutput::size_in_bytes),
+            );
+            outputs[grouping_idx] = output;
             continue;
         };
         let partition_count = first_payload.partition_count();
@@ -113,10 +157,6 @@ pub(super) fn spill_grouping_set_payloads_to_outputs(
             )));
         }
 
-        let mut domain_spec = spec.clone();
-        domain_spec.grouping_sets = vec![grouping_set.clone()].into_boxed_slice();
-        let domain_grouping_sets = [grouping_set.clone()];
-        let mut domain_writers = None;
         for partition_idx in 0..partition_count {
             let mut partition_tables = create_hash_aggregate_tables(
                 &domain_spec,

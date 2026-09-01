@@ -48,7 +48,7 @@ fn grouped_count_spec() -> AggregateSpec {
         aggregate_orders: Box::new([Box::new([])]),
         post_reduction: None,
         having_filter: Box::new([]),
-        spill_policy: crate::physical::specs::SpillExecutionPolicy::Allowed,
+        spill_policy: crate::physical::specs::SpillExecutionPolicy::Adaptive,
         perfect_hash: None,
         output_names: Box::new(["k".to_string(), "count".to_string()]),
         output_types: Box::new([LogicalType::Integer, LogicalType::BigInt]),
@@ -79,7 +79,7 @@ fn grouped_string_agg_spec() -> AggregateSpec {
         aggregate_orders: Box::new([Box::new([])]),
         post_reduction: None,
         having_filter: Box::new([]),
-        spill_policy: crate::physical::specs::SpillExecutionPolicy::Allowed,
+        spill_policy: crate::physical::specs::SpillExecutionPolicy::Adaptive,
         perfect_hash: None,
         output_names: Box::new(["k".to_string(), "items".to_string()]),
         output_types: Box::new([LogicalType::Integer, LogicalType::Varchar]),
@@ -281,6 +281,94 @@ fn grouping_set_spill_partitions_each_domain_by_its_own_keys() {
             ),
         ]
     );
+}
+
+#[test]
+fn empty_grouping_set_owns_an_identity_domain_without_input() {
+    let query = query_context();
+    let mut spec = grouped_count_spec();
+    spec.grouping_sets = Box::new([Box::new([0]), Box::new([])]);
+    let mut state = HashAggregateRuntimeState {
+        tables: Vec::new(),
+        pending_radix_merges: Vec::new(),
+        distinct: Default::default(),
+        spilled_payloads: Vec::new(),
+        spilled_states: Vec::new(),
+        spilled_outputs: None,
+        ordered_collectors: Vec::new(),
+    };
+
+    ensure_grouping_domains(&query, &spec, &mut state).expect("initialize grouping domains");
+
+    assert_eq!(state.tables.len(), 2);
+    assert_eq!(state.tables[0].count(), 0);
+    assert_eq!(state.tables[1].count(), 1);
+}
+
+#[test]
+fn external_grouping_domains_keep_empty_set_identity_without_payload() {
+    let allocator = paro_common::test_utils::test_allocator();
+    let query = query_context();
+    let thread = ThreadContext::single_threaded();
+    let memory = TaskMemoryGrants::detached(allocator.clone());
+    let wake = OperatorWakeScope {
+        task_id: PipelineTaskId(44),
+        generation: WakeGeneration(0),
+    };
+    let mut profiler = OperatorProfiler::disabled();
+    let mut ctx = OperatorFinishContext {
+        query: &query,
+        pipeline: PipelineId::new(0),
+        operator: RuntimeOperatorId::new(0),
+        finish_task: None,
+        thread: &thread,
+        memory: memory.call_scope(),
+        cancel: &query.cancellation,
+        wake: &wake,
+        profiler: &mut profiler,
+    };
+    let mut spec = grouped_count_spec();
+    spec.grouping_sets = Box::new([Box::new([0]), Box::new([])]);
+    let aggregate_objects = aggregate_objects(&spec).expect("aggregate objects");
+    let group_refs = group_payload_refs(&spec).expect("group refs");
+    let grouping_sets = normalized_grouping_sets(&spec)
+        .expect("grouping sets")
+        .into_iter()
+        .map(Vec::into_boxed_slice)
+        .collect::<Vec<_>>();
+    let mut state = HashAggregateRuntimeState {
+        tables: Vec::new(),
+        pending_radix_merges: Vec::new(),
+        distinct: Default::default(),
+        spilled_payloads: Vec::new(),
+        spilled_states: Vec::new(),
+        spilled_outputs: None,
+        ordered_collectors: Vec::new(),
+    };
+
+    spill_payload_partitions_to_outputs(
+        &mut ctx,
+        &spec,
+        &aggregate_objects,
+        &group_refs,
+        &grouping_sets,
+        &mut state,
+        &[],
+        &[],
+        None,
+    )
+    .expect("external empty grouping domain");
+
+    let mut outputs = state.spilled_outputs.take().expect("spilled outputs");
+    assert!(outputs[0].is_none());
+    let mut reader = outputs[1].take().expect("identity output").into_reader();
+    let mut output = Chunk::try_initialize(&spec.output_types, 1, allocator).expect("output chunk");
+    assert_eq!(reader.read_next(&mut output).expect("read identity"), 1);
+    assert_eq!(
+        output.column(0).unwrap().get_value(0),
+        Value::Null(LogicalType::Integer)
+    );
+    assert_eq!(output.column(1).unwrap().get_i64(0).unwrap(), 0);
 }
 
 #[test]

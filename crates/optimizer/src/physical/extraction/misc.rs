@@ -340,7 +340,7 @@ fn lower_partition_aggregate_window_spec(
         aggregate_orders: aggregate_orders.into_boxed_slice(),
         post_reduction: None,
         having_filter: Box::new([]),
-        spill_policy: SpillExecutionPolicy::Allowed,
+        spill_policy: SpillExecutionPolicy::Adaptive,
         perfect_hash: None,
         output_names: aggregate_output_names.into_boxed_slice(),
         output_types: aggregate_output_types.into_boxed_slice(),

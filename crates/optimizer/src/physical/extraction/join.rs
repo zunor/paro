@@ -146,17 +146,11 @@ impl PhysicalPlanExtractor {
         let right = self.extract_node(join.right.as_ref())?;
         let left_projection = nlj_left_projection(join);
         let right_projection = nlj_right_projection(join);
-        let left_names = project_by_index(
-            &join.left.output_names(),
-            &left_projection,
-            "nlj left output",
-        )?;
+        let left_names =
+            project_output_names(join.left.as_ref(), &left_projection, "nlj left output")?;
         let left_types = project_by_index(&join.left.types(), &left_projection, "nlj left")?;
-        let right_names = project_by_index(
-            &join.right.output_names(),
-            &right_projection,
-            "nlj right output",
-        )?;
+        let right_names =
+            project_output_names(join.right.as_ref(), &right_projection, "nlj right output")?;
         let right_types = project_by_index(&join.right.types(), &right_projection, "nlj right")?;
         let output_names = join_output_names(join.join_type, left_names, right_names);
         let output_types = join.get_types();
@@ -186,15 +180,15 @@ impl PhysicalPlanExtractor {
         let right = self.extract_node(join.right.as_ref())?;
         let left_projection = nlj_left_projection(join);
         let right_projection = nlj_right_projection(join);
-        let left_names = project_by_index(
-            &join.left.output_names(),
+        let left_names = project_output_names(
+            join.left.as_ref(),
             &left_projection,
             "sort-range join left output",
         )?;
         let left_types =
             project_by_index(&join.left.types(), &left_projection, "sort-range join left")?;
-        let right_names = project_by_index(
-            &join.right.output_names(),
+        let right_names = project_output_names(
+            join.right.as_ref(),
             &right_projection,
             "sort-range join right output",
         )?;
@@ -227,15 +221,15 @@ impl PhysicalPlanExtractor {
         let right = self.extract_node(join.right.as_ref())?;
         let left_projection = nlj_left_projection(join);
         let right_projection = nlj_right_projection(join);
-        let left_names = project_by_index(
-            &join.left.output_names(),
+        let left_names = project_output_names(
+            join.left.as_ref(),
             &left_projection,
             "classic IE join left output",
         )?;
         let left_types =
             project_by_index(&join.left.types(), &left_projection, "classic IE join left")?;
-        let right_names = project_by_index(
-            &join.right.output_names(),
+        let right_names = project_output_names(
+            join.right.as_ref(),
             &right_projection,
             "classic IE join right output",
         )?;
@@ -275,13 +269,10 @@ impl PhysicalPlanExtractor {
         let left_projection = any.left_projection_map.to_indices(any.left.types().len());
         let right_projection = any.right_projection_map.to_indices(any.right.types().len());
         let left_names =
-            project_by_index(&any.left.output_names(), &left_projection, "any join left")?;
+            project_output_names(any.left.as_ref(), &left_projection, "any join left")?;
         let left_types = project_by_index(&any.left.types(), &left_projection, "any join left")?;
-        let right_names = project_by_index(
-            &any.right.output_names(),
-            &right_projection,
-            "any join right",
-        )?;
+        let right_names =
+            project_output_names(any.right.as_ref(), &right_projection, "any join right")?;
         let right_types =
             project_by_index(&any.right.types(), &right_projection, "any join right")?;
         let output_names = join_output_names(any.join_type, left_names, right_names);
@@ -310,8 +301,16 @@ impl PhysicalPlanExtractor {
     ) -> Result<(PhysicalNodeKind, Vec<PhysicalPlanNodeId>)> {
         let left = self.extract_node(cross.left.as_ref())?;
         let right = self.extract_node(cross.right.as_ref())?;
-        let mut output_names = cross.left.output_names();
-        output_names.extend(cross.right.output_names());
+        let mut output_names = align_output_names(
+            cross.left.output_names(),
+            cross.left.types().len(),
+            "cross product left output",
+        )?;
+        output_names.extend(align_output_names(
+            cross.right.output_names(),
+            cross.right.types().len(),
+            "cross product right output",
+        )?);
         let output_types = cross.get_types();
         let spec = CrossProductSpec {
             left_output_types: cross.left.types().into_boxed_slice(),
@@ -331,14 +330,14 @@ impl PhysicalPlanExtractor {
         let right = self.extract_node(join.right.as_ref())?;
         let left_projection = hash_join_left_projection(join);
         let right_projection = hash_join_right_projection(join);
-        let left_names = project_by_index(
-            &join.left.output_names(),
+        let left_names = project_output_names(
+            join.left.as_ref(),
             &left_projection,
             "hash join left output",
         )?;
         let left_types = project_by_index(&join.left.types(), &left_projection, "hash join left")?;
-        let right_names = project_by_index(
-            &join.right.output_names(),
+        let right_names = project_output_names(
+            join.right.as_ref(),
             &right_projection,
             "hash join right output",
         )?;
@@ -816,15 +815,15 @@ impl PhysicalPlanExtractor {
     ) -> Result<PhysicalPlanNodeId> {
         let left_projection = hash_join_left_projection(join);
         let right_projection = hash_join_right_projection(join);
-        let left_names = project_by_index(
-            &join.left.output_names(),
+        let left_names = project_output_names(
+            join.left.as_ref(),
             &left_projection,
             "delim hash join left output",
         )?;
         let left_types =
             project_by_index(&join.left.types(), &left_projection, "delim hash join left")?;
-        let right_names = project_by_index(
-            &join.right.output_names(),
+        let right_names = project_output_names(
+            join.right.as_ref(),
             &right_projection,
             "delim hash join right output",
         )?;
@@ -898,14 +897,14 @@ impl PhysicalPlanExtractor {
     ) -> Result<PhysicalPlanNodeId> {
         let left_projection = nlj_left_projection(join);
         let right_projection = nlj_right_projection(join);
-        let left_names = project_by_index(
-            &join.left.output_names(),
+        let left_names = project_output_names(
+            join.left.as_ref(),
             &left_projection,
             "delim nlj left output",
         )?;
         let left_types = project_by_index(&join.left.types(), &left_projection, "delim nlj left")?;
-        let right_names = project_by_index(
-            &join.right.output_names(),
+        let right_names = project_output_names(
+            join.right.as_ref(),
             &right_projection,
             "delim nlj right output",
         )?;

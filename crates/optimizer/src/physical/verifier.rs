@@ -101,14 +101,14 @@ impl PhysicalPlanVerifier {
             }
             if let crate::physical::PhysicalNodeKind::Aggregate(spec) = &node.kind {
                 let spillable =
-                    spec.spill_policy != crate::physical::SpillExecutionPolicy::Forbidden;
+                    spec.spill_policy != crate::physical::SpillExecutionPolicy::InMemory;
                 if properties.characteristics.spillable != spillable {
                     return Err(paro_error::internal(
                         "aggregate spill policy disagrees with its physical characteristics",
                     ));
                 }
                 if spec.perfect_hash.is_some()
-                    && spec.spill_policy != crate::physical::SpillExecutionPolicy::Forbidden
+                    && spec.spill_policy != crate::physical::SpillExecutionPolicy::InMemory
                 {
                     return Err(paro_error::internal(
                         "perfect-hash aggregate cannot advertise a spill path",
@@ -121,7 +121,7 @@ impl PhysicalPlanVerifier {
                 _ => None,
             };
             if let Some(policy) = declared_spill_policy {
-                let spillable = policy != crate::physical::SpillExecutionPolicy::Forbidden;
+                let spillable = policy != crate::physical::SpillExecutionPolicy::InMemory;
                 if properties.characteristics.spillable != spillable {
                     return Err(paro_error::internal(
                         "operator spill policy disagrees with its physical characteristics",
@@ -295,7 +295,9 @@ impl PhysicalPlanVerifier {
                 .properties
                 .get(plan.root)
                 .ok_or_else(|| paro_error::internal("admitted plan root has no properties"))?;
-            if root.cumulative_cost.peak_memory_upper > reservation.memory_bytes
+            if root.cumulative_cost.minimum_memory_bytes > reservation.minimum_memory_bytes
+                || reservation.minimum_memory_bytes > reservation.target_memory_bytes
+                || reservation.target_memory_bytes > root.cumulative_cost.peak_memory_upper
                 || root.cumulative_cost.external_worker_slots_upper
                     > reservation.external_worker_slots
             {

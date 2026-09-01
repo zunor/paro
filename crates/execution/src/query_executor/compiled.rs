@@ -12,7 +12,7 @@ use paro_common::typed_parameters::TypedParameterEnv;
 use paro_common::types::LogicalType;
 use paro_context::{CompileEnvironmentKey, StatementContext};
 use paro_optimizer::physical::{
-    Fingerprint, PhysicalNodeKind, PlanDependencies, SearchSourceSpec, StableFingerprintBuilder,
+    Fingerprint, PhysicalNodeKind, SearchSourceSpec, StableFingerprintBuilder,
 };
 use paro_storage::search::OpenSearchCursorResult;
 
@@ -46,7 +46,6 @@ struct CompiledStatementImage {
     result_schema: Box<[ResultColumnDesc]>,
     parameter_types: Box<[LogicalType]>,
     compile_environment: CompileEnvironmentKey,
-    plan_dependencies: PlanDependencies,
 }
 
 impl CompiledStatement {
@@ -55,7 +54,6 @@ impl CompiledStatement {
         result_schema: Vec<ResultColumnDesc>,
         parameter_types: Vec<LogicalType>,
         compile_environment: CompileEnvironmentKey,
-        plan_dependencies: PlanDependencies,
     ) -> Self {
         Self {
             image: Arc::new(CompiledStatementImage {
@@ -63,7 +61,6 @@ impl CompiledStatement {
                 result_schema: result_schema.into_boxed_slice(),
                 parameter_types: parameter_types.into_boxed_slice(),
                 compile_environment,
-                plan_dependencies,
             }),
         }
     }
@@ -86,11 +83,6 @@ impl CompiledStatement {
     #[inline]
     pub fn compile_environment(&self) -> &CompileEnvironmentKey {
         &self.image.compile_environment
-    }
-
-    #[inline]
-    pub fn plan_dependencies(&self) -> &PlanDependencies {
-        &self.image.plan_dependencies
     }
 
     /// Validate capabilities whose generation can move without a catalog
@@ -142,7 +134,7 @@ fn statement_program_dependencies_available(
         StatementProgram::Portfolio(portfolio) => portfolio
             .variants
             .iter()
-            .all(|variant| physical_plan_dependencies_available(&variant.plan, ctx)),
+            .any(|variant| physical_plan_dependencies_available(&variant.plan, ctx)),
         StatementProgram::Pipeline { plan, .. } => physical_plan_dependencies_available(plan, ctx),
         StatementProgram::ExplainAnalyze { target, .. } => {
             statement_program_dependencies_available(target, ctx)
@@ -151,7 +143,7 @@ fn statement_program_dependencies_available(
     }
 }
 
-fn physical_plan_dependencies_available(
+pub(crate) fn physical_plan_dependencies_available(
     plan: &paro_optimizer::physical::PhysicalPlan,
     ctx: &StatementContext,
 ) -> bool {
@@ -331,7 +323,6 @@ mod tests {
             TestStatementContextBuilder::minimal()
                 .build()
                 .compile_environment_key(),
-            PlanDependencies::default(),
         )
     }
 

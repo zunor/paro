@@ -1170,18 +1170,26 @@ fn recompute_winner_cost(memo: &Memo, winner: &Winner) -> Result<SearchCost> {
             .cost;
         child_costs.push(child_cost);
     }
-    let cost = super::engine::compose_candidate_cost(
-        winner.local_cost,
-        &child_costs,
-        winner.cost_composition,
-    )?;
+    let cost = super::engine::constrain_composed_cost_to_grant(
+        super::engine::compose_candidate_cost(
+            winner.local_cost,
+            &child_costs,
+            winner.cost_composition,
+        )?,
+        winner.enforcer_cost_input,
+    )?
+    .ok_or_else(|| paro_error::internal("recorded winner exceeds its resource grant"))?;
     let enforcer_cost = super::engine::enforcer_cost(
         &winner.enforcers,
         winner.enforcer_cost_input,
         memo.calibration(),
     )?
     .ok_or_else(|| paro_error::internal("recorded winner has an infeasible enforcer grant"))?;
-    cost.sequential(enforcer_cost)
+    super::engine::constrain_composed_cost_to_grant(
+        cost.sequential(enforcer_cost)?,
+        winner.enforcer_cost_input,
+    )?
+    .ok_or_else(|| paro_error::internal("recorded winner enforcers exceed its resource grant"))
 }
 
 fn two_groups_mut(groups: &mut [Group], left: usize, right: usize) -> (&mut Group, &mut Group) {

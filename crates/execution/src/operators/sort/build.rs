@@ -46,7 +46,7 @@ pub struct SortBuildSinkExec {
 impl SortBuildSinkExec {
     pub(crate) fn create_global(&self, ctx: &mut PipelineInitContext) -> Result<SinkGlobal> {
         let handle = ctx.handles.get(self.handle)?;
-        let force_external = self.spill_policy == SpillExecutionPolicy::Forced;
+        let force_external = self.spill_policy == SpillExecutionPolicy::ForcedExternal;
         if force_external && !query_has_temporary_directory(ctx.query) {
             return Err(paro_error::out_of_memory(
                 "force_external sort requires a temporary directory",
@@ -59,7 +59,7 @@ impl SortBuildSinkExec {
             false,
         )?);
         handle.initialize(sort, self.output_types.clone(), force_external)?;
-        if self.spill_policy != SpillExecutionPolicy::Forbidden
+        if self.spill_policy != SpillExecutionPolicy::InMemory
             && query_has_temporary_directory(ctx.query)
         {
             ctx.query.memory.register_reclaimer_once_by_name(Arc::new(

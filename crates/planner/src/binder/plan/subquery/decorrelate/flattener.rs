@@ -105,9 +105,12 @@ impl DependentJoinFlattener {
         self.correlated_base_binding = Some(base_binding);
 
         match kind {
-            DependentJoinKind::Scalar => {
-                self.flatten_scalar_subquery(left, rewritten_right, visible_columns)
-            }
+            DependentJoinKind::Scalar { presence_binding } => self.flatten_scalar_subquery(
+                left,
+                rewritten_right,
+                visible_columns,
+                presence_binding,
+            ),
             DependentJoinKind::Mark {
                 mark_index,
                 subquery: MarkSubqueryKind::Exists,
@@ -160,7 +163,8 @@ impl DependentJoinFlattener {
         &mut self,
         left: LogicalPlan,
         right: LogicalPlan,
-        right_visible_columns: Vec<usize>,
+        mut right_visible_columns: Vec<usize>,
+        presence_binding: Option<ColumnBinding>,
     ) -> Result<LogicalOperator> {
         let right_types = right.types();
         if right_types.is_empty() {
@@ -181,6 +185,18 @@ impl DependentJoinFlattener {
                 scalar_child_index,
                 right_types.len()
             )));
+        }
+        if let Some(presence_binding) = presence_binding {
+            let presence_index = right
+                .get_column_bindings()
+                .iter()
+                .position(|binding| *binding == presence_binding)
+                .ok_or_else(|| {
+                    paro_error::internal(
+                        "scalar subquery presence carrier disappeared during decorrelation",
+                    )
+                })?;
+            right_visible_columns.push(presence_index);
         }
 
         let conditions = self.create_correlated_join_conditions()?;
@@ -926,7 +942,7 @@ impl DependentJoinFlattener {
                     correlated_map.clone(),
                     lateral_depth,
                 );
-                let original_projection_count = proj.expressions.len();
+                let original_visible_count = proj.visible_count;
                 proj.expressions = proj
                     .expressions
                     .into_iter()
@@ -950,7 +966,7 @@ impl DependentJoinFlattener {
                         operator: LogicalOperator::Projection(proj),
                     },
                     base_binding: ColumnBinding::new(projection_index, delim_offset),
-                    visible_columns: Self::all_columns_visible(original_projection_count),
+                    visible_columns: Self::all_columns_visible(original_visible_count),
                 })
             }
             LogicalOperator::RowFetch(mut fetch) => {

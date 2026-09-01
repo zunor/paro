@@ -108,6 +108,13 @@ pub struct SearchCost {
     /// active. This is the hard quantity that composes additively across
     /// overlapping retained-state pipelines.
     pub non_revocable_memory_upper: u64,
+    /// Query-lifetime capacity floor required for the selected operator graph
+    /// to make progress. It includes fixed scratch, per-task scratch at the
+    /// declared maximum task concurrency, and mandatory spill buffers.
+    pub minimum_memory_bytes: u64,
+    /// Preferred revocable working set. Admission may shrink this value down
+    /// to `minimum_memory_bytes`, but never below it.
+    pub revocable_memory_target: u64,
     /// Query-local peak after applying the shared allocator/revocation
     /// protocol. Revocable working sets compose by maximum, not by addition.
     pub peak_memory_upper: u64,
@@ -126,6 +133,8 @@ impl SearchCost {
         resources_risk_upper: [0.0; RESOURCE_DIMS],
         critical_path: CompactRange::ZERO,
         non_revocable_memory_upper: 0,
+        minimum_memory_bytes: 0,
+        revocable_memory_target: 0,
         peak_memory_upper: 0,
         spill_bytes_expected: 0,
         external_workers: ExternalWorkerRequirementSetId(0),
@@ -167,6 +176,25 @@ impl SearchCost {
                 "non-revocable memory exceeds the total peak memory contract",
             ));
         }
+        if self.non_revocable_memory_upper > self.minimum_memory_bytes {
+            return Err(paro_error::internal(
+                "non-revocable memory exceeds the operational memory floor",
+            ));
+        }
+        if self.minimum_memory_bytes > self.peak_memory_upper {
+            return Err(paro_error::internal(
+                "operational memory floor exceeds the total peak contract",
+            ));
+        }
+        if self
+            .minimum_memory_bytes
+            .saturating_add(self.revocable_memory_target)
+            > self.peak_memory_upper
+        {
+            return Err(paro_error::internal(
+                "memory floor plus revocable target exceeds the total peak contract",
+            ));
+        }
         Ok(())
     }
 
@@ -187,6 +215,8 @@ impl SearchCost {
             resources_risk_upper[index] =
                 self.resources_risk_upper[index] + other.resources_risk_upper[index];
         }
+        let minimum_memory_bytes = self.minimum_memory_bytes.max(other.minimum_memory_bytes);
+        let peak_memory_upper = self.peak_memory_upper.max(other.peak_memory_upper);
         let result = Self {
             score: ScoreSummary {
                 range: self.score.range.checked_add(other.score.range)?,
@@ -198,7 +228,13 @@ impl SearchCost {
             non_revocable_memory_upper: self
                 .non_revocable_memory_upper
                 .max(other.non_revocable_memory_upper),
-            peak_memory_upper: self.peak_memory_upper.max(other.peak_memory_upper),
+            minimum_memory_bytes,
+            // Sequential phases never need each other's elastic working set.
+            // Keep the target coupled to the composed floor/peak instead of
+            // independently maximizing three values that may come from three
+            // different phases and form an impossible tuple.
+            revocable_memory_target: peak_memory_upper.saturating_sub(minimum_memory_bytes),
+            peak_memory_upper,
             spill_bytes_expected: self
                 .spill_bytes_expected
                 .saturating_add(other.spill_bytes_expected),
@@ -220,6 +256,8 @@ impl SearchCost {
             && self.score.range.upper <= other.score.range.upper
             && self.critical_path.upper <= other.critical_path.upper
             && self.non_revocable_memory_upper <= other.non_revocable_memory_upper
+            && self.minimum_memory_bytes <= other.minimum_memory_bytes
+            && self.revocable_memory_target <= other.revocable_memory_target
             && self.peak_memory_upper <= other.peak_memory_upper
             && self.spill_bytes_expected <= other.spill_bytes_expected
             && self.external_worker_slots_upper <= other.external_worker_slots_upper
@@ -237,6 +275,8 @@ impl SearchCost {
             || self.score.range.upper < other.score.range.upper
             || self.critical_path.upper < other.critical_path.upper
             || self.non_revocable_memory_upper < other.non_revocable_memory_upper
+            || self.minimum_memory_bytes < other.minimum_memory_bytes
+            || self.revocable_memory_target < other.revocable_memory_target
             || self.peak_memory_upper < other.peak_memory_upper
             || self.spill_bytes_expected < other.spill_bytes_expected
             || self.external_worker_slots_upper < other.external_worker_slots_upper

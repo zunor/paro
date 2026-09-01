@@ -337,9 +337,7 @@ pub(super) fn implementation_cost(
                 OP_PERFECT_AGGREGATE_SLOT,
                 CompactRange::point(resource.slots as f64)?,
             )?;
-            peak_memory_upper = u64::try_from(resource.bytes_per_table_upper)
-                .unwrap_or(u64::MAX)
-                .saturating_mul(resource.max_local_tables as u64);
+            peak_memory_upper = resource.memory.preferred_memory_bytes().unwrap_or(u64::MAX);
         }
         PhysicalImplementationFlavor::SingletonAggregateProjection => {
             let input = facts
@@ -431,7 +429,20 @@ pub(super) fn implementation_cost(
                 .unwrap_or(CompactRange::ZERO);
             work.add(OP_NESTED_LOOP_PAIR, multiply_work(left, right)?)?;
             work.add(OP_RANGE_JOIN_ROW, facts.output_rows)?;
-            peak_memory_upper = 0;
+            peak_memory_upper = facts
+                .child_rows_hard_upper
+                .get(1)
+                .copied()
+                .flatten()
+                .unwrap_or(u64::MAX)
+                .saturating_mul(
+                    facts
+                        .child_row_widths
+                        .get(1)
+                        .copied()
+                        .unwrap_or(facts.output_row_width)
+                        .max(1),
+                );
         }
         PhysicalImplementationFlavor::SortRangeJoin
         | PhysicalImplementationFlavor::ClassicIeJoin => {
@@ -475,9 +486,92 @@ pub(super) fn implementation_cost(
         }
     }
     let mut cost = calibration.fold(&work)?;
-    cost.peak_memory_upper = peak_memory_upper;
+    apply_execution_memory_contract(metadata, flavor, peak_memory_upper, &mut cost)?;
     cost.validate()?;
     Ok(cost)
+}
+
+fn apply_execution_memory_contract(
+    metadata: &PlannerOperatorMetadata,
+    flavor: PhysicalImplementationFlavor,
+    retained_memory_upper: u64,
+    cost: &mut SearchCost,
+) -> Result<()> {
+    use crate::physical::resources::{
+        ExecutionMemoryContract, BLOCKING_FIXED_SCRATCH_BYTES, BLOCKING_PER_TASK_SCRATCH_BYTES,
+        SPILL_BUFFER_MINIMUM_BYTES,
+    };
+
+    let stateful = retained_memory_upper > 0
+        || matches!(
+            flavor,
+            PhysicalImplementationFlavor::HashAggregate
+                | PhysicalImplementationFlavor::PerfectHashAggregate
+                | PhysicalImplementationFlavor::HashJoin
+                | PhysicalImplementationFlavor::HashJoinRuntimeFilter
+                | PhysicalImplementationFlavor::NestedLoopJoin
+                | PhysicalImplementationFlavor::SortRangeJoin
+                | PhysicalImplementationFlavor::ClassicIeJoin
+                | PhysicalImplementationFlavor::Window
+                | PhysicalImplementationFlavor::PartitionAggregateWindow
+        );
+    if !stateful {
+        return Ok(());
+    }
+
+    let spillable = implementation_spillable(metadata, flavor);
+    let contract = if flavor == PhysicalImplementationFlavor::PerfectHashAggregate {
+        metadata
+            .cost_facts
+            .perfect_hash
+            .ok_or_else(|| {
+                paro_error::internal("perfect-hash memory contract disappeared during costing")
+            })?
+            .memory
+    } else if spillable {
+        let fixed_non_revocable_bytes =
+            if flavor == PhysicalImplementationFlavor::HashJoinRuntimeFilter {
+                // The exact runtime-filter domain is bounded independently of the
+                // spillable build rows and remains resident while the probe runs.
+                65_536_u64 * 24
+            } else {
+                0
+            };
+        let base = ExecutionMemoryContract {
+            fixed_non_revocable_bytes,
+            fixed_scratch_bytes: BLOCKING_FIXED_SCRATCH_BYTES,
+            per_task_scratch_bytes: BLOCKING_PER_TASK_SCRATCH_BYTES,
+            max_concurrent_tasks: metadata.max_concurrent_tasks,
+            revocable_minimum_bytes: 0,
+            revocable_target_bytes: 0,
+            spill_buffer_minimum_bytes: SPILL_BUFFER_MINIMUM_BYTES,
+        };
+        let minimum = base.minimum_memory_bytes()?;
+        ExecutionMemoryContract {
+            revocable_target_bytes: retained_memory_upper.saturating_sub(minimum),
+            ..base
+        }
+    } else {
+        ExecutionMemoryContract {
+            fixed_non_revocable_bytes: retained_memory_upper,
+            fixed_scratch_bytes: if retained_memory_upper == u64::MAX {
+                0
+            } else {
+                BLOCKING_FIXED_SCRATCH_BYTES
+            },
+            per_task_scratch_bytes: 0,
+            max_concurrent_tasks: 0,
+            revocable_minimum_bytes: 0,
+            revocable_target_bytes: 0,
+            spill_buffer_minimum_bytes: 0,
+        }
+    };
+    contract.validate()?;
+    cost.non_revocable_memory_upper = contract.fixed_non_revocable_bytes;
+    cost.minimum_memory_bytes = contract.minimum_memory_bytes()?;
+    cost.revocable_memory_target = contract.revocable_target_bytes;
+    cost.peak_memory_upper = contract.preferred_memory_bytes()?;
+    Ok(())
 }
 
 fn refreshed_structural_cost(
@@ -543,6 +637,12 @@ fn refreshed_structural_cost(
             resident_expected * width as f64;
         cost.resources_risk_upper[ResourceDimension::MemoryWrite as usize] =
             cost.peak_memory_upper as f64;
+        apply_execution_memory_contract(
+            metadata,
+            metadata.implementations.baseline,
+            cost.peak_memory_upper,
+            &mut cost,
+        )?;
     }
     cost.validate()?;
     Ok(cost)

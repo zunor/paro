@@ -428,6 +428,10 @@ impl MemoBuilder {
         let scan_access_cost = search_context
             .map(|context| context.cost_model.scan_access)
             .unwrap_or_default();
+        let max_concurrent_tasks = search_context
+            .map(|context| context.session.number_of_threads())
+            .unwrap_or(1)
+            .clamp(1, u16::MAX as usize) as u16;
         let mut has_contextual_shape = false;
 
         let mut roots: Vec<(AlternativeOrigin, LogicalPlan, BuildState)> =
@@ -741,6 +745,7 @@ impl MemoBuilder {
                         implementations,
                         grant_dependency: planner_grant_dependency(&plan.operator),
                         spillable: planner_operator_spillable(&plan.operator),
+                        max_concurrent_tasks,
                         cost_facts: planner_cost_facts(&plan, scan_access_cost)?,
                         output_columns: output_columns.clone().into_boxed_slice(),
                         child_required: intern_child_requirements(
@@ -884,6 +889,7 @@ impl MemoBuilder {
             verify_enabled: search_context.is_some_and(|context| context.verify_enabled),
             rowset_scan_pushdown,
             scan_access_cost,
+            max_concurrent_tasks,
         }));
         Ok(OptimizationInput {
             memo,

@@ -100,7 +100,7 @@ impl AggregateSpec {
                     "post-aggregate input rollup requires a perfect aggregate plan",
                 ));
             };
-            if perfect_hash.resource.max_local_tables <= 1 {
+            if perfect_hash.resource.memory.max_concurrent_tasks <= 1 {
                 return Err(paro_error::internal(
                     "post-aggregate input rollup requires multiple local perfect tables",
                 ));
@@ -879,6 +879,10 @@ pub struct PerfectHashAggregatePlan {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct PerfectHashResourceContract {
     pub slots: usize,
-    pub bytes_per_table_upper: usize,
-    pub max_local_tables: usize,
+    /// Direct-address table, occupancy bitmap, and table-owned direct-update
+    /// scratch for one local implementation instance.
+    pub table_bytes_upper: usize,
+    /// Complete operator envelope including buffers allocated outside the
+    /// table implementation.
+    pub memory: crate::physical::ExecutionMemoryContract,
 }

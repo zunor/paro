@@ -660,6 +660,7 @@ mod tests {
                 name: "corr".to_string(),
                 depth: 1,
             }],
+            None,
         );
 
         match rewriter.rewrite_operator(LogicalOperator::DependentJoin(dep)) {

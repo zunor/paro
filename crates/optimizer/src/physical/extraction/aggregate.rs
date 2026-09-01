@@ -571,7 +571,7 @@ impl PhysicalPlanExtractor {
             aggregate_orders: aggregate_orders.into_boxed_slice(),
             post_reduction: lower_post_aggregate_reduction(aggregate)?,
             having_filter,
-            spill_policy: SpillExecutionPolicy::Forbidden,
+            spill_policy: SpillExecutionPolicy::InMemory,
             perfect_hash,
             output_names: aggregate
                 .get_column_bindings()
@@ -961,7 +961,7 @@ fn can_execute_post_input_rollup(spec: &AggregateSpec) -> bool {
     let Some(perfect) = &spec.perfect_hash else {
         return false;
     };
-    if perfect.resource.max_local_tables <= 1
+    if perfect.resource.memory.max_concurrent_tasks <= 1
         || !spec.having_filter.is_empty()
         || !spec.has_plain_grouping_domain()
         || spec.aggregates.len() != 1

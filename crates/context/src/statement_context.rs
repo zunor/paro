@@ -122,6 +122,14 @@ impl StatementContext {
             .map(|provider| provider.status())
     }
 
+    pub fn python_execution_slot_limit(&self) -> u16 {
+        self.services
+            .python_runtime
+            .as_ref()
+            .map(|provider| provider.execution_slot_limit())
+            .unwrap_or(0)
+    }
+
     pub fn ensure_python_runtime_ready_for_ddl(&self) -> paro_common::error::Result<()> {
         if let Some(provider) = &self.services.python_runtime {
             provider.ensure_ready_for_ddl()
@@ -136,6 +144,17 @@ impl StatementContext {
         } else {
             Ok(())
         }
+    }
+
+    pub fn try_acquire_python_worker_slots(
+        &self,
+        query_id: u64,
+        slots: u16,
+    ) -> paro_common::error::Result<Option<paro_external::runtime::host::ExternalWorkerLease>> {
+        let Some(provider) = &self.services.python_runtime else {
+            return Ok(None);
+        };
+        provider.try_acquire_execution_slots(query_id, slots)
     }
 
     pub fn observe_python_runtime_failure(&self, message: &str) {

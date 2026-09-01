@@ -5,7 +5,9 @@ from __future__ import annotations
 
 import argparse
 import csv
+import hashlib
 import json
+import subprocess
 import time
 from collections import Counter
 from datetime import date, datetime, time as datetime_time
@@ -28,7 +30,46 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--statement-timeout-seconds", type=int, default=180)
     parser.add_argument("--threads", type=int, default=6)
     parser.add_argument("--memory-limit", default="8GB")
+    parser.add_argument(
+        "--server-binary",
+        type=Path,
+        help="local parod binary used for this run; records its content digest",
+    )
     return parser.parse_args()
+
+
+def content_digest(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        for block in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(block)
+    return digest.hexdigest()
+
+
+def corpus_digest(path: Path, suffix: str) -> str:
+    digest = hashlib.sha256()
+    for item in sorted(path.glob(f"*{suffix}")):
+        digest.update(item.name.encode("utf-8"))
+        digest.update(b"\0")
+        digest.update(bytes.fromhex(content_digest(item)))
+    return digest.hexdigest()
+
+
+def repository_revision() -> dict[str, Any]:
+    root = Path(__file__).resolve().parents[2]
+
+    def git(*arguments: str) -> str:
+        return subprocess.check_output(
+            ["git", *arguments], cwd=root, text=True, stderr=subprocess.DEVNULL
+        ).strip()
+
+    try:
+        return {
+            "commit": git("rev-parse", "HEAD"),
+            "dirty": bool(git("status", "--porcelain")),
+        }
+    except (OSError, subprocess.CalledProcessError):
+        return {"commit": None, "dirty": None}
 
 
 def actual_converter(values: list[Any]) -> Callable[[Any], Any]:
@@ -122,10 +163,35 @@ def main() -> int:
         "corpus": "TPC-DS",
         "scale_factor": 0.01,
         "query_range": [args.start, args.end],
+        "source": repository_revision(),
+        "query_corpus_sha256": corpus_digest(args.query_dir, ".sql"),
+        "answer_corpus_sha256": corpus_digest(args.answer_dir, ".csv"),
+        "configuration": {
+            "threads": args.threads,
+            "memory_limit": args.memory_limit,
+            "statement_timeout_seconds": args.statement_timeout_seconds,
+            "optimizer_verify": True,
+        },
+        "validation": {
+            "rows": "multiset",
+            "ordering": "not_checked",
+            "types": "normalized_from_actual_values",
+        },
         "queries": [],
     }
+    if args.server_binary is not None:
+        report["server_binary"] = {
+            "path": str(args.server_binary.resolve()),
+            "sha256": content_digest(args.server_binary),
+        }
     failures = 0
     with psycopg.connect(args.dsn, autocommit=True) as connection:
+        report["server"] = {
+            "host": connection.info.host,
+            "port": connection.info.port,
+            "database": connection.info.dbname,
+            "user": connection.info.user,
+        }
         with connection.cursor() as cursor:
             cursor.execute("SET optimizer_verify = true")
             cursor.execute(sql.SQL("SET threads = {}").format(sql.Literal(args.threads)))

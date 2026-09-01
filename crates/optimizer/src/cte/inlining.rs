@@ -40,28 +40,24 @@ impl<'a> CTEInlining<'a> {
     }
 
     fn rewrite_plan(&mut self, plan: LogicalPlan) -> (LogicalPlan, bool) {
-        let mut child_changed = false;
-        let plan = plan
-            .try_map_children(|child| {
-                let (child, changed) = self.rewrite_plan(child);
-                child_changed |= changed;
-                Ok(child)
-            })
-            .expect("CTE inlining child rewrite cannot fail");
-        let LogicalPlan {
-            id,
-            stats,
-            operator,
-        } = plan;
-        let (operator, local_changed) = self.try_inline(operator);
-        (
-            LogicalPlan {
+        plan.try_fold_post_order(|plan, child_changes| {
+            let child_changed = child_changes.into_iter().any(|changed| changed);
+            let LogicalPlan {
                 id,
                 stats,
                 operator,
-            },
-            child_changed || local_changed,
-        )
+            } = plan;
+            let (operator, local_changed) = self.try_inline(operator);
+            Ok((
+                LogicalPlan {
+                    id,
+                    stats,
+                    operator,
+                },
+                child_changed || local_changed,
+            ))
+        })
+        .expect("CTE inlining traversal cannot fail")
     }
 
     fn try_inline(&mut self, op: LogicalOperator) -> (LogicalOperator, bool) {

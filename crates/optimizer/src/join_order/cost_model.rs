@@ -28,6 +28,9 @@ pub(crate) struct DPJoinNode {
     pub left_set: Arc<JoinRelationSet>,
     /// The right child set (for non-leaf nodes).
     pub right_set: Arc<JoinRelationSet>,
+    /// Immutable child alternatives selected for this frontier member.
+    pub left_plan: Option<Arc<DPJoinNode>>,
+    pub right_plan: Option<Arc<DPJoinNode>>,
     /// Physical build input in the original `left_set`/`right_set`
     /// coordinates. Reconstruction places this input on the executable
     /// join's right side; it must not infer orientation again from an
@@ -47,6 +50,10 @@ pub(crate) struct DPJoinNode {
     /// relations in the set for graph connectivity while emitting only their
     /// preserved child's columns.
     pub output_payload_width: usize,
+    /// Largest retained build payload on this path. This resource dimension
+    /// is kept separate from scalar work so grant-sensitive search can retain
+    /// a lower-memory tree even when it is not the scalar-cost winner.
+    pub peak_build_bytes: u64,
 }
 
 impl DPJoinNode {
@@ -65,32 +72,38 @@ impl DPJoinNode {
             is_leaf: true,
             left_set: set.clone(),
             right_set: set,
+            left_plan: None,
+            right_plan: None,
             build_side: JoinBuildSide::Right,
             cost: 0.0,
             cardinality,
             risk_cardinality,
             output_payload_width,
+            peak_build_bytes: 0,
         }
     }
 
     /// Create an intermediate node (join of two relations).
     fn intermediate(
         predicates: Option<JoinPredicateSet>,
-        left_set: Arc<JoinRelationSet>,
-        right_set: Arc<JoinRelationSet>,
+        left: &DPJoinNode,
+        right: &DPJoinNode,
         estimate: CostedJoin,
     ) -> Self {
         Self {
             set: estimate.combination,
             predicates,
             is_leaf: false,
-            left_set,
-            right_set,
+            left_set: left.set.clone(),
+            right_set: right.set.clone(),
+            left_plan: Some(Arc::new(left.clone())),
+            right_plan: Some(Arc::new(right.clone())),
             build_side: estimate.build_side,
             cost: estimate.breakdown.total(),
             cardinality: estimate.cardinality,
             risk_cardinality: estimate.risk_cardinality,
             output_payload_width: estimate.output_payload_width,
+            peak_build_bytes: estimate.peak_build_bytes,
         }
     }
 }
@@ -123,6 +136,7 @@ struct CostedJoin {
     output_payload_width: usize,
     breakdown: JoinCostBreakdown,
     build_side: JoinBuildSide,
+    peak_build_bytes: u64,
 }
 
 struct JoinCostInputs<'a> {
@@ -164,6 +178,14 @@ const CROSS_PRODUCT_SELECTION_BYTES: usize = std::mem::size_of::<u32>();
 /// A general nested-loop comparison advances one probe/build cursor pair for
 /// every candidate before copying accepted values into flat output vectors.
 const NESTED_LOOP_CURSOR_BYTES: usize = 2 * std::mem::size_of::<usize>();
+
+fn estimated_payload_bytes(rows: f64, width: usize) -> u64 {
+    if !rows.is_finite() || rows >= u64::MAX as f64 {
+        u64::MAX
+    } else {
+        (rows.max(0.0) * width as f64).min(u64::MAX as f64) as u64
+    }
+}
 
 fn estimate_hash_probe_row_width(condition_payload_width: usize) -> usize {
     const HASH_PROBE_RUNTIME_BYTES: usize = std::mem::size_of::<u64>()
@@ -377,6 +399,18 @@ impl CostModel {
             output_payload_width,
             breakdown,
             build_side,
+            peak_build_bytes: left.peak_build_bytes.max(right.peak_build_bytes).max(
+                match build_side {
+                    JoinBuildSide::Left => estimated_payload_bytes(
+                        left_materialization_rows,
+                        left.output_payload_width,
+                    ),
+                    JoinBuildSide::Right => estimated_payload_bytes(
+                        right_materialization_rows,
+                        right.output_payload_width,
+                    ),
+                },
+            ),
         }
     }
 
@@ -641,7 +675,7 @@ impl CostModel {
     ) -> DPJoinNode {
         let estimate = self.estimate_join(left, right, set_manager, predicates.as_ref());
 
-        DPJoinNode::intermediate(predicates, left.set.clone(), right.set.clone(), estimate)
+        DPJoinNode::intermediate(predicates, left, right, estimate)
     }
 
     /// Get the estimated cardinality for a relation set.
@@ -828,8 +862,8 @@ mod tests {
 
         let node = DPJoinNode::intermediate(
             None,
-            left.clone(),
-            right.clone(),
+            &DPJoinNode::leaf(left.clone(), 5, 10.0, 10.0),
+            &DPJoinNode::leaf(right.clone(), 6, 5.0, 5.0),
             CostedJoin {
                 combination: combined.clone(),
                 cardinality: 50.0,
@@ -842,6 +876,7 @@ mod tests {
                     children: 25.0,
                 },
                 build_side: JoinBuildSide::Right,
+                peak_build_bytes: 30,
             },
         );
 
@@ -1013,11 +1048,14 @@ mod tests {
             is_leaf: false,
             left_set: left_set.clone(),
             right_set: left_set.clone(),
+            left_plan: None,
+            right_plan: None,
             build_side: JoinBuildSide::Right,
             cost: 100.0,
             cardinality: 1000.0,
             risk_cardinality: 1000.0,
             output_payload_width: cost_model.payload_width(&left_set),
+            peak_build_bytes: 0,
         };
 
         let right = DPJoinNode {
@@ -1026,11 +1064,14 @@ mod tests {
             is_leaf: false,
             left_set: right_set.clone(),
             right_set: right_set.clone(),
+            left_plan: None,
+            right_plan: None,
             build_side: JoinBuildSide::Right,
             cost: 50.0,
             cardinality: 500.0,
             risk_cardinality: 500.0,
             output_payload_width: cost_model.payload_width(&right_set),
+            peak_build_bytes: 0,
         };
 
         // Compute cost

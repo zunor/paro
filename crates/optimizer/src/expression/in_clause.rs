@@ -16,8 +16,7 @@ impl InClauseRewriter {
     }
 
     pub fn rewrite(&mut self, plan: LogicalPlan) -> paro_common::error::Result<LogicalPlan> {
-        let plan = plan.try_map_children(|child| self.rewrite(child))?;
-        Ok(self.rewrite_current(plan))
+        plan.try_map_post_order(|plan| Ok(self.rewrite_current(plan)))
     }
 
     fn rewrite_current(&mut self, plan: LogicalPlan) -> LogicalPlan {

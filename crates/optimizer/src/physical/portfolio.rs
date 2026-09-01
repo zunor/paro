@@ -42,7 +42,8 @@ pub struct PhysicalPlanPortfolio<P = PhysicalPlan> {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ReservationToken {
     pub class: ResourceGrantClassId,
-    pub memory_bytes: u64,
+    pub minimum_memory_bytes: u64,
+    pub target_memory_bytes: u64,
     pub external_worker_slots: u16,
 }
 
@@ -119,6 +120,11 @@ impl<P> PhysicalPlanPortfolio<P> {
             .filter(|(index, variant)| {
                 !all.iter().enumerate().any(|(other_index, other)| {
                     *index != other_index
+                        // Distinct physical fingerprints may carry distinct
+                        // dynamic capabilities. A cheaper specialized plan
+                        // cannot erase the baseline that admission needs when
+                        // that capability disappears after compilation.
+                        && variant.physical_fingerprint == other.physical_fingerprint
                         && variant
                             .admissible_classes
                             .is_subset(&other.admissible_classes)
@@ -140,13 +146,15 @@ impl<P> PhysicalPlanPortfolio<P> {
 
     /// Select only among optimizer-proved variants. Admission never changes
     /// algorithms or weakens the result guarantee.
-    pub fn admit(
+    pub fn admit<F>(
         &self,
         available_memory_bytes: u64,
         available_external_worker_slots: u16,
+        dependency_available: F,
     ) -> Result<AdmittedPlan<P>>
     where
         P: Clone,
+        F: Fn(&P) -> bool,
     {
         let classes = self
             .grant_classes
@@ -158,7 +166,8 @@ impl<P> PhysicalPlanPortfolio<P> {
             .iter()
             .enumerate()
             .filter_map(|(index, variant)| {
-                if variant.cost.peak_memory_upper > available_memory_bytes
+                if !dependency_available(&variant.plan)
+                    || variant.cost.minimum_memory_bytes > available_memory_bytes
                     || variant.cost.external_worker_slots_upper > available_external_worker_slots
                 {
                     return None;
@@ -200,7 +209,8 @@ impl<P> PhysicalPlanPortfolio<P> {
         Ok(AdmittedPlan {
             reservation: ReservationToken {
                 class: selected_class.id,
-                memory_bytes: selected.cost.peak_memory_upper,
+                minimum_memory_bytes: selected.cost.minimum_memory_bytes,
+                target_memory_bytes: selected.cost.peak_memory_upper.min(available_memory_bytes),
                 external_worker_slots: selected.cost.external_worker_slots_upper,
             },
             physical_fingerprint: selected.physical_fingerprint,
@@ -228,18 +238,6 @@ impl PhysicalPlanPortfolio<PhysicalPlan> {
             }
         }
         Ok(())
-    }
-
-    pub fn combined_dependencies(&self) -> Result<crate::physical::PlanDependencies> {
-        let mut variants = self.variants.iter();
-        let first = variants
-            .next()
-            .ok_or_else(|| paro_error::internal("physical portfolio is empty"))?;
-        let mut dependencies = first.plan.dependencies.clone();
-        for variant in variants {
-            dependencies.merge_artifact(&variant.plan.dependencies)?;
-        }
-        Ok(dependencies)
     }
 
     pub fn verify(&self) -> Result<()> {
@@ -283,13 +281,13 @@ impl PhysicalPlanPortfolio<PhysicalPlan> {
                 if grant.spill_policy == SpillPolicy::Forbidden
                     && variant.plan.nodes.iter().any(|node| match &node.kind {
                         crate::physical::PhysicalNodeKind::Aggregate(spec) => {
-                            spec.spill_policy != crate::physical::SpillExecutionPolicy::Forbidden
+                            spec.spill_policy != crate::physical::SpillExecutionPolicy::InMemory
                         }
                         crate::physical::PhysicalNodeKind::HashJoin(spec) => {
-                            spec.spill_policy != crate::physical::SpillExecutionPolicy::Forbidden
+                            spec.spill_policy != crate::physical::SpillExecutionPolicy::InMemory
                         }
                         crate::physical::PhysicalNodeKind::Sort(spec) => {
-                            spec.spill_policy != crate::physical::SpillExecutionPolicy::Forbidden
+                            spec.spill_policy != crate::physical::SpillExecutionPolicy::InMemory
                         }
                         _ => false,
                     })
@@ -326,7 +324,24 @@ impl PhysicalPlanPortfolio<PhysicalPlan> {
                 }
             }
         }
-        self.combined_dependencies()?;
+        let candidate_space = &self.variants[0].plan.dependencies;
+        if self.variants[1..].iter().any(|variant| {
+            let dependencies = &variant.plan.dependencies;
+            dependencies.machine_calibration_revision
+                != candidate_space.machine_calibration_revision
+                || dependencies.estimator_revision != candidate_space.estimator_revision
+                || dependencies.rule_set_revision != candidate_space.rule_set_revision
+                || dependencies.plan_stability_policy_revision
+                    != candidate_space.plan_stability_policy_revision
+                || dependencies.optimizer_config_fingerprint
+                    != candidate_space.optimizer_config_fingerprint
+                || dependencies.physical_abi_revision != candidate_space.physical_abi_revision
+                || dependencies.quality_policy_revision != candidate_space.quality_policy_revision
+        }) {
+            return Err(paro_error::internal(
+                "physical portfolio variants belong to different static candidate spaces",
+            ));
+        }
         Ok(())
     }
 }
@@ -344,6 +359,7 @@ mod tests {
             },
             critical_path: CompactRange::point(score).unwrap(),
             peak_memory_upper: memory,
+            minimum_memory_bytes: memory,
             ..SearchCost::ZERO
         }
     }
@@ -401,9 +417,10 @@ mod tests {
             ],
         )
         .unwrap();
-        let admitted = portfolio.admit(20, 0).unwrap();
+        let admitted = portfolio.admit(20, 0, |_| true).unwrap();
         assert_eq!(admitted.plan, "small");
-        assert_eq!(admitted.reservation.memory_bytes, 10);
+        assert_eq!(admitted.reservation.minimum_memory_bytes, 10);
+        assert_eq!(admitted.reservation.target_memory_bytes, 10);
     }
 
     #[test]
@@ -424,5 +441,26 @@ mod tests {
         .unwrap();
         assert_eq!(portfolio.variants.len(), 1, "dominated cost is pruned");
         assert_eq!(portfolio.variants[0].plan, "first");
+    }
+
+    #[test]
+    fn admission_filters_variant_local_dependencies() {
+        let class = ResourceGrantClass {
+            id: ResourceGrantClassId(1),
+            hard_memory_bytes: 100,
+            spill_policy: SpillPolicy::Allowed,
+            concurrency_class: 0,
+        };
+        let portfolio = PhysicalPlanPortfolio::build(
+            [class],
+            [
+                (class.id, "specialized", Fingerprint(1), cost(1.0, 10)),
+                (class.id, "baseline", Fingerprint(2), cost(2.0, 10)),
+            ],
+        )
+        .unwrap();
+
+        let admitted = portfolio.admit(100, 0, |plan| *plan == "baseline").unwrap();
+        assert_eq!(admitted.plan, "baseline");
     }
 }

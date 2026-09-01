@@ -12,7 +12,7 @@ use paro_common::memory::{
     MemoryAccountingClass, MemoryAccountingContext, MemoryDomain, MemoryOwner,
 };
 use paro_common::types::LogicalType;
-use paro_storage::buffer::MemoryTag;
+use paro_storage::buffer::{MemoryTag, DEFAULT_BLOCK_SIZE};
 use paro_storage::row::{RowFormat, RowSpillWriter, RowStoreSpillWriter};
 
 use super::{FoundBits, HandleRef, MaterializedHandle, MaterializedReader};
@@ -155,8 +155,28 @@ impl RowFormat for MaterializedRowFormat {
 }
 
 impl MaterializeSinkExec {
+    fn spill_writer(
+        ctx: &crate::runtime::context::QueryRuntimeContext,
+        global: &MaterializeSinkGlobal,
+    ) -> RowStoreSpillWriter<MaterializedRowFormat> {
+        let owner: Arc<dyn MemoryOwner> = ctx.memory.clone();
+        RowStoreSpillWriter::new(
+            ctx.session.buffer_pool().clone(),
+            MaterializedRowFormat {
+                logical_types: global.handle.metadata().row_type.types.clone(),
+            },
+            MemoryTag::HashTable,
+            MemoryAccountingContext::from_owner(
+                owner,
+                MemoryDomain::Host,
+                MemoryTag::HashTable,
+                MemoryAccountingClass::Spill,
+            ),
+        )
+    }
+
     pub(crate) fn create_global(&self, ctx: &mut PipelineInitContext) -> Result<SinkGlobal> {
-        if self.spill_policy == SpillExecutionPolicy::Forced
+        if self.spill_policy == SpillExecutionPolicy::ForcedExternal
             && !query_has_temporary_directory(ctx.query)
         {
             return Err(paro_error::out_of_memory(
@@ -178,24 +198,9 @@ impl MaterializeSinkExec {
                 "materialize sink global state mismatch",
             ));
         };
-        let external = (self.spill_policy != SpillExecutionPolicy::Forbidden
+        let external = (self.spill_policy == SpillExecutionPolicy::ForcedExternal
             && query_has_temporary_directory(ctx.query))
-        .then(|| {
-            let owner: Arc<dyn MemoryOwner> = ctx.query.memory.clone();
-            RowStoreSpillWriter::new(
-                ctx.query.session.buffer_pool().clone(),
-                MaterializedRowFormat {
-                    logical_types: global.handle.metadata().row_type.types.clone(),
-                },
-                MemoryTag::HashTable,
-                MemoryAccountingContext::from_owner(
-                    owner,
-                    MemoryDomain::Host,
-                    MemoryTag::HashTable,
-                    MemoryAccountingClass::Spill,
-                ),
-            )
-        });
+        .then(|| Self::spill_writer(ctx.query, global));
         Ok(SinkLocal::Materialize(MaterializeSinkLocal {
             chunks: Vec::new(),
             external,
@@ -205,7 +210,7 @@ impl MaterializeSinkExec {
     pub(crate) fn consume(
         &self,
         ctx: &mut OperatorCallContext,
-        _global: &SinkGlobal,
+        global: &SinkGlobal,
         local: &mut SinkLocal,
         input: &mut Chunk,
     ) -> Result<SinkPoll> {
@@ -218,6 +223,22 @@ impl MaterializeSinkExec {
                 "materialize sink local state mismatch",
             ));
         };
+        let SinkGlobal::Materialize(global) = global else {
+            return Err(paro_error::internal(
+                "materialize sink global state mismatch",
+            ));
+        };
+        if local.external.is_none()
+            && self.spill_policy == SpillExecutionPolicy::Adaptive
+            && query_has_temporary_directory(ctx.query)
+            && ctx.query.memory.available_bytes() <= DEFAULT_BLOCK_SIZE.saturating_mul(2)
+        {
+            let mut external = Self::spill_writer(ctx.query, global);
+            for mut chunk in local.chunks.drain(..) {
+                external.append_chunk(&mut chunk)?;
+            }
+            local.external = Some(external);
+        }
         if let Some(external) = &mut local.external {
             external.append_chunk(input)?;
         } else {

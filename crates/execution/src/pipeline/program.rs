@@ -183,6 +183,14 @@ impl UtilityProgram {
 }
 
 impl StatementProgram {
+    pub fn reservation(&self) -> Option<paro_optimizer::physical::ReservationToken> {
+        match self {
+            Self::Pipeline { plan, .. } => plan.reservation,
+            Self::ExplainAnalyze { target, .. } => target.reservation(),
+            Self::Portfolio(_) | Self::Utility(_) => None,
+        }
+    }
+
     pub fn pipeline(
         plan: Arc<PhysicalPlan>,
         graph: Arc<PipelineGraph>,
@@ -211,14 +219,21 @@ impl StatementProgram {
         Ok(Self::pipeline(plan, graph, programs))
     }
 
-    pub fn from_physical_portfolio(
+    pub fn from_physical_portfolio<F>(
         portfolio: paro_optimizer::physical::PhysicalPlanPortfolio,
         available_memory_bytes: u64,
         available_external_worker_slots: u16,
-    ) -> Result<Self> {
+        dependency_available: &F,
+    ) -> Result<Self>
+    where
+        F: Fn(&PhysicalPlan) -> bool,
+    {
         portfolio.verify()?;
-        let mut admitted =
-            portfolio.admit(available_memory_bytes, available_external_worker_slots)?;
+        let mut admitted = portfolio.admit(
+            available_memory_bytes,
+            available_external_worker_slots,
+            dependency_available,
+        )?;
         admitted.plan.reservation = Some(admitted.reservation);
         admitted
             .plan
@@ -242,21 +257,27 @@ impl StatementProgram {
     /// Resolve an immutable compiled image against execution-time resources.
     /// Selection is deterministic and algorithms remain exactly those proved
     /// by the optimizer; only lowering of the admitted variant happens here.
-    pub fn admit_for_execution(
+    pub fn admit_for_execution<F>(
         &self,
         available_memory_bytes: u64,
         available_external_worker_slots: u16,
-    ) -> Result<Self> {
+        dependency_available: &F,
+    ) -> Result<Self>
+    where
+        F: Fn(&PhysicalPlan) -> bool,
+    {
         match self {
             Self::Portfolio(portfolio) => Self::from_physical_portfolio(
                 portfolio.clone(),
                 available_memory_bytes,
                 available_external_worker_slots,
+                dependency_available,
             ),
             Self::ExplainAnalyze { target, spec } => Ok(Self::ExplainAnalyze {
                 target: Box::new(target.admit_for_execution(
                     available_memory_bytes,
                     available_external_worker_slots,
+                    dependency_available,
                 )?),
                 spec: *spec,
             }),
@@ -629,7 +650,7 @@ impl OperatorRuntimeRegistry {
             }
             SinkSpec::Materialize(spec) => SinkExec::Materialize(MaterializeSinkExec {
                 handle: HandleRef::new(spec.handle),
-                spill_policy: crate::physical::specs::SpillExecutionPolicy::Forbidden,
+                spill_policy: crate::physical::specs::SpillExecutionPolicy::InMemory,
             }),
             SinkSpec::CrossProductBuild(spec) => SinkExec::Materialize(MaterializeSinkExec {
                 handle: HandleRef::new(spec.handle),
@@ -1008,7 +1029,7 @@ mod tests {
             aggregate_orders: Box::new([]),
             post_reduction: None,
             having_filter: Box::new([]),
-            spill_policy: crate::physical::specs::SpillExecutionPolicy::Allowed,
+            spill_policy: crate::physical::specs::SpillExecutionPolicy::Adaptive,
             perfect_hash: None,
             output_names: Box::new(["a".to_string()]),
             output_types: Box::new([LogicalType::Integer]),
@@ -1417,7 +1438,7 @@ mod tests {
                         build_projection: Box::new([0]),
                         build_payload_types: Box::new([LogicalType::Integer]),
                         build_output_count: 1,
-                        spill_policy: crate::physical::specs::SpillExecutionPolicy::Forbidden,
+                        spill_policy: crate::physical::specs::SpillExecutionPolicy::InMemory,
                     }),
                     sink_sharing: SinkSharing::Exclusive,
                     properties: PipelineProperties::default(),
@@ -1458,7 +1479,7 @@ mod tests {
                         input_types: Box::new([LogicalType::Integer]),
                         output_names: Box::new(["a".to_string()]),
                         output_types: Box::new([LogicalType::Integer]),
-                        spill_policy: crate::physical::specs::SpillExecutionPolicy::Forbidden,
+                        spill_policy: crate::physical::specs::SpillExecutionPolicy::InMemory,
                     }),
                     sink_sharing: SinkSharing::Exclusive,
                     properties: PipelineProperties::default(),

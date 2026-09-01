@@ -126,7 +126,7 @@ fn sort_breaker_graph(input_rows: Vec<Vec<Expression>>) -> PipelineGraph {
                     input_types: Box::new([LogicalType::Integer]),
                     output_names: Box::new(["v".to_string()]),
                     output_types: Box::new([LogicalType::Integer]),
-                    spill_policy: crate::physical::specs::SpillExecutionPolicy::Allowed,
+                    spill_policy: crate::physical::specs::SpillExecutionPolicy::Adaptive,
                 }),
                 sink_sharing: SinkSharing::Exclusive,
                 properties: PipelineProperties::default(),
@@ -587,7 +587,7 @@ fn hash_aggregate_breaker_spills_payload_partitions_when_forced_external() {
         },
     );
     let mut spec = grouped_count_spec(None);
-    spec.spill_policy = crate::physical::specs::SpillExecutionPolicy::Forced;
+    spec.spill_policy = crate::physical::specs::SpillExecutionPolicy::ForcedExternal;
     let graph = aggregate_breaker_graph(
         SinkSpec::HashAggregateBuild(HashAggregateBuildSinkSpec {
             handle: BreakerHandleId::new(0),
@@ -775,8 +775,12 @@ fn perfect_hash_aggregate_breaker_groups_and_emits_counts() {
         group_cardinalities: vec![4].into_boxed_slice(),
         resource: paro_optimizer::physical::PerfectHashResourceContract {
             slots: 4,
-            bytes_per_table_upper: usize::MAX,
-            max_local_tables: 1,
+            table_bytes_upper: usize::MAX,
+            memory: paro_optimizer::physical::ExecutionMemoryContract {
+                fixed_non_revocable_bytes: u64::MAX,
+                max_concurrent_tasks: 1,
+                ..Default::default()
+            },
         },
     }));
     let graph = aggregate_breaker_graph(
@@ -872,14 +876,18 @@ fn perfect_hash_having_rejection_still_validates_every_aggregate_state() {
                 wide_type.clone(),
             )),
         ))]),
-        spill_policy: crate::physical::specs::SpillExecutionPolicy::Forbidden,
+        spill_policy: crate::physical::specs::SpillExecutionPolicy::InMemory,
         perfect_hash: Some(PerfectHashAggregatePlan {
             group_minima: Box::new([1]),
             group_cardinalities: Box::new([2]),
             resource: paro_optimizer::physical::PerfectHashResourceContract {
                 slots: 2,
-                bytes_per_table_upper: usize::MAX,
-                max_local_tables: 1,
+                table_bytes_upper: usize::MAX,
+                memory: paro_optimizer::physical::ExecutionMemoryContract {
+                    fixed_non_revocable_bytes: u64::MAX,
+                    max_concurrent_tasks: 1,
+                    ..Default::default()
+                },
             },
         }),
         output_names: Box::new([
@@ -979,8 +987,12 @@ fn perfect_hash_post_reduction_retains_every_global_maximum_tie() {
             group_cardinalities: Box::new([4]),
             resource: paro_optimizer::physical::PerfectHashResourceContract {
                 slots: 4,
-                bytes_per_table_upper: usize::MAX,
-                max_local_tables: 1,
+                table_bytes_upper: usize::MAX,
+                memory: paro_optimizer::physical::ExecutionMemoryContract {
+                    fixed_non_revocable_bytes: u64::MAX,
+                    max_concurrent_tasks: 1,
+                    ..Default::default()
+                },
             },
         }),
         Box::new([]),
@@ -1093,7 +1105,7 @@ fn external_hash_post_reduction_filters_against_the_global_spilled_domain() {
         },
     );
     let mut spec = grouped_sum_post_max_spec(LogicalType::Integer, None, Box::new([]));
-    spec.spill_policy = crate::physical::specs::SpillExecutionPolicy::Forced;
+    spec.spill_policy = crate::physical::specs::SpillExecutionPolicy::ForcedExternal;
     let graph = aggregate_breaker_graph(
         SinkSpec::HashAggregateBuild(HashAggregateBuildSinkSpec {
             handle: BreakerHandleId::new(0),

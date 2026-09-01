@@ -272,6 +272,7 @@ mod tests {
             wrap(&ctx, expression_get(0)),
             wrap(&ctx, expression_get(1)),
             vec![],
+            None,
         ));
 
         let err = verify_physical_planner_invariants(&plan).expect_err("verify should fail");

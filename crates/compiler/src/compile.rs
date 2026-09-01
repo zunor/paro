@@ -78,15 +78,15 @@ pub fn compile_statement_with_parameter_types(
         "Logical plan optimized"
     );
 
-    let plan_dependencies = match &optimized {
+    match &optimized {
         paro_optimizer::OptimizedStatement::Physical(portfolio) => {
             portfolio.verify_result_types(&result_types)?;
-            portfolio.combined_dependencies()?
+            portfolio.verify()?;
         }
         paro_optimizer::OptimizedStatement::ExplainAnalyze { target, .. } => {
-            target.combined_dependencies()?
+            target.verify()?;
         }
-    };
+    }
 
     let executable = match optimized {
         paro_optimizer::OptimizedStatement::Physical(plan) => {
@@ -116,7 +116,6 @@ pub fn compile_statement_with_parameter_types(
             .collect(),
         parameter_types.to_vec(),
         ctx.compile_environment_key(),
-        plan_dependencies,
     );
 
     debug!(

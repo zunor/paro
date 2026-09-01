@@ -305,6 +305,64 @@ mod tests {
     }
 
     #[test]
+    fn admitted_capacity_floor_survives_later_query_registration() {
+        let arbitrator = Arc::new(MemoryArbitrator::new(1_000));
+        let pool_a = Arc::new(QueryMemoryPool::new(1_000));
+        let target_a: Arc<dyn QueryMemoryTarget> = pool_a.clone();
+        let registration_a = arbitrator.clone().register_query(
+            QueryMemoryBudgetSpec::new(1, Some("a".to_string()), 1_000, None),
+            Arc::downgrade(&target_a),
+        );
+        pool_a.attach_registration(registration_a);
+        assert!(pool_a.try_reserve_minimum_capacity(700).unwrap());
+
+        let pool_b = Arc::new(QueryMemoryPool::new(1_000));
+        let target_b: Arc<dyn QueryMemoryTarget> = pool_b.clone();
+        let registration_b = arbitrator.clone().register_query(
+            QueryMemoryBudgetSpec::new(2, Some("b".to_string()), 1_000, None),
+            Arc::downgrade(&target_b),
+        );
+        pool_b.attach_registration(registration_b);
+
+        assert!(pool_a.capacity_bytes() >= 700);
+        assert_eq!(pool_a.capacity_bytes() + pool_b.capacity_bytes(), 1_000);
+        assert!(!pool_b.try_reserve_minimum_capacity(400).unwrap());
+        assert!(pool_a.capacity_bytes() >= 700);
+        assert_eq!(pool_a.capacity_bytes() + pool_b.capacity_bytes(), 1_000);
+
+        assert!(pool_b.try_grow(400).is_err());
+        assert!(pool_a.capacity_bytes() >= 700);
+        assert_eq!(pool_a.capacity_bytes() + pool_b.capacity_bytes(), 1_000);
+    }
+
+    #[test]
+    fn dynamic_system_reserve_cannot_steal_an_admitted_query_floor() {
+        let arbitrator = Arc::new(MemoryArbitrator::new(1_000));
+        let pool = Arc::new(QueryMemoryPool::new(1_000));
+        let target: Arc<dyn QueryMemoryTarget> = pool.clone();
+        let registration = arbitrator.clone().register_query(
+            QueryMemoryBudgetSpec::new(1, Some("query".to_string()), 1_000, None),
+            Arc::downgrade(&target),
+        );
+        pool.attach_registration(registration);
+        assert!(pool.try_reserve_minimum_capacity(700).unwrap());
+
+        let reserve = Arc::new(SystemReserve::new(arbitrator.clone()));
+        assert!(reserve
+            .try_acquire(SystemReserveClass::Maintenance, 301)
+            .is_err());
+        assert_eq!(arbitrator.system_reserve_bytes(), 0);
+        assert_eq!(pool.capacity_bytes(), 1_000);
+
+        let hold = reserve
+            .try_acquire(SystemReserveClass::Maintenance, 300)
+            .expect("unleased process capacity remains available");
+        assert_eq!(arbitrator.system_reserve_bytes(), 300);
+        assert_eq!(pool.capacity_bytes(), 700);
+        drop(hold);
+    }
+
+    #[test]
     fn query_pool_reclaims_from_peer_before_quota_failure() {
         let arbitrator = Arc::new(MemoryArbitrator::new(200));
         let pool_a = Arc::new(QueryMemoryPool::new(200));

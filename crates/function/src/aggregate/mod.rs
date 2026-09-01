@@ -396,11 +396,25 @@ pub enum DecimalDirectUpdate {
 /// This is a semantic contract used by rewrites that change outer-preserving
 /// aggregation into null-rejecting joins. It is intentionally independent of
 /// the SQL function name and of the aggregate's internal state identity.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub enum AggregateEmptyInput {
+    /// No reusable empty-input value has been declared.
     Unknown,
+    /// Finalizing an initialized state without input produces SQL NULL.
     Null,
-    NonNull,
+    /// Exact, already result-typed value produced without input rows.
+    Exact(Value),
+}
+
+impl AggregateEmptyInput {
+    /// Return an exact non-NULL value only when it already inhabits the
+    /// aggregate result domain. Proof metadata never performs implicit casts.
+    pub fn exact_value(&self, return_type: &LogicalType) -> Option<&Value> {
+        let Self::Exact(value) = self else {
+            return None;
+        };
+        (!value.is_null() && value.logical_type() == *return_type).then_some(value)
+    }
 }
 
 /// Exact scalar result of merging zero or one finalized partial value.
@@ -809,7 +823,7 @@ impl AggregateFunctionSet {
 
     pub fn with_empty_input(mut self, empty_input: AggregateEmptyInput) -> Self {
         for function in &mut self.functions {
-            function.empty_input = empty_input;
+            function.empty_input = empty_input.clone();
         }
         self
     }

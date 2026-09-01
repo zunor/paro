@@ -10,14 +10,134 @@ use crate::binder::plan::subquery::{
     copy_subquery_top_level, copy_subquery_top_level_plan, flatten_dependent_join,
 };
 use crate::expression::{
-    ColumnRefExpression, ComparisonExpression, ComparisonType, ConstantExpression, Expression,
+    CaseExpression, ColumnRefExpression, ComparisonExpression, ComparisonType, ConstantExpression,
+    Expression, ExpressionIterator, ExpressionVisitDecision, OperatorExpression, OperatorType,
     SubqueryExpression, SubqueryType,
 };
-use crate::operator::{AnyAllPayload, ColumnBinding, DependentJoin, LogicalOperator};
+use crate::operator::{AnyAllPayload, ColumnBinding, DependentJoin, LogicalOperator, Projection};
 use crate::plan::PlannedStatement;
 use paro_common::error::{self as paro_error, Result};
 use paro_common::runtime_value::Value;
 use paro_common::types::LogicalType;
+use paro_function::aggregate::AggregateEmptyInput;
+
+/// Derive the value produced by a scalar aggregate branch when its relational
+/// input is empty. The result remains an expression so projection semantics
+/// such as `COUNT(*) + 1` are preserved without evaluating user code while
+/// binding. Only exact aggregate contracts may cross the decorrelation
+/// boundary; NULL is represented explicitly in the same typed domain.
+fn scalar_empty_output(plan: &LogicalOperator, ordinal: usize) -> Option<Expression> {
+    fn outputs(plan: &LogicalOperator) -> Option<Vec<Expression>> {
+        match plan {
+            LogicalOperator::Aggregate(aggregate)
+                if aggregate.groups.is_empty()
+                    && aggregate.grouping_functions.is_empty()
+                    && (aggregate.grouping_sets.is_empty()
+                        || (aggregate.grouping_sets.len() == 1
+                            && aggregate.grouping_sets[0].expressions.is_empty())) =>
+            {
+                aggregate
+                    .aggregates
+                    .iter()
+                    .map(|expression| {
+                        let Expression::Aggregate(aggregate) = expression else {
+                            return None;
+                        };
+                        let return_type = aggregate.return_type.clone();
+                        let value = match &aggregate.function.empty_input {
+                            AggregateEmptyInput::Null => Value::Null(return_type.clone()),
+                            exact @ AggregateEmptyInput::Exact(_) => {
+                                exact.exact_value(&return_type)?.clone()
+                            }
+                            AggregateEmptyInput::Unknown => return None,
+                        };
+                        Some(Expression::Constant(ConstantExpression::new(
+                            value,
+                            return_type,
+                        )))
+                    })
+                    .collect()
+            }
+            LogicalOperator::Projection(projection) => {
+                let child_outputs = outputs(&projection.child.operator)?;
+                let child_bindings = projection.child.get_column_bindings();
+                if child_outputs.len() != child_bindings.len() {
+                    return None;
+                }
+                let replacements = child_bindings
+                    .into_iter()
+                    .zip(child_outputs)
+                    .collect::<std::collections::HashMap<_, _>>();
+                projection
+                    .expressions
+                    .iter()
+                    .cloned()
+                    .map(|expression| {
+                        let rewritten = expression.replace_column_ref(&|column| {
+                            (column.depth == 0)
+                                .then(|| replacements.get(&column.binding).cloned())
+                                .flatten()
+                        });
+                        let mut unresolved = false;
+                        ExpressionIterator::visit(&rewritten, &mut |candidate| {
+                            if matches!(candidate, Expression::ColumnRef(_)) {
+                                unresolved = true;
+                                ExpressionVisitDecision::SkipChildren
+                            } else {
+                                ExpressionVisitDecision::Descend
+                            }
+                        });
+                        (!unresolved).then_some(rewritten)
+                    })
+                    .collect()
+            }
+            _ => None,
+        }
+    }
+
+    outputs(plan)?.get(ordinal).cloned()
+}
+
+fn append_scalar_presence_carrier(
+    binder: &mut crate::binder::Binder,
+    plan: LogicalOperator,
+) -> (LogicalOperator, ColumnBinding) {
+    if let LogicalOperator::Projection(mut projection) = plan {
+        let presence_ordinal = projection.expressions.len();
+        projection
+            .expressions
+            .push(Expression::Constant(ConstantExpression::new(
+                Value::Boolean(true),
+                LogicalType::Boolean,
+            )));
+        projection.returned_types.push(LogicalType::Boolean);
+        let presence_binding = ColumnBinding::new(projection.table_index, presence_ordinal);
+        return (LogicalOperator::Projection(projection), presence_binding);
+    }
+
+    let child = binder.wrap_plan(plan);
+    let visible_names = child.output_names();
+    let mut expressions = child
+        .get_column_bindings()
+        .into_iter()
+        .zip(child.types())
+        .map(|(binding, logical_type)| {
+            Expression::ColumnRef(ColumnRefExpression::new(binding, logical_type))
+        })
+        .collect::<Vec<_>>();
+    expressions.push(Expression::Constant(ConstantExpression::new(
+        Value::Boolean(true),
+        LogicalType::Boolean,
+    )));
+    let table_index = binder.bind_context.generate_table_index();
+    let presence_binding = ColumnBinding::new(table_index, expressions.len() - 1);
+    (
+        LogicalOperator::Projection(
+            Projection::new(table_index, child, expressions).with_visible_names(visible_names),
+        ),
+        presence_binding,
+    )
+}
 
 impl crate::binder::Binder {
     fn build_correlated_dependent_join(
@@ -25,13 +145,16 @@ impl crate::binder::Binder {
         root: LogicalOperator,
         subquery_plan: LogicalOperator,
         subquery: &SubqueryExpression,
+        scalar_presence_binding: Option<ColumnBinding>,
     ) -> DependentJoin {
         let left = self.wrap_plan(root);
         let right = self.wrap_plan(subquery_plan);
         let correlated_columns = subquery.correlated_columns.clone();
 
         match subquery.subquery_type {
-            SubqueryType::Scalar => DependentJoin::scalar(left, right, correlated_columns),
+            SubqueryType::Scalar => {
+                DependentJoin::scalar(left, right, correlated_columns, scalar_presence_binding)
+            }
             SubqueryType::Exists => DependentJoin::mark_exists(
                 left,
                 right,
@@ -91,7 +214,17 @@ impl crate::binder::Binder {
             subquery.subquery.as_ref(),
             subquery.bind_snapshot.as_ref(),
         );
-        let subquery_plan = copied_statement.plan.operator;
+        let mut subquery_plan = copied_statement.plan.operator;
+        let scalar_empty_output = (subquery.subquery_type == SubqueryType::Scalar)
+            .then(|| scalar_empty_output(&subquery_plan, 0))
+            .flatten();
+        let scalar_presence_binding = if scalar_empty_output.is_some() {
+            let (plan, binding) = append_scalar_presence_carrier(self, subquery_plan);
+            subquery_plan = plan;
+            Some(binding)
+        } else {
+            None
+        };
 
         let old_root = std::mem::replace(root, LogicalOperator::DummyScan);
         let dependent_join = match subquery.subquery_type {
@@ -99,15 +232,20 @@ impl crate::binder::Binder {
             | SubqueryType::Exists
             | SubqueryType::NotExists
             | SubqueryType::Any
-            | SubqueryType::All => {
-                self.build_correlated_dependent_join(old_root, subquery_plan, subquery)
-            }
+            | SubqueryType::All => self.build_correlated_dependent_join(
+                old_root,
+                subquery_plan,
+                subquery,
+                scalar_presence_binding,
+            ),
         };
         let planned_mark_index = dependent_join.mark_index();
 
         let flattened = flatten_dependent_join(self, dependent_join)?;
         let result_bindings = flattened.get_column_bindings();
-        let result_col_index = result_bindings.len().saturating_sub(1);
+        let result_col_index = result_bindings
+            .len()
+            .saturating_sub(if scalar_empty_output.is_some() { 2 } else { 1 });
         *root = flattened;
         match subquery.subquery_type {
             SubqueryType::Exists | SubqueryType::Any => {
@@ -147,8 +285,34 @@ impl crate::binder::Binder {
                     .get(result_col_index)
                     .cloned()
                     .unwrap_or_else(|| subquery.return_type.clone());
-                Ok(Expression::ColumnRef(ColumnRefExpression::new(
+                let scalar = Expression::ColumnRef(ColumnRefExpression::new(
                     result_binding,
+                    result_type.clone(),
+                ));
+                let Some(empty_output) = scalar_empty_output else {
+                    return Ok(scalar);
+                };
+                if empty_output.return_type() != result_type {
+                    return Err(paro_error::internal(
+                        "correlated scalar empty-input contract changed result type",
+                    ));
+                }
+                let presence_binding = result_bindings.last().copied().ok_or_else(|| {
+                    paro_error::internal("scalar subquery presence carrier is missing")
+                })?;
+                let presence = Expression::ColumnRef(ColumnRefExpression::new(
+                    presence_binding,
+                    LogicalType::Boolean,
+                ));
+                let missing = Expression::Operator(OperatorExpression::new_unary(
+                    OperatorType::IsNull,
+                    presence,
+                    LogicalType::Boolean,
+                ));
+                Ok(Expression::Case(CaseExpression::new(
+                    missing,
+                    empty_output,
+                    scalar,
                     result_type,
                 )))
             }
@@ -313,6 +477,7 @@ mod tests {
             outer,
             expression_get(30, vec![LogicalType::Integer]),
             &subquery,
+            None,
         );
 
         match &dependent_join.kind {
@@ -351,9 +516,13 @@ mod tests {
             expression_get(30, vec![LogicalType::Integer]),
             expression_get(31, vec![LogicalType::Integer]),
             &subquery,
+            None,
         );
 
-        assert!(matches!(dependent_join.kind, DependentJoinKind::Scalar));
+        assert!(matches!(
+            dependent_join.kind,
+            DependentJoinKind::Scalar { .. }
+        ));
         assert!(dependent_join.mark_index().is_none());
     }
 
@@ -854,15 +1023,31 @@ mod tests {
 
         match &root {
             LogicalOperator::Join(Join::Comparison(join)) => match &join.right.operator {
-                LogicalOperator::Aggregate(inner_agg) => {
+                LogicalOperator::Projection(projection) => {
                     assert_eq!(join.join_type, JoinType::Single);
+                    assert_eq!(projection.visible_count, 1);
+                    assert_eq!(projection.expressions.len(), 3);
+                    assert!(matches!(
+                        &projection.expressions[1],
+                        Expression::Constant(ConstantExpression {
+                            value: Value::Boolean(true),
+                            ..
+                        })
+                    ));
+                    let LogicalOperator::Aggregate(inner_agg) = &projection.child.operator else {
+                        panic!("expected aggregate below scalar presence projection")
+                    };
                     assert_eq!(inner_agg.groups.len(), 1);
                     assert_eq!(
                         extract_binding(&join.conditions[0].right),
+                        Some(ColumnBinding::new(projection.table_index, 2))
+                    );
+                    assert_eq!(
+                        extract_binding(&projection.expressions[2]),
                         Some(ColumnBinding::new(inner_agg.group_index, 0))
                     );
                 }
-                other => panic!("expected aggregate rhs, got {other:?}"),
+                other => panic!("expected scalar presence projection rhs, got {other:?}"),
             },
             other => panic!("expected single join root, got {other:?}"),
         }

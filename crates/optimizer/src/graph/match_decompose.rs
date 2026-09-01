@@ -39,16 +39,18 @@ impl GraphMatchDecompose {
     }
 
     fn rewrite_plan(&mut self, plan: LogicalPlan) -> LogicalPlan {
-        let plan = plan.map_children(|child| self.rewrite_plan(child));
-        let operator = match plan.operator {
-            LogicalOperator::GraphMatch(gm) => self.decompose(gm),
-            other => other,
-        };
-        LogicalPlan {
-            id: plan.id,
-            stats: plan.stats,
-            operator,
-        }
+        plan.try_map_post_order(|plan| {
+            let operator = match plan.operator {
+                LogicalOperator::GraphMatch(gm) => self.decompose(gm),
+                other => other,
+            };
+            Ok(LogicalPlan {
+                id: plan.id,
+                stats: plan.stats,
+                operator,
+            })
+        })
+        .expect("graph decomposition traversal cannot fail")
     }
 
     /// Decompose a `GraphMatch` into Scan + Expand chain + Projection.

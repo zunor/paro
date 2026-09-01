@@ -21,7 +21,9 @@ use paro_common::error::Result;
 use paro_common::identity::GraphId;
 use paro_common::logging::targets;
 use paro_context::StatementContext;
-use paro_planner::binder::deep_copy::duplicate_plan_preserving_indices;
+use paro_planner::binder::deep_copy::{
+    duplicate_plan_preserving_indices, fork_plan_preserving_indices,
+};
 use paro_planner::binder::Binder;
 use paro_planner::operator::{Join, JoinType, LogicalOperator};
 use paro_planner::plan::LogicalPlan;
@@ -194,22 +196,27 @@ impl Optimizer {
         )?;
         let mut alternatives = Vec::with_capacity(graph_plans.len().saturating_mul(3));
         for (index, graph_plan) in graph_plans.into_iter().enumerate() {
-            let correlated_seed = contains_redundant_computation_region(&graph_plan).then(|| {
-                self.prepare_correlated_seed(duplicate_plan_preserving_indices(
-                    &graph_plan,
-                    self.binder.bind_context.shared().as_ref(),
-                ))
-            });
+            let (graph_plan, correlated_seed) =
+                if contains_redundant_computation_region(&graph_plan) {
+                    let (graph_plan, correlated_seed) = fork_plan_preserving_indices(
+                        graph_plan,
+                        self.binder.bind_context.shared().as_ref(),
+                    )?;
+                    (
+                        graph_plan,
+                        Some(self.prepare_correlated_seed(correlated_seed)),
+                    )
+                } else {
+                    (graph_plan, None)
+                };
             let canonical = self.canonicalize_query(graph_plan)?;
-            let baseline = self.settle_query_candidate(duplicate_plan_preserving_indices(
-                &canonical,
+            let (baseline_input, distinct_input) = fork_plan_preserving_indices(
+                canonical,
                 self.binder.bind_context.shared().as_ref(),
-            ))?;
+            )?;
+            let baseline = self.settle_query_candidate(baseline_input)?;
             let distinct_feasibility_candidate =
-                self.distinct_aggregate_feasibility_candidate(duplicate_plan_preserving_indices(
-                    &canonical,
-                    self.binder.bind_context.shared().as_ref(),
-                ))?;
+                self.distinct_aggregate_feasibility_candidate(distinct_input)?;
             alternatives.push(baseline.into_alternative(if index == 0 {
                 AlternativeOrigin::Baseline
             } else {
@@ -247,10 +254,11 @@ impl Optimizer {
             if alternatives.len() >= self.budget.max_optional_logical_exprs_per_group as usize + 1 {
                 break;
             }
-            match self.correlated_aggregate_candidate(duplicate_plan_preserving_indices(
-                &correlated_canonical,
+            let (aggregate_input, scalar_reuse_input) = fork_plan_preserving_indices(
+                correlated_canonical,
                 self.binder.bind_context.shared().as_ref(),
-            )) {
+            )?;
+            match self.correlated_aggregate_candidate(aggregate_input) {
                 Ok(plan) => {
                     alternatives.push(plan.into_alternative(AlternativeOrigin::Specialized {
                         rule: CORRELATED_AGGREGATE_REGION_RULE,
@@ -266,10 +274,7 @@ impl Optimizer {
                 break;
             }
             match self
-                .settle_query_candidate(duplicate_plan_preserving_indices(
-                    &correlated_canonical,
-                    self.binder.bind_context.shared().as_ref(),
-                ))
+                .settle_query_candidate(scalar_reuse_input)
                 .and_then(|plan| self.scalar_reuse_candidate(plan))
             {
                 Ok(plan) => {
@@ -294,57 +299,69 @@ impl Optimizer {
         // tree and add the enumerated tree as an equivalent sibling so the
         // grant-aware physical cost model jointly chooses order and algorithm.
         let mut join_region_alternatives = Vec::new();
-        for alternative in &alternatives {
-            if !contains_join_region(&alternative.plan) {
+        let base_alternative_count = alternatives.len();
+        for alternative in &mut alternatives {
+            if !contains_multiway_join_region(&alternative.plan) {
                 continue;
             }
-            let mut candidate_context = self
+            let owned_plan = std::mem::replace(
+                &mut alternative.plan,
+                LogicalPlan::synthetic(LogicalOperator::DummyScan),
+            );
+            let (original_plan, join_input) = fork_plan_preserving_indices(
+                owned_plan,
+                self.binder.bind_context.shared().as_ref(),
+            )?;
+            alternative.plan = original_plan;
+            let candidate_context = self
                 .ctx
                 .fork_for_candidate(Arc::unwrap_or_clone(alternative.column_stats.clone()));
-            let mut join_candidate = JoinOrderOptimizer::new()
+            let join_candidates = JoinOrderOptimizer::new()
                 .with_search_budget(&self.budget)
-                .optimize_plan(
+                .enumerate_plan_frontier(
                     candidate_context.session.as_ref(),
-                    duplicate_plan_preserving_indices(
-                        &alternative.plan,
-                        self.binder.bind_context.shared().as_ref(),
-                    ),
+                    join_input,
                     &candidate_context.column_stats,
                     &candidate_context.bind_context,
                 )?;
-            join_candidate = JoinPredicateNormalizer::new(&candidate_context.bind_context)
-                .optimize_plan(join_candidate)?;
-            join_candidate =
-                StatisticsGathering::new().gather(join_candidate, &mut candidate_context)?;
-            let mut propagator = StatisticsPropagator::new();
-            join_candidate =
-                propagator.propagate(candidate_context.session.clone(), join_candidate);
-            candidate_context.column_stats = propagator.take_statistics_map();
-            join_candidate =
-                StatisticsGathering::new().gather(join_candidate, &mut candidate_context)?;
-            let join_candidate = self.finalize_query_candidate(CandidatePlan {
-                plan: join_candidate,
-                column_stats: Arc::new(candidate_context.column_stats),
-            })?;
-            if let Err(error) = verify_logical_plan(&self.ctx.bind_context, &join_candidate.plan) {
-                debug!(
-                    target: targets::OPTIMIZER,
-                    %error,
-                    "join-region enumerator pruned a candidate that failed semantic verification"
-                );
-                continue;
-            }
-            join_region_alternatives.push(join_candidate.into_alternative(
-                AlternativeOrigin::Specialized {
-                    rule: JOIN_REGION_ENUMERATOR_RULE,
-                },
-            ));
-            if alternatives
-                .len()
-                .saturating_add(join_region_alternatives.len())
-                >= self.budget.max_optional_logical_exprs_per_group as usize + 1
-            {
-                break;
+            for mut join_candidate in join_candidates {
+                let mut candidate_context = self
+                    .ctx
+                    .fork_for_candidate(Arc::unwrap_or_clone(alternative.column_stats.clone()));
+                join_candidate = JoinPredicateNormalizer::new(&candidate_context.bind_context)
+                    .optimize_plan(join_candidate)?;
+                join_candidate =
+                    StatisticsGathering::new().gather(join_candidate, &mut candidate_context)?;
+                let mut propagator = StatisticsPropagator::new();
+                join_candidate =
+                    propagator.propagate(candidate_context.session.clone(), join_candidate);
+                candidate_context.column_stats = propagator.take_statistics_map();
+                join_candidate =
+                    StatisticsGathering::new().gather(join_candidate, &mut candidate_context)?;
+                let join_candidate = self.finalize_query_candidate(CandidatePlan {
+                    plan: join_candidate,
+                    column_stats: Arc::new(candidate_context.column_stats),
+                })?;
+                if let Err(error) =
+                    verify_logical_plan(&self.ctx.bind_context, &join_candidate.plan)
+                {
+                    debug!(
+                        target: targets::OPTIMIZER,
+                        %error,
+                        "join-region enumerator pruned a candidate that failed semantic verification"
+                    );
+                    continue;
+                }
+                join_region_alternatives.push(join_candidate.into_alternative(
+                    AlternativeOrigin::Specialized {
+                        rule: JOIN_REGION_ENUMERATOR_RULE,
+                    },
+                ));
+                if base_alternative_count.saturating_add(join_region_alternatives.len())
+                    >= self.budget.max_optional_logical_exprs_per_group as usize + 1
+                {
+                    break;
+                }
             }
         }
         alternatives.extend(join_region_alternatives);
@@ -1186,12 +1203,25 @@ fn resource_grant_classes(
         .into_boxed_slice()
 }
 
-fn contains_join_region(plan: &LogicalPlan) -> bool {
-    if matches!(
-        plan.operator,
-        LogicalOperator::Join(_) | LogicalOperator::DependentJoin(_)
-    ) {
-        return true;
+fn contains_multiway_join_region(plan: &LogicalPlan) -> bool {
+    fn region_relations(plan: &LogicalPlan) -> usize {
+        match &plan.operator {
+            LogicalOperator::Join(Join::Comparison(join))
+                if join.join_type == paro_planner::operator::JoinType::Inner =>
+            {
+                region_relations(&join.left).saturating_add(region_relations(&join.right))
+            }
+            LogicalOperator::Join(Join::Cross(cross)) => {
+                region_relations(&cross.left).saturating_add(region_relations(&cross.right))
+            }
+            LogicalOperator::Filter(filter) => region_relations(&filter.child),
+            _ => 1,
+        }
     }
-    plan.children().into_iter().any(contains_join_region)
+
+    region_relations(plan) >= 3
+        || plan
+            .children()
+            .into_iter()
+            .any(contains_multiway_join_region)
 }

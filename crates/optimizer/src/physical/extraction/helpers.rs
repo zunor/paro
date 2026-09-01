@@ -708,6 +708,15 @@ pub(crate) fn project_by_index<T: Clone>(
         .collect()
 }
 
+pub(crate) fn project_output_names(
+    input: &LogicalPlan,
+    projection_map: &[usize],
+    label: &str,
+) -> Result<Vec<String>> {
+    let names = align_output_names(input.output_names(), input.types().len(), label)?;
+    project_by_index(&names, projection_map, label)
+}
+
 pub(crate) fn hash_join_left_projection(join: &ComparisonJoin) -> Vec<usize> {
     match join.join_type {
         JoinType::RightSemi | JoinType::RightAnti => Vec::new(),
@@ -727,13 +736,13 @@ pub(crate) fn hash_join_right_projection(join: &ComparisonJoin) -> Vec<usize> {
 pub(crate) fn comparison_join_output_names(join: &ComparisonJoin) -> Result<Vec<String>> {
     let left_projection = hash_join_left_projection(join);
     let right_projection = hash_join_right_projection(join);
-    let left_names = project_by_index(
-        &join.left.output_names(),
+    let left_names = project_output_names(
+        join.left.as_ref(),
         &left_projection,
         "comparison join left output",
     )?;
-    let right_names = project_by_index(
-        &join.right.output_names(),
+    let right_names = project_output_names(
+        join.right.as_ref(),
         &right_projection,
         "comparison join right output",
     )?;
@@ -1101,5 +1110,36 @@ pub(crate) fn collect_row_literal_plan(
             Ok(true)
         }
         _ => Ok(false),
+    }
+}
+
+#[cfg(test)]
+mod output_name_tests {
+    use super::*;
+
+    #[test]
+    fn projected_internal_column_receives_a_physical_name() {
+        let bind_context = paro_planner::binder::context::BindContext::new();
+        let projection = LogicalProjection::new(
+            bind_context.generate_table_index(),
+            LogicalPlan::new(&bind_context, LogicalOperator::DummyScan),
+            vec![
+                Expression::Constant(ConstantExpression::new(
+                    paro_common::runtime_value::Value::Integer(1),
+                    LogicalType::Integer,
+                )),
+                Expression::Constant(ConstantExpression::new(
+                    paro_common::runtime_value::Value::Boolean(true),
+                    LogicalType::Boolean,
+                )),
+            ],
+        )
+        .with_visible_names(vec!["visible".to_string()]);
+        let plan = LogicalPlan::new(&bind_context, LogicalOperator::Projection(projection));
+
+        assert_eq!(
+            project_output_names(&plan, &[1], "hidden projection").unwrap(),
+            vec!["__paro_hidden_1"]
+        );
     }
 }

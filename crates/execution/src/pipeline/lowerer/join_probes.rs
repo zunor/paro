@@ -696,7 +696,8 @@ impl<'a> PipelineLowerer<'a> {
         match &node.kind {
             PhysicalNodeKind::HashJoin(spec) => {
                 if needs_hash_join_unmatched_source(spec.join_type)
-                    || spec.spill_policy == crate::physical::specs::SpillExecutionPolicy::Forced
+                    || spec.spill_policy
+                        == crate::physical::specs::SpillExecutionPolicy::ForcedExternal
                 {
                     return self.collect_probe_roles_source_fallback(root, pipelines, dependencies);
                 }
@@ -755,7 +756,7 @@ impl<'a> PipelineLowerer<'a> {
                 chain
                     .transforms
                     .push(hash_join_probe_transform(handle, &spec));
-                if spec.spill_policy != crate::physical::specs::SpillExecutionPolicy::Forbidden {
+                if spec.spill_policy != crate::physical::specs::SpillExecutionPolicy::InMemory {
                     chain.pending_replays.push(PendingHashJoinReplay {
                         source: hash_join_spill_replay_source(
                             handle,

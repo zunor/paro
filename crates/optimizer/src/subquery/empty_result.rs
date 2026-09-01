@@ -23,8 +23,8 @@ impl EmptyResultPullup {
     }
 
     fn optimize_recursive_plan(&mut self, plan: LogicalPlan) -> LogicalPlan {
-        let plan = plan.map_children(|child| self.optimize_recursive_plan(child));
-        plan.map_operator(|operator| self.pull_up(operator))
+        plan.try_map_post_order(|plan| Ok(plan.map_operator(|operator| self.pull_up(operator))))
+            .expect("empty-result traversal cannot fail")
     }
 
     fn pull_up(&self, plan: LogicalOperator) -> LogicalOperator {

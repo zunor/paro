@@ -1257,6 +1257,7 @@ mod tests {
                         leaf_plan(&ctx, 10),
                         leaf_plan(&ctx, 20),
                         vec![],
+                        None,
                     )),
                 )
             },

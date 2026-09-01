@@ -27,7 +27,11 @@ pub enum MarkSubqueryKind {
 
 #[derive(Debug, Clone)]
 pub enum DependentJoinKind {
-    Scalar,
+    Scalar {
+        /// Non-NULL carrier appended to the right input when scalar empty-row
+        /// assembly must distinguish "no row" from a matched SQL NULL.
+        presence_binding: Option<ColumnBinding>,
+    },
     Mark {
         mark_index: usize,
         subquery: MarkSubqueryKind,
@@ -59,12 +63,13 @@ impl DependentJoin {
         left: LogicalPlan,
         right: LogicalPlan,
         correlated_columns: Vec<CorrelatedColumnInfo>,
+        presence_binding: Option<ColumnBinding>,
     ) -> Self {
         Self {
             left: Box::new(left),
             right: Box::new(right),
             correlated_columns,
-            kind: DependentJoinKind::Scalar,
+            kind: DependentJoinKind::Scalar { presence_binding },
         }
     }
 
@@ -217,7 +222,7 @@ impl DependentJoin {
         let mut types = self.left.types();
         match self.kind {
             DependentJoinKind::Mark { .. } => types.push(LogicalType::Boolean),
-            DependentJoinKind::Scalar | DependentJoinKind::Lateral { .. } => {
+            DependentJoinKind::Scalar { .. } | DependentJoinKind::Lateral { .. } => {
                 types.extend(self.right.types())
             }
         }
@@ -234,7 +239,7 @@ impl DependentJoin {
             DependentJoinKind::Mark { mark_index, .. } => {
                 bindings.push(ColumnBinding::new(mark_index, 0));
             }
-            DependentJoinKind::Scalar | DependentJoinKind::Lateral { .. } => {
+            DependentJoinKind::Scalar { .. } | DependentJoinKind::Lateral { .. } => {
                 bindings.extend(right_bindings.iter().copied())
             }
         }
@@ -245,7 +250,7 @@ impl DependentJoin {
         let mut names = self.left.output_names();
         match self.kind {
             DependentJoinKind::Mark { .. } => names.push("mark".to_string()),
-            DependentJoinKind::Scalar | DependentJoinKind::Lateral { .. } => {
+            DependentJoinKind::Scalar { .. } | DependentJoinKind::Lateral { .. } => {
                 names.extend(self.right.output_names())
             }
         }
@@ -281,11 +286,16 @@ mod tests {
 
     #[test]
     fn scalar_constructor_sets_kind_and_correlation_metadata() {
-        let join = DependentJoin::scalar(dummy_plan(), dummy_plan(), correlated());
+        let join = DependentJoin::scalar(dummy_plan(), dummy_plan(), correlated(), None);
 
         assert!(join.has_correlated_columns());
         assert_eq!(join.correlated_column_count(), 1);
-        assert!(matches!(join.kind, DependentJoinKind::Scalar));
+        assert!(matches!(
+            join.kind,
+            DependentJoinKind::Scalar {
+                presence_binding: None
+            }
+        ));
         assert!(join.mark_index().is_none());
     }
 
@@ -377,7 +387,7 @@ mod tests {
 
     #[test]
     fn test_dependent_join_name() {
-        let join = DependentJoin::scalar(dummy_plan(), dummy_plan(), vec![]);
+        let join = DependentJoin::scalar(dummy_plan(), dummy_plan(), vec![], None);
         assert_eq!(join.name(), "DEPENDENT_JOIN");
     }
 }

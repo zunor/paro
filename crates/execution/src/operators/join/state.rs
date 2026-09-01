@@ -62,6 +62,7 @@ pub struct CrossProductProbeTransformLocal {
     pub external_store: usize,
     pub external_scan: RowScanState,
     pub external_chunk: Option<Chunk>,
+    pub external_chunk_ready: bool,
     pub probe_in_progress: bool,
 }
 

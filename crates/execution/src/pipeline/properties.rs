@@ -59,10 +59,12 @@ impl PipelinePropertyAccumulator {
         match sink {
             SinkSpec::PerfectHashAggregate(spec) => {
                 if let Some(plan) = spec.spec.perfect_hash.as_ref() {
-                    self.capabilities.parallelism = self
-                        .capabilities
-                        .parallelism
-                        .merge(Parallelism::bounded(plan.resource.max_local_tables));
+                    self.capabilities.parallelism =
+                        self.capabilities
+                            .parallelism
+                            .merge(Parallelism::bounded(usize::from(
+                                plan.resource.memory.max_concurrent_tasks,
+                            )));
                 }
             }
             SinkSpec::TopNBuild(_) => {

@@ -7,14 +7,18 @@ mod exec_ok;
 mod query_i64_col;
 
 use exec_ok::exec_ok;
-use paro_instance::Instance;
+use paro_common::runtime_value::Value;
+use paro_instance::{Instance, InstanceConfig};
 use paro_session::{CollectingSink, Session, StatementCompletion};
 use query_i64_col::query_i64_col;
 use std::collections::BTreeMap;
 
 #[tokio::test]
 async fn group_by_low_cardinality_ordered_matches_typed_runtime_gate() {
-    let instance = Instance::new_in_memory();
+    let instance = Instance::new_in_memory_with_config(
+        InstanceConfig::in_memory().with_max_memory(4 * 1024 * 1024),
+    )
+    .expect("ordered aggregate test instance");
     let mut session = Session::new(1, instance);
     let mut sink = CollectingSink::new();
 
@@ -80,4 +84,88 @@ async fn group_by_low_cardinality_ordered_matches_typed_runtime_gate() {
     assert_eq!(result.completion, StatementCompletion::Select { rows: 10 });
     assert_eq!(query_i64_col(&sink, 0), (0..10).collect::<Vec<_>>());
     assert_eq!(query_i64_col(&sink, 1), vec![100; 10]);
+}
+
+#[tokio::test]
+async fn correlated_count_restores_its_typed_empty_input_value() {
+    let instance = Instance::new_in_memory_with_config(
+        InstanceConfig::in_memory().with_max_memory(8 * 1024 * 1024),
+    )
+    .expect("correlated aggregate test instance");
+    let mut session = Session::new(1, instance);
+    let mut sink = CollectingSink::new();
+
+    exec_ok(
+        &mut session,
+        &mut sink,
+        "CREATE TABLE scalar_outer (k INT, available INT);
+         CREATE TABLE scalar_inner (k INT);
+         INSERT INTO scalar_outer VALUES (1, 2), (2, 2);
+         INSERT INTO scalar_inner VALUES (1)",
+    )
+    .await;
+    exec_ok(
+        &mut session,
+        &mut sink,
+        "SELECT o.k
+         FROM scalar_outer AS o
+         WHERE o.available > (
+             SELECT count(*) FROM scalar_inner AS i WHERE i.k = o.k
+         )
+         ORDER BY o.k",
+    )
+    .await;
+
+    assert_eq!(query_i64_col(&sink, 0), vec![1, 2]);
+
+    exec_ok(
+        &mut session,
+        &mut sink,
+        "SELECT o.k,
+                (SELECT CASE
+                            WHEN COUNT(*) = 1 THEN NULL::BIGINT
+                            ELSE COUNT(*)
+                        END
+                   FROM scalar_inner AS i
+                  WHERE i.k = o.k)
+           FROM scalar_outer AS o
+          ORDER BY o.k",
+    )
+    .await;
+    let result = sink.assert_single_result();
+    let chunk = result.chunks.first().expect("correlated scalar output");
+    assert_eq!(chunk.column(0).unwrap().get_value(0), Value::Integer(1));
+    assert_eq!(
+        chunk.column(1).unwrap().get_value(0),
+        Value::Null(paro_common::types::LogicalType::BigInt)
+    );
+    assert_eq!(chunk.column(0).unwrap().get_value(1), Value::Integer(2));
+    assert_eq!(chunk.column(1).unwrap().get_value(1), Value::BigInt(0));
+}
+
+#[tokio::test]
+async fn empty_grouping_set_emits_its_identity_row() {
+    let instance = Instance::new_in_memory();
+    let mut session = Session::new(1, instance);
+    let mut sink = CollectingSink::new();
+
+    exec_ok(&mut session, &mut sink, "CREATE TABLE empty_groups (a INT)").await;
+    exec_ok(
+        &mut session,
+        &mut sink,
+        "SELECT GROUPING(a), a, COUNT(*)
+         FROM empty_groups
+         GROUP BY GROUPING SETS ((a), ())",
+    )
+    .await;
+
+    let result = sink.assert_single_result();
+    assert_eq!(result.completion, StatementCompletion::Select { rows: 1 });
+    let chunk = result.chunks.first().expect("identity output chunk");
+    assert_eq!(chunk.column(0).unwrap().get_value(0), Value::BigInt(1));
+    assert_eq!(
+        chunk.column(1).unwrap().get_value(0),
+        Value::Null(paro_common::types::LogicalType::Integer)
+    );
+    assert_eq!(chunk.column(2).unwrap().get_value(0), Value::BigInt(0));
 }

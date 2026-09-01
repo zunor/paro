@@ -11,7 +11,7 @@ fn partition_aggregate_window_graph(
     partition_aggregate_window_graph_with_policy(
         key_type,
         input_rows,
-        crate::physical::specs::SpillExecutionPolicy::Allowed,
+        crate::physical::specs::SpillExecutionPolicy::Adaptive,
     )
 }
 
@@ -226,7 +226,7 @@ fn global_filtered_count_window_spec() -> PartitionAggregateWindowSpec {
             aggregate_orders: Box::new([Box::new([])]),
             post_reduction: None,
             having_filter: Box::new([]),
-            spill_policy: crate::physical::specs::SpillExecutionPolicy::Allowed,
+            spill_policy: crate::physical::specs::SpillExecutionPolicy::Adaptive,
             perfect_hash: None,
             output_names: Box::new(["count".to_string()]),
             output_types: Box::new([LogicalType::BigInt]),
@@ -283,7 +283,7 @@ fn global_aggregate_window_forced_external_spills_only_detail_payload() {
         },
     );
     let mut spec = global_filtered_count_window_spec();
-    spec.aggregate.spill_policy = crate::physical::specs::SpillExecutionPolicy::Forced;
+    spec.aggregate.spill_policy = crate::physical::specs::SpillExecutionPolicy::ForcedExternal;
     let graph = partition_aggregate_window_graph_from_spec(
         spec,
         vec![
@@ -340,7 +340,7 @@ fn partition_aggregate_window_forced_external_replays_raw_payload() {
             vec![null_constant(LogicalType::Integer), int_constant(40)],
             vec![int_constant(2), int_constant(50)],
         ],
-        crate::physical::specs::SpillExecutionPolicy::Forced,
+        crate::physical::specs::SpillExecutionPolicy::ForcedExternal,
     );
     let thread = ThreadContext::single_threaded();
     let wake = OperatorWakeScope {
@@ -432,7 +432,7 @@ fn partition_aggregate_window_forced_external_preserves_filter_payload() {
             aggregate_orders: Box::new([Box::new([])]),
             post_reduction: None,
             having_filter: Box::new([]),
-            spill_policy: crate::physical::specs::SpillExecutionPolicy::Allowed,
+            spill_policy: crate::physical::specs::SpillExecutionPolicy::Adaptive,
             perfect_hash: None,
             output_names: Box::new(["k".to_string(), "count".to_string()]),
             output_types: Box::new([LogicalType::Integer, LogicalType::BigInt]),

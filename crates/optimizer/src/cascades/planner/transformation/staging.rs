@@ -80,6 +80,13 @@ pub(super) fn stage_transformed_expression(
             detached.push(child);
             Ok(LogicalPlan::synthetic(LogicalOperator::DummyScan))
         })?;
+        // The payload recipe owns only this operator shell. Capturing it
+        // before children are reattached avoids duplicating the entire
+        // already-staged subtree at every ancestor (quadratic on chains).
+        let semantic_template = semantic_plan::detach_template(duplicate_plan_preserving_indices(
+            &skeleton,
+            state.bind_context.shared().as_ref(),
+        ));
         let mut child_states = Vec::with_capacity(detached.len());
         let mut children = Vec::with_capacity(detached.len());
         for child in detached {
@@ -158,11 +165,6 @@ pub(super) fn stage_transformed_expression(
         let output_rows_hard_upper = logical_properties.maximum_cardinality;
         // Preserve binding semantics before Query IR interning replaces
         // operator expressions with scalar-arena references.
-        let semantic_template = semantic_plan::detach_template(duplicate_plan_preserving_indices(
-            &plan,
-            state.bind_context.shared().as_ref(),
-        ))
-        .map_children(|_| LogicalPlan::synthetic(LogicalOperator::DummyScan));
         let scalar_roots = intern_operator_scalars(
             &mut plan.operator,
             &output_columns,
@@ -318,6 +320,7 @@ pub(super) fn stage_transformed_expression(
             implementations,
             grant_dependency: planner_grant_dependency(&plan.operator),
             spillable: planner_operator_spillable(&plan.operator),
+            max_concurrent_tasks: state.max_concurrent_tasks,
             cost_facts: planner_cost_facts(&plan, state.scan_access_cost)?,
             output_columns: output_columns.clone().into_boxed_slice(),
             child_required: intern_child_requirements(

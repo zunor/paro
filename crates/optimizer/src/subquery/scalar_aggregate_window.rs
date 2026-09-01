@@ -43,33 +43,28 @@ pub fn optimize_plan_with_change(
     plan: LogicalPlan,
     bind_context: &BindContext,
 ) -> Result<(LogicalPlan, bool)> {
-    let mut changed = false;
-    let plan = optimize_node(plan, None, bind_context, &mut changed)?;
-    Ok((plan, changed))
-}
+    let mut contracts = std::collections::HashMap::new();
+    let mut pending = vec![(&plan, None)];
+    while let Some((candidate, contract)) = pending.pop() {
+        let child_contracts = child_output_contracts(
+            &candidate.operator,
+            contract.as_ref(),
+            RewriteOutputShape::StablePrefix,
+        );
+        contracts.insert(candidate.id, contract);
+        pending.extend(candidate.children().into_iter().zip(child_contracts).rev());
+    }
 
-fn optimize_node(
-    plan: LogicalPlan,
-    output_contract: Option<OutputContract>,
-    bind_context: &BindContext,
-    changed: &mut bool,
-) -> Result<LogicalPlan> {
-    let child_contracts = child_output_contracts(
-        &plan.operator,
-        output_contract.as_ref(),
-        RewriteOutputShape::StablePrefix,
-    );
-    let mut child_ordinal = 0usize;
-    let plan = plan.try_map_children(|child| {
-        let contract = child_contracts.get(child_ordinal).cloned().flatten();
-        child_ordinal += 1;
-        optimize_node(child, contract, bind_context, changed)
+    let mut changed = false;
+    let plan = plan.try_map_post_order(|plan| {
+        let output_contract = contracts.remove(&plan.id).flatten();
+        let Some(rewrite) = recognize(&plan, output_contract.as_ref()) else {
+            return Ok(plan);
+        };
+        changed = true;
+        apply_rewrite(plan, rewrite, bind_context)
     })?;
-    let Some(rewrite) = recognize(&plan, output_contract.as_ref()) else {
-        return Ok(plan);
-    };
-    *changed = true;
-    apply_rewrite(plan, rewrite, bind_context)
+    Ok((plan, changed))
 }
 
 struct Rewrite {

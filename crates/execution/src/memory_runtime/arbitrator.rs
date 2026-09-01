@@ -22,6 +22,7 @@ fn saturating_sub_atomic(counter: &AtomicUsize, bytes: usize) {
 struct QueryEntry {
     spec: QueryMemoryBudgetSpec,
     target: Weak<dyn QueryMemoryTarget>,
+    minimum_capacity_bytes: usize,
 }
 
 #[derive(Debug, Default)]
@@ -67,11 +68,43 @@ impl MemoryArbitrator {
         self.refresh_query_capacities();
     }
 
-    pub fn add_system_reserve_bytes(&self, bytes: usize) {
-        if bytes > 0 {
-            self.system_reserve_bytes.fetch_add(bytes, Ordering::AcqRel);
-            self.refresh_query_capacities();
+    /// Atomically reserve process memory without violating any admitted query
+    /// floor. Dynamic system work must participate in the same admission
+    /// boundary as query plans; a class-local limit alone is not sufficient.
+    pub fn try_add_system_reserve_bytes(&self, bytes: usize) -> Result<(), usize> {
+        if bytes == 0 {
+            return Ok(());
         }
+        let mut registry = self
+            .registry
+            .lock()
+            .expect("query memory registry lock poisoned");
+        registry
+            .queries
+            .retain(|_, entry| entry.target.upgrade().is_some());
+        let query_floor = registry.queries.values().fold(0usize, |total, entry| {
+            total.saturating_add(entry.minimum_capacity_bytes)
+        });
+        let available = self.available_for_queries().saturating_sub(query_floor);
+        if bytes > available {
+            return Err(available);
+        }
+        self.system_reserve_bytes.fetch_add(bytes, Ordering::AcqRel);
+        let live = registry
+            .queries
+            .values()
+            .filter_map(|entry| {
+                entry
+                    .target
+                    .upgrade()
+                    .map(|target| (entry.spec.clone(), entry.minimum_capacity_bytes, target))
+            })
+            .collect::<Vec<_>>();
+        let shares = compute_fair_shares(self.available_for_queries(), &live);
+        for (spec, _, target) in live {
+            target.set_capacity_bytes(shares.get(&spec.query_id).copied().unwrap_or(0));
+        }
+        Ok(())
     }
 
     pub fn release_system_reserve_bytes(&self, bytes: usize) {
@@ -127,7 +160,7 @@ impl MemoryArbitrator {
                 entry
                     .target
                     .upgrade()
-                    .map(|target| (entry.spec.clone(), target))
+                    .map(|target| (entry.spec.clone(), entry.minimum_capacity_bytes, target))
             })
             .collect();
         if live.is_empty() {
@@ -135,7 +168,7 @@ impl MemoryArbitrator {
         }
 
         let shares = compute_fair_shares(self.available_for_queries(), &live);
-        for (spec, target) in live {
+        for (spec, _, target) in live {
             let capacity = shares.get(&spec.query_id).copied().unwrap_or(0);
             target.set_capacity_bytes(capacity);
         }
@@ -152,9 +185,14 @@ impl MemoryArbitrator {
                 .registry
                 .lock()
                 .expect("query memory registry lock poisoned");
-            registry
-                .queries
-                .insert(query_id, QueryEntry { spec, target });
+            registry.queries.insert(
+                query_id,
+                QueryEntry {
+                    spec,
+                    target,
+                    minimum_capacity_bytes: 0,
+                },
+            );
         }
         self.refresh_query_capacities();
         let coordinator: Arc<dyn QueryMemoryCoordinator> = self;
@@ -201,9 +239,9 @@ impl MemoryArbitrator {
                     }
                     entry.target.upgrade().map(|target| {
                         let reclaimable = target.reclaimable_bytes();
-                        let unused = target
-                            .capacity_bytes()
-                            .saturating_sub(target.issued_bytes());
+                        let unused = target.capacity_bytes().saturating_sub(
+                            target.issued_bytes().max(entry.minimum_capacity_bytes),
+                        );
                         (
                             *query_id,
                             unused.saturating_add(reclaimable),
@@ -293,10 +331,13 @@ impl MemoryArbitrator {
         if !Arc::ptr_eq(&registered_requester, requester) {
             return 0;
         }
-        let Some(registered_peer) = registry
-            .queries
-            .get(&peer_query_id)
-            .and_then(|entry| entry.target.upgrade())
+        let Some((registered_peer, peer_minimum)) =
+            registry.queries.get(&peer_query_id).and_then(|entry| {
+                entry
+                    .target
+                    .upgrade()
+                    .map(|target| (target, entry.minimum_capacity_bytes))
+            })
         else {
             return 0;
         };
@@ -305,7 +346,10 @@ impl MemoryArbitrator {
         }
 
         let requester_headroom = max_capacity.saturating_sub(requester.capacity_bytes());
-        let transferable = target_bytes.min(requester_headroom);
+        let peer_excess = peer
+            .capacity_bytes()
+            .saturating_sub(peer.issued_bytes().max(peer_minimum));
+        let transferable = target_bytes.min(requester_headroom).min(peer_excess);
         let relinquished = peer.relinquish_unused_capacity(transferable);
         requester.grant_capacity(relinquished, max_capacity)
     }
@@ -343,6 +387,57 @@ impl QueryMemoryCoordinator for MemoryArbitrator {
         self.acquire_capacity_from_peers(requester_query_id, target_bytes)
     }
 
+    fn try_reserve_minimum_capacity(
+        &self,
+        query_id: u64,
+        minimum_bytes: usize,
+    ) -> MemoryResult<bool> {
+        let mut registry = self
+            .registry
+            .lock()
+            .expect("query memory registry lock poisoned");
+        registry
+            .queries
+            .retain(|_, entry| entry.target.upgrade().is_some());
+        let Some(entry) = registry.queries.get(&query_id) else {
+            return Ok(false);
+        };
+        if minimum_bytes > entry.spec.desired_bytes() {
+            return Ok(false);
+        }
+        let other_floors = registry
+            .queries
+            .iter()
+            .filter(|(id, _)| **id != query_id)
+            .fold(0usize, |total, (_, entry)| {
+                total.saturating_add(entry.minimum_capacity_bytes)
+            });
+        if other_floors.saturating_add(minimum_bytes) > self.available_for_queries() {
+            return Ok(false);
+        }
+        registry
+            .queries
+            .get_mut(&query_id)
+            .expect("validated query registration disappeared")
+            .minimum_capacity_bytes = minimum_bytes;
+        let live = registry
+            .queries
+            .values()
+            .filter_map(|entry| {
+                entry
+                    .target
+                    .upgrade()
+                    .map(|target| (entry.spec.clone(), entry.minimum_capacity_bytes, target))
+            })
+            .collect::<Vec<_>>();
+
+        let shares = compute_fair_shares(self.available_for_queries(), &live);
+        for (spec, _, target) in live {
+            target.set_capacity_bytes(shares.get(&spec.query_id).copied().unwrap_or(0));
+        }
+        Ok(true)
+    }
+
     fn available_for_queries(&self) -> usize {
         MemoryArbitrator::available_for_queries(self)
     }
@@ -354,38 +449,47 @@ impl QueryMemoryCoordinator for MemoryArbitrator {
 
 fn compute_fair_shares(
     available_bytes: usize,
-    live: &[(QueryMemoryBudgetSpec, Arc<dyn QueryMemoryTarget>)],
+    live: &[(QueryMemoryBudgetSpec, usize, Arc<dyn QueryMemoryTarget>)],
 ) -> HashMap<u64, usize> {
     let mut groups: HashMap<String, Vec<&QueryMemoryBudgetSpec>> = HashMap::new();
-    let mut desired_total = 0usize;
-    for (spec, _) in live {
-        desired_total = desired_total.saturating_add(spec.desired_bytes());
+    let mut floors = HashMap::new();
+    let mut floor_total = 0usize;
+    let mut residual_total = 0usize;
+    for (spec, floor, _) in live {
+        let floor = (*floor).min(spec.desired_bytes());
+        floors.insert(spec.query_id, floor);
+        floor_total = floor_total.saturating_add(floor);
+        residual_total = residual_total.saturating_add(spec.desired_bytes().saturating_sub(floor));
         groups
             .entry(spec.query_group.clone())
             .or_default()
             .push(spec);
     }
 
-    if desired_total <= available_bytes {
+    let residual_available = available_bytes.saturating_sub(floor_total);
+    if residual_total <= residual_available {
         return live
             .iter()
-            .map(|(spec, _)| (spec.query_id, spec.desired_bytes()))
+            .map(|(spec, _, _)| (spec.query_id, spec.desired_bytes()))
             .collect();
     }
 
     let group_inputs: Vec<_> = groups
         .iter()
         .map(|(group, specs)| {
-            let cap = specs
-                .iter()
-                .fold(0usize, |sum, spec| sum.saturating_add(spec.desired_bytes()));
+            let cap = specs.iter().fold(0usize, |sum, spec| {
+                sum.saturating_add(
+                    spec.desired_bytes()
+                        .saturating_sub(floors.get(&spec.query_id).copied().unwrap_or(0)),
+                )
+            });
             let weight = specs.iter().fold(0usize, |sum, spec| {
                 sum.saturating_add(spec.priority_weight.max(1))
             });
             (group.clone(), weight.max(1), cap)
         })
         .collect();
-    let group_shares = distribute_capped(available_bytes, &group_inputs);
+    let group_shares = distribute_capped(residual_available, &group_inputs);
 
     let mut shares = HashMap::new();
     for (group, specs) in groups {
@@ -396,11 +500,24 @@ fn compute_fair_shares(
                 (
                     spec.query_id,
                     spec.priority_weight.max(1),
-                    spec.desired_bytes(),
+                    spec.desired_bytes()
+                        .saturating_sub(floors.get(&spec.query_id).copied().unwrap_or(0)),
                 )
             })
             .collect();
-        shares.extend(distribute_capped(group_share, &query_inputs));
+        for (query_id, residual) in distribute_capped(group_share, &query_inputs) {
+            shares.insert(
+                query_id,
+                floors
+                    .get(&query_id)
+                    .copied()
+                    .unwrap_or(0)
+                    .saturating_add(residual),
+            );
+        }
+    }
+    for (query_id, floor) in floors {
+        shares.entry(query_id).or_insert(floor);
     }
     shares
 }

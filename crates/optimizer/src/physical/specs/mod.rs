@@ -8,14 +8,15 @@
 //! execution compiles them into physical expression programs before running a
 //! pipeline.
 
-/// Optimizer-owned execution contract for algorithms that can spill. Runtime
-/// pressure may exercise `Allowed`, but may never upgrade `Forbidden` or
-/// reinterpret a mutable session setting as `Forced`.
+/// Optimizer-owned representation contract for blocking implementations.
+/// `Adaptive` starts in memory and may make the one-way transition to external
+/// storage under query-pool pressure. The other variants are immutable plan
+/// choices; runtime settings cannot reinterpret them after admission.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SpillExecutionPolicy {
-    Forbidden,
-    Allowed,
-    Forced,
+    InMemory,
+    Adaptive,
+    ForcedExternal,
 }
 
 pub mod aggregate;

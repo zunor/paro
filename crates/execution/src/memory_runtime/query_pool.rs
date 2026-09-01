@@ -65,6 +65,7 @@ pub struct QueryMemoryPool {
     reclaimers: Mutex<Vec<Arc<dyn Reclaimer>>>,
     admission: Arc<PipelineAdmissionController>,
     registration: Mutex<Option<QueryMemoryRegistration>>,
+    external_worker_lease: Mutex<Option<paro_external::runtime::host::ExternalWorkerLease>>,
 }
 
 impl QueryMemoryPool {
@@ -92,6 +93,7 @@ impl QueryMemoryPool {
             reclaimers: Mutex::new(Vec::new()),
             admission: Arc::new(PipelineAdmissionController::for_current_parallelism()),
             registration: Mutex::new(None),
+            external_worker_lease: Mutex::new(None),
         }
     }
 
@@ -198,7 +200,32 @@ impl QueryMemoryPool {
             .map(QueryMemoryRegistration::query_id)
     }
 
+    /// Reserve the execution contract's non-negotiable capacity floor for
+    /// this pool's registration lifetime.
+    pub fn try_reserve_minimum_capacity(&self, minimum_bytes: usize) -> MemoryResult<bool> {
+        let Some(registration) = self.registration() else {
+            return Ok(minimum_bytes <= self.capacity_bytes());
+        };
+        registration.try_reserve_minimum_capacity(minimum_bytes)
+    }
+
+    pub fn attach_external_worker_lease(
+        &self,
+        lease: paro_external::runtime::host::ExternalWorkerLease,
+    ) {
+        *self
+            .external_worker_lease
+            .lock()
+            .expect("external worker lease lock poisoned") = Some(lease);
+    }
+
     pub fn detach_registration(&self) {
+        // Admission leases have the same lifetime as the query registration,
+        // not the lifetime of incidental Arc holders retained by operators.
+        self.external_worker_lease
+            .lock()
+            .expect("external worker lease lock poisoned")
+            .take();
         if let Some(registration) = self
             .registration
             .lock()

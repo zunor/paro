@@ -135,11 +135,17 @@ impl WinnerVerifier {
                         };
                         child_costs.push(child_winner.cost);
                     }
-                    let mut recomputed_cost = super::engine::compose_candidate_cost(
-                        winner.local_cost,
-                        &child_costs,
-                        winner.cost_composition,
-                    )?;
+                    let mut recomputed_cost = super::engine::constrain_composed_cost_to_grant(
+                        super::engine::compose_candidate_cost(
+                            winner.local_cost,
+                            &child_costs,
+                            winner.cost_composition,
+                        )?,
+                        winner.enforcer_cost_input,
+                    )?
+                    .ok_or_else(|| {
+                        paro_error::internal("winner composition exceeds its resource grant")
+                    })?;
                     let enforcer_cost = super::engine::enforcer_cost(
                         &winner.enforcers,
                         winner.enforcer_cost_input,
@@ -148,7 +154,13 @@ impl WinnerVerifier {
                     .ok_or_else(|| {
                         paro_error::internal("winner enforcer exceeds its resource grant")
                     })?;
-                    recomputed_cost = recomputed_cost.sequential(enforcer_cost)?;
+                    recomputed_cost = super::engine::constrain_composed_cost_to_grant(
+                        recomputed_cost.sequential(enforcer_cost)?,
+                        winner.enforcer_cost_input,
+                    )?
+                    .ok_or_else(|| {
+                        paro_error::internal("winner enforcers exceed its resource grant")
+                    })?;
                     if recomputed_cost != winner.cost {
                         return Err(paro_error::internal(
                             "winner cumulative cost failed independent composition replay",

@@ -432,7 +432,7 @@ fn forced_external_hash_join_keeps_spill_replay_pipeline() {
     if let SinkSpec::HashJoinBuild(spec) = &graph.pipelines[0].sink {
         assert_eq!(
             spec.spill_policy,
-            crate::physical::specs::SpillExecutionPolicy::Forced
+            crate::physical::specs::SpillExecutionPolicy::ForcedExternal
         );
     }
     assert!(matches!(

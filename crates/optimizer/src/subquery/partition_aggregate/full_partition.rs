@@ -86,10 +86,7 @@ fn validate_full_partition_binding_contract(
             return false;
         }
         let expected_group_output = ColumnBinding::new(scalar.aggregate.group_index, ordinal);
-        let Some(projection_expression) = ordinal
-            .checked_add(1)
-            .and_then(|index| scalar.projection_expression(index))
-        else {
+        let Some(projection_expression) = scalar.group_projection_expression(ordinal) else {
             return false;
         };
         if !matches!(projection_expression, Expression::ColumnRef(column)
@@ -102,7 +99,7 @@ fn validate_full_partition_binding_contract(
         let Some(condition) = join.conditions.get(ordinal) else {
             return false;
         };
-        let expected_rhs = ColumnBinding::new(scalar.projection_table_index(), ordinal + 1);
+        let expected_rhs = scalar.group_projection_binding(ordinal);
         let matches = |outer: &Expression, right: &Expression| {
             same_column_expression(outer, &join.duplicate_eliminated_columns[ordinal])
                 && matches!(right, Expression::ColumnRef(column)
@@ -273,8 +270,9 @@ pub(super) fn apply_full_partition_join(
     ));
 
     // GROUP BY proves at most one right row per complete key. LEFT therefore
-    // has the same scalar cardinality and empty-input NULL extension as
-    // SINGLE, while admitting the ordinary spillable hash-join contract.
+    // has the same scalar cardinality as SINGLE. The scalar projection keeps
+    // its hidden presence carrier, so an unmatched key remains distinguishable
+    // from a matched aggregate whose SQL value is NULL.
     outer_join.join_type = JoinType::Left;
     outer_join.duplicate_eliminated_columns.clear();
     outer_join.delim_flipped = false;

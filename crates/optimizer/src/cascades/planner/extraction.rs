@@ -124,11 +124,17 @@ pub(super) fn extract_planner_tree(
                         .cost;
                     child_costs.push(child_cost);
                 }
-                let base_cost = crate::cascades::engine::compose_candidate_cost(
-                    winner.local_cost,
-                    &child_costs,
-                    winner.cost_composition,
-                )?;
+                let base_cost = crate::cascades::engine::constrain_composed_cost_to_grant(
+                    crate::cascades::engine::compose_candidate_cost(
+                        winner.local_cost,
+                        &child_costs,
+                        winner.cost_composition,
+                    )?,
+                    winner.enforcer_cost_input,
+                )?
+                .ok_or_else(|| {
+                    paro_error::internal("winner extraction exceeds its resource grant")
+                })?;
                 let base_contract = WinnerPhysicalContract {
                     required: RequiredProperties {
                         result_guarantee: physical.provided.result_guarantee,

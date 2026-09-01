@@ -147,6 +147,7 @@ impl BindingMap {
 
 struct Rewrite {
     scalar_binding: ColumnBinding,
+    presence_binding: Option<ColumnBinding>,
     scalar_source_binding: ColumnBinding,
     scalar_expression: Expression,
     aggregate: AggregateExpression,
@@ -155,6 +156,7 @@ struct Rewrite {
 
 struct GroupedJoinRewrite {
     scalar_binding: ColumnBinding,
+    presence_binding: Option<ColumnBinding>,
     scalar_source_binding: ColumnBinding,
     scalar_expression: Expression,
     aggregate: AggregateExpression,
@@ -172,6 +174,7 @@ struct ScalarBranch<'a> {
     aggregate: &'a paro_planner::operator::Aggregate,
     aggregate_expression: &'a AggregateExpression,
     scalar_binding: ColumnBinding,
+    presence_binding: Option<ColumnBinding>,
     scalar_expression: &'a Expression,
 }
 
@@ -265,6 +268,7 @@ fn recognize_filter(
     let aggregate = rebase_aggregate(shape.scalar.aggregate_expression, &bindings)?;
     Some(Rewrite {
         scalar_binding: shape.scalar.scalar_binding,
+        presence_binding: shape.scalar.presence_binding,
         scalar_source_binding: ColumnBinding::new(shape.scalar.aggregate.aggregate_index, 0),
         scalar_expression: shape.scalar.scalar_expression.clone(),
         aggregate,
@@ -287,13 +291,20 @@ fn recognize_grouped_join_filter(
 ) -> Option<GroupedJoinRewrite> {
     let shape = recognize_delim_shape(plan, output_contract)?;
     let output_contract = output_contract?;
-    if !filter_rejects_null_scalar(&shape.filter.expressions[0], shape.scalar.scalar_binding) {
+    if !filter_rejects_null_scalar(
+        &shape.filter.expressions[0],
+        shape.scalar.scalar_binding,
+        shape.scalar.presence_binding,
+    ) {
         return None;
     }
     // A strict predicate rejects the NULL produced by an empty correlated
     // aggregate. Aggregates with a non-NULL empty-input value (COUNT) cannot
     // replace the original outer-preserving scalar join with INNER.
-    if shape.scalar.aggregate_expression.function.empty_input != AggregateEmptyInput::Null {
+    if !matches!(
+        shape.scalar.aggregate_expression.function.empty_input,
+        AggregateEmptyInput::Null
+    ) {
         return None;
     }
     let direct_source_side = direct_delim_join_source(
@@ -357,6 +368,7 @@ fn recognize_grouped_join_filter(
     }
     Some(GroupedJoinRewrite {
         scalar_binding: shape.scalar.scalar_binding,
+        presence_binding: shape.scalar.presence_binding,
         scalar_source_binding: ColumnBinding::new(shape.scalar.aggregate.aggregate_index, 0),
         scalar_expression: shape.scalar.scalar_expression.clone(),
         aggregate: shape.scalar.aggregate_expression.clone(),
@@ -370,7 +382,38 @@ fn recognize_grouped_join_filter(
     })
 }
 
-fn filter_rejects_null_scalar(expression: &Expression, scalar: ColumnBinding) -> bool {
+fn filter_rejects_null_scalar(
+    expression: &Expression,
+    scalar: ColumnBinding,
+    presence: Option<ColumnBinding>,
+) -> bool {
+    fn is_scalar_value(
+        expression: &Expression,
+        scalar: ColumnBinding,
+        presence: Option<ColumnBinding>,
+    ) -> bool {
+        match expression {
+            Expression::ColumnRef(column) => column.depth == 0 && column.binding == scalar,
+            Expression::Cast(cast) => is_scalar_value(&cast.child, scalar, presence),
+            Expression::Case(case) => {
+                let Some(presence) = presence else {
+                    return false;
+                };
+                let check_is_missing = matches!(case.check.as_ref(), Expression::Operator(operator)
+                    if operator.operator_type == paro_planner::expression::OperatorType::IsNull
+                        && matches!(operator.children.as_slice(), [Expression::ColumnRef(column)]
+                            if column.depth == 0
+                                && column.binding == presence
+                                && column.return_type == paro_common::types::LogicalType::Boolean));
+                check_is_missing
+                    && matches!(case.result_if_true.as_ref(), Expression::Constant(constant)
+                        if matches!(&constant.value, paro_common::runtime_value::Value::Null(_)))
+                    && is_scalar_value(&case.result_if_false, scalar, Some(presence))
+            }
+            _ => false,
+        }
+    }
+
     let Expression::Comparison(comparison) = expression else {
         return false;
     };
@@ -385,10 +428,8 @@ fn filter_rejects_null_scalar(expression: &Expression, scalar: ColumnBinding) ->
     ) {
         return false;
     }
-    matches!(comparison.left.as_ref(), Expression::ColumnRef(column)
-        if column.depth == 0 && column.binding == scalar)
-        ^ matches!(comparison.right.as_ref(), Expression::ColumnRef(column)
-            if column.depth == 0 && column.binding == scalar)
+    is_scalar_value(&comparison.left, scalar, presence)
+        ^ is_scalar_value(&comparison.right, scalar, presence)
 }
 
 fn direct_delim_join_source(
@@ -477,7 +518,10 @@ fn canonical_scalar_delim_join(join: &ComparisonJoin) -> bool {
         && join
             .left_projection_map
             .is_identity(join.left.types().len())
-        && join.right_projection_map.as_columns() == Some(&[0])
+        && join
+            .right_projection_map
+            .as_columns()
+            .is_some_and(|columns| columns == [0] || columns == [0, 1])
         && join.conditions.len() == join.duplicate_eliminated_columns.len()
         && join.conditions.iter().all(|condition| {
             condition.comparison == JoinComparisonType::NotDistinctFrom
@@ -493,10 +537,16 @@ fn peel_scalar_branch(plan: &LogicalPlan) -> Option<ScalarBranch<'_>> {
     let LogicalOperator::Aggregate(aggregate) = &projection.child.operator else {
         return None;
     };
-    let expected_projection_width = aggregate.groups.len().checked_add(1)?;
-    if projection.expressions.len() != expected_projection_width
-        || projection.returned_types.len() != expected_projection_width
-        || projection.visible_names.len() != expected_projection_width
+    let semantic_width = aggregate.groups.len().checked_add(1)?;
+    let has_presence = projection.expressions.len() == semantic_width.checked_add(1)?
+        && projection.expressions.get(1).is_some_and(|expression| {
+            matches!(expression, Expression::Constant(constant)
+                if matches!(&constant.value, paro_common::runtime_value::Value::Boolean(true)))
+        });
+    let physical_width = semantic_width.checked_add(usize::from(has_presence))?;
+    if projection.expressions.len() != physical_width
+        || projection.returned_types.len() != physical_width
+        || projection.visible_names.len() != semantic_width
     {
         return None;
     }
@@ -529,7 +579,7 @@ fn peel_scalar_branch(plan: &LogicalPlan) -> Option<ScalarBranch<'_>> {
     if !projection
         .expressions
         .iter()
-        .skip(1)
+        .skip(1 + usize::from(has_presence))
         .enumerate()
         .all(|(ordinal, expression)| {
             matches!(expression, Expression::ColumnRef(group_output)
@@ -548,6 +598,7 @@ fn peel_scalar_branch(plan: &LogicalPlan) -> Option<ScalarBranch<'_>> {
         aggregate,
         aggregate_expression,
         scalar_binding: ColumnBinding::new(projection.table_index, 0),
+        presence_binding: has_presence.then(|| ColumnBinding::new(projection.table_index, 1)),
         scalar_expression: &projection.expressions[0],
     })
 }
@@ -576,10 +627,7 @@ fn validate_delim_binding_contract(
             return false;
         }
         let expected_group_output = ColumnBinding::new(scalar.aggregate.group_index, ordinal);
-        let projection_expression = match ordinal.checked_add(1) {
-            Some(index) => scalar.projection_expression(index),
-            None => return false,
-        };
+        let projection_expression = scalar.group_projection_expression(ordinal);
         if !matches!(projection_expression, Some(Expression::ColumnRef(column))
             if column.depth == 0
                 && column.binding == expected_group_output
@@ -590,7 +638,7 @@ fn validate_delim_binding_contract(
         let Some(condition) = join.conditions.get(ordinal) else {
             return false;
         };
-        let expected_rhs = ColumnBinding::new(scalar.projection_table_index(), ordinal + 1);
+        let expected_rhs = scalar.group_projection_binding(ordinal);
         let matches = |outer: &Expression, right: &Expression| {
             same_column_expression(outer, &join.duplicate_eliminated_columns[ordinal])
                 && matches!(right, Expression::ColumnRef(column)
@@ -614,13 +662,27 @@ impl ScalarBranch<'_> {
     }
 
     fn projection_group_count(&self) -> usize {
-        // The scalar value is the first projection output; all remaining
-        // outputs carry delimiter-group keys in ordinal order.
-        self.projection.expressions.len().saturating_sub(1)
+        self.projection
+            .expressions
+            .len()
+            .saturating_sub(self.group_projection_offset())
     }
 
-    fn projection_expression(&self, index: usize) -> Option<&Expression> {
-        self.projection.expressions.get(index)
+    fn group_projection_offset(&self) -> usize {
+        1 + usize::from(self.presence_binding.is_some())
+    }
+
+    fn group_projection_binding(&self, ordinal: usize) -> ColumnBinding {
+        ColumnBinding::new(
+            self.projection_table_index(),
+            self.group_projection_offset().saturating_add(ordinal),
+        )
+    }
+
+    fn group_projection_expression(&self, ordinal: usize) -> Option<&Expression> {
+        self.projection
+            .expressions
+            .get(self.group_projection_offset().checked_add(ordinal)?)
     }
 }
 
@@ -1109,7 +1171,13 @@ fn apply_rewrite(
         .into_iter()
         .map(|expression| {
             expression.replace_column_ref(&|column| {
-                (column.binding == rewrite.scalar_binding).then(|| scalar.clone())
+                if column.binding == rewrite.scalar_binding {
+                    Some(scalar.clone())
+                } else if Some(column.binding) == rewrite.presence_binding {
+                    Some(scalar_presence_true())
+                } else {
+                    None
+                }
             })
         })
         .collect();
@@ -1261,8 +1329,13 @@ fn apply_grouped_join_rewrite(
         .into_iter()
         .map(|expression| {
             let expression = expression.replace_column_ref(&|column| {
-                (column.depth == 0 && column.binding == rewrite.scalar_binding)
-                    .then(|| scalar.clone())
+                if column.depth == 0 && column.binding == rewrite.scalar_binding {
+                    Some(scalar.clone())
+                } else if column.depth == 0 && Some(column.binding) == rewrite.presence_binding {
+                    Some(scalar_presence_true())
+                } else {
+                    None
+                }
             });
             expression.replace_column_ref(&|column| {
                 (column.depth == 0)
@@ -1313,6 +1386,13 @@ fn apply_grouped_join_rewrite(
             filter,
             output_expressions,
         )),
+    ))
+}
+
+fn scalar_presence_true() -> Expression {
+    Expression::Constant(paro_planner::expression::ConstantExpression::new(
+        paro_common::runtime_value::Value::Boolean(true),
+        paro_common::types::LogicalType::Boolean,
     ))
 }
 

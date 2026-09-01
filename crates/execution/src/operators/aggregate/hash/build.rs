@@ -169,7 +169,7 @@ impl HashAggregateBuildSinkExec {
             ctx.query.memory.register_reclaimer_once_by_name(Arc::new(
                 AggregateLocalBuildCompactionReclaimer::new(&handle, local_id, Arc::clone(&tables)),
             ));
-            let payload_spill_name = if self.spec.spill_policy != SpillExecutionPolicy::Forbidden
+            let payload_spill_name = if self.spec.spill_policy != SpillExecutionPolicy::InMemory
                 && hash_aggregate_payload_spill_supported(&self.spec)
                 && query_has_temporary_directory(ctx.query)
             {
@@ -186,7 +186,7 @@ impl HashAggregateBuildSinkExec {
             } else {
                 None
             };
-            let state_spill_name = if self.spec.spill_policy != SpillExecutionPolicy::Forbidden
+            let state_spill_name = if self.spec.spill_policy != SpillExecutionPolicy::InMemory
                 && hash_aggregate_state_spill_supported(&self.spec, &aggregate_objects)
                 && query_has_temporary_directory(ctx.query)
             {
@@ -500,7 +500,7 @@ impl HashAggregateBuildSinkExec {
                     "aggregate handle does not contain hash aggregate state",
                 ));
             };
-            ensure_modifier_target_tables(ctx.query, &self.spec, global)
+            ensure_grouping_domains(ctx.query, &self.spec, global)
         })?;
         if let Some(group) = prepare_parallel_radix_merge(global.handle.clone(), &self.spec)? {
             return Ok(FinishWork::Parallel(group));
@@ -562,7 +562,7 @@ impl HashAggregateBuildSinkExec {
             if global.spilled_outputs.is_some() {
                 return Ok(());
             }
-            ensure_modifier_target_tables(ctx.query, &self.spec, global)?;
+            ensure_grouping_domains(ctx.query, &self.spec, global)?;
             finalize_distinct_into_tables(
                 &self.spec,
                 &aggregate_objects,
@@ -603,20 +603,82 @@ impl HashAggregateBuildSinkExec {
     }
 }
 
-fn ensure_modifier_target_tables(
+/// Establish every logical grouping domain before modifier finalization.
+///
+/// Domain existence is independent of whether it received a payload. A
+/// non-empty grouping set produces no row over empty input, while the empty
+/// grouping set owns one initialized aggregate state and therefore emits its
+/// identity row. Both in-memory and spill paths converge here once pending
+/// replay has been resolved.
+fn ensure_grouping_domains(
     query: &crate::runtime::context::QueryRuntimeContext,
     spec: &AggregateSpec,
     state: &mut HashAggregateRuntimeState,
 ) -> Result<()> {
-    if !state.tables.is_empty() || (!has_aggregate_distinct(spec) && !has_aggregate_ordered(spec)) {
+    if state.spilled_outputs.is_some()
+        || !state.spilled_payloads.is_empty()
+        || !state.spilled_states.is_empty()
+    {
         return Ok(());
     }
-    state.tables = create_hash_aggregate_tables(
-        spec,
-        query.allocator(MemoryTag::HashTable),
-        query_hash_table_memory(query),
-        query.session.number_of_threads(),
-    )?;
+    if state.tables.is_empty() {
+        state.tables = create_hash_aggregate_tables(
+            spec,
+            query.allocator(MemoryTag::HashTable),
+            query_hash_table_memory(query),
+            query.session.number_of_threads(),
+        )?;
+    }
+    let grouping_sets = normalized_grouping_sets(spec)?;
+    if grouping_sets.len() != state.tables.len() {
+        return Err(paro_error::internal(format!(
+            "hash aggregate grouping domain count mismatch: grouping_sets={} tables={}",
+            grouping_sets.len(),
+            state.tables.len()
+        )));
+    }
+    initialize_empty_grouping_domain_rows(query, spec, &grouping_sets, &mut state.tables)
+}
+
+fn initialize_empty_grouping_domain_rows<G: AsRef<[usize]>>(
+    query: &crate::runtime::context::QueryRuntimeContext,
+    spec: &AggregateSpec,
+    grouping_sets: &[G],
+    tables: &mut [AggregateHashTable],
+) -> Result<()> {
+    if grouping_sets.len() != tables.len() {
+        return Err(paro_error::internal(format!(
+            "empty grouping domain count mismatch: grouping_sets={} tables={}",
+            grouping_sets.len(),
+            tables.len()
+        )));
+    }
+    let empty_domains = grouping_sets
+        .iter()
+        .enumerate()
+        .filter_map(|(index, grouping_set)| grouping_set.as_ref().is_empty().then_some(index))
+        .collect::<Vec<_>>();
+    if empty_domains.is_empty() {
+        return Ok(());
+    }
+    let allocator = query.allocator(MemoryTag::HashTable);
+    let vectors = group_types(spec)?
+        .into_iter()
+        .map(|logical_type| {
+            Vector::try_constant_null(logical_type, 1, allocator.clone()).map(Arc::new)
+        })
+        .collect::<Result<Vec<_>>>()?;
+    let mut groups = Chunk::from_arc_vectors(vectors, allocator.clone());
+    groups.try_set_cardinality(1)?;
+    let hashes = hash_group_columns(&groups)?;
+    let mut addresses = Vector::try_new(LogicalType::BigInt, 1, allocator.clone())?;
+    let mut new_groups = SelectionVector::try_with_capacity(1, allocator)?;
+    for domain in empty_domains {
+        let table = &mut tables[domain];
+        if table.count() == 0 {
+            table.find_or_create_groups(&groups, &hashes, &mut addresses, &mut new_groups)?;
+        }
+    }
     Ok(())
 }
 
@@ -672,14 +734,14 @@ fn hash_aggregate_state_spill_encoding(
 }
 
 fn hash_aggregate_external_payload_spill_requested(spec: &AggregateSpec) -> bool {
-    spec.spill_policy == SpillExecutionPolicy::Forced
+    spec.spill_policy == SpillExecutionPolicy::ForcedExternal
 }
 
 fn hash_aggregate_external_payload_spill_enabled(
     query: &crate::runtime::context::QueryRuntimeContext,
     spec: &AggregateSpec,
 ) -> bool {
-    if spec.spill_policy == SpillExecutionPolicy::Forbidden
+    if spec.spill_policy == SpillExecutionPolicy::InMemory
         || !hash_aggregate_payload_spill_supported(spec)
         || !query_has_temporary_directory(query)
     {

@@ -31,8 +31,7 @@ impl<'a> JoinPredicateNormalizer<'a> {
     }
 
     pub fn optimize_plan(&self, plan: LogicalPlan) -> Result<LogicalPlan> {
-        let plan = plan.try_map_children(|child| self.optimize_plan(child))?;
-        Ok(self.normalize_join(self.normalize_cross_product(plan)))
+        plan.try_map_post_order(|plan| Ok(self.normalize_join(self.normalize_cross_product(plan))))
     }
 
     fn normalize_cross_product(&self, plan: LogicalPlan) -> LogicalPlan {

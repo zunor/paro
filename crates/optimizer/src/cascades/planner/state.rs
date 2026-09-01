@@ -68,6 +68,7 @@ pub(super) struct PlannerTransformState {
     pub(super) verify_enabled: bool,
     pub(super) rowset_scan_pushdown: bool,
     pub(super) scan_access_cost: paro_storage::rowset::scan_cost::ScanAccessCostModel,
+    pub(super) max_concurrent_tasks: u16,
 }
 
 pub(super) struct PlannerTransformSavepoint {
@@ -213,6 +214,7 @@ pub(super) struct PlannerOperatorMetadata {
     pub(super) implementations: PlannerImplementationSet,
     pub(super) grant_dependency: GrantDependencyDescriptor,
     pub(super) spillable: bool,
+    pub(super) max_concurrent_tasks: u16,
     pub(super) cost_facts: PlannerCostFacts,
     pub(super) output_columns: Box<[ColumnId]>,
     pub(super) child_required: Box<[PropertySetId]>,

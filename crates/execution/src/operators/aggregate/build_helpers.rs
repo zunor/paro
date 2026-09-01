@@ -571,7 +571,7 @@ pub(crate) fn create_perfect_aggregate_table(
         perfect.group_cardinalities.to_vec(),
         allocator,
         memory,
-        perfect.resource.bytes_per_table_upper,
+        perfect.resource.table_bytes_upper,
     )
 }
 

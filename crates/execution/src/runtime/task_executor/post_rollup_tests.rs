@@ -103,14 +103,18 @@ fn decimal_sum_rollup_spec(
         aggregate_orders: Box::new([Box::new([])]),
         post_reduction: Some(post_reduction),
         having_filter: Box::new([]),
-        spill_policy: crate::physical::specs::SpillExecutionPolicy::Forbidden,
+        spill_policy: crate::physical::specs::SpillExecutionPolicy::InMemory,
         perfect_hash: Some(PerfectHashAggregatePlan {
             group_minima: Box::new([1]),
             group_cardinalities: Box::new([4]),
             resource: paro_optimizer::physical::PerfectHashResourceContract {
                 slots: 4,
-                bytes_per_table_upper: usize::MAX,
-                max_local_tables,
+                table_bytes_upper: usize::MAX,
+                memory: paro_optimizer::physical::ExecutionMemoryContract {
+                    fixed_non_revocable_bytes: u64::MAX,
+                    max_concurrent_tasks: u16::try_from(max_local_tables).unwrap(),
+                    ..Default::default()
+                },
             },
         }),
         output_names: Box::new(["key".to_string(), "sum".to_string()]),
