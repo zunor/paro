@@ -8,6 +8,7 @@
 
 pub mod binder;
 pub mod expression;
+mod logical_properties;
 pub mod operator;
 pub mod plan;
 pub mod planner;

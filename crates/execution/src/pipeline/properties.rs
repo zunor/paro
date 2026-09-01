@@ -38,14 +38,18 @@ impl PipelinePropertyAccumulator {
             | TransformSpec::NestedLoopJoinProbe(_)
             | TransformSpec::SortRangeJoinProbe(_)
             | TransformSpec::CrossProductProbe(_)
-            | TransformSpec::ExternalProject(_)
             | TransformSpec::GraphExpand(_)
             | TransformSpec::RowFetch(_)
             | TransformSpec::GraphProject(_) => {}
-            TransformSpec::Limit(_)
+            TransformSpec::ExternalProject(_)
+            | TransformSpec::Limit(_)
             | TransformSpec::StreamingTopN(_)
             | TransformSpec::StreamingWindow(_)
             | TransformSpec::GraphShortestPath(_) => {
+                // One admitted external-worker slot authorizes one active
+                // bridge invocation.  Until the external host exposes a
+                // multiplexed async queue, the pipeline scheduler is the
+                // authoritative concurrency boundary.
                 self.capabilities.parallelism =
                     self.capabilities.parallelism.merge(Parallelism::single());
                 if matches!(transform, TransformSpec::StreamingTopN(_)) {
@@ -57,6 +61,14 @@ impl PipelinePropertyAccumulator {
 
     pub fn close_with_sink(mut self, sink: &SinkSpec) -> PipelineProperties {
         match sink {
+            SinkSpec::CrossProductBuild(spec) => {
+                self.memory.class = self.memory.class.max(MemoryClass::Blocking);
+                if spec.spill_policy != crate::physical::specs::SpillExecutionPolicy::InMemory {
+                    self.memory.revocable = true;
+                    self.memory.spillable = true;
+                    self.capabilities.supports_spill = true;
+                }
+            }
             SinkSpec::PerfectHashAggregate(spec) => {
                 if let Some(plan) = spec.spec.perfect_hash.as_ref() {
                     self.capabilities.parallelism =

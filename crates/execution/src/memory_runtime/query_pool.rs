@@ -107,7 +107,13 @@ impl QueryMemoryPool {
 
     pub fn set_capacity_bytes(&self, capacity_bytes: usize) {
         let _guard = self.capacity_write_guard();
-        self.capacity_bytes.store(capacity_bytes, Ordering::Release);
+        // Capacity is an admission ceiling, not a revocation mechanism.
+        // Published grants remain owned until a reclaimer releases them, so a
+        // coordinator must never manufacture headroom by assigning a ceiling
+        // below the bytes already issued by this pool.
+        let issued = self.issued_bytes.load(Ordering::Acquire);
+        self.capacity_bytes
+            .store(capacity_bytes.max(issued), Ordering::Release);
     }
 
     fn relinquish_unused_capacity(&self, target_bytes: usize) -> usize {

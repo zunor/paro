@@ -92,6 +92,11 @@ pub(super) fn planner_implementation_set(
                 crate::physical::extraction::misc::supports_partition_aggregate_window(window),
             ..PlannerImplementationSet::STRUCTURAL
         },
+        LogicalOperator::Join(Join::Cross(_)) => PlannerImplementationSet {
+            baseline: PhysicalImplementationFlavor::CrossProductInMemory,
+            external_cross_product: true,
+            ..PlannerImplementationSet::STRUCTURAL
+        },
         _ => PlannerImplementationSet::STRUCTURAL,
     }
 }
@@ -209,6 +214,7 @@ pub(super) fn selected_implementation_flavor(
         PLANNER_SINGLETON_AGGREGATE_PROJECTION => {
             Ok(PhysicalImplementationFlavor::SingletonAggregateProjection)
         }
+        PLANNER_EXTERNAL_CROSS_PRODUCT => Ok(PhysicalImplementationFlavor::CrossProductExternal),
         _ => Err(paro_error::internal(
             "winner references an implementation unavailable for its logical expression",
         )),
@@ -429,6 +435,47 @@ pub(super) fn implementation_cost(
                 .unwrap_or(CompactRange::ZERO);
             work.add(OP_NESTED_LOOP_PAIR, multiply_work(left, right)?)?;
             work.add(OP_RANGE_JOIN_ROW, facts.output_rows)?;
+            peak_memory_upper = if flavor == PhysicalImplementationFlavor::CrossProductExternal {
+                0
+            } else {
+                facts
+                    .child_rows_hard_upper
+                    .get(1)
+                    .copied()
+                    .flatten()
+                    .unwrap_or(u64::MAX)
+                    .saturating_mul(
+                        facts
+                            .child_row_widths
+                            .get(1)
+                            .copied()
+                            .unwrap_or(facts.output_row_width)
+                            .max(1),
+                    )
+            };
+        }
+        PhysicalImplementationFlavor::CrossProductInMemory
+        | PhysicalImplementationFlavor::CrossProductExternal => {
+            let right = facts
+                .child_rows
+                .get(1)
+                .copied()
+                .unwrap_or(CompactRange::ZERO);
+            // Materialization writes the build once and the probe reads it for
+            // every left row. The tuple-byte base charge already includes the
+            // logical output; external execution adds a second build pass for
+            // serialization and replay.
+            if flavor == PhysicalImplementationFlavor::CrossProductExternal {
+                let width = facts
+                    .child_row_widths
+                    .get(1)
+                    .copied()
+                    .unwrap_or(facts.output_row_width);
+                work.add(
+                    OP_TUPLE_BYTE_BLOCK,
+                    scaled_work(right, width as f64 / 16.0)?,
+                )?;
+            }
             peak_memory_upper = facts
                 .child_rows_hard_upper
                 .get(1)
@@ -487,6 +534,23 @@ pub(super) fn implementation_cost(
     }
     let mut cost = calibration.fold(&work)?;
     apply_execution_memory_contract(metadata, flavor, peak_memory_upper, &mut cost)?;
+    if flavor == PhysicalImplementationFlavor::CrossProductExternal {
+        let right = facts
+            .child_rows
+            .get(1)
+            .copied()
+            .unwrap_or(CompactRange::ZERO);
+        let width = facts
+            .child_row_widths
+            .get(1)
+            .copied()
+            .unwrap_or(facts.output_row_width)
+            .max(1);
+        add_spill_cost(
+            &mut cost,
+            (right.expected * width as f64).min(u64::MAX as f64) as u64,
+        )?;
+    }
     cost.validate()?;
     Ok(cost)
 }
@@ -512,6 +576,8 @@ fn apply_execution_memory_contract(
                 | PhysicalImplementationFlavor::NestedLoopJoin
                 | PhysicalImplementationFlavor::SortRangeJoin
                 | PhysicalImplementationFlavor::ClassicIeJoin
+                | PhysicalImplementationFlavor::CrossProductInMemory
+                | PhysicalImplementationFlavor::CrossProductExternal
                 | PhysicalImplementationFlavor::Window
                 | PhysicalImplementationFlavor::PartitionAggregateWindow
         );

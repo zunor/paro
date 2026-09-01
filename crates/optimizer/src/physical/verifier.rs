@@ -117,6 +117,7 @@ impl PhysicalPlanVerifier {
             }
             let declared_spill_policy = match &node.kind {
                 crate::physical::PhysicalNodeKind::HashJoin(spec) => Some(spec.spill_policy),
+                crate::physical::PhysicalNodeKind::CrossProduct(spec) => Some(spec.spill_policy),
                 crate::physical::PhysicalNodeKind::Sort(spec) => Some(spec.spill_policy),
                 _ => None,
             };
@@ -127,6 +128,15 @@ impl PhysicalPlanVerifier {
                         "operator spill policy disagrees with its physical characteristics",
                     ));
                 }
+            }
+            if matches!(
+                &node.kind,
+                crate::physical::PhysicalNodeKind::CrossProduct(spec)
+                    if spec.spill_policy == crate::physical::SpillExecutionPolicy::Adaptive
+            ) {
+                return Err(paro_error::internal(
+                    "cross product must select one immutable materialization representation",
+                ));
             }
             if let crate::physical::PhysicalNodeKind::HashJoin(spec) = &node.kind {
                 if let Some(runtime_filter) = spec.runtime_filter {

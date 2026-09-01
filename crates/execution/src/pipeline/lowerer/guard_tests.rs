@@ -28,6 +28,17 @@ fn lowerer_routes_external_project_as_typed_transform() {
             .iter()
             .any(|transform| matches!(transform, TransformSpec::ExternalProject(_)))
     }));
+    let external_pipeline = graph
+        .pipelines
+        .iter()
+        .find(|pipeline| {
+            pipeline
+                .transforms
+                .iter()
+                .any(|transform| matches!(transform, TransformSpec::ExternalProject(_)))
+        })
+        .expect("external project pipeline");
+    assert_eq!(external_pipeline.properties.capabilities.parallelism.max, 1);
 }
 
 #[test]

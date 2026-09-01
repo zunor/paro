@@ -5,6 +5,47 @@
 
 use super::*;
 
+/// Persistent ownership scope for one logical subtree.
+///
+/// Memo construction creates one small node per operator and materializes a
+/// set only for operators that actually own a planning-region facet. This
+/// avoids copying every descendant group into every ancestor on ordinary
+/// plans while preserving exact set semantics at the region boundary.
+#[derive(Debug, Clone)]
+pub(super) struct PlannerRegionScope(Arc<PlannerRegionScopeNode>);
+
+#[derive(Debug)]
+struct PlannerRegionScopeNode {
+    group: GroupId,
+    children: Box<[PlannerRegionScope]>,
+}
+
+impl PlannerRegionScope {
+    pub(super) fn new(
+        group: GroupId,
+        children: impl IntoIterator<Item = PlannerRegionScope>,
+    ) -> Self {
+        Self(Arc::new(PlannerRegionScopeNode {
+            group,
+            children: children.into_iter().collect(),
+        }))
+    }
+
+    /// Materialize at most `ceiling + 1` unique groups. The overflow witness
+    /// rejects an oversized facet without walking the remainder of its tree.
+    pub(super) fn materialize_bounded(&self, ceiling: usize) -> (BTreeSet<GroupId>, bool) {
+        let mut groups = BTreeSet::new();
+        let mut pending = vec![self.clone()];
+        while let Some(scope) = pending.pop() {
+            if groups.insert(scope.0.group) && groups.len() > ceiling {
+                return (groups, true);
+            }
+            pending.extend(scope.0.children.iter().cloned());
+        }
+        (groups, false)
+    }
+}
+
 #[derive(Debug)]
 pub(super) struct PlannerLogicalPayload {
     /// Binding-based operator semantics. Positional projection maps and input
@@ -268,6 +309,7 @@ pub(super) struct PlannerImplementationSet {
     pub(super) hash_join_runtime_filter: bool,
     pub(super) partition_aggregate_window: bool,
     pub(super) singleton_aggregate_projection: bool,
+    pub(super) external_cross_product: bool,
 }
 
 impl PlannerImplementationSet {
@@ -279,6 +321,7 @@ impl PlannerImplementationSet {
         hash_join_runtime_filter: false,
         partition_aggregate_window: false,
         singleton_aggregate_projection: false,
+        external_cross_product: false,
     };
 
     pub(super) fn supports(self, flavor: PhysicalImplementationFlavor) -> bool {
@@ -293,6 +336,7 @@ impl PlannerImplementationSet {
             PhysicalImplementationFlavor::SingletonAggregateProjection => {
                 self.singleton_aggregate_projection
             }
+            PhysicalImplementationFlavor::CrossProductExternal => self.external_cross_product,
             _ => false,
         }
     }

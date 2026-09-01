@@ -85,9 +85,7 @@ impl HashAggregateBuildSinkExec {
     pub(crate) fn create_global(&self, ctx: &mut PipelineInitContext) -> Result<SinkGlobal> {
         self.spec.verify_post_reduction()?;
         let handle = ctx.handles.get(self.handle)?;
-        if hash_aggregate_external_payload_spill_requested(&self.spec)
-            || self.spec.grouping_sets.len() > 1
-        {
+        if hash_aggregate_external_payload_spill_requested(&self.spec) {
             if !hash_aggregate_payload_spill_supported(&self.spec) {
                 return Err(paro_error::internal(
                     "optimizer selected forced spill for a hash aggregate without an executable spill path",

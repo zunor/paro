@@ -533,6 +533,7 @@ impl PhysicalPlanExtractor {
                     | PhysicalNodeKind::MutationInputSpool(_)
                     | PhysicalNodeKind::TopN(_)
                     | PhysicalNodeKind::HashJoin(_)
+                    | PhysicalNodeKind::CrossProduct(_)
                     | PhysicalNodeKind::Aggregate(_)
                     | PhysicalNodeKind::Window(_)
                     | PhysicalNodeKind::MaterializedCte(_)
@@ -544,6 +545,10 @@ impl PhysicalPlanExtractor {
             ) || matches!(
                 &kind,
                 PhysicalNodeKind::Aggregate(spec)
+                    if spec.spill_policy != SpillExecutionPolicy::InMemory
+            ) || matches!(
+                &kind,
+                PhysicalNodeKind::CrossProduct(spec)
                     if spec.spill_policy != SpillExecutionPolicy::InMemory
             ) || matches!(
                 &kind,

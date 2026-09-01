@@ -144,6 +144,56 @@ async fn correlated_count_restores_its_typed_empty_input_value() {
 }
 
 #[tokio::test]
+async fn correlated_count_wrappers_preserve_the_empty_input_value() {
+    let instance = Instance::new_in_memory_with_config(
+        InstanceConfig::in_memory().with_max_memory(8 * 1024 * 1024),
+    )
+    .expect("correlated aggregate wrapper test instance");
+    let mut session = Session::new(1, instance);
+    let mut sink = CollectingSink::new();
+    exec_ok(
+        &mut session,
+        &mut sink,
+        "CREATE TABLE scalar_outer_wrapped (k INT);
+         CREATE TABLE scalar_inner_wrapped (k INT);
+         INSERT INTO scalar_outer_wrapped VALUES (1), (2);
+         INSERT INTO scalar_inner_wrapped VALUES (1)",
+    )
+    .await;
+
+    exec_ok(
+        &mut session,
+        &mut sink,
+        "SELECT o.k,
+                (SELECT COUNT(*)
+                   FROM scalar_inner_wrapped AS i
+                  WHERE i.k = o.k
+                  LIMIT 1)
+           FROM scalar_outer_wrapped AS o
+          ORDER BY o.k",
+    )
+    .await;
+    assert_eq!(query_i64_col(&sink, 0), vec![1, 2]);
+    assert_eq!(query_i64_col(&sink, 1), vec![1, 0]);
+
+    exec_ok(
+        &mut session,
+        &mut sink,
+        "SELECT o.k,
+                (SELECT COUNT(*)
+                   FROM scalar_inner_wrapped AS i
+                  WHERE i.k = o.k
+                  ORDER BY COUNT(*)
+                  LIMIT 1)
+           FROM scalar_outer_wrapped AS o
+          ORDER BY o.k",
+    )
+    .await;
+    assert_eq!(query_i64_col(&sink, 0), vec![1, 2]);
+    assert_eq!(query_i64_col(&sink, 1), vec![1, 0]);
+}
+
+#[tokio::test]
 async fn empty_grouping_set_emits_its_identity_row() {
     let instance = Instance::new_in_memory();
     let mut session = Session::new(1, instance);
@@ -168,4 +218,17 @@ async fn empty_grouping_set_emits_its_identity_row() {
         Value::Null(paro_common::types::LogicalType::Integer)
     );
     assert_eq!(chunk.column(2).unwrap().get_value(0), Value::BigInt(0));
+
+    exec_ok(&mut session, &mut sink, "SET temp_directory = ''").await;
+    exec_ok(
+        &mut session,
+        &mut sink,
+        "SELECT a, b, COUNT(*)
+           FROM (VALUES (1, 10), (2, 20)) AS t(a, b)
+          GROUP BY GROUPING SETS ((a), (b))",
+    )
+    .await;
+    let result = sink.assert_single_result();
+    assert_eq!(result.completion, StatementCompletion::Select { rows: 4 });
+    assert_eq!(query_i64_col(&sink, 2), vec![1, 1, 1, 1]);
 }

@@ -1248,13 +1248,33 @@ fn admit_transformation_work(
     let mut pending = vec![source];
     let mut visited = BTreeSet::new();
     while let Some(expression) = pending.pop() {
-        let logical = memo.logical_expr(expression).ok_or_else(|| {
-            paro_error::internal("rule work accounting references a missing expression")
-        })?;
-        for child in logical.key.children.iter().copied() {
+        let children = memo
+            .logical_expr(expression)
+            .ok_or_else(|| {
+                paro_error::internal("rule work accounting references a missing expression")
+            })?
+            .key
+            .children
+            .clone();
+        for child in children.iter().copied() {
             let child = memo.canonical_group(child);
             if !visited.insert(child) {
                 continue;
+            }
+            let mut event = StableFingerprintBuilder::default();
+            event.write_bytes(b"paro.rule-work.v1");
+            event.write_u64(target.0 as u64);
+            event.write_u64(source.0 as u64);
+            event.write_u64(rule.0 as u64);
+            event.write_u64(child.0 as u64);
+            if memo
+                .group_mut(target)
+                .ok_or_else(|| paro_error::internal("rule work target group disappeared"))?
+                .ledger
+                .admit_optional(BudgetDimension::RuleWorkPerGroup, event.finish())
+                == BudgetDecision::Exhausted
+            {
+                return Ok(false);
             }
             let child_expression = memo
                 .group(child)
@@ -1264,23 +1284,6 @@ fn admit_transformation_work(
                     paro_error::internal("rule work accounting found an empty child group")
                 })?;
             pending.push(child_expression);
-        }
-    }
-    let ledger = &mut memo
-        .group_mut(target)
-        .ok_or_else(|| paro_error::internal("rule work target group disappeared"))?
-        .ledger;
-    for group in visited {
-        let mut event = StableFingerprintBuilder::default();
-        event.write_bytes(b"paro.rule-work.v1");
-        event.write_u64(target.0 as u64);
-        event.write_u64(source.0 as u64);
-        event.write_u64(rule.0 as u64);
-        event.write_u64(group.0 as u64);
-        if ledger.admit_optional(BudgetDimension::RuleWorkPerGroup, event.finish())
-            == BudgetDecision::Exhausted
-        {
-            return Ok(false);
         }
     }
     Ok(true)

@@ -274,9 +274,9 @@ pub(super) fn planner_operator_spillable(operator: &LogicalOperator) -> bool {
         LogicalOperator::Join(Join::Comparison(join)) => {
             crate::physical::extraction::helpers::supports_external_hash_join_type(join.join_type)
         }
-        // The build side is an immutable row store and the probe streams it
-        // one vector at a time. Feasibility therefore does not depend on a
-        // snapshot-local build cardinality estimate.
+        // Cross product has two explicit physical implementations. This flag
+        // advertises the external one; the in-memory implementation remains a
+        // separate non-spillable candidate.
         LogicalOperator::Join(Join::Cross(_)) => true,
         _ => false,
     }
@@ -292,8 +292,10 @@ pub(super) fn implementation_spillable(
         | PhysicalImplementationFlavor::HashAggregate
         | PhysicalImplementationFlavor::PartitionAggregateWindow
         | PhysicalImplementationFlavor::Window => metadata.spillable,
+        PhysicalImplementationFlavor::CrossProductExternal => metadata.spillable,
         PhysicalImplementationFlavor::Structural => metadata.spillable,
         PhysicalImplementationFlavor::NestedLoopJoin
+        | PhysicalImplementationFlavor::CrossProductInMemory
         | PhysicalImplementationFlavor::PerfectHashAggregate
         | PhysicalImplementationFlavor::SingletonAggregateProjection
         | PhysicalImplementationFlavor::SortRangeJoin
@@ -323,6 +325,8 @@ pub(super) fn planner_cost_composition(
     let overlapping_children = match flavor {
         PhysicalImplementationFlavor::HashJoin
         | PhysicalImplementationFlavor::HashJoinRuntimeFilter => 0b11,
+        PhysicalImplementationFlavor::CrossProductInMemory
+        | PhysicalImplementationFlavor::CrossProductExternal => 0b11,
         PhysicalImplementationFlavor::HashAggregate
         | PhysicalImplementationFlavor::PerfectHashAggregate
         | PhysicalImplementationFlavor::Window

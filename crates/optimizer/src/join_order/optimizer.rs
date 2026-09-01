@@ -3,7 +3,8 @@
 
 //! Cost-based join-order optimization.
 
-use std::collections::{HashMap, HashSet};
+use std::cmp::Reverse;
+use std::collections::{BinaryHeap, HashMap, HashSet};
 use std::sync::Arc;
 
 use paro_catalog::entry::ConstraintType;
@@ -174,6 +175,38 @@ pub struct JoinOrderOptimizer {
     max_frontier_size: usize,
 }
 
+fn k_best_cartesian_indices(lengths: &[usize], limit: usize) -> Vec<Vec<usize>> {
+    if lengths.is_empty() {
+        return vec![Vec::new()];
+    }
+    if limit == 0 || lengths.contains(&0) {
+        return Vec::new();
+    }
+
+    let origin = vec![0; lengths.len()];
+    let mut pending = BinaryHeap::from([Reverse((0usize, origin.clone()))]);
+    let mut visited = HashSet::from([origin]);
+    let mut result = Vec::with_capacity(limit);
+    while result.len() < limit {
+        let Some(Reverse((_, indices))) = pending.pop() else {
+            break;
+        };
+        result.push(indices.clone());
+        for dimension in 0..lengths.len() {
+            if indices[dimension] + 1 >= lengths[dimension] {
+                continue;
+            }
+            let mut neighbor = indices.clone();
+            neighbor[dimension] += 1;
+            if visited.insert(neighbor.clone()) {
+                let rank = neighbor.iter().sum();
+                pending.push(Reverse((rank, neighbor)));
+            }
+        }
+    }
+    result
+}
+
 impl JoinOrderOptimizer {
     /// Create a new JoinOrderOptimizer.
     pub fn new() -> Self {
@@ -267,16 +300,22 @@ impl JoinOrderOptimizer {
             child_frontiers.push(self.enumerate_tree_frontier(ctx, bind_context, child)?);
         }
 
-        let combinations = child_frontiers
-            .iter()
-            .fold(1usize, |count, frontier| {
-                count.saturating_mul(frontier.len().max(1))
-            })
-            .min(self.max_frontier_size)
-            .max(1);
-        let mut rebuilt = Vec::with_capacity(combinations);
-        for ordinal in 0..combinations {
-            let mut divisor = 1usize;
+        if child_frontiers.iter().any(Vec::is_empty) {
+            return Err(paro_common::error::internal(
+                "join frontier produced an empty child alternative set",
+            ));
+        }
+        // Every child frontier is already ordered by its non-dominated
+        // work/memory rank. Enumerate the Cartesian lattice with a min-heap
+        // over summed ranks. Unlike mixed-radix prefix truncation, this is a
+        // deterministic k-best traversal and lets every child vary before a
+        // deeper rank from one positional child can monopolize the budget.
+        let combinations = k_best_cartesian_indices(
+            &child_frontiers.iter().map(Vec::len).collect::<Vec<_>>(),
+            self.max_frontier_size,
+        );
+        let mut rebuilt = Vec::with_capacity(combinations.len());
+        for combination in combinations {
             let mut child_index = 0usize;
             let mut shell =
                 duplicate_plan_preserving_indices(&skeleton, bind_context.shared().as_ref());
@@ -284,13 +323,9 @@ impl JoinOrderOptimizer {
                 let frontier = child_frontiers.get(child_index).ok_or_else(|| {
                     paro_common::error::internal("join frontier child arity mismatch")
                 })?;
-                if frontier.is_empty() {
-                    return Err(paro_common::error::internal(
-                        "join frontier produced an empty child alternative set",
-                    ));
-                }
-                let selected = (ordinal / divisor) % frontier.len();
-                divisor = divisor.saturating_mul(frontier.len());
+                let selected = *combination.get(child_index).ok_or_else(|| {
+                    paro_common::error::internal("join frontier combination arity mismatch")
+                })?;
                 child_index += 1;
                 Ok(duplicate_plan_preserving_indices(
                     &frontier[selected],
@@ -1127,6 +1162,17 @@ mod tests {
     use std::sync::atomic::{AtomicU64, Ordering};
 
     use super::*;
+
+    #[test]
+    fn cartesian_frontier_is_ranked_without_child_position_bias() {
+        let combinations = k_best_cartesian_indices(&[4, 4], 4);
+        assert_eq!(combinations[0], vec![0, 0]);
+        assert!(combinations.iter().any(|indices| indices[0] > 0));
+        assert!(combinations.iter().any(|indices| indices[1] > 0));
+        assert!(combinations
+            .windows(2)
+            .all(|pair| pair[0].iter().sum::<usize>() <= pair[1].iter().sum()));
+    }
     use crate::join::build_probe_side::BuildProbeSideOptimizer;
     use crate::join_order::cardinality::CardinalityEstimator;
     use paro_catalog::entry::{

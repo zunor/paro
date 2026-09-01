@@ -60,6 +60,10 @@ pub(crate) enum PhysicalImplementationFlavor {
     /// Hash join plus an AuxiliaryPlanRegion-owned build-to-scan filter.
     HashJoinRuntimeFilter,
     NestedLoopJoin,
+    /// Cross-product build retained entirely in the query memory pool.
+    CrossProductInMemory,
+    /// Cross-product build written to one external row-store domain.
+    CrossProductExternal,
     SortRangeJoin,
     ClassicIeJoin,
     HashAggregate,

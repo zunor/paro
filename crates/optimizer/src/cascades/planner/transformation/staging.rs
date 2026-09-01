@@ -58,7 +58,7 @@ pub(super) fn stage_transformed_expression(
     struct NodeState {
         group: GroupId,
         columns: Box<[ColumnId]>,
-        subtree_groups: BTreeSet<GroupId>,
+        region_scope: PlannerRegionScope,
     }
 
     struct StagingOptions<'a> {
@@ -225,11 +225,10 @@ pub(super) fn stage_transformed_expression(
                     NodeState {
                         group,
                         columns: output_columns.into_boxed_slice(),
-                        subtree_groups: child_states
-                            .iter()
-                            .flat_map(|child| child.subtree_groups.iter().copied())
-                            .chain(std::iter::once(group))
-                            .collect(),
+                        region_scope: PlannerRegionScope::new(
+                            group,
+                            child_states.iter().map(|child| child.region_scope.clone()),
+                        ),
                     },
                     None,
                 ));
@@ -256,11 +255,10 @@ pub(super) fn stage_transformed_expression(
         } else {
             memo.create_group(schema, logical_properties.clone(), cardinality.clone())
         };
-        let subtree_groups = child_states
-            .iter()
-            .flat_map(|child| child.subtree_groups.iter().copied())
-            .chain(std::iter::once(group))
-            .collect::<BTreeSet<_>>();
+        let region_scope = PlannerRegionScope::new(
+            group,
+            child_states.iter().map(|child| child.region_scope.clone()),
+        );
 
         if target.is_some() {
             if let Some(existing) = memo.logical_expr_for_key(group, &key) {
@@ -269,7 +267,7 @@ pub(super) fn stage_transformed_expression(
                     NodeState {
                         group,
                         columns: output_columns.into_boxed_slice(),
-                        subtree_groups,
+                        region_scope,
                     },
                     Some(StagedEquivalent {
                         key,
@@ -352,12 +350,14 @@ pub(super) fn stage_transformed_expression(
                 memo.insert_logical(group, key.clone(), payload, EquivalenceProof::Initial)?;
             state.record_expression_group(key, group, logical);
             if runtime_filter_candidate {
+                let (scope, _) = region_scope
+                    .materialize_bounded(usize::from(memo.budget().max_composite_region_groups));
                 let mut facet = planner_region_facet(
                     RegionFacetKind::RuntimeFilter,
                     FacetCriticality::Optional,
                     logical,
                     operator_fingerprint,
-                    subtree_groups.clone(),
+                    scope,
                 );
                 facet.priority = 2_000 + RegionFacetKind::RuntimeFilter as u16;
                 let fingerprint = facet.fingerprint;
@@ -384,7 +384,7 @@ pub(super) fn stage_transformed_expression(
             NodeState {
                 group,
                 columns: output_columns.into_boxed_slice(),
-                subtree_groups,
+                region_scope,
             },
             staged,
         ))
@@ -412,7 +412,17 @@ pub(super) fn stage_transformed_expression(
             .find(|facet| facet.fingerprint == fingerprint)
             .cloned()
             .ok_or_else(|| paro_error::internal("preserved planning facet disappeared"))?;
-        facet.scope.extend(root.subtree_groups);
+        let ceiling = match facet.criticality {
+            FacetCriticality::Required => memo.budget().max_mandatory_region_groups as usize,
+            FacetCriticality::Optional => usize::from(memo.budget().max_composite_region_groups),
+        };
+        let (scope, overflow) = root.region_scope.materialize_bounded(ceiling);
+        if overflow && facet.criticality == FacetCriticality::Required {
+            return Err(paro_error::internal(
+                "required planning-region closure exceeds query complexity ceiling",
+            ));
+        }
+        facet.scope.extend(scope);
         let dropped = memo.upsert_region_facet(facet)?;
         disable_dropped_runtime_filter_facets(state, &dropped)?;
     }

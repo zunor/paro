@@ -76,12 +76,24 @@ impl PhysicalPlanExtractor {
                 self.lower_any_join(any)
             }
             Join::Cross(cross) => {
-                if implementation != crate::physical::PhysicalImplementationFlavor::Structural {
-                    return Err(paro_error::internal(
-                        "Memo selected an incompatible implementation for CrossProduct",
-                    ));
-                }
-                self.lower_cross_product(cross)
+                let spill_policy = match implementation {
+                    // Structural lowering is limited to test/utility plans
+                    // that never entered relational Memo. It receives the
+                    // canonical non-adaptive representation.
+                    crate::physical::PhysicalImplementationFlavor::Structural
+                    | crate::physical::PhysicalImplementationFlavor::CrossProductInMemory => {
+                        SpillExecutionPolicy::InMemory
+                    }
+                    crate::physical::PhysicalImplementationFlavor::CrossProductExternal => {
+                        SpillExecutionPolicy::ForcedExternal
+                    }
+                    _ => {
+                        return Err(paro_error::internal(
+                            "Memo selected an incompatible implementation for CrossProduct",
+                        ));
+                    }
+                };
+                self.lower_cross_product(cross, spill_policy)
             }
         }
     }
@@ -298,6 +310,7 @@ impl PhysicalPlanExtractor {
     pub(crate) fn lower_cross_product(
         &mut self,
         cross: &CrossProduct,
+        spill_policy: SpillExecutionPolicy,
     ) -> Result<(PhysicalNodeKind, Vec<PhysicalPlanNodeId>)> {
         let left = self.extract_node(cross.left.as_ref())?;
         let right = self.extract_node(cross.right.as_ref())?;
@@ -317,7 +330,7 @@ impl PhysicalPlanExtractor {
             right_output_types: cross.right.types().into_boxed_slice(),
             output_names: output_names.into_boxed_slice(),
             output_types: output_types.into_boxed_slice(),
-            spill_policy: self.ctx.spill_execution_policy(true),
+            spill_policy,
         };
         Ok((PhysicalNodeKind::CrossProduct(spec), vec![left, right]))
     }

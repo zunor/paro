@@ -177,7 +177,12 @@ impl<P> PhysicalPlanPortfolio<P> {
                     .iter()
                     .filter_map(|id| classes.get(id))
                     .filter(|class| {
-                        variant.cost.peak_memory_upper <= class.hard_memory_bytes
+                        // A class is one measured/planned operating point, not
+                        // merely an upper label. Never reuse its optimistic
+                        // cost below the memory at which it was optimized.
+                        (class.hard_memory_bytes <= available_memory_bytes
+                            || variant.cost.peak_memory_upper <= available_memory_bytes)
+                            && variant.cost.peak_memory_upper <= class.hard_memory_bytes
                             && (variant.cost.spill_bytes_expected == 0
                                 || class.spill_policy == SpillPolicy::Allowed)
                     })
@@ -395,12 +400,20 @@ mod tests {
     #[test]
     fn admission_is_deterministic_and_respects_hard_resources() {
         let portfolio = PhysicalPlanPortfolio::build(
-            [ResourceGrantClass {
-                id: ResourceGrantClassId(1),
-                hard_memory_bytes: 100,
-                spill_policy: SpillPolicy::Allowed,
-                concurrency_class: 0,
-            }],
+            [
+                ResourceGrantClass {
+                    id: ResourceGrantClassId(1),
+                    hard_memory_bytes: 100,
+                    spill_policy: SpillPolicy::Allowed,
+                    concurrency_class: 0,
+                },
+                ResourceGrantClass {
+                    id: ResourceGrantClassId(2),
+                    hard_memory_bytes: 20,
+                    spill_policy: SpillPolicy::Allowed,
+                    concurrency_class: 0,
+                },
+            ],
             [
                 (
                     ResourceGrantClassId(1),
@@ -409,7 +422,7 @@ mod tests {
                     cost(1.0, 100),
                 ),
                 (
-                    ResourceGrantClassId(1),
+                    ResourceGrantClassId(2),
                     "small",
                     Fingerprint(2),
                     cost(2.0, 10),
@@ -421,6 +434,41 @@ mod tests {
         assert_eq!(admitted.plan, "small");
         assert_eq!(admitted.reservation.minimum_memory_bytes, 10);
         assert_eq!(admitted.reservation.target_memory_bytes, 10);
+    }
+
+    #[test]
+    fn admission_does_not_extrapolate_a_large_grant_cost_below_its_operating_point() {
+        let large = ResourceGrantClass {
+            id: ResourceGrantClassId(1),
+            hard_memory_bytes: 100,
+            spill_policy: SpillPolicy::Allowed,
+            concurrency_class: 0,
+        };
+        let small = ResourceGrantClass {
+            id: ResourceGrantClassId(2),
+            hard_memory_bytes: 10,
+            spill_policy: SpillPolicy::Allowed,
+            concurrency_class: 0,
+        };
+        let mut large_cost = cost(1.0, 100);
+        large_cost.minimum_memory_bytes = 1;
+        let portfolio = PhysicalPlanPortfolio::build(
+            [large, small],
+            [
+                (large.id, "large-fast", Fingerprint(1), large_cost),
+                (small.id, "small-slower", Fingerprint(2), cost(2.0, 10)),
+            ],
+        )
+        .unwrap();
+
+        assert_eq!(
+            portfolio.admit(10, 0, |_| true).unwrap().plan,
+            "small-slower"
+        );
+        assert_eq!(
+            portfolio.admit(100, 0, |_| true).unwrap().plan,
+            "large-fast"
+        );
     }
 
     #[test]

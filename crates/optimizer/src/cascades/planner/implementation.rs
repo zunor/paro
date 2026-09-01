@@ -43,6 +43,10 @@ pub(super) fn register_implementations(
             PLANNER_SINGLETON_AGGREGATE_PROJECTION,
             PhysicalImplementationFlavor::SingletonAggregateProjection,
         ),
+        (
+            PLANNER_EXTERNAL_CROSS_PRODUCT,
+            PhysicalImplementationFlavor::CrossProductExternal,
+        ),
     ] {
         registry.register_implementation(AlternativeImplementation {
             id,

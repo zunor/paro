@@ -11,92 +11,14 @@ use crate::binder::plan::subquery::{
 };
 use crate::expression::{
     CaseExpression, ColumnRefExpression, ComparisonExpression, ComparisonType, ConstantExpression,
-    Expression, ExpressionIterator, ExpressionVisitDecision, OperatorExpression, OperatorType,
-    SubqueryExpression, SubqueryType,
+    Expression, OperatorExpression, OperatorType, SubqueryExpression, SubqueryType,
 };
+use crate::logical_properties::{normalize_scalar_singleton_wrappers, EmptyInputBehavior};
 use crate::operator::{AnyAllPayload, ColumnBinding, DependentJoin, LogicalOperator, Projection};
 use crate::plan::PlannedStatement;
 use paro_common::error::{self as paro_error, Result};
 use paro_common::runtime_value::Value;
 use paro_common::types::LogicalType;
-use paro_function::aggregate::AggregateEmptyInput;
-
-/// Derive the value produced by a scalar aggregate branch when its relational
-/// input is empty. The result remains an expression so projection semantics
-/// such as `COUNT(*) + 1` are preserved without evaluating user code while
-/// binding. Only exact aggregate contracts may cross the decorrelation
-/// boundary; NULL is represented explicitly in the same typed domain.
-fn scalar_empty_output(plan: &LogicalOperator, ordinal: usize) -> Option<Expression> {
-    fn outputs(plan: &LogicalOperator) -> Option<Vec<Expression>> {
-        match plan {
-            LogicalOperator::Aggregate(aggregate)
-                if aggregate.groups.is_empty()
-                    && aggregate.grouping_functions.is_empty()
-                    && (aggregate.grouping_sets.is_empty()
-                        || (aggregate.grouping_sets.len() == 1
-                            && aggregate.grouping_sets[0].expressions.is_empty())) =>
-            {
-                aggregate
-                    .aggregates
-                    .iter()
-                    .map(|expression| {
-                        let Expression::Aggregate(aggregate) = expression else {
-                            return None;
-                        };
-                        let return_type = aggregate.return_type.clone();
-                        let value = match &aggregate.function.empty_input {
-                            AggregateEmptyInput::Null => Value::Null(return_type.clone()),
-                            exact @ AggregateEmptyInput::Exact(_) => {
-                                exact.exact_value(&return_type)?.clone()
-                            }
-                            AggregateEmptyInput::Unknown => return None,
-                        };
-                        Some(Expression::Constant(ConstantExpression::new(
-                            value,
-                            return_type,
-                        )))
-                    })
-                    .collect()
-            }
-            LogicalOperator::Projection(projection) => {
-                let child_outputs = outputs(&projection.child.operator)?;
-                let child_bindings = projection.child.get_column_bindings();
-                if child_outputs.len() != child_bindings.len() {
-                    return None;
-                }
-                let replacements = child_bindings
-                    .into_iter()
-                    .zip(child_outputs)
-                    .collect::<std::collections::HashMap<_, _>>();
-                projection
-                    .expressions
-                    .iter()
-                    .cloned()
-                    .map(|expression| {
-                        let rewritten = expression.replace_column_ref(&|column| {
-                            (column.depth == 0)
-                                .then(|| replacements.get(&column.binding).cloned())
-                                .flatten()
-                        });
-                        let mut unresolved = false;
-                        ExpressionIterator::visit(&rewritten, &mut |candidate| {
-                            if matches!(candidate, Expression::ColumnRef(_)) {
-                                unresolved = true;
-                                ExpressionVisitDecision::SkipChildren
-                            } else {
-                                ExpressionVisitDecision::Descend
-                            }
-                        });
-                        (!unresolved).then_some(rewritten)
-                    })
-                    .collect()
-            }
-            _ => None,
-        }
-    }
-
-    outputs(plan)?.get(ordinal).cloned()
-}
 
 fn append_scalar_presence_carrier(
     binder: &mut crate::binder::Binder,
@@ -215,9 +137,14 @@ impl crate::binder::Binder {
             subquery.bind_snapshot.as_ref(),
         );
         let mut subquery_plan = copied_statement.plan.operator;
-        let scalar_empty_output = (subquery.subquery_type == SubqueryType::Scalar)
-            .then(|| scalar_empty_output(&subquery_plan, 0))
-            .flatten();
+        if subquery.subquery_type == SubqueryType::Scalar {
+            subquery_plan = normalize_scalar_singleton_wrappers(subquery_plan);
+        }
+        let scalar_empty_output = if subquery.subquery_type == SubqueryType::Scalar {
+            EmptyInputBehavior::derive(&subquery_plan).scalar_fallback(0, &subquery.return_type)?
+        } else {
+            None
+        };
         let scalar_presence_binding = if scalar_empty_output.is_some() {
             let (plan, binding) = append_scalar_presence_carrier(self, subquery_plan);
             subquery_plan = plan;

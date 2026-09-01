@@ -113,6 +113,7 @@ const PLANNER_SEARCH_PROVIDER: ImplementationId = ImplementationId(5);
 const PLANNER_HASH_JOIN_RUNTIME_FILTER: ImplementationId = ImplementationId(6);
 const PLANNER_PARTITION_AGGREGATE_WINDOW: ImplementationId = ImplementationId(7);
 const PLANNER_SINGLETON_AGGREGATE_PROJECTION: ImplementationId = ImplementationId(8);
+const PLANNER_EXTERNAL_CROSS_PRODUCT: ImplementationId = ImplementationId(9);
 const COST_OPTIMIZED_SEARCH_POLICY: QualityPolicyId = QualityPolicyId(1);
 pub const SEARCH_REGION_ENUMERATOR_RULE: super::ids::RuleId = super::ids::RuleId(10_002);
 pub const GRAPH_REGION_ENUMERATOR_RULE: super::ids::RuleId = super::ids::RuleId(10_003);
@@ -331,7 +332,7 @@ struct BuildState {
     group: GroupId,
     logical: super::ids::LogicalExprId,
     columns: Box<[ColumnId]>,
-    subtree_groups: BTreeSet<GroupId>,
+    region_scope: PlannerRegionScope,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -583,17 +584,16 @@ impl MemoBuilder {
                             .expect("reusable group was validated")
                             .logical_properties
                             .merge_equivalent_facts(&logical_properties);
-                        let mut subtree_groups = BTreeSet::from([group]);
-                        for child in &child_states {
-                            subtree_groups.extend(child.subtree_groups.iter().copied());
-                        }
                         return Ok((
                             plan,
                             BuildState {
                                 group,
                                 logical,
                                 columns: output_columns.into_boxed_slice(),
-                                subtree_groups,
+                                region_scope: PlannerRegionScope::new(
+                                    group,
+                                    child_states.iter().map(|child| child.region_scope.clone()),
+                                ),
                             },
                         ));
                     }
@@ -665,29 +665,40 @@ impl MemoBuilder {
                         None
                     };
                     let implementations = planner_implementation_set(&plan, rowset_scan_pushdown);
-                    let mut subtree_groups = BTreeSet::from([group]);
-                    for child in &child_states {
-                        subtree_groups.extend(child.subtree_groups.iter().copied());
-                    }
+                    let region_scope = PlannerRegionScope::new(
+                        group,
+                        child_states.iter().map(|child| child.region_scope.clone()),
+                    );
                     let mut pending = PendingPlannerRegionFacets::default();
                     if let Some(kind) = required_region_kind(&plan.operator) {
+                        let (scope, overflow) = region_scope.materialize_bounded(
+                            memo.budget().max_mandatory_region_groups as usize,
+                        );
+                        if overflow {
+                            return Err(paro_error::internal(
+                                "required planning-region closure exceeds query complexity ceiling",
+                            ));
+                        }
                         let facet = planner_region_facet(
                             kind,
                             FacetCriticality::Required,
                             logical,
                             operator_fingerprint,
-                            subtree_groups.clone(),
+                            scope,
                         );
                         pending.required = Some(facet.fingerprint);
                         region_facets.push(facet);
                     }
                     if implementations.hash_join_runtime_filter {
+                        let (scope, _) = region_scope.materialize_bounded(usize::from(
+                            memo.budget().max_composite_region_groups,
+                        ));
                         let facet = planner_region_facet(
                             RegionFacetKind::RuntimeFilter,
                             FacetCriticality::Optional,
                             logical,
                             operator_fingerprint,
-                            subtree_groups.clone(),
+                            scope,
                         );
                         pending.runtime_filter = Some(facet.fingerprint);
                         region_facets.push(facet);
@@ -776,7 +787,7 @@ impl MemoBuilder {
                             group,
                             logical,
                             columns: output_columns.into_boxed_slice(),
-                            subtree_groups,
+                            region_scope,
                         },
                     ))
                 },

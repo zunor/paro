@@ -305,6 +305,39 @@ mod tests {
     }
 
     #[test]
+    fn issued_bytes_are_a_non_fungible_capacity_floor() {
+        let arbitrator = Arc::new(MemoryArbitrator::new(1_000));
+        let pool_a = Arc::new(QueryMemoryPool::new(1_000));
+        let target_a: Arc<dyn QueryMemoryTarget> = pool_a.clone();
+        let registration_a = arbitrator.clone().register_query(
+            QueryMemoryBudgetSpec::new(1, Some("a".to_string()), 1_000, None),
+            Arc::downgrade(&target_a),
+        );
+        pool_a.attach_registration(registration_a);
+        pool_a.try_grow(800).expect("first query owns its grant");
+
+        let pool_b = Arc::new(QueryMemoryPool::new(1_000));
+        let target_b: Arc<dyn QueryMemoryTarget> = pool_b.clone();
+        let registration_b = arbitrator.clone().register_query(
+            QueryMemoryBudgetSpec::new(2, Some("b".to_string()), 1_000, None),
+            Arc::downgrade(&target_b),
+        );
+        pool_b.attach_registration(registration_b);
+
+        assert!(pool_a.capacity_bytes() >= 800);
+        assert_eq!(pool_a.capacity_bytes() + pool_b.capacity_bytes(), 1_000);
+        assert!(!pool_b.try_reserve_minimum_capacity(300).unwrap());
+        assert!(pool_a.capacity_bytes() >= 800);
+        assert_eq!(pool_a.capacity_bytes() + pool_b.capacity_bytes(), 1_000);
+
+        let reserve = Arc::new(SystemReserve::new(arbitrator.clone()));
+        assert!(reserve
+            .try_acquire(SystemReserveClass::Maintenance, 201)
+            .is_err());
+        assert_eq!(arbitrator.system_reserve_bytes(), 0);
+    }
+
+    #[test]
     fn admitted_capacity_floor_survives_later_query_registration() {
         let arbitrator = Arc::new(MemoryArbitrator::new(1_000));
         let pool_a = Arc::new(QueryMemoryPool::new(1_000));

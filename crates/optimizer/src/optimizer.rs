@@ -300,7 +300,7 @@ impl Optimizer {
         // grant-aware physical cost model jointly chooses order and algorithm.
         let mut join_region_alternatives = Vec::new();
         let base_alternative_count = alternatives.len();
-        for alternative in &mut alternatives {
+        'base_alternatives: for alternative in &mut alternatives {
             if !contains_multiway_join_region(&alternative.plan) {
                 continue;
             }
@@ -360,7 +360,7 @@ impl Optimizer {
                 if base_alternative_count.saturating_add(join_region_alternatives.len())
                     >= self.budget.max_optional_logical_exprs_per_group as usize + 1
                 {
-                    break;
+                    break 'base_alternatives;
                 }
             }
         }

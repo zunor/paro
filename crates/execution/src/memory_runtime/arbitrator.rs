@@ -83,7 +83,12 @@ impl MemoryArbitrator {
             .queries
             .retain(|_, entry| entry.target.upgrade().is_some());
         let query_floor = registry.queries.values().fold(0usize, |total, entry| {
-            total.saturating_add(entry.minimum_capacity_bytes)
+            let issued = entry
+                .target
+                .upgrade()
+                .map(|target| target.issued_bytes())
+                .unwrap_or(0);
+            total.saturating_add(issued.max(entry.minimum_capacity_bytes))
         });
         let available = self.available_for_queries().saturating_sub(query_floor);
         if bytes > available {
@@ -392,6 +397,79 @@ impl QueryMemoryCoordinator for MemoryArbitrator {
         query_id: u64,
         minimum_bytes: usize,
     ) -> MemoryResult<bool> {
+        // A reservation is a transaction over live ownership, not just the
+        // requested floor metadata.  First reclaim peers synchronously when
+        // their issued bytes would otherwise make the invariant impossible;
+        // only then publish the new floor under the registry lock.
+        let peers = {
+            let mut registry = self
+                .registry
+                .lock()
+                .expect("query memory registry lock poisoned");
+            registry
+                .queries
+                .retain(|_, entry| entry.target.upgrade().is_some());
+            let Some(entry) = registry.queries.get(&query_id) else {
+                return Ok(false);
+            };
+            if minimum_bytes > entry.spec.desired_bytes() {
+                return Ok(false);
+            }
+            let effective_total = registry.queries.iter().fold(0usize, |total, (id, entry)| {
+                let issued = entry
+                    .target
+                    .upgrade()
+                    .map(|target| target.issued_bytes())
+                    .unwrap_or(0);
+                let floor = if *id == query_id {
+                    minimum_bytes
+                } else {
+                    entry.minimum_capacity_bytes
+                };
+                total.saturating_add(issued.max(floor))
+            });
+            let deficit = effective_total.saturating_sub(self.available_for_queries());
+            if deficit == 0 {
+                Vec::new()
+            } else {
+                let mut peers = registry
+                    .queries
+                    .iter()
+                    .filter_map(|(id, entry)| {
+                        (*id != query_id).then(|| {
+                            entry.target.upgrade().map(|target| {
+                                let reclaimable = target.reclaimable_bytes().min(
+                                    target
+                                        .issued_bytes()
+                                        .saturating_sub(entry.minimum_capacity_bytes),
+                                );
+                                (reclaimable, target)
+                            })
+                        })?
+                    })
+                    .filter(|(reclaimable, _)| *reclaimable > 0)
+                    .collect::<Vec<_>>();
+                peers.sort_by(|left, right| right.0.cmp(&left.0));
+                peers
+            }
+        };
+
+        let mut remaining = {
+            let registry = self
+                .registry
+                .lock()
+                .expect("query memory registry lock poisoned");
+            effective_floor_total(&registry, Some((query_id, minimum_bytes)))
+                .saturating_sub(self.available_for_queries())
+        };
+        for (reclaimable, peer) in peers {
+            if remaining == 0 {
+                break;
+            }
+            let reclaimed = peer.reclaim(remaining.min(reclaimable))?;
+            remaining = remaining.saturating_sub(reclaimed);
+        }
+
         let mut registry = self
             .registry
             .lock()
@@ -402,17 +480,10 @@ impl QueryMemoryCoordinator for MemoryArbitrator {
         let Some(entry) = registry.queries.get(&query_id) else {
             return Ok(false);
         };
-        if minimum_bytes > entry.spec.desired_bytes() {
-            return Ok(false);
-        }
-        let other_floors = registry
-            .queries
-            .iter()
-            .filter(|(id, _)| **id != query_id)
-            .fold(0usize, |total, (_, entry)| {
-                total.saturating_add(entry.minimum_capacity_bytes)
-            });
-        if other_floors.saturating_add(minimum_bytes) > self.available_for_queries() {
+        if minimum_bytes > entry.spec.desired_bytes()
+            || effective_floor_total(&registry, Some((query_id, minimum_bytes)))
+                > self.available_for_queries()
+        {
             return Ok(false);
         }
         registry
@@ -455,8 +526,9 @@ fn compute_fair_shares(
     let mut floors = HashMap::new();
     let mut floor_total = 0usize;
     let mut residual_total = 0usize;
-    for (spec, floor, _) in live {
-        let floor = (*floor).min(spec.desired_bytes());
+    for (spec, floor, target) in live {
+        let issued = target.issued_bytes();
+        let floor = (*floor).max(issued).min(spec.desired_bytes());
         floors.insert(spec.query_id, floor);
         floor_total = floor_total.saturating_add(floor);
         residual_total = residual_total.saturating_add(spec.desired_bytes().saturating_sub(floor));
@@ -520,6 +592,21 @@ fn compute_fair_shares(
         shares.entry(query_id).or_insert(floor);
     }
     shares
+}
+
+fn effective_floor_total(registry: &QueryRegistry, replacement: Option<(u64, usize)>) -> usize {
+    registry.queries.iter().fold(0usize, |total, (id, entry)| {
+        let issued = entry
+            .target
+            .upgrade()
+            .map(|target| target.issued_bytes())
+            .unwrap_or(0);
+        let floor = replacement
+            .filter(|(replacement_id, _)| replacement_id == id)
+            .map(|(_, floor)| floor)
+            .unwrap_or(entry.minimum_capacity_bytes);
+        total.saturating_add(issued.max(floor))
+    })
 }
 
 fn distribute_capped<K>(total: usize, inputs: &[(K, usize, usize)]) -> HashMap<K, usize>
