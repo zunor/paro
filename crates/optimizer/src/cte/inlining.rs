@@ -2,7 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use paro_planner::binder::context::BindContext;
-use paro_planner::binder::deep_copy::deep_copy_plan;
+use paro_planner::binder::deep_copy::deep_copy_plan_preserving_statistics;
 use paro_planner::binder::ir::CTEMaterialize;
 use paro_planner::expression::{ColumnRefExpression, Expression};
 use paro_planner::operator::{LogicalOperator, Projection};
@@ -52,6 +52,27 @@ impl<'a> CTEInlining<'a> {
 
     pub fn optimize_plan_with_change(&mut self, plan: LogicalPlan) -> (LogicalPlan, bool) {
         self.rewrite_plan(plan)
+    }
+
+    /// Produce the alternative for one shared-plan owner without rewriting
+    /// nested owners. Memo combines this local choice with each child group's
+    /// winner; recursively rewriting here would collapse independent sharing
+    /// decisions into only "all inline" and "all materialized" shapes.
+    pub fn optimize_root_with_change(&mut self, plan: LogicalPlan) -> (LogicalPlan, bool) {
+        let LogicalPlan {
+            id,
+            stats,
+            operator,
+        } = plan;
+        let (operator, changed) = self.try_inline(operator);
+        (
+            LogicalPlan {
+                id,
+                stats,
+                operator,
+            },
+            changed,
+        )
     }
 
     fn rewrite_plan(&mut self, plan: LogicalPlan) -> (LogicalPlan, bool) {
@@ -199,7 +220,8 @@ fn inline_copied_references(
 ) -> usize {
     if let LogicalOperator::CTERef(cte_ref) = op {
         if cte_ref.cte_index == cte_index {
-            let copied = deep_copy_plan(definition, bind_context.shared().as_ref());
+            let copied =
+                deep_copy_plan_preserving_statistics(definition, bind_context.shared().as_ref());
             *op = projection_for_cte_ref(
                 cte_ref.table_index,
                 cte_ref.relation_alias.clone(),
@@ -364,5 +386,54 @@ mod tests {
             optimized.operator,
             LogicalOperator::MaterializedCTE(_)
         ));
+    }
+
+    #[test]
+    fn memo_root_choice_preserves_an_independent_nested_owner() {
+        let bind_context = BindContext::new();
+        let nested = LogicalPlan::new(
+            &bind_context,
+            LogicalOperator::MaterializedCTE(MaterializedCTE::new(
+                20,
+                "nested".to_string(),
+                vec!["v".to_string()],
+                vec![LogicalType::Integer],
+                CTEMaterialize::Default,
+                cte_ref(&bind_context, 10, 2),
+                LogicalPlan::new(
+                    &bind_context,
+                    LogicalOperator::Join(Join::Cross(CrossProduct {
+                        left: Box::new(cte_ref(&bind_context, 20, 3)),
+                        right: Box::new(cte_ref(&bind_context, 20, 4)),
+                    })),
+                ),
+            )),
+        );
+        let outer = LogicalPlan::new(
+            &bind_context,
+            LogicalOperator::MaterializedCTE(MaterializedCTE::new(
+                10,
+                "outer".to_string(),
+                vec!["v".to_string()],
+                vec![LogicalType::Integer],
+                CTEMaterialize::Default,
+                values(&bind_context, 1, &[1, 2, 3]),
+                nested,
+            )),
+        );
+
+        let (optimized, changed) = CTEInlining::new(&bind_context).optimize_root_with_change(outer);
+
+        assert!(changed);
+        let LogicalOperator::MaterializedCTE(nested) = &optimized.operator else {
+            panic!("nested owner must remain a Memo choice")
+        };
+        assert_eq!(nested.cte_index, 20);
+        assert!(!matches!(
+            nested.cte_query.operator,
+            LogicalOperator::CTERef(_)
+        ));
+        verify_logical_plan(&bind_context, &optimized)
+            .expect("local CTE alternative should verify");
     }
 }

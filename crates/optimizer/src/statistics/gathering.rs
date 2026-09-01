@@ -355,7 +355,16 @@ impl StatisticsGathering {
                 Some(estimate)
             }
             LogicalOperator::CTERef(cte_ref) => {
-                self.cte_cardinality.get(&cte_ref.cte_index).copied()
+                // A transformation may optimize an inner shared-plan region
+                // independently from an owner in an enclosing Memo group.
+                // Alpha-renaming preserves the owner's cardinality summary on
+                // the reference; use it only when this estimator instance has
+                // no locally published producer. Cardinality is an estimate,
+                // never a correctness proof.
+                self.cte_cardinality
+                    .get(&cte_ref.cte_index)
+                    .copied()
+                    .or(plan.stats.estimated_cardinality)
             }
             LogicalOperator::SearchScan(search) => {
                 Some(self.estimate_search_scan_cardinality(search, ctx))
@@ -1450,6 +1459,33 @@ mod tests {
             cte.child.stats.estimated_cardinality,
             Some(CardinalityEstimate::exact(37))
         );
+        assert_eq!(
+            gathered.stats.estimated_cardinality,
+            Some(CardinalityEstimate::exact(37))
+        );
+    }
+
+    #[test]
+    fn detached_cte_reference_retains_its_owner_cardinality_summary() {
+        let bind_context = BindContext::new();
+        let session = make_test_session();
+        let mut ctx = OptimizationContext::new(session, bind_context.clone());
+        let mut reference = LogicalPlan::new(
+            &bind_context,
+            LogicalOperator::CTERef(CTERef::new(
+                9,
+                2,
+                "shared".to_string(),
+                vec!["v".to_string()],
+                vec![LogicalType::BigInt],
+            )),
+        );
+        reference.stats.estimated_cardinality = Some(CardinalityEstimate::exact(37));
+
+        let gathered = StatisticsGathering::new()
+            .gather(reference, &mut ctx)
+            .expect("detached reference should retain its summary");
+
         assert_eq!(
             gathered.stats.estimated_cardinality,
             Some(CardinalityEstimate::exact(37))

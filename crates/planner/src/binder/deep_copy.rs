@@ -32,6 +32,23 @@ pub fn deep_copy_plan(plan: &LogicalPlan, bind_shared: &BindShared) -> LogicalPl
     copier.deep_copy(bind_shared, plan)
 }
 
+/// Alpha-rename a logical plan while retaining binding-independent node
+/// cardinality summaries.
+///
+/// This is intended for semantic alternatives whose copied subtree may refer
+/// to a shared-plan owner outside the copied boundary. Ordinary deep copies
+/// clear statistics so the caller cannot accidentally reuse stale annotations;
+/// callers of this API must immediately run the estimator again. The retained
+/// summaries are then used only when that estimator cannot resolve an external
+/// owner locally.
+pub fn deep_copy_plan_preserving_statistics(
+    plan: &LogicalPlan,
+    bind_shared: &BindShared,
+) -> LogicalPlan {
+    let mut copier = LogicalPlanDeepCopy::new_deep_preserving_statistics();
+    copier.deep_copy(bind_shared, plan)
+}
+
 /// Deep-copy an operator tree (no outer [`LogicalPlan`] wrapper). Nested [`LogicalPlan`] nodes
 /// receive fresh plan ids; table / CTE indices are remapped like [`deep_copy_plan`].
 pub fn deep_copy_operator(op: &LogicalOperator, bind_shared: &BindShared) -> LogicalOperator {
@@ -167,6 +184,16 @@ impl LogicalPlanDeepCopy {
             table_index_map: HashMap::new(),
             cte_index_map: HashMap::new(),
             preserve_logical_indices: true,
+            preserve_statistics: true,
+            nested_subquery_copy_mode: NestedSubqueryCopyMode::Deep,
+        }
+    }
+
+    fn new_deep_preserving_statistics() -> Self {
+        Self {
+            table_index_map: HashMap::new(),
+            cte_index_map: HashMap::new(),
+            preserve_logical_indices: false,
             preserve_statistics: true,
             nested_subquery_copy_mode: NestedSubqueryCopyMode::Deep,
         }
@@ -906,7 +933,10 @@ impl DeepCopyBindingRewriter {
 mod tests {
     use paro_common::types::LogicalType;
 
-    use super::{deep_copy_plan, duplicate_plan_preserving_indices, fork_plan_preserving_indices};
+    use super::{
+        deep_copy_plan, deep_copy_plan_preserving_statistics, duplicate_plan_preserving_indices,
+        fork_plan_preserving_indices,
+    };
     use crate::binder::context::BindContext;
     use crate::binder::ir::CTEMaterialize;
     use crate::expression::{
@@ -972,6 +1002,39 @@ mod tests {
             panic!("expected column ref");
         };
         assert_eq!(column_ref.binding.table_index, expr_get.table_index);
+    }
+
+    #[test]
+    fn statistics_preserving_copy_rebinds_indices_without_dropping_cardinality() {
+        let bind_context = BindContext::new();
+        let original = LogicalPlan {
+            id: PlanNodeId(99),
+            stats: NodeStats {
+                estimated_cardinality: Some(CardinalityEstimate::exact(123)),
+                ..NodeStats::default()
+            },
+            operator: LogicalOperator::Projection(Projection::new(
+                11,
+                LogicalPlan::new(&bind_context, expression_get(7)),
+                vec![Expression::ColumnRef(ColumnRefExpression::new(
+                    crate::operator::ColumnBinding::new(7, 0),
+                    LogicalType::Integer,
+                ))],
+            )),
+        };
+
+        let copy = deep_copy_plan_preserving_statistics(&original, bind_context.shared().as_ref());
+
+        assert_ne!(copy.id, original.id);
+        assert_eq!(copy.stats, original.stats);
+        let LogicalOperator::Projection(copy) = copy.operator else {
+            panic!("expected projection")
+        };
+        assert_ne!(copy.table_index, 11);
+        let LogicalOperator::ExpressionGet(input) = copy.child.operator else {
+            panic!("expected expression get")
+        };
+        assert_ne!(input.table_index, 7);
     }
 
     #[test]

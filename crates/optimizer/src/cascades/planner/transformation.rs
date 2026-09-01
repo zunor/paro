@@ -395,7 +395,7 @@ fn rewrite_planner_expression(
         }
         PlannerTransformation::CteInline => {
             let (plan, changed) =
-                CTEInlining::new(&environment.bind_context).optimize_plan_with_change(plan);
+                CTEInlining::new(&environment.bind_context).optimize_root_with_change(plan);
             if !changed {
                 return Ok(None);
             }
