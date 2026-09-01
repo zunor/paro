@@ -91,6 +91,21 @@ impl<'a> PipelineLowerer<'a> {
             self.handles.add_consumer(source.handle, consumer)?;
         } else if let SourceSpec::RecursiveTableScan(source) = source {
             self.handles.add_consumer(source.handle, consumer)?;
+        } else if let SourceSpec::Rowset(source) = source {
+            for filter in &source.dynamic_runtime_filters {
+                self.handles.add_consumer(filter.handle, consumer)?;
+                let producer = self.handles.producer(filter.handle)?.ok_or_else(|| {
+                    paro_error::internal("runtime-filter handle has no producer pipeline")
+                })?;
+                let dependency = PipelineDependency {
+                    producer,
+                    consumer,
+                    kind: DependencyKind::BuildBeforeProbe,
+                };
+                if !dependencies.contains(&dependency) {
+                    dependencies.push(dependency);
+                }
+            }
         }
         Ok(())
     }

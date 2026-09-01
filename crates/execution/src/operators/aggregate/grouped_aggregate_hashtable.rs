@@ -349,6 +349,12 @@ impl GroupedAggregateHashTable {
         self.aggregate_return_types.len()
     }
 
+    pub(crate) fn fuse_disjoint_filter_group(&mut self, filter_inputs: &[usize]) -> bool {
+        self.direct_update_program
+            .as_mut()
+            .is_some_and(|program| program.fuse_disjoint_filter_group(filter_inputs))
+    }
+
     pub fn with_capacity(
         group_types: Vec<LogicalType>,
         aggregate_objects: Vec<AggregateObject>,

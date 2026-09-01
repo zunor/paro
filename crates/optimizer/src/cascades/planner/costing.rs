@@ -119,25 +119,35 @@ pub(super) fn supports_runtime_filter_auxiliary(
     ) {
         return false;
     }
-    fn probe_lineage<'a>(
+    struct ProbeLineage<'a> {
+        get: &'a paro_planner::operator::Get,
+        output: Vec<Option<usize>>,
+    }
+
+    fn probe_lineages<'a>(
         plan: &'a LogicalPlan,
         rowset_scan_pushdown: bool,
-    ) -> Option<(&'a paro_planner::operator::Get, Vec<Option<usize>>)> {
+    ) -> Option<Vec<ProbeLineage<'a>>> {
         match &plan.operator {
-            LogicalOperator::Get(get) => {
-                Some((get, (0..get.returned_types.len()).map(Some).collect()))
-            }
+            LogicalOperator::Get(get) => Some(vec![ProbeLineage {
+                get,
+                output: (0..get.returned_types.len()).map(Some).collect(),
+            }]),
             LogicalOperator::Filter(filter) if rowset_scan_pushdown => {
-                let (get, child_lineage) = probe_lineage(&filter.child, rowset_scan_pushdown)?;
+                let mut lineages = probe_lineages(&filter.child, rowset_scan_pushdown)?;
+                if lineages.len() != 1 {
+                    return None;
+                }
+                let lineage = &mut lineages[0];
                 let filter_is_fully_pushable = [
                     filter.expressions.as_slice(),
-                    get.runtime_filter_expressions.as_slice(),
+                    lineage.get.runtime_filter_expressions.as_slice(),
                 ]
                 .into_iter()
                 .all(|expressions| {
                     crate::physical::extraction::predicate_builder::build_predicate_tree(
                         expressions,
-                        get,
+                        lineage.get,
                     )
                     .is_ok_and(|(_, residual)| residual.is_empty())
                 });
@@ -145,32 +155,45 @@ pub(super) fn supports_runtime_filter_auxiliary(
                     return None;
                 }
                 let projection = filter.projection_map.to_indices(filter.child.types().len());
-                Some((
-                    get,
-                    projection
-                        .into_iter()
-                        .map(|index| child_lineage.get(index).copied().flatten())
-                        .collect(),
-                ))
+                lineage.output = projection
+                    .into_iter()
+                    .map(|index| lineage.output.get(index).copied().flatten())
+                    .collect();
+                Some(lineages)
             }
             LogicalOperator::Projection(projection) => {
-                let (get, child_lineage) = probe_lineage(&projection.child, rowset_scan_pushdown)?;
+                let mut lineages = probe_lineages(&projection.child, rowset_scan_pushdown)?;
                 let child_bindings = projection.child.get_column_bindings();
-                let lineage = projection
-                    .expressions
+                for lineage in &mut lineages {
+                    lineage.output = projection
+                        .expressions
+                        .iter()
+                        .map(|expression| {
+                            let child_index = match expression {
+                                Expression::ColumnRef(column) if column.depth == 0 => {
+                                    child_bindings
+                                        .iter()
+                                        .position(|binding| *binding == column.binding)
+                                }
+                                Expression::Reference(reference) => Some(reference.index),
+                                _ => None,
+                            }?;
+                            lineage.output.get(child_index).copied().flatten()
+                        })
+                        .collect();
+                }
+                Some(lineages)
+            }
+            LogicalOperator::SetOperation(setop)
+                if setop.setop_type == paro_planner::operator::SetOpType::Union
+                    && setop.setop_all =>
+            {
+                let mut lineages = probe_lineages(&setop.left, rowset_scan_pushdown)?;
+                lineages.extend(probe_lineages(&setop.right, rowset_scan_pushdown)?);
+                lineages
                     .iter()
-                    .map(|expression| {
-                        let child_index = match expression {
-                            Expression::ColumnRef(column) if column.depth == 0 => child_bindings
-                                .iter()
-                                .position(|binding| *binding == column.binding),
-                            Expression::Reference(reference) => Some(reference.index),
-                            _ => None,
-                        }?;
-                        child_lineage.get(child_index).copied().flatten()
-                    })
-                    .collect::<Vec<_>>();
-                Some((get, lineage))
+                    .all(|lineage| lineage.output.len() == setop.column_count)
+                    .then_some(lineages)
             }
             // A CTE reference is not a rowset consumer. Crossing it requires
             // one AuxiliaryPlanRegion jointly owned by the CTE producer,
@@ -181,10 +204,10 @@ pub(super) fn supports_runtime_filter_auxiliary(
         }
     }
 
-    let Some((get, output_lineage)) = probe_lineage(&join.left, rowset_scan_pushdown) else {
+    let Some(lineages) = probe_lineages(&join.left, rowset_scan_pushdown) else {
         return false;
     };
-    if get.table.is_none() {
+    if lineages.is_empty() || lineages.iter().any(|lineage| lineage.get.table.is_none()) {
         return false;
     }
     let probe_bindings = join.left.get_column_bindings();
@@ -199,9 +222,16 @@ pub(super) fn supports_runtime_filter_auxiliary(
             Expression::Reference(reference) => Some(reference.index),
             _ => None,
         };
-        output_index
-            .and_then(|index| output_lineage.get(index).copied().flatten())
-            .is_some_and(|get_index| get.stored_column(get_index).is_some())
+        output_index.is_some_and(|index| {
+            lineages.iter().all(|lineage| {
+                lineage
+                    .output
+                    .get(index)
+                    .copied()
+                    .flatten()
+                    .is_some_and(|get_index| lineage.get.stored_column(get_index).is_some())
+            })
+        })
     })
 }
 

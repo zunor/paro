@@ -30,8 +30,8 @@ mod identity;
 
 use fingerprint::ExpressionFingerprintCatalog;
 pub use fingerprint::{expression_fingerprint, expression_list_fingerprints};
-use fusion::compile_decimal_factor_chains;
-pub use fusion::PhysicalDecimalFactorChain;
+use fusion::{compile_decimal_factor_chains, compile_varchar_equality_dispatches};
+pub use fusion::{PhysicalDecimalFactorChain, PhysicalVarcharEqualityDispatch};
 use identity::{
     ExpressionIdentity, ExpressionIdentityRef, ExpressionIdentityRefMap, ExpressionIdentityRefSet,
 };
@@ -363,6 +363,7 @@ pub struct PhysicalExpressionProgram {
     roots: Vec<PhysicalExpression>,
     shared_nodes: Vec<PhysicalExpression>,
     decimal_factor_chains: Vec<PhysicalDecimalFactorChain>,
+    varchar_equality_dispatches: Vec<PhysicalVarcharEqualityDispatch>,
     scratch_layout: ExpressionScratchLayout,
     root_to_unique: Vec<usize>,
     root_first_output: Vec<usize>,
@@ -448,10 +449,13 @@ impl PhysicalExpressionProgram {
             &root_to_unique,
             &root_first_output,
         );
+        let varchar_equality_dispatches =
+            compile_varchar_equality_dispatches(&roots, &root_to_unique, &root_first_output);
         Self {
             roots,
             shared_nodes,
             decimal_factor_chains,
+            varchar_equality_dispatches,
             scratch_layout: ExpressionScratchLayout {
                 slots: compiler.scratch_slots.into_boxed_slice(),
             },
@@ -500,6 +504,11 @@ impl PhysicalExpressionProgram {
     #[inline]
     pub fn decimal_factor_chains(&self) -> &[PhysicalDecimalFactorChain] {
         &self.decimal_factor_chains
+    }
+
+    #[inline]
+    pub fn varchar_equality_dispatches(&self) -> &[PhysicalVarcharEqualityDispatch] {
+        &self.varchar_equality_dispatches
     }
 
     #[inline]

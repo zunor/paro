@@ -384,17 +384,17 @@ impl PhysicalPlanExtractor {
                     "runtime-filter hash join must have probe and build children",
                 ));
             };
-            let consumer = runtime_filter_probe_scan(&self.arena, &self.children, *probe)
-                .ok_or_else(|| {
-                    paro_error::internal(
-                        "runtime-filter candidate has no row-preserving rowset-scan consumer",
-                    )
-                })?;
+            let consumers = runtime_filter_probe_scans(&self.arena, &self.children, *probe);
+            if consumers.is_empty() {
+                return Err(paro_error::internal(
+                    "runtime-filter candidate has no row-preserving rowset-scan consumer",
+                ));
+            }
             spec.runtime_filter = Some(HashJoinRuntimeFilterSpec {
                 artifact,
                 wait_policy: RuntimeFilterWaitPolicy::WaitComplete,
             });
-            Some((*build, consumer, artifact))
+            Some((*build, consumers, artifact))
         } else {
             None
         };
@@ -433,18 +433,20 @@ impl PhysicalPlanExtractor {
             properties.origin = contract.origin;
             properties.winner_goal = contract.goal_fingerprint;
         }
-        if let Some((producer, consumer, artifact)) = runtime_filter_edge {
-            let edge = self.edges.push(
-                producer,
-                consumer,
-                PhysicalEdgeKind::RuntimeFilter(artifact),
-            );
-            let properties = self.properties.get_mut(consumer).ok_or_else(|| {
-                paro_error::internal("runtime-filter consumer has no property contract")
-            })?;
-            let mut dependencies = properties.auxiliary_dependencies.to_vec();
-            dependencies.push(edge.0);
-            properties.auxiliary_dependencies = dependencies.into_boxed_slice();
+        if let Some((producer, consumers, artifact)) = runtime_filter_edge {
+            for consumer in consumers {
+                let edge = self.edges.push(
+                    producer,
+                    consumer,
+                    PhysicalEdgeKind::RuntimeFilter(artifact),
+                );
+                let properties = self.properties.get_mut(consumer).ok_or_else(|| {
+                    paro_error::internal("runtime-filter consumer has no property contract")
+                })?;
+                let mut dependencies = properties.auxiliary_dependencies.to_vec();
+                dependencies.push(edge.0);
+                properties.auxiliary_dependencies = dependencies.into_boxed_slice();
+            }
         }
         self.apply_extracted_enforcers(logical, id)
     }
@@ -623,23 +625,33 @@ impl PhysicalPlanExtractor {
     }
 }
 
-fn runtime_filter_probe_scan(
+fn runtime_filter_probe_scans(
     arena: &PhysicalPlanNodeArena,
     children: &PlanChildrenArena,
-    mut node: PhysicalPlanNodeId,
-) -> Option<PhysicalPlanNodeId> {
-    loop {
-        let current = arena.get(node)?;
-        match &current.kind {
-            PhysicalNodeKind::RowsetScan(_) => return Some(node),
-            PhysicalNodeKind::Project(_) | PhysicalNodeKind::Filter(_) => {
-                let [child] = current.children.as_slice(children) else {
-                    return None;
-                };
-                node = *child;
-            }
-            _ => return None,
+    node: PhysicalPlanNodeId,
+) -> Vec<PhysicalPlanNodeId> {
+    let Some(current) = arena.get(node) else {
+        return Vec::new();
+    };
+    match &current.kind {
+        PhysicalNodeKind::RowsetScan(_) => vec![node],
+        PhysicalNodeKind::Project(_) | PhysicalNodeKind::Filter(_) => {
+            let [child] = current.children.as_slice(children) else {
+                return Vec::new();
+            };
+            runtime_filter_probe_scans(arena, children, *child)
         }
+        PhysicalNodeKind::SetOperation(spec)
+            if spec.op == paro_planner::operator::SetOpType::Union && spec.all =>
+        {
+            current
+                .children
+                .as_slice(children)
+                .iter()
+                .flat_map(|child| runtime_filter_probe_scans(arena, children, *child))
+                .collect()
+        }
+        _ => Vec::new(),
     }
 }
 

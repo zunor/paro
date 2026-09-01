@@ -22,6 +22,7 @@ struct DirectDecimalInputUpdates {
     input_index: usize,
     width: DirectDecimalWidth,
     sums: DirectDecimalSums,
+    sums_are_disjoint: bool,
     averages: Vec<DirectStateUpdate>,
 }
 
@@ -269,6 +270,7 @@ impl DirectGroupedAggregateProgram {
                         input_index,
                         width,
                         sums: DirectDecimalSums::None,
+                        sums_are_disjoint: false,
                         averages: Vec::new(),
                     });
                     self.decimal_inputs
@@ -300,6 +302,45 @@ impl DirectGroupedAggregateProgram {
         self.update_count += 1;
         self.all_states_trivially_copyable &= state_is_trivially_copyable;
         true
+    }
+
+    /// Fuse a planner-proven set of mutually exclusive Boolean filter inputs.
+    ///
+    /// A decimal source whose sum updates are all guarded by distinct members
+    /// of this set can stop after the first passing filter. The proof is based
+    /// on physical payload indices; the program maps those indices to its
+    /// compact internal filter slots before enabling the fast path.
+    pub fn fuse_disjoint_filter_group(&mut self, filter_inputs: &[usize]) -> bool {
+        if filter_inputs.len() < 3 {
+            return false;
+        }
+        let registered_filters = &self.filter_inputs;
+        let mut changed = false;
+        for source in &mut self.decimal_inputs {
+            let updates = match &source.sums {
+                DirectDecimalSums::Narrow(updates) | DirectDecimalSums::Wide(updates) => updates,
+                DirectDecimalSums::None => continue,
+            };
+            if updates.len() < 3
+                || updates.iter().any(|update| {
+                    update.filter_slot.is_none_or(|slot| {
+                        registered_filters
+                            .get(slot)
+                            .is_none_or(|input| !filter_inputs.contains(input))
+                    })
+                })
+                || updates.iter().enumerate().any(|(index, update)| {
+                    updates[..index]
+                        .iter()
+                        .any(|candidate| candidate.filter_slot == update.filter_slot)
+                })
+            {
+                continue;
+            }
+            source.sums_are_disjoint = true;
+            changed = true;
+        }
+        changed
     }
 
     pub fn has_updates(&self) -> bool {
@@ -554,6 +595,9 @@ impl DirectGroupedAggregateProgram {
                                     &mut *base.add(update.state_offset).cast::<DecimalNarrowState>()
                                 };
                                 state.add_i64(value);
+                                if source.sums_are_disjoint {
+                                    break;
+                                }
                             }
                         }
                         for update in &source.averages {
@@ -578,6 +622,9 @@ impl DirectGroupedAggregateProgram {
                                     &mut *base.add(update.state_offset).cast::<DecimalSumState>()
                                 };
                                 state.add_direct_i128(value);
+                                if source.sums_are_disjoint {
+                                    break;
+                                }
                             }
                         }
                         for update in &source.averages {

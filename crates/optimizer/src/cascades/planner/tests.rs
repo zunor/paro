@@ -15,8 +15,8 @@ use paro_planner::expression::{
 };
 use paro_planner::operator::join::{Join, JoinCondition, JoinType};
 use paro_planner::operator::{
-    CTERef, ComparisonJoin, EmptyResult, ExpressionGet, Filter, Get, GraphScan, Projection, TopN,
-    Window as LogicalWindow,
+    CTERef, ComparisonJoin, EmptyResult, ExpressionGet, Filter, Get, GraphScan, Projection,
+    SetOperation, TopN, Window as LogicalWindow,
 };
 use paro_planner::plan::CardinalityEstimate;
 use paro_storage::table::table_factory::TableFactory;
@@ -791,6 +791,77 @@ fn passthrough_projection_keeps_the_runtime_filter_consumer_lineage() {
             .unwrap();
     crate::physical::PhysicalPlanVerifier::verify(&physical).unwrap();
     assert!(physical.edges.iter().any(|edge| matches!(
+        physical.node(edge.consumer).kind,
+        crate::physical::PhysicalNodeKind::RowsetScan(_)
+    )));
+}
+
+#[test]
+fn union_all_probe_owns_one_runtime_filter_with_two_scan_consumers() {
+    let mut first = test_base_get(0, 20_021, "first_probe", 10_000);
+    first.stats.estimated_cardinality = Some(CardinalityEstimate::exact(10_000));
+    let mut second = test_base_get(1, 20_022, "second_probe", 10_000);
+    second.stats.estimated_cardinality = Some(CardinalityEstimate::exact(10_000));
+    let mut union = LogicalPlan::synthetic(LogicalOperator::SetOperation(SetOperation::union(
+        2,
+        first,
+        second,
+        true,
+        vec![LogicalType::Integer],
+    )));
+    union.stats.estimated_cardinality = Some(CardinalityEstimate::exact(20_000));
+    let mut build = test_base_get(3, 20_023, "build", 20);
+    build.stats.estimated_cardinality = Some(CardinalityEstimate::exact(20));
+    let join = ComparisonJoin::new(
+        JoinType::Inner,
+        union,
+        build,
+        vec![JoinCondition::equality(
+            Expression::Reference(ReferenceExpression::new(0, LogicalType::Integer)),
+            Expression::Reference(ReferenceExpression::new(0, LogicalType::Integer)),
+        )],
+    );
+    assert!(supports_runtime_filter_auxiliary(&join, true));
+    let mut plan = LogicalPlan::synthetic(LogicalOperator::Join(Join::Comparison(join)));
+    plan.stats.estimated_cardinality = Some(CardinalityEstimate::exact(20));
+
+    let mut budget = SearchBudget::default();
+    budget.max_composite_region_groups = 8;
+    let input = MemoBuilder::build(plan, BindContext::new(), budget).unwrap();
+    let optimized = input
+        .optimize(&test_grant_classes())
+        .unwrap()
+        .variants
+        .into_vec()
+        .remove(0);
+    assert_eq!(
+        optimized
+            .contracts
+            .get(&optimized.plan.id)
+            .unwrap()
+            .implementation,
+        PhysicalImplementationFlavor::HashJoinRuntimeFilter
+    );
+    let physical =
+        crate::physical::PhysicalPlanExtractor::new(crate::physical::ExtractionContext::default())
+            .with_winner_contracts(optimized.contracts)
+            .with_enforcer_contracts(optimized.enforcers)
+            .requiring_winner_contracts()
+            .extract(&optimized.plan)
+            .unwrap();
+    crate::physical::PhysicalPlanVerifier::verify(&physical).unwrap();
+    let edges = physical
+        .edges
+        .iter()
+        .filter(|edge| {
+            matches!(
+                edge.kind,
+                crate::physical::PhysicalEdgeKind::RuntimeFilter(_)
+            )
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(edges.len(), 2);
+    assert!(edges.iter().all(|edge| matches!(
         physical.node(edge.consumer).kind,
         crate::physical::PhysicalNodeKind::RowsetScan(_)
     )));

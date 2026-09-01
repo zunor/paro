@@ -15,10 +15,9 @@ impl<'a> PipelineLowerer<'a> {
             match &node.kind {
                 PhysicalNodeKind::RowsetScan(spec) => {
                     transforms.reverse();
-                    return Ok((
-                        SourceSpec::Rowset(RowsetSourceSpec::new(spec.clone())),
-                        transforms,
-                    ));
+                    let mut source = RowsetSourceSpec::new(spec.clone());
+                    self.attach_owned_hash_join_runtime_filters(current, &mut source)?;
+                    return Ok((SourceSpec::Rowset(source), transforms));
                 }
                 PhysicalNodeKind::Values(spec) => {
                     transforms.reverse();

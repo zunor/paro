@@ -482,10 +482,23 @@ impl<'a> PipelineLowerer<'a> {
             dependencies,
         )?;
         self.handles.set_producer(handle, producer)?;
+        if let Some(runtime_filter) = spec.runtime_filter {
+            if self
+                .runtime_filter_handles
+                .insert(runtime_filter.artifact, handle)
+                .is_some()
+                || self
+                    .runtime_filter_owners
+                    .insert(runtime_filter.artifact, root)
+                    .is_some()
+            {
+                return Err(paro_error::internal(
+                    "runtime-filter artifact was assigned more than one build handle",
+                ));
+            }
+        }
 
         let mut chain = self.collect_probe_roles(*left, pipelines, dependencies)?;
-        chain.source =
-            self.attach_hash_join_runtime_filters(chain.source, &chain.transforms, handle, spec);
         chain
             .transforms
             .push(hash_join_probe_transform(handle, spec));
@@ -633,11 +646,14 @@ impl<'a> PipelineLowerer<'a> {
         self.add_source_handle_dependencies(&source_handles, primary.entry, dependencies)?;
         for pending in &chain.pending_builds {
             self.handles.add_consumer(pending.handle, primary.entry)?;
-            dependencies.push(PipelineDependency {
+            let dependency = PipelineDependency {
                 producer: pending.producer,
                 consumer: primary.entry,
                 kind: pending.kind,
-            });
+            };
+            if !dependencies.contains(&dependency) {
+                dependencies.push(dependency);
+            }
         }
 
         let mut tail = primary.tail;
@@ -745,14 +761,23 @@ impl<'a> PipelineLowerer<'a> {
                     dependencies,
                 )?;
                 self.handles.set_producer(handle, producer)?;
+                if let Some(runtime_filter) = spec.runtime_filter {
+                    if self
+                        .runtime_filter_handles
+                        .insert(runtime_filter.artifact, handle)
+                        .is_some()
+                        || self
+                            .runtime_filter_owners
+                            .insert(runtime_filter.artifact, root)
+                            .is_some()
+                    {
+                        return Err(paro_error::internal(
+                            "runtime-filter artifact was assigned more than one build handle",
+                        ));
+                    }
+                }
 
                 let mut chain = self.collect_probe_roles(*left, pipelines, dependencies)?;
-                chain.source = self.attach_hash_join_runtime_filters(
-                    chain.source,
-                    &chain.transforms,
-                    handle,
-                    &spec,
-                );
                 chain
                     .transforms
                     .push(hash_join_probe_transform(handle, &spec));

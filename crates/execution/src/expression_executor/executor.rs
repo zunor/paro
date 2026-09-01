@@ -116,6 +116,16 @@ impl FusedOutputSet {
         self.outputs[second] = true;
     }
 
+    fn all_available(&self, outputs: &[usize]) -> bool {
+        outputs.iter().all(|output| !self.outputs[*output])
+    }
+
+    fn mark_all(&mut self, outputs: &[usize]) {
+        for &output in outputs {
+            self.outputs[output] = true;
+        }
+    }
+
     fn contains(&self, output: usize) -> bool {
         self.outputs[output]
     }
@@ -664,6 +674,14 @@ impl ExpressionExecutor {
             };
             (|| {
                 let mut fused_outputs = FusedOutputSet::new(physical.root_count());
+                for dispatch in physical.varchar_equality_dispatches() {
+                    if !fused_outputs.all_available(&dispatch.outputs) {
+                        continue;
+                    }
+                    if Self::try_execute_varchar_equality_dispatch(dispatch, input, result)? {
+                        fused_outputs.mark_all(&dispatch.outputs);
+                    }
+                }
                 for chain in physical.decimal_factor_chains() {
                     if !fused_outputs
                         .pair_is_available(chain.producer_output, chain.consumer_output)
@@ -4694,6 +4712,72 @@ mod tests {
         assert!(outputs.contains(64));
         assert!(outputs.contains(129));
         assert!(!outputs.pair_is_available(0, 64));
+    }
+
+    #[test]
+    fn varchar_constant_equalities_use_one_dispatch_with_sql_nulls() {
+        let session = test_session();
+        let runtime = test_runtime(session);
+        let expressions = [
+            Expression::Comparison(ComparisonExpression::new(
+                ComparisonType::Equal,
+                reference_varchar(0),
+                constant_varchar("Sunday"),
+            )),
+            Expression::Comparison(ComparisonExpression::new(
+                ComparisonType::Equal,
+                constant_varchar("Monday"),
+                reference_varchar(0),
+            )),
+            Expression::Comparison(ComparisonExpression::new(
+                ComparisonType::Equal,
+                reference_varchar(0),
+                constant_varchar("Tuesday"),
+            )),
+        ];
+        let mut executor = ExpressionExecutor::with_expressions(&expressions);
+        assert_eq!(
+            executor
+                .physical_program()
+                .varchar_equality_dispatches()
+                .len(),
+            1
+        );
+
+        let input = Chunk::from_vectors(
+            vec![paro_common::test_utils::test_nullable_string_vector(&[
+                Some("Sunday"),
+                Some("Tuesday"),
+                None,
+                Some("Friday"),
+            ])],
+            paro_common::test_utils::test_allocator(),
+        );
+        let selection = paro_common::test_utils::test_selection(vec![1, 2, 0, 3]);
+        let mut output = Chunk::try_new(paro_common::test_utils::test_allocator())
+            .expect("test chunk allocation failed");
+        executor
+            .execute_all_kernel(
+                VectorKernelInput::from_chunk(&input)
+                    .with_selection(Some(&selection))
+                    .with_count(selection.len()),
+                &runtime,
+                &mut output,
+            )
+            .expect("VARCHAR equality dispatch should execute");
+
+        assert_eq!(output.column(0).unwrap().get_bool(0), Some(false));
+        assert_eq!(output.column(1).unwrap().get_bool(0), Some(false));
+        assert_eq!(output.column(2).unwrap().get_bool(0), Some(true));
+        assert_eq!(output.column(0).unwrap().get_bool(1), None);
+        assert_eq!(output.column(1).unwrap().get_bool(1), None);
+        assert_eq!(output.column(2).unwrap().get_bool(1), None);
+        assert_eq!(output.column(0).unwrap().get_bool(2), Some(true));
+        assert_eq!(output.column(1).unwrap().get_bool(2), Some(false));
+        assert_eq!(output.column(2).unwrap().get_bool(2), Some(false));
+        assert_eq!(output.column(0).unwrap().get_bool(3), Some(false));
+        assert_eq!(output.column(1).unwrap().get_bool(3), Some(false));
+        assert_eq!(output.column(2).unwrap().get_bool(3), Some(false));
     }
 
     #[test]

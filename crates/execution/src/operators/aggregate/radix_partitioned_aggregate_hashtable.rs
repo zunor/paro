@@ -194,6 +194,19 @@ impl AggregateHashTable {
         }
     }
 
+    pub(crate) fn fuse_disjoint_filter_group(&mut self, filter_inputs: &[usize]) -> bool {
+        match self {
+            Self::Flat(table) => table.fuse_disjoint_filter_group(filter_inputs),
+            Self::Radix(table) => {
+                let mut changed = false;
+                for partition in &mut table.partitions {
+                    changed |= partition.fuse_disjoint_filter_group(filter_inputs);
+                }
+                changed
+            }
+        }
+    }
+
     /// Visit finalized aggregate columns across every physical partition
     /// while retaining the table for the later output scan.
     pub(crate) fn visit_finalized_aggregates(

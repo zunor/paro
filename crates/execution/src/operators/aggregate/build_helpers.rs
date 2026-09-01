@@ -475,27 +475,46 @@ pub(crate) fn create_hash_aggregate_tables(
     let inputs = aggregate_inputs(spec);
     let group_types = group_types(spec)?;
     let strategy = choose_hash_aggregate_table_strategy(spec, &group_types, parallelism)?;
+    let disjoint_filter_groups = direct_filter_dispatch_groups(spec);
     normalized_grouping_sets(spec)?
         .iter()
-        .map(|_| match strategy {
-            HashAggregateTableStrategy::Flat => AggregateHashTable::new_flat_with_memory(
-                group_types.clone(),
-                objects.clone(),
-                inputs.clone(),
-                allocator.clone(),
-                memory.clone(),
-            ),
-            HashAggregateTableStrategy::Radix { partition_bits } => {
-                AggregateHashTable::new_radix_with_memory(
+        .map(|_| {
+            let mut table = match strategy {
+                HashAggregateTableStrategy::Flat => AggregateHashTable::new_flat_with_memory(
                     group_types.clone(),
                     objects.clone(),
                     inputs.clone(),
-                    partition_bits,
                     allocator.clone(),
                     memory.clone(),
-                )
+                )?,
+                HashAggregateTableStrategy::Radix { partition_bits } => {
+                    AggregateHashTable::new_radix_with_memory(
+                        group_types.clone(),
+                        objects.clone(),
+                        inputs.clone(),
+                        partition_bits,
+                        allocator.clone(),
+                        memory.clone(),
+                    )?
+                }
+            };
+            for group in &disjoint_filter_groups {
+                table.fuse_disjoint_filter_group(group);
             }
+            Ok(table)
         })
+        .collect()
+}
+
+fn direct_filter_dispatch_groups(spec: &AggregateSpec) -> Vec<Box<[usize]>> {
+    if spec.projection_exprs.is_empty() {
+        return Vec::new();
+    }
+    ExpressionExecutor::with_expressions(&spec.projection_exprs)
+        .physical_program()
+        .varchar_equality_dispatches()
+        .iter()
+        .map(|dispatch| dispatch.outputs.clone())
         .collect()
 }
 
@@ -563,7 +582,7 @@ pub(crate) fn create_perfect_aggregate_table(
             perfect.resource.slots
         )));
     }
-    PerfectAggregateHashTable::new_with_memory_contract(
+    let mut table = PerfectAggregateHashTable::new_with_memory_contract(
         logical_group_types(spec),
         aggregate_objects(spec)?,
         aggregate_inputs(spec),
@@ -572,7 +591,11 @@ pub(crate) fn create_perfect_aggregate_table(
         allocator,
         memory,
         perfect.resource.table_bytes_upper,
-    )
+    )?;
+    for group in direct_filter_dispatch_groups(spec) {
+        table.fuse_disjoint_filter_group(&group);
+    }
+    Ok(table)
 }
 
 /// Update hash aggregate tables with new payload rows.

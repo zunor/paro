@@ -6,6 +6,87 @@
 use super::*;
 
 impl PipelineLowerer<'_> {
+    pub(crate) fn attach_owned_hash_join_runtime_filters(
+        &self,
+        scan_node: PhysicalPlanNodeId,
+        rowset: &mut RowsetSourceSpec,
+    ) -> Result<()> {
+        for edge in self.plan.edges.iter().filter(|edge| {
+            edge.consumer == scan_node
+                && matches!(
+                    edge.kind,
+                    crate::physical::PhysicalEdgeKind::RuntimeFilter(_)
+                )
+        }) {
+            let crate::physical::PhysicalEdgeKind::RuntimeFilter(artifact) = edge.kind else {
+                unreachable!("filtered runtime-filter edge changed kind")
+            };
+            let handle = *self.runtime_filter_handles.get(&artifact).ok_or_else(|| {
+                paro_error::internal(
+                    "runtime-filter consumer was lowered before its build handle was registered",
+                )
+            })?;
+            let owner = *self.runtime_filter_owners.get(&artifact).ok_or_else(|| {
+                paro_error::internal("runtime-filter artifact has no registered physical owner")
+            })?;
+            let owner = self.plan.node(owner);
+            let PhysicalNodeKind::HashJoin(spec) = &owner.kind else {
+                return Err(paro_error::internal(
+                    "runtime-filter artifact owner is not a physical hash join",
+                ));
+            };
+            let [probe, build] = self.plan.child_ids(&owner.children) else {
+                return Err(paro_error::internal(
+                    "runtime-filter hash join owner has invalid children",
+                ));
+            };
+            if *build != edge.producer
+                || spec
+                    .runtime_filter
+                    .is_none_or(|filter| filter.artifact != artifact)
+            {
+                return Err(paro_error::internal(
+                    "runtime-filter edge disagrees with its registered physical owner",
+                ));
+            }
+            let mut installed = 0usize;
+            for (build_key_index, condition) in spec.key_conditions.iter().enumerate() {
+                if condition.comparison != JoinComparisonType::Equal {
+                    continue;
+                }
+                let Expression::Reference(reference) = &condition.left else {
+                    continue;
+                };
+                let Some(source_index) =
+                    trace_probe_reference_to_rowset(self.plan, *probe, reference.index, scan_node)
+                else {
+                    continue;
+                };
+                let Some(probe_column_id) = rowset.scan.column_projection.column_id(source_index)
+                else {
+                    continue;
+                };
+                let Ok(probe_column_id) = u32::try_from(probe_column_id) else {
+                    continue;
+                };
+                rowset.add_dynamic_runtime_filter(RowsetDynamicRuntimeFilterSpec {
+                    handle,
+                    artifact,
+                    build_key_index,
+                    probe_column_id,
+                });
+                installed += 1;
+            }
+            if installed == 0 {
+                return Err(paro_error::internal(
+                    "runtime-filter edge could not resolve a probe column at its rowset consumer",
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    #[cfg(test)]
     pub(crate) fn attach_hash_join_runtime_filters(
         &self,
         mut source: SourceSpec,
@@ -150,6 +231,42 @@ impl PipelineLowerer<'_> {
     }
 }
 
+fn trace_probe_reference_to_rowset(
+    plan: &PhysicalPlan,
+    node: PhysicalPlanNodeId,
+    output_index: usize,
+    target: PhysicalPlanNodeId,
+) -> Option<usize> {
+    let current = plan.nodes.get(node)?;
+    match &current.kind {
+        PhysicalNodeKind::RowsetScan(_) => (node == target).then_some(output_index),
+        PhysicalNodeKind::Project(spec) => {
+            let Expression::Reference(reference) = spec.expressions.get(output_index)? else {
+                return None;
+            };
+            let [child] = plan.child_ids(&current.children) else {
+                return None;
+            };
+            trace_probe_reference_to_rowset(plan, *child, reference.index, target)
+        }
+        PhysicalNodeKind::Filter(spec) => {
+            let child_index = *spec.projection_map.get(output_index)?;
+            let [child] = plan.child_ids(&current.children) else {
+                return None;
+            };
+            trace_probe_reference_to_rowset(plan, *child, child_index, target)
+        }
+        PhysicalNodeKind::SetOperation(spec)
+            if spec.op == paro_planner::operator::SetOpType::Union && spec.all =>
+        {
+            plan.child_ids(&current.children).iter().find_map(|child| {
+                trace_probe_reference_to_rowset(plan, *child, output_index, target)
+            })
+        }
+        _ => None,
+    }
+}
+
 /// Return the source reference under an exact, monotonic representation cast.
 /// Runtime scalar bounds may cross such a cast because outward rounding on the
 /// original type cannot remove a true match. Narrowing, TRY_CAST, and all
@@ -207,6 +324,7 @@ fn exact_decimal_scalar_filter(probe: &LogicalType, build: &LogicalType) -> bool
     )
 }
 
+#[cfg(test)]
 fn can_push_hash_join_runtime_filter(join_type: JoinType) -> bool {
     matches!(
         join_type,

@@ -170,14 +170,20 @@ impl PhysicalPlanVerifier {
                                     == PhysicalEdgeKind::RuntimeFilter(runtime_filter.artifact)
                         })
                         .collect::<Vec<_>>();
-                    if matching_edges.len() != 1 {
+                    if matching_edges.is_empty() {
                         return Err(paro_error::internal(
-                            "runtime-filter hash join does not own exactly one matching auxiliary edge",
+                            "runtime-filter hash join owns no matching auxiliary edge",
                         ));
                     }
-                    if runtime_filter_probe_scan(plan, *probe) != Some(matching_edges[0].consumer) {
+                    let expected_consumers = runtime_filter_probe_scans(plan, *probe);
+                    if expected_consumers.is_empty()
+                        || matching_edges.len() != expected_consumers.len()
+                        || matching_edges
+                            .iter()
+                            .any(|edge| !expected_consumers.contains(&edge.consumer))
+                    {
                         return Err(paro_error::internal(
-                            "runtime-filter consumer is not the probe's row-preserving rowset scan",
+                            "runtime-filter consumers do not match the probe's row-preserving rowset scans",
                         ));
                     }
                 }
@@ -205,6 +211,7 @@ impl PhysicalPlanVerifier {
 
         let mut feedback_by_region = BTreeMap::new();
         let mut runtime_filter_edges = BTreeSet::new();
+        let mut runtime_filter_artifacts = BTreeSet::new();
         for edge in plan.edges.iter() {
             if plan.nodes.get(edge.producer).is_none() || plan.nodes.get(edge.consumer).is_none() {
                 return Err(paro_error::internal(
@@ -220,11 +227,12 @@ impl PhysicalPlanVerifier {
                     }
                 }
                 PhysicalEdgeKind::RuntimeFilter(artifact) => {
-                    if !runtime_filter_edges.insert(artifact) {
+                    if !runtime_filter_edges.insert((artifact, edge.consumer)) {
                         return Err(paro_error::internal(
-                            "runtime-filter artifact is used by more than one auxiliary edge",
+                            "runtime-filter artifact has a duplicate consumer edge",
                         ));
                     }
+                    runtime_filter_artifacts.insert(artifact);
                     let Some((owner, kind)) = artifact_owners.get(&artifact).copied() else {
                         return Err(paro_error::internal(
                             "runtime-filter edge has no typed region artifact owner",
@@ -251,7 +259,7 @@ impl PhysicalPlanVerifier {
                             };
                             runtime_filter.artifact == artifact
                                 && *build == edge.producer
-                                && runtime_filter_probe_scan(plan, *probe) == Some(edge.consumer)
+                                && runtime_filter_probe_scans(plan, *probe).contains(&edge.consumer)
                         })
                         .count();
                     if owners != 1
@@ -278,7 +286,7 @@ impl PhysicalPlanVerifier {
         }
         for (artifact, (_, kind)) in &artifact_owners {
             if *kind == crate::physical::AuxiliaryArtifactKind::RuntimeFilter
-                && !runtime_filter_edges.contains(artifact)
+                && !runtime_filter_artifacts.contains(artifact)
             {
                 return Err(paro_error::internal(
                     "region-owned runtime-filter artifact has no physical edge",
@@ -401,23 +409,31 @@ fn verify_row_fetch(
     Ok(())
 }
 
-fn runtime_filter_probe_scan(
+fn runtime_filter_probe_scans(
     plan: &PhysicalPlan,
-    mut node: PhysicalPlanNodeId,
-) -> Option<PhysicalPlanNodeId> {
-    loop {
-        let current = plan.nodes.get(node)?;
-        match &current.kind {
-            crate::physical::PhysicalNodeKind::RowsetScan(_) => return Some(node),
-            crate::physical::PhysicalNodeKind::Project(_)
-            | crate::physical::PhysicalNodeKind::Filter(_) => {
-                let [child] = plan.child_ids(&current.children) else {
-                    return None;
-                };
-                node = *child;
-            }
-            _ => return None,
+    node: PhysicalPlanNodeId,
+) -> Vec<PhysicalPlanNodeId> {
+    let Some(current) = plan.nodes.get(node) else {
+        return Vec::new();
+    };
+    match &current.kind {
+        crate::physical::PhysicalNodeKind::RowsetScan(_) => vec![node],
+        crate::physical::PhysicalNodeKind::Project(_)
+        | crate::physical::PhysicalNodeKind::Filter(_) => {
+            let [child] = plan.child_ids(&current.children) else {
+                return Vec::new();
+            };
+            runtime_filter_probe_scans(plan, *child)
         }
+        crate::physical::PhysicalNodeKind::SetOperation(spec)
+            if spec.op == paro_planner::operator::SetOpType::Union && spec.all =>
+        {
+            plan.child_ids(&current.children)
+                .iter()
+                .flat_map(|child| runtime_filter_probe_scans(plan, *child))
+                .collect()
+        }
+        _ => Vec::new(),
     }
 }
 
