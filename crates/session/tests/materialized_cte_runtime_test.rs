@@ -57,4 +57,29 @@ async fn shared_cte_over_snapshot_unbounded_input_is_executable() {
     .await;
 
     assert_eq!(query_i64_col(&sink, 0), vec![20_000]);
+
+    exec_ok(&mut session, &mut sink, "SET force_external = false").await;
+    exec_ok(
+        &mut session,
+        &mut sink,
+        "CREATE TABLE cte_dimension (k INT);
+         INSERT INTO cte_dimension
+         SELECT i::INT FROM generate_series(0, 9) AS t(i)",
+    )
+    .await;
+    exec_ok(
+        &mut session,
+        &mut sink,
+        "WITH first_stage AS MATERIALIZED (
+             SELECT k FROM cte_input
+         ), second_stage AS MATERIALIZED (
+             SELECT first_stage.k
+             FROM first_stage
+             JOIN cte_dimension ON first_stage.k = cte_dimension.k
+         )
+         SELECT COUNT(*)::BIGINT FROM second_stage",
+    )
+    .await;
+
+    assert_eq!(query_i64_col(&sink, 0), vec![10_000]);
 }

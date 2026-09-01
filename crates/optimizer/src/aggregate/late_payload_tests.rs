@@ -263,6 +263,22 @@ fn selective_join_projection_candidate(join_type: JoinType, source_on_left: bool
     )))
 }
 
+fn selective_join_topn_candidate() -> LogicalPlan {
+    let mut projection = selective_join_projection_candidate(JoinType::Inner, true);
+    projection.stats.estimated_cardinality =
+        Some(paro_planner::plan::CardinalityEstimate::exact(100));
+    LogicalPlan::synthetic(LogicalOperator::TopN(TopN::new(
+        projection,
+        vec![OrderByNode {
+            expression: column(OUTPUT, 0, LogicalType::Varchar),
+            ascending: true,
+            nulls_first: false,
+        }],
+        10,
+        0,
+    )))
+}
+
 fn row_preserving_candidate(include_derived_prefix: bool, hidden_order_key: bool) -> LogicalPlan {
     let table = source_table();
     let mut get = Get::new(
@@ -560,6 +576,31 @@ fn selective_projection_requires_a_post_join_fetch_cost_proof() {
     let (optimized, changed) = optimize_plan(plan, &context, &CostModel::default()).unwrap();
     assert!(!changed);
     assert!(matches!(optimized.operator, LogicalOperator::Projection(_)));
+}
+
+#[test]
+fn topn_prices_ordering_payload_from_its_source_scan_frontier() {
+    let context = BindContext::new();
+    let (optimized, changed) = optimize_plan(
+        selective_join_topn_candidate(),
+        &context,
+        &CostModel::default(),
+    )
+    .unwrap();
+    assert!(changed);
+    let LogicalOperator::Projection(output) = &optimized.operator else {
+        panic!("expected rewritten output projection")
+    };
+    let LogicalOperator::TopN(topn) = &output.child.operator else {
+        panic!("expected TopN below output projection")
+    };
+    let LogicalOperator::Projection(carrier) = &topn.child.operator else {
+        panic!("expected TopN carrier projection")
+    };
+    assert!(
+        matches!(carrier.child.operator, LogicalOperator::RowFetch(_)),
+        "ordering payload should be fetched after the selective join"
+    );
 }
 
 #[test]

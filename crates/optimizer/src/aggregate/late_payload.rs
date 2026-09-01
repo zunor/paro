@@ -939,8 +939,8 @@ fn prove_row_preserving_candidate(
         }
     }
 
-    let carrier_rows = output.child.stats.estimated_cardinality?.expected;
-    let fetched_rows = u64::try_from(topn.total_rows()).ok()?.min(carrier_rows);
+    let output_rows = output.child.stats.estimated_cardinality?.expected;
+    let topn_rows = u64::try_from(topn.total_rows()).ok()?.min(output_rows);
     let sources = by_source
         .into_values()
         .filter_map(|mut source| {
@@ -950,9 +950,18 @@ fn prove_row_preserving_candidate(
                 RowIdPathPolicy::RowPreserving,
             )?;
             let carrier_stages = rowid_path.stages();
+            // Eager materialization starts at the source scan, not at the
+            // final relational frontier. A selective join can reduce a large
+            // source before its ordering payload is needed; pricing both
+            // alternatives from `output_rows` erases exactly that benefit.
+            // Conversely, a fanout may make the frontier larger than the
+            // source, so retain the larger expected work domain.
+            let carrier_rows =
+                source_estimated_rows(output.child.as_ref(), source.source_table_index)?
+                    .max(output_rows);
             let ordered_benefit = cost_model.late_row_fetch_benefit(
                 carrier_rows,
-                carrier_rows,
+                output_rows,
                 source
                     .ordered_catalog_columns
                     .keys()
@@ -961,7 +970,7 @@ fn prove_row_preserving_candidate(
             );
             let output_benefit = cost_model.late_row_fetch_benefit(
                 carrier_rows,
-                fetched_rows,
+                topn_rows,
                 source
                     .output_catalog_columns
                     .keys()

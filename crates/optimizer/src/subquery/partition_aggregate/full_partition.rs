@@ -122,7 +122,7 @@ fn validate_full_partition_binding_contract(
 /// evaluation fence.
 fn full_partition_input_is_movable(plan: &LogicalPlan) -> bool {
     let local = match &plan.operator {
-        LogicalOperator::Get(_) | LogicalOperator::DelimGet(_) => true,
+        LogicalOperator::Get(_) | LogicalOperator::CTERef(_) | LogicalOperator::DelimGet(_) => true,
         LogicalOperator::Filter(filter) => filter.expressions.iter().all(is_movable),
         LogicalOperator::Projection(projection) => projection.expressions.iter().all(is_movable),
         LogicalOperator::Aggregate(aggregate) => {

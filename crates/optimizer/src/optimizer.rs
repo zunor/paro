@@ -41,7 +41,6 @@ use crate::cascades::{
 use crate::column::lifetime::ColumnLifetimeAnalyzer;
 use crate::column::remove_unused::RemoveUnusedColumns;
 use crate::context::OptimizationContext;
-use crate::cte::filter_pusher::CTEFilterPusher;
 use crate::cte::inlining::CTEInlining;
 use crate::cte::iteration::normalize_iteration_ownership;
 use crate::expression::in_clause::InClauseRewriter;
@@ -54,6 +53,7 @@ use crate::graph::match_decompose::GraphMatchDecompose;
 use crate::graph::predicate_pushdown::GraphPredicatePushdown;
 use crate::join::mixed_predicates::JoinPredicateNormalizer;
 use crate::join_order::optimizer::JoinOrderOptimizer;
+use crate::limit::topn::TopNOptimizer;
 use crate::physical::{
     ExtractionContext, PhysicalImplementationFlavor, PhysicalPlanExtractor, WinnerPhysicalContract,
 };
@@ -77,6 +77,8 @@ const SCALAR_REUSE_REGION_RULE: crate::cascades::RuleId = crate::cascades::RuleI
 const DISTINCT_AGGREGATE_FEASIBILITY_RULE: crate::cascades::RuleId =
     crate::cascades::RuleId(10_020);
 const JOIN_REGION_ENUMERATOR_RULE: crate::cascades::RuleId = crate::cascades::RuleId(10_021);
+const CORRELATED_TOPN_PAYLOAD_REGION_RULE: crate::cascades::RuleId =
+    crate::cascades::RuleId(10_022);
 
 struct CandidatePlan {
     plan: LogicalPlan,
@@ -259,10 +261,41 @@ impl Optimizer {
                 self.binder.bind_context.shared().as_ref(),
             )?;
             match self.correlated_aggregate_candidate(aggregate_input) {
-                Ok(plan) => {
-                    alternatives.push(plan.into_alternative(AlternativeOrigin::Specialized {
-                        rule: CORRELATED_AGGREGATE_REGION_RULE,
-                    }))
+                Ok(candidate) => {
+                    let (base_plan, payload_plan) = fork_plan_preserving_indices(
+                        candidate.plan,
+                        self.binder.bind_context.shared().as_ref(),
+                    )?;
+                    let payload_input = CandidatePlan {
+                        plan: payload_plan,
+                        column_stats: candidate.column_stats.clone(),
+                    };
+                    alternatives.push(
+                        CandidatePlan {
+                            plan: base_plan,
+                            column_stats: candidate.column_stats,
+                        }
+                        .into_alternative(AlternativeOrigin::Specialized {
+                            rule: CORRELATED_AGGREGATE_REGION_RULE,
+                        }),
+                    );
+                    if alternatives.len()
+                        < self.budget.max_optional_logical_exprs_per_group as usize + 1
+                    {
+                        match self.correlated_topn_payload_candidate(payload_input) {
+                            Ok(Some(plan)) => alternatives.push(plan.into_alternative(
+                                AlternativeOrigin::Specialized {
+                                    rule: CORRELATED_TOPN_PAYLOAD_REGION_RULE,
+                                },
+                            )),
+                            Ok(None) => {}
+                            Err(error) => debug!(
+                                target: targets::OPTIMIZER,
+                                %error,
+                                "correlated TopN payload recipe rejected an invalid optional candidate"
+                            ),
+                        }
+                    }
                 }
                 Err(error) => debug!(
                     target: targets::OPTIMIZER,
@@ -868,6 +901,9 @@ impl Optimizer {
             .then(|| logical_plan_shape(&plan));
         let candidate =
             CorrelatedPartitionAggregate::new(self.ctx.bind_context.clone()).optimize_plan(plan)?;
+        let candidate = CTEInlining::new(&self.ctx.bind_context)
+            .single_reference_defaults()
+            .optimize_plan(candidate);
         if let Some(input_shape) = input_shape {
             debug!(
                 target: targets::OPTIMIZER,
@@ -879,12 +915,37 @@ impl Optimizer {
         self.settle_query_candidate(candidate)
     }
 
+    fn correlated_topn_payload_candidate(
+        &self,
+        mut candidate: CandidatePlan,
+    ) -> Result<Option<CandidatePlan>> {
+        // This is a registered, finite compound recipe. Keep the plain
+        // decorrelated candidate as a sibling; TopN introduction and payload
+        // deferral are costed together only because the latter's proof needs
+        // the former's bounded frontier.
+        candidate.plan = TopNOptimizer::new().optimize_plan(candidate.plan);
+        candidate = self.settle_query_candidate(candidate.plan)?;
+        if self.ctx.session.settings.rowset_scan_pushdown() {
+            let (plan, prefix_changed) =
+                late_payload::optimize_matched_prefix_plan(candidate.plan)?;
+            let (plan, payload_changed) =
+                late_payload::optimize_plan(plan, &self.ctx.bind_context, &self.ctx.cost_model)?;
+            if prefix_changed || payload_changed {
+                return self.settle_query_candidate(plan).map(Some);
+            }
+        }
+        Ok(None)
+    }
+
     fn prepare_correlated_seed(&self, plan: LogicalPlan) -> LogicalPlan {
-        let mut candidate = CTEInlining::new(&self.ctx.bind_context).optimize_plan(plan);
-        candidate = FilterPullup::new().rewrite_plan(candidate);
+        // Correlated-region exploration must preserve sharing ownership. A
+        // CTE reference is a semantic relation leaf whose producer statistics
+        // and execution contract remain owned by MaterializedCTE; duplicating
+        // the producer here makes decorrelation and sharing mutually exclusive
+        // alternatives for no semantic reason.
+        let mut candidate = FilterPullup::new().rewrite_plan(plan);
         candidate = FilterPushdown::new().rewrite_plan(candidate);
-        candidate = CTEFilterPusher::new().optimize_plan(candidate);
-        CTEInlining::new(&self.ctx.bind_context).optimize_plan(candidate)
+        candidate
     }
 
     fn scalar_reuse_candidate(&self, candidate: CandidatePlan) -> Result<CandidatePlan> {

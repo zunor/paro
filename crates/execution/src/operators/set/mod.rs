@@ -10,9 +10,7 @@ mod recursive_table;
 mod set_operation;
 pub mod state;
 
-pub use cte_materialize::{
-    CteMaterializeSinkExec, CteMaterializeSinkGlobal, CteMaterializeSinkLocal,
-};
+pub use cte_materialize::{CteMaterializeSinkExec, CteMaterializeSinkLocal};
 pub use cte_scan::{CteScanSourceExec, CteScanSourceGlobal, CteScanSourceLocal};
 pub use delim_capture::{delim_key_types, DelimCaptureSinkExec};
 pub use delim_scan::DelimScanSourceExec;

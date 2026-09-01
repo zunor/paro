@@ -196,48 +196,31 @@ impl RelationManager {
     ) {
         let relation_id = self.relations.len();
 
-        // Get table indices from the operator
-        let table_indices = op.get_table_index();
-
-        if table_indices.is_empty() {
-            // For operators without table indices (like joins), get all column bindings
-            let bindings = op.get_column_bindings();
-            for binding in bindings {
-                self.relation_mapping
-                    .entry(binding.table_index)
-                    .or_insert(relation_id);
+        // An atomic relation may append its own binding domain while retaining
+        // child bindings (Window is the canonical example). Join predicates
+        // can reference any visible output binding, so ownership comes from
+        // the complete output schema in addition to operator-local indices.
+        let mut table_indices = op.get_table_index();
+        table_indices.extend(
+            op.get_column_bindings()
+                .into_iter()
+                .map(|binding| binding.table_index),
+        );
+        table_indices.sort_unstable();
+        table_indices.dedup();
+        for table_index in table_indices {
+            match self.relation_mapping.entry(table_index) {
+                std::collections::hash_map::Entry::Vacant(entry) => {
+                    entry.insert(relation_id);
+                }
+                std::collections::hash_map::Entry::Occupied(entry) => {
+                    debug_assert_eq!(
+                        *entry.get(),
+                        relation_id,
+                        "table index {table_index} belongs to multiple join relations"
+                    );
+                }
             }
-        } else {
-            // Normal case: map each table index to this relation
-            for table_index in table_indices {
-                debug_assert!(
-                    !self.relation_mapping.contains_key(&table_index),
-                    "Table index {} already mapped",
-                    table_index
-                );
-                self.relation_mapping.insert(table_index, relation_id);
-            }
-        }
-
-        self.relations
-            .push(SingleJoinRelation::new(op, parent, stats));
-    }
-
-    /// Add a relation for aggregate or window operators.
-    pub fn add_aggregate_or_window_relation(
-        &mut self,
-        op: LogicalOperator,
-        parent: Option<LogicalOperator>,
-        stats: RelationStats,
-    ) {
-        let relation_id = self.relations.len();
-
-        // Get column bindings and map them
-        let bindings = op.get_column_bindings();
-        for binding in bindings {
-            self.relation_mapping
-                .entry(binding.table_index)
-                .or_insert(relation_id);
         }
 
         self.relations
@@ -600,7 +583,7 @@ mod tests {
         WindowFrameType,
     };
     use paro_planner::operator::{
-        ColumnBinding, ComparisonJoin, DelimGet, Get, JoinComparisonType, JoinCondition,
+        ColumnBinding, ComparisonJoin, DelimGet, Get, JoinComparisonType, JoinCondition, Window,
     };
     use paro_planner::plan::LogicalPlan;
 
@@ -702,6 +685,34 @@ mod tests {
 
         assert_eq!(manager.num_relations(), 1);
         assert_eq!(manager.get_relation_id(0), Some(0));
+    }
+
+    #[test]
+    fn atomic_window_relation_owns_inherited_and_appended_bindings() {
+        let child = LogicalPlan::synthetic(create_test_get(7));
+        let expression = WindowExpression::native(
+            paro_function::window::WindowFunction::row_number(),
+            vec![],
+            vec![],
+            vec![],
+            WindowFrame {
+                frame_type: WindowFrameType::Rows,
+                start_bound: WindowFrameBound::Unbounded,
+                start_is_preceding: true,
+                end_bound: WindowFrameBound::CurrentRow,
+                end_is_preceding: false,
+            },
+            false,
+        );
+        let mut manager = RelationManager::new();
+        manager.add_relation(
+            LogicalOperator::Window(Window::new(8, vec![expression], child)),
+            None,
+            RelationStats::with_cardinality(10),
+        );
+
+        assert_eq!(manager.get_relation_id(7), Some(0));
+        assert_eq!(manager.get_relation_id(8), Some(0));
     }
 
     #[test]

@@ -287,6 +287,8 @@ pub(super) struct PlannerCostFacts {
     pub(super) child_row_widths: Box<[u64]>,
     pub(super) output_row_width: u64,
     pub(super) perfect_hash: Option<crate::physical::PerfectHashResourceContract>,
+    pub(super) topn_capacity: Option<u64>,
+    pub(super) runtime_filter_probe_multiplicity: RuntimeFilterProbeMultiplicity,
 }
 
 #[derive(Debug, Clone)]
@@ -298,6 +300,19 @@ pub(super) struct ResolvedPlannerCostFacts {
     pub(super) child_row_widths: Box<[u64]>,
     pub(super) output_row_width: u64,
     pub(super) perfect_hash: Option<crate::physical::PerfectHashResourceContract>,
+    pub(super) topn_capacity: Option<u64>,
+    pub(super) runtime_filter_probe_multiplicity: RuntimeFilterProbeMultiplicity,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(super) enum RuntimeFilterProbeMultiplicity {
+    #[default]
+    Unknown,
+    /// Snapshot HLL evidence used only to rank expected/risk work. It is
+    /// neither a schema invariant nor a correctness or memory proof.
+    EstimatedUnique,
+    /// Catalog uniqueness survives plan reuse and may tighten the risk range.
+    DeclaredUnique,
 }
 
 #[derive(Debug, Clone, Copy)]

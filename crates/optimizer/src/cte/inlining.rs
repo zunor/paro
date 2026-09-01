@@ -12,14 +12,21 @@ use std::ops::ControlFlow;
 
 pub struct CTEInlining<'a> {
     bind_context: &'a BindContext,
-    inline_default: bool,
+    default_policy: DefaultInliningPolicy,
+}
+
+#[derive(Clone, Copy)]
+enum DefaultInliningPolicy {
+    All,
+    SingleReference,
+    Never,
 }
 
 impl<'a> CTEInlining<'a> {
     pub fn new(bind_context: &'a BindContext) -> Self {
         Self {
             bind_context,
-            inline_default: true,
+            default_policy: DefaultInliningPolicy::All,
         }
     }
 
@@ -27,7 +34,15 @@ impl<'a> CTEInlining<'a> {
     /// Default CTEs remain available for the SharedSubplanRegion to compare
     /// inline and shared-materialization alternatives by cost.
     pub fn only_not_materialized(mut self) -> Self {
-        self.inline_default = false;
+        self.default_policy = DefaultInliningPolicy::Never;
+        self
+    }
+
+    /// Inline a DEFAULT CTE only after another semantic rewrite has reduced
+    /// its live consumer count to one. Multi-reference sharing remains a cost
+    /// decision owned by Memo.
+    pub fn single_reference_defaults(mut self) -> Self {
+        self.default_policy = DefaultInliningPolicy::SingleReference;
         self
     }
 
@@ -74,7 +89,9 @@ impl<'a> CTEInlining<'a> {
             return (LogicalOperator::MaterializedCTE(cte), false);
         }
 
-        if cte.materialized == CTEMaterialize::Default && !self.inline_default {
+        if cte.materialized == CTEMaterialize::Default
+            && matches!(self.default_policy, DefaultInliningPolicy::Never)
+        {
             return (LogicalOperator::MaterializedCTE(cte), false);
         }
 
@@ -85,7 +102,8 @@ impl<'a> CTEInlining<'a> {
         }
 
         if cte.materialized == CTEMaterialize::NotMaterialized
-            || cte.materialized == CTEMaterialize::Default
+            || (cte.materialized == CTEMaterialize::Default
+                && matches!(self.default_policy, DefaultInliningPolicy::All))
         {
             let definition = cte.cte_query.as_ref();
             inline_copied_references(
@@ -311,6 +329,38 @@ mod tests {
         verify_logical_plan(&bind_context, &optimized)
             .expect("plan should verify after multi-inline");
         assert!(!matches!(
+            optimized.operator,
+            LogicalOperator::MaterializedCTE(_)
+        ));
+    }
+
+    #[test]
+    fn single_reference_policy_preserves_default_multi_ref_sharing() {
+        let bind_context = BindContext::new();
+        let plan = LogicalPlan::new(
+            &bind_context,
+            LogicalOperator::MaterializedCTE(MaterializedCTE::new(
+                10,
+                "nums".to_string(),
+                vec!["v".to_string()],
+                vec![LogicalType::Integer],
+                CTEMaterialize::Default,
+                values(&bind_context, 1, &[1, 2, 3]),
+                LogicalPlan::new(
+                    &bind_context,
+                    LogicalOperator::Join(Join::Cross(CrossProduct {
+                        left: Box::new(cte_ref(&bind_context, 10, 4)),
+                        right: Box::new(cte_ref(&bind_context, 10, 5)),
+                    })),
+                ),
+            )),
+        );
+
+        let optimized = CTEInlining::new(&bind_context)
+            .single_reference_defaults()
+            .optimize_plan(plan);
+        verify_logical_plan(&bind_context, &optimized).expect("shared plan should remain valid");
+        assert!(matches!(
             optimized.operator,
             LogicalOperator::MaterializedCTE(_)
         ));

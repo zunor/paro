@@ -147,6 +147,23 @@ fn full_partition_join_does_not_require_outer_key_uniqueness() {
 }
 
 #[test]
+fn full_partition_join_preserves_shared_cte_ownership() {
+    let optimized = optimize_sql(
+        "WITH detail AS MATERIALIZED ( \
+             SELECT l_partkey AS k, l_quantity AS v FROM lineitem) \
+         SELECT o.k \
+         FROM detail AS o \
+         WHERE o.v > ( \
+             SELECT avg(i.v) FROM detail AS i WHERE i.k = o.k)",
+    );
+    let inspection = inspect_plan(&optimized);
+
+    assert_eq!(inspection.delim_joins, 0, "{optimized:#?}");
+    assert_eq!(inspection.windows, 1, "{optimized:#?}");
+    assert_eq!(inspection.gets_named("lineitem"), 1, "{optimized:#?}");
+}
+
+#[test]
 fn grouped_join_preserves_real_values_before_a_live_late_ordinal() {
     let optimized = optimize_sql(
         "SELECT ps.ps_comment \

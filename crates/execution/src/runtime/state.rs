@@ -14,8 +14,8 @@ use std::sync::Arc;
 use paro_common::error::{self as paro_error, Result};
 
 use super::breaker::{
-    AggregateHandle, DelimHandle, JoinBuildHandle, MaterializedReader, RecursiveTableHandle,
-    SetOperationHandle, SortHandle, TopNHandle, WindowHandle,
+    AggregateHandle, CteHandle, DelimHandle, JoinBuildHandle, MaterializedReader,
+    RecursiveTableHandle, SetOperationHandle, SortHandle, TopNHandle, WindowHandle,
 };
 pub use super::breaker::{
     MaterializeSinkGlobal, MaterializeSinkLocal, MaterializedSourceGlobal, MaterializedSourceLocal,
@@ -59,9 +59,7 @@ pub use crate::operators::set::state::{
     RecursiveTableAppendSinkGlobal, RecursiveTableAppendSinkLocal, RecursiveTableScanSourceLocal,
     SetOperationEmitSourceLocal, SetOperationInputSinkLocal,
 };
-pub use crate::operators::set::{
-    CteMaterializeSinkGlobal, CteMaterializeSinkLocal, CteScanSourceGlobal, CteScanSourceLocal,
-};
+pub use crate::operators::set::{CteMaterializeSinkLocal, CteScanSourceGlobal, CteScanSourceLocal};
 pub use crate::operators::sort::state::{
     SortBuildSinkLocal, SortEmitSourceLocal, StreamingTopNTransformGlobal,
     StreamingTopNTransformLocal, TopNBuildSinkLocal, TopNEmitSourceLocal,
@@ -406,7 +404,7 @@ pub enum SinkGlobal {
     TopNBuild(Arc<BreakerHandleGlobal<TopNHandle>>),
     WindowBuild(Arc<BreakerHandleGlobal<WindowHandle>>),
     SetOperationInput(Arc<BreakerHandleGlobal<SetOperationHandle>>),
-    CteMaterialize(Arc<CteMaterializeSinkGlobal>),
+    CteMaterialize(Arc<BreakerHandleGlobal<CteHandle>>),
     DelimCapture(Arc<DelimCaptureSinkGlobal>),
     RecursiveTableAppend(Arc<RecursiveTableAppendSinkGlobal>),
     Dml(Arc<DmlSinkGlobal>),

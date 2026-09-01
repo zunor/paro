@@ -27,10 +27,24 @@ pub(in crate::cascades::planner) fn planner_cost_facts(
         }
         _ => None,
     };
+    let topn_capacity = match &plan.operator {
+        LogicalOperator::TopN(topn) => Some(
+            u64::try_from(topn.limit)
+                .unwrap_or(u64::MAX)
+                .saturating_add(u64::try_from(topn.offset).unwrap_or(u64::MAX)),
+        ),
+        _ => None,
+    };
+    let runtime_filter_probe_multiplicity = match &plan.operator {
+        LogicalOperator::Join(Join::Comparison(join)) => runtime_filter_probe_multiplicity(join),
+        _ => RuntimeFilterProbeMultiplicity::Unknown,
+    };
     Ok(PlannerCostFacts {
         child_row_widths,
         output_row_width,
         perfect_hash,
+        topn_capacity,
+        runtime_filter_probe_multiplicity,
     })
 }
 
@@ -81,7 +95,78 @@ pub(in crate::cascades::planner) fn expression_cost_facts(
         child_row_widths: template.child_row_widths.clone(),
         output_row_width: template.output_row_width,
         perfect_hash: template.perfect_hash,
+        topn_capacity: template.topn_capacity,
+        runtime_filter_probe_multiplicity: template.runtime_filter_probe_multiplicity,
     })
+}
+
+fn runtime_filter_probe_multiplicity(
+    join: &paro_planner::operator::ComparisonJoin,
+) -> RuntimeFilterProbeMultiplicity {
+    let get = match &join.left.operator {
+        LogicalOperator::Get(get) => get,
+        LogicalOperator::Filter(filter) if filter.projection_map.is_all() => {
+            let LogicalOperator::Get(get) = &filter.child.operator else {
+                return RuntimeFilterProbeMultiplicity::Unknown;
+            };
+            get
+        }
+        _ => return RuntimeFilterProbeMultiplicity::Unknown,
+    };
+    let equality_bindings = join
+        .conditions
+        .iter()
+        .filter_map(|condition| {
+            if condition.comparison != JoinComparisonType::Equal {
+                return None;
+            }
+            match &condition.left {
+                Expression::ColumnRef(column) if column.depth == 0 => Some(column.binding),
+                _ => None,
+            }
+        })
+        .collect::<std::collections::HashSet<_>>();
+    if crate::statistics::unique_keys::declared_unique_keys(get)
+        .iter()
+        .any(|key| {
+            !key.bindings.is_empty()
+                && key
+                    .bindings
+                    .iter()
+                    .all(|binding| equality_bindings.contains(binding))
+        })
+    {
+        return RuntimeFilterProbeMultiplicity::DeclaredUnique;
+    }
+    let bindings = equality_bindings.iter().copied().collect::<Vec<_>>();
+    let [binding] = bindings.as_slice() else {
+        return RuntimeFilterProbeMultiplicity::Unknown;
+    };
+    if binding.table_index != get.table_index {
+        return RuntimeFilterProbeMultiplicity::Unknown;
+    }
+    let column_index = binding.column_index;
+    let Some(column_id) = get.stored_column(column_index) else {
+        return RuntimeFilterProbeMultiplicity::Unknown;
+    };
+    let Some(storage) = get.table.as_ref().and_then(|table| table.get_storage()) else {
+        return RuntimeFilterProbeMultiplicity::Unknown;
+    };
+    let Some(rows) = storage.total_rows().ok().filter(|rows| *rows > 0) else {
+        return RuntimeFilterProbeMultiplicity::Unknown;
+    };
+    let Some(distinct) = storage
+        .column_statistics(column_id)
+        .map(|statistics| statistics.get_distinct_count())
+        .filter(|distinct| *distinct > 0)
+    else {
+        return RuntimeFilterProbeMultiplicity::Unknown;
+    };
+    if distinct.saturating_mul(10) >= rows.saturating_mul(9) {
+        RuntimeFilterProbeMultiplicity::EstimatedUnique
+    } else {
+        RuntimeFilterProbeMultiplicity::Unknown
+    }
 }
 
 fn group_cardinality_work_range(cardinality: Option<CardinalityEnvelope>) -> Result<CompactRange> {

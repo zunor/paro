@@ -64,6 +64,10 @@ pub(crate) enum PhysicalImplementationFlavor {
     CrossProductInMemory,
     /// Cross-product build written to one external row-store domain.
     CrossProductExternal,
+    /// Full ordering with an adaptive in-memory/external run representation.
+    AdaptiveSort,
+    /// Bounded heap retaining at most LIMIT + OFFSET candidates.
+    HeapTopN,
     SortRangeJoin,
     ClassicIeJoin,
     HashAggregate,

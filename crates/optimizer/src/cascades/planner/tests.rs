@@ -73,6 +73,8 @@ fn calibrated_tuple_work_distinguishes_narrow_and_wide_intermediates() {
         child_row_widths: vec![width].into_boxed_slice(),
         output_row_width: width,
         perfect_hash: None,
+        topn_capacity: None,
+        runtime_filter_probe_multiplicity: RuntimeFilterProbeMultiplicity::Unknown,
     };
     let calibrated_cost = |facts: &ResolvedPlannerCostFacts| {
         let mut work = LocalOperatorWork::default();
@@ -123,6 +125,8 @@ fn expression_cost_facts_read_current_group_cardinality() {
         child_row_widths: vec![16].into_boxed_slice(),
         output_row_width: 16,
         perfect_hash: None,
+        topn_capacity: None,
+        runtime_filter_probe_multiplicity: RuntimeFilterProbeMultiplicity::Unknown,
     };
 
     let initial = expression_cost_facts(&memo, parent, &[child], &template).unwrap();

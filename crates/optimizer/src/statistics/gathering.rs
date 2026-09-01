@@ -63,6 +63,8 @@ fn external_table_cardinality(
 pub struct StatisticsGathering {
     cte_cardinality: HashMap<usize, CardinalityEstimate>,
     cte_output_stats: HashMap<usize, Vec<Arc<ColumnStatistics>>>,
+    delim_cardinality: HashMap<usize, CardinalityEstimate>,
+    delim_output_stats: HashMap<usize, Vec<Arc<ColumnStatistics>>>,
 }
 
 impl StatisticsGathering {
@@ -75,13 +77,94 @@ impl StatisticsGathering {
         plan: LogicalPlan,
         ctx: &mut OptimizationContext,
     ) -> Result<LogicalPlan> {
-        let mut plan = plan.try_map_children(|child| self.gather(child, ctx))?;
+        let mut plan = plan;
+        let operator = std::mem::replace(&mut plan.operator, LogicalOperator::DummyScan);
+        let operator = match operator {
+            LogicalOperator::MaterializedCTE(mut cte) => {
+                cte.cte_query = Box::new(self.gather(*cte.cte_query, ctx)?);
+                self.publish_cte_statistics(cte.cte_index, cte.cte_query.as_ref(), ctx);
+                cte.child = Box::new(self.gather(*cte.child, ctx)?);
+                LogicalOperator::MaterializedCTE(cte)
+            }
+            LogicalOperator::RecursiveCTE(mut cte) => {
+                cte.anchor = Box::new(self.gather(*cte.anchor, ctx)?);
+                self.publish_cte_statistics(cte.cte_index, cte.anchor.as_ref(), ctx);
+                cte.recursive = Box::new(self.gather(*cte.recursive, ctx)?);
+                LogicalOperator::RecursiveCTE(cte)
+            }
+            LogicalOperator::Join(Join::Comparison(mut join))
+                if !join.duplicate_eliminated_columns.is_empty() =>
+            {
+                join.left = Box::new(self.gather(*join.left, ctx)?);
+                self.publish_delim_statistics(&join, ctx);
+                join.right = Box::new(self.gather(*join.right, ctx)?);
+                LogicalOperator::Join(Join::Comparison(join))
+            }
+            operator => {
+                plan.operator = operator;
+                plan = plan.try_map_children(|child| self.gather(child, ctx))?;
+                std::mem::replace(&mut plan.operator, LogicalOperator::DummyScan)
+            }
+        };
+        plan.operator = operator;
         if plan.stats.cardinality_provenance != CardinalityProvenance::JoinGraph {
             plan.stats.estimated_cardinality = self.estimate_plan_cardinality(&plan, ctx);
             plan.stats.cardinality_provenance = CardinalityProvenance::Statistics;
         }
         self.update_output_column_stats(&plan, ctx);
         Ok(plan)
+    }
+
+    fn publish_cte_statistics(
+        &mut self,
+        cte_index: usize,
+        producer: &LogicalPlan,
+        ctx: &OptimizationContext,
+    ) {
+        if let Some(cardinality) = producer.stats.estimated_cardinality {
+            self.cte_cardinality.insert(cte_index, cardinality);
+        }
+        self.cte_output_stats
+            .insert(cte_index, collect_output_stats(producer, ctx));
+    }
+
+    fn publish_delim_statistics(
+        &mut self,
+        join: &paro_planner::operator::ComparisonJoin,
+        ctx: &OptimizationContext,
+    ) {
+        let Some(outer) = join.left.stats.estimated_cardinality else {
+            return;
+        };
+        let stats = join
+            .duplicate_eliminated_columns
+            .iter()
+            .map(|expression| expression_statistics(expression, ctx))
+            .collect::<Vec<_>>();
+        let mut expected = 1u64;
+        let mut all_known = true;
+        for stat in &stats {
+            let distinct = stat.get_distinct_count() as u64;
+            if distinct == 0 {
+                all_known = false;
+                break;
+            }
+            expected = saturating_mul_u64(expected, distinct).min(outer.expected.max(1));
+        }
+        if !all_known {
+            expected = fallback_group_distinct(outer.expected);
+        }
+        let estimate = CardinalityEstimate {
+            min: expected.saturating_div(2),
+            expected,
+            max: expected.saturating_mul(2).min(outer.max.max(expected)),
+        };
+        let mut indices = Vec::new();
+        collect_delim_indices(&join.right, &mut indices);
+        for table_index in indices {
+            self.delim_cardinality.insert(table_index, estimate);
+            self.delim_output_stats.insert(table_index, stats.clone());
+        }
     }
 
     fn estimate_plan_cardinality(
@@ -101,7 +184,11 @@ impl StatisticsGathering {
             LogicalOperator::ExpressionGet(get) => {
                 Some(CardinalityEstimate::exact(get.expressions.len() as u64))
             }
-            LogicalOperator::DelimGet(_) => Some(CardinalityEstimate::exact(1)),
+            LogicalOperator::DelimGet(delim) => self
+                .delim_cardinality
+                .get(&delim.table_index)
+                .copied()
+                .or_else(|| Some(CardinalityEstimate::exact(1))),
             LogicalOperator::TableFunctionGet(_) => Some(CardinalityEstimate::exact(100)),
             LogicalOperator::Projection(proj) => proj.child.stats.estimated_cardinality,
             LogicalOperator::RowFetch(fetch) => fetch.child.stats.estimated_cardinality,
@@ -379,10 +466,22 @@ impl StatisticsGathering {
                 let right = cmp.right.stats.estimated_cardinality?;
                 let left_bindings = cmp.left.get_column_bindings();
                 let right_bindings = cmp.right.get_column_bindings();
+                if let Some(inner) = estimate_unique_dimension_join(
+                    cmp,
+                    left,
+                    right,
+                    &left_bindings,
+                    &right_bindings,
+                    ctx,
+                ) {
+                    return Some(adjust_join_estimate(inner, left, right, cmp.join_type));
+                }
                 let selectivity = estimate_comparison_join_selectivity(
                     &cmp.conditions,
                     &left_bindings,
                     &right_bindings,
+                    left.expected,
+                    right.expected,
                     ctx,
                 );
                 Some(adjust_join_estimate(
@@ -544,6 +643,11 @@ impl StatisticsGathering {
                 .get(&cte_ref.cte_index)
                 .cloned()
                 .unwrap_or_else(|| unknown_stats_for_types(&cte_ref.column_types)),
+            LogicalOperator::DelimGet(delim) => self
+                .delim_output_stats
+                .get(&delim.table_index)
+                .cloned()
+                .unwrap_or_else(|| unknown_stats_for_types(&delim.chunk_types)),
             LogicalOperator::SearchScan(search) => search
                 .projections
                 .iter()
@@ -591,6 +695,73 @@ impl StatisticsGathering {
     }
 }
 
+/// Estimate an equality lookup into a declared unique relation against the
+/// key domain actually present on the fact side.
+///
+/// A filtered date/customer dimension retains base-column NDV statistics even
+/// though its row count is selective. Dividing by that historical dimension
+/// NDV can underestimate a foreign-key-shaped join by orders of magnitude.
+/// Uniqueness proves at most one match per fact row; the expected match ratio
+/// is therefore `selected_dimension_rows / fact_key_domain`, capped at one.
+fn estimate_unique_dimension_join(
+    join: &paro_planner::operator::ComparisonJoin,
+    left: CardinalityEstimate,
+    right: CardinalityEstimate,
+    left_bindings: &[ColumnBinding],
+    right_bindings: &[ColumnBinding],
+    ctx: &OptimizationContext,
+) -> Option<CardinalityEstimate> {
+    let [condition] = join.conditions.as_slice() else {
+        return None;
+    };
+    if condition.comparison != JoinComparisonType::Equal {
+        return None;
+    }
+    let left_key = expression_binding(&condition.left, left_bindings)?;
+    let right_key = expression_binding(&condition.right, right_bindings)?;
+
+    if plan_has_single_column_unique_key(&join.right, right_key) {
+        return unique_lookup_estimate(left, right, left_key, ctx);
+    }
+    if plan_has_single_column_unique_key(&join.left, left_key) {
+        return unique_lookup_estimate(right, left, right_key, ctx);
+    }
+    None
+}
+
+fn plan_has_single_column_unique_key(plan: &LogicalPlan, binding: ColumnBinding) -> bool {
+    match &plan.operator {
+        LogicalOperator::Get(get) => crate::statistics::unique_keys::declared_unique_keys(get)
+            .iter()
+            .any(|key| key.bindings.as_slice() == [binding]),
+        LogicalOperator::Filter(filter) if filter.projection_map.is_all() => {
+            plan_has_single_column_unique_key(&filter.child, binding)
+        }
+        _ => false,
+    }
+}
+
+fn unique_lookup_estimate(
+    fact: CardinalityEstimate,
+    dimension: CardinalityEstimate,
+    fact_key: ColumnBinding,
+    ctx: &OptimizationContext,
+) -> Option<CardinalityEstimate> {
+    let domain = ctx.column_stats.get(&fact_key)?.get_distinct_count() as u64;
+    if domain == 0 {
+        return None;
+    }
+    let scale = |rows: u64, selected: u64| {
+        ((rows as u128).saturating_mul(selected as u128) / domain as u128).min(rows as u128) as u64
+    };
+    let expected = scale(fact.expected, dimension.expected);
+    Some(CardinalityEstimate {
+        min: scale(fact.min, dimension.min).min(expected),
+        expected,
+        max: scale(fact.max, dimension.max).max(expected),
+    })
+}
+
 /// Estimate a comparison join without manufacturing independence between
 /// marginal statistics of one composite relation pair.
 ///
@@ -606,12 +777,21 @@ fn estimate_comparison_join_selectivity(
     conditions: &[JoinCondition],
     left_bindings: &[ColumnBinding],
     right_bindings: &[ColumnBinding],
+    left_rows: u64,
+    right_rows: u64,
     ctx: &OptimizationContext,
 ) -> f64 {
     correlate_join_condition_selectivities(conditions.iter().map(|condition| {
         (
             equality_relation_pair(condition, left_bindings, right_bindings),
-            estimate_join_condition_selectivity(condition, left_bindings, right_bindings, ctx),
+            estimate_join_condition_selectivity(
+                condition,
+                left_bindings,
+                right_bindings,
+                left_rows,
+                right_rows,
+                ctx,
+            ),
         )
     }))
 }
@@ -922,6 +1102,8 @@ fn estimate_join_condition_selectivity(
     condition: &JoinCondition,
     left_bindings: &[ColumnBinding],
     right_bindings: &[ColumnBinding],
+    left_rows: u64,
+    right_rows: u64,
     ctx: &OptimizationContext,
 ) -> f64 {
     match condition.comparison {
@@ -941,7 +1123,27 @@ fn estimate_join_condition_selectivity(
                     .map(|stats| stats.get_distinct_count())
                     .unwrap_or(0);
                 if left_distinct > 0 && right_distinct > 0 {
-                    return (1.0 / left_distinct.max(right_distinct) as f64).clamp(0.0, 1.0);
+                    // A filtered relation cannot expose more distinct values
+                    // than rows. Column statistics retain their base-table
+                    // NDV through predicates on correlated columns (for
+                    // example `d_year` filtering `d_date_sk`), so cap each
+                    // marginal by the cardinality of the side that owns it.
+                    let side_rows = |binding: ColumnBinding| {
+                        if left_bindings.contains(&binding) {
+                            left_rows
+                        } else if right_bindings.contains(&binding) {
+                            right_rows
+                        } else {
+                            u64::MAX
+                        }
+                    };
+                    let left_domain = u64::try_from(left_distinct)
+                        .unwrap_or(u64::MAX)
+                        .min(side_rows(left));
+                    let right_domain = u64::try_from(right_distinct)
+                        .unwrap_or(u64::MAX)
+                        .min(side_rows(right));
+                    return (1.0 / left_domain.max(right_domain).max(1) as f64).clamp(0.0, 1.0);
                 }
             }
         }
@@ -993,6 +1195,17 @@ fn unknown_stats_for_types(types: &[LogicalType]) -> Vec<Arc<ColumnStatistics>> 
         .cloned()
         .map(ColumnStatistics::create_unknown)
         .collect()
+}
+
+fn collect_delim_indices(plan: &LogicalPlan, indices: &mut Vec<usize>) {
+    if let LogicalOperator::DelimGet(delim) = &plan.operator {
+        if !indices.contains(&delim.table_index) {
+            indices.push(delim.table_index);
+        }
+    }
+    for child in plan.children() {
+        collect_delim_indices(child, indices);
+    }
 }
 
 fn saturating_mul_u64(left: u64, right: u64) -> u64 {
@@ -1082,9 +1295,11 @@ mod tests {
     use paro_context::test_support::TestStatementContextBuilder;
     use paro_context::StatementContext;
     use paro_planner::binder::context::BindContext;
-    use paro_planner::binder::ir::GroupingSet;
+    use paro_planner::binder::ir::{CTEMaterialize, GroupingSet};
     use paro_planner::expression::ColumnRefExpression;
-    use paro_planner::operator::{Aggregate, ExpressionGet, Limit, Projection};
+    use paro_planner::operator::{
+        Aggregate, CTERef, DelimGet, ExpressionGet, Limit, MaterializedCTE, Projection,
+    };
 
     use super::*;
     use crate::context::OptimizationContext;
@@ -1193,6 +1408,102 @@ mod tests {
             Some(CardinalityEstimate::exact(10))
         );
         assert!(ctx.column_stats.contains_key(&ColumnBinding::new(2, 0)));
+    }
+
+    #[test]
+    fn materialized_cte_publishes_producer_cardinality_before_its_consumer() {
+        let bind_context = BindContext::new();
+        let session = make_test_session();
+        let mut ctx = OptimizationContext::new(session, bind_context.clone());
+        let producer = values_relation(&bind_context, 1, 37);
+        let consumer = LogicalPlan::new(
+            &bind_context,
+            LogicalOperator::CTERef(CTERef::new(
+                9,
+                2,
+                "shared".to_string(),
+                vec!["v".to_string()],
+                vec![LogicalType::BigInt],
+            )),
+        );
+        let plan = LogicalPlan::new(
+            &bind_context,
+            LogicalOperator::MaterializedCTE(MaterializedCTE::new(
+                9,
+                "shared".to_string(),
+                vec!["v".to_string()],
+                vec![LogicalType::BigInt],
+                CTEMaterialize::Materialized,
+                producer,
+                consumer,
+            )),
+        );
+
+        let gathered = StatisticsGathering::new()
+            .gather(plan, &mut ctx)
+            .expect("gather should succeed");
+        let LogicalOperator::MaterializedCTE(cte) = &gathered.operator else {
+            panic!("expected materialized CTE");
+        };
+
+        assert_eq!(
+            cte.child.stats.estimated_cardinality,
+            Some(CardinalityEstimate::exact(37))
+        );
+        assert_eq!(
+            gathered.stats.estimated_cardinality,
+            Some(CardinalityEstimate::exact(37))
+        );
+    }
+
+    #[test]
+    fn delim_join_publishes_outer_key_domain_before_its_consumer() {
+        let bind_context = BindContext::new();
+        let session = make_test_session();
+        let mut ctx = OptimizationContext::new(session, bind_context.clone());
+        let outer = LogicalPlan::new(
+            &bind_context,
+            LogicalOperator::ExpressionGet(ExpressionGet::new(
+                1,
+                (0..35)
+                    .map(|value| {
+                        vec![Expression::Constant(ConstantExpression::new(
+                            Value::BigInt(value % 7),
+                            LogicalType::BigInt,
+                        ))]
+                    })
+                    .collect(),
+                vec!["key".to_string()],
+                vec![LogicalType::BigInt],
+            )),
+        );
+        let delim = LogicalPlan::new(
+            &bind_context,
+            LogicalOperator::DelimGet(DelimGet::new(9, vec![LogicalType::BigInt])),
+        );
+        let mut join = paro_planner::operator::ComparisonJoin::new(
+            JoinType::Inner,
+            outer,
+            delim,
+            vec![equality(1, 0, 9, 0)],
+        );
+        join.duplicate_eliminated_columns = vec![column_ref(1, 0)];
+        let plan = LogicalPlan::new(&bind_context, LogicalOperator::Join(Join::Comparison(join)));
+
+        let gathered = StatisticsGathering::new()
+            .gather(plan, &mut ctx)
+            .expect("gather should succeed");
+        let LogicalOperator::Join(Join::Comparison(join)) = &gathered.operator else {
+            panic!("expected delim join")
+        };
+        let estimate = join
+            .right
+            .stats
+            .estimated_cardinality
+            .expect("DelimGet should inherit the outer key domain");
+        assert!(estimate.expected > 1 && estimate.expected < 35);
+        assert_eq!(estimate.max, estimate.expected * 2);
+        assert!(ctx.column_stats.contains_key(&ColumnBinding::new(9, 0)));
     }
 
     #[test]

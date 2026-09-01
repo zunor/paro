@@ -293,10 +293,12 @@ pub(super) fn implementation_spillable(
         | PhysicalImplementationFlavor::HashAggregate
         | PhysicalImplementationFlavor::PartitionAggregateWindow
         | PhysicalImplementationFlavor::Window => metadata.spillable,
+        PhysicalImplementationFlavor::AdaptiveSort => metadata.spillable,
         PhysicalImplementationFlavor::CrossProductExternal => metadata.spillable,
         PhysicalImplementationFlavor::Structural => metadata.spillable,
         PhysicalImplementationFlavor::NestedLoopJoin
         | PhysicalImplementationFlavor::CrossProductInMemory
+        | PhysicalImplementationFlavor::HeapTopN
         | PhysicalImplementationFlavor::PerfectHashAggregate
         | PhysicalImplementationFlavor::SingletonAggregateProjection
         | PhysicalImplementationFlavor::SortRangeJoin
@@ -332,6 +334,7 @@ pub(super) fn planner_cost_composition(
         | PhysicalImplementationFlavor::PerfectHashAggregate
         | PhysicalImplementationFlavor::Window
         | PhysicalImplementationFlavor::PartitionAggregateWindow => 0b1,
+        PhysicalImplementationFlavor::AdaptiveSort | PhysicalImplementationFlavor::HeapTopN => 0b1,
         PhysicalImplementationFlavor::SingletonAggregateProjection => 0,
         PhysicalImplementationFlavor::Structural => metadata.structural_retained_children,
         PhysicalImplementationFlavor::NestedLoopJoin

@@ -7,10 +7,12 @@
 //! generic materialization. Each CTE reference creates an independent reader,
 //! while tasks belonging to that reader claim disjoint chunks or row stores.
 
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
+use parking_lot::Mutex;
 use paro_common::chunk::Chunk;
-use paro_common::error::Result;
+use paro_common::error::{self as paro_error, Result};
 use paro_storage::row::RowStore;
 
 use crate::runtime::context::OperatorCleanupContext;
@@ -22,13 +24,24 @@ use super::registry::BreakerHandleMetadata;
 #[derive(Debug)]
 pub struct CteHandle {
     materialized: Arc<MaterializedHandle>,
+    external_selected: AtomicBool,
+    staged: Mutex<CteStagedSnapshot>,
     cleanup: CleanupState,
+}
+
+#[derive(Debug, Default)]
+pub(crate) struct CteStagedSnapshot {
+    pub(crate) chunks: Vec<Chunk>,
+    pub(crate) stores: Vec<RowStore>,
+    prepared: bool,
 }
 
 impl CteHandle {
     pub fn new(metadata: BreakerHandleMetadata) -> Self {
         Self {
             materialized: Arc::new(MaterializedHandle::new(metadata)),
+            external_selected: AtomicBool::new(false),
+            staged: Mutex::new(CteStagedSnapshot::default()),
             cleanup: CleanupState::default(),
         }
     }
@@ -41,6 +54,51 @@ impl CteHandle {
     #[inline]
     pub fn materialized(&self) -> Arc<MaterializedHandle> {
         Arc::clone(&self.materialized)
+    }
+
+    #[inline]
+    pub(crate) fn external_selected(&self) -> bool {
+        self.external_selected.load(Ordering::Acquire)
+    }
+
+    #[inline]
+    pub(crate) fn select_external(&self) {
+        self.external_selected.store(true, Ordering::Release);
+    }
+
+    pub(crate) fn stage_chunks(&self, chunks: &mut Vec<Chunk>) -> Result<()> {
+        let mut staged = self.staged.lock();
+        if staged.prepared {
+            return Err(paro_error::internal(
+                "cannot stage CTE chunks after snapshot preparation",
+            ));
+        }
+        staged.chunks.append(chunks);
+        Ok(())
+    }
+
+    pub(crate) fn stage_row_store(&self, store: RowStore) -> Result<()> {
+        let mut staged = self.staged.lock();
+        if staged.prepared {
+            return Err(paro_error::internal(
+                "cannot stage a CTE row store after snapshot preparation",
+            ));
+        }
+        staged.stores.push(store);
+        Ok(())
+    }
+
+    pub(crate) fn take_staged_snapshot(&self) -> Option<CteStagedSnapshot> {
+        let mut staged = self.staged.lock();
+        if staged.prepared {
+            return None;
+        }
+        staged.prepared = true;
+        Some(CteStagedSnapshot {
+            chunks: std::mem::take(&mut staged.chunks),
+            stores: std::mem::take(&mut staged.stores),
+            prepared: true,
+        })
     }
 
     pub fn append_chunks(&self, chunks: &mut Vec<Chunk>) -> Result<()> {
@@ -78,6 +136,7 @@ impl CteHandle {
 
 impl RuntimeCleanup for CteHandle {
     fn cleanup(&self, ctx: &mut OperatorCleanupContext, reason: CleanupReason) -> Result<()> {
+        *self.staged.lock() = CteStagedSnapshot::default();
         self.materialized.cleanup(ctx, reason)?;
         self.cleanup.mark(reason);
         Ok(())

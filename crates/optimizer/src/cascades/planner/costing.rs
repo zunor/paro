@@ -97,6 +97,14 @@ pub(super) fn planner_implementation_set(
             external_cross_product: true,
             ..PlannerImplementationSet::STRUCTURAL
         },
+        LogicalOperator::Order(_) => PlannerImplementationSet {
+            baseline: PhysicalImplementationFlavor::AdaptiveSort,
+            ..PlannerImplementationSet::STRUCTURAL
+        },
+        LogicalOperator::TopN(_) => PlannerImplementationSet {
+            baseline: PhysicalImplementationFlavor::HeapTopN,
+            ..PlannerImplementationSet::STRUCTURAL
+        },
         _ => PlannerImplementationSet::STRUCTURAL,
     }
 }
@@ -293,6 +301,11 @@ pub(super) fn sort_work(rows: CompactRange) -> Result<CompactRange> {
     )
 }
 
+fn topn_work(rows: CompactRange, capacity: u64) -> Result<CompactRange> {
+    let comparisons_per_row = (capacity.max(2) as f64).log2();
+    scaled_work(rows, comparisons_per_row)
+}
+
 pub(super) fn implementation_cost(
     metadata: &PlannerOperatorMetadata,
     facts: &ResolvedPlannerCostFacts,
@@ -315,6 +328,47 @@ pub(super) fn implementation_cost(
     match flavor {
         PhysicalImplementationFlavor::Structural | PhysicalImplementationFlavor::SearchProvider => {
             unreachable!()
+        }
+        PhysicalImplementationFlavor::AdaptiveSort => {
+            let input = facts
+                .child_rows
+                .first()
+                .copied()
+                .unwrap_or(facts.output_rows);
+            work.add(OP_SORT_COMPARE, sort_work(input)?)?;
+            peak_memory_upper = facts
+                .child_rows_hard_upper
+                .first()
+                .copied()
+                .flatten()
+                .unwrap_or(u64::MAX)
+                .saturating_mul(
+                    facts
+                        .child_row_widths
+                        .first()
+                        .copied()
+                        .unwrap_or(facts.output_row_width)
+                        .max(1),
+                );
+        }
+        PhysicalImplementationFlavor::HeapTopN => {
+            let input = facts
+                .child_rows
+                .first()
+                .copied()
+                .unwrap_or(facts.output_rows);
+            let capacity = facts.topn_capacity.ok_or_else(|| {
+                paro_error::internal("heap TopN candidate lost its bounded capacity")
+            })?;
+            work.add(OP_SORT_COMPARE, topn_work(input, capacity)?)?;
+            peak_memory_upper = capacity.saturating_mul(
+                facts
+                    .child_row_widths
+                    .first()
+                    .copied()
+                    .unwrap_or(facts.output_row_width)
+                    .max(1),
+            );
         }
         PhysicalImplementationFlavor::HashAggregate => {
             let input = facts
@@ -401,7 +455,7 @@ pub(super) fn implementation_cost(
             let probe = if flavor == PhysicalImplementationFlavor::HashJoinRuntimeFilter {
                 work.add(OP_RUNTIME_FILTER_BUILD_ROW, right)?;
                 work.add(OP_RUNTIME_FILTER_APPLY_ROW, left)?;
-                runtime_filtered_probe_work(left, right)?
+                runtime_filtered_probe_work(left, right, facts.runtime_filter_probe_multiplicity)?
             } else {
                 left
             };
@@ -578,6 +632,8 @@ fn apply_execution_memory_contract(
                 | PhysicalImplementationFlavor::ClassicIeJoin
                 | PhysicalImplementationFlavor::CrossProductInMemory
                 | PhysicalImplementationFlavor::CrossProductExternal
+                | PhysicalImplementationFlavor::AdaptiveSort
+                | PhysicalImplementationFlavor::HeapTopN
                 | PhysicalImplementationFlavor::Window
                 | PhysicalImplementationFlavor::PartitionAggregateWindow
         );
@@ -747,6 +803,7 @@ pub(super) fn scaled_work(range: CompactRange, factor: f64) -> Result<CompactRan
 pub(super) fn runtime_filtered_probe_work(
     probe: CompactRange,
     build: CompactRange,
+    probe_multiplicity: RuntimeFilterProbeMultiplicity,
 ) -> Result<CompactRange> {
     let retained = |probe_rows: f64, build_rows: f64| {
         if probe_rows <= 0.0 {
@@ -757,8 +814,21 @@ pub(super) fn runtime_filtered_probe_work(
         // damped. The upper bound retains the no-benefit fallback.
         probe_rows * ratio.sqrt().clamp(0.1, 1.0)
     };
-    let expected = retained(probe.expected, build.expected);
-    CompactRange::new(0.0, expected, probe.upper.max(expected))
+    let expected = match probe_multiplicity {
+        RuntimeFilterProbeMultiplicity::DeclaredUnique => {
+            retained(probe.expected, build.expected).min(build.expected)
+        }
+        RuntimeFilterProbeMultiplicity::EstimatedUnique => {
+            retained(probe.expected, build.expected).min(build.expected * 1.25)
+        }
+        RuntimeFilterProbeMultiplicity::Unknown => retained(probe.expected, build.expected),
+    };
+    let upper = match probe_multiplicity {
+        RuntimeFilterProbeMultiplicity::DeclaredUnique => probe.upper.min(build.upper),
+        RuntimeFilterProbeMultiplicity::EstimatedUnique => probe.upper.min(build.upper * 2.0),
+        RuntimeFilterProbeMultiplicity::Unknown => probe.upper,
+    };
+    CompactRange::new(0.0, expected, upper.max(expected))
 }
 
 pub(super) fn is_contextual_operator(operator: &LogicalOperator) -> bool {
@@ -986,4 +1056,41 @@ pub(super) fn external_operator_cost(
         estimate.bytes_cost * rows.max as f64;
     cost.validate()?;
     Ok(cost)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        runtime_filtered_probe_work, sort_work, topn_work, CompactRange,
+        RuntimeFilterProbeMultiplicity,
+    };
+
+    #[test]
+    fn bounded_topn_prices_heap_work_instead_of_a_full_sort() {
+        let rows = CompactRange::new(100_000.0, 100_000.0, 100_000.0).unwrap();
+        let sort = sort_work(rows).unwrap();
+        let topn = topn_work(rows, 100).unwrap();
+
+        assert!(topn.expected < sort.expected);
+        assert!(topn.upper < sort.upper);
+    }
+
+    #[test]
+    fn unique_probe_key_bounds_runtime_filter_survivors_by_build_rows() {
+        let probe = CompactRange::new(100_000.0, 100_000.0, 100_000.0).unwrap();
+        let build = CompactRange::new(10_000.0, 12_000.0, 15_000.0).unwrap();
+
+        let unique = runtime_filtered_probe_work(
+            probe,
+            build,
+            RuntimeFilterProbeMultiplicity::DeclaredUnique,
+        )
+        .unwrap();
+        let unconstrained =
+            runtime_filtered_probe_work(probe, build, RuntimeFilterProbeMultiplicity::Unknown)
+                .unwrap();
+
+        assert_eq!(unique.upper, 15_000.0);
+        assert_eq!(unconstrained.upper, 100_000.0);
+    }
 }

@@ -35,8 +35,10 @@ use crate::subquery::output_contract::{
 };
 
 mod full_partition;
+mod shared_relation;
 
 use full_partition::{apply_full_partition_join, recognize_full_partition_join};
+use shared_relation::{apply_shared_relation_rewrite, recognize_shared_relation_filter};
 
 /// Rewrite eligible correlated scalar aggregates into partition windows or
 /// keyed grouped joins.
@@ -77,6 +79,9 @@ impl CorrelatedPartitionAggregate {
         plan: LogicalPlan,
         output_contract: Option<&OutputContract>,
     ) -> Result<LogicalPlan> {
+        if let Some(rewrite) = recognize_shared_relation_filter(&plan, output_contract) {
+            return apply_shared_relation_rewrite(plan, rewrite, &self.bind_context);
+        }
         if let Some(rewrite) = recognize_filter(&plan, output_contract) {
             return apply_rewrite(plan, rewrite, &self.bind_context);
         }
@@ -752,6 +757,7 @@ fn collect_correlation_keys(
             }
         }
         LogicalOperator::Get(_)
+        | LogicalOperator::CTERef(_)
         | LogicalOperator::DelimGet(_)
         | LogicalOperator::Join(Join::Cross(_)) => {}
         _ => return None,

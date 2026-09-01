@@ -369,8 +369,33 @@ impl StatisticsPropagator {
     }
 
     fn propagate_plan(&mut self, ctx: &StatementContext, plan: LogicalPlan) -> LogicalPlan {
-        let plan = plan.map_children(|child| self.propagate_plan(ctx, child));
-        plan.map_operator(|operator| self.propagate_operator(ctx, operator))
+        let mut plan = plan;
+        let operator = std::mem::replace(&mut plan.operator, LogicalOperator::DummyScan);
+        let operator = match operator {
+            LogicalOperator::MaterializedCTE(mut cte) => {
+                cte.cte_query = Box::new(self.propagate_plan(ctx, *cte.cte_query));
+                if let Some(statistics) = self.capture_output_statistics(&cte.cte_query.operator) {
+                    self.cte_statistics.insert(cte.cte_index, statistics);
+                }
+                cte.child = Box::new(self.propagate_plan(ctx, *cte.child));
+                LogicalOperator::MaterializedCTE(cte)
+            }
+            LogicalOperator::RecursiveCTE(mut cte) => {
+                cte.anchor = Box::new(self.propagate_plan(ctx, *cte.anchor));
+                if let Some(statistics) = self.capture_output_statistics(&cte.anchor.operator) {
+                    self.cte_statistics.insert(cte.cte_index, statistics);
+                }
+                cte.recursive = Box::new(self.propagate_plan(ctx, *cte.recursive));
+                LogicalOperator::RecursiveCTE(cte)
+            }
+            operator => {
+                plan.operator = operator;
+                plan = plan.map_children(|child| self.propagate_plan(ctx, child));
+                std::mem::replace(&mut plan.operator, LogicalOperator::DummyScan)
+            }
+        };
+        plan.operator = self.propagate_operator(ctx, operator);
+        plan
     }
 
     /// Propagate statistics through an operator after all children have been propagated.
