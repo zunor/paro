@@ -7,9 +7,12 @@ use std::sync::Arc;
 
 use paro_common::error::{self as paro_error, Result};
 use paro_common::types::LogicalType;
-use paro_function::aggregate::{AggregateFunction, FunctionData};
+use paro_function::aggregate::{
+    AggregateDirectUpdate, AggregateFunction, DirectGroupedAggregateProgram, FunctionData,
+};
 use paro_planner::expression::{AggregateExpression, AggregateType, Expression};
 
+use super::aggregate_state::AggregateStateLayout;
 use super::grouped_aggregate_data::{reference_index, GroupedAggregateData};
 
 const MIN_STATE_ALIGNMENT: usize = 8;
@@ -138,6 +141,37 @@ pub fn create_validated_aggregate_objects(
         object.validate_with_plan(aggregate_data, idx)?;
     }
     Ok(objects)
+}
+
+/// Compile the direct grouped-state program shared by perfect and generic
+/// hash aggregation.
+pub(crate) fn compile_direct_update_program(
+    aggregate_objects: &[AggregateObject],
+    aggregate_inputs: &[Vec<usize>],
+    state_layout: &AggregateStateLayout,
+) -> DirectGroupedAggregateProgram {
+    let mut program = DirectGroupedAggregateProgram::new(aggregate_objects.len());
+    for (aggregate_index, object) in aggregate_objects.iter().enumerate() {
+        let Some(inputs) = aggregate_inputs.get(aggregate_index) else {
+            continue;
+        };
+        if object.is_distinct() || object.filter.is_some() || !object.order_bys.is_empty() {
+            continue;
+        }
+        let input = if object.function.direct_update == Some(AggregateDirectUpdate::CountStar) {
+            None
+        } else {
+            inputs.first().copied()
+        };
+        program.try_add(
+            aggregate_index,
+            object.function.direct_update,
+            state_layout.state_offset(aggregate_index),
+            input,
+            object.function.state_is_trivially_copyable(),
+        );
+    }
+    program
 }
 
 fn align_to(value: usize, alignment: usize) -> Result<usize> {

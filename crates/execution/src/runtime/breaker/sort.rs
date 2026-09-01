@@ -501,6 +501,7 @@ impl TopNHandle {
             .lock()
             .take()
             .ok_or_else(|| paro_error::internal("topn state was already sealed"))?;
+        state.heap.combine_many(&mut state.pending_heaps)?;
         let chunks = state.heap.extract_results()?;
         self.sealed_chunks
             .set(Arc::from(chunks.into_boxed_slice()))
@@ -541,6 +542,7 @@ impl RuntimeCleanup for TopNHandle {
 #[derive(Debug)]
 pub struct TopNRuntimeState {
     pub heap: TopNHeap,
+    pub pending_heaps: Vec<TopNHeap>,
     pub boundary: Arc<TopNBoundaryValue>,
 }
 
@@ -769,6 +771,7 @@ mod tests {
         handle
             .initialize(TopNRuntimeState {
                 heap: TopNHeap::new(vec![LogicalType::Integer], &[], 1, 0),
+                pending_heaps: Vec::new(),
                 boundary,
             })
             .expect("initialize topn");

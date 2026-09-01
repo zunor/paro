@@ -123,9 +123,7 @@ impl ParallelFinishDriver for RadixMergeDriver {
                 ))
             })?;
         let mut target = self.result.take_partition(work.partition_idx)?;
-        for mut source in work.sources {
-            target.combine(&mut source)?;
-        }
+        target.combine_sources(work.sources)?;
         if let Some(distinct) = &self.distinct {
             distinct.finalize_partition(work.distinct, ctx, &mut target)?;
         }
@@ -196,9 +194,7 @@ pub(super) fn prepare_parallel_radix_merge(
         .unwrap_or(usize::MAX);
     if source_rows < PARALLEL_RADIX_MERGE_MIN_SOURCE_ROWS {
         let mut target = tables.remove(0);
-        for mut source in tables {
-            target.combine(&mut source)?;
-        }
+        target.combine_sources(tables)?;
         handle.with_state_mut(|state| {
             let AggregateRuntimeState::Hash(global) = state else {
                 return Err(paro_error::internal(

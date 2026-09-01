@@ -345,6 +345,37 @@ impl Vector {
         Ok((entries, validity, heap))
     }
 
+    /// Prepare a variable-length vector whose out-of-line views borrow one
+    /// immutable external allocation.
+    ///
+    /// This is the zero-copy counterpart of [`Self::try_begin_varlen_write`].
+    /// The owner follows shallow references and dictionary children, so the
+    /// referenced bytes stay live for every subsequent `StringView` access.
+    ///
+    /// # Safety
+    ///
+    /// The caller must initialize all `count` entries before the vector is
+    /// observed. Every out-of-line pointer written there must address
+    /// immutable bytes retained by `owner` for the owner's complete lifetime.
+    pub unsafe fn try_begin_borrowed_varlen_write(
+        &mut self,
+        count: usize,
+        owner: Arc<dyn VectorLifetimeOwner>,
+    ) -> Result<(*mut StringView, &mut ValidityMask)> {
+        if !(self.logical_type.is_utf8_varlen() || self.logical_type == LogicalType::Blob) {
+            return Err(paro_error::type_mismatch(format!(
+                "borrowed varlen write requires a textual or BLOB vector, got {:?}",
+                self.logical_type
+            )));
+        }
+
+        self.make_exclusive();
+        self.try_set_len(count)?;
+        self.string_heap = None;
+        self.attach_lifetime_owner(owner);
+        Ok((self.buffer.data() as *mut StringView, &mut self.validity))
+    }
+
     /// Create a shallow reference to this vector (Zero-copy).
     pub fn reference(&self) -> Self {
         self.clone()

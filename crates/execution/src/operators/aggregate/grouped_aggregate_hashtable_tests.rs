@@ -242,6 +242,84 @@ fn build_map_from_scan(rows: Vec<Vec<Value>>) -> HashMap<i32, i64> {
     result
 }
 
+fn sum_table(groups: &[i32], values: &[i64]) -> GroupedAggregateHashTable {
+    assert_eq!(groups.len(), values.len());
+    let allocator = paro_common::test_utils::test_allocator();
+    let mut table = GroupedAggregateHashTable::new(
+        vec![LogicalType::Integer],
+        vec![make_sum_object()],
+        vec![vec![0]],
+        allocator.clone(),
+    )
+    .expect("sum table");
+    let groups = Chunk::from_vectors(
+        vec![paro_common::test_utils::test_i32_vector_with_allocator(
+            groups,
+            allocator.clone(),
+        )],
+        allocator.clone(),
+    );
+    let hashes = table.hash_groups(&groups).expect("sum table hashes");
+    let mut addresses =
+        paro_common::test_utils::test_vector_with_capacity(LogicalType::BigInt, groups.size());
+    let mut new_groups = paro_common::test_utils::test_selection_with_capacity(groups.size());
+    table
+        .find_or_create_groups(&groups, &hashes, &mut addresses, &mut new_groups)
+        .expect("sum table find/create");
+    let payload = Chunk::from_vectors(
+        vec![paro_common::test_utils::test_i64_vector_with_allocator(
+            values, allocator,
+        )],
+        paro_common::test_utils::test_allocator(),
+    );
+    table
+        .update_aggregates(&payload, &addresses, None)
+        .expect("sum table update");
+    table
+}
+
+fn count_table(groups: &[i32]) -> GroupedAggregateHashTable {
+    let allocator = paro_common::test_utils::test_allocator();
+    let function = get_count_star_function();
+    let object = AggregateObject {
+        payload_size: function.state_size,
+        function,
+        bind_info: None,
+        child_count: 0,
+        aggr_type: AggregateType::NonDistinct,
+        return_type: LogicalType::BigInt,
+        filter: None,
+        order_bys: Vec::new(),
+    };
+    let mut table = GroupedAggregateHashTable::new(
+        vec![LogicalType::Integer],
+        vec![object],
+        vec![Vec::new()],
+        allocator.clone(),
+    )
+    .expect("count table");
+    let groups = Chunk::from_vectors(
+        vec![paro_common::test_utils::test_i32_vector_with_allocator(
+            groups, allocator,
+        )],
+        paro_common::test_utils::test_allocator(),
+    );
+    let hashes = table.hash_groups(&groups).expect("count table hashes");
+    let mut addresses =
+        paro_common::test_utils::test_vector_with_capacity(LogicalType::BigInt, groups.size());
+    let mut new_groups = paro_common::test_utils::test_selection_with_capacity(groups.size());
+    table
+        .find_or_create_groups(&groups, &hashes, &mut addresses, &mut new_groups)
+        .expect("count table find/create");
+    unsafe {
+        let states = addresses.flat_data::<*mut u8>();
+        for row in 0..groups.size() {
+            *(*states.add(row)).cast::<i64>() += 1;
+        }
+    }
+    table
+}
+
 #[test]
 fn grouped_hash_table_find_create_and_update() {
     let mut table = GroupedAggregateHashTable::with_capacity(
@@ -590,88 +668,30 @@ fn grouped_hash_table_reclaims_finalized_lookup_storage_without_breaking_scan() 
 }
 
 #[test]
-fn grouped_hash_table_combines_other_table() {
-    let mut left = GroupedAggregateHashTable::new(
-        vec![LogicalType::Integer],
-        vec![make_sum_object()],
-        vec![vec![0]],
-        paro_common::test_utils::test_allocator(),
-    )
-    .expect("left table");
-    let mut right = GroupedAggregateHashTable::new(
-        vec![LogicalType::Integer],
-        vec![make_sum_object()],
-        vec![vec![0]],
-        paro_common::test_utils::test_allocator(),
-    )
-    .expect("right table");
+fn grouped_hash_table_bulk_combines_source_frontier() {
+    let mut left = sum_table(&[1, 2], &[10, 20]);
+    let right = sum_table(&[2, 3, 2], &[7, 8, 1]);
+    let tail = sum_table(&[1, 4, 3], &[5, 11, 2]);
+    let mut sources = vec![right, tail];
 
-    let left_groups = Chunk::from_vectors(
-        vec![paro_common::test_utils::test_i32_vector_with_allocator(
-            &[1, 2],
-            paro_common::test_utils::test_allocator(),
-        )],
-        paro_common::test_utils::test_allocator(),
-    );
-    let left_hashes = left.hash_groups(&left_groups).expect("left hashes");
-    let mut left_addresses =
-        paro_common::test_utils::test_vector_with_capacity(LogicalType::BigInt, left_groups.size());
-    let mut left_new_groups =
-        paro_common::test_utils::test_selection_with_capacity(left_groups.size());
-    left.find_or_create_groups(
-        &left_groups,
-        &left_hashes,
-        &mut left_addresses,
-        &mut left_new_groups,
-    )
-    .expect("left find/create");
-    let left_payload = Chunk::from_vectors(
-        vec![paro_common::test_utils::test_i64_vector_with_allocator(
-            &[10, 20],
-            paro_common::test_utils::test_allocator(),
-        )],
-        paro_common::test_utils::test_allocator(),
-    );
-    left.update_aggregates(&left_payload, &left_addresses, None)
-        .expect("left update");
-
-    let right_groups = Chunk::from_vectors(
-        vec![paro_common::test_utils::test_i32_vector_with_allocator(
-            &[2, 3, 2],
-            paro_common::test_utils::test_allocator(),
-        )],
-        paro_common::test_utils::test_allocator(),
-    );
-    let right_hashes = right.hash_groups(&right_groups).expect("right hashes");
-    let mut right_addresses = paro_common::test_utils::test_vector_with_capacity(
-        LogicalType::BigInt,
-        right_groups.size(),
-    );
-    let mut right_new_groups =
-        paro_common::test_utils::test_selection_with_capacity(right_groups.size());
-    right
-        .find_or_create_groups(
-            &right_groups,
-            &right_hashes,
-            &mut right_addresses,
-            &mut right_new_groups,
-        )
-        .expect("right find/create");
-    let right_payload = Chunk::from_vectors(
-        vec![paro_common::test_utils::test_i64_vector_with_allocator(
-            &[7, 8, 1],
-            paro_common::test_utils::test_allocator(),
-        )],
-        paro_common::test_utils::test_allocator(),
-    );
-    right
-        .update_aggregates(&right_payload, &right_addresses, None)
-        .expect("right update");
-
-    left.combine(&mut right)
-        .expect("combine grouped hash tables");
+    left.combine_many(&mut sources)
+        .expect("bulk combine grouped hash tables");
     let actual = build_map_from_scan(collect_scan_rows(&mut left));
-    let expected = HashMap::from([(1, 10), (2, 28), (3, 8)]);
+    let expected = HashMap::from([(1, 15), (2, 28), (3, 10), (4, 11)]);
+    assert_eq!(actual, expected);
+}
+
+#[test]
+fn grouped_hash_table_bulk_combines_trivial_states_directly() {
+    let mut target = count_table(&[1, 2]);
+    let mut sources = vec![count_table(&[2, 3, 2]), count_table(&[1, 4, 3])];
+    assert!(target.direct_update_program.is_some());
+
+    target
+        .combine_many(&mut sources)
+        .expect("direct bulk combine grouped hash tables");
+    let actual = build_map_from_scan(collect_scan_rows(&mut target));
+    let expected = HashMap::from([(1, 2), (2, 3), (3, 2), (4, 1)]);
     assert_eq!(actual, expected);
 }
 

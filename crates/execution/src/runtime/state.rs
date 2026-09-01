@@ -46,7 +46,9 @@ pub use crate::operators::join::state::{
     SortRangeProbeOffsets,
 };
 pub use crate::operators::result::state::{ClientResultSinkGlobal, ClientResultSinkLocal};
-pub use crate::operators::row_fetch::{RowFetchTableState, RowFetchTransformLocal};
+pub use crate::operators::row_fetch::{
+    RowFetchTableBinding, RowFetchTableState, RowFetchTransformGlobal, RowFetchTransformLocal,
+};
 pub use crate::operators::scan::state::{
     ChunkSourceGlobal, ChunkSourceLocal, EmptySourceGlobal, EmptySourceLocal,
     ExpressionSourceGlobal, ExpressionSourceLocal, PreparedRowsetPredicate, RowsetScanMorsel,
@@ -343,6 +345,7 @@ pub enum TransformGlobal {
     ExternalProject(Arc<ExternalProjectTransformGlobal>),
     GraphExpand(Arc<GraphExpandTransformGlobal>),
     GraphShortestPath(Arc<GraphShortestPathTransformGlobal>),
+    RowFetch(Arc<RowFetchTransformGlobal>),
     Dyn(DynGlobalStateBox),
 }
 

@@ -46,7 +46,11 @@ impl TopNBuildSinkExec {
             self.spec.offset,
             topn_memory_context(ctx.query),
         );
-        handle.initialize(TopNRuntimeState { heap, boundary })?;
+        handle.initialize(TopNRuntimeState {
+            heap,
+            pending_heaps: Vec::new(),
+            boundary,
+        })?;
         Ok(SinkGlobal::TopNBuild(Arc::new(BreakerHandleGlobal {
             handle,
         })))
@@ -138,7 +142,7 @@ impl TopNBuildSinkExec {
 
     pub(crate) fn merge_local(
         &self,
-        _ctx: &mut OperatorCallContext,
+        ctx: &mut OperatorCallContext,
         global: &SinkGlobal,
         local: &mut SinkLocal,
     ) -> Result<MergePoll> {
@@ -150,9 +154,19 @@ impl TopNBuildSinkExec {
         let SinkLocal::TopNBuild(local) = local else {
             return Err(paro_error::internal("topn build sink local state mismatch"));
         };
+        let completed = std::mem::replace(
+            &mut local.heap,
+            TopNHeap::new_with_memory(
+                self.spec.output_types.to_vec(),
+                &self.spec.orders,
+                self.spec.limit,
+                self.spec.offset,
+                topn_memory_context(ctx.query),
+            ),
+        );
         global.handle.with_state_mut(|state| {
-            state.heap.combine(&mut local.heap)?;
-            state.heap.reduce()
+            state.pending_heaps.push(completed);
+            Ok(())
         })?;
         Ok(MergePoll::Done)
     }

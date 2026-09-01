@@ -13,14 +13,16 @@ use paro_common::memory::{AccountedVec, MemoryAccountingClass, MemoryAccountingC
 use paro_common::runtime_value::Value;
 use paro_common::types::LogicalType;
 use paro_common::vector::{SelectionVector, Vector, VECTOR_SIZE};
-use paro_function::aggregate::{AggregateCombineType, AggregateInputData, AggregateStateInput};
+use paro_function::aggregate::{
+    AggregateCombineType, AggregateInputData, AggregateStateInput, DirectGroupedAggregateProgram,
+};
 
 use super::aggregate_kernel::{
     combine_states, destroy_states, filtered_input_vectors_for_aggregate, finalize_states,
     initialize_states, input_vectors_for_aggregate, serialize_aggregate_state_blob,
     update_filtered_states, update_states, with_aggregate_input_data, AggregatePayload,
 };
-use super::aggregate_object::AggregateObject;
+use super::aggregate_object::{compile_direct_update_program, AggregateObject};
 use super::aggregate_state::AggregateStateLayout;
 use super::group_hash::hash_group_columns;
 use super::tuple_layout::{TupleLayout, TupleScatterSource, VarlenHeap};
@@ -254,6 +256,7 @@ pub struct GroupedAggregateHashTable {
     layout: TupleLayout,
     state_layout: AggregateStateLayout,
     aggregate_objects: Vec<AggregateObject>,
+    direct_update_program: Option<DirectGroupedAggregateProgram>,
     aggregate_inputs: Vec<Vec<usize>>,
     aggregate_return_types: Vec<LogicalType>,
     varlen_heap: VarlenHeap,
@@ -355,6 +358,11 @@ impl GroupedAggregateHashTable {
         validate_aggregate_inputs(&aggregate_objects, &aggregate_inputs)?;
         let layout = TupleLayout::build(&group_types, &aggregate_objects)?;
         let state_layout = AggregateStateLayout::new(&aggregate_objects)?;
+        let direct_update_program = {
+            let program =
+                compile_direct_update_program(&aggregate_objects, &aggregate_inputs, &state_layout);
+            program.supports_trivial_state_copy().then_some(program)
+        };
         let aggregate_return_types = aggregate_objects
             .iter()
             .map(|object| object.return_type.clone())
@@ -403,6 +411,7 @@ impl GroupedAggregateHashTable {
             layout,
             state_layout,
             aggregate_objects,
+            direct_update_program,
             aggregate_inputs,
             aggregate_return_types,
             varlen_heap: VarlenHeap::new_with_memory(

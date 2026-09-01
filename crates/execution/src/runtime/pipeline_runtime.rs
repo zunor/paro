@@ -186,7 +186,11 @@ impl PipelineRuntime {
 
     /// Prove that an empty source can bypass all data-path local state.
     pub(crate) fn can_complete_empty_without_data_task(&self) -> bool {
-        self.program.transforms.is_empty() && self.program.sink.exec.empty_local_merge_is_identity()
+        self.program
+            .transforms
+            .iter()
+            .all(|transform| transform.exec.empty_local_flush_is_identity())
+            && self.program.sink.exec.empty_local_merge_is_identity()
     }
 
     fn init_context<'a>(
@@ -227,13 +231,15 @@ mod tests {
 
     use paro_common::types::LogicalType;
     use paro_context::TestStatementContextBuilder;
+    use paro_planner::expression::{Expression, ReferenceExpression};
 
     use crate::memory_runtime::QueryMemoryPool;
     use crate::physical::properties::PipelineProperties;
     use crate::physical::row_type::RowType;
-    use crate::physical::specs::EmptyResultSpec;
+    use crate::physical::specs::{EmptyResultSpec, ProjectSpec};
     use crate::pipeline::graph::{
         ClientResultSpec, PipelineId, PipelineSpec, SinkSharing, SinkSpec, SourceSpec,
+        TransformSpec,
     };
     use crate::pipeline::program::PipelineProgramBuilder;
 
@@ -299,5 +305,40 @@ mod tests {
             .expect("finish task state");
         assert!(finish.is_finish_only());
         assert!(finish.pending.is_empty());
+    }
+
+    #[test]
+    fn builtin_transforms_allow_proven_empty_data_path_elision() {
+        let query = query_context();
+        let spec = PipelineSpec {
+            id: PipelineId::new(0),
+            source: SourceSpec::Empty(EmptyResultSpec),
+            transforms: vec![TransformSpec::Project(ProjectSpec {
+                expressions: Box::new([Expression::Reference(ReferenceExpression::new(
+                    0,
+                    LogicalType::Integer,
+                ))]),
+                output_names: Box::new(["v".to_string()]),
+                visible_count: 1,
+            })],
+            sink: SinkSpec::ClientResult(ClientResultSpec::default()),
+            sink_sharing: SinkSharing::Exclusive,
+            properties: PipelineProperties::default(),
+            output: RowType::new(vec!["v".to_string()], vec![LogicalType::Integer]),
+        };
+        let program = Arc::new(
+            PipelineProgramBuilder::default()
+                .build_program(&spec)
+                .expect("program build"),
+        );
+        let runtime = PipelineRuntime::from_catalog(
+            program,
+            &BreakerHandleCatalog::default(),
+            query.params.clone(),
+            &query,
+        )
+        .expect("runtime init");
+
+        assert!(runtime.can_complete_empty_without_data_task());
     }
 }

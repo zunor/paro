@@ -495,6 +495,7 @@ mod tests {
             .expect("topn")
             .initialize(TopNRuntimeState {
                 heap: TopNHeap::new(vec![LogicalType::Integer], &[], 1, 0),
+                pending_heaps: Vec::new(),
                 boundary: Arc::new(TopNBoundaryValue::new()),
             })
             .expect("initialize topn");

@@ -12,7 +12,7 @@ use parking_lot::Mutex;
 use paro_common::allocator::Allocator;
 use paro_common::error::{self as paro_error, Result};
 use paro_common::runtime_value::Value;
-use paro_common::types::LogicalType;
+use paro_common::types::{LogicalType, StringView};
 use paro_common::vector::{
     DictionaryInfo, DictionarySource, SelectionVector, ValidatedVectorSelection, Vector,
 };
@@ -811,6 +811,16 @@ pub(crate) fn decode_sparse_column_batch(
     let Some(storage_dictionary) = &batch.storage_dictionary else {
         return decode_column_batch(logical_type, batch, rows, allocator, None);
     };
+    if let Some(vector) = decode_sparse_borrowed_varlen_dictionary(
+        logical_type,
+        storage_dictionary,
+        batch.nulls.as_deref(),
+        rows,
+        allocator.clone(),
+        batch.has_verified_utf8(),
+    )? {
+        return Ok(vector);
+    }
     let Some(localized) =
         localize_storage_dictionary(storage_dictionary, batch.nulls.as_deref(), rows)?
     else {
@@ -835,6 +845,125 @@ pub(crate) fn decode_sparse_column_batch(
         batch.has_verified_utf8(),
         None,
     )
+}
+
+/// Build a sparse dictionary child directly over the immutable storage page.
+///
+/// The ordinary localized path copies referenced strings into a new encoded
+/// page and then copies them again into a vector string heap. Sparse late
+/// fetch already owns the source dictionary page through `Bytes`; attach that
+/// owner to the child and materialize only `StringView`s plus the logical code
+/// stream. Fixed-width dictionaries keep the established decoder path.
+fn decode_sparse_borrowed_varlen_dictionary(
+    logical_type: &LogicalType,
+    batch: &StorageDictionaryBatch,
+    nulls: Option<&[u8]>,
+    rows: usize,
+    allocator: Arc<dyn Allocator>,
+    utf8_verified: bool,
+) -> Result<Option<Vector>> {
+    if !(logical_type.is_utf8_varlen() || logical_type == &LogicalType::Blob) {
+        return Ok(None);
+    }
+    let codes = ValidatedDictionaryCodes::try_new(batch.codes.as_ref(), rows)?;
+    if nulls.is_some_and(|flags| flags.len() < rows) {
+        return Err(paro_error::data_corrupted(
+            "Null map shorter than sparse dictionary row count",
+        ));
+    }
+
+    let mut dictionary = BinaryPlainPageDecoder::new(batch.dictionary.clone());
+    dictionary.init()?;
+    let dictionary_len = dictionary.count() as usize;
+    if rows.saturating_mul(4) >= dictionary_len {
+        return Ok(None);
+    }
+
+    let mut referenced_codes = Vec::with_capacity(rows);
+    for row_idx in 0..rows {
+        if nulls.is_some_and(|flags| flags[row_idx] != 0) {
+            continue;
+        }
+        let code = codes.code_at(row_idx);
+        if code as usize >= dictionary_len {
+            return Err(paro_error::data_corrupted(format!(
+                "storage dictionary code {code} out of range {dictionary_len}"
+            )));
+        }
+        referenced_codes.push(code);
+    }
+    referenced_codes.sort_unstable();
+    referenced_codes.dedup();
+
+    let has_null_slot = nulls.is_some();
+    let child_count = referenced_codes.len() + usize::from(has_null_slot);
+    let mut child = Vector::try_new(logical_type.clone(), child_count, allocator.clone())?;
+    let owner = Arc::new(batch.dictionary.clone());
+    // SAFETY: every long StringView below points into `batch.dictionary`.
+    // `owner` is a clone of that immutable Bytes allocation and is attached to
+    // the vector before the entries are published. Every entry, including the
+    // optional NULL slot, is initialized in this scope.
+    let (entries, validity) = unsafe { child.try_begin_borrowed_varlen_write(child_count, owner)? };
+    for (index, &code) in referenced_codes.iter().enumerate() {
+        let value = dictionary
+            .value_ref_at(code)
+            .ok_or_else(|| paro_error::data_corrupted("dictionary entry missing"))?;
+        if logical_type.is_utf8_varlen() && !utf8_verified {
+            std::str::from_utf8(value)
+                .map_err(|_| paro_error::data_corrupted("Invalid UTF-8 in string column"))?;
+        }
+        let view = if let Some(inline) = StringView::try_inline(value) {
+            inline
+        } else {
+            let len = u32::try_from(value.len())
+                .map_err(|_| paro_error::out_of_range("dictionary value exceeds u32 length"))?;
+            // SAFETY: `value` is a slice of the immutable page retained by the
+            // vector lifetime owner installed above.
+            unsafe { StringView::from_out_of_line(value, value.as_ptr(), len) }
+        };
+        // SAFETY: `entries` has exactly `child_count` initialized slots and
+        // every referenced-code index is inside that range.
+        unsafe { entries.add(index).write(view) };
+        validity.set_valid(index);
+    }
+    if has_null_slot {
+        let null_index = referenced_codes.len();
+        // NULL entries still receive a canonical initialized payload.
+        unsafe {
+            entries
+                .add(null_index)
+                .write(StringView::try_inline(&[]).expect("empty StringView is inline"));
+        }
+        validity.set_invalid(null_index);
+    }
+    child.try_set_count(child_count)?;
+    let child = Arc::new(child);
+
+    let null_index = referenced_codes.len() as u32;
+    let mut local_codes = Vec::with_capacity(rows);
+    for row_idx in 0..rows {
+        let local_code = if nulls.is_some_and(|flags| flags[row_idx] != 0) {
+            null_index
+        } else {
+            let code = codes.code_at(row_idx);
+            u32::try_from(referenced_codes.binary_search(&code).map_err(|_| {
+                paro_error::internal("referenced dictionary code missing from borrowed domain")
+            })?)
+            .map_err(|_| paro_error::out_of_range("sparse dictionary exceeds u32 domain"))?
+        };
+        local_codes.push(local_code);
+    }
+    let selection = SelectionVector::try_from_owned_indices(local_codes, allocator)?;
+    let selection = validate_storage_dictionary_selection(selection, child.len())?;
+    Ok(Some(Vector::try_with_validated_dictionary(
+        child,
+        selection,
+        DictionaryInfo {
+            unique_len: child_count,
+            provenance_id: None,
+            source: DictionarySource::Storage,
+        },
+    )?))
 }
 
 fn localize_storage_dictionary(
@@ -1824,6 +1953,7 @@ mod tests {
             Arc::new(default_allocator()),
         )
         .unwrap();
+        drop(batch);
 
         assert_eq!(vector.get_string(0), Some("dictionary_value_091"));
         assert_eq!(vector.get_string(1), Some("dictionary_value_003"));
@@ -1832,6 +1962,14 @@ mod tests {
         let info = vector.dictionary_info().expect("localized dictionary");
         assert_eq!(info.unique_len, 3);
         assert_eq!(info.provenance_id, None);
+        assert!(
+            vector
+                .child()
+                .expect("sparse dictionary child")
+                .string_heap()
+                .is_none(),
+            "sparse varlen child should borrow its immutable storage page"
+        );
     }
 
     #[test]

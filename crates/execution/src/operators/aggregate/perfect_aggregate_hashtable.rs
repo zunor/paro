@@ -24,7 +24,7 @@ use super::aggregate_kernel::{
     initialize_state_at_address, input_vectors_for_aggregate, update_filtered_states,
     update_states, with_aggregate_input_data, AggregatePayload,
 };
-use super::aggregate_object::AggregateObject;
+use super::aggregate_object::{compile_direct_update_program, AggregateObject};
 use super::aggregate_state::AggregateStateLayout;
 use super::perfect_hash_key::PerfectHashKeyDomain;
 
@@ -40,7 +40,6 @@ use key_encoding::{
 use key_encoding::{PreparedDictionaryKey, PreparedSlotEncoding};
 pub(crate) use reduction::ParallelPerfectAggregateMerge;
 use slot_bitmap::SlotBitmap;
-pub(crate) use support::compile_direct_update_program;
 use support::{
     accounted_vec_from_reservation, bytes_to_words, compact_state_addresses,
     direct_update_scratch_bytes, pointer_vector_from_slice, validate_addresses_vector,

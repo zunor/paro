@@ -415,7 +415,7 @@ fn materialize_row_fetch_input(
             .reader
             .as_mut()
             .expect("graph project table reader was initialized above");
-        let fetched = reader.get_by_rowids(&fetch.rowids, &fetch.column_ids)?;
+        let fetched = reader.get_by_rowids(&fetch.rowids)?;
 
         for pos in 0..fetch.required_columns.len() {
             combined_columns.push(fetched.column(pos).cloned().ok_or_else(|| {

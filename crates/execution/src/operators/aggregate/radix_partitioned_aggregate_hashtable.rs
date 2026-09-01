@@ -440,6 +440,40 @@ impl AggregateHashTable {
         }
     }
 
+    /// Consume several completed source tables in one bulk merge.
+    ///
+    /// Aggregate finalization owns every source fragment at this point. Making
+    /// that ownership explicit lets flat partitions reserve once for the full
+    /// merge frontier instead of repeatedly growing for individual workers.
+    pub(crate) fn combine_sources(&mut self, sources: Vec<Self>) -> Result<()> {
+        match self {
+            Self::Flat(target) => {
+                let mut flat_sources = Vec::with_capacity(sources.len());
+                for source in sources {
+                    let Self::Flat(source) = source else {
+                        return Err(paro_error::internal(
+                            "cannot bulk-combine radix aggregate source into flat target",
+                        ));
+                    };
+                    flat_sources.push(source);
+                }
+                target.combine_many(&mut flat_sources)
+            }
+            Self::Radix(target) => {
+                let mut radix_sources = Vec::with_capacity(sources.len());
+                for source in sources {
+                    let Self::Radix(source) = source else {
+                        return Err(paro_error::internal(
+                            "cannot bulk-combine flat aggregate source into radix target",
+                        ));
+                    };
+                    radix_sources.push(source);
+                }
+                target.combine_sources(radix_sources)
+            }
+        }
+    }
+
     pub fn scan(
         &mut self,
         position: &mut AggregateHTScanPosition,
@@ -985,6 +1019,43 @@ bits {}/{} partitions {}/{} group_types {:?}/{:?}",
                 ))
             })?;
             left.combine(right)?;
+        }
+        Ok(())
+    }
+
+    fn combine_sources(&mut self, sources: Vec<Self>) -> Result<()> {
+        for source in &sources {
+            if self.partition_bits != source.partition_bits
+                || self.group_types != source.group_types
+                || self.partitions.len() != source.partitions.len()
+            {
+                return Err(paro_error::internal(format!(
+                    "Cannot bulk-combine radix aggregate hash tables with different layouts: \
+bits {}/{} partitions {}/{} group_types {:?}/{:?}",
+                    self.partition_bits,
+                    source.partition_bits,
+                    self.partitions.len(),
+                    source.partitions.len(),
+                    self.group_types,
+                    source.group_types
+                )));
+            }
+        }
+
+        let mut sources_by_partition = (0..self.partitions.len())
+            .map(|_| Vec::with_capacity(sources.len()))
+            .collect::<Vec<_>>();
+        for source in sources {
+            for (partition_idx, partition) in source.partitions.into_iter().enumerate() {
+                sources_by_partition[partition_idx].push(partition);
+            }
+        }
+        for (target, sources) in self
+            .partitions
+            .iter_mut()
+            .zip(sources_by_partition.iter_mut())
+        {
+            target.combine_many(sources)?;
         }
         Ok(())
     }
