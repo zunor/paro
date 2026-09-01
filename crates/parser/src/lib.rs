@@ -35,7 +35,7 @@ pub use parser::entry::{parse_expr_tokens, parse_one_tokens, parse_tokens, token
 pub use parser::token::Token;
 pub use parser_error::ParseError;
 pub use span::{Range, Span};
-pub use visitor::{ExprRewriter, StatementReplacer, StatementVisitor};
+pub use visitor::{CurrentQueryExprRewriter, ExprRewriter, StatementReplacer, StatementVisitor};
 
 pub type Result<T> = std::result::Result<T, ParseError>;
 

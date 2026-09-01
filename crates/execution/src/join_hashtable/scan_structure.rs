@@ -123,6 +123,7 @@ impl ScanStructure {
         if self.finished {
             return Ok(0);
         }
+        self.try_prepare_mutable_selections()?;
 
         let prepared_keys = self.prepare_probe_keys(keys, hash_table)?;
         let mut base_count = 0;
@@ -230,6 +231,21 @@ impl ScanStructure {
             has_long_chains: false,
             exact_key_matches: false,
         })
+    }
+
+    /// Materialize every selection that may be shared with the preceding
+    /// zero-copy output batch before entering an infallible hot write loop.
+    /// Allocation failure belongs to the query error channel, never to a
+    /// worker-thread panic from `SelectionVector::set` or `as_mut_slice`.
+    fn try_prepare_mutable_selections(&mut self) -> Result<()> {
+        self.sel_vector.try_make_exclusive()?;
+        self.probe_sel.try_make_exclusive()?;
+        self.continue_sel.try_make_exclusive()?;
+        self.chain_match_sel.try_make_exclusive()?;
+        self.scratch_sel.try_make_exclusive()?;
+        self.lhs_sel.try_make_exclusive()?;
+        self.rhs_dictionary_sel.try_make_exclusive()?;
+        Ok(())
     }
 
     /// Ensure the scan structure can address all probe rows in the current batch.
@@ -425,6 +441,7 @@ impl ScanStructure {
     where
         F: FnMut(&SelectionVector, &[usize], usize, &mut SelectionVector) -> Result<usize>,
     {
+        self.try_prepare_mutable_selections()?;
         let prepared_keys = self.prepare_probe_keys(keys, hash_table)?;
         while self.count > 0 {
             let match_count = self.resolve_predicates(prepared_keys.as_ref(), hash_table, 0);
@@ -480,6 +497,7 @@ impl ScanStructure {
     where
         F: FnMut(&SelectionVector, &[usize], usize, &mut SelectionVector) -> Result<usize>,
     {
+        self.try_prepare_mutable_selections()?;
         let prepared_keys = self.prepare_probe_keys(keys, hash_table)?;
         while self.count > 0 {
             let match_count = self.resolve_predicates(prepared_keys.as_ref(), hash_table, 0);
@@ -516,6 +534,7 @@ impl ScanStructure {
     where
         F: FnMut(&SelectionVector, &[usize], usize, &mut [u8]) -> Result<()>,
     {
+        self.try_prepare_mutable_selections()?;
         let prepared_keys = self.prepare_probe_keys(keys, hash_table)?;
         while self.count > 0 {
             let match_count = self.resolve_predicates(prepared_keys.as_ref(), hash_table, 0);
@@ -554,6 +573,7 @@ impl ScanStructure {
             result.set_cardinality(0);
             return Ok(0);
         }
+        self.try_prepare_mutable_selections()?;
 
         if !self.probe_matches_ready {
             self.scan_key_matches_with_filter(keys, hash_table, residual_filter)?;
@@ -610,6 +630,7 @@ impl ScanStructure {
             result.set_cardinality(0);
             return Ok(0);
         }
+        self.try_prepare_mutable_selections()?;
 
         if !self.probe_matches_ready {
             self.scan_key_matches_with_filter(keys, hash_table, Self::accept_all_matches)?;
@@ -759,6 +780,7 @@ impl ScanStructure {
             result.try_set_cardinality(0)?;
             return Ok(0);
         }
+        self.try_prepare_mutable_selections()?;
 
         let mut output_count = 0usize;
         while self.count > 0 {
@@ -876,6 +898,7 @@ impl ScanStructure {
             result.set_cardinality(0);
             return Ok(0);
         }
+        self.try_prepare_mutable_selections()?;
 
         let prepared_keys = self.prepare_probe_keys(keys, hash_table)?;
         let mut base_count = 0;
@@ -1061,6 +1084,7 @@ impl ScanStructure {
             result.set_cardinality(0);
             return Ok(0);
         }
+        self.try_prepare_mutable_selections()?;
 
         self.scan_key_matches_with_filter(keys, hash_table, residual_filter)?;
 
@@ -1119,6 +1143,7 @@ impl ScanStructure {
             result.set_cardinality(0);
             return Ok(0);
         }
+        self.try_prepare_mutable_selections()?;
 
         if !self.probe_matches_ready {
             let prepared_keys = self.prepare_probe_keys(keys, hash_table)?;

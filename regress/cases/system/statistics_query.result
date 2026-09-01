@@ -41,26 +41,24 @@ SELECT s.id, b.payload
 FROM stats_small AS s
 JOIN stats_big AS b ON s.id = b.id;
 QUERY PLAN
-PROJECTION  (rows=0)
+PROJECTION  (rows=1)
   Output: s.id, b.payload
-  Cardinality: [0, 0, 1]
+  Cardinality: [1, 1, 1]
   Output Schema: "s.id" INTEGER, "b.payload" VARCHAR
-  ->  HASH_JOIN  (rows=0)
+  ->  HASH_JOIN  (rows=1)
     Join Type: INNER
     Build Index: integer_build_time
-    Join Condition: s.id = b.id
-    Cardinality: [0, 0, 1]
-    Output Schema: s.id INTEGER, b.payload VARCHAR
+    Join Condition: b.id = s.id
+    Cardinality: [1, 1, 1]
+    Output Schema: b.payload VARCHAR, s.id INTEGER
+    ->  ROWSET_SCAN on public.stats_big b  (rows=5)
+      Columns: id, payload
+      Cardinality: [5, 5, 5]
+      Output Schema: b.id INTEGER, b.payload VARCHAR
     ->  ROWSET_SCAN on public.stats_small s  (rows=1)
       Columns: id
       Cardinality: [1, 1, 1]
       Output Schema: s.id INTEGER
-    ->  ROWSET_SCAN on public.stats_big b  (rows=1)
-      Columns: id, payload
-      Pushed Predicate: id <= 1
-      Late Materialize: auto
-      Cardinality: [0, 1, 2]
-      Output Schema: b.id INTEGER, b.payload VARCHAR
 
 SELECT s.id, b.payload
 FROM stats_small AS s

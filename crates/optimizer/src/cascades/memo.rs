@@ -43,10 +43,17 @@ impl LogicalProperties {
     }
 }
 
+/// Declarative provenance and precedence of a group-level estimation recipe.
+///
+/// The order is semantic: later variants may replace earlier ones during a
+/// true group merge. A recipe fingerprint identifies evidence but never ranks
+/// its quality.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, PartialOrd, Ord)]
-pub enum CardinalityAuthority {
+pub enum CardinalityRecipeKind {
     #[default]
     Statistics,
+    /// An exact row-count dependency on a row-preserving input group.
+    RowPreservingInput,
     /// A rewrite whose equivalence proof exposes stronger relational-domain
     /// information to the estimator (for example aggregate subsumption).
     ConstraintRefined,
@@ -56,19 +63,25 @@ pub enum CardinalityAuthority {
 
 /// Canonical, expression-independent cardinality estimate for one Memo group.
 ///
-/// `recipe` identifies the relational estimation recipe, not a physical or
-/// rewritten tree. Equivalent-expression insertion never changes this value.
-/// A true group merge chooses a recipe deterministically, so estimates cannot
-/// depend on rule scheduling or the eventual physical winner.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+/// `recipe` identifies relational estimation evidence, not a physical winner.
+/// Shape-only alternatives inherit the current group recipe; a transformation
+/// may refine it only through an explicitly declared [`CardinalityRecipeKind`].
+/// A true group merge combines peer uncertainty deterministically, so estimates
+/// cannot depend on rule scheduling or the eventual physical winner.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct GroupCardinality {
-    pub recipe: Fingerprint,
-    pub authority: CardinalityAuthority,
-    pub range: Option<CardinalityEnvelope>,
-    /// A semantic row-preserving dependency on another group. The estimate is
-    /// resolved lazily so a refined child estimate cannot leave ancestors
-    /// stale. Direct estimator recipes leave this empty.
-    pub input: Option<GroupId>,
+    /// Stable witness for diagnostics only. It never participates in estimate
+    /// selection; peer merges retain the minimum solely as an associative,
+    /// commutative and idempotent summary.
+    recipe: Fingerprint,
+    pub kind: CardinalityRecipeKind,
+    /// The uncertainty hull of direct estimators at the selected recipe kind.
+    range: Option<CardinalityEnvelope>,
+    /// Semantic row-preserving dependencies. Multiple equivalent expressions
+    /// may expose different input groups; retaining the complete bounded set
+    /// makes group merging associative and lets their current estimates form
+    /// an uncertainty hull during costing.
+    inputs: BTreeSet<GroupId>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -82,92 +95,114 @@ pub struct CardinalityEnvelope {
 impl GroupCardinality {
     pub fn new(
         recipe: Fingerprint,
-        authority: CardinalityAuthority,
+        kind: CardinalityRecipeKind,
         lower: u64,
         expected: u64,
         upper: u64,
     ) -> Self {
         Self {
             recipe,
-            authority,
+            kind,
             range: Some(CardinalityEnvelope {
                 lower,
                 expected_lower: expected,
                 expected_upper: expected,
                 upper,
             }),
-            input: None,
+            inputs: BTreeSet::new(),
+        }
+    }
+
+    pub fn unknown(recipe: Fingerprint, kind: CardinalityRecipeKind) -> Self {
+        Self {
+            recipe,
+            kind,
+            range: None,
+            inputs: BTreeSet::new(),
         }
     }
 
     pub fn inherit(recipe: Fingerprint, input: GroupId) -> Self {
         Self {
             recipe,
-            input: Some(input),
-            ..Self::default()
+            kind: CardinalityRecipeKind::RowPreservingInput,
+            range: None,
+            inputs: BTreeSet::from([input]),
         }
+    }
+
+    pub fn with_kind(mut self, kind: CardinalityRecipeKind) -> Self {
+        self.kind = kind;
+        self
     }
 
     pub fn canonical_with(self, other: Self) -> Self {
-        let self_available = self.range.is_some() || self.input.is_some();
-        let other_available = other.range.is_some() || other.input.is_some();
-        match self.authority.cmp(&other.authority) {
-            std::cmp::Ordering::Less if other_available => other,
-            std::cmp::Ordering::Greater if self_available => self,
-            _ => match (self.range, other.range) {
-                (None, None) => Self {
-                    recipe: self.recipe.min(other.recipe),
-                    authority: self.authority.max(other.authority),
-                    range: None,
-                    input: if self.recipe <= other.recipe {
-                        self.input
-                    } else {
-                        other.input
-                    },
-                },
-                (Some(range), None) => Self {
-                    recipe: self.recipe,
-                    authority: self.authority,
-                    range: Some(range),
-                    input: self.input,
-                },
-                (None, Some(range)) => Self {
-                    recipe: other.recipe,
-                    authority: other.authority,
-                    range: Some(range),
-                    input: other.input,
-                },
-                (Some(left), Some(right)) => {
-                    // Equal-authority estimates are alternative recipes, not
-                    // independent observations. Select by recipe identity;
-                    // never bias the optimizer toward the numerically smaller
-                    // estimate or whichever expression happened to arrive.
-                    if self.recipe <= other.recipe {
-                        Self {
-                            recipe: self.recipe,
-                            authority: self.authority,
-                            range: Some(left),
-                            input: self.input,
-                        }
-                    } else {
-                        Self {
-                            recipe: other.recipe,
-                            authority: other.authority,
-                            range: Some(right),
-                            input: other.input,
-                        }
+        let self_available = self.range.is_some() || !self.inputs.is_empty();
+        let other_available = other.range.is_some() || !other.inputs.is_empty();
+        match (self_available, other_available) {
+            (false, true) => return other,
+            (true, false) => return self,
+            (false, false) => {
+                return match self.kind.cmp(&other.kind) {
+                    std::cmp::Ordering::Less => other,
+                    std::cmp::Ordering::Greater => self,
+                    std::cmp::Ordering::Equal => {
+                        Self::unknown(self.recipe.min(other.recipe), self.kind)
                     }
+                };
+            }
+            (true, true) => {}
+        }
+        match self.kind.cmp(&other.kind) {
+            std::cmp::Ordering::Less => other,
+            std::cmp::Ordering::Greater => self,
+            std::cmp::Ordering::Equal => {
+                let range = match (self.range, other.range) {
+                    (Some(left), Some(right)) => Some(left.hull(right)),
+                    (Some(range), None) | (None, Some(range)) => Some(range),
+                    (None, None) => None,
+                };
+                let mut inputs = self.inputs;
+                inputs.extend(other.inputs);
+                Self {
+                    // This value summarizes provenance; it does not elect the
+                    // estimate associated with either peer recipe.
+                    recipe: self.recipe.min(other.recipe),
+                    kind: self.kind,
+                    range,
+                    inputs,
                 }
-            },
+            }
         }
     }
 
-    pub fn representative(self) -> Option<(u64, u64, u64)> {
+    pub fn representative(&self) -> Option<(u64, u64, u64)> {
         let range = self.range?;
         let expected = range
             .expected_lower
             .saturating_add(range.expected_upper.saturating_sub(range.expected_lower) / 2);
         Some((range.lower, expected, range.upper))
+    }
+}
+
+impl CardinalityEnvelope {
+    fn hull(self, other: Self) -> Self {
+        Self {
+            lower: self.lower.min(other.lower),
+            expected_lower: self.expected_lower.min(other.expected_lower),
+            expected_upper: self.expected_upper.max(other.expected_upper),
+            upper: self.upper.max(other.upper),
+        }
+    }
+
+    fn clamp(mut self, maximum: Option<u64>) -> Self {
+        if let Some(maximum) = maximum {
+            self.lower = self.lower.min(maximum);
+            self.expected_lower = self.expected_lower.min(maximum).max(self.lower);
+            self.expected_upper = self.expected_upper.min(maximum).max(self.expected_lower);
+            self.upper = self.upper.min(maximum).max(self.expected_upper);
+        }
+        self
     }
 }
 
@@ -716,32 +751,30 @@ impl Memo {
     /// Resolve a group's canonical cardinality recipe and clamp it by every
     /// hard relational bound along a row-preserving dependency chain.
     pub fn cardinality_envelope(&self, id: GroupId) -> Option<CardinalityEnvelope> {
-        let mut current = self.canonical_group(id);
-        let mut maximum = None;
-        let mut visited = BTreeSet::new();
-        loop {
-            if !visited.insert(current) {
+        fn resolve(
+            memo: &Memo,
+            id: GroupId,
+            visiting: &mut BTreeSet<GroupId>,
+        ) -> Option<CardinalityEnvelope> {
+            let id = memo.canonical_group(id);
+            if !visiting.insert(id) {
                 return None;
             }
-            let group = self.group(current)?;
-            maximum = match (maximum, group.logical_properties.maximum_cardinality) {
-                (Some(left), Some(right)) => Some(left.min(right)),
-                (Some(bound), None) | (None, Some(bound)) => Some(bound),
-                (None, None) => None,
-            };
-            if let Some(input) = group.cardinality.input {
-                current = self.canonical_group(input);
-                continue;
+            let group = memo.group(id)?;
+            let mut envelope = group.cardinality.range;
+            for input in &group.cardinality.inputs {
+                if let Some(input) = resolve(memo, *input, visiting) {
+                    envelope = Some(match envelope {
+                        Some(current) => current.hull(input),
+                        None => input,
+                    });
+                }
             }
-            let mut range = group.cardinality.range?;
-            if let Some(maximum) = maximum {
-                range.lower = range.lower.min(maximum);
-                range.expected_lower = range.expected_lower.min(maximum).max(range.lower);
-                range.expected_upper = range.expected_upper.min(maximum).max(range.expected_lower);
-                range.upper = range.upper.min(maximum).max(range.expected_upper);
-            }
-            return Some(range);
+            visiting.remove(&id);
+            envelope.map(|range| range.clamp(group.logical_properties.maximum_cardinality))
         }
+
+        resolve(self, id, &mut BTreeSet::new())
     }
 
     pub fn cardinality_estimate(&self, id: GroupId) -> Option<(u64, u64, u64)> {
@@ -1050,9 +1083,8 @@ impl Memo {
         canonical_group
             .logical_properties
             .merge_equivalent_facts(&secondary_group.logical_properties);
-        canonical_group.cardinality = canonical_group
-            .cardinality
-            .canonical_with(secondary_group.cardinality);
+        canonical_group.cardinality = std::mem::take(&mut canonical_group.cardinality)
+            .canonical_with(std::mem::take(&mut secondary_group.cardinality));
         canonical_group.ledger.merge_from(&secondary_group.ledger);
         canonical_group
             .logical_exprs
@@ -1087,9 +1119,12 @@ impl Memo {
             }
         }
         for group in &mut self.groups {
-            if let Some(input) = group.cardinality.input.as_mut() {
-                *input = canonical(*input);
-            }
+            group.cardinality.inputs = group
+                .cardinality
+                .inputs
+                .iter()
+                .map(|input| canonical(*input))
+                .collect();
         }
         for owner in &mut self.logical_owners {
             *owner = canonical(*owner);

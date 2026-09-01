@@ -108,7 +108,7 @@ fn expression_cost_facts_read_current_group_cardinality() {
         LogicalProperties::default(),
         GroupCardinality::new(
             Fingerprint(1),
-            CardinalityAuthority::Statistics,
+            CardinalityRecipeKind::Statistics,
             80,
             100,
             120,
@@ -117,7 +117,7 @@ fn expression_cost_facts_read_current_group_cardinality() {
     let parent = memo.create_group(
         schema,
         LogicalProperties::default(),
-        GroupCardinality::new(Fingerprint(2), CardinalityAuthority::Statistics, 8, 10, 12),
+        GroupCardinality::new(Fingerprint(2), CardinalityRecipeKind::Statistics, 8, 10, 12),
     );
     let template = PlannerCostFacts {
         child_row_widths: vec![16].into_boxed_slice(),
@@ -129,7 +129,7 @@ fn expression_cost_facts_read_current_group_cardinality() {
     assert_eq!(initial.child_rows[0].expected, 100.0);
 
     memo.group_mut(child).unwrap().cardinality =
-        GroupCardinality::new(Fingerprint(3), CardinalityAuthority::JoinRegion, 4, 5, 6);
+        GroupCardinality::new(Fingerprint(3), CardinalityRecipeKind::JoinRegion, 4, 5, 6);
     let refined = expression_cost_facts(&memo, parent, &[child], &template).unwrap();
     assert_eq!(refined.child_rows[0].expected, 5.0);
 }

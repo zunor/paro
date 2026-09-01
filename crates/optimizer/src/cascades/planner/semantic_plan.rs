@@ -20,14 +20,16 @@ pub(super) fn materialize(
     memo: &Memo,
     state: &PlannerTransformState,
     expr: LogicalExprId,
+    semantic_dependencies: &[RuleId],
 ) -> Result<LogicalPlan> {
-    materialize_raw(memo, state, expr)
+    materialize_raw(memo, state, expr, semantic_dependencies)
 }
 
 fn materialize_raw(
     memo: &Memo,
     state: &PlannerTransformState,
     expr: LogicalExprId,
+    semantic_dependencies: &[RuleId],
 ) -> Result<LogicalPlan> {
     let logical = memo
         .logical_expr(expr)
@@ -41,9 +43,16 @@ fn materialize_raw(
     for child in logical.key.children.iter().copied() {
         let child_expr = memo
             .group(child)
-            .and_then(|group| preferred_semantic_expression(group.logical_exprs(), memo))
+            .and_then(|group| {
+                preferred_semantic_expression(group.logical_exprs(), memo, semantic_dependencies)
+            })
             .ok_or_else(|| paro_error::internal("planner rule found an empty child group"))?;
-        children.push(materialize_raw(memo, state, child_expr)?);
+        children.push(materialize_raw(
+            memo,
+            state,
+            child_expr,
+            semantic_dependencies,
+        )?);
     }
     let mut children = children.into_iter();
     let mut plan = duplicate_plan_preserving_indices(
@@ -69,33 +78,43 @@ fn materialize_raw(
     Ok(plan)
 }
 
-/// Pick a deterministic, semantically refined representative when a legacy
-/// tree rule crosses a Memo group boundary. The parent expression already
-/// references the whole equivalence class; preferring an explicitly proven
-/// transformation lets later rules compose with earlier group-local rewrites
-/// without smuggling either rewrite into materialization itself.
+/// Pick a semantic representative from the dependencies declared by the
+/// consuming rule. Declaration order is precedence order; the canonical
+/// initial expression is the fallback. A fingerprint only disambiguates
+/// multiple expressions produced by the same declared rule and never assigns
+/// semantic quality across rules.
 fn preferred_semantic_expression(
     expressions: &[LogicalExprId],
     memo: &Memo,
+    semantic_dependencies: &[RuleId],
 ) -> Option<LogicalExprId> {
-    expressions.iter().copied().max_by_key(|expression| {
-        let logical = memo
-            .logical_expr(*expression)
-            .expect("group expression must exist in the Memo");
-        let strongest_rule = logical
-            .proofs
+    let expression_for = |producer: Option<RuleId>| {
+        expressions
             .iter()
-            .filter_map(|proof| match proof {
-                EquivalenceProof::Transformation { rule, .. } => Some(rule.0),
-                _ => None,
+            .copied()
+            .filter(|expression| {
+                let logical = memo
+                    .logical_expr(*expression)
+                    .expect("group expression must exist in the Memo");
+                match producer {
+                    Some(producer) => logical.proofs.iter().any(|proof| {
+                        matches!(proof, EquivalenceProof::Transformation { rule, .. } if *rule == producer)
+                    }),
+                    None => logical.proofs.contains(&EquivalenceProof::Initial),
+                }
             })
-            .max();
-        (
-            strongest_rule.is_some(),
-            strongest_rule.unwrap_or_default(),
-            logical.key.stable_fingerprint(),
-        )
-    })
+            .min_by_key(|expression| {
+                memo.logical_expr(*expression)
+                    .expect("group expression must exist in the Memo")
+                    .key
+                    .stable_fingerprint()
+            })
+    };
+
+    semantic_dependencies
+        .iter()
+        .find_map(|dependency| expression_for(Some(*dependency)))
+        .or_else(|| expression_for(None))
 }
 
 pub(super) fn freeze_extraction_layout(
@@ -336,5 +355,77 @@ fn exact_projection(
         paro_planner::operator::ProjectionMap::all()
     } else {
         paro_planner::operator::ProjectionMap::new(indices)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::cascades::column::{ColumnDesc, ColumnOrigin, ColumnVisibility};
+
+    #[test]
+    fn semantic_representative_uses_declared_dependencies_not_rule_ids() {
+        let schema = GroupSchema::new([ColumnDesc {
+            id: ColumnId::new(0),
+            logical_type: paro_common::types::LogicalType::Integer,
+            nullable: false,
+            origin: ColumnOrigin::Derived {
+                key: Fingerprint(1),
+            },
+            visibility: ColumnVisibility::Visible,
+            name_hint: None,
+        }])
+        .unwrap();
+        let mut memo = Memo::new(SearchBudget::default());
+        let group = memo.create_group(
+            schema,
+            LogicalProperties::default(),
+            GroupCardinality::default(),
+        );
+        let insert = |memo: &mut Memo, operator: u128, payload: usize, proof: EquivalenceProof| {
+            memo.insert_logical(
+                group,
+                LogicalExprKey {
+                    operator: Fingerprint(operator),
+                    scalars: Box::new([]),
+                    children: Box::new([]),
+                },
+                LogicalPayloadId::new(payload),
+                proof,
+            )
+            .unwrap()
+        };
+        let initial = insert(&mut memo, 1, 0, EquivalenceProof::Initial);
+        let declared_rule = RuleId(2);
+        let declared = insert(
+            &mut memo,
+            2,
+            1,
+            EquivalenceProof::Transformation {
+                rule: declared_rule,
+                source: initial,
+                premise: Fingerprint(1),
+            },
+        );
+        insert(
+            &mut memo,
+            3,
+            2,
+            EquivalenceProof::Transformation {
+                rule: RuleId(u32::MAX - 1),
+                source: initial,
+                premise: Fingerprint(1),
+            },
+        );
+        let expressions = memo.group(group).unwrap().logical_exprs();
+
+        assert_eq!(
+            preferred_semantic_expression(expressions, &memo, &[]),
+            Some(initial)
+        );
+        assert_eq!(
+            preferred_semantic_expression(expressions, &memo, &[declared_rule]),
+            Some(declared)
+        );
     }
 }

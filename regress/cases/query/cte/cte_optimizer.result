@@ -2,11 +2,11 @@ EXPLAIN
 WITH nums(v) AS (VALUES (1), (2), (3))
 SELECT v FROM nums WHERE v > 1 ORDER BY v;
 QUERY PLAN
-ORDER_BY
+ORDER_BY  (rows=1)
   Sort Key: v ASC NULLS LAST
-  ->  PROJECTION
+  ->  PROJECTION  (rows=1)
     Output: v
-    ->  FILTER
+    ->  FILTER  (rows=1)
       Filter: nums.v > 1
       ->  PROJECTION  (rows=3)
         Output: v

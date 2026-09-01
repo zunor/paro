@@ -78,11 +78,11 @@ PROJECTION  (rows=1)
     Filter: <pushed down>
     ->  GRAPH_EXPAND  (rows=1)
       Graph: ei_graph
-      Edge Label: Knows
+      Edge Label: knows
       Direction: Forward
       ->  GRAPH_SCAN  (rows=1)
         Graph: ei_graph
-        Vertex Label: Node
+        Vertex Label: node
         Table: ei_person
         Filter: <pushed down>
 
@@ -106,12 +106,12 @@ PROJECTION  (rows=3)
     Filter: <pushed down>
     ->  GRAPH_SHORTEST_PATH  (rows=3)
       Graph: ei_graph
-      Edge Label: Route
+      Edge Label: route
       Direction: Forward
       Hops: {1,3}
       ->  GRAPH_SCAN  (rows=1)
         Graph: ei_graph
-        Vertex Label: Node
+        Vertex Label: node
         Table: ei_person
         Filter: <pushed down>
 

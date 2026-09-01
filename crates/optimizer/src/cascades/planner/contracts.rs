@@ -233,27 +233,15 @@ pub(super) fn derive_group_cardinality(
     if let Some(input) = inherited_child {
         return GroupCardinality::inherit(recipe, input);
     }
-    let authority = match stats.cardinality_provenance {
-        paro_planner::plan::CardinalityProvenance::Statistics => CardinalityAuthority::Statistics,
-        paro_planner::plan::CardinalityProvenance::JoinGraph => CardinalityAuthority::JoinRegion,
+    let kind = match stats.cardinality_provenance {
+        paro_planner::plan::CardinalityProvenance::Statistics => CardinalityRecipeKind::Statistics,
+        paro_planner::plan::CardinalityProvenance::JoinGraph => CardinalityRecipeKind::JoinRegion,
     };
-    stats.estimated_cardinality.map_or(
-        GroupCardinality {
-            recipe,
-            authority,
-            range: None,
-            input: None,
-        },
-        |estimate| {
-            GroupCardinality::new(
-                recipe,
-                authority,
-                estimate.min,
-                estimate.expected,
-                estimate.max,
-            )
-        },
-    )
+    stats
+        .estimated_cardinality
+        .map_or(GroupCardinality::unknown(recipe, kind), |estimate| {
+            GroupCardinality::new(recipe, kind, estimate.min, estimate.expected, estimate.max)
+        })
 }
 
 pub(super) fn planner_grant_dependency(operator: &LogicalOperator) -> GrantDependencyDescriptor {

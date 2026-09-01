@@ -548,7 +548,8 @@ impl CascadesEngine {
                         paro_error::internal("committed transformation lost its target group")
                     })?;
                     group.logical_properties.merge_equivalent_facts(&properties);
-                    group.cardinality = group.cardinality.canonical_with(cardinality);
+                    group.cardinality =
+                        std::mem::take(&mut group.cardinality).canonical_with(cardinality);
                 }
                 *self.effective_rule_insertions.entry(rule).or_default() +=
                     u64::try_from(inserted_groups.len()).unwrap_or(u64::MAX);

@@ -28,6 +28,11 @@ pub(crate) struct DPJoinNode {
     pub left_set: Arc<JoinRelationSet>,
     /// The right child set (for non-leaf nodes).
     pub right_set: Arc<JoinRelationSet>,
+    /// Physical build input in the original `left_set`/`right_set`
+    /// coordinates. Reconstruction places this input on the executable
+    /// join's right side; it must not infer orientation again from an
+    /// arbitrary DP pair order.
+    pub build_side: JoinBuildSide,
     /// The cost of this join node.
     pub cost: f64,
     /// The estimated cardinality of this node. Keep the fractional estimate
@@ -60,6 +65,7 @@ impl DPJoinNode {
             is_leaf: true,
             left_set: set.clone(),
             right_set: set,
+            build_side: JoinBuildSide::Right,
             cost: 0.0,
             cardinality,
             risk_cardinality,
@@ -68,26 +74,23 @@ impl DPJoinNode {
     }
 
     /// Create an intermediate node (join of two relations).
-    pub fn intermediate(
-        set: Arc<JoinRelationSet>,
+    fn intermediate(
         predicates: Option<JoinPredicateSet>,
         left_set: Arc<JoinRelationSet>,
         right_set: Arc<JoinRelationSet>,
-        cost: f64,
-        cardinality: f64,
-        risk_cardinality: f64,
-        output_payload_width: usize,
+        estimate: CostedJoin,
     ) -> Self {
         Self {
-            set,
+            set: estimate.combination,
             predicates,
             is_leaf: false,
             left_set,
             right_set,
-            cost,
-            cardinality,
-            risk_cardinality,
-            output_payload_width,
+            build_side: estimate.build_side,
+            cost: estimate.breakdown.total(),
+            cardinality: estimate.cardinality,
+            risk_cardinality: estimate.risk_cardinality,
+            output_payload_width: estimate.output_payload_width,
         }
     }
 }
@@ -99,6 +102,8 @@ pub(crate) struct CostModel {
     /// Cardinality estimator used to calculate cost.
     pub cardinality_estimator: CardinalityEstimator,
     risk_cardinality_estimator: CardinalityEstimator,
+    materialization_cardinality_estimator: CardinalityEstimator,
+    relation_materialization_cardinalities: Vec<usize>,
     relation_widths: Vec<usize>,
     relation_control_regions: Vec<bool>,
 }
@@ -117,6 +122,17 @@ struct CostedJoin {
     risk_cardinality: f64,
     output_payload_width: usize,
     breakdown: JoinCostBreakdown,
+    build_side: JoinBuildSide,
+}
+
+struct JoinCostInputs<'a> {
+    left: &'a DPJoinNode,
+    right: &'a DPJoinNode,
+    predicates: Option<&'a JoinPredicateSet>,
+    join_rows: f64,
+    output_payload_width: usize,
+    left_materialization_rows: f64,
+    right_materialization_rows: f64,
 }
 
 #[derive(Debug, Clone, Copy, Default)]
@@ -209,6 +225,8 @@ impl CostModel {
         Self {
             cardinality_estimator: CardinalityEstimator::new(),
             risk_cardinality_estimator: CardinalityEstimator::new(),
+            materialization_cardinality_estimator: CardinalityEstimator::new(),
+            relation_materialization_cardinalities: Vec::new(),
             relation_widths: Vec::new(),
             relation_control_regions: Vec::new(),
         }
@@ -218,6 +236,8 @@ impl CostModel {
     pub fn reset(&mut self) {
         self.cardinality_estimator = CardinalityEstimator::new();
         self.risk_cardinality_estimator = CardinalityEstimator::new();
+        self.materialization_cardinality_estimator = CardinalityEstimator::new();
+        self.relation_materialization_cardinalities.clear();
         self.relation_widths.clear();
         self.relation_control_regions.clear();
     }
@@ -239,10 +259,30 @@ impl CostModel {
             risk_stats.cardinality = stats.risk_cardinality.max(stats.cardinality);
             self.risk_cardinality_estimator
                 .init_cardinality_estimator_props(&set, &risk_stats);
+            let mut materialization_stats = stats.clone();
+            materialization_stats.cardinality = stats
+                .materialization_cardinality
+                .max(stats.risk_cardinality)
+                .max(stats.cardinality);
+            if !stats.materialization_distinct_count.is_empty() {
+                materialization_stats.column_distinct_count =
+                    stats.materialization_distinct_count.clone();
+            }
+            self.materialization_cardinality_estimator
+                .init_cardinality_estimator_props(&set, &materialization_stats);
         }
         self.relation_widths = relation_stats
             .iter()
             .map(|stats| stats.estimated_payload_width)
+            .collect();
+        self.relation_materialization_cardinalities = relation_stats
+            .iter()
+            .map(|stats| {
+                stats
+                    .materialization_cardinality
+                    .max(stats.risk_cardinality)
+                    .max(stats.cardinality)
+            })
             .collect();
         self.relation_control_regions = relation_stats
             .iter()
@@ -257,6 +297,8 @@ impl CostModel {
         self.cardinality_estimator
             .init_equivalent_relations(filters);
         self.risk_cardinality_estimator
+            .init_equivalent_relations(filters);
+        self.materialization_cardinality_estimator
             .init_equivalent_relations(filters);
     }
 
@@ -313,48 +355,86 @@ impl CostModel {
             .estimate_cardinality(&combination)
             .max(join_rows);
         let output_payload_width = Self::output_payload_width(left, right, predicates);
-        let breakdown = self.cost_breakdown_for_cardinality(
+        let left_materialization_rows = self
+            .materialization_cardinality(&left.set)
+            .max(left.risk_cardinality);
+        let right_materialization_rows = self
+            .materialization_cardinality(&right.set)
+            .max(right.risk_cardinality);
+        let (breakdown, build_side) = self.cost_breakdown_for_cardinality(JoinCostInputs {
             left,
             right,
             predicates,
-            risk_join_rows,
+            join_rows: risk_join_rows,
             output_payload_width,
-        );
+            left_materialization_rows,
+            right_materialization_rows,
+        });
         CostedJoin {
             combination,
             cardinality: join_rows,
             risk_cardinality: risk_join_rows,
             output_payload_width,
             breakdown,
+            build_side,
         }
+    }
+
+    /// Conservative size of a subtree if it becomes an irreversible build.
+    ///
+    /// Equality selectivity can rank a join, but without a proof that every
+    /// contributing relation is key-preserving it cannot reduce the memory
+    /// envelope below the largest atomic input. Future constraint proofs can
+    /// tighten this floor explicitly instead of relying on a point estimate.
+    fn materialization_cardinality(&mut self, set: &JoinRelationSet) -> f64 {
+        let estimated = self
+            .materialization_cardinality_estimator
+            .estimate_cardinality(set);
+        let atomic_floor = set
+            .relations()
+            .iter()
+            .filter_map(|relation| {
+                self.relation_materialization_cardinalities
+                    .get(*relation)
+                    .copied()
+            })
+            .max()
+            .unwrap_or(0) as f64;
+        estimated.max(atomic_floor)
     }
 
     fn cost_breakdown_for_cardinality(
         &self,
-        left: &DPJoinNode,
-        right: &DPJoinNode,
-        predicates: Option<&JoinPredicateSet>,
-        join_rows: f64,
-        output_payload_width: usize,
-    ) -> JoinCostBreakdown {
+        inputs: JoinCostInputs<'_>,
+    ) -> (JoinCostBreakdown, JoinBuildSide) {
+        let JoinCostInputs {
+            left,
+            right,
+            predicates,
+            join_rows,
+            output_payload_width,
+            left_materialization_rows,
+            right_materialization_rows,
+        } = inputs;
         let left_rows = left.risk_cardinality;
         let right_rows = right.risk_cardinality;
         let conditions = Self::condition_profile(predicates);
         let filtering_side = Self::reduction_filtering_side(predicates);
         if !conditions.has_hash_key {
-            let left_work =
-                left_rows * estimate_row_width_from_payload(left.output_payload_width) as f64;
-            let right_work =
-                right_rows * estimate_row_width_from_payload(right.output_payload_width) as f64;
+            let left_row_width = estimate_row_width_from_payload(left.output_payload_width) as f64;
+            let right_row_width =
+                estimate_row_width_from_payload(right.output_payload_width) as f64;
+            let left_work = left_rows * left_row_width;
+            let right_work = right_rows * right_row_width;
             let build_side = choose_join_build_side(
                 filtering_side,
                 JoinBuildCandidate {
-                    serialized_work: left_work,
+                    serialized_work: left_materialization_rows * left_row_width,
                     contains_control_region: filtering_side == Some(JoinBuildSide::Left)
                         && self.contains_control_region(&left.set),
                 },
                 JoinBuildCandidate {
-                    serialized_work: right_work,
+                    serialized_work: right_materialization_rows * right_row_width,
                     contains_control_region: filtering_side == Some(JoinBuildSide::Right)
                         && self.contains_control_region(&right.set),
                 },
@@ -364,26 +444,32 @@ impl CostModel {
                 JoinBuildSide::Right => right_work,
             };
             if !conditions.has_join_conditions {
-                return JoinCostBreakdown {
-                    build,
-                    probe: left_rows * right_rows * CROSS_PRODUCT_SELECTION_BYTES as f64,
-                    match_output: 0.0,
-                    children: left.cost + right.cost,
-                };
+                return (
+                    JoinCostBreakdown {
+                        build,
+                        probe: left_rows * right_rows * CROSS_PRODUCT_SELECTION_BYTES as f64,
+                        match_output: 0.0,
+                        children: left.cost + right.cost,
+                    },
+                    build_side,
+                );
             }
             let pair_width = conditions
                 .left_payload_width
                 .saturating_add(conditions.right_payload_width)
                 .saturating_add(NESTED_LOOP_CURSOR_BYTES);
-            return JoinCostBreakdown {
-                build,
-                probe: left_rows * right_rows * pair_width as f64,
-                // General NLJ writes accepted values into flat vectors rather
-                // than returning dictionary references like cross/hash joins.
-                match_output: join_rows
-                    * estimate_row_width_from_payload(output_payload_width) as f64,
-                children: left.cost + right.cost,
-            };
+            return (
+                JoinCostBreakdown {
+                    build,
+                    probe: left_rows * right_rows * pair_width as f64,
+                    // General NLJ writes accepted values into flat vectors rather
+                    // than returning dictionary references like cross/hash joins.
+                    match_output: join_rows
+                        * estimate_row_width_from_payload(output_payload_width) as f64,
+                    children: left.cost + right.cost,
+                },
+                build_side,
+            );
         }
         let left_input = HashInputEstimate {
             rows: left_rows,
@@ -399,16 +485,32 @@ impl CostModel {
             contains_control_region: filtering_side == Some(JoinBuildSide::Right)
                 && self.contains_control_region(&right.set),
         };
-        let (build, probe) = Self::hash_orientation(left_input, right_input, filtering_side);
-        JoinCostBreakdown {
-            build: build.execution_build_work(),
-            probe: probe.probe_work(),
-            // Hash comparison joins stage each accepted probe/build identity.
-            // Non-hash joins returned through the nested-loop branch above and
-            // therefore never pay this hash-match buffer cost.
-            match_output: join_rows * HASH_MATCH_ROW_BYTES as f64,
-            children: left.cost + right.cost,
-        }
+        let left_materialization = HashInputEstimate {
+            rows: left_materialization_rows,
+            ..left_input
+        };
+        let right_materialization = HashInputEstimate {
+            rows: right_materialization_rows,
+            ..right_input
+        };
+        let build_side =
+            Self::hash_build_side(left_materialization, right_materialization, filtering_side);
+        let (build, probe) = match build_side {
+            JoinBuildSide::Left => (left_input, right_input),
+            JoinBuildSide::Right => (right_input, left_input),
+        };
+        (
+            JoinCostBreakdown {
+                build: build.execution_build_work(),
+                probe: probe.probe_work(),
+                // Hash comparison joins stage each accepted probe/build identity.
+                // Non-hash joins returned through the nested-loop branch above and
+                // therefore never pay this hash-match buffer cost.
+                match_output: join_rows * HASH_MATCH_ROW_BYTES as f64,
+                children: left.cost + right.cost,
+            },
+            build_side,
+        )
     }
 
     fn reduction_filtering_side(predicates: Option<&JoinPredicateSet>) -> Option<JoinBuildSide> {
@@ -511,12 +613,12 @@ impl CostModel {
     /// serialized build side. A filtering control region is the one exception
     /// because moving it to the probe side would require a qualitatively
     /// different materialization.
-    fn hash_orientation(
+    fn hash_build_side(
         left: HashInputEstimate,
         right: HashInputEstimate,
         filtering_side: Option<JoinBuildSide>,
-    ) -> (HashInputEstimate, HashInputEstimate) {
-        let selected = choose_join_build_side(
+    ) -> JoinBuildSide {
+        choose_join_build_side(
             filtering_side,
             JoinBuildCandidate {
                 serialized_work: left.serialized_build_work(),
@@ -526,11 +628,7 @@ impl CostModel {
                 serialized_work: right.serialized_build_work(),
                 contains_control_region: right.contains_control_region,
             },
-        );
-        match selected {
-            JoinBuildSide::Left => (left, right),
-            JoinBuildSide::Right => (right, left),
-        }
+        )
     }
 
     /// Compute the cost and create a new DPJoinNode.
@@ -543,16 +641,7 @@ impl CostModel {
     ) -> DPJoinNode {
         let estimate = self.estimate_join(left, right, set_manager, predicates.as_ref());
 
-        DPJoinNode::intermediate(
-            estimate.combination,
-            predicates,
-            left.set.clone(),
-            right.set.clone(),
-            estimate.breakdown.total(),
-            estimate.cardinality,
-            estimate.risk_cardinality,
-            estimate.output_payload_width,
-        )
+        DPJoinNode::intermediate(predicates, left.set.clone(), right.set.clone(), estimate)
     }
 
     /// Get the estimated cardinality for a relation set.
@@ -738,14 +827,22 @@ mod tests {
         let combined = set_manager.union(&left, &right);
 
         let node = DPJoinNode::intermediate(
-            combined.clone(),
             None,
             left.clone(),
             right.clone(),
-            100.0,
-            50.0,
-            50.0,
-            11,
+            CostedJoin {
+                combination: combined.clone(),
+                cardinality: 50.0,
+                risk_cardinality: 50.0,
+                output_payload_width: 11,
+                breakdown: JoinCostBreakdown {
+                    build: 25.0,
+                    probe: 25.0,
+                    match_output: 25.0,
+                    children: 25.0,
+                },
+                build_side: JoinBuildSide::Right,
+            },
         );
 
         assert!(!node.is_leaf);
@@ -790,6 +887,72 @@ mod tests {
         let set = set_manager.get_relation(0);
         assert_eq!(cost_model.get_cardinality(&set), 100.0);
         assert_eq!(cost_model.get_risk_cardinality(&set), 500.0);
+    }
+
+    #[test]
+    fn hash_orientation_uses_materialization_risk_without_repricing_cpu_work() {
+        let mut sets = JoinRelationSetManager::new();
+        let filter = create_equality_filter(&mut sets, 0, 0, 1, 0, 0);
+        let predicates = predicate_set(std::slice::from_ref(&filter));
+        let mut left_stats = RelationStats::with_cardinality(10);
+        left_stats.risk_cardinality = 10;
+        left_stats.materialization_cardinality = 10_000;
+        left_stats.estimated_payload_width = 8;
+        left_stats.column_distinct_count =
+            column_distinct_counts(0, [DistinctCount::new(10_000, true)]);
+        let mut right_stats = RelationStats::with_cardinality(100);
+        right_stats.risk_cardinality = 100;
+        right_stats.materialization_cardinality = 100;
+        right_stats.estimated_payload_width = 8;
+        right_stats.column_distinct_count =
+            column_distinct_counts(1, [DistinctCount::new(10_000, true)]);
+
+        let mut model = CostModel::new();
+        model.init_equivalent_relations(std::slice::from_ref(&filter));
+        model.init_cost_model(&mut sets, &[left_stats, right_stats]);
+        let combined = sets.get_relation_from_vec(vec![0, 1]);
+        assert_eq!(model.materialization_cardinality(&combined), 10_000.0);
+        let left = leaf(&mut model, sets.get_relation(0));
+        let right = leaf(&mut model, sets.get_relation(1));
+        let node = model.compute_cost_and_create_node(&left, &right, &mut sets, Some(predicates));
+
+        assert_eq!(node.build_side, JoinBuildSide::Right);
+        let conditions = CostModel::condition_profile(node.predicates.as_ref());
+        let expected_right_build = HashInputEstimate {
+            rows: right.risk_cardinality,
+            projected_payload_width: right.output_payload_width,
+            condition_payload_width: conditions.right_payload_width,
+            contains_control_region: false,
+        }
+        .execution_build_work();
+        let breakdown =
+            model.compute_cost_breakdown(&left, &right, &mut sets, node.predicates.as_ref());
+        assert_eq!(breakdown.build, expected_right_build);
+    }
+
+    #[test]
+    fn materialization_rows_keep_their_own_distinct_domains() {
+        let mut sets = JoinRelationSetManager::new();
+        let filter = create_equality_filter(&mut sets, 0, 0, 1, 0, 0);
+        let mut left_stats = RelationStats::with_cardinality(10);
+        left_stats.materialization_cardinality = 1_000_000;
+        left_stats.column_distinct_count =
+            column_distinct_counts(0, [DistinctCount::new(10, false)]);
+        left_stats.materialization_distinct_count =
+            column_distinct_counts(0, [DistinctCount::new(1_000_000, false)]);
+        let mut right_stats = RelationStats::with_cardinality(10);
+        right_stats.materialization_cardinality = 1_000_000;
+        right_stats.column_distinct_count =
+            column_distinct_counts(1, [DistinctCount::new(10, false)]);
+        right_stats.materialization_distinct_count =
+            column_distinct_counts(1, [DistinctCount::new(1_000_000, false)]);
+
+        let mut model = CostModel::new();
+        model.init_equivalent_relations(std::slice::from_ref(&filter));
+        model.init_cost_model(&mut sets, &[left_stats, right_stats]);
+
+        let joined = sets.get_relation_from_vec(vec![0, 1]);
+        assert_eq!(model.materialization_cardinality(&joined), 1_000_000.0);
     }
 
     #[test]
@@ -850,6 +1013,7 @@ mod tests {
             is_leaf: false,
             left_set: left_set.clone(),
             right_set: left_set.clone(),
+            build_side: JoinBuildSide::Right,
             cost: 100.0,
             cardinality: 1000.0,
             risk_cardinality: 1000.0,
@@ -862,6 +1026,7 @@ mod tests {
             is_leaf: false,
             left_set: right_set.clone(),
             right_set: right_set.clone(),
+            build_side: JoinBuildSide::Right,
             cost: 50.0,
             cardinality: 500.0,
             risk_cardinality: 500.0,

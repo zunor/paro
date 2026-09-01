@@ -632,6 +632,23 @@ mod tests {
     }
 
     #[test]
+    fn nested_scope_resolves_its_local_column_before_ambiguous_outer_columns() {
+        let mut binder = test_binder();
+        binder
+            .bind_statement_kind(parse_statement_sql(
+                "SELECT p.order_key \
+                 FROM (VALUES (1)) AS p(order_key) \
+                 JOIN (VALUES (1)) AS d(order_key) \
+                   ON d.order_key = p.order_key \
+                 WHERE p.order_key IN ( \
+                   SELECT order_key \
+                   FROM (VALUES (1)) AS inner_detail(order_key) \
+                 )",
+            ))
+            .expect("the unique inner column must shadow outer-scope candidates");
+    }
+
+    #[test]
     fn where_clause_does_not_lowercase_match_quoted_aliases() {
         let mut binder = test_binder();
         let err = binder

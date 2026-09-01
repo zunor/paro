@@ -504,15 +504,9 @@ impl PageCache {
             }
         };
 
-        if !slot_handle.is_loaded() {
-            self.handle_unloaded(key, &entry, kind);
-            self.record_miss();
-            return None;
-        }
-
-        let buffer = match self.buffer_pool.pin(slot_handle.block_id()) {
-            Ok(buf) => buf,
-            Err(_) => {
+        let buffer = match self.buffer_pool.pin_resident(slot_handle.block_id()) {
+            Some(buffer) => buffer,
+            None => {
                 self.handle_unloaded(key, &entry, kind);
                 self.record_miss();
                 return None;
@@ -569,14 +563,12 @@ impl PageCache {
                     let slot_handle = slot.handle.clone();
                     drop(state);
 
-                    if !slot_handle.is_loaded() {
-                        self.handle_unloaded(&key, &entry, kind);
-                        continue;
+                    if let Some(buffer) = self.buffer_pool.pin_resident(slot_handle.block_id()) {
+                        self.record_hit();
+                        return Ok(PageCacheHandle::new(buffer, kind));
                     }
-
-                    let buffer = self.buffer_pool.pin(slot_handle.block_id())?;
-                    self.record_hit();
-                    return Ok(PageCacheHandle::new(buffer, kind));
+                    self.handle_unloaded(&key, &entry, kind);
+                    continue;
                 }
                 PageSlotState::Loading => {
                     state = entry.cvar.wait(state).unwrap();
@@ -660,13 +652,12 @@ impl PageCache {
                         meta.referenced.store(true, Ordering::Relaxed);
                     }
                     drop(state);
-                    if !slot_handle.is_loaded() {
-                        self.handle_unloaded(&key, &entry, PageContentKind::Decoded);
-                        continue;
+                    if let Some(buffer) = self.buffer_pool.pin_resident(slot_handle.block_id()) {
+                        self.record_hit();
+                        return Ok(Some(PageCacheHandle::new(buffer, PageContentKind::Decoded)));
                     }
-                    let buffer = self.buffer_pool.pin(slot_handle.block_id())?;
-                    self.record_hit();
-                    return Ok(Some(PageCacheHandle::new(buffer, PageContentKind::Decoded)));
+                    self.handle_unloaded(&key, &entry, PageContentKind::Decoded);
+                    continue;
                 }
                 PageSlotState::Loading => {
                     drop(entry.cvar.wait(state).unwrap());
@@ -1048,6 +1039,26 @@ mod tests {
         assert_eq!(stats.misses, 1);
         assert_eq!(stats.hits, 1);
         assert_eq!(stats.entries, 1);
+    }
+
+    #[test]
+    fn evicted_page_is_reloaded_from_its_source() {
+        let pool = BufferPool::new_arc(1024);
+        let cache = PageCache::new(pool.clone());
+        let key = PageKey::new(1, 2, 0, 3, 1024, 256);
+        let handle = cache
+            .get_or_load(key, PageContentKind::Compressed, || Ok(vec![1; 1024]))
+            .unwrap();
+        drop(handle);
+
+        let eviction = pool.evict_blocks(MemoryTag::PageCache, 0, 0, None);
+        assert!(eviction.success);
+
+        let reloaded = cache
+            .get_or_load(key, PageContentKind::Compressed, || Ok(vec![2; 1024]))
+            .unwrap();
+        assert_eq!(reloaded.data().unwrap()[0], 2);
+        assert_eq!(cache.stats().evictions, 1);
     }
 
     #[test]

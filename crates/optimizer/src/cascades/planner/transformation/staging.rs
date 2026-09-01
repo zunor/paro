@@ -18,7 +18,7 @@ pub(super) struct StagingRequest {
     target: GroupId,
     rule: RuleId,
     preserved_region_facet: Option<Fingerprint>,
-    refined_cardinality_authority: Option<CardinalityAuthority>,
+    refined_cardinality_kind: Option<CardinalityRecipeKind>,
 }
 
 impl StagingRequest {
@@ -28,7 +28,7 @@ impl StagingRequest {
         target: GroupId,
         rule: RuleId,
         preserved_region_facet: Option<Fingerprint>,
-        refined_cardinality_authority: Option<CardinalityAuthority>,
+        refined_cardinality_kind: Option<CardinalityRecipeKind>,
     ) -> Self {
         Self {
             plan,
@@ -36,7 +36,7 @@ impl StagingRequest {
             target,
             rule,
             preserved_region_facet,
-            refined_cardinality_authority,
+            refined_cardinality_kind,
         }
     }
 }
@@ -52,7 +52,7 @@ pub(super) fn stage_transformed_expression(
         target,
         rule,
         preserved_region_facet,
-        refined_cardinality_authority,
+        refined_cardinality_kind,
     } = request;
 
     struct NodeState {
@@ -73,7 +73,7 @@ pub(super) fn stage_transformed_expression(
         state: &mut PlannerTransformState,
         options: &StagingOptions<'_>,
         required_region_facet: Option<Fingerprint>,
-        refined_cardinality_authority: Option<CardinalityAuthority>,
+        refined_cardinality_kind: Option<CardinalityRecipeKind>,
     ) -> Result<(LogicalPlan, NodeState, Option<StagedEquivalent>)> {
         let mut detached = Vec::new();
         let skeleton = plan.try_map_children(|child| {
@@ -191,10 +191,20 @@ pub(super) fn stage_transformed_expression(
             &plan.stats,
             key.stable_fingerprint(),
         );
-        if target.is_some() {
-            if let Some(authority) = refined_cardinality_authority {
-                cardinality.authority = authority;
-            }
+        if let Some(target) = target {
+            cardinality = if let Some(kind) = refined_cardinality_kind {
+                cardinality.with_kind(kind)
+            } else {
+                let target = memo.canonical_group(target);
+                memo.group(target)
+                    .ok_or_else(|| {
+                        paro_error::internal(
+                            "shape-only transformation targets an unknown cardinality group",
+                        )
+                    })?
+                    .cardinality
+                    .clone()
+            };
         }
 
         if target.is_none() {
@@ -242,7 +252,7 @@ pub(super) fn stage_transformed_expression(
             }
             target
         } else {
-            memo.create_group(schema, logical_properties.clone(), cardinality)
+            memo.create_group(schema, logical_properties.clone(), cardinality.clone())
         };
         let subtree_groups = child_states
             .iter()
@@ -383,7 +393,7 @@ pub(super) fn stage_transformed_expression(
         state,
         &options,
         preserved_region_facet,
-        refined_cardinality_authority,
+        refined_cardinality_kind,
     )?;
     if let Some(fingerprint) = preserved_region_facet {
         let mut facet = memo

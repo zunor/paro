@@ -57,6 +57,14 @@ impl ExtractedFilter {
 pub struct RelationStats {
     /// Estimated distinct count for each column.
     pub column_distinct_count: HashMap<ColumnBinding, DistinctCount>,
+    /// Conservative distinct domains paired with
+    /// `materialization_cardinality`.
+    ///
+    /// Expected filter estimates may shrink `column_distinct_count`, but those
+    /// point-estimate domains cannot be combined with an unfiltered row
+    /// envelope. Keeping the domains together prevents key-preserving joins
+    /// from becoming fictitious many-to-many expansions in build-risk costing.
+    pub materialization_distinct_count: HashMap<ColumnBinding, DistinctCount>,
     /// Estimated cardinality (row count).
     pub cardinality: usize,
     /// Risk-adjusted cardinality used only to rank join orders.
@@ -64,6 +72,13 @@ pub struct RelationStats {
     /// This remains separate from `cardinality`: uncertain predicates must
     /// not rewrite the expected row estimate merely to obtain a robust plan.
     pub risk_cardinality: usize,
+    /// Conservative cardinality used when choosing an input that must be
+    /// materialized (for example, a hash-build input).
+    ///
+    /// A predicate estimate without a frequency proof may rank join orders,
+    /// but it is not an admissible memory bound. Keeping this dimension
+    /// separate avoids poisoning ordinary CPU costing with a worst-case size.
+    pub materialization_cardinality: usize,
     /// Estimated schema-dependent bytes carried by one row after projection pruning.
     pub estimated_payload_width: usize,
     /// Whether this atomic relation owns a control-region boundary that cannot
@@ -82,8 +97,10 @@ impl RelationStats {
     pub fn new() -> Self {
         Self {
             column_distinct_count: HashMap::new(),
+            materialization_distinct_count: HashMap::new(),
             cardinality: 1,
             risk_cardinality: 1,
+            materialization_cardinality: 1,
             estimated_payload_width: 1,
             contains_control_region: false,
             unique_keys: Vec::new(),
@@ -97,6 +114,7 @@ impl RelationStats {
         Self {
             cardinality,
             risk_cardinality: cardinality,
+            materialization_cardinality: cardinality,
             stats_initialized: true,
             ..Self::new()
         }

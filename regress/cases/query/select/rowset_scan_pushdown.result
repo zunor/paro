@@ -140,16 +140,16 @@ PROJECTION  (rows=1)
     Aggregates: count_star(*)
     Cardinality: [1, 1, 1]
     Output Schema: aggregate_state_1 BIGINT
-    ->  HASH_JOIN  (rows=14)
+    ->  HASH_JOIN  (rows=19)
       Join Type: INNER
+      Runtime Filter: wait_complete artifact=f7a53e1788c76f1841aec51af08c4534
       Build Index: integer_build_time
       Join Condition: c.k = d.k
-      Cardinality: [3, 14, 29]
+      Cardinality: [19, 19, 19]
       Output Schema: (none)
-      ->  ROWSET_SCAN on public.rowset_pushdown_case c  (rows=45)
+      ->  ROWSET_SCAN on public.rowset_pushdown_case c  (rows=64)
         Columns: k
-        Pushed Predicate: k >= 2 AND k <= 8
-        Cardinality: [22, 45, 64]
+        Cardinality: [64, 64, 64]
         Output Schema: c.k INTEGER
       ->  ROWSET_SCAN on public.rowset_pushdown_dim d  (rows=3)
         Columns: k

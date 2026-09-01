@@ -738,26 +738,15 @@ impl BufferPool {
         // Fast path: atomically publish the pin against the loaded allocation.
         // `is_loaded()` followed by `pin()` is not sufficient here: eviction
         // may detach the buffer between those two independent observations.
-        if block.try_pin().is_some() {
-            // Remove from eviction queue if present
-            self.remove_from_eviction_queue(block_id);
-
-            // Update LRU timestamp
-            block.set_lru_timestamp(current_timestamp_ms());
-            self.stats.pins.fetch_add(1, Ordering::Relaxed);
-
-            let pool_weak = self.weak_self.read().unwrap().clone();
-            return Ok(BufferHandle::with_pool(block, pool_weak));
+        if let Some(handle) = self.try_pin_loaded(block.clone()) {
+            return Ok(handle);
         }
 
         // Slow-path admission and publication are serialized with new block
         // allocation and memory-limit changes.
         let _admission_guard = self.admission_lock.lock().unwrap();
-        if block.try_pin().is_some() {
-            block.set_lru_timestamp(current_timestamp_ms());
-            self.stats.pins.fetch_add(1, Ordering::Relaxed);
-            let pool_weak = self.weak_self.read().unwrap().clone();
-            return Ok(BufferHandle::with_pool(block, pool_weak));
+        if let Some(handle) = self.try_pin_loaded(block.clone()) {
+            return Ok(handle);
         }
 
         // Get required memory for loading
@@ -780,12 +769,9 @@ impl BufferPool {
         }
 
         // Double-check locking: check if another thread loaded the block
-        if block.try_pin().is_some() {
+        if let Some(handle) = self.try_pin_loaded(block.clone()) {
             // Block was loaded by another thread, just pin it
-            block.set_lru_timestamp(current_timestamp_ms());
-            self.stats.pins.fetch_add(1, Ordering::Relaxed);
-            let pool_weak = self.weak_self.read().unwrap().clone();
-            return Ok(BufferHandle::with_pool(block, pool_weak));
+            return Ok(handle);
         }
 
         // Now we can actually load the block
@@ -800,6 +786,27 @@ impl BufferPool {
 
         let pool_weak = self.weak_self.read().unwrap().clone();
         Ok(BufferHandle::with_pool(block, pool_weak))
+    }
+
+    /// Pin a block only when its bytes are still resident.
+    ///
+    /// This is the cache-facing counterpart of [`Self::pin`]. It never reloads
+    /// or reconstructs an evicted block: eviction is reported as `None`, so the
+    /// owning cache can remove its stale slot and fetch the durable source
+    /// again. The loaded check and pin publication are one lifecycle-locked
+    /// operation, closing the check-then-pin race with eviction.
+    pub fn pin_resident(&self, block_id: BlockId) -> Option<BufferHandle> {
+        let block = self.blocks.read().unwrap().get(&block_id).cloned()?;
+        self.try_pin_loaded(block)
+    }
+
+    fn try_pin_loaded(&self, block: Arc<BlockHandle>) -> Option<BufferHandle> {
+        block.try_pin()?;
+        self.remove_from_eviction_queue(block.block_id());
+        block.set_lru_timestamp(current_timestamp_ms());
+        self.stats.pins.fetch_add(1, Ordering::Relaxed);
+        let pool_weak = self.weak_self.read().unwrap().clone();
+        Some(BufferHandle::with_pool(block, pool_weak))
     }
 
     /// Unpin a block by ID.

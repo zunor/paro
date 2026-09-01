@@ -9,6 +9,7 @@ use std::sync::Arc;
 use paro_catalog::entry::ConstraintType;
 use paro_common::error::Result;
 use paro_common::runtime_value::Value;
+use paro_common::types::LogicalType;
 use paro_context::StatementContext;
 use paro_planner::binder::context::BindContext;
 use paro_planner::binder::deep_copy::{
@@ -16,7 +17,7 @@ use paro_planner::binder::deep_copy::{
 };
 use paro_planner::expression::{
     ComparisonType, ConjunctionExpression, ConjunctionType, Expression, ExpressionIterator,
-    OperatorType,
+    ExpressionVisitDecision, OperatorType,
 };
 use paro_planner::operator::{
     ColumnBinding, ComparisonJoin, CrossProduct, Filter, Join, JoinComparisonType, JoinCondition,
@@ -25,11 +26,14 @@ use paro_planner::operator::{
 use paro_planner::plan::{CardinalityEstimate, CardinalityProvenance, LogicalPlan};
 use paro_storage::statistics::{ColumnStatistics, NumericStats};
 
+use crate::column::lifetime::ColumnLifetimeAnalyzer;
 use crate::cost_model::CostModel as LogicalCostModel;
 use crate::join_order::cost_model::{CostModel, DPJoinNode};
 use crate::join_order::enumerator::{EnumerationOutcome, PlanEnumerator};
 use crate::join_order::predicate_inference::infer_equality_constants;
-use crate::join_order::query_graph::{FilterInfo, JoinEdgeOrientation, QueryGraphEdges};
+use crate::join_order::query_graph::{
+    FilterInfo, JoinEdgeOrientation, JoinPredicateSet, QueryGraphEdges,
+};
 use crate::join_order::relation::{JoinRelationSet, JoinRelationSetManager};
 use crate::join_order::relation_manager::{
     DistinctCount, ExtractedFilter, RelationManager, RelationStats,
@@ -220,6 +224,12 @@ impl JoinOrderOptimizer {
         bind_context: &BindContext,
     ) -> Result<LogicalPlan> {
         self.column_stats = column_stats.clone();
+        // Join costing needs the semantic live-column set, not the canonical
+        // `ProjectionMap::all()` payload retained by Memo identities. This
+        // prepass derives that view before enumeration; final candidate
+        // settling still recomputes executable projection maps after the join
+        // tree has been reconstructed.
+        let plan = ColumnLifetimeAnalyzer::new(true).optimize(plan)?;
         plan.try_map_post_order(|plan| self.optimize_current_plan(ctx, bind_context, plan))
     }
 
@@ -280,6 +290,14 @@ impl JoinOrderOptimizer {
         self.plans.clear();
         self.relation_plans.clear();
 
+        // Preserve the columns this region promises to its parent before its
+        // predicates are detached into the query graph.
+        let region_outputs = plan
+            .get_column_bindings()
+            .into_iter()
+            .zip(plan.types())
+            .collect::<HashMap<_, _>>();
+
         // Extract relations and filters from the join tree
         let mut filters = Vec::new();
         self.extract_join_relations(ctx, bind_context, &plan, &mut filters, true)?;
@@ -300,6 +318,7 @@ impl JoinOrderOptimizer {
         let inferred_filters =
             infer_equality_constants(&filter_infos, &self.relation_manager, &mut self.set_manager);
         self.apply_relation_local_selectivity(&filter_infos);
+        self.apply_relation_payload_widths(&region_outputs, &filter_infos);
         self.filter_infos = filter_infos
             .iter()
             .cloned()
@@ -443,10 +462,21 @@ impl JoinOrderOptimizer {
                     )
                     .expected
             };
-            relation.stats.risk_cardinality = estimate
-                .expected
-                .saturating_add(risk_upper.saturating_sub(estimate.expected) / 2)
-                .max(1) as usize;
+            // The expected estimate remains the annotation-facing estimate.
+            // Join enumeration must price the complete stable-predicate
+            // envelope: interpolating back toward an uncalibrated wildcard
+            // estimate has no statistical meaning and can make a many-to-many
+            // derived subtree look safe to materialize as a hash build.
+            relation.stats.risk_cardinality = risk_upper.max(estimate.expected).max(1) as usize;
+            // Marginal NDV and default predicate selectivity do not bound
+            // skew. Until a predicate has a frequency/constraint proof, its
+            // filtered estimate may influence order but cannot justify an
+            // irreversible materialization decision.
+            relation.stats.materialization_cardinality = if estimate.max == 0 {
+                0
+            } else {
+                base_cardinality.max(estimate.expected) as usize
+            };
             for distinct in relation.stats.column_distinct_count.values_mut() {
                 // Both observed HLL values and synthetic NDV upper bounds are
                 // domains of the filtered relation. Neither can exceed its
@@ -455,6 +485,54 @@ impl JoinOrderOptimizer {
                     .distinct_count
                     .min(relation.stats.cardinality.max(1));
             }
+        }
+    }
+
+    /// Estimate the payload that can cross a join-region cut.
+    ///
+    /// A leaf can read columns solely to evaluate its own local predicates.
+    /// Those values are consumed before the leaf enters any hash build and
+    /// must not be carried through every intermediate join. Retain only the
+    /// region's public outputs and columns used by predicates spanning more
+    /// than one relation. Keeping the union of all cross-relation keys is
+    /// conservative: a key may remain costed beyond the join that consumes it,
+    /// but a local-only value can no longer distort build orientation.
+    fn apply_relation_payload_widths(
+        &mut self,
+        region_outputs: &HashMap<ColumnBinding, LogicalType>,
+        filters: &[Arc<FilterInfo>],
+    ) {
+        let mut live_columns = region_outputs.clone();
+        for filter in filters.iter().filter(|filter| filter.set.count() > 1) {
+            ExpressionIterator::visit(&filter.filter, &mut |expression| {
+                if let Expression::ColumnRef(column) = expression {
+                    live_columns
+                        .entry(column.binding)
+                        .or_insert_with(|| column.return_type.clone());
+                    ExpressionVisitDecision::SkipChildren
+                } else {
+                    ExpressionVisitDecision::Descend
+                }
+            });
+        }
+
+        let mut relation_columns = vec![HashMap::new(); self.relation_manager.num_relations()];
+        for (binding, logical_type) in live_columns {
+            let Some(relation_id) = self.relation_manager.get_relation_id(binding.table_index)
+            else {
+                continue;
+            };
+            relation_columns[relation_id].insert(binding, logical_type);
+        }
+
+        for (relation_id, columns) in relation_columns.into_iter().enumerate() {
+            let Some(relation) = self.relation_manager.get_relation_mut(relation_id) else {
+                continue;
+            };
+            relation.stats.estimated_payload_width =
+                crate::join::build_probe_side::estimate_row_payload_width(
+                    &columns.into_values().collect::<Vec<_>>(),
+                );
         }
     }
 
@@ -616,7 +694,7 @@ impl JoinOrderOptimizer {
         stats.contains_control_region =
             crate::join::build_probe_side::contains_control_region_boundary(plan);
         stats.unique_keys = declared_unique_keys(plan);
-        stats.column_distinct_count = plan
+        let distinct_counts = plan
             .get_column_bindings()
             .into_iter()
             .map(|binding| {
@@ -643,7 +721,9 @@ impl JoinOrderOptimizer {
                     ),
                 )
             })
-            .collect();
+            .collect::<HashMap<_, _>>();
+        stats.materialization_distinct_count = distinct_counts.clone();
+        stats.column_distinct_count = distinct_counts;
         self.relation_manager.add_relation(
             duplicate_operator_preserving_indices(&plan.operator, bind_context.shared().as_ref()),
             None,
@@ -690,9 +770,25 @@ impl JoinOrderOptimizer {
                 return Ok(None);
             };
 
+            // DP costing chooses a materialized build input independently of
+            // the arbitrary pair order used to enumerate a relation set.
+            // Ordinary INNER/CROSS joins are commutative, so place that input
+            // on the executable join's right side before binding conditions.
+            // Reduction joins use their explicit oriented inverse below.
+            let reduction_orientation = node
+                .predicates
+                .as_ref()
+                .and_then(JoinPredicateSet::reduction_orientation);
+            let flip_for_build = reduction_orientation.is_none()
+                && node.build_side == crate::join::build_probe_side::JoinBuildSide::Left;
+            if flip_for_build {
+                std::mem::swap(&mut left_plan, &mut right_plan);
+                std::mem::swap(&mut left_set, &mut right_set);
+            }
+
             let result = if let Some(predicates) = &node.predicates {
                 let chosen_join_type = predicates.join_type();
-                if let Some(orientation) = predicates.reduction_orientation() {
+                if let Some(orientation) = reduction_orientation {
                     if orientation == JoinEdgeOrientation::Inverted {
                         std::mem::swap(&mut left_plan, &mut right_plan);
                         std::mem::swap(&mut left_set, &mut right_set);
@@ -712,6 +808,12 @@ impl JoinOrderOptimizer {
                         // reordering; it must never silently become a cross
                         // product in release builds.
                         return Ok(None);
+                    }
+                }
+                if flip_for_build {
+                    for condition in &mut join.conditions {
+                        std::mem::swap(&mut condition.left, &mut condition.right);
+                        condition.comparison = condition.comparison.flip();
                     }
                 }
 
@@ -1201,6 +1303,46 @@ mod tests {
     }
 
     #[test]
+    fn materialized_payload_excludes_leaf_local_columns() {
+        let session = make_test_session();
+        let bind_context = BindContext::new();
+        let relation = |table_index| {
+            LogicalPlan::synthetic(LogicalOperator::ExpressionGet(ExpressionGet::new(
+                table_index,
+                Vec::new(),
+                vec!["join_key".to_string(), "local_text".to_string()],
+                vec![LogicalType::Integer, LogicalType::Varchar],
+            )))
+        };
+        let mut optimizer = JoinOrderOptimizer::new();
+        optimizer.add_relation_plan(&session, &bind_context, &relation(0));
+        optimizer.add_relation_plan(&session, &bind_context, &relation(1));
+
+        let relations = HashSet::from([0, 1]);
+        let set = optimizer.set_manager.get_relation_from_set(&relations);
+        let filter = Arc::new(FilterInfo::new(
+            Expression::Comparison(paro_planner::expression::ComparisonExpression::new(
+                ComparisonType::Equal,
+                column_ref(0, 0),
+                column_ref(1, 0),
+            )),
+            set,
+            0,
+            JoinType::Inner,
+            AntiJoinMode::Regular,
+        ));
+        let outputs = HashMap::from([(ColumnBinding::new(0, 0), LogicalType::Integer)]);
+
+        optimizer.apply_relation_payload_widths(&outputs, &[filter]);
+
+        let expected =
+            crate::join::build_probe_side::estimate_row_payload_width(&[LogicalType::Integer]);
+        let stats = optimizer.relation_manager.get_relation_stats();
+        assert_eq!(stats[0].estimated_payload_width, expected);
+        assert_eq!(stats[1].estimated_payload_width, expected);
+    }
+
+    #[test]
     fn integral_domain_cardinality_rejects_unrepresentable_full_u128_range() {
         let mut base = NumericStats::create_unknown(LogicalType::UHugeInt);
         NumericStats::set_guaranteed_min(&mut base, &Value::UHugeInt(0));
@@ -1242,6 +1384,42 @@ mod tests {
             OperatorType::Like,
             "exact"
         )));
+    }
+
+    #[test]
+    fn wildcard_filter_keeps_the_complete_unfiltered_risk_envelope() {
+        let session = make_test_session();
+        let bind_context = BindContext::new();
+        let plan = projection_relation(&bind_context, 1_000, 0, 1_000);
+        let mut optimizer = JoinOrderOptimizer::new();
+        optimizer.add_relation_plan(&session, &bind_context, &plan);
+
+        let predicate = Expression::Operator(OperatorExpression::new(
+            OperatorType::ILike,
+            vec![
+                Expression::ColumnRef(ColumnRefExpression::new(
+                    ColumnBinding::new(0, 0),
+                    LogicalType::Varchar,
+                )),
+                Expression::Constant(ConstantExpression::new(
+                    Value::Varchar("%needle%".to_string()),
+                    LogicalType::Varchar,
+                )),
+            ],
+            LogicalType::Boolean,
+        ));
+        let filter = Arc::new(FilterInfo::new_inner(
+            predicate,
+            Arc::new(JoinRelationSet::single(0)),
+            0,
+        ));
+
+        optimizer.apply_relation_local_selectivity(&[filter]);
+
+        let stats = optimizer.relation_manager.get_relation_stats();
+        assert_eq!(stats[0].cardinality, 50);
+        assert_eq!(stats[0].risk_cardinality, 1_000);
+        assert_eq!(stats[0].materialization_cardinality, 1_000);
     }
 
     #[test]
@@ -2057,6 +2235,46 @@ mod tests {
         // the single-column C relation as the final hash build instead of the
         // wider B-C intermediate.
         assert_eq!(nested_tables, HashSet::from([0usize, 1usize]));
+    }
+
+    #[test]
+    fn reconstructed_inner_join_places_the_dp_build_input_on_the_right() {
+        let session = make_test_session();
+        let bind_context = BindContext::new();
+        let small = projection_relation(&bind_context, 100, 0, 10);
+        let large = projection_relation(&bind_context, 101, 1, 1_000_000);
+        let plan = LogicalPlan {
+            id: bind_context.next_plan_id(),
+            stats: NodeStats::default(),
+            operator: LogicalOperator::Join(Join::Comparison(ComparisonJoin::new(
+                JoinType::Inner,
+                small,
+                large,
+                vec![join_condition(JoinComparisonType::Equal, 0, 1)],
+            ))),
+        };
+
+        let optimized = JoinOrderOptimizer::new()
+            .optimize_plan(&session, plan, &HashMap::new(), &bind_context)
+            .expect("join order optimization should succeed");
+        let LogicalOperator::Join(Join::Comparison(root)) = optimized.operator else {
+            panic!("expected comparison join root")
+        };
+
+        assert_eq!(
+            root.right.get_column_bindings()[0].table_index,
+            0,
+            "the input costed as the hash build must survive reconstruction on the right"
+        );
+        let condition = &root.conditions[0];
+        let Expression::ColumnRef(left) = &condition.left else {
+            panic!("expected a column join key")
+        };
+        let Expression::ColumnRef(right) = &condition.right else {
+            panic!("expected a column join key")
+        };
+        assert_eq!(left.binding.table_index, 1);
+        assert_eq!(right.binding.table_index, 0);
     }
 
     #[test]

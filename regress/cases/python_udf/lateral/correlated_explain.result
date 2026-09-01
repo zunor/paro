@@ -26,11 +26,11 @@ ORDER_BY  (rows=30)
         Join Condition: t.x IS NOT DISTINCT FROM x
         ->  DELIM_SCAN
         ->  EXTERNAL_TABLE  (rows=100)
-          ->  PROJECTION
+          ->  PROJECTION  (rows=1)
             Output: __external_arg_1, x
-            ->  CROSS_PRODUCT
-              ->  DUMMY_SCAN
+            ->  CROSS_PRODUCT  (rows=1)
               ->  DELIM_SCAN  (rows=1)
+              ->  DUMMY_SCAN  (rows=1)
 
 DROP FUNCTION py_scale(INTEGER);
 DROP FUNCTION

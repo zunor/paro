@@ -71,15 +71,15 @@ PROJECTION  (rows=2)
     Output: person_name, company_name, city_name
     ->  GRAPH_EXPAND  (rows=2)
       Graph: start_graph
-      Edge Label: WorksAt
+      Edge Label: worksat
       Direction: Backward
       ->  GRAPH_EXPAND  (rows=1)
         Graph: start_graph
-        Edge Label: LocatedIn
+        Edge Label: locatedin
         Direction: Forward
         ->  GRAPH_SCAN  (rows=1)
           Graph: start_graph
-          Vertex Label: Company
+          Vertex Label: company
           Table: ssp_company
           Filter: <pushed down>
 

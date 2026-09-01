@@ -14,6 +14,7 @@ pub(super) fn register_transformations(
     registry: &mut ImplementationRegistry,
     planner_state: Arc<RwLock<PlannerTransformState>>,
 ) -> Result<()> {
+    validate_semantic_dependencies()?;
     for transformation in PlannerTransformation::ALL {
         registry.register_transformation(PlannerTransformationRule {
             transformation,
@@ -81,15 +82,70 @@ impl PlannerTransformation {
     /// Only proof-producing rewrites may replace the group's canonical
     /// statistics recipe. Shape-only alternatives keep the normalized recipe
     /// so enumeration cannot vote estimates up or down.
-    const fn cardinality_authority(self) -> Option<CardinalityAuthority> {
+    const fn cardinality_recipe_kind(self) -> Option<CardinalityRecipeKind> {
         match self {
             Self::CteInline
             | Self::CteFilterPushdown
             | Self::AggregateJoinSubsumption
-            | Self::JoinElimination => Some(CardinalityAuthority::ConstraintRefined),
+            | Self::JoinElimination => Some(CardinalityRecipeKind::ConstraintRefined),
             _ => None,
         }
     }
+
+    /// Earlier equivalence proofs whose semantic shape this rule is allowed
+    /// to consume through a child group. Rules not listed here remain
+    /// alternatives for costing; they cannot silently change this rule's
+    /// input just because their numeric id happens to sort later.
+    const fn semantic_dependencies(self) -> &'static [RuleId] {
+        match self {
+            // Subsumption recognizes the explicit semi-join produced when a
+            // positive mark is consumed by its filter.
+            Self::AggregateJoinSubsumption => &[MARK_JOIN_TO_SEMI_RULE],
+            _ => &[],
+        }
+    }
+}
+
+fn validate_semantic_dependencies() -> Result<()> {
+    fn visit(
+        transformation: PlannerTransformation,
+        visiting: &mut BTreeSet<RuleId>,
+        visited: &mut BTreeSet<RuleId>,
+    ) -> Result<()> {
+        if visited.contains(&transformation.id()) {
+            return Ok(());
+        }
+        if !visiting.insert(transformation.id()) {
+            return Err(paro_error::internal(format!(
+                "optimizer transformation dependency cycle contains rule {}",
+                transformation.id().0
+            )));
+        }
+        for dependency in transformation.semantic_dependencies() {
+            let dependency = PlannerTransformation::ALL
+                .iter()
+                .copied()
+                .find(|candidate| candidate.id() == *dependency)
+                .ok_or_else(|| {
+                    paro_error::internal(format!(
+                        "optimizer transformation {} depends on unregistered rule {}",
+                        transformation.id().0,
+                        dependency.0
+                    ))
+                })?;
+            visit(dependency, visiting, visited)?;
+        }
+        visiting.remove(&transformation.id());
+        visited.insert(transformation.id());
+        Ok(())
+    }
+
+    let mut visiting = BTreeSet::new();
+    let mut visited = BTreeSet::new();
+    for transformation in PlannerTransformation::ALL {
+        visit(transformation, &mut visiting, &mut visited)?;
+    }
+    Ok(())
 }
 
 #[derive(Debug)]
@@ -132,7 +188,12 @@ impl TransformationRule for PlannerTransformationRule {
                     .planner_state
                     .read()
                     .expect("planner transform state poisoned");
-                let plan = semantic_plan::materialize(ctx.memo(), &state, expr)?;
+                let plan = semantic_plan::materialize(
+                    ctx.memo(),
+                    &state,
+                    expr,
+                    self.transformation.semantic_dependencies(),
+                )?;
                 let logical = ctx.memo().logical_expr(expr).ok_or_else(|| {
                     paro_error::internal("planner rule lost its source expression")
                 })?;
@@ -240,7 +301,7 @@ impl TransformationRule for PlannerTransformationRule {
                         target_group,
                         self.id(),
                         preserved_region_facet,
-                        self.transformation.cardinality_authority(),
+                        self.transformation.cardinality_recipe_kind(),
                     ),
                     memo,
                     state,

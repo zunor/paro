@@ -406,25 +406,40 @@ fn group_merge_intersects_independently_proven_cardinality_bounds() {
 }
 
 #[test]
-fn canonical_cardinality_recipe_is_order_independent_and_authority_aware() {
+fn canonical_cardinality_recipe_preserves_peer_uncertainty_and_kind_priority() {
     let statistics_a =
-        GroupCardinality::new(Fingerprint(20), CardinalityAuthority::Statistics, 4, 9, 14);
+        GroupCardinality::new(Fingerprint(20), CardinalityRecipeKind::Statistics, 4, 9, 14);
     let statistics_b =
-        GroupCardinality::new(Fingerprint(10), CardinalityAuthority::Statistics, 5, 5, 8);
-    let forward = statistics_a.canonical_with(statistics_b);
-    let reverse = statistics_b.canonical_with(statistics_a);
+        GroupCardinality::new(Fingerprint(10), CardinalityRecipeKind::Statistics, 5, 5, 8);
+    let statistics_c = GroupCardinality::new(
+        Fingerprint(30),
+        CardinalityRecipeKind::Statistics,
+        1,
+        20,
+        40,
+    );
+    let forward = statistics_a.clone().canonical_with(statistics_b.clone());
+    let reverse = statistics_b.clone().canonical_with(statistics_a.clone());
     assert_eq!(forward, reverse);
-    assert_eq!(forward.representative(), Some((5, 5, 8)));
+    assert_eq!(forward.representative(), Some((4, 7, 14)));
+    assert_eq!(forward.recipe, Fingerprint(10));
+    assert_eq!(
+        statistics_a
+            .clone()
+            .canonical_with(statistics_b.clone())
+            .canonical_with(statistics_c.clone()),
+        statistics_a.canonical_with(statistics_b.canonical_with(statistics_c))
+    );
 
-    let region = GroupCardinality::new(Fingerprint(30), CardinalityAuthority::JoinRegion, 5, 6, 7);
-    assert_eq!(forward.canonical_with(region), region);
-    assert_eq!(region.canonical_with(forward), region);
+    let region = GroupCardinality::new(Fingerprint(30), CardinalityRecipeKind::JoinRegion, 5, 6, 7);
+    assert_eq!(forward.clone().canonical_with(region.clone()), region);
+    assert_eq!(region.clone().canonical_with(forward), region);
 
     let inherited = GroupCardinality::inherit(Fingerprint(40), GroupId::new(1));
-    let mut refined = GroupCardinality::inherit(Fingerprint(50), GroupId::new(2));
-    refined.authority = CardinalityAuthority::ConstraintRefined;
-    assert_eq!(inherited.canonical_with(refined), refined);
-    assert_eq!(refined.canonical_with(inherited), refined);
+    let refined = GroupCardinality::inherit(Fingerprint(50), GroupId::new(2))
+        .with_kind(CardinalityRecipeKind::ConstraintRefined);
+    assert_eq!(inherited.clone().canonical_with(refined.clone()), refined);
+    assert_eq!(refined.clone().canonical_with(inherited), refined);
 }
 
 #[test]
@@ -435,7 +450,7 @@ fn inherited_cardinality_tracks_child_and_respects_group_hard_bound() {
         LogicalProperties::default(),
         GroupCardinality::new(
             Fingerprint(1),
-            CardinalityAuthority::Statistics,
+            CardinalityRecipeKind::Statistics,
             80,
             100,
             120,
@@ -453,8 +468,34 @@ fn inherited_cardinality_tracks_child_and_respects_group_hard_bound() {
     assert_eq!(memo.cardinality_estimate(parent), Some((80, 90, 90)));
 
     memo.group_mut(child).unwrap().cardinality =
-        GroupCardinality::new(Fingerprint(3), CardinalityAuthority::JoinRegion, 4, 5, 6);
+        GroupCardinality::new(Fingerprint(3), CardinalityRecipeKind::JoinRegion, 4, 5, 6);
     assert_eq!(memo.cardinality_estimate(parent), Some((4, 5, 6)));
+}
+
+#[test]
+fn peer_row_preserving_recipes_track_every_equivalent_input() {
+    let mut memo = Memo::new(SearchBudget::default());
+    let first = memo.create_group(
+        schema(1),
+        LogicalProperties::default(),
+        GroupCardinality::new(
+            Fingerprint(1),
+            CardinalityRecipeKind::Statistics,
+            10,
+            20,
+            30,
+        ),
+    );
+    let second = memo.create_group(
+        schema(1),
+        LogicalProperties::default(),
+        GroupCardinality::new(Fingerprint(2), CardinalityRecipeKind::Statistics, 5, 8, 12),
+    );
+    let inherited = GroupCardinality::inherit(Fingerprint(3), first)
+        .canonical_with(GroupCardinality::inherit(Fingerprint(4), second));
+    let parent = memo.create_group(schema(1), LogicalProperties::default(), inherited);
+
+    assert_eq!(memo.cardinality_estimate(parent), Some((5, 14, 30)));
 }
 
 #[test]

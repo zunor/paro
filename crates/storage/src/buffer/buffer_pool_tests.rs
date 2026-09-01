@@ -174,6 +174,20 @@ fn test_set_memory_limit_with_evict_and_rollback() {
 }
 
 #[test]
+fn resident_pin_treats_evicted_external_pages_as_cache_misses() {
+    let pool = BufferPool::new_arc(1024);
+    let handle = pool
+        .allocate(MemoryTag::PageCache, FileBufferType::ExternalFile, 1024)
+        .unwrap();
+    let block_id = handle.block_handle().unwrap().block_id();
+
+    drop(handle);
+    let result = pool.evict_blocks(MemoryTag::PageCache, 0, 0, None);
+    assert!(result.success);
+    assert!(pool.pin_resident(block_id).is_none());
+}
+
+#[test]
 fn test_swap_limit_enforced_by_spill_manager() {
     let pool = create_pool_with_temp_dir(4096);
     pool.set_swap_limit(Some(128)).unwrap();

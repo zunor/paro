@@ -56,7 +56,7 @@ use super::ids::{
     StableFingerprintBuilder,
 };
 use super::memo::{
-    CardinalityAuthority, CardinalityEnvelope, EquivalenceProof, GrantGoalKey, GroupCardinality,
+    CardinalityEnvelope, CardinalityRecipeKind, EquivalenceProof, GrantGoalKey, GroupCardinality,
     LogicalExprKey, LogicalProperties, Memo, OptimizationGoal, PhysicalExprKey, RowGoal,
 };
 use super::properties::{

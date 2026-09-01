@@ -90,7 +90,11 @@ impl StatisticsGathering {
         ctx: &mut OptimizationContext,
     ) -> Option<CardinalityEstimate> {
         match &plan.operator {
-            LogicalOperator::DummyScan => None,
+            // DUMMY_SCAN is the one-row, zero-column identity relation. It is
+            // not an unknown table: treating it as unknown inflates lateral
+            // argument plans before an external table multiplies by its
+            // per-invocation row estimate.
+            LogicalOperator::DummyScan => Some(CardinalityEstimate::exact(1)),
             LogicalOperator::Get(get) => Some(CardinalityEstimate::exact(
                 self.get_storage_rows(get, ctx) as u64,
             )),
@@ -1189,6 +1193,23 @@ mod tests {
             Some(CardinalityEstimate::exact(10))
         );
         assert!(ctx.column_stats.contains_key(&ColumnBinding::new(2, 0)));
+    }
+
+    #[test]
+    fn dummy_scan_is_the_exact_one_row_relation() {
+        let bind_context = BindContext::new();
+        let session = make_test_session();
+        let mut ctx = OptimizationContext::new(session, bind_context.clone());
+        let plan = LogicalPlan::new(&bind_context, LogicalOperator::DummyScan);
+
+        let gathered = StatisticsGathering::new()
+            .gather(plan, &mut ctx)
+            .expect("gather should succeed");
+
+        assert_eq!(
+            gathered.stats.estimated_cardinality,
+            Some(CardinalityEstimate::exact(1))
+        );
     }
 
     #[test]

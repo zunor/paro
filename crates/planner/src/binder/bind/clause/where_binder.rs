@@ -8,7 +8,7 @@ use crate::expression::{CastExpression, Expression};
 use paro_common::error::Result;
 use paro_common::types::LogicalType;
 use paro_parser::ast::{ColumnRef, Expr};
-use paro_parser::ExprRewriter;
+use paro_parser::CurrentQueryExprRewriter;
 
 use super::{AliasLookup, SelectBindState};
 
@@ -84,7 +84,7 @@ impl<'a> WhereBinder<'a> {
 
     fn rewrite_alias_references(&mut self, expr: &mut Expr) -> Result<()> {
         let mut error = None;
-        let mut rewriter = ExprRewriter::new(|expr: &mut Expr| {
+        let mut rewriter = CurrentQueryExprRewriter::new(|expr: &mut Expr| {
             if error.is_some() {
                 return;
             }
