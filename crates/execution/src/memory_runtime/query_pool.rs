@@ -225,6 +225,16 @@ impl QueryMemoryPool {
             .expect("external worker lease lock poisoned") = Some(lease);
     }
 
+    pub fn external_dispatch_gate(
+        &self,
+    ) -> Option<paro_external::runtime::host::ExternalDispatchGate> {
+        self.external_worker_lease
+            .lock()
+            .expect("external worker lease lock poisoned")
+            .as_ref()
+            .map(paro_external::runtime::host::ExternalWorkerLease::dispatch_gate)
+    }
+
     pub fn detach_registration(&self) {
         // Admission leases have the same lifetime as the query registration,
         // not the lifetime of incidental Arc holders retained by operators.

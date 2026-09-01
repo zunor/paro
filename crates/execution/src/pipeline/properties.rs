@@ -88,6 +88,11 @@ impl PipelinePropertyAccumulator {
                 self.memory.spillable = true;
                 self.capabilities.supports_spill = true;
             }
+            SinkSpec::ExternalTable(_) => {
+                self.capabilities.parallelism =
+                    self.capabilities.parallelism.merge(Parallelism::single());
+                self.memory.class = self.memory.class.max(MemoryClass::Blocking);
+            }
             _ => {}
         }
 
