@@ -261,7 +261,49 @@ pub struct ChildGoalAlternative {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CostComposition {
     Sequential,
-    RetainedState { overlapping_children: u64 },
+    RetainedState {
+        overlapping_children: u64,
+    },
+    /// A region-owned side input reduces work inside one child boundary.
+    /// Resource proofs remain unscaled; the integer ratios affect only
+    /// estimated/risk work and are recorded in the JointCostProof.
+    SidewaysFilter {
+        overlapping_children: u64,
+        filtered_child: u8,
+        expected_retained_ppm: u32,
+        upper_retained_ppm: u32,
+    },
+}
+
+impl CostComposition {
+    pub(crate) fn overlapping_children(self) -> u64 {
+        match self {
+            Self::Sequential => 0,
+            Self::RetainedState {
+                overlapping_children,
+            }
+            | Self::SidewaysFilter {
+                overlapping_children,
+                ..
+            } => overlapping_children,
+        }
+    }
+
+    pub(crate) fn sideways_filter(self) -> Option<(usize, u32, u32)> {
+        match self {
+            Self::SidewaysFilter {
+                filtered_child,
+                expected_retained_ppm,
+                upper_retained_ppm,
+                ..
+            } => Some((
+                usize::from(filtered_child),
+                expected_retained_ppm,
+                upper_retained_ppm,
+            )),
+            _ => None,
+        }
+    }
 }
 
 #[derive(Debug, Clone)]

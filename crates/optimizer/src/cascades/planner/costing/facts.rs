@@ -39,12 +39,19 @@ pub(in crate::cascades::planner) fn planner_cost_facts(
         LogicalOperator::Join(Join::Comparison(join)) => runtime_filter_probe_multiplicity(join),
         _ => RuntimeFilterProbeMultiplicity::Unknown,
     };
+    let runtime_filter_probe_source_rows = match &plan.operator {
+        LogicalOperator::Join(Join::Comparison(join)) => {
+            super::runtime_filter_probe_source_rows(join)
+        }
+        _ => None,
+    };
     Ok(PlannerCostFacts {
         child_row_widths,
         output_row_width,
         perfect_hash,
         topn_capacity,
         runtime_filter_probe_multiplicity,
+        runtime_filter_probe_source_rows,
     })
 }
 
@@ -97,6 +104,10 @@ pub(in crate::cascades::planner) fn expression_cost_facts(
         perfect_hash: template.perfect_hash,
         topn_capacity: template.topn_capacity,
         runtime_filter_probe_multiplicity: template.runtime_filter_probe_multiplicity,
+        runtime_filter_probe_source_rows: template
+            .runtime_filter_probe_source_rows
+            .map(|rows| CompactRange::new(rows.min as f64, rows.expected as f64, rows.max as f64))
+            .transpose()?,
     })
 }
 

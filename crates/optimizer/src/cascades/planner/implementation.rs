@@ -192,7 +192,11 @@ impl PhysicalImplementation for PlannerBaselineImplementation {
             provided: metadata.provided.clone(),
             child_goals,
             local_cost,
-            cost_composition: planner_cost_composition(metadata, metadata.implementations.baseline),
+            cost_composition: planner_cost_composition(
+                metadata,
+                metadata.implementations.baseline,
+                &cost_facts,
+            )?,
             spillable,
             enforcer_cost_input: planner_enforcer_cost_input(
                 &cost_facts,
@@ -334,7 +338,7 @@ impl PhysicalImplementation for AlternativeImplementation {
             provided: metadata.provided.clone(),
             child_goals,
             local_cost,
-            cost_composition: planner_cost_composition(metadata, self.flavor),
+            cost_composition: planner_cost_composition(metadata, self.flavor, &cost_facts)?,
             spillable: implementation_spillable(metadata, self.flavor),
             enforcer_cost_input: planner_enforcer_cost_input(
                 &cost_facts,

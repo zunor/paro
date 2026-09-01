@@ -113,103 +113,15 @@ pub(super) fn supports_runtime_filter_auxiliary(
     join: &paro_planner::operator::ComparisonJoin,
     rowset_scan_pushdown: bool,
 ) -> bool {
-    if !matches!(
-        join.join_type,
-        JoinType::Inner | JoinType::Semi | JoinType::RightSemi | JoinType::RightAnti
-    ) {
+    if !rowset_scan_pushdown
+        || !matches!(
+            join.join_type,
+            JoinType::Inner | JoinType::Semi | JoinType::RightSemi | JoinType::RightAnti
+        )
+    {
         return false;
-    }
-    struct ProbeLineage<'a> {
-        get: &'a paro_planner::operator::Get,
-        output: Vec<Option<usize>>,
     }
 
-    fn probe_lineages<'a>(
-        plan: &'a LogicalPlan,
-        rowset_scan_pushdown: bool,
-    ) -> Option<Vec<ProbeLineage<'a>>> {
-        match &plan.operator {
-            LogicalOperator::Get(get) => Some(vec![ProbeLineage {
-                get,
-                output: (0..get.returned_types.len()).map(Some).collect(),
-            }]),
-            LogicalOperator::Filter(filter) if rowset_scan_pushdown => {
-                let mut lineages = probe_lineages(&filter.child, rowset_scan_pushdown)?;
-                if lineages.len() != 1 {
-                    return None;
-                }
-                let lineage = &mut lineages[0];
-                let filter_is_fully_pushable = [
-                    filter.expressions.as_slice(),
-                    lineage.get.runtime_filter_expressions.as_slice(),
-                ]
-                .into_iter()
-                .all(|expressions| {
-                    crate::physical::extraction::predicate_builder::build_predicate_tree(
-                        expressions,
-                        lineage.get,
-                    )
-                    .is_ok_and(|(_, residual)| residual.is_empty())
-                });
-                if !filter_is_fully_pushable {
-                    return None;
-                }
-                let projection = filter.projection_map.to_indices(filter.child.types().len());
-                lineage.output = projection
-                    .into_iter()
-                    .map(|index| lineage.output.get(index).copied().flatten())
-                    .collect();
-                Some(lineages)
-            }
-            LogicalOperator::Projection(projection) => {
-                let mut lineages = probe_lineages(&projection.child, rowset_scan_pushdown)?;
-                let child_bindings = projection.child.get_column_bindings();
-                for lineage in &mut lineages {
-                    lineage.output = projection
-                        .expressions
-                        .iter()
-                        .map(|expression| {
-                            let child_index = match expression {
-                                Expression::ColumnRef(column) if column.depth == 0 => {
-                                    child_bindings
-                                        .iter()
-                                        .position(|binding| *binding == column.binding)
-                                }
-                                Expression::Reference(reference) => Some(reference.index),
-                                _ => None,
-                            }?;
-                            lineage.output.get(child_index).copied().flatten()
-                        })
-                        .collect();
-                }
-                Some(lineages)
-            }
-            LogicalOperator::SetOperation(setop)
-                if setop.setop_type == paro_planner::operator::SetOpType::Union
-                    && setop.setop_all =>
-            {
-                let mut lineages = probe_lineages(&setop.left, rowset_scan_pushdown)?;
-                lineages.extend(probe_lineages(&setop.right, rowset_scan_pushdown)?);
-                lineages
-                    .iter()
-                    .all(|lineage| lineage.output.len() == setop.column_count)
-                    .then_some(lineages)
-            }
-            // A CTE reference is not a rowset consumer. Crossing it requires
-            // one AuxiliaryPlanRegion jointly owned by the CTE producer,
-            // every reference, and the runtime-filter build. Keep the local
-            // implementation closed until that ownership is represented in
-            // Memo; installing a filter on only one reference is unsound.
-            _ => None,
-        }
-    }
-
-    let Some(lineages) = probe_lineages(&join.left, rowset_scan_pushdown) else {
-        return false;
-    };
-    if lineages.is_empty() || lineages.iter().any(|lineage| lineage.get.table.is_none()) {
-        return false;
-    }
     let probe_bindings = join.left.get_column_bindings();
     join.conditions.iter().any(|condition| {
         if condition.comparison != JoinComparisonType::Equal {
@@ -223,16 +135,105 @@ pub(super) fn supports_runtime_filter_auxiliary(
             _ => None,
         };
         output_index.is_some_and(|index| {
-            lineages.iter().all(|lineage| {
-                lineage
-                    .output
-                    .get(index)
-                    .copied()
-                    .flatten()
-                    .is_some_and(|get_index| lineage.get.stored_column(get_index).is_some())
-            })
+            runtime_filter_probe_lineages(&join.left, index)
+                .is_some_and(|lineages| !lineages.is_empty())
         })
     })
+}
+
+fn runtime_filter_probe_lineages(
+    plan: &LogicalPlan,
+    output_index: usize,
+) -> Option<Vec<&LogicalPlan>> {
+    match &plan.operator {
+        LogicalOperator::Get(get)
+            if get.table.is_some() && get.stored_column(output_index).is_some() =>
+        {
+            Some(vec![plan])
+        }
+        LogicalOperator::Filter(filter) => {
+            let child_index = filter
+                .projection_map
+                .to_indices(filter.child.types().len())
+                .get(output_index)
+                .copied()?;
+            runtime_filter_probe_lineages(&filter.child, child_index)
+        }
+        LogicalOperator::Projection(projection)
+            if !matches!(projection.child.operator, LogicalOperator::RowFetch(_)) =>
+        {
+            let child_bindings = projection.child.get_column_bindings();
+            let child_index = match projection.expressions.get(output_index)? {
+                Expression::ColumnRef(column) if column.depth == 0 => child_bindings
+                    .iter()
+                    .position(|binding| *binding == column.binding),
+                Expression::Reference(reference) => Some(reference.index),
+                _ => None,
+            }?;
+            runtime_filter_probe_lineages(&projection.child, child_index)
+        }
+        LogicalOperator::SetOperation(setop)
+            if setop.setop_type == paro_planner::operator::SetOpType::Union && setop.setop_all =>
+        {
+            if output_index >= setop.column_count {
+                return None;
+            }
+            let mut lineages = runtime_filter_probe_lineages(&setop.left, output_index)?;
+            lineages.extend(runtime_filter_probe_lineages(&setop.right, output_index)?);
+            Some(lineages)
+        }
+        LogicalOperator::Join(Join::Comparison(inner))
+            if inner.join_type == JoinType::Inner
+                && inner.duplicate_eliminated_columns.is_empty()
+                && !inner.delim_flipped =>
+        {
+            let left_projection = inner
+                .left_projection_map
+                .to_indices(inner.left.types().len());
+            if let Some(&child_index) = left_projection.get(output_index) {
+                return runtime_filter_probe_lineages(&inner.left, child_index);
+            }
+            let right_output = output_index.checked_sub(left_projection.len())?;
+            let right_projection = inner
+                .right_projection_map
+                .to_indices(inner.right.types().len());
+            runtime_filter_probe_lineages(&inner.right, *right_projection.get(right_output)?)
+        }
+        // A CTE reference is not a rowset consumer. Crossing it requires one
+        // AuxiliaryPlanRegion jointly owned by the CTE producer, every
+        // reference, and the runtime-filter build.
+        _ => None,
+    }
+}
+
+pub(super) fn runtime_filter_probe_source_rows(
+    join: &paro_planner::operator::ComparisonJoin,
+) -> Option<paro_planner::plan::CardinalityEstimate> {
+    let probe_bindings = join.left.get_column_bindings();
+    join.conditions
+        .iter()
+        .filter(|condition| condition.comparison == JoinComparisonType::Equal)
+        .find_map(|condition| {
+            let output_index = match &condition.left {
+                Expression::ColumnRef(column) if column.depth == 0 => probe_bindings
+                    .iter()
+                    .position(|binding| *binding == column.binding),
+                Expression::Reference(reference) => Some(reference.index),
+                _ => None,
+            }?;
+            let lineages = runtime_filter_probe_lineages(&join.left, output_index)?;
+            lineages.into_iter().try_fold(
+                paro_planner::plan::CardinalityEstimate::exact(0),
+                |sum, source| {
+                    let rows = source.stats.estimated_cardinality?;
+                    Some(paro_planner::plan::CardinalityEstimate {
+                        min: sum.min.saturating_add(rows.min),
+                        expected: sum.expected.saturating_add(rows.expected),
+                        max: sum.max.saturating_add(rows.max),
+                    })
+                },
+            )
+        })
 }
 
 pub(super) fn selected_implementation_flavor(

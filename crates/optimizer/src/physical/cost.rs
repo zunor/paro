@@ -251,6 +251,53 @@ impl SearchCost {
         Ok(result)
     }
 
+    /// Scale expected and risk work for a region-owned selectivity effect.
+    /// Hard resource quantities deliberately remain unchanged: fewer expected
+    /// rows are not a memory, worker, or forward-progress proof.
+    pub(crate) fn retain_work(
+        mut self,
+        expected_retained_ppm: u32,
+        upper_retained_ppm: u32,
+    ) -> Result<Self> {
+        const SCALE: f64 = 1_000_000.0;
+        if expected_retained_ppm > upper_retained_ppm || upper_retained_ppm > 1_000_000 {
+            return Err(paro_error::internal(
+                "sideways-filter work retention ratio is invalid",
+            ));
+        }
+        let expected_factor = f64::from(expected_retained_ppm) / SCALE;
+        let upper_factor = f64::from(upper_retained_ppm) / SCALE;
+        let risk_weight = if self.score.range.upper > self.score.range.expected {
+            ((self.score.risk_adjusted - self.score.range.expected)
+                / (self.score.range.upper - self.score.range.expected))
+                .clamp(0.0, 1.0)
+        } else {
+            0.5
+        };
+        self.score.range = CompactRange::new(
+            self.score.range.lower * expected_factor,
+            self.score.range.expected * expected_factor,
+            self.score.range.upper * upper_factor,
+        )?;
+        self.score.risk_adjusted = self.score.range.expected
+            + (self.score.range.upper - self.score.range.expected) * risk_weight;
+        self.critical_path = CompactRange::new(
+            self.critical_path.lower * expected_factor,
+            self.critical_path.expected * expected_factor,
+            self.critical_path.upper * upper_factor,
+        )?;
+        for value in &mut self.resources_expected {
+            *value *= expected_factor;
+        }
+        for value in &mut self.resources_risk_upper {
+            *value *= upper_factor;
+        }
+        self.spill_bytes_expected =
+            ((self.spill_bytes_expected as f64) * expected_factor).ceil() as u64;
+        self.validate()?;
+        Ok(self)
+    }
+
     pub fn dominates(&self, other: &Self) -> bool {
         let no_worse = self.score.risk_adjusted <= other.score.risk_adjusted
             && self.score.range.upper <= other.score.range.upper

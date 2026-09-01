@@ -13,6 +13,7 @@ pub mod edges;
 pub mod explain;
 pub mod identity;
 pub mod ids;
+pub mod lineage;
 pub mod node;
 pub mod plan;
 pub mod portfolio;

@@ -384,7 +384,12 @@ impl PhysicalPlanExtractor {
                     "runtime-filter hash join must have probe and build children",
                 ));
             };
-            let consumers = runtime_filter_probe_scans(&self.arena, &self.children, *probe);
+            let consumers = crate::physical::lineage::runtime_filter_consumers_in(
+                &self.arena,
+                &self.children,
+                *probe,
+                spec,
+            );
             if consumers.is_empty() {
                 return Err(paro_error::internal(
                     "runtime-filter candidate has no row-preserving rowset-scan consumer",
@@ -622,36 +627,6 @@ impl PhysicalPlanExtractor {
             },
         );
         id
-    }
-}
-
-fn runtime_filter_probe_scans(
-    arena: &PhysicalPlanNodeArena,
-    children: &PlanChildrenArena,
-    node: PhysicalPlanNodeId,
-) -> Vec<PhysicalPlanNodeId> {
-    let Some(current) = arena.get(node) else {
-        return Vec::new();
-    };
-    match &current.kind {
-        PhysicalNodeKind::RowsetScan(_) => vec![node],
-        PhysicalNodeKind::Project(_) | PhysicalNodeKind::Filter(_) => {
-            let [child] = current.children.as_slice(children) else {
-                return Vec::new();
-            };
-            runtime_filter_probe_scans(arena, children, *child)
-        }
-        PhysicalNodeKind::SetOperation(spec)
-            if spec.op == paro_planner::operator::SetOpType::Union && spec.all =>
-        {
-            current
-                .children
-                .as_slice(children)
-                .iter()
-                .flat_map(|child| runtime_filter_probe_scans(arena, children, *child))
-                .collect()
-        }
-        _ => Vec::new(),
     }
 }
 

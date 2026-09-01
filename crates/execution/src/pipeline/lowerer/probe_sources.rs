@@ -237,34 +237,9 @@ fn trace_probe_reference_to_rowset(
     output_index: usize,
     target: PhysicalPlanNodeId,
 ) -> Option<usize> {
-    let current = plan.nodes.get(node)?;
-    match &current.kind {
-        PhysicalNodeKind::RowsetScan(_) => (node == target).then_some(output_index),
-        PhysicalNodeKind::Project(spec) => {
-            let Expression::Reference(reference) = spec.expressions.get(output_index)? else {
-                return None;
-            };
-            let [child] = plan.child_ids(&current.children) else {
-                return None;
-            };
-            trace_probe_reference_to_rowset(plan, *child, reference.index, target)
-        }
-        PhysicalNodeKind::Filter(spec) => {
-            let child_index = *spec.projection_map.get(output_index)?;
-            let [child] = plan.child_ids(&current.children) else {
-                return None;
-            };
-            trace_probe_reference_to_rowset(plan, *child, child_index, target)
-        }
-        PhysicalNodeKind::SetOperation(spec)
-            if spec.op == paro_planner::operator::SetOpType::Union && spec.all =>
-        {
-            plan.child_ids(&current.children).iter().find_map(|child| {
-                trace_probe_reference_to_rowset(plan, *child, output_index, target)
-            })
-        }
-        _ => None,
-    }
+    paro_optimizer::physical::lineage::trace_rowset_lineage(plan, node, output_index)
+        .into_iter()
+        .find_map(|(scan, source_index)| (scan == target).then_some(source_index))
 }
 
 /// Return the source reference under an exact, monotonic representation cast.

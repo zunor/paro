@@ -324,7 +324,8 @@ pub(super) fn planner_structural_retained_children(operator: &LogicalOperator) -
 pub(super) fn planner_cost_composition(
     metadata: &PlannerOperatorMetadata,
     flavor: PhysicalImplementationFlavor,
-) -> CostComposition {
+    facts: &ResolvedPlannerCostFacts,
+) -> Result<CostComposition> {
     let overlapping_children = match flavor {
         PhysicalImplementationFlavor::HashJoin
         | PhysicalImplementationFlavor::HashJoinRuntimeFilter => 0b11,
@@ -342,12 +343,54 @@ pub(super) fn planner_cost_composition(
         | PhysicalImplementationFlavor::ClassicIeJoin
         | PhysicalImplementationFlavor::SearchProvider => 0,
     };
-    if overlapping_children == 0 {
-        CostComposition::Sequential
-    } else {
-        CostComposition::RetainedState {
-            overlapping_children,
+    if flavor == PhysicalImplementationFlavor::HashJoinRuntimeFilter {
+        let Some(source) = facts.runtime_filter_probe_source_rows else {
+            return Ok(CostComposition::RetainedState {
+                overlapping_children,
+            });
+        };
+        let build = facts
+            .child_rows
+            .get(1)
+            .copied()
+            .unwrap_or(CompactRange::ZERO);
+        let probe = facts
+            .child_rows
+            .first()
+            .copied()
+            .unwrap_or(CompactRange::ZERO);
+        // A non-local runtime filter may reduce source work only when the join
+        // estimate itself proves that the build domain can reject probe rows.
+        // Build cardinality is otherwise just a membership-table size; using
+        // it to discount a deeper scan would invent selectivity that the
+        // relational estimator does not predict.
+        if build.expected >= probe.expected {
+            return Ok(CostComposition::RetainedState {
+                overlapping_children,
+            });
         }
+        let retained =
+            runtime_filtered_probe_work(source, build, facts.runtime_filter_probe_multiplicity)?;
+        let ratio_ppm = |retained: f64, source: f64| {
+            if source <= 0.0 {
+                1_000_000
+            } else {
+                ((retained / source).clamp(0.0, 1.0) * 1_000_000.0).round() as u32
+            }
+        };
+        return Ok(CostComposition::SidewaysFilter {
+            overlapping_children,
+            filtered_child: 0,
+            expected_retained_ppm: ratio_ppm(retained.expected, source.expected),
+            upper_retained_ppm: ratio_ppm(retained.upper, source.upper),
+        });
+    }
+    if overlapping_children == 0 {
+        Ok(CostComposition::Sequential)
+    } else {
+        Ok(CostComposition::RetainedState {
+            overlapping_children,
+        })
     }
 }
 

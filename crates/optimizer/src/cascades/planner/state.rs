@@ -289,6 +289,7 @@ pub(super) struct PlannerCostFacts {
     pub(super) perfect_hash: Option<crate::physical::PerfectHashResourceContract>,
     pub(super) topn_capacity: Option<u64>,
     pub(super) runtime_filter_probe_multiplicity: RuntimeFilterProbeMultiplicity,
+    pub(super) runtime_filter_probe_source_rows: Option<paro_planner::plan::CardinalityEstimate>,
 }
 
 #[derive(Debug, Clone)]
@@ -302,6 +303,7 @@ pub(super) struct ResolvedPlannerCostFacts {
     pub(super) perfect_hash: Option<crate::physical::PerfectHashResourceContract>,
     pub(super) topn_capacity: Option<u64>,
     pub(super) runtime_filter_probe_multiplicity: RuntimeFilterProbeMultiplicity,
+    pub(super) runtime_filter_probe_source_rows: Option<CompactRange>,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]

@@ -1071,17 +1071,17 @@ fn fit_local_retained_state_to_grant(
     if grant.hard_memory_bytes == u64::MAX {
         return Ok(Some(local_cost));
     }
-    let overlapping_minimum = match composition {
-        CostComposition::Sequential => 0,
-        CostComposition::RetainedState {
-            overlapping_children,
-        } => child_costs
+    let overlapping_children = composition.overlapping_children();
+    let overlapping_minimum = if overlapping_children == 0 {
+        0
+    } else {
+        child_costs
             .iter()
             .enumerate()
             .filter(|(index, _)| overlapping_children & (1_u64 << index) != 0)
             .map(|(_, child)| child.minimum_memory_bytes)
             .max()
-            .unwrap_or(0),
+            .unwrap_or(0)
     };
     let retained_minimum = local_cost
         .minimum_memory_bytes
@@ -1161,71 +1161,74 @@ pub(crate) fn compose_candidate_cost(
     composition: CostComposition,
 ) -> Result<SearchCost> {
     let mut cost = local_cost;
-    for child in child_costs {
+    let sideways_filter = composition.sideways_filter();
+    for (index, child) in child_costs.iter().copied().enumerate() {
+        let child = match sideways_filter {
+            Some((filtered_child, expected, upper)) if index == filtered_child => {
+                child.retain_work(expected, upper)?
+            }
+            _ => child,
+        };
         cost = child.sequential(cost)?;
     }
-    match composition {
-        CostComposition::Sequential => {}
-        CostComposition::RetainedState {
-            overlapping_children,
-        } => {
-            if child_costs.len() > u64::BITS as usize
-                || (child_costs.len() < u64::BITS as usize
-                    && overlapping_children >> child_costs.len() != 0)
-            {
-                return Err(paro_error::internal(
-                    "cost composition references a missing child pipeline",
-                ));
-            }
-            let overlapping_peak = child_costs
-                .iter()
-                .enumerate()
-                .filter(|(index, _)| overlapping_children & (1_u64 << index) != 0)
-                .map(|(_, child)| child.peak_memory_upper)
-                .max()
-                .unwrap_or(0);
-            let overlapping_non_revocable = child_costs
-                .iter()
-                .enumerate()
-                .filter(|(index, _)| overlapping_children & (1_u64 << index) != 0)
-                .map(|(_, child)| child.non_revocable_memory_upper)
-                .max()
-                .unwrap_or(0);
-            let retained_non_revocable = local_cost
-                .non_revocable_memory_upper
-                .saturating_add(overlapping_non_revocable);
-            cost.non_revocable_memory_upper =
-                cost.non_revocable_memory_upper.max(retained_non_revocable);
-            let overlapping_minimum = child_costs
-                .iter()
-                .enumerate()
-                .filter(|(index, _)| overlapping_children & (1_u64 << index) != 0)
-                .map(|(_, child)| child.minimum_memory_bytes)
-                .max()
-                .unwrap_or(0);
-            // Revocable targets compete inside one query pool, but allocations
-            // required merely to make progress cannot be reclaimed from an
-            // overlapping child. Compose those execution floors additively;
-            // treating them as a shared maximum admitted plans that the
-            // runtime could immediately disprove.
-            let retained_minimum = local_cost
-                .minimum_memory_bytes
-                .saturating_add(overlapping_minimum);
-            cost.minimum_memory_bytes = cost.minimum_memory_bytes.max(retained_minimum);
-            cost.revocable_memory_target = cost
-                .revocable_memory_target
-                .max(local_cost.revocable_memory_target);
-            // Revocable operator state is governed by one shared query pool.
-            // Overlapping spillable working sets therefore compose by maximum;
-            // only their non-revocable portions must be added.
-            cost.peak_memory_upper = cost
-                .peak_memory_upper
-                .max(local_cost.peak_memory_upper)
-                .max(overlapping_peak)
-                .max(retained_non_revocable)
-                .max(retained_minimum)
-                .max(retained_minimum.saturating_add(cost.revocable_memory_target));
+    let overlapping_children = composition.overlapping_children();
+    if overlapping_children != 0 {
+        if child_costs.len() > u64::BITS as usize
+            || (child_costs.len() < u64::BITS as usize
+                && overlapping_children >> child_costs.len() != 0)
+        {
+            return Err(paro_error::internal(
+                "cost composition references a missing child pipeline",
+            ));
         }
+        let overlapping_peak = child_costs
+            .iter()
+            .enumerate()
+            .filter(|(index, _)| overlapping_children & (1_u64 << index) != 0)
+            .map(|(_, child)| child.peak_memory_upper)
+            .max()
+            .unwrap_or(0);
+        let overlapping_non_revocable = child_costs
+            .iter()
+            .enumerate()
+            .filter(|(index, _)| overlapping_children & (1_u64 << index) != 0)
+            .map(|(_, child)| child.non_revocable_memory_upper)
+            .max()
+            .unwrap_or(0);
+        let retained_non_revocable = local_cost
+            .non_revocable_memory_upper
+            .saturating_add(overlapping_non_revocable);
+        cost.non_revocable_memory_upper =
+            cost.non_revocable_memory_upper.max(retained_non_revocable);
+        let overlapping_minimum = child_costs
+            .iter()
+            .enumerate()
+            .filter(|(index, _)| overlapping_children & (1_u64 << index) != 0)
+            .map(|(_, child)| child.minimum_memory_bytes)
+            .max()
+            .unwrap_or(0);
+        // Revocable targets compete inside one query pool, but allocations
+        // required merely to make progress cannot be reclaimed from an
+        // overlapping child. Compose those execution floors additively;
+        // treating them as a shared maximum admitted plans that the
+        // runtime could immediately disprove.
+        let retained_minimum = local_cost
+            .minimum_memory_bytes
+            .saturating_add(overlapping_minimum);
+        cost.minimum_memory_bytes = cost.minimum_memory_bytes.max(retained_minimum);
+        cost.revocable_memory_target = cost
+            .revocable_memory_target
+            .max(local_cost.revocable_memory_target);
+        // Revocable operator state is governed by one shared query pool.
+        // Overlapping spillable working sets therefore compose by maximum;
+        // only their non-revocable portions must be added.
+        cost.peak_memory_upper = cost
+            .peak_memory_upper
+            .max(local_cost.peak_memory_upper)
+            .max(overlapping_peak)
+            .max(retained_non_revocable)
+            .max(retained_minimum)
+            .max(retained_minimum.saturating_add(cost.revocable_memory_target));
     }
     cost.validate()?;
     Ok(cost)

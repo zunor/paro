@@ -175,7 +175,12 @@ impl PhysicalPlanVerifier {
                             "runtime-filter hash join owns no matching auxiliary edge",
                         ));
                     }
-                    let expected_consumers = runtime_filter_probe_scans(plan, *probe);
+                    let expected_consumers = crate::physical::lineage::runtime_filter_consumers_in(
+                        &plan.nodes,
+                        &plan.children,
+                        *probe,
+                        spec,
+                    );
                     if expected_consumers.is_empty()
                         || matching_edges.len() != expected_consumers.len()
                         || matching_edges
@@ -259,7 +264,13 @@ impl PhysicalPlanVerifier {
                             };
                             runtime_filter.artifact == artifact
                                 && *build == edge.producer
-                                && runtime_filter_probe_scans(plan, *probe).contains(&edge.consumer)
+                                && crate::physical::lineage::runtime_filter_consumers_in(
+                                    &plan.nodes,
+                                    &plan.children,
+                                    *probe,
+                                    spec,
+                                )
+                                .contains(&edge.consumer)
                         })
                         .count();
                     if owners != 1
@@ -407,34 +418,6 @@ fn verify_row_fetch(
         ));
     }
     Ok(())
-}
-
-fn runtime_filter_probe_scans(
-    plan: &PhysicalPlan,
-    node: PhysicalPlanNodeId,
-) -> Vec<PhysicalPlanNodeId> {
-    let Some(current) = plan.nodes.get(node) else {
-        return Vec::new();
-    };
-    match &current.kind {
-        crate::physical::PhysicalNodeKind::RowsetScan(_) => vec![node],
-        crate::physical::PhysicalNodeKind::Project(_)
-        | crate::physical::PhysicalNodeKind::Filter(_) => {
-            let [child] = plan.child_ids(&current.children) else {
-                return Vec::new();
-            };
-            runtime_filter_probe_scans(plan, *child)
-        }
-        crate::physical::PhysicalNodeKind::SetOperation(spec)
-            if spec.op == paro_planner::operator::SetOpType::Union && spec.all =>
-        {
-            plan.child_ids(&current.children)
-                .iter()
-                .flat_map(|child| runtime_filter_probe_scans(plan, *child))
-                .collect()
-        }
-        _ => Vec::new(),
-    }
 }
 
 fn verify_write_sink(

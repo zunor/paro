@@ -1181,7 +1181,6 @@ fn arena_extractor_lowers_single_join_to_typed_hash_path() {
             vec![condition],
         )),
     );
-
     let mut extractor = PhysicalPlanExtractor::new(ExtractionContext::default());
     let plan = extractor
         .extract(&join)
@@ -1216,7 +1215,7 @@ fn auxiliary_runtime_filter_winner_emits_owned_physical_edge() {
             LogicalType::Integer,
         )),
     );
-    let join = LogicalPlan::new(
+    let mut join = LogicalPlan::new(
         &ctx,
         LogicalOperator::Join(Join::comparison(
             JoinType::Inner,
@@ -1225,6 +1224,8 @@ fn auxiliary_runtime_filter_winner_emits_owned_physical_edge() {
             vec![condition],
         )),
     );
+    crate::physical::slot_assignment::assign_expression_slots(&mut join.operator)
+        .expect("runtime-filter extraction requires the selected positional ABI");
     let artifact = crate::physical::identity::Fingerprint(77);
     let contract = crate::physical::WinnerPhysicalContract {
         required: crate::physical::RequiredProperties::default(),

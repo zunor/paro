@@ -769,6 +769,34 @@ fn retained_operator_state_overlaps_child_pipeline_memory() {
 }
 
 #[test]
+fn sideways_filter_scales_work_without_weakening_resource_proofs() {
+    let child = SearchCost {
+        non_revocable_memory_upper: 40,
+        minimum_memory_bytes: 40,
+        peak_memory_upper: 80,
+        ..cost(100.0)
+    };
+    let filtered = compose_candidate_cost(
+        SearchCost::ZERO,
+        &[child],
+        CostComposition::SidewaysFilter {
+            overlapping_children: 1,
+            filtered_child: 0,
+            expected_retained_ppm: 100_000,
+            upper_retained_ppm: 1_000_000,
+        },
+    )
+    .expect("sideways-filter composition");
+
+    assert_eq!(filtered.score.range.expected, 10.0);
+    assert_eq!(filtered.score.range.upper, 100.0);
+    assert_eq!(filtered.score.risk_adjusted, 55.0);
+    assert_eq!(filtered.non_revocable_memory_upper, 40);
+    assert_eq!(filtered.minimum_memory_bytes, 40);
+    assert_eq!(filtered.peak_memory_upper, 80);
+}
+
+#[test]
 fn revocable_retained_state_shares_one_query_pool() {
     let local = SearchCost {
         peak_memory_upper: 100,
