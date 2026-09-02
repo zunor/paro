@@ -33,6 +33,7 @@ pub const AGGREGATE_INPUT_MATERIALIZATION_RULE: RuleId = RuleId(10_016);
 pub const LIMIT_PUSHDOWN_RULE: RuleId = RuleId(10_017);
 pub const LATE_PAYLOAD_FETCH_RULE: RuleId = RuleId(10_018);
 pub const SCALAR_AGGREGATE_WINDOW_RULE: RuleId = RuleId(10_019);
+pub const JOIN_REGION_ENUMERATION_RULE: RuleId = RuleId(10_021);
 pub const TOP_N_INTRODUCTION_RULE: RuleId = RuleId(10_022);
 pub const CTE_FILTER_PUSHDOWN_RULE: RuleId = RuleId(10_023);
 
@@ -67,6 +68,7 @@ const TRANSFORMATION_RULE_NAMES: &[(RuleId, &str)] = &[
     (LIMIT_PUSHDOWN_RULE, "limit_pushdown"),
     (LATE_PAYLOAD_FETCH_RULE, "late_payload_fetch"),
     (SCALAR_AGGREGATE_WINDOW_RULE, "scalar_aggregate_window"),
+    (JOIN_REGION_ENUMERATION_RULE, "join_region_enumeration"),
     (TOP_N_INTRODUCTION_RULE, "top_n_introduction"),
 ];
 
@@ -232,6 +234,14 @@ impl<'a> TransformContext<'a> {
 
 pub trait TransformationRule: Send + Sync {
     fn id(&self) -> RuleId;
+
+    /// Maximum number of alternatives one firing may publish. Local rewrite
+    /// rules keep the default of one. A bounded whole-region owner may expose
+    /// a deterministic frontier, but the engine reserves every possible root
+    /// expression before the rule mutates Memo or sidecar state.
+    fn output_bound(&self, _ctx: &RuleContext<'_>) -> usize {
+        1
+    }
 
     fn promise(&self, _expr: &LogicalExpr, _ctx: &RuleContext<'_>) -> RulePromise {
         RulePromise::NORMAL

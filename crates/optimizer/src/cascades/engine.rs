@@ -74,6 +74,7 @@ struct TaskKey {
 struct TransformationInsertion {
     groups: BTreeSet<GroupId>,
     properties: Vec<(GroupId, LogicalProperties, GroupCardinality)>,
+    expressions: usize,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -390,21 +391,38 @@ impl CascadesEngine {
             if !admit_transformation_work(&mut self.memo, group, expression, rule)? {
                 continue;
             }
-            // Reserve the single rule output before the rule is allowed to
-            // append payloads or child groups.  TransformContext mutations
-            // are append-only and become reachable through that output, so a
+            // Reserve the complete bounded frontier before the rule may append
+            // payloads or child groups. TransformContext mutations are
+            // append-only and become reachable through those roots, so
             // post-apply budget rejection would manufacture orphan Memo
-            // state.  One canonical output per (expression, rule) also makes
-            // rule priority an agenda property instead of source-order
-            // admission hidden in a caller-side candidate list.
-            let output_event = transformation_output_event(group, expression, rule);
-            let admitted = self
-                .memo
-                .group_mut(group)
-                .ok_or_else(|| paro_error::internal("rule task references unknown group"))?
-                .ledger
-                .admit_optional(BudgetDimension::LogicalExprPerGroup, output_event);
-            if admitted == BudgetDecision::Exhausted {
+            // state. Ordinary local rules reserve one slot; region owners can
+            // declare a larger deterministic bound.
+            let output_bound = {
+                let rule_impl = self
+                    .registry
+                    .transformation(rule)
+                    .ok_or_else(|| paro_error::internal("rule disappeared from registry"))?;
+                let context = RuleContext {
+                    memo: &self.memo,
+                    group,
+                };
+                rule_impl.output_bound(&context)
+            };
+            let mut output_events = Vec::with_capacity(output_bound);
+            for ordinal in 0..output_bound {
+                let event = transformation_output_event(group, expression, rule, ordinal);
+                let admitted = self
+                    .memo
+                    .group_mut(group)
+                    .ok_or_else(|| paro_error::internal("rule task references unknown group"))?
+                    .ledger
+                    .admit_optional(BudgetDimension::LogicalExprPerGroup, event);
+                if admitted == BudgetDecision::Exhausted {
+                    break;
+                }
+                output_events.push(event);
+            }
+            if output_events.is_empty() {
                 continue;
             }
             *self.rule_attempts.entry(rule).or_default() += 1;
@@ -423,14 +441,11 @@ impl CascadesEngine {
                 Ok(outputs) => outputs,
                 Err(error) => {
                     context.rollback()?;
-                    self.memo
-                        .group_mut(group)
-                        .ok_or_else(|| paro_error::internal("rule task references unknown group"))?
-                        .ledger
-                        .release_optional_reservation(
-                            BudgetDimension::LogicalExprPerGroup,
-                            output_event,
-                        );
+                    release_transformation_output_reservations(
+                        &mut self.memo,
+                        group,
+                        &output_events,
+                    )?;
                     tracing::debug!(
                         target: "paro::optimizer",
                         %error,
@@ -443,38 +458,26 @@ impl CascadesEngine {
             };
             if outputs.is_empty() {
                 context.rollback()?;
-                self.memo
-                    .group_mut(group)
-                    .ok_or_else(|| paro_error::internal("rule task references unknown group"))?
-                    .ledger
-                    .release_optional_reservation(
-                        BudgetDimension::LogicalExprPerGroup,
-                        output_event,
-                    );
+                release_transformation_output_reservations(&mut self.memo, group, &output_events)?;
                 continue;
             }
-            if outputs.len() > 1 {
+            if outputs.len() > output_events.len() {
                 context.rollback()?;
-                self.memo
-                    .group_mut(group)
-                    .ok_or_else(|| paro_error::internal("rule task references unknown group"))?
-                    .ledger
-                    .release_optional_reservation(
-                        BudgetDimension::LogicalExprPerGroup,
-                        output_event,
-                    );
+                release_transformation_output_reservations(&mut self.memo, group, &output_events)?;
                 tracing::debug!(
                     target: "paro::optimizer",
                     rule = rule.0,
                     group = group.index(),
                     output_count = outputs.len(),
-                    "discarded optional transformation with a non-canonical output set"
+                    reserved_outputs = output_events.len(),
+                    "discarded optional transformation whose frontier exceeded its declared bound"
                 );
                 continue;
             }
             let insertion = (|| -> Result<TransformationInsertion> {
                 let mut inserted_groups = BTreeSet::new();
                 let mut inserted_properties = Vec::new();
+                let mut inserted_expressions = 0usize;
                 for output in outputs {
                     validate_transformation_proof(rule, expression, &output.proof)?;
                     let target = context.memo().canonical_group(output.target_group);
@@ -513,6 +516,7 @@ impl CascadesEngine {
                         .len();
                     if after > before {
                         inserted_groups.insert(target);
+                        inserted_expressions += after - before;
                         inserted_properties.push((
                             target,
                             output.logical_properties,
@@ -523,23 +527,22 @@ impl CascadesEngine {
                 Ok(TransformationInsertion {
                     groups: inserted_groups,
                     properties: inserted_properties,
+                    expressions: inserted_expressions,
                 })
             })();
             let TransformationInsertion {
                 groups: mut inserted_groups,
                 properties: inserted_properties,
+                expressions: inserted_expressions,
             } = match insertion {
                 Ok(result) => result,
                 Err(error) => {
                     context.rollback()?;
-                    self.memo
-                        .group_mut(group)
-                        .ok_or_else(|| paro_error::internal("rule task references unknown group"))?
-                        .ledger
-                        .release_optional_reservation(
-                            BudgetDimension::LogicalExprPerGroup,
-                            output_event,
-                        );
+                    release_transformation_output_reservations(
+                        &mut self.memo,
+                        group,
+                        &output_events,
+                    )?;
                     tracing::debug!(
                         target: "paro::optimizer",
                         %error,
@@ -554,16 +557,14 @@ impl CascadesEngine {
                 // A duplicate root is not an effective transformation. Drop
                 // any staged child groups and planner payloads with it.
                 context.rollback()?;
-                self.memo
-                    .group_mut(group)
-                    .ok_or_else(|| paro_error::internal("rule task references unknown group"))?
-                    .ledger
-                    .release_optional_reservation(
-                        BudgetDimension::LogicalExprPerGroup,
-                        output_event,
-                    );
+                release_transformation_output_reservations(&mut self.memo, group, &output_events)?;
             } else {
                 let appended_groups = context.commit()?;
+                release_transformation_output_reservations(
+                    &mut self.memo,
+                    group,
+                    &output_events[inserted_expressions.min(output_events.len())..],
+                )?;
                 for (target, properties, cardinality) in inserted_properties {
                     let group = self.memo.group_mut(target).ok_or_else(|| {
                         paro_error::internal("committed transformation lost its target group")
@@ -573,7 +574,7 @@ impl CascadesEngine {
                         std::mem::take(&mut group.cardinality).canonical_with(cardinality);
                 }
                 *self.effective_rule_insertions.entry(rule).or_default() +=
-                    u64::try_from(inserted_groups.len()).unwrap_or(u64::MAX);
+                    u64::try_from(inserted_expressions).unwrap_or(u64::MAX);
                 inserted_groups.extend(appended_groups);
             }
             for target in inserted_groups {
@@ -1007,13 +1008,30 @@ fn transformation_output_event(
     group: GroupId,
     expression: LogicalExprId,
     rule: RuleId,
+    ordinal: usize,
 ) -> Fingerprint {
     let mut event = StableFingerprintBuilder::default();
-    event.write_bytes(b"paro.memo.transformation-output.v1");
+    event.write_bytes(b"paro.memo.transformation-output.v2");
     event.write_u64(group.0 as u64);
     event.write_u64(expression.0 as u64);
     event.write_u64(rule.0 as u64);
+    event.write_u64(ordinal as u64);
     event.finish()
+}
+
+fn release_transformation_output_reservations(
+    memo: &mut Memo,
+    group: GroupId,
+    events: &[Fingerprint],
+) -> Result<()> {
+    let ledger = &mut memo
+        .group_mut(group)
+        .ok_or_else(|| paro_error::internal("rule task references unknown group"))?
+        .ledger;
+    for event in events {
+        ledger.release_optional_reservation(BudgetDimension::LogicalExprPerGroup, *event);
+    }
+    Ok(())
 }
 
 fn build_joint_cost_proof(

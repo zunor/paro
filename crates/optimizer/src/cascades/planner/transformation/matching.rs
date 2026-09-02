@@ -27,6 +27,16 @@ pub(super) fn matches_transformation(
         PlannerTransformation::CteInline => operator == Op::MaterializedCTE,
         PlannerTransformation::CteDemandPushdown => operator == Op::MaterializedCTE,
         PlannerTransformation::CteFilterPushdown => operator == Op::MaterializedCTE,
+        PlannerTransformation::JoinRegionEnumeration => {
+            operator == Op::ComparisonJoin
+                && expr.key.children.iter().copied().any(|child| {
+                    canonical_expression(child, memo).is_some_and(|child| {
+                        state.metadata.get(&child.payload).is_some_and(|metadata| {
+                            metadata.operator_type == Op::ComparisonJoin
+                        })
+                    })
+                })
+        }
         PlannerTransformation::AggregatePostReduction => {
             operator == Op::MaterializedCTE
                 || (matches!(operator, Op::Projection | Op::Filter)

@@ -118,6 +118,48 @@ impl TransformationRule for AddEquivalent {
     }
 }
 
+struct AddBoundedFrontier;
+
+impl TransformationRule for AddBoundedFrontier {
+    fn id(&self) -> RuleId {
+        RuleId(9)
+    }
+
+    fn output_bound(&self, _: &RuleContext<'_>) -> usize {
+        2
+    }
+
+    fn matches(&self, expr: &super::super::memo::LogicalExpr, _: &RuleContext<'_>) -> bool {
+        expr.key.operator == Fingerprint(10)
+    }
+
+    fn apply(
+        &self,
+        expr: LogicalExprId,
+        ctx: &mut TransformContext<'_>,
+    ) -> Result<Box<[EquivalentExpression]>> {
+        Ok([11, 12]
+            .into_iter()
+            .map(|operator| EquivalentExpression {
+                target_group: ctx.group(),
+                key: LogicalExprKey {
+                    operator: Fingerprint(operator),
+                    scalars: Box::new([]),
+                    children: Box::new([]),
+                },
+                payload: LogicalPayloadId(operator as u32),
+                logical_properties: LogicalProperties::default(),
+                cardinality: GroupCardinality::default(),
+                proof: EquivalenceProof::Transformation {
+                    rule: self.id(),
+                    source: expr,
+                    premise: Fingerprint(76),
+                },
+            })
+            .collect())
+    }
+}
+
 struct FailAfterMemoWrite;
 
 impl TransformationRule for FailAfterMemoWrite {
@@ -409,6 +451,33 @@ fn optional_transformation_can_improve_mandatory_baseline() {
     let winner = engine.optimize(group, goal, SearchMode::Memo).unwrap();
     assert!(winner.cost.score.risk_adjusted < 5.0);
     assert_eq!(winner.physical_fingerprint, Fingerprint(11));
+}
+
+#[test]
+fn bounded_region_rule_reserves_and_publishes_its_complete_frontier() {
+    let mut budget = super::super::budget::SearchBudget::default();
+    budget.disable_transformation(RuleId(5));
+    budget.max_optional_logical_exprs_per_group = 2;
+    let (mut engine, group, goal) = engine_with_budget(budget);
+    engine
+        .registry
+        .register_transformation(AddBoundedFrontier)
+        .unwrap();
+
+    let winner = engine.optimize(group, goal, SearchMode::Memo).unwrap();
+
+    assert_eq!(winner.physical_fingerprint, Fingerprint(11));
+    assert_eq!(engine.memo.group(group).unwrap().logical_exprs().len(), 3);
+    assert_eq!(engine.effective_rule_insertions().get(&RuleId(9)), Some(&2));
+    assert_eq!(
+        engine
+            .memo
+            .group(group)
+            .unwrap()
+            .ledger
+            .consumed(BudgetDimension::LogicalExprPerGroup),
+        2
+    );
 }
 
 #[test]

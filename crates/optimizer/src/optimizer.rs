@@ -71,7 +71,6 @@ const CORRELATED_AGGREGATE_REGION_RULE: crate::cascades::RuleId = crate::cascade
 const SCALAR_REUSE_REGION_RULE: crate::cascades::RuleId = crate::cascades::RuleId(10_005);
 const DISTINCT_AGGREGATE_FEASIBILITY_RULE: crate::cascades::RuleId =
     crate::cascades::RuleId(10_020);
-const JOIN_REGION_ENUMERATOR_RULE: crate::cascades::RuleId = crate::cascades::RuleId(10_021);
 const CORRELATED_TOPN_PAYLOAD_REGION_RULE: crate::cascades::RuleId =
     crate::cascades::RuleId(10_022);
 
@@ -323,77 +322,6 @@ impl Optimizer {
             phase_started.elapsed(),
         );
         let phase_started = Instant::now();
-        // A whole-region enumerator may propose a bounded join tree, but it is
-        // never allowed to select the tree before Memo. Keep the canonical SQL
-        // tree and add the enumerated tree as an equivalent sibling so the
-        // grant-aware physical cost model jointly chooses order and algorithm.
-        let mut join_region_alternatives = Vec::new();
-        let base_alternative_count = alternatives.len();
-        'base_alternatives: for alternative in &mut alternatives {
-            if !contains_multiway_join_region(&alternative.plan) {
-                continue;
-            }
-            let owned_plan = std::mem::replace(
-                &mut alternative.plan,
-                LogicalPlan::synthetic(LogicalOperator::DummyScan),
-            );
-            let (original_plan, join_input) = fork_plan_preserving_indices(
-                owned_plan,
-                self.binder.bind_context.shared().as_ref(),
-            )?;
-            alternative.plan = original_plan;
-            let candidate_context = self
-                .ctx
-                .fork_for_candidate(Arc::unwrap_or_clone(alternative.column_stats.clone()));
-            let join_candidates = JoinOrderOptimizer::new()
-                .with_search_budget(&self.budget)
-                .enumerate_plan_frontier(
-                    candidate_context.session.as_ref(),
-                    join_input,
-                    &candidate_context.column_stats,
-                    &candidate_context.bind_context,
-                )?;
-            for mut join_candidate in join_candidates {
-                let mut candidate_context = self
-                    .ctx
-                    .fork_for_candidate(Arc::unwrap_or_clone(alternative.column_stats.clone()));
-                join_candidate = JoinPredicateNormalizer::new(&candidate_context.bind_context)
-                    .optimize_plan(join_candidate)?;
-                join_candidate =
-                    StatisticsGathering::new().gather(join_candidate, &mut candidate_context)?;
-                let mut propagator = StatisticsPropagator::new();
-                join_candidate =
-                    propagator.propagate(candidate_context.session.clone(), join_candidate);
-                candidate_context.column_stats = propagator.take_statistics_map();
-                join_candidate =
-                    StatisticsGathering::new().gather(join_candidate, &mut candidate_context)?;
-                let join_candidate = self.finalize_query_candidate(CandidatePlan {
-                    plan: join_candidate,
-                    column_stats: Arc::new(candidate_context.column_stats),
-                })?;
-                if let Err(error) =
-                    verify_logical_plan(&self.ctx.bind_context, &join_candidate.plan)
-                {
-                    debug!(
-                        target: targets::OPTIMIZER,
-                        %error,
-                        "join-region enumerator pruned a candidate that failed semantic verification"
-                    );
-                    continue;
-                }
-                join_region_alternatives.push(join_candidate.into_alternative(
-                    AlternativeOrigin::Specialized {
-                        rule: JOIN_REGION_ENUMERATOR_RULE,
-                    },
-                ));
-                if base_alternative_count.saturating_add(join_region_alternatives.len())
-                    >= self.budget.max_optional_logical_exprs_per_group as usize + 1
-                {
-                    break 'base_alternatives;
-                }
-            }
-        }
-        alternatives.extend(join_region_alternatives);
         for alternative in &alternatives {
             verify_physical_planner_invariants(&alternative.plan.operator)?;
         }
@@ -1270,29 +1198,6 @@ fn resource_grant_classes(
         })
         .collect::<Vec<_>>()
         .into_boxed_slice()
-}
-
-fn contains_multiway_join_region(plan: &LogicalPlan) -> bool {
-    fn region_relations(plan: &LogicalPlan) -> usize {
-        match &plan.operator {
-            LogicalOperator::Join(Join::Comparison(join))
-                if join.join_type == paro_planner::operator::JoinType::Inner =>
-            {
-                region_relations(&join.left).saturating_add(region_relations(&join.right))
-            }
-            LogicalOperator::Join(Join::Cross(cross)) => {
-                region_relations(&cross.left).saturating_add(region_relations(&cross.right))
-            }
-            LogicalOperator::Filter(filter) => region_relations(&filter.child),
-            _ => 1,
-        }
-    }
-
-    region_relations(plan) >= 3
-        || plan
-            .children()
-            .into_iter()
-            .any(contains_multiway_join_region)
 }
 
 #[cfg(test)]

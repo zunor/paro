@@ -30,6 +30,7 @@ enum PlannerTransformation {
     CteInline,
     CteDemandPushdown,
     CteFilterPushdown,
+    JoinRegionEnumeration,
     AggregatePostReduction,
     MarkJoinToSemi,
     JoinElimination,
@@ -45,11 +46,12 @@ enum PlannerTransformation {
 }
 
 impl PlannerTransformation {
-    const ALL: [Self; 16] = [
+    const ALL: [Self; 17] = [
         Self::ExpensivePredicatePlacement,
         Self::CteInline,
         Self::CteDemandPushdown,
         Self::CteFilterPushdown,
+        Self::JoinRegionEnumeration,
         Self::AggregatePostReduction,
         Self::MarkJoinToSemi,
         Self::JoinElimination,
@@ -70,6 +72,7 @@ impl PlannerTransformation {
             Self::CteInline => CTE_INLINE_RULE,
             Self::CteDemandPushdown => CTE_DEMAND_PUSHDOWN_RULE,
             Self::CteFilterPushdown => CTE_FILTER_PUSHDOWN_RULE,
+            Self::JoinRegionEnumeration => JOIN_REGION_ENUMERATION_RULE,
             Self::AggregatePostReduction => AGGREGATE_POST_REDUCTION_RULE,
             Self::MarkJoinToSemi => MARK_JOIN_TO_SEMI_RULE,
             Self::JoinElimination => JOIN_ELIMINATION_RULE,
@@ -93,6 +96,7 @@ impl PlannerTransformation {
             Self::CteInline
             | Self::CteDemandPushdown
             | Self::CteFilterPushdown
+            | Self::JoinRegionEnumeration
             | Self::AggregateJoinSubsumption
             | Self::JoinElimination => Some(CardinalityRecipeKind::ConstraintRefined),
             _ => None,
@@ -166,6 +170,17 @@ impl TransformationRule for PlannerTransformationRule {
         self.transformation.id()
     }
 
+    fn output_bound(&self, ctx: &RuleContext<'_>) -> usize {
+        if matches!(
+            self.transformation,
+            PlannerTransformation::JoinRegionEnumeration
+        ) {
+            usize::from(ctx.memo.budget().max_multiway_join_candidates).max(1)
+        } else {
+            1
+        }
+    }
+
     fn promise(
         &self,
         _expr: &crate::cascades::memo::LogicalExpr,
@@ -229,58 +244,63 @@ impl TransformationRule for PlannerTransformationRule {
                             paro_error::internal("planner rule has no statement context")
                         })?,
                         cost_model: state.cost_model.clone(),
+                        budget: ctx.memo().budget().clone(),
                         verify_enabled: state.verify_enabled,
                     },
                 )
             };
-        let Some(plan) = rewrite_planner_expression(
+        let plans = rewrite_planner_expressions(
             self.transformation,
             plan,
             source_stats.as_ref(),
             &environment,
-        )?
-        else {
+        )?;
+        if plans.is_empty() {
             return Ok(Box::new([]));
-        };
-        let (plan, column_stats) = settle_transformed_expression(plan, &environment)?;
-        let mut preserved_region_facet = None;
-        if let Some((facet, source_operator)) = source_region {
-            let kind = ctx
-                .memo()
-                .regions()
-                .nodes
-                .iter()
-                .flat_map(|region| region.facets.iter())
-                .find(|candidate| candidate.fingerprint == facet)
-                .map(|facet| facet.kind)
-                .ok_or_else(|| {
-                    paro_error::internal("planner rule references an unknown required region facet")
-                })?;
-            let discharges_sharing =
-                matches!(self.transformation, PlannerTransformation::CteInline)
-                    && kind == RegionFacetKind::Sharing
-                    && plan.operator.op_type() != source_operator;
-            let preserves_sharing = matches!(
-                self.transformation,
-                PlannerTransformation::CteInline
-                    | PlannerTransformation::CteDemandPushdown
-                    | PlannerTransformation::CteFilterPushdown
-            ) && kind == RegionFacetKind::Sharing
-                && plan.operator.op_type() == source_operator;
-            if preserves_sharing {
-                preserved_region_facet = Some(facet);
-            } else if !discharges_sharing {
-                debug!(
-                    target: targets::OPTIMIZER,
-                    rule = self.id().0,
-                    group = target_group.index(),
-                    ?kind,
-                    "discarded local transformation that cannot preserve a required region"
-                );
-                return Ok(Box::new([]));
-            }
         }
-        {
+
+        let mut prepared = Vec::with_capacity(plans.len());
+        for plan in plans {
+            let (plan, column_stats) = settle_transformed_expression(plan, &environment)?;
+            let mut preserved_region_facet = None;
+            if let Some((facet, source_operator)) = source_region {
+                let kind = ctx
+                    .memo()
+                    .regions()
+                    .nodes
+                    .iter()
+                    .flat_map(|region| region.facets.iter())
+                    .find(|candidate| candidate.fingerprint == facet)
+                    .map(|facet| facet.kind)
+                    .ok_or_else(|| {
+                        paro_error::internal(
+                            "planner rule references an unknown required region facet",
+                        )
+                    })?;
+                let discharges_sharing =
+                    matches!(self.transformation, PlannerTransformation::CteInline)
+                        && kind == RegionFacetKind::Sharing
+                        && plan.operator.op_type() != source_operator;
+                let preserves_sharing = matches!(
+                    self.transformation,
+                    PlannerTransformation::CteInline
+                        | PlannerTransformation::CteDemandPushdown
+                        | PlannerTransformation::CteFilterPushdown
+                ) && kind == RegionFacetKind::Sharing
+                    && plan.operator.op_type() == source_operator;
+                if preserves_sharing {
+                    preserved_region_facet = Some(facet);
+                } else if !discharges_sharing {
+                    debug!(
+                        target: targets::OPTIMIZER,
+                        rule = self.id().0,
+                        group = target_group.index(),
+                        ?kind,
+                        "discarded local transformation that cannot preserve a required region"
+                    );
+                    return Ok(Box::new([]));
+                }
+            }
             let state = self
                 .planner_state
                 .read()
@@ -295,45 +315,58 @@ impl TransformationRule for PlannerTransformationRule {
                     target_schema = ?ctx.memo().group(target_group).map(|group| &group.schema),
                     "discarded optional transformation before staging an incompatible root contract"
                 );
-                return Ok(Box::new([]));
+                continue;
             }
+            drop(state);
+            prepared.push((plan, column_stats, preserved_region_facet));
+        }
+        if prepared.is_empty() {
+            return Ok(Box::new([]));
         }
         let staged = ctx.with_sidecar_transaction(
             self.planner_state.clone(),
             PlannerTransformState::savepoint,
             PlannerTransformState::rollback_to,
             |memo, state| {
-                stage_transformed_expression(
-                    StagingRequest::new(
-                        plan,
-                        Arc::new(column_stats),
-                        target_group,
-                        self.id(),
-                        preserved_region_facet,
-                        self.transformation.cardinality_recipe_kind(),
-                    ),
-                    memo,
-                    state,
-                )
+                prepared
+                    .into_iter()
+                    .map(|(plan, column_stats, preserved_region_facet)| {
+                        stage_transformed_expression(
+                            StagingRequest::new(
+                                plan,
+                                Arc::new(column_stats),
+                                target_group,
+                                self.id(),
+                                preserved_region_facet,
+                                self.transformation.cardinality_recipe_kind(),
+                            ),
+                            memo,
+                            state,
+                        )
+                    })
+                    .collect::<Result<Vec<_>>>()
             },
         )?;
         let source = ctx
             .memo()
             .logical_expr(expr)
             .ok_or_else(|| paro_error::internal("planner rule lost its source expression"))?;
-        Ok(vec![EquivalentExpression {
-            target_group,
-            key: staged.key,
-            payload: staged.payload,
-            logical_properties: staged.logical_properties,
-            cardinality: staged.cardinality,
-            proof: EquivalenceProof::Transformation {
-                rule: self.id(),
-                source: expr,
-                premise: source.key.stable_fingerprint(),
-            },
-        }]
-        .into_boxed_slice())
+        let premise = source.key.stable_fingerprint();
+        Ok(staged
+            .into_iter()
+            .map(|staged| EquivalentExpression {
+                target_group,
+                key: staged.key,
+                payload: staged.payload,
+                logical_properties: staged.logical_properties,
+                cardinality: staged.cardinality,
+                proof: EquivalenceProof::Transformation {
+                    rule: self.id(),
+                    source: expr,
+                    premise,
+                },
+            })
+            .collect())
     }
 }
 
@@ -381,7 +414,31 @@ struct PlannerRuleEnvironment {
     bind_context: BindContext,
     session: Arc<paro_context::StatementContext>,
     cost_model: crate::cost_model::CostModel,
+    budget: SearchBudget,
     verify_enabled: bool,
+}
+
+fn rewrite_planner_expressions(
+    transformation: PlannerTransformation,
+    plan: LogicalPlan,
+    column_stats: &HashMap<ColumnBinding, Arc<ColumnStatistics>>,
+    environment: &PlannerRuleEnvironment,
+) -> Result<Vec<LogicalPlan>> {
+    if matches!(transformation, PlannerTransformation::JoinRegionEnumeration) {
+        return crate::join_order::optimizer::JoinOrderOptimizer::new()
+            .with_search_budget(&environment.budget)
+            .enumerate_plan_frontier(
+                environment.session.as_ref(),
+                plan,
+                column_stats,
+                &environment.bind_context,
+            );
+    }
+    Ok(
+        rewrite_planner_expression(transformation, plan, column_stats, environment)?
+            .into_iter()
+            .collect(),
+    )
 }
 
 fn rewrite_planner_expression(
@@ -427,6 +484,9 @@ fn rewrite_planner_expression(
                 return Ok(None);
             }
             plan
+        }
+        PlannerTransformation::JoinRegionEnumeration => {
+            unreachable!("join-region enumeration returns a bounded expression frontier")
         }
         PlannerTransformation::AggregatePostReduction => {
             let (plan, changed) =
