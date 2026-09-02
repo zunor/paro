@@ -427,7 +427,7 @@ fn rewrite_planner_expressions(
     if matches!(transformation, PlannerTransformation::JoinRegionEnumeration) {
         return crate::join_order::optimizer::JoinOrderOptimizer::new()
             .with_search_budget(&environment.budget)
-            .enumerate_plan_frontier(
+            .enumerate_region(
                 environment.session.as_ref(),
                 plan,
                 column_stats,
@@ -533,11 +533,8 @@ fn rewrite_planner_expression(
             plan
         }
         PlannerTransformation::AggregateDimensionDeferral => {
-            let (plan, changed) = dimension_deferral::optimize_plan(
-                plan,
-                &environment.bind_context,
-                &environment.cost_model,
-            )?;
+            let (plan, changed) =
+                dimension_deferral::optimize_plan(plan, &environment.bind_context)?;
             if !changed {
                 return Ok(None);
             }

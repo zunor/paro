@@ -24,26 +24,17 @@ use paro_planner::operator::{
     Aggregate, ColumnBinding, ComparisonJoin, Join, JoinComparisonType, JoinType, LogicalOperator,
     ProjectionMap,
 };
-use paro_planner::plan::{CardinalityProvenance, LogicalPlan, NodeStats, PlanNodeId};
+use paro_planner::plan::{LogicalPlan, NodeStats, PlanNodeId};
 
-use crate::cost_model::CostModel;
 use crate::expression::traversal::visit_expression;
-use crate::statistics::unique_keys::{declared_unique_keys, NullRejectedKeyProof};
 
-/// Rewrite direct aggregate/projection/dimension-join shapes after cost-based
-/// join ordering has selected the dimension boundary.
-pub fn optimize_plan(
-    plan: LogicalPlan,
-    bind_context: &BindContext,
-    cost_model: &CostModel,
-) -> Result<(LogicalPlan, bool)> {
-    let mut changed = false;
-    let plan = plan.try_map_post_order(|plan| {
-        let (plan, node_changed) = rewrite_node(plan, bind_context, cost_model)?;
-        changed |= node_changed;
-        Ok(plan)
-    })?;
-    Ok((plan, changed))
+mod join_region;
+
+/// Produce one root-local aggregate alternative. Memo owns traversal and rule
+/// scheduling; recursively rewriting descendants here would duplicate work
+/// and make one firing consume unrelated equivalence groups.
+pub fn optimize_plan(plan: LogicalPlan, bind_context: &BindContext) -> Result<(LogicalPlan, bool)> {
+    rewrite_node(plan, bind_context)
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -89,12 +80,9 @@ struct DimensionRewriteInput {
     join: ComparisonJoin,
 }
 
-fn rewrite_node(
-    plan: LogicalPlan,
-    bind_context: &BindContext,
-    cost_model: &CostModel,
-) -> Result<(LogicalPlan, bool)> {
-    let Some(witness) = recognize_and_prepare(&plan, bind_context, cost_model) else {
+fn rewrite_node(plan: LogicalPlan, bind_context: &BindContext) -> Result<(LogicalPlan, bool)> {
+    let plan = join_region::isolate_widest_dimension(plan, bind_context)?;
+    let Some(witness) = recognize_and_prepare(&plan, bind_context) else {
         return Ok((plan, false));
     };
     let input = match DimensionRewriteInput::from_plan(plan, witness.projection_depth) {
@@ -110,7 +98,6 @@ fn rewrite_node(
 fn recognize_and_prepare(
     plan: &LogicalPlan,
     bind_context: &BindContext,
-    cost_model: &CostModel,
 ) -> Option<DimensionDeferral> {
     let LogicalOperator::Aggregate(aggregate) = &plan.operator else {
         return None;
@@ -142,7 +129,7 @@ fn recognize_and_prepare(
     {
         return None;
     }
-    let LogicalOperator::Get(dimension_get) = &join.right.operator else {
+    let LogicalOperator::Get(_) = &join.right.operator else {
         return None;
     };
 
@@ -175,9 +162,7 @@ fn recognize_and_prepare(
             }
             _ => return None,
         };
-        if !fact_key.evaluation_properties().can_share_evaluation()
-            || !dimension_key.evaluation_properties().can_share_evaluation()
-        {
+        if !expression_is_movable(fact_key) || !expression_is_movable(dimension_key) {
             return None;
         }
         let key_ordinal = fact_join_keys
@@ -193,44 +178,18 @@ fn recognize_and_prepare(
             fact_on_left,
         });
     }
-    let canonical_conditions = join
-        .conditions
-        .iter()
-        .zip(&fact_conditions)
-        .map(|(condition, rewrite)| {
-            if rewrite.fact_on_left {
-                paro_planner::operator::JoinCondition::equality(
-                    condition.left.clone(),
-                    condition.right.clone(),
-                )
-            } else {
-                paro_planner::operator::JoinCondition::equality(
-                    condition.right.clone(),
-                    condition.left.clone(),
-                )
-            }
-        })
-        .collect::<Vec<_>>();
-    let null_rejection = NullRejectedKeyProof::from_equal_right_keys(&canonical_conditions)?;
-    if !declared_unique_keys(dimension_get)
-        .iter()
-        .any(|key| key.is_unique_with_nulls_rejected(&null_rejection))
-    {
-        return None;
-    }
     let expanded_groups = aggregate
         .groups
         .iter()
         .map(|expression| inline_projections(expression, &projections))
         .collect::<Option<Vec<_>>>()?;
-    let fact_join_key_count = fact_join_keys.len();
     let mut partial_groups = fact_join_keys;
     let mut outer_groups = Vec::with_capacity(expanded_groups.len());
-    let mut deferred_payload_types = Vec::new();
+    let mut has_deferred_payload = false;
     for group in expanded_groups {
         match expression_domain(&group, &fact_bindings, &dimension_bindings) {
             ExpressionDomain::Fact | ExpressionDomain::Constant => {
-                if !group.evaluation_properties().can_share_evaluation() {
+                if !expression_is_movable(&group) {
                     return None;
                 }
                 let ordinal = partial_groups
@@ -244,16 +203,16 @@ fn recognize_and_prepare(
                 outer_groups.push(DeferredOuterGroup::Partial { ordinal });
             }
             ExpressionDomain::Dimension => {
-                if !group.evaluation_properties().can_share_evaluation() {
+                if !expression_is_movable(&group) {
                     return None;
                 }
-                deferred_payload_types.push(group.return_type());
+                has_deferred_payload = true;
                 outer_groups.push(DeferredOuterGroup::Dimension(Box::new(group)));
             }
             ExpressionDomain::Mixed | ExpressionDomain::Invalid => return None,
         }
     }
-    if deferred_payload_types.is_empty() {
+    if !has_deferred_payload {
         return None;
     }
 
@@ -270,11 +229,11 @@ fn recognize_and_prepare(
         if partial
             .children
             .iter()
-            .any(|child| !child.evaluation_properties().can_share_evaluation())
+            .any(|child| !expression_is_movable(child))
             || partial
                 .filter
                 .as_deref()
-                .is_some_and(|filter| !filter.evaluation_properties().can_share_evaluation())
+                .is_some_and(|filter| !expression_is_movable(filter))
         {
             return None;
         }
@@ -292,43 +251,6 @@ fn recognize_and_prepare(
         }
         partial_aggregates.push(expanded);
         merge_functions.push(merge);
-    }
-
-    // Join-graph estimates can be globally selective even when the physical
-    // carrier still processes a large fact stream. Use that estimate together
-    // with a work upper bound that does not look through fact-side reduction
-    // boundaries. This gate is cost-only; every semantic precondition above is
-    // independent of it.
-    let estimated_partial_input_rows = child.stats.estimated_cardinality?.expected;
-    let carrier_rows =
-        estimated_partial_input_rows.max(carrier_work_upper_bound(join.left.as_ref()));
-    let group_estimate = plan.stats.estimated_cardinality?.expected.max(1);
-    let dimension_rows = join.right.stats.estimated_cardinality?.expected;
-    // Every final (payload, fact-group) tuple can represent up to one partial
-    // per dimension key because SQL payloads need not be unique. Without
-    // cross-column NDV statistics, use that conservative upper bound and cap
-    // it at the carrier cardinality. This deliberately overprices, rather than
-    // underprices, the compact join and final merge when fact groups exist.
-    let partial_group_rows =
-        partial_group_work_upper_bound(carrier_rows, group_estimate, dimension_rows);
-    let key_types = partial_groups
-        .iter()
-        .take(fact_join_key_count)
-        .map(Expression::return_type)
-        .collect::<Vec<_>>();
-    let aggregate_state_types = partial_aggregates
-        .iter()
-        .map(Expression::return_type)
-        .collect::<Vec<_>>();
-    if !cost_model.dimension_deferral_is_cheaper(
-        carrier_rows,
-        partial_group_rows,
-        dimension_rows,
-        &key_types,
-        &deferred_payload_types,
-        &aggregate_state_types,
-    ) {
-        return None;
     }
 
     let old_bindings = join.right.get_column_bindings();
@@ -353,14 +275,6 @@ fn recognize_and_prepare(
         merge_functions,
         fact_conditions,
     })
-}
-
-pub(super) fn partial_group_work_upper_bound(
-    carrier_rows: u64,
-    final_group_rows: u64,
-    dimension_rows: u64,
-) -> u64 {
-    carrier_rows.min(final_group_rows.saturating_mul(dimension_rows))
 }
 
 impl DimensionRewriteInput {
@@ -506,10 +420,12 @@ fn apply(
             }
         })
         .collect();
-    // Preserve the original inner join below the partial aggregate so fact
-    // expressions retain their SQL error/evaluation domain. The declared key
-    // proves that filtering join cannot multiply facts; its descriptive
-    // payload is omitted until the compact final join.
+    // The first join is an existence filter, not a multiplicity carrier. The
+    // final inner join restores every matching dimension row before partial
+    // states are merged, so duplicate dimension keys retain exactly the SQL
+    // join multiplicity without forcing descriptive payload through the hot
+    // fact-side aggregate.
+    join.join_type = JoinType::Semi;
     join.left_projection_map = ProjectionMap::all();
     join.right_projection_map = ProjectionMap::none();
     let filtered_fact = LogicalPlan {
@@ -586,6 +502,11 @@ fn inline_projection(
     (!invalid.get()).then_some(result)
 }
 
+fn expression_is_movable(expression: &Expression) -> bool {
+    let properties = expression.evaluation_properties();
+    properties.can_share_evaluation() && !properties.is_reorder_fence()
+}
+
 fn remap_bindings(
     expression: Expression,
     bindings: &HashMap<ColumnBinding, ColumnBinding>,
@@ -646,26 +567,4 @@ fn combine_domains(left: ExpressionDomain, right: ExpressionDomain) -> Expressio
         (Dimension, Dimension) => Dimension,
         (Fact, Dimension) | (Dimension, Fact) => Mixed,
     }
-}
-
-/// Conservative carrier-work bound that trusts physically materialized
-/// operator boundaries and looks through join-graph joins. A reordered join's
-/// estimate can include runtime-filter reductions not applied before its
-/// carrier is materialized. A Filter is different: even when join ordering
-/// assigned its estimate, that physical operator executes the reduction before
-/// the carrier reaches the aggregate.
-pub(super) fn carrier_work_upper_bound(plan: &LogicalPlan) -> u64 {
-    if plan.stats.cardinality_provenance != CardinalityProvenance::JoinGraph
-        || !matches!(plan.operator, LogicalOperator::Join(_))
-    {
-        return plan
-            .stats
-            .estimated_cardinality
-            .map_or(0, |estimate| estimate.expected);
-    }
-    plan.children()
-        .into_iter()
-        .map(carrier_work_upper_bound)
-        .max()
-        .unwrap_or(0)
 }

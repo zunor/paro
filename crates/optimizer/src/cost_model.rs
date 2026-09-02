@@ -6,7 +6,6 @@ use std::sync::Arc;
 
 use paro_common::runtime_value::Value;
 use paro_common::types::LogicalType;
-use paro_common::vector::VECTOR_SIZE;
 use paro_external::routine::identity::BuiltinIntrinsicId;
 use paro_planner::expression::{
     ComparisonExpression, ComparisonType, ConjunctionType, Expression, ExpressionIterator,
@@ -142,51 +141,6 @@ fn disjunction_estimate(
 pub struct CostModel {
     pub defaults: SelectivityDefaults,
     pub scan_access: paro_storage::rowset::scan_cost::ScanAccessCostModel,
-    pub aggregate: AggregateCostModel,
-}
-
-/// Byte-work calibration for aggregate rewrites that add physical pipeline
-/// frontiers. Keeping these values beside the other cost-model inputs makes
-/// their units and ownership explicit instead of burying policy in a rewrite.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct AggregateCostModel {
-    hash_group_row_bookkeeping_bytes: usize,
-    pipeline_frontier_startup_cost: usize,
-}
-
-impl Default for AggregateCostModel {
-    fn default() -> Self {
-        Self::try_new(
-            std::mem::size_of::<u64>() + std::mem::size_of::<usize>(),
-            VECTOR_SIZE * std::mem::size_of::<usize>(),
-        )
-        .expect("built-in aggregate costs must satisfy public validation")
-    }
-}
-
-impl AggregateCostModel {
-    pub fn try_new(
-        hash_group_row_bookkeeping_bytes: usize,
-        pipeline_frontier_startup_cost: usize,
-    ) -> paro_common::error::Result<Self> {
-        if hash_group_row_bookkeeping_bytes == 0 || pipeline_frontier_startup_cost == 0 {
-            return Err(paro_common::error::invalid_input(
-                "aggregate byte-work costs must be positive",
-            ));
-        }
-        Ok(Self {
-            hash_group_row_bookkeeping_bytes,
-            pipeline_frontier_startup_cost,
-        })
-    }
-
-    pub fn hash_group_row_bookkeeping_bytes(self) -> usize {
-        self.hash_group_row_bookkeeping_bytes
-    }
-
-    pub fn pipeline_frontier_startup_cost(self) -> usize {
-        self.pipeline_frontier_startup_cost
-    }
 }
 
 #[derive(Debug, Clone)]
@@ -257,75 +211,6 @@ impl<'a> StatisticsResolver<'a> {
 }
 
 impl CostModel {
-    /// Compare the incremental byte-work of grouping a fact carrier by a
-    /// descriptive dimension payload with grouping by its compact unique key
-    /// and attaching the payload to partial groups.
-    ///
-    /// The original and rewritten plans share the first dimension join, fact
-    /// expressions, and fact-side grouping columns, so those costs cancel.
-    /// The rewritten side explicitly pays for its partial hash key, a second
-    /// dimension scan, the compact key join, and the final merge aggregate.
-    /// This keeps the decision sensitive to key, payload, and aggregate-state
-    /// widths without hiding executor work behind cardinality thresholds.
-    pub(crate) fn dimension_deferral_is_cheaper(
-        &self,
-        carrier_rows: u64,
-        partial_group_rows: u64,
-        dimension_rows: u64,
-        key_types: &[LogicalType],
-        payload_types: &[LogicalType],
-        aggregate_state_types: &[LogicalType],
-    ) -> bool {
-        // The rewrite adds one aggregate, one dimension-scan, and one compact
-        // join frontier. Charge the configured startup cost for each rather
-        // than approximating their fixed work with a minimum-row threshold.
-        const EXTRA_PIPELINE_FRONTIERS: u64 = 3;
-
-        fn work(rows: u64, width: u64) -> u64 {
-            rows.saturating_mul(width)
-        }
-
-        let key_width = key_types
-            .iter()
-            .map(|ty| self.scan_access.estimated_width(ty) as u64)
-            .sum::<u64>();
-        let payload_width = payload_types
-            .iter()
-            .map(|ty| self.scan_access.estimated_width(ty) as u64)
-            .sum::<u64>();
-        let aggregate_state_width = aggregate_state_types
-            .iter()
-            .map(|ty| self.scan_access.estimated_width(ty) as u64)
-            .sum::<u64>();
-        if carrier_rows == 0 || key_width == 0 || payload_width == 0 {
-            return false;
-        }
-
-        // Both alternatives insert the same number of carrier rows into one
-        // hash aggregate, so their per-row hash/fingerprint bookkeeping
-        // cancels. Only the rewritten final merge adds another hash-group row.
-        let hash_group_row_bookkeeping = self.aggregate.hash_group_row_bookkeeping_bytes() as u64;
-        let eager_group_work = work(carrier_rows, payload_width);
-        let partial_group_work = work(carrier_rows, key_width);
-        let dimension_rescan_and_build =
-            work(dimension_rows, key_width.saturating_add(payload_width));
-        let compact_join_probe = work(partial_group_rows, key_width);
-        let final_merge_work = work(
-            partial_group_rows,
-            payload_width
-                .saturating_add(aggregate_state_width)
-                .saturating_add(hash_group_row_bookkeeping),
-        );
-        let extra_pipeline_startup = (self.aggregate.pipeline_frontier_startup_cost() as u64)
-            .saturating_mul(EXTRA_PIPELINE_FRONTIERS);
-        let deferred_work = partial_group_work
-            .saturating_add(dimension_rescan_and_build)
-            .saturating_add(compact_join_probe)
-            .saturating_add(final_merge_work)
-            .saturating_add(extra_pipeline_startup);
-        deferred_work < eager_group_work
-    }
-
     /// Compare carrying payload through a row-preserving operator path with
     /// carrying one stable rowid and gathering the payload at a later
     /// frontier. The stage count makes blocking/serialized intermediates an
@@ -1168,43 +1053,6 @@ mod tests {
     };
 
     use super::*;
-
-    #[test]
-    fn dimension_deferral_prices_every_incremental_operator() {
-        let model = CostModel::default();
-        assert!(model.dimension_deferral_is_cheaper(
-            1_000_000,
-            100,
-            25,
-            &[LogicalType::Integer],
-            &[LogicalType::Varchar],
-            &[LogicalType::BigInt],
-        ));
-        assert!(!model.dimension_deferral_is_cheaper(
-            4_096,
-            512,
-            3_000,
-            &[LogicalType::BigInt],
-            &[LogicalType::Varchar],
-            &[LogicalType::BigInt],
-        ));
-        assert!(!model.dimension_deferral_is_cheaper(
-            1_000_000,
-            100,
-            25,
-            &[LogicalType::BigInt],
-            &[LogicalType::BigInt],
-            &[LogicalType::BigInt],
-        ));
-        assert!(model.dimension_deferral_is_cheaper(
-            1_000_000,
-            100,
-            25,
-            &[LogicalType::Integer],
-            &[LogicalType::BigInt, LogicalType::BigInt],
-            &[LogicalType::BigInt],
-        ));
-    }
 
     #[test]
     fn sparse_fetch_requires_enough_work_to_amortize_its_frontier() {

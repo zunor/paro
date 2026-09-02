@@ -12,6 +12,30 @@ use crate::expression::traversal::visit_expression;
 use crate::subquery::partition_aggregate_tests::setup_session;
 
 #[test]
+fn memo_rule_does_not_rewrite_descendants_of_a_root_projection() {
+    let session = setup_session();
+    let statement = paro_parser::parse_one(
+        "SELECT nation, sum(amount) \
+         FROM ( \
+             SELECT n_name AS nation, s_acctbal AS amount \
+             FROM supplier JOIN nation ON s_nationkey = n_nationkey \
+         ) AS profit \
+         GROUP BY nation",
+    )
+    .expect("parse dimension aggregate")
+    .stmt;
+    let mut planner = Planner::new(session);
+    planner
+        .create_plan(statement)
+        .expect("plan dimension aggregate");
+    let planned = planner.take_plan().expect("logical dimension aggregate");
+
+    let (_, changed) = dimension_deferral::optimize_plan(planned, &planner.binder.bind_context)
+        .expect("apply root-local rule");
+    assert!(!changed, "Memo, rather than a rule firing, owns traversal");
+}
+
+#[test]
 fn unique_dimension_payload_is_attached_after_partial_aggregation() {
     let session = setup_session();
     let statement = paro_parser::parse_one(
@@ -31,12 +55,8 @@ fn unique_dimension_payload_is_attached_after_partial_aggregation() {
     let planned = planner.take_plan().expect("logical dimension aggregate");
     let planned = annotate_cardinalities(planned);
 
-    let (rewritten, changed) = dimension_deferral::optimize_plan(
-        planned,
-        &planner.binder.bind_context,
-        &crate::cost_model::CostModel::default(),
-    )
-    .expect("rewrite dimension aggregate");
+    let (rewritten, changed) = rewrite_root_aggregate(planned, &planner.binder.bind_context)
+        .expect("rewrite dimension aggregate");
     assert!(changed);
     let mut aggregates = 0usize;
     let mut nation_gets = 0usize;
@@ -59,8 +79,9 @@ fn unique_dimension_payload_is_attached_after_partial_aggregation() {
                     nation_table_indices.insert(get.table_index);
                 }
                 LogicalOperator::Join(Join::Comparison(join))
-                    if join.right_projection_map.is_none() =>
+                    if join.join_type == paro_planner::operator::JoinType::Semi =>
                 {
+                    assert!(join.right_projection_map.is_none());
                     payload_free_dimension_filters += 1;
                     for condition in &join.conditions {
                         collect_bindings(&condition.left, &mut filtering_join_bindings);
@@ -104,7 +125,7 @@ fn unique_dimension_payload_is_attached_after_partial_aggregation() {
 }
 
 #[test]
-fn non_unique_dimension_key_is_not_deferred() {
+fn duplicate_dimension_keys_retain_join_multiplicity_through_final_merge() {
     let session = setup_session();
     let statement = paro_parser::parse_one(
         "SELECT customer, sum(amount) \
@@ -126,15 +147,12 @@ fn non_unique_dimension_key_is_not_deferred() {
             .expect("logical non-unique dimension aggregate"),
     );
 
-    let (rewritten, changed) = dimension_deferral::optimize_plan(
-        planned,
-        &planner.binder.bind_context,
-        &crate::cost_model::CostModel::default(),
-    )
-    .expect("inspect non-unique dimension aggregate");
-    assert!(!changed);
+    let (rewritten, changed) = rewrite_root_aggregate(planned, &planner.binder.bind_context)
+        .expect("rewrite non-unique dimension aggregate");
+    assert!(changed);
     let mut aggregates = 0usize;
     let mut customer_gets = 0usize;
+    let mut existence_filters = 0usize;
     rewritten
         .try_visit_pre_order(|plan| {
             match &plan.operator {
@@ -147,110 +165,62 @@ fn non_unique_dimension_key_is_not_deferred() {
                 {
                     customer_gets += 1;
                 }
+                LogicalOperator::Join(Join::Comparison(join))
+                    if join.join_type == paro_planner::operator::JoinType::Semi =>
+                {
+                    existence_filters += 1;
+                }
                 _ => {}
             }
             Ok(())
         })
-        .expect("inspect unchanged aggregate");
+        .expect("inspect rewritten aggregate");
 
-    assert_eq!(aggregates, 1, "{rewritten:#?}");
-    assert_eq!(customer_gets, 1, "{rewritten:#?}");
+    assert_eq!(aggregates, 2, "{rewritten:#?}");
+    assert_eq!(customer_gets, 2, "{rewritten:#?}");
+    assert_eq!(existence_filters, 1, "{rewritten:#?}");
 }
 
 #[test]
-fn selective_fact_subtree_does_not_use_unfiltered_leaf_cardinality() {
+fn multiway_region_isolates_the_widest_grouping_dimension() {
     let session = setup_session();
     let statement = paro_parser::parse_one(
-        "SELECT nation, sum(amount) \
-         FROM ( \
-             SELECT n_name AS nation, s_acctbal AS amount \
-             FROM supplier JOIN nation ON s_nationkey = n_nationkey \
-         ) AS profit \
-         GROUP BY nation",
+        "SELECT c_name, c_address, n_name, sum(s_acctbal) \
+         FROM supplier \
+         JOIN customer ON s_nationkey = c_nationkey \
+         JOIN nation ON s_nationkey = n_nationkey \
+         GROUP BY c_name, c_address, n_name",
     )
-    .expect("parse selective dimension aggregate")
+    .expect("parse multiway dimension aggregate")
     .stmt;
     let mut planner = Planner::new(session.clone());
     planner
         .create_plan(statement)
-        .expect("plan selective dimension aggregate");
-    let planned = annotate_cardinalities_with_join_rows(
+        .expect("plan multiway dimension aggregate");
+    let planned = annotate_cardinalities(
         planner
             .take_plan()
-            .expect("logical selective dimension aggregate"),
-        1_000,
-    )
-    .try_map_post_order(|mut plan| {
-        if matches!(&plan.operator,
-            LogicalOperator::Get(get)
-                if get.table.as_ref().is_some_and(|table| table.base.base.name == "supplier"))
-        {
-            plan.stats.estimated_cardinality = Some(CardinalityEstimate {
-                min: 0,
-                expected: 1_000,
-                max: 10_000,
-            });
-        }
-        Ok(plan)
-    })
-    .expect("annotate selective fact source");
-
-    let (_, changed) = dimension_deferral::optimize_plan(
-        planned,
-        &planner.binder.bind_context,
-        &crate::cost_model::CostModel::default(),
-    )
-    .expect("inspect selective dimension aggregate");
-    assert!(!changed);
-}
-
-#[test]
-fn carrier_work_trusts_a_physical_join_graph_filter() {
-    let mut leaf = LogicalPlan::synthetic(LogicalOperator::DummyScan);
-    leaf.stats.estimated_cardinality = Some(CardinalityEstimate::exact(600_000_000));
-    let mut reduced = LogicalPlan::synthetic(LogicalOperator::Filter(
-        paro_planner::operator::Filter::new(leaf, vec![]),
-    ));
-    reduced.stats.estimated_cardinality = Some(CardinalityEstimate::exact(1_000));
-    reduced.stats.cardinality_provenance = CardinalityProvenance::JoinGraph;
-
-    assert_eq!(
-        dimension_deferral::carrier_work_upper_bound(&reduced),
-        1_000
+            .expect("logical multiway dimension aggregate"),
     );
-}
 
-#[test]
-fn carrier_work_looks_through_a_join_graph_join() {
-    let mut left = LogicalPlan::synthetic(LogicalOperator::DummyScan);
-    left.stats.estimated_cardinality = Some(CardinalityEstimate::exact(600_000_000));
-    let mut right = LogicalPlan::synthetic(LogicalOperator::DummyScan);
-    right.stats.estimated_cardinality = Some(CardinalityEstimate::exact(25));
-    let mut join = LogicalPlan::synthetic(LogicalOperator::Join(Join::Cross(
-        paro_planner::operator::CrossProduct {
-            left: Box::new(left),
-            right: Box::new(right),
-        },
-    )));
-    join.stats.estimated_cardinality = Some(CardinalityEstimate::exact(1_000));
-    join.stats.cardinality_provenance = CardinalityProvenance::JoinGraph;
-
-    assert_eq!(
-        dimension_deferral::carrier_work_upper_bound(&join),
-        600_000_000
-    );
-}
-
-#[test]
-fn partial_group_work_prices_fact_groups_per_dimension_key() {
-    assert_eq!(
-        dimension_deferral::partial_group_work_upper_bound(1_000_000, 1_000, 4),
-        4_000
-    );
-    assert_eq!(
-        dimension_deferral::partial_group_work_upper_bound(2_000, 1_000, 4),
-        2_000
-    );
+    let (rewritten, changed) = rewrite_root_aggregate(planned, &planner.binder.bind_context)
+        .expect("rewrite multiway dimension aggregate");
+    assert!(changed, "{rewritten:#?}");
+    let mut filtered_dimension = None;
+    rewritten
+        .try_visit_pre_order(|plan| {
+            if let LogicalOperator::Join(Join::Comparison(join)) = &plan.operator {
+                if join.join_type == paro_planner::operator::JoinType::Semi {
+                    if let LogicalOperator::Get(get) = &join.right.operator {
+                        filtered_dimension =
+                            get.table.as_ref().map(|table| table.base.base.name.clone());
+                    }
+                }
+            }
+            Ok(())
+        })
+        .expect("inspect multiway rewrite");
+    assert_eq!(filtered_dimension.as_deref(), Some("customer"));
 }
 
 fn collect_bindings(
@@ -262,6 +232,22 @@ fn collect_bindings(
             bindings.push(column.binding);
         }
     });
+}
+
+fn rewrite_root_aggregate(
+    mut plan: LogicalPlan,
+    bind_context: &paro_planner::binder::context::BindContext,
+) -> paro_common::error::Result<(LogicalPlan, bool)> {
+    let LogicalOperator::Projection(projection) = &mut plan.operator else {
+        return dimension_deferral::optimize_plan(plan, bind_context);
+    };
+    let child = std::mem::replace(
+        &mut projection.child,
+        Box::new(LogicalPlan::synthetic(LogicalOperator::DummyScan)),
+    );
+    let (child, changed) = dimension_deferral::optimize_plan(*child, bind_context)?;
+    projection.child = Box::new(child);
+    Ok((plan, changed))
 }
 
 fn annotate_cardinalities(plan: LogicalPlan) -> LogicalPlan {

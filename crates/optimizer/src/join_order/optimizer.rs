@@ -3,8 +3,7 @@
 
 //! Cost-based join-order optimization.
 
-use std::cmp::Reverse;
-use std::collections::{BinaryHeap, HashMap, HashSet};
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use paro_catalog::entry::ConstraintType;
@@ -175,38 +174,6 @@ pub struct JoinOrderOptimizer {
     max_frontier_size: usize,
 }
 
-fn k_best_cartesian_indices(lengths: &[usize], limit: usize) -> Vec<Vec<usize>> {
-    if lengths.is_empty() {
-        return vec![Vec::new()];
-    }
-    if limit == 0 || lengths.contains(&0) {
-        return Vec::new();
-    }
-
-    let origin = vec![0; lengths.len()];
-    let mut pending = BinaryHeap::from([Reverse((0usize, origin.clone()))]);
-    let mut visited = HashSet::from([origin]);
-    let mut result = Vec::with_capacity(limit);
-    while result.len() < limit {
-        let Some(Reverse((_, indices))) = pending.pop() else {
-            break;
-        };
-        result.push(indices.clone());
-        for dimension in 0..lengths.len() {
-            if indices[dimension] + 1 >= lengths[dimension] {
-                continue;
-            }
-            let mut neighbor = indices.clone();
-            neighbor[dimension] += 1;
-            if visited.insert(neighbor.clone()) {
-                let rank = neighbor.iter().sum();
-                pending.push(Reverse((rank, neighbor)));
-            }
-        }
-    }
-    result
-}
-
 impl JoinOrderOptimizer {
     /// Create a new JoinOrderOptimizer.
     pub fn new() -> Self {
@@ -269,10 +236,12 @@ impl JoinOrderOptimizer {
         plan.try_map_post_order(|plan| self.optimize_current_plan(ctx, bind_context, plan))
     }
 
-    /// Enumerate bounded join-region alternatives without selecting one
-    /// before Memo. Non-join ancestors are rebuilt around the retained child
-    /// frontier so every returned item is a complete logical plan.
-    pub fn enumerate_plan_frontier(
+    /// Enumerate only the join region rooted at `plan`.
+    ///
+    /// Cascades schedules one firing per Memo expression, so traversal belongs
+    /// to the engine. Keeping this entry point root-local prevents overlapping
+    /// join groups from recursively re-enumerating and restaging descendants.
+    pub fn enumerate_region(
         &mut self,
         ctx: &StatementContext,
         plan: LogicalPlan,
@@ -281,87 +250,15 @@ impl JoinOrderOptimizer {
     ) -> Result<Vec<LogicalPlan>> {
         self.column_stats = column_stats.clone();
         let plan = ColumnLifetimeAnalyzer::new(true).optimize(plan)?;
-        self.enumerate_tree_frontier(ctx, bind_context, plan)
-    }
-
-    fn enumerate_tree_frontier(
-        &mut self,
-        ctx: &StatementContext,
-        bind_context: &BindContext,
-        plan: LogicalPlan,
-    ) -> Result<Vec<LogicalPlan>> {
-        let mut detached = Vec::new();
-        let skeleton = plan.try_map_children(|child| {
-            detached.push(child);
-            Ok(LogicalPlan::synthetic(LogicalOperator::DummyScan))
-        })?;
-        let mut child_frontiers = Vec::with_capacity(detached.len());
-        for child in detached {
-            child_frontiers.push(self.enumerate_tree_frontier(ctx, bind_context, child)?);
+        if !self.can_optimize_join(&plan.operator) {
+            return Ok(Vec::new());
         }
-
-        if child_frontiers.iter().any(Vec::is_empty) {
-            return Err(paro_common::error::internal(
-                "join frontier produced an empty child alternative set",
-            ));
+        let plan_id = plan.id;
+        let mut alternatives = self.optimize_join_tree(ctx, bind_context, plan)?;
+        for alternative in &mut alternatives {
+            alternative.id = plan_id;
         }
-        // Every child frontier is already ordered by its non-dominated
-        // work/memory rank. Enumerate the Cartesian lattice with a min-heap
-        // over summed ranks. Unlike mixed-radix prefix truncation, this is a
-        // deterministic k-best traversal and lets every child vary before a
-        // deeper rank from one positional child can monopolize the budget.
-        let combinations = k_best_cartesian_indices(
-            &child_frontiers.iter().map(Vec::len).collect::<Vec<_>>(),
-            self.max_frontier_size,
-        );
-        let mut rebuilt = Vec::with_capacity(combinations.len());
-        for combination in combinations {
-            let mut child_index = 0usize;
-            let mut shell =
-                duplicate_plan_preserving_indices(&skeleton, bind_context.shared().as_ref());
-            shell = shell.try_map_children(|_| {
-                let frontier = child_frontiers.get(child_index).ok_or_else(|| {
-                    paro_common::error::internal("join frontier child arity mismatch")
-                })?;
-                let selected = *combination.get(child_index).ok_or_else(|| {
-                    paro_common::error::internal("join frontier combination arity mismatch")
-                })?;
-                child_index += 1;
-                Ok(duplicate_plan_preserving_indices(
-                    &frontier[selected],
-                    bind_context.shared().as_ref(),
-                ))
-            })?;
-            rebuilt.push(shell);
-        }
-
-        let mut result = Vec::new();
-        for plan in rebuilt {
-            if self.can_optimize_join(&plan.operator) {
-                let plan_id = plan.id;
-                let mut alternatives = self.optimize_join_tree(
-                    ctx,
-                    bind_context,
-                    duplicate_plan_preserving_indices(&plan, bind_context.shared().as_ref()),
-                )?;
-                for alternative in &mut alternatives {
-                    alternative.id = plan_id;
-                }
-                if !alternatives.is_empty() {
-                    result.extend(alternatives);
-                    if result.len() >= self.max_frontier_size {
-                        result.truncate(self.max_frontier_size);
-                        break;
-                    }
-                    continue;
-                }
-            }
-            result.push(plan);
-            if result.len() >= self.max_frontier_size {
-                break;
-            }
-        }
-        Ok(result)
+        Ok(alternatives)
     }
 
     /// Keep join-graph extraction and reconstruction isolated from the
@@ -1163,16 +1060,6 @@ mod tests {
 
     use super::*;
 
-    #[test]
-    fn cartesian_frontier_is_ranked_without_child_position_bias() {
-        let combinations = k_best_cartesian_indices(&[4, 4], 4);
-        assert_eq!(combinations[0], vec![0, 0]);
-        assert!(combinations.iter().any(|indices| indices[0] > 0));
-        assert!(combinations.iter().any(|indices| indices[1] > 0));
-        assert!(combinations
-            .windows(2)
-            .all(|pair| pair[0].iter().sum::<usize>() <= pair[1].iter().sum()));
-    }
     use crate::join::build_probe_side::BuildProbeSideOptimizer;
     use crate::join_order::cardinality::CardinalityEstimator;
     use paro_catalog::entry::{
