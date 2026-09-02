@@ -61,9 +61,7 @@ fn unique_dimension_payload_is_attached_after_partial_aggregation() {
     let mut aggregates = 0usize;
     let mut nation_gets = 0usize;
     let mut nation_table_indices = std::collections::HashSet::new();
-    let mut payload_free_dimension_filters = 0usize;
     let mut final_join_stats = None;
-    let mut filtering_join_bindings = Vec::new();
     let mut final_join_bindings = Vec::new();
     rewritten
         .try_visit_pre_order(|plan| {
@@ -77,16 +75,6 @@ fn unique_dimension_payload_is_attached_after_partial_aggregation() {
                 {
                     nation_gets += 1;
                     nation_table_indices.insert(get.table_index);
-                }
-                LogicalOperator::Join(Join::Comparison(join))
-                    if join.join_type == paro_planner::operator::JoinType::Semi =>
-                {
-                    assert!(join.right_projection_map.is_none());
-                    payload_free_dimension_filters += 1;
-                    for condition in &join.conditions {
-                        collect_bindings(&condition.left, &mut filtering_join_bindings);
-                        collect_bindings(&condition.right, &mut filtering_join_bindings);
-                    }
                 }
                 LogicalOperator::Join(Join::Comparison(join)) => {
                     final_join_stats = Some((plan.id, plan.stats.clone()));
@@ -102,26 +90,18 @@ fn unique_dimension_payload_is_attached_after_partial_aggregation() {
         .expect("inspect rewritten plan");
 
     assert_eq!(aggregates, 2, "{rewritten:#?}");
-    assert_eq!(nation_gets, 2, "{rewritten:#?}");
-    assert_eq!(nation_table_indices.len(), 2, "{rewritten:#?}");
-    assert_eq!(payload_free_dimension_filters, 1, "{rewritten:#?}");
+    assert_eq!(nation_gets, 1, "{rewritten:#?}");
+    assert_eq!(nation_table_indices.len(), 1, "{rewritten:#?}");
     let (final_join_id, final_stats) =
         final_join_stats.expect("rewritten plan has a final dimension join");
     assert_ne!(final_join_id, PlanNodeId::SYNTHETIC);
     assert_eq!(final_stats, NodeStats::default());
-    let filtering_dimension_indices = filtering_join_bindings
-        .iter()
-        .map(|binding| binding.table_index)
-        .filter(|index| nation_table_indices.contains(index))
-        .collect::<std::collections::HashSet<_>>();
     let final_dimension_indices = final_join_bindings
         .iter()
         .map(|binding| binding.table_index)
         .filter(|index| nation_table_indices.contains(index))
         .collect::<std::collections::HashSet<_>>();
-    assert_eq!(filtering_dimension_indices.len(), 1, "{rewritten:#?}");
     assert_eq!(final_dimension_indices.len(), 1, "{rewritten:#?}");
-    assert_ne!(filtering_dimension_indices, final_dimension_indices);
 }
 
 #[test]
@@ -152,7 +132,6 @@ fn duplicate_dimension_keys_retain_join_multiplicity_through_final_merge() {
     assert!(changed);
     let mut aggregates = 0usize;
     let mut customer_gets = 0usize;
-    let mut existence_filters = 0usize;
     rewritten
         .try_visit_pre_order(|plan| {
             match &plan.operator {
@@ -165,11 +144,6 @@ fn duplicate_dimension_keys_retain_join_multiplicity_through_final_merge() {
                 {
                     customer_gets += 1;
                 }
-                LogicalOperator::Join(Join::Comparison(join))
-                    if join.join_type == paro_planner::operator::JoinType::Semi =>
-                {
-                    existence_filters += 1;
-                }
                 _ => {}
             }
             Ok(())
@@ -177,8 +151,7 @@ fn duplicate_dimension_keys_retain_join_multiplicity_through_final_merge() {
         .expect("inspect rewritten aggregate");
 
     assert_eq!(aggregates, 2, "{rewritten:#?}");
-    assert_eq!(customer_gets, 2, "{rewritten:#?}");
-    assert_eq!(existence_filters, 1, "{rewritten:#?}");
+    assert_eq!(customer_gets, 1, "{rewritten:#?}");
 }
 
 #[test]
@@ -206,13 +179,13 @@ fn multiway_region_isolates_the_widest_grouping_dimension() {
     let (rewritten, changed) = rewrite_root_aggregate(planned, &planner.binder.bind_context)
         .expect("rewrite multiway dimension aggregate");
     assert!(changed, "{rewritten:#?}");
-    let mut filtered_dimension = None;
+    let mut attached_dimension = None;
     rewritten
         .try_visit_pre_order(|plan| {
             if let LogicalOperator::Join(Join::Comparison(join)) = &plan.operator {
-                if join.join_type == paro_planner::operator::JoinType::Semi {
+                if attached_dimension.is_none() {
                     if let LogicalOperator::Get(get) = &join.right.operator {
-                        filtered_dimension =
+                        attached_dimension =
                             get.table.as_ref().map(|table| table.base.base.name.clone());
                     }
                 }
@@ -220,7 +193,7 @@ fn multiway_region_isolates_the_widest_grouping_dimension() {
             Ok(())
         })
         .expect("inspect multiway rewrite");
-    assert_eq!(filtered_dimension.as_deref(), Some("customer"));
+    assert_eq!(attached_dimension.as_deref(), Some("customer"));
 }
 
 fn collect_bindings(

@@ -12,17 +12,15 @@
 //! dimension keys may legally carry the same payload.
 
 use std::cell::Cell;
-use std::collections::{HashMap, HashSet};
+use std::collections::HashSet;
 
 use paro_common::error::Result;
 use paro_planner::binder::context::BindContext;
-use paro_planner::binder::deep_copy::deep_copy_plan;
 use paro_planner::expression::{
     AggregateExpression, AggregateType, ColumnRefExpression, Expression,
 };
 use paro_planner::operator::{
     Aggregate, ColumnBinding, ComparisonJoin, Join, JoinComparisonType, JoinType, LogicalOperator,
-    ProjectionMap,
 };
 use paro_planner::plan::{LogicalPlan, NodeStats, PlanNodeId};
 
@@ -48,7 +46,6 @@ enum ExpressionDomain {
 
 struct DimensionDeferral {
     projection_depth: usize,
-    dimension: PreparedDimension,
     partial_groups: Vec<Expression>,
     outer_groups: Vec<DeferredOuterGroup>,
     partial_aggregates: Vec<Expression>,
@@ -66,23 +63,16 @@ struct FactConditionRewrite {
     fact_on_left: bool,
 }
 
-struct PreparedDimension {
-    plan: LogicalPlan,
-    binding_map: HashMap<ColumnBinding, ColumnBinding>,
-}
-
 struct DimensionRewriteInput {
     root_id: PlanNodeId,
     root_stats: NodeStats,
     aggregate: Aggregate,
-    join_id: PlanNodeId,
-    join_stats: NodeStats,
     join: ComparisonJoin,
 }
 
 fn rewrite_node(plan: LogicalPlan, bind_context: &BindContext) -> Result<(LogicalPlan, bool)> {
     let plan = join_region::isolate_widest_dimension(plan, bind_context)?;
-    let Some(witness) = recognize_and_prepare(&plan, bind_context) else {
+    let Some(witness) = recognize(&plan) else {
         return Ok((plan, false));
     };
     let input = match DimensionRewriteInput::from_plan(plan, witness.projection_depth) {
@@ -92,13 +82,11 @@ fn rewrite_node(plan: LogicalPlan, bind_context: &BindContext) -> Result<(Logica
     Ok((apply(input, witness, bind_context), true))
 }
 
-/// Prove the rewrite and prepare its independently-bound dimension copy only
-/// after the cost gate accepts it. The resulting witness owns every resource
-/// needed by the total mutation phase below.
-fn recognize_and_prepare(
-    plan: &LogicalPlan,
-    bind_context: &BindContext,
-) -> Option<DimensionDeferral> {
+/// Prove that the aggregate can be split into fact-side partial states and a
+/// post-join merge. The dimension is moved, not copied: unmatched fact states
+/// disappear at the final inner join, so an earlier existence join would be
+/// both redundant and more expensive.
+fn recognize(plan: &LogicalPlan) -> Option<DimensionDeferral> {
     let LogicalOperator::Aggregate(aggregate) = &plan.operator else {
         return None;
     };
@@ -253,22 +241,8 @@ fn recognize_and_prepare(
         merge_functions.push(merge);
     }
 
-    let old_bindings = join.right.get_column_bindings();
-    let copied_dimension = deep_copy_plan(join.right.as_ref(), bind_context.shared().as_ref());
-    let new_bindings = copied_dimension.get_column_bindings();
-    debug_assert_eq!(old_bindings.len(), new_bindings.len());
-    let binding_map = old_bindings
-        .into_iter()
-        .zip(new_bindings)
-        .collect::<HashMap<_, _>>();
-    debug_assert!(binding_map.iter().all(|(old, new)| old != new));
-
     Some(DimensionDeferral {
         projection_depth: projections.len(),
-        dimension: PreparedDimension {
-            plan: copied_dimension,
-            binding_map,
-        },
         partial_groups,
         outer_groups,
         partial_aggregates,
@@ -302,12 +276,10 @@ impl DimensionRewriteInput {
             Box::new(LogicalPlan::synthetic(LogicalOperator::DummyScan)),
         );
         match take_join_below_projections(child, projection_depth) {
-            Ok((join_id, join_stats, join)) => Ok(Self {
+            Ok(join) => Ok(Self {
                 root_id,
                 root_stats,
                 aggregate,
-                join_id,
-                join_stats,
                 join,
             }),
             Err(child) => {
@@ -325,7 +297,7 @@ impl DimensionRewriteInput {
 fn take_join_below_projections(
     plan: LogicalPlan,
     projection_depth: usize,
-) -> std::result::Result<(PlanNodeId, NodeStats, ComparisonJoin), Box<LogicalPlan>> {
+) -> std::result::Result<ComparisonJoin, Box<LogicalPlan>> {
     let LogicalPlan {
         id,
         stats,
@@ -333,7 +305,7 @@ fn take_join_below_projections(
     } = plan;
     if projection_depth == 0 {
         return match operator {
-            LogicalOperator::Join(Join::Comparison(join)) => Ok((id, stats, join)),
+            LogicalOperator::Join(Join::Comparison(join)) => Ok(join),
             operator => Err(Box::new(LogicalPlan {
                 id,
                 stats,
@@ -370,13 +342,10 @@ fn apply(
         root_id,
         root_stats,
         mut aggregate,
-        join_id,
-        join_stats,
-        mut join,
+        join,
     } = input;
     let DimensionDeferral {
         projection_depth: _,
-        dimension,
         partial_groups,
         outer_groups,
         partial_aggregates,
@@ -387,10 +356,6 @@ fn apply(
     let partial_aggregate_index = bind_context.generate_table_index();
     let partial_groupings_index = bind_context.generate_table_index();
     let mut final_conditions = join.conditions.clone();
-    for condition in &mut final_conditions {
-        condition.left = remap_bindings(condition.left.clone(), &dimension.binding_map);
-        condition.right = remap_bindings(condition.right.clone(), &dimension.binding_map);
-    }
     debug_assert_eq!(final_conditions.len(), fact_conditions.len());
     for (condition, rewrite) in final_conditions.iter_mut().zip(&fact_conditions) {
         let fact_expression = if rewrite.fact_on_left {
@@ -409,9 +374,7 @@ fn apply(
     let outer_groups = outer_groups
         .into_iter()
         .map(|group| match group {
-            DeferredOuterGroup::Dimension(expression) => {
-                remap_bindings(*expression, &dimension.binding_map)
-            }
+            DeferredOuterGroup::Dimension(expression) => *expression,
             DeferredOuterGroup::Partial { ordinal } => {
                 Expression::ColumnRef(ColumnRefExpression::new(
                     ColumnBinding::new(partial_group_index, ordinal),
@@ -420,34 +383,24 @@ fn apply(
             }
         })
         .collect();
-    // The first join is an existence filter, not a multiplicity carrier. The
-    // final inner join restores every matching dimension row before partial
-    // states are merged, so duplicate dimension keys retain exactly the SQL
-    // join multiplicity without forcing descriptive payload through the hot
-    // fact-side aggregate.
-    join.join_type = JoinType::Semi;
-    join.left_projection_map = ProjectionMap::all();
-    join.right_projection_map = ProjectionMap::none();
-    let filtered_fact = LogicalPlan {
-        id: join_id,
-        stats: join_stats,
-        operator: LogicalOperator::Join(Join::Comparison(join)),
-    };
     let partial = LogicalPlan::new(
         bind_context,
         LogicalOperator::Aggregate(Aggregate::new(
             partial_group_index,
             partial_aggregate_index,
             partial_groupings_index,
-            filtered_fact,
+            *join.left,
             partial_groups,
             vec![],
             partial_aggregates,
             vec![],
         )),
     );
-    let final_join =
-        ComparisonJoin::new(JoinType::Inner, partial, dimension.plan, final_conditions);
+    // Unmatched partial states vanish here. Duplicate dimension rows are
+    // intentionally retained, and the final merge reproduces their SQL join
+    // multiplicity without carrying descriptive payload through the hot
+    // fact-side aggregate.
+    let final_join = ComparisonJoin::new(JoinType::Inner, partial, *join.right, final_conditions);
 
     let outer_aggregates = merge_functions
         .into_iter()
@@ -505,21 +458,6 @@ fn inline_projection(
 fn expression_is_movable(expression: &Expression) -> bool {
     let properties = expression.evaluation_properties();
     properties.can_share_evaluation() && !properties.is_reorder_fence()
-}
-
-fn remap_bindings(
-    expression: Expression,
-    bindings: &HashMap<ColumnBinding, ColumnBinding>,
-) -> Expression {
-    expression.replace_column_ref(&|column| {
-        bindings.get(&column.binding).copied().map(|binding| {
-            Expression::ColumnRef(ColumnRefExpression {
-                binding,
-                depth: column.depth,
-                return_type: column.return_type.clone(),
-            })
-        })
-    })
 }
 
 fn inline_projections(
