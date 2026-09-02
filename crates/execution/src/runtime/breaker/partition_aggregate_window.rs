@@ -71,7 +71,7 @@ impl PartitionAggregatePendingSpillReclaimer {
             handle,
             spec,
             buffer_pool,
-            radix_bits: aggregate_spill_radix_bits(parallelism),
+            radix_bits: aggregate_spill_radix_bits(parallelism, usize::MAX),
             memory,
         }
     }
@@ -483,7 +483,7 @@ fn seal_external(
     parallelism: usize,
     cancel: &paro_context::StatementCancellation,
 ) -> Result<PartitionAggregateSnapshot> {
-    let initial_radix_bits = aggregate_spill_radix_bits(parallelism);
+    let initial_radix_bits = aggregate_spill_radix_bits(parallelism, usize::MAX);
     let mut spills = Vec::with_capacity(pending.len());
     for local in pending {
         cancel.check()?;
@@ -857,7 +857,13 @@ mod tests {
         }
 
         let stats = handle
-            .reclaim_pending(2, &spec, buffer_pool, aggregate_spill_radix_bits(1), memory)
+            .reclaim_pending(
+                2,
+                &spec,
+                buffer_pool,
+                aggregate_spill_radix_bits(1, usize::MAX),
+                memory,
+            )
             .expect("reclaim pending locals");
         assert_eq!(stats.reclaimed_bytes, 2);
         assert!(stats.spilled_bytes > 0);
@@ -1011,7 +1017,7 @@ mod tests {
         let mut spill = AggregatePayloadSpillBuffer::new(
             Arc::clone(&buffer_pool),
             spec.aggregate.payload_types.iter().cloned(),
-            aggregate_spill_radix_bits(1),
+            aggregate_spill_radix_bits(1, usize::MAX),
             table_memory.clone(),
         )
         .expect("spill");

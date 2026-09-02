@@ -43,6 +43,7 @@ impl PipelineLowerer<'_> {
             if *build != edge.producer
                 || spec
                     .runtime_filter
+                    .as_ref()
                     .is_none_or(|filter| filter.artifact != artifact)
             {
                 return Err(paro_error::internal(
@@ -94,7 +95,7 @@ impl PipelineLowerer<'_> {
         handle: BreakerHandleId,
         spec: &HashJoinSpec,
     ) -> SourceSpec {
-        let Some(runtime_filter) = spec.runtime_filter else {
+        let Some(runtime_filter) = &spec.runtime_filter else {
             return source;
         };
         if !can_push_hash_join_runtime_filter(spec.join_type) {

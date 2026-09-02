@@ -155,7 +155,7 @@ impl PredicateEvaluator {
         // column runs. Later stages can shrink that set, so the legacy
         // batch-index reuse protocol is intentionally disabled. Projection
         // columns are gathered once from the final absolute row-id set.
-        if self.program.is_staged() {
+        if self.program.is_staged() && !self.program.has_single_stage() {
             return None;
         }
         let column_idx = self

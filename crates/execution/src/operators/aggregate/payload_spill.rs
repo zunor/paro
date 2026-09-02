@@ -50,8 +50,23 @@ pub(crate) enum AggregateStateEncoding {
 /// The upper bound matches the aggregate table's radix implementation. A
 /// consumer can repartition a pathological partition later without changing
 /// the raw-payload format.
-pub(crate) fn aggregate_spill_radix_bits(parallelism: usize) -> usize {
-    parallelism.next_power_of_two().trailing_zeros().clamp(1, 4) as usize
+pub(crate) fn aggregate_spill_radix_bits(
+    parallelism: usize,
+    admitted_memory_bytes: usize,
+) -> usize {
+    let task_bits = parallelism.next_power_of_two().trailing_zeros().clamp(1, 4) as usize;
+    // External aggregation must be able to rebuild one partition inside the
+    // admitted lease. Low-memory variants therefore choose a finer immutable
+    // partitioning policy even when their DOP is one. Sixteen partitions keep
+    // metadata bounded while leaving at least three quarters of small leases
+    // available for tuple/state storage and migration scratch.
+    let memory_bits = match admitted_memory_bytes {
+        0..=8_388_608 => 4,
+        8_388_609..=33_554_432 => 3,
+        33_554_433..=134_217_728 => 2,
+        _ => 1,
+    };
+    task_bits.max(memory_bits)
 }
 
 impl AggregatePayloadSpillBuffer {

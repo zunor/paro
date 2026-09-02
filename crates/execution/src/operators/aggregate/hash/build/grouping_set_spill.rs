@@ -32,7 +32,10 @@ pub(super) fn append_payload_to_local_spills(
             *payload_spill = Some(AggregatePayloadSpillBuffer::new(
                 ctx.query.session.buffer_pool().clone(),
                 payload.types(),
-                aggregate_spill_radix_bits(ctx.query.session.number_of_threads()),
+                aggregate_spill_radix_bits(
+                    super::admitted_parallelism(ctx.query),
+                    ctx.query.memory.capacity_bytes(),
+                ),
                 query_hash_table_memory(ctx.query),
             )?);
         }
@@ -113,7 +116,7 @@ pub(super) fn spill_grouping_set_payloads_to_outputs(
                 &domain_spec,
                 ctx.query.allocator(MemoryTag::HashTable),
                 query_hash_table_memory(ctx.query),
-                ctx.query.session.number_of_threads(),
+                super::admitted_parallelism(ctx.query),
             )?;
             initialize_empty_grouping_domain_rows(
                 ctx.query,
@@ -162,7 +165,7 @@ pub(super) fn spill_grouping_set_payloads_to_outputs(
                 &domain_spec,
                 ctx.query.allocator(MemoryTag::HashTable),
                 query_hash_table_memory(ctx.query),
-                ctx.query.session.number_of_threads(),
+                super::admitted_parallelism(ctx.query),
             )?;
             for spilled_payload in &domain_payloads {
                 spilled_payload.replay_partition_payloads(

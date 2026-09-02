@@ -653,11 +653,17 @@ fn collect_explain_properties(
         }
         PhysicalNodeKind::HashJoin(spec) => {
             push_string_property(&mut properties, "Join Type", spec.join_type.to_string());
-            if let Some(runtime_filter) = spec.runtime_filter {
+            if let Some(runtime_filter) = &spec.runtime_filter {
                 push_string_property(
                     &mut properties,
                     "Runtime Filter",
-                    format!("wait_complete artifact={:?}", runtime_filter.artifact),
+                    format!(
+                        "wait_complete capability={:?} peak={}B builders={} artifact={:?}",
+                        runtime_filter.resource.capability,
+                        runtime_filter.resource.peak_memory_bytes,
+                        runtime_filter.resource.max_local_builders,
+                        runtime_filter.artifact
+                    ),
                 );
             }
             if spec.build_time_integer_index.is_some() {

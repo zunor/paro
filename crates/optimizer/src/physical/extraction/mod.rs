@@ -398,6 +398,15 @@ impl PhysicalPlanExtractor {
             spec.runtime_filter = Some(HashJoinRuntimeFilterSpec {
                 artifact,
                 wait_policy: RuntimeFilterWaitPolicy::WaitComplete,
+                resource: crate::physical::RuntimeFilterResourceContract::for_keys(
+                    &spec
+                        .key_conditions
+                        .iter()
+                        .filter(|condition| condition.comparison == JoinComparisonType::Equal)
+                        .map(|condition| condition.right.return_type())
+                        .collect::<Vec<_>>(),
+                    u16::try_from(self.ctx.max_threads).unwrap_or(u16::MAX),
+                )?,
             });
             Some((*build, consumers, artifact))
         } else {

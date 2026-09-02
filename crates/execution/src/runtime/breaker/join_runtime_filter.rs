@@ -18,6 +18,7 @@ use paro_common::memory::{
 use paro_common::runtime_value::Value;
 use paro_common::types::LogicalType;
 use paro_common::vector::{DataRef, SelectionVector, Vector, VECTOR_SIZE};
+use paro_optimizer::physical::{RuntimeFilterKeyRepresentation, RuntimeFilterResourceContract};
 use paro_storage::index::{
     ColumnId, FixedMembership, FixedMembershipBuildPolicy, Predicate, PredicateTree,
 };
@@ -25,14 +26,16 @@ use paro_storage::index::{
 /// Bounded construction policy for analytical join filters.
 ///
 /// The mutable domain is capped independently from its frozen representation.
-/// A frozen dense set can spend up to 8 MiB and at most 256 bits per retained
+/// A frozen dense set can spend up to 8 MiB and at most 1024 bits per retained
 /// value, which covers fact-table key domains without allowing sparse endpoint
 /// ranges to dictate allocation size. Domains beyond the exact-value budget
 /// retain min/max only.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct JoinRuntimeFilterPolicy {
     max_exact_values: usize,
+    max_range_value_bytes: usize,
     membership: FixedMembershipBuildPolicy,
+    freeze_additional_bytes: usize,
 }
 
 const MIN_EXACT_PENDING_VALUES: usize = VECTOR_SIZE;
@@ -40,8 +43,42 @@ const MIN_EXACT_PENDING_VALUES: usize = VECTOR_SIZE;
 impl Default for JoinRuntimeFilterPolicy {
     fn default() -> Self {
         Self {
-            max_exact_values: 512 * 1024,
-            membership: FixedMembershipBuildPolicy::new(64 * 1024 * 1024, 256),
+            max_exact_values: RuntimeFilterResourceContract::MAX_EXACT_VALUES as usize,
+            max_range_value_bytes: RuntimeFilterResourceContract::MAX_RANGE_VALUE_BYTES as usize,
+            // Analytical filters trade bounded, cache-resident lookup space
+            // for one O(1) probe per source row. A 1024:1 span/value ratio is
+            // still capped by the absolute domain ceiling, while avoiding
+            // millions of binary searches for small dimension domains whose
+            // surrogate keys contain gaps.
+            membership: FixedMembershipBuildPolicy::new(
+                RuntimeFilterResourceContract::MAX_DENSE_BITS as usize,
+                RuntimeFilterResourceContract::MAX_DENSE_BITS_PER_VALUE as usize,
+            ),
+            freeze_additional_bytes: 0,
+        }
+    }
+}
+
+impl JoinRuntimeFilterPolicy {
+    fn from_contract(
+        contract: &RuntimeFilterResourceContract,
+        representation: RuntimeFilterKeyRepresentation,
+    ) -> Self {
+        let value_width = representation.value_width();
+        let max_exact_values = contract.max_exact_values_per_builder as usize;
+        let transfer = max_exact_values.saturating_mul(value_width);
+        let frozen = (contract.max_dense_bits as usize)
+            .div_ceil(u64::BITS as usize)
+            .saturating_mul(std::mem::size_of::<u64>())
+            .max(transfer);
+        Self {
+            max_exact_values,
+            max_range_value_bytes: contract.max_range_value_bytes as usize,
+            membership: FixedMembershipBuildPolicy::new(
+                contract.max_dense_bits as usize,
+                contract.max_dense_bits_per_value as usize,
+            ),
+            freeze_additional_bytes: transfer.saturating_add(frozen),
         }
     }
 }
@@ -262,6 +299,7 @@ where
     fn freeze_with(
         mut self,
         max_values: usize,
+        freeze_additional_bytes: usize,
         freeze: impl FnOnce(Vec<T>) -> FixedMembership,
     ) -> FrozenExactValues {
         let Self::Enabled {
@@ -282,19 +320,24 @@ where
                 _reservation: None,
             };
         }
-        let frozen = freeze(values.drain().collect());
-        if frozen.is_contiguous() {
-            return FrozenExactValues {
-                values: None,
-                _reservation: None,
-            };
-        }
-        let Ok(reservation) = memory.retain(frozen.allocation_size()) else {
+        // Acquire the complete conversion-overlap envelope before allocating
+        // the transfer vector or the frozen representation. The retained
+        // handle intentionally keeps the upper envelope for the filter's
+        // lifetime; no allocation can occur before admission accounting.
+        let Ok(reservation) = memory.retain(freeze_additional_bytes) else {
             return FrozenExactValues {
                 values: None,
                 _reservation: None,
             };
         };
+        let frozen = freeze(values.drain().collect());
+        if frozen.is_contiguous() {
+            reservation.release();
+            return FrozenExactValues {
+                values: None,
+                _reservation: None,
+            };
+        }
         FrozenExactValues {
             values: Some(frozen),
             _reservation: Some(RuntimeFilterReservation(reservation)),
@@ -438,11 +481,11 @@ where
         FrozenExactDomain {
             min: self.min,
             max: self.max,
-            values: self
-                .values
-                .freeze_with(self.policy.max_exact_values, |values| {
-                    freeze(values, membership)
-                }),
+            values: self.values.freeze_with(
+                self.policy.max_exact_values,
+                self.policy.freeze_additional_bytes,
+                |values| freeze(values, membership),
+            ),
         }
     }
 }
@@ -457,20 +500,26 @@ struct FrozenExactDomain<T> {
 #[derive(Debug)]
 struct GenericDomain {
     comparable: bool,
+    max_value_bytes: usize,
     min: Option<Value>,
     max: Option<Value>,
 }
 
 impl GenericDomain {
-    fn new() -> Self {
+    fn new(max_value_bytes: usize) -> Self {
         Self {
-            comparable: true,
+            comparable: max_value_bytes > 0,
+            max_value_bytes,
             min: None,
             max: None,
         }
     }
 
     fn add_value(&mut self, value: Value) {
+        if !self.accepts(&value) {
+            self.disable();
+            return;
+        }
         Self::update_extreme(&mut self.min, &value, &mut self.comparable, true);
         if self.comparable {
             Self::update_extreme(&mut self.max, &value, &mut self.comparable, false);
@@ -478,6 +527,10 @@ impl GenericDomain {
     }
 
     fn add_string(&mut self, value: &str) {
+        if value.len() > self.max_value_bytes {
+            self.disable();
+            return;
+        }
         Self::update_string_extreme(&mut self.min, value, &mut self.comparable, true);
         if self.comparable {
             Self::update_string_extreme(&mut self.max, value, &mut self.comparable, false);
@@ -485,8 +538,8 @@ impl GenericDomain {
     }
 
     fn merge(&mut self, incoming: Self) {
-        if !incoming.comparable {
-            self.comparable = false;
+        if self.max_value_bytes != incoming.max_value_bytes || !incoming.comparable {
+            self.disable();
         }
         if !self.comparable {
             return;
@@ -497,6 +550,21 @@ impl GenericDomain {
         if let Some(value) = incoming.max {
             Self::update_extreme(&mut self.max, &value, &mut self.comparable, false);
         }
+    }
+
+    fn accepts(&self, value: &Value) -> bool {
+        match value {
+            Value::Varchar(value) => value.len() <= self.max_value_bytes,
+            Value::Blob(value) => value.len() <= self.max_value_bytes,
+            Value::List(_, _) | Value::Struct(_, _) | Value::Array(_, _, _) => false,
+            _ => self.max_value_bytes > 0,
+        }
+    }
+
+    fn disable(&mut self) {
+        self.comparable = false;
+        self.min = None;
+        self.max = None;
     }
 
     fn update_extreme(
@@ -558,20 +626,25 @@ enum RuntimeFilterDomainBuilder {
 
 impl RuntimeFilterDomainBuilder {
     fn for_type(
-        logical_type: &LogicalType,
+        _logical_type: &LogicalType,
+        representation: RuntimeFilterKeyRepresentation,
         policy: JoinRuntimeFilterPolicy,
         memory: MemoryAccountingContext,
     ) -> Self {
-        match logical_type {
-            LogicalType::Integer | LogicalType::Date => {
+        match representation {
+            RuntimeFilterKeyRepresentation::ExactI32 => {
                 Self::I32(ExactDomainBuilder::new(policy, memory))
             }
-            LogicalType::BigInt
-            | LogicalType::Decimal {
-                precision: 0..=18, ..
-            } => Self::I64(ExactDomainBuilder::new(policy, memory)),
-            LogicalType::Decimal { .. } => Self::I128(ExactDomainBuilder::new(policy, memory)),
-            _ => Self::Generic(GenericDomain::new()),
+            RuntimeFilterKeyRepresentation::ExactI64 => {
+                Self::I64(ExactDomainBuilder::new(policy, memory))
+            }
+            RuntimeFilterKeyRepresentation::ExactI128 => {
+                Self::I128(ExactDomainBuilder::new(policy, memory))
+            }
+            RuntimeFilterKeyRepresentation::Range => {
+                Self::Generic(GenericDomain::new(policy.max_range_value_bytes))
+            }
+            RuntimeFilterKeyRepresentation::Disabled => Self::Generic(GenericDomain::new(0)),
         }
     }
 
@@ -606,9 +679,11 @@ pub struct JoinRuntimeFilterBuilder {
 
 impl JoinRuntimeFilterBuilder {
     pub fn empty(key_types: &[LogicalType]) -> Self {
+        let contract = RuntimeFilterResourceContract::for_keys(key_types, 1)
+            .expect("runtime-filter test contract must be valid");
         Self::empty_with_policy(
             key_types,
-            JoinRuntimeFilterPolicy::default(),
+            &contract,
             MemoryAccountingContext::detached(
                 MemoryTag::HashTable,
                 MemoryAccountingClass::Metadata,
@@ -618,22 +693,31 @@ impl JoinRuntimeFilterBuilder {
 
     pub(crate) fn empty_with_memory(
         key_types: &[LogicalType],
+        contract: &RuntimeFilterResourceContract,
         memory: MemoryAccountingContext,
     ) -> Self {
-        Self::empty_with_policy(key_types, JoinRuntimeFilterPolicy::default(), memory)
+        Self::empty_with_policy(key_types, contract, memory)
     }
 
     fn empty_with_policy(
         key_types: &[LogicalType],
-        policy: JoinRuntimeFilterPolicy,
+        contract: &RuntimeFilterResourceContract,
         memory: MemoryAccountingContext,
     ) -> Self {
+        debug_assert!(contract.validate(key_types.len()).is_ok());
         Self {
             keys: key_types
                 .iter()
                 .cloned()
-                .map(|logical_type| {
-                    JoinRuntimeFilterKeyBuilder::new(logical_type, policy, memory.clone())
+                .zip(contract.keys.iter().copied())
+                .map(|(logical_type, representation)| {
+                    let policy = JoinRuntimeFilterPolicy::from_contract(contract, representation);
+                    JoinRuntimeFilterKeyBuilder::new(
+                        logical_type,
+                        representation,
+                        policy,
+                        memory.clone(),
+                    )
                 })
                 .collect::<Vec<_>>()
                 .into_boxed_slice(),
@@ -645,12 +729,13 @@ impl JoinRuntimeFilterBuilder {
         key_types: &[LogicalType],
         max_exact_values: usize,
     ) -> Self {
+        let mut contract = RuntimeFilterResourceContract::for_keys(key_types, 1)
+            .expect("runtime-filter test contract must be valid");
+        contract.max_exact_values = u32::try_from(max_exact_values).unwrap_or(u32::MAX);
+        contract.max_exact_values_per_builder = contract.max_exact_values;
         Self::empty_with_policy(
             key_types,
-            JoinRuntimeFilterPolicy {
-                max_exact_values,
-                ..JoinRuntimeFilterPolicy::default()
-            },
+            &contract,
             MemoryAccountingContext::detached(
                 MemoryTag::HashTable,
                 MemoryAccountingClass::Metadata,
@@ -723,11 +808,17 @@ struct JoinRuntimeFilterKeyBuilder {
 impl JoinRuntimeFilterKeyBuilder {
     fn new(
         logical_type: LogicalType,
+        representation: RuntimeFilterKeyRepresentation,
         policy: JoinRuntimeFilterPolicy,
         memory: MemoryAccountingContext,
     ) -> Self {
         Self {
-            domain: RuntimeFilterDomainBuilder::for_type(&logical_type, policy, memory),
+            domain: RuntimeFilterDomainBuilder::for_type(
+                &logical_type,
+                representation,
+                policy,
+                memory,
+            ),
             logical_type,
             non_null_count: 0,
         }
@@ -1027,7 +1118,9 @@ fn required<T>(value: Option<T>) -> Result<T> {
 mod tests {
     use super::*;
     use crate::memory_runtime::QueryMemoryPool;
-    use paro_common::test_utils::{test_allocator, test_i64_vector_with_allocator};
+    use paro_common::test_utils::{
+        test_allocator, test_i64_vector_with_allocator, test_string_vector_with_allocator,
+    };
 
     #[test]
     fn typed_exact_domain_freezes_in_order() {
@@ -1064,6 +1157,20 @@ mod tests {
                 value: Value::BigInt(42),
             }))
         );
+    }
+
+    #[test]
+    fn oversized_string_range_degrades_to_no_filter_within_its_contract() {
+        let allocator = test_allocator();
+        let oversized =
+            "x".repeat(RuntimeFilterResourceContract::MAX_RANGE_VALUE_BYTES as usize + 1);
+        let vector = test_string_vector_with_allocator(&[&oversized], allocator.clone());
+        let keys = Chunk::from_arc_vectors(vec![std::sync::Arc::new(vector)], allocator.clone());
+        let selection = SelectionVector::try_incremental(1, allocator).unwrap();
+        let mut builder = JoinRuntimeFilterBuilder::empty(&[LogicalType::Varchar]);
+        builder.add_key_chunk(&keys, &selection, 1).unwrap();
+
+        assert_eq!(builder.freeze().predicate_for_column(0, 9), None);
     }
 
     #[test]
@@ -1244,8 +1351,9 @@ mod tests {
             MemoryTag::HashTable,
             MemoryAccountingClass::Metadata,
         );
+        let contract = RuntimeFilterResourceContract::for_keys(&[LogicalType::Integer], 1).unwrap();
         let mut sketch =
-            JoinRuntimeFilterBuilder::empty_with_memory(&[LogicalType::Integer], memory);
+            JoinRuntimeFilterBuilder::empty_with_memory(&[LogicalType::Integer], &contract, memory);
         sketch
             .add_key_chunk(&keys, &selection, values.len())
             .unwrap();

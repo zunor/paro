@@ -164,6 +164,15 @@ impl JoinBuildHandle {
         memory: MemoryAccountingContext,
     ) -> Result<Arc<JoinHashTable>> {
         let build_output_count = build_types.len();
+        let runtime_filter = runtime_filter_enabled
+            .then(|| {
+                let key_types = conditions
+                    .iter()
+                    .map(|condition| condition.right.return_type())
+                    .collect::<Vec<_>>();
+                paro_optimizer::physical::RuntimeFilterResourceContract::for_keys(&key_types, 1)
+            })
+            .transpose()?;
         self.initialize_table_with_output_count(
             buffer_pool,
             allocator,
@@ -172,7 +181,7 @@ impl JoinBuildHandle {
             build_output_count,
             join_type,
             false,
-            runtime_filter_enabled,
+            runtime_filter.as_ref(),
             memory,
         )
     }
@@ -186,16 +195,17 @@ impl JoinBuildHandle {
         build_output_count: usize,
         join_type: JoinType,
         build_keys_unique: bool,
-        runtime_filter_enabled: bool,
+        runtime_filter: Option<&paro_optimizer::physical::RuntimeFilterResourceContract>,
         memory: MemoryAccountingContext,
     ) -> Result<Arc<JoinHashTable>> {
-        if runtime_filter_enabled {
+        if let Some(runtime_filter) = runtime_filter {
             let runtime_filter_key_types = conditions
                 .iter()
                 .map(|condition| condition.right.return_type())
                 .collect::<Vec<_>>();
             self.initialize_runtime_filter_builder(
                 &runtime_filter_key_types,
+                runtime_filter,
                 memory.with_class(MemoryAccountingClass::Metadata),
             );
         }
@@ -271,12 +281,13 @@ impl JoinBuildHandle {
     pub fn initialize_runtime_filter_builder(
         &self,
         key_types: &[LogicalType],
+        contract: &paro_optimizer::physical::RuntimeFilterResourceContract,
         memory: MemoryAccountingContext,
     ) {
         let mut builder = self.runtime_filter_builder.lock();
         if builder.is_none() {
             *builder = Some(JoinRuntimeFilterBuilder::empty_with_memory(
-                key_types, memory,
+                key_types, contract, memory,
             ));
         }
     }

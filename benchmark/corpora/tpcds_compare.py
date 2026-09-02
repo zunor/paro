@@ -1,29 +1,49 @@
 #!/usr/bin/env python3
-"""Validate and compare Paro and DuckDB on one TPC-DS query at a time."""
+"""Run one typed, process-owned Paro/DuckDB TPC-DS comparison at a time."""
 
 from __future__ import annotations
 
 import argparse
-import hashlib
 import json
 import statistics
 import time
-from collections import Counter
 from pathlib import Path
 from typing import Any, Callable
 
-import duckdb
 import _duckdb
+import duckdb
 import psycopg
 from psycopg import sql
 
-from tpcds import content_digest, corpus_digest, normalize_rows, preview, repository_revision
+from benchmark_evidence import (
+    ManagedParoServer,
+    content_digest,
+    paired_order_balanced_ratio,
+    repository_identity,
+    tree_digest,
+)
+from tpcds_result_contract import (
+    ColumnContract,
+    assert_compatible_schema,
+    assert_peer_order,
+    assert_same_multiset,
+    canonicalize_rows,
+    duckdb_schema,
+    multiset_digest,
+    paro_schema,
+    parse_order_contract,
+)
 
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--dsn", default="host=127.0.0.1 port=6432 dbname=postgres user=paro")
+    parser.add_argument("--server-binary", type=Path, required=True)
+    parser.add_argument("--server-data-dir", type=Path, required=True)
+    parser.add_argument("--listen", default="127.0.0.1:6432")
+    parser.add_argument("--database", default="postgres")
+    parser.add_argument("--user", default="paro")
     parser.add_argument("--duckdb-database", type=Path, required=True)
+    parser.add_argument("--dataset-source-dir", type=Path, required=True)
     parser.add_argument("--query-dir", type=Path, required=True)
     parser.add_argument("--report", type=Path, required=True)
     parser.add_argument("--start", type=int, default=1)
@@ -33,7 +53,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--statement-timeout-seconds", type=int, default=300)
     parser.add_argument("--threads", type=int, default=4)
     parser.add_argument("--memory-limit", default="2GB")
-    parser.add_argument("--server-binary", type=Path)
+    parser.add_argument(
+        "--paro-result-format", choices=("binary", "text"), default="binary"
+    )
     return parser.parse_args()
 
 
@@ -52,11 +74,13 @@ def extension_digest(module: Any) -> dict[str, str | None]:
     }
 
 
-def timed_fetch(execute: Callable[[], list[tuple[Any, ...]]]) -> tuple[list[tuple[Any, ...]], float]:
+def timed_fetch(
+    execute: Callable[[], tuple[list[tuple[Any, ...]], tuple[ColumnContract, ...]]]
+) -> tuple[list[tuple[Any, ...]], tuple[ColumnContract, ...], float]:
     started = time.perf_counter_ns()
-    rows = execute()
+    rows, schema = execute()
     elapsed_ms = (time.perf_counter_ns() - started) / 1_000_000
-    return rows, elapsed_ms
+    return rows, schema, elapsed_ms
 
 
 def percentile(samples: list[float], fraction: float) -> float:
@@ -74,18 +98,11 @@ def timing_summary(samples: list[float]) -> dict[str, Any]:
     }
 
 
-def duckdb_rows_as_expected(rows: list[tuple[Any, ...]]) -> list[list[str]]:
-    return [["NULL" if value is None else str(value) for value in row] for row in rows]
-
-
-def result_digest(rows: Counter[tuple[Any, ...]]) -> str:
-    digest = hashlib.sha256()
-    for row, count in sorted(rows.items(), key=lambda item: repr(item[0])):
-        digest.update(repr(row).encode("utf-8"))
-        digest.update(b"\0")
-        digest.update(str(count).encode("ascii"))
-        digest.update(b"\n")
-    return digest.hexdigest()
+def schema_report(schema: tuple[ColumnContract, ...]) -> list[dict[str, str]]:
+    return [
+        {"name": column.name, "family": column.family, "engine_type": column.engine_type}
+        for column in schema
+    ]
 
 
 def main() -> int:
@@ -95,16 +112,38 @@ def main() -> int:
     if args.warmups < 0 or args.iterations < 1:
         raise SystemExit("warmups must be non-negative and iterations must be positive")
 
+    repo_root = Path(__file__).resolve().parents[2]
+    harness_files = [
+        Path(__file__).resolve(),
+        Path(__file__).with_name("benchmark_evidence.py").resolve(),
+        Path(__file__).with_name("tpcds_result_contract.py").resolve(),
+    ]
+    server = ManagedParoServer(
+        args.server_binary,
+        args.server_data_dir,
+        args.listen,
+        args.report.with_suffix(".parod.log"),
+    )
     report: dict[str, Any] = {
-        "schema_version": 1,
+        "schema_version": 2,
         "corpus": "TPC-DS",
         "scale_factor": 1,
         "query_range": [args.start, args.end],
-        "source": repository_revision(),
-        "query_corpus_sha256": corpus_digest(args.query_dir, ".sql"),
-        "duckdb_database": {
-            "path": str(args.duckdb_database.resolve()),
-            "sha256": content_digest(args.duckdb_database),
+        "source": repository_identity(repo_root),
+        "query_corpus_sha256": tree_digest(args.query_dir, (".sql",)),
+        "dataset": {
+            "source_path": str(args.dataset_source_dir.resolve()),
+            "source_sha256": tree_digest(args.dataset_source_dir),
+            "paro_data_path": str(args.server_data_dir.resolve()),
+            "paro_data_sha256_before_run": tree_digest(args.server_data_dir),
+            "duckdb_path": str(args.duckdb_database.resolve()),
+            "duckdb_sha256": content_digest(args.duckdb_database),
+        },
+        "harness": {
+            "files": [
+                {"path": str(path), "sha256": content_digest(path)}
+                for path in harness_files
+            ]
         },
         "configuration": {
             "threads": args.threads,
@@ -113,8 +152,15 @@ def main() -> int:
             "warmups": args.warmups,
             "iterations": args.iterations,
             "optimizer_verify": True,
-            "timing_scope": "execute_and_fetch_all_rows",
+            "timing_scope": "execute_fetch_and_result_metadata",
+            "validation_scope": "outside_timed_region_every_sample",
             "measurement_order": "alternating_by_query_and_iteration",
+            "paro_result_format": args.paro_result_format,
+        },
+        "validation": {
+            "rows": "typed_full_multiset_digest_every_sample",
+            "ordering": "explicit_result_keys_with_peer_group_semantics",
+            "schema": "metadata_name_arity_and_logical_family",
         },
         "duckdb": {
             "version": duckdb.__version__,
@@ -122,120 +168,153 @@ def main() -> int:
         },
         "queries": [],
     }
-    if args.server_binary is not None:
-        report["server_binary"] = {
-            "path": str(args.server_binary.resolve()),
-            "sha256": content_digest(args.server_binary),
-        }
 
     failures = 0
-    paro = psycopg.connect(args.dsn, autocommit=True)
-    duck = duckdb.connect(str(args.duckdb_database), read_only=True)
-    try:
-        with paro.cursor() as cursor:
-            cursor.execute("SET optimizer_verify = true")
-            cursor.execute(sql.SQL("SET threads = {}").format(sql.Literal(args.threads)))
-            cursor.execute(sql.SQL("SET memory_limit = {}").format(sql.Literal(args.memory_limit)))
-            cursor.execute(
-                sql.SQL("SET statement_timeout = {}").format(
-                    sql.Literal(args.statement_timeout_seconds * 1000)
-                )
-            )
-        duck.execute(f"SET threads={args.threads}")
-        duck.execute("SET memory_limit=?", [args.memory_limit])
-
-        def run_paro(query: str) -> list[tuple[Any, ...]]:
+    with server:
+        report["paro_server"] = server.identity()
+        host, port = args.listen.rsplit(":", 1)
+        dsn = f"host={host} port={port} dbname={args.database} user={args.user}"
+        paro = psycopg.connect(dsn, autocommit=True)
+        duck = duckdb.connect(str(args.duckdb_database), read_only=True)
+        try:
             with paro.cursor() as cursor:
-                cursor.execute(query)
-                return cursor.fetchall()
-
-        def run_duckdb(query: str) -> list[tuple[Any, ...]]:
-            return duck.execute(query).fetchall()
-
-        for query_number in range(args.start, args.end + 1):
-            query_id = f"{query_number:02d}"
-            query = (args.query_dir / f"{query_id}.sql").read_text(encoding="utf-8")
-            result: dict[str, Any] = {"query": query_id}
-            try:
-                paro_rows = run_paro(query)
-                duckdb_rows = run_duckdb(query)
-                if any(len(row) != len(paro_rows[0]) for row in paro_rows[1:]):
-                    raise AssertionError("Paro returned inconsistent row widths")
-                duckdb_width = len(duckdb_rows[0]) if duckdb_rows else 0
-                paro_width = len(paro_rows[0]) if paro_rows else duckdb_width
-                if duckdb_rows and any(len(row) != duckdb_width for row in duckdb_rows):
-                    raise AssertionError("DuckDB returned inconsistent row widths")
-                if paro_width != duckdb_width and paro_rows and duckdb_rows:
-                    raise AssertionError(
-                        f"schema width mismatch: Paro={paro_width}, DuckDB={duckdb_width}"
-                    )
-                actual, expected = normalize_rows(
-                    paro_rows, duckdb_rows_as_expected(duckdb_rows), paro_width
+                cursor.execute("SET optimizer_verify = true")
+                cursor.execute(sql.SQL("SET threads = {}").format(sql.Literal(args.threads)))
+                cursor.execute(
+                    sql.SQL("SET memory_limit = {}").format(sql.Literal(args.memory_limit))
                 )
-                missing = expected - actual
-                unexpected = actual - expected
-                if missing or unexpected:
-                    result["missing"] = preview(missing)
-                    result["unexpected"] = preview(unexpected)
-                    raise AssertionError(
-                        f"row multiset mismatch: missing={sum(missing.values())}, "
-                        f"unexpected={sum(unexpected.values())}"
+                cursor.execute(
+                    sql.SQL("SET statement_timeout = {}").format(
+                        sql.Literal(args.statement_timeout_seconds * 1000)
                     )
+                )
+            duck.execute(f"SET threads={args.threads}")
+            duck.execute("SET memory_limit=?", [args.memory_limit])
+            # Align omitted NULLS clauses with Paro/PostgreSQL before deriving
+            # one shared peer-order contract from the query text.
+            duck.execute("SET default_null_order='NULLS_LAST_ON_ASC_FIRST_ON_DESC'")
 
-                for _ in range(args.warmups):
-                    run_paro(query)
-                    run_duckdb(query)
+            def run_paro(query: str) -> tuple[list[tuple[Any, ...]], tuple[ColumnContract, ...]]:
+                with paro.cursor(binary=args.paro_result_format == "binary") as cursor:
+                    cursor.execute(query)
+                    schema = paro_schema(cursor.description or ())
+                    return cursor.fetchall(), schema
 
-                samples: dict[str, list[float]] = {"paro": [], "duckdb": []}
-                runners = {"paro": run_paro, "duckdb": run_duckdb}
-                for iteration in range(args.iterations):
-                    order = ["paro", "duckdb"]
-                    if (query_number + iteration) % 2:
-                        order.reverse()
-                    for engine in order:
-                        measured_rows, elapsed_ms = timed_fetch(
-                            lambda engine=engine: runners[engine](query)
-                        )
-                        if len(measured_rows) != len(paro_rows):
+            def run_duckdb(query: str) -> tuple[list[tuple[Any, ...]], tuple[ColumnContract, ...]]:
+                result = duck.execute(query)
+                schema = duckdb_schema(result.description or ())
+                return result.fetchall(), schema
+
+            for query_number in range(args.start, args.end + 1):
+                query_id = f"{query_number:02d}"
+                query = (args.query_dir / f"{query_id}.sql").read_text(encoding="utf-8")
+                result: dict[str, Any] = {"query": query_id}
+                try:
+                    duck_rows, duck_schema = run_duckdb(query)
+                    paro_rows, actual_schema = run_paro(query)
+                    assert_compatible_schema(actual_schema, duck_schema)
+                    expected = canonicalize_rows(duck_rows, duck_schema)
+                    actual = canonicalize_rows(paro_rows, actual_schema)
+                    assert_same_multiset(actual, expected)
+                    order_keys = parse_order_contract(query, duck_schema)
+                    expected_order = assert_peer_order(expected, order_keys)
+                    actual_order = assert_peer_order(actual, order_keys)
+                    if actual_order != expected_order:
+                        raise AssertionError("ordered key sequence differs across engines")
+                    oracle_digest = multiset_digest(expected)
+
+                    def validate_sample(
+                        engine: str,
+                        rows: list[tuple[Any, ...]],
+                        sample_schema: tuple[ColumnContract, ...],
+                    ) -> tuple[str, str | None]:
+                        assert_compatible_schema(sample_schema, duck_schema)
+                        normalized = canonicalize_rows(rows, sample_schema)
+                        digest = multiset_digest(normalized)
+                        if digest != oracle_digest:
                             raise AssertionError(
-                                f"{engine} row count changed during measurement"
+                                f"{engine} sample digest differs from the verified oracle"
                             )
-                        samples[engine].append(elapsed_ms)
+                        order_digest = assert_peer_order(normalized, order_keys)
+                        if order_digest != expected_order:
+                            raise AssertionError(
+                                f"{engine} sample ordered-key sequence differs from the oracle"
+                            )
+                        return digest, order_digest
 
-                paro_timing = timing_summary(samples["paro"])
-                duckdb_timing = timing_summary(samples["duckdb"])
-                ratio = paro_timing["median_ms"] / duckdb_timing["median_ms"]
-                result.update(
-                    status="passed",
-                    rows=len(paro_rows),
-                    result_sha256=result_digest(actual),
-                    paro=paro_timing,
-                    duckdb=duckdb_timing,
-                    paro_over_duckdb=round(ratio, 6),
-                    faster_than_duckdb=ratio < 1,
+                    for _ in range(args.warmups):
+                        validate_sample("paro warmup", *run_paro(query))
+                        validate_sample("duckdb warmup", *run_duckdb(query))
+
+                    samples: dict[str, list[float]] = {"paro": [], "duckdb": []}
+                    sample_digests: dict[str, list[str]] = {"paro": [], "duckdb": []}
+                    paro_ran_first: list[bool] = []
+                    runners = {"paro": run_paro, "duckdb": run_duckdb}
+                    for iteration in range(args.iterations):
+                        order = ["paro", "duckdb"]
+                        if (query_number + iteration) % 2:
+                            order.reverse()
+                        paro_ran_first.append(order[0] == "paro")
+                        for engine in order:
+                            rows, sample_schema, elapsed_ms = timed_fetch(
+                                lambda engine=engine: runners[engine](query)
+                            )
+                            digest, _ = validate_sample(engine, rows, sample_schema)
+                            samples[engine].append(elapsed_ms)
+                            sample_digests[engine].append(digest)
+
+                    paro_timing = timing_summary(samples["paro"])
+                    duckdb_timing = timing_summary(samples["duckdb"])
+                    crossover = paired_order_balanced_ratio(
+                        samples["paro"], samples["duckdb"], paro_ran_first
+                    )
+                    ratio = crossover["ratio"]
+                    confidence_high = crossover["paired_confidence_interval_95"][1]
+                    result.update(
+                        status="passed",
+                        rows=len(paro_rows),
+                        schema={
+                            "paro": schema_report(actual_schema),
+                            "duckdb": schema_report(duck_schema),
+                        },
+                        order_keys=[key.__dict__ for key in order_keys],
+                        oracle_result_sha256=oracle_digest,
+                        oracle_order_key_sha256=expected_order,
+                        measured_sample_result_sha256=sample_digests,
+                        verified_measured_samples={
+                            "paro": len(sample_digests["paro"]),
+                            "duckdb": len(sample_digests["duckdb"]),
+                        },
+                        paro=paro_timing,
+                        duckdb=duckdb_timing,
+                        crossover=crossover,
+                        paro_over_duckdb=round(ratio, 6),
+                        faster_than_duckdb=confidence_high < 1,
+                    )
+                except Exception as error:
+                    failures += 1
+                    result.update(status="failed", error=f"{type(error).__name__}: {error}")
+                report["queries"].append(result)
+                report["passed"] = len(report["queries"]) - failures
+                report["failed"] = failures
+                report["faster_than_duckdb"] = sum(
+                    item.get("faster_than_duckdb", False) for item in report["queries"]
                 )
-            except Exception as error:
-                failures += 1
-                result.update(status="failed", error=f"{type(error).__name__}: {error}")
-            report["queries"].append(result)
-            report["passed"] = len(report["queries"]) - failures
-            report["failed"] = failures
-            report["faster_than_duckdb"] = sum(
-                query.get("faster_than_duckdb", False) for query in report["queries"]
-            )
-            write_report(args.report, report)
-            if result["status"] == "passed":
-                print(
-                    f"TPC-DS {query_id}: Paro {result['paro']['median_ms']:.3f} ms, "
-                    f"DuckDB {result['duckdb']['median_ms']:.3f} ms, "
-                    f"ratio {result['paro_over_duckdb']:.3f}",
-                    flush=True,
-                )
-            else:
-                print(f"TPC-DS {query_id}: failed: {result['error']}", flush=True)
-    finally:
-        duck.close()
-        paro.close()
+                write_report(args.report, report)
+                if result["status"] == "passed":
+                    confidence = result["crossover"]["paired_confidence_interval_95"]
+                    print(
+                        f"TPC-DS {query_id}: Paro {result['paro']['median_ms']:.3f} ms, "
+                        f"DuckDB {result['duckdb']['median_ms']:.3f} ms, "
+                        f"ratio {result['paro_over_duckdb']:.3f}, "
+                        f"95% CI [{confidence[0]:.3f}, {confidence[1]:.3f}]",
+                        flush=True,
+                    )
+                else:
+                    print(f"TPC-DS {query_id}: failed: {result['error']}", flush=True)
+        finally:
+            duck.close()
+            paro.close()
 
     return 1 if failures else 0
 

@@ -212,7 +212,7 @@ fn grouping_set_spill_partitions_each_domain_by_its_own_keys() {
         let mut spill = AggregatePayloadSpillBuffer::new(
             query.session.buffer_pool().clone(),
             payload.types(),
-            aggregate_spill_radix_bits(1),
+            aggregate_spill_radix_bits(1, usize::MAX),
             table_memory.clone(),
         )
         .expect("payload spill");
@@ -430,7 +430,7 @@ fn mixed_spilled_payload_and_global_state_writes_bounded_output() {
     let mut payload_spill = AggregatePayloadSpillBuffer::new(
         query.session.buffer_pool().clone(),
         spilled_payload.types(),
-        aggregate_spill_radix_bits(1),
+        aggregate_spill_radix_bits(1, usize::MAX),
         table_memory,
     )
     .expect("payload spill");
@@ -559,7 +559,7 @@ fn mixed_spilled_payload_and_serialized_string_state_writes_bounded_output() {
     let mut payload_spill = AggregatePayloadSpillBuffer::new(
         query.session.buffer_pool().clone(),
         spilled_payload.types(),
-        aggregate_spill_radix_bits(1),
+        aggregate_spill_radix_bits(1, usize::MAX),
         table_memory,
     )
     .expect("payload spill");

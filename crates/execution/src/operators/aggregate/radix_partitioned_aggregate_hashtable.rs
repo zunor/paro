@@ -18,8 +18,11 @@ use paro_common::vector::{SelectionVector, Vector};
 
 use super::aggregate_object::AggregateObject;
 use super::grouped_aggregate_hashtable::{
-    GroupedAggregateHashTable, HTScanPosition, HashTableCapacityHint, SerializedSourceRows,
+    GroupedAggregateHashTable, HTScanPosition, HashTableCapacityHint, HashTableGrowthRequirement,
+    SerializedSourceRows,
 };
+
+use paro_common::memory::MemoryGrant;
 
 const MAX_RADIX_PARTITION_BITS: usize = 8;
 
@@ -39,6 +42,11 @@ pub struct AggregateHTScanPosition {
 pub enum AggregateHashTable {
     Flat(GroupedAggregateHashTable),
     Radix(RadixPartitionedAggregateHashTable),
+}
+
+#[derive(Debug)]
+pub(crate) struct AggregateHashTableGrowthPlan {
+    partition_rows: Box<[usize]>,
 }
 
 /// Concurrent ownership target for independently processed radix partitions.
@@ -167,6 +175,81 @@ impl ConcurrentRadixAggregateBuild {
 }
 
 impl AggregateHashTable {
+    pub(crate) fn growth_plan(
+        &mut self,
+        groups: &Chunk,
+    ) -> Result<(AggregateHashTableGrowthPlan, HashTableGrowthRequirement)> {
+        let partition_rows = match self {
+            Self::Flat(_) => vec![groups.size()],
+            Self::Radix(table) => {
+                let hashes = table.hash_groups(groups)?;
+                table.scratch.route_hashes(
+                    table.partition_bits,
+                    table.partition_mask,
+                    table.partitions.len(),
+                    &hashes,
+                    &hashes,
+                    groups.size(),
+                )?;
+                table.scratch.counts.clone()
+            }
+        };
+        let mut requirement = HashTableGrowthRequirement::default();
+        match self {
+            Self::Flat(table) => {
+                requirement = table.growth_requirement(partition_rows[0])?;
+            }
+            Self::Radix(table) => {
+                for (partition, rows) in table.partitions.iter().zip(partition_rows.iter()) {
+                    let current = partition.growth_requirement(*rows)?;
+                    requirement.persistent_bytes = requirement
+                        .persistent_bytes
+                        .checked_add(current.persistent_bytes)
+                        .ok_or_else(|| {
+                            paro_error::internal("radix aggregate persistent growth overflow")
+                        })?;
+                    requirement.overlap_bytes =
+                        requirement.overlap_bytes.max(current.overlap_bytes);
+                }
+            }
+        }
+        Ok((
+            AggregateHashTableGrowthPlan {
+                partition_rows: partition_rows.into_boxed_slice(),
+            },
+            requirement,
+        ))
+    }
+
+    pub(crate) fn prepare_growth(
+        &mut self,
+        plan: &AggregateHashTableGrowthPlan,
+        reservation: &MemoryGrant,
+    ) -> Result<()> {
+        match self {
+            Self::Flat(table) => {
+                let [rows] = plan.partition_rows.as_ref() else {
+                    return Err(paro_error::internal(
+                        "flat aggregate growth plan has the wrong partition count",
+                    ));
+                };
+                table.prepare_growth(*rows, reservation)
+            }
+            Self::Radix(table) => {
+                if plan.partition_rows.len() != table.partitions.len() {
+                    return Err(paro_error::internal(
+                        "radix aggregate growth plan has the wrong partition count",
+                    ));
+                }
+                for (partition, rows) in table.partitions.iter_mut().zip(plan.partition_rows.iter())
+                {
+                    partition.prepare_growth(*rows, reservation)?;
+                }
+                Ok(())
+            }
+        }
+    }
+
     /// Split a finalized table into independently scannable ownership units.
     pub fn into_scan_partitions(self) -> Vec<Self> {
         match self {

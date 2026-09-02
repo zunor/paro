@@ -4,6 +4,7 @@
 //! Planner payloads, implementation metadata, and transformation savepoints.
 
 use super::*;
+use paro_common::types::LogicalType;
 
 /// Persistent ownership scope for one logical subtree.
 ///
@@ -109,7 +110,6 @@ pub(super) struct PlannerTransformState {
     pub(super) verify_enabled: bool,
     pub(super) rowset_scan_pushdown: bool,
     pub(super) scan_access_cost: paro_storage::rowset::scan_cost::ScanAccessCostModel,
-    pub(super) max_concurrent_tasks: u16,
 }
 
 pub(super) struct PlannerTransformSavepoint {
@@ -255,7 +255,6 @@ pub(super) struct PlannerOperatorMetadata {
     pub(super) implementations: PlannerImplementationSet,
     pub(super) grant_dependency: GrantDependencyDescriptor,
     pub(super) spillable: bool,
-    pub(super) max_concurrent_tasks: u16,
     pub(super) cost_facts: PlannerCostFacts,
     pub(super) output_columns: Box<[ColumnId]>,
     pub(super) child_required: Box<[PropertySetId]>,
@@ -286,10 +285,15 @@ pub(super) struct PlannerSearchImplementationMetadata {
 pub(super) struct PlannerCostFacts {
     pub(super) child_row_widths: Box<[u64]>,
     pub(super) output_row_width: u64,
+    /// Bytes physically read from base-table column sources for each scan
+    /// row. `None` identifies a non-scan structural operator.
+    pub(super) scan_access_width: Option<u64>,
     pub(super) perfect_hash: Option<crate::physical::PerfectHashResourceContract>,
     pub(super) topn_capacity: Option<u64>,
     pub(super) runtime_filter_probe_multiplicity: RuntimeFilterProbeMultiplicity,
     pub(super) runtime_filter_probe_source_rows: Option<paro_planner::plan::CardinalityEstimate>,
+    pub(super) runtime_filter_probe_is_direct: bool,
+    pub(super) runtime_filter_key_types: Box<[LogicalType]>,
 }
 
 #[derive(Debug, Clone)]
@@ -300,10 +304,13 @@ pub(super) struct ResolvedPlannerCostFacts {
     pub(super) child_rows_hard_upper: Box<[Option<u64>]>,
     pub(super) child_row_widths: Box<[u64]>,
     pub(super) output_row_width: u64,
+    pub(super) scan_access_width: Option<u64>,
     pub(super) perfect_hash: Option<crate::physical::PerfectHashResourceContract>,
     pub(super) topn_capacity: Option<u64>,
     pub(super) runtime_filter_probe_multiplicity: RuntimeFilterProbeMultiplicity,
     pub(super) runtime_filter_probe_source_rows: Option<CompactRange>,
+    pub(super) runtime_filter_probe_is_direct: bool,
+    pub(super) runtime_filter_key_types: Box<[LogicalType]>,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]

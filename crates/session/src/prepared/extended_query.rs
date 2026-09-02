@@ -2420,7 +2420,7 @@ mod tests {
             .message()
             .contains("binary parameter format not supported"));
 
-        let err = execute_extended_query_message(
+        execute_extended_query_message(
             &mut session,
             ExtendedQueryMessage::Bind(BindMessage {
                 portal_name: Some("p2".to_string()),
@@ -2432,8 +2432,16 @@ mod tests {
             &mut responder,
         )
         .await
-        .unwrap_err();
-        assert!(err.message().contains("binary result format not supported"));
+        .unwrap();
+        assert_eq!(
+            session
+                .state
+                .get_portal("p2")
+                .expect("numeric binary portal")
+                .result_formats
+                .as_ref(),
+            [FormatCode::Binary]
+        );
     }
 
     #[tokio::test]

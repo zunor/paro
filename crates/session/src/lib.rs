@@ -37,7 +37,8 @@ pub use execution_control::{
 };
 pub use paro_context::StatementCancellation;
 pub use prepared::binary_codec::{
-    decode_binary_param, encode_binary_value, is_binary_recv_supported, is_binary_send_supported,
+    append_binary_value, decode_binary_param, encode_binary_value, is_binary_recv_supported,
+    is_binary_send_supported,
 };
 pub use prepared::extended_query::{
     BindMessage, CloseTarget, DescribeTarget, ExecutePortalMessage, ExtendedQueryMessage,

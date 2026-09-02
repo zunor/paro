@@ -9,7 +9,9 @@ use std::sync::Arc;
 use paro_common::allocator::{Allocator, ArenaAllocator, MemoryTag};
 use paro_common::chunk::Chunk;
 use paro_common::error::{self as paro_error, Result};
-use paro_common::memory::{AccountedVec, MemoryAccountingClass, MemoryAccountingContext};
+use paro_common::memory::{
+    AccountedVec, MemoryAccountingClass, MemoryAccountingContext, MemoryGrant,
+};
 use paro_common::runtime_value::Value;
 use paro_common::types::LogicalType;
 use paro_common::vector::{SelectionVector, Vector, VECTOR_SIZE};
@@ -43,6 +45,12 @@ const INLINE_KEY_MAX_BYTES: usize = 8;
 pub(crate) struct HashTableCapacityHint {
     pub expected_rows: usize,
     pub max_fixed_bytes: usize,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) struct HashTableGrowthRequirement {
+    pub persistent_bytes: usize,
+    pub overlap_bytes: usize,
 }
 
 impl HashTableCapacityHint {
@@ -1297,52 +1305,45 @@ impl GroupedAggregateHashTable {
         if new_capacity <= self.capacity {
             return Ok(());
         }
-
-        let mut new_entries = accounted_vec_for_context(
-            &self.memory.with_class(MemoryAccountingClass::Metadata),
-            MemoryTag::HashTable,
-            MemoryAccountingClass::Metadata,
-        )?;
-        new_entries.try_resize_with(new_capacity, AggregateHTEntry::empty)?;
-        let mut new_inline_keys = if self.inline_key_layout.is_some() {
-            let mut keys = accounted_vec_for_context(
-                &self.memory.with_class(MemoryAccountingClass::Metadata),
-                MemoryTag::HashTable,
-                MemoryAccountingClass::Metadata,
-            )?;
-            keys.try_resize_with(new_capacity, InlineKey::default)?;
-            Some(keys)
-        } else {
-            None
-        };
         if self.inline_key_layout.is_some() != self.inline_keys.is_some() {
             return Err(paro_error::internal(
                 "Aggregate inline-key layout and storage disagree",
             ));
         }
+
+        // The sink pre-reserves the allocator's old/new overlap before taking
+        // the table lock. Grow the owned representation in place, then rebuild
+        // the lookup index from the canonical tuple rows. Tuple rows remain
+        // the recovery source throughout the transition.
+        self.entries
+            .try_resize_with(new_capacity, AggregateHTEntry::empty)?;
+        if let Some(inline_keys) = self.inline_keys.as_mut() {
+            inline_keys.try_resize_with(new_capacity, InlineKey::default)?;
+        }
+        self.entries.fill(AggregateHTEntry::empty());
         let new_bitmask = new_capacity - 1;
-        for (old_slot, old_entry) in self.entries.iter().copied().enumerate() {
-            if !old_entry.is_occupied() {
-                continue;
-            }
-            let row_idx = old_entry.row_idx();
+        for row_idx in 0..self.count {
             let hash = self.layout.load_hash(self.row_ptr(row_idx));
+            let inline_key = self
+                .inline_key_layout
+                .as_ref()
+                .map(|layout| unsafe {
+                    layout.encode_serialized_row(&self.layout, self.row_ptr(row_idx))
+                })
+                .transpose()?;
             let mut slot = (hash as usize) & new_bitmask;
             loop {
-                if !new_entries[slot].is_occupied() {
-                    new_entries[slot] = AggregateHTEntry::from_hash_and_row(hash, row_idx)?;
-                    if let (Some(old_keys), Some(new_keys)) =
-                        (self.inline_keys.as_ref(), new_inline_keys.as_mut())
+                if !self.entries[slot].is_occupied() {
+                    self.entries[slot] = AggregateHTEntry::from_hash_and_row(hash, row_idx)?;
+                    if let (Some(inline_key), Some(keys)) = (inline_key, self.inline_keys.as_mut())
                     {
-                        new_keys[slot] = old_keys[old_slot];
+                        keys[slot] = inline_key;
                     }
                     break;
                 }
                 slot = (slot + 1) & new_bitmask;
             }
         }
-        self.entries = new_entries;
-        self.inline_keys = new_inline_keys;
         self.capacity = new_capacity;
         self.bitmask = new_bitmask;
         Ok(())
@@ -1540,8 +1541,99 @@ row_width {}/{} agg_state_offset {}/{}",
     }
 
     fn ensure_capacity_for(&mut self, incoming_rows: usize) -> Result<()> {
-        if incoming_rows == 0 {
+        let target_capacity = self.target_capacity_for(incoming_rows)?;
+        if target_capacity <= self.capacity {
             return Ok(());
+        }
+        self.resize(target_capacity)
+    }
+
+    /// Physical allocator overlap needed by the next lookup/row-storage
+    /// transition. The caller must retain this envelope before entering the
+    /// table owner lock; otherwise query-memory reclaim would recursively try
+    /// to acquire that same lock.
+    pub(crate) fn growth_requirement(
+        &self,
+        incoming_rows: usize,
+    ) -> Result<HashTableGrowthRequirement> {
+        let target_capacity = self.target_capacity_for(incoming_rows)?;
+        let (lookup_growth, lookup_overlap) = if target_capacity > self.capacity {
+            let entries_current = self
+                .entries
+                .capacity()
+                .saturating_mul(size_of::<AggregateHTEntry>());
+            let entries_target = target_capacity.saturating_mul(size_of::<AggregateHTEntry>());
+            let inline_current = self.inline_keys.as_ref().map_or(0, |keys| {
+                keys.capacity().saturating_mul(size_of::<InlineKey>())
+            });
+            let inline_target = self.inline_keys.as_ref().map_or(0, |_| {
+                target_capacity.saturating_mul(size_of::<InlineKey>())
+            });
+            (
+                entries_target
+                    .saturating_sub(entries_current)
+                    .saturating_add(inline_target.saturating_sub(inline_current)),
+                entries_current.max(inline_current),
+            )
+        } else {
+            (0, 0)
+        };
+        let target_rows = self.count.checked_add(incoming_rows).ok_or_else(|| {
+            paro_error::internal("aggregate row-storage transition count overflow")
+        })?;
+        let target_words = bytes_to_words(
+            target_rows
+                .checked_mul(self.layout.row_width)
+                .ok_or_else(|| paro_error::internal("aggregate row-storage transition overflow"))?,
+        )?;
+        let (row_growth, row_overlap) = if target_words > self.data.capacity() {
+            let current = self.data.capacity().saturating_mul(size_of::<u64>());
+            let target = target_words.saturating_mul(size_of::<u64>());
+            (target.saturating_sub(current), current)
+        } else {
+            (0, 0)
+        };
+        Ok(HashTableGrowthRequirement {
+            persistent_bytes: lookup_growth.saturating_add(row_growth),
+            overlap_bytes: lookup_overlap.max(row_overlap),
+        })
+    }
+
+    /// Move already-issued persistent capacity into the table's owned grants.
+    /// Subsequent physical allocation therefore cannot call query reclaim
+    /// while the owner lock is held. The unconsumed remainder is the transient
+    /// allocator-overlap envelope and stays live until the update completes.
+    pub(crate) fn prepare_growth(
+        &mut self,
+        incoming_rows: usize,
+        reservation: &MemoryGrant,
+    ) -> Result<()> {
+        let target_capacity = self.target_capacity_for(incoming_rows)?;
+        if target_capacity > self.capacity {
+            transfer_growth_capacity::<AggregateHTEntry>(
+                &self.entries,
+                target_capacity,
+                reservation,
+            )?;
+            if let Some(inline_keys) = self.inline_keys.as_ref() {
+                transfer_growth_capacity::<InlineKey>(inline_keys, target_capacity, reservation)?;
+            }
+        }
+        let target_rows = self
+            .count
+            .checked_add(incoming_rows)
+            .ok_or_else(|| paro_error::internal("aggregate prepared row-storage count overflow"))?;
+        let target_words = bytes_to_words(
+            target_rows
+                .checked_mul(self.layout.row_width)
+                .ok_or_else(|| paro_error::internal("aggregate prepared row-storage overflow"))?,
+        )?;
+        transfer_growth_capacity::<u64>(&self.data, target_words, reservation)
+    }
+
+    fn target_capacity_for(&self, incoming_rows: usize) -> Result<usize> {
+        if incoming_rows == 0 {
+            return Ok(self.capacity);
         }
         let target_count = self.count.checked_add(incoming_rows).ok_or_else(|| {
             paro_error::internal(format!(
@@ -1549,10 +1641,6 @@ row_width {}/{} agg_state_offset {}/{}",
                 self.count
             ))
         })?;
-        if target_count <= resize_threshold(self.capacity) {
-            return Ok(());
-        }
-
         let mut target_capacity = self.capacity;
         while target_count > resize_threshold(target_capacity) {
             target_capacity = target_capacity.checked_mul(2).ok_or_else(|| {
@@ -1562,7 +1650,7 @@ row_width {}/{} agg_state_offset {}/{}",
                 ))
             })?;
         }
-        self.resize(target_capacity)
+        Ok(target_capacity)
     }
 
     fn ensure_row_storage_capacity(&mut self, incoming_rows: usize) -> Result<()> {
@@ -1582,9 +1670,6 @@ row_width {}/{} agg_state_offset {}/{}",
             })?;
         let target_words = bytes_to_words(target_bytes)?;
         if target_words > self.data.capacity() {
-            if self.data.capacity() > self.data.len() {
-                self.data.shrink_to_fit_and_refund();
-            }
             let additional = target_words.saturating_sub(self.data.len());
             self.data.try_reserve(additional)?;
         }
@@ -1657,6 +1742,21 @@ row_width {}/{} agg_state_offset {}/{}",
         debug_assert_eq!(self.layout.row_width % size_of::<u64>(), 0);
         self.layout.row_width / size_of::<u64>()
     }
+}
+
+fn transfer_growth_capacity<T>(
+    target: &AccountedVec<T>,
+    target_capacity: usize,
+    reservation: &MemoryGrant,
+) -> Result<()> {
+    let current_bytes = target.capacity().saturating_mul(size_of::<T>());
+    let target_bytes = target_capacity.saturating_mul(size_of::<T>());
+    let delta = target_bytes.saturating_sub(current_bytes);
+    if delta == 0 {
+        return Ok(());
+    }
+    reservation.split(delta)?.merge_into(target.grant())?;
+    Ok(())
 }
 
 impl Drop for GroupedAggregateHashTable {

@@ -28,7 +28,7 @@ fn test_grant_classes() -> [ResourceGrantClass; 1] {
         id: super::super::ids::ResourceGrantClassId(0),
         hard_memory_bytes: u64::MAX,
         spill_policy: crate::physical::SpillPolicy::Allowed,
-        concurrency_class: 0,
+        max_parallel_tasks: 1,
     }]
 }
 
@@ -72,10 +72,13 @@ fn calibrated_tuple_work_distinguishes_narrow_and_wide_intermediates() {
         child_rows_hard_upper: vec![Some(1_000)].into_boxed_slice(),
         child_row_widths: vec![width].into_boxed_slice(),
         output_row_width: width,
+        scan_access_width: None,
         perfect_hash: None,
         topn_capacity: None,
         runtime_filter_probe_multiplicity: RuntimeFilterProbeMultiplicity::Unknown,
         runtime_filter_probe_source_rows: None,
+        runtime_filter_probe_is_direct: false,
+        runtime_filter_key_types: Box::new([]),
     };
     let calibrated_cost = |facts: &ResolvedPlannerCostFacts| {
         let mut work = LocalOperatorWork::default();
@@ -125,10 +128,13 @@ fn expression_cost_facts_read_current_group_cardinality() {
     let template = PlannerCostFacts {
         child_row_widths: vec![16].into_boxed_slice(),
         output_row_width: 16,
+        scan_access_width: None,
         perfect_hash: None,
         topn_capacity: None,
         runtime_filter_probe_multiplicity: RuntimeFilterProbeMultiplicity::Unknown,
         runtime_filter_probe_source_rows: None,
+        runtime_filter_probe_is_direct: false,
+        runtime_filter_key_types: Box::new([]),
     };
 
     let initial = expression_cost_facts(&memo, parent, &[child], &template).unwrap();
@@ -838,6 +844,55 @@ fn inner_join_probe_keeps_runtime_filter_consumer_lineage() {
         physical.node(lineage[0].0).kind,
         crate::physical::PhysicalNodeKind::RowsetScan(_)
     ));
+}
+
+#[test]
+fn nested_filters_do_not_independently_discount_the_same_rowset() {
+    let mut fact = test_base_get(0, 20_041, "fact_probe", 20_000);
+    fact.stats.estimated_cardinality = Some(CardinalityEstimate::exact(20_000));
+    let mut first_build = test_base_get(1, 20_042, "first_build", 20);
+    first_build.stats.estimated_cardinality = Some(CardinalityEstimate::exact(20));
+    let first_join = ComparisonJoin::new(
+        JoinType::Inner,
+        fact,
+        first_build,
+        vec![JoinCondition::equality(
+            Expression::Reference(ReferenceExpression::new(0, LogicalType::Integer)),
+            Expression::Reference(ReferenceExpression::new(0, LogicalType::Integer)),
+        )],
+    );
+    let mut probe = LogicalPlan::synthetic(LogicalOperator::Join(Join::Comparison(first_join)));
+    probe.stats.estimated_cardinality = Some(CardinalityEstimate::exact(200));
+    // The second build is selective at the 20,000-row source, but its lineage
+    // crosses the first join. Until one composite region jointly prices the
+    // ordered predicate stages, independently discounting the same fact-scan
+    // winner twice would invent work savings.
+    let mut second_build = test_base_get(2, 20_043, "second_build", 500);
+    second_build.stats.estimated_cardinality = Some(CardinalityEstimate::exact(500));
+    let second_join = ComparisonJoin::new(
+        JoinType::Inner,
+        probe,
+        second_build,
+        vec![JoinCondition::equality(
+            Expression::Reference(ReferenceExpression::new(0, LogicalType::Integer)),
+            Expression::Reference(ReferenceExpression::new(0, LogicalType::Integer)),
+        )],
+    );
+    let mut plan = LogicalPlan::synthetic(LogicalOperator::Join(Join::Comparison(second_join)));
+    plan.stats.estimated_cardinality = Some(CardinalityEstimate::exact(20));
+
+    let input = MemoBuilder::build(plan, BindContext::new(), SearchBudget::default())
+        .expect("build nested runtime-filter memo");
+    let optimized = input.optimize(&test_grant_classes()).expect("optimize");
+    let runtime_filters = optimized.variants[0]
+        .contracts
+        .values()
+        .filter(|contract| {
+            contract.implementation == PhysicalImplementationFlavor::HashJoinRuntimeFilter
+        })
+        .count();
+
+    assert_eq!(runtime_filters, 1);
 }
 
 #[test]

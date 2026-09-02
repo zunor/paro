@@ -73,6 +73,16 @@ use super::merge_finalize::prepare_parallel_radix_merge;
 
 const HASH_AGGREGATE_PREEMPTIVE_SPILL_CAP_PER_THREAD: usize =
     paro_storage::buffer::DEFAULT_BLOCK_ALLOC_SIZE * 4;
+const HASH_AGGREGATE_MIN_ADAPTIVE_BUILD_CAPACITY: usize = 8 * 1024 * 1024;
+
+#[inline]
+fn admitted_parallelism(query: &crate::runtime::context::QueryRuntimeContext) -> usize {
+    query
+        .session
+        .number_of_threads()
+        .max(1)
+        .min(query.memory.admission_controller().max_slots())
+}
 
 /// Sink operator that builds hash aggregate tables (one per grouping set).
 #[derive(Debug, Clone)]
@@ -148,7 +158,7 @@ impl HashAggregateBuildSinkExec {
                     &self.spec,
                     ctx.query.allocator(MemoryTag::HashTable),
                     query_hash_table_memory(ctx.query),
-                    ctx.query.session.number_of_threads(),
+                    admitted_parallelism(ctx.query),
                 )?
             },
         ));
@@ -202,7 +212,10 @@ impl HashAggregateBuildSinkExec {
                         group_types(&self.spec)?,
                         state_width,
                         state_encoding,
-                        aggregate_spill_radix_bits(ctx.query.session.number_of_threads()),
+                        aggregate_spill_radix_bits(
+                            admitted_parallelism(ctx.query),
+                            ctx.query.memory.capacity_bytes(),
+                        ),
                         query_hash_table_memory(ctx.query),
                     ),
                 ));
@@ -310,6 +323,63 @@ impl HashAggregateBuildSinkExec {
         let groups = local
             .group_key_encoder
             .encode_payload(payload, &local.group_refs)?;
+        let skip_regular_sink =
+            can_skip_regular_aggregate_sink(&self.spec, &local.aggregate_objects);
+        // Prepare a hash-table growth transition without holding the table
+        // owner lock. The reservation covers allocator old/new overlap; if it
+        // cannot be established, an adaptive implementation switches this
+        // and subsequent input to its admitted raw-payload spill path.
+        let (growth_plans, persistent_growth, growth_overlap) = if skip_regular_sink
+            || local.raw_payload_spill_enabled
+            || local.raw_payload_spill_requested.load(Ordering::Acquire)
+        {
+            (Vec::new(), 0usize, 0usize)
+        } else {
+            let mut tables = local.tables.lock();
+            if tables.len() != local.grouping_sets.len() {
+                return Err(paro_error::internal(
+                    "aggregate growth planning lost a grouping-set table",
+                ));
+            }
+            let mut plans = Vec::with_capacity(tables.len());
+            let mut persistent = 0usize;
+            let mut overlap = 0usize;
+            for (table, grouping_set) in tables.iter_mut().zip(local.grouping_sets.iter()) {
+                let table_groups =
+                    build_groups_chunk_for_set(groups, grouping_set, self.spec.grouping_key_count)?;
+                let (plan, requirement) = table.growth_plan(&table_groups)?;
+                persistent = persistent
+                    .checked_add(requirement.persistent_bytes)
+                    .ok_or_else(|| paro_error::internal("aggregate persistent growth overflow"))?;
+                overlap = overlap.max(requirement.overlap_bytes);
+                plans.push(plan);
+            }
+            (plans, persistent, overlap)
+        };
+        let growth_reservation_bytes = persistent_growth
+            .checked_add(growth_overlap)
+            .ok_or_else(|| paro_error::internal("aggregate transition reservation overflow"))?;
+        let growth_reservation = if growth_reservation_bytes == 0 {
+            None
+        } else {
+            match query_hash_table_memory(ctx.query)
+                .with_class(paro_common::memory::MemoryAccountingClass::Metadata)
+                .reserve_grant(growth_reservation_bytes)
+            {
+                Ok(reservation) => Some(reservation),
+                Err(_error)
+                    if self.spec.spill_policy != SpillExecutionPolicy::InMemory
+                        && hash_aggregate_payload_spill_supported(&self.spec)
+                        && query_has_temporary_directory(ctx.query) =>
+                {
+                    local
+                        .raw_payload_spill_requested
+                        .store(true, Ordering::Release);
+                    None
+                }
+                Err(error) => return Err(error.into()),
+            }
+        };
         if local.raw_payload_spill_enabled
             || local.raw_payload_spill_requested.load(Ordering::Acquire)
         {
@@ -329,7 +399,7 @@ impl HashAggregateBuildSinkExec {
                 &local.aggregate_objects,
                 payload,
                 groups,
-                ctx.query.session.number_of_threads(),
+                admitted_parallelism(ctx.query),
                 ctx.query.memory.capacity_bytes(),
                 &local.modifier_memory,
                 &mut local.distinct,
@@ -344,7 +414,7 @@ impl HashAggregateBuildSinkExec {
                 &mut local.ordered_collectors,
             )?;
         }
-        if can_skip_regular_aggregate_sink(&self.spec, &local.aggregate_objects) {
+        if skip_regular_sink {
             return Ok(SinkPoll::NeedMoreInput);
         }
         let tables_ref = Arc::clone(&local.tables);
@@ -363,6 +433,16 @@ impl HashAggregateBuildSinkExec {
             local.activate_raw_payload_spill_if_requested();
             return Ok(SinkPoll::NeedMoreInput);
         }
+        if let Some(reservation) = growth_reservation.as_ref() {
+            if growth_plans.len() != tables.len() {
+                return Err(paro_error::internal(
+                    "aggregate growth preparation lost a table plan",
+                ));
+            }
+            for (table, plan) in tables.iter_mut().zip(growth_plans.iter()) {
+                table.prepare_growth(plan, reservation)?;
+            }
+        }
         update_hash_aggregate_tables_with_scratch(
             &self.spec,
             &local.aggregate_objects,
@@ -374,6 +454,7 @@ impl HashAggregateBuildSinkExec {
             &mut local.addresses,
             &mut local.new_groups,
         )?;
+        drop(growth_reservation);
         Ok(SinkPoll::NeedMoreInput)
     }
 
@@ -624,7 +705,7 @@ fn ensure_grouping_domains(
             spec,
             query.allocator(MemoryTag::HashTable),
             query_hash_table_memory(query),
-            query.session.number_of_threads(),
+            admitted_parallelism(query),
         )?;
     }
     let grouping_sets = normalized_grouping_sets(spec)?;
@@ -765,7 +846,8 @@ fn hash_aggregate_preemptive_payload_spill_enabled(
         return false;
     }
     let threshold = HASH_AGGREGATE_PREEMPTIVE_SPILL_CAP_PER_THREAD
-        .saturating_mul(query.session.number_of_threads().max(1));
+        .saturating_mul(admitted_parallelism(query))
+        .max(HASH_AGGREGATE_MIN_ADAPTIVE_BUILD_CAPACITY);
     capacity <= threshold
 }
 
@@ -784,7 +866,7 @@ fn replay_spilled_states(
             spec,
             ctx.query.allocator(MemoryTag::HashTable),
             query_hash_table_memory(ctx.query),
-            ctx.query.session.number_of_threads(),
+            admitted_parallelism(ctx.query),
         )?;
     }
     let spilled_bytes = state
@@ -1157,7 +1239,7 @@ fn spill_payload_partitions_to_outputs(
             spec,
             ctx.query.allocator(MemoryTag::HashTable),
             query_hash_table_memory(ctx.query),
-            ctx.query.session.number_of_threads(),
+            admitted_parallelism(ctx.query),
         )?;
         for spilled_state in spilled_states {
             spilled_state.replay_partition_state_rows(
@@ -1272,7 +1354,10 @@ fn spill_in_memory_tables_to_state_partitions(
         group_types(spec)?,
         state_width,
         hash_aggregate_state_spill_encoding(aggregate_objects),
-        aggregate_spill_radix_bits(ctx.query.session.number_of_threads()),
+        aggregate_spill_radix_bits(
+            admitted_parallelism(ctx.query),
+            ctx.query.memory.capacity_bytes(),
+        ),
         query_hash_table_memory(ctx.query),
     )?;
     for table in tables.iter() {
@@ -1320,7 +1405,7 @@ fn replay_spilled_payloads_into_tables(
             spec,
             ctx.query.allocator(MemoryTag::HashTable),
             query_hash_table_memory(ctx.query),
-            ctx.query.session.number_of_threads(),
+            admitted_parallelism(ctx.query),
         )?;
         for spilled_payload in spilled_payloads {
             spilled_payload.replay_partition_payloads(

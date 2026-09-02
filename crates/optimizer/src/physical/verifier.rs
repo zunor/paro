@@ -139,7 +139,25 @@ impl PhysicalPlanVerifier {
                 ));
             }
             if let crate::physical::PhysicalNodeKind::HashJoin(spec) = &node.kind {
-                if let Some(runtime_filter) = spec.runtime_filter {
+                if let Some(runtime_filter) = &spec.runtime_filter {
+                    let equality_key_count = spec
+                        .key_conditions
+                        .iter()
+                        .filter(|condition| {
+                            condition.comparison
+                                == paro_planner::operator::join::JoinComparisonType::Equal
+                        })
+                        .count();
+                    runtime_filter.resource.validate(equality_key_count)?;
+                    if let Some(reservation) = plan.reservation {
+                        if runtime_filter.resource.max_local_builders
+                            != reservation.max_parallel_tasks
+                        {
+                            return Err(paro_error::internal(
+                                "runtime-filter builder count disagrees with admitted DOP",
+                            ));
+                        }
+                    }
                     if !properties.owned_artifacts.iter().any(|artifact| {
                         artifact.kind == crate::physical::AuxiliaryArtifactKind::RuntimeFilter
                             && artifact.fingerprint == runtime_filter.artifact
@@ -256,7 +274,7 @@ impl PhysicalPlanVerifier {
                             else {
                                 return false;
                             };
-                            let Some(runtime_filter) = spec.runtime_filter else {
+                            let Some(runtime_filter) = &spec.runtime_filter else {
                                 return false;
                             };
                             let [probe, build] = plan.child_ids(&node.children) else {
@@ -277,7 +295,10 @@ impl PhysicalPlanVerifier {
                         || !matches!(
                             &plan.node(owner).kind,
                             crate::physical::PhysicalNodeKind::HashJoin(spec)
-                                if spec.runtime_filter.is_some_and(|filter| filter.artifact == artifact)
+                                if spec
+                                    .runtime_filter
+                                    .as_ref()
+                                    .is_some_and(|filter| filter.artifact == artifact)
                         )
                     {
                         return Err(paro_error::internal(

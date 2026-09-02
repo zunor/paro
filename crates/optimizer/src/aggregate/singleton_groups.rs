@@ -241,7 +241,7 @@ mod tests {
             id: crate::cascades::ids::ResourceGrantClassId(0),
             hard_memory_bytes: u64::MAX,
             spill_policy: crate::physical::SpillPolicy::Allowed,
-            concurrency_class: 0,
+            max_parallel_tasks: 1,
         }];
         let extraction = input.optimize(&grants).expect("optimize singleton group");
         let variant = &extraction.variants[0];

@@ -463,7 +463,7 @@ impl<'a> PipelineLowerer<'a> {
                 join_type: spec.join_type,
                 build_keys_unique: spec.build_keys_unique,
                 build_time_integer_index: spec.build_time_integer_index.clone(),
-                runtime_filter: spec.runtime_filter,
+                runtime_filter: spec.runtime_filter.clone(),
                 key_conditions: spec.key_conditions.clone(),
                 residual_conditions: spec.build_residual_conditions.clone(),
                 build_projection: spec.build_input_projection.clone(),
@@ -482,7 +482,7 @@ impl<'a> PipelineLowerer<'a> {
             dependencies,
         )?;
         self.handles.set_producer(handle, producer)?;
-        if let Some(runtime_filter) = spec.runtime_filter {
+        if let Some(runtime_filter) = &spec.runtime_filter {
             if self
                 .runtime_filter_handles
                 .insert(runtime_filter.artifact, handle)
@@ -742,7 +742,7 @@ impl<'a> PipelineLowerer<'a> {
                         join_type: spec.join_type,
                         build_keys_unique: spec.build_keys_unique,
                         build_time_integer_index: spec.build_time_integer_index.clone(),
-                        runtime_filter: spec.runtime_filter,
+                        runtime_filter: spec.runtime_filter.clone(),
                         key_conditions: spec.key_conditions.clone(),
                         residual_conditions: spec.build_residual_conditions.clone(),
                         build_projection: spec.build_input_projection.clone(),
@@ -761,7 +761,7 @@ impl<'a> PipelineLowerer<'a> {
                     dependencies,
                 )?;
                 self.handles.set_producer(handle, producer)?;
-                if let Some(runtime_filter) = spec.runtime_filter {
+                if let Some(runtime_filter) = &spec.runtime_filter {
                     if self
                         .runtime_filter_handles
                         .insert(runtime_filter.artifact, handle)

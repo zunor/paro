@@ -222,6 +222,7 @@ impl StatementProgram {
     pub fn from_physical_portfolio<F>(
         portfolio: paro_optimizer::physical::PhysicalPlanPortfolio,
         available_memory_bytes: u64,
+        available_parallel_tasks: u16,
         available_external_worker_slots: u16,
         dependency_available: &F,
     ) -> Result<Self>
@@ -231,6 +232,7 @@ impl StatementProgram {
         portfolio.verify()?;
         let mut admitted = portfolio.admit(
             available_memory_bytes,
+            available_parallel_tasks,
             available_external_worker_slots,
             dependency_available,
         )?;
@@ -260,6 +262,7 @@ impl StatementProgram {
     pub fn admit_for_execution<F>(
         &self,
         available_memory_bytes: u64,
+        available_parallel_tasks: u16,
         available_external_worker_slots: u16,
         dependency_available: &F,
     ) -> Result<Self>
@@ -270,12 +273,14 @@ impl StatementProgram {
             Self::Portfolio(portfolio) => Self::from_physical_portfolio(
                 portfolio.clone(),
                 available_memory_bytes,
+                available_parallel_tasks,
                 available_external_worker_slots,
                 dependency_available,
             ),
             Self::ExplainAnalyze { target, spec } => Ok(Self::ExplainAnalyze {
                 target: Box::new(target.admit_for_execution(
                     available_memory_bytes,
+                    available_parallel_tasks,
                     available_external_worker_slots,
                     dependency_available,
                 )?),
@@ -661,7 +666,7 @@ impl OperatorRuntimeRegistry {
                 join_type: spec.join_type,
                 build_keys_unique: spec.build_keys_unique,
                 build_time_integer_index: spec.build_time_integer_index.clone(),
-                runtime_filter: spec.runtime_filter,
+                runtime_filter: spec.runtime_filter.clone(),
                 key_conditions: spec.key_conditions.clone(),
                 residual_conditions: spec.residual_conditions.clone(),
                 build_projection: spec.build_projection.clone(),

@@ -99,7 +99,7 @@ impl HashJoinBuildSinkExec {
             self.build_output_count,
             self.join_type,
             self.build_keys_unique,
-            self.runtime_filter.is_some(),
+            self.runtime_filter.as_ref().map(|filter| &filter.resource),
             hash_join_memory_context(ctx.query),
         )?;
         if let Some(channel_count) = self.grouped_reduction_channels {
@@ -174,9 +174,10 @@ impl HashJoinBuildSinkExec {
             build_payload: None,
             build_selection: None,
             build_hashes: Vec::new(),
-            runtime_filter_builder: self.runtime_filter.map(|_| {
+            runtime_filter_builder: self.runtime_filter.as_ref().map(|filter| {
                 JoinRuntimeFilterBuilder::empty_with_memory(
                     &build_key_types,
+                    &filter.resource,
                     hash_join_memory_context(ctx.query)
                         .with_class(paro_common::memory::MemoryAccountingClass::Metadata),
                 )

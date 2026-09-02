@@ -34,7 +34,7 @@ use crate::runtime::{
 };
 use crate::thread_context::ThreadContext;
 
-use super::scheduling_policy::{PipelineSchedulingPolicy, ReadyEntry};
+use super::scheduling_policy::{allocate_wave_task_slots, PipelineSchedulingPolicy, ReadyEntry};
 
 pub struct PipelineScheduler<'a> {
     graph: &'a PipelineGraph,
@@ -72,7 +72,8 @@ impl<'a> PipelineScheduler<'a> {
         graph: &PipelineGraph,
         query: &QueryRuntimeContext,
     ) -> bool {
-        Self::should_use_parallel_scheduler_for_session(graph, query.session.as_ref())
+        query.memory.admission_controller().max_slots() > 1
+            && Self::should_use_parallel_scheduler_for_session(graph, query.session.as_ref())
     }
 
     /// Parallel scheduling is useful only when the graph exposes independent
@@ -146,7 +147,13 @@ impl<'a> PipelineScheduler<'a> {
                 ));
             }
             let mut candidates = vec![(entry, self.runtime(pipeline)?)];
-            while candidates.len() < self.query.session.number_of_threads().max(1) {
+            let wave_width = self
+                .query
+                .session
+                .number_of_threads()
+                .max(1)
+                .min(self.query.memory.admission_controller().max_slots());
+            while candidates.len() < wave_width {
                 let Some(entry) = self.ready.pop() else {
                     break;
                 };
@@ -208,8 +215,34 @@ impl<'a> PipelineScheduler<'a> {
     }
 
     fn run_pipeline_wave(&self, wave: &[(PipelineId, Arc<PipelineRuntime>)]) -> Result<()> {
-        let mut scheduled = Vec::with_capacity(wave.len());
+        let mut desired_tasks = Vec::with_capacity(wave.len());
         for (pipeline, runtime) in wave {
+            let properties = &self
+                .graph
+                .pipeline(*pipeline)
+                .ok_or_else(|| paro_error::internal("pipeline spec missing"))?
+                .properties;
+            let work_units =
+                source_work(&runtime.source_global)?.map_or(0, |work| work.work_unit_count());
+            desired_tasks.push(pipeline_thread_count(
+                properties.capabilities.parallelism,
+                work_units,
+                self.query.as_ref(),
+            ));
+        }
+        let task_budget = self
+            .query
+            .session
+            .number_of_threads()
+            .max(1)
+            .min(self.query.memory.admission_controller().max_slots());
+        let task_limits =
+            allocate_wave_task_slots(&desired_tasks, task_budget).ok_or_else(|| {
+                paro_error::internal("ready pipeline wave exceeds its admitted query task budget")
+            })?;
+
+        let mut scheduled = Vec::with_capacity(wave.len());
+        for ((pipeline, runtime), task_limit) in wave.iter().zip(task_limits) {
             let properties = &self
                 .graph
                 .pipeline(*pipeline)
@@ -218,6 +251,7 @@ impl<'a> PipelineScheduler<'a> {
             match schedule_pipeline_data_tasks(
                 runtime.clone(),
                 properties.capabilities.parallelism,
+                task_limit,
                 self.query.clone(),
                 self.allocator.clone(),
             ) {
@@ -424,7 +458,11 @@ fn pipeline_thread_count(
     if !query.session.limits.parallel_scheduler || parallelism.max <= 1 || work_unit_count <= 1 {
         return 1;
     }
-    let threads = query.session.number_of_threads().max(1);
+    let threads = query
+        .session
+        .number_of_threads()
+        .max(1)
+        .min(query.memory.admission_controller().max_slots());
     parallelism
         .max
         .min(threads)
@@ -589,13 +627,15 @@ impl ScheduledPipelineExecution {
 fn schedule_pipeline_data_tasks(
     runtime: Arc<PipelineRuntime>,
     parallelism: Parallelism,
+    task_limit: usize,
     query: Arc<QueryRuntimeContext>,
     allocator: Arc<dyn Allocator>,
 ) -> Result<ScheduledPipelineExecution> {
     let work = source_work(&runtime.source_global)?
         .filter(|work| work.work_unit_count() > 0)
         .ok_or_else(|| paro_error::internal("pipeline wave requires source work"))?;
-    let total_threads = pipeline_thread_count(parallelism, work.work_unit_count(), query.as_ref());
+    let total_threads = pipeline_thread_count(parallelism, work.work_unit_count(), query.as_ref())
+        .min(task_limit.max(1));
     let assignments = work.into_task_assignments(total_threads);
     let data = schedule_data_tasks(
         runtime.clone(),
@@ -1461,151 +1501,5 @@ fn single_task_blocked_error(blocker: &Blocker) -> ParoError {
 }
 
 #[cfg(test)]
-mod tests {
-    use crate::runtime::PipelineReadyPriority;
-
-    use super::*;
-
-    #[test]
-    fn ready_heap_uses_policy_priority() {
-        let mut heap = BinaryHeap::new();
-        heap.push(ReadyEntry {
-            priority: PipelineReadyPriority::new(1),
-            seq: 0,
-            payload: PipelineId::new(0),
-        });
-        heap.push(ReadyEntry {
-            priority: PipelineReadyPriority::new(10),
-            seq: 1,
-            payload: PipelineId::new(1),
-        });
-        assert_eq!(heap.pop().unwrap().payload, PipelineId::new(1));
-    }
-
-    #[test]
-    fn source_work_batches_many_morsels_into_bounded_contiguous_ranges() {
-        let assignments = SourceWork::Chunks { count: 1_024 }.into_task_assignments(4);
-
-        assert_eq!(assignments.len(), 4 * DATA_TASKS_PER_THREAD);
-        assert_eq!(
-            assignments.first(),
-            Some(&SourceTaskAssignment::ChunkRange { start: 0, end: 64 })
-        );
-        assert_eq!(
-            assignments.last(),
-            Some(&SourceTaskAssignment::ChunkRange {
-                start: 960,
-                end: 1_024
-            })
-        );
-        assert_eq!(
-            assignments
-                .iter()
-                .copied()
-                .map(|assignment| assignment.morsel_count().expect("morsel assignment"))
-                .sum::<usize>(),
-            1_024
-        );
-        assert!(assignments.windows(2).all(|pair| match pair {
-            [
-                SourceTaskAssignment::ChunkRange { end, .. },
-                SourceTaskAssignment::ChunkRange { start, .. },
-            ] => end == start,
-            _ => false,
-        }));
-
-        assert!(SourceWork::Chunks { count: 0 }
-            .into_task_assignments(4)
-            .is_empty());
-    }
-
-    #[test]
-    fn empty_source_work_has_no_data_assignment() {
-        assert_eq!(SourceWork::Empty.work_unit_count(), 0);
-        assert!(SourceWork::Empty.into_task_assignments(4).is_empty());
-    }
-
-    #[test]
-    fn shared_queue_sources_spawn_workers_without_fake_morsels() {
-        let assignments = SourceWork::SharedWorkers {
-            count: 64,
-            worker: SharedSourceWorker::HashAggregateEmit,
-        }
-        .into_task_assignments(4);
-
-        assert_eq!(assignments.len(), 4);
-        assert!(assignments.iter().all(|assignment| {
-            *assignment == SourceTaskAssignment::SharedWorker(SharedSourceWorker::HashAggregateEmit)
-                && assignment.morsel_count().is_none()
-        }));
-
-        let materialized = SourceWork::SharedWorkers {
-            count: 64,
-            worker: SharedSourceWorker::Materialized,
-        }
-        .into_task_assignments(4);
-        assert_eq!(materialized.len(), 4);
-        assert!(materialized.iter().all(|assignment| {
-            *assignment == SourceTaskAssignment::SharedWorker(SharedSourceWorker::Materialized)
-                && assignment.morsel_count().is_none()
-        }));
-
-        let rowset_assignments = SourceWork::RowsetScan { count: 19 }.into_task_assignments(4);
-        assert_eq!(rowset_assignments.len(), 4);
-        assert!(rowset_assignments.iter().all(|assignment| {
-            *assignment == SourceTaskAssignment::SharedWorker(SharedSourceWorker::RowsetScan)
-                && assignment.morsel_count().is_none()
-        }));
-    }
-
-    #[test]
-    fn worker_coordinator_cancel_queued_releases_pending_slots() {
-        let coordinator = PipelineWorkerCoordinator::new(3);
-        coordinator.cancel_queued(2);
-        assert_eq!(coordinator.remaining(), 1);
-        coordinator.finish(Ok(()));
-        assert_eq!(coordinator.snapshot().unwrap(), None);
-    }
-
-    #[test]
-    fn waiter_registry_wakes_registered_work_units_once() {
-        let wake = PendingWakeRegistration {
-            task_id: PipelineTaskId(7),
-            source: WakeSource::Memory,
-            token: crate::runtime::WakeToken(11),
-            generation: crate::runtime::WakeGeneration(3),
-        };
-        let unit = WorkUnitId(99);
-        let mut registry = WaiterRegistry::default();
-
-        registry.register(wake, unit);
-        registry.register(wake, unit);
-
-        assert_eq!(registry.wake(wake.key()), vec![unit]);
-        assert!(registry.wake(wake.key()).is_empty());
-    }
-
-    #[test]
-    fn waiter_registry_moves_unit_when_wake_key_changes() {
-        let old_wake = PendingWakeRegistration {
-            task_id: PipelineTaskId(7),
-            source: WakeSource::Memory,
-            token: crate::runtime::WakeToken(11),
-            generation: crate::runtime::WakeGeneration(3),
-        };
-        let new_wake = PendingWakeRegistration {
-            task_id: PipelineTaskId(7),
-            source: WakeSource::Spill,
-            token: crate::runtime::WakeToken(12),
-            generation: crate::runtime::WakeGeneration(3),
-        };
-        let unit = WorkUnitId(99);
-        let mut registry = WaiterRegistry::default();
-
-        registry.register(old_wake, unit);
-        registry.register(new_wake, unit);
-
-        assert!(registry.wake(old_wake.key()).is_empty());
-        assert_eq!(registry.wake(new_wake.key()), vec![unit]);
-    }
-}
+#[path = "scheduler_tests.rs"]
+mod tests;

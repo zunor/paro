@@ -7,7 +7,9 @@ use super::*;
 
 mod facts;
 
-pub(super) use facts::{expression_cost_facts, planner_cost_facts, planner_row_width};
+pub(super) use facts::{
+    expression_cost_facts, planner_cost_facts, planner_row_width, planner_scan_access_width,
+};
 
 pub(super) fn planner_implementation_set(
     plan: &LogicalPlan,
@@ -127,6 +129,15 @@ pub(super) fn supports_runtime_filter_auxiliary(
         if condition.comparison != JoinComparisonType::Equal {
             return false;
         }
+        if !crate::physical::RuntimeFilterResourceContract::for_keys(
+            &[condition.right.return_type()],
+            1,
+        )
+        .is_ok_and(|contract| {
+            contract.capability != crate::physical::RuntimeFilterCapability::Disabled
+        }) {
+            return false;
+        }
         let output_index = match &condition.left {
             Expression::ColumnRef(column) if column.depth == 0 => probe_bindings
                 .iter()
@@ -136,20 +147,28 @@ pub(super) fn supports_runtime_filter_auxiliary(
         };
         output_index.is_some_and(|index| {
             runtime_filter_probe_lineages(&join.left, index)
-                .is_some_and(|lineages| !lineages.is_empty())
+                .is_some_and(|lineage| !lineage.sources.is_empty())
         })
     })
+}
+
+struct RuntimeFilterProbeLineage<'a> {
+    sources: Vec<&'a LogicalPlan>,
+    crossed_join: bool,
 }
 
 fn runtime_filter_probe_lineages(
     plan: &LogicalPlan,
     output_index: usize,
-) -> Option<Vec<&LogicalPlan>> {
+) -> Option<RuntimeFilterProbeLineage<'_>> {
     match &plan.operator {
         LogicalOperator::Get(get)
             if get.table.is_some() && get.stored_column(output_index).is_some() =>
         {
-            Some(vec![plan])
+            Some(RuntimeFilterProbeLineage {
+                sources: vec![plan],
+                crossed_join: false,
+            })
         }
         LogicalOperator::Filter(filter) => {
             let child_index = filter
@@ -178,9 +197,11 @@ fn runtime_filter_probe_lineages(
             if output_index >= setop.column_count {
                 return None;
             }
-            let mut lineages = runtime_filter_probe_lineages(&setop.left, output_index)?;
-            lineages.extend(runtime_filter_probe_lineages(&setop.right, output_index)?);
-            Some(lineages)
+            let mut left = runtime_filter_probe_lineages(&setop.left, output_index)?;
+            let right = runtime_filter_probe_lineages(&setop.right, output_index)?;
+            left.sources.extend(right.sources);
+            left.crossed_join |= right.crossed_join;
+            Some(left)
         }
         LogicalOperator::Join(Join::Comparison(inner))
             if inner.join_type == JoinType::Inner
@@ -191,13 +212,18 @@ fn runtime_filter_probe_lineages(
                 .left_projection_map
                 .to_indices(inner.left.types().len());
             if let Some(&child_index) = left_projection.get(output_index) {
-                return runtime_filter_probe_lineages(&inner.left, child_index);
+                let mut lineage = runtime_filter_probe_lineages(&inner.left, child_index)?;
+                lineage.crossed_join = true;
+                return Some(lineage);
             }
             let right_output = output_index.checked_sub(left_projection.len())?;
             let right_projection = inner
                 .right_projection_map
                 .to_indices(inner.right.types().len());
-            runtime_filter_probe_lineages(&inner.right, *right_projection.get(right_output)?)
+            let mut lineage =
+                runtime_filter_probe_lineages(&inner.right, *right_projection.get(right_output)?)?;
+            lineage.crossed_join = true;
+            Some(lineage)
         }
         // A CTE reference is not a rowset consumer. Crossing it requires one
         // AuxiliaryPlanRegion jointly owned by the CTE producer, every
@@ -221,8 +247,8 @@ pub(super) fn runtime_filter_probe_source_rows(
                 Expression::Reference(reference) => Some(reference.index),
                 _ => None,
             }?;
-            let lineages = runtime_filter_probe_lineages(&join.left, output_index)?;
-            lineages.into_iter().try_fold(
+            let lineage = runtime_filter_probe_lineages(&join.left, output_index)?;
+            lineage.sources.into_iter().try_fold(
                 paro_planner::plan::CardinalityEstimate::exact(0),
                 |sum, source| {
                     let rows = source.stats.estimated_cardinality?;
@@ -233,6 +259,27 @@ pub(super) fn runtime_filter_probe_source_rows(
                     })
                 },
             )
+        })
+}
+
+pub(super) fn runtime_filter_probe_is_direct(
+    join: &paro_planner::operator::ComparisonJoin,
+) -> bool {
+    let probe_bindings = join.left.get_column_bindings();
+    join.conditions
+        .iter()
+        .filter(|condition| condition.comparison == JoinComparisonType::Equal)
+        .any(|condition| {
+            let output_index = match &condition.left {
+                Expression::ColumnRef(column) if column.depth == 0 => probe_bindings
+                    .iter()
+                    .position(|binding| *binding == column.binding),
+                Expression::Reference(reference) => Some(reference.index),
+                _ => None,
+            };
+            output_index
+                .and_then(|index| runtime_filter_probe_lineages(&join.left, index))
+                .is_some_and(|lineage| !lineage.crossed_join)
         })
 }
 
@@ -342,12 +389,13 @@ pub(super) fn implementation_cost(
     facts: &ResolvedPlannerCostFacts,
     flavor: PhysicalImplementationFlavor,
     calibration: &MachineCalibrationBundle,
+    max_concurrent_tasks: u16,
 ) -> Result<SearchCost> {
     let mut work = LocalOperatorWork::default();
-    let mut peak_memory_upper;
+    let peak_memory_upper;
     match flavor {
         PhysicalImplementationFlavor::Structural => {
-            return refreshed_structural_cost(metadata, facts)
+            return refreshed_structural_cost(metadata, facts, max_concurrent_tasks)
         }
         PhysicalImplementationFlavor::SearchProvider => {
             return Err(paro_error::internal(
@@ -485,8 +533,25 @@ pub(super) fn implementation_cost(
             work.add(OP_HASH_BUILD_ROW, right)?;
             let probe = if flavor == PhysicalImplementationFlavor::HashJoinRuntimeFilter {
                 work.add(OP_RUNTIME_FILTER_BUILD_ROW, right)?;
-                work.add(OP_RUNTIME_FILTER_APPLY_ROW, left)?;
-                runtime_filtered_probe_work(left, right, facts.runtime_filter_probe_multiplicity)?
+                // A non-local runtime filter runs at the traced rowset source,
+                // before any intervening joins. Price every source-row lookup;
+                // charging only the already-reduced logical child makes a
+                // second sideways filter appear almost free and can select a
+                // physically slower plan.
+                work.add(
+                    OP_RUNTIME_FILTER_APPLY_ROW,
+                    facts.runtime_filter_probe_source_rows.unwrap_or(left),
+                )?;
+                let resource = crate::physical::RuntimeFilterResourceContract::for_keys(
+                    &facts.runtime_filter_key_types,
+                    max_concurrent_tasks,
+                )?;
+                runtime_filtered_probe_work(
+                    left,
+                    right,
+                    facts.runtime_filter_probe_multiplicity,
+                    resource.is_exact_single_key(),
+                )?
             } else {
                 left
             };
@@ -499,13 +564,6 @@ pub(super) fn implementation_cost(
                 .unwrap_or(u64::MAX);
             peak_memory_upper =
                 right_hard_upper.saturating_mul(facts.output_row_width.saturating_div(2).max(32));
-            if flavor == PhysicalImplementationFlavor::HashJoinRuntimeFilter {
-                // The execution policy freezes at most a bounded exact domain
-                // before degrading to min/max. Charge the upper envelope here
-                // so the auxiliary artifact participates in grant admission.
-                peak_memory_upper = peak_memory_upper
-                    .saturating_add(right_hard_upper.min(65_536).saturating_mul(24));
-            }
         }
         PhysicalImplementationFlavor::NestedLoopJoin => {
             let left = facts
@@ -618,7 +676,15 @@ pub(super) fn implementation_cost(
         }
     }
     let mut cost = calibration.fold(&work)?;
-    apply_execution_memory_contract(metadata, flavor, peak_memory_upper, &mut cost)?;
+    let retained_memory_target = expected_retained_memory_target(facts, flavor, peak_memory_upper);
+    apply_execution_memory_contract(
+        metadata,
+        flavor,
+        peak_memory_upper,
+        retained_memory_target,
+        max_concurrent_tasks,
+        &mut cost,
+    )?;
     if flavor == PhysicalImplementationFlavor::CrossProductExternal {
         let right = facts
             .child_rows
@@ -644,6 +710,8 @@ fn apply_execution_memory_contract(
     metadata: &PlannerOperatorMetadata,
     flavor: PhysicalImplementationFlavor,
     retained_memory_upper: u64,
+    retained_memory_target: u64,
+    max_concurrent_tasks: u16,
     cost: &mut SearchCost,
 ) -> Result<()> {
     use crate::physical::resources::{
@@ -684,9 +752,11 @@ fn apply_execution_memory_contract(
     } else if spillable {
         let fixed_non_revocable_bytes =
             if flavor == PhysicalImplementationFlavor::HashJoinRuntimeFilter {
-                // The exact runtime-filter domain is bounded independently of the
-                // spillable build rows and remains resident while the probe runs.
-                65_536_u64 * 24
+                crate::physical::RuntimeFilterResourceContract::for_keys(
+                    &metadata.cost_facts.runtime_filter_key_types,
+                    max_concurrent_tasks,
+                )?
+                .peak_memory_bytes
             } else {
                 0
             };
@@ -694,16 +764,27 @@ fn apply_execution_memory_contract(
             fixed_non_revocable_bytes,
             fixed_scratch_bytes: BLOCKING_FIXED_SCRATCH_BYTES,
             per_task_scratch_bytes: BLOCKING_PER_TASK_SCRATCH_BYTES,
-            max_concurrent_tasks: metadata.max_concurrent_tasks,
+            max_concurrent_tasks,
             revocable_minimum_bytes: 0,
             revocable_target_bytes: 0,
             spill_buffer_minimum_bytes: SPILL_BUFFER_MINIMUM_BYTES,
         };
         let minimum = base.minimum_memory_bytes()?;
-        ExecutionMemoryContract {
-            revocable_target_bytes: retained_memory_upper.saturating_sub(minimum),
+        let contract = ExecutionMemoryContract {
+            revocable_target_bytes: retained_memory_target.min(retained_memory_upper),
             ..base
-        }
+        };
+        contract.validate()?;
+        cost.non_revocable_memory_upper = contract.fixed_non_revocable_bytes;
+        cost.minimum_memory_bytes = minimum;
+        cost.revocable_memory_target = contract.revocable_target_bytes;
+        cost.peak_memory_upper = if retained_memory_upper == u64::MAX {
+            u64::MAX
+        } else {
+            minimum.saturating_add(retained_memory_upper)
+        };
+        cost.validate()?;
+        return Ok(());
     } else {
         ExecutionMemoryContract {
             fixed_non_revocable_bytes: retained_memory_upper,
@@ -727,9 +808,77 @@ fn apply_execution_memory_contract(
     Ok(())
 }
 
+fn expected_retained_memory_target(
+    facts: &ResolvedPlannerCostFacts,
+    flavor: PhysicalImplementationFlavor,
+    retained_memory_upper: u64,
+) -> u64 {
+    let child = |index: usize| {
+        facts
+            .child_rows
+            .get(index)
+            .copied()
+            .unwrap_or(CompactRange::ZERO)
+            .expected
+    };
+    let child_width = |index: usize| {
+        facts
+            .child_row_widths
+            .get(index)
+            .copied()
+            .unwrap_or(facts.output_row_width)
+            .max(1)
+    };
+    let expected = match flavor {
+        PhysicalImplementationFlavor::AdaptiveSort => estimated_bytes(child(0), child_width(0)),
+        PhysicalImplementationFlavor::HeapTopN => facts
+            .topn_capacity
+            .unwrap_or(0)
+            .saturating_mul(child_width(0)),
+        PhysicalImplementationFlavor::HashAggregate => estimated_bytes(
+            facts.output_rows.expected,
+            facts.output_row_width.saturating_add(16),
+        ),
+        PhysicalImplementationFlavor::Window
+        | PhysicalImplementationFlavor::PartitionAggregateWindow => {
+            estimated_bytes(child(0), facts.output_row_width.max(32))
+        }
+        PhysicalImplementationFlavor::HashJoin
+        | PhysicalImplementationFlavor::HashJoinRuntimeFilter => {
+            estimated_bytes(child(1), facts.output_row_width.saturating_div(2).max(32))
+        }
+        PhysicalImplementationFlavor::NestedLoopJoin
+        | PhysicalImplementationFlavor::CrossProductInMemory => {
+            estimated_bytes(child(1), child_width(1))
+        }
+        PhysicalImplementationFlavor::SortRangeJoin
+        | PhysicalImplementationFlavor::ClassicIeJoin => estimated_bytes(
+            child(0).max(0.0) + child(1).max(0.0),
+            facts.output_row_width.max(32),
+        ),
+        PhysicalImplementationFlavor::PerfectHashAggregate
+        | PhysicalImplementationFlavor::SingletonAggregateProjection
+        | PhysicalImplementationFlavor::CrossProductExternal
+        | PhysicalImplementationFlavor::Structural
+        | PhysicalImplementationFlavor::SearchProvider => retained_memory_upper,
+    };
+    expected.min(retained_memory_upper)
+}
+
+fn estimated_bytes(rows: f64, width: u64) -> u64 {
+    if rows <= 0.0 {
+        0
+    } else if rows >= u64::MAX as f64 / width as f64 {
+        u64::MAX
+    } else {
+        (rows.ceil() as u64).saturating_mul(width)
+    }
+}
+
 fn refreshed_structural_cost(
     metadata: &PlannerOperatorMetadata,
     facts: &ResolvedPlannerCostFacts,
+    max_concurrent_tasks: u16,
 ) -> Result<SearchCost> {
     if matches!(
         metadata.operator_type,
@@ -739,6 +888,16 @@ fn refreshed_structural_cost(
             | LogicalOperatorType::ExternalTable
     ) {
         return Ok(metadata.local_cost);
+    }
+    if metadata.operator_type == LogicalOperatorType::Get {
+        // Search-provider replacements reuse the logical Get implementation
+        // metadata with provider-specific facts. Only an actual base-table
+        // scan owns an access-width frontier; provider costs remain the
+        // immutable contract recorded by that implementation.
+        return facts.scan_access_width.map_or_else(
+            || Ok(metadata.local_cost),
+            |access_width| base_table_scan_cost(facts.output_rows, access_width),
+        );
     }
     let width_factor = (facts.output_row_width as f64 / 32.0).max(1.0);
     let child_count = facts.child_rows.len() as f64;
@@ -800,6 +959,8 @@ fn refreshed_structural_cost(
             metadata,
             metadata.implementations.baseline,
             cost.peak_memory_upper,
+            estimated_bytes(resident_expected, width).min(cost.peak_memory_upper),
+            max_concurrent_tasks,
             &mut cost,
         )?;
     }
@@ -835,6 +996,7 @@ pub(super) fn runtime_filtered_probe_work(
     probe: CompactRange,
     build: CompactRange,
     probe_multiplicity: RuntimeFilterProbeMultiplicity,
+    exact_single_key: bool,
 ) -> Result<CompactRange> {
     let retained = |probe_rows: f64, build_rows: f64| {
         if probe_rows <= 0.0 {
@@ -845,20 +1007,21 @@ pub(super) fn runtime_filtered_probe_work(
         // damped. The upper bound retains the no-benefit fallback.
         probe_rows * ratio.sqrt().clamp(0.1, 1.0)
     };
-    let expected = match probe_multiplicity {
-        RuntimeFilterProbeMultiplicity::DeclaredUnique => {
+    let expected = match (exact_single_key, probe_multiplicity) {
+        (true, RuntimeFilterProbeMultiplicity::DeclaredUnique) => {
             retained(probe.expected, build.expected).min(build.expected)
         }
-        RuntimeFilterProbeMultiplicity::EstimatedUnique => {
+        (true, RuntimeFilterProbeMultiplicity::EstimatedUnique) => {
             retained(probe.expected, build.expected).min(build.expected * 1.25)
         }
-        RuntimeFilterProbeMultiplicity::Unknown => retained(probe.expected, build.expected),
+        _ => retained(probe.expected, build.expected)
+            .max(probe.expected * 0.25)
+            .min(probe.expected),
     };
-    let upper = match probe_multiplicity {
-        RuntimeFilterProbeMultiplicity::DeclaredUnique => probe.upper.min(build.upper),
-        RuntimeFilterProbeMultiplicity::EstimatedUnique => probe.upper.min(build.upper * 2.0),
-        RuntimeFilterProbeMultiplicity::Unknown => probe.upper,
-    };
+    // Every current representation can fall back to a range, and multi-key
+    // filters are installed independently per column. Neither contract can
+    // prove a survivor cardinality below the complete probe.
+    let upper = probe.upper;
     CompactRange::new(0.0, expected, upper.max(expected))
 }
 
@@ -921,6 +1084,17 @@ pub(super) fn planner_operator_cost(
     match &plan.operator {
         LogicalOperator::SearchScan(scan) => return search_decision_cost(&scan.decision),
         LogicalOperator::FullTextFilterScan(scan) => return search_decision_cost(&scan.decision),
+        LogicalOperator::Get(get) => {
+            let rows = plan.stats.estimated_cardinality.unwrap_or(
+                paro_planner::plan::CardinalityEstimate {
+                    min: 0,
+                    expected: 1,
+                    max: 4,
+                },
+            );
+            let rows = CompactRange::new(rows.min as f64, rows.expected as f64, rows.max as f64)?;
+            return base_table_scan_cost(rows, planner_scan_access_width(get, scan_access_cost));
+        }
         LogicalOperator::ExternalProject(project) => {
             return external_operator_cost(project.cost, plan.stats.estimated_cardinality)
         }
@@ -987,6 +1161,25 @@ pub(super) fn planner_operator_cost(
         cost.resources_risk_upper[ResourceDimension::MemoryWrite as usize] =
             cost.peak_memory_upper as f64;
     }
+    cost.validate()?;
+    Ok(cost)
+}
+
+fn base_table_scan_cost(rows: CompactRange, access_width: u64) -> Result<SearchCost> {
+    // A scan pays one fixed cursor/vector unit per row plus actual storage
+    // source bytes. Do not floor the byte component: doing so makes a virtual
+    // rowid indistinguishable from another stored fixed-width column.
+    let range = scaled_work(rows, 1.0 + access_width as f64 / 32.0)?;
+    let mut cost = SearchCost {
+        score: ScoreSummary {
+            range,
+            risk_adjusted: range.expected + (range.upper - range.expected) * 0.5,
+        },
+        critical_path: range,
+        ..SearchCost::ZERO
+    };
+    cost.resources_expected[ResourceDimension::Cpu as usize] = range.expected;
+    cost.resources_risk_upper[ResourceDimension::Cpu as usize] = range.upper;
     cost.validate()?;
     Ok(cost)
 }
@@ -1107,7 +1300,7 @@ mod tests {
     }
 
     #[test]
-    fn unique_probe_key_bounds_runtime_filter_survivors_by_build_rows() {
+    fn runtime_filter_fallback_keeps_the_complete_probe_as_risk_upper() {
         let probe = CompactRange::new(100_000.0, 100_000.0, 100_000.0).unwrap();
         let build = CompactRange::new(10_000.0, 12_000.0, 15_000.0).unwrap();
 
@@ -1115,13 +1308,19 @@ mod tests {
             probe,
             build,
             RuntimeFilterProbeMultiplicity::DeclaredUnique,
+            true,
         )
         .unwrap();
-        let unconstrained =
-            runtime_filtered_probe_work(probe, build, RuntimeFilterProbeMultiplicity::Unknown)
-                .unwrap();
+        let unconstrained = runtime_filtered_probe_work(
+            probe,
+            build,
+            RuntimeFilterProbeMultiplicity::Unknown,
+            false,
+        )
+        .unwrap();
 
-        assert_eq!(unique.upper, 15_000.0);
+        assert_eq!(unique.upper, 100_000.0);
         assert_eq!(unconstrained.upper, 100_000.0);
+        assert!(unique.expected < unconstrained.expected);
     }
 }

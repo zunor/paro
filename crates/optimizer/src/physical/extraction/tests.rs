@@ -1265,7 +1265,7 @@ fn auxiliary_runtime_filter_winner_emits_owned_physical_edge() {
     let PhysicalNodeKind::HashJoin(spec) = &plan.node(plan.root).kind else {
         panic!("expected hash join root");
     };
-    assert_eq!(spec.runtime_filter.unwrap().artifact, artifact);
+    assert_eq!(spec.runtime_filter.as_ref().unwrap().artifact, artifact);
     let [probe, build] = plan.child_ids(&plan.node(plan.root).children) else {
         panic!("expected two hash join children");
     };

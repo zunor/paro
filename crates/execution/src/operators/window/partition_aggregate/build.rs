@@ -560,7 +560,13 @@ impl PartitionAggregateWindowBuildSinkExec {
                 == crate::physical::specs::SpillExecutionPolicy::Adaptive
                 && partition_aggregate_preemptive_spill_enabled(ctx.query));
         let memory = partition_aggregate_table_memory(ctx.query, spillable);
-        let radix_bits = aggregate_spill_radix_bits(ctx.query.session.number_of_threads());
+        let radix_bits = aggregate_spill_radix_bits(
+            ctx.query
+                .session
+                .number_of_threads()
+                .min(ctx.query.memory.admission_controller().max_slots()),
+            ctx.query.memory.capacity_bytes(),
+        );
         let group_refs = group_payload_refs(&self.spec.aggregate)?.into_boxed_slice();
         let backing = Arc::new(parking_lot::Mutex::new(if force_external && spillable {
             PartitionAggregateLocalBacking::External {
@@ -731,7 +737,13 @@ impl PartitionAggregateWindowBuildSinkExec {
                         ctx.query.session.buffer_pool().clone(),
                         &self.spec.aggregate.payload_types,
                         &local.group_refs,
-                        aggregate_spill_radix_bits(ctx.query.session.number_of_threads()),
+                        aggregate_spill_radix_bits(
+                            ctx.query
+                                .session
+                                .number_of_threads()
+                                .min(ctx.query.memory.admission_controller().max_slots()),
+                            ctx.query.memory.capacity_bytes(),
+                        ),
                         partition_aggregate_table_memory(ctx.query, true),
                     )?)
                 } else if let Err(error) = update_hash_aggregate_tables_with_scratch(
@@ -758,7 +770,13 @@ impl PartitionAggregateWindowBuildSinkExec {
                         ctx.query.session.buffer_pool().clone(),
                         &self.spec.aggregate.payload_types,
                         &local.group_refs,
-                        aggregate_spill_radix_bits(ctx.query.session.number_of_threads()),
+                        aggregate_spill_radix_bits(
+                            ctx.query
+                                .session
+                                .number_of_threads()
+                                .min(ctx.query.memory.admission_controller().max_slots()),
+                            ctx.query.memory.capacity_bytes(),
+                        ),
                         partition_aggregate_table_memory(ctx.query, true),
                     )?)
                 } else {

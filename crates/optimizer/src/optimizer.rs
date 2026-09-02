@@ -168,6 +168,7 @@ impl Optimizer {
         let statement = StatementPlan::split(plan, self.ctx.session.transaction_visible_version())?;
         let grant_classes = resource_grant_classes(
             self.ctx.session.limits.max_memory,
+            self.ctx.session.limits.max_threads.max(1),
             self.budget.max_grant_classes,
             self.ctx.session.limits.use_temporary_directory,
         );
@@ -595,7 +596,7 @@ impl Optimizer {
                 grant_spill_policy: grant.spill_policy,
                 rowset_scan_pushdown: self.ctx.session.limits.rowset_scan_pushdown,
                 max_memory,
-                max_threads: self.ctx.session.limits.max_threads.max(1),
+                max_threads: usize::from(grant.max_parallel_tasks),
                 scan_access_cost: Default::default(),
                 dependency_template: self.plan_dependency_template_for(&logical),
             })
@@ -661,7 +662,7 @@ impl Optimizer {
                 grant_spill_policy: grant.spill_policy,
                 rowset_scan_pushdown: self.ctx.session.limits.rowset_scan_pushdown,
                 max_memory,
-                max_threads: self.ctx.session.limits.max_threads.max(1),
+                max_threads: usize::from(grant.max_parallel_tasks),
                 scan_access_cost: Default::default(),
                 dependency_template,
             })
@@ -1231,6 +1232,7 @@ fn utility_plan_fingerprint(kind: &crate::physical::PhysicalNodeKind) -> Result<
 /// single conservative unbounded class so admission remains deterministic.
 fn resource_grant_classes(
     max_memory: usize,
+    max_threads: usize,
     max_grant_classes: u8,
     spill_available: bool,
 ) -> Box<[ResourceGrantClass]> {
@@ -1246,6 +1248,8 @@ fn resource_grant_classes(
         }
     };
     let mut previous = None;
+    let class_count = hard_limits.len();
+    let max_threads = max_threads.clamp(1, u16::MAX as usize);
     hard_limits
         .into_iter()
         .filter(|hard| previous.replace(*hard) != Some(*hard))
@@ -1258,7 +1262,15 @@ fn resource_grant_classes(
             } else {
                 SpillPolicy::Forbidden
             },
-            concurrency_class: u16::try_from(index).unwrap_or(u16::MAX),
+            max_parallel_tasks: u16::try_from(match class_count {
+                1 => max_threads,
+                2 if index == 0 => 1,
+                2 => max_threads,
+                _ if index == 0 => 1,
+                _ if index + 1 == class_count => max_threads,
+                _ => max_threads.div_ceil(2),
+            })
+            .unwrap_or(u16::MAX),
         })
         .collect::<Vec<_>>()
         .into_boxed_slice()
@@ -1285,4 +1297,24 @@ fn contains_multiway_join_region(plan: &LogicalPlan) -> bool {
             .children()
             .into_iter()
             .any(contains_multiway_join_region)
+}
+
+#[cfg(test)]
+mod resource_operating_point_tests {
+    use super::resource_grant_classes;
+
+    #[test]
+    fn low_memory_portfolio_contains_a_serial_executable_operating_point() {
+        let classes = resource_grant_classes(4 * 1024 * 1024, 10, 3, true);
+
+        assert_eq!(
+            classes
+                .iter()
+                .map(|class| class.max_parallel_tasks)
+                .collect::<Vec<_>>(),
+            vec![1, 5, 10]
+        );
+        assert_eq!(classes[0].hard_memory_bytes, 1024 * 1024);
+        assert_eq!(classes[2].hard_memory_bytes, 4 * 1024 * 1024);
+    }
 }

@@ -72,6 +72,49 @@ fn lookup_entries_only_pay_for_inline_keys_when_supported() {
 }
 
 #[test]
+fn growth_is_fully_precharged_before_the_table_owner_is_entered() {
+    let pool = Arc::new(QueryMemoryPool::new(1 << 20));
+    let owner: Arc<dyn MemoryOwner> = pool.clone();
+    let memory = MemoryAccountingContext::from_owner(
+        owner,
+        MemoryDomain::Host,
+        MemoryTag::HashTable,
+        MemoryAccountingClass::Revocable,
+    );
+    let mut table = GroupedAggregateHashTable::new_with_memory(
+        vec![LogicalType::Integer],
+        Vec::new(),
+        Vec::new(),
+        paro_common::test_utils::test_allocator(),
+        memory.clone(),
+    )
+    .expect("table");
+    let requirement = table.growth_requirement(32).expect("growth requirement");
+    let reservation = memory
+        .with_class(MemoryAccountingClass::Metadata)
+        .reserve_grant(
+            requirement
+                .persistent_bytes
+                .checked_add(requirement.overlap_bytes)
+                .expect("bounded growth reservation"),
+        )
+        .expect("precharge transition");
+    table
+        .prepare_growth(32, &reservation)
+        .expect("transfer persistent grant");
+
+    // Leave no unissued query capacity. The physical Vec reallocations can
+    // succeed only from grants transferred by prepare_growth; an owner call
+    // from inside the table transition would fail here.
+    pool.set_capacity_bytes(pool.issued_bytes());
+    table
+        .reserve_for_insertions(32)
+        .expect("prepared growth must not re-enter query reclaim");
+
+    assert!(table.capacity() >= 64);
+}
+
+#[test]
 fn dictionary_varlen_groups_share_owned_heap_bytes() {
     let allocator = paro_common::test_utils::test_allocator();
     let value = "shared-dictionary-group-value";

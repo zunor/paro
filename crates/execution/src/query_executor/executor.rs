@@ -16,7 +16,8 @@ use paro_scheduler::scheduler::TaskScheduler;
 use tracing::debug;
 
 use crate::memory_runtime::QueryMemoryPool;
-use crate::query_executor::compiled::ExecutionRequest;
+use crate::pipeline::StatementProgram;
+use crate::query_executor::compiled::{CompiledStatement, ExecutionRequest};
 use crate::query_executor::program_executor;
 use crate::runtime::ParameterBindings;
 
@@ -67,8 +68,6 @@ impl Executor {
         )) as Arc<dyn paro_common::allocator::Allocator>;
 
         let query_memory_pool = self.create_query_memory_pool();
-        let available_memory =
-            u64::try_from(query_memory_pool.capacity_bytes()).unwrap_or(u64::MAX);
         let external_worker_slots = if self.session.python_runtime_status().is_some_and(|status| {
             status.availability == paro_external::runtime::host::PythonRuntimeAvailability::Ready
         }) {
@@ -76,11 +75,8 @@ impl Executor {
         } else {
             0
         };
-        let mut program = compiled.program().admit_for_execution(
-            available_memory,
-            external_worker_slots,
-            &|plan| super::compiled::physical_plan_dependencies_available(plan, &self.session),
-        )?;
+        let mut program =
+            self.admit_program(&compiled, &query_memory_pool, external_worker_slots)?;
         let required_external_slots = program
             .reservation()
             .map(|reservation| reservation.external_worker_slots)
@@ -100,27 +96,19 @@ impl Executor {
                     // The availability snapshot raced with another query.
                     // Re-admit without external capacity so a non-external
                     // portfolio variant remains usable when one exists.
-                    program =
-                        compiled
-                            .program()
-                            .admit_for_execution(available_memory, 0, &|plan| {
-                                super::compiled::physical_plan_dependencies_available(
-                                    plan,
-                                    &self.session,
-                                )
-                            })?;
+                    // Memory, DOP, and external capability are one monotone
+                    // admission transaction. The memory floor already held
+                    // by this query remains valid while selection falls back
+                    // to a variant requiring no external worker.
+                    program = self.admit_program(&compiled, &query_memory_pool, 0)?;
                     None
                 }
             }
         };
         if let Some(reservation) = program.reservation() {
-            let minimum = usize::try_from(reservation.minimum_memory_bytes).unwrap_or(usize::MAX);
-            if !query_memory_pool.try_reserve_minimum_capacity(minimum)? {
-                return Err(paro_common::error::out_of_memory(format!(
-                    "unable to reserve the admitted plan's {} byte execution floor",
-                    reservation.minimum_memory_bytes
-                )));
-            }
+            query_memory_pool
+                .admission_controller()
+                .set_max_slots(usize::from(reservation.max_parallel_tasks));
         }
         if let Some(lease) = external_worker_lease {
             query_memory_pool.attach_external_worker_lease(lease);
@@ -140,6 +128,43 @@ impl Executor {
             "Execution pipelines completed"
         );
         Ok(handler)
+    }
+
+    /// Resolve one immutable portfolio and atomically establish its memory
+    /// floor. A raced floor reservation never turns directly into OOM: the
+    /// admissible memory ceiling decreases monotonically until a lower-memory
+    /// variant is leased or the proved portfolio is exhausted.
+    fn admit_program(
+        &self,
+        compiled: &CompiledStatement,
+        query_memory_pool: &Arc<QueryMemoryPool>,
+        available_external_worker_slots: u16,
+    ) -> Result<StatementProgram> {
+        let available_parallel_tasks =
+            u16::try_from(self.session.number_of_threads()).unwrap_or(u16::MAX);
+        let mut memory_ceiling =
+            u64::try_from(query_memory_pool.capacity_bytes()).unwrap_or(u64::MAX);
+        loop {
+            let program = compiled.program().admit_for_execution(
+                memory_ceiling,
+                available_parallel_tasks,
+                available_external_worker_slots,
+                &|plan| super::compiled::physical_plan_dependencies_available(plan, &self.session),
+            )?;
+            let Some(reservation) = program.reservation() else {
+                return Ok(program);
+            };
+            let minimum = usize::try_from(reservation.minimum_memory_bytes).unwrap_or(usize::MAX);
+            if query_memory_pool.try_reserve_minimum_capacity(minimum)? {
+                return Ok(program);
+            }
+            if reservation.minimum_memory_bytes == 0 {
+                return Err(paro_common::error::out_of_memory(
+                    "unable to reserve a zero-floor physical plan after admission changed",
+                ));
+            }
+            memory_ceiling = memory_ceiling.min(reservation.minimum_memory_bytes - 1);
+        }
     }
 
     fn execute_program(

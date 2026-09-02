@@ -353,7 +353,7 @@ impl PipelineGraph {
                         "runtime-filter artifact producer is not a hash-join build",
                     ));
                 };
-                let contract = build.runtime_filter.ok_or_else(|| {
+                let contract = build.runtime_filter.as_ref().ok_or_else(|| {
                     paro_error::internal(
                         "rowset consumes a runtime filter absent from the hash-join contract",
                     )
@@ -379,7 +379,7 @@ impl PipelineGraph {
             let SinkSpec::HashJoinBuild(build) = &producer.sink else {
                 continue;
             };
-            let Some(contract) = build.runtime_filter else {
+            let Some(contract) = &build.runtime_filter else {
                 continue;
             };
             let has_consumer = self.pipelines.iter().any(|pipeline| {

@@ -16,6 +16,10 @@ pub(in crate::cascades::planner) fn planner_cost_facts(
         .collect::<Vec<_>>()
         .into_boxed_slice();
     let output_row_width = planner_row_width(plan, scan_access_cost);
+    let scan_access_width = match &plan.operator {
+        LogicalOperator::Get(get) => Some(planner_scan_access_width(get, scan_access_cost)),
+        _ => None,
+    };
     let perfect_hash = match &plan.operator {
         LogicalOperator::Aggregate(aggregate) => {
             crate::physical::aggregate_planning::plan_perfect_hash_aggregate(
@@ -45,13 +49,32 @@ pub(in crate::cascades::planner) fn planner_cost_facts(
         }
         _ => None,
     };
+    let runtime_filter_probe_is_direct = match &plan.operator {
+        LogicalOperator::Join(Join::Comparison(join)) => {
+            super::runtime_filter_probe_is_direct(join)
+        }
+        _ => false,
+    };
+    let runtime_filter_key_types = match &plan.operator {
+        LogicalOperator::Join(Join::Comparison(join)) => join
+            .conditions
+            .iter()
+            .filter(|condition| condition.comparison == JoinComparisonType::Equal)
+            .map(|condition| condition.right.return_type())
+            .collect::<Vec<_>>()
+            .into_boxed_slice(),
+        _ => Box::new([]),
+    };
     Ok(PlannerCostFacts {
         child_row_widths,
         output_row_width,
+        scan_access_width,
         perfect_hash,
         topn_capacity,
         runtime_filter_probe_multiplicity,
         runtime_filter_probe_source_rows,
+        runtime_filter_probe_is_direct,
+        runtime_filter_key_types,
     })
 }
 
@@ -64,6 +87,49 @@ pub(in crate::cascades::planner) fn planner_row_width(
         .map(|logical_type| scan_access_cost.estimated_width(logical_type) as u64)
         .sum::<u64>()
         .saturating_add(std::mem::size_of::<u64>() as u64)
+}
+
+/// Bytes physically sourced by one base-table scan row. Virtual rowids are
+/// already available from the scan cursor and therefore carry through parent
+/// tuples without reading a stored column. Derived prefixes pay only their
+/// bounded produced width; duplicate stored projections share one source.
+pub(in crate::cascades::planner) fn planner_scan_access_width(
+    get: &paro_planner::operator::Get,
+    scan_access_cost: paro_storage::rowset::scan_cost::ScanAccessCostModel,
+) -> u64 {
+    use paro_planner::operator::GetColumnSource;
+
+    let mut stored_widths = std::collections::BTreeMap::<usize, u64>::new();
+    for (index, source) in get.column_sources.iter().enumerate() {
+        match source {
+            GetColumnSource::Stored { column_id } => {
+                let source_width = get
+                    .column_types
+                    .get(index)
+                    .map(|ty| scan_access_cost.estimated_width(ty) as u64)
+                    .unwrap_or(0);
+                stored_widths
+                    .entry(*column_id)
+                    .and_modify(|width| *width = (*width).max(source_width))
+                    .or_insert(source_width);
+            }
+            GetColumnSource::MatchedUtf8Prefix {
+                source_column,
+                byte_width,
+            } => {
+                let source_width = u64::try_from(*byte_width).unwrap_or(u64::MAX);
+                stored_widths
+                    .entry(*source_column)
+                    .and_modify(|width| *width = (*width).max(source_width))
+                    .or_insert(source_width);
+            }
+            GetColumnSource::VirtualRowId => {}
+        }
+    }
+    stored_widths
+        .values()
+        .copied()
+        .fold(0u64, u64::saturating_add)
 }
 
 pub(in crate::cascades::planner) fn expression_cost_facts(
@@ -101,6 +167,7 @@ pub(in crate::cascades::planner) fn expression_cost_facts(
         child_rows_hard_upper,
         child_row_widths: template.child_row_widths.clone(),
         output_row_width: template.output_row_width,
+        scan_access_width: template.scan_access_width,
         perfect_hash: template.perfect_hash,
         topn_capacity: template.topn_capacity,
         runtime_filter_probe_multiplicity: template.runtime_filter_probe_multiplicity,
@@ -108,6 +175,8 @@ pub(in crate::cascades::planner) fn expression_cost_facts(
             .runtime_filter_probe_source_rows
             .map(|rows| CompactRange::new(rows.min as f64, rows.expected as f64, rows.max as f64))
             .transpose()?,
+        runtime_filter_probe_is_direct: template.runtime_filter_probe_is_direct,
+        runtime_filter_key_types: template.runtime_filter_key_types.clone(),
     })
 }
 

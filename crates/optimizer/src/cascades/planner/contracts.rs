@@ -344,6 +344,18 @@ pub(super) fn planner_cost_composition(
         | PhysicalImplementationFlavor::SearchProvider => 0,
     };
     if flavor == PhysicalImplementationFlavor::HashJoinRuntimeFilter {
+        // Scaling a child winner is valid only while this region owns the
+        // rowset boundary being reduced. Once lineage crosses another join,
+        // that child's winner may already contain a sideways filter on the
+        // same scan; independently scaling the whole subtree double-counts
+        // predicate work and I/O. The non-local artifact remains enumerable
+        // and pays/saves its local work, but child-boundary reduction requires
+        // a future composite-region JointCostProof that orders all filters.
+        if !facts.runtime_filter_probe_is_direct {
+            return Ok(CostComposition::RetainedState {
+                overlapping_children,
+            });
+        }
         let Some(source) = facts.runtime_filter_probe_source_rows else {
             return Ok(CostComposition::RetainedState {
                 overlapping_children,
@@ -354,23 +366,25 @@ pub(super) fn planner_cost_composition(
             .get(1)
             .copied()
             .unwrap_or(CompactRange::ZERO);
-        let probe = facts
-            .child_rows
-            .first()
-            .copied()
-            .unwrap_or(CompactRange::ZERO);
-        // A non-local runtime filter may reduce source work only when the join
-        // estimate itself proves that the build domain can reject probe rows.
-        // Build cardinality is otherwise just a membership-table size; using
-        // it to discount a deeper scan would invent selectivity that the
-        // relational estimator does not predict.
-        if build.expected >= probe.expected {
+        // A non-local runtime filter is evaluated at the traced rowset source,
+        // before intervening joins. Compare the build domain with that source;
+        // using the already-reduced join child cardinality incorrectly rejects
+        // filters that can remove source I/O before another selective join.
+        if build.expected >= source.expected {
             return Ok(CostComposition::RetainedState {
                 overlapping_children,
             });
         }
-        let retained =
-            runtime_filtered_probe_work(source, build, facts.runtime_filter_probe_multiplicity)?;
+        let retained = runtime_filtered_probe_work(
+            source,
+            build,
+            facts.runtime_filter_probe_multiplicity,
+            crate::physical::RuntimeFilterResourceContract::for_keys(
+                &facts.runtime_filter_key_types,
+                1,
+            )?
+            .is_exact_single_key(),
+        )?;
         let ratio_ppm = |retained: f64, source: f64| {
             if source <= 0.0 {
                 1_000_000
@@ -462,7 +476,7 @@ pub(super) fn cost_for_grant(
         if class.spill_policy == SpillPolicy::Forbidden {
             return Ok(None);
         } else {
-            let spilled = cost.peak_memory_upper.max(1);
+            let spilled = cost.revocable_memory_target.max(1);
             cost.peak_memory_upper = cost.peak_memory_upper.min(class.hard_memory_bytes);
             cost.revocable_memory_target = cost
                 .revocable_memory_target
@@ -477,13 +491,15 @@ pub(super) fn cost_for_grant(
     }
     if spillable && class.spill_policy == SpillPolicy::Allowed {
         let spilled = cost
-            .peak_memory_upper
+            .preferred_memory_bytes()
             .saturating_sub(class.hard_memory_bytes);
         cost.peak_memory_upper = class.hard_memory_bytes;
         cost.revocable_memory_target = cost
             .revocable_memory_target
             .min(class.hard_memory_bytes - cost.minimum_memory_bytes);
-        add_spill_cost(&mut cost, spilled)?;
+        if spilled > 0 {
+            add_spill_cost(&mut cost, spilled)?;
+        }
         cost.validate()?;
         return Ok(Some(cost));
     }
@@ -629,7 +645,7 @@ mod resource_contract_tests {
             id: crate::cascades::ids::ResourceGrantClassId(7),
             hard_memory_bytes: 1024 * 1024,
             spill_policy,
-            concurrency_class: 1,
+            max_parallel_tasks: 1,
         }
     }
 
@@ -706,5 +722,27 @@ mod resource_contract_tests {
         assert_eq!(admitted.minimum_memory_bytes, 900 * 1024);
         assert_eq!(admitted.non_revocable_memory_upper, 900 * 1024);
         assert_eq!(admitted.revocable_memory_target, 0);
+    }
+
+    #[test]
+    fn hard_state_upper_does_not_create_expected_spill_when_the_target_fits() {
+        let spill = class(SpillPolicy::Allowed);
+        let mut estimate = cost(2 * 1024 * 1024, 256 * 1024);
+        estimate.revocable_memory_target = 256 * 1024;
+
+        let admitted = cost_for_grant(
+            estimate,
+            GrantDependencyDescriptor::Sensitive,
+            true,
+            GrantGoalKey::Class(spill.id),
+            &BTreeMap::from([(spill.id, spill)]),
+            false,
+        )
+        .unwrap()
+        .expect("spill-bounded state is executable");
+
+        assert_eq!(admitted.peak_memory_upper, spill.hard_memory_bytes);
+        assert_eq!(admitted.revocable_memory_target, 256 * 1024);
+        assert_eq!(admitted.spill_bytes_expected, 0);
     }
 }

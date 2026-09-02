@@ -8,6 +8,11 @@ fn enable_runtime_filter(mut spec: HashJoinSpec) -> HashJoinSpec {
     spec.runtime_filter = Some(paro_optimizer::physical::HashJoinRuntimeFilterSpec {
         artifact: paro_optimizer::physical::identity::Fingerprint(7),
         wait_policy: paro_optimizer::physical::RuntimeFilterWaitPolicy::WaitComplete,
+        resource: paro_optimizer::physical::RuntimeFilterResourceContract::for_keys(
+            &[paro_common::types::LogicalType::Integer],
+            1,
+        )
+        .unwrap(),
     });
     spec
 }

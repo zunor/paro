@@ -35,7 +35,10 @@ pub use plan::{PhysicalPlan, PhysicalPlanNodeArena};
 pub use portfolio::*;
 pub use properties::*;
 pub use requirements::{ProvidedProperties, RequiredProperties};
-pub use resources::ExecutionMemoryContract;
+pub use resources::{
+    ExecutionMemoryContract, RuntimeFilterCapability, RuntimeFilterKeyRepresentation,
+    RuntimeFilterResourceContract,
+};
 pub use row_type::{ColumnIdentity, RowType};
 pub use specs::*;
 pub use verifier::PhysicalPlanVerifier;

@@ -198,6 +198,14 @@ impl SearchCost {
         Ok(())
     }
 
+    /// Memory at which the expected-cost estimate is valid. The peak remains
+    /// a hard resident upper bound; spillable state below that bound is a
+    /// preference and must not make an otherwise executable DOP inadmissible.
+    pub fn preferred_memory_bytes(&self) -> u64 {
+        self.minimum_memory_bytes
+            .saturating_add(self.revocable_memory_target)
+    }
+
     pub fn sequential(self, other: Self) -> Result<Self> {
         if self.external_worker_slots_upper > 0
             && other.external_worker_slots_upper > 0
@@ -217,6 +225,10 @@ impl SearchCost {
         }
         let minimum_memory_bytes = self.minimum_memory_bytes.max(other.minimum_memory_bytes);
         let peak_memory_upper = self.peak_memory_upper.max(other.peak_memory_upper);
+        let preferred_memory_bytes = self
+            .preferred_memory_bytes()
+            .max(other.preferred_memory_bytes())
+            .max(minimum_memory_bytes);
         let result = Self {
             score: ScoreSummary {
                 range: self.score.range.checked_add(other.score.range)?,
@@ -230,10 +242,10 @@ impl SearchCost {
                 .max(other.non_revocable_memory_upper),
             minimum_memory_bytes,
             // Sequential phases never need each other's elastic working set.
-            // Keep the target coupled to the composed floor/peak instead of
-            // independently maximizing three values that may come from three
-            // different phases and form an impossible tuple.
-            revocable_memory_target: peak_memory_upper.saturating_sub(minimum_memory_bytes),
+            // Compose the expected-cost operating point independently from
+            // the spill-bounded hard peak; equating the two makes the largest
+            // grant class practically inadmissible under any process overhead.
+            revocable_memory_target: preferred_memory_bytes.saturating_sub(minimum_memory_bytes),
             peak_memory_upper,
             spill_bytes_expected: self
                 .spill_bytes_expected
@@ -344,6 +356,32 @@ impl SearchCost {
 const _: () = {
     assert!(std::mem::size_of::<SearchCost>() <= 256);
 };
+
+#[cfg(test)]
+mod memory_tests {
+    use super::*;
+
+    #[test]
+    fn sequential_composition_preserves_preferred_memory_below_the_hard_peak() {
+        let first = SearchCost {
+            minimum_memory_bytes: 10,
+            revocable_memory_target: 40,
+            peak_memory_upper: 100,
+            ..SearchCost::ZERO
+        };
+        let second = SearchCost {
+            minimum_memory_bytes: 20,
+            peak_memory_upper: 30,
+            ..SearchCost::ZERO
+        };
+
+        let combined = first.sequential(second).unwrap();
+
+        assert_eq!(combined.minimum_memory_bytes, 20);
+        assert_eq!(combined.preferred_memory_bytes(), 50);
+        assert_eq!(combined.peak_memory_upper, 100);
+    }
+}
 
 #[cfg(test)]
 mod tests {

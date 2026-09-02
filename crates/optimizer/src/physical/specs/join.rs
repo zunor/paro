@@ -18,10 +18,11 @@ pub enum RuntimeFilterWaitPolicy {
 /// Explicit sideways-artifact contract selected by an AuxiliaryPlanRegion.
 /// Absence is the mandatory no-filter fallback; execution may not infer this
 /// contract from the presence of an eligible hash join.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct HashJoinRuntimeFilterSpec {
     pub artifact: Fingerprint,
     pub wait_policy: RuntimeFilterWaitPolicy,
+    pub resource: crate::physical::RuntimeFilterResourceContract,
 }
 
 #[derive(Debug, Clone)]

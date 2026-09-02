@@ -31,7 +31,11 @@ pub(super) fn run_parallel_finish_tasks(
     profiler: &mut OperatorProfiler,
     operator_id: u64,
 ) -> Result<()> {
-    let total_threads = query.session.number_of_threads().max(1);
+    let total_threads = query
+        .session
+        .number_of_threads()
+        .max(1)
+        .min(query.memory.admission_controller().max_slots());
     let scheduler = query.session.scheduler().clone();
     let producer = scheduler.create_producer_with_priority(0);
     let coordinator = Arc::new(WorkGroupCompletion::new(task_ids.len()));

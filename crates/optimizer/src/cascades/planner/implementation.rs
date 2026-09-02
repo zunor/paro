@@ -5,6 +5,26 @@
 
 use super::*;
 
+fn parallel_tasks_for_goal(
+    goal: OptimizationGoal,
+    classes: &BTreeMap<crate::cascades::ids::ResourceGrantClassId, ResourceGrantClass>,
+) -> Result<u16> {
+    match goal.grant {
+        GrantGoalKey::Class(class) => classes
+            .get(&class)
+            .map(|class| class.max_parallel_tasks.max(1))
+            .ok_or_else(|| {
+                paro_error::internal(
+                    "physical implementation references an unknown resource grant class",
+                )
+            }),
+        // Grant-invariant implementations own no task-scaled blocking state.
+        // Keeping their local contract single-task avoids smuggling a session
+        // setting into an otherwise shareable winner.
+        GrantGoalKey::Invariant(_) => Ok(1),
+    }
+}
+
 pub(super) fn register_implementations(
     registry: &mut ImplementationRegistry,
     planner_state: Arc<RwLock<PlannerTransformState>>,
@@ -156,6 +176,7 @@ impl PhysicalImplementation for PlannerBaselineImplementation {
             &cost_facts,
             metadata.implementations.baseline,
             self.calibration.as_ref(),
+            parallel_tasks_for_goal(goal, &self.grant_classes)?,
         )?;
         let spillable = implementation_spillable(metadata, metadata.implementations.baseline);
         let estimated_peak_memory = local_cost.peak_memory_upper;
@@ -315,6 +336,7 @@ impl PhysicalImplementation for AlternativeImplementation {
             &cost_facts,
             self.flavor,
             self.calibration.as_ref(),
+            parallel_tasks_for_goal(goal, &self.grant_classes)?,
         )?;
         let Some(local_cost) = cost_for_grant(
             implementation_cost,

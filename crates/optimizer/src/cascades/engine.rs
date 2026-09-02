@@ -1094,7 +1094,7 @@ fn fit_local_retained_state_to_grant(
             local_cost.peak_memory_upper = grant.hard_memory_bytes;
             local_cost.revocable_memory_target = local_cost
                 .revocable_memory_target
-                .min(grant.hard_memory_bytes - local_cost.minimum_memory_bytes);
+                .min(grant.hard_memory_bytes - retained_minimum);
             return Ok(Some(local_cost));
         }
         return Ok(None);
@@ -1104,13 +1104,16 @@ fn fit_local_retained_state_to_grant(
     }
     if spillable && grant.spill_policy == SpillPolicy::Allowed {
         let spilled = local_cost
-            .peak_memory_upper
+            .revocable_memory_target
+            .saturating_add(retained_minimum)
             .saturating_sub(grant.hard_memory_bytes);
         local_cost.peak_memory_upper = grant.hard_memory_bytes;
         local_cost.revocable_memory_target = local_cost
             .revocable_memory_target
-            .min(grant.hard_memory_bytes - local_cost.minimum_memory_bytes);
-        add_composition_spill_cost(&mut local_cost, spilled)?;
+            .min(grant.hard_memory_bytes - retained_minimum);
+        if spilled > 0 {
+            add_composition_spill_cost(&mut local_cost, spilled)?;
+        }
         return Ok(Some(local_cost));
     }
     Ok(None)

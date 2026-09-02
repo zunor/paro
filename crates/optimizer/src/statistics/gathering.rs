@@ -809,7 +809,24 @@ fn plan_has_single_column_unique_key(plan: &LogicalPlan, binding: ColumnBinding)
         LogicalOperator::Get(get) => crate::statistics::unique_keys::declared_unique_keys(get)
             .iter()
             .any(|key| key.bindings.as_slice() == [binding]),
-        LogicalOperator::Filter(filter) if filter.projection_map.is_all() => {
+        LogicalOperator::Filter(filter)
+            if filter
+                .child
+                .get_column_bindings()
+                .iter()
+                .position(|candidate| *candidate == binding)
+                .is_some_and(|index| {
+                    filter
+                        .projection_map
+                        .to_indices(filter.child.types().len())
+                        .contains(&index)
+                }) =>
+        {
+            // A Filter can project away unrelated payload without weakening a
+            // retained declared key. Requiring ProjectionMap::all() discards
+            // the key exactly after demand pruning has made the dimension
+            // scan narrowest, and prevents downstream joins from applying the
+            // filtered unique-domain selectivity.
             plan_has_single_column_unique_key(&filter.child, binding)
         }
         _ => false,

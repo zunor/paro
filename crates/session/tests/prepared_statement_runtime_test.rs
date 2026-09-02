@@ -213,6 +213,84 @@ fn prepared_aggregate_domain_remains_valid_after_dml() {
     );
 }
 
+async fn run_prepared_join_observes_new_keys_after_dml() {
+    let base_dir = create_unique_test_dir("prepared_statement_runtime", "join_new_keys");
+    let instance = create_persistent_instance(&base_dir);
+    let mut session = Session::new(1, Arc::clone(&instance));
+    let mut sink = CollectingSink::new();
+
+    exec_ok(
+        &mut session,
+        &mut sink,
+        "CREATE TABLE prepared_range_source (k INT)",
+    )
+    .await;
+    exec_ok(
+        &mut session,
+        &mut sink,
+        "CREATE TABLE prepared_range_target (k INT)",
+    )
+    .await;
+    exec_ok(
+        &mut session,
+        &mut sink,
+        "INSERT INTO prepared_range_source VALUES \
+         (1),(2),(1),(2),(1),(2),(1),(2),(1),(2),\
+         (1),(2),(1),(2),(1),(2),(1),(2),(1),(2)",
+    )
+    .await;
+    exec_ok(
+        &mut session,
+        &mut sink,
+        "INSERT INTO prepared_range_target VALUES (1), (2), (100)",
+    )
+    .await;
+    exec_ok(
+        &mut session,
+        &mut sink,
+        "PREPARE prepared_range AS \
+         SELECT t.k, COUNT(*) \
+         FROM prepared_range_source s \
+         JOIN prepared_range_target t ON s.k = t.k \
+         GROUP BY t.k ORDER BY t.k",
+    )
+    .await;
+
+    exec_ok(&mut session, &mut sink, "EXECUTE prepared_range").await;
+    assert_eq!(query_i64_col(&sink, 0), vec![1, 2]);
+    assert_eq!(query_i64_col(&sink, 1), vec![10, 10]);
+
+    // Snapshot-local key domains are estimates, never correctness proofs in a
+    // cached physical plan. A newly visible source key must remain joinable.
+    exec_ok(
+        &mut session,
+        &mut sink,
+        "INSERT INTO prepared_range_source VALUES (100)",
+    )
+    .await;
+    exec_ok(&mut session, &mut sink, "EXECUTE prepared_range").await;
+    assert_eq!(query_i64_col(&sink, 0), vec![1, 2, 100]);
+    assert_eq!(query_i64_col(&sink, 1), vec![10, 10, 1]);
+
+    drop(session);
+    instance
+        .database_registry()
+        .get_database("postgres")
+        .expect("default database")
+        .close(DatabaseCloseAction::Checkpoint)
+        .expect("close prepared join range test database");
+    drop(instance);
+    let _ = std::fs::remove_dir_all(base_dir);
+}
+
+#[test]
+fn prepared_join_observes_new_keys_after_dml() {
+    run_async_test_with_large_stack(
+        "prepared-join-new-keys",
+        run_prepared_join_observes_new_keys_after_dml(),
+    );
+}
+
 async fn run_low_memory_grouped_average_uses_one_resource_contract() {
     let base_dir = create_unique_test_dir("prepared_statement_runtime", "aggregate_low_memory");
     let instance = create_persistent_instance(&base_dir);

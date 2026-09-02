@@ -318,7 +318,6 @@ pub(super) fn stage_transformed_expression(
             implementations,
             grant_dependency: planner_grant_dependency(&plan.operator),
             spillable: planner_operator_spillable(&plan.operator),
-            max_concurrent_tasks: state.max_concurrent_tasks,
             cost_facts: planner_cost_facts(&plan, state.scan_access_cost)?,
             output_columns: output_columns.clone().into_boxed_slice(),
             child_required: intern_child_requirements(

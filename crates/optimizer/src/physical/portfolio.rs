@@ -6,6 +6,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use paro_common::error::{self as paro_error, Result};
+use tracing::debug;
 
 use crate::physical::cost::SearchCost;
 use crate::physical::identity::{Fingerprint, ResourceGrantClassId};
@@ -22,7 +23,9 @@ pub struct ResourceGrantClass {
     pub id: ResourceGrantClassId,
     pub hard_memory_bytes: u64,
     pub spill_policy: SpillPolicy,
-    pub concurrency_class: u16,
+    /// Maximum query-local pipeline tasks admitted for this operating point.
+    /// This is an executable DOP contract, not a cost-model label.
+    pub max_parallel_tasks: u16,
 }
 
 #[derive(Debug, Clone)]
@@ -44,6 +47,7 @@ pub struct ReservationToken {
     pub class: ResourceGrantClassId,
     pub minimum_memory_bytes: u64,
     pub target_memory_bytes: u64,
+    pub max_parallel_tasks: u16,
     pub external_worker_slots: u16,
 }
 
@@ -149,6 +153,7 @@ impl<P> PhysicalPlanPortfolio<P> {
     pub fn admit<F>(
         &self,
         available_memory_bytes: u64,
+        available_parallel_tasks: u16,
         available_external_worker_slots: u16,
         dependency_available: F,
     ) -> Result<AdmittedPlan<P>>
@@ -179,14 +184,28 @@ impl<P> PhysicalPlanPortfolio<P> {
                     .filter(|class| {
                         // A class is one measured/planned operating point, not
                         // merely an upper label. Never reuse its optimistic
-                        // cost below the memory at which it was optimized.
+                        // cost below its explicit preferred working set. The
+                        // hard peak is a spill-bounded resident upper, not a
+                        // reservation that must be empty before admission.
                         (class.hard_memory_bytes <= available_memory_bytes
-                            || variant.cost.peak_memory_upper <= available_memory_bytes)
+                            || variant.cost.preferred_memory_bytes() <= available_memory_bytes)
+                            && class.max_parallel_tasks <= available_parallel_tasks.max(1)
                             && variant.cost.peak_memory_upper <= class.hard_memory_bytes
                             && (variant.cost.spill_bytes_expected == 0
                                 || class.spill_policy == SpillPolicy::Allowed)
                     })
                     .min_by_key(|class| (class.hard_memory_bytes, class.id))?;
+                debug!(
+                    variant_index = index,
+                    class = ?class.id,
+                    dop = class.max_parallel_tasks,
+                    risk_adjusted_cost = variant.cost.score.risk_adjusted,
+                    critical_path = variant.cost.critical_path.expected,
+                    minimum_memory_bytes = variant.cost.minimum_memory_bytes,
+                    peak_memory_upper = variant.cost.peak_memory_upper,
+                    fingerprint = ?variant.physical_fingerprint,
+                    "physical portfolio candidate is admissible"
+                );
                 Some((index, *class))
             })
             .min_by(|(left_index, left_class), (right_index, right_class)| {
@@ -196,6 +215,22 @@ impl<P> PhysicalPlanPortfolio<P> {
                     .score
                     .risk_adjusted
                     .total_cmp(&right.cost.score.risk_adjusted)
+                    .then_with(|| {
+                        left.cost
+                            .critical_path
+                            .expected
+                            .total_cmp(&right.cost.critical_path.expected)
+                    })
+                    // Equal-work variants are distinct resource operating
+                    // points. For the latency objective, consume the greatest
+                    // admitted DOP before falling back to a plan-identity tie
+                    // break; otherwise a fingerprint can silently cap a
+                    // query below the parallelism the caller reserved.
+                    .then_with(|| {
+                        right_class
+                            .max_parallel_tasks
+                            .cmp(&left_class.max_parallel_tasks)
+                    })
                     .then_with(|| left.physical_fingerprint.cmp(&right.physical_fingerprint))
                     .then_with(|| {
                         left_class
@@ -215,7 +250,11 @@ impl<P> PhysicalPlanPortfolio<P> {
             reservation: ReservationToken {
                 class: selected_class.id,
                 minimum_memory_bytes: selected.cost.minimum_memory_bytes,
-                target_memory_bytes: selected.cost.peak_memory_upper.min(available_memory_bytes),
+                target_memory_bytes: selected
+                    .cost
+                    .preferred_memory_bytes()
+                    .min(available_memory_bytes),
+                max_parallel_tasks: selected_class.max_parallel_tasks,
                 external_worker_slots: selected.cost.external_worker_slots_upper,
             },
             physical_fingerprint: selected.physical_fingerprint,
@@ -376,13 +415,13 @@ mod tests {
                 id: ResourceGrantClassId(1),
                 hard_memory_bytes: 10,
                 spill_policy: SpillPolicy::Allowed,
-                concurrency_class: 0,
+                max_parallel_tasks: 1,
             },
             ResourceGrantClass {
                 id: ResourceGrantClassId(2),
                 hard_memory_bytes: 20,
                 spill_policy: SpillPolicy::Allowed,
-                concurrency_class: 0,
+                max_parallel_tasks: 1,
             },
         ];
         let portfolio = PhysicalPlanPortfolio::build(
@@ -405,13 +444,13 @@ mod tests {
                     id: ResourceGrantClassId(1),
                     hard_memory_bytes: 100,
                     spill_policy: SpillPolicy::Allowed,
-                    concurrency_class: 0,
+                    max_parallel_tasks: 1,
                 },
                 ResourceGrantClass {
                     id: ResourceGrantClassId(2),
                     hard_memory_bytes: 20,
                     spill_policy: SpillPolicy::Allowed,
-                    concurrency_class: 0,
+                    max_parallel_tasks: 1,
                 },
             ],
             [
@@ -430,28 +469,29 @@ mod tests {
             ],
         )
         .unwrap();
-        let admitted = portfolio.admit(20, 0, |_| true).unwrap();
+        let admitted = portfolio.admit(20, 1, 0, |_| true).unwrap();
         assert_eq!(admitted.plan, "small");
         assert_eq!(admitted.reservation.minimum_memory_bytes, 10);
         assert_eq!(admitted.reservation.target_memory_bytes, 10);
     }
 
     #[test]
-    fn admission_does_not_extrapolate_a_large_grant_cost_below_its_operating_point() {
+    fn admission_respects_the_costed_preferred_memory_operating_point() {
         let large = ResourceGrantClass {
             id: ResourceGrantClassId(1),
             hard_memory_bytes: 100,
             spill_policy: SpillPolicy::Allowed,
-            concurrency_class: 0,
+            max_parallel_tasks: 1,
         };
         let small = ResourceGrantClass {
             id: ResourceGrantClassId(2),
             hard_memory_bytes: 10,
             spill_policy: SpillPolicy::Allowed,
-            concurrency_class: 0,
+            max_parallel_tasks: 1,
         };
         let mut large_cost = cost(1.0, 100);
         large_cost.minimum_memory_bytes = 1;
+        large_cost.revocable_memory_target = 99;
         let portfolio = PhysicalPlanPortfolio::build(
             [large, small],
             [
@@ -462,13 +502,94 @@ mod tests {
         .unwrap();
 
         assert_eq!(
-            portfolio.admit(10, 0, |_| true).unwrap().plan,
+            portfolio.admit(10, 1, 0, |_| true).unwrap().plan,
             "small-slower"
         );
         assert_eq!(
-            portfolio.admit(100, 0, |_| true).unwrap().plan,
+            portfolio.admit(100, 1, 0, |_| true).unwrap().plan,
             "large-fast"
         );
+    }
+
+    #[test]
+    fn spill_bounded_peak_does_not_hide_a_fitting_preferred_operating_point() {
+        let class = ResourceGrantClass {
+            id: ResourceGrantClassId::new(0),
+            hard_memory_bytes: 100,
+            spill_policy: SpillPolicy::Allowed,
+            max_parallel_tasks: 4,
+        };
+        let mut operating_cost = cost(1.0, 100);
+        operating_cost.minimum_memory_bytes = 5;
+        operating_cost.revocable_memory_target = 5;
+        let portfolio = PhysicalPlanPortfolio::build(
+            [class],
+            [(class.id, "parallel", Fingerprint(1), operating_cost)],
+        )
+        .unwrap();
+
+        let admitted = portfolio.admit(10, 4, 0, |_| true).unwrap();
+
+        assert_eq!(admitted.plan, "parallel");
+        assert_eq!(admitted.reservation.target_memory_bytes, 10);
+    }
+
+    #[test]
+    fn admission_selects_a_plan_whose_dop_is_currently_executable() {
+        let serial = ResourceGrantClass {
+            id: ResourceGrantClassId(1),
+            hard_memory_bytes: 20,
+            spill_policy: SpillPolicy::Allowed,
+            max_parallel_tasks: 1,
+        };
+        let parallel = ResourceGrantClass {
+            id: ResourceGrantClassId(2),
+            hard_memory_bytes: 100,
+            spill_policy: SpillPolicy::Allowed,
+            max_parallel_tasks: 8,
+        };
+        let portfolio = PhysicalPlanPortfolio::build(
+            [serial, parallel],
+            [
+                (serial.id, "serial", Fingerprint(1), cost(2.0, 20)),
+                (parallel.id, "parallel", Fingerprint(2), cost(1.0, 100)),
+            ],
+        )
+        .unwrap();
+
+        let admitted = portfolio.admit(100, 2, 0, |_| true).unwrap();
+
+        assert_eq!(admitted.plan, "serial");
+        assert_eq!(admitted.reservation.max_parallel_tasks, 1);
+    }
+
+    #[test]
+    fn equal_work_prefers_the_highest_admitted_dop_for_latency() {
+        let serial = ResourceGrantClass {
+            id: ResourceGrantClassId::new(0),
+            hard_memory_bytes: 100,
+            spill_policy: SpillPolicy::Allowed,
+            max_parallel_tasks: 1,
+        };
+        let parallel = ResourceGrantClass {
+            id: ResourceGrantClassId::new(1),
+            hard_memory_bytes: 200,
+            spill_policy: SpillPolicy::Allowed,
+            max_parallel_tasks: 8,
+        };
+        let portfolio = PhysicalPlanPortfolio::build(
+            [serial, parallel],
+            [
+                (serial.id, "serial", Fingerprint(1), cost(1.0, 100)),
+                (parallel.id, "parallel", Fingerprint(2), cost(1.0, 100)),
+            ],
+        )
+        .unwrap();
+
+        let admitted = portfolio.admit(200, 8, 0, |_| true).unwrap();
+
+        assert_eq!(admitted.plan, "parallel");
+        assert_eq!(admitted.reservation.max_parallel_tasks, 8);
     }
 
     #[test]
@@ -477,7 +598,7 @@ mod tests {
             id: ResourceGrantClassId(1),
             hard_memory_bytes: 100,
             spill_policy: SpillPolicy::Allowed,
-            concurrency_class: 0,
+            max_parallel_tasks: 1,
         };
         let portfolio = PhysicalPlanPortfolio::build(
             [class],
@@ -497,7 +618,7 @@ mod tests {
             id: ResourceGrantClassId(1),
             hard_memory_bytes: 100,
             spill_policy: SpillPolicy::Allowed,
-            concurrency_class: 0,
+            max_parallel_tasks: 1,
         };
         let portfolio = PhysicalPlanPortfolio::build(
             [class],
@@ -508,7 +629,9 @@ mod tests {
         )
         .unwrap();
 
-        let admitted = portfolio.admit(100, 0, |plan| *plan == "baseline").unwrap();
+        let admitted = portfolio
+            .admit(100, 1, 0, |plan| *plan == "baseline")
+            .unwrap();
         assert_eq!(admitted.plan, "baseline");
     }
 }

@@ -259,7 +259,19 @@ impl TopNHeap {
         // reject.
         let boundary_key = boundary.and_then(TopNBoundaryValue::get_boundary);
 
-        if self.heap_size <= SMALL_HEAP_THRESHOLD {
+        // The first batch often already is the complete input of a small
+        // aggregate or DISTINCT.  Retain its immutable vectors directly while
+        // the frontier is still underfilled; copying every value into a new
+        // chunk only to gather it again at seal adds work without reducing the
+        // bounded state.  Subsequent batches keep using the regular heap path,
+        // which compacts discarded payloads once the frontier fills.
+        if self.heap.len() == 0
+            && self.heap_data.is_empty()
+            && payload_chunk.size() <= self.heap_size
+            && boundary_key.is_none()
+        {
+            self.seed_underfilled_frontier(payload_chunk, sort_chunk)?;
+        } else if self.heap_size <= SMALL_HEAP_THRESHOLD {
             self.add_small_heap_with_sort(payload_chunk, sort_chunk, boundary_key.as_deref())?;
         } else {
             self.add_large_heap_with_sort(payload_chunk, sort_chunk, boundary_key.as_deref())?;
@@ -275,6 +287,26 @@ impl TopNHeap {
             }
         }
 
+        Ok(())
+    }
+
+    fn seed_underfilled_frontier(
+        &mut self,
+        payload_chunk: &Chunk,
+        sort_chunk: &Chunk,
+    ) -> Result<()> {
+        debug_assert_eq!(payload_chunk.size(), sort_chunk.size());
+        debug_assert!(payload_chunk.size() <= self.heap_size);
+
+        // Retain before publishing row addresses so an accounting failure
+        // cannot leave heap entries referring to an absent payload chunk.
+        self.heap_data.push(payload_chunk.clone())?;
+        let mut sort_key = Vec::new();
+        for row_index in 0..sort_chunk.size() {
+            self.encode_sort_key_into(sort_chunk, row_index, &mut sort_key)?;
+            let entry = TopNEntry::try_from_scratch(&mut sort_key, row_index, &self.memory)?;
+            self.heap.try_push(entry)?;
+        }
         Ok(())
     }
 
@@ -876,6 +908,22 @@ mod tests {
             .unwrap();
 
         assert_eq!(extract_ints(&mut worker_heap), vec![0, 2]);
+    }
+
+    #[test]
+    fn underfilled_first_batch_retains_payload_vectors_until_seal() {
+        let input = make_int_chunk(&[3, 1, 2]);
+        let input_vector = Arc::clone(input.column(0).unwrap());
+        let mut heap = manual_heap(&[], std::iter::empty(), 100);
+
+        heap.sink_with_sort_chunk(&input, &input, None).unwrap();
+
+        assert_eq!(heap.heap_data.len(), 1);
+        assert!(Arc::ptr_eq(
+            heap.heap_data.as_slice()[0].column(0).unwrap(),
+            &input_vector,
+        ));
+        assert_eq!(extract_ints(&mut heap), vec![1, 2, 3]);
     }
 
     #[test]

@@ -326,10 +326,83 @@ impl RowsetSourceExec {
                 }
             }
         }
+        order_conjuncts_by_selectivity(&mut predicates, &self.desc.table);
         Ok(EffectivePredicate {
             tree: combine_predicates(predicates),
             has_runtime_conjunct,
         })
+    }
+}
+
+/// Order independent top-level conjuncts using facts available only after
+/// runtime-filter publication.  Frozen exact domains provide a substantially
+/// better signal than physical column order for staged rowset evaluation.
+/// Unknown predicates retain their original relative order.
+fn order_conjuncts_by_selectivity(
+    predicates: &mut [PredicateTree],
+    table: &paro_catalog::entry::TableCatalogEntry,
+) {
+    let Some(storage) = table.get_storage() else {
+        return;
+    };
+    // Hints are non-negative finite values or +infinity, whose IEEE bit
+    // ordering is the same as numeric ordering. Cache them so sorting several
+    // dynamic filters does not repeatedly aggregate table statistics.
+    predicates
+        .sort_by_cached_key(|predicate| predicate_selectivity_hint(predicate, storage).to_bits());
+}
+
+fn predicate_selectivity_hint(
+    tree: &PredicateTree,
+    storage: &paro_storage::table::table_handle::TableHandle,
+) -> f64 {
+    match tree {
+        PredicateTree::Leaf(predicate) => {
+            let Some(column_id) = predicate.index_column_id() else {
+                return 1.0;
+            };
+            let distinct = storage
+                .column_statistics(column_id as usize)
+                .map(|statistics| statistics.get_distinct_count())
+                .filter(|distinct| *distinct > 0)
+                .map(|distinct| distinct as f64);
+            match predicate {
+                Predicate::Eq { .. } => distinct.map_or(1.0, |count| 1.0 / count),
+                Predicate::In { values, .. } => distinct.map_or(values.len() as f64, |count| {
+                    (values.len() as f64 / count).clamp(0.0, 1.0)
+                }),
+                Predicate::FixedIn { values, .. } => distinct
+                    .map_or(values.len() as f64, |count| {
+                        (values.len() as f64 / count).clamp(0.0, 1.0)
+                    }),
+                _ => f64::INFINITY,
+            }
+        }
+        PredicateTree::And(children) => {
+            let mut product = 1.0;
+            for child in children {
+                let hint = predicate_selectivity_hint(child, storage);
+                if hint == 0.0 {
+                    return 0.0;
+                }
+                if !hint.is_finite() {
+                    return f64::INFINITY;
+                }
+                product *= hint;
+            }
+            product
+        }
+        PredicateTree::Or(children) => {
+            let mut sum = 0.0;
+            for child in children {
+                let hint = predicate_selectivity_hint(child, storage);
+                if !hint.is_finite() {
+                    return f64::INFINITY;
+                }
+                sum += hint;
+            }
+            sum
+        }
     }
 }
 
@@ -674,7 +747,9 @@ fn rowset_morsel_rows(total_rows: u64, parallelism: usize) -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use paro_catalog::entry::ColumnDefinition;
+    use paro_catalog::entry::{CatalogObjectId, ColumnDefinition, TableCatalogEntry};
+    use paro_storage::index::FixedMembership;
+    use paro_storage::table::table_factory::TableFactory;
 
     fn scalar_filter(comparison: JoinComparisonType) -> RowsetDynamicScalarFilterDesc {
         RowsetDynamicScalarFilterDesc {
@@ -766,6 +841,43 @@ mod tests {
         )
         .expect("runtime predicate should be prepared");
         assert!(!gated.materialization.is_late());
+    }
+
+    #[test]
+    fn exact_runtime_domains_order_staged_conjuncts_by_selectivity() {
+        let table = TableCatalogEntry::new(
+            "test".to_string(),
+            "main".to_string(),
+            "predicate_order".to_string(),
+            vec![
+                ColumnDefinition::new("a".to_string(), LogicalType::Integer),
+                ColumnDefinition::new("b".to_string(), LogicalType::Integer),
+            ],
+            Arc::new(
+                TableFactory::default()
+                    .create_table(&[LogicalType::Integer, LogicalType::Integer])
+                    .unwrap(),
+            ),
+            CatalogObjectId::from_raw(42_001),
+            0,
+        );
+        let mut predicates = vec![
+            PredicateTree::leaf(Predicate::FixedIn {
+                column_id: 1,
+                values: FixedMembership::i32((0..10).collect()),
+            }),
+            PredicateTree::leaf(Predicate::FixedIn {
+                column_id: 0,
+                values: FixedMembership::i32(vec![1, 2]),
+            }),
+        ];
+
+        order_conjuncts_by_selectivity(&mut predicates, &table);
+
+        assert!(matches!(
+            &predicates[0],
+            PredicateTree::Leaf(Predicate::FixedIn { column_id: 0, .. })
+        ));
     }
 
     #[test]
