@@ -146,9 +146,28 @@ impl<'a> PipelineScheduler<'a> {
                     "pipeline scheduler dequeued a pipeline before its gates opened",
                 ));
             }
-            let mut candidates = vec![(entry, self.runtime(pipeline)?)];
-            let wave_width = self.query.max_parallel_tasks();
-            while candidates.len() < wave_width {
+            let first_runtime = self.runtime(pipeline)?;
+            let task_budget = self.query.max_parallel_tasks();
+            let first_properties = &self
+                .graph
+                .pipeline(pipeline)
+                .ok_or_else(|| paro_error::internal("pipeline spec missing"))?
+                .properties;
+            let mut desired_slots = source_work(&first_runtime.source_global)?.map_or(0, |work| {
+                pipeline_thread_count(
+                    first_properties.capabilities.parallelism,
+                    work.work_unit_count(),
+                    self.query.as_ref(),
+                )
+            });
+            let mut candidates = vec![(entry, first_runtime)];
+            // Form a work-conserving wave by useful parallelism, not by ready
+            // pipeline count. A source that can consume the admitted DOP runs
+            // as its own wave; otherwise independent narrow sources fill the
+            // unused slots. This prevents unrelated one-task build pipelines
+            // from permanently pinning a large scan to one worker for the
+            // entire wave.
+            while desired_slots < task_budget && candidates.len() < task_budget {
                 let Some(entry) = self.ready.pop() else {
                     break;
                 };
@@ -161,7 +180,22 @@ impl<'a> PipelineScheduler<'a> {
                         "pipeline scheduler dequeued a pipeline before its gates opened",
                     ));
                 }
-                candidates.push((entry, self.runtime(pipeline)?));
+                let runtime = self.runtime(pipeline)?;
+                let properties = &self
+                    .graph
+                    .pipeline(pipeline)
+                    .ok_or_else(|| paro_error::internal("pipeline spec missing"))?
+                    .properties;
+                desired_slots = desired_slots.saturating_add(
+                    source_work(&runtime.source_global)?.map_or(0, |work| {
+                        pipeline_thread_count(
+                            properties.capabilities.parallelism,
+                            work.work_unit_count(),
+                            self.query.as_ref(),
+                        )
+                    }),
+                );
+                candidates.push((entry, runtime));
             }
 
             let mut source_capable = 0usize;
