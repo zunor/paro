@@ -13,6 +13,22 @@ pub(super) fn matches_transformation(
 ) -> bool {
     use LogicalOperatorType as Op;
 
+    // Region owners publish a complete local frontier. Re-running one on an
+    // expression from that frontier does not discover another search space:
+    // join enumeration only permutes an already-enumerated region, while
+    // dimension deferral would wrap the same dimension in another
+    // semi-join/aggregate/rejoin layer. Keep the frontier finite by making
+    // this ownership explicit rather than relying on the per-expression rule
+    // history, which is necessarily empty on newly inserted expressions.
+    if matches!(
+        transformation,
+        PlannerTransformation::JoinRegionEnumeration
+            | PlannerTransformation::AggregateDimensionDeferral
+    ) && expression_was_produced_by(expr, transformation.id())
+    {
+        return false;
+    }
+
     let Some(metadata) = state.metadata.get(&expr.payload) else {
         return false;
     };
@@ -113,6 +129,21 @@ pub(super) fn matches_transformation(
                 && canonical_subtree_has_scalar_aggregate_join(expr, memo, state)
         }
     }
+}
+
+fn expression_was_produced_by(expr: &crate::cascades::memo::LogicalExpr, rule: RuleId) -> bool {
+    expr.proofs.iter().any(|proof| {
+        matches!(
+            proof,
+            EquivalenceProof::Transformation {
+                rule: producer,
+                ..
+            } | EquivalenceProof::SpecializedEnumerator {
+                rule: producer,
+                ..
+            } if *producer == rule
+        )
+    })
 }
 
 fn is_positive_consumed_mark_filter(
@@ -443,4 +474,52 @@ fn canonical_subtree_expression_any(
         pending.extend(candidate.key.children.iter().copied());
     }
     false
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn expression_with(proof: EquivalenceProof) -> crate::cascades::memo::LogicalExpr {
+        crate::cascades::memo::LogicalExpr {
+            id: LogicalExprId(7),
+            key: crate::cascades::memo::LogicalExprKey {
+                operator: Fingerprint(11),
+                scalars: Box::new([]),
+                children: Box::new([]),
+            },
+            payload: LogicalPayloadId(13),
+            proofs: [proof].into_iter().collect(),
+            applied_rules: BTreeSet::new(),
+        }
+    }
+
+    #[test]
+    fn region_owner_recognizes_its_transformation_frontier() {
+        let expression = expression_with(EquivalenceProof::Transformation {
+            rule: AGGREGATE_DIMENSION_DEFERRAL_RULE,
+            source: LogicalExprId(3),
+            premise: Fingerprint(5),
+        });
+        assert!(expression_was_produced_by(
+            &expression,
+            AGGREGATE_DIMENSION_DEFERRAL_RULE
+        ));
+        assert!(!expression_was_produced_by(
+            &expression,
+            JOIN_REGION_ENUMERATION_RULE
+        ));
+    }
+
+    #[test]
+    fn region_owner_recognizes_a_specialized_frontier() {
+        let expression = expression_with(EquivalenceProof::SpecializedEnumerator {
+            rule: JOIN_REGION_ENUMERATION_RULE,
+            region: Fingerprint(17),
+        });
+        assert!(expression_was_produced_by(
+            &expression,
+            JOIN_REGION_ENUMERATION_RULE
+        ));
+    }
 }
