@@ -196,7 +196,7 @@ impl SortBuildSinkExec {
             ));
         };
         let handle = global.handle.clone();
-        let num_threads = ctx.query.session.number_of_threads();
+        let num_threads = ctx.query.max_parallel_tasks();
         if let Some(work) = prepare_parallel_sort_finalize(
             Arc::clone(&handle),
             num_threads,
@@ -318,7 +318,7 @@ pub(crate) fn sort_run_target_bytes(query: &QueryRuntimeContext, force_external:
     let target = if query_cap >= usize::MAX / 8 {
         DEFAULT_SORT_RUN_TARGET_BYTES
     } else {
-        query_cap / query.session.number_of_threads().max(1)
+        query_cap / query.max_parallel_tasks()
     };
     target.max(paro_storage::buffer::DEFAULT_BLOCK_SIZE)
 }

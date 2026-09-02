@@ -136,11 +136,7 @@ impl CopyToFileSinkExec {
     ) -> Result<FinishPoll> {
         let global = copy_to_global(global)?;
         if self.spec.per_thread_output {
-            finalize_empty_thread_outputs(
-                &self.spec,
-                global,
-                ctx.query.session.number_of_threads().max(1),
-            )?;
+            finalize_empty_thread_outputs(&self.spec, global, ctx.query.max_parallel_tasks())?;
         } else {
             let global_lock = global
                 .global_state

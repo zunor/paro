@@ -149,9 +149,9 @@ impl PhysicalPlanVerifier {
                         })
                         .count();
                     runtime_filter.resource.validate(equality_key_count)?;
-                    if let Some(reservation) = plan.reservation {
+                    if let Some(resources) = plan.execution_resources {
                         if runtime_filter.resource.max_local_builders
-                            != reservation.max_parallel_tasks
+                            != resources.max_parallel_tasks
                         {
                             return Err(paro_error::internal(
                                 "runtime-filter builder count disagrees with admitted DOP",
@@ -340,23 +340,27 @@ impl PhysicalPlanVerifier {
                 }
             }
         }
-        if let Some(reservation) = plan.reservation {
+        if let Some(resources) = plan.execution_resources {
             let root = plan
                 .properties
                 .get(plan.root)
                 .ok_or_else(|| paro_error::internal("admitted plan root has no properties"))?;
-            if root.cumulative_cost.minimum_memory_bytes > reservation.minimum_memory_bytes
-                || reservation.minimum_memory_bytes > reservation.target_memory_bytes
-                || reservation.target_memory_bytes > root.cumulative_cost.peak_memory_upper
+            if root.cumulative_cost.minimum_memory_bytes > resources.minimum_memory_bytes
+                || resources.minimum_memory_bytes > resources.working_set_memory_bytes
+                || root.cumulative_cost.preferred_memory_bytes()
+                    > resources.working_set_memory_bytes
+                || resources.working_set_memory_bytes > resources.memory_ceiling_bytes
+                || root.cumulative_cost.peak_memory_upper > resources.memory_ceiling_bytes
                 || root.cumulative_cost.external_worker_slots_upper
-                    > reservation.external_worker_slots
+                    > resources.external_worker_slots
+                || resources.max_parallel_tasks == 0
             {
                 return Err(paro_error::internal(
-                    "admitted plan exceeds its bound reservation token",
+                    "admitted plan exceeds its execution resource contract",
                 ));
             }
             if let crate::physical::PhysicalGrantContract::Class(required) = root.grant_contract {
-                if required != reservation.class {
+                if required != resources.class {
                     return Err(paro_error::internal(
                         "admitted plan reservation has the wrong grant class",
                     ));

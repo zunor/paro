@@ -77,11 +77,7 @@ const HASH_AGGREGATE_MIN_ADAPTIVE_BUILD_CAPACITY: usize = 8 * 1024 * 1024;
 
 #[inline]
 fn admitted_parallelism(query: &crate::runtime::context::QueryRuntimeContext) -> usize {
-    query
-        .session
-        .number_of_threads()
-        .max(1)
-        .min(query.memory.admission_controller().max_slots())
+    query.max_parallel_tasks()
 }
 
 /// Sink operator that builds hash aggregate tables (one per grouping set).

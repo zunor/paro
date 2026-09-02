@@ -22,7 +22,7 @@ use paro_scheduler::task::{
 
 use crate::explain::profiler::{OperatorProfiler, ProfileMorselRange, ProfileWorkerContext};
 use crate::explain::types::ExplainRuntimeStats;
-use crate::memory_runtime::{AdmissionWaiterId, PipelineAdmissionGuard};
+use crate::memory_runtime::{QueryTaskPermit, TaskPermitWaiterId};
 use crate::physical::properties::Parallelism;
 use crate::pipeline::graph::{PipelineGraph, PipelineId, SinkSharing};
 use crate::pipeline::PipelineProgramSet;
@@ -72,7 +72,7 @@ impl<'a> PipelineScheduler<'a> {
         graph: &PipelineGraph,
         query: &QueryRuntimeContext,
     ) -> bool {
-        query.memory.admission_controller().max_slots() > 1
+        query.memory.task_permits().max_permits() > 1
             && Self::should_use_parallel_scheduler_for_session(graph, query.session.as_ref())
     }
 
@@ -147,12 +147,7 @@ impl<'a> PipelineScheduler<'a> {
                 ));
             }
             let mut candidates = vec![(entry, self.runtime(pipeline)?)];
-            let wave_width = self
-                .query
-                .session
-                .number_of_threads()
-                .max(1)
-                .min(self.query.memory.admission_controller().max_slots());
+            let wave_width = self.query.max_parallel_tasks();
             while candidates.len() < wave_width {
                 let Some(entry) = self.ready.pop() else {
                     break;
@@ -230,12 +225,7 @@ impl<'a> PipelineScheduler<'a> {
                 self.query.as_ref(),
             ));
         }
-        let task_budget = self
-            .query
-            .session
-            .number_of_threads()
-            .max(1)
-            .min(self.query.memory.admission_controller().max_slots());
+        let task_budget = self.query.max_parallel_tasks();
         let task_limits =
             allocate_wave_task_slots(&desired_tasks, task_budget).ok_or_else(|| {
                 paro_error::internal("ready pipeline wave exceeds its admitted query task budget")
@@ -458,11 +448,7 @@ fn pipeline_thread_count(
     if !query.session.limits.parallel_scheduler || parallelism.max <= 1 || work_unit_count <= 1 {
         return 1;
     }
-    let threads = query
-        .session
-        .number_of_threads()
-        .max(1)
-        .min(query.memory.admission_controller().max_slots());
+    let threads = query.max_parallel_tasks();
     parallelism
         .max
         .min(threads)
@@ -1155,9 +1141,9 @@ impl PipelineWorkerTask {
                     );
             }
         }
-        let _admission = match self.try_enter_admission()? {
-            AdmissionEntry::Acquired(guard) => guard,
-            AdmissionEntry::Blocked(blocker) => {
+        let _task_permit = match self.try_acquire_task_permit()? {
+            TaskPermitEntry::Acquired(permit) => permit,
+            TaskPermitEntry::Blocked(blocker) => {
                 self.profiler
                     .as_mut()
                     .expect("profiler initialized")
@@ -1250,24 +1236,23 @@ impl PipelineWorkerTask {
         }
     }
 
-    fn try_enter_admission(&self) -> Result<AdmissionEntry> {
+    fn try_acquire_task_permit(&self) -> Result<TaskPermitEntry> {
         let wake = self
             .wake_scope()
-            .register(WakeSource::Memory, WakeToken(self.work.id.0));
+            .register(WakeSource::TaskPermit, WakeToken(self.work.id.0));
         let key = wake.key();
         let query = self.query.clone();
         let interrupt = InterruptState::with_callback(Arc::new(move || {
             query.wake_events.wake(key);
             Ok(())
         }));
-        let controller = self.query.memory.admission_controller();
-        if let Some(guard) =
-            controller.try_acquire_for(AdmissionWaiterId(self.work.id.0), interrupt)
+        let permits = self.query.memory.task_permits();
+        if let Some(permit) = permits.try_acquire_for(TaskPermitWaiterId(self.work.id.0), interrupt)
         {
-            return Ok(AdmissionEntry::Acquired(guard));
+            return Ok(TaskPermitEntry::Acquired(permit));
         }
-        Ok(AdmissionEntry::Blocked(
-            Blocker::new(crate::runtime::BlockReason::Memory).with_wake(wake),
+        Ok(TaskPermitEntry::Blocked(
+            Blocker::new(crate::runtime::BlockReason::TaskPermit).with_wake(wake),
         ))
     }
 
@@ -1279,8 +1264,8 @@ impl PipelineWorkerTask {
     }
 }
 
-enum AdmissionEntry {
-    Acquired(PipelineAdmissionGuard),
+enum TaskPermitEntry {
+    Acquired(QueryTaskPermit),
     Blocked(Blocker),
 }
 
@@ -1479,6 +1464,7 @@ fn wake_key_ready(query: &QueryRuntimeContext, key: WakeKey) -> Option<u64> {
         WakeSource::OutputBuffer => (query.output.wake_generation() != key.generation).then_some(0),
         WakeSource::Cancellation => query.cancellation.is_cancelled().then_some(0),
         WakeSource::Memory
+        | WakeSource::TaskPermit
         | WakeSource::Spill
         | WakeSource::ExternalRuntime
         | WakeSource::DerivedIndex => query.wake_events.take_ready_with_coalesced(key),

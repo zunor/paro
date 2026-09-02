@@ -399,7 +399,7 @@ impl HashJoinBuildSinkExec {
                         ParallelDirectJoinFinalizeDriver::group(
                             handle,
                             build,
-                            ctx.query.session.number_of_threads().max(1),
+                            ctx.query.max_parallel_tasks(),
                         ),
                     ));
                 }

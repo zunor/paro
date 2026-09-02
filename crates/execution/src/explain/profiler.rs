@@ -436,6 +436,7 @@ impl OperatorProfiler {
                 wait_reason: Some(reason),
                 memory_class: Some(match blocker.reason {
                     BlockReason::Memory => "revocable",
+                    BlockReason::TaskPermit => "runtime",
                     BlockReason::Spill => "spill",
                     _ => "runtime",
                 }),
@@ -608,6 +609,7 @@ fn merge_sum(target: &mut Option<u64>, value: Option<u64>) {
 fn block_reason_name(reason: &BlockReason) -> &'static str {
     match reason {
         BlockReason::Memory => "memory",
+        BlockReason::TaskPermit => "task_permit",
         BlockReason::Spill => "spill",
         BlockReason::ExternalRuntime => "external_runtime",
         BlockReason::DerivedIndex => "derived_index",

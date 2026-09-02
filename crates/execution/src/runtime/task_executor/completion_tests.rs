@@ -774,6 +774,7 @@ fn cancellation_cleans_pending_finish_group_without_recording_operator_error() {
 fn finish_group_pending_blockers_keep_wake_registration() {
     for (reason, source) in [
         (BlockReason::Memory, WakeSource::Memory),
+        (BlockReason::TaskPermit, WakeSource::TaskPermit),
         (BlockReason::Spill, WakeSource::Spill),
         (BlockReason::ExternalRuntime, WakeSource::ExternalRuntime),
     ] {

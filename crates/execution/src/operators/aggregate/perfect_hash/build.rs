@@ -246,11 +246,7 @@ impl PerfectHashAggregateSinkExec {
             .flatten();
         prepare_parallel_perfect_merge(
             global.handle.clone(),
-            ctx.query
-                .session
-                .number_of_threads()
-                .max(1)
-                .min(ctx.query.memory.admission_controller().max_slots()),
+            ctx.query.max_parallel_tasks(),
             if post_state_filter.is_some() {
                 post_state_filter
             } else if self.spec.post_reduction.is_some() {

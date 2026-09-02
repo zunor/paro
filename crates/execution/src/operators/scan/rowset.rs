@@ -176,7 +176,7 @@ impl RowsetSourceExec {
             &self.desc.column_projection,
             &self.desc.table.columns,
         );
-        let morsels = build_scan_morsels(&segments, ctx.query.session.number_of_threads().max(1));
+        let morsels = build_scan_morsels(&segments, ctx.query.max_parallel_tasks());
 
         Ok(SourceGlobal::Rowset(Arc::new(RowsetSourceGlobal {
             table_index: self.desc.table_index,

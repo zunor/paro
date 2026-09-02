@@ -793,7 +793,8 @@ mod tests {
         TestProjectExecutor,
     };
     use crate::memory_runtime::{
-        LocalMemoryGrant, OperatorMemoryAccount, OperatorMemoryScope, QueryMemoryPool,
+        ExecutionLease, LocalMemoryGrant, OperatorMemoryAccount, OperatorMemoryScope,
+        QueryMemoryPool,
     };
     use crate::operators::external::batching::SubmissionBatchPolicy;
     use crate::runtime::{ParameterBindings, QueryOutputPort, QueryRuntimeContext};
@@ -814,6 +815,7 @@ mod tests {
         ExternalRuntimeHost, PythonRuntimeProbe, PythonRuntimeProbeResult, PythonRuntimeProvider,
     };
     use paro_function::scalar::ScalarFunction;
+    use paro_optimizer::physical::{ExecutionResourceContract, ResourceGrantClassId};
     use paro_planner::expression::{Expression, FunctionExpression, ReferenceExpression};
     use paro_planner::operator::external_project::ExternalProjectExpression;
     use std::sync::Arc;
@@ -985,7 +987,23 @@ mod tests {
             .try_acquire_execution_slots(1, 1)
             .unwrap()
             .expect("test query should acquire a worker slot");
-        ctx.memory.attach_external_worker_lease(lease);
+        ctx.memory
+            .install_execution_lease(
+                ExecutionLease::new(
+                    ExecutionResourceContract {
+                        class: ResourceGrantClassId::new(0),
+                        minimum_memory_bytes: 0,
+                        working_set_memory_bytes: 0,
+                        memory_ceiling_bytes: u64::try_from(ctx.memory.capacity_bytes())
+                            .unwrap_or(u64::MAX),
+                        max_parallel_tasks: 1,
+                        external_worker_slots: 1,
+                    },
+                    Some(lease),
+                )
+                .unwrap(),
+            )
+            .unwrap();
         let response = match bridge
             .execute_project(&ctx, &submission, &test_operator_memory_scope())
             .expect("project bridge should succeed")

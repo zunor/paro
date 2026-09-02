@@ -278,11 +278,7 @@ pub(crate) fn consume_ungrouped_sink_local(
             &local.aggregate_objects,
             payload,
             &groups,
-            ctx.query
-                .session
-                .number_of_threads()
-                .max(1)
-                .min(ctx.query.memory.admission_controller().max_slots()),
+            ctx.query.max_parallel_tasks(),
             ctx.query.memory.capacity_bytes(),
             &local.modifier_memory,
             &mut local.distinct,

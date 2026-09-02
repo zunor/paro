@@ -183,10 +183,12 @@ impl UtilityProgram {
 }
 
 impl StatementProgram {
-    pub fn reservation(&self) -> Option<paro_optimizer::physical::ReservationToken> {
+    pub fn execution_resources(
+        &self,
+    ) -> Option<paro_optimizer::physical::ExecutionResourceContract> {
         match self {
-            Self::Pipeline { plan, .. } => plan.reservation,
-            Self::ExplainAnalyze { target, .. } => target.reservation(),
+            Self::Pipeline { plan, .. } => plan.execution_resources,
+            Self::ExplainAnalyze { target, .. } => target.execution_resources(),
             Self::Portfolio(_) | Self::Utility(_) => None,
         }
     }
@@ -236,7 +238,7 @@ impl StatementProgram {
             available_external_worker_slots,
             dependency_available,
         )?;
-        admitted.plan.reservation = Some(admitted.reservation);
+        admitted.plan.execution_resources = Some(admitted.resources);
         admitted
             .plan
             .properties
@@ -245,7 +247,7 @@ impl StatementProgram {
                 paro_common::error::internal("admitted physical root lost its property contract")
             })?
             .grant_contract =
-            paro_optimizer::physical::PhysicalGrantContract::Class(admitted.reservation.class);
+            paro_optimizer::physical::PhysicalGrantContract::Class(admitted.resources.class);
         Self::from_physical_plan(admitted.plan)
     }
 

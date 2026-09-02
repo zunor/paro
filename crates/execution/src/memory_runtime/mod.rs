@@ -4,8 +4,8 @@
 //! High-level execution memory runtime API.
 
 mod accounted_buffer;
-mod admission;
 mod arbitrator;
+mod execution_lease;
 mod external_tracker;
 mod local_grant;
 mod memory_demand;
@@ -20,10 +20,11 @@ mod retained_chunks;
 mod retained_handle;
 mod shared_object;
 mod system_reserve;
+mod task_permits;
 
 pub use accounted_buffer::AccountedBuffer;
-pub use admission::{AdmissionWaiterId, PipelineAdmissionController, PipelineAdmissionGuard};
 pub use arbitrator::MemoryArbitrator;
+pub use execution_lease::ExecutionLease;
 pub use external_tracker::{LocalExternalMemoryTracker, OperatorExternalMemoryTracker};
 pub use local_grant::{
     LocalMemoryGrant, DEFAULT_LOCAL_INITIAL_GRANT_BYTES, DEFAULT_LOCAL_REFILL_CAP_BYTES,
@@ -42,6 +43,7 @@ pub use retained_chunks::RetainedChunkVec;
 pub use retained_handle::RetainedMemoryHandle;
 pub use shared_object::{SharedRetainedObject, SharedRetainedObjectState};
 pub use system_reserve::{SystemReserve, SystemReserveClass, SystemReserveReservation};
+pub use task_permits::{QueryTaskPermit, QueryTaskPermitPool, TaskPermitWaiterId};
 
 #[cfg(test)]
 mod tests {
@@ -55,6 +57,7 @@ mod tests {
     };
     use paro_common::types::LogicalType;
     use paro_context::{QueryMemoryBudgetSpec, QueryMemoryCoordinator, QueryMemoryTarget};
+    use paro_optimizer::physical::{ExecutionResourceContract, ResourceGrantClassId};
 
     use super::*;
 
@@ -213,40 +216,40 @@ mod tests {
     }
 
     #[test]
-    fn admission_controller_blocks_and_wakes_waiter() {
-        let controller = Arc::new(PipelineAdmissionController::new(1));
-        let first = controller
+    fn task_permit_pool_blocks_and_wakes_waiter() {
+        let permits = Arc::new(QueryTaskPermitPool::new(1));
+        let first = permits
             .try_acquire(paro_scheduler::task::InterruptState::new())
             .expect("first slot should be admitted");
         let signal = paro_scheduler::task::InterruptDoneSignalState::new();
-        let blocked = controller.try_acquire(paro_scheduler::task::InterruptState::with_signal(
+        let blocked = permits.try_acquire(paro_scheduler::task::InterruptState::with_signal(
             signal.downgrade(),
         ));
         assert!(blocked.is_none());
-        assert_eq!(controller.blocked_waiters(), 1);
+        assert_eq!(permits.blocked_waiters(), 1);
 
         drop(first);
-        assert_eq!(controller.blocked_waiters(), 0);
+        assert_eq!(permits.blocked_waiters(), 0);
     }
 
     #[test]
-    fn admission_controller_dedupes_stable_waiter_registration() {
-        let controller = Arc::new(PipelineAdmissionController::new(1));
-        let first = controller
+    fn task_permit_pool_dedupes_stable_waiter_registration() {
+        let permits = Arc::new(QueryTaskPermitPool::new(1));
+        let first = permits
             .try_acquire(paro_scheduler::task::InterruptState::new())
             .expect("first slot should be admitted");
-        let waiter = AdmissionWaiterId(7);
+        let waiter = TaskPermitWaiterId(7);
 
-        assert!(controller
+        assert!(permits
             .try_acquire_for(waiter, paro_scheduler::task::InterruptState::new())
             .is_none());
-        assert!(controller
+        assert!(permits
             .try_acquire_for(waiter, paro_scheduler::task::InterruptState::new())
             .is_none());
-        assert_eq!(controller.blocked_waiters(), 1);
+        assert_eq!(permits.blocked_waiters(), 1);
 
         drop(first);
-        assert_eq!(controller.blocked_waiters(), 0);
+        assert_eq!(permits.blocked_waiters(), 0);
     }
 
     #[test]
@@ -348,6 +351,22 @@ mod tests {
         );
         pool_a.attach_registration(registration_a);
         assert!(pool_a.try_reserve_minimum_capacity(700).unwrap());
+        pool_a
+            .install_execution_lease(
+                ExecutionLease::new(
+                    ExecutionResourceContract {
+                        class: ResourceGrantClassId::new(0),
+                        minimum_memory_bytes: 500,
+                        working_set_memory_bytes: 700,
+                        memory_ceiling_bytes: 800,
+                        max_parallel_tasks: 2,
+                        external_worker_slots: 0,
+                    },
+                    None,
+                )
+                .unwrap(),
+            )
+            .unwrap();
 
         let pool_b = Arc::new(QueryMemoryPool::new(1_000));
         let target_b: Arc<dyn QueryMemoryTarget> = pool_b.clone();
@@ -365,7 +384,15 @@ mod tests {
 
         assert!(pool_b.try_grow(400).is_err());
         assert!(pool_a.capacity_bytes() >= 700);
+        assert_eq!(pool_a.execution_ceiling_bytes(), 800);
         assert_eq!(pool_a.capacity_bytes() + pool_b.capacity_bytes(), 1_000);
+
+        assert!(pool_a.try_grow(801).is_err());
+        let permits = pool_a.task_permits();
+        let first = permits.try_acquire_available().unwrap();
+        let second = permits.try_acquire_available().unwrap();
+        assert!(permits.try_acquire_available().is_none());
+        drop((first, second));
     }
 
     #[test]

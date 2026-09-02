@@ -434,7 +434,7 @@ impl PartitionAggregateWindowBuildSinkExec {
                     Arc::clone(&handle),
                     self.spec.clone(),
                     ctx.query.session.buffer_pool().clone(),
-                    ctx.query.session.number_of_threads(),
+                    ctx.query.max_parallel_tasks(),
                     partition_aggregate_table_memory(ctx.query, true),
                 ),
             ));
@@ -561,10 +561,7 @@ impl PartitionAggregateWindowBuildSinkExec {
                 && partition_aggregate_preemptive_spill_enabled(ctx.query));
         let memory = partition_aggregate_table_memory(ctx.query, spillable);
         let radix_bits = aggregate_spill_radix_bits(
-            ctx.query
-                .session
-                .number_of_threads()
-                .min(ctx.query.memory.admission_controller().max_slots()),
+            ctx.query.max_parallel_tasks(),
             ctx.query.memory.capacity_bytes(),
         );
         let group_refs = group_payload_refs(&self.spec.aggregate)?.into_boxed_slice();
@@ -738,10 +735,7 @@ impl PartitionAggregateWindowBuildSinkExec {
                         &self.spec.aggregate.payload_types,
                         &local.group_refs,
                         aggregate_spill_radix_bits(
-                            ctx.query
-                                .session
-                                .number_of_threads()
-                                .min(ctx.query.memory.admission_controller().max_slots()),
+                            ctx.query.max_parallel_tasks(),
                             ctx.query.memory.capacity_bytes(),
                         ),
                         partition_aggregate_table_memory(ctx.query, true),
@@ -771,10 +765,7 @@ impl PartitionAggregateWindowBuildSinkExec {
                         &self.spec.aggregate.payload_types,
                         &local.group_refs,
                         aggregate_spill_radix_bits(
-                            ctx.query
-                                .session
-                                .number_of_threads()
-                                .min(ctx.query.memory.admission_controller().max_slots()),
+                            ctx.query.max_parallel_tasks(),
                             ctx.query.memory.capacity_bytes(),
                         ),
                         partition_aggregate_table_memory(ctx.query, true),
@@ -1008,7 +999,7 @@ fn seal_handle(
         partition_aggregate_table_memory(ctx.query, query_has_temporary_directory(ctx.query)),
         index_memory,
         ctx.query.session.buffer_pool().clone(),
-        ctx.query.session.number_of_threads(),
+        ctx.query.max_parallel_tasks(),
         ctx.cancel,
     )?;
     record_partition_aggregate_spill(handle, ctx)
@@ -1060,6 +1051,6 @@ fn partition_aggregate_preemptive_spill_enabled(
         return false;
     }
     let threshold = PARTITION_AGGREGATE_PREEMPTIVE_SPILL_CAP_PER_THREAD
-        .saturating_mul(query.session.number_of_threads().max(1));
+        .saturating_mul(query.max_parallel_tasks());
     capacity <= threshold
 }

@@ -42,11 +42,17 @@ pub struct PhysicalPlanPortfolio<P = PhysicalPlan> {
     pub variants: Box<[PortfolioVariant<P>]>,
 }
 
+/// Immutable resource operating point selected by portfolio admission.
+///
+/// This is deliberately a contract, not a lease. Execution must atomically
+/// materialize every field into a lifetime-owned `ExecutionLease` before the
+/// physical plan may run.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct ReservationToken {
+pub struct ExecutionResourceContract {
     pub class: ResourceGrantClassId,
     pub minimum_memory_bytes: u64,
-    pub target_memory_bytes: u64,
+    pub working_set_memory_bytes: u64,
+    pub memory_ceiling_bytes: u64,
     pub max_parallel_tasks: u16,
     pub external_worker_slots: u16,
 }
@@ -55,7 +61,7 @@ pub struct ReservationToken {
 pub struct AdmittedPlan<P> {
     pub plan: P,
     pub physical_fingerprint: Fingerprint,
-    pub reservation: ReservationToken,
+    pub resources: ExecutionResourceContract,
 }
 
 impl<P> PhysicalPlanPortfolio<P> {
@@ -247,13 +253,11 @@ impl<P> PhysicalPlanPortfolio<P> {
             .get(selected_index)
             .expect("selected portfolio index must remain valid");
         Ok(AdmittedPlan {
-            reservation: ReservationToken {
+            resources: ExecutionResourceContract {
                 class: selected_class.id,
                 minimum_memory_bytes: selected.cost.minimum_memory_bytes,
-                target_memory_bytes: selected
-                    .cost
-                    .preferred_memory_bytes()
-                    .min(available_memory_bytes),
+                working_set_memory_bytes: selected.cost.preferred_memory_bytes(),
+                memory_ceiling_bytes: selected_class.hard_memory_bytes,
                 max_parallel_tasks: selected_class.max_parallel_tasks,
                 external_worker_slots: selected.cost.external_worker_slots_upper,
             },
@@ -343,9 +347,9 @@ impl PhysicalPlanPortfolio<PhysicalPlan> {
             }
             variant.cost.validate()?;
             PhysicalPlanVerifier::verify(&variant.plan)?;
-            if variant.plan.reservation.is_some() {
+            if variant.plan.execution_resources.is_some() {
                 return Err(paro_error::internal(
-                    "portfolio contains a plan with a pre-bound reservation",
+                    "portfolio contains a plan with pre-bound execution resources",
                 ));
             }
             let root_properties = variant
@@ -471,8 +475,9 @@ mod tests {
         .unwrap();
         let admitted = portfolio.admit(20, 1, 0, |_| true).unwrap();
         assert_eq!(admitted.plan, "small");
-        assert_eq!(admitted.reservation.minimum_memory_bytes, 10);
-        assert_eq!(admitted.reservation.target_memory_bytes, 10);
+        assert_eq!(admitted.resources.minimum_memory_bytes, 10);
+        assert_eq!(admitted.resources.working_set_memory_bytes, 10);
+        assert_eq!(admitted.resources.memory_ceiling_bytes, 20);
     }
 
     #[test]
@@ -531,7 +536,8 @@ mod tests {
         let admitted = portfolio.admit(10, 4, 0, |_| true).unwrap();
 
         assert_eq!(admitted.plan, "parallel");
-        assert_eq!(admitted.reservation.target_memory_bytes, 10);
+        assert_eq!(admitted.resources.working_set_memory_bytes, 10);
+        assert_eq!(admitted.resources.memory_ceiling_bytes, 100);
     }
 
     #[test]
@@ -560,7 +566,7 @@ mod tests {
         let admitted = portfolio.admit(100, 2, 0, |_| true).unwrap();
 
         assert_eq!(admitted.plan, "serial");
-        assert_eq!(admitted.reservation.max_parallel_tasks, 1);
+        assert_eq!(admitted.resources.max_parallel_tasks, 1);
     }
 
     #[test]
@@ -589,7 +595,7 @@ mod tests {
         let admitted = portfolio.admit(200, 8, 0, |_| true).unwrap();
 
         assert_eq!(admitted.plan, "parallel");
-        assert_eq!(admitted.reservation.max_parallel_tasks, 8);
+        assert_eq!(admitted.resources.max_parallel_tasks, 8);
     }
 
     #[test]

@@ -1,6 +1,7 @@
 // Copyright 2024-2026 Zunor
 // SPDX-License-Identifier: Apache-2.0
 
+use std::collections::VecDeque;
 use std::panic::{self, AssertUnwindSafe};
 use std::sync::Arc;
 
@@ -12,6 +13,7 @@ use paro_scheduler::task::{ProducerToken, Task, TaskExecutionMode, TaskExecution
 use crate::explain::profiler::{
     OperatorProfilePhase, OperatorProfiler, ProfileMorselRange, ProfileWorkerContext,
 };
+use crate::memory_runtime::QueryTaskPermit;
 use crate::runtime::FinishTaskState;
 use crate::runtime::{
     FinishCoordinatorParticipation, FinishTaskGroup, FinishTaskId, FinishTaskPoll,
@@ -31,42 +33,73 @@ pub(super) fn run_parallel_finish_tasks(
     profiler: &mut OperatorProfiler,
     operator_id: u64,
 ) -> Result<()> {
-    let total_threads = query
-        .session
-        .number_of_threads()
-        .max(1)
-        .min(query.memory.admission_controller().max_slots());
     let scheduler = query.session.scheduler().clone();
     let producer = scheduler.create_producer_with_priority(0);
-    let coordinator = Arc::new(WorkGroupCompletion::new(task_ids.len()));
     let query = Arc::new(query.clone());
-    let tasks = task_ids
-        .into_iter()
-        .enumerate()
-        .map(|(idx, task_id)| {
-            Arc::new(ParkingMutex::new(ScheduledFinishTask {
-                runtime: runtime.clone(),
-                query: query.clone(),
-                group: group.clone(),
-                allocator: allocator.clone(),
-                task_id,
-                thread_id: idx % total_threads,
-                total_threads,
-                coordinator: coordinator.clone(),
-                token: None,
-            })) as Arc<ParkingMutex<dyn Task>>
-        })
-        .collect::<Vec<_>>();
-    producer.schedule_tasks(tasks);
-    wait_for_parallel_finish_group(
-        scheduler.as_ref(),
-        &producer,
-        &coordinator,
-        query.as_ref(),
-        group.coordinator_participation,
-        profiler,
-        operator_id,
-    )
+    let permits = query.memory.task_permits();
+    let mut pending = VecDeque::from(task_ids);
+
+    // The pipeline completion task is already executing under one query task
+    // permit. Each wave runs one finish unit on that coordinator and acquires
+    // an explicit permit for every scheduled helper. No finish, replay, or
+    // operator-internal worker can therefore exceed the admitted DOP.
+    while let Some(coordinator_task_id) = pending.pop_front() {
+        let mut helpers = Vec::new();
+        while !pending.is_empty() && helpers.len() + 1 < permits.max_permits() {
+            let Some(permit) = permits.try_acquire_available() else {
+                break;
+            };
+            let task_id = pending
+                .pop_front()
+                .expect("pending finish task disappeared after permit acquisition");
+            helpers.push((task_id, permit));
+        }
+        let total_threads = helpers.len() + 1;
+        let coordinator = Arc::new(WorkGroupCompletion::new(total_threads));
+        let tasks = helpers
+            .into_iter()
+            .enumerate()
+            .map(|(index, (task_id, task_permit))| {
+                Arc::new(ParkingMutex::new(ScheduledFinishTask {
+                    runtime: runtime.clone(),
+                    query: query.clone(),
+                    group: group.clone(),
+                    allocator: allocator.clone(),
+                    task_id,
+                    thread_id: index + 1,
+                    total_threads,
+                    coordinator: coordinator.clone(),
+                    task_permit: Some(task_permit),
+                    token: None,
+                })) as Arc<ParkingMutex<dyn Task>>
+            })
+            .collect::<Vec<_>>();
+        producer.schedule_tasks(tasks);
+
+        let mut coordinator_task = ScheduledFinishTask {
+            runtime: runtime.clone(),
+            query: query.clone(),
+            group: group.clone(),
+            allocator: allocator.clone(),
+            task_id: coordinator_task_id,
+            thread_id: 0,
+            total_threads,
+            coordinator: coordinator.clone(),
+            task_permit: None,
+            token: None,
+        };
+        coordinator_task.execute(TaskExecutionMode::ProcessAll)?;
+        wait_for_parallel_finish_group(
+            scheduler.as_ref(),
+            &producer,
+            &coordinator,
+            query.as_ref(),
+            group.coordinator_participation,
+            profiler,
+            operator_id,
+        )?;
+    }
+    Ok(())
 }
 
 fn wait_for_parallel_finish_group(
@@ -159,6 +192,9 @@ struct ScheduledFinishTask {
     thread_id: usize,
     total_threads: usize,
     coordinator: Arc<WorkGroupCompletion>,
+    /// Scheduled helpers own a permit. The inline coordinator task borrows
+    /// the permit already held by its enclosing pipeline completion task.
+    task_permit: Option<QueryTaskPermit>,
     token: Option<ProducerToken>,
 }
 
@@ -239,6 +275,7 @@ impl Task for ScheduledFinishTask {
             Err(_) => Err(paro_error::internal("parallel finish task panicked")),
         };
         self.coordinator.finish(result);
+        self.task_permit.take();
         Ok(TaskExecutionResult::Finished)
     }
 

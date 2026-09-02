@@ -14,7 +14,7 @@ use super::explain::types::{
 };
 use super::ids::PhysicalPlanNodeId;
 use super::node::PhysicalPlanNode;
-use super::portfolio::ReservationToken;
+use super::portfolio::ExecutionResourceContract;
 use super::properties::PlanPropertyMap;
 use super::specs::{AggregateSpec, NestedLoopJoinSpec, PhysicalNodeKind, SearchSourceSpec};
 use paro_catalog::entry::{StandardEntry, TableCatalogEntry};
@@ -74,7 +74,7 @@ pub struct PhysicalPlan {
     pub dependencies: PlanDependencies,
     /// Bound only after portfolio admission. It is not an optimizer input and
     /// therefore does not participate in the portfolio fingerprint.
-    pub reservation: Option<ReservationToken>,
+    pub execution_resources: Option<ExecutionResourceContract>,
 }
 
 impl PhysicalPlan {
@@ -91,7 +91,7 @@ impl PhysicalPlan {
             edges: PhysicalEdgeArena::default(),
             properties,
             dependencies: PlanDependencies::default(),
-            reservation: None,
+            execution_resources: None,
         }
     }
 

@@ -264,7 +264,7 @@ fn create_search_driver(
     };
     let budget = ResourceBudget::managed(
         heap_budget_items.max(1),
-        ctx.query.session.number_of_threads().max(1),
+        ctx.query.max_parallel_tasks(),
         ctx.query.memory.clone(),
         ctx.query.session.allocator(MemoryTag::VectorIndex),
     )

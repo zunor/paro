@@ -185,6 +185,17 @@ impl QueryRuntimeContext {
         self
     }
 
+    /// Exact query-local concurrency admitted for this execution attempt.
+    /// Every pipeline, finish, replay, and operator-internal worker derives
+    /// its fan-out from this value rather than the session's requested DOP.
+    pub fn max_parallel_tasks(&self) -> usize {
+        if self.session.limits.parallel_scheduler {
+            self.memory.task_permits().max_permits().max(1)
+        } else {
+            1
+        }
+    }
+
     pub fn record_operator_error(&self, error: ParoError) -> QueryErrorId {
         self.errors.record_root(error)
     }
@@ -1122,6 +1133,7 @@ impl WakeToken {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum WakeSource {
     Memory,
+    TaskPermit,
     Spill,
     ExternalRuntime,
     DerivedIndex,
@@ -1171,6 +1183,7 @@ impl Blocker {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum BlockReason {
     Memory,
+    TaskPermit,
     Spill,
     ExternalRuntime,
     DerivedIndex,
