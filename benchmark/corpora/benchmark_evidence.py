@@ -115,6 +115,85 @@ def paired_order_balanced_ratio(
     }
 
 
+def hierarchical_abba_ratio(
+    blocks: Sequence[dict[str, Any]],
+    bootstrap_samples: int = 10_000,
+) -> dict[str, Any]:
+    """Estimate a ratio without pretending same-process samples are IID.
+
+    The top-level resampling unit is a fresh process block. Samples within a
+    selected block are resampled only after that block has been selected, so
+    process-level cache/layout effects remain correlated.
+    """
+    if not blocks:
+        raise ValueError("ABBA comparison has no process blocks")
+    normalized = []
+    for block in blocks:
+        paro = [float(value) for value in block.get("paro_ms", [])]
+        duckdb = [float(value) for value in block.get("duckdb_ms", [])]
+        if len(paro) != 2 or len(duckdb) != 2:
+            raise ValueError("each ABBA block must contain two samples per engine")
+        if any(value <= 0.0 for value in [*paro, *duckdb]):
+            raise ValueError("ABBA timings must be positive")
+        normalized.append((paro, duckdb))
+
+    def block_ratio(paro: Sequence[float], duckdb: Sequence[float]) -> float:
+        return statistics.geometric_mean(paro) / statistics.geometric_mean(duckdb)
+
+    observed_blocks = [block_ratio(paro, duckdb) for paro, duckdb in normalized]
+    ratio = statistics.geometric_mean(observed_blocks)
+    rng = random.Random(0)
+    bootstrap = []
+    for _ in range(bootstrap_samples):
+        sampled_ratios = []
+        for _ in normalized:
+            paro, duckdb = normalized[rng.randrange(len(normalized))]
+            sampled_paro = [paro[rng.randrange(len(paro))] for _ in paro]
+            sampled_duckdb = [duckdb[rng.randrange(len(duckdb))] for _ in duckdb]
+            sampled_ratios.append(block_ratio(sampled_paro, sampled_duckdb))
+        bootstrap.append(statistics.geometric_mean(sampled_ratios))
+    bootstrap.sort()
+    low = bootstrap[int(0.025 * (len(bootstrap) - 1))]
+    high = bootstrap[int(0.975 * (len(bootstrap) - 1))]
+    return {
+        "ratio": round(ratio, 6),
+        "hierarchical_confidence_interval_95": [round(low, 6), round(high, 6)],
+        "process_block_ratios": [round(value, 6) for value in observed_blocks],
+        "process_blocks": len(normalized),
+        "samples_per_engine": len(normalized) * 2,
+        "bootstrap_samples": bootstrap_samples,
+        "resampling_unit": "fresh_process_block_then_within_block_sample",
+    }
+
+
+def build_benchmark_server(
+    repo_root: Path, jobs: int
+) -> tuple[Path, dict[str, Any]]:
+    """Build the exact server image used by the owned benchmark process."""
+    before = repository_identity(repo_root)
+    command = ["cargo", "build", "--release", "--locked", "--bin", "parod"]
+    environment = os.environ.copy()
+    environment["CARGO_BUILD_JOBS"] = str(max(1, jobs))
+    started = time.perf_counter_ns()
+    subprocess.run(command, cwd=repo_root, env=environment, check=True)
+    elapsed_ms = (time.perf_counter_ns() - started) / 1_000_000
+    after = repository_identity(repo_root)
+    if before != after:
+        raise RuntimeError("source tree changed while building benchmark server")
+    binary = (repo_root / "target/release/parod").resolve()
+    if not binary.is_file():
+        raise RuntimeError(f"cargo did not produce {binary}")
+    return binary, {
+        "command": command,
+        "cargo": subprocess.check_output(["cargo", "--version"], text=True).strip(),
+        "jobs": max(1, jobs),
+        "elapsed_ms": round(elapsed_ms, 3),
+        "source": after,
+        "binary_path": str(binary),
+        "binary_sha256": content_digest(binary),
+    }
+
+
 class ManagedParoServer:
     def __init__(
         self,
@@ -129,6 +208,7 @@ class ManagedParoServer:
         self.log_path = log_path.resolve()
         self.process: subprocess.Popen[bytes] | None = None
         self._log = None
+        self._started_ns: int | None = None
 
     def start(self) -> None:
         if not self.binary.is_file() or not os.access(self.binary, os.X_OK):
@@ -160,6 +240,7 @@ class ManagedParoServer:
             stderr=subprocess.STDOUT,
             cwd=self.binary.parent,
         )
+        self._started_ns = time.time_ns()
         deadline = time.monotonic() + 30
         while time.monotonic() < deadline:
             if self.process.poll() is not None:
@@ -196,6 +277,14 @@ class ManagedParoServer:
             "listen": self.listen,
             "log": str(self.log_path),
             "owned_by_harness": True,
+            "launch_argv": list(self.process.args),
+            "started_unix_ns": self._started_ns,
+            "binary_stat": {
+                "device": self.binary.stat().st_dev,
+                "inode": self.binary.stat().st_ino,
+                "size": self.binary.stat().st_size,
+                "mtime_ns": self.binary.stat().st_mtime_ns,
+            },
         }
 
     def __enter__(self) -> "ManagedParoServer":

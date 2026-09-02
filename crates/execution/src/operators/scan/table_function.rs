@@ -172,6 +172,7 @@ pub(crate) fn populate_system_table_function_data(
         "paro_schemas" => populate_paro_schemas(global_state, ctx),
         "paro_tables" => populate_paro_tables(global_state, ctx),
         "paro_columns" => populate_paro_columns(global_state, ctx),
+        "paro_constraints" => populate_paro_constraints(global_state, ctx),
         "paro_views" => populate_paro_views(global_state, ctx),
         "paro_indexes" => populate_paro_indexes(global_state, ctx),
         "paro_pg_settings" => populate_paro_pg_settings(global_state, ctx),
@@ -542,6 +543,119 @@ fn populate_paro_tables(global_state: &mut dyn GlobalTableFunctionState, ctx: &S
         }
 
         populate_table_data(state, tables);
+    }
+}
+
+/// Populate paro_constraints() from the transaction-visible catalog.
+fn populate_paro_constraints(
+    global_state: &mut dyn GlobalTableFunctionState,
+    ctx: &StatementContext,
+) {
+    use paro_catalog::entry::{ConstraintType, TableCatalogEntry};
+    use paro_function::table::system::paro_constraints::{
+        populate_constraint_data, ConstraintData, ParoConstraintsGlobalState,
+    };
+
+    let Some(state) = global_state
+        .as_any_mut()
+        .downcast_mut::<ParoConstraintsGlobalState>()
+    else {
+        return;
+    };
+    let txn = ctx.catalog_txn_view();
+    let mut entries = Vec::new();
+    for database in ctx.databases.iter() {
+        let schema_names = {
+            use paro_catalog::catalog::Catalog;
+            database.catalog.list_schemas(&txn)
+        };
+        for schema_name in schema_names {
+            let Ok(schema) = database.catalog.get_schema(&txn, &schema_name) else {
+                continue;
+            };
+            for catalog_entry in schema
+                .collection(paro_catalog::entry::CatalogType::Table)
+                .expect("table collection")
+                .scan(txn.transaction_id, txn.start_time)
+            {
+                let paro_catalog::entry::CatalogEntryEnum::Table(table) = &*catalog_entry else {
+                    continue;
+                };
+                append_table_constraints(
+                    &mut entries,
+                    database.identity.name.as_ref(),
+                    &schema_name,
+                    table,
+                );
+            }
+        }
+    }
+    entries.sort_by(|left, right| {
+        (
+            &left.database_name,
+            &left.schema_name,
+            &left.table_name,
+            &left.constraint_name,
+        )
+            .cmp(&(
+                &right.database_name,
+                &right.schema_name,
+                &right.table_name,
+                &right.constraint_name,
+            ))
+            .then(left.ordinal_position.cmp(&right.ordinal_position))
+    });
+    populate_constraint_data(state, entries);
+
+    fn append_table_constraints(
+        output: &mut Vec<ConstraintData>,
+        database_name: &str,
+        schema_name: &str,
+        table: &TableCatalogEntry,
+    ) {
+        for (constraint_index, constraint) in table.constraints().iter().enumerate() {
+            let (constraint_type, generated_kind, enforced) = match constraint.constraint_type {
+                ConstraintType::PrimaryKey => ("PRIMARY KEY", "pkey", true),
+                ConstraintType::Unique => ("UNIQUE", "key", false),
+                ConstraintType::ForeignKey => ("FOREIGN KEY", "fkey", false),
+                ConstraintType::Check => ("CHECK", "check", false),
+                ConstraintType::NotNull => ("CHECK", "not_null", true),
+            };
+            let name = format!(
+                "{}_{}_{}",
+                table.base.base.name,
+                generated_kind,
+                constraint_index + 1
+            );
+            if constraint.columns.is_empty() {
+                output.push(ConstraintData {
+                    database_name: database_name.to_string(),
+                    schema_name: schema_name.to_string(),
+                    table_name: table.base.base.name.clone(),
+                    constraint_name: name,
+                    constraint_type: constraint_type.to_string(),
+                    enforced,
+                    column_name: None,
+                    ordinal_position: None,
+                });
+                continue;
+            }
+            for (position, column_index) in constraint.columns.iter().copied().enumerate() {
+                output.push(ConstraintData {
+                    database_name: database_name.to_string(),
+                    schema_name: schema_name.to_string(),
+                    table_name: table.base.base.name.clone(),
+                    constraint_name: name.clone(),
+                    constraint_type: constraint_type.to_string(),
+                    enforced,
+                    column_name: table
+                        .columns
+                        .get(column_index)
+                        .map(|column| column.name.clone()),
+                    ordinal_position: Some((position + 1) as i64),
+                });
+            }
+        }
     }
 }
 

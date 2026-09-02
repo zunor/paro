@@ -20,7 +20,7 @@ class ResultContractError(AssertionError):
 @dataclass(frozen=True)
 class ColumnContract:
     name: str
-    family: str
+    logical_type: str
     engine_type: str
 
 
@@ -31,26 +31,25 @@ class OrderKey:
     nulls: str | None
 
 
-PARO_TYPE_FAMILIES = {
+PARO_EXACT_TYPES = {
     16: "boolean",
     17: "bytes",
-    18: "string",
-    19: "string",
-    20: "integer",
-    21: "integer",
-    23: "integer",
+    18: "char",
+    19: "name",
+    20: "int64",
+    21: "int16",
+    23: "int32",
     25: "string",
-    26: "integer",
-    700: "float",
-    701: "float",
+    26: "uint32",
+    700: "float32",
+    701: "float64",
     1043: "string",
     1082: "date",
     1083: "time",
     1114: "timestamp",
-    1184: "timestamp",
+    1184: "timestamptz",
     1186: "interval",
-    1266: "time",
-    1700: "decimal",
+    1266: "timetz",
     2950: "uuid",
 }
 
@@ -59,10 +58,21 @@ def paro_schema(description: Sequence[Any]) -> tuple[ColumnContract, ...]:
     columns = []
     for column in description:
         oid = int(column.type_code)
-        family = PARO_TYPE_FAMILIES.get(oid)
-        if family is None:
+        if oid == 1700:
+            precision = getattr(column, "precision", None)
+            scale = getattr(column, "scale", None)
+            logical_type = (
+                f"decimal({int(precision)},{int(scale)})"
+                if precision not in (None, 0) and scale is not None
+                else "numeric"
+            )
+        else:
+            logical_type = PARO_EXACT_TYPES.get(oid)
+        if logical_type is None:
             raise ResultContractError(f"unsupported Paro result OID {oid} for {column.name}")
-        columns.append(ColumnContract(_result_column_name(column.name), family, str(oid)))
+        columns.append(
+            ColumnContract(_result_column_name(column.name), logical_type, str(oid))
+        )
     return tuple(columns)
 
 
@@ -71,32 +81,60 @@ def duckdb_schema(description: Sequence[Any]) -> tuple[ColumnContract, ...]:
     for column in description:
         engine_type = str(column[1]).upper()
         if engine_type == "BOOLEAN":
-            family = "boolean"
-        elif any(token in engine_type for token in ("INT", "UTINY", "USMALL", "UINTEGER")):
-            family = "integer"
-        elif engine_type.startswith(("DECIMAL", "NUMERIC")):
-            family = "decimal"
-        elif engine_type.startswith(("FLOAT", "DOUBLE", "REAL")):
-            family = "float"
+            logical_type = "boolean"
+        elif engine_type == "TINYINT":
+            logical_type = "int8"
+        elif engine_type == "SMALLINT":
+            logical_type = "int16"
+        elif engine_type in {"INTEGER", "INT"}:
+            logical_type = "int32"
+        elif engine_type == "BIGINT":
+            logical_type = "int64"
+        elif engine_type == "HUGEINT":
+            logical_type = "int128"
+        elif engine_type == "UTINYINT":
+            logical_type = "uint8"
+        elif engine_type == "USMALLINT":
+            logical_type = "uint16"
+        elif engine_type == "UINTEGER":
+            logical_type = "uint32"
+        elif engine_type == "UBIGINT":
+            logical_type = "uint64"
+        elif engine_type == "UHUGEINT":
+            logical_type = "uint128"
+        elif re.fullmatch(r"(?:DECIMAL|NUMERIC)\(\d+,\d+\)", engine_type):
+            logical_type = engine_type.lower()
+        elif engine_type in {"DECIMAL", "NUMERIC"}:
+            logical_type = "numeric"
+        elif engine_type in {"FLOAT", "REAL"}:
+            logical_type = "float32"
+        elif engine_type == "DOUBLE":
+            logical_type = "float64"
         elif engine_type.startswith(("VARCHAR", "CHAR", "STRING")):
-            family = "string"
-        elif engine_type.startswith("DATE"):
-            family = "date"
+            logical_type = "string"
+        elif engine_type == "DATE":
+            logical_type = "date"
+        elif engine_type in {"TIMESTAMP WITH TIME ZONE", "TIMESTAMPTZ"}:
+            logical_type = "timestamptz"
         elif engine_type.startswith("TIMESTAMP"):
-            family = "timestamp"
+            logical_type = "timestamp"
+        elif engine_type in {"TIME WITH TIME ZONE", "TIMETZ"}:
+            logical_type = "timetz"
         elif engine_type.startswith("TIME"):
-            family = "time"
+            logical_type = "time"
         elif engine_type.startswith(("BLOB", "BYTEA")):
-            family = "bytes"
+            logical_type = "bytes"
         elif engine_type.startswith("INTERVAL"):
-            family = "interval"
+            logical_type = "interval"
         elif engine_type.startswith("UUID"):
-            family = "uuid"
+            logical_type = "uuid"
         else:
             raise ResultContractError(
                 f"unsupported DuckDB result type {engine_type} for {column[0]}"
             )
-        columns.append(ColumnContract(_result_column_name(column[0]), family, engine_type))
+        columns.append(
+            ColumnContract(_result_column_name(column[0]), logical_type, engine_type)
+        )
     return tuple(columns)
 
 
@@ -111,11 +149,11 @@ def assert_compatible_schema(
     if len(paro) != len(duckdb):
         raise ResultContractError(f"schema arity mismatch: Paro={len(paro)}, DuckDB={len(duckdb)}")
     for index, (actual, expected) in enumerate(zip(paro, duckdb)):
-        if actual.name != expected.name or actual.family != expected.family:
+        if actual.name != expected.name or actual.logical_type != expected.logical_type:
             raise ResultContractError(
                 "schema mismatch at column "
-                f"{index}: Paro=({actual.name},{actual.family},{actual.engine_type}) "
-                f"DuckDB=({expected.name},{expected.family},{expected.engine_type})"
+                f"{index}: Paro=({actual.name},{actual.logical_type},{actual.engine_type}) "
+                f"DuckDB=({expected.name},{expected.logical_type},{expected.engine_type})"
             )
 
 
@@ -129,31 +167,34 @@ def canonicalize_rows(
                 f"row {row_index} has {len(row)} columns, expected {len(schema)}"
             )
         result.append(
-            tuple(_canonical_value(value, column.family) for value, column in zip(row, schema))
+            tuple(
+                _canonical_value(value, column.logical_type)
+                for value, column in zip(row, schema)
+            )
         )
     return result
 
 
-def _canonical_value(value: Any, family: str) -> Any:
+def _canonical_value(value: Any, logical_type: str) -> Any:
     if value is None:
         return None
-    if family == "boolean":
+    if logical_type == "boolean":
         return bool(value)
-    if family == "integer":
+    if logical_type.startswith(("int", "uint")):
         return int(value)
-    if family == "decimal":
+    if logical_type.startswith(("decimal", "numeric")):
         decimal = value if isinstance(value, Decimal) else Decimal(str(value))
         return Decimal(0) if decimal.is_zero() else decimal.normalize()
-    if family == "float":
+    if logical_type.startswith("float"):
         number = float(value)
         if math.isnan(number):
             return "NaN"
         if math.isinf(number):
             return "+Inf" if number > 0 else "-Inf"
         return 0.0 if number == 0 else number
-    if family in {"date", "time", "timestamp"}:
+    if logical_type in {"date", "time", "timetz", "timestamp", "timestamptz"}:
         return value.isoformat() if isinstance(value, (date, datetime, time)) else str(value)
-    if family == "bytes":
+    if logical_type == "bytes":
         return bytes(value).hex()
     return str(value)
 
@@ -191,7 +232,9 @@ def parse_order_contract(query: str, schema: Sequence[ColumnContract]) -> tuple[
     clause = _top_level_order_clause(query)
     if clause is None:
         return ()
-    names = {column.name: index for index, column in enumerate(schema)}
+    names: dict[str, list[int]] = {}
+    for index, column in enumerate(schema):
+        names.setdefault(column.name, []).append(index)
     keys = []
     for raw in _split_top_level(clause):
         expression = raw.strip()
@@ -213,7 +256,12 @@ def parse_order_contract(query: str, schema: Sequence[ColumnContract]) -> tuple[
             column = int(expression) - 1
         elif re.fullmatch(r'(?is)(?:"[^"]+"|[a-z_][a-z0-9_]*)(?:\.(?:"[^"]+"|[a-z_][a-z0-9_]*))*', expression):
             name = expression.rsplit(".", 1)[-1].strip('"').lower()
-            column = names.get(name, -1)
+            matches = names.get(name, [])
+            if len(matches) > 1:
+                raise ResultContractError(
+                    f"top-level ORDER BY name is ambiguous in the result schema: {name!r}"
+                )
+            column = matches[0] if matches else -1
         else:
             column = -1
         if not 0 <= column < len(schema):
