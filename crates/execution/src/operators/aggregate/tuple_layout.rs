@@ -10,7 +10,9 @@ use paro_common::allocator::MemoryTag;
 use paro_common::chunk::Chunk;
 use paro_common::error::{self as paro_error, Result};
 use paro_common::hash::{combine_hash, hash_bytes, hash_i64, hash_u128, hash_u64, NULL_HASH};
-use paro_common::memory::{AccountedVec, MemoryAccountingClass, MemoryAccountingContext};
+use paro_common::memory::{
+    AccountedVec, MemoryAccountingClass, MemoryAccountingContext, MemoryGrant,
+};
 use paro_common::runtime_value::Value;
 use paro_common::types::{LogicalType, StringView};
 use paro_common::vector::Vector;
@@ -192,6 +194,69 @@ impl VarlenHeap {
 
     pub fn is_empty(&self) -> bool {
         self.data.is_empty()
+    }
+
+    pub(crate) fn growth_requirement(&self, incoming_bytes: usize) -> Result<(usize, usize)> {
+        if incoming_bytes == 0 {
+            return Ok((0, 0));
+        }
+        let target_capacity = self.target_capacity(incoming_bytes)?;
+        let heap_growth = target_capacity.saturating_sub(self.data.capacity());
+        let cache_growth = self
+            .dedup_cache
+            .is_none()
+            .then_some(VARLEN_DEDUP_CACHE_SLOTS.saturating_mul(size_of::<VarlenDedupEntry>()));
+        Ok((
+            heap_growth.saturating_add(cache_growth.unwrap_or(0)),
+            self.data.capacity(),
+        ))
+    }
+
+    /// Transfer an already-issued batch transition into the heap-owned
+    /// grants. Subsequent `intern` calls cannot enter the query arbitrator.
+    pub(crate) fn prepare_growth(
+        &mut self,
+        incoming_bytes: usize,
+        reservation: &MemoryGrant,
+    ) -> Result<()> {
+        if incoming_bytes == 0 {
+            return Ok(());
+        }
+        let target_capacity = self.target_capacity(incoming_bytes)?;
+        let heap_growth = target_capacity.saturating_sub(self.data.capacity());
+        if heap_growth > 0 {
+            reservation
+                .split(heap_growth)?
+                .merge_into(self.data.grant())?;
+        }
+        if self.dedup_cache.is_none() {
+            let cache_bytes =
+                VARLEN_DEDUP_CACHE_SLOTS.saturating_mul(size_of::<VarlenDedupEntry>());
+            let cache_grant = reservation.split(cache_bytes)?;
+            let mut cache = AccountedVec::new_with_accounting(
+                cache_grant,
+                MemoryTag::HashTable,
+                MemoryAccountingClass::Metadata,
+            );
+            cache.try_resize_with(VARLEN_DEDUP_CACHE_SLOTS, VarlenDedupEntry::default)?;
+            self.dedup_cache = Some(cache);
+        }
+        Ok(())
+    }
+
+    fn target_capacity(&self, incoming_bytes: usize) -> Result<usize> {
+        let required = self.data.len().checked_add(incoming_bytes).ok_or_else(|| {
+            paro_error::internal("aggregate varlen heap transition size overflow")
+        })?;
+        Ok(if required > self.data.capacity() {
+            self.data
+                .capacity()
+                .saturating_mul(2)
+                .max(MIN_VARLEN_HEAP_CAPACITY)
+                .max(required)
+        } else {
+            self.data.capacity()
+        })
     }
 
     pub fn append(&mut self, bytes: &[u8]) -> Result<usize> {

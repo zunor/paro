@@ -469,6 +469,17 @@ impl GroupedAggregateHashTable {
         hash_group_columns(groups)
     }
 
+    pub(crate) fn varlen_bytes_upper_bound(
+        &self,
+        groups: &Chunk,
+        source_rows: Option<&[u32]>,
+    ) -> Result<usize> {
+        self.validate_group_chunk(groups)?;
+        self.layout
+            .prepare_scatter(groups)?
+            .out_of_line_bytes_upper_bound(source_rows)
+    }
+
     /// Probe and insert grouped keys, returning state addresses for each input row.
     pub fn find_or_create_groups(
         &mut self,
@@ -1555,6 +1566,7 @@ row_width {}/{} agg_state_offset {}/{}",
     pub(crate) fn growth_requirement(
         &self,
         incoming_rows: usize,
+        incoming_varlen_bytes: usize,
     ) -> Result<HashTableGrowthRequirement> {
         let target_capacity = self.target_capacity_for(incoming_rows)?;
         let (lookup_growth, lookup_overlap) = if target_capacity > self.capacity {
@@ -1593,9 +1605,13 @@ row_width {}/{} agg_state_offset {}/{}",
         } else {
             (0, 0)
         };
+        let (varlen_growth, varlen_overlap) =
+            self.varlen_heap.growth_requirement(incoming_varlen_bytes)?;
         Ok(HashTableGrowthRequirement {
-            persistent_bytes: lookup_growth.saturating_add(row_growth),
-            overlap_bytes: lookup_overlap.max(row_overlap),
+            persistent_bytes: lookup_growth
+                .saturating_add(row_growth)
+                .saturating_add(varlen_growth),
+            overlap_bytes: lookup_overlap.max(row_overlap).max(varlen_overlap),
         })
     }
 
@@ -1606,6 +1622,7 @@ row_width {}/{} agg_state_offset {}/{}",
     pub(crate) fn prepare_growth(
         &mut self,
         incoming_rows: usize,
+        incoming_varlen_bytes: usize,
         reservation: &MemoryGrant,
     ) -> Result<()> {
         let target_capacity = self.target_capacity_for(incoming_rows)?;
@@ -1628,7 +1645,9 @@ row_width {}/{} agg_state_offset {}/{}",
                 .checked_mul(self.layout.row_width)
                 .ok_or_else(|| paro_error::internal("aggregate prepared row-storage overflow"))?,
         )?;
-        transfer_growth_capacity::<u64>(&self.data, target_words, reservation)
+        transfer_growth_capacity::<u64>(&self.data, target_words, reservation)?;
+        self.varlen_heap
+            .prepare_growth(incoming_varlen_bytes, reservation)
     }
 
     fn target_capacity_for(&self, incoming_rows: usize) -> Result<usize> {

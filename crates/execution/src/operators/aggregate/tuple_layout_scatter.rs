@@ -116,6 +116,42 @@ impl<'a> TupleScatterSource<'a> {
         }
     }
 
+    /// Conservative bytes that may be appended to the table-owned varlen
+    /// heap while inserting this batch. Repeated values and rows that already
+    /// exist in the table deliberately remain counted: the result is a hard
+    /// transition upper bound, not an estimate.
+    pub(crate) fn out_of_line_bytes_upper_bound(
+        &self,
+        source_rows: Option<&[u32]>,
+    ) -> Result<usize> {
+        let mut bytes = 0usize;
+        let row_count = source_rows.map_or(self.count, <[u32]>::len);
+        for position in 0..row_count {
+            let row_idx = source_rows.map_or(position, |rows| rows[position] as usize);
+            if row_idx >= self.count {
+                return Err(paro_error::internal(format!(
+                    "tuple scatter transition row out of bounds: row={row_idx}, count={}",
+                    self.count
+                )));
+            }
+            for column in &self.columns {
+                let ScatterColumn::Varlen { view, .. } = column else {
+                    continue;
+                };
+                if !column.is_valid(row_idx) {
+                    continue;
+                }
+                let len = view.bytes(row_idx).len();
+                if len > VarlenRef::inline_capacity() {
+                    bytes = bytes.checked_add(len).ok_or_else(|| {
+                        paro_error::internal("aggregate varlen transition size overflow")
+                    })?;
+                }
+            }
+        }
+        Ok(bytes)
+    }
+
     fn scatter_columns<const ALL_VALID: bool>(
         &self,
         layout: &TupleLayout,

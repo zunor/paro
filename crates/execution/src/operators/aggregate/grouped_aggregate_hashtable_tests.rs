@@ -89,7 +89,7 @@ fn growth_is_fully_precharged_before_the_table_owner_is_entered() {
         memory.clone(),
     )
     .expect("table");
-    let requirement = table.growth_requirement(32).expect("growth requirement");
+    let requirement = table.growth_requirement(32, 0).expect("growth requirement");
     let reservation = memory
         .with_class(MemoryAccountingClass::Metadata)
         .reserve_grant(
@@ -100,7 +100,7 @@ fn growth_is_fully_precharged_before_the_table_owner_is_entered() {
         )
         .expect("precharge transition");
     table
-        .prepare_growth(32, &reservation)
+        .prepare_growth(32, 0, &reservation)
         .expect("transfer persistent grant");
 
     // Leave no unissued query capacity. The physical Vec reallocations can
@@ -112,6 +112,71 @@ fn growth_is_fully_precharged_before_the_table_owner_is_entered() {
         .expect("prepared growth must not re-enter query reclaim");
 
     assert!(table.capacity() >= 64);
+}
+
+#[test]
+fn varlen_group_transition_is_precharged_before_table_update() {
+    let pool = Arc::new(QueryMemoryPool::new(1 << 20));
+    let owner: Arc<dyn MemoryOwner> = pool.clone();
+    let memory = MemoryAccountingContext::from_owner(
+        owner,
+        MemoryDomain::Host,
+        MemoryTag::HashTable,
+        MemoryAccountingClass::Revocable,
+    );
+    let allocator = paro_common::test_utils::test_allocator();
+    let values = (0..32)
+        .map(|index| format!("long-group-value-{index:04}-payload"))
+        .collect::<Vec<_>>();
+    let value_refs = values.iter().map(String::as_str).collect::<Vec<_>>();
+    let groups = Chunk::from_arc_vectors(
+        vec![Arc::new(
+            paro_common::test_utils::test_string_vector_with_allocator(
+                &value_refs,
+                allocator.clone(),
+            ),
+        )],
+        allocator.clone(),
+    );
+    let hashes = hash_group_columns(&groups).expect("group hashes");
+    let mut table = GroupedAggregateHashTable::new_with_memory(
+        vec![LogicalType::Varchar],
+        Vec::new(),
+        Vec::new(),
+        allocator,
+        memory.clone(),
+    )
+    .expect("table");
+    let varlen_bytes = table
+        .varlen_bytes_upper_bound(&groups, None)
+        .expect("varlen transition upper");
+    let requirement = table
+        .growth_requirement(groups.size(), varlen_bytes)
+        .expect("complete growth requirement");
+    let reservation = memory
+        .with_class(MemoryAccountingClass::Metadata)
+        .reserve_grant(
+            requirement
+                .persistent_bytes
+                .checked_add(requirement.overlap_bytes)
+                .expect("bounded transition reservation"),
+        )
+        .expect("precharge complete transition");
+    table
+        .prepare_growth(groups.size(), varlen_bytes, &reservation)
+        .expect("transfer complete transition");
+
+    pool.set_capacity_bytes(pool.issued_bytes());
+    let mut addresses =
+        paro_common::test_utils::test_vector_with_capacity(LogicalType::BigInt, groups.size());
+    let mut new_groups = paro_common::test_utils::test_selection_with_capacity(groups.size());
+    table
+        .find_or_create_groups(&groups, &hashes, &mut addresses, &mut new_groups)
+        .expect("precharged varlen insertion must not reacquire query capacity");
+
+    assert_eq!(table.count(), groups.size());
+    assert!(table.varlen_heap.capacity() >= varlen_bytes);
+    assert!(table.varlen_heap.dedup_cache_memory_usage() > 0);
 }
 
 #[test]

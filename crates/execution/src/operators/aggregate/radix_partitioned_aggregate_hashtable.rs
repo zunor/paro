@@ -47,6 +47,7 @@ pub enum AggregateHashTable {
 #[derive(Debug)]
 pub(crate) struct AggregateHashTableGrowthPlan {
     partition_rows: Box<[usize]>,
+    partition_varlen_bytes: Box<[usize]>,
 }
 
 /// Concurrent ownership target for independently processed radix partitions.
@@ -179,8 +180,11 @@ impl AggregateHashTable {
         &mut self,
         groups: &Chunk,
     ) -> Result<(AggregateHashTableGrowthPlan, HashTableGrowthRequirement)> {
-        let partition_rows = match self {
-            Self::Flat(_) => vec![groups.size()],
+        let (partition_rows, partition_varlen_bytes) = match self {
+            Self::Flat(table) => (
+                vec![groups.size()],
+                vec![table.varlen_bytes_upper_bound(groups, None)?],
+            ),
             Self::Radix(table) => {
                 let hashes = table.hash_groups(groups)?;
                 table.scratch.route_hashes(
@@ -191,17 +195,32 @@ impl AggregateHashTable {
                     &hashes,
                     groups.size(),
                 )?;
-                table.scratch.counts.clone()
+                let rows = table.scratch.counts.clone();
+                let mut varlen_bytes = Vec::with_capacity(table.partitions.len());
+                for (partition_idx, partition) in table.partitions.iter().enumerate() {
+                    let (start, end) = table.scratch.partition_range(partition_idx)?;
+                    varlen_bytes.push(partition.varlen_bytes_upper_bound(
+                        groups,
+                        Some(&table.scratch.rows_by_partition[start..end]),
+                    )?);
+                }
+                (rows, varlen_bytes)
             }
         };
         let mut requirement = HashTableGrowthRequirement::default();
         match self {
             Self::Flat(table) => {
-                requirement = table.growth_requirement(partition_rows[0])?;
+                requirement =
+                    table.growth_requirement(partition_rows[0], partition_varlen_bytes[0])?;
             }
             Self::Radix(table) => {
-                for (partition, rows) in table.partitions.iter().zip(partition_rows.iter()) {
-                    let current = partition.growth_requirement(*rows)?;
+                for ((partition, rows), varlen_bytes) in table
+                    .partitions
+                    .iter()
+                    .zip(partition_rows.iter())
+                    .zip(partition_varlen_bytes.iter())
+                {
+                    let current = partition.growth_requirement(*rows, *varlen_bytes)?;
                     requirement.persistent_bytes = requirement
                         .persistent_bytes
                         .checked_add(current.persistent_bytes)
@@ -216,6 +235,7 @@ impl AggregateHashTable {
         Ok((
             AggregateHashTableGrowthPlan {
                 partition_rows: partition_rows.into_boxed_slice(),
+                partition_varlen_bytes: partition_varlen_bytes.into_boxed_slice(),
             },
             requirement,
         ))
@@ -228,22 +248,31 @@ impl AggregateHashTable {
     ) -> Result<()> {
         match self {
             Self::Flat(table) => {
-                let [rows] = plan.partition_rows.as_ref() else {
+                let ([rows], [varlen_bytes]) = (
+                    plan.partition_rows.as_ref(),
+                    plan.partition_varlen_bytes.as_ref(),
+                ) else {
                     return Err(paro_error::internal(
                         "flat aggregate growth plan has the wrong partition count",
                     ));
                 };
-                table.prepare_growth(*rows, reservation)
+                table.prepare_growth(*rows, *varlen_bytes, reservation)
             }
             Self::Radix(table) => {
-                if plan.partition_rows.len() != table.partitions.len() {
+                if plan.partition_rows.len() != table.partitions.len()
+                    || plan.partition_varlen_bytes.len() != table.partitions.len()
+                {
                     return Err(paro_error::internal(
                         "radix aggregate growth plan has the wrong partition count",
                     ));
                 }
-                for (partition, rows) in table.partitions.iter_mut().zip(plan.partition_rows.iter())
+                for ((partition, rows), varlen_bytes) in table
+                    .partitions
+                    .iter_mut()
+                    .zip(plan.partition_rows.iter())
+                    .zip(plan.partition_varlen_bytes.iter())
                 {
-                    partition.prepare_growth(*rows, reservation)?;
+                    partition.prepare_growth(*rows, *varlen_bytes, reservation)?;
                 }
                 Ok(())
             }
