@@ -31,14 +31,12 @@ use crate::runtime::state::{
     SourceLocal,
 };
 
-/// Bounds for scheduler-aware scan morsels.
-///
-/// Large scans retain coarse morsels so reader construction stays amortized.
-/// A data task must also contain enough rows to amortize task state, reader
-/// construction, and scheduler coordination. Small dimension scans therefore
-/// remain single-task instead of manufacturing one morsel per admitted worker.
-const MIN_ROWSET_MORSEL_ROWS: u64 = 128 * 1024;
-const MAX_ROWSET_MORSEL_ROWS: u64 = 256 * 1024;
+/// Admission-time packetization targets. Rows are derived from projected
+/// decode width and predicate work, so a wide scan is not forced through the
+/// same fixed row packet as a narrow key scan.
+const MIN_SCAN_PACKET_WORK_BYTES: u64 = 512 * 1024;
+const TARGET_SCAN_PACKET_WORK_BYTES: u64 = 4 * 1024 * 1024;
+const SCAN_PACKETS_PER_TASK: u64 = 2;
 
 #[derive(Debug, Clone)]
 pub struct RowsetSourceExec {
@@ -176,7 +174,12 @@ impl RowsetSourceExec {
             &self.desc.column_projection,
             &self.desc.table.columns,
         );
-        let morsels = build_scan_morsels(&segments, ctx.query.max_parallel_tasks());
+        let scan_row_work_bytes = scan_row_work_bytes(&self.desc, prepared_predicate.as_ref());
+        let morsels = build_scan_morsels(
+            &segments,
+            ctx.query.max_parallel_tasks(),
+            scan_row_work_bytes,
+        );
 
         Ok(SourceGlobal::Rowset(Arc::new(RowsetSourceGlobal {
             table_index: self.desc.table_index,
@@ -706,11 +709,12 @@ fn rescale_decimal_boundary(
 fn build_scan_morsels(
     segments: &[(RowsetSharedPtr, SegmentSharedPtr)],
     parallelism: usize,
+    row_work_bytes: u64,
 ) -> Box<[RowsetScanMorsel]> {
     let total_rows = segments.iter().fold(0u64, |total, (_, segment)| {
         total.saturating_add(segment.num_rows())
     });
-    let morsel_rows = rowset_morsel_rows(total_rows, parallelism);
+    let morsel_rows = rowset_morsel_rows(total_rows, parallelism, row_work_bytes);
     segments
         .iter()
         .enumerate()
@@ -728,20 +732,89 @@ fn build_scan_morsels(
         .into_boxed_slice()
 }
 
-fn rowset_morsel_rows(total_rows: u64, parallelism: usize) -> u64 {
+fn rowset_morsel_rows(total_rows: u64, parallelism: usize, row_work_bytes: u64) -> u64 {
     if parallelism <= 1 {
         // Morsels are scheduling units, not storage batches. With only one
         // worker there is nobody to steal trailing work, so splitting a
         // segment merely rebuilds its reader and reopens its columns. Keep one
         // morsel per segment while respecting step_by's platform-sized input.
         let max_step = u64::try_from(usize::MAX).unwrap_or(u64::MAX);
-        return total_rows.max(MIN_ROWSET_MORSEL_ROWS).min(max_step);
+        return total_rows.max(1).min(max_step);
     }
 
     let parallelism = u64::try_from(parallelism).unwrap_or(u64::MAX).max(1);
+    let row_work_bytes = row_work_bytes.max(1);
+    let minimum_rows = MIN_SCAN_PACKET_WORK_BYTES.div_ceil(row_work_bytes).max(1);
+    let target_rows = TARGET_SCAN_PACKET_WORK_BYTES
+        .div_ceil(row_work_bytes)
+        .max(minimum_rows);
+    let desired_packets = parallelism.saturating_mul(SCAN_PACKETS_PER_TASK).max(1);
     total_rows
-        .div_ceil(parallelism)
-        .clamp(MIN_ROWSET_MORSEL_ROWS, MAX_ROWSET_MORSEL_ROWS)
+        .div_ceil(desired_packets)
+        .max(1)
+        .clamp(minimum_rows, target_rows)
+        .min(u64::try_from(usize::MAX).unwrap_or(u64::MAX))
+}
+
+fn scan_row_work_bytes(
+    desc: &RowsetSourceDesc,
+    predicate: Option<&PreparedRowsetPredicate>,
+) -> u64 {
+    let projected = desc.returned_types.iter().fold(0_u64, |width, logical| {
+        width.saturating_add(scan_type_work_bytes(logical))
+    });
+    let predicate_work = predicate.map_or(0, |predicate| {
+        let decoded_columns = predicate.columns.iter().fold(0_u64, |width, column_id| {
+            let column_width = desc
+                .table
+                .columns
+                .get(*column_id as usize)
+                .map(|column| scan_type_work_bytes(&column.logical_type))
+                .unwrap_or(8);
+            width.saturating_add(column_width)
+        });
+        decoded_columns.saturating_add(predicate_leaf_count(&predicate.tree).saturating_mul(8))
+    });
+    // Validity checks, selection-vector writes, and row visibility are paid
+    // even by zero-column COUNT(*) scans.
+    projected.saturating_add(predicate_work).saturating_add(8)
+}
+
+fn scan_type_work_bytes(logical: &LogicalType) -> u64 {
+    match logical {
+        LogicalType::Varchar
+        | LogicalType::VarcharCollation(_)
+        | LogicalType::TsVector
+        | LogicalType::TsQuery
+        | LogicalType::Blob
+        | LogicalType::Json
+        | LogicalType::Jsonb
+        | LogicalType::StringLiteral => 32,
+        LogicalType::List(_) => 32,
+        LogicalType::Array(element, length) => scan_type_work_bytes(element)
+            .saturating_mul(u64::try_from(*length).unwrap_or(u64::MAX))
+            .max(8),
+        LogicalType::Struct(fields) => fields
+            .iter()
+            .fold(0_u64, |width, (_, field)| {
+                width.saturating_add(scan_type_work_bytes(field))
+            })
+            .max(8),
+        _ => u64::try_from(logical.type_size())
+            .unwrap_or(u64::MAX)
+            .max(1),
+    }
+}
+
+fn predicate_leaf_count(tree: &PredicateTree) -> u64 {
+    match tree {
+        PredicateTree::Leaf(_) => 1,
+        PredicateTree::And(children) | PredicateTree::Or(children) => {
+            children.iter().fold(0_u64, |count, child| {
+                count.saturating_add(predicate_leaf_count(child))
+            })
+        }
+    }
 }
 
 #[cfg(test)]
@@ -881,24 +954,25 @@ mod tests {
     }
 
     #[test]
-    fn morsels_expose_workers_without_fragmenting_large_scans() {
-        assert_eq!(rowset_morsel_rows(25, 4), MIN_ROWSET_MORSEL_ROWS);
-        assert_eq!(rowset_morsel_rows(10_000, 4), MIN_ROWSET_MORSEL_ROWS);
-        assert_eq!(rowset_morsel_rows(73_000, 4), MIN_ROWSET_MORSEL_ROWS);
-        assert_eq!(rowset_morsel_rows(200_000, 4), MIN_ROWSET_MORSEL_ROWS);
-        assert_eq!(rowset_morsel_rows(800_000, 4), 200_000);
-        assert_eq!(rowset_morsel_rows(6_000_000, 4), MAX_ROWSET_MORSEL_ROWS);
+    fn morsels_balance_tail_work_at_the_admitted_task_count() {
+        assert_eq!(rowset_morsel_rows(25, 4, 32), 16 * 1024);
+        assert_eq!(rowset_morsel_rows(200_000, 4, 32), 25_000);
+        assert_eq!(rowset_morsel_rows(800_000, 4, 32), 100_000);
+        assert_eq!(rowset_morsel_rows(6_000_000, 4, 32), 128 * 1024);
+    }
+
+    #[test]
+    fn packet_rows_shrink_for_wide_or_predicate_heavy_scans() {
+        assert_eq!(rowset_morsel_rows(6_000_000, 4, 8), 512 * 1024);
+        assert_eq!(rowset_morsel_rows(6_000_000, 4, 256), 16 * 1024);
     }
 
     #[test]
     fn morsel_policy_handles_empty_and_single_thread_scans() {
-        assert_eq!(rowset_morsel_rows(0, 0), MIN_ROWSET_MORSEL_ROWS);
-        assert_eq!(rowset_morsel_rows(200_000, 1), 200_000);
-        assert_eq!(rowset_morsel_rows(6_000_000, 1), 6_000_000);
-        assert_eq!(
-            rowset_morsel_rows(u64::MAX, usize::MAX),
-            MIN_ROWSET_MORSEL_ROWS
-        );
+        assert_eq!(rowset_morsel_rows(0, 0, 32), 1);
+        assert_eq!(rowset_morsel_rows(200_000, 1, 32), 200_000);
+        assert_eq!(rowset_morsel_rows(6_000_000, 1, 32), 6_000_000);
+        assert_eq!(rowset_morsel_rows(u64::MAX, usize::MAX, 32), 16 * 1024);
     }
 
     #[test]

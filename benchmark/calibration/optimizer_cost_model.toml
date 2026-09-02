@@ -2,13 +2,24 @@
 # SPDX-License-Identifier: Apache-2.0
 
 [artifact]
-revision = 1
+revision = 2
 hardware_class = "portable-cpu-v1"
 corpus_id = "optimizer-cost-bootstrap-2026-08"
 validation_workload = "operator_runtime_baseline"
 provenance = "bootstrap"
 derivation = "hand-authored bootstrap; validation queries provide coverage, not fitted coefficients"
 risk_weight = 0.5
+
+[parallelism]
+# Bootstrap work/span calibration. These values are measured independently
+# from operator work coefficients: efficiency describes worker scaling, while
+# coordination is the fixed span paid for each additional admitted task.
+expected_worker_efficiency = 0.82
+risk_worker_efficiency = 0.60
+coordination_latency_expected = 128.0
+coordination_latency_upper = 512.0
+pipeline_serial_fraction = 0.05
+blocking_merge_serial_fraction = 0.20
 
 [[coefficient]]
 id = 1

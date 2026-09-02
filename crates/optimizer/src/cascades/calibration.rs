@@ -109,6 +109,19 @@ pub struct CalibratedOpCost {
     pub latency_per_unit: CompactRange,
 }
 
+/// Execution phase shape used to turn calibrated work into critical-path
+/// span. Total resource work remains invariant across task counts.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ParallelWorkProfile {
+    /// The phase has no scheduler-visible parallel decomposition.
+    Serial,
+    /// Workers consume independent packets and only synchronize at the phase
+    /// boundary.
+    Pipeline,
+    /// Workers consume packets, followed by a material merge/finalize phase.
+    BlockingMerge,
+}
+
 #[derive(Debug, Clone)]
 pub struct MachineCalibrationBundle {
     pub revision: CalibrationRevisionId,
@@ -120,6 +133,12 @@ pub struct MachineCalibrationBundle {
     coefficients: BTreeMap<OpClassId, CalibratedOpCost>,
     pub conservative_fallback: CalibratedOpCost,
     pub risk_weight: f64,
+    expected_worker_efficiency: f64,
+    risk_worker_efficiency: f64,
+    coordination_latency_expected: f64,
+    coordination_latency_upper: f64,
+    pipeline_serial_fraction: f64,
+    blocking_merge_serial_fraction: f64,
 }
 
 impl MachineCalibrationBundle {
@@ -133,6 +152,12 @@ impl MachineCalibrationBundle {
         bundle.corpus_id = generated::CORPUS_ID.to_string();
         bundle.provenance = generated::PROVENANCE.to_string();
         bundle.risk_weight = generated::RISK_WEIGHT;
+        bundle.expected_worker_efficiency = generated::EXPECTED_WORKER_EFFICIENCY;
+        bundle.risk_worker_efficiency = generated::RISK_WORKER_EFFICIENCY;
+        bundle.coordination_latency_expected = generated::COORDINATION_LATENCY_EXPECTED;
+        bundle.coordination_latency_upper = generated::COORDINATION_LATENCY_UPPER;
+        bundle.pipeline_serial_fraction = generated::PIPELINE_SERIAL_FRACTION;
+        bundle.blocking_merge_serial_fraction = generated::BLOCKING_MERGE_SERIAL_FRACTION;
         bundle.coefficients.clear();
         for coefficient in generated::COEFFICIENTS {
             bundle
@@ -194,6 +219,52 @@ impl MachineCalibrationBundle {
         };
         result.validate()?;
         Ok(result)
+    }
+
+    /// Fold total work and derive span at one admitted physical operating
+    /// point. This is Amdahl's law with calibrated imperfect worker scaling
+    /// and an explicit coordination term. It deliberately does not divide
+    /// resource work by DOP.
+    pub fn fold_for_tasks(
+        &self,
+        work: &LocalOperatorWork,
+        profile: ParallelWorkProfile,
+        max_parallel_tasks: u16,
+    ) -> Result<SearchCost> {
+        let cost = self.fold(work)?;
+        self.apply_parallelism(cost, profile, max_parallel_tasks)
+    }
+
+    pub fn apply_parallelism(
+        &self,
+        mut cost: SearchCost,
+        profile: ParallelWorkProfile,
+        max_parallel_tasks: u16,
+    ) -> Result<SearchCost> {
+        let tasks = f64::from(max_parallel_tasks.max(1));
+        if tasks == 1.0 || profile == ParallelWorkProfile::Serial {
+            return Ok(cost);
+        }
+        let serial_fraction = match profile {
+            ParallelWorkProfile::Serial => 1.0,
+            ParallelWorkProfile::Pipeline => self.pipeline_serial_fraction,
+            ParallelWorkProfile::BlockingMerge => self.blocking_merge_serial_fraction,
+        };
+        let parallel_fraction = 1.0 - serial_fraction;
+        let expected_workers = 1.0 + (tasks - 1.0) * self.expected_worker_efficiency;
+        let risk_workers = 1.0 + (tasks - 1.0) * self.risk_worker_efficiency;
+        let best_factor = serial_fraction + parallel_fraction / tasks;
+        let expected_factor = serial_fraction + parallel_fraction / expected_workers;
+        let risk_factor = serial_fraction + parallel_fraction / risk_workers;
+        let extra_tasks = tasks - 1.0;
+        cost.critical_path = CompactRange::new(
+            cost.critical_path.lower * best_factor,
+            cost.critical_path.expected * expected_factor
+                + extra_tasks * self.coordination_latency_expected,
+            cost.critical_path.upper * risk_factor + extra_tasks * self.coordination_latency_upper,
+        )?;
+        cost.validate()?;
+        Ok(cost)
     }
 }
 
@@ -269,6 +340,12 @@ impl Default for MachineCalibrationBundle {
                 },
             },
             risk_weight: 0.5,
+            expected_worker_efficiency: 0.75,
+            risk_worker_efficiency: 0.5,
+            coordination_latency_expected: 256.0,
+            coordination_latency_upper: 1024.0,
+            pipeline_serial_fraction: 0.1,
+            blocking_merge_serial_fraction: 0.25,
         }
     }
 }
@@ -328,7 +405,7 @@ mod tests {
     #[test]
     fn production_bundle_is_versioned_and_operator_specific() {
         let bundle = MachineCalibrationBundle::builtin_production();
-        assert_eq!(bundle.revision, CalibrationRevisionId(1));
+        assert_eq!(bundle.revision, CalibrationRevisionId(2));
         assert_eq!(bundle.provenance, "bootstrap");
         for class in [
             OP_RUNTIME_FILTER_BUILD_ROW,
@@ -361,5 +438,33 @@ mod tests {
         assert!(work
             .add(OpClassId(100), CompactRange::point(1.0).unwrap())
             .is_err());
+    }
+
+    #[test]
+    fn task_count_changes_span_without_changing_total_work() {
+        let mut work = LocalOperatorWork::default();
+        work.add(OpClassId(999), CompactRange::point(100_000.0).unwrap())
+            .unwrap();
+        let calibration = MachineCalibrationBundle::default();
+        let serial = calibration.fold(&work).unwrap();
+        let parallel = calibration
+            .fold_for_tasks(&work, ParallelWorkProfile::Pipeline, 4)
+            .unwrap();
+        assert_eq!(parallel.score, serial.score);
+        assert_eq!(parallel.resources_expected, serial.resources_expected);
+        assert!(parallel.critical_path.expected < serial.critical_path.expected);
+    }
+
+    #[test]
+    fn coordination_prevents_free_parallelism_for_tiny_work() {
+        let mut work = LocalOperatorWork::default();
+        work.add(OpClassId(999), CompactRange::point(1.0).unwrap())
+            .unwrap();
+        let calibration = MachineCalibrationBundle::default();
+        let serial = calibration.fold(&work).unwrap();
+        let parallel = calibration
+            .fold_for_tasks(&work, ParallelWorkProfile::Pipeline, 4)
+            .unwrap();
+        assert!(parallel.critical_path.expected > serial.critical_path.expected);
     }
 }

@@ -701,6 +701,7 @@ fn blocking_enforcers_participate_in_grant_feasibility() {
         row_width_bytes: 16,
         hard_memory_bytes: 1_024,
         spill_policy: SpillPolicy::Forbidden,
+        max_parallel_tasks: 1,
     };
     assert!(enforcer_cost(
         &[EnforcerStep::MutationInputSpool {
@@ -833,6 +834,7 @@ fn mandatory_unknown_nonspill_state_is_not_a_hard_memory_proof() {
         row_width_bytes: 8,
         hard_memory_bytes: 100,
         spill_policy: SpillPolicy::Forbidden,
+        max_parallel_tasks: 1,
     };
 
     let fitted = fit_local_retained_state_to_grant(
@@ -860,6 +862,7 @@ fn spill_capability_does_not_imply_spill_permission() {
         row_width_bytes: 8,
         hard_memory_bytes: 100,
         spill_policy: SpillPolicy::Forbidden,
+        max_parallel_tasks: 1,
     };
 
     let fitted =
@@ -885,6 +888,7 @@ fn mandatory_nonspill_parent_can_coexist_with_a_revocable_child() {
         row_width_bytes: 8,
         hard_memory_bytes: 1_024,
         spill_policy: SpillPolicy::Forbidden,
+        max_parallel_tasks: 1,
     };
 
     let fitted = fit_local_retained_state_to_grant(
@@ -919,6 +923,7 @@ fn overlapping_non_revocable_state_must_fit_the_grant() {
         row_width_bytes: 8,
         hard_memory_bytes: 1_024,
         spill_policy: SpillPolicy::Allowed,
+        max_parallel_tasks: 1,
     };
 
     let fitted = fit_local_retained_state_to_grant(

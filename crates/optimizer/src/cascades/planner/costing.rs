@@ -395,7 +395,7 @@ pub(super) fn implementation_cost(
     let peak_memory_upper;
     match flavor {
         PhysicalImplementationFlavor::Structural => {
-            return refreshed_structural_cost(metadata, facts, max_concurrent_tasks)
+            return refreshed_structural_cost(metadata, facts, calibration, max_concurrent_tasks)
         }
         PhysicalImplementationFlavor::SearchProvider => {
             return Err(paro_error::internal(
@@ -671,7 +671,11 @@ pub(super) fn implementation_cost(
                 .saturating_mul(facts.output_row_width.max(32));
         }
     }
-    let mut cost = calibration.fold(&work)?;
+    let mut cost = calibration.fold_for_tasks(
+        &work,
+        implementation_parallelism(flavor),
+        max_concurrent_tasks,
+    )?;
     let retained_memory_target = expected_retained_memory_target(facts, flavor, peak_memory_upper);
     apply_execution_memory_contract(
         metadata,
@@ -700,6 +704,27 @@ pub(super) fn implementation_cost(
     }
     cost.validate()?;
     Ok(cost)
+}
+
+fn implementation_parallelism(flavor: PhysicalImplementationFlavor) -> ParallelWorkProfile {
+    match flavor {
+        PhysicalImplementationFlavor::AdaptiveSort
+        | PhysicalImplementationFlavor::HeapTopN
+        | PhysicalImplementationFlavor::HashAggregate
+        | PhysicalImplementationFlavor::PerfectHashAggregate
+        | PhysicalImplementationFlavor::Window
+        | PhysicalImplementationFlavor::PartitionAggregateWindow
+        | PhysicalImplementationFlavor::SortRangeJoin
+        | PhysicalImplementationFlavor::ClassicIeJoin => ParallelWorkProfile::BlockingMerge,
+        PhysicalImplementationFlavor::HashJoin
+        | PhysicalImplementationFlavor::HashJoinRuntimeFilter
+        | PhysicalImplementationFlavor::NestedLoopJoin
+        | PhysicalImplementationFlavor::CrossProductInMemory
+        | PhysicalImplementationFlavor::CrossProductExternal => ParallelWorkProfile::Pipeline,
+        PhysicalImplementationFlavor::SingletonAggregateProjection
+        | PhysicalImplementationFlavor::Structural
+        | PhysicalImplementationFlavor::SearchProvider => ParallelWorkProfile::Serial,
+    }
 }
 
 fn apply_execution_memory_contract(
@@ -874,6 +899,7 @@ fn estimated_bytes(rows: f64, width: u64) -> u64 {
 fn refreshed_structural_cost(
     metadata: &PlannerOperatorMetadata,
     facts: &ResolvedPlannerCostFacts,
+    calibration: &MachineCalibrationBundle,
     max_concurrent_tasks: u16,
 ) -> Result<SearchCost> {
     if matches!(
@@ -890,9 +916,14 @@ fn refreshed_structural_cost(
         // metadata with provider-specific facts. Only an actual base-table
         // scan owns an access-width frontier; provider costs remain the
         // immutable contract recorded by that implementation.
-        return facts.scan_access_width.map_or_else(
+        let cost = facts.scan_access_width.map_or_else(
             || Ok(metadata.local_cost),
             |access_width| base_table_scan_cost(facts.output_rows, access_width),
+        )?;
+        return calibration.apply_parallelism(
+            cost,
+            ParallelWorkProfile::Pipeline,
+            max_concurrent_tasks,
         );
     }
     let width_factor = (facts.output_row_width as f64 / 32.0).max(1.0);
@@ -961,7 +992,7 @@ fn refreshed_structural_cost(
         )?;
     }
     cost.validate()?;
-    Ok(cost)
+    calibration.apply_parallelism(cost, ParallelWorkProfile::Pipeline, max_concurrent_tasks)
 }
 
 pub(super) fn add_tuple_byte_work(

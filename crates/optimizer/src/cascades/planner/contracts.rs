@@ -521,6 +521,7 @@ pub(super) fn planner_enforcer_cost_input(
         })?;
         input.hard_memory_bytes = class.hard_memory_bytes;
         input.spill_policy = class.spill_policy;
+        input.max_parallel_tasks = class.max_parallel_tasks.max(1);
     }
     Ok(input)
 }

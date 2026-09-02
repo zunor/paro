@@ -9,7 +9,7 @@ use paro_common::error::{self as paro_error, Result};
 
 use super::budget::{BudgetDecision, BudgetDimension};
 use super::calibration::{
-    LocalOperatorWork, MachineCalibrationBundle, OP_ENFORCER_RANDOM_FETCH,
+    LocalOperatorWork, MachineCalibrationBundle, ParallelWorkProfile, OP_ENFORCER_RANDOM_FETCH,
     OP_ENFORCER_SORT_COMPARE, OP_ENFORCER_SPILL_PAGE, OP_ENFORCER_STREAM_ROW,
 };
 use super::cost::{CompactRange, ResourceDimension, SearchCost};
@@ -127,6 +127,7 @@ pub struct EnforcerCostInput {
     pub row_width_bytes: u64,
     pub hard_memory_bytes: u64,
     pub spill_policy: SpillPolicy,
+    pub max_parallel_tasks: u16,
 }
 
 impl EnforcerCostInput {
@@ -136,6 +137,7 @@ impl EnforcerCostInput {
             row_width_bytes: row_width_bytes.max(1),
             hard_memory_bytes: u64::MAX,
             spill_policy: SpillPolicy::Allowed,
+            max_parallel_tasks: 1,
         }
     }
 }
@@ -1325,12 +1327,14 @@ pub(crate) fn enforcer_cost(
     }
     input.rows.checked_add(super::cost::CompactRange::ZERO)?;
     let mut work = LocalOperatorWork::default();
+    let mut profile = ParallelWorkProfile::Pipeline;
     let mut peak_memory_upper = 0_u64;
     let mut spill_bytes_expected = 0_u64;
     let row_bytes_upper = bytes_for_rows(input.rows.upper, input.row_width_bytes);
     for step in steps {
         match step {
             EnforcerStep::Sort(_) | EnforcerStep::LocalSort(_) => {
+                profile = ParallelWorkProfile::BlockingMerge;
                 work.add(OP_ENFORCER_SORT_COMPARE, sort_work(input.rows)?)?;
                 if row_bytes_upper > input.hard_memory_bytes {
                     if input.spill_policy == SpillPolicy::Forbidden {
@@ -1375,7 +1379,7 @@ pub(crate) fn enforcer_cost(
             }
         }
     }
-    let mut result = calibration.fold(&work)?;
+    let mut result = calibration.fold_for_tasks(&work, profile, input.max_parallel_tasks)?;
     result.peak_memory_upper = peak_memory_upper;
     result.spill_bytes_expected = spill_bytes_expected;
     result.validate()?;

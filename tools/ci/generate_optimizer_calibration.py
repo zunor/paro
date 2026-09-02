@@ -71,6 +71,30 @@ def _validate(payload: dict) -> None:
             if not measurement.get(field):
                 raise ValueError(f"measurement record is missing {field}")
 
+    parallelism = payload["parallelism"]
+    fractions = [
+        float(parallelism["expected_worker_efficiency"]),
+        float(parallelism["risk_worker_efficiency"]),
+        float(parallelism["pipeline_serial_fraction"]),
+        float(parallelism["blocking_merge_serial_fraction"]),
+    ]
+    if any(value <= 0.0 or value > 1.0 for value in fractions[:2]):
+        raise ValueError("parallel worker efficiencies must be in (0, 1]")
+    if any(value < 0.0 or value > 1.0 for value in fractions[2:]):
+        raise ValueError("parallel serial fractions must be in [0, 1]")
+    if parallelism["risk_worker_efficiency"] > parallelism["expected_worker_efficiency"]:
+        raise ValueError("risk worker efficiency cannot exceed expected efficiency")
+    if any(
+        float(parallelism[field]) < 0.0
+        for field in ("coordination_latency_expected", "coordination_latency_upper")
+    ):
+        raise ValueError("parallel coordination latency cannot be negative")
+    if (
+        parallelism["coordination_latency_upper"]
+        < parallelism["coordination_latency_expected"]
+    ):
+        raise ValueError("parallel coordination upper must cover its expectation")
+
     coefficients = payload.get("coefficient", [])
     ids = [int(coefficient["id"]) for coefficient in coefficients]
     if len(ids) != len(set(ids)):
@@ -110,6 +134,7 @@ def _validate(payload: dict) -> None:
 
 def _render(payload: dict) -> str:
     artifact = payload["artifact"]
+    parallelism = payload["parallelism"]
     coefficients = sorted(
         payload["coefficient"], key=lambda coefficient: int(coefficient["id"])
     )
@@ -127,6 +152,12 @@ def _render(payload: dict) -> str:
         f"pub(super) const CORPUS_ID: &str = {_rust_string(artifact['corpus_id'])};",
         f"pub(super) const PROVENANCE: &str = {_rust_string(artifact['provenance'])};",
         f"pub(super) const RISK_WEIGHT: f64 = {float(artifact['risk_weight']):.6f};",
+        f"pub(super) const EXPECTED_WORKER_EFFICIENCY: f64 = {float(parallelism['expected_worker_efficiency']):.6f};",
+        f"pub(super) const RISK_WORKER_EFFICIENCY: f64 = {float(parallelism['risk_worker_efficiency']):.6f};",
+        f"pub(super) const COORDINATION_LATENCY_EXPECTED: f64 = {float(parallelism['coordination_latency_expected']):.6f};",
+        f"pub(super) const COORDINATION_LATENCY_UPPER: f64 = {float(parallelism['coordination_latency_upper']):.6f};",
+        f"pub(super) const PIPELINE_SERIAL_FRACTION: f64 = {float(parallelism['pipeline_serial_fraction']):.6f};",
+        f"pub(super) const BLOCKING_MERGE_SERIAL_FRACTION: f64 = {float(parallelism['blocking_merge_serial_fraction']):.6f};",
         "",
         "pub(super) const COEFFICIENTS: &[BuiltinCoefficient] = &[",
     ]

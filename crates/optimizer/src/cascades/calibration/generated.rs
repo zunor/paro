@@ -6,11 +6,17 @@
 
 use super::{BuiltinCoefficient, OpClassId, ResourceDimension};
 
-pub(super) const REVISION: u32 = 1;
+pub(super) const REVISION: u32 = 2;
 pub(super) const HARDWARE_CLASS: &str = "portable-cpu-v1";
 pub(super) const CORPUS_ID: &str = "optimizer-cost-bootstrap-2026-08";
 pub(super) const PROVENANCE: &str = "bootstrap";
 pub(super) const RISK_WEIGHT: f64 = 0.500000;
+pub(super) const EXPECTED_WORKER_EFFICIENCY: f64 = 0.820000;
+pub(super) const RISK_WORKER_EFFICIENCY: f64 = 0.600000;
+pub(super) const COORDINATION_LATENCY_EXPECTED: f64 = 128.000000;
+pub(super) const COORDINATION_LATENCY_UPPER: f64 = 512.000000;
+pub(super) const PIPELINE_SERIAL_FRACTION: f64 = 0.050000;
+pub(super) const BLOCKING_MERGE_SERIAL_FRACTION: f64 = 0.200000;
 
 pub(super) const COEFFICIENTS: &[BuiltinCoefficient] = &[
     // hash_build_row; coverage queries: integer_hash_join
