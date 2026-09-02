@@ -10,7 +10,6 @@ use paro_common::chunk::Chunk;
 use paro_common::error::{self as paro_error, Result};
 use paro_common::runtime_value::Value;
 use paro_common::types::LogicalType;
-use paro_common::vector::VECTOR_SIZE;
 use paro_function::scalar::FunctionExecContext;
 
 use paro_planner::operator::JoinComparisonType;
@@ -35,9 +34,10 @@ use crate::runtime::state::{
 /// Bounds for scheduler-aware scan morsels.
 ///
 /// Large scans retain coarse morsels so reader construction stays amortized.
-/// Smaller scans are split just far enough to occupy the query's worker set;
-/// this matters for single-segment dimension tables feeding blocking joins.
-const MIN_ROWSET_MORSEL_ROWS: u64 = VECTOR_SIZE as u64;
+/// A data task must also contain enough rows to amortize task state, reader
+/// construction, and scheduler coordination. Small dimension scans therefore
+/// remain single-task instead of manufacturing one morsel per admitted worker.
+const MIN_ROWSET_MORSEL_ROWS: u64 = 128 * 1024;
 const MAX_ROWSET_MORSEL_ROWS: u64 = 256 * 1024;
 
 #[derive(Debug, Clone)]
@@ -884,7 +884,8 @@ mod tests {
     fn morsels_expose_workers_without_fragmenting_large_scans() {
         assert_eq!(rowset_morsel_rows(25, 4), MIN_ROWSET_MORSEL_ROWS);
         assert_eq!(rowset_morsel_rows(10_000, 4), MIN_ROWSET_MORSEL_ROWS);
-        assert_eq!(rowset_morsel_rows(200_000, 4), 50_000);
+        assert_eq!(rowset_morsel_rows(73_000, 4), MIN_ROWSET_MORSEL_ROWS);
+        assert_eq!(rowset_morsel_rows(200_000, 4), MIN_ROWSET_MORSEL_ROWS);
         assert_eq!(rowset_morsel_rows(800_000, 4), 200_000);
         assert_eq!(rowset_morsel_rows(6_000_000, 4), MAX_ROWSET_MORSEL_ROWS);
     }
