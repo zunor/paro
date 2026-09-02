@@ -5,6 +5,7 @@ use std::collections::{HashMap, HashSet};
 use std::ops::ControlFlow;
 
 use paro_planner::binder::ir::CTEMaterialize;
+use paro_planner::expression::ComparisonType;
 use paro_planner::expression::{ConjunctionExpression, ConjunctionType, Expression};
 use paro_planner::operator::Filter as PlannerFilter;
 use paro_planner::operator::{ColumnBinding, LogicalOperator};
@@ -166,6 +167,10 @@ impl CTEFilterPusher {
         let Some(or_expr) = build_or_filter(info, &new_bindings) else {
             return false;
         };
+        let mut producer_filters = vec![or_expr];
+        if let Some(domain) = build_common_equality_domain(info, &new_bindings) {
+            producer_filters.push(domain);
+        }
         if cte.materialized == CTEMaterialize::Default {
             cte.materialized = CTEMaterialize::Materialized;
         }
@@ -177,7 +182,7 @@ impl CTEFilterPusher {
             LogicalPlan::synthetic(LogicalOperator::DummyScan),
         );
         let pushed_plan = FilterPushdown::new().rewrite_plan(LogicalPlan::synthetic(
-            LogicalOperator::Filter(PlannerFilter::new(cte_query_plan, vec![or_expr])),
+            LogicalOperator::Filter(PlannerFilter::new(cte_query_plan, producer_filters)),
         ));
         *cte.cte_query = LogicalPlan {
             id,
@@ -185,6 +190,89 @@ impl CTEFilterPusher {
             operator: pushed_plan.operator,
         };
         true
+    }
+}
+
+/// Derive a producer-side necessary condition from equality domains present
+/// on every consumer. For `OR(ref_1, ..., ref_n)`, weakening each disjunct to
+/// its common-key equalities yields a safe superset filter while allowing the
+/// condition to cross aggregates and set-operation projections.
+fn build_common_equality_domain(
+    info: &MaterializedCTEInfo,
+    new_bindings: &[ColumnBinding],
+) -> Option<Expression> {
+    let mut per_ref = Vec::with_capacity(info.filtered_refs.len());
+    for reference in &info.filtered_refs {
+        let ordinal_by_binding = reference
+            .old_bindings
+            .iter()
+            .copied()
+            .enumerate()
+            .map(|(ordinal, binding)| (binding, ordinal))
+            .collect::<HashMap<_, _>>();
+        let mut equalities = HashMap::new();
+        for filter in &reference.filters {
+            let Expression::Comparison(comparison) = filter else {
+                continue;
+            };
+            if comparison.comparison_type != ComparisonType::Equal {
+                continue;
+            }
+            let binding = match (comparison.left.as_ref(), comparison.right.as_ref()) {
+                (Expression::ColumnRef(column), Expression::Constant(_))
+                | (Expression::Constant(_), Expression::ColumnRef(column))
+                    if column.depth == 0 =>
+                {
+                    column.binding
+                }
+                _ => continue,
+            };
+            let Some(ordinal) = ordinal_by_binding.get(&binding).copied() else {
+                continue;
+            };
+            equalities.entry(ordinal).or_insert_with(|| filter.clone());
+        }
+        per_ref.push((reference, equalities));
+    }
+    let first = per_ref.first()?;
+    let mut common_ordinals = first
+        .1
+        .keys()
+        .copied()
+        .filter(|ordinal| per_ref.iter().all(|(_, map)| map.contains_key(ordinal)))
+        .collect::<Vec<_>>();
+    common_ordinals.sort_unstable();
+    if common_ordinals.is_empty() {
+        return None;
+    }
+
+    let mut disjuncts = Vec::with_capacity(per_ref.len());
+    for (reference, equalities) in per_ref {
+        let mut replacer = ColumnBindingReplacer::new();
+        for (old_binding, new_binding) in reference.old_bindings.iter().zip(new_bindings.iter()) {
+            replacer
+                .replacement_bindings
+                .push(ReplacementBinding::new(*old_binding, *new_binding));
+        }
+        let mut conjuncts = Vec::with_capacity(common_ordinals.len());
+        for ordinal in &common_ordinals {
+            let mut equality = equalities
+                .get(ordinal)
+                .expect("common consumer domain vanished")
+                .clone();
+            replacer.visit_expression(&mut equality);
+            conjuncts.push(equality);
+        }
+        disjuncts.push(conjunction(ConjunctionType::And, conjuncts));
+    }
+    Some(conjunction(ConjunctionType::Or, disjuncts))
+}
+
+fn conjunction(kind: ConjunctionType, mut expressions: Vec<Expression>) -> Expression {
+    if expressions.len() == 1 {
+        expressions.pop().expect("one expression")
+    } else {
+        Expression::Conjunction(ConjunctionExpression::new(kind, expressions))
     }
 }
 
@@ -274,13 +362,16 @@ fn build_or_filter(
 
 #[cfg(test)]
 mod tests {
-    use super::{build_or_filter, CTEFilterPusher, FilteredCTERef, MaterializedCTEInfo};
+    use super::{
+        build_common_equality_domain, build_or_filter, CTEFilterPusher, FilteredCTERef,
+        MaterializedCTEInfo,
+    };
     use paro_common::types::LogicalType;
     use paro_planner::binder::context::BindContext;
     use paro_planner::binder::ir::CTEMaterialize;
     use paro_planner::expression::{
-        ColumnRefExpression, ComparisonExpression, ComparisonType, ConstantExpression, Expression,
-        FunctionExpression,
+        ColumnRefExpression, ComparisonExpression, ComparisonType, ConjunctionType,
+        ConstantExpression, Expression, FunctionExpression,
     };
     use paro_planner::operator::{CTERef, ExpressionGet, Filter, LogicalOperator, MaterializedCTE};
     use paro_planner::plan::LogicalPlan;
@@ -304,6 +395,20 @@ mod tests {
                 vec![LogicalType::Integer],
             )),
         )
+    }
+
+    fn integer_equality(table_index: usize, column_index: usize, value: i32) -> Expression {
+        Expression::Comparison(ComparisonExpression::new(
+            ComparisonType::Equal,
+            Expression::ColumnRef(ColumnRefExpression::new(
+                paro_planner::operator::ColumnBinding::new(table_index, column_index),
+                LogicalType::Integer,
+            )),
+            Expression::Constant(ConstantExpression {
+                value: paro_common::runtime_value::Value::Integer(value),
+                return_type: LogicalType::Integer,
+            }),
+        ))
     }
 
     #[test]
@@ -390,5 +495,57 @@ mod tests {
         };
 
         assert!(build_or_filter(&info, &[]).is_none());
+    }
+
+    #[test]
+    fn common_equality_domain_keeps_only_ordinals_constrained_by_every_consumer() {
+        let info = MaterializedCTEInfo {
+            all_refs_are_filtered: true,
+            filtered_refs: vec![
+                FilteredCTERef {
+                    old_bindings: vec![
+                        paro_planner::operator::ColumnBinding::new(2, 0),
+                        paro_planner::operator::ColumnBinding::new(2, 1),
+                    ],
+                    filters: vec![integer_equality(2, 0, 2001), integer_equality(2, 1, 1)],
+                },
+                FilteredCTERef {
+                    old_bindings: vec![
+                        paro_planner::operator::ColumnBinding::new(3, 0),
+                        paro_planner::operator::ColumnBinding::new(3, 1),
+                    ],
+                    filters: vec![integer_equality(3, 0, 2002)],
+                },
+            ],
+        };
+        let producer_bindings = [
+            paro_planner::operator::ColumnBinding::new(10, 0),
+            paro_planner::operator::ColumnBinding::new(10, 1),
+        ];
+
+        let domain = build_common_equality_domain(&info, &producer_bindings)
+            .expect("the first ordinal is constrained by every consumer");
+        let Expression::Conjunction(disjunction) = domain else {
+            panic!("two consumers must produce a disjunction");
+        };
+        assert_eq!(disjunction.conjunction_type, ConjunctionType::Or);
+        assert_eq!(disjunction.children.len(), 2);
+        for (predicate, expected_value) in disjunction.children.iter().zip([2001, 2002]) {
+            let Expression::Comparison(comparison) = predicate else {
+                panic!("one shared ordinal must produce one equality per consumer");
+            };
+            assert_eq!(comparison.comparison_type, ComparisonType::Equal);
+            let Expression::ColumnRef(column) = comparison.left.as_ref() else {
+                panic!("normalized equality must retain its column on the left");
+            };
+            assert_eq!(column.binding, producer_bindings[0]);
+            let Expression::Constant(constant) = comparison.right.as_ref() else {
+                panic!("normalized equality must retain its literal on the right");
+            };
+            assert_eq!(
+                constant.value,
+                paro_common::runtime_value::Value::Integer(expected_value)
+            );
+        }
     }
 }

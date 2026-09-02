@@ -29,6 +29,7 @@ use crate::column::lifetime::ColumnLifetimeAnalyzer;
 use crate::column::remove_unused::RemoveUnusedColumns;
 use crate::cte::inlining::CTEInlining;
 use crate::cte::{demand_pushdown::CTEDemandPusher, filter_pusher::CTEFilterPusher};
+use crate::expression::normalize_scalar_expressions;
 use crate::filter::pushdown::FilterPushdown;
 use crate::filter::reorder::ReorderFilter;
 use crate::join::elimination::JoinElimination;
@@ -37,6 +38,7 @@ use crate::limit::pushdown::LimitPushdown;
 use crate::limit::topn::TopNOptimizer;
 use crate::statistics::gathering::StatisticsGathering;
 use crate::statistics::propagator::StatisticsPropagator;
+use crate::subquery::empty_result::EmptyResultPullup;
 use crate::subquery::scalar_aggregate_window;
 use crate::verify::verify_logical_plan;
 
@@ -76,9 +78,10 @@ use super::rules::{
     TransformContext, TransformationRule, AGGREGATE_DIMENSION_DEFERRAL_RULE,
     AGGREGATE_INPUT_MATERIALIZATION_RULE, AGGREGATE_JOIN_PREAGGREGATION_RULE,
     AGGREGATE_JOIN_SUBSUMPTION_RULE, AGGREGATE_NON_NULL_INPUT_RULE, AGGREGATE_POST_REDUCTION_RULE,
-    CTE_DEMAND_PUSHDOWN_RULE, CTE_INLINE_RULE, EXPENSIVE_PREDICATE_PLACEMENT_RULE,
-    JOIN_ELIMINATION_RULE, LATE_PAYLOAD_FETCH_RULE, LIMIT_PUSHDOWN_RULE, MARK_JOIN_TO_SEMI_RULE,
-    SCALAR_AGGREGATE_WINDOW_RULE, TOP_N_INTRODUCTION_RULE,
+    CTE_DEMAND_PUSHDOWN_RULE, CTE_FILTER_PUSHDOWN_RULE, CTE_INLINE_RULE,
+    EXPENSIVE_PREDICATE_PLACEMENT_RULE, JOIN_ELIMINATION_RULE, LATE_PAYLOAD_FETCH_RULE,
+    LIMIT_PUSHDOWN_RULE, MARK_JOIN_TO_SEMI_RULE, SCALAR_AGGREGATE_WINDOW_RULE,
+    TOP_N_INTRODUCTION_RULE,
 };
 use super::scalar::ScalarArena;
 use super::scalar_lowering::{
@@ -722,6 +725,7 @@ impl MemoBuilder {
                         );
                     }
                     let operator_metadata = PlannerOperatorMetadata {
+                        origin_rule: None,
                         operator_type: plan.operator.op_type(),
                         operator_fingerprint,
                         provided: ProvidedProperties {

@@ -15,7 +15,9 @@ use paro_planner::operator::{
     LogicalOperator, Projection,
 };
 use paro_planner::plan::LogicalPlan;
+use paro_planner::visitor::LogicalOperatorVisitor;
 
+use crate::expression::binding_replacer::{ColumnBindingReplacer, ReplacementBinding};
 use crate::expression::join_has_evaluation_fence;
 use crate::expression::traversal::{
     associative_terms, expression_join_side, into_associative_terms, visit_expression,
@@ -893,7 +895,7 @@ impl FilterPushdown {
         let agg_index = agg.aggregate_index;
         let groupings_index = agg.groupings_index;
 
-        for filter in self.filters.drain(..) {
+        for mut filter in self.filters.drain(..) {
             // Check if filter references the aggregate output
             let references_aggregate =
                 filter.bindings.contains(&agg_index) || filter.bindings.contains(&groupings_index);
@@ -902,7 +904,35 @@ impl FilterPushdown {
                 // Cannot push down filters that reference aggregate results
                 remaining_filters.push(filter.filter);
             } else {
-                // Can push down filters that only reference group-by columns
+                // Group columns are outputs owned by `group_index`, not
+                // pass-through child bindings. Substitute the defining GROUP
+                // BY expression before crossing the aggregate boundary.
+                let mut pushable = !filter.filter.evaluation_properties().is_reorder_fence();
+                visit_expression(&filter.filter, &mut |expression| {
+                    let Expression::ColumnRef(column) = expression else {
+                        return;
+                    };
+                    if column.depth != 0
+                        || column.binding.table_index != agg.group_index
+                        || agg
+                            .groups
+                            .get(column.binding.column_index)
+                            .is_none_or(|group| {
+                                !group.evaluation_properties().can_share_evaluation()
+                            })
+                    {
+                        pushable = false;
+                    }
+                });
+                if !pushable {
+                    remaining_filters.push(filter.filter);
+                    continue;
+                }
+                filter.filter = filter.filter.replace_column_ref(&|column| {
+                    (column.depth == 0 && column.binding.table_index == agg.group_index)
+                        .then(|| agg.groups.get(column.binding.column_index).cloned())
+                        .flatten()
+                });
                 if child_pushdown.add_filter(filter.filter) == FilterResult::Unsatisfiable {
                     return LogicalOperator::DummyScan;
                 }
@@ -1012,19 +1042,74 @@ impl FilterPushdown {
         &mut self,
         mut setop: paro_planner::operator::SetOperation,
     ) -> LogicalOperator {
-        // For set operations, we cannot push filters through
-        // because the semantics change (UNION removes duplicates, etc.)
-        // Just finish pushdown here
-
-        // Recursively push down into children
+        // Selection distributes over UNION, INTERSECT, and EXCEPT, including
+        // their ALL variants. Rebinding is ordinal because a set operation
+        // owns a fresh output table index while each input keeps its own
+        // bindings. Observable predicates remain above the boundary: moving
+        // one to both inputs could change its evaluation count or error order.
         let mut left_pushdown = FilterPushdown::new();
         let mut right_pushdown = FilterPushdown::new();
+        let left_bindings = setop.left.get_column_bindings();
+        let right_bindings = setop.right.get_column_bindings();
+        if left_bindings.len() != setop.column_count || right_bindings.len() != setop.column_count {
+            return self.finish_pushdown(LogicalOperator::SetOperation(setop));
+        }
+
+        let mut remaining = Vec::new();
+        for filter in self.filters.drain(..) {
+            if filter.filter.evaluation_properties().is_reorder_fence()
+                || filter
+                    .bindings
+                    .iter()
+                    .any(|table_index| *table_index != setop.table_index)
+            {
+                remaining.push(filter.filter);
+                continue;
+            }
+
+            let mut left = filter.filter.clone();
+            let mut right = filter.filter;
+            let mut left_replacer = ColumnBindingReplacer::new();
+            let mut right_replacer = ColumnBindingReplacer::new();
+            for (ordinal, (left_binding, right_binding)) in
+                left_bindings.iter().zip(right_bindings.iter()).enumerate()
+            {
+                let output_binding =
+                    paro_planner::operator::ColumnBinding::new(setop.table_index, ordinal);
+                left_replacer
+                    .replacement_bindings
+                    .push(ReplacementBinding::new(output_binding, *left_binding));
+                right_replacer
+                    .replacement_bindings
+                    .push(ReplacementBinding::new(output_binding, *right_binding));
+            }
+            left_replacer.visit_expression(&mut left);
+            right_replacer.visit_expression(&mut right);
+            if left_pushdown.add_filter(left) == FilterResult::Unsatisfiable
+                || right_pushdown.add_filter(right) == FilterResult::Unsatisfiable
+            {
+                return Self::empty_result(LogicalPlan::synthetic(LogicalOperator::SetOperation(
+                    setop,
+                )))
+                .operator;
+            }
+        }
+
+        left_pushdown.generate_filters();
+        right_pushdown.generate_filters();
 
         setop.left = Box::new(left_pushdown.rewrite_plan(*setop.left));
         setop.right = Box::new(right_pushdown.rewrite_plan(*setop.right));
 
         let result = LogicalOperator::SetOperation(setop);
-        self.push_final_filters(result)
+        if remaining.is_empty() {
+            result
+        } else {
+            LogicalOperator::Filter(PlannerFilter::new(
+                LogicalPlan::synthetic(result),
+                remaining,
+            ))
+        }
     }
 }
 

@@ -71,6 +71,21 @@ pub(super) fn extract_planner_tree(
                     physical.key.implementation,
                     operator_metadata.implementations,
                 )?;
+                if memo
+                    .group(group)
+                    .is_some_and(|group| group.logical_exprs().len() > 1)
+                {
+                    debug!(
+                        target: targets::OPTIMIZER,
+                        group = group.index(),
+                        logical_expression = physical.key.logical.index(),
+                        operator = ?operator_metadata.operator_type,
+                        origin_rule = ?operator_metadata.origin_rule.map(|rule| rule.0),
+                        implementation = ?implementation,
+                        winner_score = winner.cost.score.risk_adjusted,
+                        "extracted winner from an equivalence group"
+                    );
+                }
                 if matches!(
                     implementation,
                     PhysicalImplementationFlavor::HashJoin

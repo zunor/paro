@@ -29,6 +29,7 @@ enum PlannerTransformation {
     ExpensivePredicatePlacement,
     CteInline,
     CteDemandPushdown,
+    CteFilterPushdown,
     AggregatePostReduction,
     MarkJoinToSemi,
     JoinElimination,
@@ -44,10 +45,11 @@ enum PlannerTransformation {
 }
 
 impl PlannerTransformation {
-    const ALL: [Self; 15] = [
+    const ALL: [Self; 16] = [
         Self::ExpensivePredicatePlacement,
         Self::CteInline,
         Self::CteDemandPushdown,
+        Self::CteFilterPushdown,
         Self::AggregatePostReduction,
         Self::MarkJoinToSemi,
         Self::JoinElimination,
@@ -67,6 +69,7 @@ impl PlannerTransformation {
             Self::ExpensivePredicatePlacement => EXPENSIVE_PREDICATE_PLACEMENT_RULE,
             Self::CteInline => CTE_INLINE_RULE,
             Self::CteDemandPushdown => CTE_DEMAND_PUSHDOWN_RULE,
+            Self::CteFilterPushdown => CTE_FILTER_PUSHDOWN_RULE,
             Self::AggregatePostReduction => AGGREGATE_POST_REDUCTION_RULE,
             Self::MarkJoinToSemi => MARK_JOIN_TO_SEMI_RULE,
             Self::JoinElimination => JOIN_ELIMINATION_RULE,
@@ -89,6 +92,7 @@ impl PlannerTransformation {
         match self {
             Self::CteInline
             | Self::CteDemandPushdown
+            | Self::CteFilterPushdown
             | Self::AggregateJoinSubsumption
             | Self::JoinElimination => Some(CardinalityRecipeKind::ConstraintRefined),
             _ => None,
@@ -258,7 +262,9 @@ impl TransformationRule for PlannerTransformationRule {
                     && plan.operator.op_type() != source_operator;
             let preserves_sharing = matches!(
                 self.transformation,
-                PlannerTransformation::CteInline | PlannerTransformation::CteDemandPushdown
+                PlannerTransformation::CteInline
+                    | PlannerTransformation::CteDemandPushdown
+                    | PlannerTransformation::CteFilterPushdown
             ) && kind == RegionFacetKind::Sharing
                 && plan.operator.op_type() == source_operator;
             if preserves_sharing {
@@ -410,16 +416,17 @@ fn rewrite_planner_expression(
         PlannerTransformation::CteDemandPushdown => {
             let (plan, changed) = CTEDemandPusher::new(&environment.bind_context)
                 .optimize_default_root_with_change(plan);
-            if changed {
-                plan
-            } else {
-                let (plan, changed) =
-                    CTEFilterPusher::new().optimize_default_root_with_change(plan);
-                if !changed {
-                    return Ok(None);
-                }
-                plan
+            if !changed {
+                return Ok(None);
             }
+            plan
+        }
+        PlannerTransformation::CteFilterPushdown => {
+            let (plan, changed) = CTEFilterPusher::new().optimize_default_root_with_change(plan);
+            if !changed {
+                return Ok(None);
+            }
+            plan
         }
         PlannerTransformation::AggregatePostReduction => {
             let (plan, changed) =
@@ -592,6 +599,10 @@ fn settle_transformed_expression(
     // Filter(CrossProduct) boundary after the root canonicalization pass.
     // Stage only canonical join semantics so the equivalent expression is
     // never costed as an accidental Cartesian product.
+    plan = FilterPushdown::new().rewrite_plan(plan);
+    normalize_scalar_expressions(&mut plan);
+    plan = FilterPushdown::new().rewrite_plan(plan);
+    plan = EmptyResultPullup::new().optimize_plan(plan);
     plan = JoinPredicateNormalizer::new(&environment.bind_context).optimize_plan(plan)?;
     RemoveUnusedColumns::optimize(
         &mut plan,

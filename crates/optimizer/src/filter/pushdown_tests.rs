@@ -15,8 +15,8 @@ use paro_planner::expression::{
     WindowFrameType,
 };
 use paro_planner::operator::{
-    AntiJoinMode, ColumnBinding, ComparisonJoin, DelimGet, Get, JoinComparisonType, JoinCondition,
-    MarkJoinSemantics,
+    Aggregate, AntiJoinMode, ColumnBinding, ComparisonJoin, DelimGet, Get, JoinComparisonType,
+    JoinCondition, MarkJoinSemantics, SetOperation,
 };
 use paro_planner::plan::LogicalPlan;
 
@@ -268,6 +268,113 @@ fn test_pushdown_through_projection() {
         },
         _ => panic!("Expected Projection operator"),
     }
+}
+
+#[test]
+fn deterministic_filter_distributes_through_union_all_by_ordinal() {
+    let ctx = BindContext::new();
+    let union = SetOperation::union(
+        2,
+        plan(&ctx, make_get(0)),
+        plan(&ctx, make_get(1)),
+        true,
+        vec![LogicalType::Integer, LogicalType::Varchar],
+    );
+    let filter = PlannerFilter::new(
+        plan(&ctx, LogicalOperator::SetOperation(union)),
+        vec![make_comparison(
+            ComparisonType::Equal,
+            make_column_ref(2, 0),
+            make_constant(5),
+        )],
+    );
+
+    let LogicalOperator::SetOperation(union) =
+        FilterPushdown::new().rewrite(LogicalOperator::Filter(filter))
+    else {
+        panic!("expected UNION ALL root");
+    };
+    for (child, expected_table) in [(&union.left, 0), (&union.right, 1)] {
+        let LogicalOperator::Filter(filter) = &child.operator else {
+            panic!("expected distributed child filter");
+        };
+        let Expression::Comparison(comparison) = &filter.expressions[0] else {
+            panic!("expected comparison predicate");
+        };
+        let Expression::ColumnRef(column) = comparison.left.as_ref() else {
+            panic!("expected rebound column");
+        };
+        assert_eq!(column.binding, ColumnBinding::new(expected_table, 0));
+    }
+}
+
+#[test]
+fn group_filter_rebinds_to_aggregate_input() {
+    let ctx = BindContext::new();
+    let aggregate = Aggregate::new(
+        2,
+        3,
+        4,
+        plan(&ctx, make_get(0)),
+        vec![make_column_ref(0, 0)],
+        vec![],
+        vec![],
+        vec![],
+    );
+    let filter = PlannerFilter::new(
+        plan(&ctx, LogicalOperator::Aggregate(aggregate)),
+        vec![make_comparison(
+            ComparisonType::Equal,
+            make_column_ref(2, 0),
+            make_constant(5),
+        )],
+    );
+
+    let LogicalOperator::Aggregate(aggregate) =
+        FilterPushdown::new().rewrite(LogicalOperator::Filter(filter))
+    else {
+        panic!("expected aggregate root");
+    };
+    let LogicalOperator::Filter(filter) = aggregate.child.operator else {
+        panic!("expected filter below aggregate");
+    };
+    let Expression::Comparison(comparison) = &filter.expressions[0] else {
+        panic!("expected comparison predicate");
+    };
+    let Expression::ColumnRef(column) = comparison.left.as_ref() else {
+        panic!("expected rebound child column");
+    };
+    assert_eq!(column.binding, ColumnBinding::new(0, 0));
+}
+
+#[test]
+fn volatile_filter_stays_above_union_all() {
+    let ctx = BindContext::new();
+    let union = SetOperation::union(
+        2,
+        plan(&ctx, make_get(0)),
+        plan(&ctx, make_get(1)),
+        true,
+        vec![LogicalType::Integer, LogicalType::Varchar],
+    );
+    let filter = PlannerFilter::new(
+        plan(&ctx, LogicalOperator::SetOperation(union)),
+        vec![make_comparison(
+            ComparisonType::GreaterThan,
+            volatile_call(),
+            make_constant(5),
+        )],
+    );
+
+    let LogicalOperator::Filter(filter) =
+        FilterPushdown::new().rewrite(LogicalOperator::Filter(filter))
+    else {
+        panic!("expected volatile predicate above UNION ALL");
+    };
+    assert!(matches!(
+        filter.child.operator,
+        LogicalOperator::SetOperation(_)
+    ));
 }
 
 #[test]

@@ -770,6 +770,20 @@ fn retained_operator_state_overlaps_child_pipeline_memory() {
 }
 
 #[test]
+fn schema_only_child_does_not_contribute_execution_cost() {
+    let local = cost(1.0);
+    let child = SearchCost {
+        minimum_memory_bytes: 40,
+        peak_memory_upper: 80,
+        ..cost(100.0)
+    };
+    let composed = compose_candidate_cost(local, &[child], CostComposition::LocalOnly)
+        .expect("schema-only composition");
+
+    assert_eq!(composed, local);
+}
+
+#[test]
 fn sideways_filter_scales_work_without_weakening_resource_proofs() {
     let child = SearchCost {
         non_revocable_memory_upper: 40,

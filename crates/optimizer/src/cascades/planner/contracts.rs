@@ -326,6 +326,9 @@ pub(super) fn planner_cost_composition(
     flavor: PhysicalImplementationFlavor,
     facts: &ResolvedPlannerCostFacts,
 ) -> Result<CostComposition> {
+    if metadata.operator_type == LogicalOperatorType::EmptyResult {
+        return Ok(CostComposition::LocalOnly);
+    }
     let overlapping_children = match flavor {
         PhysicalImplementationFlavor::HashJoin
         | PhysicalImplementationFlavor::HashJoinRuntimeFilter => 0b11,

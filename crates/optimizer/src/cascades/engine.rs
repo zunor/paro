@@ -1166,6 +1166,10 @@ pub(crate) fn compose_candidate_cost(
     composition: CostComposition,
 ) -> Result<SearchCost> {
     let mut cost = local_cost;
+    if composition == CostComposition::LocalOnly {
+        cost.validate()?;
+        return Ok(cost);
+    }
     let sideways_filter = composition.sideways_filter();
     for (index, child) in child_costs.iter().copied().enumerate() {
         let child = match sideways_filter {

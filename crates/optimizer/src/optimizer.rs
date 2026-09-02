@@ -44,7 +44,7 @@ use crate::context::OptimizationContext;
 use crate::cte::inlining::CTEInlining;
 use crate::cte::iteration::normalize_iteration_ownership;
 use crate::expression::in_clause::InClauseRewriter;
-use crate::expression::rewriter::ExpressionRewriter;
+use crate::expression::normalize_scalar_expressions;
 use crate::external::lowering::ExternalRoutineLoweringPass;
 use crate::filter::pullup::FilterPullup;
 use crate::filter::pushdown::FilterPushdown;
@@ -58,11 +58,6 @@ use crate::physical::{
     ExtractionContext, PhysicalImplementationFlavor, PhysicalPlanExtractor, WinnerPhysicalContract,
 };
 use crate::profiler::{publish_optimizer_profile_snapshot, OptimizerComponent};
-use crate::rules::arithmetic::ArithmeticSimplificationRule;
-use crate::rules::comparison::ComparisonSimplificationRule;
-use crate::rules::conjunction::{CommonConjunctionFactorRule, ConjunctionSimplificationRule};
-use crate::rules::constant_folding::ConstantFoldingRule;
-use crate::rules::move_constants::MoveConstantsRule;
 use crate::statement::{ExplainEnvelope, QueryStatementLayer, StatementBody, StatementPlan};
 use crate::statistics::gathering::StatisticsGathering;
 use crate::statistics::propagator::StatisticsPropagator;
@@ -807,14 +802,7 @@ impl Optimizer {
         plan = GraphMatchDecompose::new().optimize_plan(plan);
         plan = GraphPredicatePushdown::new().optimize_plan(plan);
 
-        let mut scalars = ExpressionRewriter::new();
-        scalars.add_rule(Box::new(ConstantFoldingRule::new()));
-        scalars.add_rule(Box::new(ArithmeticSimplificationRule::new()));
-        scalars.add_rule(Box::new(ComparisonSimplificationRule::new()));
-        scalars.add_rule(Box::new(ConjunctionSimplificationRule::new()));
-        scalars.add_rule(Box::new(CommonConjunctionFactorRule::new()));
-        scalars.add_rule(Box::new(MoveConstantsRule::new()));
-        scalars.rewrite_plan(&mut plan);
+        normalize_scalar_expressions(&mut plan);
 
         CommonAggregateOptimizer::new().optimize(&mut plan);
         plan = DelimJoinElimination::new().optimize_plan(plan);
@@ -832,6 +820,14 @@ impl Optimizer {
         plan = CTEInlining::new(&self.ctx.bind_context)
             .only_not_materialized()
             .optimize_plan(plan);
+        // NOT MATERIALIZED substitution creates fresh filter/projection/set
+        // boundaries. It is a mandatory semantic contract, so canonicalize
+        // predicate placement before Query IR construction just as Memo does
+        // for the optional DEFAULT-CTE inline alternative.
+        plan = FilterPushdown::new().rewrite_plan(plan);
+        normalize_scalar_expressions(&mut plan);
+        plan = FilterPushdown::new().rewrite_plan(plan);
+        plan = EmptyResultPullup::new().optimize_plan(plan);
 
         if self.ctx.verify_enabled {
             verify_logical_plan(&self.ctx.bind_context, &plan)?;

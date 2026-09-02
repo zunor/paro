@@ -34,6 +34,7 @@ pub const LIMIT_PUSHDOWN_RULE: RuleId = RuleId(10_017);
 pub const LATE_PAYLOAD_FETCH_RULE: RuleId = RuleId(10_018);
 pub const SCALAR_AGGREGATE_WINDOW_RULE: RuleId = RuleId(10_019);
 pub const TOP_N_INTRODUCTION_RULE: RuleId = RuleId(10_022);
+pub const CTE_FILTER_PUSHDOWN_RULE: RuleId = RuleId(10_023);
 
 const TRANSFORMATION_RULE_NAMES: &[(RuleId, &str)] = &[
     (
@@ -42,6 +43,7 @@ const TRANSFORMATION_RULE_NAMES: &[(RuleId, &str)] = &[
     ),
     (CTE_INLINE_RULE, "cte_inline"),
     (CTE_DEMAND_PUSHDOWN_RULE, "cte_demand_pushdown"),
+    (CTE_FILTER_PUSHDOWN_RULE, "cte_filter_pushdown"),
     (AGGREGATE_POST_REDUCTION_RULE, "aggregate_post_reduction"),
     (MARK_JOIN_TO_SEMI_RULE, "mark_join_to_semi"),
     (JOIN_ELIMINATION_RULE, "join_elimination"),
@@ -260,6 +262,8 @@ pub struct ChildGoalAlternative {
 /// total work and critical path still follow the dependency order.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CostComposition {
+    /// Children exist only to carry a schema and are never scheduled.
+    LocalOnly,
     Sequential,
     RetainedState {
         overlapping_children: u64,
@@ -278,7 +282,7 @@ pub enum CostComposition {
 impl CostComposition {
     pub(crate) fn overlapping_children(self) -> u64 {
         match self {
-            Self::Sequential => 0,
+            Self::LocalOnly | Self::Sequential => 0,
             Self::RetainedState {
                 overlapping_children,
             }

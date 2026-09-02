@@ -289,6 +289,7 @@ pub(super) fn stage_transformed_expression(
             implementations.hash_join_runtime_filter = false;
         }
         let metadata = PlannerOperatorMetadata {
+            origin_rule: Some(options.rule),
             operator_type: plan.operator.op_type(),
             operator_fingerprint,
             provided: ProvidedProperties {

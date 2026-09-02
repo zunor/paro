@@ -248,6 +248,7 @@ impl std::fmt::Debug for PlannerTransformState {
 
 #[derive(Debug, Clone)]
 pub(super) struct PlannerOperatorMetadata {
+    pub(super) origin_rule: Option<RuleId>,
     pub(super) operator_type: LogicalOperatorType,
     pub(super) operator_fingerprint: Fingerprint,
     pub(super) provided: ProvidedProperties,
