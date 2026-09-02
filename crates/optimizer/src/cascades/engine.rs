@@ -942,13 +942,26 @@ impl CascadesEngine {
                 .group(group)
                 .is_some_and(|group| group.logical_exprs().len() > 1)
             {
+                let logical_expression = self
+                    .memo
+                    .physical_expr(physical)
+                    .map(|physical| physical.key.logical);
+                let origin_rule = logical_expression.and_then(|logical| {
+                    self.memo.logical_expr(logical).and_then(|logical| {
+                        logical.proofs.iter().find_map(|proof| match proof {
+                            EquivalenceProof::Transformation { rule, .. }
+                            | EquivalenceProof::SpecializedEnumerator { rule, .. } => Some(rule.0),
+                            EquivalenceProof::Initial | EquivalenceProof::Normalization { .. } => {
+                                None
+                            }
+                        })
+                    })
+                });
                 tracing::debug!(
                     target: "paro::optimizer",
                     memo_group = group.index(),
-                    logical_expression = self
-                        .memo
-                        .physical_expr(physical)
-                        .map(|physical| physical.key.logical.index()),
+                    logical_expression = logical_expression.map(LogicalExprId::index),
+                    origin_rule,
                     physical_expression = physical.index(),
                     risk_adjusted_cost = cost.score.risk_adjusted,
                     upper_cost = cost.score.range.upper,
