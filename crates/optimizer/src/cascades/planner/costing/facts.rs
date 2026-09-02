@@ -16,6 +16,39 @@ pub(in crate::cascades::planner) fn planner_cost_facts(
         .collect::<Vec<_>>()
         .into_boxed_slice();
     let output_row_width = planner_row_width(plan, scan_access_cost);
+    let hash_key_width = match &plan.operator {
+        LogicalOperator::Aggregate(aggregate) => Some(
+            aggregate
+                .groups
+                .iter()
+                .map(|group| scan_access_cost.estimated_width(&group.return_type()) as u64)
+                .sum(),
+        ),
+        LogicalOperator::Join(Join::Comparison(join))
+            if join.conditions.iter().any(|condition| {
+                matches!(
+                    condition.comparison,
+                    JoinComparisonType::Equal | JoinComparisonType::NotDistinctFrom
+                )
+            }) =>
+        {
+            Some(
+                join.conditions
+                    .iter()
+                    .filter(|condition| {
+                        matches!(
+                            condition.comparison,
+                            JoinComparisonType::Equal | JoinComparisonType::NotDistinctFrom
+                        )
+                    })
+                    .map(|condition| {
+                        scan_access_cost.estimated_width(&condition.right.return_type()) as u64
+                    })
+                    .sum(),
+            )
+        }
+        _ => None,
+    };
     let scan_access_width = match &plan.operator {
         LogicalOperator::Get(get) => Some(planner_scan_access_width(get, scan_access_cost)),
         _ => None,
@@ -68,6 +101,7 @@ pub(in crate::cascades::planner) fn planner_cost_facts(
     Ok(PlannerCostFacts {
         child_row_widths,
         output_row_width,
+        hash_key_width,
         scan_access_width,
         perfect_hash,
         topn_capacity,
@@ -167,6 +201,7 @@ pub(in crate::cascades::planner) fn expression_cost_facts(
         child_rows_hard_upper,
         child_row_widths: template.child_row_widths.clone(),
         output_row_width: template.output_row_width,
+        hash_key_width: template.hash_key_width,
         scan_access_width: template.scan_access_width,
         perfect_hash: template.perfect_hash,
         topn_capacity: template.topn_capacity,

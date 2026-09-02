@@ -72,6 +72,7 @@ fn calibrated_tuple_work_distinguishes_narrow_and_wide_intermediates() {
         child_rows_hard_upper: vec![Some(1_000)].into_boxed_slice(),
         child_row_widths: vec![width].into_boxed_slice(),
         output_row_width: width,
+        hash_key_width: None,
         scan_access_width: None,
         perfect_hash: None,
         topn_capacity: None,
@@ -92,6 +93,28 @@ fn calibrated_tuple_work_distinguishes_narrow_and_wide_intermediates() {
     assert!(
         wide.resources_expected[ResourceDimension::MemoryRead as usize]
             > narrow.resources_expected[ResourceDimension::MemoryRead as usize]
+    );
+}
+
+#[test]
+fn calibrated_hash_work_distinguishes_integral_and_wide_keys() {
+    let calibrated_cost = |key_width| {
+        let mut work = LocalOperatorWork::default();
+        add_hash_key_byte_work(
+            &mut work,
+            CompactRange::point(10_000.0).unwrap(),
+            Some(key_width),
+        )
+        .unwrap();
+        MachineCalibrationBundle::default().fold(&work).unwrap()
+    };
+
+    let integral = calibrated_cost(8);
+    let wide = calibrated_cost(8 + 4 * 32);
+    assert!(wide.score.risk_adjusted > integral.score.risk_adjusted);
+    assert!(
+        wide.resources_expected[ResourceDimension::Cpu as usize]
+            > integral.resources_expected[ResourceDimension::Cpu as usize]
     );
 }
 
@@ -128,6 +151,7 @@ fn expression_cost_facts_read_current_group_cardinality() {
     let template = PlannerCostFacts {
         child_row_widths: vec![16].into_boxed_slice(),
         output_row_width: 16,
+        hash_key_width: None,
         scan_access_width: None,
         perfect_hash: None,
         topn_capacity: None,

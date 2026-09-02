@@ -28,6 +28,9 @@ pub const OP_RUNTIME_FILTER_APPLY_ROW: OpClassId = OpClassId(12);
 /// Keeping width in a separate class lets machine calibration vary memory
 /// bandwidth independently of the operator's row-oriented CPU work.
 pub const OP_TUPLE_BYTE_BLOCK: OpClassId = OpClassId(16);
+/// One additional 32-byte block hashed beyond the integral-key baseline
+/// already represented by the row-oriented hash operator classes.
+pub const OP_HASH_KEY_BYTE_BLOCK: OpClassId = OpClassId(17);
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct WorkUnit {
@@ -324,6 +327,10 @@ impl Default for MachineCalibrationBundle {
             OP_TUPLE_BYTE_BLOCK,
             calibrated_dimension(ResourceDimension::MemoryRead, 0.25, 1.0, 0.1, 0.5),
         );
+        coefficients.insert(
+            OP_HASH_KEY_BYTE_BLOCK,
+            calibrated_dimension(ResourceDimension::Cpu, 0.45, 1.2, 0.45, 1.6),
+        );
         Self {
             revision: CalibrationRevisionId(0),
             hardware_class: "conservative-fallback".into(),
@@ -405,12 +412,13 @@ mod tests {
     #[test]
     fn production_bundle_is_versioned_and_operator_specific() {
         let bundle = MachineCalibrationBundle::builtin_production();
-        assert_eq!(bundle.revision, CalibrationRevisionId(2));
+        assert_eq!(bundle.revision, CalibrationRevisionId(3));
         assert_eq!(bundle.provenance, "bootstrap");
         for class in [
             OP_RUNTIME_FILTER_BUILD_ROW,
             OP_RUNTIME_FILTER_APPLY_ROW,
             OP_TUPLE_BYTE_BLOCK,
+            OP_HASH_KEY_BYTE_BLOCK,
         ] {
             assert!(bundle.coefficients.contains_key(&class));
         }

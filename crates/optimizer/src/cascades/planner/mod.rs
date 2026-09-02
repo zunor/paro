@@ -44,8 +44,8 @@ use crate::verify::verify_logical_plan;
 
 use super::budget::{BudgetDimension, SearchBudget};
 use super::calibration::{
-    LocalOperatorWork, MachineCalibrationBundle, ParallelWorkProfile, OP_RUNTIME_FILTER_APPLY_ROW,
-    OP_RUNTIME_FILTER_BUILD_ROW, OP_TUPLE_BYTE_BLOCK,
+    LocalOperatorWork, MachineCalibrationBundle, ParallelWorkProfile, OP_HASH_KEY_BYTE_BLOCK,
+    OP_RUNTIME_FILTER_APPLY_ROW, OP_RUNTIME_FILTER_BUILD_ROW, OP_TUPLE_BYTE_BLOCK,
 };
 use super::column::{ColumnCatalog, ColumnOrigin, ColumnVisibility, GroupSchema};
 use super::cost::ResourceDimension;

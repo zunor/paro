@@ -286,6 +286,9 @@ pub(super) struct PlannerSearchImplementationMetadata {
 pub(super) struct PlannerCostFacts {
     pub(super) child_row_widths: Box<[u64]>,
     pub(super) output_row_width: u64,
+    /// Bytes participating in one hash key. Row-oriented hash work is
+    /// calibrated for one integral key; wider/composite keys pay separately.
+    pub(super) hash_key_width: Option<u64>,
     /// Bytes physically read from base-table column sources for each scan
     /// row. `None` identifies a non-scan structural operator.
     pub(super) scan_access_width: Option<u64>,
@@ -305,6 +308,7 @@ pub(super) struct ResolvedPlannerCostFacts {
     pub(super) child_rows_hard_upper: Box<[Option<u64>]>,
     pub(super) child_row_widths: Box<[u64]>,
     pub(super) output_row_width: u64,
+    pub(super) hash_key_width: Option<u64>,
     pub(super) scan_access_width: Option<u64>,
     pub(super) perfect_hash: Option<crate::physical::PerfectHashResourceContract>,
     pub(super) topn_capacity: Option<u64>,

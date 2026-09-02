@@ -6,7 +6,7 @@
 
 use super::{BuiltinCoefficient, OpClassId, ResourceDimension};
 
-pub(super) const REVISION: u32 = 2;
+pub(super) const REVISION: u32 = 3;
 pub(super) const HARDWARE_CLASS: &str = "portable-cpu-v1";
 pub(super) const CORPUS_ID: &str = "optimizer-cost-bootstrap-2026-08";
 pub(super) const PROVENANCE: &str = "bootstrap";
@@ -162,6 +162,15 @@ pub(super) const COEFFICIENTS: &[BuiltinCoefficient] = &[
         risk: 1.000000,
         latency_expected: 0.100000,
         latency_upper: 0.500000,
+    },
+    // hash_key_byte_block; coverage queries: string_hash_join, high_cardinality_aggregate
+    BuiltinCoefficient {
+        class: OpClassId(17),
+        dimension: ResourceDimension::Cpu,
+        expected: 0.450000,
+        risk: 1.200000,
+        latency_expected: 0.450000,
+        latency_upper: 1.600000,
     },
     // enforcer_stream_row; coverage queries: count_filter
     BuiltinCoefficient {

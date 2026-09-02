@@ -456,6 +456,7 @@ pub(super) fn implementation_cost(
                 .copied()
                 .unwrap_or(facts.output_rows);
             work.add(OP_HASH_AGGREGATE_ROW, input)?;
+            add_hash_key_byte_work(&mut work, input, facts.hash_key_width)?;
             work.add(OP_HASH_AGGREGATE_GROUP, facts.output_rows)?;
             peak_memory_upper = facts
                 .output_rows_hard_upper
@@ -556,6 +557,7 @@ pub(super) fn implementation_cost(
             } else {
                 left
             };
+            add_hash_key_byte_work(&mut work, right.checked_add(probe)?, facts.hash_key_width)?;
             work.add(OP_HASH_PROBE_ROW, probe.checked_add(facts.output_rows)?)?;
             peak_memory_upper = right_hard_upper
                 .unwrap_or(u64::MAX)
@@ -1009,6 +1011,26 @@ pub(super) fn add_tuple_byte_work(
         blocks = blocks.checked_add(scaled_work(*rows, *width as f64 / BYTE_BLOCK)?)?;
     }
     work.add(OP_TUPLE_BYTE_BLOCK, blocks)
+}
+
+pub(super) fn add_hash_key_byte_work(
+    work: &mut LocalOperatorWork,
+    rows: CompactRange,
+    key_width: Option<u64>,
+) -> Result<()> {
+    const INTEGRAL_KEY_BASELINE_BYTES: u64 = 8;
+    const BYTE_BLOCK: f64 = 32.0;
+
+    let excess_bytes = key_width
+        .unwrap_or(INTEGRAL_KEY_BASELINE_BYTES)
+        .saturating_sub(INTEGRAL_KEY_BASELINE_BYTES);
+    if excess_bytes != 0 {
+        work.add(
+            OP_HASH_KEY_BYTE_BLOCK,
+            scaled_work(rows, excess_bytes as f64 / BYTE_BLOCK)?,
+        )?;
+    }
+    Ok(())
 }
 
 pub(super) fn scaled_work(range: CompactRange, factor: f64) -> Result<CompactRange> {

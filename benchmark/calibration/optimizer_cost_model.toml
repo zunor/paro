@@ -2,7 +2,7 @@
 # SPDX-License-Identifier: Apache-2.0
 
 [artifact]
-revision = 2
+revision = 3
 hardware_class = "portable-cpu-v1"
 corpus_id = "optimizer-cost-bootstrap-2026-08"
 validation_workload = "operator_runtime_baseline"
@@ -180,6 +180,16 @@ risk = 1.00
 latency_expected = 0.10
 latency_upper = 0.50
 validation_queries = ["string_hash_join"]
+
+[[coefficient]]
+id = 17
+name = "hash_key_byte_block"
+dimension = "Cpu"
+expected = 0.45
+risk = 1.20
+latency_expected = 0.45
+latency_upper = 1.60
+validation_queries = ["string_hash_join", "high_cardinality_aggregate"]
 
 [[coefficient]]
 id = 20001
