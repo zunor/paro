@@ -38,6 +38,12 @@ struct JoinRuntimeFilterPolicy {
     freeze_additional_bytes: usize,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RuntimeFilterBuilderScope {
+    Local,
+    Global,
+}
+
 const MIN_EXACT_PENDING_VALUES: usize = VECTOR_SIZE;
 
 impl Default for JoinRuntimeFilterPolicy {
@@ -63,9 +69,13 @@ impl JoinRuntimeFilterPolicy {
     fn from_contract(
         contract: &RuntimeFilterResourceContract,
         representation: RuntimeFilterKeyRepresentation,
+        scope: RuntimeFilterBuilderScope,
     ) -> Self {
         let value_width = representation.value_width();
-        let max_exact_values = contract.max_exact_values_per_builder as usize;
+        let max_exact_values = match scope {
+            RuntimeFilterBuilderScope::Local => contract.max_local_exact_values,
+            RuntimeFilterBuilderScope::Global => contract.max_global_exact_values,
+        } as usize;
         let transfer = max_exact_values.saturating_mul(value_width);
         let frozen = (contract.max_dense_bits as usize)
             .div_ceil(u64::BITS as usize)
@@ -461,7 +471,9 @@ where
         if let Some(value) = incoming.max {
             self.max = Some(self.max.map_or(value, |current| current.max(value)));
         }
-        if self.policy != incoming.policy {
+        if self.policy.max_range_value_bytes != incoming.policy.max_range_value_bytes
+            || self.policy.membership != incoming.policy.membership
+        {
             debug_assert_eq!(
                 self.policy, incoming.policy,
                 "runtime filter policies must match across local sketches"
@@ -684,6 +696,7 @@ impl JoinRuntimeFilterBuilder {
         Self::empty_with_policy(
             key_types,
             &contract,
+            RuntimeFilterBuilderScope::Global,
             MemoryAccountingContext::detached(
                 MemoryTag::HashTable,
                 MemoryAccountingClass::Metadata,
@@ -691,17 +704,36 @@ impl JoinRuntimeFilterBuilder {
         )
     }
 
-    pub(crate) fn empty_with_memory(
+    pub(crate) fn empty_global_with_memory(
         key_types: &[LogicalType],
         contract: &RuntimeFilterResourceContract,
         memory: MemoryAccountingContext,
     ) -> Self {
-        Self::empty_with_policy(key_types, contract, memory)
+        Self::empty_with_policy(
+            key_types,
+            contract,
+            RuntimeFilterBuilderScope::Global,
+            memory,
+        )
+    }
+
+    pub(crate) fn empty_local_with_memory(
+        key_types: &[LogicalType],
+        contract: &RuntimeFilterResourceContract,
+        memory: MemoryAccountingContext,
+    ) -> Self {
+        Self::empty_with_policy(
+            key_types,
+            contract,
+            RuntimeFilterBuilderScope::Local,
+            memory,
+        )
     }
 
     fn empty_with_policy(
         key_types: &[LogicalType],
         contract: &RuntimeFilterResourceContract,
+        scope: RuntimeFilterBuilderScope,
         memory: MemoryAccountingContext,
     ) -> Self {
         debug_assert!(contract.validate(key_types.len()).is_ok());
@@ -711,7 +743,8 @@ impl JoinRuntimeFilterBuilder {
                 .cloned()
                 .zip(contract.keys.iter().copied())
                 .map(|(logical_type, representation)| {
-                    let policy = JoinRuntimeFilterPolicy::from_contract(contract, representation);
+                    let policy =
+                        JoinRuntimeFilterPolicy::from_contract(contract, representation, scope);
                     JoinRuntimeFilterKeyBuilder::new(
                         logical_type,
                         representation,
@@ -731,11 +764,12 @@ impl JoinRuntimeFilterBuilder {
     ) -> Self {
         let mut contract = RuntimeFilterResourceContract::for_keys(key_types, 1)
             .expect("runtime-filter test contract must be valid");
-        contract.max_exact_values = u32::try_from(max_exact_values).unwrap_or(u32::MAX);
-        contract.max_exact_values_per_builder = contract.max_exact_values;
+        contract.max_global_exact_values = u32::try_from(max_exact_values).unwrap_or(u32::MAX);
+        contract.max_local_exact_values = contract.max_global_exact_values;
         Self::empty_with_policy(
             key_types,
             &contract,
+            RuntimeFilterBuilderScope::Global,
             MemoryAccountingContext::detached(
                 MemoryTag::HashTable,
                 MemoryAccountingClass::Metadata,
@@ -1214,6 +1248,45 @@ mod tests {
     }
 
     #[test]
+    fn global_exact_budget_survives_balanced_local_merges() {
+        let allocator = test_allocator();
+        let mut contract =
+            RuntimeFilterResourceContract::for_keys(&[LogicalType::BigInt], 4).unwrap();
+        contract.max_local_exact_values = 2;
+        contract.max_global_exact_values = 8;
+        contract.validate(1).unwrap();
+        let memory = || {
+            MemoryAccountingContext::detached(MemoryTag::HashTable, MemoryAccountingClass::Metadata)
+        };
+        let mut global = JoinRuntimeFilterBuilder::empty_global_with_memory(
+            &[LogicalType::BigInt],
+            &contract,
+            memory(),
+        );
+        for values in [[1_i64, 3], [5, 7], [9, 11], [13, 15]] {
+            let vector = test_i64_vector_with_allocator(&values, allocator.clone());
+            let keys =
+                Chunk::from_arc_vectors(vec![std::sync::Arc::new(vector)], allocator.clone());
+            let selection = SelectionVector::try_incremental(2, allocator.clone()).unwrap();
+            let mut local = JoinRuntimeFilterBuilder::empty_local_with_memory(
+                &[LogicalType::BigInt],
+                &contract,
+                memory(),
+            );
+            local.add_key_chunk(&keys, &selection, 2).unwrap();
+            global.merge(local).unwrap();
+        }
+
+        assert_eq!(
+            global.freeze().predicate_for_column(0, 9),
+            Some(PredicateTree::leaf(Predicate::FixedIn {
+                column_id: 9,
+                values: FixedMembership::i64((1_i64..=15).step_by(2).collect()),
+            }))
+        );
+    }
+
+    #[test]
     fn exact_domain_low_ndv_buffer_stays_vector_sized() {
         let memory = MemoryAccountingContext::detached(
             MemoryTag::HashTable,
@@ -1352,8 +1425,11 @@ mod tests {
             MemoryAccountingClass::Metadata,
         );
         let contract = RuntimeFilterResourceContract::for_keys(&[LogicalType::Integer], 1).unwrap();
-        let mut sketch =
-            JoinRuntimeFilterBuilder::empty_with_memory(&[LogicalType::Integer], &contract, memory);
+        let mut sketch = JoinRuntimeFilterBuilder::empty_global_with_memory(
+            &[LogicalType::Integer],
+            &contract,
+            memory,
+        );
         sketch
             .add_key_chunk(&keys, &selection, values.len())
             .unwrap();

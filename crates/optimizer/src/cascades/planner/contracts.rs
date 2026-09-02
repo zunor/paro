@@ -383,7 +383,7 @@ pub(super) fn planner_cost_composition(
                 &facts.runtime_filter_key_types,
                 1,
             )?
-            .is_exact_single_key(),
+            .guarantees_exact_single_key(facts.child_rows_hard_upper.get(1).copied().flatten()),
         )?;
         let ratio_ppm = |retained: f64, source: f64| {
             if source <= 0.0 {

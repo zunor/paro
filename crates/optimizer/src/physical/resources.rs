@@ -103,8 +103,10 @@ pub struct RuntimeFilterResourceContract {
     pub capability: RuntimeFilterCapability,
     pub keys: Box<[RuntimeFilterKeyRepresentation]>,
     pub max_local_builders: u16,
-    pub max_exact_values: u32,
-    pub max_exact_values_per_builder: u32,
+    /// Exact NDV retained by the progressively merged global domain.
+    pub max_global_exact_values: u32,
+    /// Exact NDV retained independently by each local builder.
+    pub max_local_exact_values: u32,
     pub max_range_value_bytes: u32,
     pub max_dense_bits: u32,
     pub max_dense_bits_per_value: u16,
@@ -155,7 +157,7 @@ impl RuntimeFilterResourceContract {
             .collect::<Vec<_>>()
             .into_boxed_slice();
         let max_local_builders = max_local_builders.max(1);
-        let max_exact_values_per_builder = Self::MAX_EXACT_VALUES
+        let max_local_exact_values = Self::MAX_EXACT_VALUES
             .div_ceil(u32::from(max_local_builders))
             .max(1);
         let exact_width = keys
@@ -164,10 +166,15 @@ impl RuntimeFilterResourceContract {
                 total.checked_add(u64::try_from(key.value_width()).unwrap_or(u64::MAX))
             })
             .ok_or_else(|| paro_error::internal("runtime-filter key width overflow"))?;
-        // Local domains and the progressively merged global domain coexist.
+        // Every local domain and the progressively merged global domain may
+        // coexist. Their budgets are distinct executable capabilities.
         let mutable_bytes_upper = exact_width
-            .checked_mul(u64::from(Self::MAX_EXACT_VALUES))
-            .and_then(|bytes| bytes.checked_mul(2))
+            .checked_mul(
+                u64::from(max_local_exact_values)
+                    .checked_mul(u64::from(max_local_builders))
+                    .and_then(|bytes| bytes.checked_add(u64::from(Self::MAX_EXACT_VALUES)))
+                    .ok_or_else(|| paro_error::internal("runtime-filter local budget overflow"))?,
+            )
             .ok_or_else(|| paro_error::internal("runtime-filter mutable memory overflow"))?;
         let dense_bytes = u64::from(Self::MAX_DENSE_BITS).div_ceil(u64::BITS as u64) * 8;
         let exact_key_count = keys.iter().filter(|key| key.is_exact()).count() as u64;
@@ -221,8 +228,8 @@ impl RuntimeFilterResourceContract {
             },
             keys,
             max_local_builders,
-            max_exact_values: Self::MAX_EXACT_VALUES,
-            max_exact_values_per_builder,
+            max_global_exact_values: Self::MAX_EXACT_VALUES,
+            max_local_exact_values,
             max_range_value_bytes: Self::MAX_RANGE_VALUE_BYTES,
             max_dense_bits: Self::MAX_DENSE_BITS,
             max_dense_bits_per_value: Self::MAX_DENSE_BITS_PER_VALUE,
@@ -236,13 +243,26 @@ impl RuntimeFilterResourceContract {
     /// as one exact membership set. This deliberately excludes composite
     /// equality keys: independent per-column sets are only a superset of the
     /// build tuples and therefore cannot prove a unique-key survivor bound.
-    pub fn is_exact_single_key(&self) -> bool {
+    pub fn has_exact_single_key_representation(&self) -> bool {
         matches!(
             self.keys.as_ref(),
             [RuntimeFilterKeyRepresentation::ExactI32
                 | RuntimeFilterKeyRepresentation::ExactI64
                 | RuntimeFilterKeyRepresentation::ExactI128]
         )
+    }
+
+    /// Whether all executions admitted under this contract retain exact
+    /// membership. A total NDV proof must fit both the global domain and one
+    /// local builder because scheduler skew can route the complete build to a
+    /// single worker.
+    pub fn guarantees_exact_single_key(&self, build_ndv_hard_upper: Option<u64>) -> bool {
+        let Some(ndv) = build_ndv_hard_upper else {
+            return false;
+        };
+        self.has_exact_single_key_representation()
+            && ndv <= u64::from(self.max_global_exact_values)
+            && ndv <= u64::from(self.max_local_exact_values)
     }
 
     pub fn validate(&self, key_count: usize) -> Result<()> {
@@ -263,13 +283,13 @@ impl RuntimeFilterResourceContract {
         };
         if self.keys.len() != key_count
             || self.max_local_builders == 0
-            || self.max_exact_values == 0
-            || self.max_exact_values_per_builder == 0
+            || self.max_global_exact_values == 0
+            || self.max_local_exact_values == 0
             || self.max_range_value_bytes == 0
             || self
-                .max_exact_values_per_builder
+                .max_local_exact_values
                 .saturating_mul(u32::from(self.max_local_builders))
-                < self.max_exact_values
+                < self.max_global_exact_values
             || self.capability != expected_capability
             || self
                 .mutable_bytes_upper
@@ -317,9 +337,12 @@ mod tests {
         )
         .expect("composite contract");
 
-        assert!(integer.is_exact_single_key());
-        assert!(!string.is_exact_single_key());
-        assert!(!composite.is_exact_single_key());
+        assert!(integer.has_exact_single_key_representation());
+        assert!(!string.has_exact_single_key_representation());
+        assert!(!composite.has_exact_single_key_representation());
+        assert!(integer.guarantees_exact_single_key(Some(16_384)));
+        assert!(!integer.guarantees_exact_single_key(Some(20_000)));
+        assert!(!integer.guarantees_exact_single_key(None));
         assert_eq!(string.capability, RuntimeFilterCapability::Range);
         assert_eq!(
             RuntimeFilterResourceContract::for_keys(&[LogicalType::Blob], 4)

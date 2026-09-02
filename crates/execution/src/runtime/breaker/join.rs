@@ -286,7 +286,7 @@ impl JoinBuildHandle {
     ) {
         let mut builder = self.runtime_filter_builder.lock();
         if builder.is_none() {
-            *builder = Some(JoinRuntimeFilterBuilder::empty_with_memory(
+            *builder = Some(JoinRuntimeFilterBuilder::empty_global_with_memory(
                 key_types, contract, memory,
             ));
         }

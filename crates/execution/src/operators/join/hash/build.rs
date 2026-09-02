@@ -175,7 +175,7 @@ impl HashJoinBuildSinkExec {
             build_selection: None,
             build_hashes: Vec::new(),
             runtime_filter_builder: self.runtime_filter.as_ref().map(|filter| {
-                JoinRuntimeFilterBuilder::empty_with_memory(
+                JoinRuntimeFilterBuilder::empty_local_with_memory(
                     &build_key_types,
                     &filter.resource,
                     hash_join_memory_context(ctx.query)

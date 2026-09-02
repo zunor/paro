@@ -530,6 +530,7 @@ pub(super) fn implementation_cost(
                 .get(1)
                 .copied()
                 .unwrap_or(CompactRange::ZERO);
+            let right_hard_upper = facts.child_rows_hard_upper.get(1).copied().flatten();
             work.add(OP_HASH_BUILD_ROW, right)?;
             let probe = if flavor == PhysicalImplementationFlavor::HashJoinRuntimeFilter {
                 work.add(OP_RUNTIME_FILTER_BUILD_ROW, right)?;
@@ -550,20 +551,15 @@ pub(super) fn implementation_cost(
                     left,
                     right,
                     facts.runtime_filter_probe_multiplicity,
-                    resource.is_exact_single_key(),
+                    resource.guarantees_exact_single_key(right_hard_upper),
                 )?
             } else {
                 left
             };
             work.add(OP_HASH_PROBE_ROW, probe.checked_add(facts.output_rows)?)?;
-            let right_hard_upper = facts
-                .child_rows_hard_upper
-                .get(1)
-                .copied()
-                .flatten()
-                .unwrap_or(u64::MAX);
-            peak_memory_upper =
-                right_hard_upper.saturating_mul(facts.output_row_width.saturating_div(2).max(32));
+            peak_memory_upper = right_hard_upper
+                .unwrap_or(u64::MAX)
+                .saturating_mul(facts.output_row_width.saturating_div(2).max(32));
         }
         PhysicalImplementationFlavor::NestedLoopJoin => {
             let left = facts
