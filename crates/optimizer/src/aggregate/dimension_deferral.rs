@@ -117,9 +117,12 @@ fn recognize(plan: &LogicalPlan) -> Option<DimensionDeferral> {
     {
         return None;
     }
-    let LogicalOperator::Get(_) = &join.right.operator else {
+    if !matches!(
+        &join.right.operator,
+        LogicalOperator::Get(_) | LogicalOperator::CTERef(_)
+    ) {
         return None;
-    };
+    }
 
     let fact_bindings = join
         .left
@@ -259,11 +262,7 @@ impl DimensionRewriteInput {
         plan: LogicalPlan,
         projection_depth: usize,
     ) -> std::result::Result<Self, Box<LogicalPlan>> {
-        let LogicalPlan {
-            id: root_id,
-            stats: root_stats,
-            operator,
-        } = plan;
+        let (root_id, root_stats, operator) = plan.into_parts();
         let LogicalOperator::Aggregate(mut aggregate) = operator else {
             return Err(Box::new(LogicalPlan {
                 id: root_id,
@@ -298,11 +297,7 @@ fn take_join_below_projections(
     plan: LogicalPlan,
     projection_depth: usize,
 ) -> std::result::Result<ComparisonJoin, Box<LogicalPlan>> {
-    let LogicalPlan {
-        id,
-        stats,
-        operator,
-    } = plan;
+    let (id, stats, operator) = plan.into_parts();
     if projection_depth == 0 {
         return match operator {
             LogicalOperator::Join(Join::Comparison(join)) => Ok(join),
@@ -382,7 +377,7 @@ fn apply(
                 ))
             }
         })
-        .collect();
+        .collect::<Vec<_>>();
     let partial = LogicalPlan::new(
         bind_context,
         LogicalOperator::Aggregate(Aggregate::new(
@@ -400,7 +395,11 @@ fn apply(
     // intentionally retained, and the final merge reproduces their SQL join
     // multiplicity without carrying descriptive payload through the hot
     // fact-side aggregate.
-    let final_join = ComparisonJoin::new(JoinType::Inner, partial, *join.right, final_conditions);
+    for condition in &mut final_conditions {
+        std::mem::swap(&mut condition.left, &mut condition.right);
+        condition.comparison = condition.comparison.flip();
+    }
+    let final_join = ComparisonJoin::new(JoinType::Inner, *join.right, partial, final_conditions);
 
     let outer_aggregates = merge_functions
         .into_iter()

@@ -1128,12 +1128,12 @@ fn apply_rewrite(
     rewrite: Rewrite,
     bind_context: &BindContext,
 ) -> Result<LogicalPlan> {
-    let LogicalOperator::Filter(mut filter) = plan.operator else {
+    let LogicalOperator::Filter(mut filter) = plan.into_operator() else {
         return Err(paro_error::internal(
             "partition-aggregate witness no longer points to a Filter",
         ));
     };
-    let LogicalOperator::Join(Join::Comparison(mut join)) = filter.child.operator else {
+    let LogicalOperator::Join(Join::Comparison(mut join)) = (*filter.child).into_operator() else {
         return Err(paro_error::internal(
             "partition-aggregate witness no longer points to a comparison join",
         ));
@@ -1200,12 +1200,13 @@ fn apply_grouped_join_rewrite(
     rewrite: GroupedJoinRewrite,
     bind_context: &BindContext,
 ) -> Result<LogicalPlan> {
-    let LogicalOperator::Filter(mut filter) = plan.operator else {
+    let LogicalOperator::Filter(mut filter) = plan.into_operator() else {
         return Err(paro_error::internal(
             "grouped-join witness no longer points to a Filter",
         ));
     };
-    let LogicalOperator::Join(Join::Comparison(mut delim_join)) = filter.child.operator else {
+    let LogicalOperator::Join(Join::Comparison(mut delim_join)) = (*filter.child).into_operator()
+    else {
         return Err(paro_error::internal(
             "grouped-join witness no longer points to a comparison join",
         ));
@@ -1251,12 +1252,14 @@ fn apply_grouped_join_rewrite(
             ))
         })
         .collect::<Result<Vec<_>>>()?;
-    let LogicalOperator::Projection(scalar_projection) = delim_join.right.operator else {
+    let LogicalOperator::Projection(scalar_projection) = (*delim_join.right).into_operator() else {
         return Err(paro_error::internal(
             "grouped-join scalar branch lost its projection",
         ));
     };
-    let LogicalOperator::Aggregate(mut scalar_aggregate) = scalar_projection.child.operator else {
+    let LogicalOperator::Aggregate(mut scalar_aggregate) =
+        (*scalar_projection.child).into_operator()
+    else {
         return Err(paro_error::internal(
             "grouped-join scalar branch lost its aggregate",
         ));
@@ -1407,7 +1410,7 @@ fn take_direct_delim_join_source(
     delim_table_index: usize,
     source_side: DirectSourceSide,
 ) -> Result<LogicalPlan> {
-    let LogicalOperator::Join(Join::Comparison(join)) = plan.operator else {
+    let LogicalOperator::Join(Join::Comparison(join)) = plan.into_operator() else {
         return Err(paro_error::internal(
             "direct DelimGet witness no longer points to a comparison join",
         ));

@@ -62,7 +62,7 @@ pub fn optimize_plan_with_change(
                 &plan,
                 bind_context.shared().as_ref(),
             );
-            let LogicalOperator::MaterializedCTE(cte) = plan.operator else {
+            let LogicalOperator::MaterializedCTE(cte) = plan.into_operator() else {
                 return fallback;
             };
             return match rewrite_cte_max_reduction(cte, rewrite) {

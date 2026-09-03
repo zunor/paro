@@ -1,7 +1,7 @@
 // Copyright 2024-2026 Zunor
 // SPDX-License-Identifier: Apache-2.0
 
-use paro_planner::operator::{Join, LogicalOperator};
+use paro_planner::operator::{ColumnBinding, Join, LogicalOperator};
 use paro_planner::plan::{
     CardinalityEstimate, CardinalityProvenance, LogicalPlan, NodeStats, PlanNodeId,
 };
@@ -184,7 +184,7 @@ fn multiway_region_isolates_the_widest_grouping_dimension() {
         .try_visit_pre_order(|plan| {
             if let LogicalOperator::Join(Join::Comparison(join)) = &plan.operator {
                 if attached_dimension.is_none() {
-                    if let LogicalOperator::Get(get) = &join.right.operator {
+                    if let LogicalOperator::Get(get) = &join.left.operator {
                         attached_dimension =
                             get.table.as_ref().map(|table| table.base.base.name.clone());
                     }
@@ -194,6 +194,45 @@ fn multiway_region_isolates_the_widest_grouping_dimension() {
         })
         .expect("inspect multiway rewrite");
     assert_eq!(attached_dimension.as_deref(), Some("customer"));
+    assert_join_conditions_follow_child_orientation(&rewritten);
+}
+
+fn assert_join_conditions_follow_child_orientation(plan: &LogicalPlan) {
+    plan.try_visit_pre_order(|plan| {
+        if let LogicalOperator::Join(Join::Comparison(join)) = &plan.operator {
+            let left = join
+                .left
+                .get_column_bindings()
+                .into_iter()
+                .collect::<std::collections::HashSet<_>>();
+            let right = join
+                .right
+                .get_column_bindings()
+                .into_iter()
+                .collect::<std::collections::HashSet<_>>();
+            for condition in &join.conditions {
+                assert_expression_bindings_belong_to(&condition.left, &left);
+                assert_expression_bindings_belong_to(&condition.right, &right);
+            }
+        }
+        Ok(())
+    })
+    .expect("inspect join condition orientation");
+}
+
+fn assert_expression_bindings_belong_to(
+    expression: &paro_planner::expression::Expression,
+    expected: &std::collections::HashSet<ColumnBinding>,
+) {
+    visit_expression(expression, &mut |expression| {
+        if let paro_planner::expression::Expression::ColumnRef(column) = expression {
+            assert!(
+                column.depth != 0 || expected.contains(&column.binding),
+                "binding {:?} is outside the expected child scope {expected:?}",
+                column.binding
+            );
+        }
+    });
 }
 
 fn collect_bindings(

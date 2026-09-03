@@ -230,7 +230,7 @@ fn refuses_sources_with_different_stable_table_identity() {
     let optimized = optimize_plan(q11_shape(table(91_002), table(91_003)), &context);
 
     assert!(matches!(
-        optimized.operator,
+        &optimized.operator,
         LogicalOperator::Projection(Projection { child, .. })
             if matches!(child.operator, LogicalOperator::Filter(_))
     ));
@@ -258,7 +258,7 @@ fn refuses_grouping_sets_even_when_the_sources_match() {
 
     let optimized = optimize_plan(plan, &BindContext::new());
     assert!(matches!(
-        optimized.operator,
+        &optimized.operator,
         LogicalOperator::Projection(Projection { child, .. })
             if matches!(child.operator, LogicalOperator::Filter(_))
     ));
@@ -350,7 +350,7 @@ fn same_display_signature_with_a_different_kernel_is_not_reused() {
 
     let optimized = optimize_plan(plan, &BindContext::new());
     assert!(matches!(
-        optimized.operator,
+        &optimized.operator,
         LogicalOperator::Projection(Projection { child, .. })
             if matches!(child.operator, LogicalOperator::Filter(_))
     ));

@@ -218,7 +218,7 @@ mod tests {
     fn unique_preserved_key_and_partial_merge_prove_singleton_groups() {
         let (plan, statistics) = candidate();
         let optimized = optimize_plan(plan, &statistics);
-        let LogicalOperator::Aggregate(aggregate) = optimized.operator else {
+        let LogicalOperator::Aggregate(aggregate) = &optimized.operator else {
             panic!("aggregate root")
         };
         assert!(matches!(
@@ -276,7 +276,7 @@ mod tests {
             ColumnStatistics::create_unknown(LogicalType::BigInt),
         );
         let optimized = optimize_plan(plan, &statistics);
-        let LogicalOperator::Aggregate(aggregate) = optimized.operator else {
+        let LogicalOperator::Aggregate(aggregate) = &optimized.operator else {
             panic!("aggregate root")
         };
         assert_eq!(
@@ -298,7 +298,7 @@ mod tests {
         )));
 
         let optimized = optimize_plan(plan, &statistics);
-        let LogicalOperator::Aggregate(aggregate) = optimized.operator else {
+        let LogicalOperator::Aggregate(aggregate) = &optimized.operator else {
             panic!("aggregate root")
         };
         assert!(matches!(
@@ -318,7 +318,7 @@ mod tests {
         partial.recompute_returned_types();
 
         let optimized = optimize_plan(plan, &statistics);
-        let LogicalOperator::Aggregate(aggregate) = optimized.operator else {
+        let LogicalOperator::Aggregate(aggregate) = &optimized.operator else {
             panic!("aggregate root")
         };
         assert_eq!(
@@ -333,7 +333,7 @@ mod tests {
         candidate_join_mut(&mut plan).conditions[0].comparison = JoinComparisonType::GreaterThan;
 
         let optimized = optimize_plan(plan, &statistics);
-        let LogicalOperator::Aggregate(aggregate) = optimized.operator else {
+        let LogicalOperator::Aggregate(aggregate) = &optimized.operator else {
             panic!("aggregate root")
         };
         assert_eq!(
@@ -482,7 +482,7 @@ mod tests {
         assert!(merge.function.singleton_merge().is_none());
 
         let optimized = optimize_plan(plan, &statistics);
-        let LogicalOperator::Aggregate(aggregate) = optimized.operator else {
+        let LogicalOperator::Aggregate(aggregate) = &optimized.operator else {
             panic!("aggregate root")
         };
         assert_eq!(
@@ -504,7 +504,7 @@ mod tests {
         ];
 
         let optimized = optimize_plan(plan, &statistics);
-        let LogicalOperator::Aggregate(aggregate) = optimized.operator else {
+        let LogicalOperator::Aggregate(aggregate) = &optimized.operator else {
             panic!("aggregate root")
         };
         assert_eq!(

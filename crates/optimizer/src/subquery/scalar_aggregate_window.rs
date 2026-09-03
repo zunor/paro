@@ -520,12 +520,8 @@ fn apply_rewrite(
     rewrite: Rewrite,
     bind_context: &BindContext,
 ) -> Result<LogicalPlan> {
-    let LogicalPlan {
-        id,
-        stats,
-        operator: LogicalOperator::Join(Join::Comparison(mut join)),
-    } = plan
-    else {
+    let (id, stats, operator) = plan.into_parts();
+    let LogicalOperator::Join(Join::Comparison(mut join)) = operator else {
         return Err(paro_error::internal(
             "scalar aggregate window witness no longer points to a comparison join",
         ));
@@ -611,7 +607,7 @@ fn apply_rewrite(
     Ok(LogicalPlan {
         id,
         stats,
-        operator: installed_detail.plan.operator,
+        operator: installed_detail.plan.into_operator(),
     })
 }
 

@@ -31,7 +31,8 @@ impl BuildProbeSideOptimizer {
 
     #[cfg(test)]
     fn optimize(&mut self, plan: LogicalOperator) -> LogicalOperator {
-        self.optimize_plan(LogicalPlan::synthetic(plan)).operator
+        self.optimize_plan(LogicalPlan::synthetic(plan))
+            .into_operator()
     }
 
     pub fn optimize_plan(&mut self, plan: LogicalPlan) -> LogicalPlan {
@@ -40,7 +41,8 @@ impl BuildProbeSideOptimizer {
 
     fn optimize_recursive_plan(&mut self, plan: LogicalPlan) -> LogicalPlan {
         let plan = plan.map_children(|child| self.optimize_recursive_plan(child));
-        let operator = match plan.operator {
+        let (id, stats, operator) = plan.into_parts();
+        let operator = match operator {
             LogicalOperator::Join(join) => match join {
                 Join::Comparison(mut comp) => {
                     self.try_flip_comparison_join(&mut comp);
@@ -55,8 +57,8 @@ impl BuildProbeSideOptimizer {
             other => other,
         };
         LogicalPlan {
-            id: plan.id,
-            stats: plan.stats,
+            id,
+            stats,
             operator,
         }
     }

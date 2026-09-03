@@ -107,9 +107,7 @@ fn widest_dimension_candidate(plan: &LogicalPlan) -> Option<(usize, usize)> {
     relations
         .into_iter()
         .filter_map(|relation| {
-            let LogicalOperator::Get(get) = &relation.operator else {
-                return None;
-            };
+            let table_index = dimension_relation_table_index(relation)?;
             let dimension_bindings = relation
                 .get_column_bindings()
                 .into_iter()
@@ -141,10 +139,22 @@ fn widest_dimension_candidate(plan: &LogicalPlan) -> Option<(usize, usize)> {
             {
                 return None;
             }
-            Some((payload_width, get.table_index))
+            Some((payload_width, table_index))
         })
         .max_by_key(|(width, table_index)| (*width, std::cmp::Reverse(*table_index)))
         .map(|(_, table_index)| (projections.len(), table_index))
+}
+
+/// A CTE reference is a stable relational leaf just like a base scan. Keeping
+/// the recognizer at this semantic boundary lets a separate sharing rule
+/// materialize a repeated dimension without disabling fact-side
+/// preaggregation.
+fn dimension_relation_table_index(relation: &LogicalPlan) -> Option<usize> {
+    match &relation.operator {
+        LogicalOperator::Get(get) => Some(get.table_index),
+        LogicalOperator::CTERef(reference) => Some(reference.table_index),
+        _ => None,
+    }
 }
 
 fn is_movable(expression: &Expression) -> bool {
@@ -243,10 +253,7 @@ fn isolate_join_region(
     flatten_inner_equi_region(plan, &mut relations, &mut conditions)?;
     let dimension_position = relations
         .iter()
-        .position(|relation| {
-            matches!(&relation.operator,
-                LogicalOperator::Get(get) if get.table_index == table_index)
-        })
+        .position(|relation| dimension_relation_table_index(relation) == Some(table_index))
         .ok_or_else(|| paro_error::internal("dimension relation disappeared from join region"))?;
     let dimension = relations.remove(dimension_position);
     let dimension_bindings = dimension
@@ -270,6 +277,14 @@ fn isolate_join_region(
         ));
     }
     let fact = rebuild_inner_equi_region(relations, fact_conditions, bind_context)?;
+    let fact_bindings = fact
+        .get_column_bindings()
+        .into_iter()
+        .collect::<HashSet<_>>();
+    let boundary = boundary
+        .into_iter()
+        .map(|condition| orient_condition(condition, &fact_bindings, &dimension_bindings))
+        .collect::<Result<Vec<_>>>()?;
     Ok(LogicalPlan {
         id: root_id,
         stats: root_stats,
@@ -287,11 +302,7 @@ fn flatten_inner_equi_region(
     relations: &mut Vec<LogicalPlan>,
     conditions: &mut Vec<JoinCondition>,
 ) -> Result<()> {
-    let LogicalPlan {
-        id,
-        stats,
-        operator,
-    } = plan;
+    let (id, stats, operator) = plan.into_parts();
     match operator {
         LogicalOperator::Join(Join::Comparison(join)) if is_plain_inner_equi_join(&join) => {
             flatten_inner_equi_region(*join.left, relations, conditions)?;
@@ -349,6 +360,10 @@ fn rebuild_inner_equi_region(
                 true
             }
         });
+        let join_conditions = join_conditions
+            .into_iter()
+            .map(|condition| orient_condition(condition, &current_bindings, &relation_bindings))
+            .collect::<Result<Vec<_>>>()?;
         current = LogicalPlan::new(
             bind_context,
             LogicalOperator::Join(Join::Comparison(ComparisonJoin::new(
@@ -365,6 +380,31 @@ fn rebuild_inner_equi_region(
         ));
     }
     Ok(current)
+}
+
+/// Put each comparison operand in the child scope where physical lowering
+/// evaluates it. A flattened inner-join predicate retains the orientation of
+/// its former tree, which is not necessarily the orientation of the rebuilt
+/// tree.
+fn orient_condition(
+    mut condition: JoinCondition,
+    left_bindings: &HashSet<ColumnBinding>,
+    right_bindings: &HashSet<ColumnBinding>,
+) -> Result<JoinCondition> {
+    match (
+        expression_domain(&condition.left, left_bindings, right_bindings),
+        expression_domain(&condition.right, left_bindings, right_bindings),
+    ) {
+        (ExpressionDomain::Fact, ExpressionDomain::Dimension) => Ok(condition),
+        (ExpressionDomain::Dimension, ExpressionDomain::Fact) => {
+            std::mem::swap(&mut condition.left, &mut condition.right);
+            condition.comparison = condition.comparison.flip();
+            Ok(condition)
+        }
+        _ => Err(paro_error::internal(
+            "join-region predicate does not connect the rebuilt children",
+        )),
+    }
 }
 
 fn expression_references_any(expression: &Expression, bindings: &HashSet<ColumnBinding>) -> bool {

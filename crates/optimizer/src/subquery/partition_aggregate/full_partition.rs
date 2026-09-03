@@ -232,22 +232,25 @@ pub(super) fn apply_full_partition_join(
     rewrite: FullPartitionJoinRewrite,
     bind_context: &BindContext,
 ) -> Result<LogicalPlan> {
-    let LogicalOperator::Filter(mut filter) = plan.operator else {
+    let LogicalOperator::Filter(mut filter) = plan.into_operator() else {
         return Err(paro_error::internal(
             "full-partition witness no longer points to a Filter",
         ));
     };
-    let LogicalOperator::Join(Join::Comparison(mut outer_join)) = filter.child.operator else {
+    let LogicalOperator::Join(Join::Comparison(mut outer_join)) = (*filter.child).into_operator()
+    else {
         return Err(paro_error::internal(
             "full-partition witness no longer points to a comparison join",
         ));
     };
-    let LogicalOperator::Projection(mut scalar_projection) = outer_join.right.operator else {
+    let LogicalOperator::Projection(mut scalar_projection) = (*outer_join.right).into_operator()
+    else {
         return Err(paro_error::internal(
             "full-partition witness lost the scalar projection",
         ));
     };
-    let LogicalOperator::Aggregate(mut aggregate) = scalar_projection.child.operator else {
+    let LogicalOperator::Aggregate(mut aggregate) = (*scalar_projection.child).into_operator()
+    else {
         return Err(paro_error::internal(
             "full-partition witness lost the grouped scalar aggregate",
         ));

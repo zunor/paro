@@ -1151,32 +1151,20 @@ fn apply_rewrite(
     candidate: Candidate,
     bind_context: &BindContext,
 ) -> Result<LogicalPlan> {
-    let LogicalPlan {
-        id: topn_id,
-        stats: topn_stats,
-        operator: LogicalOperator::TopN(mut topn),
-    } = plan
-    else {
+    let (topn_id, topn_stats, operator) = plan.into_parts();
+    let LogicalOperator::TopN(mut topn) = operator else {
         return Err(rewrite_invariant("aggregate candidate root is not TopN"));
     };
     let output_plan = *topn.child;
-    let LogicalPlan {
-        id: output_id,
-        operator: LogicalOperator::Projection(mut output),
-        ..
-    } = output_plan
-    else {
+    let (output_id, _, output_operator) = output_plan.into_parts();
+    let LogicalOperator::Projection(mut output) = output_operator else {
         return Err(rewrite_invariant(
             "aggregate candidate child is not Projection",
         ));
     };
     let aggregate_plan = *output.child;
-    let LogicalPlan {
-        id: aggregate_id,
-        stats: aggregate_stats,
-        operator: LogicalOperator::Aggregate(mut aggregate),
-    } = aggregate_plan
-    else {
+    let (aggregate_id, aggregate_stats, aggregate_operator) = aggregate_plan.into_parts();
+    let LogicalOperator::Aggregate(mut aggregate) = aggregate_operator else {
         return Err(rewrite_invariant(
             "aggregate candidate payload child is not Aggregate",
         ));
@@ -1361,23 +1349,15 @@ fn apply_row_preserving_rewrite(
     candidate: RowPreservingCandidate,
     bind_context: &BindContext,
 ) -> Result<LogicalPlan> {
-    let LogicalPlan {
-        id: topn_id,
-        stats: topn_stats,
-        operator: LogicalOperator::TopN(mut topn),
-    } = plan
-    else {
+    let (topn_id, topn_stats, operator) = plan.into_parts();
+    let LogicalOperator::TopN(mut topn) = operator else {
         return Err(rewrite_invariant(
             "row-preserving candidate root is not TopN",
         ));
     };
     let output_plan = *topn.child;
-    let LogicalPlan {
-        id: output_id,
-        operator: LogicalOperator::Projection(mut output),
-        ..
-    } = output_plan
-    else {
+    let (output_id, _, output_operator) = output_plan.into_parts();
+    let LogicalOperator::Projection(mut output) = output_operator else {
         return Err(rewrite_invariant(
             "row-preserving candidate child is not Projection",
         ));
@@ -1671,12 +1651,8 @@ fn apply_selective_projection_rewrite(
     candidate: SelectiveProjectionCandidate,
     bind_context: &BindContext,
 ) -> Result<LogicalPlan> {
-    let LogicalPlan {
-        id,
-        stats,
-        operator: LogicalOperator::Projection(mut output),
-    } = plan
-    else {
+    let (id, stats, operator) = plan.into_parts();
+    let LogicalOperator::Projection(mut output) = operator else {
         return Err(rewrite_invariant(
             "selective late-payload candidate root is not Projection",
         ));

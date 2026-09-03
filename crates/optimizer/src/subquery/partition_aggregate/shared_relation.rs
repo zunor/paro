@@ -134,12 +134,12 @@ pub(super) fn apply_shared_relation_rewrite(
     rewrite: SharedRelationRewrite,
     bind_context: &BindContext,
 ) -> Result<LogicalPlan> {
-    let LogicalOperator::Filter(mut filter) = plan.operator else {
+    let LogicalOperator::Filter(mut filter) = plan.into_operator() else {
         return Err(paro_error::internal(
             "shared-relation partition witness no longer points to a Filter",
         ));
     };
-    let LogicalOperator::Join(Join::Comparison(mut join)) = filter.child.operator else {
+    let LogicalOperator::Join(Join::Comparison(mut join)) = (*filter.child).into_operator() else {
         return Err(paro_error::internal(
             "shared-relation partition witness lost its scalar join",
         ));
