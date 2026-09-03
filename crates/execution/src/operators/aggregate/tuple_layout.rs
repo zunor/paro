@@ -1186,6 +1186,98 @@ fn varlen_bytes<'a>(
     }
 }
 
+/// Compare values from two vectors under grouped-aggregate key semantics.
+///
+/// This is the vector-to-vector form of [`TupleLayout::compare_groups`]. It is
+/// shared by immutable grouping-domain indexes so finalized lookup cannot
+/// drift from the hash aggregate's NULL, floating-point, or varlen equality
+/// contract.
+pub(crate) fn group_vector_values_equal(
+    left: &Vector,
+    left_row: usize,
+    right: &Vector,
+    right_row: usize,
+    logical_type: &LogicalType,
+) -> Result<bool> {
+    let left_null = left.is_null(left_row);
+    let right_null = right.is_null(right_row);
+    if left_null || right_null {
+        return Ok(left_null == right_null);
+    }
+
+    macro_rules! compare_scalar {
+        ($getter:ident, $name:literal) => {{
+            let left = left.$getter(left_row).ok_or_else(|| {
+                paro_error::internal(format!(
+                    "Expected non-null {} group key at row {left_row}",
+                    $name
+                ))
+            })?;
+            let right = right.$getter(right_row).ok_or_else(|| {
+                paro_error::internal(format!(
+                    "Expected non-null {} group key at row {right_row}",
+                    $name
+                ))
+            })?;
+            Ok(left == right)
+        }};
+    }
+
+    match logical_type {
+        LogicalType::Boolean => compare_scalar!(get_bool, "BOOLEAN"),
+        LogicalType::TinyInt => compare_scalar!(get_i8, "TINYINT"),
+        LogicalType::UTinyInt => compare_scalar!(get_u8, "UTINYINT"),
+        LogicalType::SmallInt => compare_scalar!(get_i16, "SMALLINT"),
+        LogicalType::USmallInt => compare_scalar!(get_u16, "USMALLINT"),
+        LogicalType::Integer | LogicalType::Date => compare_scalar!(get_i32, "INT32"),
+        LogicalType::UInteger => compare_scalar!(get_u32, "UINTEGER"),
+        LogicalType::BigInt
+        | LogicalType::Timestamp
+        | LogicalType::TimestampTz
+        | LogicalType::Time => compare_scalar!(get_i64, "INT64"),
+        LogicalType::UBigInt => compare_scalar!(get_u64, "UBIGINT"),
+        LogicalType::HugeInt => compare_scalar!(get_i128, "HUGEINT"),
+        LogicalType::UHugeInt | LogicalType::Uuid => {
+            compare_scalar!(get_u128, "UHUGEINT/UUID")
+        }
+        LogicalType::Float => {
+            let left = left.get_f32(left_row).ok_or_else(|| {
+                paro_error::internal(format!("Expected non-null FLOAT at row {left_row}"))
+            })?;
+            let right = right.get_f32(right_row).ok_or_else(|| {
+                paro_error::internal(format!("Expected non-null FLOAT at row {right_row}"))
+            })?;
+            Ok(left.to_bits() == right.to_bits())
+        }
+        LogicalType::Double => {
+            let left = left.get_f64(left_row).ok_or_else(|| {
+                paro_error::internal(format!("Expected non-null DOUBLE at row {left_row}"))
+            })?;
+            let right = right.get_f64(right_row).ok_or_else(|| {
+                paro_error::internal(format!("Expected non-null DOUBLE at row {right_row}"))
+            })?;
+            Ok(left.to_bits() == right.to_bits())
+        }
+        LogicalType::Interval => compare_scalar!(get_interval, "INTERVAL"),
+        LogicalType::Decimal { precision, .. } if *precision <= 18 => {
+            compare_scalar!(get_i64, "DECIMAL64")
+        }
+        LogicalType::Decimal { .. } => compare_scalar!(get_i128, "DECIMAL128"),
+        LogicalType::Blob => Ok(varlen_bytes(left, left_row, logical_type)?
+            == varlen_bytes(right, right_row, logical_type)?),
+        LogicalType::Varchar
+        | LogicalType::VarcharCollation(_)
+        | LogicalType::TsVector
+        | LogicalType::TsQuery
+        | LogicalType::Json
+        | LogicalType::Jsonb => Ok(varlen_bytes(left, left_row, logical_type)?
+            == varlen_bytes(right, right_row, logical_type)?),
+        _ => Err(paro_error::internal(format!(
+            "Unsupported vector group key comparison type: {logical_type:?}"
+        ))),
+    }
+}
+
 fn deserialize_varlen_value(logical_type: &LogicalType, bytes: &[u8]) -> Result<Value> {
     match logical_type {
         LogicalType::Blob => Ok(Value::Blob(bytes.to_vec())),

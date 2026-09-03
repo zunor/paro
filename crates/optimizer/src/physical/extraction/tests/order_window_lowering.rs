@@ -180,6 +180,69 @@ fn whole_partition_aggregate_window_lowers_to_sort_free_breaker() {
 }
 
 #[test]
+fn composite_varlen_partition_keys_lower_to_sort_free_breaker() {
+    let ctx = BindContext::new();
+    let values = LogicalPlan::new(
+        &ctx,
+        LogicalOperator::ExpressionGet(ExpressionGet::new(
+            0,
+            vec![],
+            vec!["category".into(), "class".into(), "value".into()],
+            vec![
+                LogicalType::Varchar,
+                LogicalType::Integer,
+                LogicalType::Integer,
+            ],
+        )),
+    );
+    let (sum, _) = get_sum_function()
+        .bind(&[LogicalType::Integer])
+        .expect("bind integer sum");
+    let return_type = sum.return_type.clone();
+    let aggregate = AggregateExpression::new(
+        sum,
+        vec![Expression::Reference(ReferenceExpression::new(
+            2,
+            LogicalType::Integer,
+        ))],
+        return_type,
+    );
+    let window = LogicalPlan::new(
+        &ctx,
+        LogicalOperator::Window(LogicalWindow::new(
+            3,
+            vec![WindowExpression::aggregate(
+                aggregate,
+                vec![
+                    Expression::Reference(ReferenceExpression::new(0, LogicalType::Varchar)),
+                    Expression::Reference(ReferenceExpression::new(1, LogicalType::Integer)),
+                ],
+                Vec::new(),
+                WindowFrame::default(),
+            )],
+            values,
+        )),
+    );
+
+    let plan = PhysicalPlanExtractor::new(ExtractionContext::default())
+        .extract(&window)
+        .expect("lower composite varlen partition window");
+    let PhysicalNodeKind::PartitionAggregateWindow(spec) = &plan.node(plan.root).kind else {
+        panic!("expected sort-free partition aggregate window");
+    };
+    assert_eq!(spec.aggregate.grouping_key_count, 2);
+    assert_eq!(
+        spec.aggregate
+            .groups
+            .iter()
+            .map(Expression::return_type)
+            .collect::<Vec<_>>(),
+        vec![LogicalType::Varchar, LogicalType::Integer]
+    );
+    spec.verify().expect("composite partition aggregate spec");
+}
+
+#[test]
 fn bigint_partition_key_lowers_to_typed_sort_free_breaker() {
     let ctx = BindContext::new();
     let values = LogicalPlan::new(

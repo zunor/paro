@@ -45,15 +45,15 @@ pub enum PartitionAggregateDomain {
 }
 
 impl PartitionAggregateWindowSpec {
-    /// Verify the deliberately narrow first execution contract.
+    /// Verify the execution contract.
     ///
     /// Unsupported aggregate modifiers are rejected at the physical boundary
     /// rather than silently taking a path that cannot preserve their state.
     /// The representation remains generic over aggregate functions. Its first
-    /// lookup backend deliberately admits one INTEGER key; other SQL key
-    /// domains need the aggregate tuple codec/equality contract before they can
-    /// extend this protocol safely. Future key, DISTINCT, and ordered backends
-    /// do not need to change detail/index publication.
+    /// lookup backend uses the same vector hashing and grouping equality as
+    /// hash aggregation, so scalar and composite partition domains share one
+    /// contract. Future DISTINCT and ordered backends do not need to change
+    /// detail/index publication.
     pub fn verify(&self) -> Result<()> {
         let aggregate = &self.aggregate;
         if aggregate.groups.len() != aggregate.grouping_key_count || aggregate.aggregates.is_empty()
@@ -70,15 +70,9 @@ impl PartitionAggregateWindowSpec {
                     "global aggregate window cannot carry partition keys",
                 ));
             }
-            PartitionAggregateDomain::Keyed
-                if aggregate.groups.len() != 1
-                    || !matches!(
-                        aggregate.groups[0].return_type(),
-                        LogicalType::Integer | LogicalType::BigInt
-                    ) =>
-            {
-                return Err(paro_error::not_implemented(
-                    "partition aggregate window's keyed lookup backend requires one INTEGER or BIGINT partition key",
+            PartitionAggregateDomain::Keyed if aggregate.groups.is_empty() => {
+                return Err(paro_error::internal(
+                    "keyed partition aggregate window requires partition keys",
                 ));
             }
             _ => {}

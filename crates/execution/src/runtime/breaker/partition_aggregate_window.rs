@@ -12,6 +12,7 @@ use paro_common::chunk::Chunk;
 use paro_common::error::{self as paro_error, ErrorClass, Result};
 use paro_common::memory::{MemoryAccountingContext, MemoryError, MemoryResult};
 use paro_common::vector::{SelectionVector, ValidatedVectorSelection, Vector, VECTOR_SIZE};
+use paro_planner::expression::Expression;
 use paro_storage::row::{RowSpillWriter, RowStoreSpillWriter};
 
 use crate::memory_runtime::{ReclaimStats, Reclaimer, SpillCost};
@@ -308,9 +309,14 @@ impl PartitionAggregateWindowHandle {
                 result_chunks.push(output);
             }
             let index = FinalizedPartitionIndex::try_new(
-                spec.aggregate.groups[0].return_type(),
+                spec.aggregate
+                    .groups
+                    .iter()
+                    .map(Expression::return_type)
+                    .collect(),
                 spec.aggregate_column_count(),
                 result_chunks,
+                allocator.clone(),
                 index_memory.clone(),
             )?;
             Ok(PartitionAggregateSnapshot::InMemory {
@@ -669,9 +675,14 @@ fn finalize_partition_index(
         chunks.push(output);
     }
     FinalizedPartitionIndex::try_new(
-        spec.aggregate.groups[0].return_type(),
+        spec.aggregate
+            .groups
+            .iter()
+            .map(Expression::return_type)
+            .collect(),
         spec.aggregate_column_count(),
         chunks,
+        allocator,
         memory,
     )
 }
@@ -687,10 +698,7 @@ fn append_external_output(
     let keys = build_groups_chunk(payload, group_refs)?;
     let mut selection =
         SelectionVector::try_with_capacity(payload.size().max(1), allocator.clone())?;
-    selection.set_len(payload.size());
-    for row in 0..payload.size() {
-        selection.try_set(row, index.lookup(&keys, row)?.0 as usize)?;
-    }
+    index.select_rows(&keys, &mut selection)?;
     let child_count = index
         .aggregate_columns()
         .first()

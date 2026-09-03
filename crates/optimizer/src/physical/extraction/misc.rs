@@ -235,19 +235,6 @@ fn lower_partition_aggregate_window_spec(
     let Some(first) = window.expressions.first() else {
         return Ok(None);
     };
-    // Other key domains retain the preserving sorted window path until the
-    // immutable lookup index consumes the aggregate tuple codec directly.
-    // Boxed Value equality is not a correctness substitute for SQL grouping
-    // semantics (collations and floating keys in particular).
-    if !first.partitions.is_empty()
-        && (first.partitions.len() != 1
-            || !matches!(
-                first.partitions[0].return_type(),
-                LogicalType::Integer | LogicalType::BigInt
-            ))
-    {
-        return Ok(None);
-    }
     for expression in &window.expressions {
         expression.verify_bound_contract()?;
         let Some(aggregate) = expression.aggregate_invocation() else {
