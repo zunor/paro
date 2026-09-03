@@ -19,6 +19,7 @@ use paro_storage::table::segment_reorderer::{reorder_segments, SegmentOrderOptio
 use paro_storage::tablet::{ColumnProjection, ColumnValueProjection, TabletReaderParams};
 use paro_storage::transaction::overlay_reader::TxnOverlayReader;
 
+use super::state::ROWSET_PARALLEL_WORK_BYTES;
 use crate::physical::specs::{
     RowsetColumnProjection, RowsetColumnValueProjection, RowsetScanAccessPolicy, RowsetScanSpec,
 };
@@ -35,7 +36,7 @@ use crate::runtime::state::{
 /// decode width and predicate work, so a wide scan is not forced through the
 /// same fixed row packet as a narrow key scan.
 const MIN_SCAN_PACKET_WORK_BYTES: u64 = 512 * 1024;
-const TARGET_SCAN_PACKET_WORK_BYTES: u64 = 4 * 1024 * 1024;
+const TARGET_SCAN_PACKET_WORK_BYTES: u64 = ROWSET_PARALLEL_WORK_BYTES;
 const SCAN_PACKETS_PER_TASK: u64 = 2;
 
 #[derive(Debug, Clone)]
@@ -187,6 +188,7 @@ impl RowsetSourceExec {
             storage_snapshot,
             segments: segments.into_boxed_slice(),
             morsels,
+            row_work_bytes: scan_row_work_bytes,
             next_morsel: Default::default(),
             column_projection,
             overlay_delete_vectors,

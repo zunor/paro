@@ -18,6 +18,11 @@ use crate::physical::specs::RowsetScanMaterialization;
 
 use super::table_function::TableFunctionBindDataWrapper;
 
+/// Enough decoded/predicate work to amortize one scan task and its reader.
+/// Morsels may remain smaller for stealing; this threshold only bounds useful
+/// concurrent consumers of their shared queue.
+pub(crate) const ROWSET_PARALLEL_WORK_BYTES: u64 = 4 * 1024 * 1024;
+
 #[derive(Debug)]
 pub struct RowsetSourceGlobal {
     pub table_index: usize,
@@ -25,10 +30,31 @@ pub struct RowsetSourceGlobal {
     pub storage_snapshot: Arc<StorageSnapshot>,
     pub segments: Box<[(RowsetSharedPtr, SegmentSharedPtr)]>,
     pub morsels: Box<[RowsetScanMorsel]>,
+    pub row_work_bytes: u64,
     pub next_morsel: AtomicUsize,
     pub column_projection: ColumnProjection,
     pub overlay_delete_vectors: Option<Arc<OverlayDeleteVectorMap>>,
     pub prepared_predicate: Option<PreparedRowsetPredicate>,
+}
+
+impl RowsetSourceGlobal {
+    /// Return the number of workers that can consume at least one physical
+    /// vector of scan input. Morsels remain the stealing and reader-reopen
+    /// boundary, but tiny multi-segment tables must not manufacture useful
+    /// parallelism merely because they have several storage fragments.
+    pub(crate) fn parallel_work_count(&self) -> usize {
+        useful_rowset_scan_workers(&self.morsels, self.row_work_bytes)
+    }
+}
+
+fn useful_rowset_scan_workers(morsels: &[RowsetScanMorsel], row_work_bytes: u64) -> usize {
+    let physical_rows = morsels.iter().fold(0u64, |rows, morsel| {
+        rows.saturating_add(morsel.end_ordinal.saturating_sub(morsel.start_ordinal))
+    });
+    let physical_work = physical_rows.saturating_mul(row_work_bytes.max(1));
+    let useful_workers =
+        usize::try_from(physical_work.div_ceil(ROWSET_PARALLEL_WORK_BYTES)).unwrap_or(usize::MAX);
+    morsels.len().min(useful_workers)
 }
 
 /// Execution-bound predicate and its matching initial access mode.
@@ -91,6 +117,43 @@ pub struct TableFunctionSourceGlobal {
     pub bind_data: Arc<TableFunctionBindDataWrapper>,
     pub global_state: Option<Box<dyn GlobalTableFunctionState>>,
     pub max_threads: usize,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn rowset_scan_parallelism_is_bounded_by_physical_work() {
+        let tiny_fragments = [
+            RowsetScanMorsel {
+                segment_idx: 0,
+                start_ordinal: 0,
+                end_ordinal: 7,
+            },
+            RowsetScanMorsel {
+                segment_idx: 1,
+                start_ordinal: 0,
+                end_ordinal: 8,
+            },
+        ];
+        assert_eq!(useful_rowset_scan_workers(&tiny_fragments, 8), 1);
+
+        let useful_fragments = [
+            RowsetScanMorsel {
+                segment_idx: 0,
+                start_ordinal: 0,
+                end_ordinal: ROWSET_PARALLEL_WORK_BYTES,
+            },
+            RowsetScanMorsel {
+                segment_idx: 1,
+                start_ordinal: 0,
+                end_ordinal: ROWSET_PARALLEL_WORK_BYTES,
+            },
+        ];
+        assert_eq!(useful_rowset_scan_workers(&useful_fragments, 1), 2);
+        assert_eq!(useful_rowset_scan_workers(&[], 8), 0);
+    }
 }
 
 impl fmt::Debug for TableFunctionSourceGlobal {

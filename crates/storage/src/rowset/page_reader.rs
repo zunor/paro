@@ -25,7 +25,37 @@ const SLOW_PAGE_FALLBACK_THRESHOLD: Duration = Duration::from_millis(12);
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum DecodedPageAccess {
     Sequential,
-    SparseGather,
+    SparseGather {
+        selected_rows: usize,
+        span_rows: usize,
+    },
+}
+
+// BitShuffle decodes sparse values in eight-row groups. First-access decoded
+// admission is reserved for analytical gathers whose estimated sparse work is
+// within a bounded factor of one full-page decode. Smaller point lookups retain
+// the probation path, so a single lookup cannot populate the decoded cache.
+const BITSHUFFLE_DECODE_GROUP_ROWS: usize = 8;
+// Full-page materialization is one contiguous SIMD pass, whereas sparse
+// gather repeatedly decodes groups and copies individual values. Bound that
+// representation advantage explicitly so analytical gathers can be admitted
+// without turning one- or two-row lookups on large pages into cache entries.
+const ANALYTICAL_GATHER_MAX_MATERIALIZATION_AMPLIFICATION: usize = 40;
+
+fn analytical_gather_should_materialize(
+    selected_rows: usize,
+    span_rows: usize,
+    decoded_rows: usize,
+) -> bool {
+    let estimated_sparse_decode_rows = estimated_sparse_decode_rows(selected_rows, span_rows);
+    decoded_rows
+        <= estimated_sparse_decode_rows
+            .saturating_mul(ANALYTICAL_GATHER_MAX_MATERIALIZATION_AMPLIFICATION)
+}
+
+fn estimated_sparse_decode_rows(selected_rows: usize, span_rows: usize) -> usize {
+    let sparse_groups = selected_rows.min(span_rows.div_ceil(BITSHUFFLE_DECODE_GROUP_ROWS));
+    sparse_groups.saturating_mul(BITSHUFFLE_DECODE_GROUP_ROWS)
 }
 
 /// Page reader context used for PageKey construction and version isolation.
@@ -231,20 +261,25 @@ impl PageReader {
             .transpose()
     }
 
-    /// Sequential consumers necessarily materialize a logical page. Sparse
-    /// gathers do so only after the page has survived one probationary access,
-    /// avoiding cache pollution from one-off point lookups while recognizing
-    /// repeated analytical reuse.
+    /// Sequential consumers necessarily materialize a logical page. A sparse
+    /// gather is admitted immediately only when its page-local access shape is
+    /// analytical and the full decode has bounded work amplification. Smaller
+    /// point lookups must demonstrate reuse through the page-local probation
+    /// counter before they can populate the decoded cache.
     pub(crate) fn should_materialize_decoded(
         &self,
         pointer: PagePointer,
         access: DecodedPageAccess,
+        decoded_rows: usize,
     ) -> bool {
         match access {
             DecodedPageAccess::Sequential => true,
-            DecodedPageAccess::SparseGather => {
-                self.options.cache_decoded
-                    && self.cache.as_ref().is_some_and(|cache| {
+            DecodedPageAccess::SparseGather {
+                selected_rows,
+                span_rows,
+            } => {
+                analytical_gather_should_materialize(selected_rows, span_rows, decoded_rows)
+                    || self.cache.as_ref().is_some_and(|cache| {
                         cache.should_promote_sparse_decoded(&self.make_key(pointer))
                     })
             }
@@ -437,6 +472,16 @@ mod tests {
             format_version: 1,
             null_encoding: NullEncoding::BitShuffle,
         })
+    }
+
+    #[test]
+    fn analytical_gather_admission_has_bounded_decode_amplification() {
+        assert!(!analytical_gather_should_materialize(2, 8_000, 65_536));
+        assert!(!analytical_gather_should_materialize(64, 64, 65_536));
+        assert!(!analytical_gather_should_materialize(12, 4_096, 4_096));
+        assert!(analytical_gather_should_materialize(13, 4_096, 4_096));
+        assert!(analytical_gather_should_materialize(64, 8_000, 8_192));
+        assert!(analytical_gather_should_materialize(512, 65_536, 65_536));
     }
 
     #[test]

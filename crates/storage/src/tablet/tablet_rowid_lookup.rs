@@ -232,7 +232,7 @@ fn get_by_rowids_with_contract(
         allocator.clone(),
         rowids,
         column_ids,
-        &column_types,
+        column_types,
         allow_retained_fallback,
         segment_gather,
         lookup_scratch,
@@ -243,7 +243,7 @@ fn get_by_rowids_with_contract(
     rowid_resolver::read_chunk_by_rowids_recursive(
         tablet,
         column_ids,
-        &column_types,
+        column_types,
         rowids,
         allocator,
         depth,
@@ -429,9 +429,9 @@ fn try_get_single_segment_by_rowids(
         cached
             .as_mut()
             .expect("segment gather initialized above")
-            .read(&row_offsets)?
+            .read(row_offsets)?
     } else {
-        segment.read_by_rowids(column_ids, SegmentRowId::as_raw_slice(&row_offsets))?
+        segment.read_by_rowids(column_ids, SegmentRowId::as_raw_slice(row_offsets))?
     };
     let selection = if caller_is_physical_order {
         None

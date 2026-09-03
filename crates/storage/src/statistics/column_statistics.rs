@@ -45,6 +45,14 @@ pub struct ColumnStatistics {
     stats: BaseStatistics,
     /// Optional distinct statistics (HyperLogLog-based)
     distinct_stats: Option<Arc<DistinctStatistics>>,
+    /// A proof-backed upper bound on the number of values this column can
+    /// contain in the current relational expression.
+    ///
+    /// This is deliberately separate from the observed HLL and min/max. A
+    /// storage snapshot cannot prove a bound for a cached plan after later
+    /// writes, while a schema constraint or a query predicate can. Storage
+    /// serialization therefore never persists this plan-local fact.
+    guaranteed_distinct_upper: Option<u64>,
 }
 
 impl ColumnStatistics {
@@ -62,6 +70,7 @@ impl ColumnStatistics {
         Self {
             stats,
             distinct_stats,
+            guaranteed_distinct_upper: None,
         }
     }
 
@@ -73,7 +82,21 @@ impl ColumnStatistics {
         Self {
             stats,
             distinct_stats: distinct_stats.map(Arc::new),
+            guaranteed_distinct_upper: None,
         }
+    }
+
+    /// Attach a semantic or schema-derived distinct-count upper bound.
+    ///
+    /// Callers must not use observed table contents to create this proof.
+    pub fn with_guaranteed_distinct_upper(mut self, upper: u64) -> Self {
+        self.guaranteed_distinct_upper = Some(upper);
+        self
+    }
+
+    /// Return the proof-backed distinct-count upper bound, when one exists.
+    pub fn guaranteed_distinct_upper(&self) -> Option<u64> {
+        self.guaranteed_distinct_upper
     }
 
     /// Create empty statistics for a given type.
@@ -97,6 +120,11 @@ impl ColumnStatistics {
     /// Both base statistics and distinct statistics are merged.
     pub fn merge(&mut self, other: &ColumnStatistics) {
         self.stats.merge(&other.stats);
+
+        self.guaranteed_distinct_upper = self
+            .guaranteed_distinct_upper
+            .zip(other.guaranteed_distinct_upper)
+            .map(|(left, right)| left.saturating_add(right));
 
         if let (Some(self_distinct), Some(other_distinct)) =
             (&mut self.distinct_stats, &other.distinct_stats)
@@ -159,6 +187,7 @@ impl ColumnStatistics {
         Self {
             stats: self.stats.copy(),
             distinct_stats: self.distinct_stats.clone(),
+            guaranteed_distinct_upper: self.guaranteed_distinct_upper,
         }
     }
 
@@ -222,6 +251,7 @@ impl ColumnStatistics {
         Ok(Self {
             stats,
             distinct_stats,
+            guaranteed_distinct_upper: None,
         })
     }
 

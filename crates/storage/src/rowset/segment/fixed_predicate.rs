@@ -516,6 +516,26 @@ fn inclusive_bounds<T: DiscreteOrdered>(
     }
 }
 
+/// Return one bit per non-null lane. Predicate raw batches encode NULL as a
+/// non-zero byte; the small fixed lane count lets both range kernels apply
+/// validity after their vector comparisons without falling back to the scalar
+/// evaluator for nullable SQL columns.
+#[inline(always)]
+fn non_null_lane_mask(nulls: Option<&[u8]>, row: usize, lanes: usize) -> u32 {
+    let Some(nulls) = nulls else {
+        return u32::MAX;
+    };
+    debug_assert!(
+        nulls.len() >= row.saturating_add(lanes),
+        "predicate NULL mask must cover every SIMD lane"
+    );
+    let mut mask = 0u32;
+    for lane in 0..lanes {
+        mask |= u32::from(nulls[row + lane] == 0) << lane;
+    }
+    mask
+}
+
 fn try_filter_seed_i64_batch(
     batch: &PredicateColumnBatch,
     kernel: &FixedConjunction<i64>,
@@ -548,7 +568,7 @@ fn try_filter_seed_i64_batch(
                 |value| dense_byte_membership_contains_i64(value, base, present),
             );
         }
-        FixedKernelShape::Bounds { lower, upper } if batch.nulls.is_none() => {
+        FixedKernelShape::Bounds { lower, upper } => {
             let Some(bounds) = inclusive_bounds(lower, upper).closed_range() else {
                 selection.clear();
                 return true;
@@ -561,7 +581,14 @@ fn try_filter_seed_i64_batch(
     #[cfg(all(target_arch = "aarch64", target_endian = "little"))]
     {
         unsafe {
-            filter_i64_range_inclusive_neon(batch.data.as_ptr(), lower, upper, rows, selection)
+            filter_i64_range_inclusive_neon(
+                batch.data.as_ptr(),
+                lower,
+                upper,
+                rows,
+                selection,
+                batch.nulls.as_deref(),
+            )
         }
     }
 
@@ -569,7 +596,14 @@ fn try_filter_seed_i64_batch(
     {
         if std::arch::is_x86_feature_detected!("avx2") {
             return unsafe {
-                filter_i64_range_inclusive_avx2(batch.data.as_ptr(), lower, upper, rows, selection)
+                filter_i64_range_inclusive_avx2(
+                    batch.data.as_ptr(),
+                    lower,
+                    upper,
+                    rows,
+                    selection,
+                    batch.nulls.as_deref(),
+                )
             };
         }
         false
@@ -624,11 +658,12 @@ unsafe fn compact_ordinals_neon(
     ordinals: core::arch::aarch64::uint32x4_t,
     output: *mut BatchRowOrdinal,
     written: usize,
+    valid_mask: u32,
 ) -> usize {
     use core::arch::aarch64::{vaddvq_u32, vandq_u32, vld1q_u32};
 
     let weights = unsafe { vld1q_u32([1u32, 2, 4, 8].as_ptr()) };
-    let mask = unsafe { vaddvq_u32(vandq_u32(matched, weights)) } as usize;
+    let mask = unsafe { vaddvq_u32(vandq_u32(matched, weights)) } as usize & valid_mask as usize;
     unsafe { compact_ordinals_mask_neon(mask, ordinals, output, written) }
 }
 
@@ -645,6 +680,9 @@ unsafe fn compact_ordinals_mask_neon(
     };
 
     let mask = mask & 0x0f;
+    if mask == 0 {
+        return 0;
+    }
     let shuffle = unsafe { vld1q_u8(NEON_COMPACTION_TABLE[mask].as_ptr()) };
     let packed =
         unsafe { vreinterpretq_u32_u8(vqtbl1q_u8(vreinterpretq_u8_u32(ordinals), shuffle)) };
@@ -690,6 +728,9 @@ unsafe fn compact_ordinals_avx2(
     };
 
     let mask = (matched_mask & 0xff) as usize;
+    if mask == 0 {
+        return 0;
+    }
     let permutation =
         unsafe { _mm256_loadu_si256(AVX2_COMPACTION_TABLE[mask].as_ptr().cast::<__m256i>()) };
     let packed = unsafe { _mm256_permutevar8x32_epi32(ordinals, permutation) };
@@ -704,10 +745,11 @@ unsafe fn filter_i64_range_inclusive_neon(
     upper: i64,
     rows: usize,
     selection: &mut Vec<BatchRowOrdinal>,
+    nulls: Option<&[u8]>,
 ) -> bool {
     use core::arch::aarch64::{
-        vaddq_u32, vandq_u64, vcgeq_s64, vcleq_s64, vcombine_u32, vdup_n_u32, vdupq_n_s64,
-        vdupq_n_u32, vld1q_u32, vld1q_u8, vmovn_u64, vreinterpretq_s64_u8,
+        vaddq_u32, vandq_u64, vcgeq_s64, vcleq_s64, vcombine_u32, vdupq_n_s64, vdupq_n_u32,
+        vld1q_u32, vld1q_u8, vmaxvq_u32, vmovn_u64, vorrq_u64, vreinterpretq_s64_u8,
     };
 
     selection.reserve(rows + 4);
@@ -719,28 +761,115 @@ unsafe fn filter_i64_range_inclusive_neon(
     let lower_vector = unsafe { vdupq_n_s64(lower) };
     let upper_vector = unsafe { vdupq_n_s64(upper) };
     let mut ordinals = unsafe { vld1q_u32([0u32, 1, 2, 3].as_ptr()) };
-    let ordinal_step = unsafe { vdupq_n_u32(2) };
+    let ordinal_step = unsafe { vdupq_n_u32(4) };
+    let ordinal_block_step = unsafe { vdupq_n_u32(8) };
     let mut row = 0usize;
     let mut written = 0usize;
-    while row + 2 <= rows {
-        let bytes = unsafe { vld1q_u8(input.add(row * std::mem::size_of::<i64>())) };
-        let values = unsafe { vreinterpretq_s64_u8(bytes) };
-        let above_lower = unsafe { vcgeq_s64(values, lower_vector) };
-        let below_upper = unsafe { vcleq_s64(values, upper_vector) };
-        let matched = unsafe { vandq_u64(above_lower, below_upper) };
-        let matched = unsafe { vcombine_u32(vmovn_u64(matched), vdup_n_u32(0)) };
-        written += unsafe { compact_ordinals_neon(matched, ordinals, output, written) };
-        ordinals = unsafe { vaddq_u32(ordinals, ordinal_step) };
-        row += 2;
+    while row + 8 <= rows {
+        let bytes0 = unsafe { vld1q_u8(input.add(row * std::mem::size_of::<i64>())) };
+        let bytes1 = unsafe { vld1q_u8(input.add((row + 2) * std::mem::size_of::<i64>())) };
+        let bytes2 = unsafe { vld1q_u8(input.add((row + 4) * std::mem::size_of::<i64>())) };
+        let bytes3 = unsafe { vld1q_u8(input.add((row + 6) * std::mem::size_of::<i64>())) };
+        let values0 = unsafe { vreinterpretq_s64_u8(bytes0) };
+        let values1 = unsafe { vreinterpretq_s64_u8(bytes1) };
+        let values2 = unsafe { vreinterpretq_s64_u8(bytes2) };
+        let values3 = unsafe { vreinterpretq_s64_u8(bytes3) };
+        let matched0 = unsafe {
+            vandq_u64(
+                vcgeq_s64(values0, lower_vector),
+                vcleq_s64(values0, upper_vector),
+            )
+        };
+        let matched1 = unsafe {
+            vandq_u64(
+                vcgeq_s64(values1, lower_vector),
+                vcleq_s64(values1, upper_vector),
+            )
+        };
+        let matched2 = unsafe {
+            vandq_u64(
+                vcgeq_s64(values2, lower_vector),
+                vcleq_s64(values2, upper_vector),
+            )
+        };
+        let matched3 = unsafe {
+            vandq_u64(
+                vcgeq_s64(values3, lower_vector),
+                vcleq_s64(values3, upper_vector),
+            )
+        };
+        let any_matched = unsafe {
+            vcombine_u32(
+                vmovn_u64(vorrq_u64(matched0, matched1)),
+                vmovn_u64(vorrq_u64(matched2, matched3)),
+            )
+        };
+        if unsafe { vmaxvq_u32(any_matched) } != 0 {
+            let low_matched = unsafe { vcombine_u32(vmovn_u64(matched0), vmovn_u64(matched1)) };
+            written += unsafe {
+                compact_ordinals_neon(
+                    low_matched,
+                    ordinals,
+                    output,
+                    written,
+                    non_null_lane_mask(nulls, row, 4),
+                )
+            };
+            ordinals = unsafe { vaddq_u32(ordinals, ordinal_step) };
+            let high_matched = unsafe { vcombine_u32(vmovn_u64(matched2), vmovn_u64(matched3)) };
+            written += unsafe {
+                compact_ordinals_neon(
+                    high_matched,
+                    ordinals,
+                    output,
+                    written,
+                    non_null_lane_mask(nulls, row + 4, 4),
+                )
+            };
+            ordinals = unsafe { vaddq_u32(ordinals, ordinal_step) };
+        } else {
+            ordinals = unsafe { vaddq_u32(ordinals, ordinal_block_step) };
+        }
+        row += 8;
     }
-    if row < rows {
+    while row + 4 <= rows {
+        let low_bytes = unsafe { vld1q_u8(input.add(row * std::mem::size_of::<i64>())) };
+        let high_bytes = unsafe { vld1q_u8(input.add((row + 2) * std::mem::size_of::<i64>())) };
+        let low_values = unsafe { vreinterpretq_s64_u8(low_bytes) };
+        let high_values = unsafe { vreinterpretq_s64_u8(high_bytes) };
+        let low_matched = unsafe {
+            vandq_u64(
+                vcgeq_s64(low_values, lower_vector),
+                vcleq_s64(low_values, upper_vector),
+            )
+        };
+        let high_matched = unsafe {
+            vandq_u64(
+                vcgeq_s64(high_values, lower_vector),
+                vcleq_s64(high_values, upper_vector),
+            )
+        };
+        let matched = unsafe { vcombine_u32(vmovn_u64(low_matched), vmovn_u64(high_matched)) };
+        written += unsafe {
+            compact_ordinals_neon(
+                matched,
+                ordinals,
+                output,
+                written,
+                non_null_lane_mask(nulls, row, 4),
+            )
+        };
+        ordinals = unsafe { vaddq_u32(ordinals, ordinal_step) };
+        row += 4;
+    }
+    while row < rows {
         let value = i64::from_le(unsafe {
             input
                 .add(row * std::mem::size_of::<i64>())
                 .cast::<i64>()
                 .read_unaligned()
         });
-        if value >= lower && value <= upper {
+        if non_null_lane_mask(nulls, row, 1) != 0 && value >= lower && value <= upper {
             unsafe {
                 output
                     .add(written)
@@ -748,6 +877,7 @@ unsafe fn filter_i64_range_inclusive_neon(
             };
             written += 1;
         }
+        row += 1;
     }
     unsafe { selection.set_len(start + written) };
     true
@@ -761,6 +891,7 @@ unsafe fn filter_i64_range_inclusive_avx2(
     upper: i64,
     rows: usize,
     selection: &mut Vec<BatchRowOrdinal>,
+    nulls: Option<&[u8]>,
 ) -> bool {
     use core::arch::x86_64::{
         __m256i, _mm256_add_epi32, _mm256_castsi256_pd, _mm256_cmpgt_epi64, _mm256_loadu_si256,
@@ -793,7 +924,14 @@ unsafe fn filter_i64_range_inclusive_avx2(
             below_lower,
             above_upper,
         ))) as u32;
-        written += unsafe { compact_ordinals_avx2(!rejected & 0x0f, ordinals, output, written) };
+        written += unsafe {
+            compact_ordinals_avx2(
+                !rejected & 0x0f & non_null_lane_mask(nulls, row, 4),
+                ordinals,
+                output,
+                written,
+            )
+        };
         ordinals = _mm256_add_epi32(ordinals, ordinal_step);
         row += 4;
     }
@@ -804,7 +942,7 @@ unsafe fn filter_i64_range_inclusive_avx2(
                 .cast::<i64>()
                 .read_unaligned()
         });
-        if value >= lower && value <= upper {
+        if non_null_lane_mask(nulls, row, 1) != 0 && value >= lower && value <= upper {
             unsafe {
                 output
                     .add(written)
@@ -851,7 +989,7 @@ fn try_filter_seed_i32_batch(
                 |value| dense_byte_membership_contains_i32(value, base, present),
             );
         }
-        FixedKernelShape::Bounds { lower, upper } if batch.nulls.is_none() => {
+        FixedKernelShape::Bounds { lower, upper } => {
             let Some(bounds) = inclusive_bounds(lower, upper).closed_range() else {
                 selection.clear();
                 return true;
@@ -864,7 +1002,14 @@ fn try_filter_seed_i32_batch(
     #[cfg(all(target_arch = "aarch64", target_endian = "little"))]
     {
         unsafe {
-            filter_i32_range_inclusive_neon(batch.data.as_ptr(), lower, upper, rows, selection)
+            filter_i32_range_inclusive_neon(
+                batch.data.as_ptr(),
+                lower,
+                upper,
+                rows,
+                selection,
+                batch.nulls.as_deref(),
+            )
         }
     }
 
@@ -872,7 +1017,14 @@ fn try_filter_seed_i32_batch(
     {
         if std::arch::is_x86_feature_detected!("avx2") {
             return unsafe {
-                filter_i32_range_inclusive_avx2(batch.data.as_ptr(), lower, upper, rows, selection)
+                filter_i32_range_inclusive_avx2(
+                    batch.data.as_ptr(),
+                    lower,
+                    upper,
+                    rows,
+                    selection,
+                    batch.nulls.as_deref(),
+                )
             };
         }
         false
@@ -894,10 +1046,11 @@ unsafe fn filter_i32_range_inclusive_neon(
     upper: i32,
     rows: usize,
     selection: &mut Vec<BatchRowOrdinal>,
+    nulls: Option<&[u8]>,
 ) -> bool {
     use core::arch::aarch64::{
         vaddq_u32, vandq_u32, vcgeq_s32, vcleq_s32, vdupq_n_s32, vdupq_n_u32, vld1q_u32, vld1q_u8,
-        vreinterpretq_s32_u8,
+        vmaxvq_u32, vorrq_u32, vreinterpretq_s32_u8,
     };
 
     selection.reserve(rows + 4);
@@ -910,15 +1063,105 @@ unsafe fn filter_i32_range_inclusive_neon(
     let upper_vector = unsafe { vdupq_n_s32(upper) };
     let mut ordinals = unsafe { vld1q_u32([0u32, 1, 2, 3].as_ptr()) };
     let ordinal_step = unsafe { vdupq_n_u32(4) };
+    let ordinal_block_step = unsafe { vdupq_n_u32(16) };
     let mut row = 0usize;
     let mut written = 0usize;
+    while row + 16 <= rows {
+        let bytes0 = unsafe { vld1q_u8(input.add(row * std::mem::size_of::<i32>())) };
+        let bytes1 = unsafe { vld1q_u8(input.add((row + 4) * std::mem::size_of::<i32>())) };
+        let bytes2 = unsafe { vld1q_u8(input.add((row + 8) * std::mem::size_of::<i32>())) };
+        let bytes3 = unsafe { vld1q_u8(input.add((row + 12) * std::mem::size_of::<i32>())) };
+        let values0 = unsafe { vreinterpretq_s32_u8(bytes0) };
+        let values1 = unsafe { vreinterpretq_s32_u8(bytes1) };
+        let values2 = unsafe { vreinterpretq_s32_u8(bytes2) };
+        let values3 = unsafe { vreinterpretq_s32_u8(bytes3) };
+        let matched0 = unsafe {
+            vandq_u32(
+                vcgeq_s32(values0, lower_vector),
+                vcleq_s32(values0, upper_vector),
+            )
+        };
+        let matched1 = unsafe {
+            vandq_u32(
+                vcgeq_s32(values1, lower_vector),
+                vcleq_s32(values1, upper_vector),
+            )
+        };
+        let matched2 = unsafe {
+            vandq_u32(
+                vcgeq_s32(values2, lower_vector),
+                vcleq_s32(values2, upper_vector),
+            )
+        };
+        let matched3 = unsafe {
+            vandq_u32(
+                vcgeq_s32(values3, lower_vector),
+                vcleq_s32(values3, upper_vector),
+            )
+        };
+        let any_matched =
+            unsafe { vorrq_u32(vorrq_u32(matched0, matched1), vorrq_u32(matched2, matched3)) };
+        if unsafe { vmaxvq_u32(any_matched) } != 0 {
+            written += unsafe {
+                compact_ordinals_neon(
+                    matched0,
+                    ordinals,
+                    output,
+                    written,
+                    non_null_lane_mask(nulls, row, 4),
+                )
+            };
+            ordinals = unsafe { vaddq_u32(ordinals, ordinal_step) };
+            written += unsafe {
+                compact_ordinals_neon(
+                    matched1,
+                    ordinals,
+                    output,
+                    written,
+                    non_null_lane_mask(nulls, row + 4, 4),
+                )
+            };
+            ordinals = unsafe { vaddq_u32(ordinals, ordinal_step) };
+            written += unsafe {
+                compact_ordinals_neon(
+                    matched2,
+                    ordinals,
+                    output,
+                    written,
+                    non_null_lane_mask(nulls, row + 8, 4),
+                )
+            };
+            ordinals = unsafe { vaddq_u32(ordinals, ordinal_step) };
+            written += unsafe {
+                compact_ordinals_neon(
+                    matched3,
+                    ordinals,
+                    output,
+                    written,
+                    non_null_lane_mask(nulls, row + 12, 4),
+                )
+            };
+            ordinals = unsafe { vaddq_u32(ordinals, ordinal_step) };
+        } else {
+            ordinals = unsafe { vaddq_u32(ordinals, ordinal_block_step) };
+        }
+        row += 16;
+    }
     while row + 4 <= rows {
         let bytes = unsafe { vld1q_u8(input.add(row * std::mem::size_of::<i32>())) };
         let values = unsafe { vreinterpretq_s32_u8(bytes) };
         let above_lower = unsafe { vcgeq_s32(values, lower_vector) };
         let below_upper = unsafe { vcleq_s32(values, upper_vector) };
         let matched = unsafe { vandq_u32(above_lower, below_upper) };
-        written += unsafe { compact_ordinals_neon(matched, ordinals, output, written) };
+        written += unsafe {
+            compact_ordinals_neon(
+                matched,
+                ordinals,
+                output,
+                written,
+                non_null_lane_mask(nulls, row, 4),
+            )
+        };
         ordinals = unsafe { vaddq_u32(ordinals, ordinal_step) };
         row += 4;
     }
@@ -929,7 +1172,7 @@ unsafe fn filter_i32_range_inclusive_neon(
                 .cast::<i32>()
                 .read_unaligned()
         });
-        if value >= lower && value <= upper {
+        if non_null_lane_mask(nulls, row, 1) != 0 && value >= lower && value <= upper {
             unsafe {
                 output
                     .add(written)
@@ -950,6 +1193,7 @@ unsafe fn filter_i32_range_inclusive_avx2(
     upper: i32,
     rows: usize,
     selection: &mut Vec<BatchRowOrdinal>,
+    nulls: Option<&[u8]>,
 ) -> bool {
     use core::arch::x86_64::{
         __m256i, _mm256_add_epi32, _mm256_castsi256_ps, _mm256_cmpgt_epi32, _mm256_loadu_si256,
@@ -982,7 +1226,14 @@ unsafe fn filter_i32_range_inclusive_avx2(
             below_lower,
             above_upper,
         ))) as u32;
-        written += unsafe { compact_ordinals_avx2(!rejected & 0xff, ordinals, output, written) };
+        written += unsafe {
+            compact_ordinals_avx2(
+                !rejected & 0xff & non_null_lane_mask(nulls, row, 8),
+                ordinals,
+                output,
+                written,
+            )
+        };
         ordinals = _mm256_add_epi32(ordinals, ordinal_step);
         row += 8;
     }
@@ -993,7 +1244,7 @@ unsafe fn filter_i32_range_inclusive_avx2(
                 .cast::<i32>()
                 .read_unaligned()
         });
-        if value >= lower && value <= upper {
+        if non_null_lane_mask(nulls, row, 1) != 0 && value >= lower && value <= upper {
             unsafe {
                 output
                     .add(written)
@@ -1180,6 +1431,183 @@ fn filter_selection<T, L, V, P>(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use proptest::prelude::*;
+
+    fn scalar_range_selection<T: Copy + Ord>(
+        values: &[T],
+        nulls: Option<&[u8]>,
+        lower: T,
+        upper: T,
+    ) -> Vec<BatchRowOrdinal> {
+        values
+            .iter()
+            .enumerate()
+            .filter_map(|(row, value)| {
+                (nulls.is_none_or(|nulls| nulls[row] == 0) && *value >= lower && *value <= upper)
+                    .then_some(BatchRowOrdinal::from_validated_index(row))
+            })
+            .collect()
+    }
+
+    fn simd_i32_range_selection(
+        bytes: &[u8],
+        nulls: Option<&[u8]>,
+        lower: i32,
+        upper: i32,
+        rows: usize,
+    ) -> Option<Vec<BatchRowOrdinal>> {
+        #[cfg(all(target_arch = "aarch64", target_endian = "little"))]
+        {
+            let mut selection = Vec::new();
+            assert!(unsafe {
+                filter_i32_range_inclusive_neon(
+                    bytes.as_ptr(),
+                    lower,
+                    upper,
+                    rows,
+                    &mut selection,
+                    nulls,
+                )
+            });
+            Some(selection)
+        }
+        #[cfg(all(target_arch = "x86_64", target_endian = "little"))]
+        {
+            if std::arch::is_x86_feature_detected!("avx2") {
+                let mut selection = Vec::new();
+                assert!(unsafe {
+                    filter_i32_range_inclusive_avx2(
+                        bytes.as_ptr(),
+                        lower,
+                        upper,
+                        rows,
+                        &mut selection,
+                        nulls,
+                    )
+                });
+                Some(selection)
+            } else {
+                None
+            }
+        }
+        #[cfg(not(any(
+            all(target_arch = "aarch64", target_endian = "little"),
+            all(target_arch = "x86_64", target_endian = "little")
+        )))]
+        {
+            let _ = (bytes, nulls, lower, upper, rows);
+            None
+        }
+    }
+
+    fn simd_i64_range_selection(
+        bytes: &[u8],
+        nulls: Option<&[u8]>,
+        lower: i64,
+        upper: i64,
+        rows: usize,
+    ) -> Option<Vec<BatchRowOrdinal>> {
+        #[cfg(all(target_arch = "aarch64", target_endian = "little"))]
+        {
+            let mut selection = Vec::new();
+            assert!(unsafe {
+                filter_i64_range_inclusive_neon(
+                    bytes.as_ptr(),
+                    lower,
+                    upper,
+                    rows,
+                    &mut selection,
+                    nulls,
+                )
+            });
+            Some(selection)
+        }
+        #[cfg(all(target_arch = "x86_64", target_endian = "little"))]
+        {
+            if std::arch::is_x86_feature_detected!("avx2") {
+                let mut selection = Vec::new();
+                assert!(unsafe {
+                    filter_i64_range_inclusive_avx2(
+                        bytes.as_ptr(),
+                        lower,
+                        upper,
+                        rows,
+                        &mut selection,
+                        nulls,
+                    )
+                });
+                Some(selection)
+            } else {
+                None
+            }
+        }
+        #[cfg(not(any(
+            all(target_arch = "aarch64", target_endian = "little"),
+            all(target_arch = "x86_64", target_endian = "little")
+        )))]
+        {
+            let _ = (bytes, nulls, lower, upper, rows);
+            None
+        }
+    }
+
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(128))]
+
+        #[test]
+        fn nullable_i32_simd_range_matches_scalar_for_random_batches(
+            rows in prop::collection::vec((any::<i32>(), any::<u8>()), 0..1050),
+            lower in any::<i32>(),
+            upper in any::<i32>(),
+            nullable in any::<bool>(),
+        ) {
+            let values = rows.iter().map(|(value, _)| *value).collect::<Vec<_>>();
+            let nulls = rows
+                .iter()
+                .map(|(_, marker)| u8::from(*marker & 3 == 0))
+                .collect::<Vec<_>>();
+            let bytes = values
+                .iter()
+                .copied()
+                .flat_map(i32::to_le_bytes)
+                .collect::<Vec<_>>();
+            let nulls = nullable.then_some(nulls.as_slice());
+            let expected = scalar_range_selection(&values, nulls, lower, upper);
+
+            if let Some(actual) =
+                simd_i32_range_selection(&bytes, nulls, lower, upper, values.len())
+            {
+                prop_assert_eq!(actual, expected);
+            }
+        }
+
+        #[test]
+        fn nullable_i64_simd_range_matches_scalar_for_random_batches(
+            rows in prop::collection::vec((any::<i64>(), any::<u8>()), 0..1050),
+            lower in any::<i64>(),
+            upper in any::<i64>(),
+            nullable in any::<bool>(),
+        ) {
+            let values = rows.iter().map(|(value, _)| *value).collect::<Vec<_>>();
+            let nulls = rows
+                .iter()
+                .map(|(_, marker)| u8::from(*marker & 3 == 0))
+                .collect::<Vec<_>>();
+            let bytes = values
+                .iter()
+                .copied()
+                .flat_map(i64::to_le_bytes)
+                .collect::<Vec<_>>();
+            let nulls = nullable.then_some(nulls.as_slice());
+            let expected = scalar_range_selection(&values, nulls, lower, upper);
+
+            if let Some(actual) =
+                simd_i64_range_selection(&bytes, nulls, lower, upper, values.len())
+            {
+                prop_assert_eq!(actual, expected);
+            }
+        }
+    }
 
     #[test]
     fn scalar_i128_bounds_share_inclusive_normalization() {
@@ -1237,7 +1665,14 @@ mod tests {
             let actual = {
                 let mut selection = Vec::new();
                 assert!(unsafe {
-                    filter_i32_range_inclusive_neon(bytes.as_ptr(), 20, 70, rows, &mut selection)
+                    filter_i32_range_inclusive_neon(
+                        bytes.as_ptr(),
+                        20,
+                        70,
+                        rows,
+                        &mut selection,
+                        None,
+                    )
                 });
                 selection
             };
@@ -1249,7 +1684,134 @@ mod tests {
                 }
                 let mut selection = Vec::new();
                 assert!(unsafe {
-                    filter_i32_range_inclusive_avx2(bytes.as_ptr(), 20, 70, rows, &mut selection)
+                    filter_i32_range_inclusive_avx2(
+                        bytes.as_ptr(),
+                        20,
+                        70,
+                        rows,
+                        &mut selection,
+                        None,
+                    )
+                });
+                selection
+            };
+
+            #[cfg(not(any(
+                all(target_arch = "aarch64", target_endian = "little"),
+                all(target_arch = "x86_64", target_endian = "little")
+            )))]
+            let actual = expected.clone();
+
+            assert_eq!(actual, expected, "row count {rows}");
+
+            let nulls = (0..rows)
+                .map(|row| u8::from(row % 5 == 0))
+                .collect::<Vec<_>>();
+            let expected_nullable = expected
+                .iter()
+                .copied()
+                .filter(|row| nulls[row.index()] == 0)
+                .collect::<Vec<_>>();
+
+            #[cfg(all(target_arch = "aarch64", target_endian = "little"))]
+            let actual_nullable = {
+                let mut selection = Vec::new();
+                assert!(unsafe {
+                    filter_i32_range_inclusive_neon(
+                        bytes.as_ptr(),
+                        20,
+                        70,
+                        rows,
+                        &mut selection,
+                        Some(&nulls),
+                    )
+                });
+                selection
+            };
+
+            #[cfg(all(target_arch = "x86_64", target_endian = "little"))]
+            let actual_nullable = {
+                if !std::arch::is_x86_feature_detected!("avx2") {
+                    return;
+                }
+                let mut selection = Vec::new();
+                assert!(unsafe {
+                    filter_i32_range_inclusive_avx2(
+                        bytes.as_ptr(),
+                        20,
+                        70,
+                        rows,
+                        &mut selection,
+                        Some(&nulls),
+                    )
+                });
+                selection
+            };
+
+            #[cfg(not(any(
+                all(target_arch = "aarch64", target_endian = "little"),
+                all(target_arch = "x86_64", target_endian = "little")
+            )))]
+            let actual_nullable = expected_nullable.clone();
+
+            assert_eq!(actual_nullable, expected_nullable, "nullable rows {rows}");
+        }
+    }
+
+    #[test]
+    fn nullable_i64_range_compaction_matches_scalar() {
+        for rows in [0usize, 1, 2, 3, 4, 5, 7, 8, 999, 1000] {
+            let values = (0..rows)
+                .map(|row| ((row * 53 + 7) % 127) as i64)
+                .collect::<Vec<_>>();
+            let bytes = values
+                .iter()
+                .copied()
+                .flat_map(i64::to_le_bytes)
+                .collect::<Vec<_>>();
+            let nulls = (0..rows)
+                .map(|row| u8::from(row % 7 == 0))
+                .collect::<Vec<_>>();
+            let expected = values
+                .iter()
+                .enumerate()
+                .filter_map(|(row, value)| {
+                    (nulls[row] == 0 && (20..=90).contains(value))
+                        .then_some(BatchRowOrdinal::from_validated_index(row))
+                })
+                .collect::<Vec<_>>();
+
+            #[cfg(all(target_arch = "aarch64", target_endian = "little"))]
+            let actual = {
+                let mut selection = Vec::new();
+                assert!(unsafe {
+                    filter_i64_range_inclusive_neon(
+                        bytes.as_ptr(),
+                        20,
+                        90,
+                        rows,
+                        &mut selection,
+                        Some(&nulls),
+                    )
+                });
+                selection
+            };
+
+            #[cfg(all(target_arch = "x86_64", target_endian = "little"))]
+            let actual = {
+                if !std::arch::is_x86_feature_detected!("avx2") {
+                    return;
+                }
+                let mut selection = Vec::new();
+                assert!(unsafe {
+                    filter_i64_range_inclusive_avx2(
+                        bytes.as_ptr(),
+                        20,
+                        90,
+                        rows,
+                        &mut selection,
+                        Some(&nulls),
+                    )
                 });
                 selection
             };

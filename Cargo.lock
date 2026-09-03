@@ -1871,6 +1871,7 @@ dependencies = [
  "paro-journal",
  "paro-scheduler",
  "paro-transaction",
+ "proptest",
  "rand 0.8.5",
  "rayon",
  "roaring",

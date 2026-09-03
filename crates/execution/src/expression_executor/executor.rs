@@ -55,6 +55,8 @@ use super::state::{
 #[derive(Debug)]
 pub struct CompiledExpressionProgram {
     physical: Arc<PhysicalExpressionProgram>,
+    output_types: Box<[LogicalType]>,
+    replaced_root_prefix: usize,
 }
 
 #[derive(Debug)]
@@ -476,6 +478,15 @@ impl ExpressionExecutor {
     }
 
     fn from_physical(physical: Arc<PhysicalExpressionProgram>) -> Self {
+        let output_types = physical.root_return_types().into_boxed_slice();
+        let replaced_root_prefix = (0..physical.root_count())
+            .take_while(|&index| {
+                matches!(
+                    physical.root(index),
+                    PhysicalExpression::Constant(_) | PhysicalExpression::Reference(_)
+                )
+            })
+            .count();
         let states = (0..physical.unique_root_count())
             .map(|root_idx| Self::initialize(physical.unique_root(root_idx)))
             .collect();
@@ -489,7 +500,11 @@ impl ExpressionExecutor {
             .map(|_| SharedExpressionSlot::default())
             .collect();
         Self {
-            program: CompiledExpressionProgram { physical },
+            program: CompiledExpressionProgram {
+                physical,
+                output_types,
+                replaced_root_prefix,
+            },
             state: CompiledExecutorState {
                 states,
                 shared_states,
@@ -646,7 +661,7 @@ impl ExpressionExecutor {
         result: &mut Chunk,
     ) -> Result<()> {
         let physical = &self.program.physical;
-        let output_types = physical.root_return_types();
+        let output_types = &self.program.output_types;
         // A failed execution also releases its transient references before
         // returning, so this is only a defensive cleanup for callers that
         // abandon a partially evaluated batch through unwinding.
@@ -656,6 +671,7 @@ impl ExpressionExecutor {
             &output_types,
             input.count,
             runtime.allocator(MemoryTag::BaseTable),
+            self.program.replaced_root_prefix,
         )?;
 
         let execution = {
@@ -997,6 +1013,7 @@ impl ExpressionExecutor {
         types: &[LogicalType],
         count: usize,
         allocator: Arc<dyn Allocator>,
+        replaced_prefix: usize,
     ) -> Result<()> {
         let required_capacity = count.max(1);
         let needs_reinit = result.column_count() != types.len()
@@ -1004,6 +1021,8 @@ impl ExpressionExecutor {
             || result.types() != types;
         if needs_reinit {
             *result = Chunk::try_initialize(types, required_capacity, allocator)?;
+        } else if replaced_prefix > 0 {
+            result.try_reset_writable_suffix(replaced_prefix, allocator)?;
         } else {
             result.try_reset(result.allocator().clone())?;
         }
@@ -4815,6 +4834,27 @@ mod tests {
             output.types(),
             vec![LogicalType::Integer, LogicalType::Varchar]
         );
+    }
+
+    #[test]
+    fn execute_all_reuses_output_with_replaced_passive_prefix() {
+        let session = test_session();
+        let runtime = test_runtime(session);
+        let expressions = [reference_i32(0), constant_i32(42), greater_than_i32(0, 0)];
+        let mut executor = ExpressionExecutor::with_expressions(&expressions);
+        let mut output = Chunk::try_new(paro_common::test_utils::test_allocator())
+            .expect("test chunk allocation failed");
+
+        for values in [&[7, -1][..], &[9, 0][..]] {
+            let input = integer_chunk(values);
+            executor
+                .execute_all_into(&input, &runtime, &mut output)
+                .expect("projection with passive prefix should execute");
+            assert_eq!(output.size(), 2);
+            assert_eq!(output.get_value(0, 0), Some(Value::Integer(values[0])));
+            assert_eq!(output.get_value(1, 1), Some(Value::Integer(42)));
+            assert_eq!(output.get_value(2, 0), Some(Value::Boolean(values[0] > 0)));
+        }
     }
 
     #[test]
