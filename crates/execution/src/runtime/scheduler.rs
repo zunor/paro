@@ -208,7 +208,7 @@ impl<'a> PipelineScheduler<'a> {
                     self.ready.push(entry);
                 }
                 self.run_runtime(runtime)?;
-                self.mark_pipeline_finished(pipeline);
+                self.finish_completed_pipelines([pipeline])?;
                 continue;
             }
 
@@ -221,9 +221,7 @@ impl<'a> PipelineScheduler<'a> {
                 }
             }
             self.run_pipeline_wave(&wave)?;
-            for (pipeline, _) in wave {
-                self.mark_pipeline_finished(pipeline);
-            }
+            self.finish_completed_pipelines(wave.iter().map(|(pipeline, _)| *pipeline))?;
         }
         Ok(())
     }
@@ -348,18 +346,85 @@ impl<'a> PipelineScheduler<'a> {
         self.ready_seq = self.ready_seq.saturating_add(1);
     }
 
-    fn mark_pipeline_finished(&mut self, pipeline: PipelineId) {
-        if self.finished[pipeline.index()] {
-            return;
-        }
-        self.finished[pipeline.index()] = true;
-        self.finished_count += 1;
-        self.handles.pipeline_finished(pipeline);
-        for event in self.gates.mark_finished(pipeline) {
-            if !self.finished[event.pipeline.index()] && self.gates.is_ready(event.pipeline) {
-                self.push_ready_pipeline(event.pipeline, 1);
+    /// Publish a completed wave atomically, then drain empty continuations.
+    ///
+    /// Completion publication is deliberately separated from fallible runtime
+    /// construction/execution. Every pipeline that finished in one worker wave
+    /// is visible to handles and dependency gates even when one newly unblocked
+    /// continuation fails. Only `SourceWork::Empty` continuations are followed
+    /// inline, so the extra work is bounded by the dependency chain; their
+    /// independent failures are drained before the first error is returned.
+    fn finish_completed_pipelines(
+        &mut self,
+        pipelines: impl IntoIterator<Item = PipelineId>,
+    ) -> Result<()> {
+        let mut completed = pipelines.into_iter().collect::<VecDeque<_>>();
+        let mut first_error: Option<ParoError> = None;
+
+        while !completed.is_empty() {
+            // Drain the complete batch before performing any operation that
+            // can fail. This is the atomic wave-completion boundary.
+            let completed_count = completed.len();
+            let mut unblocked = Vec::new();
+            for _ in 0..completed_count {
+                let pipeline = completed
+                    .pop_front()
+                    .expect("completion batch length is stable while publishing");
+                if self.finished[pipeline.index()] {
+                    continue;
+                }
+                self.finished[pipeline.index()] = true;
+                self.finished_count += 1;
+                self.handles.pipeline_finished(pipeline);
+                unblocked.extend(self.gates.mark_finished(pipeline));
+            }
+
+            let mut inline = VecDeque::new();
+            for event in unblocked {
+                if self.finished[event.pipeline.index()] || !self.gates.is_ready(event.pipeline) {
+                    continue;
+                }
+                // A sealed in-memory breaker proves its replay source is
+                // empty. Complete that conditional continuation immediately
+                // while opening the dependency gate instead of putting a
+                // zero-work pipeline behind unrelated data waves. Global
+                // finish hooks still run, so shared sinks and empty-input
+                // aggregate semantics are preserved.
+                let runtime = match self.runtime(event.pipeline) {
+                    Ok(runtime) => runtime,
+                    Err(error) => {
+                        first_error.get_or_insert(error);
+                        continue;
+                    }
+                };
+                let completes_inline = match source_work(&runtime.source_global) {
+                    Ok(work) => {
+                        matches!(work, Some(SourceWork::Empty))
+                            && runtime.can_complete_empty_without_data_task()
+                    }
+                    Err(error) => {
+                        first_error.get_or_insert(error);
+                        continue;
+                    }
+                };
+                if completes_inline {
+                    inline.push_back((event.pipeline, runtime));
+                } else {
+                    self.push_ready_pipeline(event.pipeline, 1);
+                }
+            }
+
+            while let Some((pipeline, runtime)) = inline.pop_front() {
+                match self.run_runtime(runtime) {
+                    Ok(()) => completed.push_back(pipeline),
+                    Err(error) => {
+                        first_error.get_or_insert(error);
+                    }
+                }
             }
         }
+
+        first_error.map_or(Ok(()), Err)
     }
 }
 
@@ -1404,21 +1469,27 @@ fn as_scheduler_task(task: PipelineWorkerTask) -> Arc<ParkingMutex<dyn Task>> {
 fn source_work(source: &SourceGlobal) -> Result<Option<SourceWork>> {
     Ok(match source {
         SourceGlobal::Rowset(global) => Some(SourceWork::RowsetScan {
-            count: global.morsels.len(),
+            count: global.parallel_work_count(),
         }),
         SourceGlobal::Chunk(global) => Some(SourceWork::Chunks {
             count: global.chunks.len(),
         }),
-        SourceGlobal::Materialized(global) => Some(SourceWork::SharedWorkers {
-            count: global.work_count()?,
-            worker: SharedSourceWorker::Materialized,
-        }),
-        SourceGlobal::HashAggregateEmit(global) if global.work_count() > 1 => {
-            Some(SourceWork::SharedWorkers {
-                count: global.work_count(),
+        SourceGlobal::Materialized(global) => match global.parallel_work_count()? {
+            0 => Some(SourceWork::Empty),
+            count if count > 1 => Some(SourceWork::SharedWorkers {
+                count,
+                worker: SharedSourceWorker::Materialized,
+            }),
+            _ => None,
+        },
+        SourceGlobal::HashAggregateEmit(global) => match global.parallel_work_count() {
+            0 => Some(SourceWork::Empty),
+            count if count > 1 => Some(SourceWork::SharedWorkers {
+                count,
                 worker: SharedSourceWorker::HashAggregateEmit,
-            })
-        }
+            }),
+            _ => None,
+        },
         SourceGlobal::HashJoinUnmatched(global) if global.work_count() > 1 => {
             Some(SourceWork::SharedWorkers {
                 count: global.work_count(),
@@ -1438,6 +1509,7 @@ fn source_work(source: &SourceGlobal) -> Result<Option<SourceWork>> {
         SourceGlobal::HashJoinSpillReplay(global) if !global.handle.is_external() => {
             Some(SourceWork::Empty)
         }
+        SourceGlobal::Empty(_) => Some(SourceWork::Empty),
         _ => None,
     })
 }

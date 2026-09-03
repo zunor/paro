@@ -203,7 +203,6 @@ impl TopNEntryHeap {
         self.entries.len()
     }
 
-    #[cfg(test)]
     pub(super) fn is_empty(&self) -> bool {
         self.entries.is_empty()
     }

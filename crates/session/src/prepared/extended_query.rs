@@ -163,6 +163,16 @@ async fn execute_parse<R: ExtendedQueryResponder>(
     message: ParseMessage,
     responder: &mut R,
 ) -> Result<()> {
+    // The unnamed statement is replaced on every Parse, but an exact,
+    // parameter-free repeat does not need to rebuild even its immutable AST.
+    // Check the byte-identical SQL and full compile environment before
+    // entering the parser; parameterized statements retain the ordinary type
+    // resolution path below.
+    if let Some(entry) = reusable_parameter_free_unnamed_entry(session, &message) {
+        session.state.set_unnamed_prepared_statement(entry);
+        return responder.send_parse_complete().await;
+    }
+
     let statements = paro_parser::parse(&message.query)
         .map_err(|error| paro_error::from_parser(error.to_string()))?;
     if statements.len() != 1 {
@@ -237,6 +247,46 @@ async fn execute_parse<R: ExtendedQueryResponder>(
     responder.send_parse_complete().await
 }
 
+fn reusable_parameter_free_unnamed_entry(
+    session: &Session,
+    message: &ParseMessage,
+) -> Option<PreparedStatementEntry> {
+    if message.name.is_some() || !message.type_oids.is_empty() {
+        return None;
+    }
+    let previous = reusable_unnamed_statement_image(session, &message.query)?;
+    if !previous.parameter_types.is_empty() {
+        return None;
+    }
+    let mut entry = previous.clone();
+    entry.generic_plan_uses = 0;
+    debug!(
+        target: targets::QUERY,
+        sql_bytes = message.query.len(),
+        "Repeated parameter-free unnamed Parse reused immutable statement image"
+    );
+    Some(entry)
+}
+
+/// Return the one immutable unnamed statement image that is legal to reuse.
+///
+/// Parsing a byte-identical SQL string is deterministic: parse behavior has no
+/// session input. Binding and planning do, so the canonical compile-environment
+/// key is checked here before either the pre-parse or post-parse reuse path can
+/// observe the image. More-specific callers may additionally constrain
+/// parameter types or compare the parsed AST, but cannot weaken this guard.
+fn reusable_unnamed_statement_image<'a>(
+    session: &'a Session,
+    sql: &str,
+) -> Option<&'a PreparedStatementEntry> {
+    let previous = session.state.unnamed_prepared_statement()?;
+    let plan = previous.generic_plan.as_ref()?;
+    (previous.source == PreparedStatementSource::Protocol
+        && previous.source_sql.as_ref() == sql
+        && plan.compile_environment() == &session.compile_environment_key())
+        .then_some(previous)
+}
+
 /// Reuse the immutable image behind a repeated unnamed Parse.
 ///
 /// Drivers commonly use an unnamed Parse/Bind/Execute cycle even when they
@@ -251,23 +301,17 @@ fn reusable_unnamed_parse_artifacts(
     stmt: &Statement,
     parameter_types: &[Option<LogicalType>],
 ) -> Option<(Vec<ResultColumnDesc>, Option<CompiledStatement>)> {
-    let previous = session.state.unnamed_prepared_statement()?;
-    if previous.source != PreparedStatementSource::Protocol
-        || previous.source_sql.as_ref() != sql
-        || previous.raw_stmt.as_ref() != stmt
-        || previous.parameter_types != parameter_types
-    {
+    let previous = reusable_unnamed_statement_image(session, sql)?;
+    if previous.raw_stmt.as_ref() != stmt || previous.parameter_types != parameter_types {
         return None;
     }
     let plan = previous.generic_plan.as_ref()?;
-    (plan.compile_environment() == &session.compile_environment_key()).then(|| {
-        debug!(
-            target: targets::QUERY,
-            sql_bytes = sql.len(),
-            "Repeated unnamed Parse reused immutable generic plan"
-        );
-        (previous.result_schema.clone(), Some(plan.clone()))
-    })
+    debug!(
+        target: targets::QUERY,
+        sql_bytes = sql.len(),
+        "Repeated unnamed Parse reused immutable generic plan"
+    );
+    Some((previous.result_schema.clone(), Some(plan.clone())))
 }
 
 async fn execute_bind<R: ExtendedQueryResponder>(
@@ -2465,6 +2509,11 @@ mod tests {
             .unnamed_prepared_statement()
             .and_then(|statement| statement.generic_plan.clone())
             .expect("first unnamed Parse compiles a generic plan");
+        let first_ast = session
+            .state
+            .unnamed_prepared_statement()
+            .map(|statement| statement.raw_stmt.clone())
+            .expect("first unnamed Parse retains its AST");
 
         execute_extended_query_message(&mut session, parse(), &mut responder)
             .await
@@ -2475,6 +2524,14 @@ mod tests {
             .and_then(|statement| statement.generic_plan.clone())
             .expect("repeated unnamed Parse keeps a generic plan");
         assert!(second.shares_image_with(&first));
+        assert!(Arc::ptr_eq(
+            &first_ast,
+            &session
+                .state
+                .unnamed_prepared_statement()
+                .expect("repeated unnamed Parse retains its entry")
+                .raw_stmt
+        ));
 
         session.config.set_setting("threads", Value::Integer(2));
         crate::utility::settings::reconcile_effective_settings(&mut session).unwrap();

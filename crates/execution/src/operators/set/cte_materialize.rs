@@ -58,8 +58,8 @@ fn prepare_cte_snapshot(
         }
         if !staged.chunks.is_empty() {
             let mut external = cte_spill_writer(ctx, handle);
-            for mut chunk in staged.chunks.drain(..) {
-                external.append_chunk(&mut chunk)?;
+            for chunk in staged.chunks.drain(..) {
+                external.append_chunk(&chunk)?;
             }
             staged.stores.push(external.finish()?);
         }
@@ -165,8 +165,8 @@ impl CteMaterializeSinkExec {
         }
         if local.external.is_none() && global.handle.external_selected() {
             let mut external = cte_spill_writer(ctx.query, global.handle.as_ref());
-            for mut chunk in local.chunks.drain(..) {
-                external.append_chunk(&mut chunk)?;
+            for chunk in local.chunks.drain(..) {
+                external.append_chunk(&chunk)?;
             }
             local.external = Some(external);
         }

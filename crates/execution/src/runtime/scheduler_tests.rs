@@ -2,6 +2,20 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use crate::runtime::PipelineReadyPriority;
+use crate::{
+    memory_runtime::QueryMemoryPool,
+    physical::{properties::PipelineProperties, specs::EmptyResultSpec, RowType},
+    pipeline::{
+        graph::{
+            ClientResultSpec, DependencyKind, PipelineDependency, PipelineGraph, PipelineRoot,
+            PipelineSpec, SinkSharing, SinkSpec, SourceSpec,
+        },
+        handles::BreakerHandleCatalog,
+        PipelineIdMap, PipelineProgramBuilder, PipelineProgramIndex,
+    },
+    runtime::{ParameterBindings, QueryOutputPort},
+};
+use paro_context::TestStatementContextBuilder;
 
 use super::*;
 
@@ -146,4 +160,77 @@ fn waiter_registry_moves_unit_when_wake_key_changes() {
 
     assert!(registry.wake(old_wake.key()).is_empty());
     assert_eq!(registry.wake(new_wake.key()), vec![unit]);
+}
+
+#[test]
+fn completion_wave_publishes_and_drains_independent_siblings_before_error() {
+    let output = RowType::new(Vec::new(), Vec::new());
+    let pipelines = (0..4)
+        .map(|index| PipelineSpec {
+            id: PipelineId::new(index),
+            source: SourceSpec::Empty(EmptyResultSpec),
+            transforms: Vec::new(),
+            sink: SinkSpec::ClientResult(ClientResultSpec),
+            sink_sharing: SinkSharing::Exclusive,
+            properties: PipelineProperties::default(),
+            output: output.clone(),
+        })
+        .collect();
+    let graph = PipelineGraph {
+        pipelines,
+        dependencies: vec![
+            PipelineDependency {
+                producer: PipelineId::new(0),
+                consumer: PipelineId::new(2),
+                kind: DependencyKind::MaterializeBeforeRead,
+            },
+            PipelineDependency {
+                producer: PipelineId::new(1),
+                consumer: PipelineId::new(3),
+                kind: DependencyKind::MaterializeBeforeRead,
+            },
+        ],
+        handles: BreakerHandleCatalog::default(),
+        control_regions: Vec::new(),
+        root: PipelineRoot::Pipeline(PipelineId::new(3)),
+    };
+    let mut programs = PipelineProgramBuilder::default()
+        .build_program_set(&graph)
+        .expect("pipeline programs");
+
+    // Inject one bad continuation without disturbing the independent sibling.
+    // The program arena remains dense so scheduler state still covers all ids;
+    // only the id lookup contract for pipeline 2 is deliberately absent.
+    let mut by_pipeline_id = PipelineIdMap::new(4);
+    for index in [0, 1, 3] {
+        by_pipeline_id
+            .insert(PipelineId::new(index), PipelineProgramIndex::new(index))
+            .expect("valid test pipeline id");
+    }
+    programs.by_pipeline_id = by_pipeline_id;
+
+    let handles =
+        Arc::new(BreakerHandleRegistry::from_catalog(&graph.handles).expect("breaker registry"));
+    let query = QueryRuntimeContext::new(
+        TestStatementContextBuilder::minimal().build(),
+        Arc::new(ParameterBindings::empty()),
+        Arc::new(QueryMemoryPool::unbounded()),
+        QueryOutputPort::discarding(),
+    );
+    let mut scheduler = PipelineScheduler::new(
+        &graph,
+        &programs,
+        handles,
+        query,
+        paro_common::test_utils::test_allocator(),
+    )
+    .expect("scheduler");
+
+    let error = scheduler
+        .finish_completed_pipelines([PipelineId::new(0), PipelineId::new(1)])
+        .expect_err("missing continuation program must fail");
+
+    assert!(error.to_string().contains("pipeline program missing"));
+    assert_eq!(scheduler.finished, vec![true, true, false, true]);
+    assert_eq!(scheduler.finished_count, 3);
 }

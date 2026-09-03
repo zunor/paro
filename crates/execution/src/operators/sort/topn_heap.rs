@@ -265,7 +265,7 @@ impl TopNHeap {
         // chunk only to gather it again at seal adds work without reducing the
         // bounded state.  Subsequent batches keep using the regular heap path,
         // which compacts discarded payloads once the frontier fills.
-        if self.heap.len() == 0
+        if self.heap.is_empty()
             && self.heap_data.is_empty()
             && payload_chunk.size() <= self.heap_size
             && boundary_key.is_none()

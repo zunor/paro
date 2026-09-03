@@ -51,11 +51,16 @@ impl MaterializedSourceGlobal {
         self.reader.sealed_chunks()
     }
 
-    /// Number of immutable chunks available to independently scheduled source
-    /// workers. The producer dependency guarantees the handle is sealed before
-    /// this is queried by the scheduler.
-    pub(crate) fn work_count(&self) -> Result<usize> {
-        Ok(self.sealed_chunks()?.len())
+    /// Bound useful workers by output vectors while retaining every immutable
+    /// chunk as independently claimable work.
+    pub(crate) fn parallel_work_count(&self) -> Result<usize> {
+        let chunks = self.sealed_chunks()?;
+        let rows = chunks
+            .iter()
+            .fold(0usize, |rows, chunk| rows.saturating_add(chunk.size()));
+        Ok(chunks
+            .len()
+            .min(rows.div_ceil(paro_common::vector::VECTOR_SIZE).max(1)))
     }
 
     #[inline]
@@ -241,8 +246,8 @@ impl MaterializeSinkExec {
             && ctx.query.memory.available_bytes() <= DEFAULT_BLOCK_SIZE.saturating_mul(2)
         {
             let mut external = Self::spill_writer(ctx.query, global);
-            for mut chunk in local.chunks.drain(..) {
-                external.append_chunk(&mut chunk)?;
+            for chunk in local.chunks.drain(..) {
+                external.append_chunk(&chunk)?;
             }
             local.external = Some(external);
         }
@@ -358,8 +363,8 @@ mod tests {
         assert_eq!(second.next_chunk_index(), 0);
         assert_eq!(first.sealed_chunks().unwrap().len(), 2);
         assert_eq!(second.sealed_chunks().unwrap().len(), 2);
-        assert_eq!(first.work_count().unwrap(), 2);
-        assert_eq!(second.work_count().unwrap(), 2);
+        assert_eq!(first.parallel_work_count().unwrap(), 1);
+        assert_eq!(second.parallel_work_count().unwrap(), 1);
     }
 
     #[test]

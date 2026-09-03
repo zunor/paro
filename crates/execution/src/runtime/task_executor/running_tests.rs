@@ -719,12 +719,14 @@ fn hash_join_build_and_probe_use_typed_handle_without_sink_state() {
                 )),
                 transforms: vec![TransformSpec::HashJoinProbe(HashJoinProbeSpec {
                     handle,
+                    covering_runtime_filter_key: None,
                     join_type: JoinType::Inner,
                     anti_join_mode: AntiJoinMode::Regular,
                     key_conditions: vec![join_condition()].into_boxed_slice(),
                     build_residual_conditions: Box::default(),
                     probe_residual_count: 0,
                     left_projection: vec![1].into_boxed_slice(),
+                    output_permutation: crate::physical::OutputPermutation::identity(2),
                     output_names: vec!["lv".to_string(), "rv".to_string()].into_boxed_slice(),
                     output_types: vec![LogicalType::Integer, LogicalType::Integer]
                         .into_boxed_slice(),
@@ -927,11 +929,11 @@ fn cross_product_probe_streams_external_build_rows() {
 }
 
 #[test]
-fn hash_join_left_probe_null_fills_when_build_is_empty() {
+fn hash_join_left_probe_applies_output_permutation_when_build_is_empty() {
     let output = QueryOutputPort::unbounded();
     let query = query_context(output.clone());
     let join_row_type = RowType::new(
-        vec!["lv".to_string(), "rv".to_string()],
+        vec!["rv".to_string(), "lv".to_string()],
         vec![LogicalType::Integer, LogicalType::Integer],
     );
 
@@ -987,13 +989,16 @@ fn hash_join_left_probe_null_fills_when_build_is_empty() {
                 )),
                 transforms: vec![TransformSpec::HashJoinProbe(HashJoinProbeSpec {
                     handle,
+                    covering_runtime_filter_key: None,
                     join_type: JoinType::Left,
                     anti_join_mode: AntiJoinMode::Regular,
                     key_conditions: vec![join_condition()].into_boxed_slice(),
                     build_residual_conditions: Box::default(),
                     probe_residual_count: 0,
                     left_projection: vec![1].into_boxed_slice(),
-                    output_names: vec!["lv".to_string(), "rv".to_string()].into_boxed_slice(),
+                    output_permutation: crate::physical::OutputPermutation::from_forward([1, 0])
+                        .unwrap(),
+                    output_names: vec!["rv".to_string(), "lv".to_string()].into_boxed_slice(),
                     output_types: vec![LogicalType::Integer, LogicalType::Integer]
                         .into_boxed_slice(),
                     reduction_cascade: None,
@@ -1057,8 +1062,8 @@ fn hash_join_left_probe_null_fills_when_build_is_empty() {
 
     let chunk = output.pop_front().expect("left join output");
     assert_eq!(chunk.size(), 2);
-    assert_eq!(chunk.column(0).unwrap().get_i32(0), Some(100));
-    assert_eq!(chunk.column(0).unwrap().get_i32(1), Some(200));
-    assert!(chunk.column(1).unwrap().is_null(0));
-    assert!(chunk.column(1).unwrap().is_null(1));
+    assert!(chunk.column(0).unwrap().is_null(0));
+    assert!(chunk.column(0).unwrap().is_null(1));
+    assert_eq!(chunk.column(1).unwrap().get_i32(0), Some(100));
+    assert_eq!(chunk.column(1).unwrap().get_i32(1), Some(200));
 }

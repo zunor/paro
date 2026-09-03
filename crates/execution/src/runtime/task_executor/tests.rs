@@ -249,6 +249,7 @@ fn count_star_expression() -> Expression {
 fn grouped_count_spec(perfect_hash: Option<PerfectHashAggregatePlan>) -> AggregateSpec {
     AggregateSpec {
         grouping_key_count: 1,
+        initial_lookup_hash_key_count: 1,
         state_output_projection: Box::new([]),
         estimated_input_rows: None,
         projection_exprs: Box::new([]),
@@ -309,6 +310,7 @@ fn grouped_sum_post_max_spec(
     };
     AggregateSpec {
         grouping_key_count: 1,
+        initial_lookup_hash_key_count: 1,
         state_output_projection: Box::new([]),
         estimated_input_rows: None,
         projection_exprs: Box::new([]),
@@ -341,6 +343,7 @@ fn grouped_sum_post_max_spec(
 fn ungrouped_count_spec() -> AggregateSpec {
     AggregateSpec {
         grouping_key_count: 0,
+        initial_lookup_hash_key_count: 0,
         state_output_projection: Box::new([]),
         estimated_input_rows: None,
         projection_exprs: Box::new([]),
@@ -368,6 +371,7 @@ fn ungrouped_distinct_count_spec() -> AggregateSpec {
         .expect("bind count(integer)");
     AggregateSpec {
         grouping_key_count: 0,
+        initial_lookup_hash_key_count: 0,
         state_output_projection: Box::new([]),
         estimated_input_rows: None,
         projection_exprs: Box::new([]),
@@ -403,6 +407,7 @@ fn grouped_distinct_count_spec() -> AggregateSpec {
         .expect("bind count(integer)");
     AggregateSpec {
         grouping_key_count: 1,
+        initial_lookup_hash_key_count: 1,
         state_output_projection: Box::new([]),
         estimated_input_rows: None,
         projection_exprs: Box::new([]),

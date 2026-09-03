@@ -206,7 +206,7 @@ impl MaterializedHandle {
                 *pending = MaterializedPending::Chunks(std::mem::take(chunks));
             }
             MaterializedPending::Chunks(pending_chunks) => {
-                pending_chunks.extend(chunks.drain(..));
+                pending_chunks.append(chunks);
             }
             MaterializedPending::RowStores(_) => {
                 return Err(paro_error::internal(

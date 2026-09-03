@@ -550,7 +550,18 @@ impl Session {
     }
 
     pub fn compile_environment_key(&self) -> CompileEnvironmentKey {
-        self.freeze_query_context().compile_environment_key()
+        let registry = self.instance.database_registry();
+        CompileEnvironmentKey::capture(
+            self.current_database.name(),
+            self.current_schema(),
+            self.search_path().get(),
+            registry.visible_generation(),
+            registry
+                .get_databases()
+                .iter()
+                .map(|database| (database.id(), database.catalog().gc_epoch())),
+            &EffectiveSettings::new(self.effective_settings.clone()),
+        )
     }
 
     /// Create a new session with a specific user name.
@@ -1846,6 +1857,21 @@ mod tests {
 
         assert_eq!(context.time.transaction_started_at(), None);
         assert_eq!(context.time.transaction_timestamp_micros(), None);
+    }
+
+    #[test]
+    fn live_compile_environment_matches_a_frozen_statement() {
+        let instance = Instance::new_in_memory();
+        instance.create_database("analytics").unwrap();
+        let mut session = Session::new(1, instance);
+        session
+            .set_session_setting("threads", Value::Integer(2))
+            .unwrap();
+
+        let live = session.compile_environment_key();
+        let frozen = session.freeze_query_context().compile_environment_key();
+
+        assert_eq!(live, frozen);
     }
 
     #[test]
