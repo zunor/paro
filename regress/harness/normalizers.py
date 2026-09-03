@@ -57,6 +57,14 @@ _RUNTIME_KEY_VALUE_BYTES_RE = re.compile(
     r"\b(spilled_bytes|peak_memory_bytes|temp_storage_bytes|grant_bytes|"
     r"revocable_bytes|revoked_bytes|spill_bytes)=\d+\b"
 )
+_ADAPTIVE_RUNTIME_COUNTER_RE = re.compile(
+    r"\b(aggregate_hash_full_key_fallback_count|"
+    r"aggregate_hash_max_prefix_probe_distance)=\d+\b"
+)
+_JSON_ADAPTIVE_RUNTIME_COUNTER_RE = re.compile(
+    r'"(aggregate_hash_full_key_fallback_count|'
+    r'aggregate_hash_max_prefix_probe_distance)"\s*:\s*\d+'
+)
 _COPY_ROWCOUNT_RE = re.compile(r"^COPY\s+\d+$")
 _TXN_NUMERIC_ID_RE = re.compile(
     r"\b(TxnId|ReadTs|CommitTs|TableId|DatabaseId)\(\d+\)"
@@ -124,6 +132,20 @@ def normalize_explain_runtime_bytes(lines: list[str]) -> list[str]:
         line = _BYTES_FIELD_RE.sub(r"\1: <bytes>", line)
         line = _RUNTIME_KEY_VALUE_BYTES_RE.sub(lambda m: f"{m.group(1)}=<bytes>", line)
         line = _JSON_BYTES_FIELD_RE.sub(lambda m: f'"{m.group(1)}": 0', line)
+        result.append(line)
+    return result
+
+
+def normalize_explain_adaptive_runtime(lines: list[str]) -> list[str]:
+    """Preserve adaptive-runtime telemetry fields without pinning heuristics."""
+    result: list[str] = []
+    for line in lines:
+        line = _ADAPTIVE_RUNTIME_COUNTER_RE.sub(
+            lambda m: f"{m.group(1)}=<adaptive>", line
+        )
+        line = _JSON_ADAPTIVE_RUNTIME_COUNTER_RE.sub(
+            lambda m: f'"{m.group(1)}": "<adaptive>"', line
+        )
         result.append(line)
     return result
 
@@ -227,6 +249,7 @@ def normalize_python_runtime_retry_hint(lines: list[str]) -> list[str]:
 # stable: normalize per-operator timing volatility.
 # stable: normalize summary timing volatility.
 # stable: normalize runtime byte volatility for spill/memory observability.
+# stable: normalize adaptive counters while preserving telemetry presence.
 # stable: normalize repo-local regress fixture/report absolute paths.
 # stable: normalize volatile transaction/catalog ids in concurrency errors.
 # stable: normalize volatile search definition/generation/root ids in EXPLAIN output.
@@ -236,6 +259,7 @@ NORMALIZERS: dict[str, Callable[[list[str]], list[str]]] = {
     "explain_operator_counters": normalize_explain_operator_counters,
     "explain_summary_timing": normalize_explain_summary_timing,
     "explain_runtime_bytes": normalize_explain_runtime_bytes,
+    "explain_adaptive_runtime": normalize_explain_adaptive_runtime,
     "explain_routine_ids": normalize_explain_routine_ids,
     "explain_search_ids": normalize_explain_search_ids,
     "explain_external_runtime": normalize_explain_external_runtime,
@@ -275,6 +299,7 @@ __all__ = [
     "normalize_explain_operator_counters",
     "normalize_explain_operator_timing",
     "normalize_copy_rowcount",
+    "normalize_explain_adaptive_runtime",
     "normalize_explain_external_runtime",
     "normalize_explain_routine_ids",
     "normalize_explain_runtime",

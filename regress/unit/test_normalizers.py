@@ -140,6 +140,30 @@ def test_apply_explain_runtime_bytes_normalizer_rewrites_only_target_fields() ->
     ]
 
 
+def test_apply_explain_adaptive_runtime_preserves_fields_not_heuristic_values() -> None:
+    lines = [
+        (
+            "HASH_AGGREGATE_BUILD (aggregate_hash_full_key_fallback_count=2 "
+            "aggregate_hash_max_prefix_probe_distance=79 repartition_depth=1)"
+        ),
+        (
+            '{"actual":{"aggregate_hash_full_key_fallback_count":2,'
+            '"aggregate_hash_max_prefix_probe_distance":79,"rows":4}}'
+        ),
+    ]
+
+    assert apply_normalizers(lines, ("explain_adaptive_runtime",)) == [
+        (
+            "HASH_AGGREGATE_BUILD (aggregate_hash_full_key_fallback_count=<adaptive> "
+            "aggregate_hash_max_prefix_probe_distance=<adaptive> repartition_depth=1)"
+        ),
+        (
+            '{"actual":{"aggregate_hash_full_key_fallback_count": "<adaptive>",'
+            '"aggregate_hash_max_prefix_probe_distance": "<adaptive>","rows":4}}'
+        ),
+    ]
+
+
 def test_apply_explain_routine_ids_normalizer_rewrites_catalog_ids_only() -> None:
     lines = [
         "Routines: py_explain[10315@1]",
@@ -319,6 +343,7 @@ def test_normalizer_profiles_returns_registered_names() -> None:
         "explain_operator_counters",
         "explain_summary_timing",
         "explain_runtime_bytes",
+        "explain_adaptive_runtime",
         "explain_routine_ids",
         "explain_search_ids",
         "explain_external_runtime",

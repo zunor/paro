@@ -45,10 +45,15 @@ SET temp_directory = '/tmp/paro_regress_spill_h';
 
 SET force_external = true;
 
+-- Pin the execution width: adaptive aggregate telemetry legitimately differs
+-- between single-worker prefix fallback and multi-worker radix partitioning.
+-- This case verifies spill observability, not the machine's default width.
+SET threads = 1;
+
 -- @normalize explain_operator_timing,explain_summary_timing,explain_runtime_bytes
 EXPLAIN ANALYZE SELECT id FROM spill_h_sort ORDER BY id DESC;
 
--- @normalize explain_operator_timing,explain_summary_timing,explain_runtime_bytes
+-- @normalize explain_operator_timing,explain_summary_timing,explain_runtime_bytes,explain_adaptive_runtime
 EXPLAIN ANALYZE
 SELECT k1, k2, SUM(v)
 FROM spill_h_agg
@@ -70,6 +75,8 @@ SET force_external = true;
 EXPLAIN ANALYZE SELECT id FROM spill_h_sort ORDER BY id DESC;
 
 SET force_external = DEFAULT;
+
+SET threads = DEFAULT;
 
 SET max_temp_directory_size = DEFAULT;
 SET memory_limit = DEFAULT;

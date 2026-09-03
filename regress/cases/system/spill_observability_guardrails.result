@@ -24,6 +24,9 @@ SET
 SET force_external = true;
 SET
 
+SET threads = 1;
+SET
+
 -- @normalize explain_operator_timing,explain_summary_timing,explain_runtime_bytes
 EXPLAIN ANALYZE SELECT id FROM spill_h_sort ORDER BY id DESC;
 QUERY PLAN
@@ -39,7 +42,7 @@ MEMORY_PROFILE grant_bytes=<bytes> revoked_bytes=<bytes> revocable_bytes=<bytes>
 Execution Time: <time-ms>
 Rows Returned: 10000
 
--- @normalize explain_operator_timing,explain_summary_timing,explain_runtime_bytes
+-- @normalize explain_operator_timing,explain_summary_timing,explain_runtime_bytes,explain_adaptive_runtime
 EXPLAIN ANALYZE
 SELECT k1, k2, SUM(v)
 FROM spill_h_agg
@@ -47,7 +50,7 @@ GROUP BY k1, k2;
 QUERY PLAN
 PIPELINE 0
   SOURCE #0 ROWSET_SCAN (actual time=<time-range> rows=200000 loops=<loops>)
-  SINK #1 HASH_AGGREGATE_BUILD (actual time=<time-range> rows=200000 loops=<loops> spilled=true spilled_bytes=<bytes> repartition_depth=1)
+  SINK #1 HASH_AGGREGATE_BUILD (actual time=<time-range> rows=200000 loops=<loops> spilled=true spilled_bytes=<bytes> aggregate_hash_full_key_fallback_count=<adaptive> aggregate_hash_max_prefix_probe_distance=<adaptive> repartition_depth=1)
 PIPELINE 1
   SOURCE #2 HASH_AGGREGATE_EMIT (actual time=<time-range> rows=200000 loops=<loops>)
   TRANSFORM #3 PROJECTION (actual time=<time-range> rows=200000 loops=<loops>)
@@ -110,6 +113,9 @@ Execution Time: <time-ms>
 Rows Returned: 10000
 
 SET force_external = DEFAULT;
+SET
+
+SET threads = DEFAULT;
 SET
 
 SET max_temp_directory_size = DEFAULT;

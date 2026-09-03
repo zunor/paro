@@ -18,7 +18,7 @@ SET force_external = true;
 SET use_new_agg_spill = true;
 SET threads = 1;
 
--- @normalize explain_operator_timing,explain_summary_timing,explain_runtime_bytes
+-- @normalize explain_operator_timing,explain_summary_timing,explain_runtime_bytes,explain_adaptive_runtime
 EXPLAIN ANALYZE
 SELECT k1, k2, SUM(v) AS sum_v
 FROM agg_phasee_spill
@@ -36,7 +36,7 @@ FROM (
 ) AS agg_phasee_having;
 
 SET max_temp_directory_size = '64MB';
--- @normalize explain_operator_timing,explain_summary_timing,explain_runtime_bytes
+-- @normalize explain_operator_timing,explain_summary_timing,explain_runtime_bytes,explain_adaptive_runtime
 EXPLAIN ANALYZE
 SELECT k1, k2, SUM(v) AS sum_v
 FROM agg_phasee_spill
