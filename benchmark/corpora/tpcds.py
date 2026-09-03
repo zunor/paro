@@ -1,4 +1,7 @@
 #!/usr/bin/env python3
+# Copyright 2024-2026 Zunor
+# SPDX-License-Identifier: Apache-2.0
+
 """Execute the DuckDB TPC-DS corpus against Paro and verify every row multiset."""
 
 from __future__ import annotations

@@ -1,4 +1,7 @@
 #!/usr/bin/env python3
+# Copyright 2024-2026 Zunor
+# SPDX-License-Identifier: Apache-2.0
+
 """Run evidence-grade, fresh-process Paro/DuckDB TPC-DS comparisons."""
 
 from __future__ import annotations
@@ -413,7 +416,12 @@ def main() -> int:
         try:
             oracle_log = args.report.with_suffix(f".q{query_id}.oracle.parod.log")
             oracle_server = ManagedParoServer(
-                server_binary, args.server_data_dir, args.listen, oracle_log
+                server_binary,
+                args.server_data_dir,
+                args.listen,
+                oracle_log,
+                max_memory=args.memory_limit,
+                threads=args.threads,
             )
             with oracle_server, DuckDBProcess(
                 args.duckdb_database, args.threads, args.memory_limit
@@ -472,7 +480,12 @@ def main() -> int:
                     f".q{query_id}.block{block_number:03d}.parod.log"
                 )
                 block_server = ManagedParoServer(
-                    server_binary, args.server_data_dir, args.listen, block_log
+                    server_binary,
+                    args.server_data_dir,
+                    args.listen,
+                    block_log,
+                    max_memory=args.memory_limit,
+                    threads=args.threads,
                 )
                 with block_server, DuckDBProcess(
                     args.duckdb_database, args.threads, args.memory_limit

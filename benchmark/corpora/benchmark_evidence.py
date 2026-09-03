@@ -1,4 +1,7 @@
 #!/usr/bin/env python3
+# Copyright 2024-2026 Zunor
+# SPDX-License-Identifier: Apache-2.0
+
 """Reproducibility and paired-statistics helpers for corpus benchmarks."""
 
 from __future__ import annotations
@@ -201,11 +204,16 @@ class ManagedParoServer:
         data_dir: Path,
         listen: str,
         log_path: Path,
+        *,
+        max_memory: str,
+        threads: int,
     ) -> None:
         self.binary = binary.resolve()
         self.data_dir = data_dir.resolve()
         self.listen = listen
         self.log_path = log_path.resolve()
+        self.max_memory = max_memory
+        self.threads = max(1, threads)
         self.process: subprocess.Popen[bytes] | None = None
         self._log = None
         self._started_ns: int | None = None
@@ -233,6 +241,10 @@ class ManagedParoServer:
                 str(self.data_dir),
                 "--listen",
                 self.listen,
+                "--max-memory",
+                self.max_memory,
+                "--threads",
+                str(self.threads),
                 "--log-level",
                 "warn",
             ],

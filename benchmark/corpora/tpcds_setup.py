@@ -1,4 +1,7 @@
 #!/usr/bin/env python3
+# Copyright 2024-2026 Zunor
+# SPDX-License-Identifier: Apache-2.0
+
 """Load TPC-DS CSV data with its generator-guaranteed keys declared to Paro."""
 
 from __future__ import annotations

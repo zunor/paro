@@ -1,4 +1,7 @@
 #!/usr/bin/env python3
+# Copyright 2024-2026 Zunor
+# SPDX-License-Identifier: Apache-2.0
+
 """Typed result and peer-order contracts for cross-engine TPC-DS checks."""
 
 from __future__ import annotations
