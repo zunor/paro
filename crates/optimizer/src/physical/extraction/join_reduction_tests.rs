@@ -13,7 +13,7 @@ use paro_planner::expression::{
     ComparisonExpression, ComparisonType, ConstantExpression, Expression, ReferenceExpression,
 };
 use paro_planner::operator::join::{ComparisonJoin, JoinComparisonType, JoinCondition, JoinType};
-use paro_planner::operator::{Filter, Get, Join, LogicalOperator, Projection};
+use paro_planner::operator::{Filter, Get, Join, LogicalOperator, Projection, Window};
 use paro_planner::plan::LogicalPlan;
 
 use super::{
@@ -102,6 +102,79 @@ fn unique_build_proof_resolves_physical_references_through_carriers() {
     assert!(hash_join_build_keys_are_declared_unique(
         &projection,
         &conditions
+    ));
+}
+
+#[test]
+fn unique_build_proof_propagates_through_windows() {
+    let ctx = BindContext::new();
+    let get = declared_unique_get(&ctx);
+    let window = LogicalPlan::new(
+        &ctx,
+        LogicalOperator::Window(Window::new(9, Vec::new(), get)),
+    );
+    let conditions = [JoinCondition::new(
+        Expression::Reference(ReferenceExpression::new(0, LogicalType::Varchar)),
+        Expression::Reference(ReferenceExpression::new(1, LogicalType::BigInt)),
+        JoinComparisonType::Equal,
+    )];
+
+    assert!(hash_join_build_keys_are_declared_unique(
+        &window,
+        &conditions
+    ));
+}
+
+#[test]
+fn unique_build_proof_requires_a_key_preserving_join() {
+    let ctx = BindContext::new();
+    let mut left = declared_unique_get(&ctx);
+    let LogicalOperator::Get(left_get) = &mut left.operator else {
+        unreachable!("test source is a get")
+    };
+    left_get.table_index = 6;
+    let right = declared_unique_get(&ctx);
+    let mut multiplicative = ComparisonJoin::new(JoinType::Inner, left, right, Vec::new());
+    multiplicative.left_projection_map = vec![1].into();
+    multiplicative.right_projection_map = vec![1].into();
+    let multiplicative = LogicalPlan::new(
+        &ctx,
+        LogicalOperator::Join(Join::Comparison(multiplicative)),
+    );
+    let outer_conditions = [JoinCondition::new(
+        Expression::Reference(ReferenceExpression::new(0, LogicalType::BigInt)),
+        Expression::Reference(ReferenceExpression::new(0, LogicalType::BigInt)),
+        JoinComparisonType::Equal,
+    )];
+    assert!(!hash_join_build_keys_are_declared_unique(
+        &multiplicative,
+        &outer_conditions
+    ));
+
+    let mut left = declared_unique_get(&ctx);
+    let LogicalOperator::Get(left_get) = &mut left.operator else {
+        unreachable!("test source is a get")
+    };
+    left_get.table_index = 6;
+    let right = declared_unique_get(&ctx);
+    let join_conditions = vec![JoinCondition::new(
+        Expression::ColumnRef(paro_planner::expression::ColumnRefExpression::new(
+            paro_planner::operator::ColumnBinding::new(6, 1),
+            LogicalType::BigInt,
+        )),
+        Expression::ColumnRef(paro_planner::expression::ColumnRefExpression::new(
+            paro_planner::operator::ColumnBinding::new(7, 1),
+            LogicalType::BigInt,
+        )),
+        JoinComparisonType::Equal,
+    )];
+    let mut preserving = ComparisonJoin::new(JoinType::Inner, left, right, join_conditions);
+    preserving.left_projection_map = vec![1].into();
+    preserving.right_projection_map = vec![1].into();
+    let preserving = LogicalPlan::new(&ctx, LogicalOperator::Join(Join::Comparison(preserving)));
+    assert!(hash_join_build_keys_are_declared_unique(
+        &preserving,
+        &outer_conditions
     ));
 }
 

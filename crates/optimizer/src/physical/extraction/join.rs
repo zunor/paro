@@ -1477,48 +1477,26 @@ fn partition_hash_join_conditions(
     (keys.into_boxed_slice(), residuals.into_boxed_slice())
 }
 
-/// Prove uniqueness from the declared build relation rather than inferring it
-/// from sampled cardinalities. Filters preserve a base table's key; other
-/// operators must explicitly propagate keys before they can enter this path.
+/// Prove build-key uniqueness from the current relational output rather than
+/// tracing a column back to a base-table declaration. The shared proof tracks
+/// duplicate-preserving projections, windows, aggregates, and key-preserving
+/// joins; ordinary equality supplies the required NULL rejection.
 fn hash_join_build_keys_are_declared_unique(
     build: &LogicalPlan,
     key_conditions: &[JoinCondition],
 ) -> bool {
-    let build_keys = key_conditions
-        .iter()
-        .map(|condition| {
-            (condition.comparison == JoinComparisonType::Equal)
-                .then(|| resolve_base_get_column(build, &condition.right))?
-        })
-        .collect::<Option<Vec<_>>>();
-    let Some(build_keys) = build_keys.filter(|keys| !keys.is_empty()) else {
-        return false;
-    };
-    let (get, _) = build_keys[0];
-    if build_keys
-        .iter()
-        .any(|(candidate, _)| candidate.table_index != get.table_index)
+    if key_conditions.is_empty()
+        || key_conditions
+            .iter()
+            .any(|condition| condition.comparison != JoinComparisonType::Equal)
     {
         return false;
     }
-    let Some(table) = &get.table else {
-        return false;
-    };
-    let build_key_columns = build_keys
+    let expressions = key_conditions
         .iter()
-        .map(|(_, column_id)| *column_id)
-        .collect::<std::collections::HashSet<_>>();
-    table.constraints().iter().any(|constraint| {
-        matches!(
-            constraint.constraint_type,
-            paro_catalog::entry::ConstraintType::Unique
-                | paro_catalog::entry::ConstraintType::PrimaryKey
-        ) && !constraint.columns.is_empty()
-            && constraint
-                .columns
-                .iter()
-                .all(|column| build_key_columns.contains(column))
-    })
+        .map(|condition| &condition.right)
+        .collect::<Vec<_>>();
+    crate::statistics::unique_keys::expressions_cover_unique_key(build, &expressions)
 }
 
 /// Produce a speculative execution hint from the current storage snapshot.

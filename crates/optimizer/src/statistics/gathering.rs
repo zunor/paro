@@ -891,38 +891,19 @@ fn estimate_unique_dimension_join(
     let left_key = expression_binding(&condition.left, left_layout.bindings())?;
     let right_key = expression_binding(&condition.right, right_layout.bindings())?;
 
-    if plan_has_single_column_unique_key(&join.right, right_key, right_layout) {
+    if plan_has_single_column_unique_key(&join.right, right_key) {
         return unique_lookup_estimate(left, right, left_key, ctx);
     }
-    if plan_has_single_column_unique_key(&join.left, left_key, left_layout) {
+    if plan_has_single_column_unique_key(&join.left, left_key) {
         return unique_lookup_estimate(right, left, right_key, ctx);
     }
     None
 }
 
-fn plan_has_single_column_unique_key(
-    mut plan: &LogicalPlan,
-    binding: ColumnBinding,
-    output_layout: &LogicalOutputLayout,
-) -> bool {
-    // A Filter can project away unrelated payload without weakening a
-    // retained declared key. Once the root layout proves that this binding
-    // survived, every pass-through Filter below it must also have retained
-    // that same binding identity; walk the chain without re-deriving schemas.
-    if !output_layout.bindings().contains(&binding) {
-        return false;
-    }
-    loop {
-        match &plan.operator {
-            LogicalOperator::Get(get) => {
-                return crate::statistics::unique_keys::declared_unique_keys(get)
-                    .iter()
-                    .any(|key| key.bindings.as_slice() == [binding]);
-            }
-            LogicalOperator::Filter(filter) => plan = filter.child.as_ref(),
-            _ => return false,
-        }
-    }
+fn plan_has_single_column_unique_key(plan: &LogicalPlan, binding: ColumnBinding) -> bool {
+    crate::statistics::unique_keys::proven_unique_keys(plan)
+        .iter()
+        .any(|key| key.as_slice() == [binding])
 }
 
 fn unique_lookup_estimate(
@@ -1234,7 +1215,16 @@ fn aggregate_expression_statistics(
         "count" | "count_star" => Arc::new(ColumnStatistics::new(BaseStatistics::new(
             LogicalType::BigInt,
         ))),
-        "min" | "max" if agg.children.len() == 1 => expression_statistics(&agg.children[0], ctx),
+        "min" | "max" | "first" | "last" | "first_value" | "last_value" | "any_value"
+        | "arbitrary"
+            if agg.children.len() == 1 =>
+        {
+            // These aggregates can only publish a value drawn from their
+            // input domain. Preserve that domain for downstream equality and
+            // range estimates; relational cardinality still caps the number
+            // of values a grouped/scalar result can expose.
+            expression_statistics(&agg.children[0], ctx)
+        }
         _ => ColumnStatistics::create_unknown(agg.return_type.clone()),
     }
 }
@@ -2189,6 +2179,34 @@ mod tests {
             estimate_group_distinct(&column_ref(1, 0), &ctx, 4_096, 4_096),
             (1, Some(1))
         );
+    }
+
+    #[test]
+    fn value_selecting_aggregate_preserves_its_input_domain_statistics() {
+        let bind_context = BindContext::new();
+        let session = make_test_session();
+        let mut ctx = OptimizationContext::new(session, bind_context);
+        let binding = ColumnBinding::new(1, 0);
+        let mut input = ColumnStatistics::new(BaseStatistics::from_constant(&Value::BigInt(7)));
+        input.update_distinct_statistics(&[11, 29, 47], 3);
+        ctx.column_stats.insert(binding, Arc::new(input));
+        let (function, target_types) =
+            paro_function::aggregate::distributive::first_last::get_first_function()
+                .bind(&[LogicalType::BigInt])
+                .expect("bind FIRST");
+        assert_eq!(target_types, vec![LogicalType::BigInt]);
+        let return_type = function.return_type.clone();
+        let expression = Expression::Aggregate(paro_planner::expression::AggregateExpression::new(
+            function,
+            vec![column_ref(1, 0)],
+            return_type,
+        ));
+
+        let output = aggregate_expression_statistics(&expression, &ctx);
+
+        assert_eq!(output.get_distinct_count(), 3);
+        assert_eq!(output.statistics().min_value(), Some(Value::BigInt(7)));
+        assert_eq!(output.statistics().max_value(), Some(Value::BigInt(7)));
     }
 
     #[test]
