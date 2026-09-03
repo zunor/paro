@@ -31,7 +31,8 @@ impl GraphMatchDecompose {
     /// Optimize the plan by recursively decomposing any `GraphMatch` nodes.
     #[cfg(test)]
     pub(crate) fn optimize(&mut self, plan: LogicalOperator) -> LogicalOperator {
-        self.optimize_plan(LogicalPlan::synthetic(plan)).operator
+        self.optimize_plan(LogicalPlan::synthetic(plan))
+            .into_operator()
     }
 
     pub fn optimize_plan(&mut self, plan: LogicalPlan) -> LogicalPlan {
@@ -40,13 +41,14 @@ impl GraphMatchDecompose {
 
     fn rewrite_plan(&mut self, plan: LogicalPlan) -> LogicalPlan {
         plan.try_map_post_order(|plan| {
-            let operator = match plan.operator {
+            let (id, stats, operator) = plan.into_parts();
+            let operator = match operator {
                 LogicalOperator::GraphMatch(gm) => self.decompose(gm),
                 other => other,
             };
             Ok(LogicalPlan {
-                id: plan.id,
-                stats: plan.stats,
+                id,
+                stats,
                 operator,
             })
         })

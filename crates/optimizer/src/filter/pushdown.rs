@@ -79,11 +79,7 @@ impl FilterPushdown {
     ///
     /// Returns the optimized operator tree.
     pub fn rewrite_plan(&mut self, plan: LogicalPlan) -> LogicalPlan {
-        let LogicalPlan {
-            id,
-            stats,
-            operator,
-        } = plan;
+        let (id, stats, operator) = plan.into_parts();
         LogicalPlan {
             id,
             stats,
@@ -203,7 +199,7 @@ impl FilterPushdown {
             .expect("FilterPushdown child rewrite cannot fail");
 
         // Add any remaining filters
-        self.push_final_filters(plan.operator)
+        self.push_final_filters(plan.into_operator())
     }
 
     fn pushdown_materialized_cte(
@@ -238,13 +234,13 @@ impl FilterPushdown {
             let result = self.add_filter(expr);
             if result == FilterResult::Unsatisfiable {
                 // Filter is unsatisfiable - return empty result
-                return Self::empty_result(*filter.child).operator;
+                return Self::empty_result(*filter.child).into_operator();
             }
         }
 
         // Generate filters and continue pushing down
         self.generate_filters();
-        self.rewrite_plan(*filter.child).operator
+        self.rewrite_plan(*filter.child).into_operator()
     }
 
     /// Push down through a Projection operator.
@@ -1091,7 +1087,7 @@ impl FilterPushdown {
                 return Self::empty_result(LogicalPlan::synthetic(LogicalOperator::SetOperation(
                     setop,
                 )))
-                .operator;
+                .into_operator();
             }
         }
 

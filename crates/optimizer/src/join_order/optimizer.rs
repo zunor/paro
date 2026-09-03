@@ -216,7 +216,7 @@ impl JoinOrderOptimizer {
             &HashMap::new(),
             bind_context,
         )
-        .map(|plan| plan.operator)
+        .map(LogicalPlan::into_operator)
     }
 
     pub fn optimize_plan(
@@ -688,11 +688,11 @@ impl JoinOrderOptimizer {
     fn extract_comparison_join_filters(join: &ComparisonJoin, filters: &mut Vec<ExtractedFilter>) {
         let expressions = join.conditions.iter().map(|condition| {
             let expression =
-                Expression::Comparison(paro_planner::expression::ComparisonExpression {
-                    left: Box::new(condition.left.clone()),
-                    right: Box::new(condition.right.clone()),
-                    comparison_type: Self::to_comparison_type(condition.comparison),
-                });
+                Expression::Comparison(paro_planner::expression::ComparisonExpression::new(
+                    Self::to_comparison_type(condition.comparison),
+                    condition.left.clone(),
+                    condition.right.clone(),
+                ));
             expression
         });
         if matches!(join.join_type, JoinType::Semi | JoinType::Anti) {
@@ -2237,7 +2237,7 @@ mod tests {
             "final build/probe orientation must retain the side priced by DP"
         );
 
-        let LogicalOperator::Join(Join::Comparison(root)) = optimized.operator else {
+        let LogicalOperator::Join(Join::Comparison(root)) = &optimized.operator else {
             panic!("expected comparison join root");
         };
 
@@ -2287,7 +2287,7 @@ mod tests {
         let optimized = JoinOrderOptimizer::new()
             .optimize_plan(&session, plan, &HashMap::new(), &bind_context)
             .expect("join order optimization should succeed");
-        let LogicalOperator::Join(Join::Comparison(root)) = optimized.operator else {
+        let LogicalOperator::Join(Join::Comparison(root)) = &optimized.operator else {
             panic!("expected comparison join root")
         };
 
@@ -2344,7 +2344,7 @@ mod tests {
             .optimize_plan(&session, plan, &HashMap::new(), &bind_context)
             .expect("join-order optimization should succeed");
         let physical = BuildProbeSideOptimizer::new(Arc::clone(&session)).optimize_plan(optimized);
-        let LogicalOperator::Join(Join::Comparison(root)) = physical.operator else {
+        let LogicalOperator::Join(Join::Comparison(root)) = &physical.operator else {
             panic!("expected reduction join root")
         };
         assert_eq!(root.join_type, JoinType::Semi);
@@ -2373,7 +2373,7 @@ mod tests {
             .optimize_plan(&session, plan, &HashMap::new(), &bind_context)
             .expect("join-order optimization should succeed");
         let physical = BuildProbeSideOptimizer::new(Arc::clone(&session)).optimize_plan(optimized);
-        let LogicalOperator::Join(Join::Comparison(root)) = physical.operator else {
+        let LogicalOperator::Join(Join::Comparison(root)) = &physical.operator else {
             panic!("expected reduction join root")
         };
         assert_eq!(root.join_type, JoinType::RightSemi);

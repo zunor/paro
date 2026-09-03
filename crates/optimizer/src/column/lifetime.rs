@@ -30,11 +30,7 @@ impl ColumnLifetimeAnalyzer {
     }
 
     fn optimize_plan(&mut self, plan: LogicalPlan) -> Result<LogicalPlan> {
-        let LogicalPlan {
-            id,
-            stats,
-            operator,
-        } = plan;
+        let (id, stats, operator) = plan.into_parts();
         let operator = match operator {
             LogicalOperator::Projection(mut proj) => {
                 let mut child_analyzer = ColumnLifetimeAnalyzer::new(false);
@@ -512,7 +508,7 @@ mod tests {
         let plan = LogicalPlan::new(&ctx, LogicalOperator::Join(Join::Comparison(join)));
 
         let optimized = ColumnLifetimeAnalyzer::new(true).optimize(plan).unwrap();
-        let LogicalOperator::Join(Join::Comparison(join)) = optimized.operator else {
+        let LogicalOperator::Join(Join::Comparison(join)) = &optimized.operator else {
             panic!("expected comparison join");
         };
         assert_eq!(join.right_projection_map.as_columns(), Some(&[0][..]));
@@ -570,10 +566,10 @@ mod tests {
         );
 
         let optimized = ColumnLifetimeAnalyzer::new(true).optimize(plan).unwrap();
-        let LogicalOperator::Projection(projection) = optimized.operator else {
+        let LogicalOperator::Projection(projection) = &optimized.operator else {
             panic!("expected projection");
         };
-        let LogicalOperator::Join(Join::Comparison(join)) = projection.child.operator else {
+        let LogicalOperator::Join(Join::Comparison(join)) = &projection.child.operator else {
             panic!("expected comparison join");
         };
         assert_eq!(join.left_projection_map.as_columns(), Some(&[1][..]));
@@ -668,13 +664,13 @@ mod tests {
         );
 
         let optimized = ColumnLifetimeAnalyzer::new(true).optimize(plan).unwrap();
-        let LogicalOperator::Projection(projection) = optimized.operator else {
+        let LogicalOperator::Projection(projection) = &optimized.operator else {
             panic!("expected projection");
         };
-        let LogicalOperator::Window(window) = projection.child.operator else {
+        let LogicalOperator::Window(window) = &projection.child.operator else {
             panic!("expected window");
         };
-        let LogicalOperator::Join(Join::Comparison(join)) = window.child.operator else {
+        let LogicalOperator::Join(Join::Comparison(join)) = &window.child.operator else {
             panic!("expected comparison join");
         };
         assert_eq!(join.left_projection_map.as_columns(), Some(&[0, 1][..]));
@@ -717,7 +713,7 @@ mod tests {
         );
 
         let optimized = ColumnLifetimeAnalyzer::new(true).optimize(plan).unwrap();
-        let LogicalOperator::Join(Join::Comparison(join)) = optimized.operator else {
+        let LogicalOperator::Join(Join::Comparison(join)) = &optimized.operator else {
             panic!("expected comparison join");
         };
         assert_eq!(join.left_projection_map.to_indices(1), vec![0]);
@@ -764,10 +760,10 @@ mod tests {
         );
 
         let optimized = ColumnLifetimeAnalyzer::new(true).optimize(plan).unwrap();
-        let LogicalOperator::Projection(projection) = optimized.operator else {
+        let LogicalOperator::Projection(projection) = &optimized.operator else {
             panic!("expected projection");
         };
-        let LogicalOperator::Order(order) = projection.child.operator else {
+        let LogicalOperator::Order(order) = &projection.child.operator else {
             panic!("expected order");
         };
         assert_eq!(order.projection_map.as_columns(), Some(&[1][..]));
@@ -815,10 +811,10 @@ mod tests {
         );
 
         let optimized = ColumnLifetimeAnalyzer::new(true).optimize(plan).unwrap();
-        let LogicalOperator::Projection(projection) = optimized.operator else {
+        let LogicalOperator::Projection(projection) = &optimized.operator else {
             panic!("expected projection");
         };
-        let LogicalOperator::Filter(filter) = projection.child.operator else {
+        let LogicalOperator::Filter(filter) = &projection.child.operator else {
             panic!("expected filter");
         };
         assert_eq!(filter.projection_map.as_columns(), Some(&[1][..]));

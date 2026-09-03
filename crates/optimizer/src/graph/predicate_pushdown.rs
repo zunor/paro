@@ -46,7 +46,8 @@ impl GraphPredicatePushdown {
 
     #[cfg(test)]
     fn optimize(&mut self, plan: LogicalOperator) -> LogicalOperator {
-        self.optimize_plan(LogicalPlan::synthetic(plan)).operator
+        self.optimize_plan(LogicalPlan::synthetic(plan))
+            .into_operator()
     }
 
     pub fn optimize_plan(&mut self, plan: LogicalPlan) -> LogicalPlan {
@@ -89,7 +90,7 @@ impl GraphPredicatePushdown {
     ///
     /// Remaps predicates through the Projection, then pushes into graph operators.
     fn pushdown_through_graph_projection(&mut self, filter: Filter) -> LogicalOperator {
-        let proj = match filter.child.operator {
+        let proj = match (*filter.child).into_operator() {
             LogicalOperator::Projection(p) => p,
             _ => unreachable!(),
         };
@@ -182,7 +183,7 @@ impl GraphPredicatePushdown {
         }
 
         if remaining.is_empty() {
-            graph_chain.operator
+            graph_chain.into_operator()
         } else {
             LogicalOperator::Filter(Filter::new(graph_chain, remaining))
         }
@@ -673,19 +674,19 @@ mod tests {
 
     #[test]
     fn test_cross_variable_predicate_stays_above() {
-        // Filter(a.age > b.age) — references both table_index=10 and table_index=12
+        // Filter(a.name > b.name) — references both table_index=10 and table_index=12
         // This can't be pushed into a single operator, so it stays as a Filter
         let plan = build_one_hop_plan();
 
-        // Build a.age > b.age: but we need to reference through the projection.
-        // Output col 1 = a.age (table_index=10, col 2)
+        // Build a.name > b.name through the projection.
+        // Output col 0 = a.name (table_index=10, col 1)
         // Output col 2 = b.name (table_index=12, col 1)
-        // Let's make a predicate that after remapping references both table 10 and 12
+        // After remapping, the predicate references both table 10 and 12.
         let cross_pred = Expression::Comparison(ComparisonExpression::new(
             ComparisonType::GreaterThan,
             Expression::ColumnRef(ColumnRefExpression::new(
-                ColumnBinding::new(100, 1), // a.age
-                LogicalType::Integer,
+                ColumnBinding::new(100, 0), // a.name
+                LogicalType::Varchar,
             )),
             Expression::ColumnRef(ColumnRefExpression::new(
                 ColumnBinding::new(100, 2), // b.name

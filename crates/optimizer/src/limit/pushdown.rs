@@ -18,7 +18,8 @@ impl LimitPushdown {
 
     #[cfg(test)]
     fn optimize(&mut self, plan: LogicalOperator) -> LogicalOperator {
-        self.optimize_plan(LogicalPlan::synthetic(plan)).operator
+        self.optimize_plan(LogicalPlan::synthetic(plan))
+            .into_operator()
     }
 
     pub fn optimize_plan(&mut self, plan: LogicalPlan) -> LogicalPlan {
@@ -89,11 +90,7 @@ impl LimitPushdown {
     }
 
     fn apply_optimization(&mut self, plan: LogicalPlan) -> LogicalPlan {
-        let LogicalPlan {
-            id,
-            stats,
-            operator,
-        } = plan;
+        let (id, stats, operator) = plan.into_parts();
         let LogicalOperator::Limit(mut limit) = operator else {
             return LogicalPlan {
                 id,
@@ -103,11 +100,7 @@ impl LimitPushdown {
         };
 
         let child_plan = *limit.child;
-        let LogicalPlan {
-            id: child_id,
-            stats: child_stats,
-            operator: child_operator,
-        } = child_plan;
+        let (child_id, child_stats, child_operator) = child_plan.into_parts();
         let LogicalOperator::Projection(mut projection) = child_operator else {
             limit.child = Box::new(LogicalPlan {
                 id: child_id,

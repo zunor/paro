@@ -20,11 +20,7 @@ impl InClauseRewriter {
     }
 
     fn rewrite_current(&mut self, plan: LogicalPlan) -> LogicalPlan {
-        let LogicalPlan {
-            id,
-            stats,
-            operator,
-        } = plan;
+        let (id, stats, operator) = plan.into_parts();
         let operator = match operator {
             LogicalOperator::Filter(filter) => LogicalOperator::Filter(self.rewrite_filter(filter)),
             LogicalOperator::Projection(projection) => {
@@ -376,7 +372,7 @@ mod tests {
             .rewrite(plan)
             .expect("rewrite succeeds");
 
-        let LogicalOperator::Filter(filter) = rewritten.operator else {
+        let LogicalOperator::Filter(filter) = &rewritten.operator else {
             panic!("expected filter");
         };
         assert!(matches!(
@@ -411,7 +407,7 @@ mod tests {
             .rewrite(plan)
             .expect("rewrite succeeds");
 
-        let LogicalOperator::Filter(filter) = rewritten.operator else {
+        let LogicalOperator::Filter(filter) = &rewritten.operator else {
             panic!("expected filter");
         };
         assert!(filter.projection_map.is_identity(1));
@@ -421,7 +417,7 @@ mod tests {
         assert_eq!(operator.operator_type, OperatorType::In);
         assert_eq!(operator.children.len(), 6);
         assert!(matches!(
-            filter.child.operator,
+            &filter.child.operator,
             LogicalOperator::ExpressionGet(_)
         ));
     }
@@ -450,7 +446,7 @@ mod tests {
             .rewrite(plan)
             .expect("rewrite succeeds");
 
-        let LogicalOperator::Join(Join::Any(join)) = rewritten.operator else {
+        let LogicalOperator::Join(Join::Any(join)) = &rewritten.operator else {
             panic!("expected any join");
         };
         let Expression::Operator(operator) = &join.condition else {

@@ -44,11 +44,7 @@ impl ReorderFilter {
         plan: LogicalPlan,
         ctx: &OptimizationContext,
     ) -> (LogicalPlan, bool) {
-        let LogicalPlan {
-            id,
-            stats,
-            operator,
-        } = plan;
+        let (id, stats, operator) = plan.into_parts();
         let (operator, changed) = match operator {
             LogicalOperator::Filter(mut filter) => {
                 let original = filter.expressions;
@@ -214,7 +210,7 @@ mod tests {
             .rewrite(plan, &ctx)
             .expect("rewrite succeeds");
 
-        let LogicalOperator::Filter(filter) = rewritten.operator else {
+        let LogicalOperator::Filter(filter) = &rewritten.operator else {
             panic!("expected filter");
         };
         assert!(filter.expressions[0].equals(&equality_predicate));
@@ -256,10 +252,10 @@ mod tests {
         let (rewritten, changed) = ReorderFilter::new().reorder_node(plan, &ctx);
 
         assert!(!changed);
-        let LogicalOperator::Filter(parent) = rewritten.operator else {
+        let LogicalOperator::Filter(parent) = &rewritten.operator else {
             panic!("expected parent filter");
         };
-        let LogicalOperator::Filter(child) = parent.child.operator else {
+        let LogicalOperator::Filter(child) = &parent.child.operator else {
             panic!("expected child filter");
         };
         assert!(child.expressions[0].equals(&range_predicate));
@@ -303,7 +299,7 @@ mod tests {
             .rewrite(plan, &ctx)
             .expect("rewrite succeeds");
 
-        let LogicalOperator::Filter(filter) = rewritten.operator else {
+        let LogicalOperator::Filter(filter) = &rewritten.operator else {
             panic!("expected filter");
         };
         assert!(filter.expressions[0].equals(&range_predicate));

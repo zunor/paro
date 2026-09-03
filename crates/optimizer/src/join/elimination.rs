@@ -50,11 +50,7 @@ impl JoinElimination {
         plan: LogicalPlan,
         required_bindings: &HashSet<ColumnBinding>,
     ) -> LogicalPlan {
-        let LogicalPlan {
-            id,
-            stats,
-            operator,
-        } = plan;
+        let (id, stats, operator) = plan.into_parts();
         let operator = match operator {
             LogicalOperator::Filter(mut filter) => {
                 let mut child_required =
@@ -283,12 +279,12 @@ impl JoinElimination {
                 if self.can_eliminate_right_side(&comparison, required_bindings) {
                     let left = *comparison.left;
                     self.changed = true;
-                    return left.operator;
+                    return left.into_operator();
                 }
                 if self.can_eliminate_left_side(&comparison, required_bindings) {
                     let right = *comparison.right;
                     self.changed = true;
-                    return right.operator;
+                    return right.into_operator();
                 }
 
                 LogicalOperator::Join(Join::Comparison(comparison))
@@ -675,7 +671,7 @@ mod tests {
         );
 
         let optimized = JoinElimination::new().optimize(LogicalPlan::synthetic(plan));
-        let LogicalOperator::Projection(projection) = optimized.operator else {
+        let LogicalOperator::Projection(projection) = &optimized.operator else {
             panic!("expected projection");
         };
         let LogicalOperator::Get(get) = &projection.child.operator else {
@@ -704,7 +700,7 @@ mod tests {
         );
 
         let optimized = JoinElimination::new().optimize(LogicalPlan::synthetic(plan));
-        let LogicalOperator::Projection(projection) = optimized.operator else {
+        let LogicalOperator::Projection(projection) = &optimized.operator else {
             panic!("expected projection");
         };
         assert!(matches!(
@@ -733,7 +729,7 @@ mod tests {
         );
 
         let optimized = JoinElimination::new().optimize(LogicalPlan::synthetic(plan));
-        let LogicalOperator::Projection(projection) = optimized.operator else {
+        let LogicalOperator::Projection(projection) = &optimized.operator else {
             panic!("expected projection");
         };
         let LogicalOperator::Get(get) = &projection.child.operator else {
@@ -762,7 +758,7 @@ mod tests {
         );
 
         let optimized = JoinElimination::new().optimize(LogicalPlan::synthetic(plan));
-        let LogicalOperator::Projection(projection) = optimized.operator else {
+        let LogicalOperator::Projection(projection) = &optimized.operator else {
             panic!("expected projection");
         };
         assert!(matches!(
@@ -791,7 +787,7 @@ mod tests {
         );
 
         let optimized = JoinElimination::new().optimize(LogicalPlan::synthetic(plan));
-        let LogicalOperator::Projection(projection) = optimized.operator else {
+        let LogicalOperator::Projection(projection) = &optimized.operator else {
             panic!("expected projection");
         };
         let LogicalOperator::Get(get) = &projection.child.operator else {

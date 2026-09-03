@@ -71,11 +71,7 @@ impl<'a> JoinPredicateNormalizer<'a> {
         let LogicalOperator::Filter(mut filter) = operator else {
             return operator;
         };
-        let LogicalPlan {
-            id: cross_id,
-            stats: cross_stats,
-            operator: cross_operator,
-        } = *filter.child;
+        let (cross_id, cross_stats, cross_operator) = (*filter.child).into_parts();
         let LogicalOperator::Join(Join::Cross(cross)) = cross_operator else {
             filter.child = Box::new(LogicalPlan {
                 id: cross_id,
@@ -337,12 +333,12 @@ mod tests {
             optimized.stats.estimated_cardinality,
             Some(CardinalityEstimate::exact(7))
         );
-        let LogicalOperator::Filter(filter) = optimized.operator else {
+        let LogicalOperator::Filter(filter) = &optimized.operator else {
             panic!("expected residual filter");
         };
         assert_eq!(filter.expressions.len(), 1);
         assert_eq!(filter.child.stats.estimated_cardinality, None);
-        let LogicalOperator::Join(Join::Comparison(join)) = filter.child.operator else {
+        let LogicalOperator::Join(Join::Comparison(join)) = &filter.child.operator else {
             panic!("expected comparison join");
         };
         assert_eq!(join.conditions.len(), 1);
@@ -356,7 +352,7 @@ mod tests {
             .optimize_plan(join(&context, JoinType::Left))
             .expect("normalize preserving join");
 
-        let LogicalOperator::Join(Join::Comparison(join)) = optimized.operator else {
+        let LogicalOperator::Join(Join::Comparison(join)) = &optimized.operator else {
             panic!("expected comparison join");
         };
         assert_eq!(join.conditions.len(), 2);
@@ -386,7 +382,7 @@ mod tests {
             .optimize_plan(plan)
             .expect("normalize cross product");
 
-        let LogicalOperator::Join(Join::Comparison(join)) = optimized.operator else {
+        let LogicalOperator::Join(Join::Comparison(join)) = &optimized.operator else {
             panic!("expected comparison join");
         };
         assert_eq!(join.conditions.len(), 1);
@@ -419,7 +415,7 @@ mod tests {
             .optimize_plan(plan)
             .expect("normalize binding cross product");
 
-        let LogicalOperator::Join(Join::Comparison(join)) = optimized.operator else {
+        let LogicalOperator::Join(Join::Comparison(join)) = &optimized.operator else {
             panic!("expected comparison join");
         };
         assert_eq!(join.conditions.len(), 1);
@@ -456,13 +452,13 @@ mod tests {
             .optimize_plan(plan)
             .expect("normalize cross product residual");
 
-        let LogicalOperator::Filter(filter) = optimized.operator else {
+        let LogicalOperator::Filter(filter) = &optimized.operator else {
             panic!("expected residual filter");
         };
         assert_eq!(filter.expressions.len(), 1);
         assert!(filter.expressions[0].equals(&residual));
         assert!(matches!(
-            filter.child.operator,
+            &filter.child.operator,
             LogicalOperator::Join(Join::Comparison(_))
         ));
     }

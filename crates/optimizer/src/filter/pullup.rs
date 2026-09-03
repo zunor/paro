@@ -67,11 +67,7 @@ impl FilterPullup {
     }
 
     pub fn rewrite_plan(&mut self, plan: LogicalPlan) -> LogicalPlan {
-        let LogicalPlan {
-            id,
-            stats,
-            operator,
-        } = plan;
+        let (id, stats, operator) = plan.into_parts();
         LogicalPlan {
             id,
             stats,
@@ -119,7 +115,7 @@ impl FilterPullup {
             for expr in expressions {
                 self.filters_expr_pullup.push(expr);
             }
-            plan.operator
+            plan.into_operator()
         } else {
             let plan = self.rewrite_plan(*child);
             LogicalOperator::Filter(Filter::new(plan, expressions))
@@ -280,7 +276,7 @@ impl FilterPullup {
         let mut expressions = Vec::new();
         if let LogicalOperator::Filter(filter) = op {
             expressions = filter.expressions;
-            op = filter.child.operator;
+            op = (*filter.child).into_operator();
         } else if !self.can_pullup {
             return op; // No filters from below, and we can't pullup, stop.
         }
@@ -314,7 +310,7 @@ impl FilterPullup {
             }
             result
         } else {
-            Self::generate_pullup_filter_op(result, expressions).operator
+            Self::generate_pullup_filter_op(result, expressions).into_operator()
         }
     }
 
@@ -327,7 +323,7 @@ impl FilterPullup {
         let mut expressions = Vec::new();
         if let LogicalOperator::Filter(filter) = op {
             expressions = filter.expressions;
-            op = filter.child.operator;
+            op = (*filter.child).into_operator();
         } else if !self.can_pullup {
             return op;
         }
@@ -352,7 +348,7 @@ impl FilterPullup {
             }
             result
         } else {
-            Self::generate_pullup_filter_op(result, expressions).operator
+            Self::generate_pullup_filter_op(result, expressions).into_operator()
         }
     }
 
@@ -372,7 +368,7 @@ impl FilterPullup {
                 LogicalOperator::Join(Join::Comparison(cj)),
                 left_pullup.filters_expr_pullup,
             )
-            .operator
+            .into_operator()
         } else {
             LogicalOperator::Join(Join::Comparison(cj))
         }
@@ -393,7 +389,7 @@ impl FilterPullup {
                 LogicalOperator::Join(Join::Any(Box::new(aj))),
                 left_pullup.filters_expr_pullup,
             )
-            .operator
+            .into_operator()
         } else {
             LogicalOperator::Join(Join::Any(Box::new(aj)))
         }
@@ -433,7 +429,7 @@ impl FilterPullup {
         merged_filters.extend(right_pullup.filters_expr_pullup);
 
         if !merged_filters.is_empty() {
-            Self::generate_pullup_filter_op(result, merged_filters).operator
+            Self::generate_pullup_filter_op(result, merged_filters).into_operator()
         } else {
             result
         }
@@ -511,7 +507,7 @@ impl FilterPullup {
 
         if !merged_filters.is_empty() {
             Self::generate_pullup_filter_op(LogicalOperator::SetOperation(setop), merged_filters)
-                .operator
+                .into_operator()
         } else {
             LogicalOperator::SetOperation(setop)
         }
@@ -537,7 +533,7 @@ impl FilterPullup {
                 LogicalOperator::SetOperation(setop),
                 left_pullup.filters_expr_pullup,
             )
-            .operator
+            .into_operator()
         } else {
             LogicalOperator::SetOperation(setop)
         }
@@ -587,11 +583,11 @@ impl FilterPullup {
 
         // Now pull up any existing filters
         if self.filters_expr_pullup.is_empty() {
-            return plan.operator;
+            return plan.into_operator();
         }
 
         let filters = std::mem::take(&mut self.filters_expr_pullup);
-        Self::generate_pullup_filter(plan, filters).operator
+        Self::generate_pullup_filter(plan, filters).into_operator()
     }
 
     /// Convert JoinComparisonType to ComparisonType.
@@ -726,8 +722,11 @@ mod tests {
         let ctx = BindContext::new();
         let filter_expr = make_comparison(
             ComparisonType::GreaterThan,
-            make_column_ref(0, 0),
             volatile_call(),
+            Expression::Constant(ConstantExpression::new(
+                paro_common::runtime_value::Value::Double(0.5),
+                LogicalType::Double,
+            )),
         );
         let filter = Filter::new(plan(&ctx, make_get(0)), vec![filter_expr]);
 
@@ -830,7 +829,7 @@ mod tests {
         match result {
             LogicalOperator::Filter(f) => {
                 assert_eq!(f.expressions.len(), 2);
-                match f.child.operator {
+                match &f.child.operator {
                     LogicalOperator::Join(Join::Cross(cp)) => {
                         assert!(matches!(cp.left.operator, LogicalOperator::Get(_)));
                         assert!(matches!(cp.right.operator, LogicalOperator::Get(_)));

@@ -598,10 +598,10 @@ mod tests {
         })
     }
 
-    fn create_constant(value: i64) -> Expression {
+    fn create_constant(value: i32) -> Expression {
         Expression::Constant(ConstantExpression {
-            value: Value::BigInt(value),
-            return_type: LogicalType::BigInt,
+            value: Value::Integer(value),
+            return_type: LogicalType::Integer,
         })
     }
 

@@ -114,7 +114,20 @@ impl FilterCombiner {
     pub fn add_filter(&mut self, expr: Expression) -> FilterResult {
         let result = self.add_filter_internal(&expr);
         if result == FilterResult::Unsupported {
-            // Unsupported filter, push into remaining filters
+            // Unsupported shapes still admit exact structural deduplication
+            // when their evaluation contract is total and shareable. This is
+            // common after an implied domain and its source disjunction cross
+            // the same projection/set-operation boundary.
+            let properties = expr.evaluation_properties();
+            if properties.is_infallible()
+                && !properties.is_reorder_fence()
+                && self
+                    .remaining_filters
+                    .iter()
+                    .any(|existing| existing.equals(&expr))
+            {
+                return FilterResult::Success;
+            }
             self.remaining_filters.push(expr);
             return FilterResult::Success;
         }
@@ -700,6 +713,13 @@ mod tests {
         })
     }
 
+    fn make_or(children: Vec<Expression>) -> Expression {
+        Expression::Conjunction(ConjunctionExpression {
+            conjunction_type: ConjunctionType::Or,
+            children,
+        })
+    }
+
     #[test]
     fn test_filter_combiner_new() {
         let combiner = FilterCombiner::new();
@@ -1045,6 +1065,27 @@ mod tests {
 
         let filters = combiner.generate_filters();
         assert_eq!(filters.len(), 1);
+    }
+
+    #[test]
+    fn duplicate_total_disjunction_is_evaluated_once() {
+        let mut combiner = FilterCombiner::new();
+        let filter = make_or(vec![
+            make_comparison(
+                ComparisonType::Equal,
+                make_column_ref(0, 0),
+                make_constant(1),
+            ),
+            make_comparison(
+                ComparisonType::Equal,
+                make_column_ref(0, 0),
+                make_constant(2),
+            ),
+        ]);
+
+        assert_eq!(combiner.add_filter(filter.clone()), FilterResult::Success);
+        assert_eq!(combiner.add_filter(filter), FilterResult::Success);
+        assert_eq!(combiner.generate_filters().len(), 1);
     }
 
     #[test]

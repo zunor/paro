@@ -241,6 +241,11 @@ fn build_conjunction(
 }
 
 /// Simplify AND conjunction.
+fn can_elide(expression: &Expression) -> bool {
+    let properties = expression.evaluation_properties();
+    properties.is_infallible() && !properties.is_reorder_fence()
+}
+
 fn simplify_and(conj: &ConjunctionExpression) -> RuleResult {
     if conj.children.iter().any(|child| {
         matches!(
@@ -250,7 +255,7 @@ fn simplify_and(conj: &ConjunctionExpression) -> RuleResult {
                 ..
             })
         )
-    }) && conj.children.iter().all(Expression::is_passive_value)
+    }) && conj.children.iter().all(can_elide)
     {
         return RuleResult::Changed(Box::new(Expression::Constant(ConstantExpression {
             value: Value::Boolean(false),
@@ -300,7 +305,7 @@ fn simplify_or(conj: &ConjunctionExpression) -> RuleResult {
                 ..
             })
         )
-    }) && conj.children.iter().all(Expression::is_passive_value)
+    }) && conj.children.iter().all(can_elide)
     {
         return RuleResult::Changed(Box::new(Expression::Constant(ConstantExpression {
             value: Value::Boolean(true),
@@ -503,6 +508,30 @@ mod tests {
         let result = rule.apply(&LogicalOperator::DummyScan, bindings, false);
 
         assert!(matches!(result, RuleResult::NoChange));
+    }
+
+    #[test]
+    fn test_and_false_elides_total_comparison() {
+        let rule = ConjunctionSimplificationRule::new();
+        let comparison = Expression::Comparison(ComparisonExpression::new(
+            ComparisonType::Equal,
+            make_column_ref(0, 0),
+            make_bool_constant(true),
+        ));
+        let expr = make_and(vec![comparison, make_bool_constant(false)]);
+        let mut bindings = Vec::new();
+        assert!(rule.matcher().matches(&expr, &mut bindings));
+
+        let result = rule.apply(&LogicalOperator::DummyScan, bindings, false);
+
+        assert!(matches!(
+            result,
+            RuleResult::Changed(expression)
+                if matches!(*expression, Expression::Constant(ConstantExpression {
+                    value: Value::Boolean(false),
+                    ..
+                }))
+        ));
     }
 
     #[test]

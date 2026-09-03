@@ -124,11 +124,7 @@ impl<'a> ExternalRoutineLowerer<'a> {
     }
 
     fn lower_current_plan(&mut self, plan: LogicalPlan) -> Result<LogicalPlan> {
-        let LogicalPlan {
-            id,
-            stats,
-            operator,
-        } = plan;
+        let (id, stats, operator) = plan.into_parts();
 
         let operator = match operator {
             LogicalOperator::Projection(projection) => {
@@ -1008,10 +1004,10 @@ mod tests {
         let lowered = lower(plan, &bind_context);
         assert!(lowered.changed);
 
-        let LogicalOperator::Projection(projection) = lowered.plan.operator else {
+        let LogicalOperator::Projection(projection) = &lowered.plan.operator else {
             panic!("expected projection");
         };
-        let LogicalOperator::ExternalProject(project) = projection.child.operator else {
+        let LogicalOperator::ExternalProject(project) = &projection.child.operator else {
             panic!("expected LogicalExternalProject under projection");
         };
 
@@ -1034,10 +1030,10 @@ mod tests {
         let plan = LogicalPlan::new(&bind_context, LogicalOperator::Projection(projection));
 
         let lowered = lower(plan, &bind_context);
-        let LogicalOperator::Projection(projection) = lowered.plan.operator else {
+        let LogicalOperator::Projection(projection) = &lowered.plan.operator else {
             panic!("expected projection");
         };
-        let LogicalOperator::ExternalProject(project) = projection.child.operator else {
+        let LogicalOperator::ExternalProject(project) = &projection.child.operator else {
             panic!("expected external project");
         };
 
@@ -1071,13 +1067,13 @@ mod tests {
         let plan = LogicalPlan::new(&bind_context, LogicalOperator::Filter(filter));
 
         let lowered = lower(plan, &bind_context);
-        let LogicalOperator::Filter(outer) = lowered.plan.operator else {
+        let LogicalOperator::Filter(outer) = &lowered.plan.operator else {
             panic!("expected outer filter");
         };
-        let LogicalOperator::ExternalProject(project) = outer.child.operator else {
+        let LogicalOperator::ExternalProject(project) = &outer.child.operator else {
             panic!("expected external project between filters");
         };
-        let LogicalOperator::Filter(inner) = project.child.operator else {
+        let LogicalOperator::Filter(inner) = &project.child.operator else {
             panic!("expected native filter below external project");
         };
 
@@ -1108,10 +1104,10 @@ mod tests {
         let plan = LogicalPlan::new(&bind_context, LogicalOperator::Order(order));
 
         let lowered = lower(plan, &bind_context);
-        let LogicalOperator::Order(order) = lowered.plan.operator else {
+        let LogicalOperator::Order(order) = &lowered.plan.operator else {
             panic!("expected order");
         };
-        let LogicalOperator::ExternalProject(project) = order.child.operator else {
+        let LogicalOperator::ExternalProject(project) = &order.child.operator else {
             panic!("expected external project below order");
         };
         assert_eq!(project.expressions.len(), 1);
@@ -1138,10 +1134,10 @@ mod tests {
         let plan = LogicalPlan::new(&bind_context, LogicalOperator::Join(Join::Comparison(join)));
 
         let lowered = lower(plan, &bind_context);
-        let LogicalOperator::Join(Join::Comparison(join)) = lowered.plan.operator else {
+        let LogicalOperator::Join(Join::Comparison(join)) = &lowered.plan.operator else {
             panic!("expected comparison join");
         };
-        let LogicalOperator::ExternalProject(project) = join.left.operator else {
+        let LogicalOperator::ExternalProject(project) = &join.left.operator else {
             panic!("expected external project on left child");
         };
         assert_eq!(project.expressions.len(), 1);

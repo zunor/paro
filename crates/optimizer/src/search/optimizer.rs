@@ -341,18 +341,20 @@ impl SearchOptimizer {
 
             let mut other_predicates = filter.expressions.clone();
             let match_expression = other_predicates.remove(match_idx);
+            let operator = LogicalOperator::FullTextFilterScan(FullTextFilterScan {
+                get: get.clone(),
+                projection_map: filter.projection_map.clone(),
+                request,
+                match_expression,
+                other_predicates,
+                residual_predicates: Vec::new(),
+                decision,
+            });
+            let (id, stats, _) = plan.into_parts();
             return Ok(Some(LogicalPlan {
-                id: plan.id,
-                stats: plan.stats,
-                operator: LogicalOperator::FullTextFilterScan(FullTextFilterScan {
-                    get: get.clone(),
-                    projection_map: filter.projection_map.clone(),
-                    request,
-                    match_expression,
-                    other_predicates,
-                    residual_predicates: Vec::new(),
-                    decision,
-                }),
+                id,
+                stats,
+                operator,
             }));
         }
 
@@ -388,25 +390,27 @@ fn build_search_scan(
     decision: SearchDecision,
     candidate_filters: Vec<Expression>,
 ) -> LogicalPlan {
+    let operator = LogicalOperator::SearchScan(
+        SearchScan::new(
+            pattern.get.clone(),
+            request,
+            decision,
+            pattern.projection.expressions.clone(),
+            pattern.projection.table_index,
+            candidate_filters,
+            Vec::new(),
+            pattern.order_expr_idx,
+            pattern.order_expr.clone(),
+            pattern.topn.orders[0].ascending,
+            pattern.topn.limit,
+        )
+        .with_output_names(pattern.projection.visible_names.clone()),
+    );
+    let (id, stats, _) = plan.into_parts();
     LogicalPlan {
-        id: plan.id,
-        stats: plan.stats,
-        operator: LogicalOperator::SearchScan(
-            SearchScan::new(
-                pattern.get.clone(),
-                request,
-                decision,
-                pattern.projection.expressions.clone(),
-                pattern.projection.table_index,
-                candidate_filters,
-                Vec::new(),
-                pattern.order_expr_idx,
-                pattern.order_expr.clone(),
-                pattern.topn.orders[0].ascending,
-                pattern.topn.limit,
-            )
-            .with_output_names(pattern.projection.visible_names.clone()),
-        ),
+        id,
+        stats,
+        operator,
     }
 }
 

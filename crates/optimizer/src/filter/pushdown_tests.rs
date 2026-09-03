@@ -260,7 +260,7 @@ fn test_pushdown_through_projection() {
     // Filter should be pushed through projection
     // Result should be: Projection(Filter(Get))
     match result {
-        LogicalOperator::Projection(p) => match p.child.operator {
+        LogicalOperator::Projection(p) => match &p.child.operator {
             LogicalOperator::Filter(f) => {
                 assert!(matches!(f.child.operator, LogicalOperator::Get(_)));
             }
@@ -335,7 +335,7 @@ fn group_filter_rebinds_to_aggregate_input() {
     else {
         panic!("expected aggregate root");
     };
-    let LogicalOperator::Filter(filter) = aggregate.child.operator else {
+    let LogicalOperator::Filter(filter) = &aggregate.child.operator else {
         panic!("expected filter below aggregate");
     };
     let Expression::Comparison(comparison) = &filter.expressions[0] else {
@@ -429,13 +429,13 @@ fn test_pushdown_through_cross_product() {
     // Result should be: Cross(Filter(Get0), Get1)
     match result {
         LogicalOperator::Join(Join::Cross(cp)) => {
-            match cp.left.operator {
+            match &cp.left.operator {
                 LogicalOperator::Filter(f) => {
                     assert!(matches!(f.child.operator, LogicalOperator::Get(_)));
                 }
                 _ => panic!("Expected Filter on left side"),
             }
-            assert!(matches!(cp.right.operator, LogicalOperator::Get(_)));
+            assert!(matches!(&cp.right.operator, LogicalOperator::Get(_)));
         }
         _ => panic!("Expected Cross product"),
     }
@@ -591,13 +591,13 @@ fn test_or_join_filter_derives_domains_for_both_inputs() {
     let LogicalOperator::Filter(filter) = result else {
         panic!("correlated OR must remain above the join");
     };
-    let LogicalOperator::Join(Join::Cross(cross)) = filter.child.operator else {
+    let LogicalOperator::Join(Join::Cross(cross)) = &filter.child.operator else {
         panic!("expected cross product");
     };
-    let LogicalOperator::Filter(left_filter) = cross.left.operator else {
+    let LogicalOperator::Filter(left_filter) = &cross.left.operator else {
         panic!("expected implied left domain");
     };
-    let LogicalOperator::Filter(right_filter) = cross.right.operator else {
+    let LogicalOperator::Filter(right_filter) = &cross.right.operator else {
         panic!("expected implied right domain");
     };
     assert_eq!(left_filter.expressions.len(), 1);
@@ -713,7 +713,7 @@ fn compound_marker_predicate_stays_above_the_join_that_produces_it() {
         let LogicalOperator::Filter(filter) = result else {
             panic!("compound marker predicate must remain above its producer");
         };
-        let LogicalOperator::Join(Join::Comparison(outer)) = filter.child.operator else {
+        let LogicalOperator::Join(Join::Comparison(outer)) = &filter.child.operator else {
             panic!("expected outer MARK join");
         };
         assert_eq!(outer.join_type, JoinType::Mark);
@@ -824,7 +824,7 @@ fn negative_marker_with_null_safe_condition_remains_mark_join() {
     let LogicalOperator::Filter(filter) = result else {
         panic!("non-scalar negative marker must remain above the MARK join");
     };
-    let LogicalOperator::Join(Join::Comparison(join)) = filter.child.operator else {
+    let LogicalOperator::Join(Join::Comparison(join)) = &filter.child.operator else {
         panic!("expected MARK join below negative marker filter");
     };
     assert_eq!(join.join_type, JoinType::Mark);
@@ -895,7 +895,7 @@ fn test_pushdown_through_order() {
 
     // Filter should be pushed through Order
     match result {
-        LogicalOperator::Order(o) => match o.child.operator {
+        LogicalOperator::Order(o) => match &o.child.operator {
             LogicalOperator::Filter(f) => {
                 assert!(matches!(f.child.operator, LogicalOperator::Get(_)));
             }
@@ -1007,7 +1007,7 @@ fn single_delim_join_keeps_right_output_predicate_above_row_preserving_boundary(
     let LogicalOperator::Filter(filter) = result else {
         panic!("right-output predicate must remain above SINGLE delim join");
     };
-    let LogicalOperator::Join(Join::Comparison(join)) = filter.child.operator else {
+    let LogicalOperator::Join(Join::Comparison(join)) = &filter.child.operator else {
         panic!("expected SINGLE delim join below filter");
     };
     assert_eq!(join.join_type, JoinType::Single);

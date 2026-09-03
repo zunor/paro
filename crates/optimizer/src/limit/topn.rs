@@ -18,7 +18,8 @@ impl TopNOptimizer {
 
     #[cfg(test)]
     fn optimize(&mut self, plan: LogicalOperator) -> LogicalOperator {
-        self.optimize_plan(LogicalPlan::synthetic(plan)).operator
+        self.optimize_plan(LogicalPlan::synthetic(plan))
+            .into_operator()
     }
 
     pub fn optimize_plan(&mut self, plan: LogicalPlan) -> LogicalPlan {
@@ -90,11 +91,7 @@ impl TopNOptimizer {
     }
 
     fn apply_optimization(&mut self, plan: LogicalPlan) -> LogicalPlan {
-        let LogicalPlan {
-            id,
-            stats,
-            operator,
-        } = plan;
+        let (id, stats, operator) = plan.into_parts();
         let LogicalOperator::Limit(limit) = operator else {
             return LogicalPlan {
                 id,
@@ -114,7 +111,7 @@ impl TopNOptimizer {
         let mut child_lp = *limit.child;
 
         loop {
-            let op = child_lp.operator;
+            let op = child_lp.take_operator();
             let LogicalOperator::Projection(proj) = op else {
                 child_lp.operator = op;
                 break;
@@ -139,7 +136,7 @@ impl TopNOptimizer {
             child_lp = inner;
         }
 
-        let op = child_lp.operator;
+        let op = child_lp.take_operator();
         let order = match op {
             LogicalOperator::Order(o) => o,
             other => {
