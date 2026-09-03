@@ -313,16 +313,26 @@ fn physical_column_identities(
             .map(|input| input.identities.to_vec())
             .unwrap_or_else(fallback),
         PhysicalNodeKind::HashJoin(spec) => {
-            let mut identities = child(0)
+            let mut natural_identities = child(0)
                 .map(|input| project_identities(input, &spec.left_projection))
                 .unwrap_or_default();
             if let Some(input) = child(1) {
-                identities.extend(
+                natural_identities.extend(
                     spec.build_input_projection
                         .iter()
                         .take(spec.build_output_count)
                         .filter_map(|index| input.identities.get(*index).cloned()),
                 );
+            }
+            let mut identities = fallback();
+            for (natural_index, identity) in natural_identities.into_iter().enumerate() {
+                let Some(output_index) = spec.output_permutation.destination_of(natural_index)
+                else {
+                    continue;
+                };
+                if let Some(output_identity) = identities.get_mut(output_index) {
+                    *output_identity = identity;
+                }
             }
             complete_identities(identities, output, fallback)
         }

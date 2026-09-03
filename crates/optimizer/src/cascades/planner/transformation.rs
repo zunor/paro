@@ -8,7 +8,9 @@ use super::*;
 mod matching;
 mod staging;
 
-use staging::{stage_transformed_expression, StagingRequest};
+use staging::{
+    stage_transformed_expression, StagingRegionRequirements, StagingRequest, StagingTarget,
+};
 
 pub(super) fn register_transformations(
     registry: &mut ImplementationRegistry,
@@ -27,6 +29,7 @@ pub(super) fn register_transformations(
 #[derive(Debug, Clone, Copy)]
 enum PlannerTransformation {
     ExpensivePredicatePlacement,
+    CtePartitionedMaterialization,
     CteInline,
     CteDemandPushdown,
     CteFilterPushdown,
@@ -46,8 +49,9 @@ enum PlannerTransformation {
 }
 
 impl PlannerTransformation {
-    const ALL: [Self; 17] = [
+    const ALL: [Self; 18] = [
         Self::ExpensivePredicatePlacement,
+        Self::CtePartitionedMaterialization,
         Self::CteInline,
         Self::CteDemandPushdown,
         Self::CteFilterPushdown,
@@ -69,6 +73,7 @@ impl PlannerTransformation {
     const fn id(self) -> RuleId {
         match self {
             Self::ExpensivePredicatePlacement => EXPENSIVE_PREDICATE_PLACEMENT_RULE,
+            Self::CtePartitionedMaterialization => CTE_PARTITIONED_MATERIALIZATION_RULE,
             Self::CteInline => CTE_INLINE_RULE,
             Self::CteDemandPushdown => CTE_DEMAND_PUSHDOWN_RULE,
             Self::CteFilterPushdown => CTE_FILTER_PUSHDOWN_RULE,
@@ -204,7 +209,16 @@ impl TransformationRule for PlannerTransformationRule {
         ctx: &mut TransformContext<'_>,
     ) -> Result<Box<[EquivalentExpression]>> {
         let target_group = ctx.group();
-        let (plan, source_stats, source_region, environment) =
+        let (
+            plan,
+            source_stats,
+            source_region,
+            enclosing_required_region_facets,
+            source_runtime_filter_facet,
+            source_input_context,
+            source_child_context,
+            environment,
+        ) =
             {
                 let state = self
                     .planner_state
@@ -231,12 +245,24 @@ impl TransformationRule for PlannerTransformationRule {
                 let binder = state.binder.clone().ok_or_else(|| {
                     paro_error::internal("planner rule has no binder environment")
                 })?;
+                let enclosing_required_region_facets = ctx
+                    .memo()
+                    .optimization_context(metadata.child_context)
+                    .ok_or_else(|| {
+                        paro_error::internal("planner expression has an unknown child context")
+                    })?
+                    .required_region_facets()
+                    .to_vec();
                 (
                     plan,
                     payload.column_stats.clone(),
                     metadata
                         .required_region_facet
                         .map(|facet| (facet, metadata.operator_type)),
+                    enclosing_required_region_facets,
+                    metadata.runtime_filter_region_facet,
+                    metadata.input_context,
+                    metadata.child_context,
                     PlannerRuleEnvironment {
                         binder,
                         bind_context: state.bind_context.clone(),
@@ -263,6 +289,9 @@ impl TransformationRule for PlannerTransformationRule {
         for plan in plans {
             let (plan, column_stats) = settle_transformed_expression(plan, &environment)?;
             let mut preserved_region_facet = None;
+            let mut extended_required_region_facets = enclosing_required_region_facets.clone();
+            let output_input_context = source_input_context;
+            let mut output_child_context = source_child_context;
             if let Some((facet, source_operator)) = source_region {
                 let kind = ctx
                     .memo()
@@ -283,14 +312,18 @@ impl TransformationRule for PlannerTransformationRule {
                         && plan.operator.op_type() != source_operator;
                 let preserves_sharing = matches!(
                     self.transformation,
-                    PlannerTransformation::CteInline
+                    PlannerTransformation::CtePartitionedMaterialization
+                        | PlannerTransformation::CteInline
                         | PlannerTransformation::CteDemandPushdown
                         | PlannerTransformation::CteFilterPushdown
                 ) && kind == RegionFacetKind::Sharing
                     && plan.operator.op_type() == source_operator;
                 if preserves_sharing {
                     preserved_region_facet = Some(facet);
-                } else if !discharges_sharing {
+                } else if discharges_sharing {
+                    extended_required_region_facets.retain(|candidate| *candidate != facet);
+                    output_child_context = source_input_context;
+                } else {
                     debug!(
                         target: targets::OPTIMIZER,
                         rule = self.id().0,
@@ -318,7 +351,14 @@ impl TransformationRule for PlannerTransformationRule {
                 continue;
             }
             drop(state);
-            prepared.push((plan, column_stats, preserved_region_facet));
+            prepared.push((
+                plan,
+                column_stats,
+                preserved_region_facet,
+                extended_required_region_facets.into_boxed_slice(),
+                output_input_context,
+                output_child_context,
+            ));
         }
         if prepared.is_empty() {
             return Ok(Box::new([]));
@@ -328,25 +368,52 @@ impl TransformationRule for PlannerTransformationRule {
             PlannerTransformState::savepoint,
             PlannerTransformState::rollback_to,
             |memo, state| {
-                prepared
-                    .into_iter()
-                    .map(|(plan, column_stats, preserved_region_facet)| {
-                        stage_transformed_expression(
-                            StagingRequest::new(
-                                plan,
-                                Arc::new(column_stats),
-                                target_group,
-                                self.id(),
-                                preserved_region_facet,
-                                self.transformation.cardinality_recipe_kind(),
-                            ),
-                            memo,
-                            state,
-                        )
-                    })
-                    .collect::<Result<Vec<_>>>()
+                let mut staged = Vec::with_capacity(prepared.len());
+                for (
+                    plan,
+                    column_stats,
+                    preserved_region_facet,
+                    extended_required_region_facets,
+                    input_context,
+                    child_context,
+                ) in prepared
+                {
+                    let Some(expression) = stage_transformed_expression(
+                        StagingRequest {
+                            plan,
+                            column_stats: Arc::new(column_stats),
+                            target: StagingTarget {
+                                group: target_group,
+                                rule: self.id(),
+                                input_context,
+                                child_context,
+                                refined_cardinality_kind: self
+                                    .transformation
+                                    .cardinality_recipe_kind(),
+                            },
+                            regions: StagingRegionRequirements {
+                                preserved_facet: preserved_region_facet,
+                                extended_required_facets: extended_required_region_facets,
+                                inherited_runtime_filter_facet: source_runtime_filter_facet,
+                            },
+                        },
+                        memo,
+                        state,
+                    )?
+                    else {
+                        return Ok(None);
+                    };
+                    staged.push(expression);
+                }
+                Ok(Some(staged))
             },
         )?;
+        let Some(staged) = staged else {
+            // An expected occurrence-context collision is an advisory miss.
+            // Returning no outputs delegates the already-enlisted Memo and
+            // sidecar rollback to the common transformation transaction.
+            return Ok(Box::new([]));
+        };
         let source = ctx
             .memo()
             .logical_expr(expr)
@@ -460,6 +527,15 @@ fn rewrite_planner_expression(
             if !changed {
                 return Ok(None);
             }
+            plan
+        }
+        PlannerTransformation::CtePartitionedMaterialization => {
+            let Some(plan) = crate::cte::partitioned_materialization::CTEPartitioner::new(
+                &environment.bind_context,
+            )
+            .optimize_default_root(plan) else {
+                return Ok(None);
+            };
             plan
         }
         PlannerTransformation::CteInline => {
@@ -614,18 +690,11 @@ fn rewrite_positive_consumed_mark_filter(plan: LogicalPlan) -> Option<LogicalPla
         if !is_match {
             return (plan, child_changed);
         }
-        let LogicalPlan {
-            id,
-            stats,
-            operator: LogicalOperator::Filter(filter),
-        } = plan
-        else {
+        let (id, stats, operator) = plan.into_parts();
+        let LogicalOperator::Filter(filter) = operator else {
             unreachable!("positive mark-filter shape was checked")
         };
-        let LogicalPlan {
-            operator: LogicalOperator::Join(Join::Comparison(mut join)),
-            ..
-        } = *filter.child
+        let LogicalOperator::Join(Join::Comparison(mut join)) = (*filter.child).into_operator()
         else {
             unreachable!("positive mark-filter child was checked")
         };
@@ -657,6 +726,12 @@ fn settle_transformed_expression(
     // Stage only canonical join semantics so the equivalent expression is
     // never costed as an accidental Cartesian product.
     plan = FilterPushdown::new().rewrite_plan(plan);
+    normalize_scalar_expressions(&mut plan);
+    plan = FilterPushdown::new().rewrite_plan(plan);
+    // The second predicate-placement pass can expose constants while mapping
+    // predicates through set-operation and projection expressions. Settle
+    // those scalars before statistics and physical predicate extraction see
+    // the transformed alternative.
     normalize_scalar_expressions(&mut plan);
     plan = FilterPushdown::new().rewrite_plan(plan);
     plan = EmptyResultPullup::new().optimize_plan(plan);

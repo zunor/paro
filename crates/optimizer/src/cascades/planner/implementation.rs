@@ -56,6 +56,14 @@ pub(super) fn register_implementations(
             PhysicalImplementationFlavor::HashJoinRuntimeFilter,
         ),
         (
+            PLANNER_HASH_JOIN_BUILD_LEFT,
+            PhysicalImplementationFlavor::HashJoinBuildLeft,
+        ),
+        (
+            PLANNER_HASH_JOIN_BUILD_LEFT_RUNTIME_FILTER,
+            PhysicalImplementationFlavor::HashJoinBuildLeftRuntimeFilter,
+        ),
+        (
             PLANNER_PARTITION_AGGREGATE_WINDOW,
             PhysicalImplementationFlavor::PartitionAggregateWindow,
         ),
@@ -111,14 +119,15 @@ impl PhysicalImplementation for PlannerBaselineImplementation {
     fn matches(
         &self,
         expr: &crate::cascades::memo::LogicalExpr,
-        _goal: OptimizationGoal,
+        goal: OptimizationGoal,
         _ctx: &ImplementationContext<'_>,
     ) -> bool {
         self.planner_state
             .read()
             .expect("planner transform state poisoned")
             .metadata
-            .contains_key(&expr.payload)
+            .get(&expr.payload)
+            .is_some_and(|metadata| metadata.input_context == goal.context)
     }
 
     fn candidates(
@@ -156,6 +165,7 @@ impl PhysicalImplementation for PlannerBaselineImplementation {
                             PlannerChildRowGoal::All => RowGoal::All,
                             PlannerChildRowGoal::Parent => goal.row_goal,
                         },
+                        context: metadata.child_context,
                         ..goal
                     },
                 )
@@ -225,7 +235,7 @@ impl PhysicalImplementation for PlannerBaselineImplementation {
                 &self.grant_classes,
             )?,
             physical_fingerprint: fingerprint.finish(),
-            region: planner_region_contract(ctx.memo, metadata.required_region_facet, None)?,
+            region: planner_region_contract(ctx.memo, metadata.required_region_facet)?,
             mandatory: true,
         }]
         .into_boxed_slice())
@@ -269,7 +279,7 @@ impl PhysicalImplementation for AlternativeImplementation {
     fn matches(
         &self,
         expr: &crate::cascades::memo::LogicalExpr,
-        _goal: OptimizationGoal,
+        goal: OptimizationGoal,
         _ctx: &ImplementationContext<'_>,
     ) -> bool {
         self.planner_state
@@ -277,7 +287,10 @@ impl PhysicalImplementation for AlternativeImplementation {
             .expect("planner transform state poisoned")
             .metadata
             .get(&expr.payload)
-            .is_some_and(|metadata| metadata.implementations.supports(self.flavor))
+            .is_some_and(|metadata| {
+                metadata.input_context == goal.context
+                    && metadata.implementations.supports(self.flavor)
+            })
     }
 
     fn candidates(
@@ -302,6 +315,12 @@ impl PhysicalImplementation for AlternativeImplementation {
             return Ok(Box::new([]));
         }
         let children = logical.key.children.clone();
+        if self.flavor == PhysicalImplementationFlavor::HashJoinRuntimeFilter
+            && children.len().saturating_add(1)
+                > usize::from(ctx.memo.budget().max_composite_region_groups)
+        {
+            return Ok(Box::new([]));
+        }
         let cost_facts =
             expression_cost_facts(ctx.memo, ctx.group, &children, &metadata.cost_facts)?;
         let child_goals = children
@@ -318,6 +337,7 @@ impl PhysicalImplementation for AlternativeImplementation {
                             PlannerChildRowGoal::All => RowGoal::All,
                             PlannerChildRowGoal::Parent => goal.row_goal,
                         },
+                        context: metadata.child_context,
                         ..goal
                     },
                 )
@@ -368,14 +388,16 @@ impl PhysicalImplementation for AlternativeImplementation {
                 &self.grant_classes,
             )?,
             physical_fingerprint: fingerprint.finish(),
-            region: if self.flavor == PhysicalImplementationFlavor::HashJoinRuntimeFilter {
-                planner_region_contract(
+            region: if let Some((producer, consumer)) = runtime_filter_dependency_boundary(self.id)
+            {
+                Some(planner_runtime_filter_region_contract(
                     ctx.memo,
                     metadata.runtime_filter_region_facet,
-                    Some(RegionArtifactKind::RuntimeFilter),
-                )?
+                    producer,
+                    consumer,
+                )?)
             } else {
-                planner_region_contract(ctx.memo, metadata.required_region_facet, None)?
+                planner_region_contract(ctx.memo, metadata.required_region_facet)?
             },
             mandatory: false,
         }]
@@ -404,7 +426,7 @@ impl PhysicalImplementation for PlannerSearchImplementation {
     fn matches(
         &self,
         expr: &crate::cascades::memo::LogicalExpr,
-        _goal: OptimizationGoal,
+        goal: OptimizationGoal,
         _ctx: &ImplementationContext<'_>,
     ) -> bool {
         self.planner_state
@@ -412,7 +434,9 @@ impl PhysicalImplementation for PlannerSearchImplementation {
             .expect("planner transform state poisoned")
             .metadata
             .get(&expr.payload)
-            .is_some_and(|metadata| metadata.search.is_some())
+            .is_some_and(|metadata| {
+                metadata.input_context == goal.context && metadata.search.is_some()
+            })
     }
 
     fn candidates(
@@ -458,7 +482,7 @@ impl PhysicalImplementation for PlannerSearchImplementation {
                 cost_facts.output_row_width,
             ),
             physical_fingerprint: fingerprint.finish(),
-            region: planner_region_contract(ctx.memo, None, None)?,
+            region: planner_region_contract(ctx.memo, None)?,
             mandatory: false,
         }]
         .into_boxed_slice())

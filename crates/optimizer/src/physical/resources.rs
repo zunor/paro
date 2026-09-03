@@ -265,6 +265,21 @@ impl RuntimeFilterResourceContract {
             && ndv <= u64::from(self.max_local_exact_values)
     }
 
+    /// Whether the expected build domain fits the aggregate exact-membership
+    /// capacity of the admitted builders. This is an expected-cost signal,
+    /// not an execution proof: skew or stale statistics may still make a
+    /// local builder degrade to its range representation.
+    pub fn expects_exact_single_key(&self, build_ndv_expected: f64) -> bool {
+        if !build_ndv_expected.is_finite() || build_ndv_expected < 0.0 {
+            return false;
+        }
+        let aggregate_local_capacity = u64::from(self.max_local_exact_values)
+            .saturating_mul(u64::from(self.max_local_builders));
+        self.has_exact_single_key_representation()
+            && build_ndv_expected.ceil()
+                <= u64::from(self.max_global_exact_values).min(aggregate_local_capacity) as f64
+    }
+
     pub fn validate(&self, key_count: usize) -> Result<()> {
         let exact_key_count = self.keys.iter().filter(|key| key.is_exact()).count();
         let range_key_count = self
@@ -343,6 +358,9 @@ mod tests {
         assert!(integer.guarantees_exact_single_key(Some(16_384)));
         assert!(!integer.guarantees_exact_single_key(Some(20_000)));
         assert!(!integer.guarantees_exact_single_key(None));
+        assert!(integer.expects_exact_single_key(65_536.0));
+        assert!(!integer.expects_exact_single_key(65_537.0));
+        assert!(!integer.expects_exact_single_key(f64::NAN));
         assert_eq!(string.capability, RuntimeFilterCapability::Range);
         assert_eq!(
             RuntimeFilterResourceContract::for_keys(&[LogicalType::Blob], 4)

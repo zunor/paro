@@ -73,6 +73,15 @@ pub(super) fn planner_implementation_set(
             };
             PlannerImplementationSet {
                 baseline,
+                hash_join_build_left: baseline == PhysicalImplementationFlavor::HashJoin
+                    && join.anti_join_mode == AntiJoinMode::Regular
+                    && matches!(
+                        join.join_type,
+                        JoinType::Left | JoinType::Right | JoinType::Inner | JoinType::Outer
+                    ),
+                hash_join_build_left_runtime_filter: baseline
+                    == PhysicalImplementationFlavor::HashJoin
+                    && supports_build_left_runtime_filter_auxiliary(join, rowset_scan_pushdown),
                 hash_join_runtime_filter: baseline == PhysicalImplementationFlavor::HashJoin
                     && supports_runtime_filter_auxiliary(join, rowset_scan_pushdown),
                 sort_range_join:
@@ -152,6 +161,44 @@ pub(super) fn supports_runtime_filter_auxiliary(
     })
 }
 
+pub(super) fn supports_build_left_runtime_filter_auxiliary(
+    join: &paro_planner::operator::ComparisonJoin,
+    rowset_scan_pushdown: bool,
+) -> bool {
+    if !rowset_scan_pushdown
+        || join.anti_join_mode != AntiJoinMode::Regular
+        || !matches!(join.join_type, JoinType::Inner | JoinType::Left)
+    {
+        return false;
+    }
+
+    let probe_bindings = join.right.get_column_bindings();
+    join.conditions.iter().any(|condition| {
+        if condition.comparison != JoinComparisonType::Equal {
+            return false;
+        }
+        if !crate::physical::RuntimeFilterResourceContract::for_keys(
+            &[condition.left.return_type()],
+            1,
+        )
+        .is_ok_and(|contract| {
+            contract.capability != crate::physical::RuntimeFilterCapability::Disabled
+        }) {
+            return false;
+        }
+        let output_index = match &condition.right {
+            Expression::ColumnRef(column) if column.depth == 0 => probe_bindings
+                .iter()
+                .position(|binding| *binding == column.binding),
+            Expression::Reference(reference) => Some(reference.index),
+            _ => None,
+        };
+        output_index
+            .and_then(|index| runtime_filter_probe_lineages(&join.right, index))
+            .is_some_and(|lineage| !lineage.crossed_join && !lineage.sources.is_empty())
+    })
+}
+
 struct RuntimeFilterProbeLineage<'a> {
     sources: Vec<&'a LogicalPlan>,
     crossed_join: bool,
@@ -204,7 +251,7 @@ fn runtime_filter_probe_lineages(
             Some(left)
         }
         LogicalOperator::Join(Join::Comparison(inner))
-            if inner.join_type == JoinType::Inner
+            if matches!(inner.join_type, JoinType::Inner | JoinType::Left)
                 && inner.duplicate_eliminated_columns.is_empty()
                 && !inner.delim_flipped =>
         {
@@ -215,6 +262,14 @@ fn runtime_filter_probe_lineages(
                 let mut lineage = runtime_filter_probe_lineages(&inner.left, child_index)?;
                 lineage.crossed_join = true;
                 return Some(lineage);
+            }
+            if inner.join_type == JoinType::Left {
+                // A left outer join preserves every row from its left child.
+                // Sideways filtering a key whose output lineage stays on that
+                // side can only remove rows that the later consuming join
+                // would reject; tracing into the nullable build side would
+                // instead change whether a preserved row is matched.
+                return None;
             }
             let right_output = output_index.checked_sub(left_projection.len())?;
             let right_projection = inner
@@ -294,6 +349,10 @@ pub(super) fn selected_implementation_flavor(
         PLANNER_CLASSIC_IE_JOIN => Ok(PhysicalImplementationFlavor::ClassicIeJoin),
         PLANNER_SEARCH_PROVIDER => Ok(PhysicalImplementationFlavor::SearchProvider),
         PLANNER_HASH_JOIN_RUNTIME_FILTER => Ok(PhysicalImplementationFlavor::HashJoinRuntimeFilter),
+        PLANNER_HASH_JOIN_BUILD_LEFT => Ok(PhysicalImplementationFlavor::HashJoinBuildLeft),
+        PLANNER_HASH_JOIN_BUILD_LEFT_RUNTIME_FILTER => {
+            Ok(PhysicalImplementationFlavor::HashJoinBuildLeftRuntimeFilter)
+        }
         PLANNER_PARTITION_AGGREGATE_WINDOW => {
             Ok(PhysicalImplementationFlavor::PartitionAggregateWindow)
         }
@@ -310,33 +369,47 @@ pub(super) fn selected_implementation_flavor(
 pub(super) fn planner_region_contract(
     memo: &Memo,
     facet: Option<Fingerprint>,
-    artifact_kind: Option<RegionArtifactKind>,
 ) -> Result<Option<RegionCandidateContract>> {
     let Some(facet) = facet else {
-        if artifact_kind.is_some() {
-            return Err(paro_error::internal(
-                "region artifact has no owning planning facet",
-            ));
-        }
         return Ok(None);
     };
     let region = memo.regions().region_for_facet(facet).ok_or_else(|| {
         paro_error::internal("physical implementation references an unowned planning facet")
     })?;
-    let artifacts = artifact_kind
-        .map(|kind| {
-            vec![RegionOwnedArtifact {
-                fingerprint: facet,
-                kind,
-            }]
-            .into_boxed_slice()
-        })
-        .unwrap_or_default();
     Ok(Some(RegionCandidateContract {
         region,
         facets: vec![facet].into_boxed_slice(),
-        artifacts,
+        artifacts: Box::new([]),
+        artifact_dependencies: Box::new([]),
     }))
+}
+
+pub(super) fn planner_runtime_filter_region_contract(
+    memo: &Memo,
+    facet: Option<Fingerprint>,
+    build: RegionBoundaryEndpoint,
+    probe: RegionBoundaryEndpoint,
+) -> Result<RegionCandidateContract> {
+    let facet = facet.ok_or_else(|| {
+        paro_error::internal("runtime-filter artifact has no owning planning facet")
+    })?;
+    let region = memo.regions().region_for_facet(facet).ok_or_else(|| {
+        paro_error::internal("physical implementation references an unowned planning facet")
+    })?;
+    Ok(RegionCandidateContract {
+        region,
+        facets: vec![facet].into_boxed_slice(),
+        artifacts: Box::new([RegionOwnedArtifact {
+            fingerprint: facet,
+            kind: RegionArtifactKind::RuntimeFilter,
+        }]),
+        artifact_dependencies: Box::new([RegionArtifactDependencyContract {
+            artifact: facet,
+            producer: build,
+            consumer: probe,
+            kind: RegionDependencyKind::ControlWaitComplete,
+        }]),
+    })
 }
 
 const OP_HASH_BUILD_ROW: OpClassId = OpClassId(1);
@@ -520,6 +593,8 @@ pub(super) fn implementation_cost(
                 .saturating_mul(facts.output_row_width.max(32));
         }
         PhysicalImplementationFlavor::HashJoin
+        | PhysicalImplementationFlavor::HashJoinBuildLeft
+        | PhysicalImplementationFlavor::HashJoinBuildLeftRuntimeFilter
         | PhysicalImplementationFlavor::HashJoinRuntimeFilter => {
             let left = facts
                 .child_rows
@@ -531,9 +606,21 @@ pub(super) fn implementation_cost(
                 .get(1)
                 .copied()
                 .unwrap_or(CompactRange::ZERO);
-            let right_hard_upper = facts.child_rows_hard_upper.get(1).copied().flatten();
-            work.add(OP_HASH_BUILD_ROW, right)?;
+            let build_left = matches!(
+                flavor,
+                PhysicalImplementationFlavor::HashJoinBuildLeft
+                    | PhysicalImplementationFlavor::HashJoinBuildLeftRuntimeFilter
+            );
+            let build = if build_left { left } else { right };
+            let ordinary_probe = if build_left { right } else { left };
+            let build_hard_upper = facts
+                .child_rows_hard_upper
+                .get(usize::from(!build_left))
+                .copied()
+                .flatten();
+            work.add(OP_HASH_BUILD_ROW, build)?;
             let probe = if flavor == PhysicalImplementationFlavor::HashJoinRuntimeFilter {
+                let build_domain = runtime_filter_build_domain(facts, right)?;
                 work.add(OP_RUNTIME_FILTER_BUILD_ROW, right)?;
                 // A non-local runtime filter runs at the traced rowset source,
                 // before any intervening joins. Price every source-row lookup;
@@ -548,18 +635,36 @@ pub(super) fn implementation_cost(
                     &facts.runtime_filter_key_types,
                     max_concurrent_tasks,
                 )?;
+                let exact_expected = resource.guarantees_exact_single_key(build_hard_upper)
+                    || resource.expects_exact_single_key(build_domain.expected);
                 runtime_filtered_probe_work(
                     left,
-                    right,
+                    build_domain,
                     facts.runtime_filter_probe_multiplicity,
-                    resource.guarantees_exact_single_key(right_hard_upper),
+                    exact_expected,
+                )?
+            } else if flavor == PhysicalImplementationFlavor::HashJoinBuildLeftRuntimeFilter {
+                let build_domain = CompactRange::new(0.0, left.expected, left.upper)?;
+                work.add(OP_RUNTIME_FILTER_BUILD_ROW, left)?;
+                work.add(OP_RUNTIME_FILTER_APPLY_ROW, right)?;
+                let resource = crate::physical::RuntimeFilterResourceContract::for_keys(
+                    &facts.runtime_filter_key_types,
+                    max_concurrent_tasks,
+                )?;
+                let exact_expected = resource.guarantees_exact_single_key(build_hard_upper)
+                    || resource.expects_exact_single_key(build_domain.expected);
+                runtime_filtered_probe_work(
+                    right,
+                    build_domain,
+                    RuntimeFilterProbeMultiplicity::Unknown,
+                    exact_expected,
                 )?
             } else {
-                left
+                ordinary_probe
             };
-            add_hash_key_byte_work(&mut work, right.checked_add(probe)?, facts.hash_key_width)?;
+            add_hash_key_byte_work(&mut work, build.checked_add(probe)?, facts.hash_key_width)?;
             work.add(OP_HASH_PROBE_ROW, probe.checked_add(facts.output_rows)?)?;
-            peak_memory_upper = right_hard_upper
+            peak_memory_upper = build_hard_upper
                 .unwrap_or(u64::MAX)
                 .saturating_mul(facts.output_row_width.saturating_div(2).max(32));
         }
@@ -719,6 +824,8 @@ fn implementation_parallelism(flavor: PhysicalImplementationFlavor) -> ParallelW
         | PhysicalImplementationFlavor::SortRangeJoin
         | PhysicalImplementationFlavor::ClassicIeJoin => ParallelWorkProfile::BlockingMerge,
         PhysicalImplementationFlavor::HashJoin
+        | PhysicalImplementationFlavor::HashJoinBuildLeft
+        | PhysicalImplementationFlavor::HashJoinBuildLeftRuntimeFilter
         | PhysicalImplementationFlavor::HashJoinRuntimeFilter
         | PhysicalImplementationFlavor::NestedLoopJoin
         | PhysicalImplementationFlavor::CrossProductInMemory
@@ -748,6 +855,8 @@ fn apply_execution_memory_contract(
             PhysicalImplementationFlavor::HashAggregate
                 | PhysicalImplementationFlavor::PerfectHashAggregate
                 | PhysicalImplementationFlavor::HashJoin
+                | PhysicalImplementationFlavor::HashJoinBuildLeft
+                | PhysicalImplementationFlavor::HashJoinBuildLeftRuntimeFilter
                 | PhysicalImplementationFlavor::HashJoinRuntimeFilter
                 | PhysicalImplementationFlavor::NestedLoopJoin
                 | PhysicalImplementationFlavor::SortRangeJoin
@@ -773,16 +882,19 @@ fn apply_execution_memory_contract(
             })?
             .memory
     } else if spillable {
-        let fixed_non_revocable_bytes =
-            if flavor == PhysicalImplementationFlavor::HashJoinRuntimeFilter {
-                crate::physical::RuntimeFilterResourceContract::for_keys(
-                    &metadata.cost_facts.runtime_filter_key_types,
-                    max_concurrent_tasks,
-                )?
-                .peak_memory_bytes
-            } else {
-                0
-            };
+        let fixed_non_revocable_bytes = if matches!(
+            flavor,
+            PhysicalImplementationFlavor::HashJoinRuntimeFilter
+                | PhysicalImplementationFlavor::HashJoinBuildLeftRuntimeFilter
+        ) {
+            crate::physical::RuntimeFilterResourceContract::for_keys(
+                &metadata.cost_facts.runtime_filter_key_types,
+                max_concurrent_tasks,
+            )?
+            .peak_memory_bytes
+        } else {
+            0
+        };
         let base = ExecutionMemoryContract {
             fixed_non_revocable_bytes,
             fixed_scratch_bytes: BLOCKING_FIXED_SCRATCH_BYTES,
@@ -794,7 +906,14 @@ fn apply_execution_memory_contract(
         };
         let minimum = base.minimum_memory_bytes()?;
         let contract = ExecutionMemoryContract {
-            revocable_target_bytes: retained_memory_target.min(retained_memory_upper),
+            // The hard upper may deliberately remain unknown (`u64::MAX`).
+            // A preferred target is not a correctness proof and must stay a
+            // representable addition to the executable floor; admission will
+            // cap it to the granted working set while spill preserves
+            // progress at the floor.
+            revocable_target_bytes: retained_memory_target
+                .min(retained_memory_upper)
+                .min(u64::MAX - minimum),
             ..base
         };
         contract.validate()?;
@@ -867,8 +986,18 @@ fn expected_retained_memory_target(
             estimated_bytes(child(0), facts.output_row_width.max(32))
         }
         PhysicalImplementationFlavor::HashJoin
+        | PhysicalImplementationFlavor::HashJoinBuildLeft
+        | PhysicalImplementationFlavor::HashJoinBuildLeftRuntimeFilter
         | PhysicalImplementationFlavor::HashJoinRuntimeFilter => {
-            estimated_bytes(child(1), facts.output_row_width.saturating_div(2).max(32))
+            let build_index = usize::from(!matches!(
+                flavor,
+                PhysicalImplementationFlavor::HashJoinBuildLeft
+                    | PhysicalImplementationFlavor::HashJoinBuildLeftRuntimeFilter
+            ));
+            estimated_bytes(
+                child(build_index),
+                facts.output_row_width.saturating_div(2).max(32),
+            )
         }
         PhysicalImplementationFlavor::NestedLoopJoin
         | PhysicalImplementationFlavor::CrossProductInMemory => {
@@ -1074,6 +1203,20 @@ pub(super) fn runtime_filtered_probe_work(
     CompactRange::new(0.0, expected, upper.max(expected))
 }
 
+pub(super) fn runtime_filter_build_domain(
+    facts: &ResolvedPlannerCostFacts,
+    build_rows: CompactRange,
+) -> Result<CompactRange> {
+    let expected = facts
+        .runtime_filter_build_distinct_expected
+        .map(|distinct| distinct as f64)
+        .unwrap_or(build_rows.expected)
+        .min(build_rows.expected);
+    // Snapshot NDV is an expected-cost input only. The full build cardinality
+    // remains the upper domain so stale statistics cannot fabricate a proof.
+    CompactRange::new(0.0, expected, build_rows.upper)
+}
+
 pub(super) fn is_contextual_operator(operator: &LogicalOperator) -> bool {
     matches!(
         operator,
@@ -1101,7 +1244,7 @@ pub(super) fn required_region_kind(operator: &LogicalOperator) -> Option<RegionF
 pub(super) fn planner_region_facet(
     kind: RegionFacetKind,
     criticality: FacetCriticality,
-    logical: LogicalExprId,
+    logical_identity: Fingerprint,
     operator: Fingerprint,
     scope: BTreeSet<GroupId>,
 ) -> RegionFacet {
@@ -1109,7 +1252,12 @@ pub(super) fn planner_region_facet(
     fingerprint.write_bytes(b"paro.planning-region.facet.v1");
     fingerprint.write_u64(kind as u64);
     fingerprint.write_u64(criticality as u64);
-    fingerprint.write_u64(logical.0 as u64);
+    // A facet belongs to a logical expression identity, not to the arena slot
+    // that happened to receive it.  Transformations construct their root key
+    // before the engine publishes a LogicalExprId; using the canonical key
+    // fingerprint lets initial and transformed expressions participate in the
+    // same physical-property search without an insertion-order dependency.
+    fingerprint.write_fingerprint(logical_identity);
     fingerprint.write_fingerprint(operator);
     RegionFacet {
         fingerprint: fingerprint.finish(),
@@ -1118,6 +1266,11 @@ pub(super) fn planner_region_facet(
         priority: match criticality {
             FacetCriticality::Required => 100 + kind as u16,
             FacetCriticality::Optional => 1_000 + kind as u16,
+        },
+        scope_contract: if kind == RegionFacetKind::RuntimeFilter {
+            crate::cascades::region::RegionScopeContract::OwnerWithImmediateInputs
+        } else {
+            crate::cascades::region::RegionScopeContract::Exact
         },
         scope,
     }

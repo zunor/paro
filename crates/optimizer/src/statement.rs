@@ -230,11 +230,7 @@ pub(crate) struct StatementPlan {
 impl StatementPlan {
     pub(crate) fn split(plan: LogicalPlan, snapshot_version: u64) -> Result<Self> {
         let (explain, plan) = detach_explain(plan)?;
-        let LogicalPlan {
-            id,
-            stats,
-            operator,
-        } = plan;
+        let (id, stats, operator) = plan.into_parts();
         let body = match operator {
             LogicalOperator::Insert(insert) => {
                 let reads_target =
@@ -362,11 +358,7 @@ impl StatementPlan {
 }
 
 fn detach_explain(plan: LogicalPlan) -> Result<(Option<ExplainEnvelope>, LogicalPlan)> {
-    let LogicalPlan {
-        id,
-        stats,
-        operator,
-    } = plan;
+    let (id, stats, operator) = plan.into_parts();
     match operator {
         LogicalOperator::Explain(Explain {
             child,

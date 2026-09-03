@@ -1,7 +1,7 @@
 // Copyright 2024-2026 Zunor
 // SPDX-License-Identifier: Apache-2.0
 
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 use std::sync::Arc;
 
 use paro_common::error::Result;
@@ -9,13 +9,16 @@ use paro_common::runtime_value::Value;
 use paro_common::types::LogicalType;
 use paro_parser::ast::PathQuantifier;
 use paro_planner::expression::{
-    ComparisonExpression, ComparisonType, ConstantExpression, Expression,
+    ComparisonExpression, ComparisonType, ConjunctionType, ConstantExpression, Expression,
 };
 use paro_planner::operator::{
     ColumnBinding, Filter, FullTextFilterScan, Get, GraphExpand, GraphScan, Join,
-    JoinComparisonType, JoinCondition, JoinType, LogicalOperator, SearchScan, SetOpType,
+    JoinComparisonType, JoinCondition, JoinType, LogicalOperator, LogicalOutputLayout, SearchScan,
+    SetOpType,
 };
-use paro_planner::plan::{CardinalityEstimate, CardinalityProvenance, LogicalPlan};
+use paro_planner::plan::{
+    CardinalityEstimate, CardinalityProvenance, LogicalPlan, LogicalPlanPostOrderFolder,
+};
 use paro_storage::index::graph::GraphStatsProvider;
 use paro_storage::statistics::{BaseStatistics, ColumnStatistics};
 
@@ -67,6 +70,51 @@ pub struct StatisticsGathering {
     delim_output_stats: HashMap<usize, Vec<Arc<ColumnStatistics>>>,
 }
 
+struct StatisticsGatherFolder<'a> {
+    gathering: &'a mut StatisticsGathering,
+    context: &'a mut OptimizationContext,
+}
+
+impl LogicalPlanPostOrderFolder<LogicalOutputLayout> for StatisticsGatherFolder<'_> {
+    fn child_completed(
+        &mut self,
+        parent_skeleton: &LogicalPlan,
+        completed_children: &[LogicalPlan],
+        completed_layouts: &[LogicalOutputLayout],
+        remaining_children: &[LogicalPlan],
+    ) -> Result<()> {
+        self.gathering.publish_completed_first_child(
+            parent_skeleton,
+            completed_children,
+            completed_layouts,
+            remaining_children,
+            self.context,
+        );
+        Ok(())
+    }
+
+    fn fold(
+        &mut self,
+        mut plan: LogicalPlan,
+        child_layouts: Vec<LogicalOutputLayout>,
+    ) -> Result<(LogicalPlan, LogicalOutputLayout)> {
+        if plan.stats.cardinality_provenance != CardinalityProvenance::JoinGraph {
+            plan.stats.estimated_cardinality =
+                self.gathering
+                    .estimate_plan_cardinality(&plan, &child_layouts, self.context);
+            plan.stats.cardinality_provenance = CardinalityProvenance::Statistics;
+        }
+        let output_layout = plan.operator.output_layout_from_children(&child_layouts);
+        self.gathering.update_output_column_stats(
+            &plan,
+            &output_layout,
+            &child_layouts,
+            self.context,
+        );
+        Ok((plan, output_layout))
+    }
+}
+
 impl StatisticsGathering {
     pub fn new() -> Self {
         Self::default()
@@ -77,67 +125,82 @@ impl StatisticsGathering {
         plan: LogicalPlan,
         ctx: &mut OptimizationContext,
     ) -> Result<LogicalPlan> {
-        let mut plan = plan;
-        let operator = std::mem::replace(&mut plan.operator, LogicalOperator::DummyScan);
-        let operator = match operator {
-            LogicalOperator::MaterializedCTE(mut cte) => {
-                cte.cte_query = Box::new(self.gather(*cte.cte_query, ctx)?);
-                self.publish_cte_statistics(cte.cte_index, cte.cte_query.as_ref(), ctx);
-                cte.child = Box::new(self.gather(*cte.child, ctx)?);
-                LogicalOperator::MaterializedCTE(cte)
+        let mut folder = StatisticsGatherFolder {
+            gathering: self,
+            context: ctx,
+        };
+        plan.try_fold_post_order_with(&mut folder)
+            .map(|(plan, _layout)| plan)
+    }
+
+    /// Some consumers require producer statistics while their sibling is
+    /// still being gathered. Preserve that depth-first publication boundary
+    /// explicitly instead of relying on native call-stack sequencing.
+    fn publish_completed_first_child(
+        &mut self,
+        parent_skeleton: &LogicalPlan,
+        completed_children: &[LogicalPlan],
+        completed_layouts: &[LogicalOutputLayout],
+        remaining_children: &[LogicalPlan],
+        ctx: &OptimizationContext,
+    ) {
+        if completed_children.len() != 1 {
+            return;
+        }
+        let first = &completed_children[0];
+        let Some(first_layout) = completed_layouts.first() else {
+            return;
+        };
+        match &parent_skeleton.operator {
+            LogicalOperator::MaterializedCTE(cte) => {
+                self.publish_cte_statistics(cte.cte_index, first, first_layout, ctx);
             }
-            LogicalOperator::RecursiveCTE(mut cte) => {
-                cte.anchor = Box::new(self.gather(*cte.anchor, ctx)?);
-                self.publish_cte_statistics(cte.cte_index, cte.anchor.as_ref(), ctx);
-                cte.recursive = Box::new(self.gather(*cte.recursive, ctx)?);
-                LogicalOperator::RecursiveCTE(cte)
+            LogicalOperator::RecursiveCTE(cte) => {
+                self.publish_cte_statistics(cte.cte_index, first, first_layout, ctx);
             }
-            LogicalOperator::Join(Join::Comparison(mut join))
+            LogicalOperator::Join(Join::Comparison(join))
                 if !join.duplicate_eliminated_columns.is_empty() =>
             {
-                join.left = Box::new(self.gather(*join.left, ctx)?);
-                self.publish_delim_statistics(&join, ctx);
-                join.right = Box::new(self.gather(*join.right, ctx)?);
-                LogicalOperator::Join(Join::Comparison(join))
+                if let Some(right) = remaining_children.first() {
+                    self.publish_delim_statistics(
+                        first,
+                        &join.duplicate_eliminated_columns,
+                        right,
+                        ctx,
+                    );
+                }
             }
-            operator => {
-                plan.operator = operator;
-                plan = plan.try_map_children(|child| self.gather(child, ctx))?;
-                std::mem::replace(&mut plan.operator, LogicalOperator::DummyScan)
-            }
-        };
-        plan.operator = operator;
-        if plan.stats.cardinality_provenance != CardinalityProvenance::JoinGraph {
-            plan.stats.estimated_cardinality = self.estimate_plan_cardinality(&plan, ctx);
-            plan.stats.cardinality_provenance = CardinalityProvenance::Statistics;
+            _ => {}
         }
-        self.update_output_column_stats(&plan, ctx);
-        Ok(plan)
     }
 
     fn publish_cte_statistics(
         &mut self,
         cte_index: usize,
         producer: &LogicalPlan,
+        producer_layout: &LogicalOutputLayout,
         ctx: &OptimizationContext,
     ) {
         if let Some(cardinality) = producer.stats.estimated_cardinality {
             self.cte_cardinality.insert(cte_index, cardinality);
         }
-        self.cte_output_stats
-            .insert(cte_index, collect_output_stats(producer, ctx));
+        self.cte_output_stats.insert(
+            cte_index,
+            collect_output_stats_for_layout(producer_layout, ctx),
+        );
     }
 
     fn publish_delim_statistics(
         &mut self,
-        join: &paro_planner::operator::ComparisonJoin,
+        outer: &LogicalPlan,
+        duplicate_eliminated_columns: &[Expression],
+        dependent: &LogicalPlan,
         ctx: &OptimizationContext,
     ) {
-        let Some(outer) = join.left.stats.estimated_cardinality else {
+        let Some(outer_cardinality) = outer.stats.estimated_cardinality else {
             return;
         };
-        let stats = join
-            .duplicate_eliminated_columns
+        let stats = duplicate_eliminated_columns
             .iter()
             .map(|expression| expression_statistics(expression, ctx))
             .collect::<Vec<_>>();
@@ -149,18 +212,20 @@ impl StatisticsGathering {
                 all_known = false;
                 break;
             }
-            expected = saturating_mul_u64(expected, distinct).min(outer.expected.max(1));
+            expected =
+                saturating_mul_u64(expected, distinct).min(outer_cardinality.expected.max(1));
         }
         if !all_known {
-            expected = fallback_group_distinct(outer.expected);
+            expected = fallback_group_distinct(outer_cardinality.expected);
         }
         let estimate = CardinalityEstimate {
             min: expected.saturating_div(2),
             expected,
-            max: expected.saturating_mul(2).min(outer.max.max(expected)),
+            max: expected
+                .saturating_mul(2)
+                .min(outer_cardinality.max.max(expected)),
         };
-        let mut indices = Vec::new();
-        collect_delim_indices(&join.right, &mut indices);
+        let indices = collect_delim_indices(dependent);
         for table_index in indices {
             self.delim_cardinality.insert(table_index, estimate);
             self.delim_output_stats.insert(table_index, stats.clone());
@@ -170,6 +235,7 @@ impl StatisticsGathering {
     fn estimate_plan_cardinality(
         &mut self,
         plan: &LogicalPlan,
+        child_layouts: &[LogicalOutputLayout],
         ctx: &mut OptimizationContext,
     ) -> Option<CardinalityEstimate> {
         match &plan.operator {
@@ -196,10 +262,14 @@ impl StatisticsGathering {
             LogicalOperator::ExternalTable(table) => external_table_cardinality(table),
             LogicalOperator::Order(order) => order.child.stats.estimated_cardinality,
             LogicalOperator::Window(window) => window.child.stats.estimated_cardinality,
-            LogicalOperator::Distinct(distinct) => {
-                self.estimate_distinct_cardinality(distinct.child.as_ref(), ctx)
+            LogicalOperator::Distinct(distinct) => self.estimate_distinct_cardinality(
+                distinct.child.as_ref(),
+                child_layouts.first()?,
+                ctx,
+            ),
+            LogicalOperator::Filter(filter) => {
+                self.estimate_filter_cardinality(filter, child_layouts.first()?, ctx)
             }
-            LogicalOperator::Filter(filter) => self.estimate_filter_cardinality(filter, ctx),
             LogicalOperator::Limit(limit) => {
                 let child = limit.child.stats.estimated_cardinality?;
                 Some(apply_limit_estimate(
@@ -297,7 +367,12 @@ impl StatisticsGathering {
                     Some(groups)
                 }
             }
-            LogicalOperator::Join(join) => self.estimate_join_cardinality(join, ctx),
+            LogicalOperator::Join(join) => self.estimate_join_cardinality(
+                join,
+                child_layouts.first()?,
+                child_layouts.get(1)?,
+                ctx,
+            ),
             LogicalOperator::DependentJoin(join) => {
                 let left = join.left.stats.estimated_cardinality?;
                 let right = join.right.stats.estimated_cardinality?;
@@ -335,7 +410,7 @@ impl StatisticsGathering {
                 }
                 self.cte_output_stats.insert(
                     cte.cte_index,
-                    collect_output_stats(cte.cte_query.as_ref(), ctx),
+                    collect_output_stats_for_layout(child_layouts.first()?, ctx),
                 );
                 cte.child.stats.estimated_cardinality
             }
@@ -350,7 +425,7 @@ impl StatisticsGathering {
                 self.cte_cardinality.insert(cte.cte_index, estimate);
                 self.cte_output_stats.insert(
                     cte.cte_index,
-                    collect_output_stats(cte.anchor.as_ref(), ctx),
+                    collect_output_stats_for_layout(child_layouts.first()?, ctx),
                 );
                 Some(estimate)
             }
@@ -401,6 +476,7 @@ impl StatisticsGathering {
     fn estimate_filter_cardinality(
         &self,
         filter: &Filter,
+        child_layout: &LogicalOutputLayout,
         ctx: &OptimizationContext,
     ) -> Option<CardinalityEstimate> {
         let child = filter.child.stats.estimated_cardinality?;
@@ -412,22 +488,22 @@ impl StatisticsGathering {
                     .estimate_cardinality_from_selectivity(child.expected, selectivity),
             );
         }
-        let child_bindings = filter.child.get_column_bindings();
         Some(ctx.cost_model.estimate_filter_cardinality_with_positions(
             child.expected,
             &filter.expressions,
             &ctx.column_stats,
-            &child_bindings,
+            child_layout.bindings(),
         ))
     }
 
     fn estimate_distinct_cardinality(
         &self,
         child: &LogicalPlan,
+        child_layout: &LogicalOutputLayout,
         ctx: &OptimizationContext,
     ) -> Option<CardinalityEstimate> {
         let child_est = child.stats.estimated_cardinality?;
-        let stats = collect_output_stats(child, ctx);
+        let stats = collect_output_stats_for_layout(child_layout, ctx);
         let mut expected = 1u64;
         let mut saw_distinct = false;
         for stat in stats {
@@ -450,6 +526,8 @@ impl StatisticsGathering {
     fn estimate_join_cardinality(
         &self,
         join: &Join,
+        left_layout: &LogicalOutputLayout,
+        right_layout: &LogicalOutputLayout,
         ctx: &OptimizationContext,
     ) -> Option<CardinalityEstimate> {
         match join {
@@ -473,32 +551,25 @@ impl StatisticsGathering {
             Join::Comparison(cmp) => {
                 let left = cmp.left.stats.estimated_cardinality?;
                 let right = cmp.right.stats.estimated_cardinality?;
-                let left_bindings = cmp.left.get_column_bindings();
-                let right_bindings = cmp.right.get_column_bindings();
                 if let Some(estimate) = estimate_same_domain_semi_join(
                     cmp,
                     left,
                     right,
-                    &left_bindings,
-                    &right_bindings,
+                    left_layout.bindings(),
+                    right_layout.bindings(),
                     ctx,
                 ) {
                     return Some(estimate);
                 }
-                if let Some(inner) = estimate_unique_dimension_join(
-                    cmp,
-                    left,
-                    right,
-                    &left_bindings,
-                    &right_bindings,
-                    ctx,
-                ) {
+                if let Some(inner) =
+                    estimate_unique_dimension_join(cmp, left, right, left_layout, right_layout, ctx)
+                {
                     return Some(adjust_join_estimate(inner, left, right, cmp.join_type));
                 }
                 let selectivity = estimate_comparison_join_selectivity(
                     &cmp.conditions,
-                    &left_bindings,
-                    &right_bindings,
+                    left_layout.bindings(),
+                    right_layout.bindings(),
                     left.expected,
                     right.expected,
                     ctx,
@@ -608,7 +679,13 @@ impl StatisticsGathering {
         }
     }
 
-    fn update_output_column_stats(&mut self, plan: &LogicalPlan, ctx: &mut OptimizationContext) {
+    fn update_output_column_stats(
+        &mut self,
+        plan: &LogicalPlan,
+        output_layout: &LogicalOutputLayout,
+        child_layouts: &[LogicalOutputLayout],
+        ctx: &mut OptimizationContext,
+    ) {
         let output_stats = match &plan.operator {
             LogicalOperator::Get(get) => self.get_output_stats(get, ctx),
             LogicalOperator::Projection(proj) => proj
@@ -616,8 +693,20 @@ impl StatisticsGathering {
                 .iter()
                 .map(|expr| expression_statistics(expr, ctx))
                 .collect(),
+            LogicalOperator::Filter(filter) => filter_output_stats(
+                filter,
+                child_layouts
+                    .first()
+                    .expect("statistics fold completed filter child layout"),
+                ctx,
+            ),
             LogicalOperator::ExternalProject(project) => {
-                let mut stats = collect_output_stats(project.child.as_ref(), ctx);
+                let mut stats = collect_output_stats_for_layout(
+                    child_layouts
+                        .first()
+                        .expect("statistics fold completed external-project child layout"),
+                    ctx,
+                );
                 stats.extend(
                     project
                         .expressions
@@ -647,8 +736,12 @@ impl StatisticsGathering {
                 stats
             }
             LogicalOperator::SetOperation(setop) => merge_setop_output_stats(
-                setop.left.as_ref(),
-                setop.right.as_ref(),
+                child_layouts
+                    .first()
+                    .expect("statistics fold completed set-operation left layout"),
+                child_layouts
+                    .get(1)
+                    .expect("statistics fold completed set-operation right layout"),
                 &setop.types,
                 ctx,
             ),
@@ -672,11 +765,14 @@ impl StatisticsGathering {
                 .iter()
                 .map(|expr| expression_statistics(expr, ctx))
                 .collect(),
-            LogicalOperator::FullTextFilterScan(scan) => self.get_output_stats(&scan.get, ctx),
-            _ => collect_output_stats(plan, ctx),
+            LogicalOperator::FullTextFilterScan(scan) => project_column_statistics(
+                self.get_output_stats(&scan.get, ctx),
+                &scan.projection_map,
+            ),
+            _ => collect_output_stats_for_layout(output_layout, ctx),
         };
 
-        for (binding, stats) in plan.get_column_bindings().into_iter().zip(output_stats) {
+        for (binding, stats) in output_layout.bindings().iter().copied().zip(output_stats) {
             ctx.column_stats.insert(binding, stats);
         }
     }
@@ -782,8 +878,8 @@ fn estimate_unique_dimension_join(
     join: &paro_planner::operator::ComparisonJoin,
     left: CardinalityEstimate,
     right: CardinalityEstimate,
-    left_bindings: &[ColumnBinding],
-    right_bindings: &[ColumnBinding],
+    left_layout: &LogicalOutputLayout,
+    right_layout: &LogicalOutputLayout,
     ctx: &OptimizationContext,
 ) -> Option<CardinalityEstimate> {
     let [condition] = join.conditions.as_slice() else {
@@ -792,44 +888,40 @@ fn estimate_unique_dimension_join(
     if condition.comparison != JoinComparisonType::Equal {
         return None;
     }
-    let left_key = expression_binding(&condition.left, left_bindings)?;
-    let right_key = expression_binding(&condition.right, right_bindings)?;
+    let left_key = expression_binding(&condition.left, left_layout.bindings())?;
+    let right_key = expression_binding(&condition.right, right_layout.bindings())?;
 
-    if plan_has_single_column_unique_key(&join.right, right_key) {
+    if plan_has_single_column_unique_key(&join.right, right_key, right_layout) {
         return unique_lookup_estimate(left, right, left_key, ctx);
     }
-    if plan_has_single_column_unique_key(&join.left, left_key) {
+    if plan_has_single_column_unique_key(&join.left, left_key, left_layout) {
         return unique_lookup_estimate(right, left, right_key, ctx);
     }
     None
 }
 
-fn plan_has_single_column_unique_key(plan: &LogicalPlan, binding: ColumnBinding) -> bool {
-    match &plan.operator {
-        LogicalOperator::Get(get) => crate::statistics::unique_keys::declared_unique_keys(get)
-            .iter()
-            .any(|key| key.bindings.as_slice() == [binding]),
-        LogicalOperator::Filter(filter)
-            if filter
-                .child
-                .get_column_bindings()
-                .iter()
-                .position(|candidate| *candidate == binding)
-                .is_some_and(|index| {
-                    filter
-                        .projection_map
-                        .to_indices(filter.child.types().len())
-                        .contains(&index)
-                }) =>
-        {
-            // A Filter can project away unrelated payload without weakening a
-            // retained declared key. Requiring ProjectionMap::all() discards
-            // the key exactly after demand pruning has made the dimension
-            // scan narrowest, and prevents downstream joins from applying the
-            // filtered unique-domain selectivity.
-            plan_has_single_column_unique_key(&filter.child, binding)
+fn plan_has_single_column_unique_key(
+    mut plan: &LogicalPlan,
+    binding: ColumnBinding,
+    output_layout: &LogicalOutputLayout,
+) -> bool {
+    // A Filter can project away unrelated payload without weakening a
+    // retained declared key. Once the root layout proves that this binding
+    // survived, every pass-through Filter below it must also have retained
+    // that same binding identity; walk the chain without re-deriving schemas.
+    if !output_layout.bindings().contains(&binding) {
+        return false;
+    }
+    loop {
+        match &plan.operator {
+            LogicalOperator::Get(get) => {
+                return crate::statistics::unique_keys::declared_unique_keys(get)
+                    .iter()
+                    .any(|key| key.bindings.as_slice() == [binding]);
+            }
+            LogicalOperator::Filter(filter) => plan = filter.child.as_ref(),
+            _ => return false,
         }
-        _ => false,
     }
 }
 
@@ -949,14 +1041,15 @@ fn expression_binding(
     }
 }
 
-fn collect_output_stats(
-    plan: &LogicalPlan,
+fn collect_output_stats_for_layout(
+    layout: &LogicalOutputLayout,
     ctx: &impl ColumnStatsView,
 ) -> Vec<Arc<ColumnStatistics>> {
-    plan.operator
+    layout
         .types()
-        .into_iter()
-        .zip(plan.get_column_bindings())
+        .iter()
+        .cloned()
+        .zip(layout.bindings().iter().copied())
         .map(|(ty, binding)| {
             ctx.get_stat(&binding)
                 .unwrap_or_else(|| ColumnStatistics::create_unknown(ty))
@@ -964,26 +1057,150 @@ fn collect_output_stats(
         .collect()
 }
 
+fn filter_output_stats(
+    filter: &Filter,
+    child_layout: &LogicalOutputLayout,
+    ctx: &impl ColumnStatsView,
+) -> Vec<Arc<ColumnStatistics>> {
+    let mut child_output = collect_output_stats_for_layout(child_layout, ctx);
+
+    fn refine(
+        expression: &Expression,
+        bindings: &[ColumnBinding],
+        output: &mut [Arc<ColumnStatistics>],
+    ) {
+        if let Expression::Conjunction(conjunction) = expression {
+            if conjunction.conjunction_type == ConjunctionType::And {
+                for child in &conjunction.children {
+                    refine(child, bindings, output);
+                }
+                return;
+            }
+        }
+
+        let Some((binding, values)) = finite_equality_domain(expression) else {
+            return;
+        };
+        let Some(index) = bindings.iter().position(|candidate| *candidate == binding) else {
+            return;
+        };
+        let Some((first, rest)) = values.split_first() else {
+            return;
+        };
+        let mut domain = BaseStatistics::from_constant(first);
+        for value in rest {
+            domain.merge(&BaseStatistics::from_constant(value));
+        }
+        let Some(statistics) = output.get_mut(index) else {
+            return;
+        };
+        *statistics = Arc::new(
+            ColumnStatistics::new(domain).with_guaranteed_distinct_upper(values.len() as u64),
+        );
+    }
+
+    for expression in &filter.expressions {
+        refine(expression, child_layout.bindings(), &mut child_output);
+    }
+
+    filter
+        .projection_map
+        .to_indices(child_layout.len())
+        .into_iter()
+        .filter_map(|child_index| {
+            child_layout
+                .types()
+                .get(child_index)
+                .cloned()
+                .map(|output_type| {
+                    child_output
+                        .get(child_index)
+                        .cloned()
+                        .unwrap_or_else(|| ColumnStatistics::create_unknown(output_type))
+                })
+        })
+        .collect()
+}
+
+/// Extract a finite value domain proven by an equality predicate.
+///
+/// OR is accepted only when every branch constrains the same column. The
+/// resulting bound follows from the predicate itself and remains valid after
+/// DML, unlike a min/max range observed in one table snapshot.
+fn finite_equality_domain(expression: &Expression) -> Option<(ColumnBinding, Vec<Value>)> {
+    match expression {
+        Expression::Comparison(comparison)
+            if matches!(
+                comparison.comparison_type,
+                ComparisonType::Equal | ComparisonType::NotDistinctFrom
+            ) =>
+        {
+            let (column, constant) = match (comparison.left.as_ref(), comparison.right.as_ref()) {
+                (Expression::ColumnRef(column), Expression::Constant(constant))
+                | (Expression::Constant(constant), Expression::ColumnRef(column))
+                    if column.depth == 0 && !constant.value.is_null() =>
+                {
+                    (column, constant)
+                }
+                _ => return None,
+            };
+            Some((column.binding, vec![constant.value.clone()]))
+        }
+        Expression::Conjunction(conjunction)
+            if conjunction.conjunction_type == ConjunctionType::Or
+                && !conjunction.children.is_empty() =>
+        {
+            let mut binding = None;
+            let mut values = Vec::new();
+            for child in &conjunction.children {
+                let (child_binding, child_values) = finite_equality_domain(child)?;
+                if binding.is_some_and(|binding| binding != child_binding) {
+                    return None;
+                }
+                binding = Some(child_binding);
+                for value in child_values {
+                    if !values.contains(&value) {
+                        values.push(value);
+                    }
+                }
+            }
+            Some((binding?, values))
+        }
+        _ => None,
+    }
+}
+
 fn merge_setop_output_stats(
-    left: &LogicalPlan,
-    right: &LogicalPlan,
+    left_layout: &LogicalOutputLayout,
+    right_layout: &LogicalOutputLayout,
     types: &[LogicalType],
     ctx: &impl ColumnStatsView,
 ) -> Vec<Arc<ColumnStatistics>> {
-    let left_bindings = left.get_column_bindings();
-    let right_bindings = right.get_column_bindings();
     types
         .iter()
         .enumerate()
         .map(|(idx, ty)| {
-            let left_stats = left_bindings
+            let left_stats = left_layout
+                .bindings()
                 .get(idx)
                 .and_then(|binding| ctx.get_stat(binding));
-            let right_stats = right_bindings
+            let right_stats = right_layout
+                .bindings()
                 .get(idx)
                 .and_then(|binding| ctx.get_stat(binding));
             merge_column_statistics(left_stats, right_stats, ty.clone())
         })
+        .collect()
+}
+
+fn project_column_statistics(
+    statistics: Vec<Arc<ColumnStatistics>>,
+    projection: &paro_planner::operator::ProjectionMap,
+) -> Vec<Arc<ColumnStatistics>> {
+    projection
+        .to_indices(statistics.len())
+        .into_iter()
+        .filter_map(|index| statistics.get(index).cloned())
         .collect()
 }
 
@@ -1027,9 +1244,10 @@ fn expression_statistics(expr: &Expression, ctx: &impl ColumnStatsView) -> Arc<C
         Expression::ColumnRef(col_ref) => ctx
             .get_stat(&col_ref.binding)
             .unwrap_or_else(|| ColumnStatistics::create_unknown(col_ref.return_type.clone())),
-        Expression::Constant(constant) => Arc::new(ColumnStatistics::new(
-            BaseStatistics::from_constant(&constant.value),
-        )),
+        Expression::Constant(constant) => Arc::new(
+            ColumnStatistics::new(BaseStatistics::from_constant(&constant.value))
+                .with_guaranteed_distinct_upper(1),
+        ),
         Expression::Cast(cast) => ColumnStatistics::create_unknown(cast.target_type.clone()),
         Expression::Reference(reference) => {
             ColumnStatistics::create_unknown(reference.return_type.clone())
@@ -1046,20 +1264,27 @@ fn estimate_group_distinct(
 ) -> (u64, Option<u64>) {
     match expr {
         Expression::ColumnRef(col_ref) => {
-            let distinct = ctx
-                .get_stat(&col_ref.binding)
+            let statistics = ctx.get_stat(&col_ref.binding);
+            let guaranteed_upper = statistics
+                .as_ref()
+                .and_then(|stats| stats.guaranteed_distinct_upper())
+                .map(|upper| upper.min(child_max_rows));
+            let distinct = statistics
+                .as_ref()
                 .map(|stats| stats.get_distinct_count() as u64)
                 .filter(|count| *count > 0);
-            match distinct {
+            match (distinct, guaranteed_upper) {
+                (Some(distinct), Some(upper)) => (distinct.min(upper), Some(upper)),
+                (None, Some(upper)) => (upper.min(child_expected_rows), Some(upper)),
                 // HLL is an estimate rather than a semantic bound. A 2x
                 // envelope remains conservative for planning while avoiding
                 // the useless input-cardinality upper bound that made a
                 // proven preaggregation look riskier than its unreduced join.
-                Some(distinct) => (
+                (Some(distinct), None) => (
                     distinct,
                     Some(distinct.saturating_mul(2).min(child_max_rows).max(distinct)),
                 ),
-                None => (fallback_group_distinct(child_expected_rows), None),
+                (None, None) => (fallback_group_distinct(child_expected_rows), None),
             }
         }
         Expression::Constant(_) => (1, Some(1)),
@@ -1242,11 +1467,11 @@ fn estimate_join_condition_selectivity(
         _ => {}
     }
 
-    let expr = Expression::Comparison(ComparisonExpression {
-        left: Box::new(condition.left.clone()),
-        right: Box::new(condition.right.clone()),
-        comparison_type: join_comparison_to_comparison(condition.comparison),
-    });
+    let expr = Expression::Comparison(ComparisonExpression::new(
+        join_comparison_to_comparison(condition.comparison),
+        condition.left.clone(),
+        condition.right.clone(),
+    ));
     ctx.cost_model
         .estimate_selectivity(&expr, &ctx.column_stats)
 }
@@ -1289,15 +1514,16 @@ fn unknown_stats_for_types(types: &[LogicalType]) -> Vec<Arc<ColumnStatistics>> 
         .collect()
 }
 
-fn collect_delim_indices(plan: &LogicalPlan, indices: &mut Vec<usize>) {
-    if let LogicalOperator::DelimGet(delim) = &plan.operator {
-        if !indices.contains(&delim.table_index) {
-            indices.push(delim.table_index);
+fn collect_delim_indices(plan: &LogicalPlan) -> BTreeSet<usize> {
+    let mut indices = BTreeSet::new();
+    plan.try_visit_pre_order(|plan| {
+        if let LogicalOperator::DelimGet(delim) = &plan.operator {
+            indices.insert(delim.table_index);
         }
-    }
-    for child in plan.children() {
-        collect_delim_indices(child, indices);
-    }
+        Ok(())
+    })
+    .expect("delimiter-index collection has no fallible operation");
+    indices
 }
 
 fn saturating_mul_u64(left: u64, right: u64) -> u64 {
@@ -1359,13 +1585,15 @@ fn estimate_pattern_factor(
         .unwrap_or(1.0)
 }
 
-fn graph_name_for_plan(plan: &LogicalPlan) -> Option<&str> {
-    match &plan.operator {
-        LogicalOperator::GraphScan(scan) => Some(scan.graph_name.as_str()),
-        LogicalOperator::GraphExpand(expand) => graph_name_for_plan(expand.child.as_ref()),
-        LogicalOperator::Filter(filter) => graph_name_for_plan(filter.child.as_ref()),
-        LogicalOperator::EmptyResult(empty) => graph_name_for_plan(empty.child.as_ref()),
-        _ => None,
+fn graph_name_for_plan(mut plan: &LogicalPlan) -> Option<&str> {
+    loop {
+        plan = match &plan.operator {
+            LogicalOperator::GraphScan(scan) => return Some(scan.graph_name.as_str()),
+            LogicalOperator::GraphExpand(expand) => expand.child.as_ref(),
+            LogicalOperator::Filter(filter) => filter.child.as_ref(),
+            LogicalOperator::EmptyResult(empty) => empty.child.as_ref(),
+            _ => return None,
+        };
     }
 }
 
@@ -1383,18 +1611,22 @@ impl ColumnStatsView for OptimizationContext {
 mod tests {
     use std::sync::Arc;
 
+    use paro_catalog::entry::{EdgeTableInfo, VertexTableInfo};
     use paro_common::runtime_value::Value;
     use paro_context::test_support::TestStatementContextBuilder;
     use paro_context::StatementContext;
     use paro_planner::binder::context::BindContext;
     use paro_planner::binder::ir::{CTEMaterialize, GroupingSet};
-    use paro_planner::expression::ColumnRefExpression;
+    use paro_planner::expression::{ColumnRefExpression, ComparisonExpression};
+    use paro_planner::operator::graph_expand::ExpandDirection;
     use paro_planner::operator::{
-        Aggregate, CTERef, DelimGet, ExpressionGet, Limit, MaterializedCTE, Projection,
+        Aggregate, CTERef, DelimGet, ExpressionGet, Filter, GraphExpand, GraphScan, Limit,
+        MaterializedCTE, Projection,
     };
+    use paro_storage::index::graph::GraphStatistics;
 
     use super::*;
-    use crate::context::OptimizationContext;
+    use crate::context::{GraphStatsCache, GraphStatsLoader, OptimizationContext};
 
     fn make_test_session() -> Arc<StatementContext> {
         TestStatementContextBuilder::minimal().build()
@@ -1500,6 +1732,228 @@ mod tests {
             Some(CardinalityEstimate::exact(10))
         );
         assert!(ctx.column_stats.contains_key(&ColumnBinding::new(2, 0)));
+    }
+
+    #[test]
+    fn statistics_gathering_uses_a_heap_stack_for_deep_plans() {
+        std::thread::Builder::new()
+            .name("deep-statistics-gathering".to_string())
+            .stack_size(512 * 1024)
+            .spawn(|| {
+                const DEPTH: usize = 10_000;
+                let bind_context = BindContext::new();
+                let session = make_test_session();
+                let mut ctx = OptimizationContext::new(session, bind_context.clone());
+                let mut plan = LogicalPlan::new(
+                    &bind_context,
+                    LogicalOperator::ExpressionGet(ExpressionGet::new(
+                        17,
+                        vec![vec![Expression::Constant(ConstantExpression::new(
+                            Value::Integer(1),
+                            LogicalType::Integer,
+                        ))]],
+                        vec!["v".to_string()],
+                        vec![LogicalType::Integer],
+                    )),
+                );
+                for _ in 0..DEPTH {
+                    plan = LogicalPlan::new(
+                        &bind_context,
+                        LogicalOperator::Limit(Limit::new(plan, None, None)),
+                    );
+                }
+
+                let plan = StatisticsGathering::new()
+                    .gather(plan, &mut ctx)
+                    .expect("deep gathering should not consume the native stack");
+                assert!(ctx.column_stats.contains_key(&ColumnBinding::new(17, 0)));
+                let mut current = &plan;
+                for _ in 0..DEPTH {
+                    let LogicalOperator::Limit(limit) = &current.operator else {
+                        panic!("expected the deep limit chain to remain intact");
+                    };
+                    current = &limit.child;
+                }
+                assert!(matches!(
+                    &current.operator,
+                    LogicalOperator::ExpressionGet(_)
+                ));
+            })
+            .expect("deep statistics thread should start")
+            .join()
+            .expect("deep statistics gathering should complete");
+    }
+
+    #[test]
+    fn delimiter_collection_uses_a_heap_stack_for_a_deep_dependent_rhs() {
+        std::thread::Builder::new()
+            .name("deep-delimiter-collection".to_string())
+            .stack_size(512 * 1024)
+            .spawn(|| {
+                const DEPTH: usize = 10_000;
+                let bind_context = BindContext::new();
+                let session = make_test_session();
+                let mut ctx = OptimizationContext::new(session, bind_context.clone());
+                let outer = values_relation(&bind_context, 1, 35);
+                let mut dependent = LogicalPlan::new(
+                    &bind_context,
+                    LogicalOperator::DelimGet(DelimGet::new(9, vec![LogicalType::BigInt])),
+                );
+                for _ in 0..DEPTH {
+                    dependent = LogicalPlan::new(
+                        &bind_context,
+                        LogicalOperator::Limit(Limit::new(dependent, None, None)),
+                    );
+                }
+                let mut join = paro_planner::operator::ComparisonJoin::new(
+                    JoinType::Inner,
+                    outer,
+                    dependent,
+                    vec![equality(1, 0, 9, 0)],
+                );
+                join.duplicate_eliminated_columns = vec![column_ref(1, 0)];
+                let plan =
+                    LogicalPlan::new(&bind_context, LogicalOperator::Join(Join::Comparison(join)));
+
+                let gathered = StatisticsGathering::new()
+                    .gather(plan, &mut ctx)
+                    .expect("deep delimiter gathering should succeed");
+                let LogicalOperator::Join(Join::Comparison(join)) = &gathered.operator else {
+                    panic!("expected delimiter join root");
+                };
+                let mut dependent = join.right.as_ref();
+                for _ in 0..DEPTH {
+                    let LogicalOperator::Limit(limit) = &dependent.operator else {
+                        panic!("expected deep dependent RHS to retain its limit chain");
+                    };
+                    dependent = &limit.child;
+                }
+                assert!(matches!(&dependent.operator, LogicalOperator::DelimGet(_)));
+                let estimate = dependent
+                    .stats
+                    .estimated_cardinality
+                    .expect("deep DelimGet should inherit the outer key domain");
+                assert!(estimate.expected > 1 && estimate.expected < 35);
+                assert!(ctx.column_stats.contains_key(&ColumnBinding::new(9, 0)));
+            })
+            .expect("deep delimiter thread should start")
+            .join()
+            .expect("deep delimiter collection should complete");
+    }
+
+    #[test]
+    fn graph_name_lookup_uses_a_heap_stack_for_a_deep_graph_chain() {
+        std::thread::Builder::new()
+            .name("deep-graph-name-lookup".to_string())
+            .stack_size(512 * 1024)
+            .spawn(|| {
+                const DEPTH: usize = 10_000;
+
+                struct StaticGraphStatsLoader;
+
+                impl GraphStatsLoader for StaticGraphStatsLoader {
+                    fn load(&self, graph_name: &str) -> Option<Arc<GraphStatistics>> {
+                        (graph_name == "g").then(|| {
+                            Arc::new(
+                                GraphStatistics::default()
+                                    .with_vertex_count("v", 10)
+                                    .with_pattern_step_count("v", "e", "v", 10),
+                            )
+                        })
+                    }
+                }
+
+                let bind_context = BindContext::new();
+                let mut ctx = OptimizationContext::new(make_test_session(), bind_context.clone());
+                ctx.graph_stats = GraphStatsCache::with_loader(Arc::new(StaticGraphStatsLoader));
+                let mut child = LogicalPlan::new(
+                    &bind_context,
+                    LogicalOperator::GraphScan(GraphScan::new(
+                        VertexTableInfo {
+                            table_name: "vertices".to_string(),
+                            table_oid: 1,
+                            key_column_ids: vec![0],
+                            label: "v".to_string(),
+                            property_column_ids: Vec::new(),
+                        },
+                        None,
+                        0,
+                        3,
+                        "v".to_string(),
+                        "g".to_string(),
+                        "public".to_string(),
+                    )),
+                );
+                for _ in 0..DEPTH {
+                    child = LogicalPlan::new(
+                        &bind_context,
+                        LogicalOperator::Filter(Filter::new(child, Vec::new())),
+                    );
+                }
+                let plan = LogicalPlan::new(
+                    &bind_context,
+                    LogicalOperator::GraphExpand(GraphExpand::new(
+                        EdgeTableInfo {
+                            table_name: "edges".to_string(),
+                            table_oid: 2,
+                            key_column_ids: vec![0],
+                            source_key_column_ids: vec![0],
+                            source_vertex_table: "vertices".to_string(),
+                            source_ref_column_ids: vec![0],
+                            destination_key_column_ids: vec![0],
+                            destination_vertex_table: "vertices".to_string(),
+                            destination_ref_column_ids: vec![0],
+                            label: "e".to_string(),
+                            property_column_ids: Vec::new(),
+                        },
+                        ExpandDirection::Forward,
+                        "v".to_string(),
+                        0,
+                        1,
+                        2,
+                        3,
+                        "v".to_string(),
+                        1,
+                        1,
+                        "vertices".to_string(),
+                        child,
+                    )),
+                );
+
+                let gathered = StatisticsGathering::new()
+                    .gather(plan, &mut ctx)
+                    .expect("deep graph gathering should succeed");
+                assert_eq!(
+                    gathered.stats.estimated_cardinality,
+                    Some(CardinalityEstimate {
+                        min: 5,
+                        expected: 10,
+                        max: 20,
+                    })
+                );
+
+                let LogicalOperator::GraphExpand(expand) = &gathered.operator else {
+                    panic!("expected graph-expand root");
+                };
+                let mut child = expand.child.as_ref();
+                for _ in 0..DEPTH {
+                    let LogicalOperator::Filter(filter) = &child.operator else {
+                        panic!("expected deep graph chain to retain its filters");
+                    };
+                    child = &filter.child;
+                }
+                let LogicalOperator::GraphScan(scan) = &child.operator else {
+                    panic!("expected graph-scan leaf");
+                };
+                assert_eq!(scan.graph_name, "g");
+                assert_eq!(
+                    child.stats.estimated_cardinality,
+                    Some(CardinalityEstimate::exact(10))
+                );
+            })
+            .expect("deep graph-name thread should start")
+            .join()
+            .expect("deep graph-name lookup should complete");
     }
 
     #[test]
@@ -1714,6 +2168,176 @@ mod tests {
         assert_eq!(
             estimate_group_distinct(&column_ref(1, 0), &ctx, 4_096, 4_096),
             (2, Some(4))
+        );
+    }
+
+    #[test]
+    fn singleton_range_is_exact_without_forging_an_hll_observation() {
+        let bind_context = BindContext::new();
+        let session = make_test_session();
+        let mut ctx = OptimizationContext::new(session, bind_context);
+        let binding = ColumnBinding::new(1, 0);
+        ctx.column_stats.insert(
+            binding,
+            Arc::new(
+                ColumnStatistics::new(BaseStatistics::from_constant(&Value::BigInt(2001)))
+                    .with_guaranteed_distinct_upper(1),
+            ),
+        );
+
+        assert_eq!(
+            estimate_group_distinct(&column_ref(1, 0), &ctx, 4_096, 4_096),
+            (1, Some(1))
+        );
+    }
+
+    #[test]
+    fn filter_output_replaces_storage_hll_with_exact_equality_domain() {
+        let bind_context = BindContext::new();
+        let session = make_test_session();
+        let mut ctx = OptimizationContext::new(session, bind_context.clone());
+        let binding = ColumnBinding::new(1, 0);
+        let mut storage =
+            ColumnStatistics::new(BaseStatistics::create_unknown(LogicalType::BigInt));
+        storage.update_distinct_statistics(&[11, 29, 47], 3);
+        ctx.column_stats.insert(binding, Arc::new(storage));
+        let filter = Filter::new(
+            values_relation(&bind_context, 1, 4),
+            vec![Expression::Comparison(ComparisonExpression::new(
+                ComparisonType::Equal,
+                column_ref(1, 0),
+                Expression::Constant(ConstantExpression::new(
+                    Value::BigInt(2001),
+                    LogicalType::BigInt,
+                )),
+            ))],
+        );
+
+        let output = filter_output_stats(&filter, &filter.child.output_layout(), &ctx);
+        assert_eq!(output.len(), 1);
+        assert_eq!(output[0].get_distinct_count(), 0);
+        assert_eq!(
+            output[0].statistics().min_value(),
+            Some(Value::BigInt(2001))
+        );
+        ctx.column_stats.insert(binding, output[0].clone());
+        assert_eq!(
+            estimate_group_distinct(&column_ref(1, 0), &ctx, 4, 4),
+            (1, Some(1))
+        );
+    }
+
+    #[test]
+    fn filter_output_stats_follow_non_identity_projection_order() {
+        let bind_context = BindContext::new();
+        let session = make_test_session();
+        let mut ctx = OptimizationContext::new(session, bind_context.clone());
+        let first = ColumnBinding::new(1, 0);
+        let third = ColumnBinding::new(1, 2);
+        ctx.column_stats.insert(
+            first,
+            Arc::new(ColumnStatistics::new(BaseStatistics::from_constant(
+                &Value::BigInt(7),
+            ))),
+        );
+        ctx.column_stats.insert(
+            third,
+            Arc::new(ColumnStatistics::new(BaseStatistics::from_constant(
+                &Value::BigInt(99),
+            ))),
+        );
+        let child = LogicalPlan::new(
+            &bind_context,
+            LogicalOperator::ExpressionGet(ExpressionGet::new(
+                1,
+                vec![vec![
+                    Expression::Constant(ConstantExpression::new(
+                        Value::BigInt(7),
+                        LogicalType::BigInt,
+                    )),
+                    Expression::Constant(ConstantExpression::new(
+                        Value::BigInt(8),
+                        LogicalType::BigInt,
+                    )),
+                    Expression::Constant(ConstantExpression::new(
+                        Value::BigInt(99),
+                        LogicalType::BigInt,
+                    )),
+                ]],
+                vec!["a".to_string(), "b".to_string(), "c".to_string()],
+                vec![LogicalType::BigInt; 3],
+            )),
+        );
+        let mut filter = Filter::new(
+            child,
+            vec![Expression::Comparison(ComparisonExpression::new(
+                ComparisonType::Equal,
+                column_ref(1, 0),
+                Expression::Constant(ConstantExpression::new(
+                    Value::BigInt(2001),
+                    LogicalType::BigInt,
+                )),
+            ))],
+        );
+        filter.projection_map = vec![2, 0].into();
+
+        let output = filter_output_stats(&filter, &filter.child.output_layout(), &ctx);
+
+        assert_eq!(output.len(), 2);
+        assert_eq!(output[0].statistics().min_value(), Some(Value::BigInt(99)));
+        assert_eq!(
+            output[1].statistics().min_value(),
+            Some(Value::BigInt(2001))
+        );
+        assert_eq!(output[1].guaranteed_distinct_upper(), Some(1));
+    }
+
+    #[test]
+    fn finite_equality_disjunction_publishes_a_plan_invariant_domain() {
+        let bind_context = BindContext::new();
+        let session = make_test_session();
+        let mut ctx = OptimizationContext::new(session, bind_context.clone());
+        let binding = ColumnBinding::new(1, 0);
+        let mut storage =
+            ColumnStatistics::new(BaseStatistics::create_unknown(LogicalType::BigInt));
+        storage.update_distinct_statistics(&[11, 29, 47], 3);
+        ctx.column_stats.insert(binding, Arc::new(storage));
+        let equality = |year| {
+            Expression::Comparison(ComparisonExpression::new(
+                ComparisonType::Equal,
+                column_ref(1, 0),
+                Expression::Constant(ConstantExpression::new(
+                    Value::BigInt(year),
+                    LogicalType::BigInt,
+                )),
+            ))
+        };
+        let filter = Filter::new(
+            values_relation(&bind_context, 1, 4),
+            vec![Expression::Conjunction(
+                paro_planner::expression::ConjunctionExpression::new(
+                    ConjunctionType::Or,
+                    vec![equality(2001), equality(2002), equality(2001)],
+                ),
+            )],
+        );
+
+        let output = filter_output_stats(&filter, &filter.child.output_layout(), &ctx);
+        assert_eq!(output.len(), 1);
+        assert_eq!(output[0].get_distinct_count(), 0);
+        assert_eq!(output[0].guaranteed_distinct_upper(), Some(2));
+        assert_eq!(
+            output[0].statistics().min_value(),
+            Some(Value::BigInt(2001))
+        );
+        assert_eq!(
+            output[0].statistics().max_value(),
+            Some(Value::BigInt(2002))
+        );
+        ctx.column_stats.insert(binding, output[0].clone());
+        assert_eq!(
+            estimate_group_distinct(&column_ref(1, 0), &ctx, 4, 4),
+            (2, Some(2))
         );
     }
 

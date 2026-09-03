@@ -40,6 +40,9 @@ pub(super) fn matches_transformation(
                     matches!(operator, LogicalOperator::Filter(filter) if filter.expressions.len() > 1)
                 })
         }
+        PlannerTransformation::CtePartitionedMaterialization => {
+            operator == Op::MaterializedCTE
+        }
         PlannerTransformation::CteInline => operator == Op::MaterializedCTE,
         PlannerTransformation::CteDemandPushdown => operator == Op::MaterializedCTE,
         PlannerTransformation::CteFilterPushdown => operator == Op::MaterializedCTE,
@@ -353,7 +356,6 @@ fn aggregate_over_dimension_join(
         .metadata
         .get(&candidate.payload)
         .is_some_and(|metadata| metadata.operator_type == LogicalOperatorType::ComparisonJoin)
-        && canonical_child_operator(candidate, 1, memo, state) == Some(LogicalOperatorType::Get)
 }
 
 fn canonical_descendants_contain(

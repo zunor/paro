@@ -13,12 +13,20 @@ type WinnerContractMap =
     std::collections::HashMap<paro_planner::plan::PlanNodeId, WinnerPhysicalContract>;
 type WinnerEnforcerMap =
     std::collections::HashMap<paro_planner::plan::PlanNodeId, Box<[ExtractedEnforcerContract]>>;
-type ExtractedWinnerTree = (
-    LogicalPlan,
-    WinnerContractMap,
-    WinnerEnforcerMap,
-    Box<[ColumnId]>,
-);
+pub(super) struct ExtractedWinnerTree {
+    plan: LogicalPlan,
+    contracts: WinnerContractMap,
+    enforcers: WinnerEnforcerMap,
+    output_columns: Box<[ColumnId]>,
+}
+
+pub(super) struct PresentedWinnerTree {
+    pub(super) plan: LogicalPlan,
+    pub(super) contracts: WinnerContractMap,
+    pub(super) enforcers: WinnerEnforcerMap,
+    pub(super) physical_fingerprint: Fingerprint,
+    pub(super) cost: SearchCost,
+}
 
 pub(super) fn extract_planner_tree(
     memo: &Memo,
@@ -89,6 +97,8 @@ pub(super) fn extract_planner_tree(
                 if matches!(
                     implementation,
                     PhysicalImplementationFlavor::HashJoin
+                        | PhysicalImplementationFlavor::HashJoinBuildLeft
+                        | PhysicalImplementationFlavor::HashJoinBuildLeftRuntimeFilter
                         | PhysicalImplementationFlavor::HashJoinRuntimeFilter
                         | PhysicalImplementationFlavor::NestedLoopJoin
                         | PhysicalImplementationFlavor::SortRangeJoin
@@ -333,13 +343,13 @@ pub(super) fn extract_planner_tree(
             "physical extraction did not produce exactly one root",
         ));
     }
-    Ok((
-        plans.pop().unwrap(),
+    Ok(ExtractedWinnerTree {
+        plan: plans.pop().unwrap(),
         contracts,
-        extracted_enforcers,
-        root_output_columns
+        enforcers: extracted_enforcers,
+        output_columns: root_output_columns
             .ok_or_else(|| paro_error::internal("physical extraction lost root output columns"))?,
-    ))
+    })
 }
 
 /// A physical winner may use a different equivalent child expression from
@@ -481,16 +491,19 @@ pub(super) fn extracted_region_ownership(
 }
 
 pub(super) fn enforce_result_presentation(
-    child: LogicalPlan,
-    mut contracts: WinnerContractMap,
-    enforcers: &WinnerEnforcerMap,
-    output_columns: &[ColumnId],
+    extracted: ExtractedWinnerTree,
     presentation: &ResultPresentation,
     bind_context: &BindContext,
     calibration: &MachineCalibrationBundle,
     child_fingerprint: Fingerprint,
     child_cost: SearchCost,
-) -> Result<(LogicalPlan, WinnerContractMap, Fingerprint, SearchCost)> {
+) -> Result<PresentedWinnerTree> {
+    let ExtractedWinnerTree {
+        plan: child,
+        mut contracts,
+        enforcers,
+        output_columns,
+    } = extracted;
     if presentation.columns.len() != presentation.names.len() {
         return Err(paro_error::internal(
             "result presentation columns and names are not aligned",
@@ -500,8 +513,14 @@ pub(super) fn enforce_result_presentation(
     // they do not require a runtime data movement. Equal ColumnId order is a
     // proved no-op presentation enforcer. A physical projection is mandatory
     // only when equivalence search changed the executable layout.
-    if output_columns == presentation.columns.as_ref() {
-        return Ok((child, contracts, child_fingerprint, child_cost));
+    if output_columns.as_ref() == presentation.columns.as_ref() {
+        return Ok(PresentedWinnerTree {
+            plan: child,
+            contracts,
+            enforcers,
+            physical_fingerprint: child_fingerprint,
+            cost: child_cost,
+        });
     }
     let child_types = child.types();
     let expressions = presentation
@@ -578,5 +597,11 @@ pub(super) fn enforce_result_presentation(
             owned_artifacts: Box::new([]),
         },
     );
-    Ok((plan, contracts, physical_fingerprint, cost))
+    Ok(PresentedWinnerTree {
+        plan,
+        contracts,
+        enforcers,
+        physical_fingerprint,
+        cost,
+    })
 }

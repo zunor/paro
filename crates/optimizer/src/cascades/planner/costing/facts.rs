@@ -7,6 +7,7 @@ use super::*;
 
 pub(in crate::cascades::planner) fn planner_cost_facts(
     plan: &LogicalPlan,
+    column_stats: &HashMap<ColumnBinding, Arc<ColumnStatistics>>,
     scan_access_cost: paro_storage::rowset::scan_cost::ScanAccessCostModel,
 ) -> Result<PlannerCostFacts> {
     let children = plan.children();
@@ -88,6 +89,12 @@ pub(in crate::cascades::planner) fn planner_cost_facts(
         }
         _ => false,
     };
+    let runtime_filter_build_distinct_expected = match &plan.operator {
+        LogicalOperator::Join(Join::Comparison(join)) => {
+            runtime_filter_build_distinct_expected(join, column_stats)
+        }
+        _ => None,
+    };
     let runtime_filter_key_types = match &plan.operator {
         LogicalOperator::Join(Join::Comparison(join)) => join
             .conditions
@@ -108,6 +115,7 @@ pub(in crate::cascades::planner) fn planner_cost_facts(
         runtime_filter_probe_multiplicity,
         runtime_filter_probe_source_rows,
         runtime_filter_probe_is_direct,
+        runtime_filter_build_distinct_expected,
         runtime_filter_key_types,
     })
 }
@@ -211,8 +219,36 @@ pub(in crate::cascades::planner) fn expression_cost_facts(
             .map(|rows| CompactRange::new(rows.min as f64, rows.expected as f64, rows.max as f64))
             .transpose()?,
         runtime_filter_probe_is_direct: template.runtime_filter_probe_is_direct,
+        runtime_filter_build_distinct_expected: template.runtime_filter_build_distinct_expected,
         runtime_filter_key_types: template.runtime_filter_key_types.clone(),
     })
+}
+
+fn runtime_filter_build_distinct_expected(
+    join: &paro_planner::operator::ComparisonJoin,
+    column_stats: &HashMap<ColumnBinding, Arc<ColumnStatistics>>,
+) -> Option<u64> {
+    let mut equalities = join
+        .conditions
+        .iter()
+        .filter(|condition| condition.comparison == JoinComparisonType::Equal);
+    let condition = equalities.next()?;
+    if equalities.next().is_some() {
+        // Per-column membership for a composite key represents a superset of
+        // build tuples, so a single-column NDV is not its retained domain.
+        return None;
+    }
+    let binding = match &condition.right {
+        Expression::ColumnRef(column) if column.depth == 0 => column.binding,
+        Expression::Reference(reference) => {
+            *join.right.get_column_bindings().get(reference.index)?
+        }
+        _ => return None,
+    };
+    column_stats
+        .get(&binding)
+        .map(|statistics| statistics.get_distinct_count() as u64)
+        .filter(|distinct| *distinct > 0)
 }
 
 fn runtime_filter_probe_multiplicity(

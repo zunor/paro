@@ -16,7 +16,8 @@ use crate::cascades::ids::{
     PhysicalPayloadId,
 };
 use crate::cascades::memo::{
-    GrantGoalKey, GroupCardinality, LogicalExprKey, LogicalProperties, PhysicalExprKey, RowGoal,
+    GrantGoalKey, GroupCardinality, LogicalExprKey, LogicalProperties, OptimizationContext,
+    PhysicalExprKey, RowGoal,
 };
 use crate::cascades::properties::{
     MutationSafetyRequirement, OrderingRequirement, PartitioningRequirement,
@@ -24,6 +25,7 @@ use crate::cascades::properties::{
     ProvidedReplayability, ProvidedRepresentation, ReplayabilityRequirement,
     RepresentationRequirement, RequiredProperties, ResultGuarantee,
 };
+use crate::cascades::region::RegionArtifactDependencyContract;
 use crate::cascades::rules::{
     EquivalentExpression, GrantDependencyDescriptor, PhysicalImplementation, RulePromise,
     TransformationRule,
@@ -78,6 +80,86 @@ fn cost(score: f64) -> SearchCost {
     }
 }
 
+#[test]
+fn joint_cost_proof_resolves_both_runtime_filter_build_orientations() {
+    let goal = OptimizationGoal {
+        required: super::super::ids::PropertySetId(0),
+        row_goal: RowGoal::All,
+        objective: ObjectiveProfileId(0),
+        grant: GrantGoalKey::Invariant(AdmissibleGrantSetId(0)),
+        context: OptimizationContextId(0),
+    };
+    let mut memo = Memo::new(super::super::budget::SearchBudget::default());
+    let groups = (0..=12)
+        .map(|_| {
+            memo.create_group(
+                schema(),
+                LogicalProperties::default(),
+                GroupCardinality::default(),
+            )
+        })
+        .collect::<Vec<_>>();
+    let owner = groups[12];
+    let first = groups[10];
+    let second = groups[11];
+    let canonical_owner = memo.merge_groups(owner, groups[0]).unwrap();
+    let canonical_first = memo.merge_groups(first, groups[1]).unwrap();
+    let canonical_second = memo.merge_groups(second, groups[2]).unwrap();
+    let facet = Fingerprint(90);
+
+    for (producer, consumer, expected_producer, expected_consumer) in [
+        (
+            RegionBoundaryEndpoint::Input(1),
+            RegionBoundaryEndpoint::Input(0),
+            canonical_second,
+            canonical_first,
+        ),
+        (
+            RegionBoundaryEndpoint::Input(0),
+            RegionBoundaryEndpoint::Input(1),
+            canonical_first,
+            canonical_second,
+        ),
+    ] {
+        let recipe = CostRecipe {
+            child_goals: Box::new([(first, goal), (second, goal)]),
+            local_cost: SearchCost::ZERO,
+            cost_composition: CostComposition::Sequential,
+            spillable: false,
+            enforcer_cost_input: EnforcerCostInput::unbounded(CompactRange::point(1.0).unwrap(), 8),
+            physical_fingerprint: Fingerprint(91),
+            region: Some(RegionCandidateContract {
+                region: super::super::ids::RegionId::new(0),
+                facets: Box::new([facet]),
+                artifacts: Box::new([super::super::region::RegionOwnedArtifact {
+                    fingerprint: facet,
+                    kind: RegionArtifactKind::RuntimeFilter,
+                }]),
+                artifact_dependencies: Box::new([RegionArtifactDependencyContract {
+                    artifact: facet,
+                    producer,
+                    consumer,
+                    kind: RegionDependencyKind::ControlWaitComplete,
+                }]),
+            }),
+        };
+
+        let proof = build_joint_cost_proof(&memo, owner, &recipe, SearchCost::ZERO)
+            .unwrap()
+            .expect("region recipe must produce a proof");
+        assert_eq!(proof.owner_group, canonical_owner);
+        assert_eq!(proof.boundary_goals[0].0, canonical_first);
+        assert_eq!(proof.boundary_goals[1].0, canonical_second);
+        let control = proof
+            .dependencies
+            .iter()
+            .find(|dependency| dependency.kind == RegionDependencyKind::ControlWaitComplete)
+            .expect("runtime-filter proof must carry a control edge");
+        assert_eq!(control.producer, expected_producer);
+        assert_eq!(control.consumer, expected_consumer);
+    }
+}
+
 struct AddEquivalent;
 
 impl TransformationRule for AddEquivalent {
@@ -115,6 +197,28 @@ impl TransformationRule for AddEquivalent {
             },
         }]
         .into_boxed_slice())
+    }
+}
+
+struct AttemptSearchTimeContextExpansion;
+
+impl TransformationRule for AttemptSearchTimeContextExpansion {
+    fn id(&self) -> RuleId {
+        RuleId(21)
+    }
+
+    fn matches(&self, expr: &super::super::memo::LogicalExpr, _: &RuleContext<'_>) -> bool {
+        expr.key.operator == Fingerprint(10)
+    }
+
+    fn apply(
+        &self,
+        _: LogicalExprId,
+        ctx: &mut TransformContext<'_>,
+    ) -> Result<Box<[EquivalentExpression]>> {
+        ctx.memo_mut()
+            .intern_optimization_context(OptimizationContext::new([Fingerprint(999)]))?;
+        unreachable!("search-time context interning must be rejected")
     }
 }
 
@@ -451,6 +555,25 @@ fn optional_transformation_can_improve_mandatory_baseline() {
     let winner = engine.optimize(group, goal, SearchMode::Memo).unwrap();
     assert!(winner.cost.score.risk_adjusted < 5.0);
     assert_eq!(winner.physical_fingerprint, Fingerprint(11));
+}
+
+#[test]
+fn engine_seals_context_catalog_before_optional_search() {
+    let mut budget = super::super::budget::SearchBudget::default();
+    budget.disable_transformation(RuleId(5));
+    let (mut engine, group, goal) = engine_with_budget(budget);
+    engine
+        .registry
+        .register_transformation(AttemptSearchTimeContextExpansion)
+        .unwrap();
+
+    let winner = engine.optimize(group, goal, SearchMode::Memo).unwrap();
+
+    assert_eq!(winner.physical_fingerprint, Fingerprint(10));
+    assert!(engine
+        .memo()
+        .optimization_context(OptimizationContextId(1))
+        .is_none());
 }
 
 #[test]

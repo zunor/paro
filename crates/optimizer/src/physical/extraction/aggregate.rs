@@ -581,6 +581,10 @@ impl PhysicalPlanExtractor {
         };
         let mut spec = AggregateSpec {
             grouping_key_count: groups.len(),
+            initial_lookup_hash_key_count: plan_initial_lookup_hash_key_count(
+                aggregate,
+                &group_indices,
+            ),
             state_output_projection: state_output_projection.into_boxed_slice(),
             estimated_input_rows: aggregate
                 .child
@@ -657,6 +661,7 @@ impl PhysicalPlanExtractor {
 
         let spec = AggregateSpec {
             grouping_key_count: groups.len(),
+            initial_lookup_hash_key_count: groups.len(),
             state_output_projection: Box::new([]),
             estimated_input_rows: distinct
                 .child
@@ -685,6 +690,51 @@ impl PhysicalPlanExtractor {
         };
         Ok((PhysicalNodeKind::Aggregate(Box::new(spec)), vec![child]))
     }
+}
+
+/// Choose the shortest leading key for a flat table's bounded initial lookup
+/// hint. Radix ownership always uses the complete key, and an observed long
+/// probe irreversibly promotes flat lookup to the complete key. Statistics
+/// therefore affect only bounded startup work, never physical semantics.
+fn plan_initial_lookup_hash_key_count(
+    aggregate: &LogicalAggregate,
+    group_indices: &[usize],
+) -> usize {
+    if group_indices.len() <= 1 || !aggregate.grouping_sets.is_empty() {
+        return group_indices.len();
+    }
+    let input_rows = aggregate
+        .child
+        .stats
+        .estimated_cardinality
+        .map(|estimate| estimate.expected)
+        .unwrap_or(u64::MAX);
+    let distinct_counts = group_indices
+        .iter()
+        .map(|&group_index| {
+            aggregate
+                .group_stats
+                .get(group_index)
+                .and_then(Option::as_ref)
+                .map(|statistics| statistics.get_distinct_count() as u64)
+        })
+        .collect::<Vec<_>>();
+    choose_initial_lookup_hash_key_count(input_rows, &distinct_counts)
+}
+
+fn choose_initial_lookup_hash_key_count(input_rows: u64, distinct_counts: &[Option<u64>]) -> usize {
+    let target_domains = input_rows.saturating_div(4).max(1_024);
+    let mut combined_domains = 1u64;
+    for (prefix, distinct) in distinct_counts.iter().copied().enumerate() {
+        let Some(distinct) = distinct.filter(|distinct| *distinct > 0) else {
+            return distinct_counts.len();
+        };
+        combined_domains = combined_domains.saturating_mul(distinct.max(1));
+        if combined_domains >= target_domains {
+            return prefix + 1;
+        }
+    }
+    distinct_counts.len()
 }
 
 fn hash_aggregate_spill_supported(spec: &AggregateSpec) -> bool {
@@ -1061,3 +1111,32 @@ fn can_execute_post_input_rollup(spec: &AggregateSpec) -> bool {
 #[cfg(test)]
 #[path = "aggregate_payload_tests.rs"]
 mod payload_tests;
+
+#[cfg(test)]
+mod hash_planning_tests {
+    use super::choose_initial_lookup_hash_key_count;
+
+    #[test]
+    fn leading_high_cardinality_key_is_sufficient_for_initial_lookup() {
+        assert_eq!(
+            choose_initial_lookup_hash_key_count(80_000, &[Some(75_000), Some(200), Some(4_000)]),
+            1
+        );
+    }
+
+    #[test]
+    fn low_cardinality_keys_are_combined_until_the_target_domain() {
+        assert_eq!(
+            choose_initial_lookup_hash_key_count(80_000, &[Some(100), Some(250), Some(4_000)]),
+            2
+        );
+    }
+
+    #[test]
+    fn unknown_statistics_keep_the_complete_hash_key() {
+        assert_eq!(
+            choose_initial_lookup_hash_key_count(80_000, &[Some(100), None, Some(4_000)]),
+            3
+        );
+    }
+}

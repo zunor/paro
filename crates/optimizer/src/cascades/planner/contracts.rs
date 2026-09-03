@@ -289,6 +289,8 @@ pub(super) fn implementation_spillable(
 ) -> bool {
     match flavor {
         PhysicalImplementationFlavor::HashJoin
+        | PhysicalImplementationFlavor::HashJoinBuildLeft
+        | PhysicalImplementationFlavor::HashJoinBuildLeftRuntimeFilter
         | PhysicalImplementationFlavor::HashJoinRuntimeFilter
         | PhysicalImplementationFlavor::HashAggregate
         | PhysicalImplementationFlavor::PartitionAggregateWindow
@@ -331,6 +333,8 @@ pub(super) fn planner_cost_composition(
     }
     let overlapping_children = match flavor {
         PhysicalImplementationFlavor::HashJoin
+        | PhysicalImplementationFlavor::HashJoinBuildLeft
+        | PhysicalImplementationFlavor::HashJoinBuildLeftRuntimeFilter
         | PhysicalImplementationFlavor::HashJoinRuntimeFilter => 0b11,
         PhysicalImplementationFlavor::CrossProductInMemory
         | PhysicalImplementationFlavor::CrossProductExternal => 0b11,
@@ -346,6 +350,49 @@ pub(super) fn planner_cost_composition(
         | PhysicalImplementationFlavor::ClassicIeJoin
         | PhysicalImplementationFlavor::SearchProvider => 0,
     };
+    if flavor == PhysicalImplementationFlavor::HashJoinBuildLeftRuntimeFilter {
+        let build = facts
+            .child_rows
+            .first()
+            .copied()
+            .unwrap_or(CompactRange::ZERO);
+        let probe = facts
+            .child_rows
+            .get(1)
+            .copied()
+            .unwrap_or(CompactRange::ZERO);
+        if build.expected >= probe.expected {
+            return Ok(CostComposition::RetainedState {
+                overlapping_children,
+            });
+        }
+        let build_domain = CompactRange::new(0.0, build.expected, build.upper)?;
+        let resource = crate::physical::RuntimeFilterResourceContract::for_keys(
+            &facts.runtime_filter_key_types,
+            1,
+        )?;
+        let hard_exact = resource
+            .guarantees_exact_single_key(facts.child_rows_hard_upper.first().copied().flatten());
+        let retained = runtime_filtered_probe_work(
+            probe,
+            build_domain,
+            RuntimeFilterProbeMultiplicity::Unknown,
+            hard_exact || resource.expects_exact_single_key(build_domain.expected),
+        )?;
+        let ratio_ppm = |retained: f64, source: f64| {
+            if source <= 0.0 {
+                1_000_000
+            } else {
+                ((retained / source).clamp(0.0, 1.0) * 1_000_000.0).round() as u32
+            }
+        };
+        return Ok(CostComposition::SidewaysFilter {
+            overlapping_children,
+            filtered_child: 1,
+            expected_retained_ppm: ratio_ppm(retained.expected, probe.expected),
+            upper_retained_ppm: ratio_ppm(retained.upper, probe.upper),
+        });
+    }
     if flavor == PhysicalImplementationFlavor::HashJoinRuntimeFilter {
         // Scaling a child winner is valid only while this region owns the
         // rowset boundary being reduced. Once lineage crosses another join,
@@ -369,24 +416,27 @@ pub(super) fn planner_cost_composition(
             .get(1)
             .copied()
             .unwrap_or(CompactRange::ZERO);
+        let build_domain = runtime_filter_build_domain(facts, build)?;
         // A non-local runtime filter is evaluated at the traced rowset source,
         // before intervening joins. Compare the build domain with that source;
         // using the already-reduced join child cardinality incorrectly rejects
         // filters that can remove source I/O before another selective join.
-        if build.expected >= source.expected {
+        if build_domain.expected >= source.expected {
             return Ok(CostComposition::RetainedState {
                 overlapping_children,
             });
         }
+        let resource = crate::physical::RuntimeFilterResourceContract::for_keys(
+            &facts.runtime_filter_key_types,
+            1,
+        )?;
+        let hard_exact = resource
+            .guarantees_exact_single_key(facts.child_rows_hard_upper.get(1).copied().flatten());
         let retained = runtime_filtered_probe_work(
             source,
-            build,
+            build_domain,
             facts.runtime_filter_probe_multiplicity,
-            crate::physical::RuntimeFilterResourceContract::for_keys(
-                &facts.runtime_filter_key_types,
-                1,
-            )?
-            .guarantees_exact_single_key(facts.child_rows_hard_upper.get(1).copied().flatten()),
+            hard_exact || resource.expects_exact_single_key(build_domain.expected),
         )?;
         let ratio_ppm = |retained: f64, source: f64| {
             if source <= 0.0 {

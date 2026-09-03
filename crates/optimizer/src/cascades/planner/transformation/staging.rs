@@ -13,46 +13,48 @@ pub(super) struct StagedEquivalent {
 }
 
 pub(super) struct StagingRequest {
-    plan: LogicalPlan,
-    column_stats: Arc<HashMap<ColumnBinding, Arc<ColumnStatistics>>>,
-    target: GroupId,
-    rule: RuleId,
-    preserved_region_facet: Option<Fingerprint>,
-    refined_cardinality_kind: Option<CardinalityRecipeKind>,
+    pub(super) plan: LogicalPlan,
+    pub(super) column_stats: Arc<HashMap<ColumnBinding, Arc<ColumnStatistics>>>,
+    pub(super) target: StagingTarget,
+    pub(super) regions: StagingRegionRequirements,
 }
 
-impl StagingRequest {
-    pub(super) fn new(
-        plan: LogicalPlan,
-        column_stats: Arc<HashMap<ColumnBinding, Arc<ColumnStatistics>>>,
-        target: GroupId,
-        rule: RuleId,
-        preserved_region_facet: Option<Fingerprint>,
-        refined_cardinality_kind: Option<CardinalityRecipeKind>,
-    ) -> Self {
-        Self {
-            plan,
-            column_stats,
-            target,
-            rule,
-            preserved_region_facet,
-            refined_cardinality_kind,
-        }
-    }
+pub(super) struct StagingTarget {
+    pub(super) group: GroupId,
+    pub(super) rule: RuleId,
+    pub(super) input_context: OptimizationContextId,
+    pub(super) child_context: OptimizationContextId,
+    pub(super) refined_cardinality_kind: Option<CardinalityRecipeKind>,
+}
+
+pub(super) struct StagingRegionRequirements {
+    pub(super) preserved_facet: Option<Fingerprint>,
+    pub(super) extended_required_facets: Box<[Fingerprint]>,
+    pub(super) inherited_runtime_filter_facet: Option<Fingerprint>,
 }
 
 pub(super) fn stage_transformed_expression(
     request: StagingRequest,
     memo: &mut Memo,
     state: &mut PlannerTransformState,
-) -> Result<StagedEquivalent> {
+) -> Result<Option<StagedEquivalent>> {
     let StagingRequest {
         plan,
         column_stats,
-        target,
-        rule,
-        preserved_region_facet,
-        refined_cardinality_kind,
+        target:
+            StagingTarget {
+                group: target,
+                rule,
+                input_context,
+                child_context,
+                refined_cardinality_kind,
+            },
+        regions:
+            StagingRegionRequirements {
+                preserved_facet: preserved_region_facet,
+                extended_required_facets: extended_required_region_facets,
+                inherited_runtime_filter_facet,
+            },
     } = request;
 
     struct NodeState {
@@ -66,15 +68,36 @@ pub(super) fn stage_transformed_expression(
         rule: RuleId,
     }
 
-    fn stage_node(
+    struct StagingSession<'a> {
+        memo: &'a mut Memo,
+        state: &'a mut PlannerTransformState,
+        options: StagingOptions<'a>,
+        pending_runtime_filter_facets: Vec<RegionFacet>,
+    }
+
+    struct NodeStagingRequest {
         plan: LogicalPlan,
         target: Option<GroupId>,
-        memo: &mut Memo,
-        state: &mut PlannerTransformState,
-        options: &StagingOptions<'_>,
         required_region_facet: Option<Fingerprint>,
+        inherited_runtime_filter_facet: Option<Fingerprint>,
+        node_context: OptimizationContextId,
+        target_child_context: Option<OptimizationContextId>,
         refined_cardinality_kind: Option<CardinalityRecipeKind>,
+    }
+
+    fn stage_node(
+        session: &mut StagingSession<'_>,
+        request: NodeStagingRequest,
     ) -> Result<(LogicalPlan, NodeState, Option<StagedEquivalent>)> {
+        let NodeStagingRequest {
+            plan,
+            target,
+            required_region_facet,
+            inherited_runtime_filter_facet,
+            node_context,
+            target_child_context,
+            refined_cardinality_kind,
+        } = request;
         let mut detached = Vec::new();
         let skeleton = plan.try_map_children(|child| {
             detached.push(child);
@@ -85,13 +108,24 @@ pub(super) fn stage_transformed_expression(
         // already-staged subtree at every ancestor (quadratic on chains).
         let semantic_template = semantic_plan::detach_template(duplicate_plan_preserving_indices(
             &skeleton,
-            state.bind_context.shared().as_ref(),
+            session.state.bind_context.shared().as_ref(),
         ));
         let mut child_states = Vec::with_capacity(detached.len());
         let mut children = Vec::with_capacity(detached.len());
+        let descendant_context = target_child_context.unwrap_or(node_context);
         for child in detached {
-            let (child, child_state, staged) =
-                stage_node(child, None, memo, state, options, None, None)?;
+            let (child, child_state, staged) = stage_node(
+                session,
+                NodeStagingRequest {
+                    plan: child,
+                    target: None,
+                    required_region_facet: None,
+                    inherited_runtime_filter_facet: None,
+                    node_context: descendant_context,
+                    target_child_context: None,
+                    refined_cardinality_kind: None,
+                },
+            )?;
             debug_assert!(staged.is_none());
             children.push(child);
             child_states.push(child_state);
@@ -107,6 +141,11 @@ pub(super) fn stage_transformed_expression(
                 "transformed planner tree produced an extra staged child",
             ));
         }
+
+        let memo = &mut *session.memo;
+        let state = &mut *session.state;
+        let options = &session.options;
+        let pending_runtime_filter_facets = &mut session.pending_runtime_filter_facets;
 
         let output_bindings = plan.get_column_bindings();
         let output_types = plan.types();
@@ -187,12 +226,9 @@ pub(super) fn stage_transformed_expression(
                 .collect::<Vec<_>>()
                 .into_boxed_slice(),
         };
-        let mut cardinality = derive_group_cardinality(
-            &plan.operator,
-            &key.children,
-            &plan.stats,
-            key.stable_fingerprint(),
-        );
+        let logical_identity = key.stable_fingerprint();
+        let mut cardinality =
+            derive_group_cardinality(&plan.operator, &key.children, &plan.stats, logical_identity);
         if let Some(target) = target {
             cardinality = if let Some(kind) = refined_cardinality_kind {
                 cardinality.with_kind(kind)
@@ -211,15 +247,36 @@ pub(super) fn stage_transformed_expression(
 
         if target.is_none() {
             if let Some((group, _)) = state.expression_groups.get(&key).and_then(|candidates| {
-                candidates.iter().copied().find(|(group, _)| {
-                    memo.group(*group).is_some_and(|existing| {
-                        existing.schema == schema
-                            && existing
-                                .logical_properties
-                                .same_contract(&logical_properties)
-                    })
+                candidates.iter().copied().find(|(group, logical)| {
+                    let context_matches = memo
+                        .logical_expr(*logical)
+                        .and_then(|logical| state.metadata.get(&logical.payload))
+                        .is_some_and(|metadata| metadata.input_context == node_context);
+                    context_matches
+                        && memo.group(*group).is_some_and(|existing| {
+                            existing.schema == schema
+                                && existing
+                                    .logical_properties
+                                    .same_contract(&logical_properties)
+                        })
                 })
             }) {
+                let group = memo.canonical_group(group);
+                let existing = memo.group_mut(group).ok_or_else(|| {
+                    paro_error::internal("reused transformed expression lost its Memo group")
+                })?;
+                // Reusing identity must not discard facts derived in the new
+                // semantic context. This is particularly important for a CTE
+                // reference after predicate pushdown: its operator key is
+                // unchanged, while the owner proves a much tighter row
+                // domain. Equivalent facts intersect at the group boundary;
+                // no payload-local snapshot is allowed to freeze the older
+                // estimate.
+                existing
+                    .logical_properties
+                    .merge_equivalent_facts(&logical_properties);
+                existing.cardinality =
+                    std::mem::take(&mut existing.cardinality).canonical_with(cardinality.clone());
                 return Ok((
                     plan,
                     NodeState {
@@ -262,6 +319,31 @@ pub(super) fn stage_transformed_expression(
 
         if target.is_some() {
             if let Some(existing) = memo.logical_expr_for_key(group, &key) {
+                let existing_context = state
+                    .metadata
+                    .get(&existing.payload)
+                    .map(|metadata| metadata.input_context)
+                    .ok_or_else(|| {
+                        paro_error::internal("existing target expression lost planner metadata")
+                    })?;
+                if existing_context != node_context {
+                    // Structural identity is not occurrence identity. Until
+                    // the Memo index carries context as a first-class key, an
+                    // advisory rewrite that collides with the same relational
+                    // key in another expression-path context must decline.
+                    // Returning `None` lets the outer TransformContext roll
+                    // back every recursively staged child and sidecar write;
+                    // this expected miss is not an optimizer corruption.
+                    return Ok((
+                        plan,
+                        NodeState {
+                            group,
+                            columns: output_columns.into_boxed_slice(),
+                            region_scope,
+                        },
+                        None,
+                    ));
+                }
                 return Ok((
                     plan,
                     NodeState {
@@ -283,11 +365,11 @@ pub(super) fn stage_transformed_expression(
             semantic_template,
             column_stats: options.column_stats.clone(),
         });
-        let mut implementations = planner_implementation_set(&plan, state.rowset_scan_pushdown);
-        let runtime_filter_candidate = target.is_none() && implementations.hash_join_runtime_filter;
-        if !runtime_filter_candidate {
-            implementations.hash_join_runtime_filter = false;
-        }
+        let implementations = planner_implementation_set(&plan, state.rowset_scan_pushdown);
+        let runtime_filter_candidate = implementations.hash_join_runtime_filter
+            || implementations.hash_join_build_left_runtime_filter;
+        let runtime_filter_scope =
+            runtime_filter_candidate.then(|| std::iter::once(group).collect::<BTreeSet<_>>());
         let metadata = PlannerOperatorMetadata {
             origin_rule: Some(options.rule),
             operator_type: plan.operator.op_type(),
@@ -319,7 +401,11 @@ pub(super) fn stage_transformed_expression(
             implementations,
             grant_dependency: planner_grant_dependency(&plan.operator),
             spillable: planner_operator_spillable(&plan.operator),
-            cost_facts: planner_cost_facts(&plan, state.scan_access_cost)?,
+            cost_facts: planner_cost_facts(
+                &plan,
+                options.column_stats.as_ref(),
+                state.scan_access_cost,
+            )?,
             output_columns: output_columns.clone().into_boxed_slice(),
             child_required: intern_child_requirements(
                 memo,
@@ -327,6 +413,8 @@ pub(super) fn stage_transformed_expression(
             )?,
             child_row_goals: child_row_goals(&plan.operator, child_states.len()),
             search: None,
+            input_context: node_context,
+            child_context: target_child_context.unwrap_or(node_context),
             required_region_facet: target.and(required_region_facet),
             runtime_filter_region_facet: None,
             structural_retained_children: planner_structural_retained_children(&plan.operator),
@@ -339,6 +427,43 @@ pub(super) fn stage_transformed_expression(
         }
 
         let staged = if target.is_some() {
+            if runtime_filter_candidate {
+                let mut facet = if let Some(fingerprint) = inherited_runtime_filter_facet {
+                    memo.regions()
+                        .nodes
+                        .iter()
+                        .flat_map(|region| region.facets.iter())
+                        .find(|facet| facet.fingerprint == fingerprint)
+                        .cloned()
+                        .ok_or_else(|| {
+                            paro_error::internal(
+                                "transformation inherited an unknown runtime-filter facet",
+                            )
+                        })?
+                } else {
+                    let mut facet = planner_region_facet(
+                        RegionFacetKind::RuntimeFilter,
+                        FacetCriticality::Optional,
+                        logical_identity,
+                        operator_fingerprint,
+                        BTreeSet::new(),
+                    );
+                    facet.priority = 2_000 + RegionFacetKind::RuntimeFilter as u16;
+                    facet
+                };
+                facet
+                    .scope
+                    .extend(runtime_filter_scope.clone().expect("candidate scope"));
+                let fingerprint = facet.fingerprint;
+                state
+                    .metadata
+                    .get_mut(&payload)
+                    .ok_or_else(|| {
+                        paro_error::internal("transformed runtime-filter payload disappeared")
+                    })?
+                    .runtime_filter_region_facet = Some(fingerprint);
+                pending_runtime_filter_facets.push(facet);
+            }
             Some(StagedEquivalent {
                 key,
                 payload,
@@ -350,14 +475,12 @@ pub(super) fn stage_transformed_expression(
                 memo.insert_logical(group, key.clone(), payload, EquivalenceProof::Initial)?;
             state.record_expression_group(key, group, logical);
             if runtime_filter_candidate {
-                let (scope, _) = region_scope
-                    .materialize_bounded(usize::from(memo.budget().max_composite_region_groups));
                 let mut facet = planner_region_facet(
                     RegionFacetKind::RuntimeFilter,
                     FacetCriticality::Optional,
-                    logical,
+                    logical_identity,
                     operator_fingerprint,
-                    scope,
+                    runtime_filter_scope.expect("candidate scope"),
                 );
                 facet.priority = 2_000 + RegionFacetKind::RuntimeFilter as u16;
                 let fingerprint = facet.fingerprint;
@@ -374,8 +497,7 @@ pub(super) fn stage_transformed_expression(
                         paro_error::internal("dynamic runtime-filter payload disappeared")
                     })?
                     .runtime_filter_region_facet = Some(fingerprint);
-                let dropped = memo.upsert_region_facet(facet)?;
-                disable_dropped_runtime_filter_facets(state, &dropped)?;
+                pending_runtime_filter_facets.push(facet);
             }
             None
         };
@@ -390,20 +512,34 @@ pub(super) fn stage_transformed_expression(
         ))
     }
 
-    let options = StagingOptions {
-        column_stats: &column_stats,
-        rule,
+    let (root, staged, pending_runtime_filter_facets) = {
+        let mut session = StagingSession {
+            memo,
+            state,
+            options: StagingOptions {
+                column_stats: &column_stats,
+                rule,
+            },
+            pending_runtime_filter_facets: Vec::new(),
+        };
+        let (_, root, staged) = stage_node(
+            &mut session,
+            NodeStagingRequest {
+                plan,
+                target: Some(target),
+                required_region_facet: preserved_region_facet,
+                inherited_runtime_filter_facet,
+                node_context: input_context,
+                target_child_context: Some(child_context),
+                refined_cardinality_kind,
+            },
+        )?;
+        (root, staged, session.pending_runtime_filter_facets)
     };
-    let (_, root, staged) = stage_node(
-        plan,
-        Some(target),
-        memo,
-        state,
-        &options,
-        preserved_region_facet,
-        refined_cardinality_kind,
-    )?;
-    if let Some(fingerprint) = preserved_region_facet {
+    let Some(staged) = staged else {
+        return Ok(None);
+    };
+    for fingerprint in extended_required_region_facets {
         let mut facet = memo
             .regions()
             .nodes
@@ -426,7 +562,16 @@ pub(super) fn stage_transformed_expression(
         let dropped = memo.upsert_region_facet(facet)?;
         disable_dropped_runtime_filter_facets(state, &dropped)?;
     }
-    staged.ok_or_else(|| paro_error::internal("transformation failed to stage its root"))
+    // Optional facets created inside a transformed mandatory region are
+    // normalized only after that region owns its complete rewritten scope.
+    // Publishing them during recursive staging would compare them with the
+    // stale pre-transformation scope and permanently drop otherwise nested
+    // runtime filters as an apparent oversized overlap.
+    for facet in pending_runtime_filter_facets {
+        let dropped = memo.upsert_region_facet(facet)?;
+        disable_dropped_runtime_filter_facets(state, &dropped)?;
+    }
+    Ok(Some(staged))
 }
 
 fn disable_dropped_runtime_filter_facets(
@@ -448,4 +593,81 @@ fn disable_dropped_runtime_filter_facets(
         state.disable_runtime_filter(payload)?;
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use paro_common::types::LogicalType;
+    use paro_planner::operator::ExpressionGet;
+
+    use super::*;
+
+    #[test]
+    fn root_key_collision_in_another_context_declines_and_rolls_back() {
+        let bind_context = BindContext::new();
+        let plan = LogicalPlan::new(
+            &bind_context,
+            LogicalOperator::ExpressionGet(ExpressionGet::new(
+                0,
+                Vec::new(),
+                vec!["v".to_string()],
+                vec![LogicalType::Integer],
+            )),
+        );
+        let staged_plan = duplicate_plan_preserving_indices(&plan, bind_context.shared().as_ref());
+        let mut input = MemoBuilder::build(plan, bind_context, SearchBudget::default()).unwrap();
+        let root = input.root;
+        let (schema, properties, cardinality) = {
+            let group = input.memo.group(root).unwrap();
+            (
+                group.schema.clone(),
+                group.logical_properties.clone(),
+                group.cardinality.clone(),
+            )
+        };
+        let groups_before = input.memo.group_count();
+        let state = input.planner_state.clone();
+        let metadata_before = state.read().unwrap().metadata.len();
+        let mut transaction = TransformContext::new(&mut input.memo, root);
+
+        let outcome = transaction
+            .with_sidecar_transaction(
+                state.clone(),
+                PlannerTransformState::savepoint,
+                PlannerTransformState::rollback_to,
+                |memo, state| {
+                    // Model work performed while recursively staging a plan;
+                    // a context collision at its root must cause all of it to
+                    // be discarded by the common advisory-miss path.
+                    memo.create_group(schema, properties, cardinality);
+                    stage_transformed_expression(
+                        StagingRequest {
+                            plan: staged_plan,
+                            column_stats: Arc::new(HashMap::new()),
+                            target: StagingTarget {
+                                group: root,
+                                rule: RuleId(999),
+                                input_context: OptimizationContextId(1),
+                                child_context: OptimizationContextId(1),
+                                refined_cardinality_kind: None,
+                            },
+                            regions: StagingRegionRequirements {
+                                preserved_facet: None,
+                                extended_required_facets: Box::new([]),
+                                inherited_runtime_filter_facet: None,
+                            },
+                        },
+                        memo,
+                        state,
+                    )
+                },
+            )
+            .unwrap();
+
+        assert!(outcome.is_none());
+        assert_eq!(transaction.memo().group_count(), groups_before + 1);
+        transaction.rollback().unwrap();
+        assert_eq!(input.memo.group_count(), groups_before);
+        assert_eq!(state.read().unwrap().metadata.len(), metadata_before);
+    }
 }

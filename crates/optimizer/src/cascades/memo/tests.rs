@@ -575,3 +575,117 @@ fn winner_recording_recomputes_local_cost_instead_of_trusting_total() {
         )
         .is_err());
 }
+
+#[test]
+fn equivalent_region_facets_merge_their_best_scheduling_priority() {
+    use super::super::region::{FacetCriticality, RegionFacet, RegionFacetKind};
+
+    let mut memo = Memo::new(SearchBudget::default());
+    let group = memo.create_group(
+        schema(1),
+        LogicalProperties::default(),
+        GroupCardinality::default(),
+    );
+    let fingerprint = Fingerprint(91);
+    memo.upsert_region_facet(RegionFacet {
+        fingerprint,
+        kind: RegionFacetKind::RuntimeFilter,
+        criticality: FacetCriticality::Optional,
+        priority: 2_003,
+        scope_contract: super::super::region::RegionScopeContract::OwnerWithImmediateInputs,
+        scope: std::iter::once(group).collect(),
+    })
+    .unwrap();
+    memo.upsert_region_facet(RegionFacet {
+        fingerprint,
+        kind: RegionFacetKind::RuntimeFilter,
+        criticality: FacetCriticality::Optional,
+        priority: 1_003,
+        scope_contract: super::super::region::RegionScopeContract::OwnerWithImmediateInputs,
+        scope: std::iter::once(group).collect(),
+    })
+    .unwrap();
+
+    let facet = memo
+        .regions()
+        .nodes
+        .iter()
+        .flat_map(|region| region.facets.iter())
+        .find(|facet| facet.fingerprint == fingerprint)
+        .unwrap();
+    assert_eq!(facet.priority, 1_003);
+}
+
+#[test]
+fn optimization_context_catalog_is_linear_and_sealed_before_search() {
+    let mut memo = Memo::new(SearchBudget::default());
+    let group = memo.create_group(
+        schema(1),
+        LogicalProperties::default(),
+        GroupCardinality::default(),
+    );
+    memo.insert_logical(
+        group,
+        LogicalExprKey {
+            operator: Fingerprint(1),
+            scalars: Box::new([]),
+            children: Box::new([]),
+        },
+        LogicalPayloadId(0),
+        EquivalenceProof::Initial,
+    )
+    .unwrap();
+    let input = memo
+        .intern_optimization_context(OptimizationContext::new([Fingerprint(11)]))
+        .unwrap();
+    let child = memo
+        .intern_optimization_context(OptimizationContext::new([Fingerprint(22)]))
+        .unwrap();
+
+    assert_eq!(
+        memo.optimization_context(input),
+        Some(&OptimizationContext::new([Fingerprint(11)]))
+    );
+    assert_eq!(
+        memo.optimization_context(child),
+        Some(&OptimizationContext::new([Fingerprint(22)]))
+    );
+    memo.freeze_optimization_contexts().unwrap();
+
+    let error = memo
+        .intern_optimization_context(OptimizationContext::new([Fingerprint(33)]))
+        .expect_err("optional search cannot create context combinations");
+    assert!(error
+        .to_string()
+        .contains("immutable after initial Memo binding"));
+}
+
+#[test]
+fn optimization_context_catalog_rejects_a_superlinear_initial_state() {
+    let mut memo = Memo::new(SearchBudget::default());
+    let group = memo.create_group(
+        schema(1),
+        LogicalProperties::default(),
+        GroupCardinality::default(),
+    );
+    memo.insert_logical(
+        group,
+        LogicalExprKey {
+            operator: Fingerprint(1),
+            scalars: Box::new([]),
+            children: Box::new([]),
+        },
+        LogicalPayloadId(0),
+        EquivalenceProof::Initial,
+    )
+    .unwrap();
+    for facet in [11, 22, 33] {
+        memo.intern_optimization_context(OptimizationContext::new([Fingerprint(facet)]))
+            .unwrap();
+    }
+
+    let error = memo
+        .freeze_optimization_contexts()
+        .expect_err("one expression admits at most two non-root contexts");
+    assert!(error.to_string().contains("exceeds its linear bound"));
+}

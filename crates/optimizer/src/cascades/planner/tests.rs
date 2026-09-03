@@ -79,6 +79,7 @@ fn calibrated_tuple_work_distinguishes_narrow_and_wide_intermediates() {
         runtime_filter_probe_multiplicity: RuntimeFilterProbeMultiplicity::Unknown,
         runtime_filter_probe_source_rows: None,
         runtime_filter_probe_is_direct: false,
+        runtime_filter_build_distinct_expected: None,
         runtime_filter_key_types: Box::new([]),
     };
     let calibrated_cost = |facts: &ResolvedPlannerCostFacts| {
@@ -158,6 +159,7 @@ fn expression_cost_facts_read_current_group_cardinality() {
         runtime_filter_probe_multiplicity: RuntimeFilterProbeMultiplicity::Unknown,
         runtime_filter_probe_source_rows: None,
         runtime_filter_probe_is_direct: false,
+        runtime_filter_build_distinct_expected: None,
         runtime_filter_key_types: Box::new([]),
     };
 
@@ -346,6 +348,89 @@ fn memo_winner_names_the_hash_join_implementation() {
         contract.implementation,
         PhysicalImplementationFlavor::HashJoin
     );
+}
+
+#[test]
+fn memo_hash_join_can_select_logical_left_as_physical_build() {
+    let bind_context = BindContext::new();
+    let mut left = LogicalPlan::new(
+        &bind_context,
+        LogicalOperator::ExpressionGet(ExpressionGet::new(
+            0,
+            integer_value_rows(8, 1),
+            vec!["left".to_string()],
+            vec![LogicalType::Integer],
+        )),
+    );
+    left.stats.estimated_cardinality = Some(CardinalityEstimate::exact(8));
+    let mut right = LogicalPlan::new(
+        &bind_context,
+        LogicalOperator::ExpressionGet(ExpressionGet::new(
+            1,
+            integer_value_rows(4096, 1),
+            vec!["right".to_string()],
+            vec![LogicalType::Integer],
+        )),
+    );
+    right.stats.estimated_cardinality = Some(CardinalityEstimate::exact(4096));
+    let condition = JoinCondition::equality(
+        Expression::Reference(ReferenceExpression::new(0, LogicalType::Integer)),
+        Expression::Reference(ReferenceExpression::new(0, LogicalType::Integer)),
+    );
+    let mut join = LogicalPlan::new(
+        &bind_context,
+        LogicalOperator::Join(Join::comparison(
+            JoinType::Left,
+            left,
+            right,
+            vec![condition],
+        )),
+    );
+    join.stats.estimated_cardinality = Some(CardinalityEstimate::exact(8));
+
+    let input = MemoBuilder::build(join, bind_context, SearchBudget::default()).unwrap();
+    let optimized = input.optimize(&test_grant_classes()).unwrap();
+    let optimized = &optimized.variants[0];
+    let contract = optimized
+        .contracts
+        .get(&optimized.plan.id)
+        .expect("root winner contract");
+    assert_eq!(
+        contract.implementation,
+        PhysicalImplementationFlavor::HashJoinBuildLeft
+    );
+}
+
+#[test]
+fn preserved_build_can_filter_a_direct_non_preserved_probe() {
+    let mut preserved_build = test_base_get(0, 20_021, "preserved_build", 538);
+    preserved_build.stats.estimated_cardinality = Some(CardinalityEstimate::exact(538));
+    let mut non_preserved_probe = test_base_get(1, 20_022, "non_preserved_probe", 719_384);
+    non_preserved_probe.stats.estimated_cardinality = Some(CardinalityEstimate::exact(719_384));
+    let condition = JoinCondition::equality(
+        Expression::Reference(ReferenceExpression::new(0, LogicalType::Integer)),
+        Expression::Reference(ReferenceExpression::new(0, LogicalType::Integer)),
+    );
+    let join = ComparisonJoin::new(
+        JoinType::Left,
+        preserved_build,
+        non_preserved_probe,
+        vec![condition],
+    );
+    assert!(supports_build_left_runtime_filter_auxiliary(&join, true));
+    assert!(!supports_runtime_filter_auxiliary(&join, true));
+    let mut plan = LogicalPlan::synthetic(LogicalOperator::Join(Join::Comparison(join)));
+    plan.stats.estimated_cardinality = Some(CardinalityEstimate::exact(538));
+
+    let input = MemoBuilder::build(plan, BindContext::new(), SearchBudget::default()).unwrap();
+    let optimized = input.optimize(&test_grant_classes()).unwrap();
+    let variant = &optimized.variants[0];
+    let contract = variant.contracts.get(&variant.plan.id).unwrap();
+    assert_eq!(
+        contract.implementation,
+        PhysicalImplementationFlavor::HashJoinBuildLeftRuntimeFilter
+    );
+    assert_eq!(contract.owned_artifacts.len(), 1);
 }
 
 #[test]
@@ -708,7 +793,7 @@ fn direct_rowset_reference_admits_and_selects_runtime_filter_region() {
 }
 
 #[test]
-fn oversized_optional_runtime_filter_facet_yields_to_the_baseline() {
+fn oversized_runtime_filter_candidate_span_yields_to_the_baseline() {
     let mut left = test_base_get(0, 20_011, "probe", 20_000);
     left.stats.estimated_cardinality = Some(CardinalityEstimate::exact(20_000));
     let mut right = test_base_get(1, 20_012, "build", 20);
@@ -729,8 +814,8 @@ fn oversized_optional_runtime_filter_facet_yields_to_the_baseline() {
     budget.max_composite_region_groups = 2;
 
     let input = MemoBuilder::build(plan, BindContext::new(), budget).unwrap();
-    assert!(input.memo.regions().nodes.is_empty());
-    assert_eq!(input.memo.regions().dropped_optional_facets.len(), 1);
+    assert_eq!(input.memo.regions().nodes.len(), 1);
+    assert!(input.memo.regions().dropped_optional_facets.is_empty());
     let optimized = input.optimize(&test_grant_classes()).unwrap();
     let variant = &optimized.variants[0];
     let contract = variant.contracts.get(&variant.plan.id).unwrap();
@@ -868,6 +953,76 @@ fn inner_join_probe_keeps_runtime_filter_consumer_lineage() {
         physical.node(lineage[0].0).kind,
         crate::physical::PhysicalNodeKind::RowsetScan(_)
     ));
+}
+
+#[test]
+fn left_outer_preserved_probe_keeps_runtime_filter_consumer_lineage() {
+    let preserved = test_base_get(0, 20_034, "preserved_probe", 20_000);
+    let nullable_build = test_base_get(1, 20_035, "nullable_build", 2_000);
+    let left_join = ComparisonJoin::new(
+        JoinType::Left,
+        preserved,
+        nullable_build,
+        vec![JoinCondition::equality(
+            Expression::Reference(ReferenceExpression::new(0, LogicalType::Integer)),
+            Expression::Reference(ReferenceExpression::new(0, LogicalType::Integer)),
+        )],
+    );
+    let probe = LogicalPlan::synthetic(LogicalOperator::Join(Join::Comparison(left_join)));
+    let build = test_base_get(2, 20_036, "filter_build", 20);
+    let join = ComparisonJoin::new(
+        JoinType::Inner,
+        probe,
+        build,
+        vec![JoinCondition::equality(
+            Expression::Reference(ReferenceExpression::new(0, LogicalType::Integer)),
+            Expression::Reference(ReferenceExpression::new(0, LogicalType::Integer)),
+        )],
+    );
+    assert!(supports_runtime_filter_auxiliary(&join, true));
+
+    let logical = LogicalPlan::synthetic(LogicalOperator::Join(Join::Comparison(join)));
+    let physical =
+        crate::physical::PhysicalPlanExtractor::new(crate::physical::ExtractionContext::default())
+            .extract(&logical)
+            .unwrap();
+    let [probe, _] = physical.child_ids(&physical.node(physical.root).children) else {
+        panic!("outer hash join must be binary");
+    };
+    let lineage = crate::physical::lineage::trace_rowset_lineage(&physical, *probe, 0);
+    assert_eq!(lineage.len(), 1);
+    assert!(matches!(
+        physical.node(lineage[0].0).kind,
+        crate::physical::PhysicalNodeKind::RowsetScan(_)
+    ));
+}
+
+#[test]
+fn left_outer_nullable_build_output_stops_runtime_filter_lineage() {
+    let preserved = test_base_get(0, 20_037, "preserved_probe", 20_000);
+    let nullable_build = test_base_get(1, 20_038, "nullable_build", 2_000);
+    let left_join = ComparisonJoin::new(
+        JoinType::Left,
+        preserved,
+        nullable_build,
+        vec![JoinCondition::equality(
+            Expression::Reference(ReferenceExpression::new(0, LogicalType::Integer)),
+            Expression::Reference(ReferenceExpression::new(0, LogicalType::Integer)),
+        )],
+    );
+    let probe = LogicalPlan::synthetic(LogicalOperator::Join(Join::Comparison(left_join)));
+    let build = test_base_get(2, 20_039, "filter_build", 20);
+    let join = ComparisonJoin::new(
+        JoinType::Inner,
+        probe,
+        build,
+        vec![JoinCondition::equality(
+            Expression::Reference(ReferenceExpression::new(1, LogicalType::Integer)),
+            Expression::Reference(ReferenceExpression::new(0, LogicalType::Integer)),
+        )],
+    );
+
+    assert!(!supports_runtime_filter_auxiliary(&join, true));
 }
 
 #[test]

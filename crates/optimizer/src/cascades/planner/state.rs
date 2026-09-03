@@ -165,6 +165,8 @@ impl PlannerTransformState {
             if let Some(metadata) = self.metadata.get_mut(&change.payload) {
                 metadata.runtime_filter_region_facet = change.previous_facet;
                 metadata.implementations.hash_join_runtime_filter = change.previous_implementation;
+                metadata.implementations.hash_join_build_left_runtime_filter =
+                    change.previous_build_left_implementation;
             }
         }
 
@@ -221,9 +223,13 @@ impl PlannerTransformState {
                 payload,
                 previous_facet: metadata.runtime_filter_region_facet,
                 previous_implementation: metadata.implementations.hash_join_runtime_filter,
+                previous_build_left_implementation: metadata
+                    .implementations
+                    .hash_join_build_left_runtime_filter,
             });
         metadata.runtime_filter_region_facet = None;
         metadata.implementations.hash_join_runtime_filter = false;
+        metadata.implementations.hash_join_build_left_runtime_filter = false;
         Ok(())
     }
 }
@@ -232,6 +238,7 @@ pub(super) struct MetadataRuntimeFilterChange {
     payload: LogicalPayloadId,
     previous_facet: Option<Fingerprint>,
     previous_implementation: bool,
+    previous_build_left_implementation: bool,
 }
 
 impl std::fmt::Debug for PlannerTransformState {
@@ -261,6 +268,11 @@ pub(super) struct PlannerOperatorMetadata {
     pub(super) child_required: Box<[PropertySetId]>,
     pub(super) child_row_goals: Box<[PlannerChildRowGoal]>,
     pub(super) search: Option<PlannerSearchImplementationMetadata>,
+    /// Context required to implement this expression at its owning group.
+    pub(super) input_context: OptimizationContextId,
+    /// Context inherited by ordinary children. Required region owners extend
+    /// this context; alternatives that discharge the owner keep it unchanged.
+    pub(super) child_context: OptimizationContextId,
     pub(super) required_region_facet: Option<Fingerprint>,
     pub(super) runtime_filter_region_facet: Option<Fingerprint>,
     pub(super) structural_retained_children: u64,
@@ -297,6 +309,9 @@ pub(super) struct PlannerCostFacts {
     pub(super) runtime_filter_probe_multiplicity: RuntimeFilterProbeMultiplicity,
     pub(super) runtime_filter_probe_source_rows: Option<paro_planner::plan::CardinalityEstimate>,
     pub(super) runtime_filter_probe_is_direct: bool,
+    /// Snapshot estimate of the distinct build-key domain. This ranks
+    /// runtime-filter benefit; it never proves capacity or correctness.
+    pub(super) runtime_filter_build_distinct_expected: Option<u64>,
     pub(super) runtime_filter_key_types: Box<[LogicalType]>,
 }
 
@@ -315,6 +330,7 @@ pub(super) struct ResolvedPlannerCostFacts {
     pub(super) runtime_filter_probe_multiplicity: RuntimeFilterProbeMultiplicity,
     pub(super) runtime_filter_probe_source_rows: Option<CompactRange>,
     pub(super) runtime_filter_probe_is_direct: bool,
+    pub(super) runtime_filter_build_distinct_expected: Option<u64>,
     pub(super) runtime_filter_key_types: Box<[LogicalType]>,
 }
 
@@ -335,6 +351,8 @@ pub(super) struct PlannerImplementationSet {
     pub(super) perfect_hash_aggregate: bool,
     pub(super) sort_range_join: bool,
     pub(super) classic_ie_join: bool,
+    pub(super) hash_join_build_left: bool,
+    pub(super) hash_join_build_left_runtime_filter: bool,
     pub(super) hash_join_runtime_filter: bool,
     pub(super) partition_aggregate_window: bool,
     pub(super) singleton_aggregate_projection: bool,
@@ -347,6 +365,8 @@ impl PlannerImplementationSet {
         perfect_hash_aggregate: false,
         sort_range_join: false,
         classic_ie_join: false,
+        hash_join_build_left: false,
+        hash_join_build_left_runtime_filter: false,
         hash_join_runtime_filter: false,
         partition_aggregate_window: false,
         singleton_aggregate_projection: false,
@@ -358,6 +378,10 @@ impl PlannerImplementationSet {
             PhysicalImplementationFlavor::PerfectHashAggregate => self.perfect_hash_aggregate,
             PhysicalImplementationFlavor::SortRangeJoin => self.sort_range_join,
             PhysicalImplementationFlavor::ClassicIeJoin => self.classic_ie_join,
+            PhysicalImplementationFlavor::HashJoinBuildLeft => self.hash_join_build_left,
+            PhysicalImplementationFlavor::HashJoinBuildLeftRuntimeFilter => {
+                self.hash_join_build_left_runtime_filter
+            }
             PhysicalImplementationFlavor::HashJoinRuntimeFilter => self.hash_join_runtime_filter,
             PhysicalImplementationFlavor::PartitionAggregateWindow => {
                 self.partition_aggregate_window

@@ -44,7 +44,7 @@ fn rewrite_node(id: PhysicalPlanNodeId, plan: &mut PhysicalPlan, visited: &mut [
             };
             (inner.clone(), *grandchild)
         };
-        let Some(expressions) = compose_project_expressions(&outer, &inner) else {
+        let Some(composed) = outer.compose_over(&inner) else {
             return;
         };
         let node = plan
@@ -54,44 +54,53 @@ fn rewrite_node(id: PhysicalPlanNodeId, plan: &mut PhysicalPlan, visited: &mut [
         let PhysicalNodeKind::Project(project) = &mut node.kind else {
             return;
         };
-        project.expressions = expressions;
+        *project = composed;
         node.children.replace_only(grandchild);
     }
 }
 
-fn compose_project_expressions(
-    outer: &ProjectSpec,
-    inner: &ProjectSpec,
-) -> Option<Box<[Expression]>> {
-    if outer
-        .expressions
-        .iter()
-        .chain(inner.expressions.iter())
-        .any(|expression| expression.evaluation_properties().is_reorder_fence())
-    {
-        return None;
-    }
-
-    let mut references = vec![0usize; inner.expressions.len()];
-    for expression in &outer.expressions {
-        if !count_physical_references(expression, &inner.expressions, &mut references) {
+impl ProjectSpec {
+    /// Compose this projection over its direct input projection.
+    ///
+    /// The result is equivalent to `self(inner(input))`. Composition is
+    /// rejected when it could drop, duplicate, or reorder observable
+    /// expression evaluation. Keeping this contract on the physical spec lets
+    /// both tree rewrites and pipeline lowering use the same semantic guard.
+    pub fn compose_over(&self, inner: &Self) -> Option<Self> {
+        if self
+            .expressions
+            .iter()
+            .chain(inner.expressions.iter())
+            .any(|expression| expression.evaluation_properties().is_reorder_fence())
+        {
             return None;
         }
-    }
-    if inner
-        .expressions
-        .iter()
-        .zip(&references)
-        .any(|(expression, &count)| !expression.is_passive_value() && count != 1)
-    {
-        return None;
-    }
 
-    let mut expressions = outer.expressions.to_vec();
-    for expression in &mut expressions {
-        substitute_physical_references(expression, &inner.expressions);
+        let mut references = vec![0usize; inner.expressions.len()];
+        for expression in &self.expressions {
+            if !count_physical_references(expression, &inner.expressions, &mut references) {
+                return None;
+            }
+        }
+        if inner
+            .expressions
+            .iter()
+            .zip(&references)
+            .any(|(expression, &count)| !expression.is_passive_value() && count != 1)
+        {
+            return None;
+        }
+
+        let mut expressions = self.expressions.to_vec();
+        for expression in &mut expressions {
+            substitute_physical_references(expression, &inner.expressions);
+        }
+        Some(Self {
+            expressions: expressions.into_boxed_slice(),
+            output_names: self.output_names.clone(),
+            visible_count: self.visible_count,
+        })
     }
-    Some(expressions.into_boxed_slice())
 }
 
 fn count_physical_references(

@@ -36,6 +36,7 @@ pub const SCALAR_AGGREGATE_WINDOW_RULE: RuleId = RuleId(10_019);
 pub const JOIN_REGION_ENUMERATION_RULE: RuleId = RuleId(10_021);
 pub const TOP_N_INTRODUCTION_RULE: RuleId = RuleId(10_022);
 pub const CTE_FILTER_PUSHDOWN_RULE: RuleId = RuleId(10_023);
+pub const CTE_PARTITIONED_MATERIALIZATION_RULE: RuleId = RuleId(10_024);
 
 const TRANSFORMATION_RULE_NAMES: &[(RuleId, &str)] = &[
     (
@@ -45,6 +46,10 @@ const TRANSFORMATION_RULE_NAMES: &[(RuleId, &str)] = &[
     (CTE_INLINE_RULE, "cte_inline"),
     (CTE_DEMAND_PUSHDOWN_RULE, "cte_demand_pushdown"),
     (CTE_FILTER_PUSHDOWN_RULE, "cte_filter_pushdown"),
+    (
+        CTE_PARTITIONED_MATERIALIZATION_RULE,
+        "cte_partitioned_materialization",
+    ),
     (AGGREGATE_POST_REDUCTION_RULE, "aggregate_post_reduction"),
     (MARK_JOIN_TO_SEMI_RULE, "mark_join_to_semi"),
     (JOIN_ELIMINATION_RULE, "join_elimination"),
@@ -357,6 +362,16 @@ impl PhysicalCandidate {
             for artifact in &region.artifacts {
                 builder.write_fingerprint(artifact.fingerprint);
                 builder.write_u64(artifact.kind as u64);
+            }
+            for dependency in &region.artifact_dependencies {
+                builder.write_fingerprint(dependency.artifact);
+                let (producer_kind, producer_value) = dependency.producer.stable_tag();
+                builder.write_u64(producer_kind);
+                builder.write_u64(producer_value);
+                let (consumer_kind, consumer_value) = dependency.consumer.stable_tag();
+                builder.write_u64(consumer_kind);
+                builder.write_u64(consumer_value);
+                builder.write_u64(dependency.kind as u64);
             }
         }
         builder.finish()

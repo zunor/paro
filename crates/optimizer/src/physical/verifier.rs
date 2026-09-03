@@ -139,6 +139,7 @@ impl PhysicalPlanVerifier {
                 ));
             }
             if let crate::physical::PhysicalNodeKind::HashJoin(spec) = &node.kind {
+                verify_hash_join_output_permutation(spec)?;
                 if let Some(runtime_filter) = &spec.runtime_filter {
                     let equality_key_count = spec
                         .key_conditions
@@ -369,6 +370,74 @@ impl PhysicalPlanVerifier {
         }
         verify_acyclic(&dependencies)
     }
+}
+
+fn verify_hash_join_output_permutation(spec: &crate::physical::HashJoinSpec) -> Result<()> {
+    let output_count = spec.output_types.len();
+    if spec.output_names.len() != output_count || spec.output_permutation.len() != output_count {
+        return Err(paro_error::internal(
+            "hash join output names, types, and permutation have inconsistent arity",
+        ));
+    }
+    for natural_index in 0..output_count {
+        let Some(output_index) = spec.output_permutation.destination_of(natural_index) else {
+            return Err(paro_error::internal(
+                "hash join output permutation is missing a natural ordinal",
+            ));
+        };
+        if output_index >= output_count {
+            return Err(paro_error::internal(
+                "hash join output permutation contains an out-of-range destination ordinal",
+            ));
+        }
+        if spec.output_permutation.natural_of(output_index) != Some(natural_index) {
+            return Err(paro_error::internal(
+                "hash join output permutation is not bijective",
+            ));
+        }
+    }
+
+    if !spec.output_permutation.is_identity()
+        && !matches!(
+            spec.join_type,
+            paro_planner::operator::join::JoinType::Inner
+                | paro_planner::operator::join::JoinType::Left
+                | paro_planner::operator::join::JoinType::Right
+                | paro_planner::operator::join::JoinType::Outer
+        )
+    {
+        return Err(paro_error::internal(
+            "non-identity hash join output permutation is unsupported for this join type",
+        ));
+    }
+    let Some(build_output_types) = spec.build_payload_types.get(..spec.build_output_count) else {
+        return Err(paro_error::internal(
+            "hash join visible build output exceeds its payload layout",
+        ));
+    };
+    let mut natural_types = spec.left_output_types.to_vec();
+    if spec.join_type == paro_planner::operator::join::JoinType::Mark {
+        natural_types.push(paro_common::types::LogicalType::Boolean);
+    } else {
+        natural_types.extend(build_output_types.iter().cloned());
+    }
+    if natural_types.len() != output_count {
+        return Err(paro_error::internal(
+            "hash join natural and declared output arity disagree",
+        ));
+    }
+    for (natural_index, natural_type) in natural_types.iter().enumerate() {
+        let output_index = spec
+            .output_permutation
+            .destination_of(natural_index)
+            .expect("permutation arity checked above");
+        if spec.output_types.get(output_index) != Some(natural_type) {
+            return Err(paro_error::internal(
+                "hash join output permutation changes a column's logical type",
+            ));
+        }
+    }
+    Ok(())
 }
 
 fn verify_row_fetch(

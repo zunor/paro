@@ -319,6 +319,7 @@ fn lower_partition_aggregate_window_spec(
         .collect::<Vec<_>>();
     let aggregate = AggregateSpec {
         grouping_key_count: group_count,
+        initial_lookup_hash_key_count: group_count,
         state_output_projection: Box::new([]),
         estimated_input_rows: window
             .child

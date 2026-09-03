@@ -324,6 +324,33 @@ pub struct OptimizationGoal {
     pub context: OptimizationContextId,
 }
 
+/// Canonical execution context for a goal.
+///
+/// Region membership is expression-path state, not a property of a semantic
+/// group: one group may contain both a sharing owner and an equivalent inline
+/// expression.  Interning the active required facets here lets those
+/// expressions derive different child goals without cloning semantic groups
+/// or assigning one global region membership to every occurrence.
+#[derive(Debug, Clone, Default, PartialEq, Eq, PartialOrd, Ord)]
+pub struct OptimizationContext {
+    required_region_facets: Box<[Fingerprint]>,
+}
+
+impl OptimizationContext {
+    pub fn new(required_region_facets: impl IntoIterator<Item = Fingerprint>) -> Self {
+        let mut required_region_facets = required_region_facets.into_iter().collect::<Vec<_>>();
+        required_region_facets.sort_unstable();
+        required_region_facets.dedup();
+        Self {
+            required_region_facets: required_region_facets.into_boxed_slice(),
+        }
+    }
+
+    pub fn required_region_facets(&self) -> &[Fingerprint] {
+        &self.required_region_facets
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct Winner {
     pub expression: PhysicalExprId,
@@ -529,6 +556,9 @@ pub struct Memo {
     logical_owners: Vec<GroupId>,
     physical_owners: Vec<GroupId>,
     properties: PropertyInterner,
+    optimization_contexts: Vec<OptimizationContext>,
+    optimization_context_index: BTreeMap<OptimizationContext, OptimizationContextId>,
+    optimization_contexts_frozen: bool,
     budget: SearchBudget,
     calibration: Arc<MachineCalibrationBundle>,
     regions: RegionForest,
@@ -543,6 +573,7 @@ pub(crate) struct TransformationSavepoint {
 
 impl Memo {
     pub fn new(budget: SearchBudget) -> Self {
+        let root_context = OptimizationContext::default();
         Self {
             groups: Vec::new(),
             parents: Vec::new(),
@@ -551,6 +582,12 @@ impl Memo {
             logical_owners: Vec::new(),
             physical_owners: Vec::new(),
             properties: PropertyInterner::default(),
+            optimization_contexts: vec![root_context.clone()],
+            optimization_context_index: BTreeMap::from([(
+                root_context,
+                OptimizationContextId::new(0),
+            )]),
+            optimization_contexts_frozen: false,
             budget,
             calibration: Arc::new(MachineCalibrationBundle::default()),
             regions: RegionForest::default(),
@@ -671,12 +708,18 @@ impl Memo {
             Some(existing) => {
                 if existing.kind != facet.kind
                     || existing.criticality != facet.criticality
-                    || existing.priority != facet.priority
+                    || existing.scope_contract != facet.scope_contract
                 {
                     return Err(paro_error::internal(
                         "planning facet fingerprint changed its contract",
                     ));
                 }
+                // Priority is a scheduling hint, not facet identity. The
+                // fingerprint intentionally excludes it, so equivalent
+                // expressions that rediscover the same capability merge at
+                // the strongest (smallest) priority instead of becoming an
+                // order-dependent contract error.
+                existing.priority = existing.priority.min(facet.priority);
                 existing.scope.extend(facet.scope);
             }
             None => {
@@ -859,6 +902,48 @@ impl Memo {
 
     pub fn required(&self, id: PropertySetId) -> Option<&RequiredProperties> {
         self.properties.required(id)
+    }
+
+    /// Intern expression-path state while the initial logical forest is bound.
+    /// Once binding is sealed, transformations can only propagate these IDs.
+    pub(super) fn intern_optimization_context(
+        &mut self,
+        context: OptimizationContext,
+    ) -> Result<OptimizationContextId> {
+        if self.optimization_contexts_frozen {
+            return Err(paro_error::internal(
+                "optimization contexts are immutable after initial Memo binding",
+            ));
+        }
+        if let Some(id) = self.optimization_context_index.get(&context) {
+            return Ok(*id);
+        }
+        let id = OptimizationContextId::new(self.optimization_contexts.len());
+        self.optimization_contexts.push(context.clone());
+        self.optimization_context_index.insert(context, id);
+        Ok(id)
+    }
+
+    /// Seal the expression-path context catalog before optional search starts.
+    ///
+    /// Each initial logical expression contributes at most an input and child
+    /// context. This proof makes context cardinality linear in the already
+    /// admitted logical forest; optional rules cannot form a facet powerset.
+    pub(super) fn freeze_optimization_contexts(&mut self) -> Result<()> {
+        let linear_bound = self.logical_exprs.len().saturating_mul(2).saturating_add(1);
+        if self.optimization_contexts.len() > linear_bound {
+            return Err(paro_error::internal(format!(
+                "initial optimization context catalog exceeds its linear bound: contexts={}, logical_expressions={}",
+                self.optimization_contexts.len(),
+                self.logical_exprs.len(),
+            )));
+        }
+        self.optimization_contexts_frozen = true;
+        Ok(())
+    }
+
+    pub fn optimization_context(&self, id: OptimizationContextId) -> Option<&OptimizationContext> {
+        self.optimization_contexts.get(id.index())
     }
 
     pub fn insert_logical(

@@ -24,8 +24,8 @@ use super::memo::{
     Winner,
 };
 use super::region::{
-    JointCostProof, RegionArtifactKind, RegionCandidateContract, RegionDependencyEdge,
-    RegionDependencyKind,
+    JointCostProof, RegionArtifactKind, RegionBoundaryEndpoint, RegionCandidateContract,
+    RegionDependencyEdge, RegionDependencyKind,
 };
 use super::rules::{
     CostComposition, ImplementationContext, ImplementationRegistry, PhysicalCandidate, RuleContext,
@@ -198,6 +198,11 @@ impl CascadesEngine {
         goal: OptimizationGoal,
         mode: SearchMode,
     ) -> Result<Winner> {
+        // CascadesEngine is also usable with a hand-built Memo. Seal at the
+        // actual phase boundary rather than relying on one particular builder
+        // to have done so: optional rules may only propagate expression-path
+        // contexts admitted with the initial logical forest.
+        self.memo.freeze_optimization_contexts()?;
         let root = self.memo.canonical_group(root);
         if mode == SearchMode::Memo {
             self.explore_transformations()?;
@@ -234,6 +239,7 @@ impl CascadesEngine {
                 "grant portfolio exceeds the bounded class count",
             ));
         }
+        self.memo.freeze_optimization_contexts()?;
         if mode == SearchMode::Memo {
             self.explore_transformations()?;
         }
@@ -936,7 +942,7 @@ impl CascadesEngine {
                         .map(|winner| winner.physical_fingerprint)
                 }),
             );
-            let joint_cost_proof = build_joint_cost_proof(group, &recipe, local_cost)?;
+            let joint_cost_proof = build_joint_cost_proof(&self.memo, group, &recipe, local_cost)?;
             if self
                 .memo
                 .group(group)
@@ -1048,6 +1054,7 @@ fn release_transformation_output_reservations(
 }
 
 fn build_joint_cost_proof(
+    memo: &Memo,
     owner_group: GroupId,
     recipe: &CostRecipe,
     local_cost: SearchCost,
@@ -1055,8 +1062,14 @@ fn build_joint_cost_proof(
     let Some(region) = &recipe.region else {
         return Ok(None);
     };
-    let mut dependencies = recipe
+    let owner_group = memo.canonical_group(owner_group);
+    let boundary_goals = recipe
         .child_goals
+        .iter()
+        .map(|(child, goal)| (memo.canonical_group(*child), *goal))
+        .collect::<Vec<_>>()
+        .into_boxed_slice();
+    let mut dependencies = boundary_goals
         .iter()
         .map(|(child, _)| RegionDependencyEdge {
             producer: *child,
@@ -1064,34 +1077,91 @@ fn build_joint_cost_proof(
             kind: RegionDependencyKind::Data,
         })
         .collect::<Vec<_>>();
-    if region
-        .artifacts
-        .iter()
-        .any(|artifact| artifact.kind == RegionArtifactKind::RuntimeFilter)
-    {
-        let [(probe, _), (build, _)] = recipe.child_goals.as_ref() else {
+    let mut owned_artifacts = BTreeMap::new();
+    for artifact in &region.artifacts {
+        if owned_artifacts
+            .insert(artifact.fingerprint, artifact.kind)
+            .is_some()
+        {
             return Err(paro_error::internal(
-                "runtime-filter region recipe is not a binary join",
+                "region candidate owns one artifact fingerprint more than once",
+            ));
+        }
+    }
+    let mut dependency_count_by_artifact = BTreeMap::<Fingerprint, usize>::new();
+    for dependency in &region.artifact_dependencies {
+        let Some(kind) = owned_artifacts.get(&dependency.artifact) else {
+            return Err(paro_error::internal(
+                "region candidate dependency references an unowned artifact",
             ));
         };
+        if *kind == RegionArtifactKind::RuntimeFilter
+            && dependency.kind != RegionDependencyKind::ControlWaitComplete
+        {
+            return Err(paro_error::internal(
+                "runtime-filter artifact requires a wait-complete dependency",
+            ));
+        }
+        let producer =
+            resolve_region_boundary_endpoint(owner_group, &boundary_goals, dependency.producer)?;
+        let consumer =
+            resolve_region_boundary_endpoint(owner_group, &boundary_goals, dependency.consumer)?;
+        if producer == consumer {
+            return Err(paro_error::internal(
+                "region artifact dependency resolves to a self-edge",
+            ));
+        }
         dependencies.push(RegionDependencyEdge {
-            producer: *build,
-            consumer: *probe,
-            kind: RegionDependencyKind::ControlWaitComplete,
+            producer,
+            consumer,
+            kind: dependency.kind,
         });
+        *dependency_count_by_artifact
+            .entry(dependency.artifact)
+            .or_default() += 1;
+    }
+    for artifact in &region.artifacts {
+        if artifact.kind == RegionArtifactKind::RuntimeFilter
+            && dependency_count_by_artifact
+                .get(&artifact.fingerprint)
+                .copied()
+                != Some(1)
+        {
+            return Err(paro_error::internal(
+                "runtime-filter artifact must declare exactly one candidate dependency",
+            ));
+        }
     }
     dependencies.sort_unstable();
     Ok(Some(JointCostProof {
         region: region.region,
         facets: region.facets.clone(),
         owner_group,
-        boundary_goals: recipe.child_goals.clone(),
+        boundary_goals,
         owned_artifacts: region.artifacts.clone(),
+        artifact_dependencies: region.artifact_dependencies.clone(),
         dependencies: dependencies.into_boxed_slice(),
         local_cost,
         cost_composition: recipe.cost_composition,
-        candidate_fingerprint: recipe.physical_fingerprint,
     }))
+}
+
+fn resolve_region_boundary_endpoint(
+    owner_group: GroupId,
+    child_goals: &[(GroupId, OptimizationGoal)],
+    endpoint: RegionBoundaryEndpoint,
+) -> Result<GroupId> {
+    match endpoint {
+        RegionBoundaryEndpoint::Owner => Ok(owner_group),
+        RegionBoundaryEndpoint::Input(ordinal) => child_goals
+            .get(usize::from(ordinal))
+            .map(|(child, _)| *child)
+            .ok_or_else(|| {
+                paro_error::internal(format!(
+                    "region artifact dependency references missing candidate input {ordinal}"
+                ))
+            }),
+    }
 }
 
 fn fit_local_retained_state_to_grant(

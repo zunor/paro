@@ -61,6 +61,13 @@ pub(crate) enum PhysicalImplementationFlavor {
     /// specialized semantics are already fixed by their logical payload.
     Structural,
     HashJoin,
+    /// Hash join with the logical left input selected as the physical build
+    /// side. Extraction inverts the physical join and records its logical
+    /// output layout in the immutable hash-join spec.
+    HashJoinBuildLeft,
+    /// Build-left hash join plus a region-owned filter from the preserved
+    /// build input into the non-preserved physical probe input.
+    HashJoinBuildLeftRuntimeFilter,
     /// Hash join plus an AuxiliaryPlanRegion-owned build-to-scan filter.
     HashJoinRuntimeFilter,
     NestedLoopJoin,

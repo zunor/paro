@@ -28,13 +28,59 @@ pub enum FacetCriticality {
     Optional,
 }
 
+/// How a facet's admitted scope constrains a selected physical candidate.
+///
+/// Most facets own the complete set of groups recorded in [`RegionFacet::scope`].
+/// Runtime filters are different: their probe/build groups are chosen by the
+/// winning join expression, so eagerly unioning every alternative's children
+/// would collapse otherwise independent regions. Their declared scope is an
+/// anchor set and the verifier expands exactly one selected owner to its
+/// immediate inputs, under the owner's expression-path context.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum RegionScopeContract {
+    Exact,
+    OwnerWithImmediateInputs,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RegionFacet {
     pub fingerprint: Fingerprint,
     pub kind: RegionFacetKind,
     pub criticality: FacetCriticality,
     pub priority: u16,
+    pub scope_contract: RegionScopeContract,
     pub scope: BTreeSet<GroupId>,
+}
+
+impl RegionFacet {
+    /// Validate the invariant carried by the facet itself, independently of
+    /// the forest node that eventually owns it.
+    ///
+    /// A runtime filter is an optional physical capability whose concrete
+    /// producer/consumer boundary is selected with the winning join. Every
+    /// other current facet describes an exact, eagerly materialized scope.
+    pub fn validate_contract(&self) -> Result<()> {
+        if self.scope.is_empty() {
+            return Err(paro_error::internal(
+                "planning region facet has empty scope",
+            ));
+        }
+        match self.kind {
+            RegionFacetKind::RuntimeFilter
+                if self.criticality == FacetCriticality::Optional
+                    && self.scope_contract == RegionScopeContract::OwnerWithImmediateInputs =>
+            {
+                Ok(())
+            }
+            RegionFacetKind::RuntimeFilter => Err(paro_error::internal(
+                "runtime-filter facet must be optional and owner-with-immediate-inputs scoped",
+            )),
+            _ if self.scope_contract == RegionScopeContract::Exact => Ok(()),
+            _ => Err(paro_error::internal(
+                "non-runtime planning facet must have an exact scope contract",
+            )),
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -79,6 +125,37 @@ pub struct RegionOwnedArtifact {
     pub kind: RegionArtifactKind,
 }
 
+/// One endpoint of a candidate-local dependency before Memo groups are
+/// resolved. Input ordinals are stable in the [`PhysicalCandidate`](crate::cascades::rules::PhysicalCandidate)
+/// contract and deliberately do not imply left/right or build/probe semantics.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum RegionBoundaryEndpoint {
+    Owner,
+    Input(u16),
+}
+
+impl RegionBoundaryEndpoint {
+    pub const fn stable_tag(self) -> (u64, u64) {
+        match self {
+            Self::Owner => (0, 0),
+            Self::Input(ordinal) => (1, ordinal as u64),
+        }
+    }
+}
+
+/// A typed artifact edge in candidate-local coordinates.
+///
+/// The engine resolves this declaration through child goals. WinnerVerifier
+/// independently replays it through the physical expression's child list, so
+/// a proof cannot silently reverse build and probe while remaining self-valid.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct RegionArtifactDependencyContract {
+    pub artifact: Fingerprint,
+    pub producer: RegionBoundaryEndpoint,
+    pub consumer: RegionBoundaryEndpoint,
+    pub kind: RegionDependencyKind,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum RegionDependencyKind {
     Data,
@@ -102,6 +179,7 @@ pub struct RegionCandidateContract {
     pub region: RegionId,
     pub facets: Box<[Fingerprint]>,
     pub artifacts: Box<[RegionOwnedArtifact]>,
+    pub artifact_dependencies: Box<[RegionArtifactDependencyContract]>,
 }
 
 /// Extraction-time record for a non-local candidate. Every field is copied
@@ -114,10 +192,10 @@ pub struct JointCostProof {
     pub owner_group: GroupId,
     pub boundary_goals: Box<[(GroupId, OptimizationGoal)]>,
     pub owned_artifacts: Box<[RegionOwnedArtifact]>,
+    pub artifact_dependencies: Box<[RegionArtifactDependencyContract]>,
     pub dependencies: Box<[RegionDependencyEdge]>,
     pub local_cost: SearchCost,
     pub cost_composition: CostComposition,
-    pub candidate_fingerprint: Fingerprint,
 }
 
 impl RegionForest {
@@ -134,11 +212,7 @@ impl RegionForest {
         let mut required = Vec::new();
         let mut optional = Vec::new();
         for facet in facets {
-            if facet.scope.is_empty() {
-                return Err(paro_error::internal(
-                    "planning region facet has empty scope",
-                ));
-            }
+            facet.validate_contract()?;
             match facet.criticality {
                 FacetCriticality::Required => required.push(facet),
                 FacetCriticality::Optional => optional.push(facet),
@@ -336,6 +410,11 @@ mod tests {
             },
             criticality,
             priority: id as u16,
+            scope_contract: if criticality == FacetCriticality::Required {
+                RegionScopeContract::Exact
+            } else {
+                RegionScopeContract::OwnerWithImmediateInputs
+            },
             scope: groups.iter().copied().map(GroupId).collect(),
         }
     }

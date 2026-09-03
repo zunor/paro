@@ -59,6 +59,9 @@ pub struct ExplainRuntimeStats {
     /// without waiting for a late filter. Current rowset runtime filters still
     /// require the build-side filter to be installed before scan init.
     pub runtime_filter_no_wait_count: Option<u64>,
+    pub aggregate_hash_full_key_fallback_count: Option<u64>,
+    pub aggregate_hash_max_prefix_probe_distance: Option<u64>,
+    pub aggregate_hash_max_radix_partition_skew_percent: Option<u64>,
     pub grant_bytes: Option<u64>,
     pub revoked_bytes: Option<u64>,
     pub yield_latency_us: Option<u64>,
@@ -96,6 +99,11 @@ impl ExplainRuntimeStats {
             || self.output_backpressure_count.is_some()
             || self.runtime_filter_installed_count.is_some()
             || self.runtime_filter_no_wait_count.is_some()
+            || self.aggregate_hash_full_key_fallback_count.is_some()
+            || self.aggregate_hash_max_prefix_probe_distance.is_some()
+            || self
+                .aggregate_hash_max_radix_partition_skew_percent
+                .is_some()
             || self.grant_bytes.is_some()
             || self.revoked_bytes.is_some()
             || self.yield_latency_us.is_some()

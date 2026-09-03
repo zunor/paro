@@ -419,17 +419,40 @@ impl PhysicalPlan {
                 if let [left, right] = children {
                     let left_names = self.expression_scope_names(*left);
                     let right_names = self.expression_scope_names(*right);
-                    names = spec
-                        .left_projection
+                    for (natural_index, source_index) in
+                        spec.left_projection.iter().copied().enumerate()
+                    {
+                        let Some(name) = left_names.get(source_index) else {
+                            continue;
+                        };
+                        if let Some(output_index) =
+                            spec.output_permutation.destination_of(natural_index)
+                        {
+                            if let Some(output_name) = names.get_mut(output_index) {
+                                *output_name = name.clone();
+                            }
+                        }
+                    }
+                    let build_natural_offset = spec.left_projection.len();
+                    for (build_index, source_index) in spec
+                        .build_input_projection
                         .iter()
-                        .filter_map(|index| left_names.get(*index).cloned())
-                        .chain(
-                            spec.build_input_projection
-                                .iter()
-                                .take(spec.build_output_count)
-                                .filter_map(|index| right_names.get(*index).cloned()),
-                        )
-                        .collect();
+                        .copied()
+                        .take(spec.build_output_count)
+                        .enumerate()
+                    {
+                        let Some(name) = right_names.get(source_index) else {
+                            continue;
+                        };
+                        if let Some(output_index) = spec
+                            .output_permutation
+                            .destination_of(build_natural_offset + build_index)
+                        {
+                            if let Some(output_name) = names.get_mut(output_index) {
+                                *output_name = name.clone();
+                            }
+                        }
+                    }
                 }
             }
             PhysicalNodeKind::NestedLoopJoin(spec) => {
@@ -871,6 +894,17 @@ fn push_aggregate_properties(
                 .collect::<Vec<_>>()
                 .join(", "),
         );
+        if spec.initial_lookup_hash_key_count < spec.grouping_key_count {
+            push_string_property(
+                properties,
+                "Initial Lookup Hash Key",
+                spec.groups[..spec.initial_lookup_hash_key_count]
+                    .iter()
+                    .map(|expression| format_payload_expr(expression, spec, &formatter))
+                    .collect::<Vec<_>>()
+                    .join(", "),
+            );
+        }
     }
     if !spec.aggregates.is_empty() {
         push_string_property(

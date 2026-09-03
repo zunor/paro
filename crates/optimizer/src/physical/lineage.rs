@@ -88,14 +88,33 @@ pub(crate) fn trace_rowset_lineage_in(
                 .flat_map(|child| trace_rowset_lineage_in(arena, children, *child, output_index))
                 .collect()
         }
-        PhysicalNodeKind::HashJoin(spec) if spec.join_type == JoinType::Inner => {
+        PhysicalNodeKind::HashJoin(spec)
+            if matches!(
+                spec.join_type,
+                JoinType::Inner | JoinType::Left | JoinType::Right
+            ) =>
+        {
             let [left, right] = current.children.as_slice(children) else {
                 return Vec::new();
             };
-            if let Some(&child_index) = spec.left_projection.get(output_index) {
+            let Some(natural_output_index) = spec.output_permutation.natural_of(output_index)
+            else {
+                return Vec::new();
+            };
+            if let Some(&child_index) = spec.left_projection.get(natural_output_index) {
+                if spec.join_type == JoinType::Right {
+                    // The probe side is nullable in a right join. Tracing a
+                    // sideways predicate into it could change which preserved
+                    // build rows are considered matched.
+                    return Vec::new();
+                }
                 return trace_rowset_lineage_in(arena, children, *left, child_index);
             }
-            let Some(build_output) = output_index.checked_sub(spec.left_projection.len()) else {
+            if spec.join_type == JoinType::Left {
+                return Vec::new();
+            }
+            let Some(build_output) = natural_output_index.checked_sub(spec.left_projection.len())
+            else {
                 return Vec::new();
             };
             let Some(&child_index) = spec.build_input_projection.get(build_output) else {

@@ -59,7 +59,8 @@ use super::ids::{
 };
 use super::memo::{
     CardinalityEnvelope, CardinalityRecipeKind, EquivalenceProof, GrantGoalKey, GroupCardinality,
-    LogicalExprKey, LogicalProperties, Memo, OptimizationGoal, PhysicalExprKey, RowGoal,
+    LogicalExprKey, LogicalProperties, Memo, OptimizationContext, OptimizationGoal,
+    PhysicalExprKey, RowGoal,
 };
 use super::properties::{
     MutationSafetyRequirement, NullOrder, OrderingKey, OrderingRequirement, OrderingScope,
@@ -69,8 +70,9 @@ use super::properties::{
     ResultGuarantee, SortDirection,
 };
 use super::region::{
-    FacetCriticality, RegionArtifactKind, RegionCandidateContract, RegionFacet, RegionFacetKind,
-    RegionForest, RegionOwnedArtifact,
+    FacetCriticality, RegionArtifactDependencyContract, RegionArtifactKind, RegionBoundaryEndpoint,
+    RegionCandidateContract, RegionDependencyKind, RegionFacet, RegionFacetKind, RegionForest,
+    RegionOwnedArtifact,
 };
 use super::rules::{
     CostComposition, EquivalentExpression, GrantDependencyDescriptor, ImplementationContext,
@@ -79,9 +81,10 @@ use super::rules::{
     AGGREGATE_INPUT_MATERIALIZATION_RULE, AGGREGATE_JOIN_PREAGGREGATION_RULE,
     AGGREGATE_JOIN_SUBSUMPTION_RULE, AGGREGATE_NON_NULL_INPUT_RULE, AGGREGATE_POST_REDUCTION_RULE,
     CTE_DEMAND_PUSHDOWN_RULE, CTE_FILTER_PUSHDOWN_RULE, CTE_INLINE_RULE,
-    EXPENSIVE_PREDICATE_PLACEMENT_RULE, JOIN_ELIMINATION_RULE, JOIN_REGION_ENUMERATION_RULE,
-    LATE_PAYLOAD_FETCH_RULE, LIMIT_PUSHDOWN_RULE, MARK_JOIN_TO_SEMI_RULE,
-    SCALAR_AGGREGATE_WINDOW_RULE, TOP_N_INTRODUCTION_RULE,
+    CTE_PARTITIONED_MATERIALIZATION_RULE, EXPENSIVE_PREDICATE_PLACEMENT_RULE,
+    JOIN_ELIMINATION_RULE, JOIN_REGION_ENUMERATION_RULE, LATE_PAYLOAD_FETCH_RULE,
+    LIMIT_PUSHDOWN_RULE, MARK_JOIN_TO_SEMI_RULE, SCALAR_AGGREGATE_WINDOW_RULE,
+    TOP_N_INTRODUCTION_RULE,
 };
 use super::scalar::ScalarArena;
 use super::scalar_lowering::{
@@ -112,11 +115,37 @@ const PLANNER_PERFECT_HASH_AGGREGATE: ImplementationId = ImplementationId(2);
 const PLANNER_SORT_RANGE_JOIN: ImplementationId = ImplementationId(3);
 const PLANNER_CLASSIC_IE_JOIN: ImplementationId = ImplementationId(4);
 const PLANNER_SEARCH_PROVIDER: ImplementationId = ImplementationId(5);
-const PLANNER_HASH_JOIN_RUNTIME_FILTER: ImplementationId = ImplementationId(6);
+pub(super) const PLANNER_HASH_JOIN_RUNTIME_FILTER: ImplementationId = ImplementationId(6);
 const PLANNER_PARTITION_AGGREGATE_WINDOW: ImplementationId = ImplementationId(7);
 const PLANNER_SINGLETON_AGGREGATE_PROJECTION: ImplementationId = ImplementationId(8);
 const PLANNER_EXTERNAL_CROSS_PRODUCT: ImplementationId = ImplementationId(9);
+const PLANNER_HASH_JOIN_BUILD_LEFT: ImplementationId = ImplementationId(10);
+pub(super) const PLANNER_HASH_JOIN_BUILD_LEFT_RUNTIME_FILTER: ImplementationId =
+    ImplementationId(11);
 const COST_OPTIMIZED_SEARCH_POLICY: QualityPolicyId = QualityPolicyId(1);
+
+/// Runtime-filter dependency direction declared by a physical implementation.
+///
+/// Candidate construction and winner verification share this implementation
+/// metadata, while the verifier still resolves and validates the endpoints
+/// independently against the winning physical children.
+pub(super) const fn runtime_filter_dependency_boundary(
+    implementation: ImplementationId,
+) -> Option<(RegionBoundaryEndpoint, RegionBoundaryEndpoint)> {
+    if implementation.0 == PLANNER_HASH_JOIN_RUNTIME_FILTER.0 {
+        Some((
+            RegionBoundaryEndpoint::Input(1),
+            RegionBoundaryEndpoint::Input(0),
+        ))
+    } else if implementation.0 == PLANNER_HASH_JOIN_BUILD_LEFT_RUNTIME_FILTER.0 {
+        Some((
+            RegionBoundaryEndpoint::Input(0),
+            RegionBoundaryEndpoint::Input(1),
+        ))
+    } else {
+        None
+    }
+}
 pub const SEARCH_REGION_ENUMERATOR_RULE: super::ids::RuleId = super::ids::RuleId(10_002);
 pub const GRAPH_REGION_ENUMERATOR_RULE: super::ids::RuleId = super::ids::RuleId(10_003);
 
@@ -246,7 +275,7 @@ impl OptimizationInput {
                     ));
                 }
             }
-            let (plan, contracts, enforcers, output_columns) = {
+            let extracted = {
                 let planner_state = self.planner_state.read().unwrap();
                 extract_planner_tree(
                     engine.memo(),
@@ -257,11 +286,14 @@ impl OptimizationInput {
                     mode,
                 )?
             };
-            let (plan, contracts, physical_fingerprint, cost) = enforce_result_presentation(
+            let PresentedWinnerTree {
                 plan,
                 contracts,
-                &enforcers,
-                output_columns.as_ref(),
+                enforcers,
+                physical_fingerprint,
+                cost,
+            } = enforce_result_presentation(
+                extracted,
                 &self.presentation,
                 &self.bind_context,
                 self.calibration.as_ref(),
@@ -529,21 +561,20 @@ impl MemoBuilder {
                             "Memo shell retained excess detached children",
                         ));
                     }
-                    let search_candidate = if candidate_context.is_some()
-                        && matches!(
-                            plan.operator,
-                            LogicalOperator::TopN(_) | LogicalOperator::Filter(_)
-                        ) {
-                        let search_context = candidate_context
-                            .as_ref()
-                            .expect("candidate context was checked");
-                        crate::search::optimizer::SearchOptimizer::new()
-                            .physical_candidate_for_root(
-                                duplicate_plan_preserving_indices(&plan, bind_shared.as_ref()),
-                                search_context,
-                            )?
-                    } else {
-                        None
+                    let search_candidate = match candidate_context.as_ref() {
+                        Some(search_context)
+                            if matches!(
+                                &plan.operator,
+                                LogicalOperator::TopN(_) | LogicalOperator::Filter(_)
+                            ) =>
+                        {
+                            crate::search::optimizer::SearchOptimizer::new()
+                                .physical_candidate_for_root(
+                                    duplicate_plan_preserving_indices(&plan, bind_shared.as_ref()),
+                                    search_context,
+                                )?
+                        }
+                        _ => None,
                     };
                     let scalar_roots = intern_operator_scalars(
                         &mut plan.operator,
@@ -567,34 +598,10 @@ impl MemoBuilder {
                             .collect::<Vec<_>>()
                             .into_boxed_slice(),
                     };
-                    let reusable = expression_groups.get(&key).and_then(|candidates| {
-                        candidates.iter().copied().find(|(group, _)| {
-                            memo.group(*group).is_some_and(|existing| {
-                                existing.schema == schema
-                                    && existing
-                                        .logical_properties
-                                        .same_contract(&logical_properties)
-                            })
-                        })
-                    });
-                    if let Some((group, logical)) = reusable {
-                        memo.group_mut(group)
-                            .expect("reusable group was validated")
-                            .logical_properties
-                            .merge_equivalent_facts(&logical_properties);
-                        return Ok((
-                            plan,
-                            BuildState {
-                                group,
-                                logical,
-                                columns: output_columns.into_boxed_slice(),
-                                region_scope: PlannerRegionScope::new(
-                                    group,
-                                    child_states.iter().map(|child| child.region_scope.clone()),
-                                ),
-                            },
-                        ));
-                    }
+                    // Equal relational keys at different tree occurrences do
+                    // not imply equal region paths. Keep the occurrences
+                    // separate here; transformations may reuse them later
+                    // only after their OptimizationContext is known.
                     let cardinality = derive_group_cardinality(
                         &plan.operator,
                         &key.children,
@@ -647,7 +654,11 @@ impl MemoBuilder {
                             &child_maximum_cardinalities,
                             scan_access_cost,
                         )?;
-                        let cost_facts = planner_cost_facts(&search_plan, scan_access_cost)?;
+                        let cost_facts = planner_cost_facts(
+                            &search_plan,
+                            candidate_stats.as_ref(),
+                            scan_access_cost,
+                        )?;
                         search_plan.stats = NodeStats::default();
                         let payload = payloads.push_physical(PlannerPhysicalTemplate::Executable(
                             Box::new(search_plan),
@@ -680,21 +691,27 @@ impl MemoBuilder {
                         let facet = planner_region_facet(
                             kind,
                             FacetCriticality::Required,
-                            logical,
+                            key.stable_fingerprint(),
                             operator_fingerprint,
                             scope,
                         );
                         pending.required = Some(facet.fingerprint);
                         region_facets.push(facet);
                     }
-                    if implementations.hash_join_runtime_filter {
-                        let (scope, _) = region_scope.materialize_bounded(usize::from(
-                            memo.budget().max_composite_region_groups,
-                        ));
+                    if implementations.hash_join_runtime_filter
+                        || implementations.hash_join_build_left_runtime_filter
+                    {
+                        // The forest owns the auxiliary capability at its
+                        // logical join group. The selected candidate's
+                        // immediate probe/build span is replayed separately by
+                        // WinnerVerifier; pre-unioning every mutually
+                        // exclusive join-order boundary here would collapse
+                        // the decomposition before a winner exists.
+                        let scope = std::iter::once(group).collect();
                         let facet = planner_region_facet(
                             RegionFacetKind::RuntimeFilter,
                             FacetCriticality::Optional,
-                            logical,
+                            key.stable_fingerprint(),
                             operator_fingerprint,
                             scope,
                         );
@@ -719,6 +736,7 @@ impl MemoBuilder {
                             baseline = ?implementations.baseline,
                             ?join_type,
                             runtime_filter_candidate = implementations.hash_join_runtime_filter,
+                            build_left_runtime_filter_candidate = implementations.hash_join_build_left_runtime_filter,
                             probe_operator = ?probe_operator,
                             conditions = ?conditions,
                             "registered physical join implementation set"
@@ -755,7 +773,11 @@ impl MemoBuilder {
                         implementations,
                         grant_dependency: planner_grant_dependency(&plan.operator),
                         spillable: planner_operator_spillable(&plan.operator),
-                        cost_facts: planner_cost_facts(&plan, scan_access_cost)?,
+                        cost_facts: planner_cost_facts(
+                            &plan,
+                            candidate_stats.as_ref(),
+                            scan_access_cost,
+                        )?,
                         output_columns: output_columns.clone().into_boxed_slice(),
                         child_required: intern_child_requirements(
                             &mut memo,
@@ -763,6 +785,8 @@ impl MemoBuilder {
                         )?,
                         child_row_goals: child_row_goals(&plan.operator, child_states.len()),
                         search,
+                        input_context: OptimizationContextId::INVALID,
+                        child_context: OptimizationContextId::INVALID,
                         required_region_facet: None,
                         runtime_filter_region_facet: None,
                         structural_retained_children: planner_structural_retained_children(
@@ -775,10 +799,6 @@ impl MemoBuilder {
                             "planner payload metadata was assigned more than once",
                         ));
                     }
-                    expression_groups
-                        .entry(key)
-                        .or_default()
-                        .push((group, logical));
                     Ok((
                         plan,
                         BuildState {
@@ -808,6 +828,51 @@ impl MemoBuilder {
             }
             roots.push((source, root_plan, root_state));
         }
+
+        // Context belongs to an expression path, not to its semantic group.
+        // Bind it before merging equivalent roots, while every initial tree
+        // occurrence still has an unambiguous required-region membership.
+        let required_facets = region_facets
+            .iter()
+            .filter(|facet| facet.criticality == FacetCriticality::Required)
+            .cloned()
+            .collect::<Vec<_>>();
+        let group_expressions = memo
+            .groups()
+            .map(|group| (group.id, group.logical_exprs().to_vec()))
+            .collect::<Vec<_>>();
+        for (group, expressions) in group_expressions {
+            let child_facets = required_facets
+                .iter()
+                .filter(|facet| facet.scope.contains(&group))
+                .map(|facet| facet.fingerprint)
+                .collect::<BTreeSet<_>>();
+            for logical in expressions {
+                let payload = memo
+                    .logical_expr(logical)
+                    .ok_or_else(|| paro_error::internal("initial expression disappeared"))?
+                    .payload;
+                let own_facet = pending_region_facets
+                    .get(&payload)
+                    .and_then(|pending| pending.required);
+                let mut input_facets = child_facets.clone();
+                if let Some(own_facet) = own_facet {
+                    input_facets.remove(&own_facet);
+                }
+                let input_context =
+                    memo.intern_optimization_context(OptimizationContext::new(input_facets))?;
+                let child_context = memo.intern_optimization_context(OptimizationContext::new(
+                    child_facets.iter().copied(),
+                ))?;
+                let operator = metadata.get_mut(&payload).ok_or_else(|| {
+                    paro_error::internal("initial context lost operator metadata")
+                })?;
+                operator.input_context = input_context;
+                operator.child_context = child_context;
+            }
+        }
+        memo.freeze_optimization_contexts()?;
+
         let (_, root_plan, mut root_state) = roots.remove(0);
         for (_, _, alternative) in roots {
             root_state.group = memo.merge_groups(root_state.group, alternative.group)?;
@@ -838,9 +903,35 @@ impl MemoBuilder {
                 .filter(|facet| !dropped_optional.contains(facet));
             if operator.runtime_filter_region_facet.is_none() {
                 operator.implementations.hash_join_runtime_filter = false;
+                operator.implementations.hash_join_build_left_runtime_filter = false;
             }
         }
         memo.set_regions(regions);
+
+        // The staging reuse index is valid only after contexts are bound and
+        // root groups have reached their canonical identities.
+        expression_groups.clear();
+        let indexed_expressions = memo
+            .groups()
+            .flat_map(|group| {
+                group
+                    .logical_exprs()
+                    .iter()
+                    .copied()
+                    .map(move |logical| (group.id, logical))
+            })
+            .collect::<Vec<_>>();
+        for (group, logical) in indexed_expressions {
+            let key = memo
+                .logical_expr(logical)
+                .ok_or_else(|| paro_error::internal("context index lost logical expression"))?
+                .key
+                .clone();
+            expression_groups
+                .entry(key)
+                .or_default()
+                .push((group, logical));
+        }
 
         let root_provided = memo
             .group(root_state.group)
@@ -866,12 +957,17 @@ impl MemoBuilder {
             replayability: ReplayabilityRequirement::Any,
             result_guarantee: root_result_guarantee,
         })?;
+        let root_context = memo
+            .logical_expr(root_state.logical)
+            .and_then(|logical| metadata.get(&logical.payload))
+            .map(|metadata| metadata.input_context)
+            .ok_or_else(|| paro_error::internal("root expression has no optimization context"))?;
         let root_goal = OptimizationGoal {
             required: root_required,
             row_goal: RowGoal::All,
             objective: ObjectiveProfileId(0),
             grant: GrantGoalKey::Invariant(AdmissibleGrantSetId(0)),
-            context: OptimizationContextId(0),
+            context: root_context,
         };
         let presentation = ResultPresentation {
             columns: root_state.columns,

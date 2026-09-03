@@ -52,12 +52,12 @@ use super::specs::{
     GraphShortestPathSpec, HashJoinRuntimeFilterSpec, HashJoinSpec, HashReductionCascadeSpec,
     HashReductionExtremaChannelSpec, HashReductionGroupedExtremaSpec, HashReductionPredicateSpec,
     HashReductionSourcePredicateSpec, HashReductionStepSpec, InsertSpec, LimitSpec,
-    MaterializedCteSpec, MutationInputSpoolSpec, NestedLoopJoinSpec, PartitionAggregateDomain,
-    PartitionAggregateWindowSpec, PerfectHashAggregatePlan, PhysicalNodeKind,
-    PostAggregateReductionSpec, ProjectSpec, RecursiveCteSpec, RelationalRowFetchMapping,
-    RowFetchProjectionSpec, RowFetchSpec, RowsetColumnProjection, RowsetColumnValueProjection,
-    RowsetScanAccessPolicy, RowsetScanSpec, RuntimeFilterWaitPolicy, SearchSourceSpec,
-    SortRangeJoinSpec, SortSpec, SparseVectorSearchSpec, SpillExecutionPolicy,
+    MaterializedCteSpec, MutationInputSpoolSpec, NestedLoopJoinSpec, OutputPermutation,
+    PartitionAggregateDomain, PartitionAggregateWindowSpec, PerfectHashAggregatePlan,
+    PhysicalNodeKind, PostAggregateReductionSpec, ProjectSpec, RecursiveCteSpec,
+    RelationalRowFetchMapping, RowFetchProjectionSpec, RowFetchSpec, RowsetColumnProjection,
+    RowsetColumnValueProjection, RowsetScanAccessPolicy, RowsetScanSpec, RuntimeFilterWaitPolicy,
+    SearchSourceSpec, SortRangeJoinSpec, SortSpec, SparseVectorSearchSpec, SpillExecutionPolicy,
     TableFunctionScanSpec, TopNSpec, UpdateSpec, UtilitySpec, ValuesSpec, VectorSearchSpec,
     WindowSpec,
 };
@@ -349,9 +349,11 @@ impl PhysicalPlanExtractor {
             other => box_lowered(|| self.lower_unsupported(other))?,
         };
 
-        let runtime_filter_edge = if selected_implementation
-            == crate::physical::PhysicalImplementationFlavor::HashJoinRuntimeFilter
-        {
+        let runtime_filter_edge = if matches!(
+            selected_implementation,
+            crate::physical::PhysicalImplementationFlavor::HashJoinRuntimeFilter
+                | crate::physical::PhysicalImplementationFlavor::HashJoinBuildLeftRuntimeFilter
+        ) {
             let contract = self.winner_contracts.get(&logical.id).ok_or_else(|| {
                 paro_error::internal(
                     "runtime-filter implementation lost its region-owned artifact identity",

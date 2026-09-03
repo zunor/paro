@@ -30,6 +30,12 @@ pub enum GroupKeyEncoding {
 #[derive(Debug, Clone)]
 pub struct AggregateSpec {
     pub grouping_key_count: usize,
+    /// Leading physical group columns used by a flat table's initial lookup
+    /// index. This is a revocable implementation hint with a strict runtime
+    /// probe bound: it never affects ownership, radix routing, equality, or
+    /// the semantic physical plan. Runtime fallback observations describe the
+    /// lookup contract that was actually used.
+    pub initial_lookup_hash_key_count: usize,
     /// Map each SQL-visible output column to the internal finalized state
     /// column. Empty means identity. A non-identity map lets correctness-proven
     /// functionally dependent GROUP BY values live as `first` states instead
@@ -69,6 +75,14 @@ impl AggregateSpec {
     /// Validate the aggregate-owned post-reduction against the finalized
     /// aggregate domain that this physical operator actually produces.
     pub fn verify_post_reduction(&self) -> Result<()> {
+        if self.initial_lookup_hash_key_count > self.grouping_key_count
+            || (self.grouping_key_count > 0 && self.initial_lookup_hash_key_count == 0)
+        {
+            return Err(paro_error::internal(format!(
+                "aggregate initial lookup hash key is invalid: prefix={} groups={}",
+                self.initial_lookup_hash_key_count, self.grouping_key_count
+            )));
+        }
         let Some(post) = &self.post_reduction else {
             return Ok(());
         };

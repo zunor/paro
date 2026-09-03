@@ -9,6 +9,7 @@
 
 use crate::filter::propagate_result::FilterPropagateResult;
 use crate::statistics::unique_keys::declared_unique_keys;
+use paro_common::error::Result;
 use paro_common::runtime_value::Value;
 use paro_common::types::LogicalType;
 use paro_context::StatementContext;
@@ -19,15 +20,31 @@ use paro_planner::expression::{
 };
 use paro_planner::operator::{
     aggregate::GroupDependency, empty_result::EmptyResult, Aggregate, ColumnBinding, Join,
-    JoinComparisonType, LogicalOperator,
+    JoinComparisonType, LogicalOperator, LogicalOutputLayout,
 };
-use paro_planner::plan::LogicalPlan;
+use paro_planner::plan::{LogicalPlan, LogicalPlanPostOrderFolder};
 use paro_storage::statistics::{BaseStatistics, ColumnStatistics, NumericStats, StatsInfo};
 use std::collections::HashMap;
 use std::sync::Arc;
 
 fn column_statistics_arc(base: BaseStatistics) -> Arc<ColumnStatistics> {
     Arc::new(ColumnStatistics::new(base))
+}
+
+fn constant_column_statistics_arc(value: &Value) -> Arc<ColumnStatistics> {
+    Arc::new(
+        ColumnStatistics::new(BaseStatistics::from_constant(value))
+            .with_guaranteed_distinct_upper(1),
+    )
+}
+
+fn aggregate_group_statistics(statistics: &ColumnStatistics) -> BaseStatistics {
+    let mut group = statistics.statistics().copy();
+    let distinct_count = statistics.get_distinct_count();
+    if distinct_count > 0 {
+        group.set_distinct_count(distinct_count);
+    }
+    group
 }
 
 fn window_output_statistics(expression: &WindowExpression) -> BaseStatistics {
@@ -103,60 +120,105 @@ fn collect_group_dependencies(
     group_bindings: &[Option<ColumnBinding>],
     dependencies: &mut Vec<GroupDependency>,
 ) {
-    if let LogicalOperator::Get(get) = &plan.operator {
-        for key in declared_unique_keys(get) {
-            let Some(determinants) = key
-                .bindings
-                .iter()
-                .map(|binding| {
+    plan.try_visit_pre_order(|plan| {
+        if let LogicalOperator::Get(get) = &plan.operator {
+            for key in declared_unique_keys(get) {
+                let Some(determinants) = key
+                    .bindings
+                    .iter()
+                    .map(|binding| {
+                        group_bindings
+                            .iter()
+                            .position(|candidate| candidate == &Some(*binding))
+                    })
+                    .collect::<Option<Vec<_>>>()
+                else {
+                    continue;
+                };
+                if !key.is_unique_with_nulls_equal(|binding| {
                     group_bindings
                         .iter()
-                        .position(|candidate| candidate == &Some(*binding))
-                })
-                .collect::<Option<Vec<_>>>()
-            else {
-                continue;
-            };
-            if !key.is_unique_with_nulls_equal(|binding| {
-                group_bindings
-                    .iter()
-                    .position(|candidate| candidate == &Some(binding))
-                    .and_then(|group_idx| aggregate.group_stats.get(group_idx))
-                    .and_then(Option::as_ref)
-                    .is_some_and(|stats| !stats.can_have_null())
-            }) {
-                continue;
-            }
+                        .position(|candidate| candidate == &Some(binding))
+                        .and_then(|group_idx| aggregate.group_stats.get(group_idx))
+                        .and_then(Option::as_ref)
+                        .is_some_and(|stats| !stats.can_have_null())
+                }) {
+                    continue;
+                }
 
-            let dependents = group_bindings
-                .iter()
-                .enumerate()
-                .filter_map(|(group_idx, binding)| {
-                    binding
-                        .filter(|binding| {
-                            binding.table_index == get.table_index
-                                && !key.bindings.contains(binding)
-                        })
-                        .map(|_| group_idx)
-                })
-                .collect::<Vec<_>>();
-            if !dependents.is_empty() {
-                dependencies.push(GroupDependency {
-                    determinants: determinants.into_boxed_slice(),
-                    dependents: dependents.into_boxed_slice(),
-                });
+                let dependents = group_bindings
+                    .iter()
+                    .enumerate()
+                    .filter_map(|(group_idx, binding)| {
+                        binding
+                            .filter(|binding| {
+                                binding.table_index == get.table_index
+                                    && !key.bindings.contains(binding)
+                            })
+                            .map(|_| group_idx)
+                    })
+                    .collect::<Vec<_>>();
+                if !dependents.is_empty() {
+                    dependencies.push(GroupDependency {
+                        determinants: determinants.into_boxed_slice(),
+                        dependents: dependents.into_boxed_slice(),
+                    });
+                }
             }
         }
-    }
-    for child in plan.children() {
-        collect_group_dependencies(child, aggregate, group_bindings, dependencies);
-    }
+        Ok(())
+    })
+    .expect("group-dependency collection has no fallible operation");
 }
 
 /// Propagates column statistics through the logical plan.
 pub struct StatisticsPropagator {
     statistics_map: HashMap<ColumnBinding, Arc<ColumnStatistics>>,
     cte_statistics: HashMap<usize, Vec<Arc<ColumnStatistics>>>,
+}
+
+struct StatisticsPropagationFolder<'a> {
+    propagator: &'a mut StatisticsPropagator,
+    context: &'a StatementContext,
+}
+
+impl LogicalPlanPostOrderFolder<LogicalOutputLayout> for StatisticsPropagationFolder<'_> {
+    fn child_completed(
+        &mut self,
+        parent_skeleton: &LogicalPlan,
+        completed_children: &[LogicalPlan],
+        completed_layouts: &[LogicalOutputLayout],
+        _remaining_children: &[LogicalPlan],
+    ) -> Result<()> {
+        if completed_children.len() != 1 {
+            return Ok(());
+        }
+        let cte_index = match &parent_skeleton.operator {
+            LogicalOperator::MaterializedCTE(cte) => Some(cte.cte_index),
+            LogicalOperator::RecursiveCTE(cte) => Some(cte.cte_index),
+            _ => None,
+        };
+        if let Some(cte_index) = cte_index {
+            let Some(layout) = completed_layouts.first() else {
+                return Ok(());
+            };
+            if let Some(statistics) = self.propagator.capture_output_statistics(layout) {
+                self.propagator.cte_statistics.insert(cte_index, statistics);
+            }
+        }
+        Ok(())
+    }
+
+    fn fold(
+        &mut self,
+        plan: LogicalPlan,
+        child_layouts: Vec<LogicalOutputLayout>,
+    ) -> Result<(LogicalPlan, LogicalOutputLayout)> {
+        let plan = plan
+            .map_operator(|operator| self.propagator.propagate_operator(self.context, operator));
+        let output_layout = plan.operator.output_layout_from_children(&child_layouts);
+        Ok((plan, output_layout))
+    }
 }
 
 impl StatisticsPropagator {
@@ -344,6 +406,14 @@ impl StatisticsPropagator {
                     comp.comparison_type,
                 );
 
+                if matches!(
+                    comp.comparison_type,
+                    ComparisonType::Equal | ComparisonType::NotDistinctFrom
+                ) {
+                    self.publish_constant_equality(&comp.left, &comp.right);
+                    self.publish_constant_equality(&comp.right, &comp.left);
+                }
+
                 // If the filter is always true or false, replace the expression with a constant
                 match result {
                     FilterPropagateResult::FilterAlwaysTrue => {
@@ -368,34 +438,34 @@ impl StatisticsPropagator {
         FilterPropagateResult::NoPruningPossible
     }
 
-    fn propagate_plan(&mut self, ctx: &StatementContext, plan: LogicalPlan) -> LogicalPlan {
-        let mut plan = plan;
-        let operator = std::mem::replace(&mut plan.operator, LogicalOperator::DummyScan);
-        let operator = match operator {
-            LogicalOperator::MaterializedCTE(mut cte) => {
-                cte.cte_query = Box::new(self.propagate_plan(ctx, *cte.cte_query));
-                if let Some(statistics) = self.capture_output_statistics(&cte.cte_query.operator) {
-                    self.cte_statistics.insert(cte.cte_index, statistics);
-                }
-                cte.child = Box::new(self.propagate_plan(ctx, *cte.child));
-                LogicalOperator::MaterializedCTE(cte)
-            }
-            LogicalOperator::RecursiveCTE(mut cte) => {
-                cte.anchor = Box::new(self.propagate_plan(ctx, *cte.anchor));
-                if let Some(statistics) = self.capture_output_statistics(&cte.anchor.operator) {
-                    self.cte_statistics.insert(cte.cte_index, statistics);
-                }
-                cte.recursive = Box::new(self.propagate_plan(ctx, *cte.recursive));
-                LogicalOperator::RecursiveCTE(cte)
-            }
-            operator => {
-                plan.operator = operator;
-                plan = plan.map_children(|child| self.propagate_plan(ctx, child));
-                std::mem::replace(&mut plan.operator, LogicalOperator::DummyScan)
-            }
+    /// Publish the exact post-filter domain of `column = constant`.
+    ///
+    /// The storage HLL describes the pre-filter column and must not be reused
+    /// after equality narrows the domain. A constant [`BaseStatistics`] keeps
+    /// the exact singleton range available to the cardinality estimator while
+    /// leaving the HLL empty rather than forging an observed sketch.
+    fn publish_constant_equality(&mut self, column: &Expression, constant: &Expression) {
+        let (Expression::ColumnRef(column), Expression::Constant(constant)) = (column, constant)
+        else {
+            return;
         };
-        plan.operator = self.propagate_operator(ctx, operator);
-        plan
+        if column.depth != 0 || constant.value.is_null() {
+            return;
+        }
+        self.statistics_map.insert(
+            column.binding,
+            constant_column_statistics_arc(&constant.value),
+        );
+    }
+
+    fn propagate_plan(&mut self, ctx: &StatementContext, plan: LogicalPlan) -> LogicalPlan {
+        let mut folder = StatisticsPropagationFolder {
+            propagator: self,
+            context: ctx,
+        };
+        plan.try_fold_post_order_with(&mut folder)
+            .expect("statistics propagation must preserve logical plan structure")
+            .0
     }
 
     /// Propagate statistics through an operator after all children have been propagated.
@@ -444,7 +514,13 @@ impl StatisticsPropagator {
             LogicalOperator::Aggregate(mut agg) => {
                 for (i, expr) in agg.groups.iter().enumerate() {
                     if let Some(stats) = self.propagate_expression(expr) {
-                        agg.group_stats[i] = Some(stats.statistics().clone());
+                        // LogicalAggregate owns a compact BaseStatistics
+                        // snapshot, while table NDV lives in the richer HLL
+                        // sidecar. Preserve that estimate explicitly so
+                        // physical work decisions do not silently see every
+                        // group domain as unknown. This remains an estimate;
+                        // proof-backed bounds stay in ColumnStatistics.
+                        agg.group_stats[i] = Some(aggregate_group_statistics(&stats));
                         let binding = ColumnBinding {
                             table_index: agg.group_index,
                             column_index: i,
@@ -491,18 +567,8 @@ impl StatisticsPropagator {
                 LogicalOperator::TopN(topn)
             }
             LogicalOperator::Distinct(distinct) => LogicalOperator::Distinct(distinct),
-            LogicalOperator::MaterializedCTE(cte) => {
-                if let Some(stats) = self.capture_output_statistics(&cte.cte_query.operator) {
-                    self.cte_statistics.insert(cte.cte_index, stats);
-                }
-                LogicalOperator::MaterializedCTE(cte)
-            }
-            LogicalOperator::RecursiveCTE(cte) => {
-                if let Some(stats) = self.capture_output_statistics(&cte.anchor.operator) {
-                    self.cte_statistics.insert(cte.cte_index, stats);
-                }
-                LogicalOperator::RecursiveCTE(cte)
-            }
+            LogicalOperator::MaterializedCTE(cte) => LogicalOperator::MaterializedCTE(cte),
+            LogicalOperator::RecursiveCTE(cte) => LogicalOperator::RecursiveCTE(cte),
             LogicalOperator::CTERef(cte_ref) => {
                 if let Some(stats) = self.cte_statistics.get(&cte_ref.cte_index).cloned() {
                     for (column_index, stats) in stats.into_iter().enumerate() {
@@ -597,13 +663,12 @@ impl StatisticsPropagator {
 
     fn capture_output_statistics(
         &self,
-        op: &LogicalOperator,
+        layout: &LogicalOutputLayout,
     ) -> Option<Vec<Arc<ColumnStatistics>>> {
-        let bindings = op.get_column_bindings();
-        let mut result = Vec::with_capacity(bindings.len());
+        let mut result = Vec::with_capacity(layout.len());
 
-        for binding in bindings {
-            let stats = self.statistics_map.get(&binding)?.clone();
+        for binding in layout.bindings() {
+            let stats = self.statistics_map.get(binding)?.clone();
             result.push(stats);
         }
 
@@ -613,9 +678,7 @@ impl StatisticsPropagator {
     /// Propagate statistics through an expression
     fn propagate_expression(&mut self, expr: &Expression) -> Option<Arc<ColumnStatistics>> {
         match expr {
-            Expression::Constant(constant) => Some(column_statistics_arc(
-                BaseStatistics::from_constant(&constant.value),
-            )),
+            Expression::Constant(constant) => Some(constant_column_statistics_arc(&constant.value)),
             Expression::ColumnRef(col_ref) => {
                 let binding = Self::column_binding(col_ref);
                 self.statistics_map.get(&binding).cloned()
@@ -750,10 +813,14 @@ impl StatisticsPropagator {
                 NumericStats::set_guaranteed_max(&mut new_base, &max);
             }
 
-            Some(Arc::new(ColumnStatistics::with_distinct(
+            let mut casted = ColumnStatistics::with_distinct(
                 new_base,
                 stats.distinct_stats().map(|distinct| distinct.copy()),
-            )))
+            );
+            if let Some(upper) = stats.guaranteed_distinct_upper() {
+                casted = casted.with_guaranteed_distinct_upper(upper);
+            }
+            Some(Arc::new(casted))
         } else {
             None
         }
@@ -909,8 +976,12 @@ mod tests {
     use paro_function::aggregate::distributive::count::get_count_star_function;
     use paro_function::window::WindowFunction;
     use paro_planner::binder::context::BindContext;
-    use paro_planner::expression::{AggregateExpression, WindowExpression, WindowFrame};
-    use paro_planner::operator::{Aggregate, ExpressionGet, Filter, Get, Projection, Window};
+    use paro_planner::expression::{
+        AggregateExpression, ComparisonExpression, WindowExpression, WindowFrame,
+    };
+    use paro_planner::operator::{
+        Aggregate, ExpressionGet, Filter, Get, Limit, Projection, Window,
+    };
     use paro_storage::statistics::StringStats;
     use paro_storage::table::table_factory::TableFactory;
 
@@ -971,7 +1042,7 @@ mod tests {
         let aggregate = keyed_group_aggregate(Constraint::primary_key(vec![0]));
         let plan = LogicalPlan::synthetic(LogicalOperator::Aggregate(aggregate));
         let propagated = StatisticsPropagator::new().propagate(make_test_session(), plan);
-        let LogicalOperator::Aggregate(aggregate) = propagated.operator else {
+        let LogicalOperator::Aggregate(aggregate) = &propagated.operator else {
             panic!("expected aggregate root");
         };
         assert_eq!(
@@ -1021,13 +1092,139 @@ mod tests {
 
         let optimized = StatisticsPropagator::new().propagate(make_test_session(), filter);
 
-        match optimized.operator {
+        match &optimized.operator {
             LogicalOperator::EmptyResult(empty) => {
                 assert_eq!(empty.get_types(), vec![LogicalType::Integer]);
                 assert_eq!(empty.child.output_names(), vec!["quota".to_string()]);
             }
             other => panic!("expected schema-preserving EmptyResult, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn statistics_propagation_uses_a_heap_stack_for_deep_plans() {
+        std::thread::Builder::new()
+            .name("deep-statistics-propagation".to_string())
+            .stack_size(512 * 1024)
+            .spawn(|| {
+                const DEPTH: usize = 10_000;
+                let bind_context = BindContext::new();
+                let mut plan = LogicalPlan::new(
+                    &bind_context,
+                    LogicalOperator::ExpressionGet(ExpressionGet::new(
+                        17,
+                        vec![vec![Expression::Constant(ConstantExpression::new(
+                            Value::Integer(1),
+                            LogicalType::Integer,
+                        ))]],
+                        vec!["v".to_string()],
+                        vec![LogicalType::Integer],
+                    )),
+                );
+                for _ in 0..DEPTH {
+                    plan = LogicalPlan::new(
+                        &bind_context,
+                        LogicalOperator::Limit(Limit::new(plan, None, None)),
+                    );
+                }
+
+                let plan = StatisticsPropagator::new().propagate(make_test_session(), plan);
+                let mut current = &plan;
+                for _ in 0..DEPTH {
+                    let LogicalOperator::Limit(limit) = &current.operator else {
+                        panic!("expected the deep limit chain to remain intact");
+                    };
+                    current = &limit.child;
+                }
+                assert!(matches!(
+                    &current.operator,
+                    LogicalOperator::ExpressionGet(_)
+                ));
+            })
+            .expect("deep statistics thread should start")
+            .join()
+            .expect("deep statistics propagation should complete");
+    }
+
+    #[test]
+    fn group_dependency_collection_uses_a_heap_stack_for_deep_aggregate_inputs() {
+        std::thread::Builder::new()
+            .name("deep-group-dependency-collection".to_string())
+            .stack_size(512 * 1024)
+            .spawn(|| {
+                const DEPTH: usize = 10_000;
+                let mut aggregate = keyed_group_aggregate(Constraint::primary_key(vec![0]));
+                let mut child = *aggregate.child;
+                for _ in 0..DEPTH {
+                    child = LogicalPlan::synthetic(LogicalOperator::Limit(Limit::new(
+                        child, None, None,
+                    )));
+                }
+                aggregate.child = Box::new(child);
+
+                let plan = LogicalPlan::synthetic(LogicalOperator::Aggregate(aggregate));
+                let propagated = StatisticsPropagator::new().propagate(make_test_session(), plan);
+                let LogicalOperator::Aggregate(aggregate) = &propagated.operator else {
+                    panic!("expected aggregate root");
+                };
+                assert_eq!(
+                    aggregate.group_dependencies,
+                    [GroupDependency {
+                        determinants: Box::new([0]),
+                        dependents: Box::new([1, 2]),
+                    }]
+                );
+
+                let mut child = aggregate.child.as_ref();
+                for _ in 0..DEPTH {
+                    let LogicalOperator::Limit(limit) = &child.operator else {
+                        panic!("expected deep aggregate input to retain its limit chain");
+                    };
+                    child = &limit.child;
+                }
+                assert!(matches!(&child.operator, LogicalOperator::Get(_)));
+            })
+            .expect("deep group-dependency thread should start")
+            .join()
+            .expect("deep group-dependency collection should complete");
+    }
+
+    #[test]
+    fn equality_filter_publishes_exact_singleton_domain() {
+        let binding = ColumnBinding::new(7, 0);
+        let mut original =
+            ColumnStatistics::new(BaseStatistics::create_unknown(LogicalType::Integer));
+        original.update_distinct_statistics(&[11, 29, 47], 3);
+        let mut propagator = StatisticsPropagator::new();
+        propagator
+            .statistics_map
+            .insert(binding, Arc::new(original));
+        let mut predicate = Expression::Comparison(ComparisonExpression::new(
+            ComparisonType::Equal,
+            Expression::ColumnRef(ColumnRefExpression::new(binding, LogicalType::Integer)),
+            Expression::Constant(ConstantExpression::new(
+                Value::Integer(2001),
+                LogicalType::Integer,
+            )),
+        ));
+
+        assert_eq!(
+            propagator.handle_filter(&mut predicate),
+            FilterPropagateResult::NoPruningPossible
+        );
+        let statistics = propagator
+            .statistics_map
+            .get(&binding)
+            .expect("filtered column statistics");
+        assert_eq!(
+            statistics.statistics().min_value(),
+            Some(Value::Integer(2001))
+        );
+        assert_eq!(
+            statistics.statistics().max_value(),
+            Some(Value::Integer(2001))
+        );
+        assert_eq!(statistics.get_distinct_count(), 0);
     }
 
     #[test]
@@ -1128,12 +1325,24 @@ mod tests {
         );
 
         let optimized = StatisticsPropagator::new().propagate(make_test_session(), aggregate);
-        let LogicalOperator::Aggregate(aggregate) = optimized.operator else {
+        let LogicalOperator::Aggregate(aggregate) = &optimized.operator else {
             panic!("expected aggregate");
         };
         let stats = aggregate.group_stats[0].as_ref().expect("group statistics");
         assert_eq!(stats.min_value(), Some(Value::Varchar("R".to_string())));
         assert_eq!(StringStats::max_string_length(stats), Some(1));
+    }
+
+    #[test]
+    fn aggregate_group_statistics_retain_hll_distinct_estimate() {
+        let mut statistics =
+            ColumnStatistics::new(BaseStatistics::create_empty(LogicalType::Integer));
+        statistics.update_distinct_statistics(&[11, 22, 33, 44], 4);
+
+        let group = aggregate_group_statistics(&statistics);
+
+        assert!(statistics.get_distinct_count() > 0);
+        assert_eq!(group.get_distinct_count(), statistics.get_distinct_count());
     }
 
     #[test]

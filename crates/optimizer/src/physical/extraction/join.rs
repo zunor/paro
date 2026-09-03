@@ -36,6 +36,26 @@ impl PhysicalPlanExtractor {
                     }
                     self.lower_comparison_hash_join(comparison)
                 }
+                crate::physical::PhysicalImplementationFlavor::HashJoinBuildLeft
+                | crate::physical::PhysicalImplementationFlavor::HashJoinBuildLeftRuntimeFilter => {
+                    if !comparison.duplicate_eliminated_columns.is_empty()
+                        || comparison.delim_flipped
+                        || comparison.anti_join_mode != AntiJoinMode::Regular
+                        || !matches!(
+                            comparison.join_type,
+                            JoinType::Left | JoinType::Right | JoinType::Inner | JoinType::Outer
+                        )
+                        || !comparison
+                            .conditions
+                            .iter()
+                            .any(|condition| is_hash_join_comparison(condition.comparison))
+                    {
+                        return Err(paro_error::internal(
+                            "Memo selected build-left hash join for an ineligible comparison join",
+                        ));
+                    }
+                    self.lower_comparison_hash_join_build_left(comparison)
+                }
                 crate::physical::PhysicalImplementationFlavor::NestedLoopJoin => {
                     if comparison.anti_join_mode == AntiJoinMode::NullAware
                         || !comparison.duplicate_eliminated_columns.is_empty()
@@ -358,6 +378,7 @@ impl PhysicalPlanExtractor {
             project_by_index(&join.right.types(), &right_projection, "hash join right")?;
         let output_names = join_output_names(join.join_type, left_names, right_names);
         let output_types = join.get_types();
+        let output_permutation = OutputPermutation::identity(output_types.len());
         let (key_conditions, residual_conditions) = partition_hash_join_conditions(join);
         let build_keys_unique =
             hash_join_build_keys_are_declared_unique(join.right.as_ref(), &key_conditions);
@@ -384,6 +405,7 @@ impl PhysicalPlanExtractor {
             left_output_types: left_types.into_boxed_slice(),
             build_output_count,
             build_payload_types: build_payload_types.into_boxed_slice(),
+            output_permutation,
             output_names: output_names.into_boxed_slice(),
             output_types: output_types.into_boxed_slice(),
             spill_policy: self
@@ -393,6 +415,106 @@ impl PhysicalPlanExtractor {
             reduction_cascade: None,
         };
         Ok((PhysicalNodeKind::HashJoin(spec), vec![left, right]))
+    }
+
+    /// Lower a hash join whose logical left input is the physical build side.
+    ///
+    /// The immutable hash-join executor always receives probe then build. The
+    /// join is therefore inverted here. `output_permutation` maps its natural
+    /// `[logical right, logical left]` layout directly into the logical
+    /// `[logical left, logical right]` contract during result construction.
+    pub(crate) fn lower_comparison_hash_join_build_left(
+        &mut self,
+        join: &ComparisonJoin,
+    ) -> Result<(PhysicalNodeKind, Vec<PhysicalPlanNodeId>)> {
+        let probe = self.extract_node(join.right.as_ref())?;
+        let build = self.extract_node(join.left.as_ref())?;
+        let probe_projection = hash_join_right_projection(join);
+        let build_projection = hash_join_left_projection(join);
+        let probe_names = project_output_names(
+            join.right.as_ref(),
+            &probe_projection,
+            "build-left hash join probe output",
+        )?;
+        let probe_types = project_by_index(
+            &join.right.types(),
+            &probe_projection,
+            "build-left hash join probe",
+        )?;
+        let build_names = project_output_names(
+            join.left.as_ref(),
+            &build_projection,
+            "build-left hash join build output",
+        )?;
+        let build_types = project_by_index(
+            &join.left.types(),
+            &build_projection,
+            "build-left hash join build",
+        )?;
+        let physical_join_type = join.join_type.inverse().ok_or_else(|| {
+            paro_error::internal("build-left hash join has no inverse join semantics")
+        })?;
+        let output_names = join_output_names(join.join_type, build_names, probe_names);
+        let output_types = join.get_types();
+        let probe_output_count = probe_types.len();
+        let build_output_count = build_types.len();
+        let output_permutation = OutputPermutation::from_forward(
+            (0..probe_output_count)
+                .map(|probe_index| build_output_count + probe_index)
+                .chain(0..build_output_count),
+        )?;
+        let swapped_conditions = join
+            .conditions
+            .iter()
+            .map(|condition| JoinCondition {
+                left: condition.right.clone(),
+                right: condition.left.clone(),
+                comparison: condition.comparison.flip(),
+            })
+            .collect::<Vec<_>>();
+        let (key_conditions, residual_conditions): (Vec<_>, Vec<_>) = swapped_conditions
+            .into_iter()
+            .partition(|condition| is_hash_join_comparison(condition.comparison));
+        debug_assert!(
+            !key_conditions.is_empty(),
+            "hash join requires an equality key"
+        );
+        let key_conditions = key_conditions.into_boxed_slice();
+        let residual_conditions = residual_conditions.into_boxed_slice();
+        let build_keys_unique =
+            hash_join_build_keys_are_declared_unique(join.left.as_ref(), &key_conditions);
+        let build_time_integer_index =
+            plan_build_time_integer_join_index(join.left.as_ref(), &key_conditions);
+        let probe_residual_count = residual_conditions.len();
+        let mut build_payload_types = build_types;
+        build_payload_types.extend(
+            residual_conditions
+                .iter()
+                .map(|condition| condition.right.return_type()),
+        );
+        let spec = HashJoinSpec {
+            join_type: physical_join_type,
+            anti_join_mode: join.anti_join_mode,
+            build_keys_unique,
+            build_time_integer_index,
+            key_conditions,
+            build_residual_conditions: residual_conditions,
+            probe_residual_count,
+            left_projection: probe_projection.into_boxed_slice(),
+            build_input_projection: build_projection.into_boxed_slice(),
+            left_output_types: probe_types.into_boxed_slice(),
+            build_output_count,
+            build_payload_types: build_payload_types.into_boxed_slice(),
+            output_permutation,
+            output_names: output_names.into_boxed_slice(),
+            output_types: output_types.into_boxed_slice(),
+            spill_policy: self
+                .ctx
+                .spill_execution_policy(supports_external_hash_join_type(physical_join_type)),
+            runtime_filter: None,
+            reduction_cascade: None,
+        };
+        Ok((PhysicalNodeKind::HashJoin(spec), vec![probe, build]))
     }
 
     /// Fuse consecutive build-preserving existential reductions that read the
@@ -704,6 +826,7 @@ impl PhysicalPlanExtractor {
             left_output_types: Box::new([]),
             build_output_count,
             build_payload_types: build_payload_types.into_boxed_slice(),
+            output_permutation: OutputPermutation::identity(root.get_types().len()),
             output_names: comparison_join_output_names(root)?.into_boxed_slice(),
             output_types: root.get_types().into_boxed_slice(),
             spill_policy: self.ctx.spill_execution_policy(true),
@@ -847,6 +970,7 @@ impl PhysicalPlanExtractor {
         )?;
         let output_names = join_output_names(join.join_type, left_names, right_names);
         let output_types = join.get_types();
+        let output_permutation = OutputPermutation::identity(output_types.len());
         let (key_conditions, residual_conditions) = partition_hash_join_conditions(join);
         let build_keys_unique =
             hash_join_build_keys_are_declared_unique(join.right.as_ref(), &key_conditions);
@@ -873,6 +997,7 @@ impl PhysicalPlanExtractor {
             left_output_types: left_types.into_boxed_slice(),
             build_output_count,
             build_payload_types: build_payload_types.into_boxed_slice(),
+            output_permutation,
             output_names: output_names.clone().into_boxed_slice(),
             output_types: output_types.clone().into_boxed_slice(),
             spill_policy: self
