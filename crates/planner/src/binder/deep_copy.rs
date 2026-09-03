@@ -987,7 +987,7 @@ mod tests {
         assert_ne!(copy.id, original.id);
         assert_eq!(copy.stats, NodeStats::default());
 
-        let LogicalOperator::Projection(proj) = copy.operator else {
+        let LogicalOperator::Projection(proj) = &copy.operator else {
             panic!("expected projection");
         };
         assert_eq!(proj.visible_names, vec!["alias_v".to_string()]);
@@ -1027,11 +1027,11 @@ mod tests {
 
         assert_ne!(copy.id, original.id);
         assert_eq!(copy.stats, original.stats);
-        let LogicalOperator::Projection(copy) = copy.operator else {
+        let LogicalOperator::Projection(copy) = &copy.operator else {
             panic!("expected projection")
         };
         assert_ne!(copy.table_index, 11);
-        let LogicalOperator::ExpressionGet(input) = copy.child.operator else {
+        let LogicalOperator::ExpressionGet(input) = &copy.child.operator else {
             panic!("expected expression get")
         };
         assert_ne!(input.table_index, 7);
@@ -1102,7 +1102,7 @@ mod tests {
 
         let copy = deep_copy_plan(&original, bind_context.shared().as_ref());
 
-        let LogicalOperator::MaterializedCTE(cte) = copy.operator else {
+        let LogicalOperator::MaterializedCTE(cte) = &copy.operator else {
             panic!("expected materialized cte");
         };
         let LogicalOperator::CTERef(cte_ref) = &cte.child.operator else {
@@ -1146,7 +1146,7 @@ mod tests {
         );
 
         let copy = deep_copy_plan(&original, bind_context.shared().as_ref());
-        let LogicalOperator::Window(copy) = copy.operator else {
+        let LogicalOperator::Window(copy) = &copy.operator else {
             panic!("expected window");
         };
         let LogicalOperator::ExpressionGet(child) = &copy.child.operator else {
@@ -1194,7 +1194,7 @@ mod tests {
         let copy = duplicate_plan_preserving_indices(&original, bind_context.shared().as_ref());
 
         assert_eq!(copy.stats, original.stats);
-        let LogicalOperator::Projection(copy) = copy.operator else {
+        let LogicalOperator::Projection(copy) = &copy.operator else {
             panic!("expected projection");
         };
         assert_eq!(
@@ -1263,7 +1263,7 @@ mod tests {
         let original = LogicalPlan::new(&bind_context, LogicalOperator::Aggregate(aggregate));
 
         let copy = deep_copy_plan(&original, bind_context.shared().as_ref());
-        let LogicalOperator::Aggregate(copy) = copy.operator else {
+        let LogicalOperator::Aggregate(copy) = &copy.operator else {
             panic!("expected aggregate");
         };
         let reduction = copy.post_reduction.as_ref().expect("reduction");

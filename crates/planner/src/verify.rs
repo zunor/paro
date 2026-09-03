@@ -105,6 +105,16 @@ fn verify_operator(op: &LogicalOperator) -> Result<()> {
                 for cond in &comp_join.conditions {
                     verify_expression(&cond.left)?;
                     verify_expression(&cond.right)?;
+                    if !crate::expression::ComparisonExpression::operands_have_bound_input_contract(
+                        &cond.left,
+                        &cond.right,
+                    ) {
+                        return Err(paro_error::internal(format!(
+                            "Planner verify failed: join comparison operands are not explicitly coerced to one normalized type (left={}, right={})",
+                            cond.left.return_type(),
+                            cond.right.return_type(),
+                        )));
+                    }
                 }
             }
             Join::Any(any_join) => {
@@ -186,6 +196,13 @@ fn verify_expression_node(expr: &Expression, root: &Expression) -> Result<()> {
     if let Expression::Window(window) = expr {
         window.verify_bound_contract()?;
     }
+    if let Expression::Comparison(comparison) = expr {
+        verify_comparison_input_contract(
+            comparison.left.as_ref(),
+            comparison.right.as_ref(),
+            root,
+        )?;
+    }
     if let Expression::Subquery(subquery) = expr {
         return Err(paro_error::internal(format!(
             "Planner verify failed: Expression::Subquery remained after flattening (state={:?}) in {root:?}",
@@ -210,6 +227,21 @@ fn verify_expression_node(expr: &Expression, root: &Expression) -> Result<()> {
     result
 }
 
+fn verify_comparison_input_contract(
+    left: &Expression,
+    right: &Expression,
+    root: &Expression,
+) -> Result<()> {
+    if crate::expression::ComparisonExpression::operands_have_bound_input_contract(left, right) {
+        return Ok(());
+    }
+    Err(paro_error::internal(format!(
+        "Planner verify failed: comparison operands are not explicitly coerced to one normalized type (left={}, right={}) in {root:?}",
+        left.return_type(),
+        right.return_type(),
+    )))
+}
+
 #[cfg(test)]
 mod tests {
     use super::verify_physical_planner_invariants;
@@ -217,9 +249,9 @@ mod tests {
 
     use crate::binder::context::BindContext;
     use crate::expression::{
-        AggregateExpression, ColumnRefExpression, ComparisonType, ConstantExpression, Expression,
-        SubqueryExpression, SubqueryPlanningState, SubqueryType, WindowExpression, WindowFrame,
-        WindowFrameBound, WindowFrameType,
+        AggregateExpression, ColumnRefExpression, ComparisonExpression, ComparisonType,
+        ConstantExpression, Expression, SubqueryExpression, SubqueryPlanningState, SubqueryType,
+        WindowExpression, WindowFrame, WindowFrameBound, WindowFrameType,
     };
     use crate::operator::projection::Projection;
     use crate::operator::{ColumnBinding, DependentJoin, ExpressionGet, LogicalOperator};
@@ -330,6 +362,27 @@ mod tests {
 
         let err = verify_physical_planner_invariants(&plan).expect_err("verify should fail");
         assert!(err.to_string().contains("return type mismatch"), "{err}");
+    }
+
+    #[test]
+    fn verify_rejects_comparison_without_explicit_common_type() {
+        let ctx = BindContext::new();
+        let child = wrap(&ctx, expression_get(0));
+        let comparison = Expression::Comparison(ComparisonExpression {
+            left: Box::new(Expression::Constant(ConstantExpression::new(
+                Value::Integer(1),
+                LogicalType::Integer,
+            ))),
+            right: Box::new(Expression::Constant(ConstantExpression::new(
+                Value::BigInt(1),
+                LogicalType::BigInt,
+            ))),
+            comparison_type: ComparisonType::Equal,
+        });
+        let plan = LogicalOperator::Projection(Projection::new(42, child, vec![comparison]));
+
+        let err = verify_physical_planner_invariants(&plan).expect_err("verify should fail");
+        assert!(err.to_string().contains("explicitly coerced"), "{err}");
     }
 
     #[test]

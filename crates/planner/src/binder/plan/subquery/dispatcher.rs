@@ -131,12 +131,16 @@ impl Binder {
                 subquery_plan,
                 root,
                 &subquery.children,
+                &subquery.child_types,
+                &subquery.child_targets,
                 subquery.comparison_type,
             ),
             SubqueryType::All => self.plan_uncorrelated_all(
                 subquery_plan,
                 root,
                 &subquery.children,
+                &subquery.child_types,
+                &subquery.child_targets,
                 subquery.comparison_type,
             ),
         }
@@ -288,6 +292,8 @@ impl Binder {
         subquery_plan: LogicalOperator,
         root: &mut LogicalOperator,
         children: &[Expression],
+        child_types: &[LogicalType],
+        child_targets: &[LogicalType],
         comparison_type: ComparisonType,
     ) -> Result<Expression> {
         if children.is_empty() {
@@ -304,13 +310,29 @@ impl Binder {
                 subquery_types.len()
             )));
         }
+        if child_types.len() != children.len() || child_targets.len() != children.len() {
+            return Err(paro_error::internal(
+                "Binder must preserve aligned source and target types for ANY/IN operands",
+            ));
+        }
 
         let mark_index = self.bind_context.generate_table_index();
 
         let mut conditions = Vec::new();
         for (i, child) in children.iter().enumerate() {
+            if subquery_types[i] != child_types[i] {
+                return Err(paro_error::internal(format!(
+                    "ANY/IN subquery output type drift at column {i}: bound={}, planned={}",
+                    child_types[i], subquery_types[i],
+                )));
+            }
             let right =
-                Self::subquery_output_column_ref(&subquery_plan, i, subquery_types[i].clone())?;
+                Self::subquery_output_column_ref(&subquery_plan, i, child_types[i].clone())?;
+            let right = CastExpression::add_cast_if_needed(
+                right,
+                child_targets[i].clone(),
+                self.cast_functions.as_ref(),
+            )?;
 
             let join_comparison = match comparison_type {
                 ComparisonType::Equal => JoinComparisonType::Equal,
@@ -348,6 +370,8 @@ impl Binder {
         subquery_plan: LogicalOperator,
         root: &mut LogicalOperator,
         children: &[Expression],
+        child_types: &[LogicalType],
+        child_targets: &[LogicalType],
         comparison_type: ComparisonType,
     ) -> Result<Expression> {
         let inverted_comparison = match comparison_type {
@@ -361,8 +385,14 @@ impl Binder {
             ComparisonType::NotDistinctFrom => ComparisonType::DistinctFrom,
         };
 
-        let any_result =
-            self.plan_uncorrelated_any(subquery_plan, root, children, inverted_comparison)?;
+        let any_result = self.plan_uncorrelated_any(
+            subquery_plan,
+            root,
+            children,
+            child_types,
+            child_targets,
+            inverted_comparison,
+        )?;
 
         let false_const = Expression::Constant(ConstantExpression {
             value: Value::Boolean(false),
@@ -416,7 +446,10 @@ mod tests {
         let mut planner = Planner::new(session);
         let statement = paro_parser::parse_one(sql).expect("parse").stmt;
         planner.create_plan(statement).expect("planner create_plan");
-        planner.take_plan().expect("planned logical plan").operator
+        planner
+            .take_plan()
+            .expect("planned logical plan")
+            .into_operator()
     }
 
     fn binder_planned_logical_operator(sql: &str) -> LogicalOperator {
@@ -429,7 +462,7 @@ mod tests {
         binder
             .create_plan(bound)
             .expect("binder create_plan without final flatten")
-            .operator
+            .into_operator()
     }
 
     fn flattened_logical_operator(sql: &str) -> LogicalOperator {
@@ -445,7 +478,7 @@ mod tests {
         binder
             .flatten_dependent_joins(plan)
             .expect("flatten dependent joins")
-            .operator
+            .into_operator()
     }
 
     fn nested_case_sql(case: &str) -> &'static str {
@@ -730,5 +763,33 @@ mod tests {
             planned_logical_operator(nested_case_sql("uncorrelated_any_with_correlated_scalar"));
         crate::verify::verify_physical_planner_invariants(&plan)
             .expect("all nested correlation must be flattened before physical planning");
+    }
+
+    #[test]
+    fn uncorrelated_any_casts_both_join_operands_to_the_bound_domain() {
+        let plan = binder_planned_logical_operator(
+            "SELECT CAST(1 AS BIGINT) IN (\
+                 SELECT CAST(x AS INTEGER) FROM (VALUES (1)) AS t(x)\
+             )",
+        );
+        crate::verify::verify_physical_planner_invariants(&plan)
+            .expect("ANY lowering must retain the binder's common comparison type");
+
+        let mut pending = vec![&plan];
+        let condition = loop {
+            let operator = pending
+                .pop()
+                .expect("uncorrelated ANY must emit a mark join");
+            if let LogicalOperator::Join(Join::Comparison(join)) = operator {
+                if join.join_type == JoinType::Mark {
+                    break join.conditions.first().expect("ANY comparison condition");
+                }
+            }
+            pending.extend(operator.children().into_iter().map(|child| &child.operator));
+        };
+
+        assert_eq!(condition.left.return_type(), LogicalType::BigInt);
+        assert_eq!(condition.right.return_type(), LogicalType::BigInt);
+        assert!(matches!(&condition.right, Expression::Cast(_)));
     }
 }

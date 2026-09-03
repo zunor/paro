@@ -23,7 +23,12 @@ pub fn bind_comparison(
     bind_bound_comparison(binder, left, right, comparison_type)
 }
 
-fn bind_bound_comparison(
+/// Bind already-resolved operands to the same normalized physical input type.
+///
+/// Planner-generated comparisons, including `JOIN .. USING`, must use this
+/// path rather than constructing a comparison around independently typed
+/// operands. The expression executor deliberately performs no implicit cast.
+pub(crate) fn bind_bound_comparison(
     binder: &mut ExpressionBinder,
     mut left: Expression,
     mut right: Expression,
@@ -442,5 +447,84 @@ pub fn bind_map_access(
             "Map accessor not supported: {:?}",
             accessor
         ))),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::binder::test_utils::test_binder;
+    use crate::expression::ColumnRefExpression;
+    use crate::operator::ColumnBinding;
+
+    fn column(index: usize, logical_type: LogicalType) -> Expression {
+        Expression::ColumnRef(ColumnRefExpression::new(
+            ColumnBinding::new(index, 0),
+            logical_type,
+        ))
+    }
+
+    fn assert_explicit_common_comparison(left_type: LogicalType, right_type: LogicalType) {
+        let expected = try_bind_comparison(&left_type, &right_type, ComparisonType::Equal)
+            .expect("types have a comparison domain")
+            .normalize_type();
+        let mut binder = test_binder();
+        let mut expression_binder = ExpressionBinder::new(&mut binder);
+        let expression = bind_bound_comparison(
+            &mut expression_binder,
+            column(1, left_type.clone()),
+            column(2, right_type.clone()),
+            ComparisonType::Equal,
+        )
+        .expect("comparison casts are registered");
+        let Expression::Comparison(comparison) = expression else {
+            panic!("bound comparison must retain its expression kind")
+        };
+
+        assert!(comparison.has_bound_input_contract());
+        assert_eq!(comparison.left.return_type(), expected);
+        assert_eq!(comparison.right.return_type(), expected);
+        if left_type != expected {
+            assert!(matches!(comparison.left.as_ref(), Expression::Cast(_)));
+        }
+        if right_type != expected {
+            assert!(matches!(comparison.right.as_ref(), Expression::Cast(_)));
+        }
+    }
+
+    #[test]
+    fn comparison_binding_makes_implicit_numeric_casts_explicit() {
+        assert_explicit_common_comparison(LogicalType::Integer, LogicalType::BigInt);
+    }
+
+    #[test]
+    fn comparison_binding_uses_one_lossless_decimal_domain() {
+        assert_explicit_common_comparison(
+            LogicalType::Decimal {
+                precision: 6,
+                scale: 2,
+            },
+            LogicalType::Decimal {
+                precision: 9,
+                scale: 4,
+            },
+        );
+    }
+
+    #[test]
+    fn comparison_binding_requires_an_explicit_compatible_collation_domain() {
+        let nocase = LogicalType::varchar_collation("NOCASE");
+        assert_explicit_common_comparison(nocase.clone(), nocase.clone());
+
+        let mut binder = test_binder();
+        let mut expression_binder = ExpressionBinder::new(&mut binder);
+        let error = bind_bound_comparison(
+            &mut expression_binder,
+            column(1, LogicalType::Varchar),
+            column(2, nocase),
+            ComparisonType::Equal,
+        )
+        .expect_err("plain and collated strings have no implicit comparison cast");
+        assert!(error.to_string().contains("Cannot implicitly cast"));
     }
 }

@@ -345,7 +345,8 @@ fn contains_column_ref(expression: &Expression) -> bool {
 pub(crate) fn normalize_scalar_singleton_wrappers(plan: LogicalOperator) -> LogicalOperator {
     match plan {
         LogicalOperator::Limit(mut limit) => {
-            limit.child.operator = normalize_scalar_singleton_wrappers(limit.child.operator);
+            limit.child =
+                Box::new((*limit.child).map_operator(normalize_scalar_singleton_wrappers));
             let limit_keeps_singleton = match limit.limit.as_ref() {
                 None => true,
                 Some(limit) => constant_nonnegative(Some(limit)).is_some_and(|limit| limit >= 1),
@@ -358,13 +359,14 @@ pub(crate) fn normalize_scalar_singleton_wrappers(plan: LogicalOperator) -> Logi
                 && offset_is_zero
                 && maximum_cardinality(&limit.child.operator).is_some_and(|maximum| maximum <= 1)
             {
-                limit.child.operator
+                (*limit.child).into_operator()
             } else {
                 LogicalOperator::Limit(limit)
             }
         }
         LogicalOperator::Order(mut order) => {
-            order.child.operator = normalize_scalar_singleton_wrappers(order.child.operator);
+            order.child =
+                Box::new((*order.child).map_operator(normalize_scalar_singleton_wrappers));
             let removable = maximum_cardinality(&order.child.operator)
                 .is_some_and(|maximum| maximum <= 1)
                 && order.orders.iter().all(|order| {
@@ -372,13 +374,13 @@ pub(crate) fn normalize_scalar_singleton_wrappers(plan: LogicalOperator) -> Logi
                     properties.can_share_evaluation() && properties.is_infallible()
                 });
             if removable {
-                order.child.operator
+                (*order.child).into_operator()
             } else {
                 LogicalOperator::Order(order)
             }
         }
         LogicalOperator::TopN(mut topn) => {
-            topn.child.operator = normalize_scalar_singleton_wrappers(topn.child.operator);
+            topn.child = Box::new((*topn.child).map_operator(normalize_scalar_singleton_wrappers));
             let removable = topn.limit >= 1
                 && topn.offset == 0
                 && maximum_cardinality(&topn.child.operator).is_some_and(|maximum| maximum <= 1)
@@ -387,22 +389,24 @@ pub(crate) fn normalize_scalar_singleton_wrappers(plan: LogicalOperator) -> Logi
                     properties.can_share_evaluation() && properties.is_infallible()
                 });
             if removable {
-                topn.child.operator
+                (*topn.child).into_operator()
             } else {
                 LogicalOperator::TopN(topn)
             }
         }
         LogicalOperator::Projection(mut projection) => {
-            projection.child.operator =
-                normalize_scalar_singleton_wrappers(projection.child.operator);
+            projection.child =
+                Box::new((*projection.child).map_operator(normalize_scalar_singleton_wrappers));
             LogicalOperator::Projection(projection)
         }
         LogicalOperator::Filter(mut filter) => {
-            filter.child.operator = normalize_scalar_singleton_wrappers(filter.child.operator);
+            filter.child =
+                Box::new((*filter.child).map_operator(normalize_scalar_singleton_wrappers));
             LogicalOperator::Filter(filter)
         }
         LogicalOperator::Distinct(mut distinct) => {
-            distinct.child.operator = normalize_scalar_singleton_wrappers(distinct.child.operator);
+            distinct.child =
+                Box::new((*distinct.child).map_operator(normalize_scalar_singleton_wrappers));
             LogicalOperator::Distinct(distinct)
         }
         other => other,

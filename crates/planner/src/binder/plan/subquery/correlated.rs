@@ -136,7 +136,7 @@ impl crate::binder::Binder {
             subquery.subquery.as_ref(),
             subquery.bind_snapshot.as_ref(),
         );
-        let mut subquery_plan = copied_statement.plan.operator;
+        let mut subquery_plan = copied_statement.plan.into_operator();
         if subquery.subquery_type == SubqueryType::Scalar {
             subquery_plan = normalize_scalar_singleton_wrappers(subquery_plan);
         }

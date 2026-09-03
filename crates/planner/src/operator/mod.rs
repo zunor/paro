@@ -51,7 +51,7 @@ pub mod topn;
 pub mod update;
 pub mod window;
 
-pub use self::plan_operator::LogicalOperator;
+pub use self::plan_operator::{LogicalOperator, LogicalOutputLayout};
 pub use aggregate::{
     Aggregate, GroupInputMultiplicity, PostAggregateReduction, SingletonGroupProof,
 };

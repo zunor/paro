@@ -14,12 +14,92 @@ use crate::plan::LogicalPlan;
 use super::{
     Aggregate, Alter, CTERef, ColumnBinding, CopyTo, CreateIndex, CreatePropertyGraph,
     CreateRoutine, CreateSchema, CreateSequence, CreateTable, CreateView, Delete, DelimGet,
-    DependentJoin, Distinct, Drop, DropPropertyGraph, EmptyResult, Explain, ExpressionGet, Filter,
-    FullTextFilterScan, Get, GraphExpand, GraphMatch, GraphScan, Insert, Join, Limit,
-    LogicalExternalProject, LogicalExternalTable, LogicalOperatorType, MaterializedCTE, Order,
-    Projection, ProjectionMap, RecursiveCTE, RefreshPropertyGraph, RowFetch, SearchScan, SetOpType,
-    SetOperation, TableFunctionGet, TopN, Update, Window,
+    DependentJoin, DependentJoinKind, Distinct, Drop, DropPropertyGraph, EmptyResult, Explain,
+    ExpressionGet, Filter, FullTextFilterScan, Get, GraphExpand, GraphMatch, GraphScan, Insert,
+    Join, JoinType, Limit, LogicalExternalProject, LogicalExternalTable, LogicalOperatorType,
+    MaterializedCTE, Order, Projection, ProjectionMap, RecursiveCTE, RefreshPropertyGraph,
+    RowFetch, SearchScan, SetOpType, SetOperation, TableFunctionGet, TopN, Update, Window,
 };
+
+/// The execution-facing positional output layout of one logical plan node.
+///
+/// Types and bindings are derived together so positional consumers cannot
+/// accidentally combine results from two independent tree walks. The fields
+/// remain private to keep their lengths aligned. SQL-visible display names are
+/// intentionally separate: unlike bindings, they are presentation metadata and
+/// need not survive every execution-only projection or rewrite.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct LogicalOutputLayout {
+    types: Vec<LogicalType>,
+    bindings: Vec<ColumnBinding>,
+}
+
+impl LogicalOutputLayout {
+    fn new(types: Vec<LogicalType>, bindings: Vec<ColumnBinding>) -> Self {
+        assert_eq!(
+            types.len(),
+            bindings.len(),
+            "logical output types and bindings must stay positionally aligned"
+        );
+        Self { types, bindings }
+    }
+
+    fn for_table(table_index: usize, types: Vec<LogicalType>) -> Self {
+        let bindings = LogicalOperator::generate_column_bindings(table_index, types.len());
+        Self::new(types, bindings)
+    }
+
+    pub fn len(&self) -> usize {
+        self.types.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.types.is_empty()
+    }
+
+    pub fn types(&self) -> &[LogicalType] {
+        &self.types
+    }
+
+    pub fn bindings(&self) -> &[ColumnBinding] {
+        &self.bindings
+    }
+
+    pub fn into_types(self) -> Vec<LogicalType> {
+        self.types
+    }
+
+    pub fn into_bindings(self) -> Vec<ColumnBinding> {
+        self.bindings
+    }
+
+    fn push(&mut self, logical_type: LogicalType, binding: ColumnBinding) {
+        self.types.push(logical_type);
+        self.bindings.push(binding);
+    }
+
+    fn append(&mut self, mut other: Self) {
+        self.types.append(&mut other.types);
+        self.bindings.append(&mut other.bindings);
+    }
+
+    fn project(self, projection: &ProjectionMap) -> Self {
+        let Some(indices) = projection.as_columns() else {
+            return self;
+        };
+        let mut types = Vec::with_capacity(indices.len());
+        let mut bindings = Vec::with_capacity(indices.len());
+        for &index in indices {
+            if let (Some(logical_type), Some(binding)) =
+                (self.types.get(index), self.bindings.get(index))
+            {
+                types.push(logical_type.clone());
+                bindings.push(*binding);
+            }
+        }
+        Self::new(types, bindings)
+    }
+}
 
 /// The LogicalOperator represents a node in the logical query plan.
 #[derive(Debug)]
@@ -114,147 +194,7 @@ pub enum LogicalOperator {
 
 impl LogicalOperator {
     pub fn output_names(&self) -> Vec<String> {
-        fn project_names(child_names: &[String], projection_map: &ProjectionMap) -> Vec<String> {
-            match projection_map.as_columns() {
-                None => child_names.to_vec(),
-                Some(indices) => indices
-                    .iter()
-                    .filter_map(|&idx| child_names.get(idx).cloned())
-                    .collect(),
-            }
-        }
-
-        match self {
-            LogicalOperator::Get(op) => op.names.clone(),
-            LogicalOperator::Filter(op) => {
-                let child_names = op.child.output_names();
-                project_names(&child_names, &op.projection_map)
-            }
-            LogicalOperator::Projection(op) => op.visible_names.clone(),
-            LogicalOperator::RowFetch(op) => op.output_names(),
-            LogicalOperator::ExternalProject(op) => op.output_names.clone(),
-            LogicalOperator::ExternalTable(op) => op.output_columns.clone(),
-            LogicalOperator::Limit(op) => op.child.output_names(),
-            LogicalOperator::Order(op) => {
-                let child_names = op.child.output_names();
-                project_names(&child_names, &op.projection_map)
-            }
-            LogicalOperator::TopN(op) => op.child.output_names(),
-            LogicalOperator::CreateTable(_)
-            | LogicalOperator::CreateRoutine(_)
-            | LogicalOperator::Alter(_)
-            | LogicalOperator::CreateSequence(_)
-            | LogicalOperator::CreateSchema(_)
-            | LogicalOperator::CreateIndex(_)
-            | LogicalOperator::CreateView(_)
-            | LogicalOperator::Drop(_)
-            | LogicalOperator::CreatePropertyGraph(_)
-            | LogicalOperator::DropPropertyGraph(_)
-            | LogicalOperator::RefreshPropertyGraph(_)
-            | LogicalOperator::DummyScan => vec![],
-            LogicalOperator::Aggregate(op) => {
-                let mut names = Vec::with_capacity(
-                    op.groups.len() + op.aggregates.len() + op.grouping_functions.len(),
-                );
-                for (idx, group) in op.groups.iter().enumerate() {
-                    names.push(expression_output_name(group, idx, "group"));
-                }
-                for (idx, aggregate) in op.aggregates.iter().enumerate() {
-                    names.push(expression_output_name(aggregate, idx, "agg"));
-                }
-                for idx in 0..op.grouping_functions.len() {
-                    names.push(format!("grouping_{}", idx + 1));
-                }
-                names
-            }
-            LogicalOperator::Insert(_)
-            | LogicalOperator::Delete(_)
-            | LogicalOperator::Update(_) => {
-                vec!["count".to_string()]
-            }
-            LogicalOperator::ExpressionGet(op) => op.names.clone(),
-            LogicalOperator::Join(j) => {
-                let left_names = match j {
-                    Join::Comparison(cj) => {
-                        project_names(&cj.left.output_names(), &cj.left_projection_map)
-                    }
-                    Join::Any(aj) => {
-                        project_names(&aj.left.output_names(), &aj.left_projection_map)
-                    }
-                    Join::Cross(cp) => cp.left.output_names(),
-                };
-                let right_names = match j {
-                    Join::Comparison(cj) => {
-                        project_names(&cj.right.output_names(), &cj.right_projection_map)
-                    }
-                    Join::Any(aj) => {
-                        project_names(&aj.right.output_names(), &aj.right_projection_map)
-                    }
-                    Join::Cross(cp) => cp.right.output_names(),
-                };
-
-                match j.join_type() {
-                    super::join::JoinType::Semi | super::join::JoinType::Anti => left_names,
-                    super::join::JoinType::RightSemi | super::join::JoinType::RightAnti => {
-                        right_names
-                    }
-                    super::join::JoinType::Mark => {
-                        let mut names = left_names;
-                        names.push("mark".to_string());
-                        names
-                    }
-                    _ => {
-                        let mut names = left_names;
-                        names.extend(right_names);
-                        names
-                    }
-                }
-            }
-            LogicalOperator::DelimGet(op) => op.chunk_names.clone(),
-            LogicalOperator::DependentJoin(op) => op.output_names(),
-            LogicalOperator::SetOperation(op) => op.left().output_names(),
-            LogicalOperator::Distinct(op) => op.child.output_names(),
-            LogicalOperator::Window(op) => {
-                let mut names = op.child.output_names();
-                for (idx, expr) in op.expressions.iter().enumerate() {
-                    names.push(window_output_name(expr, idx));
-                }
-                names
-            }
-            LogicalOperator::Explain(_) => vec!["QUERY PLAN".to_string()],
-            LogicalOperator::EmptyResult(op) => op.child.output_names(),
-            LogicalOperator::MaterializedCTE(op) => op.child.output_names(),
-            LogicalOperator::RecursiveCTE(op) => op.column_names.clone(),
-            LogicalOperator::CTERef(op) => op.column_names.clone(),
-            LogicalOperator::TableFunctionGet(op) => op.get_names(),
-            LogicalOperator::SearchScan(op) => op.output_names.clone(),
-            LogicalOperator::FullTextFilterScan(op) => {
-                project_names(&op.get.names, &op.projection_map)
-            }
-            LogicalOperator::CopyTo(copy) => copy.names.clone(),
-            LogicalOperator::GraphMatch(gm) => {
-                gm.columns.iter().map(|col| col.alias.clone()).collect()
-            }
-            LogicalOperator::GraphScan(_gs) => {
-                vec!["local_vertex_id".to_string(), "rowid".to_string()]
-            }
-            LogicalOperator::GraphExpand(op) => {
-                let mut names = op.child.output_names();
-                names.extend([
-                    "edge_rowid".to_string(),
-                    "target_local_id".to_string(),
-                    "target_rowid".to_string(),
-                ]);
-                if op.has_path_functions {
-                    names.extend([
-                        "path_length".to_string(),
-                        "path_vertices".to_string(),
-                        "path_edges".to_string(),
-                    ]);
-                }
-                names
-            }
-        }
+        derive_output_names(self)
     }
 
     pub fn op_type(&self) -> LogicalOperatorType {
@@ -316,70 +256,17 @@ impl LogicalOperator {
 
     /// Get the logical types of the output of this operator.
     pub fn types(&self) -> Vec<LogicalType> {
-        match self {
-            LogicalOperator::Get(op) => op.returned_types.clone(),
-            LogicalOperator::Filter(op) => {
-                let child_types = op.child.types();
-                match op.projection_map.as_columns() {
-                    None => child_types,
-                    Some(indices) => indices
-                        .iter()
-                        .filter_map(|&idx| child_types.get(idx).cloned())
-                        .collect(),
-                }
-            }
-            LogicalOperator::Projection(op) => op.returned_types.clone(),
-            LogicalOperator::RowFetch(op) => op.output_types(),
-            LogicalOperator::ExternalProject(op) => op.returned_types.clone(),
-            LogicalOperator::ExternalTable(op) => op.returned_types.clone(),
-            LogicalOperator::Limit(op) => op.child.types(),
-            LogicalOperator::Order(op) => {
-                let child_types = op.child.types();
-                match op.projection_map.as_columns() {
-                    None => child_types,
-                    Some(indices) => indices
-                        .iter()
-                        .filter_map(|&idx| child_types.get(idx).cloned())
-                        .collect(),
-                }
-            }
-            LogicalOperator::TopN(op) => op.child.types(),
-            LogicalOperator::CreateTable(_) => vec![],
-            LogicalOperator::CreateRoutine(_) => vec![],
-            LogicalOperator::Alter(_) => vec![],
-            LogicalOperator::CreateSequence(_) => vec![],
-            LogicalOperator::CreateSchema(_) => vec![],
-            LogicalOperator::CreateIndex(op) => op.get_types(),
-            LogicalOperator::CreateView(_) => vec![],
-            LogicalOperator::Drop(_) => vec![],
-            LogicalOperator::CreatePropertyGraph(_) => vec![],
-            LogicalOperator::DropPropertyGraph(_) => vec![],
-            LogicalOperator::RefreshPropertyGraph(_) => vec![],
-            LogicalOperator::Aggregate(op) => op.returned_types.clone(),
-            LogicalOperator::Insert(_) => vec![LogicalType::BigInt],
-            LogicalOperator::Delete(op) => op.get_types(),
-            LogicalOperator::Update(op) => op.get_types(),
-            LogicalOperator::ExpressionGet(op) => op.types.clone(),
-            LogicalOperator::DelimGet(op) => op.get_types(),
-            LogicalOperator::Join(j) => j.get_types(),
-            LogicalOperator::DependentJoin(d) => d.get_types(),
-            LogicalOperator::SetOperation(s) => s.get_types(),
-            LogicalOperator::Distinct(d) => d.get_types(),
-            LogicalOperator::Window(w) => w.get_types(),
-            LogicalOperator::Explain(_) => vec![LogicalType::Varchar],
-            LogicalOperator::EmptyResult(op) => op.get_types(),
-            LogicalOperator::MaterializedCTE(c) => c.get_types(),
-            LogicalOperator::RecursiveCTE(c) => c.get_types(),
-            LogicalOperator::CTERef(c) => c.get_types(),
-            LogicalOperator::TableFunctionGet(t) => t.get_types(),
-            LogicalOperator::SearchScan(search) => search.get_types(),
-            LogicalOperator::FullTextFilterScan(scan) => scan.get_types(),
-            LogicalOperator::CopyTo(copy) => copy.types.clone(),
-            LogicalOperator::GraphMatch(gm) => gm.output_types.clone(),
-            LogicalOperator::GraphScan(gs) => gs.output_types.clone(),
-            LogicalOperator::GraphExpand(op) => op.output_types(),
-            LogicalOperator::DummyScan => vec![],
-        }
+        self.output_layout().into_types()
+    }
+
+    /// Derive types and bindings together with a bounded native stack.
+    ///
+    /// Schema-independent children (for example an aggregate input or a CTE
+    /// producer) are not visited. Pass-through and projection operators reuse
+    /// their child's owned schema vectors instead of cloning one vector per
+    /// plan depth.
+    pub fn output_layout(&self) -> LogicalOutputLayout {
+        derive_output_layout(self)
     }
 
     /// Get the children of this operator.
@@ -671,180 +558,7 @@ impl LogicalOperator {
     /// pair that uniquely identifies a column.
     ///
     pub fn get_column_bindings(&self) -> Vec<ColumnBinding> {
-        match self {
-            LogicalOperator::Get(get) => {
-                // Generate bindings for each column in the scan
-                Self::generate_column_bindings(get.table_index, get.returned_types.len())
-            }
-            LogicalOperator::Filter(filter) => {
-                let child_bindings = filter.child.get_column_bindings();
-                match filter.projection_map.as_columns() {
-                    None => child_bindings,
-                    Some(indices) => indices
-                        .iter()
-                        .filter_map(|&idx| child_bindings.get(idx).copied())
-                        .collect(),
-                }
-            }
-            LogicalOperator::Projection(proj) => {
-                Self::generate_column_bindings(proj.table_index, proj.expressions.len())
-            }
-            LogicalOperator::RowFetch(fetch) => {
-                let mut bindings = fetch.child.get_column_bindings();
-                for source in &fetch.sources {
-                    bindings.extend(source.needed_columns.iter().map(|&column| {
-                        ColumnBinding::new(source.materialized_table_index, column)
-                    }));
-                }
-                bindings
-            }
-            LogicalOperator::ExternalProject(external) => {
-                let mut bindings = external.child.get_column_bindings();
-                let base = bindings.len();
-                for i in 0..external.expressions.len() {
-                    bindings.push(ColumnBinding::new(external.project_index, base + i));
-                }
-                bindings
-            }
-            LogicalOperator::ExternalTable(external) => {
-                Self::generate_column_bindings(external.table_index, external.returned_types.len())
-            }
-            LogicalOperator::Limit(limit) => {
-                // Limit passes through child's bindings unchanged
-                limit.child.get_column_bindings()
-            }
-            LogicalOperator::Order(order) => {
-                let child_bindings = order.child.get_column_bindings();
-                match order.projection_map.as_columns() {
-                    None => child_bindings,
-                    Some(indices) => indices
-                        .iter()
-                        .filter_map(|&idx| child_bindings.get(idx).copied())
-                        .collect(),
-                }
-            }
-            LogicalOperator::TopN(topn) => {
-                // TopN passes through child's bindings unchanged
-                topn.child.get_column_bindings()
-            }
-            LogicalOperator::Aggregate(agg) => agg.get_column_bindings(),
-            LogicalOperator::Join(join) => {
-                // Join combines bindings from both sides
-                let left_bindings = join.left().get_column_bindings();
-                let right_bindings = join.right().get_column_bindings();
-
-                match join {
-                    Join::Comparison(cj) => cj.get_column_bindings(&left_bindings, &right_bindings),
-                    Join::Any(aj) => aj.get_column_bindings(&left_bindings, &right_bindings),
-                    Join::Cross(_) => {
-                        let mut bindings = Vec::new();
-                        bindings.extend(left_bindings);
-                        bindings.extend(right_bindings);
-                        bindings
-                    }
-                }
-            }
-            LogicalOperator::DelimGet(delim_get) => {
-                Self::generate_column_bindings(delim_get.table_index, delim_get.chunk_types.len())
-            }
-            LogicalOperator::DependentJoin(dj) => {
-                let left_bindings = dj.left.get_column_bindings();
-                let right_bindings = dj.right.get_column_bindings();
-                dj.get_column_bindings(&left_bindings, &right_bindings)
-            }
-            LogicalOperator::SetOperation(setop) => {
-                // This is similar to Projection - it outputs a new set of columns
-                Self::generate_column_bindings(setop.table_index, setop.column_count)
-            }
-            LogicalOperator::Distinct(distinct) => {
-                // Distinct passes through child's bindings
-                distinct.child.get_column_bindings()
-            }
-            LogicalOperator::Window(window) => {
-                // Window adds new columns to child's bindings
-                let mut bindings = window.child.get_column_bindings();
-                for i in 0..window.expressions.len() {
-                    bindings.push(ColumnBinding::new(window.window_index, i));
-                }
-                bindings
-            }
-            LogicalOperator::Explain(_) => {
-                // EXPLAIN returns one VARCHAR column (QUERY PLAN)
-                Self::generate_column_bindings(0, 1)
-            }
-            LogicalOperator::EmptyResult(empty) => empty.get_column_bindings(),
-            LogicalOperator::MaterializedCTE(cte) => {
-                // CTE returns child's bindings
-                cte.child.get_column_bindings()
-            }
-            LogicalOperator::RecursiveCTE(cte) => {
-                Self::generate_column_bindings(cte.cte_index, cte.column_types.len())
-            }
-            LogicalOperator::CTERef(cte_ref) => {
-                Self::generate_column_bindings(cte_ref.table_index, cte_ref.column_types.len())
-            }
-            LogicalOperator::ExpressionGet(expr_get) => {
-                Self::generate_column_bindings(expr_get.table_index, expr_get.types.len())
-            }
-            LogicalOperator::TableFunctionGet(tf) => {
-                Self::generate_column_bindings(tf.table_index, tf.column_types.len())
-            }
-            LogicalOperator::SearchScan(search) => Self::generate_column_bindings(
-                search.projection_table_index,
-                search.projections.len(),
-            ),
-            LogicalOperator::FullTextFilterScan(scan) => {
-                let input = Self::generate_column_bindings(
-                    scan.get.table_index,
-                    scan.get.returned_types.len(),
-                );
-                scan.projection_map
-                    .to_indices(input.len())
-                    .into_iter()
-                    .filter_map(|index| input.get(index).copied())
-                    .collect()
-            }
-            LogicalOperator::CopyTo(copy) => {
-                // CopyTo returns row count (or other COPY return types)
-                Self::generate_column_bindings(0, copy.types.len())
-            }
-            LogicalOperator::GraphMatch(gm) => {
-                Self::generate_column_bindings(gm.table_index, gm.output_types.len())
-            }
-            LogicalOperator::GraphScan(gs) => {
-                Self::generate_column_bindings(gs.output_table_index, gs.output_types.len())
-            }
-            LogicalOperator::GraphExpand(ge) => {
-                Self::generate_column_bindings(ge.output_table_index, ge.output_types().len())
-            }
-            LogicalOperator::Insert(_) => {
-                // Insert returns a single column (row count)
-                vec![ColumnBinding::new(0, 0)]
-            }
-            LogicalOperator::Delete(del) => {
-                let _ = del;
-                // Delete returns a single column (affected row count)
-                vec![ColumnBinding::new(0, 0)]
-            }
-            LogicalOperator::Update(upd) => {
-                let _ = upd;
-                // Update returns a single column (affected row count)
-                vec![ColumnBinding::new(0, 0)]
-            }
-            // DDL operations don't produce column bindings
-            LogicalOperator::CreateTable(_)
-            | LogicalOperator::CreateRoutine(_)
-            | LogicalOperator::Alter(_)
-            | LogicalOperator::CreateSequence(_)
-            | LogicalOperator::CreateSchema(_)
-            | LogicalOperator::CreateIndex(_)
-            | LogicalOperator::CreateView(_)
-            | LogicalOperator::CreatePropertyGraph(_)
-            | LogicalOperator::DropPropertyGraph(_)
-            | LogicalOperator::RefreshPropertyGraph(_)
-            | LogicalOperator::Drop(_)
-            | LogicalOperator::DummyScan => vec![],
-        }
+        self.output_layout().into_bindings()
     }
 
     /// Generate column bindings for a given table index and column count.
@@ -960,6 +674,701 @@ impl LogicalOperator {
             _ => false,
         }
     }
+}
+
+enum OutputNamesTask<'a> {
+    Derive(&'a LogicalOperator),
+    Project(&'a ProjectionMap),
+    ExtendRowFetch(&'a RowFetch),
+    FinishJoin(&'a Join),
+    FinishDependentJoin(&'a DependentJoin),
+    ExtendWindow(&'a Window),
+    FinishGraphExpand(&'a GraphExpand),
+}
+
+/// Derive presentation names independently from the execution layout while
+/// retaining the same bounded-native-stack guarantee.
+fn derive_output_names(root: &LogicalOperator) -> Vec<String> {
+    use OutputNamesTask::*;
+
+    let mut tasks = vec![Derive(root)];
+    let mut outputs = Vec::<Vec<String>>::new();
+    while let Some(task) = tasks.pop() {
+        match task {
+            Derive(operator) => match operator {
+                LogicalOperator::Get(get) => outputs.push(get.names.clone()),
+                LogicalOperator::Filter(filter) => {
+                    tasks.push(Project(&filter.projection_map));
+                    tasks.push(Derive(&filter.child.operator));
+                }
+                LogicalOperator::Projection(projection) => {
+                    outputs.push(projection.visible_names.clone());
+                }
+                LogicalOperator::RowFetch(fetch) => {
+                    tasks.push(ExtendRowFetch(fetch));
+                    tasks.push(Derive(&fetch.child.operator));
+                }
+                // ExternalProject owns an eagerly aligned presentation
+                // contract, so deriving its child again would be redundant.
+                LogicalOperator::ExternalProject(project) => {
+                    outputs.push(project.output_names.clone());
+                }
+                LogicalOperator::ExternalTable(table) => {
+                    outputs.push(table.output_columns.clone());
+                }
+                LogicalOperator::Limit(limit) => tasks.push(Derive(&limit.child.operator)),
+                LogicalOperator::Order(order) => {
+                    tasks.push(Project(&order.projection_map));
+                    tasks.push(Derive(&order.child.operator));
+                }
+                LogicalOperator::TopN(topn) => tasks.push(Derive(&topn.child.operator)),
+                LogicalOperator::CreateTable(_)
+                | LogicalOperator::CreateRoutine(_)
+                | LogicalOperator::Alter(_)
+                | LogicalOperator::CreateSequence(_)
+                | LogicalOperator::CreateSchema(_)
+                | LogicalOperator::CreateIndex(_)
+                | LogicalOperator::CreateView(_)
+                | LogicalOperator::Drop(_)
+                | LogicalOperator::CreatePropertyGraph(_)
+                | LogicalOperator::DropPropertyGraph(_)
+                | LogicalOperator::RefreshPropertyGraph(_)
+                | LogicalOperator::DummyScan => outputs.push(Vec::new()),
+                LogicalOperator::Aggregate(aggregate) => {
+                    let mut names = Vec::with_capacity(
+                        aggregate.groups.len()
+                            + aggregate.aggregates.len()
+                            + aggregate.grouping_functions.len(),
+                    );
+                    for (index, group) in aggregate.groups.iter().enumerate() {
+                        names.push(expression_output_name(group, index, "group"));
+                    }
+                    for (index, aggregate) in aggregate.aggregates.iter().enumerate() {
+                        names.push(expression_output_name(aggregate, index, "agg"));
+                    }
+                    for index in 0..aggregate.grouping_functions.len() {
+                        names.push(format!("grouping_{}", index + 1));
+                    }
+                    outputs.push(names);
+                }
+                LogicalOperator::Insert(_)
+                | LogicalOperator::Delete(_)
+                | LogicalOperator::Update(_) => outputs.push(vec!["count".to_string()]),
+                LogicalOperator::ExpressionGet(values) => outputs.push(values.names.clone()),
+                LogicalOperator::Join(join) => schedule_join_names(join, &mut tasks),
+                LogicalOperator::DelimGet(delim) => outputs.push(delim.chunk_names.clone()),
+                LogicalOperator::DependentJoin(join) => {
+                    tasks.push(FinishDependentJoin(join));
+                    match &join.kind {
+                        DependentJoinKind::Mark { .. } => {
+                            tasks.push(Derive(&join.left.operator));
+                        }
+                        DependentJoinKind::Scalar { .. } | DependentJoinKind::Lateral { .. } => {
+                            tasks.push(Derive(&join.right.operator));
+                            tasks.push(Derive(&join.left.operator));
+                        }
+                    }
+                }
+                LogicalOperator::SetOperation(setop) => {
+                    tasks.push(Derive(&setop.left().operator));
+                }
+                LogicalOperator::Distinct(distinct) => {
+                    tasks.push(Derive(&distinct.child.operator));
+                }
+                LogicalOperator::Window(window) => {
+                    tasks.push(ExtendWindow(window));
+                    tasks.push(Derive(&window.child.operator));
+                }
+                LogicalOperator::Explain(_) => outputs.push(vec!["QUERY PLAN".to_string()]),
+                LogicalOperator::EmptyResult(empty) => {
+                    tasks.push(Derive(&empty.child.operator));
+                }
+                LogicalOperator::MaterializedCTE(cte) => {
+                    tasks.push(Derive(&cte.child.operator));
+                }
+                LogicalOperator::RecursiveCTE(cte) => outputs.push(cte.column_names.clone()),
+                LogicalOperator::CTERef(cte) => outputs.push(cte.column_names.clone()),
+                LogicalOperator::TableFunctionGet(function) => outputs.push(function.get_names()),
+                LogicalOperator::SearchScan(search) => outputs.push(search.output_names.clone()),
+                LogicalOperator::FullTextFilterScan(scan) => outputs.push(project_output_names(
+                    scan.get.names.clone(),
+                    &scan.projection_map,
+                )),
+                LogicalOperator::CopyTo(copy) => outputs.push(copy.names.clone()),
+                LogicalOperator::GraphMatch(graph) => outputs.push(
+                    graph
+                        .columns
+                        .iter()
+                        .map(|column| column.alias.clone())
+                        .collect(),
+                ),
+                LogicalOperator::GraphScan(_) => {
+                    outputs.push(vec!["local_vertex_id".to_string(), "rowid".to_string()])
+                }
+                LogicalOperator::GraphExpand(expand) => {
+                    tasks.push(FinishGraphExpand(expand));
+                    tasks.push(Derive(&expand.child.operator));
+                }
+            },
+            Project(projection) => {
+                let names = pop_output_names(&mut outputs);
+                outputs.push(project_output_names(names, projection));
+            }
+            ExtendRowFetch(fetch) => {
+                let mut names = pop_output_names(&mut outputs);
+                for source in &fetch.sources {
+                    names.extend(source.needed_columns.iter().filter_map(|&ordinal| {
+                        source
+                            .table
+                            .columns
+                            .get(ordinal)
+                            .map(|column| column.name.clone())
+                    }));
+                }
+                outputs.push(names);
+            }
+            FinishJoin(join) => {
+                let names = finish_join_names(join, &mut outputs);
+                outputs.push(names);
+            }
+            FinishDependentJoin(join) => {
+                let mut left = match &join.kind {
+                    DependentJoinKind::Mark { .. } => pop_output_names(&mut outputs),
+                    DependentJoinKind::Scalar { .. } | DependentJoinKind::Lateral { .. } => {
+                        let right = pop_output_names(&mut outputs);
+                        let mut left = pop_output_names(&mut outputs);
+                        left.extend(right);
+                        left
+                    }
+                };
+                if matches!(&join.kind, DependentJoinKind::Mark { .. }) {
+                    left.push("mark".to_string());
+                }
+                outputs.push(left);
+            }
+            ExtendWindow(window) => {
+                let mut names = pop_output_names(&mut outputs);
+                names.extend(
+                    window
+                        .expressions
+                        .iter()
+                        .enumerate()
+                        .map(|(index, expression)| window_output_name(expression, index)),
+                );
+                outputs.push(names);
+            }
+            FinishGraphExpand(expand) => {
+                let mut names = pop_output_names(&mut outputs);
+                names.extend([
+                    "edge_rowid".to_string(),
+                    "target_local_id".to_string(),
+                    "target_rowid".to_string(),
+                ]);
+                if expand.has_path_functions {
+                    names.extend([
+                        "path_length".to_string(),
+                        "path_vertices".to_string(),
+                        "path_edges".to_string(),
+                    ]);
+                }
+                outputs.push(names);
+            }
+        }
+    }
+
+    assert_eq!(
+        outputs.len(),
+        1,
+        "logical output name derivation must produce exactly one result"
+    );
+    outputs.pop().expect("root output names were checked")
+}
+
+fn schedule_join_names<'a>(join: &'a Join, tasks: &mut Vec<OutputNamesTask<'a>>) {
+    tasks.push(OutputNamesTask::FinishJoin(join));
+    match join.join_type() {
+        JoinType::Semi | JoinType::Anti | JoinType::Mark => {
+            tasks.push(OutputNamesTask::Derive(&join.left().operator));
+        }
+        JoinType::RightSemi | JoinType::RightAnti => {
+            tasks.push(OutputNamesTask::Derive(&join.right().operator));
+        }
+        JoinType::Invalid
+        | JoinType::Left
+        | JoinType::Right
+        | JoinType::Inner
+        | JoinType::Outer
+        | JoinType::Single => {
+            tasks.push(OutputNamesTask::Derive(&join.right().operator));
+            tasks.push(OutputNamesTask::Derive(&join.left().operator));
+        }
+    }
+}
+
+fn finish_join_names(join: &Join, outputs: &mut Vec<Vec<String>>) -> Vec<String> {
+    let (left_projection, right_projection) = match join {
+        Join::Comparison(join) => (
+            Some(&join.left_projection_map),
+            Some(&join.right_projection_map),
+        ),
+        Join::Any(join) => (
+            Some(&join.left_projection_map),
+            Some(&join.right_projection_map),
+        ),
+        Join::Cross(_) => (None, None),
+    };
+
+    match join.join_type() {
+        JoinType::Semi | JoinType::Anti => project_output_names(
+            pop_output_names(outputs),
+            left_projection.expect("projected join"),
+        ),
+        JoinType::Mark => {
+            let mut left = project_output_names(
+                pop_output_names(outputs),
+                left_projection.expect("projected join"),
+            );
+            left.push("mark".to_string());
+            left
+        }
+        JoinType::RightSemi | JoinType::RightAnti => project_output_names(
+            pop_output_names(outputs),
+            right_projection.expect("projected join"),
+        ),
+        JoinType::Invalid
+        | JoinType::Left
+        | JoinType::Right
+        | JoinType::Inner
+        | JoinType::Outer
+        | JoinType::Single => {
+            let right = match right_projection {
+                Some(projection) => project_output_names(pop_output_names(outputs), projection),
+                None => pop_output_names(outputs),
+            };
+            let mut left = match left_projection {
+                Some(projection) => project_output_names(pop_output_names(outputs), projection),
+                None => pop_output_names(outputs),
+            };
+            left.extend(right);
+            left
+        }
+    }
+}
+
+fn project_output_names(names: Vec<String>, projection: &ProjectionMap) -> Vec<String> {
+    let Some(indices) = projection.as_columns() else {
+        return names;
+    };
+    indices
+        .iter()
+        .filter_map(|&index| names.get(index).cloned())
+        .collect()
+}
+
+fn pop_output_names(outputs: &mut Vec<Vec<String>>) -> Vec<String> {
+    outputs
+        .pop()
+        .expect("logical output name derivation lost a child result")
+}
+
+#[derive(Clone, Copy)]
+enum OutputLayoutChildren {
+    None,
+    First,
+    Second,
+    Both,
+}
+
+enum OutputLayoutTask<'a> {
+    Derive(&'a LogicalOperator),
+    Finish(&'a LogicalOperator, OutputLayoutChildren),
+}
+
+impl LogicalOperator {
+    /// Derive this operator's execution layout from already-completed child
+    /// layouts in the same order as [`Self::children`].
+    ///
+    /// Post-order optimizer passes should use this local reducer instead of
+    /// starting a fresh subtree traversal at every node.
+    pub fn output_layout_from_children(
+        &self,
+        child_layouts: &[LogicalOutputLayout],
+    ) -> LogicalOutputLayout {
+        debug_assert_eq!(child_layouts.len(), self.children().len());
+        let (first, second) = match output_layout_children(self) {
+            OutputLayoutChildren::None => (None, None),
+            OutputLayoutChildren::First => (child_layouts.first().cloned(), None),
+            OutputLayoutChildren::Second => (None, child_layouts.get(1).cloned()),
+            OutputLayoutChildren::Both => (
+                child_layouts.first().cloned(),
+                child_layouts.get(1).cloned(),
+            ),
+        };
+        derive_local_output_layout(self, first, second)
+    }
+}
+
+fn derive_output_layout(root: &LogicalOperator) -> LogicalOutputLayout {
+    use OutputLayoutChildren::*;
+
+    let mut tasks = vec![OutputLayoutTask::Derive(root)];
+    let mut layouts = Vec::new();
+    while let Some(task) = tasks.pop() {
+        match task {
+            OutputLayoutTask::Derive(operator) => {
+                let dependencies = output_layout_children(operator);
+                if matches!(dependencies, None) {
+                    layouts.push(derive_local_output_layout(
+                        operator,
+                        Option::None,
+                        Option::None,
+                    ));
+                    continue;
+                }
+
+                let children = operator.children();
+                tasks.push(OutputLayoutTask::Finish(operator, dependencies));
+                match dependencies {
+                    None => unreachable!("dependency-free layouts finish immediately"),
+                    First => {
+                        tasks.push(OutputLayoutTask::Derive(&children[0].operator));
+                    }
+                    Second => {
+                        tasks.push(OutputLayoutTask::Derive(&children[1].operator));
+                    }
+                    Both => {
+                        tasks.push(OutputLayoutTask::Derive(&children[1].operator));
+                        tasks.push(OutputLayoutTask::Derive(&children[0].operator));
+                    }
+                }
+            }
+            OutputLayoutTask::Finish(operator, dependencies) => {
+                let (first, second) = match dependencies {
+                    None => unreachable!("dependency-free layouts finish immediately"),
+                    First => (Some(pop_output_layout(&mut layouts)), Option::None),
+                    Second => (Option::None, Some(pop_output_layout(&mut layouts))),
+                    Both => {
+                        let second = pop_output_layout(&mut layouts);
+                        let first = pop_output_layout(&mut layouts);
+                        (Some(first), Some(second))
+                    }
+                };
+                layouts.push(derive_local_output_layout(operator, first, second));
+            }
+        }
+    }
+
+    assert_eq!(
+        layouts.len(),
+        1,
+        "logical output derivation must produce exactly one root layout"
+    );
+    layouts.pop().expect("root output layout was checked")
+}
+
+fn output_layout_children(operator: &LogicalOperator) -> OutputLayoutChildren {
+    use OutputLayoutChildren::*;
+
+    match operator {
+        LogicalOperator::Filter(_)
+        | LogicalOperator::RowFetch(_)
+        | LogicalOperator::ExternalProject(_)
+        | LogicalOperator::Limit(_)
+        | LogicalOperator::Order(_)
+        | LogicalOperator::TopN(_)
+        | LogicalOperator::Distinct(_)
+        | LogicalOperator::Window(_)
+        | LogicalOperator::EmptyResult(_)
+        | LogicalOperator::GraphExpand(_) => First,
+        LogicalOperator::MaterializedCTE(_) => Second,
+        LogicalOperator::Join(join) => match join.join_type() {
+            JoinType::Semi | JoinType::Anti | JoinType::Mark => First,
+            JoinType::RightSemi | JoinType::RightAnti => Second,
+            JoinType::Invalid
+            | JoinType::Left
+            | JoinType::Right
+            | JoinType::Inner
+            | JoinType::Outer
+            | JoinType::Single => Both,
+        },
+        LogicalOperator::DependentJoin(join) => match &join.kind {
+            DependentJoinKind::Mark { .. } => First,
+            DependentJoinKind::Scalar { .. } | DependentJoinKind::Lateral { .. } => Both,
+        },
+        LogicalOperator::Get(_)
+        | LogicalOperator::Projection(_)
+        | LogicalOperator::ExternalTable(_)
+        | LogicalOperator::CreateTable(_)
+        | LogicalOperator::CreateRoutine(_)
+        | LogicalOperator::Alter(_)
+        | LogicalOperator::CreateSequence(_)
+        | LogicalOperator::CreateSchema(_)
+        | LogicalOperator::CreateIndex(_)
+        | LogicalOperator::CreateView(_)
+        | LogicalOperator::Drop(_)
+        | LogicalOperator::CreatePropertyGraph(_)
+        | LogicalOperator::DropPropertyGraph(_)
+        | LogicalOperator::RefreshPropertyGraph(_)
+        | LogicalOperator::Aggregate(_)
+        | LogicalOperator::Insert(_)
+        | LogicalOperator::Delete(_)
+        | LogicalOperator::Update(_)
+        | LogicalOperator::ExpressionGet(_)
+        | LogicalOperator::DelimGet(_)
+        | LogicalOperator::SetOperation(_)
+        | LogicalOperator::Explain(_)
+        | LogicalOperator::RecursiveCTE(_)
+        | LogicalOperator::CTERef(_)
+        | LogicalOperator::TableFunctionGet(_)
+        | LogicalOperator::SearchScan(_)
+        | LogicalOperator::FullTextFilterScan(_)
+        | LogicalOperator::CopyTo(_)
+        | LogicalOperator::GraphMatch(_)
+        | LogicalOperator::GraphScan(_)
+        | LogicalOperator::DummyScan => None,
+    }
+}
+
+fn derive_local_output_layout(
+    operator: &LogicalOperator,
+    first: Option<LogicalOutputLayout>,
+    second: Option<LogicalOutputLayout>,
+) -> LogicalOutputLayout {
+    match operator {
+        LogicalOperator::Get(get) => {
+            LogicalOutputLayout::for_table(get.table_index, get.returned_types.clone())
+        }
+        LogicalOperator::Filter(filter) => {
+            required_output_layout(first, "filter child").project(&filter.projection_map)
+        }
+        LogicalOperator::Projection(projection) => LogicalOutputLayout::new(
+            projection.returned_types.clone(),
+            LogicalOperator::generate_column_bindings(
+                projection.table_index,
+                projection.expressions.len(),
+            ),
+        ),
+        LogicalOperator::RowFetch(fetch) => {
+            let mut layout = required_output_layout(first, "row fetch child");
+            for source in &fetch.sources {
+                for &ordinal in &source.needed_columns {
+                    let Some(column) = source.table.columns.get(ordinal) else {
+                        continue;
+                    };
+                    layout.push(
+                        column.logical_type.clone(),
+                        ColumnBinding::new(source.materialized_table_index, ordinal),
+                    );
+                }
+            }
+            layout
+        }
+        LogicalOperator::ExternalProject(project) => {
+            let mut layout = required_output_layout(first, "external project child");
+            let child_width = layout.len();
+            for (index, expression) in project.expressions.iter().enumerate() {
+                layout.push(
+                    expression.expression.return_type(),
+                    ColumnBinding::new(project.project_index, child_width + index),
+                );
+            }
+            layout
+        }
+        LogicalOperator::ExternalTable(table) => {
+            LogicalOutputLayout::for_table(table.table_index, table.returned_types.clone())
+        }
+        LogicalOperator::Limit(_) | LogicalOperator::TopN(_) | LogicalOperator::Distinct(_) => {
+            required_output_layout(first, "pass-through child")
+        }
+        LogicalOperator::Order(order) => {
+            required_output_layout(first, "order child").project(&order.projection_map)
+        }
+        LogicalOperator::CreateTable(_)
+        | LogicalOperator::CreateRoutine(_)
+        | LogicalOperator::Alter(_)
+        | LogicalOperator::CreateSequence(_)
+        | LogicalOperator::CreateSchema(_)
+        | LogicalOperator::CreateIndex(_)
+        | LogicalOperator::CreateView(_)
+        | LogicalOperator::Drop(_)
+        | LogicalOperator::CreatePropertyGraph(_)
+        | LogicalOperator::DropPropertyGraph(_)
+        | LogicalOperator::RefreshPropertyGraph(_)
+        | LogicalOperator::DummyScan => LogicalOutputLayout::default(),
+        LogicalOperator::Aggregate(aggregate) => LogicalOutputLayout::new(
+            aggregate.returned_types.clone(),
+            aggregate.get_column_bindings(),
+        ),
+        LogicalOperator::Insert(_) | LogicalOperator::Delete(_) | LogicalOperator::Update(_) => {
+            LogicalOutputLayout::new(vec![LogicalType::BigInt], vec![ColumnBinding::new(0, 0)])
+        }
+        LogicalOperator::ExpressionGet(values) => {
+            LogicalOutputLayout::for_table(values.table_index, values.types.clone())
+        }
+        LogicalOperator::Join(join) => finish_join_layout(join, first, second),
+        LogicalOperator::DelimGet(delim) => {
+            LogicalOutputLayout::for_table(delim.table_index, delim.chunk_types.clone())
+        }
+        LogicalOperator::DependentJoin(join) => {
+            let mut left = required_output_layout(first, "dependent join left child");
+            match &join.kind {
+                DependentJoinKind::Mark { mark_index, .. } => {
+                    left.push(LogicalType::Boolean, ColumnBinding::new(*mark_index, 0));
+                }
+                DependentJoinKind::Scalar { .. } | DependentJoinKind::Lateral { .. } => {
+                    left.append(required_output_layout(second, "dependent join right child"));
+                }
+            }
+            left
+        }
+        LogicalOperator::SetOperation(setop) => {
+            debug_assert_eq!(setop.column_count, setop.types.len());
+            LogicalOutputLayout::for_table(setop.table_index, setop.types.clone())
+        }
+        LogicalOperator::Window(window) => {
+            let mut layout = required_output_layout(first, "window child");
+            for (index, expression) in window.expressions.iter().enumerate() {
+                layout.push(
+                    expression.return_type(),
+                    ColumnBinding::new(window.window_index, index),
+                );
+            }
+            layout
+        }
+        LogicalOperator::Explain(_) => {
+            LogicalOutputLayout::for_table(0, vec![LogicalType::Varchar])
+        }
+        LogicalOperator::EmptyResult(_) => required_output_layout(first, "empty-result child"),
+        LogicalOperator::MaterializedCTE(_) => {
+            required_output_layout(second, "materialized CTE consumer")
+        }
+        LogicalOperator::RecursiveCTE(cte) => {
+            LogicalOutputLayout::for_table(cte.cte_index, cte.column_types.clone())
+        }
+        LogicalOperator::CTERef(cte) => {
+            LogicalOutputLayout::for_table(cte.table_index, cte.column_types.clone())
+        }
+        LogicalOperator::TableFunctionGet(function) => {
+            let ordinals = function
+                .projection_ids
+                .clone()
+                .unwrap_or_else(|| (0..function.column_types.len()).collect::<Vec<_>>());
+            let mut types = Vec::with_capacity(ordinals.len());
+            let mut bindings = Vec::with_capacity(ordinals.len());
+            for ordinal in ordinals {
+                let Some(logical_type) = function.column_types.get(ordinal) else {
+                    continue;
+                };
+                types.push(logical_type.clone());
+                bindings.push(ColumnBinding::new(function.table_index, ordinal));
+            }
+            LogicalOutputLayout::new(types, bindings)
+        }
+        LogicalOperator::SearchScan(search) => LogicalOutputLayout::for_table(
+            search.projection_table_index,
+            search
+                .projections
+                .iter()
+                .map(|expression| expression.return_type())
+                .collect(),
+        ),
+        LogicalOperator::FullTextFilterScan(scan) => {
+            LogicalOutputLayout::for_table(scan.get.table_index, scan.get.returned_types.clone())
+                .project(&scan.projection_map)
+        }
+        LogicalOperator::CopyTo(copy) => LogicalOutputLayout::for_table(0, copy.types.clone()),
+        LogicalOperator::GraphMatch(graph) => {
+            LogicalOutputLayout::for_table(graph.table_index, graph.output_types.clone())
+        }
+        LogicalOperator::GraphScan(graph) => {
+            LogicalOutputLayout::for_table(graph.output_table_index, graph.output_types.clone())
+        }
+        LogicalOperator::GraphExpand(expand) => {
+            let mut types = required_output_layout(first, "graph expand child").into_types();
+            types.extend([
+                LogicalType::UBigInt,
+                LogicalType::UBigInt,
+                LogicalType::UBigInt,
+            ]);
+            if expand.has_path_functions {
+                types.extend([
+                    LogicalType::BigInt,
+                    super::graph_expand::graph_path_element_list_type(),
+                    super::graph_expand::graph_path_element_list_type(),
+                ]);
+            }
+            LogicalOutputLayout::for_table(expand.output_table_index, types)
+        }
+    }
+}
+
+fn finish_join_layout(
+    join: &Join,
+    left: Option<LogicalOutputLayout>,
+    right: Option<LogicalOutputLayout>,
+) -> LogicalOutputLayout {
+    let (left_projection, right_projection, mark_index) = match join {
+        Join::Comparison(join) => (
+            Some(&join.left_projection_map),
+            Some(&join.right_projection_map),
+            join.mark_index,
+        ),
+        Join::Any(join) => (
+            Some(&join.left_projection_map),
+            Some(&join.right_projection_map),
+            join.mark_index,
+        ),
+        Join::Cross(_) => (None, None, None),
+    };
+
+    match join.join_type() {
+        JoinType::Semi | JoinType::Anti => required_output_layout(left, "join left child")
+            .project(left_projection.expect("projected join")),
+        JoinType::Mark => {
+            let mut left = required_output_layout(left, "mark join left child")
+                .project(left_projection.expect("projected join"));
+            left.push(
+                LogicalType::Boolean,
+                ColumnBinding::new(mark_index.unwrap_or(0), 0),
+            );
+            left
+        }
+        JoinType::RightSemi | JoinType::RightAnti => {
+            required_output_layout(right, "join right child")
+                .project(right_projection.expect("projected join"))
+        }
+        JoinType::Invalid
+        | JoinType::Left
+        | JoinType::Right
+        | JoinType::Inner
+        | JoinType::Outer
+        | JoinType::Single => {
+            let right = match right_projection {
+                Some(projection) => {
+                    required_output_layout(right, "join right child").project(projection)
+                }
+                None => required_output_layout(right, "cross join right child"),
+            };
+            let mut left = match left_projection {
+                Some(projection) => {
+                    required_output_layout(left, "join left child").project(projection)
+                }
+                None => required_output_layout(left, "cross join left child"),
+            };
+            left.append(right);
+            left
+        }
+    }
+}
+
+fn required_output_layout(layout: Option<LogicalOutputLayout>, role: &str) -> LogicalOutputLayout {
+    layout.unwrap_or_else(|| panic!("logical output derivation lost {role}"))
+}
+
+fn pop_output_layout(layouts: &mut Vec<LogicalOutputLayout>) -> LogicalOutputLayout {
+    layouts
+        .pop()
+        .expect("logical output derivation lost a completed child")
 }
 
 fn expression_output_name(

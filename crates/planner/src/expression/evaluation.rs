@@ -160,13 +160,18 @@ impl Expression {
                 can_error: true,
                 ..EvaluationProperties::default()
             },
-            // Casts and the remaining composite expression kinds do not yet
-            // carry a bound totality contract. Keep them conservative rather
-            // than inferring safety from their children.
+            // Boolean composition and CASE add no failure mode of their own.
+            // A comparison is total only once binding has made all coercion
+            // explicit and both operands have the executor's one-type input
+            // contract. Casts and arithmetic operators do add failure modes
+            // and stay conservative until their bound implementations publish
+            // a more precise contract.
+            Expression::Conjunction(_) | Expression::Case(_) => EvaluationProperties::default(),
+            Expression::Comparison(comparison) => EvaluationProperties {
+                can_error: !comparison.has_bound_input_contract(),
+                ..EvaluationProperties::default()
+            },
             Expression::Cast(_)
-            | Expression::Conjunction(_)
-            | Expression::Case(_)
-            | Expression::Comparison(_)
             | Expression::Operator(_)
             | Expression::Aggregate(_)
             | Expression::Window(_) => EvaluationProperties {
@@ -316,5 +321,39 @@ mod tests {
         );
         let mixed = infallible_call(vec![fallible_leaf]);
         assert!(!mixed.evaluation_properties().is_infallible());
+    }
+
+    #[test]
+    fn primitive_comparison_is_total_when_its_children_are_total() {
+        let comparison = Expression::Comparison(super::super::ComparisonExpression::new(
+            super::super::ComparisonType::Equal,
+            Expression::Constant(super::super::ConstantExpression::new(
+                Value::Integer(1),
+                LogicalType::Integer,
+            )),
+            Expression::Constant(super::super::ConstantExpression::new(
+                Value::Integer(2),
+                LogicalType::Integer,
+            )),
+        ));
+
+        assert!(comparison.evaluation_properties().is_infallible());
+    }
+
+    #[test]
+    fn comparison_without_bound_input_contract_is_not_total() {
+        let comparison = Expression::Comparison(super::super::ComparisonExpression {
+            left: Box::new(Expression::Constant(super::super::ConstantExpression::new(
+                Value::Integer(1),
+                LogicalType::Integer,
+            ))),
+            right: Box::new(Expression::Constant(super::super::ConstantExpression::new(
+                Value::BigInt(1),
+                LogicalType::BigInt,
+            ))),
+            comparison_type: super::super::ComparisonType::Equal,
+        });
+
+        assert!(!comparison.evaluation_properties().is_infallible());
     }
 }

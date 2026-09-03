@@ -13,11 +13,7 @@ pub(crate) fn flatten_dependent_joins_in_plan(
     binder: &mut Binder,
     plan: LogicalPlan,
 ) -> Result<LogicalPlan> {
-    let LogicalPlan {
-        id,
-        stats,
-        operator,
-    } = plan;
+    let (id, stats, operator) = plan.into_parts();
     let operator = match operator {
         LogicalOperator::DependentJoin(dep) => flatten_dependent_join(binder, dep)?,
         LogicalOperator::Filter(mut filter) => {

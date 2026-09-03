@@ -890,11 +890,7 @@ impl DependentJoinFlattener {
         plan: LogicalPlan,
         lateral_depth: usize,
     ) -> Result<PushDownResult> {
-        let LogicalPlan {
-            id,
-            stats,
-            operator,
-        } = plan;
+        let (id, stats, operator) = plan.into_parts();
         let correlated_map = build_correlated_column_map(&self.correlated_columns);
 
         match operator {
@@ -1185,7 +1181,8 @@ impl DependentJoinFlattener {
                         .unwrap_or(0);
 
                 let lim_child = *limit.child;
-                let (child, base_binding, visible_columns, orders) = match lim_child.operator {
+                let (lim_child_id, lim_child_stats, lim_child_operator) = lim_child.into_parts();
+                let (child, base_binding, visible_columns, orders) = match lim_child_operator {
                     LogicalOperator::Order(order) => {
                         let PushDownResult {
                             plan: child,
@@ -1204,14 +1201,18 @@ impl DependentJoinFlattener {
                         );
                         (child, base_binding, visible_columns, orders)
                     }
-                    _ => {
+                    operator => {
                         let PushDownResult {
                             plan: child,
                             base_binding,
                             visible_columns,
                         } = self.push_down_dependent_join_internal(
                             binder,
-                            lim_child,
+                            LogicalPlan {
+                                id: lim_child_id,
+                                stats: lim_child_stats,
+                                operator,
+                            },
                             lateral_depth,
                         )?;
                         (child, base_binding, visible_columns, vec![])

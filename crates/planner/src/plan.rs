@@ -3,13 +3,14 @@
 
 //! Logical plan wrapper and plan-node metadata.
 
+use std::mem::ManuallyDrop;
 use std::ops::ControlFlow;
 
 use paro_common::error::{self as paro_error, Result};
 use paro_common::types::LogicalType;
 
 use crate::binder::context::BindContext;
-use crate::operator::{ColumnBinding, LogicalOperator};
+use crate::operator::{ColumnBinding, LogicalOperator, LogicalOutputLayout};
 
 /// Stable node identifier within a planning session.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -77,6 +78,44 @@ pub struct PlannedStatement {
     pub plan: LogicalPlan,
 }
 
+/// Stateful consumer for the canonical iterative post-order plan traversal.
+///
+/// `child_completed` is invoked at the same boundary a recursive walker would
+/// return from one child and before it descends into the next sibling. Passes
+/// that publish producer state for later siblings can therefore share the
+/// traversal engine without duplicating its detach/rebuild machinery.
+pub trait LogicalPlanPostOrderFolder<State> {
+    fn child_completed(
+        &mut self,
+        _parent_skeleton: &LogicalPlan,
+        _completed_children: &[LogicalPlan],
+        _completed_states: &[State],
+        _remaining_children: &[LogicalPlan],
+    ) -> Result<()> {
+        Ok(())
+    }
+
+    fn fold(&mut self, plan: LogicalPlan, child_states: Vec<State>)
+        -> Result<(LogicalPlan, State)>;
+}
+
+struct ClosurePostOrderFolder<F> {
+    transform: F,
+}
+
+impl<State, F> LogicalPlanPostOrderFolder<State> for ClosurePostOrderFolder<F>
+where
+    F: FnMut(LogicalPlan, Vec<State>) -> Result<(LogicalPlan, State)>,
+{
+    fn fold(
+        &mut self,
+        plan: LogicalPlan,
+        child_states: Vec<State>,
+    ) -> Result<(LogicalPlan, State)> {
+        (self.transform)(plan, child_states)
+    }
+}
+
 impl PlannedStatement {
     pub fn types(&self) -> Vec<LogicalType> {
         self.types.clone()
@@ -115,12 +154,19 @@ impl LogicalPlan {
 
     /// Logical types of output columns.
     pub fn types(&self) -> Vec<LogicalType> {
-        self.operator.types()
+        self.output_layout().into_types()
     }
 
     /// Column bindings produced by this plan node.
     pub fn get_column_bindings(&self) -> Vec<ColumnBinding> {
-        self.operator.get_column_bindings()
+        self.output_layout().into_bindings()
+    }
+
+    /// Execution-facing types and bindings produced by this node, derived in
+    /// one stack-safe traversal and guaranteed to remain positionally aligned.
+    /// SQL-visible display names have a separate contract.
+    pub fn output_layout(&self) -> LogicalOutputLayout {
+        self.operator.output_layout()
     }
 
     /// Child plan nodes (one level).
@@ -141,11 +187,7 @@ impl LogicalPlan {
         self,
         f: impl FnOnce(LogicalOperator) -> Result<LogicalOperator>,
     ) -> Result<Self> {
-        let LogicalPlan {
-            id,
-            stats,
-            operator,
-        } = self;
+        let (id, stats, operator) = self.into_parts();
         Ok(Self {
             id,
             stats,
@@ -162,11 +204,7 @@ impl LogicalPlan {
         self,
         mut f: impl FnMut(LogicalPlan) -> Result<LogicalPlan>,
     ) -> Result<Self> {
-        let LogicalPlan {
-            id,
-            stats,
-            operator,
-        } = self;
+        let (id, stats, operator) = self.into_parts();
         Ok(Self {
             id,
             stats,
@@ -183,7 +221,15 @@ impl LogicalPlan {
     /// detach/rebuild contract instead of duplicating recursive walkers.
     pub fn try_fold_post_order<State>(
         self,
-        mut transform: impl FnMut(LogicalPlan, Vec<State>) -> Result<(LogicalPlan, State)>,
+        transform: impl FnMut(LogicalPlan, Vec<State>) -> Result<(LogicalPlan, State)>,
+    ) -> Result<(LogicalPlan, State)> {
+        self.try_fold_post_order_with(&mut ClosurePostOrderFolder { transform })
+    }
+
+    /// Canonical iterative post-order fold with a sibling-completion hook.
+    pub fn try_fold_post_order_with<State>(
+        self,
+        folder: &mut impl LogicalPlanPostOrderFolder<State>,
     ) -> Result<(LogicalPlan, State)> {
         struct Frame<State> {
             skeleton: LogicalPlan,
@@ -234,12 +280,18 @@ impl LogicalPlan {
                 .pop()
                 .ok_or_else(|| paro_error::internal("post-order traversal stack is empty"))?;
             let (plan, child_states) = frame.rebuild()?;
-            let (plan, state) = transform(plan, child_states)?;
+            let (plan, state) = folder.fold(plan, child_states)?;
             let Some(parent) = frames.last_mut() else {
                 return Ok((plan, state));
             };
             parent.children.push(plan);
             parent.child_states.push(state);
+            folder.child_completed(
+                &parent.skeleton,
+                &parent.children,
+                &parent.child_states,
+                parent.remaining.as_slice(),
+            )?;
         }
     }
 
@@ -276,12 +328,67 @@ impl LogicalPlan {
     pub fn is_graph_chain(&self) -> bool {
         self.operator.is_graph_chain()
     }
+
+    /// Dismantle an owned node without running its custom tree destructor.
+    ///
+    /// This is the only supported way to move fields out of `LogicalPlan`:
+    /// the type owns a stack-safe [`Drop`] implementation, so ordinary field
+    /// moves are intentionally rejected by Rust.
+    pub fn into_parts(self) -> (PlanNodeId, NodeStats, LogicalOperator) {
+        let plan = ManuallyDrop::new(self);
+        // SAFETY: `plan` will not be dropped, and every non-Copy field is read
+        // exactly once into the returned ownership tuple.
+        unsafe {
+            (
+                plan.id,
+                std::ptr::read(&plan.stats),
+                std::ptr::read(&plan.operator),
+            )
+        }
+    }
+
+    pub fn into_operator(self) -> LogicalOperator {
+        let (_, _, operator) = self.into_parts();
+        operator
+    }
+
+    /// Temporarily detach an operator while retaining the node metadata. The
+    /// caller must install a replacement before publishing the plan again.
+    pub fn take_operator(&mut self) -> LogicalOperator {
+        std::mem::replace(&mut self.operator, LogicalOperator::DummyScan)
+    }
+}
+
+impl Drop for LogicalPlan {
+    fn drop(&mut self) {
+        fn detach_children(operator: LogicalOperator) -> Vec<LogicalPlan> {
+            let mut detached = Vec::new();
+            let skeleton = operator
+                .try_map_owned_children(&mut |child| {
+                    detached.push(child);
+                    Ok(LogicalPlan::synthetic(LogicalOperator::DummyScan))
+                })
+                .expect("infallible plan-child detachment cannot fail");
+            // The skeleton owns only shallow dummy children. Dropping it here
+            // cannot recurse into the original plan tree.
+            drop(skeleton);
+            detached
+        }
+
+        let root = std::mem::replace(&mut self.operator, LogicalOperator::DummyScan);
+        let mut pending = detach_children(root);
+        while let Some(mut plan) = pending.pop() {
+            let operator = std::mem::replace(&mut plan.operator, LogicalOperator::DummyScan);
+            pending.extend(detach_children(operator));
+            // `plan` now owns no original descendants; its Drop is shallow.
+        }
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::operator::EmptyResult;
+    use crate::operator::{EmptyResult, ExpressionGet, Join};
 
     #[test]
     fn logical_plan_ids_share_bind_context_counter() {
@@ -314,26 +421,67 @@ mod tests {
             plan = LogicalPlan::synthetic(LogicalOperator::EmptyResult(EmptyResult::new(plan)));
         }
 
-        let (mut plan, node_count) = plan
+        let (plan, node_count) = plan
             .try_fold_post_order(|plan, children: Vec<usize>| {
                 Ok((plan, 1 + children.into_iter().sum::<usize>()))
             })
             .expect("bounded post-order traversal");
         assert_eq!(node_count, DEPTH + 1);
 
-        // Dismantle iteratively as well so the test itself never relies on a
-        // recursive Box drop for its deep synthetic tree.
-        let mut wrappers = 0;
-        loop {
-            match plan.operator {
-                LogicalOperator::EmptyResult(empty) => {
-                    wrappers += 1;
-                    plan = *empty.child;
+        drop(plan);
+    }
+
+    #[test]
+    fn output_metadata_handles_deep_binary_join_chains_with_a_bounded_stack() {
+        const DEPTH: usize = 10_000;
+        const TEST_STACK_BYTES: usize = 512 * 1024;
+
+        std::thread::Builder::new()
+            .name("deep-output-layout".to_string())
+            .stack_size(TEST_STACK_BYTES)
+            .spawn(|| {
+                fn leaf(table_index: usize) -> LogicalPlan {
+                    LogicalPlan::synthetic(LogicalOperator::ExpressionGet(ExpressionGet::new(
+                        table_index,
+                        vec![],
+                        vec![format!("c{table_index}")],
+                        vec![LogicalType::Integer],
+                    )))
                 }
-                LogicalOperator::DummyScan => break,
-                _ => panic!("unexpected operator in deep synthetic plan"),
-            }
-        }
-        assert_eq!(wrappers, DEPTH);
+
+                let mut plan = leaf(0);
+                for table_index in 1..=DEPTH {
+                    plan = LogicalPlan::synthetic(LogicalOperator::Join(Join::cross(
+                        plan,
+                        leaf(table_index),
+                    )));
+                }
+
+                let names = plan.output_names();
+                assert_eq!(names.len(), DEPTH + 1);
+                assert!(names
+                    .iter()
+                    .enumerate()
+                    .all(|(index, name)| name == &format!("c{index}")));
+                drop(names);
+
+                let layout = plan.output_layout();
+                assert_eq!(layout.len(), DEPTH + 1);
+                assert!(layout
+                    .types()
+                    .iter()
+                    .all(|logical_type| logical_type == &LogicalType::Integer));
+                assert!(layout
+                    .bindings()
+                    .iter()
+                    .enumerate()
+                    .all(|(index, binding)| { *binding == ColumnBinding::new(index, 0) }));
+                drop(layout);
+
+                drop(plan);
+            })
+            .expect("spawn bounded-stack schema test")
+            .join()
+            .expect("bounded-stack schema test completed");
     }
 }

@@ -165,6 +165,7 @@ impl TableFunctionGet {
 mod tests {
     use super::*;
     use crate::expression::ConstantExpression;
+    use crate::operator::{ColumnBinding, LogicalOperator};
     use paro_common::runtime_value::Value;
     use paro_common::types::LogicalType;
     use paro_function::table::TableFunction;
@@ -278,5 +279,12 @@ mod tests {
         assert_eq!(names.len(), 2);
         assert_eq!(names[0], "a");
         assert_eq!(names[1], "c");
+
+        let layout = LogicalOperator::TableFunctionGet(op).output_layout();
+        assert_eq!(layout.types(), &[LogicalType::Integer, LogicalType::BigInt]);
+        assert_eq!(
+            layout.bindings(),
+            &[ColumnBinding::new(0, 0), ColumnBinding::new(0, 2)]
+        );
     }
 }

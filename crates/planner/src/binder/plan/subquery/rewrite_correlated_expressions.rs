@@ -191,11 +191,7 @@ impl RewriteCorrelatedExpressions {
     }
 
     pub fn rewrite_logical_plan(&self, plan: LogicalPlan) -> LogicalPlan {
-        let LogicalPlan {
-            id,
-            stats,
-            operator,
-        } = plan;
+        let (id, stats, operator) = plan.into_parts();
         LogicalPlan {
             id,
             stats,
