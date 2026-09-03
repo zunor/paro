@@ -24,7 +24,9 @@ use paro_function::scalar::cast::{
 };
 use paro_function::scalar::string::get_substring_functions;
 use paro_function::scalar::ScalarFunctionSet;
-use paro_planner::expression::{ColumnRefExpression, Expression};
+use paro_planner::expression::{
+    ColumnRefExpression, Expression, ExpressionIterator, ExpressionVisitDecision, OperatorType,
+};
 use paro_planner::operator::LogicalOperator;
 use paro_planner::operator::{ColumnBinding, Projection};
 use paro_planner::planner::Planner;
@@ -109,6 +111,7 @@ fn full_partition_join_preserves_count_empty_input_contract() {
     let inspection = inspect_plan(&optimized);
 
     assert_eq!(inspection.delim_joins, 0, "{optimized:#?}");
+    assert_eq!(inspection.left_joins, 1, "{optimized:#?}");
     assert_eq!(inspection.gets_named("partsupp"), 1, "{optimized:#?}");
     assert_eq!(inspection.gets_named("lineitem"), 1, "{optimized:#?}");
 }
@@ -127,6 +130,7 @@ fn full_partition_join_preserves_non_null_rejecting_scalar_predicate() {
     let inspection = inspect_plan(&optimized);
 
     assert_eq!(inspection.delim_joins, 0, "{optimized:#?}");
+    assert_eq!(inspection.left_joins, 1, "{optimized:#?}");
 }
 
 #[test]
@@ -142,8 +146,43 @@ fn full_partition_join_does_not_require_outer_key_uniqueness() {
     let inspection = inspect_plan(&optimized);
 
     assert_eq!(inspection.delim_joins, 0, "{optimized:#?}");
+    assert_eq!(inspection.left_joins, 0, "{optimized:#?}");
     assert_eq!(inspection.gets_named("lineitem"), 1, "{optimized:#?}");
     assert_eq!(inspection.gets_named("partsupp"), 1, "{optimized:#?}");
+}
+
+#[test]
+fn strict_arithmetic_around_null_on_empty_scalar_enables_inner_join() {
+    let optimized = optimize_sql(
+        "SELECT l.l_orderkey \
+         FROM lineitem AS l \
+         WHERE l.l_quantity > 1.2 * ( \
+             SELECT avg(ps.ps_availqty) \
+             FROM partsupp AS ps \
+             WHERE ps.ps_partkey = l.l_partkey)",
+    );
+    let inspection = inspect_plan(&optimized);
+
+    assert_eq!(inspection.delim_joins, 0, "{optimized:#?}");
+    assert_eq!(inspection.left_joins, 0, "{optimized:#?}");
+}
+
+#[test]
+fn strict_scalar_filter_localizes_below_unrelated_inner_join() {
+    let optimized = optimize_sql(
+        "SELECT l.l_orderkey \
+         FROM lineitem AS l \
+         JOIN orders AS o ON o.o_orderkey = l.l_orderkey \
+         WHERE l.l_quantity > 1.2 * ( \
+             SELECT avg(ps.ps_availqty) \
+             FROM partsupp AS ps \
+             WHERE ps.ps_partkey = l.l_partkey)",
+    );
+    let inspection = inspect_plan(&optimized);
+
+    assert_eq!(inspection.delim_joins, 0, "{optimized:#?}");
+    assert_eq!(inspection.left_joins, 0, "{optimized:#?}");
+    assert_eq!(inspection.joins_with_filter_child, 1, "{optimized:#?}");
 }
 
 #[test]
@@ -565,9 +604,12 @@ struct PlanInspection {
     aggregate_groups: Vec<usize>,
     group_dependencies: usize,
     delim_joins: usize,
+    left_joins: usize,
+    joins_with_filter_child: usize,
     late_fetches: usize,
     late_fetch_sources: usize,
     zero_width_projections: usize,
+    is_not_null_predicates: usize,
     gets: std::collections::HashMap<String, usize>,
 }
 
@@ -585,6 +627,18 @@ fn inspect_plan(plan: &paro_planner::plan::LogicalPlan) -> PlanInspection {
                 result.late_fetch_sources += fetch.sources.len();
             }
             LogicalOperator::Window(_) => result.windows += 1,
+            LogicalOperator::Filter(filter) => {
+                for expression in &filter.expressions {
+                    ExpressionIterator::visit(expression, &mut |candidate| {
+                        if matches!(candidate, Expression::Operator(operator)
+                            if operator.operator_type == OperatorType::IsNotNull)
+                        {
+                            result.is_not_null_predicates += 1;
+                        }
+                        ExpressionVisitDecision::Descend
+                    });
+                }
+            }
             LogicalOperator::Projection(projection) if projection.expressions.is_empty() => {
                 result.zero_width_projections += 1;
             }
@@ -593,10 +647,18 @@ fn inspect_plan(plan: &paro_planner::plan::LogicalPlan) -> PlanInspection {
                 result.aggregate_groups.push(aggregate.groups.len());
                 result.group_dependencies += aggregate.group_dependencies.len();
             }
-            LogicalOperator::Join(paro_planner::operator::Join::Comparison(join))
-                if !join.duplicate_eliminated_columns.is_empty() =>
-            {
-                result.delim_joins += 1;
+            LogicalOperator::Join(paro_planner::operator::Join::Comparison(join)) => {
+                if !join.duplicate_eliminated_columns.is_empty() {
+                    result.delim_joins += 1;
+                }
+                if join.join_type == paro_planner::operator::JoinType::Left {
+                    result.left_joins += 1;
+                }
+                if matches!(join.left.operator, LogicalOperator::Filter(_))
+                    || matches!(join.right.operator, LogicalOperator::Filter(_))
+                {
+                    result.joins_with_filter_child += 1;
+                }
             }
             LogicalOperator::Get(get) => {
                 if let Some(table) = &get.table {
@@ -739,7 +801,7 @@ fn append_catalog_row(
 }
 
 #[test]
-fn unique_dimension_key_other_than_partition_key_does_not_rewrite() {
+fn unrelated_dimension_key_does_not_block_leaf_relation_reuse() {
     let session = setup_session();
     let sql = "SELECT l.l_partkey \
                FROM lineitem AS l, part AS p \
@@ -761,15 +823,12 @@ fn unique_dimension_key_other_than_partition_key_does_not_rewrite() {
         .expect("enumerate negative relational frontier");
     let inspection = inspect_plan(&optimized);
 
-    assert_eq!(
-        inspection.windows, 0,
-        "unsafe partial partition: {optimized:#?}"
-    );
-    assert_eq!(inspection.gets_named("lineitem"), 2, "{optimized:#?}");
+    assert_eq!(inspection.windows, 1, "{optimized:#?}");
+    assert_eq!(inspection.gets_named("lineitem"), 1, "{optimized:#?}");
 }
 
 #[test]
-fn nullable_correlation_without_keyed_dimension_does_not_rewrite() {
+fn nullable_correlation_is_guarded_when_reusing_the_same_relation() {
     let optimized = optimize_sql(
         "SELECT l.l_partkey \
          FROM lineitem AS l \
@@ -780,15 +839,34 @@ fn nullable_correlation_without_keyed_dimension_does_not_rewrite() {
     );
     let inspection = inspect_plan(&optimized);
 
-    assert_eq!(
-        inspection.windows, 0,
-        "nullable correlation: {optimized:#?}"
-    );
-    assert_eq!(inspection.gets_named("lineitem"), 2, "{optimized:#?}");
+    assert_eq!(inspection.windows, 1, "{optimized:#?}");
+    assert_eq!(inspection.delim_joins, 0, "{optimized:#?}");
+    assert_eq!(inspection.gets_named("lineitem"), 1, "{optimized:#?}");
+    assert_eq!(inspection.is_not_null_predicates, 1, "{optimized:#?}");
 }
 
 #[test]
-fn extra_dimension_residual_does_not_rewrite() {
+fn shared_relation_window_is_installed_below_unrelated_inner_joins() {
+    let optimized = optimize_sql(
+        "SELECT l.l_orderkey \
+         FROM lineitem AS l \
+         JOIN orders AS o ON o.o_orderkey = l.l_orderkey \
+         WHERE l.l_quantity > 1.2 * ( \
+             SELECT avg(i.l_quantity) \
+             FROM lineitem AS i \
+             WHERE i.l_returnflag = l.l_returnflag)",
+    );
+    let inspection = inspect_plan(&optimized);
+
+    assert_eq!(inspection.windows, 1, "{optimized:#?}");
+    assert_eq!(inspection.delim_joins, 0, "{optimized:#?}");
+    assert_eq!(inspection.gets_named("lineitem"), 1, "{optimized:#?}");
+    assert_eq!(inspection.gets_named("orders"), 1, "{optimized:#?}");
+    assert_eq!(inspection.is_not_null_predicates, 1, "{optimized:#?}");
+}
+
+#[test]
+fn dimension_residual_does_not_change_the_reused_partition_domain() {
     let optimized = optimize_sql(
         "SELECT l.l_partkey \
          FROM lineitem AS l, part AS p \
@@ -801,8 +879,8 @@ fn extra_dimension_residual_does_not_rewrite() {
     );
     let inspection = inspect_plan(&optimized);
 
-    assert_eq!(inspection.windows, 0, "dimension residual: {optimized:#?}");
-    assert_eq!(inspection.gets_named("lineitem"), 2, "{optimized:#?}");
+    assert_eq!(inspection.windows, 1, "dimension residual: {optimized:#?}");
+    assert_eq!(inspection.gets_named("lineitem"), 1, "{optimized:#?}");
 }
 
 #[test]

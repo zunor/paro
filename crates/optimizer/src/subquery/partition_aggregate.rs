@@ -16,11 +16,12 @@ use std::collections::{HashMap, HashSet};
 use paro_catalog::entry::ConstraintType;
 use paro_common::error::{self as paro_error, Result};
 use paro_function::aggregate::AggregateEmptyInput;
+use paro_function::FunctionNullHandling;
 use paro_planner::binder::context::BindContext;
 use paro_planner::expression::{
     AggregateExpression, AggregateType, ColumnRefExpression, ComparisonType, Expression,
-    ExpressionIterator, ExpressionVisitDecision, WindowExpression, WindowFrame, WindowFrameBound,
-    WindowFrameType,
+    ExpressionIterator, ExpressionVisitDecision, OperatorExpression, OperatorType,
+    WindowExpression, WindowFrame, WindowFrameBound, WindowFrameType,
 };
 use paro_planner::operator::{
     Aggregate, AntiJoinMode, ColumnBinding, ComparisonJoin, Get, Join, JoinComparisonType,
@@ -392,14 +393,22 @@ fn filter_rejects_null_scalar(
     scalar: ColumnBinding,
     presence: Option<ColumnBinding>,
 ) -> bool {
-    fn is_scalar_value(
+    fn is_null_when_scalar_is_null(
         expression: &Expression,
         scalar: ColumnBinding,
         presence: Option<ColumnBinding>,
     ) -> bool {
         match expression {
             Expression::ColumnRef(column) => column.depth == 0 && column.binding == scalar,
-            Expression::Cast(cast) => is_scalar_value(&cast.child, scalar, presence),
+            Expression::Cast(cast) => is_null_when_scalar_is_null(&cast.child, scalar, presence),
+            Expression::Function(function)
+                if function.function.null_handling == FunctionNullHandling::DefaultNullHandling =>
+            {
+                function
+                    .children
+                    .iter()
+                    .any(|child| is_null_when_scalar_is_null(child, scalar, presence))
+            }
             Expression::Case(case) => {
                 let Some(presence) = presence else {
                     return false;
@@ -413,7 +422,7 @@ fn filter_rejects_null_scalar(
                 check_is_missing
                     && matches!(case.result_if_true.as_ref(), Expression::Constant(constant)
                         if matches!(&constant.value, paro_common::runtime_value::Value::Null(_)))
-                    && is_scalar_value(&case.result_if_false, scalar, Some(presence))
+                    && is_null_when_scalar_is_null(&case.result_if_false, scalar, Some(presence))
             }
             _ => false,
         }
@@ -433,8 +442,8 @@ fn filter_rejects_null_scalar(
     ) {
         return false;
     }
-    is_scalar_value(&comparison.left, scalar, presence)
-        ^ is_scalar_value(&comparison.right, scalar, presence)
+    is_null_when_scalar_is_null(&comparison.left, scalar, presence)
+        ^ is_null_when_scalar_is_null(&comparison.right, scalar, presence)
 }
 
 fn direct_delim_join_source(

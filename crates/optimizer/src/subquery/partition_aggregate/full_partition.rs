@@ -14,6 +14,8 @@ pub(super) struct FullPartitionJoinRewrite {
     inner_keys: Vec<Expression>,
     delim_table_index: usize,
     correlation_key_count: usize,
+    join_type: JoinType,
+    localize_filter: bool,
 }
 
 pub(super) fn recognize_full_partition_join(
@@ -52,11 +54,27 @@ pub(super) fn recognize_full_partition_join(
     {
         return None;
     }
+    let strict_null_rejection = filter_rejects_null_scalar(
+        &filter.expressions[0],
+        scalar.scalar_binding,
+        scalar.presence_binding,
+    ) && filter.expressions.iter().all(is_movable)
+        && matches!(
+            scalar.aggregate_expression.function.empty_input,
+            AggregateEmptyInput::Null
+        );
+    let join_type = if strict_null_rejection {
+        JoinType::Inner
+    } else {
+        JoinType::Left
+    };
     (correlation.inner_keys.len() == scalar.aggregate.groups.len()).then_some(
         FullPartitionJoinRewrite {
             inner_keys: correlation.inner_keys,
             delim_table_index: delim.table_index,
             correlation_key_count: join.duplicate_eliminated_columns.len(),
+            join_type,
+            localize_filter: strict_null_rejection && filter.projection_map.is_all(),
         },
     )
 }
@@ -237,7 +255,11 @@ pub(super) fn apply_full_partition_join(
             "full-partition witness no longer points to a Filter",
         ));
     };
-    let LogicalOperator::Join(Join::Comparison(mut outer_join)) = (*filter.child).into_operator()
+    let owned_child = std::mem::replace(
+        &mut *filter.child,
+        LogicalPlan::synthetic(LogicalOperator::DummyScan),
+    );
+    let LogicalOperator::Join(Join::Comparison(mut outer_join)) = owned_child.into_operator()
     else {
         return Err(paro_error::internal(
             "full-partition witness no longer points to a comparison join",
@@ -273,10 +295,12 @@ pub(super) fn apply_full_partition_join(
     ));
 
     // GROUP BY proves at most one right row per complete key. LEFT therefore
-    // has the same scalar cardinality as SINGLE. The scalar projection keeps
-    // its hidden presence carrier, so an unmatched key remains distinguishable
-    // from a matched aggregate whose SQL value is NULL.
-    outer_join.join_type = JoinType::Left;
+    // has the same scalar cardinality as SINGLE. When a strict predicate also
+    // rejects the aggregate's NULL-on-empty result, INNER is equivalent and
+    // exposes the relation to ordinary join ordering. The scalar projection
+    // keeps its hidden presence carrier for the LEFT case, so an unmatched key
+    // remains distinguishable from a matched aggregate whose SQL value is NULL.
+    outer_join.join_type = rewrite.join_type;
     outer_join.duplicate_eliminated_columns.clear();
     outer_join.delim_flipped = false;
     for condition in &mut outer_join.conditions {
@@ -286,6 +310,9 @@ pub(super) fn apply_full_partition_join(
         bind_context,
         LogicalOperator::Projection(scalar_projection),
     ));
+    if rewrite.localize_filter {
+        return localize_inner_full_partition_filter(filter, outer_join, bind_context);
+    }
     filter.child = Box::new(LogicalPlan::new(
         bind_context,
         LogicalOperator::Join(Join::Comparison(outer_join)),
@@ -294,4 +321,129 @@ pub(super) fn apply_full_partition_join(
         bind_context,
         LogicalOperator::Filter(filter),
     ))
+}
+
+/// Attach a strict scalar predicate at the smallest clean-inner-join subtree
+/// that owns every referenced outer binding. This preserves the already
+/// optimized fact/dimension join shape while exposing the complete partition
+/// aggregate as a local relation, instead of forcing all outer rows through a
+/// late scalar join.
+fn localize_inner_full_partition_filter(
+    mut filter: paro_planner::operator::Filter,
+    mut scalar_join: ComparisonJoin,
+    bind_context: &BindContext,
+) -> Result<LogicalPlan> {
+    debug_assert_eq!(scalar_join.join_type, JoinType::Inner);
+    let outer_bindings = scalar_join
+        .left
+        .get_column_bindings()
+        .into_iter()
+        .collect::<HashSet<_>>();
+    let mut required = HashSet::new();
+    for expression in filter.expressions.iter().chain(
+        scalar_join
+            .conditions
+            .iter()
+            .flat_map(|condition| [&condition.left, &condition.right]),
+    ) {
+        ExpressionIterator::visit(expression, &mut |candidate| {
+            if let Expression::ColumnRef(column) = candidate {
+                if column.depth == 0 && outer_bindings.contains(&column.binding) {
+                    required.insert(column.binding);
+                }
+            }
+            ExpressionVisitDecision::Descend
+        });
+    }
+    if required.is_empty() {
+        filter.child = Box::new(LogicalPlan::new(
+            bind_context,
+            LogicalOperator::Join(Join::Comparison(scalar_join)),
+        ));
+        return Ok(LogicalPlan::new(
+            bind_context,
+            LogicalOperator::Filter(filter),
+        ));
+    }
+
+    let target_id = smallest_clean_inner_owner(&scalar_join.left, &required);
+    if target_id == paro_planner::plan::PlanNodeId::SYNTHETIC {
+        filter.child = Box::new(LogicalPlan::new(
+            bind_context,
+            LogicalOperator::Join(Join::Comparison(scalar_join)),
+        ));
+        return Ok(LogicalPlan::new(
+            bind_context,
+            LogicalOperator::Filter(filter),
+        ));
+    }
+
+    let outer = std::mem::replace(
+        &mut *scalar_join.left,
+        LogicalPlan::synthetic(LogicalOperator::DummyScan),
+    );
+    let mut scalar_join = Some(scalar_join);
+    let mut filter = Some(filter);
+    let mut replaced = false;
+    let localized = outer.try_map_post_order(|target| {
+        if replaced || target.id != target_id {
+            return Ok(target);
+        }
+        replaced = true;
+        let mut join = scalar_join.take().ok_or_else(|| {
+            paro_error::internal("localized scalar join was consumed more than once")
+        })?;
+        join.left = Box::new(target);
+        let mut local_filter = filter.take().ok_or_else(|| {
+            paro_error::internal("localized scalar filter was consumed more than once")
+        })?;
+        local_filter.child = Box::new(LogicalPlan::new(
+            bind_context,
+            LogicalOperator::Join(Join::Comparison(join)),
+        ));
+        local_filter.projection_map = paro_planner::operator::ProjectionMap::all();
+        Ok(LogicalPlan::new(
+            bind_context,
+            LogicalOperator::Filter(local_filter),
+        ))
+    })?;
+    if !replaced {
+        return Err(paro_error::internal(
+            "localized scalar-filter owner disappeared after recognition",
+        ));
+    }
+    Ok(localized)
+}
+
+fn smallest_clean_inner_owner(
+    plan: &LogicalPlan,
+    required: &HashSet<ColumnBinding>,
+) -> paro_planner::plan::PlanNodeId {
+    let mut target = plan;
+    loop {
+        let LogicalOperator::Join(Join::Comparison(join)) = &target.operator else {
+            return target.id;
+        };
+        if !clean_inner_join(join) {
+            return target.id;
+        }
+        let left = join
+            .left
+            .get_column_bindings()
+            .into_iter()
+            .collect::<HashSet<_>>();
+        let right = join
+            .right
+            .get_column_bindings()
+            .into_iter()
+            .collect::<HashSet<_>>();
+        match (
+            required.iter().all(|binding| left.contains(binding)),
+            required.iter().all(|binding| right.contains(binding)),
+        ) {
+            (true, false) => target = &join.left,
+            (false, true) => target = &join.right,
+            _ => return target.id,
+        }
+    }
 }

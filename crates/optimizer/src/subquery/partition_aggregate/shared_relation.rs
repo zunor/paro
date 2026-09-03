@@ -12,8 +12,36 @@ pub(super) struct SharedRelationRewrite {
     scalar_expression: Expression,
     aggregate: AggregateExpression,
     partitions: Vec<Expression>,
-    cte_index: usize,
-    outer_table_index: usize,
+    source: SharedSource,
+}
+
+#[derive(Debug, Clone, Copy)]
+enum SharedSource {
+    Cte {
+        cte_index: usize,
+        table_index: usize,
+    },
+    Table {
+        table_index: usize,
+    },
+}
+
+impl SharedSource {
+    fn matches(self, plan: &LogicalPlan) -> bool {
+        match (self, &plan.operator) {
+            (
+                Self::Cte {
+                    cte_index,
+                    table_index,
+                },
+                LogicalOperator::CTERef(reference),
+            ) => reference.cte_index == cte_index && reference.table_index == table_index,
+            (Self::Table { table_index }, LogicalOperator::Get(get)) => {
+                get.table_index == table_index
+            }
+            _ => false,
+        }
+    }
 }
 
 /// Reuse one materialized relation snapshot for both the detail row and its
@@ -39,31 +67,96 @@ pub(super) fn recognize_shared_relation_filter(
         DirectSourceSide::LeftDelim => inner_join.right.as_ref(),
         DirectSourceSide::RightDelim => inner_join.left.as_ref(),
     };
-    let LogicalOperator::CTERef(inner_ref) = &inner_source.operator else {
-        return None;
-    };
-
-    let mut outer_refs = Vec::new();
-    collect_cte_refs(&shape.join.left, inner_ref.cte_index, &mut outer_refs);
-    let [outer_ref] = outer_refs.as_slice() else {
-        return None;
-    };
-    if inner_ref.column_types != outer_ref.column_types
-        || !shared_path_is_extensible(&shape.join.left, inner_ref.cte_index, outer_ref.table_index)
-    {
+    // Replacing equality correlation with a SQL partition groups NULL keys
+    // together, while the original scalar subquery observes an empty input for
+    // every NULL outer key. A strict predicate over a NULL-on-empty aggregate
+    // lets us restore that distinction with explicit key guards.
+    if !filter_rejects_null_scalar(
+        &shape.filter.expressions[0],
+        shape.scalar.scalar_binding,
+        shape.scalar.presence_binding,
+    ) || !matches!(
+        shape.scalar.aggregate_expression.function.empty_input,
+        AggregateEmptyInput::Null
+    ) {
         return None;
     }
 
-    let mut bindings = BindingMap::default();
-    for (ordinal, ty) in inner_ref.column_types.iter().enumerate() {
-        if outer_ref.column_types.get(ordinal) != Some(ty)
-            || !bindings.bind(
-                ColumnBinding::new(inner_ref.table_index, ordinal),
-                ColumnBinding::new(outer_ref.table_index, ordinal),
+    let (bindings, source) = match &inner_source.operator {
+        LogicalOperator::CTERef(inner_ref) => {
+            let mut outer_refs = Vec::new();
+            collect_cte_refs(&shape.join.left, inner_ref.cte_index, &mut outer_refs);
+            let [outer_ref] = outer_refs.as_slice() else {
+                return None;
+            };
+            if inner_ref.column_types != outer_ref.column_types {
+                return None;
+            }
+            let mut bindings = BindingMap::default();
+            for (ordinal, ty) in inner_ref.column_types.iter().enumerate() {
+                if outer_ref.column_types.get(ordinal) != Some(ty)
+                    || !bindings.bind(
+                        ColumnBinding::new(inner_ref.table_index, ordinal),
+                        ColumnBinding::new(outer_ref.table_index, ordinal),
+                    )
+                {
+                    return None;
+                }
+            }
+            (
+                bindings,
+                SharedSource::Cte {
+                    cte_index: inner_ref.cte_index,
+                    table_index: outer_ref.table_index,
+                },
             )
-        {
-            return None;
         }
+        LogicalOperator::Get(_) => {
+            let LogicalOperator::Get(inner_get) = &inner_source.operator else {
+                unreachable!("Get shape was matched")
+            };
+            if inner_get.scan_order.is_some() || !inner_get.runtime_filter_expressions.is_empty() {
+                return None;
+            }
+            let mut outer_gets = Vec::new();
+            collect_gets(&shape.join.left, &mut outer_gets);
+            let mut candidates = outer_gets
+                .into_iter()
+                .filter_map(|outer_get| {
+                    if outer_get.scan_order.is_some()
+                        || !outer_get.runtime_filter_expressions.is_empty()
+                    {
+                        return None;
+                    }
+                    let mut bindings = BindingMap::default();
+                    bind_scan_columns(inner_get, outer_get, &mut bindings)?;
+                    if !shape
+                        .correlation
+                        .inner_keys
+                        .iter()
+                        .zip(&shape.join.duplicate_eliminated_columns)
+                        .all(|(inner, outer)| semantic_expression_equal(inner, outer, &bindings))
+                    {
+                        return None;
+                    }
+                    let source = SharedSource::Table {
+                        table_index: outer_get.table_index,
+                    };
+                    shared_path_is_extensible(&shape.join.left, source)
+                        .then_some((bindings, source))
+                })
+                .collect::<Vec<_>>()
+                .into_iter();
+            let candidate = candidates.next()?;
+            if candidates.next().is_some() {
+                return None;
+            }
+            candidate
+        }
+        _ => return None,
+    };
+    if !shared_path_is_extensible(&shape.join.left, source) {
+        return None;
     }
     let partitions = shape
         .correlation
@@ -79,8 +172,7 @@ pub(super) fn recognize_shared_relation_filter(
         scalar_expression: shape.scalar.scalar_expression.clone(),
         aggregate,
         partitions,
-        cte_index: inner_ref.cte_index,
-        outer_table_index: outer_ref.table_index,
+        source,
     })
 }
 
@@ -99,22 +191,29 @@ fn collect_cte_refs<'a>(
     }
 }
 
+fn collect_gets<'a>(plan: &'a LogicalPlan, gets: &mut Vec<&'a Get>) {
+    if let LogicalOperator::Get(get) = &plan.operator {
+        gets.push(get);
+    }
+    for child in plan.children() {
+        collect_gets(child, gets);
+    }
+}
+
 /// Only layout-relative operators may carry a newly inserted window binding
 /// from the shared leaf to the scalar filter. Positional projections and
 /// reductions deliberately terminate this optimization domain.
-fn shared_path_is_extensible(plan: &LogicalPlan, cte_index: usize, table_index: usize) -> bool {
-    if matches!(&plan.operator, LogicalOperator::CTERef(reference)
-        if reference.cte_index == cte_index && reference.table_index == table_index)
-    {
+fn shared_path_is_extensible(plan: &LogicalPlan, source: SharedSource) -> bool {
+    if source.matches(plan) {
         return true;
     }
     match &plan.operator {
         LogicalOperator::Filter(filter) if filter.projection_map.is_all() => {
-            shared_path_is_extensible(&filter.child, cte_index, table_index)
+            shared_path_is_extensible(&filter.child, source)
         }
-        LogicalOperator::Join(Join::Comparison(join)) => {
-            let left = shared_path_is_extensible(&join.left, cte_index, table_index);
-            let right = shared_path_is_extensible(&join.right, cte_index, table_index);
+        LogicalOperator::Join(Join::Comparison(join)) if clean_inner_join(join) => {
+            let left = shared_path_is_extensible(&join.left, source);
+            let right = shared_path_is_extensible(&join.right, source);
             match (left, right) {
                 (true, false) => join.left_projection_map.is_all(),
                 (false, true) => join.right_projection_map.is_all(),
@@ -122,8 +221,8 @@ fn shared_path_is_extensible(plan: &LogicalPlan, cte_index: usize, table_index: 
             }
         }
         LogicalOperator::Join(Join::Cross(cross)) => {
-            shared_path_is_extensible(&cross.left, cte_index, table_index)
-                ^ shared_path_is_extensible(&cross.right, cte_index, table_index)
+            shared_path_is_extensible(&cross.left, source)
+                ^ shared_path_is_extensible(&cross.right, source)
         }
         _ => false,
     }
@@ -158,6 +257,18 @@ pub(super) fn apply_shared_relation_rewrite(
         end_bound: WindowFrameBound::Unbounded,
         end_is_preceding: false,
     };
+    let null_guards = rewrite
+        .partitions
+        .iter()
+        .cloned()
+        .map(|partition| {
+            Expression::Operator(OperatorExpression::new_unary(
+                OperatorType::IsNotNull,
+                partition,
+                paro_common::types::LogicalType::Boolean,
+            ))
+        })
+        .collect::<Vec<_>>();
     let mut window_expression = Some(WindowExpression::aggregate(
         rewrite.aggregate,
         rewrite.partitions,
@@ -170,8 +281,7 @@ pub(super) fn apply_shared_relation_rewrite(
         .verify_bound_contract()?;
     let (detail, inserted) = insert_partition_window(
         detail,
-        rewrite.cte_index,
-        rewrite.outer_table_index,
+        rewrite.source,
         window_index,
         &mut window_expression,
         bind_context,
@@ -210,6 +320,7 @@ pub(super) fn apply_shared_relation_rewrite(
             })
         })
         .collect();
+    filter.expressions.extend(null_guards);
     filter.child = Box::new(detail);
     filter.projection_map = paro_planner::operator::ProjectionMap::all();
     Ok(LogicalPlan::new(
@@ -220,15 +331,12 @@ pub(super) fn apply_shared_relation_rewrite(
 
 fn insert_partition_window(
     plan: LogicalPlan,
-    cte_index: usize,
-    table_index: usize,
+    source: SharedSource,
     window_index: usize,
     window_expression: &mut Option<WindowExpression>,
     bind_context: &BindContext,
 ) -> Result<(LogicalPlan, bool)> {
-    if matches!(&plan.operator, LogicalOperator::CTERef(reference)
-        if reference.cte_index == cte_index && reference.table_index == table_index)
-    {
+    if source.matches(&plan) {
         return Ok((
             LogicalPlan::new(
                 bind_context,
@@ -248,14 +356,8 @@ fn insert_partition_window(
         if inserted {
             return Ok(child);
         }
-        let (child, child_inserted) = insert_partition_window(
-            child,
-            cte_index,
-            table_index,
-            window_index,
-            window_expression,
-            bind_context,
-        )?;
+        let (child, child_inserted) =
+            insert_partition_window(child, source, window_index, window_expression, bind_context)?;
         inserted = child_inserted;
         Ok(child)
     })?;

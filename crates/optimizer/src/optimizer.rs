@@ -824,8 +824,16 @@ impl Optimizer {
     fn correlated_aggregate_candidate(&self, plan: LogicalPlan) -> Result<CandidatePlan> {
         let input_shape = tracing::enabled!(target: targets::OPTIMIZER, tracing::Level::DEBUG)
             .then(|| logical_plan_shape(&plan));
-        let candidate =
-            CorrelatedPartitionAggregate::new(self.ctx.bind_context.clone()).optimize_plan(plan)?;
+        let ordered = JoinOrderOptimizer::new()
+            .with_search_budget(&self.budget)
+            .optimize_plan(
+                self.ctx.session.as_ref(),
+                plan,
+                &self.ctx.column_stats,
+                &self.ctx.bind_context,
+            )?;
+        let candidate = CorrelatedPartitionAggregate::new(self.ctx.bind_context.clone())
+            .optimize_plan(ordered)?;
         let candidate = CTEInlining::new(&self.ctx.bind_context)
             .single_reference_defaults()
             .optimize_plan(candidate);
