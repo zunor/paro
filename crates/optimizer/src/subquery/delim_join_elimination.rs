@@ -472,7 +472,7 @@ impl DelimJoinElimination {
         };
 
         *node = if filter_expressions.is_empty() {
-            replacement_plan.operator
+            replacement_plan.into_operator()
         } else {
             LogicalOperator::Filter(Filter::new(replacement_plan, filter_expressions))
         };
@@ -533,11 +533,7 @@ fn conjunction_terms(expression: &Expression) -> Vec<&Expression> {
 }
 
 fn take_existence_base(plan: LogicalPlan) -> Result<LogicalPlan, Box<LogicalPlan>> {
-    let LogicalPlan {
-        id,
-        stats,
-        operator,
-    } = plan;
+    let (id, stats, operator) = plan.into_parts();
     match operator {
         LogicalOperator::Projection(mut projection) => {
             match take_existence_base(*projection.child) {
@@ -572,11 +568,7 @@ fn take_existence_base(plan: LogicalPlan) -> Result<LogicalPlan, Box<LogicalPlan
 }
 
 fn take_existence_join_base(plan: LogicalPlan) -> Result<LogicalPlan, Box<LogicalPlan>> {
-    let LogicalPlan {
-        id,
-        stats,
-        operator,
-    } = plan;
+    let (id, stats, operator) = plan.into_parts();
     let LogicalOperator::Join(join) = operator else {
         return Err(Box::new(LogicalPlan {
             id,
@@ -947,12 +939,12 @@ mod tests {
         let result = DelimJoinElimination::new().optimize_plan(LogicalPlan::synthetic(
             LogicalOperator::Join(Join::Comparison(correlated_existence_join(true))),
         ));
-        let LogicalOperator::Join(Join::Comparison(join)) = result.operator else {
+        let LogicalOperator::Join(Join::Comparison(join)) = &result.operator else {
             panic!("expected direct existence join");
         };
         assert!(join.duplicate_eliminated_columns.is_empty());
         assert_eq!(join.conditions.len(), 1);
-        let LogicalOperator::Filter(filter) = join.right.operator else {
+        let LogicalOperator::Filter(filter) = &join.right.operator else {
             panic!("base-local predicate must remain on the direct build side");
         };
         assert_eq!(filter.expressions.len(), 1);
@@ -967,7 +959,7 @@ mod tests {
         let result = DelimJoinElimination::new().optimize_plan(LogicalPlan::synthetic(
             LogicalOperator::Join(Join::Comparison(correlated_existence_join(false))),
         ));
-        let LogicalOperator::Join(Join::Comparison(join)) = result.operator else {
+        let LogicalOperator::Join(Join::Comparison(join)) = &result.operator else {
             panic!("expected delimiter join to remain");
         };
         assert!(!join.duplicate_eliminated_columns.is_empty());
@@ -991,7 +983,7 @@ mod tests {
         let result = DelimJoinElimination::new().optimize_plan(LogicalPlan::synthetic(
             LogicalOperator::Join(Join::Comparison(join)),
         ));
-        let LogicalOperator::Join(Join::Comparison(join)) = result.operator else {
+        let LogicalOperator::Join(Join::Comparison(join)) = &result.operator else {
             panic!("expected delimiter join to remain");
         };
         assert!(!join.duplicate_eliminated_columns.is_empty());
@@ -1053,7 +1045,7 @@ mod tests {
             LogicalOperator::Join(Join::Comparison(root_join)),
         ));
 
-        match result.operator {
+        match &result.operator {
             LogicalOperator::Join(Join::Comparison(join)) => {
                 assert!(join.duplicate_eliminated_columns.is_empty());
                 assert!(matches!(

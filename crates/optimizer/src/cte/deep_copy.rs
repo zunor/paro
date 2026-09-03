@@ -119,13 +119,13 @@ mod tests {
 
         verify_logical_plan(&bind_context, &copied).expect("copied plan should remain valid");
 
-        match copied.operator {
+        match &copied.operator {
             LogicalOperator::MaterializedCTE(cte) => {
                 assert_ne!(cte.cte_index, 9);
-                match cte.cte_query.operator {
+                match &cte.cte_query.operator {
                     LogicalOperator::MaterializedCTE(nested) => {
                         assert_ne!(nested.cte_index, 4);
-                        match nested.child.operator {
+                        match &nested.child.operator {
                             LogicalOperator::CTERef(cte_ref) => {
                                 assert_eq!(cte_ref.cte_index, nested.cte_index);
                             }
@@ -135,9 +135,9 @@ mod tests {
                     other => panic!("expected nested materialized cte, got {other:?}"),
                 }
 
-                match cte.child.operator {
+                match &cte.child.operator {
                     LogicalOperator::Join(Join::Comparison(join)) => {
-                        match (join.left.operator, join.right.operator) {
+                        match (&join.left.operator, &join.right.operator) {
                             (LogicalOperator::CTERef(left), LogicalOperator::CTERef(right)) => {
                                 assert_eq!(left.cte_index, cte.cte_index);
                                 assert_eq!(right.cte_index, cte.cte_index);
@@ -180,8 +180,8 @@ mod tests {
 
         verify_logical_plan(&bind_context, &copied).expect("copied plan should remain valid");
 
-        match copied.operator {
-            LogicalOperator::SetOperation(setop) => match setop.left.operator {
+        match &copied.operator {
+            LogicalOperator::SetOperation(setop) => match &setop.left.operator {
                 LogicalOperator::CTERef(cte_ref) => {
                     assert_eq!(cte_ref.cte_index, 123);
                 }

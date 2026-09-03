@@ -102,7 +102,7 @@ impl EmptyResultPullup {
                         paro_planner::operator::SetOpType::Except => {
                             if setop.right.is_empty_result() {
                                 let left = *setop.left;
-                                left.operator
+                                left.into_operator()
                             } else {
                                 Self::empty_result(LogicalOperator::SetOperation(setop))
                             }
@@ -147,7 +147,7 @@ impl EmptyResultPullup {
                     JoinType::Anti => {
                         if right_empty {
                             let left = *comp.left;
-                            left.operator
+                            left.into_operator()
                         } else if left_empty {
                             Self::empty_result(LogicalOperator::Join(Join::Comparison(comp)))
                         } else {
@@ -179,7 +179,7 @@ impl EmptyResultPullup {
                     JoinType::Anti => {
                         if right_empty {
                             let left = *any.left;
-                            left.operator
+                            left.into_operator()
                         } else if left_empty {
                             Self::empty_result(LogicalOperator::Join(Join::Any(any)))
                         } else {
@@ -329,7 +329,7 @@ mod tests {
         let result = EmptyResultPullup::new().optimize_plan(LogicalPlan::synthetic(
             LogicalOperator::Join(Join::Comparison(join)),
         ));
-        match result.operator {
+        match &result.operator {
             LogicalOperator::Join(Join::Comparison(join)) => {
                 assert!(matches!(
                     join.right.operator,

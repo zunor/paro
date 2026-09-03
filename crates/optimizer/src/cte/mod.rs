@@ -6,3 +6,4 @@ pub mod demand_pushdown;
 pub mod filter_pusher;
 pub mod inlining;
 pub(crate) mod iteration;
+pub(crate) mod partitioned_materialization;

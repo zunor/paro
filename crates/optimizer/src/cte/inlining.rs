@@ -59,11 +59,7 @@ impl<'a> CTEInlining<'a> {
     /// winner; recursively rewriting here would collapse independent sharing
     /// decisions into only "all inline" and "all materialized" shapes.
     pub fn optimize_root_with_change(&mut self, plan: LogicalPlan) -> (LogicalPlan, bool) {
-        let LogicalPlan {
-            id,
-            stats,
-            operator,
-        } = plan;
+        let (id, stats, operator) = plan.into_parts();
         let (operator, changed) = self.try_inline(operator);
         (
             LogicalPlan {
@@ -78,11 +74,7 @@ impl<'a> CTEInlining<'a> {
     fn rewrite_plan(&mut self, plan: LogicalPlan) -> (LogicalPlan, bool) {
         plan.try_fold_post_order(|plan, child_changes| {
             let child_changed = child_changes.into_iter().any(|changed| changed);
-            let LogicalPlan {
-                id,
-                stats,
-                operator,
-            } = plan;
+            let (id, stats, operator) = plan.into_parts();
             let (operator, local_changed) = self.try_inline(operator);
             Ok((
                 LogicalPlan {
@@ -103,7 +95,7 @@ impl<'a> CTEInlining<'a> {
 
         let ref_count = count_cte_references(&cte.child.operator, cte.cte_index);
         if ref_count == 0 {
-            return (cte.child.operator, true);
+            return ((*cte.child).into_operator(), true);
         }
 
         if cte.materialized == CTEMaterialize::Materialized {
@@ -119,7 +111,7 @@ impl<'a> CTEInlining<'a> {
         if ref_count == 1 {
             let mut definition = Some(*cte.cte_query);
             inline_single_reference(&mut cte.child.operator, cte.cte_index, &mut definition);
-            return (cte.child.operator, true);
+            return ((*cte.child).into_operator(), true);
         }
 
         if cte.materialized == CTEMaterialize::NotMaterialized
@@ -133,7 +125,7 @@ impl<'a> CTEInlining<'a> {
                 cte.cte_index,
                 definition,
             );
-            return (cte.child.operator, true);
+            return ((*cte.child).into_operator(), true);
         }
 
         (LogicalOperator::MaterializedCTE(cte), false)

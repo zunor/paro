@@ -162,18 +162,18 @@ mod tests {
         }));
 
         let normalized = normalize_iteration_ownership(plan).expect("normalize recursive member");
-        let LogicalOperator::RecursiveCTE(cte) = normalized.operator else {
+        let LogicalOperator::RecursiveCTE(cte) = &normalized.operator else {
             panic!("expected recursive CTE");
         };
-        let LogicalOperator::Join(Join::Comparison(join)) = cte.recursive.operator else {
+        let LogicalOperator::Join(Join::Comparison(join)) = &cte.recursive.operator else {
             panic!("expected comparison join");
         };
         assert!(matches!(
-            join.left.operator,
+            &join.left.operator,
             LogicalOperator::CTERef(reference) if reference.cte_index == cte_index
         ));
         assert!(matches!(
-            join.right.operator,
+            &join.right.operator,
             LogicalOperator::ExpressionGet(_)
         ));
         assert_eq!(

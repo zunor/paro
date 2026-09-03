@@ -187,7 +187,7 @@ impl CTEFilterPusher {
         *cte.cte_query = LogicalPlan {
             id,
             stats,
-            operator: pushed_plan.operator,
+            operator: pushed_plan.into_operator(),
         };
         true
     }
@@ -456,11 +456,11 @@ mod tests {
         let (optimized, changed_again) =
             CTEFilterPusher::new().optimize_default_root_with_change(optimized);
         assert!(!changed_again);
-        match optimized.operator {
+        match &optimized.operator {
             LogicalOperator::MaterializedCTE(cte) => {
                 assert_eq!(cte.materialized, CTEMaterialize::Materialized);
                 assert!(!matches!(
-                    cte.cte_query.operator,
+                    &cte.cte_query.operator,
                     LogicalOperator::ExpressionGet(_)
                 ));
             }
