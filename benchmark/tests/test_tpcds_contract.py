@@ -52,6 +52,25 @@ class TpcdsResultContractTests(unittest.TestCase):
         self.assertEqual([key.descending for key in keys], [False, True, False])
         self.assertEqual([key.nulls for key in keys], ["last", "first", "last"])
 
+    def test_q06_order_contract_binds_projected_source_expression(self) -> None:
+        schema = (
+            ColumnContract("state", "string", "VARCHAR"),
+            ColumnContract("cnt", "int64", "BIGINT"),
+        )
+
+        keys = parse_order_contract(
+            """
+            SELECT a.ca_state state, count(*) cnt
+            FROM customer_address a
+            ORDER BY cnt NULLS FIRST, a.ca_state NULLS FIRST
+            LIMIT 100
+            """,
+            schema,
+        )
+
+        self.assertEqual([key.column for key in keys], [1, 0])
+        self.assertEqual([key.nulls for key in keys], ["first", "first"])
+
     def test_peer_rows_may_change_order_without_changing_order_digest(self) -> None:
         schema = (
             ColumnContract("key", "int32", "INTEGER"),

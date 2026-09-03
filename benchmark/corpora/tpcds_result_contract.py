@@ -238,6 +238,7 @@ def parse_order_contract(query: str, schema: Sequence[ColumnContract]) -> tuple[
     names: dict[str, list[int]] = {}
     for index, column in enumerate(schema):
         names.setdefault(column.name, []).append(index)
+    select_expressions = _top_level_select_expressions(query, schema)
     keys = []
     for raw in _split_top_level(clause):
         expression = raw.strip()
@@ -260,13 +261,22 @@ def parse_order_contract(query: str, schema: Sequence[ColumnContract]) -> tuple[
         elif re.fullmatch(r'(?is)(?:"[^"]+"|[a-z_][a-z0-9_]*)(?:\.(?:"[^"]+"|[a-z_][a-z0-9_]*))*', expression):
             name = expression.rsplit(".", 1)[-1].strip('"').lower()
             matches = names.get(name, [])
+            if not matches:
+                matches = select_expressions.get(_normalize_sql_expression(expression), [])
             if len(matches) > 1:
                 raise ResultContractError(
-                    f"top-level ORDER BY name is ambiguous in the result schema: {name!r}"
+                    "top-level ORDER BY expression is ambiguous in the result schema: "
+                    f"{expression!r}"
                 )
             column = matches[0] if matches else -1
         else:
-            column = -1
+            matches = select_expressions.get(_normalize_sql_expression(expression), [])
+            if len(matches) > 1:
+                raise ResultContractError(
+                    "top-level ORDER BY expression is ambiguous in the result schema: "
+                    f"{expression!r}"
+                )
+            column = matches[0] if matches else -1
         if not 0 <= column < len(schema):
             raise ResultContractError(
                 f"top-level ORDER BY expression is not a result column: {raw.strip()!r}"
@@ -275,6 +285,60 @@ def parse_order_contract(query: str, schema: Sequence[ColumnContract]) -> tuple[
     if not keys:
         raise ResultContractError("top-level ORDER BY has no keys")
     return tuple(keys)
+
+
+def _top_level_select_expressions(
+    query: str, schema: Sequence[ColumnContract]
+) -> dict[str, list[int]]:
+    """Bind ORDER BY source expressions to their projected result ordinals."""
+    tokens = _top_level_tokens(query)
+    select_index = next(
+        (index for index, (token, _, _) in enumerate(tokens) if token == "select"),
+        None,
+    )
+    if select_index is None:
+        return {}
+    from_token = next(
+        (entry for entry in tokens[select_index + 1 :] if entry[0] == "from"),
+        None,
+    )
+    if from_token is None:
+        return {}
+
+    select_start = tokens[select_index][2]
+    items = _split_top_level(query[select_start : from_token[1]])
+    if len(items) != len(schema):
+        return {}
+
+    expressions: dict[str, list[int]] = {}
+    for index, (raw_item, column) in enumerate(zip(items, schema)):
+        item = raw_item.strip()
+        item_tokens = _top_level_tokens(item)
+        expression = item
+
+        for token_index in range(len(item_tokens) - 1, -1, -1):
+            token, token_start, _ = item_tokens[token_index]
+            if token == "as" and token_index + 1 == len(item_tokens) - 1:
+                expression = item[:token_start].strip()
+                break
+        else:
+            if item_tokens:
+                alias, alias_start, _ = item_tokens[-1]
+                if (
+                    alias == column.name
+                    and alias_start > 0
+                    and item[alias_start - 1].isspace()
+                ):
+                    expression = item[:alias_start].strip()
+
+        normalized = _normalize_sql_expression(expression)
+        if normalized:
+            expressions.setdefault(normalized, []).append(index)
+    return expressions
+
+
+def _normalize_sql_expression(expression: str) -> str:
+    return re.sub(r"\s+", "", expression).lower()
 
 
 def assert_peer_order(
