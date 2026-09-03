@@ -26,12 +26,16 @@ use crate::operators::aggregate::aggregate_state::AggregateStateLayout;
 use crate::operators::aggregate::distinct_state::DistinctAggregateState;
 use crate::operators::aggregate::group_key_codec::{logical_group_types, physical_group_types};
 use crate::operators::aggregate::grouped_aggregate_data::reference_index;
+use crate::operators::aggregate::grouped_aggregate_hashtable::HashTableCapacityHint;
 use paro_storage::buffer::BufferPool;
 
-use crate::operators::aggregate::group_hash::GroupHashScratch;
+use crate::operators::aggregate::group_hash::{AggregateHashContract, GroupHashScratch};
 use crate::operators::aggregate::ordered_helpers::empty_ordered_collectors_with_memory;
 use crate::operators::aggregate::perfect_aggregate_hashtable::PerfectAggregateHashTable;
-use crate::operators::aggregate::radix_partitioned_aggregate_hashtable::AggregateHashTable;
+use crate::operators::aggregate::radix_partitioned_aggregate_hashtable::{
+    AggregateHashTable, AggregateHashTableConfig, AggregateHashTableGrowthPlan,
+    AggregateHashTableLayout,
+};
 use crate::physical::specs::AggregateSpec;
 use crate::runtime::breaker::{single_state_addresses, UngroupedAggregateRuntimeState};
 use crate::runtime::state::UngroupedAggregateSinkLocal;
@@ -476,28 +480,38 @@ pub(crate) fn create_hash_aggregate_tables(
     let group_types = group_types(spec)?;
     let strategy = choose_hash_aggregate_table_strategy(spec, &group_types, parallelism)?;
     let disjoint_filter_groups = direct_filter_dispatch_groups(spec);
+    let initial_lookup_hash_key_count = if spec.grouping_sets.is_empty() {
+        spec.initial_lookup_hash_key_count.min(group_types.len())
+    } else {
+        // Grouping domains omit different logical columns. Until the physical
+        // contract carries one policy per domain, each table owns a full-key
+        // hash contract.
+        group_types.len()
+    };
+    let hash_contract =
+        AggregateHashContract::try_new(group_types.len(), initial_lookup_hash_key_count)?;
+    let table_layout = match strategy {
+        HashAggregateTableStrategy::Flat => AggregateHashTableLayout::Flat,
+        HashAggregateTableStrategy::Radix { partition_bits } => {
+            AggregateHashTableLayout::Radix { partition_bits }
+        }
+    };
+    let table_config = AggregateHashTableConfig::new(
+        table_layout,
+        hash_contract,
+        HashTableCapacityHint::default(),
+    );
     normalized_grouping_sets(spec)?
         .iter()
         .map(|_| {
-            let mut table = match strategy {
-                HashAggregateTableStrategy::Flat => AggregateHashTable::new_flat_with_memory(
-                    group_types.clone(),
-                    objects.clone(),
-                    inputs.clone(),
-                    allocator.clone(),
-                    memory.clone(),
-                )?,
-                HashAggregateTableStrategy::Radix { partition_bits } => {
-                    AggregateHashTable::new_radix_with_memory(
-                        group_types.clone(),
-                        objects.clone(),
-                        inputs.clone(),
-                        partition_bits,
-                        allocator.clone(),
-                        memory.clone(),
-                    )?
-                }
-            };
+            let mut table = AggregateHashTable::new_configured(
+                group_types.clone(),
+                objects.clone(),
+                inputs.clone(),
+                allocator.clone(),
+                memory.clone(),
+                table_config,
+            )?;
             for group in &disjoint_filter_groups {
                 table.fuse_disjoint_filter_group(group);
             }
@@ -635,12 +649,77 @@ pub(crate) fn update_hash_aggregate_tables_with_scratch(
     addresses: &mut Vector,
     new_groups: &mut SelectionVector,
 ) -> Result<()> {
+    update_hash_aggregate_tables_impl(
+        spec,
+        aggregate_objects,
+        payload,
+        all_groups,
+        grouping_sets,
+        tables,
+        hash_scratch,
+        None,
+        addresses,
+        new_groups,
+    )
+}
+
+/// Update tables while consuming the radix routes produced by growth
+/// planning for this exact batch. The capability slice is explicit so a
+/// caller cannot silently regress to a second hash-and-route pass.
+pub(crate) fn update_hash_aggregate_tables_with_growth_plans(
+    spec: &AggregateSpec,
+    aggregate_objects: &[AggregateObject],
+    payload: &Chunk,
+    all_groups: &Chunk,
+    grouping_sets: &[Box<[usize]>],
+    tables: &mut [AggregateHashTable],
+    hash_scratch: &mut GroupHashScratch,
+    growth_plans: &mut [AggregateHashTableGrowthPlan],
+    addresses: &mut Vector,
+    new_groups: &mut SelectionVector,
+) -> Result<()> {
+    update_hash_aggregate_tables_impl(
+        spec,
+        aggregate_objects,
+        payload,
+        all_groups,
+        grouping_sets,
+        tables,
+        hash_scratch,
+        Some(growth_plans),
+        addresses,
+        new_groups,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn update_hash_aggregate_tables_impl(
+    spec: &AggregateSpec,
+    aggregate_objects: &[AggregateObject],
+    payload: &Chunk,
+    all_groups: &Chunk,
+    grouping_sets: &[Box<[usize]>],
+    tables: &mut [AggregateHashTable],
+    hash_scratch: &mut GroupHashScratch,
+    mut growth_plans: Option<&mut [AggregateHashTableGrowthPlan]>,
+    addresses: &mut Vector,
+    new_groups: &mut SelectionVector,
+) -> Result<()> {
     if grouping_sets.len() != tables.len() {
         return Err(paro_error::internal(format!(
             "hash aggregate grouping table count mismatch: grouping_sets={} tables={}",
             grouping_sets.len(),
             tables.len()
         )));
+    }
+    if let Some(plans) = growth_plans.as_ref() {
+        if plans.len() != tables.len() {
+            return Err(paro_error::internal(format!(
+                "hash aggregate growth plan count mismatch: plans={} tables={}",
+                plans.len(),
+                tables.len()
+            )));
+        }
     }
     let has_distinct = aggregate_objects.iter().any(AggregateObject::is_distinct);
     let has_ordered = aggregate_objects
@@ -649,7 +728,9 @@ pub(crate) fn update_hash_aggregate_tables_with_scratch(
     let has_filters = has_aggregate_filters(spec);
     let use_per_filter = has_filters || has_distinct || has_ordered;
     let mut filters = None;
-    for (table, grouping_set) in tables.iter_mut().zip(grouping_sets.iter()) {
+    for (table_idx, (table, grouping_set)) in
+        tables.iter_mut().zip(grouping_sets.iter()).enumerate()
+    {
         let groups =
             build_groups_chunk_for_set(all_groups, grouping_set.as_ref(), spec.grouping_key_count)?;
         ensure_group_update_scratch(
@@ -658,15 +739,27 @@ pub(crate) fn update_hash_aggregate_tables_with_scratch(
             payload.size(),
             payload.allocator().clone(),
         )?;
-        let used_adaptive_index =
-            table.try_find_or_create_adaptive_integer_groups(&groups, addresses, new_groups)?;
-        let hashes = if used_adaptive_index {
-            None
+        let lookup = if let Some(lookup) =
+            table.try_find_or_create_adaptive_integer_groups(&groups, addresses, new_groups)?
+        {
+            lookup
+        } else if let Some(plans) = growth_plans.as_deref_mut() {
+            table.find_or_create_groups_with_growth_plan(
+                &groups,
+                hash_scratch,
+                &mut plans[table_idx],
+                addresses,
+                new_groups,
+            )?
         } else {
-            let hashes = hash_scratch.hash(&groups)?;
-            table.find_or_create_groups(&groups, hashes, addresses, new_groups)?;
-            Some(hashes)
+            table.find_or_create_groups_with_scratch(
+                &groups,
+                hash_scratch,
+                addresses,
+                new_groups,
+            )?
         };
+        debug_assert_eq!(lookup.new_group_count(), new_groups.len());
         if has_filters
             && !has_distinct
             && !has_ordered
@@ -691,7 +784,7 @@ pub(crate) fn update_hash_aggregate_tables_with_scratch(
         if let Some(filters) = filters.as_ref() {
             table.update_aggregates_per_filter(payload, addresses, filters)?;
         } else {
-            table.update_aggregates(payload, hashes, addresses, None)?;
+            table.update_aggregates_after_group_lookup(lookup, payload, addresses, None)?;
         }
     }
     Ok(())

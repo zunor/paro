@@ -572,6 +572,18 @@ fn write_runtime_suffix(suffix: &mut String, runtime: &ExplainRuntimeStats) {
             "runtime_filter_no_wait_count",
             runtime.runtime_filter_no_wait_count,
         ),
+        (
+            "aggregate_hash_full_key_fallback_count",
+            runtime.aggregate_hash_full_key_fallback_count,
+        ),
+        (
+            "aggregate_hash_max_prefix_probe_distance",
+            runtime.aggregate_hash_max_prefix_probe_distance,
+        ),
+        (
+            "aggregate_hash_max_radix_partition_skew_percent",
+            runtime.aggregate_hash_max_radix_partition_skew_percent,
+        ),
         ("grant_bytes", runtime.grant_bytes),
         ("revoked_bytes", runtime.revoked_bytes),
         ("yield_latency_us", runtime.yield_latency_us),
@@ -686,6 +698,21 @@ fn insert_actual_runtime_json(actual: &mut serde_json::Value, runtime: &ExplainR
         "runtime_filter_no_wait_count",
         runtime.runtime_filter_no_wait_count,
     );
+    insert_optional_json_u64(
+        object,
+        "aggregate_hash_full_key_fallback_count",
+        runtime.aggregate_hash_full_key_fallback_count,
+    );
+    insert_optional_json_u64(
+        object,
+        "aggregate_hash_max_prefix_probe_distance",
+        runtime.aggregate_hash_max_prefix_probe_distance,
+    );
+    insert_optional_json_u64(
+        object,
+        "aggregate_hash_max_radix_partition_skew_percent",
+        runtime.aggregate_hash_max_radix_partition_skew_percent,
+    );
     insert_optional_json_u64(object, "grant_bytes", runtime.grant_bytes);
     insert_optional_json_u64(object, "revoked_bytes", runtime.revoked_bytes);
     insert_optional_json_u64(object, "yield_latency_us", runtime.yield_latency_us);
@@ -758,6 +785,9 @@ mod tests {
                     spilled_bytes: Some(8192),
                     scheduler_wait_time_us: Some(17),
                     runtime_filter_installed_count: Some(1),
+                    aggregate_hash_full_key_fallback_count: Some(2),
+                    aggregate_hash_max_prefix_probe_distance: Some(32),
+                    aggregate_hash_max_radix_partition_skew_percent: Some(125),
                     grant_bytes: Some(64),
                     allocator_tracking_event_count: Some(4),
                     ..ExplainRuntimeStats::default()
@@ -780,6 +810,18 @@ mod tests {
         assert_eq!(
             actual["runtime_filter_installed_count"],
             serde_json::Value::from(1)
+        );
+        assert_eq!(
+            actual["aggregate_hash_full_key_fallback_count"],
+            serde_json::Value::from(2)
+        );
+        assert_eq!(
+            actual["aggregate_hash_max_prefix_probe_distance"],
+            serde_json::Value::from(32)
+        );
+        assert_eq!(
+            actual["aggregate_hash_max_radix_partition_skew_percent"],
+            serde_json::Value::from(125)
         );
         assert_eq!(actual["grant_bytes"], serde_json::Value::from(64));
     }

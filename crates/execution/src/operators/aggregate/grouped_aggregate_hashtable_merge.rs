@@ -30,6 +30,10 @@ impl GroupedAggregateHashTable {
             largest_source = largest_source.max(other.count);
         }
         if incoming_rows == 0 {
+            for other in others.iter_mut() {
+                self.hash_runtime_stats
+                    .merge(other.take_hash_runtime_stats());
+            }
             return Ok(());
         }
 
@@ -54,15 +58,13 @@ impl GroupedAggregateHashTable {
             .then(|| Vector::try_new(LogicalType::BigInt, address_capacity, self.allocator()))
             .transpose()?;
         let inline_layout = self.inline_key_layout.clone();
-        let inline_key_data = inline_layout
-            .as_ref()
-            .map(|_| self.inline_key_storage_mut_ptr())
-            .transpose()?;
 
-        for other in others {
+        for other in others.iter_mut() {
             let mut row_offset = 0usize;
             while row_offset < other.count {
                 let batch_size = (other.count - row_offset).min(VECTOR_SIZE);
+                let observe_prefix_probes = self.hash_contract.lookup_is_prefix();
+                let mut max_prefix_probe_distance = 0usize;
 
                 let (source_address_data, target_address_data, new_address_data) = match (
                     &mut source_addresses,
@@ -87,12 +89,25 @@ impl GroupedAggregateHashTable {
                     }
                 };
                 let mut new_state_count = 0usize;
-
+                // This raw sidecar pointer is deliberately scoped to one data
+                // batch. A strategy transition may rebuild the lookup index
+                // after the scope, before the next batch reacquires it.
+                let inline_key_data = inline_layout
+                    .as_ref()
+                    .map(|_| self.inline_key_storage_mut_ptr())
+                    .transpose()?;
                 for batch_idx in 0..batch_size {
                     let source_row_idx = row_offset + batch_idx;
                     let source_row = other.row_ptr(source_row_idx);
                     let source_state = other.state_ptr(source_row_idx);
-                    let hash = other.layout.load_hash(source_row);
+                    // Runtime fallback is local to each table. Derive the
+                    // source row's hash under the target's active contract
+                    // instead of assuming independently built workers made
+                    // the same adaptive decision.
+                    let hash = other.serialized_hash_for_lookup_contract(
+                        source_row_idx,
+                        self.lookup_hash_contract(),
+                    )?;
                     let inline_key = inline_layout
                         .as_ref()
                         .map(|layout| unsafe {
@@ -106,6 +121,7 @@ impl GroupedAggregateHashTable {
                     }
 
                     let mut slot = self.slot_for_hash(hash);
+                    let mut probe_distance = 0usize;
                     loop {
                         let entry = self.entries[slot];
                         if !entry.is_occupied() {
@@ -184,6 +200,11 @@ impl GroupedAggregateHashTable {
                             }
                             break;
                         }
+                        probe_distance += 1;
+                        if observe_prefix_probes {
+                            max_prefix_probe_distance =
+                                max_prefix_probe_distance.max(probe_distance);
+                        }
                         slot = (slot + 1) & self.bitmask;
                     }
                 }
@@ -218,8 +239,17 @@ impl GroupedAggregateHashTable {
                         batch_size,
                     )?;
                 }
+                self.finish_prefix_probe_batch(max_prefix_probe_distance)?;
                 row_offset += batch_size;
             }
+        }
+        // A completed source owns both its tuples and the observations made
+        // while constructing them. Transfer the latter with the former so a
+        // worker-local fallback is still visible when only the final target
+        // is drained into EXPLAIN ANALYZE.
+        for other in others.iter_mut() {
+            self.hash_runtime_stats
+                .merge(other.take_hash_runtime_stats());
         }
         Ok(())
     }

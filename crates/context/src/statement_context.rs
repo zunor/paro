@@ -29,6 +29,34 @@ pub struct CompileEnvironmentKey {
     pub settings_fingerprint: u64,
 }
 
+impl CompileEnvironmentKey {
+    /// Capture every input that can change binding or physical planning.
+    ///
+    /// Live sessions and frozen statement snapshots deliberately share this
+    /// constructor. Adding a plan-affecting input therefore changes one
+    /// contract and forces every capture site to supply it at compile time;
+    /// cache-key construction must never drift silently between the two.
+    pub fn capture(
+        current_database: &str,
+        current_schema: &str,
+        search_path: &[CatalogSearchEntry],
+        visible_generation: u64,
+        catalog_epochs: impl IntoIterator<Item = (u64, u64)>,
+        settings: &EffectiveSettings,
+    ) -> Self {
+        let mut catalog_epochs = catalog_epochs.into_iter().collect::<Vec<_>>();
+        catalog_epochs.sort_unstable_by_key(|(database_id, _)| *database_id);
+        Self {
+            current_database: current_database.to_string(),
+            current_schema: current_schema.to_string(),
+            search_path: search_path.to_vec(),
+            visible_generation,
+            catalog_epochs,
+            settings_fingerprint: settings.fingerprint(),
+        }
+    }
+}
+
 #[derive(Clone)]
 pub struct StatementContext {
     pub env: StatementEnvironment,
@@ -283,18 +311,16 @@ impl StatementContext {
     }
 
     pub fn compile_environment_key(&self) -> CompileEnvironmentKey {
-        CompileEnvironmentKey {
-            current_database: self.env.current_database.clone(),
-            current_schema: self.env.current_schema.clone(),
-            search_path: self.env.search_path.clone(),
-            visible_generation: self.databases.visible_generation,
-            catalog_epochs: self
-                .databases
+        CompileEnvironmentKey::capture(
+            &self.env.current_database,
+            &self.env.current_schema,
+            &self.env.search_path,
+            self.databases.visible_generation,
+            self.databases
                 .iter()
-                .map(|database| (database.id(), database.catalog_epoch()))
-                .collect(),
-            settings_fingerprint: self.settings.fingerprint(),
-        }
+                .map(|database| (database.id(), database.catalog_epoch())),
+            self.settings.as_ref(),
+        )
     }
 
     pub fn graph_id(
@@ -311,7 +337,22 @@ impl StatementContext {
 mod tests {
     use std::sync::atomic::Ordering;
 
-    use crate::TestStatementContextBuilder;
+    use crate::{CompileEnvironmentKey, TestStatementContextBuilder};
+
+    #[test]
+    fn compile_environment_canonicalizes_catalog_identity_order() {
+        let context = TestStatementContextBuilder::minimal().build();
+        let key = CompileEnvironmentKey::capture(
+            "paro",
+            "public",
+            &[],
+            17,
+            [(9, 90), (2, 20), (5, 50)],
+            context.settings.as_ref(),
+        );
+
+        assert_eq!(key.catalog_epochs, [(2, 20), (5, 50), (9, 90)]);
+    }
 
     #[test]
     fn compile_environment_keeps_the_frozen_catalog_epoch() {

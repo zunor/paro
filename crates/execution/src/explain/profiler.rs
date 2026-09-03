@@ -588,6 +588,18 @@ fn merge_runtime_stats(source: &ExplainRuntimeStats, target: &mut ExplainRuntime
         &mut target.runtime_filter_no_wait_count,
         source.runtime_filter_no_wait_count,
     );
+    merge_sum(
+        &mut target.aggregate_hash_full_key_fallback_count,
+        source.aggregate_hash_full_key_fallback_count,
+    );
+    merge_max(
+        &mut target.aggregate_hash_max_prefix_probe_distance,
+        source.aggregate_hash_max_prefix_probe_distance,
+    );
+    merge_max(
+        &mut target.aggregate_hash_max_radix_partition_skew_percent,
+        source.aggregate_hash_max_radix_partition_skew_percent,
+    );
     merge_sum(&mut target.grant_bytes, source.grant_bytes);
     merge_sum(&mut target.revoked_bytes, source.revoked_bytes);
     merge_sum(&mut target.yield_latency_us, source.yield_latency_us);
@@ -794,5 +806,30 @@ mod tests {
         let timer = profiler.start_phase();
         profiler.end_phase(1, OperatorProfilePhase::BreakerFinish, timer, 0, None);
         profiler.flush();
+    }
+
+    #[test]
+    fn aggregate_hash_runtime_merges_fallback_counts_and_worst_case_metrics() {
+        let mut target = ExplainRuntimeStats {
+            aggregate_hash_full_key_fallback_count: Some(2),
+            aggregate_hash_max_prefix_probe_distance: Some(18),
+            aggregate_hash_max_radix_partition_skew_percent: Some(120),
+            ..ExplainRuntimeStats::default()
+        };
+        let source = ExplainRuntimeStats {
+            aggregate_hash_full_key_fallback_count: Some(3),
+            aggregate_hash_max_prefix_probe_distance: Some(32),
+            aggregate_hash_max_radix_partition_skew_percent: Some(110),
+            ..ExplainRuntimeStats::default()
+        };
+
+        merge_runtime_stats(&source, &mut target);
+
+        assert_eq!(target.aggregate_hash_full_key_fallback_count, Some(5));
+        assert_eq!(target.aggregate_hash_max_prefix_probe_distance, Some(32));
+        assert_eq!(
+            target.aggregate_hash_max_radix_partition_skew_percent,
+            Some(120)
+        );
     }
 }

@@ -30,6 +30,7 @@ fn reference(index: usize, ty: LogicalType) -> Expression {
 fn grouped_count_spec() -> AggregateSpec {
     AggregateSpec {
         grouping_key_count: 1,
+        initial_lookup_hash_key_count: 1,
         state_output_projection: Box::new([]),
         estimated_input_rows: None,
         projection_exprs: Box::new([]),
@@ -61,6 +62,7 @@ fn grouped_string_agg_spec() -> AggregateSpec {
         .expect("bind string_agg");
     AggregateSpec {
         grouping_key_count: 1,
+        initial_lookup_hash_key_count: 1,
         state_output_projection: Box::new([]),
         estimated_input_rows: None,
         projection_exprs: Box::new([]),
@@ -145,6 +147,57 @@ fn string_agg_payload(
             .set_value(row_idx, &Value::Varchar((*value).to_string()));
     }
     payload
+}
+
+#[test]
+fn hash_prefix_collisions_still_compare_the_complete_group_key() {
+    let allocator = paro_common::test_utils::test_allocator();
+    let mut spec = grouped_count_spec();
+    spec.grouping_key_count = 2;
+    spec.initial_lookup_hash_key_count = 1;
+    spec.payload_types = Box::new([LogicalType::Integer, LogicalType::Integer]);
+    spec.groups = Box::new([
+        reference(0, LogicalType::Integer),
+        reference(1, LogicalType::Integer),
+    ]);
+    spec.group_key_encodings = Box::new([GroupKeyEncoding::Identity, GroupKeyEncoding::Identity]);
+    spec.output_names = Box::new(["left".into(), "right".into(), "count".into()]);
+    spec.output_types = Box::new([
+        LogicalType::Integer,
+        LogicalType::Integer,
+        LogicalType::BigInt,
+    ]);
+
+    let aggregate_objects = aggregate_objects(&spec).expect("aggregate objects");
+    let group_refs = group_payload_refs(&spec).expect("group refs");
+    let grouping_sets = normalized_grouping_sets(&spec)
+        .expect("grouping sets")
+        .into_iter()
+        .map(Vec::into_boxed_slice)
+        .collect::<Vec<_>>();
+    let table_memory =
+        MemoryAccountingContext::detached(MemoryTag::HashTable, MemoryAccountingClass::Revocable);
+    let mut tables =
+        create_hash_aggregate_tables(&spec, allocator.clone(), table_memory, 1).expect("tables");
+    let payload = pair_payload(&[(7, 10), (7, 20), (7, 10)], allocator);
+    let groups = build_groups_chunk(&payload, &group_refs).expect("groups");
+    let mut addresses =
+        paro_common::test_utils::test_vector_with_capacity(LogicalType::BigInt, VECTOR_SIZE);
+    let mut new_groups = paro_common::test_utils::test_selection_with_capacity(VECTOR_SIZE);
+
+    update_hash_aggregate_tables(
+        &spec,
+        &aggregate_objects,
+        &payload,
+        &groups,
+        &grouping_sets,
+        &mut tables,
+        &mut addresses,
+        &mut new_groups,
+    )
+    .expect("build aggregate table");
+
+    assert_eq!(tables[0].count(), 2);
 }
 
 fn query_context() -> QueryRuntimeContext {

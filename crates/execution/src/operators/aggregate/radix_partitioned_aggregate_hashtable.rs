@@ -6,6 +6,8 @@
 //! This wraps multiple [`GroupedAggregateHashTable`] partitions and routes
 //! rows by hash high bits, so each partition resizes/scans independently.
 
+use std::num::NonZeroU64;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
 use parking_lot::Mutex;
@@ -17,9 +19,13 @@ use paro_common::types::LogicalType;
 use paro_common::vector::{SelectionVector, Vector};
 
 use super::aggregate_object::AggregateObject;
+use super::group_hash::{
+    hash_group_columns, hash_group_columns_prefix, AggregateHashContract, AggregateHashVectors,
+    DistinctHashVectors, GroupHashScratch, IncomingHashContract, RoutingHashContract,
+};
 use super::grouped_aggregate_hashtable::{
-    GroupedAggregateHashTable, HTScanPosition, HashTableCapacityHint, HashTableGrowthRequirement,
-    SerializedSourceRows,
+    AggregateHashRuntimeStats, GroupedAggregateHashTable, GroupedAggregateHashTableConfig,
+    HTScanPosition, HashTableCapacityHint, HashTableGrowthRequirement, SerializedSourceRows,
 };
 
 use paro_common::memory::MemoryGrant;
@@ -44,10 +50,150 @@ pub enum AggregateHashTable {
     Radix(RadixPartitionedAggregateHashTable),
 }
 
+/// Ownership-preserving result of dismantling an aggregate table for parallel
+/// partition work. Runtime observations belong to the table as much as its
+/// tuples do, so they must travel through the same ownership transfer.
+#[must_use = "partition ownership and runtime observations must be transferred together"]
+#[derive(Debug)]
+pub(crate) struct AggregateHashTablePartitionBundle {
+    pub(crate) partitions: Vec<AggregateHashTable>,
+    pub(crate) hash_runtime_stats: AggregateHashRuntimeStats,
+}
+
+/// Process-unique identity for the routing scratch owned by one radix table.
+///
+/// A routing epoch is meaningful only within its owner. Keeping the identity
+/// separate from the epoch prevents two freshly-created tables at the same
+/// epoch from accepting each other's lookup capability.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct RadixTableIdentity(NonZeroU64);
+
+impl RadixTableIdentity {
+    fn try_new() -> Result<Self> {
+        static NEXT_IDENTITY: AtomicU64 = AtomicU64::new(1);
+
+        let identity = NEXT_IDENTITY
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
+                current.checked_add(1)
+            })
+            .map_err(|_| paro_error::internal("radix aggregate table identity space exhausted"))?;
+        Ok(Self(
+            NonZeroU64::new(identity).expect("radix identity starts non-zero"),
+        ))
+    }
+}
+
+/// Move-only proof that a group lookup populated the address vector for one
+/// batch. Radix lookups additionally carry the table identity and exact
+/// routing epoch that own the row permutation needed by the following update.
+///
+/// The fields and constructors deliberately stay private: callers can only
+/// obtain this capability by completing a lookup, and consuming APIs prevent
+/// accidentally updating from stale or never-populated addresses.
+#[must_use = "a completed group lookup must authorize its corresponding update"]
+#[derive(Debug)]
+pub(crate) struct AggregateGroupLookup {
+    new_group_count: usize,
+    radix_owner: Option<RadixTableIdentity>,
+    radix_routing_epoch: Option<RadixRoutingEpoch>,
+}
+
+impl AggregateGroupLookup {
+    fn flat(new_group_count: usize) -> Self {
+        Self {
+            new_group_count,
+            radix_owner: None,
+            radix_routing_epoch: None,
+        }
+    }
+
+    fn radix(
+        new_group_count: usize,
+        owner: RadixTableIdentity,
+        routing_epoch: RadixRoutingEpoch,
+    ) -> Self {
+        Self {
+            new_group_count,
+            radix_owner: Some(owner),
+            radix_routing_epoch: Some(routing_epoch),
+        }
+    }
+
+    pub(crate) fn new_group_count(&self) -> usize {
+        self.new_group_count
+    }
+
+    fn into_radix_epoch(self, owner: RadixTableIdentity) -> Result<RadixRoutingEpoch> {
+        let token_owner = self.radix_owner.ok_or_else(|| {
+            paro_error::internal("flat aggregate lookup token used for a radix update")
+        })?;
+        if token_owner != owner {
+            return Err(paro_error::internal(format!(
+                "radix aggregate lookup token belongs to another table: token_owner={token_owner:?}, table_owner={owner:?}"
+            )));
+        }
+        self.radix_routing_epoch.ok_or_else(|| {
+            paro_error::internal("radix aggregate lookup token has no routing epoch")
+        })
+    }
+
+    /// Authorize a custom update that dereferences state addresses directly.
+    /// Ordered aggregates are planned as flat tables, so accepting a radix
+    /// token here would silently leave its routing epoch unconsumed.
+    pub(crate) fn consume_for_flat_custom_update(self) -> Result<()> {
+        if self.radix_owner.is_some() || self.radix_routing_epoch.is_some() {
+            return Err(paro_error::internal(
+                "radix aggregate lookup token used for a flat custom update",
+            ));
+        }
+        Ok(())
+    }
+}
+
 #[derive(Debug)]
 pub(crate) struct AggregateHashTableGrowthPlan {
     partition_rows: Box<[usize]>,
     partition_varlen_bytes: Box<[usize]>,
+    prepared_radix_route: Option<PreparedRadixGroupRoute>,
+}
+
+/// Move-only proof that growth planning has already hashed and routed one
+/// radix input batch. The later lookup consumes this capability instead of
+/// repeating that work, and the owner/epoch pair rejects stale or cross-table
+/// reuse after any intervening route.
+#[derive(Debug)]
+struct PreparedRadixGroupRoute {
+    owner: RadixTableIdentity,
+    epoch: RadixRoutingEpoch,
+    row_count: usize,
+    lookup_contract: IncomingHashContract,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum AggregateHashTableLayout {
+    Flat,
+    Radix { partition_bits: usize },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct AggregateHashTableConfig {
+    layout: AggregateHashTableLayout,
+    hash_contract: AggregateHashContract,
+    capacity_hint: HashTableCapacityHint,
+}
+
+impl AggregateHashTableConfig {
+    pub(crate) fn new(
+        layout: AggregateHashTableLayout,
+        hash_contract: AggregateHashContract,
+        capacity_hint: HashTableCapacityHint,
+    ) -> Self {
+        Self {
+            layout,
+            hash_contract,
+            capacity_hint,
+        }
+    }
 }
 
 /// Concurrent ownership target for independently processed radix partitions.
@@ -61,9 +207,15 @@ pub(crate) struct AggregateHashTableGrowthPlan {
 #[derive(Debug)]
 pub(crate) struct ConcurrentRadixAggregateBuild {
     group_types: Vec<LogicalType>,
+    hash_contract: AggregateHashContract,
     scan_output_types: Vec<LogicalType>,
     partition_bits: usize,
+    table_identity: RadixTableIdentity,
     partitions: Box<[Mutex<Option<GroupedAggregateHashTable>>]>,
+    // Observations owned by the radix wrapper (currently partition skew) are
+    // independent of the child tables handed to merge tasks. Keep them alive
+    // across disassembly/reassembly just like the child-owned observations.
+    hash_runtime_stats: AggregateHashRuntimeStats,
 }
 
 impl ConcurrentRadixAggregateBuild {
@@ -75,8 +227,10 @@ impl ConcurrentRadixAggregateBuild {
         };
         let RadixPartitionedAggregateHashTable {
             group_types,
+            hash_contract,
             partition_bits,
             partitions,
+            hash_runtime_stats,
             ..
         } = table;
         validate_radix_partition_count(partition_bits, partitions.len())?;
@@ -92,14 +246,28 @@ impl ConcurrentRadixAggregateBuild {
                 "radix aggregate target partitions have inconsistent output schemas",
             ));
         }
+        if partitions
+            .iter()
+            .any(|partition| partition.routing_hash_contract() != hash_contract.routing())
+        {
+            return Err(paro_error::internal(
+                "radix aggregate target partitions have inconsistent routing contracts",
+            ));
+        }
         Ok(Self {
             group_types,
+            hash_contract,
             scan_output_types,
             partition_bits,
+            // Reassembly installs a fresh routing scratch. Give that scratch a
+            // fresh identity as well so capabilities issued before dismantling
+            // can never become valid again when its epoch restarts from zero.
+            table_identity: RadixTableIdentity::try_new()?,
             partitions: partitions
                 .into_iter()
                 .map(|partition| Mutex::new(Some(partition)))
                 .collect(),
+            hash_runtime_stats,
         })
     }
 
@@ -130,6 +298,13 @@ impl ConcurrentRadixAggregateBuild {
                 "radix aggregate partition schema mismatch: expected={:?}, actual={:?}",
                 self.group_types,
                 table.group_types()
+            )));
+        }
+        if table.routing_hash_contract() != self.hash_contract.routing() {
+            return Err(paro_error::internal(format!(
+                "radix aggregate partition routing contract mismatch: expected={:?}, actual={:?}",
+                self.hash_contract.routing(),
+                table.routing_hash_contract()
             )));
         }
         let partition = self.partitions.get(partition_idx).ok_or_else(|| {
@@ -166,12 +341,21 @@ impl ConcurrentRadixAggregateBuild {
         Ok(AggregateHashTable::Radix(
             RadixPartitionedAggregateHashTable {
                 group_types: self.group_types.clone(),
+                hash_contract: self.hash_contract,
                 partition_bits: self.partition_bits,
                 partition_mask: partitions.len() - 1,
+                table_identity: self.table_identity,
                 partitions,
                 scratch: RadixRoutingScratch::default(),
+                hash_runtime_stats: self.hash_runtime_stats,
             },
         ))
+    }
+
+    /// Attach observations transferred from source wrappers that were
+    /// dismantled into independently owned partitions.
+    pub(crate) fn merge_hash_runtime_stats(&mut self, stats: AggregateHashRuntimeStats) {
+        self.hash_runtime_stats.merge(stats);
     }
 }
 
@@ -179,22 +363,17 @@ impl AggregateHashTable {
     pub(crate) fn growth_plan(
         &mut self,
         groups: &Chunk,
+        hash_scratch: &mut GroupHashScratch,
     ) -> Result<(AggregateHashTableGrowthPlan, HashTableGrowthRequirement)> {
-        let (partition_rows, partition_varlen_bytes) = match self {
+        let (partition_rows, partition_varlen_bytes, prepared_radix_route) = match self {
             Self::Flat(table) => (
                 vec![groups.size()],
                 vec![table.varlen_bytes_upper_bound(groups, None)?],
+                None,
             ),
             Self::Radix(table) => {
-                let hashes = table.hash_groups(groups)?;
-                table.scratch.route_hashes(
-                    table.partition_bits,
-                    table.partition_mask,
-                    table.partitions.len(),
-                    &hashes,
-                    &hashes,
-                    groups.size(),
-                )?;
+                let hashes = table.hash_groups_with_scratch(groups, hash_scratch)?;
+                let prepared_route = table.prepare_group_route(groups, hashes)?;
                 let rows = table.scratch.counts.clone();
                 let mut varlen_bytes = Vec::with_capacity(table.partitions.len());
                 for (partition_idx, partition) in table.partitions.iter().enumerate() {
@@ -204,7 +383,7 @@ impl AggregateHashTable {
                         Some(&table.scratch.rows_by_partition[start..end]),
                     )?);
                 }
-                (rows, varlen_bytes)
+                (rows, varlen_bytes, Some(prepared_route))
             }
         };
         let mut requirement = HashTableGrowthRequirement::default();
@@ -236,6 +415,7 @@ impl AggregateHashTable {
             AggregateHashTableGrowthPlan {
                 partition_rows: partition_rows.into_boxed_slice(),
                 partition_varlen_bytes: partition_varlen_bytes.into_boxed_slice(),
+                prepared_radix_route,
             },
             requirement,
         ))
@@ -248,6 +428,11 @@ impl AggregateHashTable {
     ) -> Result<()> {
         match self {
             Self::Flat(table) => {
+                if plan.prepared_radix_route.is_some() {
+                    return Err(paro_error::internal(
+                        "flat aggregate received a radix growth capability",
+                    ));
+                }
                 let ([rows], [varlen_bytes]) = (
                     plan.partition_rows.as_ref(),
                     plan.partition_varlen_bytes.as_ref(),
@@ -279,15 +464,23 @@ impl AggregateHashTable {
         }
     }
 
-    /// Split a finalized table into independently scannable ownership units.
-    pub fn into_scan_partitions(self) -> Vec<Self> {
+    /// Split a finalized table into independently scannable ownership units,
+    /// transferring all table-owned runtime observations with them.
+    pub(crate) fn into_scan_partitions(mut self) -> AggregateHashTablePartitionBundle {
+        let hash_runtime_stats = self.take_hash_runtime_stats();
         match self {
-            Self::Flat(table) => vec![Self::Flat(table)],
-            Self::Radix(table) => table
-                .into_partitions()
-                .into_iter()
-                .map(Self::Flat)
-                .collect(),
+            Self::Flat(table) => AggregateHashTablePartitionBundle {
+                partitions: vec![Self::Flat(table)],
+                hash_runtime_stats,
+            },
+            Self::Radix(table) => AggregateHashTablePartitionBundle {
+                partitions: table
+                    .into_partitions()
+                    .into_iter()
+                    .map(Self::Flat)
+                    .collect(),
+                hash_runtime_stats,
+            },
         }
     }
 
@@ -367,33 +560,75 @@ impl AggregateHashTable {
         allocator: Arc<dyn Allocator>,
         memory: MemoryAccountingContext,
     ) -> Result<Self> {
-        Ok(Self::Flat(GroupedAggregateHashTable::new_with_memory(
+        let hash_contract = AggregateHashContract::try_new(group_types.len(), group_types.len())?;
+        Self::new_configured(
             group_types,
             aggregate_objects,
             aggregate_inputs,
             allocator,
             memory,
-        )?))
+            AggregateHashTableConfig::new(
+                AggregateHashTableLayout::Flat,
+                hash_contract,
+                HashTableCapacityHint::default(),
+            ),
+        )
     }
 
-    pub(crate) fn new_flat_with_memory_capacity_hint(
+    pub(crate) fn new_configured(
         group_types: Vec<LogicalType>,
         aggregate_objects: Vec<AggregateObject>,
         aggregate_inputs: Vec<Vec<usize>>,
         allocator: Arc<dyn Allocator>,
         memory: MemoryAccountingContext,
-        capacity_hint: HashTableCapacityHint,
+        config: AggregateHashTableConfig,
     ) -> Result<Self> {
-        Ok(Self::Flat(
-            GroupedAggregateHashTable::new_with_memory_capacity_hint(
-                group_types,
-                aggregate_objects,
-                aggregate_inputs,
-                allocator,
-                memory,
-                capacity_hint,
-            )?,
-        ))
+        if config.hash_contract.key_width() != group_types.len() {
+            return Err(paro_error::internal(format!(
+                "Aggregate hash table config/key mismatch: contract={}, groups={}",
+                config.hash_contract.key_width(),
+                group_types.len()
+            )));
+        }
+        match config.layout {
+            AggregateHashTableLayout::Flat => {
+                Ok(Self::Flat(GroupedAggregateHashTable::new_configured(
+                    group_types,
+                    aggregate_objects,
+                    aggregate_inputs,
+                    allocator,
+                    memory,
+                    GroupedAggregateHashTableConfig::estimated(
+                        config.hash_contract,
+                        config.capacity_hint,
+                    ),
+                )?))
+            }
+            AggregateHashTableLayout::Radix { partition_bits } => {
+                // Ordinary Radix owns rows by the full key. That hash is
+                // already available and dominates any prefix lookup, so keep
+                // adaptive prefix lookup exclusively in flat tables. DISTINCT
+                // has a different exact contract: ownership by output-group
+                // prefix and full-key lookup, which remains unchanged here.
+                let radix_contract = if config.hash_contract.routing_is_full_key() {
+                    config.hash_contract.with_full_key_lookup()
+                } else {
+                    config.hash_contract
+                };
+                Ok(Self::Radix(
+                    RadixPartitionedAggregateHashTable::new_configured(
+                        group_types,
+                        aggregate_objects,
+                        aggregate_inputs,
+                        partition_bits,
+                        allocator,
+                        memory,
+                        radix_contract,
+                        config.capacity_hint,
+                    )?,
+                ))
+            }
+        }
     }
 
     pub fn new_radix(
@@ -424,42 +659,99 @@ impl AggregateHashTable {
         allocator: Arc<dyn Allocator>,
         memory: MemoryAccountingContext,
     ) -> Result<Self> {
-        Ok(Self::Radix(RadixPartitionedAggregateHashTable::new(
+        let hash_contract = AggregateHashContract::try_new(group_types.len(), group_types.len())?;
+        Self::new_configured(
             group_types,
             aggregate_objects,
             aggregate_inputs,
-            partition_bits,
             allocator,
             memory,
-        )?))
-    }
-
-    pub(crate) fn new_radix_with_memory_capacity_hint(
-        group_types: Vec<LogicalType>,
-        aggregate_objects: Vec<AggregateObject>,
-        aggregate_inputs: Vec<Vec<usize>>,
-        partition_bits: usize,
-        allocator: Arc<dyn Allocator>,
-        memory: MemoryAccountingContext,
-        capacity_hint: HashTableCapacityHint,
-    ) -> Result<Self> {
-        Ok(Self::Radix(
-            RadixPartitionedAggregateHashTable::new_with_capacity_hint(
-                group_types,
-                aggregate_objects,
-                aggregate_inputs,
-                partition_bits,
-                allocator,
-                memory,
-                capacity_hint,
-            )?,
-        ))
+            AggregateHashTableConfig::new(
+                AggregateHashTableLayout::Radix { partition_bits },
+                hash_contract,
+                HashTableCapacityHint::default(),
+            ),
+        )
     }
 
     pub fn hash_groups(&self, groups: &Chunk) -> Result<Vector> {
         match self {
-            Self::Flat(table) => table.hash_groups(groups),
+            Self::Flat(table) => table.hash_routing_groups(groups),
             Self::Radix(table) => table.hash_groups(groups),
+        }
+    }
+
+    pub(crate) fn routing_hash_contract(&self) -> RoutingHashContract {
+        match self {
+            Self::Flat(table) => table.routing_hash_contract(),
+            Self::Radix(table) => table.hash_contract.routing(),
+        }
+    }
+
+    pub(crate) fn take_hash_runtime_stats(&mut self) -> AggregateHashRuntimeStats {
+        match self {
+            Self::Flat(table) => table.take_hash_runtime_stats(),
+            Self::Radix(table) => table.take_hash_runtime_stats(),
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn merge_hash_runtime_stats(&mut self, stats: AggregateHashRuntimeStats) {
+        match self {
+            Self::Flat(table) => table.merge_hash_runtime_stats(stats),
+            Self::Radix(table) => table.hash_runtime_stats.merge(stats),
+        }
+    }
+
+    pub(crate) fn find_or_create_groups_with_scratch(
+        &mut self,
+        groups: &Chunk,
+        scratch: &mut GroupHashScratch,
+        addresses: &mut Vector,
+        new_groups: &mut SelectionVector,
+    ) -> Result<AggregateGroupLookup> {
+        match self {
+            Self::Flat(table) => {
+                let hashes = table.hash_groups_with_scratch(groups, scratch)?;
+                let new_group_count =
+                    table.find_or_create_groups(groups, hashes, addresses, new_groups)?;
+                Ok(AggregateGroupLookup::flat(new_group_count))
+            }
+            Self::Radix(table) => {
+                let hashes = table.hash_groups_with_scratch(groups, scratch)?;
+                table.find_or_create_groups_hashed(groups, hashes, addresses, new_groups)
+            }
+        }
+    }
+
+    /// Consume the route prepared by [`Self::growth_plan`]. Flat tables have
+    /// no routing work to reuse and follow their ordinary scratch path.
+    pub(crate) fn find_or_create_groups_with_growth_plan(
+        &mut self,
+        groups: &Chunk,
+        hash_scratch: &mut GroupHashScratch,
+        growth_plan: &mut AggregateHashTableGrowthPlan,
+        addresses: &mut Vector,
+        new_groups: &mut SelectionVector,
+    ) -> Result<AggregateGroupLookup> {
+        match self {
+            Self::Flat(table) => {
+                if growth_plan.prepared_radix_route.is_some() {
+                    return Err(paro_error::internal(
+                        "flat aggregate received a radix growth capability",
+                    ));
+                }
+                let hashes = table.hash_groups_with_scratch(groups, hash_scratch)?;
+                let new_group_count =
+                    table.find_or_create_groups(groups, hashes, addresses, new_groups)?;
+                Ok(AggregateGroupLookup::flat(new_group_count))
+            }
+            Self::Radix(table) => {
+                let prepared = growth_plan.prepared_radix_route.take().ok_or_else(|| {
+                    paro_error::internal("radix aggregate growth plan has no prepared route")
+                })?;
+                table.find_or_create_groups_prepared(groups, prepared, addresses, new_groups)
+            }
         }
     }
 
@@ -470,12 +762,18 @@ impl AggregateHashTable {
         groups: &Chunk,
         addresses: &mut Vector,
         new_groups: &mut SelectionVector,
-    ) -> Result<bool> {
+    ) -> Result<Option<AggregateGroupLookup>> {
         match self {
             Self::Flat(table) => {
-                table.try_find_or_create_adaptive_integer_groups(groups, addresses, new_groups)
+                if table
+                    .try_find_or_create_adaptive_integer_groups(groups, addresses, new_groups)?
+                {
+                    Ok(Some(AggregateGroupLookup::flat(new_groups.len())))
+                } else {
+                    Ok(None)
+                }
             }
-            Self::Radix(_) => Ok(false),
+            Self::Radix(_) => Ok(None),
         }
     }
 
@@ -486,32 +784,52 @@ impl AggregateHashTable {
         addresses: &mut Vector,
         new_groups: &mut SelectionVector,
     ) -> Result<usize> {
-        self.find_or_create_groups_partitioned(groups, hashes, hashes, addresses, new_groups)
+        match self {
+            Self::Flat(table) => table
+                .find_or_create_groups_with_routing_hashes(groups, hashes, addresses, new_groups),
+            Self::Radix(table) => {
+                table.find_or_create_groups(groups, hashes, addresses, new_groups)
+            }
+        }
     }
 
-    /// Probe using `lookup_hashes` while routing radix ownership using
-    /// `partition_hashes`.
-    ///
-    /// Ordinary aggregation passes the same vector for both. DISTINCT
-    /// aggregation routes by the output-group prefix so one final group never
-    /// spans multiple partitions, while exact deduplication still probes by
-    /// the complete `(groups..., inputs...)` key.
-    pub(crate) fn find_or_create_groups_partitioned(
+    /// Replay hashes are serialized under the immutable routing contract, not
+    /// necessarily a flat table's current adaptive lookup contract.
+    pub(crate) fn find_or_create_groups_with_routing_hashes(
         &mut self,
         groups: &Chunk,
-        lookup_hashes: &Vector,
-        partition_hashes: &Vector,
+        hashes: &Vector,
+        addresses: &mut Vector,
+        new_groups: &mut SelectionVector,
+    ) -> Result<usize> {
+        match self {
+            Self::Flat(table) => table
+                .find_or_create_groups_with_routing_hashes(groups, hashes, addresses, new_groups),
+            Self::Radix(table) => {
+                table.find_or_create_groups(groups, hashes, addresses, new_groups)
+            }
+        }
+    }
+
+    /// Insert a complete DISTINCT key while preserving its explicit output
+    /// group partitioning policy. The semantic wrapper prevents lookup and
+    /// partition vectors from being exchanged at the call boundary.
+    pub(crate) fn find_or_create_distinct_groups(
+        &mut self,
+        groups: &Chunk,
+        hashes: DistinctHashVectors<'_>,
         addresses: &mut Vector,
         new_groups: &mut SelectionVector,
     ) -> Result<usize> {
         match self {
             Self::Flat(table) => {
-                table.find_or_create_groups(groups, lookup_hashes, addresses, new_groups)
+                table.find_or_create_groups(groups, hashes.lookup(), addresses, new_groups)
             }
             Self::Radix(table) => table.find_or_create_groups_partitioned(
                 groups,
-                lookup_hashes,
-                partition_hashes,
+                hashes.lookup(),
+                hashes.partition(),
+                IncomingHashContract::Lookup(table.hash_contract.lookup()),
                 addresses,
                 new_groups,
             ),
@@ -542,16 +860,33 @@ impl AggregateHashTable {
         }
     }
 
-    pub fn update_aggregates(
+    /// Update the batch whose group lookup immediately preceded this call.
+    ///
+    /// Radix lookup owns the canonical row-to-partition permutation. Keeping
+    /// that permutation live across the lookup/update boundary avoids routing
+    /// the same hash vector twice while the consumable epoch prevents stale
+    /// scratch from being reused by a later batch.
+    pub(crate) fn update_aggregates_after_group_lookup(
         &mut self,
+        lookup: AggregateGroupLookup,
         payload: &Chunk,
-        hashes: Option<&Vector>,
         addresses: &Vector,
         filter: Option<&SelectionVector>,
     ) -> Result<()> {
         match self {
-            Self::Flat(table) => table.update_aggregates(payload, addresses, filter),
-            Self::Radix(table) => table.update_aggregates(payload, hashes, addresses, filter),
+            Self::Flat(table) => {
+                lookup.consume_for_flat_custom_update()?;
+                table.update_aggregates(payload, addresses, filter)
+            }
+            Self::Radix(table) => {
+                let routing_epoch = lookup.into_radix_epoch(table.table_identity)?;
+                table.update_aggregates_after_group_lookup(
+                    routing_epoch,
+                    payload,
+                    addresses,
+                    filter,
+                )
+            }
         }
     }
 
@@ -790,10 +1125,13 @@ impl AggregateHashTable {
 #[derive(Debug)]
 pub struct RadixPartitionedAggregateHashTable {
     group_types: Vec<LogicalType>,
+    hash_contract: AggregateHashContract,
     partition_bits: usize,
     partition_mask: usize,
+    table_identity: RadixTableIdentity,
     partitions: Vec<GroupedAggregateHashTable>,
     scratch: RadixRoutingScratch,
+    hash_runtime_stats: AggregateHashRuntimeStats,
 }
 
 #[derive(Debug, Default)]
@@ -810,6 +1148,21 @@ struct RadixRoutingScratch {
     address_vector: Option<Vector>,
     partition_addresses: Option<Vector>,
     partition_new_groups: Option<SelectionVector>,
+    routing_epoch: RadixRoutingEpoch,
+    group_lookup_epoch: Option<RadixRoutingEpoch>,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct RadixRoutingEpoch(u64);
+
+impl RadixRoutingEpoch {
+    fn try_advance(&mut self) -> Result<Self> {
+        self.0 = self
+            .0
+            .checked_add(1)
+            .ok_or_else(|| paro_error::internal("radix aggregate routing epoch space exhausted"))?;
+        Ok(*self)
+    }
 }
 
 impl RadixPartitionedAggregateHashTable {
@@ -817,53 +1170,45 @@ impl RadixPartitionedAggregateHashTable {
         self.partitions
     }
 
-    pub fn new(
+    fn new_configured(
         group_types: Vec<LogicalType>,
         aggregate_objects: Vec<AggregateObject>,
         aggregate_inputs: Vec<Vec<usize>>,
         partition_bits: usize,
         allocator: Arc<dyn Allocator>,
         memory: MemoryAccountingContext,
-    ) -> Result<Self> {
-        Self::new_with_capacity_hint(
-            group_types,
-            aggregate_objects,
-            aggregate_inputs,
-            partition_bits,
-            allocator,
-            memory,
-            HashTableCapacityHint::default(),
-        )
-    }
-
-    fn new_with_capacity_hint(
-        group_types: Vec<LogicalType>,
-        aggregate_objects: Vec<AggregateObject>,
-        aggregate_inputs: Vec<Vec<usize>>,
-        partition_bits: usize,
-        allocator: Arc<dyn Allocator>,
-        memory: MemoryAccountingContext,
+        hash_contract: AggregateHashContract,
         capacity_hint: HashTableCapacityHint,
     ) -> Result<Self> {
+        if hash_contract.key_width() != group_types.len() {
+            return Err(paro_error::internal(format!(
+                "Radix aggregate hash contract/key mismatch: contract={}, groups={}",
+                hash_contract.key_width(),
+                group_types.len()
+            )));
+        }
         let partition_count = radix_partition_count(partition_bits)?;
         let partition_hint = capacity_hint.divided_across(partition_count);
         let mut partitions = Vec::with_capacity(partition_count);
         for _ in 0..partition_count {
-            partitions.push(GroupedAggregateHashTable::new_with_memory_capacity_hint(
+            partitions.push(GroupedAggregateHashTable::new_configured(
                 group_types.clone(),
                 aggregate_objects.clone(),
                 aggregate_inputs.clone(),
                 allocator.clone(),
                 memory.clone(),
-                partition_hint,
+                GroupedAggregateHashTableConfig::estimated(hash_contract, partition_hint),
             )?);
         }
         Ok(Self {
             group_types,
+            hash_contract,
             partition_bits,
             partition_mask: partition_count - 1,
+            table_identity: RadixTableIdentity::try_new()?,
             partitions,
             scratch: RadixRoutingScratch::default(),
+            hash_runtime_stats: AggregateHashRuntimeStats::default(),
         })
     }
 
@@ -892,42 +1237,41 @@ impl RadixPartitionedAggregateHashTable {
     }
 
     pub fn hash_groups(&self, groups: &Chunk) -> Result<Vector> {
-        self.partitions
-            .first()
-            .ok_or_else(|| {
-                paro_error::internal("Radix aggregate hash table has no partitions".to_string())
-            })?
-            .hash_groups(groups)
-    }
-
-    pub fn find_or_create_groups(
-        &mut self,
-        groups: &Chunk,
-        hashes: &Vector,
-        addresses: &mut Vector,
-        new_groups: &mut SelectionVector,
-    ) -> Result<usize> {
-        self.find_or_create_groups_partitioned(groups, hashes, hashes, addresses, new_groups)
-    }
-
-    fn find_or_create_groups_partitioned(
-        &mut self,
-        groups: &Chunk,
-        lookup_hashes: &Vector,
-        partition_hashes: &Vector,
-        addresses: &mut Vector,
-        new_groups: &mut SelectionVector,
-    ) -> Result<usize> {
-        validate_hashes(lookup_hashes, groups.size())?;
-        validate_hashes(partition_hashes, groups.size())?;
-        validate_address_capacity(addresses, groups.size())?;
-
-        if groups.size() == 0 {
-            addresses.try_set_count(0)?;
-            new_groups.set_len(0);
-            return Ok(0);
+        if groups.column_count() != self.group_types.len() {
+            return Err(paro_error::internal(format!(
+                "Radix aggregate group width mismatch: expected={}, actual={}",
+                self.group_types.len(),
+                groups.column_count()
+            )));
         }
+        hash_group_columns(groups)
+    }
 
+    fn hash_groups_with_scratch<'a>(
+        &self,
+        groups: &Chunk,
+        scratch: &'a mut GroupHashScratch,
+    ) -> Result<AggregateHashVectors<'a>> {
+        if groups.column_count() != self.group_types.len() {
+            return Err(paro_error::internal(format!(
+                "Radix aggregate group width mismatch: expected={}, actual={}",
+                self.group_types.len(),
+                groups.column_count()
+            )));
+        }
+        scratch.hash_aggregate(groups, self.hash_contract)
+    }
+
+    /// Route under the immutable ownership contract and retain the worst
+    /// observed imbalance. Lookup fallback is deliberately independent:
+    /// changing ownership after groups exist would require state migration and
+    /// could diverge across independently built worker-local tables.
+    fn route_hashes_and_observe(
+        &mut self,
+        groups: &Chunk,
+        partition_hashes: &Vector,
+        lookup_hashes: &Vector,
+    ) -> Result<()> {
         self.scratch.route_hashes(
             self.partition_bits,
             self.partition_mask,
@@ -936,6 +1280,169 @@ impl RadixPartitionedAggregateHashTable {
             lookup_hashes,
             groups.size(),
         )?;
+        let row_count = groups.size();
+        let partition_count = self.partitions.len();
+        if row_count != 0 && partition_count != 0 {
+            let peak = self.scratch.counts.iter().copied().max().unwrap_or(0);
+            let skew_percent = peak
+                .saturating_mul(partition_count)
+                .saturating_mul(100)
+                .div_ceil(row_count) as u64;
+            self.hash_runtime_stats.max_radix_partition_skew_percent = self
+                .hash_runtime_stats
+                .max_radix_partition_skew_percent
+                .max(skew_percent);
+        }
+        Ok(())
+    }
+
+    fn prepare_group_route(
+        &mut self,
+        groups: &Chunk,
+        hashes: AggregateHashVectors<'_>,
+    ) -> Result<PreparedRadixGroupRoute> {
+        let (lookup_hashes, lookup_contract) = hashes.lookup();
+        let (routing_hashes, _) = hashes.routing();
+        self.route_hashes_and_observe(groups, routing_hashes, lookup_hashes)?;
+        Ok(PreparedRadixGroupRoute {
+            owner: self.table_identity,
+            epoch: self.scratch.routing_epoch,
+            row_count: groups.size(),
+            lookup_contract: IncomingHashContract::Lookup(lookup_contract),
+        })
+    }
+
+    fn take_hash_runtime_stats(&mut self) -> AggregateHashRuntimeStats {
+        let mut stats = std::mem::take(&mut self.hash_runtime_stats);
+        for partition in &mut self.partitions {
+            stats.merge(partition.take_hash_runtime_stats());
+        }
+        stats
+    }
+
+    pub fn find_or_create_groups(
+        &mut self,
+        groups: &Chunk,
+        routing_hashes: &Vector,
+        addresses: &mut Vector,
+        new_groups: &mut SelectionVector,
+    ) -> Result<usize> {
+        if self.hash_contract.lookup_is_prefix() {
+            let lookup_hashes =
+                hash_group_columns_prefix(groups, self.hash_contract.lookup().width())?;
+            self.find_or_create_groups_partitioned(
+                groups,
+                &lookup_hashes,
+                routing_hashes,
+                IncomingHashContract::Lookup(self.hash_contract.lookup()),
+                addresses,
+                new_groups,
+            )
+        } else {
+            self.find_or_create_groups_partitioned(
+                groups,
+                routing_hashes,
+                routing_hashes,
+                IncomingHashContract::Lookup(self.hash_contract.lookup()),
+                addresses,
+                new_groups,
+            )
+        }
+    }
+
+    fn find_or_create_groups_hashed(
+        &mut self,
+        groups: &Chunk,
+        hashes: AggregateHashVectors<'_>,
+        addresses: &mut Vector,
+        new_groups: &mut SelectionVector,
+    ) -> Result<AggregateGroupLookup> {
+        let (lookup_hashes, lookup_contract) = hashes.lookup();
+        let (routing_hashes, _) = hashes.routing();
+        let new_group_count = self.find_or_create_groups_partitioned(
+            groups,
+            lookup_hashes,
+            routing_hashes,
+            IncomingHashContract::Lookup(lookup_contract),
+            addresses,
+            new_groups,
+        )?;
+        let routing_epoch = self.scratch.group_lookup_epoch.ok_or_else(|| {
+            paro_error::internal("radix group lookup completed without a routing epoch")
+        })?;
+        Ok(AggregateGroupLookup::radix(
+            new_group_count,
+            self.table_identity,
+            routing_epoch,
+        ))
+    }
+
+    fn find_or_create_groups_prepared(
+        &mut self,
+        groups: &Chunk,
+        prepared: PreparedRadixGroupRoute,
+        addresses: &mut Vector,
+        new_groups: &mut SelectionVector,
+    ) -> Result<AggregateGroupLookup> {
+        if prepared.owner != self.table_identity
+            || prepared.epoch != self.scratch.routing_epoch
+            || prepared.row_count != groups.size()
+            || self.scratch.group_lookup_epoch.is_some()
+        {
+            return Err(paro_error::internal(format!(
+                "radix aggregate prepared route is stale: token_owner={:?}, table_owner={:?}, token_epoch={:?}, current_epoch={:?}, token_rows={}, groups={}, lookup_epoch={:?}",
+                prepared.owner,
+                self.table_identity,
+                prepared.epoch,
+                self.scratch.routing_epoch,
+                prepared.row_count,
+                groups.size(),
+                self.scratch.group_lookup_epoch,
+            )));
+        }
+        let new_group_count = self.find_or_create_groups_from_current_routing(
+            groups,
+            prepared.lookup_contract,
+            addresses,
+            new_groups,
+        )?;
+        Ok(AggregateGroupLookup::radix(
+            new_group_count,
+            self.table_identity,
+            prepared.epoch,
+        ))
+    }
+
+    fn find_or_create_groups_partitioned(
+        &mut self,
+        groups: &Chunk,
+        lookup_hashes: &Vector,
+        partition_hashes: &Vector,
+        lookup_contract: IncomingHashContract,
+        addresses: &mut Vector,
+        new_groups: &mut SelectionVector,
+    ) -> Result<usize> {
+        validate_hashes(lookup_hashes, groups.size())?;
+        validate_hashes(partition_hashes, groups.size())?;
+        validate_address_capacity(addresses, groups.size())?;
+
+        self.route_hashes_and_observe(groups, partition_hashes, lookup_hashes)?;
+        self.find_or_create_groups_from_current_routing(
+            groups,
+            lookup_contract,
+            addresses,
+            new_groups,
+        )
+    }
+
+    fn find_or_create_groups_from_current_routing(
+        &mut self,
+        groups: &Chunk,
+        lookup_contract: IncomingHashContract,
+        addresses: &mut Vector,
+        new_groups: &mut SelectionVector,
+    ) -> Result<usize> {
+        self.scratch.mark_group_lookup_route();
 
         addresses.try_set_count(groups.size())?;
         if new_groups.capacity() < groups.size() {
@@ -945,7 +1452,6 @@ impl RadixPartitionedAggregateHashTable {
         new_groups.set_len(groups.size());
         let new_group_data = new_groups.as_mut_slice().as_mut_ptr();
         let mut new_group_count = 0usize;
-
         let RadixPartitionedAggregateHashTable {
             partitions,
             scratch,
@@ -973,10 +1479,17 @@ impl RadixPartitionedAggregateHashTable {
                     "Radix partition index out of bounds: partition_idx={partition_idx}"
                 ))
             })?;
+            if partition.lookup_hash_contract().width() != lookup_contract.width() {
+                return Err(paro_error::internal(format!(
+                    "radix child lookup contract diverged: child={:?}, incoming={lookup_contract:?}",
+                    partition.lookup_hash_contract()
+                )));
+            }
             partition.find_or_create_groups_selected(
                 groups,
                 &scratch.rows_by_partition[start..end],
                 &scratch.hashes_by_partition[start..end],
+                lookup_contract,
                 addresses,
                 &mut partition_new_groups,
             )?;
@@ -1075,29 +1588,19 @@ impl RadixPartitionedAggregateHashTable {
         Ok(())
     }
 
-    pub fn update_aggregates(
+    fn update_aggregates_after_group_lookup(
         &mut self,
+        routing_epoch: RadixRoutingEpoch,
         payload: &Chunk,
-        hashes: Option<&Vector>,
         addresses: &Vector,
         filter: Option<&SelectionVector>,
     ) -> Result<()> {
-        if payload.size() == 0 {
-            return Ok(());
-        }
         if filter.is_some() {
             return Err(paro_error::internal(
                 "Radix partitioned aggregate hash table does not support filtered updates directly"
                     .to_string(),
             ));
         }
-        let hashes = hashes.ok_or_else(|| {
-            paro_error::internal(
-                "Radix partitioned aggregate hash table requires hash vector for updates"
-                    .to_string(),
-            )
-        })?;
-        validate_hashes(hashes, payload.size())?;
         if addresses.len() < payload.size() {
             return Err(paro_error::internal(format!(
                 "Address vector too small for radix aggregate update: addresses={} payload_rows={}",
@@ -1105,16 +1608,19 @@ impl RadixPartitionedAggregateHashTable {
                 payload.size()
             )));
         }
+        self.scratch
+            .consume_group_lookup_route(routing_epoch, payload.size())?;
+        if payload.size() == 0 {
+            return Ok(());
+        }
+        self.update_aggregates_from_current_routing(payload, addresses)
+    }
 
-        self.scratch.route_hashes(
-            self.partition_bits,
-            self.partition_mask,
-            self.partitions.len(),
-            hashes,
-            hashes,
-            payload.size(),
-        )?;
-
+    fn update_aggregates_from_current_routing(
+        &mut self,
+        payload: &Chunk,
+        addresses: &Vector,
+    ) -> Result<()> {
         let RadixPartitionedAggregateHashTable {
             partitions,
             scratch,
@@ -1148,14 +1654,17 @@ impl RadixPartitionedAggregateHashTable {
 
     pub fn combine(&mut self, other: &mut Self) -> Result<()> {
         if self.partition_bits != other.partition_bits
+            || self.hash_contract.routing() != other.hash_contract.routing()
             || self.group_types != other.group_types
             || self.partitions.len() != other.partitions.len()
         {
             return Err(paro_error::internal(format!(
                 "Cannot combine radix aggregate hash tables with different layouts: \
-bits {}/{} partitions {}/{} group_types {:?}/{:?}",
+bits {}/{} routing {:?}/{:?} partitions {}/{} group_types {:?}/{:?}",
                 self.partition_bits,
                 other.partition_bits,
+                self.hash_contract.routing(),
+                other.hash_contract.routing(),
                 self.partitions.len(),
                 other.partitions.len(),
                 self.group_types,
@@ -1175,20 +1684,25 @@ bits {}/{} partitions {}/{} group_types {:?}/{:?}",
             })?;
             left.combine(right)?;
         }
+        self.hash_runtime_stats
+            .merge(std::mem::take(&mut other.hash_runtime_stats));
         Ok(())
     }
 
     fn combine_sources(&mut self, sources: Vec<Self>) -> Result<()> {
         for source in &sources {
             if self.partition_bits != source.partition_bits
+                || self.hash_contract.routing() != source.hash_contract.routing()
                 || self.group_types != source.group_types
                 || self.partitions.len() != source.partitions.len()
             {
                 return Err(paro_error::internal(format!(
                     "Cannot bulk-combine radix aggregate hash tables with different layouts: \
-bits {}/{} partitions {}/{} group_types {:?}/{:?}",
+bits {}/{} routing {:?}/{:?} partitions {}/{} group_types {:?}/{:?}",
                     self.partition_bits,
                     source.partition_bits,
+                    self.hash_contract.routing(),
+                    source.hash_contract.routing(),
                     self.partitions.len(),
                     source.partitions.len(),
                     self.group_types,
@@ -1197,10 +1711,12 @@ bits {}/{} partitions {}/{} group_types {:?}/{:?}",
             }
         }
 
+        let mut source_runtime_stats = AggregateHashRuntimeStats::default();
         let mut sources_by_partition = (0..self.partitions.len())
             .map(|_| Vec::with_capacity(sources.len()))
             .collect::<Vec<_>>();
         for source in sources {
+            source_runtime_stats.merge(source.hash_runtime_stats);
             for (partition_idx, partition) in source.partitions.into_iter().enumerate() {
                 sources_by_partition[partition_idx].push(partition);
             }
@@ -1212,6 +1728,7 @@ bits {}/{} partitions {}/{} group_types {:?}/{:?}",
         {
             target.combine_many(sources)?;
         }
+        self.hash_runtime_stats.merge(source_runtime_stats);
         Ok(())
     }
 
@@ -1511,6 +2028,8 @@ impl RadixRoutingScratch {
         lookup_hashes: &Vector,
         row_count: usize,
     ) -> Result<()> {
+        self.routing_epoch.try_advance()?;
+        self.group_lookup_epoch = None;
         self.partition_ids.resize(row_count, 0);
         self.rows_by_partition.resize(row_count, 0);
         self.decoded_hashes.resize(row_count, 0);
@@ -1567,6 +2086,34 @@ impl RadixRoutingScratch {
             self.hashes_by_partition[target] = self.decoded_hashes[row_idx];
             self.cursors[partition_idx] += 1;
         }
+        Ok(())
+    }
+
+    fn mark_group_lookup_route(&mut self) {
+        self.group_lookup_epoch = Some(self.routing_epoch);
+    }
+
+    fn consume_group_lookup_route(
+        &mut self,
+        expected_epoch: RadixRoutingEpoch,
+        expected_rows: usize,
+    ) -> Result<()> {
+        let epoch = self.group_lookup_epoch.ok_or_else(|| {
+            paro_error::internal(
+                "radix aggregate update has no unconsumed group-lookup routing epoch",
+            )
+        })?;
+        if epoch != expected_epoch
+            || epoch != self.routing_epoch
+            || self.rows_by_partition.len() != expected_rows
+        {
+            return Err(paro_error::internal(format!(
+                "radix aggregate group-lookup routing is stale: token_epoch={expected_epoch:?}, lookup_epoch={epoch:?}, current_epoch={:?}, routed_rows={}, payload_rows={expected_rows}",
+                self.routing_epoch,
+                self.rows_by_partition.len()
+            )));
+        }
+        self.group_lookup_epoch = None;
         Ok(())
     }
 
@@ -1736,6 +2283,347 @@ mod tests {
             .expect("find/create groups");
     }
 
+    #[test]
+    fn radix_normalizes_correlated_prefix_hint_to_full_key_contract() {
+        let allocator = test_allocator();
+        let row_count = 512usize;
+        let leading = vec![11i32; row_count];
+        let suffix = (0..row_count).map(|row| row as i32).collect::<Vec<_>>();
+        let groups = Chunk::from_vectors(
+            vec![
+                test_i32_vector_with_allocator(&leading, allocator.clone()),
+                test_i32_vector_with_allocator(&suffix, allocator.clone()),
+            ],
+            allocator.clone(),
+        );
+        let hash_contract = AggregateHashContract::try_new(2, 1).expect("hash contract");
+        let mut table = AggregateHashTable::new_configured(
+            vec![LogicalType::Integer, LogicalType::Integer],
+            Vec::new(),
+            Vec::new(),
+            allocator,
+            MemoryAccountingContext::detached(
+                paro_common::allocator::MemoryTag::HashTable,
+                MemoryAccountingClass::Revocable,
+            ),
+            AggregateHashTableConfig::new(
+                AggregateHashTableLayout::Radix { partition_bits: 2 },
+                hash_contract,
+                HashTableCapacityHint::default(),
+            ),
+        )
+        .expect("radix prefix table");
+
+        let prefix_hashes = hash_group_columns_prefix(&groups, 1).expect("prefix hashes");
+        assert!(prefix_hashes
+            .as_slice::<u64>()
+            .windows(2)
+            .all(|pair| pair[0] == pair[1]));
+        let routing_hashes = table.hash_groups(&groups).expect("routing hashes");
+        assert!(routing_hashes
+            .as_slice::<u64>()
+            .windows(2)
+            .any(|pair| pair[0] != pair[1]));
+        let mut hash_scratch =
+            GroupHashScratch::try_new(row_count, groups.allocator().clone()).expect("hash scratch");
+        {
+            let AggregateHashTable::Radix(radix) = &table else {
+                panic!("expected radix table");
+            };
+            let hashes = radix
+                .hash_groups_with_scratch(&groups, &mut hash_scratch)
+                .expect("typed radix hashes");
+            let (lookup, lookup_contract) = hashes.lookup();
+            let (routing, routing_contract) = hashes.routing();
+            assert_eq!(lookup_contract.width(), 2);
+            assert_eq!(routing_contract.width(), 2);
+            assert!(std::ptr::eq(lookup, routing), "full/full must not snapshot");
+        }
+        let mut addresses = test_vector_with_capacity(LogicalType::BigInt, row_count);
+        let mut new_groups = test_selection_with_capacity(row_count);
+        assert_eq!(
+            table
+                .find_or_create_groups_with_scratch(
+                    &groups,
+                    &mut hash_scratch,
+                    &mut addresses,
+                    &mut new_groups,
+                )
+                .expect("insert skewed groups")
+                .new_group_count(),
+            row_count
+        );
+        assert_eq!(table.count(), row_count);
+        assert_eq!(table.routing_hash_contract().width(), 2);
+        let AggregateHashTable::Radix(radix) = &table else {
+            panic!("expected radix table");
+        };
+        assert!(radix
+            .partitions
+            .iter()
+            .all(|partition| partition.lookup_hash_contract().width() == 2));
+
+        let stats = table.take_hash_runtime_stats();
+        assert_eq!(stats.full_key_fallback_count, 0);
+        assert_eq!(stats.max_prefix_probe_distance, 0);
+        assert!(stats.max_radix_partition_skew_percent < 200);
+
+        // Ownership and lookup both use the stable full-key hash. The planned
+        // prefix remains only a flat-table hint.
+        let second_hashes = table.hash_groups(&groups).expect("stable route hashes");
+        assert_eq!(
+            second_hashes.as_slice::<u64>(),
+            routing_hashes.as_slice::<u64>()
+        );
+        assert_eq!(
+            table
+                .find_or_create_groups(&groups, &second_hashes, &mut addresses, &mut new_groups,)
+                .expect("probe locally promoted partition"),
+            0
+        );
+        assert_eq!(table.count(), row_count);
+    }
+
+    #[test]
+    fn growth_plan_route_is_consumed_without_a_second_route() {
+        let allocator = test_allocator();
+        let groups = Chunk::from_vectors(
+            vec![test_i32_vector_with_allocator(
+                &[1, 2, 3, 4, 5],
+                allocator.clone(),
+            )],
+            allocator.clone(),
+        );
+        let mut table = AggregateHashTable::new_radix(
+            vec![LogicalType::Integer],
+            Vec::new(),
+            Vec::new(),
+            2,
+            allocator.clone(),
+        )
+        .expect("radix table");
+        let mut hash_scratch =
+            GroupHashScratch::try_new(groups.size(), allocator).expect("hash scratch");
+        let (mut growth_plan, _) = table
+            .growth_plan(&groups, &mut hash_scratch)
+            .expect("growth plan");
+        let planned_epoch = match &table {
+            AggregateHashTable::Radix(radix) => radix.scratch.routing_epoch,
+            AggregateHashTable::Flat(_) => panic!("expected radix table"),
+        };
+        let mut addresses = test_vector_with_capacity(LogicalType::BigInt, groups.size());
+        let mut new_groups = test_selection_with_capacity(groups.size());
+        let lookup = table
+            .find_or_create_groups_with_growth_plan(
+                &groups,
+                &mut hash_scratch,
+                &mut growth_plan,
+                &mut addresses,
+                &mut new_groups,
+            )
+            .expect("consume prepared route");
+        let consumed_epoch = match &table {
+            AggregateHashTable::Radix(radix) => radix.scratch.routing_epoch,
+            AggregateHashTable::Flat(_) => panic!("expected radix table"),
+        };
+        assert_eq!(consumed_epoch, planned_epoch, "lookup must not reroute");
+        assert!(growth_plan.prepared_radix_route.is_none());
+        table
+            .update_aggregates_after_group_lookup(lookup, &groups, &addresses, None)
+            .expect("prepared lookup token remains consumable");
+    }
+
+    #[test]
+    fn radix_group_lookup_token_rejects_stale_routing_epoch() {
+        let allocator = test_allocator();
+        let groups = Chunk::from_vectors(
+            vec![test_i32_vector_with_allocator(
+                &[1, 2, 3],
+                allocator.clone(),
+            )],
+            allocator.clone(),
+        );
+        let mut table = AggregateHashTable::new_radix(
+            vec![LogicalType::Integer],
+            Vec::new(),
+            Vec::new(),
+            2,
+            allocator.clone(),
+        )
+        .expect("radix table");
+        let mut hash_scratch =
+            GroupHashScratch::try_new(groups.size(), allocator).expect("hash scratch");
+        let mut addresses = test_vector_with_capacity(LogicalType::BigInt, groups.size());
+        let mut new_groups = test_selection_with_capacity(groups.size());
+
+        let stale = table
+            .find_or_create_groups_with_scratch(
+                &groups,
+                &mut hash_scratch,
+                &mut addresses,
+                &mut new_groups,
+            )
+            .expect("first lookup");
+        let current = table
+            .find_or_create_groups_with_scratch(
+                &groups,
+                &mut hash_scratch,
+                &mut addresses,
+                &mut new_groups,
+            )
+            .expect("second lookup");
+
+        let error = table
+            .update_aggregates_after_group_lookup(stale, &groups, &addresses, None)
+            .expect_err("superseded lookup token must be rejected");
+        assert!(error.to_string().contains("routing is stale"));
+        table
+            .update_aggregates_after_group_lookup(current, &groups, &addresses, None)
+            .expect("current lookup token remains consumable");
+    }
+
+    #[test]
+    fn radix_group_lookup_token_rejects_another_table_at_the_same_epoch() {
+        let allocator = test_allocator();
+        let groups = Chunk::from_vectors(
+            vec![test_i32_vector_with_allocator(
+                &[1, 2, 3],
+                allocator.clone(),
+            )],
+            allocator.clone(),
+        );
+        let mut first = AggregateHashTable::new_radix(
+            vec![LogicalType::Integer],
+            Vec::new(),
+            Vec::new(),
+            2,
+            allocator.clone(),
+        )
+        .expect("first radix table");
+        let mut second = AggregateHashTable::new_radix(
+            vec![LogicalType::Integer],
+            Vec::new(),
+            Vec::new(),
+            2,
+            allocator.clone(),
+        )
+        .expect("second radix table");
+        let mut first_scratch =
+            GroupHashScratch::try_new(groups.size(), allocator.clone()).expect("first scratch");
+        let mut second_scratch =
+            GroupHashScratch::try_new(groups.size(), allocator).expect("second scratch");
+        let mut first_addresses = test_vector_with_capacity(LogicalType::BigInt, groups.size());
+        let mut second_addresses = test_vector_with_capacity(LogicalType::BigInt, groups.size());
+        let mut first_new_groups = test_selection_with_capacity(groups.size());
+        let mut second_new_groups = test_selection_with_capacity(groups.size());
+
+        let first_lookup = first
+            .find_or_create_groups_with_scratch(
+                &groups,
+                &mut first_scratch,
+                &mut first_addresses,
+                &mut first_new_groups,
+            )
+            .expect("first lookup");
+        let second_lookup = second
+            .find_or_create_groups_with_scratch(
+                &groups,
+                &mut second_scratch,
+                &mut second_addresses,
+                &mut second_new_groups,
+            )
+            .expect("second lookup");
+        assert_eq!(
+            first_lookup.radix_routing_epoch, second_lookup.radix_routing_epoch,
+            "the owner check, rather than a coincidentally different epoch, must reject the token"
+        );
+        assert_ne!(first_lookup.radix_owner, second_lookup.radix_owner);
+
+        let error = first
+            .update_aggregates_after_group_lookup(second_lookup, &groups, &first_addresses, None)
+            .expect_err("a lookup token from another table must be rejected");
+        assert!(error.to_string().contains("belongs to another table"));
+        first
+            .update_aggregates_after_group_lookup(first_lookup, &groups, &first_addresses, None)
+            .expect("the owning table must still accept its token");
+    }
+
+    #[test]
+    fn radix_group_lookup_token_rejects_previous_table_incarnation() {
+        let allocator = test_allocator();
+        let groups = Chunk::from_vectors(
+            vec![test_i32_vector_with_allocator(
+                &[1, 2, 3],
+                allocator.clone(),
+            )],
+            allocator.clone(),
+        );
+        let mut table = AggregateHashTable::new_radix(
+            vec![LogicalType::Integer],
+            Vec::new(),
+            Vec::new(),
+            2,
+            allocator.clone(),
+        )
+        .expect("radix table");
+        let mut hash_scratch =
+            GroupHashScratch::try_new(groups.size(), allocator).expect("hash scratch");
+        let mut stale_addresses = test_vector_with_capacity(LogicalType::BigInt, groups.size());
+        let mut current_addresses = test_vector_with_capacity(LogicalType::BigInt, groups.size());
+        let mut stale_new_groups = test_selection_with_capacity(groups.size());
+        let mut current_new_groups = test_selection_with_capacity(groups.size());
+
+        let stale = table
+            .find_or_create_groups_with_scratch(
+                &groups,
+                &mut hash_scratch,
+                &mut stale_addresses,
+                &mut stale_new_groups,
+            )
+            .expect("lookup before dismantling");
+        let stale_epoch = stale.radix_routing_epoch;
+        let stale_owner = stale.radix_owner;
+
+        let build = ConcurrentRadixAggregateBuild::try_new(table)
+            .expect("dismantle radix table for concurrent assembly");
+        let mut table = build.finish().expect("reassemble radix table");
+        let current = table
+            .find_or_create_groups_with_scratch(
+                &groups,
+                &mut hash_scratch,
+                &mut current_addresses,
+                &mut current_new_groups,
+            )
+            .expect("lookup after reassembly");
+        assert_eq!(
+            stale_epoch, current.radix_routing_epoch,
+            "a fresh routing scratch deliberately restarts its local epoch"
+        );
+        assert_ne!(
+            stale_owner, current.radix_owner,
+            "a fresh routing scratch must have a distinct capability owner"
+        );
+
+        let error = table
+            .update_aggregates_after_group_lookup(stale, &groups, &stale_addresses, None)
+            .expect_err("a lookup token must not survive table reassembly");
+        assert!(error.to_string().contains("belongs to another table"));
+        table
+            .update_aggregates_after_group_lookup(current, &groups, &current_addresses, None)
+            .expect("the reassembled table must accept its own lookup token");
+    }
+
+    #[test]
+    fn radix_routing_epoch_rejects_exhaustion() {
+        let mut epoch = RadixRoutingEpoch(u64::MAX);
+        let error = epoch
+            .try_advance()
+            .expect_err("routing epochs must never wrap and become reusable");
+
+        assert!(error.to_string().contains("routing epoch space exhausted"));
+        assert_eq!(epoch, RadixRoutingEpoch(u64::MAX));
+    }
+
     fn drain_integer_group_table(table: &mut AggregateHashTable) -> usize {
         let mut position = AggregateHTScanPosition::default();
         let mut output = test_chunk_with_capacity(&[LogicalType::Integer], 2);
@@ -1827,7 +2715,46 @@ mod tests {
         });
 
         let mut table = build.finish().expect("finish concurrent build");
+        assert!(
+            table
+                .take_hash_runtime_stats()
+                .max_radix_partition_skew_percent
+                > 0,
+            "disassembling and reassembling the radix table must preserve wrapper observations"
+        );
         assert_eq!(drain_integer_group_table(&mut table), 6);
+    }
+
+    #[test]
+    fn radix_bulk_combine_transfers_source_wrapper_observations() {
+        let mut target = AggregateHashTable::new_radix(
+            vec![LogicalType::Integer],
+            Vec::new(),
+            Vec::new(),
+            2,
+            test_allocator(),
+        )
+        .expect("target table");
+        let mut source = AggregateHashTable::new_radix(
+            vec![LogicalType::Integer],
+            Vec::new(),
+            Vec::new(),
+            2,
+            test_allocator(),
+        )
+        .expect("source table");
+        insert_integer_groups(&mut source, &[1, 2, 3]);
+
+        target
+            .combine_sources(vec![source])
+            .expect("bulk combine radix source");
+        assert!(
+            target
+                .take_hash_runtime_stats()
+                .max_radix_partition_skew_percent
+                > 0,
+            "source wrapper observations must move with its partitions"
+        );
     }
 
     #[test]
@@ -1868,6 +2795,9 @@ mod tests {
                 0,
                 groups.len(),
                 1,
+                AggregateHashContract::try_new(1, 1)
+                    .expect("projection contract")
+                    .routing(),
                 &mut run_starts,
                 &mut projected_hashes,
             )

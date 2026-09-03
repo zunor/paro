@@ -209,6 +209,7 @@ fn global_filtered_count_window_spec() -> PartitionAggregateWindowSpec {
         detail_columns: Box::new([0]),
         aggregate: AggregateSpec {
             grouping_key_count: 0,
+            initial_lookup_hash_key_count: 0,
             state_output_projection: Box::new([]),
             estimated_input_rows: None,
             projection_exprs: Box::new([
@@ -414,6 +415,7 @@ fn partition_aggregate_window_forced_external_preserves_filter_payload() {
         detail_columns: Box::new([0, 1]),
         aggregate: AggregateSpec {
             grouping_key_count: 1,
+            initial_lookup_hash_key_count: 1,
             state_output_projection: Box::new([]),
             estimated_input_rows: None,
             projection_exprs: Box::new([

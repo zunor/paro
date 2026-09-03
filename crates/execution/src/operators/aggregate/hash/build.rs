@@ -17,6 +17,7 @@ use paro_function::scalar::FunctionExecContext;
 use paro_storage::buffer::BufferPool;
 use paro_storage::row::{RowSpillWriter, RowStoreSpillWriter};
 
+use crate::explain::profiler::OperatorProfiler;
 use crate::explain::types::ExplainRuntimeStats;
 use crate::expression_executor::executor::ExpressionExecutor;
 use crate::operators::aggregate::aggregate_kernel::{
@@ -31,7 +32,7 @@ use crate::operators::aggregate::build_helpers::{
     create_hash_aggregate_tables, group_payload_refs, group_types, has_aggregate_distinct,
     has_aggregate_ordered, normalized_grouping_sets, projected_payload_chunk,
     query_hash_table_memory, query_modifier_memory, update_hash_aggregate_tables,
-    update_hash_aggregate_tables_with_scratch,
+    update_hash_aggregate_tables_with_growth_plans,
 };
 use crate::operators::aggregate::distinct_helpers::{
     collect_distinct_rows, finalize_distinct_into_tables,
@@ -39,6 +40,7 @@ use crate::operators::aggregate::distinct_helpers::{
 use crate::operators::aggregate::distinct_state::DistinctAggregateState;
 use crate::operators::aggregate::group_hash::{hash_group_columns, GroupHashScratch};
 use crate::operators::aggregate::group_key_codec::GroupKeyEncoder;
+use crate::operators::aggregate::grouped_aggregate_hashtable::AggregateHashRuntimeStats;
 use crate::operators::aggregate::ordered_helpers::{
     collect_ordered_rows, empty_ordered_collectors_with_memory, finalize_ordered_into_hash_tables,
     merge_ordered_collectors,
@@ -160,6 +162,8 @@ impl HashAggregateBuildSinkExec {
         ));
         let raw_payload_spill_requested = Arc::new(AtomicBool::new(raw_payload_spill_enabled));
         let state_spill = Arc::new(parking_lot::Mutex::new(None));
+        let hash_runtime_stats =
+            Arc::new(parking_lot::Mutex::new(AggregateHashRuntimeStats::default()));
         let (
             local_build_reclaimer_name,
             local_payload_spill_reclaimer_name,
@@ -184,6 +188,7 @@ impl HashAggregateBuildSinkExec {
                         local_id,
                         Arc::clone(&tables),
                         Arc::clone(&raw_payload_spill_requested),
+                        Arc::clone(&hash_runtime_stats),
                     ),
                 ));
                 Some(name)
@@ -204,6 +209,7 @@ impl HashAggregateBuildSinkExec {
                         Arc::clone(&tables),
                         Arc::clone(&state_spill),
                         Arc::clone(&raw_payload_spill_requested),
+                        Arc::clone(&hash_runtime_stats),
                         ctx.query.session.buffer_pool().clone(),
                         group_types(&self.spec)?,
                         state_width,
@@ -268,6 +274,7 @@ impl HashAggregateBuildSinkExec {
                 ctx.query.allocator(MemoryTag::HashTable),
             )?,
             tables,
+            hash_runtime_stats,
             local_build_reclaimer_name,
             local_payload_spill_reclaimer_name,
             local_state_spill_reclaimer_name,
@@ -325,7 +332,7 @@ impl HashAggregateBuildSinkExec {
         // owner lock. The reservation covers allocator old/new overlap; if it
         // cannot be established, an adaptive implementation switches this
         // and subsequent input to its admitted raw-payload spill path.
-        let (growth_plans, persistent_growth, growth_overlap) = if skip_regular_sink
+        let (mut growth_plans, persistent_growth, growth_overlap) = if skip_regular_sink
             || local.raw_payload_spill_enabled
             || local.raw_payload_spill_requested.load(Ordering::Acquire)
         {
@@ -343,7 +350,8 @@ impl HashAggregateBuildSinkExec {
             for (table, grouping_set) in tables.iter_mut().zip(local.grouping_sets.iter()) {
                 let table_groups =
                     build_groups_chunk_for_set(groups, grouping_set, self.spec.grouping_key_count)?;
-                let (plan, requirement) = table.growth_plan(&table_groups)?;
+                let (plan, requirement) =
+                    table.growth_plan(&table_groups, &mut local.group_hash_scratch)?;
                 persistent = persistent
                     .checked_add(requirement.persistent_bytes)
                     .ok_or_else(|| paro_error::internal("aggregate persistent growth overflow"))?;
@@ -439,7 +447,7 @@ impl HashAggregateBuildSinkExec {
                 table.prepare_growth(plan, reservation)?;
             }
         }
-        update_hash_aggregate_tables_with_scratch(
+        update_hash_aggregate_tables_with_growth_plans(
             &self.spec,
             &local.aggregate_objects,
             payload,
@@ -447,6 +455,7 @@ impl HashAggregateBuildSinkExec {
             &local.grouping_sets,
             &mut tables,
             &mut local.group_hash_scratch,
+            &mut growth_plans,
             &mut local.addresses,
             &mut local.new_groups,
         )?;
@@ -456,7 +465,7 @@ impl HashAggregateBuildSinkExec {
 
     pub(crate) fn merge_local(
         &self,
-        _ctx: &mut OperatorCallContext,
+        ctx: &mut OperatorCallContext,
         global: &SinkGlobal,
         local: &mut SinkLocal,
     ) -> Result<MergePoll> {
@@ -471,6 +480,17 @@ impl HashAggregateBuildSinkExec {
             ));
         };
         local.activate_raw_payload_spill_if_requested();
+        let local_hash_runtime_stats = {
+            let mut tables = local.tables.lock();
+            let mut stats = std::mem::take(&mut *local.hash_runtime_stats.lock());
+            stats.merge(drain_aggregate_hash_runtime(&mut tables));
+            stats
+        };
+        record_aggregate_hash_runtime_stats(
+            ctx.profiler,
+            ctx.operator.index() as u64,
+            local_hash_runtime_stats,
+        );
         if local.raw_payload_spill_enabled() {
             global.handle.with_state_mut(|state| {
                 let AggregateRuntimeState::Hash(global) = state else {
@@ -635,10 +655,15 @@ impl HashAggregateBuildSinkExec {
                 post_reducer.as_mut(),
             )?;
             if global.spilled_outputs.is_some() {
+                record_aggregate_hash_runtime(
+                    ctx.profiler,
+                    ctx.operator.index() as u64,
+                    &mut global.tables,
+                );
                 return Ok(());
             }
             ensure_grouping_domains(ctx.query, &self.spec, global)?;
-            finalize_distinct_into_tables(
+            let mut hash_runtime_stats = finalize_distinct_into_tables(
                 &self.spec,
                 &aggregate_objects,
                 &group_refs,
@@ -665,6 +690,12 @@ impl HashAggregateBuildSinkExec {
                     )?;
                 }
             }
+            hash_runtime_stats.merge(drain_aggregate_hash_runtime(&mut global.tables));
+            record_aggregate_hash_runtime_stats(
+                ctx.profiler,
+                ctx.operator.index() as u64,
+                hash_runtime_stats,
+            );
             Ok(())
         })?;
         if let Some(reducer) = post_reducer {
@@ -676,6 +707,47 @@ impl HashAggregateBuildSinkExec {
         global.handle.enable_state_reclaim();
         Ok(FinishPoll::Done)
     }
+}
+
+fn record_aggregate_hash_runtime(
+    profiler: &mut OperatorProfiler,
+    operator_id: u64,
+    tables: &mut [AggregateHashTable],
+) {
+    let stats = drain_aggregate_hash_runtime(tables);
+    record_aggregate_hash_runtime_stats(profiler, operator_id, stats);
+}
+
+fn record_aggregate_hash_runtime_stats(
+    profiler: &mut OperatorProfiler,
+    operator_id: u64,
+    stats: AggregateHashRuntimeStats,
+) {
+    if stats == AggregateHashRuntimeStats::default() {
+        return;
+    }
+    profiler.record_runtime(
+        operator_id,
+        ExplainRuntimeStats {
+            aggregate_hash_full_key_fallback_count: (stats.full_key_fallback_count > 0)
+                .then_some(stats.full_key_fallback_count),
+            aggregate_hash_max_prefix_probe_distance: (stats.max_prefix_probe_distance > 0)
+                .then_some(stats.max_prefix_probe_distance),
+            aggregate_hash_max_radix_partition_skew_percent: (stats
+                .max_radix_partition_skew_percent
+                > 0)
+            .then_some(stats.max_radix_partition_skew_percent),
+            ..ExplainRuntimeStats::default()
+        },
+    );
+}
+
+fn drain_aggregate_hash_runtime(tables: &mut [AggregateHashTable]) -> AggregateHashRuntimeStats {
+    let mut stats = AggregateHashRuntimeStats::default();
+    for table in tables {
+        stats.merge(table.take_hash_runtime_stats());
+    }
+    stats
 }
 
 /// Establish every logical grouping domain before modifier finalization.
@@ -822,8 +894,7 @@ fn hash_aggregate_external_payload_spill_enabled(
     {
         return false;
     }
-    spec.grouping_sets.len() > 1
-        || hash_aggregate_external_payload_spill_requested(spec)
+    hash_aggregate_external_payload_spill_requested(spec)
         || hash_aggregate_preemptive_payload_spill_enabled(query)
 }
 
@@ -970,7 +1041,8 @@ fn combine_spilled_state_batch(
         )));
     }
 
-    target_table.find_or_create_groups(groups, hashes, addresses, new_groups)?;
+    target_table
+        .find_or_create_groups_with_routing_hashes(groups, hashes, addresses, new_groups)?;
     if aggregate_objects.is_empty() {
         return Ok(());
     }
@@ -1212,6 +1284,7 @@ fn spill_payload_partitions_to_outputs(
         }
     }
 
+    record_aggregate_hash_runtime(ctx.profiler, ctx.operator.index() as u64, &mut state.tables);
     let in_memory_state_spill = spill_in_memory_tables_to_state_partitions(
         ctx,
         spec,
@@ -1296,6 +1369,11 @@ fn spill_payload_partitions_to_outputs(
                 },
             )?;
         }
+        record_aggregate_hash_runtime(
+            ctx.profiler,
+            ctx.operator.index() as u64,
+            &mut partition_tables,
+        );
         append_partition_tables_to_output_writers(
             &mut writers,
             &mut partition_tables,
@@ -1432,6 +1510,11 @@ fn replay_spilled_payloads_into_tables(
         for (target, partition) in target_tables.iter_mut().zip(partition_tables.iter_mut()) {
             target.combine(partition)?;
         }
+        record_aggregate_hash_runtime(
+            ctx.profiler,
+            ctx.operator.index() as u64,
+            &mut partition_tables,
+        );
     }
     Ok(())
 }

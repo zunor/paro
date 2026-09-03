@@ -105,6 +105,18 @@ impl DecimalNarrowState {
         self.value_words != Self::UNSET
     }
 
+    /// Observe the additive identity without rewriting an already-observed
+    /// SUM state. Constant-zero projection columns are common in UNION-based
+    /// analytical queries; treating their update as idempotent avoids writing
+    /// the same state row for every input tuple while preserving the
+    /// distinction between an empty SUM and SUM over one or more zeroes.
+    #[inline]
+    pub(in crate::aggregate) fn observe_zero(&mut self) {
+        if !self.is_set() {
+            self.set_i64(0);
+        }
+    }
+
     pub(in crate::aggregate) fn overflowed(&self) -> bool {
         self.value_words == Self::OVERFLOWED
     }
@@ -185,6 +197,13 @@ impl DecimalSumState {
 
     fn is_set(&self) -> bool {
         self.value_words != Self::UNSET
+    }
+
+    #[inline]
+    pub(in crate::aggregate) fn observe_zero(&mut self) {
+        if !self.is_set() {
+            self.set_i128(0);
+        }
     }
 
     fn overflowed(&self) -> bool {

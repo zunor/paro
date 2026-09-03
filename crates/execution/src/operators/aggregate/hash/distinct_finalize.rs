@@ -15,6 +15,7 @@ use crate::operators::aggregate::build_helpers::{
 };
 use crate::operators::aggregate::distinct_helpers::finalize_distinct_fragments_into_table;
 use crate::operators::aggregate::distinct_state::DistinctKeyTable;
+use crate::operators::aggregate::grouped_aggregate_hashtable::AggregateHashRuntimeStats;
 use crate::operators::aggregate::radix_partitioned_aggregate_hashtable::{
     AggregateHashTable, ConcurrentRadixAggregateBuild,
 };
@@ -51,9 +52,14 @@ pub(super) struct PartitionedDistinctFinalize {
     spec: AggregateSpec,
     aggregate_objects: Arc<[AggregateObject]>,
     group_refs: Arc<[usize]>,
+    hash_runtime_stats: AggregateHashRuntimeStats,
 }
 
 impl PartitionedDistinctFinalize {
+    pub(super) fn take_hash_runtime_stats(&mut self) -> AggregateHashRuntimeStats {
+        std::mem::take(&mut self.hash_runtime_stats)
+    }
+
     pub(super) fn finalize_partition(
         &self,
         aggregates: Vec<DistinctAggregatePartition>,
@@ -226,16 +232,15 @@ pub(super) fn prepare_parallel_distinct_finalize(
     if work.is_empty() {
         return Ok(None);
     }
-    let result = ConcurrentRadixAggregateBuild::try_new(result_table.ok_or_else(|| {
+    let mut distinct = distinct.ok_or_else(|| {
+        paro_error::internal("parallel DISTINCT finalize lost its execution context")
+    })?;
+    let mut result = ConcurrentRadixAggregateBuild::try_new(result_table.ok_or_else(|| {
         paro_error::internal("parallel DISTINCT finalize did not detach its result table")
     })?)?;
+    result.merge_hash_runtime_stats(distinct.take_hash_runtime_stats());
     Ok(Some(DistinctFinalizeDriver::group(
-        handle,
-        distinct.ok_or_else(|| {
-            paro_error::internal("parallel DISTINCT finalize lost its execution context")
-        })?,
-        result,
-        work,
+        handle, distinct, result, work,
     )))
 }
 
@@ -260,11 +265,14 @@ pub(super) fn take_partitioned_distinct_work(
         Arc::from(aggregate_objects(spec)?.into_boxed_slice());
     let group_refs: Arc<[usize]> = Arc::from(group_payload_refs(spec)?.into_boxed_slice());
     let mut partitions = (0..partition_count).map(|_| Vec::new()).collect::<Vec<_>>();
+    let mut hash_runtime_stats = AggregateHashRuntimeStats::default();
     for (aggregate_idx, object) in aggregate_objects.iter().enumerate() {
         if !object.is_distinct() || !object.order_bys.is_empty() {
             continue;
         }
-        let partition_groups = global.distinct.take_partition_groups(aggregate_idx)?;
+        let partition_bundle = global.distinct.take_partition_groups(aggregate_idx)?;
+        hash_runtime_stats.merge(partition_bundle.hash_runtime_stats);
+        let partition_groups = partition_bundle.groups;
         if partition_groups.len() != partition_count {
             return Err(paro_error::internal(format!(
                 "DISTINCT/output radix partition count mismatch at aggregate {aggregate_idx}: distinct={}, output={partition_count}",
@@ -288,6 +296,7 @@ pub(super) fn take_partitioned_distinct_work(
             spec: spec.clone(),
             aggregate_objects,
             group_refs,
+            hash_runtime_stats,
         },
         partitions,
     )))

@@ -89,6 +89,7 @@ fn decimal_sum_rollup_spec(
     };
     let spec = AggregateSpec {
         grouping_key_count: 1,
+        initial_lookup_hash_key_count: 1,
         state_output_projection: Box::new([]),
         estimated_input_rows: None,
         projection_exprs: Box::new([]),

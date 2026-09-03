@@ -658,6 +658,7 @@ mod tests {
         ))];
         AggregateSpec {
             grouping_key_count: 1,
+            initial_lookup_hash_key_count: 1,
             state_output_projection: Box::new([]),
             estimated_input_rows: None,
             projection_exprs: Box::new([]),
@@ -847,14 +848,19 @@ mod tests {
         let query = query_context();
         let mut spec = decimal_sum_reduction_spec();
         let hidden_type = spec.scalar_types[0].clone();
-        spec.predicate = Expression::Comparison(ComparisonExpression::new(
-            ComparisonType::Equal,
-            Expression::Reference(ReferenceExpression::new(1, hidden_type)),
-            Expression::Constant(ConstantExpression::new(
+        // Bypass the checked constructor deliberately: this test exercises
+        // the runtime boundary's defense against corrupted physical input.
+        spec.predicate = Expression::Comparison(ComparisonExpression {
+            left: Box::new(Expression::Reference(ReferenceExpression::new(
+                1,
+                hidden_type,
+            ))),
+            right: Box::new(Expression::Constant(ConstantExpression::new(
                 Value::BigInt(1),
                 LogicalType::BigInt,
-            )),
-        ));
+            ))),
+            comparison_type: ComparisonType::Equal,
+        });
 
         let error = reducer_init_error(&spec, &query);
         assert!(

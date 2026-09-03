@@ -582,6 +582,10 @@ impl DirectGroupedAggregateProgram {
                 if !inputs.is_valid(source_idx, row, shared_physical_row) {
                     continue;
                 }
+                if inputs.is_constant_zero(source_idx) {
+                    unsafe { Self::update_constant_zero(source, &inputs, row, base) };
+                    continue;
+                }
                 match source.width {
                     DirectDecimalWidth::I64 => {
                         let value =
@@ -641,6 +645,65 @@ impl DirectGroupedAggregateProgram {
             }
         }
         Ok(true)
+    }
+
+    /// Apply the aggregate semantics of one non-NULL constant-zero row.
+    ///
+    /// Constant detection is a vector execution optimization, not a logical
+    /// rewrite: the state must still distinguish an empty SUM from an observed
+    /// zero, and AVG must still count every admitted row. Keeping those rules
+    /// in one width-dispatched operation prevents the row-wise kernels from
+    /// growing independent lifecycle implementations.
+    ///
+    /// # Safety
+    ///
+    /// `base` must address a live state row compiled by this program.
+    unsafe fn update_constant_zero(
+        source: &DirectDecimalInputUpdates,
+        inputs: &PreparedDirectGroupedAggregateInput<'_>,
+        row: usize,
+        base: *mut u8,
+    ) {
+        match &source.sums {
+            DirectDecimalSums::Narrow(updates) => {
+                for update in updates {
+                    if !inputs.filter_passes(update.filter_slot, row) {
+                        continue;
+                    }
+                    let state =
+                        unsafe { &mut *base.add(update.state_offset).cast::<DecimalNarrowState>() };
+                    state.observe_zero();
+                    if source.sums_are_disjoint {
+                        break;
+                    }
+                }
+            }
+            DirectDecimalSums::Wide(updates) => {
+                for update in updates {
+                    if !inputs.filter_passes(update.filter_slot, row) {
+                        continue;
+                    }
+                    let state =
+                        unsafe { &mut *base.add(update.state_offset).cast::<DecimalSumState>() };
+                    state.observe_zero();
+                    if source.sums_are_disjoint {
+                        break;
+                    }
+                }
+            }
+            DirectDecimalSums::None => {}
+        }
+        for update in &source.averages {
+            if !inputs.filter_passes(update.filter_slot, row) {
+                continue;
+            }
+            let state =
+                unsafe { &mut *base.add(update.state_offset).cast::<DecimalAverageState>() };
+            match source.width {
+                DirectDecimalWidth::I64 => state.update_direct_i64(0),
+                DirectDecimalWidth::I128 => state.update_direct_i128(0, 1),
+            }
+        }
     }
 
     /// Collapse a batch by slot and update states in direct-addressing storage.
@@ -732,7 +795,8 @@ impl DirectGroupedAggregateProgram {
         S: DirectGroupSlotSource,
         F: FnMut(usize, *mut u8) -> Result<()>,
     {
-        if scratch.decimal_sources.len() != self.decimal_inputs.len()
+        if !self.handles_all()
+            || scratch.decimal_sources.len() != self.decimal_inputs.len()
             || slot_source.slot_count() != scratch.slot_count
         {
             return Ok(false);
@@ -989,6 +1053,9 @@ impl DirectGroupedAggregateProgram {
             for (source_idx, source) in self.decimal_inputs.iter().enumerate() {
                 let source_scratch =
                     unsafe { scratch.decimal_sources.get_unchecked_mut(source_idx) };
+                if inputs.is_constant_zero(source_idx) {
+                    continue;
+                }
                 let source_overflowed = match (source.width, source_scratch) {
                     (DirectDecimalWidth::I64, DirectDecimalScratch::I64 { primary, .. }) => {
                         let value =
@@ -1170,6 +1237,7 @@ struct PreparedDecimalInput<'a> {
     data: PreparedDecimalData,
     direct: bool,
     uses_shared_selection: bool,
+    constant_zero: bool,
 }
 
 struct PreparedFilterInput<'a> {
@@ -1200,17 +1268,23 @@ impl<'a> PreparedDirectGroupedAggregateInput<'a> {
         });
         let inputs: SmallVec<[PreparedDecimalInput<'a>; 8]> = decoded
             .into_iter()
-            .map(|(decoded, width)| PreparedDecimalInput {
-                data: match width {
+            .map(|(decoded, width)| {
+                let data = match width {
                     DirectDecimalWidth::I64 => PreparedDecimalData::I64(decoded.get_data::<i64>()),
                     DirectDecimalWidth::I128 => {
                         PreparedDecimalData::I128(decoded.get_data::<i128>())
                     }
-                },
-                direct: matches!(decoded.sel(), SelectionRef::Incremental { .. }),
-                uses_shared_selection: shared_identity
-                    .is_some_and(|identity| decoded.sel().allocation_identity() == Some(identity)),
-                decoded,
+                };
+                let constant_zero = decoded_decimal_is_constant_zero(&decoded, data);
+                PreparedDecimalInput {
+                    data,
+                    direct: matches!(decoded.sel(), SelectionRef::Incremental { .. }),
+                    uses_shared_selection: shared_identity.is_some_and(|identity| {
+                        decoded.sel().allocation_identity() == Some(identity)
+                    }),
+                    constant_zero,
+                    decoded,
+                }
             })
             .collect();
         let shared_selection_data = shared_selection_input
@@ -1273,6 +1347,11 @@ impl<'a> PreparedDirectGroupedAggregateInput<'a> {
     }
 
     #[inline(always)]
+    fn is_constant_zero(&self, source: usize) -> bool {
+        unsafe { self.inputs.get_unchecked(source).constant_zero }
+    }
+
+    #[inline(always)]
     fn filter_passes(&self, filter_slot: Option<usize>, row: usize) -> bool {
         let Some(filter_slot) = filter_slot else {
             return true;
@@ -1316,10 +1395,27 @@ impl<'a> PreparedDirectGroupedAggregateInput<'a> {
     }
 }
 
+fn decoded_decimal_is_constant_zero(
+    decoded: &DecodedVectorRef<'_>,
+    data: PreparedDecimalData,
+) -> bool {
+    let SelectionRef::Constant { index, .. } = decoded.sel() else {
+        return false;
+    };
+    if !decoded.validity().is_valid(*index) {
+        return false;
+    }
+    match data {
+        PreparedDecimalData::I64(data) => unsafe { *data.add(*index) == 0 },
+        PreparedDecimalData::I128(data) => unsafe { *data.add(*index) == 0 },
+    }
+}
+
 struct FixedReductionInputs<const N: usize> {
     input_data: [*const u8; N],
     scratch_data: [*mut u8; N],
     direct_mask: u8,
+    constant_zero_mask: u8,
     shared_selection: *const u32,
 }
 
@@ -1391,6 +1487,7 @@ fn prepare_fixed_reduction<const N: usize, const WIDTH_MASK: u8>(
     let mut input_data = [std::ptr::null(); N];
     let mut scratch_data = [std::ptr::null_mut(); N];
     let mut direct_mask = 0_u8;
+    let mut constant_zero_mask = 0_u8;
     for source_idx in 0..N {
         let input = &inputs.inputs[source_idx];
         let expects_i128 = WIDTH_MASK & (1_u8 << source_idx) != 0;
@@ -1413,6 +1510,9 @@ fn prepare_fixed_reduction<const N: usize, const WIDTH_MASK: u8>(
         } else if !input.uses_shared_selection {
             return None;
         }
+        if input.constant_zero {
+            constant_zero_mask |= 1_u8 << source_idx;
+        }
     }
     if direct_mask != ((1_u16 << N) - 1) as u8 && inputs.shared_selection_data.is_null() {
         return None;
@@ -1421,6 +1521,7 @@ fn prepare_fixed_reduction<const N: usize, const WIDTH_MASK: u8>(
         input_data,
         scratch_data,
         direct_mask,
+        constant_zero_mask,
         shared_selection: inputs.shared_selection_data,
     })
 }
@@ -1445,6 +1546,9 @@ fn reduce_fixed_inputs<const N: usize, const WIDTH_MASK: u8, S: DirectGroupSlotS
             unsafe { *prepared.shared_selection.add(row) as usize }
         };
         for source_idx in 0..N {
+            if prepared.constant_zero_mask & (1_u8 << source_idx) != 0 {
+                continue;
+            }
             let physical_row = if prepared.direct_mask & (1_u8 << source_idx) != 0 {
                 row
             } else {
@@ -1489,11 +1593,15 @@ fn clear_reduced_source(
     traversal: ReducedSlotTraversal,
 ) {
     let mut clear_slot = |slot: usize| match source {
-        DirectDecimalScratch::I64 { primary, fallback } => {
+        DirectDecimalScratch::I64 {
+            primary, fallback, ..
+        } => {
             primary[slot] = 0;
             fallback[slot] = 0;
         }
-        DirectDecimalScratch::I128 { primary, fallback } => {
+        DirectDecimalScratch::I128 {
+            primary, fallback, ..
+        } => {
             primary[slot] = 0;
             fallback[slot] = i256::ZERO;
         }

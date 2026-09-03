@@ -10,6 +10,7 @@ use parking_lot::Mutex;
 use paro_common::error::{self as paro_error, Result};
 use paro_common::vector::VECTOR_SIZE;
 
+use crate::operators::aggregate::grouped_aggregate_hashtable::AggregateHashRuntimeStats;
 use crate::operators::aggregate::radix_partitioned_aggregate_hashtable::{
     AggregateHashTable, ConcurrentRadixAggregateBuild,
 };
@@ -32,6 +33,34 @@ struct RadixMergePartition {
     partition_idx: usize,
     sources: Vec<AggregateHashTable>,
     distinct: Vec<DistinctAggregatePartition>,
+}
+
+fn partition_radix_merge_sources(
+    tables: Vec<AggregateHashTable>,
+    partition_count: usize,
+) -> Result<(Vec<RadixMergePartition>, AggregateHashRuntimeStats)> {
+    let mut work = (0..partition_count)
+        .map(|partition_idx| RadixMergePartition {
+            partition_idx,
+            sources: Vec::with_capacity(tables.len()),
+            distinct: Vec::new(),
+        })
+        .collect::<Vec<_>>();
+    let mut hash_runtime_stats = AggregateHashRuntimeStats::default();
+    for table in tables {
+        let bundle = table.into_scan_partitions();
+        hash_runtime_stats.merge(bundle.hash_runtime_stats);
+        if bundle.partitions.len() != partition_count {
+            return Err(paro_error::internal(format!(
+                "aggregate merge radix partition mismatch: expected={partition_count} actual={}",
+                bundle.partitions.len()
+            )));
+        }
+        for (partition_idx, partition) in bundle.partitions.into_iter().enumerate() {
+            work[partition_idx].sources.push(partition);
+        }
+    }
+    Ok((work, hash_runtime_stats))
 }
 
 #[derive(Debug)]
@@ -211,25 +240,8 @@ pub(super) fn prepare_parallel_radix_merge(
     let partition_count = result_table.radix_partition_count().ok_or_else(|| {
         paro_error::internal("parallel aggregate merge target is not radix partitioned")
     })?;
-    let mut work = (0..partition_count)
-        .map(|partition_idx| RadixMergePartition {
-            partition_idx,
-            sources: Vec::with_capacity(tables.len()),
-            distinct: Vec::new(),
-        })
-        .collect::<Vec<_>>();
-    for table in tables {
-        let partitions = table.into_scan_partitions();
-        if partitions.len() != partition_count {
-            return Err(paro_error::internal(format!(
-                "aggregate merge radix partition mismatch: expected={partition_count} actual={}",
-                partitions.len()
-            )));
-        }
-        for (partition_idx, partition) in partitions.into_iter().enumerate() {
-            work[partition_idx].sources.push(partition);
-        }
-    }
+    let (mut work, source_hash_runtime_stats) =
+        partition_radix_merge_sources(tables, partition_count)?;
     let distinct = handle.with_state_mut(|state| {
         let AggregateRuntimeState::Hash(global) = state else {
             return Err(paro_error::internal(
@@ -238,7 +250,7 @@ pub(super) fn prepare_parallel_radix_merge(
         };
         take_partitioned_distinct_work(spec, global, partition_count)
     })?;
-    let distinct_context = if let Some((context, partitions)) = distinct {
+    let mut distinct_context = if let Some((context, partitions)) = distinct {
         if partitions.len() != work.len() {
             return Err(paro_error::internal(format!(
                 "aggregate merge DISTINCT partition mismatch: merge={} distinct={}",
@@ -253,11 +265,91 @@ pub(super) fn prepare_parallel_radix_merge(
     } else {
         None
     };
-    let result = ConcurrentRadixAggregateBuild::try_new(result_table)?;
+    let mut result = ConcurrentRadixAggregateBuild::try_new(result_table)?;
+    result.merge_hash_runtime_stats(source_hash_runtime_stats);
+    if let Some(distinct) = distinct_context.as_mut() {
+        result.merge_hash_runtime_stats(distinct.take_hash_runtime_stats());
+    }
     Ok(Some(RadixMergeDriver::group(
         handle,
         result,
         distinct_context,
         work,
     )))
+}
+
+#[cfg(test)]
+mod tests {
+    use paro_common::chunk::Chunk;
+    use paro_common::test_utils::{
+        test_allocator, test_i32_vector_with_allocator, test_selection_with_capacity,
+        test_vector_with_capacity,
+    };
+    use paro_common::types::LogicalType;
+
+    use super::*;
+
+    #[test]
+    fn parallel_radix_source_bundle_preserves_runtime_stats_above_threshold() {
+        let allocator = test_allocator();
+        let row_count = PARALLEL_RADIX_MERGE_MIN_SOURCE_ROWS;
+        let values = (0..row_count as i32).collect::<Vec<_>>();
+        let groups = Chunk::from_vectors(
+            vec![test_i32_vector_with_allocator(&values, allocator.clone())],
+            allocator.clone(),
+        );
+        let mut source = AggregateHashTable::new_radix(
+            vec![LogicalType::Integer],
+            Vec::new(),
+            Vec::new(),
+            2,
+            allocator.clone(),
+        )
+        .expect("source radix table");
+        let hashes = source.hash_groups(&groups).expect("source hashes");
+        let mut addresses = test_vector_with_capacity(LogicalType::BigInt, row_count);
+        let mut new_groups = test_selection_with_capacity(row_count);
+        source
+            .find_or_create_groups(&groups, &hashes, &mut addresses, &mut new_groups)
+            .expect("source groups");
+        assert!(source.count() >= PARALLEL_RADIX_MERGE_MIN_SOURCE_ROWS);
+
+        let partition_count = source
+            .radix_partition_count()
+            .expect("source partition count");
+        let (work, source_stats) = partition_radix_merge_sources(vec![source], partition_count)
+            .expect("partition source work");
+        assert!(source_stats.max_radix_partition_skew_percent > 0);
+
+        let target = AggregateHashTable::new_radix(
+            vec![LogicalType::Integer],
+            Vec::new(),
+            Vec::new(),
+            2,
+            allocator,
+        )
+        .expect("target radix table");
+        let mut result = ConcurrentRadixAggregateBuild::try_new(target).expect("result build");
+        result.merge_hash_runtime_stats(source_stats);
+        for partition_work in work {
+            let mut target = result
+                .take_partition(partition_work.partition_idx)
+                .expect("take target partition");
+            target
+                .combine_sources(partition_work.sources)
+                .expect("combine source partition");
+            result
+                .install(partition_work.partition_idx, target)
+                .expect("install target partition");
+        }
+
+        let mut merged = result.finish().expect("finish result");
+        assert_eq!(merged.count(), row_count);
+        assert!(
+            merged
+                .take_hash_runtime_stats()
+                .max_radix_partition_skew_percent
+                > 0
+        );
+    }
 }

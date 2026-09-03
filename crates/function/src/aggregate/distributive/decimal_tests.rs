@@ -146,6 +146,89 @@ fn direct_decimal_program_fuses_shared_group_and_input_updates() {
 }
 
 #[test]
+fn direct_decimal_program_observes_constant_zero_without_losing_sum_semantics() {
+    let input_type = LogicalType::Decimal {
+        precision: 15,
+        scale: 2,
+    };
+    let (sum, _) = bind_sum(std::slice::from_ref(&input_type)).unwrap();
+    let (average, _) = bind_avg(std::slice::from_ref(&input_type)).unwrap();
+    let sum_offset = 0;
+    let average_offset = std::mem::size_of::<DecimalNarrowState>();
+    let mut program = crate::aggregate::DirectGroupedAggregateProgram::new(2);
+    assert!(program.try_add(0, sum.direct_update, sum_offset, Some(0), true));
+    assert!(program.try_add(1, average.direct_update, average_offset, Some(0), true));
+
+    let state_bytes = average_offset + std::mem::size_of::<DecimalAverageState>();
+    let mut storage = vec![0_u64; state_bytes.div_ceil(std::mem::size_of::<u64>())];
+    let base = storage.as_mut_ptr().cast::<u8>();
+    unsafe {
+        initialize_narrow(base.add(sum_offset));
+        initialize_average(base.add(average_offset));
+    }
+    let mut addresses = paro_common::test_utils::test_vector(LogicalType::BigInt);
+    addresses.set_count(3);
+    unsafe {
+        let address_data = addresses.flat_data_mut::<*mut u8>();
+        for row in 0..3 {
+            *address_data.add(row) = base;
+        }
+    }
+    let values = Vector::try_constant(input_type, 0_i64, 3, Arc::new(default_allocator())).unwrap();
+    let payload = paro_common::test_utils::test_chunk_from_vectors(vec![values]);
+
+    assert!(unsafe { program.execute(&payload, &addresses, 3) }.unwrap());
+    let sum = unsafe { &*base.add(sum_offset).cast::<DecimalNarrowState>() };
+    let average = unsafe { &*base.add(average_offset).cast::<DecimalAverageState>() };
+    assert!(sum.is_set());
+    assert_eq!(sum.value(), 0);
+    assert_eq!(average.value(), i256::ZERO);
+    assert_eq!(average.count, 3);
+}
+
+#[test]
+fn wide_direct_decimal_program_shares_constant_zero_lifecycle_semantics() {
+    let input_type = LogicalType::Decimal {
+        precision: 31,
+        scale: 4,
+    };
+    let (sum, _) = bind_sum(std::slice::from_ref(&input_type)).unwrap();
+    let (average, _) = bind_avg(std::slice::from_ref(&input_type)).unwrap();
+    let sum_offset = 0;
+    let average_offset = std::mem::size_of::<DecimalSumState>();
+    let mut program = crate::aggregate::DirectGroupedAggregateProgram::new(2);
+    assert!(program.try_add(0, sum.direct_update, sum_offset, Some(0), true));
+    assert!(program.try_add(1, average.direct_update, average_offset, Some(0), true));
+
+    let state_bytes = average_offset + std::mem::size_of::<DecimalAverageState>();
+    let mut storage = vec![0_u64; state_bytes.div_ceil(std::mem::size_of::<u64>())];
+    let base = storage.as_mut_ptr().cast::<u8>();
+    unsafe {
+        initialize_sum(base.add(sum_offset));
+        initialize_average(base.add(average_offset));
+    }
+    let mut addresses = paro_common::test_utils::test_vector(LogicalType::BigInt);
+    addresses.set_count(3);
+    unsafe {
+        let address_data = addresses.flat_data_mut::<*mut u8>();
+        for row in 0..3 {
+            *address_data.add(row) = base;
+        }
+    }
+    let values =
+        Vector::try_constant(input_type, 0_i128, 3, Arc::new(default_allocator())).unwrap();
+    let payload = paro_common::test_utils::test_chunk_from_vectors(vec![values]);
+
+    assert!(unsafe { program.execute(&payload, &addresses, 3) }.unwrap());
+    let sum = unsafe { &*base.add(sum_offset).cast::<DecimalSumState>() };
+    let average = unsafe { &*base.add(average_offset).cast::<DecimalAverageState>() };
+    assert!(sum.is_set());
+    assert_eq!(sum.try_i128(), Some(0));
+    assert_eq!(average.value(), i256::ZERO);
+    assert_eq!(average.count, 3);
+}
+
+#[test]
 fn direct_decimal_program_uses_the_bound_i128_physical_width() {
     let input_type = LogicalType::Decimal {
         precision: 31,

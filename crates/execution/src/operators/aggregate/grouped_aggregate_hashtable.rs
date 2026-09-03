@@ -26,7 +26,12 @@ use super::aggregate_kernel::{
 };
 use super::aggregate_object::{compile_direct_update_program, AggregateObject};
 use super::aggregate_state::AggregateStateLayout;
+#[cfg(test)]
 use super::group_hash::hash_group_columns;
+use super::group_hash::{
+    hash_group_columns_prefix, AggregateHashContract, GroupHashScratch, IncomingHashContract,
+    LookupHashContract, RoutingHashContract,
+};
 use super::tuple_layout::{TupleLayout, TupleScatterSource, VarlenHeap};
 use adaptive_integer_index::AdaptiveIntegerGroupIndexState;
 
@@ -34,6 +39,35 @@ const MIN_CAPACITY: usize = 8;
 const LOAD_FACTOR_NUMERATOR: usize = 3; // 0.6
 const LOAD_FACTOR_DENOMINATOR: usize = 5;
 const INLINE_KEY_MAX_BYTES: usize = 8;
+/// A planned prefix is only an optimization hint. Once a probe crosses this
+/// bound, the table rebuilds its lookup index from the complete serialized
+/// keys. This caps the amount of work that a stale or correlated NDV estimate
+/// can impose before the estimate is discarded.
+pub(crate) const MAX_PREFIX_PROBE_DISTANCE: usize = 32;
+
+#[must_use = "aggregate hash telemetry must be merged into its operator-level owner"]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) struct AggregateHashRuntimeStats {
+    pub full_key_fallback_count: u64,
+    pub max_prefix_probe_distance: u64,
+    /// 100 means perfectly balanced; e.g. 400 means the hottest radix
+    /// partition received four times its ideal share of a routed batch.
+    pub max_radix_partition_skew_percent: u64,
+}
+
+impl AggregateHashRuntimeStats {
+    pub(crate) fn merge(&mut self, other: Self) {
+        self.full_key_fallback_count = self
+            .full_key_fallback_count
+            .saturating_add(other.full_key_fallback_count);
+        self.max_prefix_probe_distance = self
+            .max_prefix_probe_distance
+            .max(other.max_prefix_probe_distance);
+        self.max_radix_partition_skew_percent = self
+            .max_radix_partition_skew_percent
+            .max(other.max_radix_partition_skew_percent);
+    }
+}
 
 /// Soft upper bound for eager hash-table allocation.
 ///
@@ -51,6 +85,48 @@ pub(crate) struct HashTableCapacityHint {
 pub(crate) struct HashTableGrowthRequirement {
     pub persistent_bytes: usize,
     pub overlap_bytes: usize,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum HashTableInitialSizing {
+    Minimum,
+    Fixed(usize),
+    Estimated(HashTableCapacityHint),
+}
+
+/// Construction policy for a flat aggregate table. Hash semantics and sizing
+/// travel as one value instead of being encoded by a growing matrix of
+/// similarly named constructors.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct GroupedAggregateHashTableConfig {
+    hash_contract: AggregateHashContract,
+    sizing: HashTableInitialSizing,
+}
+
+impl GroupedAggregateHashTableConfig {
+    pub(crate) fn minimum(hash_contract: AggregateHashContract) -> Self {
+        Self {
+            hash_contract,
+            sizing: HashTableInitialSizing::Minimum,
+        }
+    }
+
+    pub(crate) fn estimated(
+        hash_contract: AggregateHashContract,
+        capacity_hint: HashTableCapacityHint,
+    ) -> Self {
+        Self {
+            hash_contract,
+            sizing: HashTableInitialSizing::Estimated(capacity_hint),
+        }
+    }
+
+    pub(crate) fn fixed(hash_contract: AggregateHashContract, capacity: usize) -> Self {
+        Self {
+            hash_contract,
+            sizing: HashTableInitialSizing::Fixed(capacity),
+        }
+    }
 }
 
 impl HashTableCapacityHint {
@@ -275,6 +351,11 @@ pub struct GroupedAggregateHashTable {
     count: usize,
     capacity: usize,
     bitmask: usize,
+    /// Owns both the immutable full-key routing policy and the adaptive lookup
+    /// policy. Keeping them in a single typed contract prevents insertion,
+    /// spill, and merge paths from silently exchanging two bare widths.
+    hash_contract: AggregateHashContract,
+    hash_runtime_stats: AggregateHashRuntimeStats,
 }
 
 impl GroupedAggregateHashTable {
@@ -303,33 +384,14 @@ impl GroupedAggregateHashTable {
         allocator: Arc<dyn Allocator>,
         memory: MemoryAccountingContext,
     ) -> Result<Self> {
-        Self::with_capacity(
+        let hash_contract = AggregateHashContract::try_new(group_types.len(), group_types.len())?;
+        Self::new_configured(
             group_types,
             aggregate_objects,
             aggregate_inputs,
-            MIN_CAPACITY,
             allocator,
             memory,
-        )
-    }
-
-    pub(crate) fn new_with_memory_capacity_hint(
-        group_types: Vec<LogicalType>,
-        aggregate_objects: Vec<AggregateObject>,
-        aggregate_inputs: Vec<Vec<usize>>,
-        allocator: Arc<dyn Allocator>,
-        memory: MemoryAccountingContext,
-        capacity_hint: HashTableCapacityHint,
-    ) -> Result<Self> {
-        let initial_capacity =
-            initial_capacity_for_hint(&group_types, &aggregate_objects, capacity_hint)?;
-        Self::with_capacity(
-            group_types,
-            aggregate_objects,
-            aggregate_inputs,
-            initial_capacity,
-            allocator,
-            memory,
+            GroupedAggregateHashTableConfig::minimum(hash_contract),
         )
     }
 
@@ -371,7 +433,40 @@ impl GroupedAggregateHashTable {
         allocator: Arc<dyn Allocator>,
         memory: MemoryAccountingContext,
     ) -> Result<Self> {
+        let hash_contract = AggregateHashContract::try_new(group_types.len(), group_types.len())?;
+        Self::new_configured(
+            group_types,
+            aggregate_objects,
+            aggregate_inputs,
+            allocator,
+            memory,
+            GroupedAggregateHashTableConfig::fixed(hash_contract, initial_capacity),
+        )
+    }
+
+    pub(crate) fn new_configured(
+        group_types: Vec<LogicalType>,
+        aggregate_objects: Vec<AggregateObject>,
+        aggregate_inputs: Vec<Vec<usize>>,
+        allocator: Arc<dyn Allocator>,
+        memory: MemoryAccountingContext,
+        config: GroupedAggregateHashTableConfig,
+    ) -> Result<Self> {
+        if config.hash_contract.key_width() != group_types.len() {
+            return Err(paro_error::internal(format!(
+                "Aggregate hash contract/key mismatch: contract={}, groups={}",
+                config.hash_contract.key_width(),
+                group_types.len()
+            )));
+        }
         validate_aggregate_inputs(&aggregate_objects, &aggregate_inputs)?;
+        let initial_capacity = match config.sizing {
+            HashTableInitialSizing::Minimum => MIN_CAPACITY,
+            HashTableInitialSizing::Fixed(capacity) => capacity,
+            HashTableInitialSizing::Estimated(hint) => {
+                initial_capacity_for_hint(&group_types, &aggregate_objects, hint)?
+            }
+        };
         let layout = TupleLayout::build(&group_types, &aggregate_objects)?;
         let state_layout = AggregateStateLayout::new(&aggregate_objects)?;
         let direct_update_program = {
@@ -439,6 +534,8 @@ impl GroupedAggregateHashTable {
             count: 0,
             capacity,
             bitmask,
+            hash_contract: config.hash_contract,
+            hash_runtime_stats: AggregateHashRuntimeStats::default(),
         })
     }
 
@@ -466,7 +563,30 @@ impl GroupedAggregateHashTable {
     /// Hash grouped keys using Paro vector hash implementation.
     pub fn hash_groups(&self, groups: &Chunk) -> Result<Vector> {
         self.validate_group_chunk(groups)?;
-        hash_group_columns(groups)
+        hash_group_columns_prefix(groups, self.hash_contract.lookup().width())
+    }
+
+    pub(crate) fn hash_routing_groups(&self, groups: &Chunk) -> Result<Vector> {
+        self.validate_group_chunk(groups)?;
+        hash_group_columns_prefix(groups, self.hash_contract.routing().width())
+    }
+
+    pub(crate) fn hash_groups_with_scratch<'a>(
+        &self,
+        groups: &Chunk,
+        scratch: &'a mut GroupHashScratch,
+    ) -> Result<&'a Vector> {
+        self.validate_group_chunk(groups)?;
+        scratch.hash_prefix(groups, self.hash_contract.lookup().width())
+    }
+
+    pub(crate) fn take_hash_runtime_stats(&mut self) -> AggregateHashRuntimeStats {
+        std::mem::take(&mut self.hash_runtime_stats)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn merge_hash_runtime_stats(&mut self, stats: AggregateHashRuntimeStats) {
+        self.hash_runtime_stats.merge(stats);
     }
 
     pub(crate) fn varlen_bytes_upper_bound(
@@ -488,6 +608,39 @@ impl GroupedAggregateHashTable {
         addresses: &mut Vector,
         new_groups: &mut SelectionVector,
     ) -> Result<usize> {
+        self.find_or_create_groups_with_hash_contract(
+            groups,
+            hashes,
+            IncomingHashContract::Lookup(self.hash_contract.lookup()),
+            addresses,
+            new_groups,
+        )
+    }
+
+    pub(crate) fn find_or_create_groups_with_routing_hashes(
+        &mut self,
+        groups: &Chunk,
+        hashes: &Vector,
+        addresses: &mut Vector,
+        new_groups: &mut SelectionVector,
+    ) -> Result<usize> {
+        self.find_or_create_groups_with_hash_contract(
+            groups,
+            hashes,
+            IncomingHashContract::Routing(self.hash_contract.routing()),
+            addresses,
+            new_groups,
+        )
+    }
+
+    fn find_or_create_groups_with_hash_contract(
+        &mut self,
+        groups: &Chunk,
+        hashes: &Vector,
+        incoming_contract: IncomingHashContract,
+        addresses: &mut Vector,
+        new_groups: &mut SelectionVector,
+    ) -> Result<usize> {
         self.validate_group_chunk(groups)?;
         validate_hashes(hashes, groups.size())?;
         let hash_format = hashes.try_decode_ref(groups.size())?;
@@ -495,6 +648,7 @@ impl GroupedAggregateHashTable {
         self.find_or_create_groups_with(
             groups,
             groups.size(),
+            incoming_contract,
             |input_idx| input_idx,
             |_, source_row| {
                 let hash_idx = hash_format.physical_index(source_row);
@@ -522,6 +676,7 @@ impl GroupedAggregateHashTable {
         groups: &Chunk,
         source_rows: &[u32],
         hashes: &[u64],
+        incoming_contract: IncomingHashContract,
         addresses: &mut Vector,
         new_groups: &mut SelectionVector,
     ) -> Result<usize> {
@@ -544,6 +699,7 @@ impl GroupedAggregateHashTable {
         self.find_or_create_groups_with(
             groups,
             source_rows.len(),
+            incoming_contract,
             |input_idx| source_rows[input_idx] as usize,
             |input_idx, _| Ok(hashes[input_idx]),
             addresses,
@@ -555,6 +711,7 @@ impl GroupedAggregateHashTable {
         &mut self,
         groups: &Chunk,
         input_row_count: usize,
+        incoming_contract: IncomingHashContract,
         source_row_at: impl Fn(usize) -> usize,
         hash_at: impl Fn(usize, usize) -> Result<u64>,
         addresses: &mut Vector,
@@ -576,6 +733,22 @@ impl GroupedAggregateHashTable {
         self.ensure_capacity_for(input_row_count)?;
         self.ensure_row_storage_capacity(input_row_count)?;
 
+        if incoming_contract.width() > self.layout.group_count() {
+            return Err(paro_error::internal(format!(
+                "Invalid incoming aggregate hash contract: groups={}, contract={incoming_contract:?}",
+                self.layout.group_count(),
+            )));
+        }
+        let recalculated_hashes =
+            if incoming_contract.width() == self.hash_contract.lookup().width() {
+                None
+            } else {
+                Some(hash_group_columns_prefix(
+                    groups,
+                    self.hash_contract.lookup().width(),
+                )?)
+            };
+
         let address_data = unsafe { addresses.flat_data_mut::<*mut u8>() };
         let mut new_state_ptrs = Vec::new();
         if new_groups.capacity() < input_row_count {
@@ -585,14 +758,21 @@ impl GroupedAggregateHashTable {
         new_groups.set_len(input_row_count);
         let new_group_data = new_groups.as_mut_slice().as_mut_ptr();
         let mut new_group_count = 0usize;
+        let observe_prefix_probes = self.hash_contract.lookup_is_prefix();
+        let mut max_prefix_probe_distance = 0usize;
         let inline_key_layout = self.inline_key_layout.clone();
         if let Some(inline_layout) = inline_key_layout {
             let inline_key_data = self.inline_key_storage_mut_ptr()?;
             for input_idx in 0..input_row_count {
                 let row_idx = source_row_at(input_idx);
-                let hash = hash_at(input_idx, row_idx)?;
+                let hash = if let Some(hashes) = recalculated_hashes.as_ref() {
+                    hashes.as_slice::<u64>()[row_idx]
+                } else {
+                    hash_at(input_idx, row_idx)?
+                };
                 let inline_key = inline_layout.encode_row(groups, row_idx)?;
                 let mut slot = self.slot_for_hash(hash);
+                let mut probe_distance = 0usize;
                 loop {
                     let entry = self.entries[slot];
                     if !entry.is_occupied() {
@@ -631,14 +811,23 @@ impl GroupedAggregateHashTable {
                         break;
                     }
 
+                    probe_distance += 1;
+                    if observe_prefix_probes {
+                        max_prefix_probe_distance = max_prefix_probe_distance.max(probe_distance);
+                    }
                     slot = (slot + 1) & self.bitmask;
                 }
             }
         } else {
             for input_idx in 0..input_row_count {
                 let row_idx = source_row_at(input_idx);
-                let hash = hash_at(input_idx, row_idx)?;
+                let hash = if let Some(hashes) = recalculated_hashes.as_ref() {
+                    hashes.as_slice::<u64>()[row_idx]
+                } else {
+                    hash_at(input_idx, row_idx)?
+                };
                 let mut slot = self.slot_for_hash(hash);
+                let mut probe_distance = 0usize;
                 loop {
                     let entry = self.entries[slot];
                     if !entry.is_occupied() {
@@ -676,10 +865,20 @@ impl GroupedAggregateHashTable {
                         break;
                     }
 
+                    probe_distance += 1;
+                    if observe_prefix_probes {
+                        max_prefix_probe_distance = max_prefix_probe_distance.max(probe_distance);
+                    }
                     slot = (slot + 1) & self.bitmask;
                 }
             }
         }
+
+        // Strategy transitions happen only after the data-plane batch has
+        // released every lookup-sidecar pointer. Besides keeping the unsafe
+        // aliasing contract honest, this bounds a bad prefix hint to one
+        // vector batch before the canonical rows rebuild a full-key index.
+        self.finish_prefix_probe_batch(max_prefix_probe_distance)?;
 
         if !new_state_ptrs.is_empty() {
             let new_addresses = pointer_vector_from_slice(&new_state_ptrs, self.allocator())?;
@@ -1094,10 +1293,11 @@ impl GroupedAggregateHashTable {
 
         for row in 0..batch_size {
             let source_ptr = self.row_ptr(position.offset + row);
+            let hash = self.serialized_routing_hash(position.offset + row)?;
             result
                 .column_mut(0)
                 .ok_or_else(|| paro_error::internal("Missing aggregate state hash column"))?
-                .set_value(row, &Value::UBigInt(self.layout.load_hash(source_ptr)));
+                .set_value(row, &Value::UBigInt(hash));
             for group_idx in 0..group_count {
                 let value = self.layout.deserialize_group_value(
                     source_ptr,
@@ -1161,12 +1361,13 @@ impl GroupedAggregateHashTable {
 
         for row in 0..batch_size {
             let source_ptr = self.row_ptr(position.offset + row);
+            let hash = self.serialized_routing_hash(position.offset + row)?;
             result
                 .column_mut(0)
                 .ok_or_else(|| {
                     paro_error::internal("Missing aggregate serialized state hash column")
                 })?
-                .set_value(row, &Value::UBigInt(self.layout.load_hash(source_ptr)));
+                .set_value(row, &Value::UBigInt(hash));
             for group_idx in 0..group_count {
                 let value = self.layout.deserialize_group_value(
                     source_ptr,
@@ -1331,8 +1532,111 @@ impl GroupedAggregateHashTable {
         if let Some(inline_keys) = self.inline_keys.as_mut() {
             inline_keys.try_resize_with(new_capacity, InlineKey::default)?;
         }
+        self.rebuild_lookup_index(new_capacity)?;
+        self.capacity = new_capacity;
+        self.bitmask = new_capacity - 1;
+        Ok(())
+    }
+
+    /// Publish one batch's work under the speculative prefix contract and, if
+    /// needed, perform its one-way transition at the batch boundary.
+    fn finish_prefix_probe_batch(&mut self, max_probe_distance: usize) -> Result<()> {
+        if !self.hash_contract.lookup_is_prefix() {
+            return Ok(());
+        }
+        self.hash_runtime_stats.max_prefix_probe_distance = self
+            .hash_runtime_stats
+            .max_prefix_probe_distance
+            .max(max_probe_distance as u64);
+        if max_probe_distance >= MAX_PREFIX_PROBE_DISTANCE {
+            self.promote_lookup_hash_to_full()?;
+        }
+        Ok(())
+    }
+
+    /// Replace a speculative prefix lookup index with a full-key index.
+    ///
+    /// Tuple rows and aggregate states are canonical and never move. Only the
+    /// stored hash and lookup sidecars are rebuilt, so every state address
+    /// already returned for the current batch remains valid.
+    fn promote_lookup_hash_to_full(&mut self) -> Result<bool> {
+        if !self.hash_contract.lookup_is_prefix() {
+            return Ok(false);
+        }
+        let full_group_count = self.hash_contract.routing().width();
+        for row_idx in 0..self.count {
+            let row = self.row_ptr(row_idx);
+            let hash = unsafe {
+                self.layout.hash_serialized_group_prefix(
+                    row,
+                    full_group_count,
+                    &self.varlen_heap,
+                )?
+            };
+            self.layout.store_hash(row.cast_mut(), hash);
+        }
+        self.rebuild_lookup_index(self.capacity)?;
+        let promoted = self.hash_contract.promote_lookup_to_full();
+        debug_assert!(promoted);
+        self.hash_runtime_stats.full_key_fallback_count = self
+            .hash_runtime_stats
+            .full_key_fallback_count
+            .saturating_add(1);
+        Ok(true)
+    }
+
+    pub(super) fn lookup_hash_contract(&self) -> LookupHashContract {
+        self.hash_contract.lookup()
+    }
+
+    pub(super) fn routing_hash_contract(&self) -> RoutingHashContract {
+        self.hash_contract.routing()
+    }
+
+    pub(super) fn serialized_hash_for_lookup_contract(
+        &self,
+        row_idx: usize,
+        contract: LookupHashContract,
+    ) -> Result<u64> {
+        self.serialized_hash_for_contract(row_idx, IncomingHashContract::Lookup(contract))
+    }
+
+    pub(super) fn serialized_routing_hash(&self, row_idx: usize) -> Result<u64> {
+        self.serialized_hash_for_contract(
+            row_idx,
+            IncomingHashContract::Routing(self.hash_contract.routing()),
+        )
+    }
+
+    fn serialized_hash_for_contract(
+        &self,
+        row_idx: usize,
+        contract: IncomingHashContract,
+    ) -> Result<u64> {
+        if row_idx >= self.count {
+            return Err(paro_error::internal(format!(
+                "Serialized group hash row out of bounds: row={row_idx}, count={}",
+                self.count
+            )));
+        }
+        if contract.width() == self.hash_contract.lookup().width() {
+            return Ok(self.layout.load_hash(self.row_ptr(row_idx)));
+        }
+        unsafe {
+            self.layout.hash_serialized_group_prefix(
+                self.row_ptr(row_idx),
+                contract.width(),
+                &self.varlen_heap,
+            )
+        }
+    }
+
+    fn rebuild_lookup_index(&mut self, capacity: usize) -> Result<()> {
         self.entries.fill(AggregateHTEntry::empty());
-        let new_bitmask = new_capacity - 1;
+        if let Some(inline_keys) = self.inline_keys.as_mut() {
+            inline_keys.fill(InlineKey::default());
+        }
+        let new_bitmask = capacity - 1;
         for row_idx in 0..self.count {
             let hash = self.layout.load_hash(self.row_ptr(row_idx));
             let inline_key = self
@@ -1355,8 +1659,6 @@ impl GroupedAggregateHashTable {
                 slot = (slot + 1) & new_bitmask;
             }
         }
-        self.capacity = new_capacity;
-        self.bitmask = new_bitmask;
         Ok(())
     }
 
@@ -1398,6 +1700,13 @@ impl GroupedAggregateHashTable {
                 "Cannot combine hash tables with different key modes: left_inline_width={:?}, right_inline_width={:?}",
                 self.inline_key_width(),
                 other.inline_key_width()
+            )));
+        }
+        if self.hash_contract.routing() != other.hash_contract.routing() {
+            return Err(paro_error::internal(format!(
+                "Cannot combine hash tables with different routing contracts: left={:?}, right={:?}",
+                self.hash_contract.routing(),
+                other.hash_contract.routing()
             )));
         }
         if self.aggregate_objects.len() != other.aggregate_objects.len() {

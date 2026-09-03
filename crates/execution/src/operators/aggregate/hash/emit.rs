@@ -46,6 +46,7 @@ impl HashAggregateEmitSourceExec {
             handle,
             work: parking_lot::Mutex::new(None),
             work_count: AtomicUsize::new(0),
+            row_count: AtomicUsize::new(0),
         });
         if global.handle.is_finalized() {
             initialize_work(ctx.query, &global)?;
@@ -401,6 +402,8 @@ fn initialize_work(
         .unregister_reclaimer_by_name(&AggregateFinalizedStateReclaimer::name_for(&global.handle));
 
     let mut work = std::collections::VecDeque::new();
+    let mut row_count = 0usize;
+    let mut spilled = false;
     if let Some(state) = global.handle.take_state()? {
         let AggregateRuntimeState::Hash(state) = state else {
             return Err(paro_error::internal(
@@ -408,6 +411,7 @@ fn initialize_work(
             ));
         };
         if let Some(spilled_outputs) = state.spilled_outputs {
+            spilled = true;
             for (grouping_idx, output) in spilled_outputs.into_iter().enumerate() {
                 if let Some(output) = output {
                     work.push_back(HashAggregateEmitWork::Spilled {
@@ -418,7 +422,14 @@ fn initialize_work(
             }
         } else {
             for (grouping_idx, table) in state.tables.into_iter().enumerate() {
-                for table in table.into_scan_partitions() {
+                row_count = row_count.saturating_add(table.count());
+                let bundle = table.into_scan_partitions();
+                debug_assert_eq!(
+                    bundle.hash_runtime_stats,
+                    Default::default(),
+                    "aggregate hash runtime observations must be drained before emit"
+                );
+                for table in bundle.partitions {
                     work.push_back(HashAggregateEmitWork::Table {
                         grouping_idx,
                         table,
@@ -427,6 +438,12 @@ fn initialize_work(
             }
         }
     }
+    if spilled {
+        // A spilled reader does not expose cardinality without consuming its
+        // stream. Preserve work-unit parallelism rather than guessing low.
+        row_count = work.len().saturating_mul(VECTOR_SIZE);
+    }
+    global.row_count.store(row_count, Ordering::Release);
     global.work_count.store(work.len(), Ordering::Release);
     *shared_work = Some(work);
     Ok(())
