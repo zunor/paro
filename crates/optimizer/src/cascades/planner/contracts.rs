@@ -331,6 +331,9 @@ pub(super) fn planner_cost_composition(
     if metadata.operator_type == LogicalOperatorType::EmptyResult {
         return Ok(CostComposition::LocalOnly);
     }
+    if let Some(source) = facts.scan_work_source {
+        return Ok(CostComposition::Source { source });
+    }
     let overlapping_children = match flavor {
         PhysicalImplementationFlavor::HashJoin
         | PhysicalImplementationFlavor::HashJoinBuildLeft
@@ -376,7 +379,7 @@ pub(super) fn planner_cost_composition(
         let retained = runtime_filtered_probe_work(
             probe,
             build_domain,
-            RuntimeFilterProbeMultiplicity::Unknown,
+            facts.runtime_filter_build_left_probe_multiplicity,
             hard_exact || resource.expects_exact_single_key(build_domain.expected),
         )?;
         let ratio_ppm = |retained: f64, source: f64| {
@@ -389,24 +392,28 @@ pub(super) fn planner_cost_composition(
         return Ok(CostComposition::SidewaysFilter {
             overlapping_children,
             filtered_child: 1,
+            source: match facts.runtime_filter_build_left_probe_work_source {
+                Some(source) => source,
+                None => {
+                    return Ok(CostComposition::RetainedState {
+                        overlapping_children,
+                    })
+                }
+            },
             expected_retained_ppm: ratio_ppm(retained.expected, probe.expected),
             upper_retained_ppm: ratio_ppm(retained.upper, probe.upper),
         });
     }
     if flavor == PhysicalImplementationFlavor::HashJoinRuntimeFilter {
-        // Scaling a child winner is valid only while this region owns the
-        // rowset boundary being reduced. Once lineage crosses another join,
-        // that child's winner may already contain a sideways filter on the
-        // same scan; independently scaling the whole subtree double-counts
-        // predicate work and I/O. The non-local artifact remains enumerable
-        // and pays/saves its local work, but child-boundary reduction requires
-        // a future composite-region JointCostProof that orders all filters.
-        if !facts.runtime_filter_probe_is_direct {
+        let Some(source) = facts.runtime_filter_probe_source_rows else {
             return Ok(CostComposition::RetainedState {
                 overlapping_children,
             });
-        }
-        let Some(source) = facts.runtime_filter_probe_source_rows else {
+        };
+        let Some(work_source) = facts.runtime_filter_probe_work_source else {
+            // A union or otherwise plural source cannot be represented by one
+            // disjoint source-work lane. Keep the physical artifact, but do
+            // not claim a child-boundary cost reduction without that proof.
             return Ok(CostComposition::RetainedState {
                 overlapping_children,
             });
@@ -448,6 +455,7 @@ pub(super) fn planner_cost_composition(
         return Ok(CostComposition::SidewaysFilter {
             overlapping_children,
             filtered_child: 0,
+            source: work_source,
             expected_retained_ppm: ratio_ppm(retained.expected, source.expected),
             upper_retained_ppm: ratio_ppm(retained.upper, source.upper),
         });

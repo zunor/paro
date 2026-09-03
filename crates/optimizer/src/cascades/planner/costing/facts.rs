@@ -16,6 +16,17 @@ pub(in crate::cascades::planner) fn planner_cost_facts(
         .map(|child| planner_row_width(child, scan_access_cost))
         .collect::<Vec<_>>()
         .into_boxed_slice();
+    let child_materialization_risk_rows = children
+        .iter()
+        .map(|child| {
+            child
+                .stats
+                .materialization_risk_cardinality
+                .or_else(|| child.stats.estimated_cardinality.map(|rows| rows.max))
+                .unwrap_or(1)
+        })
+        .collect::<Vec<_>>()
+        .into_boxed_slice();
     let output_row_width = planner_row_width(plan, scan_access_cost);
     let hash_key_width = match &plan.operator {
         LogicalOperator::Aggregate(aggregate) => Some(
@@ -54,6 +65,10 @@ pub(in crate::cascades::planner) fn planner_cost_facts(
         LogicalOperator::Get(get) => Some(planner_scan_access_width(get, scan_access_cost)),
         _ => None,
     };
+    let scan_work_source = match &plan.operator {
+        LogicalOperator::Get(get) if get.table.is_some() => Some(WorkSourceId(get.table_index)),
+        _ => None,
+    };
     let perfect_hash = match &plan.operator {
         LogicalOperator::Aggregate(aggregate) => {
             crate::physical::aggregate_planning::plan_perfect_hash_aggregate(
@@ -74,7 +89,23 @@ pub(in crate::cascades::planner) fn planner_cost_facts(
         _ => None,
     };
     let runtime_filter_probe_multiplicity = match &plan.operator {
-        LogicalOperator::Join(Join::Comparison(join)) => runtime_filter_probe_multiplicity(join),
+        LogicalOperator::Join(Join::Comparison(join)) => infer_runtime_filter_probe_multiplicity(
+            &join.left,
+            join.conditions
+                .iter()
+                .filter(|condition| condition.comparison == JoinComparisonType::Equal)
+                .map(|condition| &condition.left),
+        ),
+        _ => RuntimeFilterProbeMultiplicity::Unknown,
+    };
+    let runtime_filter_build_left_probe_multiplicity = match &plan.operator {
+        LogicalOperator::Join(Join::Comparison(join)) => infer_runtime_filter_probe_multiplicity(
+            &join.right,
+            join.conditions
+                .iter()
+                .filter(|condition| condition.comparison == JoinComparisonType::Equal)
+                .map(|condition| &condition.right),
+        ),
         _ => RuntimeFilterProbeMultiplicity::Unknown,
     };
     let runtime_filter_probe_source_rows = match &plan.operator {
@@ -83,11 +114,17 @@ pub(in crate::cascades::planner) fn planner_cost_facts(
         }
         _ => None,
     };
-    let runtime_filter_probe_is_direct = match &plan.operator {
+    let runtime_filter_probe_work_source = match &plan.operator {
         LogicalOperator::Join(Join::Comparison(join)) => {
-            super::runtime_filter_probe_is_direct(join)
+            super::runtime_filter_probe_work_source(join)
         }
-        _ => false,
+        _ => None,
+    };
+    let runtime_filter_build_left_probe_work_source = match &plan.operator {
+        LogicalOperator::Join(Join::Comparison(join)) => {
+            super::runtime_filter_build_left_probe_work_source(join)
+        }
+        _ => None,
     };
     let runtime_filter_build_distinct_expected = match &plan.operator {
         LogicalOperator::Join(Join::Comparison(join)) => {
@@ -107,14 +144,18 @@ pub(in crate::cascades::planner) fn planner_cost_facts(
     };
     Ok(PlannerCostFacts {
         child_row_widths,
+        child_materialization_risk_rows,
         output_row_width,
         hash_key_width,
         scan_access_width,
+        scan_work_source,
         perfect_hash,
         topn_capacity,
         runtime_filter_probe_multiplicity,
+        runtime_filter_build_left_probe_multiplicity,
         runtime_filter_probe_source_rows,
-        runtime_filter_probe_is_direct,
+        runtime_filter_probe_work_source,
+        runtime_filter_build_left_probe_work_source,
         runtime_filter_build_distinct_expected,
         runtime_filter_key_types,
     })
@@ -208,17 +249,23 @@ pub(in crate::cascades::planner) fn expression_cost_facts(
         output_rows_hard_upper,
         child_rows_hard_upper,
         child_row_widths: template.child_row_widths.clone(),
+        child_materialization_risk_rows: template.child_materialization_risk_rows.clone(),
         output_row_width: template.output_row_width,
         hash_key_width: template.hash_key_width,
         scan_access_width: template.scan_access_width,
+        scan_work_source: template.scan_work_source,
         perfect_hash: template.perfect_hash,
         topn_capacity: template.topn_capacity,
         runtime_filter_probe_multiplicity: template.runtime_filter_probe_multiplicity,
+        runtime_filter_build_left_probe_multiplicity: template
+            .runtime_filter_build_left_probe_multiplicity,
         runtime_filter_probe_source_rows: template
             .runtime_filter_probe_source_rows
             .map(|rows| CompactRange::new(rows.min as f64, rows.expected as f64, rows.max as f64))
             .transpose()?,
-        runtime_filter_probe_is_direct: template.runtime_filter_probe_is_direct,
+        runtime_filter_probe_work_source: template.runtime_filter_probe_work_source,
+        runtime_filter_build_left_probe_work_source: template
+            .runtime_filter_build_left_probe_work_source,
         runtime_filter_build_distinct_expected: template.runtime_filter_build_distinct_expected,
         runtime_filter_key_types: template.runtime_filter_key_types.clone(),
     })
@@ -251,10 +298,17 @@ fn runtime_filter_build_distinct_expected(
         .filter(|distinct| *distinct > 0)
 }
 
-fn runtime_filter_probe_multiplicity(
-    join: &paro_planner::operator::ComparisonJoin,
+fn infer_runtime_filter_probe_multiplicity<'a>(
+    plan: &LogicalPlan,
+    equality_expressions: impl IntoIterator<Item = &'a Expression>,
 ) -> RuntimeFilterProbeMultiplicity {
-    let get = match &join.left.operator {
+    let equality_expressions = equality_expressions.into_iter().collect::<Vec<_>>();
+    if !equality_expressions.is_empty()
+        && crate::statistics::unique_keys::expressions_cover_unique_key(plan, &equality_expressions)
+    {
+        return RuntimeFilterProbeMultiplicity::DeclaredUnique;
+    }
+    let get = match &plan.operator {
         LogicalOperator::Get(get) => get,
         LogicalOperator::Filter(filter) if filter.projection_map.is_all() => {
             let LogicalOperator::Get(get) = &filter.child.operator else {
@@ -264,31 +318,13 @@ fn runtime_filter_probe_multiplicity(
         }
         _ => return RuntimeFilterProbeMultiplicity::Unknown,
     };
-    let equality_bindings = join
-        .conditions
-        .iter()
-        .filter_map(|condition| {
-            if condition.comparison != JoinComparisonType::Equal {
-                return None;
-            }
-            match &condition.left {
-                Expression::ColumnRef(column) if column.depth == 0 => Some(column.binding),
-                _ => None,
-            }
+    let equality_bindings = equality_expressions
+        .into_iter()
+        .filter_map(|expression| match expression {
+            Expression::ColumnRef(column) if column.depth == 0 => Some(column.binding),
+            _ => None,
         })
         .collect::<std::collections::HashSet<_>>();
-    if crate::statistics::unique_keys::declared_unique_keys(get)
-        .iter()
-        .any(|key| {
-            !key.bindings.is_empty()
-                && key
-                    .bindings
-                    .iter()
-                    .all(|binding| equality_bindings.contains(binding))
-        })
-    {
-        return RuntimeFilterProbeMultiplicity::DeclaredUnique;
-    }
     let bindings = equality_bindings.iter().copied().collect::<Vec<_>>();
     let [binding] = bindings.as_slice() else {
         return RuntimeFilterProbeMultiplicity::Unknown;

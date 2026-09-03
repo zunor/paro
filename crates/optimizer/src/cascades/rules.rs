@@ -267,6 +267,35 @@ pub enum GrantDependencyDescriptor {
     Sensitive,
 }
 
+/// Query-local identity of one base row source. Binder table indexes are
+/// unique across aliases, so self joins remain distinct while equivalent Memo
+/// expressions retain the same source identity.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub struct WorkSourceId(pub usize);
+
+/// A disjoint portion of a winner's work proven to belong to one base source.
+/// The contained cost is work-only: memory and external-resource contracts
+/// remain on the complete winner and are never weakened by selectivity.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct SourceFilterWork {
+    pub expected_retained_ppm: u32,
+    pub upper_retained_ppm: u32,
+    /// Cost of evaluating this predicate against the unfiltered source. Joint
+    /// composition orders and scales these costs by preceding predicates.
+    pub full_apply_cost: SearchCost,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct SourceWork {
+    pub source: WorkSourceId,
+    /// Base-source access work after every selected runtime filter.
+    pub cost: SearchCost,
+    /// Runtime predicates already attached to this source.
+    pub filters: Box<[SourceFilterWork]>,
+    /// Jointly ordered evaluation work currently present in the winner cost.
+    pub filter_apply_cost: SearchCost,
+}
+
 #[derive(Debug, Clone)]
 pub struct ChildGoalAlternative {
     pub children: Box<[(GroupId, OptimizationGoal)]>,
@@ -279,6 +308,11 @@ pub struct ChildGoalAlternative {
 pub enum CostComposition {
     /// Children exist only to carry a schema and are never scheduled.
     LocalOnly,
+    /// A base scan establishes one source-work lane. Ancestors propagate this
+    /// lane without guessing which of their own local work is source-driven.
+    Source {
+        source: WorkSourceId,
+    },
     Sequential,
     RetainedState {
         overlapping_children: u64,
@@ -289,6 +323,7 @@ pub enum CostComposition {
     SidewaysFilter {
         overlapping_children: u64,
         filtered_child: u8,
+        source: WorkSourceId,
         expected_retained_ppm: u32,
         upper_retained_ppm: u32,
     },
@@ -297,7 +332,7 @@ pub enum CostComposition {
 impl CostComposition {
     pub(crate) fn overlapping_children(self) -> u64 {
         match self {
-            Self::LocalOnly | Self::Sequential => 0,
+            Self::LocalOnly | Self::Source { .. } | Self::Sequential => 0,
             Self::RetainedState {
                 overlapping_children,
             }
@@ -308,15 +343,17 @@ impl CostComposition {
         }
     }
 
-    pub(crate) fn sideways_filter(self) -> Option<(usize, u32, u32)> {
+    pub(crate) fn sideways_filter(self) -> Option<(usize, WorkSourceId, u32, u32)> {
         match self {
             Self::SidewaysFilter {
                 filtered_child,
+                source,
                 expected_retained_ppm,
                 upper_retained_ppm,
                 ..
             } => Some((
                 usize::from(filtered_child),
+                source,
                 expected_retained_ppm,
                 upper_retained_ppm,
             )),
@@ -332,6 +369,9 @@ pub struct PhysicalCandidate {
     pub provided: ProvidedProperties,
     pub child_goals: Box<[(GroupId, OptimizationGoal)]>,
     pub local_cost: SearchCost,
+    /// Work already included in `local_cost` for evaluating this candidate's
+    /// runtime predicate against an otherwise unfiltered source.
+    pub source_filter_apply_cost: Option<SearchCost>,
     pub cost_composition: CostComposition,
     /// Whether operator-owned retained state can yield memory to spill after
     /// child winner peaks are known.

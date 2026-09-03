@@ -195,6 +195,7 @@ pub struct JointCostProof {
     pub artifact_dependencies: Box<[RegionArtifactDependencyContract]>,
     pub dependencies: Box<[RegionDependencyEdge]>,
     pub local_cost: SearchCost,
+    pub source_filter_apply_cost: Option<SearchCost>,
     pub cost_composition: CostComposition,
 }
 

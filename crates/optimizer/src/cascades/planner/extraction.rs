@@ -139,22 +139,26 @@ pub(super) fn extract_planner_tree(
                 };
                 let (region_owner, owned_artifacts) = extracted_region_ownership(memo, winner)?;
                 let mut child_costs = Vec::with_capacity(winner.child_goals.len());
+                let mut child_source_work = Vec::with_capacity(winner.child_goals.len());
                 for (child, child_goal) in &winner.child_goals {
-                    let child_cost = memo
+                    let child_winner = memo
                         .group(*child)
                         .and_then(|group| group.winner(*child_goal))
                         .ok_or_else(|| {
                             paro_error::internal("winner extraction lost a child winner")
-                        })?
-                        .cost;
-                    child_costs.push(child_cost);
+                        })?;
+                    child_costs.push(child_winner.cost);
+                    child_source_work.push(child_winner.source_work.as_ref());
                 }
                 let base_cost = crate::cascades::engine::constrain_composed_cost_to_grant(
-                    crate::cascades::engine::compose_candidate_cost(
+                    crate::cascades::engine::compose_candidate_cost_with_sources(
                         winner.local_cost,
+                        winner.source_filter_apply_cost,
                         &child_costs,
+                        &child_source_work,
                         winner.cost_composition,
-                    )?,
+                    )?
+                    .cost,
                     winner.enforcer_cost_input,
                 )?
                 .ok_or_else(|| {

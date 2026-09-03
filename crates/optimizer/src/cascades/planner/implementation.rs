@@ -181,12 +181,19 @@ impl PhysicalImplementation for PlannerBaselineImplementation {
                 && implementation_spillable(metadata, metadata.implementations.baseline))
                 as u64,
         );
+        let max_concurrent_tasks = parallel_tasks_for_goal(goal, &self.grant_classes)?;
         let local_cost = implementation_cost(
             metadata,
             &cost_facts,
             metadata.implementations.baseline,
             self.calibration.as_ref(),
-            parallel_tasks_for_goal(goal, &self.grant_classes)?,
+            max_concurrent_tasks,
+        )?;
+        let source_filter_apply_cost = runtime_filter_apply_cost(
+            &cost_facts,
+            metadata.implementations.baseline,
+            self.calibration.as_ref(),
+            max_concurrent_tasks,
         )?;
         let spillable = implementation_spillable(metadata, metadata.implementations.baseline);
         let estimated_peak_memory = local_cost.peak_memory_upper;
@@ -223,6 +230,7 @@ impl PhysicalImplementation for PlannerBaselineImplementation {
             provided: metadata.provided.clone(),
             child_goals,
             local_cost,
+            source_filter_apply_cost,
             cost_composition: planner_cost_composition(
                 metadata,
                 metadata.implementations.baseline,
@@ -351,12 +359,19 @@ impl PhysicalImplementation for AlternativeImplementation {
         fingerprint.write_u64(
             (self.force_spill && implementation_spillable(metadata, self.flavor)) as u64,
         );
+        let max_concurrent_tasks = parallel_tasks_for_goal(goal, &self.grant_classes)?;
         let implementation_cost = implementation_cost(
             metadata,
             &cost_facts,
             self.flavor,
             self.calibration.as_ref(),
-            parallel_tasks_for_goal(goal, &self.grant_classes)?,
+            max_concurrent_tasks,
+        )?;
+        let source_filter_apply_cost = runtime_filter_apply_cost(
+            &cost_facts,
+            self.flavor,
+            self.calibration.as_ref(),
+            max_concurrent_tasks,
         )?;
         let Some(local_cost) = cost_for_grant(
             implementation_cost,
@@ -380,6 +395,7 @@ impl PhysicalImplementation for AlternativeImplementation {
             provided: metadata.provided.clone(),
             child_goals,
             local_cost,
+            source_filter_apply_cost,
             cost_composition: planner_cost_composition(metadata, self.flavor, &cost_facts)?,
             spillable: implementation_spillable(metadata, self.flavor),
             enforcer_cost_input: planner_enforcer_cost_input(
@@ -475,6 +491,7 @@ impl PhysicalImplementation for PlannerSearchImplementation {
             provided: search.provided.clone(),
             child_goals: Box::new([]),
             local_cost: search.local_cost,
+            source_filter_apply_cost: None,
             cost_composition: CostComposition::Sequential,
             spillable: false,
             enforcer_cost_input: crate::cascades::engine::EnforcerCostInput::unbounded(

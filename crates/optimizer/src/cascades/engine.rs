@@ -27,9 +27,11 @@ use super::region::{
     JointCostProof, RegionArtifactKind, RegionBoundaryEndpoint, RegionCandidateContract,
     RegionDependencyEdge, RegionDependencyKind,
 };
+#[cfg(test)]
+use super::rules::WorkSourceId;
 use super::rules::{
     CostComposition, ImplementationContext, ImplementationRegistry, PhysicalCandidate, RuleContext,
-    TransformContext,
+    SourceFilterWork, SourceWork, TransformContext,
 };
 use crate::physical::SpillPolicy;
 
@@ -112,6 +114,7 @@ impl StableAgenda {
 struct CostRecipe {
     child_goals: Box<[(GroupId, OptimizationGoal)]>,
     local_cost: SearchCost,
+    source_filter_apply_cost: Option<SearchCost>,
     cost_composition: CostComposition,
     spillable: bool,
     enforcer_cost_input: EnforcerCostInput,
@@ -777,6 +780,7 @@ impl CascadesEngine {
         self.recipes.entry(recipe_key).or_insert(CostRecipe {
             child_goals: candidate.child_goals,
             local_cost: candidate.local_cost,
+            source_filter_apply_cost: candidate.source_filter_apply_cost,
             cost_composition: candidate.cost_composition,
             spillable: candidate.spillable,
             enforcer_cost_input: candidate.enforcer_cost_input,
@@ -845,14 +849,14 @@ impl CascadesEngine {
         }
         for (physical, recipe) in recipes {
             let mut child_costs = Vec::with_capacity(recipe.child_goals.len());
+            let mut child_source_work = Vec::with_capacity(recipe.child_goals.len());
             let mut children_feasible = true;
             for (child, child_goal) in recipe.child_goals.iter().copied() {
                 self.optimize_group(child, child_goal)?;
-                let Some(child_cost) = self
+                let Some(child_winner) = self
                     .memo
                     .group(child)
                     .and_then(|group| group.winner(child_goal))
-                    .map(|winner| winner.cost)
                 else {
                     tracing::debug!(
                         target: "paro::optimizer",
@@ -865,7 +869,8 @@ impl CascadesEngine {
                     children_feasible = false;
                     break;
                 };
-                child_costs.push(child_cost);
+                child_costs.push(child_winner.cost);
+                child_source_work.push(child_winner.source_work.clone());
             }
             if !children_feasible {
                 continue;
@@ -889,10 +894,20 @@ impl CascadesEngine {
                 );
                 continue;
             };
-            let Some(mut cost) = constrain_composed_cost_to_grant(
-                compose_candidate_cost(local_cost, &child_costs, recipe.cost_composition)?,
-                recipe.enforcer_cost_input,
-            )?
+            let child_source_work_refs = child_source_work
+                .iter()
+                .map(|work| work.as_ref())
+                .collect::<Vec<_>>();
+            let composed = compose_candidate_cost_with_sources(
+                local_cost,
+                recipe.source_filter_apply_cost,
+                &child_costs,
+                &child_source_work_refs,
+                recipe.cost_composition,
+            )?;
+            let source_work = composed.source_work;
+            let Some(mut cost) =
+                constrain_composed_cost_to_grant(composed.cost, recipe.enforcer_cost_input)?
             else {
                 continue;
             };
@@ -969,6 +984,10 @@ impl CascadesEngine {
                     logical_expression = logical_expression.map(LogicalExprId::index),
                     origin_rule,
                     physical_expression = physical.index(),
+                    implementation = self
+                        .memo
+                        .physical_expr(physical)
+                        .map(|physical| physical.key.implementation.0),
                     risk_adjusted_cost = cost.score.risk_adjusted,
                     upper_cost = cost.score.range.upper,
                     "costed an equivalent physical candidate"
@@ -984,8 +1003,10 @@ impl CascadesEngine {
                     enforcer_cost_input: recipe.enforcer_cost_input,
                     provided: enforced.provided,
                     local_cost,
+                    source_filter_apply_cost: recipe.source_filter_apply_cost,
                     cost_composition: recipe.cost_composition,
                     cost,
+                    source_work,
                     physical_fingerprint: fingerprint,
                     joint_cost_proof,
                 },
@@ -1142,6 +1163,7 @@ fn build_joint_cost_proof(
         artifact_dependencies: region.artifact_dependencies.clone(),
         dependencies: dependencies.into_boxed_slice(),
         local_cost,
+        source_filter_apply_cost: recipe.source_filter_apply_cost,
         cost_composition: recipe.cost_composition,
     }))
 }
@@ -1261,25 +1283,105 @@ pub(crate) fn constrain_composed_cost_to_grant(
     Ok(Some(cost))
 }
 
-pub(crate) fn compose_candidate_cost(
-    local_cost: SearchCost,
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct ComposedCost {
+    pub(crate) cost: SearchCost,
+    pub(crate) source_work: Box<[SourceWork]>,
+}
+
+pub(crate) fn compose_candidate_cost_with_sources(
+    mut local_cost: SearchCost,
+    source_filter_apply_cost: Option<SearchCost>,
     child_costs: &[SearchCost],
+    child_source_work: &[&[SourceWork]],
     composition: CostComposition,
-) -> Result<SearchCost> {
+) -> Result<ComposedCost> {
+    if child_costs.len() != child_source_work.len() {
+        return Err(paro_error::internal(
+            "cost composition has no source-work evidence for one or more children",
+        ));
+    }
     let mut cost = local_cost;
     if composition == CostComposition::LocalOnly {
         cost.validate()?;
-        return Ok(cost);
+        return Ok(ComposedCost {
+            cost,
+            source_work: Box::new([]),
+        });
+    }
+    if let CostComposition::Source { source } = composition {
+        if !child_costs.is_empty() {
+            return Err(paro_error::internal(
+                "a base source-work lane unexpectedly has child pipelines",
+            ));
+        }
+        cost.validate()?;
+        return Ok(ComposedCost {
+            cost,
+            source_work: Box::new([SourceWork {
+                source,
+                cost: local_cost.work_only(),
+                filters: Box::new([]),
+                filter_apply_cost: SearchCost::ZERO,
+            }]),
+        });
     }
     let sideways_filter = composition.sideways_filter();
+    let mut source_work = Vec::new();
     for (index, child) in child_costs.iter().copied().enumerate() {
-        let child = match sideways_filter {
-            Some((filtered_child, expected, upper)) if index == filtered_child => {
-                child.retain_work(expected, upper)?
+        let mut child = child;
+        let mut lanes = child_source_work[index].to_vec();
+        if let Some((filtered_child, source, expected, upper)) = sideways_filter {
+            if index == filtered_child {
+                let matching_lanes = lanes.iter().filter(|lane| lane.source == source).count();
+                if matching_lanes > 1 {
+                    return Err(paro_error::internal(
+                        "one runtime filter resolved to multiple identical source-work lanes",
+                    ));
+                }
+                if matching_lanes == 1 {
+                    let full_apply_cost = source_filter_apply_cost.ok_or_else(|| {
+                        paro_error::internal(
+                            "sideways-filter composition has no predicate-application cost",
+                        )
+                    })?;
+                    local_cost = local_cost.replace_work(full_apply_cost, SearchCost::ZERO)?;
+                    cost = cost.replace_work(full_apply_cost, SearchCost::ZERO)?;
+                }
+                for lane in &mut lanes {
+                    if lane.source == source {
+                        let full_apply_cost = source_filter_apply_cost.expect(
+                            "matching source-work lane established predicate application cost",
+                        );
+                        let retained = lane.cost.retain_work(expected, upper)?;
+                        child = child.replace_work(lane.cost, retained)?;
+                        lane.cost = retained;
+                        let old_apply_cost = lane.filter_apply_cost;
+                        let mut filters = lane.filters.to_vec();
+                        filters.push(SourceFilterWork {
+                            expected_retained_ppm: expected,
+                            upper_retained_ppm: upper,
+                            full_apply_cost: full_apply_cost.work_only(),
+                        });
+                        let new_apply_cost = ordered_source_filter_cost(&filters)?;
+                        child = child.replace_work(old_apply_cost, new_apply_cost)?;
+                        lane.filters = filters.into_boxed_slice();
+                        lane.filter_apply_cost = new_apply_cost;
+                    }
+                }
+                tracing::debug!(
+                    target: "paro::optimizer",
+                    source = source.0,
+                    matching_lanes,
+                    expected_retained_ppm = expected,
+                    upper_retained_ppm = upper,
+                    child_expected_cost = child.score.range.expected,
+                    "composed source-attributed sideways filter"
+                );
             }
-            _ => child,
-        };
+        }
         cost = child.sequential(cost)?;
+        source_work.extend(lanes);
     }
     let overlapping_children = composition.overlapping_children();
     if overlapping_children != 0 {
@@ -1341,6 +1443,49 @@ pub(crate) fn compose_candidate_cost(
             .max(retained_minimum.saturating_add(cost.revocable_memory_target));
     }
     cost.validate()?;
+    Ok(ComposedCost {
+        cost,
+        source_work: source_work.into_boxed_slice(),
+    })
+}
+
+#[cfg(test)]
+pub(crate) fn compose_candidate_cost(
+    local_cost: SearchCost,
+    child_costs: &[SearchCost],
+    composition: CostComposition,
+) -> Result<SearchCost> {
+    let empty_sources = vec![&[][..]; child_costs.len()];
+    Ok(compose_candidate_cost_with_sources(
+        local_cost,
+        None,
+        child_costs,
+        &empty_sources,
+        composition,
+    )?
+    .cost)
+}
+
+fn ordered_source_filter_cost(filters: &[SourceFilterWork]) -> Result<SearchCost> {
+    const SCALE: u64 = 1_000_000;
+    fn multiply_ppm(left: u32, right: u32) -> u32 {
+        ((u64::from(left) * u64::from(right) + SCALE / 2) / SCALE) as u32
+    }
+
+    let mut ordered = filters.to_vec();
+    ordered.sort_by_key(|filter| (filter.expected_retained_ppm, filter.upper_retained_ppm));
+    let mut expected_prefix = SCALE as u32;
+    let mut upper_prefix = SCALE as u32;
+    let mut cost = SearchCost::ZERO;
+    for filter in ordered {
+        cost = cost.sequential(
+            filter
+                .full_apply_cost
+                .retain_work(expected_prefix, upper_prefix)?,
+        )?;
+        expected_prefix = multiply_ppm(expected_prefix, filter.expected_retained_ppm);
+        upper_prefix = multiply_ppm(upper_prefix, filter.upper_retained_ppm);
+    }
     Ok(cost)
 }
 

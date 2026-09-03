@@ -310,6 +310,100 @@ impl SearchCost {
         Ok(self)
     }
 
+    /// Keep only quantities which describe divisible execution work. Source
+    /// attribution deliberately carries no capacity or ownership proof: a
+    /// runtime filter may reduce work, but it cannot make retained memory,
+    /// worker slots, or an external dependency disappear.
+    pub(crate) fn work_only(mut self) -> Self {
+        self.non_revocable_memory_upper = 0;
+        self.minimum_memory_bytes = 0;
+        self.revocable_memory_target = 0;
+        self.peak_memory_upper = 0;
+        self.external_workers = ExternalWorkerRequirementSetId(0);
+        self.external_worker_slots_upper = 0;
+        self
+    }
+
+    /// Replace one disjoint, attributed portion of this cost with a revised
+    /// version of the same work. This is the algebra used by non-local
+    /// filters: independent work remains unchanged and hard resource proofs
+    /// stay attached to the complete candidate.
+    pub(crate) fn replace_work(self, old: Self, new: Self) -> Result<Self> {
+        fn replace(total: f64, old: f64, new: f64) -> Result<f64> {
+            let tolerance = total.abs().max(old.abs()).max(1.0) * 1e-10;
+            if old > total + tolerance {
+                return Err(paro_error::internal(
+                    "attributed source work exceeds the complete candidate cost",
+                ));
+            }
+            Ok((total - old).max(0.0) + new)
+        }
+
+        let mut result = self;
+        result.score.range = CompactRange::new(
+            replace(
+                self.score.range.lower,
+                old.score.range.lower,
+                new.score.range.lower,
+            )?,
+            replace(
+                self.score.range.expected,
+                old.score.range.expected,
+                new.score.range.expected,
+            )?,
+            replace(
+                self.score.range.upper,
+                old.score.range.upper,
+                new.score.range.upper,
+            )?,
+        )?;
+        result.score.risk_adjusted = replace(
+            self.score.risk_adjusted,
+            old.score.risk_adjusted,
+            new.score.risk_adjusted,
+        )?;
+        result.critical_path = CompactRange::new(
+            replace(
+                self.critical_path.lower,
+                old.critical_path.lower,
+                new.critical_path.lower,
+            )?,
+            replace(
+                self.critical_path.expected,
+                old.critical_path.expected,
+                new.critical_path.expected,
+            )?,
+            replace(
+                self.critical_path.upper,
+                old.critical_path.upper,
+                new.critical_path.upper,
+            )?,
+        )?;
+        for index in 0..RESOURCE_DIMS {
+            result.resources_expected[index] = replace(
+                self.resources_expected[index],
+                old.resources_expected[index],
+                new.resources_expected[index],
+            )?;
+            result.resources_risk_upper[index] = replace(
+                self.resources_risk_upper[index],
+                old.resources_risk_upper[index],
+                new.resources_risk_upper[index],
+            )?;
+        }
+        if old.spill_bytes_expected > self.spill_bytes_expected {
+            return Err(paro_error::internal(
+                "attributed source spill work exceeds the complete candidate cost",
+            ));
+        }
+        result.spill_bytes_expected = self
+            .spill_bytes_expected
+            .saturating_sub(old.spill_bytes_expected)
+            .saturating_add(new.spill_bytes_expected);
+        result.validate()?;
+        Ok(result)
+    }
+
     pub fn dominates(&self, other: &Self) -> bool {
         let no_worse = self.score.risk_adjusted <= other.score.risk_adjusted
             && self.score.range.upper <= other.score.range.upper

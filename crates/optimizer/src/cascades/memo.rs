@@ -361,8 +361,13 @@ pub struct Winner {
     /// Operator-local cost retained so WinnerVerifier can independently
     /// replay composition instead of trusting the enumerator's total.
     pub local_cost: SearchCost,
+    pub source_filter_apply_cost: Option<SearchCost>,
     pub cost_composition: CostComposition,
     pub cost: SearchCost,
+    /// Disjoint base-source work retained for safe non-local selectivity
+    /// composition. This evidence is replayed with the winner tree and is not
+    /// embedded in the fixed-size hot SearchCost value.
+    pub source_work: Box<[super::rules::SourceWork]>,
     pub physical_fingerprint: Fingerprint,
     pub joint_cost_proof: Option<JointCostProof>,
 }
@@ -1108,10 +1113,10 @@ impl Memo {
             };
             child_winner.cost.validate()?;
         }
-        let recomputed_cost = recompute_winner_cost(self, &winner)?;
-        if recomputed_cost != winner.cost {
+        let recomputed = recompute_winner_cost(self, &winner)?;
+        if recomputed.cost != winner.cost || recomputed.source_work != winner.source_work {
             return Err(paro_error::internal(
-                "winner cumulative cost disagrees with local/child/enforcer composition",
+                "winner cumulative cost or source-work evidence disagrees with composition",
             ));
         }
 
@@ -1245,36 +1250,39 @@ impl Memo {
     }
 }
 
-fn recompute_winner_cost(memo: &Memo, winner: &Winner) -> Result<SearchCost> {
+fn recompute_winner_cost(memo: &Memo, winner: &Winner) -> Result<super::engine::ComposedCost> {
     let mut child_costs = Vec::with_capacity(winner.child_goals.len());
+    let mut child_source_work = Vec::with_capacity(winner.child_goals.len());
     for (child, child_goal) in winner.child_goals.iter().copied() {
-        let child_cost = memo
+        let child_winner = memo
             .group(child)
             .and_then(|group| group.winner(child_goal))
-            .ok_or_else(|| paro_error::internal("winner cost replay lost a child winner"))?
-            .cost;
-        child_costs.push(child_cost);
+            .ok_or_else(|| paro_error::internal("winner cost replay lost a child winner"))?;
+        child_costs.push(child_winner.cost);
+        child_source_work.push(child_winner.source_work.as_ref());
     }
-    let cost = super::engine::constrain_composed_cost_to_grant(
-        super::engine::compose_candidate_cost(
-            winner.local_cost,
-            &child_costs,
-            winner.cost_composition,
-        )?,
-        winner.enforcer_cost_input,
-    )?
-    .ok_or_else(|| paro_error::internal("recorded winner exceeds its resource grant"))?;
+    let mut composed = super::engine::compose_candidate_cost_with_sources(
+        winner.local_cost,
+        winner.source_filter_apply_cost,
+        &child_costs,
+        &child_source_work,
+        winner.cost_composition,
+    )?;
+    composed.cost =
+        super::engine::constrain_composed_cost_to_grant(composed.cost, winner.enforcer_cost_input)?
+            .ok_or_else(|| paro_error::internal("recorded winner exceeds its resource grant"))?;
     let enforcer_cost = super::engine::enforcer_cost(
         &winner.enforcers,
         winner.enforcer_cost_input,
         memo.calibration(),
     )?
     .ok_or_else(|| paro_error::internal("recorded winner has an infeasible enforcer grant"))?;
-    super::engine::constrain_composed_cost_to_grant(
-        cost.sequential(enforcer_cost)?,
+    composed.cost = super::engine::constrain_composed_cost_to_grant(
+        composed.cost.sequential(enforcer_cost)?,
         winner.enforcer_cost_input,
     )?
-    .ok_or_else(|| paro_error::internal("recorded winner enforcers exceed its resource grant"))
+    .ok_or_else(|| paro_error::internal("recorded winner enforcers exceed its resource grant"))?;
+    Ok(composed)
 }
 
 fn two_groups_mut(groups: &mut [Group], left: usize, right: usize) -> (&mut Group, &mut Group) {

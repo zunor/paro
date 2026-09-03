@@ -204,6 +204,49 @@ struct RuntimeFilterProbeLineage<'a> {
     crossed_join: bool,
 }
 
+fn singular_runtime_filter_work_source(
+    plan: &LogicalPlan,
+    expression: &Expression,
+) -> Option<WorkSourceId> {
+    let bindings = plan.get_column_bindings();
+    let output_index = match expression {
+        Expression::ColumnRef(column) if column.depth == 0 => bindings
+            .iter()
+            .position(|binding| *binding == column.binding),
+        Expression::Reference(reference) => Some(reference.index),
+        _ => None,
+    }?;
+    let lineage = runtime_filter_probe_lineages(plan, output_index)?;
+    let mut sources = lineage.sources.into_iter().filter_map(|source| {
+        let LogicalOperator::Get(get) = &source.operator else {
+            return None;
+        };
+        Some(WorkSourceId(get.table_index))
+    });
+    let source = sources.next()?;
+    sources
+        .all(|candidate| candidate == source)
+        .then_some(source)
+}
+
+pub(super) fn runtime_filter_probe_work_source(
+    join: &paro_planner::operator::ComparisonJoin,
+) -> Option<WorkSourceId> {
+    join.conditions
+        .iter()
+        .filter(|condition| condition.comparison == JoinComparisonType::Equal)
+        .find_map(|condition| singular_runtime_filter_work_source(&join.left, &condition.left))
+}
+
+pub(super) fn runtime_filter_build_left_probe_work_source(
+    join: &paro_planner::operator::ComparisonJoin,
+) -> Option<WorkSourceId> {
+    join.conditions
+        .iter()
+        .filter(|condition| condition.comparison == JoinComparisonType::Equal)
+        .find_map(|condition| singular_runtime_filter_work_source(&join.right, &condition.right))
+}
+
 fn runtime_filter_probe_lineages(
     plan: &LogicalPlan,
     output_index: usize,
@@ -314,27 +357,6 @@ pub(super) fn runtime_filter_probe_source_rows(
                     })
                 },
             )
-        })
-}
-
-pub(super) fn runtime_filter_probe_is_direct(
-    join: &paro_planner::operator::ComparisonJoin,
-) -> bool {
-    let probe_bindings = join.left.get_column_bindings();
-    join.conditions
-        .iter()
-        .filter(|condition| condition.comparison == JoinComparisonType::Equal)
-        .any(|condition| {
-            let output_index = match &condition.left {
-                Expression::ColumnRef(column) if column.depth == 0 => probe_bindings
-                    .iter()
-                    .position(|binding| *binding == column.binding),
-                Expression::Reference(reference) => Some(reference.index),
-                _ => None,
-            };
-            output_index
-                .and_then(|index| runtime_filter_probe_lineages(&join.left, index))
-                .is_some_and(|lineage| !lineage.crossed_join)
         })
 }
 
@@ -613,15 +635,26 @@ pub(super) fn implementation_cost(
             );
             let build = if build_left { left } else { right };
             let ordinary_probe = if build_left { right } else { left };
+            let build_index = usize::from(!build_left);
+            let build_materialization_risk = facts
+                .child_materialization_risk_rows
+                .get(build_index)
+                .copied()
+                .unwrap_or(0) as f64;
+            let build_work = CompactRange::new(
+                build.lower,
+                build.expected,
+                build.upper.max(build_materialization_risk),
+            )?;
             let build_hard_upper = facts
                 .child_rows_hard_upper
-                .get(usize::from(!build_left))
+                .get(build_index)
                 .copied()
                 .flatten();
-            work.add(OP_HASH_BUILD_ROW, build)?;
+            work.add(OP_HASH_BUILD_ROW, build_work)?;
             let probe = if flavor == PhysicalImplementationFlavor::HashJoinRuntimeFilter {
                 let build_domain = runtime_filter_build_domain(facts, right)?;
-                work.add(OP_RUNTIME_FILTER_BUILD_ROW, right)?;
+                work.add(OP_RUNTIME_FILTER_BUILD_ROW, build_work)?;
                 // A non-local runtime filter runs at the traced rowset source,
                 // before any intervening joins. Price every source-row lookup;
                 // charging only the already-reduced logical child makes a
@@ -645,7 +678,7 @@ pub(super) fn implementation_cost(
                 )?
             } else if flavor == PhysicalImplementationFlavor::HashJoinBuildLeftRuntimeFilter {
                 let build_domain = CompactRange::new(0.0, left.expected, left.upper)?;
-                work.add(OP_RUNTIME_FILTER_BUILD_ROW, left)?;
+                work.add(OP_RUNTIME_FILTER_BUILD_ROW, build_work)?;
                 work.add(OP_RUNTIME_FILTER_APPLY_ROW, right)?;
                 let resource = crate::physical::RuntimeFilterResourceContract::for_keys(
                     &facts.runtime_filter_key_types,
@@ -656,13 +689,17 @@ pub(super) fn implementation_cost(
                 runtime_filtered_probe_work(
                     right,
                     build_domain,
-                    RuntimeFilterProbeMultiplicity::Unknown,
+                    facts.runtime_filter_build_left_probe_multiplicity,
                     exact_expected,
                 )?
             } else {
                 ordinary_probe
             };
-            add_hash_key_byte_work(&mut work, build.checked_add(probe)?, facts.hash_key_width)?;
+            add_hash_key_byte_work(
+                &mut work,
+                build_work.checked_add(probe)?,
+                facts.hash_key_width,
+            )?;
             work.add(OP_HASH_PROBE_ROW, probe.checked_add(facts.output_rows)?)?;
             peak_memory_upper = build_hard_upper
                 .unwrap_or(u64::MAX)
@@ -811,6 +848,42 @@ pub(super) fn implementation_cost(
     }
     cost.validate()?;
     Ok(cost)
+}
+
+/// Isolate the full-source predicate-evaluation work already charged by a
+/// runtime-filter implementation. Candidate composition removes this term and
+/// rebuilds all predicates on the same source in selectivity order, matching
+/// the staged rowset evaluator without discounting independent join work.
+pub(super) fn runtime_filter_apply_cost(
+    facts: &ResolvedPlannerCostFacts,
+    flavor: PhysicalImplementationFlavor,
+    calibration: &MachineCalibrationBundle,
+    max_concurrent_tasks: u16,
+) -> Result<Option<SearchCost>> {
+    let rows = match flavor {
+        PhysicalImplementationFlavor::HashJoinRuntimeFilter => {
+            facts.runtime_filter_probe_source_rows.unwrap_or_else(|| {
+                facts
+                    .child_rows
+                    .first()
+                    .copied()
+                    .unwrap_or(CompactRange::ZERO)
+            })
+        }
+        PhysicalImplementationFlavor::HashJoinBuildLeftRuntimeFilter => facts
+            .child_rows
+            .get(1)
+            .copied()
+            .unwrap_or(CompactRange::ZERO),
+        _ => return Ok(None),
+    };
+    let mut work = LocalOperatorWork::default();
+    work.add(OP_RUNTIME_FILTER_APPLY_ROW, rows)?;
+    Ok(Some(calibration.fold_for_tasks(
+        &work,
+        ParallelWorkProfile::Pipeline,
+        max_concurrent_tasks,
+    )?))
 }
 
 fn implementation_parallelism(flavor: PhysicalImplementationFlavor) -> ParallelWorkProfile {

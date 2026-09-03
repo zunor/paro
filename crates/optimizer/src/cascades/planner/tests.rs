@@ -71,14 +71,18 @@ fn calibrated_tuple_work_distinguishes_narrow_and_wide_intermediates() {
         output_rows_hard_upper: Some(1_000),
         child_rows_hard_upper: vec![Some(1_000)].into_boxed_slice(),
         child_row_widths: vec![width].into_boxed_slice(),
+        child_materialization_risk_rows: vec![1_000].into_boxed_slice(),
         output_row_width: width,
         hash_key_width: None,
         scan_access_width: None,
+        scan_work_source: None,
         perfect_hash: None,
         topn_capacity: None,
         runtime_filter_probe_multiplicity: RuntimeFilterProbeMultiplicity::Unknown,
+        runtime_filter_build_left_probe_multiplicity: RuntimeFilterProbeMultiplicity::Unknown,
         runtime_filter_probe_source_rows: None,
-        runtime_filter_probe_is_direct: false,
+        runtime_filter_probe_work_source: None,
+        runtime_filter_build_left_probe_work_source: None,
         runtime_filter_build_distinct_expected: None,
         runtime_filter_key_types: Box::new([]),
     };
@@ -151,14 +155,18 @@ fn expression_cost_facts_read_current_group_cardinality() {
     );
     let template = PlannerCostFacts {
         child_row_widths: vec![16].into_boxed_slice(),
+        child_materialization_risk_rows: vec![120].into_boxed_slice(),
         output_row_width: 16,
         hash_key_width: None,
         scan_access_width: None,
+        scan_work_source: None,
         perfect_hash: None,
         topn_capacity: None,
         runtime_filter_probe_multiplicity: RuntimeFilterProbeMultiplicity::Unknown,
+        runtime_filter_build_left_probe_multiplicity: RuntimeFilterProbeMultiplicity::Unknown,
         runtime_filter_probe_source_rows: None,
-        runtime_filter_probe_is_direct: false,
+        runtime_filter_probe_work_source: None,
+        runtime_filter_build_left_probe_work_source: None,
         runtime_filter_build_distinct_expected: None,
         runtime_filter_key_types: Box::new([]),
     };
@@ -398,6 +406,61 @@ fn memo_hash_join_can_select_logical_left_as_physical_build() {
     assert_eq!(
         contract.implementation,
         PhysicalImplementationFlavor::HashJoinBuildLeft
+    );
+}
+
+#[test]
+fn memo_hash_join_does_not_materialize_a_selectivity_reduced_fact_subtree() {
+    let bind_context = BindContext::new();
+    let mut reduced_fact = LogicalPlan::new(
+        &bind_context,
+        LogicalOperator::ExpressionGet(ExpressionGet::new(
+            0,
+            integer_value_rows(8, 1),
+            vec!["reduced_fact".to_string()],
+            vec![LogicalType::Integer],
+        )),
+    );
+    reduced_fact.stats.estimated_cardinality = Some(CardinalityEstimate::exact(8));
+    reduced_fact.stats.materialization_risk_cardinality = Some(1_000_000);
+
+    let mut dimension = LogicalPlan::new(
+        &bind_context,
+        LogicalOperator::ExpressionGet(ExpressionGet::new(
+            1,
+            integer_value_rows(4096, 1),
+            vec!["dimension".to_string()],
+            vec![LogicalType::Integer],
+        )),
+    );
+    dimension.stats.estimated_cardinality = Some(CardinalityEstimate::exact(4096));
+    dimension.stats.materialization_risk_cardinality = Some(4096);
+
+    let condition = JoinCondition::equality(
+        Expression::Reference(ReferenceExpression::new(0, LogicalType::Integer)),
+        Expression::Reference(ReferenceExpression::new(0, LogicalType::Integer)),
+    );
+    let mut join = LogicalPlan::new(
+        &bind_context,
+        LogicalOperator::Join(Join::comparison(
+            JoinType::Inner,
+            reduced_fact,
+            dimension,
+            vec![condition],
+        )),
+    );
+    join.stats.estimated_cardinality = Some(CardinalityEstimate::exact(8));
+
+    let input = MemoBuilder::build(join, bind_context, SearchBudget::default()).unwrap();
+    let optimized = input.optimize(&test_grant_classes()).unwrap();
+    let optimized = &optimized.variants[0];
+    let contract = optimized
+        .contracts
+        .get(&optimized.plan.id)
+        .expect("root winner contract");
+    assert_eq!(
+        contract.implementation,
+        PhysicalImplementationFlavor::HashJoin
     );
 }
 

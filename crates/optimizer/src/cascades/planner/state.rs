@@ -297,6 +297,10 @@ pub(super) struct PlannerSearchImplementationMetadata {
 #[derive(Debug, Clone)]
 pub(super) struct PlannerCostFacts {
     pub(super) child_row_widths: Box<[u64]>,
+    /// Expression-local cardinality risk for materializing each child. Unlike
+    /// `child_rows_hard_upper`, this is statistical evidence used for ranking
+    /// only; it never proves capacity or query correctness.
+    pub(super) child_materialization_risk_rows: Box<[u64]>,
     pub(super) output_row_width: u64,
     /// Bytes participating in one hash key. Row-oriented hash work is
     /// calibrated for one integral key; wider/composite keys pay separately.
@@ -304,11 +308,14 @@ pub(super) struct PlannerCostFacts {
     /// Bytes physically read from base-table column sources for each scan
     /// row. `None` identifies a non-scan structural operator.
     pub(super) scan_access_width: Option<u64>,
+    pub(super) scan_work_source: Option<WorkSourceId>,
     pub(super) perfect_hash: Option<crate::physical::PerfectHashResourceContract>,
     pub(super) topn_capacity: Option<u64>,
     pub(super) runtime_filter_probe_multiplicity: RuntimeFilterProbeMultiplicity,
+    pub(super) runtime_filter_build_left_probe_multiplicity: RuntimeFilterProbeMultiplicity,
     pub(super) runtime_filter_probe_source_rows: Option<paro_planner::plan::CardinalityEstimate>,
-    pub(super) runtime_filter_probe_is_direct: bool,
+    pub(super) runtime_filter_probe_work_source: Option<WorkSourceId>,
+    pub(super) runtime_filter_build_left_probe_work_source: Option<WorkSourceId>,
     /// Snapshot estimate of the distinct build-key domain. This ranks
     /// runtime-filter benefit; it never proves capacity or correctness.
     pub(super) runtime_filter_build_distinct_expected: Option<u64>,
@@ -322,14 +329,18 @@ pub(super) struct ResolvedPlannerCostFacts {
     pub(super) output_rows_hard_upper: Option<u64>,
     pub(super) child_rows_hard_upper: Box<[Option<u64>]>,
     pub(super) child_row_widths: Box<[u64]>,
+    pub(super) child_materialization_risk_rows: Box<[u64]>,
     pub(super) output_row_width: u64,
     pub(super) hash_key_width: Option<u64>,
     pub(super) scan_access_width: Option<u64>,
+    pub(super) scan_work_source: Option<WorkSourceId>,
     pub(super) perfect_hash: Option<crate::physical::PerfectHashResourceContract>,
     pub(super) topn_capacity: Option<u64>,
     pub(super) runtime_filter_probe_multiplicity: RuntimeFilterProbeMultiplicity,
+    pub(super) runtime_filter_build_left_probe_multiplicity: RuntimeFilterProbeMultiplicity,
     pub(super) runtime_filter_probe_source_rows: Option<CompactRange>,
-    pub(super) runtime_filter_probe_is_direct: bool,
+    pub(super) runtime_filter_probe_work_source: Option<WorkSourceId>,
+    pub(super) runtime_filter_build_left_probe_work_source: Option<WorkSourceId>,
     pub(super) runtime_filter_build_distinct_expected: Option<u64>,
     pub(super) runtime_filter_key_types: Box<[LogicalType]>,
 }

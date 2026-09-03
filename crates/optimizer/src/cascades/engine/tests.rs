@@ -124,6 +124,7 @@ fn joint_cost_proof_resolves_both_runtime_filter_build_orientations() {
         let recipe = CostRecipe {
             child_goals: Box::new([(first, goal), (second, goal)]),
             local_cost: SearchCost::ZERO,
+            source_filter_apply_cost: None,
             cost_composition: CostComposition::Sequential,
             spillable: false,
             enforcer_cost_input: EnforcerCostInput::unbounded(CompactRange::point(1.0).unwrap(), 8),
@@ -496,6 +497,7 @@ impl PhysicalImplementation for LeafImplementation {
             provided: provided(),
             child_goals: Box::new([]),
             local_cost: cost(score),
+            source_filter_apply_cost: None,
             cost_composition: CostComposition::Sequential,
             spillable: false,
             enforcer_cost_input: EnforcerCostInput::unbounded(CompactRange::point(1.0)?, 8),
@@ -817,6 +819,7 @@ impl PhysicalImplementation for FeasibleAlternativeImplementation {
             provided: provided(),
             child_goals,
             local_cost: cost(1.0),
+            source_filter_apply_cost: None,
             cost_composition: CostComposition::Sequential,
             spillable: false,
             enforcer_cost_input: EnforcerCostInput::unbounded(CompactRange::point(1.0)?, 8),
@@ -977,23 +980,34 @@ fn schema_only_child_does_not_contribute_execution_cost() {
 
 #[test]
 fn sideways_filter_scales_work_without_weakening_resource_proofs() {
+    let source = WorkSourceId(7);
     let child = SearchCost {
         non_revocable_memory_upper: 40,
         minimum_memory_bytes: 40,
         peak_memory_upper: 80,
         ..cost(100.0)
     };
-    let filtered = compose_candidate_cost(
+    let source_work = [SourceWork {
+        source,
+        cost: child.work_only(),
+        filters: Box::new([]),
+        filter_apply_cost: SearchCost::ZERO,
+    }];
+    let filtered = compose_candidate_cost_with_sources(
         SearchCost::ZERO,
+        Some(SearchCost::ZERO),
         &[child],
+        &[&source_work],
         CostComposition::SidewaysFilter {
             overlapping_children: 1,
             filtered_child: 0,
+            source,
             expected_retained_ppm: 100_000,
             upper_retained_ppm: 1_000_000,
         },
     )
-    .expect("sideways-filter composition");
+    .expect("sideways-filter composition")
+    .cost;
 
     assert_eq!(filtered.score.range.expected, 10.0);
     assert_eq!(filtered.score.range.upper, 100.0);
@@ -1001,6 +1015,109 @@ fn sideways_filter_scales_work_without_weakening_resource_proofs() {
     assert_eq!(filtered.non_revocable_memory_upper, 40);
     assert_eq!(filtered.minimum_memory_bytes, 40);
     assert_eq!(filtered.peak_memory_upper, 80);
+}
+
+#[test]
+fn repeated_sideways_filters_scale_only_the_matching_source_lane() {
+    let source = WorkSourceId(11);
+    let scan = compose_candidate_cost_with_sources(
+        cost(100.0),
+        None,
+        &[],
+        &[],
+        CostComposition::Source { source },
+    )
+    .unwrap();
+    let independent_parent = compose_candidate_cost_with_sources(
+        cost(50.0),
+        None,
+        &[scan.cost],
+        &[scan.source_work.as_ref()],
+        CostComposition::Sequential,
+    )
+    .unwrap();
+    let first = compose_candidate_cost_with_sources(
+        cost(10.0),
+        Some(SearchCost::ZERO),
+        &[independent_parent.cost],
+        &[independent_parent.source_work.as_ref()],
+        CostComposition::SidewaysFilter {
+            overlapping_children: 0,
+            filtered_child: 0,
+            source,
+            expected_retained_ppm: 500_000,
+            upper_retained_ppm: 500_000,
+        },
+    )
+    .unwrap();
+    let second = compose_candidate_cost_with_sources(
+        cost(20.0),
+        Some(SearchCost::ZERO),
+        &[first.cost],
+        &[first.source_work.as_ref()],
+        CostComposition::SidewaysFilter {
+            overlapping_children: 0,
+            filtered_child: 0,
+            source,
+            expected_retained_ppm: 100_000,
+            upper_retained_ppm: 100_000,
+        },
+    )
+    .unwrap();
+
+    assert_eq!(second.cost.score.range.expected, 85.0);
+    assert_eq!(second.source_work.len(), 1);
+    assert_eq!(second.source_work[0].cost.score.range.expected, 5.0);
+}
+
+#[test]
+fn source_predicate_cost_is_reordered_by_runtime_selectivity() {
+    let source = WorkSourceId(12);
+    let scan = compose_candidate_cost_with_sources(
+        cost(100.0),
+        None,
+        &[],
+        &[],
+        CostComposition::Source { source },
+    )
+    .unwrap();
+    let first = compose_candidate_cost_with_sources(
+        cost(30.0),
+        Some(cost(20.0)),
+        &[scan.cost],
+        &[scan.source_work.as_ref()],
+        CostComposition::SidewaysFilter {
+            overlapping_children: 0,
+            filtered_child: 0,
+            source,
+            expected_retained_ppm: 500_000,
+            upper_retained_ppm: 500_000,
+        },
+    )
+    .unwrap();
+    let second = compose_candidate_cost_with_sources(
+        cost(30.0),
+        Some(cost(20.0)),
+        &[first.cost],
+        &[first.source_work.as_ref()],
+        CostComposition::SidewaysFilter {
+            overlapping_children: 0,
+            filtered_child: 0,
+            source,
+            expected_retained_ppm: 100_000,
+            upper_retained_ppm: 100_000,
+        },
+    )
+    .unwrap();
+
+    // Base access is retained by 5%; each join keeps 10 units of independent
+    // work, and predicate evaluation is 20 + (10% * 20), not tree-order
+    // evaluation 20 + (50% * 20).
+    assert_eq!(second.cost.score.range.expected, 47.0);
+    assert_eq!(
+        second.source_work[0].filter_apply_cost.score.range.expected,
+        22.0
+    );
 }
 
 #[test]
@@ -1198,6 +1315,7 @@ impl PhysicalImplementation for GrantTreeImplementation {
             provided: provided(),
             child_goals,
             local_cost: cost(1.0),
+            source_filter_apply_cost: None,
             cost_composition: CostComposition::Sequential,
             spillable: false,
             enforcer_cost_input: EnforcerCostInput::unbounded(CompactRange::point(1.0)?, 8),

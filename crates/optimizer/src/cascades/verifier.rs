@@ -127,6 +127,7 @@ impl WinnerVerifier {
                         ));
                     }
                     let mut child_costs = Vec::with_capacity(winner.child_goals.len());
+                    let mut child_source_work = Vec::with_capacity(winner.child_goals.len());
                     for (child, child_goal) in &winner.child_goals {
                         verify_optimization_context(memo, *child, child_goal.context)?;
                         let Some(child_winner) = memo
@@ -138,13 +139,22 @@ impl WinnerVerifier {
                             ));
                         };
                         child_costs.push(child_winner.cost);
+                        child_source_work.push(child_winner.source_work.as_ref());
+                    }
+                    let recomposed = super::engine::compose_candidate_cost_with_sources(
+                        winner.local_cost,
+                        winner.source_filter_apply_cost,
+                        &child_costs,
+                        &child_source_work,
+                        winner.cost_composition,
+                    )?;
+                    if recomposed.source_work != winner.source_work {
+                        return Err(paro_error::internal(
+                            "winner source-work evidence failed independent composition replay",
+                        ));
                     }
                     let mut recomputed_cost = super::engine::constrain_composed_cost_to_grant(
-                        super::engine::compose_candidate_cost(
-                            winner.local_cost,
-                            &child_costs,
-                            winner.cost_composition,
-                        )?,
+                        recomposed.cost,
                         winner.enforcer_cost_input,
                     )?
                     .ok_or_else(|| {
@@ -278,6 +288,11 @@ fn verify_joint_cost_proof(
     if proof.local_cost != winner.local_cost {
         return Err(paro_error::internal(
             "region JointCostProof local cost disagrees with its winner",
+        ));
+    }
+    if proof.source_filter_apply_cost != winner.source_filter_apply_cost {
+        return Err(paro_error::internal(
+            "region JointCostProof source-filter cost disagrees with its winner",
         ));
     }
     if proof.cost_composition != winner.cost_composition {
@@ -757,8 +772,10 @@ mod tests {
             ),
             provided: provided(),
             local_cost: SearchCost::ZERO,
+            source_filter_apply_cost: None,
             cost_composition: CostComposition::Sequential,
             cost: SearchCost::ZERO,
+            source_work: Box::new([]),
             physical_fingerprint: Fingerprint(212),
             joint_cost_proof: Some(crate::cascades::region::JointCostProof {
                 region: memo.regions().region_for_facet(facet).unwrap(),
@@ -777,6 +794,7 @@ mod tests {
                 }]),
                 dependencies: dependencies.into_boxed_slice(),
                 local_cost: SearchCost::ZERO,
+                source_filter_apply_cost: None,
                 cost_composition: CostComposition::Sequential,
             }),
         };
@@ -949,8 +967,10 @@ mod tests {
             ),
             provided: provided(),
             local_cost: SearchCost::ZERO,
+            source_filter_apply_cost: None,
             cost_composition: CostComposition::Sequential,
             cost: SearchCost::ZERO,
+            source_work: Box::new([]),
             physical_fingerprint: Fingerprint(400),
             joint_cost_proof: Some(crate::cascades::region::JointCostProof {
                 region: memo.regions().region_for_facet(facet).unwrap(),
@@ -971,6 +991,7 @@ mod tests {
                 ]),
                 dependencies: dependencies.into_boxed_slice(),
                 local_cost: SearchCost::ZERO,
+                source_filter_apply_cost: None,
                 cost_composition: CostComposition::Sequential,
             }),
         };
