@@ -20,6 +20,16 @@ use crate::join_order::relation_manager::RelationStats;
 /// Default fraction of preserved-side rows that match a SEMI/ANTI join.
 const DEFAULT_SEMI_ANTI_MATCH_FRACTION: f64 = 0.2;
 
+/// Distribution-free selectivity priors for comparisons between two columns.
+///
+/// Marginal NDV does not describe the ordering or correlation of two value
+/// domains. In particular, using `NDV^(2/3)` as an inequality denominator
+/// makes a residual range predicate arbitrarily more selective as the domain
+/// grows. Keep these priors independent of NDV until joint histograms or an
+/// explicit ordering model provide evidence to refine them.
+const DEFAULT_RANGE_JOIN_SELECTIVITY: f64 = 0.3;
+const DEFAULT_NOT_EQUAL_JOIN_SELECTIVITY: f64 = 0.9;
+
 /// Information about the denominator calculation.
 #[derive(Debug)]
 pub struct DenomInfo {
@@ -1012,11 +1022,8 @@ impl CardinalityEstimator {
                 }
                 let extra_ratio = match comparison_type {
                     Some(ComparisonKind::Equal) => filter.get_distinct_count() as f64,
-                    Some(ComparisonKind::NotEqual) | Some(ComparisonKind::Range) => {
-                        // Assume this blows up, but use tdom to bound it
-                        let tdom = filter.get_distinct_count() as f64;
-                        tdom.powf(2.0 / 3.0)
-                    }
+                    Some(ComparisonKind::NotEqual) => 1.0 / DEFAULT_NOT_EQUAL_JOIN_SELECTIVITY,
+                    Some(ComparisonKind::Range) => 1.0 / DEFAULT_RANGE_JOIN_SELECTIVITY,
                     None => 1.0,
                 };
 
@@ -1394,10 +1401,30 @@ mod tests {
         right_col: usize,
         filter_index: usize,
     ) -> Arc<FilterInfo> {
+        create_comparison_filter(
+            set_manager,
+            left_table,
+            left_col,
+            right_table,
+            right_col,
+            filter_index,
+            ComparisonType::Equal,
+        )
+    }
+
+    fn create_comparison_filter(
+        set_manager: &mut JoinRelationSetManager,
+        left_table: usize,
+        left_col: usize,
+        right_table: usize,
+        right_col: usize,
+        filter_index: usize,
+        comparison_type: ComparisonType,
+    ) -> Arc<FilterInfo> {
         let expr = Expression::Comparison(ComparisonExpression {
             left: Box::new(create_column_ref(left_table, left_col)),
             right: Box::new(create_column_ref(right_table, right_col)),
-            comparison_type: ComparisonType::Equal,
+            comparison_type,
         });
 
         let set = set_manager.get_relation_from_vec(vec![left_table, right_table]);
@@ -1603,6 +1630,53 @@ mod tests {
 
         // Expected: (1000 * 500) / max(100, 50) = 500000 / 100 = 5000
         assert!(cardinality > 0.0);
+    }
+
+    #[test]
+    fn range_join_selectivity_does_not_depend_on_marginal_ndv() {
+        let mut set_manager = JoinRelationSetManager::new();
+        let mut estimator = CardinalityEstimator::new();
+        let range =
+            create_comparison_filter(&mut set_manager, 0, 0, 1, 0, 0, ComparisonType::GreaterThan);
+        estimator.init_equivalent_relations(&[range]);
+
+        for relation in 0..=1 {
+            let set = set_manager.get_relation(relation);
+            let mut stats = RelationStats::with_cardinality(1_000);
+            stats.column_distinct_count =
+                column_distinct_counts(relation, [DistinctCount::new(1_000, true)]);
+            estimator.init_cardinality_estimator_props(&set, &stats);
+        }
+
+        let join = set_manager.get_relation_from_vec(vec![0, 1]);
+        assert_eq!(estimator.estimate_cardinality(&join), 300_000.0);
+    }
+
+    #[test]
+    fn range_residual_refines_equality_join_with_distribution_free_prior() {
+        let mut set_manager = JoinRelationSetManager::new();
+        let mut estimator = CardinalityEstimator::new();
+        let filters = vec![
+            create_equality_filter(&mut set_manager, 0, 0, 1, 0, 0),
+            create_comparison_filter(&mut set_manager, 0, 1, 1, 1, 1, ComparisonType::GreaterThan),
+        ];
+        estimator.init_equivalent_relations(&filters);
+
+        for relation in 0..=1 {
+            let set = set_manager.get_relation(relation);
+            let mut stats = RelationStats::with_cardinality(1_000);
+            stats.column_distinct_count = column_distinct_counts(
+                relation,
+                [
+                    DistinctCount::new(10, true),
+                    DistinctCount::new(1_000, true),
+                ],
+            );
+            estimator.init_cardinality_estimator_props(&set, &stats);
+        }
+
+        let join = set_manager.get_relation_from_vec(vec![0, 1]);
+        assert!((estimator.estimate_cardinality(&join) - 30_000.0).abs() < 1e-6);
     }
 
     #[test]

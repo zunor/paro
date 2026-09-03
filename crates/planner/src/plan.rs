@@ -61,6 +61,15 @@ pub enum CardinalityProvenance {
 pub struct NodeStats {
     pub estimated_cardinality: Option<CardinalityEstimate>,
     pub cardinality_provenance: CardinalityProvenance,
+    /// Conservative row-count estimate used only when this result becomes an
+    /// irreversible materialization, such as a hash-build input.
+    ///
+    /// This is deliberately independent of `estimated_cardinality`: an
+    /// equality or range selectivity can rank join orders without proving
+    /// that a filtered fact subtree is safe to materialize at the reduced
+    /// point estimate. It is neither a semantic upper bound nor a correctness
+    /// proof and must not clamp the group's cardinality envelope.
+    pub materialization_risk_cardinality: Option<u64>,
 }
 
 /// Logical plan wrapper that owns plan-node identity and node-local metadata.

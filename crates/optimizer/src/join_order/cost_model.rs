@@ -44,6 +44,10 @@ pub(crate) struct DPJoinNode {
     pub cardinality: f64,
     /// Cardinality used for risk-adjusted work costing.
     pub risk_cardinality: f64,
+    /// Conservative cardinality used only if this subtree is selected as an
+    /// irreversible build input. This keeps selectivity uncertainty from
+    /// being mistaken for a physical materialization proof.
+    pub materialization_cardinality: f64,
     /// Schema-dependent bytes emitted by this node.
     ///
     /// This cannot be recovered from `set`: reduction joins retain filtering
@@ -57,6 +61,29 @@ pub(crate) struct DPJoinNode {
 }
 
 impl DPJoinNode {
+    pub(crate) fn compact_shape(&self) -> String {
+        if self.is_leaf {
+            return self
+                .set
+                .relations()
+                .first()
+                .map_or_else(|| "?".to_string(), usize::to_string);
+        }
+        let left = self
+            .left_plan
+            .as_deref()
+            .map_or_else(|| "?".to_string(), Self::compact_shape);
+        let right = self
+            .right_plan
+            .as_deref()
+            .map_or_else(|| "?".to_string(), Self::compact_shape);
+        let build = match self.build_side {
+            JoinBuildSide::Left => "L",
+            JoinBuildSide::Right => "R",
+        };
+        format!("({left} {build} {right})")
+    }
+
     /// Create a leaf node (single relation).
     ///
     /// Leaf nodes have cost 0 since they represent base tables.
@@ -65,6 +92,7 @@ impl DPJoinNode {
         output_payload_width: usize,
         cardinality: f64,
         risk_cardinality: f64,
+        materialization_cardinality: f64,
     ) -> Self {
         Self {
             set: set.clone(),
@@ -78,6 +106,7 @@ impl DPJoinNode {
             cost: 0.0,
             cardinality,
             risk_cardinality,
+            materialization_cardinality,
             output_payload_width,
             peak_build_bytes: 0,
         }
@@ -102,6 +131,7 @@ impl DPJoinNode {
             cost: estimate.breakdown.total(),
             cardinality: estimate.cardinality,
             risk_cardinality: estimate.risk_cardinality,
+            materialization_cardinality: estimate.materialization_cardinality,
             output_payload_width: estimate.output_payload_width,
             peak_build_bytes: estimate.peak_build_bytes,
         }
@@ -133,6 +163,7 @@ struct CostedJoin {
     combination: Arc<JoinRelationSet>,
     cardinality: f64,
     risk_cardinality: f64,
+    materialization_cardinality: f64,
     output_payload_width: usize,
     breakdown: JoinCostBreakdown,
     build_side: JoinBuildSide,
@@ -383,6 +414,9 @@ impl CostModel {
         let right_materialization_rows = self
             .materialization_cardinality(&right.set)
             .max(right.risk_cardinality);
+        let output_materialization_rows = self
+            .materialization_cardinality(&combination)
+            .max(risk_join_rows);
         let (breakdown, build_side) = self.cost_breakdown_for_cardinality(JoinCostInputs {
             left,
             right,
@@ -396,6 +430,7 @@ impl CostModel {
             combination,
             cardinality: join_rows,
             risk_cardinality: risk_join_rows,
+            materialization_cardinality: output_materialization_rows,
             output_payload_width,
             breakdown,
             build_side,
@@ -688,6 +723,11 @@ impl CostModel {
             .estimate_cardinality(set)
             .max(self.get_cardinality(set))
     }
+
+    pub fn get_materialization_cardinality(&mut self, set: &JoinRelationSet) -> f64 {
+        self.materialization_cardinality(set)
+            .max(self.get_risk_cardinality(set))
+    }
 }
 
 #[cfg(test)]
@@ -829,6 +869,7 @@ mod tests {
             model.payload_width(set.as_ref()),
             cardinality,
             risk_cardinality,
+            model.get_materialization_cardinality(set.as_ref()),
         )
     }
 
@@ -844,7 +885,7 @@ mod tests {
         let mut set_manager = JoinRelationSetManager::new();
         let set = set_manager.get_relation(0);
 
-        let node = DPJoinNode::leaf(set.clone(), 7, 0.0, 0.0);
+        let node = DPJoinNode::leaf(set.clone(), 7, 0.0, 0.0, 0.0);
 
         assert!(node.is_leaf);
         assert_eq!(node.cost, 0.0);
@@ -862,12 +903,13 @@ mod tests {
 
         let node = DPJoinNode::intermediate(
             None,
-            &DPJoinNode::leaf(left.clone(), 5, 10.0, 10.0),
-            &DPJoinNode::leaf(right.clone(), 6, 5.0, 5.0),
+            &DPJoinNode::leaf(left.clone(), 5, 10.0, 10.0, 10.0),
+            &DPJoinNode::leaf(right.clone(), 6, 5.0, 5.0, 5.0),
             CostedJoin {
                 combination: combined.clone(),
                 cardinality: 50.0,
                 risk_cardinality: 50.0,
+                materialization_cardinality: 50.0,
                 output_payload_width: 11,
                 breakdown: JoinCostBreakdown {
                     build: 25.0,
@@ -1054,6 +1096,7 @@ mod tests {
             cost: 100.0,
             cardinality: 1000.0,
             risk_cardinality: 1000.0,
+            materialization_cardinality: 1000.0,
             output_payload_width: cost_model.payload_width(&left_set),
             peak_build_bytes: 0,
         };
@@ -1070,6 +1113,7 @@ mod tests {
             cost: 50.0,
             cardinality: 500.0,
             risk_cardinality: 500.0,
+            materialization_cardinality: 500.0,
             output_payload_width: cost_model.payload_width(&right_set),
             peak_build_bytes: 0,
         };

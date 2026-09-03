@@ -6,8 +6,8 @@
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
-use paro_catalog::entry::ConstraintType;
 use paro_common::error::Result;
+use paro_common::logging::targets;
 use paro_common::runtime_value::Value;
 use paro_common::types::LogicalType;
 use paro_context::StatementContext;
@@ -25,6 +25,7 @@ use paro_planner::operator::{
 };
 use paro_planner::plan::{CardinalityEstimate, CardinalityProvenance, LogicalPlan};
 use paro_storage::statistics::{ColumnStatistics, NumericStats};
+use tracing::debug;
 
 use crate::column::lifetime::ColumnLifetimeAnalyzer;
 use crate::cost_model::CostModel as LogicalCostModel;
@@ -76,47 +77,6 @@ fn has_open_ended_selectivity(expression: &Expression) -> bool {
         found |= has_open_ended_selectivity(child);
     });
     found
-}
-
-fn declared_unique_keys(plan: &LogicalPlan) -> Vec<Vec<ColumnBinding>> {
-    let get = match &plan.operator {
-        LogicalOperator::Get(get) => get,
-        LogicalOperator::Filter(filter) => return declared_unique_keys(&filter.child),
-        _ => return Vec::new(),
-    };
-    let Some(table) = &get.table else {
-        return Vec::new();
-    };
-
-    table
-        .constraints()
-        .iter()
-        .filter(|constraint| {
-            matches!(
-                constraint.constraint_type,
-                ConstraintType::Unique | ConstraintType::PrimaryKey
-            ) && !constraint.columns.is_empty()
-        })
-        .filter_map(|constraint| {
-            constraint
-                .columns
-                .iter()
-                .map(|column_id| {
-                    get.column_sources
-                        .iter()
-                        .position(|source| {
-                            matches!(
-                                source,
-                                paro_planner::operator::GetColumnSource::Stored {
-                                    column_id: candidate
-                                } if candidate == column_id
-                            )
-                        })
-                        .map(|column_index| ColumnBinding::new(get.table_index, column_index))
-                })
-                .collect::<Option<Vec<_>>>()
-        })
-        .collect()
 }
 
 fn integral_ordinal(value: &paro_common::runtime_value::Value) -> Option<u128> {
@@ -433,6 +393,14 @@ impl JoinOrderOptimizer {
 
         let mut result = Vec::with_capacity(final_plans.len());
         for final_plan in final_plans {
+            debug!(
+                target: targets::OPTIMIZER,
+                shape = %final_plan.compact_shape(),
+                cardinality = final_plan.cardinality,
+                cost = final_plan.cost,
+                peak_build_bytes = final_plan.peak_build_bytes,
+                "reconstructing join-order frontier member"
+            );
             let Some(reconstructed) =
                 self.reconstruct_plan(bind_context, &final_plan, &mut HashSet::new())?
             else {
@@ -727,7 +695,7 @@ impl JoinOrderOptimizer {
             crate::join::build_probe_side::estimate_row_payload_width(&plan.types());
         stats.contains_control_region =
             crate::join::build_probe_side::contains_control_region_boundary(plan);
-        stats.unique_keys = declared_unique_keys(plan);
+        stats.unique_keys = crate::statistics::unique_keys::proven_unique_keys(plan);
         let distinct_counts = plan
             .get_column_bindings()
             .into_iter()
@@ -783,11 +751,14 @@ impl JoinOrderOptimizer {
                 paro_common::error::internal(format!("Relation {} not found", relation_id))
             })?;
 
-            Ok(Some(self.attach_remaining_filters(
+            let mut result = self.attach_remaining_filters(
                 duplicate_plan_preserving_indices(relation, bind_context.shared().as_ref()),
                 &node.set,
                 used_filters,
-            )))
+            );
+            result.stats.materialization_risk_cardinality =
+                Some(Self::quantize_cardinality(node.materialization_cardinality));
+            Ok(Some(result))
         } else {
             let left_node = node.left_plan.as_deref().ok_or_else(|| {
                 paro_common::error::internal("join frontier member lost its left child")
@@ -867,6 +838,8 @@ impl JoinOrderOptimizer {
                     plan.stats.estimated_cardinality =
                         Some(Self::join_cardinality_estimate(node.cardinality));
                     plan.stats.cardinality_provenance = CardinalityProvenance::JoinGraph;
+                    plan.stats.materialization_risk_cardinality =
+                        Some(Self::quantize_cardinality(node.materialization_cardinality));
                     plan
                 } else {
                     debug_assert!(predicates.has_join_conditions());
@@ -875,6 +848,8 @@ impl JoinOrderOptimizer {
                     plan.stats.estimated_cardinality =
                         Some(Self::join_cardinality_estimate(node.cardinality));
                     plan.stats.cardinality_provenance = CardinalityProvenance::JoinGraph;
+                    plan.stats.materialization_risk_cardinality =
+                        Some(Self::quantize_cardinality(node.materialization_cardinality));
                     plan
                 }
             } else {
@@ -886,6 +861,8 @@ impl JoinOrderOptimizer {
                 plan.stats.estimated_cardinality =
                     Some(Self::join_cardinality_estimate(node.cardinality));
                 plan.stats.cardinality_provenance = CardinalityProvenance::JoinGraph;
+                plan.stats.materialization_risk_cardinality =
+                    Some(Self::quantize_cardinality(node.materialization_cardinality));
                 plan
             };
 
@@ -898,12 +875,15 @@ impl JoinOrderOptimizer {
     }
 
     fn join_cardinality_estimate(cardinality: f64) -> CardinalityEstimate {
-        let expected = if !cardinality.is_finite() || cardinality >= u64::MAX as f64 {
+        CardinalityEstimate::exact(Self::quantize_cardinality(cardinality))
+    }
+
+    fn quantize_cardinality(cardinality: f64) -> u64 {
+        if !cardinality.is_finite() || cardinality >= u64::MAX as f64 {
             u64::MAX
         } else {
             cardinality.max(1.0) as u64
-        };
-        CardinalityEstimate::exact(expected)
+        }
     }
 
     fn attach_remaining_filters(
@@ -961,9 +941,11 @@ impl JoinOrderOptimizer {
                 &self.column_stats,
             )
         });
+        let materialization_risk_cardinality = result.stats.materialization_risk_cardinality;
         result = LogicalPlan::synthetic(LogicalOperator::Filter(Filter::new(result, expressions)));
         result.stats.estimated_cardinality = estimated_cardinality;
         result.stats.cardinality_provenance = CardinalityProvenance::JoinGraph;
+        result.stats.materialization_risk_cardinality = materialization_risk_cardinality;
         result
     }
 
@@ -1520,9 +1502,12 @@ mod tests {
         let mut optimizer = JoinOrderOptimizer::new();
         optimizer.add_relation_plan(&make_test_session(), &bind_context, &plan);
         let mut left_stats = optimizer.relation_manager.get_relation_stats()[0].clone();
+        // Unique keys are sets. The shared proof layer canonicalizes them by
+        // output position after resolving the catalog IDs through this Get's
+        // reordered column sources.
         assert_eq!(
             left_stats.unique_keys,
-            vec![vec![ColumnBinding::new(40, 1), ColumnBinding::new(40, 0)]]
+            vec![vec![ColumnBinding::new(40, 0), ColumnBinding::new(40, 1)]]
         );
         left_stats.column_distinct_count = HashMap::from([
             (ColumnBinding::new(40, 0), DistinctCount::new(10, true)),

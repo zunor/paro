@@ -99,11 +99,13 @@ impl<'a> PlanEnumerator<'a> {
             let set = self.set_manager.get_relation(i);
             let cardinality = self.cost_model.get_cardinality(&set);
             let risk_cardinality = self.cost_model.get_risk_cardinality(&set);
+            let materialization_cardinality = self.cost_model.get_materialization_cardinality(&set);
             let node = DPJoinNode::leaf(
                 set.clone(),
                 self.cost_model.payload_width(set.as_ref()),
                 cardinality,
                 risk_cardinality,
+                materialization_cardinality,
             );
 
             self.plans.insert(set, vec![node]);
