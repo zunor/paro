@@ -117,6 +117,9 @@ enum ExactValues<T> {
 #[derive(Debug)]
 struct FrozenExactValues {
     values: Option<FixedMembership>,
+    /// Whether `values`, or the published contiguous min/max range, still
+    /// represents the complete non-null build-key domain.
+    exact: bool,
     _reservation: Option<RuntimeFilterReservation>,
 }
 
@@ -320,6 +323,7 @@ where
         else {
             return FrozenExactValues {
                 values: None,
+                exact: false,
                 _reservation: None,
             };
         };
@@ -327,6 +331,7 @@ where
         if values.len() > max_values {
             return FrozenExactValues {
                 values: None,
+                exact: false,
                 _reservation: None,
             };
         }
@@ -337,6 +342,7 @@ where
         let Ok(reservation) = memory.retain(freeze_additional_bytes) else {
             return FrozenExactValues {
                 values: None,
+                exact: false,
                 _reservation: None,
             };
         };
@@ -345,11 +351,13 @@ where
             reservation.release();
             return FrozenExactValues {
                 values: None,
+                exact: true,
                 _reservation: None,
             };
         }
         FrozenExactValues {
             values: Some(frozen),
+            exact: true,
             _reservation: Some(RuntimeFilterReservation(reservation)),
         }
     }
@@ -962,6 +970,12 @@ impl JoinRuntimeFilter {
             .get(build_key_index)
             .and_then(|key| key.predicate_for_column(probe_column_id))
     }
+
+    pub(crate) fn key_is_exact(&self, build_key_index: usize) -> bool {
+        self.keys
+            .get(build_key_index)
+            .is_some_and(JoinRuntimeFilterKey::is_exact)
+    }
 }
 
 #[derive(Debug)]
@@ -972,6 +986,23 @@ struct JoinRuntimeFilterKey {
 }
 
 impl JoinRuntimeFilterKey {
+    fn is_exact(&self) -> bool {
+        if self.non_null_count == 0 {
+            return false;
+        }
+        match &self.domain {
+            RuntimeFilterDomain::I32(domain) => domain.values.exact,
+            RuntimeFilterDomain::I64(domain) => domain.values.exact,
+            RuntimeFilterDomain::I128(domain) => domain.values.exact,
+            // Range-only domains are exact only when both endpoints identify
+            // the same value. With a declared-unique build key this is a
+            // complete one-row membership proof.
+            RuntimeFilterDomain::Generic(domain) => {
+                domain.comparable && domain.min.is_some() && domain.min == domain.max
+            }
+        }
+    }
+
     fn predicate_for_column(&self, column_id: ColumnId) -> Option<PredicateTree> {
         if self.non_null_count == 0 {
             return None;
@@ -1092,6 +1123,17 @@ fn exact_or_range_predicate<T: Copy + Eq + Ord>(
         });
     }
     if let Some(values) = domain.values.values.as_ref() {
+        // Fixed-width integer domains are discrete. A gap-free exact set is
+        // therefore identical to its inclusive range, while the range form
+        // enables zonemap pruning and a two-bound scan kernel instead of one
+        // membership lookup per row.
+        if values.is_contiguous() {
+            return Some(Predicate::Range {
+                column_id,
+                lower: to_value(min),
+                upper: to_value(max),
+            });
+        }
         return Some(Predicate::FixedIn {
             column_id,
             values: values.clone(),
@@ -1194,6 +1236,27 @@ mod tests {
     }
 
     #[test]
+    fn contiguous_exact_integer_domain_publishes_range() {
+        let allocator = test_allocator();
+        let vector = test_i64_vector_with_allocator(&[12, 10, 11, 12], allocator.clone());
+        let keys = Chunk::from_arc_vectors(vec![std::sync::Arc::new(vector)], allocator.clone());
+        let selection = SelectionVector::try_incremental(4, allocator).unwrap();
+        let mut builder = JoinRuntimeFilterBuilder::empty(&[LogicalType::BigInt]);
+        builder.add_key_chunk(&keys, &selection, 4).unwrap();
+        let filter = builder.freeze();
+
+        assert_eq!(
+            filter.predicate_for_column(0, 9),
+            Some(PredicateTree::leaf(Predicate::Range {
+                column_id: 9,
+                lower: Value::BigInt(10),
+                upper: Value::BigInt(12),
+            }))
+        );
+        assert!(filter.key_is_exact(0));
+    }
+
+    #[test]
     fn oversized_string_range_degrades_to_no_filter_within_its_contract() {
         let allocator = test_allocator();
         let oversized =
@@ -1236,15 +1299,17 @@ mod tests {
         let mut builder =
             JoinRuntimeFilterBuilder::empty_with_exact_value_limit(&[LogicalType::BigInt], 3);
         builder.add_key_chunk(&keys, &selection, 4).unwrap();
+        let filter = builder.freeze();
 
         assert_eq!(
-            builder.freeze().predicate_for_column(0, 9),
+            filter.predicate_for_column(0, 9),
             Some(PredicateTree::leaf(Predicate::Range {
                 column_id: 9,
                 lower: Value::BigInt(10),
                 upper: Value::BigInt(40),
             }))
         );
+        assert!(!filter.key_is_exact(0));
     }
 
     #[test]

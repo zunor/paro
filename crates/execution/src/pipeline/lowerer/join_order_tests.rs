@@ -2,7 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use super::*;
-use paro_optimizer::physical::ProjectSpec;
+use paro_optimizer::physical::{OutputPermutation, ProjectSpec};
 
 fn enable_runtime_filter(mut spec: HashJoinSpec) -> HashJoinSpec {
     spec.runtime_filter = Some(paro_optimizer::physical::HashJoinRuntimeFilterSpec {
@@ -41,6 +41,166 @@ fn projection_above_hash_join_stays_after_probe() {
         graph.pipelines[1].output.types.as_ref(),
         [LogicalType::Integer]
     );
+}
+
+#[test]
+fn union_all_probe_sources_share_one_build_and_runtime_filter_artifact() {
+    let mut plan = union_all_probe_hash_join_plan();
+    let physical_node_count = plan.nodes.len();
+    assert_eq!(
+        plan.nodes
+            .iter()
+            .filter(|node| matches!(node.kind, PhysicalNodeKind::HashJoin(_)))
+            .count(),
+        1,
+        "the selected physical plan owns exactly one join"
+    );
+
+    let join_children = plan.child_ids(&plan.node(plan.root).children).to_vec();
+    let [probe_root, build_root] = join_children.as_slice() else {
+        panic!("hash join should have probe and build children");
+    };
+    let mut pending = vec![*probe_root];
+    let mut probe_scans = Vec::new();
+    while let Some(node_id) = pending.pop() {
+        let children = plan.child_ids(&plan.node(node_id).children).to_vec();
+        if matches!(plan.node(node_id).kind, PhysicalNodeKind::Values(_)) {
+            plan.nodes.get_mut(node_id).unwrap().kind =
+                PhysicalNodeKind::RowsetScan(rowset_spec_for_test());
+            probe_scans.push(node_id);
+        } else {
+            pending.extend(children);
+        }
+    }
+    assert_eq!(probe_scans.len(), 3);
+
+    let artifact = paro_optimizer::physical::identity::Fingerprint(7);
+    let PhysicalNodeKind::HashJoin(spec) = &mut plan.nodes.get_mut(plan.root).unwrap().kind else {
+        panic!("expected hash join root");
+    };
+    *spec = enable_runtime_filter(spec.clone());
+    for &scan in &probe_scans {
+        plan.edges.push(
+            *build_root,
+            scan,
+            paro_optimizer::physical::PhysicalEdgeKind::RuntimeFilter(artifact),
+        );
+    }
+
+    let mut lowerer = PipelineLowerer::new(&plan);
+    let graph = lowerer.lower_to_pipeline_graph(plan.root).unwrap();
+
+    assert_eq!(plan.nodes.len(), physical_node_count);
+    assert_eq!(
+        plan.nodes
+            .iter()
+            .filter(|node| matches!(node.kind, PhysicalNodeKind::HashJoin(_)))
+            .count(),
+        1,
+        "pipeline decomposition must not rewrite or copy the Memo winner"
+    );
+    let hash_builds = graph
+        .pipelines
+        .iter()
+        .filter_map(|pipeline| match &pipeline.sink {
+            SinkSpec::HashJoinBuild(build) => Some((pipeline.id, build)),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    let [(build_pipeline, hash_build)] = hash_builds.as_slice() else {
+        panic!("all UNION ALL sources must share exactly one hash build");
+    };
+    assert_eq!(
+        hash_build.runtime_filter.as_ref().unwrap().artifact,
+        artifact
+    );
+
+    let probe_pipelines = graph
+        .pipelines
+        .iter()
+        .filter_map(|pipeline| {
+            pipeline
+                .transforms
+                .iter()
+                .find_map(|transform| match transform {
+                    TransformSpec::HashJoinProbe(probe) if probe.handle == hash_build.handle => {
+                        Some(pipeline)
+                    }
+                    _ => None,
+                })
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(probe_pipelines.len(), 3);
+    for pipeline in &probe_pipelines {
+        assert!(matches!(
+            pipeline.transforms.as_slice(),
+            [
+                TransformSpec::Filter(_),
+                TransformSpec::Filter(_),
+                TransformSpec::Project(_),
+                TransformSpec::HashJoinProbe(_)
+            ]
+        ));
+        let SourceSpec::Rowset(source) = &pipeline.source else {
+            panic!("each physical UNION ALL leaf should remain a rowset source");
+        };
+        assert_eq!(source.dynamic_runtime_filters.len(), 1);
+        assert_eq!(source.dynamic_runtime_filters[0].handle, hash_build.handle);
+        assert_eq!(source.dynamic_runtime_filters[0].artifact, artifact);
+    }
+    assert_eq!(
+        graph
+            .dependencies
+            .iter()
+            .filter(|dependency| {
+                dependency.producer == *build_pipeline
+                    && dependency.kind == DependencyKind::BuildBeforeProbe
+            })
+            .count(),
+        3
+    );
+}
+
+#[test]
+fn union_all_probe_source_collection_uses_an_explicit_stack() {
+    let mut plan = union_all_probe_hash_join_plan();
+    let join_children = plan.child_ids(&plan.node(plan.root).children).to_vec();
+    let [original_probe, build] = join_children.as_slice() else {
+        panic!("hash join should have probe and build children");
+    };
+    let mut probe = *original_probe;
+    const DEPTH: usize = 4_096;
+    for _ in 0..DEPTH {
+        let child = plan.children.pack(vec![probe]);
+        probe = plan.nodes.push(PhysicalPlanNode {
+            id: PhysicalPlanNodeId::INVALID,
+            output: RowType::new(vec!["probe_key".to_string()], vec![LogicalType::Integer]),
+            cardinality: None,
+            kind: PhysicalNodeKind::Project(ProjectSpec {
+                expressions: vec![Expression::Reference(ReferenceExpression::new(
+                    0,
+                    LogicalType::Integer,
+                ))]
+                .into_boxed_slice(),
+                output_names: vec!["probe_key".to_string()].into_boxed_slice(),
+                visible_count: 1,
+            }),
+            children: child,
+            label: OperatorLabel::new(PlanNodeId::SYNTHETIC, "PROJECT"),
+        });
+    }
+    let join_children = plan.children.pack(vec![probe, *build]);
+    plan.nodes.get_mut(plan.root).unwrap().children = join_children;
+
+    let lowerer = PipelineLowerer::new(&plan);
+    let sources = lowerer
+        .collect_union_all_probe_sources(probe)
+        .unwrap()
+        .expect("nested physical UNION ALL should expose its leaves");
+    assert_eq!(sources.len(), 3);
+    assert!(sources
+        .iter()
+        .all(|source| source.transforms.len() == DEPTH + 3));
 }
 
 #[test]
@@ -158,6 +318,75 @@ fn direct_rowset_probe_gets_hash_join_runtime_filter_gate() {
         rowset.dynamic_runtime_filters[0].artifact,
         paro_optimizer::physical::identity::Fingerprint(7)
     );
+}
+
+#[test]
+fn exact_unique_payload_free_probe_is_covered_only_by_its_rowset_filter() {
+    let plan = hash_join_plan(JoinType::Inner);
+    let lowerer = PipelineLowerer::new(&plan);
+    let mut spec = match &plan.node(plan.root).kind {
+        PhysicalNodeKind::HashJoin(spec) => enable_runtime_filter(spec.clone()),
+        _ => panic!("expected hash join plan"),
+    };
+    spec.build_keys_unique = true;
+    spec.build_output_count = 0;
+    spec.build_input_projection = Box::new([]);
+    spec.build_payload_types = Box::new([]);
+    spec.output_names = spec
+        .left_output_types
+        .iter()
+        .map(|_| "probe".into())
+        .collect();
+    spec.output_types = spec.left_output_types.clone();
+    spec.output_permutation = OutputPermutation::identity(spec.output_types.len());
+
+    let handle = BreakerHandleId::new(3);
+    let mut transforms = vec![hash_join_probe_transform(handle, &spec)];
+    let source = lowerer.attach_hash_join_runtime_filters(
+        SourceSpec::Rowset(RowsetSourceSpec::new(rowset_spec_for_test())),
+        &[],
+        handle,
+        &spec,
+    );
+    super::super::pipelines::confirm_covering_runtime_filters(&source, &mut transforms);
+    let TransformSpec::HashJoinProbe(probe) = &transforms[0] else {
+        panic!("expected hash join probe");
+    };
+    assert_eq!(probe.covering_runtime_filter_key, Some(0));
+
+    let mut unmatched = transforms;
+    let unrelated_source = SourceSpec::Rowset(RowsetSourceSpec::new(rowset_spec_for_test()));
+    super::super::pipelines::confirm_covering_runtime_filters(&unrelated_source, &mut unmatched);
+    let TransformSpec::HashJoinProbe(probe) = &unmatched[0] else {
+        panic!("expected hash join probe");
+    };
+    assert_eq!(probe.covering_runtime_filter_key, None);
+}
+
+#[test]
+fn runtime_filter_does_not_cover_non_unique_or_payload_probe() {
+    let plan = hash_join_plan(JoinType::Inner);
+    let mut spec = match &plan.node(plan.root).kind {
+        PhysicalNodeKind::HashJoin(spec) => enable_runtime_filter(spec.clone()),
+        _ => panic!("expected hash join plan"),
+    };
+    assert!(matches!(
+        hash_join_probe_transform(BreakerHandleId::new(3), &spec),
+        TransformSpec::HashJoinProbe(HashJoinProbeSpec {
+            covering_runtime_filter_key: None,
+            ..
+        })
+    ));
+
+    spec.build_keys_unique = true;
+    assert!(spec.build_output_count > 0);
+    assert!(matches!(
+        hash_join_probe_transform(BreakerHandleId::new(3), &spec),
+        TransformSpec::HashJoinProbe(HashJoinProbeSpec {
+            covering_runtime_filter_key: None,
+            ..
+        })
+    ));
 }
 
 #[test]

@@ -444,6 +444,28 @@ impl<'a> PipelineLowerer<'a> {
         pipelines: &mut Vec<PipelineSpec>,
         dependencies: &mut Vec<PipelineDependency>,
     ) -> Result<PipelineId> {
+        if let BreakerDispatch::SetOperation(spec) = &breaker {
+            if spec.op == paro_planner::operator::SetOpType::Union
+                && spec.all
+                && transforms.iter().all(|transform| {
+                    matches!(
+                        transform,
+                        TransformSpec::Filter(_) | TransformSpec::Project(_)
+                    )
+                })
+                && !matches!(sink, SinkSpec::ClientResult(_))
+            {
+                return self.lower_union_all_to_sink(
+                    root,
+                    transforms,
+                    sink,
+                    sink_sharing,
+                    output,
+                    pipelines,
+                    dependencies,
+                );
+            }
+        }
         match breaker {
             breaker @ (BreakerDispatch::TopN(_)
             | BreakerDispatch::Sort(_)

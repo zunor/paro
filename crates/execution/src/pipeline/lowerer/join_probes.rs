@@ -383,6 +383,7 @@ impl<'a> PipelineLowerer<'a> {
                 children.len()
             )));
         };
+        let union_probe_sources = self.collect_union_all_probe_sources(*left)?;
 
         let join_output = RowType::new(spec.output_names.to_vec(), spec.output_types.to_vec());
         let handle = self.handles.register(
@@ -424,7 +425,7 @@ impl<'a> PipelineLowerer<'a> {
         } else {
             consumer_transforms.clone()
         };
-        let (branch_sink, branch_sharing, branch_output) =
+        let (branch_sink, mut branch_sharing, branch_output) =
             if let Some((_, handle, spec, input)) = topn_merge.as_ref() {
                 (
                     SinkSpec::TopNBuild(TopNBuildSinkSpec {
@@ -455,6 +456,9 @@ impl<'a> PipelineLowerer<'a> {
                 };
                 (sink.clone(), sharing, output.clone())
             };
+        if union_probe_sources.is_some() && matches!(branch_sharing, SinkSharing::Exclusive) {
+            branch_sharing = SinkSharing::Shared(self.next_shared_sink());
+        }
 
         let producer = self.lower_subtree_to_sink(
             *right,
@@ -498,24 +502,79 @@ impl<'a> PipelineLowerer<'a> {
             }
         }
 
-        let mut chain = self.collect_probe_roles(*left, pipelines, dependencies)?;
-        chain
-            .transforms
-            .push(hash_join_probe_transform(handle, spec));
-        chain.transforms.extend(branch_transforms.iter().cloned());
-        chain.pending_builds.push(PendingProbeDependency {
-            producer,
-            handle,
-            kind: DependencyKind::BuildBeforeProbe,
-        });
-        let pushed = self.push_collected_probe_chain(
-            chain,
-            branch_sink.clone(),
-            branch_sharing,
-            branch_output.clone(),
-            pipelines,
-            dependencies,
-        )?;
+        let mut pushed_branches = Vec::new();
+        if let Some(probe_sources) = union_probe_sources {
+            pushed_branches.reserve(probe_sources.len());
+            // Every physical source probes the same handle built above. The
+            // hash join itself and its runtime-filter artifact remain single
+            // instances owned by the selected physical-plan node.
+            for source in probe_sources {
+                let mut transforms = source.transforms;
+                transforms.push(hash_join_probe_transform(handle, spec));
+                transforms.extend(branch_transforms.iter().cloned());
+                let first_pipeline = pipelines.len();
+                let tail = self.lower_subtree_with_consumer_transforms_to_sink(
+                    source.root,
+                    transforms,
+                    branch_sink.clone(),
+                    branch_sharing,
+                    branch_output.clone(),
+                    pipelines,
+                    dependencies,
+                )?;
+                let mut attached = false;
+                for pipeline in &pipelines[first_pipeline..] {
+                    let consumes_outer_join = pipeline.transforms.iter().any(|transform| {
+                        matches!(
+                            transform,
+                            TransformSpec::HashJoinProbe(probe) if probe.handle == handle
+                        )
+                    });
+                    if !consumes_outer_join {
+                        continue;
+                    }
+                    attached = true;
+                    self.handles.add_consumer(handle, pipeline.id)?;
+                    let dependency = PipelineDependency {
+                        producer,
+                        consumer: pipeline.id,
+                        kind: DependencyKind::BuildBeforeProbe,
+                    };
+                    if !dependencies.contains(&dependency) {
+                        dependencies.push(dependency);
+                    }
+                }
+                if !attached {
+                    return Err(paro_error::internal(
+                        "distributed UNION ALL branch lost its hash-join probe transform",
+                    ));
+                }
+                pushed_branches.push(PipelineChain { entry: tail, tail });
+            }
+        } else {
+            let mut chain = self.collect_probe_roles(*left, pipelines, dependencies)?;
+            chain
+                .transforms
+                .push(hash_join_probe_transform(handle, spec));
+            chain.transforms.extend(branch_transforms.iter().cloned());
+            chain.pending_builds.push(PendingProbeDependency {
+                producer,
+                handle,
+                kind: DependencyKind::BuildBeforeProbe,
+            });
+            pushed_branches.push(self.push_collected_probe_chain(
+                chain,
+                branch_sink.clone(),
+                branch_sharing,
+                branch_output.clone(),
+                pipelines,
+                dependencies,
+            )?);
+        }
+        let pushed = pushed_branches
+            .first()
+            .copied()
+            .ok_or_else(|| paro_error::internal("UNION ALL probe produced no branches"))?;
 
         // Non-forced hash joins can still switch to external mode during build
         // finish under memory pressure. Keep the replay fence in the graph for
@@ -535,11 +594,13 @@ impl<'a> PipelineLowerer<'a> {
             pipelines,
         )?;
         self.handles.add_consumer(handle, replay.entry)?;
-        dependencies.push(PipelineDependency {
-            producer: pushed.tail,
-            consumer: replay.entry,
-            kind: DependencyKind::ProbeBeforeSpillReplay,
-        });
+        for pushed_branch in pushed_branches {
+            dependencies.push(PipelineDependency {
+                producer: pushed_branch.tail,
+                consumer: replay.entry,
+                kind: DependencyKind::ProbeBeforeSpillReplay,
+            });
+        }
 
         let mut last_branch = replay.tail;
 
@@ -548,6 +609,7 @@ impl<'a> PipelineLowerer<'a> {
                 handle,
                 join_type: spec.join_type,
                 left_output_types: spec.left_output_types.clone(),
+                output_permutation: spec.output_permutation.clone(),
                 output_names: spec.output_names.clone(),
                 output_types: spec.output_types.clone(),
                 reduction_cascade: spec.reduction_cascade.clone(),
@@ -616,6 +678,60 @@ impl<'a> PipelineLowerer<'a> {
             kind: DependencyKind::FinalizeBeforeEmit,
         });
         Ok(merged.tail)
+    }
+
+    /// Collect independently schedulable leaves from a physical `UNION ALL`
+    /// probe subtree.
+    ///
+    /// This deliberately lives below physical-plan selection. It removes the
+    /// union fan-in barrier from execution and copies only stateless physical
+    /// Project/Filter transforms on the path to each source. It must not grow
+    /// a logical join per branch, duplicate the build, mint another artifact,
+    /// or otherwise reinterpret the Memo winner.
+    pub(super) fn collect_union_all_probe_sources(
+        &self,
+        root: PhysicalPlanNodeId,
+    ) -> Result<Option<Vec<UnionAllProbeSource>>> {
+        let mut found_union = false;
+        let mut sources = Vec::new();
+        let mut pending = vec![(root, Vec::new())];
+        while let Some((root, mut upper_transforms)) = pending.pop() {
+            let node = self.plan.node(root);
+            match &node.kind {
+                PhysicalNodeKind::Project(spec) => {
+                    upper_transforms.push(TransformSpec::Project(spec.clone()));
+                    pending.push((self.only_child(root)?, upper_transforms));
+                }
+                PhysicalNodeKind::Filter(spec) => {
+                    upper_transforms.push(TransformSpec::Filter(spec.clone()));
+                    pending.push((self.only_child(root)?, upper_transforms));
+                }
+                PhysicalNodeKind::SetOperation(spec)
+                    if spec.op == paro_planner::operator::SetOpType::Union && spec.all =>
+                {
+                    found_union = true;
+                    let children = self.plan.child_ids(&node.children);
+                    let [left, right] = children else {
+                        return Err(paro_error::internal(format!(
+                            "{} expected two UNION ALL probe children, got {}",
+                            node.label.display_name,
+                            children.len()
+                        )));
+                    };
+                    // LIFO order keeps physical left-to-right source order.
+                    pending.push((*right, upper_transforms.clone()));
+                    pending.push((*left, upper_transforms));
+                }
+                _ => {
+                    upper_transforms.reverse();
+                    sources.push(UnionAllProbeSource {
+                        root,
+                        transforms: upper_transforms,
+                    });
+                }
+            }
+        }
+        Ok(found_union.then_some(sources))
     }
 
     /// Lower the primary fused probe path and every external-join continuation
@@ -949,6 +1065,7 @@ fn hash_join_spill_replay_source(
         build_payload_types: spec.build_payload_types.clone(),
         build_output_count: spec.build_output_count,
         left_projection: spec.left_projection.clone(),
+        output_permutation: spec.output_permutation.clone(),
         output_names: spec.output_names.clone(),
         output_types: spec.output_types.clone(),
         reduction_cascade: spec.reduction_cascade.clone(),

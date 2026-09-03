@@ -105,6 +105,7 @@ fn left_only_output_replaces_shared_vectors_before_cardinality_change() {
         &[0],
         &first_selection,
         &[],
+        &OutputPermutation::identity(1),
     )
     .unwrap();
     assert!(Arc::ptr_eq(&result.data[0], &left_first.data[0]));
@@ -119,6 +120,7 @@ fn left_only_output_replaces_shared_vectors_before_cardinality_change() {
         &[0],
         &second_selection,
         &[],
+        &OutputPermutation::identity(1),
     )
     .expect("left-only batch replacement must not allocate");
     assert!(Arc::ptr_eq(&result.data[0], &left_second.data[0]));
@@ -350,14 +352,28 @@ fn test_next_left_join_emits_matches_then_unmatched_rows() {
     );
 
     let first = scan
-        .next_left_join(&keys, &left, &mut result, &ht, &[0])
+        .next_left_join(
+            &keys,
+            &left,
+            &mut result,
+            &ht,
+            &[0],
+            &OutputPermutation::identity(2),
+        )
         .unwrap();
     assert_eq!(first, 1);
     assert_eq!(result.data[0].get_value(0).to_string(), "1");
     assert_eq!(result.data[1].get_value(0).to_string(), "10");
 
     let second = scan
-        .next_left_join(&keys, &left, &mut result, &ht, &[0])
+        .next_left_join(
+            &keys,
+            &left,
+            &mut result,
+            &ht,
+            &[0],
+            &OutputPermutation::identity(2),
+        )
         .unwrap();
     assert_eq!(second, 1);
     assert_eq!(result.data[0].get_value(0).to_string(), "3");
@@ -372,7 +388,14 @@ fn test_next_semi_anti_and_mark_join() {
     let mut semi_result =
         paro_common::test_utils::test_chunk_with_capacity(&[LogicalType::Integer], 2);
     let semi_count = semi_scan
-        .next_semi_join(&keys, &left, &mut semi_result, &ht, &[0])
+        .next_semi_join(
+            &keys,
+            &left,
+            &mut semi_result,
+            &ht,
+            &[0],
+            &OutputPermutation::identity(1),
+        )
         .unwrap();
     assert_eq!(semi_count, 1);
     assert_eq!(semi_result.data[0].get_value(0).to_string(), "1");
@@ -381,7 +404,14 @@ fn test_next_semi_anti_and_mark_join() {
     let mut anti_result =
         paro_common::test_utils::test_chunk_with_capacity(&[LogicalType::Integer], 2);
     let anti_count = anti_scan
-        .next_anti_join(&keys, &left, &mut anti_result, &ht, &[0])
+        .next_anti_join(
+            &keys,
+            &left,
+            &mut anti_result,
+            &ht,
+            &[0],
+            &OutputPermutation::identity(1),
+        )
         .unwrap();
     assert_eq!(anti_count, 1);
     assert_eq!(anti_result.data[0].get_value(0).to_string(), "3");
@@ -392,7 +422,14 @@ fn test_next_semi_anti_and_mark_join() {
         2,
     );
     let mark_count = mark_scan
-        .next_mark_join(&keys, &left, &mut mark_result, &ht, &[0])
+        .next_mark_join(
+            &keys,
+            &left,
+            &mut mark_result,
+            &ht,
+            &[0],
+            &OutputPermutation::identity(2),
+        )
         .unwrap();
     assert_eq!(mark_count, 2);
     assert_eq!(mark_result.data[1].get_value(0).to_string(), "true");
@@ -411,7 +448,14 @@ fn existence_joins_drain_probe_batches_larger_than_the_output_vector() {
     let (mut semi_scan, probe_keys, left) = prepare_probe(&semi_table, &keys);
     for batch in 0..2 {
         let count = semi_scan
-            .next_semi_join(&probe_keys, &left, &mut result, &semi_table, &[0])
+            .next_semi_join(
+                &probe_keys,
+                &left,
+                &mut result,
+                &semi_table,
+                &[0],
+                &OutputPermutation::identity(1),
+            )
             .unwrap();
         assert_eq!(count, VECTOR_SIZE);
         assert_eq!(
@@ -425,7 +469,14 @@ fn existence_joins_drain_probe_batches_larger_than_the_output_vector() {
     let (mut anti_scan, probe_keys, left) = prepare_probe(&anti_table, &keys);
     for batch in 0..2 {
         let count = anti_scan
-            .next_anti_join(&probe_keys, &left, &mut result, &anti_table, &[0])
+            .next_anti_join(
+                &probe_keys,
+                &left,
+                &mut result,
+                &anti_table,
+                &[0],
+                &OutputPermutation::identity(1),
+            )
             .unwrap();
         assert_eq!(count, VECTOR_SIZE);
         assert_eq!(
@@ -438,7 +489,14 @@ fn existence_joins_drain_probe_batches_larger_than_the_output_vector() {
     let (mut null_aware_scan, probe_keys, left) = prepare_probe(&anti_table, &keys);
     for batch in 0..2 {
         let count = null_aware_scan
-            .next_null_aware_anti_join(&probe_keys, &left, &mut result, &anti_table, &[0])
+            .next_null_aware_anti_join(
+                &probe_keys,
+                &left,
+                &mut result,
+                &anti_table,
+                &[0],
+                &OutputPermutation::identity(1),
+            )
             .unwrap();
         assert_eq!(count, VECTOR_SIZE);
         assert_eq!(
@@ -468,7 +526,14 @@ fn test_not_distinct_from_semi_and_anti_join_respect_null_matches() {
     let mut semi_result =
         paro_common::test_utils::test_chunk_with_capacity(&[LogicalType::Integer], 3);
     let semi_count = semi_scan
-        .next_semi_join(&keys, &left, &mut semi_result, &ht, &[0])
+        .next_semi_join(
+            &keys,
+            &left,
+            &mut semi_result,
+            &ht,
+            &[0],
+            &OutputPermutation::identity(1),
+        )
         .unwrap();
     assert_eq!(semi_count, 2);
     assert!(semi_result.data[0].is_null(0));
@@ -481,7 +546,14 @@ fn test_not_distinct_from_semi_and_anti_join_respect_null_matches() {
     let mut anti_result =
         paro_common::test_utils::test_chunk_with_capacity(&[LogicalType::Integer], 3);
     let anti_count = anti_scan
-        .next_anti_join(&keys, &left, &mut anti_result, &ht, &[0])
+        .next_anti_join(
+            &keys,
+            &left,
+            &mut anti_result,
+            &ht,
+            &[0],
+            &OutputPermutation::identity(1),
+        )
         .unwrap();
     assert_eq!(anti_count, 1);
     assert_eq!(anti_result.data[0].get_value(0).to_string(), "1");
@@ -497,13 +569,44 @@ fn test_next_single_join_null_fills_unmatched_rows() {
     );
 
     let count = scan
-        .next_single_join(&keys, &left, &mut result, &ht, &[0])
+        .next_single_join(
+            &keys,
+            &left,
+            &mut result,
+            &ht,
+            &[0],
+            &OutputPermutation::identity(2),
+        )
         .unwrap();
     assert_eq!(count, 2);
     assert_eq!(result.data[0].get_value(0).to_string(), "1");
     assert_eq!(result.data[1].get_value(0).to_string(), "10");
     assert_eq!(result.data[0].get_value(1).to_string(), "3");
     assert!(result.data[1].is_null(1));
+}
+
+#[test]
+fn test_next_single_join_honors_output_permutation() {
+    let ht = build_hash_table(JoinType::Single, &[1], &[10]);
+    let (mut scan, keys, left) = prepare_probe(&ht, &[1]);
+    let mut result = paro_common::test_utils::test_chunk_with_capacity(
+        &[LogicalType::Integer, LogicalType::Integer],
+        1,
+    );
+
+    let count = scan
+        .next_single_join(
+            &keys,
+            &left,
+            &mut result,
+            &ht,
+            &[0],
+            &OutputPermutation::from_forward([1, 0]).unwrap(),
+        )
+        .unwrap();
+    assert_eq!(count, 1);
+    assert_eq!(result.data[0].get_value(0), Value::Integer(10));
+    assert_eq!(result.data[1].get_value(0), Value::Integer(1));
 }
 
 #[test]
@@ -516,7 +619,14 @@ fn test_next_single_join_errors_on_duplicates() {
     );
 
     let err = scan
-        .next_single_join(&keys, &left, &mut result, &ht, &[0])
+        .next_single_join(
+            &keys,
+            &left,
+            &mut result,
+            &ht,
+            &[0],
+            &OutputPermutation::identity(2),
+        )
         .unwrap_err();
     assert!(err
         .to_string()
@@ -536,7 +646,14 @@ fn test_next_single_join_drains_probe_larger_than_output_vector() {
     );
 
     let first = scan
-        .next_single_join(&probe_keys, &left, &mut result, &ht, &[0])
+        .next_single_join(
+            &probe_keys,
+            &left,
+            &mut result,
+            &ht,
+            &[0],
+            &OutputPermutation::identity(2),
+        )
         .unwrap();
     assert_eq!(first, VECTOR_SIZE);
     assert!(!scan.finished);
@@ -547,7 +664,14 @@ fn test_next_single_join_drains_probe_larger_than_output_vector() {
     );
 
     let second = scan
-        .next_single_join(&probe_keys, &left, &mut result, &ht, &[0])
+        .next_single_join(
+            &probe_keys,
+            &left,
+            &mut result,
+            &ht,
+            &[0],
+            &OutputPermutation::identity(2),
+        )
         .unwrap();
     assert_eq!(second, VECTOR_SIZE);
     assert!(scan.finished);
@@ -576,13 +700,27 @@ fn test_next_single_join_uses_capacity_after_output_reset() {
     result.set_capacity(4);
 
     let first = scan
-        .next_single_join(&probe_keys, &left, &mut result, &ht, &[0])
+        .next_single_join(
+            &probe_keys,
+            &left,
+            &mut result,
+            &ht,
+            &[0],
+            &OutputPermutation::identity(2),
+        )
         .unwrap();
     assert_eq!(first, 2);
     assert!(!scan.finished);
 
     let second = scan
-        .next_single_join(&probe_keys, &left, &mut result, &ht, &[0])
+        .next_single_join(
+            &probe_keys,
+            &left,
+            &mut result,
+            &ht,
+            &[0],
+            &OutputPermutation::identity(2),
+        )
         .unwrap();
     assert_eq!(second, 2);
     assert!(scan.finished);
@@ -653,12 +791,19 @@ fn test_next_inner_join_marks_build_rows_for_right_join_source_scan() {
     );
 
     let count = scan
-        .next_inner_join(&keys, &left, &mut result, &ht, &[0])
+        .next_inner_join(
+            &keys,
+            &left,
+            &mut result,
+            &ht,
+            &[0],
+            &OutputPermutation::from_forward([1, 0]).unwrap(),
+        )
         .unwrap();
     assert_eq!(count, 1);
-    assert_eq!(result.data[0].get_value(0).to_string(), "1");
-    assert_eq!(result.data[1].get_value(0).to_string(), "10");
-    assert!(Arc::ptr_eq(&result.data[0], &left.data[0]));
+    assert_eq!(result.data[0].get_value(0).to_string(), "10");
+    assert_eq!(result.data[1].get_value(0).to_string(), "1");
+    assert!(Arc::ptr_eq(&result.data[1], &left.data[0]));
 
     let mut unmatched_state = ht.create_full_outer_scan_state();
     let mut unmatched = Chunk::try_new(paro_common::test_utils::test_allocator())
@@ -684,7 +829,12 @@ fn exact_unique_left_only_inner_join_reuses_index_selection() {
     let mut result = paro_common::test_utils::test_chunk_with_capacity(&[LogicalType::Varchar], 1);
 
     let count = scan
-        .next_exact_unique_left_only_inner_join(&left, &mut result, &[0])
+        .next_exact_unique_left_only_inner_join(
+            &left,
+            &mut result,
+            &[0],
+            &OutputPermutation::identity(1),
+        )
         .unwrap();
 
     assert_eq!(count, 2);
@@ -706,7 +856,14 @@ fn repeated_build_matches_preserve_varlen_payload_as_dictionary() {
     );
 
     let count = scan
-        .next_inner_join(&keys, &left, &mut result, &ht, &[0])
+        .next_inner_join(
+            &keys,
+            &left,
+            &mut result,
+            &ht,
+            &[0],
+            &OutputPermutation::identity(2),
+        )
         .unwrap();
 
     assert_eq!(count, 3);
@@ -727,4 +884,30 @@ fn repeated_build_matches_preserve_varlen_payload_as_dictionary() {
             Value::Varchar("shared-build-value".to_string())
         );
     }
+}
+
+#[test]
+fn matched_join_writes_probe_and_build_columns_to_permuted_destinations() {
+    let ht = build_string_hash_table(&[1], &["build"]);
+    let (mut scan, keys, probe) = prepare_probe(&ht, &[1]);
+    let mut result = paro_common::test_utils::test_chunk_with_capacity(
+        &[LogicalType::Varchar, LogicalType::Integer],
+        1,
+    );
+
+    let count = scan
+        .next_inner_join(
+            &keys,
+            &probe,
+            &mut result,
+            &ht,
+            &[0],
+            &OutputPermutation::from_forward([1, 0]).unwrap(),
+        )
+        .unwrap();
+
+    assert_eq!(count, 1);
+    assert_eq!(result.data[0].get_value(0), Value::Varchar("build".into()));
+    assert_eq!(result.data[1].get_value(0), Value::Integer(1));
+    assert!(Arc::ptr_eq(&result.data[1], &probe.data[0]));
 }

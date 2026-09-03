@@ -213,56 +213,54 @@ fn transform_external_cross_product(
         )?);
     }
 
-    loop {
-        let build = local
-            .external_chunk
-            .as_mut()
-            .expect("external cross product scratch initialized above");
-        if !local.external_chunk_ready {
-            loop {
-                let Some(store) = stores.get(local.external_store) else {
-                    local.probe_in_progress = false;
-                    output.try_set_cardinality(0)?;
-                    return Ok(TransformPoll::NeedMoreInput);
-                };
-                let count = store.scan_with_state(&mut local.external_scan, build)?;
-                if count > 0 {
-                    local.external_chunk_ready = true;
-                    local.probe_row = 0;
-                    break;
-                }
-                local.external_store += 1;
-                local.external_scan.reset();
+    let build = local
+        .external_chunk
+        .as_mut()
+        .expect("external cross product scratch initialized above");
+    if !local.external_chunk_ready {
+        loop {
+            let Some(store) = stores.get(local.external_store) else {
+                local.probe_in_progress = false;
+                output.try_set_cardinality(0)?;
+                return Ok(TransformPoll::NeedMoreInput);
+            };
+            let count = store.scan_with_state(&mut local.external_scan, build)?;
+            if count > 0 {
+                local.external_chunk_ready = true;
+                local.probe_row = 0;
+                break;
             }
+            local.external_store += 1;
+            local.external_scan.reset();
         }
+    }
 
-        let count = build.size();
-        if count == 1 {
-            emit_scalar_build_batch(input, build, left_column_count, output)?;
-            local.external_chunk_ready = false;
-            local.probe_row = 0;
-            return Ok(TransformPoll::OutputMore);
-        }
-        emit_cross_product_batch(
-            input,
-            build,
-            left_column_count,
-            local.probe_row,
-            0,
-            count,
-            output,
-        )?;
-        local.probe_row += 1;
-        if local.probe_row >= input.size() {
-            // Reuse each external build block for the whole probe vector
-            // before advancing the disk cursor. This changes external cross
-            // product I/O from one full build scan per probe row to one scan
-            // per probe chunk while retaining vector-bounded output.
-            local.external_chunk_ready = false;
-            local.probe_row = 0;
-        }
+    let count = build.size();
+    if count == 1 {
+        emit_scalar_build_batch(input, build, left_column_count, output)?;
+        local.external_chunk_ready = false;
+        local.probe_row = 0;
         return Ok(TransformPoll::OutputMore);
     }
+    emit_cross_product_batch(
+        input,
+        build,
+        left_column_count,
+        local.probe_row,
+        0,
+        count,
+        output,
+    )?;
+    local.probe_row += 1;
+    if local.probe_row >= input.size() {
+        // Reuse each external build block for the whole probe vector
+        // before advancing the disk cursor. This changes external cross
+        // product I/O from one full build scan per probe row to one scan
+        // per probe chunk while retaining vector-bounded output.
+        local.external_chunk_ready = false;
+        local.probe_row = 0;
+    }
+    Ok(TransformPoll::OutputMore)
 }
 
 fn singleton_build_chunk(build_chunks: &[Chunk]) -> Option<&Chunk> {

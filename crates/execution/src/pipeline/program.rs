@@ -477,6 +477,7 @@ impl OperatorRuntimeRegistry {
                     build_output_count: spec.build_output_count,
                     build_payload_types: spec.build_payload_types.clone(),
                     left_projection: spec.left_projection.clone(),
+                    output_permutation: spec.output_permutation.clone(),
                     output_types: spec.output_types.clone(),
                     reduction_cascade: spec.reduction_cascade.clone(),
                 })
@@ -486,6 +487,7 @@ impl OperatorRuntimeRegistry {
                     handle: HandleRef::new(spec.handle),
                     join_type: spec.join_type,
                     left_output_types: spec.left_output_types.clone(),
+                    output_permutation: spec.output_permutation.clone(),
                     output_types: spec.output_types.clone(),
                     reduction_cascade: spec.reduction_cascade.clone(),
                 })
@@ -564,12 +566,14 @@ impl OperatorRuntimeRegistry {
             TransformSpec::HashJoinProbe(spec) => {
                 TransformExec::HashJoinProbe(HashJoinProbeTransformExec {
                     handle: HandleRef::new(spec.handle),
+                    covering_runtime_filter_key: spec.covering_runtime_filter_key,
                     join_type: spec.join_type,
                     anti_join_mode: spec.anti_join_mode,
                     key_conditions: spec.key_conditions.clone(),
                     build_residual_conditions: spec.build_residual_conditions.clone(),
                     probe_residual_count: spec.probe_residual_count,
                     left_projection: spec.left_projection.clone(),
+                    output_permutation: spec.output_permutation.clone(),
                     output_types: spec.output_types.clone(),
                     reduction_cascade: spec.reduction_cascade.clone(),
                 })
@@ -956,7 +960,7 @@ mod tests {
     use crate::physical::row_type::RowType;
     use crate::physical::specs::{
         AggregateSpec, DeleteSpec, DummyScanSpec, FilterSpec, GraphExpandSpec, GraphScanSpec,
-        LimitSpec, ProjectSpec, ValuesSpec,
+        LimitSpec, OutputPermutation, ProjectSpec, ValuesSpec,
     };
     use crate::runtime::{OperatorRole, RuntimeRoleOrdinal};
 
@@ -1023,6 +1027,7 @@ mod tests {
     fn empty_aggregate_spec() -> AggregateSpec {
         AggregateSpec {
             grouping_key_count: 0,
+            initial_lookup_hash_key_count: 0,
             state_output_projection: Box::new([]),
             estimated_input_rows: None,
             projection_exprs: Box::new([]),
@@ -1418,18 +1423,21 @@ mod tests {
                         build_payload_types: Box::new([LogicalType::Integer]),
                         build_output_count: 1,
                         left_projection: Box::new([0]),
+                        output_permutation: OutputPermutation::identity(2),
                         output_names: Box::new(["l".to_string(), "r".to_string()]),
                         output_types: Box::new([LogicalType::Integer, LogicalType::Integer]),
                         reduction_cascade: None,
                     }),
                     transforms: vec![TransformSpec::HashJoinProbe(HashJoinProbeSpec {
                         handle: join,
+                        covering_runtime_filter_key: None,
                         join_type: JoinType::Inner,
                         anti_join_mode: AntiJoinMode::Regular,
                         key_conditions: Box::new([join_condition()]),
                         build_residual_conditions: Box::default(),
                         probe_residual_count: 0,
                         left_projection: Box::new([0]),
+                        output_permutation: OutputPermutation::identity(2),
                         output_names: Box::new(["l".to_string(), "r".to_string()]),
                         output_types: Box::new([LogicalType::Integer, LogicalType::Integer]),
                         reduction_cascade: None,

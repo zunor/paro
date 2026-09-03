@@ -8,12 +8,14 @@ impl<'a> PipelineLowerer<'a> {
     pub(crate) fn push_pipeline(
         &mut self,
         source: SourceSpec,
-        transforms: Vec<TransformSpec>,
+        mut transforms: Vec<TransformSpec>,
         sink: SinkSpec,
         sink_sharing: SinkSharing,
         output: RowType,
         pipelines: &mut Vec<PipelineSpec>,
     ) -> Result<PipelineChain> {
+        confirm_covering_runtime_filters(&source, &mut transforms);
+        let transforms = fuse_adjacent_projects(transforms);
         let properties = self.build_pipeline_properties(&source, &transforms, &sink);
         let id = self.push_pipeline_stage(
             source,
@@ -137,4 +139,58 @@ impl<'a> PipelineLowerer<'a> {
         graph.validate()?;
         Ok(graph)
     }
+}
+
+/// A probe candidate is safe only in the concrete pipeline whose rowset
+/// source owns the matching dynamic predicate. Spill replay, CTE scans, and
+/// branches where lineage could not reach storage retain the ordinary probe.
+pub(super) fn confirm_covering_runtime_filters(
+    source: &SourceSpec,
+    transforms: &mut [TransformSpec],
+) {
+    let SourceSpec::Rowset(rowset) = source else {
+        for transform in transforms {
+            if let TransformSpec::HashJoinProbe(probe) = transform {
+                probe.covering_runtime_filter_key = None;
+            }
+        }
+        return;
+    };
+    for transform in transforms {
+        let TransformSpec::HashJoinProbe(probe) = transform else {
+            continue;
+        };
+        let Some(key_index) = probe.covering_runtime_filter_key else {
+            continue;
+        };
+        if !rowset
+            .dynamic_runtime_filters
+            .iter()
+            .any(|filter| filter.handle == probe.handle && filter.build_key_index == key_index)
+        {
+            probe.covering_runtime_filter_key = None;
+        }
+    }
+}
+
+/// Fuse projection chains that only become adjacent after physical operators
+/// are distributed into pipeline producers, notably UNION ALL fan-in.
+pub(super) fn fuse_adjacent_projects(transforms: Vec<TransformSpec>) -> Vec<TransformSpec> {
+    let mut fused = Vec::with_capacity(transforms.len());
+    for transform in transforms {
+        let TransformSpec::Project(outer) = transform else {
+            fused.push(transform);
+            continue;
+        };
+        let Some(TransformSpec::Project(inner)) = fused.last_mut() else {
+            fused.push(TransformSpec::Project(outer));
+            continue;
+        };
+        let Some(composed) = outer.compose_over(inner) else {
+            fused.push(TransformSpec::Project(outer));
+            continue;
+        };
+        *inner = composed;
+    }
+    fused
 }

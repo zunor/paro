@@ -46,6 +46,7 @@ fn hash_join_spill_replay_source_is_independent_from_probe_for_in_memory_builds(
                 build_payload_types: vec![LogicalType::Integer].into_boxed_slice(),
                 build_output_count: 1,
                 left_projection: vec![0].into_boxed_slice(),
+                output_permutation: crate::physical::OutputPermutation::identity(2),
                 output_names: vec!["lv".to_string(), "rv".to_string()].into_boxed_slice(),
                 output_types: vec![LogicalType::Integer, LogicalType::Integer].into_boxed_slice(),
                 reduction_cascade: None,
@@ -92,7 +93,7 @@ fn hash_join_spill_replay_source_is_independent_from_probe_for_in_memory_builds(
 }
 
 #[test]
-fn hash_join_external_spill_replay_source_outputs_probe_matches() {
+fn hash_join_external_spill_replay_source_outputs_permuted_probe_matches() {
     let output = QueryOutputPort::unbounded();
     let query = query_context(output.clone());
     let build_row_type = RowType::new(
@@ -100,8 +101,8 @@ fn hash_join_external_spill_replay_source_outputs_probe_matches() {
         vec![LogicalType::Integer, LogicalType::Varchar],
     );
     let join_row_type = RowType::new(
-        vec!["lv".to_string(), "rv".to_string()],
-        vec![LogicalType::Integer, LogicalType::Varchar],
+        vec!["rv".to_string(), "lv".to_string()],
+        vec![LogicalType::Varchar, LogicalType::Integer],
     );
 
     let mut handles = BreakerHandleCatalogBuilder::default();
@@ -161,14 +162,17 @@ fn hash_join_external_spill_replay_source_outputs_probe_matches() {
                 )),
                 transforms: vec![TransformSpec::HashJoinProbe(HashJoinProbeSpec {
                     handle,
+                    covering_runtime_filter_key: None,
                     join_type: JoinType::Inner,
                     anti_join_mode: AntiJoinMode::Regular,
                     key_conditions: vec![join_condition()].into_boxed_slice(),
                     build_residual_conditions: Box::default(),
                     probe_residual_count: 0,
                     left_projection: vec![1].into_boxed_slice(),
-                    output_names: vec!["lv".to_string(), "rv".to_string()].into_boxed_slice(),
-                    output_types: vec![LogicalType::Integer, LogicalType::Varchar]
+                    output_permutation: crate::physical::OutputPermutation::from_forward([1, 0])
+                        .unwrap(),
+                    output_names: vec!["rv".to_string(), "lv".to_string()].into_boxed_slice(),
+                    output_types: vec![LogicalType::Varchar, LogicalType::Integer]
                         .into_boxed_slice(),
                     reduction_cascade: None,
                 })],
@@ -191,8 +195,10 @@ fn hash_join_external_spill_replay_source_outputs_probe_matches() {
                     build_payload_types: vec![LogicalType::Varchar].into_boxed_slice(),
                     build_output_count: 1,
                     left_projection: vec![1].into_boxed_slice(),
-                    output_names: vec!["lv".to_string(), "rv".to_string()].into_boxed_slice(),
-                    output_types: vec![LogicalType::Integer, LogicalType::Varchar]
+                    output_permutation: crate::physical::OutputPermutation::from_forward([1, 0])
+                        .unwrap(),
+                    output_names: vec!["rv".to_string(), "lv".to_string()].into_boxed_slice(),
+                    output_types: vec![LogicalType::Varchar, LogicalType::Integer]
                         .into_boxed_slice(),
                     reduction_cascade: None,
                 }),
@@ -254,8 +260,8 @@ fn hash_join_external_spill_replay_source_outputs_probe_matches() {
 
     let chunk = output.pop_front().expect("external replay output");
     assert_eq!(chunk.size(), 1);
-    assert_eq!(chunk.column(0).unwrap().get_i32(0), Some(100));
-    assert_eq!(chunk.column(1).unwrap().get_string(0), Some("ALGERIA"));
+    assert_eq!(chunk.column(0).unwrap().get_string(0), Some("ALGERIA"));
+    assert_eq!(chunk.column(1).unwrap().get_i32(0), Some(100));
     assert!(output.pop_front().is_none());
 }
 
@@ -325,12 +331,14 @@ fn hash_join_external_right_replay_emits_unmatched_build_rows_once() {
                 )),
                 transforms: vec![TransformSpec::HashJoinProbe(HashJoinProbeSpec {
                     handle,
+                    covering_runtime_filter_key: None,
                     join_type: JoinType::Right,
                     anti_join_mode: AntiJoinMode::Regular,
                     key_conditions: vec![join_condition()].into_boxed_slice(),
                     build_residual_conditions: Box::default(),
                     probe_residual_count: 0,
                     left_projection: vec![1].into_boxed_slice(),
+                    output_permutation: crate::physical::OutputPermutation::identity(2),
                     output_names: vec!["lv".to_string(), "rv".to_string()].into_boxed_slice(),
                     output_types: vec![LogicalType::Integer, LogicalType::Integer]
                         .into_boxed_slice(),
@@ -355,6 +363,7 @@ fn hash_join_external_right_replay_emits_unmatched_build_rows_once() {
                     build_payload_types: vec![LogicalType::Integer].into_boxed_slice(),
                     build_output_count: 1,
                     left_projection: vec![1].into_boxed_slice(),
+                    output_permutation: crate::physical::OutputPermutation::identity(2),
                     output_names: vec!["lv".to_string(), "rv".to_string()].into_boxed_slice(),
                     output_types: vec![LogicalType::Integer, LogicalType::Integer]
                         .into_boxed_slice(),
@@ -372,6 +381,7 @@ fn hash_join_external_right_replay_emits_unmatched_build_rows_once() {
                     handle,
                     join_type: JoinType::Right,
                     left_output_types: vec![LogicalType::Integer].into_boxed_slice(),
+                    output_permutation: crate::physical::OutputPermutation::identity(2),
                     output_names: vec!["lv".to_string(), "rv".to_string()].into_boxed_slice(),
                     output_types: vec![LogicalType::Integer, LogicalType::Integer]
                         .into_boxed_slice(),
@@ -522,6 +532,7 @@ fn hash_join_external_right_replay_outputs_build_rows_when_probe_never_spilled()
                     build_payload_types: vec![LogicalType::Integer].into_boxed_slice(),
                     build_output_count: 1,
                     left_projection: vec![1].into_boxed_slice(),
+                    output_permutation: crate::physical::OutputPermutation::identity(2),
                     output_names: vec!["lv".to_string(), "rv".to_string()].into_boxed_slice(),
                     output_types: vec![LogicalType::Integer, LogicalType::Integer]
                         .into_boxed_slice(),
@@ -655,12 +666,14 @@ fn hash_join_external_mark_replay_preserves_global_build_null_marker() {
                 )),
                 transforms: vec![TransformSpec::HashJoinProbe(HashJoinProbeSpec {
                     handle,
+                    covering_runtime_filter_key: None,
                     join_type: JoinType::Mark,
                     anti_join_mode: AntiJoinMode::Regular,
                     key_conditions: vec![join_condition()].into_boxed_slice(),
                     build_residual_conditions: Box::default(),
                     probe_residual_count: 0,
                     left_projection: vec![1].into_boxed_slice(),
+                    output_permutation: crate::physical::OutputPermutation::identity(2),
                     output_names: vec!["lv".to_string(), "mark".to_string()].into_boxed_slice(),
                     output_types: vec![LogicalType::Integer, LogicalType::Boolean]
                         .into_boxed_slice(),
@@ -685,6 +698,7 @@ fn hash_join_external_mark_replay_preserves_global_build_null_marker() {
                     build_payload_types: vec![LogicalType::Integer].into_boxed_slice(),
                     build_output_count: 1,
                     left_projection: vec![1].into_boxed_slice(),
+                    output_permutation: crate::physical::OutputPermutation::identity(2),
                     output_names: vec!["lv".to_string(), "mark".to_string()].into_boxed_slice(),
                     output_types: vec![LogicalType::Integer, LogicalType::Boolean]
                         .into_boxed_slice(),

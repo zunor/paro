@@ -554,7 +554,14 @@ fn ranked_build_time_index_links_duplicates_across_parallel_local_tables() {
     )
     .expect("output chunk");
     let count = scan
-        .next_inner_join(&probe, &probe, &mut output, &merged, &[0])
+        .next_inner_join(
+            &probe,
+            &probe,
+            &mut output,
+            &merged,
+            &[0],
+            &crate::physical::OutputPermutation::identity(2),
+        )
         .expect("scan duplicate matches");
     assert_eq!(count, 3);
     let mut payloads = (0..count)
@@ -592,7 +599,14 @@ fn duplicate_direct_integer_build_uses_exact_index_chains() {
     )
     .expect("output chunk");
     let count = scan
-        .next_inner_join(&probe, &probe, &mut output, &ht, &[0])
+        .next_inner_join(
+            &probe,
+            &probe,
+            &mut output,
+            &ht,
+            &[0],
+            &crate::physical::OutputPermutation::identity(2),
+        )
         .expect("scan duplicate matches");
     assert_eq!(count, 2);
 }
@@ -634,7 +648,14 @@ fn bigint_pair_build_uses_exact_index_and_preserves_duplicate_chains() {
     )
     .expect("output chunk");
     let count = scan
-        .next_inner_join(&probe, &probe, &mut output, &ht, &[0])
+        .next_inner_join(
+            &probe,
+            &probe,
+            &mut output,
+            &ht,
+            &[0],
+            &crate::physical::OutputPermutation::identity(2),
+        )
         .expect("scan pair matches");
     assert_eq!(count, 3);
     let mut payloads = (0..count)
@@ -895,7 +916,14 @@ fn test_not_distinct_from_keeps_null_keys_and_probe_matches_them() {
         VECTOR_SIZE,
     );
     let count = scan
-        .next_inner_join(&probe_keys, &left, &mut result, &ht, &[0])
+        .next_inner_join(
+            &probe_keys,
+            &left,
+            &mut result,
+            &ht,
+            &[0],
+            &crate::physical::OutputPermutation::identity(2),
+        )
         .unwrap();
 
     assert_eq!(count, 1);
@@ -1010,7 +1038,14 @@ fn test_probe_linear_probing_finds_rows_behind_salt_mismatch() {
         VECTOR_SIZE,
     );
     let count = scan
-        .next_inner_join(&probe_keys, &left, &mut result, &ht, &[0])
+        .next_inner_join(
+            &probe_keys,
+            &left,
+            &mut result,
+            &ht,
+            &[0],
+            &crate::physical::OutputPermutation::identity(2),
+        )
         .unwrap();
 
     assert_eq!(count, 1);
@@ -1054,7 +1089,14 @@ fn inner_join_drains_probe_matches_larger_than_one_output_vector() {
     let mut emitted = 0;
     while !scan.finished {
         emitted += scan
-            .next_inner_join(&keys, &keys, &mut result, &table, &[0])
+            .next_inner_join(
+                &keys,
+                &keys,
+                &mut result,
+                &table,
+                &[0],
+                &crate::physical::OutputPermutation::identity(2),
+            )
             .unwrap();
     }
 

@@ -338,6 +338,12 @@ impl JoinBuildHandle {
         self.runtime_filter.get().is_some()
     }
 
+    pub fn runtime_filter_key_is_exact(&self, build_key_index: usize) -> bool {
+        self.runtime_filter
+            .get()
+            .is_some_and(|filter| filter.key_is_exact(build_key_index))
+    }
+
     pub fn enable_build_reclaim(&self) {
         if !self.completion.is_complete() && !self.is_external() {
             let _ = self.build_reclaim_state.compare_exchange(

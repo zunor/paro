@@ -18,9 +18,9 @@ use crate::physical::properties::{NullOrdering, OrderingColumn, OrderingDirectio
 use crate::physical::row_type::RowType;
 use crate::physical::specs::{
     AggregateSpec, ClassicIeJoinSpec, CrossProductSpec, DelimJoinSideSpec, DelimJoinSpec,
-    DelimScanTarget, ExternalTableSpec, HashJoinSpec, MaterializedCteSpec, NestedLoopJoinSpec,
-    PartitionAggregateWindowSpec, PhysicalNodeKind, RecursiveCteSpec, SetOperationInputSide,
-    SetOperationSpec, SortRangeJoinSpec, SortSpec, TopNSpec, WindowSpec,
+    DelimScanTarget, EmptyResultSpec, ExternalTableSpec, HashJoinSpec, MaterializedCteSpec,
+    NestedLoopJoinSpec, PartitionAggregateWindowSpec, PhysicalNodeKind, RecursiveCteSpec,
+    SetOperationInputSide, SetOperationSpec, SortRangeJoinSpec, SortSpec, TopNSpec, WindowSpec,
 };
 
 use super::graph::{
@@ -98,9 +98,21 @@ pub(crate) struct BreakerProbeSource {
     pub(crate) dependencies: Vec<PendingProbeDependency>,
 }
 
+#[derive(Debug, Clone, Copy)]
 pub(crate) struct PipelineChain {
     pub(crate) entry: PipelineId,
     pub(crate) tail: PipelineId,
+}
+
+/// One leaf of an already-selected physical `UNION ALL` probe subtree.
+///
+/// Pipeline lowering may schedule these sources independently against one
+/// shared hash-build handle. This is execution decomposition only: it neither
+/// creates another logical join nor changes the Memo winner.
+#[derive(Debug, Clone)]
+struct UnionAllProbeSource {
+    root: PhysicalPlanNodeId,
+    transforms: Vec<TransformSpec>,
 }
 
 impl<'a> PipelineLowerer<'a> {

@@ -5,7 +5,7 @@ use super::*;
 use crate::physical::properties::MemoryClass;
 use crate::physical::{
     BaseRelationId, MutationBarrierId, MutationInputSpoolSpec, OperatorLabel, PhysicalPlanNode,
-    PhysicalPlanNodeId, SnapshotId,
+    PhysicalPlanNodeId, ProjectSpec, SnapshotId,
 };
 
 #[test]
@@ -39,6 +39,43 @@ fn lowerer_uses_root_output_schema_after_transforms() {
     assert_eq!(pipeline.output.column_count(), 1);
     assert_eq!(&pipeline.output.names[..], ["b".to_string()]);
     assert_eq!(&pipeline.output.types[..], [LogicalType::Varchar]);
+}
+
+#[test]
+fn pipeline_fuses_projects_created_by_consumer_distribution() {
+    let inner = ProjectSpec {
+        expressions: vec![
+            Expression::Reference(ReferenceExpression::new(1, LogicalType::Integer)),
+            Expression::Reference(ReferenceExpression::new(0, LogicalType::Integer)),
+        ]
+        .into_boxed_slice(),
+        output_names: vec!["b".to_string(), "a".to_string()].into_boxed_slice(),
+        visible_count: 2,
+    };
+    let outer = ProjectSpec {
+        expressions: vec![Expression::Reference(ReferenceExpression::new(
+            0,
+            LogicalType::Integer,
+        ))]
+        .into_boxed_slice(),
+        output_names: vec!["result".to_string()].into_boxed_slice(),
+        visible_count: 1,
+    };
+
+    let transforms = super::super::pipelines::fuse_adjacent_projects(vec![
+        TransformSpec::Project(inner),
+        TransformSpec::Project(outer),
+    ]);
+
+    let [TransformSpec::Project(project)] = transforms.as_slice() else {
+        panic!("safe adjacent projections must fuse into one transform");
+    };
+    assert_eq!(&project.output_names[..], ["result"]);
+    assert_eq!(project.visible_count, 1);
+    let Expression::Reference(reference) = &project.expressions[0] else {
+        panic!("composed projection must retain the selected input reference");
+    };
+    assert_eq!(reference.index, 1);
 }
 
 #[test]

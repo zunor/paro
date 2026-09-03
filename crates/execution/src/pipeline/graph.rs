@@ -16,7 +16,7 @@ use crate::physical::specs::{
     ClassicIeJoinSpec, CopyToFileSpec, DeleteSpec, DummyScanSpec, EmptyResultSpec,
     ExpressionScanSpec, ExternalProjectSpec, ExternalTableSpec, FilterSpec, FullTextSearchSpec,
     GraphExpandSpec, GraphProjectSpec, GraphScanSpec, GraphShortestPathSpec,
-    HashJoinRuntimeFilterSpec, HashReductionCascadeSpec, InsertSpec, LimitSpec,
+    HashJoinRuntimeFilterSpec, HashReductionCascadeSpec, InsertSpec, LimitSpec, OutputPermutation,
     PartitionAggregateWindowSpec, ProjectSpec, RowFetchSpec, RowsetScanSpec, SetOperationInputSide,
     SetOperationSpec, SparseVectorSearchSpec, SpillExecutionPolicy, TableFunctionScanSpec,
     TopNSpec, UpdateSpec, ValuesSpec, VectorSearchSpec, WindowSpec,
@@ -737,6 +737,7 @@ pub struct HashJoinSpillReplaySourceSpec {
     pub build_payload_types: Box<[LogicalType]>,
     pub build_output_count: usize,
     pub left_projection: Box<[usize]>,
+    pub output_permutation: OutputPermutation,
     pub output_names: Box<[String]>,
     pub output_types: Box<[LogicalType]>,
     pub reduction_cascade: Option<HashReductionCascadeSpec>,
@@ -747,6 +748,7 @@ pub struct HashJoinUnmatchedSourceSpec {
     pub handle: BreakerHandleId,
     pub join_type: JoinType,
     pub left_output_types: Box<[LogicalType]>,
+    pub output_permutation: OutputPermutation,
     pub output_names: Box<[String]>,
     pub output_types: Box<[LogicalType]>,
     pub reduction_cascade: Option<HashReductionCascadeSpec>,
@@ -928,12 +930,17 @@ impl TransformSpec {
 #[derive(Debug, Clone)]
 pub struct HashJoinProbeSpec {
     pub handle: BreakerHandleId,
+    /// Single build-key ordinal whose exact runtime predicate was attached to
+    /// this pipeline's rowset source. Execution may bypass a payload-free,
+    /// unique inner probe only while the frozen filter remains exact.
+    pub covering_runtime_filter_key: Option<usize>,
     pub join_type: JoinType,
     pub anti_join_mode: paro_planner::operator::join::AntiJoinMode,
     pub key_conditions: Box<[JoinCondition]>,
     pub build_residual_conditions: Box<[JoinCondition]>,
     pub probe_residual_count: usize,
     pub left_projection: Box<[usize]>,
+    pub output_permutation: OutputPermutation,
     pub output_names: Box<[String]>,
     pub output_types: Box<[LogicalType]>,
     pub reduction_cascade: Option<HashReductionCascadeSpec>,

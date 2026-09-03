@@ -6,6 +6,58 @@
 use super::*;
 
 impl<'a> PipelineLowerer<'a> {
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn lower_subtree_with_consumer_transforms_to_sink(
+        &mut self,
+        root: PhysicalPlanNodeId,
+        mut consumer_transforms: Vec<TransformSpec>,
+        sink: SinkSpec,
+        sink_sharing: SinkSharing,
+        output: RowType,
+        pipelines: &mut Vec<PipelineSpec>,
+        dependencies: &mut Vec<PipelineDependency>,
+    ) -> Result<PipelineId> {
+        if consumer_transforms.is_empty() {
+            return self.lower_subtree_to_sink(
+                root,
+                sink,
+                sink_sharing,
+                output,
+                pipelines,
+                dependencies,
+            );
+        }
+        if let Some(breaker) = self.breaker_dispatch_for_root(root) {
+            return self.dispatch_breaker_to_sink(
+                root,
+                breaker,
+                consumer_transforms,
+                sink,
+                sink_sharing,
+                output,
+                pipelines,
+                dependencies,
+            );
+        }
+        if let Some(mut tail) = self.collect_tail_to_breaker(root, Self::is_tail_breaker)? {
+            tail.transforms.append(&mut consumer_transforms);
+            return self.lower_tail_breaker_to_sink(
+                tail,
+                sink,
+                sink_sharing,
+                pipelines,
+                dependencies,
+            );
+        }
+        let (source, mut transforms) = self.collect_linear_roles(root)?;
+        let source_handles = source.clone();
+        transforms.append(&mut consumer_transforms);
+        let pushed =
+            self.push_pipeline(source, transforms, sink, sink_sharing, output, pipelines)?;
+        self.add_source_handle_dependencies(&source_handles, pushed.entry, dependencies)?;
+        Ok(pushed.tail)
+    }
+
     pub(crate) fn lower_subtree_to_sink(
         &mut self,
         root: PhysicalPlanNodeId,

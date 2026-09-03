@@ -376,6 +376,81 @@ fn hash_join_plan(join_type: JoinType) -> crate::physical::PhysicalPlan {
     hash_join_plan_with_context(join_type, ExtractionContext::default())
 }
 
+fn union_all_probe_hash_join_plan() -> crate::physical::PhysicalPlan {
+    let ctx = BindContext::new();
+    let values = |table_index, name: &str| {
+        let values = LogicalPlan::new(
+            &ctx,
+            LogicalOperator::ExpressionGet(ExpressionGet::new(
+                table_index,
+                vec![],
+                vec![name.to_string()],
+                vec![LogicalType::Integer],
+            )),
+        );
+        // A streaming filter keeps the test source from being folded into the
+        // row-literal UNION ALL fast path during physical extraction.
+        LogicalPlan::new(
+            &ctx,
+            LogicalOperator::Filter(Filter::new(values, Vec::new())),
+        )
+    };
+    let left_union = LogicalPlan::new(
+        &ctx,
+        LogicalOperator::SetOperation(LogicalSetOperation::union(
+            3,
+            values(0, "a"),
+            values(1, "b"),
+            true,
+            vec![LogicalType::Integer],
+        )),
+    );
+    let nested_union = LogicalPlan::new(
+        &ctx,
+        LogicalOperator::SetOperation(LogicalSetOperation::union(
+            4,
+            left_union,
+            values(2, "c"),
+            true,
+            vec![LogicalType::Integer],
+        )),
+    );
+    let filtered = LogicalPlan::new(
+        &ctx,
+        LogicalOperator::Filter(Filter::new(nested_union, Vec::new())),
+    );
+    let projected = LogicalPlan::new(
+        &ctx,
+        LogicalOperator::Projection(
+            Projection::new(
+                5,
+                filtered,
+                vec![Expression::Reference(ReferenceExpression::new(
+                    0,
+                    LogicalType::Integer,
+                ))],
+            )
+            .with_visible_names(vec!["probe_key".to_string()]),
+        ),
+    );
+    let join = LogicalPlan::new(
+        &ctx,
+        LogicalOperator::Join(Join::comparison(
+            JoinType::Inner,
+            projected,
+            values(6, "build_key"),
+            vec![JoinCondition::equality(
+                Expression::Reference(ReferenceExpression::new(0, LogicalType::Integer)),
+                Expression::Reference(ReferenceExpression::new(0, LogicalType::Integer)),
+            )],
+        )),
+    );
+
+    PhysicalPlanExtractor::new(ExtractionContext::default())
+        .extract(&join)
+        .unwrap()
+}
+
 fn hash_join_plan_with_context(
     join_type: JoinType,
     extraction_context: ExtractionContext,
