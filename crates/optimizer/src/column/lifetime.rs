@@ -236,7 +236,19 @@ impl ColumnLifetimeAnalyzer {
                 // projection maps also distinguish visible subquery output from
                 // internal correlation columns, so only replace those maps when
                 // the complete binding set is safe to analyze.
-                if !preserve_planner_layout && !self.has_unknown_references(&known_bindings) {
+                if self.everything_referenced {
+                    // `everything` means every value already exposed by this
+                    // operator, not every value its children can produce. A
+                    // group-local rewrite freezes that visible contract in
+                    // the join projection maps before lifetime analysis; the
+                    // analysis may remap it after child compaction but must
+                    // never widen it back to both complete child layouts.
+                    comp_join.left_projection_map =
+                        Self::remap_projection(&left_bindings, &retained_left_bindings, "left")?;
+                    comp_join.right_projection_map =
+                        Self::remap_projection(&right_bindings, &retained_right_bindings, "right")?;
+                } else if !preserve_planner_layout && !self.has_unknown_references(&known_bindings)
+                {
                     comp_join.left_projection_map = if Self::join_outputs_left(comp_join.join_type)
                     {
                         self.generate_exact_projection_map(&left_bindings, &output_references)
@@ -296,7 +308,13 @@ impl ColumnLifetimeAnalyzer {
                 known_bindings.extend(left_bindings.iter().copied());
                 known_bindings.extend(right_bindings.iter().copied());
 
-                if !preserve_planner_layout && !self.has_unknown_references(&known_bindings) {
+                if self.everything_referenced {
+                    any_join.left_projection_map =
+                        Self::remap_projection(&left_bindings, &retained_left_bindings, "left")?;
+                    any_join.right_projection_map =
+                        Self::remap_projection(&right_bindings, &retained_right_bindings, "right")?;
+                } else if !preserve_planner_layout && !self.has_unknown_references(&known_bindings)
+                {
                     any_join.left_projection_map = if Self::join_outputs_left(any_join.join_type) {
                         self.generate_exact_projection_map(&left_bindings, &output_references)
                     } else {
@@ -570,6 +588,56 @@ mod tests {
             panic!("expected projection");
         };
         let LogicalOperator::Join(Join::Comparison(join)) = &projection.child.operator else {
+            panic!("expected comparison join");
+        };
+        assert_eq!(join.left_projection_map.as_columns(), Some(&[1][..]));
+        assert!(join.right_projection_map.is_none());
+        assert_eq!(join.get_types(), vec![LogicalType::BigInt]);
+    }
+
+    #[test]
+    fn root_analysis_preserves_an_explicit_join_output_contract() {
+        let ctx = BindContext::new();
+        let left = LogicalPlan::new(
+            &ctx,
+            LogicalOperator::ExpressionGet(ExpressionGet::new(
+                10,
+                Vec::new(),
+                vec!["left_key".into(), "payload".into()],
+                vec![LogicalType::Integer, LogicalType::BigInt],
+            )),
+        );
+        let right = LogicalPlan::new(
+            &ctx,
+            LogicalOperator::ExpressionGet(ExpressionGet::new(
+                20,
+                Vec::new(),
+                vec!["right_key".into(), "dead_payload".into()],
+                vec![LogicalType::Integer, LogicalType::Varchar],
+            )),
+        );
+        let mut join = ComparisonJoin::new(
+            JoinType::Inner,
+            left,
+            right,
+            vec![JoinCondition::new(
+                Expression::ColumnRef(ColumnRefExpression::new(
+                    ColumnBinding::new(10, 0),
+                    LogicalType::Integer,
+                )),
+                Expression::ColumnRef(ColumnRefExpression::new(
+                    ColumnBinding::new(20, 0),
+                    LogicalType::Integer,
+                )),
+                JoinComparisonType::Equal,
+            )],
+        );
+        join.left_projection_map = vec![1].into();
+        join.right_projection_map.clear();
+        let plan = LogicalPlan::new(&ctx, LogicalOperator::Join(Join::Comparison(join)));
+
+        let optimized = ColumnLifetimeAnalyzer::new(true).optimize(plan).unwrap();
+        let LogicalOperator::Join(Join::Comparison(join)) = &optimized.operator else {
             panic!("expected comparison join");
         };
         assert_eq!(join.left_projection_map.as_columns(), Some(&[1][..]));

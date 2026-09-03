@@ -217,6 +217,7 @@ impl TransformationRule for PlannerTransformationRule {
             source_runtime_filter_facet,
             source_input_context,
             source_child_context,
+            source_output_columns,
             environment,
         ) =
             {
@@ -263,6 +264,7 @@ impl TransformationRule for PlannerTransformationRule {
                     metadata.runtime_filter_region_facet,
                     metadata.input_context,
                     metadata.child_context,
+                    metadata.output_columns.clone(),
                     PlannerRuleEnvironment {
                         binder,
                         bind_context: state.bind_context.clone(),
@@ -286,7 +288,18 @@ impl TransformationRule for PlannerTransformationRule {
         }
 
         let mut prepared = Vec::with_capacity(plans.len());
-        for plan in plans {
+        for mut plan in plans {
+            if matches!(
+                self.transformation,
+                PlannerTransformation::JoinRegionEnumeration
+            ) {
+                let state = self
+                    .planner_state
+                    .read()
+                    .expect("planner transform state poisoned");
+                plan =
+                    semantic_plan::freeze_extraction_layout(plan, &source_output_columns, &state)?;
+            }
             let (plan, column_stats) = settle_transformed_expression(plan, &environment)?;
             let mut preserved_region_facet = None;
             let mut extended_required_region_facets = enclosing_required_region_facets.clone();
