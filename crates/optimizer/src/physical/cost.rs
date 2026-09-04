@@ -9,6 +9,20 @@ use super::identity::ExternalWorkerRequirementSetId;
 
 pub const RESOURCE_DIMS: usize = 6;
 
+/// Whether the admitted memory ceiling proves completion for this plan.
+///
+/// `RuntimeCapped` is an explicit last-resort contract for operators whose
+/// retained state cannot yet spill and whose input has no semantic row bound.
+/// The query allocator still proves the resident-memory ceiling, but execution
+/// may report resource exhaustion if the state reaches it. Keeping this state
+/// explicit prevents an unknown estimate from either masquerading as a proof
+/// or making every physical alternative disappear during planning.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum MemoryCompletion {
+    Guaranteed,
+    RuntimeCapped,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(usize)]
 pub enum ResourceDimension {
@@ -118,6 +132,8 @@ pub struct SearchCost {
     /// Query-local peak after applying the shared allocator/revocation
     /// protocol. Revocable working sets compose by maximum, not by addition.
     pub peak_memory_upper: u64,
+    /// Strength of the forward-progress proof behind `peak_memory_upper`.
+    pub memory_completion: MemoryCompletion,
     pub spill_bytes_expected: u64,
     pub external_workers: ExternalWorkerRequirementSetId,
     pub external_worker_slots_upper: u16,
@@ -136,6 +152,7 @@ impl SearchCost {
         minimum_memory_bytes: 0,
         revocable_memory_target: 0,
         peak_memory_upper: 0,
+        memory_completion: MemoryCompletion::Guaranteed,
         spill_bytes_expected: 0,
         external_workers: ExternalWorkerRequirementSetId(0),
         external_worker_slots_upper: 0,
@@ -176,7 +193,9 @@ impl SearchCost {
                 "non-revocable memory exceeds the total peak memory contract",
             ));
         }
-        if self.non_revocable_memory_upper > self.minimum_memory_bytes {
+        if self.memory_completion == MemoryCompletion::Guaranteed
+            && self.non_revocable_memory_upper > self.minimum_memory_bytes
+        {
             return Err(paro_error::internal(
                 "non-revocable memory exceeds the operational memory floor",
             ));
@@ -247,6 +266,7 @@ impl SearchCost {
             // grant class practically inadmissible under any process overhead.
             revocable_memory_target: preferred_memory_bytes.saturating_sub(minimum_memory_bytes),
             peak_memory_upper,
+            memory_completion: self.memory_completion.max(other.memory_completion),
             spill_bytes_expected: self
                 .spill_bytes_expected
                 .saturating_add(other.spill_bytes_expected),
@@ -319,6 +339,7 @@ impl SearchCost {
         self.minimum_memory_bytes = 0;
         self.revocable_memory_target = 0;
         self.peak_memory_upper = 0;
+        self.memory_completion = MemoryCompletion::Guaranteed;
         self.external_workers = ExternalWorkerRequirementSetId(0);
         self.external_worker_slots_upper = 0;
         self
@@ -416,6 +437,7 @@ impl SearchCost {
             && self.minimum_memory_bytes <= other.minimum_memory_bytes
             && self.revocable_memory_target <= other.revocable_memory_target
             && self.peak_memory_upper <= other.peak_memory_upper
+            && self.memory_completion <= other.memory_completion
             && self.spill_bytes_expected <= other.spill_bytes_expected
             && self.external_worker_slots_upper <= other.external_worker_slots_upper
             && self
@@ -435,6 +457,7 @@ impl SearchCost {
             || self.minimum_memory_bytes < other.minimum_memory_bytes
             || self.revocable_memory_target < other.revocable_memory_target
             || self.peak_memory_upper < other.peak_memory_upper
+            || self.memory_completion < other.memory_completion
             || self.spill_bytes_expected < other.spill_bytes_expected
             || self.external_worker_slots_upper < other.external_worker_slots_upper
             || self

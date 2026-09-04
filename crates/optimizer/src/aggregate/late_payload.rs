@@ -14,7 +14,8 @@ use paro_function::scalar::ScalarPredicateProjection;
 use paro_planner::binder::context::BindContext;
 use paro_planner::expression::{ColumnRefExpression, ConjunctionType, Expression, OperatorType};
 use paro_planner::operator::{
-    ColumnBinding, Get, Join, JoinType, LogicalOperator, Projection, RowFetch, RowFetchSource,
+    ColumnBinding, Get, Join, JoinType, LogicalOperator, Projection, ProjectionMap, RowFetch,
+    RowFetchSource,
 };
 use paro_planner::plan::LogicalPlan;
 
@@ -892,9 +893,18 @@ fn prove_row_preserving_candidate(
             .then_some(column.binding.column_index)
         })
         .collect::<Option<HashSet<_>>>()?;
+    let projected_outputs =
+        checked_projection_indices(&topn.projection_map, output.expressions.len())?
+            .into_iter()
+            .collect::<HashSet<_>>();
 
     let mut by_source: HashMap<usize, RowPreservingSource> = HashMap::new();
     for (output_index, expression) in output.expressions.iter().enumerate() {
+        let ordered = ordered_outputs.contains(&output_index);
+        let projected = projected_outputs.contains(&output_index);
+        if !ordered && !projected {
+            continue;
+        }
         let Expression::ColumnRef(column) = expression else {
             return None;
         };
@@ -928,11 +938,11 @@ fn prove_row_preserving_candidate(
                 benefit: 0.0,
                 rowid_path: RowIdPath::Get,
             });
-        if ordered_outputs.contains(&output_index) {
+        if ordered {
             source
                 .ordered_catalog_columns
                 .insert(output_index, catalog_column);
-        } else {
+        } else if projected {
             source
                 .output_catalog_columns
                 .insert(output_index, catalog_column);
@@ -1162,6 +1172,9 @@ fn apply_rewrite(
             "aggregate candidate child is not Projection",
         ));
     };
+    let projected_output_indices =
+        checked_projection_indices(&topn.projection_map, output.expressions.len())
+            .ok_or_else(|| rewrite_invariant("TopN output projection is out of bounds"))?;
     let aggregate_plan = *output.child;
     let (aggregate_id, aggregate_stats, aggregate_operator) = aggregate_plan.into_parts();
     let LogicalOperator::Aggregate(mut aggregate) = aggregate_operator else {
@@ -1295,6 +1308,31 @@ fn apply_rewrite(
     )));
     carrier_names.push("__late_rowid".to_string());
 
+    let needed_columns = projected_output_indices
+        .iter()
+        .filter_map(|output_index| {
+            let Expression::ColumnRef(column) = output.expressions.get(*output_index)? else {
+                return None;
+            };
+            (column.binding.table_index == aggregate.group_index)
+                .then(|| {
+                    candidate
+                        .dependent_catalog_columns
+                        .get(&column.binding.column_index)
+                        .copied()
+                })
+                .flatten()
+        })
+        .collect::<std::collections::BTreeSet<_>>();
+    let mut topn_output_indices = projected_output_indices
+        .iter()
+        .filter_map(|output_index| output_to_carrier.get(*output_index).copied().flatten())
+        .collect::<Vec<_>>();
+    if !needed_columns.is_empty() {
+        topn_output_indices.push(rowid_carrier_index);
+    }
+    topn.projection_map = ProjectionMap::new(topn_output_indices);
+
     let aggregate_plan = LogicalPlan {
         id: aggregate_id,
         stats: aggregate_stats.clone(),
@@ -1309,8 +1347,10 @@ fn apply_rewrite(
         stats: topn_stats.clone(),
         operator: LogicalOperator::TopN(topn),
     };
-    output.child = Box::new(LogicalPlan::synthetic(LogicalOperator::RowFetch(
-        RowFetch::new(
+    output.child = Box::new(if needed_columns.is_empty() {
+        topn_plan
+    } else {
+        LogicalPlan::synthetic(LogicalOperator::RowFetch(RowFetch::new(
             carrier_table_index,
             vec![RowFetchSource {
                 materialized_table_index,
@@ -1319,19 +1359,19 @@ fn apply_rewrite(
                     LogicalType::BigInt,
                 )),
                 table: candidate.table,
-                needed_columns: candidate
-                    .dependent_catalog_columns
-                    .values()
-                    .copied()
-                    .collect::<std::collections::BTreeSet<_>>()
+                needed_columns: needed_columns
                     .into_iter()
                     .collect::<Vec<_>>()
                     .into_boxed_slice(),
             }],
             topn_plan,
-        ),
-    )));
-    output.expressions = final_expressions;
+        )))
+    });
+    output.expressions = projected_output_indices
+        .iter()
+        .map(|index| final_expressions[*index].clone())
+        .collect();
+    project_visible_output_contract(&mut output, &projected_output_indices)?;
     output.returned_types = output
         .expressions
         .iter()
@@ -1362,6 +1402,9 @@ fn apply_row_preserving_rewrite(
             "row-preserving candidate child is not Projection",
         ));
     };
+    let projected_output_indices =
+        checked_projection_indices(&topn.projection_map, output.expressions.len())
+            .ok_or_else(|| rewrite_invariant("TopN output projection is out of bounds"))?;
 
     struct RewriteSource {
         source: RowPreservingSource,
@@ -1557,6 +1600,17 @@ fn apply_row_preserving_rewrite(
             .ok_or_else(|| rewrite_invariant("ordered output is not materialized before TopN"))?;
         column.binding = ColumnBinding::new(topn_table_index, topn_output);
     }
+    let mut topn_output_indices = projected_output_indices
+        .iter()
+        .filter_map(|output_index| output_to_topn.get(*output_index).copied().flatten())
+        .collect::<Vec<_>>();
+    topn_output_indices.extend(
+        sources
+            .iter()
+            .filter(|source| !source.source.output_catalog_columns.is_empty())
+            .filter_map(|source| source.topn_rowid_index),
+    );
+    topn.projection_map = ProjectionMap::new(topn_output_indices);
     topn.child = Box::new(LogicalPlan::synthetic(LogicalOperator::Projection(
         topn_carrier,
     )));
@@ -1566,8 +1620,9 @@ fn apply_row_preserving_rewrite(
         operator: LogicalOperator::TopN(topn),
     };
 
-    let mut final_expressions = Vec::with_capacity(output.expressions.len());
-    for (output_index, expression) in output.expressions.iter().enumerate() {
+    let mut final_expressions = Vec::with_capacity(projected_output_indices.len());
+    for &output_index in &projected_output_indices {
+        let expression = &output.expressions[output_index];
         if let Some(source) = sources.iter().find(|source| {
             source
                 .source
@@ -1634,6 +1689,7 @@ fn apply_row_preserving_rewrite(
         )))
     });
     output.expressions = final_expressions;
+    project_visible_output_contract(&mut output, &projected_output_indices)?;
     output.returned_types = output
         .expressions
         .iter()
@@ -1992,6 +2048,47 @@ fn include_required_join_outputs(
 
 fn rewrite_invariant(detail: &str) -> paro_common::error::ParoError {
     paro_error::internal(format!("late row-fetch proof/rewrite mismatch: {detail}"))
+}
+
+fn checked_projection_indices(
+    projection: &ProjectionMap,
+    child_width: usize,
+) -> Option<Vec<usize>> {
+    match projection.as_columns() {
+        None => Some((0..child_width).collect()),
+        Some(indices) if indices.iter().all(|index| *index < child_width) => Some(indices.to_vec()),
+        Some(_) => None,
+    }
+}
+
+fn project_visible_output_contract(
+    output: &mut Projection,
+    projected_indices: &[usize],
+) -> Result<()> {
+    let visible_count = projected_indices
+        .iter()
+        .take_while(|index| **index < output.visible_count)
+        .count();
+    if projected_indices[visible_count..]
+        .iter()
+        .any(|index| *index < output.visible_count)
+    {
+        return Err(rewrite_invariant(
+            "TopN output projection interleaves visible and internal columns",
+        ));
+    }
+    output.visible_names = projected_indices[..visible_count]
+        .iter()
+        .map(|index| {
+            output
+                .visible_names
+                .get(*index)
+                .cloned()
+                .ok_or_else(|| rewrite_invariant("projection output name is out of bounds"))
+        })
+        .collect::<Result<Vec<_>>>()?;
+    output.visible_count = visible_count;
+    Ok(())
 }
 
 fn collect_column_bindings<'a>(

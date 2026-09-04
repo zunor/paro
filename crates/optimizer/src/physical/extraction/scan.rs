@@ -348,11 +348,13 @@ impl PhysicalPlanExtractor {
         topn: &LogicalTopN,
     ) -> Result<(PhysicalNodeKind, Vec<PhysicalPlanNodeId>)> {
         let child = self.extract_node(topn.child.as_ref())?;
-        let output_types = topn.child.types();
-        let output_names =
-            align_output_names(topn.child.output_names(), output_types.len(), "topn output")?;
+        let child_types = topn.child.types();
+        let projection_map = topn.projection_map.to_indices(child_types.len());
+        let output_types = project_by_index(&child_types, &projection_map, "topn output")?;
+        let output_names = project_output_names(&topn.child, &projection_map, "topn output")?;
         let spec = TopNSpec {
             orders: topn.orders.clone().into_boxed_slice(),
+            projection_map: projection_map.into_boxed_slice(),
             limit: topn.limit,
             offset: topn.offset,
             hnsw_options: topn.hnsw_options,

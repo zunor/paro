@@ -35,7 +35,7 @@ PROJECTION  (rows=1)
     Sort Key: bm25(public.search_opt_docs.content, 'graph database') DESC NULLS FIRST, id ASC NULLS LAST
     Limit: 2
     Cardinality: [0, 1, 1]
-    Output Schema: id INTEGER, expression_2 FLOAT
+    Output Schema: id INTEGER
     ->  PROJECTION  (rows=1)
       Output: id, bm25(public.search_opt_docs.content, 'graph database')
       Cardinality: [0, 1, 1]

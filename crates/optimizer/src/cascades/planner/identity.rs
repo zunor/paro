@@ -85,6 +85,11 @@ pub(super) fn query_operator_fingerprint(
                 fingerprint.write_u64(join.join_type as u64);
                 fingerprint.write_u64(join.anti_join_mode as u64);
                 fingerprint.write_u64(join.delim_flipped as u64);
+                fingerprint.write_u64(match join.build_side_constraint {
+                    paro_planner::operator::JoinBuildSideConstraint::Either => 0,
+                    paro_planner::operator::JoinBuildSideConstraint::Left => 1,
+                    paro_planner::operator::JoinBuildSideConstraint::Right => 2,
+                });
                 encode_optional_usize(&mut fingerprint, join.mark_index);
                 match join.mark_semantics {
                     paro_planner::operator::MarkJoinSemantics::NotMark => fingerprint.write_u64(0),
@@ -166,7 +171,12 @@ pub(super) fn query_operator_fingerprint(
         LogicalOperator::SearchScan(search) => {
             encode_get(&mut fingerprint, &search.get);
             encode_search_request(&mut fingerprint, &search.request);
-            fingerprint.write_u64(search.score_projection_index as u64);
+            fingerprint.write_u64(
+                search
+                    .score_output_index
+                    .and_then(|index| u64::try_from(index).ok())
+                    .unwrap_or(u64::MAX),
+            );
             fingerprint.write_u64(search.order_ascending as u64);
             fingerprint.write_u64(search.limit as u64);
         }

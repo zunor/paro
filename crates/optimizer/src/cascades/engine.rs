@@ -12,7 +12,7 @@ use super::calibration::{
     LocalOperatorWork, MachineCalibrationBundle, ParallelWorkProfile, OP_ENFORCER_RANDOM_FETCH,
     OP_ENFORCER_SORT_COMPARE, OP_ENFORCER_SPILL_PAGE, OP_ENFORCER_STREAM_ROW,
 };
-use super::cost::{CompactRange, ResourceDimension, SearchCost};
+use super::cost::{CompactRange, MemoryCompletion, ResourceDimension, SearchCost};
 use super::enforcer::{EnforcementPlanner, EnforcerStep};
 use super::grant::{derive_grant_sensitivity, verify_grant_invariance, GrantSensitivitySummary};
 use super::ids::{
@@ -1222,6 +1222,14 @@ fn fit_local_retained_state_to_grant(
                 .min(grant.hard_memory_bytes - retained_minimum);
             return Ok(Some(local_cost));
         }
+        if local_cost.memory_completion == MemoryCompletion::RuntimeCapped {
+            local_cost.non_revocable_memory_upper = grant.hard_memory_bytes;
+            local_cost.peak_memory_upper = grant.hard_memory_bytes;
+            local_cost.revocable_memory_target = local_cost
+                .revocable_memory_target
+                .min(grant.hard_memory_bytes - retained_minimum);
+            return Ok(Some(local_cost));
+        }
         return Ok(None);
     }
     if local_cost.peak_memory_upper <= grant.hard_memory_bytes {
@@ -1239,6 +1247,14 @@ fn fit_local_retained_state_to_grant(
         if spilled > 0 {
             add_composition_spill_cost(&mut local_cost, spilled)?;
         }
+        return Ok(Some(local_cost));
+    }
+    if local_cost.memory_completion == MemoryCompletion::RuntimeCapped {
+        local_cost.non_revocable_memory_upper = grant.hard_memory_bytes;
+        local_cost.peak_memory_upper = grant.hard_memory_bytes;
+        local_cost.revocable_memory_target = local_cost
+            .revocable_memory_target
+            .min(grant.hard_memory_bytes - retained_minimum);
         return Ok(Some(local_cost));
     }
     Ok(None)
@@ -1279,6 +1295,10 @@ pub(crate) fn constrain_composed_cost_to_grant(
         .peak_memory_upper
         .min(grant.hard_memory_bytes)
         .max(cost.minimum_memory_bytes);
+    if cost.memory_completion == MemoryCompletion::RuntimeCapped {
+        cost.non_revocable_memory_upper =
+            cost.non_revocable_memory_upper.min(grant.hard_memory_bytes);
+    }
     cost.validate()?;
     Ok(Some(cost))
 }

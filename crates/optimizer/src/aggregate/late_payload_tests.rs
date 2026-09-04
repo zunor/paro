@@ -12,7 +12,7 @@ use paro_planner::expression::{AggregateExpression, ColumnRefExpression, Express
 use paro_planner::operator::aggregate::GroupDependency;
 use paro_planner::operator::{
     Aggregate, ColumnBinding, ComparisonJoin, CrossProduct, Filter, Get, GetColumnSource, Join,
-    JoinComparisonType, JoinCondition, JoinType, LogicalOperator, Projection, TopN,
+    JoinComparisonType, JoinCondition, JoinType, LogicalOperator, Projection, ProjectionMap, TopN,
 };
 use paro_planner::plan::LogicalPlan;
 use paro_storage::table::table_factory::TableFactory;
@@ -331,7 +331,7 @@ fn row_preserving_candidate(include_derived_prefix: bool, hidden_order_key: bool
     let mut projection = LogicalPlan::synthetic(LogicalOperator::Projection(projection));
     projection.stats.estimated_cardinality =
         Some(paro_planner::plan::CardinalityEstimate::exact(100_000));
-    LogicalPlan::synthetic(LogicalOperator::TopN(TopN::new(
+    let mut topn = TopN::new(
         projection,
         vec![OrderByNode {
             expression: column(OUTPUT, order_index, LogicalType::BigInt),
@@ -340,7 +340,11 @@ fn row_preserving_candidate(include_derived_prefix: bool, hidden_order_key: bool
         }],
         3,
         0,
-    )))
+    );
+    if hidden_order_key {
+        topn.projection_map = ProjectionMap::new(vec![0, 1]);
+    }
+    LogicalPlan::synthetic(LogicalOperator::TopN(topn))
 }
 
 #[test]
@@ -433,7 +437,14 @@ fn hidden_order_key_has_an_internal_name_during_row_preserving_rewrite() {
         panic!("expected rewritten output projection")
     };
     assert_eq!(output.visible_names, ["name", "address"]);
-    assert_eq!(output.expressions.len(), 3);
+    assert_eq!(output.expressions.len(), 2);
+    let LogicalOperator::RowFetch(fetch) = &output.child.operator else {
+        panic!("expected output payload fetch")
+    };
+    let LogicalOperator::TopN(topn) = &fetch.child.operator else {
+        panic!("expected TopN below output payload fetch")
+    };
+    assert_eq!(topn.projection_map, ProjectionMap::new(vec![1]));
 }
 
 #[test]

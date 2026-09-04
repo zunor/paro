@@ -8,26 +8,24 @@ ORDER_BY  (rows=1)
     Output: v
     ->  FILTER  (rows=1)
       Filter: nums.v > 1
-      ->  PROJECTION  (rows=3)
-        Output: v
-        ->  VALUES  (rows=3)
+      ->  VALUES  (rows=3)
 
 EXPLAIN
 WITH nums(v) AS MATERIALIZED (VALUES (1), (2), (3))
 SELECT v FROM nums WHERE v > 1 ORDER BY v;
 QUERY PLAN
-MATERIALIZED_CTE
+MATERIALIZED_CTE  (rows=1)
   CTE Name: nums
   Materialization: MATERIALIZED
   Reference Count: 1
   ->  VALUES  (rows=3)
-  ->  ORDER_BY
+  ->  ORDER_BY  (rows=1)
     Sort Key: v ASC NULLS LAST
-    ->  PROJECTION
+    ->  PROJECTION  (rows=1)
       Output: v
-      ->  FILTER
+      ->  FILTER  (rows=1)
         Filter: nums.v > 1
-        ->  CTE_SCAN
+        ->  CTE_SCAN  (rows=3)
           CTE Index: 0
           Table Index: 8
 

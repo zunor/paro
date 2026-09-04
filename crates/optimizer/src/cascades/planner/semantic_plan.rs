@@ -75,7 +75,13 @@ fn materialize_raw(
     plan.stats.estimated_cardinality = memo
         .cardinality_estimate(owner)
         .map(|(min, expected, max)| paro_planner::plan::CardinalityEstimate { min, expected, max });
-    Ok(plan)
+    let output_columns = state
+        .metadata
+        .get(&logical.payload)
+        .ok_or_else(|| paro_error::internal("planner rule payload has no operator metadata"))?
+        .output_columns
+        .clone();
+    freeze_output_layout(plan, &output_columns, state)
 }
 
 /// Pick a semantic representative from the dependencies declared by the
@@ -117,7 +123,10 @@ fn preferred_semantic_expression(
         .or_else(|| expression_for(None))
 }
 
-pub(super) fn freeze_extraction_layout(
+/// Restore the occurrence's exact output contract after materializing a
+/// canonical Memo template. Every node is frozen independently because a
+/// parent's schema cannot describe hidden columns removed by its children.
+pub(super) fn freeze_output_layout(
     mut plan: LogicalPlan,
     output_columns: &[ColumnId],
     state: &PlannerTransformState,
@@ -130,6 +139,10 @@ pub(super) fn freeze_extraction_layout(
         LogicalOperator::Order(order) => {
             order.projection_map =
                 projection_for_columns(&order.child, output_columns, &state.binding_ids)?;
+        }
+        LogicalOperator::TopN(topn) => {
+            topn.projection_map =
+                projection_for_columns(&topn.child, output_columns, &state.binding_ids)?;
         }
         LogicalOperator::Join(Join::Comparison(join)) => {
             let marker = marker_column(join.mark_index, &state.binding_ids)?;
@@ -178,6 +191,9 @@ fn canonicalize_projection_maps(operator: &mut LogicalOperator) {
         }
         LogicalOperator::Order(order) => {
             order.projection_map = paro_planner::operator::ProjectionMap::all();
+        }
+        LogicalOperator::TopN(topn) => {
+            topn.projection_map = paro_planner::operator::ProjectionMap::all();
         }
         LogicalOperator::Join(Join::Comparison(join)) => {
             (join.left_projection_map, join.right_projection_map) =

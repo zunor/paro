@@ -68,13 +68,11 @@ impl Executor {
         )) as Arc<dyn paro_common::allocator::Allocator>;
 
         let query_memory_pool = self.create_query_memory_pool();
-        let external_worker_slots = if self.session.python_runtime_status().is_some_and(|status| {
-            status.availability == paro_external::runtime::host::PythonRuntimeAvailability::Ready
-        }) {
-            self.session.python_execution_slot_limit()
-        } else {
-            0
-        };
+        // Portfolio admission models configured capacity. Runtime readiness is
+        // an execution capability with its own typed diagnostics; collapsing
+        // the two here turns a precise unavailable/misconfigured error into a
+        // misleading "no physical variant" planning failure.
+        let external_worker_slots = self.session.python_execution_slot_limit();
         let (program, execution_lease) =
             self.admit_program(&compiled, &query_memory_pool, external_worker_slots)?;
         if let Some(lease) = execution_lease {

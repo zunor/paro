@@ -124,6 +124,69 @@ pub(super) const PLANNER_HASH_JOIN_BUILD_LEFT_RUNTIME_FILTER: ImplementationId =
     ImplementationId(11);
 const COST_OPTIMIZED_SEARCH_POLICY: QualityPolicyId = QualityPolicyId(1);
 
+struct SearchStagingRequest<'a> {
+    plan: LogicalPlan,
+    expected_output_bindings: &'a [ColumnBinding],
+    expected_output_types: &'a [paro_common::types::LogicalType],
+    output_columns: &'a [ColumnId],
+    materialized_columns: &'a BTreeSet<ColumnId>,
+    binding_ids: &'a BindingCatalog,
+    operator_fingerprint: Fingerprint,
+    output_rows_hard_upper: Option<u64>,
+    column_stats: &'a HashMap<ColumnBinding, Arc<ColumnStatistics>>,
+    scan_access_cost: paro_storage::rowset::scan_cost::ScanAccessCostModel,
+}
+
+fn stage_search_implementation(
+    request: SearchStagingRequest<'_>,
+    payloads: &mut PlannerPayloadArena,
+) -> Result<PlannerSearchImplementationMetadata> {
+    let SearchStagingRequest {
+        mut plan,
+        expected_output_bindings,
+        expected_output_types,
+        output_columns,
+        materialized_columns,
+        binding_ids,
+        operator_fingerprint,
+        output_rows_hard_upper,
+        column_stats,
+        scan_access_cost,
+    } = request;
+    if plan.get_column_bindings() != expected_output_bindings
+        || plan.types() != expected_output_types
+    {
+        return Err(paro_error::internal(
+            "physical search candidate changed its logical output contract",
+        ));
+    }
+    let payload_fingerprint = search_payload_fingerprint(operator_fingerprint, &plan.operator);
+    let provided = ProvidedProperties {
+        ordering: derive_provided_ordering(&plan.operator, output_columns, None, binding_ids),
+        partitioning: ProvidedPartitioning::Singleton,
+        materialization: ProvidedMaterialization {
+            values: materialized_columns.clone(),
+            locators: BTreeMap::new(),
+        },
+        mutation_safety: ProvidedMutationSafety::NotApplicable,
+        representation: ProvidedRepresentation::Flat,
+        replayability: ProvidedReplayability::OnePass,
+        result_guarantee: provided_result_guarantee(&plan.operator),
+    };
+    let local_cost =
+        planner_operator_cost(&plan, 0, output_rows_hard_upper, &[], scan_access_cost)?;
+    let cost_facts = planner_cost_facts(&plan, column_stats, scan_access_cost)?;
+    plan.stats = NodeStats::default();
+    let payload = payloads.push_physical(PlannerPhysicalTemplate::Executable(Box::new(plan)));
+    Ok(PlannerSearchImplementationMetadata {
+        payload,
+        payload_fingerprint,
+        provided,
+        local_cost,
+        cost_facts,
+    })
+}
+
 /// Runtime-filter dependency direction declared by a physical implementation.
 ///
 /// Candidate construction and winner verification share this implementation
@@ -620,59 +683,25 @@ impl MemoBuilder {
                         payload,
                         EquivalenceProof::Initial,
                     )?;
-                    let search = if let Some(mut search_plan) = search_candidate {
-                        if search_plan.get_column_bindings() != output_bindings
-                            || search_plan.types() != plan.types()
-                        {
-                            return Err(paro_error::internal(
-                                "physical search candidate changed its logical output contract",
-                            ));
-                        }
-                        let search_fingerprint =
-                            search_payload_fingerprint(operator_fingerprint, &search_plan.operator);
-                        let provided = ProvidedProperties {
-                            ordering: derive_provided_ordering(
-                                &search_plan.operator,
-                                &output_columns,
-                                None,
-                                &binding_ids,
-                            ),
-                            partitioning: ProvidedPartitioning::Singleton,
-                            materialization: ProvidedMaterialization {
-                                values: unique_columns.clone(),
-                                locators: BTreeMap::new(),
-                            },
-                            mutation_safety: ProvidedMutationSafety::NotApplicable,
-                            representation: ProvidedRepresentation::Flat,
-                            replayability: ProvidedReplayability::OnePass,
-                            result_guarantee: provided_result_guarantee(&search_plan.operator),
-                        };
-                        let local_cost = planner_operator_cost(
-                            &search_plan,
-                            0,
-                            output_rows_hard_upper,
-                            &child_maximum_cardinalities,
-                            scan_access_cost,
-                        )?;
-                        let cost_facts = planner_cost_facts(
-                            &search_plan,
-                            candidate_stats.as_ref(),
-                            scan_access_cost,
-                        )?;
-                        search_plan.stats = NodeStats::default();
-                        let payload = payloads.push_physical(PlannerPhysicalTemplate::Executable(
-                            Box::new(search_plan),
-                        ));
-                        Some(PlannerSearchImplementationMetadata {
-                            payload,
-                            payload_fingerprint: search_fingerprint,
-                            provided,
-                            local_cost,
-                            cost_facts,
+                    let search = search_candidate
+                        .map(|search_plan| {
+                            stage_search_implementation(
+                                SearchStagingRequest {
+                                    plan: search_plan,
+                                    expected_output_bindings: &output_bindings,
+                                    expected_output_types: &plan.types(),
+                                    output_columns: &output_columns,
+                                    materialized_columns: &unique_columns,
+                                    binding_ids: &binding_ids,
+                                    operator_fingerprint,
+                                    output_rows_hard_upper,
+                                    column_stats: candidate_stats.as_ref(),
+                                    scan_access_cost,
+                                },
+                                &mut payloads,
+                            )
                         })
-                    } else {
-                        None
-                    };
+                        .transpose()?;
                     let implementations = planner_implementation_set(&plan, rowset_scan_pushdown);
                     let region_scope = PlannerRegionScope::new(
                         group,

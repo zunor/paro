@@ -61,8 +61,22 @@ pub(super) fn planner_implementation_set(
                     | JoinType::RightSemi
                     | JoinType::RightAnti
             );
-            let baseline = if has_hash_key && !mark_has_residual && supports_hash_type {
+            let supports_build_left_type = matches!(
+                join.join_type,
+                JoinType::Left | JoinType::Right | JoinType::Inner | JoinType::Outer
+            ) && join.anti_join_mode == AntiJoinMode::Regular;
+            let baseline = if has_hash_key
+                && !mark_has_residual
+                && supports_hash_type
+                && join.build_side_constraint.allows_right()
+            {
                 PhysicalImplementationFlavor::HashJoin
+            } else if has_hash_key
+                && !mark_has_residual
+                && supports_build_left_type
+                && join.build_side_constraint.allows_left()
+            {
+                PhysicalImplementationFlavor::HashJoinBuildLeft
             } else if join.anti_join_mode == AntiJoinMode::NullAware {
                 // The extractor reports the precise semantic capability error;
                 // keep structural lowering for this malformed/non-hashable
@@ -74,15 +88,14 @@ pub(super) fn planner_implementation_set(
             PlannerImplementationSet {
                 baseline,
                 hash_join_build_left: baseline == PhysicalImplementationFlavor::HashJoin
-                    && join.anti_join_mode == AntiJoinMode::Regular
-                    && matches!(
-                        join.join_type,
-                        JoinType::Left | JoinType::Right | JoinType::Inner | JoinType::Outer
-                    ),
-                hash_join_build_left_runtime_filter: baseline
-                    == PhysicalImplementationFlavor::HashJoin
+                    && supports_build_left_type
+                    && join.build_side_constraint.allows_left(),
+                hash_join_build_left_runtime_filter: supports_build_left_type
+                    && join.build_side_constraint.allows_left()
                     && supports_build_left_runtime_filter_auxiliary(join, rowset_scan_pushdown),
-                hash_join_runtime_filter: baseline == PhysicalImplementationFlavor::HashJoin
+                hash_join_runtime_filter: has_hash_key
+                    && supports_hash_type
+                    && join.build_side_constraint.allows_right()
                     && supports_runtime_filter_auxiliary(join, rowset_scan_pushdown),
                 sort_range_join:
                     crate::physical::extraction::inequality_join_gate::is_sort_range_join_candidate(
@@ -970,6 +983,7 @@ fn apply_execution_memory_contract(
         ExecutionMemoryContract, BLOCKING_FIXED_SCRATCH_BYTES, BLOCKING_PER_TASK_SCRATCH_BYTES,
         SPILL_BUFFER_MINIMUM_BYTES,
     };
+    use crate::physical::MemoryCompletion;
 
     let stateful = retained_memory_upper > 0
         || matches!(
@@ -1049,14 +1063,24 @@ fn apply_execution_memory_contract(
         };
         cost.validate()?;
         return Ok(());
+    } else if retained_memory_upper == u64::MAX {
+        // A missing semantic row bound cannot prove how much state this
+        // non-spillable operator will eventually retain.  It also must not
+        // erase the only semantically valid implementation.  Publish the
+        // executable scratch floor and preserve the unknown retained-state
+        // upper explicitly; grant admission will cap resident memory while
+        // keeping the weaker completion contract visible to plan selection.
+        cost.non_revocable_memory_upper = u64::MAX;
+        cost.minimum_memory_bytes = BLOCKING_FIXED_SCRATCH_BYTES;
+        cost.revocable_memory_target = 0;
+        cost.peak_memory_upper = u64::MAX;
+        cost.memory_completion = MemoryCompletion::RuntimeCapped;
+        cost.validate()?;
+        return Ok(());
     } else {
         ExecutionMemoryContract {
             fixed_non_revocable_bytes: retained_memory_upper,
-            fixed_scratch_bytes: if retained_memory_upper == u64::MAX {
-                0
-            } else {
-                BLOCKING_FIXED_SCRATCH_BYTES
-            },
+            fixed_scratch_bytes: BLOCKING_FIXED_SCRATCH_BYTES,
             per_task_scratch_bytes: 0,
             max_concurrent_tasks: 0,
             revocable_minimum_bytes: 0,

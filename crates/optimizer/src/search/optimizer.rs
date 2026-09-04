@@ -390,21 +390,33 @@ fn build_search_scan(
     decision: SearchDecision,
     candidate_filters: Vec<Expression>,
 ) -> LogicalPlan {
+    let output_indices = pattern
+        .topn
+        .projection_map
+        .to_indices(pattern.projection.expressions.len());
+    let projections = output_indices
+        .iter()
+        .filter_map(|&index| pattern.projection.expressions.get(index).cloned())
+        .collect();
+    let score_output_index = output_indices
+        .iter()
+        .position(|&index| index == pattern.order_expr_idx);
+    let output_names = plan.output_names();
     let operator = LogicalOperator::SearchScan(
         SearchScan::new(
             pattern.get.clone(),
             request,
             decision,
-            pattern.projection.expressions.clone(),
+            projections,
             pattern.projection.table_index,
             candidate_filters,
             Vec::new(),
-            pattern.order_expr_idx,
+            score_output_index,
             pattern.order_expr.clone(),
             pattern.topn.orders[0].ascending,
             pattern.topn.limit,
         )
-        .with_output_names(pattern.projection.visible_names.clone()),
+        .with_output_names(output_names),
     );
     let (id, stats, _) = plan.into_parts();
     LogicalPlan {
@@ -1182,22 +1194,28 @@ fn rebuild_topn_from_search(search: &SearchScan) -> LogicalOperator {
         )));
     }
 
-    let projection = Projection::new(
-        search.projection_table_index,
-        child,
-        search.projections.clone(),
-    )
-    .with_visible_names(search.output_names.clone());
+    let mut projections = search.projections.clone();
+    let visible_width = projections.len();
+    let score_projection_index = search.score_output_index.unwrap_or_else(|| {
+        projections.push(search.score_expression.clone());
+        projections.len() - 1
+    });
+    let projection = Projection::new(search.projection_table_index, child, projections)
+        .with_visible_names(search.output_names.clone());
     let projection = LogicalPlan::synthetic(LogicalOperator::Projection(projection));
     let order = OrderByNode {
         expression: Expression::Reference(ReferenceExpression::new(
-            search.score_projection_index,
+            score_projection_index,
             search.score_expression.return_type(),
         )),
         ascending: search.order_ascending,
         nulls_first: false,
     };
-    LogicalOperator::TopN(TopN::new(projection, vec![order], search.limit, 0))
+    let mut topn = TopN::new(projection, vec![order], search.limit, 0);
+    if search.score_output_index.is_none() {
+        topn.projection_map = (0..visible_width).collect::<Vec<_>>().into();
+    }
+    LogicalOperator::TopN(topn)
 }
 
 #[cfg(test)]
@@ -1383,7 +1401,7 @@ mod tests {
             9,
             vec![],
             vec![],
-            1,
+            Some(1),
             Expression::Constant(ConstantExpression::new(
                 Value::Float(0.5),
                 LogicalType::Float,

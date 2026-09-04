@@ -259,7 +259,7 @@ pub(super) fn extract_planner_tree(
                     ));
                 }
                 if matches!(&payload.template, PlannerPhysicalTemplate::Logical(_)) {
-                    plan = semantic_plan::freeze_extraction_layout(plan, &output_columns, state)?;
+                    plan = semantic_plan::freeze_output_layout(plan, &output_columns, state)?;
                 }
                 anchor_output_cardinality(&mut plan, output_estimate);
                 contracts.insert(plan.id, base_contract.clone());

@@ -654,7 +654,7 @@ impl PythonRuntimeProvider for ExternalRuntimeHost {
                 Vec::new(),
             )));
         }
-        self.ensure_ready("external routine execution admission")?;
+        self.ensure_ready("external routine execution")?;
         let mut permits = self
             .permits
             .lock()

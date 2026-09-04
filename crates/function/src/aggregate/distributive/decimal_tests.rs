@@ -924,3 +924,24 @@ fn decimal_avg_uses_wide_accumulator_before_division() {
     let result = unsafe { finalize_single(&mut state, &data, LogicalType::Double) }.unwrap();
     assert_eq!(unsafe { result.get_fixed::<f64>(0) }, input as f64);
 }
+
+#[test]
+fn decimal_avg_rounds_the_exact_scaled_quotient_once() {
+    let data = DecimalAggregateBindData {
+        op: DecimalAggregateOp::Avg,
+        input_scale: 2,
+        output_precision: 38,
+        output_scale: 2,
+        output_limit: 10_i128.pow(38),
+        wide_sum: false,
+    };
+    let mut state = initialized_average_state();
+    for value in [3_507, 3_507, 3_506] {
+        update_average_state(&mut state, value);
+    }
+
+    let result = unsafe { finalize_single(&mut state, &data, LogicalType::Double) }.unwrap();
+    let average = unsafe { result.get_fixed::<f64>(0) };
+    assert_eq!(average.to_bits(), (10_520_f64 / 300_f64).to_bits());
+    assert_ne!(average.to_bits(), (10_520_f64 / 3_f64 / 100_f64).to_bits());
+}

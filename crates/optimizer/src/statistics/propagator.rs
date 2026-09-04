@@ -193,9 +193,13 @@ impl LogicalPlanPostOrderFolder<LogicalOutputLayout> for StatisticsPropagationFo
         if completed_children.len() != 1 {
             return Ok(());
         }
+        // A materialized producer is complete before its consumer sibling is
+        // visited, so its output domain is valid there.  A recursive CTE's
+        // first child is only the anchor: publishing that domain to the
+        // recursive reference mistakes iteration zero for a fixed point and
+        // can erase termination predicates as "always true".
         let cte_index = match &parent_skeleton.operator {
             LogicalOperator::MaterializedCTE(cte) => Some(cte.cte_index),
-            LogicalOperator::RecursiveCTE(cte) => Some(cte.cte_index),
             _ => None,
         };
         if let Some(cte_index) = cte_index {
@@ -980,7 +984,7 @@ mod tests {
         AggregateExpression, ComparisonExpression, WindowExpression, WindowFrame,
     };
     use paro_planner::operator::{
-        Aggregate, ExpressionGet, Filter, Get, Limit, Projection, Window,
+        Aggregate, CTERef, ExpressionGet, Filter, Get, Limit, Projection, RecursiveCTE, Window,
     };
     use paro_storage::statistics::StringStats;
     use paro_storage::table::table_factory::TableFactory;
@@ -1225,6 +1229,71 @@ mod tests {
             Some(Value::Integer(2001))
         );
         assert_eq!(statistics.get_distinct_count(), 0);
+    }
+
+    #[test]
+    fn recursive_reference_does_not_inherit_anchor_only_domain() {
+        let bind_context = BindContext::new();
+        let anchor = LogicalPlan::new(
+            &bind_context,
+            LogicalOperator::ExpressionGet(ExpressionGet::new(
+                7,
+                vec![vec![Expression::Constant(ConstantExpression::new(
+                    Value::Integer(1),
+                    LogicalType::Integer,
+                ))]],
+                vec!["n".to_string()],
+                vec![LogicalType::Integer],
+            )),
+        );
+        let recursive_binding = ColumnBinding::new(8, 0);
+        let recursive = LogicalPlan::new(
+            &bind_context,
+            LogicalOperator::Filter(Filter::new(
+                LogicalPlan::new(
+                    &bind_context,
+                    LogicalOperator::CTERef(CTERef::new(
+                        3,
+                        8,
+                        "counter".to_string(),
+                        vec!["n".to_string()],
+                        vec![LogicalType::Integer],
+                    )),
+                ),
+                vec![Expression::Comparison(ComparisonExpression::new(
+                    ComparisonType::LessThan,
+                    Expression::ColumnRef(ColumnRefExpression::new(
+                        recursive_binding,
+                        LogicalType::Integer,
+                    )),
+                    Expression::Constant(ConstantExpression::new(
+                        Value::Integer(4),
+                        LogicalType::Integer,
+                    )),
+                ))],
+            )),
+        );
+        let plan = LogicalPlan::new(
+            &bind_context,
+            LogicalOperator::RecursiveCTE(RecursiveCTE {
+                cte_index: 3,
+                cte_name: "counter".to_string(),
+                column_names: vec!["n".to_string()],
+                column_types: vec![LogicalType::Integer],
+                union_all: true,
+                anchor: Box::new(anchor),
+                recursive: Box::new(recursive),
+            }),
+        );
+
+        let propagated = StatisticsPropagator::new().propagate(make_test_session(), plan);
+        let LogicalOperator::RecursiveCTE(cte) = &propagated.operator else {
+            panic!("expected recursive CTE root");
+        };
+        let LogicalOperator::Filter(filter) = &cte.recursive.operator else {
+            panic!("recursive termination filter must remain in the plan");
+        };
+        assert_eq!(filter.expressions.len(), 1);
     }
 
     #[test]

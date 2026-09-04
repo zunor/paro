@@ -460,7 +460,9 @@ fn sort_range_column_stats_for_output(
             sort_range_column_stats_for_output(order.child.as_ref(), child_idx)
         }
         LogicalOperator::TopN(topn) => {
-            sort_range_column_stats_for_output(topn.child.as_ref(), output_idx)
+            let child_idx =
+                projected_child_index(&topn.projection_map, topn.child.types().len(), output_idx)?;
+            sort_range_column_stats_for_output(topn.child.as_ref(), child_idx)
         }
         _ => None,
     }

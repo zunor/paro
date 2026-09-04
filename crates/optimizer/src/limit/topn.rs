@@ -164,8 +164,10 @@ impl TopNOptimizer {
         };
 
         let order_child = *order.child;
-        let topn = TopN::new(order_child, order.orders, limit_val, offset_val)
+        let order_projection = order.projection_map;
+        let mut topn = TopN::new(order_child, order.orders, limit_val, offset_val)
             .with_hnsw_options(limit.hnsw_options);
+        topn.projection_map = order_projection;
         let mut result = LogicalOperator::TopN(topn);
 
         while let Some((table_index, expressions, output_names, visible_count, qualifier)) =
@@ -387,6 +389,31 @@ mod tests {
         } else {
             panic!("Expected TopN operator");
         }
+    }
+
+    #[test]
+    fn test_optimize_preserves_order_output_projection() {
+        let mut optimizer = TopNOptimizer::new();
+        let get = create_test_get();
+        let mut order = create_order_by(get);
+        let LogicalOperator::Order(order_node) = &mut order else {
+            unreachable!()
+        };
+        order_node.projection_map = vec![0].into();
+        let limit = LogicalOperator::Limit(Limit::new(
+            LogicalPlan::synthetic(order),
+            Some(create_constant_expr(10)),
+            None,
+        ));
+
+        let result = optimizer.optimize(limit);
+
+        let result_types = result.types();
+        let LogicalOperator::TopN(topn) = result else {
+            panic!("Expected TopN operator")
+        };
+        assert_eq!(topn.projection_map.as_columns(), Some(&[0][..]));
+        assert_eq!(result_types, vec![LogicalType::Integer]);
     }
 
     #[test]

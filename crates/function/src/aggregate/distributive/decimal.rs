@@ -1154,8 +1154,11 @@ unsafe fn finalize_average(
         if state.overflowed {
             return Err(paro_error::out_of_range("Decimal AVG aggregate overflow"));
         }
-        let value =
-            state.value().as_f64() / state.count as f64 / 10_f64.powi(i32::from(data.input_scale));
+        // Divide once by the scaled denominator. Splitting this into `/ count`
+        // and `/ scale` rounds the intermediate quotient and can move the
+        // correctly-rounded IEEE-754 result by one ULP.
+        let denominator = state.count as f64 * 10_f64.powi(i32::from(data.input_scale));
+        let value = state.value().as_f64() / denominator;
         *result.flat_data_mut::<f64>().add(row) = value;
     }
     Ok(())

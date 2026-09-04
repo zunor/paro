@@ -359,6 +359,7 @@ mod tests {
                         minimum_memory_bytes: 500,
                         working_set_memory_bytes: 700,
                         memory_ceiling_bytes: 800,
+                        memory_completion: paro_optimizer::physical::MemoryCompletion::Guaranteed,
                         max_parallel_tasks: 2,
                         external_worker_slots: 0,
                     },

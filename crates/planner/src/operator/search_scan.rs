@@ -66,8 +66,9 @@ pub struct SearchScan {
     pub projection_table_index: usize,
     pub absorbed_predicates: Vec<Expression>,
     pub residual_predicates: Vec<Expression>,
-    /// Index of the score expression inside `projections`.
-    pub score_projection_index: usize,
+    /// Output position of the score when it is visible. Ranking can depend on
+    /// an internal score that the TopN output contract projects away.
+    pub score_output_index: Option<usize>,
     pub score_expression: Expression,
     pub order_ascending: bool,
     pub limit: usize,
@@ -83,7 +84,7 @@ impl SearchScan {
         projection_table_index: usize,
         absorbed_predicates: Vec<Expression>,
         residual_predicates: Vec<Expression>,
-        score_projection_index: usize,
+        score_output_index: Option<usize>,
         score_expression: Expression,
         order_ascending: bool,
         limit: usize,
@@ -100,7 +101,7 @@ impl SearchScan {
             projection_table_index,
             absorbed_predicates,
             residual_predicates,
-            score_projection_index,
+            score_output_index,
             score_expression,
             order_ascending,
             limit,

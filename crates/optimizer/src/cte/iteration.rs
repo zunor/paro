@@ -54,6 +54,16 @@ fn orient_recursive_member(
             if right_contains_reference {
                 move_recursive_input_to_probe(join, cte_name)?;
             }
+            if left_contains_reference || right_contains_reference {
+                if let Join::Comparison(join) = join {
+                    // Every stateful implementation inside the loop must keep
+                    // the changing delta on its streaming side.  Persist the
+                    // requirement beyond logical orientation so physical
+                    // build-left alternatives cannot undo it during costing.
+                    join.build_side_constraint =
+                        paro_planner::operator::JoinBuildSideConstraint::Right;
+                }
+            }
         }
 
         Ok((plan, contains_reference))
@@ -65,6 +75,7 @@ fn move_recursive_input_to_probe(join: &mut Join, cte_name: &str) -> Result<()> 
     match join {
         Join::Comparison(join) if join.join_type == JoinType::Inner => {
             std::mem::swap(&mut join.left, &mut join.right);
+            join.build_side_constraint = join.build_side_constraint.flip();
             for condition in &mut join.conditions {
                 std::mem::swap(&mut condition.left, &mut condition.right);
                 condition.comparison = condition.comparison.flip();
@@ -96,8 +107,8 @@ mod tests {
     use paro_common::types::LogicalType;
     use paro_planner::expression::{ColumnRefExpression, Expression};
     use paro_planner::operator::{
-        CTERef, ColumnBinding, ComparisonJoin, ExpressionGet, Join, JoinComparisonType,
-        JoinCondition, JoinType, LogicalOperator, RecursiveCTE,
+        CTERef, ColumnBinding, ComparisonJoin, ExpressionGet, Join, JoinBuildSideConstraint,
+        JoinComparisonType, JoinCondition, JoinType, LogicalOperator, RecursiveCTE,
     };
     use paro_planner::plan::LogicalPlan;
 
@@ -184,5 +195,6 @@ mod tests {
             panic!("expected left column reference");
         };
         assert_eq!(left.binding.table_index, recursive_table_index);
+        assert_eq!(join.build_side_constraint, JoinBuildSideConstraint::Right);
     }
 }

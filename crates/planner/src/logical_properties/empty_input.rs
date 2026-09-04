@@ -119,6 +119,7 @@ impl EmptyInputBehavior {
                     Self::ZeroRows(plan.types().into_boxed_slice())
                 } else {
                     Self::derive(&topn.child.operator)
+                        .project_indices(&topn.projection_map, &topn.child.types())
                 }
             }
             LogicalOperator::Distinct(distinct) => Self::derive(&distinct.child.operator),
@@ -388,7 +389,7 @@ pub(crate) fn normalize_scalar_singleton_wrappers(plan: LogicalOperator) -> Logi
                     let properties = order.expression.evaluation_properties();
                     properties.can_share_evaluation() && properties.is_infallible()
                 });
-            if removable {
+            if removable && topn.projection_map.is_identity(topn.child.types().len()) {
                 (*topn.child).into_operator()
             } else {
                 LogicalOperator::TopN(topn)

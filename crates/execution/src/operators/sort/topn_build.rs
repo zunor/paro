@@ -91,6 +91,11 @@ impl TopNBuildSinkExec {
                 VECTOR_SIZE,
                 ctx.query.allocator(MemoryTag::BaseTable),
             )?,
+            payload_chunk: Chunk::try_initialize(
+                &self.spec.output_types,
+                VECTOR_SIZE,
+                ctx.query.allocator(MemoryTag::BaseTable),
+            )?,
             order_types,
         }))
     }
@@ -134,8 +139,13 @@ impl TopNBuildSinkExec {
             &mut local.sort_chunk,
         )?;
         local
-            .heap
-            .sink_with_sort_chunk(input, &local.sort_chunk, Some(&local.boundary))?;
+            .payload_chunk
+            .reference_columns(input, &self.spec.projection_map);
+        local.heap.sink_with_sort_chunk(
+            &local.payload_chunk,
+            &local.sort_chunk,
+            Some(&local.boundary),
+        )?;
         local.heap.reduce()?;
         Ok(SinkPoll::NeedMoreInput)
     }

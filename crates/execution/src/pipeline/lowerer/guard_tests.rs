@@ -15,6 +15,7 @@ use crate::physical::specs::{ExternalProjectSpec, ExternalRoutineDescriptor, Ext
 fn streaming_topn_guard_rejects_missing_order() {
     let topn = TopNSpec {
         orders: Box::new([]),
+        projection_map: Box::new([0]),
         limit: 10,
         offset: 0,
         hnsw_options: Default::default(),

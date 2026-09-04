@@ -333,6 +333,35 @@ impl MarkJoinSemantics {
 
 /// ComparisonJoin represents a join with comparison conditions.
 /// This is the most common type of join (e.g., a.id = b.id).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum JoinBuildSideConstraint {
+    /// Either input may be materialized by a physical join implementation.
+    #[default]
+    Either,
+    /// Only the logical left input may be materialized.
+    Left,
+    /// Only the logical right input may be materialized.
+    Right,
+}
+
+impl JoinBuildSideConstraint {
+    pub fn allows_left(self) -> bool {
+        matches!(self, Self::Either | Self::Left)
+    }
+
+    pub fn allows_right(self) -> bool {
+        matches!(self, Self::Either | Self::Right)
+    }
+
+    pub fn flip(self) -> Self {
+        match self {
+            Self::Either => Self::Either,
+            Self::Left => Self::Right,
+            Self::Right => Self::Left,
+        }
+    }
+}
+
 #[derive(Debug)]
 pub struct ComparisonJoin {
     /// The type of join (INNER, LEFT, RIGHT, etc.)
@@ -353,6 +382,8 @@ pub struct ComparisonJoin {
     pub duplicate_eliminated_columns: Vec<Expression>,
     /// Whether the delim join has been flipped to de-duplicating the RHS instead.
     pub delim_flipped: bool,
+    /// Physical materialization constraint imposed by a control region.
+    pub build_side_constraint: JoinBuildSideConstraint,
     /// Columns from left side to output.
     pub left_projection_map: ProjectionMap,
     /// Columns from right side to output.
@@ -385,6 +416,7 @@ impl ComparisonJoin {
             mark_semantics: MarkJoinSemantics::for_join_type(join_type),
             duplicate_eliminated_columns: vec![],
             delim_flipped: false,
+            build_side_constraint: JoinBuildSideConstraint::Either,
             left_projection_map,
             right_projection_map,
         }

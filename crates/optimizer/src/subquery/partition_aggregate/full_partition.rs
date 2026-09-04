@@ -412,6 +412,7 @@ fn localize_inner_full_partition_filter(
         mark_semantics,
         duplicate_eliminated_columns,
         delim_flipped,
+        build_side_constraint,
         left_projection_map,
         right_projection_map,
     } = scalar_join;
@@ -427,6 +428,7 @@ fn localize_inner_full_partition_filter(
             mark_semantics,
             duplicate_eliminated_columns,
             delim_flipped,
+            build_side_constraint,
             left_projection_map,
             right_projection_map,
         };

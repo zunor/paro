@@ -97,6 +97,14 @@ pub(crate) fn child_output_contracts(
         LogicalOperator::TopN(topn) if inherited.is_some() => {
             let mut contract = inherited.cloned().unwrap_or_default();
             contract.extend(topn.orders.iter().map(|order| &order.expression));
+            if !extend_stored_projection(
+                &mut contract,
+                topn.child.as_ref(),
+                &topn.projection_map,
+                rewrite_shape,
+            ) {
+                return vec![None];
+            }
             vec![Some(contract)]
         }
         LogicalOperator::Join(Join::Comparison(join)) if inherited.is_some() => {

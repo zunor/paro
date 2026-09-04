@@ -8,7 +8,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use paro_common::error::{self as paro_error, Result};
 use tracing::debug;
 
-use crate::physical::cost::SearchCost;
+use crate::physical::cost::{MemoryCompletion, SearchCost};
 use crate::physical::identity::{Fingerprint, ResourceGrantClassId};
 use crate::physical::{PhysicalPlan, PhysicalPlanVerifier};
 
@@ -53,6 +53,7 @@ pub struct ExecutionResourceContract {
     pub minimum_memory_bytes: u64,
     pub working_set_memory_bytes: u64,
     pub memory_ceiling_bytes: u64,
+    pub memory_completion: MemoryCompletion,
     pub max_parallel_tasks: u16,
     pub external_worker_slots: u16,
 }
@@ -218,9 +219,14 @@ impl<P> PhysicalPlanPortfolio<P> {
                 let left = &variants[*left_index];
                 let right = &variants[*right_index];
                 left.cost
-                    .score
-                    .risk_adjusted
-                    .total_cmp(&right.cost.score.risk_adjusted)
+                    .memory_completion
+                    .cmp(&right.cost.memory_completion)
+                    .then_with(|| {
+                        left.cost
+                            .score
+                            .risk_adjusted
+                            .total_cmp(&right.cost.score.risk_adjusted)
+                    })
                     .then_with(|| {
                         left.cost
                             .critical_path
@@ -258,6 +264,7 @@ impl<P> PhysicalPlanPortfolio<P> {
                 minimum_memory_bytes: selected.cost.minimum_memory_bytes,
                 working_set_memory_bytes: selected.cost.preferred_memory_bytes(),
                 memory_ceiling_bytes: selected_class.hard_memory_bytes,
+                memory_completion: selected.cost.memory_completion,
                 max_parallel_tasks: selected_class.max_parallel_tasks,
                 external_worker_slots: selected.cost.external_worker_slots_upper,
             },
@@ -478,6 +485,35 @@ mod tests {
         assert_eq!(admitted.resources.minimum_memory_bytes, 10);
         assert_eq!(admitted.resources.working_set_memory_bytes, 10);
         assert_eq!(admitted.resources.memory_ceiling_bytes, 20);
+    }
+
+    #[test]
+    fn admission_prefers_a_completion_proof_over_a_cheaper_runtime_cap() {
+        let class = ResourceGrantClass {
+            id: ResourceGrantClassId(1),
+            hard_memory_bytes: 100,
+            spill_policy: SpillPolicy::Forbidden,
+            max_parallel_tasks: 1,
+        };
+        let mut capped = cost(1.0, 100);
+        capped.minimum_memory_bytes = 10;
+        capped.memory_completion = MemoryCompletion::RuntimeCapped;
+        let portfolio = PhysicalPlanPortfolio::build(
+            [class],
+            [
+                (class.id, "capped", Fingerprint(1), capped),
+                (class.id, "guaranteed", Fingerprint(2), cost(2.0, 100)),
+            ],
+        )
+        .unwrap();
+
+        let admitted = portfolio.admit(100, 1, 0, |_| true).unwrap();
+
+        assert_eq!(admitted.plan, "guaranteed");
+        assert_eq!(
+            admitted.resources.memory_completion,
+            MemoryCompletion::Guaranteed
+        );
     }
 
     #[test]

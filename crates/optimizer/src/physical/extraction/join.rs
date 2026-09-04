@@ -19,6 +19,7 @@ impl PhysicalPlanExtractor {
                 | crate::physical::PhysicalImplementationFlavor::HashJoinRuntimeFilter => {
                     if !comparison.duplicate_eliminated_columns.is_empty()
                         || comparison.delim_flipped
+                        || !comparison.build_side_constraint.allows_right()
                         || !supports_typed_hash_join_type(comparison.join_type)
                         || !comparison
                             .conditions
@@ -40,6 +41,7 @@ impl PhysicalPlanExtractor {
                 | crate::physical::PhysicalImplementationFlavor::HashJoinBuildLeftRuntimeFilter => {
                     if !comparison.duplicate_eliminated_columns.is_empty()
                         || comparison.delim_flipped
+                        || !comparison.build_side_constraint.allows_left()
                         || comparison.anti_join_mode != AntiJoinMode::Regular
                         || !matches!(
                             comparison.join_type,
@@ -1576,7 +1578,14 @@ fn resolve_base_get_output(
             resolve_base_get_output(&order.child, child_index)
         }
         LogicalOperator::Limit(limit) => resolve_base_get_output(&limit.child, output_index),
-        LogicalOperator::TopN(topn) => resolve_base_get_output(&topn.child, output_index),
+        LogicalOperator::TopN(topn) => {
+            let child_index = topn
+                .projection_map
+                .to_indices(topn.child.types().len())
+                .get(output_index)
+                .copied()?;
+            resolve_base_get_output(&topn.child, child_index)
+        }
         LogicalOperator::Join(Join::Comparison(join))
             if join.join_type == JoinType::Inner
                 && join.duplicate_eliminated_columns.is_empty()

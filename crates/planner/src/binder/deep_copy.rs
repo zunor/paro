@@ -401,6 +401,7 @@ impl LogicalPlanDeepCopy {
                     limit: t.limit,
                     offset: t.offset,
                     hnsw_options: t.hnsw_options,
+                    projection_map: t.projection_map.clone(),
                     child: Box::new(child),
                 })
             }
@@ -516,6 +517,7 @@ impl LogicalPlanDeepCopy {
                         mark_semantics: cj.mark_semantics,
                         duplicate_eliminated_columns: cj.duplicate_eliminated_columns.clone(),
                         delim_flipped: cj.delim_flipped,
+                        build_side_constraint: cj.build_side_constraint,
                         left_projection_map: cj.left_projection_map.clone(),
                         right_projection_map: cj.right_projection_map.clone(),
                     })
@@ -693,7 +695,7 @@ impl LogicalPlanDeepCopy {
                     projection_table_index,
                     absorbed_predicates: s.absorbed_predicates.clone(),
                     residual_predicates: s.residual_predicates.clone(),
-                    score_projection_index: s.score_projection_index,
+                    score_output_index: s.score_output_index,
                     score_expression: s.score_expression.clone(),
                     order_ascending: s.order_ascending,
                     limit: s.limit,

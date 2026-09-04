@@ -65,6 +65,7 @@ pub(super) fn stage_transformed_expression(
 
     struct StagingOptions<'a> {
         column_stats: &'a Arc<HashMap<ColumnBinding, Arc<ColumnStatistics>>>,
+        search_context: &'a crate::context::OptimizationContext,
         rule: RuleId,
     }
 
@@ -110,6 +111,14 @@ pub(super) fn stage_transformed_expression(
             &skeleton,
             session.state.bind_context.shared().as_ref(),
         ));
+        // Recursive staging interns every node's scalar expressions into the
+        // Query IR.  Keep a second operator shell for the binding-semantic
+        // tree returned to the parent: provider matching and later rule
+        // staging must never observe a child's arena-local References.
+        let semantic_skeleton = duplicate_plan_preserving_indices(
+            &skeleton,
+            session.state.bind_context.shared().as_ref(),
+        );
         let mut child_states = Vec::with_capacity(detached.len());
         let mut children = Vec::with_capacity(detached.len());
         let descendant_context = target_child_context.unwrap_or(node_context);
@@ -131,7 +140,7 @@ pub(super) fn stage_transformed_expression(
             child_states.push(child_state);
         }
         let mut children = children.into_iter();
-        let mut plan = skeleton.try_map_children(|_| {
+        let semantic_plan = semantic_skeleton.try_map_children(|_| {
             children
                 .next()
                 .ok_or_else(|| paro_error::internal("transformed planner tree lost a staged child"))
@@ -147,9 +156,9 @@ pub(super) fn stage_transformed_expression(
         let options = &session.options;
         let pending_runtime_filter_facets = &mut session.pending_runtime_filter_facets;
 
-        let output_bindings = plan.get_column_bindings();
-        let output_types = plan.types();
-        let output_names = plan.output_names();
+        let output_bindings = semantic_plan.get_column_bindings();
+        let output_types = semantic_plan.types();
+        let output_names = semantic_plan.output_names();
         if output_bindings.len() != output_types.len() {
             return Err(paro_error::internal(
                 "transformed plan output binding/type arity mismatch",
@@ -159,7 +168,7 @@ pub(super) fn stage_transformed_expression(
         for (index, (binding, logical_type)) in output_bindings
             .iter()
             .copied()
-            .zip(output_types.into_iter())
+            .zip(output_types.iter().cloned())
             .enumerate()
         {
             let type_domain = logical_type_fingerprint(&logical_type);
@@ -200,8 +209,31 @@ pub(super) fn stage_transformed_expression(
             })
             .collect::<Vec<_>>();
         let logical_properties =
-            derive_logical_properties(&plan.operator, &child_maximum_cardinalities);
+            derive_logical_properties(&semantic_plan.operator, &child_maximum_cardinalities);
         let output_rows_hard_upper = logical_properties.maximum_cardinality;
+        let search_candidate = if matches!(
+            &semantic_plan.operator,
+            LogicalOperator::TopN(_) | LogicalOperator::Filter(_)
+        ) {
+            crate::search::optimizer::SearchOptimizer::new().physical_candidate_for_root(
+                duplicate_plan_preserving_indices(
+                    &semantic_plan,
+                    state.bind_context.shared().as_ref(),
+                ),
+                options.search_context,
+            )?
+        } else {
+            None
+        };
+        if search_candidate.is_some() {
+            debug!(
+                target: targets::OPTIMIZER,
+                rule = options.rule.0,
+                operator = ?semantic_plan.operator.op_type(),
+                "attached search provider to transformed logical expression"
+            );
+        }
+        let mut plan = skeleton;
         // Preserve binding semantics before Query IR interning replaces
         // operator expressions with scalar-arena references.
         let scalar_roots = intern_operator_scalars(
@@ -227,8 +259,12 @@ pub(super) fn stage_transformed_expression(
                 .into_boxed_slice(),
         };
         let logical_identity = key.stable_fingerprint();
-        let mut cardinality =
-            derive_group_cardinality(&plan.operator, &key.children, &plan.stats, logical_identity);
+        let mut cardinality = derive_group_cardinality(
+            &semantic_plan.operator,
+            &key.children,
+            &semantic_plan.stats,
+            logical_identity,
+        );
         if let Some(target) = target {
             cardinality = if let Some(kind) = refined_cardinality_kind {
                 cardinality.with_kind(kind)
@@ -278,7 +314,7 @@ pub(super) fn stage_transformed_expression(
                 existing.cardinality =
                     std::mem::take(&mut existing.cardinality).canonical_with(cardinality.clone());
                 return Ok((
-                    plan,
+                    semantic_plan,
                     NodeState {
                         group,
                         columns: output_columns.into_boxed_slice(),
@@ -335,7 +371,7 @@ pub(super) fn stage_transformed_expression(
                     // back every recursively staged child and sidecar write;
                     // this expected miss is not an optimizer corruption.
                     return Ok((
-                        plan,
+                        semantic_plan,
                         NodeState {
                             group,
                             columns: output_columns.into_boxed_slice(),
@@ -345,7 +381,7 @@ pub(super) fn stage_transformed_expression(
                     ));
                 }
                 return Ok((
-                    plan,
+                    semantic_plan,
                     NodeState {
                         group,
                         columns: output_columns.into_boxed_slice(),
@@ -365,18 +401,56 @@ pub(super) fn stage_transformed_expression(
             semantic_template,
             column_stats: options.column_stats.clone(),
         });
-        let implementations = planner_implementation_set(&plan, state.rowset_scan_pushdown);
+        let search = search_candidate
+            .map(|search_plan| {
+                stage_search_implementation(
+                    SearchStagingRequest {
+                        plan: search_plan,
+                        expected_output_bindings: &output_bindings,
+                        expected_output_types: &output_types,
+                        output_columns: &output_columns,
+                        materialized_columns: &unique_columns,
+                        binding_ids: &state.binding_ids,
+                        operator_fingerprint,
+                        output_rows_hard_upper,
+                        column_stats: options.column_stats.as_ref(),
+                        scan_access_cost: state.scan_access_cost,
+                    },
+                    &mut state.payloads,
+                )
+            })
+            .transpose()?;
+        // Physical admission and costing need the recursively reattached
+        // semantic tree. `plan` is deliberately only an interned operator
+        // shell whose children are DummyScan placeholders; consulting it for
+        // lineage, widths, or child statistics would make every transformed
+        // join appear to have no rowset consumer.
+        let implementations =
+            planner_implementation_set(&semantic_plan, state.rowset_scan_pushdown);
+        if let LogicalOperator::Join(Join::Comparison(join)) = &semantic_plan.operator {
+            debug!(
+                target: targets::OPTIMIZER,
+                rule = options.rule.0,
+                baseline = ?implementations.baseline,
+                join_type = ?join.join_type,
+                runtime_filter_candidate = implementations.hash_join_runtime_filter,
+                build_left_runtime_filter_candidate = implementations.hash_join_build_left_runtime_filter,
+                probe_operator = ?join.left.operator.op_type(),
+                conditions = ?join.conditions,
+                "staged transformed physical join implementation set"
+            );
+        }
         let runtime_filter_candidate = implementations.hash_join_runtime_filter
             || implementations.hash_join_build_left_runtime_filter;
         let runtime_filter_scope =
             runtime_filter_candidate.then(|| std::iter::once(group).collect::<BTreeSet<_>>());
         let metadata = PlannerOperatorMetadata {
             origin_rule: Some(options.rule),
-            operator_type: plan.operator.op_type(),
+            operator_type: semantic_plan.operator.op_type(),
             operator_fingerprint,
             provided: ProvidedProperties {
                 ordering: derive_provided_ordering(
-                    &plan.operator,
+                    &semantic_plan.operator,
                     &output_columns,
                     child_states.first().map(|child| child.columns.as_ref()),
                     &state.binding_ids,
@@ -389,20 +463,20 @@ pub(super) fn stage_transformed_expression(
                 mutation_safety: ProvidedMutationSafety::NotApplicable,
                 representation: ProvidedRepresentation::Flat,
                 replayability: ProvidedReplayability::OnePass,
-                result_guarantee: provided_result_guarantee(&plan.operator),
+                result_guarantee: provided_result_guarantee(&semantic_plan.operator),
             },
             local_cost: planner_operator_cost(
-                &plan,
+                &semantic_plan,
                 child_states.len(),
                 output_rows_hard_upper,
                 &child_maximum_cardinalities,
                 state.scan_access_cost,
             )?,
             implementations,
-            grant_dependency: planner_grant_dependency(&plan.operator),
-            spillable: planner_operator_spillable(&plan.operator),
+            grant_dependency: planner_grant_dependency(&semantic_plan.operator),
+            spillable: planner_operator_spillable(&semantic_plan.operator),
             cost_facts: planner_cost_facts(
-                &plan,
+                &semantic_plan,
                 options.column_stats.as_ref(),
                 state.scan_access_cost,
             )?,
@@ -411,13 +485,15 @@ pub(super) fn stage_transformed_expression(
                 memo,
                 child_states.iter().map(|child| child.columns.as_ref()),
             )?,
-            child_row_goals: child_row_goals(&plan.operator, child_states.len()),
-            search: None,
+            child_row_goals: child_row_goals(&semantic_plan.operator, child_states.len()),
+            search,
             input_context: node_context,
             child_context: target_child_context.unwrap_or(node_context),
             required_region_facet: target.and(required_region_facet),
             runtime_filter_region_facet: None,
-            structural_retained_children: planner_structural_retained_children(&plan.operator),
+            structural_retained_children: planner_structural_retained_children(
+                &semantic_plan.operator,
+            ),
             baseline_payload,
         };
         if state.metadata.insert(payload, metadata).is_some() {
@@ -502,7 +578,7 @@ pub(super) fn stage_transformed_expression(
             None
         };
         Ok((
-            plan,
+            semantic_plan,
             NodeState {
                 group,
                 columns: output_columns.into_boxed_slice(),
@@ -512,12 +588,23 @@ pub(super) fn stage_transformed_expression(
         ))
     }
 
+    let session_context = state
+        .session
+        .clone()
+        .ok_or_else(|| paro_error::internal("planner rule has no statement context"))?;
+    let mut search_context =
+        crate::context::OptimizationContext::new(session_context, state.bind_context.clone());
+    search_context.column_stats = column_stats.as_ref().clone();
+    search_context.cost_model = state.cost_model.clone();
+    search_context.verify_enabled = state.verify_enabled;
+
     let (root, staged, pending_runtime_filter_facets) = {
         let mut session = StagingSession {
             memo,
             state,
             options: StagingOptions {
                 column_stats: &column_stats,
+                search_context: &search_context,
                 rule,
             },
             pending_runtime_filter_facets: Vec::new(),
@@ -597,10 +684,58 @@ fn disable_dropped_runtime_filter_facets(
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
+
+    use paro_catalog::entry::{CatalogObjectId, ColumnDefinition, TableCatalogEntry};
     use paro_common::types::LogicalType;
-    use paro_planner::operator::ExpressionGet;
+    use paro_context::TestStatementContextBuilder;
+    use paro_planner::expression::{Expression, ReferenceExpression};
+    use paro_planner::operator::join::{Join, JoinCondition, JoinType};
+    use paro_planner::operator::{ComparisonJoin, ExpressionGet, Get};
+    use paro_planner::plan::CardinalityEstimate;
+    use paro_storage::table::table_factory::TableFactory;
 
     use super::*;
+
+    fn test_base_get(table_index: usize, object_id: u64, name: &str, rows: u64) -> LogicalPlan {
+        let storage = Arc::new(
+            TableFactory::default()
+                .create_table(&[LogicalType::Integer])
+                .expect("table storage"),
+        );
+        let table = Arc::new(TableCatalogEntry::new(
+            "paro".to_string(),
+            "public".to_string(),
+            name.to_string(),
+            vec![ColumnDefinition::new(
+                "id".to_string(),
+                LogicalType::Integer,
+            )],
+            storage,
+            CatalogObjectId::from_raw(object_id),
+            0,
+        ));
+        let mut plan = LogicalPlan::synthetic(LogicalOperator::Get(Get::new(
+            table_index,
+            vec!["id".to_string()],
+            vec![LogicalType::Integer],
+            table,
+        )));
+        plan.stats.estimated_cardinality = Some(CardinalityEstimate::exact(rows));
+        plan
+    }
+
+    fn equality_join(left: LogicalPlan, right: LogicalPlan, rows: u64) -> LogicalPlan {
+        let condition = JoinCondition::equality(
+            Expression::Reference(ReferenceExpression::new(0, LogicalType::Integer)),
+            Expression::Reference(ReferenceExpression::new(0, LogicalType::Integer)),
+        );
+        let mut plan = LogicalPlan::synthetic(LogicalOperator::Join(Join::Comparison(
+            ComparisonJoin::new(JoinType::Inner, left, right, vec![condition]),
+        )));
+        plan.stats.estimated_cardinality = Some(CardinalityEstimate::exact(rows));
+        plan
+    }
 
     #[test]
     fn root_key_collision_in_another_context_declines_and_rolls_back() {
@@ -627,6 +762,7 @@ mod tests {
         };
         let groups_before = input.memo.group_count();
         let state = input.planner_state.clone();
+        state.write().unwrap().session = Some(TestStatementContextBuilder::minimal().build());
         let metadata_before = state.read().unwrap().metadata.len();
         let mut transaction = TransformContext::new(&mut input.memo, root);
 
@@ -669,5 +805,82 @@ mod tests {
         transaction.rollback().unwrap();
         assert_eq!(input.memo.group_count(), groups_before);
         assert_eq!(state.read().unwrap().metadata.len(), metadata_before);
+    }
+
+    #[test]
+    fn transformed_join_uses_reattached_children_for_physical_facts() {
+        let baseline = equality_join(
+            equality_join(
+                test_base_get(0, 30_001, "fact", 20_000),
+                test_base_get(1, 30_002, "first_dimension", 20),
+                20,
+            ),
+            test_base_get(2, 30_003, "second_dimension", 30),
+            20,
+        );
+        let transformed = equality_join(
+            equality_join(
+                test_base_get(0, 30_001, "fact", 20_000),
+                test_base_get(2, 30_003, "second_dimension", 30),
+                30,
+            ),
+            test_base_get(1, 30_002, "first_dimension", 20),
+            20,
+        );
+        let mut input =
+            MemoBuilder::build(baseline, BindContext::new(), SearchBudget::default()).unwrap();
+        let root = input.root;
+        let state = input.planner_state.clone();
+        state.write().unwrap().session = Some(TestStatementContextBuilder::minimal().build());
+        let mut transaction = TransformContext::new(&mut input.memo, root);
+
+        let staged = transaction
+            .with_sidecar_transaction(
+                state.clone(),
+                PlannerTransformState::savepoint,
+                PlannerTransformState::rollback_to,
+                |memo, state| {
+                    stage_transformed_expression(
+                        StagingRequest {
+                            plan: transformed,
+                            column_stats: Arc::new(HashMap::new()),
+                            target: StagingTarget {
+                                group: root,
+                                rule: JOIN_REGION_ENUMERATION_RULE,
+                                input_context: OptimizationContextId(0),
+                                child_context: OptimizationContextId(0),
+                                refined_cardinality_kind: Some(
+                                    CardinalityRecipeKind::ConstraintRefined,
+                                ),
+                            },
+                            regions: StagingRegionRequirements {
+                                preserved_facet: None,
+                                extended_required_facets: Box::new([]),
+                                inherited_runtime_filter_facet: None,
+                            },
+                        },
+                        memo,
+                        state,
+                    )
+                },
+            )
+            .unwrap()
+            .expect("reordered join should stage");
+
+        let planner_state = state.read().unwrap();
+        let metadata = planner_state
+            .metadata
+            .get(&staged.payload)
+            .expect("staged root metadata");
+        assert!(metadata.implementations.hash_join_runtime_filter);
+        assert_eq!(
+            metadata.cost_facts.runtime_filter_probe_work_source,
+            Some(WorkSourceId(0))
+        );
+        assert!(metadata
+            .cost_facts
+            .child_row_widths
+            .iter()
+            .all(|width| *width > 8));
     }
 }

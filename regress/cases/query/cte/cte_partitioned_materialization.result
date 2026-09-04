@@ -41,17 +41,17 @@ MATERIALIZED_CTE  (rows=1)
               ->  PROJECTION  (rows=1)
                 Output: v
                 ->  CTE_SCAN  (rows=1)
-                  CTE Index: 81
+                  CTE Index: 84
                   Table Index: 33
               ->  PROJECTION  (rows=1)
                 Output: v
                 ->  CTE_SCAN  (rows=1)
-                  CTE Index: 82
+                  CTE Index: 85
                   Table Index: 41
             ->  PROJECTION  (rows=1)
               Output: v
               ->  CTE_SCAN  (rows=1)
-                CTE Index: 83
+                CTE Index: 86
                 Table Index: 49
 
 WITH segmented(v, st) AS (

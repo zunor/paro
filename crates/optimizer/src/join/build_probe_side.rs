@@ -129,6 +129,7 @@ impl BuildProbeSideOptimizer {
         }
 
         std::mem::swap(&mut join.left, &mut join.right);
+        join.build_side_constraint = join.build_side_constraint.flip();
         join.join_type = inverse_type;
         for cond in &mut join.conditions {
             std::mem::swap(&mut cond.left, &mut cond.right);

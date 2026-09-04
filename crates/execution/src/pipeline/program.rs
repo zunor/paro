@@ -1060,6 +1060,7 @@ mod tests {
     fn topn_spec() -> crate::physical::specs::TopNSpec {
         crate::physical::specs::TopNSpec {
             orders: vec![order_by_first_column()].into_boxed_slice(),
+            projection_map: Box::new([0]),
             limit: 2,
             offset: 0,
             hnsw_options: Default::default(),

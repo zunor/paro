@@ -288,19 +288,18 @@ impl TransformationRule for PlannerTransformationRule {
         }
 
         let mut prepared = Vec::with_capacity(plans.len());
-        for mut plan in plans {
-            if matches!(
-                self.transformation,
-                PlannerTransformation::JoinRegionEnumeration
-            ) {
-                let state = self
-                    .planner_state
-                    .read()
-                    .expect("planner transform state poisoned");
-                plan =
-                    semantic_plan::freeze_extraction_layout(plan, &source_output_columns, &state)?;
-            }
+        for plan in plans {
             let (plan, column_stats) = settle_transformed_expression(plan, &environment)?;
+            // The target Memo group owns the output contract. Settlement may
+            // legitimately widen child carriers for predicates and ordering,
+            // but the transformed root must be frozen back to the group's
+            // exact binding layout before equivalence validation and staging.
+            let state = self
+                .planner_state
+                .read()
+                .expect("planner transform state poisoned");
+            let plan = semantic_plan::freeze_output_layout(plan, &source_output_columns, &state)?;
+            drop(state);
             let mut preserved_region_facet = None;
             let mut extended_required_region_facets = enclosing_required_region_facets.clone();
             let output_input_context = source_input_context;

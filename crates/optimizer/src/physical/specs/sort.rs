@@ -18,6 +18,8 @@ pub struct SortSpec {
 #[derive(Debug, Clone)]
 pub struct TopNSpec {
     pub orders: Box<[OrderByNode]>,
+    /// Child columns retained as TopN payload and emitted in this order.
+    pub projection_map: Box<[usize]>,
     pub limit: usize,
     pub offset: usize,
     pub hnsw_options: paro_storage::index::hnsw::HnswQueryOptions,

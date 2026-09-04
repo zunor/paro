@@ -996,6 +996,7 @@ mod tests {
                         working_set_memory_bytes: 0,
                         memory_ceiling_bytes: u64::try_from(ctx.memory.capacity_bytes())
                             .unwrap_or(u64::MAX),
+                        memory_completion: paro_optimizer::physical::MemoryCompletion::Guaranteed,
                         max_parallel_tasks: 1,
                         external_worker_slots: 1,
                     },

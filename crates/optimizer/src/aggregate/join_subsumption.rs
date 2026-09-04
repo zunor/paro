@@ -159,13 +159,13 @@ impl AggregateJoinSubsumption {
                 JoinType::Semi => (
                     join.left.as_mut(),
                     join.right.as_mut(),
-                    &join.left_projection_map,
+                    &mut join.left_projection_map,
                     &mut join.right_projection_map,
                 ),
                 JoinType::RightSemi => (
                     join.right.as_mut(),
                     join.left.as_mut(),
-                    &join.right_projection_map,
+                    &mut join.right_projection_map,
                     &mut join.left_projection_map,
                 ),
                 _ => return None,
@@ -174,7 +174,6 @@ impl AggregateJoinSubsumption {
             || join.mark_index.is_some()
             || !join.duplicate_eliminated_columns.is_empty()
             || join.delim_flipped
-            || !preserved_projection.is_all()
             || !reduction_projection.is_none()
         {
             return None;
@@ -197,6 +196,10 @@ impl AggregateJoinSubsumption {
             };
 
         let detail = Self::inspect_detail_edge(preserved, preserved_key, outer_sum)?;
+        let retained_bindings = Self::projected_bindings(preserved, preserved_projection)?
+            .into_iter()
+            .filter(|binding| binding.table_index != detail.table_index)
+            .collect::<Vec<_>>();
         let exposure = Self::inspect_reduction(reduction, reduction_key, &detail)?;
         let replacement = Self::replacement_sum(&exposure, outer_sum)?;
 
@@ -204,8 +207,13 @@ impl AggregateJoinSubsumption {
         if !Self::remove_detail_edge(preserved, preserved_key, &detail, outer_sum) {
             return None;
         }
+        *preserved_projection = Self::projection_for_bindings(preserved, &retained_bindings)?;
+        let partial_index = reduction
+            .get_column_bindings()
+            .iter()
+            .position(|binding| *binding == exposure.output_binding)?;
         join.join_type = JoinType::Inner;
-        *reduction_projection = ProjectionMap::all();
+        *reduction_projection = ProjectionMap::new(vec![partial_index]);
         Some(replacement)
     }
 
@@ -392,27 +400,23 @@ impl AggregateJoinSubsumption {
         detail: &DetailScan,
         outer_sum: &OuterSum,
     ) -> Option<Expression> {
-        let (preserved, reduction, preserved_projection, reduction_projection) =
-            match join.join_type {
-                JoinType::Semi => (
-                    join.left.as_ref(),
-                    join.right.as_mut(),
-                    &join.left_projection_map,
-                    &mut join.right_projection_map,
-                ),
-                JoinType::RightSemi => (
-                    join.right.as_ref(),
-                    join.left.as_mut(),
-                    &join.right_projection_map,
-                    &mut join.left_projection_map,
-                ),
-                _ => return None,
-            };
+        let (preserved, reduction, reduction_projection) = match join.join_type {
+            JoinType::Semi => (
+                join.left.as_ref(),
+                join.right.as_mut(),
+                &mut join.right_projection_map,
+            ),
+            JoinType::RightSemi => (
+                join.right.as_ref(),
+                join.left.as_mut(),
+                &mut join.left_projection_map,
+            ),
+            _ => return None,
+        };
         if join.conditions.len() != 1
             || join.mark_index.is_some()
             || !join.duplicate_eliminated_columns.is_empty()
             || join.delim_flipped
-            || !preserved_projection.is_all()
             || !reduction_projection.is_none()
             || !preserved.get_column_bindings().contains(&preserved_key)
         {
@@ -435,8 +439,12 @@ impl AggregateJoinSubsumption {
         let exposure = Self::inspect_reduction(&*reduction, reduction_key, detail)?;
         let replacement = Self::replacement_sum(&exposure, outer_sum)?;
         Self::apply_exposure(reduction, &exposure.mutation)?;
+        let partial_index = reduction
+            .get_column_bindings()
+            .iter()
+            .position(|binding| *binding == exposure.output_binding)?;
         join.join_type = JoinType::Inner;
-        *reduction_projection = ProjectionMap::all();
+        *reduction_projection = ProjectionMap::new(vec![partial_index]);
 
         Some(replacement)
     }
@@ -616,6 +624,36 @@ impl AggregateJoinSubsumption {
         .then_some(get)
     }
 
+    fn projected_bindings(
+        child: &LogicalPlan,
+        projection: &ProjectionMap,
+    ) -> Option<Vec<ColumnBinding>> {
+        let child_bindings = child.get_column_bindings();
+        match projection.as_columns() {
+            None => Some(child_bindings),
+            Some(indices) => indices
+                .iter()
+                .map(|index| child_bindings.get(*index).copied())
+                .collect(),
+        }
+    }
+
+    fn projection_for_bindings(
+        child: &LogicalPlan,
+        bindings: &[ColumnBinding],
+    ) -> Option<ProjectionMap> {
+        let child_bindings = child.get_column_bindings();
+        bindings
+            .iter()
+            .map(|binding| {
+                child_bindings
+                    .iter()
+                    .position(|candidate| candidate == binding)
+            })
+            .collect::<Option<Vec<_>>>()
+            .map(ProjectionMap::new)
+    }
+
     fn detail_join_keys(
         condition: &paro_planner::operator::JoinCondition,
         detail_table_index: usize,
@@ -686,7 +724,7 @@ mod tests {
     use paro_planner::expression::{AggregateExpression, ColumnRefExpression, Expression};
     use paro_planner::operator::{
         Aggregate, ColumnBinding, ExpressionGet, Get, Join, JoinCondition, JoinType,
-        LogicalOperator, PostAggregateReduction, Projection,
+        LogicalOperator, PostAggregateReduction, Projection, ProjectionMap,
     };
     use paro_planner::plan::LogicalPlan;
     use paro_storage::table::table_factory::TableFactory;
@@ -841,6 +879,67 @@ mod tests {
         plan
     }
 
+    fn reduction_wraps_projected_detail_join(table: Arc<TableCatalogEntry>) -> LogicalPlan {
+        let inner_sum = sum(column(INNER_DETAIL, 1, decimal(15)));
+        let inner_aggregate = LogicalPlan::synthetic(LogicalOperator::Aggregate(Aggregate::new(
+            INNER_GROUP,
+            INNER_AGGREGATE,
+            42,
+            get(INNER_DETAIL, table.clone()),
+            vec![column(INNER_DETAIL, 0, LogicalType::BigInt)],
+            vec![],
+            vec![inner_sum],
+            vec![],
+        )));
+        let reduction = LogicalPlan::synthetic(LogicalOperator::Projection(Projection::new(
+            REDUCTION_PROJECTION,
+            inner_aggregate,
+            vec![column(INNER_GROUP, 0, LogicalType::BigInt)],
+        )));
+        let mut detail_join = match Join::comparison(
+            JoinType::Inner,
+            preserved(),
+            get(OUTER_DETAIL, table),
+            vec![JoinCondition::equality(
+                column(PRESERVED, 0, LogicalType::BigInt),
+                column(OUTER_DETAIL, 0, LogicalType::BigInt),
+            )],
+        ) {
+            Join::Comparison(join) => join,
+            _ => unreachable!(),
+        };
+        detail_join.left_projection_map = ProjectionMap::all();
+        detail_join.right_projection_map = ProjectionMap::all();
+        let detail_join =
+            LogicalPlan::synthetic(LogicalOperator::Join(Join::Comparison(detail_join)));
+        let mut reduction_join = match Join::comparison(
+            JoinType::Semi,
+            detail_join,
+            reduction,
+            vec![JoinCondition::equality(
+                column(PRESERVED, 0, LogicalType::BigInt),
+                column(REDUCTION_PROJECTION, 0, LogicalType::BigInt),
+            )],
+        ) {
+            Join::Comparison(join) => join,
+            _ => unreachable!(),
+        };
+        // The exact occurrence contract exposes only the preserved key and
+        // detail value consumed by the outer aggregate.
+        reduction_join.left_projection_map = ProjectionMap::new(vec![0, 2]);
+
+        LogicalPlan::synthetic(LogicalOperator::Aggregate(Aggregate::new(
+            OUTER_GROUP,
+            OUTER_AGGREGATE,
+            62,
+            LogicalPlan::synthetic(LogicalOperator::Join(Join::Comparison(reduction_join))),
+            vec![column(PRESERVED, 0, LogicalType::BigInt)],
+            vec![],
+            vec![sum(column(OUTER_DETAIL, 1, decimal(15)))],
+            vec![],
+        )))
+    }
+
     #[test]
     fn reuses_filtered_partial_sum_without_catalog_uniqueness() {
         let table = detail_table(70_001);
@@ -867,6 +966,36 @@ mod tests {
             panic!("reduction projection");
         };
         assert_eq!(projection.expressions.len(), 2);
+    }
+
+    #[test]
+    fn remaps_exact_projection_after_removing_detail_edge() {
+        let optimized = optimize_plan(reduction_wraps_projected_detail_join(detail_table(70_006)));
+
+        let LogicalOperator::Aggregate(outer) = &optimized.operator else {
+            panic!("outer aggregate");
+        };
+        let Expression::Aggregate(sum) = &outer.aggregates[0] else {
+            panic!("outer sum");
+        };
+        let [Expression::ColumnRef(partial)] = sum.children.as_slice() else {
+            panic!("partial sum reference");
+        };
+        assert_eq!(partial.binding, ColumnBinding::new(REDUCTION_PROJECTION, 1));
+
+        let LogicalOperator::Join(Join::Comparison(join)) = &outer.child.operator else {
+            panic!("rewritten reduction join");
+        };
+        assert_eq!(join.join_type, JoinType::Inner);
+        assert_eq!(join.left_projection_map, ProjectionMap::new(vec![0]));
+        assert_eq!(join.right_projection_map, ProjectionMap::new(vec![1]));
+        assert_eq!(
+            outer.child.get_column_bindings(),
+            vec![
+                ColumnBinding::new(PRESERVED, 0),
+                ColumnBinding::new(REDUCTION_PROJECTION, 1),
+            ]
+        );
     }
 
     #[test]

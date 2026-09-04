@@ -114,11 +114,18 @@ impl ColumnLifetimeAnalyzer {
                 LogicalOperator::Limit(limit)
             }
             LogicalOperator::TopN(mut topn) => {
+                let output_references = self.column_references.clone();
                 for order_expr in &topn.orders {
                     self.visit_expression(&order_expr.expression);
                 }
                 let child = *topn.child;
                 topn.child = Box::new(self.optimize_plan(child)?);
+                let child_bindings = topn.child.get_column_bindings();
+                topn.projection_map = if self.has_unknown_references(&child_bindings) {
+                    ProjectionMap::all()
+                } else {
+                    self.generate_exact_projection_map(&child_bindings, &output_references)
+                };
                 LogicalOperator::TopN(topn)
             }
             LogicalOperator::Window(mut window) => {

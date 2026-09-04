@@ -83,15 +83,8 @@ PROJECTION  (rows=2)
       ->  AGGREGATE  (rows=5)
         Group Key: f.key_a
         Aggregates: count_star(*), sum(f.amount), sum(f.amount) FILTER (WHERE f.keep)
-        ->  HASH_JOIN  (rows=9600)
-          Join Type: INNER
-          Runtime Filter: wait_complete artifact=cefb492671ef865ad94bb5120e08171c
-          Build Index: integer_build_time
-          Join Condition: f.key_a = d.key_a
-          ->  ROWSET_SCAN on public.agg_defer_fact f  (rows=12000)
-            Columns: key_a, amount, keep
-          ->  ROWSET_SCAN on public.agg_defer_plan_dimension d  (rows=4)
-            Columns: key_a
+        ->  ROWSET_SCAN on public.agg_defer_fact f  (rows=12000)
+          Columns: key_a, amount, keep
       ->  ROWSET_SCAN on public.agg_defer_plan_dimension d  (rows=4)
         Columns: key_a, payload
 

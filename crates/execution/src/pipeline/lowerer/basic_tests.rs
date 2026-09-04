@@ -605,6 +605,9 @@ fn hash_join_merges_optional_branches_directly_into_topn_heap() {
             nulls_first: true,
         }]
         .into_boxed_slice(),
+        projection_map: (0..output.types.len())
+            .collect::<Vec<_>>()
+            .into_boxed_slice(),
         limit: 1,
         offset: 0,
         hnsw_options: Default::default(),

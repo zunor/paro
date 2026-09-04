@@ -721,7 +721,10 @@ fn derive_output_names(root: &LogicalOperator) -> Vec<String> {
                     tasks.push(Project(&order.projection_map));
                     tasks.push(Derive(&order.child.operator));
                 }
-                LogicalOperator::TopN(topn) => tasks.push(Derive(&topn.child.operator)),
+                LogicalOperator::TopN(topn) => {
+                    tasks.push(Project(&topn.projection_map));
+                    tasks.push(Derive(&topn.child.operator));
+                }
                 LogicalOperator::CreateTable(_)
                 | LogicalOperator::CreateRoutine(_)
                 | LogicalOperator::Alter(_)
@@ -1177,8 +1180,11 @@ fn derive_local_output_layout(
         LogicalOperator::ExternalTable(table) => {
             LogicalOutputLayout::for_table(table.table_index, table.returned_types.clone())
         }
-        LogicalOperator::Limit(_) | LogicalOperator::TopN(_) | LogicalOperator::Distinct(_) => {
+        LogicalOperator::Limit(_) | LogicalOperator::Distinct(_) => {
             required_output_layout(first, "pass-through child")
+        }
+        LogicalOperator::TopN(topn) => {
+            required_output_layout(first, "topn child").project(&topn.projection_map)
         }
         LogicalOperator::Order(order) => {
             required_output_layout(first, "order child").project(&order.projection_map)
@@ -2066,7 +2072,7 @@ mod tests {
             22,
             vec![],
             vec![],
-            0,
+            Some(0),
             Expression::Constant(ConstantExpression::new(
                 paro_common::runtime_value::Value::Float(0.5),
                 LogicalType::Float,

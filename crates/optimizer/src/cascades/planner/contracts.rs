@@ -4,6 +4,7 @@
 //! Logical/physical property contracts, grant sensitivity, and guarantees.
 
 use super::*;
+use crate::physical::MemoryCompletion;
 
 pub(super) fn optimization_goal_fingerprint(goal: OptimizationGoal) -> Fingerprint {
     let mut fingerprint = StableFingerprintBuilder::default();
@@ -22,8 +23,9 @@ pub(super) fn derive_provided_ordering(
     binding_ids: &BindingCatalog,
 ) -> ProvidedOrdering {
     if let LogicalOperator::SearchScan(search) = operator {
-        return output_columns
-            .get(search.score_projection_index)
+        return search
+            .score_output_index
+            .and_then(|index| output_columns.get(index))
             .copied()
             .map(|column| ProvidedOrdering::Ordered {
                 keys: vec![OrderingKey {
@@ -421,6 +423,19 @@ pub(super) fn cost_for_grant(
             cost.validate()?;
             return Ok(Some(cost));
         }
+        if cost.memory_completion == MemoryCompletion::RuntimeCapped {
+            // The query allocator is the resident-memory proof for this
+            // explicitly best-effort implementation.  This does not promote
+            // it to a forward-progress guarantee: portfolio selection keeps
+            // preferring any fully bounded or spillable alternative.
+            cost.non_revocable_memory_upper = class.hard_memory_bytes;
+            cost.peak_memory_upper = class.hard_memory_bytes;
+            cost.revocable_memory_target = cost
+                .revocable_memory_target
+                .min(class.hard_memory_bytes - cost.minimum_memory_bytes);
+            cost.validate()?;
+            return Ok(Some(cost));
+        }
         return Ok(None);
     }
     if force_spill && spillable {
@@ -451,6 +466,15 @@ pub(super) fn cost_for_grant(
         if spilled > 0 {
             add_spill_cost(&mut cost, spilled)?;
         }
+        cost.validate()?;
+        return Ok(Some(cost));
+    }
+    if cost.memory_completion == MemoryCompletion::RuntimeCapped {
+        cost.non_revocable_memory_upper = class.hard_memory_bytes;
+        cost.peak_memory_upper = class.hard_memory_bytes;
+        cost.revocable_memory_target = cost
+            .revocable_memory_target
+            .min(class.hard_memory_bytes - cost.minimum_memory_bytes);
         cost.validate()?;
         return Ok(Some(cost));
     }
@@ -551,7 +575,12 @@ pub(super) fn search_payload_fingerprint(
         LogicalOperator::SearchScan(search) => {
             fingerprint.write_u64(0);
             encode_search_request(&mut fingerprint, &search.request);
-            fingerprint.write_u64(search.score_projection_index as u64);
+            fingerprint.write_u64(
+                search
+                    .score_output_index
+                    .and_then(|index| u64::try_from(index).ok())
+                    .unwrap_or(u64::MAX),
+            );
             fingerprint.write_u64(search.order_ascending as u64);
             fingerprint.write_u64(search.limit as u64);
             write_decision(&mut fingerprint, &search.decision);
@@ -640,6 +669,34 @@ mod resource_contract_tests {
             .peak_memory_upper,
             spill.hard_memory_bytes
         );
+    }
+
+    #[test]
+    fn explicitly_runtime_capped_state_remains_an_admissible_fallback() {
+        let no_spill = class(SpillPolicy::Forbidden);
+        let mut estimate = cost(u64::MAX, 64 * 1024);
+        estimate.non_revocable_memory_upper = u64::MAX;
+        estimate.revocable_memory_target = 0;
+        estimate.memory_completion = MemoryCompletion::RuntimeCapped;
+
+        let admitted = cost_for_grant(
+            estimate,
+            GrantDependencyDescriptor::Sensitive,
+            false,
+            GrantGoalKey::Class(no_spill.id),
+            &BTreeMap::from([(no_spill.id, no_spill)]),
+            false,
+        )
+        .unwrap()
+        .expect("a runtime-capped semantic baseline must survive planning");
+
+        assert_eq!(admitted.minimum_memory_bytes, 64 * 1024);
+        assert_eq!(
+            admitted.non_revocable_memory_upper,
+            no_spill.hard_memory_bytes
+        );
+        assert_eq!(admitted.peak_memory_upper, no_spill.hard_memory_bytes);
+        assert_eq!(admitted.memory_completion, MemoryCompletion::RuntimeCapped);
     }
 
     #[test]

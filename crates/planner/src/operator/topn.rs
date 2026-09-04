@@ -4,6 +4,7 @@
 //! `ORDER BY` + `LIMIT` (+ optional `OFFSET`) fused for top-N evaluation without full sort.
 
 use crate::binder::ir::OrderByNode;
+use crate::operator::ProjectionMap;
 use crate::plan::LogicalPlan;
 use paro_storage::index::hnsw::HnswQueryOptions;
 
@@ -26,6 +27,8 @@ pub struct TopN {
     pub offset: usize,
     /// Typed dense-vector query options propagated from Limit.
     pub hnsw_options: HnswQueryOptions,
+    /// Exact output projection inherited from the fused Order operator.
+    pub projection_map: ProjectionMap,
     /// The child operator
     pub child: Box<LogicalPlan>,
 }
@@ -38,6 +41,7 @@ impl TopN {
             limit,
             offset,
             hnsw_options: HnswQueryOptions::default(),
+            projection_map: ProjectionMap::all(),
             child: Box::new(child),
         }
     }

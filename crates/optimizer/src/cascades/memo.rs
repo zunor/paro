@@ -445,69 +445,72 @@ fn compare_objective(
     // 0=risk/latency, 1=throughput, 2=memory, 3=robustness. Unknown extension
     // profiles use the conservative risk ordering until their registry owns
     // comparison during extraction.
-    match objective.0 {
-        1 => left.cost.resources_expected[0]
-            .total_cmp(&right.cost.resources_expected[0])
-            .then_with(|| {
-                left.cost
-                    .score
-                    .risk_adjusted
-                    .total_cmp(&right.cost.score.risk_adjusted)
-            })
-            .then_with(|| {
-                left.cost
-                    .peak_memory_upper
-                    .cmp(&right.cost.peak_memory_upper)
-            }),
-        2 => left
-            .cost
-            .peak_memory_upper
-            .cmp(&right.cost.peak_memory_upper)
-            .then_with(|| {
-                left.cost
-                    .score
-                    .risk_adjusted
-                    .total_cmp(&right.cost.score.risk_adjusted)
-            })
-            .then_with(|| {
-                left.cost
-                    .spill_bytes_expected
-                    .cmp(&right.cost.spill_bytes_expected)
-            }),
-        3 => left
-            .cost
-            .score
-            .range
-            .upper
-            .total_cmp(&right.cost.score.range.upper)
-            .then_with(|| {
-                left.cost
-                    .score
-                    .risk_adjusted
-                    .total_cmp(&right.cost.score.risk_adjusted)
-            })
-            .then_with(|| {
-                left.cost
-                    .peak_memory_upper
-                    .cmp(&right.cost.peak_memory_upper)
-            }),
-        _ => left
-            .cost
-            .score
-            .risk_adjusted
-            .total_cmp(&right.cost.score.risk_adjusted)
-            .then_with(|| {
-                left.cost
-                    .critical_path
-                    .expected
-                    .total_cmp(&right.cost.critical_path.expected)
-            })
-            .then_with(|| {
-                left.cost
-                    .peak_memory_upper
-                    .cmp(&right.cost.peak_memory_upper)
-            }),
-    }
+    left.cost
+        .memory_completion
+        .cmp(&right.cost.memory_completion)
+        .then_with(|| match objective.0 {
+            1 => left.cost.resources_expected[0]
+                .total_cmp(&right.cost.resources_expected[0])
+                .then_with(|| {
+                    left.cost
+                        .score
+                        .risk_adjusted
+                        .total_cmp(&right.cost.score.risk_adjusted)
+                })
+                .then_with(|| {
+                    left.cost
+                        .peak_memory_upper
+                        .cmp(&right.cost.peak_memory_upper)
+                }),
+            2 => left
+                .cost
+                .peak_memory_upper
+                .cmp(&right.cost.peak_memory_upper)
+                .then_with(|| {
+                    left.cost
+                        .score
+                        .risk_adjusted
+                        .total_cmp(&right.cost.score.risk_adjusted)
+                })
+                .then_with(|| {
+                    left.cost
+                        .spill_bytes_expected
+                        .cmp(&right.cost.spill_bytes_expected)
+                }),
+            3 => left
+                .cost
+                .score
+                .range
+                .upper
+                .total_cmp(&right.cost.score.range.upper)
+                .then_with(|| {
+                    left.cost
+                        .score
+                        .risk_adjusted
+                        .total_cmp(&right.cost.score.risk_adjusted)
+                })
+                .then_with(|| {
+                    left.cost
+                        .peak_memory_upper
+                        .cmp(&right.cost.peak_memory_upper)
+                }),
+            _ => left
+                .cost
+                .score
+                .risk_adjusted
+                .total_cmp(&right.cost.score.risk_adjusted)
+                .then_with(|| {
+                    left.cost
+                        .critical_path
+                        .expected
+                        .total_cmp(&right.cost.critical_path.expected)
+                })
+                .then_with(|| {
+                    left.cost
+                        .peak_memory_upper
+                        .cmp(&right.cost.peak_memory_upper)
+                }),
+        })
 }
 
 #[derive(Debug)]
