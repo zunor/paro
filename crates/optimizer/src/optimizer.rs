@@ -64,7 +64,7 @@ use crate::statistics::propagator::StatisticsPropagator;
 use crate::subquery::delim_join_elimination::DelimJoinElimination;
 use crate::subquery::empty_result::EmptyResultPullup;
 use crate::subquery::partition_aggregate::CorrelatedPartitionAggregate;
-use crate::subquery::scalar_aggregate_window;
+use crate::subquery::{scalar_aggregate_fusion, scalar_aggregate_window};
 use crate::verify::verify_logical_plan;
 
 const CORRELATED_AGGREGATE_REGION_RULE: crate::cascades::RuleId = crate::cascades::RuleId(10_004);
@@ -194,7 +194,9 @@ impl Optimizer {
         let mut alternatives = Vec::with_capacity(graph_plans.len().saturating_mul(3));
         for (index, graph_plan) in graph_plans.into_iter().enumerate() {
             let (graph_plan, correlated_seed) =
-                if contains_redundant_computation_region(&graph_plan) {
+                if contains_redundant_computation_region(&graph_plan)
+                    || scalar_aggregate_fusion::contains_candidate_root(&graph_plan)
+                {
                     let (graph_plan, correlated_seed) = fork_plan_preserving_indices(
                         graph_plan,
                         self.binder.bind_context.shared().as_ref(),
@@ -891,6 +893,7 @@ impl Optimizer {
                 &context.column_stats,
                 &context.bind_context,
             )?;
+        candidate = scalar_aggregate_fusion::optimize_plan(candidate, &self.ctx.bind_context)?;
         candidate = scalar_aggregate_window::optimize_plan(candidate, &self.ctx.bind_context)?;
         if self.ctx.session.settings.rowset_scan_pushdown() {
             (candidate, _) = late_payload::optimize_matched_prefix_plan(candidate)?;

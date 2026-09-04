@@ -97,5 +97,12 @@ o.grp	quota_sum
 40	0
 NULL	0
 
+SELECT
+  (SELECT count(*) FROM subquery_scalar_outer WHERE grp = 20) AS matching_rows,
+  (SELECT avg(amt) FROM subquery_scalar_outer WHERE grp = 20) AS avg_amt,
+  (SELECT sum(amt) FROM subquery_scalar_outer WHERE grp = 20) AS total_amt;
+matching_rows	avg_amt	total_amt
+2	5.000000	10
+
 SELECT (SELECT v FROM subquery_scalar_multi) AS should_fail;
 ERROR: More than one row returned by a subquery used as an expression (SQLSTATE=42601)

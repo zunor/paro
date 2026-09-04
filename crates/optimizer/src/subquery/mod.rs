@@ -7,6 +7,7 @@ pub mod delim_join_elimination;
 pub mod empty_result;
 pub(crate) mod output_contract;
 pub mod partition_aggregate;
+pub mod scalar_aggregate_fusion;
 pub mod scalar_aggregate_window;
 
 #[cfg(test)]

@@ -154,7 +154,14 @@ FROM subquery_scalar_outer AS o
 GROUP BY o.grp
 ORDER BY o.grp;
 
--- 9. Multi-row scalar subquery must error
+-- 9. Sibling scalar aggregates over the same filtered input retain scalar semantics
+-- @query
+SELECT
+  (SELECT count(*) FROM subquery_scalar_outer WHERE grp = 20) AS matching_rows,
+  (SELECT avg(amt) FROM subquery_scalar_outer WHERE grp = 20) AS avg_amt,
+  (SELECT sum(amt) FROM subquery_scalar_outer WHERE grp = 20) AS total_amt;
+
+-- 10. Multi-row scalar subquery must error
 -- @statement error More than one row returned by a subquery
 SELECT (SELECT v FROM subquery_scalar_multi) AS should_fail;
 
