@@ -863,6 +863,7 @@ fn shared_relation_window_is_installed_below_unrelated_inner_joins() {
     assert_eq!(inspection.gets_named("lineitem"), 1, "{optimized:#?}");
     assert_eq!(inspection.gets_named("orders"), 1, "{optimized:#?}");
     assert_eq!(inspection.is_not_null_predicates, 1, "{optimized:#?}");
+    assert_eq!(inspection.joins_with_filter_child, 1, "{optimized:#?}");
 }
 
 #[test]

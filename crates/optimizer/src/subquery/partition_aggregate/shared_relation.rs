@@ -71,11 +71,13 @@ pub(super) fn recognize_shared_relation_filter(
     // together, while the original scalar subquery observes an empty input for
     // every NULL outer key. A strict predicate over a NULL-on-empty aggregate
     // lets us restore that distinction with explicit key guards.
-    if !filter_rejects_null_scalar(
-        &shape.filter.expressions[0],
-        shape.scalar.scalar_binding,
-        shape.scalar.presence_binding,
-    ) || !matches!(
+    if !shape.filter.expressions.iter().any(|expression| {
+        filter_rejects_null_scalar(
+            expression,
+            shape.scalar.scalar_binding,
+            shape.scalar.presence_binding,
+        )
+    }) || !matches!(
         shape.scalar.aggregate_expression.function.empty_input,
         AggregateEmptyInput::Null
     ) {
@@ -111,10 +113,7 @@ pub(super) fn recognize_shared_relation_filter(
                 },
             )
         }
-        LogicalOperator::Get(_) => {
-            let LogicalOperator::Get(inner_get) = &inner_source.operator else {
-                unreachable!("Get shape was matched")
-            };
+        LogicalOperator::Get(inner_get) => {
             if inner_get.scan_order.is_some() || !inner_get.runtime_filter_expressions.is_empty() {
                 return None;
             }
@@ -139,11 +138,12 @@ pub(super) fn recognize_shared_relation_filter(
                     {
                         return None;
                     }
-                    let source = SharedSource::Table {
-                        table_index: outer_get.table_index,
-                    };
-                    shared_path_is_extensible(&shape.join.left, source)
-                        .then_some((bindings, source))
+                    Some((
+                        bindings,
+                        SharedSource::Table {
+                            table_index: outer_get.table_index,
+                        },
+                    ))
                 })
                 .collect::<Vec<_>>()
                 .into_iter();
@@ -279,19 +279,6 @@ pub(super) fn apply_shared_relation_rewrite(
         .as_ref()
         .expect("window expression was just created")
         .verify_bound_contract()?;
-    let (detail, inserted) = insert_partition_window(
-        detail,
-        rewrite.source,
-        window_index,
-        &mut window_expression,
-        bind_context,
-    )?;
-    if !inserted {
-        return Err(paro_error::internal(
-            "shared-relation partition witness lost its outer reference",
-        ));
-    }
-
     let scalar = rewrite.scalar_expression.replace_column_ref(&|column| {
         (column.depth == 0 && column.binding == rewrite.scalar_source_binding).then(|| {
             Expression::ColumnRef(ColumnRefExpression::new(
@@ -321,12 +308,64 @@ pub(super) fn apply_shared_relation_rewrite(
         })
         .collect();
     filter.expressions.extend(null_guards);
-    filter.child = Box::new(detail);
-    filter.projection_map = paro_planner::operator::ProjectionMap::all();
-    Ok(LogicalPlan::new(
+    let mut required = HashSet::new();
+    for expression in &filter.expressions {
+        ExpressionIterator::visit(expression, &mut |candidate| {
+            if let Expression::ColumnRef(column) = candidate {
+                if column.depth == 0 {
+                    required.insert(column.binding);
+                }
+                ExpressionVisitDecision::SkipChildren
+            } else {
+                ExpressionVisitDecision::Descend
+            }
+        });
+    }
+    if !required.contains(&window_binding) {
+        return Err(paro_error::internal(
+            "shared-relation partition filter lost its window dependency",
+        ));
+    }
+
+    let (detail, inserted) = insert_partition_window(
+        detail,
+        rewrite.source,
+        window_index,
+        &mut window_expression,
         bind_context,
-        LogicalOperator::Filter(filter),
-    ))
+    )?;
+    if !inserted {
+        return Err(paro_error::internal(
+            "shared-relation partition witness lost its outer reference",
+        ));
+    }
+    let target_id = smallest_extensible_inner_owner(&detail, &required);
+    let mut expressions = Some(filter.expressions);
+    let mut localized = false;
+    let detail = detail.try_map_post_order(|target| {
+        if localized || target.id != target_id {
+            return Ok(target);
+        }
+        localized = true;
+        Ok(LogicalPlan::new(
+            bind_context,
+            LogicalOperator::Filter(paro_planner::operator::Filter {
+                expressions: expressions.take().ok_or_else(|| {
+                    paro_error::internal(
+                        "shared-relation partition filter was consumed more than once",
+                    )
+                })?,
+                child: Box::new(target),
+                projection_map: paro_planner::operator::ProjectionMap::all(),
+            }),
+        ))
+    })?;
+    if !localized {
+        return Err(paro_error::internal(
+            "shared-relation partition filter owner disappeared after recognition",
+        ));
+    }
+    Ok(detail)
 }
 
 fn insert_partition_window(

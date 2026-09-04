@@ -1613,6 +1613,46 @@ fn clean_inner_join(join: &ComparisonJoin) -> bool {
         })
 }
 
+/// Find the deepest clean-inner-join subtree that owns every required
+/// binding and whose path can carry a newly appended output column.
+///
+/// Projection maps are directional: widening the left child only requires a
+/// layout-relative left map, and likewise for the right. Requiring `All` on
+/// the unrelated side rejects valid localization opportunities without
+/// protecting any layout invariant.
+fn smallest_extensible_inner_owner(
+    plan: &LogicalPlan,
+    required: &HashSet<ColumnBinding>,
+) -> paro_planner::plan::PlanNodeId {
+    let mut target = plan;
+    loop {
+        let LogicalOperator::Join(Join::Comparison(join)) = &target.operator else {
+            return target.id;
+        };
+        if !clean_inner_join(join) {
+            return target.id;
+        }
+        let left = join
+            .left
+            .get_column_bindings()
+            .into_iter()
+            .collect::<HashSet<_>>();
+        let right = join
+            .right
+            .get_column_bindings()
+            .into_iter()
+            .collect::<HashSet<_>>();
+        match (
+            required.iter().all(|binding| left.contains(binding)),
+            required.iter().all(|binding| right.contains(binding)),
+        ) {
+            (true, false) if join.left_projection_map.is_all() => target = &join.left,
+            (false, true) if join.right_projection_map.is_all() => target = &join.right,
+            _ => return target.id,
+        }
+    }
+}
+
 fn find_only_delim_get(plan: &LogicalPlan) -> Option<&paro_planner::operator::DelimGet> {
     let mut found = Vec::new();
     collect_delim_gets(plan, &mut found);

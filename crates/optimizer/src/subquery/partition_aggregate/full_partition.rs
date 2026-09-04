@@ -54,11 +54,9 @@ pub(super) fn recognize_full_partition_join(
     {
         return None;
     }
-    let strict_null_rejection = filter_rejects_null_scalar(
-        &filter.expressions[0],
-        scalar.scalar_binding,
-        scalar.presence_binding,
-    ) && filter.expressions.iter().all(is_movable)
+    let strict_null_rejection = filter.expressions.iter().any(|expression| {
+        filter_rejects_null_scalar(expression, scalar.scalar_binding, scalar.presence_binding)
+    }) && filter.expressions.iter().all(is_movable)
         && matches!(
             scalar.aggregate_expression.function.empty_input,
             AggregateEmptyInput::Null
@@ -204,45 +202,51 @@ fn delim_source_path_is_removable(
 }
 
 fn remove_delim_source_path(
-    mut plan: LogicalPlan,
+    plan: LogicalPlan,
     delim_table_index: usize,
     correlation_key_count: usize,
 ) -> Result<LogicalPlan> {
     let direct = direct_delim_join_source(&plan, delim_table_index, correlation_key_count);
-    let LogicalOperator::Join(Join::Comparison(join)) = &mut plan.operator else {
+    let (id, stats, operator) = plan.into_parts();
+    let LogicalOperator::Join(Join::Comparison(mut join)) = operator else {
         return Err(paro_error::internal(
             "full-partition delimiter path lost its comparison join",
         ));
     };
     if let Some(side) = direct {
         return Ok(match side {
-            DirectSourceSide::LeftDelim => std::mem::replace(
-                &mut *join.right,
-                LogicalPlan::synthetic(LogicalOperator::DummyScan),
-            ),
-            DirectSourceSide::RightDelim => std::mem::replace(
-                &mut *join.left,
-                LogicalPlan::synthetic(LogicalOperator::DummyScan),
-            ),
+            DirectSourceSide::LeftDelim => *join.right,
+            DirectSourceSide::RightDelim => *join.left,
         });
     }
     let left_has_delim = plan_references_delim(&join.left, delim_table_index);
     let right_has_delim = plan_references_delim(&join.right, delim_table_index);
-    let child = match (left_has_delim, right_has_delim) {
-        (true, false) => &mut join.left,
-        (false, true) => &mut join.right,
+    match (left_has_delim, right_has_delim) {
+        (true, false) => {
+            join.left = Box::new(remove_delim_source_path(
+                *join.left,
+                delim_table_index,
+                correlation_key_count,
+            )?);
+        }
+        (false, true) => {
+            join.right = Box::new(remove_delim_source_path(
+                *join.right,
+                delim_table_index,
+                correlation_key_count,
+            )?);
+        }
         _ => {
             return Err(paro_error::internal(
                 "full-partition delimiter path became ambiguous",
             ));
         }
-    };
-    let owned = std::mem::replace(
-        &mut **child,
-        LogicalPlan::synthetic(LogicalOperator::DummyScan),
-    );
-    **child = remove_delim_source_path(owned, delim_table_index, correlation_key_count)?;
-    Ok(plan)
+    }
+    Ok(LogicalPlan {
+        id,
+        stats,
+        operator: LogicalOperator::Join(Join::Comparison(join)),
+    })
 }
 
 pub(super) fn apply_full_partition_join(
@@ -250,15 +254,17 @@ pub(super) fn apply_full_partition_join(
     rewrite: FullPartitionJoinRewrite,
     bind_context: &BindContext,
 ) -> Result<LogicalPlan> {
-    let LogicalOperator::Filter(mut filter) = plan.into_operator() else {
+    let LogicalOperator::Filter(filter) = plan.into_operator() else {
         return Err(paro_error::internal(
             "full-partition witness no longer points to a Filter",
         ));
     };
-    let owned_child = std::mem::replace(
-        &mut *filter.child,
-        LogicalPlan::synthetic(LogicalOperator::DummyScan),
-    );
+    let paro_planner::operator::Filter {
+        expressions: filter_expressions,
+        child,
+        projection_map: filter_projection_map,
+    } = filter;
+    let owned_child = *child;
     let LogicalOperator::Join(Join::Comparison(mut outer_join)) = owned_child.into_operator()
     else {
         return Err(paro_error::internal(
@@ -311,12 +317,21 @@ pub(super) fn apply_full_partition_join(
         LogicalOperator::Projection(scalar_projection),
     ));
     if rewrite.localize_filter {
-        return localize_inner_full_partition_filter(filter, outer_join, bind_context);
+        return localize_inner_full_partition_filter(
+            filter_expressions,
+            filter_projection_map,
+            outer_join,
+            bind_context,
+        );
     }
-    filter.child = Box::new(LogicalPlan::new(
-        bind_context,
-        LogicalOperator::Join(Join::Comparison(outer_join)),
-    ));
+    let filter = paro_planner::operator::Filter {
+        expressions: filter_expressions,
+        child: Box::new(LogicalPlan::new(
+            bind_context,
+            LogicalOperator::Join(Join::Comparison(outer_join)),
+        )),
+        projection_map: filter_projection_map,
+    };
     Ok(LogicalPlan::new(
         bind_context,
         LogicalOperator::Filter(filter),
@@ -329,8 +344,9 @@ pub(super) fn apply_full_partition_join(
 /// aggregate as a local relation, instead of forcing all outer rows through a
 /// late scalar join.
 fn localize_inner_full_partition_filter(
-    mut filter: paro_planner::operator::Filter,
-    mut scalar_join: ComparisonJoin,
+    filter_expressions: Vec<Expression>,
+    filter_projection_map: paro_planner::operator::ProjectionMap,
+    scalar_join: ComparisonJoin,
     bind_context: &BindContext,
 ) -> Result<LogicalPlan> {
     debug_assert_eq!(scalar_join.join_type, JoinType::Inner);
@@ -340,7 +356,7 @@ fn localize_inner_full_partition_filter(
         .into_iter()
         .collect::<HashSet<_>>();
     let mut required = HashSet::new();
-    for expression in filter.expressions.iter().chain(
+    for expression in filter_expressions.iter().chain(
         scalar_join
             .conditions
             .iter()
@@ -356,52 +372,98 @@ fn localize_inner_full_partition_filter(
         });
     }
     if required.is_empty() {
-        filter.child = Box::new(LogicalPlan::new(
-            bind_context,
-            LogicalOperator::Join(Join::Comparison(scalar_join)),
-        ));
+        let filter = paro_planner::operator::Filter {
+            expressions: filter_expressions,
+            child: Box::new(LogicalPlan::new(
+                bind_context,
+                LogicalOperator::Join(Join::Comparison(scalar_join)),
+            )),
+            projection_map: filter_projection_map,
+        };
         return Ok(LogicalPlan::new(
             bind_context,
             LogicalOperator::Filter(filter),
         ));
     }
 
-    let target_id = smallest_clean_inner_owner(&scalar_join.left, &required);
+    let target_id = smallest_extensible_inner_owner(&scalar_join.left, &required);
     if target_id == paro_planner::plan::PlanNodeId::SYNTHETIC {
-        filter.child = Box::new(LogicalPlan::new(
-            bind_context,
-            LogicalOperator::Join(Join::Comparison(scalar_join)),
-        ));
+        let filter = paro_planner::operator::Filter {
+            expressions: filter_expressions,
+            child: Box::new(LogicalPlan::new(
+                bind_context,
+                LogicalOperator::Join(Join::Comparison(scalar_join)),
+            )),
+            projection_map: filter_projection_map,
+        };
         return Ok(LogicalPlan::new(
             bind_context,
             LogicalOperator::Filter(filter),
         ));
     }
 
-    let outer = std::mem::replace(
-        &mut *scalar_join.left,
-        LogicalPlan::synthetic(LogicalOperator::DummyScan),
-    );
-    let mut scalar_join = Some(scalar_join);
-    let mut filter = Some(filter);
+    let ComparisonJoin {
+        join_type,
+        anti_join_mode,
+        left,
+        right,
+        conditions,
+        mark_index,
+        mark_semantics,
+        duplicate_eliminated_columns,
+        delim_flipped,
+        left_projection_map,
+        right_projection_map,
+    } = scalar_join;
+    let outer = *left;
+    let mut right = Some(right);
+    let mut conditions = Some(conditions);
+    let mut duplicate_eliminated_columns = Some(duplicate_eliminated_columns);
+    let mut left_projection_map = Some(left_projection_map);
+    let mut right_projection_map = Some(right_projection_map);
+    let mut filter_expressions = Some(filter_expressions);
     let mut replaced = false;
     let localized = outer.try_map_post_order(|target| {
         if replaced || target.id != target_id {
             return Ok(target);
         }
         replaced = true;
-        let mut join = scalar_join.take().ok_or_else(|| {
-            paro_error::internal("localized scalar join was consumed more than once")
-        })?;
-        join.left = Box::new(target);
-        let mut local_filter = filter.take().ok_or_else(|| {
+        let join = ComparisonJoin {
+            join_type,
+            anti_join_mode,
+            left: Box::new(target),
+            right: right.take().ok_or_else(|| {
+                paro_error::internal("localized scalar join was consumed more than once")
+            })?,
+            conditions: conditions.take().ok_or_else(|| {
+                paro_error::internal("localized scalar join conditions were consumed twice")
+            })?,
+            mark_index,
+            mark_semantics,
+            duplicate_eliminated_columns: duplicate_eliminated_columns.take().ok_or_else(|| {
+                paro_error::internal("localized scalar join metadata was consumed twice")
+            })?,
+            delim_flipped,
+            left_projection_map: left_projection_map.take().ok_or_else(|| {
+                paro_error::internal("localized scalar join projection was consumed twice")
+            })?,
+            right_projection_map: right_projection_map.take().ok_or_else(|| {
+                paro_error::internal("localized scalar join projection was consumed twice")
+            })?,
+        };
+        let expressions = filter_expressions.take().ok_or_else(|| {
             paro_error::internal("localized scalar filter was consumed more than once")
         })?;
-        local_filter.child = Box::new(LogicalPlan::new(
-            bind_context,
-            LogicalOperator::Join(Join::Comparison(join)),
-        ));
-        local_filter.projection_map = paro_planner::operator::ProjectionMap::all();
+        let local_filter = paro_planner::operator::Filter {
+            expressions,
+            child: Box::new(LogicalPlan::new(
+                bind_context,
+                LogicalOperator::Join(Join::Comparison(join)),
+            )),
+            // The localized relation widens the selected owner by the scalar
+            // output; its enclosing join path is required to use `All` maps.
+            projection_map: paro_planner::operator::ProjectionMap::all(),
+        };
         Ok(LogicalPlan::new(
             bind_context,
             LogicalOperator::Filter(local_filter),
@@ -415,35 +477,99 @@ fn localize_inner_full_partition_filter(
     Ok(localized)
 }
 
-fn smallest_clean_inner_owner(
-    plan: &LogicalPlan,
-    required: &HashSet<ColumnBinding>,
-) -> paro_planner::plan::PlanNodeId {
-    let mut target = plan;
-    loop {
-        let LogicalOperator::Join(Join::Comparison(join)) = &target.operator else {
-            return target.id;
-        };
-        if !clean_inner_join(join) {
-            return target.id;
-        }
-        let left = join
-            .left
-            .get_column_bindings()
-            .into_iter()
-            .collect::<HashSet<_>>();
-        let right = join
-            .right
-            .get_column_bindings()
-            .into_iter()
-            .collect::<HashSet<_>>();
-        match (
-            required.iter().all(|binding| left.contains(binding)),
-            required.iter().all(|binding| right.contains(binding)),
-        ) {
-            (true, false) => target = &join.left,
-            (false, true) => target = &join.right,
-            _ => return target.id,
-        }
+#[cfg(test)]
+mod tests {
+    use paro_common::types::LogicalType;
+    use paro_planner::binder::context::BindContext;
+    use paro_planner::operator::{ExpressionGet, ProjectionMap};
+
+    use super::*;
+
+    fn one_column_relation(context: &BindContext, table_index: usize) -> LogicalPlan {
+        LogicalPlan::new(
+            context,
+            LogicalOperator::ExpressionGet(ExpressionGet::new(
+                table_index,
+                Vec::new(),
+                vec!["key".to_string()],
+                vec![LogicalType::BigInt],
+            )),
+        )
+    }
+
+    fn column(table_index: usize) -> Expression {
+        Expression::ColumnRef(ColumnRefExpression::new(
+            ColumnBinding::new(table_index, 0),
+            LogicalType::BigInt,
+        ))
+    }
+
+    #[test]
+    fn explicit_identity_projection_is_not_a_layout_relative_owner() {
+        let context = BindContext::new();
+        let left = one_column_relation(&context, 1);
+        let left_id = left.id;
+        let mut join = ComparisonJoin::new(
+            JoinType::Inner,
+            left,
+            one_column_relation(&context, 2),
+            vec![JoinCondition::new(
+                column(1),
+                column(2),
+                JoinComparisonType::Equal,
+            )],
+        );
+        join.left_projection_map = ProjectionMap::new(vec![0]);
+        join.right_projection_map = ProjectionMap::new(vec![0]);
+        let root = LogicalPlan::new(&context, LogicalOperator::Join(Join::Comparison(join)));
+        let required = HashSet::from([ColumnBinding::new(1, 0)]);
+
+        assert_ne!(root.id, left_id);
+        assert_eq!(smallest_extensible_inner_owner(&root, &required), root.id);
+    }
+
+    #[test]
+    fn all_projection_allows_layout_relative_localization() {
+        let context = BindContext::new();
+        let left = one_column_relation(&context, 1);
+        let left_id = left.id;
+        let root = LogicalPlan::new(
+            &context,
+            LogicalOperator::Join(Join::Comparison(ComparisonJoin::new(
+                JoinType::Inner,
+                left,
+                one_column_relation(&context, 2),
+                vec![JoinCondition::new(
+                    column(1),
+                    column(2),
+                    JoinComparisonType::Equal,
+                )],
+            ))),
+        );
+        let required = HashSet::from([ColumnBinding::new(1, 0)]);
+
+        assert_eq!(smallest_extensible_inner_owner(&root, &required), left_id);
+    }
+
+    #[test]
+    fn unrelated_fixed_projection_does_not_block_localization() {
+        let context = BindContext::new();
+        let left = one_column_relation(&context, 1);
+        let left_id = left.id;
+        let mut join = ComparisonJoin::new(
+            JoinType::Inner,
+            left,
+            one_column_relation(&context, 2),
+            vec![JoinCondition::new(
+                column(1),
+                column(2),
+                JoinComparisonType::Equal,
+            )],
+        );
+        join.right_projection_map = ProjectionMap::new(vec![0]);
+        let root = LogicalPlan::new(&context, LogicalOperator::Join(Join::Comparison(join)));
+        let required = HashSet::from([ColumnBinding::new(1, 0)]);
+
+        assert_eq!(smallest_extensible_inner_owner(&root, &required), left_id);
     }
 }
