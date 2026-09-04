@@ -15,7 +15,7 @@ use paro_common::types::LogicalType;
 
 use crate::index::ColumnId;
 
-use super::fixed_membership::FixedMembership;
+use super::fixed_membership::{FixedMembership, FixedMembershipWidth};
 
 /// Ordering operation used by a row-level column comparison.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -540,6 +540,20 @@ pub fn value_to_bytes(value: &Value, logical_type: &LogicalType) -> Result<Vec<u
         (LogicalType::Uuid, Value::Uuid(v)) => Ok(v.to_le_bytes().to_vec()),
         (LogicalType::Float, Value::Float(v)) => Ok(v.to_le_bytes().to_vec()),
         (LogicalType::Double, Value::Double(v)) => Ok(v.to_le_bytes().to_vec()),
+        (LogicalType::Date, Value::Date(v)) => Ok(v.to_le_bytes().to_vec()),
+        (LogicalType::Timestamp, Value::Timestamp(v)) => Ok(v.to_le_bytes().to_vec()),
+        (LogicalType::TimestampTz, Value::TimestampTz(v)) => Ok(v.to_le_bytes().to_vec()),
+        (LogicalType::Time, Value::Time(v)) => Ok(v.to_le_bytes().to_vec()),
+        (LogicalType::Decimal { precision, .. }, Value::Decimal(v, _, _)) => {
+            if *precision <= 18 {
+                Ok(i64::try_from(*v)
+                    .map_err(|_| paro_error::type_mismatch("Decimal value exceeds i64 storage"))?
+                    .to_le_bytes()
+                    .to_vec())
+            } else {
+                Ok(v.to_le_bytes().to_vec())
+            }
+        }
         (
             LogicalType::Varchar
             | LogicalType::VarcharCollation(_)
@@ -555,6 +569,42 @@ pub fn value_to_bytes(value: &Value, logical_type: &LogicalType) -> Result<Vec<u
             "Unsupported value/logical type pair: {:?} / {:?}",
             value, logical_type
         ))),
+    }
+}
+
+pub(crate) fn fixed_membership_to_bytes(
+    values: &FixedMembership,
+    logical_type: &LogicalType,
+) -> Option<Vec<Vec<u8>>> {
+    let mut canonical = Vec::with_capacity(values.len());
+    let width = values.visit_canonical_values(|value| canonical.push(value));
+    match (width, logical_type) {
+        (FixedMembershipWidth::I32, LogicalType::Integer | LogicalType::Date) => canonical
+            .into_iter()
+            .map(|value| Some(i32::try_from(value).ok()?.to_le_bytes().to_vec()))
+            .collect(),
+        (FixedMembershipWidth::I64, LogicalType::BigInt)
+        | (
+            FixedMembershipWidth::I64,
+            LogicalType::Decimal {
+                precision: 0..=18, ..
+            },
+        ) => canonical
+            .into_iter()
+            .map(|value| Some(i64::try_from(value).ok()?.to_le_bytes().to_vec()))
+            .collect(),
+        (
+            FixedMembershipWidth::I128,
+            LogicalType::Decimal {
+                precision: 19.., ..
+            },
+        ) => Some(
+            canonical
+                .into_iter()
+                .map(|value| value.to_le_bytes().to_vec())
+                .collect(),
+        ),
+        _ => None,
     }
 }
 
@@ -755,6 +805,14 @@ pub fn compare_bytes(logical_type: &LogicalType, left: &[u8], right: &[u8]) -> R
             );
             Ok(l.partial_cmp(&r).unwrap_or(Ordering::Equal))
         }
+        LogicalType::Date => compare_i32_bytes(left, right, "Date"),
+        LogicalType::Timestamp | LogicalType::TimestampTz | LogicalType::Time => {
+            compare_i64_bytes(left, right, "Temporal")
+        }
+        LogicalType::Decimal { precision, .. } if *precision <= 18 => {
+            compare_i64_bytes(left, right, "Decimal64")
+        }
+        LogicalType::Decimal { .. } => compare_i128_bytes(left, right, "Decimal128"),
         LogicalType::Varchar
         | LogicalType::VarcharCollation(_)
         | LogicalType::TsVector
@@ -767,6 +825,57 @@ pub fn compare_bytes(logical_type: &LogicalType, left: &[u8], right: &[u8]) -> R
             logical_type
         ))),
     }
+}
+
+fn compare_i32_bytes(left: &[u8], right: &[u8], label: &str) -> Result<Ordering> {
+    let left = i32::from_le_bytes(
+        left.get(..4)
+            .ok_or_else(|| paro_error::type_mismatch(format!("{label}: insufficient bytes")))?
+            .try_into()
+            .expect("four-byte slice"),
+    );
+    let right = i32::from_le_bytes(
+        right
+            .get(..4)
+            .ok_or_else(|| paro_error::type_mismatch(format!("{label}: insufficient bytes")))?
+            .try_into()
+            .expect("four-byte slice"),
+    );
+    Ok(left.cmp(&right))
+}
+
+fn compare_i64_bytes(left: &[u8], right: &[u8], label: &str) -> Result<Ordering> {
+    let left = i64::from_le_bytes(
+        left.get(..8)
+            .ok_or_else(|| paro_error::type_mismatch(format!("{label}: insufficient bytes")))?
+            .try_into()
+            .expect("eight-byte slice"),
+    );
+    let right = i64::from_le_bytes(
+        right
+            .get(..8)
+            .ok_or_else(|| paro_error::type_mismatch(format!("{label}: insufficient bytes")))?
+            .try_into()
+            .expect("eight-byte slice"),
+    );
+    Ok(left.cmp(&right))
+}
+
+fn compare_i128_bytes(left: &[u8], right: &[u8], label: &str) -> Result<Ordering> {
+    let left = i128::from_le_bytes(
+        left.get(..16)
+            .ok_or_else(|| paro_error::type_mismatch(format!("{label}: insufficient bytes")))?
+            .try_into()
+            .expect("sixteen-byte slice"),
+    );
+    let right = i128::from_le_bytes(
+        right
+            .get(..16)
+            .ok_or_else(|| paro_error::type_mismatch(format!("{label}: insufficient bytes")))?
+            .try_into()
+            .expect("sixteen-byte slice"),
+    );
+    Ok(left.cmp(&right))
 }
 
 /// Whether the durable scalar encoding has a total ordering understood by
@@ -790,6 +899,11 @@ pub fn supports_ordered_bytes(logical_type: &LogicalType) -> bool {
             | LogicalType::Uuid
             | LogicalType::Float
             | LogicalType::Double
+            | LogicalType::Date
+            | LogicalType::Timestamp
+            | LogicalType::TimestampTz
+            | LogicalType::Time
+            | LogicalType::Decimal { .. }
             | LogicalType::Varchar
             | LogicalType::VarcharCollation(_)
             | LogicalType::TsVector
