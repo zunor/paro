@@ -7,7 +7,7 @@ use paro_common::chunk::Chunk;
 use paro_common::error::{self as paro_error, Result};
 use paro_common::types::LogicalType;
 use paro_common::vector::SelectionVector;
-use paro_planner::operator::join::{AntiJoinMode, JoinType};
+use paro_planner::operator::join::{AntiJoinMode, JoinType, MarkJoinSemantics};
 
 use crate::join_hashtable::scan_structure::ScanStructure;
 use crate::join_hashtable::JoinHashTable;
@@ -21,6 +21,7 @@ use crate::runtime::context::QueryRuntimeContext;
 pub(crate) fn scan_hash_join_results(
     join_type: JoinType,
     anti_join_mode: AntiJoinMode,
+    mark_semantics: MarkJoinSemantics,
     probe_keys: &Chunk,
     input: &Chunk,
     output: &mut Chunk,
@@ -161,6 +162,7 @@ pub(crate) fn scan_hash_join_results(
             hash_table,
             left_projection,
             output_permutation,
+            mark_semantics,
         ),
         JoinType::Single => scan_structure.next_single_join(
             probe_keys,

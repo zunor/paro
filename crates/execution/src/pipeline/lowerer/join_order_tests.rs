@@ -364,6 +364,26 @@ fn exact_unique_payload_free_probe_is_covered_only_by_its_rowset_filter() {
 }
 
 #[test]
+fn exact_payload_free_semi_probe_does_not_require_unique_build_keys() {
+    let plan = hash_join_plan(JoinType::Semi);
+    let mut spec = match &plan.node(plan.root).kind {
+        PhysicalNodeKind::HashJoin(spec) => enable_runtime_filter(spec.clone()),
+        _ => panic!("expected hash join plan"),
+    };
+    spec.build_keys_unique = false;
+    spec.build_output_count = 0;
+    spec.build_input_projection = Box::new([]);
+    spec.build_payload_types = Box::new([]);
+
+    let TransformSpec::HashJoinProbe(probe) =
+        hash_join_probe_transform(BreakerHandleId::new(3), &spec)
+    else {
+        panic!("expected hash join probe");
+    };
+    assert_eq!(probe.covering_runtime_filter_key, Some(0));
+}
+
+#[test]
 fn runtime_filter_does_not_cover_non_unique_or_payload_probe() {
     let plan = hash_join_plan(JoinType::Inner);
     let mut spec = match &plan.node(plan.root).kind {

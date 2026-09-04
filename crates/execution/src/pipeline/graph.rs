@@ -730,6 +730,7 @@ pub struct HashJoinSpillReplaySourceSpec {
     pub handle: BreakerHandleId,
     pub join_type: JoinType,
     pub anti_join_mode: paro_planner::operator::join::AntiJoinMode,
+    pub mark_semantics: paro_planner::operator::MarkJoinSemantics,
     pub key_conditions: Box<[JoinCondition]>,
     pub build_residual_conditions: Box<[JoinCondition]>,
     pub probe_residual_count: usize,
@@ -931,11 +932,13 @@ impl TransformSpec {
 pub struct HashJoinProbeSpec {
     pub handle: BreakerHandleId,
     /// Single build-key ordinal whose exact runtime predicate was attached to
-    /// this pipeline's rowset source. Execution may bypass a payload-free,
-    /// unique inner probe only while the frozen filter remains exact.
+    /// this pipeline's rowset source. Execution may bypass a payload-free
+    /// unique INNER or duplicate-insensitive SEMI probe only while the frozen
+    /// filter remains exact.
     pub covering_runtime_filter_key: Option<usize>,
     pub join_type: JoinType,
     pub anti_join_mode: paro_planner::operator::join::AntiJoinMode,
+    pub mark_semantics: paro_planner::operator::MarkJoinSemantics,
     pub key_conditions: Box<[JoinCondition]>,
     pub build_residual_conditions: Box<[JoinCondition]>,
     pub probe_residual_count: usize,

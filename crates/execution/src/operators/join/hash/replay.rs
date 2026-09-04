@@ -9,7 +9,7 @@ use paro_common::error::{self as paro_error, Result};
 use paro_common::types::LogicalType;
 use paro_common::vector::{SelectionVector, VECTOR_SIZE};
 use paro_function::scalar::FunctionExecContext;
-use paro_planner::operator::join::{AntiJoinMode, JoinCondition, JoinType};
+use paro_planner::operator::join::{AntiJoinMode, JoinCondition, JoinType, MarkJoinSemantics};
 
 use crate::expression_executor::executor::ExpressionExecutor;
 use crate::join_hashtable::{FullOuterScanState, JoinHashTable, JoinHashTableConfig};
@@ -39,6 +39,7 @@ pub struct HashJoinSpillReplaySourceExec {
     pub handle: HandleRef<JoinBuildHandle>,
     pub join_type: JoinType,
     pub anti_join_mode: AntiJoinMode,
+    pub mark_semantics: MarkJoinSemantics,
     pub key_conditions: Box<[JoinCondition]>,
     pub build_residual_conditions: Box<[JoinCondition]>,
     pub probe_residual_count: usize,
@@ -430,6 +431,7 @@ impl HashJoinSpillReplaySourceExec {
         let count = scan_hash_join_results(
             self.join_type,
             self.anti_join_mode,
+            self.mark_semantics,
             probe_keys,
             probe_input,
             output,

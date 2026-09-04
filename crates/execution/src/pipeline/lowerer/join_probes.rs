@@ -1058,6 +1058,7 @@ fn hash_join_spill_replay_source(
         handle,
         join_type: spec.join_type,
         anti_join_mode: spec.anti_join_mode,
+        mark_semantics: spec.mark_semantics,
         key_conditions: spec.key_conditions.clone(),
         build_residual_conditions: spec.build_residual_conditions.clone(),
         probe_residual_count: spec.probe_residual_count,

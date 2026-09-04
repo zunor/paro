@@ -72,6 +72,7 @@ pub(crate) fn hash_join_probe_transform(
         covering_runtime_filter_key: hash_join_runtime_filter_probe_candidate(spec),
         join_type: spec.join_type,
         anti_join_mode: spec.anti_join_mode,
+        mark_semantics: spec.mark_semantics,
         key_conditions: spec.key_conditions.clone(),
         build_residual_conditions: spec.build_residual_conditions.clone(),
         probe_residual_count: spec.probe_residual_count,
@@ -88,8 +89,9 @@ fn hash_join_runtime_filter_probe_candidate(spec: &HashJoinSpec) -> Option<usize
         return None;
     };
     let runtime_filter = spec.runtime_filter.as_ref()?;
-    (spec.join_type == JoinType::Inner
-        && spec.build_keys_unique
+    let covered_semantics = (spec.join_type == JoinType::Inner && spec.build_keys_unique)
+        || spec.join_type == JoinType::Semi;
+    (covered_semantics
         && spec.build_output_count == 0
         && spec.build_residual_conditions.is_empty()
         && spec.probe_residual_count == 0

@@ -162,6 +162,7 @@ mod output_permutation_tests {
 pub struct HashJoinSpec {
     pub join_type: JoinType,
     pub anti_join_mode: AntiJoinMode,
+    pub mark_semantics: MarkJoinSemantics,
     /// Correctness proof that the complete build equality-key tuple is unique.
     /// Runtime index construction may use this to publish disjoint slots
     /// without duplicate-chain synchronization.

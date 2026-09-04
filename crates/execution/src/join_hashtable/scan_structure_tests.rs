@@ -429,6 +429,7 @@ fn test_next_semi_anti_and_mark_join() {
             &ht,
             &[0],
             &OutputPermutation::identity(2),
+            paro_planner::operator::MarkJoinSemantics::ThreeValuedFrom(0),
         )
         .unwrap();
     assert_eq!(mark_count, 2);

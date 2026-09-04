@@ -30,6 +30,10 @@ impl PhysicalPlanExtractor {
                                 .conditions
                                 .iter()
                                 .any(|condition| !is_hash_join_comparison(condition.comparison)))
+                        || matches!(
+                            comparison.mark_semantics,
+                            MarkJoinSemantics::ThreeValuedFrom(start) if start > 0
+                        )
                     {
                         return Err(paro_error::internal(
                             "Memo selected hash join for an ineligible comparison join",
@@ -45,7 +49,14 @@ impl PhysicalPlanExtractor {
                         || comparison.anti_join_mode != AntiJoinMode::Regular
                         || !matches!(
                             comparison.join_type,
-                            JoinType::Left | JoinType::Right | JoinType::Inner | JoinType::Outer
+                            JoinType::Left
+                                | JoinType::Right
+                                | JoinType::Inner
+                                | JoinType::Outer
+                                | JoinType::Semi
+                                | JoinType::Anti
+                                | JoinType::RightSemi
+                                | JoinType::RightAnti
                         )
                         || !comparison
                             .conditions
@@ -407,6 +418,7 @@ impl PhysicalPlanExtractor {
         let spec = HashJoinSpec {
             join_type: join.join_type,
             anti_join_mode: join.anti_join_mode,
+            mark_semantics: join.mark_semantics,
             build_keys_unique,
             build_time_integer_index,
             key_conditions,
@@ -507,6 +519,7 @@ impl PhysicalPlanExtractor {
         let spec = HashJoinSpec {
             join_type: physical_join_type,
             anti_join_mode: join.anti_join_mode,
+            mark_semantics: join.mark_semantics,
             build_keys_unique,
             build_time_integer_index,
             key_conditions,
@@ -828,6 +841,7 @@ impl PhysicalPlanExtractor {
         let spec = HashJoinSpec {
             join_type: JoinType::RightSemi,
             anti_join_mode: AntiJoinMode::Regular,
+            mark_semantics: MarkJoinSemantics::NotMark,
             build_keys_unique: false,
             build_time_integer_index: None,
             key_conditions: key_conditions.into_boxed_slice(),
@@ -999,6 +1013,7 @@ impl PhysicalPlanExtractor {
         let spec = HashJoinSpec {
             join_type: join.join_type,
             anti_join_mode: join.anti_join_mode,
+            mark_semantics: join.mark_semantics,
             build_keys_unique,
             build_time_integer_index,
             key_conditions,

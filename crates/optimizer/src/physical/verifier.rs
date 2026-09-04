@@ -415,6 +415,19 @@ fn verify_hash_join_output_permutation(spec: &crate::physical::HashJoinSpec) -> 
             "hash join visible build output exceeds its payload layout",
         ));
     };
+    let valid_mark_contract = match spec.join_type {
+        paro_planner::operator::join::JoinType::Mark => matches!(
+            spec.mark_semantics,
+            paro_planner::operator::MarkJoinSemantics::TwoValued
+                | paro_planner::operator::MarkJoinSemantics::ThreeValuedFrom(0)
+        ),
+        _ => spec.mark_semantics == paro_planner::operator::MarkJoinSemantics::NotMark,
+    };
+    if !valid_mark_contract {
+        return Err(paro_error::internal(
+            "hash join has an incompatible MARK truth-value contract",
+        ));
+    }
     let mut natural_types = spec.left_output_types.to_vec();
     if spec.join_type == paro_planner::operator::join::JoinType::Mark {
         natural_types.push(paro_common::types::LogicalType::Boolean);

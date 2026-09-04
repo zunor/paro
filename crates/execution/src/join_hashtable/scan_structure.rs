@@ -6,7 +6,7 @@
 //! Tracks pointers into the hash table, collision chains, and match flags for outer joins.
 
 use paro_common::allocator::Allocator;
-use paro_common::error::Result;
+use paro_common::error::{self as paro_error, Result};
 use paro_common::types::LogicalType;
 use paro_common::vector::Vector;
 use paro_common::vector::{SelectionVector, VECTOR_SIZE};
@@ -1111,6 +1111,7 @@ impl ScanStructure {
         hash_table: &JoinHashTable,
         left_projection_map: &[usize],
         output_permutation: &OutputPermutation,
+        mark_semantics: paro_planner::operator::MarkJoinSemantics,
     ) -> Result<usize> {
         self.next_mark_join_with_filter(
             keys,
@@ -1119,6 +1120,7 @@ impl ScanStructure {
             hash_table,
             left_projection_map,
             output_permutation,
+            mark_semantics,
             Self::accept_all_matches,
         )
     }
@@ -1131,11 +1133,22 @@ impl ScanStructure {
         hash_table: &JoinHashTable,
         left_projection_map: &[usize],
         output_permutation: &OutputPermutation,
+        mark_semantics: paro_planner::operator::MarkJoinSemantics,
         residual_filter: F,
     ) -> Result<usize>
     where
         F: FnMut(&SelectionVector, &[usize], usize, &mut SelectionVector) -> Result<usize>,
     {
+        let nulls_produce_unknown = match mark_semantics {
+            paro_planner::operator::MarkJoinSemantics::TwoValued => false,
+            paro_planner::operator::MarkJoinSemantics::ThreeValuedFrom(0) => true,
+            paro_planner::operator::MarkJoinSemantics::NotMark
+            | paro_planner::operator::MarkJoinSemantics::ThreeValuedFrom(_) => {
+                return Err(paro_error::internal(
+                    "hash MARK probe received an unsupported truth-value contract",
+                ));
+            }
+        };
         if self.finished {
             result.set_cardinality(0);
             return Ok(0);
@@ -1148,10 +1161,11 @@ impl ScanStructure {
             .map(|idx| {
                 if self.found_match[idx] {
                     Some(true)
-                } else if Self::probe_row_has_null(keys, hash_table, idx)
-                    || hash_table
-                        .has_null
-                        .load(std::sync::atomic::Ordering::Relaxed)
+                } else if nulls_produce_unknown
+                    && (Self::probe_row_has_null(keys, hash_table, idx)
+                        || hash_table
+                            .has_null
+                            .load(std::sync::atomic::Ordering::Relaxed))
                 {
                     None
                 } else {

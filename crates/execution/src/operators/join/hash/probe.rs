@@ -5,7 +5,7 @@ use paro_common::chunk::Chunk;
 use paro_common::error::{self as paro_error, Result};
 use paro_common::types::LogicalType;
 use paro_common::vector::VECTOR_SIZE;
-use paro_planner::operator::join::{AntiJoinMode, JoinCondition, JoinType};
+use paro_planner::operator::join::{AntiJoinMode, JoinCondition, JoinType, MarkJoinSemantics};
 
 use crate::expression_executor::executor::ExpressionExecutor;
 use crate::operators::join::hash::hashing::compute_hashes_for_keys_into;
@@ -35,6 +35,7 @@ pub struct HashJoinProbeTransformExec {
     pub covering_runtime_filter_key: Option<usize>,
     pub join_type: JoinType,
     pub anti_join_mode: AntiJoinMode,
+    pub mark_semantics: MarkJoinSemantics,
     pub key_conditions: Box<[JoinCondition]>,
     pub build_residual_conditions: Box<[JoinCondition]>,
     pub probe_residual_count: usize,
@@ -514,6 +515,7 @@ impl HashJoinProbeTransformExec {
                 let count = scan_hash_join_results(
                     self.join_type,
                     self.anti_join_mode,
+                    self.mark_semantics,
                     probe_keys,
                     input,
                     output,
