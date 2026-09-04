@@ -764,17 +764,17 @@ impl Optimizer {
     }
 
     fn estimate_query_candidate(&self, mut plan: LogicalPlan) -> Result<CandidatePlan> {
-        let mut context = self.ctx.fork_for_candidate(HashMap::new());
+        let mut context = self.ctx.fork_for_candidate(Arc::new(HashMap::new()));
 
         plan = StatisticsGathering::new().gather(plan, &mut context)?;
         let mut propagator = StatisticsPropagator::new();
         plan = propagator.propagate(context.session.clone(), plan);
-        context.column_stats = propagator.take_statistics_map();
+        context.column_stats = Arc::new(propagator.take_statistics_map());
         plan = StatisticsGathering::new().gather(plan, &mut context)?;
 
         Ok(CandidatePlan {
             plan,
-            column_stats: Arc::new(context.column_stats),
+            column_stats: context.column_stats,
         })
     }
 
@@ -882,9 +882,7 @@ impl Optimizer {
     }
 
     fn scalar_reuse_candidate(&self, candidate: CandidatePlan) -> Result<CandidatePlan> {
-        let context = self
-            .ctx
-            .fork_for_candidate(Arc::unwrap_or_clone(candidate.column_stats));
+        let context = self.ctx.fork_for_candidate(candidate.column_stats.clone());
         let mut candidate = JoinOrderOptimizer::new(self.ctx.cost_model.defaults.clone())
             .with_search_budget(&self.budget)
             .optimize_plan(

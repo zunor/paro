@@ -800,7 +800,7 @@ impl StatisticsGathering {
         };
 
         for (binding, stats) in output_layout.bindings().iter().copied().zip(output_stats) {
-            ctx.column_stats.insert(binding, stats);
+            ctx.column_stats_mut().insert(binding, stats);
         }
     }
 
@@ -2180,7 +2180,7 @@ mod tests {
         let base = BaseStatistics::new(LogicalType::BigInt);
         let mut stats = ColumnStatistics::new(base);
         stats.update_distinct_statistics(&[11, 29], 2);
-        ctx.column_stats.insert(binding, Arc::new(stats));
+        ctx.column_stats_mut().insert(binding, Arc::new(stats));
 
         assert_eq!(
             estimate_group_distinct(&column_ref(1, 0), &ctx, 4_096, 4_096),
@@ -2194,7 +2194,7 @@ mod tests {
         let session = make_test_session();
         let mut ctx = OptimizationContext::new(session, bind_context);
         let binding = ColumnBinding::new(1, 0);
-        ctx.column_stats.insert(
+        ctx.column_stats_mut().insert(
             binding,
             Arc::new(
                 ColumnStatistics::new(BaseStatistics::from_constant(&Value::BigInt(2001)))
@@ -2216,7 +2216,7 @@ mod tests {
         let binding = ColumnBinding::new(1, 0);
         let mut input = ColumnStatistics::new(BaseStatistics::from_constant(&Value::BigInt(7)));
         input.update_distinct_statistics(&[11, 29, 47], 3);
-        ctx.column_stats.insert(binding, Arc::new(input));
+        ctx.column_stats_mut().insert(binding, Arc::new(input));
         let (function, target_types) =
             paro_function::aggregate::distributive::first_last::get_first_function()
                 .bind(&[LogicalType::BigInt])
@@ -2249,7 +2249,7 @@ mod tests {
         let mut storage =
             ColumnStatistics::new(BaseStatistics::create_unknown(LogicalType::BigInt));
         storage.update_distinct_statistics(&[11, 29, 47], 3);
-        ctx.column_stats.insert(binding, Arc::new(storage));
+        ctx.column_stats_mut().insert(binding, Arc::new(storage));
         let filter = Filter::new(
             values_relation(&bind_context, 1, 4),
             vec![Expression::Comparison(ComparisonExpression::new(
@@ -2269,7 +2269,7 @@ mod tests {
             output[0].statistics().min_value(),
             Some(Value::BigInt(2001))
         );
-        ctx.column_stats.insert(binding, output[0].clone());
+        ctx.column_stats_mut().insert(binding, output[0].clone());
         assert_eq!(
             estimate_group_distinct(&column_ref(1, 0), &ctx, 4, 4),
             (1, Some(1))
@@ -2283,13 +2283,13 @@ mod tests {
         let mut ctx = OptimizationContext::new(session, bind_context.clone());
         let first = ColumnBinding::new(1, 0);
         let third = ColumnBinding::new(1, 2);
-        ctx.column_stats.insert(
+        ctx.column_stats_mut().insert(
             first,
             Arc::new(ColumnStatistics::new(BaseStatistics::from_constant(
                 &Value::BigInt(7),
             ))),
         );
-        ctx.column_stats.insert(
+        ctx.column_stats_mut().insert(
             third,
             Arc::new(ColumnStatistics::new(BaseStatistics::from_constant(
                 &Value::BigInt(99),
@@ -2350,7 +2350,7 @@ mod tests {
         let mut storage =
             ColumnStatistics::new(BaseStatistics::create_unknown(LogicalType::BigInt));
         storage.update_distinct_statistics(&[11, 29, 47], 3);
-        ctx.column_stats.insert(binding, Arc::new(storage));
+        ctx.column_stats_mut().insert(binding, Arc::new(storage));
         let equality = |year| {
             Expression::Comparison(ComparisonExpression::new(
                 ComparisonType::Equal,
@@ -2383,7 +2383,7 @@ mod tests {
             output[0].statistics().max_value(),
             Some(Value::BigInt(2002))
         );
-        ctx.column_stats.insert(binding, output[0].clone());
+        ctx.column_stats_mut().insert(binding, output[0].clone());
         assert_eq!(
             estimate_group_distinct(&column_ref(1, 0), &ctx, 4, 4),
             (2, Some(2))
@@ -2398,9 +2398,10 @@ mod tests {
         let mut shared = ColumnStatistics::new(BaseStatistics::from_constant(&Value::BigInt(7)));
         shared.update_distinct_statistics(&[11, 29, 47], 3);
         let shared = Arc::new(shared);
-        ctx.column_stats
+        ctx.column_stats_mut()
             .insert(ColumnBinding::new(1, 0), shared.clone());
-        ctx.column_stats.insert(ColumnBinding::new(2, 0), shared);
+        ctx.column_stats_mut()
+            .insert(ColumnBinding::new(2, 0), shared);
 
         let join = paro_planner::operator::ComparisonJoin::new(
             JoinType::Semi,

@@ -5,7 +5,6 @@ use paro_common::error::{self as paro_error, Result};
 use paro_common::runtime_value::Value;
 use paro_common::types::LogicalType;
 use paro_external::routine::identity::BuiltinIntrinsicId;
-use paro_planner::binder::deep_copy::deep_copy_plan;
 use paro_planner::expression::{
     Expression, ExpressionIterator, ExpressionVisitDecision, OperatorType,
 };
@@ -44,15 +43,20 @@ impl SearchOptimizer {
     /// itself provider- and capability-free.
     pub(crate) fn physical_candidate_for_root(
         &mut self,
-        plan: LogicalPlan,
+        plan: &LogicalPlan,
         ctx: &OptimizationContext,
     ) -> Result<Option<LogicalPlan>> {
-        let rewritten = self.rewrite_current(plan, ctx)?;
-        Ok(matches!(
-            rewritten.operator,
-            LogicalOperator::SearchScan(_) | LogicalOperator::FullTextFilterScan(_)
-        )
-        .then_some(rewritten))
+        match &plan.operator {
+            LogicalOperator::TopN(topn) if extract_topn_pattern(topn).is_some() => {
+                self.try_rewrite_topn(plan, topn, ctx)
+            }
+            LogicalOperator::Filter(filter)
+                if matches!(filter.child.operator, LogicalOperator::Get(_)) =>
+            {
+                self.try_rewrite_fulltext_filter(plan, filter, ctx)
+            }
+            _ => Ok(None),
+        }
     }
 
     fn rewrite_current(
@@ -60,35 +64,13 @@ impl SearchOptimizer {
         plan: LogicalPlan,
         ctx: &OptimizationContext,
     ) -> Result<LogicalPlan> {
-        let bind_context = &ctx.bind_context;
-        match &plan.operator {
-            LogicalOperator::TopN(topn) => {
-                if let Some(plan) = self.try_rewrite_topn(
-                    deep_copy_plan(&plan, bind_context.shared().as_ref()),
-                    topn,
-                    ctx,
-                )? {
-                    return Ok(plan);
-                }
-                Ok(plan)
-            }
-            LogicalOperator::Filter(filter) => {
-                if let Some(plan) = self.try_rewrite_fulltext_filter(
-                    deep_copy_plan(&plan, bind_context.shared().as_ref()),
-                    filter,
-                    ctx,
-                )? {
-                    return Ok(plan);
-                }
-                Ok(plan)
-            }
-            _ => Ok(plan),
-        }
+        let candidate = self.physical_candidate_for_root(&plan, ctx)?;
+        Ok(candidate.unwrap_or(plan))
     }
 
     fn try_rewrite_topn(
         &self,
-        plan: LogicalPlan,
+        plan: &LogicalPlan,
         topn: &TopN,
         ctx: &OptimizationContext,
     ) -> Result<Option<LogicalPlan>> {
@@ -278,7 +260,7 @@ impl SearchOptimizer {
 
     fn try_rewrite_fulltext_filter(
         &self,
-        plan: LogicalPlan,
+        plan: &LogicalPlan,
         filter: &Filter,
         ctx: &OptimizationContext,
     ) -> Result<Option<LogicalPlan>> {
@@ -345,7 +327,8 @@ impl SearchOptimizer {
                 residual_predicates: Vec::new(),
                 decision,
             });
-            let (id, stats, _) = plan.into_parts();
+            let id = plan.id;
+            let stats = plan.stats.clone();
             return Ok(Some(LogicalPlan {
                 id,
                 stats,
@@ -379,7 +362,7 @@ fn residual_fulltext_filters(
 }
 
 fn build_search_scan(
-    plan: LogicalPlan,
+    plan: &LogicalPlan,
     pattern: TopNPattern<'_>,
     request: NormalizedSearchRequest,
     decision: SearchDecision,
@@ -418,7 +401,8 @@ fn build_search_scan(
         )
         .with_output_names(output_names),
     );
-    let (id, stats, _) = plan.into_parts();
+    let id = plan.id;
+    let stats = plan.stats.clone();
     Ok(LogicalPlan {
         id,
         stats,

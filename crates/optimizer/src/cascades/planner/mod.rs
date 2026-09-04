@@ -533,9 +533,8 @@ impl MemoBuilder {
         for alternative in alternatives {
             let source = alternative.source;
             let candidate_stats = alternative.column_stats.clone();
-            let candidate_context = search_context.map(|context| {
-                context.fork_for_candidate(Arc::unwrap_or_clone(alternative.column_stats))
-            });
+            let candidate_context = search_context
+                .map(|context| context.fork_for_candidate(alternative.column_stats.clone()));
             let (root_plan, root_state) = alternative.plan.try_fold_post_order(
                 |plan, child_states: Vec<BuildState>| -> Result<(LogicalPlan, BuildState)> {
                     has_contextual_shape |= is_contextual_operator(&plan.operator);
@@ -632,10 +631,7 @@ impl MemoBuilder {
                             ) =>
                         {
                             crate::search::optimizer::SearchOptimizer::new()
-                                .physical_candidate_for_root(
-                                    duplicate_plan_preserving_indices(&plan, bind_shared.as_ref()),
-                                    search_context,
-                                )?
+                                .physical_candidate_for_root(&plan, search_context)?
                         }
                         _ => None,
                     };

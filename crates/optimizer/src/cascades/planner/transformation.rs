@@ -393,7 +393,7 @@ impl TransformationRule for PlannerTransformationRule {
                     let Some(expression) = stage_transformed_expression(
                         StagingRequest {
                             plan,
-                            column_stats: Arc::new(column_stats),
+                            column_stats,
                             target: StagingTarget {
                                 group: target_group,
                                 rule: self.id(),
@@ -534,7 +534,7 @@ fn rewrite_planner_expression(
                 environment.session.clone(),
                 environment.bind_context.clone(),
             );
-            context.column_stats = column_stats.clone();
+            context.column_stats = Arc::new(column_stats.clone());
             context.cost_model = environment.cost_model.clone();
             context.verify_enabled = environment.verify_enabled;
             let (plan, changed) = ReorderFilter::new().reorder_node(plan, &context);
@@ -734,7 +734,10 @@ fn rewrite_positive_consumed_mark_filter(plan: LogicalPlan) -> Option<LogicalPla
 fn settle_transformed_expression(
     mut plan: LogicalPlan,
     environment: &PlannerRuleEnvironment,
-) -> Result<(LogicalPlan, HashMap<ColumnBinding, Arc<ColumnStatistics>>)> {
+) -> Result<(
+    LogicalPlan,
+    Arc<HashMap<ColumnBinding, Arc<ColumnStatistics>>>,
+)> {
     // A group-local rewrite such as CTE substitution can expose a fresh
     // Filter(CrossProduct) boundary after the root canonicalization pass.
     // Stage only canonical join semantics so the equivalent expression is
@@ -765,7 +768,7 @@ fn settle_transformed_expression(
     plan = StatisticsGathering::new().gather(plan, &mut context)?;
     let mut propagator = StatisticsPropagator::new();
     plan = propagator.propagate(environment.session.clone(), plan);
-    context.column_stats = propagator.take_statistics_map();
+    context.column_stats = Arc::new(propagator.take_statistics_map());
     plan = StatisticsGathering::new().gather(plan, &mut context)?;
     plan = singleton_groups::optimize_plan(plan, &context.column_stats);
     plan = ColumnLifetimeAnalyzer::new(true).optimize(plan)?;

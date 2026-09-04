@@ -74,7 +74,7 @@ impl Default for GraphStatsCache {
 pub struct OptimizationContext {
     pub session: Arc<StatementContext>,
     pub bind_context: BindContext,
-    pub column_stats: HashMap<ColumnBinding, Arc<ColumnStatistics>>,
+    pub column_stats: Arc<HashMap<ColumnBinding, Arc<ColumnStatistics>>>,
     pub graph_stats: GraphStatsCache,
     pub cost_model: CostModel,
     pub verify_enabled: bool,
@@ -143,7 +143,7 @@ impl OptimizationContext {
             })),
             session,
             bind_context,
-            column_stats: HashMap::new(),
+            column_stats: Arc::new(HashMap::new()),
             cost_model: CostModel::default(),
             verify_enabled,
             profiler: OptimizerProfiler::default(),
@@ -158,13 +158,22 @@ impl OptimizationContext {
     /// must never change another alternative's join order or access path.
     pub(crate) fn fork_for_candidate(
         &self,
-        column_stats: HashMap<ColumnBinding, Arc<ColumnStatistics>>,
+        column_stats: Arc<HashMap<ColumnBinding, Arc<ColumnStatistics>>>,
     ) -> Self {
         let mut candidate = Self::new(self.session.clone(), self.bind_context.clone());
         candidate.column_stats = column_stats;
         candidate.cost_model = self.cost_model.clone();
         candidate.verify_enabled = self.verify_enabled;
         candidate
+    }
+
+    /// Mutate a candidate's statistics through copy-on-write. Read-only
+    /// physical alternatives share the immutable map; gathering detaches only
+    /// when it actually publishes a new fact.
+    pub(crate) fn column_stats_mut(
+        &mut self,
+    ) -> &mut HashMap<ColumnBinding, Arc<ColumnStatistics>> {
+        Arc::make_mut(&mut self.column_stats)
     }
 }
 

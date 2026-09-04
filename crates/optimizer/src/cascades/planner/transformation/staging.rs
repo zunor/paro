@@ -33,6 +33,22 @@ pub(super) struct StagingRegionRequirements {
     pub(super) inherited_runtime_filter_facet: Option<Fingerprint>,
 }
 
+fn contains_search_candidate_root(plan: &LogicalPlan) -> bool {
+    let mut pending = vec![plan];
+    while let Some(plan) = pending.pop() {
+        match &plan.operator {
+            LogicalOperator::TopN(_) => return true,
+            LogicalOperator::Filter(filter)
+                if matches!(filter.child.operator, LogicalOperator::Get(_)) =>
+            {
+                return true;
+            }
+            _ => pending.extend(plan.operator.children()),
+        }
+    }
+    false
+}
+
 pub(super) fn stage_transformed_expression(
     request: StagingRequest,
     memo: &mut Memo,
@@ -65,7 +81,7 @@ pub(super) fn stage_transformed_expression(
 
     struct StagingOptions<'a> {
         column_stats: &'a Arc<HashMap<ColumnBinding, Arc<ColumnStatistics>>>,
-        search_context: &'a crate::context::OptimizationContext,
+        search_context: Option<&'a crate::context::OptimizationContext>,
         rule: RuleId,
     }
 
@@ -211,17 +227,14 @@ pub(super) fn stage_transformed_expression(
         let logical_properties =
             derive_logical_properties(&semantic_plan.operator, &child_maximum_cardinalities);
         let output_rows_hard_upper = logical_properties.maximum_cardinality;
-        let search_candidate = if matches!(
-            &semantic_plan.operator,
-            LogicalOperator::TopN(_) | LogicalOperator::Filter(_)
-        ) {
-            crate::search::optimizer::SearchOptimizer::new().physical_candidate_for_root(
-                duplicate_plan_preserving_indices(
-                    &semantic_plan,
-                    state.bind_context.shared().as_ref(),
-                ),
-                options.search_context,
-            )?
+        let search_candidate = if let Some(search_context) = options.search_context.filter(|_| {
+            matches!(
+                &semantic_plan.operator,
+                LogicalOperator::TopN(_) | LogicalOperator::Filter(_)
+            )
+        }) {
+            crate::search::optimizer::SearchOptimizer::new()
+                .physical_candidate_for_root(&semantic_plan, search_context)?
         } else {
             None
         };
@@ -588,15 +601,20 @@ pub(super) fn stage_transformed_expression(
         ))
     }
 
-    let session_context = state
-        .session
-        .clone()
-        .ok_or_else(|| paro_error::internal("planner rule has no statement context"))?;
-    let mut search_context =
-        crate::context::OptimizationContext::new(session_context, state.bind_context.clone());
-    search_context.column_stats = column_stats.as_ref().clone();
-    search_context.cost_model = state.cost_model.clone();
-    search_context.verify_enabled = state.verify_enabled;
+    let search_context = if contains_search_candidate_root(&plan) {
+        let session_context = state
+            .session
+            .clone()
+            .ok_or_else(|| paro_error::internal("search planning has no statement context"))?;
+        let mut search_context =
+            crate::context::OptimizationContext::new(session_context, state.bind_context.clone());
+        search_context.column_stats = column_stats.clone();
+        search_context.cost_model = state.cost_model.clone();
+        search_context.verify_enabled = state.verify_enabled;
+        Some(search_context)
+    } else {
+        None
+    };
 
     let (root, staged, pending_runtime_filter_facets) = {
         let mut session = StagingSession {
@@ -604,7 +622,7 @@ pub(super) fn stage_transformed_expression(
             state,
             options: StagingOptions {
                 column_stats: &column_stats,
-                search_context: &search_context,
+                search_context: search_context.as_ref(),
                 rule,
             },
             pending_runtime_filter_facets: Vec::new(),
