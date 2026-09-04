@@ -37,10 +37,12 @@ pub(crate) enum DecodedPageAccess {
 // the probation path, so a single lookup cannot populate the decoded cache.
 const BITSHUFFLE_DECODE_GROUP_ROWS: usize = 8;
 // Full-page materialization is one contiguous SIMD pass, whereas sparse
-// gather repeatedly decodes groups and copies individual values. Bound that
-// representation advantage explicitly so analytical gathers can be admitted
-// without turning one- or two-row lookups on large pages into cache entries.
-const ANALYTICAL_GATHER_MAX_MATERIALIZATION_AMPLIFICATION: usize = 40;
+// gather repeatedly seeks, decodes an eight-row group, and copies individual
+// values. The calibrated bound still rejects point lookups (a 65K-row page
+// needs at least 64 independently selected rows), while admitting analytical
+// selections early enough that their first repeated scan does not pay both
+// sparse decoding and cache promotion.
+const ANALYTICAL_GATHER_MAX_MATERIALIZATION_AMPLIFICATION: usize = 128;
 
 fn analytical_gather_should_materialize(
     selected_rows: usize,
@@ -478,8 +480,8 @@ mod tests {
     fn analytical_gather_admission_has_bounded_decode_amplification() {
         assert!(!analytical_gather_should_materialize(2, 8_000, 65_536));
         assert!(!analytical_gather_should_materialize(64, 64, 65_536));
-        assert!(!analytical_gather_should_materialize(12, 4_096, 4_096));
-        assert!(analytical_gather_should_materialize(13, 4_096, 4_096));
+        assert!(!analytical_gather_should_materialize(3, 4_096, 4_096));
+        assert!(analytical_gather_should_materialize(4, 4_096, 4_096));
         assert!(analytical_gather_should_materialize(64, 8_000, 8_192));
         assert!(analytical_gather_should_materialize(512, 65_536, 65_536));
     }
