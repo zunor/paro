@@ -1279,6 +1279,9 @@ pub(crate) fn constrain_composed_cost_to_grant(
     // pool and are therefore preferences, not additive reservations. Clamp
     // only that elastic portion after composing the mandatory floors.
     if cost.memory_completion.is_runtime_capped() {
+        // A capped plan has no completion proof below its uncapped demand, so
+        // its resident peak denotes the admitted ceiling itself rather than a
+        // tighter estimate. The original demand remains in memory_completion.
         cost.apply_runtime_cap(grant.hard_memory_bytes, cost.minimum_memory_bytes)?;
     } else {
         cost.revocable_memory_target = cost.revocable_memory_target.min(
@@ -1308,13 +1311,6 @@ pub(crate) fn compose_candidate_cost_with_sources(
     child_source_work: &[&[SourceWork]],
     composition: CostComposition,
 ) -> Result<ComposedCost> {
-    local_cost.validate()?;
-    if let Some(filter_cost) = source_filter_apply_cost {
-        filter_cost.validate()?;
-    }
-    for child in child_costs {
-        child.validate()?;
-    }
     if child_costs.len() != child_source_work.len() {
         return Err(paro_error::internal(
             "cost composition has no source-work evidence for one or more children",

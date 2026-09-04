@@ -33,22 +33,6 @@ pub(super) struct StagingRegionRequirements {
     pub(super) inherited_runtime_filter_facet: Option<Fingerprint>,
 }
 
-fn contains_search_candidate_root(plan: &LogicalPlan) -> bool {
-    let mut pending = vec![plan];
-    while let Some(plan) = pending.pop() {
-        match &plan.operator {
-            LogicalOperator::TopN(_) => return true,
-            LogicalOperator::Filter(filter)
-                if matches!(filter.child.operator, LogicalOperator::Get(_)) =>
-            {
-                return true;
-            }
-            _ => pending.extend(plan.operator.children()),
-        }
-    }
-    false
-}
-
 pub(super) fn stage_transformed_expression(
     request: StagingRequest,
     memo: &mut Memo,
@@ -601,20 +585,23 @@ pub(super) fn stage_transformed_expression(
         ))
     }
 
-    let search_context = if contains_search_candidate_root(&plan) {
-        let session_context = state
-            .session
-            .clone()
-            .ok_or_else(|| paro_error::internal("search planning has no statement context"))?;
-        let mut search_context =
-            crate::context::OptimizationContext::new(session_context, state.bind_context.clone());
-        search_context.column_stats = column_stats.clone();
-        search_context.cost_model = state.cost_model.clone();
-        search_context.verify_enabled = state.verify_enabled;
-        Some(search_context)
-    } else {
-        None
-    };
+    let search_context =
+        if crate::search::optimizer::SearchOptimizer::contains_candidate_root(&plan) {
+            let session_context = state
+                .session
+                .clone()
+                .ok_or_else(|| paro_error::internal("search planning has no statement context"))?;
+            let mut search_context = crate::context::OptimizationContext::new(
+                session_context,
+                state.bind_context.clone(),
+            );
+            search_context.column_stats = column_stats.clone();
+            search_context.cost_model = state.cost_model.clone();
+            search_context.verify_enabled = state.verify_enabled;
+            Some(search_context)
+        } else {
+            None
+        };
 
     let (root, staged, pending_runtime_filter_facets) = {
         let mut session = StagingSession {

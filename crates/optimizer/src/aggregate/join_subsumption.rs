@@ -25,7 +25,7 @@ use paro_planner::expression::{
 };
 use paro_planner::operator::{
     Aggregate, ColumnBinding, ComparisonJoin, Get, Join, JoinComparisonType, JoinType,
-    LogicalOperator, ProjectionMap,
+    LogicalOperator, Projection, ProjectionMap,
 };
 use paro_planner::plan::LogicalPlan;
 
@@ -42,19 +42,20 @@ struct DetailScan {
     value_column_id: usize,
 }
 
-#[derive(Clone)]
-enum ExposureMutation {
+enum ExposureMutation<'a> {
     None,
     AppendProjection {
+        projection: &'a mut Projection,
         aggregate_binding: ColumnBinding,
         aggregate_type: LogicalType,
     },
 }
 
-struct ReductionExposure {
+struct ReductionExposure<'a> {
     output_binding: ColumnBinding,
     output_type: LogicalType,
-    mutation: ExposureMutation,
+    output_index: usize,
+    mutation: ExposureMutation<'a>,
 }
 
 /// Eliminate redundant detail scans covered by a filtered partial aggregate.
@@ -212,12 +213,12 @@ impl AggregateJoinSubsumption {
             .collect::<Vec<_>>();
         let rewritten_preserved_projection =
             Self::projection_for_binding_layout(&rewritten_preserved_bindings, &retained_bindings)?;
-        let partial_index = Self::exposed_output_index(reduction, &exposure)?;
+        let partial_index = exposure.output_index;
 
         if !Self::remove_detail_edge(preserved, preserved_key, &detail, outer_sum) {
             return None;
         }
-        Self::apply_exposure(reduction, &exposure.mutation);
+        Self::apply_exposure(exposure.mutation);
         *preserved_projection = rewritten_preserved_projection;
         join.join_type = JoinType::Inner;
         *reduction_projection = ProjectionMap::new(vec![partial_index]);
@@ -443,18 +444,21 @@ impl AggregateJoinSubsumption {
             return None;
         };
 
-        let exposure = Self::inspect_reduction(&*reduction, reduction_key, detail)?;
+        let exposure = Self::inspect_reduction(reduction, reduction_key, detail)?;
         let replacement = Self::replacement_sum(&exposure, outer_sum)?;
-        let partial_index = Self::exposed_output_index(reduction, &exposure)?;
+        let partial_index = exposure.output_index;
 
-        Self::apply_exposure(reduction, &exposure.mutation);
+        Self::apply_exposure(exposure.mutation);
         join.join_type = JoinType::Inner;
         *reduction_projection = ProjectionMap::new(vec![partial_index]);
 
         Some(replacement)
     }
 
-    fn replacement_sum(exposure: &ReductionExposure, outer_sum: &OuterSum) -> Option<Expression> {
+    fn replacement_sum(
+        exposure: &ReductionExposure<'_>,
+        outer_sum: &OuterSum,
+    ) -> Option<Expression> {
         let (function, target_types) = get_sum_function()
             .bind(std::slice::from_ref(&exposure.output_type))
             .ok()?;
@@ -479,50 +483,67 @@ impl AggregateJoinSubsumption {
         )))
     }
 
-    fn inspect_reduction(
-        plan: &LogicalPlan,
+    fn inspect_reduction<'a>(
+        plan: &'a mut LogicalPlan,
         reduction_key: ColumnBinding,
         detail: &DetailScan,
-    ) -> Option<ReductionExposure> {
-        if let LogicalOperator::Projection(projection) = &plan.operator {
-            if reduction_key.table_index != projection.table_index {
-                return None;
-            }
-            let projected_key =
-                Self::column_binding(projection.expressions.get(reduction_key.column_index)?)?;
-            let (aggregate_binding, aggregate_type) =
-                Self::inspect_reduction_core(projection.child.as_ref(), projected_key, detail)?;
-            if let Some((index, expression)) = projection
-                .expressions
-                .iter()
-                .enumerate()
-                .find(|(_, expression)| Self::column_binding(expression) == Some(aggregate_binding))
-            {
-                return Some(ReductionExposure {
-                    output_binding: ColumnBinding::new(projection.table_index, index),
-                    output_type: expression.return_type(),
-                    mutation: ExposureMutation::None,
-                });
-            }
-            return Some(ReductionExposure {
-                output_binding: ColumnBinding::new(
-                    projection.table_index,
-                    projection.expressions.len(),
-                ),
-                output_type: aggregate_type.clone(),
-                mutation: ExposureMutation::AppendProjection {
-                    aggregate_binding,
-                    aggregate_type,
-                },
-            });
+    ) -> Option<ReductionExposure<'a>> {
+        if matches!(plan.operator, LogicalOperator::Projection(_)) {
+            return Self::inspect_projected_reduction(plan, reduction_key, detail);
         }
 
         let (aggregate_binding, aggregate_type) =
-            Self::inspect_reduction_core(plan, reduction_key, detail)?;
+            Self::inspect_reduction_core(&*plan, reduction_key, detail)?;
+        let output_index = plan
+            .get_column_bindings()
+            .iter()
+            .position(|binding| *binding == aggregate_binding)?;
         Some(ReductionExposure {
             output_binding: aggregate_binding,
             output_type: aggregate_type,
+            output_index,
             mutation: ExposureMutation::None,
+        })
+    }
+
+    fn inspect_projected_reduction<'a>(
+        plan: &'a mut LogicalPlan,
+        reduction_key: ColumnBinding,
+        detail: &DetailScan,
+    ) -> Option<ReductionExposure<'a>> {
+        let LogicalOperator::Projection(projection) = &mut plan.operator else {
+            return None;
+        };
+        if reduction_key.table_index != projection.table_index {
+            return None;
+        }
+        let projected_key =
+            Self::column_binding(projection.expressions.get(reduction_key.column_index)?)?;
+        let (aggregate_binding, aggregate_type) =
+            Self::inspect_reduction_core(projection.child.as_ref(), projected_key, detail)?;
+        if let Some((index, expression)) = projection
+            .expressions
+            .iter()
+            .enumerate()
+            .find(|(_, expression)| Self::column_binding(expression) == Some(aggregate_binding))
+        {
+            return Some(ReductionExposure {
+                output_binding: ColumnBinding::new(projection.table_index, index),
+                output_type: expression.return_type(),
+                output_index: index,
+                mutation: ExposureMutation::None,
+            });
+        }
+        let output_index = projection.expressions.len();
+        Some(ReductionExposure {
+            output_binding: ColumnBinding::new(projection.table_index, output_index),
+            output_type: aggregate_type.clone(),
+            output_index,
+            mutation: ExposureMutation::AppendProjection {
+                projection,
+                aggregate_binding,
+                aggregate_type,
+            },
         })
     }
 
@@ -594,43 +615,26 @@ impl AggregateJoinSubsumption {
             })
     }
 
-    fn exposed_output_index(plan: &LogicalPlan, exposure: &ReductionExposure) -> Option<usize> {
-        match exposure.mutation {
-            ExposureMutation::None => plan
-                .get_column_bindings()
-                .iter()
-                .position(|binding| *binding == exposure.output_binding),
-            ExposureMutation::AppendProjection { .. } => {
-                let LogicalOperator::Projection(projection) = &plan.operator else {
-                    return None;
-                };
-                Some(projection.expressions.len())
-            }
-        }
-    }
-
-    fn apply_exposure(plan: &mut LogicalPlan, mutation: &ExposureMutation) {
+    fn apply_exposure(mutation: ExposureMutation<'_>) {
         let ExposureMutation::AppendProjection {
+            projection,
             aggregate_binding,
             aggregate_type,
         } = mutation
         else {
             return;
         };
-        let LogicalOperator::Projection(projection) = &mut plan.operator else {
-            unreachable!("an inspected projection exposure must remain a projection");
-        };
         projection
             .expressions
             .push(Expression::ColumnRef(ColumnRefExpression::new(
-                *aggregate_binding,
+                aggregate_binding,
                 aggregate_type.clone(),
             )));
         projection
             .visible_names
             .push("partial_aggregate".to_string());
         projection.visible_count += 1;
-        projection.returned_types.push(aggregate_type.clone());
+        projection.returned_types.push(aggregate_type);
     }
 
     fn direct_detail_get<'a>(plan: &'a LogicalPlan, outer_sum: &OuterSum) -> Option<&'a Get> {

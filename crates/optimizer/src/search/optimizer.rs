@@ -32,51 +32,63 @@ impl SearchOptimizer {
         Self
     }
 
-    pub fn rewrite(&mut self, plan: LogicalPlan, ctx: &OptimizationContext) -> Result<LogicalPlan> {
-        let plan = plan.try_map_children(|child| self.rewrite(child, ctx))?;
-        self.rewrite_current(plan, ctx)
-    }
-
     /// Derive a physical search payload for exactly this logical root.  It is
     /// intentionally non-recursive: the Memo builder attaches the payload to
     /// the matching Filter/TopN expression and keeps the logical expression
     /// itself provider- and capability-free.
     pub(crate) fn physical_candidate_for_root(
-        &mut self,
+        &self,
         plan: &LogicalPlan,
         ctx: &OptimizationContext,
     ) -> Result<Option<LogicalPlan>> {
-        match &plan.operator {
-            LogicalOperator::TopN(topn) if extract_topn_pattern(topn).is_some() => {
-                self.try_rewrite_topn(plan, topn, ctx)
-            }
-            LogicalOperator::Filter(filter)
-                if matches!(filter.child.operator, LogicalOperator::Get(_)) =>
-            {
-                self.try_rewrite_fulltext_filter(plan, filter, ctx)
-            }
+        let candidate = match &plan.operator {
+            LogicalOperator::TopN(topn) => match extract_topn_pattern(topn) {
+                Some(pattern) => self.try_rewrite_topn(plan, pattern, ctx),
+                None => Ok(None),
+            },
+            LogicalOperator::Filter(filter) => self.try_rewrite_fulltext_filter(plan, filter, ctx),
             _ => Ok(None),
+        }?;
+        if candidate.as_ref().is_some_and(|candidate| {
+            !matches!(
+                candidate.operator,
+                LogicalOperator::SearchScan(_) | LogicalOperator::FullTextFilterScan(_)
+            )
+        }) {
+            return Err(paro_error::internal(
+                "search rewrite produced a non-search physical candidate",
+            ));
         }
+        Ok(candidate)
     }
 
-    fn rewrite_current(
-        &mut self,
-        plan: LogicalPlan,
-        ctx: &OptimizationContext,
-    ) -> Result<LogicalPlan> {
-        let candidate = self.physical_candidate_for_root(&plan, ctx)?;
-        Ok(candidate.unwrap_or(plan))
+    /// Cheap structural guard for statement-context construction. Keep this
+    /// rooted in the exact same eligibility predicate as candidate derivation.
+    pub(crate) fn contains_candidate_root(plan: &LogicalPlan) -> bool {
+        let mut pending = vec![plan];
+        while let Some(plan) = pending.pop() {
+            let eligible = match &plan.operator {
+                LogicalOperator::TopN(topn) => extract_topn_pattern(topn).is_some(),
+                LogicalOperator::Filter(filter) => {
+                    matches!(filter.child.operator, LogicalOperator::Get(_))
+                }
+                _ => false,
+            };
+            if eligible {
+                return true;
+            }
+            pending.extend(plan.operator.children());
+        }
+        false
     }
 
     fn try_rewrite_topn(
         &self,
         plan: &LogicalPlan,
-        topn: &TopN,
+        pattern: TopNPattern<'_>,
         ctx: &OptimizationContext,
     ) -> Result<Option<LogicalPlan>> {
-        let Some(pattern) = extract_topn_pattern(topn) else {
-            return Ok(None);
-        };
+        let topn = pattern.topn;
         let vector_intent = extract_vector_intent(
             pattern.order_expr,
             pattern.get,
@@ -92,7 +104,8 @@ impl SearchOptimizer {
             return Ok(None);
         };
 
-        let candidate_filters = candidate_filters(&pattern.filters, pattern.get);
+        let filters = collect_filters(pattern.projection.child.as_ref());
+        let candidate_filters = candidate_filters(&filters, pattern.get);
         let base_rows = base_rows(pattern.get_plan, pattern.get);
         let filtered = ctx.cost_model.estimate_filter_cardinality(
             base_rows,
@@ -615,7 +628,6 @@ struct TopNPattern<'a> {
     get: &'a Get,
     order_expr_idx: usize,
     order_expr: &'a Expression,
-    filters: Vec<Expression>,
 }
 
 fn extract_topn_pattern(topn: &TopN) -> Option<TopNPattern<'_>> {
@@ -628,7 +640,7 @@ fn extract_topn_pattern(topn: &TopN) -> Option<TopNPattern<'_>> {
     };
     let order_expr_idx = order_expression_index(&topn.orders[0].expression)?;
     let order_expr = projection.expressions.get(order_expr_idx)?;
-    let (filters, get_plan) = find_filters_and_get_plan(projection.child.as_ref())?;
+    let get_plan = find_get_plan(projection.child.as_ref())?;
     let LogicalOperator::Get(get) = &get_plan.operator else {
         return None;
     };
@@ -639,7 +651,6 @@ fn extract_topn_pattern(topn: &TopN) -> Option<TopNPattern<'_>> {
         get,
         order_expr_idx,
         order_expr,
-        filters,
     })
 }
 
@@ -651,20 +662,26 @@ fn order_expression_index(expr: &Expression) -> Option<usize> {
     }
 }
 
-fn find_filters_and_get_plan(mut plan: &LogicalPlan) -> Option<(Vec<Expression>, &LogicalPlan)> {
-    let mut all_filters = Vec::new();
+fn find_get_plan(mut plan: &LogicalPlan) -> Option<&LogicalPlan> {
     loop {
         match &plan.operator {
             LogicalOperator::Filter(filter) => {
-                all_filters.extend(filter.expressions.iter().cloned());
                 plan = filter.child.as_ref();
             }
-            LogicalOperator::Get(_) => {
-                return Some((all_filters, plan));
-            }
+            LogicalOperator::Get(_) => return Some(plan),
             _ => return None,
         }
     }
+}
+
+fn collect_filters(mut plan: &LogicalPlan) -> Vec<Expression> {
+    let mut filters = Vec::new();
+    while let LogicalOperator::Filter(filter) = &plan.operator {
+        filters.extend(filter.expressions.iter().cloned());
+        plan = filter.child.as_ref();
+    }
+    debug_assert!(matches!(plan.operator, LogicalOperator::Get(_)));
+    filters
 }
 
 fn extract_vector_intent(
