@@ -124,6 +124,34 @@ class TpcdsResultContractTests(unittest.TestCase):
         with self.assertRaises(ResultContractError):
             parse_order_contract("SELECT 1 ORDER BY key", schema)
 
+    def test_duplicate_peer_equivalent_projection_can_bind_order_key(self) -> None:
+        schema = (
+            ColumnContract("key", "int32", "INTEGER"),
+            ColumnContract("key", "int32", "INTEGER"),
+        )
+
+        keys = parse_order_contract("SELECT key, key FROM t ORDER BY key", schema)
+
+        self.assertEqual([key.column for key in keys], [0])
+
+    def test_expression_normalization_preserves_quoted_contents(self) -> None:
+        schema = (
+            ColumnContract("literal", "string", "VARCHAR"),
+            ColumnContract("quoted", "int32", "INTEGER"),
+        )
+
+        literal = parse_order_contract(
+            "SELECT 'A B' AS literal, \"My Col\" AS quoted FROM t ORDER BY 'A B'",
+            schema,
+        )
+        quoted = parse_order_contract(
+            'SELECT \'A B\' AS literal, "My Col" AS quoted FROM t ORDER BY "My Col"',
+            schema,
+        )
+
+        self.assertEqual([key.column for key in literal], [0])
+        self.assertEqual([key.column for key in quoted], [1])
+
     def test_hierarchical_abba_resamples_fresh_process_blocks(self) -> None:
         result = hierarchical_abba_ratio(
             [

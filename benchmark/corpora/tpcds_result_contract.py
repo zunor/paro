@@ -264,18 +264,26 @@ def parse_order_contract(query: str, schema: Sequence[ColumnContract]) -> tuple[
             if not matches:
                 matches = select_expressions.get(_normalize_sql_expression(expression), [])
             if len(matches) > 1:
-                raise ResultContractError(
-                    "top-level ORDER BY expression is ambiguous in the result schema: "
-                    f"{expression!r}"
+                expression_matches = select_expressions.get(
+                    _normalize_sql_expression(expression), []
                 )
+                # Repeated projections of the same source expression induce
+                # identical peer groups. Either ordinal is therefore a valid
+                # witness for ORDER BY, while genuinely ambiguous aliases
+                # still fail closed.
+                if expression_matches != matches:
+                    raise ResultContractError(
+                        "top-level ORDER BY expression is ambiguous in the result schema: "
+                        f"{expression!r}"
+                    )
+                matches = matches[:1]
             column = matches[0] if matches else -1
         else:
             matches = select_expressions.get(_normalize_sql_expression(expression), [])
+            # Every entry under one normalized expression is peer-equivalent,
+            # so duplicate projections may use their first ordinal.
             if len(matches) > 1:
-                raise ResultContractError(
-                    "top-level ORDER BY expression is ambiguous in the result schema: "
-                    f"{expression!r}"
-                )
+                matches = matches[:1]
             column = matches[0] if matches else -1
         if not 0 <= column < len(schema):
             raise ResultContractError(
@@ -338,7 +346,27 @@ def _top_level_select_expressions(
 
 
 def _normalize_sql_expression(expression: str) -> str:
-    return re.sub(r"\s+", "", expression).lower()
+    """Normalize SQL outside quoted literals and identifiers only."""
+    result: list[str] = []
+    quote: str | None = None
+    index = 0
+    while index < len(expression):
+        character = expression[index]
+        if quote is not None:
+            result.append(character)
+            if character == quote:
+                if index + 1 < len(expression) and expression[index + 1] == quote:
+                    result.append(expression[index + 1])
+                    index += 1
+                else:
+                    quote = None
+        elif character in {"'", '"'}:
+            quote = character
+            result.append(character)
+        elif not character.isspace():
+            result.append(character.lower())
+        index += 1
+    return "".join(result)
 
 
 def assert_peer_order(
