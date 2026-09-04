@@ -232,15 +232,16 @@ impl PageCacheEntry {
         }
     }
 
-    /// A first sparse access leaves the page on probation. Repeated access is
-    /// evidence of reuse and promotes it into the decoded cache. Saturation
-    /// preserves that history without adding global admission metadata.
-    fn observe_sparse_decoded_access(&self) -> bool {
-        self.decoded_accesses
+    /// Record a sparse access while the page is on probation. Saturation
+    /// preserves frequency evidence without adding global admission metadata.
+    fn observe_sparse_decoded_access(&self) -> u8 {
+        let previous = self
+            .decoded_accesses
             .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |count| {
                 Some(count.saturating_add(1))
             })
-            .is_ok_and(|previous| previous > 0)
+            .expect("saturating sparse-access update cannot fail");
+        previous.saturating_add(1)
     }
 }
 
@@ -385,6 +386,11 @@ pub struct PageCacheStats {
     evictions: AtomicU64,
     entries: AtomicUsize,
     decoded_admission_rejections: AtomicU64,
+    decoded_hits: AtomicU64,
+    decoded_misses: AtomicU64,
+    decoded_first_touch_admissions: AtomicU64,
+    decoded_probation_promotions: AtomicU64,
+    decoded_policy_rejections: AtomicU64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -398,6 +404,11 @@ pub struct PageCacheStatsSnapshot {
     pub decoded_physical_bytes: usize,
     pub decoded_capacity: usize,
     pub decoded_admission_rejections: u64,
+    pub decoded_hits: u64,
+    pub decoded_misses: u64,
+    pub decoded_first_touch_admissions: u64,
+    pub decoded_probation_promotions: u64,
+    pub decoded_policy_rejections: u64,
 }
 
 impl PageCacheStats {
@@ -416,6 +427,13 @@ impl PageCacheStats {
             decoded_physical_bytes,
             decoded_capacity: decoded.options.decoded_capacity,
             decoded_admission_rejections: self.decoded_admission_rejections.load(Ordering::Relaxed),
+            decoded_hits: self.decoded_hits.load(Ordering::Relaxed),
+            decoded_misses: self.decoded_misses.load(Ordering::Relaxed),
+            decoded_first_touch_admissions: self
+                .decoded_first_touch_admissions
+                .load(Ordering::Relaxed),
+            decoded_probation_promotions: self.decoded_probation_promotions.load(Ordering::Relaxed),
+            decoded_policy_rejections: self.decoded_policy_rejections.load(Ordering::Relaxed),
         }
     }
 }
@@ -464,13 +482,30 @@ impl PageCache {
         self.stats.snapshot(&decoded, decoded_physical_bytes)
     }
 
-    /// Return whether a sparse codec access has demonstrated reuse and should
-    /// be promoted to the decoded cache. The probation counter shares the
-    /// lifetime of the physical page entry, keeping admission metadata bounded
-    /// by the page cache itself.
-    pub(crate) fn should_promote_sparse_decoded(&self, key: &PageKey) -> bool {
+    /// Record and return the page-local sparse-access frequency. The probation
+    /// counter shares the lifetime of the physical page entry, keeping
+    /// admission metadata bounded by the page cache itself.
+    pub(crate) fn observe_sparse_decoded_access(&self, key: &PageKey) -> Option<u8> {
         let entry = self.entries.read().unwrap().get(key).cloned();
-        entry.is_some_and(|entry| entry.observe_sparse_decoded_access())
+        entry.map(|entry| entry.observe_sparse_decoded_access())
+    }
+
+    pub(crate) fn record_decoded_first_touch_admission(&self) {
+        self.stats
+            .decoded_first_touch_admissions
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub(crate) fn record_decoded_probation_promotion(&self) {
+        self.stats
+            .decoded_probation_promotions
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub(crate) fn record_decoded_policy_rejection(&self) {
+        self.stats
+            .decoded_policy_rejections
+            .fetch_add(1, Ordering::Relaxed);
     }
 
     /// Non-blocking lookup for a cached page.
@@ -480,14 +515,14 @@ impl PageCache {
             guard.get(key).cloned()
         };
         let Some(entry) = entry else {
-            self.record_miss();
+            self.record_miss(kind);
             return None;
         };
 
         let slot_handle = {
             let state = entry.state.lock().unwrap();
             if state.removing {
-                self.record_miss();
+                self.record_miss(kind);
                 return None;
             }
             match state.slot(kind) {
@@ -498,7 +533,7 @@ impl PageCache {
                     slot.handle.clone()
                 }
                 PageSlotState::Empty | PageSlotState::Loading | PageSlotState::Failed(_) => {
-                    self.record_miss();
+                    self.record_miss(kind);
                     return None;
                 }
             }
@@ -508,12 +543,12 @@ impl PageCache {
             Some(buffer) => buffer,
             None => {
                 self.handle_unloaded(key, &entry, kind);
-                self.record_miss();
+                self.record_miss(kind);
                 return None;
             }
         };
 
-        self.record_hit();
+        self.record_hit(kind);
         Some(PageCacheHandle::new(buffer, kind))
     }
 
@@ -564,7 +599,7 @@ impl PageCache {
                     drop(state);
 
                     if let Some(buffer) = self.buffer_pool.pin_resident(slot_handle.block_id()) {
-                        self.record_hit();
+                        self.record_hit(kind);
                         return Ok(PageCacheHandle::new(buffer, kind));
                     }
                     self.handle_unloaded(&key, &entry, kind);
@@ -585,7 +620,7 @@ impl PageCache {
                     *state.slot_mut(kind) = PageSlotState::Loading;
                     drop(state);
 
-                    self.record_miss();
+                    self.record_miss(kind);
                     let data = match loader() {
                         Ok(data) => data,
                         Err(err) => {
@@ -653,7 +688,7 @@ impl PageCache {
                     }
                     drop(state);
                     if let Some(buffer) = self.buffer_pool.pin_resident(slot_handle.block_id()) {
-                        self.record_hit();
+                        self.record_hit(PageContentKind::Decoded);
                         return Ok(Some(PageCacheHandle::new(buffer, PageContentKind::Decoded)));
                     }
                     self.handle_unloaded(&key, &entry, PageContentKind::Decoded);
@@ -676,7 +711,7 @@ impl PageCache {
                 }
             }
 
-            self.record_miss();
+            self.record_miss(PageContentKind::Decoded);
             let Some(buffer) = self.try_allocate_decoded(key, size) else {
                 self.cancel_loading(&key, &entry, PageContentKind::Decoded);
                 self.stats
@@ -953,14 +988,20 @@ impl PageCache {
     }
 
     #[inline]
-    fn record_hit(&self) {
+    fn record_hit(&self, kind: PageContentKind) {
         self.stats.hits.fetch_add(1, Ordering::Relaxed);
+        if kind == PageContentKind::Decoded {
+            self.stats.decoded_hits.fetch_add(1, Ordering::Relaxed);
+        }
         storage_metrics().inc_page_cache_hit();
     }
 
     #[inline]
-    fn record_miss(&self) {
+    fn record_miss(&self, kind: PageContentKind) {
         self.stats.misses.fetch_add(1, Ordering::Relaxed);
+        if kind == PageContentKind::Decoded {
+            self.stats.decoded_misses.fetch_add(1, Ordering::Relaxed);
+        }
         storage_metrics().inc_page_cache_miss();
     }
 
@@ -1075,6 +1116,9 @@ mod tests {
         let bytes = handle.try_into_bytes().unwrap();
         assert_eq!(bytes.as_ptr(), cached_ptr);
         assert_eq!(bytes.as_ref(), &[1, 2, 3, 4]);
+        drop(cache.lookup(&key, PageContentKind::Decoded));
+        assert_eq!(cache.stats().decoded_misses, 1);
+        assert_eq!(cache.stats().decoded_hits, 1);
         assert!(cache.remove(&key));
         assert_eq!(bytes.as_ref(), &[1, 2, 3, 4]);
     }

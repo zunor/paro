@@ -21,7 +21,7 @@ use crate::rowset::encoding::{
 use crate::rowset::page::{
     EncodingType, NullEncoding, PageFooter, PageReadOptions, CURRENT_DATA_PAGE_FORMAT_VERSION,
 };
-use crate::rowset::page_reader::{DecodedPageAccess, PageReader};
+use crate::rowset::page_reader::{DecodedPageAccess, PageReader, BITSHUFFLE_DECODE_GROUP_ROWS};
 use crate::rowset::SegmentRowId;
 use bytes::Bytes;
 use paro_common::error::{self as paro_error, Result};
@@ -73,13 +73,16 @@ struct RowIdPageRun {
     span_start: u64,
     span_end: u64,
     span_len: usize,
+    decoded_groups: usize,
+    group_runs: usize,
 }
 
 impl RowIdPageRun {
     fn decoded_page_access(self) -> DecodedPageAccess {
         DecodedPageAccess::SparseGather {
             selected_rows: self.run_end - self.run_start,
-            span_rows: self.span_len,
+            decoded_groups: self.decoded_groups,
+            group_runs: self.group_runs,
         }
     }
 }
@@ -916,10 +919,27 @@ impl<R: Read + Seek> ScalarColumnIterator<R> {
         idx: &mut usize,
     ) -> Result<RowIdPageRun> {
         let page_idx = self.page_index_for_rowid(rowids.pair(*idx).1)?;
+        let page_start = self
+            .ordinal_index
+            .get_page(page_idx)
+            .ok_or_else(|| paro_error::data_corrupted("rowid page index disappeared"))?
+            .first_ordinal;
         let page_end = self.page_end_ordinal(page_idx);
         let run_start = *idx;
+        let mut previous_group =
+            (rowids.pair(*idx).1 - page_start) / BITSHUFFLE_DECODE_GROUP_ROWS as u64;
+        let mut decoded_groups = 1usize;
+        let mut group_runs = 1usize;
         *idx += 1;
         while *idx < rowids.len() && rowids.pair(*idx).1 < page_end {
+            let group = (rowids.pair(*idx).1 - page_start) / BITSHUFFLE_DECODE_GROUP_ROWS as u64;
+            if group != previous_group {
+                decoded_groups = decoded_groups.saturating_add(1);
+                if group != previous_group.saturating_add(1) {
+                    group_runs = group_runs.saturating_add(1);
+                }
+                previous_group = group;
+            }
             *idx += 1;
         }
 
@@ -934,6 +954,8 @@ impl<R: Read + Seek> ScalarColumnIterator<R> {
             span_start,
             span_end,
             span_len,
+            decoded_groups,
+            group_runs,
         })
     }
 

@@ -27,37 +27,73 @@ pub(crate) enum DecodedPageAccess {
     Sequential,
     SparseGather {
         selected_rows: usize,
-        span_rows: usize,
+        decoded_groups: usize,
+        group_runs: usize,
     },
 }
 
-// BitShuffle decodes sparse values in eight-row groups. First-access decoded
-// admission is reserved for analytical gathers whose estimated sparse work is
-// within a bounded factor of one full-page decode. Smaller point lookups retain
-// the probation path, so a single lookup cannot populate the decoded cache.
-const BITSHUFFLE_DECODE_GROUP_ROWS: usize = 8;
-// Full-page materialization is one contiguous SIMD pass, whereas sparse
-// gather repeatedly seeks, decodes an eight-row group, and copies individual
-// values. The calibrated bound still rejects point lookups (a 65K-row page
-// needs at least 64 independently selected rows), while admitting analytical
-// selections early enough that their first repeated scan does not pay both
-// sparse decoding and cache promotion.
-const ANALYTICAL_GATHER_MAX_MATERIALIZATION_AMPLIFICATION: usize = 128;
+pub(crate) const BITSHUFFLE_DECODE_GROUP_ROWS: usize = 8;
+
+/// Machine-independent work units for decoded-page first-touch admission.
+///
+/// One full materialization is a contiguous SIMD pass. Sparse decoding pays
+/// for each touched codec group and for every discontinuous decoder seek. The
+/// policy compares those two physical shapes and separately excludes point
+/// lookups; it does not infer reuse from a page-size ratio. Probation promotion
+/// uses the same work ratio as its reuse threshold, so an expensive full-page
+/// decode requires proportionally stronger observed-frequency evidence.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DecodedPageAdmissionPolicy {
+    pub min_analytical_selected_rows: usize,
+    pub sequential_decode_advantage: usize,
+    pub sparse_seek_penalty_rows: usize,
+}
+
+impl Default for DecodedPageAdmissionPolicy {
+    fn default() -> Self {
+        Self {
+            min_analytical_selected_rows: 16,
+            sequential_decode_advantage: BITSHUFFLE_DECODE_GROUP_ROWS,
+            sparse_seek_penalty_rows: 1024,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct DecodedPageWork {
+    sequential: usize,
+    sparse: usize,
+}
+
+impl DecodedPageWork {
+    fn promotion_accesses(self) -> usize {
+        self.sequential.div_ceil(self.sparse.max(1)).max(2)
+    }
+}
+
+fn decoded_page_work(
+    decoded_groups: usize,
+    group_runs: usize,
+    decoded_rows: usize,
+    policy: DecodedPageAdmissionPolicy,
+) -> Option<DecodedPageWork> {
+    if policy.sequential_decode_advantage == 0 {
+        return None;
+    }
+    Some(DecodedPageWork {
+        sequential: decoded_rows.div_ceil(policy.sequential_decode_advantage),
+        sparse: decoded_groups
+            .saturating_mul(BITSHUFFLE_DECODE_GROUP_ROWS)
+            .saturating_add(group_runs.saturating_mul(policy.sparse_seek_penalty_rows)),
+    })
+}
 
 fn analytical_gather_should_materialize(
     selected_rows: usize,
-    span_rows: usize,
-    decoded_rows: usize,
+    work: DecodedPageWork,
+    policy: DecodedPageAdmissionPolicy,
 ) -> bool {
-    let estimated_sparse_decode_rows = estimated_sparse_decode_rows(selected_rows, span_rows);
-    decoded_rows
-        <= estimated_sparse_decode_rows
-            .saturating_mul(ANALYTICAL_GATHER_MAX_MATERIALIZATION_AMPLIFICATION)
-}
-
-fn estimated_sparse_decode_rows(selected_rows: usize, span_rows: usize) -> usize {
-    let sparse_groups = selected_rows.min(span_rows.div_ceil(BITSHUFFLE_DECODE_GROUP_ROWS));
-    sparse_groups.saturating_mul(BITSHUFFLE_DECODE_GROUP_ROWS)
+    selected_rows >= policy.min_analytical_selected_rows && work.sequential <= work.sparse
 }
 
 /// Page reader context used for PageKey construction and version isolation.
@@ -85,6 +121,7 @@ impl PageReaderContext {
 pub struct PageReaderOptions {
     pub cache_decompressed: bool,
     pub cache_decoded: bool,
+    pub decoded_admission_policy: DecodedPageAdmissionPolicy,
     pub parallel_decompressor: Option<ParallelDecompressor>,
 }
 
@@ -93,6 +130,7 @@ impl Default for PageReaderOptions {
         Self {
             cache_decompressed: false,
             cache_decoded: false,
+            decoded_admission_policy: DecodedPageAdmissionPolicy::default(),
             parallel_decompressor: None,
         }
     }
@@ -278,12 +316,38 @@ impl PageReader {
             DecodedPageAccess::Sequential => true,
             DecodedPageAccess::SparseGather {
                 selected_rows,
-                span_rows,
+                decoded_groups,
+                group_runs,
             } => {
-                analytical_gather_should_materialize(selected_rows, span_rows, decoded_rows)
-                    || self.cache.as_ref().is_some_and(|cache| {
-                        cache.should_promote_sparse_decoded(&self.make_key(pointer))
-                    })
+                let Some(cache) = self.cache.as_ref().filter(|_| self.options.cache_decoded) else {
+                    return false;
+                };
+                let Some(work) = decoded_page_work(
+                    decoded_groups,
+                    group_runs,
+                    decoded_rows,
+                    self.options.decoded_admission_policy,
+                ) else {
+                    cache.record_decoded_policy_rejection();
+                    return false;
+                };
+                if analytical_gather_should_materialize(
+                    selected_rows,
+                    work,
+                    self.options.decoded_admission_policy,
+                ) {
+                    cache.record_decoded_first_touch_admission();
+                    true
+                } else if cache
+                    .observe_sparse_decoded_access(&self.make_key(pointer))
+                    .is_some_and(|accesses| usize::from(accesses) >= work.promotion_accesses())
+                {
+                    cache.record_decoded_probation_promotion();
+                    true
+                } else {
+                    cache.record_decoded_policy_rejection();
+                    false
+                }
             }
         }
     }
@@ -477,13 +541,98 @@ mod tests {
     }
 
     #[test]
-    fn analytical_gather_admission_has_bounded_decode_amplification() {
-        assert!(!analytical_gather_should_materialize(2, 8_000, 65_536));
-        assert!(!analytical_gather_should_materialize(64, 64, 65_536));
-        assert!(!analytical_gather_should_materialize(3, 4_096, 4_096));
-        assert!(analytical_gather_should_materialize(4, 4_096, 4_096));
-        assert!(analytical_gather_should_materialize(64, 8_000, 8_192));
-        assert!(analytical_gather_should_materialize(512, 65_536, 65_536));
+    fn analytical_gather_admission_compares_decode_and_seek_work() {
+        let policy = DecodedPageAdmissionPolicy::default();
+        let point = decoded_page_work(2, 2, 65_536, policy).unwrap();
+        let dense = decoded_page_work(8, 1, 65_536, policy).unwrap();
+        let clustered = decoded_page_work(8, 8, 65_536, policy).unwrap();
+        let scattered_i64 = decoded_page_work(16, 16, 32_768, policy).unwrap();
+        let scattered_i32 = decoded_page_work(64, 64, 65_536, policy).unwrap();
+        let broad = decoded_page_work(512, 500, 65_536, policy).unwrap();
+
+        assert!(!analytical_gather_should_materialize(2, point, policy));
+        assert!(!analytical_gather_should_materialize(64, dense, policy));
+        assert!(analytical_gather_should_materialize(64, clustered, policy));
+        assert!(!analytical_gather_should_materialize(
+            15,
+            scattered_i64,
+            policy
+        ));
+        assert!(analytical_gather_should_materialize(
+            16,
+            scattered_i64,
+            policy
+        ));
+        assert!(analytical_gather_should_materialize(
+            64,
+            scattered_i32,
+            policy
+        ));
+        assert!(analytical_gather_should_materialize(512, broad, policy));
+        assert!(dense.promotion_accesses() > broad.promotion_accesses());
+    }
+
+    #[test]
+    fn sparse_admission_paths_are_observable() {
+        let cache = Arc::new(PageCache::new(BufferPool::new_arc(1024 * 1024)));
+        let pointer = PagePointer::new(128, 64);
+        let reader = PageReader::new(
+            PageReaderContext::new(1, 2, 3, 4),
+            Some(cache.clone()),
+            PageReaderOptions {
+                cache_decoded: true,
+                ..PageReaderOptions::default()
+            },
+        );
+        cache
+            .insert(
+                reader.make_key(pointer),
+                PageContentKind::Compressed,
+                vec![1],
+            )
+            .unwrap();
+
+        assert!(reader.should_materialize_decoded(
+            pointer,
+            DecodedPageAccess::SparseGather {
+                selected_rows: 64,
+                decoded_groups: 64,
+                group_runs: 64,
+            },
+            65_536,
+        ));
+        let point_promotion_accesses =
+            decoded_page_work(1, 1, 65_536, DecodedPageAdmissionPolicy::default())
+                .unwrap()
+                .promotion_accesses();
+        for _ in 1..point_promotion_accesses {
+            assert!(!reader.should_materialize_decoded(
+                pointer,
+                DecodedPageAccess::SparseGather {
+                    selected_rows: 1,
+                    decoded_groups: 1,
+                    group_runs: 1,
+                },
+                65_536,
+            ));
+        }
+        assert!(reader.should_materialize_decoded(
+            pointer,
+            DecodedPageAccess::SparseGather {
+                selected_rows: 1,
+                decoded_groups: 1,
+                group_runs: 1,
+            },
+            65_536,
+        ));
+
+        let stats = cache.stats();
+        assert_eq!(stats.decoded_first_touch_admissions, 1);
+        assert_eq!(
+            stats.decoded_policy_rejections,
+            u64::try_from(point_promotion_accesses - 1).unwrap()
+        );
+        assert_eq!(stats.decoded_probation_promotions, 1);
     }
 
     #[test]
@@ -572,6 +721,7 @@ mod tests {
             PageReaderOptions {
                 cache_decompressed: false,
                 cache_decoded: false,
+                decoded_admission_policy: Default::default(),
                 parallel_decompressor: Some(
                     ParallelDecompressor::new(Arc::new(default_allocator())).with_max_threads(4),
                 ),
@@ -640,6 +790,7 @@ mod tests {
             PageReaderOptions {
                 cache_decompressed: false,
                 cache_decoded: false,
+                decoded_admission_policy: Default::default(),
                 parallel_decompressor: Some(
                     ParallelDecompressor::new(Arc::new(default_allocator())).with_max_threads(4),
                 ),

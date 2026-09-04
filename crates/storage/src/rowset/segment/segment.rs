@@ -288,6 +288,7 @@ impl Segment {
             crate::rowset::page_reader::PageReaderOptions {
                 cache_decompressed: options.cache_decompressed,
                 cache_decoded: options.cache_decoded,
+                decoded_admission_policy: Default::default(),
                 parallel_decompressor: options.parallel_decompressor.clone(),
             },
         );
