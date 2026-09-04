@@ -9,17 +9,21 @@
 use paro_common::error::{self as paro_error, Result};
 
 use crate::expression::{Expression, ExpressionIterator};
-use crate::operator::{Join, LogicalOperator};
+use crate::operator::{Join, LogicalOperator, LogicalOutputLayout};
 
 /// Verify that a logical plan is ready for physical planning/execution.
 ///
 /// The planner must fully flatten dependent joins and remove subquery
 /// expressions before this point.
 pub fn verify_physical_planner_invariants(plan: &LogicalOperator) -> Result<()> {
-    verify_operator(plan)
+    plan.try_fold_ref_post_order(|operator, child_layouts| {
+        verify_operator(operator, child_layouts)?;
+        Ok(operator.output_layout_from_children(child_layouts))
+    })
+    .map(|_| ())
 }
 
-fn verify_operator(op: &LogicalOperator) -> Result<()> {
+fn verify_operator(op: &LogicalOperator, child_layouts: &[LogicalOutputLayout]) -> Result<()> {
     match op {
         LogicalOperator::DependentJoin(_) => {
             return Err(paro_error::internal(
@@ -27,7 +31,7 @@ fn verify_operator(op: &LogicalOperator) -> Result<()> {
             ));
         }
         LogicalOperator::Filter(filter) => {
-            filter.projection_map.validate(filter.child.types().len())?;
+            filter.projection_map.validate(child_layouts[0].len())?;
             for expr in &filter.expressions {
                 verify_expression(expr)?;
             }
@@ -59,13 +63,13 @@ fn verify_operator(op: &LogicalOperator) -> Result<()> {
             }
         }
         LogicalOperator::Order(order) => {
-            order.projection_map.validate(order.child.types().len())?;
+            order.projection_map.validate(child_layouts[0].len())?;
             for order in &order.orders {
                 verify_expression(&order.expression)?;
             }
         }
         LogicalOperator::TopN(topn) => {
-            topn.projection_map.validate(topn.child.types().len())?;
+            topn.projection_map.validate(child_layouts[0].len())?;
             for order in &topn.orders {
                 verify_expression(&order.expression)?;
             }
@@ -104,10 +108,10 @@ fn verify_operator(op: &LogicalOperator) -> Result<()> {
             Join::Comparison(comp_join) => {
                 comp_join
                     .left_projection_map
-                    .validate(comp_join.left.types().len())?;
+                    .validate(child_layouts[0].len())?;
                 comp_join
                     .right_projection_map
-                    .validate(comp_join.right.types().len())?;
+                    .validate(child_layouts[1].len())?;
                 for expr in &comp_join.duplicate_eliminated_columns {
                     verify_expression(expr)?;
                 }
@@ -129,10 +133,10 @@ fn verify_operator(op: &LogicalOperator) -> Result<()> {
             Join::Any(any_join) => {
                 any_join
                     .left_projection_map
-                    .validate(any_join.left.types().len())?;
+                    .validate(child_layouts[0].len())?;
                 any_join
                     .right_projection_map
-                    .validate(any_join.right.types().len())?;
+                    .validate(child_layouts[1].len())?;
                 verify_expression(&any_join.condition)?;
             }
             Join::Cross(_) => {}
@@ -196,10 +200,6 @@ fn verify_operator(op: &LogicalOperator) -> Result<()> {
             }
         }
         _ => {}
-    }
-
-    for child in op.children() {
-        verify_operator(&child.operator)?;
     }
 
     Ok(())
@@ -271,7 +271,9 @@ mod tests {
         WindowExpression, WindowFrame, WindowFrameBound, WindowFrameType,
     };
     use crate::operator::projection::Projection;
-    use crate::operator::{ColumnBinding, DependentJoin, ExpressionGet, LogicalOperator, TopN};
+    use crate::operator::{
+        ColumnBinding, DependentJoin, ExpressionGet, Filter, LogicalOperator, TopN,
+    };
     use crate::plan::LogicalPlan;
     use crate::plan::PlannedStatement;
     use paro_common::runtime_value::Value;
@@ -427,5 +429,28 @@ mod tests {
         ));
 
         verify_physical_planner_invariants(&plan).expect("verify should pass");
+    }
+
+    #[test]
+    fn verify_reuses_child_layouts_on_a_deep_filter_chain() {
+        const DEPTH: usize = 10_000;
+        const TEST_STACK_BYTES: usize = 512 * 1024;
+
+        std::thread::Builder::new()
+            .name("deep-plan-verifier".to_string())
+            .stack_size(TEST_STACK_BYTES)
+            .spawn(|| {
+                let ctx = BindContext::new();
+                let mut plan = wrap(&ctx, expression_get(0));
+                for _ in 0..DEPTH {
+                    plan = wrap(&ctx, LogicalOperator::Filter(Filter::new(plan, Vec::new())));
+                }
+
+                verify_physical_planner_invariants(&plan.operator)
+                    .expect("deep valid plan should verify with a bounded native stack");
+            })
+            .expect("verifier thread should start")
+            .join()
+            .expect("verifier thread should not overflow its stack");
     }
 }

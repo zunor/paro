@@ -319,6 +319,55 @@ impl LogicalOperator {
         }
     }
 
+    /// Fold a borrowed plan in post-order with one caller-owned state per
+    /// subtree and a bounded native stack.
+    ///
+    /// Read-only validation and analysis passes use this counterpart to
+    /// [`LogicalPlan::try_fold_post_order`] so they can reuse completed child
+    /// facts instead of starting a fresh subtree traversal at every node.
+    pub fn try_fold_ref_post_order<State>(
+        &self,
+        mut fold: impl FnMut(&LogicalOperator, &[State]) -> Result<State>,
+    ) -> Result<State> {
+        struct Frame<'a, State> {
+            operator: &'a LogicalOperator,
+            remaining: std::vec::IntoIter<&'a LogicalPlan>,
+            child_states: Vec<State>,
+        }
+
+        impl<'a, State> Frame<'a, State> {
+            fn new(operator: &'a LogicalOperator) -> Self {
+                let children = operator.children();
+                let child_count = children.len();
+                Self {
+                    operator,
+                    remaining: children.into_iter(),
+                    child_states: Vec::with_capacity(child_count),
+                }
+            }
+        }
+
+        let mut stack = vec![Frame::new(self)];
+        loop {
+            let frame = stack
+                .last_mut()
+                .expect("borrowed post-order traversal retains its root frame");
+            if let Some(child) = frame.remaining.next() {
+                stack.push(Frame::new(&child.operator));
+                continue;
+            }
+
+            let completed = stack
+                .pop()
+                .expect("borrowed post-order traversal retains its completed frame");
+            let state = fold(completed.operator, &completed.child_states)?;
+            let Some(parent) = stack.last_mut() else {
+                return Ok(state);
+            };
+            parent.child_states.push(state);
+        }
+    }
+
     pub fn visit_children_mut<F>(&mut self, mut f: F) -> ControlFlow<()>
     where
         F: for<'a> FnMut(&'a mut LogicalPlan) -> ControlFlow<()>,
