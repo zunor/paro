@@ -213,7 +213,7 @@ impl Optimizer {
                 canonical,
                 self.binder.bind_context.shared().as_ref(),
             )?;
-            let baseline = self.settle_query_candidate(baseline_input)?;
+            let baseline = self.settle_relational_baseline(baseline_input)?;
             let distinct_feasibility_candidate =
                 self.distinct_aggregate_feasibility_candidate(distinct_input)?;
             alternatives.push(baseline.into_alternative(if index == 0 {
@@ -735,7 +735,7 @@ impl Optimizer {
         normalize_scalar_expressions(&mut plan);
 
         CommonAggregateOptimizer::new().optimize(&mut plan);
-        plan = DelimJoinElimination::new().optimize_plan(plan);
+        plan = DelimJoinElimination::canonical().optimize_plan(plan);
         plan = EmptyResultPullup::new().optimize_plan(plan);
         plan = JoinPredicateNormalizer::new(&self.ctx.bind_context).optimize_plan(plan)?;
         plan = InClauseRewriter::new().rewrite(plan)?;
@@ -758,7 +758,6 @@ impl Optimizer {
         normalize_scalar_expressions(&mut plan);
         plan = FilterPushdown::new().rewrite_plan(plan);
         plan = EmptyResultPullup::new().optimize_plan(plan);
-
         if self.ctx.verify_enabled {
             verify_logical_plan(&self.ctx.bind_context, &plan)?;
         }
@@ -821,6 +820,31 @@ impl Optimizer {
             return Ok(None);
         }
         self.settle_query_candidate(plan).map(Some)
+    }
+
+    fn settle_relational_baseline(&self, plan: LogicalPlan) -> Result<CandidatePlan> {
+        // Direct two-valued existence decorrelation and sibling-marker folding
+        // erase only delimiter carriers and multiplicity that no SQL result can
+        // observe. They therefore define the baseline relational form rather
+        // than a cost choice. Specialized correlated candidates are forked
+        // before this boundary and retain the carrier required by their proofs.
+        let plan = DelimJoinElimination::projected_existence().optimize_plan(plan);
+        // Marker observability is encoded by executable projection maps. Settle
+        // once before recognizing a disjunction, then rebuild statistics and
+        // layouts exactly once if either normalization changes the tree.
+        let candidate = self.settle_query_candidate(plan)?;
+        let (plan, disjunction_changed) = crate::subquery::existence_disjunction::optimize_plan(
+            candidate.plan,
+            &self.ctx.bind_context,
+        )?;
+        let (plan, reduction_changed) = crate::subquery::existence_reduction::optimize_plan(plan)?;
+        if !disjunction_changed && !reduction_changed {
+            return Ok(CandidatePlan {
+                plan,
+                column_stats: candidate.column_stats,
+            });
+        }
+        self.settle_query_candidate(plan)
     }
 
     fn correlated_aggregate_candidate(&self, plan: LogicalPlan) -> Result<CandidatePlan> {

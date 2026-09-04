@@ -11,7 +11,8 @@ use paro_planner::expression::{
     OperatorExpression, OperatorType,
 };
 use paro_planner::operator::{
-    ComparisonJoin, Filter, Join, JoinComparisonType, JoinCondition, JoinType, LogicalOperator,
+    ColumnBinding, ComparisonJoin, DelimGet, Filter, Join, JoinBuildSideConstraint,
+    JoinComparisonType, JoinCondition, JoinType, LogicalOperator,
 };
 use paro_planner::plan::LogicalPlan;
 use paro_planner::visitor::LogicalOperatorVisitor;
@@ -19,7 +20,9 @@ use paro_planner::visitor::LogicalOperatorVisitor;
 use crate::expression::binding_replacer::{ColumnBindingReplacer, ReplacementBinding};
 
 /// Remove redundant joins against `DelimGet`.
-pub struct DelimJoinElimination;
+pub struct DelimJoinElimination {
+    projected_existence: bool,
+}
 
 struct ExistenceDecorrelation {
     conditions: Vec<JoinCondition>,
@@ -27,8 +30,20 @@ struct ExistenceDecorrelation {
 }
 
 impl DelimJoinElimination {
-    pub fn new() -> Self {
-        Self
+    /// Canonical delimiter cleanup shared by every logical candidate.
+    pub fn canonical() -> Self {
+        Self {
+            projected_existence: false,
+        }
+    }
+
+    /// The broader existence-region alternative may consume a two-valued
+    /// marker directly. Keeping this out of canonicalization preserves the
+    /// original delimiter shape for specialized correlated-region proofs.
+    pub fn projected_existence() -> Self {
+        Self {
+            projected_existence: true,
+        }
     }
 
     pub fn optimize_plan(&mut self, plan: LogicalPlan) -> LogicalPlan {
@@ -50,9 +65,11 @@ impl DelimJoinElimination {
             return LogicalOperator::Join(Join::Comparison(join));
         }
 
-        if let Some(rewrite) = Self::plan_existence_decorrelation(&join) {
+        if let Some(rewrite) = self.plan_existence_decorrelation(&join) {
             return LogicalOperator::Join(Join::Comparison(Self::decorrelate_existence(
-                join, rewrite,
+                join,
+                rewrite,
+                self.projected_existence,
             )));
         }
 
@@ -97,22 +114,30 @@ impl DelimJoinElimination {
 
     /// Collapse the canonical correlated-EXISTS shape into one comparison
     /// join. The delimiter cross product only supplies the current outer
-    /// correlation tuple; once the marker is consumed as SEMI/ANTI, the same
-    /// tuple is already available directly from the preserved side.
+    /// correlation tuple; the same tuple is already available directly from
+    /// the preserved side of a two-valued MARK, SEMI, or ANTI join.
     ///
     /// ```text
-    /// outer SEMI/ANTI projection(filter(base CROSS delim))
-    ///   -> outer SEMI/ANTI base
+    /// outer existence-join projection(filter(base CROSS delim))
+    ///   -> outer existence-join base
     /// ```
     ///
     /// Correlation predicates are rebound from delim columns to their outer
     /// expressions. This removes both delimiter materialization and the second
     /// hash table while preserving arbitrary side-local work below `base`.
-    fn plan_existence_decorrelation(join: &ComparisonJoin) -> Option<ExistenceDecorrelation> {
-        if !matches!(join.join_type, JoinType::Semi | JoinType::Anti)
+    fn plan_existence_decorrelation(
+        &self,
+        join: &ComparisonJoin,
+    ) -> Option<ExistenceDecorrelation> {
+        let consumed_existence = matches!(join.join_type, JoinType::Semi | JoinType::Anti)
+            && join.mark_index.is_none()
+            && join.mark_semantics == paro_planner::operator::MarkJoinSemantics::NotMark;
+        let two_valued_marker = self.projected_existence
+            && join.join_type == JoinType::Mark
+            && join.mark_index.is_some()
+            && join.mark_semantics == paro_planner::operator::MarkJoinSemantics::TwoValued;
+        if !(consumed_existence || two_valued_marker)
             || join.delim_flipped
-            || join.mark_index.is_some()
-            || join.mark_semantics != paro_planner::operator::MarkJoinSemantics::NotMark
             || join.anti_join_mode != paro_planner::operator::AntiJoinMode::Regular
             || join.conditions.len() != join.duplicate_eliminated_columns.len()
             || join
@@ -129,11 +154,23 @@ impl DelimJoinElimination {
         let LogicalOperator::Filter(filter) = &filter_plan.operator else {
             return None;
         };
-        let (delim, base, correlated_join_conditions) = match &filter.child.operator {
+        let (delim, base_bindings, correlated_join_conditions) = match &filter.child.operator {
+            LogicalOperator::Join(Join::Cross(_)) if self.projected_existence => {
+                let (delim, base_bindings) = cross_delim_region(filter.child.as_ref())?;
+                (delim, base_bindings, None)
+            }
             LogicalOperator::Join(Join::Cross(cross)) => {
                 match (&cross.left.operator, &cross.right.operator) {
-                    (LogicalOperator::DelimGet(delim), _) => (delim, cross.right.as_ref(), None),
-                    (_, LogicalOperator::DelimGet(delim)) => (delim, cross.left.as_ref(), None),
+                    (LogicalOperator::DelimGet(delim), _) => (
+                        delim,
+                        cross.right.get_column_bindings().into_iter().collect(),
+                        None,
+                    ),
+                    (_, LogicalOperator::DelimGet(delim)) => (
+                        delim,
+                        cross.left.get_column_bindings().into_iter().collect(),
+                        None,
+                    ),
                     _ => return None,
                 }
             }
@@ -145,16 +182,30 @@ impl DelimJoinElimination {
                     &correlated_join.left.operator,
                     &correlated_join.right.operator,
                 ) {
-                    (LogicalOperator::DelimGet(delim), _) => (
-                        delim,
-                        correlated_join.right.as_ref(),
-                        Some(correlated_join.conditions.as_slice()),
-                    ),
-                    (_, LogicalOperator::DelimGet(delim)) => (
-                        delim,
-                        correlated_join.left.as_ref(),
-                        Some(correlated_join.conditions.as_slice()),
-                    ),
+                    (LogicalOperator::DelimGet(delim), _) => {
+                        let base_bindings = correlated_join
+                            .right
+                            .get_column_bindings()
+                            .into_iter()
+                            .collect();
+                        (
+                            delim,
+                            base_bindings,
+                            Some(correlated_join.conditions.as_slice()),
+                        )
+                    }
+                    (_, LogicalOperator::DelimGet(delim)) => {
+                        let base_bindings = correlated_join
+                            .left
+                            .get_column_bindings()
+                            .into_iter()
+                            .collect();
+                        (
+                            delim,
+                            base_bindings,
+                            Some(correlated_join.conditions.as_slice()),
+                        )
+                    }
                     _ => return None,
                 }
             }
@@ -166,10 +217,6 @@ impl DelimJoinElimination {
         if !outer_conditions_bind_exact_delim_columns(join, delim.table_index) {
             return None;
         }
-        let base_bindings = base
-            .get_column_bindings()
-            .into_iter()
-            .collect::<HashSet<_>>();
         let mut conditions = Vec::new();
         for condition in correlated_join_conditions.into_iter().flatten() {
             if !condition
@@ -227,12 +274,13 @@ impl DelimJoinElimination {
     fn decorrelate_existence(
         mut join: ComparisonJoin,
         rewrite: ExistenceDecorrelation,
+        projected_existence: bool,
     ) -> ComparisonJoin {
         let right = *std::mem::replace(
             &mut join.right,
             Box::new(LogicalPlan::synthetic(LogicalOperator::DummyScan)),
         );
-        let base = match take_existence_base(right) {
+        let base = match take_existence_base(right, projected_existence) {
             Ok(base) => base,
             Err(right) => {
                 // The rewrite planner and extractor deliberately have separate
@@ -254,6 +302,11 @@ impl DelimJoinElimination {
         let mut direct = ComparisonJoin::new(join.join_type, *join.left, base, rewrite.conditions);
         direct.anti_join_mode = join.anti_join_mode;
         direct.left_projection_map = join.left_projection_map;
+        if join.join_type == JoinType::Mark {
+            direct.mark_index = join.mark_index;
+            direct.mark_semantics = join.mark_semantics;
+            direct.right_projection_map = join.right_projection_map;
+        }
         direct
     }
 
@@ -508,13 +561,54 @@ impl DelimJoinElimination {
     }
 
     fn contains_delim_get(plan: &LogicalPlan) -> bool {
-        if Self::operator_is_delim_get(&plan.operator) {
-            return true;
+        let mut pending = vec![plan];
+        while let Some(plan) = pending.pop() {
+            if Self::operator_is_delim_get(&plan.operator) {
+                return true;
+            }
+            pending.extend(plan.children());
         }
-        plan.children()
-            .iter()
-            .any(|child| Self::contains_delim_get(child))
+        false
     }
+}
+
+/// Prove that an unconstrained cross-product region contains exactly one
+/// delimiter leaf and return the complete binding domain of every other leaf.
+/// The region may contain any number of side-local relations; treating only a
+/// direct `base CROSS delim` as canonical makes decorrelation depend on parser
+/// join associativity.
+fn cross_delim_region(plan: &LogicalPlan) -> Option<(&DelimGet, HashSet<ColumnBinding>)> {
+    let mut pending = vec![plan];
+    let mut delim = None;
+    let mut base_bindings = HashSet::new();
+    let mut base_leaves = 0usize;
+    while let Some(plan) = pending.pop() {
+        match &plan.operator {
+            LogicalOperator::Join(Join::Cross(cross)) => {
+                if cross.build_side_constraint != JoinBuildSideConstraint::Either {
+                    return None;
+                }
+                pending.push(cross.right.as_ref());
+                pending.push(cross.left.as_ref());
+            }
+            LogicalOperator::DelimGet(candidate) => {
+                if delim.replace(candidate).is_some() {
+                    return None;
+                }
+            }
+            _ => {
+                if DelimJoinElimination::contains_delim_get(plan) {
+                    return None;
+                }
+                base_leaves += 1;
+                base_bindings.extend(plan.get_column_bindings());
+            }
+        }
+    }
+    if base_leaves == 0 {
+        return None;
+    }
+    Some((delim?, base_bindings))
 }
 
 fn conjunction_terms(expression: &Expression) -> Vec<&Expression> {
@@ -532,11 +626,14 @@ fn conjunction_terms(expression: &Expression) -> Vec<&Expression> {
     }
 }
 
-fn take_existence_base(plan: LogicalPlan) -> Result<LogicalPlan, Box<LogicalPlan>> {
+fn take_existence_base(
+    plan: LogicalPlan,
+    projected_existence: bool,
+) -> Result<LogicalPlan, Box<LogicalPlan>> {
     let (id, stats, operator) = plan.into_parts();
     match operator {
         LogicalOperator::Projection(mut projection) => {
-            match take_existence_base(*projection.child) {
+            match take_existence_base(*projection.child, projected_existence) {
                 Ok(base) => Ok(base),
                 Err(child) => {
                     projection.child = child;
@@ -548,17 +645,19 @@ fn take_existence_base(plan: LogicalPlan) -> Result<LogicalPlan, Box<LogicalPlan
                 }
             }
         }
-        LogicalOperator::Filter(mut filter) => match take_existence_join_base(*filter.child) {
-            Ok(base) => Ok(base),
-            Err(child) => {
-                filter.child = child;
-                Err(Box::new(LogicalPlan {
-                    id,
-                    stats,
-                    operator: LogicalOperator::Filter(filter),
-                }))
+        LogicalOperator::Filter(mut filter) => {
+            match take_existence_join_base(*filter.child, projected_existence) {
+                Ok(base) => Ok(base),
+                Err(child) => {
+                    filter.child = child;
+                    Err(Box::new(LogicalPlan {
+                        id,
+                        stats,
+                        operator: LogicalOperator::Filter(filter),
+                    }))
+                }
             }
-        },
+        }
         operator => Err(Box::new(LogicalPlan {
             id,
             stats,
@@ -567,7 +666,10 @@ fn take_existence_base(plan: LogicalPlan) -> Result<LogicalPlan, Box<LogicalPlan
     }
 }
 
-fn take_existence_join_base(plan: LogicalPlan) -> Result<LogicalPlan, Box<LogicalPlan>> {
+fn take_existence_join_base(
+    plan: LogicalPlan,
+    projected_existence: bool,
+) -> Result<LogicalPlan, Box<LogicalPlan>> {
     let (id, stats, operator) = plan.into_parts();
     let LogicalOperator::Join(join) = operator else {
         return Err(Box::new(LogicalPlan {
@@ -577,11 +679,63 @@ fn take_existence_join_base(plan: LogicalPlan) -> Result<LogicalPlan, Box<Logica
         }));
     };
     match join {
-        Join::Cross(cross) if matches!(cross.left.operator, LogicalOperator::DelimGet(_)) => {
+        Join::Cross(cross)
+            if (!projected_existence
+                || cross.build_side_constraint == JoinBuildSideConstraint::Either)
+                && matches!(cross.left.operator, LogicalOperator::DelimGet(_)) =>
+        {
             Ok(*cross.right)
         }
-        Join::Cross(cross) if matches!(cross.right.operator, LogicalOperator::DelimGet(_)) => {
+        Join::Cross(cross)
+            if (!projected_existence
+                || cross.build_side_constraint == JoinBuildSideConstraint::Either)
+                && matches!(cross.right.operator, LogicalOperator::DelimGet(_)) =>
+        {
             Ok(*cross.left)
+        }
+        Join::Cross(mut cross)
+            if projected_existence
+                && cross.build_side_constraint == JoinBuildSideConstraint::Either =>
+        {
+            let left_has_delim = DelimJoinElimination::contains_delim_get(cross.left.as_ref());
+            let right_has_delim = DelimJoinElimination::contains_delim_get(cross.right.as_ref());
+            if left_has_delim == right_has_delim {
+                return Err(Box::new(LogicalPlan {
+                    id,
+                    stats,
+                    operator: LogicalOperator::Join(Join::Cross(cross)),
+                }));
+            }
+            if left_has_delim {
+                match take_existence_join_base(*cross.left, true) {
+                    Ok(base) => cross.left = Box::new(base),
+                    Err(left) => {
+                        cross.left = left;
+                        return Err(Box::new(LogicalPlan {
+                            id,
+                            stats,
+                            operator: LogicalOperator::Join(Join::Cross(cross)),
+                        }));
+                    }
+                }
+            } else {
+                match take_existence_join_base(*cross.right, true) {
+                    Ok(base) => cross.right = Box::new(base),
+                    Err(right) => {
+                        cross.right = right;
+                        return Err(Box::new(LogicalPlan {
+                            id,
+                            stats,
+                            operator: LogicalOperator::Join(Join::Cross(cross)),
+                        }));
+                    }
+                }
+            }
+            Ok(LogicalPlan {
+                id,
+                stats,
+                operator: LogicalOperator::Join(Join::Cross(cross)),
+            })
         }
         Join::Comparison(join) if matches!(join.left.operator, LogicalOperator::DelimGet(_)) => {
             Ok(*join.right)
@@ -834,7 +988,8 @@ mod tests {
     };
     use paro_planner::operator::{
         ColumnBinding, ComparisonJoin, CrossProduct, DelimGet, ExpressionGet, Filter, Join,
-        JoinComparisonType, JoinCondition, JoinType, LogicalOperator, Projection,
+        JoinComparisonType, JoinCondition, JoinType, LogicalOperator, MarkJoinSemantics,
+        Projection,
     };
     use paro_planner::plan::LogicalPlan;
 
@@ -936,7 +1091,7 @@ mod tests {
 
     #[test]
     fn decorrelates_existence_and_preserves_base_local_filters() {
-        let result = DelimJoinElimination::new().optimize_plan(LogicalPlan::synthetic(
+        let result = DelimJoinElimination::canonical().optimize_plan(LogicalPlan::synthetic(
             LogicalOperator::Join(Join::Comparison(correlated_existence_join(true))),
         ));
         let LogicalOperator::Join(Join::Comparison(join)) = &result.operator else {
@@ -955,8 +1110,73 @@ mod tests {
     }
 
     #[test]
+    fn decorrelates_two_valued_mark_over_a_multi_relation_cross_region() {
+        let outer = expression_get(0);
+        let fact = expression_get(1);
+        let dimension = expression_get(2);
+        let delim = LogicalPlan::synthetic(LogicalOperator::DelimGet(DelimGet::new(
+            99,
+            vec![LogicalType::Integer],
+        )));
+        let fact_and_delim = LogicalPlan::synthetic(LogicalOperator::Join(Join::Cross(
+            CrossProduct::new(fact, delim),
+        )));
+        let region = LogicalPlan::synthetic(LogicalOperator::Join(Join::Cross(CrossProduct::new(
+            fact_and_delim,
+            dimension,
+        ))));
+        let correlated = comparison(ComparisonType::Equal, column(1), column(99));
+        let side_local = comparison(ComparisonType::Equal, column(1), column(2));
+        let filtered = LogicalPlan::synthetic(LogicalOperator::Filter(Filter::new(
+            region,
+            vec![correlated, side_local],
+        )));
+        let projected = LogicalPlan::synthetic(LogicalOperator::Projection(Projection::new(
+            3,
+            filtered,
+            vec![column(99)],
+        )));
+        let mut join = ComparisonJoin::new(
+            JoinType::Mark,
+            outer,
+            projected,
+            vec![JoinCondition::new(
+                column(0),
+                column(3),
+                JoinComparisonType::NotDistinctFrom,
+            )],
+        );
+        join.mark_index = Some(4);
+        join.mark_semantics = MarkJoinSemantics::TwoValued;
+        join.duplicate_eliminated_columns = vec![column(0)];
+
+        let result = DelimJoinElimination::projected_existence().optimize_plan(
+            LogicalPlan::synthetic(LogicalOperator::Join(Join::Comparison(join))),
+        );
+        let LogicalOperator::Join(Join::Comparison(join)) = &result.operator else {
+            panic!("expected direct two-valued mark join");
+        };
+        assert_eq!(join.join_type, JoinType::Mark);
+        assert_eq!(join.mark_index, Some(4));
+        assert_eq!(join.mark_semantics, MarkJoinSemantics::TwoValued);
+        assert!(join.duplicate_eliminated_columns.is_empty());
+        assert_eq!(join.conditions.len(), 1);
+        let LogicalOperator::Filter(filter) = &join.right.operator else {
+            panic!("side-local predicate must remain over the independent cross region");
+        };
+        assert_eq!(filter.expressions.len(), 1);
+        assert!(matches!(
+            filter.child.operator,
+            LogicalOperator::Join(Join::Cross(_))
+        ));
+        assert!(!DelimJoinElimination::contains_delim_get(
+            join.right.as_ref()
+        ));
+    }
+
+    #[test]
     fn does_not_decorrelate_when_outer_join_does_not_bind_delim_output() {
-        let result = DelimJoinElimination::new().optimize_plan(LogicalPlan::synthetic(
+        let result = DelimJoinElimination::canonical().optimize_plan(LogicalPlan::synthetic(
             LogicalOperator::Join(Join::Comparison(correlated_existence_join(false))),
         ));
         let LogicalOperator::Join(Join::Comparison(join)) = &result.operator else {
@@ -980,7 +1200,7 @@ mod tests {
         };
         filter.expressions[0] = comparison(ComparisonType::Equal, volatile_call(), column(99));
 
-        let result = DelimJoinElimination::new().optimize_plan(LogicalPlan::synthetic(
+        let result = DelimJoinElimination::canonical().optimize_plan(LogicalPlan::synthetic(
             LogicalOperator::Join(Join::Comparison(join)),
         ));
         let LogicalOperator::Join(Join::Comparison(join)) = &result.operator else {
@@ -1041,7 +1261,7 @@ mod tests {
             ColumnRefExpression::new(ColumnBinding::new(0, 0), LogicalType::Integer),
         )];
 
-        let result = DelimJoinElimination::new().optimize_plan(LogicalPlan::synthetic(
+        let result = DelimJoinElimination::canonical().optimize_plan(LogicalPlan::synthetic(
             LogicalOperator::Join(Join::Comparison(root_join)),
         ));
 

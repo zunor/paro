@@ -5,6 +5,8 @@
 
 pub mod delim_join_elimination;
 pub mod empty_result;
+pub(crate) mod existence_disjunction;
+pub(crate) mod existence_reduction;
 pub(crate) mod output_contract;
 pub mod partition_aggregate;
 pub mod scalar_aggregate_fusion;
