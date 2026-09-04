@@ -98,7 +98,7 @@ pub fn fork_plan_preserving_indices(
     let (original, duplicate) = plan.try_fold_post_order(|plan, duplicate_children| {
         let duplicate_stats = plan.stats.clone();
         let mut original_children = Vec::new();
-        let skeleton = plan.try_map_children(|child| {
+        let skeleton = plan.try_rebuild_children_preserving_stats(|child| {
             original_children.push(child);
             Ok(LogicalPlan::synthetic(LogicalOperator::DummyScan))
         })?;
@@ -109,7 +109,7 @@ pub fn fork_plan_preserving_indices(
         let duplicate_operator = copier.copy_operator(&skeleton.operator, bind_shared);
 
         let mut original_children = original_children.into_iter();
-        let original = skeleton.try_map_children(|_| {
+        let original = skeleton.try_rebuild_children_preserving_stats(|_| {
             original_children
                 .next()
                 .ok_or_else(|| paro_error::internal("plan fork lost an original child"))
@@ -126,7 +126,7 @@ pub fn fork_plan_preserving_indices(
             operator: duplicate_operator,
         };
         let mut duplicate_children = duplicate_children.into_iter();
-        duplicate = duplicate.try_map_children(|_| {
+        duplicate = duplicate.try_rebuild_children_preserving_stats(|_| {
             duplicate_children
                 .next()
                 .ok_or_else(|| paro_error::internal("plan fork lost a duplicate child"))

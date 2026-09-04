@@ -143,9 +143,11 @@ pub(crate) fn declared_unique_keys(get: &Get) -> Vec<DeclaredUniqueKey> {
 
 /// Return cached keys as stable output bindings for statistics consumers.
 pub(crate) fn proven_unique_keys(plan: &LogicalPlan) -> Vec<Vec<ColumnBinding>> {
+    let layout = plan.output_layout();
     plan.stats
         .unique_keys
         .iter()
+        .filter(|key| key_matches_layout(key, &layout))
         .map(|key| key.columns.iter().map(|column| column.binding).collect())
         .collect()
 }
@@ -177,10 +179,12 @@ fn expressions_cover_key(
     expressions: &[&Expression],
     required_provenance: Option<UniqueKeyProvenance>,
 ) -> bool {
+    let layout = plan.output_layout();
     !expressions.is_empty()
         && plan.stats.unique_keys.iter().any(|key| {
             required_provenance.is_none_or(|required| key.provenance == required)
                 && !key.columns.is_empty()
+                && key_matches_layout(key, &layout)
                 && key.columns.iter().all(|column| {
                     expressions.iter().any(|expression| match expression {
                         Expression::Reference(reference) => reference.index == column.output_index,
@@ -191,6 +195,19 @@ fn expressions_cover_key(
                     })
                 })
         })
+}
+
+/// Cached witnesses are usable only while both halves of every positional
+/// identity still describe the current output slot. Treat a mismatch as an
+/// optimization miss: a cache is never allowed to manufacture a semantic
+/// uniqueness proof.
+fn key_matches_layout(
+    key: &UniqueKey,
+    layout: &paro_planner::operator::LogicalOutputLayout,
+) -> bool {
+    key.columns
+        .iter()
+        .all(|column| layout.bindings().get(column.output_index).copied() == Some(column.binding))
 }
 
 /// Derive and cache keys for one node whose children have already completed
@@ -580,6 +597,10 @@ fn remap_unique_keys_by_binding(
     output_layout: &paro_planner::operator::LogicalOutputLayout,
     structural: bool,
 ) -> Vec<UniqueKey> {
+    // A ColumnBinding names one logical value even when a projection exposes
+    // it more than once, so choosing the first matching output slot preserves
+    // the key proof. Consumers still validate that slot against the binding
+    // before turning the cached witness into a physical contract.
     keys.iter()
         .filter_map(|key| {
             let columns = key
@@ -611,7 +632,8 @@ fn remap_unique_keys_by_binding(
 #[cfg(test)]
 mod tests {
     use paro_common::types::LogicalType;
-    use paro_planner::expression::ColumnRefExpression;
+    use paro_planner::expression::{ColumnRefExpression, ReferenceExpression};
+    use paro_planner::operator::ExpressionGet;
 
     use super::*;
 
@@ -655,5 +677,26 @@ mod tests {
 
         let incomplete = NullRejectedKeyProof::from_equal_right_keys(&conditions[..1]).unwrap();
         assert!(!key.is_unique_with_nulls_rejected(&incomplete));
+    }
+
+    #[test]
+    fn stale_positional_key_fails_closed_against_current_layout() {
+        let mut plan = LogicalPlan::synthetic(LogicalOperator::ExpressionGet(ExpressionGet::new(
+            7,
+            Vec::new(),
+            vec!["a".to_string(), "b".to_string()],
+            vec![LogicalType::BigInt, LogicalType::BigInt],
+        )));
+        plan.stats.unique_keys.push(UniqueKey::new(
+            [UniqueKeyColumn {
+                output_index: 0,
+                binding: ColumnBinding::new(7, 1),
+            }],
+            UniqueKeyProvenance::CatalogEnforced,
+        ));
+        let reference = Expression::Reference(ReferenceExpression::new(0, LogicalType::BigInt));
+
+        assert!(!expressions_cover_catalog_unique_key(&plan, &[&reference]));
+        assert!(proven_unique_keys(&plan).is_empty());
     }
 }

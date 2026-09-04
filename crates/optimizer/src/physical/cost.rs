@@ -324,11 +324,9 @@ impl SearchCost {
         self
     }
 
-    /// Replace one disjoint, attributed portion of this cost with a revised
-    /// version of the same work. This is the algebra used by non-local
-    /// filters: independent work remains unchanged and hard resource proofs
-    /// stay attached to the complete candidate.
-    /// Replace one attributed portion of divisible work.
+    /// Replace one attributed portion of divisible work with a revised
+    /// version of the same work. Independent work remains unchanged and hard
+    /// resource proofs stay attached to the complete candidate.
     ///
     /// The critical-path subtraction is valid only because source lanes and
     /// predicate application use `ParallelWorkProfile::Pipeline`: attributed

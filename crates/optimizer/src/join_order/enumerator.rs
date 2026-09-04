@@ -767,7 +767,7 @@ mod tests {
             query_graph.create_edge(&left, Arc::clone(&right), Some(Arc::clone(&filter)));
             query_graph.create_edge(&right, Arc::clone(&left), Some(filter));
         }
-        let mut cost_model = CostModel::new();
+        let mut cost_model = CostModel::new(crate::cost_model::SelectivityDefaults::default());
         cost_model.init_cost_model(
             &mut set_manager,
             &[
@@ -825,7 +825,7 @@ mod tests {
     #[test]
     fn test_plan_enumerator_init_leaf_plans() {
         let mut set_manager = JoinRelationSetManager::new();
-        let mut cost_model = CostModel::new();
+        let mut cost_model = CostModel::new(crate::cost_model::SelectivityDefaults::default());
         let query_graph = QueryGraphEdges::new();
 
         // Initialize cost model
@@ -852,7 +852,7 @@ mod tests {
     #[test]
     fn greedy_missing_input_is_not_reported_as_semantic_ineligibility() {
         let mut set_manager = JoinRelationSetManager::new();
-        let mut cost_model = CostModel::new();
+        let mut cost_model = CostModel::new(crate::cost_model::SelectivityDefaults::default());
         let query_graph = QueryGraphEdges::new();
         cost_model.init_cost_model(
             &mut set_manager,
@@ -876,7 +876,7 @@ mod tests {
     #[test]
     fn test_plan_enumerator_two_relations() {
         let mut set_manager = JoinRelationSetManager::new();
-        let mut cost_model = CostModel::new();
+        let mut cost_model = CostModel::new(crate::cost_model::SelectivityDefaults::default());
         let mut query_graph = QueryGraphEdges::new();
 
         // Create join filter
@@ -915,7 +915,7 @@ mod tests {
     #[test]
     fn test_plan_enumerator_three_relations_chain() {
         let mut set_manager = JoinRelationSetManager::new();
-        let mut cost_model = CostModel::new();
+        let mut cost_model = CostModel::new(crate::cost_model::SelectivityDefaults::default());
         let mut query_graph = QueryGraphEdges::new();
 
         // Create chain: A - B - C
@@ -967,7 +967,7 @@ mod tests {
     #[test]
     fn test_plan_enumerator_cross_product() {
         let mut set_manager = JoinRelationSetManager::new();
-        let mut cost_model = CostModel::new();
+        let mut cost_model = CostModel::new(crate::cost_model::SelectivityDefaults::default());
         let query_graph = QueryGraphEdges::new();
 
         // No join conditions - will need cross product
@@ -993,7 +993,7 @@ mod tests {
     #[test]
     fn test_plan_enumerator_approximate() {
         let mut set_manager = JoinRelationSetManager::new();
-        let mut cost_model = CostModel::new();
+        let mut cost_model = CostModel::new(crate::cost_model::SelectivityDefaults::default());
         let query_graph = QueryGraphEdges::new();
 
         // Create many relations to trigger approximate algorithm

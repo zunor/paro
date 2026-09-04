@@ -350,36 +350,64 @@ fn order_conjuncts_by_selectivity(
     let Some(storage) = table.get_storage() else {
         return;
     };
-    // Hints are non-negative finite values or +infinity, whose IEEE bit
-    // ordering is the same as numeric ordering. Cache them so sorting several
-    // dynamic filters does not repeatedly aggregate table statistics.
-    predicates
-        .sort_by_cached_key(|predicate| predicate_selectivity_hint(predicate, storage).to_bits());
+    // Cache hints so sorting several dynamic filters does not repeatedly
+    // aggregate table statistics. Cost class and evidence are distinct:
+    // unknown selectivity must not masquerade as a proven 100% predicate.
+    predicates.sort_by_cached_key(|predicate| {
+        let hint = predicate_ordering_hint(predicate, storage);
+        (
+            hint.cost_class,
+            hint.selectivity.is_none(),
+            hint.selectivity.unwrap_or(1.0).clamp(0.0, 1.0).to_bits(),
+            hint.fallback_rank,
+        )
+    });
 }
 
-fn predicate_selectivity_hint(
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+enum PredicateCostClass {
+    Fixed,
+    General,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct PredicateOrderingHint {
+    selectivity: Option<f64>,
+    cost_class: PredicateCostClass,
+    /// A non-selectivity tie breaker for predicates with no domain bound.
+    /// Exact membership lists retain useful relative ordering without being
+    /// mislabeled as a fraction in the absence of an NDV denominator.
+    fallback_rank: u64,
+}
+
+fn predicate_ordering_hint(
     tree: &PredicateTree,
     storage: &paro_storage::table::table_handle::TableHandle,
-) -> f64 {
+) -> PredicateOrderingHint {
     match tree {
         PredicateTree::Leaf(predicate) => {
             let Some(column_id) = predicate.index_column_id() else {
-                return 1.0;
+                return PredicateOrderingHint {
+                    selectivity: None,
+                    cost_class: PredicateCostClass::General,
+                    fallback_rank: u64::MAX,
+                };
             };
             let distinct = storage
                 .column_statistics(column_id as usize)
                 .map(|statistics| statistics.get_distinct_count())
                 .filter(|distinct| *distinct > 0)
                 .map(|distinct| distinct as f64);
-            match predicate {
-                Predicate::Eq { .. } => distinct.map_or(1.0, |count| 1.0 / count),
-                Predicate::In { values, .. } => distinct.map_or(values.len() as f64, |count| {
-                    (values.len() as f64 / count).clamp(0.0, 1.0)
-                }),
-                Predicate::FixedIn { values, .. } => distinct
-                    .map_or(values.len() as f64, |count| {
-                        (values.len() as f64 / count).clamp(0.0, 1.0)
-                    }),
+            let (selectivity, fallback_rank) = match predicate {
+                Predicate::Eq { .. } => (distinct.map(|count| 1.0 / count), 1),
+                Predicate::In { values, .. } => (
+                    distinct.map(|count| (values.len() as f64 / count).clamp(0.0, 1.0)),
+                    values.len() as u64,
+                ),
+                Predicate::FixedIn { values, .. } => (
+                    distinct.map(|count| (values.len() as f64 / count).clamp(0.0, 1.0)),
+                    values.len() as u64,
+                ),
                 predicate @ (Predicate::Range { .. }
                 | Predicate::Ge { .. }
                 | Predicate::Le { .. }
@@ -395,47 +423,81 @@ fn predicate_selectivity_hint(
                         Predicate::Lt { value, .. } => (None, Some(value), true, false),
                         _ => unreachable!("ordered predicate shape was matched"),
                     };
-                    storage
-                        .column_statistics(column_id as usize)
-                        .and_then(|statistics| {
-                            ordered_range_selectivity_bounds(
-                                &statistics.statistics().min_value()?,
-                                &statistics.statistics().max_value()?,
-                                lower,
-                                upper,
-                                lower_inclusive,
-                                upper_inclusive,
-                            )
-                        })
-                        .unwrap_or(1.0)
+                    (
+                        storage
+                            .column_statistics(column_id as usize)
+                            .and_then(|statistics| {
+                                ordered_range_selectivity_bounds(
+                                    &statistics.statistics().min_value()?,
+                                    &statistics.statistics().max_value()?,
+                                    lower,
+                                    upper,
+                                    lower_inclusive,
+                                    upper_inclusive,
+                                )
+                            }),
+                        u64::MAX,
+                    )
                 }
-                _ => f64::INFINITY,
+                _ => {
+                    return PredicateOrderingHint {
+                        selectivity: None,
+                        cost_class: PredicateCostClass::General,
+                        fallback_rank: u64::MAX,
+                    };
+                }
+            };
+            PredicateOrderingHint {
+                selectivity,
+                cost_class: PredicateCostClass::Fixed,
+                fallback_rank,
             }
         }
         PredicateTree::And(children) => {
             let mut product = 1.0;
+            let mut known = true;
+            let mut zero = false;
+            let mut cost_class = PredicateCostClass::Fixed;
             for child in children {
-                let hint = predicate_selectivity_hint(child, storage);
-                if hint == 0.0 {
-                    return 0.0;
+                let hint = predicate_ordering_hint(child, storage);
+                cost_class = cost_class.max(hint.cost_class);
+                match hint.selectivity {
+                    Some(selectivity) => {
+                        zero |= selectivity == 0.0;
+                        product *= selectivity;
+                    }
+                    None => known = false,
                 }
-                if !hint.is_finite() {
-                    return f64::INFINITY;
-                }
-                product *= hint;
             }
-            product
+            PredicateOrderingHint {
+                selectivity: if zero {
+                    Some(0.0)
+                } else if known {
+                    Some(product.clamp(0.0, 1.0))
+                } else {
+                    None
+                },
+                cost_class,
+                fallback_rank: u64::MAX,
+            }
         }
         PredicateTree::Or(children) => {
             let mut sum = 0.0;
+            let mut known = true;
+            let mut cost_class = PredicateCostClass::Fixed;
             for child in children {
-                let hint = predicate_selectivity_hint(child, storage);
-                if !hint.is_finite() {
-                    return f64::INFINITY;
+                let hint = predicate_ordering_hint(child, storage);
+                cost_class = cost_class.max(hint.cost_class);
+                match hint.selectivity {
+                    Some(selectivity) => sum += selectivity,
+                    None => known = false,
                 }
-                sum += hint;
             }
-            sum
+            PredicateOrderingHint {
+                selectivity: known.then(|| sum.clamp(0.0, 1.0)),
+                cost_class,
+                fallback_rank: u64::MAX,
+            }
         }
     }
 }
@@ -511,7 +573,7 @@ fn ordered_range_selectivity_bounds(
     };
     let (upper_domain, mut upper) = match upper {
         Some(upper) => ordered_range_coordinate(upper)?,
-        None => (minimum_domain, maximum),
+        None => (maximum_domain, maximum),
     };
     if minimum_domain != maximum_domain
         || minimum_domain != lower_domain

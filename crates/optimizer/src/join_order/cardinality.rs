@@ -329,7 +329,7 @@ impl CardinalityHelper {
 /// counts of joined columns. If you have two tables A and B joined using A.x = B.y,
 /// we assume that each tuple in A will match ~ B/distinct(y) tuples in B.
 /// The cardinality estimation then becomes (|A|*|B|) / max(distinct(x), distinct(y)).
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub struct CardinalityEstimator {
     /// Shared priors used by both logical expression costing and join-order
     /// enumeration when no distributional evidence is available.
@@ -365,9 +365,21 @@ pub struct CardinalityEstimator {
 }
 
 impl CardinalityEstimator {
-    /// Create a new CardinalityEstimator.
-    pub fn new() -> Self {
-        Self::default()
+    /// Create an estimator with the statement's shared selectivity priors.
+    pub fn new(selectivity_defaults: SelectivityDefaults) -> Self {
+        Self {
+            selectivity_defaults,
+            relation_set_stats: Vec::new(),
+            equality_graphs: Vec::new(),
+            equality_pair_class_frequency: HashMap::new(),
+            equality_graphs_dirty: false,
+            equality_scratch: EqualityDenominatorScratch::default(),
+            binding_stats: HashMap::new(),
+            relation_unique_keys: HashMap::new(),
+            relation_cardinalities: HashMap::new(),
+            relation_set_2_cardinality: HashMap::new(),
+            set_manager: JoinRelationSetManager::new(),
+        }
     }
 
     /// Initialize equivalent relations from filter information.
@@ -1488,15 +1500,18 @@ mod tests {
 
     #[test]
     fn test_cardinality_estimator_new() {
-        let estimator = CardinalityEstimator::new();
+        let mut defaults = SelectivityDefaults::default();
+        defaults.range = 0.42;
+        let estimator = CardinalityEstimator::new(defaults);
         assert!(estimator.relation_set_stats.is_empty());
         assert!(estimator.relation_set_2_cardinality.is_empty());
+        assert_eq!(estimator.selectivity_defaults.range, 0.42);
     }
 
     #[test]
     fn test_init_equivalent_relations_single_filter() {
         let mut set_manager = JoinRelationSetManager::new();
-        let mut estimator = CardinalityEstimator::new();
+        let mut estimator = CardinalityEstimator::new(SelectivityDefaults::default());
 
         let filter = create_single_column_filter(&mut set_manager, 0, 0, 0);
         estimator.init_equivalent_relations(&[filter]);
@@ -1510,7 +1525,7 @@ mod tests {
     #[test]
     fn test_init_equivalent_relations_join_filter() {
         let mut set_manager = JoinRelationSetManager::new();
-        let mut estimator = CardinalityEstimator::new();
+        let mut estimator = CardinalityEstimator::new(SelectivityDefaults::default());
 
         let filter = create_equality_filter(&mut set_manager, 0, 0, 1, 0, 0);
         estimator.init_equivalent_relations(&[filter]);
@@ -1527,7 +1542,7 @@ mod tests {
     #[test]
     fn test_init_equivalent_relations_transitive() {
         let mut set_manager = JoinRelationSetManager::new();
-        let mut estimator = CardinalityEstimator::new();
+        let mut estimator = CardinalityEstimator::new(SelectivityDefaults::default());
 
         // A.x = B.y and B.y = C.z should create one equivalence class
         let filter1 = create_equality_filter(&mut set_manager, 0, 0, 1, 0, 0);
@@ -1551,7 +1566,7 @@ mod tests {
     #[test]
     fn merging_equivalence_classes_retains_all_join_edges() {
         let mut set_manager = JoinRelationSetManager::new();
-        let mut estimator = CardinalityEstimator::new();
+        let mut estimator = CardinalityEstimator::new(SelectivityDefaults::default());
 
         let filter_ab = create_equality_filter(&mut set_manager, 0, 0, 1, 0, 0);
         let filter_cd = create_equality_filter(&mut set_manager, 2, 0, 3, 0, 1);
@@ -1566,7 +1581,7 @@ mod tests {
     #[test]
     fn test_init_cardinality_estimator_props() {
         let mut set_manager = JoinRelationSetManager::new();
-        let mut estimator = CardinalityEstimator::new();
+        let mut estimator = CardinalityEstimator::new(SelectivityDefaults::default());
 
         // Initialize with a filter first
         let filter = create_equality_filter(&mut set_manager, 0, 0, 1, 0, 0);
@@ -1589,7 +1604,7 @@ mod tests {
     #[test]
     fn test_estimate_cardinality_single_relation() {
         let mut set_manager = JoinRelationSetManager::new();
-        let mut estimator = CardinalityEstimator::new();
+        let mut estimator = CardinalityEstimator::new(SelectivityDefaults::default());
 
         // Initialize relation 0
         let set0 = set_manager.get_relation(0);
@@ -1604,7 +1619,7 @@ mod tests {
     #[test]
     fn test_estimate_cardinality_join() {
         let mut set_manager = JoinRelationSetManager::new();
-        let mut estimator = CardinalityEstimator::new();
+        let mut estimator = CardinalityEstimator::new(SelectivityDefaults::default());
 
         // Create join filter
         let filter = create_equality_filter(&mut set_manager, 0, 0, 1, 0, 0);
@@ -1633,7 +1648,7 @@ mod tests {
     #[test]
     fn range_join_selectivity_does_not_depend_on_marginal_ndv() {
         let mut set_manager = JoinRelationSetManager::new();
-        let mut estimator = CardinalityEstimator::new();
+        let mut estimator = CardinalityEstimator::new(SelectivityDefaults::default());
         let range =
             create_comparison_filter(&mut set_manager, 0, 0, 1, 0, 0, ComparisonType::GreaterThan);
         estimator.init_equivalent_relations(&[range]);
@@ -1653,7 +1668,7 @@ mod tests {
     #[test]
     fn range_residual_refines_equality_join_with_distribution_free_prior() {
         let mut set_manager = JoinRelationSetManager::new();
-        let mut estimator = CardinalityEstimator::new();
+        let mut estimator = CardinalityEstimator::new(SelectivityDefaults::default());
         let filters = vec![
             create_equality_filter(&mut set_manager, 0, 0, 1, 0, 0),
             create_comparison_filter(&mut set_manager, 0, 1, 1, 1, 1, ComparisonType::GreaterThan),
@@ -1680,7 +1695,7 @@ mod tests {
     #[test]
     fn parallel_equality_classes_do_not_assume_composite_key_independence() {
         let mut set_manager = JoinRelationSetManager::new();
-        let mut estimator = CardinalityEstimator::new();
+        let mut estimator = CardinalityEstimator::new(SelectivityDefaults::default());
         let filters = vec![
             create_equality_filter(&mut set_manager, 0, 0, 1, 0, 0),
             create_equality_filter(&mut set_manager, 0, 1, 1, 1, 1),
@@ -1719,7 +1734,7 @@ mod tests {
     #[test]
     fn declared_composite_key_provides_a_joint_equality_domain() {
         let mut set_manager = JoinRelationSetManager::new();
-        let mut estimator = CardinalityEstimator::new();
+        let mut estimator = CardinalityEstimator::new(SelectivityDefaults::default());
         let filters = vec![
             create_equality_filter(&mut set_manager, 0, 0, 1, 0, 0),
             create_equality_filter(&mut set_manager, 0, 1, 1, 1, 1),
@@ -1756,7 +1771,7 @@ mod tests {
     #[test]
     fn parallel_key_correlation_survives_a_larger_equivalence_scope() {
         let mut set_manager = JoinRelationSetManager::new();
-        let mut estimator = CardinalityEstimator::new();
+        let mut estimator = CardinalityEstimator::new(SelectivityDefaults::default());
         let filters = vec![
             // part.partkey = lineitem.partkey = partsupp.partkey
             create_equality_filter(&mut set_manager, 0, 0, 1, 0, 0),
@@ -1801,7 +1816,7 @@ mod tests {
     #[test]
     fn filtered_dimension_and_composite_key_keep_fact_join_cardinality() {
         let mut set_manager = JoinRelationSetManager::new();
-        let mut estimator = CardinalityEstimator::new();
+        let mut estimator = CardinalityEstimator::new(SelectivityDefaults::default());
         let filters = vec![
             create_equality_filter(&mut set_manager, 0, 0, 2, 0, 0),
             create_equality_filter(&mut set_manager, 1, 0, 2, 0, 1),
@@ -1845,7 +1860,7 @@ mod tests {
     #[test]
     fn composite_fact_join_stays_large_across_transitive_dimensions() {
         let mut set_manager = JoinRelationSetManager::new();
-        let mut estimator = CardinalityEstimator::new();
+        let mut estimator = CardinalityEstimator::new(SelectivityDefaults::default());
         let filters = vec![
             create_equality_filter(&mut set_manager, 0, 0, 2, 0, 0),
             create_equality_filter(&mut set_manager, 1, 0, 2, 1, 1),
@@ -1887,7 +1902,7 @@ mod tests {
     #[test]
     fn transitive_triangles_align_composite_key_domains() {
         let mut set_manager = JoinRelationSetManager::new();
-        let mut estimator = CardinalityEstimator::new();
+        let mut estimator = CardinalityEstimator::new(SelectivityDefaults::default());
         let filters = vec![
             // part_key equivalence class. The dimension-to-partsupp edge is
             // inferred transitively and creates a triangle.
@@ -1936,7 +1951,7 @@ mod tests {
     #[test]
     fn star_correlation_only_removes_owned_denominator_factors() {
         let mut set_manager = JoinRelationSetManager::new();
-        let mut estimator = CardinalityEstimator::new();
+        let mut estimator = CardinalityEstimator::new(SelectivityDefaults::default());
         let filters = vec![
             create_equality_filter(&mut set_manager, 0, 0, 1, 0, 0),
             create_equality_filter(&mut set_manager, 0, 0, 2, 0, 1),
@@ -1970,7 +1985,7 @@ mod tests {
     #[test]
     fn parallel_self_join_edges_retain_every_owned_factor() {
         let mut set_manager = JoinRelationSetManager::new();
-        let mut estimator = CardinalityEstimator::new();
+        let mut estimator = CardinalityEstimator::new(SelectivityDefaults::default());
         let filters = vec![
             // One equality class has three binding vertices but only two
             // relation aliases. Both tree edges therefore belong to pair
@@ -2022,7 +2037,7 @@ mod tests {
     #[test]
     fn filtered_relation_domains_produce_a_nonzero_join_estimate() {
         let mut set_manager = JoinRelationSetManager::new();
-        let mut estimator = CardinalityEstimator::new();
+        let mut estimator = CardinalityEstimator::new(SelectivityDefaults::default());
         let filter = create_equality_filter(&mut set_manager, 0, 0, 1, 0, 0);
         estimator.init_equivalent_relations(&[filter]);
 
@@ -2043,7 +2058,7 @@ mod tests {
     #[test]
     fn semi_join_uses_the_build_side_distinct_domain() {
         let mut set_manager = JoinRelationSetManager::new();
-        let mut estimator = CardinalityEstimator::new();
+        let mut estimator = CardinalityEstimator::new(SelectivityDefaults::default());
         let filter = create_semi_anti_filter(&mut set_manager, JoinType::Semi);
         estimator.init_equivalent_relations(&[filter]);
 
@@ -2066,7 +2081,7 @@ mod tests {
     #[test]
     fn anti_join_estimates_the_unmatched_preserved_rows() {
         let mut set_manager = JoinRelationSetManager::new();
-        let mut estimator = CardinalityEstimator::new();
+        let mut estimator = CardinalityEstimator::new(SelectivityDefaults::default());
         let filter = create_semi_anti_filter(&mut set_manager, JoinType::Anti);
         estimator.init_equivalent_relations(&[filter]);
 
@@ -2089,7 +2104,7 @@ mod tests {
     #[test]
     fn test_estimate_cardinality_cached() {
         let mut set_manager = JoinRelationSetManager::new();
-        let mut estimator = CardinalityEstimator::new();
+        let mut estimator = CardinalityEstimator::new(SelectivityDefaults::default());
 
         let set0 = set_manager.get_relation(0);
         let stats0 = RelationStats::with_cardinality(1000);
@@ -2162,7 +2177,7 @@ mod tests {
 
     #[test]
     fn test_remove_empty_total_domains() {
-        let mut estimator = CardinalityEstimator::new();
+        let mut estimator = CardinalityEstimator::new(SelectivityDefaults::default());
 
         // Add some stats
         let mut bindings1 = HashSet::new();

@@ -347,8 +347,13 @@ pub(super) fn extract_planner_tree(
             "physical extraction did not produce exactly one root",
         ));
     }
+    // Winner extraction substitutes equivalent child expressions and freezes
+    // physical projection maps. Rebuild every positional uniqueness witness
+    // once, on that final tree, before physical lowering is allowed to turn a
+    // catalog proof into an execution contract.
+    let plan = crate::statistics::unique_keys::refresh_unique_keys(plans.pop().unwrap())?;
     Ok(ExtractedWinnerTree {
-        plan: plans.pop().unwrap(),
+        plan,
         contracts,
         enforcers: extracted_enforcers,
         output_columns: root_output_columns
@@ -551,11 +556,9 @@ pub(super) fn enforce_result_presentation(
         LogicalProjection::new(bind_context.generate_table_index(), child, expressions)
             .with_visible_names(presentation.names.to_vec());
     let mut plan = LogicalPlan::new(bind_context, LogicalOperator::Projection(projection));
-    plan.stats = plan
-        .children()
-        .first()
-        .map(|child| child.stats.clone())
-        .unwrap_or_default();
+    if let Some(child_stats) = plan.children().first().map(|child| child.stats.clone()) {
+        plan.stats.inherit_cardinality_from(&child_stats);
+    }
 
     let child_contract = enforcers
         .get(&child_id)

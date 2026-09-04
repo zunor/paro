@@ -3,6 +3,7 @@
 
 //! Join-order cost model based on cardinality estimates.
 
+use crate::cost_model::SelectivityDefaults;
 use crate::join::build_probe_side::{
     choose_join_build_side, estimate_hash_build_row_width, estimate_row_payload_width,
     estimate_row_width_from_payload, JoinBuildCandidate, JoinBuildSide,
@@ -142,6 +143,7 @@ impl DPJoinNode {
 ///
 #[derive(Debug)]
 pub(crate) struct CostModel {
+    selectivity_defaults: SelectivityDefaults,
     /// Cardinality estimator used to calculate cost.
     pub cardinality_estimator: CardinalityEstimator,
     risk_cardinality_estimator: CardinalityEstimator,
@@ -266,19 +268,16 @@ impl JoinCostBreakdown {
     }
 }
 
-impl Default for CostModel {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
 impl CostModel {
-    /// Create a new CostModel.
-    pub fn new() -> Self {
+    /// Create a join cost model from the statement's shared priors.
+    pub fn new(selectivity_defaults: SelectivityDefaults) -> Self {
         Self {
-            cardinality_estimator: CardinalityEstimator::new(),
-            risk_cardinality_estimator: CardinalityEstimator::new(),
-            materialization_cardinality_estimator: CardinalityEstimator::new(),
+            cardinality_estimator: CardinalityEstimator::new(selectivity_defaults.clone()),
+            risk_cardinality_estimator: CardinalityEstimator::new(selectivity_defaults.clone()),
+            materialization_cardinality_estimator: CardinalityEstimator::new(
+                selectivity_defaults.clone(),
+            ),
+            selectivity_defaults,
             relation_materialization_cardinalities: Vec::new(),
             relation_widths: Vec::new(),
             relation_control_regions: Vec::new(),
@@ -287,9 +286,11 @@ impl CostModel {
 
     /// Clear query-local estimates.
     pub fn reset(&mut self) {
-        self.cardinality_estimator = CardinalityEstimator::new();
-        self.risk_cardinality_estimator = CardinalityEstimator::new();
-        self.materialization_cardinality_estimator = CardinalityEstimator::new();
+        self.cardinality_estimator = CardinalityEstimator::new(self.selectivity_defaults.clone());
+        self.risk_cardinality_estimator =
+            CardinalityEstimator::new(self.selectivity_defaults.clone());
+        self.materialization_cardinality_estimator =
+            CardinalityEstimator::new(self.selectivity_defaults.clone());
         self.relation_materialization_cardinalities.clear();
         self.relation_widths.clear();
         self.relation_control_regions.clear();
@@ -875,7 +876,7 @@ mod tests {
 
     #[test]
     fn test_cost_model_new() {
-        let mut cost_model = CostModel::new();
+        let mut cost_model = CostModel::new(SelectivityDefaults::default());
         // Just verify it can be created
         assert_eq!(cost_model.get_cardinality(&JoinRelationSet::empty()), 1.0);
     }
@@ -934,7 +935,7 @@ mod tests {
     #[test]
     fn test_init_cost_model() {
         let mut set_manager = JoinRelationSetManager::new();
-        let mut cost_model = CostModel::new();
+        let mut cost_model = CostModel::new(SelectivityDefaults::default());
 
         let stats = vec![
             RelationStats::with_cardinality(1000),
@@ -956,7 +957,7 @@ mod tests {
     #[test]
     fn leaf_risk_cardinality_does_not_replace_its_expected_estimate() {
         let mut set_manager = JoinRelationSetManager::new();
-        let mut cost_model = CostModel::new();
+        let mut cost_model = CostModel::new(SelectivityDefaults::default());
         let mut stats = RelationStats::with_cardinality(100);
         stats.risk_cardinality = 500;
         cost_model.init_cost_model(&mut set_manager, &[stats]);
@@ -984,7 +985,7 @@ mod tests {
         right_stats.column_distinct_count =
             column_distinct_counts(1, [DistinctCount::new(10_000, true)]);
 
-        let mut model = CostModel::new();
+        let mut model = CostModel::new(SelectivityDefaults::default());
         model.init_equivalent_relations(std::slice::from_ref(&filter));
         model.init_cost_model(&mut sets, &[left_stats, right_stats]);
         let combined = sets.get_relation_from_vec(vec![0, 1]);
@@ -1024,7 +1025,7 @@ mod tests {
         right_stats.materialization_distinct_count =
             column_distinct_counts(1, [DistinctCount::new(1_000_000, false)]);
 
-        let mut model = CostModel::new();
+        let mut model = CostModel::new(SelectivityDefaults::default());
         model.init_equivalent_relations(std::slice::from_ref(&filter));
         model.init_cost_model(&mut sets, &[left_stats, right_stats]);
 
@@ -1035,7 +1036,7 @@ mod tests {
     #[test]
     fn test_compute_cost_leaf_nodes() {
         let mut set_manager = JoinRelationSetManager::new();
-        let mut cost_model = CostModel::new();
+        let mut cost_model = CostModel::new(SelectivityDefaults::default());
 
         // Initialize with join filter
         let filter = create_equality_filter(&mut set_manager, 0, 0, 1, 0, 0);
@@ -1065,7 +1066,7 @@ mod tests {
     #[test]
     fn test_compute_cost_with_existing_costs() {
         let mut set_manager = JoinRelationSetManager::new();
-        let mut cost_model = CostModel::new();
+        let mut cost_model = CostModel::new(SelectivityDefaults::default());
 
         // Initialize with join filter
         let filter = create_equality_filter(&mut set_manager, 0, 0, 1, 0, 0);
@@ -1128,7 +1129,7 @@ mod tests {
     #[test]
     fn test_compute_cost_and_create_node() {
         let mut set_manager = JoinRelationSetManager::new();
-        let mut cost_model = CostModel::new();
+        let mut cost_model = CostModel::new(SelectivityDefaults::default());
 
         // Initialize with join filter
         let filter = create_equality_filter(&mut set_manager, 0, 0, 1, 0, 0);
@@ -1160,7 +1161,7 @@ mod tests {
     #[test]
     fn test_get_cardinality() {
         let mut set_manager = JoinRelationSetManager::new();
-        let mut cost_model = CostModel::new();
+        let mut cost_model = CostModel::new(SelectivityDefaults::default());
 
         let stats = vec![RelationStats::with_cardinality(1000)];
         cost_model.init_cost_model(&mut set_manager, &stats);
@@ -1173,7 +1174,7 @@ mod tests {
     #[test]
     fn test_three_way_join_cost() {
         let mut set_manager = JoinRelationSetManager::new();
-        let mut cost_model = CostModel::new();
+        let mut cost_model = CostModel::new(SelectivityDefaults::default());
 
         // Create filters for A-B and B-C joins
         let filter_ab = create_equality_filter(&mut set_manager, 0, 0, 1, 0, 0);
@@ -1241,7 +1242,7 @@ mod tests {
         supplier_stats.column_distinct_count =
             column_distinct_counts(2, [DistinctCount::new(112, true)]);
 
-        let mut model = CostModel::new();
+        let mut model = CostModel::new(SelectivityDefaults::default());
         model.init_equivalent_relations(&filters);
         model.init_cost_model(&mut sets, &[partsupp_stats, part_stats, supplier_stats]);
 
@@ -1295,7 +1296,7 @@ mod tests {
         left_stats.estimated_payload_width = 1_024;
         let mut right_stats = RelationStats::with_cardinality(100);
         right_stats.estimated_payload_width = 8;
-        let mut model = CostModel::new();
+        let mut model = CostModel::new(SelectivityDefaults::default());
         model.init_cost_model(&mut sets, &[left_stats, right_stats]);
         let mut left = leaf(&mut model, sets.get_relation(0));
         left.cardinality = 10.0;
@@ -1339,7 +1340,7 @@ mod tests {
         let mut probe_stats = RelationStats::with_cardinality(1_000);
         probe_stats.column_distinct_count =
             column_distinct_counts(1, [DistinctCount::new(1_000, true)]);
-        let mut model = CostModel::new();
+        let mut model = CostModel::new(SelectivityDefaults::default());
         model.init_equivalent_relations(&[Arc::clone(&filter)]);
         model.init_cost_model(&mut sets, &[build_stats, probe_stats]);
         let build = leaf(&mut model, sets.get_relation(0));
@@ -1361,7 +1362,7 @@ mod tests {
         let filter = create_comparison_filter(&mut sets, 0, 0, 1, 0, 0, ComparisonType::LessThan);
         let left_stats = RelationStats::with_cardinality(10);
         let right_stats = RelationStats::with_cardinality(1_000);
-        let mut model = CostModel::new();
+        let mut model = CostModel::new(SelectivityDefaults::default());
         model.init_cost_model(&mut sets, &[left_stats, right_stats]);
         let left = leaf(&mut model, sets.get_relation(0));
         let right = leaf(&mut model, sets.get_relation(1));
@@ -1392,7 +1393,7 @@ mod tests {
         let mut filtering_stats = RelationStats::with_cardinality(100);
         filtering_stats.estimated_payload_width = 1_024;
         filtering_stats.contains_control_region = true;
-        let mut model = CostModel::new();
+        let mut model = CostModel::new(SelectivityDefaults::default());
         model.init_cost_model(&mut sets, &[preserved_stats, filtering_stats]);
         let mut preserved = leaf(&mut model, sets.get_relation(0));
         preserved.cardinality = 10.0;
@@ -1491,7 +1492,7 @@ mod tests {
                 ..RelationStats::default()
             },
         ];
-        let mut model = CostModel::new();
+        let mut model = CostModel::new(SelectivityDefaults::default());
         model.init_equivalent_relations(&filters);
         model.init_cost_model(&mut sets, &stats);
 
@@ -1543,7 +1544,7 @@ mod tests {
                 ..RelationStats::default()
             },
         ];
-        let mut model = CostModel::new();
+        let mut model = CostModel::new(SelectivityDefaults::default());
         model.init_equivalent_relations(&filters);
         model.init_cost_model(&mut sets, &stats);
 
@@ -1554,7 +1555,7 @@ mod tests {
     #[test]
     fn test_cross_product_cost() {
         let mut set_manager = JoinRelationSetManager::new();
-        let mut cost_model = CostModel::new();
+        let mut cost_model = CostModel::new(SelectivityDefaults::default());
 
         // No join filters - this will be a cross product
         let stats = vec![
@@ -1598,7 +1599,7 @@ mod tests {
         };
         assert!(!predicates.has_join_conditions());
 
-        let mut model = CostModel::new();
+        let mut model = CostModel::new(SelectivityDefaults::default());
         model.init_cost_model(
             &mut sets,
             &[

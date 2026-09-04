@@ -4,6 +4,7 @@
 //! Statistics propagation and cost estimation.
 
 pub(crate) mod aggregate_filter;
+pub(crate) mod cardinality_bound;
 pub mod cost;
 pub mod gathering;
 pub mod propagator;

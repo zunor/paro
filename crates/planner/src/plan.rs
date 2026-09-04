@@ -112,6 +112,17 @@ pub struct NodeStats {
 }
 
 impl NodeStats {
+    /// Invalidate facts whose proof is tied to this node's current output
+    /// layout or child semantics.
+    ///
+    /// Cardinality annotations describe the node's row domain and have their
+    /// own provenance contract. Unique-key witnesses additionally contain
+    /// positional output ordinals, so an operator or child replacement must
+    /// never carry them across the structural mutation implicitly.
+    pub fn invalidate_structural_facts(&mut self) {
+        self.unique_keys.clear();
+    }
+
     /// Replace the complete row-count contract as one coherent update.
     pub fn set_cardinality(
         &mut self,
@@ -259,11 +270,13 @@ impl LogicalPlan {
         self,
         f: impl FnOnce(LogicalOperator) -> Result<LogicalOperator>,
     ) -> Result<Self> {
-        let (id, stats, operator) = self.into_parts();
+        let (id, mut stats, operator) = self.into_parts();
+        let operator = f(operator)?;
+        stats.invalidate_structural_facts();
         Ok(Self {
             id,
             stats,
-            operator: f(operator)?,
+            operator,
         })
     }
 
@@ -273,6 +286,26 @@ impl LogicalPlan {
     }
 
     pub fn try_map_children(
+        self,
+        mut f: impl FnMut(LogicalPlan) -> Result<LogicalPlan>,
+    ) -> Result<Self> {
+        let (id, mut stats, operator) = self.into_parts();
+        let operator = operator.try_map_owned_children(&mut f)?;
+        stats.invalidate_structural_facts();
+        Ok(Self {
+            id,
+            stats,
+            operator,
+        })
+    }
+
+    /// Rebuild children known to be relationally and positionally identical.
+    ///
+    /// This escape hatch exists for the canonical traversal engine and
+    /// binder-owned structural copies. Rewriters must use
+    /// [`LogicalPlan::try_map_children`], whose contract invalidates cached
+    /// layout-dependent facts.
+    pub(crate) fn try_rebuild_children_preserving_stats(
         self,
         mut f: impl FnMut(LogicalPlan) -> Result<LogicalPlan>,
     ) -> Result<Self> {
@@ -313,7 +346,7 @@ impl LogicalPlan {
         impl<State> Frame<State> {
             fn detach(plan: LogicalPlan) -> Result<Self> {
                 let mut detached = Vec::new();
-                let skeleton = plan.try_map_children(|child| {
+                let skeleton = plan.try_rebuild_children_preserving_stats(|child| {
                     detached.push(child);
                     Ok(LogicalPlan::synthetic(LogicalOperator::DummyScan))
                 })?;
@@ -328,7 +361,7 @@ impl LogicalPlan {
 
             fn rebuild(self) -> Result<(LogicalPlan, Vec<State>)> {
                 let mut children = self.children.into_iter();
-                let plan = self.skeleton.try_map_children(|_| {
+                let plan = self.skeleton.try_rebuild_children_preserving_stats(|_| {
                     children.next().ok_or_else(|| {
                         paro_error::internal("post-order traversal lost a transformed child")
                     })
@@ -374,6 +407,39 @@ impl LogicalPlan {
     ) -> Result<LogicalPlan> {
         self.try_fold_post_order(|plan, _children: Vec<()>| Ok((transform(plan)?, ())))
             .map(|(plan, ())| plan)
+    }
+
+    /// Replace one identified node with an owned, single-use transformation.
+    ///
+    /// Plan ids are unique except for [`PlanNodeId::SYNTHETIC`], which is
+    /// rejected. Layout-dependent facts are invalidated on the replaced node
+    /// before it reaches the closure and on every ancestor whose child
+    /// changed; unrelated subtrees retain their facts.
+    pub fn try_replace_node(
+        self,
+        target: PlanNodeId,
+        replace: impl FnOnce(LogicalPlan) -> Result<LogicalPlan>,
+    ) -> Result<(LogicalPlan, bool)> {
+        if target == PlanNodeId::SYNTHETIC {
+            return Err(paro_error::internal(
+                "synthetic plan ids cannot identify a unique replacement target",
+            ));
+        }
+        let mut replace = Some(replace);
+        self.try_fold_post_order(|mut plan, child_replacements: Vec<bool>| {
+            let child_replaced = child_replacements.into_iter().any(|replaced| replaced);
+            if plan.id == target {
+                plan.stats.invalidate_structural_facts();
+                let replace = replace.take().ok_or_else(|| {
+                    paro_error::internal("plan contains a duplicate non-synthetic node id")
+                })?;
+                return Ok((replace(plan)?, true));
+            }
+            if child_replaced {
+                plan.stats.invalidate_structural_facts();
+            }
+            Ok((plan, child_replaced))
+        })
     }
 
     /// Visit every node with a bounded native stack.
@@ -427,6 +493,7 @@ impl LogicalPlan {
     /// Temporarily detach an operator while retaining the node metadata. The
     /// caller must install a replacement before publishing the plan again.
     pub fn take_operator(&mut self) -> LogicalOperator {
+        self.stats.invalidate_structural_facts();
         std::mem::replace(&mut self.operator, LogicalOperator::DummyScan)
     }
 }
@@ -462,6 +529,16 @@ mod tests {
     use super::*;
     use crate::operator::{EmptyResult, ExpressionGet, Join};
 
+    fn structural_key() -> UniqueKey {
+        UniqueKey::new(
+            [UniqueKeyColumn {
+                output_index: 0,
+                binding: ColumnBinding::new(1, 0),
+            }],
+            UniqueKeyProvenance::Structural,
+        )
+    }
+
     #[test]
     fn logical_plan_ids_share_bind_context_counter() {
         let root_ctx = BindContext::new();
@@ -483,6 +560,56 @@ mod tests {
         assert_eq!(synthetic.id, PlanNodeId::SYNTHETIC);
         assert_eq!(synthetic.stats, NodeStats::default());
         assert!(!synthetic.is_empty_result());
+    }
+
+    #[test]
+    fn structural_mutation_invalidates_positional_unique_keys() {
+        let mut child = LogicalPlan::synthetic(LogicalOperator::DummyScan);
+        child.stats.unique_keys.push(structural_key());
+        let mut plan =
+            LogicalPlan::synthetic(LogicalOperator::EmptyResult(EmptyResult::new(child)));
+        plan.stats.unique_keys.push(structural_key());
+
+        let plan = plan.map_children(|child| child);
+
+        assert!(plan.stats.unique_keys.is_empty());
+        assert_eq!(plan.children()[0].stats.unique_keys, vec![structural_key()]);
+    }
+
+    #[test]
+    fn canonical_traversal_preserves_unmodified_node_facts() {
+        let mut plan = LogicalPlan::synthetic(LogicalOperator::DummyScan);
+        plan.stats.unique_keys.push(structural_key());
+
+        let (plan, ()) = plan
+            .try_fold_post_order(|plan, _: Vec<()>| Ok((plan, ())))
+            .expect("identity traversal");
+
+        assert_eq!(plan.stats.unique_keys, vec![structural_key()]);
+    }
+
+    #[test]
+    fn node_replacement_invalidates_only_the_changed_ancestor_path() {
+        let bind_context = BindContext::new();
+        let mut left = LogicalPlan::dummy_scan(&bind_context);
+        let left_id = left.id;
+        left.stats.unique_keys.push(structural_key());
+        let mut right = LogicalPlan::dummy_scan(&bind_context);
+        right.stats.unique_keys.push(structural_key());
+        let mut root = LogicalPlan::new(
+            &bind_context,
+            LogicalOperator::Join(Join::cross(left, right)),
+        );
+        root.stats.unique_keys.push(structural_key());
+
+        let (root, replaced) = root
+            .try_replace_node(left_id, Ok)
+            .expect("replace identified node");
+
+        assert!(replaced);
+        assert!(root.stats.unique_keys.is_empty());
+        assert!(root.children()[0].stats.unique_keys.is_empty());
+        assert_eq!(root.children()[1].stats.unique_keys, vec![structural_key()]);
     }
 
     #[test]

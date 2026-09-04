@@ -416,46 +416,22 @@ fn localize_inner_full_partition_filter(
         right_projection_map,
     } = scalar_join;
     let outer = *left;
-    let mut right = Some(right);
-    let mut conditions = Some(conditions);
-    let mut duplicate_eliminated_columns = Some(duplicate_eliminated_columns);
-    let mut left_projection_map = Some(left_projection_map);
-    let mut right_projection_map = Some(right_projection_map);
-    let mut filter_expressions = Some(filter_expressions);
-    let mut replaced = false;
-    let localized = outer.try_map_post_order(|target| {
-        if replaced || target.id != target_id {
-            return Ok(target);
-        }
-        replaced = true;
+    let (localized, replaced) = outer.try_replace_node(target_id, move |target| {
         let join = ComparisonJoin {
             join_type,
             anti_join_mode,
             left: Box::new(target),
-            right: right.take().ok_or_else(|| {
-                paro_error::internal("localized scalar join was consumed more than once")
-            })?,
-            conditions: conditions.take().ok_or_else(|| {
-                paro_error::internal("localized scalar join conditions were consumed twice")
-            })?,
+            right,
+            conditions,
             mark_index,
             mark_semantics,
-            duplicate_eliminated_columns: duplicate_eliminated_columns.take().ok_or_else(|| {
-                paro_error::internal("localized scalar join metadata was consumed twice")
-            })?,
+            duplicate_eliminated_columns,
             delim_flipped,
-            left_projection_map: left_projection_map.take().ok_or_else(|| {
-                paro_error::internal("localized scalar join projection was consumed twice")
-            })?,
-            right_projection_map: right_projection_map.take().ok_or_else(|| {
-                paro_error::internal("localized scalar join projection was consumed twice")
-            })?,
+            left_projection_map,
+            right_projection_map,
         };
-        let expressions = filter_expressions.take().ok_or_else(|| {
-            paro_error::internal("localized scalar filter was consumed more than once")
-        })?;
         let local_filter = paro_planner::operator::Filter {
-            expressions,
+            expressions: filter_expressions,
             child: Box::new(LogicalPlan::new(
                 bind_context,
                 LogicalOperator::Join(Join::Comparison(join)),

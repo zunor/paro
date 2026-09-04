@@ -824,7 +824,7 @@ impl Optimizer {
     fn correlated_aggregate_candidate(&self, plan: LogicalPlan) -> Result<CandidatePlan> {
         let input_shape = tracing::enabled!(target: targets::OPTIMIZER, tracing::Level::DEBUG)
             .then(|| logical_plan_shape(&plan));
-        let ordered = JoinOrderOptimizer::new()
+        let ordered = JoinOrderOptimizer::new(self.ctx.cost_model.defaults.clone())
             .with_search_budget(&self.budget)
             .optimize_plan(
                 self.ctx.session.as_ref(),
@@ -885,7 +885,7 @@ impl Optimizer {
         let context = self
             .ctx
             .fork_for_candidate(Arc::unwrap_or_clone(candidate.column_stats));
-        let mut candidate = JoinOrderOptimizer::new()
+        let mut candidate = JoinOrderOptimizer::new(self.ctx.cost_model.defaults.clone())
             .with_search_budget(&self.budget)
             .optimize_plan(
                 context.session.as_ref(),

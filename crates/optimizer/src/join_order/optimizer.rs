@@ -28,7 +28,7 @@ use paro_storage::statistics::{ColumnStatistics, NumericStats};
 use tracing::debug;
 
 use crate::column::lifetime::ColumnLifetimeAnalyzer;
-use crate::cost_model::CostModel as LogicalCostModel;
+use crate::cost_model::{CostModel as LogicalCostModel, SelectivityDefaults};
 use crate::join_order::cost_model::{CostModel, DPJoinNode};
 use crate::join_order::enumerator::{EnumerationOutcome, PlanEnumerator};
 use crate::join_order::predicate_inference::infer_equality_constants;
@@ -136,12 +136,12 @@ pub struct JoinOrderOptimizer {
 
 impl JoinOrderOptimizer {
     /// Create a new JoinOrderOptimizer.
-    pub fn new() -> Self {
+    pub fn new(selectivity_defaults: SelectivityDefaults) -> Self {
         Self {
             relation_manager: RelationManager::new(),
             set_manager: JoinRelationSetManager::new(),
             query_graph: QueryGraphEdges::new(),
-            cost_model: CostModel::new(),
+            cost_model: CostModel::new(selectivity_defaults),
             filter_infos: Vec::new(),
             plans: HashMap::new(),
             column_stats: HashMap::new(),
@@ -1025,12 +1025,6 @@ impl JoinOrderOptimizer {
     }
 }
 
-impl Default for JoinOrderOptimizer {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use std::collections::HashMap;
@@ -1167,7 +1161,7 @@ mod tests {
     #[test]
     fn optimize_reconstructs_comparison_join_with_original_predicate() {
         let session = make_test_session();
-        let mut optimizer = JoinOrderOptimizer::new();
+        let mut optimizer = JoinOrderOptimizer::new(SelectivityDefaults::default());
         let plan = LogicalOperator::Join(Join::Comparison(ComparisonJoin::new(
             JoinType::Inner,
             LogicalPlan::synthetic(create_scan(0)),
@@ -1194,7 +1188,7 @@ mod tests {
     #[test]
     fn optimize_converts_filtered_cross_product_to_comparison_join() {
         let session = make_test_session();
-        let mut optimizer = JoinOrderOptimizer::new();
+        let mut optimizer = JoinOrderOptimizer::new(SelectivityDefaults::default());
         let cross = LogicalPlan::synthetic(LogicalOperator::Join(Join::Cross(CrossProduct::new(
             LogicalPlan::synthetic(create_scan(0)),
             LogicalPlan::synthetic(create_scan(1)),
@@ -1235,7 +1229,7 @@ mod tests {
         column_stats.update_distinct_statistics(&hashes, hashes.len());
         assert!(column_stats.get_distinct_count() > 9);
 
-        let mut optimizer = JoinOrderOptimizer::new();
+        let mut optimizer = JoinOrderOptimizer::new(SelectivityDefaults::default());
         optimizer
             .column_stats
             .insert(ColumnBinding::new(0, 0), Arc::new(column_stats));
@@ -1256,7 +1250,7 @@ mod tests {
         let session = make_test_session();
         let bind_context = BindContext::new();
         let plan = projection_relation(&bind_context, 100, 0, 100);
-        let mut optimizer = JoinOrderOptimizer::new();
+        let mut optimizer = JoinOrderOptimizer::new(SelectivityDefaults::default());
         optimizer.add_relation_plan(&session, &bind_context, &plan);
 
         let predicate =
@@ -1294,7 +1288,7 @@ mod tests {
         NumericStats::set_guaranteed_min(&mut base, &Value::Integer(-12));
         NumericStats::set_guaranteed_max(&mut base, &Value::Integer(12));
 
-        let mut optimizer = JoinOrderOptimizer::new();
+        let mut optimizer = JoinOrderOptimizer::new(SelectivityDefaults::default());
         optimizer.column_stats.insert(
             ColumnBinding::new(0, 0),
             Arc::new(ColumnStatistics::new(base)),
@@ -1322,7 +1316,7 @@ mod tests {
                 vec![LogicalType::Integer, LogicalType::Varchar],
             )))
         };
-        let mut optimizer = JoinOrderOptimizer::new();
+        let mut optimizer = JoinOrderOptimizer::new(SelectivityDefaults::default());
         optimizer.add_relation_plan(&session, &bind_context, &relation(0));
         optimizer.add_relation_plan(&session, &bind_context, &relation(1));
 
@@ -1399,7 +1393,7 @@ mod tests {
         let session = make_test_session();
         let bind_context = BindContext::new();
         let plan = projection_relation(&bind_context, 1_000, 0, 1_000);
-        let mut optimizer = JoinOrderOptimizer::new();
+        let mut optimizer = JoinOrderOptimizer::new(SelectivityDefaults::default());
         optimizer.add_relation_plan(&session, &bind_context, &plan);
 
         let predicate = Expression::Operator(OperatorExpression::new(
@@ -1497,7 +1491,7 @@ mod tests {
         let plan =
             crate::statistics::unique_keys::refresh_unique_keys(plan).expect("cache unique keys");
 
-        let mut optimizer = JoinOrderOptimizer::new();
+        let mut optimizer = JoinOrderOptimizer::new(SelectivityDefaults::default());
         optimizer.add_relation_plan(&make_test_session(), &bind_context, &plan);
         let mut left_stats = optimizer.relation_manager.get_relation_stats()[0].clone();
         // Unique keys are sets. The shared proof layer canonicalizes them by
@@ -1549,7 +1543,7 @@ mod tests {
             (ColumnBinding::new(50, 1), DistinctCount::new(10, true)),
         ]);
 
-        let mut estimator = CardinalityEstimator::new();
+        let mut estimator = CardinalityEstimator::new(SelectivityDefaults::default());
         estimator.init_equivalent_relations(&filters);
         estimator.init_cardinality_estimator_props(&set_manager.get_relation(0), &left_stats);
         estimator.init_cardinality_estimator_props(&set_manager.get_relation(1), &right_stats);
@@ -1572,7 +1566,7 @@ mod tests {
     #[test]
     fn optimize_preserves_relation_independent_filter_above_reordered_join() {
         let session = make_test_session();
-        let mut optimizer = JoinOrderOptimizer::new();
+        let mut optimizer = JoinOrderOptimizer::new(SelectivityDefaults::default());
         let equality = Expression::Comparison(paro_planner::expression::ComparisonExpression::new(
             ComparisonType::Equal,
             column_ref(0, 0),
@@ -1622,7 +1616,7 @@ mod tests {
         let plan =
             LogicalOperator::Filter(Filter::new(cross_product(0, 1), vec![residual.clone()]));
 
-        let optimized = JoinOrderOptimizer::new()
+        let optimized = JoinOrderOptimizer::new(SelectivityDefaults::default())
             .optimize(&make_test_session(), &BindContext::new(), plan)
             .unwrap();
         let LogicalOperator::Filter(filter) = optimized else {
@@ -1654,7 +1648,7 @@ mod tests {
         for predicate in plans {
             let original = predicate.clone();
             let plan = LogicalOperator::Filter(Filter::new(cross_product(0, 1), vec![predicate]));
-            let optimized = JoinOrderOptimizer::new()
+            let optimized = JoinOrderOptimizer::new(SelectivityDefaults::default())
                 .optimize(&session, &BindContext::new(), plan)
                 .unwrap();
             let LogicalOperator::Filter(filter) = optimized else {
@@ -1670,9 +1664,9 @@ mod tests {
         let predicate = volatile_boolean();
         let plan =
             LogicalOperator::Filter(Filter::new(cross_product(0, 1), vec![predicate.clone()]));
-        assert!(!JoinOrderOptimizer::new().can_optimize_join(&plan));
+        assert!(!JoinOrderOptimizer::new(SelectivityDefaults::default()).can_optimize_join(&plan));
 
-        let optimized = JoinOrderOptimizer::new()
+        let optimized = JoinOrderOptimizer::new(SelectivityDefaults::default())
             .optimize(&make_test_session(), &BindContext::new(), plan)
             .unwrap();
         let LogicalOperator::Filter(filter) = optimized else {
@@ -1690,7 +1684,8 @@ mod tests {
             LogicalPlan::synthetic(create_scan(1)),
             vec![join_condition(JoinComparisonType::Equal, 0, 1)],
         )));
-        assert!(!JoinOrderOptimizer::new().can_optimize_join(&surrounding_join));
+        assert!(!JoinOrderOptimizer::new(SelectivityDefaults::default())
+            .can_optimize_join(&surrounding_join));
 
         let volatile_preserved = LogicalPlan::synthetic(LogicalOperator::Filter(Filter::new(
             LogicalPlan::synthetic(create_scan(0)),
@@ -1736,7 +1731,7 @@ mod tests {
 
         let session = make_test_session();
         let bind_context = BindContext::new();
-        let optimized = JoinOrderOptimizer::new()
+        let optimized = JoinOrderOptimizer::new(SelectivityDefaults::default())
             .optimize(&session, &bind_context, plan)
             .unwrap();
         assert!(matches!(
@@ -1748,7 +1743,7 @@ mod tests {
     #[test]
     fn optimize_coalesces_single_relation_filters_after_join_reordering() {
         let session = make_test_session();
-        let mut optimizer = JoinOrderOptimizer::new();
+        let mut optimizer = JoinOrderOptimizer::new(SelectivityDefaults::default());
         let cross = LogicalPlan::synthetic(LogicalOperator::Join(Join::Cross(CrossProduct::new(
             LogicalPlan::synthetic(create_scan(0)),
             LogicalPlan::synthetic(create_scan(1)),
@@ -1801,7 +1796,7 @@ mod tests {
     #[test]
     fn optimize_three_way_join_reconstructs_nested_join_tree() {
         let session = make_test_session();
-        let mut optimizer = JoinOrderOptimizer::new();
+        let mut optimizer = JoinOrderOptimizer::new(SelectivityDefaults::default());
         let join_ab = LogicalOperator::Join(Join::Comparison(ComparisonJoin::new(
             JoinType::Inner,
             LogicalPlan::synthetic(create_scan(0)),
@@ -1838,7 +1833,7 @@ mod tests {
     #[test]
     fn semi_join_optimization_preserves_join_semantics() {
         let session = make_test_session();
-        let mut optimizer = JoinOrderOptimizer::new();
+        let mut optimizer = JoinOrderOptimizer::new(SelectivityDefaults::default());
         let plan = LogicalOperator::Join(Join::Comparison(ComparisonJoin::new(
             JoinType::Semi,
             LogicalPlan::synthetic(create_scan(0)),
@@ -1867,7 +1862,7 @@ mod tests {
     #[test]
     fn null_aware_anti_join_semantics_survive_reconstruction() {
         let session = make_test_session();
-        let mut optimizer = JoinOrderOptimizer::new();
+        let mut optimizer = JoinOrderOptimizer::new(SelectivityDefaults::default());
         let mut join = ComparisonJoin::new(
             JoinType::Anti,
             LogicalPlan::synthetic(create_scan(0)),
@@ -1912,7 +1907,7 @@ mod tests {
                 vec![join_condition(JoinComparisonType::Equal, 0, 2)],
             ),
         )));
-        let mut optimizer = JoinOrderOptimizer::new();
+        let mut optimizer = JoinOrderOptimizer::new(SelectivityDefaults::default());
         let mut filters = Vec::new();
 
         optimizer
@@ -1956,7 +1951,7 @@ mod tests {
                 vec![join_condition(JoinComparisonType::Equal, 0, 2)],
             ),
         )));
-        let mut optimizer = JoinOrderOptimizer::new();
+        let mut optimizer = JoinOrderOptimizer::new(SelectivityDefaults::default());
         let mut filters = Vec::new();
 
         optimizer
@@ -2000,7 +1995,7 @@ mod tests {
                 vec![join_condition(JoinComparisonType::Equal, 0, 2)],
             ),
         )));
-        let mut optimizer = JoinOrderOptimizer::new();
+        let mut optimizer = JoinOrderOptimizer::new(SelectivityDefaults::default());
         let mut filters = Vec::new();
 
         optimizer
@@ -2045,7 +2040,7 @@ mod tests {
                 )],
             ),
         )));
-        let mut optimizer = JoinOrderOptimizer::new();
+        let mut optimizer = JoinOrderOptimizer::new(SelectivityDefaults::default());
         let mut filters = Vec::new();
 
         assert!(
@@ -2098,7 +2093,7 @@ mod tests {
                 )],
             ),
         )));
-        let mut optimizer = JoinOrderOptimizer::new();
+        let mut optimizer = JoinOrderOptimizer::new(SelectivityDefaults::default());
         let mut filters = Vec::new();
 
         optimizer
@@ -2135,7 +2130,7 @@ mod tests {
                 vec![join_condition(JoinComparisonType::Equal, 0, 2)],
             ),
         )));
-        let mut optimizer = JoinOrderOptimizer::new();
+        let mut optimizer = JoinOrderOptimizer::new(SelectivityDefaults::default());
         let mut filters = Vec::new();
 
         optimizer
@@ -2189,7 +2184,7 @@ mod tests {
             );
         }
 
-        let mut optimizer = JoinOrderOptimizer::new();
+        let mut optimizer = JoinOrderOptimizer::new(SelectivityDefaults::default());
         let optimized = optimizer
             .optimize_plan(&session, plan, &column_stats, &bind_context)
             .expect("join order optimization should succeed");
@@ -2267,7 +2262,7 @@ mod tests {
             ))),
         };
 
-        let optimized = JoinOrderOptimizer::new()
+        let optimized = JoinOrderOptimizer::new(SelectivityDefaults::default())
             .optimize_plan(&session, plan, &HashMap::new(), &bind_context)
             .expect("join order optimization should succeed");
         let LogicalOperator::Join(Join::Comparison(root)) = &optimized.operator else {
@@ -2323,7 +2318,7 @@ mod tests {
             ))),
         };
 
-        let optimized = JoinOrderOptimizer::new()
+        let optimized = JoinOrderOptimizer::new(SelectivityDefaults::default())
             .optimize_plan(&session, plan, &HashMap::new(), &bind_context)
             .expect("join-order optimization should succeed");
         let physical = BuildProbeSideOptimizer::new(Arc::clone(&session)).optimize_plan(optimized);
@@ -2352,7 +2347,7 @@ mod tests {
             ))),
         };
 
-        let optimized = JoinOrderOptimizer::new()
+        let optimized = JoinOrderOptimizer::new(SelectivityDefaults::default())
             .optimize_plan(&session, plan, &HashMap::new(), &bind_context)
             .expect("join-order optimization should succeed");
         let physical = BuildProbeSideOptimizer::new(Arc::clone(&session)).optimize_plan(optimized);

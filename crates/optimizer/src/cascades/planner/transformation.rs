@@ -505,14 +505,16 @@ fn rewrite_planner_expressions(
     environment: &PlannerRuleEnvironment,
 ) -> Result<Vec<LogicalPlan>> {
     if matches!(transformation, PlannerTransformation::JoinRegionEnumeration) {
-        return crate::join_order::optimizer::JoinOrderOptimizer::new()
-            .with_search_budget(&environment.budget)
-            .enumerate_region(
-                environment.session.as_ref(),
-                plan,
-                column_stats,
-                &environment.bind_context,
-            );
+        return crate::join_order::optimizer::JoinOrderOptimizer::new(
+            environment.cost_model.defaults.clone(),
+        )
+        .with_search_budget(&environment.budget)
+        .enumerate_region(
+            environment.session.as_ref(),
+            plan,
+            column_stats,
+            &environment.bind_context,
+        );
     }
     Ok(
         rewrite_planner_expression(transformation, plan, column_stats, environment)?

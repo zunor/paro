@@ -75,18 +75,23 @@ struct StatisticsGatherFolder<'a> {
     context: &'a mut OptimizationContext,
 }
 
-impl LogicalPlanPostOrderFolder<LogicalOutputLayout> for StatisticsGatherFolder<'_> {
+struct GatheredNodeProperties {
+    layout: LogicalOutputLayout,
+    maximum_cardinality: Option<u64>,
+}
+
+impl LogicalPlanPostOrderFolder<GatheredNodeProperties> for StatisticsGatherFolder<'_> {
     fn child_completed(
         &mut self,
         parent_skeleton: &LogicalPlan,
         completed_children: &[LogicalPlan],
-        completed_layouts: &[LogicalOutputLayout],
+        completed_properties: &[GatheredNodeProperties],
         remaining_children: &[LogicalPlan],
     ) -> Result<()> {
         self.gathering.publish_completed_first_child(
             parent_skeleton,
             completed_children,
-            completed_layouts,
+            completed_properties,
             remaining_children,
             self.context,
         );
@@ -96,8 +101,12 @@ impl LogicalPlanPostOrderFolder<LogicalOutputLayout> for StatisticsGatherFolder<
     fn fold(
         &mut self,
         mut plan: LogicalPlan,
-        child_layouts: Vec<LogicalOutputLayout>,
-    ) -> Result<(LogicalPlan, LogicalOutputLayout)> {
+        child_properties: Vec<GatheredNodeProperties>,
+    ) -> Result<(LogicalPlan, GatheredNodeProperties)> {
+        let (child_layouts, child_maximum_cardinalities): (Vec<_>, Vec<_>) = child_properties
+            .into_iter()
+            .map(|properties| (properties.layout, properties.maximum_cardinality))
+            .unzip();
         if plan.stats.cardinality_provenance != CardinalityProvenance::JoinGraph {
             plan.stats.estimated_cardinality =
                 self.gathering
@@ -105,6 +114,10 @@ impl LogicalPlanPostOrderFolder<LogicalOutputLayout> for StatisticsGatherFolder<
             plan.stats.cardinality_provenance = CardinalityProvenance::Statistics;
         }
         let output_layout = plan.operator.output_layout_from_children(&child_layouts);
+        let maximum_cardinality = crate::statistics::cardinality_bound::derive_maximum_cardinality(
+            &plan.operator,
+            &child_maximum_cardinalities,
+        );
         plan.stats.unique_keys = crate::statistics::unique_keys::derive_local_unique_keys(
             &plan.operator,
             &output_layout,
@@ -114,9 +127,16 @@ impl LogicalPlanPostOrderFolder<LogicalOutputLayout> for StatisticsGatherFolder<
             &plan,
             &output_layout,
             &child_layouts,
+            maximum_cardinality,
             self.context,
         );
-        Ok((plan, output_layout))
+        Ok((
+            plan,
+            GatheredNodeProperties {
+                layout: output_layout,
+                maximum_cardinality,
+            },
+        ))
     }
 }
 
@@ -135,7 +155,7 @@ impl StatisticsGathering {
             context: ctx,
         };
         plan.try_fold_post_order_with(&mut folder)
-            .map(|(plan, _layout)| plan)
+            .map(|(plan, _properties)| plan)
     }
 
     /// Some consumers require producer statistics while their sibling is
@@ -145,7 +165,7 @@ impl StatisticsGathering {
         &mut self,
         parent_skeleton: &LogicalPlan,
         completed_children: &[LogicalPlan],
-        completed_layouts: &[LogicalOutputLayout],
+        completed_properties: &[GatheredNodeProperties],
         remaining_children: &[LogicalPlan],
         ctx: &OptimizationContext,
     ) {
@@ -153,7 +173,10 @@ impl StatisticsGathering {
             return;
         }
         let first = &completed_children[0];
-        let Some(first_layout) = completed_layouts.first() else {
+        let Some(first_layout) = completed_properties
+            .first()
+            .map(|properties| &properties.layout)
+        else {
             return;
         };
         match &parent_skeleton.operator {
@@ -689,6 +712,7 @@ impl StatisticsGathering {
         plan: &LogicalPlan,
         output_layout: &LogicalOutputLayout,
         child_layouts: &[LogicalOutputLayout],
+        guaranteed_output_rows: Option<u64>,
         ctx: &mut OptimizationContext,
     ) {
         let output_stats = match &plan.operator {
@@ -729,11 +753,7 @@ impl StatisticsGathering {
                         .map(|expr| expression_statistics(expr, ctx)),
                 );
                 stats.extend(agg.aggregates.iter().map(|expr| {
-                    aggregate_expression_statistics(
-                        expr,
-                        ctx,
-                        plan.stats.estimated_cardinality.map(|rows| rows.max),
-                    )
+                    aggregate_expression_statistics(expr, ctx, guaranteed_output_rows)
                 }));
                 stats.extend(
                     agg.grouping_functions
@@ -1212,7 +1232,7 @@ fn merge_column_statistics(
 fn aggregate_expression_statistics(
     expr: &Expression,
     ctx: &impl ColumnStatsView,
-    output_rows: Option<u64>,
+    guaranteed_output_rows: Option<u64>,
 ) -> Arc<ColumnStatistics> {
     let Expression::Aggregate(agg) = expr else {
         return expression_statistics(expr, ctx);
@@ -1227,7 +1247,7 @@ fn aggregate_expression_statistics(
             // input domain. Cap its NDV where the result is produced so every
             // downstream consumer observes self-consistent column statistics.
             let mut statistics = expression_statistics(&agg.children[0], ctx).as_ref().copy();
-            if let Some(output_rows) = output_rows {
+            if let Some(output_rows) = guaranteed_output_rows {
                 statistics = statistics.with_guaranteed_distinct_upper(output_rows);
             }
             Arc::new(statistics)
@@ -2208,6 +2228,10 @@ mod tests {
             vec![column_ref(1, 0)],
             return_type,
         ));
+
+        let unconstrained = aggregate_expression_statistics(&expression, &ctx, None);
+        assert_eq!(unconstrained.get_distinct_count(), 3);
+        assert_eq!(unconstrained.guaranteed_distinct_upper(), None);
 
         let output = aggregate_expression_statistics(&expression, &ctx, Some(1));
 

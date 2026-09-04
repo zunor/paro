@@ -315,7 +315,7 @@ pub(super) fn apply_shared_relation_rewrite(
                 if column.depth == 0 {
                     required.insert(column.binding);
                 }
-                ExpressionVisitDecision::SkipChildren
+                ExpressionVisitDecision::Descend
             } else {
                 ExpressionVisitDecision::Descend
             }
@@ -339,7 +339,7 @@ pub(super) fn apply_shared_relation_rewrite(
             "shared-relation partition witness lost its outer reference",
         ));
     }
-    let target_id = smallest_extensible_inner_owner(&detail, &required);
+    let target_id = smallest_filter_owner(&detail, &required);
     let mut expressions = Some(filter.expressions);
     let mut localized = false;
     let detail = detail.try_map_post_order(|target| {

@@ -1653,6 +1653,61 @@ fn smallest_extensible_inner_owner(
     }
 }
 
+/// Find the deepest subtree where a binding-local predicate can execute.
+///
+/// Unlike scalar-join localization this operation does not widen a child, so
+/// fixed projection maps do not block descent. Only row-preserving operators
+/// that commute with a movable filter are crossed. In particular, Limit and
+/// TopN are deliberate barriers: filtering below either changes which rows
+/// belong to the result.
+fn smallest_filter_owner(
+    plan: &LogicalPlan,
+    required: &HashSet<ColumnBinding>,
+) -> paro_planner::plan::PlanNodeId {
+    fn owns(plan: &LogicalPlan, required: &HashSet<ColumnBinding>) -> bool {
+        let bindings = plan
+            .get_column_bindings()
+            .into_iter()
+            .collect::<HashSet<_>>();
+        required.iter().all(|binding| bindings.contains(binding))
+    }
+
+    let mut target = plan;
+    loop {
+        let child = match &target.operator {
+            LogicalOperator::Join(Join::Comparison(join)) if clean_inner_join(join) => {
+                match (owns(&join.left, required), owns(&join.right, required)) {
+                    (true, false) => Some(join.left.as_ref()),
+                    (false, true) => Some(join.right.as_ref()),
+                    _ => None,
+                }
+            }
+            LogicalOperator::Filter(filter)
+                if filter.expressions.iter().all(is_movable) && owns(&filter.child, required) =>
+            {
+                Some(filter.child.as_ref())
+            }
+            LogicalOperator::Order(order)
+                if order
+                    .orders
+                    .iter()
+                    .all(|order| is_movable(&order.expression))
+                    && owns(&order.child, required) =>
+            {
+                Some(order.child.as_ref())
+            }
+            LogicalOperator::RowFetch(fetch) if owns(&fetch.child, required) => {
+                Some(fetch.child.as_ref())
+            }
+            _ => None,
+        };
+        let Some(child) = child else {
+            return target.id;
+        };
+        target = child;
+    }
+}
+
 fn find_only_delim_get(plan: &LogicalPlan) -> Option<&paro_planner::operator::DelimGet> {
     let mut found = Vec::new();
     collect_delim_gets(plan, &mut found);
