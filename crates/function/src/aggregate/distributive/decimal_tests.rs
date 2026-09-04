@@ -926,7 +926,7 @@ fn decimal_avg_uses_wide_accumulator_before_division() {
 }
 
 #[test]
-fn decimal_avg_rounds_the_exact_scaled_quotient_once() {
+fn decimal_avg_performs_one_final_scale_conversion_to_double() {
     let data = DecimalAggregateBindData {
         op: DecimalAggregateOp::Avg,
         input_scale: 2,

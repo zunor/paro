@@ -1154,9 +1154,10 @@ unsafe fn finalize_average(
         if state.overflowed {
             return Err(paro_error::out_of_range("Decimal AVG aggregate overflow"));
         }
-        // Divide once by the scaled denominator. Splitting this into `/ count`
-        // and `/ scale` rounds the intermediate quotient and can move the
-        // correctly-rounded IEEE-754 result by one ULP.
+        // AVG(DECIMAL) deliberately returns DOUBLE. Convert the exact integer
+        // accumulator to that approximate domain once and divide by one
+        // scaled denominator; two floating-point divisions can add an avoidable
+        // intermediate rounding and move the result by one ULP.
         let denominator = state.count as f64 * 10_f64.powi(i32::from(data.input_scale));
         let value = state.value().as_f64() / denominator;
         *result.flat_data_mut::<f64>().add(row) = value;
