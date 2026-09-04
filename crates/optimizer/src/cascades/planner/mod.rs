@@ -27,6 +27,7 @@ use crate::aggregate::{
 };
 use crate::column::lifetime::ColumnLifetimeAnalyzer;
 use crate::column::remove_unused::RemoveUnusedColumns;
+use crate::context::SharedColumnStatistics;
 use crate::cte::inlining::CTEInlining;
 use crate::cte::{demand_pushdown::CTEDemandPusher, filter_pusher::CTEFilterPusher};
 use crate::expression::normalize_scalar_expressions;
@@ -218,7 +219,7 @@ pub struct LogicalAlternative {
     pub source: AlternativeOrigin,
     /// Immutable estimator input owned by this alternative. Search providers
     /// must never observe statistics left behind by a different candidate.
-    pub column_stats: Arc<HashMap<ColumnBinding, Arc<ColumnStatistics>>>,
+    pub column_stats: SharedColumnStatistics,
 }
 
 #[derive(Debug, Clone, Copy)]

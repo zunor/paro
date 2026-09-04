@@ -52,7 +52,7 @@ pub(super) struct PlannerLogicalPayload {
     /// Binding-based operator semantics. Positional projection maps and input
     /// slots are derived only after winner selection.
     pub(super) semantic_template: LogicalPlan,
-    pub(super) column_stats: Arc<HashMap<ColumnBinding, Arc<ColumnStatistics>>>,
+    pub(super) column_stats: SharedColumnStatistics,
 }
 
 #[derive(Debug)]

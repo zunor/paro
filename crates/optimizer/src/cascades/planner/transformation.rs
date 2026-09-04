@@ -734,10 +734,7 @@ fn rewrite_positive_consumed_mark_filter(plan: LogicalPlan) -> Option<LogicalPla
 fn settle_transformed_expression(
     mut plan: LogicalPlan,
     environment: &PlannerRuleEnvironment,
-) -> Result<(
-    LogicalPlan,
-    Arc<HashMap<ColumnBinding, Arc<ColumnStatistics>>>,
-)> {
+) -> Result<(LogicalPlan, SharedColumnStatistics)> {
     // A group-local rewrite such as CTE substitution can expose a fresh
     // Filter(CrossProduct) boundary after the root canonicalization pass.
     // Stage only canonical join semantics so the equivalent expression is

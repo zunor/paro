@@ -14,7 +14,7 @@ pub(super) struct StagedEquivalent {
 
 pub(super) struct StagingRequest {
     pub(super) plan: LogicalPlan,
-    pub(super) column_stats: Arc<HashMap<ColumnBinding, Arc<ColumnStatistics>>>,
+    pub(super) column_stats: SharedColumnStatistics,
     pub(super) target: StagingTarget,
     pub(super) regions: StagingRegionRequirements,
 }

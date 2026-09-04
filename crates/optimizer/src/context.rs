@@ -15,6 +15,9 @@ use paro_storage::statistics::ColumnStatistics;
 use crate::cost_model::CostModel;
 use crate::profiler::OptimizerProfiler;
 
+/// Immutable column statistics shared by candidate-local optimizer contexts.
+pub type SharedColumnStatistics = Arc<HashMap<ColumnBinding, Arc<ColumnStatistics>>>;
+
 pub trait GraphStatsLoader: Send + Sync {
     fn load(&self, graph_name: &str) -> Option<Arc<GraphStatistics>>;
 }
@@ -74,7 +77,7 @@ impl Default for GraphStatsCache {
 pub struct OptimizationContext {
     pub session: Arc<StatementContext>,
     pub bind_context: BindContext,
-    pub column_stats: Arc<HashMap<ColumnBinding, Arc<ColumnStatistics>>>,
+    pub column_stats: SharedColumnStatistics,
     pub graph_stats: GraphStatsCache,
     pub cost_model: CostModel,
     pub verify_enabled: bool,
