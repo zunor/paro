@@ -120,17 +120,23 @@ pub(in crate::cascades::planner) fn planner_cost_facts(
         }
         _ => None,
     };
-    let runtime_filter_probe_work_source = match &plan.operator {
+    let runtime_filter_build_left_probe_source_rows = match &plan.operator {
         LogicalOperator::Join(Join::Comparison(join)) => {
-            super::runtime_filter_probe_work_source(join)
+            super::runtime_filter_build_left_probe_source_rows(join)
         }
         _ => None,
     };
-    let runtime_filter_build_left_probe_work_source = match &plan.operator {
+    let runtime_filter_probe_work_sources = match &plan.operator {
         LogicalOperator::Join(Join::Comparison(join)) => {
-            super::runtime_filter_build_left_probe_work_source(join)
+            super::runtime_filter_probe_work_sources(join).unwrap_or_default()
         }
-        _ => None,
+        _ => Box::new([]),
+    };
+    let runtime_filter_build_left_probe_work_sources = match &plan.operator {
+        LogicalOperator::Join(Join::Comparison(join)) => {
+            super::runtime_filter_build_left_probe_work_sources(join).unwrap_or_default()
+        }
+        _ => Box::new([]),
     };
     let runtime_filter_build_distinct_expected = match &plan.operator {
         LogicalOperator::Join(Join::Comparison(join)) => {
@@ -160,8 +166,9 @@ pub(in crate::cascades::planner) fn planner_cost_facts(
         runtime_filter_probe_multiplicity,
         runtime_filter_build_left_probe_multiplicity,
         runtime_filter_probe_source_rows,
-        runtime_filter_probe_work_source,
-        runtime_filter_build_left_probe_work_source,
+        runtime_filter_build_left_probe_source_rows,
+        runtime_filter_probe_work_sources,
+        runtime_filter_build_left_probe_work_sources,
         runtime_filter_build_distinct_expected,
         runtime_filter_key_types,
     })
@@ -269,9 +276,14 @@ pub(in crate::cascades::planner) fn expression_cost_facts(
             .runtime_filter_probe_source_rows
             .map(|rows| CompactRange::new(rows.min as f64, rows.expected as f64, rows.max as f64))
             .transpose()?,
-        runtime_filter_probe_work_source: template.runtime_filter_probe_work_source,
-        runtime_filter_build_left_probe_work_source: template
-            .runtime_filter_build_left_probe_work_source,
+        runtime_filter_build_left_probe_source_rows: template
+            .runtime_filter_build_left_probe_source_rows
+            .map(|rows| CompactRange::new(rows.min as f64, rows.expected as f64, rows.max as f64))
+            .transpose()?,
+        runtime_filter_probe_work_sources: template.runtime_filter_probe_work_sources.clone(),
+        runtime_filter_build_left_probe_work_sources: template
+            .runtime_filter_build_left_probe_work_sources
+            .clone(),
         runtime_filter_build_distinct_expected: template.runtime_filter_build_distinct_expected,
         runtime_filter_key_types: template.runtime_filter_key_types.clone(),
     })

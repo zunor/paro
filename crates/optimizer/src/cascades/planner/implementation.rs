@@ -384,6 +384,7 @@ impl PhysicalImplementation for AlternativeImplementation {
         else {
             return Ok(Box::new([]));
         };
+        let cost_composition = planner_cost_composition(metadata, self.flavor, &cost_facts)?;
         Ok(vec![PhysicalCandidate {
             key: PhysicalExprKey {
                 implementation: self.id,
@@ -396,7 +397,7 @@ impl PhysicalImplementation for AlternativeImplementation {
             child_goals,
             local_cost,
             source_filter_apply_cost,
-            cost_composition: planner_cost_composition(metadata, self.flavor, &cost_facts)?,
+            cost_composition,
             spillable: implementation_spillable(metadata, self.flavor),
             enforcer_cost_input: planner_enforcer_cost_input(
                 &cost_facts,

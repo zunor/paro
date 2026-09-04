@@ -879,8 +879,11 @@ mod tests {
             .expect("staged root metadata");
         assert!(metadata.implementations.hash_join_runtime_filter);
         assert_eq!(
-            metadata.cost_facts.runtime_filter_probe_work_source,
-            Some(WorkSourceId(0))
+            metadata
+                .cost_facts
+                .runtime_filter_probe_work_sources
+                .as_ref(),
+            &[WorkSourceId(0)]
         );
         assert!(metadata
             .cost_facts

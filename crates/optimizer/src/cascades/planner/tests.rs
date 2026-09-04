@@ -81,8 +81,9 @@ fn calibrated_tuple_work_distinguishes_narrow_and_wide_intermediates() {
         runtime_filter_probe_multiplicity: RuntimeFilterProbeMultiplicity::Unknown,
         runtime_filter_build_left_probe_multiplicity: RuntimeFilterProbeMultiplicity::Unknown,
         runtime_filter_probe_source_rows: None,
-        runtime_filter_probe_work_source: None,
-        runtime_filter_build_left_probe_work_source: None,
+        runtime_filter_build_left_probe_source_rows: None,
+        runtime_filter_probe_work_sources: Box::new([]),
+        runtime_filter_build_left_probe_work_sources: Box::new([]),
         runtime_filter_build_distinct_expected: None,
         runtime_filter_key_types: Box::new([]),
     };
@@ -165,8 +166,9 @@ fn expression_cost_facts_read_current_group_cardinality() {
         runtime_filter_probe_multiplicity: RuntimeFilterProbeMultiplicity::Unknown,
         runtime_filter_build_left_probe_multiplicity: RuntimeFilterProbeMultiplicity::Unknown,
         runtime_filter_probe_source_rows: None,
-        runtime_filter_probe_work_source: None,
-        runtime_filter_build_left_probe_work_source: None,
+        runtime_filter_build_left_probe_source_rows: None,
+        runtime_filter_probe_work_sources: Box::new([]),
+        runtime_filter_build_left_probe_work_sources: Box::new([]),
         runtime_filter_build_distinct_expected: None,
         runtime_filter_key_types: Box::new([]),
     };
@@ -1206,6 +1208,73 @@ fn union_all_probe_owns_one_runtime_filter_with_two_scan_consumers() {
         physical.node(edge.consumer).kind,
         crate::physical::PhysicalNodeKind::RowsetScan(_)
     )));
+}
+
+#[test]
+fn build_left_semi_join_filters_every_union_all_probe_source() {
+    let mut first = test_base_get(0, 20_031, "first_probe", 10_000);
+    first.stats.estimated_cardinality = Some(CardinalityEstimate::exact(10_000));
+    let mut second = test_base_get(1, 20_032, "second_probe", 10_000);
+    second.stats.estimated_cardinality = Some(CardinalityEstimate::exact(10_000));
+    let mut union = LogicalPlan::synthetic(LogicalOperator::SetOperation(SetOperation::union(
+        2,
+        first,
+        second,
+        true,
+        vec![LogicalType::Integer],
+    )));
+    union.stats.estimated_cardinality = Some(CardinalityEstimate::exact(20_000));
+    let mut build = test_base_get(3, 20_033, "build", 20);
+    build.stats.estimated_cardinality = Some(CardinalityEstimate::exact(20));
+    let join = ComparisonJoin::new(
+        JoinType::Semi,
+        build,
+        union,
+        vec![JoinCondition::equality(
+            Expression::Reference(ReferenceExpression::new(0, LogicalType::Integer)),
+            Expression::Reference(ReferenceExpression::new(0, LogicalType::Integer)),
+        )],
+    );
+    assert!(supports_build_left_runtime_filter_auxiliary(&join, true));
+    let mut plan = LogicalPlan::synthetic(LogicalOperator::Join(Join::Comparison(join)));
+    plan.stats.estimated_cardinality = Some(CardinalityEstimate::exact(20));
+
+    let mut budget = SearchBudget::default();
+    budget.max_composite_region_groups = 8;
+    let input = MemoBuilder::build(plan, BindContext::new(), budget).unwrap();
+    let optimized = input
+        .optimize(&test_grant_classes())
+        .unwrap()
+        .variants
+        .into_vec()
+        .remove(0);
+    assert_eq!(
+        optimized
+            .contracts
+            .get(&optimized.plan.id)
+            .unwrap()
+            .implementation,
+        PhysicalImplementationFlavor::HashJoinBuildLeftRuntimeFilter
+    );
+    let physical =
+        crate::physical::PhysicalPlanExtractor::new(crate::physical::ExtractionContext::default())
+            .with_winner_contracts(optimized.contracts)
+            .with_enforcer_contracts(optimized.enforcers)
+            .requiring_winner_contracts()
+            .extract(&optimized.plan)
+            .unwrap();
+    crate::physical::PhysicalPlanVerifier::verify(&physical).unwrap();
+    assert_eq!(
+        physical
+            .edges
+            .iter()
+            .filter(|edge| matches!(
+                edge.kind,
+                crate::physical::PhysicalEdgeKind::RuntimeFilter(_)
+            ))
+            .count(),
+        2
+    );
 }
 
 #[test]

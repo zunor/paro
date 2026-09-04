@@ -314,8 +314,10 @@ pub(super) struct PlannerCostFacts {
     pub(super) runtime_filter_probe_multiplicity: RuntimeFilterProbeMultiplicity,
     pub(super) runtime_filter_build_left_probe_multiplicity: RuntimeFilterProbeMultiplicity,
     pub(super) runtime_filter_probe_source_rows: Option<paro_planner::plan::CardinalityEstimate>,
-    pub(super) runtime_filter_probe_work_source: Option<WorkSourceId>,
-    pub(super) runtime_filter_build_left_probe_work_source: Option<WorkSourceId>,
+    pub(super) runtime_filter_build_left_probe_source_rows:
+        Option<paro_planner::plan::CardinalityEstimate>,
+    pub(super) runtime_filter_probe_work_sources: Box<[WorkSourceId]>,
+    pub(super) runtime_filter_build_left_probe_work_sources: Box<[WorkSourceId]>,
     /// Snapshot estimate of the distinct build-key domain. This ranks
     /// runtime-filter benefit; it never proves capacity or correctness.
     pub(super) runtime_filter_build_distinct_expected: Option<u64>,
@@ -339,8 +341,9 @@ pub(super) struct ResolvedPlannerCostFacts {
     pub(super) runtime_filter_probe_multiplicity: RuntimeFilterProbeMultiplicity,
     pub(super) runtime_filter_build_left_probe_multiplicity: RuntimeFilterProbeMultiplicity,
     pub(super) runtime_filter_probe_source_rows: Option<CompactRange>,
-    pub(super) runtime_filter_probe_work_source: Option<WorkSourceId>,
-    pub(super) runtime_filter_build_left_probe_work_source: Option<WorkSourceId>,
+    pub(super) runtime_filter_build_left_probe_source_rows: Option<CompactRange>,
+    pub(super) runtime_filter_probe_work_sources: Box<[WorkSourceId]>,
+    pub(super) runtime_filter_build_left_probe_work_sources: Box<[WorkSourceId]>,
     pub(super) runtime_filter_build_distinct_expected: Option<u64>,
     pub(super) runtime_filter_key_types: Box<[LogicalType]>,
 }

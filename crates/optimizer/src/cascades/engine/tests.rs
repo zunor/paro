@@ -1018,7 +1018,7 @@ fn sideways_filter_scales_work_without_weakening_resource_proofs() {
         CostComposition::SidewaysFilter {
             overlapping_children: 1,
             filtered_child: 0,
-            source,
+            sources: Box::new([source]),
             expected_retained_ppm: 100_000,
         },
     )
@@ -1031,6 +1031,76 @@ fn sideways_filter_scales_work_without_weakening_resource_proofs() {
     assert_eq!(filtered.non_revocable_memory_upper, 40);
     assert_eq!(filtered.minimum_memory_bytes, 40);
     assert_eq!(filtered.peak_memory_upper, 80);
+}
+
+#[test]
+fn sideways_filter_attributes_one_predicate_cost_across_union_sources() {
+    let left_source = WorkSourceId(8);
+    let right_source = WorkSourceId(9);
+    let left = compose_candidate_cost_with_sources(
+        cost(100.0),
+        None,
+        &[],
+        &[],
+        CostComposition::Source {
+            source: left_source,
+        },
+    )
+    .unwrap();
+    let right = compose_candidate_cost_with_sources(
+        cost(300.0),
+        None,
+        &[],
+        &[],
+        CostComposition::Source {
+            source: right_source,
+        },
+    )
+    .unwrap();
+    let union = compose_candidate_cost_with_sources(
+        SearchCost::ZERO,
+        None,
+        &[left.cost, right.cost],
+        &[left.source_work.as_ref(), right.source_work.as_ref()],
+        CostComposition::Sequential,
+    )
+    .unwrap();
+    let filtered = compose_candidate_cost_with_sources(
+        cost(40.0),
+        Some(cost(20.0)),
+        &[union.cost],
+        &[union.source_work.as_ref()],
+        CostComposition::SidewaysFilter {
+            overlapping_children: 0,
+            filtered_child: 0,
+            sources: Box::new([left_source, right_source]),
+            expected_retained_ppm: 500_000,
+        },
+    )
+    .unwrap();
+
+    // The two scans retain 50% of their work. The one 20-unit predicate
+    // application is split 1:3 by source work, while the remaining 20 units
+    // of operator-local work stay outside both source lanes.
+    assert_eq!(filtered.cost.score.range.expected, 240.0);
+    assert_eq!(filtered.source_work[0].cost.score.range.expected, 50.0);
+    assert_eq!(filtered.source_work[1].cost.score.range.expected, 150.0);
+    assert_eq!(
+        filtered.source_work[0]
+            .filter_apply_cost
+            .score
+            .range
+            .expected,
+        5.0
+    );
+    assert_eq!(
+        filtered.source_work[1]
+            .filter_apply_cost
+            .score
+            .range
+            .expected,
+        15.0
+    );
 }
 
 #[test]
@@ -1060,7 +1130,7 @@ fn repeated_sideways_filters_scale_only_the_matching_source_lane() {
         CostComposition::SidewaysFilter {
             overlapping_children: 0,
             filtered_child: 0,
-            source,
+            sources: Box::new([source]),
             expected_retained_ppm: 500_000,
         },
     )
@@ -1073,7 +1143,7 @@ fn repeated_sideways_filters_scale_only_the_matching_source_lane() {
         CostComposition::SidewaysFilter {
             overlapping_children: 0,
             filtered_child: 0,
-            source,
+            sources: Box::new([source]),
             expected_retained_ppm: 100_000,
         },
     )
@@ -1103,7 +1173,7 @@ fn source_predicate_cost_is_reordered_by_runtime_selectivity() {
         CostComposition::SidewaysFilter {
             overlapping_children: 0,
             filtered_child: 0,
-            source,
+            sources: Box::new([source]),
             expected_retained_ppm: 500_000,
         },
     )
@@ -1116,7 +1186,7 @@ fn source_predicate_cost_is_reordered_by_runtime_selectivity() {
         CostComposition::SidewaysFilter {
             overlapping_children: 0,
             filtered_child: 0,
-            source,
+            sources: Box::new([source]),
             expected_retained_ppm: 100_000,
         },
     )

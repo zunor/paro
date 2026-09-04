@@ -303,7 +303,7 @@ pub struct ChildGoalAlternative {
 /// Physical lifecycle used when composing a candidate with its children.
 /// The mask names child pipelines whose peak can overlap operator-owned state;
 /// total work and critical path still follow the dependency order.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum CostComposition {
     /// Children exist only to carry a schema and are never scheduled.
     LocalOnly,
@@ -322,13 +322,13 @@ pub enum CostComposition {
     SidewaysFilter {
         overlapping_children: u64,
         filtered_child: u8,
-        source: WorkSourceId,
+        sources: Box<[WorkSourceId]>,
         expected_retained_ppm: u32,
     },
 }
 
 impl CostComposition {
-    pub(crate) fn overlapping_children(self) -> u64 {
+    pub(crate) fn overlapping_children(&self) -> u64 {
         match self {
             Self::LocalOnly | Self::Source { .. } | Self::Sequential => 0,
             Self::RetainedState {
@@ -337,18 +337,22 @@ impl CostComposition {
             | Self::SidewaysFilter {
                 overlapping_children,
                 ..
-            } => overlapping_children,
+            } => *overlapping_children,
         }
     }
 
-    pub(crate) fn sideways_filter(self) -> Option<(usize, WorkSourceId, u32)> {
+    pub(crate) fn sideways_filter(&self) -> Option<(usize, &[WorkSourceId], u32)> {
         match self {
             Self::SidewaysFilter {
                 filtered_child,
-                source,
+                sources,
                 expected_retained_ppm,
                 ..
-            } => Some((usize::from(filtered_child), source, expected_retained_ppm)),
+            } => Some((
+                usize::from(*filtered_child),
+                sources.as_ref(),
+                *expected_retained_ppm,
+            )),
             _ => None,
         }
     }

@@ -274,7 +274,10 @@ pub(super) fn planner_cost_composition(
             .get(1)
             .copied()
             .unwrap_or(CompactRange::ZERO);
-        if build.expected >= probe.expected {
+        let source = facts
+            .runtime_filter_build_left_probe_source_rows
+            .unwrap_or(probe);
+        if build.expected >= source.expected {
             return Ok(CostComposition::RetainedState {
                 overlapping_children,
             });
@@ -287,21 +290,24 @@ pub(super) fn planner_cost_composition(
         let hard_exact = resource
             .guarantees_exact_single_key(facts.child_rows_hard_upper.first().copied().flatten());
         let retained = runtime_filtered_probe_work(
-            probe,
+            source,
             build_domain,
             facts.runtime_filter_build_left_probe_multiplicity,
             hard_exact || resource.expects_exact_single_key(build_domain.expected),
         )?;
-        let Some(source) = facts.runtime_filter_build_left_probe_work_source else {
+        if facts
+            .runtime_filter_build_left_probe_work_sources
+            .is_empty()
+        {
             return Ok(CostComposition::RetainedState {
                 overlapping_children,
             });
-        };
+        }
         return Ok(CostComposition::SidewaysFilter {
             overlapping_children,
             filtered_child: 1,
-            source,
-            expected_retained_ppm: retained_ratio_ppm(retained.expected, probe.expected),
+            sources: facts.runtime_filter_build_left_probe_work_sources.clone(),
+            expected_retained_ppm: retained_ratio_ppm(retained.expected, source.expected),
         });
     }
     if flavor == PhysicalImplementationFlavor::HashJoinRuntimeFilter {
@@ -310,14 +316,11 @@ pub(super) fn planner_cost_composition(
                 overlapping_children,
             });
         };
-        let Some(work_source) = facts.runtime_filter_probe_work_source else {
-            // A union or otherwise plural source cannot be represented by one
-            // disjoint source-work lane. Keep the physical artifact, but do
-            // not claim a child-boundary cost reduction without that proof.
+        if facts.runtime_filter_probe_work_sources.is_empty() {
             return Ok(CostComposition::RetainedState {
                 overlapping_children,
             });
-        };
+        }
         let build = facts
             .child_rows
             .get(1)
@@ -348,7 +351,7 @@ pub(super) fn planner_cost_composition(
         return Ok(CostComposition::SidewaysFilter {
             overlapping_children,
             filtered_child: 0,
-            source: work_source,
+            sources: facts.runtime_filter_probe_work_sources.clone(),
             expected_retained_ppm: retained_ratio_ppm(retained.expected, source.expected),
         });
     }

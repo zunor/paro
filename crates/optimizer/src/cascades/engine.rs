@@ -758,6 +758,13 @@ impl CascadesEngine {
                     && admitted.len()
                         >= usize::from(self.memo.budget().max_composite_region_candidates)
                 {
+                    tracing::debug!(
+                        target: "paro::optimizer",
+                        memo_group = group.index(),
+                        implementation = candidate.key.implementation.0,
+                        region_candidate_count = admitted.len(),
+                        "optional physical candidate rejected by its region budget"
+                    );
                     return Ok(());
                 }
                 admitted.insert(candidate.physical_fingerprint);
@@ -767,6 +774,12 @@ impl CascadesEngine {
                 candidate.stable_event(goal),
             );
             if decision == BudgetDecision::Exhausted {
+                tracing::debug!(
+                    target: "paro::optimizer",
+                    memo_group = group.index(),
+                    implementation = candidate.key.implementation.0,
+                    "optional physical candidate rejected by its group budget"
+                );
                 return Ok(());
             }
         }
@@ -878,7 +891,7 @@ impl CascadesEngine {
             let Some(local_cost) = fit_local_retained_state_to_grant(
                 recipe.local_cost,
                 &child_costs,
-                recipe.cost_composition,
+                recipe.cost_composition.clone(),
                 recipe.spillable,
                 recipe.enforcer_cost_input,
             )?
@@ -903,7 +916,7 @@ impl CascadesEngine {
                 recipe.source_filter_apply_cost,
                 &child_costs,
                 &child_source_work_refs,
-                recipe.cost_composition,
+                recipe.cost_composition.clone(),
             )?;
             let source_work = composed.source_work;
             let Some(mut cost) =
@@ -1004,7 +1017,7 @@ impl CascadesEngine {
                     provided: enforced.provided,
                     local_cost,
                     source_filter_apply_cost: recipe.source_filter_apply_cost,
-                    cost_composition: recipe.cost_composition,
+                    cost_composition: recipe.cost_composition.clone(),
                     cost,
                     source_work,
                     physical_fingerprint: fingerprint,
@@ -1164,7 +1177,7 @@ fn build_joint_cost_proof(
         dependencies: dependencies.into_boxed_slice(),
         local_cost,
         source_filter_apply_cost: recipe.source_filter_apply_cost,
-        cost_composition: recipe.cost_composition,
+        cost_composition: recipe.cost_composition.clone(),
     }))
 }
 
@@ -1324,7 +1337,7 @@ pub(crate) fn compose_candidate_cost_with_sources(
             source_work: Box::new([]),
         });
     }
-    if let CostComposition::Source { source } = composition {
+    if let CostComposition::Source { source } = &composition {
         if !child_costs.is_empty() {
             return Err(paro_error::internal(
                 "a base source-work lane unexpectedly has child pipelines",
@@ -1334,7 +1347,7 @@ pub(crate) fn compose_candidate_cost_with_sources(
         return Ok(ComposedCost {
             cost,
             source_work: Box::new([SourceWork {
-                source,
+                source: *source,
                 cost: local_cost.work_only(),
                 filters: Box::new([]),
                 filter_apply_cost: SearchCost::ZERO,
@@ -1346,15 +1359,18 @@ pub(crate) fn compose_candidate_cost_with_sources(
     for (index, child) in child_costs.iter().copied().enumerate() {
         let mut child = child;
         let mut lanes = child_source_work[index].to_vec();
-        if let Some((filtered_child, source, expected)) = sideways_filter {
+        if let Some((filtered_child, sources, expected)) = sideways_filter {
             if index == filtered_child {
-                let matching_lanes = lanes.iter().filter(|lane| lane.source == source).count();
-                if matching_lanes > 1 {
+                let matching_lanes = lanes
+                    .iter()
+                    .filter(|lane| sources.contains(&lane.source))
+                    .count();
+                if matching_lanes != sources.len() {
                     return Err(paro_error::internal(
-                        "one runtime filter resolved to multiple identical source-work lanes",
+                        "runtime filter lineage does not match its source-work lanes",
                     ));
                 }
-                if matching_lanes == 1 {
+                if matching_lanes != 0 {
                     let full_apply_cost = source_filter_apply_cost.ok_or_else(|| {
                         paro_error::internal(
                             "sideways-filter composition has no predicate-application cost",
@@ -1362,11 +1378,47 @@ pub(crate) fn compose_candidate_cost_with_sources(
                     })?;
                     cost = cost.replace_work(full_apply_cost, SearchCost::ZERO)?;
                 }
+                let matching_work = lanes
+                    .iter()
+                    .filter(|lane| sources.contains(&lane.source))
+                    .map(|lane| lane.cost.score.range.expected.max(0.0))
+                    .sum::<f64>();
+                // Predicate evaluation is one operator-local cost before it
+                // is attributed to source lanes. Allocate every ppm exactly
+                // once so splitting a UNION into more branches cannot create
+                // or discard work through independent rounding.
+                let mut apply_shares = Vec::with_capacity(matching_lanes);
+                let mut unallocated_ppm = 1_000_000_u32;
+                for lane in lanes.iter().filter(|lane| sources.contains(&lane.source)) {
+                    let remaining_lanes = matching_lanes - apply_shares.len();
+                    let share = if remaining_lanes == 1 {
+                        unallocated_ppm
+                    } else if matching_work > 0.0 {
+                        ((lane.cost.score.range.expected.max(0.0) / matching_work * 1_000_000.0)
+                            .floor() as u32)
+                            .min(unallocated_ppm)
+                    } else {
+                        unallocated_ppm
+                            / u32::try_from(remaining_lanes).map_err(|_| {
+                                paro_error::internal(
+                                    "runtime filter has too many source-work lanes",
+                                )
+                            })?
+                    };
+                    apply_shares.push(share);
+                    unallocated_ppm -= share;
+                }
+                debug_assert_eq!(unallocated_ppm, 0);
+                let mut apply_shares = apply_shares.into_iter();
                 for lane in &mut lanes {
-                    if lane.source == source {
-                        let full_apply_cost = source_filter_apply_cost.expect(
+                    if sources.contains(&lane.source) {
+                        let total_apply_cost = source_filter_apply_cost.expect(
                             "matching source-work lane established predicate application cost",
                         );
+                        let share = apply_shares
+                            .next()
+                            .expect("one predicate-cost share per matching source lane");
+                        let full_apply_cost = total_apply_cost.retain_work(share, 1_000_000)?;
                         // Runtime filters are speculative: stale statistics or
                         // a coarse representation can retain every source row.
                         let retained = lane.cost.retain_work(expected, 1_000_000)?;
@@ -1386,7 +1438,7 @@ pub(crate) fn compose_candidate_cost_with_sources(
                 }
                 tracing::debug!(
                     target: "paro::optimizer",
-                    source = source.0,
+                    source_count = sources.len(),
                     matching_lanes,
                     expected_retained_ppm = expected,
                     child_expected_cost = child.score.range.expected,

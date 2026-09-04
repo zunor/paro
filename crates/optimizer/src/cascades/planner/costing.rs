@@ -48,6 +48,10 @@ pub(super) fn planner_implementation_set(
                         JoinComparisonType::Equal | JoinComparisonType::NotDistinctFrom
                     )
                 });
+            let mark_needs_scoped_nulls = matches!(
+                join.mark_semantics,
+                paro_planner::operator::MarkJoinSemantics::ThreeValuedFrom(start) if start > 0
+            );
             let supports_hash_type = matches!(
                 join.join_type,
                 JoinType::Left
@@ -63,16 +67,25 @@ pub(super) fn planner_implementation_set(
             );
             let supports_build_left_type = matches!(
                 join.join_type,
-                JoinType::Left | JoinType::Right | JoinType::Inner | JoinType::Outer
+                JoinType::Left
+                    | JoinType::Right
+                    | JoinType::Inner
+                    | JoinType::Outer
+                    | JoinType::Semi
+                    | JoinType::Anti
+                    | JoinType::RightSemi
+                    | JoinType::RightAnti
             ) && join.anti_join_mode == AntiJoinMode::Regular;
             let baseline = if has_hash_key
                 && !mark_has_residual
+                && !mark_needs_scoped_nulls
                 && supports_hash_type
                 && join.build_side_constraint.allows_right()
             {
                 PhysicalImplementationFlavor::HashJoin
             } else if has_hash_key
                 && !mark_has_residual
+                && !mark_needs_scoped_nulls
                 && supports_build_left_type
                 && join.build_side_constraint.allows_left()
             {
@@ -194,7 +207,10 @@ pub(super) fn supports_build_left_runtime_filter_auxiliary(
 ) -> bool {
     if !rowset_scan_pushdown
         || join.anti_join_mode != AntiJoinMode::Regular
-        || !matches!(join.join_type, JoinType::Inner | JoinType::Left)
+        || !matches!(
+            join.join_type,
+            JoinType::Inner | JoinType::Left | JoinType::Semi | JoinType::Anti
+        )
     {
         return false;
     }
@@ -222,19 +238,18 @@ pub(super) fn supports_build_left_runtime_filter_auxiliary(
         };
         output_index
             .and_then(|index| runtime_filter_probe_lineages(&join.right, index))
-            .is_some_and(|lineage| !lineage.crossed_join && !lineage.sources.is_empty())
+            .is_some_and(|lineage| !lineage.sources.is_empty())
     })
 }
 
 struct RuntimeFilterProbeLineage<'a> {
     sources: Vec<&'a LogicalPlan>,
-    crossed_join: bool,
 }
 
-fn singular_runtime_filter_work_source(
+fn runtime_filter_work_sources(
     plan: &LogicalPlan,
     expression: &Expression,
-) -> Option<WorkSourceId> {
+) -> Option<Vec<WorkSourceId>> {
     let bindings = plan.get_column_bindings();
     let output_index = match expression {
         Expression::ColumnRef(column) if column.depth == 0 => bindings
@@ -244,38 +259,41 @@ fn singular_runtime_filter_work_source(
         _ => None,
     }?;
     let lineage = runtime_filter_probe_lineages(plan, output_index)?;
-    let mut sources = lineage.sources.into_iter().map(|source| {
-        let get = match &source.operator {
-            LogicalOperator::Get(get) => get,
-            LogicalOperator::SearchScan(search) => &search.get,
-            LogicalOperator::FullTextFilterScan(search) => &search.get,
-            _ => return None,
-        };
-        Some(WorkSourceId(get.table_index))
-    });
-    let source = sources.next()??;
-    sources
-        .all(|candidate| candidate == Some(source))
-        .then_some(source)
+    let mut sources = lineage
+        .sources
+        .into_iter()
+        .map(|source| {
+            let get = match &source.operator {
+                LogicalOperator::Get(get) => get,
+                LogicalOperator::SearchScan(search) => &search.get,
+                LogicalOperator::FullTextFilterScan(search) => &search.get,
+                _ => return None,
+            };
+            Some(WorkSourceId(get.table_index))
+        })
+        .collect::<Option<Vec<_>>>()?;
+    sources.sort_unstable();
+    sources.dedup();
+    (!sources.is_empty()).then_some(sources)
 }
 
-fn common_runtime_filter_work_source<'a>(
+fn common_runtime_filter_work_sources<'a>(
     plan: &LogicalPlan,
     expressions: impl IntoIterator<Item = &'a Expression>,
-) -> Option<WorkSourceId> {
+) -> Option<Box<[WorkSourceId]>> {
     let mut sources = expressions
         .into_iter()
-        .map(|expression| singular_runtime_filter_work_source(plan, expression));
+        .map(|expression| runtime_filter_work_sources(plan, expression));
     let source = sources.next()??;
     sources
-        .all(|candidate| candidate == Some(source))
-        .then_some(source)
+        .all(|candidate| candidate.as_ref() == Some(&source))
+        .then(|| source.into_boxed_slice())
 }
 
-pub(super) fn runtime_filter_probe_work_source(
+pub(super) fn runtime_filter_probe_work_sources(
     join: &paro_planner::operator::ComparisonJoin,
-) -> Option<WorkSourceId> {
-    common_runtime_filter_work_source(
+) -> Option<Box<[WorkSourceId]>> {
+    common_runtime_filter_work_sources(
         &join.left,
         join.conditions
             .iter()
@@ -284,10 +302,10 @@ pub(super) fn runtime_filter_probe_work_source(
     )
 }
 
-pub(super) fn runtime_filter_build_left_probe_work_source(
+pub(super) fn runtime_filter_build_left_probe_work_sources(
     join: &paro_planner::operator::ComparisonJoin,
-) -> Option<WorkSourceId> {
-    common_runtime_filter_work_source(
+) -> Option<Box<[WorkSourceId]>> {
+    common_runtime_filter_work_sources(
         &join.right,
         join.conditions
             .iter()
@@ -306,7 +324,6 @@ fn runtime_filter_probe_lineages(
         {
             Some(RuntimeFilterProbeLineage {
                 sources: vec![plan],
-                crossed_join: false,
             })
         }
         LogicalOperator::SearchScan(search) if search.get.table.is_some() => {
@@ -322,7 +339,6 @@ fn runtime_filter_probe_lineages(
             search.get.stored_column(source_index)?;
             Some(RuntimeFilterProbeLineage {
                 sources: vec![plan],
-                crossed_join: false,
             })
         }
         LogicalOperator::FullTextFilterScan(search) if search.get.table.is_some() => {
@@ -333,7 +349,6 @@ fn runtime_filter_probe_lineages(
             search.get.stored_column(source_index)?;
             Some(RuntimeFilterProbeLineage {
                 sources: vec![plan],
-                crossed_join: false,
             })
         }
         LogicalOperator::Filter(filter) => {
@@ -366,7 +381,6 @@ fn runtime_filter_probe_lineages(
             let mut left = runtime_filter_probe_lineages(&setop.left, output_index)?;
             let right = runtime_filter_probe_lineages(&setop.right, output_index)?;
             left.sources.extend(right.sources);
-            left.crossed_join |= right.crossed_join;
             Some(left)
         }
         LogicalOperator::Join(Join::Comparison(inner))
@@ -378,9 +392,7 @@ fn runtime_filter_probe_lineages(
                 .left_projection_map
                 .to_indices(inner.left.types().len());
             if let Some(&child_index) = left_projection.get(output_index) {
-                let mut lineage = runtime_filter_probe_lineages(&inner.left, child_index)?;
-                lineage.crossed_join = true;
-                return Some(lineage);
+                return runtime_filter_probe_lineages(&inner.left, child_index);
             }
             if inner.join_type == JoinType::Left {
                 // A left outer join preserves every row from its left child.
@@ -394,10 +406,7 @@ fn runtime_filter_probe_lineages(
             let right_projection = inner
                 .right_projection_map
                 .to_indices(inner.right.types().len());
-            let mut lineage =
-                runtime_filter_probe_lineages(&inner.right, *right_projection.get(right_output)?)?;
-            lineage.crossed_join = true;
-            Some(lineage)
+            runtime_filter_probe_lineages(&inner.right, *right_projection.get(right_output)?)
         }
         // A CTE reference is not a rowset consumer. Crossing it requires one
         // AuxiliaryPlanRegion jointly owned by the CTE producer, every
@@ -406,34 +415,56 @@ fn runtime_filter_probe_lineages(
     }
 }
 
+fn runtime_filter_source_rows(
+    plan: &LogicalPlan,
+    expressions: impl IntoIterator<Item = Expression>,
+) -> Option<paro_planner::plan::CardinalityEstimate> {
+    let probe_bindings = plan.get_column_bindings();
+    expressions.into_iter().find_map(|expression| {
+        let output_index = match expression {
+            Expression::ColumnRef(column) if column.depth == 0 => probe_bindings
+                .iter()
+                .position(|binding| *binding == column.binding),
+            Expression::Reference(reference) => Some(reference.index),
+            _ => None,
+        }?;
+        let lineage = runtime_filter_probe_lineages(plan, output_index)?;
+        lineage.sources.into_iter().try_fold(
+            paro_planner::plan::CardinalityEstimate::exact(0),
+            |sum, source| {
+                let rows = source.stats.estimated_cardinality?;
+                Some(paro_planner::plan::CardinalityEstimate {
+                    min: sum.min.saturating_add(rows.min),
+                    expected: sum.expected.saturating_add(rows.expected),
+                    max: sum.max.saturating_add(rows.max),
+                })
+            },
+        )
+    })
+}
+
 pub(super) fn runtime_filter_probe_source_rows(
     join: &paro_planner::operator::ComparisonJoin,
 ) -> Option<paro_planner::plan::CardinalityEstimate> {
-    let probe_bindings = join.left.get_column_bindings();
-    join.conditions
-        .iter()
-        .filter(|condition| condition.comparison == JoinComparisonType::Equal)
-        .find_map(|condition| {
-            let output_index = match &condition.left {
-                Expression::ColumnRef(column) if column.depth == 0 => probe_bindings
-                    .iter()
-                    .position(|binding| *binding == column.binding),
-                Expression::Reference(reference) => Some(reference.index),
-                _ => None,
-            }?;
-            let lineage = runtime_filter_probe_lineages(&join.left, output_index)?;
-            lineage.sources.into_iter().try_fold(
-                paro_planner::plan::CardinalityEstimate::exact(0),
-                |sum, source| {
-                    let rows = source.stats.estimated_cardinality?;
-                    Some(paro_planner::plan::CardinalityEstimate {
-                        min: sum.min.saturating_add(rows.min),
-                        expected: sum.expected.saturating_add(rows.expected),
-                        max: sum.max.saturating_add(rows.max),
-                    })
-                },
-            )
-        })
+    runtime_filter_source_rows(
+        &join.left,
+        join.conditions
+            .iter()
+            .filter(|condition| condition.comparison == JoinComparisonType::Equal)
+            .map(|condition| condition.left.clone()),
+    )
+}
+
+pub(super) fn runtime_filter_build_left_probe_source_rows(
+    join: &paro_planner::operator::ComparisonJoin,
+) -> Option<paro_planner::plan::CardinalityEstimate> {
+    runtime_filter_source_rows(
+        &join.right,
+        join.conditions
+            .iter()
+            .filter(|condition| condition.comparison == JoinComparisonType::Equal)
+            .map(|condition| condition.right.clone()),
+    )
 }
 
 pub(super) fn selected_implementation_flavor(
@@ -754,8 +785,11 @@ pub(super) fn implementation_cost(
                 )?
             } else if flavor == PhysicalImplementationFlavor::HashJoinBuildLeftRuntimeFilter {
                 let build_domain = CompactRange::new(0.0, left.expected, left.upper)?;
+                let source = facts
+                    .runtime_filter_build_left_probe_source_rows
+                    .unwrap_or(right);
                 work.add(OP_RUNTIME_FILTER_BUILD_ROW, build_work)?;
-                work.add(OP_RUNTIME_FILTER_APPLY_ROW, right)?;
+                work.add(OP_RUNTIME_FILTER_APPLY_ROW, source)?;
                 let resource = crate::physical::RuntimeFilterResourceContract::for_keys(
                     &facts.runtime_filter_key_types,
                     max_concurrent_tasks,
@@ -763,7 +797,7 @@ pub(super) fn implementation_cost(
                 let exact_expected = resource.guarantees_exact_single_key(build_hard_upper)
                     || resource.expects_exact_single_key(build_domain.expected);
                 runtime_filtered_probe_work(
-                    right,
+                    source,
                     build_domain,
                     facts.runtime_filter_build_left_probe_multiplicity,
                     exact_expected,
@@ -947,9 +981,8 @@ pub(super) fn runtime_filter_apply_cost(
             })
         }
         PhysicalImplementationFlavor::HashJoinBuildLeftRuntimeFilter => facts
-            .child_rows
-            .get(1)
-            .copied()
+            .runtime_filter_build_left_probe_source_rows
+            .or_else(|| facts.child_rows.get(1).copied())
             .unwrap_or(CompactRange::ZERO),
         _ => return Ok(None),
     };
@@ -1371,8 +1404,11 @@ pub(super) fn runtime_filtered_probe_work(
         }
         let ratio = (build_rows / probe_rows).clamp(0.0, 1.0);
         // Without a joint histogram the expected benefit is deliberately
-        // damped. The upper bound retains the no-benefit fallback.
-        probe_rows * ratio.sqrt().clamp(0.1, 1.0)
+        // damped. Do not add a fixed survivor floor here: exact membership has
+        // no false positives, while key skew is already represented by the
+        // square-root estimate and the complete-probe risk upper. Coarse
+        // representations receive their separate 25% floor below.
+        probe_rows * ratio.sqrt()
     };
     let expected = match (exact_single_key, probe_multiplicity) {
         (true, RuntimeFilterProbeMultiplicity::DeclaredUnique) => {
@@ -1381,7 +1417,15 @@ pub(super) fn runtime_filtered_probe_work(
         (true, RuntimeFilterProbeMultiplicity::EstimatedUnique) => {
             retained(probe.expected, build.expected).min(build.expected * 1.25)
         }
-        _ => retained(probe.expected, build.expected)
+        (true, RuntimeFilterProbeMultiplicity::Unknown) => {
+            // Exact membership cannot admit a key outside the build domain.
+            // Unknown multiplicity only prevents a row-count bound; the
+            // square-root damping and full risk upper already represent key
+            // skew, so applying the additional coarse-filter 25% floor would
+            // erase all useful ranking for small exact domains.
+            retained(probe.expected, build.expected)
+        }
+        (false, _) => retained(probe.expected, build.expected)
             .max(probe.expected * 0.25)
             .min(probe.expected),
     };
@@ -1709,9 +1753,26 @@ mod tests {
             false,
         )
         .unwrap();
+        let small_exact_domain = CompactRange::new(50.0, 100.0, 150.0).unwrap();
+        let exact_unconstrained = runtime_filtered_probe_work(
+            probe,
+            small_exact_domain,
+            RuntimeFilterProbeMultiplicity::Unknown,
+            true,
+        )
+        .unwrap();
+        let coarse_unconstrained = runtime_filtered_probe_work(
+            probe,
+            small_exact_domain,
+            RuntimeFilterProbeMultiplicity::Unknown,
+            false,
+        )
+        .unwrap();
 
         assert_eq!(unique.upper, 100_000.0);
         assert_eq!(unconstrained.upper, 100_000.0);
+        assert_eq!(exact_unconstrained.upper, 100_000.0);
         assert!(unique.expected < unconstrained.expected);
+        assert!(exact_unconstrained.expected < coarse_unconstrained.expected);
     }
 }

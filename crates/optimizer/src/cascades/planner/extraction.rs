@@ -156,7 +156,7 @@ pub(super) fn extract_planner_tree(
                         winner.source_filter_apply_cost,
                         &child_costs,
                         &child_source_work,
-                        winner.cost_composition,
+                        winner.cost_composition.clone(),
                     )?
                     .cost,
                     winner.enforcer_cost_input,

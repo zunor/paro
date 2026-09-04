@@ -146,7 +146,7 @@ impl WinnerVerifier {
                         winner.source_filter_apply_cost,
                         &child_costs,
                         &child_source_work,
-                        winner.cost_composition,
+                        winner.cost_composition.clone(),
                     )?;
                     if recomposed.source_work != winner.source_work {
                         return Err(paro_error::internal(
