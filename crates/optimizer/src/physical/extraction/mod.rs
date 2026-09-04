@@ -397,16 +397,19 @@ impl PhysicalPlanExtractor {
                     "runtime-filter candidate has no row-preserving rowset-scan consumer",
                 ));
             }
+            let (condition_indices, key_types): (Vec<_>, Vec<_>) = spec
+                .key_conditions
+                .iter()
+                .enumerate()
+                .filter(|(_, condition)| condition.comparison == JoinComparisonType::Equal)
+                .map(|(index, condition)| (index, condition.right.return_type()))
+                .unzip();
             spec.runtime_filter = Some(HashJoinRuntimeFilterSpec {
                 artifact,
                 wait_policy: RuntimeFilterWaitPolicy::WaitComplete,
+                condition_indices: condition_indices.into_boxed_slice(),
                 resource: crate::physical::RuntimeFilterResourceContract::for_keys(
-                    &spec
-                        .key_conditions
-                        .iter()
-                        .filter(|condition| condition.comparison == JoinComparisonType::Equal)
-                        .map(|condition| condition.right.return_type())
-                        .collect::<Vec<_>>(),
+                    &key_types,
                     u16::try_from(self.ctx.max_threads).unwrap_or(u16::MAX),
                 )?,
             });

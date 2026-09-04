@@ -813,6 +813,37 @@ impl JoinRuntimeFilterBuilder {
         Ok(())
     }
 
+    pub(crate) fn add_mapped_key_chunk(
+        &mut self,
+        keys: &Chunk,
+        condition_indices: &[usize],
+        selection: &SelectionVector,
+        selected_count: usize,
+    ) -> Result<()> {
+        if condition_indices.len() != self.keys.len() {
+            return Err(paro_error::internal(format!(
+                "hash join runtime filter mapping count mismatch: sketch={}, mapping={}",
+                self.keys.len(),
+                condition_indices.len()
+            )));
+        }
+        if selected_count > selection.len() {
+            return Err(paro_error::internal(format!(
+                "hash join runtime filter selected count exceeds selection length: selected={selected_count}, selection={}",
+                selection.len()
+            )));
+        }
+        for (key, &condition_index) in self.keys.iter_mut().zip(condition_indices) {
+            let vector = keys.column(condition_index).ok_or_else(|| {
+                paro_error::internal(
+                    "hash join runtime filter mapping references a missing key column",
+                )
+            })?;
+            key.add_selected(vector, keys.size(), selection, selected_count)?;
+        }
+        Ok(())
+    }
+
     pub(crate) fn merge(&mut self, incoming: Self) -> Result<()> {
         if self.keys.len() != incoming.keys.len() {
             return Err(paro_error::internal(format!(
@@ -1210,6 +1241,31 @@ mod tests {
 
         assert_eq!(
             filter.predicate_for_column(0, 9),
+            Some(PredicateTree::leaf(Predicate::FixedIn {
+                column_id: 9,
+                values: FixedMembership::i64(vec![10, 20, 30]),
+            }))
+        );
+    }
+
+    #[test]
+    fn mapped_domain_reads_only_runtime_filter_join_keys() {
+        let allocator = test_allocator();
+        let ignored = test_i64_vector_with_allocator(&[100, 200, 300], allocator.clone());
+        let filtered = test_i64_vector_with_allocator(&[30, 10, 20], allocator.clone());
+        let keys = Chunk::from_arc_vectors(
+            vec![std::sync::Arc::new(ignored), std::sync::Arc::new(filtered)],
+            allocator.clone(),
+        );
+        let selection = SelectionVector::try_incremental(3, allocator).unwrap();
+        let mut builder = JoinRuntimeFilterBuilder::empty(&[LogicalType::BigInt]);
+
+        builder
+            .add_mapped_key_chunk(&keys, &[1], &selection, 3)
+            .unwrap();
+
+        assert_eq!(
+            builder.freeze().predicate_for_column(0, 9),
             Some(PredicateTree::leaf(Predicate::FixedIn {
                 column_id: 9,
                 values: FixedMembership::i64(vec![10, 20, 30]),

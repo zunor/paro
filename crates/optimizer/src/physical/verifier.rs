@@ -141,15 +141,7 @@ impl PhysicalPlanVerifier {
             if let crate::physical::PhysicalNodeKind::HashJoin(spec) = &node.kind {
                 verify_hash_join_output_permutation(spec)?;
                 if let Some(runtime_filter) = &spec.runtime_filter {
-                    let equality_key_count = spec
-                        .key_conditions
-                        .iter()
-                        .filter(|condition| {
-                            condition.comparison
-                                == paro_planner::operator::join::JoinComparisonType::Equal
-                        })
-                        .count();
-                    runtime_filter.resource.validate(equality_key_count)?;
+                    runtime_filter.mapped_key_types(&spec.key_conditions)?;
                     if let Some(resources) = plan.execution_resources {
                         if runtime_filter.resource.max_local_builders
                             != resources.max_parallel_tasks
@@ -415,14 +407,11 @@ fn verify_hash_join_output_permutation(spec: &crate::physical::HashJoinSpec) -> 
             "hash join visible build output exceeds its payload layout",
         ));
     };
-    let valid_mark_contract = match spec.join_type {
-        paro_planner::operator::join::JoinType::Mark => matches!(
-            spec.mark_semantics,
-            paro_planner::operator::MarkJoinSemantics::TwoValued
-                | paro_planner::operator::MarkJoinSemantics::ThreeValuedFrom(0)
-        ),
-        _ => spec.mark_semantics == paro_planner::operator::MarkJoinSemantics::NotMark,
-    };
+    let valid_mark_contract = crate::physical::hash_join_mark_contract_is_supported(
+        spec.join_type,
+        spec.mark_semantics,
+        !spec.build_residual_conditions.is_empty(),
+    );
     if !valid_mark_contract {
         return Err(paro_error::internal(
             "hash join has an incompatible MARK truth-value contract",

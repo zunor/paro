@@ -375,6 +375,31 @@ impl PipelineGraph {
             }
         }
 
+        for pipeline in &self.pipelines {
+            for transform in &pipeline.transforms {
+                let TransformSpec::HashJoinProbe(probe) = transform else {
+                    continue;
+                };
+                let Some(key_index) = probe.covering_runtime_filter_key else {
+                    continue;
+                };
+                let SourceSpec::Rowset(source) = &pipeline.source else {
+                    return Err(paro_error::internal(
+                        "hash probe replacement has no rowset filter installation",
+                    ));
+                };
+                if !source.dynamic_runtime_filters.iter().any(|filter| {
+                    filter.handle == probe.handle
+                        && filter.runtime_filter_key_index == key_index
+                        && filter.application == RuntimeFilterApplication::ProbeReplacementEligible
+                }) {
+                    return Err(paro_error::internal(
+                        "hash probe replacement is not authorized by its runtime-filter installation",
+                    ));
+                }
+            }
+        }
+
         for producer in &self.pipelines {
             let SinkSpec::HashJoinBuild(build) = &producer.sink else {
                 continue;
@@ -673,12 +698,23 @@ impl RowsetSourceSpec {
     }
 }
 
+/// Semantic authority granted to one concrete runtime-filter installation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RuntimeFilterApplication {
+    /// The filter is a pruning hint; the hash probe remains authoritative.
+    FilteringOnly,
+    /// This installation covers the probe key and may replace the hash probe
+    /// if the materialized runtime representation is exact.
+    ProbeReplacementEligible,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct RowsetDynamicRuntimeFilterSpec {
     pub handle: BreakerHandleId,
     pub artifact: crate::physical::Fingerprint,
-    pub build_key_index: usize,
+    pub runtime_filter_key_index: usize,
     pub probe_column_id: u32,
+    pub application: RuntimeFilterApplication,
 }
 
 /// Scan predicate derived from a materialized scalar join input.

@@ -69,7 +69,9 @@ pub(crate) fn hash_join_probe_transform(
     debug_assert!(spec.probe_residual_count <= spec.build_residual_conditions.len());
     TransformSpec::HashJoinProbe(HashJoinProbeSpec {
         handle,
-        covering_runtime_filter_key: hash_join_runtime_filter_probe_candidate(spec),
+        // A concrete rowset installation grants this authority when the
+        // pipeline is sealed. Candidates never enable probe replacement.
+        covering_runtime_filter_key: None,
         join_type: spec.join_type,
         anti_join_mode: spec.anti_join_mode,
         mark_semantics: spec.mark_semantics,
@@ -84,7 +86,7 @@ pub(crate) fn hash_join_probe_transform(
     })
 }
 
-fn hash_join_runtime_filter_probe_candidate(spec: &HashJoinSpec) -> Option<usize> {
+pub(crate) fn hash_join_runtime_filter_probe_candidate(spec: &HashJoinSpec) -> Option<usize> {
     let [condition] = spec.key_conditions.as_ref() else {
         return None;
     };
@@ -97,6 +99,7 @@ fn hash_join_runtime_filter_probe_candidate(spec: &HashJoinSpec) -> Option<usize
         && spec.probe_residual_count == 0
         && spec.reduction_cascade.is_none()
         && condition.comparison == JoinComparisonType::Equal
+        && runtime_filter.condition_indices.as_ref() == [0]
         && runtime_filter
             .resource
             .keys

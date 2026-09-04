@@ -10,6 +10,26 @@ use std::sync::Arc;
 use super::SpillExecutionPolicy;
 use crate::physical::identity::Fingerprint;
 
+/// Validate the truth-value contract implemented by the physical hash probe.
+/// This is the single capability boundary shared by implementation selection,
+/// extraction, and physical-plan verification.
+pub fn hash_join_mark_contract_is_supported(
+    join_type: JoinType,
+    semantics: MarkJoinSemantics,
+    has_residual_condition: bool,
+) -> bool {
+    match join_type {
+        JoinType::Mark => {
+            !has_residual_condition
+                && matches!(
+                    semantics,
+                    MarkJoinSemantics::TwoValued | MarkJoinSemantics::ThreeValuedFrom(0)
+                )
+        }
+        _ => semantics == MarkJoinSemantics::NotMark,
+    }
+}
+
 /// Immutable bijection from the executor's natural join-output ordinals to
 /// the SQL-facing output ordinals.
 ///
@@ -127,7 +147,50 @@ pub enum RuntimeFilterWaitPolicy {
 pub struct HashJoinRuntimeFilterSpec {
     pub artifact: Fingerprint,
     pub wait_policy: RuntimeFilterWaitPolicy,
+    /// Runtime-domain ordinal -> hash-join condition ordinal. Only ordinary
+    /// equality is safe: NOT DISTINCT FROM would require NULL membership.
+    pub condition_indices: Box<[usize]>,
     pub resource: crate::physical::RuntimeFilterResourceContract,
+}
+
+impl HashJoinRuntimeFilterSpec {
+    pub fn mapped_key_types(
+        &self,
+        conditions: &[JoinCondition],
+    ) -> paro_common::error::Result<Vec<LogicalType>> {
+        self.resource.validate(self.condition_indices.len())?;
+        let mut previous = None;
+        let mut key_types = Vec::with_capacity(self.condition_indices.len());
+        for &condition_index in &self.condition_indices {
+            if previous.is_some_and(|previous| previous >= condition_index) {
+                return Err(paro_common::error::internal(
+                    "runtime-filter condition mapping is not strictly ordered",
+                ));
+            }
+            let condition = conditions.get(condition_index).ok_or_else(|| {
+                paro_common::error::internal(
+                    "runtime-filter condition mapping references a missing join key",
+                )
+            })?;
+            if condition.comparison != paro_planner::operator::join::JoinComparisonType::Equal {
+                return Err(paro_common::error::internal(
+                    "runtime-filter condition mapping contains a non-equality join key",
+                ));
+            }
+            key_types.push(condition.right.return_type());
+            previous = Some(condition_index);
+        }
+        let expected = crate::physical::RuntimeFilterResourceContract::for_keys(
+            &key_types,
+            self.resource.max_local_builders,
+        )?;
+        if expected.keys != self.resource.keys || expected.capability != self.resource.capability {
+            return Err(paro_common::error::internal(
+                "runtime-filter representations disagree with their mapped join keys",
+            ));
+        }
+        Ok(key_types)
+    }
 }
 
 #[cfg(test)]

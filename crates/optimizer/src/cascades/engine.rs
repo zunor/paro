@@ -1365,11 +1365,6 @@ pub(crate) fn compose_candidate_cost_with_sources(
                     .iter()
                     .filter(|lane| sources.contains(&lane.source))
                     .count();
-                if matching_lanes != sources.len() {
-                    return Err(paro_error::internal(
-                        "runtime filter lineage does not match its source-work lanes",
-                    ));
-                }
                 if matching_lanes != 0 {
                     let full_apply_cost = source_filter_apply_cost.ok_or_else(|| {
                         paro_error::internal(
@@ -1377,68 +1372,68 @@ pub(crate) fn compose_candidate_cost_with_sources(
                         )
                     })?;
                     cost = cost.replace_work(full_apply_cost, SearchCost::ZERO)?;
-                }
-                let matching_work = lanes
-                    .iter()
-                    .filter(|lane| sources.contains(&lane.source))
-                    .map(|lane| lane.cost.score.range.expected.max(0.0))
-                    .sum::<f64>();
-                // Predicate evaluation is one operator-local cost before it
-                // is attributed to source lanes. Allocate every ppm exactly
-                // once so splitting a UNION into more branches cannot create
-                // or discard work through independent rounding.
-                let mut apply_shares = Vec::with_capacity(matching_lanes);
-                let mut unallocated_ppm = 1_000_000_u32;
-                for lane in lanes.iter().filter(|lane| sources.contains(&lane.source)) {
-                    let remaining_lanes = matching_lanes - apply_shares.len();
-                    let share = if remaining_lanes == 1 {
-                        unallocated_ppm
-                    } else if matching_work > 0.0 {
-                        ((lane.cost.score.range.expected.max(0.0) / matching_work * 1_000_000.0)
-                            .floor() as u32)
-                            .min(unallocated_ppm)
-                    } else {
-                        unallocated_ppm
-                            / u32::try_from(remaining_lanes).map_err(|_| {
-                                paro_error::internal(
-                                    "runtime filter has too many source-work lanes",
-                                )
-                            })?
-                    };
-                    apply_shares.push(share);
-                    unallocated_ppm -= share;
-                }
-                debug_assert_eq!(unallocated_ppm, 0);
-                let mut apply_shares = apply_shares.into_iter();
-                for lane in &mut lanes {
-                    if sources.contains(&lane.source) {
-                        let total_apply_cost = source_filter_apply_cost.expect(
-                            "matching source-work lane established predicate application cost",
-                        );
-                        let share = apply_shares
-                            .next()
-                            .expect("one predicate-cost share per matching source lane");
-                        let full_apply_cost = total_apply_cost.retain_work(share, 1_000_000)?;
-                        // Runtime filters are speculative: stale statistics or
-                        // a coarse representation can retain every source row.
-                        let retained = lane.cost.retain_work(expected, 1_000_000)?;
-                        child = child.replace_work(lane.cost, retained)?;
-                        lane.cost = retained;
-                        let old_apply_cost = lane.filter_apply_cost;
-                        let mut filters = lane.filters.to_vec();
-                        filters.push(SourceFilterWork {
-                            expected_retained_ppm: expected,
-                            full_apply_cost: full_apply_cost.work_only(),
-                        });
-                        let new_apply_cost = ordered_source_filter_cost(&filters)?;
-                        child = child.replace_work(old_apply_cost, new_apply_cost)?;
-                        lane.filters = filters.into_boxed_slice();
-                        lane.filter_apply_cost = new_apply_cost;
+                    let matching_work = lanes
+                        .iter()
+                        .filter(|lane| sources.contains(&lane.source))
+                        .map(|lane| lane.cost.score.range.expected.max(0.0))
+                        .sum::<f64>();
+                    // Predicate evaluation is one operator-local cost before it
+                    // is attributed to source lanes. Allocate every ppm exactly
+                    // once so splitting a UNION into more branches cannot create
+                    // or discard work through independent rounding.
+                    let mut apply_shares = Vec::with_capacity(matching_lanes);
+                    let mut unallocated_ppm = 1_000_000_u32;
+                    for lane in lanes.iter().filter(|lane| sources.contains(&lane.source)) {
+                        let remaining_lanes = matching_lanes - apply_shares.len();
+                        let share = if remaining_lanes == 1 {
+                            unallocated_ppm
+                        } else if matching_work > 0.0 {
+                            ((lane.cost.score.range.expected.max(0.0) / matching_work * 1_000_000.0)
+                                .floor() as u32)
+                                .min(unallocated_ppm)
+                        } else {
+                            unallocated_ppm
+                                / u32::try_from(remaining_lanes).map_err(|_| {
+                                    paro_error::internal(
+                                        "runtime filter has too many source-work lanes",
+                                    )
+                                })?
+                        };
+                        apply_shares.push(share);
+                        unallocated_ppm -= share;
+                    }
+                    debug_assert_eq!(unallocated_ppm, 0);
+                    let mut apply_shares = apply_shares.into_iter();
+                    for lane in &mut lanes {
+                        if sources.contains(&lane.source) {
+                            let total_apply_cost = source_filter_apply_cost.expect(
+                                "matching source-work lane established predicate application cost",
+                            );
+                            let share = apply_shares
+                                .next()
+                                .expect("one predicate-cost share per matching source lane");
+                            let full_apply_cost = total_apply_cost.retain_work(share, 1_000_000)?;
+                            // Runtime filters are speculative: stale statistics or
+                            // a coarse representation can retain every source row.
+                            let retained = lane.cost.retain_work(expected, 1_000_000)?;
+                            child = child.replace_work(lane.cost, retained)?;
+                            lane.cost = retained;
+                            let old_apply_cost = lane.filter_apply_cost;
+                            let mut filters = lane.filters.to_vec();
+                            filters.push(SourceFilterWork {
+                                expected_retained_ppm: expected,
+                                full_apply_cost: full_apply_cost.work_only(),
+                            });
+                            let new_apply_cost = ordered_source_filter_cost(&filters)?;
+                            child = child.replace_work(old_apply_cost, new_apply_cost)?;
+                            lane.filters = filters.into_boxed_slice();
+                            lane.filter_apply_cost = new_apply_cost;
+                        }
                     }
                 }
                 tracing::debug!(
                     target: "paro::optimizer",
-                    source_count = sources.len(),
+                    declared_source_count = sources.len(),
                     matching_lanes,
                     expected_retained_ppm = expected,
                     child_expected_cost = child.score.range.expected,

@@ -63,6 +63,11 @@ pub struct HashJoinBuildSinkExec {
 impl HashJoinBuildSinkExec {
     pub(crate) fn create_global(&self, ctx: &mut PipelineInitContext) -> Result<SinkGlobal> {
         let handle = ctx.handles.get(self.handle)?;
+        let runtime_filter_key_types = self
+            .runtime_filter
+            .as_ref()
+            .map(|filter| filter.mapped_key_types(&self.key_conditions))
+            .transpose()?;
         if self.spill_policy != SpillExecutionPolicy::ForcedExternal
             && handle.build_time_integer_builder().is_none()
         {
@@ -99,7 +104,10 @@ impl HashJoinBuildSinkExec {
             self.build_output_count,
             self.join_type,
             self.build_keys_unique,
-            self.runtime_filter.as_ref().map(|filter| &filter.resource),
+            self.runtime_filter
+                .as_ref()
+                .zip(runtime_filter_key_types.as_deref())
+                .map(|(filter, key_types)| (&filter.resource, key_types)),
             hash_join_memory_context(ctx.query),
         )?;
         if let Some(channel_count) = self.grouped_reduction_channels {
@@ -132,6 +140,11 @@ impl HashJoinBuildSinkExec {
         };
         let build_time_integer_builder = global.handle.build_time_integer_builder();
         let build_key_types = join_key_types(&self.key_conditions, JoinKeySide::Build);
+        let runtime_filter_key_types = self
+            .runtime_filter
+            .as_ref()
+            .map(|filter| filter.mapped_key_types(&self.key_conditions))
+            .transpose()?;
         let build_residual_types = join_key_types(&self.residual_conditions, JoinKeySide::Build);
         let hash_table = Arc::new(JoinHashTable::new_with_memory_and_output_count(
             ctx.query.session.buffer_pool().clone(),
@@ -176,7 +189,9 @@ impl HashJoinBuildSinkExec {
             build_hashes: Vec::new(),
             runtime_filter_builder: self.runtime_filter.as_ref().map(|filter| {
                 JoinRuntimeFilterBuilder::empty_local_with_memory(
-                    &build_key_types,
+                    runtime_filter_key_types
+                        .as_deref()
+                        .expect("runtime-filter key types were derived above"),
                     &filter.resource,
                     hash_join_memory_context(ctx.query)
                         .with_class(paro_common::memory::MemoryAccountingClass::Metadata),
@@ -288,7 +303,17 @@ impl HashJoinBuildSinkExec {
         )?;
         if appended_count > 0 {
             if let Some(builder) = local.runtime_filter_builder.as_mut() {
-                builder.add_key_chunk(key_chunk, build_selection, appended_count)?;
+                let condition_indices = &self
+                    .runtime_filter
+                    .as_ref()
+                    .expect("runtime-filter builder requires its physical contract")
+                    .condition_indices;
+                builder.add_mapped_key_chunk(
+                    key_chunk,
+                    condition_indices,
+                    build_selection,
+                    appended_count,
+                )?;
             }
         }
         Ok(SinkPoll::NeedMoreInput)

@@ -141,34 +141,34 @@ impl<'a> PipelineLowerer<'a> {
     }
 }
 
-/// A probe candidate is safe only in the concrete pipeline whose rowset
-/// source owns the matching dynamic predicate. Spill replay, CTE scans, and
-/// branches where lineage could not reach storage retain the ordinary probe.
+/// Grant probe-replacement authority from concrete filter installations.
+/// Spill replay, CTE scans, and branches where lineage could not reach storage
+/// never acquire that authority and retain the ordinary probe.
 pub(super) fn confirm_covering_runtime_filters(
     source: &SourceSpec,
     transforms: &mut [TransformSpec],
 ) {
-    let SourceSpec::Rowset(rowset) = source else {
-        for transform in transforms {
-            if let TransformSpec::HashJoinProbe(probe) = transform {
-                probe.covering_runtime_filter_key = None;
-            }
-        }
-        return;
-    };
     for transform in transforms {
         let TransformSpec::HashJoinProbe(probe) = transform else {
             continue;
         };
-        let Some(key_index) = probe.covering_runtime_filter_key else {
+        probe.covering_runtime_filter_key = None;
+        let SourceSpec::Rowset(rowset) = source else {
             continue;
         };
-        if !rowset
+        let mut covering = rowset
             .dynamic_runtime_filters
             .iter()
-            .any(|filter| filter.handle == probe.handle && filter.build_key_index == key_index)
-        {
-            probe.covering_runtime_filter_key = None;
+            .filter(|filter| {
+                filter.handle == probe.handle
+                    && filter.application == RuntimeFilterApplication::ProbeReplacementEligible
+            })
+            .map(|filter| filter.runtime_filter_key_index);
+        let Some(key_index) = covering.next() else {
+            continue;
+        };
+        if covering.all(|candidate| candidate == key_index) {
+            probe.covering_runtime_filter_key = Some(key_index);
         }
     }
 }

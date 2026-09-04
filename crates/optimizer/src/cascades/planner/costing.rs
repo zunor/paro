@@ -41,16 +41,16 @@ pub(super) fn planner_implementation_set(
                     JoinComparisonType::Equal | JoinComparisonType::NotDistinctFrom
                 )
             });
-            let mark_has_residual = join.join_type == JoinType::Mark
-                && join.conditions.iter().any(|condition| {
-                    !matches!(
-                        condition.comparison,
-                        JoinComparisonType::Equal | JoinComparisonType::NotDistinctFrom
-                    )
-                });
-            let mark_needs_scoped_nulls = matches!(
+            let has_non_hash_condition = join.conditions.iter().any(|condition| {
+                !matches!(
+                    condition.comparison,
+                    JoinComparisonType::Equal | JoinComparisonType::NotDistinctFrom
+                )
+            });
+            let mark_contract_supported = crate::physical::hash_join_mark_contract_is_supported(
+                join.join_type,
                 join.mark_semantics,
-                paro_planner::operator::MarkJoinSemantics::ThreeValuedFrom(start) if start > 0
+                has_non_hash_condition,
             );
             let supports_hash_type = matches!(
                 join.join_type,
@@ -77,15 +77,13 @@ pub(super) fn planner_implementation_set(
                     | JoinType::RightAnti
             ) && join.anti_join_mode == AntiJoinMode::Regular;
             let baseline = if has_hash_key
-                && !mark_has_residual
-                && !mark_needs_scoped_nulls
+                && mark_contract_supported
                 && supports_hash_type
                 && join.build_side_constraint.allows_right()
             {
                 PhysicalImplementationFlavor::HashJoin
             } else if has_hash_key
-                && !mark_has_residual
-                && !mark_needs_scoped_nulls
+                && mark_contract_supported
                 && supports_build_left_type
                 && join.build_side_constraint.allows_left()
             {
@@ -1403,12 +1401,10 @@ pub(super) fn runtime_filtered_probe_work(
             return 0.0;
         }
         let ratio = (build_rows / probe_rows).clamp(0.0, 1.0);
-        // Without a joint histogram the expected benefit is deliberately
-        // damped. Do not add a fixed survivor floor here: exact membership has
-        // no false positives, while key skew is already represented by the
-        // square-root estimate and the complete-probe risk upper. Coarse
-        // representations receive their separate 25% floor below.
-        probe_rows * ratio.sqrt()
+        // Domain size alone does not describe probe-key skew. Preserve a
+        // conservative expected-work floor until propagated distribution
+        // evidence can price page pruning and surviving rows independently.
+        probe_rows * ratio.sqrt().clamp(0.1, 1.0)
     };
     let expected = match (exact_single_key, probe_multiplicity) {
         (true, RuntimeFilterProbeMultiplicity::DeclaredUnique) => {
@@ -1417,17 +1413,11 @@ pub(super) fn runtime_filtered_probe_work(
         (true, RuntimeFilterProbeMultiplicity::EstimatedUnique) => {
             retained(probe.expected, build.expected).min(build.expected * 1.25)
         }
-        (true, RuntimeFilterProbeMultiplicity::Unknown) => {
-            // Exact membership cannot admit a key outside the build domain.
-            // Unknown multiplicity only prevents a row-count bound; the
-            // square-root damping and full risk upper already represent key
-            // skew, so applying the additional coarse-filter 25% floor would
-            // erase all useful ranking for small exact domains.
+        (true, RuntimeFilterProbeMultiplicity::Unknown) | (false, _) => {
             retained(probe.expected, build.expected)
+                .max(probe.expected * 0.25)
+                .min(probe.expected)
         }
-        (false, _) => retained(probe.expected, build.expected)
-            .max(probe.expected * 0.25)
-            .min(probe.expected),
     };
     // Every current representation can fall back to a range, and multi-key
     // filters are installed independently per column. Neither contract can
@@ -1773,6 +1763,6 @@ mod tests {
         assert_eq!(unconstrained.upper, 100_000.0);
         assert_eq!(exact_unconstrained.upper, 100_000.0);
         assert!(unique.expected < unconstrained.expected);
-        assert!(exact_unconstrained.expected < coarse_unconstrained.expected);
+        assert_eq!(exact_unconstrained.expected, coarse_unconstrained.expected);
     }
 }

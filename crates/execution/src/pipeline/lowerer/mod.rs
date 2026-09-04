@@ -36,10 +36,10 @@ use super::graph::{
     PipelineGraph, PipelineId, PipelineRoot, PipelineSpec, PipelineSubgraphRoot, RecursiveCteDedup,
     RecursiveCteRegion, RecursiveTableAppendSinkSpec, RecursiveTableScanSourceSpec,
     RecursiveTermination, RowsetDynamicRuntimeFilterSpec, RowsetDynamicScalarFilterSpec,
-    RowsetSourceSpec, ScalarFilterSemantics, SetOperationEmitSourceSpec, SetOperationInputSinkSpec,
-    SharedSinkId, SinkSharing, SinkSpec, SortBuildSinkSpec, SortEmitSourceSpec,
-    SortRangeJoinProbeSpec, SourceSpec, TopNBuildSinkSpec, TopNEmitSourceSpec, TransformSpec,
-    UngroupedAggregateEmitSourceSpec, UngroupedAggregateSinkSpec, UpdateSinkSpec,
+    RowsetSourceSpec, RuntimeFilterApplication, ScalarFilterSemantics, SetOperationEmitSourceSpec,
+    SetOperationInputSinkSpec, SharedSinkId, SinkSharing, SinkSpec, SortBuildSinkSpec,
+    SortEmitSourceSpec, SortRangeJoinProbeSpec, SourceSpec, TopNBuildSinkSpec, TopNEmitSourceSpec,
+    TransformSpec, UngroupedAggregateEmitSourceSpec, UngroupedAggregateSinkSpec, UpdateSinkSpec,
     WindowBuildSinkSpec, WindowEmitSourceSpec,
 };
 use super::handles::{BreakerHandleCatalogBuilder, BreakerHandleId, BreakerHandleKind};

@@ -1104,6 +1104,140 @@ fn sideways_filter_attributes_one_predicate_cost_across_union_sources() {
 }
 
 #[test]
+fn sideways_filter_degrades_to_matching_source_lanes() {
+    let matched = WorkSourceId(18);
+    let missing = WorkSourceId(19);
+    let unrelated = WorkSourceId(20);
+    let lanes = [
+        SourceWork {
+            source: matched,
+            cost: cost(100.0),
+            filters: Box::new([]),
+            filter_apply_cost: SearchCost::ZERO,
+        },
+        SourceWork {
+            source: unrelated,
+            cost: cost(300.0),
+            filters: Box::new([]),
+            filter_apply_cost: SearchCost::ZERO,
+        },
+    ];
+    let filtered = compose_candidate_cost_with_sources(
+        cost(40.0),
+        Some(cost(20.0)),
+        &[cost(400.0)],
+        &[&lanes],
+        CostComposition::SidewaysFilter {
+            overlapping_children: 0,
+            filtered_child: 0,
+            sources: Box::new([matched, missing]),
+            expected_retained_ppm: 500_000,
+        },
+    )
+    .expect("missing source-work lineage must be a safe cost degradation");
+
+    assert_eq!(filtered.cost.score.range.expected, 390.0);
+    assert_eq!(filtered.source_work[0].cost.score.range.expected, 50.0);
+    assert_eq!(
+        filtered.source_work[0]
+            .filter_apply_cost
+            .score
+            .range
+            .expected,
+        20.0
+    );
+    assert_eq!(filtered.source_work[1].cost.score.range.expected, 300.0);
+    assert_eq!(
+        filtered.source_work[1]
+            .filter_apply_cost
+            .score
+            .range
+            .expected,
+        0.0
+    );
+}
+
+#[test]
+fn sideways_filter_accepts_multiple_lanes_for_one_source() {
+    let source = WorkSourceId(21);
+    let lanes = [
+        SourceWork {
+            source,
+            cost: cost(100.0),
+            filters: Box::new([]),
+            filter_apply_cost: SearchCost::ZERO,
+        },
+        SourceWork {
+            source,
+            cost: cost(300.0),
+            filters: Box::new([]),
+            filter_apply_cost: SearchCost::ZERO,
+        },
+    ];
+    let filtered = compose_candidate_cost_with_sources(
+        cost(40.0),
+        Some(cost(20.0)),
+        &[cost(400.0)],
+        &[&lanes],
+        CostComposition::SidewaysFilter {
+            overlapping_children: 0,
+            filtered_child: 0,
+            sources: Box::new([source]),
+            expected_retained_ppm: 500_000,
+        },
+    )
+    .expect("one source may legitimately own multiple physical work lanes");
+
+    assert_eq!(filtered.cost.score.range.expected, 240.0);
+    assert_eq!(filtered.source_work[0].cost.score.range.expected, 50.0);
+    assert_eq!(filtered.source_work[1].cost.score.range.expected, 150.0);
+    assert_eq!(
+        filtered.source_work[0]
+            .filter_apply_cost
+            .score
+            .range
+            .expected,
+        5.0
+    );
+    assert_eq!(
+        filtered.source_work[1]
+            .filter_apply_cost
+            .score
+            .range
+            .expected,
+        15.0
+    );
+}
+
+#[test]
+fn sideways_filter_with_no_physical_lane_is_retained() {
+    let declared = WorkSourceId(22);
+    let unrelated = WorkSourceId(23);
+    let lanes = [SourceWork {
+        source: unrelated,
+        cost: cost(400.0),
+        filters: Box::new([]),
+        filter_apply_cost: SearchCost::ZERO,
+    }];
+    let filtered = compose_candidate_cost_with_sources(
+        cost(40.0),
+        None,
+        &[cost(400.0)],
+        &[&lanes],
+        CostComposition::SidewaysFilter {
+            overlapping_children: 0,
+            filtered_child: 0,
+            sources: Box::new([declared]),
+            expected_retained_ppm: 1,
+        },
+    )
+    .expect("unmatched logical lineage must retain physical work without a filter cost");
+
+    assert_eq!(filtered.cost.score.range.expected, 440.0);
+    assert_eq!(filtered.source_work.as_ref(), lanes);
+}
+
+#[test]
 fn repeated_sideways_filters_scale_only_the_matching_source_lane() {
     let source = WorkSourceId(11);
     let scan = compose_candidate_cost_with_sources(

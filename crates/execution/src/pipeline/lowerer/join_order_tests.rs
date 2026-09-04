@@ -8,6 +8,7 @@ fn enable_runtime_filter(mut spec: HashJoinSpec) -> HashJoinSpec {
     spec.runtime_filter = Some(paro_optimizer::physical::HashJoinRuntimeFilterSpec {
         artifact: paro_optimizer::physical::identity::Fingerprint(7),
         wait_policy: paro_optimizer::physical::RuntimeFilterWaitPolicy::WaitComplete,
+        condition_indices: Box::new([0]),
         resource: paro_optimizer::physical::RuntimeFilterResourceContract::for_keys(
             &[paro_common::types::LogicalType::Integer],
             1,
@@ -312,7 +313,10 @@ fn direct_rowset_probe_gets_hash_join_runtime_filter_gate() {
         rowset.dynamic_runtime_filters[0].handle,
         BreakerHandleId::new(3)
     );
-    assert_eq!(rowset.dynamic_runtime_filters[0].build_key_index, 0);
+    assert_eq!(
+        rowset.dynamic_runtime_filters[0].runtime_filter_key_index,
+        0
+    );
     assert_eq!(rowset.dynamic_runtime_filters[0].probe_column_id, 0);
     assert_eq!(
         rowset.dynamic_runtime_filters[0].artifact,
@@ -342,6 +346,10 @@ fn exact_unique_payload_free_probe_is_covered_only_by_its_rowset_filter() {
 
     let handle = BreakerHandleId::new(3);
     let mut transforms = vec![hash_join_probe_transform(handle, &spec)];
+    let TransformSpec::HashJoinProbe(probe) = &transforms[0] else {
+        panic!("expected hash join probe");
+    };
+    assert_eq!(probe.covering_runtime_filter_key, None);
     let source = lowerer.attach_hash_join_runtime_filters(
         SourceSpec::Rowset(RowsetSourceSpec::new(rowset_spec_for_test())),
         &[],
@@ -366,6 +374,7 @@ fn exact_unique_payload_free_probe_is_covered_only_by_its_rowset_filter() {
 #[test]
 fn exact_payload_free_semi_probe_does_not_require_unique_build_keys() {
     let plan = hash_join_plan(JoinType::Semi);
+    let lowerer = PipelineLowerer::new(&plan);
     let mut spec = match &plan.node(plan.root).kind {
         PhysicalNodeKind::HashJoin(spec) => enable_runtime_filter(spec.clone()),
         _ => panic!("expected hash join plan"),
@@ -375,9 +384,16 @@ fn exact_payload_free_semi_probe_does_not_require_unique_build_keys() {
     spec.build_input_projection = Box::new([]);
     spec.build_payload_types = Box::new([]);
 
-    let TransformSpec::HashJoinProbe(probe) =
-        hash_join_probe_transform(BreakerHandleId::new(3), &spec)
-    else {
+    let handle = BreakerHandleId::new(3);
+    let mut transforms = vec![hash_join_probe_transform(handle, &spec)];
+    let source = lowerer.attach_hash_join_runtime_filters(
+        SourceSpec::Rowset(RowsetSourceSpec::new(rowset_spec_for_test())),
+        &[],
+        handle,
+        &spec,
+    );
+    super::super::pipelines::confirm_covering_runtime_filters(&source, &mut transforms);
+    let TransformSpec::HashJoinProbe(probe) = &transforms[0] else {
         panic!("expected hash join probe");
     };
     assert_eq!(probe.covering_runtime_filter_key, Some(0));

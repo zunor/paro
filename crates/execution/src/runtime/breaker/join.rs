@@ -164,13 +164,20 @@ impl JoinBuildHandle {
         memory: MemoryAccountingContext,
     ) -> Result<Arc<JoinHashTable>> {
         let build_output_count = build_types.len();
+        let runtime_filter_key_types = runtime_filter_enabled.then(|| {
+            conditions
+                .iter()
+                .map(|condition| condition.right.return_type())
+                .collect::<Vec<_>>()
+        });
         let runtime_filter = runtime_filter_enabled
             .then(|| {
-                let key_types = conditions
-                    .iter()
-                    .map(|condition| condition.right.return_type())
-                    .collect::<Vec<_>>();
-                paro_optimizer::physical::RuntimeFilterResourceContract::for_keys(&key_types, 1)
+                paro_optimizer::physical::RuntimeFilterResourceContract::for_keys(
+                    runtime_filter_key_types
+                        .as_deref()
+                        .expect("enabled runtime filter has key types"),
+                    1,
+                )
             })
             .transpose()?;
         self.initialize_table_with_output_count(
@@ -181,7 +188,9 @@ impl JoinBuildHandle {
             build_output_count,
             join_type,
             false,
-            runtime_filter.as_ref(),
+            runtime_filter
+                .as_ref()
+                .zip(runtime_filter_key_types.as_deref()),
             memory,
         )
     }
@@ -195,16 +204,15 @@ impl JoinBuildHandle {
         build_output_count: usize,
         join_type: JoinType,
         build_keys_unique: bool,
-        runtime_filter: Option<&paro_optimizer::physical::RuntimeFilterResourceContract>,
+        runtime_filter: Option<(
+            &paro_optimizer::physical::RuntimeFilterResourceContract,
+            &[LogicalType],
+        )>,
         memory: MemoryAccountingContext,
     ) -> Result<Arc<JoinHashTable>> {
-        if let Some(runtime_filter) = runtime_filter {
-            let runtime_filter_key_types = conditions
-                .iter()
-                .map(|condition| condition.right.return_type())
-                .collect::<Vec<_>>();
+        if let Some((runtime_filter, runtime_filter_key_types)) = runtime_filter {
             self.initialize_runtime_filter_builder(
-                &runtime_filter_key_types,
+                runtime_filter_key_types,
                 runtime_filter,
                 memory.with_class(MemoryAccountingClass::Metadata),
             );

@@ -50,11 +50,20 @@ impl PipelineLowerer<'_> {
                     "runtime-filter edge disagrees with its registered physical owner",
                 ));
             }
+            let runtime_filter = spec
+                .runtime_filter
+                .as_ref()
+                .expect("runtime-filter owner identity was checked above");
+            let covering_key = hash_join_runtime_filter_probe_candidate(spec);
             let mut installed = 0usize;
-            for (build_key_index, condition) in spec.key_conditions.iter().enumerate() {
-                if condition.comparison != JoinComparisonType::Equal {
-                    continue;
-                }
+            for (runtime_filter_key_index, &condition_index) in
+                runtime_filter.condition_indices.iter().enumerate()
+            {
+                let condition = spec.key_conditions.get(condition_index).ok_or_else(|| {
+                    paro_error::internal(
+                        "runtime-filter condition mapping references a missing join key",
+                    )
+                })?;
                 let Expression::Reference(reference) = &condition.left else {
                     continue;
                 };
@@ -73,8 +82,13 @@ impl PipelineLowerer<'_> {
                 rowset.add_dynamic_runtime_filter(RowsetDynamicRuntimeFilterSpec {
                     handle,
                     artifact,
-                    build_key_index,
+                    runtime_filter_key_index,
                     probe_column_id,
+                    application: if covering_key == Some(runtime_filter_key_index) {
+                        RuntimeFilterApplication::ProbeReplacementEligible
+                    } else {
+                        RuntimeFilterApplication::FilteringOnly
+                    },
                 });
                 installed += 1;
             }
@@ -104,10 +118,13 @@ impl PipelineLowerer<'_> {
         let SourceSpec::Rowset(rowset) = &mut source else {
             return source;
         };
-        for (build_key_index, condition) in spec.key_conditions.iter().enumerate() {
-            if condition.comparison != JoinComparisonType::Equal {
+        let covering_key = hash_join_runtime_filter_probe_candidate(spec);
+        for (runtime_filter_key_index, &condition_index) in
+            runtime_filter.condition_indices.iter().enumerate()
+        {
+            let Some(condition) = spec.key_conditions.get(condition_index) else {
                 continue;
-            }
+            };
             let Expression::Reference(reference) = &condition.left else {
                 continue;
             };
@@ -125,8 +142,13 @@ impl PipelineLowerer<'_> {
             rowset.add_dynamic_runtime_filter(RowsetDynamicRuntimeFilterSpec {
                 handle,
                 artifact: runtime_filter.artifact,
-                build_key_index,
+                runtime_filter_key_index,
                 probe_column_id,
+                application: if covering_key == Some(runtime_filter_key_index) {
+                    RuntimeFilterApplication::ProbeReplacementEligible
+                } else {
+                    RuntimeFilterApplication::FilteringOnly
+                },
             });
         }
         source

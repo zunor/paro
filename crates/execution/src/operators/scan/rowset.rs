@@ -62,7 +62,7 @@ pub struct RowsetSourceDesc {
 pub struct RowsetDynamicRuntimeFilterDesc {
     pub handle: HandleRef<JoinBuildHandle>,
     pub artifact: crate::physical::Fingerprint,
-    pub build_key_index: usize,
+    pub runtime_filter_key_index: usize,
     pub probe_column_id: u32,
 }
 
@@ -100,7 +100,7 @@ impl RowsetSourceDesc {
             .map(|filter| RowsetDynamicRuntimeFilterDesc {
                 handle: HandleRef::new(filter.handle),
                 artifact: filter.artifact,
-                build_key_index: filter.build_key_index,
+                runtime_filter_key_index: filter.runtime_filter_key_index,
                 probe_column_id: filter.probe_column_id,
             })
             .collect::<Vec<_>>()
@@ -280,8 +280,8 @@ impl RowsetSourceExec {
                     self.desc.table.name()
                 )));
             }
-            if let Some(predicate) =
-                handle.runtime_filter_predicate(filter.build_key_index, filter.probe_column_id)
+            if let Some(predicate) = handle
+                .runtime_filter_predicate(filter.runtime_filter_key_index, filter.probe_column_id)
             {
                 predicates.push(predicate);
                 has_runtime_conjunct = true;

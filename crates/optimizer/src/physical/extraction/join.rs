@@ -25,14 +25,13 @@ impl PhysicalPlanExtractor {
                             .conditions
                             .iter()
                             .any(|condition| is_hash_join_comparison(condition.comparison))
-                        || (comparison.join_type == JoinType::Mark
-                            && comparison
+                        || !crate::physical::hash_join_mark_contract_is_supported(
+                            comparison.join_type,
+                            comparison.mark_semantics,
+                            comparison
                                 .conditions
                                 .iter()
-                                .any(|condition| !is_hash_join_comparison(condition.comparison)))
-                        || matches!(
-                            comparison.mark_semantics,
-                            MarkJoinSemantics::ThreeValuedFrom(start) if start > 0
+                                .any(|condition| !is_hash_join_comparison(condition.comparison)),
                         )
                     {
                         return Err(paro_error::internal(
@@ -912,14 +911,16 @@ impl PhysicalPlanExtractor {
             .conditions
             .iter()
             .any(|condition| is_hash_join_comparison(condition.comparison));
-        let mark_has_residual = join.join_type == JoinType::Mark
-            && join
-                .conditions
-                .iter()
-                .any(|condition| !is_hash_join_comparison(condition.comparison));
-        let mark_needs_scoped_nulls =
-            matches!(join.mark_semantics, MarkJoinSemantics::ThreeValuedFrom(start) if start > 0);
-        let wrapped_join = if has_hash_key && !mark_has_residual && !mark_needs_scoped_nulls {
+        let has_non_hash_condition = join
+            .conditions
+            .iter()
+            .any(|condition| !is_hash_join_comparison(condition.comparison));
+        let mark_contract_supported = crate::physical::hash_join_mark_contract_is_supported(
+            join.join_type,
+            join.mark_semantics,
+            has_non_hash_condition,
+        );
+        let wrapped_join = if has_hash_key && mark_contract_supported {
             self.push_wrapped_hash_join(join, wrapped_left, wrapped_right)?
         } else {
             self.push_wrapped_nlj(join, wrapped_left, wrapped_right)?
