@@ -3,7 +3,10 @@
 
 //! Fixed-size search cost used in the Memo hot path and extracted plans.
 
+use std::cmp::Ordering;
+
 use paro_common::error::{self as paro_error, Result};
+pub use paro_common::memory::UncappedMemoryDemand;
 
 use super::identity::ExternalWorkerRequirementSetId;
 
@@ -17,20 +20,26 @@ pub const RESOURCE_DIMS: usize = 6;
 /// may report resource exhaustion if the state reaches it. Keeping this state
 /// explicit prevents an unknown estimate from either masquerading as a proof
 /// or making every physical alternative disappear during planning.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MemoryCompletion {
     Guaranteed,
     RuntimeCapped {
         /// Retained-state demand before grant admission imposed the resident
-        /// ceiling. `u64::MAX` means the logical input has no proven bound.
-        uncapped_peak_memory_upper: u64,
+        /// ceiling.
+        uncapped_memory_demand: UncappedMemoryDemand,
     },
 }
 
 impl MemoryCompletion {
-    pub const fn runtime_capped(uncapped_peak_memory_upper: u64) -> Self {
+    pub const fn runtime_capped_known(uncapped_peak_memory_upper: u64) -> Self {
         Self::RuntimeCapped {
-            uncapped_peak_memory_upper,
+            uncapped_memory_demand: UncappedMemoryDemand::KnownBytes(uncapped_peak_memory_upper),
+        }
+    }
+
+    pub const fn runtime_capped_unbounded() -> Self {
+        Self::RuntimeCapped {
+            uncapped_memory_demand: UncappedMemoryDemand::Unbounded,
         }
     }
 
@@ -38,13 +47,109 @@ impl MemoryCompletion {
         matches!(self, Self::RuntimeCapped { .. })
     }
 
-    pub const fn uncapped_peak_memory_upper(self) -> Option<u64> {
+    pub const fn uncapped_memory_demand(self) -> Option<UncappedMemoryDemand> {
         match self {
             Self::Guaranteed => None,
             Self::RuntimeCapped {
-                uncapped_peak_memory_upper,
-            } => Some(uncapped_peak_memory_upper),
+                uncapped_memory_demand,
+            } => Some(uncapped_memory_demand),
         }
+    }
+
+    /// Deterministic portfolio preference. A completion proof always wins;
+    /// among best-effort alternatives, a smaller known demand wins and an
+    /// unbounded demand ranks last.
+    pub fn preference_cmp(self, other: Self) -> Ordering {
+        match (self, other) {
+            (Self::Guaranteed, Self::Guaranteed) => Ordering::Equal,
+            (Self::Guaranteed, Self::RuntimeCapped { .. }) => Ordering::Less,
+            (Self::RuntimeCapped { .. }, Self::Guaranteed) => Ordering::Greater,
+            (
+                Self::RuntimeCapped {
+                    uncapped_memory_demand: left,
+                },
+                Self::RuntimeCapped {
+                    uncapped_memory_demand: right,
+                },
+            ) => demand_preference_cmp(left, right),
+        }
+    }
+
+    pub fn no_worse_than(self, other: Self) -> bool {
+        self.preference_cmp(other) != Ordering::Greater
+    }
+
+    pub fn strictly_better_than(self, other: Self) -> bool {
+        self.preference_cmp(other) == Ordering::Less
+    }
+
+    /// Compose phases whose retained states do not overlap.
+    pub fn sequential(self, admitted_peak: u64, other: Self, other_admitted_peak: u64) -> Self {
+        if self == Self::Guaranteed && other == Self::Guaranteed {
+            return Self::Guaranteed;
+        }
+        Self::RuntimeCapped {
+            uncapped_memory_demand: demand_max(
+                self.demand_or_admitted_peak(admitted_peak),
+                other.demand_or_admitted_peak(other_admitted_peak),
+            ),
+        }
+    }
+
+    /// Compose retained states that must be resident at the same time.
+    pub fn overlapping(self, admitted_peak: u64, other: Self, other_admitted_peak: u64) -> Self {
+        if self == Self::Guaranteed && other == Self::Guaranteed {
+            return Self::Guaranteed;
+        }
+        Self::RuntimeCapped {
+            uncapped_memory_demand: demand_add(
+                self.demand_or_admitted_peak(admitted_peak),
+                other.demand_or_admitted_peak(other_admitted_peak),
+            ),
+        }
+    }
+
+    fn demand_or_admitted_peak(self, admitted_peak: u64) -> UncappedMemoryDemand {
+        let admitted_peak = if admitted_peak == u64::MAX {
+            UncappedMemoryDemand::Unbounded
+        } else {
+            UncappedMemoryDemand::KnownBytes(admitted_peak)
+        };
+        match self {
+            Self::Guaranteed => admitted_peak,
+            Self::RuntimeCapped {
+                uncapped_memory_demand,
+            } => demand_max(uncapped_memory_demand, admitted_peak),
+        }
+    }
+}
+
+fn demand_preference_cmp(left: UncappedMemoryDemand, right: UncappedMemoryDemand) -> Ordering {
+    match (left, right) {
+        (UncappedMemoryDemand::KnownBytes(left), UncappedMemoryDemand::KnownBytes(right)) => {
+            left.cmp(&right)
+        }
+        (UncappedMemoryDemand::KnownBytes(_), UncappedMemoryDemand::Unbounded) => Ordering::Less,
+        (UncappedMemoryDemand::Unbounded, UncappedMemoryDemand::KnownBytes(_)) => Ordering::Greater,
+        (UncappedMemoryDemand::Unbounded, UncappedMemoryDemand::Unbounded) => Ordering::Equal,
+    }
+}
+
+fn demand_max(left: UncappedMemoryDemand, right: UncappedMemoryDemand) -> UncappedMemoryDemand {
+    if demand_preference_cmp(left, right) == Ordering::Less {
+        right
+    } else {
+        left
+    }
+}
+
+fn demand_add(left: UncappedMemoryDemand, right: UncappedMemoryDemand) -> UncappedMemoryDemand {
+    match (left, right) {
+        (UncappedMemoryDemand::KnownBytes(left), UncappedMemoryDemand::KnownBytes(right)) => left
+            .checked_add(right)
+            .map(UncappedMemoryDemand::KnownBytes)
+            .unwrap_or(UncappedMemoryDemand::Unbounded),
+        _ => UncappedMemoryDemand::Unbounded,
     }
 }
 
@@ -239,11 +344,10 @@ impl SearchCost {
                 "memory floor plus revocable target exceeds the total peak contract",
             ));
         }
-        if self
-            .memory_completion
-            .uncapped_peak_memory_upper()
-            .is_some_and(|uncapped| uncapped < self.peak_memory_upper)
-        {
+        if matches!(
+            self.memory_completion.uncapped_memory_demand(),
+            Some(UncappedMemoryDemand::KnownBytes(uncapped)) if uncapped < self.peak_memory_upper
+        ) {
             return Err(paro_error::internal(
                 "runtime-capped demand is below the admitted resident peak",
             ));
@@ -302,7 +406,11 @@ impl SearchCost {
             // grant class practically inadmissible under any process overhead.
             revocable_memory_target: preferred_memory_bytes.saturating_sub(minimum_memory_bytes),
             peak_memory_upper,
-            memory_completion: self.memory_completion.max(other.memory_completion),
+            memory_completion: self.memory_completion.sequential(
+                self.peak_memory_upper,
+                other.memory_completion,
+                other.peak_memory_upper,
+            ),
             spill_bytes_expected: self
                 .spill_bytes_expected
                 .saturating_add(other.spill_bytes_expected),
@@ -332,15 +440,20 @@ impl SearchCost {
                 "runtime memory cap is below the overlapping execution floor",
             ));
         }
-        let Some(previous_uncapped) = self.memory_completion.uncapped_peak_memory_upper() else {
+        let Some(previous_uncapped) = self.memory_completion.uncapped_memory_demand() else {
             return Err(paro_error::internal(
                 "a guaranteed plan cannot be weakened by runtime grant clamping",
             ));
         };
-        let uncapped_peak_memory_upper = previous_uncapped
-            .max(self.peak_memory_upper)
-            .max(self.non_revocable_memory_upper);
-        self.memory_completion = MemoryCompletion::runtime_capped(uncapped_peak_memory_upper);
+        let uncapped_memory_demand = demand_max(
+            previous_uncapped,
+            self.memory_completion.demand_or_admitted_peak(
+                self.peak_memory_upper.max(self.non_revocable_memory_upper),
+            ),
+        );
+        self.memory_completion = MemoryCompletion::RuntimeCapped {
+            uncapped_memory_demand,
+        };
         self.non_revocable_memory_upper = self.non_revocable_memory_upper.min(memory_ceiling_bytes);
         self.peak_memory_upper = memory_ceiling_bytes.max(self.minimum_memory_bytes);
         self.revocable_memory_target = self
@@ -503,7 +616,9 @@ impl SearchCost {
             && self.minimum_memory_bytes <= other.minimum_memory_bytes
             && self.revocable_memory_target <= other.revocable_memory_target
             && self.peak_memory_upper <= other.peak_memory_upper
-            && self.memory_completion <= other.memory_completion
+            && self
+                .memory_completion
+                .no_worse_than(other.memory_completion)
             && self.spill_bytes_expected <= other.spill_bytes_expected
             && self.external_worker_slots_upper <= other.external_worker_slots_upper
             && self
@@ -523,7 +638,9 @@ impl SearchCost {
             || self.minimum_memory_bytes < other.minimum_memory_bytes
             || self.revocable_memory_target < other.revocable_memory_target
             || self.peak_memory_upper < other.peak_memory_upper
-            || self.memory_completion < other.memory_completion
+            || self
+                .memory_completion
+                .strictly_better_than(other.memory_completion)
             || self.spill_bytes_expected < other.spill_bytes_expected
             || self.external_worker_slots_upper < other.external_worker_slots_upper
             || self
@@ -575,7 +692,7 @@ mod memory_tests {
             non_revocable_memory_upper: u64::MAX,
             minimum_memory_bytes: 10,
             peak_memory_upper: u64::MAX,
-            memory_completion: MemoryCompletion::runtime_capped(u64::MAX),
+            memory_completion: MemoryCompletion::runtime_capped_unbounded(),
             ..SearchCost::ZERO
         };
 
@@ -583,9 +700,40 @@ mod memory_tests {
 
         assert_eq!(cost.peak_memory_upper, 100);
         assert_eq!(
-            cost.memory_completion.uncapped_peak_memory_upper(),
-            Some(u64::MAX)
+            cost.memory_completion.uncapped_memory_demand(),
+            Some(UncappedMemoryDemand::Unbounded)
         );
+    }
+
+    #[test]
+    fn completion_composition_distinguishes_phases_from_overlapping_state() {
+        let left = MemoryCompletion::runtime_capped_known(100);
+        let right = MemoryCompletion::runtime_capped_known(70);
+
+        assert_eq!(
+            left.sequential(40, right, 30),
+            MemoryCompletion::runtime_capped_known(100)
+        );
+        assert_eq!(
+            left.overlapping(40, right, 30),
+            MemoryCompletion::runtime_capped_known(170)
+        );
+        assert_eq!(
+            left.overlapping(40, MemoryCompletion::runtime_capped_unbounded(), 30),
+            MemoryCompletion::runtime_capped_unbounded()
+        );
+    }
+
+    #[test]
+    fn completion_preference_is_explicit_and_proof_first() {
+        let bounded = MemoryCompletion::runtime_capped_known(100);
+        let unbounded = MemoryCompletion::runtime_capped_unbounded();
+
+        assert_eq!(
+            MemoryCompletion::Guaranteed.preference_cmp(bounded),
+            Ordering::Less
+        );
+        assert_eq!(bounded.preference_cmp(unbounded), Ordering::Less);
     }
 
     #[test]
@@ -600,7 +748,7 @@ mod memory_tests {
             non_revocable_memory_upper: 10,
             minimum_memory_bytes: 10,
             peak_memory_upper: 10,
-            memory_completion: MemoryCompletion::runtime_capped(10),
+            memory_completion: MemoryCompletion::runtime_capped_known(10),
             ..SearchCost::ZERO
         };
 

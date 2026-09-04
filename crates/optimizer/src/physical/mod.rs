@@ -25,7 +25,7 @@ pub mod specs;
 pub mod verifier;
 
 pub use children::{InlinePlanChildren, PlanChildren, PlanChildrenArena};
-pub use cost::{MemoryCompletion, SearchCost};
+pub use cost::{MemoryCompletion, SearchCost, UncappedMemoryDemand};
 pub use dependencies::PlanDependencies;
 pub use edges::{PhysicalEdge, PhysicalEdgeArena, PhysicalEdgeId, PhysicalEdgeKind};
 pub use identity::*;

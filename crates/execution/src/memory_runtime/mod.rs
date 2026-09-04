@@ -406,9 +406,8 @@ mod tests {
                     minimum_memory_bytes: 10,
                     working_set_memory_bytes: 10,
                     memory_ceiling_bytes: 100,
-                    memory_completion: paro_optimizer::physical::MemoryCompletion::runtime_capped(
-                        1_000,
-                    ),
+                    memory_completion:
+                        paro_optimizer::physical::MemoryCompletion::runtime_capped_known(1_000),
                     max_parallel_tasks: 1,
                     external_worker_slots: 0,
                 },
@@ -421,7 +420,9 @@ mod tests {
         assert!(matches!(
             pool.try_grow(101),
             Err(MemoryError::RuntimeCapExhausted {
-                uncapped_peak_memory_upper: 1_000,
+                uncapped_memory_demand: paro_common::memory::UncappedMemoryDemand::KnownBytes(
+                    1_000
+                ),
                 ..
             })
         ));

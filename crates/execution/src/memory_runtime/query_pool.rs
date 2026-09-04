@@ -532,30 +532,25 @@ impl QueryMemoryPool {
     }
 
     fn annotate_runtime_cap_exhaustion(&self, error: MemoryError) -> MemoryError {
-        let uncapped_peak_memory_upper = self
+        let uncapped_memory_demand = self
             .execution_lease
             .lock()
             .expect("execution lease lock poisoned")
             .as_ref()
-            .and_then(|lease| {
-                lease
-                    .resources()
-                    .memory_completion
-                    .uncapped_peak_memory_upper()
-            });
-        match (error, uncapped_peak_memory_upper) {
+            .and_then(|lease| lease.resources().memory_completion.uncapped_memory_demand());
+        match (error, uncapped_memory_demand) {
             (
                 MemoryError::QuotaExhausted {
                     domain,
                     requested,
                     available,
                 },
-                Some(uncapped_peak_memory_upper),
+                Some(uncapped_memory_demand),
             ) => MemoryError::RuntimeCapExhausted {
                 domain,
                 requested,
                 available,
-                uncapped_peak_memory_upper,
+                uncapped_memory_demand,
             },
             (error, _) => error,
         }

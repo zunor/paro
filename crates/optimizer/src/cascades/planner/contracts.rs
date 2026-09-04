@@ -672,7 +672,7 @@ mod resource_contract_tests {
         let mut estimate = cost(u64::MAX, 64 * 1024);
         estimate.non_revocable_memory_upper = u64::MAX;
         estimate.revocable_memory_target = 0;
-        estimate.memory_completion = MemoryCompletion::runtime_capped(estimate.peak_memory_upper);
+        estimate.memory_completion = MemoryCompletion::runtime_capped_unbounded();
 
         let admitted = cost_for_grant(
             estimate,
@@ -693,7 +693,7 @@ mod resource_contract_tests {
         assert_eq!(admitted.peak_memory_upper, no_spill.hard_memory_bytes);
         assert_eq!(
             admitted.memory_completion,
-            MemoryCompletion::runtime_capped(u64::MAX)
+            MemoryCompletion::runtime_capped_unbounded()
         );
     }
 
@@ -703,7 +703,7 @@ mod resource_contract_tests {
         let mut estimate = cost(u64::MAX, 64 * 1024);
         estimate.non_revocable_memory_upper = u64::MAX;
         estimate.revocable_memory_target = 0;
-        estimate.memory_completion = MemoryCompletion::runtime_capped(u64::MAX);
+        estimate.memory_completion = MemoryCompletion::runtime_capped_unbounded();
 
         let error = cost_for_grant(
             estimate,

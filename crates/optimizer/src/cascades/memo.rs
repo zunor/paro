@@ -447,7 +447,7 @@ fn compare_objective(
     // comparison during extraction.
     left.cost
         .memory_completion
-        .cmp(&right.cost.memory_completion)
+        .preference_cmp(right.cost.memory_completion)
         .then_with(|| match objective.0 {
             1 => left.cost.resources_expected[0]
                 .total_cmp(&right.cost.resources_expected[0])

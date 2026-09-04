@@ -1100,7 +1100,7 @@ fn apply_execution_memory_contract(
             contract,
             u64::MAX,
             u64::MAX,
-            MemoryCompletion::runtime_capped(u64::MAX),
+            MemoryCompletion::runtime_capped_unbounded(),
         )?;
         return Ok(());
     } else {

@@ -221,7 +221,7 @@ impl<P> PhysicalPlanPortfolio<P> {
                 let right = &variants[*right_index];
                 left.cost
                     .memory_completion
-                    .cmp(&right.cost.memory_completion)
+                    .preference_cmp(right.cost.memory_completion)
                     .then_with(|| {
                         left.cost
                             .score
@@ -498,7 +498,7 @@ mod tests {
         };
         let mut capped = cost(1.0, 100);
         capped.minimum_memory_bytes = 10;
-        capped.memory_completion = MemoryCompletion::runtime_capped(capped.peak_memory_upper);
+        capped.memory_completion = MemoryCompletion::runtime_capped_known(capped.peak_memory_upper);
         let portfolio = PhysicalPlanPortfolio::build(
             [class],
             [

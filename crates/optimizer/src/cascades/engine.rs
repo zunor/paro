@@ -12,7 +12,7 @@ use super::calibration::{
     LocalOperatorWork, MachineCalibrationBundle, ParallelWorkProfile, OP_ENFORCER_RANDOM_FETCH,
     OP_ENFORCER_SORT_COMPARE, OP_ENFORCER_SPILL_PAGE, OP_ENFORCER_STREAM_ROW,
 };
-use super::cost::{CompactRange, ResourceDimension, SearchCost};
+use super::cost::{CompactRange, MemoryCompletion, ResourceDimension, SearchCost};
 use super::enforcer::{EnforcementPlanner, EnforcerStep};
 use super::grant::{derive_grant_sensitivity, verify_grant_invariance, GrantSensitivitySummary};
 use super::ids::{
@@ -1418,6 +1418,36 @@ pub(crate) fn compose_candidate_cost_with_sources(
             .map(|(_, child)| child.peak_memory_upper)
             .max()
             .unwrap_or(0);
+        let (overlapping_completion, overlapping_completion_peak) = child_costs
+            .iter()
+            .enumerate()
+            .filter(|(index, _)| overlapping_children & (1_u64 << index) != 0)
+            .fold(
+                (MemoryCompletion::Guaranteed, 0_u64),
+                |(completion, peak), (_, child)| {
+                    (
+                        completion.sequential(
+                            peak,
+                            child.memory_completion,
+                            child.peak_memory_upper,
+                        ),
+                        peak.max(child.peak_memory_upper),
+                    )
+                },
+            );
+        let retained_completion = local_cost.memory_completion.overlapping(
+            local_cost.peak_memory_upper,
+            overlapping_completion,
+            overlapping_completion_peak,
+        );
+        let sequential_peak = cost.peak_memory_upper;
+        cost.memory_completion = cost.memory_completion.sequential(
+            sequential_peak,
+            retained_completion,
+            local_cost
+                .peak_memory_upper
+                .saturating_add(overlapping_completion_peak),
+        );
         let overlapping_non_revocable = child_costs
             .iter()
             .enumerate()
