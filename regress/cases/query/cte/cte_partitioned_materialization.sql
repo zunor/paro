@@ -3,6 +3,7 @@
 
 -- All producer branches are live and every reference fixes the same constant
 -- discriminator, so the complete partitioned-materialization recipe applies.
+-- @normalize explain_cte_ids
 EXPLAIN
 WITH segmented(v, st) AS (
     SELECT 10, 1

@@ -1,3 +1,4 @@
+-- @normalize explain_cte_ids
 EXPLAIN
 WITH segmented(v, st) AS (
     SELECT 10, 1
@@ -41,17 +42,17 @@ MATERIALIZED_CTE  (rows=1)
               ->  PROJECTION  (rows=1)
                 Output: v
                 ->  CTE_SCAN  (rows=1)
-                  CTE Index: 78
+                  CTE Index: <cte-1>
                   Table Index: 33
               ->  PROJECTION  (rows=1)
                 Output: v
                 ->  CTE_SCAN  (rows=1)
-                  CTE Index: 79
+                  CTE Index: <cte-2>
                   Table Index: 41
             ->  PROJECTION  (rows=1)
               Output: v
               ->  CTE_SCAN  (rows=1)
-                CTE Index: 80
+                CTE Index: <cte-3>
                 Table Index: 49
 
 WITH segmented(v, st) AS (

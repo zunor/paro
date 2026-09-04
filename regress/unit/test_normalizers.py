@@ -200,6 +200,23 @@ def test_apply_explain_search_ids_normalizer_rewrites_dynamic_ids_only() -> None
     ]
 
 
+def test_apply_explain_cte_ids_normalizer_preserves_identity_relationships() -> None:
+    assert apply_normalizers(
+        [
+            "  CTE Index: 78",
+            "  CTE Index: 99",
+            "  CTE Index: 78",
+            "  Table Index: 78",
+        ],
+        ("explain_cte_ids",),
+    ) == [
+        "  CTE Index: <cte-1>",
+        "  CTE Index: <cte-2>",
+        "  CTE Index: <cte-1>",
+        "  Table Index: 78",
+    ]
+
+
 def test_apply_explain_external_runtime_normalizer_rewrites_latency_line() -> None:
     lines = [
         "Latency(us): acquire=1 queue=0 kernel=34738 encode_decode=34693",
@@ -346,6 +363,7 @@ def test_normalizer_profiles_returns_registered_names() -> None:
         "explain_adaptive_runtime",
         "explain_routine_ids",
         "explain_search_ids",
+        "explain_cte_ids",
         "explain_external_runtime",
         "explain_runtime",
         "copy_rowcount",

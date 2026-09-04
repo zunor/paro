@@ -138,6 +138,7 @@ product-contract problems. Current registered profiles are:
 | `explain_summary_timing` | Normalize EXPLAIN summary timing text | `Planning Time: ...`, `Execution Time: ...` | Stable |
 | `explain_runtime_bytes` | Normalize volatile spill/memory byte fields | `Memory: ...`, `Disk: ...`, `Peak Memory: ...`, `Temp Storage: ...` | Stable |
 | `explain_routine_ids` | Normalize catalog ids embedded in routine labels | `Routine: name[id@generation]`, `Routines: ...` | Stable |
+| `explain_cte_ids` | Normalize allocation-dependent CTE ids while preserving repeated-id equality | `CTE Index: ...` | Stable |
 | `explain_external_runtime` | Normalize volatile external runtime latency fields | `Latency(us): acquire=... queue=... kernel=... encode_decode=...` | Stable |
 | `explain_runtime` | Legacy alias combining operator + summary timing normalization | `actual time=...`, `Planning Time: ...`, `Execution Time: ...` | Transitional |
 | `transaction_ids` | Normalize volatile ids in concurrency error text | `TxnId(...)`, `transaction ...`, table/db/read/commit ids | Stable |

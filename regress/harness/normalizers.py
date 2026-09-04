@@ -18,6 +18,7 @@ _ROUTINE_ID_RE = re.compile(r"(\bRoutine(?:s)?:\s+[^\[]+)\[(\d+)@(\d+)\]")
 _SEARCH_EXPLAIN_ID_RE = re.compile(
     r"(\bSearch (Definition|Generation|Root):\s*)\d+\b"
 )
+_CTE_EXPLAIN_ID_RE = re.compile(r"(\bCTE Index:\s*)(\d+)\b")
 _EXTERNAL_LATENCY_RE = re.compile(
     r"Latency\(us\):\s*acquire=\d+\s+queue=\d+\s+kernel=\d+\s+encode_decode=\d+"
 )
@@ -169,6 +170,18 @@ def normalize_explain_search_ids(lines: list[str]) -> list[str]:
     return [_SEARCH_EXPLAIN_ID_RE.sub(_replace, line) for line in lines]
 
 
+def normalize_explain_cte_ids(lines: list[str]) -> list[str]:
+    """Normalize allocated CTE ids while preserving identity relationships."""
+    canonical_ids: dict[str, int] = {}
+
+    def _replace(match: re.Match[str]) -> str:
+        raw_id = match.group(2)
+        canonical_id = canonical_ids.setdefault(raw_id, len(canonical_ids) + 1)
+        return f"{match.group(1)}<cte-{canonical_id}>"
+
+    return [_CTE_EXPLAIN_ID_RE.sub(_replace, line) for line in lines]
+
+
 def normalize_explain_external_runtime(lines: list[str]) -> list[str]:
     """Normalize volatile external runtime latency fields in EXPLAIN output."""
     result: list[str] = []
@@ -253,6 +266,7 @@ def normalize_python_runtime_retry_hint(lines: list[str]) -> list[str]:
 # stable: normalize repo-local regress fixture/report absolute paths.
 # stable: normalize volatile transaction/catalog ids in concurrency errors.
 # stable: normalize volatile search definition/generation/root ids in EXPLAIN output.
+# stable: normalize allocated CTE ids while preserving repeated-id equality.
 # transitional: legacy alias kept for gradual migration from explain_runtime.
 NORMALIZERS: dict[str, Callable[[list[str]], list[str]]] = {
     "explain_operator_timing": normalize_explain_operator_timing,
@@ -262,6 +276,7 @@ NORMALIZERS: dict[str, Callable[[list[str]], list[str]]] = {
     "explain_adaptive_runtime": normalize_explain_adaptive_runtime,
     "explain_routine_ids": normalize_explain_routine_ids,
     "explain_search_ids": normalize_explain_search_ids,
+    "explain_cte_ids": normalize_explain_cte_ids,
     "explain_external_runtime": normalize_explain_external_runtime,
     "explain_runtime": normalize_explain_runtime,
     "copy_rowcount": normalize_copy_rowcount,
@@ -300,6 +315,7 @@ __all__ = [
     "normalize_explain_operator_timing",
     "normalize_copy_rowcount",
     "normalize_explain_adaptive_runtime",
+    "normalize_explain_cte_ids",
     "normalize_explain_external_runtime",
     "normalize_explain_routine_ids",
     "normalize_explain_runtime",
