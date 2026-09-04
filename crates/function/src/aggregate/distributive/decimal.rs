@@ -638,6 +638,15 @@ fn bind(
         })?,
         wide_sum,
     });
+    if matches!(
+        op,
+        DecimalAggregateOp::Min
+            | DecimalAggregateOp::Max
+            | DecimalAggregateOp::First
+            | DecimalAggregateOp::Last
+    ) {
+        function = function.with_preserves_input_domain();
+    }
     function = match (op, *precision <= 18, wide_sum) {
         (DecimalAggregateOp::Sum, true, false) => function.with_direct_update(
             AggregateDirectUpdate::Decimal(DecimalDirectUpdate::NarrowSumI64),

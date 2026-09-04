@@ -105,6 +105,11 @@ impl LogicalPlanPostOrderFolder<LogicalOutputLayout> for StatisticsGatherFolder<
             plan.stats.cardinality_provenance = CardinalityProvenance::Statistics;
         }
         let output_layout = plan.operator.output_layout_from_children(&child_layouts);
+        plan.stats.unique_keys = crate::statistics::unique_keys::derive_local_unique_keys(
+            &plan.operator,
+            &output_layout,
+            &child_layouts,
+        );
         self.gathering.update_output_column_stats(
             &plan,
             &output_layout,
@@ -723,11 +728,13 @@ impl StatisticsGathering {
                         .iter()
                         .map(|expr| expression_statistics(expr, ctx)),
                 );
-                stats.extend(
-                    agg.aggregates
-                        .iter()
-                        .map(|expr| aggregate_expression_statistics(expr, ctx)),
-                );
+                stats.extend(agg.aggregates.iter().map(|expr| {
+                    aggregate_expression_statistics(
+                        expr,
+                        ctx,
+                        plan.stats.estimated_cardinality.map(|rows| rows.max),
+                    )
+                }));
                 stats.extend(
                     agg.grouping_functions
                         .iter()
@@ -1205,25 +1212,25 @@ fn merge_column_statistics(
 fn aggregate_expression_statistics(
     expr: &Expression,
     ctx: &impl ColumnStatsView,
+    output_rows: Option<u64>,
 ) -> Arc<ColumnStatistics> {
     let Expression::Aggregate(agg) = expr else {
         return expression_statistics(expr, ctx);
     };
 
-    let name = agg.function.name.to_ascii_lowercase();
-    match name.as_str() {
+    match agg.function.name.to_ascii_lowercase().as_str() {
         "count" | "count_star" => Arc::new(ColumnStatistics::new(BaseStatistics::new(
             LogicalType::BigInt,
         ))),
-        "min" | "max" | "first" | "last" | "first_value" | "last_value" | "any_value"
-        | "arbitrary"
-            if agg.children.len() == 1 =>
-        {
+        _ if agg.function.preserves_input_domain() && agg.children.len() == 1 => {
             // These aggregates can only publish a value drawn from their
-            // input domain. Preserve that domain for downstream equality and
-            // range estimates; relational cardinality still caps the number
-            // of values a grouped/scalar result can expose.
-            expression_statistics(&agg.children[0], ctx)
+            // input domain. Cap its NDV where the result is produced so every
+            // downstream consumer observes self-consistent column statistics.
+            let mut statistics = expression_statistics(&agg.children[0], ctx).as_ref().copy();
+            if let Some(output_rows) = output_rows {
+                statistics = statistics.with_guaranteed_distinct_upper(output_rows);
+            }
+            Arc::new(statistics)
         }
         _ => ColumnStatistics::create_unknown(agg.return_type.clone()),
     }
@@ -2202,9 +2209,9 @@ mod tests {
             return_type,
         ));
 
-        let output = aggregate_expression_statistics(&expression, &ctx);
+        let output = aggregate_expression_statistics(&expression, &ctx, Some(1));
 
-        assert_eq!(output.get_distinct_count(), 3);
+        assert_eq!(output.get_distinct_count(), 1);
         assert_eq!(output.statistics().min_value(), Some(Value::BigInt(7)));
         assert_eq!(output.statistics().max_value(), Some(Value::BigInt(7)));
     }

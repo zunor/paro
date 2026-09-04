@@ -90,7 +90,10 @@ impl ColumnStatistics {
     ///
     /// Callers must not use observed table contents to create this proof.
     pub fn with_guaranteed_distinct_upper(mut self, upper: u64) -> Self {
-        self.guaranteed_distinct_upper = Some(upper);
+        self.guaranteed_distinct_upper = Some(
+            self.guaranteed_distinct_upper
+                .map_or(upper, |current| current.min(upper)),
+        );
         self
     }
 
@@ -200,10 +203,17 @@ impl ColumnStatistics {
     ///
     /// Returns 0 if distinct statistics are not available.
     pub fn get_distinct_count(&self) -> usize {
-        self.distinct_stats
+        let observed = self
+            .distinct_stats
             .as_ref()
             .map(|d| d.get_count())
-            .unwrap_or(0)
+            .unwrap_or(0);
+        if observed == 0 {
+            return 0;
+        }
+        self.guaranteed_distinct_upper
+            .and_then(|upper| usize::try_from(upper).ok())
+            .map_or(observed, |upper| observed.min(upper))
     }
 
     /// Serialize the ColumnStatistics to a writer.
@@ -498,6 +508,19 @@ mod tests {
 
         // Should return 0 when no distinct stats
         assert_eq!(stats.get_distinct_count(), 0);
+    }
+
+    #[test]
+    fn guaranteed_upper_caps_an_observed_distinct_count_monotonically() {
+        let mut stats = ColumnStatistics::new(BaseStatistics::create_empty(LogicalType::Integer));
+        stats.update_distinct_statistics(&[1, 2, 3], 3);
+
+        let stats = stats
+            .with_guaranteed_distinct_upper(2)
+            .with_guaranteed_distinct_upper(1);
+
+        assert_eq!(stats.guaranteed_distinct_upper(), Some(1));
+        assert_eq!(stats.get_distinct_count(), 1);
     }
 
     #[test]

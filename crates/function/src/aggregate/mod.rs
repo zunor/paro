@@ -485,6 +485,11 @@ pub struct AggregateFunction {
     /// Algebraic identity available to logical aggregate rewrites.
     pub algebra: Option<AggregateAlgebra>,
 
+    /// Every non-NULL finalized value is drawn unchanged from the aggregate's
+    /// first input domain. Optimizers may preserve min/max and NDV statistics
+    /// only when this capability is declared by the bound implementation.
+    preserves_input_domain: bool,
+
     /// Optional aggregate over finalized partial results.
     partial_merge: Option<AggregatePartialMergeFn>,
 
@@ -556,6 +561,7 @@ impl fmt::Debug for AggregateFunction {
             .field("arguments", &self.arguments)
             .field("return_type", &self.return_type)
             .field("empty_input", &self.empty_input)
+            .field("preserves_input_domain", &self.preserves_input_domain)
             .field("state_size", &self.state_size)
             .field("has_partial_merge", &self.partial_merge.is_some())
             .field("singleton_merge", &self.singleton_merge)
@@ -586,6 +592,7 @@ impl AggregateFunction {
             return_type,
             empty_input: AggregateEmptyInput::Unknown,
             algebra: None,
+            preserves_input_domain: false,
             partial_merge: None,
             singleton_merge: None,
             input_rollup: None,
@@ -627,6 +634,15 @@ impl AggregateFunction {
     pub fn with_empty_input(mut self, empty_input: AggregateEmptyInput) -> Self {
         self.empty_input = empty_input;
         self
+    }
+
+    pub fn with_preserves_input_domain(mut self) -> Self {
+        self.preserves_input_domain = true;
+        self
+    }
+
+    pub fn preserves_input_domain(&self) -> bool {
+        self.preserves_input_domain
     }
 
     pub fn with_partial_merge(mut self, merge: AggregatePartialMergeFn) -> Self {
@@ -690,6 +706,7 @@ impl AggregateFunction {
             && self.return_type == other.return_type
             && self.empty_input == other.empty_input
             && self.algebra == other.algebra
+            && self.preserves_input_domain == other.preserves_input_domain
             && optional_fn_equal!(self.partial_merge, other.partial_merge)
             && optional_fn_equal!(self.input_rollup, other.input_rollup)
             && optional_fn_equal!(self.non_null_input, other.non_null_input)
@@ -824,6 +841,13 @@ impl AggregateFunctionSet {
     pub fn with_empty_input(mut self, empty_input: AggregateEmptyInput) -> Self {
         for function in &mut self.functions {
             function.empty_input = empty_input.clone();
+        }
+        self
+    }
+
+    pub fn with_preserves_input_domain(mut self) -> Self {
+        for function in &mut self.functions {
+            function.preserves_input_domain = true;
         }
         self
     }

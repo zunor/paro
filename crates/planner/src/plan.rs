@@ -56,6 +56,43 @@ pub enum CardinalityProvenance {
     JoinGraph,
 }
 
+/// Strength of a node-local uniqueness proof.
+///
+/// Structural proofs are valid for planning and cardinality, but only a proof
+/// that remains rooted in an enforced catalog key may select execution paths
+/// where a duplicate is diagnosed as storage corruption.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum UniqueKeyProvenance {
+    CatalogEnforced,
+    Structural,
+}
+
+/// One column of a unique key in a node's current output layout.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub struct UniqueKeyColumn {
+    pub output_index: usize,
+    pub binding: ColumnBinding,
+}
+
+/// Cached unique-key proof produced by statistics gathering.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UniqueKey {
+    pub columns: Box<[UniqueKeyColumn]>,
+    pub provenance: UniqueKeyProvenance,
+}
+
+impl UniqueKey {
+    pub fn new(
+        columns: impl IntoIterator<Item = UniqueKeyColumn>,
+        provenance: UniqueKeyProvenance,
+    ) -> Self {
+        Self {
+            columns: columns.into_iter().collect(),
+            provenance,
+        }
+    }
+}
+
 /// Statistics attached to a logical plan node.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct NodeStats {
@@ -70,6 +107,32 @@ pub struct NodeStats {
     /// point estimate. It is neither a semantic upper bound nor a correctness
     /// proof and must not clamp the group's cardinality envelope.
     pub materialization_risk_cardinality: Option<u64>,
+    /// Node-local unique keys derived once in the statistics post-order pass.
+    pub unique_keys: Vec<UniqueKey>,
+}
+
+impl NodeStats {
+    /// Replace the complete row-count contract as one coherent update.
+    pub fn set_cardinality(
+        &mut self,
+        estimate: CardinalityEstimate,
+        provenance: CardinalityProvenance,
+        materialization_risk_cardinality: Option<u64>,
+    ) {
+        self.estimated_cardinality = Some(estimate);
+        self.cardinality_provenance = provenance;
+        self.materialization_risk_cardinality = materialization_risk_cardinality;
+    }
+
+    /// Carry join-graph row estimates across a row-preserving wrapper.
+    ///
+    /// Unique keys are deliberately excluded: their positional layout must be
+    /// re-derived by the wrapper's statistics fold.
+    pub fn inherit_cardinality_from(&mut self, source: &Self) {
+        self.estimated_cardinality = source.estimated_cardinality;
+        self.cardinality_provenance = source.cardinality_provenance;
+        self.materialization_risk_cardinality = source.materialization_risk_cardinality;
+    }
 }
 
 /// Logical plan wrapper that owns plan-node identity and node-local metadata.

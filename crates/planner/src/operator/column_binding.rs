@@ -6,7 +6,7 @@
 //! Represents a binding to a specific column in a specific table.
 
 /// ColumnBinding represents a binding to a specific column in a specific table (index).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Default)]
 pub struct ColumnBinding {
     pub table_index: usize,
     pub column_index: usize,

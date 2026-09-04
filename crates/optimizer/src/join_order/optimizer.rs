@@ -835,21 +835,13 @@ impl JoinOrderOptimizer {
                             left: join.left,
                             right: join.right,
                         })));
-                    plan.stats.estimated_cardinality =
-                        Some(Self::join_cardinality_estimate(node.cardinality));
-                    plan.stats.cardinality_provenance = CardinalityProvenance::JoinGraph;
-                    plan.stats.materialization_risk_cardinality =
-                        Some(Self::quantize_cardinality(node.materialization_cardinality));
+                    Self::set_reconstructed_cardinality(&mut plan, node);
                     plan
                 } else {
                     debug_assert!(predicates.has_join_conditions());
                     let mut plan =
                         LogicalPlan::synthetic(LogicalOperator::Join(Join::Comparison(join)));
-                    plan.stats.estimated_cardinality =
-                        Some(Self::join_cardinality_estimate(node.cardinality));
-                    plan.stats.cardinality_provenance = CardinalityProvenance::JoinGraph;
-                    plan.stats.materialization_risk_cardinality =
-                        Some(Self::quantize_cardinality(node.materialization_cardinality));
+                    Self::set_reconstructed_cardinality(&mut plan, node);
                     plan
                 }
             } else {
@@ -858,11 +850,7 @@ impl JoinOrderOptimizer {
                         left: Box::new(left_plan),
                         right: Box::new(right_plan),
                     })));
-                plan.stats.estimated_cardinality =
-                    Some(Self::join_cardinality_estimate(node.cardinality));
-                plan.stats.cardinality_provenance = CardinalityProvenance::JoinGraph;
-                plan.stats.materialization_risk_cardinality =
-                    Some(Self::quantize_cardinality(node.materialization_cardinality));
+                Self::set_reconstructed_cardinality(&mut plan, node);
                 plan
             };
 
@@ -876,6 +864,14 @@ impl JoinOrderOptimizer {
 
     fn join_cardinality_estimate(cardinality: f64) -> CardinalityEstimate {
         CardinalityEstimate::exact(Self::quantize_cardinality(cardinality))
+    }
+
+    fn set_reconstructed_cardinality(plan: &mut LogicalPlan, node: &DPJoinNode) {
+        plan.stats.set_cardinality(
+            Self::join_cardinality_estimate(node.cardinality),
+            CardinalityProvenance::JoinGraph,
+            Some(Self::quantize_cardinality(node.materialization_cardinality)),
+        );
     }
 
     fn quantize_cardinality(cardinality: f64) -> u64 {
@@ -934,18 +930,18 @@ impl JoinOrderOptimizer {
         if expressions.is_empty() {
             return result;
         }
-        let estimated_cardinality = result.stats.estimated_cardinality.map(|estimate| {
+        let child_stats = result.stats.clone();
+        let estimated_cardinality = child_stats.estimated_cardinality.map(|estimate| {
             cost_model.estimate_filter_cardinality(
                 estimate.expected,
                 &expressions,
                 &self.column_stats,
             )
         });
-        let materialization_risk_cardinality = result.stats.materialization_risk_cardinality;
         result = LogicalPlan::synthetic(LogicalOperator::Filter(Filter::new(result, expressions)));
+        result.stats.inherit_cardinality_from(&child_stats);
         result.stats.estimated_cardinality = estimated_cardinality;
         result.stats.cardinality_provenance = CardinalityProvenance::JoinGraph;
-        result.stats.materialization_risk_cardinality = materialization_risk_cardinality;
         result
     }
 
@@ -1498,6 +1494,8 @@ mod tests {
             },
             operator: LogicalOperator::Get(get),
         };
+        let plan =
+            crate::statistics::unique_keys::refresh_unique_keys(plan).expect("cache unique keys");
 
         let mut optimizer = JoinOrderOptimizer::new();
         optimizer.add_relation_plan(&make_test_session(), &bind_context, &plan);

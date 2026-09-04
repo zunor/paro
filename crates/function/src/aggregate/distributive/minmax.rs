@@ -198,6 +198,7 @@ pub fn get_min_function() -> AggregateFunctionSet {
     set.add_function(min_varchar_function());
 
     set.with_empty_input(AggregateEmptyInput::Null)
+        .with_preserves_input_domain()
 }
 
 pub fn get_max_function() -> AggregateFunctionSet {
@@ -249,6 +250,7 @@ pub fn get_max_function() -> AggregateFunctionSet {
     set.add_function(max_varchar_function());
 
     set.with_empty_input(AggregateEmptyInput::Null)
+        .with_preserves_input_domain()
 }
 
 #[cfg(test)]

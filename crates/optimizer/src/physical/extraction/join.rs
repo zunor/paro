@@ -1496,7 +1496,7 @@ fn hash_join_build_keys_are_declared_unique(
         .iter()
         .map(|condition| &condition.right)
         .collect::<Vec<_>>();
-    crate::statistics::unique_keys::expressions_cover_unique_key(build, &expressions)
+    crate::statistics::unique_keys::expressions_cover_catalog_unique_key(build, &expressions)
 }
 
 /// Produce a speculative execution hint from the current storage snapshot.

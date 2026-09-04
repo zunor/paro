@@ -4,7 +4,8 @@
 use std::sync::Arc;
 
 use paro_catalog::entry::{
-    CatalogObjectId, ColumnDefinition, Constraint, CreateTableInfo, TableCatalogEntry,
+    CatalogObjectId, ColumnDefinition, Constraint, CreateTableInfo, EdgeTableInfo,
+    TableCatalogEntry,
 };
 use paro_common::runtime_value::Value;
 use paro_common::types::LogicalType;
@@ -12,6 +13,7 @@ use paro_planner::binder::context::BindContext;
 use paro_planner::expression::{
     ComparisonExpression, ComparisonType, ConstantExpression, Expression, ReferenceExpression,
 };
+use paro_planner::operator::graph_expand::{ExpandDirection, GraphExpand};
 use paro_planner::operator::join::{ComparisonJoin, JoinComparisonType, JoinCondition, JoinType};
 use paro_planner::operator::{Filter, Get, Join, LogicalOperator, Projection, Window};
 use paro_planner::plan::LogicalPlan;
@@ -89,6 +91,8 @@ fn unique_build_proof_resolves_physical_references_through_carriers() {
             ))],
         )),
     );
+    let projection =
+        crate::statistics::unique_keys::refresh_unique_keys(projection).expect("cache unique keys");
     let conditions = [JoinCondition::new(
         Expression::Reference(ReferenceExpression::new(0, LogicalType::BigInt)),
         Expression::Reference(ReferenceExpression::new(0, LogicalType::BigInt)),
@@ -103,6 +107,10 @@ fn unique_build_proof_resolves_physical_references_through_carriers() {
         &projection,
         &conditions
     ));
+    assert!(hash_join_build_keys_are_declared_unique(
+        &projection,
+        &[conditions[0].clone(), conditions[0].clone()],
+    ));
 }
 
 #[test]
@@ -113,6 +121,8 @@ fn unique_build_proof_propagates_through_windows() {
         &ctx,
         LogicalOperator::Window(Window::new(9, Vec::new(), get)),
     );
+    let window =
+        crate::statistics::unique_keys::refresh_unique_keys(window).expect("cache unique keys");
     let conditions = [JoinCondition::new(
         Expression::Reference(ReferenceExpression::new(0, LogicalType::Varchar)),
         Expression::Reference(ReferenceExpression::new(1, LogicalType::BigInt)),
@@ -122,6 +132,50 @@ fn unique_build_proof_propagates_through_windows() {
     assert!(hash_join_build_keys_are_declared_unique(
         &window,
         &conditions
+    ));
+}
+
+#[test]
+fn graph_expand_does_not_promote_its_input_key_to_an_output_key() {
+    let ctx = BindContext::new();
+    let expand = GraphExpand::new(
+        EdgeTableInfo {
+            table_name: "edges".to_string(),
+            table_oid: 2,
+            key_column_ids: vec![0],
+            source_key_column_ids: vec![0],
+            source_vertex_table: "vertices".to_string(),
+            source_ref_column_ids: vec![0],
+            destination_key_column_ids: vec![0],
+            destination_vertex_table: "vertices".to_string(),
+            destination_ref_column_ids: vec![0],
+            label: "e".to_string(),
+            property_column_ids: Vec::new(),
+        },
+        ExpandDirection::Forward,
+        "v".to_string(),
+        7,
+        8,
+        9,
+        10,
+        "v".to_string(),
+        1,
+        1,
+        "vertices".to_string(),
+        declared_unique_get(&ctx),
+    );
+    let expanded = LogicalPlan::new(&ctx, LogicalOperator::GraphExpand(expand));
+    let expanded =
+        crate::statistics::unique_keys::refresh_unique_keys(expanded).expect("cache unique keys");
+    let conditions = [JoinCondition::new(
+        Expression::Reference(ReferenceExpression::new(0, LogicalType::Varchar)),
+        Expression::Reference(ReferenceExpression::new(1, LogicalType::BigInt)),
+        JoinComparisonType::Equal,
+    )];
+
+    assert!(!hash_join_build_keys_are_declared_unique(
+        &expanded,
+        &conditions,
     ));
 }
 
@@ -141,6 +195,8 @@ fn unique_build_proof_requires_a_key_preserving_join() {
         &ctx,
         LogicalOperator::Join(Join::Comparison(multiplicative)),
     );
+    let multiplicative = crate::statistics::unique_keys::refresh_unique_keys(multiplicative)
+        .expect("cache unique keys");
     let outer_conditions = [JoinCondition::new(
         Expression::Reference(ReferenceExpression::new(0, LogicalType::BigInt)),
         Expression::Reference(ReferenceExpression::new(0, LogicalType::BigInt)),
@@ -172,7 +228,15 @@ fn unique_build_proof_requires_a_key_preserving_join() {
     preserving.left_projection_map = vec![1].into();
     preserving.right_projection_map = vec![1].into();
     let preserving = LogicalPlan::new(&ctx, LogicalOperator::Join(Join::Comparison(preserving)));
-    assert!(hash_join_build_keys_are_declared_unique(
+    let preserving =
+        crate::statistics::unique_keys::refresh_unique_keys(preserving).expect("cache unique keys");
+    assert!(
+        crate::statistics::unique_keys::expressions_cover_unique_key(
+            &preserving,
+            &[&outer_conditions[0].right],
+        )
+    );
+    assert!(!hash_join_build_keys_are_declared_unique(
         &preserving,
         &outer_conditions
     ));
@@ -214,6 +278,8 @@ fn unique_build_proof_declines_computed_keys_and_null_safe_equality() {
             ))],
         )),
     );
+    let computed =
+        crate::statistics::unique_keys::refresh_unique_keys(computed).expect("cache unique keys");
     let mut condition = JoinCondition::new(
         Expression::Reference(ReferenceExpression::new(0, LogicalType::BigInt)),
         Expression::Reference(ReferenceExpression::new(0, LogicalType::BigInt)),
@@ -224,7 +290,8 @@ fn unique_build_proof_declines_computed_keys_and_null_safe_equality() {
         std::slice::from_ref(&condition)
     ));
 
-    let get = declared_unique_get(&ctx);
+    let get = crate::statistics::unique_keys::refresh_unique_keys(declared_unique_get(&ctx))
+        .expect("cache unique keys");
     condition.right = Expression::Reference(ReferenceExpression::new(1, LogicalType::BigInt));
     condition.comparison = JoinComparisonType::NotDistinctFrom;
     assert!(!hash_join_build_keys_are_declared_unique(

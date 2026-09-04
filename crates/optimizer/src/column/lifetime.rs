@@ -26,7 +26,8 @@ impl ColumnLifetimeAnalyzer {
     }
 
     pub fn optimize(mut self, plan: LogicalPlan) -> Result<LogicalPlan> {
-        self.optimize_plan(plan)
+        let plan = self.optimize_plan(plan)?;
+        crate::statistics::unique_keys::refresh_unique_keys(plan)
     }
 
     fn optimize_plan(&mut self, plan: LogicalPlan) -> Result<LogicalPlan> {
@@ -236,18 +237,9 @@ impl ColumnLifetimeAnalyzer {
                 // projection maps also distinguish visible subquery output from
                 // internal correlation columns, so only replace those maps when
                 // the complete binding set is safe to analyze.
-                if self.everything_referenced {
-                    // `everything` means every value already exposed by this
-                    // operator, not every value its children can produce. A
-                    // group-local rewrite freezes that visible contract in
-                    // the join projection maps before lifetime analysis; the
-                    // analysis may remap it after child compaction but must
-                    // never widen it back to both complete child layouts.
-                    comp_join.left_projection_map =
-                        Self::remap_projection(&left_bindings, &retained_left_bindings, "left")?;
-                    comp_join.right_projection_map =
-                        Self::remap_projection(&right_bindings, &retained_right_bindings, "right")?;
-                } else if !preserve_planner_layout && !self.has_unknown_references(&known_bindings)
+                if !self.everything_referenced
+                    && !preserve_planner_layout
+                    && !self.has_unknown_references(&known_bindings)
                 {
                     comp_join.left_projection_map = if Self::join_outputs_left(comp_join.join_type)
                     {
@@ -262,8 +254,10 @@ impl ColumnLifetimeAnalyzer {
                             ProjectionMap::none()
                         };
                 } else {
-                    // Correlated and otherwise unresolved plans carry a
-                    // planner-defined visible layout. Preserve that layout by
+                    // `everything` means every value already exposed by this
+                    // operator, not every value its children can produce.
+                    // Correlated and otherwise unresolved plans likewise own
+                    // an explicit visible layout. Preserve both contracts by
                     // binding identity, never by stale child positions.
                     comp_join.left_projection_map =
                         Self::remap_projection(&left_bindings, &retained_left_bindings, "left")?;
@@ -308,12 +302,9 @@ impl ColumnLifetimeAnalyzer {
                 known_bindings.extend(left_bindings.iter().copied());
                 known_bindings.extend(right_bindings.iter().copied());
 
-                if self.everything_referenced {
-                    any_join.left_projection_map =
-                        Self::remap_projection(&left_bindings, &retained_left_bindings, "left")?;
-                    any_join.right_projection_map =
-                        Self::remap_projection(&right_bindings, &retained_right_bindings, "right")?;
-                } else if !preserve_planner_layout && !self.has_unknown_references(&known_bindings)
+                if !self.everything_referenced
+                    && !preserve_planner_layout
+                    && !self.has_unknown_references(&known_bindings)
                 {
                     any_join.left_projection_map = if Self::join_outputs_left(any_join.join_type) {
                         self.generate_exact_projection_map(&left_bindings, &output_references)
