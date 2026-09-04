@@ -27,6 +27,7 @@ fn verify_operator(op: &LogicalOperator) -> Result<()> {
             ));
         }
         LogicalOperator::Filter(filter) => {
+            filter.projection_map.validate(filter.child.types().len())?;
             for expr in &filter.expressions {
                 verify_expression(expr)?;
             }
@@ -58,11 +59,13 @@ fn verify_operator(op: &LogicalOperator) -> Result<()> {
             }
         }
         LogicalOperator::Order(order) => {
+            order.projection_map.validate(order.child.types().len())?;
             for order in &order.orders {
                 verify_expression(&order.expression)?;
             }
         }
         LogicalOperator::TopN(topn) => {
+            topn.projection_map.validate(topn.child.types().len())?;
             for order in &topn.orders {
                 verify_expression(&order.expression)?;
             }
@@ -99,6 +102,12 @@ fn verify_operator(op: &LogicalOperator) -> Result<()> {
         }
         LogicalOperator::Join(join) => match join {
             Join::Comparison(comp_join) => {
+                comp_join
+                    .left_projection_map
+                    .validate(comp_join.left.types().len())?;
+                comp_join
+                    .right_projection_map
+                    .validate(comp_join.right.types().len())?;
                 for expr in &comp_join.duplicate_eliminated_columns {
                     verify_expression(expr)?;
                 }
@@ -118,6 +127,12 @@ fn verify_operator(op: &LogicalOperator) -> Result<()> {
                 }
             }
             Join::Any(any_join) => {
+                any_join
+                    .left_projection_map
+                    .validate(any_join.left.types().len())?;
+                any_join
+                    .right_projection_map
+                    .validate(any_join.right.types().len())?;
                 verify_expression(&any_join.condition)?;
             }
             Join::Cross(_) => {}
@@ -170,6 +185,8 @@ fn verify_operator(op: &LogicalOperator) -> Result<()> {
             verify_expression(&search.score_expression)?;
         }
         LogicalOperator::FullTextFilterScan(scan) => {
+            scan.projection_map
+                .validate(scan.get.returned_types.len())?;
             verify_expression(&scan.match_expression)?;
             for expr in &scan.other_predicates {
                 verify_expression(expr)?;
@@ -254,7 +271,7 @@ mod tests {
         WindowExpression, WindowFrame, WindowFrameBound, WindowFrameType,
     };
     use crate::operator::projection::Projection;
-    use crate::operator::{ColumnBinding, DependentJoin, ExpressionGet, LogicalOperator};
+    use crate::operator::{ColumnBinding, DependentJoin, ExpressionGet, LogicalOperator, TopN};
     use crate::plan::LogicalPlan;
     use crate::plan::PlannedStatement;
     use paro_common::runtime_value::Value;
@@ -309,6 +326,17 @@ mod tests {
 
         let err = verify_physical_planner_invariants(&plan).expect_err("verify should fail");
         assert!(err.to_string().contains("DependentJoin"));
+    }
+
+    #[test]
+    fn verify_rejects_an_invalid_topn_projection() {
+        let ctx = BindContext::new();
+        let mut topn = TopN::new(wrap(&ctx, expression_get(0)), vec![], 1, 0);
+        topn.projection_map = vec![1].into();
+
+        let error = verify_physical_planner_invariants(&LogicalOperator::TopN(topn))
+            .expect_err("projection outside the child must fail verification");
+        assert!(error.to_string().contains("outside child layout width 1"));
     }
 
     #[test]

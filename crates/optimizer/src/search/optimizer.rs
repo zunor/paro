@@ -24,11 +24,6 @@ use paro_storage::search::{
 use crate::context::OptimizationContext;
 use crate::statistics::cost::{FullTextScanCostModel, VectorScanCostModel};
 
-#[cfg(test)]
-use paro_planner::binder::ir::OrderByNode;
-#[cfg(test)]
-use paro_planner::expression::ReferenceExpression;
-
 const SIMPLE_CONFIG: &str = "simple";
 
 pub struct SearchOptimizer;
@@ -176,7 +171,7 @@ impl SearchOptimizer {
                 request,
                 decision,
                 candidate_filters,
-            )));
+            )?));
         }
 
         if let Some(intent) = extract_sparse_intent(pattern.order_expr, pattern.get)? {
@@ -217,7 +212,7 @@ impl SearchOptimizer {
                 request,
                 decision,
                 candidate_filters,
-            )));
+            )?));
         }
 
         if let Some(intent) = extract_fulltext_score_intent(pattern.order_expr, pattern.get)? {
@@ -275,7 +270,7 @@ impl SearchOptimizer {
                 request,
                 decision,
                 candidate_filters,
-            )));
+            )?));
         }
 
         Ok(None)
@@ -389,15 +384,20 @@ fn build_search_scan(
     request: NormalizedSearchRequest,
     decision: SearchDecision,
     candidate_filters: Vec<Expression>,
-) -> LogicalPlan {
+) -> Result<LogicalPlan> {
+    pattern
+        .topn
+        .projection_map
+        .validate(pattern.projection.expressions.len())?;
     let output_indices = pattern
         .topn
         .projection_map
         .to_indices(pattern.projection.expressions.len());
     let projections = output_indices
         .iter()
-        .filter_map(|&index| pattern.projection.expressions.get(index).cloned())
-        .collect();
+        .map(|&index| pattern.projection.expressions.get(index).cloned())
+        .collect::<Option<Vec<_>>>()
+        .ok_or_else(|| paro_error::internal("validated TopN projection became invalid"))?;
     let score_output_index = output_indices
         .iter()
         .position(|&index| index == pattern.order_expr_idx);
@@ -419,11 +419,11 @@ fn build_search_scan(
         .with_output_names(output_names),
     );
     let (id, stats, _) = plan.into_parts();
-    LogicalPlan {
+    Ok(LogicalPlan {
         id,
         stats,
         operator,
-    }
+    })
 }
 
 fn build_search_candidate(
@@ -1179,46 +1179,6 @@ fn strip_casts(mut expr: &Expression) -> &Expression {
 }
 
 #[cfg(test)]
-fn rebuild_topn_from_search(search: &SearchScan) -> LogicalOperator {
-    let mut child = LogicalPlan::synthetic(LogicalOperator::Get(search.get.clone()));
-    if !search.absorbed_predicates.is_empty() {
-        child = LogicalPlan::synthetic(LogicalOperator::Filter(Filter::new(
-            child,
-            search.absorbed_predicates.clone(),
-        )));
-    }
-    if !search.residual_predicates.is_empty() {
-        child = LogicalPlan::synthetic(LogicalOperator::Filter(Filter::new(
-            child,
-            search.residual_predicates.clone(),
-        )));
-    }
-
-    let mut projections = search.projections.clone();
-    let visible_width = projections.len();
-    let score_projection_index = search.score_output_index.unwrap_or_else(|| {
-        projections.push(search.score_expression.clone());
-        projections.len() - 1
-    });
-    let projection = Projection::new(search.projection_table_index, child, projections)
-        .with_visible_names(search.output_names.clone());
-    let projection = LogicalPlan::synthetic(LogicalOperator::Projection(projection));
-    let order = OrderByNode {
-        expression: Expression::Reference(ReferenceExpression::new(
-            score_projection_index,
-            search.score_expression.return_type(),
-        )),
-        ascending: search.order_ascending,
-        nulls_first: false,
-    };
-    let mut topn = TopN::new(projection, vec![order], search.limit, 0);
-    if search.score_output_index.is_none() {
-        topn.projection_map = (0..visible_width).collect::<Vec<_>>().into();
-    }
-    LogicalOperator::TopN(topn)
-}
-
-#[cfg(test)]
 mod tests {
     use super::*;
     use paro_common::runtime_value::Value;
@@ -1342,81 +1302,6 @@ mod tests {
         assert_eq!(intent.query_kind, FullTextQueryKind::SerializedTsQuery);
         assert_eq!(intent.config, "simple");
         assert_eq!(intent.query_stats.effective_query_terms(), 2);
-    }
-
-    #[test]
-    fn rebuild_topn_from_search_uses_score_projection_index() {
-        let search = SearchScan::new(
-            Get::new_without_table(1, vec!["v".to_string()], vec![LogicalType::Varchar]),
-            NormalizedSearchRequest {
-                table_id: 1,
-                mode: SearchRequestMode::TopK { limit: 3 },
-                predicate: None,
-                projections: ProjectionSpec {
-                    columns: vec![0],
-                    include_score: true,
-                },
-                intents: vec![SearchIntent::FullText(FullTextIntent {
-                    column_id: 0,
-                    query: "graph".to_string(),
-                    query_kind: FullTextQueryKind::Legacy,
-                    query_stats: FullTextQueryStats::new(1),
-                    config: "simple".to_string(),
-                    score_mode: FullTextScoreMode::Bm25,
-                })],
-                fusion: None,
-            },
-            SearchDecision::IndexScan {
-                candidate: SearchCandidate {
-                    intent: SearchIntent::FullText(FullTextIntent {
-                        column_id: 0,
-                        query: "graph".to_string(),
-                        query_kind: FullTextQueryKind::Legacy,
-                        query_stats: FullTextQueryStats::new(1),
-                        config: "simple".to_string(),
-                        score_mode: FullTextScoreMode::Bm25,
-                    }),
-                    token: paro_storage::search::CapabilityToken {
-                        definition_id: 1,
-                        generation_id: 1,
-                        root_version: 1,
-                        capability_state: paro_storage::search::SearchCapabilityState::Queryable,
-                    },
-                    kind: paro_storage::search::SearchIndexKind::FullText,
-                    estimated_cost: Some(PlannedSearchCostEstimate::new(1.0)),
-                    exact_filter_materialization: None,
-                },
-                confidence: Confidence::High,
-            },
-            vec![
-                Expression::Constant(ConstantExpression::new(
-                    Value::Integer(1),
-                    LogicalType::Integer,
-                )),
-                Expression::Constant(ConstantExpression::new(
-                    Value::Float(0.5),
-                    LogicalType::Float,
-                )),
-            ],
-            9,
-            vec![],
-            vec![],
-            Some(1),
-            Expression::Constant(ConstantExpression::new(
-                Value::Float(0.5),
-                LogicalType::Float,
-            )),
-            false,
-            5,
-        );
-
-        let LogicalOperator::TopN(topn) = rebuild_topn_from_search(&search) else {
-            panic!("expected topn");
-        };
-        match &topn.orders[0].expression {
-            Expression::Reference(reference) => assert_eq!(reference.index, 1),
-            other => panic!("expected reference, got {other:?}"),
-        }
     }
 
     #[test]

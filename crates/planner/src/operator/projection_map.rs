@@ -3,6 +3,8 @@
 
 //! Explicit projections over a logical child layout.
 
+use paro_common::error::{self as paro_error, Result};
+
 /// Columns retained from one logical child.
 ///
 /// `All` is layout-relative and therefore survives structural optimizer passes
@@ -47,6 +49,20 @@ impl ProjectionMap {
                 indices.clone()
             }
         }
+    }
+
+    /// Prove that every positional reference belongs to the current child
+    /// layout before the plan crosses into physical planning.
+    pub fn validate(&self, child_width: usize) -> Result<()> {
+        let Some(index) = self
+            .as_columns()
+            .and_then(|indices| indices.iter().copied().find(|index| *index >= child_width))
+        else {
+            return Ok(());
+        };
+        Err(paro_error::internal(format!(
+            "projection index {index} is outside child layout width {child_width}",
+        )))
     }
 
     pub fn clear(&mut self) {
@@ -102,5 +118,11 @@ mod tests {
         assert_eq!(ProjectionMap::all().to_indices(3), vec![0, 1, 2]);
         assert!(ProjectionMap::none().is_none());
         assert!(!ProjectionMap::none().is_all());
+    }
+
+    #[test]
+    fn validation_rejects_an_out_of_bounds_column() {
+        let error = ProjectionMap::new(vec![0, 2]).validate(2).unwrap_err();
+        assert!(error.to_string().contains("outside child layout width 2"));
     }
 }

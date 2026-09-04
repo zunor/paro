@@ -203,15 +203,22 @@ impl AggregateJoinSubsumption {
         let exposure = Self::inspect_reduction(reduction, reduction_key, &detail)?;
         let replacement = Self::replacement_sum(&exposure, outer_sum)?;
 
-        Self::apply_exposure(reduction, &exposure.mutation)?;
+        // Complete every fallible calculation before changing either child.
+        // Removing a clean detail edge preserves the relative layout of all
+        // other bindings, so its result layout is predictable from inspection.
+        let rewritten_preserved_bindings = preserved_bindings
+            .into_iter()
+            .filter(|binding| binding.table_index != detail.table_index)
+            .collect::<Vec<_>>();
+        let rewritten_preserved_projection =
+            Self::projection_for_binding_layout(&rewritten_preserved_bindings, &retained_bindings)?;
+        let partial_index = Self::exposed_output_index(reduction, &exposure)?;
+
         if !Self::remove_detail_edge(preserved, preserved_key, &detail, outer_sum) {
             return None;
         }
-        *preserved_projection = Self::projection_for_bindings(preserved, &retained_bindings)?;
-        let partial_index = reduction
-            .get_column_bindings()
-            .iter()
-            .position(|binding| *binding == exposure.output_binding)?;
+        Self::apply_exposure(reduction, &exposure.mutation);
+        *preserved_projection = rewritten_preserved_projection;
         join.join_type = JoinType::Inner;
         *reduction_projection = ProjectionMap::new(vec![partial_index]);
         Some(replacement)
@@ -438,11 +445,9 @@ impl AggregateJoinSubsumption {
 
         let exposure = Self::inspect_reduction(&*reduction, reduction_key, detail)?;
         let replacement = Self::replacement_sum(&exposure, outer_sum)?;
-        Self::apply_exposure(reduction, &exposure.mutation)?;
-        let partial_index = reduction
-            .get_column_bindings()
-            .iter()
-            .position(|binding| *binding == exposure.output_binding)?;
+        let partial_index = Self::exposed_output_index(reduction, &exposure)?;
+
+        Self::apply_exposure(reduction, &exposure.mutation);
         join.join_type = JoinType::Inner;
         *reduction_projection = ProjectionMap::new(vec![partial_index]);
 
@@ -589,16 +594,31 @@ impl AggregateJoinSubsumption {
             })
     }
 
-    fn apply_exposure(plan: &mut LogicalPlan, mutation: &ExposureMutation) -> Option<()> {
+    fn exposed_output_index(plan: &LogicalPlan, exposure: &ReductionExposure) -> Option<usize> {
+        match exposure.mutation {
+            ExposureMutation::None => plan
+                .get_column_bindings()
+                .iter()
+                .position(|binding| *binding == exposure.output_binding),
+            ExposureMutation::AppendProjection { .. } => {
+                let LogicalOperator::Projection(projection) = &plan.operator else {
+                    return None;
+                };
+                Some(projection.expressions.len())
+            }
+        }
+    }
+
+    fn apply_exposure(plan: &mut LogicalPlan, mutation: &ExposureMutation) {
         let ExposureMutation::AppendProjection {
             aggregate_binding,
             aggregate_type,
         } = mutation
         else {
-            return Some(());
+            return;
         };
         let LogicalOperator::Projection(projection) = &mut plan.operator else {
-            return None;
+            unreachable!("an inspected projection exposure must remain a projection");
         };
         projection
             .expressions
@@ -611,7 +631,6 @@ impl AggregateJoinSubsumption {
             .push("partial_aggregate".to_string());
         projection.visible_count += 1;
         projection.returned_types.push(aggregate_type.clone());
-        Some(())
     }
 
     fn direct_detail_get<'a>(plan: &'a LogicalPlan, outer_sum: &OuterSum) -> Option<&'a Get> {
@@ -638,11 +657,10 @@ impl AggregateJoinSubsumption {
         }
     }
 
-    fn projection_for_bindings(
-        child: &LogicalPlan,
+    fn projection_for_binding_layout(
+        child_bindings: &[ColumnBinding],
         bindings: &[ColumnBinding],
     ) -> Option<ProjectionMap> {
-        let child_bindings = child.get_column_bindings();
         bindings
             .iter()
             .map(|binding| {
