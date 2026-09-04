@@ -67,6 +67,7 @@ struct DisjunctionWitness {
     filter_index: usize,
     markers: Vec<ColumnBinding>,
     output_bindings: Vec<ColumnBinding>,
+    carrier_bindings: Vec<ColumnBinding>,
     comparisons: Vec<JoinComparisonType>,
 }
 
@@ -163,6 +164,26 @@ fn recognize(
     {
         return None;
     }
+    let mut execution_bindings = HashSet::new();
+    if filter
+        .expressions
+        .iter()
+        .enumerate()
+        .filter(|(index, _)| *index != filter_index)
+        .any(|(_, expression)| {
+            !collect_expression_bindings(expression, &child_bindings, &mut execution_bindings)
+        })
+        || execution_bindings
+            .iter()
+            .any(|binding| !base_bindings.contains(binding))
+    {
+        return None;
+    }
+    let carrier_bindings = base_bindings
+        .iter()
+        .copied()
+        .filter(|binding| output_bindings.contains(binding) || execution_bindings.contains(binding))
+        .collect();
     common_left_keys?
         .iter()
         .all(|expression| expression_bindings_belong_to(expression, &base_bindings))
@@ -170,6 +191,7 @@ fn recognize(
             filter_index,
             markers,
             output_bindings,
+            carrier_bindings,
             comparisons: common_comparisons?,
         })
 }
@@ -227,6 +249,33 @@ fn expression_bindings_belong_to(expression: &Expression, bindings: &[ColumnBind
         } else {
             ExpressionVisitDecision::Descend
         }
+    });
+    valid
+}
+
+fn collect_expression_bindings(
+    expression: &Expression,
+    input_bindings: &[ColumnBinding],
+    bindings: &mut HashSet<ColumnBinding>,
+) -> bool {
+    let mut valid = true;
+    ExpressionIterator::visit(expression, &mut |node| match node {
+        Expression::ColumnRef(column) => {
+            if column.depth != 0 || !input_bindings.contains(&column.binding) {
+                valid = false;
+            } else {
+                bindings.insert(column.binding);
+            }
+            ExpressionVisitDecision::SkipChildren
+        }
+        // Positional references belong to the current input layout. This
+        // rewrite deliberately changes that layout, so it may only proceed in
+        // the stable bound-column namespace.
+        Expression::Reference(_) => {
+            valid = false;
+            ExpressionVisitDecision::SkipChildren
+        }
+        _ => ExpressionVisitDecision::Descend,
     });
     valid
 }
@@ -313,8 +362,13 @@ fn apply(
     }
 
     let base_bindings = current.get_column_bindings();
-    let left_projection_map = witness
-        .output_bindings
+    filter.expressions.remove(witness.filter_index);
+    let projected_bindings = if filter.expressions.is_empty() {
+        &witness.output_bindings
+    } else {
+        &witness.carrier_bindings
+    };
+    let left_projection_map = projected_bindings
         .iter()
         .map(|binding| {
             base_bindings
@@ -346,7 +400,6 @@ fn apply(
         LogicalOperator::Join(Join::Comparison(reduction)),
     );
 
-    filter.expressions.remove(witness.filter_index);
     if filter.expressions.is_empty() {
         let (_, _, operator) = reduction.into_parts();
         return Ok(LogicalPlan {
@@ -356,7 +409,19 @@ fn apply(
         });
     }
     filter.child = Box::new(reduction);
-    filter.projection_map = ProjectionMap::all();
+    filter.projection_map = ProjectionMap::new(
+        witness
+            .output_bindings
+            .iter()
+            .map(|binding| {
+                witness
+                    .carrier_bindings
+                    .iter()
+                    .position(|candidate| candidate == binding)
+                    .expect("recognized output binding must be carried through the reduction")
+            })
+            .collect(),
+    );
     Ok(LogicalPlan {
         id,
         stats,
@@ -368,7 +433,9 @@ fn apply(
 mod tests {
     use super::*;
     use paro_common::runtime_value::Value;
-    use paro_planner::expression::{ConjunctionExpression, ConstantExpression};
+    use paro_planner::expression::{
+        ComparisonExpression, ComparisonType, ConjunctionExpression, ConstantExpression,
+    };
     use paro_planner::operator::{ExpressionGet, Filter, MarkJoinSemantics};
 
     fn value_plan(ctx: &BindContext, table_index: usize, width: usize) -> LogicalPlan {
@@ -484,6 +551,51 @@ mod tests {
 
         let (_, changed) = optimize_plan(plan, &ctx).unwrap();
         assert!(!changed);
+    }
+
+    #[test]
+    fn carries_residual_predicate_columns_without_exposing_them() {
+        let ctx = BindContext::new();
+        let base = value_plan(&ctx, 0, 2);
+        let inner = mark(&ctx, base, 1, 10);
+        let outer = mark(&ctx, inner, 2, 11);
+        let disjunction = Expression::Conjunction(ConjunctionExpression::new(
+            ConjunctionType::Or,
+            vec![
+                column(10, 0, LogicalType::Boolean),
+                column(11, 0, LogicalType::Boolean),
+            ],
+        ));
+        let residual = Expression::Comparison(ComparisonExpression::new(
+            ComparisonType::Equal,
+            column(0, 0, LogicalType::Integer),
+            Expression::Constant(ConstantExpression::new(
+                Value::Integer(1),
+                LogicalType::Integer,
+            )),
+        ));
+        let mut filter = Filter::new(outer, vec![disjunction, residual]);
+        filter.projection_map = ProjectionMap::new(vec![1]);
+
+        let (result, changed) = optimize_plan(
+            LogicalPlan::new(&ctx, LogicalOperator::Filter(filter)),
+            &ctx,
+        )
+        .unwrap();
+        assert!(changed);
+        let LogicalOperator::Filter(filter) = &result.operator else {
+            panic!("residual predicate must retain the filter");
+        };
+        assert_eq!(filter.projection_map.as_columns(), Some(&[1][..]));
+        assert_eq!(result.get_column_bindings(), vec![ColumnBinding::new(0, 1)]);
+        let LogicalOperator::Join(Join::Comparison(join)) = &filter.child.operator else {
+            panic!("marker disjunction should become a semi join");
+        };
+        assert_eq!(join.left_projection_map.as_columns(), Some(&[0, 1][..]));
+        assert_eq!(
+            filter.child.get_column_bindings(),
+            vec![ColumnBinding::new(0, 0), ColumnBinding::new(0, 1)]
+        );
     }
 
     #[test]

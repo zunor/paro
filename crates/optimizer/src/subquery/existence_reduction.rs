@@ -154,8 +154,11 @@ fn reduce_input(plan: LogicalPlan, demanded: &HashSet<ColumnBinding>) -> (Logica
             let LogicalOperator::SetOperation(mut setop) = operator else {
                 unreachable!();
             };
-            let (left, left_changed) = reduce_input(*setop.left, &left_demanded);
-            let (right, right_changed) = reduce_input(*setop.right, &right_demanded);
+            // A set operation owns a positional schema contract. A reduction
+            // may change a join's width only below a Projection that restores
+            // the branch width expected here.
+            let (left, left_changed) = reduce_setop_branch(*setop.left, &left_demanded);
+            let (right, right_changed) = reduce_setop_branch(*setop.right, &right_demanded);
             setop.left = Box::new(left);
             setop.right = Box::new(right);
             (
@@ -213,6 +216,43 @@ fn reduce_input(plan: LogicalPlan, demanded: &HashSet<ColumnBinding>) -> (Logica
     }
 }
 
+fn reduce_setop_branch(
+    plan: LogicalPlan,
+    demanded: &HashSet<ColumnBinding>,
+) -> (LogicalPlan, bool) {
+    match &plan.operator {
+        LogicalOperator::Projection(_) => reduce_input(plan, demanded),
+        LogicalOperator::Filter(filter) => {
+            let child_bindings = filter.child.get_column_bindings();
+            if filter.projection_map.to_indices(child_bindings.len()).len() != child_bindings.len()
+            {
+                return (plan, false);
+            }
+            let mut child_demanded = demanded.clone();
+            if filter.expressions.iter().any(|expression| {
+                !collect_expression_bindings(expression, &child_bindings, &mut child_demanded)
+            }) {
+                return (plan, false);
+            }
+            let (id, stats, operator) = plan.into_parts();
+            let LogicalOperator::Filter(mut filter) = operator else {
+                unreachable!();
+            };
+            let (child, changed) = reduce_setop_branch(*filter.child, &child_demanded);
+            filter.child = Box::new(child);
+            (
+                LogicalPlan {
+                    id,
+                    stats,
+                    operator: LogicalOperator::Filter(filter),
+                },
+                changed,
+            )
+        }
+        _ => (plan, false),
+    }
+}
+
 fn collect_expression_bindings(
     expression: &Expression,
     input_bindings: &[ColumnBinding],
@@ -228,12 +268,11 @@ fn collect_expression_bindings(
             }
             ExpressionVisitDecision::SkipChildren
         }
-        Expression::Reference(reference) => {
-            if let Some(binding) = input_bindings.get(reference.index) {
-                bindings.insert(*binding);
-            } else {
-                valid = false;
-            }
+        // Changing an input join's width invalidates positional references.
+        // Reduction is therefore confined to bound-column expressions; a
+        // physical-layout rewrite needs a separate, explicit rebasing pass.
+        Expression::Reference(_) => {
+            valid = false;
             ExpressionVisitDecision::SkipChildren
         }
         _ => ExpressionVisitDecision::Descend,
@@ -397,6 +436,58 @@ mod tests {
             };
             assert_eq!(join.join_type, JoinType::Semi);
             assert!(join.right_projection_map.is_none());
+        }
+    }
+
+    #[test]
+    fn union_all_branch_schema_cannot_be_narrowed_in_place() {
+        let ctx = BindContext::new();
+        let branch = |left, right| {
+            LogicalPlan::new(
+                &ctx,
+                LogicalOperator::Join(Join::Comparison(ComparisonJoin::new(
+                    JoinType::Inner,
+                    values(&ctx, left),
+                    values(&ctx, right),
+                    vec![equality(left, right)],
+                ))),
+            )
+        };
+        let union = LogicalPlan::new(
+            &ctx,
+            LogicalOperator::SetOperation(SetOperation::union(
+                7,
+                branch(1, 2),
+                branch(3, 4),
+                true,
+                vec![LogicalType::Integer, LogicalType::Integer],
+            )),
+        );
+        let outer = LogicalPlan::new(
+            &ctx,
+            LogicalOperator::Join(Join::Comparison(ComparisonJoin::new(
+                JoinType::Semi,
+                values(&ctx, 0),
+                union,
+                vec![equality(0, 7)],
+            ))),
+        );
+
+        let (result, changed) = optimize_plan(outer).unwrap();
+        assert!(!changed);
+        let LogicalOperator::Join(Join::Comparison(outer)) = &result.operator else {
+            panic!("expected outer semi join");
+        };
+        let LogicalOperator::SetOperation(union) = &outer.right.operator else {
+            panic!("expected union-all input");
+        };
+        assert_eq!(union.column_count, 2);
+        for branch in [union.left.as_ref(), union.right.as_ref()] {
+            assert_eq!(branch.get_column_bindings().len(), 2);
+            let LogicalOperator::Join(Join::Comparison(join)) = &branch.operator else {
+                panic!("expected branch join");
+            };
+            assert_eq!(join.join_type, JoinType::Inner);
         }
     }
 }
