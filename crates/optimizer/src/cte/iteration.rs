@@ -55,14 +55,12 @@ fn orient_recursive_member(
                 move_recursive_input_to_probe(join, cte_name)?;
             }
             if left_contains_reference || right_contains_reference {
-                if let Join::Comparison(join) = join {
-                    // Every stateful implementation inside the loop must keep
-                    // the changing delta on its streaming side.  Persist the
-                    // requirement beyond logical orientation so physical
-                    // build-left alternatives cannot undo it during costing.
-                    join.build_side_constraint =
-                        paro_planner::operator::JoinBuildSideConstraint::Right;
-                }
+                // Every stateful implementation inside the loop must keep the
+                // changing delta on its streaming side. This is a logical join
+                // property, independent of predicate representation.
+                join.set_build_side_constraint(
+                    paro_planner::operator::JoinBuildSideConstraint::Right,
+                );
             }
         }
 
@@ -75,7 +73,6 @@ fn move_recursive_input_to_probe(join: &mut Join, cte_name: &str) -> Result<()> 
     match join {
         Join::Comparison(join) if join.join_type == JoinType::Inner => {
             std::mem::swap(&mut join.left, &mut join.right);
-            join.build_side_constraint = join.build_side_constraint.flip();
             for condition in &mut join.conditions {
                 std::mem::swap(&mut condition.left, &mut condition.right);
                 condition.comparison = condition.comparison.flip();
@@ -107,8 +104,9 @@ mod tests {
     use paro_common::types::LogicalType;
     use paro_planner::expression::{ColumnRefExpression, Expression};
     use paro_planner::operator::{
-        CTERef, ColumnBinding, ComparisonJoin, ExpressionGet, Join, JoinBuildSideConstraint,
-        JoinComparisonType, JoinCondition, JoinType, LogicalOperator, RecursiveCTE,
+        AnyJoin, CTERef, ColumnBinding, ComparisonJoin, CrossProduct, ExpressionGet, Join,
+        JoinBuildSideConstraint, JoinComparisonType, JoinCondition, JoinType, LogicalOperator,
+        RecursiveCTE,
     };
     use paro_planner::plan::LogicalPlan;
 
@@ -195,6 +193,67 @@ mod tests {
             panic!("expected left column reference");
         };
         assert_eq!(left.binding.table_index, recursive_table_index);
+        assert_eq!(join.build_side_constraint, JoinBuildSideConstraint::Right);
+    }
+
+    #[test]
+    fn arbitrary_join_persists_recursive_build_ownership() {
+        let cte_index = 7;
+        let recursive =
+            LogicalPlan::synthetic(LogicalOperator::Join(Join::Any(Box::new(AnyJoin::new(
+                JoinType::Inner,
+                values(11),
+                recursive_reference(cte_index, 12),
+                Expression::Constant(paro_planner::expression::ConstantExpression::new(
+                    paro_common::runtime_value::Value::Boolean(true),
+                    LogicalType::Boolean,
+                )),
+            )))));
+        let plan = LogicalPlan::synthetic(LogicalOperator::RecursiveCTE(RecursiveCTE {
+            cte_index,
+            cte_name: "walk".to_string(),
+            column_names: vec!["value".to_string()],
+            column_types: vec![LogicalType::Integer],
+            union_all: true,
+            anchor: Box::new(values(10)),
+            recursive: Box::new(recursive),
+        }));
+
+        let normalized = normalize_iteration_ownership(plan).unwrap();
+        let LogicalOperator::RecursiveCTE(cte) = &normalized.operator else {
+            panic!("expected recursive CTE");
+        };
+        let LogicalOperator::Join(Join::Any(join)) = &cte.recursive.operator else {
+            panic!("expected arbitrary join");
+        };
+        assert!(matches!(join.left.operator, LogicalOperator::CTERef(_)));
+        assert_eq!(join.build_side_constraint, JoinBuildSideConstraint::Right);
+    }
+
+    #[test]
+    fn cross_product_persists_recursive_build_ownership() {
+        let cte_index = 7;
+        let recursive = LogicalPlan::synthetic(LogicalOperator::Join(Join::Cross(
+            CrossProduct::new(values(11), recursive_reference(cte_index, 12)),
+        )));
+        let plan = LogicalPlan::synthetic(LogicalOperator::RecursiveCTE(RecursiveCTE {
+            cte_index,
+            cte_name: "walk".to_string(),
+            column_names: vec!["value".to_string()],
+            column_types: vec![LogicalType::Integer],
+            union_all: true,
+            anchor: Box::new(values(10)),
+            recursive: Box::new(recursive),
+        }));
+
+        let normalized = normalize_iteration_ownership(plan).unwrap();
+        let LogicalOperator::RecursiveCTE(cte) = &normalized.operator else {
+            panic!("expected recursive CTE");
+        };
+        let LogicalOperator::Join(Join::Cross(join)) = &cte.recursive.operator else {
+            panic!("expected cross product");
+        };
+        assert!(matches!(join.left.operator, LogicalOperator::CTERef(_)));
         assert_eq!(join.build_side_constraint, JoinBuildSideConstraint::Right);
     }
 }

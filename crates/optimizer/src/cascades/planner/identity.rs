@@ -105,9 +105,21 @@ pub(super) fn query_operator_fingerprint(
             Join::Any(join) => {
                 fingerprint.write_u64(1);
                 fingerprint.write_u64(join.join_type as u64);
+                fingerprint.write_u64(match join.build_side_constraint {
+                    paro_planner::operator::JoinBuildSideConstraint::Either => 0,
+                    paro_planner::operator::JoinBuildSideConstraint::Left => 1,
+                    paro_planner::operator::JoinBuildSideConstraint::Right => 2,
+                });
                 encode_optional_usize(&mut fingerprint, join.mark_index);
             }
-            Join::Cross(_) => fingerprint.write_u64(2),
+            Join::Cross(join) => {
+                fingerprint.write_u64(2);
+                fingerprint.write_u64(match join.build_side_constraint {
+                    paro_planner::operator::JoinBuildSideConstraint::Either => 0,
+                    paro_planner::operator::JoinBuildSideConstraint::Left => 1,
+                    paro_planner::operator::JoinBuildSideConstraint::Right => 2,
+                });
+            }
         },
         LogicalOperator::DelimGet(_) => {}
         LogicalOperator::DependentJoin(join) => encode_dependent_join(&mut fingerprint, join),

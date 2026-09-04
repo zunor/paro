@@ -335,6 +335,7 @@ mod tests {
                 LogicalOperator::Join(Join::Cross(CrossProduct {
                     left: Box::new(cte_ref(&bind_context, 10, 4)),
                     right: Box::new(cte_ref(&bind_context, 10, 5)),
+                    build_side_constraint: Default::default(),
                 })),
             ),
         ));
@@ -365,6 +366,7 @@ mod tests {
                     LogicalOperator::Join(Join::Cross(CrossProduct {
                         left: Box::new(cte_ref(&bind_context, 10, 4)),
                         right: Box::new(cte_ref(&bind_context, 10, 5)),
+                        build_side_constraint: Default::default(),
                     })),
                 ),
             )),
@@ -397,6 +399,7 @@ mod tests {
                     LogicalOperator::Join(Join::Cross(CrossProduct {
                         left: Box::new(cte_ref(&bind_context, 20, 3)),
                         right: Box::new(cte_ref(&bind_context, 20, 4)),
+                        build_side_constraint: Default::default(),
                     })),
                 ),
             )),

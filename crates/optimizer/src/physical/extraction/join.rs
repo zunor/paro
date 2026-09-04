@@ -90,7 +90,12 @@ impl PhysicalPlanExtractor {
                 )),
             },
             Join::Any(any) => {
-                if implementation != crate::physical::PhysicalImplementationFlavor::Structural {
+                if !matches!(
+                    implementation,
+                    crate::physical::PhysicalImplementationFlavor::Structural
+                        | crate::physical::PhysicalImplementationFlavor::NestedLoopJoin
+                ) || !any.build_side_constraint.allows_right()
+                {
                     return Err(paro_error::internal(
                         "Memo selected an incompatible implementation for AnyJoin",
                     ));
@@ -98,6 +103,11 @@ impl PhysicalPlanExtractor {
                 self.lower_any_join(any)
             }
             Join::Cross(cross) => {
+                if !cross.build_side_constraint.allows_right() {
+                    return Err(paro_error::internal(
+                        "cross product cannot materialize its constrained probe input",
+                    ));
+                }
                 let spill_policy = match implementation {
                     // Structural lowering is limited to test/utility plans
                     // that never entered relational Memo. It receives the

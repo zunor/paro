@@ -834,6 +834,7 @@ impl JoinOrderOptimizer {
                         LogicalPlan::synthetic(LogicalOperator::Join(Join::Cross(CrossProduct {
                             left: join.left,
                             right: join.right,
+                            build_side_constraint: Default::default(),
                         })));
                     Self::set_reconstructed_cardinality(&mut plan, node);
                     plan
@@ -849,6 +850,7 @@ impl JoinOrderOptimizer {
                     LogicalPlan::synthetic(LogicalOperator::Join(Join::Cross(CrossProduct {
                         left: Box::new(left_plan),
                         right: Box::new(right_plan),
+                        build_side_constraint: Default::default(),
                     })));
                 Self::set_reconstructed_cardinality(&mut plan, node);
                 plan

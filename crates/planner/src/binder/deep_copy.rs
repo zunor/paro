@@ -535,6 +535,7 @@ impl LogicalPlanDeepCopy {
                         right: Box::new(right),
                         condition: aj.condition.clone(),
                         mark_index,
+                        build_side_constraint: aj.build_side_constraint,
                         left_projection_map: aj.left_projection_map.clone(),
                         right_projection_map: aj.right_projection_map.clone(),
                     }))
@@ -545,6 +546,7 @@ impl LogicalPlanDeepCopy {
                     JoinOp::Cross(CrossProduct {
                         left: Box::new(left),
                         right: Box::new(right),
+                        build_side_constraint: cp.build_side_constraint,
                     })
                 }
             }),

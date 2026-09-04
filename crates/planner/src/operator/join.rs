@@ -482,6 +482,8 @@ pub struct AnyJoin {
     pub condition: Expression,
     /// Table index for MARK join results.
     pub mark_index: Option<usize>,
+    /// Physical materialization constraint imposed by a control region.
+    pub build_side_constraint: JoinBuildSideConstraint,
     /// Columns from left side to output.
     pub left_projection_map: ProjectionMap,
     /// Columns from right side to output.
@@ -503,6 +505,7 @@ impl AnyJoin {
             right: Box::new(right),
             condition,
             mark_index: None,
+            build_side_constraint: JoinBuildSideConstraint::Either,
             left_projection_map,
             right_projection_map,
         }
@@ -539,6 +542,8 @@ pub struct CrossProduct {
     pub left: Box<LogicalPlan>,
     /// Right child operator.
     pub right: Box<LogicalPlan>,
+    /// Physical materialization constraint imposed by a control region.
+    pub build_side_constraint: JoinBuildSideConstraint,
 }
 
 impl CrossProduct {
@@ -547,6 +552,7 @@ impl CrossProduct {
         Self {
             left: Box::new(left),
             right: Box::new(right),
+            build_side_constraint: JoinBuildSideConstraint::Either,
         }
     }
 
@@ -638,6 +644,22 @@ impl Join {
             Join::Comparison(j) => j.right.as_mut(),
             Join::Any(j) => j.right.as_mut(),
             Join::Cross(j) => j.right.as_mut(),
+        }
+    }
+
+    pub fn build_side_constraint(&self) -> JoinBuildSideConstraint {
+        match self {
+            Join::Comparison(join) => join.build_side_constraint,
+            Join::Any(join) => join.build_side_constraint,
+            Join::Cross(join) => join.build_side_constraint,
+        }
+    }
+
+    pub fn set_build_side_constraint(&mut self, constraint: JoinBuildSideConstraint) {
+        match self {
+            Join::Comparison(join) => join.build_side_constraint = constraint,
+            Join::Any(join) => join.build_side_constraint = constraint,
+            Join::Cross(join) => join.build_side_constraint = constraint,
         }
     }
 

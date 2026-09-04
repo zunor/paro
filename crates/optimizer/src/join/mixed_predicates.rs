@@ -366,6 +366,7 @@ mod tests {
             LogicalOperator::Join(Join::Cross(CrossProduct {
                 left: Box::new(input(&context, 1)),
                 right: Box::new(input(&context, 2)),
+                build_side_constraint: Default::default(),
             })),
         );
         let equality = Expression::Comparison(ComparisonExpression::new(
@@ -399,6 +400,7 @@ mod tests {
             LogicalOperator::Join(Join::Cross(CrossProduct {
                 left: Box::new(input(&context, 1)),
                 right: Box::new(input(&context, 2)),
+                build_side_constraint: Default::default(),
             })),
         );
         let equality = Expression::Comparison(ComparisonExpression::new(
@@ -431,6 +433,7 @@ mod tests {
             LogicalOperator::Join(Join::Cross(CrossProduct {
                 left: Box::new(input(&context, 1)),
                 right: Box::new(input(&context, 2)),
+                build_side_constraint: Default::default(),
             })),
         );
         let equality = Expression::Comparison(ComparisonExpression::new(

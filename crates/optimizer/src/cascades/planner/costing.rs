@@ -116,11 +116,25 @@ pub(super) fn planner_implementation_set(
                 crate::physical::extraction::misc::supports_partition_aggregate_window(window),
             ..PlannerImplementationSet::STRUCTURAL
         },
-        LogicalOperator::Join(Join::Cross(_)) => PlannerImplementationSet {
-            baseline: PhysicalImplementationFlavor::CrossProductInMemory,
-            external_cross_product: true,
+        LogicalOperator::Join(Join::Any(join)) => PlannerImplementationSet {
+            baseline: if join.build_side_constraint.allows_right() {
+                PhysicalImplementationFlavor::NestedLoopJoin
+            } else {
+                PhysicalImplementationFlavor::Structural
+            },
             ..PlannerImplementationSet::STRUCTURAL
         },
+        LogicalOperator::Join(Join::Cross(join)) => {
+            if join.build_side_constraint.allows_right() {
+                PlannerImplementationSet {
+                    baseline: PhysicalImplementationFlavor::CrossProductInMemory,
+                    external_cross_product: true,
+                    ..PlannerImplementationSet::STRUCTURAL
+                }
+            } else {
+                PlannerImplementationSet::STRUCTURAL
+            }
+        }
         LogicalOperator::Order(_) => PlannerImplementationSet {
             baseline: PhysicalImplementationFlavor::AdaptiveSort,
             ..PlannerImplementationSet::STRUCTURAL
