@@ -147,6 +147,8 @@ pub struct CostModel {
 pub struct SelectivityDefaults {
     pub equality: f64,
     pub range: f64,
+    pub not_equal: f64,
+    pub semi_anti_match: f64,
     pub predicate: f64,
     pub like_prefix: f64,
     pub like_contains: f64,
@@ -160,6 +162,8 @@ impl Default for SelectivityDefaults {
         Self {
             equality: 0.1,
             range: 0.3,
+            not_equal: 0.9,
+            semi_anti_match: 0.2,
             predicate: 0.75,
             // Prefix anchoring is materially more selective than an
             // unanchored substring search. This is also the ordering required

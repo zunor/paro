@@ -12,13 +12,11 @@ use paro_planner::expression::{ConjunctionType, Expression};
 use paro_planner::operator::{ColumnBinding, JoinType};
 use tracing::trace;
 
+use crate::cost_model::SelectivityDefaults;
 use crate::join_order::equality_graph::{find_component, union_components, EqualityClassGraph};
 use crate::join_order::query_graph::FilterInfo;
 use crate::join_order::relation::{JoinRelationSet, JoinRelationSetManager};
 use crate::join_order::relation_manager::RelationStats;
-
-/// Default fraction of preserved-side rows that match a SEMI/ANTI join.
-const DEFAULT_SEMI_ANTI_MATCH_FRACTION: f64 = 0.2;
 
 /// Distribution-free selectivity priors for comparisons between two columns.
 ///
@@ -27,9 +25,6 @@ const DEFAULT_SEMI_ANTI_MATCH_FRACTION: f64 = 0.2;
 /// makes a residual range predicate arbitrarily more selective as the domain
 /// grows. Keep these priors independent of NDV until joint histograms or an
 /// explicit ordering model provide evidence to refine them.
-const DEFAULT_RANGE_JOIN_SELECTIVITY: f64 = 0.3;
-const DEFAULT_NOT_EQUAL_JOIN_SELECTIVITY: f64 = 0.9;
-
 /// Information about the denominator calculation.
 #[derive(Debug)]
 pub struct DenomInfo {
@@ -336,6 +331,9 @@ impl CardinalityHelper {
 /// The cardinality estimation then becomes (|A|*|B|) / max(distinct(x), distinct(y)).
 #[derive(Debug, Default)]
 pub struct CardinalityEstimator {
+    /// Shared priors used by both logical expression costing and join-order
+    /// enumeration when no distributional evidence is available.
+    selectivity_defaults: SelectivityDefaults,
     /// Statistics for equivalent relation sets.
     relation_set_stats: Vec<RelationsSetToStats>,
     /// Equality-class topology compiled once before DP subset enumeration.
@@ -1022,8 +1020,8 @@ impl CardinalityEstimator {
                 }
                 let extra_ratio = match comparison_type {
                     Some(ComparisonKind::Equal) => filter.get_distinct_count() as f64,
-                    Some(ComparisonKind::NotEqual) => 1.0 / DEFAULT_NOT_EQUAL_JOIN_SELECTIVITY,
-                    Some(ComparisonKind::Range) => 1.0 / DEFAULT_RANGE_JOIN_SELECTIVITY,
+                    Some(ComparisonKind::NotEqual) => 1.0 / self.selectivity_defaults.not_equal,
+                    Some(ComparisonKind::Range) => 1.0 / self.selectivity_defaults.range,
                     None => 1.0,
                 };
 
@@ -1094,12 +1092,12 @@ impl CardinalityEstimator {
             None
         };
         let (matched_fraction, minimum_output_fraction) =
-            estimate.unwrap_or((DEFAULT_SEMI_ANTI_MATCH_FRACTION, 0.0));
+            estimate.unwrap_or((self.selectivity_defaults.semi_anti_match, 0.0));
 
         let output_fraction = match filter.filter_info.join_type() {
             JoinType::Semi => matched_fraction,
             JoinType::Anti => 1.0 - matched_fraction,
-            _ => return DEFAULT_SEMI_ANTI_MATCH_FRACTION,
+            _ => return self.selectivity_defaults.semi_anti_match,
         };
 
         // Cardinality estimates participate in divisions and plan costs. Keep
