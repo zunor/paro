@@ -235,6 +235,13 @@ fn lower_partition_aggregate_window_spec(
     let Some(first) = window.expressions.first() else {
         return Ok(None);
     };
+    if first
+        .partitions
+        .iter()
+        .any(|expression| !expression.return_type().supports_flat_group_key())
+    {
+        return Ok(None);
+    }
     for expression in &window.expressions {
         expression.verify_bound_contract()?;
         let Some(aggregate) = expression.aggregate_invocation() else {

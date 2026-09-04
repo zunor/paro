@@ -314,7 +314,7 @@ impl PartitionAggregateWindowHandle {
                     .iter()
                     .map(Expression::return_type)
                     .collect(),
-                spec.aggregate_column_count(),
+                result_types[spec.aggregate.grouping_key_count..].to_vec(),
                 result_chunks,
                 allocator.clone(),
                 index_memory.clone(),
@@ -680,7 +680,7 @@ fn finalize_partition_index(
             .iter()
             .map(Expression::return_type)
             .collect(),
-        spec.aggregate_column_count(),
+        result_types[spec.aggregate.grouping_key_count..].to_vec(),
         chunks,
         allocator,
         memory,

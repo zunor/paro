@@ -17,7 +17,6 @@ use crate::operators::aggregate::group_hash::hash_group_columns;
 use crate::operators::aggregate::tuple_layout::group_vector_values_equal;
 
 const EMPTY_DENSE_SLOT: u32 = u32::MAX;
-const EMPTY_HASH_SLOT: u32 = 0;
 const MIN_HASH_CAPACITY: usize = 8;
 const HASH_LOAD_FACTOR_NUMERATOR: usize = 3;
 const HASH_LOAD_FACTOR_DENOMINATOR: usize = 5;
@@ -43,20 +42,36 @@ impl AggregateRowRef {
     }
 }
 
+/// Occupancy encoding for the immutable hash index.
+///
+/// Keeping the `row + 1` representation behind this type prevents callers
+/// from mixing it with the dense index's raw row/sentinel representation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(transparent)]
+struct HashSlot(u32);
+
+impl HashSlot {
+    const EMPTY: Self = Self(0);
+
+    fn try_from_row(row: AggregateRowRef) -> Result<Self> {
+        row.0.checked_add(1).map(Self).ok_or_else(|| {
+            paro_error::not_implemented(
+                "partition aggregate finalized domain exceeds hash-slot width",
+            )
+        })
+    }
+
+    fn row(self) -> Option<AggregateRowRef> {
+        self.0.checked_sub(1).map(AggregateRowRef)
+    }
+}
+
 #[derive(Debug)]
 enum PartitionKeyIndex {
     DenseInteger {
         key_type: LogicalType,
         minimum: i64,
         slots: Box<[u32]>,
-        null_row: Option<AggregateRowRef>,
-    },
-    SparseInteger {
-        key_type: LogicalType,
-        /// Immutable, precisely-sized key domain. Sparse lookup is deliberately
-        /// logarithmic: unlike `HashMap`, a boxed sorted slice has an exact
-        /// publication footprint that can be admitted before allocation.
-        rows: Box<[(i64, AggregateRowRef)]>,
         null_row: Option<AggregateRowRef>,
     },
     /// Frozen, read-only open-addressing index for generic or composite SQL
@@ -66,8 +81,7 @@ enum PartitionKeyIndex {
     Hashed {
         key_types: Box<[LogicalType]>,
         key_columns: Box<[Arc<Vector>]>,
-        /// Zero is empty; occupied entries store `aggregate_row + 1`.
-        slots: Box<[u32]>,
+        slots: Box<[HashSlot]>,
     },
 }
 
@@ -83,17 +97,26 @@ pub(crate) struct FinalizedPartitionIndex {
 impl FinalizedPartitionIndex {
     pub(crate) fn try_new(
         key_types: Vec<LogicalType>,
-        aggregate_count: usize,
+        aggregate_types: Vec<LogicalType>,
         chunks: Vec<Chunk>,
         allocator: Arc<dyn paro_common::allocator::Allocator>,
         memory: MemoryAccountingContext,
     ) -> Result<Self> {
-        if key_types.is_empty() || aggregate_count == 0 {
+        if key_types.is_empty() || aggregate_types.is_empty() {
             return Err(paro_error::internal(
                 "partition aggregate index requires partition keys and aggregate values",
             ));
         }
+        if key_types
+            .iter()
+            .any(|logical_type| !logical_type.supports_flat_group_key())
+        {
+            return Err(paro_error::internal(
+                "partition aggregate index received an unsupported group key type",
+            ));
+        }
         let key_count = key_types.len();
+        let aggregate_count = aggregate_types.len();
         let chunks: Arc<[Chunk]> = Arc::from(chunks.into_boxed_slice());
         for (index, chunk) in chunks.iter().enumerate() {
             if chunk.column_count() != key_count + aggregate_count {
@@ -105,23 +128,26 @@ impl FinalizedPartitionIndex {
             }
         }
         if chunks.iter().any(|chunk| {
-            chunk
-                .types()
-                .get(..key_count)
-                .is_none_or(|types| types != key_types.as_slice())
+            chunk.types().get(..key_count) != Some(key_types.as_slice())
+                || chunk.types().get(key_count..) != Some(aggregate_types.as_slice())
         }) {
             return Err(paro_error::internal(
-                "partition aggregate finalized key types disagree with its physical plan",
+                "partition aggregate finalized types disagree with its physical plan",
             ));
         }
         let (keys, index_memory) = if key_types.len() == 1
             && matches!(key_types[0], LogicalType::Integer | LogicalType::BigInt)
         {
-            build_integer_index(&chunks, key_types[0].clone(), memory.clone())?
+            build_integer_index(
+                &chunks,
+                key_types[0].clone(),
+                allocator.clone(),
+                memory.clone(),
+            )?
         } else {
-            build_hash_index(&chunks, key_types, allocator, memory.clone())?
+            build_hash_index(&chunks, key_types, allocator.clone(), memory.clone())?
         };
-        let aggregate_columns = flatten_aggregate_columns(&chunks, key_count, aggregate_count)?;
+        let aggregate_columns = flatten_columns(&chunks, key_count, &aggregate_types, allocator)?;
         Ok(Self {
             key_count,
             aggregate_columns,
@@ -175,24 +201,6 @@ impl FinalizedPartitionIndex {
                             .and_then(|offset| slots.get(offset).copied())
                             .filter(|slot| *slot != EMPTY_DENSE_SLOT)
                             .map(AggregateRowRef),
-                    }
-                }
-                PartitionKeyIndex::SparseInteger {
-                    key_type,
-                    rows,
-                    null_row,
-                } => {
-                    let key = read_integer_key(
-                        keys.column(0).expect("verified single partition key"),
-                        row,
-                        key_type,
-                    )?;
-                    match key {
-                        None => *null_row,
-                        Some(key) => rows
-                            .binary_search_by_key(&key, |(candidate, _)| *candidate)
-                            .ok()
-                            .map(|index| rows[index].1),
                     }
                 }
                 PartitionKeyIndex::Hashed { .. } => unreachable!("hashed index returned above"),
@@ -255,37 +263,38 @@ fn build_hash_index(
             paro_error::out_of_range("partition aggregate hash index row count overflow")
         })
     })?;
-    if group_count >= EMPTY_DENSE_SLOT as usize {
+    if group_count >= u32::MAX as usize {
         return Err(paro_error::not_implemented(
             "partition aggregate finalized domain exceeds dictionary index width",
         ));
     }
-    let key_columns = flatten_columns(chunks, 0, key_types.len())?;
-    let keys = Chunk::try_from_arc_vectors_with_cardinality(
-        key_columns.iter().cloned().collect(),
-        group_count,
-        allocator,
-    )?;
+    let key_columns = flatten_columns(chunks, 0, &key_types, allocator.clone())?;
+    if key_columns.len() != key_types.len() {
+        return Err(paro_error::internal(
+            "partition aggregate hash key columns do not match key types",
+        ));
+    }
+    let keys =
+        Chunk::try_from_arc_vectors_with_cardinality(key_columns.to_vec(), group_count, allocator)?;
     let hashes = hash_group_columns(&keys)?;
     let hashes = hashes.as_slice::<u64>();
     let capacity = hash_capacity(group_count)?;
     let mut slots =
         AccountedVec::new_with_accounting(memory.grant()?, memory.tag(), memory.accounting_class());
-    slots.try_resize_with(capacity, || EMPTY_HASH_SLOT)?;
+    slots.try_resize_with(capacity, || HashSlot::EMPTY)?;
     let mask = capacity - 1;
     for row in 0..group_count {
         let mut slot = hash_slot(hashes[row], mask);
         loop {
             let entry = slots[slot];
-            if entry == EMPTY_HASH_SLOT {
-                slots[slot] = u32::try_from(row + 1).map_err(|_| {
-                    paro_error::not_implemented(
-                        "partition aggregate finalized domain exceeds dictionary index width",
-                    )
-                })?;
+            if entry == HashSlot::EMPTY {
+                slots[slot] = HashSlot::try_from_row(AggregateRowRef::try_new(row)?)?;
                 break;
             }
-            let existing = entry as usize - 1;
+            let existing = entry
+                .row()
+                .expect("non-empty partition aggregate hash slot")
+                .0 as usize;
             if group_rows_equal(&key_types, &key_columns, existing, &keys, row)? {
                 return Err(duplicate_group_error());
             }
@@ -294,7 +303,7 @@ fn build_hash_index(
     }
 
     let final_bytes = capacity
-        .checked_mul(std::mem::size_of::<u32>())
+        .checked_mul(std::mem::size_of::<HashSlot>())
         .ok_or_else(|| paro_error::out_of_range("partition aggregate hash index size overflow"))?;
     let final_memory = RetainedMemoryHandle::new(memory.retain(final_bytes)?);
     let slots = slots.as_slice().to_vec().into_boxed_slice();
@@ -311,7 +320,7 @@ fn build_hash_index(
 fn select_hash_rows(
     key_types: &[LogicalType],
     key_columns: &[Arc<Vector>],
-    slots: &[u32],
+    slots: &[HashSlot],
     keys: &Chunk,
     selection: &mut SelectionVector,
 ) -> Result<()> {
@@ -327,12 +336,15 @@ fn select_hash_rows(
         let mut slot = hash_slot(hashes[row], mask);
         loop {
             let entry = slots[slot];
-            if entry == EMPTY_HASH_SLOT {
+            if entry == HashSlot::EMPTY {
                 return Err(paro_error::internal(format!(
                     "partition aggregate detail row {row} has no finalized group"
                 )));
             }
-            let aggregate_row = entry as usize - 1;
+            let aggregate_row = entry
+                .row()
+                .expect("non-empty partition aggregate hash slot")
+                .0 as usize;
             if group_rows_equal(key_types, key_columns, aggregate_row, keys, row)? {
                 selection.try_set(row, aggregate_row)?;
                 break;
@@ -350,6 +362,14 @@ fn group_rows_equal(
     incoming: &Chunk,
     incoming_row: usize,
 ) -> Result<bool> {
+    if stored.len() != key_types.len() || incoming.column_count() != key_types.len() {
+        return Err(paro_error::internal(format!(
+            "partition aggregate key arity mismatch: types={}, stored={}, incoming={}",
+            key_types.len(),
+            stored.len(),
+            incoming.column_count()
+        )));
+    }
     for (column_index, (column, logical_type)) in stored.iter().zip(key_types).enumerate() {
         let incoming_column = incoming
             .column(column_index)
@@ -387,19 +407,26 @@ fn hash_slot(hash: u64, mask: usize) -> usize {
 fn flatten_columns(
     chunks: &[Chunk],
     source_offset: usize,
-    column_count: usize,
+    column_types: &[LogicalType],
+    allocator: Arc<dyn paro_common::allocator::Allocator>,
 ) -> Result<Box<[Arc<Vector>]>> {
     let total_rows = chunks.iter().try_fold(0usize, |total, chunk| {
         total.checked_add(chunk.size()).ok_or_else(|| {
             paro_error::out_of_range("partition aggregate finalized row count overflow")
         })
     })?;
-    if total_rows == 0 {
-        return Ok(Box::new([]));
-    }
-    let first = chunks
-        .first()
-        .expect("non-empty finalized domain has a result chunk");
+    let column_count = column_types.len();
+    let Some(first) = chunks.first() else {
+        return column_types
+            .iter()
+            .map(|logical_type| {
+                let mut vector = Vector::try_new(logical_type.clone(), 0, allocator.clone())?;
+                vector.try_set_count(0)?;
+                Ok(Arc::new(vector))
+            })
+            .collect::<Result<Vec<_>>>()
+            .map(Vec::into_boxed_slice);
+    };
     if chunks.len() == 1 {
         return Ok((0..column_count)
             .map(|column| {
@@ -415,14 +442,8 @@ fn flatten_columns(
     let mut columns = Vec::with_capacity(column_count);
     for column in 0..column_count {
         let source_index = source_offset + column;
-        let source = first
-            .column(source_index)
-            .expect("verified finalized result width");
-        let mut result = Vector::try_new(
-            source.logical_type().clone(),
-            total_rows,
-            first.allocator().clone(),
-        )?;
+        let mut result =
+            Vector::try_new(column_types[column].clone(), total_rows, allocator.clone())?;
         result.try_set_count(total_rows)?;
         let mut offset = 0usize;
         for chunk in chunks {
@@ -437,17 +458,10 @@ fn flatten_columns(
     Ok(columns.into_boxed_slice())
 }
 
-fn flatten_aggregate_columns(
-    chunks: &[Chunk],
-    group_count: usize,
-    aggregate_count: usize,
-) -> Result<Box<[Arc<Vector>]>> {
-    flatten_columns(chunks, group_count, aggregate_count)
-}
-
 fn build_integer_index(
     chunks: &[Chunk],
     key_type: LogicalType,
+    allocator: Arc<dyn paro_common::allocator::Allocator>,
     memory: MemoryAccountingContext,
 ) -> Result<(PartitionKeyIndex, RetainedMemoryHandle)> {
     let mut minimum = i64::MAX;
@@ -523,46 +537,7 @@ fn build_integer_index(
         ));
     }
 
-    let mut rows =
-        AccountedVec::new_with_accounting(memory.grant()?, memory.tag(), memory.accounting_class());
-    rows.try_reserve(group_count)?;
-    let mut null_row = None;
-    let mut result_row = 0usize;
-    for chunk in chunks {
-        let column = chunk.column(0).expect("verified integer group key");
-        for row in 0..chunk.size() {
-            let key = read_integer_key(column, row, &key_type)?;
-            let reference = AggregateRowRef::try_new(result_row)?;
-            match key {
-                None if null_row.replace(reference).is_some() => {
-                    return Err(duplicate_group_error());
-                }
-                None => {}
-                Some(key) => rows.try_push((key, reference))?,
-            }
-            result_row += 1;
-        }
-    }
-    rows.sort_unstable_by_key(|(key, _)| *key);
-    if rows.windows(2).any(|pair| pair[0].0 == pair[1].0) {
-        return Err(duplicate_group_error());
-    }
-    let final_bytes = rows
-        .len()
-        .checked_mul(std::mem::size_of::<(i64, AggregateRowRef)>())
-        .ok_or_else(|| {
-            paro_error::out_of_range("partition aggregate sparse index size overflow")
-        })?;
-    let final_memory = RetainedMemoryHandle::new(memory.retain(final_bytes)?);
-    let rows = rows.as_slice().to_vec().into_boxed_slice();
-    Ok((
-        PartitionKeyIndex::SparseInteger {
-            key_type,
-            rows,
-            null_row,
-        },
-        final_memory,
-    ))
+    build_hash_index(chunks, vec![key_type], allocator, memory)
 }
 
 fn read_integer_key(
@@ -617,7 +592,7 @@ mod tests {
             paro_common::chunk::Chunk::from_vectors(vec![groups, sums], allocator.clone());
         let index = FinalizedPartitionIndex::try_new(
             vec![LogicalType::Integer],
-            1,
+            vec![LogicalType::BigInt],
             vec![results],
             allocator.clone(),
             detached_memory(),
@@ -653,14 +628,25 @@ mod tests {
     fn empty_finalized_domain_is_publishable_without_a_lookup() {
         let allocator = test_allocator();
         let index = FinalizedPartitionIndex::try_new(
-            vec![LogicalType::Integer],
-            1,
+            vec![LogicalType::Varchar],
+            vec![LogicalType::BigInt],
             Vec::new(),
-            allocator,
+            allocator.clone(),
             detached_memory(),
         )
         .expect("empty snapshot index");
-        assert!(index.aggregate_columns.is_empty());
+        assert_eq!(index.aggregate_columns.len(), 1);
+        assert_eq!(index.aggregate_columns[0].len(), 0);
+
+        let keys = paro_common::chunk::Chunk::from_vectors(
+            vec![test_string_vector_with_allocator(
+                &["absent"],
+                allocator.clone(),
+            )],
+            allocator.clone(),
+        );
+        let mut selection = SelectionVector::try_with_capacity(1, allocator).expect("selection");
+        assert!(index.select_rows(&keys, &mut selection).is_err());
     }
 
     #[test]
@@ -675,7 +661,7 @@ mod tests {
         );
         let index = FinalizedPartitionIndex::try_new(
             vec![LogicalType::BigInt],
-            1,
+            vec![LogicalType::BigInt],
             vec![results],
             allocator.clone(),
             detached_memory(),
@@ -712,7 +698,7 @@ mod tests {
         );
         let index = FinalizedPartitionIndex::try_new(
             vec![LogicalType::BigInt],
-            1,
+            vec![LogicalType::BigInt],
             vec![results],
             allocator.clone(),
             detached_memory(),
@@ -767,7 +753,7 @@ mod tests {
         );
         let index = FinalizedPartitionIndex::try_new(
             vec![LogicalType::Varchar, LogicalType::Integer],
-            1,
+            vec![LogicalType::BigInt],
             vec![first, second],
             allocator.clone(),
             detached_memory(),

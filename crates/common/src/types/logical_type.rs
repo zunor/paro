@@ -160,6 +160,45 @@ pub enum LogicalType {
 }
 
 impl LogicalType {
+    /// Whether the type has one canonical flat-vector representation for SQL
+    /// grouping equality and hashing.
+    ///
+    /// Nested and binding-only types must be lowered before entering a flat
+    /// hash-group domain. Callers that offer an alternative implementation
+    /// should use this as an admission check rather than fail at execution.
+    pub fn supports_flat_group_key(&self) -> bool {
+        matches!(
+            self,
+            Self::Boolean
+                | Self::TinyInt
+                | Self::SmallInt
+                | Self::Integer
+                | Self::BigInt
+                | Self::HugeInt
+                | Self::UTinyInt
+                | Self::USmallInt
+                | Self::UInteger
+                | Self::UBigInt
+                | Self::UHugeInt
+                | Self::Float
+                | Self::Double
+                | Self::Decimal { .. }
+                | Self::Varchar
+                | Self::VarcharCollation(_)
+                | Self::TsVector
+                | Self::TsQuery
+                | Self::Date
+                | Self::Timestamp
+                | Self::TimestampTz
+                | Self::Time
+                | Self::Interval
+                | Self::Blob
+                | Self::Uuid
+                | Self::Json
+                | Self::Jsonb
+        )
+    }
+
     /// Returns the type ID for serialization.
     ///
     /// This is used for compact binary serialization in WAL entries.

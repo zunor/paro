@@ -1119,6 +1119,11 @@ fn is_varlen_group_type(logical_type: &LogicalType) -> bool {
 }
 
 fn group_storage_width(logical_type: &LogicalType) -> Result<usize> {
+    if !logical_type.supports_flat_group_key() {
+        return Err(paro_error::internal(format!(
+            "Unsupported group key type in TupleLayout: {logical_type:?}"
+        )));
+    }
     if is_varlen_group_type(logical_type) {
         return Ok(size_of::<VarlenRef>());
     }
@@ -1192,6 +1197,11 @@ fn varlen_bytes<'a>(
 /// shared by immutable grouping-domain indexes so finalized lookup cannot
 /// drift from the hash aggregate's NULL, floating-point, or varlen equality
 /// contract.
+///
+/// `VarcharCollation` deliberately compares the same raw bytes used by the
+/// hash aggregate today. Collation-aware grouping must introduce one shared
+/// canonical key representation before hashing; this lookup must never apply
+/// a different comparator after groups have already been formed.
 pub(crate) fn group_vector_values_equal(
     left: &Vector,
     left_row: usize,
