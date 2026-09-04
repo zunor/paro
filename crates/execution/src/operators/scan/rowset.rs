@@ -380,17 +380,35 @@ fn predicate_selectivity_hint(
                     .map_or(values.len() as f64, |count| {
                         (values.len() as f64 / count).clamp(0.0, 1.0)
                     }),
-                Predicate::Range { lower, upper, .. } => storage
-                    .column_statistics(column_id as usize)
-                    .and_then(|statistics| {
-                        ordered_range_selectivity(
-                            &statistics.statistics().min_value()?,
-                            &statistics.statistics().max_value()?,
-                            lower,
-                            upper,
-                        )
-                    })
-                    .unwrap_or(1.0),
+                predicate @ (Predicate::Range { .. }
+                | Predicate::Ge { .. }
+                | Predicate::Le { .. }
+                | Predicate::Gt { .. }
+                | Predicate::Lt { .. }) => {
+                    let (lower, upper, lower_inclusive, upper_inclusive) = match predicate {
+                        Predicate::Range { lower, upper, .. } => {
+                            (Some(lower), Some(upper), true, true)
+                        }
+                        Predicate::Ge { value, .. } => (Some(value), None, true, true),
+                        Predicate::Gt { value, .. } => (Some(value), None, false, true),
+                        Predicate::Le { value, .. } => (None, Some(value), true, true),
+                        Predicate::Lt { value, .. } => (None, Some(value), true, false),
+                        _ => unreachable!("ordered predicate shape was matched"),
+                    };
+                    storage
+                        .column_statistics(column_id as usize)
+                        .and_then(|statistics| {
+                            ordered_range_selectivity_bounds(
+                                &statistics.statistics().min_value()?,
+                                &statistics.statistics().max_value()?,
+                                lower,
+                                upper,
+                                lower_inclusive,
+                                upper_inclusive,
+                            )
+                        })
+                        .unwrap_or(1.0)
+                }
                 _ => f64::INFINITY,
             }
         }
@@ -434,31 +452,31 @@ enum OrderedRangeDomain {
     Floating,
 }
 
-fn ordered_range_coordinate(value: &Value) -> Option<(OrderedRangeDomain, f64, bool)> {
+impl OrderedRangeDomain {
+    const fn is_discrete(self) -> bool {
+        !matches!(self, Self::Floating)
+    }
+}
+
+fn ordered_range_coordinate(value: &Value) -> Option<(OrderedRangeDomain, f64)> {
     let coordinate = match value {
-        Value::TinyInt(value) => (OrderedRangeDomain::SignedInteger(8), *value as f64, true),
-        Value::SmallInt(value) => (OrderedRangeDomain::SignedInteger(16), *value as f64, true),
-        Value::Integer(value) => (OrderedRangeDomain::SignedInteger(32), *value as f64, true),
-        Value::BigInt(value) => (OrderedRangeDomain::SignedInteger(64), *value as f64, true),
-        Value::HugeInt(value) => (OrderedRangeDomain::SignedInteger(128), *value as f64, true),
-        Value::UTinyInt(value) => (OrderedRangeDomain::UnsignedInteger(8), *value as f64, true),
-        Value::USmallInt(value) => (OrderedRangeDomain::UnsignedInteger(16), *value as f64, true),
-        Value::UInteger(value) => (OrderedRangeDomain::UnsignedInteger(32), *value as f64, true),
-        Value::UBigInt(value) => (OrderedRangeDomain::UnsignedInteger(64), *value as f64, true),
-        Value::UHugeInt(value) => (
-            OrderedRangeDomain::UnsignedInteger(128),
-            *value as f64,
-            true,
-        ),
-        Value::Decimal(value, _, scale) => {
-            (OrderedRangeDomain::Decimal(*scale), *value as f64, true)
-        }
-        Value::Date(value) => (OrderedRangeDomain::Date, *value as f64, true),
-        Value::Timestamp(value) => (OrderedRangeDomain::Timestamp, *value as f64, true),
-        Value::TimestampTz(value) => (OrderedRangeDomain::TimestampTz, *value as f64, true),
-        Value::Time(value) => (OrderedRangeDomain::Time, *value as f64, true),
-        Value::Float(value) => (OrderedRangeDomain::Floating, *value as f64, false),
-        Value::Double(value) => (OrderedRangeDomain::Floating, *value, false),
+        Value::TinyInt(value) => (OrderedRangeDomain::SignedInteger(8), *value as f64),
+        Value::SmallInt(value) => (OrderedRangeDomain::SignedInteger(16), *value as f64),
+        Value::Integer(value) => (OrderedRangeDomain::SignedInteger(32), *value as f64),
+        Value::BigInt(value) => (OrderedRangeDomain::SignedInteger(64), *value as f64),
+        Value::HugeInt(value) => (OrderedRangeDomain::SignedInteger(128), *value as f64),
+        Value::UTinyInt(value) => (OrderedRangeDomain::UnsignedInteger(8), *value as f64),
+        Value::USmallInt(value) => (OrderedRangeDomain::UnsignedInteger(16), *value as f64),
+        Value::UInteger(value) => (OrderedRangeDomain::UnsignedInteger(32), *value as f64),
+        Value::UBigInt(value) => (OrderedRangeDomain::UnsignedInteger(64), *value as f64),
+        Value::UHugeInt(value) => (OrderedRangeDomain::UnsignedInteger(128), *value as f64),
+        Value::Decimal(value, _, scale) => (OrderedRangeDomain::Decimal(*scale), *value as f64),
+        Value::Date(value) => (OrderedRangeDomain::Date, *value as f64),
+        Value::Timestamp(value) => (OrderedRangeDomain::Timestamp, *value as f64),
+        Value::TimestampTz(value) => (OrderedRangeDomain::TimestampTz, *value as f64),
+        Value::Time(value) => (OrderedRangeDomain::Time, *value as f64),
+        Value::Float(value) => (OrderedRangeDomain::Floating, *value as f64),
+        Value::Double(value) => (OrderedRangeDomain::Floating, *value),
         _ => return None,
     };
     coordinate.1.is_finite().then_some(coordinate)
@@ -467,33 +485,60 @@ fn ordered_range_coordinate(value: &Value) -> Option<(OrderedRangeDomain, f64, b
 /// Estimate the fraction of a complete ordered domain covered by an exact,
 /// inclusive runtime range. This is used only to order equivalent conjuncts;
 /// a missing or incomparable domain falls back without changing semantics.
+#[cfg(test)]
 fn ordered_range_selectivity(
     minimum: &Value,
     maximum: &Value,
     lower: &Value,
     upper: &Value,
 ) -> Option<f64> {
-    let (minimum_domain, minimum, minimum_discrete) = ordered_range_coordinate(minimum)?;
-    let (maximum_domain, maximum, maximum_discrete) = ordered_range_coordinate(maximum)?;
-    let (lower_domain, lower, lower_discrete) = ordered_range_coordinate(lower)?;
-    let (upper_domain, upper, upper_discrete) = ordered_range_coordinate(upper)?;
+    ordered_range_selectivity_bounds(minimum, maximum, Some(lower), Some(upper), true, true)
+}
+
+fn ordered_range_selectivity_bounds(
+    minimum: &Value,
+    maximum: &Value,
+    lower: Option<&Value>,
+    upper: Option<&Value>,
+    lower_inclusive: bool,
+    upper_inclusive: bool,
+) -> Option<f64> {
+    let (minimum_domain, minimum) = ordered_range_coordinate(minimum)?;
+    let (maximum_domain, maximum) = ordered_range_coordinate(maximum)?;
+    let (lower_domain, mut lower) = match lower {
+        Some(lower) => ordered_range_coordinate(lower)?,
+        None => (minimum_domain, minimum),
+    };
+    let (upper_domain, mut upper) = match upper {
+        Some(upper) => ordered_range_coordinate(upper)?,
+        None => (minimum_domain, maximum),
+    };
     if minimum_domain != maximum_domain
         || minimum_domain != lower_domain
         || minimum_domain != upper_domain
-        || minimum_discrete != maximum_discrete
-        || minimum_discrete != lower_discrete
-        || minimum_discrete != upper_discrete
         || minimum > maximum
         || lower > upper
     {
         return None;
+    }
+    if minimum_domain.is_discrete() {
+        if !lower_inclusive {
+            lower += 1.0;
+        }
+        if !upper_inclusive {
+            upper -= 1.0;
+        }
     }
     let lower = lower.max(minimum);
     let upper = upper.min(maximum);
     if lower > upper {
         return Some(0.0);
     }
-    let unit = if minimum_discrete { 1.0 } else { 0.0 };
+    let unit = if minimum_domain.is_discrete() {
+        1.0
+    } else {
+        0.0
+    };
     let domain = maximum - minimum + unit;
     if domain == 0.0 {
         return Some(1.0);
@@ -1073,6 +1118,26 @@ mod tests {
                 &Value::BigInt(19),
             ),
             None
+        );
+
+        let minimum = Value::Integer(0);
+        let maximum = Value::Integer(99);
+        let bound = Value::Integer(10);
+        assert_eq!(
+            ordered_range_selectivity_bounds(&minimum, &maximum, Some(&bound), None, true, true,),
+            Some(0.9),
+        );
+        assert_eq!(
+            ordered_range_selectivity_bounds(&minimum, &maximum, Some(&bound), None, false, true,),
+            Some(0.89),
+        );
+        assert_eq!(
+            ordered_range_selectivity_bounds(&minimum, &maximum, None, Some(&bound), true, true,),
+            Some(0.11),
+        );
+        assert_eq!(
+            ordered_range_selectivity_bounds(&minimum, &maximum, None, Some(&bound), true, false,),
+            Some(0.1),
         );
     }
 
