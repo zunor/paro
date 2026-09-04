@@ -23,6 +23,17 @@ pub enum MemoryError {
         available: usize,
     },
 
+    /// A best-effort non-spillable plan reached its admitted resident cap.
+    #[error(
+        "runtime-capped plan exhausted memory in {domain:?}: requested {requested} bytes, available {available} bytes; uncapped peak demand {uncapped_peak_memory_upper} bytes has no forward-progress proof"
+    )]
+    RuntimeCapExhausted {
+        domain: MemoryDomain,
+        requested: usize,
+        available: usize,
+        uncapped_peak_memory_upper: u64,
+    },
+
     /// The physical allocator failed after a grant was consumed.
     #[error("physical allocation failed for {bytes} bytes")]
     PhysicalAllocationFailed { bytes: usize },
@@ -71,6 +82,14 @@ impl From<MemoryError> for ParoError {
                 available,
             } => paro_error::out_of_memory(format!(
                 "memory quota exhausted in {domain:?}: requested {requested} bytes, available {available} bytes"
+            )),
+            MemoryError::RuntimeCapExhausted {
+                domain,
+                requested,
+                available,
+                uncapped_peak_memory_upper,
+            } => paro_error::out_of_memory(format!(
+                "runtime-capped plan exhausted memory in {domain:?}: requested {requested} bytes, available {available} bytes; uncapped peak demand {uncapped_peak_memory_upper} bytes has no forward-progress proof"
             )),
             MemoryError::PhysicalAllocationFailed { bytes } => {
                 paro_error::out_of_memory(format!("physical allocation failed for {bytes} bytes"))

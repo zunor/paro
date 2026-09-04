@@ -20,7 +20,32 @@ pub const RESOURCE_DIMS: usize = 6;
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum MemoryCompletion {
     Guaranteed,
-    RuntimeCapped,
+    RuntimeCapped {
+        /// Retained-state demand before grant admission imposed the resident
+        /// ceiling. `u64::MAX` means the logical input has no proven bound.
+        uncapped_peak_memory_upper: u64,
+    },
+}
+
+impl MemoryCompletion {
+    pub const fn runtime_capped(uncapped_peak_memory_upper: u64) -> Self {
+        Self::RuntimeCapped {
+            uncapped_peak_memory_upper,
+        }
+    }
+
+    pub const fn is_runtime_capped(self) -> bool {
+        matches!(self, Self::RuntimeCapped { .. })
+    }
+
+    pub const fn uncapped_peak_memory_upper(self) -> Option<u64> {
+        match self {
+            Self::Guaranteed => None,
+            Self::RuntimeCapped {
+                uncapped_peak_memory_upper,
+            } => Some(uncapped_peak_memory_upper),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -214,18 +239,29 @@ impl SearchCost {
                 "memory floor plus revocable target exceeds the total peak contract",
             ));
         }
+        if self
+            .memory_completion
+            .uncapped_peak_memory_upper()
+            .is_some_and(|uncapped| uncapped < self.peak_memory_upper)
+        {
+            return Err(paro_error::internal(
+                "runtime-capped demand is below the admitted resident peak",
+            ));
+        }
         Ok(())
     }
 
-    /// Memory at which the expected-cost estimate is valid. The peak remains
-    /// a hard resident upper bound; spillable state below that bound is a
-    /// preference and must not make an otherwise executable DOP inadmissible.
+    /// Memory at which the expected-cost estimate is valid. The admitted peak
+    /// is a resident upper bound; a runtime-capped plan separately retains its
+    /// uncapped demand because that ceiling is not a completion proof.
     pub fn preferred_memory_bytes(&self) -> u64 {
         self.minimum_memory_bytes
             .saturating_add(self.revocable_memory_target)
     }
 
     pub fn sequential(self, other: Self) -> Result<Self> {
+        self.validate()?;
+        other.validate()?;
         if self.external_worker_slots_upper > 0
             && other.external_worker_slots_upper > 0
             && self.external_workers != other.external_workers
@@ -281,6 +317,36 @@ impl SearchCost {
         };
         result.validate()?;
         Ok(result)
+    }
+
+    /// Apply a resident ceiling without erasing the demand that made this
+    /// plan best-effort. Only an explicitly runtime-capped implementation may
+    /// use this path.
+    pub(crate) fn apply_runtime_cap(
+        &mut self,
+        memory_ceiling_bytes: u64,
+        overlapping_minimum_bytes: u64,
+    ) -> Result<()> {
+        if overlapping_minimum_bytes > memory_ceiling_bytes {
+            return Err(paro_error::internal(
+                "runtime memory cap is below the overlapping execution floor",
+            ));
+        }
+        let Some(previous_uncapped) = self.memory_completion.uncapped_peak_memory_upper() else {
+            return Err(paro_error::internal(
+                "a guaranteed plan cannot be weakened by runtime grant clamping",
+            ));
+        };
+        let uncapped_peak_memory_upper = previous_uncapped
+            .max(self.peak_memory_upper)
+            .max(self.non_revocable_memory_upper);
+        self.memory_completion = MemoryCompletion::runtime_capped(uncapped_peak_memory_upper);
+        self.non_revocable_memory_upper = self.non_revocable_memory_upper.min(memory_ceiling_bytes);
+        self.peak_memory_upper = memory_ceiling_bytes.max(self.minimum_memory_bytes);
+        self.revocable_memory_target = self
+            .revocable_memory_target
+            .min(memory_ceiling_bytes - overlapping_minimum_bytes);
+        self.validate()
     }
 
     /// Scale expected and risk work for a region-owned selectivity effect.
@@ -501,6 +567,44 @@ mod memory_tests {
         assert_eq!(combined.minimum_memory_bytes, 20);
         assert_eq!(combined.preferred_memory_bytes(), 50);
         assert_eq!(combined.peak_memory_upper, 100);
+    }
+
+    #[test]
+    fn runtime_cap_preserves_the_uncapped_demand() {
+        let mut cost = SearchCost {
+            non_revocable_memory_upper: u64::MAX,
+            minimum_memory_bytes: 10,
+            peak_memory_upper: u64::MAX,
+            memory_completion: MemoryCompletion::runtime_capped(u64::MAX),
+            ..SearchCost::ZERO
+        };
+
+        cost.apply_runtime_cap(100, 10).unwrap();
+
+        assert_eq!(cost.peak_memory_upper, 100);
+        assert_eq!(
+            cost.memory_completion.uncapped_peak_memory_upper(),
+            Some(u64::MAX)
+        );
+    }
+
+    #[test]
+    fn runtime_capped_peer_cannot_mask_an_invalid_guaranteed_component() {
+        let invalid_guaranteed = SearchCost {
+            non_revocable_memory_upper: 20,
+            minimum_memory_bytes: 10,
+            peak_memory_upper: 20,
+            ..SearchCost::ZERO
+        };
+        let runtime_capped = SearchCost {
+            non_revocable_memory_upper: 10,
+            minimum_memory_bytes: 10,
+            peak_memory_upper: 10,
+            memory_completion: MemoryCompletion::runtime_capped(10),
+            ..SearchCost::ZERO
+        };
+
+        assert!(invalid_guaranteed.sequential(runtime_capped).is_err());
     }
 }
 

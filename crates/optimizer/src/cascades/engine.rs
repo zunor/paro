@@ -12,7 +12,7 @@ use super::calibration::{
     LocalOperatorWork, MachineCalibrationBundle, ParallelWorkProfile, OP_ENFORCER_RANDOM_FETCH,
     OP_ENFORCER_SORT_COMPARE, OP_ENFORCER_SPILL_PAGE, OP_ENFORCER_STREAM_ROW,
 };
-use super::cost::{CompactRange, MemoryCompletion, ResourceDimension, SearchCost};
+use super::cost::{CompactRange, ResourceDimension, SearchCost};
 use super::enforcer::{EnforcementPlanner, EnforcerStep};
 use super::grant::{derive_grant_sensitivity, verify_grant_invariance, GrantSensitivitySummary};
 use super::ids::{
@@ -1222,12 +1222,8 @@ fn fit_local_retained_state_to_grant(
                 .min(grant.hard_memory_bytes - retained_minimum);
             return Ok(Some(local_cost));
         }
-        if local_cost.memory_completion == MemoryCompletion::RuntimeCapped {
-            local_cost.non_revocable_memory_upper = grant.hard_memory_bytes;
-            local_cost.peak_memory_upper = grant.hard_memory_bytes;
-            local_cost.revocable_memory_target = local_cost
-                .revocable_memory_target
-                .min(grant.hard_memory_bytes - retained_minimum);
+        if local_cost.memory_completion.is_runtime_capped() {
+            local_cost.apply_runtime_cap(grant.hard_memory_bytes, retained_minimum)?;
             return Ok(Some(local_cost));
         }
         return Ok(None);
@@ -1249,12 +1245,8 @@ fn fit_local_retained_state_to_grant(
         }
         return Ok(Some(local_cost));
     }
-    if local_cost.memory_completion == MemoryCompletion::RuntimeCapped {
-        local_cost.non_revocable_memory_upper = grant.hard_memory_bytes;
-        local_cost.peak_memory_upper = grant.hard_memory_bytes;
-        local_cost.revocable_memory_target = local_cost
-            .revocable_memory_target
-            .min(grant.hard_memory_bytes - retained_minimum);
+    if local_cost.memory_completion.is_runtime_capped() {
+        local_cost.apply_runtime_cap(grant.hard_memory_bytes, retained_minimum)?;
         return Ok(Some(local_cost));
     }
     Ok(None)
@@ -1286,18 +1278,18 @@ pub(crate) fn constrain_composed_cost_to_grant(
     // against this class. Their revocable targets draw from the same query
     // pool and are therefore preferences, not additive reservations. Clamp
     // only that elastic portion after composing the mandatory floors.
-    cost.revocable_memory_target = cost.revocable_memory_target.min(
-        grant
-            .hard_memory_bytes
-            .saturating_sub(cost.minimum_memory_bytes),
-    );
-    cost.peak_memory_upper = cost
-        .peak_memory_upper
-        .min(grant.hard_memory_bytes)
-        .max(cost.minimum_memory_bytes);
-    if cost.memory_completion == MemoryCompletion::RuntimeCapped {
-        cost.non_revocable_memory_upper =
-            cost.non_revocable_memory_upper.min(grant.hard_memory_bytes);
+    if cost.memory_completion.is_runtime_capped() {
+        cost.apply_runtime_cap(grant.hard_memory_bytes, cost.minimum_memory_bytes)?;
+    } else {
+        cost.revocable_memory_target = cost.revocable_memory_target.min(
+            grant
+                .hard_memory_bytes
+                .saturating_sub(cost.minimum_memory_bytes),
+        );
+        cost.peak_memory_upper = cost
+            .peak_memory_upper
+            .min(grant.hard_memory_bytes)
+            .max(cost.minimum_memory_bytes);
     }
     cost.validate()?;
     Ok(Some(cost))
@@ -1316,6 +1308,13 @@ pub(crate) fn compose_candidate_cost_with_sources(
     child_source_work: &[&[SourceWork]],
     composition: CostComposition,
 ) -> Result<ComposedCost> {
+    local_cost.validate()?;
+    if let Some(filter_cost) = source_filter_apply_cost {
+        filter_cost.validate()?;
+    }
+    for child in child_costs {
+        child.validate()?;
+    }
     if child_costs.len() != child_source_work.len() {
         return Err(paro_error::internal(
             "cost composition has no source-work evidence for one or more children",

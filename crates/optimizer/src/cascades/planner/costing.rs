@@ -1052,16 +1052,18 @@ fn apply_execution_memory_contract(
                 .min(u64::MAX - minimum),
             ..base
         };
-        contract.validate()?;
-        cost.non_revocable_memory_upper = contract.fixed_non_revocable_bytes;
-        cost.minimum_memory_bytes = minimum;
-        cost.revocable_memory_target = contract.revocable_target_bytes;
-        cost.peak_memory_upper = if retained_memory_upper == u64::MAX {
+        let peak_memory_upper = if retained_memory_upper == u64::MAX {
             u64::MAX
         } else {
             minimum.saturating_add(retained_memory_upper)
         };
-        cost.validate()?;
+        publish_execution_memory_contract(
+            cost,
+            contract,
+            contract.fixed_non_revocable_bytes,
+            peak_memory_upper,
+            MemoryCompletion::Guaranteed,
+        )?;
         return Ok(());
     } else if retained_memory_upper == u64::MAX {
         // A missing semantic row bound cannot prove how much state this
@@ -1070,12 +1072,22 @@ fn apply_execution_memory_contract(
         // executable scratch floor and preserve the unknown retained-state
         // upper explicitly; grant admission will cap resident memory while
         // keeping the weaker completion contract visible to plan selection.
-        cost.non_revocable_memory_upper = u64::MAX;
-        cost.minimum_memory_bytes = BLOCKING_FIXED_SCRATCH_BYTES;
-        cost.revocable_memory_target = 0;
-        cost.peak_memory_upper = u64::MAX;
-        cost.memory_completion = MemoryCompletion::RuntimeCapped;
-        cost.validate()?;
+        let contract = ExecutionMemoryContract {
+            fixed_non_revocable_bytes: 0,
+            fixed_scratch_bytes: BLOCKING_FIXED_SCRATCH_BYTES,
+            per_task_scratch_bytes: 0,
+            max_concurrent_tasks: 0,
+            revocable_minimum_bytes: 0,
+            revocable_target_bytes: 0,
+            spill_buffer_minimum_bytes: 0,
+        };
+        publish_execution_memory_contract(
+            cost,
+            contract,
+            u64::MAX,
+            u64::MAX,
+            MemoryCompletion::runtime_capped(u64::MAX),
+        )?;
         return Ok(());
     } else {
         ExecutionMemoryContract {
@@ -1088,12 +1100,29 @@ fn apply_execution_memory_contract(
             spill_buffer_minimum_bytes: 0,
         }
     };
+    publish_execution_memory_contract(
+        cost,
+        contract,
+        contract.fixed_non_revocable_bytes,
+        contract.preferred_memory_bytes()?,
+        MemoryCompletion::Guaranteed,
+    )
+}
+
+fn publish_execution_memory_contract(
+    cost: &mut SearchCost,
+    contract: crate::physical::resources::ExecutionMemoryContract,
+    non_revocable_memory_upper: u64,
+    peak_memory_upper: u64,
+    memory_completion: crate::physical::MemoryCompletion,
+) -> Result<()> {
     contract.validate()?;
-    cost.non_revocable_memory_upper = contract.fixed_non_revocable_bytes;
+    cost.non_revocable_memory_upper = non_revocable_memory_upper;
     cost.minimum_memory_bytes = contract.minimum_memory_bytes()?;
     cost.revocable_memory_target = contract.revocable_target_bytes;
-    cost.peak_memory_upper = contract.preferred_memory_bytes()?;
-    Ok(())
+    cost.peak_memory_upper = peak_memory_upper;
+    cost.memory_completion = memory_completion;
+    cost.validate()
 }
 
 fn expected_retained_memory_target(

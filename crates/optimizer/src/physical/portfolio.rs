@@ -210,6 +210,7 @@ impl<P> PhysicalPlanPortfolio<P> {
                     critical_path = variant.cost.critical_path.expected,
                     minimum_memory_bytes = variant.cost.minimum_memory_bytes,
                     peak_memory_upper = variant.cost.peak_memory_upper,
+                    memory_completion = ?variant.cost.memory_completion,
                     fingerprint = ?variant.physical_fingerprint,
                     "physical portfolio candidate is admissible"
                 );
@@ -497,7 +498,7 @@ mod tests {
         };
         let mut capped = cost(1.0, 100);
         capped.minimum_memory_bytes = 10;
-        capped.memory_completion = MemoryCompletion::RuntimeCapped;
+        capped.memory_completion = MemoryCompletion::runtime_capped(capped.peak_memory_upper);
         let portfolio = PhysicalPlanPortfolio::build(
             [class],
             [

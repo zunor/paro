@@ -4,6 +4,7 @@
 //! Logical/physical property contracts, grant sensitivity, and guarantees.
 
 use super::*;
+#[cfg(test)]
 use crate::physical::MemoryCompletion;
 
 pub(super) fn optimization_goal_fingerprint(goal: OptimizationGoal) -> Fingerprint {
@@ -423,17 +424,12 @@ pub(super) fn cost_for_grant(
             cost.validate()?;
             return Ok(Some(cost));
         }
-        if cost.memory_completion == MemoryCompletion::RuntimeCapped {
+        if cost.memory_completion.is_runtime_capped() {
             // The query allocator is the resident-memory proof for this
             // explicitly best-effort implementation.  This does not promote
             // it to a forward-progress guarantee: portfolio selection keeps
             // preferring any fully bounded or spillable alternative.
-            cost.non_revocable_memory_upper = class.hard_memory_bytes;
-            cost.peak_memory_upper = class.hard_memory_bytes;
-            cost.revocable_memory_target = cost
-                .revocable_memory_target
-                .min(class.hard_memory_bytes - cost.minimum_memory_bytes);
-            cost.validate()?;
+            cost.apply_runtime_cap(class.hard_memory_bytes, cost.minimum_memory_bytes)?;
             return Ok(Some(cost));
         }
         return Ok(None);
@@ -469,13 +465,8 @@ pub(super) fn cost_for_grant(
         cost.validate()?;
         return Ok(Some(cost));
     }
-    if cost.memory_completion == MemoryCompletion::RuntimeCapped {
-        cost.non_revocable_memory_upper = class.hard_memory_bytes;
-        cost.peak_memory_upper = class.hard_memory_bytes;
-        cost.revocable_memory_target = cost
-            .revocable_memory_target
-            .min(class.hard_memory_bytes - cost.minimum_memory_bytes);
-        cost.validate()?;
+    if cost.memory_completion.is_runtime_capped() {
+        cost.apply_runtime_cap(class.hard_memory_bytes, cost.minimum_memory_bytes)?;
         return Ok(Some(cost));
     }
     Ok(None)
@@ -677,7 +668,7 @@ mod resource_contract_tests {
         let mut estimate = cost(u64::MAX, 64 * 1024);
         estimate.non_revocable_memory_upper = u64::MAX;
         estimate.revocable_memory_target = 0;
-        estimate.memory_completion = MemoryCompletion::RuntimeCapped;
+        estimate.memory_completion = MemoryCompletion::runtime_capped(estimate.peak_memory_upper);
 
         let admitted = cost_for_grant(
             estimate,
@@ -696,7 +687,10 @@ mod resource_contract_tests {
             no_spill.hard_memory_bytes
         );
         assert_eq!(admitted.peak_memory_upper, no_spill.hard_memory_bytes);
-        assert_eq!(admitted.memory_completion, MemoryCompletion::RuntimeCapped);
+        assert_eq!(
+            admitted.memory_completion,
+            MemoryCompletion::runtime_capped(u64::MAX)
+        );
     }
 
     #[test]

@@ -483,9 +483,9 @@ impl QueryMemoryPool {
                     if self.request_peer_capacity(target)? > 0 {
                         continue;
                     }
-                    return Err(err);
+                    return Err(self.annotate_runtime_cap_exhaustion(err));
                 }
-                Err(err) => return Err(err),
+                Err(err) => return Err(self.annotate_runtime_cap_exhaustion(err)),
             }
         }
     }
@@ -508,7 +508,7 @@ impl QueryMemoryPool {
                         self.try_grow(bytes)?;
                         return Ok(GrowOutcome::Granted);
                     }
-                    return Err(err);
+                    return Err(self.annotate_runtime_cap_exhaustion(err));
                 };
                 match handle.result() {
                     Some(Ok(stats)) if stats.reclaimed_bytes > 0 => {
@@ -520,7 +520,7 @@ impl QueryMemoryPool {
                             self.try_grow(bytes)?;
                             Ok(GrowOutcome::Granted)
                         } else {
-                            Err(err)
+                            Err(self.annotate_runtime_cap_exhaustion(err))
                         }
                     }
                     Some(Err(reclaim_err)) => Err(reclaim_err),
@@ -528,6 +528,36 @@ impl QueryMemoryPool {
                 }
             }
             Err(err) => Err(err),
+        }
+    }
+
+    fn annotate_runtime_cap_exhaustion(&self, error: MemoryError) -> MemoryError {
+        let uncapped_peak_memory_upper = self
+            .execution_lease
+            .lock()
+            .expect("execution lease lock poisoned")
+            .as_ref()
+            .and_then(|lease| {
+                lease
+                    .resources()
+                    .memory_completion
+                    .uncapped_peak_memory_upper()
+            });
+        match (error, uncapped_peak_memory_upper) {
+            (
+                MemoryError::QuotaExhausted {
+                    domain,
+                    requested,
+                    available,
+                },
+                Some(uncapped_peak_memory_upper),
+            ) => MemoryError::RuntimeCapExhausted {
+                domain,
+                requested,
+                available,
+                uncapped_peak_memory_upper,
+            },
+            (error, _) => error,
         }
     }
 

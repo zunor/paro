@@ -53,7 +53,7 @@ mod tests {
     use paro_common::allocator::{DefaultAllocator, MemoryTag};
     use paro_common::chunk::Chunk;
     use paro_common::memory::{
-        MemoryAccountingClass, MemoryAccountingContext, MemoryDomain, MemoryOwner,
+        MemoryAccountingClass, MemoryAccountingContext, MemoryDomain, MemoryError, MemoryOwner,
     };
     use paro_common::types::LogicalType;
     use paro_context::{QueryMemoryBudgetSpec, QueryMemoryCoordinator, QueryMemoryTarget};
@@ -394,6 +394,37 @@ mod tests {
         let second = permits.try_acquire_available().unwrap();
         assert!(permits.try_acquire_available().is_none());
         drop((first, second));
+    }
+
+    #[test]
+    fn runtime_capped_exhaustion_reports_the_missing_progress_proof() {
+        let pool = QueryMemoryPool::new(100);
+        pool.install_execution_lease(
+            ExecutionLease::new(
+                ExecutionResourceContract {
+                    class: ResourceGrantClassId::new(0),
+                    minimum_memory_bytes: 10,
+                    working_set_memory_bytes: 10,
+                    memory_ceiling_bytes: 100,
+                    memory_completion: paro_optimizer::physical::MemoryCompletion::runtime_capped(
+                        1_000,
+                    ),
+                    max_parallel_tasks: 1,
+                    external_worker_slots: 0,
+                },
+                None,
+            )
+            .unwrap(),
+        )
+        .unwrap();
+
+        assert!(matches!(
+            pool.try_grow(101),
+            Err(MemoryError::RuntimeCapExhausted {
+                uncapped_peak_memory_upper: 1_000,
+                ..
+            })
+        ));
     }
 
     #[test]
