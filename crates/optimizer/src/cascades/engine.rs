@@ -1290,7 +1290,7 @@ pub(crate) struct ComposedCost {
 }
 
 pub(crate) fn compose_candidate_cost_with_sources(
-    mut local_cost: SearchCost,
+    local_cost: SearchCost,
     source_filter_apply_cost: Option<SearchCost>,
     child_costs: &[SearchCost],
     child_source_work: &[&[SourceWork]],
@@ -1331,7 +1331,7 @@ pub(crate) fn compose_candidate_cost_with_sources(
     for (index, child) in child_costs.iter().copied().enumerate() {
         let mut child = child;
         let mut lanes = child_source_work[index].to_vec();
-        if let Some((filtered_child, source, expected, upper)) = sideways_filter {
+        if let Some((filtered_child, source, expected)) = sideways_filter {
             if index == filtered_child {
                 let matching_lanes = lanes.iter().filter(|lane| lane.source == source).count();
                 if matching_lanes > 1 {
@@ -1345,7 +1345,6 @@ pub(crate) fn compose_candidate_cost_with_sources(
                             "sideways-filter composition has no predicate-application cost",
                         )
                     })?;
-                    local_cost = local_cost.replace_work(full_apply_cost, SearchCost::ZERO)?;
                     cost = cost.replace_work(full_apply_cost, SearchCost::ZERO)?;
                 }
                 for lane in &mut lanes {
@@ -1353,14 +1352,15 @@ pub(crate) fn compose_candidate_cost_with_sources(
                         let full_apply_cost = source_filter_apply_cost.expect(
                             "matching source-work lane established predicate application cost",
                         );
-                        let retained = lane.cost.retain_work(expected, upper)?;
+                        // Runtime filters are speculative: stale statistics or
+                        // a coarse representation can retain every source row.
+                        let retained = lane.cost.retain_work(expected, 1_000_000)?;
                         child = child.replace_work(lane.cost, retained)?;
                         lane.cost = retained;
                         let old_apply_cost = lane.filter_apply_cost;
                         let mut filters = lane.filters.to_vec();
                         filters.push(SourceFilterWork {
                             expected_retained_ppm: expected,
-                            upper_retained_ppm: upper,
                             full_apply_cost: full_apply_cost.work_only(),
                         });
                         let new_apply_cost = ordered_source_filter_cost(&filters)?;
@@ -1374,7 +1374,6 @@ pub(crate) fn compose_candidate_cost_with_sources(
                     source = source.0,
                     matching_lanes,
                     expected_retained_ppm = expected,
-                    upper_retained_ppm = upper,
                     child_expected_cost = child.score.range.expected,
                     "composed source-attributed sideways filter"
                 );
@@ -1449,23 +1448,6 @@ pub(crate) fn compose_candidate_cost_with_sources(
     })
 }
 
-#[cfg(test)]
-pub(crate) fn compose_candidate_cost(
-    local_cost: SearchCost,
-    child_costs: &[SearchCost],
-    composition: CostComposition,
-) -> Result<SearchCost> {
-    let empty_sources = vec![&[][..]; child_costs.len()];
-    Ok(compose_candidate_cost_with_sources(
-        local_cost,
-        None,
-        child_costs,
-        &empty_sources,
-        composition,
-    )?
-    .cost)
-}
-
 fn ordered_source_filter_cost(filters: &[SourceFilterWork]) -> Result<SearchCost> {
     const SCALE: u64 = 1_000_000;
     fn multiply_ppm(left: u32, right: u32) -> u32 {
@@ -1473,18 +1455,16 @@ fn ordered_source_filter_cost(filters: &[SourceFilterWork]) -> Result<SearchCost
     }
 
     let mut ordered = filters.to_vec();
-    ordered.sort_by_key(|filter| (filter.expected_retained_ppm, filter.upper_retained_ppm));
+    ordered.sort_by_key(|filter| filter.expected_retained_ppm);
     let mut expected_prefix = SCALE as u32;
-    let mut upper_prefix = SCALE as u32;
     let mut cost = SearchCost::ZERO;
     for filter in ordered {
         cost = cost.sequential(
             filter
                 .full_apply_cost
-                .retain_work(expected_prefix, upper_prefix)?,
+                .retain_work(expected_prefix, SCALE as u32)?,
         )?;
         expected_prefix = multiply_ppm(expected_prefix, filter.expected_retained_ppm);
-        upper_prefix = multiply_ppm(upper_prefix, filter.upper_retained_ppm);
     }
     Ok(cost)
 }

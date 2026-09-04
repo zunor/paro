@@ -323,6 +323,14 @@ pub(super) fn planner_structural_retained_children(operator: &LogicalOperator) -
     }
 }
 
+fn retained_ratio_ppm(retained: f64, source: f64) -> u32 {
+    if source <= 0.0 {
+        1_000_000
+    } else {
+        ((retained / source).clamp(0.0, 1.0) * 1_000_000.0).round() as u32
+    }
+}
+
 pub(super) fn planner_cost_composition(
     metadata: &PlannerOperatorMetadata,
     flavor: PhysicalImplementationFlavor,
@@ -382,26 +390,16 @@ pub(super) fn planner_cost_composition(
             facts.runtime_filter_build_left_probe_multiplicity,
             hard_exact || resource.expects_exact_single_key(build_domain.expected),
         )?;
-        let ratio_ppm = |retained: f64, source: f64| {
-            if source <= 0.0 {
-                1_000_000
-            } else {
-                ((retained / source).clamp(0.0, 1.0) * 1_000_000.0).round() as u32
-            }
+        let Some(source) = facts.runtime_filter_build_left_probe_work_source else {
+            return Ok(CostComposition::RetainedState {
+                overlapping_children,
+            });
         };
         return Ok(CostComposition::SidewaysFilter {
             overlapping_children,
             filtered_child: 1,
-            source: match facts.runtime_filter_build_left_probe_work_source {
-                Some(source) => source,
-                None => {
-                    return Ok(CostComposition::RetainedState {
-                        overlapping_children,
-                    })
-                }
-            },
-            expected_retained_ppm: ratio_ppm(retained.expected, probe.expected),
-            upper_retained_ppm: ratio_ppm(retained.upper, probe.upper),
+            source,
+            expected_retained_ppm: retained_ratio_ppm(retained.expected, probe.expected),
         });
     }
     if flavor == PhysicalImplementationFlavor::HashJoinRuntimeFilter {
@@ -445,19 +443,11 @@ pub(super) fn planner_cost_composition(
             facts.runtime_filter_probe_multiplicity,
             hard_exact || resource.expects_exact_single_key(build_domain.expected),
         )?;
-        let ratio_ppm = |retained: f64, source: f64| {
-            if source <= 0.0 {
-                1_000_000
-            } else {
-                ((retained / source).clamp(0.0, 1.0) * 1_000_000.0).round() as u32
-            }
-        };
         return Ok(CostComposition::SidewaysFilter {
             overlapping_children,
             filtered_child: 0,
             source: work_source,
-            expected_retained_ppm: ratio_ppm(retained.expected, source.expected),
-            upper_retained_ppm: ratio_ppm(retained.upper, source.upper),
+            expected_retained_ppm: retained_ratio_ppm(retained.expected, source.expected),
         });
     }
     if overlapping_children == 0 {

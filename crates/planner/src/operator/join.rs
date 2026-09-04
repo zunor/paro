@@ -127,7 +127,8 @@ fn project_bindings(
     }
 }
 
-fn default_join_projections(join_type: JoinType) -> (ProjectionMap, ProjectionMap) {
+/// Canonical visible-side projection contract for a logical join type.
+pub fn default_join_projections(join_type: JoinType) -> (ProjectionMap, ProjectionMap) {
     match join_type {
         JoinType::Semi | JoinType::Anti | JoinType::Mark => {
             (ProjectionMap::all(), ProjectionMap::none())

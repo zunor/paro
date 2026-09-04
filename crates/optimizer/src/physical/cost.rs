@@ -328,6 +328,12 @@ impl SearchCost {
     /// version of the same work. This is the algebra used by non-local
     /// filters: independent work remains unchanged and hard resource proofs
     /// stay attached to the complete candidate.
+    /// Replace one attributed portion of divisible work.
+    ///
+    /// The critical-path subtraction is valid only because source lanes and
+    /// predicate application use `ParallelWorkProfile::Pipeline`: attributed
+    /// work is serial within that lane. This operation must not be used for
+    /// independent branches whose critical path composes by `max`.
     pub(crate) fn replace_work(self, old: Self, new: Self) -> Result<Self> {
         fn replace(total: f64, old: f64, new: f64) -> Result<f64> {
             let tolerance = total.abs().max(old.abs()).max(1.0) * 1e-10;

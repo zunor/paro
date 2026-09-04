@@ -217,34 +217,56 @@ fn singular_runtime_filter_work_source(
         _ => None,
     }?;
     let lineage = runtime_filter_probe_lineages(plan, output_index)?;
-    let mut sources = lineage.sources.into_iter().filter_map(|source| {
-        let LogicalOperator::Get(get) = &source.operator else {
-            return None;
+    let mut sources = lineage.sources.into_iter().map(|source| {
+        let get = match &source.operator {
+            LogicalOperator::Get(get) => get,
+            LogicalOperator::SearchScan(search) => &search.get,
+            LogicalOperator::FullTextFilterScan(search) => &search.get,
+            _ => return None,
         };
         Some(WorkSourceId(get.table_index))
     });
-    let source = sources.next()?;
+    let source = sources.next()??;
     sources
-        .all(|candidate| candidate == source)
+        .all(|candidate| candidate == Some(source))
+        .then_some(source)
+}
+
+fn common_runtime_filter_work_source<'a>(
+    plan: &LogicalPlan,
+    expressions: impl IntoIterator<Item = &'a Expression>,
+) -> Option<WorkSourceId> {
+    let mut sources = expressions
+        .into_iter()
+        .map(|expression| singular_runtime_filter_work_source(plan, expression));
+    let source = sources.next()??;
+    sources
+        .all(|candidate| candidate == Some(source))
         .then_some(source)
 }
 
 pub(super) fn runtime_filter_probe_work_source(
     join: &paro_planner::operator::ComparisonJoin,
 ) -> Option<WorkSourceId> {
-    join.conditions
-        .iter()
-        .filter(|condition| condition.comparison == JoinComparisonType::Equal)
-        .find_map(|condition| singular_runtime_filter_work_source(&join.left, &condition.left))
+    common_runtime_filter_work_source(
+        &join.left,
+        join.conditions
+            .iter()
+            .filter(|condition| condition.comparison == JoinComparisonType::Equal)
+            .map(|condition| &condition.left),
+    )
 }
 
 pub(super) fn runtime_filter_build_left_probe_work_source(
     join: &paro_planner::operator::ComparisonJoin,
 ) -> Option<WorkSourceId> {
-    join.conditions
-        .iter()
-        .filter(|condition| condition.comparison == JoinComparisonType::Equal)
-        .find_map(|condition| singular_runtime_filter_work_source(&join.right, &condition.right))
+    common_runtime_filter_work_source(
+        &join.right,
+        join.conditions
+            .iter()
+            .filter(|condition| condition.comparison == JoinComparisonType::Equal)
+            .map(|condition| &condition.right),
+    )
 }
 
 fn runtime_filter_probe_lineages(
@@ -255,6 +277,33 @@ fn runtime_filter_probe_lineages(
         LogicalOperator::Get(get)
             if get.table.is_some() && get.stored_column(output_index).is_some() =>
         {
+            Some(RuntimeFilterProbeLineage {
+                sources: vec![plan],
+                crossed_join: false,
+            })
+        }
+        LogicalOperator::SearchScan(search) if search.get.table.is_some() => {
+            let source_index = match search.projections.get(output_index)? {
+                Expression::Reference(reference) => reference.index,
+                Expression::ColumnRef(column) if column.depth == 0 => {
+                    (0..search.get.returned_types.len()).find(|index| {
+                        ColumnBinding::new(search.get.table_index, *index) == column.binding
+                    })?
+                }
+                _ => return None,
+            };
+            search.get.stored_column(source_index)?;
+            Some(RuntimeFilterProbeLineage {
+                sources: vec![plan],
+                crossed_join: false,
+            })
+        }
+        LogicalOperator::FullTextFilterScan(search) if search.get.table.is_some() => {
+            let source_index = *search
+                .projection_map
+                .to_indices(search.get.returned_types.len())
+                .get(output_index)?;
+            search.get.stored_column(source_index)?;
             Some(RuntimeFilterProbeLineage {
                 sources: vec![plan],
                 crossed_join: false,

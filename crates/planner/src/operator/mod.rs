@@ -84,8 +84,8 @@ pub use graph_match::GraphMatch;
 pub use graph_scan::GraphScan;
 pub use insert::{Insert, InsertOnConflict, InsertOnConflictAction};
 pub use join::{
-    AntiJoinMode, AnyJoin, ComparisonJoin, CrossProduct, Join, JoinComparisonType, JoinCondition,
-    JoinSide, JoinType, MarkJoinSemantics,
+    default_join_projections, AntiJoinMode, AnyJoin, ComparisonJoin, CrossProduct, Join,
+    JoinComparisonType, JoinCondition, JoinSide, JoinType, MarkJoinSemantics,
 };
 pub use limit::Limit;
 pub use operator_type::LogicalOperatorType;

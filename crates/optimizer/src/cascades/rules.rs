@@ -279,7 +279,6 @@ pub struct WorkSourceId(pub usize);
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct SourceFilterWork {
     pub expected_retained_ppm: u32,
-    pub upper_retained_ppm: u32,
     /// Cost of evaluating this predicate against the unfiltered source. Joint
     /// composition orders and scales these costs by preceding predicates.
     pub full_apply_cost: SearchCost,
@@ -325,7 +324,6 @@ pub enum CostComposition {
         filtered_child: u8,
         source: WorkSourceId,
         expected_retained_ppm: u32,
-        upper_retained_ppm: u32,
     },
 }
 
@@ -343,20 +341,14 @@ impl CostComposition {
         }
     }
 
-    pub(crate) fn sideways_filter(self) -> Option<(usize, WorkSourceId, u32, u32)> {
+    pub(crate) fn sideways_filter(self) -> Option<(usize, WorkSourceId, u32)> {
         match self {
             Self::SidewaysFilter {
                 filtered_child,
                 source,
                 expected_retained_ppm,
-                upper_retained_ppm,
                 ..
-            } => Some((
-                usize::from(filtered_child),
-                source,
-                expected_retained_ppm,
-                upper_retained_ppm,
-            )),
+            } => Some((usize::from(filtered_child), source, expected_retained_ppm)),
             _ => None,
         }
     }

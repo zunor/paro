@@ -67,6 +67,12 @@ pub(in crate::cascades::planner) fn planner_cost_facts(
     };
     let scan_work_source = match &plan.operator {
         LogicalOperator::Get(get) if get.table.is_some() => Some(WorkSourceId(get.table_index)),
+        LogicalOperator::SearchScan(search) if search.get.table.is_some() => {
+            Some(WorkSourceId(search.get.table_index))
+        }
+        LogicalOperator::FullTextFilterScan(search) if search.get.table.is_some() => {
+            Some(WorkSourceId(search.get.table_index))
+        }
         _ => None,
     };
     let perfect_hash = match &plan.operator {

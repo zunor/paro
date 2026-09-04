@@ -950,16 +950,26 @@ fn retained_operator_state_overlaps_child_pipeline_memory() {
         peak_memory_upper: 40,
         ..cost(1.0)
     };
-    let sequential = compose_candidate_cost(local, &[child], CostComposition::Sequential)
-        .expect("sequential composition");
-    let retained = compose_candidate_cost(
+    let sequential = compose_candidate_cost_with_sources(
         local,
+        None,
         &[child],
+        &[&[]],
+        CostComposition::Sequential,
+    )
+    .expect("sequential composition")
+    .cost;
+    let retained = compose_candidate_cost_with_sources(
+        local,
+        None,
+        &[child],
+        &[&[]],
         CostComposition::RetainedState {
             overlapping_children: 1,
         },
     )
-    .expect("retained-state composition");
+    .expect("retained-state composition")
+    .cost;
     assert_eq!(sequential.peak_memory_upper, 100);
     assert_eq!(retained.peak_memory_upper, 140);
 }
@@ -972,8 +982,15 @@ fn schema_only_child_does_not_contribute_execution_cost() {
         peak_memory_upper: 80,
         ..cost(100.0)
     };
-    let composed = compose_candidate_cost(local, &[child], CostComposition::LocalOnly)
-        .expect("schema-only composition");
+    let composed = compose_candidate_cost_with_sources(
+        local,
+        None,
+        &[child],
+        &[&[]],
+        CostComposition::LocalOnly,
+    )
+    .expect("schema-only composition")
+    .cost;
 
     assert_eq!(composed, local);
 }
@@ -1003,7 +1020,6 @@ fn sideways_filter_scales_work_without_weakening_resource_proofs() {
             filtered_child: 0,
             source,
             expected_retained_ppm: 100_000,
-            upper_retained_ppm: 1_000_000,
         },
     )
     .expect("sideways-filter composition")
@@ -1046,7 +1062,6 @@ fn repeated_sideways_filters_scale_only_the_matching_source_lane() {
             filtered_child: 0,
             source,
             expected_retained_ppm: 500_000,
-            upper_retained_ppm: 500_000,
         },
     )
     .unwrap();
@@ -1060,7 +1075,6 @@ fn repeated_sideways_filters_scale_only_the_matching_source_lane() {
             filtered_child: 0,
             source,
             expected_retained_ppm: 100_000,
-            upper_retained_ppm: 100_000,
         },
     )
     .unwrap();
@@ -1091,7 +1105,6 @@ fn source_predicate_cost_is_reordered_by_runtime_selectivity() {
             filtered_child: 0,
             source,
             expected_retained_ppm: 500_000,
-            upper_retained_ppm: 500_000,
         },
     )
     .unwrap();
@@ -1105,7 +1118,6 @@ fn source_predicate_cost_is_reordered_by_runtime_selectivity() {
             filtered_child: 0,
             source,
             expected_retained_ppm: 100_000,
-            upper_retained_ppm: 100_000,
         },
     )
     .unwrap();
@@ -1130,14 +1142,17 @@ fn revocable_retained_state_shares_one_query_pool() {
         peak_memory_upper: 40,
         ..cost(1.0)
     };
-    let retained = compose_candidate_cost(
+    let retained = compose_candidate_cost_with_sources(
         local,
+        None,
         &[child],
+        &[&[]],
         CostComposition::RetainedState {
             overlapping_children: 1,
         },
     )
-    .expect("revocable retained-state composition");
+    .expect("revocable retained-state composition")
+    .cost;
     assert_eq!(retained.non_revocable_memory_upper, 0);
     assert_eq!(retained.peak_memory_upper, 100);
 }

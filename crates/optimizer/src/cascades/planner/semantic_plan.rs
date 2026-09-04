@@ -181,33 +181,16 @@ fn canonicalize_projection_maps(operator: &mut LogicalOperator) {
         }
         LogicalOperator::Join(Join::Comparison(join)) => {
             (join.left_projection_map, join.right_projection_map) =
-                canonical_join_projections(join.join_type);
+                paro_planner::operator::default_join_projections(join.join_type);
         }
         LogicalOperator::Join(Join::Any(join)) => {
             (join.left_projection_map, join.right_projection_map) =
-                canonical_join_projections(join.join_type);
+                paro_planner::operator::default_join_projections(join.join_type);
         }
         LogicalOperator::FullTextFilterScan(scan) => {
             scan.projection_map = paro_planner::operator::ProjectionMap::all();
         }
         _ => {}
-    }
-}
-
-fn canonical_join_projections(
-    join_type: JoinType,
-) -> (
-    paro_planner::operator::ProjectionMap,
-    paro_planner::operator::ProjectionMap,
-) {
-    use paro_planner::operator::ProjectionMap;
-
-    match join_type {
-        JoinType::Semi | JoinType::Anti | JoinType::Mark => {
-            (ProjectionMap::all(), ProjectionMap::none())
-        }
-        JoinType::RightSemi | JoinType::RightAnti => (ProjectionMap::none(), ProjectionMap::all()),
-        _ => (ProjectionMap::all(), ProjectionMap::all()),
     }
 }
 
