@@ -150,8 +150,7 @@ pub(super) fn planner_grant_dependency(operator: &LogicalOperator) -> GrantDepen
             | LogicalOperator::Window(_)
             | LogicalOperator::MaterializedCTE(_)
             | LogicalOperator::RecursiveCTE(_)
-            | LogicalOperator::Join(Join::Comparison(_))
-            | LogicalOperator::Join(Join::Cross(_))
+            | LogicalOperator::Join(_)
     ) {
         GrantDependencyDescriptor::Sensitive
     } else {
@@ -381,6 +380,11 @@ pub(super) fn cost_for_grant(
     force_spill: bool,
 ) -> Result<Option<SearchCost>> {
     if dependency == GrantDependencyDescriptor::Invariant {
+        if cost.peak_memory_upper == u64::MAX || cost.memory_completion.is_runtime_capped() {
+            return Err(paro_error::internal(
+                "unbounded or runtime-capped memory makes an implementation grant-sensitive",
+            ));
+        }
         cost.validate()?;
         return Ok(Some(cost));
     }
@@ -691,6 +695,29 @@ mod resource_contract_tests {
             admitted.memory_completion,
             MemoryCompletion::runtime_capped(u64::MAX)
         );
+    }
+
+    #[test]
+    fn runtime_capped_state_cannot_claim_grant_invariance() {
+        let no_spill = class(SpillPolicy::Forbidden);
+        let mut estimate = cost(u64::MAX, 64 * 1024);
+        estimate.non_revocable_memory_upper = u64::MAX;
+        estimate.revocable_memory_target = 0;
+        estimate.memory_completion = MemoryCompletion::runtime_capped(u64::MAX);
+
+        let error = cost_for_grant(
+            estimate,
+            GrantDependencyDescriptor::Invariant,
+            false,
+            GrantGoalKey::Invariant(crate::cascades::ids::AdmissibleGrantSetId(0)),
+            &BTreeMap::from([(no_spill.id, no_spill)]),
+            false,
+        )
+        .expect_err("runtime-capped cost must participate in grant optimization");
+
+        assert!(error
+            .to_string()
+            .contains("runtime-capped memory makes an implementation grant-sensitive"));
     }
 
     #[test]
