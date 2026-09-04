@@ -14,7 +14,7 @@ use paro_common::types::LogicalType;
 use paro_context::StatementContext;
 use paro_planner::operator::{Join, LogicalOperator};
 #[cfg(test)]
-use paro_planner::operator::{JoinType, ProjectionMap};
+use paro_planner::operator::{JoinBuildSideConstraint, JoinType, ProjectionMap};
 use paro_planner::plan::LogicalPlan;
 
 /// Choose a cheaper build side for joins.
@@ -111,7 +111,7 @@ impl BuildProbeSideOptimizer {
             Some(JoinBuildSide::Right) => contains_control_region_boundary(join.right.as_ref()),
             None => false,
         };
-        let build_side = choose_join_build_side(
+        let preferred_build_side = choose_join_build_side(
             filtering_side,
             JoinBuildCandidate {
                 serialized_work: left_cost,
@@ -124,6 +124,11 @@ impl BuildProbeSideOptimizer {
                     && filtering_contains_control_region,
             },
         );
+        let build_side = match join.build_side_constraint {
+            JoinBuildSideConstraint::Either => preferred_build_side,
+            JoinBuildSideConstraint::Left => JoinBuildSide::Left,
+            JoinBuildSideConstraint::Right => JoinBuildSide::Right,
+        };
         if build_side == JoinBuildSide::Right {
             return;
         }
@@ -147,8 +152,14 @@ impl BuildProbeSideOptimizer {
     fn try_flip_cross_product(&self, join: &mut paro_planner::operator::CrossProduct) {
         let left_cost = self.build_cost(join.left.as_ref());
         let right_cost = self.build_cost(join.right.as_ref());
-        if right_cost > left_cost {
+        let build_left = match join.build_side_constraint {
+            JoinBuildSideConstraint::Either => right_cost > left_cost,
+            JoinBuildSideConstraint::Left => true,
+            JoinBuildSideConstraint::Right => false,
+        };
+        if build_left {
             std::mem::swap(&mut join.left, &mut join.right);
+            join.build_side_constraint = join.build_side_constraint.flip();
         }
     }
 
@@ -374,8 +385,8 @@ mod tests {
     use paro_planner::binder::context::BindContext;
     use paro_planner::expression::{ColumnRefExpression, Expression};
     use paro_planner::operator::{
-        ColumnBinding, ComparisonJoin, ExpressionGet, Get, Join, JoinComparisonType, JoinCondition,
-        JoinType, LogicalOperator,
+        ColumnBinding, ComparisonJoin, CrossProduct, ExpressionGet, Get, Join,
+        JoinBuildSideConstraint, JoinComparisonType, JoinCondition, JoinType, LogicalOperator,
     };
     use paro_planner::plan::{CardinalityEstimate, LogicalPlan};
     use paro_storage::table::table_factory::TableFactory;
@@ -495,6 +506,54 @@ mod tests {
             }
             _ => panic!("expected comparison join"),
         }
+    }
+
+    #[test]
+    fn build_probe_obeys_explicit_comparison_build_side() {
+        let ctx = BindContext::new();
+        let mut join = ComparisonJoin::new(
+            JoinType::Inner,
+            plan_with_cardinality(&ctx, expression_get(0, 1, vec![LogicalType::Integer]), 1),
+            plan_with_cardinality(&ctx, expression_get(1, 64, vec![LogicalType::Integer]), 64),
+            vec![JoinCondition::new(
+                Expression::ColumnRef(ColumnRefExpression::new(
+                    ColumnBinding::new(0, 0),
+                    LogicalType::Integer,
+                )),
+                Expression::ColumnRef(ColumnRefExpression::new(
+                    ColumnBinding::new(1, 0),
+                    LogicalType::Integer,
+                )),
+                JoinComparisonType::Equal,
+            )],
+        );
+        join.build_side_constraint = JoinBuildSideConstraint::Right;
+
+        let result = BuildProbeSideOptimizer::new(make_test_session())
+            .optimize(LogicalOperator::Join(Join::Comparison(join)));
+        let LogicalOperator::Join(Join::Comparison(join)) = result else {
+            panic!("expected comparison join");
+        };
+        assert_eq!(join.build_side_constraint, JoinBuildSideConstraint::Right);
+        assert_eq!(join.right.stats.estimated_cardinality.unwrap().expected, 64);
+    }
+
+    #[test]
+    fn build_probe_flips_cross_constraint_with_its_input() {
+        let ctx = BindContext::new();
+        let mut join = CrossProduct::new(
+            plan_with_cardinality(&ctx, expression_get(0, 1, vec![LogicalType::Integer]), 1),
+            plan_with_cardinality(&ctx, expression_get(1, 64, vec![LogicalType::Integer]), 64),
+        );
+        join.build_side_constraint = JoinBuildSideConstraint::Left;
+
+        let result = BuildProbeSideOptimizer::new(make_test_session())
+            .optimize(LogicalOperator::Join(Join::Cross(join)));
+        let LogicalOperator::Join(Join::Cross(join)) = result else {
+            panic!("expected cross product");
+        };
+        assert_eq!(join.build_side_constraint, JoinBuildSideConstraint::Right);
+        assert_eq!(join.right.stats.estimated_cardinality.unwrap().expected, 1);
     }
 
     #[test]

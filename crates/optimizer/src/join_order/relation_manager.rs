@@ -9,7 +9,8 @@ use std::sync::Arc;
 use paro_common::logging::targets;
 use paro_planner::expression::{ComparisonType, Expression, ExpressionIterator};
 use paro_planner::operator::{
-    AntiJoinMode, ColumnBinding, Join, JoinType, LogicalOperator, LogicalOperatorType,
+    AntiJoinMode, ColumnBinding, Join, JoinBuildSideConstraint, JoinType, LogicalOperator,
+    LogicalOperatorType,
 };
 
 use crate::expression::{
@@ -369,7 +370,10 @@ impl RelationManager {
     /// Check if a join is reorderable.
     pub fn join_is_reorderable(join: &Join) -> bool {
         match join {
-            Join::Cross(_) => !join_tree_has_evaluation_fence(join),
+            Join::Cross(_) => {
+                !join_tree_has_evaluation_fence(join)
+                    && !Self::join_tree_has_build_side_boundary(join)
+            }
             Join::Comparison(join) => Self::comparison_join_is_reorderable(join),
             Join::Any(_) => false,
         }
@@ -377,12 +381,44 @@ impl RelationManager {
 
     fn comparison_join_is_reorderable(join: &paro_planner::operator::ComparisonJoin) -> bool {
         !comparison_join_tree_has_evaluation_fence(join)
+            && !Self::comparison_join_tree_has_build_side_boundary(join)
             && join.duplicate_eliminated_columns.is_empty()
             && matches!(
                 join.join_type,
                 JoinType::Inner | JoinType::Semi | JoinType::Anti
             )
             && Self::comparison_has_binary_edge(join)
+    }
+
+    /// A one-sided materialization requirement is a boundary of the logical
+    /// join region, not a property of an equality edge. Flattening it into the
+    /// query graph would lose which complete subtree owns the build side when
+    /// DP enumeration associates that edge differently. Keep the constrained
+    /// join atomic while independently optimizing each child.
+    fn join_tree_has_build_side_boundary(join: &Join) -> bool {
+        join.build_side_constraint() != JoinBuildSideConstraint::Either
+            || [join.left(), join.right()]
+                .into_iter()
+                .any(|child| Self::join_region_has_build_side_boundary(&child.operator))
+    }
+
+    fn comparison_join_tree_has_build_side_boundary(
+        join: &paro_planner::operator::ComparisonJoin,
+    ) -> bool {
+        join.build_side_constraint != JoinBuildSideConstraint::Either
+            || [&join.left, &join.right]
+                .into_iter()
+                .any(|child| Self::join_region_has_build_side_boundary(&child.operator))
+    }
+
+    fn join_region_has_build_side_boundary(operator: &LogicalOperator) -> bool {
+        match operator {
+            LogicalOperator::Join(join) => Self::join_tree_has_build_side_boundary(join),
+            LogicalOperator::Filter(filter) => {
+                Self::join_region_has_build_side_boundary(&filter.child.operator)
+            }
+            _ => false,
+        }
     }
 
     /// Whether this reduction can be detached from its current preserved
@@ -583,7 +619,8 @@ mod tests {
         WindowFrameType,
     };
     use paro_planner::operator::{
-        ColumnBinding, ComparisonJoin, DelimGet, Get, JoinComparisonType, JoinCondition, Window,
+        ColumnBinding, ComparisonJoin, DelimGet, Get, JoinBuildSideConstraint, JoinComparisonType,
+        JoinCondition, Window,
     };
     use paro_planner::plan::LogicalPlan;
 
@@ -991,6 +1028,49 @@ mod tests {
 
         assert!(!RelationManager::join_is_reorderable(&Join::Comparison(
             join
+        )));
+    }
+
+    #[test]
+    fn test_build_side_constraint_is_a_transitive_join_order_boundary() {
+        let mut constrained = ComparisonJoin::new(
+            JoinType::Inner,
+            LogicalPlan::synthetic(create_test_get(0)),
+            LogicalPlan::synthetic(create_test_get(1)),
+            vec![JoinCondition::new(
+                create_column_ref(0, 0),
+                create_column_ref(1, 0),
+                JoinComparisonType::Equal,
+            )],
+        );
+        constrained.build_side_constraint = JoinBuildSideConstraint::Right;
+        assert!(!RelationManager::join_is_reorderable(&Join::Comparison(
+            constrained
+        )));
+
+        let mut constrained_child = ComparisonJoin::new(
+            JoinType::Inner,
+            LogicalPlan::synthetic(create_test_get(0)),
+            LogicalPlan::synthetic(create_test_get(1)),
+            vec![JoinCondition::new(
+                create_column_ref(0, 0),
+                create_column_ref(1, 0),
+                JoinComparisonType::Equal,
+            )],
+        );
+        constrained_child.build_side_constraint = JoinBuildSideConstraint::Right;
+        let parent = ComparisonJoin::new(
+            JoinType::Inner,
+            LogicalPlan::synthetic(LogicalOperator::Join(Join::Comparison(constrained_child))),
+            LogicalPlan::synthetic(create_test_get(2)),
+            vec![JoinCondition::new(
+                create_column_ref(1, 0),
+                create_column_ref(2, 0),
+                JoinComparisonType::Equal,
+            )],
+        );
+        assert!(!RelationManager::join_is_reorderable(&Join::Comparison(
+            parent
         )));
     }
 
