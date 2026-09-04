@@ -15,6 +15,7 @@ use crate::expression::traversal::visit_expression as traverse_expression;
 pub struct ColumnLifetimeAnalyzer {
     column_references: HashSet<ColumnBinding>,
     everything_referenced: bool,
+    preserve_unresolved_predicate_carriers: bool,
 }
 
 impl ColumnLifetimeAnalyzer {
@@ -22,6 +23,28 @@ impl ColumnLifetimeAnalyzer {
         Self {
             column_references: HashSet::new(),
             everything_referenced: is_root,
+            preserve_unresolved_predicate_carriers: false,
+        }
+    }
+
+    /// Join-region extraction runs before every specialized correlation proof
+    /// has consumed its planner carrier. Preserve a Filter/Order/TopN's full
+    /// visible layout when its local expressions still reference bindings
+    /// outside the current child layout; final executable settling uses
+    /// [`Self::new`] and can narrow those predicate-only values safely.
+    pub fn for_join_enumeration() -> Self {
+        Self {
+            column_references: HashSet::new(),
+            everything_referenced: true,
+            preserve_unresolved_predicate_carriers: true,
+        }
+    }
+
+    fn child(&self, everything_referenced: bool) -> Self {
+        Self {
+            column_references: HashSet::new(),
+            everything_referenced,
+            preserve_unresolved_predicate_carriers: self.preserve_unresolved_predicate_carriers,
         }
     }
 
@@ -34,7 +57,7 @@ impl ColumnLifetimeAnalyzer {
         let (id, stats, operator) = plan.into_parts();
         let operator = match operator {
             LogicalOperator::Projection(mut proj) => {
-                let mut child_analyzer = ColumnLifetimeAnalyzer::new(false);
+                let mut child_analyzer = self.child(false);
                 for expr in &proj.expressions {
                     child_analyzer.visit_expression(expr);
                 }
@@ -44,7 +67,7 @@ impl ColumnLifetimeAnalyzer {
             }
             LogicalOperator::RowFetch(mut fetch) => {
                 let child_bindings = fetch.child.get_column_bindings();
-                let mut child_analyzer = ColumnLifetimeAnalyzer::new(self.everything_referenced);
+                let mut child_analyzer = self.child(self.everything_referenced);
                 if !self.everything_referenced {
                     child_analyzer.column_references.extend(
                         self.column_references
@@ -70,10 +93,15 @@ impl ColumnLifetimeAnalyzer {
                 filter.child = Box::new(self.optimize_plan(child)?);
                 let child_bindings = filter.child.get_column_bindings();
                 // Correlated-subquery flattening can temporarily leave stale
-                // bindings before physical reference resolution. Preserve the
-                // full carrier only for that explicit fallback; ordinary
-                // filters should not expose predicate-only columns upstream.
-                filter.projection_map = if self.has_unknown_references(&child_bindings) {
+                // predicate bindings before physical reference resolution.
+                // Those are execution dependencies, not output demands: only
+                // an unresolved parent-visible binding can require the full
+                // carrier above this Filter.
+                filter.projection_map = if self.everything_referenced
+                    || Self::references_unknown_binding(&output_references, &child_bindings)
+                    || (self.preserve_unresolved_predicate_carriers
+                        && self.has_unknown_references(&child_bindings))
+                {
                     ProjectionMap::all()
                 } else {
                     self.generate_exact_projection_map(&child_bindings, &output_references)
@@ -81,7 +109,7 @@ impl ColumnLifetimeAnalyzer {
                 LogicalOperator::Filter(filter)
             }
             LogicalOperator::Aggregate(mut agg) => {
-                let mut child_analyzer = ColumnLifetimeAnalyzer::new(false);
+                let mut child_analyzer = self.child(false);
                 for expr in &agg.groups {
                     child_analyzer.visit_expression(expr);
                 }
@@ -101,7 +129,11 @@ impl ColumnLifetimeAnalyzer {
                 let child = *order.child;
                 order.child = Box::new(self.optimize_plan(child)?);
                 let child_bindings = order.child.get_column_bindings();
-                order.projection_map = if self.has_unknown_references(&child_bindings) {
+                order.projection_map = if self.everything_referenced
+                    || Self::references_unknown_binding(&output_references, &child_bindings)
+                    || (self.preserve_unresolved_predicate_carriers
+                        && self.has_unknown_references(&child_bindings))
+                {
                     ProjectionMap::all()
                 } else {
                     self.generate_exact_projection_map(&child_bindings, &output_references)
@@ -121,7 +153,11 @@ impl ColumnLifetimeAnalyzer {
                 let child = *topn.child;
                 topn.child = Box::new(self.optimize_plan(child)?);
                 let child_bindings = topn.child.get_column_bindings();
-                topn.projection_map = if self.has_unknown_references(&child_bindings) {
+                topn.projection_map = if self.everything_referenced
+                    || Self::references_unknown_binding(&output_references, &child_bindings)
+                    || (self.preserve_unresolved_predicate_carriers
+                        && self.has_unknown_references(&child_bindings))
+                {
                     ProjectionMap::all()
                 } else {
                     self.generate_exact_projection_map(&child_bindings, &output_references)
@@ -137,7 +173,7 @@ impl ColumnLifetimeAnalyzer {
                 // produced here and would look like unresolved correlated
                 // references below, disabling join projection pruning.
                 let child_bindings = window.child.get_column_bindings();
-                let mut child_analyzer = ColumnLifetimeAnalyzer::new(self.everything_referenced);
+                let mut child_analyzer = self.child(self.everything_referenced);
                 if !self.everything_referenced {
                     child_analyzer.column_references.extend(
                         self.column_references
@@ -157,17 +193,21 @@ impl ColumnLifetimeAnalyzer {
                 LogicalOperator::Window(window)
             }
             LogicalOperator::Distinct(mut distinct) => {
-                self.everything_referenced = true;
                 let child = *distinct.child;
-                distinct.child = Box::new(self.optimize_plan(child)?);
+                // DISTINCT consumes its complete input row, but that demand is
+                // local to this child. Mutating the current analyzer leaks the
+                // full-width contract into sibling branches and every parent
+                // above the DISTINCT, preventing their projection maps from
+                // representing actual output demand.
+                distinct.child = Box::new(self.child(true).optimize_plan(child)?);
                 LogicalOperator::Distinct(distinct)
             }
             LogicalOperator::MaterializedCTE(mut cte) => {
-                let mut cte_query_analyzer = ColumnLifetimeAnalyzer::new(true);
+                let mut cte_query_analyzer = self.child(true);
                 let cte_query = *cte.cte_query;
                 cte.cte_query = Box::new(cte_query_analyzer.optimize_plan(cte_query)?);
 
-                let mut child_analyzer = ColumnLifetimeAnalyzer::new(self.everything_referenced);
+                let mut child_analyzer = self.child(self.everything_referenced);
                 child_analyzer.column_references = self.column_references.clone();
                 let child = *cte.child;
                 cte.child = Box::new(child_analyzer.optimize_plan(child)?);
@@ -176,9 +216,8 @@ impl ColumnLifetimeAnalyzer {
             LogicalOperator::RecursiveCTE(mut cte) => {
                 let anchor = *cte.anchor;
                 let recursive = *cte.recursive;
-                cte.anchor = Box::new(ColumnLifetimeAnalyzer::new(true).optimize_plan(anchor)?);
-                cte.recursive =
-                    Box::new(ColumnLifetimeAnalyzer::new(true).optimize_plan(recursive)?);
+                cte.anchor = Box::new(self.child(true).optimize_plan(anchor)?);
+                cte.recursive = Box::new(self.child(true).optimize_plan(recursive)?);
                 LogicalOperator::RecursiveCTE(cte)
             }
             LogicalOperator::CTERef(cte_ref) => LogicalOperator::CTERef(cte_ref),
@@ -361,7 +400,14 @@ impl ColumnLifetimeAnalyzer {
         if self.everything_referenced || self.column_references.is_empty() {
             return false;
         }
-        self.column_references
+        Self::references_unknown_binding(&self.column_references, known_bindings)
+    }
+
+    fn references_unknown_binding(
+        references: &HashSet<ColumnBinding>,
+        known_bindings: &[ColumnBinding],
+    ) -> bool {
+        references
             .iter()
             .any(|binding| !known_bindings.contains(binding))
     }
@@ -463,8 +509,8 @@ mod tests {
         WindowFrame, WindowFrameBound, WindowFrameType,
     };
     use paro_planner::operator::{
-        ColumnBinding, ComparisonJoin, ExpressionGet, Filter, Join, JoinComparisonType,
-        JoinCondition, JoinType, LogicalOperator, Order, Projection, Window,
+        ColumnBinding, ComparisonJoin, CrossProduct, Distinct, ExpressionGet, Filter, Join,
+        JoinComparisonType, JoinCondition, JoinType, LogicalOperator, Order, Projection, Window,
     };
     use paro_planner::plan::LogicalPlan;
 
@@ -851,6 +897,125 @@ mod tests {
             &ctx,
             LogicalOperator::Filter(Filter::new(
                 input,
+                vec![Expression::Comparison(ComparisonExpression::new(
+                    ComparisonType::GreaterThan,
+                    Expression::ColumnRef(ColumnRefExpression::new(
+                        ColumnBinding::new(10, 0),
+                        LogicalType::Integer,
+                    )),
+                    Expression::ColumnRef(ColumnRefExpression::new(
+                        ColumnBinding::new(10, 0),
+                        LogicalType::Integer,
+                    )),
+                ))],
+            )),
+        );
+        let plan = LogicalPlan::new(
+            &ctx,
+            LogicalOperator::Projection(Projection::new(
+                30,
+                filter,
+                vec![Expression::ColumnRef(ColumnRefExpression::new(
+                    ColumnBinding::new(10, 1),
+                    LogicalType::BigInt,
+                ))],
+            )),
+        );
+
+        let optimized = ColumnLifetimeAnalyzer::new(true).optimize(plan).unwrap();
+        let LogicalOperator::Projection(projection) = &optimized.operator else {
+            panic!("expected projection");
+        };
+        let LogicalOperator::Filter(filter) = &projection.child.operator else {
+            panic!("expected filter");
+        };
+        assert_eq!(filter.projection_map.as_columns(), Some(&[1][..]));
+    }
+
+    #[test]
+    fn unresolved_filter_key_does_not_expand_the_visible_output_contract() {
+        let ctx = BindContext::new();
+        let input = LogicalPlan::new(
+            &ctx,
+            LogicalOperator::ExpressionGet(ExpressionGet::new(
+                10,
+                Vec::new(),
+                vec!["key".into(), "payload".into()],
+                vec![LogicalType::Integer, LogicalType::BigInt],
+            )),
+        );
+        let filter = LogicalPlan::new(
+            &ctx,
+            LogicalOperator::Filter(Filter::new(
+                input,
+                vec![Expression::Comparison(ComparisonExpression::new(
+                    ComparisonType::GreaterThan,
+                    Expression::ColumnRef(ColumnRefExpression::new(
+                        ColumnBinding::new(99, 0),
+                        LogicalType::Integer,
+                    )),
+                    Expression::ColumnRef(ColumnRefExpression::new(
+                        ColumnBinding::new(99, 0),
+                        LogicalType::Integer,
+                    )),
+                ))],
+            )),
+        );
+        let plan = LogicalPlan::new(
+            &ctx,
+            LogicalOperator::Projection(Projection::new(
+                30,
+                filter,
+                vec![Expression::ColumnRef(ColumnRefExpression::new(
+                    ColumnBinding::new(10, 1),
+                    LogicalType::BigInt,
+                ))],
+            )),
+        );
+
+        let optimized = ColumnLifetimeAnalyzer::new(true).optimize(plan).unwrap();
+        let LogicalOperator::Projection(projection) = &optimized.operator else {
+            panic!("expected projection");
+        };
+        let LogicalOperator::Filter(filter) = &projection.child.operator else {
+            panic!("expected filter");
+        };
+        assert_eq!(filter.projection_map.as_columns(), Some(&[1][..]));
+    }
+
+    #[test]
+    fn distinct_full_row_demand_is_isolated_from_parent_filter_output() {
+        let ctx = BindContext::new();
+        let preserved = LogicalPlan::new(
+            &ctx,
+            LogicalOperator::ExpressionGet(ExpressionGet::new(
+                10,
+                Vec::new(),
+                vec!["filter_key".into(), "payload".into()],
+                vec![LogicalType::Integer, LogicalType::BigInt],
+            )),
+        );
+        let distinct_input = LogicalPlan::new(
+            &ctx,
+            LogicalOperator::ExpressionGet(ExpressionGet::new(
+                20,
+                Vec::new(),
+                vec!["distinct_key".into()],
+                vec![LogicalType::Integer],
+            )),
+        );
+        let distinct = LogicalPlan::new(
+            &ctx,
+            LogicalOperator::Distinct(Distinct::new(distinct_input)),
+        );
+        let cross = LogicalPlan::new(
+            &ctx,
+            LogicalOperator::Join(Join::Cross(CrossProduct::new(preserved, distinct))),
+        );
+        let filter = LogicalPlan::new(
+            &ctx,
+            LogicalOperator::Filter(Filter::new(
+                cross,
                 vec![Expression::Comparison(ComparisonExpression::new(
                     ComparisonType::GreaterThan,
                     Expression::ColumnRef(ColumnRefExpression::new(

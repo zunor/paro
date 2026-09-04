@@ -1080,12 +1080,25 @@ impl CardinalityEstimator {
                 .and_then(|bindings| {
                     let preserved = *self.binding_stats.get(&bindings.preserved)?;
                     let filtering = *self.binding_stats.get(&bindings.filtering)?;
-                    let estimate = (preserved.distinct_count > 0).then_some((
-                        (filtering.distinct_count as f64
+                    let estimate = (preserved.distinct_count > 0).then(|| {
+                        let domain_fraction = (filtering.distinct_count as f64
                             / preserved.distinct_count.max(filtering.distinct_count) as f64)
-                            .clamp(0.0, 1.0),
-                        1.0 / preserved.relation_cardinality.max(1) as f64,
-                    ));
+                            .clamp(0.0, 1.0);
+                        // Two boundary-observed HLLs estimate key coverage
+                        // directly. An inherited or synthetic domain is only
+                        // an upper bound: it may tighten the configured prior,
+                        // but must not inflate that prior as if the derived
+                        // relation had been observed after its filters.
+                        let matched_fraction = if preserved.from_hll && filtering.from_hll {
+                            domain_fraction
+                        } else {
+                            domain_fraction.min(self.selectivity_defaults.semi_anti_match)
+                        };
+                        (
+                            matched_fraction,
+                            1.0 / preserved.relation_cardinality.max(1) as f64,
+                        )
+                    });
                     trace!(
                         target: targets::OPTIMIZER,
                         filter_index = filter.filter_info.filter_index,
@@ -2076,6 +2089,33 @@ mod tests {
 
         let join_set = set_manager.get_relation_from_vec(vec![0, 1]);
         assert_eq!(estimator.estimate_cardinality(&join_set), 735.0);
+    }
+
+    #[test]
+    fn inherited_domain_does_not_inflate_semi_join_coverage_prior() {
+        let mut set_manager = JoinRelationSetManager::new();
+        let mut estimator = CardinalityEstimator::new(SelectivityDefaults::default());
+        let filter = create_semi_anti_filter(&mut set_manager, JoinType::Semi);
+        estimator.init_equivalent_relations(&[filter]);
+
+        let left = set_manager.get_relation(0);
+        let mut left_stats = RelationStats::with_cardinality(1_000);
+        left_stats.column_distinct_count =
+            column_distinct_counts(0, [DistinctCount::new(1_000, true)]);
+        estimator.init_cardinality_estimator_props(&left, &left_stats);
+
+        let right = set_manager.get_relation(1);
+        let mut right_stats = RelationStats::with_cardinality(900);
+        right_stats.column_distinct_count =
+            column_distinct_counts(1, [DistinctCount::new(900, false)]);
+        estimator.init_cardinality_estimator_props(&right, &right_stats);
+
+        let join_set = set_manager.get_relation_from_vec(vec![0, 1]);
+        assert_eq!(
+            estimator.estimate_cardinality(&join_set),
+            200.0,
+            "an upper-bound domain may tighten but never inflate the 20% match prior"
+        );
     }
 
     #[test]

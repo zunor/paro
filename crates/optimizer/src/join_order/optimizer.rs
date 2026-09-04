@@ -192,7 +192,7 @@ impl JoinOrderOptimizer {
         // prepass derives that view before enumeration; final candidate
         // settling still recomputes executable projection maps after the join
         // tree has been reconstructed.
-        let plan = ColumnLifetimeAnalyzer::new(true).optimize(plan)?;
+        let plan = ColumnLifetimeAnalyzer::for_join_enumeration().optimize(plan)?;
         plan.try_map_post_order(|plan| self.optimize_current_plan(ctx, bind_context, plan))
     }
 
@@ -209,7 +209,7 @@ impl JoinOrderOptimizer {
         bind_context: &BindContext,
     ) -> Result<Vec<LogicalPlan>> {
         self.column_stats = column_stats.clone();
-        let plan = ColumnLifetimeAnalyzer::new(true).optimize(plan)?;
+        let plan = ColumnLifetimeAnalyzer::for_join_enumeration().optimize(plan)?;
         if !self.can_optimize_join(&plan.operator) {
             return Ok(Vec::new());
         }
@@ -696,6 +696,12 @@ impl JoinOrderOptimizer {
         stats.contains_control_region =
             crate::join::build_probe_side::contains_control_region_boundary(plan);
         stats.unique_keys = crate::statistics::unique_keys::proven_unique_keys(plan);
+        // A storage HLL is an observation of its base scan, not of an
+        // arbitrary derived relation. Once a binding crosses a row-reducing
+        // join/filter boundary the same value remains a useful upper bound,
+        // but advertising it as an observed output domain makes SEMI/ANTI
+        // coverage estimates systematically ignore correlated filtering.
+        let hll_is_boundary_observation = matches!(plan.operator, LogicalOperator::Get(_));
         let distinct_counts = plan
             .get_column_bindings()
             .into_iter()
@@ -704,8 +710,8 @@ impl JoinOrderOptimizer {
                 let distinct = column_stats
                     .map(|stats| stats.get_distinct_count())
                     .unwrap_or(0);
-                let from_hll = distinct > 0;
-                let distinct = if from_hll {
+                let has_hll = distinct > 0;
+                let distinct = if has_hll {
                     distinct
                 } else {
                     column_stats
@@ -719,7 +725,7 @@ impl JoinOrderOptimizer {
                         // rewriting base-column HLL or min/max statistics. The
                         // surviving domain cannot contain more values than rows.
                         distinct.min(cardinality.max(1)),
-                        from_hll,
+                        has_hll && hll_is_boundary_observation,
                     ),
                 )
             })
@@ -1214,7 +1220,7 @@ mod tests {
     }
 
     #[test]
-    fn filtered_relation_hll_domain_is_bounded_by_its_cardinality() {
+    fn derived_relation_hll_domain_becomes_a_bounded_upper_estimate() {
         use std::hash::{DefaultHasher, Hash, Hasher};
 
         let session = make_test_session();
@@ -1244,7 +1250,7 @@ mod tests {
             .get(&ColumnBinding::new(0, 0))
             .expect("projection column should retain its binding-keyed statistics");
         assert_eq!(distinct_count.distinct_count, 9);
-        assert!(distinct_count.from_hll);
+        assert!(!distinct_count.from_hll);
     }
 
     #[test]
