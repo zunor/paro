@@ -8,7 +8,7 @@
 //! codec-decoded representations have independent eviction slots.
 
 use std::collections::{HashMap, VecDeque};
-use std::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex, RwLock};
 
 use bytes::Bytes;
@@ -220,7 +220,7 @@ impl PageCacheEntryState {
 struct PageCacheEntry {
     state: Mutex<PageCacheEntryState>,
     cvar: Condvar,
-    decoded_accesses: AtomicU8,
+    decoded_accesses: AtomicU32,
 }
 
 impl PageCacheEntry {
@@ -228,13 +228,13 @@ impl PageCacheEntry {
         Self {
             state: Mutex::new(PageCacheEntryState::new()),
             cvar: Condvar::new(),
-            decoded_accesses: AtomicU8::new(0),
+            decoded_accesses: AtomicU32::new(0),
         }
     }
 
     /// Record a sparse access while the page is on probation. Saturation
     /// preserves frequency evidence without adding global admission metadata.
-    fn observe_sparse_decoded_access(&self) -> u8 {
+    fn observe_sparse_decoded_access(&self) -> u32 {
         let previous = self
             .decoded_accesses
             .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |count| {
@@ -485,7 +485,7 @@ impl PageCache {
     /// Record and return the page-local sparse-access frequency. The probation
     /// counter shares the lifetime of the physical page entry, keeping
     /// admission metadata bounded by the page cache itself.
-    pub(crate) fn observe_sparse_decoded_access(&self, key: &PageKey) -> Option<u8> {
+    pub(crate) fn observe_sparse_decoded_access(&self, key: &PageKey) -> Option<u32> {
         let entry = self.entries.read().unwrap().get(key).cloned();
         entry.map(|entry| entry.observe_sparse_decoded_access())
     }
@@ -494,18 +494,21 @@ impl PageCache {
         self.stats
             .decoded_first_touch_admissions
             .fetch_add(1, Ordering::Relaxed);
+        storage_metrics().inc_decoded_page_cache_first_touch_admission();
     }
 
     pub(crate) fn record_decoded_probation_promotion(&self) {
         self.stats
             .decoded_probation_promotions
             .fetch_add(1, Ordering::Relaxed);
+        storage_metrics().inc_decoded_page_cache_probation_promotion();
     }
 
     pub(crate) fn record_decoded_policy_rejection(&self) {
         self.stats
             .decoded_policy_rejections
             .fetch_add(1, Ordering::Relaxed);
+        storage_metrics().inc_decoded_page_cache_policy_rejection();
     }
 
     /// Non-blocking lookup for a cached page.
@@ -992,6 +995,7 @@ impl PageCache {
         self.stats.hits.fetch_add(1, Ordering::Relaxed);
         if kind == PageContentKind::Decoded {
             self.stats.decoded_hits.fetch_add(1, Ordering::Relaxed);
+            storage_metrics().inc_decoded_page_cache_hit();
         }
         storage_metrics().inc_page_cache_hit();
     }
@@ -1001,6 +1005,7 @@ impl PageCache {
         self.stats.misses.fetch_add(1, Ordering::Relaxed);
         if kind == PageContentKind::Decoded {
             self.stats.decoded_misses.fetch_add(1, Ordering::Relaxed);
+            storage_metrics().inc_decoded_page_cache_miss();
         }
         storage_metrics().inc_page_cache_miss();
     }

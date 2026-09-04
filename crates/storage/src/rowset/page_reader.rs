@@ -33,28 +33,55 @@ pub(crate) enum DecodedPageAccess {
 }
 
 pub(crate) const BITSHUFFLE_DECODE_GROUP_ROWS: usize = 8;
+const DEFAULT_FULL_DECODE_ROWS_PER_WORK_UNIT: usize = 8;
+const DEFAULT_DECODER_SEEK_WORK_UNITS: usize = 1024;
 
-/// Machine-independent work units for decoded-page first-touch admission.
+/// Relative work units for decoded-page first-touch admission.
 ///
 /// One full materialization is a contiguous SIMD pass. Sparse decoding pays
 /// for each touched codec group and for every discontinuous decoder seek. The
 /// policy compares those two physical shapes and separately excludes point
 /// lookups; it does not infer reuse from a page-size ratio. Probation promotion
 /// uses the same work ratio as its reuse threshold, so an expensive full-page
-/// decode requires proportionally stronger observed-frequency evidence.
+/// decode requires proportionally stronger observed-frequency evidence. The
+/// weights are calibration parameters, not codec geometry: their defaults are
+/// tracked by the `search_row_fetch` small-batch benchmark independently from
+/// `BITSHUFFLE_DECODE_GROUP_ROWS`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct DecodedPageAdmissionPolicy {
-    pub min_analytical_selected_rows: usize,
-    pub sequential_decode_advantage: usize,
-    pub sparse_seek_penalty_rows: usize,
+    min_analytical_selected_rows: usize,
+    full_decode_rows_per_work_unit: usize,
+    decoder_seek_work_units: usize,
+}
+
+impl DecodedPageAdmissionPolicy {
+    pub fn new(
+        min_analytical_selected_rows: usize,
+        full_decode_rows_per_work_unit: usize,
+        decoder_seek_work_units: usize,
+    ) -> Result<Self> {
+        if min_analytical_selected_rows == 0
+            || full_decode_rows_per_work_unit == 0
+            || decoder_seek_work_units == 0
+        {
+            return Err(paro_error::invalid_input(
+                "decoded-page admission weights must be positive",
+            ));
+        }
+        Ok(Self {
+            min_analytical_selected_rows,
+            full_decode_rows_per_work_unit,
+            decoder_seek_work_units,
+        })
+    }
 }
 
 impl Default for DecodedPageAdmissionPolicy {
     fn default() -> Self {
         Self {
             min_analytical_selected_rows: 16,
-            sequential_decode_advantage: BITSHUFFLE_DECODE_GROUP_ROWS,
-            sparse_seek_penalty_rows: 1024,
+            full_decode_rows_per_work_unit: DEFAULT_FULL_DECODE_ROWS_PER_WORK_UNIT,
+            decoder_seek_work_units: DEFAULT_DECODER_SEEK_WORK_UNITS,
         }
     }
 }
@@ -66,8 +93,8 @@ struct DecodedPageWork {
 }
 
 impl DecodedPageWork {
-    fn promotion_accesses(self) -> usize {
-        self.sequential.div_ceil(self.sparse.max(1)).max(2)
+    fn promotion_accesses(self) -> u32 {
+        u32::try_from(self.sequential.div_ceil(self.sparse.max(1)).max(2)).unwrap_or(u32::MAX)
     }
 }
 
@@ -76,16 +103,13 @@ fn decoded_page_work(
     group_runs: usize,
     decoded_rows: usize,
     policy: DecodedPageAdmissionPolicy,
-) -> Option<DecodedPageWork> {
-    if policy.sequential_decode_advantage == 0 {
-        return None;
-    }
-    Some(DecodedPageWork {
-        sequential: decoded_rows.div_ceil(policy.sequential_decode_advantage),
+) -> DecodedPageWork {
+    DecodedPageWork {
+        sequential: decoded_rows.div_ceil(policy.full_decode_rows_per_work_unit),
         sparse: decoded_groups
             .saturating_mul(BITSHUFFLE_DECODE_GROUP_ROWS)
-            .saturating_add(group_runs.saturating_mul(policy.sparse_seek_penalty_rows)),
-    })
+            .saturating_add(group_runs.saturating_mul(policy.decoder_seek_work_units)),
+    }
 }
 
 fn analytical_gather_should_materialize(
@@ -322,15 +346,12 @@ impl PageReader {
                 let Some(cache) = self.cache.as_ref().filter(|_| self.options.cache_decoded) else {
                     return false;
                 };
-                let Some(work) = decoded_page_work(
+                let work = decoded_page_work(
                     decoded_groups,
                     group_runs,
                     decoded_rows,
                     self.options.decoded_admission_policy,
-                ) else {
-                    cache.record_decoded_policy_rejection();
-                    return false;
-                };
+                );
                 if analytical_gather_should_materialize(
                     selected_rows,
                     work,
@@ -340,7 +361,7 @@ impl PageReader {
                     true
                 } else if cache
                     .observe_sparse_decoded_access(&self.make_key(pointer))
-                    .is_some_and(|accesses| usize::from(accesses) >= work.promotion_accesses())
+                    .is_some_and(|accesses| accesses >= work.promotion_accesses())
                 {
                     cache.record_decoded_probation_promotion();
                     true
@@ -543,12 +564,12 @@ mod tests {
     #[test]
     fn analytical_gather_admission_compares_decode_and_seek_work() {
         let policy = DecodedPageAdmissionPolicy::default();
-        let point = decoded_page_work(2, 2, 65_536, policy).unwrap();
-        let dense = decoded_page_work(8, 1, 65_536, policy).unwrap();
-        let clustered = decoded_page_work(8, 8, 65_536, policy).unwrap();
-        let scattered_i64 = decoded_page_work(16, 16, 32_768, policy).unwrap();
-        let scattered_i32 = decoded_page_work(64, 64, 65_536, policy).unwrap();
-        let broad = decoded_page_work(512, 500, 65_536, policy).unwrap();
+        let point = decoded_page_work(2, 2, 65_536, policy);
+        let dense = decoded_page_work(8, 1, 65_536, policy);
+        let clustered = decoded_page_work(8, 8, 65_536, policy);
+        let scattered_i64 = decoded_page_work(16, 16, 32_768, policy);
+        let scattered_i32 = decoded_page_work(64, 64, 65_536, policy);
+        let broad = decoded_page_work(512, 500, 65_536, policy);
 
         assert!(!analytical_gather_should_materialize(2, point, policy));
         assert!(!analytical_gather_should_materialize(64, dense, policy));
@@ -570,6 +591,24 @@ mod tests {
         ));
         assert!(analytical_gather_should_materialize(512, broad, policy));
         assert!(dense.promotion_accesses() > broad.promotion_accesses());
+    }
+
+    #[test]
+    fn admission_policy_rejects_zero_calibration_weights() {
+        assert!(DecodedPageAdmissionPolicy::new(0, 8, 1024).is_err());
+        assert!(DecodedPageAdmissionPolicy::new(16, 0, 1024).is_err());
+        assert!(DecodedPageAdmissionPolicy::new(16, 8, 0).is_err());
+    }
+
+    #[test]
+    fn promotion_threshold_is_representable_by_the_probation_counter() {
+        let work = decoded_page_work(
+            1,
+            1,
+            usize::MAX,
+            DecodedPageAdmissionPolicy::new(16, 1, 1).unwrap(),
+        );
+        assert_eq!(work.promotion_accesses(), u32::MAX);
     }
 
     #[test]
@@ -603,7 +642,6 @@ mod tests {
         ));
         let point_promotion_accesses =
             decoded_page_work(1, 1, 65_536, DecodedPageAdmissionPolicy::default())
-                .unwrap()
                 .promotion_accesses();
         for _ in 1..point_promotion_accesses {
             assert!(!reader.should_materialize_decoded(
@@ -630,7 +668,7 @@ mod tests {
         assert_eq!(stats.decoded_first_touch_admissions, 1);
         assert_eq!(
             stats.decoded_policy_rejections,
-            u64::try_from(point_promotion_accesses - 1).unwrap()
+            u64::from(point_promotion_accesses - 1)
         );
         assert_eq!(stats.decoded_probation_promotions, 1);
     }

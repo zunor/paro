@@ -388,6 +388,31 @@ pub const SEARCH_METRIC_DESCRIPTORS: &[SearchMetricDescriptor] = &[
         TABLE_PROVIDER,
     ),
     SearchMetricDescriptor::counter(
+        "search_decoded_page_cache_hits_total",
+        SearchMetricUnit::Count,
+        GLOBAL,
+    ),
+    SearchMetricDescriptor::counter(
+        "search_decoded_page_cache_misses_total",
+        SearchMetricUnit::Count,
+        GLOBAL,
+    ),
+    SearchMetricDescriptor::counter(
+        "search_decoded_page_cache_first_touch_admissions_total",
+        SearchMetricUnit::Count,
+        GLOBAL,
+    ),
+    SearchMetricDescriptor::counter(
+        "search_decoded_page_cache_probation_promotions_total",
+        SearchMetricUnit::Count,
+        GLOBAL,
+    ),
+    SearchMetricDescriptor::counter(
+        "search_decoded_page_cache_policy_rejections_total",
+        SearchMetricUnit::Count,
+        GLOBAL,
+    ),
+    SearchMetricDescriptor::counter(
         "search_generation_retired_total",
         SearchMetricUnit::Count,
         PROVIDER,
