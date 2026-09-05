@@ -62,11 +62,10 @@ impl Default for FixedMembershipBuildPolicy {
 
 pub(crate) trait FixedMembershipValue: Copy + Ord {
     fn offset_from(self, base: Self) -> Option<usize>;
-    fn checked_add_offset(self, offset: usize) -> Option<Self>;
 }
 
 macro_rules! impl_fixed_membership_value {
-    ($ty:ty, $unsigned:ty, $wide:ty) => {
+    ($ty:ty, $unsigned:ty) => {
         impl FixedMembershipValue for $ty {
             #[inline]
             fn offset_from(self, base: Self) -> Option<usize> {
@@ -79,18 +78,12 @@ macro_rules! impl_fixed_membership_value {
                 let offset = (self as $unsigned).wrapping_sub(base as $unsigned);
                 usize::try_from(offset).ok()
             }
-
-            #[inline]
-            fn checked_add_offset(self, offset: usize) -> Option<Self> {
-                let value = <$wide>::from(self).checked_add(<$wide>::try_from(offset).ok()?)?;
-                Self::try_from(value).ok()
-            }
         }
     };
 }
 
-impl_fixed_membership_value!(i32, u32, i64);
-impl_fixed_membership_value!(i64, u64, i128);
+impl_fixed_membership_value!(i32, u32);
+impl_fixed_membership_value!(i64, u64);
 
 impl FixedMembershipValue for i128 {
     #[inline]
@@ -100,11 +93,6 @@ impl FixedMembershipValue for i128 {
         }
         usize::try_from((self as u128).wrapping_sub(base as u128)).ok()
     }
-
-    #[inline]
-    fn checked_add_offset(self, offset: usize) -> Option<Self> {
-        self.checked_add(i128::try_from(offset).ok()?)
-    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -113,12 +101,15 @@ enum FixedMembershipRepresentation<T> {
     DenseBits {
         base: T,
         span: usize,
-        count: usize,
+        /// Canonical storage is retained because range and enumeration
+        /// consumers need logarithmic/linear-in-N access, independently of
+        /// the point-lookup accelerator's domain span.
+        ordered: Arc<[T]>,
         bits: Arc<[u64]>,
     },
     DenseBytes {
         base: T,
-        count: usize,
+        ordered: Arc<[T]>,
         present: Arc<[u8]>,
     },
 }
@@ -164,12 +155,10 @@ impl<T: FixedMembershipValue> FixedMembershipSet<T> {
             };
         }
 
-        let mut min = values[0];
-        let mut max = values[0];
-        for &value in &values[1..] {
-            min = min.min(value);
-            max = max.max(value);
-        }
+        values.sort_unstable();
+        values.dedup();
+        let min = values[0];
+        let max = values[values.len() - 1];
         if let Some(span) = max
             .offset_from(min)
             .and_then(|offset| offset.checked_add(1))
@@ -177,49 +166,39 @@ impl<T: FixedMembershipValue> FixedMembershipSet<T> {
         {
             if span <= MAX_BYTE_LOOKUP_DOMAIN {
                 let mut present = vec![0_u8; span];
-                let mut count = 0usize;
-                for value in values {
+                for &value in &values {
                     let offset = value
                         .offset_from(min)
                         .expect("membership value lies inside measured byte lookup range");
-                    if present[offset] == 0 {
-                        present[offset] = 1;
-                        count += 1;
-                    }
+                    present[offset] = 1;
                 }
                 return Self {
                     representation: FixedMembershipRepresentation::DenseBytes {
                         base: min,
-                        count,
+                        ordered: values.into(),
                         present: present.into(),
                     },
                 };
             }
             let mut bits = vec![0_u64; span.div_ceil(u64::BITS as usize)];
-            let mut count = 0usize;
-            for value in values {
+            for &value in &values {
                 let offset = value
                     .offset_from(min)
                     .expect("membership value lies inside measured dense range");
                 let word = &mut bits[offset / u64::BITS as usize];
                 let mask = 1_u64 << (offset % u64::BITS as usize);
-                if *word & mask == 0 {
-                    *word |= mask;
-                    count += 1;
-                }
+                *word |= mask;
             }
             return Self {
                 representation: FixedMembershipRepresentation::DenseBits {
                     base: min,
                     span,
-                    count,
+                    ordered: values.into(),
                     bits: bits.into(),
                 },
             };
         }
 
-        values.sort_unstable();
-        values.dedup();
         Self {
             representation: FixedMembershipRepresentation::Sorted(values.into()),
         }
@@ -264,11 +243,7 @@ impl<T: FixedMembershipValue> FixedMembershipSet<T> {
     }
 
     pub(crate) fn len(&self) -> usize {
-        match &self.representation {
-            FixedMembershipRepresentation::Sorted(values) => values.len(),
-            FixedMembershipRepresentation::DenseBits { count, .. }
-            | FixedMembershipRepresentation::DenseBytes { count, .. } => *count,
-        }
+        self.canonical_values().len()
     }
 
     pub(crate) fn is_empty(&self) -> bool {
@@ -280,107 +255,42 @@ impl<T: FixedMembershipValue> FixedMembershipSet<T> {
             FixedMembershipRepresentation::Sorted(values) => {
                 values.len().saturating_mul(std::mem::size_of::<T>())
             }
-            FixedMembershipRepresentation::DenseBits { bits, .. } => {
-                bits.len().saturating_mul(std::mem::size_of::<u64>())
-            }
-            FixedMembershipRepresentation::DenseBytes { present, .. } => present.len(),
+            FixedMembershipRepresentation::DenseBits { ordered, bits, .. } => ordered
+                .len()
+                .saturating_mul(std::mem::size_of::<T>())
+                .saturating_add(bits.len().saturating_mul(std::mem::size_of::<u64>())),
+            FixedMembershipRepresentation::DenseBytes {
+                ordered, present, ..
+            } => ordered
+                .len()
+                .saturating_mul(std::mem::size_of::<T>())
+                .saturating_add(present.len()),
         }
     }
 
     pub(crate) fn is_contiguous(&self) -> bool {
-        match &self.representation {
-            FixedMembershipRepresentation::Sorted(values) => {
-                let (Some(first), Some(last)) = (values.first(), values.last()) else {
-                    return false;
-                };
-                last.offset_from(*first)
-                    .and_then(|offset| offset.checked_add(1))
-                    == Some(values.len())
-            }
-            FixedMembershipRepresentation::DenseBits { span, count, .. } => span == count,
-            FixedMembershipRepresentation::DenseBytes { present, count, .. } => {
-                present.len() == *count
-            }
-        }
+        let values = self.canonical_values();
+        let (Some(first), Some(last)) = (values.first(), values.last()) else {
+            return false;
+        };
+        last.offset_from(*first)
+            .and_then(|offset| offset.checked_add(1))
+            == Some(values.len())
     }
 
     pub(crate) fn first(&self) -> Option<T> {
-        match &self.representation {
-            FixedMembershipRepresentation::Sorted(values) => values.first().copied(),
-            FixedMembershipRepresentation::DenseBits { base, bits, .. } => {
-                let word_idx = bits.iter().position(|word| *word != 0)?;
-                let bit_idx = bits[word_idx].trailing_zeros() as usize;
-                base.checked_add_offset(word_idx * u64::BITS as usize + bit_idx)
-            }
-            FixedMembershipRepresentation::DenseBytes { base, present, .. } => {
-                base.checked_add_offset(present.iter().position(|present| *present != 0)?)
-            }
-        }
+        self.canonical_values().first().copied()
     }
 
     pub(crate) fn last(&self) -> Option<T> {
-        match &self.representation {
-            FixedMembershipRepresentation::Sorted(values) => values.last().copied(),
-            FixedMembershipRepresentation::DenseBits {
-                base, span, bits, ..
-            } => {
-                let word_idx = bits.iter().rposition(|word| *word != 0)?;
-                let bit_idx = (u64::BITS - 1 - bits[word_idx].leading_zeros()) as usize;
-                let offset = word_idx * u64::BITS as usize + bit_idx;
-                (offset < *span)
-                    .then(|| base.checked_add_offset(offset))
-                    .flatten()
-            }
-            FixedMembershipRepresentation::DenseBytes { base, present, .. } => {
-                base.checked_add_offset(present.iter().rposition(|present| *present != 0)?)
-            }
-        }
+        self.canonical_values().last().copied()
     }
 
     fn first_at_or_after(&self, target: T) -> Option<T> {
-        match &self.representation {
-            FixedMembershipRepresentation::Sorted(values) => values
-                .get(values.partition_point(|value| *value < target))
-                .copied(),
-            FixedMembershipRepresentation::DenseBits {
-                base, span, bits, ..
-            } => {
-                let offset = if target <= *base {
-                    0
-                } else {
-                    target.offset_from(*base)?
-                };
-                if offset >= *span {
-                    return None;
-                }
-                let word_index = offset / u64::BITS as usize;
-                let bit_index = offset % u64::BITS as usize;
-                let first_word = bits[word_index] & (u64::MAX << bit_index);
-                let (word_index, word) = if first_word != 0 {
-                    (word_index, first_word)
-                } else {
-                    let relative = bits[word_index + 1..].iter().position(|word| *word != 0)?;
-                    let word_index = word_index + 1 + relative;
-                    (word_index, bits[word_index])
-                };
-                let offset = word_index * u64::BITS as usize + word.trailing_zeros() as usize;
-                (offset < *span)
-                    .then(|| base.checked_add_offset(offset))
-                    .flatten()
-            }
-            FixedMembershipRepresentation::DenseBytes { base, present, .. } => {
-                let offset = if target <= *base {
-                    0
-                } else {
-                    target.offset_from(*base)?
-                };
-                let relative = present
-                    .get(offset..)?
-                    .iter()
-                    .position(|value| *value != 0)?;
-                base.checked_add_offset(offset + relative)
-            }
-        }
+        let values = self.canonical_values();
+        values
+            .get(values.partition_point(|value| *value < target))
+            .copied()
     }
 
     pub(crate) fn retain(&mut self, mut predicate: impl FnMut(T) -> bool) {
@@ -395,54 +305,20 @@ impl<T: FixedMembershipValue> FixedMembershipSet<T> {
         self.retain(|value| other.contains(value));
     }
 
-    fn iter(&self) -> FixedMembershipIter<'_, T> {
-        FixedMembershipIter {
-            set: self,
-            next_offset: 0,
+    fn canonical_values(&self) -> &[T] {
+        match &self.representation {
+            FixedMembershipRepresentation::Sorted(values)
+            | FixedMembershipRepresentation::DenseBits {
+                ordered: values, ..
+            }
+            | FixedMembershipRepresentation::DenseBytes {
+                ordered: values, ..
+            } => values,
         }
     }
-}
 
-struct FixedMembershipIter<'a, T> {
-    set: &'a FixedMembershipSet<T>,
-    next_offset: usize,
-}
-
-impl<T: FixedMembershipValue> Iterator for FixedMembershipIter<'_, T> {
-    type Item = T;
-
-    fn next(&mut self) -> Option<Self::Item> {
-        match &self.set.representation {
-            FixedMembershipRepresentation::Sorted(values) => {
-                let value = values.get(self.next_offset).copied();
-                self.next_offset += usize::from(value.is_some());
-                value
-            }
-            FixedMembershipRepresentation::DenseBits {
-                base, span, bits, ..
-            } => {
-                while self.next_offset < *span {
-                    let offset = self.next_offset;
-                    self.next_offset += 1;
-                    if bits[offset / u64::BITS as usize] & (1_u64 << (offset % u64::BITS as usize))
-                        != 0
-                    {
-                        return base.checked_add_offset(offset);
-                    }
-                }
-                None
-            }
-            FixedMembershipRepresentation::DenseBytes { base, present, .. } => {
-                while self.next_offset < present.len() {
-                    let offset = self.next_offset;
-                    self.next_offset += 1;
-                    if present[offset] != 0 {
-                        return base.checked_add_offset(offset);
-                    }
-                }
-                None
-            }
-        }
+    fn iter(&self) -> impl Iterator<Item = T> + '_ {
+        self.canonical_values().iter().copied()
     }
 }
 
@@ -690,5 +566,22 @@ mod tests {
         ));
         assert_eq!(dense_bits.first_at_or_after(65_537), Some(131_072));
         assert_eq!(dense_bits.first_at_or_after(131_073), None);
+    }
+
+    #[test]
+    fn sparse_dense_accelerator_retains_logarithmic_interval_index() {
+        let values = FixedMembershipSet::from_values_with_policy(
+            vec![0_i64, 33_554_432, 67_108_863],
+            FixedMembershipBuildPolicy::new(67_108_864, 2_000_000),
+        );
+
+        let FixedMembershipRepresentation::DenseBits { ordered, bits, .. } = &values.representation
+        else {
+            panic!("expected point-lookup accelerator");
+        };
+        assert_eq!(ordered.as_ref(), &[0, 33_554_432, 67_108_863]);
+        assert_eq!(bits.len(), 67_108_864 / u64::BITS as usize);
+        assert_eq!(values.first_at_or_after(1), Some(33_554_432));
+        assert_eq!(values.first_at_or_after(33_554_433), Some(67_108_863));
     }
 }

@@ -4,11 +4,11 @@
 //! Canonicalize null-safe join equalities under executable non-NULL proofs.
 
 use paro_planner::expression::{ColumnRefExpression, ConjunctionType, Expression, OperatorType};
-use paro_planner::operator::{Join, JoinComparisonType, LogicalOperator};
+use paro_planner::operator::{Join, JoinComparisonType, LogicalOperator, MarkJoinSemantics};
 use paro_planner::plan::LogicalPlan;
 
-/// Replace `IS NOT DISTINCT FROM` with strict equality when either input is
-/// proven non-NULL at the join boundary.
+/// Replace `IS NOT DISTINCT FROM` with strict equality under the proof required
+/// by the comparison's observable semantics.
 ///
 /// This is an equivalence rewrite, not a selectivity assumption. It restores
 /// the canonical equality after dependent-join flattening has represented an
@@ -23,10 +23,14 @@ pub fn optimize_plan(plan: LogicalPlan) -> (LogicalPlan, bool) {
     });
     let plan = plan.map_operator(|operator| match operator {
         LogicalOperator::Join(Join::Comparison(mut join)) => {
-            for condition in &mut join.conditions {
+            for (condition_index, condition) in join.conditions.iter_mut().enumerate() {
                 if condition.comparison == JoinComparisonType::NotDistinctFrom
-                    && (expression_is_proven_non_null_at(join.left.as_ref(), &condition.left)
-                        || expression_is_proven_non_null_at(join.right.as_ref(), &condition.right))
+                    && equality_proof_holds(
+                        join.mark_semantics,
+                        condition_index,
+                        expression_is_proven_non_null_at(join.left.as_ref(), &condition.left),
+                        expression_is_proven_non_null_at(join.right.as_ref(), &condition.right),
+                    )
                 {
                     condition.comparison = JoinComparisonType::Equal;
                     changed = true;
@@ -37,6 +41,28 @@ pub fn optimize_plan(plan: LogicalPlan) -> (LogicalPlan, bool) {
         operator => operator,
     });
     (plan, changed)
+}
+
+/// The two comparisons always have the same TRUE set when either operand is
+/// non-NULL. They have the same full SQL truth value only when both are
+/// non-NULL: `NULL IS NOT DISTINCT FROM 1` is FALSE, while `NULL = 1` is
+/// UNKNOWN. Ordinary joins and EXISTS-style MARK joins observe only the TRUE
+/// set. The payload suffix of an IN/ANY MARK join also observes UNKNOWN.
+fn equality_proof_holds(
+    mark_semantics: MarkJoinSemantics,
+    condition_index: usize,
+    left_non_null: bool,
+    right_non_null: bool,
+) -> bool {
+    let truth_value_is_observable = matches!(
+        mark_semantics,
+        MarkJoinSemantics::ThreeValuedFrom(start) if condition_index >= start
+    );
+    if truth_value_is_observable {
+        left_non_null && right_non_null
+    } else {
+        left_non_null || right_non_null
+    }
 }
 
 /// Follow a direct value through relational operators that preserve its
@@ -179,7 +205,8 @@ mod tests {
     use paro_common::types::LogicalType;
     use paro_planner::expression::{ColumnRefExpression, OperatorExpression};
     use paro_planner::operator::{
-        ColumnBinding, ComparisonJoin, ExpressionGet, Filter, JoinCondition, JoinType, Projection,
+        ColumnBinding, ComparisonJoin, ExpressionGet, Filter, JoinCondition, JoinType,
+        MarkJoinSemantics, Projection,
     };
 
     fn column(table: usize) -> Expression {
@@ -273,5 +300,76 @@ mod tests {
             join.conditions[0].comparison,
             JoinComparisonType::NotDistinctFrom
         );
+    }
+
+    #[test]
+    fn three_valued_mark_payload_requires_both_sides_non_null() {
+        let mut join = ComparisonJoin::new(
+            JoinType::Mark,
+            values(0),
+            non_null_filter(1),
+            vec![JoinCondition::new(
+                column(0),
+                column(1),
+                JoinComparisonType::NotDistinctFrom,
+            )],
+        );
+        join.mark_semantics = MarkJoinSemantics::ThreeValuedFrom(0);
+        let plan = LogicalPlan::synthetic(LogicalOperator::Join(Join::Comparison(join)));
+
+        let (plan, changed) = optimize_plan(plan);
+        assert!(!changed);
+        let LogicalOperator::Join(Join::Comparison(join)) = &plan.operator else {
+            panic!("expected comparison join");
+        };
+        assert_eq!(
+            join.conditions[0].comparison,
+            JoinComparisonType::NotDistinctFrom
+        );
+    }
+
+    #[test]
+    fn three_valued_mark_prefix_only_requires_same_true_set() {
+        let mut join = ComparisonJoin::new(
+            JoinType::Mark,
+            values(0),
+            non_null_filter(1),
+            vec![
+                JoinCondition::new(column(0), column(1), JoinComparisonType::NotDistinctFrom),
+                JoinCondition::new(column(0), column(1), JoinComparisonType::Equal),
+            ],
+        );
+        join.mark_semantics = MarkJoinSemantics::ThreeValuedFrom(1);
+        let plan = LogicalPlan::synthetic(LogicalOperator::Join(Join::Comparison(join)));
+
+        let (plan, changed) = optimize_plan(plan);
+        assert!(changed);
+        let LogicalOperator::Join(Join::Comparison(join)) = &plan.operator else {
+            panic!("expected comparison join");
+        };
+        assert_eq!(join.conditions[0].comparison, JoinComparisonType::Equal);
+    }
+
+    #[test]
+    fn three_valued_mark_payload_accepts_two_non_null_proofs() {
+        let mut join = ComparisonJoin::new(
+            JoinType::Mark,
+            non_null_filter(0),
+            non_null_filter(1),
+            vec![JoinCondition::new(
+                column(0),
+                column(1),
+                JoinComparisonType::NotDistinctFrom,
+            )],
+        );
+        join.mark_semantics = MarkJoinSemantics::ThreeValuedFrom(0);
+        let plan = LogicalPlan::synthetic(LogicalOperator::Join(Join::Comparison(join)));
+
+        let (plan, changed) = optimize_plan(plan);
+        assert!(changed);
+        let LogicalOperator::Join(Join::Comparison(join)) = &plan.operator else {
+            panic!("expected comparison join");
+        };
+        assert_eq!(join.conditions[0].comparison, JoinComparisonType::Equal);
     }
 }

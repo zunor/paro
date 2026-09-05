@@ -212,7 +212,11 @@ impl RuntimeFilterResourceContract {
                 let bytes = match key {
                     RuntimeFilterKeyRepresentation::Disabled
                     | RuntimeFilterKeyRepresentation::Range => 0,
-                    _ => dense_bytes.max(
+                    // The sorted canonical domain remains resident beside an
+                    // optional dense point-lookup accelerator. This makes
+                    // interval and enumeration work proportional to member
+                    // count rather than to gaps in the address space.
+                    _ => dense_bytes.saturating_add(
                         u64::try_from(key.value_width())
                             .unwrap_or(u64::MAX)
                             .saturating_mul(u64::from(max_global_exact_values)),

@@ -33,6 +33,47 @@ pub(crate) struct PredicateIndexAnalysis {
     conjuncts: Option<Box<[IndexPredicateEvaluation]>>,
 }
 
+/// Incremental AND state. Candidate intersection is updated as each child is
+/// evaluated so an empty cumulative domain prevents all remaining indexes
+/// from being opened. Direct child evaluations may still be retained by the
+/// caller for residual-elision proofs.
+struct AndEvaluation {
+    candidates: PredicateResult,
+    guaranteed: PredicateResult,
+    exact: bool,
+}
+
+impl AndEvaluation {
+    fn new() -> Self {
+        Self {
+            candidates: PredicateResult::AllMatch,
+            guaranteed: PredicateResult::AllMatch,
+            exact: true,
+        }
+    }
+
+    /// Returns whether another conjunct can affect the result.
+    fn push(&mut self, child: &IndexPredicateEvaluation) -> bool {
+        self.exact &= child.is_exact();
+        self.candidates = intersect(&self.candidates, &child.candidates);
+        if matches!(self.candidates, PredicateResult::NoneMatch) {
+            self.guaranteed = PredicateResult::NoneMatch;
+            self.exact = true;
+            return false;
+        }
+        self.guaranteed = intersect(&self.guaranteed, child.guaranteed());
+        true
+    }
+
+    fn finish(self) -> IndexPredicateEvaluation {
+        if self.exact {
+            IndexPredicateEvaluation::exact(self.candidates)
+        } else {
+            IndexPredicateEvaluation::new(self.candidates, self.guaranteed)
+        }
+    }
+}
+
 impl PredicateIndexAnalysis {
     pub(crate) fn requires_row_verification(&self) -> bool {
         !self.evaluation.is_exact()
@@ -104,25 +145,26 @@ impl IndexEvaluator {
         let conjuncts = match predicate_tree {
             PredicateTree::And(children) => {
                 let mut evaluations = Vec::with_capacity(children.len());
+                let mut combined = AndEvaluation::new();
                 for child in children {
                     let evaluation = self.evaluate_tree(child);
-                    let rejects_every_row =
-                        matches!(evaluation.candidates, PredicateResult::NoneMatch);
+                    let needs_more = combined.push(&evaluation);
                     evaluations.push(evaluation);
-                    if rejects_every_row {
+                    if !needs_more {
                         // The remaining conjuncts cannot make an AND row
                         // eligible. Missing suffix entries intentionally mean
                         // "not proven" to residual-compilation consumers.
                         break;
                     }
                 }
-                Some(evaluations.into_boxed_slice())
+                Some((evaluations.into_boxed_slice(), combined.finish()))
             }
             PredicateTree::Leaf(_) | PredicateTree::Or(_) => None,
         };
-        let evaluation = conjuncts
-            .as_deref()
-            .map_or_else(|| self.evaluate_tree(predicate_tree), Self::combine_and);
+        let (conjuncts, evaluation) = match conjuncts {
+            Some((conjuncts, evaluation)) => (Some(conjuncts), evaluation),
+            None => (None, self.evaluate_tree(predicate_tree)),
+        };
         PredicateIndexAnalysis {
             evaluation,
             conjuncts,
@@ -133,17 +175,14 @@ impl IndexEvaluator {
         match predicate_tree {
             PredicateTree::Leaf(predicate) => self.evaluate_single(predicate),
             PredicateTree::And(children) => {
-                let mut evaluations = Vec::with_capacity(children.len());
+                let mut combined = AndEvaluation::new();
                 for child in children {
                     let evaluation = self.evaluate_tree(child);
-                    let rejects_every_row =
-                        matches!(evaluation.candidates, PredicateResult::NoneMatch);
-                    evaluations.push(evaluation);
-                    if rejects_every_row {
+                    if !combined.push(&evaluation) {
                         break;
                     }
                 }
-                Self::combine_and(&evaluations)
+                combined.finish()
             }
             PredicateTree::Or(children) => {
                 let mut candidates = PredicateResult::NoneMatch;
@@ -161,27 +200,6 @@ impl IndexEvaluator {
                     IndexPredicateEvaluation::new(candidates, guaranteed)
                 }
             }
-        }
-    }
-
-    fn combine_and(children: &[IndexPredicateEvaluation]) -> IndexPredicateEvaluation {
-        let mut candidates = PredicateResult::AllMatch;
-        let mut guaranteed = PredicateResult::AllMatch;
-        let mut exact = true;
-        for child in children {
-            exact &= child.is_exact();
-            candidates = intersect(&candidates, &child.candidates);
-            if matches!(candidates, PredicateResult::NoneMatch) {
-                // `guaranteed ⊆ candidates` makes the proof empty too;
-                // no remaining child can make an AND row eligible.
-                return IndexPredicateEvaluation::exact(PredicateResult::NoneMatch);
-            }
-            guaranteed = intersect(&guaranteed, child.guaranteed());
-        }
-        if exact {
-            IndexPredicateEvaluation::exact(candidates)
-        } else {
-            IndexPredicateEvaluation::new(candidates, guaranteed)
         }
     }
 
@@ -356,10 +374,14 @@ mod tests {
 
     impl MockIndex {
         fn new(index_type: &str, result: PredicateResult) -> Self {
+            Self::for_column(index_type, 0, result)
+        }
+
+        fn for_column(index_type: &str, column_id: ColumnId, result: PredicateResult) -> Self {
             Self {
                 name: format!("mock_{}", index_type),
                 index_type: index_type.to_string(),
-                column_ids: vec![0],
+                column_ids: vec![column_id],
                 logical_types: vec![LogicalType::Integer],
                 result,
                 evaluations: AtomicUsize::new(0),
@@ -570,6 +592,46 @@ mod tests {
         assert!(matches!(result.candidates, PredicateResult::NoneMatch));
         assert!(matches!(result.guaranteed(), PredicateResult::NoneMatch));
         assert_eq!(rejecting.evaluations.load(Ordering::Relaxed), 1);
+    }
+
+    #[test]
+    fn and_stops_after_cumulative_candidate_intersection_becomes_empty() {
+        let first = Arc::new(MockIndex::for_column(
+            "BITMAP",
+            0,
+            PredicateResult::Bitmap(RoaringBitmap::from_iter([1])),
+        ));
+        let second = Arc::new(MockIndex::for_column(
+            "BITMAP",
+            1,
+            PredicateResult::Bitmap(RoaringBitmap::from_iter([2])),
+        ));
+        let unopened = Arc::new(MockIndex::for_column(
+            "BITMAP",
+            2,
+            PredicateResult::Bitmap(RoaringBitmap::from_iter([3])),
+        ));
+        let evaluator = IndexEvaluator::new(vec![first.clone(), second.clone(), unopened.clone()]);
+        let leaf = |column_id, value| {
+            PredicateTree::leaf(Predicate::Eq {
+                column_id,
+                value: paro_common::runtime_value::Value::Integer(value),
+            })
+        };
+
+        let analysis = evaluator.analyze(&PredicateTree::And(vec![
+            leaf(0, 1),
+            leaf(1, 2),
+            leaf(2, 3),
+        ]));
+
+        assert!(matches!(
+            analysis.into_evaluation().candidates,
+            PredicateResult::NoneMatch
+        ));
+        assert_eq!(first.evaluations.load(Ordering::Relaxed), 1);
+        assert_eq!(second.evaluations.load(Ordering::Relaxed), 1);
+        assert_eq!(unopened.evaluations.load(Ordering::Relaxed), 0);
     }
 
     #[test]

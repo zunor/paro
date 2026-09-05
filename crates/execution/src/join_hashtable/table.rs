@@ -1013,6 +1013,15 @@ impl JoinHashTable {
         }
 
         let mut store = self.build_store.lock().unwrap();
+        let preserve_all_build_rows = Self::propagates_build_side(self.join_type);
+        let known_valid_key_prefix = if !preserve_all_build_rows {
+            self.null_values_are_equal
+                .iter()
+                .take_while(|nulls_equal| !**nulls_equal)
+                .count()
+        } else {
+            0
+        };
         let build_time_integer_builder = self.config.build_time_integer_builder.as_ref();
         let build_time_integer_reservation =
             build_time_integer_builder.and_then(|builder| builder.reserve_batch(appended_count));
@@ -1033,6 +1042,7 @@ impl JoinHashTable {
             appended_count,
             (!defer_hashes).then_some(hashes.as_slice()),
             false,
+            known_valid_key_prefix,
             |output_idx, source_row_idx, row_ptr| {
                 if let (Some(builder), Some(reservation), Some(key)) = (
                     build_time_integer_builder,

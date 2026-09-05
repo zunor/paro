@@ -58,10 +58,14 @@ impl JoinRuntimeFilterPolicy {
             RuntimeFilterBuilderScope::Global => contract.max_global_exact_values,
         } as usize;
         let transfer = max_exact_values.saturating_mul(value_width);
+        // Dense point lookup is an accelerator layered over the canonical
+        // sorted domain. Account for both retained representations; the
+        // canonical copy keeps interval probes and enumeration independent of
+        // gaps in the dense address space.
         let frozen = (contract.max_dense_bits as usize)
             .div_ceil(u64::BITS as usize)
             .saturating_mul(std::mem::size_of::<u64>())
-            .max(transfer);
+            .saturating_add(transfer);
         Self {
             max_exact_values,
             max_range_value_bytes: contract.max_range_value_bytes as usize,
