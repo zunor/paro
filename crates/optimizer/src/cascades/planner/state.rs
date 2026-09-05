@@ -308,6 +308,10 @@ pub(super) struct PlannerCostFacts {
     /// Bytes physically read from base-table column sources for each scan
     /// row. `None` identifies a non-scan structural operator.
     pub(super) scan_access_width: Option<u64>,
+    /// Snapshot physical rows presented by a base-table source before
+    /// predicates. This is task-supply evidence only: it affects duration
+    /// ranking, never cardinality or a semantic upper bound.
+    pub(super) scan_physical_rows: Option<u64>,
     pub(super) scan_work_source: Option<WorkSourceId>,
     pub(super) perfect_hash: Option<crate::physical::PerfectHashResourceContract>,
     pub(super) topn_capacity: Option<u64>,
@@ -338,6 +342,7 @@ pub(super) struct ResolvedPlannerCostFacts {
     pub(super) output_row_width: u64,
     pub(super) hash_key_width: Option<u64>,
     pub(super) scan_access_width: Option<u64>,
+    pub(super) scan_physical_rows: Option<u64>,
     pub(super) scan_work_source: Option<WorkSourceId>,
     pub(super) perfect_hash: Option<crate::physical::PerfectHashResourceContract>,
     pub(super) topn_capacity: Option<u64>,
@@ -356,9 +361,10 @@ pub(super) struct ResolvedPlannerCostFacts {
 pub(super) enum RuntimeFilterProbeMultiplicity {
     #[default]
     Unknown,
-    /// Snapshot HLL evidence used only to rank expected/risk work. It is
-    /// neither a schema invariant nor a correctness or memory proof.
-    EstimatedUnique,
+    /// Snapshot HLL evidence for the probe-key domain. This is an expected
+    /// distribution input only; it is neither a schema invariant nor a
+    /// correctness or memory proof.
+    EstimatedDistinct { keys: u64 },
     /// Catalog uniqueness survives plan reuse and may tighten the risk range.
     DeclaredUnique,
 }

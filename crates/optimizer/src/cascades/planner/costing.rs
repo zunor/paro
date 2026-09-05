@@ -4,6 +4,7 @@
 //! Physical implementation admission and calibrated local costing.
 
 use super::*;
+use paro_common::task_supply::useful_pipeline_tasks;
 
 mod facts;
 
@@ -648,11 +649,18 @@ pub(super) fn implementation_cost(
     calibration: &MachineCalibrationBundle,
     max_concurrent_tasks: u16,
 ) -> Result<SearchCost> {
+    let useful_parallel_tasks = useful_parallel_tasks_for_facts(facts, max_concurrent_tasks);
     let mut work = LocalOperatorWork::default();
     let peak_memory_upper;
     match flavor {
         PhysicalImplementationFlavor::Structural => {
-            return refreshed_structural_cost(metadata, facts, calibration, max_concurrent_tasks)
+            return refreshed_structural_cost(
+                metadata,
+                facts,
+                calibration,
+                max_concurrent_tasks,
+                useful_parallel_tasks,
+            )
         }
         PhysicalImplementationFlavor::SearchProvider => {
             return Err(paro_error::internal(
@@ -1004,7 +1012,7 @@ pub(super) fn implementation_cost(
     let mut cost = calibration.fold_for_tasks(
         &work,
         implementation_parallelism(flavor),
-        max_concurrent_tasks,
+        useful_parallel_tasks,
     )?;
     let retained_memory_target = expected_retained_memory_target(facts, flavor, peak_memory_upper);
     apply_execution_memory_contract(
@@ -1064,11 +1072,45 @@ pub(super) fn runtime_filter_apply_cost(
     };
     let mut work = LocalOperatorWork::default();
     work.add(OP_RUNTIME_FILTER_APPLY_ROW, rows)?;
+    // This is a replaceable decomposition of `implementation_cost`, not an
+    // independently scheduled operator. Fold it at the exact same physical
+    // operating point so every score/span dimension remains a valid subset
+    // of the complete local candidate.
+    let useful_parallel_tasks = useful_parallel_tasks_for_facts(facts, max_concurrent_tasks);
     Ok(Some(calibration.fold_for_tasks(
         &work,
         ParallelWorkProfile::Pipeline,
-        max_concurrent_tasks,
+        useful_parallel_tasks,
     )?))
+}
+
+/// Derive an operator's executable task supply independently from its grant.
+///
+/// The runtime starts workers from physical source/breaker work, not from the
+/// session thread setting alone. A local phase cannot exploit more workers
+/// than its largest input/output stream can feed at the shared amortization
+/// boundary. Base scans use pre-predicate physical rows because decoding and
+/// visibility work still occur for rejected tuples.
+pub(super) fn useful_parallel_tasks_for_facts(
+    facts: &ResolvedPlannerCostFacts,
+    max_concurrent_tasks: u16,
+) -> u16 {
+    let scan_width = facts.scan_access_width.unwrap_or(facts.output_row_width);
+    let mut largest_stream_bytes = facts.scan_physical_rows.map_or(0, |physical_rows| {
+        physical_rows.saturating_mul(scan_width.saturating_add(8).max(1))
+    });
+    if facts.scan_physical_rows.is_none() {
+        largest_stream_bytes = estimated_bytes(facts.output_rows.expected, facts.output_row_width);
+        for (rows, width) in facts.child_rows.iter().zip(facts.child_row_widths.iter()) {
+            largest_stream_bytes = largest_stream_bytes.max(estimated_bytes(rows.expected, *width));
+        }
+    }
+    u16::try_from(useful_pipeline_tasks(
+        largest_stream_bytes,
+        usize::from(max_concurrent_tasks.max(1)),
+    ))
+    .unwrap_or(max_concurrent_tasks.max(1))
+    .max(1)
 }
 
 fn implementation_parallelism(flavor: PhysicalImplementationFlavor) -> ParallelWorkProfile {
@@ -1330,6 +1372,7 @@ fn refreshed_structural_cost(
     facts: &ResolvedPlannerCostFacts,
     calibration: &MachineCalibrationBundle,
     max_concurrent_tasks: u16,
+    useful_parallel_tasks: u16,
 ) -> Result<SearchCost> {
     if matches!(
         metadata.operator_type,
@@ -1352,7 +1395,7 @@ fn refreshed_structural_cost(
         return calibration.apply_parallelism(
             cost,
             ParallelWorkProfile::Pipeline,
-            max_concurrent_tasks,
+            useful_parallel_tasks,
         );
     }
     let width_factor = (facts.output_row_width as f64 / 32.0).max(1.0);
@@ -1422,7 +1465,7 @@ fn refreshed_structural_cost(
         )?;
     }
     cost.validate()?;
-    calibration.apply_parallelism(cost, ParallelWorkProfile::Pipeline, max_concurrent_tasks)
+    calibration.apply_parallelism(cost, ParallelWorkProfile::Pipeline, useful_parallel_tasks)
 }
 
 pub(super) fn add_tuple_byte_work(
@@ -1519,28 +1562,26 @@ pub(super) fn runtime_filtered_probe_work(
     probe_multiplicity: RuntimeFilterProbeMultiplicity,
     exactness: RuntimeFilterExactness,
 ) -> Result<CompactRange> {
-    let retained = |probe_rows: f64, build_rows: f64| {
+    let retained = |probe_rows: f64, probe_distinct: f64, build_distinct: f64| {
         if probe_rows <= 0.0 {
             return 0.0;
         }
-        let ratio = (build_rows / probe_rows).clamp(0.0, 1.0);
-        // Domain size alone does not describe probe-key skew, so the expected
-        // benefit is deliberately square-root damped. Risk remains represented
-        // by the complete-probe upper bound below.
+        let ratio = (build_distinct / probe_distinct.max(1.0)).clamp(0.0, 1.0);
+        // NDV ratio estimates uniform membership. Square-root damping keeps
+        // expected work conservative under key skew; the complete-probe risk
+        // upper remains below because snapshot HLL is never a proof.
         probe_rows * ratio.sqrt().clamp(0.1, 1.0)
     };
     let expected = match (exactness.expected_exact(), probe_multiplicity) {
         (true, RuntimeFilterProbeMultiplicity::DeclaredUnique) => {
-            retained(probe.expected, build.expected).min(build.expected)
+            retained(probe.expected, probe.expected, build.expected).min(build.expected)
         }
-        (true, RuntimeFilterProbeMultiplicity::EstimatedUnique) => {
-            retained(probe.expected, build.expected).min(build.expected * 1.25)
+        (true, RuntimeFilterProbeMultiplicity::EstimatedDistinct { keys }) => {
+            retained(probe.expected, keys as f64, build.expected)
         }
-        (true, RuntimeFilterProbeMultiplicity::Unknown) | (false, _) => {
-            retained(probe.expected, build.expected)
-                .max(probe.expected * 0.25)
-                .min(probe.expected)
-        }
+        // A row count is not a key-domain estimate. Unknown multiplicity and
+        // coarse range fallback therefore claim no membership reduction.
+        (true, RuntimeFilterProbeMultiplicity::Unknown) | (false, _) => probe.expected,
     };
     // Only a capacity-guaranteed exact single-key domain and a declared-unique
     // probe can bound survivors by build keys. Expected exactness may still
@@ -1911,10 +1952,10 @@ mod tests {
             },
         )
         .unwrap();
-        let estimated_unique = runtime_filtered_probe_work(
+        let estimated_distinct = runtime_filtered_probe_work(
             probe,
             build,
-            RuntimeFilterProbeMultiplicity::EstimatedUnique,
+            RuntimeFilterProbeMultiplicity::EstimatedDistinct { keys: 95_000 },
             RuntimeFilterExactness::Guaranteed {
                 build_keys_upper: 2_000,
             },
@@ -1922,6 +1963,31 @@ mod tests {
         .unwrap();
 
         assert_eq!(exact.upper, 2_000.0);
-        assert_eq!(estimated_unique.upper, probe.upper);
+        assert_eq!(estimated_distinct.upper, probe.upper);
+    }
+
+    #[test]
+    fn runtime_filter_selectivity_uses_probe_ndv_instead_of_probe_rows() {
+        let probe = CompactRange::point(12_000.0).unwrap();
+        let build = CompactRange::point(4.0).unwrap();
+
+        let repeated = runtime_filtered_probe_work(
+            probe,
+            build,
+            RuntimeFilterProbeMultiplicity::EstimatedDistinct { keys: 6 },
+            RuntimeFilterExactness::Expected,
+        )
+        .unwrap();
+        let unknown = runtime_filtered_probe_work(
+            probe,
+            build,
+            RuntimeFilterProbeMultiplicity::Unknown,
+            RuntimeFilterExactness::Expected,
+        )
+        .unwrap();
+
+        assert!(repeated.expected > 9_000.0);
+        assert!(repeated.expected < probe.expected);
+        assert_eq!(unknown.expected, probe.expected);
     }
 }

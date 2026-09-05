@@ -6,6 +6,7 @@ use std::sync::atomic::AtomicUsize;
 use std::sync::Arc;
 
 use paro_common::chunk::Chunk;
+use paro_common::task_supply::useful_pipeline_tasks;
 use paro_function::table::{GlobalTableFunctionState, LocalTableFunctionState};
 use paro_storage::index::{ColumnId, PredicateTree};
 use paro_storage::rowset::{RowsetSharedPtr, SegmentSharedPtr};
@@ -17,11 +18,6 @@ use paro_storage::transaction::overlay_reader::OverlayDeleteVectorMap;
 use crate::physical::specs::RowsetScanMaterialization;
 
 use super::table_function::TableFunctionBindDataWrapper;
-
-/// Enough decoded/predicate work to amortize one scan task and its reader.
-/// Morsels may remain smaller for stealing; this threshold only bounds useful
-/// concurrent consumers of their shared queue.
-pub(crate) const ROWSET_PARALLEL_WORK_BYTES: u64 = 4 * 1024 * 1024;
 
 #[derive(Debug)]
 pub struct RowsetSourceGlobal {
@@ -52,9 +48,9 @@ fn useful_rowset_scan_workers(morsels: &[RowsetScanMorsel], row_work_bytes: u64)
         rows.saturating_add(morsel.end_ordinal.saturating_sub(morsel.start_ordinal))
     });
     let physical_work = physical_rows.saturating_mul(row_work_bytes.max(1));
-    let useful_workers =
-        usize::try_from(physical_work.div_ceil(ROWSET_PARALLEL_WORK_BYTES)).unwrap_or(usize::MAX);
-    morsels.len().min(useful_workers)
+    morsels
+        .len()
+        .min(useful_pipeline_tasks(physical_work, morsels.len()))
 }
 
 /// Execution-bound predicate and its matching initial access mode.
@@ -143,12 +139,12 @@ mod tests {
             RowsetScanMorsel {
                 segment_idx: 0,
                 start_ordinal: 0,
-                end_ordinal: ROWSET_PARALLEL_WORK_BYTES,
+                end_ordinal: paro_common::task_supply::MIN_USEFUL_PIPELINE_WORK_BYTES,
             },
             RowsetScanMorsel {
                 segment_idx: 1,
                 start_ordinal: 0,
-                end_ordinal: ROWSET_PARALLEL_WORK_BYTES,
+                end_ordinal: paro_common::task_supply::MIN_USEFUL_PIPELINE_WORK_BYTES,
             },
         ];
         assert_eq!(useful_rowset_scan_workers(&useful_fragments, 1), 2);

@@ -1208,6 +1208,9 @@ impl CascadesEngine {
                         expected_cost = cost.score.range.expected,
                         risk_adjusted_cost = cost.score.risk_adjusted,
                         upper_cost = cost.score.range.upper,
+                        work_latency = cost.work_latency.expected,
+                        critical_path = cost.critical_path.expected,
+                        useful_parallel_tasks = cost.max_parallel_tasks,
                         "costed an equivalent physical candidate"
                     );
                 }

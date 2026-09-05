@@ -65,6 +65,15 @@ pub(in crate::cascades::planner) fn planner_cost_facts(
         LogicalOperator::Get(get) => Some(planner_scan_access_width(get, scan_access_cost)),
         _ => None,
     };
+    let scan_physical_rows = match &plan.operator {
+        LogicalOperator::Get(get) => get
+            .table
+            .as_ref()
+            .and_then(|table| table.statistics())
+            .map(|statistics| statistics.row_count)
+            .filter(|rows| *rows > 0),
+        _ => None,
+    };
     let scan_work_source = match &plan.operator {
         LogicalOperator::Get(get) if get.table.is_some() => Some(WorkSourceId(get.table_index)),
         LogicalOperator::SearchScan(search) if search.get.table.is_some() => {
@@ -166,6 +175,7 @@ pub(in crate::cascades::planner) fn planner_cost_facts(
         output_row_width,
         hash_key_width,
         scan_access_width,
+        scan_physical_rows,
         scan_work_source,
         perfect_hash,
         topn_capacity,
@@ -273,6 +283,7 @@ pub(in crate::cascades::planner) fn expression_cost_facts(
         output_row_width: template.output_row_width,
         hash_key_width: template.hash_key_width,
         scan_access_width: template.scan_access_width,
+        scan_physical_rows: template.scan_physical_rows,
         scan_work_source: template.scan_work_source,
         perfect_hash: template.perfect_hash,
         topn_capacity: template.topn_capacity,
@@ -413,10 +424,8 @@ pub(super) fn infer_runtime_filter_probe_multiplicity<'a>(
     else {
         return RuntimeFilterProbeMultiplicity::Unknown;
     };
-    if distinct.saturating_mul(10) >= rows.saturating_mul(9) {
-        RuntimeFilterProbeMultiplicity::EstimatedUnique
-    } else {
-        RuntimeFilterProbeMultiplicity::Unknown
+    RuntimeFilterProbeMultiplicity::EstimatedDistinct {
+        keys: u64::try_from(distinct.min(rows)).unwrap_or(u64::MAX),
     }
 }
 

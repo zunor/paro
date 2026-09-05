@@ -558,12 +558,12 @@ impl SearchCost {
     /// work is serial within that lane. This operation must not be used for
     /// independent branches whose critical path composes by `max`.
     pub(crate) fn replace_work(self, old: Self, new: Self) -> Result<Self> {
-        fn replace(total: f64, old: f64, new: f64) -> Result<f64> {
+        fn replace(kind: &str, total: f64, old: f64, new: f64) -> Result<f64> {
             let tolerance = total.abs().max(old.abs()).max(1.0) * 1e-10;
             if old > total + tolerance {
-                return Err(paro_error::internal(
-                    "attributed source work exceeds the complete candidate cost",
-                ));
+                return Err(paro_error::internal(format!(
+                    "attributed {kind} source work {old} exceeds complete candidate work {total}"
+                )));
             }
             Ok((total - old).max(0.0) + new)
         }
@@ -571,38 +571,45 @@ impl SearchCost {
         let mut result = self;
         result.score.range = CompactRange::new(
             replace(
+                "lower",
                 self.score.range.lower,
                 old.score.range.lower,
                 new.score.range.lower,
             )?,
             replace(
+                "expected",
                 self.score.range.expected,
                 old.score.range.expected,
                 new.score.range.expected,
             )?,
             replace(
+                "upper",
                 self.score.range.upper,
                 old.score.range.upper,
                 new.score.range.upper,
             )?,
         )?;
         result.score.risk_adjusted = replace(
+            "risk-adjusted",
             self.score.risk_adjusted,
             old.score.risk_adjusted,
             new.score.risk_adjusted,
         )?;
         result.critical_path = CompactRange::new(
             replace(
+                "critical-path lower",
                 self.critical_path.lower,
                 old.critical_path.lower,
                 new.critical_path.lower,
             )?,
             replace(
+                "critical-path expected",
                 self.critical_path.expected,
                 old.critical_path.expected,
                 new.critical_path.expected,
             )?,
             replace(
+                "critical-path upper",
                 self.critical_path.upper,
                 old.critical_path.upper,
                 new.critical_path.upper,
@@ -610,16 +617,19 @@ impl SearchCost {
         )?;
         result.work_latency = CompactRange::new(
             replace(
+                "work-latency lower",
                 self.work_latency.lower,
                 old.work_latency.lower,
                 new.work_latency.lower,
             )?,
             replace(
+                "work-latency expected",
                 self.work_latency.expected,
                 old.work_latency.expected,
                 new.work_latency.expected,
             )?,
             replace(
+                "work-latency upper",
                 self.work_latency.upper,
                 old.work_latency.upper,
                 new.work_latency.upper,
@@ -627,11 +637,13 @@ impl SearchCost {
         )?;
         for index in 0..RESOURCE_DIMS {
             result.resources_expected[index] = replace(
+                "expected resource",
                 self.resources_expected[index],
                 old.resources_expected[index],
                 new.resources_expected[index],
             )?;
             result.resources_risk_upper[index] = replace(
+                "risk resource",
                 self.resources_risk_upper[index],
                 old.resources_risk_upper[index],
                 new.resources_risk_upper[index],

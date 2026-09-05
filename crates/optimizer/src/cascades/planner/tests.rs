@@ -75,6 +75,7 @@ fn calibrated_tuple_work_distinguishes_narrow_and_wide_intermediates() {
         output_row_width: width,
         hash_key_width: None,
         scan_access_width: None,
+        scan_physical_rows: None,
         scan_work_source: None,
         perfect_hash: None,
         topn_capacity: None,
@@ -104,6 +105,126 @@ fn calibrated_tuple_work_distinguishes_narrow_and_wide_intermediates() {
 }
 
 #[test]
+fn duration_parallelism_is_bounded_by_executable_stream_work() {
+    let facts = |rows: f64| ResolvedPlannerCostFacts {
+        output_rows: CompactRange::point(rows).unwrap(),
+        child_rows: vec![CompactRange::point(rows).unwrap()].into_boxed_slice(),
+        output_rows_hard_upper: None,
+        child_rows_hard_upper: vec![None].into_boxed_slice(),
+        child_row_widths: vec![32].into_boxed_slice(),
+        child_materialization_risk_rows: vec![rows as u64].into_boxed_slice(),
+        output_row_width: 32,
+        hash_key_width: None,
+        scan_access_width: None,
+        scan_physical_rows: None,
+        scan_work_source: None,
+        perfect_hash: None,
+        topn_capacity: None,
+        runtime_filter_probe_multiplicity: RuntimeFilterProbeMultiplicity::Unknown,
+        runtime_filter_build_left_probe_multiplicity: RuntimeFilterProbeMultiplicity::Unknown,
+        runtime_filter_probe_source_rows: None,
+        runtime_filter_build_left_probe_source_rows: None,
+        runtime_filter_probe_sources: Box::new([]),
+        runtime_filter_build_left_probe_sources: Box::new([]),
+        runtime_filter_build_distinct_expected: None,
+        runtime_filter_build_left_distinct_expected: None,
+        runtime_filter_key_types: Box::new([]),
+    };
+
+    assert_eq!(
+        super::costing::useful_parallel_tasks_for_facts(&facts(1_000.0), 10),
+        1
+    );
+    assert_eq!(
+        super::costing::useful_parallel_tasks_for_facts(&facts(2_000_000.0), 10),
+        10
+    );
+}
+
+#[test]
+fn scan_parallelism_uses_pre_predicate_physical_work() {
+    let facts = ResolvedPlannerCostFacts {
+        output_rows: CompactRange::point(1.0).unwrap(),
+        child_rows: Box::new([]),
+        output_rows_hard_upper: None,
+        child_rows_hard_upper: Box::new([]),
+        child_row_widths: Box::new([]),
+        child_materialization_risk_rows: Box::new([]),
+        output_row_width: 8,
+        hash_key_width: None,
+        scan_access_width: Some(8),
+        scan_physical_rows: Some(4_000_000),
+        scan_work_source: Some(WorkSourceId(0)),
+        perfect_hash: None,
+        topn_capacity: None,
+        runtime_filter_probe_multiplicity: RuntimeFilterProbeMultiplicity::Unknown,
+        runtime_filter_build_left_probe_multiplicity: RuntimeFilterProbeMultiplicity::Unknown,
+        runtime_filter_probe_source_rows: None,
+        runtime_filter_build_left_probe_source_rows: None,
+        runtime_filter_probe_sources: Box::new([]),
+        runtime_filter_build_left_probe_sources: Box::new([]),
+        runtime_filter_build_distinct_expected: None,
+        runtime_filter_build_left_distinct_expected: None,
+        runtime_filter_key_types: Box::new([]),
+    };
+
+    assert_eq!(
+        super::costing::useful_parallel_tasks_for_facts(&facts, 10),
+        10
+    );
+}
+
+#[test]
+fn replaceable_runtime_filter_work_uses_candidate_task_supply() {
+    let facts = ResolvedPlannerCostFacts {
+        output_rows: CompactRange::point(10.0).unwrap(),
+        child_rows: vec![
+            CompactRange::point(2_000_000.0).unwrap(),
+            CompactRange::point(100.0).unwrap(),
+        ]
+        .into_boxed_slice(),
+        output_rows_hard_upper: None,
+        child_rows_hard_upper: vec![None, None].into_boxed_slice(),
+        child_row_widths: vec![32, 8].into_boxed_slice(),
+        child_materialization_risk_rows: vec![2_000_000, 100].into_boxed_slice(),
+        output_row_width: 32,
+        hash_key_width: Some(8),
+        scan_access_width: None,
+        scan_physical_rows: None,
+        scan_work_source: None,
+        perfect_hash: None,
+        topn_capacity: None,
+        runtime_filter_probe_multiplicity: RuntimeFilterProbeMultiplicity::Unknown,
+        runtime_filter_build_left_probe_multiplicity: RuntimeFilterProbeMultiplicity::Unknown,
+        // The replaceable term is much smaller than the input pipeline. It
+        // must nevertheless use the candidate's operating point because it
+        // is subtracted from that candidate during source attribution.
+        runtime_filter_probe_source_rows: Some(CompactRange::point(20_000.0).unwrap()),
+        runtime_filter_build_left_probe_source_rows: None,
+        runtime_filter_probe_sources: Box::new([]),
+        runtime_filter_build_left_probe_sources: Box::new([]),
+        runtime_filter_build_distinct_expected: None,
+        runtime_filter_build_left_distinct_expected: None,
+        runtime_filter_key_types: vec![LogicalType::BigInt].into_boxed_slice(),
+    };
+
+    let apply = super::costing::runtime_filter_apply_cost(
+        &facts,
+        PhysicalImplementationFlavor::HashJoinRuntimeFilter,
+        &MachineCalibrationBundle::default(),
+        10,
+    )
+    .unwrap()
+    .unwrap();
+
+    assert_eq!(
+        apply.max_parallel_tasks,
+        super::costing::useful_parallel_tasks_for_facts(&facts, 10)
+    );
+    assert_eq!(apply.max_parallel_tasks, 10);
+}
+
+#[test]
 fn runtime_filter_tuple_work_counts_only_rows_delivered_to_the_join() {
     let facts = ResolvedPlannerCostFacts {
         output_rows: CompactRange::point(10.0).unwrap(),
@@ -119,6 +240,7 @@ fn runtime_filter_tuple_work_counts_only_rows_delivered_to_the_join() {
         output_row_width: 128,
         hash_key_width: Some(8),
         scan_access_width: None,
+        scan_physical_rows: None,
         scan_work_source: None,
         perfect_hash: None,
         topn_capacity: None,
@@ -210,6 +332,7 @@ fn expression_cost_facts_read_current_group_cardinality() {
         output_row_width: 16,
         hash_key_width: None,
         scan_access_width: None,
+        scan_physical_rows: None,
         scan_work_source: None,
         perfect_hash: None,
         topn_capacity: None,
@@ -827,9 +950,13 @@ fn test_base_get(table_index: usize, oid: u64, name: &str, rows: usize) -> Logic
     let mut remaining = rows;
     while remaining > 0 {
         let chunk_rows = remaining.min(paro_common::vector::VECTOR_SIZE);
+        let start = rows - remaining;
+        let values = (start..start + chunk_rows)
+            .map(|value| i32::try_from(value).expect("test key fits i32"))
+            .collect::<Vec<_>>();
         storage
             .append(&paro_common::test_utils::test_chunk_from_vectors(vec![
-                paro_common::test_utils::test_i32_vector(&vec![0; chunk_rows]),
+                paro_common::test_utils::test_i32_vector(&values),
             ]))
             .expect("populate test table");
         remaining -= chunk_rows;
