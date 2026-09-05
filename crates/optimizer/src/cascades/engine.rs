@@ -20,8 +20,8 @@ use super::ids::{
     ResourceGrantClassId, RuleId, StableFingerprintBuilder,
 };
 use super::memo::{
-    EquivalenceProof, GrantGoalKey, GroupCardinality, LogicalProperties, Memo, OptimizationGoal,
-    Winner,
+    ChildWinnerRef, EquivalenceProof, GrantGoalKey, GroupCardinality, LogicalProperties, Memo,
+    OptimizationGoal, Winner,
 };
 use super::region::{
     JointCostProof, RegionArtifactKind, RegionBoundaryEndpoint, RegionCandidateContract,
@@ -31,7 +31,7 @@ use super::region::{
 use super::rules::WorkSourceId;
 use super::rules::{
     CostComposition, ImplementationContext, ImplementationRegistry, PhysicalCandidate, RuleContext,
-    SourceFilterWork, SourceWork, TransformContext,
+    SourceFilterWork, SourceRetentionProof, SourceWork, TransformContext,
 };
 use crate::physical::SpillPolicy;
 
@@ -388,6 +388,33 @@ impl CascadesEngine {
                 expression,
                 rule,
             };
+            let root_matches = {
+                let rule_impl = self
+                    .registry
+                    .transformation(rule)
+                    .ok_or_else(|| paro_error::internal("rule disappeared from registry"))?;
+                let expression_ref = self.memo.logical_expr(expression).ok_or_else(|| {
+                    paro_error::internal("rule task references unknown expression")
+                })?;
+                rule_impl.matches_root(expression_ref)
+            };
+            if !root_matches {
+                continue;
+            }
+            // A zero fire budget cannot admit any transformation. Avoid
+            // constructing dependency closures for work the caller has
+            // explicitly disabled. Likewise, the legacy region-work budget
+            // cannot admit a non-leaf expression when it is zero.
+            let budget = self.memo.budget();
+            let expression_has_children = self
+                .memo
+                .logical_expr(expression)
+                .is_some_and(|expression| !expression.key.children.is_empty());
+            if budget.max_rule_firings_per_group == 0
+                || (budget.max_rule_work_units_per_group == 0 && expression_has_children)
+            {
+                continue;
+            }
             let Some(dependency_version) = self.observe_transformation_inputs(task_id)? else {
                 continue;
             };
@@ -989,15 +1016,14 @@ impl CascadesEngine {
             );
         }
         for (physical, recipe) in recipes {
-            let mut child_costs = Vec::with_capacity(recipe.child_goals.len());
-            let mut child_source_work = Vec::with_capacity(recipe.child_goals.len());
+            let mut child_frontiers = Vec::with_capacity(recipe.child_goals.len());
             let mut children_feasible = true;
             for (child, child_goal) in recipe.child_goals.iter().copied() {
                 self.optimize_group(child, child_goal)?;
-                let Some(child_winner) = self
+                let Some(frontier) = self
                     .memo
                     .group(child)
-                    .and_then(|group| group.winner(child_goal))
+                    .and_then(|group| group.winner_frontier(child_goal))
                 else {
                     tracing::debug!(
                         target: "paro::optimizer",
@@ -1010,168 +1036,212 @@ impl CascadesEngine {
                     children_feasible = false;
                     break;
                 };
-                child_costs.push(child_winner.cost);
-                child_source_work.push(child_winner.source_work.clone());
+                child_frontiers.push(frontier.candidates().to_vec());
             }
             if !children_feasible {
                 continue;
             }
-            let Some(local_cost) = fit_local_retained_state_to_grant(
-                recipe.local_cost,
-                &child_costs,
-                recipe.cost_composition.clone(),
-                recipe.spillable,
-                recipe.enforcer_cost_input,
-            )?
-            else {
-                tracing::debug!(
-                    target: "paro::optimizer",
-                    memo_group = group.index(),
-                    physical_expression = physical.index(),
-                    local_peak_memory = recipe.local_cost.peak_memory_upper,
-                    spillable = recipe.spillable,
-                    hard_memory = recipe.enforcer_cost_input.hard_memory_bytes,
-                    "physical recipe rejected by its resource grant"
-                );
-                continue;
-            };
-            let child_source_work_refs = child_source_work
-                .iter()
-                .map(|work| work.as_ref())
-                .collect::<Vec<_>>();
-            let composed = compose_candidate_cost_with_sources(
-                local_cost,
-                recipe.source_filter_apply_cost,
-                &child_costs,
-                &child_source_work_refs,
-                recipe.cost_composition.clone(),
-            )?;
-            let source_work = composed.source_work;
-            let Some(mut cost) =
-                constrain_composed_cost_to_grant(composed.cost, recipe.enforcer_cost_input)?
-            else {
-                continue;
-            };
-            let physical_properties = self.memo.physical_expr(physical).unwrap().provided.clone();
-            let Some(enforced) = self
-                .enforcement
-                .canonical_baseline(physical_properties, &required)?
-            else {
-                tracing::debug!(
-                    target: "paro::optimizer",
-                    memo_group = group.index(),
-                    physical_expression = physical.index(),
-                    "physical recipe rejected because its required enforcer is absent from the execution ABI"
-                );
-                continue;
-            };
-            let Some(enforcer_cost) = enforcer_cost(
-                &enforced.steps,
-                recipe.enforcer_cost_input,
-                self.memo.calibration(),
-            )?
-            else {
-                tracing::debug!(
-                    target: "paro::optimizer",
-                    memo_group = group.index(),
-                    physical_expression = physical.index(),
-                    ?enforced.steps,
-                    "physical recipe rejected because its enforcer chain is infeasible"
-                );
-                continue;
-            };
-            let Some(constrained_cost) = constrain_composed_cost_to_grant(
-                cost.sequential(enforcer_cost)?,
-                recipe.enforcer_cost_input,
-            )?
-            else {
-                continue;
-            };
-            cost = constrained_cost;
-            let fingerprint = enforced_fingerprint(
-                recipe.physical_fingerprint,
-                &enforced.steps,
-                recipe.child_goals.iter().filter_map(|(child, child_goal)| {
-                    self.memo
-                        .group(*child)
-                        .and_then(|group| group.winner(*child_goal))
-                        .map(|winner| winner.physical_fingerprint)
-                }),
-            );
-            let joint_cost_proof = build_joint_cost_proof(&self.memo, group, &recipe, local_cost)?;
-            if self
+            let combination_limit = self
                 .memo
-                .group(group)
-                .is_some_and(|group| group.logical_exprs().len() > 1)
+                .budget()
+                .max_child_frontier_combinations_per_group
+                .saturating_add(1) as usize;
+            for (ordinal, child_winners) in
+                child_winner_combinations(&child_frontiers, combination_limit)
+                    .into_iter()
+                    .enumerate()
             {
-                let logical_expression = self
-                    .memo
-                    .physical_expr(physical)
-                    .map(|physical| physical.key.logical);
-                let origin_rule = logical_expression.and_then(|logical| {
-                    self.memo.logical_expr(logical).and_then(|logical| {
-                        logical.proofs.iter().find_map(|proof| match proof {
-                            EquivalenceProof::Transformation { rule, .. }
-                            | EquivalenceProof::SpecializedEnumerator { rule, .. } => Some(rule.0),
-                            EquivalenceProof::Initial | EquivalenceProof::Normalization { .. } => {
-                                None
-                            }
-                        })
-                    })
-                });
-                tracing::debug!(
-                    target: "paro::optimizer",
-                    memo_group = group.index(),
-                    logical_expression = logical_expression.map(LogicalExprId::index),
-                    origin_rule,
-                    physical_expression = physical.index(),
-                    child_groups = ?recipe
-                        .child_goals
+                if ordinal > 0 {
+                    let event = child_frontier_combination_event(
+                        physical,
+                        goal,
+                        recipe.physical_fingerprint,
+                        &child_winners,
+                    );
+                    if self
+                        .memo
+                        .group_mut(group)
+                        .ok_or_else(|| paro_error::internal("child-combination owner disappeared"))?
+                        .ledger
+                        .admit_optional(BudgetDimension::ChildFrontierCombination, event)
+                        == BudgetDecision::Exhausted
+                    {
+                        continue;
+                    }
+                }
+                let child_costs = child_winners
+                    .iter()
+                    .map(|winner| winner.cost)
+                    .collect::<Vec<_>>();
+                let child_source_work_refs = child_winners
+                    .iter()
+                    .map(|winner| winner.source_work.as_ref())
+                    .collect::<Vec<_>>();
+                let Some(local_cost) = fit_local_retained_state_to_grant(
+                    recipe.local_cost,
+                    &child_costs,
+                    recipe.cost_composition.clone(),
+                    recipe.spillable,
+                    recipe.enforcer_cost_input,
+                )?
+                else {
+                    tracing::debug!(
+                        target: "paro::optimizer",
+                        memo_group = group.index(),
+                        physical_expression = physical.index(),
+                        local_peak_memory = recipe.local_cost.peak_memory_upper,
+                        spillable = recipe.spillable,
+                        hard_memory = recipe.enforcer_cost_input.hard_memory_bytes,
+                        "physical recipe rejected by its resource grant"
+                    );
+                    continue;
+                };
+                let composed = compose_candidate_cost_with_sources(
+                    local_cost,
+                    recipe.source_filter_apply_cost,
+                    &child_costs,
+                    &child_source_work_refs,
+                    recipe.cost_composition.clone(),
+                )?;
+                let source_work = composed.source_work;
+                let Some(mut cost) =
+                    constrain_composed_cost_to_grant(composed.cost, recipe.enforcer_cost_input)?
+                else {
+                    continue;
+                };
+                let physical_properties =
+                    self.memo.physical_expr(physical).unwrap().provided.clone();
+                let Some(enforced) = self
+                    .enforcement
+                    .canonical_baseline(physical_properties, &required)?
+                else {
+                    tracing::debug!(
+                        target: "paro::optimizer",
+                        memo_group = group.index(),
+                        physical_expression = physical.index(),
+                        "physical recipe rejected because its required enforcer is absent from the execution ABI"
+                    );
+                    continue;
+                };
+                let Some(enforcer_cost) = enforcer_cost(
+                    &enforced.steps,
+                    recipe.enforcer_cost_input,
+                    self.memo.calibration(),
+                )?
+                else {
+                    tracing::debug!(
+                        target: "paro::optimizer",
+                        memo_group = group.index(),
+                        physical_expression = physical.index(),
+                        ?enforced.steps,
+                        "physical recipe rejected because its enforcer chain is infeasible"
+                    );
+                    continue;
+                };
+                let Some(constrained_cost) = constrain_composed_cost_to_grant(
+                    cost.sequential(enforcer_cost)?,
+                    recipe.enforcer_cost_input,
+                )?
+                else {
+                    continue;
+                };
+                cost = constrained_cost;
+                let fingerprint = enforced_fingerprint(
+                    recipe.physical_fingerprint,
+                    &enforced.steps,
+                    child_winners
                         .iter()
-                        .map(|(child, _)| child.index())
-                        .collect::<Vec<_>>(),
-                    implementation = self
+                        .map(|winner| winner.physical_fingerprint),
+                );
+                let joint_cost_proof =
+                    build_joint_cost_proof(&self.memo, group, &recipe, local_cost)?;
+                if self
+                    .memo
+                    .group(group)
+                    .is_some_and(|group| group.logical_exprs().len() > 1)
+                {
+                    let logical_expression = self
                         .memo
                         .physical_expr(physical)
-                        .map(|physical| physical.key.implementation.0),
-                    local_expected_cost = local_cost.score.range.expected,
-                    local_risk_adjusted_cost = local_cost.score.risk_adjusted,
-                    child_expected_costs = ?child_costs
-                        .iter()
-                        .map(|cost| cost.score.range.expected)
-                        .collect::<Vec<_>>(),
-                    child_risk_adjusted_costs = ?child_costs
-                        .iter()
-                        .map(|cost| cost.score.risk_adjusted)
-                        .collect::<Vec<_>>(),
-                    source_filter_apply_risk_adjusted_cost = recipe
-                        .source_filter_apply_cost
-                        .map(|cost| cost.score.risk_adjusted),
-                    composition = ?recipe.cost_composition,
-                    expected_cost = cost.score.range.expected,
-                    risk_adjusted_cost = cost.score.risk_adjusted,
-                    upper_cost = cost.score.range.upper,
-                    "costed an equivalent physical candidate"
-                );
+                        .map(|physical| physical.key.logical);
+                    let origin_rule = logical_expression.and_then(|logical| {
+                        self.memo.logical_expr(logical).and_then(|logical| {
+                            logical.proofs.iter().find_map(|proof| match proof {
+                                EquivalenceProof::Transformation { rule, .. }
+                                | EquivalenceProof::SpecializedEnumerator { rule, .. } => {
+                                    Some(rule.0)
+                                }
+                                EquivalenceProof::Initial
+                                | EquivalenceProof::Normalization { .. } => None,
+                            })
+                        })
+                    });
+                    tracing::debug!(
+                        target: "paro::optimizer",
+                        memo_group = group.index(),
+                        logical_expression = logical_expression.map(LogicalExprId::index),
+                        origin_rule,
+                        physical_expression = physical.index(),
+                        child_groups = ?recipe
+                            .child_goals
+                            .iter()
+                            .map(|(child, _)| child.index())
+                            .collect::<Vec<_>>(),
+                        implementation = self
+                            .memo
+                            .physical_expr(physical)
+                            .map(|physical| physical.key.implementation.0),
+                        local_expected_cost = local_cost.score.range.expected,
+                        local_risk_adjusted_cost = local_cost.score.risk_adjusted,
+                        child_expected_costs = ?child_costs
+                            .iter()
+                            .map(|cost| cost.score.range.expected)
+                            .collect::<Vec<_>>(),
+                        child_risk_adjusted_costs = ?child_costs
+                            .iter()
+                            .map(|cost| cost.score.risk_adjusted)
+                            .collect::<Vec<_>>(),
+                        source_filter_apply_risk_adjusted_cost = recipe
+                            .source_filter_apply_cost
+                            .map(|cost| cost.score.risk_adjusted),
+                        composition = ?recipe.cost_composition,
+                        expected_cost = cost.score.range.expected,
+                        risk_adjusted_cost = cost.score.risk_adjusted,
+                        upper_cost = cost.score.range.upper,
+                        "costed an equivalent physical candidate"
+                    );
+                }
+                self.memo.record_winner(
+                    group,
+                    goal,
+                    Winner {
+                        expression: physical,
+                        children: recipe
+                            .child_goals
+                            .iter()
+                            .copied()
+                            .zip(child_winners.iter())
+                            .map(|((child, child_goal), winner)| ChildWinnerRef {
+                                group: child,
+                                goal: child_goal,
+                                expression: winner.expression,
+                                physical_fingerprint: winner.physical_fingerprint,
+                            })
+                            .collect::<Vec<_>>()
+                            .into_boxed_slice(),
+                        enforcers: enforced.steps,
+                        enforcer_cost_input: recipe.enforcer_cost_input,
+                        provided: enforced.provided,
+                        local_cost,
+                        source_filter_apply_cost: recipe.source_filter_apply_cost,
+                        cost_composition: recipe.cost_composition.clone(),
+                        cost,
+                        source_work,
+                        physical_fingerprint: fingerprint,
+                        joint_cost_proof,
+                    },
+                )?;
             }
-            self.memo.record_winner(
-                group,
-                goal,
-                Winner {
-                    expression: physical,
-                    child_goals: recipe.child_goals.clone(),
-                    enforcers: enforced.steps,
-                    enforcer_cost_input: recipe.enforcer_cost_input,
-                    provided: enforced.provided,
-                    local_cost,
-                    source_filter_apply_cost: recipe.source_filter_apply_cost,
-                    cost_composition: recipe.cost_composition.clone(),
-                    cost,
-                    source_work,
-                    physical_fingerprint: fingerprint,
-                    joint_cost_proof,
-                },
-            )?;
         }
         Ok(())
     }
@@ -1467,6 +1537,49 @@ pub(crate) struct ComposedCost {
     pub(crate) source_work: Box<[SourceWork]>,
 }
 
+fn child_winner_combinations(frontiers: &[Vec<Winner>], limit: usize) -> Vec<Vec<Winner>> {
+    let limit = limit.max(1);
+    let mut combinations = vec![Vec::new()];
+    for frontier in frontiers {
+        let mut next =
+            Vec::with_capacity(combinations.len().saturating_mul(frontier.len()).min(limit));
+        'product: for prefix in combinations {
+            for winner in frontier {
+                if next.len() == limit {
+                    break 'product;
+                }
+                let mut combination = prefix.clone();
+                combination.push(winner.clone());
+                next.push(combination);
+            }
+        }
+        combinations = next;
+    }
+    combinations
+}
+
+fn child_frontier_combination_event(
+    physical: PhysicalExprId,
+    goal: OptimizationGoal,
+    recipe: Fingerprint,
+    children: &[Winner],
+) -> Fingerprint {
+    let mut event = StableFingerprintBuilder::default();
+    event.write_bytes(b"paro.memo.child-frontier-combination.v1");
+    event.write_u64(physical.0 as u64);
+    event.write_u64(goal.required.0 as u64);
+    event.write_u64(goal.row_goal.stable_tag());
+    event.write_u64(goal.objective.stable_tag());
+    event.write_u64(goal.grant.stable_tag());
+    event.write_u64(goal.context.0 as u64);
+    event.write_fingerprint(recipe);
+    for child in children {
+        event.write_u64(child.expression.0 as u64);
+        event.write_fingerprint(child.physical_fingerprint);
+    }
+    event.finish()
+}
+
 pub(crate) fn compose_candidate_cost_with_sources(
     local_cost: SearchCost,
     source_filter_apply_cost: Option<SearchCost>,
@@ -1498,7 +1611,9 @@ pub(crate) fn compose_candidate_cost_with_sources(
             cost,
             source_work: Box::new([SourceWork {
                 source: *source,
+                base_cost: local_cost.work_only(),
                 cost: local_cost.work_only(),
+                retentions: Box::new([]),
                 filters: Box::new([]),
                 filter_apply_cost: SearchCost::ZERO,
             }]),
@@ -1571,12 +1686,21 @@ pub(crate) fn compose_candidate_cost_with_sources(
                             // Speculative filters retain the complete risk
                             // ceiling. Exact membership over a declared-unique
                             // probe carries a proof-backed smaller ceiling.
-                            let retained = lane.cost.retain_work(
-                                source.expected_retained_ppm,
-                                source.upper_retained_ppm,
-                            )?;
+                            let mut retentions = lane.retentions.to_vec();
+                            if !retentions
+                                .iter()
+                                .any(|retention| retention.proof == source.proof)
+                            {
+                                retentions.push(SourceRetentionProof {
+                                    proof: source.proof,
+                                    expected_retained_ppm: source.expected_retained_ppm,
+                                    upper_retained_ppm: source.upper_retained_ppm,
+                                });
+                            }
+                            let retained = retained_source_cost(lane.base_cost, &retentions)?;
                             child = child.replace_work(lane.cost, retained)?;
                             lane.cost = retained;
+                            lane.retentions = retentions.into_boxed_slice();
                             let old_apply_cost = lane.filter_apply_cost;
                             let mut filters = lane.filters.to_vec();
                             filters.push(SourceFilterWork {
@@ -1718,6 +1842,27 @@ fn ordered_source_filter_cost(filters: &[SourceFilterWork]) -> Result<SearchCost
         expected_prefix = multiply_ppm(expected_prefix, filter.expected_retained_ppm);
     }
     Ok(cost)
+}
+
+fn retained_source_cost(
+    base_cost: SearchCost,
+    retentions: &[SourceRetentionProof],
+) -> Result<SearchCost> {
+    const SCALE: u64 = 1_000_000;
+    let expected = retentions.iter().fold(SCALE as u32, |prefix, proof| {
+        ((u64::from(prefix) * u64::from(proof.expected_retained_ppm) + SCALE / 2) / SCALE) as u32
+    });
+    // Every upper bound is absolute in the immutable base-source domain. With
+    // unknown correlation, intersection cardinality is bounded by the
+    // smallest individual domain; multiplying those bounds would incorrectly
+    // assume conditional independence. Repeated proof identities were removed
+    // before this function is called, making the survivor contract idempotent.
+    let upper = retentions
+        .iter()
+        .map(|proof| proof.upper_retained_ppm)
+        .min()
+        .unwrap_or(SCALE as u32);
+    base_cost.retain_work(expected.min(upper), upper)
 }
 
 fn transformation_dependency_versions(

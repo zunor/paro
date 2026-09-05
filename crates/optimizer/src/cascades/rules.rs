@@ -240,6 +240,12 @@ impl<'a> TransformContext<'a> {
 pub trait TransformationRule: Send + Sync {
     fn id(&self) -> RuleId;
 
+    /// Allocation-free dispatch predicate over the immutable expression
+    /// shell. Implementations must not inspect child groups here: a false
+    /// result means descendant changes can never make this rule applicable,
+    /// so the scheduler deliberately records no dependency subscriptions.
+    fn matches_root(&self, expr: &LogicalExpr) -> bool;
+
     /// Maximum number of alternatives one firing may publish. Local rewrite
     /// rules keep the default of one. A bounded whole-region owner may expose
     /// a deterministic frontier, but the engine reserves every possible root
@@ -279,7 +285,20 @@ pub struct WorkSourceId(pub usize);
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct SidewaysFilterSource {
     pub source: WorkSourceId,
+    /// Identity of the exact domain proof. Replaying the same proof is
+    /// idempotent; different identities are conservatively correlated unless
+    /// a future joint-domain proof explicitly relates them.
+    pub proof: Fingerprint,
     pub expected_retained_ppm: u32,
+    pub upper_retained_ppm: u32,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SourceRetentionProof {
+    pub proof: Fingerprint,
+    pub expected_retained_ppm: u32,
+    /// Absolute survivor bound relative to the immutable base source, never a
+    /// conditional selectivity relative to the preceding filter.
     pub upper_retained_ppm: u32,
 }
 
@@ -297,8 +316,13 @@ pub struct SourceFilterWork {
 #[derive(Debug, Clone, PartialEq)]
 pub struct SourceWork {
     pub source: WorkSourceId,
+    /// Work of the unfiltered source. Every survivor proof is interpreted in
+    /// this immutable domain so correlated filters cannot multiply hard bounds.
+    pub base_cost: SearchCost,
     /// Base-source access work after every selected runtime filter.
     pub cost: SearchCost,
+    /// Unique survivor proofs already applied to the base domain.
+    pub retentions: Box<[SourceRetentionProof]>,
     /// Runtime predicates already attached to this source.
     pub filters: Box<[SourceFilterWork]>,
     /// Jointly ordered evaluation work currently present in the winner cost.
@@ -391,7 +415,7 @@ impl PhysicalCandidate {
         builder.write_fingerprint(self.physical_fingerprint);
         builder.write_u64(goal.required.0 as u64);
         builder.write_u64(goal.row_goal.stable_tag());
-        builder.write_u64(goal.objective.0 as u64);
+        builder.write_u64(goal.objective.stable_tag());
         builder.write_u64(goal.grant.stable_tag());
         builder.write_u64(goal.context.0 as u64);
         if let Some(region) = &self.region {

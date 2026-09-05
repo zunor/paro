@@ -6,7 +6,7 @@
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::sync::{Arc, RwLock};
 
-use crate::physical::{ResourceGrantClass, SpillPolicy};
+use crate::physical::{ObjectiveProfile, ResourceGrantClass, SpillPolicy};
 use paro_catalog::entry::CatalogEntry;
 use paro_common::error::{self as paro_error, Result};
 use paro_common::logging::targets;
@@ -54,14 +54,13 @@ use super::cost::{CompactRange, ScoreSummary, SearchCost};
 use super::engine::{CascadesEngine, SearchMode};
 use super::ids::{
     AdmissibleGrantSetId, BaseRelationId, ColumnId, Fingerprint, GroupId, ImplementationId,
-    LogicalExprId, LogicalPayloadId, ObjectiveProfileId, OpClassId, OptimizationContextId,
-    PhysicalPayloadId, PropertySetId, QualityPolicyId, RuleId, ScalarExprId, SnapshotId,
-    StableFingerprintBuilder,
+    LogicalExprId, LogicalPayloadId, OpClassId, OptimizationContextId, PhysicalPayloadId,
+    PropertySetId, QualityPolicyId, RuleId, ScalarExprId, SnapshotId, StableFingerprintBuilder,
 };
 use super::memo::{
-    CardinalityEnvelope, CardinalityRecipeKind, EquivalenceProof, GrantGoalKey, GroupCardinality,
-    LogicalExprKey, LogicalProperties, Memo, OptimizationContext, OptimizationGoal,
-    PhysicalExprKey, RowGoal,
+    CardinalityEnvelope, CardinalityRecipeKind, ChildWinnerRef, EquivalenceProof, GrantGoalKey,
+    GroupCardinality, LogicalExprKey, LogicalProperties, Memo, OptimizationContext,
+    OptimizationGoal, PhysicalExprKey, RowGoal,
 };
 use super::properties::{
     MutationSafetyRequirement, NullOrder, OrderingKey, OrderingRequirement, OrderingScope,
@@ -991,7 +990,7 @@ impl MemoBuilder {
         let root_goal = OptimizationGoal {
             required: root_required,
             row_goal: RowGoal::All,
-            objective: ObjectiveProfileId(0),
+            objective: ObjectiveProfile::Latency,
             grant: GrantGoalKey::Invariant(AdmissibleGrantSetId(0)),
             context: root_context,
         };

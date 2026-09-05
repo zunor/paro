@@ -15,6 +15,7 @@ pub enum BudgetDimension {
     InterestingGoalPerGroup,
     RuleFirePerGroup,
     RuleWorkPerGroup,
+    ChildFrontierCombination,
     JoinConnectedPair,
     GraphFrontier,
     FactorizationVariant,
@@ -36,6 +37,7 @@ impl BudgetDimension {
             Self::InterestingGoalPerGroup => "interesting_goal_per_group",
             Self::RuleFirePerGroup => "rule_fire_per_group",
             Self::RuleWorkPerGroup => "rule_work_per_group",
+            Self::ChildFrontierCombination => "child_frontier_combination",
             Self::JoinConnectedPair => "join_connected_pair",
             Self::GraphFrontier => "graph_frontier",
             Self::FactorizationVariant => "factorization_variant",
@@ -65,6 +67,9 @@ pub struct SearchBudget {
     /// materialization for one target group. This bounds legacy whole-region
     /// rules until each is expressed entirely as local Memo operands.
     pub max_rule_work_units_per_group: u32,
+    /// Additional child-frontier combinations costed for a group. The
+    /// selected-child baseline is mandatory and does not consume this credit.
+    pub max_child_frontier_combinations_per_group: u32,
     pub max_join_connected_pairs: u32,
     pub max_join_exact_relations: u16,
     pub join_beam_width: u16,
@@ -95,6 +100,7 @@ impl Default for SearchBudget {
             max_optional_interesting_goals_per_group: 16,
             max_rule_firings_per_group: 256,
             max_rule_work_units_per_group: 65_536,
+            max_child_frontier_combinations_per_group: 4_096,
             max_join_connected_pairs: 65_536,
             max_join_exact_relations: 12,
             join_beam_width: 64,
@@ -153,6 +159,9 @@ impl SearchBudget {
             }
             BudgetDimension::RuleFirePerGroup => self.max_rule_firings_per_group,
             BudgetDimension::RuleWorkPerGroup => self.max_rule_work_units_per_group,
+            BudgetDimension::ChildFrontierCombination => {
+                self.max_child_frontier_combinations_per_group
+            }
             BudgetDimension::JoinConnectedPair => self.max_join_connected_pairs,
             BudgetDimension::GraphFrontier => self.max_graph_frontiers,
             BudgetDimension::FactorizationVariant => self.max_factorization_variants as u32,

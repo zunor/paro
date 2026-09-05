@@ -186,6 +186,15 @@ impl TransformationRule for PlannerTransformationRule {
         }
     }
 
+    fn matches_root(&self, expr: &crate::cascades::memo::LogicalExpr) -> bool {
+        let state = self
+            .planner_state
+            .read()
+            .expect("planner transform state poisoned");
+        state.binder.is_some()
+            && matching::matches_transformation_root(self.transformation, expr, &state)
+    }
+
     fn promise(
         &self,
         _expr: &crate::cascades::memo::LogicalExpr,

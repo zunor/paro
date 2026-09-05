@@ -126,16 +126,13 @@ impl WinnerVerifier {
                             "winner enforcer replay does not satisfy its goal",
                         ));
                     }
-                    let mut child_costs = Vec::with_capacity(winner.child_goals.len());
-                    let mut child_source_work = Vec::with_capacity(winner.child_goals.len());
-                    for (child, child_goal) in &winner.child_goals {
-                        verify_optimization_context(memo, *child, child_goal.context)?;
-                        let Some(child_winner) = memo
-                            .group(*child)
-                            .and_then(|group| group.winner(*child_goal))
-                        else {
+                    let mut child_costs = Vec::with_capacity(winner.children.len());
+                    let mut child_source_work = Vec::with_capacity(winner.children.len());
+                    for child in &winner.children {
+                        verify_optimization_context(memo, child.group, child.goal.context)?;
+                        let Some(child_winner) = memo.resolve_child_winner(*child) else {
                             return Err(paro_error::internal(
-                                "winner child goal has no verified child winner",
+                                "winner has no verified exact child candidate",
                             ));
                         };
                         child_costs.push(child_winner.cost);
@@ -301,9 +298,9 @@ fn verify_joint_cost_proof(
         ));
     }
     let canonical_winner_boundary = winner
-        .child_goals
+        .children
         .iter()
-        .map(|(child, goal)| (memo.canonical_group(*child), *goal))
+        .map(|child| (memo.canonical_group(child.group), child.goal))
         .collect::<Vec<_>>();
     if proof.boundary_goals.as_ref() != canonical_winner_boundary.as_slice()
         || proof
@@ -394,14 +391,14 @@ fn verify_joint_cost_proof(
         ));
     }
     let owns_runtime_filter = !runtime_filter_artifacts.is_empty();
-    if physical.key.children.len() != winner.child_goals.len()
+    if physical.key.children.len() != winner.children.len()
         || physical
             .key
             .children
             .iter()
-            .zip(winner.child_goals.iter())
-            .any(|(physical_child, (goal_child, _))| {
-                memo.canonical_group(*physical_child) != memo.canonical_group(*goal_child)
+            .zip(winner.children.iter())
+            .any(|(physical_child, child)| {
+                memo.canonical_group(*physical_child) != memo.canonical_group(child.group)
             })
     {
         return Err(paro_error::internal(
@@ -449,9 +446,9 @@ fn verify_joint_cost_proof(
         // in an equivalent inline sibling, so GroupId alone cannot establish
         // whether the selected inputs cross a required region boundary.
         if winner
-            .child_goals
+            .children
             .iter()
-            .any(|(_, child_goal)| child_goal.context != owner_goal.context)
+            .any(|child| child.goal.context != owner_goal.context)
         {
             return Err(paro_error::internal(
                 "runtime-filter candidate crosses a required planning-region boundary",
@@ -468,10 +465,10 @@ fn verify_joint_cost_proof(
         ));
     }
     let mut expected_dependencies = winner
-        .child_goals
+        .children
         .iter()
-        .map(|(child, _)| RegionDependencyEdge {
-            producer: memo.canonical_group(*child),
+        .map(|child| RegionDependencyEdge {
+            producer: memo.canonical_group(child.group),
             consumer: owner_group,
             kind: RegionDependencyKind::Data,
         })
@@ -627,7 +624,7 @@ mod tests {
     use crate::cascades::column::{ColumnDesc, ColumnOrigin, ColumnVisibility, GroupSchema};
     use crate::cascades::cost::{CompactRange, SearchCost};
     use crate::cascades::ids::{
-        AdmissibleGrantSetId, ColumnId, LogicalPayloadId, ObjectiveProfileId, PhysicalPayloadId,
+        AdmissibleGrantSetId, ColumnId, LogicalPayloadId, PhysicalExprId, PhysicalPayloadId,
     };
     use crate::cascades::memo::{
         GrantGoalKey, GroupCardinality, LogicalExprKey, LogicalProperties, PhysicalExprKey,
@@ -642,6 +639,7 @@ mod tests {
         RegionArtifactDependencyContract, RegionForest, RegionOwnedArtifact,
     };
     use crate::cascades::rules::CostComposition;
+    use crate::physical::ObjectiveProfile;
 
     fn schema(column: u32) -> GroupSchema {
         GroupSchema::new([ColumnDesc {
@@ -739,7 +737,7 @@ mod tests {
         let goal = crate::cascades::memo::OptimizationGoal {
             required,
             row_goal: RowGoal::All,
-            objective: ObjectiveProfileId(0),
+            objective: ObjectiveProfile::Latency,
             grant: GrantGoalKey::Invariant(AdmissibleGrantSetId(0)),
             context: OptimizationContextId(0),
         };
@@ -764,7 +762,16 @@ mod tests {
         dependencies.sort_unstable();
         let winner = Winner {
             expression: physical,
-            child_goals: child_goals.clone(),
+            children: child_goals
+                .iter()
+                .map(|(group, goal)| crate::cascades::memo::ChildWinnerRef {
+                    group: *group,
+                    goal: *goal,
+                    expression: PhysicalExprId::new(0),
+                    physical_fingerprint: Fingerprint::default(),
+                })
+                .collect::<Vec<_>>()
+                .into_boxed_slice(),
             enforcers: Box::new([]),
             enforcer_cost_input: crate::cascades::engine::EnforcerCostInput::unbounded(
                 CompactRange::point(1.0).unwrap(),
@@ -934,7 +941,7 @@ mod tests {
         let goal = crate::cascades::memo::OptimizationGoal {
             required,
             row_goal: RowGoal::All,
-            objective: ObjectiveProfileId(0),
+            objective: ObjectiveProfile::Latency,
             grant: GrantGoalKey::Invariant(AdmissibleGrantSetId(0)),
             context: OptimizationContextId(0),
         };
@@ -959,7 +966,16 @@ mod tests {
         dependencies.sort_unstable();
         let winner = Winner {
             expression: physical,
-            child_goals: child_goals.clone(),
+            children: child_goals
+                .iter()
+                .map(|(group, goal)| crate::cascades::memo::ChildWinnerRef {
+                    group: *group,
+                    goal: *goal,
+                    expression: PhysicalExprId::new(0),
+                    physical_fingerprint: Fingerprint::default(),
+                })
+                .collect::<Vec<_>>()
+                .into_boxed_slice(),
             enforcers: Box::new([]),
             enforcer_cost_input: crate::cascades::engine::EnforcerCostInput::unbounded(
                 CompactRange::point(1.0).unwrap(),

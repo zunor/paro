@@ -219,6 +219,7 @@ impl PhysicalImplementation for PlannerBaselineImplementation {
             );
             return Ok(Box::new([]));
         };
+        let physical_fingerprint = fingerprint.finish();
         Ok(vec![PhysicalCandidate {
             key: PhysicalExprKey {
                 implementation: self.id(),
@@ -236,6 +237,7 @@ impl PhysicalImplementation for PlannerBaselineImplementation {
                 metadata.implementations.baseline,
                 &cost_facts,
                 max_concurrent_tasks,
+                physical_fingerprint,
             )?,
             spillable,
             enforcer_cost_input: planner_enforcer_cost_input(
@@ -243,7 +245,7 @@ impl PhysicalImplementation for PlannerBaselineImplementation {
                 goal.grant,
                 &self.grant_classes,
             )?,
-            physical_fingerprint: fingerprint.finish(),
+            physical_fingerprint,
             region: planner_region_contract(ctx.memo, metadata.required_region_facet)?,
             mandatory: true,
         }]
@@ -324,9 +326,12 @@ impl PhysicalImplementation for AlternativeImplementation {
             return Ok(Box::new([]));
         }
         let children = logical.key.children.clone();
-        if self.flavor == PhysicalImplementationFlavor::HashJoinRuntimeFilter
-            && children.len().saturating_add(1)
-                > usize::from(ctx.memo.budget().max_composite_region_groups)
+        if matches!(
+            self.flavor,
+            PhysicalImplementationFlavor::HashJoinRuntimeFilter
+                | PhysicalImplementationFlavor::HashJoinBuildLeftRuntimeFilter
+        ) && children.len().saturating_add(1)
+            > usize::from(ctx.memo.budget().max_composite_region_groups)
         {
             return Ok(Box::new([]));
         }
@@ -385,8 +390,14 @@ impl PhysicalImplementation for AlternativeImplementation {
         else {
             return Ok(Box::new([]));
         };
-        let cost_composition =
-            planner_cost_composition(metadata, self.flavor, &cost_facts, max_concurrent_tasks)?;
+        let physical_fingerprint = fingerprint.finish();
+        let cost_composition = planner_cost_composition(
+            metadata,
+            self.flavor,
+            &cost_facts,
+            max_concurrent_tasks,
+            physical_fingerprint,
+        )?;
         Ok(vec![PhysicalCandidate {
             key: PhysicalExprKey {
                 implementation: self.id,
@@ -406,7 +417,7 @@ impl PhysicalImplementation for AlternativeImplementation {
                 goal.grant,
                 &self.grant_classes,
             )?,
-            physical_fingerprint: fingerprint.finish(),
+            physical_fingerprint,
             region: if let Some((producer, consumer)) = runtime_filter_dependency_boundary(self.id)
             {
                 Some(planner_runtime_filter_region_contract(

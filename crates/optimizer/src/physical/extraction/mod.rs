@@ -621,6 +621,7 @@ impl PhysicalPlanExtractor {
                 range,
                 risk_adjusted: expected,
             },
+            work_latency: range,
             critical_path: range,
             ..SearchCost::ZERO
         };

@@ -49,7 +49,6 @@ id_type!(LogicalPayloadId);
 id_type!(PhysicalPayloadId);
 id_type!(PropertySetId);
 id_type!(OptimizationContextId);
-id_type!(ObjectiveProfileId);
 id_type!(ResourceGrantClassId);
 id_type!(AdmissibleGrantSetId);
 id_type!(RuleId);

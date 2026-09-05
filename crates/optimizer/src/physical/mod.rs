@@ -15,6 +15,7 @@ pub mod identity;
 pub mod ids;
 pub mod lineage;
 pub mod node;
+pub mod objective;
 pub mod plan;
 pub mod portfolio;
 pub mod properties;
@@ -31,6 +32,7 @@ pub use edges::{PhysicalEdge, PhysicalEdgeArena, PhysicalEdgeId, PhysicalEdgeKin
 pub use identity::*;
 pub use ids::{PhysicalPlanNodeId, PlanChildrenId};
 pub use node::{OperatorLabel, PhysicalPlanNode};
+pub use objective::ObjectiveProfile;
 pub use plan::{PhysicalPlan, PhysicalPlanNodeArena};
 pub use portfolio::*;
 pub use properties::*;

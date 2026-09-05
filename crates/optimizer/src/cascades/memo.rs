@@ -14,12 +14,13 @@ use super::cost::SearchCost;
 use super::enforcer::{replay_enforcer_chain, EnforcerStep};
 use super::ids::{
     AdmissibleGrantSetId, Fingerprint, GroupId, ImplementationId, LogicalExprId, LogicalPayloadId,
-    ObjectiveProfileId, OptimizationContextId, PhysicalExprId, PhysicalPayloadId, PropertySetId,
-    ResourceGrantClassId, RuleId, StableFingerprintBuilder,
+    OptimizationContextId, PhysicalExprId, PhysicalPayloadId, PropertySetId, ResourceGrantClassId,
+    RuleId, StableFingerprintBuilder,
 };
 use super::properties::{PropertyInterner, ProvidedProperties, RequiredProperties};
 use super::region::{JointCostProof, RegionFacet, RegionForest};
 use super::rules::CostComposition;
+use crate::physical::ObjectiveProfile;
 use std::sync::Arc;
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -319,7 +320,7 @@ impl GrantGoalKey {
 pub struct OptimizationGoal {
     pub required: PropertySetId,
     pub row_goal: RowGoal,
-    pub objective: ObjectiveProfileId,
+    pub objective: ObjectiveProfile,
     pub grant: GrantGoalKey,
     pub context: OptimizationContextId,
 }
@@ -351,10 +352,21 @@ impl OptimizationContext {
     }
 }
 
+/// Stable reference to the exact child candidate used to cost a parent.
+/// Group/goal alone is insufficient because a parent-side source filter can
+/// make a non-selected child frontier member globally optimal.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ChildWinnerRef {
+    pub group: GroupId,
+    pub goal: OptimizationGoal,
+    pub expression: PhysicalExprId,
+    pub physical_fingerprint: Fingerprint,
+}
+
 #[derive(Debug, Clone)]
 pub struct Winner {
     pub expression: PhysicalExprId,
-    pub child_goals: Box<[(GroupId, OptimizationGoal)]>,
+    pub children: Box<[ChildWinnerRef]>,
     pub enforcers: Box<[EnforcerStep]>,
     pub enforcer_cost_input: super::engine::EnforcerCostInput,
     pub provided: ProvidedProperties,
@@ -405,16 +417,18 @@ impl WinnerFrontier {
         let old_selected = self.selected().map(|entry| entry.physical_fingerprint);
 
         if self.candidates.iter().any(|incumbent| {
-            incumbent.cost.dominates(&winner.cost)
+            winner_dominates(incumbent, &winner)
                 || (costs_equal(&incumbent.cost, &winner.cost)
+                    && incumbent.source_work == winner.source_work
                     && winner_tie_break(incumbent) <= winner_tie_break(&winner))
         }) {
             return false;
         }
 
         self.candidates.retain(|incumbent| {
-            !(winner.cost.dominates(&incumbent.cost)
+            !(winner_dominates(&winner, incumbent)
                 || costs_equal(&winner.cost, &incumbent.cost)
+                    && winner.source_work == incumbent.source_work
                     && winner_tie_break(&winner) < winner_tie_break(incumbent))
         });
         self.candidates.push(winner);
@@ -428,6 +442,15 @@ impl WinnerFrontier {
     }
 }
 
+fn winner_dominates(left: &Winner, right: &Winner) -> bool {
+    // Until source demand is part of the OptimizationContext, only prune two
+    // candidates when every parent-visible source response is identical.
+    // This is deliberately stricter than ordinary cost dominance: otherwise a
+    // parent filter can reverse the local ordering by removing work attributed
+    // to one source but not independent work in the competing candidate.
+    left.source_work == right.source_work && left.cost.dominates(&right.cost)
+}
+
 fn winner_tie_break(winner: &Winner) -> (PhysicalExprId, Fingerprint) {
     (winner.expression, winner.physical_fingerprint)
 }
@@ -439,106 +462,9 @@ fn costs_equal(left: &SearchCost, right: &SearchCost) -> bool {
 fn compare_objective(
     left: &Winner,
     right: &Winner,
-    objective: ObjectiveProfileId,
+    objective: ObjectiveProfile,
 ) -> std::cmp::Ordering {
-    // Objective IDs are registry identities. The built-in profiles reserve
-    // 0=latency, 1=throughput, 2=memory, 3=robustness. Feasibility and memory
-    // completion are compared before every soft objective. Latency ranks
-    // expected work before its critical path: bounded worker pools cannot turn
-    // avoidable work into free parallelism. Uncertainty remains a deterministic
-    // tie-break and is the primary quantity for robustness. Unknown extension
-    // profiles fail closed to conservative risk ordering until their registry
-    // owns the comparison contract.
-    left.cost
-        .memory_completion
-        .preference_cmp(right.cost.memory_completion)
-        .then_with(|| match objective.0 {
-            1 => left.cost.resources_expected[0]
-                .total_cmp(&right.cost.resources_expected[0])
-                .then_with(|| {
-                    left.cost
-                        .score
-                        .risk_adjusted
-                        .total_cmp(&right.cost.score.risk_adjusted)
-                })
-                .then_with(|| {
-                    left.cost
-                        .peak_memory_upper
-                        .cmp(&right.cost.peak_memory_upper)
-                }),
-            2 => left
-                .cost
-                .peak_memory_upper
-                .cmp(&right.cost.peak_memory_upper)
-                .then_with(|| {
-                    left.cost
-                        .score
-                        .risk_adjusted
-                        .total_cmp(&right.cost.score.risk_adjusted)
-                })
-                .then_with(|| {
-                    left.cost
-                        .spill_bytes_expected
-                        .cmp(&right.cost.spill_bytes_expected)
-                }),
-            3 => left
-                .cost
-                .score
-                .range
-                .upper
-                .total_cmp(&right.cost.score.range.upper)
-                .then_with(|| {
-                    left.cost
-                        .score
-                        .risk_adjusted
-                        .total_cmp(&right.cost.score.risk_adjusted)
-                })
-                .then_with(|| {
-                    left.cost
-                        .peak_memory_upper
-                        .cmp(&right.cost.peak_memory_upper)
-                }),
-            0 => left
-                .cost
-                .score
-                .range
-                .expected
-                .total_cmp(&right.cost.score.range.expected)
-                .then_with(|| {
-                    left.cost
-                        .critical_path
-                        .expected
-                        .total_cmp(&right.cost.critical_path.expected)
-                })
-                .then_with(|| {
-                    left.cost
-                        .score
-                        .risk_adjusted
-                        .total_cmp(&right.cost.score.risk_adjusted)
-                })
-                .then_with(|| {
-                    left.cost
-                        .peak_memory_upper
-                        .cmp(&right.cost.peak_memory_upper)
-                }),
-            _ => left
-                .cost
-                .score
-                .risk_adjusted
-                .total_cmp(&right.cost.score.risk_adjusted)
-                .then_with(|| {
-                    left.cost
-                        .score
-                        .range
-                        .upper
-                        .total_cmp(&right.cost.score.range.upper)
-                })
-                .then_with(|| {
-                    left.cost
-                        .peak_memory_upper
-                        .cmp(&right.cost.peak_memory_upper)
-                }),
-        })
+    objective.compare(&left.cost, &right.cost)
 }
 
 #[derive(Debug)]
@@ -1154,13 +1080,10 @@ impl Memo {
                 "winner provided properties disagree with the recomputed enforcer chain",
             ));
         }
-        for (child, child_goal) in winner.child_goals.iter() {
-            let Some(child_winner) = self
-                .group(*child)
-                .and_then(|group| group.winner(*child_goal))
-            else {
+        for child in winner.children.iter() {
+            let Some(child_winner) = self.resolve_child_winner(*child) else {
                 return Err(paro_error::internal(
-                    "winner contains an unresolved or invalid child goal",
+                    "winner contains an unresolved or stale child candidate",
                 ));
             };
             child_winner.cost.validate()?;
@@ -1185,6 +1108,18 @@ impl Memo {
                 Ok(entry.get_mut().insert(goal, winner))
             }
         }
+    }
+
+    pub fn resolve_child_winner(&self, child: ChildWinnerRef) -> Option<&Winner> {
+        let group = self.group(self.canonical_group(child.group))?;
+        group
+            .winner_frontier(child.goal)?
+            .candidates()
+            .iter()
+            .find(|winner| {
+                winner.expression == child.expression
+                    && winner.physical_fingerprint == child.physical_fingerprint
+            })
     }
 
     pub fn merge_groups(&mut self, left: GroupId, right: GroupId) -> Result<GroupId> {
@@ -1308,13 +1243,12 @@ impl Memo {
 }
 
 fn recompute_winner_cost(memo: &Memo, winner: &Winner) -> Result<super::engine::ComposedCost> {
-    let mut child_costs = Vec::with_capacity(winner.child_goals.len());
-    let mut child_source_work = Vec::with_capacity(winner.child_goals.len());
-    for (child, child_goal) in winner.child_goals.iter().copied() {
-        let child_winner = memo
-            .group(child)
-            .and_then(|group| group.winner(child_goal))
-            .ok_or_else(|| paro_error::internal("winner cost replay lost a child winner"))?;
+    let mut child_costs = Vec::with_capacity(winner.children.len());
+    let mut child_source_work = Vec::with_capacity(winner.children.len());
+    for child in winner.children.iter().copied() {
+        let child_winner = memo.resolve_child_winner(child).ok_or_else(|| {
+            paro_error::internal("winner cost replay lost its exact child candidate")
+        })?;
         child_costs.push(child_winner.cost);
         child_source_work.push(child_winner.source_work.as_ref());
     }

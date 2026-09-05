@@ -50,22 +50,38 @@ pub(super) fn extract_planner_tree(
 
     #[derive(Debug)]
     enum Task {
-        Visit(GroupId, OptimizationGoal),
+        Visit {
+            group: GroupId,
+            goal: OptimizationGoal,
+            candidate: Option<ChildWinnerRef>,
+        },
         Build(Box<BuildTask>),
     }
 
-    let mut tasks = vec![Task::Visit(root, goal)];
+    let mut tasks = vec![Task::Visit {
+        group: root,
+        goal,
+        candidate: None,
+    }];
     let mut plans = Vec::new();
     let mut contracts = std::collections::HashMap::new();
     let mut extracted_enforcers = std::collections::HashMap::new();
     let mut root_output_columns = None;
     while let Some(task) = tasks.pop() {
         match task {
-            Task::Visit(group, goal) => {
-                let winner = memo
-                    .group(group)
-                    .and_then(|group| group.winner(goal))
-                    .ok_or_else(|| paro_error::internal("extraction found no group winner"))?;
+            Task::Visit {
+                group,
+                goal,
+                candidate,
+            } => {
+                let winner = candidate
+                    .map_or_else(
+                        || memo.group(group).and_then(|group| group.winner(goal)),
+                        |candidate| memo.resolve_child_winner(candidate),
+                    )
+                    .ok_or_else(|| {
+                        paro_error::internal("extraction found no exact group winner")
+                    })?;
                 let physical = memo.physical_expr(winner.expression).ok_or_else(|| {
                     paro_error::internal("winner physical expression disappeared")
                 })?;
@@ -138,15 +154,12 @@ pub(super) fn extract_planner_tree(
                     }
                 };
                 let (region_owner, owned_artifacts) = extracted_region_ownership(memo, winner)?;
-                let mut child_costs = Vec::with_capacity(winner.child_goals.len());
-                let mut child_source_work = Vec::with_capacity(winner.child_goals.len());
-                for (child, child_goal) in &winner.child_goals {
-                    let child_winner = memo
-                        .group(*child)
-                        .and_then(|group| group.winner(*child_goal))
-                        .ok_or_else(|| {
-                            paro_error::internal("winner extraction lost a child winner")
-                        })?;
+                let mut child_costs = Vec::with_capacity(winner.children.len());
+                let mut child_source_work = Vec::with_capacity(winner.children.len());
+                for child in &winner.children {
+                    let child_winner = memo.resolve_child_winner(*child).ok_or_else(|| {
+                        paro_error::internal("winner extraction lost its exact child candidate")
+                    })?;
                     child_costs.push(child_winner.cost);
                     child_source_work.push(child_winner.source_work.as_ref());
                 }
@@ -193,7 +206,7 @@ pub(super) fn extract_planner_tree(
                 };
                 tasks.push(Task::Build(Box::new(BuildTask {
                     payload: physical.payload,
-                    child_count: winner.child_goals.len(),
+                    child_count: winner.children.len(),
                     output_columns: operator_metadata.output_columns.clone(),
                     enforcers: winner.enforcers.clone(),
                     enforcer_cost_input: winner.enforcer_cost_input,
@@ -207,8 +220,12 @@ pub(super) fn extract_planner_tree(
                         },
                     ),
                 })));
-                for (child, child_goal) in winner.child_goals.iter().rev() {
-                    tasks.push(Task::Visit(*child, *child_goal));
+                for child in winner.children.iter().rev() {
+                    tasks.push(Task::Visit {
+                        group: child.group,
+                        goal: child.goal,
+                        candidate: Some(*child),
+                    });
                 }
             }
             Task::Build(task) => {

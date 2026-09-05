@@ -4,8 +4,10 @@
 //! Immutable physical-value sets for fixed-width storage predicates.
 //!
 //! Dense domains use a bitset and sparse domains use sorted values. The
-//! representation is reference counted because runtime predicates are cloned
-//! into independent segment readers after a join build completes.
+//! frozen domain is reference counted because runtime predicates are cloned
+//! into independent segment readers after a join build completes. The Arc owns
+//! the Vec headers rather than separately reference-counting each slice: freeze
+//! can therefore transfer every large backing allocation without copying it.
 
 use std::sync::Arc;
 
@@ -97,20 +99,20 @@ impl FixedMembershipValue for i128 {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum FixedMembershipRepresentation<T> {
-    Sorted(Arc<[T]>),
+    Sorted(Vec<T>),
     DenseBits {
         base: T,
         span: usize,
         /// Canonical storage is retained because range and enumeration
         /// consumers need logarithmic/linear-in-N access, independently of
         /// the point-lookup accelerator's domain span.
-        ordered: Arc<[T]>,
-        bits: Arc<[u64]>,
+        ordered: Vec<T>,
+        bits: Vec<u64>,
     },
     DenseBytes {
         base: T,
-        ordered: Arc<[T]>,
-        present: Arc<[u8]>,
+        ordered: Vec<T>,
+        present: Vec<u8>,
     },
 }
 
@@ -137,7 +139,7 @@ const MAX_BYTE_LOOKUP_DOMAIN: usize = 32 * 1024;
 /// Immutable membership set for one physical integer width.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct FixedMembershipSet<T> {
-    representation: FixedMembershipRepresentation<T>,
+    representation: Arc<FixedMembershipRepresentation<T>>,
 }
 
 impl<T: FixedMembershipValue> FixedMembershipSet<T> {
@@ -151,7 +153,7 @@ impl<T: FixedMembershipValue> FixedMembershipSet<T> {
     ) -> Self {
         if values.is_empty() {
             return Self {
-                representation: FixedMembershipRepresentation::Sorted(Arc::from([])),
+                representation: Arc::new(FixedMembershipRepresentation::Sorted(Vec::new())),
             };
         }
 
@@ -173,11 +175,11 @@ impl<T: FixedMembershipValue> FixedMembershipSet<T> {
                     present[offset] = 1;
                 }
                 return Self {
-                    representation: FixedMembershipRepresentation::DenseBytes {
+                    representation: Arc::new(FixedMembershipRepresentation::DenseBytes {
                         base: min,
-                        ordered: values.into(),
-                        present: present.into(),
-                    },
+                        ordered: values,
+                        present,
+                    }),
                 };
             }
             let mut bits = vec![0_u64; span.div_ceil(u64::BITS as usize)];
@@ -190,23 +192,23 @@ impl<T: FixedMembershipValue> FixedMembershipSet<T> {
                 *word |= mask;
             }
             return Self {
-                representation: FixedMembershipRepresentation::DenseBits {
+                representation: Arc::new(FixedMembershipRepresentation::DenseBits {
                     base: min,
                     span,
-                    ordered: values.into(),
-                    bits: bits.into(),
-                },
+                    ordered: values,
+                    bits,
+                }),
             };
         }
 
         Self {
-            representation: FixedMembershipRepresentation::Sorted(values.into()),
+            representation: Arc::new(FixedMembershipRepresentation::Sorted(values)),
         }
     }
 
     #[inline]
     pub(crate) fn contains(&self, value: T) -> bool {
-        match &self.representation {
+        match self.representation.as_ref() {
             FixedMembershipRepresentation::Sorted(values) => values.binary_search(&value).is_ok(),
             FixedMembershipRepresentation::DenseBits {
                 base, span, bits, ..
@@ -224,7 +226,7 @@ impl<T: FixedMembershipValue> FixedMembershipSet<T> {
     }
 
     pub(crate) fn view(&self) -> FixedMembershipView<'_, T> {
-        match &self.representation {
+        match self.representation.as_ref() {
             FixedMembershipRepresentation::Sorted(values) => FixedMembershipView::Sorted(values),
             FixedMembershipRepresentation::DenseBits {
                 base, span, bits, ..
@@ -251,21 +253,28 @@ impl<T: FixedMembershipValue> FixedMembershipSet<T> {
     }
 
     fn allocation_size(&self) -> usize {
-        match &self.representation {
+        let payload = match self.representation.as_ref() {
             FixedMembershipRepresentation::Sorted(values) => {
-                values.len().saturating_mul(std::mem::size_of::<T>())
+                values.capacity().saturating_mul(std::mem::size_of::<T>())
             }
             FixedMembershipRepresentation::DenseBits { ordered, bits, .. } => ordered
-                .len()
+                .capacity()
                 .saturating_mul(std::mem::size_of::<T>())
-                .saturating_add(bits.len().saturating_mul(std::mem::size_of::<u64>())),
+                .saturating_add(bits.capacity().saturating_mul(std::mem::size_of::<u64>())),
             FixedMembershipRepresentation::DenseBytes {
                 ordered, present, ..
             } => ordered
-                .len()
+                .capacity()
                 .saturating_mul(std::mem::size_of::<T>())
-                .saturating_add(present.len()),
-        }
+                .saturating_add(present.capacity()),
+        };
+        // Count the Arc allocation as retained state as well as the moved Vec
+        // backings. Two reference counters precede the payload in Arc's heap
+        // allocation; allocator padding can only make this conservative for
+        // the memory accounting callers that consume this value.
+        payload
+            .saturating_add(std::mem::size_of::<FixedMembershipRepresentation<T>>())
+            .saturating_add(2 * std::mem::size_of::<usize>())
     }
 
     pub(crate) fn is_contiguous(&self) -> bool {
@@ -306,7 +315,7 @@ impl<T: FixedMembershipValue> FixedMembershipSet<T> {
     }
 
     fn canonical_values(&self) -> &[T] {
-        match &self.representation {
+        match self.representation.as_ref() {
             FixedMembershipRepresentation::Sorted(values)
             | FixedMembershipRepresentation::DenseBits {
                 ordered: values, ..
@@ -540,11 +549,11 @@ mod tests {
         );
 
         assert!(matches!(
-            conservative.representation,
+            conservative.representation.as_ref(),
             FixedMembershipRepresentation::Sorted(_)
         ));
         assert!(matches!(
-            analytical.representation,
+            analytical.representation.as_ref(),
             FixedMembershipRepresentation::DenseBytes { .. }
         ));
         assert_eq!(analytical.first_at_or_after(-1), Some(0));
@@ -561,7 +570,7 @@ mod tests {
             FixedMembershipBuildPolicy::new(262_144, 16_384),
         );
         assert!(matches!(
-            dense_bits.representation,
+            dense_bits.representation.as_ref(),
             FixedMembershipRepresentation::DenseBits { .. }
         ));
         assert_eq!(dense_bits.first_at_or_after(65_537), Some(131_072));
@@ -575,13 +584,33 @@ mod tests {
             FixedMembershipBuildPolicy::new(67_108_864, 2_000_000),
         );
 
-        let FixedMembershipRepresentation::DenseBits { ordered, bits, .. } = &values.representation
+        let FixedMembershipRepresentation::DenseBits { ordered, bits, .. } =
+            values.representation.as_ref()
         else {
             panic!("expected point-lookup accelerator");
         };
-        assert_eq!(ordered.as_ref(), &[0, 33_554_432, 67_108_863]);
+        assert_eq!(ordered.as_slice(), &[0, 33_554_432, 67_108_863]);
         assert_eq!(bits.len(), 67_108_864 / u64::BITS as usize);
         assert_eq!(values.first_at_or_after(1), Some(33_554_432));
         assert_eq!(values.first_at_or_after(33_554_433), Some(67_108_863));
+    }
+
+    #[test]
+    fn freeze_transfers_the_canonical_backing_allocation() {
+        let input = (0_i32..524_288).collect::<Vec<_>>();
+        let input_pointer = input.as_ptr();
+        let input_capacity = input.capacity();
+
+        let values = FixedMembershipSet::from_values_with_policy(
+            input,
+            FixedMembershipBuildPolicy::new(67_108_864, 2_000_000),
+        );
+
+        assert_eq!(values.canonical_values().as_ptr(), input_pointer);
+        assert_eq!(values.canonical_values().len(), input_capacity);
+        assert!(matches!(
+            values.representation.as_ref(),
+            FixedMembershipRepresentation::DenseBits { .. }
+        ));
     }
 }

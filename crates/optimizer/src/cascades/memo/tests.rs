@@ -187,7 +187,7 @@ fn winner_is_keyed_by_goal_and_uses_stable_tie_break() {
     let goal = OptimizationGoal {
         required,
         row_goal: RowGoal::All,
-        objective: ObjectiveProfileId(0),
+        objective: ObjectiveProfile::Latency,
         grant: GrantGoalKey::Invariant(AdmissibleGrantSetId(0)),
         context: OptimizationContextId(0),
     };
@@ -203,7 +203,7 @@ fn winner_is_keyed_by_goal_and_uses_stable_tie_break() {
         goal,
         Winner {
             expression: physical,
-            child_goals: Box::new([]),
+            children: Box::new([]),
             enforcers: Box::new([]),
             enforcer_cost_input: enforcer_cost_input(),
             provided: properties.clone(),
@@ -222,7 +222,7 @@ fn winner_is_keyed_by_goal_and_uses_stable_tie_break() {
         goal,
         Winner {
             expression: physical,
-            child_goals: Box::new([]),
+            children: Box::new([]),
             enforcers: Box::new([]),
             enforcer_cost_input: enforcer_cost_input(),
             provided: properties,
@@ -312,7 +312,7 @@ fn exact_tie_keeps_the_mandatory_expression_ahead_of_ephemeral_fingerprints() {
     let goal = OptimizationGoal {
         required: memo.intern_required(required()).unwrap(),
         row_goal: RowGoal::All,
-        objective: ObjectiveProfileId(0),
+        objective: ObjectiveProfile::Latency,
         grant: GrantGoalKey::Invariant(AdmissibleGrantSetId(0)),
         context: OptimizationContextId(0),
     };
@@ -332,7 +332,7 @@ fn exact_tie_keeps_the_mandatory_expression_ahead_of_ephemeral_fingerprints() {
             goal,
             Winner {
                 expression,
-                child_goals: Box::new([]),
+                children: Box::new([]),
                 enforcers: Box::new([]),
                 enforcer_cost_input: enforcer_cost_input(),
                 provided: properties.clone(),
@@ -392,7 +392,7 @@ fn winner_frontier_retains_non_dominated_resource_tradeoffs() {
     let goal = OptimizationGoal {
         required: memo.intern_required(required()).unwrap(),
         row_goal: RowGoal::All,
-        objective: ObjectiveProfileId(0),
+        objective: ObjectiveProfile::Latency,
         grant: GrantGoalKey::Invariant(AdmissibleGrantSetId(0)),
         context: OptimizationContextId(0),
     };
@@ -412,7 +412,7 @@ fn winner_frontier_retains_non_dominated_resource_tradeoffs() {
             goal,
             Winner {
                 expression: physical,
-                child_goals: Box::new([]),
+                children: Box::new([]),
                 enforcers: Box::new([]),
                 enforcer_cost_input: enforcer_cost_input(),
                 provided: properties.clone(),
@@ -443,12 +443,14 @@ fn latency_and_robustness_profiles_rank_uncertainty_explicitly() {
                 range: CompactRange::new(expected_work, expected_work, risk_upper).unwrap(),
                 risk_adjusted,
             },
+            work_latency: CompactRange::new(expected_work, expected_work, risk_upper).unwrap(),
+            max_parallel_tasks: 4,
             critical_path: CompactRange::new(expected_path, expected_path, risk_upper).unwrap(),
             ..SearchCost::ZERO
         };
         Winner {
             expression: PhysicalExprId::new(expression),
-            child_goals: Box::new([]),
+            children: Box::new([]),
             enforcers: Box::new([]),
             enforcer_cost_input: enforcer_cost_input(),
             provided: provided(),
@@ -461,27 +463,129 @@ fn latency_and_robustness_profiles_rank_uncertainty_explicitly() {
             joint_cost_proof: None,
         }
     };
-    let work_efficient = winner(1, 20.0, 20.0, 100.0, 80.0);
-    let short_path_narrow_uncertainty = winner(2, 10.0, 22.0, 30.0, 25.0);
+    let parallel_uncertain = winner(1, 26.0, 104.0, 200.0, 150.0);
+    let serial_robust = winner(2, 100.0, 100.0, 110.0, 105.0);
 
     assert_eq!(
         compare_objective(
-            &work_efficient,
-            &short_path_narrow_uncertainty,
-            ObjectiveProfileId(0),
+            &parallel_uncertain,
+            &serial_robust,
+            ObjectiveProfile::Latency,
         ),
         std::cmp::Ordering::Less,
-        "the latency profile first avoids work on the bounded worker pool"
+        "latency combines capacity-adjusted work with dependency span"
     );
     assert_eq!(
         compare_objective(
-            &work_efficient,
-            &short_path_narrow_uncertainty,
-            ObjectiveProfileId(3),
+            &parallel_uncertain,
+            &serial_robust,
+            ObjectiveProfile::Robustness,
         ),
         std::cmp::Ordering::Greater,
         "the robustness profile optimizes the hard uncertainty bound"
     );
+}
+
+#[test]
+fn frontier_and_admission_share_the_same_objective_contract() {
+    use crate::physical::{PhysicalPlanPortfolio, ResourceGrantClass, SpillPolicy};
+
+    let winner = |expression: usize, expected: f64, upper: f64, risk_adjusted: f64| {
+        let range = CompactRange::new(expected, expected, upper).unwrap();
+        let cost = SearchCost {
+            score: ScoreSummary {
+                range,
+                risk_adjusted,
+            },
+            work_latency: range,
+            critical_path: range,
+            ..SearchCost::ZERO
+        };
+        Winner {
+            expression: PhysicalExprId::new(expression),
+            children: Box::new([]),
+            enforcers: Box::new([]),
+            enforcer_cost_input: enforcer_cost_input(),
+            provided: provided(),
+            local_cost: cost,
+            source_filter_apply_cost: None,
+            cost_composition: CostComposition::Sequential,
+            cost,
+            source_work: Box::new([]),
+            physical_fingerprint: Fingerprint(expression as u128),
+            joint_cost_proof: None,
+        }
+    };
+    let latency = winner(1, 20.0, 100.0, 80.0);
+    let robust = winner(2, 22.0, 30.0, 25.0);
+    let goal = OptimizationGoal {
+        required: PropertySetId(0),
+        row_goal: RowGoal::All,
+        objective: ObjectiveProfile::Latency,
+        grant: GrantGoalKey::Invariant(AdmissibleGrantSetId(0)),
+        context: OptimizationContextId(0),
+    };
+    let mut frontier = WinnerFrontier::new(8);
+    frontier.insert(goal, latency.clone());
+    frontier.insert(goal, robust.clone());
+    assert_eq!(
+        frontier.selected().unwrap().physical_fingerprint,
+        latency.physical_fingerprint
+    );
+
+    let class = ResourceGrantClass {
+        id: ResourceGrantClassId(1),
+        hard_memory_bytes: 100,
+        spill_policy: SpillPolicy::Allowed,
+        max_parallel_tasks: 1,
+    };
+    let portfolio = PhysicalPlanPortfolio::build(
+        goal.objective,
+        [class],
+        [
+            (
+                class.id,
+                "latency",
+                latency.physical_fingerprint,
+                latency.cost,
+            ),
+            (class.id, "robust", robust.physical_fingerprint, robust.cost),
+        ],
+    )
+    .unwrap();
+    let admitted = portfolio.admit(100, 1, 0, |_| true).unwrap();
+    assert_eq!(admitted.physical_fingerprint, latency.physical_fingerprint);
+}
+
+#[test]
+fn dominance_preserves_equal_work_latency_span_tradeoffs() {
+    let mut fast_uncertain = SearchCost {
+        score: ScoreSummary {
+            range: CompactRange::new(20.0, 20.0, 100.0).unwrap(),
+            risk_adjusted: 60.0,
+        },
+        work_latency: CompactRange::new(20.0, 20.0, 100.0).unwrap(),
+        critical_path: CompactRange::new(10.0, 10.0, 100.0).unwrap(),
+        ..SearchCost::ZERO
+    };
+    let mut slow_robust = SearchCost {
+        score: ScoreSummary {
+            range: CompactRange::new(20.0, 20.0, 30.0).unwrap(),
+            risk_adjusted: 25.0,
+        },
+        work_latency: CompactRange::new(20.0, 20.0, 30.0).unwrap(),
+        critical_path: CompactRange::new(20.0, 20.0, 30.0).unwrap(),
+        ..SearchCost::ZERO
+    };
+    // Resource arrays participate in dominance independently of the scalar
+    // score and must carry the same expected/risk tradeoff.
+    fast_uncertain.resources_expected[0] = 20.0;
+    fast_uncertain.resources_risk_upper[0] = 100.0;
+    slow_robust.resources_expected[0] = 20.0;
+    slow_robust.resources_risk_upper[0] = 30.0;
+
+    assert!(!slow_robust.dominates(&fast_uncertain));
+    assert!(!fast_uncertain.dominates(&slow_robust));
 }
 
 #[test]
@@ -651,7 +755,7 @@ fn winner_recording_recomputes_local_cost_instead_of_trusting_total() {
     let goal = OptimizationGoal {
         required: memo.intern_required(required()).unwrap(),
         row_goal: RowGoal::All,
-        objective: ObjectiveProfileId(0),
+        objective: ObjectiveProfile::Latency,
         grant: GrantGoalKey::Invariant(AdmissibleGrantSetId(0)),
         context: OptimizationContextId(0),
     };
@@ -677,7 +781,7 @@ fn winner_recording_recomputes_local_cost_instead_of_trusting_total() {
             goal,
             Winner {
                 expression: physical,
-                child_goals: Box::new([]),
+                children: Box::new([]),
                 enforcers: Box::new([]),
                 enforcer_cost_input: enforcer_cost_input(),
                 provided: properties,

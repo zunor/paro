@@ -5,6 +5,65 @@
 
 use super::*;
 
+pub(super) fn matches_transformation_root(
+    transformation: PlannerTransformation,
+    expr: &crate::cascades::memo::LogicalExpr,
+    state: &PlannerTransformState,
+) -> bool {
+    use LogicalOperatorType as Op;
+
+    // These owners publish a complete local frontier. The provenance is part
+    // of the immutable expression shell, so it is safe to reject before any
+    // descendant dependency is observed.
+    if matches!(
+        transformation,
+        PlannerTransformation::JoinRegionEnumeration
+            | PlannerTransformation::AggregateDimensionDeferral
+    ) && expression_was_produced_by(expr, transformation.id())
+    {
+        return false;
+    }
+
+    let Some(metadata) = state.metadata.get(&expr.payload) else {
+        return false;
+    };
+    let operator = metadata.operator_type;
+    match transformation {
+        PlannerTransformation::ExpensivePredicatePlacement => operator == Op::Filter,
+        PlannerTransformation::CtePartitionedMaterialization
+        | PlannerTransformation::CteInline
+        | PlannerTransformation::CteDemandPushdown
+        | PlannerTransformation::CteFilterPushdown => operator == Op::MaterializedCTE,
+        PlannerTransformation::JoinRegionEnumeration => operator == Op::ComparisonJoin,
+        PlannerTransformation::AggregatePostReduction => {
+            matches!(operator, Op::MaterializedCTE | Op::Projection | Op::Filter)
+        }
+        // This transformation currently recognizes a consumed mark below a
+        // transparent wrapper. Until that matcher is expressed with native
+        // group holes, every known root remains a possible carrier.
+        PlannerTransformation::MarkJoinToSemi => true,
+        PlannerTransformation::JoinElimination => matches!(
+            operator,
+            Op::Projection | Op::Filter | Op::Aggregate | Op::Limit | Op::Order | Op::TopN
+        ),
+        PlannerTransformation::AggregateJoinPreaggregation
+        | PlannerTransformation::AggregateJoinSubsumption
+        | PlannerTransformation::AggregateNonNullInput
+        | PlannerTransformation::AggregateDimensionDeferral
+        | PlannerTransformation::AggregateInputMaterialization => operator == Op::Aggregate,
+        PlannerTransformation::TopNIntroduction | PlannerTransformation::LimitPushdown => {
+            operator == Op::Limit
+        }
+        PlannerTransformation::LatePayloadFetch => {
+            state.rowset_scan_pushdown
+                && matches!(operator, Op::Projection | Op::Aggregate | Op::TopN)
+        }
+        PlannerTransformation::ScalarAggregateWindow => {
+            matches!(operator, Op::ComparisonJoin | Op::Projection | Op::Filter)
+        }
+    }
+}
+
 pub(super) fn matches_transformation(
     transformation: PlannerTransformation,
     expr: &crate::cascades::memo::LogicalExpr,
@@ -13,19 +72,7 @@ pub(super) fn matches_transformation(
 ) -> bool {
     use LogicalOperatorType as Op;
 
-    // Region owners publish a complete local frontier. Re-running one on an
-    // expression from that frontier does not discover another search space:
-    // join enumeration only permutes an already-enumerated region, while
-    // dimension deferral would wrap the same dimension in another
-    // semi-join/aggregate/rejoin layer. Keep the frontier finite by making
-    // this ownership explicit rather than relying on the per-expression rule
-    // history, which is necessarily empty on newly inserted expressions.
-    if matches!(
-        transformation,
-        PlannerTransformation::JoinRegionEnumeration
-            | PlannerTransformation::AggregateDimensionDeferral
-    ) && expression_was_produced_by(expr, transformation.id())
-    {
+    if !matches_transformation_root(transformation, expr, state) {
         return false;
     }
 

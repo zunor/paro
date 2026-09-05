@@ -217,6 +217,7 @@ impl MachineCalibrationBundle {
             },
             resources_expected,
             resources_risk_upper,
+            work_latency: critical_path,
             critical_path,
             ..SearchCost::ZERO
         };
@@ -244,6 +245,7 @@ impl MachineCalibrationBundle {
         profile: ParallelWorkProfile,
         max_parallel_tasks: u16,
     ) -> Result<SearchCost> {
+        cost.max_parallel_tasks = max_parallel_tasks.max(1);
         let tasks = f64::from(max_parallel_tasks.max(1));
         if tasks == 1.0 || profile == ParallelWorkProfile::Serial {
             return Ok(cost);

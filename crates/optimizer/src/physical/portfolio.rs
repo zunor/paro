@@ -10,6 +10,7 @@ use tracing::debug;
 
 use crate::physical::cost::{MemoryCompletion, SearchCost};
 use crate::physical::identity::{Fingerprint, ResourceGrantClassId};
+use crate::physical::ObjectiveProfile;
 use crate::physical::{PhysicalPlan, PhysicalPlanVerifier};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -38,6 +39,7 @@ pub struct PortfolioVariant<P> {
 
 #[derive(Debug, Clone)]
 pub struct PhysicalPlanPortfolio<P = PhysicalPlan> {
+    pub objective: ObjectiveProfile,
     pub grant_classes: Box<[ResourceGrantClass]>,
     pub variants: Box<[PortfolioVariant<P>]>,
 }
@@ -67,6 +69,7 @@ pub struct AdmittedPlan<P> {
 
 impl<P> PhysicalPlanPortfolio<P> {
     pub fn build(
+        objective: ObjectiveProfile,
         grant_classes: impl IntoIterator<Item = ResourceGrantClass>,
         class_plans: impl IntoIterator<Item = (ResourceGrantClassId, P, Fingerprint, SearchCost)>,
     ) -> Result<Self> {
@@ -145,6 +148,7 @@ impl<P> PhysicalPlanPortfolio<P> {
             .map(|(index, _)| index)
             .collect::<BTreeSet<_>>();
         Ok(Self {
+            objective,
             grant_classes: classes.into_values().collect::<Vec<_>>().into_boxed_slice(),
             variants: all
                 .into_iter()
@@ -219,21 +223,8 @@ impl<P> PhysicalPlanPortfolio<P> {
             .min_by(|(left_index, left_class), (right_index, right_class)| {
                 let left = &variants[*left_index];
                 let right = &variants[*right_index];
-                left.cost
-                    .memory_completion
-                    .preference_cmp(right.cost.memory_completion)
-                    .then_with(|| {
-                        left.cost
-                            .score
-                            .risk_adjusted
-                            .total_cmp(&right.cost.score.risk_adjusted)
-                    })
-                    .then_with(|| {
-                        left.cost
-                            .critical_path
-                            .expected
-                            .total_cmp(&right.cost.critical_path.expected)
-                    })
+                self.objective
+                    .compare(&left.cost, &right.cost)
                     // Equal-work variants are distinct resource operating
                     // points. For the latency objective, consume the greatest
                     // admitted DOP before falling back to a plan-identity tie
@@ -413,6 +404,7 @@ mod tests {
                 range: CompactRange::point(score).unwrap(),
                 risk_adjusted: score,
             },
+            work_latency: CompactRange::point(score).unwrap(),
             critical_path: CompactRange::point(score).unwrap(),
             peak_memory_upper: memory,
             minimum_memory_bytes: memory,
@@ -437,6 +429,7 @@ mod tests {
             },
         ];
         let portfolio = PhysicalPlanPortfolio::build(
+            ObjectiveProfile::Latency,
             classes,
             [
                 (ResourceGrantClassId(1), "p", Fingerprint(7), cost(2.0, 10)),
@@ -451,6 +444,7 @@ mod tests {
     #[test]
     fn admission_is_deterministic_and_respects_hard_resources() {
         let portfolio = PhysicalPlanPortfolio::build(
+            ObjectiveProfile::Latency,
             [
                 ResourceGrantClass {
                     id: ResourceGrantClassId(1),
@@ -500,6 +494,7 @@ mod tests {
         capped.minimum_memory_bytes = 10;
         capped.memory_completion = MemoryCompletion::runtime_capped_known(capped.peak_memory_upper);
         let portfolio = PhysicalPlanPortfolio::build(
+            ObjectiveProfile::Latency,
             [class],
             [
                 (class.id, "capped", Fingerprint(1), capped),
@@ -535,6 +530,7 @@ mod tests {
         large_cost.minimum_memory_bytes = 1;
         large_cost.revocable_memory_target = 99;
         let portfolio = PhysicalPlanPortfolio::build(
+            ObjectiveProfile::Latency,
             [large, small],
             [
                 (large.id, "large-fast", Fingerprint(1), large_cost),
@@ -565,6 +561,7 @@ mod tests {
         operating_cost.minimum_memory_bytes = 5;
         operating_cost.revocable_memory_target = 5;
         let portfolio = PhysicalPlanPortfolio::build(
+            ObjectiveProfile::Latency,
             [class],
             [(class.id, "parallel", Fingerprint(1), operating_cost)],
         )
@@ -592,6 +589,7 @@ mod tests {
             max_parallel_tasks: 8,
         };
         let portfolio = PhysicalPlanPortfolio::build(
+            ObjectiveProfile::Latency,
             [serial, parallel],
             [
                 (serial.id, "serial", Fingerprint(1), cost(2.0, 20)),
@@ -621,6 +619,7 @@ mod tests {
             max_parallel_tasks: 8,
         };
         let portfolio = PhysicalPlanPortfolio::build(
+            ObjectiveProfile::Latency,
             [serial, parallel],
             [
                 (serial.id, "serial", Fingerprint(1), cost(1.0, 100)),
@@ -644,6 +643,7 @@ mod tests {
             max_parallel_tasks: 1,
         };
         let portfolio = PhysicalPlanPortfolio::build(
+            ObjectiveProfile::Latency,
             [class],
             [
                 (class.id, "first", Fingerprint(7), cost(1.0, 10)),
@@ -664,6 +664,7 @@ mod tests {
             max_parallel_tasks: 1,
         };
         let portfolio = PhysicalPlanPortfolio::build(
+            ObjectiveProfile::Latency,
             [class],
             [
                 (class.id, "specialized", Fingerprint(1), cost(1.0, 10)),

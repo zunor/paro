@@ -1366,6 +1366,7 @@ fn refreshed_structural_cost(
             range,
             risk_adjusted: expected + (upper - expected) * 0.5,
         },
+        work_latency: range,
         critical_path: range,
         ..SearchCost::ZERO
     };
@@ -1681,6 +1682,7 @@ pub(super) fn planner_operator_cost(
             range: CompactRange::new(1.0, expected, upper)?,
             risk_adjusted: expected + (upper - expected) * 0.5,
         },
+        work_latency: CompactRange::new(1.0, expected, upper)?,
         critical_path: CompactRange::new(1.0, expected, upper)?,
         ..SearchCost::ZERO
     };
@@ -1727,6 +1729,7 @@ fn base_table_scan_cost(rows: CompactRange, access_width: u64) -> Result<SearchC
             range,
             risk_adjusted: range.expected + (range.upper - range.expected) * 0.5,
         },
+        work_latency: range,
         critical_path: range,
         ..SearchCost::ZERO
     };
@@ -1782,6 +1785,7 @@ pub(super) fn search_decision_cost(
             range,
             risk_adjusted: expected + (range.upper - expected) * 0.5,
         },
+        work_latency: range,
         critical_path: range,
         ..SearchCost::ZERO
     };
@@ -1817,6 +1821,7 @@ pub(super) fn external_operator_cost(
             range,
             risk_adjusted: expected + (range.upper - expected) * 0.5,
         },
+        work_latency: range,
         critical_path: range,
         external_workers: crate::cascades::ids::ExternalWorkerRequirementSetId(1),
         external_worker_slots_upper: 1,

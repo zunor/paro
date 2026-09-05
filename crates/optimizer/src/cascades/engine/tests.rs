@@ -12,8 +12,7 @@ use super::*;
 use crate::cascades::column::{ColumnDesc, ColumnOrigin, ColumnVisibility, GroupSchema};
 use crate::cascades::cost::{CompactRange, ScoreSummary};
 use crate::cascades::ids::{
-    AdmissibleGrantSetId, ColumnId, LogicalPayloadId, ObjectiveProfileId, OptimizationContextId,
-    PhysicalPayloadId,
+    AdmissibleGrantSetId, ColumnId, LogicalPayloadId, OptimizationContextId, PhysicalPayloadId,
 };
 use crate::cascades::memo::{
     GrantGoalKey, GroupCardinality, LogicalExprKey, LogicalProperties, OptimizationContext,
@@ -30,6 +29,7 @@ use crate::cascades::rules::{
     EquivalentExpression, GrantDependencyDescriptor, PhysicalImplementation, RulePromise,
     SidewaysFilterSource, TransformationRule,
 };
+use crate::physical::ObjectiveProfile;
 
 fn schema() -> GroupSchema {
     GroupSchema::new([ColumnDesc {
@@ -75,6 +75,7 @@ fn cost(score: f64) -> SearchCost {
             range: CompactRange::point(score).unwrap(),
             risk_adjusted: score,
         },
+        work_latency: CompactRange::point(score).unwrap(),
         critical_path: CompactRange::point(score).unwrap(),
         ..SearchCost::ZERO
     }
@@ -87,6 +88,11 @@ fn retained_source(
 ) -> SidewaysFilterSource {
     SidewaysFilterSource {
         source,
+        proof: Fingerprint(
+            ((source.0 as u128) << 64)
+                | ((u128::from(expected_retained_ppm)) << 32)
+                | u128::from(upper_retained_ppm),
+        ),
         expected_retained_ppm,
         upper_retained_ppm,
     }
@@ -97,7 +103,7 @@ fn joint_cost_proof_resolves_both_runtime_filter_build_orientations() {
     let goal = OptimizationGoal {
         required: super::super::ids::PropertySetId(0),
         row_goal: RowGoal::All,
-        objective: ObjectiveProfileId(0),
+        objective: ObjectiveProfile::Latency,
         grant: GrantGoalKey::Invariant(AdmissibleGrantSetId(0)),
         context: OptimizationContextId(0),
     };
@@ -184,8 +190,12 @@ impl TransformationRule for AddEquivalent {
         RulePromise::HIGH
     }
 
-    fn matches(&self, expr: &super::super::memo::LogicalExpr, _: &RuleContext<'_>) -> bool {
+    fn matches_root(&self, expr: &super::super::memo::LogicalExpr) -> bool {
         expr.key.operator == Fingerprint(10)
+    }
+
+    fn matches(&self, expr: &super::super::memo::LogicalExpr, _: &RuleContext<'_>) -> bool {
+        self.matches_root(expr)
     }
 
     fn apply(
@@ -220,8 +230,12 @@ impl TransformationRule for AttemptSearchTimeContextExpansion {
         RuleId(21)
     }
 
-    fn matches(&self, expr: &super::super::memo::LogicalExpr, _: &RuleContext<'_>) -> bool {
+    fn matches_root(&self, expr: &super::super::memo::LogicalExpr) -> bool {
         expr.key.operator == Fingerprint(10)
+    }
+
+    fn matches(&self, expr: &super::super::memo::LogicalExpr, _: &RuleContext<'_>) -> bool {
+        self.matches_root(expr)
     }
 
     fn apply(
@@ -246,8 +260,12 @@ impl TransformationRule for AddBoundedFrontier {
         2
     }
 
-    fn matches(&self, expr: &super::super::memo::LogicalExpr, _: &RuleContext<'_>) -> bool {
+    fn matches_root(&self, expr: &super::super::memo::LogicalExpr) -> bool {
         expr.key.operator == Fingerprint(10)
+    }
+
+    fn matches(&self, expr: &super::super::memo::LogicalExpr, _: &RuleContext<'_>) -> bool {
+        self.matches_root(expr)
     }
 
     fn apply(
@@ -284,8 +302,12 @@ impl TransformationRule for FailAfterMemoWrite {
         RuleId(6)
     }
 
-    fn matches(&self, expr: &super::super::memo::LogicalExpr, _: &RuleContext<'_>) -> bool {
+    fn matches_root(&self, expr: &super::super::memo::LogicalExpr) -> bool {
         expr.key.operator == Fingerprint(10)
+    }
+
+    fn matches(&self, expr: &super::super::memo::LogicalExpr, _: &RuleContext<'_>) -> bool {
+        self.matches_root(expr)
     }
 
     fn apply(
@@ -309,8 +331,12 @@ impl TransformationRule for DuplicateEquivalent {
         RuleId(8)
     }
 
-    fn matches(&self, expr: &super::super::memo::LogicalExpr, _: &RuleContext<'_>) -> bool {
+    fn matches_root(&self, expr: &super::super::memo::LogicalExpr) -> bool {
         expr.key.operator == Fingerprint(10)
+    }
+
+    fn matches(&self, expr: &super::super::memo::LogicalExpr, _: &RuleContext<'_>) -> bool {
+        self.matches_root(expr)
     }
 
     fn apply(
@@ -341,8 +367,12 @@ impl TransformationRule for AddEquivalentWithNewChild {
         RuleId(20)
     }
 
-    fn matches(&self, expr: &super::super::memo::LogicalExpr, _: &RuleContext<'_>) -> bool {
+    fn matches_root(&self, expr: &super::super::memo::LogicalExpr) -> bool {
         expr.key.operator == Fingerprint(10)
+    }
+
+    fn matches(&self, expr: &super::super::memo::LogicalExpr, _: &RuleContext<'_>) -> bool {
+        self.matches_root(expr)
     }
 
     fn apply(
@@ -392,8 +422,12 @@ impl TransformationRule for RewriteNewChild {
         RuleId(21)
     }
 
-    fn matches(&self, expr: &super::super::memo::LogicalExpr, _: &RuleContext<'_>) -> bool {
+    fn matches_root(&self, expr: &super::super::memo::LogicalExpr) -> bool {
         expr.key.operator == Fingerprint(30)
+    }
+
+    fn matches(&self, expr: &super::super::memo::LogicalExpr, _: &RuleContext<'_>) -> bool {
+        self.matches_root(expr)
     }
 
     fn apply(
@@ -430,8 +464,12 @@ impl TransformationRule for AddChildAlternative {
         self.id
     }
 
-    fn matches(&self, expr: &super::super::memo::LogicalExpr, _: &RuleContext<'_>) -> bool {
+    fn matches_root(&self, expr: &super::super::memo::LogicalExpr) -> bool {
         expr.key.operator == Fingerprint(40)
+    }
+
+    fn matches(&self, expr: &super::super::memo::LogicalExpr, _: &RuleContext<'_>) -> bool {
+        self.matches_root(expr)
     }
 
     fn apply(
@@ -468,8 +506,12 @@ impl TransformationRule for RewriteParentAfterChildAlternative {
         self.id
     }
 
+    fn matches_root(&self, expr: &super::super::memo::LogicalExpr) -> bool {
+        expr.key.operator == Fingerprint(50)
+    }
+
     fn matches(&self, expr: &super::super::memo::LogicalExpr, ctx: &RuleContext<'_>) -> bool {
-        if expr.key.operator != Fingerprint(50) {
+        if !self.matches_root(expr) {
             return false;
         }
         let [child] = expr.key.children.as_ref() else {
@@ -519,8 +561,12 @@ impl TransformationRule for RejectAfterSidecarWrite {
         RuleId(7)
     }
 
-    fn matches(&self, expr: &super::super::memo::LogicalExpr, _: &RuleContext<'_>) -> bool {
+    fn matches_root(&self, expr: &super::super::memo::LogicalExpr) -> bool {
         expr.key.operator == Fingerprint(10)
+    }
+
+    fn matches(&self, expr: &super::super::memo::LogicalExpr, _: &RuleContext<'_>) -> bool {
+        self.matches_root(expr)
     }
 
     fn apply(
@@ -640,7 +686,7 @@ fn engine_with_budget(
     let goal = OptimizationGoal {
         required,
         row_goal: RowGoal::All,
-        objective: ObjectiveProfileId(0),
+        objective: ObjectiveProfile::Latency,
         grant: GrantGoalKey::Invariant(AdmissibleGrantSetId(0)),
         context: OptimizationContextId(0),
     };
@@ -650,6 +696,42 @@ fn engine_with_budget(
         .register_implementation(LeafImplementation)
         .unwrap();
     (CascadesEngine::new(memo, registry), group, goal)
+}
+
+fn transformation_chain_engine(
+    depth: usize,
+    root_operator: Fingerprint,
+    budget: super::super::budget::SearchBudget,
+) -> CascadesEngine {
+    assert!(depth > 0);
+    let mut memo = Memo::new(budget);
+    let mut child = None;
+    for ordinal in 0..depth {
+        let group = memo.create_group(
+            schema(),
+            LogicalProperties::default(),
+            GroupCardinality::default(),
+        );
+        memo.insert_logical(
+            group,
+            LogicalExprKey {
+                operator: if ordinal + 1 == depth {
+                    root_operator
+                } else {
+                    Fingerprint(40)
+                },
+                scalars: Box::new([]),
+                children: child.into_iter().collect(),
+            },
+            LogicalPayloadId(ordinal as u32),
+            EquivalenceProof::Initial,
+        )
+        .unwrap();
+        child = Some(group);
+    }
+    let mut registry = ImplementationRegistry::default();
+    registry.register_transformation(AddEquivalent).unwrap();
+    CascadesEngine::new(memo, registry)
 }
 
 #[test]
@@ -721,6 +803,32 @@ fn exhausted_optional_budget_still_extracts_baseline() {
     let winner = engine.optimize(group, goal, SearchMode::Memo).unwrap();
     assert_eq!(winner.cost.score.risk_adjusted, 5.0);
     assert_eq!(winner.physical_fingerprint, Fingerprint(10));
+}
+
+#[test]
+fn root_dispatch_does_not_subscribe_structurally_impossible_rules() {
+    let mut budget = super::super::budget::SearchBudget::default();
+    budget.max_rule_firings_per_group = 0;
+    budget.max_rule_work_units_per_group = 0;
+    let mut engine = transformation_chain_engine(256, Fingerprint(40), budget);
+
+    engine.explore_transformations().unwrap();
+
+    assert!(engine.transformation_observations.is_empty());
+    assert!(engine.transformation_subscribers.is_empty());
+}
+
+#[test]
+fn zero_rule_budget_precedes_dependency_observation() {
+    let mut budget = super::super::budget::SearchBudget::default();
+    budget.max_rule_firings_per_group = 0;
+    budget.max_rule_work_units_per_group = 0;
+    let mut engine = transformation_chain_engine(256, Fingerprint(10), budget);
+
+    engine.explore_transformations().unwrap();
+
+    assert!(engine.transformation_observations.is_empty());
+    assert!(engine.transformation_subscribers.is_empty());
 }
 
 #[test]
@@ -916,8 +1024,12 @@ impl TransformationRule for ReplaceInfeasibleBranch {
         RuleId(13)
     }
 
-    fn matches(&self, expr: &super::super::memo::LogicalExpr, _: &RuleContext<'_>) -> bool {
+    fn matches_root(&self, expr: &super::super::memo::LogicalExpr) -> bool {
         expr.key.operator == Fingerprint(30)
+    }
+
+    fn matches(&self, expr: &super::super::memo::LogicalExpr, _: &RuleContext<'_>) -> bool {
+        self.matches_root(expr)
     }
 
     fn apply(
@@ -1037,7 +1149,7 @@ fn infeasible_child_rejects_only_its_parent_recipe() {
     let goal = OptimizationGoal {
         required,
         row_goal: RowGoal::All,
-        objective: ObjectiveProfileId(0),
+        objective: ObjectiveProfile::Latency,
         grant: GrantGoalKey::Invariant(AdmissibleGrantSetId(0)),
         context: OptimizationContextId(0),
     };
@@ -1173,7 +1285,9 @@ fn sideways_filter_scales_work_without_weakening_resource_proofs() {
     };
     let source_work = [SourceWork {
         source,
+        base_cost: child.work_only(),
         cost: child.work_only(),
+        retentions: Box::new([]),
         filters: Box::new([]),
         filter_apply_cost: SearchCost::ZERO,
     }];
@@ -1278,13 +1392,17 @@ fn sideways_filter_preserves_source_local_risk_bounds() {
     let lanes = [
         SourceWork {
             source: unique_source,
+            base_cost: cost(100.0),
             cost: cost(100.0),
+            retentions: Box::new([]),
             filters: Box::new([]),
             filter_apply_cost: SearchCost::ZERO,
         },
         SourceWork {
             source: repeated_source,
+            base_cost: cost(300.0),
             cost: cost(300.0),
+            retentions: Box::new([]),
             filters: Box::new([]),
             filter_apply_cost: SearchCost::ZERO,
         },
@@ -1323,13 +1441,17 @@ fn sideways_filter_degrades_to_matching_source_lanes() {
     let lanes = [
         SourceWork {
             source: matched,
+            base_cost: cost(100.0),
             cost: cost(100.0),
+            retentions: Box::new([]),
             filters: Box::new([]),
             filter_apply_cost: SearchCost::ZERO,
         },
         SourceWork {
             source: unrelated,
+            base_cost: cost(300.0),
             cost: cost(300.0),
+            retentions: Box::new([]),
             filters: Box::new([]),
             filter_apply_cost: SearchCost::ZERO,
         },
@@ -1377,13 +1499,17 @@ fn sideways_filter_accepts_multiple_lanes_for_one_source() {
     let lanes = [
         SourceWork {
             source,
+            base_cost: cost(100.0),
             cost: cost(100.0),
+            retentions: Box::new([]),
             filters: Box::new([]),
             filter_apply_cost: SearchCost::ZERO,
         },
         SourceWork {
             source,
+            base_cost: cost(300.0),
             cost: cost(300.0),
+            retentions: Box::new([]),
             filters: Box::new([]),
             filter_apply_cost: SearchCost::ZERO,
         },
@@ -1428,7 +1554,9 @@ fn sideways_filter_with_no_physical_lane_is_retained() {
     let unrelated = WorkSourceId(23);
     let lanes = [SourceWork {
         source: unrelated,
+        base_cost: cost(400.0),
         cost: cost(400.0),
+        retentions: Box::new([]),
         filters: Box::new([]),
         filter_apply_cost: SearchCost::ZERO,
     }];
@@ -1496,6 +1624,49 @@ fn repeated_sideways_filters_scale_only_the_matching_source_lane() {
     assert_eq!(second.cost.score.range.expected, 85.0);
     assert_eq!(second.source_work.len(), 1);
     assert_eq!(second.source_work[0].cost.score.range.expected, 5.0);
+}
+
+#[test]
+fn exact_survivor_bounds_are_absolute_and_proof_idempotent() {
+    let source = WorkSourceId(777);
+    let scan = compose_candidate_cost_with_sources(
+        cost(1_000.0),
+        None,
+        &[],
+        &[],
+        CostComposition::Source { source },
+    )
+    .unwrap();
+    let first_proof = retained_source(source, 100_000, 100_000);
+    let apply = |input: &ComposedCost, proof: SidewaysFilterSource| {
+        compose_candidate_cost_with_sources(
+            SearchCost::ZERO,
+            Some(SearchCost::ZERO),
+            &[input.cost],
+            &[input.source_work.as_ref()],
+            CostComposition::SidewaysFilter {
+                overlapping_children: 0,
+                filtered_child: 0,
+                sources: Box::new([proof]),
+            },
+        )
+        .unwrap()
+    };
+
+    let first = apply(&scan, first_proof);
+    let duplicate = apply(&first, first_proof);
+    assert_eq!(duplicate.source_work[0].cost.score.range.expected, 100.0);
+    assert_eq!(duplicate.source_work[0].cost.score.range.upper, 100.0);
+
+    let correlated = apply(
+        &first,
+        SidewaysFilterSource {
+            proof: Fingerprint(first_proof.proof.0 + 1),
+            ..first_proof
+        },
+    );
+    assert_eq!(correlated.source_work[0].cost.score.range.expected, 10.0);
+    assert_eq!(correlated.source_work[0].cost.score.range.upper, 100.0);
 }
 
 #[test]
@@ -1795,7 +1966,7 @@ fn grant_sensitive_parent_reuses_invariant_child_goal_across_classes() {
     let goal = OptimizationGoal {
         required,
         row_goal: RowGoal::All,
-        objective: ObjectiveProfileId(0),
+        objective: ObjectiveProfile::Latency,
         grant: GrantGoalKey::Invariant(AdmissibleGrantSetId(0)),
         context: OptimizationContextId(0),
     };
@@ -1838,5 +2009,141 @@ fn grant_sensitive_parent_reuses_invariant_child_goal_across_classes() {
             GrantGoalKey::Class(ResourceGrantClassId(1)),
             GrantGoalKey::Class(ResourceGrantClassId(2)),
         ]
+    );
+}
+
+struct SourceSensitiveAlternativeImplementation;
+
+impl PhysicalImplementation for SourceSensitiveAlternativeImplementation {
+    fn id(&self) -> ImplementationId {
+        ImplementationId(700)
+    }
+
+    fn matches(
+        &self,
+        _: &super::super::memo::LogicalExpr,
+        _: OptimizationGoal,
+        _: &ImplementationContext<'_>,
+    ) -> bool {
+        true
+    }
+
+    fn candidates(
+        &self,
+        expr: LogicalExprId,
+        goal: OptimizationGoal,
+        ctx: &ImplementationContext<'_>,
+    ) -> Result<Box<[PhysicalCandidate]>> {
+        let logical = ctx.memo.logical_expr(expr).unwrap();
+        let source = WorkSourceId(777);
+        let (work, composition, apply_cost) = match logical.key.operator.0 {
+            201 => (100.0, CostComposition::Sequential, None),
+            202 => (0.0, CostComposition::Sequential, None),
+            211 => (10.0, CostComposition::Source { source }, None),
+            212 => (120.0, CostComposition::Source { source }, None),
+            203 => (
+                0.0,
+                CostComposition::SidewaysFilter {
+                    overlapping_children: 0,
+                    filtered_child: 0,
+                    sources: Box::new([retained_source(source, 10_000, 1_000_000)]),
+                },
+                Some(cost(0.0)),
+            ),
+            _ => unreachable!(),
+        };
+        Ok(Box::new([PhysicalCandidate {
+            key: PhysicalExprKey {
+                implementation: self.id(),
+                logical: expr,
+                children: logical.key.children.clone(),
+                payload_fingerprint: logical.key.operator,
+            },
+            payload: PhysicalPayloadId(logical.payload.0),
+            provided: provided(),
+            child_goals: logical
+                .key
+                .children
+                .iter()
+                .map(|child| (*child, goal))
+                .collect::<Vec<_>>()
+                .into_boxed_slice(),
+            local_cost: cost(work),
+            source_filter_apply_cost: apply_cost,
+            cost_composition: composition,
+            spillable: false,
+            enforcer_cost_input: EnforcerCostInput::unbounded(CompactRange::point(1.0)?, 8),
+            physical_fingerprint: logical.key.operator,
+            region: None,
+            mandatory: true,
+        }]))
+    }
+}
+
+#[test]
+fn parent_costs_every_source_sensitive_child_frontier_candidate() {
+    let mut memo = Memo::new(super::super::budget::SearchBudget::default());
+    let mut add = |operator: u128, children: Box<[GroupId]>, group: Option<GroupId>| {
+        let group = group.unwrap_or_else(|| {
+            memo.create_group(
+                schema(),
+                LogicalProperties::default(),
+                GroupCardinality::default(),
+            )
+        });
+        memo.insert_logical(
+            group,
+            LogicalExprKey {
+                operator: Fingerprint(operator),
+                scalars: Box::new([]),
+                children,
+            },
+            LogicalPayloadId(operator as u32),
+            if operator == 202 {
+                EquivalenceProof::Normalization { rule: RuleId(701) }
+            } else {
+                EquivalenceProof::Initial
+            },
+        )
+        .unwrap();
+        group
+    };
+    let scan_a = add(211, Box::new([]), None);
+    let scan_b = add(212, Box::new([]), None);
+    let child = add(201, Box::new([scan_a]), None);
+    add(202, Box::new([scan_b]), Some(child));
+    let root = add(203, Box::new([child]), None);
+    let goal = OptimizationGoal {
+        required: memo.intern_required(required()).unwrap(),
+        row_goal: RowGoal::All,
+        objective: ObjectiveProfile::Latency,
+        grant: GrantGoalKey::Invariant(AdmissibleGrantSetId(0)),
+        context: OptimizationContextId(0),
+    };
+    let mut registry = ImplementationRegistry::default();
+    registry
+        .register_implementation(SourceSensitiveAlternativeImplementation)
+        .unwrap();
+    let mut engine = CascadesEngine::new(memo, registry);
+
+    let winner = engine.optimize(root, goal, SearchMode::Memo).unwrap();
+
+    assert!((winner.cost.score.range.expected - 1.2).abs() < 1e-9);
+    assert_eq!(winner.children.len(), 1);
+    let selected_child = engine
+        .memo()
+        .resolve_child_winner(winner.children[0])
+        .unwrap();
+    assert_eq!(selected_child.local_cost.score.range.expected, 0.0);
+    assert_eq!(
+        engine
+            .memo()
+            .group(child)
+            .unwrap()
+            .winner_frontier(goal)
+            .unwrap()
+            .candidates()
+            .len(),
+        2
     );
 }

@@ -11,7 +11,7 @@ pub(super) fn optimization_goal_fingerprint(goal: OptimizationGoal) -> Fingerpri
     let mut fingerprint = StableFingerprintBuilder::default();
     fingerprint.write_u64(goal.required.0 as u64);
     fingerprint.write_u64(goal.row_goal.stable_tag());
-    fingerprint.write_u64(goal.objective.0 as u64);
+    fingerprint.write_u64(goal.objective.stable_tag());
     fingerprint.write_u64(goal.grant.stable_tag());
     fingerprint.write_u64(goal.context.0 as u64);
     fingerprint.finish()
@@ -250,6 +250,7 @@ fn runtime_filter_source_retentions(
     sources: &[ResolvedRuntimeFilterSource],
     build_domain: CompactRange,
     exactness: RuntimeFilterExactness,
+    proof: Fingerprint,
 ) -> Result<Box<[SidewaysFilterSource]>> {
     sources
         .iter()
@@ -267,6 +268,7 @@ fn runtime_filter_source_retentions(
             let expected_retained_ppm = retained_ratio_ppm(retained.expected, source.rows.expected);
             Ok(SidewaysFilterSource {
                 source: source.source,
+                proof,
                 expected_retained_ppm,
                 upper_retained_ppm: retained_upper_ratio_ppm(
                     retained.upper,
@@ -284,6 +286,7 @@ pub(super) fn planner_cost_composition(
     flavor: PhysicalImplementationFlavor,
     facts: &ResolvedPlannerCostFacts,
     max_concurrent_tasks: u16,
+    physical_fingerprint: Fingerprint,
 ) -> Result<CostComposition> {
     if metadata.operator_type == LogicalOperatorType::EmptyResult {
         return Ok(CostComposition::LocalOnly);
@@ -337,6 +340,7 @@ pub(super) fn planner_cost_composition(
                 &facts.runtime_filter_build_left_probe_sources,
                 build_domain,
                 exactness,
+                physical_fingerprint,
             )?,
         });
     }
@@ -371,6 +375,7 @@ pub(super) fn planner_cost_composition(
                 &facts.runtime_filter_probe_sources,
                 build_domain,
                 exactness,
+                physical_fingerprint,
             )?,
         });
     }

@@ -533,7 +533,11 @@ impl Optimizer {
             let fingerprint = utility_plan_fingerprint(&plan.node(plan.root).kind)?;
             class_plans.push((grant.id, plan, fingerprint, cost));
         }
-        let portfolio = PhysicalPlanPortfolio::build(grant_classes.iter().copied(), class_plans)?;
+        let portfolio = PhysicalPlanPortfolio::build(
+            crate::physical::ObjectiveProfile::Latency,
+            grant_classes.iter().copied(),
+            class_plans,
+        )?;
         portfolio.verify()?;
         Ok(portfolio)
     }
@@ -603,7 +607,11 @@ impl Optimizer {
                 variant.cost,
             ));
         }
-        let portfolio = PhysicalPlanPortfolio::build(grant_classes.iter().copied(), class_plans)?;
+        let portfolio = PhysicalPlanPortfolio::build(
+            crate::physical::ObjectiveProfile::Latency,
+            grant_classes.iter().copied(),
+            class_plans,
+        )?;
         portfolio.verify()?;
         Ok(portfolio)
     }
@@ -633,6 +641,7 @@ impl Optimizer {
             u64::from(budget.max_optional_interesting_goals_per_group),
             u64::from(budget.max_rule_firings_per_group),
             u64::from(budget.max_rule_work_units_per_group),
+            u64::from(budget.max_child_frontier_combinations_per_group),
             u64::from(budget.max_join_connected_pairs),
             u64::from(budget.max_join_exact_relations),
             u64::from(budget.join_beam_width),

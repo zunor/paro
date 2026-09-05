@@ -247,6 +247,12 @@ pub struct SearchCost {
     pub score: ScoreSummary,
     pub resources_expected: [f64; RESOURCE_DIMS],
     pub resources_risk_upper: [f64; RESOURCE_DIMS],
+    /// Serial work expressed in calibrated latency units. Unlike
+    /// `critical_path`, this remains invariant when a phase is assigned more
+    /// workers and supplies the W/P capacity lower bound.
+    pub work_latency: CompactRange,
+    /// Physical worker capacity used to derive this operating point.
+    pub max_parallel_tasks: u16,
     pub critical_path: CompactRange,
     /// Memory that cannot be reclaimed or spilled while this operator is
     /// active. This is the hard quantity that composes additively across
@@ -277,6 +283,8 @@ impl SearchCost {
         },
         resources_expected: [0.0; RESOURCE_DIMS],
         resources_risk_upper: [0.0; RESOURCE_DIMS],
+        work_latency: CompactRange::ZERO,
+        max_parallel_tasks: 1,
         critical_path: CompactRange::ZERO,
         non_revocable_memory_upper: 0,
         minimum_memory_bytes: 0,
@@ -299,6 +307,9 @@ impl SearchCost {
                 self.score.range.expected,
                 self.score.range.upper,
                 self.score.risk_adjusted,
+                self.work_latency.lower,
+                self.work_latency.expected,
+                self.work_latency.upper,
                 self.critical_path.lower,
                 self.critical_path.expected,
                 self.critical_path.upper,
@@ -313,10 +324,17 @@ impl SearchCost {
         }
         if self.score.range.lower > self.score.range.expected
             || self.score.range.expected > self.score.range.upper
+            || self.work_latency.lower > self.work_latency.expected
+            || self.work_latency.expected > self.work_latency.upper
             || self.critical_path.lower > self.critical_path.expected
             || self.critical_path.expected > self.critical_path.upper
         {
             return Err(paro_error::internal("search cost interval is inverted"));
+        }
+        if self.max_parallel_tasks == 0 {
+            return Err(paro_error::internal(
+                "search cost declares zero physical worker capacity",
+            ));
         }
         if self.non_revocable_memory_upper > self.peak_memory_upper {
             return Err(paro_error::internal(
@@ -395,6 +413,8 @@ impl SearchCost {
             },
             resources_expected,
             resources_risk_upper,
+            work_latency: self.work_latency.checked_add(other.work_latency)?,
+            max_parallel_tasks: self.max_parallel_tasks.max(other.max_parallel_tasks),
             critical_path: self.critical_path.checked_add(other.critical_path)?,
             non_revocable_memory_upper: self
                 .non_revocable_memory_upper
@@ -497,6 +517,11 @@ impl SearchCost {
             self.critical_path.expected * expected_factor,
             self.critical_path.upper * upper_factor,
         )?;
+        self.work_latency = CompactRange::new(
+            self.work_latency.lower * expected_factor,
+            self.work_latency.expected * expected_factor,
+            self.work_latency.upper * upper_factor,
+        )?;
         for value in &mut self.resources_expected {
             *value *= expected_factor;
         }
@@ -583,6 +608,23 @@ impl SearchCost {
                 new.critical_path.upper,
             )?,
         )?;
+        result.work_latency = CompactRange::new(
+            replace(
+                self.work_latency.lower,
+                old.work_latency.lower,
+                new.work_latency.lower,
+            )?,
+            replace(
+                self.work_latency.expected,
+                old.work_latency.expected,
+                new.work_latency.expected,
+            )?,
+            replace(
+                self.work_latency.upper,
+                old.work_latency.upper,
+                new.work_latency.upper,
+            )?,
+        )?;
         for index in 0..RESOURCE_DIMS {
             result.resources_expected[index] = replace(
                 self.resources_expected[index],
@@ -609,8 +651,12 @@ impl SearchCost {
     }
 
     pub fn dominates(&self, other: &Self) -> bool {
-        let no_worse = self.score.risk_adjusted <= other.score.risk_adjusted
+        let no_worse = self.score.range.expected <= other.score.range.expected
+            && self.score.risk_adjusted <= other.score.risk_adjusted
             && self.score.range.upper <= other.score.range.upper
+            && self.work_latency.expected <= other.work_latency.expected
+            && self.work_latency.upper <= other.work_latency.upper
+            && self.critical_path.expected <= other.critical_path.expected
             && self.critical_path.upper <= other.critical_path.upper
             && self.non_revocable_memory_upper <= other.non_revocable_memory_upper
             && self.minimum_memory_bytes <= other.minimum_memory_bytes
@@ -631,8 +677,12 @@ impl SearchCost {
                 .iter()
                 .zip(other.resources_risk_upper.iter())
                 .all(|(left, right)| left <= right);
-        let strictly_better = self.score.risk_adjusted < other.score.risk_adjusted
+        let strictly_better = self.score.range.expected < other.score.range.expected
+            || self.score.risk_adjusted < other.score.risk_adjusted
             || self.score.range.upper < other.score.range.upper
+            || self.work_latency.expected < other.work_latency.expected
+            || self.work_latency.upper < other.work_latency.upper
+            || self.critical_path.expected < other.critical_path.expected
             || self.critical_path.upper < other.critical_path.upper
             || self.non_revocable_memory_upper < other.non_revocable_memory_upper
             || self.minimum_memory_bytes < other.minimum_memory_bytes
