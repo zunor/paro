@@ -140,7 +140,13 @@ pub(in crate::cascades::planner) fn planner_cost_facts(
     };
     let runtime_filter_build_distinct_expected = match &plan.operator {
         LogicalOperator::Join(Join::Comparison(join)) => {
-            runtime_filter_build_distinct_expected(join, column_stats)
+            join_key_distinct_expected(join, column_stats, JoinKeySide::Right)
+        }
+        _ => None,
+    };
+    let runtime_filter_build_left_distinct_expected = match &plan.operator {
+        LogicalOperator::Join(Join::Comparison(join)) => {
+            join_key_distinct_expected(join, column_stats, JoinKeySide::Left)
         }
         _ => None,
     };
@@ -170,6 +176,7 @@ pub(in crate::cascades::planner) fn planner_cost_facts(
         runtime_filter_probe_work_sources,
         runtime_filter_build_left_probe_work_sources,
         runtime_filter_build_distinct_expected,
+        runtime_filter_build_left_distinct_expected,
         runtime_filter_key_types,
     })
 }
@@ -285,13 +292,22 @@ pub(in crate::cascades::planner) fn expression_cost_facts(
             .runtime_filter_build_left_probe_work_sources
             .clone(),
         runtime_filter_build_distinct_expected: template.runtime_filter_build_distinct_expected,
+        runtime_filter_build_left_distinct_expected: template
+            .runtime_filter_build_left_distinct_expected,
         runtime_filter_key_types: template.runtime_filter_key_types.clone(),
     })
 }
 
-fn runtime_filter_build_distinct_expected(
+#[derive(Debug, Clone, Copy)]
+enum JoinKeySide {
+    Left,
+    Right,
+}
+
+fn join_key_distinct_expected(
     join: &paro_planner::operator::ComparisonJoin,
     column_stats: &HashMap<ColumnBinding, Arc<ColumnStatistics>>,
+    side: JoinKeySide,
 ) -> Option<u64> {
     let mut equalities = join
         .conditions
@@ -303,11 +319,13 @@ fn runtime_filter_build_distinct_expected(
         // build tuples, so a single-column NDV is not its retained domain.
         return None;
     }
-    let binding = match &condition.right {
+    let (expression, input) = match side {
+        JoinKeySide::Left => (&condition.left, join.left.as_ref()),
+        JoinKeySide::Right => (&condition.right, join.right.as_ref()),
+    };
+    let binding = match expression {
         Expression::ColumnRef(column) if column.depth == 0 => column.binding,
-        Expression::Reference(reference) => {
-            *join.right.get_column_bindings().get(reference.index)?
-        }
+        Expression::Reference(reference) => *input.get_column_bindings().get(reference.index)?,
         _ => return None,
     };
     column_stats

@@ -85,6 +85,7 @@ fn calibrated_tuple_work_distinguishes_narrow_and_wide_intermediates() {
         runtime_filter_probe_work_sources: Box::new([]),
         runtime_filter_build_left_probe_work_sources: Box::new([]),
         runtime_filter_build_distinct_expected: None,
+        runtime_filter_build_left_distinct_expected: None,
         runtime_filter_key_types: Box::new([]),
     };
     let calibrated_cost = |facts: &ResolvedPlannerCostFacts| {
@@ -170,6 +171,7 @@ fn expression_cost_facts_read_current_group_cardinality() {
         runtime_filter_probe_work_sources: Box::new([]),
         runtime_filter_build_left_probe_work_sources: Box::new([]),
         runtime_filter_build_distinct_expected: None,
+        runtime_filter_build_left_distinct_expected: None,
         runtime_filter_key_types: Box::new([]),
     };
 
@@ -993,6 +995,48 @@ fn inner_join_probe_keeps_runtime_filter_consumer_lineage() {
     );
     let probe = LogicalPlan::synthetic(LogicalOperator::Join(Join::Comparison(first_join)));
     let build = test_base_get(2, 20_033, "second_build", 20);
+    let join = ComparisonJoin::new(
+        JoinType::Inner,
+        probe,
+        build,
+        vec![JoinCondition::equality(
+            Expression::Reference(ReferenceExpression::new(0, LogicalType::Integer)),
+            Expression::Reference(ReferenceExpression::new(0, LogicalType::Integer)),
+        )],
+    );
+    assert!(supports_runtime_filter_auxiliary(&join, true));
+
+    let logical = LogicalPlan::synthetic(LogicalOperator::Join(Join::Comparison(join)));
+    let physical =
+        crate::physical::PhysicalPlanExtractor::new(crate::physical::ExtractionContext::default())
+            .extract(&logical)
+            .unwrap();
+    let [probe, _] = physical.child_ids(&physical.node(physical.root).children) else {
+        panic!("outer hash join must be binary");
+    };
+    let lineage = crate::physical::lineage::trace_rowset_lineage(&physical, *probe, 0);
+    assert_eq!(lineage.len(), 1);
+    assert!(matches!(
+        physical.node(lineage[0].0).kind,
+        crate::physical::PhysicalNodeKind::RowsetScan(_)
+    ));
+}
+
+#[test]
+fn semi_join_preserved_probe_keeps_runtime_filter_consumer_lineage() {
+    let fact = test_base_get(0, 20_044, "fact_probe", 20_000);
+    let dimension = test_base_get(1, 20_045, "first_build", 20);
+    let first_join = ComparisonJoin::new(
+        JoinType::Semi,
+        fact,
+        dimension,
+        vec![JoinCondition::equality(
+            Expression::Reference(ReferenceExpression::new(0, LogicalType::Integer)),
+            Expression::Reference(ReferenceExpression::new(0, LogicalType::Integer)),
+        )],
+    );
+    let probe = LogicalPlan::synthetic(LogicalOperator::Join(Join::Comparison(first_join)));
+    let build = test_base_get(2, 20_046, "second_build", 20);
     let join = ComparisonJoin::new(
         JoinType::Inner,
         probe,

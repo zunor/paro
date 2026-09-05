@@ -277,12 +277,13 @@ pub(super) fn planner_cost_composition(
         let source = facts
             .runtime_filter_build_left_probe_source_rows
             .unwrap_or(probe);
-        if build.expected >= source.expected {
+        let build_domain =
+            runtime_filter_build_domain(facts.runtime_filter_build_left_distinct_expected, build)?;
+        if build_domain.expected >= source.expected {
             return Ok(CostComposition::RetainedState {
                 overlapping_children,
             });
         }
-        let build_domain = CompactRange::new(0.0, build.expected, build.upper)?;
         let resource = crate::physical::RuntimeFilterResourceContract::for_keys(
             &facts.runtime_filter_key_types,
             1,
@@ -326,7 +327,8 @@ pub(super) fn planner_cost_composition(
             .get(1)
             .copied()
             .unwrap_or(CompactRange::ZERO);
-        let build_domain = runtime_filter_build_domain(facts, build)?;
+        let build_domain =
+            runtime_filter_build_domain(facts.runtime_filter_build_distinct_expected, build)?;
         // A non-local runtime filter is evaluated at the traced rowset source,
         // before intervening joins. Compare the build domain with that source;
         // using the already-reduced join child cardinality incorrectly rejects

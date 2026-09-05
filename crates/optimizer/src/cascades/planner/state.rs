@@ -321,6 +321,9 @@ pub(super) struct PlannerCostFacts {
     /// Snapshot estimate of the distinct build-key domain. This ranks
     /// runtime-filter benefit; it never proves capacity or correctness.
     pub(super) runtime_filter_build_distinct_expected: Option<u64>,
+    /// Snapshot estimate for the logical-left key domain when a physical
+    /// implementation inverts build and probe.
+    pub(super) runtime_filter_build_left_distinct_expected: Option<u64>,
     pub(super) runtime_filter_key_types: Box<[LogicalType]>,
 }
 
@@ -345,6 +348,7 @@ pub(super) struct ResolvedPlannerCostFacts {
     pub(super) runtime_filter_probe_work_sources: Box<[WorkSourceId]>,
     pub(super) runtime_filter_build_left_probe_work_sources: Box<[WorkSourceId]>,
     pub(super) runtime_filter_build_distinct_expected: Option<u64>,
+    pub(super) runtime_filter_build_left_distinct_expected: Option<u64>,
     pub(super) runtime_filter_key_types: Box<[LogicalType]>,
 }
 

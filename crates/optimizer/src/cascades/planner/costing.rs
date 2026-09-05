@@ -207,7 +207,11 @@ pub(super) fn supports_build_left_runtime_filter_auxiliary(
         || join.anti_join_mode != AntiJoinMode::Regular
         || !matches!(
             join.join_type,
-            JoinType::Inner | JoinType::Left | JoinType::Semi | JoinType::Anti
+            JoinType::Inner
+                | JoinType::Left
+                | JoinType::Semi
+                | JoinType::Anti
+                | JoinType::RightSemi
         )
     {
         return false;
@@ -382,22 +386,21 @@ fn runtime_filter_probe_lineages(
             Some(left)
         }
         LogicalOperator::Join(Join::Comparison(inner))
-            if matches!(inner.join_type, JoinType::Inner | JoinType::Left)
-                && inner.duplicate_eliminated_columns.is_empty()
-                && !inner.delim_flipped =>
+            if inner.duplicate_eliminated_columns.is_empty() && !inner.delim_flipped =>
         {
             let left_projection = inner
                 .left_projection_map
                 .to_indices(inner.left.types().len());
             if let Some(&child_index) = left_projection.get(output_index) {
+                if !inner.join_type.preserves_left_values() {
+                    return None;
+                }
                 return runtime_filter_probe_lineages(&inner.left, child_index);
             }
-            if inner.join_type == JoinType::Left {
-                // A left outer join preserves every row from its left child.
-                // Sideways filtering a key whose output lineage stays on that
-                // side can only remove rows that the later consuming join
-                // would reject; tracing into the nullable build side would
-                // instead change whether a preserved row is matched.
+            if !inner.join_type.preserves_right_values() {
+                // A NULL-extended value no longer has exact source lineage.
+                // Pushing a predicate into its stored origin could change
+                // which preserved rows are considered matched.
                 return None;
             }
             let right_output = output_index.checked_sub(left_projection.len())?;
@@ -758,7 +761,10 @@ pub(super) fn implementation_cost(
                 .flatten();
             work.add(OP_HASH_BUILD_ROW, build_work)?;
             let probe = if flavor == PhysicalImplementationFlavor::HashJoinRuntimeFilter {
-                let build_domain = runtime_filter_build_domain(facts, right)?;
+                let build_domain = runtime_filter_build_domain(
+                    facts.runtime_filter_build_distinct_expected,
+                    right,
+                )?;
                 work.add(OP_RUNTIME_FILTER_BUILD_ROW, build_work)?;
                 // A non-local runtime filter runs at the traced rowset source,
                 // before any intervening joins. Price every source-row lookup;
@@ -782,7 +788,10 @@ pub(super) fn implementation_cost(
                     exact_expected,
                 )?
             } else if flavor == PhysicalImplementationFlavor::HashJoinBuildLeftRuntimeFilter {
-                let build_domain = CompactRange::new(0.0, left.expected, left.upper)?;
+                let build_domain = runtime_filter_build_domain(
+                    facts.runtime_filter_build_left_distinct_expected,
+                    left,
+                )?;
                 let source = facts
                     .runtime_filter_build_left_probe_source_rows
                     .unwrap_or(right);
@@ -1401,9 +1410,9 @@ pub(super) fn runtime_filtered_probe_work(
             return 0.0;
         }
         let ratio = (build_rows / probe_rows).clamp(0.0, 1.0);
-        // Domain size alone does not describe probe-key skew. Preserve a
-        // conservative expected-work floor until propagated distribution
-        // evidence can price page pruning and surviving rows independently.
+        // Domain size alone does not describe probe-key skew, so the expected
+        // benefit is deliberately square-root damped. Risk remains represented
+        // by the complete-probe upper bound below.
         probe_rows * ratio.sqrt().clamp(0.1, 1.0)
     };
     let expected = match (exact_single_key, probe_multiplicity) {
@@ -1427,11 +1436,10 @@ pub(super) fn runtime_filtered_probe_work(
 }
 
 pub(super) fn runtime_filter_build_domain(
-    facts: &ResolvedPlannerCostFacts,
+    build_distinct_expected: Option<u64>,
     build_rows: CompactRange,
 ) -> Result<CompactRange> {
-    let expected = facts
-        .runtime_filter_build_distinct_expected
+    let expected = build_distinct_expected
         .map(|distinct| distinct as f64)
         .unwrap_or(build_rows.expected)
         .min(build_rows.expected);
