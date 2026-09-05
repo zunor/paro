@@ -16,7 +16,6 @@ pub(super) fn register_transformations(
     registry: &mut ImplementationRegistry,
     planner_state: Arc<RwLock<PlannerTransformState>>,
 ) -> Result<()> {
-    validate_semantic_dependencies()?;
     for transformation in PlannerTransformation::ALL {
         registry.register_transformation(PlannerTransformationRule {
             transformation,
@@ -107,61 +106,6 @@ impl PlannerTransformation {
             _ => None,
         }
     }
-
-    /// Earlier equivalence proofs whose semantic shape this rule is allowed
-    /// to consume through a child group. Rules not listed here remain
-    /// alternatives for costing; they cannot silently change this rule's
-    /// input just because their numeric id happens to sort later.
-    const fn semantic_dependencies(self) -> &'static [RuleId] {
-        match self {
-            // Subsumption recognizes the explicit semi-join produced when a
-            // positive mark is consumed by its filter.
-            Self::AggregateJoinSubsumption => &[MARK_JOIN_TO_SEMI_RULE],
-            _ => &[],
-        }
-    }
-}
-
-fn validate_semantic_dependencies() -> Result<()> {
-    fn visit(
-        transformation: PlannerTransformation,
-        visiting: &mut BTreeSet<RuleId>,
-        visited: &mut BTreeSet<RuleId>,
-    ) -> Result<()> {
-        if visited.contains(&transformation.id()) {
-            return Ok(());
-        }
-        if !visiting.insert(transformation.id()) {
-            return Err(paro_error::internal(format!(
-                "optimizer transformation dependency cycle contains rule {}",
-                transformation.id().0
-            )));
-        }
-        for dependency in transformation.semantic_dependencies() {
-            let dependency = PlannerTransformation::ALL
-                .iter()
-                .copied()
-                .find(|candidate| candidate.id() == *dependency)
-                .ok_or_else(|| {
-                    paro_error::internal(format!(
-                        "optimizer transformation {} depends on unregistered rule {}",
-                        transformation.id().0,
-                        dependency.0
-                    ))
-                })?;
-            visit(dependency, visiting, visited)?;
-        }
-        visiting.remove(&transformation.id());
-        visited.insert(transformation.id());
-        Ok(())
-    }
-
-    let mut visiting = BTreeSet::new();
-    let mut visited = BTreeSet::new();
-    for transformation in PlannerTransformation::ALL {
-        visit(transformation, &mut visiting, &mut visited)?;
-    }
-    Ok(())
 }
 
 #[derive(Debug)]
@@ -204,19 +148,29 @@ impl TransformationRule for PlannerTransformationRule {
     }
 
     fn matches(&self, expr: &crate::cascades::memo::LogicalExpr, _ctx: &RuleContext<'_>) -> bool {
-        let state = self
-            .planner_state
-            .read()
-            .expect("planner transform state poisoned");
-        state.binder.is_some()
-            && matching::matches_transformation(self.transformation, expr, _ctx.memo, &state)
+        self.matches_root(expr)
+    }
+
+    fn bindings(&self, expr: LogicalExprId, ctx: &RuleContext<'_>) -> Result<PatternBindingSet> {
+        matching::pattern_bindings(ctx.group, expr, ctx.memo, ctx.memo.budget())
     }
 
     fn apply(
         &self,
-        expr: LogicalExprId,
+        _expr: LogicalExprId,
+        _ctx: &mut TransformContext<'_>,
+    ) -> Result<Box<[EquivalentExpression]>> {
+        Err(paro_error::internal(
+            "planner transformations require an explicit PatternBinding",
+        ))
+    }
+
+    fn apply_binding(
+        &self,
+        binding: &PatternBinding,
         ctx: &mut TransformContext<'_>,
     ) -> Result<Box<[EquivalentExpression]>> {
+        let expr = binding.root_expression();
         let target_group = ctx.group();
         let (
             plan,
@@ -235,12 +189,8 @@ impl TransformationRule for PlannerTransformationRule {
                     .planner_state
                     .read()
                     .expect("planner transform state poisoned");
-                let plan = semantic_plan::materialize(
-                    ctx.memo(),
-                    &state,
-                    expr,
-                    self.transformation.semantic_dependencies(),
-                )?;
+                let plan =
+                    semantic_plan::instantiate_bound_plan(ctx.memo(), &state, &binding.root)?;
                 let logical = ctx.memo().logical_expr(expr).ok_or_else(|| {
                     paro_error::internal("planner rule lost its source expression")
                 })?;
@@ -255,7 +205,7 @@ impl TransformationRule for PlannerTransformationRule {
                     .ok_or_else(|| paro_error::internal("planner rule lost its source payload"))?;
                 let memo_group_holes =
                     if matches!(self.transformation, PlannerTransformation::TopNIntroduction) {
-                        direct_topn_input_group(expr, ctx.memo(), &state)
+                        topn_input_group(&binding.root, ctx.memo(), &state)
                             .map(|group| vec![group].into_boxed_slice())
                     } else {
                         None
@@ -477,32 +427,43 @@ impl TransformationRule for PlannerTransformationRule {
 /// rediscovering it from one recursively materialized representative. The
 /// resulting TopN expression keeps the order input as the same group hole, so
 /// alternatives added below aggregate/join nodes remain composable.
-fn direct_topn_input_group(
-    expression: LogicalExprId,
+fn topn_input_group(
+    binding: &PatternOperand,
     memo: &Memo,
     state: &PlannerTransformState,
 ) -> Option<GroupId> {
-    let limit = memo.logical_expr(expression)?;
+    let PatternOperand::Expression {
+        expression,
+        children,
+        ..
+    } = binding
+    else {
+        return None;
+    };
+    let limit = memo.logical_expr(*expression)?;
     if state.metadata.get(&limit.payload)?.operator_type != LogicalOperatorType::Limit {
         return None;
     }
-    let order_group = memo.group(*limit.key.children.first()?)?;
-    let order = order_group
-        .logical_exprs()
-        .iter()
-        .filter_map(|expression| memo.logical_expr(*expression))
-        .filter(|expression| expression.proofs.contains(&EquivalenceProof::Initial))
-        .filter(|expression| {
-            state
-                .metadata
-                .get(&expression.payload)
-                .is_some_and(|metadata| metadata.operator_type == LogicalOperatorType::Order)
-        })
-        .min_by_key(|expression| expression.key.stable_fingerprint())?;
-    let [input] = order.key.children.as_ref() else {
+    let [PatternOperand::Expression {
+        expression: order_expression,
+        children: order_children,
+        ..
+    }] = children.as_ref()
+    else {
         return None;
     };
-    Some(memo.canonical_group(*input))
+    let order = memo.logical_expr(*order_expression)?;
+    if state.metadata.get(&order.payload)?.operator_type != LogicalOperatorType::Order {
+        return None;
+    }
+    let [input] = order_children.as_ref() else {
+        return None;
+    };
+    Some(match input {
+        PatternOperand::Expression { group, .. } | PatternOperand::Group(group) => {
+            memo.canonical_group(*group)
+        }
+    })
 }
 
 fn transformed_plan_matches_group_contract(

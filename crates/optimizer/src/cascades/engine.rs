@@ -30,8 +30,9 @@ use super::region::{
 #[cfg(test)]
 use super::rules::WorkSourceId;
 use super::rules::{
-    CostComposition, ImplementationContext, ImplementationRegistry, PhysicalCandidate, RuleContext,
-    SourceFilterWork, SourceRetentionProof, SourceWork, TransformContext,
+    CostComposition, ImplementationContext, ImplementationRegistry, PatternEnumerationCompletion,
+    PatternRead, PhysicalCandidate, RuleContext, SourceFilterWork, SourceRetentionProof,
+    SourceWork, TransformContext,
 };
 use crate::physical::SpillPolicy;
 
@@ -172,7 +173,7 @@ pub struct CascadesEngine {
     /// Last child-expression frontier consumed by each transformation task.
     /// A task that declined a match is recorded as well: a later child
     /// alternative may make that same pattern applicable.
-    transformation_observations: BTreeMap<TransformationTaskId, Box<[(GroupId, u64)]>>,
+    transformation_observations: BTreeMap<TransformationTaskId, Box<[PatternRead]>>,
     /// Reverse index for incrementally closing transformation dependencies.
     /// Subscribers are woken only after a Memo transaction commits.
     transformation_subscribers: BTreeMap<GroupId, BTreeSet<TransformationTaskId>>,
@@ -415,56 +416,7 @@ impl CascadesEngine {
             {
                 continue;
             }
-            let Some(dependency_version) = self.observe_transformation_inputs(task_id)? else {
-                continue;
-            };
-            let matches = {
-                let rule_impl = self
-                    .registry
-                    .transformation(rule)
-                    .ok_or_else(|| paro_error::internal("rule disappeared from registry"))?;
-                let expression_ref = self.memo.logical_expr(expression).ok_or_else(|| {
-                    paro_error::internal("rule task references unknown expression")
-                })?;
-                let context = RuleContext {
-                    memo: &self.memo,
-                    group,
-                };
-                rule_impl.matches(expression_ref, &context)
-            };
-            if !matches {
-                continue;
-            }
-            // `applied_rules` remains an audit of whether this rule has ever
-            // reached apply for the expression. Incremental idempotence is
-            // governed by the dependency-version observation above.
-            self.memo.mark_rule_applied(expression, rule)?;
-            let event = transformation_event(group, expression, rule, dependency_version);
-            let admitted = self
-                .memo
-                .group_mut(group)
-                .ok_or_else(|| paro_error::internal("rule task references unknown group"))?
-                .ledger
-                .admit_optional(BudgetDimension::RuleFirePerGroup, event);
-            if admitted == BudgetDecision::Exhausted {
-                continue;
-            }
-            if !admit_transformation_work(
-                &mut self.memo,
-                group,
-                expression,
-                rule,
-                dependency_version,
-            )? {
-                continue;
-            }
-            // Reserve the complete bounded frontier before the rule may append
-            // payloads or child groups. TransformContext mutations are
-            // append-only and become reachable through those roots, so
-            // post-apply budget rejection would manufacture orphan Memo
-            // state. Ordinary local rules reserve one slot; region owners can
-            // declare a larger deterministic bound.
-            let output_bound = {
+            let binding_set = {
                 let rule_impl = self
                     .registry
                     .transformation(rule)
@@ -473,186 +425,267 @@ impl CascadesEngine {
                     memo: &self.memo,
                     group,
                 };
-                rule_impl.output_bound(&context)
+                rule_impl.bindings(expression, &context)?
             };
-            let mut output_events = Vec::with_capacity(output_bound);
-            for ordinal in 0..output_bound {
-                let event = transformation_output_event(
-                    group,
-                    expression,
-                    rule,
-                    dependency_version,
-                    ordinal,
-                );
+            let Some(read_version) =
+                self.observe_transformation_inputs(task_id, &binding_set.reads)?
+            else {
+                continue;
+            };
+            if matches!(
+                binding_set.completion,
+                PatternEnumerationCompletion::BudgetLimited { .. }
+            ) {
+                let mut witness = StableFingerprintBuilder::default();
+                witness.write_bytes(b"paro.pattern-enumeration-limited.v1");
+                witness.write_u64(group.0 as u64);
+                witness.write_u64(expression.0 as u64);
+                witness.write_u64(rule.0 as u64);
+                witness.write_fingerprint(read_version);
+                self.memo
+                    .group_mut(group)
+                    .ok_or_else(|| paro_error::internal("pattern owner group disappeared"))?
+                    .ledger
+                    .record_budget_limited(BudgetDimension::RuleWorkPerGroup, witness.finish());
+            }
+            if binding_set.bindings.is_empty() {
+                continue;
+            }
+            for binding in binding_set.bindings.iter() {
+                let dependency_version =
+                    transformation_binding_fingerprint(read_version, binding.fingerprint);
+                // `applied_rules` remains an audit of whether this rule has ever
+                // reached apply for the expression. Incremental idempotence is
+                // governed by the dependency-version observation above.
+                self.memo.mark_rule_applied(expression, rule)?;
+                let event = transformation_event(group, expression, rule, dependency_version);
                 let admitted = self
                     .memo
                     .group_mut(group)
                     .ok_or_else(|| paro_error::internal("rule task references unknown group"))?
                     .ledger
-                    .admit_optional(BudgetDimension::LogicalExprPerGroup, event);
+                    .admit_optional(BudgetDimension::RuleFirePerGroup, event);
                 if admitted == BudgetDecision::Exhausted {
-                    break;
-                }
-                output_events.push(event);
-            }
-            if output_events.is_empty() {
-                continue;
-            }
-            *self.rule_attempts.entry(rule).or_default() += 1;
-            // The context owns the complete attempt. Its Memo snapshot is
-            // lazy, and rule-specific side state enlists in the same rollback
-            // domain before its first write.
-            let mut context = TransformContext::new(&mut self.memo, group);
-            let outputs_result = {
-                let rule_impl = self
-                    .registry
-                    .transformation(rule)
-                    .ok_or_else(|| paro_error::internal("rule disappeared from registry"))?;
-                rule_impl.apply(expression, &mut context)
-            };
-            let outputs = match outputs_result {
-                Ok(outputs) => outputs,
-                Err(error) => {
-                    context.rollback()?;
-                    release_transformation_output_reservations(
-                        &mut self.memo,
-                        group,
-                        &output_events,
-                    )?;
-                    tracing::debug!(
-                        target: "paro::optimizer",
-                        %error,
-                        rule = rule.0,
-                        group = group.index(),
-                        "discarded failed optional transformation"
-                    );
                     continue;
                 }
-            };
-            if outputs.is_empty() {
-                context.rollback()?;
-                release_transformation_output_reservations(&mut self.memo, group, &output_events)?;
-                continue;
-            }
-            if outputs.len() > output_events.len() {
-                context.rollback()?;
-                release_transformation_output_reservations(&mut self.memo, group, &output_events)?;
-                tracing::debug!(
-                    target: "paro::optimizer",
-                    rule = rule.0,
-                    group = group.index(),
-                    output_count = outputs.len(),
-                    reserved_outputs = output_events.len(),
-                    "discarded optional transformation whose frontier exceeded its declared bound"
-                );
-                continue;
-            }
-            let insertion = (|| -> Result<TransformationInsertion> {
-                let mut inserted_groups = BTreeSet::new();
-                let mut inserted_properties = Vec::new();
-                let mut inserted_expressions = 0usize;
-                for output in outputs {
-                    validate_transformation_proof(rule, expression, &output.proof)?;
-                    let target = context.memo().canonical_group(output.target_group);
-                    if target != context.memo().canonical_group(group) {
-                        return Err(paro_error::internal(
-                            "a local transformation must target its source equivalence group",
-                        ));
-                    }
-                    // A duplicate output is an ineffective transformation.
-                    // Do not call `insert_logical`: that method is allowed to
-                    // enrich the proof set of an existing expression, while
-                    // this attempt must remain completely side-effect free.
-                    if context
-                        .memo()
-                        .logical_expr_for_key(target, &output.key)
-                        .is_some()
-                    {
-                        continue;
-                    }
-                    let before = context
-                        .memo()
-                        .group(target)
-                        .map(|group| group.logical_exprs().len())
-                        .unwrap_or(0);
-                    context.memo_mut().insert_logical(
-                        target,
-                        output.key,
-                        output.payload,
-                        output.proof,
-                    )?;
-                    let after = context
-                        .memo()
-                        .group(target)
-                        .expect("target group was validated")
-                        .logical_exprs()
-                        .len();
-                    if after > before {
-                        inserted_groups.insert(target);
-                        inserted_expressions += after - before;
-                        inserted_properties.push((
-                            target,
-                            output.logical_properties,
-                            output.cardinality,
-                        ));
-                    }
-                }
-                Ok(TransformationInsertion {
-                    groups: inserted_groups,
-                    properties: inserted_properties,
-                    expressions: inserted_expressions,
-                })
-            })();
-            let TransformationInsertion {
-                groups: mut inserted_groups,
-                properties: inserted_properties,
-                expressions: inserted_expressions,
-            } = match insertion {
-                Ok(result) => result,
-                Err(error) => {
-                    context.rollback()?;
-                    release_transformation_output_reservations(
-                        &mut self.memo,
-                        group,
-                        &output_events,
-                    )?;
-                    tracing::debug!(
-                        target: "paro::optimizer",
-                        %error,
-                        rule = rule.0,
-                        group = group.index(),
-                        "discarded invalid optional transformation output"
-                    );
-                    continue;
-                }
-            };
-            if inserted_groups.is_empty() {
-                // A duplicate root is not an effective transformation. Drop
-                // any staged child groups and planner payloads with it.
-                context.rollback()?;
-                release_transformation_output_reservations(&mut self.memo, group, &output_events)?;
-            } else {
-                let appended_groups = context.commit()?;
-                release_transformation_output_reservations(
+                if !admit_transformation_work(
                     &mut self.memo,
                     group,
-                    &output_events[inserted_expressions.min(output_events.len())..],
-                )?;
-                for (target, properties, cardinality) in inserted_properties {
-                    let group = self.memo.group_mut(target).ok_or_else(|| {
-                        paro_error::internal("committed transformation lost its target group")
-                    })?;
-                    group.logical_properties.merge_equivalent_facts(&properties);
-                    group.cardinality =
-                        std::mem::take(&mut group.cardinality).canonical_with(cardinality);
+                    expression,
+                    rule,
+                    dependency_version,
+                    &binding_set.reads,
+                )? {
+                    continue;
                 }
-                *self.effective_rule_insertions.entry(rule).or_default() +=
-                    u64::try_from(inserted_expressions).unwrap_or(u64::MAX);
-                inserted_groups.extend(appended_groups);
-            }
-            for target in inserted_groups {
-                self.schedule_transformations(target, &mut agenda)?;
-                self.schedule_transformation_dependents(target, &mut agenda)?;
+                // Reserve the complete bounded frontier before the rule may append
+                // payloads or child groups. TransformContext mutations are
+                // append-only and become reachable through those roots, so
+                // post-apply budget rejection would manufacture orphan Memo
+                // state. Ordinary local rules reserve one slot; region owners can
+                // declare a larger deterministic bound.
+                let output_bound = {
+                    let rule_impl = self
+                        .registry
+                        .transformation(rule)
+                        .ok_or_else(|| paro_error::internal("rule disappeared from registry"))?;
+                    let context = RuleContext {
+                        memo: &self.memo,
+                        group,
+                    };
+                    rule_impl.output_bound(&context)
+                };
+                let mut output_events = Vec::with_capacity(output_bound);
+                for ordinal in 0..output_bound {
+                    let event = transformation_output_event(
+                        group,
+                        expression,
+                        rule,
+                        dependency_version,
+                        ordinal,
+                    );
+                    let admitted = self
+                        .memo
+                        .group_mut(group)
+                        .ok_or_else(|| paro_error::internal("rule task references unknown group"))?
+                        .ledger
+                        .admit_optional(BudgetDimension::LogicalExprPerGroup, event);
+                    if admitted == BudgetDecision::Exhausted {
+                        break;
+                    }
+                    output_events.push(event);
+                }
+                if output_events.is_empty() {
+                    continue;
+                }
+                *self.rule_attempts.entry(rule).or_default() += 1;
+                // The context owns the complete attempt. Its Memo snapshot is
+                // lazy, and rule-specific side state enlists in the same rollback
+                // domain before its first write.
+                let mut context = TransformContext::new(&mut self.memo, group);
+                let outputs_result = {
+                    let rule_impl = self
+                        .registry
+                        .transformation(rule)
+                        .ok_or_else(|| paro_error::internal("rule disappeared from registry"))?;
+                    rule_impl.apply_binding(binding, &mut context)
+                };
+                let outputs = match outputs_result {
+                    Ok(outputs) => outputs,
+                    Err(error) => {
+                        context.rollback()?;
+                        release_transformation_output_reservations(
+                            &mut self.memo,
+                            group,
+                            &output_events,
+                        )?;
+                        tracing::debug!(
+                            target: "paro::optimizer",
+                            %error,
+                            rule = rule.0,
+                            group = group.index(),
+                            "discarded failed optional transformation"
+                        );
+                        continue;
+                    }
+                };
+                if outputs.is_empty() {
+                    context.rollback()?;
+                    release_transformation_output_reservations(
+                        &mut self.memo,
+                        group,
+                        &output_events,
+                    )?;
+                    continue;
+                }
+                if outputs.len() > output_events.len() {
+                    context.rollback()?;
+                    release_transformation_output_reservations(
+                        &mut self.memo,
+                        group,
+                        &output_events,
+                    )?;
+                    tracing::debug!(
+                        target: "paro::optimizer",
+                        rule = rule.0,
+                        group = group.index(),
+                        output_count = outputs.len(),
+                        reserved_outputs = output_events.len(),
+                        "discarded optional transformation whose frontier exceeded its declared bound"
+                    );
+                    continue;
+                }
+                let insertion = (|| -> Result<TransformationInsertion> {
+                    let mut inserted_groups = BTreeSet::new();
+                    let mut inserted_properties = Vec::new();
+                    let mut inserted_expressions = 0usize;
+                    for output in outputs {
+                        validate_transformation_proof(rule, expression, &output.proof)?;
+                        let target = context.memo().canonical_group(output.target_group);
+                        if target != context.memo().canonical_group(group) {
+                            return Err(paro_error::internal(
+                                "a local transformation must target its source equivalence group",
+                            ));
+                        }
+                        // A duplicate output is an ineffective transformation.
+                        // Do not call `insert_logical`: that method is allowed to
+                        // enrich the proof set of an existing expression, while
+                        // this attempt must remain completely side-effect free.
+                        if context
+                            .memo()
+                            .logical_expr_for_key(target, &output.key)
+                            .is_some()
+                        {
+                            continue;
+                        }
+                        let before = context
+                            .memo()
+                            .group(target)
+                            .map(|group| group.logical_exprs().len())
+                            .unwrap_or(0);
+                        context.memo_mut().insert_logical(
+                            target,
+                            output.key,
+                            output.payload,
+                            output.proof,
+                        )?;
+                        let after = context
+                            .memo()
+                            .group(target)
+                            .expect("target group was validated")
+                            .logical_exprs()
+                            .len();
+                        if after > before {
+                            inserted_groups.insert(target);
+                            inserted_expressions += after - before;
+                            inserted_properties.push((
+                                target,
+                                output.logical_properties,
+                                output.cardinality,
+                            ));
+                        }
+                    }
+                    Ok(TransformationInsertion {
+                        groups: inserted_groups,
+                        properties: inserted_properties,
+                        expressions: inserted_expressions,
+                    })
+                })();
+                let TransformationInsertion {
+                    groups: mut inserted_groups,
+                    properties: inserted_properties,
+                    expressions: inserted_expressions,
+                } = match insertion {
+                    Ok(result) => result,
+                    Err(error) => {
+                        context.rollback()?;
+                        release_transformation_output_reservations(
+                            &mut self.memo,
+                            group,
+                            &output_events,
+                        )?;
+                        tracing::debug!(
+                            target: "paro::optimizer",
+                            %error,
+                            rule = rule.0,
+                            group = group.index(),
+                            "discarded invalid optional transformation output"
+                        );
+                        continue;
+                    }
+                };
+                if inserted_groups.is_empty() {
+                    // A duplicate root is not an effective transformation. Drop
+                    // any staged child groups and planner payloads with it.
+                    context.rollback()?;
+                    release_transformation_output_reservations(
+                        &mut self.memo,
+                        group,
+                        &output_events,
+                    )?;
+                } else {
+                    let appended_groups = context.commit()?;
+                    release_transformation_output_reservations(
+                        &mut self.memo,
+                        group,
+                        &output_events[inserted_expressions.min(output_events.len())..],
+                    )?;
+                    for (target, properties, cardinality) in inserted_properties {
+                        let group = self.memo.group_mut(target).ok_or_else(|| {
+                            paro_error::internal("committed transformation lost its target group")
+                        })?;
+                        group.logical_properties.merge_equivalent_facts(&properties);
+                        group.cardinality =
+                            std::mem::take(&mut group.cardinality).canonical_with(cardinality);
+                    }
+                    *self.effective_rule_insertions.entry(rule).or_default() +=
+                        u64::try_from(inserted_expressions).unwrap_or(u64::MAX);
+                    inserted_groups.extend(appended_groups);
+                }
+                for target in inserted_groups {
+                    self.schedule_transformations(target, &mut agenda)?;
+                    self.schedule_transformation_dependents(target, &mut agenda)?;
+                }
             }
         }
         Ok(())
@@ -711,9 +744,10 @@ impl CascadesEngine {
         let group = self.memo.canonical_group(group);
         let subscribers = self
             .transformation_subscribers
-            .get(&group)
-            .cloned()
-            .unwrap_or_default();
+            .iter()
+            .filter(|(observed, _)| self.memo.canonical_group(**observed) == group)
+            .flat_map(|(_, subscribers)| subscribers.iter().copied())
+            .collect::<BTreeSet<_>>();
         for subscriber in subscribers {
             let expression_ref =
                 self.memo
@@ -757,15 +791,17 @@ impl CascadesEngine {
         Ok(())
     }
 
-    /// Record the complete logical frontier reachable through the source
-    /// expression's child group holes. This conservative closure covers
-    /// legacy rules that still materialize a planner subtree while local
-    /// Memo-native rules naturally subscribe only to their direct holes.
+    /// Publish precisely the frontier revisions read by the matcher. Reads
+    /// from a completed no-match are retained, so a newly inserted alternative
+    /// wakes the parent without subscribing to unrelated descendants.
     fn observe_transformation_inputs(
         &mut self,
         task: TransformationTaskId,
+        reads: &[PatternRead],
     ) -> Result<Option<Fingerprint>> {
-        let dependencies = transformation_dependency_versions(&self.memo, task.expression)?;
+        let mut dependencies = reads.to_vec();
+        dependencies.sort_unstable();
+        dependencies.dedup();
         if self
             .transformation_observations
             .get(&task)
@@ -775,15 +811,15 @@ impl CascadesEngine {
         }
 
         if let Some(previous) = self.transformation_observations.get(&task) {
-            for &(group, _) in previous {
-                if let Some(subscribers) = self.transformation_subscribers.get_mut(&group) {
+            for read in previous {
+                if let Some(subscribers) = self.transformation_subscribers.get_mut(&read.group) {
                     subscribers.remove(&task);
                 }
             }
         }
-        for (group, _) in dependencies.iter().copied() {
+        for read in dependencies.iter().copied() {
             self.transformation_subscribers
-                .entry(group)
+                .entry(read.group)
                 .or_default()
                 .insert(task);
         }
@@ -1041,16 +1077,22 @@ impl CascadesEngine {
             if !children_feasible {
                 continue;
             }
-            let combination_limit = self
+            let admitted_combination_limit = self
                 .memo
                 .budget()
                 .max_child_frontier_combinations_per_group
                 .saturating_add(1) as usize;
-            for (ordinal, child_winners) in
-                child_winner_combinations(&child_frontiers, combination_limit)
-                    .into_iter()
-                    .enumerate()
-            {
+            let combinations =
+                child_winner_combinations(&child_frontiers, admitted_combination_limit);
+            tracing::debug!(
+                target: "paro::optimizer",
+                parent_group = group.index(),
+                physical_expression = physical.index(),
+                completion = ?combinations.completion,
+                generated_combinations = combinations.combinations.len(),
+                "enumerated bounded child frontier product"
+            );
+            for (ordinal, child_winners) in combinations.combinations.into_iter().enumerate() {
                 if ordinal > 0 {
                     let event = child_frontier_combination_event(
                         physical,
@@ -1218,6 +1260,7 @@ impl CascadesEngine {
                     group,
                     goal,
                     Winner {
+                        candidate: super::ids::CandidateId::INVALID,
                         expression: physical,
                         children: recipe
                             .child_goals
@@ -1227,8 +1270,7 @@ impl CascadesEngine {
                             .map(|((child, child_goal), winner)| ChildWinnerRef {
                                 group: child,
                                 goal: child_goal,
-                                expression: winner.expression,
-                                physical_fingerprint: winner.physical_fingerprint,
+                                candidate: winner.candidate,
                             })
                             .collect::<Vec<_>>()
                             .into_boxed_slice(),
@@ -1540,15 +1582,37 @@ pub(crate) struct ComposedCost {
     pub(crate) source_work: Box<[SourceWork]>,
 }
 
-fn child_winner_combinations(frontiers: &[Vec<Winner>], limit: usize) -> Vec<Vec<Winner>> {
-    let limit = limit.max(1);
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum EnumerationCompletion {
+    Complete,
+    BudgetLimited { omitted_at_least: usize },
+}
+
+#[derive(Debug)]
+struct ChildCombinationBatch {
+    combinations: Vec<Vec<Winner>>,
+    completion: EnumerationCompletion,
+}
+
+/// Materialize only the admissible child product plus one rejection witness.
+/// The extra item lets the ledger prove that a finite search was truncated.
+fn child_winner_combinations(
+    frontiers: &[Vec<Winner>],
+    admitted_limit: usize,
+) -> ChildCombinationBatch {
+    let admitted_limit = admitted_limit.max(1);
+    let witness_limit = admitted_limit.saturating_add(1);
     let mut combinations = vec![Vec::new()];
     for frontier in frontiers {
-        let mut next =
-            Vec::with_capacity(combinations.len().saturating_mul(frontier.len()).min(limit));
+        let mut next = Vec::with_capacity(
+            combinations
+                .len()
+                .saturating_mul(frontier.len())
+                .min(witness_limit),
+        );
         'product: for prefix in combinations {
             for winner in frontier {
-                if next.len() == limit {
+                if next.len() == witness_limit {
                     break 'product;
                 }
                 let mut combination = prefix.clone();
@@ -1558,7 +1622,19 @@ fn child_winner_combinations(frontiers: &[Vec<Winner>], limit: usize) -> Vec<Vec
         }
         combinations = next;
     }
-    combinations
+    let total = frontiers.iter().fold(1_usize, |product, frontier| {
+        product.saturating_mul(frontier.len())
+    });
+    ChildCombinationBatch {
+        completion: if total <= admitted_limit {
+            EnumerationCompletion::Complete
+        } else {
+            EnumerationCompletion::BudgetLimited {
+                omitted_at_least: total.saturating_sub(admitted_limit),
+            }
+        },
+        combinations,
+    }
 }
 
 fn child_frontier_combination_event(
@@ -1577,8 +1653,7 @@ fn child_frontier_combination_event(
     event.write_u64(goal.context.0 as u64);
     event.write_fingerprint(recipe);
     for child in children {
-        event.write_u64(child.expression.0 as u64);
-        event.write_fingerprint(child.physical_fingerprint);
+        event.write_u64(child.candidate.0 as u64);
     }
     event.finish()
 }
@@ -1891,43 +1966,25 @@ fn retained_source_cost(
     base_cost.retain_work(expected.min(upper), upper)
 }
 
-fn transformation_dependency_versions(
-    memo: &Memo,
-    source: LogicalExprId,
-) -> Result<Vec<(GroupId, u64)>> {
-    let source = memo
-        .logical_expr(source)
-        .ok_or_else(|| paro_error::internal("transformation dependency source disappeared"))?;
-    let mut pending = source.key.children.to_vec();
-    let mut visited = BTreeSet::new();
-    let mut dependencies = BTreeMap::new();
-    while let Some(group) = pending.pop() {
-        let group = memo.canonical_group(group);
-        if !visited.insert(group) {
-            continue;
-        }
-        let group_ref = memo.group(group).ok_or_else(|| {
-            paro_error::internal("transformation dependency references an unknown group")
-        })?;
-        dependencies.insert(group, group_ref.logical_expression_version());
-        for expression in group_ref.logical_exprs() {
-            let expression = memo.logical_expr(*expression).ok_or_else(|| {
-                paro_error::internal("transformation dependency expression disappeared")
-            })?;
-            pending.extend(expression.key.children.iter().copied());
-        }
-    }
-    Ok(dependencies.into_iter().collect())
-}
-
-fn transformation_dependency_fingerprint(dependencies: &[(GroupId, u64)]) -> Fingerprint {
+fn transformation_dependency_fingerprint(dependencies: &[PatternRead]) -> Fingerprint {
     let mut builder = StableFingerprintBuilder::default();
     builder.write_bytes(b"paro.transformation-dependencies.v1");
     builder.write_u64(dependencies.len() as u64);
-    for (group, version) in dependencies {
-        builder.write_u64(group.0 as u64);
-        builder.write_u64(*version);
+    for read in dependencies {
+        builder.write_u64(read.group.0 as u64);
+        builder.write_u64(read.logical_frontier_revision);
     }
+    builder.finish()
+}
+
+fn transformation_binding_fingerprint(
+    read_version: Fingerprint,
+    binding: Fingerprint,
+) -> Fingerprint {
+    let mut builder = StableFingerprintBuilder::default();
+    builder.write_bytes(b"paro.transformation-binding.v1");
+    builder.write_fingerprint(read_version);
+    builder.write_fingerprint(binding);
     builder.finish()
 }
 
@@ -1952,47 +2009,25 @@ fn admit_transformation_work(
     source: LogicalExprId,
     rule: RuleId,
     dependency_version: Fingerprint,
+    reads: &[PatternRead],
 ) -> Result<bool> {
-    let mut pending = vec![source];
-    let mut visited = BTreeSet::new();
-    while let Some(expression) = pending.pop() {
-        let children = memo
-            .logical_expr(expression)
-            .ok_or_else(|| {
-                paro_error::internal("rule work accounting references a missing expression")
-            })?
-            .key
-            .children
-            .clone();
-        for child in children.iter().copied() {
-            let child = memo.canonical_group(child);
-            if !visited.insert(child) {
-                continue;
-            }
-            let mut event = StableFingerprintBuilder::default();
-            event.write_bytes(b"paro.rule-work.v2");
-            event.write_u64(target.0 as u64);
-            event.write_u64(source.0 as u64);
-            event.write_u64(rule.0 as u64);
-            event.write_fingerprint(dependency_version);
-            event.write_u64(child.0 as u64);
-            if memo
-                .group_mut(target)
-                .ok_or_else(|| paro_error::internal("rule work target group disappeared"))?
-                .ledger
-                .admit_optional(BudgetDimension::RuleWorkPerGroup, event.finish())
-                == BudgetDecision::Exhausted
-            {
-                return Ok(false);
-            }
-            let child_expression = memo
-                .group(child)
-                .and_then(|group| group.logical_exprs().first())
-                .copied()
-                .ok_or_else(|| {
-                    paro_error::internal("rule work accounting found an empty child group")
-                })?;
-            pending.push(child_expression);
+    for read in reads {
+        let mut event = StableFingerprintBuilder::default();
+        event.write_bytes(b"paro.rule-work.v3");
+        event.write_u64(target.0 as u64);
+        event.write_u64(source.0 as u64);
+        event.write_u64(rule.0 as u64);
+        event.write_fingerprint(dependency_version);
+        event.write_u64(read.group.0 as u64);
+        event.write_u64(read.logical_frontier_revision);
+        if memo
+            .group_mut(target)
+            .ok_or_else(|| paro_error::internal("rule work target group disappeared"))?
+            .ledger
+            .admit_optional(BudgetDimension::RuleWorkPerGroup, event.finish())
+            == BudgetDecision::Exhausted
+        {
+            return Ok(false);
         }
     }
     Ok(true)

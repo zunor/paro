@@ -229,6 +229,13 @@ impl SearchLedger {
         self.consumed.get(&dimension).map_or(0, BTreeSet::len)
     }
 
+    /// Record an omission discovered by a lazy enumerator which stopped
+    /// before constructing the rejected semantic event. This is completion
+    /// evidence only; it cannot consume or manufacture optional credit.
+    pub fn record_budget_limited(&mut self, dimension: BudgetDimension, witness: Fingerprint) {
+        self.exhaustion_events.insert((dimension, witness));
+    }
+
     /// Release a provisional optional admission that did not make any Memo
     /// state reachable.  Transformations reserve their output slot before
     /// running because their context is append-only; a no-op firing must not

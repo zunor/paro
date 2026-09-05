@@ -45,6 +45,7 @@ id_type!(ScalarExprId);
 id_type!(GroupId);
 id_type!(LogicalExprId);
 id_type!(PhysicalExprId);
+id_type!(CandidateId);
 id_type!(LogicalPayloadId);
 id_type!(PhysicalPayloadId);
 id_type!(PropertySetId);

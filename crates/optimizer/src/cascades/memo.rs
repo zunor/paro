@@ -13,9 +13,9 @@ use super::column::GroupSchema;
 use super::cost::SearchCost;
 use super::enforcer::{replay_enforcer_chain, EnforcerStep};
 use super::ids::{
-    AdmissibleGrantSetId, Fingerprint, GroupId, ImplementationId, LogicalExprId, LogicalPayloadId,
-    OptimizationContextId, PhysicalExprId, PhysicalPayloadId, PropertySetId, ResourceGrantClassId,
-    RuleId, StableFingerprintBuilder,
+    AdmissibleGrantSetId, CandidateId, Fingerprint, GroupId, ImplementationId, LogicalExprId,
+    LogicalPayloadId, OptimizationContextId, PhysicalExprId, PhysicalPayloadId, PropertySetId,
+    ResourceGrantClassId, RuleId, StableFingerprintBuilder,
 };
 use super::properties::{PropertyInterner, ProvidedProperties, RequiredProperties};
 use super::region::{JointCostProof, RegionFacet, RegionForest};
@@ -359,12 +359,15 @@ impl OptimizationContext {
 pub struct ChildWinnerRef {
     pub group: GroupId,
     pub goal: OptimizationGoal,
-    pub expression: PhysicalExprId,
-    pub physical_fingerprint: Fingerprint,
+    /// Immutable winner-arena identity. Frontier pruning, resorting, and group
+    /// merging cannot invalidate this reference.
+    pub candidate: CandidateId,
 }
 
 #[derive(Debug, Clone)]
 pub struct Winner {
+    /// Assigned exactly once by `Memo::record_winner`.
+    pub candidate: CandidateId,
     pub expression: PhysicalExprId,
     pub children: Box<[ChildWinnerRef]>,
     pub enforcers: Box<[EnforcerStep]>,
@@ -525,6 +528,7 @@ pub struct Memo {
     physical_exprs: Vec<PhysicalExpr>,
     logical_owners: Vec<GroupId>,
     physical_owners: Vec<GroupId>,
+    winner_candidates: Vec<WinnerCandidate>,
     properties: PropertyInterner,
     optimization_contexts: Vec<OptimizationContext>,
     optimization_context_index: BTreeMap<OptimizationContext, OptimizationContextId>,
@@ -533,6 +537,13 @@ pub struct Memo {
     budget: SearchBudget,
     calibration: Arc<MachineCalibrationBundle>,
     regions: RegionForest,
+}
+
+#[derive(Debug, Clone)]
+struct WinnerCandidate {
+    group: GroupId,
+    goal: OptimizationGoal,
+    winner: Winner,
 }
 
 #[derive(Debug)]
@@ -552,6 +563,7 @@ impl Memo {
             physical_exprs: Vec::new(),
             logical_owners: Vec::new(),
             physical_owners: Vec::new(),
+            winner_candidates: Vec::new(),
             properties: PropertyInterner::default(),
             optimization_contexts: vec![root_context.clone()],
             optimization_context_index: BTreeMap::from([(
@@ -1052,7 +1064,7 @@ impl Memo {
         &mut self,
         group: GroupId,
         goal: OptimizationGoal,
-        winner: Winner,
+        mut winner: Winner,
     ) -> Result<bool> {
         winner.local_cost.validate()?;
         winner.cost.validate()?;
@@ -1095,6 +1107,13 @@ impl Memo {
             ));
         }
 
+        let candidate = CandidateId::new(self.winner_candidates.len());
+        winner.candidate = candidate;
+        self.winner_candidates.push(WinnerCandidate {
+            group,
+            goal,
+            winner: winner.clone(),
+        });
         let frontier_limit = self.budget.max_pareto_winners_per_goal;
         let slot = self.groups[group.index()].winner_frontiers.entry(goal);
         match slot {
@@ -1111,15 +1130,10 @@ impl Memo {
     }
 
     pub fn resolve_child_winner(&self, child: ChildWinnerRef) -> Option<&Winner> {
-        let group = self.group(self.canonical_group(child.group))?;
-        group
-            .winner_frontier(child.goal)?
-            .candidates()
-            .iter()
-            .find(|winner| {
-                winner.expression == child.expression
-                    && winner.physical_fingerprint == child.physical_fingerprint
-            })
+        let candidate = self.winner_candidates.get(child.candidate.index())?;
+        (self.canonical_group(candidate.group) == self.canonical_group(child.group)
+            && candidate.goal == child.goal)
+            .then_some(&candidate.winner)
     }
 
     pub fn merge_groups(&mut self, left: GroupId, right: GroupId) -> Result<GroupId> {

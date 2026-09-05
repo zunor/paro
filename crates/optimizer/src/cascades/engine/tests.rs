@@ -2339,3 +2339,173 @@ fn source_predicate_attribution_is_invariant_to_lane_partitioning() {
             .sum::<f64>()
     );
 }
+
+struct BudgetLimitedCombinationImplementation;
+
+impl PhysicalImplementation for BudgetLimitedCombinationImplementation {
+    fn id(&self) -> ImplementationId {
+        ImplementationId(701)
+    }
+
+    fn matches(
+        &self,
+        _: &super::super::memo::LogicalExpr,
+        _: OptimizationGoal,
+        _: &ImplementationContext<'_>,
+    ) -> bool {
+        true
+    }
+
+    fn candidates(
+        &self,
+        expr: LogicalExprId,
+        goal: OptimizationGoal,
+        ctx: &ImplementationContext<'_>,
+    ) -> Result<Box<[PhysicalCandidate]>> {
+        let logical = ctx.memo.logical_expr(expr).unwrap();
+        let source = WorkSourceId(777);
+        let (work, composition, apply_cost) = match logical.key.operator.0 {
+            201 => (100.0, CostComposition::Sequential, None),
+            202 => (95.0, CostComposition::Sequential, None),
+            211 => (
+                10.0,
+                CostComposition::Source {
+                    source,
+                    source_rows: 10,
+                },
+                None,
+            ),
+            212 => (
+                25.0,
+                CostComposition::Source {
+                    source,
+                    source_rows: 25,
+                },
+                None,
+            ),
+            204 => (0.0, CostComposition::Sequential, None),
+            213 => (
+                130.0,
+                CostComposition::Source {
+                    source,
+                    source_rows: 130,
+                },
+                None,
+            ),
+            203 => (
+                0.0,
+                CostComposition::SidewaysFilter {
+                    overlapping_children: 0,
+                    filtered_child: 0,
+                    sources: Box::new([retained_source(source, 10_000, 1_000_000)]),
+                },
+                Some(cost(0.0)),
+            ),
+            _ => unreachable!(),
+        };
+        Ok(Box::new([PhysicalCandidate {
+            key: PhysicalExprKey {
+                implementation: self.id(),
+                logical: expr,
+                children: logical.key.children.clone(),
+                payload_fingerprint: logical.key.operator,
+            },
+            payload: PhysicalPayloadId(logical.payload.0),
+            provided: provided(),
+            child_goals: logical
+                .key
+                .children
+                .iter()
+                .map(|child| (*child, goal))
+                .collect::<Vec<_>>()
+                .into_boxed_slice(),
+            local_cost: cost(work),
+            source_filter_apply_cost: apply_cost,
+            cost_composition: composition,
+            spillable: false,
+            enforcer_cost_input: EnforcerCostInput::unbounded(CompactRange::point(1.0).unwrap(), 8),
+            physical_fingerprint: logical.key.operator,
+            region: None,
+            mandatory: true,
+        }]))
+    }
+}
+
+#[test]
+fn child_product_cutoff_records_budget_limited_completion() {
+    fn search(limit: u32) -> (f64, usize, usize, usize) {
+        let mut budget = super::super::budget::SearchBudget::default();
+        budget.max_child_frontier_combinations_per_group = limit;
+        let mut memo = Memo::new(budget);
+        let mut add = |operator: u128, children: Box<[GroupId]>, group: Option<GroupId>| {
+            let group = group.unwrap_or_else(|| {
+                memo.create_group(
+                    schema(),
+                    LogicalProperties::default(),
+                    GroupCardinality::default(),
+                )
+            });
+            memo.insert_logical(
+                group,
+                LogicalExprKey {
+                    operator: Fingerprint(operator),
+                    scalars: Box::new([]),
+                    children,
+                },
+                LogicalPayloadId(operator as u32),
+                if matches!(operator, 202 | 204) {
+                    EquivalenceProof::Normalization { rule: RuleId(701) }
+                } else {
+                    EquivalenceProof::Initial
+                },
+            )
+            .unwrap();
+            group
+        };
+        let scan_a = add(211, Box::new([]), None);
+        let scan_b = add(212, Box::new([]), None);
+        let scan_c = add(213, Box::new([]), None);
+        let child = add(201, Box::new([scan_a]), None);
+        add(202, Box::new([scan_b]), Some(child));
+        add(204, Box::new([scan_c]), Some(child));
+        let root = add(203, Box::new([child]), None);
+        let goal = OptimizationGoal {
+            required: memo.intern_required(required()).unwrap(),
+            row_goal: RowGoal::All,
+            objective: ObjectiveProfile::Latency,
+            grant: GrantGoalKey::Invariant(AdmissibleGrantSetId(0)),
+            context: OptimizationContextId(0),
+        };
+        let mut registry = ImplementationRegistry::default();
+        registry
+            .register_implementation(BudgetLimitedCombinationImplementation)
+            .unwrap();
+        let mut engine = CascadesEngine::new(memo, registry);
+        let winner = engine.optimize(root, goal, SearchMode::Memo).unwrap();
+        let root_group = engine.memo().group(root).unwrap();
+        let consumed = root_group
+            .ledger
+            .consumed(BudgetDimension::ChildFrontierCombination);
+        let exhausted = root_group
+            .ledger
+            .exhaustion_events()
+            .filter(|(dimension, _)| *dimension == BudgetDimension::ChildFrontierCombination)
+            .count();
+        let width = engine
+            .memo()
+            .group(child)
+            .unwrap()
+            .winner_frontier(goal)
+            .unwrap()
+            .candidates()
+            .len();
+        (winner.cost.score.range.expected, consumed, exhausted, width)
+    }
+    let (chosen, consumed, exhausted, width) = search(1);
+    let (oracle, _, _, _) = search(8);
+    assert_eq!(width, 3);
+    assert_eq!(consumed, 1);
+    assert!(exhausted > 0);
+    assert!(chosen > oracle);
+    assert!((oracle - 1.3).abs() < 1e-9);
+}

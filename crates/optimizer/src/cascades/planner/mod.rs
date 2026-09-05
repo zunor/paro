@@ -76,8 +76,9 @@ use super::region::{
 };
 use super::rules::{
     CostComposition, EquivalentExpression, GrantDependencyDescriptor, ImplementationContext,
-    ImplementationRegistry, PhysicalCandidate, PhysicalImplementation, RuleContext, RulePromise,
-    SidewaysFilterSource, TransformContext, TransformationRule, WorkSourceId,
+    ImplementationRegistry, PatternBinding, PatternBindingSet, PatternEnumerationCompletion,
+    PatternOperand, PatternRead, PhysicalCandidate, PhysicalImplementation, RuleContext,
+    RulePromise, SidewaysFilterSource, TransformContext, TransformationRule, WorkSourceId,
     AGGREGATE_DIMENSION_DEFERRAL_RULE, AGGREGATE_INPUT_MATERIALIZATION_RULE,
     AGGREGATE_JOIN_PREAGGREGATION_RULE, AGGREGATE_JOIN_SUBSUMPTION_RULE,
     AGGREGATE_NON_NULL_INPUT_RULE, AGGREGATE_POST_REDUCTION_RULE, CTE_DEMAND_PUSHDOWN_RULE,

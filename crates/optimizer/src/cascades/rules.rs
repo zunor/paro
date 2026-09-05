@@ -130,6 +130,79 @@ pub struct RuleContext<'a> {
     pub group: GroupId,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PatternEnumerationCompletion {
+    Complete,
+    BudgetLimited { omitted_at_least: usize },
+}
+
+/// One explicitly bound Memo operand. Expression nodes name the exact logical
+/// alternative consumed by a matcher; group nodes are preserved holes which
+/// a transformation deliberately does not inspect.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PatternOperand {
+    Expression {
+        group: GroupId,
+        expression: LogicalExprId,
+        children: Box<[PatternOperand]>,
+    },
+    Group(GroupId),
+}
+
+impl PatternOperand {
+    pub fn expression(&self) -> Option<LogicalExprId> {
+        match self {
+            Self::Expression { expression, .. } => Some(*expression),
+            Self::Group(_) => None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PatternBinding {
+    pub root: PatternOperand,
+    pub fingerprint: Fingerprint,
+}
+
+impl PatternBinding {
+    pub fn root_expression(&self) -> LogicalExprId {
+        self.root
+            .expression()
+            .expect("a transformation binding root must be an expression")
+    }
+
+    pub fn root_only(group: GroupId, expression: LogicalExprId, logical: &LogicalExpr) -> Self {
+        Self {
+            root: PatternOperand::Expression {
+                group,
+                expression,
+                children: logical
+                    .key
+                    .children
+                    .iter()
+                    .copied()
+                    .map(PatternOperand::Group)
+                    .collect::<Vec<_>>()
+                    .into_boxed_slice(),
+            },
+            fingerprint: logical.key.stable_fingerprint(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub struct PatternRead {
+    pub group: GroupId,
+    pub logical_frontier_revision: u64,
+}
+
+#[derive(Debug, Clone)]
+pub struct PatternBindingSet {
+    pub bindings: Box<[PatternBinding]>,
+    pub reads: Box<[PatternRead]>,
+    pub completion: PatternEnumerationCompletion,
+}
+
 type TransformationRollback = Box<dyn FnOnce() -> Result<()> + 'static>;
 
 pub struct TransformContext<'a> {
@@ -260,11 +333,60 @@ pub trait TransformationRule: Send + Sync {
 
     fn matches(&self, expr: &LogicalExpr, ctx: &RuleContext<'_>) -> bool;
 
+    /// Bind the exact alternatives consumed by this firing and return every
+    /// frontier revision read while doing so, including a completed no-match.
+    /// Rules which only inspect their root inherit the root binding and direct
+    /// child read set; structural planner rules override this with native
+    /// pattern enumeration.
+    fn bindings(&self, expr: LogicalExprId, ctx: &RuleContext<'_>) -> Result<PatternBindingSet> {
+        let logical = ctx
+            .memo
+            .logical_expr(expr)
+            .ok_or_else(|| paro_error::internal("rule binding lost its root expression"))?;
+        let reads = logical
+            .key
+            .children
+            .iter()
+            .copied()
+            .map(|group| {
+                let group = ctx.memo.canonical_group(group);
+                let logical_frontier_revision = ctx
+                    .memo
+                    .group(group)
+                    .ok_or_else(|| paro_error::internal("rule binding read an unknown group"))?
+                    .logical_expression_version();
+                Ok(PatternRead {
+                    group,
+                    logical_frontier_revision,
+                })
+            })
+            .collect::<Result<Vec<_>>>()?;
+        let bindings = self
+            .matches(logical, ctx)
+            .then(|| PatternBinding::root_only(ctx.group, expr, logical))
+            .into_iter()
+            .collect::<Vec<_>>()
+            .into_boxed_slice();
+        Ok(PatternBindingSet {
+            bindings,
+            reads: reads.into_boxed_slice(),
+            completion: PatternEnumerationCompletion::Complete,
+        })
+    }
+
     fn apply(
         &self,
         expr: LogicalExprId,
         ctx: &mut TransformContext<'_>,
     ) -> Result<Box<[EquivalentExpression]>>;
+
+    fn apply_binding(
+        &self,
+        binding: &PatternBinding,
+        ctx: &mut TransformContext<'_>,
+    ) -> Result<Box<[EquivalentExpression]>> {
+        self.apply(binding.root_expression(), ctx)
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]

@@ -624,7 +624,7 @@ mod tests {
     use crate::cascades::column::{ColumnDesc, ColumnOrigin, ColumnVisibility, GroupSchema};
     use crate::cascades::cost::{CompactRange, SearchCost};
     use crate::cascades::ids::{
-        AdmissibleGrantSetId, ColumnId, LogicalPayloadId, PhysicalExprId, PhysicalPayloadId,
+        AdmissibleGrantSetId, ColumnId, LogicalPayloadId, PhysicalPayloadId,
     };
     use crate::cascades::memo::{
         GrantGoalKey, GroupCardinality, LogicalExprKey, LogicalProperties, PhysicalExprKey,
@@ -761,14 +761,14 @@ mod tests {
         ];
         dependencies.sort_unstable();
         let winner = Winner {
+            candidate: crate::cascades::ids::CandidateId::INVALID,
             expression: physical,
             children: child_goals
                 .iter()
                 .map(|(group, goal)| crate::cascades::memo::ChildWinnerRef {
                     group: *group,
                     goal: *goal,
-                    expression: PhysicalExprId::new(0),
-                    physical_fingerprint: Fingerprint::default(),
+                    candidate: crate::cascades::ids::CandidateId::INVALID,
                 })
                 .collect::<Vec<_>>()
                 .into_boxed_slice(),
@@ -965,14 +965,14 @@ mod tests {
         ];
         dependencies.sort_unstable();
         let winner = Winner {
+            candidate: crate::cascades::ids::CandidateId::INVALID,
             expression: physical,
             children: child_goals
                 .iter()
                 .map(|(group, goal)| crate::cascades::memo::ChildWinnerRef {
                     group: *group,
                     goal: *goal,
-                    expression: PhysicalExprId::new(0),
-                    physical_fingerprint: Fingerprint::default(),
+                    candidate: crate::cascades::ids::CandidateId::INVALID,
                 })
                 .collect::<Vec<_>>()
                 .into_boxed_slice(),

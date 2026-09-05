@@ -202,6 +202,7 @@ fn winner_is_keyed_by_goal_and_uses_stable_tie_break() {
         group,
         goal,
         Winner {
+            candidate: CandidateId::INVALID,
             expression: physical,
             children: Box::new([]),
             enforcers: Box::new([]),
@@ -217,10 +218,12 @@ fn winner_is_keyed_by_goal_and_uses_stable_tie_break() {
         },
     )
     .unwrap();
+    let retired_candidate = memo.group(group).unwrap().winner(goal).unwrap().candidate;
     memo.record_winner(
         group,
         goal,
         Winner {
+            candidate: CandidateId::INVALID,
             expression: physical,
             children: Box::new([]),
             enforcers: Box::new([]),
@@ -243,6 +246,17 @@ fn winner_is_keyed_by_goal_and_uses_stable_tie_break() {
             .unwrap()
             .physical_fingerprint,
         Fingerprint(10)
+    );
+    assert_eq!(
+        memo.resolve_child_winner(ChildWinnerRef {
+            group,
+            goal,
+            candidate: retired_candidate,
+        })
+        .unwrap()
+        .physical_fingerprint,
+        Fingerprint(20),
+        "an exact child reference must survive frontier pruning"
     );
 }
 
@@ -331,6 +345,7 @@ fn exact_tie_keeps_the_mandatory_expression_ahead_of_ephemeral_fingerprints() {
             group,
             goal,
             Winner {
+                candidate: CandidateId::INVALID,
                 expression,
                 children: Box::new([]),
                 enforcers: Box::new([]),
@@ -411,6 +426,7 @@ fn winner_frontier_retains_non_dominated_resource_tradeoffs() {
             group,
             goal,
             Winner {
+                candidate: CandidateId::INVALID,
                 expression: physical,
                 children: Box::new([]),
                 enforcers: Box::new([]),
@@ -449,6 +465,7 @@ fn latency_and_robustness_profiles_rank_uncertainty_explicitly() {
             ..SearchCost::ZERO
         };
         Winner {
+            candidate: CandidateId::INVALID,
             expression: PhysicalExprId::new(expression),
             children: Box::new([]),
             enforcers: Box::new([]),
@@ -502,6 +519,7 @@ fn frontier_and_admission_share_the_same_objective_contract() {
             ..SearchCost::ZERO
         };
         Winner {
+            candidate: CandidateId::INVALID,
             expression: PhysicalExprId::new(expression),
             children: Box::new([]),
             enforcers: Box::new([]),
@@ -780,6 +798,7 @@ fn winner_recording_recomputes_local_cost_instead_of_trusting_total() {
             group,
             goal,
             Winner {
+                candidate: CandidateId::INVALID,
                 expression: physical,
                 children: Box::new([]),
                 enforcers: Box::new([]),
