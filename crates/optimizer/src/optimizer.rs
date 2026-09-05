@@ -785,6 +785,10 @@ impl Optimizer {
         // the Query-IR boundary canonical so equality edges always reach join
         // enumeration and physical implementation selection.
         plan = JoinPredicateNormalizer::new(&self.ctx.bind_context).optimize_plan(plan)?;
+        // Dependent-join flattening can preserve strict equality as a
+        // null-safe comparison plus an explicit null rejection. Recover the
+        // canonical equality before costing and physical artifact selection.
+        plan = crate::join::null_rejected_equality::optimize_plan(plan).0;
         // Query-IR output contracts are demand driven. Until every planner
         // operator natively exposes ColumnIds, derive the same canonical
         // demand projection once at the Query IR boundary; this is not an

@@ -6,3 +6,4 @@
 pub mod build_probe_side;
 pub mod elimination;
 pub mod mixed_predicates;
+pub mod null_rejected_equality;

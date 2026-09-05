@@ -70,6 +70,31 @@ impl JoinType {
         )
     }
 
+    /// Whether a value originating on the left remains unchanged in this
+    /// join's output. This is a value-lineage contract, independent of whether
+    /// the side is present in a particular projection map.
+    pub fn preserves_left_values(&self) -> bool {
+        matches!(
+            self,
+            JoinType::Inner
+                | JoinType::Left
+                | JoinType::Semi
+                | JoinType::Anti
+                | JoinType::Mark
+                | JoinType::Single
+        )
+    }
+
+    /// Whether a value originating on the right remains unchanged in this
+    /// join's output. `SINGLE` has left-outer value semantics on its right
+    /// side even though it is not classified as a regular outer join.
+    pub fn preserves_right_values(&self) -> bool {
+        matches!(
+            self,
+            JoinType::Inner | JoinType::Right | JoinType::RightSemi | JoinType::RightAnti
+        )
+    }
+
     /// Returns the inverse join type if it exists.
     pub fn inverse(&self) -> Option<JoinType> {
         match self {
