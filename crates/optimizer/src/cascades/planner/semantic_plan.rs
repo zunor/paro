@@ -123,9 +123,11 @@ fn preferred_semantic_expression(
         .or_else(|| expression_for(None))
 }
 
-/// Restore the occurrence's exact output contract after materializing a
-/// canonical Memo template. Every node is frozen independently because a
-/// parent's schema cannot describe hidden columns removed by its children.
+/// Restore the occurrence's output column set after materializing a canonical
+/// Memo template. Unary projection maps retain the requested order. Joins
+/// retain their natural left/right partition because Memo schemas are
+/// unordered ColumnId sets; parents and final presentation map identities to
+/// slots after winner selection.
 pub(super) fn freeze_output_layout(
     mut plan: LogicalPlan,
     output_columns: &[ColumnId],
@@ -362,23 +364,16 @@ fn join_projections(
     let right_columns = resolved_columns(right, bindings)?;
     let mut left_indices = Vec::new();
     let mut right_indices = Vec::new();
-    let mut reached_right = false;
     for output in output_columns {
         if let Some(index) = left_columns
             .iter()
             .position(|candidate| candidate == output)
         {
-            if reached_right {
-                return Err(paro_error::internal(
-                    "inner-join group output interleaves its child layouts",
-                ));
-            }
             left_indices.push(index);
         } else if let Some(index) = right_columns
             .iter()
             .position(|candidate| candidate == output)
         {
-            reached_right = true;
             right_indices.push(index);
         } else if Some(*output) != marker {
             return Err(paro_error::internal(

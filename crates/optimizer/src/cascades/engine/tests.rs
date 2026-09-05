@@ -28,7 +28,7 @@ use crate::cascades::properties::{
 use crate::cascades::region::RegionArtifactDependencyContract;
 use crate::cascades::rules::{
     EquivalentExpression, GrantDependencyDescriptor, PhysicalImplementation, RulePromise,
-    TransformationRule,
+    SidewaysFilterSource, TransformationRule,
 };
 
 fn schema() -> GroupSchema {
@@ -77,6 +77,18 @@ fn cost(score: f64) -> SearchCost {
         },
         critical_path: CompactRange::point(score).unwrap(),
         ..SearchCost::ZERO
+    }
+}
+
+fn retained_source(
+    source: WorkSourceId,
+    expected_retained_ppm: u32,
+    upper_retained_ppm: u32,
+) -> SidewaysFilterSource {
+    SidewaysFilterSource {
+        source,
+        expected_retained_ppm,
+        upper_retained_ppm,
     }
 }
 
@@ -409,6 +421,95 @@ impl TransformationRule for RewriteNewChild {
     }
 }
 
+struct AddChildAlternative {
+    id: RuleId,
+}
+
+impl TransformationRule for AddChildAlternative {
+    fn id(&self) -> RuleId {
+        self.id
+    }
+
+    fn matches(&self, expr: &super::super::memo::LogicalExpr, _: &RuleContext<'_>) -> bool {
+        expr.key.operator == Fingerprint(40)
+    }
+
+    fn apply(
+        &self,
+        expr: LogicalExprId,
+        ctx: &mut TransformContext<'_>,
+    ) -> Result<Box<[EquivalentExpression]>> {
+        Ok(vec![EquivalentExpression {
+            target_group: ctx.group(),
+            key: LogicalExprKey {
+                operator: Fingerprint(41),
+                scalars: Box::new([]),
+                children: Box::new([]),
+            },
+            payload: LogicalPayloadId(41),
+            logical_properties: LogicalProperties::default(),
+            cardinality: GroupCardinality::default(),
+            proof: EquivalenceProof::Transformation {
+                rule: self.id(),
+                source: expr,
+                premise: Fingerprint(401),
+            },
+        }]
+        .into_boxed_slice())
+    }
+}
+
+struct RewriteParentAfterChildAlternative {
+    id: RuleId,
+}
+
+impl TransformationRule for RewriteParentAfterChildAlternative {
+    fn id(&self) -> RuleId {
+        self.id
+    }
+
+    fn matches(&self, expr: &super::super::memo::LogicalExpr, ctx: &RuleContext<'_>) -> bool {
+        if expr.key.operator != Fingerprint(50) {
+            return false;
+        }
+        let [child] = expr.key.children.as_ref() else {
+            return false;
+        };
+        ctx.memo.group(*child).is_some_and(|group| {
+            group.logical_exprs().iter().any(|expression| {
+                ctx.memo
+                    .logical_expr(*expression)
+                    .is_some_and(|expression| expression.key.operator == Fingerprint(41))
+            })
+        })
+    }
+
+    fn apply(
+        &self,
+        expr: LogicalExprId,
+        ctx: &mut TransformContext<'_>,
+    ) -> Result<Box<[EquivalentExpression]>> {
+        let source = ctx.memo().logical_expr(expr).unwrap();
+        Ok(vec![EquivalentExpression {
+            target_group: ctx.group(),
+            key: LogicalExprKey {
+                operator: Fingerprint(51),
+                scalars: Box::new([]),
+                children: source.key.children.clone(),
+            },
+            payload: LogicalPayloadId(51),
+            logical_properties: LogicalProperties::default(),
+            cardinality: GroupCardinality::default(),
+            proof: EquivalenceProof::Transformation {
+                rule: self.id(),
+                source: expr,
+                premise: Fingerprint(501),
+            },
+        }]
+        .into_boxed_slice())
+    }
+}
+
 struct RejectAfterSidecarWrite {
     sidecar: Arc<AtomicUsize>,
 }
@@ -732,6 +833,72 @@ fn committed_child_groups_are_scheduled_for_exploration() {
 }
 
 #[test]
+fn parent_transformations_close_over_late_child_alternatives_independent_of_rule_order() {
+    fn explore(parent_rule: RuleId, child_rule: RuleId) -> bool {
+        let mut budget = super::super::budget::SearchBudget::default();
+        budget.disable_transformation(RuleId(5));
+        let (mut engine, root, _) = engine_with_budget(budget);
+        let child = engine.memo_mut().create_group(
+            schema(),
+            LogicalProperties::default(),
+            GroupCardinality::default(),
+        );
+        engine
+            .memo_mut()
+            .insert_logical(
+                child,
+                LogicalExprKey {
+                    operator: Fingerprint(40),
+                    scalars: Box::new([]),
+                    children: Box::new([]),
+                },
+                LogicalPayloadId(40),
+                EquivalenceProof::Initial,
+            )
+            .unwrap();
+        engine
+            .memo_mut()
+            .insert_logical(
+                root,
+                LogicalExprKey {
+                    operator: Fingerprint(50),
+                    scalars: Box::new([]),
+                    children: Box::new([child]),
+                },
+                LogicalPayloadId(50),
+                EquivalenceProof::Normalization { rule: RuleId(50) },
+            )
+            .unwrap();
+        engine
+            .registry
+            .register_transformation(RewriteParentAfterChildAlternative { id: parent_rule })
+            .unwrap();
+        engine
+            .registry
+            .register_transformation(AddChildAlternative { id: child_rule })
+            .unwrap();
+
+        engine.explore_transformations().unwrap();
+
+        engine
+            .memo()
+            .group(root)
+            .unwrap()
+            .logical_exprs()
+            .iter()
+            .any(|expression| {
+                engine
+                    .memo()
+                    .logical_expr(*expression)
+                    .is_some_and(|expression| expression.key.operator == Fingerprint(51))
+            })
+    }
+
+    assert!(explore(RuleId(30), RuleId(31)), "parent ran before child");
+    assert!(explore(RuleId(31), RuleId(30)), "child ran before parent");
+}
+
+#[test]
 fn direct_and_memo_share_implementation_registry() {
     let (mut direct, group, goal) = engine(8);
     let direct_winner = direct.optimize(group, goal, SearchMode::Direct).unwrap();
@@ -1018,8 +1185,7 @@ fn sideways_filter_scales_work_without_weakening_resource_proofs() {
         CostComposition::SidewaysFilter {
             overlapping_children: 1,
             filtered_child: 0,
-            sources: Box::new([source]),
-            expected_retained_ppm: 100_000,
+            sources: Box::new([retained_source(source, 100_000, 1_000_000)]),
         },
     )
     .expect("sideways-filter composition")
@@ -1073,8 +1239,10 @@ fn sideways_filter_attributes_one_predicate_cost_across_union_sources() {
         CostComposition::SidewaysFilter {
             overlapping_children: 0,
             filtered_child: 0,
-            sources: Box::new([left_source, right_source]),
-            expected_retained_ppm: 500_000,
+            sources: Box::new([
+                retained_source(left_source, 500_000, 1_000_000),
+                retained_source(right_source, 500_000, 1_000_000),
+            ]),
         },
     )
     .unwrap();
@@ -1104,6 +1272,50 @@ fn sideways_filter_attributes_one_predicate_cost_across_union_sources() {
 }
 
 #[test]
+fn sideways_filter_preserves_source_local_risk_bounds() {
+    let unique_source = WorkSourceId(80);
+    let repeated_source = WorkSourceId(81);
+    let lanes = [
+        SourceWork {
+            source: unique_source,
+            cost: cost(100.0),
+            filters: Box::new([]),
+            filter_apply_cost: SearchCost::ZERO,
+        },
+        SourceWork {
+            source: repeated_source,
+            cost: cost(300.0),
+            filters: Box::new([]),
+            filter_apply_cost: SearchCost::ZERO,
+        },
+    ];
+    let filtered = compose_candidate_cost_with_sources(
+        cost(40.0),
+        Some(cost(20.0)),
+        &[cost(400.0)],
+        &[&lanes],
+        CostComposition::SidewaysFilter {
+            overlapping_children: 0,
+            filtered_child: 0,
+            sources: Box::new([
+                retained_source(unique_source, 100_000, 200_000),
+                retained_source(repeated_source, 500_000, 1_000_000),
+            ]),
+        },
+    )
+    .unwrap();
+
+    assert_eq!(filtered.source_work[0].cost.score.range.expected, 10.0);
+    assert_eq!(filtered.source_work[0].cost.score.range.upper, 20.0);
+    assert_eq!(filtered.source_work[1].cost.score.range.expected, 150.0);
+    assert_eq!(filtered.source_work[1].cost.score.range.upper, 300.0);
+    assert_eq!(filtered.cost.score.range.expected, 200.0);
+    // Each lane retains the full predicate-application ceiling because the
+    // source-work contract does not yet carry a hard row-share proof.
+    assert_eq!(filtered.cost.score.range.upper, 380.0);
+}
+
+#[test]
 fn sideways_filter_degrades_to_matching_source_lanes() {
     let matched = WorkSourceId(18);
     let missing = WorkSourceId(19);
@@ -1130,8 +1342,10 @@ fn sideways_filter_degrades_to_matching_source_lanes() {
         CostComposition::SidewaysFilter {
             overlapping_children: 0,
             filtered_child: 0,
-            sources: Box::new([matched, missing]),
-            expected_retained_ppm: 500_000,
+            sources: Box::new([
+                retained_source(matched, 500_000, 1_000_000),
+                retained_source(missing, 500_000, 1_000_000),
+            ]),
         },
     )
     .expect("missing source-work lineage must be a safe cost degradation");
@@ -1182,8 +1396,7 @@ fn sideways_filter_accepts_multiple_lanes_for_one_source() {
         CostComposition::SidewaysFilter {
             overlapping_children: 0,
             filtered_child: 0,
-            sources: Box::new([source]),
-            expected_retained_ppm: 500_000,
+            sources: Box::new([retained_source(source, 500_000, 1_000_000)]),
         },
     )
     .expect("one source may legitimately own multiple physical work lanes");
@@ -1227,8 +1440,7 @@ fn sideways_filter_with_no_physical_lane_is_retained() {
         CostComposition::SidewaysFilter {
             overlapping_children: 0,
             filtered_child: 0,
-            sources: Box::new([declared]),
-            expected_retained_ppm: 1,
+            sources: Box::new([retained_source(declared, 1, 1_000_000)]),
         },
     )
     .expect("unmatched logical lineage must retain physical work without a filter cost");
@@ -1264,8 +1476,7 @@ fn repeated_sideways_filters_scale_only_the_matching_source_lane() {
         CostComposition::SidewaysFilter {
             overlapping_children: 0,
             filtered_child: 0,
-            sources: Box::new([source]),
-            expected_retained_ppm: 500_000,
+            sources: Box::new([retained_source(source, 500_000, 1_000_000)]),
         },
     )
     .unwrap();
@@ -1277,8 +1488,7 @@ fn repeated_sideways_filters_scale_only_the_matching_source_lane() {
         CostComposition::SidewaysFilter {
             overlapping_children: 0,
             filtered_child: 0,
-            sources: Box::new([source]),
-            expected_retained_ppm: 100_000,
+            sources: Box::new([retained_source(source, 100_000, 1_000_000)]),
         },
     )
     .unwrap();
@@ -1307,8 +1517,7 @@ fn source_predicate_cost_is_reordered_by_runtime_selectivity() {
         CostComposition::SidewaysFilter {
             overlapping_children: 0,
             filtered_child: 0,
-            sources: Box::new([source]),
-            expected_retained_ppm: 500_000,
+            sources: Box::new([retained_source(source, 500_000, 1_000_000)]),
         },
     )
     .unwrap();
@@ -1320,8 +1529,7 @@ fn source_predicate_cost_is_reordered_by_runtime_selectivity() {
         CostComposition::SidewaysFilter {
             overlapping_children: 0,
             filtered_child: 0,
-            sources: Box::new([source]),
-            expected_retained_ppm: 100_000,
+            sources: Box::new([retained_source(source, 100_000, 1_000_000)]),
         },
     )
     .unwrap();

@@ -273,6 +273,16 @@ pub enum GrantDependencyDescriptor {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub struct WorkSourceId(pub usize);
 
+/// Source-local work retention derived for one runtime-filter installation.
+/// Keeping the ratio beside its source preserves a unique-key proof on one
+/// lineage even when another lineage of the same join key is non-unique.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SidewaysFilterSource {
+    pub source: WorkSourceId,
+    pub expected_retained_ppm: u32,
+    pub upper_retained_ppm: u32,
+}
+
 /// A disjoint portion of a winner's work proven to belong to one base source.
 /// The contained cost is work-only: memory and external-resource contracts
 /// remain on the complete winner and are never weakened by selectivity.
@@ -322,8 +332,7 @@ pub enum CostComposition {
     SidewaysFilter {
         overlapping_children: u64,
         filtered_child: u8,
-        sources: Box<[WorkSourceId]>,
-        expected_retained_ppm: u32,
+        sources: Box<[SidewaysFilterSource]>,
     },
 }
 
@@ -341,18 +350,13 @@ impl CostComposition {
         }
     }
 
-    pub(crate) fn sideways_filter(&self) -> Option<(usize, &[WorkSourceId], u32)> {
+    pub(crate) fn sideways_filter(&self) -> Option<(usize, &[SidewaysFilterSource])> {
         match self {
             Self::SidewaysFilter {
                 filtered_child,
                 sources,
-                expected_retained_ppm,
                 ..
-            } => Some((
-                usize::from(*filtered_child),
-                sources.as_ref(),
-                *expected_retained_ppm,
-            )),
+            } => Some((usize::from(*filtered_child), sources.as_ref())),
             _ => None,
         }
     }

@@ -235,6 +235,7 @@ impl PhysicalImplementation for PlannerBaselineImplementation {
                 metadata,
                 metadata.implementations.baseline,
                 &cost_facts,
+                max_concurrent_tasks,
             )?,
             spillable,
             enforcer_cost_input: planner_enforcer_cost_input(
@@ -384,7 +385,8 @@ impl PhysicalImplementation for AlternativeImplementation {
         else {
             return Ok(Box::new([]));
         };
-        let cost_composition = planner_cost_composition(metadata, self.flavor, &cost_facts)?;
+        let cost_composition =
+            planner_cost_composition(metadata, self.flavor, &cost_facts, max_concurrent_tasks)?;
         Ok(vec![PhysicalCandidate {
             key: PhysicalExprKey {
                 implementation: self.id,

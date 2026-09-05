@@ -245,57 +245,111 @@ pub(super) fn supports_build_left_runtime_filter_auxiliary(
 }
 
 struct RuntimeFilterProbeLineage<'a> {
-    sources: Vec<&'a LogicalPlan>,
+    sources: Vec<RuntimeFilterProbeSource<'a>>,
 }
 
-fn runtime_filter_work_sources(
-    plan: &LogicalPlan,
-    expression: &Expression,
-) -> Option<Vec<WorkSourceId>> {
-    let bindings = plan.get_column_bindings();
-    let output_index = match expression {
-        Expression::ColumnRef(column) if column.depth == 0 => bindings
-            .iter()
-            .position(|binding| *binding == column.binding),
-        Expression::Reference(reference) => Some(reference.index),
-        _ => None,
-    }?;
-    let lineage = runtime_filter_probe_lineages(plan, output_index)?;
-    let mut sources = lineage
-        .sources
-        .into_iter()
-        .map(|source| {
-            let get = match &source.operator {
-                LogicalOperator::Get(get) => get,
-                LogicalOperator::SearchScan(search) => &search.get,
-                LogicalOperator::FullTextFilterScan(search) => &search.get,
-                _ => return None,
-            };
-            Some(WorkSourceId(get.table_index))
-        })
-        .collect::<Option<Vec<_>>>()?;
-    sources.sort_unstable();
-    sources.dedup();
-    (!sources.is_empty()).then_some(sources)
+#[derive(Clone, Copy)]
+struct RuntimeFilterProbeSource<'a> {
+    plan: &'a LogicalPlan,
+    output_index: usize,
 }
 
-fn common_runtime_filter_work_sources<'a>(
+fn runtime_filter_source_id(source: RuntimeFilterProbeSource<'_>) -> Option<WorkSourceId> {
+    let get = match &source.plan.operator {
+        LogicalOperator::Get(get) => get,
+        LogicalOperator::SearchScan(search) => &search.get,
+        LogicalOperator::FullTextFilterScan(search) => &search.get,
+        _ => return None,
+    };
+    Some(WorkSourceId(get.table_index))
+}
+
+fn runtime_filter_source_facts<'a>(
     plan: &LogicalPlan,
     expressions: impl IntoIterator<Item = &'a Expression>,
-) -> Option<Box<[WorkSourceId]>> {
-    let mut sources = expressions
+) -> Option<Box<[PlannerRuntimeFilterSource]>> {
+    let bindings = plan.get_column_bindings();
+    let mut expected_sources = None;
+    let mut source_keys = BTreeMap::<WorkSourceId, (&LogicalPlan, BTreeSet<usize>)>::new();
+    let mut saw_expression = false;
+    for expression in expressions {
+        saw_expression = true;
+        let output_index = match expression {
+            Expression::ColumnRef(column) if column.depth == 0 => bindings
+                .iter()
+                .position(|binding| *binding == column.binding),
+            Expression::Reference(reference) => Some(reference.index),
+            _ => None,
+        }?;
+        let lineage = runtime_filter_probe_lineages(plan, output_index)?;
+        let mut current_sources = lineage
+            .sources
+            .iter()
+            .copied()
+            .map(runtime_filter_source_id)
+            .collect::<Option<Vec<_>>>()?;
+        current_sources.sort_unstable();
+        current_sources.dedup();
+        if current_sources.is_empty()
+            || expected_sources
+                .as_ref()
+                .is_some_and(|expected| expected != &current_sources)
+        {
+            return None;
+        }
+        expected_sources.get_or_insert(current_sources);
+        for source in lineage.sources {
+            let source_id = runtime_filter_source_id(source)?;
+            let entry = source_keys
+                .entry(source_id)
+                .or_insert_with(|| (source.plan, BTreeSet::new()));
+            // One binding identity names one physical rowset occurrence. If a
+            // future lineage maps it to two plan nodes, decline instead of
+            // merging unrelated statistics under one source-work identity.
+            if !std::ptr::eq(entry.0, source.plan) {
+                return None;
+            }
+            entry.1.insert(source.output_index);
+        }
+    }
+    if !saw_expression {
+        return None;
+    }
+    source_keys
         .into_iter()
-        .map(|expression| runtime_filter_work_sources(plan, expression));
-    let source = sources.next()??;
-    sources
-        .all(|candidate| candidate.as_ref() == Some(&source))
-        .then(|| source.into_boxed_slice())
+        .map(|(source, (plan, output_indices))| {
+            let types = plan.types();
+            let bindings = plan.get_column_bindings();
+            let key_expressions = output_indices
+                .into_iter()
+                .map(|index| {
+                    Some(Expression::ColumnRef(
+                        paro_planner::expression::ColumnRefExpression::new(
+                            *bindings.get(index)?,
+                            types.get(index)?.clone(),
+                        ),
+                    ))
+                })
+                .collect::<Option<Vec<_>>>()?;
+            let rows = plan.stats.estimated_cardinality?;
+            let multiplicity = facts::infer_runtime_filter_probe_multiplicity(
+                plan,
+                key_expressions.iter().collect::<Vec<_>>(),
+            );
+            Some(PlannerRuntimeFilterSource {
+                source,
+                rows,
+                multiplicity,
+            })
+        })
+        .collect::<Option<Vec<_>>>()
+        .map(Vec::into_boxed_slice)
 }
 
-pub(super) fn runtime_filter_probe_work_sources(
+pub(super) fn runtime_filter_probe_sources(
     join: &paro_planner::operator::ComparisonJoin,
-) -> Option<Box<[WorkSourceId]>> {
-    common_runtime_filter_work_sources(
+) -> Option<Box<[PlannerRuntimeFilterSource]>> {
+    runtime_filter_source_facts(
         &join.left,
         join.conditions
             .iter()
@@ -304,10 +358,10 @@ pub(super) fn runtime_filter_probe_work_sources(
     )
 }
 
-pub(super) fn runtime_filter_build_left_probe_work_sources(
+pub(super) fn runtime_filter_build_left_probe_sources(
     join: &paro_planner::operator::ComparisonJoin,
-) -> Option<Box<[WorkSourceId]>> {
-    common_runtime_filter_work_sources(
+) -> Option<Box<[PlannerRuntimeFilterSource]>> {
+    runtime_filter_source_facts(
         &join.right,
         join.conditions
             .iter()
@@ -325,7 +379,7 @@ fn runtime_filter_probe_lineages(
             if get.table.is_some() && get.stored_column(output_index).is_some() =>
         {
             Some(RuntimeFilterProbeLineage {
-                sources: vec![plan],
+                sources: vec![RuntimeFilterProbeSource { plan, output_index }],
             })
         }
         LogicalOperator::SearchScan(search) if search.get.table.is_some() => {
@@ -340,7 +394,7 @@ fn runtime_filter_probe_lineages(
             };
             search.get.stored_column(source_index)?;
             Some(RuntimeFilterProbeLineage {
-                sources: vec![plan],
+                sources: vec![RuntimeFilterProbeSource { plan, output_index }],
             })
         }
         LogicalOperator::FullTextFilterScan(search) if search.get.table.is_some() => {
@@ -350,7 +404,7 @@ fn runtime_filter_probe_lineages(
                 .get(output_index)?;
             search.get.stored_column(source_index)?;
             Some(RuntimeFilterProbeLineage {
-                sources: vec![plan],
+                sources: vec![RuntimeFilterProbeSource { plan, output_index }],
             })
         }
         LogicalOperator::Filter(filter) => {
@@ -433,7 +487,7 @@ fn runtime_filter_source_rows(
         lineage.sources.into_iter().try_fold(
             paro_planner::plan::CardinalityEstimate::exact(0),
             |sum, source| {
-                let rows = source.stats.estimated_cardinality?;
+                let rows = source.plan.stats.estimated_cardinality?;
                 Some(paro_planner::plan::CardinalityEstimate {
                     min: sum.min.saturating_add(rows.min),
                     expected: sum.expected.saturating_add(rows.expected),
@@ -605,6 +659,10 @@ pub(super) fn implementation_cost(
                 "search provider cost must come from its physical payload",
             ));
         }
+        PhysicalImplementationFlavor::HashJoin
+        | PhysicalImplementationFlavor::HashJoinBuildLeft
+        | PhysicalImplementationFlavor::HashJoinBuildLeftRuntimeFilter
+        | PhysicalImplementationFlavor::HashJoinRuntimeFilter => {}
         _ => add_tuple_byte_work(&mut work, facts)?,
     }
     match flavor {
@@ -779,13 +837,13 @@ pub(super) fn implementation_cost(
                     &facts.runtime_filter_key_types,
                     max_concurrent_tasks,
                 )?;
-                let exact_expected = resource.guarantees_exact_single_key(build_hard_upper)
-                    || resource.expects_exact_single_key(build_domain.expected);
+                let exactness =
+                    runtime_filter_exactness(&resource, build_hard_upper, build_domain.expected);
                 runtime_filtered_probe_work(
                     left,
                     build_domain,
                     facts.runtime_filter_probe_multiplicity,
-                    exact_expected,
+                    exactness,
                 )?
             } else if flavor == PhysicalImplementationFlavor::HashJoinBuildLeftRuntimeFilter {
                 let build_domain = runtime_filter_build_domain(
@@ -801,17 +859,28 @@ pub(super) fn implementation_cost(
                     &facts.runtime_filter_key_types,
                     max_concurrent_tasks,
                 )?;
-                let exact_expected = resource.guarantees_exact_single_key(build_hard_upper)
-                    || resource.expects_exact_single_key(build_domain.expected);
+                let exactness =
+                    runtime_filter_exactness(&resource, build_hard_upper, build_domain.expected);
                 runtime_filtered_probe_work(
-                    source,
+                    right,
                     build_domain,
                     facts.runtime_filter_build_left_probe_multiplicity,
-                    exact_expected,
+                    exactness,
                 )?
             } else {
                 ordinary_probe
             };
+            // Runtime filtering is evaluated at the traced source, but rows
+            // rejected there never enter this join operator.  Source-work
+            // composition prices the full lookup stream separately; local
+            // tuple movement and probing must use only the surviving logical
+            // child rows or wide probes are charged twice.
+            let effective_children = if build_left {
+                [left, probe]
+            } else {
+                [probe, right]
+            };
+            add_tuple_byte_work_for_children(&mut work, facts, &effective_children)?;
             add_hash_key_byte_work(
                 &mut work,
                 build_work.checked_add(probe)?,
@@ -1359,13 +1428,27 @@ pub(super) fn add_tuple_byte_work(
     work: &mut LocalOperatorWork,
     facts: &ResolvedPlannerCostFacts,
 ) -> Result<()> {
+    add_tuple_byte_work_for_children(work, facts, &facts.child_rows)
+}
+
+pub(super) fn add_tuple_byte_work_for_children(
+    work: &mut LocalOperatorWork,
+    facts: &ResolvedPlannerCostFacts,
+    child_rows: &[CompactRange],
+) -> Result<()> {
     const BYTE_BLOCK: f64 = 32.0;
+
+    if child_rows.len() != facts.child_row_widths.len() {
+        return Err(paro_error::internal(
+            "tuple-byte costing has no width for one or more child streams",
+        ));
+    }
 
     let mut blocks = scaled_work(
         facts.output_rows,
         facts.output_row_width as f64 / BYTE_BLOCK,
     )?;
-    for (rows, width) in facts.child_rows.iter().zip(facts.child_row_widths.iter()) {
+    for (rows, width) in child_rows.iter().zip(facts.child_row_widths.iter()) {
         blocks = blocks.checked_add(scaled_work(*rows, *width as f64 / BYTE_BLOCK)?)?;
     }
     work.add(OP_TUPLE_BYTE_BLOCK, blocks)
@@ -1399,11 +1482,41 @@ pub(super) fn scaled_work(range: CompactRange, factor: f64) -> Result<CompactRan
     )
 }
 
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub(super) enum RuntimeFilterExactness {
+    Coarse,
+    Expected,
+    Guaranteed { build_keys_upper: u64 },
+}
+
+impl RuntimeFilterExactness {
+    fn expected_exact(self) -> bool {
+        !matches!(self, Self::Coarse)
+    }
+}
+
+pub(super) fn runtime_filter_exactness(
+    resource: &crate::physical::RuntimeFilterResourceContract,
+    build_rows_hard_upper: Option<u64>,
+    build_distinct_expected: f64,
+) -> RuntimeFilterExactness {
+    if resource.guarantees_exact_single_key(build_rows_hard_upper) {
+        RuntimeFilterExactness::Guaranteed {
+            build_keys_upper: build_rows_hard_upper
+                .expect("an exact-membership guarantee requires a hard build bound"),
+        }
+    } else if resource.expects_exact_single_key(build_distinct_expected) {
+        RuntimeFilterExactness::Expected
+    } else {
+        RuntimeFilterExactness::Coarse
+    }
+}
+
 pub(super) fn runtime_filtered_probe_work(
     probe: CompactRange,
     build: CompactRange,
     probe_multiplicity: RuntimeFilterProbeMultiplicity,
-    exact_single_key: bool,
+    exactness: RuntimeFilterExactness,
 ) -> Result<CompactRange> {
     let retained = |probe_rows: f64, build_rows: f64| {
         if probe_rows <= 0.0 {
@@ -1415,7 +1528,7 @@ pub(super) fn runtime_filtered_probe_work(
         // by the complete-probe upper bound below.
         probe_rows * ratio.sqrt().clamp(0.1, 1.0)
     };
-    let expected = match (exact_single_key, probe_multiplicity) {
+    let expected = match (exactness.expected_exact(), probe_multiplicity) {
         (true, RuntimeFilterProbeMultiplicity::DeclaredUnique) => {
             retained(probe.expected, build.expected).min(build.expected)
         }
@@ -1428,10 +1541,16 @@ pub(super) fn runtime_filtered_probe_work(
                 .min(probe.expected)
         }
     };
-    // Every current representation can fall back to a range, and multi-key
-    // filters are installed independently per column. Neither contract can
-    // prove a survivor cardinality below the complete probe.
-    let upper = probe.upper;
+    // Only a capacity-guaranteed exact single-key domain and a declared-unique
+    // probe can bound survivors by build keys. Expected exactness may still
+    // degrade to a range under skew, and estimated uniqueness is not a proof.
+    let upper = match (exactness, probe_multiplicity) {
+        (
+            RuntimeFilterExactness::Guaranteed { build_keys_upper },
+            RuntimeFilterProbeMultiplicity::DeclaredUnique,
+        ) => probe.upper.min(build_keys_upper as f64),
+        _ => probe.upper,
+    };
     CompactRange::new(0.0, expected, upper.max(expected))
 }
 
@@ -1718,7 +1837,7 @@ pub(super) fn external_operator_cost(
 #[cfg(test)]
 mod tests {
     use super::{
-        runtime_filtered_probe_work, sort_work, topn_work, CompactRange,
+        runtime_filtered_probe_work, sort_work, topn_work, CompactRange, RuntimeFilterExactness,
         RuntimeFilterProbeMultiplicity,
     };
 
@@ -1741,14 +1860,14 @@ mod tests {
             probe,
             build,
             RuntimeFilterProbeMultiplicity::DeclaredUnique,
-            true,
+            RuntimeFilterExactness::Expected,
         )
         .unwrap();
         let unconstrained = runtime_filtered_probe_work(
             probe,
             build,
             RuntimeFilterProbeMultiplicity::Unknown,
-            false,
+            RuntimeFilterExactness::Coarse,
         )
         .unwrap();
         let small_exact_domain = CompactRange::new(50.0, 100.0, 150.0).unwrap();
@@ -1756,14 +1875,14 @@ mod tests {
             probe,
             small_exact_domain,
             RuntimeFilterProbeMultiplicity::Unknown,
-            true,
+            RuntimeFilterExactness::Expected,
         )
         .unwrap();
         let coarse_unconstrained = runtime_filtered_probe_work(
             probe,
             small_exact_domain,
             RuntimeFilterProbeMultiplicity::Unknown,
-            false,
+            RuntimeFilterExactness::Coarse,
         )
         .unwrap();
 
@@ -1772,5 +1891,32 @@ mod tests {
         assert_eq!(exact_unconstrained.upper, 100_000.0);
         assert!(unique.expected < unconstrained.expected);
         assert_eq!(exact_unconstrained.expected, coarse_unconstrained.expected);
+    }
+
+    #[test]
+    fn guaranteed_exact_filter_bounds_a_declared_unique_probe() {
+        let probe = CompactRange::new(0.0, 100_000.0, 120_000.0).unwrap();
+        let build = CompactRange::new(0.0, 100.0, 5_000.0).unwrap();
+        let exact = runtime_filtered_probe_work(
+            probe,
+            build,
+            RuntimeFilterProbeMultiplicity::DeclaredUnique,
+            RuntimeFilterExactness::Guaranteed {
+                build_keys_upper: 2_000,
+            },
+        )
+        .unwrap();
+        let estimated_unique = runtime_filtered_probe_work(
+            probe,
+            build,
+            RuntimeFilterProbeMultiplicity::EstimatedUnique,
+            RuntimeFilterExactness::Guaranteed {
+                build_keys_upper: 2_000,
+            },
+        )
+        .unwrap();
+
+        assert_eq!(exact.upper, 2_000.0);
+        assert_eq!(estimated_unique.upper, probe.upper);
     }
 }

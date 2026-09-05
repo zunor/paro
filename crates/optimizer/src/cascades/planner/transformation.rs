@@ -218,6 +218,7 @@ impl TransformationRule for PlannerTransformationRule {
             source_input_context,
             source_child_context,
             source_output_columns,
+            memo_group_holes,
             environment,
         ) =
             {
@@ -243,6 +244,13 @@ impl TransformationRule for PlannerTransformationRule {
                     .logical
                     .get(logical.payload.index())
                     .ok_or_else(|| paro_error::internal("planner rule lost its source payload"))?;
+                let memo_group_holes =
+                    if matches!(self.transformation, PlannerTransformation::TopNIntroduction) {
+                        direct_topn_input_group(expr, ctx.memo(), &state)
+                            .map(|group| vec![group].into_boxed_slice())
+                    } else {
+                        None
+                    };
                 let binder = state.binder.clone().ok_or_else(|| {
                     paro_error::internal("planner rule has no binder environment")
                 })?;
@@ -265,6 +273,7 @@ impl TransformationRule for PlannerTransformationRule {
                     metadata.input_context,
                     metadata.child_context,
                     metadata.output_columns.clone(),
+                    memo_group_holes,
                     PlannerRuleEnvironment {
                         binder,
                         bind_context: state.bind_context.clone(),
@@ -290,6 +299,9 @@ impl TransformationRule for PlannerTransformationRule {
         let mut prepared = Vec::with_capacity(plans.len());
         for plan in plans {
             let (plan, column_stats) = settle_transformed_expression(plan, &environment)?;
+            let root_child_groups = memo_group_holes
+                .clone()
+                .filter(|_| matches!(plan.operator, LogicalOperator::TopN(_)));
             // The target Memo group owns the output contract. Settlement may
             // legitimately widen child carriers for predicates and ordering,
             // but the transformed root must be frozen back to the group's
@@ -370,6 +382,7 @@ impl TransformationRule for PlannerTransformationRule {
                 extended_required_region_facets.into_boxed_slice(),
                 output_input_context,
                 output_child_context,
+                root_child_groups,
             ));
         }
         if prepared.is_empty() {
@@ -388,6 +401,7 @@ impl TransformationRule for PlannerTransformationRule {
                     extended_required_region_facets,
                     input_context,
                     child_context,
+                    root_child_groups,
                 ) in prepared
                 {
                     let Some(expression) = stage_transformed_expression(
@@ -408,6 +422,7 @@ impl TransformationRule for PlannerTransformationRule {
                                 extended_required_facets: extended_required_region_facets,
                                 inherited_runtime_filter_facet: source_runtime_filter_facet,
                             },
+                            root_child_groups,
                         },
                         memo,
                         state,
@@ -447,6 +462,38 @@ impl TransformationRule for PlannerTransformationRule {
             })
             .collect())
     }
+}
+
+/// Match the direct `Limit(Order(group))` boundary in the Memo instead of
+/// rediscovering it from one recursively materialized representative. The
+/// resulting TopN expression keeps the order input as the same group hole, so
+/// alternatives added below aggregate/join nodes remain composable.
+fn direct_topn_input_group(
+    expression: LogicalExprId,
+    memo: &Memo,
+    state: &PlannerTransformState,
+) -> Option<GroupId> {
+    let limit = memo.logical_expr(expression)?;
+    if state.metadata.get(&limit.payload)?.operator_type != LogicalOperatorType::Limit {
+        return None;
+    }
+    let order_group = memo.group(*limit.key.children.first()?)?;
+    let order = order_group
+        .logical_exprs()
+        .iter()
+        .filter_map(|expression| memo.logical_expr(*expression))
+        .filter(|expression| expression.proofs.contains(&EquivalenceProof::Initial))
+        .filter(|expression| {
+            state
+                .metadata
+                .get(&expression.payload)
+                .is_some_and(|metadata| metadata.operator_type == LogicalOperatorType::Order)
+        })
+        .min_by_key(|expression| expression.key.stable_fingerprint())?;
+    let [input] = order.key.children.as_ref() else {
+        return None;
+    };
+    Some(memo.canonical_group(*input))
 }
 
 fn transformed_plan_matches_group_contract(

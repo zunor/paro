@@ -92,6 +92,64 @@ fn rule_history_is_expression_local_and_duplicate_expr_is_deduped() {
 }
 
 #[test]
+fn logical_frontier_revision_never_aliases_a_rolled_back_candidate() {
+    let mut memo = Memo::new(SearchBudget::default());
+    let group = memo.create_group(
+        schema(1),
+        LogicalProperties::default(),
+        GroupCardinality::default(),
+    );
+    let initial = memo
+        .insert_logical(
+            group,
+            LogicalExprKey {
+                operator: Fingerprint(10),
+                scalars: Box::new([]),
+                children: Box::new([]),
+            },
+            LogicalPayloadId(0),
+            EquivalenceProof::Initial,
+        )
+        .unwrap();
+    let initial_revision = memo.group(group).unwrap().logical_expression_version();
+    let savepoint = memo.transformation_savepoint();
+    memo.insert_logical(
+        group,
+        LogicalExprKey {
+            operator: Fingerprint(20),
+            scalars: Box::new([]),
+            children: Box::new([]),
+        },
+        LogicalPayloadId(1),
+        EquivalenceProof::Normalization { rule: RuleId(1) },
+    )
+    .unwrap();
+    let transient_revision = memo.group(group).unwrap().logical_expression_version();
+
+    memo.rollback_transformation(savepoint).unwrap();
+    let rollback_revision = memo.group(group).unwrap().logical_expression_version();
+    assert!(initial_revision < transient_revision);
+    assert!(transient_revision < rollback_revision);
+
+    memo.insert_logical(
+        group,
+        LogicalExprKey {
+            operator: Fingerprint(30),
+            scalars: Box::new([]),
+            children: Box::new([]),
+        },
+        LogicalPayloadId(2),
+        EquivalenceProof::Transformation {
+            rule: RuleId(2),
+            source: initial,
+            premise: Fingerprint(10),
+        },
+    )
+    .unwrap();
+    assert!(memo.group(group).unwrap().logical_expression_version() > rollback_revision);
+}
+
+#[test]
 fn winner_is_keyed_by_goal_and_uses_stable_tie_break() {
     let mut memo = Memo::new(SearchBudget::default());
     let group = memo.create_group(
@@ -374,6 +432,47 @@ fn winner_frontier_retains_non_dominated_resource_tradeoffs() {
     assert_eq!(
         frontier.selected().unwrap().physical_fingerprint,
         Fingerprint(1)
+    );
+}
+
+#[test]
+fn latency_and_robustness_profiles_rank_uncertainty_explicitly() {
+    let winner = |expression, expected_path, expected_work, risk_upper, risk_adjusted| {
+        let cost = SearchCost {
+            score: ScoreSummary {
+                range: CompactRange::new(expected_work, expected_work, risk_upper).unwrap(),
+                risk_adjusted,
+            },
+            critical_path: CompactRange::new(expected_path, expected_path, risk_upper).unwrap(),
+            ..SearchCost::ZERO
+        };
+        Winner {
+            expression: PhysicalExprId::new(expression),
+            child_goals: Box::new([]),
+            enforcers: Box::new([]),
+            enforcer_cost_input: enforcer_cost_input(),
+            provided: provided(),
+            local_cost: cost,
+            source_filter_apply_cost: None,
+            cost_composition: CostComposition::Sequential,
+            cost,
+            source_work: Box::new([]),
+            physical_fingerprint: Fingerprint(expression as u128),
+            joint_cost_proof: None,
+        }
+    };
+    let fast_expected = winner(1, 10.0, 20.0, 100.0, 80.0);
+    let narrow_uncertainty = winner(2, 20.0, 22.0, 30.0, 25.0);
+
+    assert_eq!(
+        compare_objective(&fast_expected, &narrow_uncertainty, ObjectiveProfileId(0)),
+        std::cmp::Ordering::Less,
+        "the latency profile optimizes expected response time"
+    );
+    assert_eq!(
+        compare_objective(&fast_expected, &narrow_uncertainty, ObjectiveProfileId(3)),
+        std::cmp::Ordering::Greater,
+        "the robustness profile optimizes the hard uncertainty bound"
     );
 }
 

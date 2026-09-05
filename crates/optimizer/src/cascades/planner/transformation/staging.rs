@@ -17,6 +17,10 @@ pub(super) struct StagingRequest {
     pub(super) column_stats: SharedColumnStatistics,
     pub(super) target: StagingTarget,
     pub(super) regions: StagingRegionRequirements,
+    /// Existing Memo groups referenced by the transformed root's child holes.
+    /// `None` imports an owned tree; `Some` preserves every listed boundary
+    /// and stages only the new operator shell.
+    pub(super) root_child_groups: Option<Box<[GroupId]>>,
 }
 
 pub(super) struct StagingTarget {
@@ -55,6 +59,7 @@ pub(super) fn stage_transformed_expression(
                 extended_required_facets: extended_required_region_facets,
                 inherited_runtime_filter_facet,
             },
+        root_child_groups,
     } = request;
 
     struct NodeState {
@@ -84,6 +89,36 @@ pub(super) fn stage_transformed_expression(
         node_context: OptimizationContextId,
         target_child_context: Option<OptimizationContextId>,
         refined_cardinality_kind: Option<CardinalityRecipeKind>,
+        preserved_child_groups: Option<Box<[GroupId]>>,
+    }
+
+    fn referenced_group_scope(memo: &Memo, root: GroupId) -> PlannerRegionScope {
+        let root = memo.canonical_group(root);
+        let mut visited = BTreeSet::from([root]);
+        let mut pending = vec![root];
+        while let Some(group) = pending.pop() {
+            let Some(group) = memo.group(group) else {
+                continue;
+            };
+            for child in group
+                .logical_exprs()
+                .iter()
+                .filter_map(|expression| memo.logical_expr(*expression))
+                .flat_map(|expression| expression.key.children.iter().copied())
+                .map(|child| memo.canonical_group(child))
+            {
+                if visited.insert(child) {
+                    pending.push(child);
+                }
+            }
+        }
+        PlannerRegionScope::new(
+            root,
+            visited
+                .into_iter()
+                .filter(|group| *group != root)
+                .map(|group| PlannerRegionScope::new(group, std::iter::empty())),
+        )
     }
 
     fn stage_node(
@@ -98,6 +133,7 @@ pub(super) fn stage_transformed_expression(
             node_context,
             target_child_context,
             refined_cardinality_kind,
+            preserved_child_groups,
         } = request;
         let mut detached = Vec::new();
         let skeleton = plan.try_map_children(|child| {
@@ -119,25 +155,83 @@ pub(super) fn stage_transformed_expression(
             &skeleton,
             session.state.bind_context.shared().as_ref(),
         );
+        if preserved_child_groups
+            .as_deref()
+            .is_some_and(|groups| groups.len() != detached.len())
+        {
+            return Err(paro_error::internal(
+                "transformation group-hole arity disagrees with its operator shell",
+            ));
+        }
+        let preserved_child_groups = preserved_child_groups.as_deref();
         let mut child_states = Vec::with_capacity(detached.len());
         let mut children = Vec::with_capacity(detached.len());
         let descendant_context = target_child_context.unwrap_or(node_context);
-        for child in detached {
-            let (child, child_state, staged) = stage_node(
-                session,
-                NodeStagingRequest {
-                    plan: child,
-                    target: None,
-                    required_region_facet: None,
-                    inherited_runtime_filter_facet: None,
-                    node_context: descendant_context,
-                    target_child_context: None,
-                    refined_cardinality_kind: None,
-                },
-            )?;
-            debug_assert!(staged.is_none());
-            children.push(child);
-            child_states.push(child_state);
+        for (index, child) in detached.into_iter().enumerate() {
+            if let Some(group) = preserved_child_groups
+                .and_then(|groups| groups.get(index))
+                .copied()
+            {
+                let bindings = child.get_column_bindings();
+                let types = child.types();
+                if bindings.len() != types.len() {
+                    return Err(paro_error::internal(
+                        "transformation group hole has inconsistent binding/type arity",
+                    ));
+                }
+                let columns = bindings
+                    .into_iter()
+                    .zip(types)
+                    .map(|(binding, logical_type)| {
+                        session
+                            .state
+                            .binding_ids
+                            .get(&(
+                                binding.table_index,
+                                binding.column_index,
+                                logical_type_fingerprint(&logical_type),
+                            ))
+                            .copied()
+                            .ok_or_else(|| {
+                                paro_error::internal(
+                                    "transformation group hole references an unknown column",
+                                )
+                            })
+                    })
+                    .collect::<Result<Vec<_>>>()?;
+                let group = session.memo.canonical_group(group);
+                let contract = session.memo.group(group).ok_or_else(|| {
+                    paro_error::internal("transformation group hole references an unknown group")
+                })?;
+                if columns.iter().copied().collect::<BTreeSet<_>>() != contract.schema.ids() {
+                    return Err(paro_error::internal(
+                        "transformation group hole changes its referenced group schema",
+                    ));
+                }
+                child_states.push(NodeState {
+                    group,
+                    columns: columns.into_boxed_slice(),
+                    region_scope: referenced_group_scope(session.memo, group),
+                });
+                children.push(child);
+            } else {
+                let (child, child_state, staged) = stage_node(
+                    session,
+                    NodeStagingRequest {
+                        plan: child,
+                        target: None,
+                        required_region_facet: None,
+                        inherited_runtime_filter_facet: None,
+                        node_context: descendant_context,
+                        target_child_context: None,
+                        refined_cardinality_kind: None,
+                        preserved_child_groups: None,
+                    },
+                )?;
+                debug_assert!(staged.is_none());
+                children.push(child);
+                child_states.push(child_state);
+            }
         }
         let mut children = children.into_iter();
         let semantic_plan = semantic_skeleton.try_map_children(|_| {
@@ -624,6 +718,7 @@ pub(super) fn stage_transformed_expression(
                 node_context: input_context,
                 target_child_context: Some(child_context),
                 refined_cardinality_kind,
+                preserved_child_groups: root_child_groups,
             },
         )?;
         (root, staged, session.pending_runtime_filter_facets)
@@ -797,6 +892,7 @@ mod tests {
                                 extended_required_facets: Box::new([]),
                                 inherited_runtime_filter_facet: None,
                             },
+                            root_child_groups: None,
                         },
                         memo,
                         state,
@@ -863,6 +959,7 @@ mod tests {
                                 extended_required_facets: Box::new([]),
                                 inherited_runtime_filter_facet: None,
                             },
+                            root_child_groups: None,
                         },
                         memo,
                         state,
@@ -881,9 +978,11 @@ mod tests {
         assert_eq!(
             metadata
                 .cost_facts
-                .runtime_filter_probe_work_sources
-                .as_ref(),
-            &[WorkSourceId(0)]
+                .runtime_filter_probe_sources
+                .iter()
+                .map(|source| source.source)
+                .collect::<Vec<_>>(),
+            vec![WorkSourceId(0)]
         );
         assert!(metadata
             .cost_facts

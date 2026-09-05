@@ -233,10 +233,57 @@ fn retained_ratio_ppm(retained: f64, source: f64) -> u32 {
     }
 }
 
+fn retained_upper_ratio_ppm(retained: f64, source: f64, expected_ppm: u32) -> u32 {
+    if source <= 0.0 {
+        1_000_000
+    } else {
+        // This ratio participates in a hard work upper bound. Rounding it down
+        // would turn a conservative cardinality bound into an optimistic one.
+        // It must also dominate the separately estimated expected ratio: the
+        // two ratios use different points of their respective ranges, so that
+        // ordering does not follow from `retained.expected <= retained.upper`.
+        (((retained / source).clamp(0.0, 1.0) * 1_000_000.0).ceil() as u32).max(expected_ppm)
+    }
+}
+
+fn runtime_filter_source_retentions(
+    sources: &[ResolvedRuntimeFilterSource],
+    build_domain: CompactRange,
+    exactness: RuntimeFilterExactness,
+) -> Result<Box<[SidewaysFilterSource]>> {
+    sources
+        .iter()
+        .map(|source| {
+            let retained = if build_domain.expected < source.rows.expected {
+                runtime_filtered_probe_work(
+                    source.rows,
+                    build_domain,
+                    source.multiplicity,
+                    exactness,
+                )?
+            } else {
+                source.rows
+            };
+            let expected_retained_ppm = retained_ratio_ppm(retained.expected, source.rows.expected);
+            Ok(SidewaysFilterSource {
+                source: source.source,
+                expected_retained_ppm,
+                upper_retained_ppm: retained_upper_ratio_ppm(
+                    retained.upper,
+                    source.rows.upper,
+                    expected_retained_ppm,
+                ),
+            })
+        })
+        .collect::<Result<Vec<_>>>()
+        .map(Vec::into_boxed_slice)
+}
+
 pub(super) fn planner_cost_composition(
     metadata: &PlannerOperatorMetadata,
     flavor: PhysicalImplementationFlavor,
     facts: &ResolvedPlannerCostFacts,
+    max_concurrent_tasks: u16,
 ) -> Result<CostComposition> {
     if metadata.operator_type == LogicalOperatorType::EmptyResult {
         return Ok(CostComposition::LocalOnly);
@@ -269,37 +316,16 @@ pub(super) fn planner_cost_composition(
             .first()
             .copied()
             .unwrap_or(CompactRange::ZERO);
-        let probe = facts
-            .child_rows
-            .get(1)
-            .copied()
-            .unwrap_or(CompactRange::ZERO);
-        let source = facts
-            .runtime_filter_build_left_probe_source_rows
-            .unwrap_or(probe);
         let build_domain =
             runtime_filter_build_domain(facts.runtime_filter_build_left_distinct_expected, build)?;
-        if build_domain.expected >= source.expected {
-            return Ok(CostComposition::RetainedState {
-                overlapping_children,
-            });
-        }
         let resource = crate::physical::RuntimeFilterResourceContract::for_keys(
             &facts.runtime_filter_key_types,
-            1,
+            max_concurrent_tasks,
         )?;
-        let hard_exact = resource
-            .guarantees_exact_single_key(facts.child_rows_hard_upper.first().copied().flatten());
-        let retained = runtime_filtered_probe_work(
-            source,
-            build_domain,
-            facts.runtime_filter_build_left_probe_multiplicity,
-            hard_exact || resource.expects_exact_single_key(build_domain.expected),
-        )?;
-        if facts
-            .runtime_filter_build_left_probe_work_sources
-            .is_empty()
-        {
+        let build_hard_upper = facts.child_rows_hard_upper.first().copied().flatten();
+        let exactness =
+            runtime_filter_exactness(&resource, build_hard_upper, build_domain.expected);
+        if facts.runtime_filter_build_left_probe_sources.is_empty() {
             return Ok(CostComposition::RetainedState {
                 overlapping_children,
             });
@@ -307,17 +333,15 @@ pub(super) fn planner_cost_composition(
         return Ok(CostComposition::SidewaysFilter {
             overlapping_children,
             filtered_child: 1,
-            sources: facts.runtime_filter_build_left_probe_work_sources.clone(),
-            expected_retained_ppm: retained_ratio_ppm(retained.expected, source.expected),
+            sources: runtime_filter_source_retentions(
+                &facts.runtime_filter_build_left_probe_sources,
+                build_domain,
+                exactness,
+            )?,
         });
     }
     if flavor == PhysicalImplementationFlavor::HashJoinRuntimeFilter {
-        let Some(source) = facts.runtime_filter_probe_source_rows else {
-            return Ok(CostComposition::RetainedState {
-                overlapping_children,
-            });
-        };
-        if facts.runtime_filter_probe_work_sources.is_empty() {
+        if facts.runtime_filter_probe_sources.is_empty() {
             return Ok(CostComposition::RetainedState {
                 overlapping_children,
             });
@@ -333,28 +357,21 @@ pub(super) fn planner_cost_composition(
         // before intervening joins. Compare the build domain with that source;
         // using the already-reduced join child cardinality incorrectly rejects
         // filters that can remove source I/O before another selective join.
-        if build_domain.expected >= source.expected {
-            return Ok(CostComposition::RetainedState {
-                overlapping_children,
-            });
-        }
         let resource = crate::physical::RuntimeFilterResourceContract::for_keys(
             &facts.runtime_filter_key_types,
-            1,
+            max_concurrent_tasks,
         )?;
-        let hard_exact = resource
-            .guarantees_exact_single_key(facts.child_rows_hard_upper.get(1).copied().flatten());
-        let retained = runtime_filtered_probe_work(
-            source,
-            build_domain,
-            facts.runtime_filter_probe_multiplicity,
-            hard_exact || resource.expects_exact_single_key(build_domain.expected),
-        )?;
+        let build_hard_upper = facts.child_rows_hard_upper.get(1).copied().flatten();
+        let exactness =
+            runtime_filter_exactness(&resource, build_hard_upper, build_domain.expected);
         return Ok(CostComposition::SidewaysFilter {
             overlapping_children,
             filtered_child: 0,
-            sources: facts.runtime_filter_probe_work_sources.clone(),
-            expected_retained_ppm: retained_ratio_ppm(retained.expected, source.expected),
+            sources: runtime_filter_source_retentions(
+                &facts.runtime_filter_probe_sources,
+                build_domain,
+                exactness,
+            )?,
         });
     }
     if overlapping_children == 0 {
@@ -363,6 +380,22 @@ pub(super) fn planner_cost_composition(
         Ok(CostComposition::RetainedState {
             overlapping_children,
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{retained_ratio_ppm, retained_upper_ratio_ppm};
+
+    #[test]
+    fn retained_upper_ratio_never_rounds_below_the_proof() {
+        assert_eq!(retained_ratio_ppm(1.0, 3.0), 333_333);
+        assert_eq!(retained_upper_ratio_ppm(1.0, 3.0, 0), 333_334);
+    }
+
+    #[test]
+    fn retained_upper_ratio_dominates_the_expected_ratio() {
+        assert_eq!(retained_upper_ratio_ppm(1.0, 10.0, 250_000), 250_000);
     }
 }
 

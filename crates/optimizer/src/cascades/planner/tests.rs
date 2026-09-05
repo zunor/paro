@@ -82,8 +82,8 @@ fn calibrated_tuple_work_distinguishes_narrow_and_wide_intermediates() {
         runtime_filter_build_left_probe_multiplicity: RuntimeFilterProbeMultiplicity::Unknown,
         runtime_filter_probe_source_rows: None,
         runtime_filter_build_left_probe_source_rows: None,
-        runtime_filter_probe_work_sources: Box::new([]),
-        runtime_filter_build_left_probe_work_sources: Box::new([]),
+        runtime_filter_probe_sources: Box::new([]),
+        runtime_filter_build_left_probe_sources: Box::new([]),
         runtime_filter_build_distinct_expected: None,
         runtime_filter_build_left_distinct_expected: None,
         runtime_filter_key_types: Box::new([]),
@@ -100,6 +100,55 @@ fn calibrated_tuple_work_distinguishes_narrow_and_wide_intermediates() {
     assert!(
         wide.resources_expected[ResourceDimension::MemoryRead as usize]
             > narrow.resources_expected[ResourceDimension::MemoryRead as usize]
+    );
+}
+
+#[test]
+fn runtime_filter_tuple_work_counts_only_rows_delivered_to_the_join() {
+    let facts = ResolvedPlannerCostFacts {
+        output_rows: CompactRange::point(10.0).unwrap(),
+        child_rows: vec![
+            CompactRange::point(1_000_000.0).unwrap(),
+            CompactRange::point(100.0).unwrap(),
+        ]
+        .into_boxed_slice(),
+        output_rows_hard_upper: Some(10),
+        child_rows_hard_upper: vec![Some(1_000_000), Some(100)].into_boxed_slice(),
+        child_row_widths: vec![128, 8].into_boxed_slice(),
+        child_materialization_risk_rows: vec![1_000_000, 100].into_boxed_slice(),
+        output_row_width: 128,
+        hash_key_width: Some(8),
+        scan_access_width: None,
+        scan_work_source: None,
+        perfect_hash: None,
+        topn_capacity: None,
+        runtime_filter_probe_multiplicity: RuntimeFilterProbeMultiplicity::Unknown,
+        runtime_filter_build_left_probe_multiplicity: RuntimeFilterProbeMultiplicity::Unknown,
+        runtime_filter_probe_source_rows: None,
+        runtime_filter_build_left_probe_source_rows: None,
+        runtime_filter_probe_sources: Box::new([]),
+        runtime_filter_build_left_probe_sources: Box::new([]),
+        runtime_filter_build_distinct_expected: None,
+        runtime_filter_build_left_distinct_expected: None,
+        runtime_filter_key_types: vec![LogicalType::BigInt].into_boxed_slice(),
+    };
+    let calibrated =
+        |work: &LocalOperatorWork| MachineCalibrationBundle::default().fold(work).unwrap();
+    let mut unfiltered = LocalOperatorWork::default();
+    add_tuple_byte_work(&mut unfiltered, &facts).unwrap();
+    let mut filtered = LocalOperatorWork::default();
+    add_tuple_byte_work_for_children(
+        &mut filtered,
+        &facts,
+        &[
+            CompactRange::point(100.0).unwrap(),
+            CompactRange::point(100.0).unwrap(),
+        ],
+    )
+    .unwrap();
+
+    assert!(
+        calibrated(&filtered).score.risk_adjusted < calibrated(&unfiltered).score.risk_adjusted
     );
 }
 
@@ -168,8 +217,8 @@ fn expression_cost_facts_read_current_group_cardinality() {
         runtime_filter_build_left_probe_multiplicity: RuntimeFilterProbeMultiplicity::Unknown,
         runtime_filter_probe_source_rows: None,
         runtime_filter_build_left_probe_source_rows: None,
-        runtime_filter_probe_work_sources: Box::new([]),
-        runtime_filter_build_left_probe_work_sources: Box::new([]),
+        runtime_filter_probe_sources: Box::new([]),
+        runtime_filter_build_left_probe_sources: Box::new([]),
         runtime_filter_build_distinct_expected: None,
         runtime_filter_build_left_distinct_expected: None,
         runtime_filter_key_types: Box::new([]),
@@ -1135,7 +1184,7 @@ fn left_outer_nullable_build_output_stops_runtime_filter_lineage() {
 }
 
 #[test]
-fn nested_filters_do_not_independently_discount_the_same_rowset() {
+fn nested_filters_share_one_ordered_source_work_lane() {
     let mut fact = test_base_get(0, 20_041, "fact_probe", 20_000);
     fact.stats.estimated_cardinality = Some(CardinalityEstimate::exact(20_000));
     let mut first_build = test_base_get(1, 20_042, "first_build", 20);
@@ -1151,10 +1200,10 @@ fn nested_filters_do_not_independently_discount_the_same_rowset() {
     );
     let mut probe = LogicalPlan::synthetic(LogicalOperator::Join(Join::Comparison(first_join)));
     probe.stats.estimated_cardinality = Some(CardinalityEstimate::exact(200));
-    // The second build is selective at the 20,000-row source, but its lineage
-    // crosses the first join. Until one composite region jointly prices the
-    // ordered predicate stages, independently discounting the same fact-scan
-    // winner twice would invent work savings.
+    // The second build is selective at the 20,000-row source and its lineage
+    // crosses the first join. Source-work composition owns one lane and
+    // jointly prices both predicates in selectivity order, so both physical
+    // filters are admissible without independently discounting the scan.
     let mut second_build = test_base_get(2, 20_043, "second_build", 500);
     second_build.stats.estimated_cardinality = Some(CardinalityEstimate::exact(500));
     let second_join = ComparisonJoin::new(
@@ -1180,7 +1229,7 @@ fn nested_filters_do_not_independently_discount_the_same_rowset() {
         })
         .count();
 
-    assert_eq!(runtime_filters, 1);
+    assert_eq!(runtime_filters, 2);
 }
 
 #[test]

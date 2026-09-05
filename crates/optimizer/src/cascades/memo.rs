@@ -442,9 +442,12 @@ fn compare_objective(
     objective: ObjectiveProfileId,
 ) -> std::cmp::Ordering {
     // Objective IDs are registry identities. The built-in profiles reserve
-    // 0=risk/latency, 1=throughput, 2=memory, 3=robustness. Unknown extension
-    // profiles use the conservative risk ordering until their registry owns
-    // comparison during extraction.
+    // 0=latency, 1=throughput, 2=memory, 3=robustness. Feasibility and memory
+    // completion are compared before every soft objective. Latency ranks the
+    // expected critical path; uncertainty remains a deterministic tie-break
+    // and is the primary quantity for robustness. Unknown extension profiles
+    // fail closed to conservative risk ordering until their registry owns the
+    // comparison contract.
     left.cost
         .memory_completion
         .preference_cmp(right.cost.memory_completion)
@@ -494,6 +497,29 @@ fn compare_objective(
                         .peak_memory_upper
                         .cmp(&right.cost.peak_memory_upper)
                 }),
+            0 => left
+                .cost
+                .critical_path
+                .expected
+                .total_cmp(&right.cost.critical_path.expected)
+                .then_with(|| {
+                    left.cost
+                        .score
+                        .range
+                        .expected
+                        .total_cmp(&right.cost.score.range.expected)
+                })
+                .then_with(|| {
+                    left.cost
+                        .score
+                        .risk_adjusted
+                        .total_cmp(&right.cost.score.risk_adjusted)
+                })
+                .then_with(|| {
+                    left.cost
+                        .peak_memory_upper
+                        .cmp(&right.cost.peak_memory_upper)
+                }),
             _ => left
                 .cost
                 .score
@@ -501,9 +527,10 @@ fn compare_objective(
                 .total_cmp(&right.cost.score.risk_adjusted)
                 .then_with(|| {
                     left.cost
-                        .critical_path
-                        .expected
-                        .total_cmp(&right.cost.critical_path.expected)
+                        .score
+                        .range
+                        .upper
+                        .total_cmp(&right.cost.score.range.upper)
                 })
                 .then_with(|| {
                     left.cost
@@ -520,6 +547,10 @@ pub struct Group {
     pub logical_properties: LogicalProperties,
     pub cardinality: GroupCardinality,
     logical_exprs: Vec<LogicalExprId>,
+    /// Last Memo-global revision that changed the logical expression set.
+    /// Transformation consumers use it to distinguish a completed match from
+    /// one whose child frontier has since changed, including through rollback.
+    logical_expression_version: u64,
     physical_exprs: Vec<PhysicalExprId>,
     logical_index: BTreeMap<LogicalExprKey, LogicalExprId>,
     physical_index: BTreeMap<PhysicalExprKey, PhysicalExprId>,
@@ -530,6 +561,10 @@ pub struct Group {
 impl Group {
     pub fn logical_exprs(&self) -> &[LogicalExprId] {
         &self.logical_exprs
+    }
+
+    pub fn logical_expression_version(&self) -> u64 {
+        self.logical_expression_version
     }
 
     pub fn physical_exprs(&self) -> &[PhysicalExprId] {
@@ -567,6 +602,7 @@ pub struct Memo {
     optimization_contexts: Vec<OptimizationContext>,
     optimization_context_index: BTreeMap<OptimizationContext, OptimizationContextId>,
     optimization_contexts_frozen: bool,
+    logical_frontier_revision: u64,
     budget: SearchBudget,
     calibration: Arc<MachineCalibrationBundle>,
     regions: RegionForest,
@@ -596,6 +632,7 @@ impl Memo {
                 OptimizationContextId::new(0),
             )]),
             optimization_contexts_frozen: false,
+            logical_frontier_revision: 0,
             budget,
             calibration: Arc::new(MachineCalibrationBundle::default()),
             regions: RegionForest::default(),
@@ -652,6 +689,10 @@ impl Memo {
             // append-ownership assertion.
             if owner.index() < savepoint.group_count {
                 let expression = &self.logical_exprs[index];
+                self.logical_frontier_revision = self
+                    .logical_frontier_revision
+                    .checked_add(1)
+                    .ok_or_else(|| paro_error::internal("Memo frontier revision overflow"))?;
                 let group = &mut self.groups[owner.index()];
                 if group.logical_exprs.pop() != Some(id)
                     || group.logical_index.remove(&expression.key) != Some(id)
@@ -660,6 +701,7 @@ impl Memo {
                         "transformation rollback found inconsistent group membership",
                     ));
                 }
+                group.logical_expression_version = self.logical_frontier_revision;
             }
         }
         self.logical_exprs
@@ -770,6 +812,7 @@ impl Memo {
             logical_properties,
             cardinality,
             logical_exprs: Vec::new(),
+            logical_expression_version: 0,
             physical_exprs: Vec::new(),
             logical_index: BTreeMap::new(),
             physical_index: BTreeMap::new(),
@@ -997,9 +1040,14 @@ impl Memo {
             applied_rules: BTreeSet::new(),
         });
         self.logical_owners.push(target);
+        self.logical_frontier_revision = self
+            .logical_frontier_revision
+            .checked_add(1)
+            .ok_or_else(|| paro_error::internal("Memo frontier revision overflow"))?;
         let group = &mut self.groups[target.index()];
         group.logical_index.insert(key, id);
         group.logical_exprs.push(id);
+        group.logical_expression_version = self.logical_frontier_revision;
         Ok(id)
     }
 
@@ -1166,6 +1214,10 @@ impl Memo {
             )));
         }
         self.parents[secondary.index()] = canonical;
+        self.logical_frontier_revision = self
+            .logical_frontier_revision
+            .checked_add(1)
+            .ok_or_else(|| paro_error::internal("Memo frontier revision overflow"))?;
 
         let (canonical_group, secondary_group) =
             two_groups_mut(&mut self.groups, canonical.index(), secondary.index());
@@ -1182,6 +1234,7 @@ impl Memo {
         canonical_group
             .logical_exprs
             .append(&mut secondary_group.logical_exprs);
+        canonical_group.logical_expression_version = self.logical_frontier_revision;
         canonical_group
             .physical_exprs
             .append(&mut secondary_group.physical_exprs);

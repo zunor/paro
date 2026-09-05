@@ -316,8 +316,8 @@ pub(super) struct PlannerCostFacts {
     pub(super) runtime_filter_probe_source_rows: Option<paro_planner::plan::CardinalityEstimate>,
     pub(super) runtime_filter_build_left_probe_source_rows:
         Option<paro_planner::plan::CardinalityEstimate>,
-    pub(super) runtime_filter_probe_work_sources: Box<[WorkSourceId]>,
-    pub(super) runtime_filter_build_left_probe_work_sources: Box<[WorkSourceId]>,
+    pub(super) runtime_filter_probe_sources: Box<[PlannerRuntimeFilterSource]>,
+    pub(super) runtime_filter_build_left_probe_sources: Box<[PlannerRuntimeFilterSource]>,
     /// Snapshot estimate of the distinct build-key domain. This ranks
     /// runtime-filter benefit; it never proves capacity or correctness.
     pub(super) runtime_filter_build_distinct_expected: Option<u64>,
@@ -345,8 +345,8 @@ pub(super) struct ResolvedPlannerCostFacts {
     pub(super) runtime_filter_build_left_probe_multiplicity: RuntimeFilterProbeMultiplicity,
     pub(super) runtime_filter_probe_source_rows: Option<CompactRange>,
     pub(super) runtime_filter_build_left_probe_source_rows: Option<CompactRange>,
-    pub(super) runtime_filter_probe_work_sources: Box<[WorkSourceId]>,
-    pub(super) runtime_filter_build_left_probe_work_sources: Box<[WorkSourceId]>,
+    pub(super) runtime_filter_probe_sources: Box<[ResolvedRuntimeFilterSource]>,
+    pub(super) runtime_filter_build_left_probe_sources: Box<[ResolvedRuntimeFilterSource]>,
     pub(super) runtime_filter_build_distinct_expected: Option<u64>,
     pub(super) runtime_filter_build_left_distinct_expected: Option<u64>,
     pub(super) runtime_filter_key_types: Box<[LogicalType]>,
@@ -361,6 +361,23 @@ pub(super) enum RuntimeFilterProbeMultiplicity {
     EstimatedUnique,
     /// Catalog uniqueness survives plan reuse and may tighten the risk range.
     DeclaredUnique,
+}
+
+/// One physical rowset lane reached by a runtime-filter key lineage. Source
+/// cardinality and key multiplicity stay attached to the lane: summing them
+/// first loses a declared-unique proof when another lineage is non-unique.
+#[derive(Debug, Clone)]
+pub(super) struct PlannerRuntimeFilterSource {
+    pub(super) source: WorkSourceId,
+    pub(super) rows: paro_planner::plan::CardinalityEstimate,
+    pub(super) multiplicity: RuntimeFilterProbeMultiplicity,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub(super) struct ResolvedRuntimeFilterSource {
+    pub(super) source: WorkSourceId,
+    pub(super) rows: CompactRange,
+    pub(super) multiplicity: RuntimeFilterProbeMultiplicity,
 }
 
 #[derive(Debug, Clone, Copy)]

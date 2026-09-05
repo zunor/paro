@@ -49,6 +49,11 @@ pub(crate) struct DPJoinNode {
     /// irreversible build input. This keeps selectivity uncertainty from
     /// being mistaken for a physical materialization proof.
     pub materialization_cardinality: f64,
+    /// Whether `materialization_cardinality` is an operator-local upper bound
+    /// that is tighter than the relation-set estimate. Reduction joins own
+    /// such a bound because they cannot emit more rows than their preserved
+    /// child; ordinary joins must be re-estimated from the complete set.
+    pub materialization_is_reduction_bound: bool,
     /// Schema-dependent bytes emitted by this node.
     ///
     /// This cannot be recovered from `set`: reduction joins retain filtering
@@ -108,6 +113,7 @@ impl DPJoinNode {
             cardinality,
             risk_cardinality,
             materialization_cardinality,
+            materialization_is_reduction_bound: false,
             output_payload_width,
             peak_build_bytes: 0,
         }
@@ -133,6 +139,7 @@ impl DPJoinNode {
             cardinality: estimate.cardinality,
             risk_cardinality: estimate.risk_cardinality,
             materialization_cardinality: estimate.materialization_cardinality,
+            materialization_is_reduction_bound: estimate.materialization_is_reduction_bound,
             output_payload_width: estimate.output_payload_width,
             peak_build_bytes: estimate.peak_build_bytes,
         }
@@ -166,6 +173,7 @@ struct CostedJoin {
     cardinality: f64,
     risk_cardinality: f64,
     materialization_cardinality: f64,
+    materialization_is_reduction_bound: bool,
     output_payload_width: usize,
     breakdown: JoinCostBreakdown,
     build_side: JoinBuildSide,
@@ -401,23 +409,52 @@ impl CostModel {
         predicates: Option<&JoinPredicateSet>,
     ) -> CostedJoin {
         let combination = set_manager.union(&left.set, &right.set);
-        let join_rows = self
+        let reduction_orientation = predicates.and_then(JoinPredicateSet::reduction_orientation);
+        let preserved_expected_rows = match reduction_orientation {
+            Some(JoinEdgeOrientation::Forward) => Some(left.cardinality),
+            Some(JoinEdgeOrientation::Inverted) => Some(right.cardinality),
+            None => None,
+        };
+        let preserved_risk_rows = match reduction_orientation {
+            Some(JoinEdgeOrientation::Forward) => Some(left.risk_cardinality),
+            Some(JoinEdgeOrientation::Inverted) => Some(right.risk_cardinality),
+            None => None,
+        };
+        let estimated_join_rows = self
             .cardinality_estimator
             .estimate_cardinality(&combination);
-        let risk_join_rows = self
+        let join_rows = preserved_expected_rows.map_or(estimated_join_rows, |preserved| {
+            estimated_join_rows.min(preserved)
+        });
+        let estimated_risk_join_rows = self
             .risk_cardinality_estimator
             .estimate_cardinality(&combination)
             .max(join_rows);
+        let risk_join_rows = preserved_risk_rows.map_or(estimated_risk_join_rows, |preserved| {
+            estimated_risk_join_rows.min(preserved.max(join_rows))
+        });
         let output_payload_width = Self::output_payload_width(left, right, predicates);
-        let left_materialization_rows = self
-            .materialization_cardinality(&left.set)
-            .max(left.risk_cardinality);
-        let right_materialization_rows = self
-            .materialization_cardinality(&right.set)
-            .max(right.risk_cardinality);
-        let output_materialization_rows = self
-            .materialization_cardinality(&combination)
-            .max(risk_join_rows);
+        // A reduction's materialization bound belongs to the selected child
+        // expression: its relation set also contains the filtering relation,
+        // but those rows can never be emitted. Ordinary children still use
+        // the relation-set estimator so alternate inner-join trees retain the
+        // same conservative build contract.
+        let child_materialization_rows = |model: &mut Self, child: &DPJoinNode| {
+            if child.materialization_is_reduction_bound {
+                child.materialization_cardinality
+            } else {
+                model.materialization_cardinality(&child.set)
+            }
+            .max(child.risk_cardinality)
+        };
+        let left_materialization_rows = child_materialization_rows(self, left);
+        let right_materialization_rows = child_materialization_rows(self, right);
+        let output_materialization_rows = match reduction_orientation {
+            Some(JoinEdgeOrientation::Forward) => left_materialization_rows,
+            Some(JoinEdgeOrientation::Inverted) => right_materialization_rows,
+            None => self.materialization_cardinality(&combination),
+        }
+        .max(risk_join_rows);
         let (breakdown, build_side) = self.cost_breakdown_for_cardinality(JoinCostInputs {
             left,
             right,
@@ -432,6 +469,7 @@ impl CostModel {
             cardinality: join_rows,
             risk_cardinality: risk_join_rows,
             materialization_cardinality: output_materialization_rows,
+            materialization_is_reduction_bound: reduction_orientation.is_some(),
             output_payload_width,
             breakdown,
             build_side,
@@ -911,6 +949,7 @@ mod tests {
                 cardinality: 50.0,
                 risk_cardinality: 50.0,
                 materialization_cardinality: 50.0,
+                materialization_is_reduction_bound: false,
                 output_payload_width: 11,
                 breakdown: JoinCostBreakdown {
                     build: 25.0,
@@ -1098,6 +1137,7 @@ mod tests {
             cardinality: 1000.0,
             risk_cardinality: 1000.0,
             materialization_cardinality: 1000.0,
+            materialization_is_reduction_bound: false,
             output_payload_width: cost_model.payload_width(&left_set),
             peak_build_bytes: 0,
         };
@@ -1115,6 +1155,7 @@ mod tests {
             cardinality: 500.0,
             risk_cardinality: 500.0,
             materialization_cardinality: 500.0,
+            materialization_is_reduction_bound: false,
             output_payload_width: cost_model.payload_width(&right_set),
             peak_build_bytes: 0,
         };
@@ -1323,11 +1364,59 @@ mod tests {
             model.compute_cost_breakdown(&left, &right, &mut sets, Some(&reduction));
         assert_eq!(reduction_cost.build, inner_cost.build);
         assert_eq!(reduction_cost.probe, inner_cost.probe);
-        assert_eq!(reduction_cost.total(), inner_cost.total());
+        assert!(reduction_cost.match_output < inner_cost.match_output);
+        assert!(reduction_cost.total() < inner_cost.total());
 
         let reduction_node =
             model.compute_cost_and_create_node(&left, &right, &mut sets, Some(reduction));
         assert_eq!(reduction_node.output_payload_width, 1_024);
+    }
+
+    #[test]
+    fn reduction_materialization_risk_is_bounded_by_the_preserved_child() {
+        let mut sets = JoinRelationSetManager::new();
+        let reduction_filter = create_reduction_filter(&mut sets, 0, 0, 1, 0, 0, JoinType::Semi);
+        let predicates = predicate_set(std::slice::from_ref(&reduction_filter));
+        let mut preserved_stats = RelationStats::with_cardinality(64);
+        preserved_stats.risk_cardinality = 1_092;
+        preserved_stats.materialization_cardinality = 1_092;
+        let mut filtering_stats = RelationStats::with_cardinality(291_606);
+        filtering_stats.risk_cardinality = 291_606;
+        filtering_stats.materialization_cardinality = 291_606;
+        let mut model = CostModel::new(SelectivityDefaults::default());
+        model.init_cost_model(&mut sets, &[preserved_stats, filtering_stats]);
+
+        let preserved = leaf(&mut model, sets.get_relation(0));
+        let filtering = leaf(&mut model, sets.get_relation(1));
+        let forward = model.compute_cost_and_create_node(
+            &preserved,
+            &filtering,
+            &mut sets,
+            Some(predicates.clone()),
+        );
+        let CutPredicateResolution::Resolved(Some(inverted_predicates)) =
+            JoinPredicateSet::from_filters(
+                [&reduction_filter],
+                filtering.set.as_ref(),
+                preserved.set.as_ref(),
+            )
+        else {
+            panic!("expected an inverted reduction predicate set")
+        };
+        let inverted = model.compute_cost_and_create_node(
+            &filtering,
+            &preserved,
+            &mut sets,
+            Some(inverted_predicates),
+        );
+
+        assert_eq!(forward.materialization_cardinality, 1_092.0);
+        assert_eq!(inverted.materialization_cardinality, 1_092.0);
+        assert_eq!(forward.output_payload_width, preserved.output_payload_width);
+        assert_eq!(
+            inverted.output_payload_width,
+            preserved.output_payload_width
+        );
     }
 
     #[test]

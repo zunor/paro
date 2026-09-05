@@ -79,6 +79,13 @@ struct TransformationInsertion {
     expressions: usize,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+struct TransformationTaskId {
+    group: GroupId,
+    expression: LogicalExprId,
+    rule: RuleId,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum SearchTask {
     Transform {
@@ -162,6 +169,13 @@ pub struct CascadesEngine {
     grant_sensitivity: BTreeMap<GroupId, GrantSensitivitySummary>,
     rule_attempts: BTreeMap<RuleId, u64>,
     effective_rule_insertions: BTreeMap<RuleId, u64>,
+    /// Last child-expression frontier consumed by each transformation task.
+    /// A task that declined a match is recorded as well: a later child
+    /// alternative may make that same pattern applicable.
+    transformation_observations: BTreeMap<TransformationTaskId, Box<[(GroupId, u64)]>>,
+    /// Reverse index for incrementally closing transformation dependencies.
+    /// Subscribers are woken only after a Memo transaction commits.
+    transformation_subscribers: BTreeMap<GroupId, BTreeSet<TransformationTaskId>>,
     region_candidates: BTreeMap<super::ids::RegionId, BTreeSet<Fingerprint>>,
 }
 
@@ -183,6 +197,8 @@ impl CascadesEngine {
             grant_sensitivity: BTreeMap::new(),
             rule_attempts: BTreeMap::new(),
             effective_rule_insertions: BTreeMap::new(),
+            transformation_observations: BTreeMap::new(),
+            transformation_subscribers: BTreeMap::new(),
             region_candidates: BTreeMap::new(),
         }
     }
@@ -367,6 +383,14 @@ impl CascadesEngine {
             else {
                 unreachable!("transformation agenda contains implementation task")
             };
+            let task_id = TransformationTaskId {
+                group,
+                expression,
+                rule,
+            };
+            let Some(dependency_version) = self.observe_transformation_inputs(task_id)? else {
+                continue;
+            };
             let matches = {
                 let rule_impl = self
                     .registry
@@ -384,10 +408,11 @@ impl CascadesEngine {
             if !matches {
                 continue;
             }
-            if !self.memo.mark_rule_applied(expression, rule)? {
-                continue;
-            }
-            let event = transformation_event(group, expression, rule);
+            // `applied_rules` remains an audit of whether this rule has ever
+            // reached apply for the expression. Incremental idempotence is
+            // governed by the dependency-version observation above.
+            self.memo.mark_rule_applied(expression, rule)?;
+            let event = transformation_event(group, expression, rule, dependency_version);
             let admitted = self
                 .memo
                 .group_mut(group)
@@ -397,7 +422,13 @@ impl CascadesEngine {
             if admitted == BudgetDecision::Exhausted {
                 continue;
             }
-            if !admit_transformation_work(&mut self.memo, group, expression, rule)? {
+            if !admit_transformation_work(
+                &mut self.memo,
+                group,
+                expression,
+                rule,
+                dependency_version,
+            )? {
                 continue;
             }
             // Reserve the complete bounded frontier before the rule may append
@@ -419,7 +450,13 @@ impl CascadesEngine {
             };
             let mut output_events = Vec::with_capacity(output_bound);
             for ordinal in 0..output_bound {
-                let event = transformation_output_event(group, expression, rule, ordinal);
+                let event = transformation_output_event(
+                    group,
+                    expression,
+                    rule,
+                    dependency_version,
+                    ordinal,
+                );
                 let admitted = self
                     .memo
                     .group_mut(group)
@@ -588,6 +625,7 @@ impl CascadesEngine {
             }
             for target in inserted_groups {
                 self.schedule_transformations(target, &mut agenda)?;
+                self.schedule_transformation_dependents(target, &mut agenda)?;
             }
         }
         Ok(())
@@ -636,6 +674,96 @@ impl CascadesEngine {
             }
         }
         Ok(())
+    }
+
+    fn schedule_transformation_dependents(
+        &self,
+        group: GroupId,
+        agenda: &mut StableAgenda,
+    ) -> Result<()> {
+        let group = self.memo.canonical_group(group);
+        let subscribers = self
+            .transformation_subscribers
+            .get(&group)
+            .cloned()
+            .unwrap_or_default();
+        for subscriber in subscribers {
+            let expression_ref =
+                self.memo
+                    .logical_expr(subscriber.expression)
+                    .ok_or_else(|| {
+                        paro_error::internal(
+                            "transformation subscriber references unknown expression",
+                        )
+                    })?;
+            let rule = self
+                .registry
+                .transformation(subscriber.rule)
+                .ok_or_else(|| paro_error::internal("subscribed transformation disappeared"))?;
+            let owner = self
+                .memo
+                .logical_owner(subscriber.expression)
+                .ok_or_else(|| {
+                    paro_error::internal("transformation subscriber has no owning group")
+                })?;
+            let context = RuleContext {
+                memo: &self.memo,
+                group: owner,
+            };
+            let promise = rule.promise(expression_ref, &context);
+            agenda.push(
+                TaskKey {
+                    priority: promise.priority,
+                    kind: TaskKind::Transform,
+                    stable_id: subscriber.rule.0,
+                    group: owner,
+                    expression: subscriber.expression,
+                    goal: None,
+                },
+                SearchTask::Transform {
+                    group: owner,
+                    expression: subscriber.expression,
+                    rule: subscriber.rule,
+                },
+            );
+        }
+        Ok(())
+    }
+
+    /// Record the complete logical frontier reachable through the source
+    /// expression's child group holes. This conservative closure covers
+    /// legacy rules that still materialize a planner subtree while local
+    /// Memo-native rules naturally subscribe only to their direct holes.
+    fn observe_transformation_inputs(
+        &mut self,
+        task: TransformationTaskId,
+    ) -> Result<Option<Fingerprint>> {
+        let dependencies = transformation_dependency_versions(&self.memo, task.expression)?;
+        if self
+            .transformation_observations
+            .get(&task)
+            .is_some_and(|observed| observed.as_ref() == dependencies.as_slice())
+        {
+            return Ok(None);
+        }
+
+        if let Some(previous) = self.transformation_observations.get(&task) {
+            for &(group, _) in previous {
+                if let Some(subscribers) = self.transformation_subscribers.get_mut(&group) {
+                    subscribers.remove(&task);
+                }
+            }
+        }
+        for (group, _) in dependencies.iter().copied() {
+            self.transformation_subscribers
+                .entry(group)
+                .or_default()
+                .insert(task);
+        }
+        let version = transformation_dependency_fingerprint(&dependencies);
+        self.transformation_observations
+            .insert(task, dependencies.into_boxed_slice());
+        Ok(Some(version))
     }
 
     fn enumerate_implementations(&mut self, group: GroupId, goal: OptimizationGoal) -> Result<()> {
@@ -997,10 +1125,30 @@ impl CascadesEngine {
                     logical_expression = logical_expression.map(LogicalExprId::index),
                     origin_rule,
                     physical_expression = physical.index(),
+                    child_groups = ?recipe
+                        .child_goals
+                        .iter()
+                        .map(|(child, _)| child.index())
+                        .collect::<Vec<_>>(),
                     implementation = self
                         .memo
                         .physical_expr(physical)
                         .map(|physical| physical.key.implementation.0),
+                    local_expected_cost = local_cost.score.range.expected,
+                    local_risk_adjusted_cost = local_cost.score.risk_adjusted,
+                    child_expected_costs = ?child_costs
+                        .iter()
+                        .map(|cost| cost.score.range.expected)
+                        .collect::<Vec<_>>(),
+                    child_risk_adjusted_costs = ?child_costs
+                        .iter()
+                        .map(|cost| cost.score.risk_adjusted)
+                        .collect::<Vec<_>>(),
+                    source_filter_apply_risk_adjusted_cost = recipe
+                        .source_filter_apply_cost
+                        .map(|cost| cost.score.risk_adjusted),
+                    composition = ?recipe.cost_composition,
+                    expected_cost = cost.score.range.expected,
                     risk_adjusted_cost = cost.score.risk_adjusted,
                     upper_cost = cost.score.range.upper,
                     "costed an equivalent physical candidate"
@@ -1061,6 +1209,7 @@ fn transformation_output_event(
     group: GroupId,
     expression: LogicalExprId,
     rule: RuleId,
+    dependency_version: Fingerprint,
     ordinal: usize,
 ) -> Fingerprint {
     let mut event = StableFingerprintBuilder::default();
@@ -1068,6 +1217,7 @@ fn transformation_output_event(
     event.write_u64(group.0 as u64);
     event.write_u64(expression.0 as u64);
     event.write_u64(rule.0 as u64);
+    event.write_fingerprint(dependency_version);
     event.write_u64(ordinal as u64);
     event.finish()
 }
@@ -1359,11 +1509,11 @@ pub(crate) fn compose_candidate_cost_with_sources(
     for (index, child) in child_costs.iter().copied().enumerate() {
         let mut child = child;
         let mut lanes = child_source_work[index].to_vec();
-        if let Some((filtered_child, sources, expected)) = sideways_filter {
+        if let Some((filtered_child, sources)) = sideways_filter {
             if index == filtered_child {
                 let matching_lanes = lanes
                     .iter()
-                    .filter(|lane| sources.contains(&lane.source))
+                    .filter(|lane| sources.iter().any(|source| source.source == lane.source))
                     .count();
                 if matching_lanes != 0 {
                     let full_apply_cost = source_filter_apply_cost.ok_or_else(|| {
@@ -1374,7 +1524,7 @@ pub(crate) fn compose_candidate_cost_with_sources(
                     cost = cost.replace_work(full_apply_cost, SearchCost::ZERO)?;
                     let matching_work = lanes
                         .iter()
-                        .filter(|lane| sources.contains(&lane.source))
+                        .filter(|lane| sources.iter().any(|source| source.source == lane.source))
                         .map(|lane| lane.cost.score.range.expected.max(0.0))
                         .sum::<f64>();
                     // Predicate evaluation is one operator-local cost before it
@@ -1383,7 +1533,10 @@ pub(crate) fn compose_candidate_cost_with_sources(
                     // or discard work through independent rounding.
                     let mut apply_shares = Vec::with_capacity(matching_lanes);
                     let mut unallocated_ppm = 1_000_000_u32;
-                    for lane in lanes.iter().filter(|lane| sources.contains(&lane.source)) {
+                    for lane in lanes
+                        .iter()
+                        .filter(|lane| sources.iter().any(|source| source.source == lane.source))
+                    {
                         let remaining_lanes = matching_lanes - apply_shares.len();
                         let share = if remaining_lanes == 1 {
                             unallocated_ppm
@@ -1405,7 +1558,9 @@ pub(crate) fn compose_candidate_cost_with_sources(
                     debug_assert_eq!(unallocated_ppm, 0);
                     let mut apply_shares = apply_shares.into_iter();
                     for lane in &mut lanes {
-                        if sources.contains(&lane.source) {
+                        if let Some(source) =
+                            sources.iter().find(|source| source.source == lane.source)
+                        {
                             let total_apply_cost = source_filter_apply_cost.expect(
                                 "matching source-work lane established predicate application cost",
                             );
@@ -1413,15 +1568,19 @@ pub(crate) fn compose_candidate_cost_with_sources(
                                 .next()
                                 .expect("one predicate-cost share per matching source lane");
                             let full_apply_cost = total_apply_cost.retain_work(share, 1_000_000)?;
-                            // Runtime filters are speculative: stale statistics or
-                            // a coarse representation can retain every source row.
-                            let retained = lane.cost.retain_work(expected, 1_000_000)?;
+                            // Speculative filters retain the complete risk
+                            // ceiling. Exact membership over a declared-unique
+                            // probe carries a proof-backed smaller ceiling.
+                            let retained = lane.cost.retain_work(
+                                source.expected_retained_ppm,
+                                source.upper_retained_ppm,
+                            )?;
                             child = child.replace_work(lane.cost, retained)?;
                             lane.cost = retained;
                             let old_apply_cost = lane.filter_apply_cost;
                             let mut filters = lane.filters.to_vec();
                             filters.push(SourceFilterWork {
-                                expected_retained_ppm: expected,
+                                expected_retained_ppm: source.expected_retained_ppm,
                                 full_apply_cost: full_apply_cost.work_only(),
                             });
                             let new_apply_cost = ordered_source_filter_cost(&filters)?;
@@ -1435,7 +1594,7 @@ pub(crate) fn compose_candidate_cost_with_sources(
                     target: "paro::optimizer",
                     declared_source_count = sources.len(),
                     matching_lanes,
-                    expected_retained_ppm = expected,
+                    source_retentions = ?sources,
                     child_expected_cost = child.score.range.expected,
                     "composed source-attributed sideways filter"
                 );
@@ -1561,11 +1720,58 @@ fn ordered_source_filter_cost(filters: &[SourceFilterWork]) -> Result<SearchCost
     Ok(cost)
 }
 
-fn transformation_event(group: GroupId, expression: LogicalExprId, rule: RuleId) -> Fingerprint {
+fn transformation_dependency_versions(
+    memo: &Memo,
+    source: LogicalExprId,
+) -> Result<Vec<(GroupId, u64)>> {
+    let source = memo
+        .logical_expr(source)
+        .ok_or_else(|| paro_error::internal("transformation dependency source disappeared"))?;
+    let mut pending = source.key.children.to_vec();
+    let mut visited = BTreeSet::new();
+    let mut dependencies = BTreeMap::new();
+    while let Some(group) = pending.pop() {
+        let group = memo.canonical_group(group);
+        if !visited.insert(group) {
+            continue;
+        }
+        let group_ref = memo.group(group).ok_or_else(|| {
+            paro_error::internal("transformation dependency references an unknown group")
+        })?;
+        dependencies.insert(group, group_ref.logical_expression_version());
+        for expression in group_ref.logical_exprs() {
+            let expression = memo.logical_expr(*expression).ok_or_else(|| {
+                paro_error::internal("transformation dependency expression disappeared")
+            })?;
+            pending.extend(expression.key.children.iter().copied());
+        }
+    }
+    Ok(dependencies.into_iter().collect())
+}
+
+fn transformation_dependency_fingerprint(dependencies: &[(GroupId, u64)]) -> Fingerprint {
     let mut builder = StableFingerprintBuilder::default();
+    builder.write_bytes(b"paro.transformation-dependencies.v1");
+    builder.write_u64(dependencies.len() as u64);
+    for (group, version) in dependencies {
+        builder.write_u64(group.0 as u64);
+        builder.write_u64(*version);
+    }
+    builder.finish()
+}
+
+fn transformation_event(
+    group: GroupId,
+    expression: LogicalExprId,
+    rule: RuleId,
+    dependency_version: Fingerprint,
+) -> Fingerprint {
+    let mut builder = StableFingerprintBuilder::default();
+    builder.write_bytes(b"paro.transformation-fire.v2");
     builder.write_u64(group.0 as u64);
     builder.write_u64(expression.0 as u64);
     builder.write_u64(rule.0 as u64);
+    builder.write_fingerprint(dependency_version);
     builder.finish()
 }
 
@@ -1574,6 +1780,7 @@ fn admit_transformation_work(
     target: GroupId,
     source: LogicalExprId,
     rule: RuleId,
+    dependency_version: Fingerprint,
 ) -> Result<bool> {
     let mut pending = vec![source];
     let mut visited = BTreeSet::new();
@@ -1592,10 +1799,11 @@ fn admit_transformation_work(
                 continue;
             }
             let mut event = StableFingerprintBuilder::default();
-            event.write_bytes(b"paro.rule-work.v1");
+            event.write_bytes(b"paro.rule-work.v2");
             event.write_u64(target.0 as u64);
             event.write_u64(source.0 as u64);
             event.write_u64(rule.0 as u64);
+            event.write_fingerprint(dependency_version);
             event.write_u64(child.0 as u64);
             if memo
                 .group_mut(target)

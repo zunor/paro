@@ -47,7 +47,7 @@ PROJECTION  (rows=1)
   Output Schema: "s.id" INTEGER, "b.payload" VARCHAR
   ->  HASH_JOIN  (rows=1)
     Join Type: INNER
-    Runtime Filter: wait_complete capability=AdaptiveExactMembership peak=14680064B builders=1 artifact=e9da22dd76bdc23ff4fb682248710b68
+    Runtime Filter: wait_complete capability=AdaptiveExactMembership peak=16777216B builders=1 artifact=e9da22dd76bdc23ff4fb682248710b68
     Build Index: integer_build_time
     Join Condition: b.id = s.id
     Cardinality: [1, 1, 1]

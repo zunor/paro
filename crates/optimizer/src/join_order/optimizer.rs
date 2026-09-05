@@ -558,11 +558,13 @@ impl JoinOrderOptimizer {
                             if matches!(child.join_type, JoinType::Semi | JoinType::Anti)
                     ) {
                         // Consecutive reductions over the same preserved side
-                        // are commutative filters. Expose only that cascade as
-                        // a join-order region; the preserved input beneath it
-                        // has already been optimized recursively and remains
-                        // atomic here.
-                        self.extract_reduction_cascade(ctx, bind_context, join, filters);
+                        // are commutative filters. Keep the reorderable inner
+                        // region beneath them in the same graph: a reduction
+                        // may then shrink the preserved key domain before a
+                        // wide or expensive dimension is joined. Reduction
+                        // role edges still prevent a filter from running
+                        // before the relation that owns its preserved key.
+                        self.extract_reduction_cascade(ctx, bind_context, join, filters)?;
                     } else {
                         // A single reduction retains the established behavior:
                         // its preserved inner-join region may be reordered
@@ -632,25 +634,32 @@ impl JoinOrderOptimizer {
         bind_context: &BindContext,
         join: &ComparisonJoin,
         filters: &mut Vec<ExtractedFilter>,
-    ) {
+    ) -> Result<()> {
         // Every entry is validated by the root match or the recursive child
         // guard below. Invalid reductions remain atomic relations at their
         // caller, preserving existential multiplicity in every build mode.
-        if let LogicalOperator::Join(Join::Comparison(child)) = &join.left.operator {
-            if RelationManager::reduction_join_is_reorderable(child) {
-                self.extract_reduction_cascade(ctx, bind_context, child, filters);
-            } else {
+        match &join.left.operator {
+            LogicalOperator::Join(Join::Comparison(child))
+                if RelationManager::reduction_join_is_reorderable(child) =>
+            {
+                self.extract_reduction_cascade(ctx, bind_context, child, filters)?;
+            }
+            LogicalOperator::Join(Join::Comparison(child))
+                if matches!(child.join_type, JoinType::Semi | JoinType::Anti) =>
+            {
                 // A reduction whose predicate does not identify both inputs
                 // (for example `5 = rhs.key`) is valid SQL but not a graph
                 // edge. Keep the complete subtree atomic so its existential
                 // semantics survive while outer reductions remain reorderable.
                 self.add_relation_plan(ctx, bind_context, &join.left);
             }
-        } else {
-            self.add_relation_plan(ctx, bind_context, &join.left);
+            _ => {
+                self.extract_join_relations(ctx, bind_context, &join.left, filters, false)?;
+            }
         }
         self.add_relation_plan(ctx, bind_context, &join.right);
         Self::extract_comparison_join_filters(join, filters);
+        Ok(())
     }
 
     fn extract_comparison_join_filters(join: &ComparisonJoin, filters: &mut Vec<ExtractedFilter>) {
@@ -1974,6 +1983,48 @@ mod tests {
             optimizer.relation_plans[2].operator,
             LogicalOperator::ExpressionGet(_)
         ));
+    }
+
+    #[test]
+    fn reduction_cascade_shares_one_region_with_its_reorderable_preserved_joins() {
+        let session = make_test_session();
+        let bind_context = BindContext::new();
+        let preserved = LogicalPlan::synthetic(LogicalOperator::Join(Join::Comparison(
+            ComparisonJoin::new(
+                JoinType::Inner,
+                LogicalPlan::synthetic(create_scan(0)),
+                LogicalPlan::synthetic(create_scan(1)),
+                vec![join_condition(JoinComparisonType::Equal, 0, 1)],
+            ),
+        )));
+        let first = LogicalPlan::synthetic(LogicalOperator::Join(Join::Comparison(
+            ComparisonJoin::new(
+                JoinType::Semi,
+                preserved,
+                LogicalPlan::synthetic(create_scan(2)),
+                vec![join_condition(JoinComparisonType::Equal, 0, 2)],
+            ),
+        )));
+        let plan = LogicalPlan::synthetic(LogicalOperator::Join(Join::Comparison(
+            ComparisonJoin::new(
+                JoinType::Semi,
+                first,
+                LogicalPlan::synthetic(create_scan(3)),
+                vec![join_condition(JoinComparisonType::Equal, 0, 3)],
+            ),
+        )));
+        let mut optimizer = JoinOrderOptimizer::new(SelectivityDefaults::default());
+        let mut filters = Vec::new();
+
+        optimizer
+            .extract_join_relations(&session, &bind_context, &plan, &mut filters, true)
+            .unwrap();
+
+        assert_eq!(optimizer.relation_manager.num_relations(), 4);
+        assert_eq!(filters.len(), 3);
+        assert_eq!(filters[0].join_type, JoinType::Inner);
+        assert_eq!(filters[1].join_type, JoinType::Semi);
+        assert_eq!(filters[2].join_type, JoinType::Semi);
     }
 
     #[test]
