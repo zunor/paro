@@ -171,24 +171,27 @@ pub(super) fn matches_transformation_root(
     expr: &crate::cascades::memo::LogicalExpr,
     state: &PlannerTransformState,
 ) -> bool {
-    use LogicalOperatorType as Op;
-
-    // These owners publish a complete local frontier. The provenance is part
-    // of the immutable expression shell, so it is safe to reject before any
-    // descendant dependency is observed.
-    if matches!(
-        transformation,
-        PlannerTransformation::JoinRegionEnumeration
-            | PlannerTransformation::AggregateDimensionDeferral
-    ) && expression_was_produced_by(expr, transformation.id())
-    {
-        return false;
-    }
-
     let Some(metadata) = state.metadata.get(&expr.payload) else {
         return false;
     };
-    let operator = metadata.operator_type;
+    transformation_root_operator_matches(
+        transformation,
+        metadata.operator_type,
+        state.rowset_scan_pushdown,
+    )
+}
+
+/// Root dispatch is a function of the immutable operator shell and session
+/// capabilities only. Equivalence provenance is deliberately absent: a rule
+/// proof is audit evidence, never a semantic guard against newly added child
+/// bindings of an expression produced by that same rule.
+fn transformation_root_operator_matches(
+    transformation: PlannerTransformation,
+    operator: LogicalOperatorType,
+    rowset_scan_pushdown: bool,
+) -> bool {
+    use LogicalOperatorType as Op;
+
     match transformation {
         PlannerTransformation::ExpensivePredicatePlacement => operator == Op::Filter,
         PlannerTransformation::CtePartitionedMaterialization
@@ -216,28 +219,12 @@ pub(super) fn matches_transformation_root(
             operator == Op::Limit
         }
         PlannerTransformation::LatePayloadFetch => {
-            state.rowset_scan_pushdown
-                && matches!(operator, Op::Projection | Op::Aggregate | Op::TopN)
+            rowset_scan_pushdown && matches!(operator, Op::Projection | Op::Aggregate | Op::TopN)
         }
         PlannerTransformation::ScalarAggregateWindow => {
             matches!(operator, Op::ComparisonJoin | Op::Projection | Op::Filter)
         }
     }
-}
-
-fn expression_was_produced_by(expr: &crate::cascades::memo::LogicalExpr, rule: RuleId) -> bool {
-    expr.proofs.iter().any(|proof| {
-        matches!(
-            proof,
-            EquivalenceProof::Transformation {
-                rule: producer,
-                ..
-            } | EquivalenceProof::SpecializedEnumerator {
-                rule: producer,
-                ..
-            } if *producer == rule
-        )
-    })
 }
 
 #[cfg(test)]
@@ -371,46 +358,22 @@ mod tests {
         );
     }
 
-    fn expression_with(proof: EquivalenceProof) -> crate::cascades::memo::LogicalExpr {
-        crate::cascades::memo::LogicalExpr {
-            id: LogicalExprId(7),
-            key: crate::cascades::memo::LogicalExprKey {
-                operator: Fingerprint(11),
-                scalars: Box::new([]),
-                children: Box::new([]),
-            },
-            payload: LogicalPayloadId(13),
-            proofs: [proof].into_iter().collect(),
-            applied_rules: BTreeSet::new(),
-        }
-    }
-
     #[test]
-    fn region_owner_recognizes_its_transformation_frontier() {
-        let expression = expression_with(EquivalenceProof::Transformation {
-            rule: AGGREGATE_DIMENSION_DEFERRAL_RULE,
-            source: LogicalExprId(3),
-            premise: Fingerprint(5),
-        });
-        assert!(expression_was_produced_by(
-            &expression,
-            AGGREGATE_DIMENSION_DEFERRAL_RULE
+    fn root_dispatch_has_no_equivalence_provenance_input() {
+        assert!(transformation_root_operator_matches(
+            PlannerTransformation::JoinRegionEnumeration,
+            LogicalOperatorType::ComparisonJoin,
+            true,
         ));
-        assert!(!expression_was_produced_by(
-            &expression,
-            JOIN_REGION_ENUMERATION_RULE
+        assert!(transformation_root_operator_matches(
+            PlannerTransformation::AggregateDimensionDeferral,
+            LogicalOperatorType::Aggregate,
+            true,
         ));
-    }
-
-    #[test]
-    fn region_owner_recognizes_a_specialized_frontier() {
-        let expression = expression_with(EquivalenceProof::SpecializedEnumerator {
-            rule: JOIN_REGION_ENUMERATION_RULE,
-            region: Fingerprint(17),
-        });
-        assert!(expression_was_produced_by(
-            &expression,
-            JOIN_REGION_ENUMERATION_RULE
+        assert!(!transformation_root_operator_matches(
+            PlannerTransformation::JoinRegionEnumeration,
+            LogicalOperatorType::Projection,
+            true,
         ));
     }
 }
