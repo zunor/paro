@@ -149,6 +149,7 @@ pub(super) fn pattern_bindings(
         .collect::<Vec<_>>();
     bindings.sort_by_key(|binding| binding.fingerprint);
     bindings.dedup_by_key(|binding| binding.fingerprint);
+    let enumerated_bindings = bindings.len();
     Ok(PatternBindingSet {
         bindings: bindings.into_boxed_slice(),
         reads: enumerator
@@ -158,6 +159,7 @@ pub(super) fn pattern_bindings(
             .into_boxed_slice(),
         completion: if enumerator.limited {
             PatternEnumerationCompletion::BudgetLimited {
+                enumerated_bindings,
                 omitted_at_least: 1,
             }
         } else {

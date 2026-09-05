@@ -442,16 +442,19 @@ impl CascadesEngine {
             else {
                 continue;
             };
-            if matches!(
-                binding_set.completion,
-                PatternEnumerationCompletion::BudgetLimited { .. }
-            ) {
+            if let PatternEnumerationCompletion::BudgetLimited {
+                enumerated_bindings,
+                omitted_at_least,
+            } = binding_set.completion
+            {
                 let mut witness = StableFingerprintBuilder::default();
                 witness.write_bytes(b"paro.pattern-enumeration-limited.v1");
                 witness.write_u64(group.0 as u64);
                 witness.write_u64(expression.0 as u64);
                 witness.write_u64(rule.0 as u64);
                 witness.write_fingerprint(read_version);
+                witness.write_u64(enumerated_bindings as u64);
+                witness.write_u64(omitted_at_least as u64);
                 self.memo
                     .group_mut(group)
                     .ok_or_else(|| paro_error::internal("pattern owner group disappeared"))?
@@ -1144,11 +1147,25 @@ impl CascadesEngine {
                 .saturating_add(1) as usize;
             let combinations =
                 child_winner_combinations(&child_frontiers, admitted_combination_limit);
+            let (completion, first_omitted_ordinal, omitted_at_least) =
+                match combinations.completion {
+                    EnumerationCompletion::Complete => ("complete", None, 0),
+                    EnumerationCompletion::BudgetLimited {
+                        first_omitted_ordinal,
+                        omitted_at_least,
+                    } => (
+                        "budget_limited",
+                        Some(first_omitted_ordinal),
+                        omitted_at_least,
+                    ),
+                };
             tracing::debug!(
                 target: "paro::optimizer",
                 parent_group = group.index(),
                 physical_expression = physical.index(),
-                completion = ?combinations.completion,
+                completion,
+                first_omitted_ordinal,
+                omitted_at_least,
                 generated_combinations = combinations.combinations.len(),
                 "enumerated bounded child frontier product"
             );
@@ -1659,7 +1676,10 @@ pub(crate) struct ComposedCost {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum EnumerationCompletion {
     Complete,
-    BudgetLimited { omitted_at_least: usize },
+    BudgetLimited {
+        first_omitted_ordinal: usize,
+        omitted_at_least: usize,
+    },
 }
 
 #[derive(Debug)]
@@ -1704,6 +1724,7 @@ fn child_winner_combinations(
             EnumerationCompletion::Complete
         } else {
             EnumerationCompletion::BudgetLimited {
+                first_omitted_ordinal: admitted_limit,
                 omitted_at_least: total.saturating_sub(admitted_limit),
             }
         },

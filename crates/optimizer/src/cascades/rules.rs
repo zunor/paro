@@ -134,7 +134,10 @@ pub struct RuleContext<'a> {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PatternEnumerationCompletion {
     Complete,
-    BudgetLimited { omitted_at_least: usize },
+    BudgetLimited {
+        enumerated_bindings: usize,
+        omitted_at_least: usize,
+    },
 }
 
 /// One explicitly bound Memo operand. Expression nodes name the exact logical
