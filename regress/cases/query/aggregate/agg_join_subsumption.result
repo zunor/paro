@@ -58,6 +58,7 @@ ORDER_BY  (rows=4)
       Aggregates: sum(partial_aggregate)
       ->  HASH_JOIN  (rows=4)
         Join Type: INNER
+        Runtime Filter: wait_complete capability=AdaptiveExactMembership peak=16777216B builders=1 artifact=960d402143965a4a9fee556b4dc7a7f4
         Join Condition: p.order_key = order_key
         ->  ROWSET_SCAN on public.agg_sub_preserved p  (rows=6)
           Columns: order_key, label

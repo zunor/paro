@@ -443,11 +443,12 @@ fn compare_objective(
 ) -> std::cmp::Ordering {
     // Objective IDs are registry identities. The built-in profiles reserve
     // 0=latency, 1=throughput, 2=memory, 3=robustness. Feasibility and memory
-    // completion are compared before every soft objective. Latency ranks the
-    // expected critical path; uncertainty remains a deterministic tie-break
-    // and is the primary quantity for robustness. Unknown extension profiles
-    // fail closed to conservative risk ordering until their registry owns the
-    // comparison contract.
+    // completion are compared before every soft objective. Latency ranks
+    // expected work before its critical path: bounded worker pools cannot turn
+    // avoidable work into free parallelism. Uncertainty remains a deterministic
+    // tie-break and is the primary quantity for robustness. Unknown extension
+    // profiles fail closed to conservative risk ordering until their registry
+    // owns the comparison contract.
     left.cost
         .memory_completion
         .preference_cmp(right.cost.memory_completion)
@@ -499,15 +500,15 @@ fn compare_objective(
                 }),
             0 => left
                 .cost
-                .critical_path
+                .score
+                .range
                 .expected
-                .total_cmp(&right.cost.critical_path.expected)
+                .total_cmp(&right.cost.score.range.expected)
                 .then_with(|| {
                     left.cost
-                        .score
-                        .range
+                        .critical_path
                         .expected
-                        .total_cmp(&right.cost.score.range.expected)
+                        .total_cmp(&right.cost.critical_path.expected)
                 })
                 .then_with(|| {
                     left.cost

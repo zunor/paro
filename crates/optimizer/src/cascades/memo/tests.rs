@@ -461,16 +461,24 @@ fn latency_and_robustness_profiles_rank_uncertainty_explicitly() {
             joint_cost_proof: None,
         }
     };
-    let fast_expected = winner(1, 10.0, 20.0, 100.0, 80.0);
-    let narrow_uncertainty = winner(2, 20.0, 22.0, 30.0, 25.0);
+    let work_efficient = winner(1, 20.0, 20.0, 100.0, 80.0);
+    let short_path_narrow_uncertainty = winner(2, 10.0, 22.0, 30.0, 25.0);
 
     assert_eq!(
-        compare_objective(&fast_expected, &narrow_uncertainty, ObjectiveProfileId(0)),
+        compare_objective(
+            &work_efficient,
+            &short_path_narrow_uncertainty,
+            ObjectiveProfileId(0),
+        ),
         std::cmp::Ordering::Less,
-        "the latency profile optimizes expected response time"
+        "the latency profile first avoids work on the bounded worker pool"
     );
     assert_eq!(
-        compare_objective(&fast_expected, &narrow_uncertainty, ObjectiveProfileId(3)),
+        compare_objective(
+            &work_efficient,
+            &short_path_narrow_uncertainty,
+            ObjectiveProfileId(3),
+        ),
         std::cmp::Ordering::Greater,
         "the robustness profile optimizes the hard uncertainty bound"
     );
