@@ -597,7 +597,7 @@ fn rewrite_planner_expression(
         }
         PlannerTransformation::AggregatePostReduction => {
             let (plan, changed) =
-                post_reduction::optimize_plan_with_change(plan, &environment.bind_context);
+                post_reduction::optimize_plan_with_change(plan, &environment.bind_context)?;
             if !changed {
                 return Ok(None);
             }
@@ -699,52 +699,48 @@ fn rewrite_planner_expression(
 /// require it. Rewrite the staged subtree here and let the ordinary group
 /// contract check accept the smallest ancestor that preserves its full output.
 fn rewrite_positive_consumed_mark_filter(plan: LogicalPlan) -> Option<LogicalPlan> {
-    fn rewrite_subtree(plan: LogicalPlan) -> (LogicalPlan, bool) {
-        let mut child_changed = false;
-        let plan = plan.map_children(|child| {
-            let (child, changed) = rewrite_subtree(child);
-            child_changed |= changed;
-            child
-        });
-        let is_match = matches!(
-            &plan.operator,
-            LogicalOperator::Filter(filter)
-                if matches!(filter.expressions.as_slice(), [Expression::ColumnRef(marker)]
-                    if marker.depth == 0
-                        && matches!(&filter.child.operator,
-                            LogicalOperator::Join(Join::Comparison(join))
-                                if join.join_type == JoinType::Mark
-                                    && join.mark_index.is_some_and(|index| {
-                                        marker.binding == ColumnBinding::new(index, 0)
-                                    })))
-        );
-        if !is_match {
-            return (plan, child_changed);
-        }
-        let (id, stats, operator) = plan.into_parts();
-        let LogicalOperator::Filter(filter) = operator else {
-            unreachable!("positive mark-filter shape was checked")
-        };
-        let LogicalOperator::Join(Join::Comparison(mut join)) = (*filter.child).into_operator()
-        else {
-            unreachable!("positive mark-filter child was checked")
-        };
-        join.join_type = JoinType::Semi;
-        join.mark_index = None;
-        join.mark_semantics = paro_planner::operator::MarkJoinSemantics::NotMark;
-        join.left_projection_map = paro_planner::operator::ProjectionMap::all();
-        join.right_projection_map = paro_planner::operator::ProjectionMap::none();
-        (
-            LogicalPlan {
-                id,
-                stats,
-                operator: LogicalOperator::Join(Join::Comparison(join)),
-            },
-            true,
-        )
-    }
-
-    let (plan, changed) = rewrite_subtree(plan);
+    let mut changed = false;
+    let (plan, ()) = plan
+        .try_fold_post_order(|plan, _children: Vec<()>| {
+            let is_match = matches!(
+                &plan.operator,
+                LogicalOperator::Filter(filter)
+                    if matches!(filter.expressions.as_slice(), [Expression::ColumnRef(marker)]
+                        if marker.depth == 0
+                            && matches!(&filter.child.operator,
+                                LogicalOperator::Join(Join::Comparison(join))
+                                    if join.join_type == JoinType::Mark
+                                        && join.mark_index.is_some_and(|index| {
+                                            marker.binding == ColumnBinding::new(index, 0)
+                                        })))
+            );
+            if !is_match {
+                return Ok((plan, ()));
+            }
+            let (id, stats, operator) = plan.into_parts();
+            let LogicalOperator::Filter(filter) = operator else {
+                unreachable!("positive mark-filter shape was checked")
+            };
+            let LogicalOperator::Join(Join::Comparison(mut join)) = (*filter.child).into_operator()
+            else {
+                unreachable!("positive mark-filter child was checked")
+            };
+            join.join_type = JoinType::Semi;
+            join.mark_index = None;
+            join.mark_semantics = paro_planner::operator::MarkJoinSemantics::NotMark;
+            join.left_projection_map = paro_planner::operator::ProjectionMap::all();
+            join.right_projection_map = paro_planner::operator::ProjectionMap::none();
+            changed = true;
+            Ok((
+                LogicalPlan {
+                    id,
+                    stats,
+                    operator: LogicalOperator::Join(Join::Comparison(join)),
+                },
+                (),
+            ))
+        })
+        .ok()?;
     changed.then_some(plan)
 }
 

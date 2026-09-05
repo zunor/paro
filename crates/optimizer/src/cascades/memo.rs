@@ -42,6 +42,27 @@ impl LogicalProperties {
             (None, None) => None,
         };
     }
+
+    fn stable_fact_fingerprint(&self) -> Fingerprint {
+        let mut fingerprint = StableFingerprintBuilder::default();
+        fingerprint.write_bytes(b"paro.memo.logical-facts.v1");
+        fingerprint.write_u64(self.unique_keys.len() as u64);
+        for key in &self.unique_keys {
+            fingerprint.write_u64(key.len() as u64);
+            for column in key.iter() {
+                fingerprint.write_u64(column.0 as u64);
+            }
+        }
+        fingerprint.write_u64(self.outer_references.len() as u64);
+        for column in &self.outer_references {
+            fingerprint.write_u64(column.0 as u64);
+        }
+        fingerprint.write_u64(self.maximum_cardinality.is_some() as u64);
+        if let Some(maximum) = self.maximum_cardinality {
+            fingerprint.write_u64(maximum);
+        }
+        fingerprint.finish()
+    }
 }
 
 /// Declarative provenance and precedence of a group-level estimation recipe.
@@ -94,6 +115,25 @@ pub struct CardinalityEnvelope {
 }
 
 impl GroupCardinality {
+    fn stable_snapshot_fingerprint(&self) -> Fingerprint {
+        let mut fingerprint = StableFingerprintBuilder::default();
+        fingerprint.write_bytes(b"paro.memo.statistics-snapshot.v1");
+        fingerprint.write_fingerprint(self.recipe);
+        fingerprint.write_u64(self.kind as u64);
+        fingerprint.write_u64(self.range.is_some() as u64);
+        if let Some(range) = self.range {
+            fingerprint.write_u64(range.lower);
+            fingerprint.write_u64(range.expected_lower);
+            fingerprint.write_u64(range.expected_upper);
+            fingerprint.write_u64(range.upper);
+        }
+        fingerprint.write_u64(self.inputs.len() as u64);
+        for input in &self.inputs {
+            fingerprint.write_u64(input.0 as u64);
+        }
+        fingerprint.finish()
+    }
+
     pub fn new(
         recipe: Fingerprint,
         kind: CardinalityRecipeKind,
@@ -495,6 +535,14 @@ impl Group {
 
     pub fn logical_expression_version(&self) -> u64 {
         self.logical_expression_version
+    }
+
+    pub fn logical_fact_fingerprint(&self) -> Fingerprint {
+        self.logical_properties.stable_fact_fingerprint()
+    }
+
+    pub fn statistics_snapshot_fingerprint(&self) -> Fingerprint {
+        self.cardinality.stable_snapshot_fingerprint()
     }
 
     pub fn physical_exprs(&self) -> &[PhysicalExprId] {

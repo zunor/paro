@@ -195,6 +195,23 @@ impl PatternBinding {
 pub struct PatternRead {
     pub group: GroupId,
     pub logical_frontier_revision: u64,
+    pub logical_fact_fingerprint: Fingerprint,
+    pub statistics_snapshot_fingerprint: Fingerprint,
+}
+
+impl PatternRead {
+    pub fn from_group(memo: &Memo, group: GroupId) -> Result<Self> {
+        let group = memo.canonical_group(group);
+        let group_ref = memo
+            .group(group)
+            .ok_or_else(|| paro_error::internal("rule binding read an unknown group"))?;
+        Ok(Self {
+            group,
+            logical_frontier_revision: group_ref.logical_expression_version(),
+            logical_fact_fingerprint: group_ref.logical_fact_fingerprint(),
+            statistics_snapshot_fingerprint: group_ref.statistics_snapshot_fingerprint(),
+        })
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -349,18 +366,7 @@ pub trait TransformationRule: Send + Sync {
             .children
             .iter()
             .copied()
-            .map(|group| {
-                let group = ctx.memo.canonical_group(group);
-                let logical_frontier_revision = ctx
-                    .memo
-                    .group(group)
-                    .ok_or_else(|| paro_error::internal("rule binding read an unknown group"))?
-                    .logical_expression_version();
-                Ok(PatternRead {
-                    group,
-                    logical_frontier_revision,
-                })
-            })
+            .map(|group| PatternRead::from_group(ctx.memo, group))
             .collect::<Result<Vec<_>>>()?;
         let bindings = self
             .matches(logical, ctx)

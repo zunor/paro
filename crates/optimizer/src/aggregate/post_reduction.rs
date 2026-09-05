@@ -15,6 +15,7 @@
 //! admitted between them. The optimizer requires an advertised partial merge; it never infers it
 //! name or from a SQL return type.
 
+use paro_common::error::Result;
 use paro_common::types::LogicalType;
 use paro_function::aggregate::distributive::count::get_count_star_function;
 use paro_function::aggregate::distributive::first_last::get_first_function;
@@ -37,51 +38,57 @@ use crate::aggregate::semantic_kernels::aggregate_kernels_equal;
 use alpha::AlphaBindings;
 /// Replace eligible grouped/scalar sibling plans with one grouped aggregate
 /// carrying a hidden post-aggregate reduction.
-pub fn optimize_plan(plan: LogicalPlan, bind_context: &BindContext) -> LogicalPlan {
-    optimize_plan_with_change(plan, bind_context).0
+pub fn optimize_plan(plan: LogicalPlan, bind_context: &BindContext) -> Result<LogicalPlan> {
+    optimize_plan_with_change(plan, bind_context).map(|(plan, _)| plan)
 }
 
 pub fn optimize_plan_with_change(
     plan: LogicalPlan,
     bind_context: &BindContext,
-) -> (LogicalPlan, bool) {
-    fn optimize_node(
-        plan: LogicalPlan,
-        bind_context: &BindContext,
-        changed: &mut bool,
-    ) -> LogicalPlan {
-        let cte_rewrite = match &plan.operator {
-            LogicalOperator::MaterializedCTE(cte) => recognize_cte_max_reduction(cte, bind_context),
-            _ => None,
-        };
-        if let Some(rewrite) = cte_rewrite {
-            // Recognition and mutation stay separately defensive. Preserve a
-            // binding-identical fallback so future plan-shape drift declines
-            // without turning an optimizer opportunity into a query failure.
-            let fallback = paro_planner::binder::deep_copy::duplicate_plan_preserving_indices(
-                &plan,
-                bind_context.shared().as_ref(),
-            );
-            let LogicalOperator::MaterializedCTE(cte) = plan.into_operator() else {
-                return fallback;
-            };
-            return match rewrite_cte_max_reduction(cte, rewrite) {
-                Some(rewritten) => {
-                    *changed = true;
-                    optimize_node(rewritten, bind_context, changed)
-                }
-                None => fallback,
-            };
-        }
-        let plan = plan.map_children(|child| optimize_node(child, bind_context, changed));
-        let (plan, node_changed) = rewrite_projection_with_change(plan, bind_context);
-        *changed |= node_changed;
-        plan
-    }
-
+) -> Result<(LogicalPlan, bool)> {
+    // `LogicalOperator` is intentionally a wide enum. Recursing while moving
+    // an owned `LogicalPlan` therefore consumes a large native stack frame at
+    // every level, even for a modest relational tree. Use the canonical heap
+    // traversal and repeat only when a CTE rewrite exposes a fresh subtree.
+    let mut plan = plan;
     let mut changed = false;
-    let plan = optimize_node(plan, bind_context, &mut changed);
-    (plan, changed)
+    loop {
+        let mut pass_changed = false;
+        let (next, ()) = plan.try_fold_post_order(|plan, _children: Vec<()>| {
+            let cte_rewrite = match &plan.operator {
+                LogicalOperator::MaterializedCTE(cte) => {
+                    recognize_cte_max_reduction(cte, bind_context)
+                }
+                _ => None,
+            };
+            if let Some(rewrite) = cte_rewrite {
+                // Recognition and mutation stay separately defensive.
+                // Preserve a binding-identical fallback so future plan-shape
+                // drift declines without turning an opportunity into a query
+                // failure.
+                let fallback = paro_planner::binder::deep_copy::duplicate_plan_preserving_indices(
+                    &plan,
+                    bind_context.shared().as_ref(),
+                );
+                let LogicalOperator::MaterializedCTE(cte) = plan.into_operator() else {
+                    return Ok((fallback, ()));
+                };
+                if let Some(rewritten) = rewrite_cte_max_reduction(cte, rewrite) {
+                    pass_changed = true;
+                    return Ok((rewritten, ()));
+                }
+                return Ok((fallback, ()));
+            }
+            let (plan, node_changed) = rewrite_projection_with_change(plan, bind_context);
+            pass_changed |= node_changed;
+            Ok((plan, ()))
+        })?;
+        plan = next;
+        changed |= pass_changed;
+        if !pass_changed {
+            return Ok((plan, changed));
+        }
+    }
 }
 
 fn rewrite_cte_max_reduction(cte: MaterializedCTE, rewrite: CteMaxRewrite) -> Option<LogicalPlan> {

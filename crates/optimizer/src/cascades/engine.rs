@@ -2095,6 +2095,8 @@ fn transformation_dependency_fingerprint(dependencies: &[PatternRead]) -> Finger
     for read in dependencies {
         builder.write_u64(read.group.0 as u64);
         builder.write_u64(read.logical_frontier_revision);
+        builder.write_fingerprint(read.logical_fact_fingerprint);
+        builder.write_fingerprint(read.statistics_snapshot_fingerprint);
     }
     builder.finish()
 }

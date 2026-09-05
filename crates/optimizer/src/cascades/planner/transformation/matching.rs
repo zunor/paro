@@ -17,7 +17,7 @@ pub(super) fn pattern_bindings(
     struct Enumerator<'a> {
         memo: &'a Memo,
         limit: usize,
-        reads: BTreeMap<GroupId, u64>,
+        reads: BTreeMap<GroupId, PatternRead>,
         limited: bool,
     }
 
@@ -36,7 +36,7 @@ pub(super) fn pattern_bindings(
                 return Ok(Vec::new());
             }
             self.reads
-                .insert(group, group_ref.logical_expression_version());
+                .insert(group, PatternRead::from_group(self.memo, group)?);
             if !active.insert(group) {
                 let mut fingerprint = StableFingerprintBuilder::default();
                 fingerprint.write_bytes(b"paro.pattern.group-hole.v1");
@@ -153,11 +153,7 @@ pub(super) fn pattern_bindings(
         bindings: bindings.into_boxed_slice(),
         reads: enumerator
             .reads
-            .into_iter()
-            .map(|(group, logical_frontier_revision)| PatternRead {
-                group,
-                logical_frontier_revision,
-            })
+            .into_values()
             .collect::<Vec<_>>()
             .into_boxed_slice(),
         completion: if enumerator.limited {
@@ -332,6 +328,46 @@ mod tests {
         assert_eq!(
             baseline_reads[0].logical_frontier_revision,
             renamed_reads[0].logical_frontier_revision
+        );
+    }
+
+    #[test]
+    fn pattern_reads_track_facts_and_statistics_without_frontier_churn() {
+        let mut memo = Memo::new(SearchBudget::default());
+        let group = memo.create_group(
+            GroupSchema::new(std::iter::empty()).unwrap(),
+            LogicalProperties::default(),
+            GroupCardinality::default(),
+        );
+        let initial = PatternRead::from_group(&memo, group).unwrap();
+        memo.group_mut(group)
+            .unwrap()
+            .logical_properties
+            .maximum_cardinality = Some(7);
+        let with_fact = PatternRead::from_group(&memo, group).unwrap();
+        assert_eq!(
+            initial.logical_frontier_revision,
+            with_fact.logical_frontier_revision
+        );
+        assert_ne!(
+            initial.logical_fact_fingerprint,
+            with_fact.logical_fact_fingerprint
+        );
+
+        memo.group_mut(group).unwrap().cardinality =
+            GroupCardinality::new(Fingerprint(17), CardinalityRecipeKind::Statistics, 1, 4, 9);
+        let with_statistics = PatternRead::from_group(&memo, group).unwrap();
+        assert_eq!(
+            with_fact.logical_frontier_revision,
+            with_statistics.logical_frontier_revision
+        );
+        assert_eq!(
+            with_fact.logical_fact_fingerprint,
+            with_statistics.logical_fact_fingerprint
+        );
+        assert_ne!(
+            with_fact.statistics_snapshot_fingerprint,
+            with_statistics.statistics_snapshot_fingerprint
         );
     }
 

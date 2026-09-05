@@ -180,7 +180,7 @@ fn q11_shape(
 fn folds_alpha_equivalent_scalar_sum_into_grouped_reduction() {
     let source = table(91_001);
     let context = BindContext::new();
-    let optimized = optimize_plan(q11_shape(source.clone(), source), &context);
+    let optimized = optimize_plan(q11_shape(source.clone(), source), &context).unwrap();
 
     let LogicalOperator::Projection(output) = &optimized.operator else {
         panic!("expected the output projection");
@@ -227,7 +227,7 @@ fn folds_alpha_equivalent_scalar_sum_into_grouped_reduction() {
 #[test]
 fn refuses_sources_with_different_stable_table_identity() {
     let context = BindContext::new();
-    let optimized = optimize_plan(q11_shape(table(91_002), table(91_003)), &context);
+    let optimized = optimize_plan(q11_shape(table(91_002), table(91_003)), &context).unwrap();
 
     assert!(matches!(
         &optimized.operator,
@@ -256,7 +256,7 @@ fn refuses_grouping_sets_even_when_the_sources_match() {
         expressions: vec![0],
     }];
 
-    let optimized = optimize_plan(plan, &BindContext::new());
+    let optimized = optimize_plan(plan, &BindContext::new()).unwrap();
     assert!(matches!(
         &optimized.operator,
         LogicalOperator::Projection(Projection { child, .. })
@@ -348,7 +348,7 @@ fn same_display_signature_with_a_different_kernel_is_not_reused() {
     impostor.algebra = Some(AggregateAlgebra::Sum);
     scalar_sum.function = impostor;
 
-    let optimized = optimize_plan(plan, &BindContext::new());
+    let optimized = optimize_plan(plan, &BindContext::new()).unwrap();
     assert!(matches!(
         &optimized.operator,
         LogicalOperator::Projection(Projection { child, .. })
@@ -369,7 +369,7 @@ fn scalar_wrapper_output_that_escapes_the_boundary_prevents_rewrite() {
     output.returned_types.push(LogicalType::BigInt);
     output.visible_names.push("scalar_value".to_string());
 
-    let optimized = optimize_plan(plan, &BindContext::new());
+    let optimized = optimize_plan(plan, &BindContext::new()).unwrap();
     let LogicalOperator::Projection(output) = &optimized.operator else {
         panic!("output projection");
     };
