@@ -109,19 +109,31 @@ pub struct RuntimeFilterResourceContract {
     pub max_local_exact_values: u32,
     pub max_range_value_bytes: u32,
     pub max_dense_bits: u32,
-    pub max_dense_bits_per_value: u16,
+    /// Rows expected to probe the frozen membership representation. This is
+    /// advisory physical work, never a correctness or capacity bound.
+    pub expected_probe_rows: u64,
     pub mutable_bytes_upper: u64,
     pub freeze_additional_bytes_upper: u64,
     pub peak_memory_bytes: u64,
 }
 
 impl RuntimeFilterResourceContract {
-    pub const MAX_EXACT_VALUES: u32 = 65_536;
+    /// Maximum typed payload retained by one complete exact domain. Capacity
+    /// is derived from the physical key width so the admission contract has
+    /// one stable memory meaning across i32, i64, and i128 keys.
+    pub const MAX_EXACT_VALUE_BYTES: u64 = 2 * 1024 * 1024;
     pub const MAX_DENSE_BITS: u32 = 64 * 1024 * 1024;
-    pub const MAX_DENSE_BITS_PER_VALUE: u16 = 1_024;
     pub const MAX_RANGE_VALUE_BYTES: u32 = 4 * 1024;
 
     pub fn for_keys(key_types: &[LogicalType], max_local_builders: u16) -> Result<Self> {
+        Self::for_probe_rows(key_types, max_local_builders, 0)
+    }
+
+    pub fn for_probe_rows(
+        key_types: &[LogicalType],
+        max_local_builders: u16,
+        expected_probe_rows: u64,
+    ) -> Result<Self> {
         let keys = key_types
             .iter()
             .map(|logical_type| match logical_type {
@@ -157,22 +169,29 @@ impl RuntimeFilterResourceContract {
             .collect::<Vec<_>>()
             .into_boxed_slice();
         let max_local_builders = max_local_builders.max(1);
-        let max_local_exact_values = Self::MAX_EXACT_VALUES
-            .div_ceil(u32::from(max_local_builders))
-            .max(1);
         let exact_width = keys
             .iter()
             .try_fold(0u64, |total, key| {
                 total.checked_add(u64::try_from(key.value_width()).unwrap_or(u64::MAX))
             })
             .ok_or_else(|| paro_error::internal("runtime-filter key width overflow"))?;
+        let max_global_exact_values = u32::try_from(
+            Self::MAX_EXACT_VALUE_BYTES
+                .checked_div(exact_width.max(1))
+                .unwrap_or(0)
+                .clamp(1, u64::from(u32::MAX)),
+        )
+        .map_err(|_| paro_error::internal("runtime-filter exact capacity overflow"))?;
+        let max_local_exact_values = max_global_exact_values
+            .div_ceil(u32::from(max_local_builders))
+            .max(1);
         // Every local domain and the progressively merged global domain may
         // coexist. Their budgets are distinct executable capabilities.
         let mutable_bytes_upper = exact_width
             .checked_mul(
                 u64::from(max_local_exact_values)
                     .checked_mul(u64::from(max_local_builders))
-                    .and_then(|bytes| bytes.checked_add(u64::from(Self::MAX_EXACT_VALUES)))
+                    .and_then(|bytes| bytes.checked_add(u64::from(max_global_exact_values)))
                     .ok_or_else(|| paro_error::internal("runtime-filter local budget overflow"))?,
             )
             .ok_or_else(|| paro_error::internal("runtime-filter mutable memory overflow"))?;
@@ -185,7 +204,7 @@ impl RuntimeFilterResourceContract {
         // Freeze first materializes a typed transfer vector, then the final
         // sparse or dense representation, while mutable builders still live.
         let transfer_bytes = exact_width
-            .checked_mul(u64::from(Self::MAX_EXACT_VALUES))
+            .checked_mul(u64::from(max_global_exact_values))
             .ok_or_else(|| paro_error::internal("runtime-filter freeze scratch overflow"))?;
         let frozen_bytes = keys
             .iter()
@@ -196,7 +215,7 @@ impl RuntimeFilterResourceContract {
                     _ => dense_bytes.max(
                         u64::try_from(key.value_width())
                             .unwrap_or(u64::MAX)
-                            .saturating_mul(u64::from(Self::MAX_EXACT_VALUES)),
+                            .saturating_mul(u64::from(max_global_exact_values)),
                     ),
                 };
                 total.checked_add(bytes)
@@ -228,11 +247,11 @@ impl RuntimeFilterResourceContract {
             },
             keys,
             max_local_builders,
-            max_global_exact_values: Self::MAX_EXACT_VALUES,
+            max_global_exact_values,
             max_local_exact_values,
             max_range_value_bytes: Self::MAX_RANGE_VALUE_BYTES,
             max_dense_bits: Self::MAX_DENSE_BITS,
-            max_dense_bits_per_value: Self::MAX_DENSE_BITS_PER_VALUE,
+            expected_probe_rows,
             mutable_bytes_upper,
             freeze_additional_bytes_upper,
             peak_memory_bytes,
@@ -355,11 +374,13 @@ mod tests {
         assert!(integer.has_exact_single_key_representation());
         assert!(!string.has_exact_single_key_representation());
         assert!(!composite.has_exact_single_key_representation());
-        assert!(integer.guarantees_exact_single_key(Some(16_384)));
-        assert!(!integer.guarantees_exact_single_key(Some(20_000)));
+        assert_eq!(integer.max_global_exact_values, 524_288);
+        assert_eq!(integer.max_local_exact_values, 131_072);
+        assert!(integer.guarantees_exact_single_key(Some(131_072)));
+        assert!(!integer.guarantees_exact_single_key(Some(131_073)));
         assert!(!integer.guarantees_exact_single_key(None));
-        assert!(integer.expects_exact_single_key(65_536.0));
-        assert!(!integer.expects_exact_single_key(65_537.0));
+        assert!(integer.expects_exact_single_key(524_288.0));
+        assert!(!integer.expects_exact_single_key(524_289.0));
         assert!(!integer.expects_exact_single_key(f64::NAN));
         assert_eq!(string.capability, RuntimeFilterCapability::Range);
         assert_eq!(

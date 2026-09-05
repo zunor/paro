@@ -397,6 +397,22 @@ impl PhysicalPlanExtractor {
                     "runtime-filter candidate has no row-preserving rowset-scan consumer",
                 ));
             }
+            let expected_probe_rows = consumers.iter().fold(0_u64, |total, consumer| {
+                let rows = self
+                    .arena
+                    .get(*consumer)
+                    .and_then(|node| match &node.kind {
+                        PhysicalNodeKind::RowsetScan(scan) => scan
+                            .table
+                            .statistics()
+                            .map(|statistics| statistics.row_count)
+                            .filter(|rows| *rows > 0)
+                            .or_else(|| node.cardinality.map(|estimate| estimate.expected)),
+                        _ => None,
+                    })
+                    .unwrap_or(0);
+                total.saturating_add(rows)
+            });
             let (condition_indices, key_types): (Vec<_>, Vec<_>) = spec
                 .key_conditions
                 .iter()
@@ -408,9 +424,10 @@ impl PhysicalPlanExtractor {
                 artifact,
                 wait_policy: RuntimeFilterWaitPolicy::WaitComplete,
                 condition_indices: condition_indices.into_boxed_slice(),
-                resource: crate::physical::RuntimeFilterResourceContract::for_keys(
+                resource: crate::physical::RuntimeFilterResourceContract::for_probe_rows(
                     &key_types,
                     u16::try_from(self.ctx.max_threads).unwrap_or(u16::MAX),
+                    expected_probe_rows,
                 )?,
             });
             Some((*build, consumers, artifact))

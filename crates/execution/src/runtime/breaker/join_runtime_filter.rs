@@ -26,9 +26,9 @@ use paro_storage::index::{
 /// Bounded construction policy for analytical join filters.
 ///
 /// The mutable domain is capped independently from its frozen representation.
-/// A frozen dense set can spend up to 8 MiB and at most 1024 bits per retained
-/// value, which covers fact-table key domains without allowing sparse endpoint
-/// ranges to dictate allocation size. Domains beyond the exact-value budget
+/// A frozen dense set can spend up to 8 MiB when the physical consumer's
+/// expected probe work pays back its initialization. Sparse or short-lived
+/// consumers retain sorted storage. Domains beyond the exact-value budget
 /// retain min/max only.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct JoinRuntimeFilterPolicy {
@@ -45,25 +45,6 @@ enum RuntimeFilterBuilderScope {
 }
 
 const MIN_EXACT_PENDING_VALUES: usize = VECTOR_SIZE;
-
-impl Default for JoinRuntimeFilterPolicy {
-    fn default() -> Self {
-        Self {
-            max_exact_values: RuntimeFilterResourceContract::MAX_EXACT_VALUES as usize,
-            max_range_value_bytes: RuntimeFilterResourceContract::MAX_RANGE_VALUE_BYTES as usize,
-            // Analytical filters trade bounded, cache-resident lookup space
-            // for one O(1) probe per source row. A 1024:1 span/value ratio is
-            // still capped by the absolute domain ceiling, while avoiding
-            // millions of binary searches for small dimension domains whose
-            // surrogate keys contain gaps.
-            membership: FixedMembershipBuildPolicy::new(
-                RuntimeFilterResourceContract::MAX_DENSE_BITS as usize,
-                RuntimeFilterResourceContract::MAX_DENSE_BITS_PER_VALUE as usize,
-            ),
-            freeze_additional_bytes: 0,
-        }
-    }
-}
 
 impl JoinRuntimeFilterPolicy {
     fn from_contract(
@@ -86,7 +67,7 @@ impl JoinRuntimeFilterPolicy {
             max_range_value_bytes: contract.max_range_value_bytes as usize,
             membership: FixedMembershipBuildPolicy::new(
                 contract.max_dense_bits as usize,
-                contract.max_dense_bits_per_value as usize,
+                usize::try_from(contract.expected_probe_rows).unwrap_or(usize::MAX),
             ),
             freeze_additional_bytes: transfer.saturating_add(frozen),
         }

@@ -24,6 +24,36 @@ pub struct IndexEvaluator {
     segment_rows: Option<u64>,
 }
 
+/// One immutable-segment index analysis reused by candidate selection and
+/// residual row-verification compilation. Direct conjunct results are kept
+/// because an exact `AllMatch` proof can remove that conjunct without opening
+/// its column, while the combined result drives page/row selection.
+pub(crate) struct PredicateIndexAnalysis {
+    evaluation: IndexPredicateEvaluation,
+    conjuncts: Option<Box<[IndexPredicateEvaluation]>>,
+}
+
+impl PredicateIndexAnalysis {
+    pub(crate) fn requires_row_verification(&self) -> bool {
+        !self.evaluation.is_exact()
+    }
+
+    pub(crate) fn guaranteed_all(&self) -> bool {
+        matches!(self.evaluation.guaranteed(), PredicateResult::AllMatch)
+    }
+
+    pub(crate) fn conjunct_guaranteed_all(&self, index: usize) -> bool {
+        self.conjuncts
+            .as_deref()
+            .and_then(|conjuncts| conjuncts.get(index))
+            .is_some_and(|evaluation| matches!(evaluation.guaranteed(), PredicateResult::AllMatch))
+    }
+
+    pub(crate) fn into_evaluation(self) -> IndexPredicateEvaluation {
+        self.evaluation
+    }
+}
+
 impl IndexEvaluator {
     /// Create a new evaluator from a list of indexes.
     pub fn new(indexes: Vec<Arc<dyn BoundIndex>>) -> Self {
@@ -64,35 +94,63 @@ impl IndexEvaluator {
 
     /// Evaluate candidates and guaranteed-true rows through one tree walk.
     pub fn evaluate_with_proof(&self, predicate_tree: &PredicateTree) -> IndexPredicateEvaluation {
+        self.evaluate_tree(predicate_tree)
+    }
+
+    /// Analyze a segment predicate once for all scan consumers. Previously
+    /// candidate selection, row-verification admission, and proven-conjunct
+    /// removal each reopened every scalar index independently.
+    pub(crate) fn analyze(&self, predicate_tree: &PredicateTree) -> PredicateIndexAnalysis {
+        let conjuncts = match predicate_tree {
+            PredicateTree::And(children) => {
+                let mut evaluations = Vec::with_capacity(children.len());
+                for child in children {
+                    let evaluation = self.evaluate_tree(child);
+                    let rejects_every_row =
+                        matches!(evaluation.candidates, PredicateResult::NoneMatch);
+                    evaluations.push(evaluation);
+                    if rejects_every_row {
+                        // The remaining conjuncts cannot make an AND row
+                        // eligible. Missing suffix entries intentionally mean
+                        // "not proven" to residual-compilation consumers.
+                        break;
+                    }
+                }
+                Some(evaluations.into_boxed_slice())
+            }
+            PredicateTree::Leaf(_) | PredicateTree::Or(_) => None,
+        };
+        let evaluation = conjuncts
+            .as_deref()
+            .map_or_else(|| self.evaluate_tree(predicate_tree), Self::combine_and);
+        PredicateIndexAnalysis {
+            evaluation,
+            conjuncts,
+        }
+    }
+
+    fn evaluate_tree(&self, predicate_tree: &PredicateTree) -> IndexPredicateEvaluation {
         match predicate_tree {
             PredicateTree::Leaf(predicate) => self.evaluate_single(predicate),
             PredicateTree::And(children) => {
-                let mut candidates = PredicateResult::AllMatch;
-                let mut guaranteed = PredicateResult::AllMatch;
-                let mut exact = true;
+                let mut evaluations = Vec::with_capacity(children.len());
                 for child in children {
-                    let child = self.evaluate_with_proof(child);
-                    exact &= child.is_exact();
-                    candidates = intersect(&candidates, &child.candidates);
-                    if matches!(candidates, PredicateResult::NoneMatch) {
-                        // `guaranteed ⊆ candidates` makes the proof empty too;
-                        // no remaining child can make an AND row eligible.
-                        return IndexPredicateEvaluation::exact(PredicateResult::NoneMatch);
+                    let evaluation = self.evaluate_tree(child);
+                    let rejects_every_row =
+                        matches!(evaluation.candidates, PredicateResult::NoneMatch);
+                    evaluations.push(evaluation);
+                    if rejects_every_row {
+                        break;
                     }
-                    guaranteed = intersect(&guaranteed, child.guaranteed());
                 }
-                if exact {
-                    IndexPredicateEvaluation::exact(candidates)
-                } else {
-                    IndexPredicateEvaluation::new(candidates, guaranteed)
-                }
+                Self::combine_and(&evaluations)
             }
             PredicateTree::Or(children) => {
                 let mut candidates = PredicateResult::NoneMatch;
                 let mut guaranteed = PredicateResult::NoneMatch;
                 let mut exact = true;
                 for child in children {
-                    let child = self.evaluate_with_proof(child);
+                    let child = self.evaluate_tree(child);
                     exact &= child.is_exact();
                     candidates = union(&candidates, &child.candidates);
                     guaranteed = union(&guaranteed, child.guaranteed());
@@ -103,6 +161,27 @@ impl IndexEvaluator {
                     IndexPredicateEvaluation::new(candidates, guaranteed)
                 }
             }
+        }
+    }
+
+    fn combine_and(children: &[IndexPredicateEvaluation]) -> IndexPredicateEvaluation {
+        let mut candidates = PredicateResult::AllMatch;
+        let mut guaranteed = PredicateResult::AllMatch;
+        let mut exact = true;
+        for child in children {
+            exact &= child.is_exact();
+            candidates = intersect(&candidates, &child.candidates);
+            if matches!(candidates, PredicateResult::NoneMatch) {
+                // `guaranteed ⊆ candidates` makes the proof empty too;
+                // no remaining child can make an AND row eligible.
+                return IndexPredicateEvaluation::exact(PredicateResult::NoneMatch);
+            }
+            guaranteed = intersect(&guaranteed, child.guaranteed());
+        }
+        if exact {
+            IndexPredicateEvaluation::exact(candidates)
+        } else {
+            IndexPredicateEvaluation::new(candidates, guaranteed)
         }
     }
 

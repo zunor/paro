@@ -72,6 +72,7 @@ mod predicate_result;
 pub use bound_index::{BoundIndex, DeltaIndexType, IndexAppendInfo, IndexAppendMode};
 pub(crate) use bound_index::{PredicateIndexBinding, SegmentLocalComplete};
 pub use evaluator::IndexEvaluator;
+pub(crate) use evaluator::PredicateIndexAnalysis;
 pub(crate) use exact_row_set::OrdinalRowSet;
 pub use exact_row_set::{
     DenseRowSet, ExactOrdinalPosting, ExactRowAdmission, ExactRowPartitions, ExactRowSet,

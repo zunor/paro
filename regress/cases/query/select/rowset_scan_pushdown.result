@@ -142,7 +142,7 @@ PROJECTION  (rows=1)
     Output Schema: aggregate_state_1 BIGINT
     ->  HASH_JOIN  (rows=19)
       Join Type: INNER
-      Runtime Filter: wait_complete capability=AdaptiveExactMembership peak=9175040B builders=1 artifact=e9da22dd76bdc23ff4fb682248710b68
+      Runtime Filter: wait_complete capability=AdaptiveExactMembership peak=14680064B builders=1 artifact=e9da22dd76bdc23ff4fb682248710b68
       Build Index: integer_build_time
       Join Condition: c.k = d.k
       Cardinality: [10, 19, 29]

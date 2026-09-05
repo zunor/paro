@@ -572,40 +572,44 @@ pub fn value_to_bytes(value: &Value, logical_type: &LogicalType) -> Result<Vec<u
     }
 }
 
-pub(crate) fn fixed_membership_to_bytes(
+pub(crate) fn visit_fixed_membership_bytes(
     values: &FixedMembership,
     logical_type: &LogicalType,
-) -> Option<Vec<Vec<u8>>> {
-    let mut canonical = Vec::with_capacity(values.len());
-    let width = values.visit_canonical_values(|value| canonical.push(value));
-    match (width, logical_type) {
-        (FixedMembershipWidth::I32, LogicalType::Integer | LogicalType::Date) => canonical
-            .into_iter()
-            .map(|value| Some(i32::try_from(value).ok()?.to_le_bytes().to_vec()))
-            .collect(),
+    mut visit: impl FnMut(&[u8]),
+) -> bool {
+    match (values.width(), logical_type) {
+        (FixedMembershipWidth::I32, LogicalType::Integer | LogicalType::Date) => {
+            values.visit_canonical_values(|value| {
+                let bytes = (value as i32).to_le_bytes();
+                visit(&bytes);
+            });
+        }
         (FixedMembershipWidth::I64, LogicalType::BigInt)
         | (
             FixedMembershipWidth::I64,
             LogicalType::Decimal {
                 precision: 0..=18, ..
             },
-        ) => canonical
-            .into_iter()
-            .map(|value| Some(i64::try_from(value).ok()?.to_le_bytes().to_vec()))
-            .collect(),
+        ) => {
+            values.visit_canonical_values(|value| {
+                let bytes = (value as i64).to_le_bytes();
+                visit(&bytes);
+            });
+        }
         (
             FixedMembershipWidth::I128,
             LogicalType::Decimal {
                 precision: 19.., ..
             },
-        ) => Some(
-            canonical
-                .into_iter()
-                .map(|value| value.to_le_bytes().to_vec())
-                .collect(),
-        ),
-        _ => None,
+        ) => {
+            values.visit_canonical_values(|value| {
+                let bytes = value.to_le_bytes();
+                visit(&bytes);
+            });
+        }
+        _ => return false,
     }
+    true
 }
 
 /// Compare two raw byte values according to the logical type.

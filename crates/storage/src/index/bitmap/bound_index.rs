@@ -17,7 +17,7 @@ use roaring::RoaringBitmap;
 
 use crate::index::bound_index::BoundIndex;
 use crate::index::predicate::{
-    compare_bytes, fixed_membership_to_bytes, value_to_bytes, Predicate,
+    compare_bytes, value_to_bytes, visit_fixed_membership_bytes, Predicate,
 };
 use crate::index::predicate_result::PredicateResult;
 use crate::index::{
@@ -318,11 +318,13 @@ impl BitmapIndex {
                 }
             }
             Predicate::FixedIn { values, .. } => {
-                for bytes in fixed_membership_to_bytes(values, logical_type)? {
-                    let (ordinal, exact) = self.reader.seek_dictionary(&bytes);
+                if !visit_fixed_membership_bytes(values, logical_type, |bytes| {
+                    let (ordinal, exact) = self.reader.seek_dictionary(bytes);
                     if exact {
                         accepted.insert(ordinal);
                     }
+                }) {
+                    return None;
                 }
             }
             Predicate::Range { lower, upper, .. } => {
@@ -414,15 +416,19 @@ impl BitmapIndex {
         let Some(logical_type) = self.logical_type() else {
             return PredicateResult::Unknown;
         };
-        let Some(values) = fixed_membership_to_bytes(values, logical_type) else {
-            return PredicateResult::Unknown;
-        };
         let mut result = RoaringBitmap::new();
-        for value in values {
-            match self.reader.get_rows_for_value(&value) {
-                Ok(bitmap) => result |= bitmap,
-                Err(_) => return PredicateResult::Unknown,
+        let mut failed = false;
+        if !visit_fixed_membership_bytes(values, logical_type, |value| {
+            if failed {
+                return;
             }
+            match self.reader.get_rows_for_value(value) {
+                Ok(bitmap) => result |= bitmap,
+                Err(_) => failed = true,
+            }
+        }) || failed
+        {
+            return PredicateResult::Unknown;
         }
         if result.is_empty() {
             PredicateResult::NoneMatch

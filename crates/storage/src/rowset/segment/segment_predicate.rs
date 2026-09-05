@@ -8,7 +8,7 @@ use super::segment_predicate_program::{CompiledPredicateProgram, PredicateStageS
 use super::varlen_predicate::{VarlenConjunction, VarlenMatcher};
 use crate::buffer::Prefetcher;
 use crate::index::{
-    collect_predicate_columns, IndexEvaluator, Predicate, PredicateComparison, PredicateResult,
+    collect_predicate_columns, Predicate, PredicateComparison, PredicateIndexAnalysis,
     PredicateTree,
 };
 use crate::rowset::column::ColumnBatch;
@@ -175,15 +175,15 @@ impl PredicateEvaluator {
     pub(super) fn new(
         segment: &Segment,
         tree: PredicateTree,
-        evaluator: &IndexEvaluator,
+        index_analysis: &PredicateIndexAnalysis,
         prefetcher: Option<Arc<Prefetcher>>,
         explicit_predicate_columns: Option<Vec<ColumnId>>,
     ) -> Result<Option<Self>> {
-        let Some(tree) = Self::remove_index_proven_conjuncts(tree, evaluator) else {
+        let Some(tree) = Self::remove_index_proven_conjuncts(tree, index_analysis) else {
             return Ok(None);
         };
         if !Self::predicate_tree_requires_row_verification(&tree)
-            && !Self::requires_row_level_predicate_eval(evaluator, &tree)
+            && !index_analysis.requires_row_verification()
         {
             return Ok(None);
         }
@@ -272,12 +272,9 @@ impl PredicateEvaluator {
     /// child from OR would change `TRUE OR x` into `x`.
     fn remove_index_proven_conjuncts(
         tree: PredicateTree,
-        evaluator: &IndexEvaluator,
+        index_analysis: &PredicateIndexAnalysis,
     ) -> Option<PredicateTree> {
-        if matches!(
-            evaluator.evaluate_with_proof(&tree).guaranteed(),
-            PredicateResult::AllMatch
-        ) {
+        if index_analysis.guaranteed_all() {
             return None;
         }
         let PredicateTree::And(children) = tree else {
@@ -285,33 +282,15 @@ impl PredicateEvaluator {
         };
         let residual = children
             .into_iter()
-            .filter(|child| {
-                !matches!(
-                    evaluator.evaluate_with_proof(child).guaranteed(),
-                    PredicateResult::AllMatch
-                )
+            .enumerate()
+            .filter_map(|(index, child)| {
+                (!index_analysis.conjunct_guaranteed_all(index)).then_some(child)
             })
             .collect::<Vec<_>>();
         match residual.len() {
             0 => None,
             1 => residual.into_iter().next(),
             _ => Some(PredicateTree::And(residual)),
-        }
-    }
-
-    pub(super) fn requires_row_level_predicate_eval(
-        evaluator: &IndexEvaluator,
-        predicate_tree: &PredicateTree,
-    ) -> bool {
-        match predicate_tree {
-            PredicateTree::Leaf(predicate) => {
-                let leaf = PredicateTree::Leaf(predicate.clone());
-                let evaluation = evaluator.evaluate_with_proof(&leaf);
-                matches!(evaluation.candidates, PredicateResult::Unknown) || !evaluation.is_exact()
-            }
-            PredicateTree::And(children) | PredicateTree::Or(children) => children
-                .iter()
-                .any(|child| Self::requires_row_level_predicate_eval(evaluator, child)),
         }
     }
 

@@ -18,26 +18,45 @@ use std::sync::Arc;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct FixedMembershipBuildPolicy {
     max_dense_bits: usize,
-    max_dense_bits_per_value: usize,
+    expected_probe_count: usize,
 }
 
 impl FixedMembershipBuildPolicy {
-    pub const fn new(max_dense_bits: usize, max_dense_bits_per_value: usize) -> Self {
+    pub const fn new(max_dense_bits: usize, expected_probe_count: usize) -> Self {
         Self {
             max_dense_bits,
-            max_dense_bits_per_value,
+            expected_probe_count,
         }
     }
 
     fn permits_dense(self, span: usize, value_count: usize) -> bool {
-        span <= self.max_dense_bits
-            && span <= value_count.saturating_mul(self.max_dense_bits_per_value)
+        if span > self.max_dense_bits || value_count < 2 {
+            return false;
+        }
+
+        // Compare executable work instead of classifying a domain by an
+        // arbitrary span/value ratio. A sorted set needs ceil(log2(N))
+        // comparisons for every probe. Dense lookup needs one indexed load,
+        // plus one sequential initialization pass over its backing storage.
+        // The representation changes only when the predicted lookup savings
+        // pay for that initialization within this consumer's scan.
+        let sorted_comparisons =
+            usize::BITS as usize - value_count.saturating_sub(1).leading_zeros() as usize;
+        let lookup_savings = self
+            .expected_probe_count
+            .saturating_mul(sorted_comparisons.saturating_sub(1));
+        let initialization_words = if span <= MAX_BYTE_LOOKUP_DOMAIN {
+            span.div_ceil(std::mem::size_of::<u64>())
+        } else {
+            span.div_ceil(u64::BITS as usize)
+        };
+        initialization_words <= lookup_savings
     }
 }
 
 impl Default for FixedMembershipBuildPolicy {
     fn default() -> Self {
-        Self::new(1 << 20, 16)
+        Self::new(1 << 20, 0)
     }
 }
 
@@ -318,6 +337,52 @@ impl<T: FixedMembershipValue> FixedMembershipSet<T> {
         }
     }
 
+    fn first_at_or_after(&self, target: T) -> Option<T> {
+        match &self.representation {
+            FixedMembershipRepresentation::Sorted(values) => values
+                .get(values.partition_point(|value| *value < target))
+                .copied(),
+            FixedMembershipRepresentation::DenseBits {
+                base, span, bits, ..
+            } => {
+                let offset = if target <= *base {
+                    0
+                } else {
+                    target.offset_from(*base)?
+                };
+                if offset >= *span {
+                    return None;
+                }
+                let word_index = offset / u64::BITS as usize;
+                let bit_index = offset % u64::BITS as usize;
+                let first_word = bits[word_index] & (u64::MAX << bit_index);
+                let (word_index, word) = if first_word != 0 {
+                    (word_index, first_word)
+                } else {
+                    let relative = bits[word_index + 1..].iter().position(|word| *word != 0)?;
+                    let word_index = word_index + 1 + relative;
+                    (word_index, bits[word_index])
+                };
+                let offset = word_index * u64::BITS as usize + word.trailing_zeros() as usize;
+                (offset < *span)
+                    .then(|| base.checked_add_offset(offset))
+                    .flatten()
+            }
+            FixedMembershipRepresentation::DenseBytes { base, present, .. } => {
+                let offset = if target <= *base {
+                    0
+                } else {
+                    target.offset_from(*base)?
+                };
+                let relative = present
+                    .get(offset..)?
+                    .iter()
+                    .position(|value| *value != 0)?;
+                base.checked_add_offset(offset + relative)
+            }
+        }
+    }
+
     pub(crate) fn retain(&mut self, mut predicate: impl FnMut(T) -> bool) {
         let values = self
             .iter()
@@ -474,6 +539,59 @@ impl FixedMembership {
         }
     }
 
+    pub fn width(&self) -> FixedMembershipWidth {
+        match &self.kind {
+            FixedMembershipKind::I32(_) => FixedMembershipWidth::I32,
+            FixedMembershipKind::I64(_) => FixedMembershipWidth::I64,
+            FixedMembershipKind::I128(_) => FixedMembershipWidth::I128,
+        }
+    }
+
+    /// Least canonical member greater than or equal to `target`.
+    ///
+    /// This is the type-erased range-probe primitive used by scalar indexes;
+    /// it preserves the frozen dense/sorted representation instead of
+    /// rebuilding a boxed byte vector for every segment.
+    pub fn first_at_or_after(&self, target: i128) -> Option<i128> {
+        match &self.kind {
+            FixedMembershipKind::I32(values) => {
+                if target <= i128::from(i32::MIN) {
+                    values.first().map(i128::from)
+                } else if target > i128::from(i32::MAX) {
+                    None
+                } else {
+                    values.first_at_or_after(target as i32).map(i128::from)
+                }
+            }
+            FixedMembershipKind::I64(values) => {
+                if target <= i128::from(i64::MIN) {
+                    values.first().map(i128::from)
+                } else if target > i128::from(i64::MAX) {
+                    None
+                } else {
+                    values.first_at_or_after(target as i64).map(i128::from)
+                }
+            }
+            FixedMembershipKind::I128(values) => values.first_at_or_after(target),
+        }
+    }
+
+    pub fn first_canonical(&self) -> Option<i128> {
+        match &self.kind {
+            FixedMembershipKind::I32(values) => values.first().map(i128::from),
+            FixedMembershipKind::I64(values) => values.first().map(i128::from),
+            FixedMembershipKind::I128(values) => values.first(),
+        }
+    }
+
+    pub fn last_canonical(&self) -> Option<i128> {
+        match &self.kind {
+            FixedMembershipKind::I32(values) => values.last().map(i128::from),
+            FixedMembershipKind::I64(values) => values.last().map(i128::from),
+            FixedMembershipKind::I128(values) => values.last(),
+        }
+    }
+
     /// Visit the canonical ascending, deduplicated values independently of the
     /// dense or sorted runtime representation chosen for lookup.
     pub fn visit_canonical_values(&self, mut visit: impl FnMut(i128)) -> FixedMembershipWidth {
@@ -553,9 +671,24 @@ mod tests {
             analytical.representation,
             FixedMembershipRepresentation::DenseBytes { .. }
         ));
+        assert_eq!(analytical.first_at_or_after(-1), Some(0));
+        assert_eq!(analytical.first_at_or_after(1), Some(128));
+        assert_eq!(analytical.first_at_or_after(129), Some(256));
+        assert_eq!(analytical.first_at_or_after(257), None);
         assert_eq!(
             conservative.iter().collect::<Vec<_>>(),
             analytical.iter().collect::<Vec<_>>()
         );
+
+        let dense_bits = FixedMembershipSet::from_values_with_policy(
+            vec![0_i64, 65_536, 131_072],
+            FixedMembershipBuildPolicy::new(262_144, 16_384),
+        );
+        assert!(matches!(
+            dense_bits.representation,
+            FixedMembershipRepresentation::DenseBits { .. }
+        ));
+        assert_eq!(dense_bits.first_at_or_after(65_537), Some(131_072));
+        assert_eq!(dense_bits.first_at_or_after(131_073), None);
     }
 }
