@@ -200,6 +200,21 @@ def test_apply_explain_search_ids_normalizer_rewrites_dynamic_ids_only() -> None
     ]
 
 
+def test_apply_explain_schema_order_preserves_nested_types_and_all_fields() -> None:
+    assert apply_normalizers(
+        [
+            '    Output Schema: s.id INTEGER, b.payload VARCHAR',
+            '    Output Schema: z DECIMAL(18, 2), a STRUCT(x INTEGER, y VARCHAR)',
+            '    Output: s.id, b.payload',
+        ],
+        ("explain_schema_order",),
+    ) == [
+        '    Output Schema: b.payload VARCHAR, s.id INTEGER',
+        '    Output Schema: a STRUCT(x INTEGER, y VARCHAR), z DECIMAL(18, 2)',
+        '    Output: s.id, b.payload',
+    ]
+
+
 def test_apply_explain_cte_ids_normalizer_preserves_identity_relationships() -> None:
     assert apply_normalizers(
         [
@@ -363,6 +378,7 @@ def test_normalizer_profiles_returns_registered_names() -> None:
         "explain_adaptive_runtime",
         "explain_routine_ids",
         "explain_search_ids",
+        "explain_schema_order",
         "explain_cte_ids",
         "explain_external_runtime",
         "explain_runtime",

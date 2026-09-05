@@ -58,23 +58,25 @@ DROP TABLE IF EXISTS explain_sort_range_right;
 CREATE TABLE explain_sort_range_left (x INT);
 CREATE TABLE explain_sort_range_right (lo INT, hi INT);
 INSERT INTO explain_sort_range_left VALUES (2), (5), (9);
-INSERT INTO explain_sort_range_right VALUES (1, 3), (4, 6), (7, 10);
+-- LEFT JOIN gives this physical range-join contract a semantic orientation.
+-- An INNER range join may choose either same-cost nested-loop direction.
+INSERT INTO explain_sort_range_right VALUES (1, 3), (4, 6), (7, 10), (11, 12);
 
 EXPLAIN
 SELECT *
 FROM explain_sort_range_left AS l
-JOIN explain_sort_range_right AS r ON l.x BETWEEN r.lo AND r.hi;
+LEFT JOIN explain_sort_range_right AS r ON l.x BETWEEN r.lo AND r.hi;
 
 EXPLAIN (VERBOSE)
 SELECT *
 FROM explain_sort_range_left AS l
-JOIN explain_sort_range_right AS r ON l.x BETWEEN r.lo AND r.hi;
+LEFT JOIN explain_sort_range_right AS r ON l.x BETWEEN r.lo AND r.hi;
 
 -- @query json
 EXPLAIN
 SELECT *
 FROM explain_sort_range_left AS l
-JOIN explain_sort_range_right AS r ON l.x BETWEEN r.lo AND r.hi
+LEFT JOIN explain_sort_range_right AS r ON l.x BETWEEN r.lo AND r.hi
 FORMAT JSON;
 
 DROP TABLE explain_sort_range_left;

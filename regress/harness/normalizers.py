@@ -76,6 +76,31 @@ _REGRESS_PATH_RE = re.compile(
     r"(?<!<repo>)/(?:[^'\"\s)]+/)*regress/(?:report/fixtures|fixtures)/[^'\"\s)]+"
 )
 _PYTHON_RETRY_HINT_RE = re.compile(r"next automatic Python runtime probe in \d+ ms")
+_OUTPUT_SCHEMA_RE = re.compile(r"^(\s*Output Schema:\s*)(.*)$")
+
+
+def _split_top_level_commas(value: str) -> list[str]:
+    """Split an EXPLAIN schema without splitting nested type parameters."""
+    fields: list[str] = []
+    start = 0
+    depth = 0
+    quote: str | None = None
+    for index, char in enumerate(value):
+        if quote is not None:
+            if char == quote:
+                quote = None
+            continue
+        if char in {'"', "'"}:
+            quote = char
+        elif char in "([<{":
+            depth += 1
+        elif char in ")]>}":
+            depth = max(depth - 1, 0)
+        elif char == "," and depth == 0:
+            fields.append(value[start:index].strip())
+            start = index + 1
+    fields.append(value[start:].strip())
+    return fields
 
 
 def normalize_explain_operator_timing(lines: list[str]) -> list[str]:
@@ -194,6 +219,19 @@ def normalize_explain_external_runtime(lines: list[str]) -> list[str]:
     return result
 
 
+def normalize_explain_schema_order(lines: list[str]) -> list[str]:
+    """Canonicalize the unordered relational schema shown by verbose EXPLAIN."""
+    result: list[str] = []
+    for line in lines:
+        match = _OUTPUT_SCHEMA_RE.match(line)
+        if match is None:
+            result.append(line)
+            continue
+        fields = _split_top_level_commas(match.group(2))
+        result.append(f"{match.group(1)}{', '.join(sorted(fields))}")
+    return result
+
+
 def normalize_explain_operator_counters(lines: list[str]) -> list[str]:
     """Normalize volatile EXPLAIN ANALYZE row/loop counters."""
     result: list[str] = []
@@ -276,6 +314,7 @@ NORMALIZERS: dict[str, Callable[[list[str]], list[str]]] = {
     "explain_adaptive_runtime": normalize_explain_adaptive_runtime,
     "explain_routine_ids": normalize_explain_routine_ids,
     "explain_search_ids": normalize_explain_search_ids,
+    "explain_schema_order": normalize_explain_schema_order,
     "explain_cte_ids": normalize_explain_cte_ids,
     "explain_external_runtime": normalize_explain_external_runtime,
     "explain_runtime": normalize_explain_runtime,
@@ -321,6 +360,7 @@ __all__ = [
     "normalize_explain_runtime",
     "normalize_explain_runtime_bytes",
     "normalize_explain_search_ids",
+    "normalize_explain_schema_order",
     "normalize_explain_summary_timing",
     "normalize_python_runtime_retry_hint",
     "normalize_regress_paths",
