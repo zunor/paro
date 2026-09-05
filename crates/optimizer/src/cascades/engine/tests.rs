@@ -2325,8 +2325,40 @@ fn parent_costs_every_source_sensitive_child_frontier_candidate() {
 
     let winner = engine.optimize(root, goal, SearchMode::Memo).unwrap();
 
+    // Independent exhaustive oracle: remove each candidate's source phase
+    // from its complete cost, apply the proven absolute survivor ratio once,
+    // and enumerate the whole child frontier. This intentionally does not
+    // call the production composition routine or its helper algebra.
+    let (oracle_cost, oracle_candidate) = engine
+        .memo()
+        .group(child)
+        .unwrap()
+        .winner_frontier(goal)
+        .unwrap()
+        .candidates()
+        .iter()
+        .map(|candidate| {
+            let source_cost = candidate
+                .source_work
+                .iter()
+                .map(|lane| lane.phased_cost.score.range.expected)
+                .sum::<f64>();
+            let retained_source_cost = candidate
+                .source_work
+                .iter()
+                .map(|lane| lane.base_cost.score.range.expected * 0.01)
+                .sum::<f64>();
+            (
+                candidate.cost.score.range.expected - source_cost + retained_source_cost,
+                candidate.candidate,
+            )
+        })
+        .min_by(|left, right| left.0.total_cmp(&right.0))
+        .unwrap();
     assert!((winner.cost.score.range.expected - 1.2).abs() < 1e-9);
+    assert!((winner.cost.score.range.expected - oracle_cost).abs() < 1e-9);
     assert_eq!(winner.children.len(), 1);
+    assert_eq!(winner.children[0].candidate, oracle_candidate);
     let selected_child = engine
         .memo()
         .resolve_child_winner(winner.children[0])
@@ -2662,11 +2694,16 @@ fn child_product_cutoff_records_budget_limited_completion() {
             .len();
         (winner.cost.score.range.expected, consumed, exhausted, width)
     }
+    let (baseline_only, zero_consumed, zero_exhausted, zero_width) = search(0);
     let (chosen, consumed, exhausted, width) = search(1);
     let (oracle, _, _, _) = search(8);
+    assert_eq!(zero_width, 3);
+    assert_eq!(zero_consumed, 0);
+    assert!(zero_exhausted > 0);
     assert_eq!(width, 3);
     assert_eq!(consumed, 1);
     assert!(exhausted > 0);
+    assert!(baseline_only >= chosen);
     assert!(chosen > oracle);
     assert!((oracle - 1.3).abs() < 1e-9);
 }

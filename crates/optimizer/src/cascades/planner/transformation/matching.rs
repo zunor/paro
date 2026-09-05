@@ -64,6 +64,8 @@ pub(super) fn pattern_bindings(
                 }
             }
             active.remove(&group);
+            result.sort_by_key(|(_, fingerprint)| *fingerprint);
+            result.dedup_by_key(|(_, fingerprint)| *fingerprint);
             Ok(result)
         }
 
@@ -101,7 +103,11 @@ pub(super) fn pattern_bindings(
                 .map(|children| {
                     let mut fingerprint = StableFingerprintBuilder::default();
                     fingerprint.write_bytes(b"paro.pattern.binding.v1");
-                    fingerprint.write_fingerprint(logical.key.stable_fingerprint());
+                    // The operator fingerprint already contains semantic
+                    // scalar fingerprints. Child group ids are allocation
+                    // artifacts and are replaced by the exact bound child
+                    // fingerprints below.
+                    fingerprint.write_fingerprint(logical.key.operator);
                     for (_, child_fingerprint) in &children {
                         fingerprint.write_fingerprint(*child_fingerprint);
                     }
@@ -242,9 +248,20 @@ fn expression_was_produced_by(expr: &crate::cascades::memo::LogicalExpr, rule: R
 mod tests {
     use super::*;
 
-    fn binding_fingerprints(reverse: bool) -> (Vec<Fingerprint>, Box<[PatternRead]>) {
+    fn binding_fingerprints(
+        reverse: bool,
+        id_shift: usize,
+        proof_rule: RuleId,
+    ) -> (Vec<Fingerprint>, Box<[PatternRead]>) {
         let mut memo = Memo::new(SearchBudget::default());
         let schema = GroupSchema::new(std::iter::empty()).unwrap();
+        for _ in 0..id_shift {
+            memo.create_group(
+                schema.clone(),
+                LogicalProperties::default(),
+                GroupCardinality::default(),
+            );
+        }
         let child = memo.create_group(
             schema.clone(),
             LogicalProperties::default(),
@@ -263,7 +280,7 @@ mod tests {
                 if index == 0 {
                     EquivalenceProof::Initial
                 } else {
-                    EquivalenceProof::Normalization { rule: RuleId(99) }
+                    EquivalenceProof::Normalization { rule: proof_rule }
                 },
             )
             .unwrap();
@@ -298,11 +315,24 @@ mod tests {
 
     #[test]
     fn binding_closure_is_independent_of_expression_insertion_order() {
-        let (forward, reads) = binding_fingerprints(false);
-        let (reverse, _) = binding_fingerprints(true);
+        let (forward, reads) = binding_fingerprints(false, 0, RuleId(99));
+        let (reverse, _) = binding_fingerprints(true, 0, RuleId(99));
         assert_eq!(forward, reverse);
         assert_eq!(forward.len(), 2);
         assert_eq!(reads.len(), 1);
+    }
+
+    #[test]
+    fn binding_closure_is_independent_of_ids_and_proof_fingerprints() {
+        let (baseline, baseline_reads) = binding_fingerprints(false, 0, RuleId(99));
+        let (renamed, renamed_reads) = binding_fingerprints(false, 3, RuleId(9_999));
+        assert_eq!(baseline, renamed);
+        assert_eq!(baseline_reads.len(), renamed_reads.len());
+        assert_ne!(baseline_reads[0].group, renamed_reads[0].group);
+        assert_eq!(
+            baseline_reads[0].logical_frontier_revision,
+            renamed_reads[0].logical_frontier_revision
+        );
     }
 
     fn expression_with(proof: EquivalenceProof) -> crate::cascades::memo::LogicalExpr {
