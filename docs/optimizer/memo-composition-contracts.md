@@ -29,8 +29,13 @@ heuristics.
 - Every omitted logical binding or physical child combination produces a
   `BudgetLimited` witness. A finite-budget winner without that witness is a
   claim that the applicable search space was completely enumerated.
-- Parent recipes bind exact immutable child candidate identities. Frontier
-  ordering and pruning cannot change an already recorded winner tree.
+- Parent recipes enumerate every admitted child-frontier product and bind
+  exact immutable `CandidateId` values. Candidate storage is append-only, so
+  frontier ordering, dominance pruning, and group merging cannot retarget an
+  already recorded winner tree.
+- Logical frontier revisions are globally monotonic across insert, rollback,
+  and group merge. A rolled-back alternative can therefore never reuse an
+  observed read cursor.
 
 ## Transformation bindings
 
@@ -40,8 +45,17 @@ heuristics.
 - Matching records the precise logical frontier and fact revisions it reads,
   including reads which currently produce no match. A later alternative or
   fact revision invalidates only dependent bindings.
-- Transformation output is staged as Memo shells plus group references; plan
-  materialization is not part of exploration.
+- A rule which publishes the complete output frontier for one observed binding
+  may seed its outputs with that binding's read cursor. The cursor is an
+  incremental-work optimization only: any observed frontier, fact, or
+  statistics change makes those outputs ordinarily matchable again.
+- Mature planner rewrite kernels receive a temporary semantic plan rebuilt
+  from the exact `PatternBinding`. This boundary adapter cannot choose a Memo
+  representative. Rewritten output is decomposed into canonical operator
+  shells during transactional staging; declared group holes are preserved as
+  group references.
+- Equivalence proofs are audit evidence checked at publication. They never
+  participate in root dispatch, binding identity, or incremental idempotence.
 
 ## Execution phases
 
@@ -51,3 +65,7 @@ heuristics.
   Coordination cost is charged once for each scheduler-visible phase.
 - Source filtering replaces raw work before phase folding. Total work, span
   lower bound, and estimated duration remain distinct quantities.
+- `max_parallel_tasks` records the operating point of all phases contained in
+  a candidate; `output_pipeline_tasks` is the executable supply exported to a
+  streaming parent. A wide projection cannot manufacture workers when its
+  source pipeline exported one task.

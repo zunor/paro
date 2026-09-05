@@ -2,11 +2,13 @@
 
 All planner transformations consume `PatternBinding` operands. A binding
 selects every inspected logical expression explicitly and records each Memo
-frontier revision read during enumeration. The planner-plan instance used by
-the mature rewrite kernels is reconstructed from that exact binding; no rule
-chooses a representative expression.
+frontier, logical-fact, and statistics snapshot read during enumeration. The
+semantic-plan instance used by the mature rewrite kernels is a boundary view
+reconstructed from that exact binding; no rule chooses a representative
+expression. Its output is imported transactionally as canonical operator
+shells and explicit child groups.
 
-| Rule | Root shell | Bound scope | Preserved group boundary |
+| Rule | Root shell | Bound scope | Preserved output boundary |
 |---|---|---|---|
 | expensive predicate placement | Filter | exact subtree binding | none |
 | CTE partitioned materialization | MaterializedCTE | exact producer/consumer binding | sharing facet |
@@ -27,6 +29,12 @@ chooses a representative expression.
 | late payload fetch | Projection/Aggregate/TopN | exact selective subtree binding | none |
 | scalar aggregate window | join/unary carrier | exact aggregate binding | none |
 
+The table is exhaustive over `PlannerTransformation::ALL`. “None” means the
+rewrite changed that subtree and staging owns the newly emitted shells; it
+does not mean an arbitrary representative was substituted. TopN retains the
+`Order` input group because `Limit(Order(G)) -> TopN(G)` changes only the two
+operator shells above `G`.
+
 Removed search bridges:
 
 - recursive representative selection by `Initial` proof or rule id;
@@ -39,3 +47,17 @@ Removed search bridges:
 and child-frontier enumerators both retain one explicit omission witness, and
 the mandatory physical baseline remains available when optional search is
 limited.
+
+Rules that publish a complete local frontier for an observed binding declare
+that contract through `output_saturates_observed_binding`. Produced
+expressions inherit only the corresponding read cursor. This prevents a
+whole-region enumerator from immediately enumerating its own complete output,
+while a later child alternative, fact change, or statistics snapshot change
+invalidates the cursor. Ordinary chain rewrites keep the default non-saturating
+contract and may continue rewriting their own output.
+
+The remaining `instantiate_bound_plan` helper is deliberately not a search
+bridge. It accepts a fully explicit `PatternOperand` tree, fails on an
+unconsumed group hole, and has no API for selecting an expression from a
+group. It is the typed semantic boundary for the existing rewrite kernels;
+winner extraction and positional layout conversion remain separate.
