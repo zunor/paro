@@ -649,18 +649,11 @@ pub(super) fn implementation_cost(
     calibration: &MachineCalibrationBundle,
     max_concurrent_tasks: u16,
 ) -> Result<SearchCost> {
-    let useful_parallel_tasks = useful_parallel_tasks_for_facts(facts, max_concurrent_tasks);
     let mut work = LocalOperatorWork::default();
     let peak_memory_upper;
     match flavor {
         PhysicalImplementationFlavor::Structural => {
-            return refreshed_structural_cost(
-                metadata,
-                facts,
-                calibration,
-                max_concurrent_tasks,
-                useful_parallel_tasks,
-            )
+            return refreshed_structural_cost(metadata, facts, max_concurrent_tasks)
         }
         PhysicalImplementationFlavor::SearchProvider => {
             return Err(paro_error::internal(
@@ -1009,11 +1002,10 @@ pub(super) fn implementation_cost(
                 .saturating_mul(facts.output_row_width.max(32));
         }
     }
-    let mut cost = calibration.fold_for_tasks(
-        &work,
-        implementation_parallelism(flavor),
-        useful_parallel_tasks,
-    )?;
+    // Preserve implementation work in a serial-normalized form. The Memo
+    // engine assigns it to scheduler-visible phases only after concrete child
+    // winners expose their pipeline task supply.
+    let mut cost = calibration.fold(&work)?;
     let retained_memory_target = expected_retained_memory_target(facts, flavor, peak_memory_upper);
     apply_execution_memory_contract(
         metadata,
@@ -1052,7 +1044,7 @@ pub(super) fn runtime_filter_apply_cost(
     facts: &ResolvedPlannerCostFacts,
     flavor: PhysicalImplementationFlavor,
     calibration: &MachineCalibrationBundle,
-    max_concurrent_tasks: u16,
+    _max_concurrent_tasks: u16,
 ) -> Result<Option<SearchCost>> {
     let rows = match flavor {
         PhysicalImplementationFlavor::HashJoinRuntimeFilter => {
@@ -1076,12 +1068,7 @@ pub(super) fn runtime_filter_apply_cost(
     // independently scheduled operator. Fold it at the exact same physical
     // operating point so every score/span dimension remains a valid subset
     // of the complete local candidate.
-    let useful_parallel_tasks = useful_parallel_tasks_for_facts(facts, max_concurrent_tasks);
-    Ok(Some(calibration.fold_for_tasks(
-        &work,
-        ParallelWorkProfile::Pipeline,
-        useful_parallel_tasks,
-    )?))
+    Ok(Some(calibration.fold(&work)?))
 }
 
 /// Derive an operator's executable task supply independently from its grant.
@@ -1095,16 +1082,13 @@ pub(super) fn useful_parallel_tasks_for_facts(
     facts: &ResolvedPlannerCostFacts,
     max_concurrent_tasks: u16,
 ) -> u16 {
+    let Some(physical_rows) = facts.scan_physical_rows else {
+        // A non-source operator inherits supply from a child winner. Returning
+        // one here is intentional: its own wider output cannot create tasks.
+        return 1;
+    };
     let scan_width = facts.scan_access_width.unwrap_or(facts.output_row_width);
-    let mut largest_stream_bytes = facts.scan_physical_rows.map_or(0, |physical_rows| {
-        physical_rows.saturating_mul(scan_width.saturating_add(8).max(1))
-    });
-    if facts.scan_physical_rows.is_none() {
-        largest_stream_bytes = estimated_bytes(facts.output_rows.expected, facts.output_row_width);
-        for (rows, width) in facts.child_rows.iter().zip(facts.child_row_widths.iter()) {
-            largest_stream_bytes = largest_stream_bytes.max(estimated_bytes(rows.expected, *width));
-        }
-    }
+    let largest_stream_bytes = physical_rows.saturating_mul(scan_width.saturating_add(8).max(1));
     u16::try_from(useful_pipeline_tasks(
         largest_stream_bytes,
         usize::from(max_concurrent_tasks.max(1)),
@@ -1113,27 +1097,104 @@ pub(super) fn useful_parallel_tasks_for_facts(
     .max(1)
 }
 
-fn implementation_parallelism(flavor: PhysicalImplementationFlavor) -> ParallelWorkProfile {
-    match flavor {
-        PhysicalImplementationFlavor::AdaptiveSort
-        | PhysicalImplementationFlavor::HeapTopN
-        | PhysicalImplementationFlavor::HashAggregate
-        | PhysicalImplementationFlavor::PerfectHashAggregate
-        | PhysicalImplementationFlavor::Window
-        | PhysicalImplementationFlavor::PartitionAggregateWindow
-        | PhysicalImplementationFlavor::SortRangeJoin
-        | PhysicalImplementationFlavor::ClassicIeJoin => ParallelWorkProfile::BlockingMerge,
-        PhysicalImplementationFlavor::HashJoin
-        | PhysicalImplementationFlavor::HashJoinBuildLeft
-        | PhysicalImplementationFlavor::HashJoinBuildLeftRuntimeFilter
-        | PhysicalImplementationFlavor::HashJoinRuntimeFilter
-        | PhysicalImplementationFlavor::NestedLoopJoin
-        | PhysicalImplementationFlavor::CrossProductInMemory
-        | PhysicalImplementationFlavor::CrossProductExternal => ParallelWorkProfile::Pipeline,
-        PhysicalImplementationFlavor::SingletonAggregateProjection
-        | PhysicalImplementationFlavor::Structural
-        | PhysicalImplementationFlavor::SearchProvider => ParallelWorkProfile::Serial,
+pub(super) fn useful_output_tasks(
+    facts: &ResolvedPlannerCostFacts,
+    max_concurrent_tasks: u16,
+) -> u16 {
+    u16::try_from(useful_pipeline_tasks(
+        estimated_bytes(facts.output_rows.expected, facts.output_row_width),
+        usize::from(max_concurrent_tasks.max(1)),
+    ))
+    .unwrap_or(max_concurrent_tasks.max(1))
+    .max(1)
+}
+
+/// Calibrated share of hash-join work executed by the build pipeline. Runtime
+/// predicate application is deliberately excluded: it executes in the traced
+/// source pipeline and is repriced independently during source composition.
+pub(super) fn hash_join_build_work_ppm(
+    facts: &ResolvedPlannerCostFacts,
+    flavor: PhysicalImplementationFlavor,
+    calibration: &MachineCalibrationBundle,
+) -> Result<u32> {
+    let left = facts
+        .child_rows
+        .first()
+        .copied()
+        .unwrap_or(CompactRange::ZERO);
+    let right = facts
+        .child_rows
+        .get(1)
+        .copied()
+        .unwrap_or(CompactRange::ZERO);
+    let build_left = matches!(
+        flavor,
+        PhysicalImplementationFlavor::HashJoinBuildLeft
+            | PhysicalImplementationFlavor::HashJoinBuildLeftRuntimeFilter
+    );
+    let (build, probe, build_index, probe_index) = if build_left {
+        (left, right, 0, 1)
+    } else {
+        (right, left, 1, 0)
+    };
+    let build_materialization_risk = facts
+        .child_materialization_risk_rows
+        .get(build_index)
+        .copied()
+        .unwrap_or(0) as f64;
+    let build = CompactRange::new(
+        build.lower,
+        build.expected,
+        build.upper.max(build_materialization_risk),
+    )?;
+    let mut build_work = LocalOperatorWork::default();
+    build_work.add(OP_HASH_BUILD_ROW, build)?;
+    if matches!(
+        flavor,
+        PhysicalImplementationFlavor::HashJoinRuntimeFilter
+            | PhysicalImplementationFlavor::HashJoinBuildLeftRuntimeFilter
+    ) {
+        build_work.add(OP_RUNTIME_FILTER_BUILD_ROW, build)?;
     }
+    add_hash_key_byte_work(&mut build_work, build, facts.hash_key_width)?;
+    add_stream_byte_work(
+        &mut build_work,
+        build,
+        facts
+            .child_row_widths
+            .get(build_index)
+            .copied()
+            .unwrap_or(facts.output_row_width),
+    )?;
+
+    let mut probe_work = LocalOperatorWork::default();
+    add_hash_key_byte_work(&mut probe_work, probe, facts.hash_key_width)?;
+    probe_work.add(OP_HASH_PROBE_ROW, probe.checked_add(facts.output_rows)?)?;
+    add_stream_byte_work(
+        &mut probe_work,
+        probe,
+        facts
+            .child_row_widths
+            .get(probe_index)
+            .copied()
+            .unwrap_or(facts.output_row_width),
+    )?;
+    add_stream_byte_work(&mut probe_work, facts.output_rows, facts.output_row_width)?;
+    let build_score = calibration.fold(&build_work)?.score.range.expected;
+    let probe_score = calibration.fold(&probe_work)?.score.range.expected;
+    let total = build_score + probe_score;
+    if total <= 0.0 {
+        return Ok(0);
+    }
+    Ok(((build_score / total * 1_000_000.0).round() as u32).min(1_000_000))
+}
+
+fn add_stream_byte_work(
+    work: &mut LocalOperatorWork,
+    rows: CompactRange,
+    width: u64,
+) -> Result<()> {
+    work.add(OP_TUPLE_BYTE_BLOCK, scaled_work(rows, width as f64 / 32.0)?)
 }
 
 fn apply_execution_memory_contract(
@@ -1357,7 +1418,7 @@ fn expected_retained_memory_target(
     expected.min(retained_memory_upper)
 }
 
-fn estimated_bytes(rows: f64, width: u64) -> u64 {
+pub(super) fn estimated_bytes(rows: f64, width: u64) -> u64 {
     if rows <= 0.0 {
         0
     } else if rows >= u64::MAX as f64 / width as f64 {
@@ -1370,9 +1431,7 @@ fn estimated_bytes(rows: f64, width: u64) -> u64 {
 fn refreshed_structural_cost(
     metadata: &PlannerOperatorMetadata,
     facts: &ResolvedPlannerCostFacts,
-    calibration: &MachineCalibrationBundle,
     max_concurrent_tasks: u16,
-    useful_parallel_tasks: u16,
 ) -> Result<SearchCost> {
     if matches!(
         metadata.operator_type,
@@ -1392,11 +1451,7 @@ fn refreshed_structural_cost(
             || Ok(metadata.local_cost),
             |access_width| base_table_scan_cost(facts.output_rows, access_width),
         )?;
-        return calibration.apply_parallelism(
-            cost,
-            ParallelWorkProfile::Pipeline,
-            useful_parallel_tasks,
-        );
+        return Ok(cost);
     }
     let width_factor = (facts.output_row_width as f64 / 32.0).max(1.0);
     let child_count = facts.child_rows.len() as f64;
@@ -1465,7 +1520,7 @@ fn refreshed_structural_cost(
         )?;
     }
     cost.validate()?;
-    calibration.apply_parallelism(cost, ParallelWorkProfile::Pipeline, useful_parallel_tasks)
+    Ok(cost)
 }
 
 pub(super) fn add_tuple_byte_work(

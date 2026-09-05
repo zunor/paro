@@ -8,6 +8,7 @@ use std::sync::{Arc, RwLock};
 
 use paro_common::error::{self as paro_error, Result};
 
+use super::calibration::ParallelWorkProfile;
 use super::cost::SearchCost;
 use super::ids::{
     Fingerprint, GroupId, ImplementationId, LogicalExprId, LogicalPayloadId, PhysicalPayloadId,
@@ -447,6 +448,7 @@ pub struct SourceFilterWork {
     pub domain: DomainProofId,
     pub evaluation: EvaluationOccurrenceId,
     pub expected_retained_ppm: u32,
+    pub upper_retained_ppm: u32,
     /// Cost of evaluating this predicate against the unfiltered source. Joint
     /// composition orders and scales these costs by preceding predicates.
     pub full_apply_cost: SearchCost,
@@ -470,6 +472,10 @@ pub struct SourceWork {
     pub filters: Box<[SourceFilterWork]>,
     /// Jointly ordered evaluation work currently present in the winner cost.
     pub filter_apply_cost: SearchCost,
+    /// Complete source-pipeline work after retention and predicate ordering,
+    /// folded once at the pipeline operating point.
+    pub phased_cost: SearchCost,
+    pub phase_tasks: u16,
 }
 
 #[derive(Debug, Clone)]
@@ -502,6 +508,40 @@ pub enum CostComposition {
         filtered_child: u8,
         sources: Box<[SidewaysFilterSource]>,
     },
+}
+
+/// Physical pipeline/phase contract used to price span after child winners
+/// are known. Total work remains in `SearchCost`; this contract only assigns
+/// that work to real scheduler phases and carries the resulting output supply.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TaskSupplyContract {
+    /// Utility, finish, and other intrinsically single-task work.
+    Serial,
+    /// A physical source creates a new pipeline task domain.
+    Source { tasks: u16 },
+    /// A streaming transform executes in, and preserves, one child pipeline.
+    Streaming { input: u8 },
+    /// A breaker consumes an input pipeline and creates a distinct emit
+    /// source. `output_tasks` comes from that source representation.
+    Breaker {
+        input: u8,
+        output_tasks: u16,
+        profile: ParallelWorkProfile,
+    },
+    /// Hash/cross-product execution has a build phase and a probe phase. The
+    /// split is expressed in calibrated work ppm, not row or byte cardinality,
+    /// and therefore conserves the immutable work vector exactly.
+    BuildProbe {
+        build: u8,
+        probe: u8,
+        build_work_ppm: u32,
+    },
+}
+
+impl TaskSupplyContract {
+    pub const fn serial() -> Self {
+        Self::Serial
+    }
 }
 
 impl CostComposition {
@@ -540,6 +580,7 @@ pub struct PhysicalCandidate {
     /// Work already included in `local_cost` for evaluating this candidate's
     /// runtime predicate against an otherwise unfiltered source.
     pub source_filter_apply_cost: Option<SearchCost>,
+    pub task_supply: TaskSupplyContract,
     pub cost_composition: CostComposition,
     /// Whether operator-owned retained state can yield memory to spill after
     /// child winner peaks are known.

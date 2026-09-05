@@ -220,6 +220,13 @@ impl PhysicalImplementation for PlannerBaselineImplementation {
             return Ok(Box::new([]));
         };
         let physical_fingerprint = fingerprint.finish();
+        let task_supply = planner_task_supply_contract(
+            metadata,
+            metadata.implementations.baseline,
+            &cost_facts,
+            self.calibration.as_ref(),
+            max_concurrent_tasks,
+        )?;
         Ok(vec![PhysicalCandidate {
             key: PhysicalExprKey {
                 implementation: self.id(),
@@ -232,6 +239,7 @@ impl PhysicalImplementation for PlannerBaselineImplementation {
             child_goals,
             local_cost,
             source_filter_apply_cost,
+            task_supply,
             cost_composition: planner_cost_composition(
                 metadata,
                 metadata.implementations.baseline,
@@ -398,6 +406,13 @@ impl PhysicalImplementation for AlternativeImplementation {
             max_concurrent_tasks,
             physical_fingerprint,
         )?;
+        let task_supply = planner_task_supply_contract(
+            metadata,
+            self.flavor,
+            &cost_facts,
+            self.calibration.as_ref(),
+            max_concurrent_tasks,
+        )?;
         Ok(vec![PhysicalCandidate {
             key: PhysicalExprKey {
                 implementation: self.id,
@@ -410,6 +425,7 @@ impl PhysicalImplementation for AlternativeImplementation {
             child_goals,
             local_cost,
             source_filter_apply_cost,
+            task_supply,
             cost_composition,
             spillable: implementation_spillable(metadata, self.flavor),
             enforcer_cost_input: planner_enforcer_cost_input(
@@ -506,6 +522,7 @@ impl PhysicalImplementation for PlannerSearchImplementation {
             child_goals: Box::new([]),
             local_cost: search.local_cost,
             source_filter_apply_cost: None,
+            task_supply: TaskSupplyContract::Serial,
             cost_composition: CostComposition::Sequential,
             spillable: false,
             enforcer_cost_input: crate::cascades::engine::EnforcerCostInput::unbounded(

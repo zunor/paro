@@ -32,7 +32,7 @@ use super::rules::WorkSourceId;
 use super::rules::{
     CostComposition, ImplementationContext, ImplementationRegistry, PatternEnumerationCompletion,
     PatternRead, PhysicalCandidate, RuleContext, SourceFilterWork, SourceRetentionProof,
-    SourceWork, TransformContext,
+    SourceWork, TaskSupplyContract, TransformContext,
 };
 use crate::physical::SpillPolicy;
 
@@ -123,6 +123,7 @@ struct CostRecipe {
     child_goals: Box<[(GroupId, OptimizationGoal)]>,
     local_cost: SearchCost,
     source_filter_apply_cost: Option<SearchCost>,
+    task_supply: TaskSupplyContract,
     cost_composition: CostComposition,
     spillable: bool,
     enforcer_cost_input: EnforcerCostInput,
@@ -985,6 +986,7 @@ impl CascadesEngine {
             child_goals: candidate.child_goals,
             local_cost: candidate.local_cost,
             source_filter_apply_cost: candidate.source_filter_apply_cost,
+            task_supply: candidate.task_supply,
             cost_composition: candidate.cost_composition,
             spillable: candidate.spillable,
             enforcer_cost_input: candidate.enforcer_cost_input,
@@ -1138,12 +1140,26 @@ impl CascadesEngine {
                     );
                     continue;
                 };
-                let composed = compose_candidate_cost_with_sources(
+                let local_without_source_filter = match recipe.source_filter_apply_cost {
+                    Some(apply) => local_cost.replace_work(apply, SearchCost::ZERO)?,
+                    None => local_cost,
+                };
+                let mut local_cost = resolve_task_supply(
+                    local_without_source_filter,
+                    &child_costs,
+                    &recipe.task_supply,
+                    self.memo.calibration(),
+                )?;
+                if let Some(apply) = recipe.source_filter_apply_cost {
+                    local_cost = local_cost.replace_work(SearchCost::ZERO, apply)?;
+                }
+                let composed = compose_candidate_cost_with_sources_at(
                     local_cost,
                     recipe.source_filter_apply_cost,
                     &child_costs,
                     &child_source_work_refs,
                     recipe.cost_composition.clone(),
+                    self.memo.calibration(),
                 )?;
                 let source_work = composed.source_work;
                 let Some(mut cost) =
@@ -1658,12 +1674,106 @@ fn child_frontier_combination_event(
     event.finish()
 }
 
+fn resolve_task_supply(
+    local_cost: SearchCost,
+    child_costs: &[SearchCost],
+    contract: &TaskSupplyContract,
+    calibration: &MachineCalibrationBundle,
+) -> Result<SearchCost> {
+    let child_tasks = |index: u8| -> Result<u16> {
+        child_costs
+            .get(usize::from(index))
+            .map(|cost| cost.output_pipeline_tasks)
+            .ok_or_else(|| {
+                paro_error::internal("task-supply contract references an absent child pipeline")
+            })
+    };
+    match *contract {
+        TaskSupplyContract::Serial => {
+            calibration.rephase(local_cost, ParallelWorkProfile::Serial, 1, 1)
+        }
+        TaskSupplyContract::Source { tasks } => {
+            calibration.rephase(local_cost, ParallelWorkProfile::Pipeline, tasks, tasks)
+        }
+        TaskSupplyContract::Streaming { input } => {
+            let tasks = child_tasks(input)?;
+            calibration.rephase(local_cost, ParallelWorkProfile::Pipeline, tasks, tasks)
+        }
+        TaskSupplyContract::Breaker {
+            input,
+            output_tasks,
+            profile,
+        } => calibration.rephase(local_cost, profile, child_tasks(input)?, output_tasks),
+        TaskSupplyContract::BuildProbe {
+            build,
+            probe,
+            build_work_ppm,
+        } => {
+            if build_work_ppm > 1_000_000 {
+                return Err(paro_error::internal(
+                    "build/probe task-supply contract has an invalid work split",
+                ));
+            }
+            let serial_work = local_cost.work_only();
+            let build_work = serial_work.retain_work(build_work_ppm, build_work_ppm)?;
+            let probe_work = serial_work.replace_work(build_work, SearchCost::ZERO)?;
+            let build_tasks = child_tasks(build)?;
+            let probe_tasks = child_tasks(probe)?;
+            let build_cost = calibration.rephase(
+                build_work,
+                ParallelWorkProfile::Pipeline,
+                build_tasks,
+                build_tasks,
+            )?;
+            let probe_cost = calibration.rephase(
+                probe_work,
+                ParallelWorkProfile::Pipeline,
+                probe_tasks,
+                probe_tasks,
+            )?;
+            let phased_work = build_cost.sequential(probe_cost)?;
+            let mut result = local_cost.replace_work(serial_work, phased_work)?;
+            result.max_parallel_tasks = build_tasks.max(probe_tasks);
+            result.output_pipeline_tasks = probe_tasks;
+            result.validate()?;
+            Ok(result)
+        }
+    }
+}
+
+fn serial_normalized_work(cost: SearchCost) -> SearchCost {
+    let mut work = cost.work_only();
+    work.critical_path = work.work_latency;
+    work.max_parallel_tasks = 1;
+    work.output_pipeline_tasks = 1;
+    work
+}
+
+#[cfg(test)]
 pub(crate) fn compose_candidate_cost_with_sources(
     local_cost: SearchCost,
     source_filter_apply_cost: Option<SearchCost>,
     child_costs: &[SearchCost],
     child_source_work: &[&[SourceWork]],
     composition: CostComposition,
+) -> Result<ComposedCost> {
+    compose_candidate_cost_with_sources_at(
+        local_cost,
+        source_filter_apply_cost,
+        child_costs,
+        child_source_work,
+        composition,
+        &MachineCalibrationBundle::default(),
+    )
+}
+
+pub(crate) fn compose_candidate_cost_with_sources_at(
+    local_cost: SearchCost,
+    source_filter_apply_cost: Option<SearchCost>,
+    child_costs: &[SearchCost],
+    child_source_work: &[&[SourceWork]],
+    composition: CostComposition,
+    calibration: &MachineCalibrationBundle,
 ) -> Result<ComposedCost> {
     if child_costs.len() != child_source_work.len() {
         return Err(paro_error::internal(
@@ -1689,16 +1799,19 @@ pub(crate) fn compose_candidate_cost_with_sources(
             ));
         }
         cost.validate()?;
+        let serial_cost = serial_normalized_work(local_cost);
         return Ok(ComposedCost {
             cost,
             source_work: Box::new([SourceWork {
                 source: *source,
                 source_rows: *source_rows,
-                base_cost: local_cost.work_only(),
-                cost: local_cost.work_only(),
+                base_cost: serial_cost,
+                cost: serial_cost,
                 retentions: Box::new([]),
                 filters: Box::new([]),
                 filter_apply_cost: SearchCost::ZERO,
+                phased_cost: local_cost.work_only(),
+                phase_tasks: local_cost.output_pipeline_tasks,
             }]),
         });
     }
@@ -1765,7 +1878,7 @@ pub(crate) fn compose_candidate_cost_with_sources(
                             let share = apply_shares
                                 .next()
                                 .expect("one predicate-cost share per matching source lane");
-                            let full_apply_cost = total_apply_cost.retain_work(share, 1_000_000)?;
+                            let full_apply_cost = total_apply_cost.retain_work(share, share)?;
                             // Speculative filters retain the complete risk
                             // ceiling. Exact membership over a declared-unique
                             // probe carries a proof-backed smaller ceiling.
@@ -1782,10 +1895,8 @@ pub(crate) fn compose_candidate_cost_with_sources(
                             }
                             retentions.sort_by_key(|retention| retention.domain);
                             let retained = retained_source_cost(lane.base_cost, &retentions)?;
-                            child = child.replace_work(lane.cost, retained)?;
                             lane.cost = retained;
                             lane.retentions = retentions.into_boxed_slice();
-                            let old_apply_cost = lane.filter_apply_cost;
                             let mut filters = lane.filters.to_vec();
                             if !filters
                                 .iter()
@@ -1795,14 +1906,23 @@ pub(crate) fn compose_candidate_cost_with_sources(
                                     domain: source.domain,
                                     evaluation: source.evaluation,
                                     expected_retained_ppm: source.expected_retained_ppm,
+                                    upper_retained_ppm: source.upper_retained_ppm,
                                     full_apply_cost: full_apply_cost.work_only(),
                                 });
                             }
                             filters.sort_by_key(|filter| filter.evaluation);
                             let new_apply_cost = ordered_source_filter_cost(&filters)?;
-                            child = child.replace_work(old_apply_cost, new_apply_cost)?;
                             lane.filters = filters.into_boxed_slice();
                             lane.filter_apply_cost = new_apply_cost;
+                            let serial_pipeline = retained.sequential(new_apply_cost)?;
+                            let phased_pipeline = calibration.rephase(
+                                serial_pipeline,
+                                ParallelWorkProfile::Pipeline,
+                                lane.phase_tasks,
+                                lane.phase_tasks,
+                            )?;
+                            child = child.replace_work(lane.phased_cost, phased_pipeline)?;
+                            lane.phased_cost = phased_pipeline;
                         }
                     }
                 }
@@ -1930,16 +2050,18 @@ fn ordered_source_filter_cost(filters: &[SourceFilterWork]) -> Result<SearchCost
         )
     });
     let mut expected_prefix = SCALE as u32;
+    let mut upper_prefix = SCALE as u32;
     let mut applied_domains = BTreeSet::new();
     let mut cost = SearchCost::ZERO;
     for filter in ordered {
         cost = cost.sequential(
             filter
                 .full_apply_cost
-                .retain_work(expected_prefix, SCALE as u32)?,
+                .retain_work(expected_prefix.min(upper_prefix), upper_prefix)?,
         )?;
         if applied_domains.insert(filter.domain) {
             expected_prefix = multiply_ppm(expected_prefix, filter.expected_retained_ppm);
+            upper_prefix = upper_prefix.min(filter.upper_retained_ppm);
         }
     }
     Ok(cost)

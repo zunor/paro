@@ -271,6 +271,26 @@ impl MachineCalibrationBundle {
         cost.validate()?;
         Ok(cost)
     }
+
+    /// Reprice a serial-folded phase at its resolved physical task supply.
+    /// Resource work remains unchanged; only phase span and worker evidence
+    /// are replaced. Calling this twice is idempotent because `work_latency`
+    /// is the invariant serial work term.
+    pub fn rephase(
+        &self,
+        mut cost: SearchCost,
+        profile: ParallelWorkProfile,
+        max_parallel_tasks: u16,
+        output_pipeline_tasks: u16,
+    ) -> Result<SearchCost> {
+        cost.critical_path = cost.work_latency;
+        cost.max_parallel_tasks = 1;
+        cost.output_pipeline_tasks = output_pipeline_tasks.max(1);
+        let mut cost = self.apply_parallelism(cost, profile, max_parallel_tasks)?;
+        cost.output_pipeline_tasks = output_pipeline_tasks.max(1);
+        cost.validate()?;
+        Ok(cost)
+    }
 }
 
 fn validate_calibrated_cost(cost: CalibratedOpCost) -> Result<()> {

@@ -227,3 +227,114 @@ fn write_copy_to_chunk(
         )
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use std::fs;
+    use std::sync::atomic::{AtomicU64, AtomicUsize};
+    use std::thread;
+
+    use paro_common::runtime_value::Value;
+    use paro_function::copy::csv::register_csv_copy_function;
+    use paro_function::copy::{CopyFormat, CopyOptions};
+
+    use super::*;
+
+    #[test]
+    fn parallel_copy_shards_preserve_the_complete_row_domain() {
+        const WORKERS: usize = 4;
+        const ROWS_PER_WORKER: usize = 1_024;
+
+        let directory = tempfile::tempdir().expect("parallel COPY output directory");
+        let output = directory.path().join("rows.csv");
+        let copy = register_csv_copy_function()
+            .copy_to
+            .expect("CSV COPY TO implementation");
+        let mut options = CopyOptions::default();
+        options.format = CopyFormat::Csv;
+        options.per_thread_output = true;
+        let bind_data = (copy.copy_to_bind)(
+            &options,
+            &["id".to_string()],
+            &[paro_common::types::LogicalType::BigInt],
+        )
+        .expect("bind CSV COPY TO");
+        let spec = Arc::new(CopyToFileSpec {
+            copy_function: copy,
+            bind_data: Arc::from(bind_data),
+            file_path: output.to_string_lossy().into_owned(),
+            per_thread_output: true,
+            output_types: vec![paro_common::types::LogicalType::BigInt].into_boxed_slice(),
+        });
+        let global = Arc::new(CopyToSinkGlobal {
+            row_count: AtomicU64::new(0),
+            per_thread_output: true,
+            global_state: None,
+            next_file_id: AtomicUsize::new(0),
+        });
+
+        let workers = (0..WORKERS)
+            .map(|worker| {
+                let spec = Arc::clone(&spec);
+                let global = Arc::clone(&global);
+                thread::spawn(move || {
+                    let mut local = CopyToSinkLocal {
+                        local_state: (spec.copy_function.copy_to_initialize_local)(
+                            &*spec.bind_data,
+                        )
+                        .expect("initialize COPY worker"),
+                        thread_global_state: None,
+                    };
+                    let allocator = paro_common::test_utils::test_allocator();
+                    let mut chunk = Chunk::try_initialize(
+                        &[paro_common::types::LogicalType::BigInt],
+                        ROWS_PER_WORKER,
+                        allocator,
+                    )
+                    .expect("COPY input chunk");
+                    chunk.set_cardinality(ROWS_PER_WORKER);
+                    for offset in 0..ROWS_PER_WORKER {
+                        let id = worker * ROWS_PER_WORKER + offset;
+                        chunk
+                            .set_value(0, offset, &Value::BigInt(id as i64))
+                            .expect("COPY input value");
+                    }
+                    write_copy_to_chunk(&spec, &global, &mut local, &chunk)
+                        .expect("write COPY worker shard");
+                    let mut thread_global = local
+                        .thread_global_state
+                        .take()
+                        .expect("COPY worker owns a shard");
+                    (spec.copy_function.copy_to_combine)(
+                        &*spec.bind_data,
+                        &mut *thread_global,
+                        &mut *local.local_state,
+                    )
+                    .expect("combine COPY worker");
+                    (spec.copy_function.copy_to_finalize)(&*spec.bind_data, &mut *thread_global)
+                        .expect("finalize COPY worker");
+                })
+            })
+            .collect::<Vec<_>>();
+        for worker in workers {
+            worker.join().expect("COPY worker thread");
+        }
+
+        let mut shards = fs::read_dir(directory.path())
+            .expect("enumerate COPY output")
+            .map(|entry| entry.expect("COPY output entry").path())
+            .collect::<Vec<_>>();
+        shards.sort();
+        assert_eq!(shards.len(), WORKERS);
+        let mut seen = vec![false; WORKERS * ROWS_PER_WORKER];
+        for shard in shards {
+            for line in fs::read_to_string(shard).expect("read COPY shard").lines() {
+                let id = line.parse::<usize>().expect("COPY row id");
+                assert!(id < seen.len());
+                assert!(!seen[id], "COPY emitted a duplicate row");
+                seen[id] = true;
+            }
+        }
+        assert!(seen.into_iter().all(|present| present));
+    }
+}

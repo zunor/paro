@@ -183,68 +183,68 @@ impl TransformationRule for PlannerTransformationRule {
             source_output_columns,
             memo_group_holes,
             environment,
-        ) =
-            {
-                let state = self
-                    .planner_state
-                    .read()
-                    .expect("planner transform state poisoned");
-                let plan =
-                    semantic_plan::instantiate_bound_plan(ctx.memo(), &state, &binding.root)?;
-                let logical = ctx.memo().logical_expr(expr).ok_or_else(|| {
-                    paro_error::internal("planner rule lost its source expression")
-                })?;
-                let metadata = state
-                    .metadata
-                    .get(&logical.payload)
-                    .ok_or_else(|| paro_error::internal("planner rule lost its source metadata"))?;
-                let payload = state
-                    .payloads
-                    .logical
-                    .get(logical.payload.index())
-                    .ok_or_else(|| paro_error::internal("planner rule lost its source payload"))?;
-                let memo_group_holes =
-                    if matches!(self.transformation, PlannerTransformation::TopNIntroduction) {
-                        topn_input_group(&binding.root, ctx.memo(), &state)
-                            .map(|group| vec![group].into_boxed_slice())
-                    } else {
-                        None
-                    };
-                let binder = state.binder.clone().ok_or_else(|| {
-                    paro_error::internal("planner rule has no binder environment")
-                })?;
-                let enclosing_required_region_facets = ctx
-                    .memo()
-                    .optimization_context(metadata.child_context)
-                    .ok_or_else(|| {
-                        paro_error::internal("planner expression has an unknown child context")
-                    })?
-                    .required_region_facets()
-                    .to_vec();
-                (
-                    plan,
-                    payload.column_stats.clone(),
-                    metadata
-                        .required_region_facet
-                        .map(|facet| (facet, metadata.operator_type)),
-                    enclosing_required_region_facets,
-                    metadata.runtime_filter_region_facet,
-                    metadata.input_context,
-                    metadata.child_context,
-                    metadata.output_columns.clone(),
-                    memo_group_holes,
-                    PlannerRuleEnvironment {
-                        binder,
-                        bind_context: state.bind_context.clone(),
-                        session: state.session.clone().ok_or_else(|| {
-                            paro_error::internal("planner rule has no statement context")
-                        })?,
-                        cost_model: state.cost_model.clone(),
-                        budget: ctx.memo().budget().clone(),
-                        verify_enabled: state.verify_enabled,
-                    },
-                )
-            };
+        ) = {
+            let state = self
+                .planner_state
+                .read()
+                .expect("planner transform state poisoned");
+            let plan = semantic_plan::instantiate_bound_plan(ctx.memo(), &state, &binding.root)?;
+            let logical = ctx
+                .memo()
+                .logical_expr(expr)
+                .ok_or_else(|| paro_error::internal("planner rule lost its source expression"))?;
+            let metadata = state
+                .metadata
+                .get(&logical.payload)
+                .ok_or_else(|| paro_error::internal("planner rule lost its source metadata"))?;
+            let payload = state
+                .payloads
+                .logical
+                .get(logical.payload.index())
+                .ok_or_else(|| paro_error::internal("planner rule lost its source payload"))?;
+            let memo_group_holes =
+                if matches!(self.transformation, PlannerTransformation::TopNIntroduction) {
+                    topn_input_group(&binding.root, ctx.memo(), &state)
+                        .map(|group| vec![group].into_boxed_slice())
+                } else {
+                    None
+                };
+            let binder = state
+                .binder
+                .clone()
+                .ok_or_else(|| paro_error::internal("planner rule has no binder environment"))?;
+            let enclosing_required_region_facets = ctx
+                .memo()
+                .optimization_context(metadata.child_context)
+                .ok_or_else(|| {
+                    paro_error::internal("planner expression has an unknown child context")
+                })?
+                .required_region_facets()
+                .to_vec();
+            (
+                plan,
+                payload.column_stats.clone(),
+                metadata
+                    .required_region_facet
+                    .map(|facet| (facet, metadata.operator_type)),
+                enclosing_required_region_facets,
+                metadata.runtime_filter_region_facet,
+                metadata.input_context,
+                metadata.child_context,
+                metadata.output_columns.clone(),
+                memo_group_holes,
+                PlannerRuleEnvironment {
+                    binder,
+                    bind_context: state.bind_context.clone(),
+                    session: state.session.clone().ok_or_else(|| {
+                        paro_error::internal("planner rule has no statement context")
+                    })?,
+                    cost_model: state.cost_model.clone(),
+                    budget: ctx.memo().budget().clone(),
+                    verify_enabled: state.verify_enabled,
+                },
+            )
+        };
         let plans = rewrite_planner_expressions(
             self.transformation,
             plan,

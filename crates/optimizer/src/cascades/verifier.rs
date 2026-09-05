@@ -138,12 +138,13 @@ impl WinnerVerifier {
                         child_costs.push(child_winner.cost);
                         child_source_work.push(child_winner.source_work.as_ref());
                     }
-                    let recomposed = super::engine::compose_candidate_cost_with_sources(
+                    let recomposed = super::engine::compose_candidate_cost_with_sources_at(
                         winner.local_cost,
                         winner.source_filter_apply_cost,
                         &child_costs,
                         &child_source_work,
                         winner.cost_composition.clone(),
+                        memo.calibration(),
                     )?;
                     if recomposed.source_work != winner.source_work {
                         return Err(paro_error::internal(

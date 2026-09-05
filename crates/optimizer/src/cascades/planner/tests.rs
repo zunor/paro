@@ -105,7 +105,7 @@ fn calibrated_tuple_work_distinguishes_narrow_and_wide_intermediates() {
 }
 
 #[test]
-fn duration_parallelism_is_bounded_by_executable_stream_work() {
+fn non_source_width_cannot_manufacture_pipeline_tasks() {
     let facts = |rows: f64| ResolvedPlannerCostFacts {
         output_rows: CompactRange::point(rows).unwrap(),
         child_rows: vec![CompactRange::point(rows).unwrap()].into_boxed_slice(),
@@ -137,7 +137,7 @@ fn duration_parallelism_is_bounded_by_executable_stream_work() {
     );
     assert_eq!(
         super::costing::useful_parallel_tasks_for_facts(&facts(2_000_000.0), 10),
-        10
+        1
     );
 }
 
@@ -175,7 +175,7 @@ fn scan_parallelism_uses_pre_predicate_physical_work() {
 }
 
 #[test]
-fn replaceable_runtime_filter_work_uses_candidate_task_supply() {
+fn replaceable_runtime_filter_work_is_serial_until_bound_to_a_source() {
     let facts = ResolvedPlannerCostFacts {
         output_rows: CompactRange::point(10.0).unwrap(),
         child_rows: vec![
@@ -196,9 +196,8 @@ fn replaceable_runtime_filter_work_uses_candidate_task_supply() {
         topn_capacity: None,
         runtime_filter_probe_multiplicity: RuntimeFilterProbeMultiplicity::Unknown,
         runtime_filter_build_left_probe_multiplicity: RuntimeFilterProbeMultiplicity::Unknown,
-        // The replaceable term is much smaller than the input pipeline. It
-        // must nevertheless use the candidate's operating point because it
-        // is subtracted from that candidate during source attribution.
+        // The replaceable term is bound to the traced source only after child
+        // winners expose that source pipeline's task supply.
         runtime_filter_probe_source_rows: Some(CompactRange::point(20_000.0).unwrap()),
         runtime_filter_build_left_probe_source_rows: None,
         runtime_filter_probe_sources: Box::new([]),
@@ -217,11 +216,8 @@ fn replaceable_runtime_filter_work_uses_candidate_task_supply() {
     .unwrap()
     .unwrap();
 
-    assert_eq!(
-        apply.max_parallel_tasks,
-        super::costing::useful_parallel_tasks_for_facts(&facts, 10)
-    );
-    assert_eq!(apply.max_parallel_tasks, 10);
+    assert_eq!(apply.max_parallel_tasks, 1);
+    assert_eq!(apply.output_pipeline_tasks, 1);
 }
 
 #[test]

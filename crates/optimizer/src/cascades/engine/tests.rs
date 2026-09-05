@@ -31,6 +31,143 @@ use crate::cascades::rules::{
 };
 use crate::physical::ObjectiveProfile;
 
+#[test]
+fn streaming_task_supply_is_inherited_from_the_child_pipeline() {
+    let calibration = MachineCalibrationBundle::default();
+    let mut child = cost(10.0);
+    child.max_parallel_tasks = 1;
+    child.output_pipeline_tasks = 1;
+    let local = cost(100.0);
+    let resolved = resolve_task_supply(
+        local,
+        &[child],
+        &TaskSupplyContract::Streaming { input: 0 },
+        &calibration,
+    )
+    .unwrap();
+    assert_eq!(resolved.max_parallel_tasks, 1);
+    assert_eq!(resolved.output_pipeline_tasks, 1);
+    assert_eq!(resolved.work_latency.expected, 100.0);
+}
+
+#[test]
+fn build_supply_does_not_manufacture_probe_parallelism() {
+    let calibration = MachineCalibrationBundle::default();
+    let mut build = cost(10.0);
+    build.max_parallel_tasks = 8;
+    build.output_pipeline_tasks = 8;
+    let mut probe = cost(10.0);
+    probe.max_parallel_tasks = 1;
+    probe.output_pipeline_tasks = 1;
+    let resolved = resolve_task_supply(
+        cost(100.0),
+        &[probe, build],
+        &TaskSupplyContract::BuildProbe {
+            build: 1,
+            probe: 0,
+            build_work_ppm: 750_000,
+        },
+        &calibration,
+    )
+    .unwrap();
+    assert_eq!(resolved.max_parallel_tasks, 8);
+    assert_eq!(resolved.output_pipeline_tasks, 1);
+    assert_eq!(resolved.work_latency.expected, 100.0);
+}
+
+#[test]
+fn breaker_creates_only_its_declared_emit_supply() {
+    let calibration = MachineCalibrationBundle::default();
+    let mut input = cost(10.0);
+    input.max_parallel_tasks = 8;
+    input.output_pipeline_tasks = 8;
+    let resolved = resolve_task_supply(
+        cost(100.0),
+        &[input],
+        &TaskSupplyContract::Breaker {
+            input: 0,
+            output_tasks: 2,
+            profile: ParallelWorkProfile::BlockingMerge,
+        },
+        &calibration,
+    )
+    .unwrap();
+    assert_eq!(resolved.max_parallel_tasks, 8);
+    assert_eq!(resolved.output_pipeline_tasks, 2);
+    assert_eq!(resolved.work_latency.expected, 100.0);
+}
+
+#[test]
+fn task_supply_operating_points_conserve_work() {
+    let calibration = MachineCalibrationBundle::default();
+    for tasks in [1, 2, 4, 8] {
+        let resolved = resolve_task_supply(
+            cost(100.0),
+            &[],
+            &TaskSupplyContract::Source { tasks },
+            &calibration,
+        )
+        .unwrap();
+        assert_eq!(resolved.max_parallel_tasks, tasks);
+        assert_eq!(resolved.output_pipeline_tasks, tasks);
+        assert_eq!(resolved.work_latency.expected, 100.0);
+    }
+}
+
+#[test]
+fn source_filter_replacement_folds_each_source_phase_once() {
+    let calibration = MachineCalibrationBundle::default();
+    let source = WorkSourceId(91);
+    for tasks in [1, 2, 4, 8] {
+        let scan = resolve_task_supply(
+            cost(100.0),
+            &[],
+            &TaskSupplyContract::Source { tasks },
+            &calibration,
+        )
+        .unwrap();
+        let scan = compose_candidate_cost_with_sources_at(
+            scan,
+            None,
+            &[],
+            &[],
+            CostComposition::Source {
+                source,
+                source_rows: 100,
+            },
+            &calibration,
+        )
+        .unwrap();
+        let filtered = compose_candidate_cost_with_sources_at(
+            cost(20.0),
+            Some(cost(20.0)),
+            &[scan.cost],
+            &[scan.source_work.as_ref()],
+            CostComposition::SidewaysFilter {
+                overlapping_children: 0,
+                filtered_child: 0,
+                sources: Box::new([retained_source(source, 500_000, 500_000)]),
+            },
+            &calibration,
+        )
+        .unwrap();
+        let lane = &filtered.source_work[0];
+        assert_eq!(lane.phase_tasks, tasks);
+        assert_eq!(lane.cost.work_latency.expected, 50.0);
+        assert_eq!(lane.filter_apply_cost.work_latency.expected, 20.0);
+        assert_eq!(lane.phased_cost.work_latency.expected, 70.0);
+        let expected = calibration
+            .rephase(
+                lane.cost.sequential(lane.filter_apply_cost).unwrap(),
+                ParallelWorkProfile::Pipeline,
+                tasks,
+                tasks,
+            )
+            .unwrap();
+        assert_eq!(lane.phased_cost.critical_path, expected.critical_path);
+    }
+}
+
 fn schema() -> GroupSchema {
     GroupSchema::new([ColumnDesc {
         id: ColumnId(0),
@@ -148,6 +285,7 @@ fn joint_cost_proof_resolves_both_runtime_filter_build_orientations() {
             child_goals: Box::new([(first, goal), (second, goal)]),
             local_cost: SearchCost::ZERO,
             source_filter_apply_cost: None,
+            task_supply: TaskSupplyContract::Serial,
             cost_composition: CostComposition::Sequential,
             spillable: false,
             enforcer_cost_input: EnforcerCostInput::unbounded(CompactRange::point(1.0).unwrap(), 8),
@@ -650,6 +788,7 @@ impl PhysicalImplementation for LeafImplementation {
             child_goals: Box::new([]),
             local_cost: cost(score),
             source_filter_apply_cost: None,
+            task_supply: TaskSupplyContract::Serial,
             cost_composition: CostComposition::Sequential,
             spillable: false,
             enforcer_cost_input: EnforcerCostInput::unbounded(CompactRange::point(1.0)?, 8),
@@ -1104,6 +1243,7 @@ impl PhysicalImplementation for FeasibleAlternativeImplementation {
             child_goals,
             local_cost: cost(1.0),
             source_filter_apply_cost: None,
+            task_supply: TaskSupplyContract::Serial,
             cost_composition: CostComposition::Sequential,
             spillable: false,
             enforcer_cost_input: EnforcerCostInput::unbounded(CompactRange::point(1.0)?, 8),
@@ -1296,6 +1436,8 @@ fn sideways_filter_scales_work_without_weakening_resource_proofs() {
         retentions: Box::new([]),
         filters: Box::new([]),
         filter_apply_cost: SearchCost::ZERO,
+        phased_cost: child.work_only(),
+        phase_tasks: 1,
     }];
     let filtered = compose_candidate_cost_with_sources(
         SearchCost::ZERO,
@@ -1406,6 +1548,8 @@ fn sideways_filter_preserves_source_local_risk_bounds() {
             retentions: Box::new([]),
             filters: Box::new([]),
             filter_apply_cost: SearchCost::ZERO,
+            phased_cost: cost(100.0),
+            phase_tasks: 1,
         },
         SourceWork {
             source: repeated_source,
@@ -1415,6 +1559,8 @@ fn sideways_filter_preserves_source_local_risk_bounds() {
             retentions: Box::new([]),
             filters: Box::new([]),
             filter_apply_cost: SearchCost::ZERO,
+            phased_cost: cost(300.0),
+            phase_tasks: 1,
         },
     ];
     let filtered = compose_candidate_cost_with_sources(
@@ -1438,9 +1584,9 @@ fn sideways_filter_preserves_source_local_risk_bounds() {
     assert_eq!(filtered.source_work[1].cost.score.range.expected, 150.0);
     assert_eq!(filtered.source_work[1].cost.score.range.upper, 300.0);
     assert_eq!(filtered.cost.score.range.expected, 200.0);
-    // Each lane retains the full predicate-application ceiling because the
-    // source-work contract does not yet carry a hard row-share proof.
-    assert_eq!(filtered.cost.score.range.upper, 380.0);
+    // Evaluation work is partitioned by immutable source-row ownership; its
+    // upper work cannot grow merely because one source is split into lanes.
+    assert_eq!(filtered.cost.score.range.upper, 360.0);
 }
 
 #[test]
@@ -1457,6 +1603,8 @@ fn sideways_filter_degrades_to_matching_source_lanes() {
             retentions: Box::new([]),
             filters: Box::new([]),
             filter_apply_cost: SearchCost::ZERO,
+            phased_cost: cost(100.0),
+            phase_tasks: 1,
         },
         SourceWork {
             source: unrelated,
@@ -1466,6 +1614,8 @@ fn sideways_filter_degrades_to_matching_source_lanes() {
             retentions: Box::new([]),
             filters: Box::new([]),
             filter_apply_cost: SearchCost::ZERO,
+            phased_cost: cost(300.0),
+            phase_tasks: 1,
         },
     ];
     let filtered = compose_candidate_cost_with_sources(
@@ -1517,6 +1667,8 @@ fn sideways_filter_accepts_multiple_lanes_for_one_source() {
             retentions: Box::new([]),
             filters: Box::new([]),
             filter_apply_cost: SearchCost::ZERO,
+            phased_cost: cost(100.0),
+            phase_tasks: 1,
         },
         SourceWork {
             source,
@@ -1526,6 +1678,8 @@ fn sideways_filter_accepts_multiple_lanes_for_one_source() {
             retentions: Box::new([]),
             filters: Box::new([]),
             filter_apply_cost: SearchCost::ZERO,
+            phased_cost: cost(300.0),
+            phase_tasks: 1,
         },
     ];
     let filtered = compose_candidate_cost_with_sources(
@@ -1574,6 +1728,8 @@ fn sideways_filter_with_no_physical_lane_is_retained() {
         retentions: Box::new([]),
         filters: Box::new([]),
         filter_apply_cost: SearchCost::ZERO,
+        phased_cost: cost(400.0),
+        phase_tasks: 1,
     }];
     let filtered = compose_candidate_cost_with_sources(
         cost(40.0),
@@ -1939,6 +2095,7 @@ impl PhysicalImplementation for GrantTreeImplementation {
             child_goals,
             local_cost: cost(1.0),
             source_filter_apply_cost: None,
+            task_supply: TaskSupplyContract::Serial,
             cost_composition: CostComposition::Sequential,
             spillable: false,
             enforcer_cost_input: EnforcerCostInput::unbounded(CompactRange::point(1.0)?, 8),
@@ -2109,6 +2266,7 @@ impl PhysicalImplementation for SourceSensitiveAlternativeImplementation {
                 .into_boxed_slice(),
             local_cost: cost(work),
             source_filter_apply_cost: apply_cost,
+            task_supply: TaskSupplyContract::Serial,
             cost_composition: composition,
             spillable: false,
             enforcer_cost_input: EnforcerCostInput::unbounded(CompactRange::point(1.0)?, 8),
@@ -2295,6 +2453,8 @@ fn source_predicate_attribution_is_invariant_to_lane_partitioning() {
         retentions: Box::new([]),
         filters: Box::new([]),
         filter_apply_cost: SearchCost::ZERO,
+        phased_cost: cost(work),
+        phase_tasks: 1,
     };
     let composition = CostComposition::SidewaysFilter {
         overlapping_children: 0,
@@ -2421,6 +2581,7 @@ impl PhysicalImplementation for BudgetLimitedCombinationImplementation {
                 .into_boxed_slice(),
             local_cost: cost(work),
             source_filter_apply_cost: apply_cost,
+            task_supply: TaskSupplyContract::Serial,
             cost_composition: composition,
             spillable: false,
             enforcer_cost_input: EnforcerCostInput::unbounded(CompactRange::point(1.0).unwrap(), 8),

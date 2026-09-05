@@ -1266,12 +1266,13 @@ fn recompute_winner_cost(memo: &Memo, winner: &Winner) -> Result<super::engine::
         child_costs.push(child_winner.cost);
         child_source_work.push(child_winner.source_work.as_ref());
     }
-    let mut composed = super::engine::compose_candidate_cost_with_sources(
+    let mut composed = super::engine::compose_candidate_cost_with_sources_at(
         winner.local_cost,
         winner.source_filter_apply_cost,
         &child_costs,
         &child_source_work,
         winner.cost_composition.clone(),
+        memo.calibration(),
     )?;
     composed.cost =
         super::engine::constrain_composed_cost_to_grant(composed.cost, winner.enforcer_cost_input)?

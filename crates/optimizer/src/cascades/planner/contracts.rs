@@ -407,6 +407,126 @@ pub(super) fn planner_cost_composition(
     }
 }
 
+pub(super) fn planner_task_supply_contract(
+    metadata: &PlannerOperatorMetadata,
+    flavor: PhysicalImplementationFlavor,
+    facts: &ResolvedPlannerCostFacts,
+    calibration: &MachineCalibrationBundle,
+    max_concurrent_tasks: u16,
+) -> Result<TaskSupplyContract> {
+    if facts.scan_work_source.is_some() {
+        return Ok(TaskSupplyContract::Source {
+            tasks: useful_parallel_tasks_for_facts(facts, max_concurrent_tasks),
+        });
+    }
+    let output_tasks = useful_output_tasks(facts, max_concurrent_tasks);
+    let contract = match flavor {
+        PhysicalImplementationFlavor::Structural => match metadata.operator_type {
+            LogicalOperatorType::Limit | LogicalOperatorType::EmptyResult => {
+                TaskSupplyContract::Serial
+            }
+            LogicalOperatorType::LogicalUnion
+            | LogicalOperatorType::LogicalIntersect
+            | LogicalOperatorType::LogicalExcept
+            | LogicalOperatorType::Order
+            | LogicalOperatorType::TopN
+            | LogicalOperatorType::Window => TaskSupplyContract::Breaker {
+                input: 0,
+                output_tasks: 1,
+                profile: ParallelWorkProfile::BlockingMerge,
+            },
+            LogicalOperatorType::MaterializedCTE | LogicalOperatorType::Distinct => {
+                TaskSupplyContract::Breaker {
+                    input: 0,
+                    output_tasks,
+                    profile: ParallelWorkProfile::BlockingMerge,
+                }
+            }
+            _ if !facts.child_rows.is_empty() => TaskSupplyContract::Streaming { input: 0 },
+            LogicalOperatorType::GraphScan
+            | LogicalOperatorType::CTERef
+            | LogicalOperatorType::ExternalTable => TaskSupplyContract::Source {
+                tasks: output_tasks,
+            },
+            _ => TaskSupplyContract::Serial,
+        },
+        PhysicalImplementationFlavor::HashJoin
+        | PhysicalImplementationFlavor::HashJoinBuildLeft
+        | PhysicalImplementationFlavor::HashJoinBuildLeftRuntimeFilter
+        | PhysicalImplementationFlavor::HashJoinRuntimeFilter => {
+            let build_left = matches!(
+                flavor,
+                PhysicalImplementationFlavor::HashJoinBuildLeft
+                    | PhysicalImplementationFlavor::HashJoinBuildLeftRuntimeFilter
+            );
+            TaskSupplyContract::BuildProbe {
+                build: u8::from(!build_left),
+                probe: u8::from(build_left),
+                build_work_ppm: hash_join_build_work_ppm(facts, flavor, calibration)?,
+            }
+        }
+        PhysicalImplementationFlavor::HashAggregate
+        | PhysicalImplementationFlavor::PerfectHashAggregate
+        | PhysicalImplementationFlavor::PartitionAggregateWindow => TaskSupplyContract::Breaker {
+            input: 0,
+            output_tasks,
+            profile: ParallelWorkProfile::BlockingMerge,
+        },
+        PhysicalImplementationFlavor::AdaptiveSort
+        | PhysicalImplementationFlavor::HeapTopN
+        | PhysicalImplementationFlavor::Window
+        | PhysicalImplementationFlavor::SortRangeJoin
+        | PhysicalImplementationFlavor::ClassicIeJoin => TaskSupplyContract::Breaker {
+            input: 0,
+            output_tasks: 1,
+            profile: ParallelWorkProfile::BlockingMerge,
+        },
+        PhysicalImplementationFlavor::NestedLoopJoin
+        | PhysicalImplementationFlavor::CrossProductInMemory
+        | PhysicalImplementationFlavor::CrossProductExternal => TaskSupplyContract::BuildProbe {
+            build: 1,
+            probe: 0,
+            build_work_ppm: build_probe_byte_work_ppm(facts),
+        },
+        PhysicalImplementationFlavor::SingletonAggregateProjection
+        | PhysicalImplementationFlavor::SearchProvider => TaskSupplyContract::Serial,
+    };
+    Ok(contract)
+}
+
+fn build_probe_byte_work_ppm(facts: &ResolvedPlannerCostFacts) -> u32 {
+    let build = facts
+        .child_rows
+        .get(1)
+        .map(|rows| {
+            estimated_bytes(
+                rows.expected,
+                facts.child_row_widths.get(1).copied().unwrap_or(1),
+            )
+        })
+        .unwrap_or(0);
+    let probe = facts
+        .child_rows
+        .first()
+        .map(|rows| {
+            estimated_bytes(
+                rows.expected,
+                facts.child_row_widths.first().copied().unwrap_or(1),
+            )
+        })
+        .unwrap_or(0)
+        .saturating_add(estimated_bytes(
+            facts.output_rows.expected,
+            facts.output_row_width,
+        ));
+    let total = build.saturating_add(probe);
+    if total == 0 {
+        0
+    } else {
+        ((build as f64 / total as f64 * 1_000_000.0).round() as u32).min(1_000_000)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::{retained_ratio_ppm, retained_upper_ratio_ppm};

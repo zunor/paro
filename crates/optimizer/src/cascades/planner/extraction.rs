@@ -164,12 +164,13 @@ pub(super) fn extract_planner_tree(
                     child_source_work.push(child_winner.source_work.as_ref());
                 }
                 let base_cost = crate::cascades::engine::constrain_composed_cost_to_grant(
-                    crate::cascades::engine::compose_candidate_cost_with_sources(
+                    crate::cascades::engine::compose_candidate_cost_with_sources_at(
                         winner.local_cost,
                         winner.source_filter_apply_cost,
                         &child_costs,
                         &child_source_work,
                         winner.cost_composition.clone(),
+                        memo.calibration(),
                     )?
                     .cost,
                     winner.enforcer_cost_input,

@@ -253,6 +253,10 @@ pub struct SearchCost {
     pub work_latency: CompactRange,
     /// Physical worker capacity used to derive this operating point.
     pub max_parallel_tasks: u16,
+    /// Executable task supply carried by this plan's output pipeline. Unlike
+    /// `max_parallel_tasks`, this is inherited through streaming operators and
+    /// changes only at a source, exchange, or pipeline breaker.
+    pub output_pipeline_tasks: u16,
     pub critical_path: CompactRange,
     /// Memory that cannot be reclaimed or spilled while this operator is
     /// active. This is the hard quantity that composes additively across
@@ -285,6 +289,7 @@ impl SearchCost {
         resources_risk_upper: [0.0; RESOURCE_DIMS],
         work_latency: CompactRange::ZERO,
         max_parallel_tasks: 1,
+        output_pipeline_tasks: 1,
         critical_path: CompactRange::ZERO,
         non_revocable_memory_upper: 0,
         minimum_memory_bytes: 0,
@@ -331,9 +336,9 @@ impl SearchCost {
         {
             return Err(paro_error::internal("search cost interval is inverted"));
         }
-        if self.max_parallel_tasks == 0 {
+        if self.max_parallel_tasks == 0 || self.output_pipeline_tasks == 0 {
             return Err(paro_error::internal(
-                "search cost declares zero physical worker capacity",
+                "search cost declares zero physical worker or pipeline capacity",
             ));
         }
         if self.non_revocable_memory_upper > self.peak_memory_upper {
@@ -415,6 +420,7 @@ impl SearchCost {
             resources_risk_upper,
             work_latency: self.work_latency.checked_add(other.work_latency)?,
             max_parallel_tasks: self.max_parallel_tasks.max(other.max_parallel_tasks),
+            output_pipeline_tasks: other.output_pipeline_tasks,
             critical_path: self.critical_path.checked_add(other.critical_path)?,
             non_revocable_memory_upper: self
                 .non_revocable_memory_upper
