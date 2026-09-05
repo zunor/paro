@@ -26,8 +26,8 @@ use crate::cascades::properties::{
 };
 use crate::cascades::region::RegionArtifactDependencyContract;
 use crate::cascades::rules::{
-    EquivalentExpression, GrantDependencyDescriptor, PhysicalImplementation, RulePromise,
-    SidewaysFilterSource, TransformationRule,
+    DomainProofId, EquivalentExpression, EvaluationOccurrenceId, GrantDependencyDescriptor,
+    PhysicalImplementation, RulePromise, SidewaysFilterSource, TransformationRule,
 };
 use crate::physical::ObjectiveProfile;
 
@@ -88,11 +88,16 @@ fn retained_source(
 ) -> SidewaysFilterSource {
     SidewaysFilterSource {
         source,
-        proof: Fingerprint(
+        domain: DomainProofId(Fingerprint(
             ((source.0 as u128) << 64)
                 | ((u128::from(expected_retained_ppm)) << 32)
                 | u128::from(upper_retained_ppm),
-        ),
+        )),
+        evaluation: EvaluationOccurrenceId(Fingerprint(
+            ((source.0 as u128) << 64)
+                | ((u128::from(expected_retained_ppm)) << 32)
+                | u128::from(upper_retained_ppm),
+        )),
         expected_retained_ppm,
         upper_retained_ppm,
     }
@@ -1285,6 +1290,7 @@ fn sideways_filter_scales_work_without_weakening_resource_proofs() {
     };
     let source_work = [SourceWork {
         source,
+        source_rows: 100,
         base_cost: child.work_only(),
         cost: child.work_only(),
         retentions: Box::new([]),
@@ -1324,6 +1330,7 @@ fn sideways_filter_attributes_one_predicate_cost_across_union_sources() {
         &[],
         CostComposition::Source {
             source: left_source,
+            source_rows: 100,
         },
     )
     .unwrap();
@@ -1334,6 +1341,7 @@ fn sideways_filter_attributes_one_predicate_cost_across_union_sources() {
         &[],
         CostComposition::Source {
             source: right_source,
+            source_rows: 300,
         },
     )
     .unwrap();
@@ -1392,6 +1400,7 @@ fn sideways_filter_preserves_source_local_risk_bounds() {
     let lanes = [
         SourceWork {
             source: unique_source,
+            source_rows: 100,
             base_cost: cost(100.0),
             cost: cost(100.0),
             retentions: Box::new([]),
@@ -1400,6 +1409,7 @@ fn sideways_filter_preserves_source_local_risk_bounds() {
         },
         SourceWork {
             source: repeated_source,
+            source_rows: 300,
             base_cost: cost(300.0),
             cost: cost(300.0),
             retentions: Box::new([]),
@@ -1441,6 +1451,7 @@ fn sideways_filter_degrades_to_matching_source_lanes() {
     let lanes = [
         SourceWork {
             source: matched,
+            source_rows: 100,
             base_cost: cost(100.0),
             cost: cost(100.0),
             retentions: Box::new([]),
@@ -1449,6 +1460,7 @@ fn sideways_filter_degrades_to_matching_source_lanes() {
         },
         SourceWork {
             source: unrelated,
+            source_rows: 300,
             base_cost: cost(300.0),
             cost: cost(300.0),
             retentions: Box::new([]),
@@ -1499,6 +1511,7 @@ fn sideways_filter_accepts_multiple_lanes_for_one_source() {
     let lanes = [
         SourceWork {
             source,
+            source_rows: 100,
             base_cost: cost(100.0),
             cost: cost(100.0),
             retentions: Box::new([]),
@@ -1507,6 +1520,7 @@ fn sideways_filter_accepts_multiple_lanes_for_one_source() {
         },
         SourceWork {
             source,
+            source_rows: 300,
             base_cost: cost(300.0),
             cost: cost(300.0),
             retentions: Box::new([]),
@@ -1554,6 +1568,7 @@ fn sideways_filter_with_no_physical_lane_is_retained() {
     let unrelated = WorkSourceId(23);
     let lanes = [SourceWork {
         source: unrelated,
+        source_rows: 400,
         base_cost: cost(400.0),
         cost: cost(400.0),
         retentions: Box::new([]),
@@ -1585,7 +1600,10 @@ fn repeated_sideways_filters_scale_only_the_matching_source_lane() {
         None,
         &[],
         &[],
-        CostComposition::Source { source },
+        CostComposition::Source {
+            source,
+            source_rows: 100,
+        },
     )
     .unwrap();
     let independent_parent = compose_candidate_cost_with_sources(
@@ -1634,7 +1652,10 @@ fn exact_survivor_bounds_are_absolute_and_proof_idempotent() {
         None,
         &[],
         &[],
-        CostComposition::Source { source },
+        CostComposition::Source {
+            source,
+            source_rows: 1_000,
+        },
     )
     .unwrap();
     let first_proof = retained_source(source, 100_000, 100_000);
@@ -1661,7 +1682,8 @@ fn exact_survivor_bounds_are_absolute_and_proof_idempotent() {
     let correlated = apply(
         &first,
         SidewaysFilterSource {
-            proof: Fingerprint(first_proof.proof.0 + 1),
+            domain: DomainProofId(Fingerprint(first_proof.domain.0 .0 + 1)),
+            evaluation: EvaluationOccurrenceId(Fingerprint(first_proof.evaluation.0 .0 + 1)),
             ..first_proof
         },
     );
@@ -1677,7 +1699,10 @@ fn source_predicate_cost_is_reordered_by_runtime_selectivity() {
         None,
         &[],
         &[],
-        CostComposition::Source { source },
+        CostComposition::Source {
+            source,
+            source_rows: 100,
+        },
     )
     .unwrap();
     let first = compose_candidate_cost_with_sources(
@@ -2039,8 +2064,22 @@ impl PhysicalImplementation for SourceSensitiveAlternativeImplementation {
         let (work, composition, apply_cost) = match logical.key.operator.0 {
             201 => (100.0, CostComposition::Sequential, None),
             202 => (0.0, CostComposition::Sequential, None),
-            211 => (10.0, CostComposition::Source { source }, None),
-            212 => (120.0, CostComposition::Source { source }, None),
+            211 => (
+                10.0,
+                CostComposition::Source {
+                    source,
+                    source_rows: 10,
+                },
+                None,
+            ),
+            212 => (
+                120.0,
+                CostComposition::Source {
+                    source,
+                    source_rows: 120,
+                },
+                None,
+            ),
             203 => (
                 0.0,
                 CostComposition::SidewaysFilter {
@@ -2145,5 +2184,158 @@ fn parent_costs_every_source_sensitive_child_frontier_candidate() {
             .candidates()
             .len(),
         2
+    );
+}
+
+#[test]
+fn source_predicate_costs_commute_across_join_composition() {
+    let left_source = WorkSourceId(800);
+    let right_source = WorkSourceId(801);
+    let scan = |source| {
+        compose_candidate_cost_with_sources(
+            cost(100.0),
+            None,
+            &[],
+            &[],
+            CostComposition::Source {
+                source,
+                source_rows: 1_000,
+            },
+        )
+        .unwrap()
+    };
+    let left = scan(left_source);
+    let right = scan(right_source);
+    let union = compose_candidate_cost_with_sources(
+        SearchCost::ZERO,
+        None,
+        &[left.cost, right.cost],
+        &[left.source_work.as_ref(), right.source_work.as_ref()],
+        CostComposition::Sequential,
+    )
+    .unwrap();
+    let apply = |input: &ComposedCost, id: u128, left: u32, right: u32| {
+        let source = |work_source, retained| SidewaysFilterSource {
+            source: work_source,
+            domain: DomainProofId(Fingerprint(id + work_source.0 as u128)),
+            evaluation: EvaluationOccurrenceId(Fingerprint(id)),
+            expected_retained_ppm: retained,
+            upper_retained_ppm: 1_000_000,
+        };
+        compose_candidate_cost_with_sources(
+            cost(100.0),
+            Some(cost(100.0)),
+            &[input.cost],
+            &[input.source_work.as_ref()],
+            CostComposition::SidewaysFilter {
+                overlapping_children: 0,
+                filtered_child: 0,
+                sources: Box::new([source(left_source, left), source(right_source, right)]),
+            },
+        )
+        .unwrap()
+    };
+    let ab = apply(&apply(&union, 11, 100_000, 500_000), 12, 200_000, 800_000);
+    let ba = apply(&apply(&union, 12, 200_000, 800_000), 11, 100_000, 500_000);
+    assert_eq!(ab.source_work, ba.source_work);
+    assert!((ab.cost.score.range.expected - ba.cost.score.range.expected).abs() < 1e-9);
+}
+
+#[test]
+fn duplicate_domain_proof_does_not_shrink_later_evaluation_domain() {
+    let source = WorkSourceId(900);
+    let scan = compose_candidate_cost_with_sources(
+        cost(1_000.0),
+        None,
+        &[],
+        &[],
+        CostComposition::Source {
+            source,
+            source_rows: 1_000,
+        },
+    )
+    .unwrap();
+    let apply = |input: &ComposedCost, proof: u128, occurrence: u128, retained: u32| {
+        compose_candidate_cost_with_sources(
+            cost(1_000.0),
+            Some(cost(1_000.0)),
+            &[input.cost],
+            &[input.source_work.as_ref()],
+            CostComposition::SidewaysFilter {
+                overlapping_children: 0,
+                filtered_child: 0,
+                sources: Box::new([SidewaysFilterSource {
+                    source,
+                    domain: DomainProofId(Fingerprint(proof)),
+                    evaluation: EvaluationOccurrenceId(Fingerprint(occurrence)),
+                    expected_retained_ppm: retained,
+                    upper_retained_ppm: 1_000_000,
+                }]),
+            },
+        )
+        .unwrap()
+    };
+    let first = apply(&scan, 21, 101, 100_000);
+    let repeated = apply(&first, 21, 102, 100_000);
+    let final_filter = apply(&repeated, 22, 103, 1_000_000);
+    let lane = &final_filter.source_work[0];
+    assert_eq!(lane.retentions.len(), 2);
+    assert_eq!(lane.filters.len(), 3);
+    assert_eq!(lane.filter_apply_cost.score.range.expected, 1_200.0);
+}
+
+#[test]
+fn source_predicate_attribution_is_invariant_to_lane_partitioning() {
+    let source = WorkSourceId(901);
+    let lane = |rows, work| SourceWork {
+        source,
+        source_rows: rows,
+        base_cost: cost(work),
+        cost: cost(work),
+        retentions: Box::new([]),
+        filters: Box::new([]),
+        filter_apply_cost: SearchCost::ZERO,
+    };
+    let composition = CostComposition::SidewaysFilter {
+        overlapping_children: 0,
+        filtered_child: 0,
+        sources: Box::new([SidewaysFilterSource {
+            source,
+            domain: DomainProofId(Fingerprint(31)),
+            evaluation: EvaluationOccurrenceId(Fingerprint(131)),
+            expected_retained_ppm: 250_000,
+            upper_retained_ppm: 1_000_000,
+        }]),
+    };
+    let merged_lanes = [lane(1_000, 100.0)];
+    let split_lanes = [lane(250, 25.0), lane(750, 75.0)];
+    let merged = compose_candidate_cost_with_sources(
+        cost(20.0),
+        Some(cost(20.0)),
+        &[cost(100.0)],
+        &[&merged_lanes],
+        composition.clone(),
+    )
+    .unwrap();
+    let split = compose_candidate_cost_with_sources(
+        cost(20.0),
+        Some(cost(20.0)),
+        &[cost(100.0)],
+        &[&split_lanes],
+        composition,
+    )
+    .unwrap();
+    assert!((merged.cost.score.range.expected - split.cost.score.range.expected).abs() < 1e-9);
+    assert_eq!(
+        merged
+            .source_work
+            .iter()
+            .map(|lane| lane.filter_apply_cost.score.range.expected)
+            .sum::<f64>(),
+        split
+            .source_work
+            .iter()
+            .map(|lane| lane.filter_apply_cost.score.range.expected)
+            .sum::<f64>()
     );
 }

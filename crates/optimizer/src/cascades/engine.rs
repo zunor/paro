@@ -1603,7 +1603,11 @@ pub(crate) fn compose_candidate_cost_with_sources(
             source_work: Box::new([]),
         });
     }
-    if let CostComposition::Source { source } = &composition {
+    if let CostComposition::Source {
+        source,
+        source_rows,
+    } = &composition
+    {
         if !child_costs.is_empty() {
             return Err(paro_error::internal(
                 "a base source-work lane unexpectedly has child pipelines",
@@ -1614,6 +1618,7 @@ pub(crate) fn compose_candidate_cost_with_sources(
             cost,
             source_work: Box::new([SourceWork {
                 source: *source,
+                source_rows: *source_rows,
                 base_cost: local_cost.work_only(),
                 cost: local_cost.work_only(),
                 retentions: Box::new([]),
@@ -1640,11 +1645,11 @@ pub(crate) fn compose_candidate_cost_with_sources(
                         )
                     })?;
                     cost = cost.replace_work(full_apply_cost, SearchCost::ZERO)?;
-                    let matching_work = lanes
+                    let matching_rows = lanes
                         .iter()
                         .filter(|lane| sources.iter().any(|source| source.source == lane.source))
-                        .map(|lane| lane.cost.score.range.expected.max(0.0))
-                        .sum::<f64>();
+                        .map(|lane| lane.source_rows)
+                        .sum::<u64>();
                     // Predicate evaluation is one operator-local cost before it
                     // is attributed to source lanes. Allocate every ppm exactly
                     // once so splitting a UNION into more branches cannot create
@@ -1658,9 +1663,9 @@ pub(crate) fn compose_candidate_cost_with_sources(
                         let remaining_lanes = matching_lanes - apply_shares.len();
                         let share = if remaining_lanes == 1 {
                             unallocated_ppm
-                        } else if matching_work > 0.0 {
-                            ((lane.cost.score.range.expected.max(0.0) / matching_work * 1_000_000.0)
-                                .floor() as u32)
+                        } else if matching_rows > 0 {
+                            ((lane.source_rows as f64 / matching_rows as f64 * 1_000_000.0).floor()
+                                as u32)
                                 .min(unallocated_ppm)
                         } else {
                             unallocated_ppm
@@ -1692,24 +1697,33 @@ pub(crate) fn compose_candidate_cost_with_sources(
                             let mut retentions = lane.retentions.to_vec();
                             if !retentions
                                 .iter()
-                                .any(|retention| retention.proof == source.proof)
+                                .any(|retention| retention.domain == source.domain)
                             {
                                 retentions.push(SourceRetentionProof {
-                                    proof: source.proof,
+                                    domain: source.domain,
                                     expected_retained_ppm: source.expected_retained_ppm,
                                     upper_retained_ppm: source.upper_retained_ppm,
                                 });
                             }
+                            retentions.sort_by_key(|retention| retention.domain);
                             let retained = retained_source_cost(lane.base_cost, &retentions)?;
                             child = child.replace_work(lane.cost, retained)?;
                             lane.cost = retained;
                             lane.retentions = retentions.into_boxed_slice();
                             let old_apply_cost = lane.filter_apply_cost;
                             let mut filters = lane.filters.to_vec();
-                            filters.push(SourceFilterWork {
-                                expected_retained_ppm: source.expected_retained_ppm,
-                                full_apply_cost: full_apply_cost.work_only(),
-                            });
+                            if !filters
+                                .iter()
+                                .any(|filter| filter.evaluation == source.evaluation)
+                            {
+                                filters.push(SourceFilterWork {
+                                    domain: source.domain,
+                                    evaluation: source.evaluation,
+                                    expected_retained_ppm: source.expected_retained_ppm,
+                                    full_apply_cost: full_apply_cost.work_only(),
+                                });
+                            }
+                            filters.sort_by_key(|filter| filter.evaluation);
                             let new_apply_cost = ordered_source_filter_cost(&filters)?;
                             child = child.replace_work(old_apply_cost, new_apply_cost)?;
                             lane.filters = filters.into_boxed_slice();
@@ -1833,8 +1847,15 @@ fn ordered_source_filter_cost(filters: &[SourceFilterWork]) -> Result<SearchCost
     }
 
     let mut ordered = filters.to_vec();
-    ordered.sort_by_key(|filter| filter.expected_retained_ppm);
+    ordered.sort_by_key(|filter| {
+        (
+            filter.expected_retained_ppm,
+            filter.domain,
+            filter.evaluation,
+        )
+    });
     let mut expected_prefix = SCALE as u32;
+    let mut applied_domains = BTreeSet::new();
     let mut cost = SearchCost::ZERO;
     for filter in ordered {
         cost = cost.sequential(
@@ -1842,7 +1863,9 @@ fn ordered_source_filter_cost(filters: &[SourceFilterWork]) -> Result<SearchCost
                 .full_apply_cost
                 .retain_work(expected_prefix, SCALE as u32)?,
         )?;
-        expected_prefix = multiply_ppm(expected_prefix, filter.expected_retained_ppm);
+        if applied_domains.insert(filter.domain) {
+            expected_prefix = multiply_ppm(expected_prefix, filter.expected_retained_ppm);
+        }
     }
     Ok(cost)
 }

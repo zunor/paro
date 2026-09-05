@@ -279,6 +279,19 @@ pub enum GrantDependencyDescriptor {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub struct WorkSourceId(pub usize);
 
+/// Stable identity of one survivor-domain proof. It names the build domain,
+/// probe-key mapping, equality/NULL semantics, and statistics snapshot used
+/// to derive a source-local retention bound. Reusing the same proof cannot
+/// shrink the source domain twice.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub struct DomainProofId(pub Fingerprint);
+
+/// Stable identity of one physical predicate evaluation. This is deliberately
+/// separate from [`DomainProofId`]: two operators may evaluate the same domain
+/// proof, while replaying one operator during search must not charge it twice.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub struct EvaluationOccurrenceId(pub Fingerprint);
+
 /// Source-local work retention derived for one runtime-filter installation.
 /// Keeping the ratio beside its source preserves a unique-key proof on one
 /// lineage even when another lineage of the same join key is non-unique.
@@ -288,14 +301,16 @@ pub struct SidewaysFilterSource {
     /// Identity of the exact domain proof. Replaying the same proof is
     /// idempotent; different identities are conservatively correlated unless
     /// a future joint-domain proof explicitly relates them.
-    pub proof: Fingerprint,
+    pub domain: DomainProofId,
+    /// Physical evaluation which publishes `domain` to this source.
+    pub evaluation: EvaluationOccurrenceId,
     pub expected_retained_ppm: u32,
     pub upper_retained_ppm: u32,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct SourceRetentionProof {
-    pub proof: Fingerprint,
+    pub domain: DomainProofId,
     pub expected_retained_ppm: u32,
     /// Absolute survivor bound relative to the immutable base source, never a
     /// conditional selectivity relative to the preceding filter.
@@ -307,6 +322,8 @@ pub struct SourceRetentionProof {
 /// remain on the complete winner and are never weakened by selectivity.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct SourceFilterWork {
+    pub domain: DomainProofId,
+    pub evaluation: EvaluationOccurrenceId,
     pub expected_retained_ppm: u32,
     /// Cost of evaluating this predicate against the unfiltered source. Joint
     /// composition orders and scales these costs by preceding predicates.
@@ -316,6 +333,10 @@ pub struct SourceFilterWork {
 #[derive(Debug, Clone, PartialEq)]
 pub struct SourceWork {
     pub source: WorkSourceId,
+    /// Immutable number of rows in this physical source lane before runtime
+    /// predicates. Predicate work is attributed by this row domain, never by
+    /// byte cost or by a cost already reduced by an earlier predicate.
+    pub source_rows: u64,
     /// Work of the unfiltered source. Every survivor proof is interpreted in
     /// this immutable domain so correlated filters cannot multiply hard bounds.
     pub base_cost: SearchCost,
@@ -345,6 +366,7 @@ pub enum CostComposition {
     /// lane without guessing which of their own local work is source-driven.
     Source {
         source: WorkSourceId,
+        source_rows: u64,
     },
     Sequential,
     RetainedState {

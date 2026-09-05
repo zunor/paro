@@ -4,6 +4,7 @@
 //! Logical/physical property contracts, grant sensitivity, and guarantees.
 
 use super::*;
+use crate::cascades::rules::{DomainProofId, EvaluationOccurrenceId};
 #[cfg(test)]
 use crate::physical::MemoryCompletion;
 
@@ -250,7 +251,8 @@ fn runtime_filter_source_retentions(
     sources: &[ResolvedRuntimeFilterSource],
     build_domain: CompactRange,
     exactness: RuntimeFilterExactness,
-    proof: Fingerprint,
+    semantic_proof: Fingerprint,
+    evaluation: Fingerprint,
 ) -> Result<Box<[SidewaysFilterSource]>> {
     sources
         .iter()
@@ -266,9 +268,14 @@ fn runtime_filter_source_retentions(
                 source.rows
             };
             let expected_retained_ppm = retained_ratio_ppm(retained.expected, source.rows.expected);
+            let mut domain = StableFingerprintBuilder::default();
+            domain.write_bytes(b"paro.runtime-filter-domain.v1");
+            domain.write_fingerprint(semantic_proof);
+            domain.write_u64(source.source.0 as u64);
             Ok(SidewaysFilterSource {
                 source: source.source,
-                proof,
+                domain: DomainProofId(domain.finish()),
+                evaluation: EvaluationOccurrenceId(evaluation),
                 expected_retained_ppm,
                 upper_retained_ppm: retained_upper_ratio_ppm(
                     retained.upper,
@@ -292,7 +299,17 @@ pub(super) fn planner_cost_composition(
         return Ok(CostComposition::LocalOnly);
     }
     if let Some(source) = facts.scan_work_source {
-        return Ok(CostComposition::Source { source });
+        let source_rows = facts.scan_physical_rows.unwrap_or_else(|| {
+            facts
+                .output_rows
+                .expected
+                .ceil()
+                .clamp(0.0, u64::MAX as f64) as u64
+        });
+        return Ok(CostComposition::Source {
+            source,
+            source_rows,
+        });
     }
     let overlapping_children = match flavor {
         PhysicalImplementationFlavor::HashJoin
@@ -340,6 +357,7 @@ pub(super) fn planner_cost_composition(
                 &facts.runtime_filter_build_left_probe_sources,
                 build_domain,
                 exactness,
+                metadata.operator_fingerprint,
                 physical_fingerprint,
             )?,
         });
@@ -375,6 +393,7 @@ pub(super) fn planner_cost_composition(
                 &facts.runtime_filter_probe_sources,
                 build_domain,
                 exactness,
+                metadata.operator_fingerprint,
                 physical_fingerprint,
             )?,
         });
