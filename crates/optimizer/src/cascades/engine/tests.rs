@@ -976,6 +976,57 @@ fn zero_rule_budget_precedes_dependency_observation() {
 }
 
 #[test]
+fn saturated_transformation_cursor_invalidates_when_an_observed_frontier_advances() {
+    let (mut engine, owner, _) = engine(8);
+    let expression = engine.memo.group(owner).unwrap().logical_exprs()[0];
+    let observed = engine.memo_mut().create_group(
+        schema(),
+        LogicalProperties::default(),
+        GroupCardinality::default(),
+    );
+    engine
+        .memo_mut()
+        .insert_logical(
+            observed,
+            LogicalExprKey {
+                operator: Fingerprint(40),
+                scalars: Box::new([]),
+                children: Box::new([]),
+            },
+            LogicalPayloadId(40),
+            EquivalenceProof::Initial,
+        )
+        .unwrap();
+    let task = TransformationTaskId {
+        group: owner,
+        expression,
+        rule: RuleId(5),
+    };
+    let read = PatternRead::from_group(engine.memo(), observed).unwrap();
+
+    engine
+        .seed_transformation_observation(task, &[read])
+        .unwrap();
+    assert!(engine.transformation_observation_is_current(task).unwrap());
+
+    engine
+        .memo_mut()
+        .insert_logical(
+            observed,
+            LogicalExprKey {
+                operator: Fingerprint(41),
+                scalars: Box::new([]),
+                children: Box::new([]),
+            },
+            LogicalPayloadId(41),
+            EquivalenceProof::Normalization { rule: RuleId(41) },
+        )
+        .unwrap();
+
+    assert!(!engine.transformation_observation_is_current(task).unwrap());
+}
+
+#[test]
 fn failed_optional_transformation_rolls_back_and_keeps_baseline() {
     let mut budget = super::super::budget::SearchBudget::default();
     budget.disable_transformation(RuleId(5));

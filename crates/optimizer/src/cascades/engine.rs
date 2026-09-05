@@ -77,7 +77,7 @@ struct TaskKey {
 struct TransformationInsertion {
     groups: BTreeSet<GroupId>,
     properties: Vec<(GroupId, LogicalProperties, GroupCardinality)>,
-    expressions: usize,
+    expressions: Vec<(GroupId, LogicalExprId)>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
@@ -417,6 +417,15 @@ impl CascadesEngine {
             {
                 continue;
             }
+            // A task produced by this same rule inherits the exact read cursor
+            // of the binding which produced it. Avoid rebuilding its pattern
+            // closure until one of those reads advances. This is an
+            // incremental-work cursor, not a provenance match guard: any
+            // relevant child/fact revision invalidates it and makes the new
+            // expression eligible for ordinary matching.
+            if self.transformation_observation_is_current(task_id)? {
+                continue;
+            }
             let binding_set = {
                 let rule_impl = self
                     .registry
@@ -579,7 +588,7 @@ impl CascadesEngine {
                 let insertion = (|| -> Result<TransformationInsertion> {
                     let mut inserted_groups = BTreeSet::new();
                     let mut inserted_properties = Vec::new();
-                    let mut inserted_expressions = 0usize;
+                    let mut inserted_expressions = Vec::new();
                     for output in outputs {
                         validate_transformation_proof(rule, expression, &output.proof)?;
                         let target = context.memo().canonical_group(output.target_group);
@@ -604,7 +613,7 @@ impl CascadesEngine {
                             .group(target)
                             .map(|group| group.logical_exprs().len())
                             .unwrap_or(0);
-                        context.memo_mut().insert_logical(
+                        let inserted = context.memo_mut().insert_logical(
                             target,
                             output.key,
                             output.payload,
@@ -618,7 +627,7 @@ impl CascadesEngine {
                             .len();
                         if after > before {
                             inserted_groups.insert(target);
-                            inserted_expressions += after - before;
+                            inserted_expressions.push((target, inserted));
                             inserted_properties.push((
                                 target,
                                 output.logical_properties,
@@ -669,7 +678,7 @@ impl CascadesEngine {
                     release_transformation_output_reservations(
                         &mut self.memo,
                         group,
-                        &output_events[inserted_expressions.min(output_events.len())..],
+                        &output_events[inserted_expressions.len().min(output_events.len())..],
                     )?;
                     for (target, properties, cardinality) in inserted_properties {
                         let group = self.memo.group_mut(target).ok_or_else(|| {
@@ -680,7 +689,32 @@ impl CascadesEngine {
                             std::mem::take(&mut group.cardinality).canonical_with(cardinality);
                     }
                     *self.effective_rule_insertions.entry(rule).or_default() +=
-                        u64::try_from(inserted_expressions).unwrap_or(u64::MAX);
+                        u64::try_from(inserted_expressions.len()).unwrap_or(u64::MAX);
+                    let saturates_binding = self
+                        .registry
+                        .transformation(rule)
+                        .ok_or_else(|| paro_error::internal("transformation disappeared"))?
+                        .output_saturates_observed_binding();
+                    if saturates_binding {
+                        let mut inherited_reads = binding_set.reads.to_vec();
+                        inherited_reads.extend(
+                            appended_groups
+                                .iter()
+                                .copied()
+                                .map(|group| PatternRead::from_group(&self.memo, group))
+                                .collect::<Result<Vec<_>>>()?,
+                        );
+                        for (owner, inserted) in inserted_expressions {
+                            self.seed_transformation_observation(
+                                TransformationTaskId {
+                                    group: owner,
+                                    expression: inserted,
+                                    rule,
+                                },
+                                &inherited_reads,
+                            )?;
+                        }
+                    }
                     inserted_groups.extend(appended_groups);
                 }
                 for target in inserted_groups {
@@ -811,6 +845,31 @@ impl CascadesEngine {
             return Ok(None);
         }
 
+        let version = transformation_dependency_fingerprint(&dependencies);
+        self.seed_transformation_observation(task, &dependencies)?;
+        Ok(Some(version))
+    }
+
+    fn transformation_observation_is_current(&self, task: TransformationTaskId) -> Result<bool> {
+        let Some(observed) = self.transformation_observations.get(&task) else {
+            return Ok(false);
+        };
+        for read in observed {
+            if PatternRead::from_group(&self.memo, read.group)? != *read {
+                return Ok(false);
+            }
+        }
+        Ok(true)
+    }
+
+    fn seed_transformation_observation(
+        &mut self,
+        task: TransformationTaskId,
+        reads: &[PatternRead],
+    ) -> Result<()> {
+        let mut dependencies = reads.to_vec();
+        dependencies.sort_unstable();
+        dependencies.dedup();
         if let Some(previous) = self.transformation_observations.get(&task) {
             for read in previous {
                 if let Some(subscribers) = self.transformation_subscribers.get_mut(&read.group) {
@@ -824,10 +883,9 @@ impl CascadesEngine {
                 .or_default()
                 .insert(task);
         }
-        let version = transformation_dependency_fingerprint(&dependencies);
         self.transformation_observations
             .insert(task, dependencies.into_boxed_slice());
-        Ok(Some(version))
+        Ok(())
     }
 
     fn enumerate_implementations(&mut self, group: GroupId, goal: OptimizationGoal) -> Result<()> {

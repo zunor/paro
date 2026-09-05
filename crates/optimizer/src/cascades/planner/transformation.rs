@@ -130,6 +130,14 @@ impl TransformationRule for PlannerTransformationRule {
         }
     }
 
+    fn output_saturates_observed_binding(&self) -> bool {
+        matches!(
+            self.transformation,
+            PlannerTransformation::JoinRegionEnumeration
+                | PlannerTransformation::AggregateDimensionDeferral
+        )
+    }
+
     fn matches_root(&self, expr: &crate::cascades::memo::LogicalExpr) -> bool {
         let state = self
             .planner_state

@@ -345,6 +345,15 @@ pub trait TransformationRule: Send + Sync {
         1
     }
 
+    /// Whether one successful binding publishes that rule's complete output
+    /// frontier for the observed read set. The engine may seed the produced
+    /// expression with the same read cursor, but must invalidate it whenever
+    /// any observed frontier or fact advances. This is an incremental-work
+    /// contract, not an equivalence/provenance predicate.
+    fn output_saturates_observed_binding(&self) -> bool {
+        false
+    }
+
     fn promise(&self, _expr: &LogicalExpr, _ctx: &RuleContext<'_>) -> RulePromise {
         RulePromise::NORMAL
     }
