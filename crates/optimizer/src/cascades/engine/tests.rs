@@ -27,7 +27,8 @@ use crate::cascades::properties::{
 use crate::cascades::region::RegionArtifactDependencyContract;
 use crate::cascades::rules::{
     DomainProofId, EquivalentExpression, EvaluationOccurrenceId, GrantDependencyDescriptor,
-    PhysicalImplementation, RulePromise, SidewaysFilterSource, TransformationRule,
+    PatternBinding, PatternBindingSet, PatternEnumerationCompletion, PhysicalImplementation,
+    RulePromise, SidewaysFilterSource, TransformationBudgetClass, TransformationRule,
 };
 use crate::physical::ObjectiveProfile;
 
@@ -360,6 +361,72 @@ impl TransformationRule for AddEquivalent {
                 rule: self.id(),
                 source: expr,
                 premise: Fingerprint(77),
+            },
+        }]
+        .into_boxed_slice())
+    }
+}
+
+struct EnumerateTwoCompositionBindings;
+
+impl TransformationRule for EnumerateTwoCompositionBindings {
+    fn id(&self) -> RuleId {
+        RuleId(22)
+    }
+
+    fn matches_root(&self, expr: &super::super::memo::LogicalExpr) -> bool {
+        expr.key.operator == Fingerprint(10)
+    }
+
+    fn budget_class(&self) -> TransformationBudgetClass {
+        TransformationBudgetClass::Composition
+    }
+
+    fn matches(&self, expr: &super::super::memo::LogicalExpr, _: &RuleContext<'_>) -> bool {
+        self.matches_root(expr)
+    }
+
+    fn bindings(&self, expr: LogicalExprId, ctx: &RuleContext<'_>) -> Result<PatternBindingSet> {
+        let logical = ctx.memo.logical_expr(expr).unwrap();
+        let root = PatternBinding::root_only(ctx.group, expr, logical).root;
+        Ok(PatternBindingSet {
+            bindings: vec![
+                PatternBinding {
+                    root: root.clone(),
+                    fingerprint: Fingerprint(220),
+                },
+                PatternBinding {
+                    root,
+                    fingerprint: Fingerprint(221),
+                },
+            ]
+            .into_boxed_slice(),
+            reads: Box::new([]),
+            work_units: 3,
+            work_dimension: BudgetDimension::CompositionRuleWorkPerGroup,
+            completion: PatternEnumerationCompletion::Complete,
+        })
+    }
+
+    fn apply(
+        &self,
+        expr: LogicalExprId,
+        ctx: &mut TransformContext<'_>,
+    ) -> Result<Box<[EquivalentExpression]>> {
+        Ok(vec![EquivalentExpression {
+            target_group: ctx.group(),
+            key: LogicalExprKey {
+                operator: Fingerprint(11),
+                scalars: Box::new([]),
+                children: Box::new([]),
+            },
+            payload: LogicalPayloadId(22),
+            logical_properties: LogicalProperties::default(),
+            cardinality: GroupCardinality::default(),
+            proof: EquivalenceProof::Transformation {
+                rule: self.id(),
+                source: expr,
+                premise: Fingerprint(220),
             },
         }]
         .into_boxed_slice())
@@ -973,6 +1040,76 @@ fn zero_rule_budget_precedes_dependency_observation() {
 
     assert!(engine.transformation_observations.is_empty());
     assert!(engine.transformation_subscribers.is_empty());
+}
+
+#[test]
+fn binding_enumeration_work_is_charged_once_in_its_declared_pool() {
+    let mut budget = super::super::budget::SearchBudget::default();
+    budget.disable_transformation(RuleId(5));
+    budget.max_rule_work_units_per_group = 0;
+    budget.max_rule_firings_per_group = 0;
+    budget.max_optional_logical_exprs_per_group = 0;
+    budget.max_composition_rule_work_units_per_group = 3;
+    budget.max_composition_rule_firings_per_group = 2;
+    budget.max_optional_composition_logical_exprs_per_group = 2;
+    let (mut engine, group, _) = engine_with_budget(budget);
+    engine
+        .registry
+        .register_transformation(EnumerateTwoCompositionBindings)
+        .unwrap();
+
+    engine.explore_transformations().unwrap();
+
+    let group_ref = engine.memo.group(group).unwrap();
+    assert!(group_ref.logical_exprs().iter().any(|expression| {
+        engine
+            .memo
+            .logical_expr(*expression)
+            .is_some_and(|logical| logical.key.operator == Fingerprint(11))
+    }));
+    assert_eq!(
+        group_ref.ledger.consumed(BudgetDimension::RuleWorkPerGroup),
+        0
+    );
+    assert_eq!(
+        group_ref.ledger.consumed(BudgetDimension::RuleFirePerGroup),
+        0
+    );
+    assert_eq!(
+        group_ref
+            .ledger
+            .consumed(BudgetDimension::LogicalExprPerGroup),
+        0
+    );
+    assert_eq!(
+        group_ref
+            .ledger
+            .consumed(BudgetDimension::CompositionRuleWorkPerGroup),
+        3,
+        "one matcher frontier costs three units regardless of its two bindings"
+    );
+    assert_eq!(
+        group_ref
+            .ledger
+            .exhaustion_events()
+            .filter(|(dimension, _)| { *dimension == BudgetDimension::CompositionRuleWorkPerGroup })
+            .count(),
+        0,
+        "a second binding must not repay the matcher frontier"
+    );
+    assert_eq!(
+        group_ref
+            .ledger
+            .consumed(BudgetDimension::CompositionRuleFirePerGroup),
+        2
+    );
+    assert_eq!(
+        group_ref
+            .ledger
+            .consumed(BudgetDimension::CompositionLogicalExprPerGroup),
+        1,
+        "the duplicate second output releases its composition reservation"
+    );
 }
 
 #[test]

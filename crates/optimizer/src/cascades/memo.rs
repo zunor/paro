@@ -587,6 +587,8 @@ pub struct Memo {
     budget: SearchBudget,
     calibration: Arc<MachineCalibrationBundle>,
     regions: RegionForest,
+    global_ledger: SearchLedger,
+    optional_group_sequence: u64,
 }
 
 #[derive(Debug, Clone)]
@@ -606,6 +608,7 @@ pub(crate) struct TransformationSavepoint {
 impl Memo {
     pub fn new(budget: SearchBudget) -> Self {
         let root_context = OptimizationContext::default();
+        let global_ledger = SearchLedger::new(budget.clone());
         Self {
             groups: Vec::new(),
             parents: Vec::new(),
@@ -625,6 +628,8 @@ impl Memo {
             budget,
             calibration: Arc::new(MachineCalibrationBundle::default()),
             regions: RegionForest::default(),
+            global_ledger,
+            optional_group_sequence: 0,
         }
     }
 
@@ -729,13 +734,19 @@ impl Memo {
     /// fingerprint and must invoke this before physical recipes are built.
     pub fn upsert_region_facet(
         &mut self,
-        mut facet: RegionFacet,
+        facet: RegionFacet,
     ) -> Result<Box<[super::ids::Fingerprint]>> {
-        facet.scope = facet
-            .scope
-            .iter()
-            .map(|group| self.canonical_group(*group))
-            .collect();
+        self.upsert_region_facets(std::iter::once(facet))
+    }
+
+    /// Apply one staging transaction's complete facet delta and normalize the
+    /// forest once. A transformed subtree may publish many runtime-filter and
+    /// sharing facets; normalizing after each individual shell turns one Memo
+    /// write into a sequence of increasingly expensive full-forest rebuilds.
+    pub fn upsert_region_facets(
+        &mut self,
+        pending: impl IntoIterator<Item = RegionFacet>,
+    ) -> Result<Box<[super::ids::Fingerprint]>> {
         let mut facets = self
             .regions
             .nodes
@@ -743,27 +754,42 @@ impl Memo {
             .flat_map(|region| region.facets.iter().cloned())
             .map(|facet| (facet.fingerprint, facet))
             .collect::<BTreeMap<_, _>>();
-        match facets.get_mut(&facet.fingerprint) {
-            Some(existing) => {
-                if existing.kind != facet.kind
-                    || existing.criticality != facet.criticality
-                    || existing.scope_contract != facet.scope_contract
-                {
-                    return Err(paro_error::internal(
-                        "planning facet fingerprint changed its contract",
-                    ));
+        let mut changed = false;
+        for mut facet in pending {
+            facet.scope = facet
+                .scope
+                .iter()
+                .map(|group| self.canonical_group(*group))
+                .collect();
+            match facets.get_mut(&facet.fingerprint) {
+                Some(existing) => {
+                    if existing.kind != facet.kind
+                        || existing.criticality != facet.criticality
+                        || existing.scope_contract != facet.scope_contract
+                    {
+                        return Err(paro_error::internal(
+                            "planning facet fingerprint changed its contract",
+                        ));
+                    }
+                    // Priority is a scheduling hint, not facet identity. The
+                    // fingerprint intentionally excludes it, so equivalent
+                    // expressions that rediscover the same capability merge
+                    // at the strongest priority.
+                    if existing.priority > facet.priority || !facet.scope.is_subset(&existing.scope)
+                    {
+                        existing.priority = existing.priority.min(facet.priority);
+                        existing.scope.extend(facet.scope);
+                        changed = true;
+                    }
                 }
-                // Priority is a scheduling hint, not facet identity. The
-                // fingerprint intentionally excludes it, so equivalent
-                // expressions that rediscover the same capability merge at
-                // the strongest (smallest) priority instead of becoming an
-                // order-dependent contract error.
-                existing.priority = existing.priority.min(facet.priority);
-                existing.scope.extend(facet.scope);
+                None => {
+                    facets.insert(facet.fingerprint, facet);
+                    changed = true;
+                }
             }
-            None => {
-                facets.insert(facet.fingerprint, facet);
-            }
+        }
+        if !changed {
+            return Ok(self.regions.dropped_optional_facets.clone());
         }
         let previously_dropped = self
             .regions
@@ -810,6 +836,31 @@ impl Memo {
         });
         self.parents.push(id);
         id
+    }
+
+    /// Create a group owned by optional transformation search. The admission
+    /// is query-global and intentionally survives a transformation rollback:
+    /// allocating and then discarding a staged subtree still consumed planner
+    /// work and must not manufacture fresh credit.
+    pub(crate) fn create_optional_group(
+        &mut self,
+        dimension: BudgetDimension,
+        schema: GroupSchema,
+        logical_properties: LogicalProperties,
+        cardinality: GroupCardinality,
+    ) -> Result<GroupId> {
+        let mut event = StableFingerprintBuilder::default();
+        event.write_bytes(b"paro.optional-group-allocation.v1");
+        event.write_u64(self.optional_group_sequence);
+        self.optional_group_sequence = self.optional_group_sequence.saturating_add(1);
+        if self.global_ledger.admit_optional(dimension, event.finish())
+            == super::budget::BudgetDecision::Exhausted
+        {
+            return Err(paro_error::internal(
+                "optional transformation group budget exhausted",
+            ));
+        }
+        Ok(self.create_group(schema, logical_properties, cardinality))
     }
 
     pub fn canonical_group(&self, mut id: GroupId) -> GroupId {
@@ -918,6 +969,9 @@ impl Memo {
 
     pub fn exhaustion_counts(&self) -> BTreeMap<BudgetDimension, u64> {
         let mut counts = BTreeMap::new();
+        for (dimension, _) in self.global_ledger.exhaustion_events() {
+            *counts.entry(*dimension).or_default() += 1;
+        }
         for group in self.groups() {
             for (dimension, _) in group.ledger.exhaustion_events() {
                 *counts.entry(*dimension).or_default() += 1;

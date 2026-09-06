@@ -10,11 +10,15 @@ use super::ids::{Fingerprint, RuleId};
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum BudgetDimension {
     Group,
+    CompositionGroup,
     LogicalExprPerGroup,
+    CompositionLogicalExprPerGroup,
     PhysicalExprPerGroup,
     InterestingGoalPerGroup,
     RuleFirePerGroup,
+    CompositionRuleFirePerGroup,
     RuleWorkPerGroup,
+    CompositionRuleWorkPerGroup,
     ChildFrontierCombination,
     JoinConnectedPair,
     GraphFrontier,
@@ -32,11 +36,15 @@ impl BudgetDimension {
     pub const fn stable_name(self) -> &'static str {
         match self {
             Self::Group => "group",
+            Self::CompositionGroup => "composition_group",
             Self::LogicalExprPerGroup => "logical_expr_per_group",
+            Self::CompositionLogicalExprPerGroup => "composition_logical_expr_per_group",
             Self::PhysicalExprPerGroup => "physical_expr_per_group",
             Self::InterestingGoalPerGroup => "interesting_goal_per_group",
             Self::RuleFirePerGroup => "rule_fire_per_group",
+            Self::CompositionRuleFirePerGroup => "composition_rule_fire_per_group",
             Self::RuleWorkPerGroup => "rule_work_per_group",
+            Self::CompositionRuleWorkPerGroup => "composition_rule_work_per_group",
             Self::ChildFrontierCombination => "child_frontier_combination",
             Self::JoinConnectedPair => "join_connected_pair",
             Self::GraphFrontier => "graph_frontier",
@@ -59,14 +67,30 @@ pub struct SearchBudget {
     /// cannot be disabled through this set.
     pub disabled_transformation_rules: BTreeSet<RuleId>,
     pub max_optional_groups: u32,
+    /// Reserved query-global groups for alternatives that combine already
+    /// published child frontiers. Local expansion cannot consume this pool,
+    /// so a bounded search can still form a parent candidate after reaching
+    /// the ordinary group ceiling.
+    pub max_optional_composition_groups: u32,
     pub max_optional_logical_exprs_per_group: u32,
+    /// Root alternatives reserved for rules which combine child frontiers.
+    /// Local rewrites cannot strand a bounded parent composition after they
+    /// fill the ordinary logical-expression frontier.
+    pub max_optional_composition_logical_exprs_per_group: u32,
     pub max_optional_physical_exprs_per_group: u32,
     pub max_optional_interesting_goals_per_group: u32,
     pub max_rule_firings_per_group: u32,
+    /// Fire credits reserved for bindings across independent child
+    /// frontiers. A composition binding has its own semantic event identity
+    /// and must not compete with local rewrites of the same root group.
+    pub max_composition_rule_firings_per_group: u32,
     /// Maximum number of logical group visits performed by optional rule
     /// materialization for one target group. This bounds legacy whole-region
     /// rules until each is expressed entirely as local Memo operands.
     pub max_rule_work_units_per_group: u32,
+    /// Work reserved for parent rules which combine already-published child
+    /// alternatives. Descendant expansion cannot starve this pool.
+    pub max_composition_rule_work_units_per_group: u32,
     /// Additional child-frontier combinations costed for a group. The
     /// selected-child baseline is mandatory and does not consume this credit.
     pub max_child_frontier_combinations_per_group: u32,
@@ -94,12 +118,21 @@ impl Default for SearchBudget {
     fn default() -> Self {
         Self {
             disabled_transformation_rules: BTreeSet::new(),
-            max_optional_groups: 4_096,
+            // Optional groups are query-global, unlike the per-owner
+            // expression frontiers below. A bounded local rewrite should add
+            // shells, not clone complete trees; 512 leaves ample composition
+            // space while providing a real planner-memory ceiling if a rule
+            // violates that contract.
+            max_optional_groups: 512,
+            max_optional_composition_groups: 512,
             max_optional_logical_exprs_per_group: 64,
+            max_optional_composition_logical_exprs_per_group: 32,
             max_optional_physical_exprs_per_group: 64,
             max_optional_interesting_goals_per_group: 16,
             max_rule_firings_per_group: 256,
+            max_composition_rule_firings_per_group: 32,
             max_rule_work_units_per_group: 65_536,
+            max_composition_rule_work_units_per_group: 65_536,
             max_child_frontier_combinations_per_group: 4_096,
             max_join_connected_pairs: 65_536,
             max_join_exact_relations: 12,
@@ -152,13 +185,23 @@ impl SearchBudget {
     pub fn optional_limit(&self, dimension: BudgetDimension) -> u32 {
         match dimension {
             BudgetDimension::Group => self.max_optional_groups,
+            BudgetDimension::CompositionGroup => self.max_optional_composition_groups,
             BudgetDimension::LogicalExprPerGroup => self.max_optional_logical_exprs_per_group,
+            BudgetDimension::CompositionLogicalExprPerGroup => {
+                self.max_optional_composition_logical_exprs_per_group
+            }
             BudgetDimension::PhysicalExprPerGroup => self.max_optional_physical_exprs_per_group,
             BudgetDimension::InterestingGoalPerGroup => {
                 self.max_optional_interesting_goals_per_group
             }
             BudgetDimension::RuleFirePerGroup => self.max_rule_firings_per_group,
+            BudgetDimension::CompositionRuleFirePerGroup => {
+                self.max_composition_rule_firings_per_group
+            }
             BudgetDimension::RuleWorkPerGroup => self.max_rule_work_units_per_group,
+            BudgetDimension::CompositionRuleWorkPerGroup => {
+                self.max_composition_rule_work_units_per_group
+            }
             BudgetDimension::ChildFrontierCombination => {
                 self.max_child_frontier_combinations_per_group
             }

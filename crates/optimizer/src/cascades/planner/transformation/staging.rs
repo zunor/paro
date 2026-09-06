@@ -26,6 +26,7 @@ pub(super) struct StagingRequest {
 pub(super) struct StagingTarget {
     pub(super) group: GroupId,
     pub(super) rule: RuleId,
+    pub(super) budget_class: TransformationBudgetClass,
     pub(super) input_context: OptimizationContextId,
     pub(super) child_context: OptimizationContextId,
     pub(super) refined_cardinality_kind: Option<CardinalityRecipeKind>,
@@ -49,6 +50,7 @@ pub(super) fn stage_transformed_expression(
             StagingTarget {
                 group: target,
                 rule,
+                budget_class,
                 input_context,
                 child_context,
                 refined_cardinality_kind,
@@ -72,6 +74,7 @@ pub(super) fn stage_transformed_expression(
         column_stats: &'a Arc<HashMap<ColumnBinding, Arc<ColumnStatistics>>>,
         search_context: Option<&'a crate::context::OptimizationContext>,
         rule: RuleId,
+        group_budget: BudgetDimension,
     }
 
     struct StagingSession<'a> {
@@ -437,7 +440,12 @@ pub(super) fn stage_transformed_expression(
             }
             target
         } else {
-            memo.create_group(schema, logical_properties.clone(), cardinality.clone())
+            memo.create_optional_group(
+                options.group_budget,
+                schema,
+                logical_properties.clone(),
+                cardinality.clone(),
+            )?
         };
         let region_scope = PlannerRegionScope::new(
             group,
@@ -705,6 +713,7 @@ pub(super) fn stage_transformed_expression(
                 column_stats: &column_stats,
                 search_context: search_context.as_ref(),
                 rule,
+                group_budget: budget_class.group_dimension(),
             },
             pending_runtime_filter_facets: Vec::new(),
         };
@@ -726,6 +735,11 @@ pub(super) fn stage_transformed_expression(
     let Some(staged) = staged else {
         return Ok(None);
     };
+    let mut region_facets = Vec::with_capacity(
+        extended_required_region_facets
+            .len()
+            .saturating_add(pending_runtime_filter_facets.len()),
+    );
     for fingerprint in extended_required_region_facets {
         let mut facet = memo
             .regions()
@@ -746,16 +760,19 @@ pub(super) fn stage_transformed_expression(
             ));
         }
         facet.scope.extend(scope);
-        let dropped = memo.upsert_region_facet(facet)?;
-        disable_dropped_runtime_filter_facets(state, &dropped)?;
+        region_facets.push(facet);
     }
     // Optional facets created inside a transformed mandatory region are
     // normalized only after that region owns its complete rewritten scope.
     // Publishing them during recursive staging would compare them with the
     // stale pre-transformation scope and permanently drop otherwise nested
     // runtime filters as an apparent oversized overlap.
-    for facet in pending_runtime_filter_facets {
-        let dropped = memo.upsert_region_facet(facet)?;
+    region_facets.extend(pending_runtime_filter_facets);
+    if !region_facets.is_empty() {
+        if let Some(session) = &state.session {
+            session.cancellation.check()?;
+        }
+        let dropped = memo.upsert_region_facets(region_facets)?;
         disable_dropped_runtime_filter_facets(state, &dropped)?;
     }
     Ok(Some(staged))
@@ -883,6 +900,7 @@ mod tests {
                             target: StagingTarget {
                                 group: root,
                                 rule: RuleId(999),
+                                budget_class: TransformationBudgetClass::Local,
                                 input_context: OptimizationContextId(1),
                                 child_context: OptimizationContextId(1),
                                 refined_cardinality_kind: None,
@@ -948,6 +966,7 @@ mod tests {
                             target: StagingTarget {
                                 group: root,
                                 rule: JOIN_REGION_ENUMERATION_RULE,
+                                budget_class: TransformationBudgetClass::Local,
                                 input_context: OptimizationContextId(0),
                                 child_context: OptimizationContextId(0),
                                 refined_cardinality_kind: Some(

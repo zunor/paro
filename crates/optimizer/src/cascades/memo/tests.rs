@@ -6,6 +6,7 @@
 use paro_common::types::LogicalType;
 
 use super::*;
+use crate::cascades::budget::BudgetDecision;
 use crate::cascades::column::{ColumnDesc, ColumnOrigin, ColumnVisibility};
 use crate::cascades::cost::{CompactRange, ScoreSummary};
 use crate::cascades::properties::{
@@ -854,6 +855,186 @@ fn equivalent_region_facets_merge_their_best_scheduling_priority() {
         .find(|facet| facet.fingerprint == fingerprint)
         .unwrap();
     assert_eq!(facet.priority, 1_003);
+}
+
+#[test]
+fn repeated_region_facet_upsert_is_allocation_free() {
+    use super::super::region::{FacetCriticality, RegionFacet, RegionFacetKind};
+
+    let mut memo = Memo::new(SearchBudget::default());
+    let group = memo.create_group(
+        schema(1),
+        LogicalProperties::default(),
+        GroupCardinality::default(),
+    );
+    let facet = RegionFacet {
+        fingerprint: Fingerprint(92),
+        kind: RegionFacetKind::RuntimeFilter,
+        criticality: FacetCriticality::Optional,
+        priority: 1_003,
+        scope_contract: super::super::region::RegionScopeContract::OwnerWithImmediateInputs,
+        scope: std::iter::once(group).collect(),
+    };
+    memo.upsert_region_facet(facet.clone()).unwrap();
+    let nodes = memo.regions().nodes.as_ptr();
+    memo.upsert_region_facet(facet).unwrap();
+    assert_eq!(memo.regions().nodes.as_ptr(), nodes);
+}
+
+#[test]
+fn region_facet_batch_matches_individual_normalization() {
+    use super::super::region::{FacetCriticality, RegionFacet, RegionFacetKind};
+
+    fn memo_with_groups() -> (Memo, [GroupId; 3]) {
+        let mut memo = Memo::new(SearchBudget::default());
+        let groups = std::array::from_fn(|_| {
+            memo.create_group(
+                schema(1),
+                LogicalProperties::default(),
+                GroupCardinality::default(),
+            )
+        });
+        (memo, groups)
+    }
+    fn facets(groups: [GroupId; 3]) -> Vec<RegionFacet> {
+        [[groups[0], groups[1]], [groups[1], groups[2]]]
+            .into_iter()
+            .enumerate()
+            .map(|(index, scope)| RegionFacet {
+                fingerprint: Fingerprint(100 + index as u128),
+                kind: RegionFacetKind::RuntimeFilter,
+                criticality: FacetCriticality::Optional,
+                priority: 1_003,
+                scope_contract: super::super::region::RegionScopeContract::OwnerWithImmediateInputs,
+                scope: scope.into_iter().collect(),
+            })
+            .collect()
+    }
+
+    let (mut individual, individual_groups) = memo_with_groups();
+    for facet in facets(individual_groups) {
+        individual.upsert_region_facet(facet).unwrap();
+    }
+    let (mut batched, batched_groups) = memo_with_groups();
+    batched
+        .upsert_region_facets(facets(batched_groups))
+        .unwrap();
+    assert_eq!(individual.regions(), batched.regions());
+}
+
+#[test]
+fn optional_group_budgets_are_query_global_isolated_and_observable() {
+    let mut budget = SearchBudget::default();
+    budget.max_optional_groups = 1;
+    budget.max_optional_composition_groups = 1;
+    let mut memo = Memo::new(budget);
+    memo.create_optional_group(
+        BudgetDimension::Group,
+        schema(1),
+        LogicalProperties::default(),
+        GroupCardinality::default(),
+    )
+    .unwrap();
+    assert!(memo
+        .create_optional_group(
+            BudgetDimension::Group,
+            schema(1),
+            LogicalProperties::default(),
+            GroupCardinality::default(),
+        )
+        .is_err());
+    assert_eq!(
+        memo.exhaustion_counts().get(&BudgetDimension::Group),
+        Some(&1)
+    );
+    memo.create_optional_group(
+        BudgetDimension::CompositionGroup,
+        schema(1),
+        LogicalProperties::default(),
+        GroupCardinality::default(),
+    )
+    .expect("local expansion must not consume the composition reserve");
+    assert!(memo
+        .create_optional_group(
+            BudgetDimension::CompositionGroup,
+            schema(1),
+            LogicalProperties::default(),
+            GroupCardinality::default(),
+        )
+        .is_err());
+    assert_eq!(
+        memo.exhaustion_counts()
+            .get(&BudgetDimension::CompositionGroup),
+        Some(&1)
+    );
+}
+
+#[test]
+fn composition_rule_work_is_isolated_from_descendant_expansion() {
+    let mut budget = SearchBudget::default();
+    budget.max_rule_work_units_per_group = 1;
+    budget.max_composition_rule_work_units_per_group = 1;
+    let mut memo = Memo::new(budget);
+    let group = memo.create_group(
+        schema(1),
+        LogicalProperties::default(),
+        GroupCardinality::default(),
+    );
+    let ledger = &mut memo.group_mut(group).unwrap().ledger;
+    assert_eq!(
+        ledger.admit_optional(BudgetDimension::RuleWorkPerGroup, Fingerprint(1)),
+        BudgetDecision::Allowed
+    );
+    assert_eq!(
+        ledger.admit_optional(BudgetDimension::RuleWorkPerGroup, Fingerprint(2)),
+        BudgetDecision::Exhausted
+    );
+    assert_eq!(
+        ledger.admit_optional(BudgetDimension::CompositionRuleWorkPerGroup, Fingerprint(3)),
+        BudgetDecision::Allowed
+    );
+    assert_eq!(
+        ledger.admit_optional(BudgetDimension::CompositionRuleWorkPerGroup, Fingerprint(4)),
+        BudgetDecision::Exhausted
+    );
+}
+
+#[test]
+fn composition_fire_and_output_budgets_are_isolated_from_local_rewrites() {
+    let mut budget = SearchBudget::default();
+    budget.max_rule_firings_per_group = 1;
+    budget.max_composition_rule_firings_per_group = 1;
+    budget.max_optional_logical_exprs_per_group = 1;
+    budget.max_optional_composition_logical_exprs_per_group = 1;
+    let mut ledger = SearchLedger::new(budget);
+
+    assert_eq!(
+        ledger.admit_optional(BudgetDimension::RuleFirePerGroup, Fingerprint(1)),
+        BudgetDecision::Allowed
+    );
+    assert_eq!(
+        ledger.admit_optional(BudgetDimension::RuleFirePerGroup, Fingerprint(2)),
+        BudgetDecision::Exhausted
+    );
+    assert_eq!(
+        ledger.admit_optional(BudgetDimension::CompositionRuleFirePerGroup, Fingerprint(3)),
+        BudgetDecision::Allowed
+    );
+    assert_eq!(
+        ledger.admit_optional(BudgetDimension::LogicalExprPerGroup, Fingerprint(4)),
+        BudgetDecision::Allowed
+    );
+    assert_eq!(
+        ledger.admit_optional(BudgetDimension::LogicalExprPerGroup, Fingerprint(5)),
+        BudgetDecision::Exhausted
+    );
+    assert_eq!(
+        ledger.admit_optional(
+            BudgetDimension::CompositionLogicalExprPerGroup,
+            Fingerprint(6)
+        ),
+        BudgetDecision::Allowed
+    );
 }
 
 #[test]

@@ -8,6 +8,7 @@ use std::sync::{Arc, RwLock};
 
 use paro_common::error::{self as paro_error, Result};
 
+use super::budget::BudgetDimension;
 use super::calibration::ParallelWorkProfile;
 use super::cost::SearchCost;
 use super::ids::{
@@ -38,6 +39,7 @@ pub const JOIN_REGION_ENUMERATION_RULE: RuleId = RuleId(10_021);
 pub const TOP_N_INTRODUCTION_RULE: RuleId = RuleId(10_022);
 pub const CTE_FILTER_PUSHDOWN_RULE: RuleId = RuleId(10_023);
 pub const CTE_PARTITIONED_MATERIALIZATION_RULE: RuleId = RuleId(10_024);
+pub const AGGREGATE_DIMENSION_SHARING_RULE: RuleId = RuleId(10_025);
 
 const TRANSFORMATION_RULE_NAMES: &[(RuleId, &str)] = &[
     (
@@ -66,6 +68,10 @@ const TRANSFORMATION_RULE_NAMES: &[(RuleId, &str)] = &[
     (
         AGGREGATE_DIMENSION_DEFERRAL_RULE,
         "aggregate_dimension_deferral",
+    ),
+    (
+        AGGREGATE_DIMENSION_SHARING_RULE,
+        "aggregate_dimension_sharing",
     ),
     (
         AGGREGATE_INPUT_MATERIALIZATION_RULE,
@@ -108,6 +114,46 @@ pub fn validate_transformation_rule_names(names: &str) -> Result<()> {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub struct RulePromise {
     pub priority: u16,
+}
+
+/// Resource class for optional logical search. A composition rule combines
+/// already-published child alternatives and therefore needs a small reserved
+/// path through every admission gate; reserving only its enumeration work or
+/// child groups still lets unrelated local rewrites strand the parent result.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TransformationBudgetClass {
+    Local,
+    Composition,
+}
+
+impl TransformationBudgetClass {
+    pub const fn group_dimension(self) -> BudgetDimension {
+        match self {
+            Self::Local => BudgetDimension::Group,
+            Self::Composition => BudgetDimension::CompositionGroup,
+        }
+    }
+
+    pub const fn output_dimension(self) -> BudgetDimension {
+        match self {
+            Self::Local => BudgetDimension::LogicalExprPerGroup,
+            Self::Composition => BudgetDimension::CompositionLogicalExprPerGroup,
+        }
+    }
+
+    pub const fn fire_dimension(self) -> BudgetDimension {
+        match self {
+            Self::Local => BudgetDimension::RuleFirePerGroup,
+            Self::Composition => BudgetDimension::CompositionRuleFirePerGroup,
+        }
+    }
+
+    pub const fn work_dimension(self) -> BudgetDimension {
+        match self {
+            Self::Local => BudgetDimension::RuleWorkPerGroup,
+            Self::Composition => BudgetDimension::CompositionRuleWorkPerGroup,
+        }
+    }
 }
 
 impl RulePromise {
@@ -197,23 +243,41 @@ impl PatternBinding {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub struct PatternRead {
     pub group: GroupId,
-    pub logical_frontier_revision: u64,
+    /// `Some` when the matcher enumerated this group's alternatives. A fixed
+    /// root expression may consume only group facts/statistics; in that case
+    /// peer root insertions must not invalidate and recursively wake the same
+    /// binding task.
+    pub logical_frontier_revision: Option<u64>,
     pub logical_fact_fingerprint: Fingerprint,
     pub statistics_snapshot_fingerprint: Fingerprint,
 }
 
 impl PatternRead {
     pub fn from_group(memo: &Memo, group: GroupId) -> Result<Self> {
+        Self::read(memo, group, true)
+    }
+
+    pub fn facts_from_group(memo: &Memo, group: GroupId) -> Result<Self> {
+        Self::read(memo, group, false)
+    }
+
+    fn read(memo: &Memo, group: GroupId, reads_frontier: bool) -> Result<Self> {
         let group = memo.canonical_group(group);
         let group_ref = memo
             .group(group)
             .ok_or_else(|| paro_error::internal("rule binding read an unknown group"))?;
         Ok(Self {
             group,
-            logical_frontier_revision: group_ref.logical_expression_version(),
+            logical_frontier_revision: reads_frontier
+                .then(|| group_ref.logical_expression_version()),
             logical_fact_fingerprint: group_ref.logical_fact_fingerprint(),
             statistics_snapshot_fingerprint: group_ref.statistics_snapshot_fingerprint(),
         })
+    }
+
+    pub fn is_current(self, memo: &Memo) -> Result<bool> {
+        let current = Self::read(memo, self.group, self.logical_frontier_revision.is_some())?;
+        Ok(current == self)
     }
 }
 
@@ -226,6 +290,10 @@ pub struct PatternBindingSet {
     /// This is deliberately distinct from `reads`: a shared DAG can have a
     /// small read set while requiring exponentially many tree operands.
     pub work_units: usize,
+    /// Ledger dimension charged for `work_units`. Parent composition rules use
+    /// an isolated pool so local expansion cannot prevent them from observing
+    /// already-published child alternatives.
+    pub work_dimension: BudgetDimension,
     pub completion: PatternEnumerationCompletion,
 }
 
@@ -366,6 +434,13 @@ pub trait TransformationRule: Send + Sync {
         RulePromise::NORMAL
     }
 
+    /// Admission class used by binding enumeration, rule firing, output
+    /// reservation, and newly staged groups. The engine applies this single
+    /// declaration to the complete optional transaction.
+    fn budget_class(&self) -> TransformationBudgetClass {
+        TransformationBudgetClass::Local
+    }
+
     fn matches(&self, expr: &LogicalExpr, ctx: &RuleContext<'_>) -> bool;
 
     /// Bind the exact alternatives consumed by this firing and return every
@@ -395,6 +470,7 @@ pub trait TransformationRule: Send + Sync {
             bindings,
             reads: reads.into_boxed_slice(),
             work_units: 1 + logical.key.children.len(),
+            work_dimension: self.budget_class().work_dimension(),
             completion: PatternEnumerationCompletion::Complete,
         })
     }

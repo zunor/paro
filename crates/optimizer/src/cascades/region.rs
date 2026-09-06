@@ -222,11 +222,13 @@ impl RegionForest {
         required.sort_by_key(facet_stable_key);
         optional.sort_by_key(facet_stable_key);
 
-        let mut working = required
-            .into_iter()
-            .map(WorkingRegion::from_facet)
-            .collect::<Vec<_>>();
-        normalize_overlaps(&mut working);
+        let mut working = required.into_iter().map(WorkingRegion::from_facet).fold(
+            Vec::new(),
+            |mut working, candidate| {
+                insert_overlap_closure(&mut working, candidate);
+                working
+            },
+        );
         if working
             .iter()
             .any(|region| region.scope.len() > mandatory_complexity_ceiling)
@@ -239,23 +241,11 @@ impl RegionForest {
         let mut dropped = Vec::new();
         for facet in optional {
             let fingerprint = facet.fingerprint;
-            let mut trial = working.clone();
-            trial.push(WorkingRegion::from_facet(facet));
-            normalize_overlaps(&mut trial);
-            let admitted_scope = trial
-                .iter()
-                .find(|region| {
-                    region
-                        .facets
-                        .iter()
-                        .any(|candidate| candidate.fingerprint == fingerprint)
-                })
-                .map(|region| region.scope.len())
-                .expect("trial must contain the optional facet");
-            if admitted_scope > max_composite_region_groups {
+            let candidate = overlap_closure(&working, WorkingRegion::from_facet(facet));
+            if candidate.region.scope.len() > max_composite_region_groups {
                 dropped.push(fingerprint);
             } else {
-                working = trial;
+                commit_overlap_closure(&mut working, candidate);
             }
         }
 
@@ -353,28 +343,54 @@ fn facet_stable_key(facet: &RegionFacet) -> (u16, Fingerprint) {
     (facet.priority, facet.fingerprint)
 }
 
-fn normalize_overlaps(regions: &mut Vec<WorkingRegion>) {
+struct OverlapClosure {
+    region: WorkingRegion,
+    merged_indices: Vec<usize>,
+}
+
+/// Compute only the connected overlap component touched by one new facet.
+/// Contained and disjoint regions remain independent, so cloning the complete
+/// forest for every optional facet is unnecessary and made normalization grow
+/// quadratically in both facets and bytes copied.
+fn overlap_closure(regions: &[WorkingRegion], mut region: WorkingRegion) -> OverlapClosure {
+    let mut merged = BTreeSet::new();
     loop {
-        let mut merge_pair = None;
-        'outer: for left in 0..regions.len() {
-            for right in (left + 1)..regions.len() {
-                if regions[left].scope == regions[right].scope
-                    || partially_overlaps(&regions[left].scope, &regions[right].scope)
-                {
-                    merge_pair = Some((left, right));
-                    break 'outer;
-                }
+        let mut changed = false;
+        for (index, candidate) in regions.iter().enumerate() {
+            if merged.contains(&index) {
+                continue;
+            }
+            if region.scope == candidate.scope
+                || partially_overlaps(&region.scope, &candidate.scope)
+            {
+                merged.insert(index);
+                region.scope.extend(candidate.scope.iter().copied());
+                region.facets.extend(candidate.facets.iter().cloned());
+                changed = true;
             }
         }
-        let Some((left, right)) = merge_pair else {
+        if !changed {
             break;
-        };
-        let mut merged = regions.remove(right);
-        regions[left].scope.extend(merged.scope);
-        regions[left].facets.append(&mut merged.facets);
-        regions[left].facets.sort_by_key(facet_stable_key);
-        regions[left].facets.dedup_by_key(|facet| facet.fingerprint);
+        }
     }
+    region.facets.sort_by_key(facet_stable_key);
+    region.facets.dedup_by_key(|facet| facet.fingerprint);
+    OverlapClosure {
+        region,
+        merged_indices: merged.into_iter().collect(),
+    }
+}
+
+fn commit_overlap_closure(regions: &mut Vec<WorkingRegion>, closure: OverlapClosure) {
+    for index in closure.merged_indices.into_iter().rev() {
+        regions.remove(index);
+    }
+    regions.push(closure.region);
+}
+
+fn insert_overlap_closure(regions: &mut Vec<WorkingRegion>, region: WorkingRegion) {
+    let closure = overlap_closure(regions, region);
+    commit_overlap_closure(regions, closure);
 }
 
 fn partially_overlaps(left: &BTreeSet<GroupId>, right: &BTreeSet<GroupId>) -> bool {
@@ -470,5 +486,68 @@ mod tests {
         let node = &forest.nodes[owner.index()];
         assert_eq!(node.scope.len(), 2);
         assert!(node.parent.is_some());
+    }
+
+    #[test]
+    fn incremental_overlap_closure_matches_batch_oracle() {
+        fn reference(regions: &mut Vec<WorkingRegion>) {
+            loop {
+                let mut pair = None;
+                'outer: for left in 0..regions.len() {
+                    for right in (left + 1)..regions.len() {
+                        if regions[left].scope == regions[right].scope
+                            || partially_overlaps(&regions[left].scope, &regions[right].scope)
+                        {
+                            pair = Some((left, right));
+                            break 'outer;
+                        }
+                    }
+                }
+                let Some((left, right)) = pair else {
+                    break;
+                };
+                let mut merged = regions.remove(right);
+                regions[left].scope.extend(merged.scope);
+                regions[left].facets.append(&mut merged.facets);
+                regions[left].facets.sort_by_key(facet_stable_key);
+                regions[left].facets.dedup_by_key(|facet| facet.fingerprint);
+            }
+        }
+
+        fn summary(mut regions: Vec<WorkingRegion>) -> Vec<(Vec<GroupId>, Vec<Fingerprint>)> {
+            let mut summary = regions
+                .drain(..)
+                .map(|region| {
+                    (
+                        region.scope.into_iter().collect(),
+                        region
+                            .facets
+                            .into_iter()
+                            .map(|facet| facet.fingerprint)
+                            .collect(),
+                    )
+                })
+                .collect::<Vec<_>>();
+            summary.sort();
+            summary
+        }
+
+        let scopes = [&[1, 2][..], &[2, 3], &[3, 4], &[5], &[1], &[4, 5]];
+        for order in [[0, 1, 2, 3, 4, 5], [5, 4, 3, 2, 1, 0], [1, 3, 5, 0, 2, 4]] {
+            let candidates = order.map(|index| {
+                WorkingRegion::from_facet(facet(
+                    index as u128 + 1,
+                    FacetCriticality::Required,
+                    scopes[index],
+                ))
+            });
+            let mut expected = candidates.to_vec();
+            reference(&mut expected);
+            let mut actual = Vec::new();
+            for candidate in candidates {
+                insert_overlap_closure(&mut actual, candidate);
+            }
+            assert_eq!(summary(actual), summary(expected));
+        }
     }
 }

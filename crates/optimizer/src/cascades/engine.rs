@@ -390,7 +390,7 @@ impl CascadesEngine {
                 expression,
                 rule,
             };
-            let root_matches = {
+            let (root_matches, budget_class) = {
                 let rule_impl = self
                     .registry
                     .transformation(rule)
@@ -398,7 +398,10 @@ impl CascadesEngine {
                 let expression_ref = self.memo.logical_expr(expression).ok_or_else(|| {
                     paro_error::internal("rule task references unknown expression")
                 })?;
-                rule_impl.matches_root(expression_ref)
+                (
+                    rule_impl.matches_root(expression_ref),
+                    rule_impl.budget_class(),
+                )
             };
             if !root_matches {
                 continue;
@@ -408,12 +411,15 @@ impl CascadesEngine {
             // explicitly disabled. Likewise, the legacy region-work budget
             // cannot admit a non-leaf expression when it is zero.
             let budget = self.memo.budget();
+            let fire_dimension = budget_class.fire_dimension();
+            let work_dimension = budget_class.work_dimension();
+            let output_dimension = budget_class.output_dimension();
             let expression_has_children = self
                 .memo
                 .logical_expr(expression)
                 .is_some_and(|expression| !expression.key.children.is_empty());
-            if budget.max_rule_firings_per_group == 0
-                || (budget.max_rule_work_units_per_group == 0 && expression_has_children)
+            if budget.optional_limit(fire_dimension) == 0
+                || (budget.optional_limit(work_dimension) == 0 && expression_has_children)
             {
                 continue;
             }
@@ -442,6 +448,11 @@ impl CascadesEngine {
             else {
                 continue;
             };
+            if binding_set.work_dimension != work_dimension {
+                return Err(paro_error::internal(
+                    "transformation binding work dimension disagrees with rule contract",
+                ));
+            }
             if let PatternEnumerationCompletion::BudgetLimited {
                 enumerated_bindings,
                 omitted_at_least,
@@ -459,7 +470,23 @@ impl CascadesEngine {
                     .group_mut(group)
                     .ok_or_else(|| paro_error::internal("pattern owner group disappeared"))?
                     .ledger
-                    .record_budget_limited(BudgetDimension::RuleWorkPerGroup, witness.finish());
+                    .record_budget_limited(binding_set.work_dimension, witness.finish());
+            }
+            // Enumeration work belongs to the observed pattern frontier, not
+            // to every binding produced from it. Charging the whole read and
+            // construction cost once per binding would make the same search
+            // exponentially more expensive as its bounded output frontier
+            // grows, and a completed no-match would incorrectly be free.
+            if !admit_transformation_work(
+                &mut self.memo,
+                group,
+                expression,
+                rule,
+                read_version,
+                binding_set.work_units,
+                binding_set.work_dimension,
+            )? {
+                continue;
             }
             if binding_set.bindings.is_empty() {
                 continue;
@@ -477,18 +504,8 @@ impl CascadesEngine {
                     .group_mut(group)
                     .ok_or_else(|| paro_error::internal("rule task references unknown group"))?
                     .ledger
-                    .admit_optional(BudgetDimension::RuleFirePerGroup, event);
+                    .admit_optional(fire_dimension, event);
                 if admitted == BudgetDecision::Exhausted {
-                    continue;
-                }
-                if !admit_transformation_work(
-                    &mut self.memo,
-                    group,
-                    expression,
-                    rule,
-                    dependency_version,
-                    binding_set.work_units,
-                )? {
                     continue;
                 }
                 // Reserve the complete bounded frontier before the rule may append
@@ -522,7 +539,7 @@ impl CascadesEngine {
                         .group_mut(group)
                         .ok_or_else(|| paro_error::internal("rule task references unknown group"))?
                         .ledger
-                        .admit_optional(BudgetDimension::LogicalExprPerGroup, event);
+                        .admit_optional(output_dimension, event);
                     if admitted == BudgetDecision::Exhausted {
                         break;
                     }
@@ -551,6 +568,7 @@ impl CascadesEngine {
                             &mut self.memo,
                             group,
                             &output_events,
+                            output_dimension,
                         )?;
                         tracing::debug!(
                             target: "paro::optimizer",
@@ -568,6 +586,7 @@ impl CascadesEngine {
                         &mut self.memo,
                         group,
                         &output_events,
+                        output_dimension,
                     )?;
                     continue;
                 }
@@ -577,6 +596,7 @@ impl CascadesEngine {
                         &mut self.memo,
                         group,
                         &output_events,
+                        output_dimension,
                     )?;
                     tracing::debug!(
                         target: "paro::optimizer",
@@ -656,6 +676,7 @@ impl CascadesEngine {
                             &mut self.memo,
                             group,
                             &output_events,
+                            output_dimension,
                         )?;
                         tracing::debug!(
                             target: "paro::optimizer",
@@ -675,6 +696,7 @@ impl CascadesEngine {
                         &mut self.memo,
                         group,
                         &output_events,
+                        output_dimension,
                     )?;
                 } else {
                     let appended_groups = context.commit()?;
@@ -682,6 +704,7 @@ impl CascadesEngine {
                         &mut self.memo,
                         group,
                         &output_events[inserted_expressions.len().min(output_events.len())..],
+                        output_dimension,
                     )?;
                     for (target, properties, cardinality) in inserted_properties {
                         let group = self.memo.group_mut(target).ok_or_else(|| {
@@ -858,7 +881,7 @@ impl CascadesEngine {
             return Ok(false);
         };
         for read in observed {
-            if PatternRead::from_group(&self.memo, read.group)? != *read {
+            if !read.is_current(&self.memo)? {
                 return Ok(false);
             }
         }
@@ -1432,13 +1455,14 @@ fn release_transformation_output_reservations(
     memo: &mut Memo,
     group: GroupId,
     events: &[Fingerprint],
+    dimension: BudgetDimension,
 ) -> Result<()> {
     let ledger = &mut memo
         .group_mut(group)
         .ok_or_else(|| paro_error::internal("rule task references unknown group"))?
         .ledger;
     for event in events {
-        ledger.release_optional_reservation(BudgetDimension::LogicalExprPerGroup, *event);
+        ledger.release_optional_reservation(dimension, *event);
     }
     Ok(())
 }
@@ -2169,11 +2193,12 @@ fn retained_source_cost(
 
 fn transformation_dependency_fingerprint(dependencies: &[PatternRead]) -> Fingerprint {
     let mut builder = StableFingerprintBuilder::default();
-    builder.write_bytes(b"paro.transformation-dependencies.v1");
+    builder.write_bytes(b"paro.transformation-dependencies.v2");
     builder.write_u64(dependencies.len() as u64);
     for read in dependencies {
         builder.write_u64(read.group.0 as u64);
-        builder.write_u64(read.logical_frontier_revision);
+        builder.write_u64(u64::from(read.logical_frontier_revision.is_some()));
+        builder.write_u64(read.logical_frontier_revision.unwrap_or_default());
         builder.write_fingerprint(read.logical_fact_fingerprint);
         builder.write_fingerprint(read.statistics_snapshot_fingerprint);
     }
@@ -2213,6 +2238,7 @@ fn admit_transformation_work(
     rule: RuleId,
     dependency_version: Fingerprint,
     work_units: usize,
+    work_dimension: BudgetDimension,
 ) -> Result<bool> {
     for ordinal in 0..work_units {
         let mut event = StableFingerprintBuilder::default();
@@ -2226,7 +2252,7 @@ fn admit_transformation_work(
             .group_mut(target)
             .ok_or_else(|| paro_error::internal("rule work target group disappeared"))?
             .ledger
-            .admit_optional(BudgetDimension::RuleWorkPerGroup, event.finish())
+            .admit_optional(work_dimension, event.finish())
             == BudgetDecision::Exhausted
         {
             return Ok(false);
@@ -2256,27 +2282,27 @@ fn validate_transformation_proof(
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
-pub(crate) enum EnforcerPhaseCost {
-    /// Requirements were already satisfied. This is the absence of a phase,
-    /// not a serial zero-work phase with its own output task domain.
-    Absent,
-    Phase(SearchCost),
+pub(crate) struct EnforcerPhaseCost {
+    /// Keep the discriminant outside `SearchCost` without boxing it. This
+    /// value is ignored when `present` is false; the explicit bit preserves
+    /// the semantic difference between no phase and a zero-work phase while
+    /// keeping candidate costing allocation-free.
+    cost: SearchCost,
+    present: bool,
 }
 
 impl EnforcerPhaseCost {
     pub(crate) fn compose_after(self, input: SearchCost) -> Result<SearchCost> {
-        match self {
-            Self::Absent => Ok(input),
-            Self::Phase(cost) => input.sequential(cost),
+        if self.present {
+            input.sequential(self.cost)
+        } else {
+            Ok(input)
         }
     }
 
     #[cfg(test)]
     pub(crate) fn phase(self) -> Option<SearchCost> {
-        match self {
-            Self::Absent => None,
-            Self::Phase(cost) => Some(cost),
-        }
+        self.present.then_some(self.cost)
     }
 }
 
@@ -2286,7 +2312,10 @@ pub(crate) fn enforcer_cost(
     calibration: &MachineCalibrationBundle,
 ) -> Result<Option<EnforcerPhaseCost>> {
     if steps.is_empty() {
-        return Ok(Some(EnforcerPhaseCost::Absent));
+        return Ok(Some(EnforcerPhaseCost {
+            cost: SearchCost::ZERO,
+            present: false,
+        }));
     }
     input.rows.checked_add(super::cost::CompactRange::ZERO)?;
     let mut work = LocalOperatorWork::default();
@@ -2346,7 +2375,10 @@ pub(crate) fn enforcer_cost(
     result.peak_memory_upper = peak_memory_upper;
     result.spill_bytes_expected = spill_bytes_expected;
     result.validate()?;
-    Ok(Some(EnforcerPhaseCost::Phase(result)))
+    Ok(Some(EnforcerPhaseCost {
+        cost: result,
+        present: true,
+    }))
 }
 
 fn scale_range(range: super::cost::CompactRange, factor: f64) -> Result<super::cost::CompactRange> {

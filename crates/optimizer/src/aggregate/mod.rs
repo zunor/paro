@@ -5,6 +5,7 @@
 
 pub mod common;
 pub mod dimension_deferral;
+pub mod dimension_sharing;
 pub mod distinct_decomposition;
 pub mod input_materialization;
 pub mod join_preaggregation;

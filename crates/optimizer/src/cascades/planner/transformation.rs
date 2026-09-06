@@ -40,6 +40,7 @@ enum PlannerTransformation {
     AggregateJoinSubsumption,
     AggregateNonNullInput,
     AggregateDimensionDeferral,
+    AggregateDimensionSharing,
     AggregateInputMaterialization,
     TopNIntroduction,
     LimitPushdown,
@@ -48,7 +49,7 @@ enum PlannerTransformation {
 }
 
 impl PlannerTransformation {
-    const ALL: [Self; 18] = [
+    const ALL: [Self; 19] = [
         Self::ExpensivePredicatePlacement,
         Self::CtePartitionedMaterialization,
         Self::CteInline,
@@ -62,6 +63,7 @@ impl PlannerTransformation {
         Self::AggregateJoinSubsumption,
         Self::AggregateNonNullInput,
         Self::AggregateDimensionDeferral,
+        Self::AggregateDimensionSharing,
         Self::AggregateInputMaterialization,
         Self::TopNIntroduction,
         Self::LimitPushdown,
@@ -84,6 +86,7 @@ impl PlannerTransformation {
             Self::AggregateJoinSubsumption => AGGREGATE_JOIN_SUBSUMPTION_RULE,
             Self::AggregateNonNullInput => AGGREGATE_NON_NULL_INPUT_RULE,
             Self::AggregateDimensionDeferral => AGGREGATE_DIMENSION_DEFERRAL_RULE,
+            Self::AggregateDimensionSharing => AGGREGATE_DIMENSION_SHARING_RULE,
             Self::AggregateInputMaterialization => AGGREGATE_INPUT_MATERIALIZATION_RULE,
             Self::TopNIntroduction => TOP_N_INTRODUCTION_RULE,
             Self::LimitPushdown => LIMIT_PUSHDOWN_RULE,
@@ -152,7 +155,35 @@ impl TransformationRule for PlannerTransformationRule {
         _expr: &crate::cascades::memo::LogicalExpr,
         _ctx: &RuleContext<'_>,
     ) -> RulePromise {
-        RulePromise::NORMAL
+        match self.transformation {
+            // Sharing-preserving producer restrictions must be explored before
+            // an inline alternative duplicates the producer.  Besides exposing
+            // the cheaper shared shape sooner, this makes the global optional
+            // group budget independent of the number of CTE references: an
+            // expansive alternative cannot consume all staging capacity before
+            // the bounded producer alternatives have been considered.
+            PlannerTransformation::CteFilterPushdown => RulePromise::HIGH,
+            // Partitioning and inlining duplicate sharing-owner structure.
+            // Explore them only after producer restriction and the ordinary
+            // local rewrites of the restricted child groups have reached the
+            // Memo, so a finite query-wide group budget cannot strand the
+            // sharing-preserving composition.
+            PlannerTransformation::CtePartitionedMaterialization
+            | PlannerTransformation::CteInline => RulePromise::LOW,
+            _ => RulePromise::NORMAL,
+        }
+    }
+
+    fn budget_class(&self) -> TransformationBudgetClass {
+        if matches!(
+            self.transformation,
+            PlannerTransformation::CtePartitionedMaterialization
+                | PlannerTransformation::AggregateDimensionSharing
+        ) {
+            TransformationBudgetClass::Composition
+        } else {
+            TransformationBudgetClass::Local
+        }
     }
 
     fn matches(&self, expr: &crate::cascades::memo::LogicalExpr, _ctx: &RuleContext<'_>) -> bool {
@@ -160,18 +191,33 @@ impl TransformationRule for PlannerTransformationRule {
     }
 
     fn bindings(&self, expr: LogicalExprId, ctx: &RuleContext<'_>) -> Result<PatternBindingSet> {
-        let cancellation = self
+        let state = self
             .planner_state
             .read()
-            .map_err(|_| paro_error::internal("planner transform state poisoned"))?
+            .map_err(|_| paro_error::internal("planner transform state poisoned"))?;
+        let cancellation = state
             .session
             .as_ref()
             .map(|session| session.cancellation.clone());
+        if matches!(
+            self.transformation,
+            PlannerTransformation::AggregateDimensionSharing
+        ) {
+            return matching::dimension_sharing_pattern_bindings(
+                ctx.group,
+                expr,
+                ctx.memo,
+                &state,
+                ctx.memo.budget(),
+                cancellation.as_ref(),
+            );
+        }
         matching::pattern_bindings(
             ctx.group,
             expr,
             ctx.memo,
             ctx.memo.budget(),
+            self.budget_class().work_dimension(),
             cancellation.as_ref(),
         )
     }
@@ -391,6 +437,7 @@ impl TransformationRule for PlannerTransformationRule {
                             target: StagingTarget {
                                 group: target_group,
                                 rule: self.id(),
+                                budget_class: self.budget_class(),
                                 input_context,
                                 child_context,
                                 refined_cardinality_kind: self
@@ -666,6 +713,19 @@ fn rewrite_planner_expression(
             if !changed {
                 return Ok(None);
             }
+            plan
+        }
+        PlannerTransformation::AggregateDimensionSharing => {
+            let (plan, changed) =
+                dimension_sharing::optimize_plan(plan, &environment.bind_context)?;
+            if !changed {
+                return Ok(None);
+            }
+            debug!(
+                target: targets::OPTIMIZER,
+                rule = AGGREGATE_DIMENSION_SHARING_RULE.0,
+                "recognized shareable aggregate dimension branches"
+            );
             plan
         }
         PlannerTransformation::AggregateInputMaterialization => {

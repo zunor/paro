@@ -22,8 +22,8 @@ use paro_storage::statistics::ColumnStatistics;
 use tracing::debug;
 
 use crate::aggregate::{
-    dimension_deferral, input_materialization, join_preaggregation, join_subsumption, late_payload,
-    non_null_inputs, post_reduction, singleton_groups,
+    dimension_deferral, dimension_sharing, input_materialization, join_preaggregation,
+    join_subsumption, late_payload, non_null_inputs, post_reduction, singleton_groups,
 };
 use crate::column::lifetime::ColumnLifetimeAnalyzer;
 use crate::column::remove_unused::RemoveUnusedColumns;
@@ -78,8 +78,9 @@ use super::rules::{
     CostComposition, EquivalentExpression, GrantDependencyDescriptor, ImplementationContext,
     ImplementationRegistry, PatternBinding, PatternBindingSet, PatternEnumerationCompletion,
     PatternOperand, PatternRead, PhysicalCandidate, PhysicalImplementation, RuleContext,
-    RulePromise, SidewaysFilterSource, TaskSupplyContract, TransformContext, TransformationRule,
-    WorkSourceId, AGGREGATE_DIMENSION_DEFERRAL_RULE, AGGREGATE_INPUT_MATERIALIZATION_RULE,
+    RulePromise, SidewaysFilterSource, TaskSupplyContract, TransformContext,
+    TransformationBudgetClass, TransformationRule, WorkSourceId, AGGREGATE_DIMENSION_DEFERRAL_RULE,
+    AGGREGATE_DIMENSION_SHARING_RULE, AGGREGATE_INPUT_MATERIALIZATION_RULE,
     AGGREGATE_JOIN_PREAGGREGATION_RULE, AGGREGATE_JOIN_SUBSUMPTION_RULE,
     AGGREGATE_NON_NULL_INPUT_RULE, AGGREGATE_POST_REDUCTION_RULE, CTE_DEMAND_PUSHDOWN_RULE,
     CTE_FILTER_PUSHDOWN_RULE, CTE_INLINE_RULE, CTE_PARTITIONED_MATERIALIZATION_RULE,
