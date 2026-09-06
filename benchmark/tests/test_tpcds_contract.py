@@ -164,6 +164,24 @@ class TpcdsResultContractTests(unittest.TestCase):
         self.assertEqual(result["samples_per_engine"], 4)
         self.assertGreater(result["hierarchical_confidence_interval_95"][0], 0)
 
+    def test_hierarchical_abba_accepts_multiple_rounds_per_process(self) -> None:
+        result = hierarchical_abba_ratio(
+            [
+                {
+                    "paro_ms": [9.0, 9.2, 9.1, 9.3, 9.0, 9.2],
+                    "duckdb_ms": [10.0, 10.1, 10.2, 10.0, 10.1, 10.2],
+                },
+                {
+                    "paro_ms": [9.5, 9.4, 9.3, 9.5, 9.4, 9.3],
+                    "duckdb_ms": [10.2, 10.0, 10.1, 10.2, 10.0, 10.1],
+                },
+            ],
+            bootstrap_samples=100,
+        )
+
+        self.assertEqual(result["process_blocks"], 2)
+        self.assertEqual(result["samples_per_engine"], 12)
+
 
 if __name__ == "__main__":
     unittest.main()

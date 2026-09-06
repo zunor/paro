@@ -37,12 +37,14 @@ the authoritative result. `EXPLAIN`-only success is not a correctness result.
 
 For a paired TPC-DS SF1 correctness and latency comparison, use
 `corpora/tpcds_compare.py`. The harness builds the tested Paro image itself and
-owns every server process. Each seeded-random ABBA block uses a fresh Paro
-server and a fresh spawned DuckDB process, applies the same thread and memory
-limits, and validates the exact result schema plus the complete row multiset
-outside every timed sample. Confidence intervals use process blocks as the
-outer resampling unit. The report records source, build, corpus, DDL, database,
-optimizer-visible key inventories, processes, and per-sample result digests.
+owns every server process. Each block uses a fresh Paro server and a fresh
+spawned DuckDB process. Within the block, configurable measurement rounds use
+independently seeded-random ABBA order, so an isolated scheduling outlier cannot
+stand in for a whole process while the process remains the outer resampling
+unit. The harness applies the same thread and memory limits and validates the
+exact result schema plus the complete row multiset outside every timed sample.
+The report records source, build, corpus, DDL, database, optimizer-visible key
+inventories, processes, round orders, and per-sample result digests.
 
 Pass `--metadata-track none` for a qualifying engine comparison. The
 `generator-declared` track remains useful for measuring Paro's best known plan,

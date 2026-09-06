@@ -72,6 +72,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--end", type=int, default=99)
     parser.add_argument("--warmups-per-process", type=int, default=1)
     parser.add_argument("--process-blocks", type=int, default=5)
+    parser.add_argument("--measurement-rounds-per-process", type=int, default=3)
     parser.add_argument("--bootstrap-samples", type=int, default=10_000)
     parser.add_argument("--random-seed", type=int, default=0)
     parser.add_argument("--statement-timeout-seconds", type=int, default=300)
@@ -340,10 +341,15 @@ def main() -> int:
     args = parse_args()
     if not 1 <= args.start <= args.end <= 99:
         raise SystemExit("query range must satisfy 1 <= start <= end <= 99")
-    if args.warmups_per_process < 1 or args.process_blocks < 2:
+    if (
+        args.warmups_per_process < 1
+        or args.process_blocks < 2
+        or args.measurement_rounds_per_process < 1
+    ):
         raise SystemExit(
             "warmups-per-process must be at least one so cached and cold-statement "
-            "latencies have distinct, auditable scopes; process-blocks must be at least two"
+            "latencies have distinct, auditable scopes; process-blocks must be at least two; "
+            "measurement-rounds-per-process must be at least one"
         )
     if args.bootstrap_samples < 100:
         raise SystemExit("bootstrap-samples must be at least 100")
@@ -357,7 +363,7 @@ def main() -> int:
         Path(__file__).with_name("tpcds_setup.py").resolve(),
     ]
     report: dict[str, Any] = {
-        "schema_version": 4,
+        "schema_version": 5,
         "corpus": "TPC-DS",
         "scale_factor": 1,
         "query_range": [args.start, args.end],
@@ -387,14 +393,20 @@ def main() -> int:
             "statement_timeout_seconds": args.statement_timeout_seconds,
             "warmups_per_process": args.warmups_per_process,
             "process_blocks": args.process_blocks,
-            "samples_per_engine": args.process_blocks * 2,
+            "measurement_rounds_per_process": args.measurement_rounds_per_process,
+            "samples_per_process_per_engine": args.measurement_rounds_per_process * 2,
+            "samples_per_engine": (
+                args.process_blocks * args.measurement_rounds_per_process * 2
+            ),
             "optimizer_verify": True,
             "timing_scope": {
                 "steady_state": "execute_fetch_and_result_metadata_after_instance_plan_cache_warmup",
                 "cold_statement": "first_statement_compile_execute_fetch_and_result_metadata",
             },
             "validation_scope": "outside_timed_region_every_sample",
-            "measurement_order": "seeded_random_ABBA_per_fresh_process_block",
+            "measurement_order": (
+                "seeded_random_ABBA_per_round_within_fresh_process_block"
+            ),
             "paro_result_format": args.paro_result_format,
             "random_seed": args.random_seed,
         },
@@ -528,31 +540,40 @@ def main() -> int:
                             duck_rows, duck_schema_sample, _ = duck_process.execute(query)
                             validate_sample("duckdb warmup", duck_rows, duck_schema_sample)
 
-                        if rng.getrandbits(1):
-                            order = ["paro", "duckdb", "duckdb", "paro"]
-                        else:
-                            order = ["duckdb", "paro", "paro", "duckdb"]
+                        round_orders = []
+                        for _ in range(args.measurement_rounds_per_process):
+                            if rng.getrandbits(1):
+                                round_orders.append(
+                                    ["paro", "duckdb", "duckdb", "paro"]
+                                )
+                            else:
+                                round_orders.append(
+                                    ["duckdb", "paro", "paro", "duckdb"]
+                                )
                         block = {
                             "block": block_number,
                             "cold_order": cold_order,
                             "cold_statement_ms": cold_statement_ms,
-                            "order": order,
+                            "measurement_round_orders": round_orders,
                             "paro_ms": [],
                             "duckdb_ms": [],
                             "paro_server": block_server.identity(),
                             "duckdb_process": duck_process.identity,
                         }
-                        for engine in order:
-                            if engine == "paro":
-                                rows, sample_schema, elapsed_ms = timed_fetch(
-                                    lambda: run_paro(paro, query, binary_result)
-                                )
-                            else:
-                                rows, sample_schema, elapsed_ms = duck_process.execute(query)
-                            digest, _ = validate_sample(engine, rows, sample_schema)
-                            samples[engine].append(elapsed_ms)
-                            sample_digests[engine].append(digest)
-                            block[f"{engine}_ms"].append(round(elapsed_ms, 6))
+                        for order in round_orders:
+                            for engine in order:
+                                if engine == "paro":
+                                    rows, sample_schema, elapsed_ms = timed_fetch(
+                                        lambda: run_paro(paro, query, binary_result)
+                                    )
+                                else:
+                                    rows, sample_schema, elapsed_ms = duck_process.execute(
+                                        query
+                                    )
+                                digest, _ = validate_sample(engine, rows, sample_schema)
+                                samples[engine].append(elapsed_ms)
+                                sample_digests[engine].append(digest)
+                                block[f"{engine}_ms"].append(round(elapsed_ms, 6))
                         blocks.append(block)
                     finally:
                         paro.close()

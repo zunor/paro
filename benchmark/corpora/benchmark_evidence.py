@@ -134,8 +134,11 @@ def hierarchical_abba_ratio(
     for block in blocks:
         paro = [float(value) for value in block.get("paro_ms", [])]
         duckdb = [float(value) for value in block.get("duckdb_ms", [])]
-        if len(paro) != 2 or len(duckdb) != 2:
-            raise ValueError("each ABBA block must contain two samples per engine")
+        if len(paro) < 2 or len(paro) != len(duckdb) or len(paro) % 2 != 0:
+            raise ValueError(
+                "each process block must contain the same positive number of "
+                "complete ABBA-round samples per engine"
+            )
         if any(value <= 0.0 for value in [*paro, *duckdb]):
             raise ValueError("ABBA timings must be positive")
         normalized.append((paro, duckdb))
@@ -163,7 +166,7 @@ def hierarchical_abba_ratio(
         "hierarchical_confidence_interval_95": [round(low, 6), round(high, 6)],
         "process_block_ratios": [round(value, 6) for value in observed_blocks],
         "process_blocks": len(normalized),
-        "samples_per_engine": len(normalized) * 2,
+        "samples_per_engine": sum(len(paro) for paro, _ in normalized),
         "bootstrap_samples": bootstrap_samples,
         "resampling_unit": "fresh_process_block_then_within_block_sample",
     }
