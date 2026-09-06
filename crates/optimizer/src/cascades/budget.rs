@@ -119,8 +119,12 @@ impl Default for SearchBudget {
     fn default() -> Self {
         Self {
             disabled_transformation_rules: BTreeSet::new(),
-            max_optional_groups_per_initial_group: 8,
-            max_optional_composition_groups_per_initial_group: 8,
+            // Local and composition shells are separate pools, but both must
+            // leave enough headroom for two independent child rewrites to be
+            // composed at their parent. Eight groups per initial node strands
+            // that closure on ordinary multi-consumer analytical queries.
+            max_optional_groups_per_initial_group: 16,
+            max_optional_composition_groups_per_initial_group: 16,
             max_optional_logical_exprs_per_group: 64,
             max_optional_composition_logical_exprs_per_group: 32,
             max_optional_physical_exprs_per_group: 64,
@@ -178,11 +182,16 @@ impl SearchBudget {
         Ok(())
     }
 
-    pub fn optional_limit(&self, dimension: BudgetDimension) -> u32 {
-        match dimension {
+    /// Return a statically configured limit.
+    ///
+    /// Query-global group pools intentionally have no value until the initial
+    /// Memo is sealed. Representing that state as `None` keeps an unsealed
+    /// ledger distinct from a deliberately disabled (zero-credit) pool.
+    pub fn optional_limit(&self, dimension: BudgetDimension) -> Option<u32> {
+        Some(match dimension {
             // Group pools are query-global and receive their size-dependent
             // limits when the initial Memo is sealed.
-            BudgetDimension::Group | BudgetDimension::CompositionGroup => 0,
+            BudgetDimension::Group | BudgetDimension::CompositionGroup => return None,
             BudgetDimension::LogicalExprPerGroup => self.max_optional_logical_exprs_per_group,
             BudgetDimension::CompositionLogicalExprPerGroup => {
                 self.max_optional_composition_logical_exprs_per_group
@@ -214,7 +223,7 @@ impl SearchBudget {
             }
             BudgetDimension::RecursiveCandidate => self.max_recursive_candidates as u32,
             BudgetDimension::EnforcerChain => self.max_optional_enforcer_chains_per_goal as u32,
-        }
+        })
     }
 }
 
@@ -223,6 +232,10 @@ pub enum BudgetDecision {
     Allowed,
     Duplicate,
     Exhausted,
+    /// The dimension receives its limit from a later lifecycle boundary and
+    /// that boundary has not run. This is an optimizer invariant failure, not
+    /// a zero-sized search envelope.
+    Unconfigured,
 }
 
 /// Optional budget consumption is keyed by stable semantic events. Replaying a
@@ -278,7 +291,9 @@ impl SearchLedger {
         if units == 0 {
             return BudgetDecision::Allowed;
         }
-        let limit = self.limit(dimension);
+        let Some(limit) = self.limit(dimension) else {
+            return BudgetDecision::Unconfigured;
+        };
         let usage = self.consumed.entry(dimension).or_default();
         let previous = usage.events.get(&event).copied().unwrap_or(0);
         if units <= previous {
@@ -307,11 +322,11 @@ impl SearchLedger {
         self.limit_overrides.insert(dimension, limit);
     }
 
-    fn limit(&self, dimension: BudgetDimension) -> u32 {
+    fn limit(&self, dimension: BudgetDimension) -> Option<u32> {
         self.limit_overrides
             .get(&dimension)
             .copied()
-            .unwrap_or_else(|| self.budget.optional_limit(dimension))
+            .or_else(|| self.budget.optional_limit(dimension))
     }
 
     /// Record an omission discovered by a lazy enumerator which stopped
@@ -402,6 +417,22 @@ mod tests {
         );
         assert_eq!(
             ledger.admit_optional(BudgetDimension::SearchCandidate, Fingerprint(8)),
+            BudgetDecision::Exhausted
+        );
+    }
+
+    #[test]
+    fn dynamic_group_pool_is_not_misreported_as_zero_credit() {
+        let mut ledger = SearchLedger::new(SearchBudget::default());
+        assert_eq!(
+            ledger.admit_optional(BudgetDimension::Group, Fingerprint(1)),
+            BudgetDecision::Unconfigured
+        );
+        assert!(ledger.exhaustion_events().next().is_none());
+
+        ledger.set_limit(BudgetDimension::Group, 0);
+        assert_eq!(
+            ledger.admit_optional(BudgetDimension::Group, Fingerprint(1)),
             BudgetDecision::Exhausted
         );
     }

@@ -8,6 +8,7 @@ use super::*;
 pub(super) struct StagedEquivalent {
     pub(super) key: LogicalExprKey,
     pub(super) payload: LogicalPayloadId,
+    pub(super) operator_encoding: Box<[u8]>,
     pub(super) logical_properties: LogicalProperties,
     pub(super) cardinality: GroupCardinality,
 }
@@ -21,6 +22,10 @@ pub(super) struct StagingRequest {
     /// `None` imports an owned tree; `Some` preserves every listed boundary
     /// and stages only the new operator shell.
     pub(super) root_child_groups: Option<Box<[GroupId]>>,
+    /// Opaque Memo inputs retained at arbitrary depth by a native pattern.
+    /// Staging must consume every transport node exactly once and substitute
+    /// the named group before publishing the transformed expression.
+    pub(super) nested_group_holes: BTreeMap<u32, GroupId>,
 }
 
 pub(super) struct StagingTarget {
@@ -62,6 +67,7 @@ pub(super) fn stage_transformed_expression(
                 inherited_runtime_filter_facet,
             },
         root_child_groups,
+        nested_group_holes,
     } = request;
 
     struct NodeState {
@@ -82,6 +88,7 @@ pub(super) fn stage_transformed_expression(
         state: &'a mut PlannerTransformState,
         options: StagingOptions<'a>,
         pending_runtime_filter_facets: Vec<RegionFacet>,
+        nested_group_holes: BTreeMap<u32, GroupId>,
     }
 
     struct NodeStagingRequest {
@@ -138,6 +145,51 @@ pub(super) fn stage_transformed_expression(
             refined_cardinality_kind,
             preserved_child_groups,
         } = request;
+        if target.is_none() {
+            if let Some(group) = session.nested_group_holes.remove(&plan.id.0) {
+                let bindings = plan.get_column_bindings();
+                let types = plan.types();
+                if bindings.len() != types.len() {
+                    return Err(paro_error::internal(
+                        "nested group hole has inconsistent binding/type arity",
+                    ));
+                }
+                let columns = bindings
+                    .into_iter()
+                    .zip(types)
+                    .map(|(binding, logical_type)| {
+                        session
+                            .state
+                            .binding_ids
+                            .get(binding.table_index, binding.column_index, &logical_type)
+                            .copied()
+                            .ok_or_else(|| {
+                                paro_error::internal(
+                                    "nested group hole references an unknown column",
+                                )
+                            })
+                    })
+                    .collect::<Result<Vec<_>>>()?;
+                let group = session.memo.canonical_group(group);
+                let contract = session.memo.group(group).ok_or_else(|| {
+                    paro_error::internal("nested group hole references an unknown group")
+                })?;
+                if columns.iter().copied().collect::<BTreeSet<_>>() != contract.schema.ids() {
+                    return Err(paro_error::internal(
+                        "nested group hole changes its referenced group schema",
+                    ));
+                }
+                return Ok(Some((
+                    plan,
+                    NodeState {
+                        group,
+                        columns: columns.into_boxed_slice(),
+                        region_scope: referenced_group_scope(session.memo, group),
+                    },
+                    None,
+                )));
+            }
+        }
         let mut detached = Vec::new();
         let skeleton = plan.try_map_children(|child| {
             detached.push(child);
@@ -189,11 +241,7 @@ pub(super) fn stage_transformed_expression(
                         session
                             .state
                             .binding_ids
-                            .get(&(
-                                binding.table_index,
-                                binding.column_index,
-                                logical_type_fingerprint(&logical_type),
-                            ))
+                            .get(binding.table_index, binding.column_index, &logical_type)
                             .copied()
                             .ok_or_else(|| {
                                 paro_error::internal(
@@ -272,12 +320,15 @@ pub(super) fn stage_transformed_expression(
             .enumerate()
         {
             let type_domain = logical_type_fingerprint(&logical_type);
-            let binding_key = (binding.table_index, binding.column_index, type_domain);
-            let id = if let Some(id) = state.binding_ids.get(&binding_key).copied() {
+            let id = if let Some(id) = state
+                .binding_ids
+                .get(binding.table_index, binding.column_index, &logical_type)
+                .copied()
+            {
                 id
             } else {
                 let id = state.columns.intern(
-                    logical_type,
+                    logical_type.clone(),
                     true,
                     ColumnOrigin::Derived {
                         key: typed_binding_fingerprint(binding, type_domain),
@@ -285,7 +336,12 @@ pub(super) fn stage_transformed_expression(
                     ColumnVisibility::Visible,
                     output_names.get(index).cloned(),
                 )?;
-                state.binding_ids.insert(binding_key, id)?;
+                state.binding_ids.insert(
+                    binding.table_index,
+                    binding.column_index,
+                    &logical_type,
+                    id,
+                )?;
                 id
             };
             output_columns.push(id);
@@ -344,8 +400,8 @@ pub(super) fn stage_transformed_expression(
             &mut state.columns,
             &mut state.scalars,
         )?;
-        let operator_fingerprint =
-            query_operator_fingerprint(&plan, &scalar_roots, &state.scalars)?;
+        let (operator_fingerprint, operator_encoding) =
+            query_operator_identity(&plan, &scalar_roots, &state.scalars)?;
         let key = LogicalExprKey {
             operator: operator_fingerprint,
             scalars: scalar_roots,
@@ -381,11 +437,19 @@ pub(super) fn stage_transformed_expression(
         if target.is_none() {
             if let Some((group, _)) = state.expression_groups.get(&key).and_then(|candidates| {
                 candidates.iter().copied().find(|(group, logical)| {
-                    let context_matches = memo
+                    let payload = memo
                         .logical_expr(*logical)
-                        .and_then(|logical| state.metadata.get(&logical.payload))
+                        .map(|logical| logical.payload);
+                    let context_matches = payload
+                        .and_then(|payload| state.metadata.get(&payload))
                         .is_some_and(|metadata| metadata.input_context == node_context);
+                    let structure_matches = payload
+                        .and_then(|payload| state.payloads.logical.get(payload.index()))
+                        .is_some_and(|payload| {
+                            payload.operator_encoding.as_ref() == operator_encoding.as_ref()
+                        });
                     context_matches
+                        && structure_matches
                         && memo.group(*group).is_some_and(|existing| {
                             existing.schema == schema
                                 && existing
@@ -455,7 +519,7 @@ pub(super) fn stage_transformed_expression(
                 schema,
                 logical_properties.clone(),
                 cardinality.clone(),
-            ) else {
+            )? else {
                 return Ok(None);
             };
             group
@@ -466,7 +530,9 @@ pub(super) fn stage_transformed_expression(
         );
 
         if target.is_some() {
-            if let Some(existing) = memo.logical_expr_for_key(group, &key) {
+            if let Some(existing) =
+                memo.logical_expr_for_structural_key(group, &key, &operator_encoding)
+            {
                 let existing_context = state
                     .metadata
                     .get(&existing.payload)
@@ -502,6 +568,7 @@ pub(super) fn stage_transformed_expression(
                     Some(StagedEquivalent {
                         key,
                         payload: existing.payload,
+                        operator_encoding,
                         logical_properties,
                         cardinality,
                     }),
@@ -511,6 +578,7 @@ pub(super) fn stage_transformed_expression(
 
         let (payload, baseline_payload) = state.payloads.push_logical(PlannerLogicalPayload {
             semantic_template,
+            operator_encoding: operator_encoding.clone(),
             column_stats: options.column_stats.clone(),
         });
         let search = search_candidate
@@ -655,12 +723,18 @@ pub(super) fn stage_transformed_expression(
             Some(StagedEquivalent {
                 key,
                 payload,
+                operator_encoding,
                 logical_properties,
                 cardinality,
             })
         } else {
-            let logical =
-                memo.insert_logical(group, key.clone(), payload, EquivalenceProof::Initial)?;
+            let logical = memo.insert_logical_with_operator_encoding(
+                group,
+                key.clone(),
+                payload,
+                EquivalenceProof::Initial,
+                operator_encoding,
+            )?;
             state.record_expression_group(key, group, logical);
             if runtime_filter_candidate {
                 let mut facet = planner_region_facet(
@@ -729,6 +803,7 @@ pub(super) fn stage_transformed_expression(
                 group_budget: budget_class.group_dimension(),
             },
             pending_runtime_filter_facets: Vec::new(),
+            nested_group_holes,
         };
         let Some((_, root, staged)) = stage_node(
             &mut session,
@@ -746,6 +821,11 @@ pub(super) fn stage_transformed_expression(
         else {
             return Ok(None);
         };
+        if !session.nested_group_holes.is_empty() {
+            return Err(paro_error::internal(
+                "transformation rewrite discarded an opaque Memo group hole",
+            ));
+        }
         (root, staged, session.pending_runtime_filter_facets)
     };
     let Some(staged) = staged else {
@@ -927,6 +1007,7 @@ mod tests {
                                 inherited_runtime_filter_facet: None,
                             },
                             root_child_groups: None,
+                            nested_group_holes: BTreeMap::new(),
                         },
                         memo,
                         state,
@@ -995,6 +1076,7 @@ mod tests {
                                 inherited_runtime_filter_facet: None,
                             },
                             root_child_groups: None,
+                            nested_group_holes: BTreeMap::new(),
                         },
                         memo,
                         state,

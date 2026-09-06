@@ -249,13 +249,33 @@ impl TransformationRule for PlannerTransformationRule {
             source_child_context,
             source_output_columns,
             memo_group_holes,
+            nested_group_holes,
             environment,
         ) = {
             let state = self
                 .planner_state
                 .read()
                 .expect("planner transform state poisoned");
-            let plan = semantic_plan::instantiate_bound_plan(ctx.memo(), &state, &binding.root)?;
+            let instantiated = if matches!(
+                self.transformation,
+                PlannerTransformation::AggregateDimensionSharing
+            ) {
+                semantic_plan::instantiate_bound_plan_with_group_holes(
+                    ctx.memo(),
+                    &state,
+                    &binding.root,
+                )?
+            } else {
+                semantic_plan::InstantiatedPlanWithGroupHoles {
+                    plan: semantic_plan::instantiate_bound_plan(
+                        ctx.memo(),
+                        &state,
+                        &binding.root,
+                    )?,
+                    group_holes: BTreeMap::new(),
+                }
+            };
+            let plan = instantiated.plan;
             let logical = ctx
                 .memo()
                 .logical_expr(expr)
@@ -300,6 +320,7 @@ impl TransformationRule for PlannerTransformationRule {
                 metadata.child_context,
                 metadata.output_columns.clone(),
                 memo_group_holes,
+                instantiated.group_holes,
                 PlannerRuleEnvironment {
                     binder,
                     bind_context: state.bind_context.clone(),
@@ -409,6 +430,7 @@ impl TransformationRule for PlannerTransformationRule {
                 output_input_context,
                 output_child_context,
                 root_child_groups,
+                nested_group_holes.clone(),
             ));
         }
         if prepared.is_empty() {
@@ -428,6 +450,7 @@ impl TransformationRule for PlannerTransformationRule {
                     input_context,
                     child_context,
                     root_child_groups,
+                    nested_group_holes,
                 ) in prepared
                 {
                     let Some(expression) = stage_transformed_expression(
@@ -450,6 +473,7 @@ impl TransformationRule for PlannerTransformationRule {
                                 inherited_runtime_filter_facet: source_runtime_filter_facet,
                             },
                             root_child_groups,
+                            nested_group_holes,
                         },
                         memo,
                         state,
@@ -479,6 +503,7 @@ impl TransformationRule for PlannerTransformationRule {
                 target_group,
                 key: staged.key,
                 payload: staged.payload,
+                operator_encoding: Some(staged.operator_encoding),
                 logical_properties: staged.logical_properties,
                 cardinality: staged.cardinality,
                 proof: EquivalenceProof::Transformation {
@@ -547,10 +572,9 @@ fn transformed_plan_matches_group_contract(
     }
     let mut columns = BTreeSet::new();
     for (binding, logical_type) in bindings.into_iter().zip(types) {
-        let domain = logical_type_fingerprint(&logical_type);
         let Some(column) = state
             .binding_ids
-            .get(&(binding.table_index, binding.column_index, domain))
+            .get(binding.table_index, binding.column_index, &logical_type)
             .copied()
         else {
             return Ok(false);

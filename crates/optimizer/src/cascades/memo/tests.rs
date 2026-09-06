@@ -93,6 +93,52 @@ fn rule_history_is_expression_local_and_duplicate_expr_is_deduped() {
 }
 
 #[test]
+fn relational_hash_collision_requires_exact_operator_encoding() {
+    let mut memo = Memo::new(SearchBudget::default());
+    let group = memo.create_group(
+        schema(1),
+        LogicalProperties::default(),
+        GroupCardinality::default(),
+    );
+    let key = LogicalExprKey {
+        operator: Fingerprint(77),
+        scalars: Box::new([]),
+        children: Box::new([]),
+    };
+    let first = memo
+        .insert_logical_with_operator_encoding(
+            group,
+            key.clone(),
+            LogicalPayloadId(1),
+            EquivalenceProof::Initial,
+            b"operator-a".to_vec().into_boxed_slice(),
+        )
+        .unwrap();
+    let collision = memo
+        .insert_logical_with_operator_encoding(
+            group,
+            key.clone(),
+            LogicalPayloadId(2),
+            EquivalenceProof::Normalization { rule: RuleId(1) },
+            b"operator-b".to_vec().into_boxed_slice(),
+        )
+        .unwrap();
+    let duplicate = memo
+        .insert_logical_with_operator_encoding(
+            group,
+            key,
+            LogicalPayloadId(3),
+            EquivalenceProof::Normalization { rule: RuleId(2) },
+            b"operator-a".to_vec().into_boxed_slice(),
+        )
+        .unwrap();
+
+    assert_ne!(first, collision);
+    assert_eq!(first, duplicate);
+    assert_eq!(memo.group(group).unwrap().logical_exprs().len(), 2);
+}
+
+#[test]
 fn logical_frontier_revision_never_aliases_a_rolled_back_candidate() {
     let mut memo = Memo::new(SearchBudget::default());
     let group = memo.create_group(
@@ -944,6 +990,7 @@ fn optional_group_budgets_are_query_global_isolated_and_observable() {
             LogicalProperties::default(),
             GroupCardinality::default(),
         )
+        .unwrap()
         .is_none());
     assert_eq!(
         memo.exhaustion_counts().get(&BudgetDimension::Group),
@@ -965,12 +1012,39 @@ fn optional_group_budgets_are_query_global_isolated_and_observable() {
             LogicalProperties::default(),
             GroupCardinality::default(),
         )
+        .unwrap()
         .is_none());
     assert_eq!(
         memo.exhaustion_counts()
             .get(&BudgetDimension::CompositionGroup),
         Some(&1)
     );
+}
+
+#[test]
+fn duplicate_optional_group_identity_is_an_invariant_error() {
+    let mut memo = Memo::new(SearchBudget::default());
+    memo.create_optional_group(
+        BudgetDimension::Group,
+        Fingerprint(41),
+        schema(1),
+        LogicalProperties::default(),
+        GroupCardinality::default(),
+    )
+    .unwrap()
+    .expect("first allocation");
+    let error = memo
+        .create_optional_group(
+            BudgetDimension::Group,
+            Fingerprint(41),
+            schema(1),
+            LogicalProperties::default(),
+            GroupCardinality::default(),
+        )
+        .unwrap_err();
+    assert!(error
+        .to_string()
+        .contains("allocation identity was reused"));
 }
 
 #[test]
@@ -1016,6 +1090,7 @@ fn optional_group_budget_scales_with_initial_memo_and_rollback_refunds_credit() 
             LogicalProperties::default(),
             GroupCardinality::default(),
         )
+        .unwrap()
         .is_none());
 }
 
@@ -1039,6 +1114,7 @@ fn optional_group_rollback_preserves_exhaustion_evidence() {
             LogicalProperties::default(),
             GroupCardinality::default(),
         )
+        .unwrap()
         .is_none());
     memo.rollback_transformation(savepoint).unwrap();
     assert_eq!(

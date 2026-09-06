@@ -59,11 +59,11 @@ pub(super) fn derive_provided_ordering(
         .map(|order| {
             let column = match &order.expression {
                 Expression::ColumnRef(column) if column.depth == 0 => binding_ids
-                    .get(&(
+                    .get(
                         column.binding.table_index,
                         column.binding.column_index,
-                        logical_type_fingerprint(&column.return_type),
-                    ))
+                        &column.return_type,
+                    )
                     .copied(),
                 Expression::Reference(reference) => child_columns
                     .and_then(|columns| columns.get(reference.index))

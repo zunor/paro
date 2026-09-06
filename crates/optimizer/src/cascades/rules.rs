@@ -167,6 +167,10 @@ pub struct EquivalentExpression {
     pub target_group: GroupId,
     pub key: LogicalExprKey,
     pub payload: LogicalPayloadId,
+    /// Exact operator-shell equality witness for collision-safe Memo
+    /// interning. Core-only rules may leave this absent when their synthetic
+    /// fingerprint is itself the complete test-domain identity.
+    pub operator_encoding: Option<Box<[u8]>>,
     pub logical_properties: super::memo::LogicalProperties,
     pub cardinality: super::memo::GroupCardinality,
     pub proof: EquivalenceProof,

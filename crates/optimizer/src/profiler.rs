@@ -116,6 +116,10 @@ impl OptimizerProfiler {
     }
 
     pub fn record_search_summary(&mut self, summary: &crate::cascades::SearchSummary) {
+        self.counters.insert(
+            "search_complete".to_string(),
+            u64::from(summary.is_complete()),
+        );
         self.counters
             .insert("memo_group_count".to_string(), summary.groups);
         self.counters.insert(
@@ -203,5 +207,28 @@ mod tests {
             .unwrap();
         assert_eq!(memo.invocation_count, 1);
         assert_eq!(memo.last_elapsed, Duration::from_micros(7));
+    }
+
+
+    #[test]
+    fn search_completion_is_published_as_an_explicit_counter() {
+        let mut profiler = OptimizerProfiler::default();
+        profiler.record_search_summary(&crate::cascades::SearchSummary {
+            groups: 1,
+            logical_expressions: 1,
+            physical_expressions: 1,
+            exhaustion_events: [(
+                crate::cascades::budget::BudgetDimension::Group,
+                1,
+            )]
+            .into_iter()
+            .collect(),
+        });
+        let snapshot = profiler.snapshot();
+        assert_eq!(snapshot.counters.get("search_complete"), Some(&0));
+        assert_eq!(
+            snapshot.counters.get("budget_exhaustion_group"),
+            Some(&1)
+        );
     }
 }

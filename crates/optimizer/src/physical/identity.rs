@@ -88,13 +88,17 @@ impl fmt::Debug for Fingerprint {
 #[derive(Debug, Clone)]
 pub struct StableFingerprintBuilder {
     state: Sha256,
+    transcript: Option<Vec<u8>>,
 }
 
 impl Default for StableFingerprintBuilder {
     fn default() -> Self {
         let mut state = Sha256::new();
         state.update(b"paro.stable-fingerprint.v2");
-        Self { state }
+        Self {
+            state,
+            transcript: None,
+        }
     }
 }
 
@@ -103,20 +107,36 @@ impl StableFingerprintBuilder {
     const U64_TAG: u8 = 2;
     const FINGERPRINT_TAG: u8 = 3;
 
-    pub fn write_bytes(&mut self, bytes: &[u8]) {
-        self.state.update([Self::BYTES_TAG]);
-        self.state.update((bytes.len() as u64).to_le_bytes());
+    /// Record the exact domain-delimited byte stream alongside its hash.
+    /// Memo operator interning uses this form so a digest collision only
+    /// selects a bucket and can never establish logical equivalence.
+    pub fn recording() -> Self {
+        let mut builder = Self::default();
+        builder.transcript = Some(b"paro.stable-fingerprint.v2".to_vec());
+        builder
+    }
+
+    fn update(&mut self, bytes: &[u8]) {
         self.state.update(bytes);
+        if let Some(transcript) = &mut self.transcript {
+            transcript.extend_from_slice(bytes);
+        }
+    }
+
+    pub fn write_bytes(&mut self, bytes: &[u8]) {
+        self.update(&[Self::BYTES_TAG]);
+        self.update(&(bytes.len() as u64).to_le_bytes());
+        self.update(bytes);
     }
 
     pub fn write_u64(&mut self, value: u64) {
-        self.state.update([Self::U64_TAG]);
-        self.state.update(value.to_le_bytes());
+        self.update(&[Self::U64_TAG]);
+        self.update(&value.to_le_bytes());
     }
 
     pub fn write_fingerprint(&mut self, value: Fingerprint) {
-        self.state.update([Self::FINGERPRINT_TAG]);
-        self.state.update(value.0.to_le_bytes());
+        self.update(&[Self::FINGERPRINT_TAG]);
+        self.update(&value.0.to_le_bytes());
     }
 
     pub fn finish(self) -> Fingerprint {
@@ -124,6 +144,14 @@ impl StableFingerprintBuilder {
         let mut bytes = [0_u8; 16];
         bytes.copy_from_slice(&digest[..16]);
         Fingerprint(u128::from_le_bytes(bytes))
+    }
+
+    pub fn finish_recording(self) -> (Fingerprint, Box<[u8]>) {
+        let transcript = self
+            .transcript
+            .clone()
+            .expect("finish_recording requires StableFingerprintBuilder::recording");
+        (self.finish(), transcript.into_boxed_slice())
     }
 }
 

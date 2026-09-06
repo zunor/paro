@@ -7,7 +7,7 @@
 //! `ScalarExprId`s, while executable expression trees remain in extraction
 //! payloads and never participate in Memo identity.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 
 use paro_common::error::{self as paro_error, Result};
 use paro_common::runtime_value::Value;
@@ -29,7 +29,7 @@ use super::scalar::{
     ComparisonOp, ScalarArena, ScalarKind, ScalarLocalProperties, ScalarSpec, Volatility,
 };
 
-type BindingKey = (usize, usize, Fingerprint);
+type BindingKey = (usize, usize, u32);
 
 /// Stable planner binding to optimizer column identities with an append-only
 /// insertion journal. Transformations can therefore roll back the delta
@@ -38,14 +38,40 @@ type BindingKey = (usize, usize, Fingerprint);
 pub(crate) struct BindingCatalog {
     entries: BTreeMap<BindingKey, ColumnId>,
     insertions: Vec<BindingKey>,
+    /// Exact query-local type interning. Binding lookup is a hot layout path;
+    /// it must not recompute a cryptographic digest for every column visit.
+    types: Vec<LogicalType>,
+    type_ids: HashMap<LogicalType, u32>,
 }
 
 impl BindingCatalog {
-    pub(crate) fn get(&self, key: &BindingKey) -> Option<&ColumnId> {
-        self.entries.get(key)
+    pub(crate) fn get(
+        &self,
+        table_index: usize,
+        column_index: usize,
+        logical_type: &LogicalType,
+    ) -> Option<&ColumnId> {
+        let type_id = self.type_ids.get(logical_type)?;
+        self.entries.get(&(table_index, column_index, *type_id))
     }
 
-    pub(crate) fn insert(&mut self, key: BindingKey, column: ColumnId) -> Result<()> {
+    pub(crate) fn insert(
+        &mut self,
+        table_index: usize,
+        column_index: usize,
+        logical_type: &LogicalType,
+        column: ColumnId,
+    ) -> Result<()> {
+        let type_id = if let Some(type_id) = self.type_ids.get(logical_type).copied() {
+            type_id
+        } else {
+            let type_id = u32::try_from(self.types.len())
+                .map_err(|_| paro_error::internal("query type arena exceeds u32 identity space"))?;
+            self.types.push(logical_type.clone());
+            self.type_ids.insert(logical_type.clone(), type_id);
+            type_id
+        };
+        let key = (table_index, column_index, type_id);
         if let Some(existing) = self.entries.get(&key) {
             if *existing != column {
                 return Err(paro_error::internal(
@@ -419,8 +445,10 @@ fn intern_column_binding(
     columns: &mut ColumnCatalog,
 ) -> Result<ColumnId> {
     let type_domain = logical_type_fingerprint(&logical_type);
-    let key = (binding.table_index, binding.column_index, type_domain);
-    if let Some(column) = binding_ids.get(&key).copied() {
+    if let Some(column) = binding_ids
+        .get(binding.table_index, binding.column_index, &logical_type)
+        .copied()
+    {
         return Ok(column);
     }
     let column = columns.intern(
@@ -432,7 +460,15 @@ fn intern_column_binding(
         ColumnVisibility::Hidden,
         None,
     )?;
-    binding_ids.insert(key, column)?;
+    binding_ids.insert(
+        binding.table_index,
+        binding.column_index,
+        &columns
+            .get(column)
+            .expect("newly interned column must exist")
+            .logical_type,
+        column,
+    )?;
     Ok(column)
 }
 

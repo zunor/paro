@@ -355,6 +355,7 @@ impl TransformationRule for AddEquivalent {
                 children: Box::new([]),
             },
             payload: LogicalPayloadId(1),
+            operator_encoding: None,
             logical_properties: LogicalProperties::default(),
             cardinality: GroupCardinality::default(),
             proof: EquivalenceProof::Transformation {
@@ -421,6 +422,7 @@ impl TransformationRule for EnumerateTwoCompositionBindings {
                 children: Box::new([]),
             },
             payload: LogicalPayloadId(22),
+            operator_encoding: None,
             logical_properties: LogicalProperties::default(),
             cardinality: GroupCardinality::default(),
             proof: EquivalenceProof::Transformation {
@@ -493,6 +495,7 @@ impl TransformationRule for AddBoundedFrontier {
                     children: Box::new([]),
                 },
                 payload: LogicalPayloadId(operator as u32),
+                operator_encoding: None,
                 logical_properties: LogicalProperties::default(),
                 cardinality: GroupCardinality::default(),
                 proof: EquivalenceProof::Transformation {
@@ -558,6 +561,7 @@ impl TransformationRule for DuplicateEquivalent {
             target_group: ctx.group(),
             key: ctx.memo().logical_expr(expr).unwrap().key.clone(),
             payload: LogicalPayloadId(0),
+            operator_encoding: None,
             logical_properties: LogicalProperties::default(),
             cardinality: GroupCardinality::default(),
             proof: EquivalenceProof::Transformation {
@@ -613,6 +617,7 @@ impl TransformationRule for AddEquivalentWithNewChild {
                 children: Box::new([child]),
             },
             payload: LogicalPayloadId(4),
+            operator_encoding: None,
             logical_properties: LogicalProperties::default(),
             cardinality: GroupCardinality::default(),
             proof: EquivalenceProof::Transformation {
@@ -653,6 +658,7 @@ impl TransformationRule for RewriteNewChild {
                 children: Box::new([]),
             },
             payload: LogicalPayloadId(5),
+            operator_encoding: None,
             logical_properties: LogicalProperties::default(),
             cardinality: GroupCardinality::default(),
             proof: EquivalenceProof::Transformation {
@@ -695,6 +701,7 @@ impl TransformationRule for AddChildAlternative {
                 children: Box::new([]),
             },
             payload: LogicalPayloadId(41),
+            operator_encoding: None,
             logical_properties: LogicalProperties::default(),
             cardinality: GroupCardinality::default(),
             proof: EquivalenceProof::Transformation {
@@ -750,6 +757,7 @@ impl TransformationRule for RewriteParentAfterChildAlternative {
                 children: source.key.children.clone(),
             },
             payload: LogicalPayloadId(51),
+            operator_encoding: None,
             logical_properties: LogicalProperties::default(),
             cardinality: GroupCardinality::default(),
             proof: EquivalenceProof::Transformation {
@@ -803,6 +811,7 @@ impl TransformationRule for RejectAfterSidecarWrite {
                 children: Box::new([]),
             },
             payload: LogicalPayloadId(2),
+            operator_encoding: None,
             logical_properties: LogicalProperties::default(),
             cardinality: GroupCardinality::default(),
             proof: EquivalenceProof::Transformation {
@@ -1377,6 +1386,7 @@ impl TransformationRule for ReplaceInfeasibleBranch {
                 children: Box::new([]),
             },
             payload: LogicalPayloadId(2),
+            operator_encoding: None,
             logical_properties: LogicalProperties::default(),
             cardinality: GroupCardinality::default(),
             proof: EquivalenceProof::Transformation {

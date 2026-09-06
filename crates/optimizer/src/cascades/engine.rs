@@ -419,8 +419,8 @@ impl CascadesEngine {
                 .memo
                 .logical_expr(expression)
                 .is_some_and(|expression| !expression.key.children.is_empty());
-            if budget.optional_limit(fire_dimension) == 0
-                || (budget.optional_limit(work_dimension) == 0 && expression_has_children)
+            if budget.optional_limit(fire_dimension) == Some(0)
+                || (budget.optional_limit(work_dimension) == Some(0) && expression_has_children)
             {
                 continue;
             }
@@ -625,11 +625,17 @@ impl CascadesEngine {
                         // Do not call `insert_logical`: that method is allowed to
                         // enrich the proof set of an existing expression, while
                         // this attempt must remain completely side-effect free.
-                        if context
-                            .memo()
-                            .logical_expr_for_key(target, &output.key)
-                            .is_some()
-                        {
+                        let duplicate = match output.operator_encoding.as_deref() {
+                            Some(encoding) => context
+                                .memo()
+                                .logical_expr_for_structural_key(target, &output.key, encoding)
+                                .is_some(),
+                            None => context
+                                .memo()
+                                .logical_expr_for_key(target, &output.key)
+                                .is_some(),
+                        };
+                        if duplicate {
                             continue;
                         }
                         let before = context
@@ -637,12 +643,22 @@ impl CascadesEngine {
                             .group(target)
                             .map(|group| group.logical_exprs().len())
                             .unwrap_or(0);
-                        let inserted = context.memo_mut().insert_logical(
-                            target,
-                            output.key,
-                            output.payload,
-                            output.proof,
-                        )?;
+                        let inserted = if let Some(encoding) = output.operator_encoding {
+                            context.memo_mut().insert_logical_with_operator_encoding(
+                                target,
+                                output.key,
+                                output.payload,
+                                output.proof,
+                                encoding,
+                            )?
+                        } else {
+                            context.memo_mut().insert_logical(
+                                target,
+                                output.key,
+                                output.payload,
+                                output.proof,
+                            )?
+                        };
                         let after = context
                             .memo()
                             .group(target)

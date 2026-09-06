@@ -415,6 +415,15 @@ pub struct SearchSummary {
     pub exhaustion_events: BTreeMap<BudgetDimension, u64>,
 }
 
+impl SearchSummary {
+    /// Whether optional search reached every configured frontier. Mandatory
+    /// normalization and baseline implementations remain valid when false,
+    /// but the selected winner is explicitly a budget-limited result.
+    pub fn is_complete(&self) -> bool {
+        self.exhaustion_events.is_empty()
+    }
+}
+
 #[derive(Debug)]
 pub struct OptimizedVariant {
     pub class: super::ids::ResourceGrantClassId,
@@ -556,8 +565,10 @@ impl MemoBuilder {
                         .enumerate()
                     {
                         let type_domain = logical_type_fingerprint(&logical_type);
-                        let key = (binding.table_index, binding.column_index, type_domain);
-                        let id = if let Some(id) = binding_ids.get(&key).copied() {
+                        let id = if let Some(id) = binding_ids
+                            .get(binding.table_index, binding.column_index, &logical_type)
+                            .copied()
+                        {
                             let desc = columns.get(id).ok_or_else(|| {
                                 paro_error::internal(
                                     "column binding map references missing ColumnId",
@@ -570,13 +581,18 @@ impl MemoBuilder {
                                 key: typed_binding_fingerprint(binding, type_domain),
                             };
                             let id = columns.intern(
-                                logical_type,
+                                logical_type.clone(),
                                 true,
                                 origin,
                                 ColumnVisibility::Visible,
                                 output_names.get(index).cloned(),
                             )?;
-                            binding_ids.insert(key, id)?;
+                            binding_ids.insert(
+                                binding.table_index,
+                                binding.column_index,
+                                &logical_type,
+                                id,
+                            )?;
                             id
                         };
                         output_columns.push(id);
@@ -648,8 +664,8 @@ impl MemoBuilder {
                         &mut columns,
                         &mut scalars,
                     )?;
-                    let operator_fingerprint =
-                        query_operator_fingerprint(&plan, &scalar_roots, &scalars)?;
+                    let (operator_fingerprint, operator_encoding) =
+                        query_operator_identity(&plan, &scalar_roots, &scalars)?;
                     let key = LogicalExprKey {
                         operator: operator_fingerprint,
                         scalars: scalar_roots,
@@ -673,13 +689,15 @@ impl MemoBuilder {
                     let (payload, baseline_payload) =
                         payloads.push_logical(PlannerLogicalPayload {
                             semantic_template,
+                            operator_encoding: operator_encoding.clone(),
                             column_stats: candidate_stats.clone(),
                         });
-                    let logical = memo.insert_logical(
+                    let logical = memo.insert_logical_with_operator_encoding(
                         group,
                         key.clone(),
                         payload,
                         EquivalenceProof::Initial,
+                        operator_encoding,
                     )?;
                     let search = search_candidate
                         .map(|search_plan| {

@@ -291,6 +291,10 @@ impl LogicalExprKey {
 pub struct LogicalExpr {
     pub id: LogicalExprId,
     pub key: LogicalExprKey,
+    /// Exact canonical operator encoding. `key.operator` selects a bucket;
+    /// these bytes establish equivalence inside it. Generic optimizer-core
+    /// tests may omit the encoding and then the complete key is authoritative.
+    pub operator_encoding: Option<Arc<[u8]>>,
     pub payload: LogicalPayloadId,
     pub proofs: BTreeSet<EquivalenceProof>,
     pub applied_rules: BTreeSet<RuleId>,
@@ -524,7 +528,7 @@ pub struct Group {
     /// one whose child frontier has since changed, including through rollback.
     logical_expression_version: u64,
     physical_exprs: Vec<PhysicalExprId>,
-    logical_index: BTreeMap<LogicalExprKey, LogicalExprId>,
+    logical_index: BTreeMap<LogicalExprKey, Vec<LogicalExprId>>,
     physical_index: BTreeMap<PhysicalExprKey, PhysicalExprId>,
     winner_frontiers: BTreeMap<OptimizationGoal, WinnerFrontier>,
     pub ledger: SearchLedger,
@@ -691,12 +695,29 @@ impl Memo {
                     .checked_add(1)
                     .ok_or_else(|| paro_error::internal("Memo frontier revision overflow"))?;
                 let group = &mut self.groups[owner.index()];
-                if group.logical_exprs.pop() != Some(id)
-                    || group.logical_index.remove(&expression.key) != Some(id)
-                {
+                if group.logical_exprs.pop() != Some(id) {
                     return Err(paro_error::internal(
                         "transformation rollback found inconsistent group membership",
                     ));
+                }
+                let remove_bucket = {
+                    let bucket = group.logical_index.get_mut(&expression.key).ok_or_else(|| {
+                        paro_error::internal(
+                            "transformation rollback lost its logical-expression bucket",
+                        )
+                    })?;
+                    let position = bucket.iter().position(|candidate| *candidate == id).ok_or_else(
+                        || {
+                            paro_error::internal(
+                                "transformation rollback lost its logical-expression identity",
+                            )
+                        },
+                    )?;
+                    bucket.remove(position);
+                    bucket.is_empty()
+                };
+                if remove_bucket {
+                    group.logical_index.remove(&expression.key);
                 }
                 group.logical_expression_version = self.logical_frontier_revision;
             }
@@ -875,17 +896,33 @@ impl Memo {
         schema: GroupSchema,
         logical_properties: LogicalProperties,
         cardinality: GroupCardinality,
-    ) -> Option<GroupId> {
+    ) -> Result<Option<GroupId>> {
         self.seal_optional_group_budget();
         let mut event = StableFingerprintBuilder::default();
         event.write_bytes(b"paro.optional-group-allocation.v2");
         event.write_fingerprint(allocation_identity);
-        if self.global_ledger.admit_optional(dimension, event.finish())
-            != super::budget::BudgetDecision::Allowed
+        match self
+            .global_ledger
+            .admit_optional(dimension, event.finish())
         {
-            return None;
+            super::budget::BudgetDecision::Allowed => {}
+            super::budget::BudgetDecision::Exhausted => return Ok(None),
+            super::budget::BudgetDecision::Duplicate => {
+                return Err(paro_error::internal(
+                    "optional Memo group allocation identity was reused without reusing its group",
+                ));
+            }
+            super::budget::BudgetDecision::Unconfigured => {
+                return Err(paro_error::internal(
+                    "optional Memo group allocation reached an unsealed budget",
+                ));
+            }
         }
-        Some(self.create_group(schema, logical_properties, cardinality))
+        Ok(Some(self.create_group(
+            schema,
+            logical_properties,
+            cardinality,
+        )))
     }
 
     pub fn canonical_group(&self, mut id: GroupId) -> GroupId {
@@ -954,8 +991,34 @@ impl Memo {
         key: &LogicalExprKey,
     ) -> Option<&LogicalExpr> {
         let group = self.canonical_group(group);
-        let expression = self.groups.get(group.index())?.logical_index.get(key)?;
+        let expression = self
+            .groups
+            .get(group.index())?
+            .logical_index
+            .get(key)?
+            .first()?;
         self.logical_expr(*expression)
+    }
+
+    pub(crate) fn logical_expr_for_structural_key(
+        &self,
+        group: GroupId,
+        key: &LogicalExprKey,
+        operator_encoding: &[u8],
+    ) -> Option<&LogicalExpr> {
+        let group = self.canonical_group(group);
+        self.groups
+            .get(group.index())?
+            .logical_index
+            .get(key)?
+            .iter()
+            .filter_map(|expression| self.logical_expr(*expression))
+            .find(|expression| {
+                expression
+                    .operator_encoding
+                    .as_deref()
+                    .is_some_and(|encoding| encoding == operator_encoding)
+            })
     }
 
     pub fn logical_owner(&self, id: LogicalExprId) -> Option<GroupId> {
@@ -1068,9 +1131,37 @@ impl Memo {
     pub fn insert_logical(
         &mut self,
         target: GroupId,
+        key: LogicalExprKey,
+        payload: LogicalPayloadId,
+        proof: EquivalenceProof,
+    ) -> Result<LogicalExprId> {
+        self.insert_logical_structural(target, key, payload, proof, None)
+    }
+
+    pub(crate) fn insert_logical_with_operator_encoding(
+        &mut self,
+        target: GroupId,
+        key: LogicalExprKey,
+        payload: LogicalPayloadId,
+        proof: EquivalenceProof,
+        operator_encoding: Box<[u8]>,
+    ) -> Result<LogicalExprId> {
+        self.insert_logical_structural(
+            target,
+            key,
+            payload,
+            proof,
+            Some(Arc::from(operator_encoding)),
+        )
+    }
+
+    fn insert_logical_structural(
+        &mut self,
+        target: GroupId,
         mut key: LogicalExprKey,
         payload: LogicalPayloadId,
         proof: EquivalenceProof,
+        operator_encoding: Option<Arc<[u8]>>,
     ) -> Result<LogicalExprId> {
         let target = self.canonical_group(target);
         for child in key.children.iter_mut() {
@@ -1088,9 +1179,14 @@ impl Memo {
                 "a non-initial equivalence proof cannot seed an empty group",
             ));
         }
-        if let Some(existing) = self.groups[target.index()].logical_index.get(&key).copied() {
-            self.logical_exprs[existing.index()].proofs.insert(proof);
-            return Ok(existing);
+        if let Some(existing) = self.groups[target.index()].logical_index.get(&key) {
+            let equivalent = existing.iter().copied().find(|existing| {
+                self.logical_exprs[existing.index()].operator_encoding == operator_encoding
+            });
+            if let Some(existing) = equivalent {
+                self.logical_exprs[existing.index()].proofs.insert(proof);
+                return Ok(existing);
+            }
         }
         if matches!(proof, EquivalenceProof::Initial)
             && !self.groups[target.index()].logical_exprs.is_empty()
@@ -1103,6 +1199,7 @@ impl Memo {
         self.logical_exprs.push(LogicalExpr {
             id,
             key: key.clone(),
+            operator_encoding,
             payload,
             proofs: [proof].into_iter().collect(),
             applied_rules: BTreeSet::new(),
@@ -1113,7 +1210,7 @@ impl Memo {
             .checked_add(1)
             .ok_or_else(|| paro_error::internal("Memo frontier revision overflow"))?;
         let group = &mut self.groups[target.index()];
-        group.logical_index.insert(key, id);
+        group.logical_index.entry(key).or_default().push(id);
         group.logical_exprs.push(id);
         group.logical_expression_version = self.logical_frontier_revision;
         Ok(id)
@@ -1362,14 +1459,29 @@ impl Memo {
             group.physical_index.clear();
             group.winner_frontiers.clear();
             group.logical_exprs.sort_unstable();
-            group.logical_exprs.dedup_by(|left, right| {
-                self.logical_exprs[left.index()].key == self.logical_exprs[right.index()].key
-            });
-            for &expression in &group.logical_exprs {
-                group.logical_index.insert(
+            let mut unique = BTreeMap::<
+                (LogicalExprKey, Option<Arc<[u8]>>),
+                LogicalExprId,
+            >::new();
+            for expression in std::mem::take(&mut group.logical_exprs) {
+                let semantic_key = (
                     self.logical_exprs[expression.index()].key.clone(),
-                    expression,
+                    self.logical_exprs[expression.index()].operator_encoding.clone(),
                 );
+                if let Some(existing) = unique.get(&semantic_key).copied() {
+                    let proofs = self.logical_exprs[expression.index()].proofs.clone();
+                    self.logical_exprs[existing.index()].proofs.extend(proofs);
+                } else {
+                    unique.insert(semantic_key, expression);
+                    group.logical_exprs.push(expression);
+                }
+            }
+            for &expression in &group.logical_exprs {
+                group
+                    .logical_index
+                    .entry(self.logical_exprs[expression.index()].key.clone())
+                    .or_default()
+                    .push(expression);
             }
             group.physical_exprs.sort_unstable();
             group.physical_exprs.dedup_by(|left, right| {

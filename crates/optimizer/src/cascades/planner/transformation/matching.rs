@@ -278,37 +278,26 @@ pub(super) fn dimension_sharing_pattern_bindings(
             )))
         }
 
-        fn stable_subtree(
+        fn group_hole(
             &mut self,
             group: GroupId,
-            active: &mut BTreeSet<GroupId>,
         ) -> Result<Option<(PatternOperand, Fingerprint)>> {
             let group = self.memo.canonical_group(group);
-            if !self.observe(group)? {
+            // The rule deliberately does not inspect the fact subtree. Facts
+            // still participate in the read cursor because staging and
+            // costing consume the group's schema/cardinality contract.
+            if !self.observe_facts(group)? || !self.admit_work(1)? {
                 return Ok(None);
             }
-            if !active.insert(group) {
-                // Recursive groups are valid Memo structure but cannot be
-                // materialized into the finite operand required by this local
-                // rewrite. Decline this candidate instead of turning an
-                // inapplicable optimization into a user-visible error.
-                return Ok(None);
-            }
-            let Some(expression) = self.expressions(group)?.into_iter().next() else {
-                active.remove(&group);
-                return Ok(None);
-            };
-            let child_groups = self.logical(expression)?.key.children.clone();
-            let mut children = Vec::with_capacity(child_groups.len());
-            for child in child_groups.iter().copied() {
-                let Some(child) = self.stable_subtree(child, active)? else {
-                    active.remove(&group);
-                    return Ok(None);
-                };
-                children.push(child);
-            }
-            active.remove(&group);
-            self.expression_operand(group, expression, children)
+            let group_ref = self.memo.group(group).ok_or_else(|| {
+                paro_error::internal("local pattern group hole references an unknown group")
+            })?;
+            let mut fingerprint = StableFingerprintBuilder::default();
+            fingerprint.write_bytes(b"paro.pattern.semantic-group-hole.v1");
+            fingerprint.write_u64(group.0 as u64);
+            fingerprint.write_fingerprint(group_ref.logical_fact_fingerprint());
+            fingerprint.write_fingerprint(group_ref.statistics_snapshot_fingerprint());
+            Ok(Some((PatternOperand::Group(group), fingerprint.finish())))
         }
 
         fn branch_operand(
@@ -352,9 +341,8 @@ pub(super) fn dimension_sharing_pattern_bindings(
                 .children
                 .clone();
             let mut partial_children = Vec::with_capacity(partial_child_groups.len());
-            let mut active = BTreeSet::new();
             for child in partial_child_groups.iter().copied() {
-                let Some(child) = self.stable_subtree(child, &mut active)? else {
+                let Some(child) = self.group_hole(child)? else {
                     return Ok(None);
                 };
                 partial_children.push(child);
@@ -409,8 +397,12 @@ pub(super) fn dimension_sharing_pattern_bindings(
     }
 
     let work_dimension = BudgetDimension::CompositionRuleWorkPerGroup;
-    let configured_limit =
-        usize::try_from(budget.optional_limit(work_dimension)).unwrap_or(usize::MAX);
+    let configured_limit = usize::try_from(
+        budget
+            .optional_limit(work_dimension)
+            .expect("rule-work dimensions have a static limit"),
+    )
+    .unwrap_or(usize::MAX);
     let root_group = memo.canonical_group(root_group);
     let already_consumed = memo
         .group(root_group)
@@ -518,9 +510,10 @@ pub(super) fn dimension_sharing_pattern_bindings(
             if !matcher.admit_work(LocalMatcher::operand_nodes(&root))? {
                 break 'frontiers;
             }
-            let candidate =
-                super::super::semantic_plan::instantiate_bound_plan(memo, state, &root)?;
-            if !crate::aggregate::dimension_sharing::recognizes_plan(&candidate) {
+            let candidate = super::super::semantic_plan::instantiate_bound_plan_with_group_holes(
+                memo, state, &root,
+            )?;
+            if !crate::aggregate::dimension_sharing::recognizes_plan(&candidate.plan) {
                 continue;
             }
             if bindings.len() == variant_limit {
@@ -752,8 +745,12 @@ pub(super) fn pattern_bindings(
         }
     }
 
-    let configured_limit =
-        usize::try_from(budget.optional_limit(work_dimension)).unwrap_or(usize::MAX);
+    let configured_limit = usize::try_from(
+        budget
+            .optional_limit(work_dimension)
+            .expect("rule-work dimensions have a static limit"),
+    )
+    .unwrap_or(usize::MAX);
     let already_consumed = memo
         .group(memo.canonical_group(root_group))
         .map_or(0, |group| group.ledger.consumed(work_dimension));

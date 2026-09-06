@@ -52,6 +52,9 @@ pub(super) struct PlannerLogicalPayload {
     /// Binding-based operator semantics. Positional projection maps and input
     /// slots are derived only after winner selection.
     pub(super) semantic_template: LogicalPlan,
+    /// Exact canonical encoding of this operator shell. The Memo hashes this
+    /// value for lookup but compares the bytes before declaring equivalence.
+    pub(super) operator_encoding: Box<[u8]>,
     pub(super) column_stats: SharedColumnStatistics,
 }
 

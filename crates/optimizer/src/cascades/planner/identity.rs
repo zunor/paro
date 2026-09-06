@@ -22,12 +22,24 @@ pub(super) fn typed_binding_fingerprint(
     fingerprint.finish()
 }
 
+#[cfg(test)]
 pub(super) fn query_operator_fingerprint(
     plan: &LogicalPlan,
     scalar_roots: &[ScalarExprId],
     scalars: &ScalarArena,
 ) -> Result<Fingerprint> {
-    let mut fingerprint = StableFingerprintBuilder::default();
+    Ok(query_operator_identity(plan, scalar_roots, scalars)?.0)
+}
+
+/// Hash-bucket key plus exact canonical encoding for one relational shell.
+/// The encoding is retained by the Memo payload and is the final equality
+/// check; the 128-bit digest is only an index accelerator.
+pub(super) fn query_operator_identity(
+    plan: &LogicalPlan,
+    scalar_roots: &[ScalarExprId],
+    scalars: &ScalarArena,
+) -> Result<(Fingerprint, Box<[u8]>)> {
+    let mut fingerprint = StableFingerprintBuilder::recording();
     fingerprint.write_u64(operator_tag(plan.operator.op_type()));
     fingerprint.write_u64(scalar_roots.len() as u64);
     for root in scalar_roots {
@@ -304,7 +316,7 @@ pub(super) fn query_operator_fingerprint(
             ));
         }
     }
-    Ok(fingerprint.finish())
+    Ok(fingerprint.finish_recording())
 }
 
 pub(super) fn encode_graph_pattern(
