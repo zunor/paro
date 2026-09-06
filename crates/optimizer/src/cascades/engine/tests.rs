@@ -1403,7 +1403,9 @@ fn blocking_enforcers_participate_in_grant_feasibility() {
         &MachineCalibrationBundle::default(),
     )
     .unwrap()
-    .expect("sort may spill under an allowed grant");
+    .expect("sort may spill under an allowed grant")
+    .phase()
+    .expect("a sort creates an execution phase");
     assert_eq!(cost.peak_memory_upper, 1_024);
     assert!(cost.spill_bytes_expected > 0);
     assert!(
@@ -2757,4 +2759,141 @@ fn child_product_cutoff_records_budget_limited_completion() {
     assert!(baseline_only >= chosen);
     assert!(chosen > oracle);
     assert!((oracle - 1.3).abs() < 1e-9);
+}
+
+struct PipelineSupplyImplementation;
+
+impl PhysicalImplementation for PipelineSupplyImplementation {
+    fn id(&self) -> ImplementationId {
+        ImplementationId(9_871)
+    }
+
+    fn matches(
+        &self,
+        _: &super::super::memo::LogicalExpr,
+        _: OptimizationGoal,
+        _: &ImplementationContext<'_>,
+    ) -> bool {
+        true
+    }
+
+    fn candidates(
+        &self,
+        expr: LogicalExprId,
+        goal: OptimizationGoal,
+        ctx: &ImplementationContext<'_>,
+    ) -> Result<Box<[PhysicalCandidate]>> {
+        let logical = ctx.memo.logical_expr(expr).unwrap();
+        let source = logical.key.children.is_empty();
+        Ok(Box::new([PhysicalCandidate {
+            key: PhysicalExprKey {
+                implementation: self.id(),
+                logical: expr,
+                children: logical.key.children.clone(),
+                payload_fingerprint: logical.key.operator,
+            },
+            payload: PhysicalPayloadId(logical.payload.0),
+            provided: provided(),
+            child_goals: logical
+                .key
+                .children
+                .iter()
+                .map(|child| (*child, goal))
+                .collect::<Vec<_>>()
+                .into_boxed_slice(),
+            local_cost: cost(10_000.0),
+            source_filter_apply_cost: None,
+            task_supply: if source {
+                TaskSupplyContract::Source { tasks: 4 }
+            } else {
+                TaskSupplyContract::Streaming { input: 0 }
+            },
+            cost_composition: if source {
+                CostComposition::Source {
+                    source: WorkSourceId(9_871),
+                    source_rows: 10_000,
+                }
+            } else {
+                CostComposition::Sequential
+            },
+            spillable: false,
+            enforcer_cost_input: EnforcerCostInput::unbounded(CompactRange::point(10_000.0)?, 8),
+            physical_fingerprint: logical.key.operator,
+            region: None,
+            mandatory: true,
+        }]))
+    }
+}
+
+#[test]
+fn empty_enforcement_preserves_source_supply_through_engine() {
+    let mut memo = Memo::new(super::super::budget::SearchBudget::default());
+    let source = memo.create_group(
+        schema(),
+        LogicalProperties::default(),
+        GroupCardinality::default(),
+    );
+    let parent = memo.create_group(
+        schema(),
+        LogicalProperties::default(),
+        GroupCardinality::default(),
+    );
+    for (group, children) in [(source, vec![]), (parent, vec![source])] {
+        memo.insert_logical(
+            group,
+            LogicalExprKey {
+                operator: Fingerprint(9_871 + group.0 as u128),
+                scalars: Box::new([]),
+                children: children.into_boxed_slice(),
+            },
+            LogicalPayloadId(group.0),
+            EquivalenceProof::Initial,
+        )
+        .unwrap();
+    }
+    let goal = OptimizationGoal {
+        required: memo.intern_required(required()).unwrap(),
+        row_goal: RowGoal::All,
+        objective: ObjectiveProfile::Latency,
+        grant: GrantGoalKey::Invariant(AdmissibleGrantSetId(0)),
+        context: OptimizationContextId(0),
+    };
+    let mut registry = ImplementationRegistry::default();
+    registry
+        .register_implementation(PipelineSupplyImplementation)
+        .unwrap();
+    let mut engine = CascadesEngine::new(memo, registry);
+    let leaf = engine.optimize(source, goal, SearchMode::Memo).unwrap();
+    let parent = engine.optimize(parent, goal, SearchMode::Memo).unwrap();
+    assert_eq!(leaf.cost.output_pipeline_tasks, 4);
+    assert_eq!(parent.local_cost.output_pipeline_tasks, 4);
+}
+
+#[test]
+fn one_pipeline_coordination_is_invariant_to_streaming_boundaries() {
+    let calibration = MachineCalibrationBundle::default();
+    let source = resolve_task_supply(
+        cost(10_000.0),
+        &[],
+        &TaskSupplyContract::Source { tasks: 4 },
+        &calibration,
+    )
+    .unwrap();
+    let projection = resolve_task_supply(
+        cost(10_000.0),
+        &[source],
+        &TaskSupplyContract::Streaming { input: 0 },
+        &calibration,
+    )
+    .unwrap();
+    let split = source.sequential(projection).unwrap();
+    let fused = resolve_task_supply(
+        cost(20_000.0),
+        &[],
+        &TaskSupplyContract::Source { tasks: 4 },
+        &calibration,
+    )
+    .unwrap();
+    assert_eq!(split.work_latency, fused.work_latency);
+    assert_eq!(split.critical_path, fused.critical_path);
 }

@@ -283,7 +283,7 @@ pub(super) fn extract_planner_tree(
                 contracts.insert(plan.id, base_contract.clone());
                 let mut provided = base_contract.provided;
                 let mut cumulative_cost = base_contract.cost;
-                let enforcer_cost = crate::cascades::engine::enforcer_cost(
+                let enforcer_phase = crate::cascades::engine::enforcer_cost(
                     enforcers.as_ref(),
                     enforcer_cost_input,
                     memo.calibration(),
@@ -291,7 +291,7 @@ pub(super) fn extract_planner_tree(
                 .ok_or_else(|| {
                     paro_error::internal("extracted enforcer exceeds its verified resource grant")
                 })?;
-                let expected_final_cost = cumulative_cost.sequential(enforcer_cost)?;
+                let expected_final_cost = enforcer_phase.compose_after(cumulative_cost)?;
                 if !enforcers.is_empty() && expected_final_cost != final_contract.cost {
                     return Err(paro_error::internal(
                         "extracted enforcer chain cost disagrees with the verified winner",
@@ -301,7 +301,7 @@ pub(super) fn extract_planner_tree(
                 for (index, enforcer) in enforcers.iter().enumerate() {
                     let is_final = index + 1 == enforcers.len();
                     provided = enforcer.apply(provided, &final_contract.required)?;
-                    let single_cost = crate::cascades::engine::enforcer_cost(
+                    let single_phase = crate::cascades::engine::enforcer_cost(
                         std::slice::from_ref(enforcer),
                         enforcer_cost_input,
                         memo.calibration(),
@@ -311,7 +311,7 @@ pub(super) fn extract_planner_tree(
                             "extracted enforcer step exceeds its verified resource grant",
                         )
                     })?;
-                    cumulative_cost = cumulative_cost.sequential(single_cost)?;
+                    cumulative_cost = single_phase.compose_after(cumulative_cost)?;
                     let mut contract = final_contract.clone();
                     contract.required = if is_final {
                         final_contract.required.clone()

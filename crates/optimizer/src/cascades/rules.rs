@@ -221,6 +221,11 @@ impl PatternRead {
 pub struct PatternBindingSet {
     pub bindings: Box<[PatternBinding]>,
     pub reads: Box<[PatternRead]>,
+    /// Actual matcher work admitted before any operand is allocated. One unit
+    /// represents either an observed Memo group or a constructed operand.
+    /// This is deliberately distinct from `reads`: a shared DAG can have a
+    /// small read set while requiring exponentially many tree operands.
+    pub work_units: usize,
     pub completion: PatternEnumerationCompletion,
 }
 
@@ -389,6 +394,7 @@ pub trait TransformationRule: Send + Sync {
         Ok(PatternBindingSet {
             bindings,
             reads: reads.into_boxed_slice(),
+            work_units: 1 + logical.key.children.len(),
             completion: PatternEnumerationCompletion::Complete,
         })
     }

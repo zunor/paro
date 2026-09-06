@@ -160,7 +160,20 @@ impl TransformationRule for PlannerTransformationRule {
     }
 
     fn bindings(&self, expr: LogicalExprId, ctx: &RuleContext<'_>) -> Result<PatternBindingSet> {
-        matching::pattern_bindings(ctx.group, expr, ctx.memo, ctx.memo.budget())
+        let cancellation = self
+            .planner_state
+            .read()
+            .map_err(|_| paro_error::internal("planner transform state poisoned"))?
+            .session
+            .as_ref()
+            .map(|session| session.cancellation.clone());
+        matching::pattern_bindings(
+            ctx.group,
+            expr,
+            ctx.memo,
+            ctx.memo.budget(),
+            cancellation.as_ref(),
+        )
     }
 
     fn apply(

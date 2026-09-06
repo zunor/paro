@@ -291,6 +291,37 @@ impl MachineCalibrationBundle {
         cost.validate()?;
         Ok(cost)
     }
+
+    /// Price work which joins an already running pipeline. A transparent
+    /// streaming operator inherits the scheduler domain created by its input;
+    /// it contributes parallel work but does not launch another worker set or
+    /// pay a second coordination charge.
+    pub fn continue_pipeline(
+        &self,
+        mut cost: SearchCost,
+        max_parallel_tasks: u16,
+    ) -> Result<SearchCost> {
+        let tasks = max_parallel_tasks.max(1);
+        cost.critical_path = cost.work_latency;
+        cost.max_parallel_tasks = tasks;
+        cost.output_pipeline_tasks = tasks;
+        if tasks == 1 {
+            cost.validate()?;
+            return Ok(cost);
+        }
+        let task_count = f64::from(tasks);
+        let serial_fraction = self.pipeline_serial_fraction;
+        let parallel_fraction = 1.0 - serial_fraction;
+        let expected_workers = 1.0 + (task_count - 1.0) * self.expected_worker_efficiency;
+        let risk_workers = 1.0 + (task_count - 1.0) * self.risk_worker_efficiency;
+        cost.critical_path = CompactRange::new(
+            cost.critical_path.lower * (serial_fraction + parallel_fraction / task_count),
+            cost.critical_path.expected * (serial_fraction + parallel_fraction / expected_workers),
+            cost.critical_path.upper * (serial_fraction + parallel_fraction / risk_workers),
+        )?;
+        cost.validate()?;
+        Ok(cost)
+    }
 }
 
 fn validate_calibrated_cost(cost: CalibratedOpCost) -> Result<()> {

@@ -487,7 +487,7 @@ impl CascadesEngine {
                     expression,
                     rule,
                     dependency_version,
-                    &binding_set.reads,
+                    binding_set.work_units,
                 )? {
                     continue;
                 }
@@ -1256,7 +1256,7 @@ impl CascadesEngine {
                     );
                     continue;
                 };
-                let Some(enforcer_cost) = enforcer_cost(
+                let Some(enforcer_phase) = enforcer_cost(
                     &enforced.steps,
                     recipe.enforcer_cost_input,
                     self.memo.calibration(),
@@ -1272,7 +1272,7 @@ impl CascadesEngine {
                     continue;
                 };
                 let Some(constrained_cost) = constrain_composed_cost_to_grant(
-                    cost.sequential(enforcer_cost)?,
+                    enforcer_phase.compose_after(cost)?,
                     recipe.enforcer_cost_input,
                 )?
                 else {
@@ -1776,7 +1776,7 @@ fn resolve_task_supply(
         }
         TaskSupplyContract::Streaming { input } => {
             let tasks = child_tasks(input)?;
-            calibration.rephase(local_cost, ParallelWorkProfile::Pipeline, tasks, tasks)
+            calibration.continue_pipeline(local_cost, tasks)
         }
         TaskSupplyContract::Breaker {
             input,
@@ -2212,17 +2212,16 @@ fn admit_transformation_work(
     source: LogicalExprId,
     rule: RuleId,
     dependency_version: Fingerprint,
-    reads: &[PatternRead],
+    work_units: usize,
 ) -> Result<bool> {
-    for read in reads {
+    for ordinal in 0..work_units {
         let mut event = StableFingerprintBuilder::default();
-        event.write_bytes(b"paro.rule-work.v3");
+        event.write_bytes(b"paro.rule-work.v4");
         event.write_u64(target.0 as u64);
         event.write_u64(source.0 as u64);
         event.write_u64(rule.0 as u64);
         event.write_fingerprint(dependency_version);
-        event.write_u64(read.group.0 as u64);
-        event.write_u64(read.logical_frontier_revision);
+        event.write_u64(ordinal as u64);
         if memo
             .group_mut(target)
             .ok_or_else(|| paro_error::internal("rule work target group disappeared"))?
@@ -2256,13 +2255,38 @@ fn validate_transformation_proof(
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub(crate) enum EnforcerPhaseCost {
+    /// Requirements were already satisfied. This is the absence of a phase,
+    /// not a serial zero-work phase with its own output task domain.
+    Absent,
+    Phase(SearchCost),
+}
+
+impl EnforcerPhaseCost {
+    pub(crate) fn compose_after(self, input: SearchCost) -> Result<SearchCost> {
+        match self {
+            Self::Absent => Ok(input),
+            Self::Phase(cost) => input.sequential(cost),
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn phase(self) -> Option<SearchCost> {
+        match self {
+            Self::Absent => None,
+            Self::Phase(cost) => Some(cost),
+        }
+    }
+}
+
 pub(crate) fn enforcer_cost(
     steps: &[EnforcerStep],
     input: EnforcerCostInput,
     calibration: &MachineCalibrationBundle,
-) -> Result<Option<SearchCost>> {
+) -> Result<Option<EnforcerPhaseCost>> {
     if steps.is_empty() {
-        return Ok(Some(SearchCost::ZERO));
+        return Ok(Some(EnforcerPhaseCost::Absent));
     }
     input.rows.checked_add(super::cost::CompactRange::ZERO)?;
     let mut work = LocalOperatorWork::default();
@@ -2322,7 +2346,7 @@ pub(crate) fn enforcer_cost(
     result.peak_memory_upper = peak_memory_upper;
     result.spill_bytes_expected = spill_bytes_expected;
     result.validate()?;
-    Ok(Some(result))
+    Ok(Some(EnforcerPhaseCost::Phase(result)))
 }
 
 fn scale_range(range: super::cost::CompactRange, factor: f64) -> Result<super::cost::CompactRange> {

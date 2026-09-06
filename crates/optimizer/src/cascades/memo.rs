@@ -491,7 +491,9 @@ fn winner_dominates(left: &Winner, right: &Winner) -> bool {
     // This is deliberately stricter than ordinary cost dominance: otherwise a
     // parent filter can reverse the local ordering by removing work attributed
     // to one source but not independent work in the competing candidate.
-    left.source_work == right.source_work && left.cost.dominates(&right.cost)
+    left.source_work == right.source_work
+        && left.cost.output_pipeline_tasks == right.cost.output_pipeline_tasks
+        && left.cost.dominates(&right.cost)
 }
 
 fn winner_tie_break(winner: &Winner) -> (PhysicalExprId, Fingerprint) {
@@ -1325,14 +1327,14 @@ fn recompute_winner_cost(memo: &Memo, winner: &Winner) -> Result<super::engine::
     composed.cost =
         super::engine::constrain_composed_cost_to_grant(composed.cost, winner.enforcer_cost_input)?
             .ok_or_else(|| paro_error::internal("recorded winner exceeds its resource grant"))?;
-    let enforcer_cost = super::engine::enforcer_cost(
+    let enforcer_phase = super::engine::enforcer_cost(
         &winner.enforcers,
         winner.enforcer_cost_input,
         memo.calibration(),
     )?
     .ok_or_else(|| paro_error::internal("recorded winner has an infeasible enforcer grant"))?;
     composed.cost = super::engine::constrain_composed_cost_to_grant(
-        composed.cost.sequential(enforcer_cost)?,
+        enforcer_phase.compose_after(composed.cost)?,
         winner.enforcer_cost_input,
     )?
     .ok_or_else(|| paro_error::internal("recorded winner enforcers exceed its resource grant"))?;

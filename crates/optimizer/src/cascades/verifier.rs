@@ -158,7 +158,7 @@ impl WinnerVerifier {
                     .ok_or_else(|| {
                         paro_error::internal("winner composition exceeds its resource grant")
                     })?;
-                    let enforcer_cost = super::engine::enforcer_cost(
+                    let enforcer_phase = super::engine::enforcer_cost(
                         &winner.enforcers,
                         winner.enforcer_cost_input,
                         memo.calibration(),
@@ -167,7 +167,7 @@ impl WinnerVerifier {
                         paro_error::internal("winner enforcer exceeds its resource grant")
                     })?;
                     recomputed_cost = super::engine::constrain_composed_cost_to_grant(
-                        recomputed_cost.sequential(enforcer_cost)?,
+                        enforcer_phase.compose_after(recomputed_cost)?,
                         winner.enforcer_cost_input,
                     )?
                     .ok_or_else(|| {
