@@ -19,7 +19,6 @@ pub struct CTEInlining<'a> {
 enum DefaultInliningPolicy {
     All,
     SingleReference,
-    Never,
 }
 
 impl<'a> CTEInlining<'a> {
@@ -30,17 +29,11 @@ impl<'a> CTEInlining<'a> {
         }
     }
 
-    /// Restrict the pass to SQL's mandatory `NOT MATERIALIZED` contract.
-    /// Default CTEs remain available for the SharedSubplanRegion to compare
-    /// inline and shared-materialization alternatives by cost.
-    pub fn only_not_materialized(mut self) -> Self {
-        self.default_policy = DefaultInliningPolicy::Never;
-        self
-    }
-
-    /// Inline a DEFAULT CTE only after another semantic rewrite has reduced
-    /// its live consumer count to one. Multi-reference sharing remains a cost
-    /// decision owned by Memo.
+    /// Canonicalize every single-reference DEFAULT CTE and SQL's mandatory
+    /// `NOT MATERIALIZED` contract. A one-consumer materialization has no
+    /// reuse benefit, adds a blocking write/read boundary, and cannot dominate
+    /// the equivalent inline relation under any execution requirement. Only
+    /// multi-reference DEFAULT CTEs remain a Memo sharing decision.
     pub fn single_reference_defaults(mut self) -> Self {
         self.default_policy = DefaultInliningPolicy::SingleReference;
         self
@@ -99,12 +92,6 @@ impl<'a> CTEInlining<'a> {
         }
 
         if cte.materialized == CTEMaterialize::Materialized {
-            return (LogicalOperator::MaterializedCTE(cte), false);
-        }
-
-        if cte.materialized == CTEMaterialize::Default
-            && matches!(self.default_policy, DefaultInliningPolicy::Never)
-        {
             return (LogicalOperator::MaterializedCTE(cte), false);
         }
 
@@ -350,8 +337,28 @@ mod tests {
     }
 
     #[test]
-    fn single_reference_policy_preserves_default_multi_ref_sharing() {
+    fn canonical_policy_inlines_single_reference_and_preserves_multi_ref_sharing() {
         let bind_context = BindContext::new();
+        let single = LogicalPlan::new(
+            &bind_context,
+            LogicalOperator::MaterializedCTE(MaterializedCTE::new(
+                9,
+                "single".to_string(),
+                vec!["v".to_string()],
+                vec![LogicalType::Integer],
+                CTEMaterialize::Default,
+                values(&bind_context, 0, &[1, 2, 3]),
+                cte_ref(&bind_context, 9, 3),
+            )),
+        );
+        let single = CTEInlining::new(&bind_context)
+            .single_reference_defaults()
+            .optimize_plan(single);
+        assert!(!matches!(
+            single.operator,
+            LogicalOperator::MaterializedCTE(_)
+        ));
+
         let plan = LogicalPlan::new(
             &bind_context,
             LogicalOperator::MaterializedCTE(MaterializedCTE::new(

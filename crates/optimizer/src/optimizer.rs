@@ -761,12 +761,11 @@ impl Optimizer {
         plan = JoinPredicateNormalizer::new(&self.ctx.bind_context).optimize_plan(plan)?;
         plan = ExternalRoutineLoweringPass::lower(plan, &self.ctx.bind_context)?.plan;
         plan = CTEInlining::new(&self.ctx.bind_context)
-            .only_not_materialized()
+            .single_reference_defaults()
             .optimize_plan(plan);
-        // NOT MATERIALIZED substitution creates fresh filter/projection/set
-        // boundaries. It is a mandatory semantic contract, so canonicalize
-        // predicate placement before Query IR construction just as Memo does
-        // for the optional DEFAULT-CTE inline alternative.
+        // Mandatory substitution creates fresh filter/projection/set
+        // boundaries. Canonicalize predicate placement before Query IR
+        // construction just as Memo does for optional multi-consumer choices.
         plan = FilterPushdown::new().rewrite_plan(plan);
         normalize_scalar_expressions(&mut plan);
         plan = FilterPushdown::new().rewrite_plan(plan);
