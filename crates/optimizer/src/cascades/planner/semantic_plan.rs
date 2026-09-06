@@ -91,22 +91,24 @@ pub(super) fn instantiate_bound_plan_with_group_holes(
             state.bind_context.shared().as_ref(),
         )
         .try_map_children(|_| {
-            children.next().ok_or_else(|| {
-                paro_error::internal("group-hole transport lost a child expression")
-            })
+            children
+                .next()
+                .ok_or_else(|| paro_error::internal("group-hole transport lost a child expression"))
         })?;
         if children.next().is_some() {
             return Err(paro_error::internal(
                 "group-hole transport produced an extra child expression",
             ));
         }
-        plan.stats.estimated_cardinality = memo.cardinality_estimate(group).map(
-            |(min, expected, max)| paro_planner::plan::CardinalityEstimate {
-                min,
-                expected,
-                max,
-            },
-        );
+        plan.stats.estimated_cardinality =
+            memo.cardinality_estimate(group)
+                .map(
+                    |(min, expected, max)| paro_planner::plan::CardinalityEstimate {
+                        min,
+                        expected,
+                        max,
+                    },
+                );
         let output_columns = state
             .metadata
             .get(&logical.payload)
@@ -177,13 +179,15 @@ pub(super) fn instantiate_bound_plan_with_group_holes(
                         "planner payload child arity disagrees with Memo expression",
                     ));
                 }
-                plan.stats.estimated_cardinality = memo.cardinality_estimate(*group).map(
-                    |(min, expected, max)| paro_planner::plan::CardinalityEstimate {
-                        min,
-                        expected,
-                        max,
-                    },
-                );
+                plan.stats.estimated_cardinality =
+                    memo.cardinality_estimate(*group)
+                        .map(
+                            |(min, expected, max)| paro_planner::plan::CardinalityEstimate {
+                                min,
+                                expected,
+                                max,
+                            },
+                        );
                 let output_columns = state
                     .metadata
                     .get(&logical.payload)
@@ -529,11 +533,7 @@ fn marker_column(mark_index: Option<usize>, bindings: &BindingCatalog) -> Result
         return Ok(None);
     };
     bindings
-        .get(
-            mark_index,
-            0,
-            &paro_common::types::LogicalType::Boolean,
-        )
+        .get(mark_index, 0, &paro_common::types::LogicalType::Boolean)
         .copied()
         .map(Some)
         .ok_or_else(|| {

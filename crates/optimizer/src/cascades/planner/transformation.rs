@@ -267,11 +267,7 @@ impl TransformationRule for PlannerTransformationRule {
                 )?
             } else {
                 semantic_plan::InstantiatedPlanWithGroupHoles {
-                    plan: semantic_plan::instantiate_bound_plan(
-                        ctx.memo(),
-                        &state,
-                        &binding.root,
-                    )?,
+                    plan: semantic_plan::instantiate_bound_plan(ctx.memo(), &state, &binding.root)?,
                     group_holes: BTreeMap::new(),
                 }
             };

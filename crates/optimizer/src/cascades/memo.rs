@@ -701,18 +701,22 @@ impl Memo {
                     ));
                 }
                 let remove_bucket = {
-                    let bucket = group.logical_index.get_mut(&expression.key).ok_or_else(|| {
-                        paro_error::internal(
-                            "transformation rollback lost its logical-expression bucket",
-                        )
-                    })?;
-                    let position = bucket.iter().position(|candidate| *candidate == id).ok_or_else(
-                        || {
+                    let bucket = group
+                        .logical_index
+                        .get_mut(&expression.key)
+                        .ok_or_else(|| {
+                            paro_error::internal(
+                                "transformation rollback lost its logical-expression bucket",
+                            )
+                        })?;
+                    let position = bucket
+                        .iter()
+                        .position(|candidate| *candidate == id)
+                        .ok_or_else(|| {
                             paro_error::internal(
                                 "transformation rollback lost its logical-expression identity",
                             )
-                        },
-                    )?;
+                        })?;
                     bucket.remove(position);
                     bucket.is_empty()
                 };
@@ -901,10 +905,7 @@ impl Memo {
         let mut event = StableFingerprintBuilder::default();
         event.write_bytes(b"paro.optional-group-allocation.v2");
         event.write_fingerprint(allocation_identity);
-        match self
-            .global_ledger
-            .admit_optional(dimension, event.finish())
-        {
+        match self.global_ledger.admit_optional(dimension, event.finish()) {
             super::budget::BudgetDecision::Allowed => {}
             super::budget::BudgetDecision::Exhausted => return Ok(None),
             super::budget::BudgetDecision::Duplicate => {
@@ -1459,14 +1460,13 @@ impl Memo {
             group.physical_index.clear();
             group.winner_frontiers.clear();
             group.logical_exprs.sort_unstable();
-            let mut unique = BTreeMap::<
-                (LogicalExprKey, Option<Arc<[u8]>>),
-                LogicalExprId,
-            >::new();
+            let mut unique = BTreeMap::<(LogicalExprKey, Option<Arc<[u8]>>), LogicalExprId>::new();
             for expression in std::mem::take(&mut group.logical_exprs) {
                 let semantic_key = (
                     self.logical_exprs[expression.index()].key.clone(),
-                    self.logical_exprs[expression.index()].operator_encoding.clone(),
+                    self.logical_exprs[expression.index()]
+                        .operator_encoding
+                        .clone(),
                 );
                 if let Some(existing) = unique.get(&semantic_key).copied() {
                     let proofs = self.logical_exprs[expression.index()].proofs.clone();

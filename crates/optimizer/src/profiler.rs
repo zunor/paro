@@ -209,7 +209,6 @@ mod tests {
         assert_eq!(memo.last_elapsed, Duration::from_micros(7));
     }
 
-
     #[test]
     fn search_completion_is_published_as_an_explicit_counter() {
         let mut profiler = OptimizerProfiler::default();
@@ -217,18 +216,12 @@ mod tests {
             groups: 1,
             logical_expressions: 1,
             physical_expressions: 1,
-            exhaustion_events: [(
-                crate::cascades::budget::BudgetDimension::Group,
-                1,
-            )]
-            .into_iter()
-            .collect(),
+            exhaustion_events: [(crate::cascades::budget::BudgetDimension::Group, 1)]
+                .into_iter()
+                .collect(),
         });
         let snapshot = profiler.snapshot();
         assert_eq!(snapshot.counters.get("search_complete"), Some(&0));
-        assert_eq!(
-            snapshot.counters.get("budget_exhaustion_group"),
-            Some(&1)
-        );
+        assert_eq!(snapshot.counters.get("budget_exhaustion_group"), Some(&1));
     }
 }

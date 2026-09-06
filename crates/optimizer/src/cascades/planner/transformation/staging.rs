@@ -437,9 +437,7 @@ pub(super) fn stage_transformed_expression(
         if target.is_none() {
             if let Some((group, _)) = state.expression_groups.get(&key).and_then(|candidates| {
                 candidates.iter().copied().find(|(group, logical)| {
-                    let payload = memo
-                        .logical_expr(*logical)
-                        .map(|logical| logical.payload);
+                    let payload = memo.logical_expr(*logical).map(|logical| logical.payload);
                     let context_matches = payload
                         .and_then(|payload| state.metadata.get(&payload))
                         .is_some_and(|metadata| metadata.input_context == node_context);
@@ -519,7 +517,8 @@ pub(super) fn stage_transformed_expression(
                 schema,
                 logical_properties.clone(),
                 cardinality.clone(),
-            )? else {
+            )?
+            else {
                 return Ok(None);
             };
             group

@@ -1042,9 +1042,7 @@ fn duplicate_optional_group_identity_is_an_invariant_error() {
             GroupCardinality::default(),
         )
         .unwrap_err();
-    assert!(error
-        .to_string()
-        .contains("allocation identity was reused"));
+    assert!(error.to_string().contains("allocation identity was reused"));
 }
 
 #[test]

@@ -278,10 +278,7 @@ pub(super) fn dimension_sharing_pattern_bindings(
             )))
         }
 
-        fn group_hole(
-            &mut self,
-            group: GroupId,
-        ) -> Result<Option<(PatternOperand, Fingerprint)>> {
+        fn group_hole(&mut self, group: GroupId) -> Result<Option<(PatternOperand, Fingerprint)>> {
             let group = self.memo.canonical_group(group);
             // The rule deliberately does not inspect the fact subtree. Facts
             // still participate in the read cursor because staging and
