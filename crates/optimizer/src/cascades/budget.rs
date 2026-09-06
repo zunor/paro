@@ -4,6 +4,7 @@
 //! Deterministic multidimensional search budgets.
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::sync::Arc;
 
 use super::ids::{Fingerprint, RuleId};
 
@@ -66,12 +67,12 @@ pub struct SearchBudget {
     /// Mandatory normalization and baseline implementations are not rules and
     /// cannot be disabled through this set.
     pub disabled_transformation_rules: BTreeSet<RuleId>,
-    pub max_optional_groups: u32,
-    /// Reserved query-global groups for alternatives that combine already
-    /// published child frontiers. Local expansion cannot consume this pool,
-    /// so a bounded search can still form a parent candidate after reaching
-    /// the ordinary group ceiling.
-    pub max_optional_composition_groups: u32,
+    /// Query-global local groups admitted per group in the immutable initial
+    /// Memo. Scaling from the mandatory DAG keeps the search envelope stable
+    /// across query size instead of imposing a cliff at one absolute count.
+    pub max_optional_groups_per_initial_group: u32,
+    /// Query-global composition groups admitted per initial Memo group.
+    pub max_optional_composition_groups_per_initial_group: u32,
     pub max_optional_logical_exprs_per_group: u32,
     /// Root alternatives reserved for rules which combine child frontiers.
     /// Local rewrites cannot strand a bounded parent composition after they
@@ -118,13 +119,8 @@ impl Default for SearchBudget {
     fn default() -> Self {
         Self {
             disabled_transformation_rules: BTreeSet::new(),
-            // Optional groups are query-global, unlike the per-owner
-            // expression frontiers below. A bounded local rewrite should add
-            // shells, not clone complete trees; 512 leaves ample composition
-            // space while providing a real planner-memory ceiling if a rule
-            // violates that contract.
-            max_optional_groups: 512,
-            max_optional_composition_groups: 512,
+            max_optional_groups_per_initial_group: 8,
+            max_optional_composition_groups_per_initial_group: 8,
             max_optional_logical_exprs_per_group: 64,
             max_optional_composition_logical_exprs_per_group: 32,
             max_optional_physical_exprs_per_group: 64,
@@ -184,8 +180,9 @@ impl SearchBudget {
 
     pub fn optional_limit(&self, dimension: BudgetDimension) -> u32 {
         match dimension {
-            BudgetDimension::Group => self.max_optional_groups,
-            BudgetDimension::CompositionGroup => self.max_optional_composition_groups,
+            // Group pools are query-global and receive their size-dependent
+            // limits when the initial Memo is sealed.
+            BudgetDimension::Group | BudgetDimension::CompositionGroup => 0,
             BudgetDimension::LogicalExprPerGroup => self.max_optional_logical_exprs_per_group,
             BudgetDimension::CompositionLogicalExprPerGroup => {
                 self.max_optional_composition_logical_exprs_per_group
@@ -232,15 +229,28 @@ pub enum BudgetDecision {
 /// task or merging groups cannot manufacture fresh credit.
 #[derive(Debug, Clone)]
 pub struct SearchLedger {
-    budget: SearchBudget,
-    consumed: BTreeMap<BudgetDimension, BTreeSet<Fingerprint>>,
+    budget: Arc<SearchBudget>,
+    limit_overrides: BTreeMap<BudgetDimension, u32>,
+    consumed: BTreeMap<BudgetDimension, BudgetUsage>,
     exhaustion_events: BTreeSet<(BudgetDimension, Fingerprint)>,
 }
 
+/// Per-dimension reservations with semantic idempotence and O(1) admission.
+///
+/// One event may account for many homogeneous units. Keeping the aggregate
+/// beside the event map avoids rescanning every previous reservation whenever
+/// a query-global group budget admits another node.
+#[derive(Debug, Clone, Default)]
+struct BudgetUsage {
+    units: u32,
+    events: BTreeMap<Fingerprint, u32>,
+}
+
 impl SearchLedger {
-    pub fn new(budget: SearchBudget) -> Self {
+    pub fn new(budget: impl Into<Arc<SearchBudget>>) -> Self {
         Self {
-            budget,
+            budget: budget.into(),
+            limit_overrides: BTreeMap::new(),
             consumed: BTreeMap::new(),
             exhaustion_events: BTreeSet::new(),
         }
@@ -256,20 +266,52 @@ impl SearchLedger {
         dimension: BudgetDimension,
         event: Fingerprint,
     ) -> BudgetDecision {
-        let events = self.consumed.entry(dimension).or_default();
-        if events.contains(&event) {
+        self.admit_optional_units(dimension, event, 1)
+    }
+
+    pub fn admit_optional_units(
+        &mut self,
+        dimension: BudgetDimension,
+        event: Fingerprint,
+        units: u32,
+    ) -> BudgetDecision {
+        if units == 0 {
+            return BudgetDecision::Allowed;
+        }
+        let limit = self.limit(dimension);
+        let usage = self.consumed.entry(dimension).or_default();
+        let previous = usage.events.get(&event).copied().unwrap_or(0);
+        if units <= previous {
             return BudgetDecision::Duplicate;
         }
-        if events.len() as u32 >= self.budget.optional_limit(dimension) {
+        // An incrementally rediscovered semantic event may expose a larger
+        // homogeneous batch. Charge only the newly observed suffix; silently
+        // treating it as a duplicate would make the budget non-conservative.
+        let additional = units - previous;
+        if usage.units.saturating_add(additional) > limit {
             self.exhaustion_events.insert((dimension, event));
             return BudgetDecision::Exhausted;
         }
-        events.insert(event);
+        usage.events.insert(event, units);
+        usage.units = usage.units.saturating_add(additional);
         BudgetDecision::Allowed
     }
 
     pub fn consumed(&self, dimension: BudgetDimension) -> usize {
-        self.consumed.get(&dimension).map_or(0, BTreeSet::len)
+        self.consumed
+            .get(&dimension)
+            .map_or(0, |usage| usage.units as usize)
+    }
+
+    pub fn set_limit(&mut self, dimension: BudgetDimension, limit: u32) {
+        self.limit_overrides.insert(dimension, limit);
+    }
+
+    fn limit(&self, dimension: BudgetDimension) -> u32 {
+        self.limit_overrides
+            .get(&dimension)
+            .copied()
+            .unwrap_or_else(|| self.budget.optional_limit(dimension))
     }
 
     /// Record an omission discovered by a lazy enumerator which stopped
@@ -288,20 +330,43 @@ impl SearchLedger {
         dimension: BudgetDimension,
         event: Fingerprint,
     ) -> bool {
-        self.consumed
-            .get_mut(&dimension)
-            .is_some_and(|events| events.remove(&event))
+        self.consumed.get_mut(&dimension).is_some_and(|usage| {
+            let Some(units) = usage.events.remove(&event) else {
+                return false;
+            };
+            usage.units = usage.units.saturating_sub(units);
+            true
+        })
     }
 
     pub fn merge_from(&mut self, other: &Self) {
-        for (&dimension, events) in &other.consumed {
-            self.consumed
+        for (&dimension, usage) in &other.consumed {
+            let target = self.consumed.entry(dimension).or_default();
+            for (&event, &units) in &usage.events {
+                let existing = target.events.entry(event).or_default();
+                if units > *existing {
+                    target.units = target.units.saturating_add(units - *existing);
+                    *existing = units;
+                }
+            }
+        }
+        for (&dimension, &limit) in &other.limit_overrides {
+            self.limit_overrides
                 .entry(dimension)
-                .or_default()
-                .extend(events.iter().copied());
+                .and_modify(|existing| *existing = (*existing).min(limit))
+                .or_insert(limit);
         }
         self.exhaustion_events
             .extend(other.exhaustion_events.iter().copied());
+    }
+
+    /// Restore reservations to a transactional savepoint while retaining
+    /// evidence that the abandoned attempt reached a search boundary.
+    pub fn rollback_to_preserving_exhaustion(&mut self, mut savepoint: Self) {
+        savepoint
+            .exhaustion_events
+            .extend(self.exhaustion_events.iter().copied());
+        *self = savepoint;
     }
 
     pub fn exhaustion_events(&self) -> impl Iterator<Item = &(BudgetDimension, Fingerprint)> {
@@ -316,7 +381,7 @@ mod tests {
     #[test]
     fn mandatory_work_is_never_rejected_by_optional_budget() {
         let mut budget = SearchBudget::default();
-        budget.max_optional_groups = 0;
+        budget.max_optional_groups_per_initial_group = 0;
         let ledger = SearchLedger::new(budget);
         assert_eq!(ledger.admit_mandatory(), BudgetDecision::Allowed);
     }
@@ -346,11 +411,11 @@ mod tests {
         let budget = SearchBudget::default();
         let mut left = SearchLedger::new(budget.clone());
         let mut right = SearchLedger::new(budget);
-        left.admit_optional(BudgetDimension::RuleFirePerGroup, Fingerprint(1));
-        right.admit_optional(BudgetDimension::RuleFirePerGroup, Fingerprint(1));
-        right.admit_optional(BudgetDimension::RuleFirePerGroup, Fingerprint(2));
+        left.admit_optional_units(BudgetDimension::RuleFirePerGroup, Fingerprint(1), 2);
+        right.admit_optional_units(BudgetDimension::RuleFirePerGroup, Fingerprint(1), 3);
+        right.admit_optional_units(BudgetDimension::RuleFirePerGroup, Fingerprint(2), 2);
         left.merge_from(&right);
-        assert_eq!(left.consumed(BudgetDimension::RuleFirePerGroup), 2);
+        assert_eq!(left.consumed(BudgetDimension::RuleFirePerGroup), 5);
     }
 
     #[test]
@@ -367,6 +432,38 @@ mod tests {
         assert!(ledger.release_optional_reservation(BudgetDimension::LogicalExprPerGroup, first));
         assert_eq!(
             ledger.admit_optional(BudgetDimension::LogicalExprPerGroup, second),
+            BudgetDecision::Allowed
+        );
+    }
+
+    #[test]
+    fn batch_admission_is_atomic_and_idempotent() {
+        let mut budget = SearchBudget::default();
+        budget.max_rule_work_units_per_group = 4;
+        let mut ledger = SearchLedger::new(budget);
+        let batch = Fingerprint(10);
+        assert_eq!(
+            ledger.admit_optional_units(BudgetDimension::RuleWorkPerGroup, batch, 2),
+            BudgetDecision::Allowed
+        );
+        assert_eq!(
+            ledger.admit_optional_units(BudgetDimension::RuleWorkPerGroup, batch, 2),
+            BudgetDecision::Duplicate
+        );
+        assert_eq!(
+            ledger.admit_optional_units(BudgetDimension::RuleWorkPerGroup, batch, 3),
+            BudgetDecision::Allowed
+        );
+        assert_eq!(ledger.consumed(BudgetDimension::RuleWorkPerGroup), 3);
+        assert_eq!(
+            ledger.admit_optional_units(BudgetDimension::RuleWorkPerGroup, Fingerprint(11), 2,),
+            BudgetDecision::Exhausted
+        );
+        assert_eq!(ledger.consumed(BudgetDimension::RuleWorkPerGroup), 3);
+        assert!(ledger.release_optional_reservation(BudgetDimension::RuleWorkPerGroup, batch));
+        assert_eq!(ledger.consumed(BudgetDimension::RuleWorkPerGroup), 0);
+        assert_eq!(
+            ledger.admit_optional_units(BudgetDimension::RuleWorkPerGroup, Fingerprint(11), 1,),
             BudgetDecision::Allowed
         );
     }

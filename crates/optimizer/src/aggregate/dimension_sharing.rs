@@ -11,11 +11,14 @@
 //! carried through the narrow union and become merge grouping keys. A hidden
 //! branch identity remains a grouping key even when the visible constants are
 //! equal, preserving the duplicate rows required by `UNION ALL` bag semantics.
+//! The equivalence is deliberately binary: a nested `UNION ALL` is not a
+//! branch shell and requires a future n-ary Memo expression, not recursive
+//! tree surgery with order-dependent intermediate schemas.
 
 use std::collections::{HashMap, HashSet};
 
 use paro_catalog::entry::CatalogEntry;
-use paro_common::error::Result;
+use paro_common::error::{self as paro_error, Result};
 use paro_common::runtime_value::Value;
 use paro_common::types::LogicalType;
 use paro_planner::binder::context::BindContext;
@@ -65,7 +68,7 @@ pub fn optimize_plan(plan: LogicalPlan, bind_context: &BindContext) -> Result<(L
     let Some(witness) = recognize(&plan) else {
         return Ok((plan, false));
     };
-    Ok((apply(plan, witness, bind_context), true))
+    Ok((apply(plan, witness, bind_context)?, true))
 }
 
 /// Exact semantic predicate used by the native Memo matcher before it spends
@@ -212,6 +215,7 @@ fn grouping_constants_prove_distinct(
         || right.value.is_null()
         || matches!(left.value, Value::Float(_) | Value::Double(_))
         || matches!(right.value, Value::Float(_) | Value::Double(_))
+        || matches!(left.return_type, LogicalType::VarcharCollation(_))
     {
         return false;
     }
@@ -524,15 +528,17 @@ fn apply(
     plan: LogicalPlan,
     witness: SharedDimensionWitness,
     bind_context: &BindContext,
-) -> LogicalPlan {
+) -> Result<LogicalPlan> {
     let (root_id, root_stats, operator) = plan.into_parts();
     let LogicalOperator::SetOperation(setop) = operator else {
-        unreachable!("shared dimension witness requires UNION ALL");
+        return Err(paro_error::internal(
+            "shared dimension witness lost its UNION ALL root",
+        ));
     };
-    let left = take_branch(*setop.left);
-    let right = take_branch(*setop.right);
+    let left = take_branch(*setop.left)?;
+    let right = take_branch(*setop.right)?;
 
-    let left_partial = aggregate_from_plan(&left.partial);
+    let left_partial = aggregate_from_plan(&left.partial)?;
     let partial_group_count = left_partial.groups.len();
     let partial_aggregate_count = left_partial.aggregates.len();
     let left_partial_group_index = left_partial.group_index;
@@ -586,13 +592,13 @@ fn apply(
         left_constants,
         witness.needs_hidden_branch_identity.then_some(0),
         bind_context,
-    );
+    )?;
     let right_arm = partial_union_arm(
         right_partial,
         right_constants,
         witness.needs_hidden_branch_identity.then_some(1),
         bind_context,
-    );
+    )?;
     let union_index = bind_context.generate_table_index();
     let branch_identity_ordinal = witness
         .needs_hidden_branch_identity
@@ -735,17 +741,19 @@ fn apply(
         })
         .collect();
     let projection = Projection::new(setop.table_index, final_input, output_expressions);
-    LogicalPlan {
+    Ok(LogicalPlan {
         id: root_id,
         stats: root_stats,
         operator: LogicalOperator::Projection(projection),
-    }
+    })
 }
 
-fn take_branch(plan: LogicalPlan) -> OwnedBranch {
+fn take_branch(plan: LogicalPlan) -> Result<OwnedBranch> {
     let (_, _, operator) = plan.into_parts();
     let LogicalOperator::Projection(projection) = operator else {
-        unreachable!("shared dimension witness requires a branch projection");
+        return Err(paro_error::internal(
+            "shared dimension witness lost a branch projection",
+        ));
     };
     let Projection {
         expressions: projection_expressions,
@@ -764,7 +772,9 @@ fn take_branch(plan: LogicalPlan) -> OwnedBranch {
         operator => (None, operator),
     };
     let LogicalOperator::Aggregate(mut outer) = operator else {
-        unreachable!("shared dimension witness requires an outer aggregate");
+        return Err(paro_error::internal(
+            "shared dimension witness lost an outer aggregate",
+        ));
     };
     let child = *std::mem::replace(
         &mut outer.child,
@@ -772,27 +782,31 @@ fn take_branch(plan: LogicalPlan) -> OwnedBranch {
     );
     let (_, _, operator) = child.into_parts();
     let LogicalOperator::Join(Join::Comparison(mut join)) = operator else {
-        unreachable!("shared dimension witness requires a comparison join");
+        return Err(paro_error::internal(
+            "shared dimension witness lost its comparison join",
+        ));
     };
     let dimension = *join.left;
     let partial = *join.right;
     join.left = Box::new(LogicalPlan::synthetic(LogicalOperator::DummyScan));
     join.right = Box::new(LogicalPlan::synthetic(LogicalOperator::DummyScan));
-    OwnedBranch {
+    Ok(OwnedBranch {
         projection_expressions,
         filter_expressions,
         outer,
         join,
         dimension,
         partial,
-    }
+    })
 }
 
-fn aggregate_from_plan(plan: &LogicalPlan) -> &Aggregate {
+fn aggregate_from_plan(plan: &LogicalPlan) -> Result<&Aggregate> {
     let LogicalOperator::Aggregate(aggregate) = &plan.operator else {
-        unreachable!("shared dimension witness requires a partial aggregate");
+        return Err(paro_error::internal(
+            "shared dimension witness lost a partial aggregate",
+        ));
     };
-    aggregate
+    Ok(aggregate)
 }
 
 fn partial_union_arm(
@@ -800,8 +814,8 @@ fn partial_union_arm(
     constants: Vec<Expression>,
     branch_identity: Option<u8>,
     bind_context: &BindContext,
-) -> LogicalPlan {
-    let partial = aggregate_from_plan(&partial_plan);
+) -> Result<LogicalPlan> {
+    let partial = aggregate_from_plan(&partial_plan)?;
     let expressions = (0..partial.groups.len())
         .map(|ordinal| {
             Expression::ColumnRef(ColumnRefExpression::new(
@@ -823,7 +837,7 @@ fn partial_union_arm(
             ))
         }))
         .collect();
-    LogicalPlan::new(
+    Ok(LogicalPlan::new(
         bind_context,
         LogicalOperator::Projection(
             Projection::new(
@@ -833,7 +847,7 @@ fn partial_union_arm(
             )
             .with_internal_outputs(),
         ),
-    )
+    ))
 }
 
 #[cfg(test)]
@@ -855,6 +869,14 @@ mod tests {
             .expect("plan union aggregate");
         let plan = planner.take_plan().expect("logical union aggregate");
         (plan, planner)
+    }
+
+    #[test]
+    fn collated_constants_never_prove_disjoint_grouping_domains() {
+        let logical_type = LogicalType::VarcharCollation("NOCASE".to_string());
+        let lower = ConstantExpression::new(Value::Varchar("s".to_string()), logical_type.clone());
+        let upper = ConstantExpression::new(Value::Varchar("S".to_string()), logical_type);
+        assert!(!grouping_constants_prove_distinct(&lower, &upper));
     }
 
     fn defer_branch_aggregates(plan: LogicalPlan, bind_context: &BindContext) -> LogicalPlan {

@@ -635,8 +635,8 @@ impl Optimizer {
 
         let budget = &self.budget;
         let config_values = [
-            u64::from(budget.max_optional_groups),
-            u64::from(budget.max_optional_composition_groups),
+            u64::from(budget.max_optional_groups_per_initial_group),
+            u64::from(budget.max_optional_composition_groups_per_initial_group),
             u64::from(budget.max_optional_logical_exprs_per_group),
             u64::from(budget.max_optional_composition_logical_exprs_per_group),
             u64::from(budget.max_optional_physical_exprs_per_group),

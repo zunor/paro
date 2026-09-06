@@ -1455,9 +1455,33 @@ fn refreshed_structural_cost(
     }
     let width_factor = (facts.output_row_width as f64 / 32.0).max(1.0);
     let child_count = facts.child_rows.len() as f64;
-    let expected = facts.output_rows.expected.max(1.0) * width_factor + child_count;
-    let upper =
-        facts.output_rows.upper.max(facts.output_rows.expected) * width_factor + child_count;
+    // A materialized CTE is a real breaker: its first child is written into
+    // retained storage before the consumer (the second child) can run.  The
+    // child candidates account for producing and consuming tuples, but not
+    // for this write.  Pricing only the wrapper's final output made a
+    // single-reference materialization appear cheaper than its inline peer
+    // whenever the consumer was selective.
+    let materialization_write = if metadata.operator_type == LogicalOperatorType::MaterializedCTE {
+        let producer = facts
+            .child_rows
+            .first()
+            .copied()
+            .unwrap_or(CompactRange::ZERO);
+        let producer_width = facts
+            .child_row_widths
+            .first()
+            .copied()
+            .unwrap_or(facts.output_row_width);
+        scaled_work(producer, (producer_width as f64 / 32.0).max(1.0))?
+    } else {
+        CompactRange::ZERO
+    };
+    let expected = facts.output_rows.expected.max(1.0) * width_factor
+        + child_count
+        + materialization_write.expected;
+    let upper = facts.output_rows.upper.max(facts.output_rows.expected) * width_factor
+        + child_count
+        + materialization_write.upper;
     let range = CompactRange::new(1.0_f64.min(expected), expected, upper.max(expected))?;
     let mut cost = SearchCost {
         score: ScoreSummary {
@@ -1765,14 +1789,34 @@ pub(super) fn planner_operator_cost(
     // publishes operator-specific structural coefficients.
     let output_row_width = planner_row_width(plan, scan_access_cost);
     let width_factor = (output_row_width as f64 / 32.0).max(1.0);
-    let expected = expected_rows * width_factor + child_count as f64;
+    let materialization_write = match &plan.operator {
+        LogicalOperator::MaterializedCTE(cte) => {
+            let producer_rows =
+                cte.cte_query
+                    .stats
+                    .estimated_cardinality
+                    .unwrap_or(CardinalityEstimate {
+                        min: 0,
+                        expected: 1,
+                        max: 4,
+                    });
+            let producer_width = planner_row_width(&cte.cte_query, scan_access_cost);
+            let factor = (producer_width as f64 / 32.0).max(1.0);
+            (
+                producer_rows.expected as f64 * factor,
+                producer_rows.max as f64 * factor,
+            )
+        }
+        _ => (0.0, 0.0),
+    };
+    let expected = expected_rows * width_factor + child_count as f64 + materialization_write.0;
     let upper_rows = plan
         .stats
         .estimated_cardinality
         .map(|cardinality| cardinality.max as f64)
         .unwrap_or(expected_rows * 4.0)
         .max(expected_rows);
-    let upper = upper_rows * width_factor + child_count as f64;
+    let upper = upper_rows * width_factor + child_count as f64 + materialization_write.1;
     let mut cost = SearchCost {
         score: ScoreSummary {
             range: CompactRange::new(1.0, expected, upper)?,
@@ -1789,12 +1833,18 @@ pub(super) fn planner_operator_cost(
         // tiny build side by many orders of magnitude under a hard grant.
         let resident_plan = match &plan.operator {
             LogicalOperator::Join(Join::Cross(cross)) => cross.right.as_ref(),
+            LogicalOperator::MaterializedCTE(cte) => cte.cte_query.as_ref(),
             _ => plan,
         };
         let row_width = planner_row_width(resident_plan, scan_access_cost);
         let resident_rows = match &plan.operator {
             LogicalOperator::Join(Join::Cross(_)) => child_rows_hard_upper
                 .get(1)
+                .copied()
+                .flatten()
+                .unwrap_or(u64::MAX),
+            LogicalOperator::MaterializedCTE(_) => child_rows_hard_upper
+                .first()
                 .copied()
                 .flatten()
                 .unwrap_or(u64::MAX),

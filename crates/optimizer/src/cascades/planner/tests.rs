@@ -9,14 +9,15 @@ use paro_catalog::entry::{CatalogObjectId, ColumnDefinition, TableCatalogEntry, 
 use paro_common::runtime_value::Value;
 use paro_common::types::LogicalType;
 use paro_function::aggregate::distributive::count::get_count_star_function;
+use paro_planner::binder::ir::CTEMaterialize;
 use paro_planner::expression::{
     AggregateExpression, ColumnRefExpression, ConstantExpression, Expression, ReferenceExpression,
     WindowExpression, WindowFrame,
 };
 use paro_planner::operator::join::{Join, JoinCondition, JoinType};
 use paro_planner::operator::{
-    CTERef, ComparisonJoin, EmptyResult, ExpressionGet, Filter, Get, GraphScan, Projection,
-    SetOperation, TopN, Window as LogicalWindow,
+    CTERef, ComparisonJoin, EmptyResult, ExpressionGet, Filter, Get, GraphScan, MaterializedCTE,
+    Projection, SetOperation, TopN, Window as LogicalWindow,
 };
 use paro_planner::plan::CardinalityEstimate;
 use paro_storage::table::table_factory::TableFactory;
@@ -61,6 +62,52 @@ fn cross_product_memory_tracks_only_the_materialized_build_side() {
     .expect("cross-product cost");
 
     assert_eq!(cost.peak_memory_upper, 3 * (8 + 8));
+}
+
+#[test]
+fn materialized_cte_cost_tracks_the_producer_write() {
+    let cost_for_rows = |rows| {
+        let mut producer =
+            LogicalPlan::synthetic(LogicalOperator::ExpressionGet(ExpressionGet::new(
+                0,
+                Vec::new(),
+                vec!["v".to_string()],
+                vec![LogicalType::BigInt],
+            )));
+        producer.stats.estimated_cardinality = Some(CardinalityEstimate::exact(rows));
+        let mut consumer = LogicalPlan::synthetic(LogicalOperator::CTERef(CTERef::new(
+            1,
+            1,
+            "shared".to_string(),
+            vec!["v".to_string()],
+            vec![LogicalType::BigInt],
+        )));
+        consumer.stats.estimated_cardinality = Some(CardinalityEstimate::exact(1));
+        let mut plan =
+            LogicalPlan::synthetic(LogicalOperator::MaterializedCTE(MaterializedCTE::new(
+                1,
+                "shared".to_string(),
+                vec!["v".to_string()],
+                vec![LogicalType::BigInt],
+                CTEMaterialize::Materialized,
+                producer,
+                consumer,
+            )));
+        plan.stats.estimated_cardinality = Some(CardinalityEstimate::exact(1));
+        planner_operator_cost(
+            &plan,
+            2,
+            Some(1),
+            &[Some(rows), Some(1)],
+            Default::default(),
+        )
+        .expect("materialized CTE cost")
+    };
+
+    let one_row = cost_for_rows(1);
+    let hundred_rows = cost_for_rows(100);
+    assert!(hundred_rows.work_latency.expected > one_row.work_latency.expected + 90.0);
+    assert!(hundred_rows.peak_memory_upper > one_row.peak_memory_upper);
 }
 
 #[test]

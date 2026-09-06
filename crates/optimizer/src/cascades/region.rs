@@ -489,7 +489,7 @@ mod tests {
     }
 
     #[test]
-    fn incremental_overlap_closure_matches_batch_oracle() {
+    fn incremental_overlap_closure_matches_batch_oracle_for_every_insertion_order() {
         fn reference(regions: &mut Vec<WorkingRegion>) {
             loop {
                 let mut pair = None;
@@ -532,22 +532,51 @@ mod tests {
             summary
         }
 
+        fn advance_permutation(order: &mut [usize]) -> bool {
+            let Some(pivot) = (0..order.len().saturating_sub(1))
+                .rev()
+                .find(|index| order[*index] < order[*index + 1])
+            else {
+                return false;
+            };
+            let successor = ((pivot + 1)..order.len())
+                .rev()
+                .find(|index| order[*index] > order[pivot])
+                .expect("permutation pivot has a successor");
+            order.swap(pivot, successor);
+            order[(pivot + 1)..].reverse();
+            true
+        }
+
         let scopes = [&[1, 2][..], &[2, 3], &[3, 4], &[5], &[1], &[4, 5]];
-        for order in [[0, 1, 2, 3, 4, 5], [5, 4, 3, 2, 1, 0], [1, 3, 5, 0, 2, 4]] {
-            let candidates = order.map(|index| {
+        let mut canonical = (0..scopes.len())
+            .map(|index| {
                 WorkingRegion::from_facet(facet(
                     index as u128 + 1,
                     FacetCriticality::Required,
                     scopes[index],
                 ))
-            });
-            let mut expected = candidates.to_vec();
-            reference(&mut expected);
+            })
+            .collect::<Vec<_>>();
+        reference(&mut canonical);
+        let expected = summary(canonical);
+        let mut order = (0..scopes.len()).collect::<Vec<_>>();
+        loop {
             let mut actual = Vec::new();
-            for candidate in candidates {
-                insert_overlap_closure(&mut actual, candidate);
+            for index in order.iter().copied() {
+                insert_overlap_closure(
+                    &mut actual,
+                    WorkingRegion::from_facet(facet(
+                        index as u128 + 1,
+                        FacetCriticality::Required,
+                        scopes[index],
+                    )),
+                );
             }
-            assert_eq!(summary(actual), summary(expected));
+            assert_eq!(summary(actual), expected, "insertion order {order:?}");
+            if !advance_permutation(&mut order) {
+                break;
+            }
         }
     }
 }

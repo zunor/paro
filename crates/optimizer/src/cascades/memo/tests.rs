@@ -925,11 +925,12 @@ fn region_facet_batch_matches_individual_normalization() {
 #[test]
 fn optional_group_budgets_are_query_global_isolated_and_observable() {
     let mut budget = SearchBudget::default();
-    budget.max_optional_groups = 1;
-    budget.max_optional_composition_groups = 1;
+    budget.max_optional_groups_per_initial_group = 1;
+    budget.max_optional_composition_groups_per_initial_group = 1;
     let mut memo = Memo::new(budget);
     memo.create_optional_group(
         BudgetDimension::Group,
+        Fingerprint(1),
         schema(1),
         LogicalProperties::default(),
         GroupCardinality::default(),
@@ -938,17 +939,19 @@ fn optional_group_budgets_are_query_global_isolated_and_observable() {
     assert!(memo
         .create_optional_group(
             BudgetDimension::Group,
+            Fingerprint(2),
             schema(1),
             LogicalProperties::default(),
             GroupCardinality::default(),
         )
-        .is_err());
+        .is_none());
     assert_eq!(
         memo.exhaustion_counts().get(&BudgetDimension::Group),
         Some(&1)
     );
     memo.create_optional_group(
         BudgetDimension::CompositionGroup,
+        Fingerprint(3),
         schema(1),
         LogicalProperties::default(),
         GroupCardinality::default(),
@@ -957,14 +960,89 @@ fn optional_group_budgets_are_query_global_isolated_and_observable() {
     assert!(memo
         .create_optional_group(
             BudgetDimension::CompositionGroup,
+            Fingerprint(4),
             schema(1),
             LogicalProperties::default(),
             GroupCardinality::default(),
         )
-        .is_err());
+        .is_none());
     assert_eq!(
         memo.exhaustion_counts()
             .get(&BudgetDimension::CompositionGroup),
+        Some(&1)
+    );
+}
+
+#[test]
+fn optional_group_budget_scales_with_initial_memo_and_rollback_refunds_credit() {
+    let mut budget = SearchBudget::default();
+    budget.max_optional_groups_per_initial_group = 2;
+    let mut memo = Memo::new(budget);
+    for column in 0..3 {
+        memo.create_group(
+            schema(column),
+            LogicalProperties::default(),
+            GroupCardinality::default(),
+        );
+    }
+    memo.seal_optional_group_budget();
+
+    let savepoint = memo.transformation_savepoint();
+    memo.create_optional_group(
+        BudgetDimension::Group,
+        Fingerprint(10),
+        schema(10),
+        LogicalProperties::default(),
+        GroupCardinality::default(),
+    )
+    .unwrap();
+    memo.rollback_transformation(savepoint).unwrap();
+
+    for identity in 10..16 {
+        memo.create_optional_group(
+            BudgetDimension::Group,
+            Fingerprint(identity),
+            schema(identity as u32),
+            LogicalProperties::default(),
+            GroupCardinality::default(),
+        )
+        .unwrap();
+    }
+    assert!(memo
+        .create_optional_group(
+            BudgetDimension::Group,
+            Fingerprint(16),
+            schema(16),
+            LogicalProperties::default(),
+            GroupCardinality::default(),
+        )
+        .is_none());
+}
+
+#[test]
+fn optional_group_rollback_preserves_exhaustion_evidence() {
+    let mut budget = SearchBudget::default();
+    budget.max_optional_groups_per_initial_group = 0;
+    let mut memo = Memo::new(budget);
+    memo.create_group(
+        schema(1),
+        LogicalProperties::default(),
+        GroupCardinality::default(),
+    );
+    memo.seal_optional_group_budget();
+    let savepoint = memo.transformation_savepoint();
+    assert!(memo
+        .create_optional_group(
+            BudgetDimension::Group,
+            Fingerprint(20),
+            schema(2),
+            LogicalProperties::default(),
+            GroupCardinality::default(),
+        )
+        .is_none());
+    memo.rollback_transformation(savepoint).unwrap();
+    assert_eq!(
+        memo.exhaustion_counts().get(&BudgetDimension::Group),
         Some(&1)
     );
 }

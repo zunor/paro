@@ -17,7 +17,7 @@ use paro_planner::binder::Binder;
 use paro_planner::expression::Expression;
 use paro_planner::operator::join::{AntiJoinMode, Join, JoinComparisonType, JoinType};
 use paro_planner::operator::{ColumnBinding, LogicalOperator, LogicalOperatorType};
-use paro_planner::plan::{LogicalPlan, NodeStats};
+use paro_planner::plan::{CardinalityEstimate, LogicalPlan, NodeStats};
 use paro_storage::statistics::ColumnStatistics;
 use tracing::debug;
 

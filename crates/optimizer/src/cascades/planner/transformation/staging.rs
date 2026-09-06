@@ -127,7 +127,7 @@ pub(super) fn stage_transformed_expression(
     fn stage_node(
         session: &mut StagingSession<'_>,
         request: NodeStagingRequest,
-    ) -> Result<(LogicalPlan, NodeState, Option<StagedEquivalent>)> {
+    ) -> Result<Option<(LogicalPlan, NodeState, Option<StagedEquivalent>)>> {
         let NodeStagingRequest {
             plan,
             target,
@@ -218,7 +218,7 @@ pub(super) fn stage_transformed_expression(
                 });
                 children.push(child);
             } else {
-                let (child, child_state, staged) = stage_node(
+                let Some((child, child_state, staged)) = stage_node(
                     session,
                     NodeStagingRequest {
                         plan: child,
@@ -230,7 +230,10 @@ pub(super) fn stage_transformed_expression(
                         refined_cardinality_kind: None,
                         preserved_child_groups: None,
                     },
-                )?;
+                )?
+                else {
+                    return Ok(None);
+                };
                 debug_assert!(staged.is_none());
                 children.push(child);
                 child_states.push(child_state);
@@ -407,7 +410,7 @@ pub(super) fn stage_transformed_expression(
                     .merge_equivalent_facts(&logical_properties);
                 existing.cardinality =
                     std::mem::take(&mut existing.cardinality).canonical_with(cardinality.clone());
-                return Ok((
+                return Ok(Some((
                     semantic_plan,
                     NodeState {
                         group,
@@ -418,7 +421,7 @@ pub(super) fn stage_transformed_expression(
                         ),
                     },
                     None,
-                ));
+                )));
             }
         }
 
@@ -440,12 +443,22 @@ pub(super) fn stage_transformed_expression(
             }
             target
         } else {
-            memo.create_optional_group(
+            let Some(group) = memo.create_optional_group(
                 options.group_budget,
+                {
+                    let mut allocation = StableFingerprintBuilder::default();
+                    allocation.write_bytes(b"paro.transformed-group.v1");
+                    allocation.write_fingerprint(logical_identity);
+                    allocation.write_u64(node_context.0 as u64);
+                    allocation.finish()
+                },
                 schema,
                 logical_properties.clone(),
                 cardinality.clone(),
-            )?
+            ) else {
+                return Ok(None);
+            };
+            group
         };
         let region_scope = PlannerRegionScope::new(
             group,
@@ -469,7 +482,7 @@ pub(super) fn stage_transformed_expression(
                     // Returning `None` lets the outer TransformContext roll
                     // back every recursively staged child and sidecar write;
                     // this expected miss is not an optimizer corruption.
-                    return Ok((
+                    return Ok(Some((
                         semantic_plan,
                         NodeState {
                             group,
@@ -477,9 +490,9 @@ pub(super) fn stage_transformed_expression(
                             region_scope,
                         },
                         None,
-                    ));
+                    )));
                 }
-                return Ok((
+                return Ok(Some((
                     semantic_plan,
                     NodeState {
                         group,
@@ -492,7 +505,7 @@ pub(super) fn stage_transformed_expression(
                         logical_properties,
                         cardinality,
                     }),
-                ));
+                )));
             }
         }
 
@@ -676,7 +689,7 @@ pub(super) fn stage_transformed_expression(
             }
             None
         };
-        Ok((
+        Ok(Some((
             semantic_plan,
             NodeState {
                 group,
@@ -684,7 +697,7 @@ pub(super) fn stage_transformed_expression(
                 region_scope,
             },
             staged,
-        ))
+        )))
     }
 
     let search_context =
@@ -717,7 +730,7 @@ pub(super) fn stage_transformed_expression(
             },
             pending_runtime_filter_facets: Vec::new(),
         };
-        let (_, root, staged) = stage_node(
+        let Some((_, root, staged)) = stage_node(
             &mut session,
             NodeStagingRequest {
                 plan,
@@ -729,7 +742,10 @@ pub(super) fn stage_transformed_expression(
                 refined_cardinality_kind,
                 preserved_child_groups: root_child_groups,
             },
-        )?;
+        )?
+        else {
+            return Ok(None);
+        };
         (root, staged, session.pending_runtime_filter_facets)
     };
     let Some(staged) = staged else {

@@ -22,39 +22,53 @@ FROM peers AS p
 JOIN agg AS a ON a.grp = p.grp
 ORDER BY p.id, p.peer_id;
 QUERY PLAN
-MATERIALIZED_CTE  (rows=0)
+MATERIALIZED_CTE  (rows=1)
   CTE Name: base
   Materialization: MATERIALIZED
   Reference Count: 3
   ->  VALUES  (rows=5)
-  ->  ORDER_BY  (rows=0)
-    Sort Key: p.id ASC NULLS LAST, p.peer_id ASC NULLS LAST
-    ->  PROJECTION  (rows=0)
-      Output: p.id, p.peer_id, a.total
-      ->  HASH_JOIN  (rows=0)
-        Join Type: INNER
-        Join Condition: a.grp = p.grp
-        ->  PROJECTION  (rows=3)
-          Output: grp, total
-          ->  AGGREGATE  (rows=3)
-            Group Key: base.grp
-            Aggregates: sum(base.amount)
+  ->  MATERIALIZED_CTE  (rows=1)
+    CTE Name: agg
+    Materialization: MATERIALIZED
+    Reference Count: 1
+    ->  PROJECTION  (rows=3)
+      Output: grp, total
+      ->  AGGREGATE  (rows=3)
+        Group Key: base.grp
+        Aggregates: sum(base.amount)
+        ->  CTE_SCAN  (rows=5)
+          CTE Index: 0
+          Table Index: 25
+    ->  MATERIALIZED_CTE  (rows=1)
+      CTE Name: peers
+      Materialization: MATERIALIZED
+      Reference Count: 1
+      ->  PROJECTION  (rows=1)
+        Output: l.id, peer_id, l.grp
+        ->  FILTER  (rows=1)
+          Filter: l.id < r.id
+          ->  HASH_JOIN  (rows=3)
+            Join Type: INNER
+            Join Condition: l.grp = r.grp
             ->  CTE_SCAN  (rows=5)
               CTE Index: 0
-              Table Index: 25
+              Table Index: 16
+            ->  CTE_SCAN  (rows=5)
+              CTE Index: 0
+              Table Index: 17
+      ->  ORDER_BY  (rows=1)
+        Sort Key: p.id ASC NULLS LAST, p.peer_id ASC NULLS LAST
         ->  PROJECTION  (rows=1)
-          Output: id, peer_id, grp
-          ->  FILTER  (rows=1)
-            Filter: l.id < r.id
-            ->  HASH_JOIN  (rows=3)
-              Join Type: INNER
-              Join Condition: l.grp = r.grp
-              ->  CTE_SCAN  (rows=5)
-                CTE Index: 0
-                Table Index: 16
-              ->  CTE_SCAN  (rows=5)
-                CTE Index: 0
-                Table Index: 17
+          Output: p.id, p.peer_id, a.total
+          ->  HASH_JOIN  (rows=1)
+            Join Type: INNER
+            Join Condition: a.grp = p.grp
+            ->  CTE_SCAN  (rows=3)
+              CTE Index: 1
+              Table Index: 26
+            ->  CTE_SCAN  (rows=1)
+              CTE Index: 2
+              Table Index: 18
 
 -- @normalize explain_operator_timing,explain_summary_timing
 EXPLAIN ANALYZE
@@ -86,34 +100,40 @@ PIPELINE 0
   SINK #1 CTE_MATERIALIZE (actual time=<time-range> rows=5 loops=<loops>)
 PIPELINE 1
   SOURCE #2 CTE_SCAN (actual time=<time-range> rows=5 loops=<loops>)
-  SINK #3 HASH_JOIN_BUILD (actual time=<time-range> rows=5 loops=<loops>)
+  SINK #3 HASH_AGGREGATE_BUILD (actual time=<time-range> rows=5 loops=<loops>)
 PIPELINE 2
-  SOURCE #4 CTE_SCAN (actual time=<time-range> rows=5 loops=<loops>)
-  TRANSFORM #5 HASH_JOIN_PROBE (actual time=<time-range> rows=9 loops=<loops>)
-  TRANSFORM #6 FILTER (actual time=<time-range> rows=2 loops=<loops>)
-  TRANSFORM #7 PROJECTION (actual time=<time-range> rows=2 loops=<loops>)
-  SINK #8 HASH_JOIN_BUILD (actual time=<time-range> rows=2 loops=<loops>)
+  SOURCE #4 HASH_AGGREGATE_EMIT (actual time=<time-range> rows=3 loops=<loops>)
+  TRANSFORM #5 PROJECTION (actual time=<time-range> rows=3 loops=<loops>)
+  SINK #6 CTE_MATERIALIZE (actual time=<time-range> rows=3 loops=<loops>)
 PIPELINE 3
-  SOURCE #9 HASH_JOIN_SPILL_REPLAY (actual time=<time-range> rows=0 loops=<loops>)
-  TRANSFORM #10 FILTER (actual time=<time-range> rows=0 loops=<loops>)
-  TRANSFORM #11 PROJECTION (actual time=<time-range> rows=0 loops=<loops>)
-  SINK #12 HASH_JOIN_BUILD (actual time=<time-range> rows=0 loops=<loops>)
+  SOURCE #7 CTE_SCAN (actual time=<time-range> rows=5 loops=<loops>)
+  SINK #8 HASH_JOIN_BUILD (actual time=<time-range> rows=5 loops=<loops>)
 PIPELINE 4
-  SOURCE #13 CTE_SCAN (actual time=<time-range> rows=5 loops=<loops>)
-  SINK #14 HASH_AGGREGATE_BUILD (actual time=<time-range> rows=5 loops=<loops>)
+  SOURCE #9 CTE_SCAN (actual time=<time-range> rows=5 loops=<loops>)
+  TRANSFORM #10 HASH_JOIN_PROBE (actual time=<time-range> rows=9 loops=<loops>)
+  TRANSFORM #11 FILTER (actual time=<time-range> rows=2 loops=<loops>)
+  TRANSFORM #12 PROJECTION (actual time=<time-range> rows=2 loops=<loops>)
+  SINK #13 CTE_MATERIALIZE (actual time=<time-range> rows=2 loops=<loops>)
 PIPELINE 5
-  SOURCE #15 HASH_AGGREGATE_EMIT (actual time=<time-range> rows=3 loops=<loops>)
-  TRANSFORM #16 PROJECTION (actual time=<time-range> rows=3 loops=<loops>)
-  TRANSFORM #17 HASH_JOIN_PROBE (actual time=<time-range> rows=2 loops=<loops>)
-  TRANSFORM #18 PROJECTION (actual time=<time-range> rows=2 loops=<loops>)
-  SINK #19 SORT_BUILD (actual time=<time-range> rows=2 loops=<loops> peak_memory_bytes=262148)
+  SOURCE #14 HASH_JOIN_SPILL_REPLAY (actual time=<time-range> rows=0 loops=<loops>)
+  TRANSFORM #15 FILTER (actual time=<time-range> rows=0 loops=<loops>)
+  TRANSFORM #16 PROJECTION (actual time=<time-range> rows=0 loops=<loops>)
+  SINK #17 CTE_MATERIALIZE (actual time=<time-range> rows=0 loops=<loops>)
 PIPELINE 6
-  SOURCE #20 HASH_JOIN_SPILL_REPLAY (actual time=<time-range> rows=0 loops=<loops>)
-  TRANSFORM #21 PROJECTION (actual time=<time-range> rows=0 loops=<loops>)
-  SINK #22 SORT_BUILD (actual time=<time-range> rows=0 loops=<loops>)
+  SOURCE #18 CTE_SCAN (actual time=<time-range> rows=2 loops=<loops>)
+  SINK #19 HASH_JOIN_BUILD (actual time=<time-range> rows=2 loops=<loops>)
 PIPELINE 7
-  SOURCE #23 SORT_EMIT (actual time=<time-range> rows=2 loops=<loops>)
-  SINK #24 CLIENT_RESULT (actual time=<time-range> rows=2 loops=<loops>)
+  SOURCE #20 CTE_SCAN (actual time=<time-range> rows=3 loops=<loops>)
+  TRANSFORM #21 HASH_JOIN_PROBE (actual time=<time-range> rows=2 loops=<loops>)
+  TRANSFORM #22 PROJECTION (actual time=<time-range> rows=2 loops=<loops>)
+  SINK #23 SORT_BUILD (actual time=<time-range> rows=2 loops=<loops> peak_memory_bytes=262148)
+PIPELINE 8
+  SOURCE #24 HASH_JOIN_SPILL_REPLAY (actual time=<time-range> rows=0 loops=<loops>)
+  TRANSFORM #25 PROJECTION (actual time=<time-range> rows=0 loops=<loops>)
+  SINK #26 SORT_BUILD (actual time=<time-range> rows=0 loops=<loops>)
+PIPELINE 9
+  SOURCE #27 SORT_EMIT (actual time=<time-range> rows=2 loops=<loops>)
+  SINK #28 CLIENT_RESULT (actual time=<time-range> rows=2 loops=<loops>)
 PROFILE schema_version=1 query_id=<id> events=<events> parallelism=<threads> workers=<workers> worker_utilization=<ratio> ready_time_us=<us> wait_time_us=<us> wake_coalesce=<count> backpressure=<count> runtime_filter_installed=0 runtime_filter_no_wait=0
 MEMORY_PROFILE grant_bytes=<bytes> revoked_bytes=<bytes> revocable_bytes=<bytes> spill_bytes=<bytes> spill_latency_us=<us> yield_latency_us=<us> repartition_depth=0
 Execution Time: <time-ms>

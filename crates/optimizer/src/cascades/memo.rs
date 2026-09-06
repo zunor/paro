@@ -584,11 +584,11 @@ pub struct Memo {
     optimization_context_index: BTreeMap<OptimizationContext, OptimizationContextId>,
     optimization_contexts_frozen: bool,
     logical_frontier_revision: u64,
-    budget: SearchBudget,
+    budget: Arc<SearchBudget>,
     calibration: Arc<MachineCalibrationBundle>,
     regions: RegionForest,
     global_ledger: SearchLedger,
-    optional_group_sequence: u64,
+    optional_group_budget_sealed: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -603,11 +603,13 @@ pub(crate) struct TransformationSavepoint {
     group_count: usize,
     logical_expression_count: usize,
     regions: RegionForest,
+    global_ledger: SearchLedger,
 }
 
 impl Memo {
     pub fn new(budget: SearchBudget) -> Self {
         let root_context = OptimizationContext::default();
+        let budget = Arc::new(budget);
         let global_ledger = SearchLedger::new(budget.clone());
         Self {
             groups: Vec::new(),
@@ -629,7 +631,7 @@ impl Memo {
             calibration: Arc::new(MachineCalibrationBundle::default()),
             regions: RegionForest::default(),
             global_ledger,
-            optional_group_sequence: 0,
+            optional_group_budget_sealed: false,
         }
     }
 
@@ -653,6 +655,7 @@ impl Memo {
             group_count: self.groups.len(),
             logical_expression_count: self.logical_exprs.len(),
             regions: self.regions.clone(),
+            global_ledger: self.global_ledger.clone(),
         }
     }
 
@@ -705,6 +708,8 @@ impl Memo {
         self.groups.truncate(savepoint.group_count);
         self.parents.truncate(savepoint.group_count);
         self.regions = savepoint.regions;
+        self.global_ledger
+            .rollback_to_preserving_exhaustion(savepoint.global_ledger);
         Ok(())
     }
 
@@ -838,29 +843,49 @@ impl Memo {
         id
     }
 
-    /// Create a group owned by optional transformation search. The admission
-    /// is query-global and intentionally survives a transformation rollback:
-    /// allocating and then discarding a staged subtree still consumed planner
-    /// work and must not manufacture fresh credit.
+    /// Freeze query-global group envelopes against the immutable initial Memo.
+    /// Optional group memory scales with query size; rollback restores these
+    /// reservations because discarded groups no longer consume memory. The
+    /// separate rule-work ledger retains the cost of discovering them.
+    pub(crate) fn seal_optional_group_budget(&mut self) {
+        if self.optional_group_budget_sealed {
+            return;
+        }
+        let initial_groups = u32::try_from(self.groups.len().max(1)).unwrap_or(u32::MAX);
+        self.global_ledger.set_limit(
+            BudgetDimension::Group,
+            initial_groups.saturating_mul(self.budget.max_optional_groups_per_initial_group),
+        );
+        self.global_ledger.set_limit(
+            BudgetDimension::CompositionGroup,
+            initial_groups.saturating_mul(
+                self.budget
+                    .max_optional_composition_groups_per_initial_group,
+            ),
+        );
+        self.optional_group_budget_sealed = true;
+    }
+
+    /// Create a group owned by optional transformation search. Exhaustion is
+    /// an expected incomplete-search result, never an internal error.
     pub(crate) fn create_optional_group(
         &mut self,
         dimension: BudgetDimension,
+        allocation_identity: Fingerprint,
         schema: GroupSchema,
         logical_properties: LogicalProperties,
         cardinality: GroupCardinality,
-    ) -> Result<GroupId> {
+    ) -> Option<GroupId> {
+        self.seal_optional_group_budget();
         let mut event = StableFingerprintBuilder::default();
-        event.write_bytes(b"paro.optional-group-allocation.v1");
-        event.write_u64(self.optional_group_sequence);
-        self.optional_group_sequence = self.optional_group_sequence.saturating_add(1);
+        event.write_bytes(b"paro.optional-group-allocation.v2");
+        event.write_fingerprint(allocation_identity);
         if self.global_ledger.admit_optional(dimension, event.finish())
-            == super::budget::BudgetDecision::Exhausted
+            != super::budget::BudgetDecision::Allowed
         {
-            return Err(paro_error::internal(
-                "optional transformation group budget exhausted",
-            ));
+            return None;
         }
-        Ok(self.create_group(schema, logical_properties, cardinality))
+        Some(self.create_group(schema, logical_properties, cardinality))
     }
 
     pub fn canonical_group(&self, mut id: GroupId) -> GroupId {
@@ -987,7 +1012,7 @@ impl Memo {
     }
 
     pub fn budget(&self) -> &SearchBudget {
-        &self.budget
+        self.budget.as_ref()
     }
 
     pub fn intern_required(&mut self, properties: RequiredProperties) -> Result<PropertySetId> {

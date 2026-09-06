@@ -369,6 +369,7 @@ impl CascadesEngine {
     }
 
     fn explore_transformations(&mut self) -> Result<()> {
+        self.memo.seal_optional_group_budget();
         let mut agenda = StableAgenda::default();
         for group_index in 0..self.memo.group_count() {
             let group = GroupId::new(group_index);
@@ -2240,25 +2241,19 @@ fn admit_transformation_work(
     work_units: usize,
     work_dimension: BudgetDimension,
 ) -> Result<bool> {
-    for ordinal in 0..work_units {
-        let mut event = StableFingerprintBuilder::default();
-        event.write_bytes(b"paro.rule-work.v4");
-        event.write_u64(target.0 as u64);
-        event.write_u64(source.0 as u64);
-        event.write_u64(rule.0 as u64);
-        event.write_fingerprint(dependency_version);
-        event.write_u64(ordinal as u64);
-        if memo
-            .group_mut(target)
-            .ok_or_else(|| paro_error::internal("rule work target group disappeared"))?
-            .ledger
-            .admit_optional(work_dimension, event.finish())
-            == BudgetDecision::Exhausted
-        {
-            return Ok(false);
-        }
-    }
-    Ok(true)
+    let units = u32::try_from(work_units).unwrap_or(u32::MAX);
+    let mut event = StableFingerprintBuilder::default();
+    event.write_bytes(b"paro.rule-work-batch.v1");
+    event.write_u64(target.0 as u64);
+    event.write_u64(source.0 as u64);
+    event.write_u64(rule.0 as u64);
+    event.write_fingerprint(dependency_version);
+    Ok(memo
+        .group_mut(target)
+        .ok_or_else(|| paro_error::internal("rule work target group disappeared"))?
+        .ledger
+        .admit_optional_units(work_dimension, event.finish(), units)
+        != BudgetDecision::Exhausted)
 }
 
 fn validate_transformation_proof(
