@@ -146,7 +146,13 @@ pub(super) fn stage_transformed_expression(
             preserved_child_groups,
         } = request;
         if target.is_none() {
-            if let Some(group) = session.nested_group_holes.remove(&plan.id.0) {
+            let nested_reference = match &plan.operator {
+                LogicalOperator::BoundReference(reference) => Some(reference.reference_id),
+                _ => None,
+            };
+            if let Some(group) = nested_reference
+                .and_then(|reference_id| session.nested_group_holes.remove(&reference_id))
+            {
                 let bindings = plan.get_column_bindings();
                 let types = plan.types();
                 if bindings.len() != types.len() {
@@ -364,8 +370,28 @@ pub(super) fn stage_transformed_expression(
                     .and_then(|group| group.logical_properties.maximum_cardinality)
             })
             .collect::<Vec<_>>();
-        let logical_properties =
+        let mut logical_properties =
             derive_logical_properties(&semantic_plan.operator, &child_maximum_cardinalities);
+        attach_group_column_domains(
+            &mut logical_properties,
+            &output_bindings,
+            &output_columns,
+            options.column_stats.as_ref(),
+            semantic_plan.stats.estimated_cardinality,
+        );
+        if let LogicalOperator::CTERef(reference) = &semantic_plan.operator {
+            logical_properties
+                .cte_references
+                .insert(CteReferenceDomain {
+                    cte_index: reference.cte_index,
+                    columns: output_columns.clone().into_boxed_slice(),
+                });
+        }
+        if let LogicalOperator::MaterializedCTE(cte) = &semantic_plan.operator {
+            if let Some(producer) = child_states.first() {
+                memo.register_cte_producer(cte.cte_index, producer.group, producer.columns.clone());
+            }
+        }
         let output_rows_hard_upper = logical_properties.maximum_cardinality;
         let search_candidate = if let Some(search_context) = options.search_context.filter(|_| {
             matches!(
@@ -435,8 +461,27 @@ pub(super) fn stage_transformed_expression(
         }
 
         if target.is_none() {
-            if let Some((group, _)) = state.expression_groups.get(&key).and_then(|candidates| {
-                candidates.iter().copied().find(|(group, logical)| {
+            // Group merges canonicalize child identities in the Memo without
+            // rewriting this sidecar's historical keys. Compare children in
+            // the current union-find domain so rediscovering the same shell
+            // reuses its group instead of colliding in the allocation ledger.
+            let equivalent_key =
+                |candidate: &LogicalExprKey| {
+                    candidate.operator == key.operator
+                        && candidate.scalars == key.scalars
+                        && candidate.children.len() == key.children.len()
+                        && candidate.children.iter().zip(key.children.iter()).all(
+                            |(left, right)| {
+                                memo.canonical_group(*left) == memo.canonical_group(*right)
+                            },
+                        )
+                };
+            if let Some((group, _)) = state
+                .expression_groups
+                .iter()
+                .filter(|(candidate, _)| equivalent_key(candidate))
+                .flat_map(|(_, candidates)| candidates.iter().copied())
+                .find(|(group, logical)| {
                     let payload = memo.logical_expr(*logical).map(|logical| logical.payload);
                     let context_matches = payload
                         .and_then(|payload| state.metadata.get(&payload))
@@ -455,7 +500,7 @@ pub(super) fn stage_transformed_expression(
                                     .same_contract(&logical_properties)
                         })
                 })
-            }) {
+            {
                 let group = memo.canonical_group(group);
                 let existing = memo.group_mut(group).ok_or_else(|| {
                     paro_error::internal("reused transformed expression lost its Memo group")
@@ -657,9 +702,19 @@ pub(super) fn stage_transformed_expression(
             cost_facts: planner_cost_facts(
                 &semantic_plan,
                 options.column_stats.as_ref(),
+                &state.binding_ids,
                 state.scan_access_cost,
             )?,
             output_columns: output_columns.clone().into_boxed_slice(),
+            child_layouts: semantic_plan
+                .children()
+                .into_iter()
+                .map(|child| PlannerBindingLayout {
+                    bindings: child.get_column_bindings().into_boxed_slice(),
+                    types: child.types().into_boxed_slice(),
+                })
+                .collect::<Vec<_>>()
+                .into_boxed_slice(),
             child_required: intern_child_requirements(
                 memo,
                 child_states.iter().map(|child| child.columns.as_ref()),

@@ -11,9 +11,11 @@
 //! carried through the narrow union and become merge grouping keys. A hidden
 //! branch identity remains a grouping key even when the visible constants are
 //! equal, preserving the duplicate rows required by `UNION ALL` bag semantics.
-//! The equivalence is deliberately binary: a nested `UNION ALL` is not a
-//! branch shell and requires a future n-ary Memo expression, not recursive
-//! tree surgery with order-dependent intermediate schemas.
+//! Nested binary parser nodes are treated as one associative n-ary UNION
+//! expression. Recognition binds every leaf against one semantic shell and
+//! application rebuilds the physical binary carrier only after the complete
+//! n-ary equivalence proof succeeds, so insertion/tree order cannot change
+//! which dimension is shared.
 
 use std::collections::{HashMap, HashSet};
 
@@ -90,94 +92,99 @@ fn recognize(plan: &LogicalPlan) -> Option<SharedDimensionWitness> {
     {
         return None;
     }
-    let Some(left) = branch_view(setop.left.as_ref()) else {
+    let mut arm_plans = Vec::new();
+    collect_union_all_arms(plan, &setop.types, &mut arm_plans)?;
+    if arm_plans.len() < 2 {
         return None;
-    };
-    let Some(right) = branch_view(setop.right.as_ref()) else {
-        return None;
-    };
-    if left.output_slots.len() != setop.column_count
-        || left.output_slots.len() != right.output_slots.len()
-        || left.outer.groups.len() != right.outer.groups.len()
-        || left.outer.aggregates.len() != right.outer.aggregates.len()
-        || left.partial.groups.len() != right.partial.groups.len()
-        || left.partial.aggregates.len() != right.partial.aggregates.len()
-        || left.join.conditions.len() != right.join.conditions.len()
-        || left
-            .partial
-            .groups
-            .iter()
-            .map(Expression::return_type)
-            .ne(right.partial.groups.iter().map(Expression::return_type))
-        || left
-            .partial
-            .aggregates
-            .iter()
-            .map(Expression::return_type)
-            .ne(right.partial.aggregates.iter().map(Expression::return_type))
-    {
+    }
+    let branches = arm_plans
+        .into_iter()
+        .map(branch_view)
+        .collect::<Option<Vec<_>>>()?;
+    let left = branches.first()?;
+    if left.output_slots.len() != setop.column_count {
         return None;
     }
 
-    let Some(binding_map) = equivalent_branch_bindings(&left, &right) else {
-        return None;
-    };
-    let filters_match = match (left.filter, right.filter) {
-        (None, None) => true,
-        (Some(left), Some(right)) => {
-            let right = right
-                .expressions
+    for right in branches.iter().skip(1) {
+        if left.output_slots.len() != right.output_slots.len()
+            || left.outer.groups.len() != right.outer.groups.len()
+            || left.outer.aggregates.len() != right.outer.aggregates.len()
+            || left.partial.groups.len() != right.partial.groups.len()
+            || left.partial.aggregates.len() != right.partial.aggregates.len()
+            || left.join.conditions.len() != right.join.conditions.len()
+            || left
+                .partial
+                .groups
                 .iter()
-                .map(|expression| remap_expression(expression, &binding_map))
-                .collect::<Option<Vec<_>>>();
-            right.is_some_and(|right| expression_multisets_equal(&left.expressions, &right))
-        }
-        _ => false,
-    };
-    if !filters_match
-        || !left
-            .outer
-            .groups
-            .iter()
-            .zip(&right.outer.groups)
-            .all(|(left, right)| {
-                remap_expression(right, &binding_map).is_some_and(|right| left.equals(&right))
-            })
-        || !left
-            .outer
-            .aggregates
-            .iter()
-            .zip(&right.outer.aggregates)
-            .all(|(left, right)| {
-                remap_expression(right, &binding_map).is_some_and(|right| left.equals(&right))
-            })
-        || !left
-            .join
-            .conditions
-            .iter()
-            .zip(&right.join.conditions)
-            .all(|(left, right)| {
-                left.comparison == right.comparison
-                    && remap_expression(&right.left, &binding_map)
-                        .is_some_and(|right| left.left.equals(&right))
-                    && remap_expression(&right.right, &binding_map)
-                        .is_some_and(|right| left.right.equals(&right))
-            })
-        || left.output_slots != right.output_slots
-    {
-        return None;
-    }
-
-    for (slot, (left_expression, right_expression)) in left.output_slots.iter().zip(
-        left.projection
-            .expressions
-            .iter()
-            .zip(&right.projection.expressions),
-    ) {
-        if *slot == OutputSlot::Constant
-            && left_expression.return_type() != right_expression.return_type()
+                .map(Expression::return_type)
+                .ne(right.partial.groups.iter().map(Expression::return_type))
+            || left
+                .partial
+                .aggregates
+                .iter()
+                .map(Expression::return_type)
+                .ne(right.partial.aggregates.iter().map(Expression::return_type))
         {
             return None;
+        }
+        let binding_map = equivalent_branch_bindings(left, right)?;
+        let filters_match = match (left.filter, right.filter) {
+            (None, None) => true,
+            (Some(left), Some(right)) => {
+                let right = right
+                    .expressions
+                    .iter()
+                    .map(|expression| remap_expression(expression, &binding_map))
+                    .collect::<Option<Vec<_>>>();
+                right.is_some_and(|right| expression_multisets_equal(&left.expressions, &right))
+            }
+            _ => false,
+        };
+        if !filters_match
+            || !left
+                .outer
+                .groups
+                .iter()
+                .zip(&right.outer.groups)
+                .all(|(left, right)| {
+                    remap_expression(right, &binding_map).is_some_and(|right| left.equals(&right))
+                })
+            || !left
+                .outer
+                .aggregates
+                .iter()
+                .zip(&right.outer.aggregates)
+                .all(|(left, right)| {
+                    remap_expression(right, &binding_map).is_some_and(|right| left.equals(&right))
+                })
+            || !left
+                .join
+                .conditions
+                .iter()
+                .zip(&right.join.conditions)
+                .all(|(left, right)| {
+                    left.comparison == right.comparison
+                        && remap_expression(&right.left, &binding_map)
+                            .is_some_and(|right| left.left.equals(&right))
+                        && remap_expression(&right.right, &binding_map)
+                            .is_some_and(|right| left.right.equals(&right))
+                })
+            || left.output_slots != right.output_slots
+        {
+            return None;
+        }
+        for (slot, (left_expression, right_expression)) in left.output_slots.iter().zip(
+            left.projection
+                .expressions
+                .iter()
+                .zip(&right.projection.expressions),
+        ) {
+            if *slot == OutputSlot::Constant
+                && left_expression.return_type() != right_expression.return_type()
+            {
+                return None;
+            }
         }
     }
 
@@ -187,20 +194,45 @@ fn recognize(plan: &LogicalPlan) -> Option<SharedDimensionWitness> {
         .enumerate()
         .filter_map(|(ordinal, slot)| (*slot == OutputSlot::Constant).then_some(ordinal))
         .collect::<Vec<_>>();
-    let visible_constants_prove_disjoint = constant_outputs.iter().any(|ordinal| {
-        let (Expression::Constant(left_constant), Expression::Constant(right_constant)) = (
-            &left.projection.expressions[*ordinal],
-            &right.projection.expressions[*ordinal],
-        ) else {
-            return false;
-        };
-        grouping_constants_prove_distinct(left_constant, right_constant)
+    let visible_constants_prove_disjoint = (0..branches.len()).all(|left_index| {
+        ((left_index + 1)..branches.len()).all(|right_index| {
+            constant_outputs.iter().any(|ordinal| {
+                let (Expression::Constant(left_constant), Expression::Constant(right_constant)) = (
+                    &branches[left_index].projection.expressions[*ordinal],
+                    &branches[right_index].projection.expressions[*ordinal],
+                ) else {
+                    return false;
+                };
+                grouping_constants_prove_distinct(left_constant, right_constant)
+            })
+        })
     });
     Some(SharedDimensionWitness {
         constant_outputs,
         needs_hidden_branch_identity: !visible_constants_prove_disjoint,
-        output_slots: left.output_slots,
+        output_slots: left.output_slots.clone(),
     })
+}
+
+fn collect_union_all_arms<'a>(
+    plan: &'a LogicalPlan,
+    output_types: &[LogicalType],
+    arms: &mut Vec<&'a LogicalPlan>,
+) -> Option<()> {
+    let LogicalOperator::SetOperation(setop) = &plan.operator else {
+        arms.push(plan);
+        return Some(());
+    };
+    if !setop.is_union_all()
+        || setop.column_count != output_types.len()
+        || setop.types != output_types
+        || setop.left.types() != output_types
+        || setop.right.types() != output_types
+    {
+        return None;
+    }
+    collect_union_all_arms(setop.left.as_ref(), output_types, arms)?;
+    collect_union_all_arms(setop.right.as_ref(), output_types, arms)
 }
 
 /// Prove two literals cannot land in the same SQL grouping domain. Floating
@@ -535,8 +567,19 @@ fn apply(
             "shared dimension witness lost its UNION ALL root",
         ));
     };
-    let left = take_branch(*setop.left)?;
-    let right = take_branch(*setop.right)?;
+    let mut branch_plans = Vec::new();
+    collect_owned_union_all_arms(*setop.left, &setop.types, &mut branch_plans)?;
+    collect_owned_union_all_arms(*setop.right, &setop.types, &mut branch_plans)?;
+    let mut branches = branch_plans
+        .into_iter()
+        .map(take_branch)
+        .collect::<Result<Vec<_>>>()?;
+    if branches.len() < 2 {
+        return Err(paro_error::internal(
+            "shared dimension n-ary witness requires at least two arms",
+        ));
+    }
+    let left = branches.remove(0);
 
     let left_partial = aggregate_from_plan(&left.partial)?;
     let partial_group_count = left_partial.groups.len();
@@ -557,7 +600,7 @@ fn apply(
         .chain(
             witness
                 .needs_hidden_branch_identity
-                .then_some(LogicalType::UTinyInt),
+                .then_some(LogicalType::UBigInt),
         )
         .collect::<Vec<LogicalType>>();
 
@@ -569,44 +612,38 @@ fn apply(
         dimension: left_dimension,
         partial: left_partial,
     } = left;
-    let OwnedBranch {
-        projection_expressions: right_projection_expressions,
-        filter_expressions: _,
-        outer: _,
-        join: _,
-        dimension: _,
-        partial: right_partial,
-    } = right;
     let left_constants = witness
         .constant_outputs
         .iter()
         .map(|ordinal| left_projection_expressions[*ordinal].clone())
         .collect();
-    let right_constants = witness
-        .constant_outputs
-        .iter()
-        .map(|ordinal| right_projection_expressions[*ordinal].clone())
-        .collect();
-    let left_arm = partial_union_arm(
+    let mut partial_arms = vec![partial_union_arm(
         left_partial,
         left_constants,
         witness.needs_hidden_branch_identity.then_some(0),
         bind_context,
-    )?;
-    let right_arm = partial_union_arm(
-        right_partial,
-        right_constants,
-        witness.needs_hidden_branch_identity.then_some(1),
-        bind_context,
-    )?;
-    let union_index = bind_context.generate_table_index();
+    )?];
+    for (index, branch) in branches.into_iter().enumerate() {
+        let constants = witness
+            .constant_outputs
+            .iter()
+            .map(|ordinal| branch.projection_expressions[*ordinal].clone())
+            .collect();
+        partial_arms.push(partial_union_arm(
+            branch.partial,
+            constants,
+            witness
+                .needs_hidden_branch_identity
+                .then_some(u64::try_from(index + 1).unwrap_or(u64::MAX)),
+            bind_context,
+        )?);
+    }
     let branch_identity_ordinal = witness
         .needs_hidden_branch_identity
         .then_some(union_types.len() - 1);
     let allow_out_of_order = setop.allow_out_of_order;
-    let mut partial_union =
-        SetOperation::union(union_index, left_arm, right_arm, true, union_types);
-    partial_union.allow_out_of_order = allow_out_of_order;
+    let (partial_union, union_index) =
+        build_nary_union_all(partial_arms, &union_types, allow_out_of_order, bind_context)?;
 
     let mut partial_to_union = HashMap::new();
     extend_positional_bindings(
@@ -632,7 +669,7 @@ fn apply(
         LogicalOperator::Join(Join::Comparison(ComparisonJoin::new(
             JoinType::Inner,
             left_dimension,
-            LogicalPlan::new(bind_context, LogicalOperator::SetOperation(partial_union)),
+            partial_union,
             conditions,
         ))),
     );
@@ -662,7 +699,7 @@ fn apply(
     if let Some(branch_identity_ordinal) = branch_identity_ordinal {
         final_groups.push(Expression::ColumnRef(ColumnRefExpression::new(
             ColumnBinding::new(union_index, branch_identity_ordinal),
-            LogicalType::UTinyInt,
+            LogicalType::UBigInt,
         )));
     }
     let final_aggregates = left_outer
@@ -800,6 +837,35 @@ fn take_branch(plan: LogicalPlan) -> Result<OwnedBranch> {
     })
 }
 
+fn collect_owned_union_all_arms(
+    plan: LogicalPlan,
+    output_types: &[LogicalType],
+    arms: &mut Vec<LogicalPlan>,
+) -> Result<()> {
+    let LogicalOperator::SetOperation(_) = &plan.operator else {
+        arms.push(plan);
+        return Ok(());
+    };
+    let (_, _, operator) = plan.into_parts();
+    let LogicalOperator::SetOperation(setop) = operator else {
+        return Err(paro_error::internal(
+            "shared dimension set-operation ownership split changed operator",
+        ));
+    };
+    if !setop.is_union_all()
+        || setop.column_count != output_types.len()
+        || setop.types != output_types
+        || setop.left.types() != output_types
+        || setop.right.types() != output_types
+    {
+        return Err(paro_error::internal(
+            "shared dimension n-ary witness changed before application",
+        ));
+    }
+    collect_owned_union_all_arms(*setop.left, output_types, arms)?;
+    collect_owned_union_all_arms(*setop.right, output_types, arms)
+}
+
 fn aggregate_from_plan(plan: &LogicalPlan) -> Result<&Aggregate> {
     let LogicalOperator::Aggregate(aggregate) = &plan.operator else {
         return Err(paro_error::internal(
@@ -812,7 +878,7 @@ fn aggregate_from_plan(plan: &LogicalPlan) -> Result<&Aggregate> {
 fn partial_union_arm(
     partial_plan: LogicalPlan,
     constants: Vec<Expression>,
-    branch_identity: Option<u8>,
+    branch_identity: Option<u64>,
     bind_context: &BindContext,
 ) -> Result<LogicalPlan> {
     let partial = aggregate_from_plan(&partial_plan)?;
@@ -832,8 +898,8 @@ fn partial_union_arm(
         .chain(constants)
         .chain(branch_identity.map(|branch_identity| {
             Expression::Constant(ConstantExpression::new(
-                Value::UTinyInt(branch_identity),
-                LogicalType::UTinyInt,
+                Value::UBigInt(branch_identity),
+                LogicalType::UBigInt,
             ))
         }))
         .collect();
@@ -850,13 +916,43 @@ fn partial_union_arm(
     ))
 }
 
+fn build_nary_union_all(
+    arms: Vec<LogicalPlan>,
+    types: &[LogicalType],
+    allow_out_of_order: bool,
+    bind_context: &BindContext,
+) -> Result<(LogicalPlan, usize)> {
+    let mut arms = arms.into_iter();
+    let mut union = arms
+        .next()
+        .ok_or_else(|| paro_error::internal("shared dimension n-ary union has no partial arms"))?;
+    let mut union_index = 0usize;
+    for arm in arms {
+        union_index = bind_context.generate_table_index();
+        let mut setop = SetOperation::union(union_index, union, arm, true, types.to_vec());
+        setop.allow_out_of_order = allow_out_of_order;
+        union = LogicalPlan::new(bind_context, LogicalOperator::SetOperation(setop));
+    }
+    if union_index == 0 {
+        return Err(paro_error::internal(
+            "shared dimension n-ary union requires at least two partial arms",
+        ));
+    }
+    Ok((union, union_index))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::aggregate::dimension_deferral;
+    use crate::cascades::planner::{AlternativeOrigin, LogicalAlternative, MemoBuilder};
+    use crate::cascades::SearchBudget;
+    use crate::physical::{ResourceGrantClass, SpillPolicy};
     use crate::subquery::partition_aggregate_tests::setup_session;
     use crate::verify::verify_logical_plan;
     use paro_planner::planner::Planner;
+    use std::collections::HashMap;
+    use std::sync::Arc;
 
     fn planned_union(sql: &str) -> (LogicalPlan, Planner) {
         let session = setup_session();
@@ -965,6 +1061,134 @@ mod tests {
             Some(3),
             "dimension group, visible constant, and hidden branch identity are all required: {plan:#?}"
         );
+    }
+
+    #[test]
+    fn three_union_arms_share_one_dimension_independent_of_binary_shape() {
+        let (plan, planner) = planned_union(
+            "SELECT n_name, sum(s_acctbal), 'a' FROM supplier JOIN nation \
+             ON s_nationkey = n_nationkey GROUP BY n_name \
+             UNION ALL \
+             SELECT n_name, sum(s_acctbal), 'b' FROM supplier JOIN nation \
+             ON s_nationkey = n_nationkey GROUP BY n_name \
+             UNION ALL \
+             SELECT n_name, sum(s_acctbal), 'c' FROM supplier JOIN nation \
+             ON s_nationkey = n_nationkey GROUP BY n_name",
+        );
+        let plan = defer_branch_aggregates(plan, &planner.binder.bind_context);
+        let (plan, changed) =
+            optimize_plan(plan, &planner.binder.bind_context).expect("share n-ary dimension");
+        assert!(changed, "{plan:#?}");
+        verify_logical_plan(&planner.binder.bind_context, &plan).expect("verify shared plan");
+
+        let mut nation_scans = 0;
+        let mut aggregates = 0;
+        plan.try_visit_pre_order(|node| {
+            match &node.operator {
+                LogicalOperator::Get(get)
+                    if get
+                        .table
+                        .as_ref()
+                        .is_some_and(|table| table.base.base.name == "nation") =>
+                {
+                    nation_scans += 1;
+                }
+                LogicalOperator::Aggregate(_) => aggregates += 1,
+                _ => {}
+            }
+            Ok(())
+        })
+        .expect("inspect n-ary shared plan");
+        assert_eq!(nation_scans, 1, "{plan:#?}");
+        assert_eq!(aggregates, 4, "three partials plus one merge: {plan:#?}");
+    }
+
+    #[test]
+    fn nary_sharing_plan_is_stable_across_default_budget_envelope() {
+        fn optimize(group_factor: u32) -> (crate::cascades::Fingerprint, f64, usize, u64) {
+            let session = setup_session();
+            let statement = paro_parser::parse_one(
+                "SELECT n_name, sum(s_acctbal), 'a' FROM supplier JOIN nation \
+                 ON s_nationkey = n_nationkey GROUP BY n_name \
+                 UNION ALL \
+                 SELECT n_name, sum(s_acctbal), 'b' FROM supplier JOIN nation \
+                 ON s_nationkey = n_nationkey GROUP BY n_name \
+                 UNION ALL \
+                 SELECT n_name, sum(s_acctbal), 'c' FROM supplier JOIN nation \
+                 ON s_nationkey = n_nationkey GROUP BY n_name",
+            )
+            .unwrap()
+            .stmt;
+            let mut planner = Planner::new(session.clone());
+            planner.create_plan(statement).unwrap();
+            let plan =
+                defer_branch_aggregates(planner.take_plan().unwrap(), &planner.binder.bind_context);
+            let mut budget = SearchBudget::default();
+            budget.max_optional_groups_per_initial_group = group_factor;
+            budget.max_optional_composition_groups_per_initial_group = group_factor;
+            let context = crate::context::OptimizationContext::new(
+                session,
+                planner.binder.bind_context.clone(),
+            );
+            let output = MemoBuilder::build_with_search(
+                vec![LogicalAlternative {
+                    plan,
+                    source: AlternativeOrigin::Baseline,
+                    column_stats: Arc::new(HashMap::new()),
+                }],
+                &planner.binder,
+                budget,
+                &context,
+            )
+            .unwrap()
+            .optimize(&[ResourceGrantClass {
+                id: crate::cascades::ResourceGrantClassId(0),
+                hard_memory_bytes: u64::MAX,
+                spill_policy: SpillPolicy::Allowed,
+                max_parallel_tasks: 1,
+            }])
+            .unwrap();
+            assert!(output
+                .rule_insertions
+                .get(&crate::cascades::rules::AGGREGATE_DIMENSION_SHARING_RULE)
+                .is_some_and(|count| *count > 0));
+            let winner = &output.variants[0];
+            let mut dimension_scans = 0;
+            winner
+                .plan
+                .try_visit_pre_order(|node| {
+                    if matches!(&node.operator, LogicalOperator::Get(get)
+                        if get.table.as_ref().is_some_and(|table| table.base.base.name == "nation"))
+                    {
+                        dimension_scans += 1;
+                    }
+                    Ok(())
+                })
+                .unwrap();
+            (
+                winner.physical_fingerprint,
+                winner.cost.score.range.expected,
+                dimension_scans,
+                output
+                    .rule_insertions
+                    .get(&crate::cascades::rules::AGGREGATE_DIMENSION_SHARING_RULE)
+                    .copied()
+                    .unwrap_or(0),
+            )
+        }
+
+        let variants = [8, 16, 32, 64, 128]
+            .into_iter()
+            .map(optimize)
+            .collect::<Vec<_>>();
+        assert!(variants
+            .iter()
+            .all(|(_, _, _, insertions)| *insertions >= 2));
+        assert!(variants.windows(2).all(|pair| pair[0].2 == pair[1].2));
+        assert!(variants.windows(2).all(|pair| pair[0].0 == pair[1].0));
+        assert!(variants
+            .windows(2)
+            .all(|pair| (pair[0].1 - pair[1].1).abs() < 1e-9));
     }
 
     #[test]

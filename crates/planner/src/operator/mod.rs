@@ -12,6 +12,7 @@ mod projection_map;
 
 pub mod aggregate;
 pub mod alter;
+pub mod bound_reference;
 pub mod copy_to;
 pub mod create_index;
 pub mod create_property_graph;
@@ -56,6 +57,7 @@ pub use aggregate::{
     Aggregate, GroupInputMultiplicity, PostAggregateReduction, SingletonGroupProof,
 };
 pub use alter::Alter;
+pub use bound_reference::BoundReference;
 pub use column_binding::ColumnBinding;
 pub use copy_to::CopyTo;
 pub use create_index::CreateIndex;

@@ -33,6 +33,32 @@ pub(super) fn dimension_sharing_pattern_bindings(
         partial_aggregate: LogicalExprId,
     }
 
+    #[derive(Debug, Clone)]
+    enum UnionSkeleton {
+        Branch {
+            group: GroupId,
+            branch: BranchSkeleton,
+        },
+        SetOperation {
+            group: GroupId,
+            expression: LogicalExprId,
+            left: Box<UnionSkeleton>,
+            right: Box<UnionSkeleton>,
+        },
+    }
+
+    impl UnionSkeleton {
+        fn branches(&self, output: &mut Vec<BranchSkeleton>) {
+            match self {
+                Self::Branch { branch, .. } => output.push(*branch),
+                Self::SetOperation { left, right, .. } => {
+                    left.branches(output);
+                    right.branches(output);
+                }
+            }
+        }
+    }
+
     struct LocalMatcher<'a> {
         memo: &'a Memo,
         state: &'a PlannerTransformState,
@@ -117,6 +143,19 @@ pub(super) fn dimension_sharing_pattern_bindings(
                 .is_some_and(|(left, right)| {
                     crate::aggregate::dimension_sharing::equivalent_dimension_gets(left, right)
                 })
+        }
+
+        fn union_dimensions_can_share(&self, skeleton: &UnionSkeleton) -> bool {
+            let mut branches = Vec::new();
+            skeleton.branches(&mut branches);
+            let Some(first) = branches.first().copied() else {
+                return false;
+            };
+            branches
+                .iter()
+                .copied()
+                .skip(1)
+                .all(|branch| self.dimensions_can_share(first, branch))
         }
 
         fn expressions(&mut self, group: GroupId) -> Result<Vec<LogicalExprId>> {
@@ -380,6 +419,94 @@ pub(super) fn dimension_sharing_pattern_bindings(
             self.expression_operand(group, skeleton.projection, vec![child])
         }
 
+        fn union_skeletons(&mut self, group: GroupId) -> Result<Vec<UnionSkeleton>> {
+            let group = self.memo.canonical_group(group);
+            let mut skeletons = self
+                .branch_skeletons(group)?
+                .into_iter()
+                .map(|branch| UnionSkeleton::Branch { group, branch })
+                .collect::<Vec<_>>();
+            for expression in self.expressions_of_type(group, LogicalOperatorType::LogicalUnion)? {
+                let (left_group, right_group) = {
+                    let logical = self.logical(expression)?;
+                    let [left_group, right_group] = logical.key.children.as_ref() else {
+                        continue;
+                    };
+                    (*left_group, *right_group)
+                };
+                let left = self.union_skeletons(left_group)?;
+                let right = self.union_skeletons(right_group)?;
+                'pairs: for left in &left {
+                    for right in &right {
+                        if !self.admit_work(1)? {
+                            break 'pairs;
+                        }
+                        skeletons.push(UnionSkeleton::SetOperation {
+                            group,
+                            expression,
+                            left: Box::new(left.clone()),
+                            right: Box::new(right.clone()),
+                        });
+                    }
+                }
+                if self.limited {
+                    break;
+                }
+            }
+            skeletons.sort_by_key(|skeleton| self.union_skeleton_fingerprint(skeleton));
+            skeletons.dedup_by_key(|skeleton| self.union_skeleton_fingerprint(skeleton));
+            Ok(skeletons)
+        }
+
+        fn union_skeleton_fingerprint(&self, skeleton: &UnionSkeleton) -> Fingerprint {
+            let mut fingerprint = StableFingerprintBuilder::default();
+            match skeleton {
+                UnionSkeleton::Branch { group, branch } => {
+                    fingerprint.write_bytes(b"paro.dimension-sharing.branch.v1");
+                    fingerprint.write_u64(group.0 as u64);
+                    fingerprint.write_fingerprint(self.operator_fingerprint(branch.projection));
+                    fingerprint
+                        .write_fingerprint(self.operator_fingerprint(branch.partial_aggregate));
+                }
+                UnionSkeleton::SetOperation {
+                    group,
+                    expression,
+                    left,
+                    right,
+                } => {
+                    fingerprint.write_bytes(b"paro.dimension-sharing.nary-union.v1");
+                    fingerprint.write_u64(group.0 as u64);
+                    fingerprint.write_fingerprint(self.operator_fingerprint(*expression));
+                    fingerprint.write_fingerprint(self.union_skeleton_fingerprint(left));
+                    fingerprint.write_fingerprint(self.union_skeleton_fingerprint(right));
+                }
+            }
+            fingerprint.finish()
+        }
+
+        fn union_operand(
+            &mut self,
+            skeleton: &UnionSkeleton,
+        ) -> Result<Option<(PatternOperand, Fingerprint)>> {
+            match skeleton {
+                UnionSkeleton::Branch { group, branch } => self.branch_operand(*group, *branch),
+                UnionSkeleton::SetOperation {
+                    group,
+                    expression,
+                    left,
+                    right,
+                } => {
+                    let Some(left) = self.union_operand(left)? else {
+                        return Ok(None);
+                    };
+                    let Some(right) = self.union_operand(right)? else {
+                        return Ok(None);
+                    };
+                    self.expression_operand(*group, *expression, vec![left, right])
+                }
+            }
+        }
+
         fn operand_nodes(operand: &PatternOperand) -> usize {
             match operand {
                 PatternOperand::Group(_) => 1,
@@ -442,8 +569,8 @@ pub(super) fn dimension_sharing_pattern_bindings(
         };
         (*left_group, *right_group)
     };
-    let left_skeletons = matcher.branch_skeletons(left_group)?;
-    let right_skeletons = matcher.branch_skeletons(right_group)?;
+    let left_skeletons = matcher.union_skeletons(left_group)?;
+    let right_skeletons = matcher.union_skeletons(right_group)?;
     debug!(
         target: targets::OPTIMIZER,
         group = root_group.index(),
@@ -479,26 +606,23 @@ pub(super) fn dimension_sharing_pattern_bindings(
             if !matcher.admit_work(1)? {
                 break 'frontiers;
             }
-            let left_skeleton = left_skeletons[left_index];
-            let right_skeleton = right_skeletons[right_index];
-            if !matcher.dimensions_can_share(left_skeleton, right_skeleton) {
+            let left_skeleton = &left_skeletons[left_index];
+            let right_skeleton = &right_skeletons[right_index];
+            let combined = UnionSkeleton::SetOperation {
+                group: root_group,
+                expression: root_expression,
+                left: Box::new(left_skeleton.clone()),
+                right: Box::new(right_skeleton.clone()),
+            };
+            if !matcher.union_dimensions_can_share(&combined) {
                 continue;
             }
-            let left = match matcher.branch_operand(left_group, left_skeleton)? {
-                Some(left) => left,
+            let root = match matcher.union_operand(&combined)? {
+                Some(root) => root,
                 None if matcher.limited => break 'frontiers,
                 None => continue,
             };
-            let right = match matcher.branch_operand(right_group, right_skeleton)? {
-                Some(right) => right,
-                None if matcher.limited => break 'frontiers,
-                None => continue,
-            };
-            let Some((root, fingerprint)) =
-                matcher.expression_operand(root_group, root_expression, vec![left, right])?
-            else {
-                break 'frontiers;
-            };
+            let (root, fingerprint) = root;
             // The output frontier counts semantic matches, not raw shell
             // pairs. Pre-admit the exact tree-clone work, instantiate the
             // bound candidate, and run the same proof recognizer used by

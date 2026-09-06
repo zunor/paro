@@ -35,105 +35,64 @@ pub(super) struct InstantiatedPlanWithGroupHoles {
 /// Instantiate the operator shells explicitly consumed by a pattern while
 /// retaining opaque group operands as staging boundaries.
 ///
-/// The temporary representative below a hole supplies the planner adapter's
-/// binding layout to legacy semantic code. Its descendants are never staged,
-/// costed, or used as an equivalence choice: the returned hole map replaces
-/// the complete subtree with the original Memo group atomically.
+/// A [`paro_planner::operator::BoundReference`] supplies only the binding,
+/// type, and cardinality contract consumed by legacy semantic code. It cannot
+/// be implemented and the returned hole map replaces it with the original
+/// Memo group atomically before the transformed expression is published.
 pub(super) fn instantiate_bound_plan_with_group_holes(
     memo: &Memo,
     state: &PlannerTransformState,
     binding: &PatternOperand,
 ) -> Result<InstantiatedPlanWithGroupHoles> {
-    fn materialize_group(
-        memo: &Memo,
+    fn group_hole_transport(
         state: &PlannerTransformState,
-        group: GroupId,
-        active: &mut BTreeSet<GroupId>,
+        layout: &PlannerBindingLayout,
+        cardinality: Option<(u64, u64, u64)>,
     ) -> Result<LogicalPlan> {
-        let group = memo.canonical_group(group);
-        if !active.insert(group) {
+        if layout.bindings.len() != layout.types.len() {
             return Err(paro_error::internal(
-                "recursive Memo group cannot be used as a finite planner transport",
+                "group-hole binding/type layout has inconsistent arity",
             ));
         }
-        let group_ref = memo
-            .group(group)
-            .ok_or_else(|| paro_error::internal("group hole references an unknown Memo group"))?;
-        let expression = group_ref
-            .logical_exprs()
-            .iter()
-            .copied()
-            .min_by_key(|expression| {
-                memo.logical_expr(*expression)
-                    .map(|logical| logical.key.stable_fingerprint())
-                    .unwrap_or_default()
-            })
-            .ok_or_else(|| paro_error::internal("group hole references an empty Memo group"))?;
-        let logical = memo
-            .logical_expr(expression)
-            .ok_or_else(|| paro_error::internal("group hole lost its logical expression"))?;
-        let payload = state
-            .payloads
-            .logical
-            .get(logical.payload.index())
-            .ok_or_else(|| paro_error::internal("group hole lost its planner payload"))?;
-        let children = logical
-            .key
-            .children
-            .iter()
-            .copied()
-            .map(|child| materialize_group(memo, state, child, active))
-            .collect::<Result<Vec<_>>>()?;
-        active.remove(&group);
-        let mut children = children.into_iter();
-        let mut plan = duplicate_plan_preserving_indices(
-            &payload.semantic_template,
-            state.bind_context.shared().as_ref(),
-        )
-        .try_map_children(|_| {
-            children
-                .next()
-                .ok_or_else(|| paro_error::internal("group-hole transport lost a child expression"))
-        })?;
-        if children.next().is_some() {
-            return Err(paro_error::internal(
-                "group-hole transport produced an extra child expression",
-            ));
-        }
+        let reference_id = state.bind_context.next_plan_id().0;
+        let mut plan = LogicalPlan::new(
+            &state.bind_context,
+            LogicalOperator::BoundReference(paro_planner::operator::BoundReference::new(
+                reference_id,
+                layout.bindings.to_vec(),
+                layout.types.to_vec(),
+            )),
+        );
+        debug_assert_ne!(reference_id, paro_planner::plan::PlanNodeId::SYNTHETIC.0);
         plan.stats.estimated_cardinality =
-            memo.cardinality_estimate(group)
-                .map(
-                    |(min, expected, max)| paro_planner::plan::CardinalityEstimate {
-                        min,
-                        expected,
-                        max,
-                    },
-                );
-        let output_columns = state
-            .metadata
-            .get(&logical.payload)
-            .ok_or_else(|| paro_error::internal("group hole has no operator metadata"))?
-            .output_columns
-            .clone();
-        freeze_output_layout(plan, &output_columns, state)
+            cardinality.map(
+                |(min, expected, max)| paro_planner::plan::CardinalityEstimate {
+                    min,
+                    expected,
+                    max,
+                },
+            );
+        Ok(plan)
     }
 
     fn instantiate(
         memo: &Memo,
         state: &PlannerTransformState,
         binding: &PatternOperand,
+        expected_layout: Option<&PlannerBindingLayout>,
         holes: &mut BTreeMap<u32, GroupId>,
     ) -> Result<LogicalPlan> {
         match binding {
             PatternOperand::Group(group) => {
                 let group = memo.canonical_group(*group);
-                let plan = materialize_group(memo, state, group, &mut BTreeSet::new())?;
-                if plan.id == paro_planner::plan::PlanNodeId::SYNTHETIC {
-                    return Err(paro_error::internal(
-                        "group-hole transport requires a stable planner node identity",
-                    ));
-                }
-                if holes.insert(plan.id.0, group).is_some() {
+                let layout = expected_layout.ok_or_else(|| {
+                    paro_error::internal("root Memo group cannot be an untyped pattern hole")
+                })?;
+                let plan = group_hole_transport(state, layout, memo.cardinality_estimate(group))?;
+                let LogicalOperator::BoundReference(reference) = &plan.operator else {
+                    unreachable!("group-hole transport constructor returned another operator")
+                };
+                if holes.insert(reference.reference_id, group).is_some() {
                     return Err(paro_error::internal(
                         "group-hole transport reused a planner node identity",
                     ));
@@ -155,6 +114,9 @@ pub(super) fn instantiate_bound_plan_with_group_holes(
                     .ok_or_else(|| {
                         paro_error::internal("planner rule references unknown payload")
                     })?;
+                let metadata = state.metadata.get(&logical.payload).ok_or_else(|| {
+                    paro_error::internal("planner rule payload has no operator metadata")
+                })?;
                 if children.len() != logical.key.children.len() {
                     return Err(paro_error::internal(
                         "pattern binding child arity disagrees with its logical expression",
@@ -162,7 +124,10 @@ pub(super) fn instantiate_bound_plan_with_group_holes(
                 }
                 let bound_children = children
                     .iter()
-                    .map(|child| instantiate(memo, state, child, holes))
+                    .enumerate()
+                    .map(|(index, child)| {
+                        instantiate(memo, state, child, metadata.child_layouts.get(index), holes)
+                    })
                     .collect::<Result<Vec<_>>>()?;
                 let mut bound_children = bound_children.into_iter();
                 let mut plan = duplicate_plan_preserving_indices(
@@ -188,21 +153,14 @@ pub(super) fn instantiate_bound_plan_with_group_holes(
                                 max,
                             },
                         );
-                let output_columns = state
-                    .metadata
-                    .get(&logical.payload)
-                    .ok_or_else(|| {
-                        paro_error::internal("planner rule payload has no operator metadata")
-                    })?
-                    .output_columns
-                    .clone();
+                let output_columns = metadata.output_columns.clone();
                 freeze_output_layout(plan, &output_columns, state)
             }
         }
     }
 
     let mut group_holes = BTreeMap::new();
-    let plan = instantiate(memo, state, binding, &mut group_holes)?;
+    let plan = instantiate(memo, state, binding, None, &mut group_holes)?;
     Ok(InstantiatedPlanWithGroupHoles { plan, group_holes })
 }
 
@@ -325,6 +283,7 @@ pub(super) fn freeze_output_layout(
         }
         LogicalOperator::Join(Join::Cross(_))
         | LogicalOperator::Get(_)
+        | LogicalOperator::BoundReference(_)
         | LogicalOperator::Projection(_)
         | LogicalOperator::RowFetch(_)
         | LogicalOperator::ExternalProject(_)
@@ -391,6 +350,7 @@ fn canonicalize_projection_maps(operator: &mut LogicalOperator) {
         }
         LogicalOperator::Join(Join::Cross(_))
         | LogicalOperator::Get(_)
+        | LogicalOperator::BoundReference(_)
         | LogicalOperator::Projection(_)
         | LogicalOperator::RowFetch(_)
         | LogicalOperator::ExternalProject(_)

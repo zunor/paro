@@ -28,6 +28,74 @@ pub struct LogicalProperties {
     pub unique_keys: BTreeSet<Box<[super::ids::ColumnId]>>,
     pub outer_references: BTreeSet<super::ids::ColumnId>,
     pub maximum_cardinality: Option<u64>,
+    /// Expression-independent domains keyed by the group's stable ColumnIds.
+    /// Physical alternatives and parent transformations consume this shared
+    /// fact instead of retaining an expression-local statistics snapshot.
+    pub column_domains: BTreeMap<super::ids::ColumnId, GroupColumnDomain>,
+    /// Positional bridges from CTE scan-local ColumnIds to producer groups.
+    /// Equivalent references may originate from different CTE identities, so
+    /// this is a canonical set rather than an insertion-order-sensitive slot.
+    /// No physical winner or materialized payload is captured here.
+    pub cte_references: BTreeSet<CteReferenceDomain>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+pub struct CteReferenceDomain {
+    pub cte_index: usize,
+    pub columns: Box<[super::ids::ColumnId]>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+struct CteProducerDomain {
+    group: GroupId,
+    columns: Box<[super::ids::ColumnId]>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct GroupColumnDomain {
+    /// Hull of observed/estimated NDV evidence for equivalent expressions.
+    pub expected_lower: u64,
+    pub expected_upper: u64,
+    /// Predicate/schema proof. Unlike observed HLL state, this remains a safe
+    /// upper bound after data changes permitted by the compiled plan.
+    pub guaranteed_upper: Option<u64>,
+}
+
+impl GroupColumnDomain {
+    pub fn new(expected: Option<u64>, guaranteed_upper: Option<u64>) -> Option<Self> {
+        if expected.is_none() && guaranteed_upper.is_none() {
+            return None;
+        }
+        let expected = expected.unwrap_or(0);
+        Some(Self {
+            expected_lower: expected,
+            expected_upper: expected,
+            guaranteed_upper,
+        })
+    }
+
+    pub fn expected(self) -> Option<u64> {
+        (self.expected_upper > 0).then(|| {
+            self.expected_lower
+                .saturating_add(self.expected_upper.saturating_sub(self.expected_lower) / 2)
+        })
+    }
+
+    pub(crate) fn canonical_with(self, other: Self) -> Self {
+        Self {
+            expected_lower: match (self.expected_lower, other.expected_lower) {
+                (0, right) => right,
+                (left, 0) => left,
+                (left, right) => left.min(right),
+            },
+            expected_upper: self.expected_upper.max(other.expected_upper),
+            guaranteed_upper: match (self.guaranteed_upper, other.guaranteed_upper) {
+                (Some(left), Some(right)) => Some(left.min(right)),
+                (Some(bound), None) | (None, Some(bound)) => Some(bound),
+                (None, None) => None,
+            },
+        }
+    }
 }
 
 impl LogicalProperties {
@@ -41,6 +109,14 @@ impl LogicalProperties {
             (Some(bound), None) | (None, Some(bound)) => Some(bound),
             (None, None) => None,
         };
+        for (&column, &domain) in &other.column_domains {
+            self.column_domains
+                .entry(column)
+                .and_modify(|current| *current = current.canonical_with(domain))
+                .or_insert(domain);
+        }
+        self.cte_references
+            .extend(other.cte_references.iter().cloned());
     }
 
     fn stable_fact_fingerprint(&self) -> Fingerprint {
@@ -60,6 +136,24 @@ impl LogicalProperties {
         fingerprint.write_u64(self.maximum_cardinality.is_some() as u64);
         if let Some(maximum) = self.maximum_cardinality {
             fingerprint.write_u64(maximum);
+        }
+        fingerprint.write_u64(self.column_domains.len() as u64);
+        for (column, domain) in &self.column_domains {
+            fingerprint.write_u64(column.0 as u64);
+            fingerprint.write_u64(domain.expected_lower);
+            fingerprint.write_u64(domain.expected_upper);
+            fingerprint.write_u64(domain.guaranteed_upper.is_some() as u64);
+            if let Some(upper) = domain.guaranteed_upper {
+                fingerprint.write_u64(upper);
+            }
+        }
+        fingerprint.write_u64(self.cte_references.len() as u64);
+        for reference in &self.cte_references {
+            fingerprint.write_u64(reference.cte_index as u64);
+            fingerprint.write_u64(reference.columns.len() as u64);
+            for column in &reference.columns {
+                fingerprint.write_u64(column.0 as u64);
+            }
         }
         fingerprint.finish()
     }
@@ -593,6 +687,7 @@ pub struct Memo {
     regions: RegionForest,
     global_ledger: SearchLedger,
     optional_group_budget_sealed: bool,
+    cte_producers: BTreeMap<usize, BTreeSet<CteProducerDomain>>,
 }
 
 #[derive(Debug, Clone)]
@@ -608,6 +703,7 @@ pub(crate) struct TransformationSavepoint {
     logical_expression_count: usize,
     regions: RegionForest,
     global_ledger: SearchLedger,
+    cte_producers: BTreeMap<usize, BTreeSet<CteProducerDomain>>,
 }
 
 impl Memo {
@@ -636,6 +732,7 @@ impl Memo {
             regions: RegionForest::default(),
             global_ledger,
             optional_group_budget_sealed: false,
+            cte_producers: BTreeMap::new(),
         }
     }
 
@@ -645,6 +742,61 @@ impl Memo {
 
     pub fn calibration(&self) -> &MachineCalibrationBundle {
         self.calibration.as_ref()
+    }
+
+    pub(crate) fn register_cte_producer(
+        &mut self,
+        cte_index: usize,
+        group: GroupId,
+        columns: Box<[super::ids::ColumnId]>,
+    ) {
+        let group = self.canonical_group(group);
+        self.cte_producers
+            .entry(cte_index)
+            .or_default()
+            .insert(CteProducerDomain { group, columns });
+    }
+
+    /// Resolve a column domain through the relational group, including a CTE
+    /// scan's positional dependency on every equivalent producer expression.
+    /// Multiple producer witnesses form an uncertainty hull; none is selected
+    /// by a physical winner, so cost search cannot freeze stale payload stats.
+    pub(crate) fn column_domain(
+        &self,
+        group: GroupId,
+        column: super::ids::ColumnId,
+    ) -> Option<GroupColumnDomain> {
+        let group = self.group(self.canonical_group(group))?;
+        let direct = group
+            .logical_properties
+            .column_domains
+            .get(&column)
+            .copied();
+        let producer = group
+            .logical_properties
+            .cte_references
+            .iter()
+            .filter_map(|reference| {
+                let ordinal = reference
+                    .columns
+                    .iter()
+                    .position(|candidate| *candidate == column)?;
+                self.cte_producers
+                    .get(&reference.cte_index)?
+                    .iter()
+                    .filter_map(|producer| {
+                        let producer_group = self.group(self.canonical_group(producer.group))?;
+                        let producer_column = *producer.columns.get(ordinal)?;
+                        producer_group
+                            .logical_properties
+                            .column_domains
+                            .get(&producer_column)
+                            .copied()
+                    })
+                    .reduce(GroupColumnDomain::canonical_with)
+            })
+            .reduce(GroupColumnDomain::canonical_with);
+        producer.or(direct)
     }
 
     pub fn set_regions(&mut self, regions: RegionForest) {
@@ -660,6 +812,7 @@ impl Memo {
             logical_expression_count: self.logical_exprs.len(),
             regions: self.regions.clone(),
             global_ledger: self.global_ledger.clone(),
+            cte_producers: self.cte_producers.clone(),
         }
     }
 
@@ -735,6 +888,7 @@ impl Memo {
         self.regions = savepoint.regions;
         self.global_ledger
             .rollback_to_preserving_exhaustion(savepoint.global_ledger);
+        self.cte_producers = savepoint.cte_producers;
         Ok(())
     }
 
@@ -958,7 +1112,22 @@ impl Memo {
                 return None;
             }
             let group = memo.group(id)?;
-            let mut envelope = group.cardinality.range;
+            let producer_envelope = group
+                .logical_properties
+                .cte_references
+                .iter()
+                .flat_map(|reference| {
+                    memo.cte_producers
+                        .get(&reference.cte_index)
+                        .into_iter()
+                        .flatten()
+                })
+                .filter_map(|producer| resolve(memo, producer.group, visiting))
+                .reduce(CardinalityEnvelope::hull);
+            // A CTE scan observes the current producer relation. Its own
+            // payload statistics are only a fallback when the producer has
+            // not entered the Memo yet.
+            let mut envelope = producer_envelope.or(group.cardinality.range);
             for input in &group.cardinality.inputs {
                 if let Some(input) = resolve(memo, *input, visiting) {
                     envelope = Some(match envelope {

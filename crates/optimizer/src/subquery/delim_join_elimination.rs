@@ -421,6 +421,7 @@ impl DelimJoinElimination {
                 Self::remove_first_redundant_join(&mut expand.child.operator)
             }
             LogicalOperator::Get(_)
+            | LogicalOperator::BoundReference(_)
             | LogicalOperator::ExpressionGet(_)
             | LogicalOperator::DelimGet(_)
             | LogicalOperator::DependentJoin(_)

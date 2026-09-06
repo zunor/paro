@@ -211,6 +211,7 @@ impl<'a> RecursiveSubqueryPlanner<'a> {
             | LogicalOperator::FullTextFilterScan(_)
             | LogicalOperator::ExpressionGet(_) => Ok(false),
             LogicalOperator::Get(_)
+            | LogicalOperator::BoundReference(_)
             | LogicalOperator::Alter(_)
             | LogicalOperator::CreateTable(_)
             | LogicalOperator::CreateRoutine(_)

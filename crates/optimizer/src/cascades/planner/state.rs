@@ -268,6 +268,10 @@ pub(super) struct PlannerOperatorMetadata {
     pub(super) spillable: bool,
     pub(super) cost_facts: PlannerCostFacts,
     pub(super) output_columns: Box<[ColumnId]>,
+    /// Binding layouts consumed by this exact operator shell. Native group
+    /// holes use these layouts directly; they never materialize a descendant
+    /// expression merely to recover planner-era column identities.
+    pub(super) child_layouts: Box<[PlannerBindingLayout]>,
     pub(super) child_required: Box<[PropertySetId]>,
     pub(super) child_row_goals: Box<[PlannerChildRowGoal]>,
     pub(super) search: Option<PlannerSearchImplementationMetadata>,
@@ -280,6 +284,12 @@ pub(super) struct PlannerOperatorMetadata {
     pub(super) runtime_filter_region_facet: Option<Fingerprint>,
     pub(super) structural_retained_children: u64,
     pub(super) baseline_payload: PhysicalPayloadId,
+}
+
+#[derive(Debug, Clone)]
+pub(super) struct PlannerBindingLayout {
+    pub(super) bindings: Box<[ColumnBinding]>,
+    pub(super) types: Box<[LogicalType]>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -328,9 +338,13 @@ pub(super) struct PlannerCostFacts {
     /// Snapshot estimate of the distinct build-key domain. This ranks
     /// runtime-filter benefit; it never proves capacity or correctness.
     pub(super) runtime_filter_build_distinct_expected: Option<u64>,
+    /// Stable output identity used to resolve the current build domain from
+    /// the right child group at cost-composition time.
+    pub(super) runtime_filter_build_domain_column: Option<ColumnId>,
     /// Snapshot estimate for the logical-left key domain when a physical
     /// implementation inverts build and probe.
     pub(super) runtime_filter_build_left_distinct_expected: Option<u64>,
+    pub(super) runtime_filter_build_left_domain_column: Option<ColumnId>,
     pub(super) runtime_filter_key_types: Box<[LogicalType]>,
 }
 

@@ -58,9 +58,9 @@ use super::ids::{
     PropertySetId, QualityPolicyId, RuleId, ScalarExprId, SnapshotId, StableFingerprintBuilder,
 };
 use super::memo::{
-    CardinalityEnvelope, CardinalityRecipeKind, ChildWinnerRef, EquivalenceProof, GrantGoalKey,
-    GroupCardinality, LogicalExprKey, LogicalProperties, Memo, OptimizationContext,
-    OptimizationGoal, PhysicalExprKey, RowGoal,
+    CardinalityEnvelope, CardinalityRecipeKind, ChildWinnerRef, CteReferenceDomain,
+    EquivalenceProof, GrantGoalKey, GroupCardinality, GroupColumnDomain, LogicalExprKey,
+    LogicalProperties, Memo, OptimizationContext, OptimizationGoal, PhysicalExprKey, RowGoal,
 };
 use super::properties::{
     MutationSafetyRequirement, NullOrder, OrderingKey, OrderingRequirement, OrderingScope,
@@ -177,7 +177,7 @@ fn stage_search_implementation(
     };
     let local_cost =
         planner_operator_cost(&plan, 0, output_rows_hard_upper, &[], scan_access_cost)?;
-    let cost_facts = planner_cost_facts(&plan, column_stats, scan_access_cost)?;
+    let cost_facts = planner_cost_facts(&plan, column_stats, binding_ids, scan_access_cost)?;
     plan.stats = NodeStats::default();
     let payload = payloads.push_physical(PlannerPhysicalTemplate::Executable(Box::new(plan)));
     Ok(PlannerSearchImplementationMetadata {
@@ -443,6 +443,39 @@ struct BuildState {
     region_scope: PlannerRegionScope,
 }
 
+fn attach_group_column_domains(
+    properties: &mut LogicalProperties,
+    output_bindings: &[ColumnBinding],
+    output_columns: &[ColumnId],
+    column_stats: &HashMap<ColumnBinding, Arc<ColumnStatistics>>,
+    estimated_cardinality: Option<CardinalityEstimate>,
+) {
+    for (&binding, &column) in output_bindings.iter().zip(output_columns) {
+        let statistics = column_stats.get(&binding);
+        let expected = statistics
+            .map(|statistics| statistics.get_distinct_count() as u64)
+            .filter(|distinct| *distinct > 0)
+            .map(|distinct| {
+                estimated_cardinality
+                    .map(|rows| rows.expected)
+                    .map_or(distinct, |rows| distinct.min(rows))
+            });
+        let guaranteed_upper = statistics
+            .and_then(|statistics| statistics.guaranteed_distinct_upper())
+            .into_iter()
+            .chain(properties.maximum_cardinality)
+            .min();
+        let Some(domain) = GroupColumnDomain::new(expected, guaranteed_upper) else {
+            continue;
+        };
+        properties
+            .column_domains
+            .entry(column)
+            .and_modify(|current| *current = current.canonical_with(domain))
+            .or_insert(domain);
+    }
+}
+
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 struct PendingPlannerRegionFacets {
     required: Option<Fingerprint>,
@@ -610,8 +643,30 @@ impl MemoBuilder {
                                 .and_then(|group| group.logical_properties.maximum_cardinality)
                         })
                         .collect::<Vec<_>>();
-                    let logical_properties =
+                    let mut logical_properties =
                         derive_logical_properties(&plan.operator, &child_maximum_cardinalities);
+                    attach_group_column_domains(
+                        &mut logical_properties,
+                        &output_bindings,
+                        &output_columns,
+                        candidate_stats.as_ref(),
+                        plan.stats.estimated_cardinality,
+                    );
+                    if let LogicalOperator::CTERef(reference) = &plan.operator {
+                        logical_properties.cte_references.insert(CteReferenceDomain {
+                            cte_index: reference.cte_index,
+                            columns: output_columns.clone().into_boxed_slice(),
+                        });
+                    }
+                    if let LogicalOperator::MaterializedCTE(cte) = &plan.operator {
+                        if let Some(producer) = child_states.first() {
+                            memo.register_cte_producer(
+                                cte.cte_index,
+                                producer.group,
+                                producer.columns.clone(),
+                            );
+                        }
+                    }
                     let output_rows_hard_upper = logical_properties.maximum_cardinality;
                     // Capture binding semantics before Query IR interning
                     // replaces operator expressions with positional arena
@@ -821,9 +876,19 @@ impl MemoBuilder {
                         cost_facts: planner_cost_facts(
                             &plan,
                             candidate_stats.as_ref(),
+                            &binding_ids,
                             scan_access_cost,
                         )?,
                         output_columns: output_columns.clone().into_boxed_slice(),
+                        child_layouts: plan
+                            .children()
+                            .into_iter()
+                            .map(|child| PlannerBindingLayout {
+                                bindings: child.get_column_bindings().into_boxed_slice(),
+                                types: child.types().into_boxed_slice(),
+                            })
+                            .collect::<Vec<_>>()
+                            .into_boxed_slice(),
                         child_required: intern_child_requirements(
                             &mut memo,
                             child_states.iter().map(|state| state.columns.as_ref()),

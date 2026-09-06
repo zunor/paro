@@ -111,6 +111,51 @@ fn materialized_cte_cost_tracks_the_producer_write() {
 }
 
 #[test]
+fn materialized_cte_cost_is_monotone_in_producer_width() {
+    let cost_for_types = |types: Vec<LogicalType>| {
+        let names = (0..types.len())
+            .map(|index| format!("v{index}"))
+            .collect::<Vec<_>>();
+        let mut producer = LogicalPlan::synthetic(LogicalOperator::ExpressionGet(
+            ExpressionGet::new(0, Vec::new(), names.clone(), types.clone()),
+        ));
+        producer.stats.estimated_cardinality = Some(CardinalityEstimate::exact(1_000));
+        let mut consumer = LogicalPlan::synthetic(LogicalOperator::CTERef(CTERef::new(
+            1,
+            1,
+            "shared".to_string(),
+            names.clone(),
+            types.clone(),
+        )));
+        consumer.stats.estimated_cardinality = Some(CardinalityEstimate::exact(1_000));
+        let mut plan =
+            LogicalPlan::synthetic(LogicalOperator::MaterializedCTE(MaterializedCTE::new(
+                1,
+                "shared".to_string(),
+                names,
+                types,
+                CTEMaterialize::Materialized,
+                producer,
+                consumer,
+            )));
+        plan.stats.estimated_cardinality = Some(CardinalityEstimate::exact(1_000));
+        planner_operator_cost(
+            &plan,
+            2,
+            Some(1_000),
+            &[Some(1_000), Some(1_000)],
+            Default::default(),
+        )
+        .unwrap()
+    };
+
+    let narrow = cost_for_types(vec![LogicalType::BigInt]);
+    let wide = cost_for_types(vec![LogicalType::Varchar; 8]);
+    assert!(wide.work_latency.expected > narrow.work_latency.expected);
+    assert!(wide.peak_memory_upper > narrow.peak_memory_upper);
+}
+
+#[test]
 fn calibrated_tuple_work_distinguishes_narrow_and_wide_intermediates() {
     let facts = |width| ResolvedPlannerCostFacts {
         output_rows: CompactRange::point(1_000.0).unwrap(),
@@ -353,9 +398,14 @@ fn expression_cost_facts_read_current_group_cardinality() {
     }])
     .unwrap();
     let mut memo = Memo::new(SearchBudget::default());
+    let mut child_properties = LogicalProperties::default();
+    child_properties.column_domains.insert(
+        ColumnId::new(0),
+        GroupColumnDomain::new(Some(25), Some(40)).unwrap(),
+    );
     let child = memo.create_group(
         schema.clone(),
-        LogicalProperties::default(),
+        child_properties,
         GroupCardinality::new(
             Fingerprint(1),
             CardinalityRecipeKind::Statistics,
@@ -386,17 +436,32 @@ fn expression_cost_facts_read_current_group_cardinality() {
         runtime_filter_probe_sources: Box::new([]),
         runtime_filter_build_left_probe_sources: Box::new([]),
         runtime_filter_build_distinct_expected: None,
-        runtime_filter_build_left_distinct_expected: None,
+        runtime_filter_build_domain_column: None,
+        runtime_filter_build_left_distinct_expected: Some(100),
+        runtime_filter_build_left_domain_column: Some(ColumnId::new(0)),
         runtime_filter_key_types: Box::new([]),
     };
 
     let initial = expression_cost_facts(&memo, parent, &[child], &template).unwrap();
     assert_eq!(initial.child_rows[0].expected, 100.0);
+    assert_eq!(
+        initial.runtime_filter_build_left_distinct_expected,
+        Some(25)
+    );
 
     memo.group_mut(child).unwrap().cardinality =
         GroupCardinality::new(Fingerprint(3), CardinalityRecipeKind::JoinRegion, 4, 5, 6);
+    memo.group_mut(child)
+        .unwrap()
+        .logical_properties
+        .column_domains
+        .insert(
+            ColumnId::new(0),
+            GroupColumnDomain::new(Some(5), Some(6)).unwrap(),
+        );
     let refined = expression_cost_facts(&memo, parent, &[child], &template).unwrap();
     assert_eq!(refined.child_rows[0].expected, 5.0);
+    assert_eq!(refined.runtime_filter_build_left_distinct_expected, Some(5));
 }
 
 #[test]

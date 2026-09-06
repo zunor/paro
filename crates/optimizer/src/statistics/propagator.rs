@@ -233,6 +233,18 @@ impl StatisticsPropagator {
         }
     }
 
+    /// Begin a local propagation pass from facts already owned by the Memo
+    /// expression being transformed. Opaque group references have no storage
+    /// operator from which those facts could be rediscovered.
+    pub(crate) fn with_statistics_map(
+        statistics_map: HashMap<ColumnBinding, Arc<ColumnStatistics>>,
+    ) -> Self {
+        Self {
+            statistics_map,
+            cte_statistics: HashMap::new(),
+        }
+    }
+
     fn column_binding(col_ref: &ColumnRefExpression) -> ColumnBinding {
         col_ref.binding
     }

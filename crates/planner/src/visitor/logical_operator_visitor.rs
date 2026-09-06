@@ -328,6 +328,7 @@ where
         }
         // DDL and other operators without expressions
         LogicalOperator::Alter(_)
+        | LogicalOperator::BoundReference(_)
         | LogicalOperator::CreateTable(_)
         | LogicalOperator::CreateRoutine(_)
         | LogicalOperator::CreateSequence(_)

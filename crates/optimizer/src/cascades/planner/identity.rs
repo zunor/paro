@@ -50,6 +50,11 @@ pub(super) fn query_operator_identity(
     }
     match &plan.operator {
         LogicalOperator::Get(get) => encode_get(&mut fingerprint, get),
+        LogicalOperator::BoundReference(_) => {
+            return Err(paro_error::internal(
+                "transformation group hole crossed the Memo staging boundary",
+            ));
+        }
         LogicalOperator::Filter(_) => {}
         LogicalOperator::Projection(projection) => {
             fingerprint.write_u64(projection.visible_count as u64);
@@ -973,5 +978,6 @@ pub(super) fn operator_tag(operator: LogicalOperatorType) -> u64 {
         LogicalOperatorType::GraphMatch => 43,
         LogicalOperatorType::GraphScan => 44,
         LogicalOperatorType::GraphExpand => 45,
+        LogicalOperatorType::BoundReference => 46,
     }
 }

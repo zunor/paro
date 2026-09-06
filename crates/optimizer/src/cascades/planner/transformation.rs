@@ -341,7 +341,17 @@ impl TransformationRule for PlannerTransformationRule {
 
         let mut prepared = Vec::with_capacity(plans.len());
         for plan in plans {
-            let (plan, column_stats) = settle_transformed_expression(plan, &environment)?;
+            let group_hole_guard = GroupHoleTransportGuard::capture(
+                &plan,
+                nested_group_holes.keys().copied(),
+                &environment.bind_context,
+            )?;
+            let (plan, column_stats) = settle_transformed_expression(
+                plan,
+                &source_stats,
+                &environment,
+                &group_hole_guard,
+            )?;
             let root_child_groups = memo_group_holes
                 .clone()
                 .filter(|_| matches!(plan.operator, LogicalOperator::TopN(_)));
@@ -845,44 +855,168 @@ fn rewrite_positive_consumed_mark_filter(plan: LogicalPlan) -> Option<LogicalPla
     changed.then_some(plan)
 }
 
+struct GroupHoleTransportGuard {
+    templates: BTreeMap<u32, GroupHoleTransportTemplate>,
+    bind_context: BindContext,
+}
+
+struct GroupHoleTransportTemplate {
+    plan: LogicalPlan,
+}
+
+impl GroupHoleTransportGuard {
+    fn is_empty(&self) -> bool {
+        self.templates.is_empty()
+    }
+
+    fn capture(
+        plan: &LogicalPlan,
+        hole_ids: impl IntoIterator<Item = u32>,
+        bind_context: &BindContext,
+    ) -> Result<Self> {
+        let wanted = hole_ids.into_iter().collect::<BTreeSet<_>>();
+        let mut templates = BTreeMap::new();
+        plan.try_visit_pre_order(|node| {
+            let LogicalOperator::BoundReference(reference) = &node.operator else {
+                return Ok(());
+            };
+            if wanted.contains(&reference.reference_id) {
+                if templates
+                    .insert(
+                        reference.reference_id,
+                        GroupHoleTransportTemplate {
+                            plan: duplicate_plan_preserving_indices(
+                                node,
+                                bind_context.shared().as_ref(),
+                            ),
+                        },
+                    )
+                    .is_some()
+                {
+                    return Err(paro_error::internal(
+                        "group-hole transport reused a non-synthetic plan identity",
+                    ));
+                }
+            }
+            Ok(())
+        })?;
+        if templates.len() != wanted.len() {
+            return Err(paro_error::internal(
+                "transformation output discarded a bound Memo group hole",
+            ));
+        }
+        Ok(Self {
+            templates,
+            bind_context: bind_context.clone(),
+        })
+    }
+
+    fn restore(&self, mut plan: LogicalPlan) -> Result<LogicalPlan> {
+        if self.templates.is_empty() {
+            return Ok(plan);
+        }
+        for (&reference_id, template) in &self.templates {
+            let mut current_node_id = None;
+            plan.try_visit_pre_order(|node| {
+                if matches!(
+                    &node.operator,
+                    LogicalOperator::BoundReference(reference)
+                        if reference.reference_id == reference_id
+                ) {
+                    if current_node_id.replace(node.id).is_some() {
+                        return Err(paro_error::internal(
+                            "optimizer duplicated an opaque Memo group-hole occurrence",
+                        ));
+                    }
+                }
+                Ok(())
+            })?;
+            let current_node_id = current_node_id.ok_or_else(|| {
+                paro_error::internal("settlement removed a protected Memo group hole")
+            })?;
+            let replacement = |_: LogicalPlan| {
+                Ok(duplicate_plan_preserving_indices(
+                    &template.plan,
+                    self.bind_context.shared().as_ref(),
+                ))
+            };
+            let (next, restored) = plan.try_replace_node(current_node_id, replacement)?;
+            plan = next;
+            if !restored {
+                return Err(paro_error::internal(
+                    "settlement lost a located Memo group-hole occurrence",
+                ));
+            }
+        }
+        Ok(plan)
+    }
+}
+
 fn settle_transformed_expression(
     mut plan: LogicalPlan,
+    source_stats: &SharedColumnStatistics,
     environment: &PlannerRuleEnvironment,
+    group_holes: &GroupHoleTransportGuard,
 ) -> Result<(LogicalPlan, SharedColumnStatistics)> {
     // A group-local rewrite such as CTE substitution can expose a fresh
     // Filter(CrossProduct) boundary after the root canonicalization pass.
     // Stage only canonical join semantics so the equivalent expression is
     // never costed as an accidental Cartesian product.
     plan = FilterPushdown::new().rewrite_plan(plan);
+    plan = group_holes.restore(plan)?;
     normalize_scalar_expressions(&mut plan);
+    plan = group_holes.restore(plan)?;
     plan = FilterPushdown::new().rewrite_plan(plan);
+    plan = group_holes.restore(plan)?;
     // The second predicate-placement pass can expose constants while mapping
     // predicates through set-operation and projection expressions. Settle
     // those scalars before statistics and physical predicate extraction see
     // the transformed alternative.
     normalize_scalar_expressions(&mut plan);
+    plan = group_holes.restore(plan)?;
     plan = FilterPushdown::new().rewrite_plan(plan);
+    plan = group_holes.restore(plan)?;
     plan = EmptyResultPullup::new().optimize_plan(plan);
+    plan = group_holes.restore(plan)?;
     plan = JoinPredicateNormalizer::new(&environment.bind_context).optimize_plan(plan)?;
+    plan = group_holes.restore(plan)?;
     RemoveUnusedColumns::optimize(
         &mut plan,
         &environment.binder,
         environment.session.as_ref(),
         true,
     );
+    plan = group_holes.restore(plan)?;
     let mut context = crate::context::OptimizationContext::new(
         environment.session.clone(),
         environment.bind_context.clone(),
     );
+    // A native hole deliberately omits its descendant tree, so its binding
+    // facts must be supplied by the source expression. Fully materialized
+    // rewrites keep the canonical gather/propagate pipeline self-contained;
+    // injecting an expression-local snapshot there would make rule order
+    // change the cost of unrelated alternatives.
+    if !group_holes.is_empty() {
+        context.column_stats = source_stats.clone();
+    }
     context.cost_model = environment.cost_model.clone();
     context.verify_enabled = environment.verify_enabled;
     plan = StatisticsGathering::new().gather(plan, &mut context)?;
-    let mut propagator = StatisticsPropagator::new();
+    plan = group_holes.restore(plan)?;
+    let mut propagator = if group_holes.is_empty() {
+        StatisticsPropagator::new()
+    } else {
+        StatisticsPropagator::with_statistics_map(source_stats.as_ref().clone())
+    };
     plan = propagator.propagate(environment.session.clone(), plan);
+    plan = group_holes.restore(plan)?;
     context.column_stats = Arc::new(propagator.take_statistics_map());
     plan = StatisticsGathering::new().gather(plan, &mut context)?;
+    plan = group_holes.restore(plan)?;
     plan = singleton_groups::optimize_plan(plan, &context.column_stats);
+    plan = group_holes.restore(plan)?;
     plan = ColumnLifetimeAnalyzer::new(true).optimize(plan)?;
+    plan = group_holes.restore(plan)?;
     if environment.verify_enabled {
         verify_logical_plan(&environment.bind_context, &plan)?;
     }

@@ -8,6 +8,7 @@ use super::*;
 pub(in crate::cascades::planner) fn planner_cost_facts(
     plan: &LogicalPlan,
     column_stats: &HashMap<ColumnBinding, Arc<ColumnStatistics>>,
+    binding_ids: &BindingCatalog,
     scan_access_cost: paro_storage::rowset::scan_cost::ScanAccessCostModel,
 ) -> Result<PlannerCostFacts> {
     let children = plan.children();
@@ -159,6 +160,18 @@ pub(in crate::cascades::planner) fn planner_cost_facts(
         }
         _ => None,
     };
+    let runtime_filter_build_domain_column = match &plan.operator {
+        LogicalOperator::Join(Join::Comparison(join)) => {
+            join_key_domain_column(join, binding_ids, JoinKeySide::Right)
+        }
+        _ => None,
+    };
+    let runtime_filter_build_left_domain_column = match &plan.operator {
+        LogicalOperator::Join(Join::Comparison(join)) => {
+            join_key_domain_column(join, binding_ids, JoinKeySide::Left)
+        }
+        _ => None,
+    };
     let runtime_filter_key_types = match &plan.operator {
         LogicalOperator::Join(Join::Comparison(join)) => join
             .conditions
@@ -186,7 +199,9 @@ pub(in crate::cascades::planner) fn planner_cost_facts(
         runtime_filter_probe_sources,
         runtime_filter_build_left_probe_sources,
         runtime_filter_build_distinct_expected,
+        runtime_filter_build_domain_column,
         runtime_filter_build_left_distinct_expected,
+        runtime_filter_build_left_domain_column,
         runtime_filter_key_types,
     })
 }
@@ -330,9 +345,22 @@ pub(in crate::cascades::planner) fn expression_cost_facts(
             })
             .collect::<Result<Vec<_>>>()?
             .into_boxed_slice(),
-        runtime_filter_build_distinct_expected: template.runtime_filter_build_distinct_expected,
-        runtime_filter_build_left_distinct_expected: template
-            .runtime_filter_build_left_distinct_expected,
+        runtime_filter_build_distinct_expected: children
+            .get(1)
+            .zip(template.runtime_filter_build_domain_column)
+            .and_then(|(group, column)| {
+                memo.column_domain(*group, column)
+                    .and_then(|domain| domain.expected())
+            })
+            .or(template.runtime_filter_build_distinct_expected),
+        runtime_filter_build_left_distinct_expected: children
+            .first()
+            .zip(template.runtime_filter_build_left_domain_column)
+            .and_then(|(group, column)| {
+                memo.column_domain(*group, column)
+                    .and_then(|domain| domain.expected())
+            })
+            .or(template.runtime_filter_build_left_distinct_expected),
         runtime_filter_key_types: template.runtime_filter_key_types.clone(),
     })
 }
@@ -371,6 +399,38 @@ fn join_key_distinct_expected(
         .get(&binding)
         .map(|statistics| statistics.get_distinct_count() as u64)
         .filter(|distinct| *distinct > 0)
+}
+
+fn join_key_domain_column(
+    join: &paro_planner::operator::ComparisonJoin,
+    binding_ids: &BindingCatalog,
+    side: JoinKeySide,
+) -> Option<ColumnId> {
+    let mut equalities = join
+        .conditions
+        .iter()
+        .filter(|condition| condition.comparison == JoinComparisonType::Equal);
+    let condition = equalities.next()?;
+    if equalities.next().is_some() {
+        return None;
+    }
+    let (expression, input) = match side {
+        JoinKeySide::Left => (&condition.left, join.left.as_ref()),
+        JoinKeySide::Right => (&condition.right, join.right.as_ref()),
+    };
+    let (binding, logical_type) = match expression {
+        Expression::ColumnRef(column) if column.depth == 0 => {
+            (column.binding, column.return_type.clone())
+        }
+        Expression::Reference(reference) => (
+            *input.get_column_bindings().get(reference.index)?,
+            reference.return_type.clone(),
+        ),
+        _ => return None,
+    };
+    binding_ids
+        .get(binding.table_index, binding.column_index, &logical_type)
+        .copied()
 }
 
 pub(super) fn infer_runtime_filter_probe_multiplicity<'a>(

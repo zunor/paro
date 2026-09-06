@@ -12,13 +12,14 @@ use paro_common::{error::Result, types::LogicalType};
 use crate::plan::LogicalPlan;
 
 use super::{
-    Aggregate, Alter, CTERef, ColumnBinding, CopyTo, CreateIndex, CreatePropertyGraph,
-    CreateRoutine, CreateSchema, CreateSequence, CreateTable, CreateView, Delete, DelimGet,
-    DependentJoin, DependentJoinKind, Distinct, Drop, DropPropertyGraph, EmptyResult, Explain,
-    ExpressionGet, Filter, FullTextFilterScan, Get, GraphExpand, GraphMatch, GraphScan, Insert,
-    Join, JoinType, Limit, LogicalExternalProject, LogicalExternalTable, LogicalOperatorType,
-    MaterializedCTE, Order, Projection, ProjectionMap, RecursiveCTE, RefreshPropertyGraph,
-    RowFetch, SearchScan, SetOpType, SetOperation, TableFunctionGet, TopN, Update, Window,
+    Aggregate, Alter, BoundReference, CTERef, ColumnBinding, CopyTo, CreateIndex,
+    CreatePropertyGraph, CreateRoutine, CreateSchema, CreateSequence, CreateTable, CreateView,
+    Delete, DelimGet, DependentJoin, DependentJoinKind, Distinct, Drop, DropPropertyGraph,
+    EmptyResult, Explain, ExpressionGet, Filter, FullTextFilterScan, Get, GraphExpand, GraphMatch,
+    GraphScan, Insert, Join, JoinType, Limit, LogicalExternalProject, LogicalExternalTable,
+    LogicalOperatorType, MaterializedCTE, Order, Projection, ProjectionMap, RecursiveCTE,
+    RefreshPropertyGraph, RowFetch, SearchScan, SetOpType, SetOperation, TableFunctionGet, TopN,
+    Update, Window,
 };
 
 /// The execution-facing positional output layout of one logical plan node.
@@ -188,6 +189,11 @@ pub enum LogicalOperator {
     /// Graph edge expansion
     GraphExpand(GraphExpand),
 
+    /// Opaque schema boundary used only inside a transformation transaction.
+    /// Keep this transport-only variant after every executable operator so
+    /// introducing it cannot perturb legacy discriminant-based ordering.
+    BoundReference(BoundReference),
+
     /// A dummy scan that produces one row (used for SELECT 1)
     DummyScan,
 }
@@ -200,6 +206,7 @@ impl LogicalOperator {
     pub fn op_type(&self) -> LogicalOperatorType {
         match self {
             LogicalOperator::Get(_) => LogicalOperatorType::Get,
+            LogicalOperator::BoundReference(_) => LogicalOperatorType::BoundReference,
             LogicalOperator::Filter(_) => LogicalOperatorType::Filter,
             LogicalOperator::Projection(_) => LogicalOperatorType::Projection,
             LogicalOperator::RowFetch(_) => LogicalOperatorType::RowFetch,
@@ -273,6 +280,7 @@ impl LogicalOperator {
     pub fn children(&self) -> Vec<&LogicalPlan> {
         match self {
             LogicalOperator::Get(_) => vec![],
+            LogicalOperator::BoundReference(_) => vec![],
             LogicalOperator::Filter(op) => vec![op.child.as_ref()],
             LogicalOperator::Projection(op) => vec![op.child.as_ref()],
             LogicalOperator::RowFetch(op) => vec![op.child.as_ref()],
@@ -374,6 +382,7 @@ impl LogicalOperator {
     {
         match self {
             LogicalOperator::Get(_) => ControlFlow::Continue(()),
+            LogicalOperator::BoundReference(_) => ControlFlow::Continue(()),
             LogicalOperator::Filter(op) => visit_boxed_child(&mut op.child, &mut f),
             LogicalOperator::Projection(op) => visit_boxed_child(&mut op.child, &mut f),
             LogicalOperator::RowFetch(op) => visit_boxed_child(&mut op.child, &mut f),
@@ -457,6 +466,7 @@ impl LogicalOperator {
     ) -> Result<Self> {
         match self {
             LogicalOperator::Get(op) => Ok(LogicalOperator::Get(op)),
+            LogicalOperator::BoundReference(op) => Ok(LogicalOperator::BoundReference(op)),
             LogicalOperator::Filter(mut op) => {
                 op.child = try_map_boxed_child(op.child, f)?;
                 Ok(LogicalOperator::Filter(op))
@@ -635,6 +645,7 @@ impl LogicalOperator {
     pub fn get_table_index(&self) -> Vec<usize> {
         match self {
             LogicalOperator::Get(get) => vec![get.table_index],
+            LogicalOperator::BoundReference(_) => vec![],
             LogicalOperator::Projection(proj) => vec![proj.table_index],
             LogicalOperator::RowFetch(fetch) => fetch
                 .sources
@@ -746,6 +757,11 @@ fn derive_output_names(root: &LogicalOperator) -> Vec<String> {
         match task {
             Derive(operator) => match operator {
                 LogicalOperator::Get(get) => outputs.push(get.names.clone()),
+                LogicalOperator::BoundReference(reference) => outputs.push(
+                    (0..reference.bindings.len())
+                        .map(|index| format!("__bound_reference_{index}"))
+                        .collect(),
+                ),
                 LogicalOperator::Filter(filter) => {
                     tasks.push(Project(&filter.projection_map));
                     tasks.push(Derive(&filter.child.operator));
@@ -1148,6 +1164,7 @@ fn output_layout_children(operator: &LogicalOperator) -> OutputLayoutChildren {
             DependentJoinKind::Scalar { .. } | DependentJoinKind::Lateral { .. } => Both,
         },
         LogicalOperator::Get(_)
+        | LogicalOperator::BoundReference(_)
         | LogicalOperator::Projection(_)
         | LogicalOperator::ExternalTable(_)
         | LogicalOperator::CreateTable(_)
@@ -1189,6 +1206,9 @@ fn derive_local_output_layout(
     match operator {
         LogicalOperator::Get(get) => {
             LogicalOutputLayout::for_table(get.table_index, get.returned_types.clone())
+        }
+        LogicalOperator::BoundReference(reference) => {
+            LogicalOutputLayout::new(reference.types.clone(), reference.bindings.clone())
         }
         LogicalOperator::Filter(filter) => {
             required_output_layout(first, "filter child").project(&filter.projection_map)

@@ -9,6 +9,7 @@ use super::*;
 use crate::cascades::budget::BudgetDecision;
 use crate::cascades::column::{ColumnDesc, ColumnOrigin, ColumnVisibility};
 use crate::cascades::cost::{CompactRange, ScoreSummary};
+use crate::cascades::ids::ColumnId;
 use crate::cascades::properties::{
     MaterializationRequirement, MutationSafetyRequirement, OrderingRequirement,
     PartitioningRequirement, ProvidedMaterialization, ProvidedMutationSafety, ProvidedOrdering,
@@ -755,6 +756,63 @@ fn inherited_cardinality_tracks_child_and_respects_group_hard_bound() {
     memo.group_mut(child).unwrap().cardinality =
         GroupCardinality::new(Fingerprint(3), CardinalityRecipeKind::JoinRegion, 4, 5, 6);
     assert_eq!(memo.cardinality_estimate(parent), Some((4, 5, 6)));
+}
+
+#[test]
+fn cte_reference_domain_reads_the_current_producer_group_fact() {
+    let mut memo = Memo::new(SearchBudget::default());
+    let mut producer_properties = LogicalProperties::default();
+    producer_properties.column_domains.insert(
+        ColumnId::new(0),
+        GroupColumnDomain::new(Some(10), Some(20)).unwrap(),
+    );
+    let producer = memo.create_group(
+        schema(1),
+        producer_properties,
+        GroupCardinality::new(Fingerprint(1), CardinalityRecipeKind::Statistics, 5, 10, 20),
+    );
+
+    let mut reference_properties = LogicalProperties::default();
+    reference_properties.column_domains.insert(
+        ColumnId::new(1),
+        GroupColumnDomain::new(Some(100), None).unwrap(),
+    );
+    reference_properties
+        .cte_references
+        .insert(CteReferenceDomain {
+            cte_index: 7,
+            columns: vec![ColumnId::new(1)].into_boxed_slice(),
+        });
+    let reference = memo.create_group(schema(2), reference_properties, GroupCardinality::default());
+    memo.register_cte_producer(7, producer, vec![ColumnId::new(0)].into_boxed_slice());
+
+    assert_eq!(
+        memo.column_domain(reference, ColumnId::new(1))
+            .and_then(GroupColumnDomain::expected),
+        Some(10)
+    );
+    assert_eq!(memo.cardinality_estimate(reference), Some((5, 10, 20)));
+    memo.group_mut(producer)
+        .unwrap()
+        .logical_properties
+        .column_domains
+        .insert(
+            ColumnId::new(0),
+            GroupColumnDomain::new(Some(4), Some(8)).unwrap(),
+        );
+    memo.group_mut(producer).unwrap().cardinality = GroupCardinality::new(
+        Fingerprint(2),
+        CardinalityRecipeKind::ConstraintRefined,
+        2,
+        4,
+        8,
+    );
+    assert_eq!(
+        memo.column_domain(reference, ColumnId::new(1))
+            .and_then(GroupColumnDomain::expected),
+        Some(4)
+    );
+    assert_eq!(memo.cardinality_estimate(reference), Some((2, 4, 8)));
 }
 
 #[test]

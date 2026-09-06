@@ -75,4 +75,8 @@ pub enum LogicalOperatorType {
     GraphScan,
     /// Graph edge expansion
     GraphExpand,
+    /// Schema-only boundary owned by an external relational optimizer.
+    /// Appended so existing discriminants remain stable for downstream code
+    /// that has not yet migrated to explicit operator tags.
+    BoundReference,
 }

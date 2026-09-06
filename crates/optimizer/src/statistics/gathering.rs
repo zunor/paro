@@ -272,6 +272,7 @@ impl StatisticsGathering {
             // argument plans before an external table multiplies by its
             // per-invocation row estimate.
             LogicalOperator::DummyScan => Some(CardinalityEstimate::exact(1)),
+            LogicalOperator::BoundReference(_) => plan.stats.estimated_cardinality,
             LogicalOperator::Get(get) => Some(CardinalityEstimate::exact(
                 self.get_storage_rows(get, ctx) as u64,
             )),
@@ -717,6 +718,9 @@ impl StatisticsGathering {
     ) {
         let output_stats = match &plan.operator {
             LogicalOperator::Get(get) => self.get_output_stats(get, ctx),
+            LogicalOperator::BoundReference(_) => {
+                collect_output_stats_for_layout(output_layout, ctx)
+            }
             LogicalOperator::Projection(proj) => proj
                 .expressions
                 .iter()

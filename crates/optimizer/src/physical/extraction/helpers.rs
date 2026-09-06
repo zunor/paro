@@ -38,6 +38,7 @@ pub(crate) fn can_use_perfect_hash_aggregate(
 pub(crate) fn logical_name(op: &LogicalOperator) -> &'static str {
     match op {
         LogicalOperator::Get(_) => "GET",
+        LogicalOperator::BoundReference(_) => "BOUND_REFERENCE",
         LogicalOperator::Filter(_) => "FILTER",
         LogicalOperator::Projection(_) => "PROJECTION",
         LogicalOperator::RowFetch(_) => "ROW_FETCH",
