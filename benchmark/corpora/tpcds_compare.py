@@ -340,8 +340,11 @@ def main() -> int:
     args = parse_args()
     if not 1 <= args.start <= args.end <= 99:
         raise SystemExit("query range must satisfy 1 <= start <= end <= 99")
-    if args.warmups_per_process < 0 or args.process_blocks < 2:
-        raise SystemExit("warmups must be non-negative and process-blocks must be at least two")
+    if args.warmups_per_process < 1 or args.process_blocks < 2:
+        raise SystemExit(
+            "warmups-per-process must be at least one so cached and cold-statement "
+            "latencies have distinct, auditable scopes; process-blocks must be at least two"
+        )
     if args.bootstrap_samples < 100:
         raise SystemExit("bootstrap-samples must be at least 100")
 
@@ -354,7 +357,7 @@ def main() -> int:
         Path(__file__).with_name("tpcds_setup.py").resolve(),
     ]
     report: dict[str, Any] = {
-        "schema_version": 3,
+        "schema_version": 4,
         "corpus": "TPC-DS",
         "scale_factor": 1,
         "query_range": [args.start, args.end],
@@ -386,7 +389,10 @@ def main() -> int:
             "process_blocks": args.process_blocks,
             "samples_per_engine": args.process_blocks * 2,
             "optimizer_verify": True,
-            "timing_scope": "engine_execute_fetch_and_result_metadata",
+            "timing_scope": {
+                "steady_state": "execute_fetch_and_result_metadata_after_instance_plan_cache_warmup",
+                "cold_statement": "first_statement_compile_execute_fetch_and_result_metadata",
+            },
             "validation_scope": "outside_timed_region_every_sample",
             "measurement_order": "seeded_random_ABBA_per_fresh_process_block",
             "paro_result_format": args.paro_result_format,
@@ -472,6 +478,7 @@ def main() -> int:
                 return digest, order_digest
 
             samples: dict[str, list[float]] = {"paro": [], "duckdb": []}
+            cold_samples: dict[str, list[float]] = {"paro": [], "duckdb": []}
             sample_digests: dict[str, list[str]] = {"paro": [], "duckdb": []}
             blocks: list[dict[str, Any]] = []
             rng = random.Random(args.random_seed + query_number * 1_000_003)
@@ -497,7 +504,24 @@ def main() -> int:
                         if duckdb_metadata_inventory(duck_process) != duckdb_inventory:
                             raise AssertionError("DuckDB metadata changed between process blocks")
 
-                        for _ in range(args.warmups_per_process):
+                        cold_order = ["paro", "duckdb"]
+                        if rng.getrandbits(1):
+                            cold_order.reverse()
+                        cold_statement_ms: dict[str, float] = {}
+                        for engine in cold_order:
+                            if engine == "paro":
+                                rows, sample_schema, elapsed_ms = timed_fetch(
+                                    lambda: run_paro(paro, query, binary_result)
+                                )
+                            else:
+                                rows, sample_schema, elapsed_ms = duck_process.execute(query)
+                            validate_sample(f"{engine} cold statement", rows, sample_schema)
+                            cold_samples[engine].append(elapsed_ms)
+                            cold_statement_ms[engine] = round(elapsed_ms, 6)
+
+                        # The measured cold statement is also the first warmup.
+                        # Additional warmups are deliberately outside both timed scopes.
+                        for _ in range(args.warmups_per_process - 1):
                             validate_sample(
                                 "paro warmup", *run_paro(paro, query, binary_result)
                             )
@@ -510,6 +534,8 @@ def main() -> int:
                             order = ["duckdb", "paro", "paro", "duckdb"]
                         block = {
                             "block": block_number,
+                            "cold_order": cold_order,
+                            "cold_statement_ms": cold_statement_ms,
                             "order": order,
                             "paro_ms": [],
                             "duckdb_ms": [],
@@ -560,6 +586,10 @@ def main() -> int:
                     "duckdb": len(sample_digests["duckdb"]),
                 },
                 process_blocks=blocks,
+                cold_statement={
+                    "paro": timing_summary(cold_samples["paro"]),
+                    "duckdb": timing_summary(cold_samples["duckdb"]),
+                },
                 paro=paro_timing,
                 duckdb=duckdb_timing,
                 crossover=crossover,

@@ -9,7 +9,7 @@ use paro_common::error::{self as paro_error, ParoError, Result};
 use paro_common::logging::targets;
 use paro_common::runtime_value::Value;
 use paro_common::types::{logical_type_from_pg_oid, LogicalType};
-use paro_compiler::{compile_statement, compile_statement_with_parameter_types};
+use paro_compiler::compile_statement_with_parameter_types;
 use paro_context::{StatementCancellation, StatementContext, StatementOptions, StatementSource};
 use paro_execution::query_executor::compiled::{
     CompiledStatement, ExecutionRequest, ResultColumnDesc,
@@ -575,15 +575,23 @@ fn build_parse_artifacts(
                 },
                 session.compile_scope_cancellation(),
             );
+            let share_across_sessions = !session.transaction.has_active_transaction();
             if parameter_types.is_empty() {
-                let compiled = compile_statement(snapshot, stmt.clone())?;
+                let compiled =
+                    build_query_plan(session, snapshot, stmt.clone(), &[], share_across_sessions)?;
                 Ok((compiled.result_schema().to_vec(), Some(compiled)))
             } else {
                 let parameter_types = parameter_types
                     .iter()
                     .map(|ty| ty.clone().unwrap_or(LogicalType::Unknown))
                     .collect::<Vec<_>>();
-                let compiled = build_query_plan(snapshot, stmt.clone(), &parameter_types)?;
+                let compiled = build_query_plan(
+                    session,
+                    snapshot,
+                    stmt.clone(),
+                    &parameter_types,
+                    share_across_sessions,
+                )?;
                 let generic_plan = parameter_types
                     .iter()
                     .all(|ty| !matches!(ty, LogicalType::Unknown))
@@ -606,11 +614,30 @@ fn utility_result_schema(cmd: &crate::dispatch::UtilityCommand) -> Vec<ResultCol
 }
 
 fn build_query_plan(
+    session: &Session,
     snapshot: Arc<StatementContext>,
     stmt: Statement,
     parameter_types: &[LogicalType],
+    share_across_sessions: bool,
 ) -> Result<CompiledStatement> {
-    compile_statement_with_parameter_types(snapshot, stmt, parameter_types)
+    if share_across_sessions {
+        if let Some(plan) =
+            session.reusable_instance_query_plan(&stmt, parameter_types, snapshot.as_ref())
+        {
+            return Ok(plan);
+        }
+    }
+    let plan =
+        compile_statement_with_parameter_types(snapshot.clone(), stmt.clone(), parameter_types)?;
+    if share_across_sessions {
+        session.publish_instance_query_plan(
+            stmt,
+            parameter_types.to_vec(),
+            snapshot.as_ref(),
+            plan.clone(),
+        );
+    }
+    Ok(plan)
 }
 
 fn select_protocol_query_plan(
@@ -640,9 +667,11 @@ fn select_protocol_query_plan(
         session.compile_scope_cancellation(),
     );
     build_query_plan(
+        session,
         snapshot,
         statement.raw_stmt.as_ref().clone(),
         &parameter_types,
+        !session.transaction.has_active_transaction(),
     )
 }
 
@@ -803,7 +832,7 @@ async fn execute_query_portal<R: ExtendedQueryResponder>(
                 .current_statement_cancellation()
                 .expect("portal execution requires an active statement scope"),
         );
-        let execution = revalidate_portal_execution(snapshot.clone(), portal, execution)?;
+        let execution = revalidate_portal_execution(session, snapshot.clone(), portal, execution)?;
         portal.kind = PortalKind::Query(execution.clone());
         if !execution.statement().is_query() {
             return execute_non_row_query_portal(
@@ -891,6 +920,7 @@ async fn execute_query_portal<R: ExtendedQueryResponder>(
 /// Paro acquires a portal's data snapshot at first Execute, rather than Bind.
 /// Revalidate against that same snapshot so catalog bindings cannot lag behind it.
 fn revalidate_portal_execution(
+    session: &Session,
     snapshot: Arc<StatementContext>,
     portal: &PortalEntry,
     execution: ExecutionRequest,
@@ -904,7 +934,13 @@ fn revalidate_portal_execution(
     }
 
     let parameter_types = execution.statement().parameter_types().to_vec();
-    let plan = build_query_plan(snapshot, portal.raw_stmt.as_ref().clone(), &parameter_types)?;
+    let plan = build_query_plan(
+        session,
+        snapshot,
+        portal.raw_stmt.as_ref().clone(),
+        &parameter_types,
+        false,
+    )?;
     if plan.result_schema() != portal.result_schema.as_ref() {
         return Err(ParoError::new(paro_error::ErrorData::new(
             paro_error::Severity::Error,
@@ -2591,40 +2627,51 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn repeated_simple_query_reuses_only_the_same_compile_environment() {
+    async fn query_plan_cache_is_instance_wide_and_environment_exact() {
         let instance = paro_instance::Instance::new_in_memory();
-        let mut session = Session::new(1, instance);
+        let mut session = Session::new(1, instance.clone());
+        session
+            .config
+            .set_setting("optimizer_verify", Value::Boolean(true));
+        crate::utility::settings::reconcile_effective_settings(&mut session).unwrap();
 
         let mut first_sink = CollectingSink::new();
         exec_simple_ok(&mut session, &mut first_sink, "SELECT 1").await;
-        let statement = paro_parser::parse("SELECT 1")
-            .unwrap()
-            .into_iter()
-            .next()
-            .unwrap()
-            .stmt;
-        let first = session
-            .state
-            .reusable_simple_query_plan(&statement, None, &session.compile_environment_key())
-            .expect("first Simple Query publishes a reusable plan");
+        let after_first = instance.plan_cache().metrics();
+        assert_eq!(after_first.entries, 1);
+        assert_eq!(after_first.hits, 0);
+        assert_eq!(after_first.misses, 1);
 
         let mut second_sink = CollectingSink::new();
         exec_simple_ok(&mut session, &mut second_sink, "SELECT 1").await;
-        let second = session
-            .state
-            .reusable_simple_query_plan(&statement, None, &session.compile_environment_key())
-            .expect("repeated Simple Query retains a reusable plan");
-        assert!(second.shares_image_with(&first));
+        assert_eq!(instance.plan_cache().metrics().hits, 1);
+
+        let mut peer = Session::new(2, instance.clone());
+        peer.config
+            .set_setting("optimizer_verify", Value::Boolean(true));
+        crate::utility::settings::reconcile_effective_settings(&mut peer).unwrap();
+        assert_eq!(session.effective_settings(), peer.effective_settings());
+        assert_eq!(
+            session.compile_environment_key(),
+            peer.compile_environment_key()
+        );
+        assert_eq!(
+            session.freeze_query_context().env,
+            peer.freeze_query_context().env
+        );
+        let mut peer_sink = CollectingSink::new();
+        exec_simple_ok(&mut peer, &mut peer_sink, "SELECT 1").await;
+        let after_peer = instance.plan_cache().metrics();
+        assert_eq!(after_peer.hits, 2, "{after_peer:?}");
 
         session.config.set_setting("threads", Value::Integer(2));
         crate::utility::settings::reconcile_effective_settings(&mut session).unwrap();
         let mut changed_sink = CollectingSink::new();
         exec_simple_ok(&mut session, &mut changed_sink, "SELECT 1").await;
-        let changed = session
-            .state
-            .reusable_simple_query_plan(&statement, None, &session.compile_environment_key())
-            .expect("changed environment publishes a replacement plan");
-        assert!(!changed.shares_image_with(&second));
+        let changed = instance.plan_cache().metrics();
+        assert_eq!(changed.hits, 2);
+        assert_eq!(changed.misses, 2);
+        assert_eq!(changed.entries, 2);
     }
 
     #[tokio::test]

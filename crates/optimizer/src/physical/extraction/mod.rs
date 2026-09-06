@@ -691,6 +691,13 @@ fn populate_plan_dependencies(
         dependencies
             .statistics_compatibility
             .insert(object, table.timestamp());
+        dependencies.search_planning_revisions.insert(
+            object,
+            table
+                .storage
+                .as_ref()
+                .map_or(0, |storage| storage.search_planning_revision()),
+        );
     }
 
     fn register_search(

@@ -7,6 +7,7 @@ use std::sync::Arc;
 
 use crate::pipeline::StatementProgram;
 use crate::runtime::{ParameterBindingEpoch, ParameterBindings};
+use paro_catalog::entry::CatalogEntry;
 use paro_common::error::{self as paro_error, Result};
 use paro_common::typed_parameters::TypedParameterEnv;
 use paro_common::types::LogicalType;
@@ -147,6 +148,28 @@ pub(crate) fn physical_plan_dependencies_available(
     plan: &paro_optimizer::physical::PhysicalPlan,
     ctx: &StatementContext,
 ) -> bool {
+    fn domain_fingerprint(domain: u64, value: u64) -> Fingerprint {
+        let mut builder = StableFingerprintBuilder::default();
+        builder.write_u64(domain);
+        builder.write_u64(value);
+        builder.finish()
+    }
+
+    fn table_search_planning_state_available(
+        plan: &paro_optimizer::physical::PhysicalPlan,
+        table: &paro_catalog::entry::TableCatalogEntry,
+    ) -> bool {
+        let key = domain_fingerprint(1, table.object_id().raw());
+        let Some(expected) = plan.dependencies.search_planning_revisions.get(&key) else {
+            return false;
+        };
+        table
+            .storage
+            .as_ref()
+            .map_or(0, |storage| storage.search_planning_revision())
+            == *expected
+    }
+
     fn search_available(
         table: &paro_catalog::entry::TableCatalogEntry,
         token: &paro_storage::search::CapabilityToken,
@@ -184,24 +207,33 @@ pub(crate) fn physical_plan_dependencies_available(
     }
 
     plan.nodes.iter().all(|node| match &node.kind {
+        PhysicalNodeKind::RowsetScan(spec) => {
+            table_search_planning_state_available(plan, &spec.table)
+        }
         PhysicalNodeKind::VectorSearch(spec) => {
-            search_available(&spec.table, &spec.capability_token)
+            table_search_planning_state_available(plan, &spec.table)
+                && search_available(&spec.table, &spec.capability_token)
         }
         PhysicalNodeKind::SparseVectorSearch(spec) => {
-            search_available(&spec.table, &spec.capability_token)
+            table_search_planning_state_available(plan, &spec.table)
+                && search_available(&spec.table, &spec.capability_token)
         }
         PhysicalNodeKind::FullTextSearch(spec) => {
-            search_available(&spec.table, &spec.capability_token)
+            table_search_planning_state_available(plan, &spec.table)
+                && search_available(&spec.table, &spec.capability_token)
         }
         PhysicalNodeKind::AdaptiveSearch(spec) => match spec.selected.as_ref() {
             SearchSourceSpec::Vector(source) => {
-                search_available(&spec.table, &source.capability_token)
+                table_search_planning_state_available(plan, &spec.table)
+                    && search_available(&spec.table, &source.capability_token)
             }
             SearchSourceSpec::Sparse(source) => {
-                search_available(&spec.table, &source.capability_token)
+                table_search_planning_state_available(plan, &spec.table)
+                    && search_available(&spec.table, &source.capability_token)
             }
             SearchSourceSpec::FullText(source) => {
-                search_available(&spec.table, &source.capability_token)
+                table_search_planning_state_available(plan, &spec.table)
+                    && search_available(&spec.table, &source.capability_token)
             }
         },
         PhysicalNodeKind::GraphScan(spec) => {

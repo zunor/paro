@@ -360,10 +360,13 @@ impl Session {
 
         let statement_completion = initial_statement_completion(&stmt);
         let started_at = Instant::now();
-        let simple_plan_cache_eligible = reuse_simple_query_plan
+        // Only auto-started read statements can publish an instance-wide
+        // image. A user transaction may expose session-local catalog state
+        // that must never cross a connection boundary.
+        let shared_plan_cache_eligible = reuse_simple_query_plan
             && parameter_env.is_none()
-            && matches!(stmt, Statement::Query(_));
-        let cached_statement_format = statement_format.clone();
+            && matches!(stmt, Statement::Query(_))
+            && require_new_transaction;
 
         let ctx = self.freeze_statement_context_with_input(
             StatementOptions {
@@ -382,22 +385,14 @@ impl Session {
             statement_completion = %statement_completion,
             "Statement compilation started"
         );
-        let compile_environment = ctx.compile_environment_key();
-        let cached_plan = simple_plan_cache_eligible.then(|| {
-            self.state.reusable_simple_query_plan(
-                &stmt,
-                cached_statement_format.as_deref(),
-                &compile_environment,
-            )
-        });
-        let cached_plan = cached_plan
-            .flatten()
-            .filter(|plan| plan.dynamic_dependencies_available(ctx.as_ref()));
+        let cached_plan = shared_plan_cache_eligible
+            .then(|| self.reusable_instance_query_plan(&stmt, &[], ctx.as_ref()))
+            .flatten();
         let compile_result = if let Some(plan) = cached_plan.as_ref() {
             debug!(
                 target: targets::QUERY,
                 session_id = self.id,
-                "Repeated Simple Query reused immutable plan"
+                "Query reused an instance-wide immutable plan"
             );
             Ok(plan.clone())
         } else {
@@ -433,10 +428,11 @@ impl Session {
                 return Err(e);
             }
         };
-        if simple_plan_cache_eligible && cached_plan.is_none() {
-            self.state.publish_simple_query_plan(
+        if shared_plan_cache_eligible && cached_plan.is_none() {
+            self.publish_instance_query_plan(
                 stmt.clone(),
-                cached_statement_format,
+                Vec::new(),
+                ctx.as_ref(),
                 compiled.clone(),
             );
         }

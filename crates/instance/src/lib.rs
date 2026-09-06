@@ -84,6 +84,7 @@ pub use recovery::replay_handler::{
 pub use runtime::connection_registry::{ConnectionHandle, ConnectionId, ConnectionRegistry};
 pub use runtime::copy_stdin::{CopyStdinMetrics, CopyStdinMetricsSnapshot, CopyStdinRejectReason};
 pub use runtime::object_cache::{ObjectCache, ObjectCacheEntry};
+pub use runtime::plan_cache::{InstancePlanCache, InstancePlanCacheMetrics};
 pub use runtime::runtime_tuning::{RuntimeTuning, RuntimeTuningSnapshot};
 pub use runtime::session_registry::{
     RegistryKey, SessionExecutionHandle, SessionExecutionRegistry,

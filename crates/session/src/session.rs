@@ -26,6 +26,7 @@ use paro_common::effect::{GraphDmlTableDelta, PostCommitHookDescriptor};
 use paro_common::error::{self as paro_error, ParoError, Result};
 use paro_common::logging::targets;
 use paro_common::runtime_value::Value;
+use paro_common::types::LogicalType;
 use paro_common::version::{pg_compat_server_version, PG_COMPAT_SERVER_VERSION_NUM};
 use paro_context::{
     AttachedDatabaseCommitFrontierSnapshot, AttachedDatabaseCommitPoisonSnapshot,
@@ -40,8 +41,10 @@ use paro_execution::operators::graph::refresh_property_graph::{
     mark_property_graph_stale, refresh_property_graph_committed,
     schedule_property_graph_background_rebuild,
 };
+use paro_execution::query_executor::compiled::CompiledStatement;
 use paro_execution::query_executor::executor::Executor;
 use paro_instance::{DatabaseHandle, Instance};
+use paro_parser::ast::Statement;
 use paro_storage::metrics::storage_metrics;
 use paro_storage::transaction::write_buffer::transaction_write_buffer_memory_budget;
 use paro_transaction::{CommitAckPolicy, DatabaseId, IsolationLevel, ReadTrackingPolicy};
@@ -562,6 +565,39 @@ impl Session {
                 .map(|database| (database.id(), database.catalog().gc_epoch())),
             &EffectiveSettings::new(self.effective_settings.clone()),
         )
+    }
+
+    pub(crate) fn reusable_instance_query_plan(
+        &self,
+        statement: &Statement,
+        parameter_types: &[LogicalType],
+        context: &StatementContext,
+    ) -> Option<CompiledStatement> {
+        self.instance.plan_cache().get_validated(
+            statement,
+            context.statement_format(),
+            parameter_types,
+            &context.compile_environment_key(),
+            &context.env,
+            |plan| plan.dynamic_dependencies_available(context),
+        )
+    }
+
+    pub(crate) fn publish_instance_query_plan(
+        &self,
+        statement: Statement,
+        parameter_types: Vec<LogicalType>,
+        context: &StatementContext,
+        plan: CompiledStatement,
+    ) {
+        self.instance.plan_cache().publish(
+            statement,
+            context.statement_format().map(str::to_owned),
+            parameter_types,
+            context.compile_environment_key(),
+            context.env.clone(),
+            plan,
+        );
     }
 
     /// Create a new session with a specific user name.

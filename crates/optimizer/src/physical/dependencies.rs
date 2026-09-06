@@ -14,6 +14,10 @@ pub struct PlanDependencies {
     pub graph_generations: BTreeMap<Fingerprint, u64>,
     pub provider_capabilities: BTreeMap<Fingerprint, u64>,
     pub search_index_generations: BTreeMap<Fingerprint, u64>,
+    /// Table-local search registry revisions observed while enumerating access
+    /// paths. Unlike `search_index_generations`, this also records the proof
+    /// that no usable search alternative existed for an ordinary scan.
+    pub search_planning_revisions: BTreeMap<Fingerprint, u64>,
     pub machine_calibration_revision: Fingerprint,
     pub estimator_revision: Fingerprint,
     pub routine_artifacts: BTreeMap<Fingerprint, u64>,
