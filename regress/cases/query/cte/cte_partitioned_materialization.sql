@@ -1,8 +1,9 @@
 -- Copyright 2024-2026 Zunor
 -- SPDX-License-Identifier: Apache-2.0
 
--- All producer branches are live and every reference fixes the same constant
--- discriminator, so the complete partitioned-materialization recipe applies.
+-- Every reference fixes a discriminator. Native requirements admit both one
+-- shared producer and per-domain producers; costing chooses the physical
+-- sharing layout without changing the SQL materialization policy.
 -- @normalize explain_cte_ids
 EXPLAIN
 WITH segmented(v, st) AS (
@@ -30,8 +31,8 @@ CROSS JOIN (SELECT * FROM segmented WHERE st = 2) AS second_ref
 CROSS JOIN (SELECT * FROM segmented WHERE st = 3) AS third_ref;
 
 -- A discriminator on the null-supplying side of an outer join must remain
--- NULL for unmatched rows. Partition constant substitution must reject this
--- shape instead of turning nullable_ref.st into the branch constant 2.
+-- NULL for unmatched rows. Partitioning must retain the occurrence and its
+-- null-extension boundary, never replace nullable_ref.st by constant 2.
 WITH segmented(v, st) AS (
     SELECT 10, 1
     UNION ALL
@@ -45,9 +46,9 @@ LEFT JOIN (SELECT * FROM segmented WHERE st = 2) AS nullable_ref
     ON FALSE
 CROSS JOIN (SELECT * FROM segmented WHERE st = 3) AS third_ref;
 
--- Partitioning is an all-branch sharing-layout choice. With fewer references
--- than producer branches it must leave the original CTE intact rather than
--- silently suppressing branches that currently have no consumer.
+-- Demands are owned by occurrences, not by the producer's UNION syntax. A
+-- producer branch with no consumer may be pruned, while both requested domains
+-- remain represented regardless of the chosen sharing layout.
 WITH segmented(v, st) AS (
     SELECT 10, 1
     UNION ALL

@@ -18,15 +18,17 @@ MATERIALIZED_CTE  (rows=1)
   CTE Name: nums
   Materialization: MATERIALIZED
   Reference Count: 1
-  ->  VALUES  (rows=3)
+  ->  FILTER  (rows=1)
+    Filter: nums.v > 1
+    ->  VALUES  (rows=3)
   ->  ORDER_BY  (rows=1)
     Sort Key: v ASC NULLS LAST
     ->  PROJECTION  (rows=1)
       Output: v
       ->  FILTER  (rows=1)
         Filter: nums.v > 1
-        ->  CTE_SCAN  (rows=3)
-          CTE Index: 0
+        ->  CTE_SCAN  (rows=1)
+          CTE Index: 9
           Table Index: 8
 
 EXPLAIN

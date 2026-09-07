@@ -13,47 +13,37 @@ CROSS JOIN (SELECT * FROM segmented WHERE st = 2) AS second_ref
 CROSS JOIN (SELECT * FROM segmented WHERE st = 3) AS third_ref;
 QUERY PLAN
 MATERIALIZED_CTE  (rows=1)
-  CTE Name: segmented$partition1
+  CTE Name: segmented
   Materialization: MATERIALIZED
-  Reference Count: 1
+  Reference Count: 3
+  ->  VALUES  (rows=1)
   ->  PROJECTION  (rows=1)
-    Output: 10, 1
-    ->  DUMMY_SCAN  (rows=1)
-  ->  MATERIALIZED_CTE  (rows=1)
-    CTE Name: segmented$partition2
-    Materialization: MATERIALIZED
-    Reference Count: 1
-    ->  PROJECTION  (rows=1)
-      Output: 20, 2
-      ->  DUMMY_SCAN  (rows=1)
-    ->  MATERIALIZED_CTE  (rows=1)
-      CTE Name: segmented$partition3
-      Materialization: MATERIALIZED
-      Reference Count: 1
-      ->  PROJECTION  (rows=1)
-        Output: 30, 3
-        ->  DUMMY_SCAN  (rows=1)
-      ->  PROJECTION  (rows=1)
-        Output: selected_sum
-        ->  AGGREGATE  (rows=1)
-          Aggregates: sum(+(+(first_ref.v, second_ref.v), third_ref.v))
-          ->  CROSS_PRODUCT  (rows=1)
-            ->  CROSS_PRODUCT  (rows=1)
-              ->  PROJECTION  (rows=1)
-                Output: v
-                ->  CTE_SCAN  (rows=1)
-                  CTE Index: <cte-1>
-                  Table Index: 33
-              ->  PROJECTION  (rows=1)
-                Output: v
-                ->  CTE_SCAN  (rows=1)
-                  CTE Index: <cte-2>
-                  Table Index: 41
-            ->  PROJECTION  (rows=1)
-              Output: v
+    Output: selected_sum
+    ->  AGGREGATE  (rows=1)
+      Aggregates: sum(+(+(first_ref.v, second_ref.v), third_ref.v))
+      ->  CROSS_PRODUCT  (rows=1)
+        ->  CROSS_PRODUCT  (rows=1)
+          ->  PROJECTION  (rows=1)
+            Output: v
+            ->  FILTER  (rows=1)
+              Filter: segmented.st = 1
               ->  CTE_SCAN  (rows=1)
-                CTE Index: <cte-3>
-                Table Index: 49
+                CTE Index: <cte-1>
+                Table Index: 33
+          ->  PROJECTION  (rows=1)
+            Output: v
+            ->  FILTER  (rows=1)
+              Filter: segmented.st = 2
+              ->  CTE_SCAN  (rows=1)
+                CTE Index: <cte-1>
+                Table Index: 41
+        ->  PROJECTION  (rows=1)
+          Output: v
+          ->  FILTER  (rows=1)
+            Filter: segmented.st = 3
+            ->  CTE_SCAN  (rows=1)
+              CTE Index: <cte-1>
+              Table Index: 49
 
 WITH segmented(v, st) AS (
     SELECT 10, 1

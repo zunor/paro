@@ -88,17 +88,20 @@ ORDER_BY  (rows=2)
       Aggregates: count_star(*)
       ->  PROJECTION  (rows=3)
         Output: c_count
-        ->  HASH_JOIN  (rows=3)
-          Join Type: LEFT
-          Join Condition: c.customer_key = o.customer_key
-          ->  ROWSET_SCAN on public.singleton_customer c  (rows=3)
-            Columns: customer_key
-          ->  AGGREGATE  (rows=2)
-            Group Key: o.customer_key
-            Aggregates: count_star(*)
-            ->  ROWSET_SCAN on public.singleton_orders_large o  (rows=4050)
+        ->  AGGREGATE  (rows=3)
+          Group Key: c.customer_key
+          Aggregates: count_partial_merge(count_star(*))
+          ->  HASH_JOIN  (rows=3)
+            Join Type: LEFT
+            Join Condition: c.customer_key = o.customer_key
+            ->  ROWSET_SCAN on public.singleton_customer c  (rows=3)
               Columns: customer_key
-              Pushed Predicate: comment NOT LIKE "%special%requests%"
+            ->  AGGREGATE  (rows=2)
+              Group Key: o.customer_key
+              Aggregates: count_star(*)
+              ->  ROWSET_SCAN on public.singleton_orders_large o  (rows=4050)
+                Columns: customer_key
+                Pushed Predicate: comment NOT LIKE "%special%requests%"
 
 SELECT c_count, count(*) AS customer_distribution
 FROM (
