@@ -623,7 +623,7 @@ mod tests {
         ColumnBinding, ComparisonJoin, DelimGet, Get, JoinBuildSideConstraint, JoinComparisonType,
         JoinCondition, Window,
     };
-    use paro_planner::plan::LogicalPlan;
+    use paro_planner::plan::OwnedLogicalPlan;
 
     fn create_column_ref(table_index: usize, column_index: usize) -> Expression {
         Expression::ColumnRef(ColumnRefExpression {
@@ -727,7 +727,7 @@ mod tests {
 
     #[test]
     fn atomic_window_relation_owns_inherited_and_appended_bindings() {
-        let child = LogicalPlan::synthetic(create_test_get(7));
+        let child = OwnedLogicalPlan::synthetic(create_test_get(7));
         let expression = WindowExpression::native(
             paro_function::window::WindowFunction::row_number(),
             vec![],
@@ -1017,8 +1017,8 @@ mod tests {
         let right = create_test_get(1);
         let mut join = ComparisonJoin::new(
             JoinType::Inner,
-            LogicalPlan::synthetic(left),
-            LogicalPlan::synthetic(right),
+            OwnedLogicalPlan::synthetic(left),
+            OwnedLogicalPlan::synthetic(right),
             vec![JoinCondition::new(
                 create_column_ref(0, 0),
                 create_column_ref(1, 0),
@@ -1036,8 +1036,8 @@ mod tests {
     fn test_build_side_constraint_is_a_transitive_join_order_boundary() {
         let mut constrained = ComparisonJoin::new(
             JoinType::Inner,
-            LogicalPlan::synthetic(create_test_get(0)),
-            LogicalPlan::synthetic(create_test_get(1)),
+            OwnedLogicalPlan::synthetic(create_test_get(0)),
+            OwnedLogicalPlan::synthetic(create_test_get(1)),
             vec![JoinCondition::new(
                 create_column_ref(0, 0),
                 create_column_ref(1, 0),
@@ -1051,8 +1051,8 @@ mod tests {
 
         let mut constrained_child = ComparisonJoin::new(
             JoinType::Inner,
-            LogicalPlan::synthetic(create_test_get(0)),
-            LogicalPlan::synthetic(create_test_get(1)),
+            OwnedLogicalPlan::synthetic(create_test_get(0)),
+            OwnedLogicalPlan::synthetic(create_test_get(1)),
             vec![JoinCondition::new(
                 create_column_ref(0, 0),
                 create_column_ref(1, 0),
@@ -1062,8 +1062,8 @@ mod tests {
         constrained_child.build_side_constraint = JoinBuildSideConstraint::Right;
         let parent = ComparisonJoin::new(
             JoinType::Inner,
-            LogicalPlan::synthetic(LogicalOperator::Join(Join::Comparison(constrained_child))),
-            LogicalPlan::synthetic(create_test_get(2)),
+            OwnedLogicalPlan::synthetic(LogicalOperator::Join(Join::Comparison(constrained_child))),
+            OwnedLogicalPlan::synthetic(create_test_get(2)),
             vec![JoinCondition::new(
                 create_column_ref(1, 0),
                 create_column_ref(2, 0),
@@ -1081,8 +1081,8 @@ mod tests {
         let right = LogicalOperator::DelimGet(DelimGet::new(99, vec![LogicalType::Integer]));
         let join = ComparisonJoin::new(
             JoinType::Inner,
-            LogicalPlan::synthetic(left),
-            LogicalPlan::synthetic(right),
+            OwnedLogicalPlan::synthetic(left),
+            OwnedLogicalPlan::synthetic(right),
             vec![JoinCondition::new(
                 create_column_ref(0, 0),
                 Expression::ColumnRef(ColumnRefExpression::new(
@@ -1102,8 +1102,8 @@ mod tests {
     fn test_join_with_volatile_condition_is_not_reorderable() {
         let join = ComparisonJoin::new(
             JoinType::Inner,
-            LogicalPlan::synthetic(create_test_get(0)),
-            LogicalPlan::synthetic(create_test_get(1)),
+            OwnedLogicalPlan::synthetic(create_test_get(0)),
+            OwnedLogicalPlan::synthetic(create_test_get(1)),
             vec![JoinCondition::new(
                 create_column_ref(0, 0),
                 volatile_expression_with_column(1),

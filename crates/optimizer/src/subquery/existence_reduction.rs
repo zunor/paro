@@ -16,9 +16,9 @@ use paro_planner::expression::{Expression, ExpressionIterator, ExpressionVisitDe
 use paro_planner::operator::{
     AntiJoinMode, ColumnBinding, Join, JoinType, LogicalOperator, MarkJoinSemantics, ProjectionMap,
 };
-use paro_planner::plan::LogicalPlan;
+use paro_planner::plan::OwnedLogicalPlan;
 
-pub(crate) fn optimize_plan(plan: LogicalPlan) -> Result<(LogicalPlan, bool)> {
+pub(crate) fn optimize_plan(plan: OwnedLogicalPlan) -> Result<(OwnedLogicalPlan, bool)> {
     let mut changed = false;
     let plan = plan.try_map_post_order(|plan| {
         let (plan, local_changed) = reduce_existence_consumer(plan);
@@ -28,7 +28,7 @@ pub(crate) fn optimize_plan(plan: LogicalPlan) -> Result<(LogicalPlan, bool)> {
     Ok((plan, changed))
 }
 
-fn reduce_existence_consumer(plan: LogicalPlan) -> (LogicalPlan, bool) {
+fn reduce_existence_consumer(plan: OwnedLogicalPlan) -> (OwnedLogicalPlan, bool) {
     let LogicalOperator::Join(Join::Comparison(parent)) = &plan.operator else {
         return (plan, false);
     };
@@ -62,7 +62,7 @@ fn reduce_existence_consumer(plan: LogicalPlan) -> (LogicalPlan, bool) {
     let (right, reduced) = reduce_input(*parent.right, &demanded);
     parent.right = Box::new(right);
     (
-        LogicalPlan {
+        OwnedLogicalPlan {
             id,
             stats,
             operator: LogicalOperator::Join(Join::Comparison(parent)),
@@ -71,7 +71,7 @@ fn reduce_existence_consumer(plan: LogicalPlan) -> (LogicalPlan, bool) {
     )
 }
 
-fn reduce_input(plan: LogicalPlan, demanded: &HashSet<ColumnBinding>) -> (LogicalPlan, bool) {
+fn reduce_input(plan: OwnedLogicalPlan, demanded: &HashSet<ColumnBinding>) -> (OwnedLogicalPlan, bool) {
     match &plan.operator {
         LogicalOperator::Projection(projection) => {
             let child_bindings = projection.child.get_column_bindings();
@@ -88,7 +88,7 @@ fn reduce_input(plan: LogicalPlan, demanded: &HashSet<ColumnBinding>) -> (Logica
             let (child, changed) = reduce_input(*projection.child, &child_demanded);
             projection.child = Box::new(child);
             (
-                LogicalPlan {
+                OwnedLogicalPlan {
                     id,
                     stats,
                     operator: LogicalOperator::Projection(projection),
@@ -111,7 +111,7 @@ fn reduce_input(plan: LogicalPlan, demanded: &HashSet<ColumnBinding>) -> (Logica
             let (child, changed) = reduce_input(*filter.child, &child_demanded);
             filter.child = Box::new(child);
             (
-                LogicalPlan {
+                OwnedLogicalPlan {
                     id,
                     stats,
                     operator: LogicalOperator::Filter(filter),
@@ -162,7 +162,7 @@ fn reduce_input(plan: LogicalPlan, demanded: &HashSet<ColumnBinding>) -> (Logica
             setop.left = Box::new(left);
             setop.right = Box::new(right);
             (
-                LogicalPlan {
+                OwnedLogicalPlan {
                     id,
                     stats,
                     operator: LogicalOperator::SetOperation(setop),
@@ -204,7 +204,7 @@ fn reduce_input(plan: LogicalPlan, demanded: &HashSet<ColumnBinding>) -> (Logica
                 join.left_projection_map = ProjectionMap::none();
             }
             (
-                LogicalPlan {
+                OwnedLogicalPlan {
                     id,
                     stats,
                     operator: LogicalOperator::Join(Join::Comparison(join)),
@@ -217,9 +217,9 @@ fn reduce_input(plan: LogicalPlan, demanded: &HashSet<ColumnBinding>) -> (Logica
 }
 
 fn reduce_setop_branch(
-    plan: LogicalPlan,
+    plan: OwnedLogicalPlan,
     demanded: &HashSet<ColumnBinding>,
-) -> (LogicalPlan, bool) {
+) -> (OwnedLogicalPlan, bool) {
     match &plan.operator {
         LogicalOperator::Projection(_) => reduce_input(plan, demanded),
         LogicalOperator::Filter(filter) => {
@@ -241,7 +241,7 @@ fn reduce_setop_branch(
             let (child, changed) = reduce_setop_branch(*filter.child, &child_demanded);
             filter.child = Box::new(child);
             (
-                LogicalPlan {
+                OwnedLogicalPlan {
                     id,
                     stats,
                     operator: LogicalOperator::Filter(filter),
@@ -291,8 +291,8 @@ mod tests {
         ComparisonJoin, ExpressionGet, JoinComparisonType, JoinCondition, Projection, SetOperation,
     };
 
-    fn values(ctx: &BindContext, table: usize) -> LogicalPlan {
-        LogicalPlan::new(
+    fn values(ctx: &BindContext, table: usize) -> OwnedLogicalPlan {
+        OwnedLogicalPlan::new(
             ctx,
             LogicalOperator::ExpressionGet(ExpressionGet::new(
                 table,
@@ -320,7 +320,7 @@ mod tests {
     #[test]
     fn inner_filtering_relation_becomes_semi_under_existence() {
         let ctx = BindContext::new();
-        let inner = LogicalPlan::new(
+        let inner = OwnedLogicalPlan::new(
             &ctx,
             LogicalOperator::Join(Join::Comparison(ComparisonJoin::new(
                 JoinType::Inner,
@@ -329,7 +329,7 @@ mod tests {
                 vec![equality(1, 2)],
             ))),
         );
-        let outer = LogicalPlan::new(
+        let outer = OwnedLogicalPlan::new(
             &ctx,
             LogicalOperator::Join(Join::Comparison(ComparisonJoin::new(
                 JoinType::Semi,
@@ -354,7 +354,7 @@ mod tests {
     #[test]
     fn inner_join_is_kept_when_both_sides_are_observed() {
         let ctx = BindContext::new();
-        let inner = LogicalPlan::new(
+        let inner = OwnedLogicalPlan::new(
             &ctx,
             LogicalOperator::Join(Join::Comparison(ComparisonJoin::new(
                 JoinType::Inner,
@@ -363,7 +363,7 @@ mod tests {
                 vec![equality(1, 2)],
             ))),
         );
-        let outer = LogicalPlan::new(
+        let outer = OwnedLogicalPlan::new(
             &ctx,
             LogicalOperator::Join(Join::Comparison(ComparisonJoin::new(
                 JoinType::Semi,
@@ -381,7 +381,7 @@ mod tests {
     fn existence_demand_reduces_each_union_all_branch() {
         let ctx = BindContext::new();
         let branch = |preserved, filtering, projection| {
-            let inner = LogicalPlan::new(
+            let inner = OwnedLogicalPlan::new(
                 &ctx,
                 LogicalOperator::Join(Join::Comparison(ComparisonJoin::new(
                     JoinType::Inner,
@@ -390,7 +390,7 @@ mod tests {
                     vec![equality(preserved, filtering)],
                 ))),
             );
-            LogicalPlan::new(
+            OwnedLogicalPlan::new(
                 &ctx,
                 LogicalOperator::Projection(Projection::new(
                     projection,
@@ -399,7 +399,7 @@ mod tests {
                 )),
             )
         };
-        let union = LogicalPlan::new(
+        let union = OwnedLogicalPlan::new(
             &ctx,
             LogicalOperator::SetOperation(SetOperation::union(
                 7,
@@ -409,7 +409,7 @@ mod tests {
                 vec![LogicalType::Integer],
             )),
         );
-        let outer = LogicalPlan::new(
+        let outer = OwnedLogicalPlan::new(
             &ctx,
             LogicalOperator::Join(Join::Comparison(ComparisonJoin::new(
                 JoinType::Semi,
@@ -443,7 +443,7 @@ mod tests {
     fn union_all_branch_schema_cannot_be_narrowed_in_place() {
         let ctx = BindContext::new();
         let branch = |left, right| {
-            LogicalPlan::new(
+            OwnedLogicalPlan::new(
                 &ctx,
                 LogicalOperator::Join(Join::Comparison(ComparisonJoin::new(
                     JoinType::Inner,
@@ -453,7 +453,7 @@ mod tests {
                 ))),
             )
         };
-        let union = LogicalPlan::new(
+        let union = OwnedLogicalPlan::new(
             &ctx,
             LogicalOperator::SetOperation(SetOperation::union(
                 7,
@@ -463,7 +463,7 @@ mod tests {
                 vec![LogicalType::Integer, LogicalType::Integer],
             )),
         );
-        let outer = LogicalPlan::new(
+        let outer = OwnedLogicalPlan::new(
             &ctx,
             LogicalOperator::Join(Join::Comparison(ComparisonJoin::new(
                 JoinType::Semi,

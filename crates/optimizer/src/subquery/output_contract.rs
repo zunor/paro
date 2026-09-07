@@ -149,7 +149,7 @@ pub(crate) fn child_output_contracts(
 
 fn extend_stored_projection(
     contract: &mut OutputContract,
-    child: &paro_planner::plan::LogicalPlan,
+    child: &paro_planner::plan::OwnedLogicalPlan,
     projection: &paro_planner::operator::ProjectionMap,
     rewrite_shape: RewriteOutputShape,
 ) -> bool {

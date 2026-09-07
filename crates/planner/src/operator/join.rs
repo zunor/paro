@@ -8,7 +8,7 @@ use std::collections::HashSet;
 
 use super::{ColumnBinding, ProjectionMap};
 use crate::expression::{ComparisonType, Expression};
-use crate::plan::LogicalPlan;
+use crate::plan::OwnedLogicalPlan;
 use paro_common::types::LogicalType;
 
 /// Type of join operation.
@@ -387,16 +387,16 @@ impl JoinBuildSideConstraint {
     }
 }
 
-#[derive(Debug)]
-pub struct ComparisonJoin {
+#[derive(Debug, Clone)]
+pub struct ComparisonJoin<Child = Box<OwnedLogicalPlan>> {
     /// The type of join (INNER, LEFT, RIGHT, etc.)
     pub join_type: JoinType,
     /// Three-valued-logic mode for `JoinType::Anti`.
     pub anti_join_mode: AntiJoinMode,
     /// Left child operator.
-    pub left: Box<LogicalPlan>,
+    pub left: Child,
     /// Right child operator.
-    pub right: Box<LogicalPlan>,
+    pub right: Child,
     /// The comparison conditions (e.g., a.id = b.id).
     pub conditions: Vec<JoinCondition>,
     /// Table index for MARK join results.
@@ -426,8 +426,8 @@ impl ComparisonJoin {
     /// Create a new comparison join.
     pub fn new(
         join_type: JoinType,
-        left: LogicalPlan,
-        right: LogicalPlan,
+        left: OwnedLogicalPlan,
+        right: OwnedLogicalPlan,
         conditions: Vec<JoinCondition>,
     ) -> Self {
         let (left_projection_map, right_projection_map) = default_join_projections(join_type);
@@ -495,14 +495,14 @@ impl ComparisonJoin {
 
 /// AnyJoin represents a join with an arbitrary condition.
 /// Used when the join condition cannot be expressed as simple comparisons.
-#[derive(Debug)]
-pub struct AnyJoin {
+#[derive(Debug, Clone)]
+pub struct AnyJoin<Child = Box<OwnedLogicalPlan>> {
     /// The type of join (INNER, LEFT, RIGHT, etc.)
     pub join_type: JoinType,
     /// Left child operator.
-    pub left: Box<LogicalPlan>,
+    pub left: Child,
     /// Right child operator.
-    pub right: Box<LogicalPlan>,
+    pub right: Child,
     /// The arbitrary join condition.
     pub condition: Expression,
     /// Table index for MARK join results.
@@ -519,8 +519,8 @@ impl AnyJoin {
     /// Create a new any join.
     pub fn new(
         join_type: JoinType,
-        left: LogicalPlan,
-        right: LogicalPlan,
+        left: OwnedLogicalPlan,
+        right: OwnedLogicalPlan,
         condition: Expression,
     ) -> Self {
         let (left_projection_map, right_projection_map) = default_join_projections(join_type);
@@ -561,19 +561,19 @@ impl AnyJoin {
 
 /// CrossProduct represents a cross join (cartesian product).
 /// This is a join without any condition.
-#[derive(Debug)]
-pub struct CrossProduct {
+#[derive(Debug, Clone)]
+pub struct CrossProduct<Child = Box<OwnedLogicalPlan>> {
     /// Left child operator.
-    pub left: Box<LogicalPlan>,
+    pub left: Child,
     /// Right child operator.
-    pub right: Box<LogicalPlan>,
+    pub right: Child,
     /// Physical materialization constraint imposed by a control region.
     pub build_side_constraint: JoinBuildSideConstraint,
 }
 
 impl CrossProduct {
     /// Create a new cross product.
-    pub fn new(left: LogicalPlan, right: LogicalPlan) -> Self {
+    pub fn new(left: OwnedLogicalPlan, right: OwnedLogicalPlan) -> Self {
         Self {
             left: Box::new(left),
             right: Box::new(right),
@@ -591,22 +591,22 @@ impl CrossProduct {
 
 /// Unified Join enum that encompasses all join types.
 /// This provides a single entry point for join operations in the logical plan.
-#[derive(Debug)]
-pub enum Join {
+#[derive(Debug, Clone)]
+pub enum Join<Child = Box<OwnedLogicalPlan>> {
     /// Comparison join (most common, e.g., A.x = B.y)
-    Comparison(ComparisonJoin),
+    Comparison(ComparisonJoin<Child>),
     /// Any join (arbitrary condition)
-    Any(Box<AnyJoin>),
+    Any(Box<AnyJoin<Child>>),
     /// Cross product (no condition)
-    Cross(CrossProduct),
+    Cross(CrossProduct<Child>),
 }
 
 impl Join {
     /// Create a comparison join.
     pub fn comparison(
         join_type: JoinType,
-        left: LogicalPlan,
-        right: LogicalPlan,
+        left: OwnedLogicalPlan,
+        right: OwnedLogicalPlan,
         conditions: Vec<JoinCondition>,
     ) -> Self {
         Join::Comparison(ComparisonJoin::new(join_type, left, right, conditions))
@@ -615,29 +615,20 @@ impl Join {
     /// Create an any join.
     pub fn any(
         join_type: JoinType,
-        left: LogicalPlan,
-        right: LogicalPlan,
+        left: OwnedLogicalPlan,
+        right: OwnedLogicalPlan,
         condition: Expression,
     ) -> Self {
         Join::Any(Box::new(AnyJoin::new(join_type, left, right, condition)))
     }
 
     /// Create a cross product.
-    pub fn cross(left: LogicalPlan, right: LogicalPlan) -> Self {
+    pub fn cross(left: OwnedLogicalPlan, right: OwnedLogicalPlan) -> Self {
         Join::Cross(CrossProduct::new(left, right))
     }
 
-    /// Get the join type.
-    pub fn join_type(&self) -> JoinType {
-        match self {
-            Join::Comparison(j) => j.join_type,
-            Join::Any(j) => j.join_type,
-            Join::Cross(_) => JoinType::Inner, // Cross is essentially inner with no condition
-        }
-    }
-
     /// Get the left child.
-    pub fn left(&self) -> &LogicalPlan {
+    pub fn left(&self) -> &OwnedLogicalPlan {
         match self {
             Join::Comparison(j) => j.left.as_ref(),
             Join::Any(j) => j.left.as_ref(),
@@ -646,7 +637,7 @@ impl Join {
     }
 
     /// Get the right child.
-    pub fn right(&self) -> &LogicalPlan {
+    pub fn right(&self) -> &OwnedLogicalPlan {
         match self {
             Join::Comparison(j) => j.right.as_ref(),
             Join::Any(j) => j.right.as_ref(),
@@ -655,7 +646,7 @@ impl Join {
     }
 
     /// Get mutable reference to the left child.
-    pub fn left_mut(&mut self) -> &mut LogicalPlan {
+    pub fn left_mut(&mut self) -> &mut OwnedLogicalPlan {
         match self {
             Join::Comparison(j) => j.left.as_mut(),
             Join::Any(j) => j.left.as_mut(),
@@ -664,19 +655,11 @@ impl Join {
     }
 
     /// Get mutable reference to the right child.
-    pub fn right_mut(&mut self) -> &mut LogicalPlan {
+    pub fn right_mut(&mut self) -> &mut OwnedLogicalPlan {
         match self {
             Join::Comparison(j) => j.right.as_mut(),
             Join::Any(j) => j.right.as_mut(),
             Join::Cross(j) => j.right.as_mut(),
-        }
-    }
-
-    pub fn build_side_constraint(&self) -> JoinBuildSideConstraint {
-        match self {
-            Join::Comparison(join) => join.build_side_constraint,
-            Join::Any(join) => join.build_side_constraint,
-            Join::Cross(join) => join.build_side_constraint,
         }
     }
 
@@ -698,6 +681,25 @@ impl Join {
     }
 }
 
+impl<Child> Join<Child> {
+    /// Get the join type.
+    pub fn join_type(&self) -> JoinType {
+        match self {
+            Join::Comparison(j) => j.join_type,
+            Join::Any(j) => j.join_type,
+            Join::Cross(_) => JoinType::Inner, // Cross is essentially inner with no condition
+        }
+    }
+
+    pub fn build_side_constraint(&self) -> JoinBuildSideConstraint {
+        match self {
+            Join::Comparison(join) => join.build_side_constraint,
+            Join::Any(join) => join.build_side_constraint,
+            Join::Cross(join) => join.build_side_constraint,
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -711,14 +713,17 @@ mod tests {
         LogicalOperator::ExpressionGet(ExpressionGet::new(table_index, vec![], names, types))
     }
 
-    fn expression_get_plan(table_index: usize, types: Vec<LogicalType>) -> LogicalPlan {
+    fn expression_get_plan(table_index: usize, types: Vec<LogicalType>) -> OwnedLogicalPlan {
         let ctx = BindContext::new();
-        LogicalPlan::new(&ctx, expression_get(table_index, types))
+        OwnedLogicalPlan::new(&ctx, expression_get(table_index, types))
     }
 
-    fn dummy_plan_pair() -> (LogicalPlan, LogicalPlan) {
+    fn dummy_plan_pair() -> (OwnedLogicalPlan, OwnedLogicalPlan) {
         let ctx = BindContext::new();
-        (LogicalPlan::dummy_scan(&ctx), LogicalPlan::dummy_scan(&ctx))
+        (
+            OwnedLogicalPlan::dummy_scan(&ctx),
+            OwnedLogicalPlan::dummy_scan(&ctx),
+        )
     }
 
     #[test]

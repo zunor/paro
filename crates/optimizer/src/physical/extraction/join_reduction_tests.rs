@@ -16,14 +16,14 @@ use paro_planner::expression::{
 use paro_planner::operator::graph_expand::{ExpandDirection, GraphExpand};
 use paro_planner::operator::join::{ComparisonJoin, JoinComparisonType, JoinCondition, JoinType};
 use paro_planner::operator::{Filter, Get, Join, LogicalOperator, Projection, Window};
-use paro_planner::plan::LogicalPlan;
+use paro_planner::plan::OwnedLogicalPlan;
 
 use super::{
     hash_join_build_keys_are_declared_unique, plan_reduction_runtime_filter_fusion,
     remap_reduction_expression, resolve_base_get_column, ReductionPredicateBits,
 };
 
-fn declared_unique_get(ctx: &BindContext) -> LogicalPlan {
+fn declared_unique_get(ctx: &BindContext) -> OwnedLogicalPlan {
     let storage = Arc::new(
         paro_storage::table::table_factory::TableFactory::default()
             .create_table(&[LogicalType::Varchar, LogicalType::BigInt])
@@ -53,7 +53,7 @@ fn declared_unique_get(ctx: &BindContext) -> LogicalPlan {
         )
         .expect("unique table catalog entry"),
     );
-    LogicalPlan::new(
+    OwnedLogicalPlan::new(
         ctx,
         LogicalOperator::Get(Get {
             table_index: 7,
@@ -79,8 +79,8 @@ fn unique_build_proof_resolves_physical_references_through_carriers() {
     let get = declared_unique_get(&ctx);
     let mut filter = Filter::new(get, Vec::new());
     filter.projection_map = vec![1, 0].into();
-    let filter = LogicalPlan::new(&ctx, LogicalOperator::Filter(filter));
-    let projection = LogicalPlan::new(
+    let filter = OwnedLogicalPlan::new(&ctx, LogicalOperator::Filter(filter));
+    let projection = OwnedLogicalPlan::new(
         &ctx,
         LogicalOperator::Projection(Projection::new(
             8,
@@ -117,7 +117,7 @@ fn unique_build_proof_resolves_physical_references_through_carriers() {
 fn unique_build_proof_propagates_through_windows() {
     let ctx = BindContext::new();
     let get = declared_unique_get(&ctx);
-    let window = LogicalPlan::new(
+    let window = OwnedLogicalPlan::new(
         &ctx,
         LogicalOperator::Window(Window::new(9, Vec::new(), get)),
     );
@@ -164,7 +164,7 @@ fn graph_expand_does_not_promote_its_input_key_to_an_output_key() {
         "vertices".to_string(),
         declared_unique_get(&ctx),
     );
-    let expanded = LogicalPlan::new(&ctx, LogicalOperator::GraphExpand(expand));
+    let expanded = OwnedLogicalPlan::new(&ctx, LogicalOperator::GraphExpand(expand));
     let expanded =
         crate::statistics::unique_keys::refresh_unique_keys(expanded).expect("cache unique keys");
     let conditions = [JoinCondition::new(
@@ -191,7 +191,7 @@ fn unique_build_proof_requires_a_key_preserving_join() {
     let mut multiplicative = ComparisonJoin::new(JoinType::Inner, left, right, Vec::new());
     multiplicative.left_projection_map = vec![1].into();
     multiplicative.right_projection_map = vec![1].into();
-    let multiplicative = LogicalPlan::new(
+    let multiplicative = OwnedLogicalPlan::new(
         &ctx,
         LogicalOperator::Join(Join::Comparison(multiplicative)),
     );
@@ -227,7 +227,7 @@ fn unique_build_proof_requires_a_key_preserving_join() {
     let mut preserving = ComparisonJoin::new(JoinType::Inner, left, right, join_conditions);
     preserving.left_projection_map = vec![1].into();
     preserving.right_projection_map = vec![1].into();
-    let preserving = LogicalPlan::new(&ctx, LogicalOperator::Join(Join::Comparison(preserving)));
+    let preserving = OwnedLogicalPlan::new(&ctx, LogicalOperator::Join(Join::Comparison(preserving)));
     let preserving =
         crate::statistics::unique_keys::refresh_unique_keys(preserving).expect("cache unique keys");
     assert!(
@@ -254,7 +254,7 @@ fn integer_build_hint_traces_projected_outputs_through_inner_join_carriers() {
     let mut carrier = ComparisonJoin::new(JoinType::Inner, left, right, Vec::new());
     carrier.left_projection_map = vec![0].into();
     carrier.right_projection_map = vec![1].into();
-    let carrier = LogicalPlan::new(&ctx, LogicalOperator::Join(Join::Comparison(carrier)));
+    let carrier = OwnedLogicalPlan::new(&ctx, LogicalOperator::Join(Join::Comparison(carrier)));
 
     let key = Expression::Reference(ReferenceExpression::new(1, LogicalType::BigInt));
     let (get, column_id) = resolve_base_get_column(&carrier, &key)
@@ -267,7 +267,7 @@ fn integer_build_hint_traces_projected_outputs_through_inner_join_carriers() {
 fn unique_build_proof_declines_computed_keys_and_null_safe_equality() {
     let ctx = BindContext::new();
     let get = declared_unique_get(&ctx);
-    let computed = LogicalPlan::new(
+    let computed = OwnedLogicalPlan::new(
         &ctx,
         LogicalOperator::Projection(Projection::new(
             8,

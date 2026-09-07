@@ -15,7 +15,7 @@ mod tests {
         CTERef, ComparisonJoin, Join, JoinComparisonType, JoinCondition, LogicalOperator,
         MaterializedCTE, Projection, SetOpType, SetOperation,
     };
-    use paro_planner::plan::LogicalPlan;
+    use paro_planner::plan::OwnedLogicalPlan;
 
     fn expr_get(table_index: usize, values: &[i32]) -> LogicalOperator {
         let expressions = values
@@ -37,8 +37,8 @@ mod tests {
         ))
     }
 
-    fn plan_expr_get(ctx: &BindContext, table_index: usize, values: &[i32]) -> LogicalPlan {
-        LogicalPlan::new(ctx, expr_get(table_index, values))
+    fn plan_expr_get(ctx: &BindContext, table_index: usize, values: &[i32]) -> OwnedLogicalPlan {
+        OwnedLogicalPlan::new(ctx, expr_get(table_index, values))
     }
 
     #[test]
@@ -58,8 +58,8 @@ mod tests {
             vec!["v".to_string()],
             vec![LogicalType::Integer],
             CTEMaterialize::Default,
-            LogicalPlan::new(&bind_context, cte_query),
-            LogicalPlan::new(
+            OwnedLogicalPlan::new(&bind_context, cte_query),
+            OwnedLogicalPlan::new(
                 &bind_context,
                 LogicalOperator::CTERef(CTERef::new(
                     4,
@@ -87,8 +87,8 @@ mod tests {
         ));
         let join = LogicalOperator::Join(Join::Comparison(ComparisonJoin::new(
             paro_planner::operator::JoinType::Inner,
-            LogicalPlan::new(&bind_context, left_ref),
-            LogicalPlan::new(&bind_context, right_ref),
+            OwnedLogicalPlan::new(&bind_context, left_ref),
+            OwnedLogicalPlan::new(&bind_context, right_ref),
             vec![JoinCondition::new(
                 Expression::ColumnRef(ColumnRefExpression::new(
                     paro_planner::operator::ColumnBinding::new(6, 0),
@@ -108,12 +108,12 @@ mod tests {
             vec!["v".to_string()],
             vec![LogicalType::Integer],
             CTEMaterialize::Default,
-            LogicalPlan::new(&bind_context, cte_query_with_nested),
-            LogicalPlan::new(&bind_context, join),
+            OwnedLogicalPlan::new(&bind_context, cte_query_with_nested),
+            OwnedLogicalPlan::new(&bind_context, join),
         ));
 
         let copied = deep_copy_plan(
-            &LogicalPlan::new(&bind_context, plan),
+            &OwnedLogicalPlan::new(&bind_context, plan),
             bind_context.shared().as_ref(),
         );
 
@@ -166,7 +166,7 @@ mod tests {
         ));
         let plan = LogicalOperator::SetOperation(SetOperation::new(
             2,
-            LogicalPlan::new(&bind_context, inner_ref),
+            OwnedLogicalPlan::new(&bind_context, inner_ref),
             plan_expr_get(&bind_context, 3, &[1]),
             SetOpType::Union,
             true,
@@ -174,7 +174,7 @@ mod tests {
         ));
 
         let copied = deep_copy_plan(
-            &LogicalPlan::new(&bind_context, plan),
+            &OwnedLogicalPlan::new(&bind_context, plan),
             bind_context.shared().as_ref(),
         );
 

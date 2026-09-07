@@ -30,19 +30,19 @@ use paro_planner::operator::{
     Aggregate, ColumnBinding, CrossProduct, Filter, Get, Join, JoinBuildSideConstraint,
     LogicalOperator, Projection,
 };
-use paro_planner::plan::LogicalPlan;
+use paro_planner::plan::OwnedLogicalPlan;
 
 use crate::aggregate::post_reduction::alpha::AlphaBindings;
 use crate::aggregate::semantic_kernels::aggregate_kernels_equal;
 
-pub fn optimize_plan(plan: LogicalPlan, bind_context: &BindContext) -> Result<LogicalPlan> {
+pub fn optimize_plan(plan: OwnedLogicalPlan, bind_context: &BindContext) -> Result<OwnedLogicalPlan> {
     optimize_plan_with_change(plan, bind_context).map(|(plan, _)| plan)
 }
 
 /// Clone-free structural prefilter for optional-candidate construction. Exact
 /// source and expression equivalence remains the responsibility of
 /// [`recognize`]; a false positive here only creates a declined candidate.
-pub(crate) fn contains_candidate_root(plan: &LogicalPlan) -> bool {
+pub(crate) fn contains_candidate_root(plan: &OwnedLogicalPlan) -> bool {
     let mut pending = vec![plan];
     while let Some(candidate) = pending.pop() {
         if let LogicalOperator::Projection(projection) = &candidate.operator {
@@ -63,7 +63,7 @@ pub(crate) fn contains_candidate_root(plan: &LogicalPlan) -> bool {
     false
 }
 
-fn has_scalar_branch_shape(plan: &LogicalPlan) -> bool {
+fn has_scalar_branch_shape(plan: &OwnedLogicalPlan) -> bool {
     let LogicalOperator::Projection(wrapper) = &plan.operator else {
         return false;
     };
@@ -86,9 +86,9 @@ fn has_scalar_branch_shape(plan: &LogicalPlan) -> bool {
 }
 
 pub fn optimize_plan_with_change(
-    plan: LogicalPlan,
+    plan: OwnedLogicalPlan,
     bind_context: &BindContext,
-) -> Result<(LogicalPlan, bool)> {
+) -> Result<(OwnedLogicalPlan, bool)> {
     let mut changed = false;
     let plan = plan.try_map_post_order(|plan| {
         let Some(witness) = recognize(&plan) else {
@@ -123,7 +123,7 @@ struct FusionWitness {
     groups: Vec<FusionGroup>,
 }
 
-fn recognize(plan: &LogicalPlan) -> Option<FusionWitness> {
+fn recognize(plan: &OwnedLogicalPlan) -> Option<FusionWitness> {
     let LogicalOperator::Projection(projection) = &plan.operator else {
         return None;
     };
@@ -177,8 +177,8 @@ fn recognize(plan: &LogicalPlan) -> Option<FusionWitness> {
 }
 
 fn collect_cross_leaves<'a>(
-    plan: &'a LogicalPlan,
-    leaves: &mut Vec<&'a LogicalPlan>,
+    plan: &'a OwnedLogicalPlan,
+    leaves: &mut Vec<&'a OwnedLogicalPlan>,
 ) -> Option<()> {
     let mut pending = vec![plan];
     while let Some(plan) = pending.pop() {
@@ -195,7 +195,7 @@ fn collect_cross_leaves<'a>(
     Some(())
 }
 
-fn peel_scalar_branch(plan: &LogicalPlan, leaf_index: usize) -> Option<ScalarBranch> {
+fn peel_scalar_branch(plan: &OwnedLogicalPlan, leaf_index: usize) -> Option<ScalarBranch> {
     let LogicalOperator::Projection(wrapper_projection) = &plan.operator else {
         return None;
     };
@@ -422,10 +422,10 @@ fn filters_equal(grouped: &[Expression], scalar: &[Expression], bindings: &Alpha
 }
 
 fn apply_rewrite(
-    plan: LogicalPlan,
+    plan: OwnedLogicalPlan,
     witness: FusionWitness,
     bind_context: &BindContext,
-) -> Result<LogicalPlan> {
+) -> Result<OwnedLogicalPlan> {
     let (id, stats, operator) = plan.into_parts();
     let LogicalOperator::Projection(mut projection) = operator else {
         return Err(paro_error::internal(
@@ -434,7 +434,7 @@ fn apply_rewrite(
     };
     let original_child = std::mem::replace(
         &mut *projection.child,
-        LogicalPlan::synthetic(LogicalOperator::DummyScan),
+        OwnedLogicalPlan::synthetic(LogicalOperator::DummyScan),
     );
     let mut leaves = Vec::new();
     flatten_cross_owned(original_child, &mut leaves)?;
@@ -494,14 +494,14 @@ fn apply_rewrite(
             "scalar aggregate fusion left a reference to an eliminated branch",
         ));
     }
-    Ok(LogicalPlan {
+    Ok(OwnedLogicalPlan {
         id,
         stats,
         operator: LogicalOperator::Projection(projection),
     })
 }
 
-fn flatten_cross_owned(plan: LogicalPlan, leaves: &mut Vec<LogicalPlan>) -> Result<()> {
+fn flatten_cross_owned(plan: OwnedLogicalPlan, leaves: &mut Vec<OwnedLogicalPlan>) -> Result<()> {
     let mut pending = vec![plan];
     while let Some(plan) = pending.pop() {
         if !matches!(plan.operator, LogicalOperator::Join(Join::Cross(_))) {
@@ -529,12 +529,12 @@ fn build_fused_group(
     group: FusionGroup,
     branches: &[ScalarBranch],
     bind_context: &BindContext,
-) -> Result<(LogicalPlan, Vec<(ColumnBinding, ColumnBinding)>)> {
-    let get_plan = LogicalPlan::new(bind_context, LogicalOperator::Get(group.fused_get.clone()));
+) -> Result<(OwnedLogicalPlan, Vec<(ColumnBinding, ColumnBinding)>)> {
+    let get_plan = OwnedLogicalPlan::new(bind_context, LogicalOperator::Get(group.fused_get.clone()));
     let source = if group.filter_expressions.is_empty() {
         get_plan
     } else {
-        LogicalPlan::new(
+        OwnedLogicalPlan::new(
             bind_context,
             LogicalOperator::Filter(Filter::new(get_plan, group.filter_expressions)),
         )
@@ -586,7 +586,7 @@ fn build_fused_group(
         aggregates,
         Vec::new(),
     );
-    let aggregate_plan = LogicalPlan::new(bind_context, LogicalOperator::Aggregate(aggregate));
+    let aggregate_plan = OwnedLogicalPlan::new(bind_context, LogicalOperator::Aggregate(aggregate));
     let projection_index = bind_context.generate_table_index();
     let projection = Projection::new(projection_index, aggregate_plan, scalar_expressions)
         .with_internal_outputs();
@@ -604,18 +604,18 @@ fn build_fused_group(
         })
         .collect();
     Ok((
-        LogicalPlan::new(bind_context, LogicalOperator::Projection(projection)),
+        OwnedLogicalPlan::new(bind_context, LogicalOperator::Projection(projection)),
         replacements,
     ))
 }
 
-fn rebuild_cross(leaves: Vec<LogicalPlan>, bind_context: &BindContext) -> Result<LogicalPlan> {
+fn rebuild_cross(leaves: Vec<OwnedLogicalPlan>, bind_context: &BindContext) -> Result<OwnedLogicalPlan> {
     let mut leaves = leaves.into_iter();
     let first = leaves
         .next()
         .ok_or_else(|| paro_error::internal("scalar aggregate fusion removed every input"))?;
     Ok(leaves.fold(first, |left, right| {
-        LogicalPlan::new(
+        OwnedLogicalPlan::new(
             bind_context,
             LogicalOperator::Join(Join::Cross(CrossProduct::new(left, right))),
         )

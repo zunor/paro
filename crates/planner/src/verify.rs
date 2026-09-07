@@ -274,7 +274,7 @@ mod tests {
     use crate::operator::{
         ColumnBinding, DependentJoin, ExpressionGet, Filter, LogicalOperator, TopN,
     };
-    use crate::plan::LogicalPlan;
+    use crate::plan::OwnedLogicalPlan;
     use crate::plan::PlannedStatement;
     use paro_common::runtime_value::Value;
     use paro_common::types::LogicalType;
@@ -290,8 +290,8 @@ mod tests {
         ))
     }
 
-    fn wrap(ctx: &BindContext, op: LogicalOperator) -> LogicalPlan {
-        LogicalPlan::new(ctx, op)
+    fn wrap(ctx: &BindContext, op: LogicalOperator) -> OwnedLogicalPlan {
+        OwnedLogicalPlan::new(ctx, op)
     }
 
     fn dummy_subquery_expr() -> Expression {

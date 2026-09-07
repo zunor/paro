@@ -85,14 +85,14 @@ pub(crate) fn logical_name(op: &LogicalOperator) -> &'static str {
     }
 }
 
-pub(crate) fn is_read_csv_table_function(plan: &LogicalPlan) -> bool {
+pub(crate) fn is_read_csv_table_function(plan: &OwnedLogicalPlan) -> bool {
     matches!(
         &plan.operator,
         LogicalOperator::TableFunctionGet(get) if get.function.name.eq_ignore_ascii_case("read_csv")
     )
 }
 
-pub(crate) fn physical_output_row_type(logical: &LogicalPlan) -> Result<RowType> {
+pub(crate) fn physical_output_row_type(logical: &OwnedLogicalPlan) -> Result<RowType> {
     let types = logical.types();
     let visible_names = logical.output_names();
     let names = align_output_names(visible_names.clone(), types.len(), "logical output")?;
@@ -101,7 +101,7 @@ pub(crate) fn physical_output_row_type(logical: &LogicalPlan) -> Result<RowType>
 }
 
 pub(crate) fn physical_output_row_type_for_kind(
-    logical: &LogicalPlan,
+    logical: &OwnedLogicalPlan,
     kind: &PhysicalNodeKind,
     child_outputs: &[&RowType],
 ) -> Result<RowType> {
@@ -194,7 +194,7 @@ pub(crate) fn physical_output_row_type_for_kind(
 }
 
 fn physical_column_identities(
-    logical: &LogicalPlan,
+    logical: &OwnedLogicalPlan,
     kind: &PhysicalNodeKind,
     child_outputs: &[&RowType],
     output: &RowType,
@@ -612,7 +612,7 @@ fn search_projection_identity(
 }
 
 fn logical_row_fetch_column_name(
-    logical: &LogicalPlan,
+    logical: &OwnedLogicalPlan,
     table_index: usize,
     column_id: u32,
 ) -> Option<String> {
@@ -720,7 +720,7 @@ pub(crate) fn project_by_index<T: Clone>(
 }
 
 pub(crate) fn project_output_names(
-    input: &LogicalPlan,
+    input: &OwnedLogicalPlan,
     projection_map: &[usize],
     label: &str,
 ) -> Result<Vec<String>> {
@@ -836,14 +836,14 @@ pub(crate) fn explain_line_expression(line: impl Into<String>) -> Box<[Expressio
     ))])
 }
 
-pub(crate) fn is_graph_chain(plan: &LogicalPlan) -> bool {
+pub(crate) fn is_graph_chain(plan: &OwnedLogicalPlan) -> bool {
     matches!(
         &plan.operator,
         LogicalOperator::GraphScan(_) | LogicalOperator::GraphExpand(_)
     )
 }
 
-pub(crate) fn extract_graph_name_from_logical(plan: &LogicalPlan) -> Option<String> {
+pub(crate) fn extract_graph_name_from_logical(plan: &OwnedLogicalPlan) -> Option<String> {
     match &plan.operator {
         LogicalOperator::GraphScan(scan) => Some(scan.graph_name.clone()),
         LogicalOperator::GraphExpand(expand) => {
@@ -853,7 +853,7 @@ pub(crate) fn extract_graph_name_from_logical(plan: &LogicalPlan) -> Option<Stri
     }
 }
 
-pub(crate) fn extract_schema_name_from_logical(plan: &LogicalPlan) -> Option<String> {
+pub(crate) fn extract_schema_name_from_logical(plan: &OwnedLogicalPlan) -> Option<String> {
     match &plan.operator {
         LogicalOperator::GraphScan(scan) => Some(scan.schema_name.clone()),
         LogicalOperator::GraphExpand(expand) => {
@@ -871,7 +871,7 @@ pub(crate) struct GraphChainLayout {
     pub(crate) rowid_cols: HashMap<usize, usize>,
 }
 
-pub(crate) fn build_graph_chain_layout(plan: &LogicalPlan) -> Result<GraphChainLayout> {
+pub(crate) fn build_graph_chain_layout(plan: &OwnedLogicalPlan) -> Result<GraphChainLayout> {
     match &plan.operator {
         LogicalOperator::GraphScan(scan) => {
             let mut layout = GraphChainLayout {
@@ -915,7 +915,7 @@ pub(crate) fn build_graph_chain_layout(plan: &LogicalPlan) -> Result<GraphChainL
 }
 
 pub(crate) fn build_rowid_mappings_from_logical(
-    plan: &LogicalPlan,
+    plan: &OwnedLogicalPlan,
     schema_name: &str,
 ) -> Result<Vec<GraphRowFetchMapping>> {
     let layout = build_graph_chain_layout(plan)?;
@@ -925,7 +925,7 @@ pub(crate) fn build_rowid_mappings_from_logical(
 }
 
 pub(crate) fn collect_rowid_mappings_from_logical(
-    plan: &LogicalPlan,
+    plan: &OwnedLogicalPlan,
     schema_name: &str,
     layout: &GraphChainLayout,
     mappings: &mut Vec<GraphRowFetchMapping>,
@@ -1000,13 +1000,13 @@ pub(crate) fn collect_rowid_mappings_from_logical(
     }
 }
 
-pub(crate) fn collect_graph_filters_from_logical(plan: &LogicalPlan) -> Vec<Expression> {
+pub(crate) fn collect_graph_filters_from_logical(plan: &OwnedLogicalPlan) -> Vec<Expression> {
     let mut filters = Vec::new();
     collect_graph_filters_recursive(plan, &mut filters);
     filters
 }
 
-pub(crate) fn collect_graph_filters_recursive(plan: &LogicalPlan, filters: &mut Vec<Expression>) {
+pub(crate) fn collect_graph_filters_recursive(plan: &OwnedLogicalPlan, filters: &mut Vec<Expression>) {
     match &plan.operator {
         LogicalOperator::GraphScan(_) => {}
         LogicalOperator::GraphExpand(expand) => {
@@ -1077,7 +1077,7 @@ pub(crate) fn collect_union_all_row_literals(
 }
 
 pub(crate) fn collect_row_literal_plan(
-    plan: &LogicalPlan,
+    plan: &OwnedLogicalPlan,
     output_width: usize,
     rows: &mut Vec<Box<[Expression]>>,
 ) -> Result<bool> {
@@ -1133,7 +1133,7 @@ mod output_name_tests {
         let bind_context = paro_planner::binder::context::BindContext::new();
         let projection = LogicalProjection::new(
             bind_context.generate_table_index(),
-            LogicalPlan::new(&bind_context, LogicalOperator::DummyScan),
+            OwnedLogicalPlan::new(&bind_context, LogicalOperator::DummyScan),
             vec![
                 Expression::Constant(ConstantExpression::new(
                     paro_common::runtime_value::Value::Integer(1),
@@ -1146,7 +1146,7 @@ mod output_name_tests {
             ],
         )
         .with_visible_names(vec!["visible".to_string()]);
-        let plan = LogicalPlan::new(&bind_context, LogicalOperator::Projection(projection));
+        let plan = OwnedLogicalPlan::new(&bind_context, LogicalOperator::Projection(projection));
 
         assert_eq!(
             project_output_names(&plan, &[1], "hidden projection").unwrap(),

@@ -67,8 +67,8 @@ fn table(object_id: u64) -> Arc<TableCatalogEntry> {
     )
 }
 
-fn get(table_index: usize, table: Arc<TableCatalogEntry>) -> LogicalPlan {
-    LogicalPlan::synthetic(LogicalOperator::Get(Get::new(
+fn get(table_index: usize, table: Arc<TableCatalogEntry>) -> OwnedLogicalPlan {
+    OwnedLogicalPlan::synthetic(LogicalOperator::Get(Get::new(
         table_index,
         vec!["key".to_string(), "value".to_string()],
         vec![LogicalType::BigInt, LogicalType::Integer],
@@ -79,7 +79,7 @@ fn get(table_index: usize, table: Arc<TableCatalogEntry>) -> LogicalPlan {
 fn q11_shape(
     grouped_table: Arc<TableCatalogEntry>,
     scalar_table: Arc<TableCatalogEntry>,
-) -> LogicalPlan {
+) -> OwnedLogicalPlan {
     let grouped = Aggregate::new(
         GROUP_INDEX,
         GROUP_AGGREGATE,
@@ -114,7 +114,7 @@ fn q11_shape(
     ));
     let scalar_projection = Projection::new(
         SCALAR_PROJECTION,
-        LogicalPlan::synthetic(LogicalOperator::Aggregate(scalar_aggregate)),
+        OwnedLogicalPlan::synthetic(LogicalOperator::Aggregate(scalar_aggregate)),
         vec![scalar_expression],
     );
 
@@ -125,7 +125,7 @@ fn q11_shape(
         WRAPPER_GROUP,
         WRAPPER_AGGREGATE,
         WRAPPER_GROUPINGS,
-        LogicalPlan::synthetic(LogicalOperator::Projection(scalar_projection)),
+        OwnedLogicalPlan::synthetic(LogicalOperator::Projection(scalar_projection)),
         vec![],
         vec![],
         vec![
@@ -152,12 +152,12 @@ fn q11_shape(
     ));
     let wrapper_projection = Projection::new(
         WRAPPER_PROJECTION,
-        LogicalPlan::synthetic(LogicalOperator::Aggregate(wrapper)),
+        OwnedLogicalPlan::synthetic(LogicalOperator::Aggregate(wrapper)),
         vec![checked],
     );
-    let cross = LogicalPlan::synthetic(LogicalOperator::Join(Join::Cross(CrossProduct::new(
-        LogicalPlan::synthetic(LogicalOperator::Aggregate(grouped)),
-        LogicalPlan::synthetic(LogicalOperator::Projection(wrapper_projection)),
+    let cross = OwnedLogicalPlan::synthetic(LogicalOperator::Join(Join::Cross(CrossProduct::new(
+        OwnedLogicalPlan::synthetic(LogicalOperator::Aggregate(grouped)),
+        OwnedLogicalPlan::synthetic(LogicalOperator::Projection(wrapper_projection)),
     ))));
     let predicate = Expression::Comparison(ComparisonExpression::new(
         ComparisonType::GreaterThan,
@@ -165,8 +165,8 @@ fn q11_shape(
         column(WRAPPER_PROJECTION, 0, LogicalType::BigInt),
     ));
     let filter =
-        LogicalPlan::synthetic(LogicalOperator::Filter(Filter::new(cross, vec![predicate])));
-    LogicalPlan::synthetic(LogicalOperator::Projection(Projection::new(
+        OwnedLogicalPlan::synthetic(LogicalOperator::Filter(Filter::new(cross, vec![predicate])));
+    OwnedLogicalPlan::synthetic(LogicalOperator::Projection(Projection::new(
         OUTPUT_PROJECTION,
         filter,
         vec![

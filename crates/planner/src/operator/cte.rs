@@ -6,19 +6,19 @@
 use paro_common::types::LogicalType;
 
 use crate::binder::ir::CTEMaterialize;
-use crate::plan::LogicalPlan;
+use crate::plan::OwnedLogicalPlan;
 
 /// Non-recursive materialized CTE wrapper.
-#[derive(Debug)]
-pub struct MaterializedCTE {
+#[derive(Debug, Clone)]
+pub struct MaterializedCTE<Child = Box<OwnedLogicalPlan>> {
     pub cte_index: usize,
     pub cte_name: String,
     pub column_names: Vec<String>,
     pub column_types: Vec<LogicalType>,
     pub materialized: CTEMaterialize,
     pub ref_count: usize,
-    pub cte_query: Box<LogicalPlan>,
-    pub child: Box<LogicalPlan>,
+    pub cte_query: Child,
+    pub child: Child,
 }
 
 impl MaterializedCTE {
@@ -28,8 +28,8 @@ impl MaterializedCTE {
         column_names: Vec<String>,
         column_types: Vec<LogicalType>,
         materialized: CTEMaterialize,
-        mut cte_query: LogicalPlan,
-        child: LogicalPlan,
+        mut cte_query: OwnedLogicalPlan,
+        child: OwnedLogicalPlan,
     ) -> Self {
         if let crate::operator::LogicalOperator::ExpressionGet(values) = &mut cte_query.operator {
             values.names.clone_from(&column_names);
@@ -58,15 +58,15 @@ impl MaterializedCTE {
 }
 
 /// Recursive CTE producer.
-#[derive(Debug)]
-pub struct RecursiveCTE {
+#[derive(Debug, Clone)]
+pub struct RecursiveCTE<Child = Box<OwnedLogicalPlan>> {
     pub cte_index: usize,
     pub cte_name: String,
     pub column_names: Vec<String>,
     pub column_types: Vec<LogicalType>,
     pub union_all: bool,
-    pub anchor: Box<LogicalPlan>,
-    pub recursive: Box<LogicalPlan>,
+    pub anchor: Child,
+    pub recursive: Child,
 }
 
 impl RecursiveCTE {
@@ -78,6 +78,9 @@ impl RecursiveCTE {
 /// CTE reference (leaf node).
 #[derive(Debug, Clone)]
 pub struct CTERef {
+    /// Lexical producer-domain symbol, not a display name. Optimizer demand
+    /// rewrites must rebind this symbol when changing the producer's domain;
+    /// scans of different domains cannot share expression-independent facts.
     pub cte_index: usize,
     pub table_index: usize,
     pub relation_alias: String,

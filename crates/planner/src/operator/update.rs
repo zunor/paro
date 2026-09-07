@@ -10,7 +10,7 @@ use paro_common::types::LogicalType;
 
 use crate::expression::Expression;
 
-use crate::plan::LogicalPlan;
+use crate::plan::OwnedLogicalPlan;
 
 /// Update represents an UPDATE operation in the logical plan.
 ///
@@ -24,8 +24,8 @@ use crate::plan::LogicalPlan;
 /// - Has bound_defaults for DEFAULT values
 /// - Has bound_constraints for constraint checking
 /// - Has update_is_del_and_insert flag for certain update strategies
-#[derive(Debug)]
-pub struct Update {
+#[derive(Debug, Clone)]
+pub struct Update<Child = Box<OwnedLogicalPlan>> {
     /// The table to update.
     pub table: Arc<TableCatalogEntry>,
     /// The table index for this update operation (used for column bindings).
@@ -40,7 +40,7 @@ pub struct Update {
     pub expressions: Vec<Expression>,
     /// The child operator that produces rows to update.
     /// This is typically a Get + Filter + Projection.
-    pub child: Box<LogicalPlan>,
+    pub child: Child,
 }
 
 impl Update {
@@ -50,7 +50,7 @@ impl Update {
         table_index: u32,
         columns: Vec<usize>,
         expressions: Vec<Expression>,
-        child: LogicalPlan,
+        child: OwnedLogicalPlan,
     ) -> Self {
         Self {
             table,

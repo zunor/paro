@@ -17,7 +17,7 @@ use paro_planner::binder::bind::graph::BoundPatternElement;
 use paro_planner::operator::{
     ExpandDirection, GraphExpand, GraphMatch, GraphScan, LogicalOperator, Projection,
 };
-use paro_planner::plan::LogicalPlan;
+use paro_planner::plan::OwnedLogicalPlan;
 use std::collections::HashMap;
 
 /// Decomposes `GraphMatch` into Scan + Expand chain + Projection.
@@ -31,22 +31,22 @@ impl GraphMatchDecompose {
     /// Optimize the plan by recursively decomposing any `GraphMatch` nodes.
     #[cfg(test)]
     pub(crate) fn optimize(&mut self, plan: LogicalOperator) -> LogicalOperator {
-        self.optimize_plan(LogicalPlan::synthetic(plan))
+        self.optimize_plan(OwnedLogicalPlan::synthetic(plan))
             .into_operator()
     }
 
-    pub fn optimize_plan(&mut self, plan: LogicalPlan) -> LogicalPlan {
+    pub fn optimize_plan(&mut self, plan: OwnedLogicalPlan) -> OwnedLogicalPlan {
         self.rewrite_plan(plan)
     }
 
-    fn rewrite_plan(&mut self, plan: LogicalPlan) -> LogicalPlan {
+    fn rewrite_plan(&mut self, plan: OwnedLogicalPlan) -> OwnedLogicalPlan {
         plan.try_map_post_order(|plan| {
             let (id, stats, operator) = plan.into_parts();
             let operator = match operator {
                 LogicalOperator::GraphMatch(gm) => self.decompose(gm),
                 other => other,
             };
-            Ok(LogicalPlan {
+            Ok(OwnedLogicalPlan {
                 id,
                 stats,
                 operator,
@@ -86,7 +86,7 @@ impl GraphMatchDecompose {
             }
         };
 
-        let mut current = LogicalPlan::synthetic(LogicalOperator::GraphScan(GraphScan::new(
+        let mut current = OwnedLogicalPlan::synthetic(LogicalOperator::GraphScan(GraphScan::new(
             first_vertex.vertex_table_info.clone(),
             first_vertex.filter.clone(),
             first_vertex.table_index,
@@ -155,7 +155,7 @@ impl GraphMatchDecompose {
             expand.path_mode = path_mode.clone();
             expand.has_path_functions = gm.has_path_functions && is_terminal_expand;
 
-            current = LogicalPlan::synthetic(LogicalOperator::GraphExpand(expand));
+            current = OwnedLogicalPlan::synthetic(LogicalOperator::GraphExpand(expand));
             bound_vertices.insert(target_vertex.variable_name.clone(), target_vertex);
         }
 
@@ -300,7 +300,7 @@ mod tests {
         let mut decompose = GraphMatchDecompose::new();
         let result = decompose.optimize(plan);
 
-        crate::verify::verify_logical_plan(&BindContext::new(), &LogicalPlan::synthetic(result))
+        crate::verify::verify_logical_plan(&BindContext::new(), &OwnedLogicalPlan::synthetic(result))
             .expect("decomposed graph projection should satisfy logical invariants");
     }
 
@@ -317,7 +317,7 @@ mod tests {
         let plan = make_graph_match(elements, vec![make_column(99, 1)], 100);
 
         let mut decompose = GraphMatchDecompose::new();
-        let result = LogicalPlan::synthetic(decompose.optimize(plan));
+        let result = OwnedLogicalPlan::synthetic(decompose.optimize(plan));
         let error = crate::verify::verify_logical_plan(&BindContext::new(), &result)
             .expect_err("unknown graph relation must not pass verification");
 
@@ -485,7 +485,7 @@ mod tests {
         let graph_match = make_graph_match(elements, columns, 100);
 
         let plan = LogicalOperator::Filter(paro_planner::operator::Filter::new(
-            LogicalPlan::synthetic(graph_match),
+            OwnedLogicalPlan::synthetic(graph_match),
             vec![],
         ));
 

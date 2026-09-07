@@ -7,7 +7,7 @@ use std::ops::ControlFlow;
 
 use crate::expression::*;
 use crate::operator::LogicalOperator;
-use crate::plan::LogicalPlan;
+use crate::plan::OwnedLogicalPlan;
 
 /// LogicalOperatorVisitor trait for traversing logical plans.
 ///
@@ -37,8 +37,8 @@ pub trait LogicalOperatorVisitor {
         self.visit_operator_expressions(op);
     }
 
-    /// Visit a child [`LogicalPlan`] (delegates to the wrapped operator).
-    fn visit_logical_plan(&mut self, plan: &mut LogicalPlan) {
+    /// Visit a child [`OwnedLogicalPlan`] (delegates to the wrapped operator).
+    fn visit_logical_plan(&mut self, plan: &mut OwnedLogicalPlan) {
         self.visit_operator(&mut plan.operator);
     }
 
@@ -150,7 +150,7 @@ pub trait LogicalOperatorVisitor {
 
 /// Enumerate all expressions in a logical operator and call the callback for each.
 /// This is a static helper function that can be used independently of the visitor.
-pub fn enumerate_expressions<F>(op: &mut LogicalOperator, mut callback: F)
+pub fn enumerate_expressions<Child, F>(op: &mut LogicalOperator<Child>, mut callback: F)
 where
     F: FnMut(&mut Expression),
 {
@@ -357,7 +357,7 @@ mod tests {
     }
 
     impl LogicalOperatorVisitor for RecordingVisitor {
-        fn visit_logical_plan(&mut self, plan: &mut LogicalPlan) {
+        fn visit_logical_plan(&mut self, plan: &mut OwnedLogicalPlan) {
             self.visited.push(plan.id);
             self.visit_operator(&mut plan.operator);
         }
@@ -367,17 +367,17 @@ mod tests {
     fn visitor_recurses_via_operator_child_primitive() {
         let ctx = BindContext::new();
 
-        let left_leaf = LogicalPlan::new(&ctx, LogicalOperator::DummyScan);
+        let left_leaf = OwnedLogicalPlan::new(&ctx, LogicalOperator::DummyScan);
         let left_leaf_id = left_leaf.id;
-        let left = LogicalPlan::new(
+        let left = OwnedLogicalPlan::new(
             &ctx,
             LogicalOperator::Filter(Filter::new(left_leaf, Vec::new())),
         );
         let left_id = left.id;
 
-        let right_leaf = LogicalPlan::new(&ctx, LogicalOperator::DummyScan);
+        let right_leaf = OwnedLogicalPlan::new(&ctx, LogicalOperator::DummyScan);
         let right_leaf_id = right_leaf.id;
-        let right = LogicalPlan::new(
+        let right = OwnedLogicalPlan::new(
             &ctx,
             LogicalOperator::EmptyResult(EmptyResult::new(right_leaf)),
         );

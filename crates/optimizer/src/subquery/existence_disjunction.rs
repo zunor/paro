@@ -23,13 +23,13 @@ use paro_planner::operator::{
     JoinCondition, JoinType, LogicalOperator, MarkJoinSemantics, Projection, ProjectionMap,
     SetOperation,
 };
-use paro_planner::plan::LogicalPlan;
+use paro_planner::plan::OwnedLogicalPlan;
 use paro_planner::visitor::LogicalOperatorVisitor;
 
 pub(crate) fn optimize_plan(
-    mut plan: LogicalPlan,
+    mut plan: OwnedLogicalPlan,
     bind_context: &BindContext,
-) -> Result<(LogicalPlan, bool)> {
+) -> Result<(OwnedLogicalPlan, bool)> {
     let root_outputs = plan
         .get_column_bindings()
         .into_iter()
@@ -72,7 +72,7 @@ struct DisjunctionWitness {
 }
 
 fn recognize(
-    plan: &LogicalPlan,
+    plan: &OwnedLogicalPlan,
     binding_uses: &HashMap<ColumnBinding, usize>,
     root_outputs: &HashSet<ColumnBinding>,
 ) -> Option<DisjunctionWitness> {
@@ -281,10 +281,10 @@ fn collect_expression_bindings(
 }
 
 fn apply(
-    plan: LogicalPlan,
+    plan: OwnedLogicalPlan,
     witness: DisjunctionWitness,
     bind_context: &BindContext,
-) -> Result<LogicalPlan> {
+) -> Result<OwnedLogicalPlan> {
     let (id, stats, operator) = plan.into_parts();
     let LogicalOperator::Filter(mut filter) = operator else {
         unreachable!("existence-disjunction witness must belong to a filter");
@@ -319,7 +319,7 @@ fn apply(
             .map(|condition| condition.right.clone())
             .collect::<Vec<_>>();
         let projection_index = bind_context.generate_table_index();
-        let projected = LogicalPlan::new(
+        let projected = OwnedLogicalPlan::new(
             bind_context,
             LogicalOperator::Projection(
                 Projection::new(projection_index, *join.right, right_keys).with_internal_outputs(),
@@ -349,7 +349,7 @@ fn apply(
         .table_index;
     for branch in branches {
         union_index = bind_context.generate_table_index();
-        union = LogicalPlan::new(
+        union = OwnedLogicalPlan::new(
             bind_context,
             LogicalOperator::SetOperation(SetOperation::union(
                 union_index,
@@ -395,14 +395,14 @@ fn apply(
     let mut reduction = ComparisonJoin::new(JoinType::Semi, current, union, conditions);
     reduction.left_projection_map = ProjectionMap::new(left_projection_map);
     reduction.right_projection_map = ProjectionMap::none();
-    let reduction = LogicalPlan::new(
+    let reduction = OwnedLogicalPlan::new(
         bind_context,
         LogicalOperator::Join(Join::Comparison(reduction)),
     );
 
     if filter.expressions.is_empty() {
         let (_, _, operator) = reduction.into_parts();
-        return Ok(LogicalPlan {
+        return Ok(OwnedLogicalPlan {
             id,
             stats,
             operator,
@@ -422,7 +422,7 @@ fn apply(
             })
             .collect(),
     );
-    Ok(LogicalPlan {
+    Ok(OwnedLogicalPlan {
         id,
         stats,
         operator: LogicalOperator::Filter(filter),
@@ -438,8 +438,8 @@ mod tests {
     };
     use paro_planner::operator::{ExpressionGet, Filter, MarkJoinSemantics};
 
-    fn value_plan(ctx: &BindContext, table_index: usize, width: usize) -> LogicalPlan {
-        LogicalPlan::new(
+    fn value_plan(ctx: &BindContext, table_index: usize, width: usize) -> OwnedLogicalPlan {
+        OwnedLogicalPlan::new(
             ctx,
             LogicalOperator::ExpressionGet(ExpressionGet::new(
                 table_index,
@@ -465,10 +465,10 @@ mod tests {
 
     fn mark(
         ctx: &BindContext,
-        left: LogicalPlan,
+        left: OwnedLogicalPlan,
         right_table: usize,
         marker_table: usize,
-    ) -> LogicalPlan {
+    ) -> OwnedLogicalPlan {
         mark_with_comparison(
             ctx,
             left,
@@ -480,11 +480,11 @@ mod tests {
 
     fn mark_with_comparison(
         ctx: &BindContext,
-        left: LogicalPlan,
+        left: OwnedLogicalPlan,
         right_table: usize,
         marker_table: usize,
         comparison: JoinComparisonType,
-    ) -> LogicalPlan {
+    ) -> OwnedLogicalPlan {
         let mut join = ComparisonJoin::new(
             JoinType::Mark,
             left,
@@ -497,7 +497,7 @@ mod tests {
         );
         join.mark_index = Some(marker_table);
         join.mark_semantics = MarkJoinSemantics::TwoValued;
-        LogicalPlan::new(ctx, LogicalOperator::Join(Join::Comparison(join)))
+        OwnedLogicalPlan::new(ctx, LogicalOperator::Join(Join::Comparison(join)))
     }
 
     #[test]
@@ -515,7 +515,7 @@ mod tests {
         ));
         let mut filter = Filter::new(outer, vec![disjunction]);
         filter.projection_map = ProjectionMap::new(vec![1]);
-        let plan = LogicalPlan::new(&ctx, LogicalOperator::Filter(filter));
+        let plan = OwnedLogicalPlan::new(&ctx, LogicalOperator::Filter(filter));
 
         let (result, changed) = optimize_plan(plan, &ctx).unwrap();
         assert!(changed);
@@ -547,7 +547,7 @@ mod tests {
         ));
         let mut filter = Filter::new(outer, vec![disjunction]);
         filter.projection_map = ProjectionMap::new(vec![1, 2]);
-        let plan = LogicalPlan::new(&ctx, LogicalOperator::Filter(filter));
+        let plan = OwnedLogicalPlan::new(&ctx, LogicalOperator::Filter(filter));
 
         let (_, changed) = optimize_plan(plan, &ctx).unwrap();
         assert!(!changed);
@@ -578,7 +578,7 @@ mod tests {
         filter.projection_map = ProjectionMap::new(vec![1]);
 
         let (result, changed) = optimize_plan(
-            LogicalPlan::new(&ctx, LogicalOperator::Filter(filter)),
+            OwnedLogicalPlan::new(&ctx, LogicalOperator::Filter(filter)),
             &ctx,
         )
         .unwrap();
@@ -615,7 +615,7 @@ mod tests {
         filter.projection_map = ProjectionMap::new(vec![0]);
 
         let (result, changed) = optimize_plan(
-            LogicalPlan::new(&ctx, LogicalOperator::Filter(filter)),
+            OwnedLogicalPlan::new(&ctx, LogicalOperator::Filter(filter)),
             &ctx,
         )
         .unwrap();

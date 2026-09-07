@@ -8,7 +8,7 @@
 
 use paro_planner::operator::empty_result::EmptyResult;
 use paro_planner::operator::{Join, JoinType, LogicalOperator};
-use paro_planner::plan::LogicalPlan;
+use paro_planner::plan::OwnedLogicalPlan;
 
 /// Pull empty-result markers upward through the logical plan.
 pub struct EmptyResultPullup;
@@ -18,11 +18,11 @@ impl EmptyResultPullup {
         Self
     }
 
-    pub fn optimize_plan(&mut self, plan: LogicalPlan) -> LogicalPlan {
+    pub fn optimize_plan(&mut self, plan: OwnedLogicalPlan) -> OwnedLogicalPlan {
         self.optimize_recursive_plan(plan)
     }
 
-    fn optimize_recursive_plan(&mut self, plan: LogicalPlan) -> LogicalPlan {
+    fn optimize_recursive_plan(&mut self, plan: OwnedLogicalPlan) -> OwnedLogicalPlan {
         plan.try_map_post_order(|plan| Ok(plan.map_operator(|operator| self.pull_up(operator))))
             .expect("empty-result traversal cannot fail")
     }
@@ -207,7 +207,7 @@ impl EmptyResultPullup {
     }
 
     fn empty_result(op: LogicalOperator) -> LogicalOperator {
-        LogicalOperator::EmptyResult(EmptyResult::new(LogicalPlan::synthetic(op)))
+        LogicalOperator::EmptyResult(EmptyResult::new(OwnedLogicalPlan::synthetic(op)))
     }
 }
 
@@ -222,10 +222,10 @@ mod tests {
         ColumnBinding, ComparisonJoin, ExpressionGet, Join, JoinComparisonType, JoinCondition,
         JoinType, LogicalOperator,
     };
-    use paro_planner::plan::LogicalPlan;
+    use paro_planner::plan::OwnedLogicalPlan;
 
-    fn expression_get(ctx: &BindContext, table_index: usize) -> LogicalPlan {
-        LogicalPlan::new(
+    fn expression_get(ctx: &BindContext, table_index: usize) -> OwnedLogicalPlan {
+        OwnedLogicalPlan::new(
             ctx,
             LogicalOperator::ExpressionGet(ExpressionGet::new(
                 table_index,
@@ -239,10 +239,10 @@ mod tests {
         )
     }
 
-    fn empty(ctx: &BindContext, op: LogicalOperator) -> LogicalPlan {
-        LogicalPlan::new(
+    fn empty(ctx: &BindContext, op: LogicalOperator) -> OwnedLogicalPlan {
+        OwnedLogicalPlan::new(
             ctx,
-            LogicalOperator::EmptyResult(EmptyResult::new(LogicalPlan::new(ctx, op))),
+            LogicalOperator::EmptyResult(EmptyResult::new(OwnedLogicalPlan::new(ctx, op))),
         )
     }
 
@@ -283,7 +283,7 @@ mod tests {
             LogicalType::Integer,
         ))];
 
-        let result = EmptyResultPullup::new().optimize_plan(LogicalPlan::synthetic(
+        let result = EmptyResultPullup::new().optimize_plan(OwnedLogicalPlan::synthetic(
             LogicalOperator::Join(Join::Comparison(join)),
         ));
         assert!(matches!(result.operator, LogicalOperator::EmptyResult(_)));
@@ -326,7 +326,7 @@ mod tests {
             LogicalType::Integer,
         ))];
 
-        let result = EmptyResultPullup::new().optimize_plan(LogicalPlan::synthetic(
+        let result = EmptyResultPullup::new().optimize_plan(OwnedLogicalPlan::synthetic(
             LogicalOperator::Join(Join::Comparison(join)),
         ));
         match &result.operator {

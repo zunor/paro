@@ -17,11 +17,11 @@ use paro_planner::expression::{
 use paro_planner::operator::{
     Aggregate, ColumnBinding, ComparisonJoin, Join, JoinComparisonType, JoinType, LogicalOperator,
 };
-use paro_planner::plan::LogicalPlan;
+use paro_planner::plan::OwnedLogicalPlan;
 /// Enumerate the semantics-preserving pre-aggregation alternative. Whether it
 /// is profitable belongs to Memo costing, not to the transformation itself.
-pub fn optimize_plan(plan: LogicalPlan, bind_context: &BindContext) -> (LogicalPlan, bool) {
-    fn rewrite(plan: LogicalPlan, bind_context: &BindContext) -> (LogicalPlan, bool) {
+pub fn optimize_plan(plan: OwnedLogicalPlan, bind_context: &BindContext) -> (OwnedLogicalPlan, bool) {
+    fn rewrite(plan: OwnedLogicalPlan, bind_context: &BindContext) -> (OwnedLogicalPlan, bool) {
         let mut child_changed = false;
         let mut plan = plan.map_children(|child| {
             let (child, changed) = rewrite(child, bind_context);
@@ -167,9 +167,9 @@ impl JoinPreaggregation {
         }));
         let right = std::mem::replace(
             join.right.as_mut(),
-            LogicalPlan::synthetic(LogicalOperator::DummyScan),
+            OwnedLogicalPlan::synthetic(LogicalOperator::DummyScan),
         );
-        let partial_plan = LogicalPlan::new(
+        let partial_plan = OwnedLogicalPlan::new(
             bind_context,
             LogicalOperator::Aggregate(Aggregate::new(
                 group_index,
@@ -238,7 +238,7 @@ mod tests {
         Aggregate, ColumnBinding, ComparisonJoin, ExpressionGet, Join, JoinCondition, JoinType,
         LogicalOperator, PostAggregateReduction,
     };
-    use paro_planner::plan::LogicalPlan;
+    use paro_planner::plan::OwnedLogicalPlan;
 
     use super::{optimize_plan, JoinPreaggregation};
 
@@ -249,8 +249,8 @@ mod tests {
         ))
     }
 
-    fn input(table: usize, columns: usize) -> LogicalPlan {
-        LogicalPlan::synthetic(LogicalOperator::ExpressionGet(ExpressionGet::new(
+    fn input(table: usize, columns: usize) -> OwnedLogicalPlan {
+        OwnedLogicalPlan::synthetic(LogicalOperator::ExpressionGet(ExpressionGet::new(
             table,
             vec![],
             (0..columns).map(|idx| format!("c{idx}")).collect(),
@@ -268,8 +268,8 @@ mod tests {
         ))
     }
 
-    fn candidate(bind_context: &BindContext) -> LogicalPlan {
-        let join = LogicalPlan::new(
+    fn candidate(bind_context: &BindContext) -> OwnedLogicalPlan {
+        let join = OwnedLogicalPlan::new(
             bind_context,
             LogicalOperator::Join(Join::Comparison(ComparisonJoin::new(
                 JoinType::Left,
@@ -278,7 +278,7 @@ mod tests {
                 vec![JoinCondition::equality(column(1, 0), column(2, 0))],
             ))),
         );
-        LogicalPlan::new(
+        OwnedLogicalPlan::new(
             bind_context,
             LogicalOperator::Aggregate(Aggregate::new(
                 3,

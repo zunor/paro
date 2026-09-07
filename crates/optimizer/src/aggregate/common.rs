@@ -8,7 +8,7 @@ use std::collections::HashMap;
 
 use paro_planner::expression::{ColumnRefExpression, Expression};
 use paro_planner::operator::{Aggregate, ColumnBinding, LogicalOperator};
-use paro_planner::plan::LogicalPlan;
+use paro_planner::plan::OwnedLogicalPlan;
 use paro_planner::visitor::LogicalOperatorVisitor;
 
 pub struct CommonAggregateOptimizer {
@@ -22,7 +22,7 @@ impl CommonAggregateOptimizer {
         }
     }
 
-    pub fn optimize(&mut self, plan: &mut LogicalPlan) {
+    pub fn optimize(&mut self, plan: &mut OwnedLogicalPlan) {
         self.visit_logical_plan(plan);
     }
 
@@ -141,7 +141,7 @@ mod tests {
     use paro_planner::operator::{
         Aggregate, ColumnBinding, LogicalOperator, PostAggregateReduction,
     };
-    use paro_planner::plan::LogicalPlan;
+    use paro_planner::plan::OwnedLogicalPlan;
 
     use super::CommonAggregateOptimizer;
 
@@ -178,7 +178,7 @@ mod tests {
             1,
             2,
             3,
-            LogicalPlan::synthetic(LogicalOperator::DummyScan),
+            OwnedLogicalPlan::synthetic(LogicalOperator::DummyScan),
             vec![],
             vec![],
             vec![aggregate.clone(), aggregate],
@@ -226,7 +226,7 @@ mod tests {
             1,
             aggregate_index,
             3,
-            LogicalPlan::synthetic(LogicalOperator::DummyScan),
+            OwnedLogicalPlan::synthetic(LogicalOperator::DummyScan),
             vec![Expression::Constant(
                 paro_planner::expression::ConstantExpression::new(
                     paro_common::runtime_value::Value::Integer(1),
@@ -246,7 +246,7 @@ mod tests {
             ))],
             predicate,
         });
-        let mut plan = LogicalPlan::synthetic(LogicalOperator::Aggregate(aggregate));
+        let mut plan = OwnedLogicalPlan::synthetic(LogicalOperator::Aggregate(aggregate));
 
         CommonAggregateOptimizer::new().optimize(&mut plan);
 

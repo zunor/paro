@@ -22,7 +22,7 @@ use paro_planner::expression::Expression;
 use paro_planner::operator::{
     CopyTo, Delete, Explain, ExplainSpec, Insert, InsertOnConflict, LogicalOperator, Update,
 };
-use paro_planner::plan::{CardinalityEstimate, LogicalPlan, NodeStats, PlanNodeId};
+use paro_planner::plan::{CardinalityEstimate, OwnedLogicalPlan, NodeStats, PlanNodeId};
 
 #[derive(Debug, Clone)]
 pub(crate) struct ExplainEnvelope {
@@ -34,8 +34,8 @@ pub(crate) struct ExplainEnvelope {
 }
 
 impl ExplainEnvelope {
-    pub(crate) fn attach(&self, child: LogicalPlan) -> LogicalPlan {
-        LogicalPlan {
+    pub(crate) fn attach(&self, child: OwnedLogicalPlan) -> OwnedLogicalPlan {
+        OwnedLogicalPlan {
             id: self.id,
             stats: self.stats.clone(),
             operator: LogicalOperator::Explain(Explain {
@@ -122,7 +122,7 @@ impl QueryStatementLayer {
         }
     }
 
-    pub(crate) fn attach(&self, query: LogicalPlan) -> LogicalPlan {
+    pub(crate) fn attach(&self, query: OwnedLogicalPlan) -> OwnedLogicalPlan {
         match self {
             Self::Query => query,
             Self::Insert {
@@ -133,7 +133,7 @@ impl QueryStatementLayer {
                 expected_types,
                 on_conflict,
                 ..
-            } => LogicalPlan {
+            } => OwnedLogicalPlan {
                 id: *id,
                 stats: stats.clone(),
                 operator: LogicalOperator::Insert(Insert {
@@ -152,7 +152,7 @@ impl QueryStatementLayer {
                 return_chunk,
                 is_full_table_delete,
                 ..
-            } => LogicalPlan {
+            } => OwnedLogicalPlan {
                 id: *id,
                 stats: stats.clone(),
                 operator: LogicalOperator::Delete(Delete {
@@ -172,7 +172,7 @@ impl QueryStatementLayer {
                 columns,
                 expressions,
                 ..
-            } => LogicalPlan {
+            } => OwnedLogicalPlan {
                 id: *id,
                 stats: stats.clone(),
                 operator: LogicalOperator::Update(Update {
@@ -194,7 +194,7 @@ impl QueryStatementLayer {
                 options,
                 names,
                 types,
-            } => LogicalPlan {
+            } => OwnedLogicalPlan {
                 id: *id,
                 stats: stats.clone(),
                 operator: LogicalOperator::CopyTo(CopyTo {
@@ -215,10 +215,10 @@ impl QueryStatementLayer {
 #[derive(Debug)]
 pub(crate) enum StatementBody {
     Query {
-        query: Box<LogicalPlan>,
+        query: Box<OwnedLogicalPlan>,
         layer: Box<QueryStatementLayer>,
     },
-    Utility(Box<LogicalPlan>),
+    Utility(Box<OwnedLogicalPlan>),
 }
 
 #[derive(Debug)]
@@ -228,7 +228,7 @@ pub(crate) struct StatementPlan {
 }
 
 impl StatementPlan {
-    pub(crate) fn split(plan: LogicalPlan, snapshot_version: u64) -> Result<Self> {
+    pub(crate) fn split(plan: OwnedLogicalPlan, snapshot_version: u64) -> Result<Self> {
         let (explain, plan) = detach_explain(plan)?;
         let (id, stats, operator) = plan.into_parts();
         let body = match operator {
@@ -333,14 +333,14 @@ impl StatementPlan {
             | LogicalOperator::CreatePropertyGraph(_)
             | LogicalOperator::DropPropertyGraph(_)
             | LogicalOperator::RefreshPropertyGraph(_)) => {
-                StatementBody::Utility(Box::new(LogicalPlan {
+                StatementBody::Utility(Box::new(OwnedLogicalPlan {
                     id,
                     stats,
                     operator: utility,
                 }))
             }
             query => StatementBody::Query {
-                query: Box::new(LogicalPlan {
+                query: Box::new(OwnedLogicalPlan {
                     id,
                     stats,
                     operator: query,
@@ -357,7 +357,7 @@ impl StatementPlan {
     }
 }
 
-fn detach_explain(plan: LogicalPlan) -> Result<(Option<ExplainEnvelope>, LogicalPlan)> {
+fn detach_explain(plan: OwnedLogicalPlan) -> Result<(Option<ExplainEnvelope>, OwnedLogicalPlan)> {
     let (id, stats, operator) = plan.into_parts();
     match operator {
         LogicalOperator::Explain(Explain {
@@ -382,7 +382,7 @@ fn detach_explain(plan: LogicalPlan) -> Result<(Option<ExplainEnvelope>, Logical
         }
         operator => Ok((
             None,
-            LogicalPlan {
+            OwnedLogicalPlan {
                 id,
                 stats,
                 operator,
@@ -434,7 +434,7 @@ fn write_contract(
     }
 }
 
-fn reads_target(plan: &LogicalPlan, target_object_id: u64) -> bool {
+fn reads_target(plan: &OwnedLogicalPlan, target_object_id: u64) -> bool {
     let reads_here = match &plan.operator {
         LogicalOperator::Get(get) => get
             .table

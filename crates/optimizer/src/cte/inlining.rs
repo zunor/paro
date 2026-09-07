@@ -6,7 +6,7 @@ use paro_planner::binder::deep_copy::deep_copy_plan_preserving_statistics;
 use paro_planner::binder::ir::CTEMaterialize;
 use paro_planner::expression::{ColumnRefExpression, Expression};
 use paro_planner::operator::{LogicalOperator, Projection};
-use paro_planner::plan::LogicalPlan;
+use paro_planner::plan::OwnedLogicalPlan;
 
 use std::ops::ControlFlow;
 
@@ -39,11 +39,11 @@ impl<'a> CTEInlining<'a> {
         self
     }
 
-    pub fn optimize_plan(&mut self, plan: LogicalPlan) -> LogicalPlan {
+    pub fn optimize_plan(&mut self, plan: OwnedLogicalPlan) -> OwnedLogicalPlan {
         self.optimize_plan_with_change(plan).0
     }
 
-    pub fn optimize_plan_with_change(&mut self, plan: LogicalPlan) -> (LogicalPlan, bool) {
+    pub fn optimize_plan_with_change(&mut self, plan: OwnedLogicalPlan) -> (OwnedLogicalPlan, bool) {
         self.rewrite_plan(plan)
     }
 
@@ -51,11 +51,11 @@ impl<'a> CTEInlining<'a> {
     /// nested owners. Memo combines this local choice with each child group's
     /// winner; recursively rewriting here would collapse independent sharing
     /// decisions into only "all inline" and "all materialized" shapes.
-    pub fn optimize_root_with_change(&mut self, plan: LogicalPlan) -> (LogicalPlan, bool) {
+    pub fn optimize_root_with_change(&mut self, plan: OwnedLogicalPlan) -> (OwnedLogicalPlan, bool) {
         let (id, stats, operator) = plan.into_parts();
         let (operator, changed) = self.try_inline(operator);
         (
-            LogicalPlan {
+            OwnedLogicalPlan {
                 id,
                 stats,
                 operator,
@@ -64,13 +64,13 @@ impl<'a> CTEInlining<'a> {
         )
     }
 
-    fn rewrite_plan(&mut self, plan: LogicalPlan) -> (LogicalPlan, bool) {
+    fn rewrite_plan(&mut self, plan: OwnedLogicalPlan) -> (OwnedLogicalPlan, bool) {
         plan.try_fold_post_order(|plan, child_changes| {
             let child_changed = child_changes.into_iter().any(|changed| changed);
             let (id, stats, operator) = plan.into_parts();
             let (operator, local_changed) = self.try_inline(operator);
             Ok((
-                LogicalPlan {
+                OwnedLogicalPlan {
                     id,
                     stats,
                     operator,
@@ -135,7 +135,7 @@ fn projection_for_cte_ref(
     table_index: usize,
     relation_alias: String,
     column_names: Vec<String>,
-    mut definition: LogicalPlan,
+    mut definition: OwnedLogicalPlan,
 ) -> LogicalOperator {
     // A direct VALUES definition remains the physical producer after filter
     // pushdown crosses this reference boundary. Attach the CTE reference's
@@ -162,7 +162,7 @@ fn projection_for_cte_ref(
 fn inline_single_reference(
     op: &mut LogicalOperator,
     cte_index: usize,
-    definition: &mut Option<LogicalPlan>,
+    definition: &mut Option<OwnedLogicalPlan>,
 ) -> bool {
     if let LogicalOperator::CTERef(cte_ref) = op {
         if cte_ref.cte_index == cte_index {
@@ -195,7 +195,7 @@ fn inline_copied_references(
     bind_context: &BindContext,
     op: &mut LogicalOperator,
     cte_index: usize,
-    definition: &LogicalPlan,
+    definition: &OwnedLogicalPlan,
 ) -> usize {
     if let LogicalOperator::CTERef(cte_ref) = op {
         if cte_ref.cte_index == cte_index {
@@ -232,10 +232,10 @@ mod tests {
         CTERef, CrossProduct, ExpressionGet, Filter, Join, LogicalOperator, MaterializedCTE,
         Projection,
     };
-    use paro_planner::plan::LogicalPlan;
+    use paro_planner::plan::OwnedLogicalPlan;
 
-    fn values(ctx: &BindContext, table_index: usize, vals: &[i32]) -> LogicalPlan {
-        LogicalPlan::new(
+    fn values(ctx: &BindContext, table_index: usize, vals: &[i32]) -> OwnedLogicalPlan {
+        OwnedLogicalPlan::new(
             ctx,
             LogicalOperator::ExpressionGet(ExpressionGet::new(
                 table_index,
@@ -253,8 +253,8 @@ mod tests {
         )
     }
 
-    fn cte_ref(ctx: &BindContext, cte_index: usize, table_index: usize) -> LogicalPlan {
-        LogicalPlan::new(
+    fn cte_ref(ctx: &BindContext, cte_index: usize, table_index: usize) -> OwnedLogicalPlan {
+        OwnedLogicalPlan::new(
             ctx,
             LogicalOperator::CTERef(CTERef::new(
                 cte_index,
@@ -276,7 +276,7 @@ mod tests {
             vec![LogicalType::Integer],
             CTEMaterialize::Default,
             values(&bind_context, 1, &[1, 2, 3]),
-            LogicalPlan::new(
+            OwnedLogicalPlan::new(
                 &bind_context,
                 LogicalOperator::Filter(Filter::new(
                     cte_ref(&bind_context, 10, 2),
@@ -288,7 +288,7 @@ mod tests {
             ),
         ));
 
-        let optimized = CTEInlining::new(&bind_context).optimize_plan(LogicalPlan::synthetic(plan));
+        let optimized = CTEInlining::new(&bind_context).optimize_plan(OwnedLogicalPlan::synthetic(plan));
         verify_logical_plan(&bind_context, &optimized).expect("plan should verify after inlining");
         assert_eq!(optimized.operator.output_names(), ["v"]);
         assert!(!matches!(
@@ -306,7 +306,7 @@ mod tests {
             vec!["v".to_string()],
             vec![LogicalType::Integer],
             CTEMaterialize::NotMaterialized,
-            LogicalPlan::new(
+            OwnedLogicalPlan::new(
                 &bind_context,
                 LogicalOperator::Projection(Projection::new(
                     3,
@@ -317,7 +317,7 @@ mod tests {
                     ))],
                 )),
             ),
-            LogicalPlan::new(
+            OwnedLogicalPlan::new(
                 &bind_context,
                 LogicalOperator::Join(Join::Cross(CrossProduct {
                     left: Box::new(cte_ref(&bind_context, 10, 4)),
@@ -327,7 +327,7 @@ mod tests {
             ),
         ));
 
-        let optimized = CTEInlining::new(&bind_context).optimize_plan(LogicalPlan::synthetic(plan));
+        let optimized = CTEInlining::new(&bind_context).optimize_plan(OwnedLogicalPlan::synthetic(plan));
         verify_logical_plan(&bind_context, &optimized)
             .expect("plan should verify after multi-inline");
         assert!(!matches!(
@@ -339,7 +339,7 @@ mod tests {
     #[test]
     fn canonical_policy_inlines_single_reference_and_preserves_multi_ref_sharing() {
         let bind_context = BindContext::new();
-        let single = LogicalPlan::new(
+        let single = OwnedLogicalPlan::new(
             &bind_context,
             LogicalOperator::MaterializedCTE(MaterializedCTE::new(
                 9,
@@ -359,7 +359,7 @@ mod tests {
             LogicalOperator::MaterializedCTE(_)
         ));
 
-        let plan = LogicalPlan::new(
+        let plan = OwnedLogicalPlan::new(
             &bind_context,
             LogicalOperator::MaterializedCTE(MaterializedCTE::new(
                 10,
@@ -368,7 +368,7 @@ mod tests {
                 vec![LogicalType::Integer],
                 CTEMaterialize::Default,
                 values(&bind_context, 1, &[1, 2, 3]),
-                LogicalPlan::new(
+                OwnedLogicalPlan::new(
                     &bind_context,
                     LogicalOperator::Join(Join::Cross(CrossProduct {
                         left: Box::new(cte_ref(&bind_context, 10, 4)),
@@ -392,7 +392,7 @@ mod tests {
     #[test]
     fn memo_root_choice_preserves_an_independent_nested_owner() {
         let bind_context = BindContext::new();
-        let nested = LogicalPlan::new(
+        let nested = OwnedLogicalPlan::new(
             &bind_context,
             LogicalOperator::MaterializedCTE(MaterializedCTE::new(
                 20,
@@ -401,7 +401,7 @@ mod tests {
                 vec![LogicalType::Integer],
                 CTEMaterialize::Default,
                 cte_ref(&bind_context, 10, 2),
-                LogicalPlan::new(
+                OwnedLogicalPlan::new(
                     &bind_context,
                     LogicalOperator::Join(Join::Cross(CrossProduct {
                         left: Box::new(cte_ref(&bind_context, 20, 3)),
@@ -411,7 +411,7 @@ mod tests {
                 ),
             )),
         );
-        let outer = LogicalPlan::new(
+        let outer = OwnedLogicalPlan::new(
             &bind_context,
             LogicalOperator::MaterializedCTE(MaterializedCTE::new(
                 10,

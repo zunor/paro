@@ -6,7 +6,7 @@
 use super::{ColumnBinding, JoinType};
 use crate::binder::CorrelatedColumnInfo;
 use crate::expression::{ComparisonType, Expression};
-use crate::plan::LogicalPlan;
+use crate::plan::OwnedLogicalPlan;
 use paro_common::types::LogicalType;
 
 #[derive(Debug, Clone)]
@@ -46,12 +46,12 @@ pub enum DependentJoinKind {
 ///
 /// This is a temporary construct used during planning for correlated subqueries.
 /// It will be transformed into a regular join by `DependentJoinFlattener`.
-#[derive(Debug)]
-pub struct DependentJoin {
+#[derive(Debug, Clone)]
+pub struct DependentJoin<Child = Box<OwnedLogicalPlan>> {
     /// Left child operator (outer query).
-    pub left: Box<LogicalPlan>,
+    pub left: Child,
     /// Right child operator (subquery / lateral rhs).
-    pub right: Box<LogicalPlan>,
+    pub right: Child,
     /// The list of columns that have correlations with the right side.
     pub correlated_columns: Vec<CorrelatedColumnInfo>,
     /// Encodes the legal dependent-join state for the specific subquery shape.
@@ -60,8 +60,8 @@ pub struct DependentJoin {
 
 impl DependentJoin {
     pub fn scalar(
-        left: LogicalPlan,
-        right: LogicalPlan,
+        left: OwnedLogicalPlan,
+        right: OwnedLogicalPlan,
         correlated_columns: Vec<CorrelatedColumnInfo>,
         presence_binding: Option<ColumnBinding>,
     ) -> Self {
@@ -74,8 +74,8 @@ impl DependentJoin {
     }
 
     pub fn mark_exists(
-        left: LogicalPlan,
-        right: LogicalPlan,
+        left: OwnedLogicalPlan,
+        right: OwnedLogicalPlan,
         correlated_columns: Vec<CorrelatedColumnInfo>,
         mark_index: usize,
     ) -> Self {
@@ -91,8 +91,8 @@ impl DependentJoin {
     }
 
     pub fn mark_not_exists(
-        left: LogicalPlan,
-        right: LogicalPlan,
+        left: OwnedLogicalPlan,
+        right: OwnedLogicalPlan,
         correlated_columns: Vec<CorrelatedColumnInfo>,
         mark_index: usize,
     ) -> Self {
@@ -108,8 +108,8 @@ impl DependentJoin {
     }
 
     pub fn mark_any(
-        left: LogicalPlan,
-        right: LogicalPlan,
+        left: OwnedLogicalPlan,
+        right: OwnedLogicalPlan,
         correlated_columns: Vec<CorrelatedColumnInfo>,
         mark_index: usize,
         payload: AnyAllPayload,
@@ -126,8 +126,8 @@ impl DependentJoin {
     }
 
     pub fn mark_all(
-        left: LogicalPlan,
-        right: LogicalPlan,
+        left: OwnedLogicalPlan,
+        right: OwnedLogicalPlan,
         correlated_columns: Vec<CorrelatedColumnInfo>,
         mark_index: usize,
         payload: AnyAllPayload,
@@ -144,8 +144,8 @@ impl DependentJoin {
     }
 
     pub fn lateral(
-        left: LogicalPlan,
-        right: LogicalPlan,
+        left: OwnedLogicalPlan,
+        right: OwnedLogicalPlan,
         correlated_columns: Vec<CorrelatedColumnInfo>,
         join_type: JoinType,
         join_condition: Option<Expression>,
@@ -160,7 +160,9 @@ impl DependentJoin {
             },
         }
     }
+}
 
+impl<Child> DependentJoin<Child> {
     pub fn has_correlated_columns(&self) -> bool {
         !self.correlated_columns.is_empty()
     }
@@ -217,7 +219,9 @@ impl DependentJoin {
             _ => None,
         }
     }
+}
 
+impl DependentJoin {
     pub fn get_types(&self) -> Vec<LogicalType> {
         let mut types = self.left.types();
         match self.kind {
@@ -269,9 +273,9 @@ mod tests {
 
     use super::*;
 
-    fn dummy_plan() -> LogicalPlan {
+    fn dummy_plan() -> OwnedLogicalPlan {
         let ctx = BindContext::new();
-        LogicalPlan::dummy_scan(&ctx)
+        OwnedLogicalPlan::dummy_scan(&ctx)
     }
 
     fn correlated() -> Vec<CorrelatedColumnInfo> {
@@ -352,7 +356,7 @@ mod tests {
     fn mark_dependent_join_outputs_left_columns_plus_marker_binding() {
         let ctx = BindContext::new();
         let mut join = DependentJoin::mark_exists(dummy_plan(), dummy_plan(), vec![], 88);
-        join.left = Box::new(LogicalPlan::new(
+        join.left = Box::new(OwnedLogicalPlan::new(
             &ctx,
             LogicalOperator::ExpressionGet(crate::operator::ExpressionGet::new(
                 10,
@@ -361,7 +365,7 @@ mod tests {
                 vec![LogicalType::Integer],
             )),
         ));
-        join.right = Box::new(LogicalPlan::new(
+        join.right = Box::new(OwnedLogicalPlan::new(
             &ctx,
             LogicalOperator::ExpressionGet(crate::operator::ExpressionGet::new(
                 20,

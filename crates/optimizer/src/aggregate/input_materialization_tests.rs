@@ -62,7 +62,7 @@ fn source_binding_used_outside_candidate_declines_width_proof() {
     assert_eq!(materialized_projection_count(&rewritten), 0);
 }
 
-fn optimize_sql(sql: &str) -> (paro_planner::plan::LogicalPlan, bool) {
+fn optimize_sql(sql: &str) -> (paro_planner::plan::OwnedLogicalPlan, bool) {
     let session = setup_session();
     let statement = paro_parser::parse_one(sql)
         .expect("parse aggregate input materialization")
@@ -80,7 +80,7 @@ fn optimize_sql(sql: &str) -> (paro_planner::plan::LogicalPlan, bool) {
     .expect("optimize aggregate input materialization")
 }
 
-fn materialized_projection_count(plan: &paro_planner::plan::LogicalPlan) -> usize {
+fn materialized_projection_count(plan: &paro_planner::plan::OwnedLogicalPlan) -> usize {
     let mut count = 0;
     plan.try_visit_pre_order(|plan| {
         if matches!(&plan.operator,

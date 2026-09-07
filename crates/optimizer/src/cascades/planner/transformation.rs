@@ -660,7 +660,7 @@ fn proofs_are_only_rule_output(proofs: &BTreeSet<EquivalenceProof>, rule: RuleId
 }
 
 fn transformed_plan_matches_group_contract(
-    plan: &LogicalPlan,
+    plan: &OwnedLogicalPlan,
     target: GroupId,
     memo: &Memo,
     state: &PlannerTransformState,
@@ -708,10 +708,10 @@ struct PlannerRuleEnvironment {
 
 fn rewrite_planner_expressions(
     transformation: PlannerTransformation,
-    plan: LogicalPlan,
+    plan: OwnedLogicalPlan,
     column_stats: &HashMap<ColumnBinding, Arc<ColumnStatistics>>,
     environment: &PlannerRuleEnvironment,
-) -> Result<Vec<LogicalPlan>> {
+) -> Result<Vec<OwnedLogicalPlan>> {
     if matches!(transformation, PlannerTransformation::JoinRegionEnumeration) {
         return crate::join_order::optimizer::JoinOrderOptimizer::new(
             environment.cost_model.defaults.clone(),
@@ -733,10 +733,10 @@ fn rewrite_planner_expressions(
 
 fn rewrite_planner_expression(
     transformation: PlannerTransformation,
-    plan: LogicalPlan,
+    plan: OwnedLogicalPlan,
     column_stats: &HashMap<ColumnBinding, Arc<ColumnStatistics>>,
     environment: &PlannerRuleEnvironment,
-) -> Result<Option<LogicalPlan>> {
+) -> Result<Option<OwnedLogicalPlan>> {
     let rewritten = match transformation {
         PlannerTransformation::ExpensivePredicatePlacement => {
             let mut context = crate::context::OptimizationContext::new(
@@ -903,7 +903,7 @@ fn rewrite_planner_expression(
 /// still expose the always-true marker, while an ancestor may no longer
 /// require it. Rewrite the staged subtree here and let the ordinary group
 /// contract check accept the smallest ancestor that preserves its full output.
-fn rewrite_positive_consumed_mark_filter(plan: LogicalPlan) -> Option<LogicalPlan> {
+fn rewrite_positive_consumed_mark_filter(plan: OwnedLogicalPlan) -> Option<OwnedLogicalPlan> {
     let mut changed = false;
     let (plan, ()) = plan
         .try_fold_post_order(|plan, _children: Vec<()>| {
@@ -937,7 +937,7 @@ fn rewrite_positive_consumed_mark_filter(plan: LogicalPlan) -> Option<LogicalPla
             join.right_projection_map = paro_planner::operator::ProjectionMap::none();
             changed = true;
             Ok((
-                LogicalPlan {
+                OwnedLogicalPlan {
                     id,
                     stats,
                     operator: LogicalOperator::Join(Join::Comparison(join)),
@@ -960,7 +960,7 @@ struct GroupHoleTransportGuard {
 /// inputs. Surviving references must still be registered exactly once; an
 /// introduced or duplicated reference is never accepted as equivalent.
 fn retained_group_holes(
-    plan: &LogicalPlan,
+    plan: &OwnedLogicalPlan,
     available: &BTreeMap<u32, GroupId>,
 ) -> Result<BTreeMap<u32, GroupId>> {
     let mut retained = BTreeMap::new();
@@ -985,7 +985,7 @@ fn retained_group_holes(
 }
 
 struct GroupHoleTransportTemplate {
-    plan: LogicalPlan,
+    plan: OwnedLogicalPlan,
 }
 
 impl GroupHoleTransportGuard {
@@ -994,7 +994,7 @@ impl GroupHoleTransportGuard {
     }
 
     fn capture(
-        plan: &LogicalPlan,
+        plan: &OwnedLogicalPlan,
         hole_ids: impl IntoIterator<Item = u32>,
         bind_context: &BindContext,
     ) -> Result<Self> {
@@ -1036,7 +1036,7 @@ impl GroupHoleTransportGuard {
         })
     }
 
-    fn restore(&self, plan: LogicalPlan) -> Result<LogicalPlan> {
+    fn restore(&self, plan: OwnedLogicalPlan) -> Result<OwnedLogicalPlan> {
         if self.templates.is_empty() {
             return Ok(plan);
         }
@@ -1068,11 +1068,11 @@ impl GroupHoleTransportGuard {
 }
 
 fn settle_transformed_expression(
-    mut plan: LogicalPlan,
+    mut plan: OwnedLogicalPlan,
     source_stats: &SharedColumnStatistics,
     environment: &PlannerRuleEnvironment,
     group_holes: &GroupHoleTransportGuard,
-) -> Result<(LogicalPlan, SharedColumnStatistics)> {
+) -> Result<(OwnedLogicalPlan, SharedColumnStatistics)> {
     // A group-local rewrite such as CTE substitution can expose a fresh
     // Filter(CrossProduct) boundary after the root canonicalization pass.
     // Stage only canonical join semantics so the equivalent expression is

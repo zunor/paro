@@ -27,7 +27,7 @@ use paro_planner::operator::{
     Aggregate, AntiJoinMode, ColumnBinding, ComparisonJoin, Filter, Get, Join, JoinType,
     LogicalOperator, MarkJoinSemantics, ProjectionMap, Window,
 };
-use paro_planner::plan::LogicalPlan;
+use paro_planner::plan::OwnedLogicalPlan;
 
 use crate::aggregate::post_reduction::alpha::AlphaBindings;
 use crate::aggregate::semantic_kernels::aggregate_kernels_equal;
@@ -35,14 +35,14 @@ use crate::subquery::output_contract::{
     child_output_contracts, OutputContract, RewriteOutputShape,
 };
 
-pub fn optimize_plan(plan: LogicalPlan, bind_context: &BindContext) -> Result<LogicalPlan> {
+pub fn optimize_plan(plan: OwnedLogicalPlan, bind_context: &BindContext) -> Result<OwnedLogicalPlan> {
     optimize_plan_with_change(plan, bind_context).map(|(plan, _)| plan)
 }
 
 pub fn optimize_plan_with_change(
-    plan: LogicalPlan,
+    plan: OwnedLogicalPlan,
     bind_context: &BindContext,
-) -> Result<(LogicalPlan, bool)> {
+) -> Result<(OwnedLogicalPlan, bool)> {
     let mut contracts = std::collections::HashMap::new();
     let mut pending = vec![(&plan, None)];
     while let Some((candidate, contract)) = pending.pop() {
@@ -97,7 +97,7 @@ enum DetailPathStep {
     RightReduction,
 }
 
-fn recognize(plan: &LogicalPlan, output_contract: Option<&OutputContract>) -> Option<Rewrite> {
+fn recognize(plan: &OwnedLogicalPlan, output_contract: Option<&OutputContract>) -> Option<Rewrite> {
     let LogicalOperator::Join(Join::Comparison(join)) = &plan.operator else {
         return None;
     };
@@ -200,7 +200,7 @@ fn recognize_detail_left_scalar_right(
     })
 }
 
-fn peel_detail_branch(plan: &LogicalPlan) -> Option<DetailBranch<'_>> {
+fn peel_detail_branch(plan: &OwnedLogicalPlan) -> Option<DetailBranch<'_>> {
     let mut current = plan;
     let mut path = Vec::new();
     loop {
@@ -246,7 +246,7 @@ fn plain_reduction_carrier(join: &ComparisonJoin) -> bool {
         && !join.conditions.is_empty()
 }
 
-fn peel_scalar_branch(plan: &LogicalPlan) -> Option<ScalarBranch<'_>> {
+fn peel_scalar_branch(plan: &OwnedLogicalPlan) -> Option<ScalarBranch<'_>> {
     let LogicalOperator::Projection(wrapper_projection) = &plan.operator else {
         return None;
     };
@@ -516,10 +516,10 @@ fn is_movable(expression: &Expression) -> bool {
 }
 
 fn apply_rewrite(
-    plan: LogicalPlan,
+    plan: OwnedLogicalPlan,
     rewrite: Rewrite,
     bind_context: &BindContext,
-) -> Result<LogicalPlan> {
+) -> Result<OwnedLogicalPlan> {
     let (id, stats, operator) = plan.into_parts();
     let LogicalOperator::Join(Join::Comparison(mut join)) = operator else {
         return Err(paro_error::internal(
@@ -528,7 +528,7 @@ fn apply_rewrite(
     };
     let detail = std::mem::replace(
         &mut *join.left,
-        LogicalPlan::synthetic(LogicalOperator::DummyScan),
+        OwnedLogicalPlan::synthetic(LogicalOperator::DummyScan),
     );
     let window_index = bind_context.generate_table_index();
     let window_binding = ColumnBinding::new(window_index, 0);
@@ -604,7 +604,7 @@ fn apply_rewrite(
             preserved_input_width,
         )?;
     }
-    Ok(LogicalPlan {
+    Ok(OwnedLogicalPlan {
         id,
         stats,
         operator: installed_detail.plan.into_operator(),
@@ -619,13 +619,13 @@ fn apply_rewrite(
 /// eliminates the previous cross-function assumption that the window column
 /// happened to be hidden by an identity-looking filter projection.
 struct InstalledScalarWindow {
-    plan: LogicalPlan,
+    plan: OwnedLogicalPlan,
     output_width: usize,
     preserved_input_width: Option<usize>,
 }
 
 fn install_scalar_window(
-    mut plan: LogicalPlan,
+    mut plan: OwnedLogicalPlan,
     path: &[DetailPathStep],
     window_index: usize,
     window_expression: WindowExpression,
@@ -636,7 +636,7 @@ fn install_scalar_window(
     let Some((step, remaining)) = path.split_first() else {
         let detail_width = plan.types().len();
         let detail_stats = plan.stats.clone();
-        let mut window = LogicalPlan::new(
+        let mut window = OwnedLogicalPlan::new(
             bind_context,
             LogicalOperator::Window(Window::new(window_index, vec![window_expression], plan)),
         );
@@ -646,7 +646,7 @@ fn install_scalar_window(
             || ProjectionMap::new((0..detail_width).collect()),
             |projection| ProjectionMap::new(projection.to_indices(detail_width)),
         );
-        let mut result = LogicalPlan::new(bind_context, LogicalOperator::Filter(filter));
+        let mut result = OwnedLogicalPlan::new(bind_context, LogicalOperator::Filter(filter));
         result.stats = detail_stats;
         let output_width = result.types().len();
         return Ok(InstalledScalarWindow {
@@ -685,7 +685,7 @@ fn install_scalar_window(
     };
     let owned_child = std::mem::replace(
         child.as_mut(),
-        LogicalPlan::synthetic(LogicalOperator::DummyScan),
+        OwnedLogicalPlan::synthetic(LogicalOperator::DummyScan),
     );
     let installed_child = install_scalar_window(
         owned_child,
@@ -707,7 +707,7 @@ fn install_scalar_window(
 }
 
 fn apply_detail_projection(
-    plan: &mut LogicalPlan,
+    plan: &mut OwnedLogicalPlan,
     projection: &ProjectionMap,
     witnessed_child_width: usize,
 ) -> Result<()> {

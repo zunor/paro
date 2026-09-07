@@ -13,7 +13,7 @@ use paro_planner::operator::{
     ColumnBinding, ComparisonJoin, Join, JoinComparisonType, JoinCondition, JoinType,
     LogicalOperator,
 };
-use paro_planner::plan::LogicalPlan;
+use paro_planner::plan::OwnedLogicalPlan;
 
 use crate::expression::traversal::visit_expression;
 
@@ -24,9 +24,9 @@ use super::{expression_domain, inline_projections, ExpressionDomain};
 /// decomposition, not a join-order decision: the fact-side joins retain all
 /// predicates, and Memo still costs both the original and deferred forms.
 pub(super) fn isolate_widest_dimension(
-    mut plan: LogicalPlan,
+    mut plan: OwnedLogicalPlan,
     bind_context: &BindContext,
-) -> Result<LogicalPlan> {
+) -> Result<OwnedLogicalPlan> {
     let Some((projection_depth, table_index)) = widest_dimension_candidate(&plan) else {
         return Ok(plan);
     };
@@ -35,7 +35,7 @@ pub(super) fn isolate_widest_dimension(
     };
     let child = std::mem::replace(
         &mut aggregate.child,
-        Box::new(LogicalPlan::synthetic(LogicalOperator::DummyScan)),
+        Box::new(OwnedLogicalPlan::synthetic(LogicalOperator::DummyScan)),
     );
     aggregate.child = Box::new(isolate_below_projections(
         *child,
@@ -46,7 +46,7 @@ pub(super) fn isolate_widest_dimension(
     Ok(plan)
 }
 
-fn widest_dimension_candidate(plan: &LogicalPlan) -> Option<(usize, usize)> {
+fn widest_dimension_candidate(plan: &OwnedLogicalPlan) -> Option<(usize, usize)> {
     let LogicalOperator::Aggregate(aggregate) = &plan.operator else {
         return None;
     };
@@ -149,7 +149,7 @@ fn widest_dimension_candidate(plan: &LogicalPlan) -> Option<(usize, usize)> {
 /// the recognizer at this semantic boundary lets a separate sharing rule
 /// materialize a repeated dimension without disabling fact-side
 /// preaggregation.
-fn dimension_relation_table_index(relation: &LogicalPlan) -> Option<usize> {
+fn dimension_relation_table_index(relation: &OwnedLogicalPlan) -> Option<usize> {
     match &relation.operator {
         LogicalOperator::Get(get) => Some(get.table_index),
         LogicalOperator::CTERef(reference) => Some(reference.table_index),
@@ -171,8 +171,8 @@ fn group_width(expression: &Expression) -> usize {
 }
 
 fn collect_inner_equi_region<'a>(
-    plan: &'a LogicalPlan,
-    relations: &mut Vec<&'a LogicalPlan>,
+    plan: &'a OwnedLogicalPlan,
+    relations: &mut Vec<&'a OwnedLogicalPlan>,
     conditions: &mut Vec<&'a JoinCondition>,
 ) -> Option<()> {
     match &plan.operator {
@@ -215,11 +215,11 @@ fn condition_crosses_boundary(
 }
 
 fn isolate_below_projections(
-    mut plan: LogicalPlan,
+    mut plan: OwnedLogicalPlan,
     projection_depth: usize,
     table_index: usize,
     bind_context: &BindContext,
-) -> Result<LogicalPlan> {
+) -> Result<OwnedLogicalPlan> {
     if projection_depth == 0 {
         return isolate_join_region(plan, table_index, bind_context);
     }
@@ -230,7 +230,7 @@ fn isolate_below_projections(
     };
     let child = std::mem::replace(
         &mut projection.child,
-        Box::new(LogicalPlan::synthetic(LogicalOperator::DummyScan)),
+        Box::new(OwnedLogicalPlan::synthetic(LogicalOperator::DummyScan)),
     );
     projection.child = Box::new(isolate_below_projections(
         *child,
@@ -242,10 +242,10 @@ fn isolate_below_projections(
 }
 
 fn isolate_join_region(
-    plan: LogicalPlan,
+    plan: OwnedLogicalPlan,
     table_index: usize,
     bind_context: &BindContext,
-) -> Result<LogicalPlan> {
+) -> Result<OwnedLogicalPlan> {
     let root_id = plan.id;
     let root_stats = plan.stats.clone();
     let mut relations = Vec::new();
@@ -285,7 +285,7 @@ fn isolate_join_region(
         .into_iter()
         .map(|condition| orient_condition(condition, &fact_bindings, &dimension_bindings))
         .collect::<Result<Vec<_>>>()?;
-    Ok(LogicalPlan {
+    Ok(OwnedLogicalPlan {
         id: root_id,
         stats: root_stats,
         operator: LogicalOperator::Join(Join::Comparison(ComparisonJoin::new(
@@ -298,8 +298,8 @@ fn isolate_join_region(
 }
 
 fn flatten_inner_equi_region(
-    plan: LogicalPlan,
-    relations: &mut Vec<LogicalPlan>,
+    plan: OwnedLogicalPlan,
+    relations: &mut Vec<OwnedLogicalPlan>,
     conditions: &mut Vec<JoinCondition>,
 ) -> Result<()> {
     let (id, stats, operator) = plan.into_parts();
@@ -309,7 +309,7 @@ fn flatten_inner_equi_region(
             flatten_inner_equi_region(*join.right, relations, conditions)?;
             conditions.extend(join.conditions);
         }
-        operator => relations.push(LogicalPlan {
+        operator => relations.push(OwnedLogicalPlan {
             id,
             stats,
             operator,
@@ -319,10 +319,10 @@ fn flatten_inner_equi_region(
 }
 
 fn rebuild_inner_equi_region(
-    mut relations: Vec<LogicalPlan>,
+    mut relations: Vec<OwnedLogicalPlan>,
     mut conditions: Vec<JoinCondition>,
     bind_context: &BindContext,
-) -> Result<LogicalPlan> {
+) -> Result<OwnedLogicalPlan> {
     if relations.is_empty() {
         return Err(paro_error::internal(
             "dimension isolation removed the complete join region",
@@ -364,7 +364,7 @@ fn rebuild_inner_equi_region(
             .into_iter()
             .map(|condition| orient_condition(condition, &current_bindings, &relation_bindings))
             .collect::<Result<Vec<_>>>()?;
-        current = LogicalPlan::new(
+        current = OwnedLogicalPlan::new(
             bind_context,
             LogicalOperator::Join(Join::Comparison(ComparisonJoin::new(
                 JoinType::Inner,

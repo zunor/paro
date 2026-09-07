@@ -7,16 +7,16 @@ use paro_common::types::LogicalType;
 use paro_function::copy::{CopyFunctionBindData, CopyOptions, CopyToFunction};
 use paro_parser::ast::CopySource;
 
-use crate::plan::LogicalPlan;
+use crate::plan::OwnedLogicalPlan;
 
-#[derive(Debug)]
-pub struct CopyTo {
+#[derive(Debug, Clone)]
+pub struct CopyTo<Child = Box<OwnedLogicalPlan>> {
     pub copy_function: CopyToFunction,
     pub bind_data: Arc<dyn CopyFunctionBindData>,
     pub file_path: String,
     pub source: CopySource,
     pub options: CopyOptions,
-    pub child: Box<LogicalPlan>,
+    pub child: Child,
     pub names: Vec<String>,
     pub types: Vec<LogicalType>,
 }
@@ -29,7 +29,7 @@ impl CopyTo {
         file_path: String,
         source: CopySource,
         options: CopyOptions,
-        child: LogicalPlan,
+        child: OwnedLogicalPlan,
         names: Vec<String>,
         types: Vec<LogicalType>,
     ) -> Self {

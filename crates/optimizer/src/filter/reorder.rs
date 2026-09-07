@@ -4,7 +4,7 @@
 use paro_common::error::Result;
 use paro_planner::expression::Expression;
 use paro_planner::operator::LogicalOperator;
-use paro_planner::plan::LogicalPlan;
+use paro_planner::plan::OwnedLogicalPlan;
 
 use crate::context::OptimizationContext;
 
@@ -15,15 +15,15 @@ impl ReorderFilter {
         Self
     }
 
-    pub fn rewrite(&mut self, plan: LogicalPlan, ctx: &OptimizationContext) -> Result<LogicalPlan> {
+    pub fn rewrite(&mut self, plan: OwnedLogicalPlan, ctx: &OptimizationContext) -> Result<OwnedLogicalPlan> {
         self.rewrite_with_change(plan, ctx).map(|(plan, _)| plan)
     }
 
     pub fn rewrite_with_change(
         &mut self,
-        plan: LogicalPlan,
+        plan: OwnedLogicalPlan,
         ctx: &OptimizationContext,
-    ) -> Result<(LogicalPlan, bool)> {
+    ) -> Result<(OwnedLogicalPlan, bool)> {
         let mut changed = false;
         let plan = plan.try_map_children(|child| {
             let (child, child_changed) = self.rewrite_with_change(child, ctx)?;
@@ -41,9 +41,9 @@ impl ReorderFilter {
     /// of every independently reorderable descendant Filter.
     pub(crate) fn reorder_node(
         &mut self,
-        plan: LogicalPlan,
+        plan: OwnedLogicalPlan,
         ctx: &OptimizationContext,
-    ) -> (LogicalPlan, bool) {
+    ) -> (OwnedLogicalPlan, bool) {
         let (id, stats, operator) = plan.into_parts();
         let (operator, changed) = match operator {
             LogicalOperator::Filter(mut filter) => {
@@ -59,7 +59,7 @@ impl ReorderFilter {
             other => (other, false),
         };
         (
-            LogicalPlan {
+            OwnedLogicalPlan {
                 id,
                 stats,
                 operator,
@@ -130,8 +130,8 @@ mod tests {
         TestStatementContextBuilder::minimal().build()
     }
 
-    fn integer_get(bind_context: &BindContext, table_index: usize) -> LogicalPlan {
-        LogicalPlan::new(
+    fn integer_get(bind_context: &BindContext, table_index: usize) -> OwnedLogicalPlan {
+        OwnedLogicalPlan::new(
             bind_context,
             LogicalOperator::ExpressionGet(ExpressionGet::new(
                 table_index,
@@ -188,7 +188,7 @@ mod tests {
         );
         let equality_predicate =
             comparison(ComparisonType::Equal, int_column(0, 0), int_constant(42));
-        let plan = LogicalPlan::new(
+        let plan = OwnedLogicalPlan::new(
             &bind_context,
             LogicalOperator::Filter(Filter::new(
                 child,
@@ -227,14 +227,14 @@ mod tests {
         );
         let equality_predicate =
             comparison(ComparisonType::Equal, int_column(0, 0), int_constant(42));
-        let child = LogicalPlan::new(
+        let child = OwnedLogicalPlan::new(
             &bind_context,
             LogicalOperator::Filter(Filter::new(
                 integer_get(&bind_context, 0),
                 vec![range_predicate.clone(), equality_predicate.clone()],
             )),
         );
-        let plan = LogicalPlan::new(
+        let plan = OwnedLogicalPlan::new(
             &bind_context,
             LogicalOperator::Filter(Filter::new(child, vec![equality_predicate.clone()])),
         );
@@ -273,7 +273,7 @@ mod tests {
         let volatile = volatile_expression();
         let equality_predicate =
             comparison(ComparisonType::Equal, int_column(0, 0), int_constant(42));
-        let plan = LogicalPlan::new(
+        let plan = OwnedLogicalPlan::new(
             &bind_context,
             LogicalOperator::Filter(Filter::new(
                 integer_get(&bind_context, 0),

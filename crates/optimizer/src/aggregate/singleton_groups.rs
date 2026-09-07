@@ -23,15 +23,15 @@ use paro_planner::operator::{
     binding_preserving_get, Aggregate, ColumnBinding, GroupInputMultiplicity, Join,
     LogicalOperator, SingletonGroupProof,
 };
-use paro_planner::plan::LogicalPlan;
+use paro_planner::plan::OwnedLogicalPlan;
 use paro_storage::statistics::ColumnStatistics;
 
 use crate::statistics::unique_keys::declared_unique_keys;
 
 pub fn optimize_plan(
-    plan: LogicalPlan,
+    plan: OwnedLogicalPlan,
     column_stats: &HashMap<ColumnBinding, Arc<ColumnStatistics>>,
-) -> LogicalPlan {
+) -> OwnedLogicalPlan {
     plan.map_children(|child| optimize_plan(child, column_stats))
         .map_operator(|operator| match operator {
             LogicalOperator::Aggregate(mut aggregate) => {
@@ -119,7 +119,7 @@ mod tests {
         ))
     }
 
-    fn candidate() -> (LogicalPlan, HashMap<ColumnBinding, Arc<ColumnStatistics>>) {
+    fn candidate() -> (OwnedLogicalPlan, HashMap<ColumnBinding, Arc<ColumnStatistics>>) {
         let types = vec![LogicalType::BigInt];
         let storage = Arc::new(TableFactory::default().create_table(&types).unwrap());
         let info = CreateTableInfo::new(
@@ -136,7 +136,7 @@ mod tests {
             TableCatalogEntry::from_info(info, storage, CatalogObjectId::from_raw(91_001), 0)
                 .unwrap(),
         );
-        let left = LogicalPlan::synthetic(LogicalOperator::Get(Get::new(
+        let left = OwnedLogicalPlan::synthetic(LogicalOperator::Get(Get::new(
             1,
             vec!["key".to_string()],
             types,
@@ -147,11 +147,11 @@ mod tests {
             unreachable!()
         };
         let merge = source.function.partial_merge_function().unwrap();
-        let right = LogicalPlan::synthetic(LogicalOperator::Aggregate(Aggregate::new(
+        let right = OwnedLogicalPlan::synthetic(LogicalOperator::Aggregate(Aggregate::new(
             3,
             4,
             5,
-            LogicalPlan::synthetic(LogicalOperator::ExpressionGet(ExpressionGet::new(
+            OwnedLogicalPlan::synthetic(LogicalOperator::ExpressionGet(ExpressionGet::new(
                 2,
                 vec![],
                 vec!["key".to_string(), "value".to_string()],
@@ -162,7 +162,7 @@ mod tests {
             vec![source_count],
             vec![],
         )));
-        let join = LogicalPlan::synthetic(LogicalOperator::Join(Join::Comparison(
+        let join = OwnedLogicalPlan::synthetic(LogicalOperator::Join(Join::Comparison(
             ComparisonJoin::new(
                 JoinType::Left,
                 left,
@@ -192,12 +192,12 @@ mod tests {
             ))),
         );
         (
-            LogicalPlan::synthetic(LogicalOperator::Aggregate(outer)),
+            OwnedLogicalPlan::synthetic(LogicalOperator::Aggregate(outer)),
             statistics,
         )
     }
 
-    fn candidate_join_mut(plan: &mut LogicalPlan) -> &mut ComparisonJoin {
+    fn candidate_join_mut(plan: &mut OwnedLogicalPlan) -> &mut ComparisonJoin {
         let LogicalOperator::Aggregate(aggregate) = &mut plan.operator else {
             panic!("aggregate root")
         };
@@ -207,7 +207,7 @@ mod tests {
         join
     }
 
-    fn candidate_aggregate_mut(plan: &mut LogicalPlan) -> &mut Aggregate {
+    fn candidate_aggregate_mut(plan: &mut OwnedLogicalPlan) -> &mut Aggregate {
         let LogicalOperator::Aggregate(aggregate) = &mut plan.operator else {
             panic!("aggregate root")
         };
@@ -291,9 +291,9 @@ mod tests {
         let join = candidate_join_mut(&mut plan);
         let left = std::mem::replace(
             &mut join.left,
-            Box::new(LogicalPlan::synthetic(LogicalOperator::DummyScan)),
+            Box::new(OwnedLogicalPlan::synthetic(LogicalOperator::DummyScan)),
         );
-        join.left = Box::new(LogicalPlan::synthetic(LogicalOperator::Filter(
+        join.left = Box::new(OwnedLogicalPlan::synthetic(LogicalOperator::Filter(
             Filter::new(*left, Vec::new()),
         )));
 

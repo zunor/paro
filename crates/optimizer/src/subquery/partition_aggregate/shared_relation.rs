@@ -27,7 +27,7 @@ enum SharedSource {
 }
 
 impl SharedSource {
-    fn matches(self, plan: &LogicalPlan) -> bool {
+    fn matches(self, plan: &OwnedLogicalPlan) -> bool {
         match (self, &plan.operator) {
             (
                 Self::Cte {
@@ -49,7 +49,7 @@ impl SharedSource {
 /// outer shared-relation leaf, before filtering or dimension joins, so it
 /// observes exactly the same relation domain as the scalar branch.
 pub(super) fn recognize_shared_relation_filter(
-    plan: &LogicalPlan,
+    plan: &OwnedLogicalPlan,
     output_contract: Option<&OutputContract>,
 ) -> Option<SharedRelationRewrite> {
     let shape = recognize_delim_shape(plan, output_contract)?;
@@ -177,7 +177,7 @@ pub(super) fn recognize_shared_relation_filter(
 }
 
 fn collect_cte_refs<'a>(
-    plan: &'a LogicalPlan,
+    plan: &'a OwnedLogicalPlan,
     cte_index: usize,
     refs: &mut Vec<&'a paro_planner::operator::CTERef>,
 ) {
@@ -191,7 +191,7 @@ fn collect_cte_refs<'a>(
     }
 }
 
-fn collect_gets<'a>(plan: &'a LogicalPlan, gets: &mut Vec<&'a Get>) {
+fn collect_gets<'a>(plan: &'a OwnedLogicalPlan, gets: &mut Vec<&'a Get>) {
     if let LogicalOperator::Get(get) = &plan.operator {
         gets.push(get);
     }
@@ -203,7 +203,7 @@ fn collect_gets<'a>(plan: &'a LogicalPlan, gets: &mut Vec<&'a Get>) {
 /// Only layout-relative operators may carry a newly inserted window binding
 /// from the shared leaf to the scalar filter. Positional projections and
 /// reductions deliberately terminate this optimization domain.
-fn shared_path_is_extensible(plan: &LogicalPlan, source: SharedSource) -> bool {
+fn shared_path_is_extensible(plan: &OwnedLogicalPlan, source: SharedSource) -> bool {
     if source.matches(plan) {
         return true;
     }
@@ -229,10 +229,10 @@ fn shared_path_is_extensible(plan: &LogicalPlan, source: SharedSource) -> bool {
 }
 
 pub(super) fn apply_shared_relation_rewrite(
-    plan: LogicalPlan,
+    plan: OwnedLogicalPlan,
     rewrite: SharedRelationRewrite,
     bind_context: &BindContext,
-) -> Result<LogicalPlan> {
+) -> Result<OwnedLogicalPlan> {
     let LogicalOperator::Filter(mut filter) = plan.into_operator() else {
         return Err(paro_error::internal(
             "shared-relation partition witness no longer points to a Filter",
@@ -245,7 +245,7 @@ pub(super) fn apply_shared_relation_rewrite(
     };
     let detail = std::mem::replace(
         &mut *join.left,
-        LogicalPlan::synthetic(LogicalOperator::DummyScan),
+        OwnedLogicalPlan::synthetic(LogicalOperator::DummyScan),
     );
     let window_index = bind_context.generate_table_index();
     let window_binding = ColumnBinding::new(window_index, 0);
@@ -347,7 +347,7 @@ pub(super) fn apply_shared_relation_rewrite(
             return Ok(target);
         }
         localized = true;
-        Ok(LogicalPlan::new(
+        Ok(OwnedLogicalPlan::new(
             bind_context,
             LogicalOperator::Filter(paro_planner::operator::Filter {
                 expressions: expressions.take().ok_or_else(|| {
@@ -369,15 +369,15 @@ pub(super) fn apply_shared_relation_rewrite(
 }
 
 fn insert_partition_window(
-    plan: LogicalPlan,
+    plan: OwnedLogicalPlan,
     source: SharedSource,
     window_index: usize,
     window_expression: &mut Option<WindowExpression>,
     bind_context: &BindContext,
-) -> Result<(LogicalPlan, bool)> {
+) -> Result<(OwnedLogicalPlan, bool)> {
     if source.matches(&plan) {
         return Ok((
-            LogicalPlan::new(
+            OwnedLogicalPlan::new(
                 bind_context,
                 LogicalOperator::Window(Window::new(
                     window_index,

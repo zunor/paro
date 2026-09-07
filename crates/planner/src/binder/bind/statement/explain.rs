@@ -90,7 +90,7 @@ fn bind_explain_impl(
     // 1) Bind the inner statement.
     let bound_inner = binder.bind_statement_kind(query)?;
 
-    // 2) Create the inner logical plan (root [`LogicalPlan`]).
+    // 2) Create the inner logical plan (root [`OwnedLogicalPlan`]).
     let child_plan = binder.create_plan(bound_inner)?;
 
     // 3) Wrap it in Explain and return BoundStatementKind::Explain.

@@ -11,7 +11,7 @@ use paro_common::types::LogicalType;
 use paro_parser::ast::{PathMode, PathQuantifier};
 
 use crate::expression::Expression;
-use crate::plan::LogicalPlan;
+use crate::plan::OwnedLogicalPlan;
 
 /// Direction of edge expansion.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -26,8 +26,8 @@ pub enum ExpandDirection {
 /// Preserves the input graph carrier and appends
 /// `(edge_rowid, dst_local_id, dst_rowid)`. A terminal path-producing expand
 /// additionally appends `(path_length, path_vertices, path_edges)`.
-#[derive(Debug)]
-pub struct GraphExpand {
+#[derive(Debug, Clone)]
+pub struct GraphExpand<Child = Box<OwnedLogicalPlan>> {
     /// Edge table metadata from the property graph definition.
     pub edge_info: EdgeTableInfo,
     /// Expansion direction.
@@ -61,7 +61,7 @@ pub struct GraphExpand {
     /// Whether path functions (path_length, etc.) are used in COLUMNS.
     pub has_path_functions: bool,
     /// The child operator (source of vertex IDs).
-    pub child: Box<LogicalPlan>,
+    pub child: Child,
 }
 
 impl GraphExpand {
@@ -77,7 +77,7 @@ impl GraphExpand {
         source_table_oid: u64,
         target_table_oid: u64,
         target_table_name: String,
-        child: LogicalPlan,
+        child: OwnedLogicalPlan,
     ) -> Self {
         Self {
             edge_info,

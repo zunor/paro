@@ -19,7 +19,7 @@ fn random_call() -> Expression {
 #[test]
 fn arena_extractor_materializes_computed_window_arguments_once() {
     let ctx = BindContext::new();
-    let values = LogicalPlan::new(
+    let values = OwnedLogicalPlan::new(
         &ctx,
         LogicalOperator::ExpressionGet(ExpressionGet::new(
             0,
@@ -40,7 +40,7 @@ fn arena_extractor_materializes_computed_window_arguments_once() {
         LogicalType::BigInt,
     ));
     let function = WindowFunction::nth_value(LogicalType::Integer);
-    let window = LogicalPlan::new(
+    let window = OwnedLogicalPlan::new(
         &ctx,
         LogicalOperator::Window(LogicalWindow::new(
             2,
@@ -83,7 +83,7 @@ fn arena_extractor_materializes_computed_window_arguments_once() {
 #[test]
 fn arena_extractor_preserves_independent_volatile_window_arguments() {
     let ctx = BindContext::new();
-    let values = LogicalPlan::new(
+    let values = OwnedLogicalPlan::new(
         &ctx,
         LogicalOperator::ExpressionGet(ExpressionGet::new(
             0,
@@ -101,7 +101,7 @@ fn arena_extractor_preserves_independent_volatile_window_arguments() {
         WindowFrame::get_default_frame(&function),
         false,
     );
-    let window = LogicalPlan::new(
+    let window = OwnedLogicalPlan::new(
         &ctx,
         LogicalOperator::Window(LogicalWindow::new(
             1,

@@ -9,7 +9,7 @@ use paro_catalog::entry::TableCatalogEntry;
 use paro_common::types::LogicalType;
 
 use crate::expression::Expression;
-use crate::plan::LogicalPlan;
+use crate::plan::OwnedLogicalPlan;
 
 /// One base-table namespace materialized from a rowid carried by the child.
 #[derive(Debug, Clone)]
@@ -31,18 +31,18 @@ pub struct RowFetchSource {
 /// catalog-column namespace whose ordinals are physical catalog column ids.
 /// A projection above this operator selects the fetched columns it actually
 /// needs; physical lowering may fuse that projection with the fetch.
-#[derive(Debug)]
-pub struct RowFetch {
+#[derive(Debug, Clone)]
+pub struct RowFetch<Child = Box<OwnedLogicalPlan>> {
     pub carrier_table_index: usize,
     pub sources: Vec<RowFetchSource>,
-    pub child: Box<LogicalPlan>,
+    pub child: Child,
 }
 
 impl RowFetch {
     pub fn new(
         carrier_table_index: usize,
         sources: Vec<RowFetchSource>,
-        child: LogicalPlan,
+        child: OwnedLogicalPlan,
     ) -> Self {
         Self {
             carrier_table_index,

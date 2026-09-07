@@ -51,7 +51,7 @@ impl PlannerRegionScope {
 pub(super) struct PlannerLogicalPayload {
     /// Binding-based operator semantics. Positional projection maps and input
     /// slots are derived only after winner selection.
-    pub(super) semantic_template: LogicalPlan,
+    pub(super) semantic_template: OwnedLogicalPlan,
     /// Exact canonical encoding of this operator shell. The Memo hashes this
     /// value for lookup but compares the bytes before declaring equivalence.
     pub(super) operator_encoding: Box<[u8]>,
@@ -61,7 +61,7 @@ pub(super) struct PlannerLogicalPayload {
 #[derive(Debug)]
 pub(super) enum PlannerPhysicalTemplate {
     Logical(LogicalPayloadId),
-    Executable(Box<LogicalPlan>),
+    Executable(Box<OwnedLogicalPlan>),
 }
 
 #[derive(Debug)]

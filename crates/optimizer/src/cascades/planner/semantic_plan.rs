@@ -10,14 +10,14 @@
 
 use super::*;
 
-pub(super) fn detach_template(mut plan: LogicalPlan) -> LogicalPlan {
+pub(super) fn detach_template(mut plan: OwnedLogicalPlan) -> OwnedLogicalPlan {
     canonicalize_projection_maps(&mut plan.operator);
     plan.stats = NodeStats::default();
     plan
 }
 
 pub(super) struct InstantiatedPlanWithGroupHoles {
-    pub(super) plan: LogicalPlan,
+    pub(super) plan: OwnedLogicalPlan,
     /// Plan-node identities are transport labels only. Staging consumes every
     /// entry and substitutes the named Memo group before publishing a logical
     /// expression, so the representative subtree can never become semantics.
@@ -42,7 +42,7 @@ pub(super) fn instantiate_bound_plan_with_group_holes(
         layout: &PlannerBindingLayout,
         cardinality: Option<(u64, u64, u64)>,
         facts: Option<Arc<paro_planner::operator::bound_reference::BoundRelationFacts>>,
-    ) -> Result<LogicalPlan> {
+    ) -> Result<OwnedLogicalPlan> {
         if layout.bindings.len() != layout.types.len() {
             return Err(paro_error::internal(
                 "group-hole binding/type layout has inconsistent arity",
@@ -58,7 +58,7 @@ pub(super) fn instantiate_bound_plan_with_group_holes(
             reference = reference.with_facts(facts);
         }
         let unique_keys = reference.facts.unique_keys.clone();
-        let mut plan = LogicalPlan::new(
+        let mut plan = OwnedLogicalPlan::new(
             &state.bind_context,
             LogicalOperator::BoundReference(reference),
         );
@@ -191,10 +191,10 @@ pub(super) fn instantiate_bound_plan_with_group_holes(
 /// unordered ColumnId sets; parents and final presentation map identities to
 /// slots after winner selection.
 pub(super) fn freeze_output_layout(
-    mut plan: LogicalPlan,
+    mut plan: OwnedLogicalPlan,
     output_columns: &[ColumnId],
     state: &PlannerTransformState,
-) -> Result<LogicalPlan> {
+) -> Result<OwnedLogicalPlan> {
     match &mut plan.operator {
         LogicalOperator::Filter(filter) => {
             filter.projection_map =
@@ -355,7 +355,7 @@ fn canonicalize_projection_maps(operator: &mut LogicalOperator) {
 }
 
 fn projection_for_columns(
-    child: &LogicalPlan,
+    child: &OwnedLogicalPlan,
     output_columns: &[ColumnId],
     bindings: &BindingCatalog,
 ) -> Result<paro_planner::operator::ProjectionMap> {
@@ -414,8 +414,8 @@ fn projection_for_bindings(
 }
 
 fn join_projections(
-    left: &LogicalPlan,
-    right: &LogicalPlan,
+    left: &OwnedLogicalPlan,
+    right: &OwnedLogicalPlan,
     output_columns: &[ColumnId],
     marker: Option<ColumnId>,
     bindings: &BindingCatalog,
@@ -463,7 +463,7 @@ fn marker_column(mark_index: Option<usize>, bindings: &BindingCatalog) -> Result
         })
 }
 
-fn resolved_columns(plan: &LogicalPlan, bindings: &BindingCatalog) -> Result<Vec<ColumnId>> {
+fn resolved_columns(plan: &OwnedLogicalPlan, bindings: &BindingCatalog) -> Result<Vec<ColumnId>> {
     plan.get_column_bindings()
         .into_iter()
         .zip(plan.types())

@@ -14,10 +14,10 @@ use paro_common::error::Result;
 use paro_planner::binder::context::BindContext;
 use paro_planner::expression::{AggregateType, ColumnRefExpression, Expression};
 use paro_planner::operator::{Aggregate, ColumnBinding, LogicalOperator};
-use paro_planner::plan::{LogicalPlan, NodeStats};
+use paro_planner::plan::{OwnedLogicalPlan, NodeStats};
 
 /// Rewrite every independently eligible grouped aggregate in post-order.
-pub fn optimize_plan(plan: LogicalPlan, bind_context: &BindContext) -> Result<(LogicalPlan, bool)> {
+pub fn optimize_plan(plan: OwnedLogicalPlan, bind_context: &BindContext) -> Result<(OwnedLogicalPlan, bool)> {
     let mut changed = false;
     let plan = plan.try_map_post_order(|plan| {
         let (plan, node_changed) = rewrite_node(plan, bind_context);
@@ -27,7 +27,7 @@ pub fn optimize_plan(plan: LogicalPlan, bind_context: &BindContext) -> Result<(L
     Ok((plan, changed))
 }
 
-fn rewrite_node(mut plan: LogicalPlan, bind_context: &BindContext) -> (LogicalPlan, bool) {
+fn rewrite_node(mut plan: OwnedLogicalPlan, bind_context: &BindContext) -> (OwnedLogicalPlan, bool) {
     let LogicalOperator::Aggregate(aggregate) = &mut plan.operator else {
         return (plan, false);
     };
@@ -47,9 +47,9 @@ fn rewrite_node(mut plan: LogicalPlan, bind_context: &BindContext) -> (LogicalPl
         .collect::<Vec<_>>();
     let child = std::mem::replace(
         &mut aggregate.child,
-        Box::new(LogicalPlan::synthetic(LogicalOperator::DummyScan)),
+        Box::new(OwnedLogicalPlan::synthetic(LogicalOperator::DummyScan)),
     );
-    let inner = LogicalPlan::new(
+    let inner = OwnedLogicalPlan::new(
         bind_context,
         LogicalOperator::Aggregate(Aggregate::new(
             inner_group_index,
@@ -150,7 +150,7 @@ mod tests {
         AggregateExpression, AggregateType, ColumnRefExpression, Expression,
     };
     use paro_planner::operator::{Aggregate, ColumnBinding, ExpressionGet, LogicalOperator};
-    use paro_planner::plan::LogicalPlan;
+    use paro_planner::plan::OwnedLogicalPlan;
 
     use super::optimize_plan;
 
@@ -177,7 +177,7 @@ mod tests {
         for _ in 0..8 {
             bind_context.generate_table_index();
         }
-        let child = LogicalPlan::new(
+        let child = OwnedLogicalPlan::new(
             &bind_context,
             LogicalOperator::ExpressionGet(ExpressionGet::new(
                 0,
@@ -186,7 +186,7 @@ mod tests {
                 vec![LogicalType::BigInt, LogicalType::BigInt],
             )),
         );
-        let plan = LogicalPlan::new(
+        let plan = OwnedLogicalPlan::new(
             &bind_context,
             LogicalOperator::Aggregate(Aggregate::new(
                 1,

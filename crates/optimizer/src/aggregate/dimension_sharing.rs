@@ -29,7 +29,7 @@ use paro_planner::operator::{
     Aggregate, ColumnBinding, ComparisonJoin, Filter, Join, JoinComparisonType, JoinType,
     LogicalOperator, Projection, SetOperation,
 };
-use paro_planner::plan::LogicalPlan;
+use paro_planner::plan::OwnedLogicalPlan;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum OutputSlot {
@@ -59,14 +59,14 @@ struct OwnedBranch {
     filter_expressions: Option<Vec<Expression>>,
     outer: Aggregate,
     join: ComparisonJoin,
-    dimension: LogicalPlan,
-    partial: LogicalPlan,
+    dimension: OwnedLogicalPlan,
+    partial: OwnedLogicalPlan,
 }
 
 /// Produce one root-local alternative that shares a compatible dimension
 /// attachment across two `UNION ALL` arms. Memo owns descendant enumeration;
 /// this rule consumes the exact pair of child alternatives in its binding.
-pub fn optimize_plan(plan: LogicalPlan, bind_context: &BindContext) -> Result<(LogicalPlan, bool)> {
+pub fn optimize_plan(plan: OwnedLogicalPlan, bind_context: &BindContext) -> Result<(OwnedLogicalPlan, bool)> {
     let Some(witness) = recognize(&plan) else {
         return Ok((plan, false));
     };
@@ -77,11 +77,11 @@ pub fn optimize_plan(plan: LogicalPlan, bind_context: &BindContext) -> Result<(L
 /// the bounded transformation-output frontier. The rewrite calls the same
 /// recognizer again at apply time, keeping matching advisory and the
 /// equivalence proof self-validating.
-pub(crate) fn recognizes_plan(plan: &LogicalPlan) -> bool {
+pub(crate) fn recognizes_plan(plan: &OwnedLogicalPlan) -> bool {
     recognize(plan).is_some()
 }
 
-fn recognize(plan: &LogicalPlan) -> Option<SharedDimensionWitness> {
+fn recognize(plan: &OwnedLogicalPlan) -> Option<SharedDimensionWitness> {
     let LogicalOperator::SetOperation(setop) = &plan.operator else {
         return None;
     };
@@ -215,9 +215,9 @@ fn recognize(plan: &LogicalPlan) -> Option<SharedDimensionWitness> {
 }
 
 fn collect_union_all_arms<'a>(
-    plan: &'a LogicalPlan,
+    plan: &'a OwnedLogicalPlan,
     output_types: &[LogicalType],
-    arms: &mut Vec<&'a LogicalPlan>,
+    arms: &mut Vec<&'a OwnedLogicalPlan>,
 ) -> Option<()> {
     let LogicalOperator::SetOperation(setop) = &plan.operator else {
         arms.push(plan);
@@ -254,7 +254,7 @@ fn grouping_constants_prove_distinct(
     left.value != right.value
 }
 
-fn branch_view(plan: &LogicalPlan) -> Option<BranchView<'_>> {
+fn branch_view(plan: &OwnedLogicalPlan) -> Option<BranchView<'_>> {
     let LogicalOperator::Projection(projection) = &plan.operator else {
         return None;
     };
@@ -557,10 +557,10 @@ fn expression_multisets_equal(left: &[Expression], right: &[Expression]) -> bool
 }
 
 fn apply(
-    plan: LogicalPlan,
+    plan: OwnedLogicalPlan,
     witness: SharedDimensionWitness,
     bind_context: &BindContext,
-) -> Result<LogicalPlan> {
+) -> Result<OwnedLogicalPlan> {
     let (root_id, root_stats, operator) = plan.into_parts();
     let LogicalOperator::SetOperation(setop) = operator else {
         return Err(paro_error::internal(
@@ -664,7 +664,7 @@ fn apply(
         condition.left = replace_known_bindings(condition.left.clone(), &partial_to_union);
         condition.right = replace_known_bindings(condition.right.clone(), &partial_to_union);
     }
-    let joined = LogicalPlan::new(
+    let joined = OwnedLogicalPlan::new(
         bind_context,
         LogicalOperator::Join(Join::Comparison(ComparisonJoin::new(
             JoinType::Inner,
@@ -710,7 +710,7 @@ fn apply(
     let final_group_index = bind_context.generate_table_index();
     let final_aggregate_index = bind_context.generate_table_index();
     let final_groupings_index = bind_context.generate_table_index();
-    let final_aggregate = LogicalPlan::new(
+    let final_aggregate = OwnedLogicalPlan::new(
         bind_context,
         LogicalOperator::Aggregate(Aggregate::new(
             final_group_index,
@@ -738,7 +738,7 @@ fn apply(
         original_aggregate_count,
     );
     let final_input = if let Some(filter_expressions) = left_filter_expressions {
-        LogicalPlan::new(
+        OwnedLogicalPlan::new(
             bind_context,
             LogicalOperator::Filter(Filter::new(
                 final_aggregate,
@@ -778,14 +778,14 @@ fn apply(
         })
         .collect();
     let projection = Projection::new(setop.table_index, final_input, output_expressions);
-    Ok(LogicalPlan {
+    Ok(OwnedLogicalPlan {
         id: root_id,
         stats: root_stats,
         operator: LogicalOperator::Projection(projection),
     })
 }
 
-fn take_branch(plan: LogicalPlan) -> Result<OwnedBranch> {
+fn take_branch(plan: OwnedLogicalPlan) -> Result<OwnedBranch> {
     let (_, _, operator) = plan.into_parts();
     let LogicalOperator::Projection(projection) = operator else {
         return Err(paro_error::internal(
@@ -815,7 +815,7 @@ fn take_branch(plan: LogicalPlan) -> Result<OwnedBranch> {
     };
     let child = *std::mem::replace(
         &mut outer.child,
-        Box::new(LogicalPlan::synthetic(LogicalOperator::DummyScan)),
+        Box::new(OwnedLogicalPlan::synthetic(LogicalOperator::DummyScan)),
     );
     let (_, _, operator) = child.into_parts();
     let LogicalOperator::Join(Join::Comparison(mut join)) = operator else {
@@ -825,8 +825,8 @@ fn take_branch(plan: LogicalPlan) -> Result<OwnedBranch> {
     };
     let dimension = *join.left;
     let partial = *join.right;
-    join.left = Box::new(LogicalPlan::synthetic(LogicalOperator::DummyScan));
-    join.right = Box::new(LogicalPlan::synthetic(LogicalOperator::DummyScan));
+    join.left = Box::new(OwnedLogicalPlan::synthetic(LogicalOperator::DummyScan));
+    join.right = Box::new(OwnedLogicalPlan::synthetic(LogicalOperator::DummyScan));
     Ok(OwnedBranch {
         projection_expressions,
         filter_expressions,
@@ -838,9 +838,9 @@ fn take_branch(plan: LogicalPlan) -> Result<OwnedBranch> {
 }
 
 fn collect_owned_union_all_arms(
-    plan: LogicalPlan,
+    plan: OwnedLogicalPlan,
     output_types: &[LogicalType],
-    arms: &mut Vec<LogicalPlan>,
+    arms: &mut Vec<OwnedLogicalPlan>,
 ) -> Result<()> {
     let LogicalOperator::SetOperation(_) = &plan.operator else {
         arms.push(plan);
@@ -866,7 +866,7 @@ fn collect_owned_union_all_arms(
     collect_owned_union_all_arms(*setop.right, output_types, arms)
 }
 
-fn aggregate_from_plan(plan: &LogicalPlan) -> Result<&Aggregate> {
+fn aggregate_from_plan(plan: &OwnedLogicalPlan) -> Result<&Aggregate> {
     let LogicalOperator::Aggregate(aggregate) = &plan.operator else {
         return Err(paro_error::internal(
             "shared dimension witness lost a partial aggregate",
@@ -876,11 +876,11 @@ fn aggregate_from_plan(plan: &LogicalPlan) -> Result<&Aggregate> {
 }
 
 fn partial_union_arm(
-    partial_plan: LogicalPlan,
+    partial_plan: OwnedLogicalPlan,
     constants: Vec<Expression>,
     branch_identity: Option<u64>,
     bind_context: &BindContext,
-) -> Result<LogicalPlan> {
+) -> Result<OwnedLogicalPlan> {
     let partial = aggregate_from_plan(&partial_plan)?;
     let expressions = (0..partial.groups.len())
         .map(|ordinal| {
@@ -903,7 +903,7 @@ fn partial_union_arm(
             ))
         }))
         .collect();
-    Ok(LogicalPlan::new(
+    Ok(OwnedLogicalPlan::new(
         bind_context,
         LogicalOperator::Projection(
             Projection::new(
@@ -917,11 +917,11 @@ fn partial_union_arm(
 }
 
 fn build_nary_union_all(
-    arms: Vec<LogicalPlan>,
+    arms: Vec<OwnedLogicalPlan>,
     types: &[LogicalType],
     allow_out_of_order: bool,
     bind_context: &BindContext,
-) -> Result<(LogicalPlan, usize)> {
+) -> Result<(OwnedLogicalPlan, usize)> {
     let mut arms = arms.into_iter();
     let mut union = arms
         .next()
@@ -931,7 +931,7 @@ fn build_nary_union_all(
         union_index = bind_context.generate_table_index();
         let mut setop = SetOperation::union(union_index, union, arm, true, types.to_vec());
         setop.allow_out_of_order = allow_out_of_order;
-        union = LogicalPlan::new(bind_context, LogicalOperator::SetOperation(setop));
+        union = OwnedLogicalPlan::new(bind_context, LogicalOperator::SetOperation(setop));
     }
     if union_index == 0 {
         return Err(paro_error::internal(
@@ -954,7 +954,7 @@ mod tests {
     use std::collections::HashMap;
     use std::sync::Arc;
 
-    fn planned_union(sql: &str) -> (LogicalPlan, Planner) {
+    fn planned_union(sql: &str) -> (OwnedLogicalPlan, Planner) {
         let session = setup_session();
         let statement = paro_parser::parse_one(sql)
             .expect("parse union aggregate")
@@ -975,7 +975,7 @@ mod tests {
         assert!(!grouping_constants_prove_distinct(&lower, &upper));
     }
 
-    fn defer_branch_aggregates(plan: LogicalPlan, bind_context: &BindContext) -> LogicalPlan {
+    fn defer_branch_aggregates(plan: OwnedLogicalPlan, bind_context: &BindContext) -> OwnedLogicalPlan {
         plan.try_map_post_order(|plan| {
             let (plan, _) = dimension_deferral::optimize_plan(plan, bind_context)?;
             Ok(plan)

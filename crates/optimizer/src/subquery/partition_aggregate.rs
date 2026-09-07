@@ -27,7 +27,7 @@ use paro_planner::operator::{
     Aggregate, AntiJoinMode, ColumnBinding, ComparisonJoin, Get, Join, JoinComparisonType,
     JoinCondition, JoinType, LogicalOperator, MarkJoinSemantics, Projection, Window,
 };
-use paro_planner::plan::LogicalPlan;
+use paro_planner::plan::OwnedLogicalPlan;
 
 use crate::aggregate::semantic_kernels::{cast_kernels_equal, scalar_kernels_equal};
 use crate::statistics::unique_keys::{declared_unique_keys, NullRejectedKeyProof};
@@ -52,15 +52,15 @@ impl CorrelatedPartitionAggregate {
         Self { bind_context }
     }
 
-    pub fn optimize_plan(&mut self, plan: LogicalPlan) -> Result<LogicalPlan> {
+    pub fn optimize_plan(&mut self, plan: OwnedLogicalPlan) -> Result<OwnedLogicalPlan> {
         self.optimize_node(plan, None)
     }
 
     fn optimize_node(
         &self,
-        plan: LogicalPlan,
+        plan: OwnedLogicalPlan,
         output_contract: Option<OutputContract>,
-    ) -> Result<LogicalPlan> {
+    ) -> Result<OwnedLogicalPlan> {
         let child_contracts = child_output_contracts(
             &plan.operator,
             output_contract.as_ref(),
@@ -77,9 +77,9 @@ impl CorrelatedPartitionAggregate {
 
     fn rewrite_filter(
         &self,
-        plan: LogicalPlan,
+        plan: OwnedLogicalPlan,
         output_contract: Option<&OutputContract>,
-    ) -> Result<LogicalPlan> {
+    ) -> Result<OwnedLogicalPlan> {
         if let Some(rewrite) = recognize_shared_relation_filter(&plan, output_contract) {
             return apply_shared_relation_rewrite(plan, rewrite, &self.bind_context);
         }
@@ -199,7 +199,7 @@ enum DirectSourceSide {
 }
 
 fn recognize_delim_shape<'a>(
-    plan: &'a LogicalPlan,
+    plan: &'a OwnedLogicalPlan,
     output_contract: Option<&OutputContract>,
 ) -> Option<DelimShape<'a>> {
     let LogicalOperator::Filter(filter) = &plan.operator else {
@@ -253,7 +253,7 @@ fn recognize_delim_shape<'a>(
 }
 
 fn recognize_filter(
-    plan: &LogicalPlan,
+    plan: &OwnedLogicalPlan,
     output_contract: Option<&OutputContract>,
 ) -> Option<Rewrite> {
     let shape = recognize_delim_shape(plan, output_contract)?;
@@ -292,7 +292,7 @@ fn recognize_filter(
 /// aggregate reproduces the outer bindings verbatim, so consumers above the
 /// hiding projection do not observe an implementation-only binding domain.
 fn recognize_grouped_join_filter(
-    plan: &LogicalPlan,
+    plan: &OwnedLogicalPlan,
     output_contract: Option<&OutputContract>,
 ) -> Option<GroupedJoinRewrite> {
     let shape = recognize_delim_shape(plan, output_contract)?;
@@ -447,7 +447,7 @@ fn filter_rejects_null_scalar(
 }
 
 fn direct_delim_join_source(
-    plan: &LogicalPlan,
+    plan: &OwnedLogicalPlan,
     delim_table_index: usize,
     correlation_key_count: usize,
 ) -> Option<DirectSourceSide> {
@@ -460,7 +460,7 @@ fn direct_delim_join_source(
     if !clean_inner_join(join) || join.conditions.len() != correlation_key_count {
         return None;
     }
-    let direct = |child: &LogicalPlan| {
+    let direct = |child: &OwnedLogicalPlan| {
         matches!(&child.operator, LogicalOperator::DelimGet(delim)
             if delim.table_index == delim_table_index)
     };
@@ -474,7 +474,7 @@ fn direct_delim_join_source(
     }
 }
 
-fn plan_references_delim(plan: &LogicalPlan, delim_table_index: usize) -> bool {
+fn plan_references_delim(plan: &OwnedLogicalPlan, delim_table_index: usize) -> bool {
     matches!(&plan.operator, LogicalOperator::DelimGet(delim)
         if delim.table_index == delim_table_index)
         || plan
@@ -486,10 +486,10 @@ fn plan_references_delim(plan: &LogicalPlan, delim_table_index: usize) -> bool {
 /// Follow cardinality-preserving unary/reduction operators to the base scan
 /// that owns the complete correlation tuple and prove a declared key.
 fn prove_null_rejected_preserved_unique_key(
-    plan: &LogicalPlan,
+    plan: &OwnedLogicalPlan,
     null_rejection: &NullRejectedKeyProof,
 ) -> Option<()> {
-    fn recurse(plan: &LogicalPlan, null_rejection: &NullRejectedKeyProof) -> Option<()> {
+    fn recurse(plan: &OwnedLogicalPlan, null_rejection: &NullRejectedKeyProof) -> Option<()> {
         match &plan.operator {
             LogicalOperator::Get(get) => {
                 if null_rejection
@@ -544,7 +544,7 @@ fn canonical_scalar_delim_join(join: &ComparisonJoin) -> bool {
         })
 }
 
-fn peel_scalar_branch(plan: &LogicalPlan) -> Option<ScalarBranch<'_>> {
+fn peel_scalar_branch(plan: &OwnedLogicalPlan) -> Option<ScalarBranch<'_>> {
     let LogicalOperator::Projection(projection) = &plan.operator else {
         return None;
     };
@@ -705,7 +705,7 @@ struct Correlation {
 }
 
 fn match_correlation_keys(
-    plan: &LogicalPlan,
+    plan: &OwnedLogicalPlan,
     delim_table_index: usize,
     outer_keys: &[Expression],
 ) -> Option<Correlation> {
@@ -721,7 +721,7 @@ fn match_correlation_keys(
 }
 
 fn collect_correlation_keys(
-    plan: &LogicalPlan,
+    plan: &OwnedLogicalPlan,
     delim_table_index: usize,
     key_count: usize,
     keys: &mut Vec<(usize, Expression)>,
@@ -789,15 +789,15 @@ fn direct_delim_column(expression: &Expression, table_index: usize) -> Option<us
 }
 
 impl<'a> JoinGraph<'a> {
-    fn extract(plan: &'a LogicalPlan) -> Option<Self> {
+    fn extract(plan: &'a OwnedLogicalPlan) -> Option<Self> {
         Self::extract_internal(plan, None)
     }
 
-    fn extract_correlated(plan: &'a LogicalPlan, delim_table_index: usize) -> Option<Self> {
+    fn extract_correlated(plan: &'a OwnedLogicalPlan, delim_table_index: usize) -> Option<Self> {
         Self::extract_internal(plan, Some(delim_table_index))
     }
 
-    fn extract_internal(plan: &'a LogicalPlan, ignored_delim: Option<usize>) -> Option<Self> {
+    fn extract_internal(plan: &'a OwnedLogicalPlan, ignored_delim: Option<usize>) -> Option<Self> {
         let mut graph = Self {
             relations: Vec::new(),
             edges: Vec::new(),
@@ -809,7 +809,7 @@ impl<'a> JoinGraph<'a> {
 
     fn extract_node(
         &mut self,
-        plan: &'a LogicalPlan,
+        plan: &'a OwnedLogicalPlan,
         mut pending_filters: Vec<&'a Expression>,
         ignored_delim: Option<usize>,
     ) -> Option<HashSet<RelationId>> {
@@ -1133,10 +1133,10 @@ fn same_column_expression(left: &Expression, right: &Expression) -> bool {
 }
 
 fn apply_rewrite(
-    plan: LogicalPlan,
+    plan: OwnedLogicalPlan,
     rewrite: Rewrite,
     bind_context: &BindContext,
-) -> Result<LogicalPlan> {
+) -> Result<OwnedLogicalPlan> {
     let LogicalOperator::Filter(mut filter) = plan.into_operator() else {
         return Err(paro_error::internal(
             "partition-aggregate witness no longer points to a Filter",
@@ -1149,7 +1149,7 @@ fn apply_rewrite(
     };
     let detail = std::mem::replace(
         &mut *join.left,
-        LogicalPlan::synthetic(LogicalOperator::DummyScan),
+        OwnedLogicalPlan::synthetic(LogicalOperator::DummyScan),
     );
     let window_index = bind_context.generate_table_index();
     let window_binding = ColumnBinding::new(window_index, 0);
@@ -1164,7 +1164,7 @@ fn apply_rewrite(
     let window_expression =
         WindowExpression::aggregate(rewrite.aggregate, rewrite.partitions, Vec::new(), frame);
     window_expression.verify_bound_contract()?;
-    let window = LogicalPlan::new(
+    let window = OwnedLogicalPlan::new(
         bind_context,
         LogicalOperator::Window(Window::new(window_index, vec![window_expression], detail)),
     );
@@ -1198,17 +1198,17 @@ fn apply_rewrite(
         .collect();
     filter.child = Box::new(window);
     filter.projection_map = paro_planner::operator::ProjectionMap::all();
-    Ok(LogicalPlan::new(
+    Ok(OwnedLogicalPlan::new(
         bind_context,
         LogicalOperator::Filter(filter),
     ))
 }
 
 fn apply_grouped_join_rewrite(
-    plan: LogicalPlan,
+    plan: OwnedLogicalPlan,
     rewrite: GroupedJoinRewrite,
     bind_context: &BindContext,
-) -> Result<LogicalPlan> {
+) -> Result<OwnedLogicalPlan> {
     let LogicalOperator::Filter(mut filter) = plan.into_operator() else {
         return Err(paro_error::internal(
             "grouped-join witness no longer points to a Filter",
@@ -1222,7 +1222,7 @@ fn apply_grouped_join_rewrite(
     };
     let outer = std::mem::replace(
         &mut *delim_join.left,
-        LogicalPlan::synthetic(LogicalOperator::DummyScan),
+        OwnedLogicalPlan::synthetic(LogicalOperator::DummyScan),
     );
     // Give the consumed outer source fresh internal bindings so the final
     // projection can safely reintroduce its original binding domain above the
@@ -1276,12 +1276,12 @@ fn apply_grouped_join_rewrite(
     let inner = take_direct_delim_join_source(
         std::mem::replace(
             &mut *scalar_aggregate.child,
-            LogicalPlan::synthetic(LogicalOperator::DummyScan),
+            OwnedLogicalPlan::synthetic(LogicalOperator::DummyScan),
         ),
         rewrite.delim_table_index,
         rewrite.direct_source_side,
     )?;
-    let joined = LogicalPlan::new(
+    let joined = OwnedLogicalPlan::new(
         bind_context,
         LogicalOperator::Join(Join::Comparison(ComparisonJoin::new(
             JoinType::Inner,
@@ -1326,7 +1326,7 @@ fn apply_grouped_join_rewrite(
         vec![Expression::Aggregate(rewrite.aggregate.clone())],
         Vec::new(),
     );
-    let aggregate = LogicalPlan::new(bind_context, LogicalOperator::Aggregate(aggregate));
+    let aggregate = OwnedLogicalPlan::new(bind_context, LogicalOperator::Aggregate(aggregate));
     let aggregate_binding = ColumnBinding::new(aggregate_index, 0);
     let aggregate_type = rewrite.aggregate.return_type.clone();
     let scalar = rewrite.scalar_expression.replace_column_ref(&|column| {
@@ -1370,7 +1370,7 @@ fn apply_grouped_join_rewrite(
         .collect();
     filter.child = Box::new(aggregate);
     filter.projection_map = (0..rewrite.group_ordinals.len()).collect::<Vec<_>>().into();
-    let filter = LogicalPlan::new(bind_context, LogicalOperator::Filter(filter));
+    let filter = OwnedLogicalPlan::new(bind_context, LogicalOperator::Filter(filter));
 
     // A binding-aware ancestor that references no outer column is independent
     // of this subtree's physical width. Keep the grouped filter directly and
@@ -1397,7 +1397,7 @@ fn apply_grouped_join_rewrite(
         .first()
         .ok_or_else(|| paro_error::internal("grouped-join witness has no outer bindings"))?
         .table_index;
-    Ok(LogicalPlan::new(
+    Ok(OwnedLogicalPlan::new(
         bind_context,
         LogicalOperator::Projection(Projection::new(
             output_table_index,
@@ -1415,10 +1415,10 @@ fn scalar_presence_true() -> Expression {
 }
 
 fn take_direct_delim_join_source(
-    plan: LogicalPlan,
+    plan: OwnedLogicalPlan,
     delim_table_index: usize,
     source_side: DirectSourceSide,
-) -> Result<LogicalPlan> {
+) -> Result<OwnedLogicalPlan> {
     let LogicalOperator::Join(Join::Comparison(join)) = plan.into_operator() else {
         return Err(paro_error::internal(
             "direct DelimGet witness no longer points to a comparison join",
@@ -1621,7 +1621,7 @@ fn clean_inner_join(join: &ComparisonJoin) -> bool {
 /// the unrelated side rejects valid localization opportunities without
 /// protecting any layout invariant.
 fn smallest_extensible_inner_owner(
-    plan: &LogicalPlan,
+    plan: &OwnedLogicalPlan,
     required: &HashSet<ColumnBinding>,
 ) -> paro_planner::plan::PlanNodeId {
     let mut target = plan;
@@ -1661,10 +1661,10 @@ fn smallest_extensible_inner_owner(
 /// TopN are deliberate barriers: filtering below either changes which rows
 /// belong to the result.
 fn smallest_filter_owner(
-    plan: &LogicalPlan,
+    plan: &OwnedLogicalPlan,
     required: &HashSet<ColumnBinding>,
 ) -> paro_planner::plan::PlanNodeId {
-    fn owns(plan: &LogicalPlan, required: &HashSet<ColumnBinding>) -> bool {
+    fn owns(plan: &OwnedLogicalPlan, required: &HashSet<ColumnBinding>) -> bool {
         let bindings = plan
             .get_column_bindings()
             .into_iter()
@@ -1708,14 +1708,14 @@ fn smallest_filter_owner(
     }
 }
 
-fn find_only_delim_get(plan: &LogicalPlan) -> Option<&paro_planner::operator::DelimGet> {
+fn find_only_delim_get(plan: &OwnedLogicalPlan) -> Option<&paro_planner::operator::DelimGet> {
     let mut found = Vec::new();
     collect_delim_gets(plan, &mut found);
     (found.len() == 1).then(|| found[0])
 }
 
 fn collect_delim_gets<'a>(
-    plan: &'a LogicalPlan,
+    plan: &'a OwnedLogicalPlan,
     found: &mut Vec<&'a paro_planner::operator::DelimGet>,
 ) {
     if let LogicalOperator::DelimGet(delim) = &plan.operator {
@@ -1833,18 +1833,18 @@ mod proof_tests {
     fn direct_delim_source_rejects_unconsumed_residual_condition() {
         let context = BindContext::new();
         let delim_index = 10;
-        let delim = LogicalPlan::new(
+        let delim = OwnedLogicalPlan::new(
             &context,
             LogicalOperator::DelimGet(DelimGet::new(delim_index, vec![LogicalType::BigInt])),
         );
-        let inner = LogicalPlan::dummy_scan(&context);
+        let inner = OwnedLogicalPlan::dummy_scan(&context);
         let column = |table_index, column_index| {
             Expression::ColumnRef(ColumnRefExpression::new(
                 ColumnBinding::new(table_index, column_index),
                 LogicalType::BigInt,
             ))
         };
-        let plan = LogicalPlan::new(
+        let plan = OwnedLogicalPlan::new(
             &context,
             LogicalOperator::Join(Join::Comparison(ComparisonJoin::new(
                 JoinType::Inner,
@@ -1867,7 +1867,7 @@ mod proof_tests {
     #[test]
     fn exact_identity_projection_terminates_output_contract() {
         let context = BindContext::new();
-        let mut filter = Filter::new(LogicalPlan::dummy_scan(&context), Vec::new());
+        let mut filter = Filter::new(OwnedLogicalPlan::dummy_scan(&context), Vec::new());
         filter.projection_map = ProjectionMap::new(vec![0]);
 
         let contracts = child_output_contracts(
@@ -1883,7 +1883,7 @@ mod proof_tests {
     #[test]
     fn layout_relative_projection_propagates_output_contract() {
         let context = BindContext::new();
-        let filter = Filter::new(LogicalPlan::dummy_scan(&context), Vec::new());
+        let filter = Filter::new(OwnedLogicalPlan::dummy_scan(&context), Vec::new());
 
         let contracts = child_output_contracts(
             &LogicalOperator::Filter(filter),

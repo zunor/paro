@@ -291,13 +291,13 @@ mod tests {
         JoinComparisonType, JoinType, MarkSubqueryKind, Projection, SetOpType, SetOperation,
         Window,
     };
-    use crate::plan::LogicalPlan;
+    use crate::plan::OwnedLogicalPlan;
     use crate::plan::PlannedStatement;
     use paro_function::aggregate::distributive::first_last::get_first_function;
     use paro_function::window::WindowFunction;
     use std::sync::Arc;
 
-    fn wrapped(binder: &crate::binder::Binder, op: LogicalOperator) -> LogicalPlan {
+    fn wrapped(binder: &crate::binder::Binder, op: LogicalOperator) -> OwnedLogicalPlan {
         binder.wrap_plan(op)
     }
 
@@ -340,7 +340,7 @@ mod tests {
             subquery: Arc::new(PlannedStatement {
                 types: subquery_plan.types(),
                 names: vec!["subq".to_string()],
-                plan: LogicalPlan::new(&BindContext::new(), subquery_plan),
+                plan: OwnedLogicalPlan::new(&BindContext::new(), subquery_plan),
             }),
             children,
             child_types,
@@ -362,7 +362,7 @@ mod tests {
     }
 
     /// Walks common single-child wrappers to the leaf `ExpressionGet` (test plans only).
-    fn expression_get_table_index_root(plan: &LogicalPlan) -> usize {
+    fn expression_get_table_index_root(plan: &OwnedLogicalPlan) -> usize {
         match &plan.operator {
             LogicalOperator::ExpressionGet(eg) => eg.table_index,
             LogicalOperator::Filter(f) => expression_get_table_index_root(&f.child),

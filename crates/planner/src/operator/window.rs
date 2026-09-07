@@ -6,20 +6,20 @@
 use paro_common::types::LogicalType;
 
 use crate::expression::WindowExpression;
-use crate::plan::LogicalPlan;
+use crate::plan::OwnedLogicalPlan;
 
 /// Window represents a window function computation.
 ///
 /// Window functions compute values over a set of rows related to the current row.
 /// Examples: ROW_NUMBER(), RANK(), SUM() OVER (...)
-#[derive(Debug)]
-pub struct Window {
+#[derive(Debug, Clone)]
+pub struct Window<Child = Box<OwnedLogicalPlan>> {
     /// Unique index for this window operator.
     pub window_index: usize,
     /// The window expressions to compute.
     pub expressions: Vec<WindowExpression>,
     /// The child operator providing input rows.
-    pub child: Box<LogicalPlan>,
+    pub child: Child,
 }
 
 impl Window {
@@ -27,7 +27,7 @@ impl Window {
     pub fn new(
         window_index: usize,
         expressions: Vec<WindowExpression>,
-        child: LogicalPlan,
+        child: OwnedLogicalPlan,
     ) -> Self {
         Self {
             window_index,

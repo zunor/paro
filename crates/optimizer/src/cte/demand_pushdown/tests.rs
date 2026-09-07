@@ -10,7 +10,7 @@ use paro_planner::operator::{
     Aggregate, CTERef, ComparisonJoin, ExpressionGet, Join, JoinComparisonType, JoinCondition,
     JoinType, LogicalOperator, MaterializedCTE, Projection, SetOperation,
 };
-use paro_planner::plan::LogicalPlan;
+use paro_planner::plan::OwnedLogicalPlan;
 
 use super::CTEDemandPusher;
 
@@ -21,8 +21,8 @@ fn column(table_index: usize) -> Expression {
     ))
 }
 
-fn values(bind_context: &BindContext, table_index: usize, value: i32) -> LogicalPlan {
-    LogicalPlan::new(
+fn values(bind_context: &BindContext, table_index: usize, value: i32) -> OwnedLogicalPlan {
+    OwnedLogicalPlan::new(
         bind_context,
         LogicalOperator::ExpressionGet(ExpressionGet::new(
             table_index,
@@ -38,12 +38,12 @@ fn values(bind_context: &BindContext, table_index: usize, value: i32) -> Logical
 
 fn equality_join(
     bind_context: &BindContext,
-    left: LogicalPlan,
-    right: LogicalPlan,
+    left: OwnedLogicalPlan,
+    right: OwnedLogicalPlan,
     left_table: usize,
     right_table: usize,
-) -> LogicalPlan {
-    LogicalPlan::new(
+) -> OwnedLogicalPlan {
+    OwnedLogicalPlan::new(
         bind_context,
         LogicalOperator::Join(Join::Comparison(ComparisonJoin::new(
             JoinType::Inner,
@@ -58,8 +58,8 @@ fn equality_join(
     )
 }
 
-fn cte_ref(bind_context: &BindContext, cte_index: usize, table_index: usize) -> LogicalPlan {
-    LogicalPlan::new(
+fn cte_ref(bind_context: &BindContext, cte_index: usize, table_index: usize) -> OwnedLogicalPlan {
+    OwnedLogicalPlan::new(
         bind_context,
         LogicalOperator::CTERef(CTERef::new(
             cte_index,
@@ -71,7 +71,7 @@ fn cte_ref(bind_context: &BindContext, cte_index: usize, table_index: usize) -> 
     )
 }
 
-fn demand_plan(bind_context: &BindContext) -> LogicalPlan {
+fn demand_plan(bind_context: &BindContext) -> OwnedLogicalPlan {
     let producer_join = equality_join(
         bind_context,
         values(bind_context, 1, 1),
@@ -79,7 +79,7 @@ fn demand_plan(bind_context: &BindContext) -> LogicalPlan {
         1,
         2,
     );
-    let producer_aggregate = LogicalPlan::new(
+    let producer_aggregate = OwnedLogicalPlan::new(
         bind_context,
         LogicalOperator::Aggregate(Aggregate::new(
             3,
@@ -92,7 +92,7 @@ fn demand_plan(bind_context: &BindContext) -> LogicalPlan {
             Vec::new(),
         )),
     );
-    let producer = LogicalPlan::new(
+    let producer = OwnedLogicalPlan::new(
         bind_context,
         LogicalOperator::Projection(Projection::new(6, producer_aggregate, vec![column(3)])),
     );
@@ -111,7 +111,7 @@ fn demand_plan(bind_context: &BindContext) -> LogicalPlan {
         12,
         13,
     );
-    let consumers = LogicalPlan::new(
+    let consumers = OwnedLogicalPlan::new(
         bind_context,
         LogicalOperator::SetOperation(SetOperation::union(
             14,
@@ -122,7 +122,7 @@ fn demand_plan(bind_context: &BindContext) -> LogicalPlan {
         )),
     );
 
-    LogicalPlan::new(
+    OwnedLogicalPlan::new(
         bind_context,
         LogicalOperator::MaterializedCTE(MaterializedCTE::new(
             9,

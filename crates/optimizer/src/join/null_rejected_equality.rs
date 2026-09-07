@@ -5,7 +5,7 @@
 
 use paro_planner::expression::{ColumnRefExpression, ConjunctionType, Expression, OperatorType};
 use paro_planner::operator::{Join, JoinComparisonType, LogicalOperator, MarkJoinSemantics};
-use paro_planner::plan::LogicalPlan;
+use paro_planner::plan::OwnedLogicalPlan;
 
 /// Replace `IS NOT DISTINCT FROM` with strict equality under the proof required
 /// by the comparison's observable semantics.
@@ -14,7 +14,7 @@ use paro_planner::plan::LogicalPlan;
 /// the canonical equality after dependent-join flattening has represented an
 /// original equality as a null-safe comparison plus an executable inner-side
 /// `IS NOT NULL` predicate.
-pub fn optimize_plan(plan: LogicalPlan) -> (LogicalPlan, bool) {
+pub fn optimize_plan(plan: OwnedLogicalPlan) -> (OwnedLogicalPlan, bool) {
     let mut changed = false;
     let plan = plan.map_children(|child| {
         let (child, child_changed) = optimize_plan(child);
@@ -68,7 +68,7 @@ fn equality_proof_holds(
 /// Follow a direct value through relational operators that preserve its
 /// non-NULL proof. Projections are substituted exactly, set operations require
 /// both branches, and NULL-extending join sides stop the walk.
-fn expression_is_proven_non_null_at(plan: &LogicalPlan, expression: &Expression) -> bool {
+fn expression_is_proven_non_null_at(plan: &OwnedLogicalPlan, expression: &Expression) -> bool {
     if let Expression::Constant(constant) = expression {
         return !constant.value.is_null();
     }
@@ -216,8 +216,8 @@ mod tests {
         ))
     }
 
-    fn values(table: usize) -> LogicalPlan {
-        LogicalPlan::synthetic(LogicalOperator::ExpressionGet(ExpressionGet::new(
+    fn values(table: usize) -> OwnedLogicalPlan {
+        OwnedLogicalPlan::synthetic(LogicalOperator::ExpressionGet(ExpressionGet::new(
             table,
             vec![vec![column(table)]],
             vec!["v".to_string()],
@@ -225,8 +225,8 @@ mod tests {
         )))
     }
 
-    fn non_null_filter(table: usize) -> LogicalPlan {
-        LogicalPlan::synthetic(LogicalOperator::Filter(Filter::new(
+    fn non_null_filter(table: usize) -> OwnedLogicalPlan {
+        OwnedLogicalPlan::synthetic(LogicalOperator::Filter(Filter::new(
             values(table),
             vec![Expression::Operator(OperatorExpression::new_unary(
                 OperatorType::IsNotNull,
@@ -238,12 +238,12 @@ mod tests {
 
     #[test]
     fn restores_equality_through_projection() {
-        let right = LogicalPlan::synthetic(LogicalOperator::Projection(Projection::new(
+        let right = OwnedLogicalPlan::synthetic(LogicalOperator::Projection(Projection::new(
             2,
             non_null_filter(1),
             vec![column(1)],
         )));
-        let plan = LogicalPlan::synthetic(LogicalOperator::Join(Join::Comparison(
+        let plan = OwnedLogicalPlan::synthetic(LogicalOperator::Join(Join::Comparison(
             ComparisonJoin::new(
                 JoinType::Semi,
                 values(0),
@@ -266,7 +266,7 @@ mod tests {
 
     #[test]
     fn does_not_cross_null_extending_side() {
-        let nullable_right = LogicalPlan::synthetic(LogicalOperator::Join(Join::Comparison(
+        let nullable_right = OwnedLogicalPlan::synthetic(LogicalOperator::Join(Join::Comparison(
             ComparisonJoin::new(
                 JoinType::Left,
                 values(2),
@@ -278,7 +278,7 @@ mod tests {
                 )],
             ),
         )));
-        let plan = LogicalPlan::synthetic(LogicalOperator::Join(Join::Comparison(
+        let plan = OwnedLogicalPlan::synthetic(LogicalOperator::Join(Join::Comparison(
             ComparisonJoin::new(
                 JoinType::Inner,
                 values(0),
@@ -315,7 +315,7 @@ mod tests {
             )],
         );
         join.mark_semantics = MarkJoinSemantics::ThreeValuedFrom(0);
-        let plan = LogicalPlan::synthetic(LogicalOperator::Join(Join::Comparison(join)));
+        let plan = OwnedLogicalPlan::synthetic(LogicalOperator::Join(Join::Comparison(join)));
 
         let (plan, changed) = optimize_plan(plan);
         assert!(!changed);
@@ -340,7 +340,7 @@ mod tests {
             ],
         );
         join.mark_semantics = MarkJoinSemantics::ThreeValuedFrom(1);
-        let plan = LogicalPlan::synthetic(LogicalOperator::Join(Join::Comparison(join)));
+        let plan = OwnedLogicalPlan::synthetic(LogicalOperator::Join(Join::Comparison(join)));
 
         let (plan, changed) = optimize_plan(plan);
         assert!(changed);
@@ -363,7 +363,7 @@ mod tests {
             )],
         );
         join.mark_semantics = MarkJoinSemantics::ThreeValuedFrom(0);
-        let plan = LogicalPlan::synthetic(LogicalOperator::Join(Join::Comparison(join)));
+        let plan = OwnedLogicalPlan::synthetic(LogicalOperator::Join(Join::Comparison(join)));
 
         let (plan, changed) = optimize_plan(plan);
         assert!(changed);

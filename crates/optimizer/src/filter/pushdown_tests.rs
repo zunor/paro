@@ -18,10 +18,10 @@ use paro_planner::operator::{
     Aggregate, AntiJoinMode, ColumnBinding, ComparisonJoin, DelimGet, Get, JoinComparisonType,
     JoinCondition, MarkJoinSemantics, SetOperation,
 };
-use paro_planner::plan::LogicalPlan;
+use paro_planner::plan::OwnedLogicalPlan;
 
-fn plan(ctx: &BindContext, op: LogicalOperator) -> LogicalPlan {
-    LogicalPlan::new(ctx, op)
+fn plan(ctx: &BindContext, op: LogicalOperator) -> OwnedLogicalPlan {
+    OwnedLogicalPlan::new(ctx, op)
 }
 
 fn make_column_ref(table_index: usize, column_index: usize) -> Expression {
@@ -144,7 +144,7 @@ fn make_delim_join(ctx: &BindContext, join_type: JoinType) -> LogicalOperator {
     LogicalOperator::Join(Join::Comparison(join))
 }
 
-fn contains_empty_result(p: &LogicalPlan) -> bool {
+fn contains_empty_result(p: &OwnedLogicalPlan) -> bool {
     if p.is_empty_result() {
         return true;
     }

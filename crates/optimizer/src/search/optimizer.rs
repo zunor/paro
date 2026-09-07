@@ -14,7 +14,7 @@ use paro_planner::operator::{
     FullTextQueryKind, FullTextScoreMode, Get, LogicalOperator, Projection, SearchCandidate,
     SearchDecision, SearchScan, TopN,
 };
-use paro_planner::plan::LogicalPlan;
+use paro_planner::plan::OwnedLogicalPlan;
 use paro_storage::search::{
     DenseVectorQuery, ExactFilterMaterialization, FullTextIntent, HnswIntent,
     NormalizedSearchRequest, ProjectionSpec, SearchCostEstimate as PlannedSearchCostEstimate,
@@ -39,9 +39,9 @@ impl SearchOptimizer {
     /// itself provider- and capability-free.
     pub(crate) fn physical_candidate_for_root(
         &self,
-        plan: &LogicalPlan,
+        plan: &OwnedLogicalPlan,
         ctx: &OptimizationContext,
-    ) -> Result<Option<LogicalPlan>> {
+    ) -> Result<Option<OwnedLogicalPlan>> {
         let candidate = match &plan.operator {
             LogicalOperator::TopN(topn) => match extract_topn_pattern(topn) {
                 Some(pattern) => self.try_rewrite_topn(plan, pattern, ctx),
@@ -65,7 +65,7 @@ impl SearchOptimizer {
 
     /// Cheap structural guard for statement-context construction. Keep this
     /// rooted in the exact same eligibility predicate as candidate derivation.
-    pub(crate) fn contains_candidate_root(plan: &LogicalPlan) -> bool {
+    pub(crate) fn contains_candidate_root(plan: &OwnedLogicalPlan) -> bool {
         let mut pending = vec![plan];
         while let Some(plan) = pending.pop() {
             let eligible = match &plan.operator {
@@ -88,7 +88,7 @@ impl SearchOptimizer {
     /// negative search observation: adding a provider cannot create a legal
     /// alternative unless the statement carries a matching search intent.
     pub(crate) fn planning_observation_tables(
-        plan: &LogicalPlan,
+        plan: &OwnedLogicalPlan,
     ) -> Result<Vec<std::sync::Arc<paro_catalog::entry::TableCatalogEntry>>> {
         let mut tables = std::collections::BTreeMap::new();
         let mut pending = vec![plan];
@@ -135,10 +135,10 @@ impl SearchOptimizer {
 
     fn try_rewrite_topn(
         &self,
-        plan: &LogicalPlan,
+        plan: &OwnedLogicalPlan,
         pattern: TopNPattern<'_>,
         ctx: &OptimizationContext,
-    ) -> Result<Option<LogicalPlan>> {
+    ) -> Result<Option<OwnedLogicalPlan>> {
         let topn = pattern.topn;
         let vector_intent = extract_vector_intent(
             pattern.order_expr,
@@ -324,10 +324,10 @@ impl SearchOptimizer {
 
     fn try_rewrite_fulltext_filter(
         &self,
-        plan: &LogicalPlan,
+        plan: &OwnedLogicalPlan,
         filter: &Filter,
         ctx: &OptimizationContext,
-    ) -> Result<Option<LogicalPlan>> {
+    ) -> Result<Option<OwnedLogicalPlan>> {
         let LogicalOperator::Get(get) = &filter.child.operator else {
             return Ok(None);
         };
@@ -393,7 +393,7 @@ impl SearchOptimizer {
             });
             let id = plan.id;
             let stats = plan.stats.clone();
-            return Ok(Some(LogicalPlan {
+            return Ok(Some(OwnedLogicalPlan {
                 id,
                 stats,
                 operator,
@@ -426,12 +426,12 @@ fn residual_fulltext_filters(
 }
 
 fn build_search_scan(
-    plan: &LogicalPlan,
+    plan: &OwnedLogicalPlan,
     pattern: TopNPattern<'_>,
     request: NormalizedSearchRequest,
     decision: SearchDecision,
     candidate_filters: Vec<Expression>,
-) -> Result<LogicalPlan> {
+) -> Result<OwnedLogicalPlan> {
     pattern
         .topn
         .projection_map
@@ -467,7 +467,7 @@ fn build_search_scan(
     );
     let id = plan.id;
     let stats = plan.stats.clone();
-    Ok(LogicalPlan {
+    Ok(OwnedLogicalPlan {
         id,
         stats,
         operator,
@@ -602,7 +602,7 @@ fn estimate_selectivity(base_rows: u64, filtered_rows: u64) -> f64 {
     }
 }
 
-fn base_rows(get_plan: &LogicalPlan, get: &Get) -> u64 {
+fn base_rows(get_plan: &OwnedLogicalPlan, get: &Get) -> u64 {
     get_plan
         .stats
         .estimated_cardinality
@@ -675,7 +675,7 @@ fn exact_filter_materialization(
 struct TopNPattern<'a> {
     topn: &'a TopN,
     projection: &'a Projection,
-    get_plan: &'a LogicalPlan,
+    get_plan: &'a OwnedLogicalPlan,
     get: &'a Get,
     order_expr_idx: usize,
     order_expr: &'a Expression,
@@ -713,7 +713,7 @@ fn order_expression_index(expr: &Expression) -> Option<usize> {
     }
 }
 
-fn find_get_plan(mut plan: &LogicalPlan) -> Option<&LogicalPlan> {
+fn find_get_plan(mut plan: &OwnedLogicalPlan) -> Option<&OwnedLogicalPlan> {
     loop {
         match &plan.operator {
             LogicalOperator::Filter(filter) => {
@@ -725,7 +725,7 @@ fn find_get_plan(mut plan: &LogicalPlan) -> Option<&LogicalPlan> {
     }
 }
 
-fn collect_filters(mut plan: &LogicalPlan) -> Vec<Expression> {
+fn collect_filters(mut plan: &OwnedLogicalPlan) -> Vec<Expression> {
     let mut filters = Vec::new();
     while let LogicalOperator::Filter(filter) = &plan.operator {
         filters.extend(filter.expressions.iter().cloned());

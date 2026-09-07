@@ -7,9 +7,9 @@ use paro_common::error::{self as paro_error, Result};
 use paro_planner::binder::context::BindContext;
 use paro_planner::expression::{ColumnRefExpression, Expression, ExpressionIterator};
 use paro_planner::operator::{ColumnBinding, Join, LogicalOperator};
-use paro_planner::plan::LogicalPlan;
+use paro_planner::plan::OwnedLogicalPlan;
 
-pub fn verify_logical_plan(_bind_context: &BindContext, plan: &LogicalPlan) -> Result<()> {
+pub fn verify_logical_plan(_bind_context: &BindContext, plan: &OwnedLogicalPlan) -> Result<()> {
     verify_plan(_bind_context, &plan.operator)
 }
 
@@ -31,7 +31,7 @@ struct GraphProjectionScope {
 }
 
 impl GraphProjectionScope {
-    fn from_plan(plan: &LogicalPlan) -> Option<Self> {
+    fn from_plan(plan: &OwnedLogicalPlan) -> Option<Self> {
         match &plan.operator {
             LogicalOperator::GraphScan(scan) => Some(Self {
                 materialized_table_indices: HashSet::from([scan.table_index]),
@@ -84,7 +84,7 @@ impl Verifier {
         Ok(())
     }
 
-    fn verify_logical_plan(&mut self, plan: &LogicalPlan) -> Result<()> {
+    fn verify_logical_plan(&mut self, plan: &OwnedLogicalPlan) -> Result<()> {
         self.verify_operator(&plan.operator)
     }
 

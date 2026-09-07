@@ -19,7 +19,7 @@ pub(super) struct FullPartitionJoinRewrite {
 }
 
 pub(super) fn recognize_full_partition_join(
-    plan: &LogicalPlan,
+    plan: &OwnedLogicalPlan,
     _output_contract: Option<&OutputContract>,
 ) -> Option<FullPartitionJoinRewrite> {
     // This fallback preserves the complete join and filter output contract, so
@@ -136,7 +136,7 @@ fn validate_full_partition_binding_contract(
 /// can evaluate rows for keys absent from the current outer stream. Admit that
 /// change only when every newly exposed expression is shareable and has no
 /// evaluation fence.
-fn full_partition_input_is_movable(plan: &LogicalPlan) -> bool {
+fn full_partition_input_is_movable(plan: &OwnedLogicalPlan) -> bool {
     let local = match &plan.operator {
         LogicalOperator::Get(_) | LogicalOperator::CTERef(_) | LogicalOperator::DelimGet(_) => true,
         LogicalOperator::Filter(filter) => filter.expressions.iter().all(is_movable),
@@ -169,7 +169,7 @@ fn full_partition_input_is_movable(plan: &LogicalPlan) -> bool {
 /// admits a normal join tree around the correlated source without allowing a
 /// hidden delimiter predicate to disappear with the leaf.
 fn delim_source_path_is_removable(
-    plan: &LogicalPlan,
+    plan: &OwnedLogicalPlan,
     delim_table_index: usize,
     correlation_key_count: usize,
 ) -> bool {
@@ -202,10 +202,10 @@ fn delim_source_path_is_removable(
 }
 
 fn remove_delim_source_path(
-    plan: LogicalPlan,
+    plan: OwnedLogicalPlan,
     delim_table_index: usize,
     correlation_key_count: usize,
-) -> Result<LogicalPlan> {
+) -> Result<OwnedLogicalPlan> {
     let direct = direct_delim_join_source(&plan, delim_table_index, correlation_key_count);
     let (id, stats, operator) = plan.into_parts();
     let LogicalOperator::Join(Join::Comparison(mut join)) = operator else {
@@ -242,7 +242,7 @@ fn remove_delim_source_path(
             ));
         }
     }
-    Ok(LogicalPlan {
+    Ok(OwnedLogicalPlan {
         id,
         stats,
         operator: LogicalOperator::Join(Join::Comparison(join)),
@@ -250,10 +250,10 @@ fn remove_delim_source_path(
 }
 
 pub(super) fn apply_full_partition_join(
-    plan: LogicalPlan,
+    plan: OwnedLogicalPlan,
     rewrite: FullPartitionJoinRewrite,
     bind_context: &BindContext,
-) -> Result<LogicalPlan> {
+) -> Result<OwnedLogicalPlan> {
     let LogicalOperator::Filter(filter) = plan.into_operator() else {
         return Err(paro_error::internal(
             "full-partition witness no longer points to a Filter",
@@ -295,7 +295,7 @@ pub(super) fn apply_full_partition_join(
     }
     aggregate.groups = rewrite.inner_keys;
     aggregate.child = Box::new(inner);
-    scalar_projection.child = Box::new(LogicalPlan::new(
+    scalar_projection.child = Box::new(OwnedLogicalPlan::new(
         bind_context,
         LogicalOperator::Aggregate(aggregate),
     ));
@@ -312,7 +312,7 @@ pub(super) fn apply_full_partition_join(
     for condition in &mut outer_join.conditions {
         condition.comparison = JoinComparisonType::Equal;
     }
-    outer_join.right = Box::new(LogicalPlan::new(
+    outer_join.right = Box::new(OwnedLogicalPlan::new(
         bind_context,
         LogicalOperator::Projection(scalar_projection),
     ));
@@ -326,13 +326,13 @@ pub(super) fn apply_full_partition_join(
     }
     let filter = paro_planner::operator::Filter {
         expressions: filter_expressions,
-        child: Box::new(LogicalPlan::new(
+        child: Box::new(OwnedLogicalPlan::new(
             bind_context,
             LogicalOperator::Join(Join::Comparison(outer_join)),
         )),
         projection_map: filter_projection_map,
     };
-    Ok(LogicalPlan::new(
+    Ok(OwnedLogicalPlan::new(
         bind_context,
         LogicalOperator::Filter(filter),
     ))
@@ -348,7 +348,7 @@ fn localize_inner_full_partition_filter(
     filter_projection_map: paro_planner::operator::ProjectionMap,
     scalar_join: ComparisonJoin,
     bind_context: &BindContext,
-) -> Result<LogicalPlan> {
+) -> Result<OwnedLogicalPlan> {
     debug_assert_eq!(scalar_join.join_type, JoinType::Inner);
     let outer_bindings = scalar_join
         .left
@@ -374,13 +374,13 @@ fn localize_inner_full_partition_filter(
     if required.is_empty() {
         let filter = paro_planner::operator::Filter {
             expressions: filter_expressions,
-            child: Box::new(LogicalPlan::new(
+            child: Box::new(OwnedLogicalPlan::new(
                 bind_context,
                 LogicalOperator::Join(Join::Comparison(scalar_join)),
             )),
             projection_map: filter_projection_map,
         };
-        return Ok(LogicalPlan::new(
+        return Ok(OwnedLogicalPlan::new(
             bind_context,
             LogicalOperator::Filter(filter),
         ));
@@ -390,13 +390,13 @@ fn localize_inner_full_partition_filter(
     if target_id == paro_planner::plan::PlanNodeId::SYNTHETIC {
         let filter = paro_planner::operator::Filter {
             expressions: filter_expressions,
-            child: Box::new(LogicalPlan::new(
+            child: Box::new(OwnedLogicalPlan::new(
                 bind_context,
                 LogicalOperator::Join(Join::Comparison(scalar_join)),
             )),
             projection_map: filter_projection_map,
         };
-        return Ok(LogicalPlan::new(
+        return Ok(OwnedLogicalPlan::new(
             bind_context,
             LogicalOperator::Filter(filter),
         ));
@@ -434,7 +434,7 @@ fn localize_inner_full_partition_filter(
         };
         let local_filter = paro_planner::operator::Filter {
             expressions: filter_expressions,
-            child: Box::new(LogicalPlan::new(
+            child: Box::new(OwnedLogicalPlan::new(
                 bind_context,
                 LogicalOperator::Join(Join::Comparison(join)),
             )),
@@ -442,7 +442,7 @@ fn localize_inner_full_partition_filter(
             // output; its enclosing join path is required to use `All` maps.
             projection_map: paro_planner::operator::ProjectionMap::all(),
         };
-        Ok(LogicalPlan::new(
+        Ok(OwnedLogicalPlan::new(
             bind_context,
             LogicalOperator::Filter(local_filter),
         ))
@@ -463,8 +463,8 @@ mod tests {
 
     use super::*;
 
-    fn one_column_relation(context: &BindContext, table_index: usize) -> LogicalPlan {
-        LogicalPlan::new(
+    fn one_column_relation(context: &BindContext, table_index: usize) -> OwnedLogicalPlan {
+        OwnedLogicalPlan::new(
             context,
             LogicalOperator::ExpressionGet(ExpressionGet::new(
                 table_index,
@@ -499,7 +499,7 @@ mod tests {
         );
         join.left_projection_map = ProjectionMap::new(vec![0]);
         join.right_projection_map = ProjectionMap::new(vec![0]);
-        let root = LogicalPlan::new(&context, LogicalOperator::Join(Join::Comparison(join)));
+        let root = OwnedLogicalPlan::new(&context, LogicalOperator::Join(Join::Comparison(join)));
         let required = HashSet::from([ColumnBinding::new(1, 0)]);
 
         assert_ne!(root.id, left_id);
@@ -511,7 +511,7 @@ mod tests {
         let context = BindContext::new();
         let left = one_column_relation(&context, 1);
         let left_id = left.id;
-        let root = LogicalPlan::new(
+        let root = OwnedLogicalPlan::new(
             &context,
             LogicalOperator::Join(Join::Comparison(ComparisonJoin::new(
                 JoinType::Inner,
@@ -545,7 +545,7 @@ mod tests {
             )],
         );
         join.right_projection_map = ProjectionMap::new(vec![0]);
-        let root = LogicalPlan::new(&context, LogicalOperator::Join(Join::Comparison(join)));
+        let root = OwnedLogicalPlan::new(&context, LogicalOperator::Join(Join::Comparison(join)));
         let required = HashSet::from([ColumnBinding::new(1, 0)]);
 
         assert_eq!(smallest_extensible_inner_owner(&root, &required), left_id);

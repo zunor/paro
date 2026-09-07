@@ -19,7 +19,7 @@ use paro_planner::binder::Binder;
 use paro_planner::expression::Expression;
 use paro_planner::operator::join::{AntiJoinMode, Join, JoinComparisonType, JoinType};
 use paro_planner::operator::{ColumnBinding, LogicalOperator, LogicalOperatorType};
-use paro_planner::plan::{CardinalityEstimate, LogicalPlan, NodeStats};
+use paro_planner::plan::{CardinalityEstimate, OwnedLogicalPlan, NodeStats};
 use paro_storage::statistics::ColumnStatistics;
 use tracing::debug;
 
@@ -129,7 +129,7 @@ pub(super) const PLANNER_HASH_JOIN_BUILD_LEFT_RUNTIME_FILTER: ImplementationId =
 const COST_OPTIMIZED_SEARCH_POLICY: QualityPolicyId = QualityPolicyId(1);
 
 struct SearchStagingRequest<'a> {
-    plan: LogicalPlan,
+    plan: OwnedLogicalPlan,
     expected_output_bindings: &'a [ColumnBinding],
     expected_output_types: &'a [paro_common::types::LogicalType],
     output_columns: &'a [ColumnId],
@@ -218,7 +218,7 @@ pub const GRAPH_REGION_ENUMERATOR_RULE: super::ids::RuleId = super::ids::RuleId(
 
 #[derive(Debug)]
 pub struct LogicalAlternative {
-    pub plan: LogicalPlan,
+    pub plan: OwnedLogicalPlan,
     pub source: AlternativeOrigin,
     /// Immutable estimator input owned by this alternative. Search providers
     /// must never observe statistics left behind by a different candidate.
@@ -442,7 +442,7 @@ impl SearchSummary {
 #[derive(Debug)]
 pub struct OptimizedVariant {
     pub class: super::ids::ResourceGrantClassId,
-    pub plan: LogicalPlan,
+    pub plan: OwnedLogicalPlan,
     pub(crate) contracts: WinnerPhysicalContracts,
     pub(crate) enforcers: ExtractedEnforcerContracts,
     pub(crate) write_contracts: crate::physical::StatementWriteContracts,
@@ -501,7 +501,7 @@ pub struct MemoBuilder;
 
 impl MemoBuilder {
     pub fn build(
-        plan: LogicalPlan,
+        plan: OwnedLogicalPlan,
         bind_context: BindContext,
         budget: SearchBudget,
     ) -> Result<OptimizationInput> {
@@ -587,7 +587,7 @@ impl MemoBuilder {
             .unwrap_or_default();
         let mut has_contextual_shape = false;
 
-        let mut roots: Vec<(AlternativeOrigin, LogicalPlan, BuildState)> =
+        let mut roots: Vec<(AlternativeOrigin, OwnedLogicalPlan, BuildState)> =
             Vec::with_capacity(alternatives.len());
         for alternative in alternatives {
             let source = alternative.source;
@@ -595,7 +595,7 @@ impl MemoBuilder {
             let candidate_context = search_context
                 .map(|context| context.fork_for_candidate(alternative.column_stats.clone()));
             let (root_plan, root_state) = alternative.plan.try_fold_post_order(
-                |plan, child_states: Vec<BuildState>| -> Result<(LogicalPlan, BuildState)> {
+                |plan, child_states: Vec<BuildState>| -> Result<(OwnedLogicalPlan, BuildState)> {
                     has_contextual_shape |= is_contextual_operator(&plan.operator);
                     let output_bindings = plan.get_column_bindings();
                     let output_types = plan.types();
@@ -693,7 +693,7 @@ impl MemoBuilder {
                     let mut detached_children = Vec::with_capacity(child_states.len());
                     let shell = plan.try_map_children(|child| {
                         detached_children.push(child);
-                        Ok::<_, paro_common::error::ParoError>(LogicalPlan::synthetic(
+                        Ok::<_, paro_common::error::ParoError>(OwnedLogicalPlan::synthetic(
                             LogicalOperator::DummyScan,
                         ))
                     })?;

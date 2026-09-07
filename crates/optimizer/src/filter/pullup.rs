@@ -13,7 +13,7 @@ use paro_planner::operator::{
     AnyJoin, ColumnBinding, ComparisonJoin, CrossProduct, Filter, Join, JoinType, LogicalOperator,
     Projection, SetOpType, SetOperation,
 };
-use paro_planner::plan::LogicalPlan;
+use paro_planner::plan::OwnedLogicalPlan;
 
 use crate::expression::join_has_evaluation_fence;
 use crate::expression::traversal::visit_expression;
@@ -66,9 +66,9 @@ impl FilterPullup {
         }
     }
 
-    pub fn rewrite_plan(&mut self, plan: LogicalPlan) -> LogicalPlan {
+    pub fn rewrite_plan(&mut self, plan: OwnedLogicalPlan) -> OwnedLogicalPlan {
         let (id, stats, operator) = plan.into_parts();
-        LogicalPlan {
+        OwnedLogicalPlan {
             id,
             stats,
             operator: self.rewrite(operator),
@@ -76,13 +76,13 @@ impl FilterPullup {
     }
 
     /// Generate a Filter with the pulled up expressions.
-    fn generate_pullup_filter(child: LogicalPlan, expressions: Vec<Expression>) -> LogicalPlan {
+    fn generate_pullup_filter(child: OwnedLogicalPlan, expressions: Vec<Expression>) -> OwnedLogicalPlan {
         if expressions.is_empty() {
             return child;
         }
         let id = child.id;
         let stats = child.stats.clone();
-        LogicalPlan {
+        OwnedLogicalPlan {
             id,
             stats,
             operator: LogicalOperator::Filter(Filter::new(child, expressions)),
@@ -92,8 +92,8 @@ impl FilterPullup {
     fn generate_pullup_filter_op(
         child: LogicalOperator,
         expressions: Vec<Expression>,
-    ) -> LogicalPlan {
-        Self::generate_pullup_filter(LogicalPlan::synthetic(child), expressions)
+    ) -> OwnedLogicalPlan {
+        Self::generate_pullup_filter(OwnedLogicalPlan::synthetic(child), expressions)
     }
 
     /// Pull up through a Filter operator.
@@ -186,7 +186,7 @@ impl FilterPullup {
         let filters = std::mem::take(&mut self.filters_expr_pullup);
         let child = std::mem::replace(
             &mut *proj.child,
-            LogicalPlan::synthetic(LogicalOperator::DummyScan),
+            OwnedLogicalPlan::synthetic(LogicalOperator::DummyScan),
         );
         *proj.child = Self::generate_pullup_filter(child, filters);
     }
@@ -573,7 +573,7 @@ impl FilterPullup {
 
     /// Finish pullup at this operator.
     fn finish_pullup(&mut self, op: LogicalOperator) -> LogicalOperator {
-        let plan = LogicalPlan::synthetic(op);
+        let plan = OwnedLogicalPlan::synthetic(op);
         let plan = plan
             .try_map_children(|child| {
                 let mut child_pullup = FilterPullup::new();
@@ -624,8 +624,8 @@ mod tests {
     use paro_planner::expression::{ConstantExpression, FunctionExpression};
     use paro_planner::operator::{Get, JoinComparisonType, JoinCondition};
 
-    fn plan(ctx: &BindContext, op: LogicalOperator) -> LogicalPlan {
-        LogicalPlan::new(ctx, op)
+    fn plan(ctx: &BindContext, op: LogicalOperator) -> OwnedLogicalPlan {
+        OwnedLogicalPlan::new(ctx, op)
     }
 
     fn make_column_ref(table_index: usize, column_index: usize) -> Expression {

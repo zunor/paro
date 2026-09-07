@@ -14,7 +14,7 @@ use paro_planner::operator::{
     AnyJoin, ComparisonJoin, CrossProduct, Join, JoinComparisonType, JoinSide, JoinType,
     LogicalOperator, Projection,
 };
-use paro_planner::plan::LogicalPlan;
+use paro_planner::plan::OwnedLogicalPlan;
 use paro_planner::visitor::LogicalOperatorVisitor;
 
 use crate::expression::binding_replacer::{ColumnBindingReplacer, ReplacementBinding};
@@ -78,9 +78,9 @@ impl FilterPushdown {
     /// Perform filter pushdown on a logical operator tree.
     ///
     /// Returns the optimized operator tree.
-    pub fn rewrite_plan(&mut self, plan: LogicalPlan) -> LogicalPlan {
+    pub fn rewrite_plan(&mut self, plan: OwnedLogicalPlan) -> OwnedLogicalPlan {
         let (id, stats, operator) = plan.into_parts();
-        LogicalPlan {
+        OwnedLogicalPlan {
             id,
             stats,
             operator: self.rewrite(operator),
@@ -173,13 +173,13 @@ impl FilterPushdown {
         }
 
         let expressions: Vec<Expression> = self.filters.drain(..).map(|f| f.filter).collect();
-        LogicalOperator::Filter(PlannerFilter::new(LogicalPlan::synthetic(op), expressions))
+        LogicalOperator::Filter(PlannerFilter::new(OwnedLogicalPlan::synthetic(op), expressions))
     }
 
-    fn empty_result(plan: LogicalPlan) -> LogicalPlan {
+    fn empty_result(plan: OwnedLogicalPlan) -> OwnedLogicalPlan {
         let id = plan.id;
         let stats = plan.stats.clone();
-        LogicalPlan {
+        OwnedLogicalPlan {
             id,
             stats,
             operator: LogicalOperator::EmptyResult(EmptyResult::new(plan)),
@@ -190,7 +190,7 @@ impl FilterPushdown {
     ///
     /// Recursively pushes down into children, then adds any remaining filters.
     fn finish_pushdown(&mut self, op: LogicalOperator) -> LogicalOperator {
-        let plan = LogicalPlan::synthetic(op);
+        let plan = OwnedLogicalPlan::synthetic(op);
         let plan = plan
             .try_map_children(|child| {
                 let mut child_pushdown = FilterPushdown::new();
@@ -282,7 +282,7 @@ impl FilterPushdown {
             result
         } else {
             LogicalOperator::Filter(PlannerFilter::new(
-                LogicalPlan::synthetic(result),
+                OwnedLogicalPlan::synthetic(result),
                 remaining_filters,
             ))
         }
@@ -384,7 +384,7 @@ impl FilterPushdown {
     }
 
     /// Get table bindings from a plan subtree.
-    fn get_table_bindings_plan(plan: &LogicalPlan) -> HashSet<usize> {
+    fn get_table_bindings_plan(plan: &OwnedLogicalPlan) -> HashSet<usize> {
         // Predicate routing is governed by the child's output contract, not by
         // every table index introduced somewhere below it. The latter includes
         // bindings hidden by projections and misses synthetic outputs such as a
@@ -469,7 +469,7 @@ impl FilterPushdown {
             result
         } else {
             LogicalOperator::Filter(PlannerFilter::new(
-                LogicalPlan::synthetic(result),
+                OwnedLogicalPlan::synthetic(result),
                 remaining_filters,
             ))
         }
@@ -542,7 +542,7 @@ impl FilterPushdown {
             result
         } else {
             LogicalOperator::Filter(PlannerFilter::new(
-                LogicalPlan::synthetic(result),
+                OwnedLogicalPlan::synthetic(result),
                 remaining_filters,
             ))
         }
@@ -632,7 +632,7 @@ impl FilterPushdown {
             result
         } else {
             LogicalOperator::Filter(PlannerFilter::new(
-                LogicalPlan::synthetic(result),
+                OwnedLogicalPlan::synthetic(result),
                 remaining_filters,
             ))
         }
@@ -761,7 +761,7 @@ impl FilterPushdown {
             result
         } else {
             LogicalOperator::Filter(PlannerFilter::new(
-                LogicalPlan::synthetic(result),
+                OwnedLogicalPlan::synthetic(result),
                 join_filters,
             ))
         }
@@ -943,7 +943,7 @@ impl FilterPushdown {
             result
         } else {
             LogicalOperator::Filter(PlannerFilter::new(
-                LogicalPlan::synthetic(result),
+                OwnedLogicalPlan::synthetic(result),
                 remaining_filters,
             ))
         }
@@ -1027,7 +1027,7 @@ impl FilterPushdown {
             result
         } else {
             LogicalOperator::Filter(PlannerFilter::new(
-                LogicalPlan::synthetic(result),
+                OwnedLogicalPlan::synthetic(result),
                 remaining_filters,
             ))
         }
@@ -1084,7 +1084,7 @@ impl FilterPushdown {
             if left_pushdown.add_filter(left) == FilterResult::Unsatisfiable
                 || right_pushdown.add_filter(right) == FilterResult::Unsatisfiable
             {
-                return Self::empty_result(LogicalPlan::synthetic(LogicalOperator::SetOperation(
+                return Self::empty_result(OwnedLogicalPlan::synthetic(LogicalOperator::SetOperation(
                     setop,
                 )))
                 .into_operator();
@@ -1102,7 +1102,7 @@ impl FilterPushdown {
             result
         } else {
             LogicalOperator::Filter(PlannerFilter::new(
-                LogicalPlan::synthetic(result),
+                OwnedLogicalPlan::synthetic(result),
                 remaining,
             ))
         }

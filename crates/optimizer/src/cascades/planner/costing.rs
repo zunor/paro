@@ -13,7 +13,7 @@ pub(super) use facts::{
 };
 
 pub(super) fn planner_implementation_set(
-    plan: &LogicalPlan,
+    plan: &OwnedLogicalPlan,
     rowset_scan_pushdown: bool,
 ) -> PlannerImplementationSet {
     match &plan.operator {
@@ -251,7 +251,7 @@ struct RuntimeFilterProbeLineage<'a> {
 
 #[derive(Clone, Copy)]
 struct RuntimeFilterProbeSource<'a> {
-    plan: &'a LogicalPlan,
+    plan: &'a OwnedLogicalPlan,
     output_index: usize,
     boundary: Option<&'a paro_planner::operator::bound_reference::BoundSourceColumn>,
 }
@@ -270,7 +270,7 @@ fn runtime_filter_source_id(source: RuntimeFilterProbeSource<'_>) -> Option<Work
 }
 
 fn runtime_filter_source_facts<'a>(
-    plan: &LogicalPlan,
+    plan: &OwnedLogicalPlan,
     expressions: impl IntoIterator<Item = &'a Expression>,
 ) -> Option<Box<[PlannerRuntimeFilterSource]>> {
     let bindings = plan.get_column_bindings();
@@ -409,7 +409,7 @@ pub(super) fn runtime_filter_build_left_probe_sources(
 }
 
 fn runtime_filter_probe_lineages(
-    plan: &LogicalPlan,
+    plan: &OwnedLogicalPlan,
     output_index: usize,
 ) -> Option<RuntimeFilterProbeLineage<'_>> {
     match &plan.operator {
@@ -534,7 +534,7 @@ fn runtime_filter_probe_lineages(
 }
 
 fn runtime_filter_source_rows(
-    plan: &LogicalPlan,
+    plan: &OwnedLogicalPlan,
     expressions: impl IntoIterator<Item = Expression>,
 ) -> Option<paro_planner::plan::CardinalityEstimate> {
     let probe_bindings = plan.get_column_bindings();
@@ -1814,7 +1814,7 @@ pub(super) fn planner_region_facet(
 }
 
 pub(super) fn planner_operator_cost(
-    plan: &LogicalPlan,
+    plan: &OwnedLogicalPlan,
     child_count: usize,
     output_rows_hard_upper: Option<u64>,
     child_rows_hard_upper: &[Option<u64>],

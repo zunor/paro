@@ -13,7 +13,7 @@ use paro_planner::expression::{
     ConjunctionExpression, ConjunctionType, ConstantExpression, Expression,
 };
 use paro_planner::operator::{LogicalOperator, Projection};
-use paro_planner::plan::LogicalPlan;
+use paro_planner::plan::OwnedLogicalPlan;
 
 const DEPTH: usize = 10;
 
@@ -23,9 +23,9 @@ fn main() {
 
 #[divan::bench(sample_count = 100)]
 fn rewrite_balanced_expression_without_changes(bencher: Bencher) {
-    let mut plan = LogicalPlan::synthetic(LogicalOperator::Projection(Projection::new(
+    let mut plan = OwnedLogicalPlan::synthetic(LogicalOperator::Projection(Projection::new(
         0,
-        LogicalPlan::synthetic(LogicalOperator::DummyScan),
+        OwnedLogicalPlan::synthetic(LogicalOperator::DummyScan),
         vec![nested_conjunction(DEPTH)],
     )));
     let mut rewriter = ExpressionRewriter::new();

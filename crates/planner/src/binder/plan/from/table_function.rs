@@ -4,7 +4,7 @@
 use crate::binder::ir::{BoundExternalRoutine, BoundTableFunction};
 use crate::binder::Binder;
 use crate::operator::{LogicalExternalTable, LogicalOperator, Projection, TableFunctionGet};
-use crate::plan::LogicalPlan;
+use crate::plan::OwnedLogicalPlan;
 use paro_common::error::Result;
 
 impl Binder {
@@ -28,10 +28,10 @@ impl Binder {
         routine_ref: BoundExternalRoutine,
     ) -> Result<LogicalOperator> {
         let projection_index = self.bind_context.generate_table_index();
-        let child = LogicalPlan::synthetic(LogicalOperator::Projection(
+        let child = OwnedLogicalPlan::synthetic(LogicalOperator::Projection(
             Projection::new(
                 projection_index,
-                LogicalPlan::synthetic(LogicalOperator::DummyScan),
+                OwnedLogicalPlan::synthetic(LogicalOperator::DummyScan),
                 routine_ref.bound_arguments.clone(),
             )
             .with_visible_names(

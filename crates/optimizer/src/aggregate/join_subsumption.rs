@@ -27,7 +27,7 @@ use paro_planner::operator::{
     Aggregate, ColumnBinding, ComparisonJoin, Get, Join, JoinComparisonType, JoinType,
     LogicalOperator, Projection, ProjectionMap,
 };
-use paro_planner::plan::LogicalPlan;
+use paro_planner::plan::OwnedLogicalPlan;
 
 #[derive(Clone)]
 struct OuterSum {
@@ -59,11 +59,11 @@ struct ReductionExposure<'a> {
 }
 
 /// Eliminate redundant detail scans covered by a filtered partial aggregate.
-pub fn optimize_plan(plan: LogicalPlan) -> LogicalPlan {
+pub fn optimize_plan(plan: OwnedLogicalPlan) -> OwnedLogicalPlan {
     optimize_plan_with_change(plan).0
 }
 
-pub fn optimize_plan_with_change(plan: LogicalPlan) -> (LogicalPlan, bool) {
+pub fn optimize_plan_with_change(plan: OwnedLogicalPlan) -> (OwnedLogicalPlan, bool) {
     plan.try_fold_post_order(|plan, children: Vec<bool>| {
         let (plan, changed) = optimize_root_with_change(plan);
         Ok((plan, changed || children.into_iter().any(|changed| changed)))
@@ -79,7 +79,7 @@ pub(crate) fn recognizes_outer_aggregate(operator: &LogicalOperator) -> bool {
 
 /// Memo schedules descendant groups independently; a firing changes only
 /// the aggregate shell whose proof was matched.
-pub(crate) fn optimize_root_with_change(mut plan: LogicalPlan) -> (LogicalPlan, bool) {
+pub(crate) fn optimize_root_with_change(mut plan: OwnedLogicalPlan) -> (OwnedLogicalPlan, bool) {
     let LogicalOperator::Aggregate(aggregate) = &mut plan.operator else {
         return (plan, false);
     };
@@ -133,7 +133,7 @@ impl AggregateJoinSubsumption {
         })
     }
 
-    fn substitute_detail_join(plan: &mut LogicalPlan, outer_sum: &OuterSum) -> Option<Expression> {
+    fn substitute_detail_join(plan: &mut OwnedLogicalPlan, outer_sum: &OuterSum) -> Option<Expression> {
         if let Some(replacement) = Self::try_substitute_reduction_join(plan, outer_sum) {
             return Some(replacement);
         }
@@ -157,7 +157,7 @@ impl AggregateJoinSubsumption {
     /// Rewrite the pre-join-order shape where a reduction SEMI join wraps an
     /// inner region that still contains the redundant detail scan.
     fn try_substitute_reduction_join(
-        plan: &mut LogicalPlan,
+        plan: &mut OwnedLogicalPlan,
         outer_sum: &OuterSum,
     ) -> Option<Expression> {
         let LogicalOperator::Join(Join::Comparison(join)) = &mut plan.operator else {
@@ -234,7 +234,7 @@ impl AggregateJoinSubsumption {
     }
 
     fn inspect_detail_edge(
-        plan: &LogicalPlan,
+        plan: &OwnedLogicalPlan,
         preserved_key: ColumnBinding,
         outer_sum: &OuterSum,
     ) -> Option<DetailScan> {
@@ -271,7 +271,7 @@ impl AggregateJoinSubsumption {
     }
 
     fn remove_detail_edge(
-        plan: &mut LogicalPlan,
+        plan: &mut OwnedLogicalPlan,
         preserved_key: ColumnBinding,
         detail: &DetailScan,
         outer_sum: &OuterSum,
@@ -299,12 +299,12 @@ impl AggregateJoinSubsumption {
                 let replacement = if detail_on_left {
                     std::mem::replace(
                         &mut join.right,
-                        Box::new(LogicalPlan::synthetic(LogicalOperator::DummyScan)),
+                        Box::new(OwnedLogicalPlan::synthetic(LogicalOperator::DummyScan)),
                     )
                 } else {
                     std::mem::replace(
                         &mut join.left,
-                        Box::new(LogicalPlan::synthetic(LogicalOperator::DummyScan)),
+                        Box::new(OwnedLogicalPlan::synthetic(LogicalOperator::DummyScan)),
                     )
                 };
                 *plan = *replacement;
@@ -316,7 +316,7 @@ impl AggregateJoinSubsumption {
     }
 
     fn try_substitute_direct_join(
-        plan: &mut LogicalPlan,
+        plan: &mut OwnedLogicalPlan,
         outer_sum: &OuterSum,
     ) -> Option<Expression> {
         let LogicalOperator::Join(Join::Comparison(join)) = &mut plan.operator else {
@@ -355,12 +355,12 @@ impl AggregateJoinSubsumption {
         let replacement_plan = if detail_on_left {
             std::mem::replace(
                 &mut join.right,
-                Box::new(LogicalPlan::synthetic(LogicalOperator::DummyScan)),
+                Box::new(OwnedLogicalPlan::synthetic(LogicalOperator::DummyScan)),
             )
         } else {
             std::mem::replace(
                 &mut join.left,
-                Box::new(LogicalPlan::synthetic(LogicalOperator::DummyScan)),
+                Box::new(OwnedLogicalPlan::synthetic(LogicalOperator::DummyScan)),
             )
         };
         *plan = *replacement_plan;
@@ -368,7 +368,7 @@ impl AggregateJoinSubsumption {
     }
 
     fn expose_reduction_sum(
-        plan: &mut LogicalPlan,
+        plan: &mut OwnedLogicalPlan,
         preserved_key: ColumnBinding,
         detail: &DetailScan,
         outer_sum: &OuterSum,
@@ -492,7 +492,7 @@ impl AggregateJoinSubsumption {
     }
 
     fn inspect_reduction<'a>(
-        plan: &'a mut LogicalPlan,
+        plan: &'a mut OwnedLogicalPlan,
         reduction_key: ColumnBinding,
         detail: &DetailScan,
     ) -> Option<ReductionExposure<'a>> {
@@ -515,7 +515,7 @@ impl AggregateJoinSubsumption {
     }
 
     fn inspect_projected_reduction<'a>(
-        plan: &'a mut LogicalPlan,
+        plan: &'a mut OwnedLogicalPlan,
         reduction_key: ColumnBinding,
         detail: &DetailScan,
     ) -> Option<ReductionExposure<'a>> {
@@ -556,7 +556,7 @@ impl AggregateJoinSubsumption {
     }
 
     fn inspect_reduction_core(
-        plan: &LogicalPlan,
+        plan: &OwnedLogicalPlan,
         reduction_key: ColumnBinding,
         detail: &DetailScan,
     ) -> Option<(ColumnBinding, LogicalType)> {
@@ -645,7 +645,7 @@ impl AggregateJoinSubsumption {
         projection.returned_types.push(aggregate_type);
     }
 
-    fn direct_detail_get<'a>(plan: &'a LogicalPlan, outer_sum: &OuterSum) -> Option<&'a Get> {
+    fn direct_detail_get<'a>(plan: &'a OwnedLogicalPlan, outer_sum: &OuterSum) -> Option<&'a Get> {
         let LogicalOperator::Get(get) = &plan.operator else {
             return None;
         };
@@ -656,7 +656,7 @@ impl AggregateJoinSubsumption {
     }
 
     fn projected_bindings(
-        child: &LogicalPlan,
+        child: &OwnedLogicalPlan,
         projection: &ProjectionMap,
     ) -> Option<Vec<ColumnBinding>> {
         let child_bindings = child.get_column_bindings();
@@ -756,7 +756,7 @@ mod tests {
         Aggregate, ColumnBinding, ExpressionGet, Get, Join, JoinCondition, JoinType,
         LogicalOperator, PostAggregateReduction, Projection, ProjectionMap,
     };
-    use paro_planner::plan::LogicalPlan;
+    use paro_planner::plan::OwnedLogicalPlan;
     use paro_storage::table::table_factory::TableFactory;
 
     use super::optimize_plan;
@@ -813,8 +813,8 @@ mod tests {
         )
     }
 
-    fn get(table_index: usize, table: Arc<TableCatalogEntry>) -> LogicalPlan {
-        LogicalPlan::synthetic(LogicalOperator::Get(Get::new(
+    fn get(table_index: usize, table: Arc<TableCatalogEntry>) -> OwnedLogicalPlan {
+        OwnedLogicalPlan::synthetic(LogicalOperator::Get(Get::new(
             table_index,
             vec!["key".to_string(), "value".to_string()],
             vec![LogicalType::BigInt, decimal(15)],
@@ -822,8 +822,8 @@ mod tests {
         )))
     }
 
-    fn preserved() -> LogicalPlan {
-        LogicalPlan::synthetic(LogicalOperator::ExpressionGet(ExpressionGet::new(
+    fn preserved() -> OwnedLogicalPlan {
+        OwnedLogicalPlan::synthetic(LogicalOperator::ExpressionGet(ExpressionGet::new(
             PRESERVED,
             vec![],
             vec!["key".to_string()],
@@ -834,9 +834,9 @@ mod tests {
     fn q18_shape(
         outer_table: Arc<TableCatalogEntry>,
         inner_table: Arc<TableCatalogEntry>,
-    ) -> LogicalPlan {
+    ) -> OwnedLogicalPlan {
         let inner_sum = sum(column(INNER_DETAIL, 1, decimal(15)));
-        let inner_aggregate = LogicalPlan::synthetic(LogicalOperator::Aggregate(Aggregate::new(
+        let inner_aggregate = OwnedLogicalPlan::synthetic(LogicalOperator::Aggregate(Aggregate::new(
             INNER_GROUP,
             INNER_AGGREGATE,
             42,
@@ -846,12 +846,12 @@ mod tests {
             vec![inner_sum],
             vec![],
         )));
-        let reduction = LogicalPlan::synthetic(LogicalOperator::Projection(Projection::new(
+        let reduction = OwnedLogicalPlan::synthetic(LogicalOperator::Projection(Projection::new(
             REDUCTION_PROJECTION,
             inner_aggregate,
             vec![column(INNER_GROUP, 0, LogicalType::BigInt)],
         )));
-        let semi = LogicalPlan::synthetic(LogicalOperator::Join(Join::comparison(
+        let semi = OwnedLogicalPlan::synthetic(LogicalOperator::Join(Join::comparison(
             JoinType::Semi,
             preserved(),
             reduction,
@@ -860,7 +860,7 @@ mod tests {
                 column(REDUCTION_PROJECTION, 0, LogicalType::BigInt),
             )],
         )));
-        let detail_join = LogicalPlan::synthetic(LogicalOperator::Join(Join::comparison(
+        let detail_join = OwnedLogicalPlan::synthetic(LogicalOperator::Join(Join::comparison(
             JoinType::Inner,
             semi,
             get(OUTER_DETAIL, outer_table),
@@ -869,7 +869,7 @@ mod tests {
                 column(OUTER_DETAIL, 0, LogicalType::BigInt),
             )],
         )));
-        LogicalPlan::synthetic(LogicalOperator::Aggregate(Aggregate::new(
+        OwnedLogicalPlan::synthetic(LogicalOperator::Aggregate(Aggregate::new(
             OUTER_GROUP,
             OUTER_AGGREGATE,
             62,
@@ -881,21 +881,21 @@ mod tests {
         )))
     }
 
-    fn with_join_above_detail_edge(mut plan: LogicalPlan) -> LogicalPlan {
+    fn with_join_above_detail_edge(mut plan: OwnedLogicalPlan) -> OwnedLogicalPlan {
         let LogicalOperator::Aggregate(outer) = &mut plan.operator else {
             panic!("outer aggregate");
         };
         let detail_join = std::mem::replace(
             outer.child.as_mut(),
-            LogicalPlan::synthetic(LogicalOperator::DummyScan),
+            OwnedLogicalPlan::synthetic(LogicalOperator::DummyScan),
         );
-        let extra = LogicalPlan::synthetic(LogicalOperator::ExpressionGet(ExpressionGet::new(
+        let extra = OwnedLogicalPlan::synthetic(LogicalOperator::ExpressionGet(ExpressionGet::new(
             EXTRA_RELATION,
             vec![],
             vec!["key".to_string()],
             vec![LogicalType::BigInt],
         )));
-        outer.child = Box::new(LogicalPlan::synthetic(LogicalOperator::Join(
+        outer.child = Box::new(OwnedLogicalPlan::synthetic(LogicalOperator::Join(
             Join::comparison(
                 JoinType::Inner,
                 detail_join,
@@ -909,9 +909,9 @@ mod tests {
         plan
     }
 
-    fn reduction_wraps_projected_detail_join(table: Arc<TableCatalogEntry>) -> LogicalPlan {
+    fn reduction_wraps_projected_detail_join(table: Arc<TableCatalogEntry>) -> OwnedLogicalPlan {
         let inner_sum = sum(column(INNER_DETAIL, 1, decimal(15)));
-        let inner_aggregate = LogicalPlan::synthetic(LogicalOperator::Aggregate(Aggregate::new(
+        let inner_aggregate = OwnedLogicalPlan::synthetic(LogicalOperator::Aggregate(Aggregate::new(
             INNER_GROUP,
             INNER_AGGREGATE,
             42,
@@ -921,7 +921,7 @@ mod tests {
             vec![inner_sum],
             vec![],
         )));
-        let reduction = LogicalPlan::synthetic(LogicalOperator::Projection(Projection::new(
+        let reduction = OwnedLogicalPlan::synthetic(LogicalOperator::Projection(Projection::new(
             REDUCTION_PROJECTION,
             inner_aggregate,
             vec![column(INNER_GROUP, 0, LogicalType::BigInt)],
@@ -941,7 +941,7 @@ mod tests {
         detail_join.left_projection_map = ProjectionMap::all();
         detail_join.right_projection_map = ProjectionMap::all();
         let detail_join =
-            LogicalPlan::synthetic(LogicalOperator::Join(Join::Comparison(detail_join)));
+            OwnedLogicalPlan::synthetic(LogicalOperator::Join(Join::Comparison(detail_join)));
         let mut reduction_join = match Join::comparison(
             JoinType::Semi,
             detail_join,
@@ -958,11 +958,11 @@ mod tests {
         // detail value consumed by the outer aggregate.
         reduction_join.left_projection_map = ProjectionMap::new(vec![0, 2]);
 
-        LogicalPlan::synthetic(LogicalOperator::Aggregate(Aggregate::new(
+        OwnedLogicalPlan::synthetic(LogicalOperator::Aggregate(Aggregate::new(
             OUTER_GROUP,
             OUTER_AGGREGATE,
             62,
-            LogicalPlan::synthetic(LogicalOperator::Join(Join::Comparison(reduction_join))),
+            OwnedLogicalPlan::synthetic(LogicalOperator::Join(Join::Comparison(reduction_join))),
             vec![column(PRESERVED, 0, LogicalType::BigInt)],
             vec![],
             vec![sum(column(OUTER_DETAIL, 1, decimal(15)))],

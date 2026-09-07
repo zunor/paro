@@ -5,14 +5,71 @@
 
 use crate::plan::{CardinalityEstimate, UniqueKey};
 use paro_common::types::LogicalType;
+use paro_storage::statistics::{BaseStatistics, ColumnStatistics};
 use std::sync::Arc;
 
 use super::ColumnBinding;
 
+/// Immutable value-domain evidence at a relational boundary. NDV estimates and
+/// their proofs are separate; this snapshot contains validity, typed bounds,
+/// and nested value domains, without carrying an HLL allocation into Memo.
+#[derive(Debug, Clone)]
+pub struct BoundColumnValues {
+    statistics: Arc<BaseStatistics>,
+    encoding: Arc<[u8]>,
+}
+
+impl PartialEq for BoundColumnValues {
+    fn eq(&self, other: &Self) -> bool {
+        self.statistics.get_type() == other.statistics.get_type() && self.encoding == other.encoding
+    }
+}
+
+impl Eq for BoundColumnValues {}
+
+impl BoundColumnValues {
+    pub fn new(mut statistics: BaseStatistics) -> paro_common::error::Result<Self> {
+        statistics.set_distinct_count(0);
+        let encoding = statistics.to_bytes()?.into();
+        Ok(Self {
+            statistics: Arc::new(statistics),
+            encoding,
+        })
+    }
+
+    pub fn statistics(&self) -> &BaseStatistics {
+        &self.statistics
+    }
+
+    pub fn encoding(&self) -> &[u8] {
+        &self.encoding
+    }
+
+    pub fn hull(&self, other: &Self) -> paro_common::error::Result<Self> {
+        if self == other {
+            return Ok(self.clone());
+        }
+        if self.statistics.get_type() != other.statistics.get_type() {
+            return Err(paro_common::error::internal(
+                "column value domains have different types",
+            ));
+        }
+        // Pin the reduction order, including floating-point endpoint ties.
+        let (left, right) = if self.encoding <= other.encoding {
+            (self, other)
+        } else {
+            (other, self)
+        };
+        let mut statistics = left.statistics.as_ref().clone();
+        statistics.merge(&right.statistics);
+        Self::new(statistics)
+    }
+}
+
 /// A fact-backed relation reference whose implementation remains owned by an
 /// external relational optimizer. It is legal only inside a transformation
 /// transaction and must be consumed before physical planning.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct BoundReference {
     /// Stable identity of this reference occurrence. Unlike `PlanNodeId`, this
     /// survives optimizer passes that rebuild an operator shell.
@@ -39,6 +96,20 @@ pub struct BoundSourceColumn {
 /// not be confused with a covered path containing zero rows.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BoundRelationFacts {
+    /// A finite effect-free derivation proves that this equivalence class is
+    /// safe to evaluate independently again on the same inputs. Splitting a
+    /// sharing owner requires this proof; commuting evaluation requires more.
+    pub can_replay: bool,
+    /// Immutable row-domain estimate supplied by the referenced Memo group.
+    /// A shell rewrite may clear NodeStats; it cannot clear this boundary fact.
+    pub cardinality: Option<CardinalityEstimate>,
+    /// A semantic row bound, separate from snapshot/cardinality estimates.
+    pub maximum_cardinality: Option<u64>,
+    /// Occurrence-independent domains from the referenced group. Statistical
+    /// state accumulated while visiting another occurrence is not evidence
+    /// for this boundary, even when its ColumnBindings are identical.
+    pub column_domains: Vec<BoundColumnDomain>,
+    pub column_values: Vec<Option<BoundColumnValues>>,
     pub unique_keys: Vec<UniqueKey>,
     /// Keys that remain unique when SQL grouping treats NULL values as equal.
     /// This is deliberately separate from ordinary/catalog uniqueness: a
@@ -51,6 +122,11 @@ pub struct BoundRelationFacts {
 impl Default for BoundRelationFacts {
     fn default() -> Self {
         Self {
+            can_replay: false,
+            cardinality: None,
+            maximum_cardinality: None,
+            column_domains: Vec::new(),
+            column_values: Vec::new(),
             unique_keys: Vec::new(),
             grouping_unique_keys: Vec::new(),
             source_lineage: Vec::new(),
@@ -59,7 +135,45 @@ impl Default for BoundRelationFacts {
     }
 }
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct BoundColumnDomain {
+    pub expected_distinct: Option<u64>,
+    pub guaranteed_distinct_upper: Option<u64>,
+}
+
 impl BoundReference {
+    pub fn column_statistics(&self) -> Vec<Arc<ColumnStatistics>> {
+        self.types
+            .iter()
+            .enumerate()
+            .map(|(ordinal, ty)| {
+                let domain = self
+                    .facts
+                    .column_domains
+                    .get(ordinal)
+                    .copied()
+                    .unwrap_or_default();
+                let mut base = self
+                    .facts
+                    .column_values
+                    .get(ordinal)
+                    .and_then(Option::as_ref)
+                    .map(|value| value.statistics().clone())
+                    .unwrap_or_else(|| BaseStatistics::create_unknown(ty.clone()));
+                base.set_distinct_count(0);
+                let mut column = ColumnStatistics::with_estimated_distinct(
+                    base,
+                    domain
+                        .expected_distinct
+                        .map(|distinct| usize::try_from(distinct).unwrap_or(usize::MAX)),
+                );
+                if let Some(upper) = domain.guaranteed_distinct_upper {
+                    column = column.with_guaranteed_distinct_upper(upper);
+                }
+                Arc::new(column)
+            })
+            .collect()
+    }
     pub fn new(reference_id: u32, bindings: Vec<ColumnBinding>, types: Vec<LogicalType>) -> Self {
         assert_eq!(bindings.len(), types.len());
         Self {

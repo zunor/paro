@@ -2,20 +2,20 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use crate::expression::Expression;
-use crate::plan::LogicalPlan;
+use crate::plan::OwnedLogicalPlan;
 use paro_common::types::LogicalType;
 use paro_external::routine::bound::BoundRoutineCallMeta;
 
 use super::external_project::ExternalCostEstimate;
 
-#[derive(Debug)]
-pub struct LogicalExternalTable {
+#[derive(Debug, Clone)]
+pub struct LogicalExternalTable<Child = Box<OwnedLogicalPlan>> {
     pub table_index: usize,
     pub output_columns: Vec<String>,
     pub returned_types: Vec<LogicalType>,
     pub call_expression: Expression,
     pub call: BoundRoutineCallMeta,
-    pub child: Option<Box<LogicalPlan>>,
+    pub child: Option<Child>,
     pub lateral: bool,
     pub parameterized: bool,
     pub cost: ExternalCostEstimate,
@@ -42,7 +42,12 @@ impl LogicalExternalTable {
         }
     }
 
-    pub fn with_child(mut self, child: LogicalPlan, lateral: bool, parameterized: bool) -> Self {
+    pub fn with_child(
+        mut self,
+        child: OwnedLogicalPlan,
+        lateral: bool,
+        parameterized: bool,
+    ) -> Self {
         self.child = Some(Box::new(child));
         self.lateral = lateral;
         self.parameterized = parameterized;

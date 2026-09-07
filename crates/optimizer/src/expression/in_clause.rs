@@ -6,7 +6,7 @@ use paro_planner::expression::{
     WindowExpression, WindowFrameBound, WindowInvocation,
 };
 use paro_planner::operator::{Filter, Join, LogicalOperator, Projection};
-use paro_planner::plan::LogicalPlan;
+use paro_planner::plan::OwnedLogicalPlan;
 
 pub struct InClauseRewriter;
 
@@ -15,11 +15,11 @@ impl InClauseRewriter {
         Self
     }
 
-    pub fn rewrite(&mut self, plan: LogicalPlan) -> paro_common::error::Result<LogicalPlan> {
+    pub fn rewrite(&mut self, plan: OwnedLogicalPlan) -> paro_common::error::Result<OwnedLogicalPlan> {
         plan.try_map_post_order(|plan| Ok(self.rewrite_current(plan)))
     }
 
-    fn rewrite_current(&mut self, plan: LogicalPlan) -> LogicalPlan {
+    fn rewrite_current(&mut self, plan: OwnedLogicalPlan) -> OwnedLogicalPlan {
         let (id, stats, operator) = plan.into_parts();
         let operator = match operator {
             LogicalOperator::Filter(filter) => LogicalOperator::Filter(self.rewrite_filter(filter)),
@@ -125,7 +125,7 @@ impl InClauseRewriter {
             }
             other => other,
         };
-        LogicalPlan {
+        OwnedLogicalPlan {
             id,
             stats,
             operator,
@@ -328,8 +328,8 @@ mod tests {
     use paro_planner::operator::{ColumnBinding, ExpressionGet, JoinType};
 
     use super::*;
-    fn integer_get(bind_context: &BindContext, table_index: usize) -> LogicalPlan {
-        LogicalPlan::new(
+    fn integer_get(bind_context: &BindContext, table_index: usize) -> OwnedLogicalPlan {
+        OwnedLogicalPlan::new(
             bind_context,
             LogicalOperator::ExpressionGet(ExpressionGet::new(
                 table_index,
@@ -363,7 +363,7 @@ mod tests {
             vec![integer_column(0, 0), int_constant(1)],
             LogicalType::Boolean,
         ));
-        let plan = LogicalPlan::new(
+        let plan = OwnedLogicalPlan::new(
             &bind_context,
             LogicalOperator::Filter(Filter::new(child, vec![expr])),
         );
@@ -398,7 +398,7 @@ mod tests {
             ],
             LogicalType::Boolean,
         ));
-        let plan = LogicalPlan::new(
+        let plan = OwnedLogicalPlan::new(
             &bind_context,
             LogicalOperator::Filter(Filter::new(child, vec![expr])),
         );
@@ -440,7 +440,7 @@ mod tests {
             LogicalType::Boolean,
         ));
         let join = Join::any(JoinType::Inner, left, right, condition);
-        let plan = LogicalPlan::new(&bind_context, LogicalOperator::Join(join));
+        let plan = OwnedLogicalPlan::new(&bind_context, LogicalOperator::Join(join));
 
         let rewritten = InClauseRewriter::new()
             .rewrite(plan)

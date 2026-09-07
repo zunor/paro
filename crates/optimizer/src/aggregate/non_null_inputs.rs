@@ -12,20 +12,20 @@ use std::sync::Arc;
 
 use paro_planner::expression::{AggregateType, Expression};
 use paro_planner::operator::{binding_preserving_get, ColumnBinding, LogicalOperator};
-use paro_planner::plan::LogicalPlan;
+use paro_planner::plan::OwnedLogicalPlan;
 use paro_storage::statistics::ColumnStatistics;
 
 pub fn optimize_plan(
-    plan: LogicalPlan,
+    plan: OwnedLogicalPlan,
     column_stats: &HashMap<ColumnBinding, Arc<ColumnStatistics>>,
-) -> LogicalPlan {
+) -> OwnedLogicalPlan {
     optimize_plan_with_change(plan, column_stats).0
 }
 
 pub fn optimize_plan_with_change(
-    plan: LogicalPlan,
+    plan: OwnedLogicalPlan,
     column_stats: &HashMap<ColumnBinding, Arc<ColumnStatistics>>,
-) -> (LogicalPlan, bool) {
+) -> (OwnedLogicalPlan, bool) {
     let mut changed = false;
     let plan = plan.map_children(|child| {
         let (child, child_changed) = optimize_plan_with_change(child, column_stats);
@@ -46,7 +46,7 @@ pub fn optimize_plan_with_change(
 
 fn rewrite_aggregate(
     expression: &mut Expression,
-    child: &LogicalPlan,
+    child: &OwnedLogicalPlan,
     column_stats: &HashMap<ColumnBinding, Arc<ColumnStatistics>>,
 ) -> bool {
     let Expression::Aggregate(aggregate) = expression else {
@@ -83,7 +83,7 @@ fn rewrite_aggregate(
 /// base column from the NULL-extended copy produced by an outer join. Only
 /// row-preserving unary operators may carry the base proof to this use site.
 fn binding_is_non_null_at(
-    plan: &LogicalPlan,
+    plan: &OwnedLogicalPlan,
     binding: ColumnBinding,
     column_stats: &HashMap<ColumnBinding, Arc<ColumnStatistics>>,
 ) -> bool {
@@ -126,8 +126,8 @@ mod tests {
         ))
     }
 
-    fn scan(binding: ColumnBinding) -> LogicalPlan {
-        LogicalPlan::synthetic(LogicalOperator::Get(Get::new_without_table(
+    fn scan(binding: ColumnBinding) -> OwnedLogicalPlan {
+        OwnedLogicalPlan::synthetic(LogicalOperator::Get(Get::new_without_table(
             binding.table_index,
             vec!["value".to_string()],
             vec![LogicalType::BigInt],
@@ -181,7 +181,7 @@ mod tests {
         let left = ColumnBinding::new(1, 0);
         let right = ColumnBinding::new(2, 0);
         let mut expression = count(right);
-        let child = LogicalPlan::synthetic(LogicalOperator::Join(Join::Comparison(
+        let child = OwnedLogicalPlan::synthetic(LogicalOperator::Join(Join::Comparison(
             ComparisonJoin::new(
                 JoinType::Left,
                 scan(left),
@@ -221,21 +221,21 @@ mod tests {
             ))),
         );
         let wrappers = [
-            LogicalPlan::synthetic(LogicalOperator::Filter(Filter::new(
+            OwnedLogicalPlan::synthetic(LogicalOperator::Filter(Filter::new(
                 scan(binding),
                 Vec::new(),
             ))),
-            LogicalPlan::synthetic(LogicalOperator::Order(Order::new(
+            OwnedLogicalPlan::synthetic(LogicalOperator::Order(Order::new(
                 scan(binding),
                 Vec::new(),
             ))),
-            LogicalPlan::synthetic(LogicalOperator::TopN(TopN::new(
+            OwnedLogicalPlan::synthetic(LogicalOperator::TopN(TopN::new(
                 scan(binding),
                 Vec::new(),
                 10,
                 0,
             ))),
-            LogicalPlan::synthetic(LogicalOperator::Limit(Limit::new(
+            OwnedLogicalPlan::synthetic(LogicalOperator::Limit(Limit::new(
                 scan(binding),
                 None,
                 None,

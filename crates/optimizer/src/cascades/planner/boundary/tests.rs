@@ -6,15 +6,15 @@ use paro_common::types::LogicalType;
 use paro_planner::expression::{ColumnRefExpression, ConstantExpression};
 use paro_planner::operator::{Projection, SetOpType, SetOperation};
 
-fn source(table: usize) -> LogicalPlan {
+fn source(table: usize) -> OwnedLogicalPlan {
     let mut plan = super::super::tests::test_base_get(table, table as u64 + 1, "facts", 10);
     plan.stats.estimated_cardinality = Some(CardinalityEstimate::exact(10));
     plan
 }
 
-fn project(plan: LogicalPlan, table: usize) -> LogicalPlan {
+fn project(plan: OwnedLogicalPlan, table: usize) -> OwnedLogicalPlan {
     let binding = plan.get_column_bindings()[0];
-    LogicalPlan::synthetic(LogicalOperator::Projection(Projection::new(
+    OwnedLogicalPlan::synthetic(LogicalOperator::Projection(Projection::new(
         table,
         plan,
         vec![Expression::ColumnRef(ColumnRefExpression::new(
@@ -24,12 +24,12 @@ fn project(plan: LogicalPlan, table: usize) -> LogicalPlan {
     )))
 }
 
-fn input(plan: LogicalPlan, budget: SearchBudget) -> OptimizationInput {
+fn input(plan: OwnedLogicalPlan, budget: SearchBudget) -> OptimizationInput {
     MemoBuilder::build(plan, BindContext::new(), budget).unwrap()
 }
 
-fn grouped_branch_with_tag(source_table: usize, output_table: usize, tag: &str) -> LogicalPlan {
-    let aggregate = LogicalPlan::synthetic(LogicalOperator::Aggregate(
+fn grouped_branch_with_tag(source_table: usize, output_table: usize, tag: &str) -> OwnedLogicalPlan {
+    let aggregate = OwnedLogicalPlan::synthetic(LogicalOperator::Aggregate(
         paro_planner::operator::Aggregate::new(
             output_table + 10,
             output_table + 11,
@@ -44,7 +44,7 @@ fn grouped_branch_with_tag(source_table: usize, output_table: usize, tag: &str) 
             vec![],
         ),
     ));
-    LogicalPlan::synthetic(LogicalOperator::Projection(Projection::new(
+    OwnedLogicalPlan::synthetic(LogicalOperator::Projection(Projection::new(
         output_table,
         aggregate,
         vec![
@@ -141,7 +141,7 @@ fn native_boundary_retains_alias_lineage_and_records_inherited_statistics() {
 
 #[test]
 fn aggregate_key_is_derived_from_native_shell_without_cached_plan_statistics() {
-    let aggregate = LogicalPlan::synthetic(LogicalOperator::Aggregate(
+    let aggregate = OwnedLogicalPlan::synthetic(LogicalOperator::Aggregate(
         paro_planner::operator::Aggregate::new(
             1,
             2,
@@ -225,7 +225,7 @@ fn group_boundary_never_unions_coverage_from_different_alternatives() {
 
 #[test]
 fn repeated_union_occurrences_cannot_claim_one_source_work_identity() {
-    let plan = LogicalPlan::synthetic(LogicalOperator::SetOperation(SetOperation::new(
+    let plan = OwnedLogicalPlan::synthetic(LogicalOperator::SetOperation(SetOperation::new(
         1,
         source(0),
         source(0),
@@ -252,7 +252,7 @@ fn repeated_union_occurrences_cannot_claim_one_source_work_identity() {
 
 #[test]
 fn disjoint_finite_grouping_domains_make_union_all_key_composable() {
-    let plan = LogicalPlan::synthetic(LogicalOperator::SetOperation(SetOperation::new(
+    let plan = OwnedLogicalPlan::synthetic(LogicalOperator::SetOperation(SetOperation::new(
         30,
         grouped_branch_with_tag(0, 20, "store"),
         grouped_branch_with_tag(1, 21, "web"),
@@ -338,7 +338,7 @@ fn shared_dag_facts_do_not_expand_bag_occurrences() {
     let mut plan = source(0);
     for table in 1..9 {
         let right = duplicate_plan_preserving_indices(&plan, bind.shared().as_ref());
-        plan = LogicalPlan::synthetic(LogicalOperator::SetOperation(SetOperation::new(
+        plan = OwnedLogicalPlan::synthetic(LogicalOperator::SetOperation(SetOperation::new(
             table,
             plan,
             right,

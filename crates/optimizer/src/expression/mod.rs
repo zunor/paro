@@ -9,7 +9,7 @@ pub mod rewriter;
 pub(crate) mod traversal;
 
 use paro_planner::operator::{ComparisonJoin, Join, LogicalOperator};
-use paro_planner::plan::LogicalPlan;
+use paro_planner::plan::OwnedLogicalPlan;
 
 use crate::rules::arithmetic::ArithmeticSimplificationRule;
 use crate::rules::comparison::ComparisonSimplificationRule;
@@ -19,7 +19,7 @@ use crate::rules::move_constants::MoveConstantsRule;
 
 /// Restore canonical scalar form after a relational substitution combines
 /// expressions that were previously separated by an operator boundary.
-pub(crate) fn normalize_scalar_expressions(plan: &mut LogicalPlan) {
+pub(crate) fn normalize_scalar_expressions(plan: &mut OwnedLogicalPlan) {
     let mut rewriter = rewriter::ExpressionRewriter::new();
     rewriter.add_rule(Box::new(ConstantFoldingRule::new()));
     rewriter.add_rule(Box::new(ArithmeticSimplificationRule::new()));

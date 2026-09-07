@@ -17,7 +17,7 @@ use paro_planner::operator::{
     ColumnBinding, Get, Join, JoinType, LogicalOperator, Projection, ProjectionMap, RowFetch,
     RowFetchSource,
 };
-use paro_planner::plan::LogicalPlan;
+use paro_planner::plan::OwnedLogicalPlan;
 
 use crate::aggregate::semantic_kernels::scalar_kernels_equal;
 use crate::cost_model::CostModel;
@@ -26,10 +26,10 @@ use crate::expression::traversal::visit_expression;
 /// Rewrite every eligible subtree while preserving an ordinary narrow plan as
 /// the fallback for shapes whose dependency or expression domain is unclear.
 pub fn optimize_plan(
-    plan: LogicalPlan,
+    plan: OwnedLogicalPlan,
     bind_context: &BindContext,
     cost_model: &CostModel,
-) -> Result<(LogicalPlan, bool)> {
+) -> Result<(OwnedLogicalPlan, bool)> {
     plan.try_fold_post_order(|plan, child_changes: Vec<bool>| {
         let (plan, node_changed) = rewrite_node(plan, bind_context, cost_model)?;
         Ok((
@@ -40,10 +40,10 @@ pub fn optimize_plan(
 }
 
 pub(crate) fn rewrite_node(
-    plan: LogicalPlan,
+    plan: OwnedLogicalPlan,
     bind_context: &BindContext,
     cost_model: &CostModel,
-) -> Result<(LogicalPlan, bool)> {
+) -> Result<(OwnedLogicalPlan, bool)> {
     if let Some(proof) = prove_selective_projection_candidate(&plan, cost_model) {
         return Ok((
             apply_selective_projection_rewrite(plan, proof, bind_context)?,
@@ -65,7 +65,7 @@ pub(crate) fn rewrite_node(
 /// Lower exact leading-substring expressions to derived scan outputs. This is
 /// a separate optimizer lifecycle from late row fetching: it neither creates
 /// row IDs nor changes where stored payload is materialized.
-pub fn optimize_matched_prefix_plan(plan: LogicalPlan) -> Result<(LogicalPlan, bool)> {
+pub fn optimize_matched_prefix_plan(plan: OwnedLogicalPlan) -> Result<(OwnedLogicalPlan, bool)> {
     plan.try_fold_post_order(|plan, child_changes: Vec<bool>| {
         let (plan, node_changed) = rewrite_matched_prefix_node(plan)?;
         Ok((
@@ -75,7 +75,7 @@ pub fn optimize_matched_prefix_plan(plan: LogicalPlan) -> Result<(LogicalPlan, b
     })
 }
 
-pub(crate) fn rewrite_matched_prefix_node(plan: LogicalPlan) -> Result<(LogicalPlan, bool)> {
+pub(crate) fn rewrite_matched_prefix_node(plan: OwnedLogicalPlan) -> Result<(OwnedLogicalPlan, bool)> {
     match prove_matched_prefix_candidate(&plan) {
         Some(proof) => Ok((apply_matched_prefix_rewrite(plan, proof)?, true)),
         None => Ok((plan, false)),
@@ -95,7 +95,7 @@ struct MatchedPrefixCandidate {
 /// row-producing operator.  The predicate is the semantic witness: arbitrary
 /// UTF-8 rows cannot be byte-truncated, but every emitted matching row begins
 /// with the proven ASCII bytes.
-fn prove_matched_prefix_candidate(plan: &LogicalPlan) -> Option<MatchedPrefixCandidate> {
+fn prove_matched_prefix_candidate(plan: &OwnedLogicalPlan) -> Option<MatchedPrefixCandidate> {
     let LogicalOperator::Projection(output) = &plan.operator else {
         return None;
     };
@@ -153,7 +153,7 @@ fn prove_matched_prefix_candidate(plan: &LogicalPlan) -> Option<MatchedPrefixCan
 }
 
 fn prove_matched_prefix_use_path(
-    plan: &LogicalPlan,
+    plan: &OwnedLogicalPlan,
     source_binding: ColumnBinding,
     kernel: &paro_function::scalar::BoundScalarFunction,
     byte_width: usize,
@@ -213,8 +213,8 @@ fn prove_matched_prefix_use_path(
 }
 
 fn prove_prefix_join_child(
-    left: &LogicalPlan,
-    right: &LogicalPlan,
+    left: &OwnedLogicalPlan,
+    right: &OwnedLogicalPlan,
     source_binding: ColumnBinding,
     kernel: &paro_function::scalar::BoundScalarFunction,
     byte_width: usize,
@@ -279,9 +279,9 @@ fn prove_prefix_filter_expression(
 }
 
 fn apply_matched_prefix_rewrite(
-    mut plan: LogicalPlan,
+    mut plan: OwnedLogicalPlan,
     candidate: MatchedPrefixCandidate,
-) -> Result<LogicalPlan> {
+) -> Result<OwnedLogicalPlan> {
     let LogicalOperator::Projection(output) = &mut plan.operator else {
         return Err(rewrite_invariant("matched-prefix root is not Projection"));
     };
@@ -310,7 +310,7 @@ fn apply_matched_prefix_rewrite(
 }
 
 fn append_get_matched_prefix_projection(
-    plan: &mut LogicalPlan,
+    plan: &mut OwnedLogicalPlan,
     table_index: usize,
     source_binding: ColumnBinding,
     byte_width: usize,
@@ -335,7 +335,7 @@ fn append_get_matched_prefix_projection(
 }
 
 fn append_prefix_through_operator(
-    plan: &mut LogicalPlan,
+    plan: &mut OwnedLogicalPlan,
     table_index: usize,
     source_binding: ColumnBinding,
     byte_width: usize,
@@ -432,8 +432,8 @@ fn append_prefix_through_operator(
 
 #[allow(clippy::too_many_arguments)]
 fn append_prefix_join_child(
-    left: &mut LogicalPlan,
-    right: &mut LogicalPlan,
+    left: &mut OwnedLogicalPlan,
+    right: &mut OwnedLogicalPlan,
     left_projection: Option<&mut paro_planner::operator::ProjectionMap>,
     right_projection: Option<&mut paro_planner::operator::ProjectionMap>,
     table_index: usize,
@@ -515,7 +515,7 @@ struct Candidate {
 /// predicate inputs cross the blocker, while wide output-only columns are
 /// gathered for the surviving rows immediately below their final projection.
 fn prove_selective_projection_candidate(
-    plan: &LogicalPlan,
+    plan: &OwnedLogicalPlan,
     cost_model: &CostModel,
 ) -> Option<SelectiveProjectionCandidate> {
     let LogicalOperator::Projection(output) = &plan.operator else {
@@ -628,7 +628,7 @@ fn prove_selective_projection_candidate(
     (!sources.is_empty()).then_some(SelectiveProjectionCandidate { sources })
 }
 
-fn source_estimated_rows(plan: &LogicalPlan, table_index: usize) -> Option<u64> {
+fn source_estimated_rows(plan: &OwnedLogicalPlan, table_index: usize) -> Option<u64> {
     if matches!(&plan.operator, LogicalOperator::Get(get) if get.table_index == table_index) {
         return plan
             .stats
@@ -705,7 +705,7 @@ impl RowIdPath {
     }
 }
 
-fn prove_candidate(plan: &LogicalPlan, cost_model: &CostModel) -> Option<Candidate> {
+fn prove_candidate(plan: &OwnedLogicalPlan, cost_model: &CostModel) -> Option<Candidate> {
     let LogicalOperator::TopN(topn) = &plan.operator else {
         return None;
     };
@@ -857,7 +857,7 @@ fn prove_candidate(plan: &LogicalPlan, cost_model: &CostModel) -> Option<Candida
 }
 
 fn prove_row_preserving_candidate(
-    plan: &LogicalPlan,
+    plan: &OwnedLogicalPlan,
     cost_model: &CostModel,
 ) -> Option<RowPreservingCandidate> {
     let LogicalOperator::TopN(topn) = &plan.operator else {
@@ -1015,7 +1015,7 @@ fn prove_row_preserving_candidate(
 /// whitelist; an unrecognized node is a declined optimization, never a blind
 /// recursive rewrite.
 fn prove_rowid_path(
-    plan: &LogicalPlan,
+    plan: &OwnedLogicalPlan,
     source_table_index: usize,
     policy: RowIdPathPolicy,
 ) -> Option<RowIdPath> {
@@ -1026,12 +1026,12 @@ fn prove_rowid_path(
 }
 
 #[cfg(test)]
-pub(super) fn proves_row_preserving_path(plan: &LogicalPlan, source_table_index: usize) -> bool {
+pub(super) fn proves_row_preserving_path(plan: &OwnedLogicalPlan, source_table_index: usize) -> bool {
     prove_rowid_path(plan, source_table_index, RowIdPathPolicy::RowPreserving).is_some()
 }
 
 fn prove_unique_rowid_path(
-    plan: &LogicalPlan,
+    plan: &OwnedLogicalPlan,
     source_table_index: usize,
     policy: RowIdPathPolicy,
 ) -> Option<RowIdPath> {
@@ -1090,8 +1090,8 @@ fn prove_unique_rowid_path(
 fn prove_join_rowid_path(
     kind: RowIdJoinKind,
     join_type: JoinType,
-    left: &LogicalPlan,
-    right: &LogicalPlan,
+    left: &OwnedLogicalPlan,
+    right: &OwnedLogicalPlan,
     source_table_index: usize,
     policy: RowIdPathPolicy,
 ) -> Option<RowIdPath> {
@@ -1148,7 +1148,7 @@ fn prove_join_rowid_path(
     })
 }
 
-fn count_source_gets(plan: &LogicalPlan, source_table_index: usize) -> usize {
+fn count_source_gets(plan: &OwnedLogicalPlan, source_table_index: usize) -> usize {
     let here = usize::from(matches!(
         &plan.operator,
         LogicalOperator::Get(get) if get.table_index == source_table_index
@@ -1161,10 +1161,10 @@ fn count_source_gets(plan: &LogicalPlan, source_table_index: usize) -> usize {
 }
 
 fn apply_rewrite(
-    plan: LogicalPlan,
+    plan: OwnedLogicalPlan,
     candidate: Candidate,
     bind_context: &BindContext,
-) -> Result<LogicalPlan> {
+) -> Result<OwnedLogicalPlan> {
     let (topn_id, topn_stats, operator) = plan.into_parts();
     let LogicalOperator::TopN(mut topn) = operator else {
         return Err(rewrite_invariant("aggregate candidate root is not TopN"));
@@ -1337,7 +1337,7 @@ fn apply_rewrite(
     }
     topn.projection_map = ProjectionMap::new(topn_output_indices);
 
-    let aggregate_plan = LogicalPlan {
+    let aggregate_plan = OwnedLogicalPlan {
         id: aggregate_id,
         stats: aggregate_stats.clone(),
         operator: LogicalOperator::Aggregate(aggregate),
@@ -1345,8 +1345,8 @@ fn apply_rewrite(
     let carrier = Projection::new(carrier_table_index, aggregate_plan, carrier_expressions)
         .with_visible_names(carrier_names)
         .with_internal_outputs();
-    topn.child = Box::new(LogicalPlan::synthetic(LogicalOperator::Projection(carrier)));
-    let topn_plan = LogicalPlan {
+    topn.child = Box::new(OwnedLogicalPlan::synthetic(LogicalOperator::Projection(carrier)));
+    let topn_plan = OwnedLogicalPlan {
         id: topn_id,
         stats: topn_stats.clone(),
         operator: LogicalOperator::TopN(topn),
@@ -1354,7 +1354,7 @@ fn apply_rewrite(
     output.child = Box::new(if needed_columns.is_empty() {
         topn_plan
     } else {
-        LogicalPlan::synthetic(LogicalOperator::RowFetch(RowFetch::new(
+        OwnedLogicalPlan::synthetic(LogicalOperator::RowFetch(RowFetch::new(
             carrier_table_index,
             vec![RowFetchSource {
                 materialized_table_index,
@@ -1381,7 +1381,7 @@ fn apply_rewrite(
         .iter()
         .map(Expression::return_type)
         .collect();
-    Ok(LogicalPlan {
+    Ok(OwnedLogicalPlan {
         id: output_id,
         stats: topn_stats,
         operator: LogicalOperator::Projection(output),
@@ -1389,10 +1389,10 @@ fn apply_rewrite(
 }
 
 fn apply_row_preserving_rewrite(
-    plan: LogicalPlan,
+    plan: OwnedLogicalPlan,
     candidate: RowPreservingCandidate,
     bind_context: &BindContext,
-) -> Result<LogicalPlan> {
+) -> Result<OwnedLogicalPlan> {
     let (topn_id, topn_stats, operator) = plan.into_parts();
     let LogicalOperator::TopN(mut topn) = operator else {
         return Err(rewrite_invariant(
@@ -1579,11 +1579,11 @@ fn apply_row_preserving_rewrite(
                 })
         })
         .collect::<Vec<_>>();
-    let narrow_plan = LogicalPlan::synthetic(LogicalOperator::Projection(narrow));
+    let narrow_plan = OwnedLogicalPlan::synthetic(LogicalOperator::Projection(narrow));
     let topn_carrier_child = if ordered_fetch_sources.is_empty() {
         narrow_plan
     } else {
-        LogicalPlan::synthetic(LogicalOperator::RowFetch(RowFetch::new(
+        OwnedLogicalPlan::synthetic(LogicalOperator::RowFetch(RowFetch::new(
             narrow_table_index,
             ordered_fetch_sources,
             narrow_plan,
@@ -1615,10 +1615,10 @@ fn apply_row_preserving_rewrite(
             .filter_map(|source| source.topn_rowid_index),
     );
     topn.projection_map = ProjectionMap::new(topn_output_indices);
-    topn.child = Box::new(LogicalPlan::synthetic(LogicalOperator::Projection(
+    topn.child = Box::new(OwnedLogicalPlan::synthetic(LogicalOperator::Projection(
         topn_carrier,
     )));
-    let topn_plan = LogicalPlan {
+    let topn_plan = OwnedLogicalPlan {
         id: topn_id,
         stats: topn_stats.clone(),
         operator: LogicalOperator::TopN(topn),
@@ -1686,7 +1686,7 @@ fn apply_row_preserving_rewrite(
     output.child = Box::new(if output_fetch_sources.is_empty() {
         topn_plan
     } else {
-        LogicalPlan::synthetic(LogicalOperator::RowFetch(RowFetch::new(
+        OwnedLogicalPlan::synthetic(LogicalOperator::RowFetch(RowFetch::new(
             topn_table_index,
             output_fetch_sources,
             topn_plan,
@@ -1699,7 +1699,7 @@ fn apply_row_preserving_rewrite(
         .iter()
         .map(Expression::return_type)
         .collect();
-    Ok(LogicalPlan {
+    Ok(OwnedLogicalPlan {
         id: output_id,
         stats: topn_stats,
         operator: LogicalOperator::Projection(output),
@@ -1707,10 +1707,10 @@ fn apply_row_preserving_rewrite(
 }
 
 fn apply_selective_projection_rewrite(
-    plan: LogicalPlan,
+    plan: OwnedLogicalPlan,
     candidate: SelectiveProjectionCandidate,
     bind_context: &BindContext,
-) -> Result<LogicalPlan> {
+) -> Result<OwnedLogicalPlan> {
     let (id, stats, operator) = plan.into_parts();
     let LogicalOperator::Projection(mut output) = operator else {
         return Err(rewrite_invariant(
@@ -1831,13 +1831,13 @@ fn apply_selective_projection_rewrite(
 
     let child = std::mem::replace(
         &mut *output.child,
-        LogicalPlan::synthetic(LogicalOperator::DummyScan),
+        OwnedLogicalPlan::synthetic(LogicalOperator::DummyScan),
     );
     let child_stats = child.stats.clone();
     let carrier = Projection::new(carrier_table_index, child, carrier_expressions)
         .with_visible_names(carrier_names)
         .with_internal_outputs();
-    let mut carrier = LogicalPlan::synthetic(LogicalOperator::Projection(carrier));
+    let mut carrier = OwnedLogicalPlan::synthetic(LogicalOperator::Projection(carrier));
     carrier.stats = child_stats;
     let fetch_sources = sources
         .drain(..)
@@ -1860,10 +1860,10 @@ fn apply_selective_projection_rewrite(
                 .into_boxed_slice(),
         })
         .collect::<Vec<_>>();
-    output.child = Box::new(LogicalPlan::synthetic(LogicalOperator::RowFetch(
+    output.child = Box::new(OwnedLogicalPlan::synthetic(LogicalOperator::RowFetch(
         RowFetch::new(carrier_table_index, fetch_sources, carrier),
     )));
-    Ok(LogicalPlan {
+    Ok(OwnedLogicalPlan {
         id,
         stats,
         operator: LogicalOperator::Projection(output),
@@ -1871,7 +1871,7 @@ fn apply_selective_projection_rewrite(
 }
 
 fn append_virtual_rowid(
-    plan: &mut LogicalPlan,
+    plan: &mut OwnedLogicalPlan,
     path: &RowIdPath,
     table_index: usize,
     required_output_bindings: &HashSet<ColumnBinding>,
@@ -2002,8 +2002,8 @@ fn append_virtual_rowid(
 
 #[allow(clippy::too_many_arguments)]
 fn append_projected_join_rowid(
-    left: &mut Box<LogicalPlan>,
-    right: &mut Box<LogicalPlan>,
+    left: &mut Box<OwnedLogicalPlan>,
+    right: &mut Box<OwnedLogicalPlan>,
     left_projection: &mut paro_planner::operator::ProjectionMap,
     right_projection: &mut paro_planner::operator::ProjectionMap,
     side: RowIdJoinSide,
@@ -2039,7 +2039,7 @@ fn append_projected_join_rowid(
 }
 
 fn include_required_join_outputs(
-    child: &LogicalPlan,
+    child: &OwnedLogicalPlan,
     projection: &mut paro_planner::operator::ProjectionMap,
     required: &HashSet<ColumnBinding>,
 ) {
@@ -2109,7 +2109,7 @@ fn collect_column_bindings<'a>(
     bindings
 }
 
-pub(super) fn unique_get(plan: &LogicalPlan, table_index: usize) -> Option<&Get> {
+pub(super) fn unique_get(plan: &OwnedLogicalPlan, table_index: usize) -> Option<&Get> {
     let mut found = None;
     let mut duplicate = false;
     collect_get(plan, table_index, &mut found, &mut duplicate);
@@ -2117,7 +2117,7 @@ pub(super) fn unique_get(plan: &LogicalPlan, table_index: usize) -> Option<&Get>
 }
 
 fn collect_get<'a>(
-    plan: &'a LogicalPlan,
+    plan: &'a OwnedLogicalPlan,
     table_index: usize,
     found: &mut Option<&'a Get>,
     duplicate: &mut bool,

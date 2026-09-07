@@ -30,7 +30,7 @@ use paro_planner::operator::{
     Aggregate, AntiJoinMode, ColumnBinding, ComparisonJoin, Join, JoinComparisonType, JoinType,
     LogicalOperator, MarkJoinSemantics, MaterializedCTE, PostAggregateReduction, Projection,
 };
-use paro_planner::plan::LogicalPlan;
+use paro_planner::plan::OwnedLogicalPlan;
 
 pub(crate) mod alpha;
 
@@ -38,16 +38,16 @@ use crate::aggregate::semantic_kernels::aggregate_kernels_equal;
 use alpha::AlphaBindings;
 /// Replace eligible grouped/scalar sibling plans with one grouped aggregate
 /// carrying a hidden post-aggregate reduction.
-pub fn optimize_plan(plan: LogicalPlan, bind_context: &BindContext) -> Result<LogicalPlan> {
+pub fn optimize_plan(plan: OwnedLogicalPlan, bind_context: &BindContext) -> Result<OwnedLogicalPlan> {
     optimize_plan_with_change(plan, bind_context).map(|(plan, _)| plan)
 }
 
 pub fn optimize_plan_with_change(
-    plan: LogicalPlan,
+    plan: OwnedLogicalPlan,
     bind_context: &BindContext,
-) -> Result<(LogicalPlan, bool)> {
+) -> Result<(OwnedLogicalPlan, bool)> {
     // `LogicalOperator` is intentionally a wide enum. Recursing while moving
-    // an owned `LogicalPlan` therefore consumes a large native stack frame at
+    // an owned `OwnedLogicalPlan` therefore consumes a large native stack frame at
     // every level, even for a modest relational tree. Use the canonical heap
     // traversal and repeat only when a CTE rewrite exposes a fresh subtree.
     let mut plan = plan;
@@ -91,7 +91,7 @@ pub fn optimize_plan_with_change(
     }
 }
 
-fn rewrite_cte_max_reduction(cte: MaterializedCTE, rewrite: CteMaxRewrite) -> Option<LogicalPlan> {
+fn rewrite_cte_max_reduction(cte: MaterializedCTE, rewrite: CteMaxRewrite) -> Option<OwnedLogicalPlan> {
     let grouped_plan = attach_cte_reduction(*cte.cte_query, rewrite.reduction)?;
     let rewritten_child = rewrite_cte_consumer(
         *cte.child,
@@ -204,7 +204,7 @@ fn recognize_cte_max_reduction(
     })
 }
 
-fn cte_grouped_definition(plan: &LogicalPlan) -> Option<(&Projection, &Aggregate)> {
+fn cte_grouped_definition(plan: &OwnedLogicalPlan) -> Option<(&Projection, &Aggregate)> {
     let LogicalOperator::Projection(projection) = &plan.operator else {
         return None;
     };
@@ -214,7 +214,7 @@ fn cte_grouped_definition(plan: &LogicalPlan) -> Option<(&Projection, &Aggregate
     Some((projection, aggregate))
 }
 
-fn cte_source_is_shareable(plan: &LogicalPlan) -> bool {
+fn cte_source_is_shareable(plan: &OwnedLogicalPlan) -> bool {
     match &plan.operator {
         LogicalOperator::Get(get) => {
             get.scan_order.is_none()
@@ -258,7 +258,7 @@ fn map_definition_aggregate_output(
 }
 
 fn collect_cte_references<'a>(
-    plan: &'a LogicalPlan,
+    plan: &'a OwnedLogicalPlan,
     cte_index: usize,
 ) -> Vec<&'a paro_planner::operator::CTERef> {
     let mut references = Vec::new();
@@ -283,14 +283,14 @@ struct CteScalarMax<'a> {
     scalar_expression: &'a Expression,
 }
 
-fn find_cte_scalar_max<'a>(plan: &'a LogicalPlan, cte_index: usize) -> Option<CteScalarMax<'a>> {
+fn find_cte_scalar_max<'a>(plan: &'a OwnedLogicalPlan, cte_index: usize) -> Option<CteScalarMax<'a>> {
     let mut found = None;
     find_cte_scalar_max_inner(plan, cte_index, &mut found)?;
     found
 }
 
 fn find_cte_scalar_max_inner<'a>(
-    plan: &'a LogicalPlan,
+    plan: &'a OwnedLogicalPlan,
     cte_index: usize,
     found: &mut Option<CteScalarMax<'a>>,
 ) -> Option<()> {
@@ -307,7 +307,7 @@ fn find_cte_scalar_max_inner<'a>(
     Some(())
 }
 
-fn peel_cte_scalar_max(plan: &LogicalPlan, cte_index: usize) -> Option<CteScalarMax<'_>> {
+fn peel_cte_scalar_max(plan: &OwnedLogicalPlan, cte_index: usize) -> Option<CteScalarMax<'_>> {
     let LogicalOperator::Projection(wrapper_projection) = &plan.operator else {
         return None;
     };
@@ -472,7 +472,7 @@ fn peel_scalar_wrapper_prefix(projection: &Projection) -> Option<ScalarWrapperPr
 }
 
 fn find_and_rebase_cte_predicate(
-    plan: &LogicalPlan,
+    plan: &OwnedLogicalPlan,
     main_binding: ColumnBinding,
     wrapper_binding: ColumnBinding,
     aggregate_binding: ColumnBinding,
@@ -493,7 +493,7 @@ fn find_and_rebase_cte_predicate(
 }
 
 fn find_cte_predicate_inner(
-    plan: &LogicalPlan,
+    plan: &OwnedLogicalPlan,
     main_binding: ColumnBinding,
     wrapper_binding: ColumnBinding,
     aggregate_binding: ColumnBinding,
@@ -549,9 +549,9 @@ fn find_cte_predicate_inner(
 }
 
 fn attach_cte_reduction(
-    mut plan: LogicalPlan,
+    mut plan: OwnedLogicalPlan,
     reduction: PostAggregateReduction,
-) -> Option<LogicalPlan> {
+) -> Option<OwnedLogicalPlan> {
     let LogicalOperator::Projection(projection) = &mut plan.operator else {
         return None;
     };
@@ -564,12 +564,12 @@ fn attach_cte_reduction(
 }
 
 fn rewrite_cte_consumer(
-    mut plan: LogicalPlan,
+    mut plan: OwnedLogicalPlan,
     cte_index: usize,
     main_table_index: usize,
     wrapper_binding: ColumnBinding,
-    grouped_plan: LogicalPlan,
-) -> Option<LogicalPlan> {
+    grouped_plan: OwnedLogicalPlan,
+) -> Option<OwnedLogicalPlan> {
     let scalar_root_id = find_scalar_wrapper_id(&plan, cte_index)?;
     if !remove_scalar_join(&mut plan, scalar_root_id, wrapper_binding) {
         return None;
@@ -584,7 +584,7 @@ fn rewrite_cte_consumer(
 }
 
 fn find_scalar_wrapper_id(
-    plan: &LogicalPlan,
+    plan: &OwnedLogicalPlan,
     cte_index: usize,
 ) -> Option<paro_planner::plan::PlanNodeId> {
     let mut ids = Vec::new();
@@ -600,7 +600,7 @@ fn find_scalar_wrapper_id(
 }
 
 fn remove_scalar_join(
-    plan: &mut LogicalPlan,
+    plan: &mut OwnedLogicalPlan,
     scalar_root_id: paro_planner::plan::PlanNodeId,
     wrapper_binding: ColumnBinding,
 ) -> bool {
@@ -639,12 +639,12 @@ fn remove_scalar_join(
                     replacement = Some(if left_scalar {
                         std::mem::replace(
                             &mut *join.right,
-                            LogicalPlan::synthetic(LogicalOperator::DummyScan),
+                            OwnedLogicalPlan::synthetic(LogicalOperator::DummyScan),
                         )
                     } else {
                         std::mem::replace(
                             &mut *join.left,
-                            LogicalPlan::synthetic(LogicalOperator::DummyScan),
+                            OwnedLogicalPlan::synthetic(LogicalOperator::DummyScan),
                         )
                     });
                 }
@@ -680,7 +680,7 @@ fn expression_mentions_binding(expression: &Expression, binding: ColumnBinding) 
     found
 }
 
-fn count_binding_uses(plan: &LogicalPlan, binding: ColumnBinding) -> Option<usize> {
+fn count_binding_uses(plan: &OwnedLogicalPlan, binding: ColumnBinding) -> Option<usize> {
     let mut count_expression = |expression: &Expression| {
         let mut count = 0;
         ExpressionIterator::visit(expression, &mut |node| {
@@ -728,10 +728,10 @@ fn count_binding_uses(plan: &LogicalPlan, binding: ColumnBinding) -> Option<usiz
 }
 
 fn replace_main_cte_ref(
-    plan: &mut LogicalPlan,
+    plan: &mut OwnedLogicalPlan,
     cte_index: usize,
     main_table_index: usize,
-    grouped_plan: &mut Option<LogicalPlan>,
+    grouped_plan: &mut Option<OwnedLogicalPlan>,
 ) -> bool {
     if matches!(&plan.operator, LogicalOperator::CTERef(reference)
         if reference.cte_index == cte_index && reference.table_index == main_table_index)
@@ -741,7 +741,7 @@ fn replace_main_cte_ref(
         };
         let bindings = definition.get_column_bindings();
         let types = definition.types();
-        *plan = LogicalPlan {
+        *plan = OwnedLogicalPlan {
             id: plan.id,
             stats: Default::default(),
             operator: LogicalOperator::Projection(Projection::new(
@@ -780,9 +780,9 @@ struct Rewrite {
 }
 
 fn rewrite_projection_with_change(
-    plan: LogicalPlan,
+    plan: OwnedLogicalPlan,
     bind_context: &BindContext,
-) -> (LogicalPlan, bool) {
+) -> (OwnedLogicalPlan, bool) {
     let Some(rewrite) = recognize(&plan, bind_context) else {
         return (plan, false);
     };
@@ -810,7 +810,7 @@ fn rewrite_projection_with_change(
     }
     let mut grouped_plan = std::mem::replace(
         grouped_slot,
-        Box::new(LogicalPlan::synthetic(LogicalOperator::DummyScan)),
+        Box::new(OwnedLogicalPlan::synthetic(LogicalOperator::DummyScan)),
     );
     let LogicalOperator::Aggregate(grouped) = &mut grouped_plan.operator else {
         *grouped_slot = grouped_plan;
@@ -821,7 +821,7 @@ fn rewrite_projection_with_change(
     (plan, true)
 }
 
-fn recognize(plan: &LogicalPlan, bind_context: &BindContext) -> Option<Rewrite> {
+fn recognize(plan: &OwnedLogicalPlan, bind_context: &BindContext) -> Option<Rewrite> {
     let LogicalOperator::Projection(output) = &plan.operator else {
         return None;
     };
@@ -873,7 +873,7 @@ fn recognize(plan: &LogicalPlan, bind_context: &BindContext) -> Option<Rewrite> 
     projection_consumes_only(output, grouped).then_some(rewrite)
 }
 
-fn projection_consumes_only(projection: &Projection, source: &LogicalPlan) -> bool {
+fn projection_consumes_only(projection: &Projection, source: &OwnedLogicalPlan) -> bool {
     let available = source
         .get_column_bindings()
         .into_iter()
@@ -902,8 +902,8 @@ fn projection_consumes_only(projection: &Projection, source: &LogicalPlan) -> bo
 }
 
 fn recognize_orientation(
-    grouped_plan: &LogicalPlan,
-    scalar_wrapper_plan: &LogicalPlan,
+    grouped_plan: &OwnedLogicalPlan,
+    scalar_wrapper_plan: &OwnedLogicalPlan,
     predicate: &Expression,
     grouped_side: GroupedSide,
     bind_context: &BindContext,
@@ -1017,7 +1017,7 @@ struct ScalarBranch<'a> {
     aggregate: &'a Aggregate,
 }
 
-fn peel_scalar_wrapper(plan: &LogicalPlan) -> Option<ScalarBranch<'_>> {
+fn peel_scalar_wrapper(plan: &OwnedLogicalPlan) -> Option<ScalarBranch<'_>> {
     let LogicalOperator::Projection(wrapper_projection) = &plan.operator else {
         return None;
     };

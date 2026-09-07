@@ -7,7 +7,7 @@ use paro_common::types::LogicalType;
 
 use crate::binder::ir::OrderByNode;
 use crate::expression::Expression;
-use crate::plan::LogicalPlan;
+use crate::plan::OwnedLogicalPlan;
 
 /// The type of DISTINCT operation.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -24,8 +24,8 @@ pub enum DistinctType {
 ///
 /// For DISTINCT ON, the `order_by` field determines which row to keep
 /// for each distinct group (the first row according to the ORDER BY).
-#[derive(Debug)]
-pub struct Distinct {
+#[derive(Debug, Clone)]
+pub struct Distinct<Child = Box<OwnedLogicalPlan>> {
     /// The type of distinct operation.
     pub distinct_type: DistinctType,
     /// The expressions to compute distinctness on.
@@ -36,12 +36,12 @@ pub struct Distinct {
     /// Used to determine which row to keep for each distinct group.
     pub order_by: Option<Vec<OrderByNode>>,
     /// The child operator.
-    pub child: Box<LogicalPlan>,
+    pub child: Child,
 }
 
 impl Distinct {
     /// Create a new Distinct for regular DISTINCT.
-    pub fn new(child: LogicalPlan) -> Self {
+    pub fn new(child: OwnedLogicalPlan) -> Self {
         Self {
             distinct_type: DistinctType::Distinct,
             distinct_targets: Vec::new(),
@@ -51,7 +51,7 @@ impl Distinct {
     }
 
     /// Create a new Distinct for DISTINCT ON.
-    pub fn distinct_on(targets: Vec<Expression>, child: LogicalPlan) -> Self {
+    pub fn distinct_on(targets: Vec<Expression>, child: OwnedLogicalPlan) -> Self {
         Self {
             distinct_type: DistinctType::DistinctOn,
             distinct_targets: targets,
@@ -64,7 +64,7 @@ impl Distinct {
     pub fn distinct_on_with_order(
         targets: Vec<Expression>,
         order_by: Vec<OrderByNode>,
-        child: LogicalPlan,
+        child: OwnedLogicalPlan,
     ) -> Self {
         Self {
             distinct_type: DistinctType::DistinctOn,

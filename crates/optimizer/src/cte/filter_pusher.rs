@@ -9,7 +9,7 @@ use paro_planner::expression::ComparisonType;
 use paro_planner::expression::{ConjunctionExpression, ConjunctionType, Expression};
 use paro_planner::operator::Filter as PlannerFilter;
 use paro_planner::operator::{ColumnBinding, LogicalOperator};
-use paro_planner::plan::LogicalPlan;
+use paro_planner::plan::OwnedLogicalPlan;
 use paro_planner::visitor::LogicalOperatorVisitor;
 
 use crate::expression::binding_replacer::{ColumnBindingReplacer, ReplacementBinding};
@@ -43,11 +43,11 @@ impl CTEFilterPusher {
         Self
     }
 
-    pub fn optimize_plan(&mut self, plan: LogicalPlan) -> LogicalPlan {
+    pub fn optimize_plan(&mut self, plan: OwnedLogicalPlan) -> OwnedLogicalPlan {
         self.optimize_plan_with_change(plan).0
     }
 
-    pub fn optimize_plan_with_change(&mut self, mut plan: LogicalPlan) -> (LogicalPlan, bool) {
+    pub fn optimize_plan_with_change(&mut self, mut plan: OwnedLogicalPlan) -> (OwnedLogicalPlan, bool) {
         let mut infos = HashMap::new();
         self.find_candidates(&plan.operator, &mut infos);
         let changed = self.push_filters(&mut plan.operator, &infos);
@@ -62,8 +62,8 @@ impl CTEFilterPusher {
     /// to MATERIALIZED makes the transformation structurally idempotent.
     pub(crate) fn optimize_default_root_with_change(
         &mut self,
-        mut plan: LogicalPlan,
-    ) -> (LogicalPlan, bool) {
+        mut plan: OwnedLogicalPlan,
+    ) -> (OwnedLogicalPlan, bool) {
         let is_default_root = matches!(
             &plan.operator,
             LogicalOperator::MaterializedCTE(cte)
@@ -179,12 +179,12 @@ impl CTEFilterPusher {
         let stats = cte.cte_query.stats.clone();
         let cte_query_plan = std::mem::replace(
             &mut *cte.cte_query,
-            LogicalPlan::synthetic(LogicalOperator::DummyScan),
+            OwnedLogicalPlan::synthetic(LogicalOperator::DummyScan),
         );
-        let pushed_plan = FilterPushdown::new().rewrite_plan(LogicalPlan::synthetic(
+        let pushed_plan = FilterPushdown::new().rewrite_plan(OwnedLogicalPlan::synthetic(
             LogicalOperator::Filter(PlannerFilter::new(cte_query_plan, producer_filters)),
         ));
-        *cte.cte_query = LogicalPlan {
+        *cte.cte_query = OwnedLogicalPlan {
             id,
             stats,
             operator: pushed_plan.into_operator(),
@@ -374,10 +374,10 @@ mod tests {
         ConstantExpression, Expression, FunctionExpression,
     };
     use paro_planner::operator::{CTERef, ExpressionGet, Filter, LogicalOperator, MaterializedCTE};
-    use paro_planner::plan::LogicalPlan;
+    use paro_planner::plan::OwnedLogicalPlan;
 
-    fn values(ctx: &BindContext, table_index: usize) -> LogicalPlan {
-        LogicalPlan::new(
+    fn values(ctx: &BindContext, table_index: usize) -> OwnedLogicalPlan {
+        OwnedLogicalPlan::new(
             ctx,
             LogicalOperator::ExpressionGet(ExpressionGet::new(
                 table_index,
@@ -431,10 +431,10 @@ mod tests {
             vec![LogicalType::Integer],
             CTEMaterialize::Default,
             values(&bind_context, 1),
-            LogicalPlan::new(
+            OwnedLogicalPlan::new(
                 &bind_context,
                 LogicalOperator::Filter(Filter::new(
-                    LogicalPlan::new(&bind_context, cte_ref(2)),
+                    OwnedLogicalPlan::new(&bind_context, cte_ref(2)),
                     vec![Expression::Comparison(ComparisonExpression::new(
                         ComparisonType::GreaterThan,
                         Expression::ColumnRef(ColumnRefExpression::new(
@@ -451,7 +451,7 @@ mod tests {
         ));
 
         let (optimized, changed) =
-            CTEFilterPusher::new().optimize_default_root_with_change(LogicalPlan::synthetic(plan));
+            CTEFilterPusher::new().optimize_default_root_with_change(OwnedLogicalPlan::synthetic(plan));
         assert!(changed);
         let (optimized, changed_again) =
             CTEFilterPusher::new().optimize_default_root_with_change(optimized);

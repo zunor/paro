@@ -3,7 +3,7 @@
 
 use paro_planner::operator::{ColumnBinding, Join, LogicalOperator};
 use paro_planner::plan::{
-    CardinalityEstimate, CardinalityProvenance, LogicalPlan, NodeStats, PlanNodeId,
+    CardinalityEstimate, CardinalityProvenance, OwnedLogicalPlan, NodeStats, PlanNodeId,
 };
 use paro_planner::planner::Planner;
 
@@ -216,7 +216,7 @@ fn multiway_region_isolates_the_widest_grouping_dimension() {
     assert_join_conditions_follow_child_orientation(&rewritten);
 }
 
-fn assert_join_conditions_follow_child_orientation(plan: &LogicalPlan) {
+fn assert_join_conditions_follow_child_orientation(plan: &OwnedLogicalPlan) {
     plan.try_visit_pre_order(|plan| {
         if let LogicalOperator::Join(Join::Comparison(join)) = &plan.operator {
             let left = join
@@ -266,26 +266,26 @@ fn collect_bindings(
 }
 
 fn rewrite_root_aggregate(
-    mut plan: LogicalPlan,
+    mut plan: OwnedLogicalPlan,
     bind_context: &paro_planner::binder::context::BindContext,
-) -> paro_common::error::Result<(LogicalPlan, bool)> {
+) -> paro_common::error::Result<(OwnedLogicalPlan, bool)> {
     let LogicalOperator::Projection(projection) = &mut plan.operator else {
         return dimension_deferral::optimize_plan(plan, bind_context);
     };
     let child = std::mem::replace(
         &mut projection.child,
-        Box::new(LogicalPlan::synthetic(LogicalOperator::DummyScan)),
+        Box::new(OwnedLogicalPlan::synthetic(LogicalOperator::DummyScan)),
     );
     let (child, changed) = dimension_deferral::optimize_plan(*child, bind_context)?;
     projection.child = Box::new(child);
     Ok((plan, changed))
 }
 
-fn annotate_cardinalities(plan: LogicalPlan) -> LogicalPlan {
+fn annotate_cardinalities(plan: OwnedLogicalPlan) -> OwnedLogicalPlan {
     annotate_cardinalities_with_join_rows(plan, 10_000)
 }
 
-fn annotate_cardinalities_with_join_rows(plan: LogicalPlan, join_rows: u64) -> LogicalPlan {
+fn annotate_cardinalities_with_join_rows(plan: OwnedLogicalPlan, join_rows: u64) -> OwnedLogicalPlan {
     plan.try_map_post_order(|mut plan| {
         let expected = match &plan.operator {
             LogicalOperator::Get(get) => match get

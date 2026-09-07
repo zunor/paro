@@ -21,7 +21,7 @@ use paro_planner::expression::Expression;
 use paro_planner::operator::{
     ComparisonJoin, Join, JoinComparisonType, JoinType, LogicalOperator, MaterializedCTE,
 };
-use paro_planner::plan::LogicalPlan;
+use paro_planner::plan::OwnedLogicalPlan;
 
 #[path = "demand_pushdown/producer.rs"]
 mod producer;
@@ -36,7 +36,7 @@ mod tests;
 struct JoinedDemand {
     key_ordinals: Vec<usize>,
     key_types: Vec<LogicalType>,
-    plan: LogicalPlan,
+    plan: OwnedLogicalPlan,
     expressions: Vec<Expression>,
 }
 
@@ -70,8 +70,8 @@ impl<'a> CTEDemandPusher<'a> {
     /// cannot fire this rule again.
     pub(crate) fn optimize_default_root_with_change(
         &self,
-        mut plan: LogicalPlan,
-    ) -> (LogicalPlan, bool) {
+        mut plan: OwnedLogicalPlan,
+    ) -> (OwnedLogicalPlan, bool) {
         let is_default_root = matches!(
             &plan.operator,
             LogicalOperator::MaterializedCTE(cte)
@@ -208,7 +208,7 @@ impl<'a> CTEDemandPusher<'a> {
             return None;
         }
 
-        let dummy = Box::new(LogicalPlan::synthetic(LogicalOperator::DummyScan));
+        let dummy = Box::new(OwnedLogicalPlan::synthetic(LogicalOperator::DummyScan));
         let mut plan = if cte_is_left {
             *std::mem::replace(&mut join.right, dummy)
         } else {

@@ -19,7 +19,7 @@ use paro_planner::operator::aggregate::GroupDependency;
 use paro_planner::operator::{
     Aggregate, ColumnBinding, ExpressionGet, Filter, LogicalOperator, PostAggregateReduction,
 };
-use paro_planner::plan::LogicalPlan;
+use paro_planner::plan::OwnedLogicalPlan;
 use paro_storage::statistics::NumericStats;
 
 use super::*;
@@ -449,9 +449,9 @@ fn lower_aggregate(
     with_having: bool,
 ) -> crate::physical::specs::AggregateSpec {
     let aggregate_type = aggregate.aggregates[0].return_type();
-    let aggregate = LogicalPlan::new(ctx, LogicalOperator::Aggregate(aggregate));
+    let aggregate = OwnedLogicalPlan::new(ctx, LogicalOperator::Aggregate(aggregate));
     let mut root = if with_having {
-        LogicalPlan::new(
+        OwnedLogicalPlan::new(
             ctx,
             LogicalOperator::Filter(Filter::new(
                 aggregate,
@@ -508,8 +508,8 @@ fn decimal_cast(child: Expression, target: LogicalType) -> Expression {
     Expression::Cast(CastExpression::new(child, target, cast_info, false))
 }
 
-fn values(ctx: &BindContext, types: Vec<LogicalType>) -> LogicalPlan {
-    LogicalPlan::new(
+fn values(ctx: &BindContext, types: Vec<LogicalType>) -> OwnedLogicalPlan {
+    OwnedLogicalPlan::new(
         ctx,
         LogicalOperator::ExpressionGet(ExpressionGet::new(
             0,

@@ -216,7 +216,7 @@ mod tests {
     use crate::binder::test_utils::test_binder;
     use crate::operator::LogicalOperator;
 
-    fn plan(sql: &str) -> crate::plan::LogicalPlan {
+    fn plan(sql: &str) -> crate::plan::OwnedLogicalPlan {
         let statement = paro_parser::parse_one(sql).expect("parse query").stmt;
         test_binder().bind(statement).expect("plan query").plan
     }

@@ -38,7 +38,7 @@ mod tests {
         ComparisonType, Expression, SubqueryExpression, SubqueryPlanningState, SubqueryType,
     };
     use crate::operator::{ExpressionGet, LogicalOperator, Projection};
-    use crate::plan::LogicalPlan;
+    use crate::plan::OwnedLogicalPlan;
 
     fn expression_get(table_index: usize) -> LogicalOperator {
         LogicalOperator::ExpressionGet(ExpressionGet::new(
@@ -54,13 +54,13 @@ mod tests {
         let nested_stmt = Arc::new(PlannedStatement {
             types: vec![LogicalType::Integer],
             names: vec!["v".to_string()],
-            plan: LogicalPlan::new(&BindContext::new(), expression_get(99)),
+            plan: OwnedLogicalPlan::new(&BindContext::new(), expression_get(99)),
         });
         let nested_bind_snapshot = BindContext::new().snapshot();
         let root_ctx = BindContext::new();
         let op = LogicalOperator::Projection(Projection::new(
             11,
-            LogicalPlan::new(&root_ctx, expression_get(7)),
+            OwnedLogicalPlan::new(&root_ctx, expression_get(7)),
             vec![Expression::Subquery(SubqueryExpression {
                 subquery_type: SubqueryType::Scalar,
                 subquery: Arc::clone(&nested_stmt),

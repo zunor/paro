@@ -1192,7 +1192,7 @@ struct ReductionScanBranch<'a> {
 }
 
 impl<'a> ReductionScanBranch<'a> {
-    fn inspect(plan: &'a LogicalPlan) -> Option<Self> {
+    fn inspect(plan: &'a OwnedLogicalPlan) -> Option<Self> {
         match &plan.operator {
             LogicalOperator::Get(get) => {
                 let output_column_ids = (0..get.returned_types.len())
@@ -1510,7 +1510,7 @@ fn partition_hash_join_conditions(
 /// duplicate-preserving projections, windows, aggregates, and key-preserving
 /// joins; ordinary equality supplies the required NULL rejection.
 fn hash_join_build_keys_are_declared_unique(
-    build: &LogicalPlan,
+    build: &OwnedLogicalPlan,
     key_conditions: &[JoinCondition],
 ) -> bool {
     if key_conditions.is_empty()
@@ -1532,7 +1532,7 @@ fn hash_join_build_keys_are_declared_unique(
 /// concurrent builder invalidates itself on any runtime domain/count drift and
 /// hash-join finish falls back to the canonical retained-row path.
 fn plan_build_time_integer_join_index(
-    build: &LogicalPlan,
+    build: &OwnedLogicalPlan,
     key_conditions: &[JoinCondition],
 ) -> Option<BuildTimeIntegerJoinIndexSpec> {
     let [condition] = key_conditions else {
@@ -1562,7 +1562,7 @@ fn plan_build_time_integer_join_index(
 /// Keeping this translation here makes uniqueness an explicit property of a
 /// transparent unary carrier rather than an accident of expression bindings.
 fn resolve_base_get_column<'a>(
-    build: &'a LogicalPlan,
+    build: &'a OwnedLogicalPlan,
     expression: &Expression,
 ) -> Option<(&'a paro_planner::operator::Get, usize)> {
     match expression {
@@ -1577,7 +1577,7 @@ fn resolve_base_get_column<'a>(
 }
 
 fn resolve_base_get_output(
-    build: &LogicalPlan,
+    build: &OwnedLogicalPlan,
     output_index: usize,
 ) -> Option<(&paro_planner::operator::Get, usize)> {
     match &build.operator {
@@ -1632,7 +1632,7 @@ fn resolve_base_get_output(
 }
 
 fn resolve_bound_get_column(
-    build: &LogicalPlan,
+    build: &OwnedLogicalPlan,
     table_index: usize,
     column_index: usize,
 ) -> Option<(&paro_planner::operator::Get, usize)> {

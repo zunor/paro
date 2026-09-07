@@ -421,7 +421,7 @@ fn probability_of(condition: bool) -> f64 {
 }
 
 fn sort_range_column_stats_for_expr(
-    plan: &LogicalPlan,
+    plan: &OwnedLogicalPlan,
     expression: &Expression,
 ) -> Option<SortRangeColumnStats> {
     let Expression::Reference(reference) = expression else {
@@ -431,7 +431,7 @@ fn sort_range_column_stats_for_expr(
 }
 
 fn sort_range_column_stats_for_output(
-    plan: &LogicalPlan,
+    plan: &OwnedLogicalPlan,
     output_idx: usize,
 ) -> Option<SortRangeColumnStats> {
     match &plan.operator {
@@ -735,8 +735,8 @@ mod tests {
         )
     }
 
-    fn plan_with_cardinality(rows: u64) -> LogicalPlan {
-        let mut plan = LogicalPlan::synthetic(LogicalOperator::DummyScan);
+    fn plan_with_cardinality(rows: u64) -> OwnedLogicalPlan {
+        let mut plan = OwnedLogicalPlan::synthetic(LogicalOperator::DummyScan);
         if rows > 0 {
             plan.stats.estimated_cardinality =
                 Some(paro_planner::plan::CardinalityEstimate::exact(rows));

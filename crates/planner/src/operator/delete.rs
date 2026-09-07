@@ -8,7 +8,7 @@ use std::sync::Arc;
 use paro_catalog::entry::TableCatalogEntry;
 use paro_common::types::LogicalType;
 
-use crate::plan::LogicalPlan;
+use crate::plan::OwnedLogicalPlan;
 
 /// Delete represents a DELETE operation in the logical plan.
 ///
@@ -19,8 +19,8 @@ use crate::plan::LogicalPlan;
 /// - Has a table_index for result projection
 /// - Has return_chunk flag for RETURNING clause
 /// - Has bound_constraints for constraint checking
-#[derive(Debug)]
-pub struct Delete {
+#[derive(Debug, Clone)]
+pub struct Delete<Child = Box<OwnedLogicalPlan>> {
     /// The table to delete from.
     pub table: Arc<TableCatalogEntry>,
     /// The table index for this delete operation (used for column bindings).
@@ -32,7 +32,7 @@ pub struct Delete {
     pub is_full_table_delete: bool,
     /// The child operator that produces rows to delete.
     /// This is typically a Get + Filter.
-    pub child: Box<LogicalPlan>,
+    pub child: Child,
 }
 
 impl Delete {
@@ -40,7 +40,7 @@ impl Delete {
     pub fn new(
         table: Arc<TableCatalogEntry>,
         table_index: u32,
-        child: LogicalPlan,
+        child: OwnedLogicalPlan,
         is_full_table_delete: bool,
     ) -> Self {
         Self {

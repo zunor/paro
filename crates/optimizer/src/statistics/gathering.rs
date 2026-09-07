@@ -17,7 +17,7 @@ use paro_planner::operator::{
     SetOpType,
 };
 use paro_planner::plan::{
-    CardinalityEstimate, CardinalityProvenance, LogicalPlan, LogicalPlanPostOrderFolder,
+    CardinalityEstimate, CardinalityProvenance, OwnedLogicalPlan, LogicalPlanPostOrderFolder,
 };
 use paro_storage::index::graph::GraphStatsProvider;
 use paro_storage::statistics::{BaseStatistics, ColumnStatistics};
@@ -83,10 +83,10 @@ struct GatheredNodeProperties {
 impl LogicalPlanPostOrderFolder<GatheredNodeProperties> for StatisticsGatherFolder<'_> {
     fn child_completed(
         &mut self,
-        parent_skeleton: &LogicalPlan,
-        completed_children: &[LogicalPlan],
+        parent_skeleton: &OwnedLogicalPlan,
+        completed_children: &[OwnedLogicalPlan],
         completed_properties: &[GatheredNodeProperties],
-        remaining_children: &[LogicalPlan],
+        remaining_children: &[OwnedLogicalPlan],
     ) -> Result<()> {
         self.gathering.publish_completed_first_child(
             parent_skeleton,
@@ -100,9 +100,9 @@ impl LogicalPlanPostOrderFolder<GatheredNodeProperties> for StatisticsGatherFold
 
     fn fold(
         &mut self,
-        mut plan: LogicalPlan,
+        mut plan: OwnedLogicalPlan,
         child_properties: Vec<GatheredNodeProperties>,
-    ) -> Result<(LogicalPlan, GatheredNodeProperties)> {
+    ) -> Result<(OwnedLogicalPlan, GatheredNodeProperties)> {
         let (child_layouts, child_maximum_cardinalities): (Vec<_>, Vec<_>) = child_properties
             .into_iter()
             .map(|properties| (properties.layout, properties.maximum_cardinality))
@@ -147,9 +147,9 @@ impl StatisticsGathering {
 
     pub fn gather(
         &mut self,
-        plan: LogicalPlan,
+        plan: OwnedLogicalPlan,
         ctx: &mut OptimizationContext,
-    ) -> Result<LogicalPlan> {
+    ) -> Result<OwnedLogicalPlan> {
         let mut folder = StatisticsGatherFolder {
             gathering: self,
             context: ctx,
@@ -163,10 +163,10 @@ impl StatisticsGathering {
     /// explicitly instead of relying on native call-stack sequencing.
     fn publish_completed_first_child(
         &mut self,
-        parent_skeleton: &LogicalPlan,
-        completed_children: &[LogicalPlan],
+        parent_skeleton: &OwnedLogicalPlan,
+        completed_children: &[OwnedLogicalPlan],
         completed_properties: &[GatheredNodeProperties],
-        remaining_children: &[LogicalPlan],
+        remaining_children: &[OwnedLogicalPlan],
         ctx: &OptimizationContext,
     ) {
         if completed_children.len() != 1 {
@@ -205,7 +205,7 @@ impl StatisticsGathering {
     fn publish_cte_statistics(
         &mut self,
         cte_index: usize,
-        producer: &LogicalPlan,
+        producer: &OwnedLogicalPlan,
         producer_layout: &LogicalOutputLayout,
         ctx: &OptimizationContext,
     ) {
@@ -220,9 +220,9 @@ impl StatisticsGathering {
 
     fn publish_delim_statistics(
         &mut self,
-        outer: &LogicalPlan,
+        outer: &OwnedLogicalPlan,
         duplicate_eliminated_columns: &[Expression],
-        dependent: &LogicalPlan,
+        dependent: &OwnedLogicalPlan,
         ctx: &OptimizationContext,
     ) {
         let Some(outer_cardinality) = outer.stats.estimated_cardinality else {
@@ -262,7 +262,7 @@ impl StatisticsGathering {
 
     fn estimate_plan_cardinality(
         &mut self,
-        plan: &LogicalPlan,
+        plan: &OwnedLogicalPlan,
         child_layouts: &[LogicalOutputLayout],
         ctx: &mut OptimizationContext,
     ) -> Option<CardinalityEstimate> {
@@ -527,7 +527,7 @@ impl StatisticsGathering {
 
     fn estimate_distinct_cardinality(
         &self,
-        child: &LogicalPlan,
+        child: &OwnedLogicalPlan,
         child_layout: &LogicalOutputLayout,
         ctx: &OptimizationContext,
     ) -> Option<CardinalityEstimate> {
@@ -710,7 +710,7 @@ impl StatisticsGathering {
 
     fn update_output_column_stats(
         &mut self,
-        plan: &LogicalPlan,
+        plan: &OwnedLogicalPlan,
         output_layout: &LogicalOutputLayout,
         child_layouts: &[LogicalOutputLayout],
         guaranteed_output_rows: Option<u64>,
@@ -931,7 +931,7 @@ fn estimate_unique_dimension_join(
     None
 }
 
-fn plan_has_single_column_unique_key(plan: &LogicalPlan, binding: ColumnBinding) -> bool {
+fn plan_has_single_column_unique_key(plan: &OwnedLogicalPlan, binding: ColumnBinding) -> bool {
     crate::statistics::unique_keys::proven_unique_keys(plan)
         .iter()
         .any(|key| key.as_slice() == [binding])
@@ -1538,7 +1538,7 @@ fn unknown_stats_for_types(types: &[LogicalType]) -> Vec<Arc<ColumnStatistics>> 
         .collect()
 }
 
-fn collect_delim_indices(plan: &LogicalPlan) -> BTreeSet<usize> {
+fn collect_delim_indices(plan: &OwnedLogicalPlan) -> BTreeSet<usize> {
     let mut indices = BTreeSet::new();
     plan.try_visit_pre_order(|plan| {
         if let LogicalOperator::DelimGet(delim) = &plan.operator {
@@ -1609,7 +1609,7 @@ fn estimate_pattern_factor(
         .unwrap_or(1.0)
 }
 
-fn graph_name_for_plan(mut plan: &LogicalPlan) -> Option<&str> {
+fn graph_name_for_plan(mut plan: &OwnedLogicalPlan) -> Option<&str> {
     loop {
         plan = match &plan.operator {
             LogicalOperator::GraphScan(scan) => return Some(scan.graph_name.as_str()),
@@ -1677,8 +1677,8 @@ mod tests {
         )
     }
 
-    fn values_relation(bind_context: &BindContext, table_index: usize, rows: usize) -> LogicalPlan {
-        LogicalPlan::new(
+    fn values_relation(bind_context: &BindContext, table_index: usize, rows: usize) -> OwnedLogicalPlan {
+        OwnedLogicalPlan::new(
             bind_context,
             LogicalOperator::ExpressionGet(ExpressionGet::new(
                 table_index,
@@ -1701,7 +1701,7 @@ mod tests {
         let session = make_test_session();
         let mut ctx = OptimizationContext::new(session, bind_context.clone());
 
-        let child = LogicalPlan::new(
+        let child = OwnedLogicalPlan::new(
             &bind_context,
             LogicalOperator::ExpressionGet(ExpressionGet::new(
                 1,
@@ -1716,7 +1716,7 @@ mod tests {
                 vec![LogicalType::BigInt],
             )),
         );
-        let projection = LogicalPlan::new(
+        let projection = OwnedLogicalPlan::new(
             &bind_context,
             LogicalOperator::Projection(Projection::new(
                 2,
@@ -1728,7 +1728,7 @@ mod tests {
                 })],
             )),
         );
-        let plan = LogicalPlan::new(
+        let plan = OwnedLogicalPlan::new(
             &bind_context,
             LogicalOperator::Limit(Limit::new(
                 projection,
@@ -1768,7 +1768,7 @@ mod tests {
                 let bind_context = BindContext::new();
                 let session = make_test_session();
                 let mut ctx = OptimizationContext::new(session, bind_context.clone());
-                let mut plan = LogicalPlan::new(
+                let mut plan = OwnedLogicalPlan::new(
                     &bind_context,
                     LogicalOperator::ExpressionGet(ExpressionGet::new(
                         17,
@@ -1781,7 +1781,7 @@ mod tests {
                     )),
                 );
                 for _ in 0..DEPTH {
-                    plan = LogicalPlan::new(
+                    plan = OwnedLogicalPlan::new(
                         &bind_context,
                         LogicalOperator::Limit(Limit::new(plan, None, None)),
                     );
@@ -1819,12 +1819,12 @@ mod tests {
                 let session = make_test_session();
                 let mut ctx = OptimizationContext::new(session, bind_context.clone());
                 let outer = values_relation(&bind_context, 1, 35);
-                let mut dependent = LogicalPlan::new(
+                let mut dependent = OwnedLogicalPlan::new(
                     &bind_context,
                     LogicalOperator::DelimGet(DelimGet::new(9, vec![LogicalType::BigInt])),
                 );
                 for _ in 0..DEPTH {
-                    dependent = LogicalPlan::new(
+                    dependent = OwnedLogicalPlan::new(
                         &bind_context,
                         LogicalOperator::Limit(Limit::new(dependent, None, None)),
                     );
@@ -1837,7 +1837,7 @@ mod tests {
                 );
                 join.duplicate_eliminated_columns = vec![column_ref(1, 0)];
                 let plan =
-                    LogicalPlan::new(&bind_context, LogicalOperator::Join(Join::Comparison(join)));
+                    OwnedLogicalPlan::new(&bind_context, LogicalOperator::Join(Join::Comparison(join)));
 
                 let gathered = StatisticsGathering::new()
                     .gather(plan, &mut ctx)
@@ -1890,7 +1890,7 @@ mod tests {
                 let bind_context = BindContext::new();
                 let mut ctx = OptimizationContext::new(make_test_session(), bind_context.clone());
                 ctx.graph_stats = GraphStatsCache::with_loader(Arc::new(StaticGraphStatsLoader));
-                let mut child = LogicalPlan::new(
+                let mut child = OwnedLogicalPlan::new(
                     &bind_context,
                     LogicalOperator::GraphScan(GraphScan::new(
                         VertexTableInfo {
@@ -1909,12 +1909,12 @@ mod tests {
                     )),
                 );
                 for _ in 0..DEPTH {
-                    child = LogicalPlan::new(
+                    child = OwnedLogicalPlan::new(
                         &bind_context,
                         LogicalOperator::Filter(Filter::new(child, Vec::new())),
                     );
                 }
-                let plan = LogicalPlan::new(
+                let plan = OwnedLogicalPlan::new(
                     &bind_context,
                     LogicalOperator::GraphExpand(GraphExpand::new(
                         EdgeTableInfo {
@@ -1986,7 +1986,7 @@ mod tests {
         let session = make_test_session();
         let mut ctx = OptimizationContext::new(session, bind_context.clone());
         let producer = values_relation(&bind_context, 1, 37);
-        let consumer = LogicalPlan::new(
+        let consumer = OwnedLogicalPlan::new(
             &bind_context,
             LogicalOperator::CTERef(CTERef::new(
                 9,
@@ -1996,7 +1996,7 @@ mod tests {
                 vec![LogicalType::BigInt],
             )),
         );
-        let plan = LogicalPlan::new(
+        let plan = OwnedLogicalPlan::new(
             &bind_context,
             LogicalOperator::MaterializedCTE(MaterializedCTE::new(
                 9,
@@ -2031,7 +2031,7 @@ mod tests {
         let bind_context = BindContext::new();
         let session = make_test_session();
         let mut ctx = OptimizationContext::new(session, bind_context.clone());
-        let mut reference = LogicalPlan::new(
+        let mut reference = OwnedLogicalPlan::new(
             &bind_context,
             LogicalOperator::CTERef(CTERef::new(
                 9,
@@ -2058,7 +2058,7 @@ mod tests {
         let bind_context = BindContext::new();
         let session = make_test_session();
         let mut ctx = OptimizationContext::new(session, bind_context.clone());
-        let outer = LogicalPlan::new(
+        let outer = OwnedLogicalPlan::new(
             &bind_context,
             LogicalOperator::ExpressionGet(ExpressionGet::new(
                 1,
@@ -2074,7 +2074,7 @@ mod tests {
                 vec![LogicalType::BigInt],
             )),
         );
-        let delim = LogicalPlan::new(
+        let delim = OwnedLogicalPlan::new(
             &bind_context,
             LogicalOperator::DelimGet(DelimGet::new(9, vec![LogicalType::BigInt])),
         );
@@ -2085,7 +2085,7 @@ mod tests {
             vec![equality(1, 0, 9, 0)],
         );
         join.duplicate_eliminated_columns = vec![column_ref(1, 0)];
-        let plan = LogicalPlan::new(&bind_context, LogicalOperator::Join(Join::Comparison(join)));
+        let plan = OwnedLogicalPlan::new(&bind_context, LogicalOperator::Join(Join::Comparison(join)));
 
         let gathered = StatisticsGathering::new()
             .gather(plan, &mut ctx)
@@ -2108,7 +2108,7 @@ mod tests {
         let bind_context = BindContext::new();
         let session = make_test_session();
         let mut ctx = OptimizationContext::new(session, bind_context.clone());
-        let plan = LogicalPlan::new(&bind_context, LogicalOperator::DummyScan);
+        let plan = OwnedLogicalPlan::new(&bind_context, LogicalOperator::DummyScan);
 
         let gathered = StatisticsGathering::new()
             .gather(plan, &mut ctx)
@@ -2132,7 +2132,7 @@ mod tests {
             vec![equality(1, 0, 2, 0)],
         );
         let mut plan =
-            LogicalPlan::new(&bind_context, LogicalOperator::Join(Join::Comparison(join)));
+            OwnedLogicalPlan::new(&bind_context, LogicalOperator::Join(Join::Comparison(join)));
         plan.stats.estimated_cardinality = Some(CardinalityEstimate::exact(73));
         plan.stats.cardinality_provenance = CardinalityProvenance::JoinGraph;
 
@@ -2166,7 +2166,7 @@ mod tests {
             Vec::new(),
             Vec::new(),
         );
-        let plan = LogicalPlan::new(&bind_context, LogicalOperator::Aggregate(aggregate));
+        let plan = OwnedLogicalPlan::new(&bind_context, LogicalOperator::Aggregate(aggregate));
 
         let gathered = StatisticsGathering::new()
             .gather(plan, &mut ctx)
@@ -2302,7 +2302,7 @@ mod tests {
                 &Value::BigInt(99),
             ))),
         );
-        let child = LogicalPlan::new(
+        let child = OwnedLogicalPlan::new(
             &bind_context,
             LogicalOperator::ExpressionGet(ExpressionGet::new(
                 1,
@@ -2456,7 +2456,7 @@ mod tests {
             Vec::new(),
             Vec::new(),
         );
-        let plan = LogicalPlan::new(&bind_context, LogicalOperator::Aggregate(aggregate));
+        let plan = OwnedLogicalPlan::new(&bind_context, LogicalOperator::Aggregate(aggregate));
 
         let gathered = StatisticsGathering::new()
             .gather(plan, &mut ctx)

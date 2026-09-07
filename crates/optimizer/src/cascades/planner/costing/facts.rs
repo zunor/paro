@@ -6,7 +6,7 @@
 use super::*;
 
 pub(in crate::cascades::planner) fn planner_cost_facts(
-    plan: &LogicalPlan,
+    plan: &OwnedLogicalPlan,
     column_stats: &HashMap<ColumnBinding, Arc<ColumnStatistics>>,
     binding_ids: &BindingCatalog,
     scan_access_cost: paro_storage::rowset::scan_cost::ScanAccessCostModel,
@@ -207,7 +207,7 @@ pub(in crate::cascades::planner) fn planner_cost_facts(
 }
 
 pub(in crate::cascades::planner) fn planner_row_width(
-    plan: &LogicalPlan,
+    plan: &OwnedLogicalPlan,
     scan_access_cost: paro_storage::rowset::scan_cost::ScanAccessCostModel,
 ) -> u64 {
     plan.types()
@@ -434,7 +434,7 @@ fn join_key_domain_column(
 }
 
 pub(super) fn infer_runtime_filter_probe_multiplicity<'a>(
-    plan: &LogicalPlan,
+    plan: &OwnedLogicalPlan,
     equality_expressions: impl IntoIterator<Item = &'a Expression>,
 ) -> RuntimeFilterProbeMultiplicity {
     let equality_expressions = equality_expressions.into_iter().collect::<Vec<_>>();

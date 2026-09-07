@@ -172,8 +172,8 @@ mod tests {
     use paro_planner::expression::ColumnRefExpression;
     use paro_planner::operator::{ComparisonJoin, Get, JoinCondition};
 
-    fn scan(table: usize) -> LogicalPlan {
-        let mut plan = LogicalPlan::synthetic(LogicalOperator::Get(Get::new_without_table(
+    fn scan(table: usize) -> OwnedLogicalPlan {
+        let mut plan = OwnedLogicalPlan::synthetic(LogicalOperator::Get(Get::new_without_table(
             table,
             vec!["k".into()],
             vec![LogicalType::BigInt],
@@ -181,14 +181,14 @@ mod tests {
         plan.stats.estimated_cardinality = Some(CardinalityEstimate::exact(100));
         plan
     }
-    fn join(left: LogicalPlan, right: LogicalPlan, a: usize, b: usize) -> LogicalPlan {
+    fn join(left: OwnedLogicalPlan, right: OwnedLogicalPlan, a: usize, b: usize) -> OwnedLogicalPlan {
         let column = |table| {
             Expression::ColumnRef(ColumnRefExpression::new(
                 ColumnBinding::new(table, 0),
                 LogicalType::BigInt,
             ))
         };
-        LogicalPlan::synthetic(LogicalOperator::Join(Join::Comparison(
+        OwnedLogicalPlan::synthetic(LogicalOperator::Join(Join::Comparison(
             ComparisonJoin::new(
                 JoinType::Inner,
                 left,

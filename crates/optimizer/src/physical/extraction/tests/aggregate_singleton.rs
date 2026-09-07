@@ -17,7 +17,7 @@ use paro_planner::operator::{
     Aggregate, ColumnBinding, ExpressionGet, Get, GroupInputMultiplicity, LogicalOperator,
     SingletonGroupProof,
 };
-use paro_planner::plan::LogicalPlan;
+use paro_planner::plan::OwnedLogicalPlan;
 use paro_storage::table::table_factory::TableFactory;
 
 use super::{ExtractionContext, PhysicalNodeKind, PhysicalPlanExtractor};
@@ -58,7 +58,7 @@ fn stale_singleton_hint_falls_back_to_a_physical_aggregate() {
             .expect("declared key witness");
 
     let ctx = BindContext::new();
-    let child = LogicalPlan::new(
+    let child = OwnedLogicalPlan::new(
         &ctx,
         LogicalOperator::ExpressionGet(ExpressionGet::new(
             0,
@@ -88,7 +88,7 @@ fn stale_singleton_hint_falls_back_to_a_physical_aggregate() {
         Vec::new(),
     );
     aggregate.group_input_multiplicity = GroupInputMultiplicity::AtMostOne(proof);
-    let logical = LogicalPlan::new(&ctx, LogicalOperator::Aggregate(aggregate));
+    let logical = OwnedLogicalPlan::new(&ctx, LogicalOperator::Aggregate(aggregate));
 
     let physical = PhysicalPlanExtractor::new(ExtractionContext::default())
         .extract(&logical)

@@ -17,7 +17,7 @@ use paro_planner::operator::{
     ColumnBinding, ComparisonJoin, Filter, Join, JoinComparisonType, JoinCondition, JoinSide,
     JoinType, LogicalOperator,
 };
-use paro_planner::plan::LogicalPlan;
+use paro_planner::plan::OwnedLogicalPlan;
 
 use crate::expression::traversal::{expression_join_side, into_associative_terms};
 
@@ -30,11 +30,11 @@ impl<'a> JoinPredicateNormalizer<'a> {
         Self { bind_context }
     }
 
-    pub fn optimize_plan(&self, plan: LogicalPlan) -> Result<LogicalPlan> {
+    pub fn optimize_plan(&self, plan: OwnedLogicalPlan) -> Result<OwnedLogicalPlan> {
         plan.try_map_post_order(|plan| Ok(self.normalize_join(self.normalize_cross_product(plan))))
     }
 
-    fn normalize_cross_product(&self, plan: LogicalPlan) -> LogicalPlan {
+    fn normalize_cross_product(&self, plan: OwnedLogicalPlan) -> OwnedLogicalPlan {
         let LogicalOperator::Filter(filter) = &plan.operator else {
             return plan;
         };
@@ -73,7 +73,7 @@ impl<'a> JoinPredicateNormalizer<'a> {
         };
         let (cross_id, cross_stats, cross_operator) = (*filter.child).into_parts();
         let LogicalOperator::Join(Join::Cross(cross)) = cross_operator else {
-            filter.child = Box::new(LogicalPlan {
+            filter.child = Box::new(OwnedLogicalPlan {
                 id: cross_id,
                 stats: cross_stats,
                 operator: cross_operator,
@@ -94,7 +94,7 @@ impl<'a> JoinPredicateNormalizer<'a> {
         }
         if conditions.is_empty() {
             filter.expressions = residuals;
-            filter.child = Box::new(LogicalPlan {
+            filter.child = Box::new(OwnedLogicalPlan {
                 id: cross_id,
                 stats: cross_stats,
                 operator: LogicalOperator::Join(Join::Cross(cross)),
@@ -107,7 +107,7 @@ impl<'a> JoinPredicateNormalizer<'a> {
             LogicalOperator::Join(Join::Comparison(join))
         } else {
             LogicalOperator::Filter(Filter::new(
-                LogicalPlan {
+                OwnedLogicalPlan {
                     id: cross_id,
                     // The equality join has a different cardinality from the cross product it
                     // replaces. Preserve the enclosing filter estimate, but make the new child
@@ -120,7 +120,7 @@ impl<'a> JoinPredicateNormalizer<'a> {
         }
     }
 
-    fn normalize_join(&self, plan: LogicalPlan) -> LogicalPlan {
+    fn normalize_join(&self, plan: OwnedLogicalPlan) -> OwnedLogicalPlan {
         plan.map_operator(|operator| self.normalize_join_operator(operator))
     }
 
@@ -159,7 +159,7 @@ impl<'a> JoinPredicateNormalizer<'a> {
                 ))
             })
             .collect();
-        let join_plan = LogicalPlan {
+        let join_plan = OwnedLogicalPlan {
             id: self.bind_context.next_plan_id(),
             // The original estimate includes the residual predicate. It belongs to the outer
             // filter, not to this less selective hash-join child.
@@ -292,8 +292,8 @@ mod tests {
         Expression::Reference(ReferenceExpression::new(index, LogicalType::Integer))
     }
 
-    fn input(context: &BindContext, table: usize) -> LogicalPlan {
-        LogicalPlan::new(
+    fn input(context: &BindContext, table: usize) -> OwnedLogicalPlan {
+        OwnedLogicalPlan::new(
             context,
             LogicalOperator::ExpressionGet(ExpressionGet::new(
                 table,
@@ -304,12 +304,12 @@ mod tests {
         )
     }
 
-    fn join(context: &BindContext, join_type: JoinType) -> LogicalPlan {
+    fn join(context: &BindContext, join_type: JoinType) -> OwnedLogicalPlan {
         let conditions = vec![
             JoinCondition::new(column(1, 0), column(2, 0), JoinComparisonType::Equal),
             JoinCondition::new(column(1, 1), column(2, 1), JoinComparisonType::NotEqual),
         ];
-        LogicalPlan::new(
+        OwnedLogicalPlan::new(
             context,
             LogicalOperator::Join(Join::Comparison(ComparisonJoin::new(
                 join_type,
@@ -361,7 +361,7 @@ mod tests {
     #[test]
     fn equality_filter_over_cross_product_becomes_hash_join() {
         let context = BindContext::new();
-        let cross = LogicalPlan::new(
+        let cross = OwnedLogicalPlan::new(
             &context,
             LogicalOperator::Join(Join::Cross(CrossProduct {
                 left: Box::new(input(&context, 1)),
@@ -374,7 +374,7 @@ mod tests {
             reference(1),
             reference(2),
         ));
-        let plan = LogicalPlan::new(
+        let plan = OwnedLogicalPlan::new(
             &context,
             LogicalOperator::Filter(Filter::new(cross, vec![equality])),
         );
@@ -395,7 +395,7 @@ mod tests {
     #[test]
     fn binding_equality_filter_over_cross_product_becomes_hash_join() {
         let context = BindContext::new();
-        let cross = LogicalPlan::new(
+        let cross = OwnedLogicalPlan::new(
             &context,
             LogicalOperator::Join(Join::Cross(CrossProduct {
                 left: Box::new(input(&context, 1)),
@@ -408,7 +408,7 @@ mod tests {
             column(1, 1),
             column(2, 0),
         ));
-        let plan = LogicalPlan::new(
+        let plan = OwnedLogicalPlan::new(
             &context,
             LogicalOperator::Filter(Filter::new(cross, vec![equality])),
         );
@@ -428,7 +428,7 @@ mod tests {
     #[test]
     fn cross_product_residual_stays_above_normalized_hash_join() {
         let context = BindContext::new();
-        let cross = LogicalPlan::new(
+        let cross = OwnedLogicalPlan::new(
             &context,
             LogicalOperator::Join(Join::Cross(CrossProduct {
                 left: Box::new(input(&context, 1)),
@@ -446,7 +446,7 @@ mod tests {
             reference(1),
             reference(3),
         ));
-        let plan = LogicalPlan::new(
+        let plan = OwnedLogicalPlan::new(
             &context,
             LogicalOperator::Filter(Filter::new(cross, vec![equality, residual.clone()])),
         );

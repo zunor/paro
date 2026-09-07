@@ -13,11 +13,11 @@ use paro_planner::operator::{
     Aggregate, AnyJoin, ComparisonJoin, Distinct, Filter, Join, JoinSide, LogicalExternalProject,
     LogicalOperator, Order, Projection, TopN, Update, Window,
 };
-use paro_planner::plan::LogicalPlan;
+use paro_planner::plan::OwnedLogicalPlan;
 
 #[derive(Debug)]
 pub struct ExternalRoutineLoweringResult {
-    pub plan: LogicalPlan,
+    pub plan: OwnedLogicalPlan,
     pub changed: bool,
 }
 
@@ -30,7 +30,7 @@ impl ExternalRoutineLoweringPass {
     }
 
     pub fn lower(
-        plan: LogicalPlan,
+        plan: OwnedLogicalPlan,
         bind_context: &BindContext,
     ) -> Result<ExternalRoutineLoweringResult> {
         let mut lowerer = ExternalRoutineLowerer::new(bind_context);
@@ -119,11 +119,11 @@ impl<'a> ExternalRoutineLowerer<'a> {
         }
     }
 
-    fn lower_plan(&mut self, plan: LogicalPlan) -> Result<LogicalPlan> {
+    fn lower_plan(&mut self, plan: OwnedLogicalPlan) -> Result<OwnedLogicalPlan> {
         plan.try_map_post_order(|plan| self.lower_current_plan(plan))
     }
 
-    fn lower_current_plan(&mut self, plan: LogicalPlan) -> Result<LogicalPlan> {
+    fn lower_current_plan(&mut self, plan: OwnedLogicalPlan) -> Result<OwnedLogicalPlan> {
         let (id, stats, operator) = plan.into_parts();
 
         let operator = match operator {
@@ -151,7 +151,7 @@ impl<'a> ExternalRoutineLowerer<'a> {
             other => other,
         };
 
-        Ok(LogicalPlan {
+        Ok(OwnedLogicalPlan {
             id,
             stats,
             operator,
@@ -199,7 +199,7 @@ impl<'a> ExternalRoutineLowerer<'a> {
         let mut native_filter = Filter::new(child, native_predicates);
         native_filter.projection_map = filter.projection_map.clone();
         let native_child =
-            LogicalPlan::new(self.bind_context, LogicalOperator::Filter(native_filter));
+            OwnedLogicalPlan::new(self.bind_context, LogicalOperator::Filter(native_filter));
 
         let lowered_child =
             self.lower_external_in_expression_vec(native_child, &mut residual_predicates)?;
@@ -416,9 +416,9 @@ impl<'a> ExternalRoutineLowerer<'a> {
 
     fn lower_external_in_expression_vec(
         &mut self,
-        mut child: LogicalPlan,
+        mut child: OwnedLogicalPlan,
         expressions: &mut Vec<Expression>,
-    ) -> Result<LogicalPlan> {
+    ) -> Result<OwnedLogicalPlan> {
         loop {
             let layer = self.collect_ready_layer(expressions.iter())?;
             if layer.calls.is_empty() {
@@ -609,10 +609,10 @@ impl<'a> ExternalRoutineLowerer<'a> {
 
     fn wrap_external_layer(
         &mut self,
-        child: LogicalPlan,
+        child: OwnedLogicalPlan,
         calls: Vec<Expression>,
         reused_calls: usize,
-    ) -> Result<(LogicalPlan, Vec<LayerMapping>)> {
+    ) -> Result<(OwnedLogicalPlan, Vec<LayerMapping>)> {
         let project_index = self.bind_context.generate_table_index();
         let child_column_count = child.get_column_bindings().len();
         let expressions = calls
@@ -649,12 +649,12 @@ impl<'a> ExternalRoutineLowerer<'a> {
         self.changed = true;
 
         Ok((
-            LogicalPlan::new(self.bind_context, LogicalOperator::ExternalProject(project)),
+            OwnedLogicalPlan::new(self.bind_context, LogicalOperator::ExternalProject(project)),
             mappings,
         ))
     }
 
-    fn ensure_no_unlowered_external_routines(&self, plan: &LogicalPlan) -> Result<()> {
+    fn ensure_no_unlowered_external_routines(&self, plan: &OwnedLogicalPlan) -> Result<()> {
         plan.try_visit_pre_order(|plan| self.ensure_operator_is_lowered(&plan.operator))
     }
 
@@ -862,7 +862,7 @@ mod tests {
         ComparisonJoin, ExpressionGet, Filter, Join, JoinCondition, JoinType, LogicalOperator,
         Order, Projection,
     };
-    use paro_planner::plan::LogicalPlan;
+    use paro_planner::plan::OwnedLogicalPlan;
 
     use super::{ExternalRoutineLoweringPass, ExternalRoutineLoweringResult};
 
@@ -966,8 +966,8 @@ mod tests {
         expression
     }
 
-    fn expression_get(bind_context: &BindContext, table_index: usize) -> LogicalPlan {
-        LogicalPlan::new(
+    fn expression_get(bind_context: &BindContext, table_index: usize) -> OwnedLogicalPlan {
+        OwnedLogicalPlan::new(
             bind_context,
             LogicalOperator::ExpressionGet(ExpressionGet::new(
                 table_index,
@@ -981,7 +981,7 @@ mod tests {
         )
     }
 
-    fn lower(plan: LogicalPlan, bind_context: &BindContext) -> ExternalRoutineLoweringResult {
+    fn lower(plan: OwnedLogicalPlan, bind_context: &BindContext) -> ExternalRoutineLoweringResult {
         ExternalRoutineLoweringPass::lower(plan, bind_context)
             .expect("late lowering should succeed")
     }
@@ -999,7 +999,7 @@ mod tests {
                 native_binary("+", external.clone(), external, LogicalType::Integer),
             ],
         );
-        let plan = LogicalPlan::new(&bind_context, LogicalOperator::Projection(projection));
+        let plan = OwnedLogicalPlan::new(&bind_context, LogicalOperator::Projection(projection));
 
         let lowered = lower(plan, &bind_context);
         assert!(lowered.changed);
@@ -1027,7 +1027,7 @@ mod tests {
         let external =
             volatile_external_call("py_next", vec![int_column(1, 0)], LogicalType::Integer);
         let projection = Projection::new(2, child, vec![external.clone(), external]);
-        let plan = LogicalPlan::new(&bind_context, LogicalOperator::Projection(projection));
+        let plan = OwnedLogicalPlan::new(&bind_context, LogicalOperator::Projection(projection));
 
         let lowered = lower(plan, &bind_context);
         let LogicalOperator::Projection(projection) = &lowered.plan.operator else {
@@ -1064,7 +1064,7 @@ mod tests {
             bool_constant(true),
         ));
         let filter = Filter::new(child, vec![native_predicate, external_predicate]);
-        let plan = LogicalPlan::new(&bind_context, LogicalOperator::Filter(filter));
+        let plan = OwnedLogicalPlan::new(&bind_context, LogicalOperator::Filter(filter));
 
         let lowered = lower(plan, &bind_context);
         let LogicalOperator::Filter(outer) = &lowered.plan.operator else {
@@ -1101,7 +1101,7 @@ mod tests {
                 nulls_first: false,
             }],
         );
-        let plan = LogicalPlan::new(&bind_context, LogicalOperator::Order(order));
+        let plan = OwnedLogicalPlan::new(&bind_context, LogicalOperator::Order(order));
 
         let lowered = lower(plan, &bind_context);
         let LogicalOperator::Order(order) = &lowered.plan.operator else {
@@ -1131,7 +1131,7 @@ mod tests {
                 int_column(2, 0),
             )],
         );
-        let plan = LogicalPlan::new(&bind_context, LogicalOperator::Join(Join::Comparison(join)));
+        let plan = OwnedLogicalPlan::new(&bind_context, LogicalOperator::Join(Join::Comparison(join)));
 
         let lowered = lower(plan, &bind_context);
         let LogicalOperator::Join(Join::Comparison(join)) = &lowered.plan.operator else {
@@ -1155,7 +1155,7 @@ mod tests {
             LogicalType::Boolean,
         );
         let join = Join::any(JoinType::Inner, left, right, condition);
-        let plan = LogicalPlan::new(&bind_context, LogicalOperator::Join(join));
+        let plan = OwnedLogicalPlan::new(&bind_context, LogicalOperator::Join(join));
 
         let error = ExternalRoutineLoweringPass::lower(plan, &bind_context)
             .expect_err("cross-side call must fail");

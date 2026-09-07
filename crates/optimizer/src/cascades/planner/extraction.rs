@@ -14,14 +14,14 @@ type WinnerContractMap =
 type WinnerEnforcerMap =
     std::collections::HashMap<paro_planner::plan::PlanNodeId, Box<[ExtractedEnforcerContract]>>;
 pub(super) struct ExtractedWinnerTree {
-    plan: LogicalPlan,
+    plan: OwnedLogicalPlan,
     contracts: WinnerContractMap,
     enforcers: WinnerEnforcerMap,
     output_columns: Box<[ColumnId]>,
 }
 
 pub(super) struct PresentedWinnerTree {
-    pub(super) plan: LogicalPlan,
+    pub(super) plan: OwnedLogicalPlan,
     pub(super) contracts: WinnerContractMap,
     pub(super) enforcers: WinnerEnforcerMap,
     pub(super) physical_fingerprint: Fingerprint,
@@ -385,7 +385,7 @@ pub(super) fn extract_planner_tree(
 /// physical lowering cannot publish contradictory cardinalities for nodes
 /// that provably emit the same row domain.
 fn anchor_output_cardinality(
-    plan: &mut LogicalPlan,
+    plan: &mut OwnedLogicalPlan,
     estimate: Option<paro_planner::plan::CardinalityEstimate>,
 ) {
     plan.stats.estimated_cardinality = estimate;
@@ -414,7 +414,7 @@ fn anchor_output_cardinality(
 }
 
 pub(super) fn extract_physical_enforcer(
-    child: &LogicalPlan,
+    child: &OwnedLogicalPlan,
     enforcer: &crate::cascades::enforcer::EnforcerStep,
     output_columns: &[ColumnId],
     required: &RequiredProperties,
@@ -573,7 +573,7 @@ pub(super) fn enforce_result_presentation(
     let projection =
         LogicalProjection::new(bind_context.generate_table_index(), child, expressions)
             .with_visible_names(presentation.names.to_vec());
-    let mut plan = LogicalPlan::new(bind_context, LogicalOperator::Projection(projection));
+    let mut plan = OwnedLogicalPlan::new(bind_context, LogicalOperator::Projection(projection));
     if let Some(child_stats) = plan.children().first().map(|child| child.stats.clone()) {
         plan.stats.inherit_cardinality_from(&child_stats);
     }

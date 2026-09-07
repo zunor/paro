@@ -2,7 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use crate::expression::Expression;
-use crate::plan::LogicalPlan;
+use crate::plan::OwnedLogicalPlan;
 use paro_common::types::LogicalType;
 use paro_external::routine::bound::BoundRoutineCallMeta;
 
@@ -21,11 +21,11 @@ pub struct ExternalProjectExpression {
     pub routine_meta: BoundRoutineCallMeta,
 }
 
-#[derive(Debug)]
-pub struct LogicalExternalProject {
+#[derive(Debug, Clone)]
+pub struct LogicalExternalProject<Child = Box<OwnedLogicalPlan>> {
     pub project_index: usize,
     pub expressions: Vec<ExternalProjectExpression>,
-    pub child: Box<LogicalPlan>,
+    pub child: Child,
     pub output_names: Vec<String>,
     pub returned_types: Vec<LogicalType>,
     pub cost: ExternalCostEstimate,
@@ -34,7 +34,7 @@ pub struct LogicalExternalProject {
 impl LogicalExternalProject {
     pub fn new(
         project_index: usize,
-        child: LogicalPlan,
+        child: OwnedLogicalPlan,
         expressions: Vec<ExternalProjectExpression>,
     ) -> Self {
         let mut output_names = child.output_names();

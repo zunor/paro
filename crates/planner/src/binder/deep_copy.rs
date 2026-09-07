@@ -22,12 +22,12 @@ use crate::operator::{
     SearchScan as SearchScanNode, SetOperation as SetOpNode, TableFunctionGet as TblFnGetNode,
     TopN as TopNNode, Update as UpdNode, Window as WinNode,
 };
-use crate::plan::{LogicalPlan, NodeStats, PlannedStatement};
+use crate::plan::{NodeStats, OwnedLogicalPlan, PlannedStatement};
 use crate::visitor::LogicalOperatorVisitor;
 
 /// Deep-copy a logical plan root while remapping all logical indices owned by
 /// the embedded operator tree and clearing statistics on the copy.
-pub fn deep_copy_plan(plan: &LogicalPlan, bind_shared: &BindShared) -> LogicalPlan {
+pub fn deep_copy_plan(plan: &OwnedLogicalPlan, bind_shared: &BindShared) -> OwnedLogicalPlan {
     let mut copier = LogicalPlanDeepCopy::new_deep();
     copier.deep_copy(bind_shared, plan)
 }
@@ -42,14 +42,14 @@ pub fn deep_copy_plan(plan: &LogicalPlan, bind_shared: &BindShared) -> LogicalPl
 /// summaries are then used only when that estimator cannot resolve an external
 /// owner locally.
 pub fn deep_copy_plan_preserving_statistics(
-    plan: &LogicalPlan,
+    plan: &OwnedLogicalPlan,
     bind_shared: &BindShared,
-) -> LogicalPlan {
+) -> OwnedLogicalPlan {
     let mut copier = LogicalPlanDeepCopy::new_deep_preserving_statistics();
     copier.deep_copy(bind_shared, plan)
 }
 
-/// Deep-copy an operator tree (no outer [`LogicalPlan`] wrapper). Nested [`LogicalPlan`] nodes
+/// Deep-copy an operator tree (no outer [`OwnedLogicalPlan`] wrapper). Nested [`OwnedLogicalPlan`] nodes
 /// receive fresh plan ids; table / CTE indices are remapped like [`deep_copy_plan`].
 pub fn deep_copy_operator(op: &LogicalOperator, bind_shared: &BindShared) -> LogicalOperator {
     let mut copier = LogicalPlanDeepCopy::new_deep();
@@ -57,9 +57,9 @@ pub fn deep_copy_operator(op: &LogicalOperator, bind_shared: &BindShared) -> Log
 }
 
 pub(crate) fn deep_copy_plan_shallow_subqueries(
-    plan: &LogicalPlan,
+    plan: &OwnedLogicalPlan,
     bind_shared: &BindShared,
-) -> LogicalPlan {
+) -> OwnedLogicalPlan {
     let mut copier = LogicalPlanDeepCopy::new_shallow_subqueries();
     copier.deep_copy(bind_shared, plan)
 }
@@ -75,9 +75,9 @@ pub(crate) fn deep_copy_operator_shallow_subqueries(
 /// Deep structural duplicate of a plan while keeping table / CTE indices and expression bindings
 /// aligned with the original tree (optimizer snapshots, join-order extraction).
 pub fn duplicate_plan_preserving_indices(
-    plan: &LogicalPlan,
+    plan: &OwnedLogicalPlan,
     bind_shared: &BindShared,
-) -> LogicalPlan {
+) -> OwnedLogicalPlan {
     let mut copier = LogicalPlanDeepCopy::new_preserve_indices();
     copier.duplicate_plan_preserve(bind_shared, plan)
 }
@@ -91,16 +91,16 @@ pub fn duplicate_plan_preserving_indices(
 /// tree: decorrelation can make otherwise modest SQL plans deep enough that a
 /// recursive `LogicalOperator` copy exhausts an executor thread's stack.
 pub fn fork_plan_preserving_indices(
-    plan: LogicalPlan,
+    plan: OwnedLogicalPlan,
     bind_shared: &BindShared,
-) -> Result<(LogicalPlan, LogicalPlan)> {
+) -> Result<(OwnedLogicalPlan, OwnedLogicalPlan)> {
     let mut copier = LogicalPlanDeepCopy::new_preserve_indices();
     let (original, duplicate) = plan.try_fold_post_order(|plan, duplicate_children| {
         let duplicate_stats = plan.stats.clone();
         let mut original_children = Vec::new();
         let skeleton = plan.try_rebuild_children_preserving_stats(|child| {
             original_children.push(child);
-            Ok(LogicalPlan::synthetic(LogicalOperator::DummyScan))
+            Ok(OwnedLogicalPlan::synthetic(LogicalOperator::DummyScan))
         })?;
 
         // `skeleton` has at most one level of dummy children, so the legacy
@@ -120,7 +120,7 @@ pub fn fork_plan_preserving_indices(
             ));
         }
 
-        let mut duplicate = LogicalPlan {
+        let mut duplicate = OwnedLogicalPlan {
             id: bind_shared.next_plan_id(),
             stats: duplicate_stats,
             operator: duplicate_operator,
@@ -212,19 +212,19 @@ impl LogicalPlanDeepCopy {
     fn duplicate_plan_preserve(
         &mut self,
         bind_shared: &BindShared,
-        plan: &LogicalPlan,
-    ) -> LogicalPlan {
+        plan: &OwnedLogicalPlan,
+    ) -> OwnedLogicalPlan {
         self.table_index_map.clear();
         self.cte_index_map.clear();
         let operator = self.copy_operator(&plan.operator, bind_shared);
-        LogicalPlan {
+        OwnedLogicalPlan {
             id: bind_shared.next_plan_id(),
             stats: plan.stats.clone(),
             operator,
         }
     }
 
-    fn deep_copy(&mut self, bind_shared: &BindShared, plan: &LogicalPlan) -> LogicalPlan {
+    fn deep_copy(&mut self, bind_shared: &BindShared, plan: &OwnedLogicalPlan) -> OwnedLogicalPlan {
         self.table_index_map.clear();
         self.cte_index_map.clear();
         let mut out = self.copy_plan(plan, bind_shared);
@@ -254,9 +254,9 @@ impl LogicalPlanDeepCopy {
         out
     }
 
-    fn copy_plan(&mut self, plan: &LogicalPlan, bind_shared: &BindShared) -> LogicalPlan {
+    fn copy_plan(&mut self, plan: &OwnedLogicalPlan, bind_shared: &BindShared) -> OwnedLogicalPlan {
         let operator = self.copy_operator(&plan.operator, bind_shared);
-        LogicalPlan {
+        OwnedLogicalPlan {
             id: bind_shared.next_plan_id(),
             stats: if self.preserve_statistics {
                 plan.stats.clone()
@@ -960,7 +960,7 @@ mod tests {
         Aggregate, CTERef, ColumnBinding, ExpressionGet, Filter, LogicalOperator, MaterializedCTE,
         PostAggregateReduction, Projection, Window,
     };
-    use crate::plan::{CardinalityEstimate, LogicalPlan, NodeStats, PlanNodeId};
+    use crate::plan::{CardinalityEstimate, NodeStats, OwnedLogicalPlan, PlanNodeId};
     use paro_function::aggregate::distributive::count::get_count_star_function;
     use paro_function::aggregate::distributive::minmax::{get_max_function, get_min_function};
 
@@ -976,7 +976,7 @@ mod tests {
     #[test]
     fn deep_copy_plan_rebinds_table_indices_and_clears_stats() {
         let bind_context = BindContext::new();
-        let original = LogicalPlan {
+        let original = OwnedLogicalPlan {
             id: PlanNodeId(99),
             stats: NodeStats {
                 estimated_cardinality: Some(CardinalityEstimate::exact(123)),
@@ -985,7 +985,7 @@ mod tests {
             operator: LogicalOperator::Projection(
                 Projection::new(
                     11,
-                    LogicalPlan::new(&bind_context, expression_get(7)),
+                    OwnedLogicalPlan::new(&bind_context, expression_get(7)),
                     vec![Expression::ColumnRef(ColumnRefExpression::new(
                         crate::operator::ColumnBinding::new(7, 0),
                         LogicalType::Integer,
@@ -1020,7 +1020,7 @@ mod tests {
     #[test]
     fn statistics_preserving_copy_rebinds_indices_without_dropping_cardinality() {
         let bind_context = BindContext::new();
-        let original = LogicalPlan {
+        let original = OwnedLogicalPlan {
             id: PlanNodeId(99),
             stats: NodeStats {
                 estimated_cardinality: Some(CardinalityEstimate::exact(123)),
@@ -1028,7 +1028,7 @@ mod tests {
             },
             operator: LogicalOperator::Projection(Projection::new(
                 11,
-                LogicalPlan::new(&bind_context, expression_get(7)),
+                OwnedLogicalPlan::new(&bind_context, expression_get(7)),
                 vec![Expression::ColumnRef(ColumnRefExpression::new(
                     crate::operator::ColumnBinding::new(7, 0),
                     LogicalType::Integer,
@@ -1053,9 +1053,9 @@ mod tests {
     #[test]
     fn optimizer_plan_fork_uses_a_bounded_native_stack() {
         let bind_context = BindContext::new();
-        let mut plan = LogicalPlan::new(&bind_context, expression_get(7));
+        let mut plan = OwnedLogicalPlan::new(&bind_context, expression_get(7));
         for _ in 0..128 {
-            plan = LogicalPlan::new(
+            plan = OwnedLogicalPlan::new(
                 &bind_context,
                 LogicalOperator::Filter(Filter::new(plan, Vec::new())),
             );
@@ -1090,7 +1090,7 @@ mod tests {
     #[test]
     fn deep_copy_plan_rewrites_internal_cte_refs() {
         let bind_context = BindContext::new();
-        let original = LogicalPlan {
+        let original = OwnedLogicalPlan {
             id: PlanNodeId(7),
             stats: NodeStats::default(),
             operator: LogicalOperator::MaterializedCTE(MaterializedCTE::new(
@@ -1099,8 +1099,8 @@ mod tests {
                 vec!["v".to_string()],
                 vec![LogicalType::Integer],
                 CTEMaterialize::Default,
-                LogicalPlan::new(&bind_context, expression_get(1)),
-                LogicalPlan::new(
+                OwnedLogicalPlan::new(&bind_context, expression_get(1)),
+                OwnedLogicalPlan::new(
                     &bind_context,
                     LogicalOperator::CTERef(CTERef::new(
                         4,
@@ -1141,7 +1141,7 @@ mod tests {
             ))],
             LogicalType::Integer,
         );
-        let original = LogicalPlan::new(
+        let original = OwnedLogicalPlan::new(
             &bind_context,
             LogicalOperator::Window(Window::new(
                 8,
@@ -1154,7 +1154,7 @@ mod tests {
                     vec![],
                     WindowFrame::default(),
                 )],
-                LogicalPlan::new(&bind_context, expression_get(7)),
+                OwnedLogicalPlan::new(&bind_context, expression_get(7)),
             )),
         );
 
@@ -1186,9 +1186,9 @@ mod tests {
     #[test]
     fn duplicate_plan_preserving_indices_keeps_nested_statistics() {
         let bind_context = BindContext::new();
-        let mut child = LogicalPlan::new(&bind_context, expression_get(7));
+        let mut child = OwnedLogicalPlan::new(&bind_context, expression_get(7));
         child.stats.estimated_cardinality = Some(CardinalityEstimate::exact(456));
-        let original = LogicalPlan {
+        let original = OwnedLogicalPlan {
             id: PlanNodeId(99),
             stats: NodeStats {
                 estimated_cardinality: Some(CardinalityEstimate::exact(123)),
@@ -1255,7 +1255,7 @@ mod tests {
             11,
             12,
             13,
-            LogicalPlan::new(&bind_context, expression_get(7)),
+            OwnedLogicalPlan::new(&bind_context, expression_get(7)),
             vec![Expression::ColumnRef(ColumnRefExpression::new(
                 ColumnBinding::new(7, 0),
                 LogicalType::Integer,
@@ -1273,7 +1273,7 @@ mod tests {
             ))],
             predicate,
         });
-        let original = LogicalPlan::new(&bind_context, LogicalOperator::Aggregate(aggregate));
+        let original = OwnedLogicalPlan::new(&bind_context, LogicalOperator::Aggregate(aggregate));
 
         let copy = deep_copy_plan(&original, bind_context.shared().as_ref());
         let LogicalOperator::Aggregate(copy) = &copy.operator else {

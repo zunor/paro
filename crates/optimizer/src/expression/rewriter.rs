@@ -7,7 +7,7 @@ use std::ops::ControlFlow;
 
 use paro_planner::expression::{Expression, ExpressionIterator};
 use paro_planner::operator::LogicalOperator;
-use paro_planner::plan::LogicalPlan;
+use paro_planner::plan::OwnedLogicalPlan;
 use paro_planner::visitor::enumerate_expressions;
 
 use crate::rules::rule::{Rule, RuleResult};
@@ -33,7 +33,7 @@ impl ExpressionRewriter {
     }
 
     /// Rewrite every operator/expression in a logical plan.
-    pub fn rewrite_plan(&mut self, plan: &mut LogicalPlan) {
+    pub fn rewrite_plan(&mut self, plan: &mut OwnedLogicalPlan) {
         self.visit_logical_plan(plan);
     }
 
@@ -46,7 +46,7 @@ impl ExpressionRewriter {
         self.visit_operator_expressions(op);
     }
 
-    fn visit_logical_plan(&mut self, plan: &mut LogicalPlan) {
+    fn visit_logical_plan(&mut self, plan: &mut OwnedLogicalPlan) {
         self.visit_operator(&mut plan.operator);
     }
 
@@ -417,7 +417,7 @@ mod tests {
         ));
 
         let mut op = LogicalOperator::Filter(Filter::new(
-            LogicalPlan::synthetic(LogicalOperator::DummyScan),
+            OwnedLogicalPlan::synthetic(LogicalOperator::DummyScan),
             vec![condition],
         ));
 
@@ -445,7 +445,7 @@ mod tests {
         // Create projection with expressions: [98, 99]
         let mut op = LogicalOperator::Projection(Projection::new(
             0,
-            LogicalPlan::synthetic(LogicalOperator::DummyScan),
+            OwnedLogicalPlan::synthetic(LogicalOperator::DummyScan),
             vec![make_constant(98), make_constant(99)],
         ));
 
@@ -496,13 +496,13 @@ mod tests {
         let mut rewriter = ExpressionRewriter::new();
         rewriter.add_rule(Box::new(IncrementSmallConstantRule::new()));
 
-        let values = LogicalPlan::synthetic(LogicalOperator::ExpressionGet(ExpressionGet::new(
+        let values = OwnedLogicalPlan::synthetic(LogicalOperator::ExpressionGet(ExpressionGet::new(
             0,
             vec![vec![make_constant(97)]],
             vec!["col0".to_string()],
             vec![LogicalType::Integer],
         )));
-        let distinct = LogicalPlan::synthetic(LogicalOperator::Distinct(Distinct::distinct_on(
+        let distinct = OwnedLogicalPlan::synthetic(LogicalOperator::Distinct(Distinct::distinct_on(
             vec![make_constant(98)],
             values,
         )));

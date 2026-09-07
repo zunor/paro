@@ -6,7 +6,7 @@ use super::*;
 #[test]
 fn arena_extractor_names_hidden_order_columns() {
     let ctx = BindContext::new();
-    let values = LogicalPlan::new(
+    let values = OwnedLogicalPlan::new(
         &ctx,
         LogicalOperator::ExpressionGet(ExpressionGet::new(
             0,
@@ -19,13 +19,13 @@ fn arena_extractor_names_hidden_order_columns() {
         Expression::Reference(ReferenceExpression::new(0, LogicalType::Integer)),
         Expression::Reference(ReferenceExpression::new(1, LogicalType::Integer)),
     ];
-    let project = LogicalPlan::new(
+    let project = OwnedLogicalPlan::new(
         &ctx,
         LogicalOperator::Projection(
             Projection::new(1, values, exprs).with_visible_names(vec!["a".into()]),
         ),
     );
-    let order = LogicalPlan::new(
+    let order = OwnedLogicalPlan::new(
         &ctx,
         LogicalOperator::Order(Order::new(
             project,
@@ -62,7 +62,7 @@ fn arena_extractor_names_hidden_order_columns() {
 #[test]
 fn arena_extractor_names_hidden_window_child_columns() {
     let ctx = BindContext::new();
-    let values = LogicalPlan::new(
+    let values = OwnedLogicalPlan::new(
         &ctx,
         LogicalOperator::ExpressionGet(ExpressionGet::new(
             0,
@@ -84,14 +84,14 @@ fn arena_extractor_names_hidden_window_child_columns() {
         Expression::Reference(ReferenceExpression::new(1, LogicalType::Integer)),
         Expression::Reference(ReferenceExpression::new(2, LogicalType::Integer)),
     ];
-    let project = LogicalPlan::new(
+    let project = OwnedLogicalPlan::new(
         &ctx,
         LogicalOperator::Projection(
             Projection::new(1, values, exprs).with_visible_names(vec!["visible".into()]),
         ),
     );
     let row_number = WindowFunction::row_number();
-    let window = LogicalPlan::new(
+    let window = OwnedLogicalPlan::new(
         &ctx,
         LogicalOperator::Window(LogicalWindow::new(
             2,
@@ -127,7 +127,7 @@ fn arena_extractor_names_hidden_window_child_columns() {
 #[test]
 fn whole_partition_aggregate_window_lowers_to_sort_free_breaker() {
     let ctx = BindContext::new();
-    let values = LogicalPlan::new(
+    let values = OwnedLogicalPlan::new(
         &ctx,
         LogicalOperator::ExpressionGet(ExpressionGet::new(
             0,
@@ -149,7 +149,7 @@ fn whole_partition_aggregate_window_lowers_to_sort_free_breaker() {
         ))],
         return_type,
     );
-    let window = LogicalPlan::new(
+    let window = OwnedLogicalPlan::new(
         &ctx,
         LogicalOperator::Window(LogicalWindow::new(
             2,
@@ -182,7 +182,7 @@ fn whole_partition_aggregate_window_lowers_to_sort_free_breaker() {
 #[test]
 fn composite_varlen_partition_keys_lower_to_sort_free_breaker() {
     let ctx = BindContext::new();
-    let values = LogicalPlan::new(
+    let values = OwnedLogicalPlan::new(
         &ctx,
         LogicalOperator::ExpressionGet(ExpressionGet::new(
             0,
@@ -207,7 +207,7 @@ fn composite_varlen_partition_keys_lower_to_sort_free_breaker() {
         ))],
         return_type,
     );
-    let window = LogicalPlan::new(
+    let window = OwnedLogicalPlan::new(
         &ctx,
         LogicalOperator::Window(LogicalWindow::new(
             3,
@@ -245,7 +245,7 @@ fn composite_varlen_partition_keys_lower_to_sort_free_breaker() {
 #[test]
 fn bigint_partition_key_lowers_to_typed_sort_free_breaker() {
     let ctx = BindContext::new();
-    let values = LogicalPlan::new(
+    let values = OwnedLogicalPlan::new(
         &ctx,
         LogicalOperator::ExpressionGet(ExpressionGet::new(
             0,
@@ -256,7 +256,7 @@ fn bigint_partition_key_lowers_to_typed_sort_free_breaker() {
     );
     let aggregate =
         AggregateExpression::new(get_count_star_function(), Vec::new(), LogicalType::BigInt);
-    let window = LogicalPlan::new(
+    let window = OwnedLogicalPlan::new(
         &ctx,
         LogicalOperator::Window(LogicalWindow::new(
             2,
@@ -286,7 +286,7 @@ fn bigint_partition_key_lowers_to_typed_sort_free_breaker() {
 #[test]
 fn ordered_full_partition_aggregate_keeps_the_semantic_window_fallback() {
     let ctx = BindContext::new();
-    let values = LogicalPlan::new(
+    let values = OwnedLogicalPlan::new(
         &ctx,
         LogicalOperator::ExpressionGet(ExpressionGet::new(
             0,
@@ -306,7 +306,7 @@ fn ordered_full_partition_aggregate_keeps_the_semantic_window_fallback() {
         ))],
         LogicalType::BigInt,
     );
-    let window = LogicalPlan::new(
+    let window = OwnedLogicalPlan::new(
         &ctx,
         LogicalOperator::Window(LogicalWindow::new(
             2,
@@ -349,12 +349,12 @@ fn ordered_full_partition_aggregate_keeps_the_semantic_window_fallback() {
 fn arena_extractor_lowers_row_literal_union_all_to_values() {
     let ctx = BindContext::new();
     let row = |value| {
-        LogicalPlan::new(
+        OwnedLogicalPlan::new(
             &ctx,
             LogicalOperator::Projection(
                 Projection::new(
                     1,
-                    LogicalPlan::dummy_scan(&ctx),
+                    OwnedLogicalPlan::dummy_scan(&ctx),
                     vec![Expression::Constant(ConstantExpression::new(
                         Value::Integer(value),
                         LogicalType::Integer,
@@ -364,7 +364,7 @@ fn arena_extractor_lowers_row_literal_union_all_to_values() {
             ),
         )
     };
-    let union = LogicalPlan::new(
+    let union = OwnedLogicalPlan::new(
         &ctx,
         LogicalOperator::SetOperation(SetOperation::union(
             2,

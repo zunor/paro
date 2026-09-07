@@ -367,7 +367,7 @@ impl PhysicalPlanExtractor {
     pub(crate) fn lower_search_scan(
         &mut self,
         scan: &LogicalSearchScan,
-        logical: &LogicalPlan,
+        logical: &OwnedLogicalPlan,
     ) -> Result<(PhysicalNodeKind, Vec<PhysicalPlanNodeId>)> {
         let table =
             scan.get.get_table().cloned().ok_or_else(|| {

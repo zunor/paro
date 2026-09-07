@@ -14,7 +14,7 @@ pub(super) struct StagedEquivalent {
 }
 
 pub(super) struct StagingRequest {
-    pub(super) plan: LogicalPlan,
+    pub(super) plan: OwnedLogicalPlan,
     pub(super) column_stats: SharedColumnStatistics,
     pub(super) target: StagingTarget,
     pub(super) regions: StagingRegionRequirements,
@@ -87,7 +87,7 @@ pub(super) fn stage_transformed_expression(
     }
 
     struct NodeStagingRequest {
-        plan: LogicalPlan,
+        plan: OwnedLogicalPlan,
         target: Option<GroupId>,
         required_region_facet: Option<Fingerprint>,
         inherited_runtime_filter_facet: Option<Fingerprint>,
@@ -128,7 +128,7 @@ pub(super) fn stage_transformed_expression(
     fn stage_node(
         session: &mut StagingSession<'_>,
         request: NodeStagingRequest,
-    ) -> Result<Option<(LogicalPlan, NodeState, Option<StagedEquivalent>)>> {
+    ) -> Result<Option<(OwnedLogicalPlan, NodeState, Option<StagedEquivalent>)>> {
         let NodeStagingRequest {
             plan,
             target,
@@ -203,7 +203,7 @@ pub(super) fn stage_transformed_expression(
         let mut detached = Vec::new();
         let skeleton = plan.try_map_children(|child| {
             detached.push(child);
-            Ok(LogicalPlan::synthetic(LogicalOperator::DummyScan))
+            Ok(OwnedLogicalPlan::synthetic(LogicalOperator::DummyScan))
         })?;
         // The payload recipe owns only this operator shell. Capturing it
         // before children are reattached avoids duplicating the entire
@@ -940,7 +940,7 @@ mod tests {
 
     use super::*;
 
-    fn test_base_get(table_index: usize, object_id: u64, name: &str, rows: u64) -> LogicalPlan {
+    fn test_base_get(table_index: usize, object_id: u64, name: &str, rows: u64) -> OwnedLogicalPlan {
         let storage = Arc::new(
             TableFactory::default()
                 .create_table(&[LogicalType::Integer])
@@ -958,7 +958,7 @@ mod tests {
             CatalogObjectId::from_raw(object_id),
             0,
         ));
-        let mut plan = LogicalPlan::synthetic(LogicalOperator::Get(Get::new(
+        let mut plan = OwnedLogicalPlan::synthetic(LogicalOperator::Get(Get::new(
             table_index,
             vec!["id".to_string()],
             vec![LogicalType::Integer],
@@ -968,12 +968,12 @@ mod tests {
         plan
     }
 
-    fn equality_join(left: LogicalPlan, right: LogicalPlan, rows: u64) -> LogicalPlan {
+    fn equality_join(left: OwnedLogicalPlan, right: OwnedLogicalPlan, rows: u64) -> OwnedLogicalPlan {
         let condition = JoinCondition::equality(
             Expression::Reference(ReferenceExpression::new(0, LogicalType::Integer)),
             Expression::Reference(ReferenceExpression::new(0, LogicalType::Integer)),
         );
-        let mut plan = LogicalPlan::synthetic(LogicalOperator::Join(Join::Comparison(
+        let mut plan = OwnedLogicalPlan::synthetic(LogicalOperator::Join(Join::Comparison(
             ComparisonJoin::new(JoinType::Inner, left, right, vec![condition]),
         )));
         plan.stats.estimated_cardinality = Some(CardinalityEstimate::exact(rows));
@@ -986,7 +986,7 @@ mod tests {
         use paro_planner::operator::{Projection, SetOperation};
         let source = || test_base_get(0, 30_099, "shared_source", 100);
         let union = |left, right| {
-            LogicalPlan::synthetic(LogicalOperator::SetOperation(SetOperation::union(
+            OwnedLogicalPlan::synthetic(LogicalOperator::SetOperation(SetOperation::union(
                 10,
                 left,
                 right,
@@ -1001,7 +1001,7 @@ mod tests {
         )
         .unwrap();
         let project = |table| {
-            LogicalPlan::synthetic(LogicalOperator::Projection(Projection::new(
+            OwnedLogicalPlan::synthetic(LogicalOperator::Projection(Projection::new(
                 table,
                 source(),
                 vec![Expression::ColumnRef(ColumnRefExpression::new(
@@ -1048,7 +1048,7 @@ mod tests {
     #[test]
     fn root_key_collision_in_another_context_declines_and_rolls_back() {
         let bind_context = BindContext::new();
-        let plan = LogicalPlan::new(
+        let plan = OwnedLogicalPlan::new(
             &bind_context,
             LogicalOperator::ExpressionGet(ExpressionGet::new(
                 0,

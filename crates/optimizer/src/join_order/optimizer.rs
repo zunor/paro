@@ -23,7 +23,7 @@ use paro_planner::operator::{
     ColumnBinding, ComparisonJoin, CrossProduct, Filter, Join, JoinComparisonType, JoinCondition,
     JoinType, LogicalOperator,
 };
-use paro_planner::plan::{CardinalityEstimate, CardinalityProvenance, LogicalPlan};
+use paro_planner::plan::{CardinalityEstimate, CardinalityProvenance, OwnedLogicalPlan};
 use paro_storage::statistics::{ColumnStatistics, NumericStats};
 use tracing::debug;
 
@@ -128,7 +128,7 @@ pub struct JoinOrderOptimizer {
     /// Output-column statistics gathered earlier in the pipeline.
     column_stats: HashMap<ColumnBinding, Arc<ColumnStatistics>>,
     /// Original base-relation subplans keyed by relation id for reconstruction.
-    relation_plans: Vec<LogicalPlan>,
+    relation_plans: Vec<OwnedLogicalPlan>,
     exact_relation_limit: usize,
     max_pairs: usize,
     max_frontier_size: usize,
@@ -172,20 +172,20 @@ impl JoinOrderOptimizer {
     ) -> Result<LogicalOperator> {
         self.optimize_plan(
             ctx,
-            LogicalPlan::synthetic(plan),
+            OwnedLogicalPlan::synthetic(plan),
             &HashMap::new(),
             bind_context,
         )
-        .map(LogicalPlan::into_operator)
+        .map(OwnedLogicalPlan::into_operator)
     }
 
     pub fn optimize_plan(
         &mut self,
         ctx: &StatementContext,
-        plan: LogicalPlan,
+        plan: OwnedLogicalPlan,
         column_stats: &HashMap<ColumnBinding, Arc<ColumnStatistics>>,
         bind_context: &BindContext,
-    ) -> Result<LogicalPlan> {
+    ) -> Result<OwnedLogicalPlan> {
         self.column_stats = column_stats.clone();
         // Join costing needs the semantic live-column set, not the canonical
         // `ProjectionMap::all()` payload retained by Memo identities. This
@@ -204,10 +204,10 @@ impl JoinOrderOptimizer {
     pub fn enumerate_region(
         &mut self,
         ctx: &StatementContext,
-        plan: LogicalPlan,
+        plan: OwnedLogicalPlan,
         column_stats: &HashMap<ColumnBinding, Arc<ColumnStatistics>>,
         bind_context: &BindContext,
-    ) -> Result<Vec<LogicalPlan>> {
+    ) -> Result<Vec<OwnedLogicalPlan>> {
         self.column_stats = column_stats.clone();
         let plan = ColumnLifetimeAnalyzer::for_join_enumeration().optimize(plan)?;
         if !self.can_optimize_join(&plan.operator) {
@@ -228,8 +228,8 @@ impl JoinOrderOptimizer {
         &mut self,
         ctx: &StatementContext,
         bind_context: &BindContext,
-        plan: LogicalPlan,
-    ) -> Result<LogicalPlan> {
+        plan: OwnedLogicalPlan,
+    ) -> Result<OwnedLogicalPlan> {
         if self.can_optimize_join(&plan.operator) {
             if let Some(mut optimized) = self
                 .optimize_join_tree(
@@ -271,8 +271,8 @@ impl JoinOrderOptimizer {
         &mut self,
         ctx: &StatementContext,
         bind_context: &BindContext,
-        plan: LogicalPlan,
-    ) -> Result<Vec<LogicalPlan>> {
+        plan: OwnedLogicalPlan,
+    ) -> Result<Vec<OwnedLogicalPlan>> {
         // Reset state
         self.relation_manager = RelationManager::new();
         self.set_manager = JoinRelationSetManager::new();
@@ -543,7 +543,7 @@ impl JoinOrderOptimizer {
         &mut self,
         ctx: &StatementContext,
         bind_context: &BindContext,
-        plan: &LogicalPlan,
+        plan: &OwnedLogicalPlan,
         filters: &mut Vec<ExtractedFilter>,
         at_region_root: bool,
     ) -> Result<()> {
@@ -696,7 +696,7 @@ impl JoinOrderOptimizer {
         &mut self,
         ctx: &StatementContext,
         bind_context: &BindContext,
-        plan: &LogicalPlan,
+        plan: &OwnedLogicalPlan,
     ) {
         let cardinality = crate::join::build_probe_side::estimate_plan_cardinality(ctx, plan);
         let mut stats = RelationStats::with_cardinality(cardinality);
@@ -758,7 +758,7 @@ impl JoinOrderOptimizer {
         bind_context: &BindContext,
         node: &DPJoinNode,
         used_filters: &mut HashSet<usize>,
-    ) -> Result<Option<LogicalPlan>> {
+    ) -> Result<Option<OwnedLogicalPlan>> {
         if node.is_leaf {
             // This is a base relation
             let relation_id = node.set.relations()[0];
@@ -846,7 +846,7 @@ impl JoinOrderOptimizer {
                         return Ok(None);
                     }
                     let mut plan =
-                        LogicalPlan::synthetic(LogicalOperator::Join(Join::Cross(CrossProduct {
+                        OwnedLogicalPlan::synthetic(LogicalOperator::Join(Join::Cross(CrossProduct {
                             left: join.left,
                             right: join.right,
                             build_side_constraint: Default::default(),
@@ -856,13 +856,13 @@ impl JoinOrderOptimizer {
                 } else {
                     debug_assert!(predicates.has_join_conditions());
                     let mut plan =
-                        LogicalPlan::synthetic(LogicalOperator::Join(Join::Comparison(join)));
+                        OwnedLogicalPlan::synthetic(LogicalOperator::Join(Join::Comparison(join)));
                     Self::set_reconstructed_cardinality(&mut plan, node);
                     plan
                 }
             } else {
                 let mut plan =
-                    LogicalPlan::synthetic(LogicalOperator::Join(Join::Cross(CrossProduct {
+                    OwnedLogicalPlan::synthetic(LogicalOperator::Join(Join::Cross(CrossProduct {
                         left: Box::new(left_plan),
                         right: Box::new(right_plan),
                         build_side_constraint: Default::default(),
@@ -883,7 +883,7 @@ impl JoinOrderOptimizer {
         CardinalityEstimate::exact(Self::quantize_cardinality(cardinality))
     }
 
-    fn set_reconstructed_cardinality(plan: &mut LogicalPlan, node: &DPJoinNode) {
+    fn set_reconstructed_cardinality(plan: &mut OwnedLogicalPlan, node: &DPJoinNode) {
         plan.stats.set_cardinality(
             Self::join_cardinality_estimate(node.cardinality),
             CardinalityProvenance::JoinGraph,
@@ -901,10 +901,10 @@ impl JoinOrderOptimizer {
 
     fn attach_remaining_filters(
         &self,
-        mut result: LogicalPlan,
+        mut result: OwnedLogicalPlan,
         result_set: &Arc<JoinRelationSet>,
         used_filters: &mut HashSet<usize>,
-    ) -> LogicalPlan {
+    ) -> OwnedLogicalPlan {
         let logical_cost_model = LogicalCostModel::default();
         let mut expressions = Vec::new();
         let mut filter_indexes = Vec::new();
@@ -928,9 +928,9 @@ impl JoinOrderOptimizer {
 
     fn attach_filter_expressions(
         &self,
-        result: LogicalPlan,
+        result: OwnedLogicalPlan,
         expressions: Vec<Expression>,
-    ) -> LogicalPlan {
+    ) -> OwnedLogicalPlan {
         self.attach_filter_expressions_with_cost_model(
             result,
             expressions,
@@ -940,10 +940,10 @@ impl JoinOrderOptimizer {
 
     fn attach_filter_expressions_with_cost_model(
         &self,
-        mut result: LogicalPlan,
+        mut result: OwnedLogicalPlan,
         expressions: Vec<Expression>,
         cost_model: &LogicalCostModel,
-    ) -> LogicalPlan {
+    ) -> OwnedLogicalPlan {
         if expressions.is_empty() {
             return result;
         }
@@ -955,7 +955,7 @@ impl JoinOrderOptimizer {
                 &self.column_stats,
             )
         });
-        result = LogicalPlan::synthetic(LogicalOperator::Filter(Filter::new(result, expressions)));
+        result = OwnedLogicalPlan::synthetic(LogicalOperator::Filter(Filter::new(result, expressions)));
         result.stats.inherit_cardinality_from(&child_stats);
         result.stats.estimated_cardinality = estimated_cardinality;
         result.stats.cardinality_provenance = CardinalityProvenance::JoinGraph;
@@ -1103,10 +1103,10 @@ mod tests {
         )
     }
 
-    fn cross_product(left_table: usize, right_table: usize) -> LogicalPlan {
-        LogicalPlan::synthetic(LogicalOperator::Join(Join::Cross(CrossProduct::new(
-            LogicalPlan::synthetic(create_scan(left_table)),
-            LogicalPlan::synthetic(create_scan(right_table)),
+    fn cross_product(left_table: usize, right_table: usize) -> OwnedLogicalPlan {
+        OwnedLogicalPlan::synthetic(LogicalOperator::Join(Join::Cross(CrossProduct::new(
+            OwnedLogicalPlan::synthetic(create_scan(left_table)),
+            OwnedLogicalPlan::synthetic(create_scan(right_table)),
         ))))
     }
 
@@ -1146,8 +1146,8 @@ mod tests {
         input_table_index: usize,
         output_table_index: usize,
         rows: u64,
-    ) -> LogicalPlan {
-        let input = LogicalPlan {
+    ) -> OwnedLogicalPlan {
+        let input = OwnedLogicalPlan {
             id: bind_context.next_plan_id(),
             stats: NodeStats {
                 estimated_cardinality: Some(CardinalityEstimate::exact(rows)),
@@ -1161,7 +1161,7 @@ mod tests {
             )),
         };
 
-        LogicalPlan {
+        OwnedLogicalPlan {
             id: bind_context.next_plan_id(),
             stats: NodeStats {
                 estimated_cardinality: Some(CardinalityEstimate::exact(rows)),
@@ -1181,8 +1181,8 @@ mod tests {
         let mut optimizer = JoinOrderOptimizer::new(SelectivityDefaults::default());
         let plan = LogicalOperator::Join(Join::Comparison(ComparisonJoin::new(
             JoinType::Inner,
-            LogicalPlan::synthetic(create_scan(0)),
-            LogicalPlan::synthetic(create_scan(1)),
+            OwnedLogicalPlan::synthetic(create_scan(0)),
+            OwnedLogicalPlan::synthetic(create_scan(1)),
             vec![join_condition(JoinComparisonType::GreaterThan, 0, 1)],
         )));
 
@@ -1206,9 +1206,9 @@ mod tests {
     fn optimize_converts_filtered_cross_product_to_comparison_join() {
         let session = make_test_session();
         let mut optimizer = JoinOrderOptimizer::new(SelectivityDefaults::default());
-        let cross = LogicalPlan::synthetic(LogicalOperator::Join(Join::Cross(CrossProduct::new(
-            LogicalPlan::synthetic(create_scan(0)),
-            LogicalPlan::synthetic(create_scan(1)),
+        let cross = OwnedLogicalPlan::synthetic(LogicalOperator::Join(Join::Cross(CrossProduct::new(
+            OwnedLogicalPlan::synthetic(create_scan(0)),
+            OwnedLogicalPlan::synthetic(create_scan(1)),
         ))));
         let equality = Expression::Comparison(paro_planner::expression::ComparisonExpression::new(
             ComparisonType::Equal,
@@ -1326,7 +1326,7 @@ mod tests {
         let session = make_test_session();
         let bind_context = BindContext::new();
         let relation = |table_index| {
-            LogicalPlan::synthetic(LogicalOperator::ExpressionGet(ExpressionGet::new(
+            OwnedLogicalPlan::synthetic(LogicalOperator::ExpressionGet(ExpressionGet::new(
                 table_index,
                 Vec::new(),
                 vec!["join_key".to_string(), "local_text".to_string()],
@@ -1497,7 +1497,7 @@ mod tests {
             .map(|column_id| paro_planner::operator::GetColumnSource::Stored { column_id })
             .collect();
         let bind_context = BindContext::new();
-        let plan = LogicalPlan {
+        let plan = OwnedLogicalPlan {
             id: bind_context.next_plan_id(),
             stats: NodeStats {
                 estimated_cardinality: Some(CardinalityEstimate::exact(100)),
@@ -1691,27 +1691,27 @@ mod tests {
         };
         assert!(filter.expressions[0].equals(&predicate));
 
-        let nested_filter = LogicalPlan::synthetic(LogicalOperator::Filter(Filter::new(
-            LogicalPlan::synthetic(create_scan(0)),
+        let nested_filter = OwnedLogicalPlan::synthetic(LogicalOperator::Filter(Filter::new(
+            OwnedLogicalPlan::synthetic(create_scan(0)),
             vec![volatile_boolean()],
         )));
         let surrounding_join = LogicalOperator::Join(Join::Comparison(ComparisonJoin::new(
             JoinType::Inner,
             nested_filter,
-            LogicalPlan::synthetic(create_scan(1)),
+            OwnedLogicalPlan::synthetic(create_scan(1)),
             vec![join_condition(JoinComparisonType::Equal, 0, 1)],
         )));
         assert!(!JoinOrderOptimizer::new(SelectivityDefaults::default())
             .can_optimize_join(&surrounding_join));
 
-        let volatile_preserved = LogicalPlan::synthetic(LogicalOperator::Filter(Filter::new(
-            LogicalPlan::synthetic(create_scan(0)),
+        let volatile_preserved = OwnedLogicalPlan::synthetic(LogicalOperator::Filter(Filter::new(
+            OwnedLogicalPlan::synthetic(create_scan(0)),
             vec![volatile_boolean()],
         )));
         let reduction = ComparisonJoin::new(
             JoinType::Semi,
             volatile_preserved,
-            LogicalPlan::synthetic(create_scan(1)),
+            OwnedLogicalPlan::synthetic(create_scan(1)),
             vec![join_condition(JoinComparisonType::Equal, 0, 1)],
         );
         assert!(
@@ -1722,7 +1722,7 @@ mod tests {
 
     #[test]
     fn filtered_cte_join_is_reordered_as_an_atomic_relation() {
-        let cte_ref = LogicalPlan::synthetic(LogicalOperator::CTERef(
+        let cte_ref = OwnedLogicalPlan::synthetic(LogicalOperator::CTERef(
             paro_planner::operator::CTERef::new(
                 12,
                 30,
@@ -1731,9 +1731,9 @@ mod tests {
                 vec![LogicalType::Integer],
             ),
         ));
-        let cross = LogicalPlan::synthetic(LogicalOperator::Join(Join::Cross(CrossProduct::new(
+        let cross = OwnedLogicalPlan::synthetic(LogicalOperator::Join(Join::Cross(CrossProduct::new(
             cte_ref,
-            LogicalPlan::synthetic(create_scan(31)),
+            OwnedLogicalPlan::synthetic(create_scan(31)),
         ))));
         let plan = LogicalOperator::Filter(Filter::new(
             cross,
@@ -1761,9 +1761,9 @@ mod tests {
     fn optimize_coalesces_single_relation_filters_after_join_reordering() {
         let session = make_test_session();
         let mut optimizer = JoinOrderOptimizer::new(SelectivityDefaults::default());
-        let cross = LogicalPlan::synthetic(LogicalOperator::Join(Join::Cross(CrossProduct::new(
-            LogicalPlan::synthetic(create_scan(0)),
-            LogicalPlan::synthetic(create_scan(1)),
+        let cross = OwnedLogicalPlan::synthetic(LogicalOperator::Join(Join::Cross(CrossProduct::new(
+            OwnedLogicalPlan::synthetic(create_scan(0)),
+            OwnedLogicalPlan::synthetic(create_scan(1)),
         ))));
         let compare = |comparison_type, left, right| {
             Expression::Comparison(paro_planner::expression::ComparisonExpression::new(
@@ -1816,14 +1816,14 @@ mod tests {
         let mut optimizer = JoinOrderOptimizer::new(SelectivityDefaults::default());
         let join_ab = LogicalOperator::Join(Join::Comparison(ComparisonJoin::new(
             JoinType::Inner,
-            LogicalPlan::synthetic(create_scan(0)),
-            LogicalPlan::synthetic(create_scan(1)),
+            OwnedLogicalPlan::synthetic(create_scan(0)),
+            OwnedLogicalPlan::synthetic(create_scan(1)),
             vec![join_condition(JoinComparisonType::Equal, 0, 1)],
         )));
         let plan = LogicalOperator::Join(Join::Comparison(ComparisonJoin::new(
             JoinType::Inner,
-            LogicalPlan::synthetic(join_ab),
-            LogicalPlan::synthetic(create_scan(2)),
+            OwnedLogicalPlan::synthetic(join_ab),
+            OwnedLogicalPlan::synthetic(create_scan(2)),
             vec![join_condition(JoinComparisonType::Equal, 1, 2)],
         )));
 
@@ -1853,8 +1853,8 @@ mod tests {
         let mut optimizer = JoinOrderOptimizer::new(SelectivityDefaults::default());
         let plan = LogicalOperator::Join(Join::Comparison(ComparisonJoin::new(
             JoinType::Semi,
-            LogicalPlan::synthetic(create_scan(0)),
-            LogicalPlan::synthetic(create_scan(1)),
+            OwnedLogicalPlan::synthetic(create_scan(0)),
+            OwnedLogicalPlan::synthetic(create_scan(1)),
             vec![join_condition(JoinComparisonType::Equal, 0, 1)],
         )));
 
@@ -1882,8 +1882,8 @@ mod tests {
         let mut optimizer = JoinOrderOptimizer::new(SelectivityDefaults::default());
         let mut join = ComparisonJoin::new(
             JoinType::Anti,
-            LogicalPlan::synthetic(create_scan(0)),
-            LogicalPlan::synthetic(create_scan(1)),
+            OwnedLogicalPlan::synthetic(create_scan(0)),
+            OwnedLogicalPlan::synthetic(create_scan(1)),
             vec![join_condition(JoinComparisonType::Equal, 0, 1)],
         );
         join.anti_join_mode = AntiJoinMode::NullAware;
@@ -1908,19 +1908,19 @@ mod tests {
     fn assert_nested_join_is_atomic(boundary_type: JoinType) {
         let session = make_test_session();
         let bind_context = BindContext::new();
-        let boundary = LogicalPlan::synthetic(LogicalOperator::Join(Join::Comparison(
+        let boundary = OwnedLogicalPlan::synthetic(LogicalOperator::Join(Join::Comparison(
             ComparisonJoin::new(
                 boundary_type,
-                LogicalPlan::synthetic(create_scan(0)),
-                LogicalPlan::synthetic(create_scan(1)),
+                OwnedLogicalPlan::synthetic(create_scan(0)),
+                OwnedLogicalPlan::synthetic(create_scan(1)),
                 vec![join_condition(JoinComparisonType::Equal, 0, 1)],
             ),
         )));
-        let plan = LogicalPlan::synthetic(LogicalOperator::Join(Join::Comparison(
+        let plan = OwnedLogicalPlan::synthetic(LogicalOperator::Join(Join::Comparison(
             ComparisonJoin::new(
                 JoinType::Inner,
                 boundary,
-                LogicalPlan::synthetic(create_scan(2)),
+                OwnedLogicalPlan::synthetic(create_scan(2)),
                 vec![join_condition(JoinComparisonType::Equal, 0, 2)],
             ),
         )));
@@ -1952,19 +1952,19 @@ mod tests {
     fn root_semi_join_reorders_preserved_side_but_keeps_rhs_atomic() {
         let session = make_test_session();
         let bind_context = BindContext::new();
-        let preserved = LogicalPlan::synthetic(LogicalOperator::Join(Join::Comparison(
+        let preserved = OwnedLogicalPlan::synthetic(LogicalOperator::Join(Join::Comparison(
             ComparisonJoin::new(
                 JoinType::Inner,
-                LogicalPlan::synthetic(create_scan(0)),
-                LogicalPlan::synthetic(create_scan(1)),
+                OwnedLogicalPlan::synthetic(create_scan(0)),
+                OwnedLogicalPlan::synthetic(create_scan(1)),
                 vec![join_condition(JoinComparisonType::Equal, 0, 1)],
             ),
         )));
-        let plan = LogicalPlan::synthetic(LogicalOperator::Join(Join::Comparison(
+        let plan = OwnedLogicalPlan::synthetic(LogicalOperator::Join(Join::Comparison(
             ComparisonJoin::new(
                 JoinType::Semi,
                 preserved,
-                LogicalPlan::synthetic(create_scan(2)),
+                OwnedLogicalPlan::synthetic(create_scan(2)),
                 vec![join_condition(JoinComparisonType::Equal, 0, 2)],
             ),
         )));
@@ -1989,27 +1989,27 @@ mod tests {
     fn reduction_cascade_shares_one_region_with_its_reorderable_preserved_joins() {
         let session = make_test_session();
         let bind_context = BindContext::new();
-        let preserved = LogicalPlan::synthetic(LogicalOperator::Join(Join::Comparison(
+        let preserved = OwnedLogicalPlan::synthetic(LogicalOperator::Join(Join::Comparison(
             ComparisonJoin::new(
                 JoinType::Inner,
-                LogicalPlan::synthetic(create_scan(0)),
-                LogicalPlan::synthetic(create_scan(1)),
+                OwnedLogicalPlan::synthetic(create_scan(0)),
+                OwnedLogicalPlan::synthetic(create_scan(1)),
                 vec![join_condition(JoinComparisonType::Equal, 0, 1)],
             ),
         )));
-        let first = LogicalPlan::synthetic(LogicalOperator::Join(Join::Comparison(
+        let first = OwnedLogicalPlan::synthetic(LogicalOperator::Join(Join::Comparison(
             ComparisonJoin::new(
                 JoinType::Semi,
                 preserved,
-                LogicalPlan::synthetic(create_scan(2)),
+                OwnedLogicalPlan::synthetic(create_scan(2)),
                 vec![join_condition(JoinComparisonType::Equal, 0, 2)],
             ),
         )));
-        let plan = LogicalPlan::synthetic(LogicalOperator::Join(Join::Comparison(
+        let plan = OwnedLogicalPlan::synthetic(LogicalOperator::Join(Join::Comparison(
             ComparisonJoin::new(
                 JoinType::Semi,
                 first,
-                LogicalPlan::synthetic(create_scan(3)),
+                OwnedLogicalPlan::synthetic(create_scan(3)),
                 vec![join_condition(JoinComparisonType::Equal, 0, 3)],
             ),
         )));
@@ -2031,11 +2031,11 @@ mod tests {
     fn reduction_without_two_graph_roles_is_an_atomic_preserved_input() {
         let session = make_test_session();
         let bind_context = BindContext::new();
-        let constant_key_reduction = LogicalPlan::synthetic(LogicalOperator::Join(
+        let constant_key_reduction = OwnedLogicalPlan::synthetic(LogicalOperator::Join(
             Join::Comparison(ComparisonJoin::new(
                 JoinType::Semi,
-                LogicalPlan::synthetic(create_scan(0)),
-                LogicalPlan::synthetic(create_scan(1)),
+                OwnedLogicalPlan::synthetic(create_scan(0)),
+                OwnedLogicalPlan::synthetic(create_scan(1)),
                 vec![paro_planner::operator::JoinCondition::new(
                     Expression::Constant(ConstantExpression::new(
                         Value::Integer(5),
@@ -2046,11 +2046,11 @@ mod tests {
                 )],
             )),
         ));
-        let plan = LogicalPlan::synthetic(LogicalOperator::Join(Join::Comparison(
+        let plan = OwnedLogicalPlan::synthetic(LogicalOperator::Join(Join::Comparison(
             ComparisonJoin::new(
                 JoinType::Semi,
                 constant_key_reduction,
-                LogicalPlan::synthetic(create_scan(2)),
+                OwnedLogicalPlan::synthetic(create_scan(2)),
                 vec![join_condition(JoinComparisonType::Equal, 0, 2)],
             ),
         )));
@@ -2076,19 +2076,19 @@ mod tests {
     fn roleless_reduction_at_region_root_remains_fully_atomic() {
         let session = make_test_session();
         let bind_context = BindContext::new();
-        let valid_inner_reduction = LogicalPlan::synthetic(LogicalOperator::Join(
+        let valid_inner_reduction = OwnedLogicalPlan::synthetic(LogicalOperator::Join(
             Join::Comparison(ComparisonJoin::new(
                 JoinType::Semi,
-                LogicalPlan::synthetic(create_scan(0)),
-                LogicalPlan::synthetic(create_scan(1)),
+                OwnedLogicalPlan::synthetic(create_scan(0)),
+                OwnedLogicalPlan::synthetic(create_scan(1)),
                 vec![join_condition(JoinComparisonType::Equal, 0, 1)],
             )),
         ));
-        let plan = LogicalPlan::synthetic(LogicalOperator::Join(Join::Comparison(
+        let plan = OwnedLogicalPlan::synthetic(LogicalOperator::Join(Join::Comparison(
             ComparisonJoin::new(
                 JoinType::Semi,
                 valid_inner_reduction,
-                LogicalPlan::synthetic(create_scan(2)),
+                OwnedLogicalPlan::synthetic(create_scan(2)),
                 vec![paro_planner::operator::JoinCondition::new(
                     Expression::Constant(ConstantExpression::new(
                         Value::Integer(5),
@@ -2129,19 +2129,19 @@ mod tests {
     fn single_roleless_root_reduction_does_not_expose_its_preserved_join() {
         let session = make_test_session();
         let bind_context = BindContext::new();
-        let preserved = LogicalPlan::synthetic(LogicalOperator::Join(Join::Comparison(
+        let preserved = OwnedLogicalPlan::synthetic(LogicalOperator::Join(Join::Comparison(
             ComparisonJoin::new(
                 JoinType::Inner,
-                LogicalPlan::synthetic(create_scan(0)),
-                LogicalPlan::synthetic(create_scan(1)),
+                OwnedLogicalPlan::synthetic(create_scan(0)),
+                OwnedLogicalPlan::synthetic(create_scan(1)),
                 vec![join_condition(JoinComparisonType::Equal, 0, 1)],
             ),
         )));
-        let plan = LogicalPlan::synthetic(LogicalOperator::Join(Join::Comparison(
+        let plan = OwnedLogicalPlan::synthetic(LogicalOperator::Join(Join::Comparison(
             ComparisonJoin::new(
                 JoinType::Anti,
                 preserved,
-                LogicalPlan::synthetic(create_scan(2)),
+                OwnedLogicalPlan::synthetic(create_scan(2)),
                 vec![paro_planner::operator::JoinCondition::new(
                     Expression::Constant(ConstantExpression::new(
                         Value::Integer(5),
@@ -2172,20 +2172,20 @@ mod tests {
         let session = make_test_session();
         let bind_context = BindContext::new();
         let boundary =
-            LogicalPlan::synthetic(LogicalOperator::Join(Join::Any(Box::new(AnyJoin::new(
+            OwnedLogicalPlan::synthetic(LogicalOperator::Join(Join::Any(Box::new(AnyJoin::new(
                 JoinType::Inner,
-                LogicalPlan::synthetic(create_scan(0)),
-                LogicalPlan::synthetic(create_scan(1)),
+                OwnedLogicalPlan::synthetic(create_scan(0)),
+                OwnedLogicalPlan::synthetic(create_scan(1)),
                 Expression::Constant(ConstantExpression::new(
                     Value::Boolean(true),
                     LogicalType::Boolean,
                 )),
             )))));
-        let plan = LogicalPlan::synthetic(LogicalOperator::Join(Join::Comparison(
+        let plan = OwnedLogicalPlan::synthetic(LogicalOperator::Join(Join::Comparison(
             ComparisonJoin::new(
                 JoinType::Inner,
                 boundary,
-                LogicalPlan::synthetic(create_scan(2)),
+                OwnedLogicalPlan::synthetic(create_scan(2)),
                 vec![join_condition(JoinComparisonType::Equal, 0, 2)],
             ),
         )));
@@ -2212,7 +2212,7 @@ mod tests {
         let rel_b = projection_relation(&bind_context, 101, 1, 10);
         let rel_c = projection_relation(&bind_context, 102, 2, 10);
 
-        let join_ab = LogicalPlan {
+        let join_ab = OwnedLogicalPlan {
             id: bind_context.next_plan_id(),
             stats: NodeStats::default(),
             operator: LogicalOperator::Join(Join::Comparison(ComparisonJoin::new(
@@ -2222,7 +2222,7 @@ mod tests {
                 vec![join_condition(JoinComparisonType::Equal, 0, 1)],
             ))),
         };
-        let plan = LogicalPlan {
+        let plan = OwnedLogicalPlan {
             id: bind_context.next_plan_id(),
             stats: NodeStats::default(),
             operator: LogicalOperator::Join(Join::Comparison(ComparisonJoin::new(
@@ -2310,7 +2310,7 @@ mod tests {
         let bind_context = BindContext::new();
         let small = projection_relation(&bind_context, 100, 0, 10);
         let large = projection_relation(&bind_context, 101, 1, 1_000_000);
-        let plan = LogicalPlan {
+        let plan = OwnedLogicalPlan {
             id: bind_context.next_plan_id(),
             stats: NodeStats::default(),
             operator: LogicalOperator::Join(Join::Comparison(ComparisonJoin::new(
@@ -2358,7 +2358,7 @@ mod tests {
             vec![join_condition(JoinComparisonType::Equal, 1, 2)],
         );
         dependent.duplicate_eliminated_columns = vec![column_ref(1, 0)];
-        let dependent = LogicalPlan {
+        let dependent = OwnedLogicalPlan {
             id: bind_context.next_plan_id(),
             stats: NodeStats {
                 estimated_cardinality: Some(CardinalityEstimate::exact(64)),
@@ -2366,7 +2366,7 @@ mod tests {
             },
             operator: LogicalOperator::Join(Join::Comparison(dependent)),
         };
-        let plan = LogicalPlan {
+        let plan = OwnedLogicalPlan {
             id: bind_context.next_plan_id(),
             stats: NodeStats::default(),
             operator: LogicalOperator::Join(Join::Comparison(ComparisonJoin::new(
@@ -2395,7 +2395,7 @@ mod tests {
     fn reduction_work_orientation_survives_physical_side_selection() {
         let session = make_test_session();
         let bind_context = BindContext::new();
-        let plan = LogicalPlan {
+        let plan = OwnedLogicalPlan {
             id: bind_context.next_plan_id(),
             stats: NodeStats::default(),
             operator: LogicalOperator::Join(Join::Comparison(ComparisonJoin::new(

@@ -14,7 +14,7 @@ use crate::operator::{
     AnyJoin, ComparisonJoin, Filter, Join, JoinComparisonType, JoinCondition, JoinSide, JoinType,
     LogicalOperator,
 };
-use crate::plan::LogicalPlan;
+use crate::plan::OwnedLogicalPlan;
 use paro_common::error::Result;
 
 pub fn convert_join_type(binder_type: BinderJoinType) -> JoinType {
@@ -163,8 +163,8 @@ pub fn create_join_operator(
 
         let any_join = AnyJoin::new(
             join_type,
-            LogicalPlan::new(bind_ctx, left_child),
-            LogicalPlan::new(bind_ctx, right_child),
+            OwnedLogicalPlan::new(bind_ctx, left_child),
+            OwnedLogicalPlan::new(bind_ctx, right_child),
             condition,
         );
         return Ok(LogicalOperator::Join(Join::Any(Box::new(any_join))));
@@ -173,8 +173,8 @@ pub fn create_join_operator(
     if arbitrary_expressions.is_empty() {
         let comp_join = ComparisonJoin::new(
             join_type,
-            LogicalPlan::new(bind_ctx, left_child),
-            LogicalPlan::new(bind_ctx, right_child),
+            OwnedLogicalPlan::new(bind_ctx, left_child),
+            OwnedLogicalPlan::new(bind_ctx, right_child),
             conditions,
         );
         return Ok(LogicalOperator::Join(Join::Comparison(comp_join)));
@@ -183,13 +183,16 @@ pub fn create_join_operator(
     if join_type == JoinType::Inner {
         let comp_join = ComparisonJoin::new(
             join_type,
-            LogicalPlan::new(bind_ctx, left_child),
-            LogicalPlan::new(bind_ctx, right_child),
+            OwnedLogicalPlan::new(bind_ctx, left_child),
+            OwnedLogicalPlan::new(bind_ctx, right_child),
             conditions,
         );
         let join_op = LogicalOperator::Join(Join::Comparison(comp_join));
 
-        let filter = Filter::new(LogicalPlan::new(bind_ctx, join_op), arbitrary_expressions);
+        let filter = Filter::new(
+            OwnedLogicalPlan::new(bind_ctx, join_op),
+            arbitrary_expressions,
+        );
         Ok(LogicalOperator::Filter(filter))
     } else {
         let mut all_expressions: Vec<Expression> = conditions
@@ -201,8 +204,8 @@ pub fn create_join_operator(
         let condition = combine_expressions_with_and(all_expressions);
         let any_join = AnyJoin::new(
             join_type,
-            LogicalPlan::new(bind_ctx, left_child),
-            LogicalPlan::new(bind_ctx, right_child),
+            OwnedLogicalPlan::new(bind_ctx, left_child),
+            OwnedLogicalPlan::new(bind_ctx, right_child),
             condition,
         );
         Ok(LogicalOperator::Join(Join::Any(Box::new(any_join))))

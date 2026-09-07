@@ -12,7 +12,7 @@
 
 use crate::binder::ir::statement::BoundStatementKind;
 use crate::binder::Binder;
-use crate::plan::LogicalPlan;
+use crate::plan::OwnedLogicalPlan;
 use crate::stack::maybe_grow_planner_stack;
 use crate::verify::verify_physical_planner_invariants;
 use paro_common::error::Result;
@@ -62,7 +62,7 @@ pub struct Planner {
     context: Arc<StatementContext>,
 
     /// The resulting logical plan.
-    pub plan: Option<LogicalPlan>,
+    pub plan: Option<OwnedLogicalPlan>,
 
     /// Result column names.
     pub names: Vec<String>,
@@ -188,7 +188,7 @@ impl Planner {
 
     /// Take the logical plan, consuming it from the planner.
     #[inline]
-    pub fn take_plan(&mut self) -> Option<LogicalPlan> {
+    pub fn take_plan(&mut self) -> Option<OwnedLogicalPlan> {
         self.plan.take()
     }
 

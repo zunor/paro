@@ -631,7 +631,7 @@ fn dummy_and_empty_sources_are_single_task() {
     let ctx = BindContext::new();
     let mut extractor = PhysicalPlanExtractor::new(ExtractionContext::default());
     let dummy = extractor
-        .extract(&LogicalPlan::new(&ctx, LogicalOperator::DummyScan))
+        .extract(&OwnedLogicalPlan::new(&ctx, LogicalOperator::DummyScan))
         .unwrap();
     let mut dummy_lowerer = PipelineLowerer::new(&dummy);
     let dummy_graph = dummy_lowerer.lower_to_pipeline_graph(dummy.root).unwrap();
@@ -645,7 +645,7 @@ fn dummy_and_empty_sources_are_single_task() {
         crate::physical::properties::Parallelism::single()
     );
 
-    let values = LogicalPlan::new(
+    let values = OwnedLogicalPlan::new(
         &ctx,
         LogicalOperator::ExpressionGet(ExpressionGet::new(
             0,
@@ -656,7 +656,7 @@ fn dummy_and_empty_sources_are_single_task() {
     );
     let mut extractor = PhysicalPlanExtractor::new(ExtractionContext::default());
     let empty = extractor
-        .extract(&LogicalPlan::new(
+        .extract(&OwnedLogicalPlan::new(
             &ctx,
             LogicalOperator::EmptyResult(EmptyResult::new(values)),
         ))
@@ -718,7 +718,7 @@ fn graph_validation_rejects_dependency_cycles() {
 #[test]
 fn physical_extraction_rejects_unimplemented_nodes_before_lowering() {
     let ctx = BindContext::new();
-    let values = LogicalPlan::new(
+    let values = OwnedLogicalPlan::new(
         &ctx,
         LogicalOperator::ExpressionGet(ExpressionGet::new(
             0,
@@ -727,7 +727,7 @@ fn physical_extraction_rejects_unimplemented_nodes_before_lowering() {
             vec![LogicalType::Integer],
         )),
     );
-    let distinct = LogicalPlan::new(
+    let distinct = OwnedLogicalPlan::new(
         &ctx,
         LogicalOperator::Distinct(Distinct::distinct_on(
             vec![Expression::Reference(ReferenceExpression::new(

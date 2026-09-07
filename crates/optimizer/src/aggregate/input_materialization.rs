@@ -20,11 +20,11 @@ use paro_planner::expression::{
 use paro_planner::operator::{
     ColumnBinding, ComparisonJoin, Join, JoinType, LogicalOperator, Projection,
 };
-use paro_planner::plan::LogicalPlan;
+use paro_planner::plan::OwnedLogicalPlan;
 
 use crate::expression::traversal::visit_expression;
 
-pub fn optimize_plan(plan: LogicalPlan, bind_context: &BindContext) -> Result<(LogicalPlan, bool)> {
+pub fn optimize_plan(plan: OwnedLogicalPlan, bind_context: &BindContext) -> Result<(OwnedLogicalPlan, bool)> {
     let mut changed = false;
     let plan = plan.try_map_post_order(|mut plan| {
         if let LogicalOperator::Aggregate(aggregate) = &mut plan.operator {
@@ -73,7 +73,7 @@ struct MaterializedInput {
 }
 
 fn materialize_inputs(
-    child: &mut LogicalPlan,
+    child: &mut OwnedLogicalPlan,
     groups: &mut [Expression],
     aggregates: &mut [Expression],
     bind_context: &BindContext,
@@ -194,7 +194,7 @@ fn expression_uses_bindings_outside(
 }
 
 fn materialize_at_deepest_join_domain(
-    plan: &mut LogicalPlan,
+    plan: &mut OwnedLogicalPlan,
     expression: &Expression,
     bind_context: &BindContext,
     crossed_joins: usize,
@@ -274,7 +274,7 @@ fn expression_uses_any_binding(expression: &Expression, bindings: &HashSet<Colum
 }
 
 fn include_materialized_binding(
-    child: &LogicalPlan,
+    child: &OwnedLogicalPlan,
     projection: &mut paro_planner::operator::ProjectionMap,
     binding: ColumnBinding,
 ) {
@@ -295,12 +295,12 @@ fn include_materialized_binding(
 }
 
 fn wrap_projection(
-    plan: &mut LogicalPlan,
+    plan: &mut OwnedLogicalPlan,
     expression: &Expression,
     bind_context: &BindContext,
 ) -> Option<MaterializedInput> {
     let expression_bindings = expression_bindings(expression)?;
-    let original = std::mem::replace(plan, LogicalPlan::synthetic(LogicalOperator::DummyScan));
+    let original = std::mem::replace(plan, OwnedLogicalPlan::synthetic(LogicalOperator::DummyScan));
     let old_bindings = original.get_column_bindings();
     let old_types = original.types();
     if old_bindings.len() != old_types.len()
@@ -323,7 +323,7 @@ fn wrap_projection(
         .collect::<Vec<_>>();
     expressions.push(expression.clone());
     output_names.push("__paro_materialized_aggregate_input".to_string());
-    *plan = LogicalPlan::new(
+    *plan = OwnedLogicalPlan::new(
         bind_context,
         LogicalOperator::Projection(
             Projection::new(projection_index, original, expressions)

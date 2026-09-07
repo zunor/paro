@@ -23,7 +23,7 @@ use paro_planner::operator::join::{Join, JoinCondition, JoinType};
 use paro_planner::operator::{
     Aggregate as LogicalAggregate, ExpressionGet, LogicalOperator, Order as LogicalOrder,
 };
-use paro_planner::plan::LogicalPlan;
+use paro_planner::plan::OwnedLogicalPlan;
 
 use crate::memory_runtime::QueryMemoryPool;
 use crate::physical::children::{PlanChildren, PlanChildrenArena};
@@ -63,7 +63,7 @@ fn execute_program_uses_compiled_parameter_bindings() {
         RuntimeParamId::new(0),
         LogicalType::Integer,
     )));
-    let logical = LogicalPlan::new(
+    let logical = OwnedLogicalPlan::new(
         &ctx,
         LogicalOperator::ExpressionGet(ExpressionGet::new(
             0,
@@ -1046,7 +1046,7 @@ fn assert_pipeline_count_at_least(statement: &StatementProgram, expected: usize)
     );
 }
 
-fn statement_from_logical(logical: LogicalPlan) -> StatementProgram {
+fn statement_from_logical(logical: OwnedLogicalPlan) -> StatementProgram {
     let mut extractor = PhysicalPlanExtractor::new(ExtractionContext::default());
     let plan = Arc::new(extractor.extract(&logical).expect("physical plan"));
     let mut lowerer = PipelineLowerer::new(plan.as_ref());
@@ -1065,7 +1065,7 @@ fn statement_from_logical(logical: LogicalPlan) -> StatementProgram {
     }
 }
 
-fn hash_join_logical_plan(row_count: usize) -> LogicalPlan {
+fn hash_join_logical_plan(row_count: usize) -> OwnedLogicalPlan {
     let ctx = BindContext::new();
     let left_rows = (0..row_count)
         .map(|idx| {
@@ -1089,7 +1089,7 @@ fn hash_join_logical_plan(row_count: usize) -> LogicalPlan {
         Expression::Reference(ReferenceExpression::new(0, LogicalType::Integer)),
         Expression::Reference(ReferenceExpression::new(0, LogicalType::Integer)),
     );
-    LogicalPlan::new(
+    OwnedLogicalPlan::new(
         &ctx,
         LogicalOperator::Join(Join::comparison(
             JoinType::Inner,
@@ -1100,7 +1100,7 @@ fn hash_join_logical_plan(row_count: usize) -> LogicalPlan {
     )
 }
 
-fn sort_logical_plan(row_count: usize) -> LogicalPlan {
+fn sort_logical_plan(row_count: usize) -> OwnedLogicalPlan {
     let ctx = BindContext::new();
     let rows = (0..row_count)
         .rev()
@@ -1112,19 +1112,19 @@ fn sort_logical_plan(row_count: usize) -> LogicalPlan {
         ascending: true,
         nulls_first: false,
     };
-    LogicalPlan::new(
+    OwnedLogicalPlan::new(
         &ctx,
         LogicalOperator::Order(LogicalOrder::new(values, vec![order])),
     )
 }
 
-fn grouped_aggregate_logical_plan(row_count: usize) -> LogicalPlan {
+fn grouped_aggregate_logical_plan(row_count: usize) -> OwnedLogicalPlan {
     let ctx = BindContext::new();
     let rows = (0..row_count)
         .map(|idx| vec![int_constant(idx as i32)])
         .collect::<Vec<_>>();
     let values = int_values(&ctx, 0, vec!["k"], rows);
-    LogicalPlan::new(
+    OwnedLogicalPlan::new(
         &ctx,
         LogicalOperator::Aggregate(LogicalAggregate::new(
             1,
@@ -1151,9 +1151,9 @@ fn int_values(
     table_index: usize,
     names: Vec<&str>,
     rows: Vec<Vec<Expression>>,
-) -> LogicalPlan {
+) -> OwnedLogicalPlan {
     let column_count = names.len();
-    LogicalPlan::new(
+    OwnedLogicalPlan::new(
         ctx,
         LogicalOperator::ExpressionGet(ExpressionGet::new(
             table_index,

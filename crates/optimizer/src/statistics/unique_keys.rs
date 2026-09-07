@@ -16,7 +16,7 @@ use paro_planner::expression::{ColumnRefExpression, Expression};
 use paro_planner::operator::{
     ColumnBinding, Get, Join, JoinComparisonType, JoinCondition, JoinType, LogicalOperator,
 };
-use paro_planner::plan::{LogicalPlan, UniqueKey, UniqueKeyColumn, UniqueKeyProvenance};
+use paro_planner::plan::{OwnedLogicalPlan, UniqueKey, UniqueKeyColumn, UniqueKeyProvenance};
 
 /// Evidence that every candidate key binding is evaluated by an ordinary
 /// equality predicate and therefore rejects NULL before uniqueness is used.
@@ -142,7 +142,7 @@ pub(crate) fn declared_unique_keys(get: &Get) -> Vec<DeclaredUniqueKey> {
 }
 
 /// Return cached keys as stable output bindings for statistics consumers.
-pub(crate) fn proven_unique_keys(plan: &LogicalPlan) -> Vec<Vec<ColumnBinding>> {
+pub(crate) fn proven_unique_keys(plan: &OwnedLogicalPlan) -> Vec<Vec<ColumnBinding>> {
     let layout = plan.output_layout();
     plan.stats
         .unique_keys
@@ -155,7 +155,7 @@ pub(crate) fn proven_unique_keys(plan: &LogicalPlan) -> Vec<Vec<ColumnBinding>> 
 /// Prove that the supplied expressions cover one key of the current relation.
 /// Callers remain responsible for proving ordinary-equality NULL rejection.
 pub(crate) fn expressions_cover_unique_key(
-    plan: &LogicalPlan,
+    plan: &OwnedLogicalPlan,
     expressions: &[&Expression],
 ) -> bool {
     expressions_cover_key(plan, expressions, None)
@@ -164,7 +164,7 @@ pub(crate) fn expressions_cover_unique_key(
 /// Stronger proof used only by execution strategies that diagnose a duplicate
 /// as a violated storage invariant rather than a planner-quality miss.
 pub(crate) fn expressions_cover_catalog_unique_key(
-    plan: &LogicalPlan,
+    plan: &OwnedLogicalPlan,
     expressions: &[&Expression],
 ) -> bool {
     expressions_cover_key(
@@ -175,7 +175,7 @@ pub(crate) fn expressions_cover_catalog_unique_key(
 }
 
 fn expressions_cover_key(
-    plan: &LogicalPlan,
+    plan: &OwnedLogicalPlan,
     expressions: &[&Expression],
     required_provenance: Option<UniqueKeyProvenance>,
 ) -> bool {
@@ -310,7 +310,7 @@ pub(crate) fn derive_unique_keys_from_facts(
 /// Statistics gathering owns the normal derivation. Layout-rewriting passes
 /// call this once at their public boundary so downstream consumers never see
 /// bindings paired with stale output ordinals.
-pub(crate) fn refresh_unique_keys(plan: LogicalPlan) -> Result<LogicalPlan> {
+pub(crate) fn refresh_unique_keys(plan: OwnedLogicalPlan) -> Result<OwnedLogicalPlan> {
     plan.try_fold_post_order(|mut plan, child_layouts: Vec<_>| {
         let output_layout = plan.operator.output_layout_from_children(&child_layouts);
         plan.stats.unique_keys =
@@ -693,7 +693,7 @@ mod tests {
 
     #[test]
     fn stale_positional_key_fails_closed_against_current_layout() {
-        let mut plan = LogicalPlan::synthetic(LogicalOperator::ExpressionGet(ExpressionGet::new(
+        let mut plan = OwnedLogicalPlan::synthetic(LogicalOperator::ExpressionGet(ExpressionGet::new(
             7,
             Vec::new(),
             vec!["a".to_string(), "b".to_string()],

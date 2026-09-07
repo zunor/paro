@@ -3,7 +3,7 @@
 
 //! `UNION` / `INTERSECT` / `EXCEPT` (with or without `ALL`). `UNION BY NAME` is not modeled here.
 
-use crate::plan::LogicalPlan;
+use crate::plan::OwnedLogicalPlan;
 use paro_common::types::LogicalType;
 
 /// Type of set operation for logical planning.
@@ -33,16 +33,16 @@ impl std::fmt::Display for SetOpType {
 /// ```sql
 /// SELECT a FROM t1 UNION SELECT b FROM t2
 /// ```
-#[derive(Debug)]
-pub struct SetOperation {
+#[derive(Debug, Clone)]
+pub struct SetOperation<Child = Box<OwnedLogicalPlan>> {
     /// Table index for the result.
     pub table_index: usize,
     /// Number of columns in the result.
     pub column_count: usize,
     /// Left child operator.
-    pub left: Box<LogicalPlan>,
+    pub left: Child,
     /// Right child operator.
-    pub right: Box<LogicalPlan>,
+    pub right: Child,
     /// Type of set operation (UNION, INTERSECT, EXCEPT).
     pub setop_type: SetOpType,
     /// Whether to keep all rows (ALL) or remove duplicates (DISTINCT).
@@ -60,8 +60,8 @@ impl SetOperation {
     /// Create a new set operation with two children.
     pub fn new(
         table_index: usize,
-        left: LogicalPlan,
-        right: LogicalPlan,
+        left: OwnedLogicalPlan,
+        right: OwnedLogicalPlan,
         setop_type: SetOpType,
         setop_all: bool,
         types: Vec<LogicalType>,
@@ -82,8 +82,8 @@ impl SetOperation {
     /// Create a UNION operation.
     pub fn union(
         table_index: usize,
-        left: LogicalPlan,
-        right: LogicalPlan,
+        left: OwnedLogicalPlan,
+        right: OwnedLogicalPlan,
         setop_all: bool,
         types: Vec<LogicalType>,
     ) -> Self {
@@ -93,8 +93,8 @@ impl SetOperation {
     /// Create an INTERSECT operation.
     pub fn intersect(
         table_index: usize,
-        left: LogicalPlan,
-        right: LogicalPlan,
+        left: OwnedLogicalPlan,
+        right: OwnedLogicalPlan,
         setop_all: bool,
         types: Vec<LogicalType>,
     ) -> Self {
@@ -111,8 +111,8 @@ impl SetOperation {
     /// Create an EXCEPT operation.
     pub fn except(
         table_index: usize,
-        left: LogicalPlan,
-        right: LogicalPlan,
+        left: OwnedLogicalPlan,
+        right: OwnedLogicalPlan,
         setop_all: bool,
         types: Vec<LogicalType>,
     ) -> Self {
@@ -133,22 +133,22 @@ impl SetOperation {
     }
 
     /// Get the left child.
-    pub fn left(&self) -> &LogicalPlan {
+    pub fn left(&self) -> &OwnedLogicalPlan {
         &self.left
     }
 
     /// Get the right child.
-    pub fn right(&self) -> &LogicalPlan {
+    pub fn right(&self) -> &OwnedLogicalPlan {
         &self.right
     }
 
     /// Get mutable reference to the left child.
-    pub fn left_mut(&mut self) -> &mut LogicalPlan {
+    pub fn left_mut(&mut self) -> &mut OwnedLogicalPlan {
         &mut self.left
     }
 
     /// Get mutable reference to the right child.
-    pub fn right_mut(&mut self) -> &mut LogicalPlan {
+    pub fn right_mut(&mut self) -> &mut OwnedLogicalPlan {
         &mut self.right
     }
 
@@ -171,9 +171,12 @@ mod tests {
 
     use super::*;
 
-    fn dummy_pair() -> (LogicalPlan, LogicalPlan) {
+    fn dummy_pair() -> (OwnedLogicalPlan, OwnedLogicalPlan) {
         let ctx = BindContext::new();
-        (LogicalPlan::dummy_scan(&ctx), LogicalPlan::dummy_scan(&ctx))
+        (
+            OwnedLogicalPlan::dummy_scan(&ctx),
+            OwnedLogicalPlan::dummy_scan(&ctx),
+        )
     }
 
     #[test]

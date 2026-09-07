@@ -5,7 +5,7 @@
 //!
 //!
 
-use crate::plan::LogicalPlan;
+use crate::plan::OwnedLogicalPlan;
 
 /// EXPLAIN operator mode.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -69,10 +69,10 @@ impl ExplainSpec {
 }
 
 /// Explain wraps a query plan that needs to be rendered.
-#[derive(Debug)]
-pub struct Explain {
+#[derive(Debug, Clone)]
+pub struct Explain<Child = Box<OwnedLogicalPlan>> {
     /// Child logical plan that EXPLAIN targets.
-    pub child: Box<LogicalPlan>,
+    pub child: Child,
     /// Structured explain spec.
     pub spec: ExplainSpec,
     /// Optional unoptimized logical plan string.
@@ -82,7 +82,7 @@ pub struct Explain {
 }
 
 impl Explain {
-    pub fn new(child: LogicalPlan, spec: ExplainSpec) -> Self {
+    pub fn new(child: OwnedLogicalPlan, spec: ExplainSpec) -> Self {
         Self {
             child: Box::new(child),
             spec,

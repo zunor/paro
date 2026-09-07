@@ -18,7 +18,7 @@ use paro_planner::expression::{Expression, ExpressionIterator, WindowExpression}
 use paro_planner::operator::{
     ColumnBinding, ComparisonJoin, Join, JoinComparisonType, JoinType, LogicalOperator, Projection,
 };
-use paro_planner::plan::LogicalPlan;
+use paro_planner::plan::OwnedLogicalPlan;
 
 pub struct JoinElimination {
     changed: bool,
@@ -29,17 +29,17 @@ impl JoinElimination {
         Self { changed: false }
     }
 
-    pub fn optimize(&mut self, plan: LogicalPlan) -> LogicalPlan {
+    pub fn optimize(&mut self, plan: OwnedLogicalPlan) -> OwnedLogicalPlan {
         let required_bindings = output_bindings(&plan.operator);
         self.optimize_required_plan(plan, &required_bindings)
     }
 
-    pub fn optimize_plan(&mut self, plan: LogicalPlan) -> LogicalPlan {
+    pub fn optimize_plan(&mut self, plan: OwnedLogicalPlan) -> OwnedLogicalPlan {
         let required_bindings = output_bindings(&plan.operator);
         self.optimize_required_plan(plan, &required_bindings)
     }
 
-    pub fn optimize_plan_with_change(&mut self, plan: LogicalPlan) -> (LogicalPlan, bool) {
+    pub fn optimize_plan_with_change(&mut self, plan: OwnedLogicalPlan) -> (OwnedLogicalPlan, bool) {
         self.changed = false;
         let plan = self.optimize_plan(plan);
         (plan, self.changed)
@@ -47,9 +47,9 @@ impl JoinElimination {
 
     fn optimize_required_plan(
         &mut self,
-        plan: LogicalPlan,
+        plan: OwnedLogicalPlan,
         required_bindings: &HashSet<ColumnBinding>,
-    ) -> LogicalPlan {
+    ) -> OwnedLogicalPlan {
         let (id, stats, operator) = plan.into_parts();
         let operator = match operator {
             LogicalOperator::Filter(mut filter) => {
@@ -242,7 +242,7 @@ impl JoinElimination {
             }
             other => other,
         };
-        LogicalPlan {
+        OwnedLogicalPlan {
             id,
             stats,
             operator,
@@ -378,7 +378,7 @@ impl JoinElimination {
     fn conditions_cover_unique_key(
         &self,
         join: &ComparisonJoin,
-        eliminated: &LogicalPlan,
+        eliminated: &OwnedLogicalPlan,
         eliminate_right: bool,
     ) -> bool {
         let mut key_bindings = HashSet::new();
@@ -452,7 +452,7 @@ fn output_bindings(op: &LogicalOperator) -> HashSet<ColumnBinding> {
 
 fn filter_required_bindings(
     required_bindings: &HashSet<ColumnBinding>,
-    child: &LogicalPlan,
+    child: &OwnedLogicalPlan,
 ) -> HashSet<ColumnBinding> {
     let child_outputs = output_bindings(&child.operator);
     filter_required_by_output(required_bindings, &child_outputs)
@@ -518,7 +518,7 @@ fn add_bindings_for_child(
 
 fn has_required_bindings_from_child(
     required_bindings: &HashSet<ColumnBinding>,
-    child: &LogicalPlan,
+    child: &OwnedLogicalPlan,
 ) -> bool {
     let child_outputs = output_bindings(&child.operator);
     required_bindings
@@ -563,7 +563,7 @@ mod tests {
     use paro_planner::operator::{
         ColumnBinding, Get, Join, JoinCondition, JoinType, LogicalOperator, Projection,
     };
-    use paro_planner::plan::LogicalPlan;
+    use paro_planner::plan::OwnedLogicalPlan;
     use paro_storage::table::table_factory::TableFactory;
     use paro_storage::table::table_handle::TableHandle;
 
@@ -637,7 +637,7 @@ mod tests {
     ) -> LogicalOperator {
         LogicalOperator::Projection(Projection::new(
             table_index,
-            LogicalPlan::synthetic(child),
+            OwnedLogicalPlan::synthetic(child),
             expressions,
         ))
     }
@@ -650,8 +650,8 @@ mod tests {
     ) -> LogicalOperator {
         LogicalOperator::Join(Join::comparison(
             join_type,
-            LogicalPlan::synthetic(left),
-            LogicalPlan::synthetic(right),
+            OwnedLogicalPlan::synthetic(left),
+            OwnedLogicalPlan::synthetic(right),
             conditions,
         ))
     }
@@ -675,7 +675,7 @@ mod tests {
             vec![col(0, 0)],
         );
 
-        let optimized = JoinElimination::new().optimize(LogicalPlan::synthetic(plan));
+        let optimized = JoinElimination::new().optimize(OwnedLogicalPlan::synthetic(plan));
         let LogicalOperator::Projection(projection) = &optimized.operator else {
             panic!("expected projection");
         };
@@ -704,7 +704,7 @@ mod tests {
             vec![col(1, 0)],
         );
 
-        let optimized = JoinElimination::new().optimize(LogicalPlan::synthetic(plan));
+        let optimized = JoinElimination::new().optimize(OwnedLogicalPlan::synthetic(plan));
         let LogicalOperator::Projection(projection) = &optimized.operator else {
             panic!("expected projection");
         };
@@ -733,7 +733,7 @@ mod tests {
             vec![col(1, 0)],
         );
 
-        let optimized = JoinElimination::new().optimize(LogicalPlan::synthetic(plan));
+        let optimized = JoinElimination::new().optimize(OwnedLogicalPlan::synthetic(plan));
         let LogicalOperator::Projection(projection) = &optimized.operator else {
             panic!("expected projection");
         };
@@ -762,7 +762,7 @@ mod tests {
             vec![col(0, 0)],
         );
 
-        let optimized = JoinElimination::new().optimize(LogicalPlan::synthetic(plan));
+        let optimized = JoinElimination::new().optimize(OwnedLogicalPlan::synthetic(plan));
         let LogicalOperator::Projection(projection) = &optimized.operator else {
             panic!("expected projection");
         };
@@ -791,7 +791,7 @@ mod tests {
             vec![col(0, 0)],
         );
 
-        let optimized = JoinElimination::new().optimize(LogicalPlan::synthetic(plan));
+        let optimized = JoinElimination::new().optimize(OwnedLogicalPlan::synthetic(plan));
         let LogicalOperator::Projection(projection) = &optimized.operator else {
             panic!("expected projection");
         };

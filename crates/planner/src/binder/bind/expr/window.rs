@@ -373,7 +373,7 @@ mod tests {
     use super::*;
     use crate::binder::test_utils::test_binder_with_search_path;
     use crate::operator::LogicalOperator;
-    use crate::plan::LogicalPlan;
+    use crate::plan::OwnedLogicalPlan;
     use paro_catalog::collection::InstallMode;
     use paro_catalog::entry::{AggregateFunctionCatalogEntry, CatalogEntryEnum, CatalogType};
     use paro_catalog::search_path::CatalogSearchEntry;
@@ -384,7 +384,7 @@ mod tests {
     use paro_parser::ast::Literal;
     use std::sync::Arc;
 
-    fn bind_window_plan(sql: &str) -> Result<LogicalPlan> {
+    fn bind_window_plan(sql: &str) -> Result<OwnedLogicalPlan> {
         let mut binder =
             test_binder_with_search_path(vec![CatalogSearchEntry::schema_only("public")]);
         install_test_aggregate(&binder, get_min_function());

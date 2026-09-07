@@ -12,7 +12,7 @@ use paro_planner::expression::{
     AggregateExpression, ColumnRefExpression, ConstantExpression, Expression, ExpressionIterator,
 };
 use paro_planner::operator::{ColumnBinding, LogicalOperator, Projection};
-use paro_planner::plan::LogicalPlan;
+use paro_planner::plan::OwnedLogicalPlan;
 use paro_planner::visitor::LogicalOperatorVisitor;
 
 use crate::expression::binding_replacer::ReplacementBinding;
@@ -49,7 +49,7 @@ impl<'a> RemoveUnusedColumns<'a> {
     }
 
     pub fn optimize(
-        plan: &mut LogicalPlan,
+        plan: &mut OwnedLogicalPlan,
         binder: &'a Binder,
         session: &'a StatementContext,
         is_root: bool,
@@ -180,7 +180,7 @@ impl<'a> RemoveUnusedColumns<'a> {
     }
 
     fn projected_bindings(
-        plan: &LogicalPlan,
+        plan: &OwnedLogicalPlan,
         projection: &paro_planner::operator::ProjectionMap,
     ) -> Vec<ColumnBinding> {
         let bindings = plan.get_column_bindings();
@@ -204,7 +204,7 @@ impl<'a> RemoveUnusedColumns<'a> {
     }
 
     fn rebuild_projection_map(
-        plan: &LogicalPlan,
+        plan: &OwnedLogicalPlan,
         projected_bindings: &[ColumnBinding],
     ) -> Vec<usize> {
         plan.get_column_bindings()
@@ -216,7 +216,7 @@ impl<'a> RemoveUnusedColumns<'a> {
 }
 
 impl LogicalOperatorVisitor for RemoveUnusedColumns<'_> {
-    fn visit_logical_plan(&mut self, plan: &mut LogicalPlan) {
+    fn visit_logical_plan(&mut self, plan: &mut OwnedLogicalPlan) {
         self.visit_operator(&mut plan.operator);
 
         // Window is cardinality-preserving and only appends computed columns. Once pruning has
@@ -761,11 +761,11 @@ impl LogicalOperatorVisitor for RemoveUnusedColumns<'_> {
                             let projection_index = self.generate_table_index();
                             let old_child = std::mem::replace(
                                 child,
-                                Box::new(LogicalPlan::synthetic(LogicalOperator::DummyScan)),
+                                Box::new(OwnedLogicalPlan::synthetic(LogicalOperator::DummyScan)),
                             );
                             let projection =
                                 Projection::new(projection_index, *old_child, expressions);
-                            *child = Box::new(LogicalPlan::new(
+                            *child = Box::new(OwnedLogicalPlan::new(
                                 &self.binder.bind_context,
                                 LogicalOperator::Projection(projection),
                             ));
@@ -1006,7 +1006,7 @@ mod tests {
         JoinComparisonType, JoinCondition, JoinType, LogicalOperator, PostAggregateReduction,
         Projection,
     };
-    use paro_planner::plan::LogicalPlan;
+    use paro_planner::plan::OwnedLogicalPlan;
 
     fn int_column(table_index: usize, column_index: usize) -> Expression {
         Expression::ColumnRef(ColumnRefExpression::new(
@@ -1027,7 +1027,7 @@ mod tests {
         let session = TestStatementContextBuilder::minimal().build();
         let binder = Binder::new(session.clone());
         let ctx = &binder.bind_context;
-        let values = LogicalPlan::new(
+        let values = OwnedLogicalPlan::new(
             ctx,
             LogicalOperator::ExpressionGet(ExpressionGet::new(
                 10,
@@ -1084,10 +1084,10 @@ mod tests {
             ))],
             predicate,
         });
-        let aggregate = LogicalPlan::new(ctx, LogicalOperator::Aggregate(aggregate));
+        let aggregate = OwnedLogicalPlan::new(ctx, LogicalOperator::Aggregate(aggregate));
         // The public projection observes only the group key. Aggregate #1 is
         // nevertheless required exclusively by the hidden reduction.
-        let mut plan = LogicalPlan::new(
+        let mut plan = OwnedLogicalPlan::new(
             ctx,
             LogicalOperator::Projection(Projection::new(20, aggregate, vec![int_column(11, 0)])),
         );
@@ -1120,7 +1120,7 @@ mod tests {
         let session = TestStatementContextBuilder::minimal().build();
         let binder = Binder::new(session.clone());
         let ctx = &binder.bind_context;
-        let left = LogicalPlan::new(
+        let left = OwnedLogicalPlan::new(
             ctx,
             LogicalOperator::Get(Get::new_without_table(
                 10,
@@ -1128,7 +1128,7 @@ mod tests {
                 vec![LogicalType::Integer, LogicalType::Integer],
             )),
         );
-        let right = LogicalPlan::new(
+        let right = OwnedLogicalPlan::new(
             ctx,
             LogicalOperator::ExpressionGet(ExpressionGet::new(
                 20,
@@ -1149,8 +1149,8 @@ mod tests {
         );
         join.duplicate_eliminated_columns = vec![int_column(10, 1)];
         join.right_projection_map = vec![0].into();
-        let joined = LogicalPlan::new(ctx, LogicalOperator::Join(Join::Comparison(join)));
-        let mut plan = LogicalPlan::new(
+        let joined = OwnedLogicalPlan::new(ctx, LogicalOperator::Join(Join::Comparison(join)));
+        let mut plan = OwnedLogicalPlan::new(
             ctx,
             LogicalOperator::Projection(Projection::new(30, joined, vec![int_column(20, 0)])),
         );
@@ -1179,7 +1179,7 @@ mod tests {
         let session = TestStatementContextBuilder::minimal().build();
         let binder = Binder::new(session.clone());
         let ctx = &binder.bind_context;
-        let scan = LogicalPlan::new(
+        let scan = OwnedLogicalPlan::new(
             ctx,
             LogicalOperator::Get(Get::new_without_table(
                 10,
@@ -1203,8 +1203,8 @@ mod tests {
         correlation_projection.visible_names =
             vec!["payload_0".into(), "payload_1".into(), "__corr_1".into()];
         let correlation_projection =
-            LogicalPlan::new(ctx, LogicalOperator::Projection(correlation_projection));
-        let mut plan = LogicalPlan::new(
+            OwnedLogicalPlan::new(ctx, LogicalOperator::Projection(correlation_projection));
+        let mut plan = OwnedLogicalPlan::new(
             ctx,
             LogicalOperator::Projection(Projection::new(
                 30,
@@ -1235,7 +1235,7 @@ mod tests {
         let session = TestStatementContextBuilder::minimal().build();
         let binder = Binder::new(session.clone());
         let ctx = &binder.bind_context;
-        let scan = LogicalPlan::new(
+        let scan = OwnedLogicalPlan::new(
             ctx,
             LogicalOperator::Get(Get::new_without_table(
                 10,
@@ -1249,8 +1249,8 @@ mod tests {
             vec![int_column(10, 0), int_column(10, 1), int_column(10, 2)],
         )
         .with_visible_names(vec!["dead".into(), "visible".into()]);
-        let projection = LogicalPlan::new(ctx, LogicalOperator::Projection(projection));
-        let mut plan = LogicalPlan::new(
+        let projection = OwnedLogicalPlan::new(ctx, LogicalOperator::Projection(projection));
+        let mut plan = OwnedLogicalPlan::new(
             ctx,
             LogicalOperator::Projection(Projection::new(
                 30,
@@ -1290,8 +1290,8 @@ mod tests {
             vec![LogicalType::Integer; 4],
         );
         get.runtime_filter_expressions.push(int_column(10, 3));
-        let scan = LogicalPlan::new(ctx, LogicalOperator::Get(get));
-        let mut plan = LogicalPlan::new(
+        let scan = OwnedLogicalPlan::new(ctx, LogicalOperator::Get(get));
+        let mut plan = OwnedLogicalPlan::new(
             ctx,
             LogicalOperator::Projection(Projection::new(20, scan, vec![int_column(10, 0)])),
         );
@@ -1324,12 +1324,12 @@ mod tests {
         );
         get.column_types[1] = LogicalType::VarcharCollation("C".into());
         get.returned_types[1] = LogicalType::Varchar;
-        let scan = LogicalPlan::new(ctx, LogicalOperator::Get(get));
+        let scan = OwnedLogicalPlan::new(ctx, LogicalOperator::Get(get));
         let text = Expression::ColumnRef(ColumnRefExpression::new(
             ColumnBinding::new(10, 1),
             LogicalType::Varchar,
         ));
-        let mut plan = LogicalPlan::new(
+        let mut plan = OwnedLogicalPlan::new(
             ctx,
             LogicalOperator::Projection(Projection::new(20, scan, vec![text])),
         );
@@ -1354,7 +1354,7 @@ mod tests {
         let session = TestStatementContextBuilder::minimal().build();
         let binder = Binder::new(session.clone());
         let ctx = &binder.bind_context;
-        let scan = LogicalPlan::new(
+        let scan = OwnedLogicalPlan::new(
             ctx,
             LogicalOperator::Get(Get::new_without_table(
                 10,
@@ -1373,8 +1373,8 @@ mod tests {
         ));
         let mut filter = Filter::new(scan, vec![predicate]);
         filter.projection_map = vec![0, 2].into();
-        let filtered = LogicalPlan::new(ctx, LogicalOperator::Filter(filter));
-        let mut plan = LogicalPlan::new(
+        let filtered = OwnedLogicalPlan::new(ctx, LogicalOperator::Filter(filter));
+        let mut plan = OwnedLogicalPlan::new(
             ctx,
             LogicalOperator::Projection(Projection::new(20, filtered, vec![int_column(10, 2)])),
         );

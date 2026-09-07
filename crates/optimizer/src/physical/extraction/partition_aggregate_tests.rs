@@ -10,13 +10,13 @@ use paro_planner::expression::{
     AggregateExpression, Expression, ReferenceExpression, WindowExpression, WindowFrame,
 };
 use paro_planner::operator::{ExpressionGet, LogicalOperator, Window as LogicalWindow};
-use paro_planner::plan::LogicalPlan;
+use paro_planner::plan::OwnedLogicalPlan;
 
 use super::{ExtractionContext, PhysicalNodeKind, PhysicalPlan, PhysicalPlanExtractor};
 
 fn lower_full_partition_window(function: AggregateFunction) -> PhysicalPlan {
     let ctx = BindContext::new();
-    let values = LogicalPlan::new(
+    let values = OwnedLogicalPlan::new(
         &ctx,
         LogicalOperator::ExpressionGet(ExpressionGet::new(
             0,
@@ -34,7 +34,7 @@ fn lower_full_partition_window(function: AggregateFunction) -> PhysicalPlan {
         ))],
         return_type,
     );
-    let window = LogicalPlan::new(
+    let window = OwnedLogicalPlan::new(
         &ctx,
         LogicalOperator::Window(LogicalWindow::new(
             2,

@@ -27,7 +27,7 @@ use paro_planner::binder::deep_copy::{
 };
 use paro_planner::binder::Binder;
 use paro_planner::operator::{Join, JoinType, LogicalOperator};
-use paro_planner::plan::LogicalPlan;
+use paro_planner::plan::OwnedLogicalPlan;
 use paro_planner::verify::verify_physical_planner_invariants;
 use paro_storage::statistics::ColumnStatistics;
 use tracing::debug;
@@ -76,7 +76,7 @@ const CORRELATED_TOPN_PAYLOAD_REGION_RULE: crate::cascades::RuleId =
     crate::cascades::RuleId(10_022);
 
 struct CandidatePlan {
-    plan: LogicalPlan,
+    plan: OwnedLogicalPlan,
     column_stats: Arc<HashMap<paro_planner::operator::ColumnBinding, Arc<ColumnStatistics>>>,
 }
 
@@ -137,8 +137,8 @@ impl Optimizer {
     #[cfg(test)]
     pub(crate) fn correlated_frontier_for_test(
         &mut self,
-        plan: LogicalPlan,
-    ) -> Result<LogicalPlan> {
+        plan: OwnedLogicalPlan,
+    ) -> Result<OwnedLogicalPlan> {
         let prepared = self.prepare_correlated_seed(plan);
         let canonical = self.canonicalize_query(prepared)?;
         Ok(self.correlated_aggregate_candidate(canonical)?.plan)
@@ -147,15 +147,15 @@ impl Optimizer {
     #[cfg(test)]
     pub(crate) fn scalar_reuse_frontier_for_test(
         &mut self,
-        plan: LogicalPlan,
-    ) -> Result<LogicalPlan> {
+        plan: OwnedLogicalPlan,
+    ) -> Result<OwnedLogicalPlan> {
         let prepared = self.prepare_correlated_seed(plan);
         let canonical = self.canonicalize_query(prepared)?;
         let baseline = self.settle_query_candidate(canonical)?;
         Ok(self.scalar_reuse_candidate(baseline)?.plan)
     }
 
-    pub fn optimize(&mut self, plan: LogicalPlan) -> Result<OptimizedStatement> {
+    pub fn optimize(&mut self, plan: OwnedLogicalPlan) -> Result<OptimizedStatement> {
         // Allocation attribution is a planning concern. The global allocator
         // remains installed for observation, while counter updates are scoped
         // to this synchronous compiler operation so execution pays no tax.
@@ -470,7 +470,7 @@ impl Optimizer {
         let child_estimate = variant.plan.stats.estimated_cardinality;
         let child = std::mem::replace(
             &mut variant.plan,
-            LogicalPlan::synthetic(LogicalOperator::DummyScan),
+            OwnedLogicalPlan::synthetic(LogicalOperator::DummyScan),
         );
         let mut statement = layer.attach(child);
         if let Some(cardinality) = layer.result_cardinality() {
@@ -502,7 +502,7 @@ impl Optimizer {
         let child_contract = extracted_root_contract(variant)?.clone();
         let child = std::mem::replace(
             &mut variant.plan,
-            LogicalPlan::synthetic(LogicalOperator::DummyScan),
+            OwnedLogicalPlan::synthetic(LogicalOperator::DummyScan),
         );
         let plan = explain.attach(child);
         let local_cost = self.statement_local_cost(100, None)?;
@@ -547,7 +547,7 @@ impl Optimizer {
 
     fn extract_utility(
         &self,
-        utility: LogicalPlan,
+        utility: OwnedLogicalPlan,
         grant_classes: &[ResourceGrantClass],
     ) -> Result<PhysicalPlanPortfolio> {
         let mut class_plans = Vec::with_capacity(grant_classes.len());
@@ -737,7 +737,7 @@ impl Optimizer {
 
     fn plan_dependency_template_for(
         &self,
-        plan: &LogicalPlan,
+        plan: &OwnedLogicalPlan,
     ) -> Result<crate::physical::PlanDependencies> {
         fn graph_key(id: &GraphId) -> Fingerprint {
             let mut fingerprint = StableFingerprintBuilder::default();
@@ -748,7 +748,7 @@ impl Optimizer {
 
         fn collect(
             optimizer: &Optimizer,
-            plan: &LogicalPlan,
+            plan: &OwnedLogicalPlan,
             dependencies: &mut crate::physical::PlanDependencies,
         ) {
             if let LogicalOperator::GraphScan(scan) = &plan.operator {
@@ -790,7 +790,7 @@ impl Optimizer {
 
     /// Only canonical, mandatory semantic work belongs here. Cost alternatives
     /// are owned by the implementation registry after this boundary.
-    fn canonicalize_query(&mut self, mut plan: LogicalPlan) -> Result<LogicalPlan> {
+    fn canonicalize_query(&mut self, mut plan: OwnedLogicalPlan) -> Result<OwnedLogicalPlan> {
         if self.ctx.verify_enabled {
             verify_logical_plan(&self.ctx.bind_context, &plan)?;
         }
@@ -833,7 +833,7 @@ impl Optimizer {
         Ok(plan)
     }
 
-    fn estimate_query_candidate(&self, mut plan: LogicalPlan) -> Result<CandidatePlan> {
+    fn estimate_query_candidate(&self, mut plan: OwnedLogicalPlan) -> Result<CandidatePlan> {
         let mut context = self.ctx.fork_for_candidate(Arc::new(HashMap::new()));
 
         plan = StatisticsGathering::new().gather(plan, &mut context)?;
@@ -848,7 +848,7 @@ impl Optimizer {
         })
     }
 
-    fn settle_schema_candidate(&self, mut plan: LogicalPlan) -> Result<CandidatePlan> {
+    fn settle_schema_candidate(&self, mut plan: OwnedLogicalPlan) -> Result<CandidatePlan> {
         // Optional region rewrites and CTE substitution can expose a new
         // Filter(CrossProduct) boundary after the initial semantic pass. Keep
         // the Query-IR boundary canonical so equality edges always reach join
@@ -879,14 +879,14 @@ impl Optimizer {
         Ok(candidate)
     }
 
-    fn settle_query_candidate(&self, plan: LogicalPlan) -> Result<CandidatePlan> {
+    fn settle_query_candidate(&self, plan: OwnedLogicalPlan) -> Result<CandidatePlan> {
         let candidate = self.settle_schema_candidate(plan)?;
         self.finalize_query_candidate(candidate)
     }
 
     fn distinct_aggregate_feasibility_candidate(
         &self,
-        plan: LogicalPlan,
+        plan: OwnedLogicalPlan,
     ) -> Result<Option<CandidatePlan>> {
         let (plan, changed) = distinct_decomposition::optimize_plan(plan, &self.ctx.bind_context)?;
         if !changed {
@@ -895,7 +895,7 @@ impl Optimizer {
         self.settle_query_candidate(plan).map(Some)
     }
 
-    fn settle_relational_baseline(&self, plan: LogicalPlan) -> Result<CandidatePlan> {
+    fn settle_relational_baseline(&self, plan: OwnedLogicalPlan) -> Result<CandidatePlan> {
         // Direct two-valued existence decorrelation and sibling-marker folding
         // erase only delimiter carriers and multiplicity that no SQL result can
         // observe. They therefore define the baseline relational form rather
@@ -920,7 +920,7 @@ impl Optimizer {
         self.settle_query_candidate(plan)
     }
 
-    fn correlated_aggregate_candidate(&self, plan: LogicalPlan) -> Result<CandidatePlan> {
+    fn correlated_aggregate_candidate(&self, plan: OwnedLogicalPlan) -> Result<CandidatePlan> {
         let input_shape = tracing::enabled!(target: targets::OPTIMIZER, tracing::Level::DEBUG)
             .then(|| logical_plan_shape(&plan));
         let ordered = JoinOrderOptimizer::new(self.ctx.cost_model.defaults.clone())
@@ -969,7 +969,7 @@ impl Optimizer {
         Ok(None)
     }
 
-    fn prepare_correlated_seed(&self, plan: LogicalPlan) -> LogicalPlan {
+    fn prepare_correlated_seed(&self, plan: OwnedLogicalPlan) -> OwnedLogicalPlan {
         // Correlated-region exploration must preserve sharing ownership. A
         // CTE reference is a semantic relation leaf whose producer statistics
         // and execution contract remain owned by MaterializedCTE; duplicating
@@ -999,7 +999,7 @@ impl Optimizer {
     }
 }
 
-fn observes_optimizer_diagnostics(plan: &LogicalPlan) -> bool {
+fn observes_optimizer_diagnostics(plan: &OwnedLogicalPlan) -> bool {
     matches!(
         &plan.operator,
         LogicalOperator::TableFunctionGet(function)
@@ -1010,7 +1010,7 @@ fn observes_optimizer_diagnostics(plan: &LogicalPlan) -> bool {
         .any(observes_optimizer_diagnostics)
 }
 
-fn contains_redundant_computation_region(plan: &LogicalPlan) -> bool {
+fn contains_redundant_computation_region(plan: &OwnedLogicalPlan) -> bool {
     let local_candidate = match &plan.operator {
         LogicalOperator::Join(Join::Comparison(join)) if join.join_type == JoinType::Single => {
             contains_aggregate(&join.right)
@@ -1034,15 +1034,15 @@ fn contains_redundant_computation_region(plan: &LogicalPlan) -> bool {
             .any(contains_redundant_computation_region)
 }
 
-fn contains_aggregate(plan: &LogicalPlan) -> bool {
+fn contains_aggregate(plan: &OwnedLogicalPlan) -> bool {
     matches!(plan.operator, LogicalOperator::Aggregate(_))
         || plan.children().into_iter().any(contains_aggregate)
 }
 
-fn logical_plan_shape(plan: &LogicalPlan) -> String {
+fn logical_plan_shape(plan: &OwnedLogicalPlan) -> String {
     use std::fmt::Write;
 
-    fn append(plan: &LogicalPlan, output: &mut String) {
+    fn append(plan: &OwnedLogicalPlan, output: &mut String) {
         match &plan.operator {
             LogicalOperator::Join(Join::Comparison(join)) => {
                 let _ = write!(
@@ -1080,13 +1080,13 @@ fn logical_plan_shape(plan: &LogicalPlan) -> String {
 /// GraphMatch decomposition.  The binder order is retained as candidate zero;
 /// every additional frontier is only a certified equivalent input to Memo.
 fn enumerate_graph_region_plans(
-    plan: LogicalPlan,
+    plan: OwnedLogicalPlan,
     bind_context: &paro_planner::binder::context::BindContext,
     max_optional_frontiers: u32,
-) -> Result<Vec<LogicalPlan>> {
+) -> Result<Vec<OwnedLogicalPlan>> {
     type PatternOrder = Vec<paro_planner::binder::bind::graph::BoundPatternElement>;
 
-    fn collect(plan: &LogicalPlan, patterns: &mut Vec<Vec<PatternOrder>>, per_pattern_max: usize) {
+    fn collect(plan: &OwnedLogicalPlan, patterns: &mut Vec<Vec<PatternOrder>>, per_pattern_max: usize) {
         if let LogicalOperator::GraphMatch(graph_match) = &plan.operator {
             patterns.push(
                 GraphFrontierEnumerator::new()
@@ -1099,7 +1099,7 @@ fn enumerate_graph_region_plans(
     }
 
     fn replace_nth(
-        plan: &mut LogicalPlan,
+        plan: &mut OwnedLogicalPlan,
         target: usize,
         seen: &mut usize,
         order: &[paro_planner::binder::bind::graph::BoundPatternElement],

@@ -12,14 +12,14 @@ use paro_planner::operator::{
     ColumnBinding, ComparisonJoin, Join, JoinComparisonType, JoinCondition, JoinType,
     LogicalOperator, Projection, SetOperation,
 };
-use paro_planner::plan::{LogicalPlan, NodeStats};
+use paro_planner::plan::{OwnedLogicalPlan, NodeStats};
 
 use super::MaterializedDemandInfo;
 
 pub(super) fn build_demand_relation(
     info: MaterializedDemandInfo,
     bind_context: &BindContext,
-) -> Option<(Vec<usize>, LogicalPlan)> {
+) -> Option<(Vec<usize>, OwnedLogicalPlan)> {
     let first = info.joined_refs.first()?;
     let key_ordinals = first.key_ordinals.clone();
     let key_types = first.key_types.clone();
@@ -33,7 +33,7 @@ pub(super) fn build_demand_relation(
 
     let mut branches = info.joined_refs.into_iter().map(|demand| {
         let projection_index = bind_context.generate_table_index();
-        LogicalPlan::new(
+        OwnedLogicalPlan::new(
             bind_context,
             LogicalOperator::Projection(
                 Projection::new(projection_index, demand.plan, demand.expressions)
@@ -44,7 +44,7 @@ pub(super) fn build_demand_relation(
     let mut relation = branches.next()?;
     for branch in branches {
         let set_index = bind_context.generate_table_index();
-        relation = LogicalPlan::new(
+        relation = OwnedLogicalPlan::new(
             bind_context,
             LogicalOperator::SetOperation(SetOperation::union(
                 set_index,
@@ -59,9 +59,9 @@ pub(super) fn build_demand_relation(
 }
 
 pub(super) fn push_group_demand(
-    producer: &mut LogicalPlan,
+    producer: &mut OwnedLogicalPlan,
     key_ordinals: &[usize],
-    demand: LogicalPlan,
+    demand: OwnedLogicalPlan,
     bind_context: &BindContext,
 ) -> bool {
     let output_bindings = producer.get_column_bindings();
@@ -79,9 +79,9 @@ pub(super) fn push_group_demand(
 }
 
 fn push_group_demand_inner(
-    producer: &mut LogicalPlan,
+    producer: &mut OwnedLogicalPlan,
     keys: Vec<(ColumnBinding, LogicalType)>,
-    demand: LogicalPlan,
+    demand: OwnedLogicalPlan,
     bind_context: &BindContext,
 ) -> bool {
     match &mut producer.operator {
@@ -146,9 +146,9 @@ fn push_group_demand_inner(
 }
 
 fn push_to_key_owner(
-    producer: &mut LogicalPlan,
+    producer: &mut OwnedLogicalPlan,
     key_expressions: &[Expression],
-    demand: LogicalPlan,
+    demand: OwnedLogicalPlan,
     bind_context: &BindContext,
 ) -> bool {
     let mut key_bindings = Vec::new();
@@ -215,8 +215,8 @@ fn push_to_key_owner(
             )
         })
         .collect();
-    let preserved = std::mem::replace(producer, LogicalPlan::synthetic(LogicalOperator::DummyScan));
-    *producer = LogicalPlan::new(
+    let preserved = std::mem::replace(producer, OwnedLogicalPlan::synthetic(LogicalOperator::DummyScan));
+    *producer = OwnedLogicalPlan::new(
         bind_context,
         LogicalOperator::Join(Join::Comparison(ComparisonJoin::new(
             JoinType::Semi,

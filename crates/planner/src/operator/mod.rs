@@ -5,6 +5,7 @@
 //!
 //!
 
+mod child_links;
 mod column_binding;
 mod operator_type;
 mod plan_operator;

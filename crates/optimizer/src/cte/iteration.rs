@@ -12,11 +12,11 @@
 
 use paro_common::error::{self as paro_error, Result};
 use paro_planner::operator::{Join, JoinType, LogicalOperator};
-use paro_planner::plan::LogicalPlan;
+use paro_planner::plan::OwnedLogicalPlan;
 
 /// Normalize every recursive member's join ownership without affecting CTE
 /// references that consume the completed result outside the iteration.
-pub(crate) fn normalize_iteration_ownership(plan: LogicalPlan) -> Result<LogicalPlan> {
+pub(crate) fn normalize_iteration_ownership(plan: OwnedLogicalPlan) -> Result<OwnedLogicalPlan> {
     plan.try_map_post_order(|plan| {
         plan.try_map_operator(|operator| match operator {
             LogicalOperator::RecursiveCTE(mut cte) => {
@@ -33,10 +33,10 @@ pub(crate) fn normalize_iteration_ownership(plan: LogicalPlan) -> Result<Logical
 }
 
 fn orient_recursive_member(
-    plan: LogicalPlan,
+    plan: OwnedLogicalPlan,
     cte_index: usize,
     cte_name: &str,
-) -> Result<LogicalPlan> {
+) -> Result<OwnedLogicalPlan> {
     let (plan, _) = plan.try_fold_post_order(|mut plan, children: Vec<bool>| {
         let contains_reference = matches!(
             &plan.operator,
@@ -108,12 +108,12 @@ mod tests {
         JoinBuildSideConstraint, JoinComparisonType, JoinCondition, JoinType, LogicalOperator,
         RecursiveCTE,
     };
-    use paro_planner::plan::LogicalPlan;
+    use paro_planner::plan::OwnedLogicalPlan;
 
     use super::normalize_iteration_ownership;
 
-    fn values(table_index: usize) -> LogicalPlan {
-        LogicalPlan::synthetic(LogicalOperator::ExpressionGet(ExpressionGet::new(
+    fn values(table_index: usize) -> OwnedLogicalPlan {
+        OwnedLogicalPlan::synthetic(LogicalOperator::ExpressionGet(ExpressionGet::new(
             table_index,
             vec![vec![Expression::Constant(
                 paro_planner::expression::ConstantExpression::new(
@@ -126,8 +126,8 @@ mod tests {
         )))
     }
 
-    fn recursive_reference(cte_index: usize, table_index: usize) -> LogicalPlan {
-        LogicalPlan::synthetic(LogicalOperator::CTERef(CTERef::new(
+    fn recursive_reference(cte_index: usize, table_index: usize) -> OwnedLogicalPlan {
+        OwnedLogicalPlan::synthetic(LogicalOperator::CTERef(CTERef::new(
             cte_index,
             table_index,
             "delta".to_string(),
@@ -152,7 +152,7 @@ mod tests {
             )),
             JoinComparisonType::LessThan,
         );
-        let recursive = LogicalPlan::synthetic(LogicalOperator::Join(Join::Comparison(
+        let recursive = OwnedLogicalPlan::synthetic(LogicalOperator::Join(Join::Comparison(
             ComparisonJoin::new(
                 JoinType::Inner,
                 values(static_table_index),
@@ -160,7 +160,7 @@ mod tests {
                 vec![condition],
             ),
         )));
-        let plan = LogicalPlan::synthetic(LogicalOperator::RecursiveCTE(RecursiveCTE {
+        let plan = OwnedLogicalPlan::synthetic(LogicalOperator::RecursiveCTE(RecursiveCTE {
             cte_index,
             cte_name: "walk".to_string(),
             column_names: vec!["value".to_string()],
@@ -200,7 +200,7 @@ mod tests {
     fn arbitrary_join_persists_recursive_build_ownership() {
         let cte_index = 7;
         let recursive =
-            LogicalPlan::synthetic(LogicalOperator::Join(Join::Any(Box::new(AnyJoin::new(
+            OwnedLogicalPlan::synthetic(LogicalOperator::Join(Join::Any(Box::new(AnyJoin::new(
                 JoinType::Inner,
                 values(11),
                 recursive_reference(cte_index, 12),
@@ -209,7 +209,7 @@ mod tests {
                     LogicalType::Boolean,
                 )),
             )))));
-        let plan = LogicalPlan::synthetic(LogicalOperator::RecursiveCTE(RecursiveCTE {
+        let plan = OwnedLogicalPlan::synthetic(LogicalOperator::RecursiveCTE(RecursiveCTE {
             cte_index,
             cte_name: "walk".to_string(),
             column_names: vec!["value".to_string()],
@@ -233,10 +233,10 @@ mod tests {
     #[test]
     fn cross_product_persists_recursive_build_ownership() {
         let cte_index = 7;
-        let recursive = LogicalPlan::synthetic(LogicalOperator::Join(Join::Cross(
+        let recursive = OwnedLogicalPlan::synthetic(LogicalOperator::Join(Join::Cross(
             CrossProduct::new(values(11), recursive_reference(cte_index, 12)),
         )));
-        let plan = LogicalPlan::synthetic(LogicalOperator::RecursiveCTE(RecursiveCTE {
+        let plan = OwnedLogicalPlan::synthetic(LogicalOperator::RecursiveCTE(RecursiveCTE {
             cte_index,
             cte_name: "walk".to_string(),
             column_names: vec!["value".to_string()],

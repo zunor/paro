@@ -22,7 +22,7 @@ use paro_planner::operator::{
     aggregate::GroupDependency, empty_result::EmptyResult, Aggregate, ColumnBinding, Join,
     JoinComparisonType, LogicalOperator, LogicalOutputLayout,
 };
-use paro_planner::plan::{LogicalPlan, LogicalPlanPostOrderFolder};
+use paro_planner::plan::{OwnedLogicalPlan, LogicalPlanPostOrderFolder};
 use paro_storage::statistics::{BaseStatistics, ColumnStatistics, NumericStats, StatsInfo};
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -115,7 +115,7 @@ fn derive_group_dependencies(aggregate: &Aggregate) -> Vec<GroupDependency> {
 }
 
 fn collect_group_dependencies(
-    plan: &LogicalPlan,
+    plan: &OwnedLogicalPlan,
     aggregate: &Aggregate,
     group_bindings: &[Option<ColumnBinding>],
     dependencies: &mut Vec<GroupDependency>,
@@ -185,10 +185,10 @@ struct StatisticsPropagationFolder<'a> {
 impl LogicalPlanPostOrderFolder<LogicalOutputLayout> for StatisticsPropagationFolder<'_> {
     fn child_completed(
         &mut self,
-        parent_skeleton: &LogicalPlan,
-        completed_children: &[LogicalPlan],
+        parent_skeleton: &OwnedLogicalPlan,
+        completed_children: &[OwnedLogicalPlan],
         completed_layouts: &[LogicalOutputLayout],
-        _remaining_children: &[LogicalPlan],
+        _remaining_children: &[OwnedLogicalPlan],
     ) -> Result<()> {
         if completed_children.len() != 1 {
             return Ok(());
@@ -215,9 +215,9 @@ impl LogicalPlanPostOrderFolder<LogicalOutputLayout> for StatisticsPropagationFo
 
     fn fold(
         &mut self,
-        plan: LogicalPlan,
+        plan: OwnedLogicalPlan,
         child_layouts: Vec<LogicalOutputLayout>,
-    ) -> Result<(LogicalPlan, LogicalOutputLayout)> {
+    ) -> Result<(OwnedLogicalPlan, LogicalOutputLayout)> {
         let plan = plan
             .map_operator(|operator| self.propagator.propagate_operator(self.context, operator));
         let output_layout = plan.operator.output_layout_from_children(&child_layouts);
@@ -250,7 +250,7 @@ impl StatisticsPropagator {
     }
 
     /// Propagate statistics through a logical plan root.
-    pub fn propagate(&mut self, ctx: Arc<StatementContext>, plan: LogicalPlan) -> LogicalPlan {
+    pub fn propagate(&mut self, ctx: Arc<StatementContext>, plan: OwnedLogicalPlan) -> OwnedLogicalPlan {
         self.propagate_plan(ctx.as_ref(), plan)
     }
 
@@ -474,7 +474,7 @@ impl StatisticsPropagator {
         );
     }
 
-    fn propagate_plan(&mut self, ctx: &StatementContext, plan: LogicalPlan) -> LogicalPlan {
+    fn propagate_plan(&mut self, ctx: &StatementContext, plan: OwnedLogicalPlan) -> OwnedLogicalPlan {
         let mut folder = StatisticsPropagationFolder {
             propagator: self,
             context: ctx,
@@ -516,7 +516,7 @@ impl StatisticsPropagator {
                         | FilterPropagateResult::FilterFalseOrNull => {
                             filter.expressions.clear();
                             return LogicalOperator::EmptyResult(EmptyResult::new(
-                                LogicalPlan::synthetic(LogicalOperator::Filter(filter)),
+                                OwnedLogicalPlan::synthetic(LogicalOperator::Filter(filter)),
                             ));
                         }
                         _ => {
@@ -1029,7 +1029,7 @@ mod tests {
             TableCatalogEntry::from_info(info, storage, CatalogObjectId::from_raw(20_001), 0)
                 .unwrap(),
         );
-        let child = LogicalPlan::synthetic(LogicalOperator::Get(Get::new(
+        let child = OwnedLogicalPlan::synthetic(LogicalOperator::Get(Get::new(
             7,
             vec!["key".to_string(), "name".to_string(), "comment".to_string()],
             types.clone(),
@@ -1056,7 +1056,7 @@ mod tests {
     #[test]
     fn primary_key_proves_group_dependencies_without_runtime_statistics() {
         let aggregate = keyed_group_aggregate(Constraint::primary_key(vec![0]));
-        let plan = LogicalPlan::synthetic(LogicalOperator::Aggregate(aggregate));
+        let plan = OwnedLogicalPlan::synthetic(LogicalOperator::Aggregate(aggregate));
         let propagated = StatisticsPropagator::new().propagate(make_test_session(), plan);
         let LogicalOperator::Aggregate(aggregate) = &propagated.operator else {
             panic!("expected aggregate root");
@@ -1083,7 +1083,7 @@ mod tests {
     #[test]
     fn false_filter_becomes_schema_preserving_empty_result() {
         let bind_context = BindContext::new();
-        let child = LogicalPlan::new(
+        let child = OwnedLogicalPlan::new(
             &bind_context,
             LogicalOperator::ExpressionGet(ExpressionGet::new(
                 7,
@@ -1095,7 +1095,7 @@ mod tests {
                 vec![LogicalType::Integer],
             )),
         );
-        let filter = LogicalPlan::new(
+        let filter = OwnedLogicalPlan::new(
             &bind_context,
             LogicalOperator::Filter(Filter::new(
                 child,
@@ -1125,7 +1125,7 @@ mod tests {
             .spawn(|| {
                 const DEPTH: usize = 10_000;
                 let bind_context = BindContext::new();
-                let mut plan = LogicalPlan::new(
+                let mut plan = OwnedLogicalPlan::new(
                     &bind_context,
                     LogicalOperator::ExpressionGet(ExpressionGet::new(
                         17,
@@ -1138,7 +1138,7 @@ mod tests {
                     )),
                 );
                 for _ in 0..DEPTH {
-                    plan = LogicalPlan::new(
+                    plan = OwnedLogicalPlan::new(
                         &bind_context,
                         LogicalOperator::Limit(Limit::new(plan, None, None)),
                     );
@@ -1172,13 +1172,13 @@ mod tests {
                 let mut aggregate = keyed_group_aggregate(Constraint::primary_key(vec![0]));
                 let mut child = *aggregate.child;
                 for _ in 0..DEPTH {
-                    child = LogicalPlan::synthetic(LogicalOperator::Limit(Limit::new(
+                    child = OwnedLogicalPlan::synthetic(LogicalOperator::Limit(Limit::new(
                         child, None, None,
                     )));
                 }
                 aggregate.child = Box::new(child);
 
-                let plan = LogicalPlan::synthetic(LogicalOperator::Aggregate(aggregate));
+                let plan = OwnedLogicalPlan::synthetic(LogicalOperator::Aggregate(aggregate));
                 let propagated = StatisticsPropagator::new().propagate(make_test_session(), plan);
                 let LogicalOperator::Aggregate(aggregate) = &propagated.operator else {
                     panic!("expected aggregate root");
@@ -1246,7 +1246,7 @@ mod tests {
     #[test]
     fn recursive_reference_does_not_inherit_anchor_only_domain() {
         let bind_context = BindContext::new();
-        let anchor = LogicalPlan::new(
+        let anchor = OwnedLogicalPlan::new(
             &bind_context,
             LogicalOperator::ExpressionGet(ExpressionGet::new(
                 7,
@@ -1259,10 +1259,10 @@ mod tests {
             )),
         );
         let recursive_binding = ColumnBinding::new(8, 0);
-        let recursive = LogicalPlan::new(
+        let recursive = OwnedLogicalPlan::new(
             &bind_context,
             LogicalOperator::Filter(Filter::new(
-                LogicalPlan::new(
+                OwnedLogicalPlan::new(
                     &bind_context,
                     LogicalOperator::CTERef(CTERef::new(
                         3,
@@ -1285,7 +1285,7 @@ mod tests {
                 ))],
             )),
         );
-        let plan = LogicalPlan::new(
+        let plan = OwnedLogicalPlan::new(
             &bind_context,
             LogicalOperator::RecursiveCTE(RecursiveCTE {
                 cte_index: 3,
@@ -1311,11 +1311,11 @@ mod tests {
     #[test]
     fn window_outputs_keep_statistics_available_to_parent_projections() {
         let bind_context = BindContext::new();
-        let input = LogicalPlan::new(
+        let input = OwnedLogicalPlan::new(
             &bind_context,
             LogicalOperator::Projection(Projection::new(
                 7,
-                LogicalPlan::new(&bind_context, LogicalOperator::DummyScan),
+                OwnedLogicalPlan::new(&bind_context, LogicalOperator::DummyScan),
                 vec![Expression::Constant(ConstantExpression::new(
                     Value::Integer(11),
                     LogicalType::Integer,
@@ -1323,7 +1323,7 @@ mod tests {
             )),
         );
         let function = WindowFunction::row_number();
-        let window = LogicalPlan::new(
+        let window = OwnedLogicalPlan::new(
             &bind_context,
             LogicalOperator::Window(Window::new(
                 20,
@@ -1341,7 +1341,7 @@ mod tests {
                 input,
             )),
         );
-        let root = LogicalPlan::new(
+        let root = OwnedLogicalPlan::new(
             &bind_context,
             LogicalOperator::Projection(Projection::new(
                 30,
@@ -1375,18 +1375,18 @@ mod tests {
     #[test]
     fn aggregate_retains_group_statistics_for_physical_planning() {
         let bind_context = BindContext::new();
-        let input = LogicalPlan::new(
+        let input = OwnedLogicalPlan::new(
             &bind_context,
             LogicalOperator::Projection(Projection::new(
                 7,
-                LogicalPlan::new(&bind_context, LogicalOperator::DummyScan),
+                OwnedLogicalPlan::new(&bind_context, LogicalOperator::DummyScan),
                 vec![Expression::Constant(ConstantExpression::new(
                     Value::Varchar("R".to_string()),
                     LogicalType::Varchar,
                 ))],
             )),
         );
-        let aggregate = LogicalPlan::new(
+        let aggregate = OwnedLogicalPlan::new(
             &bind_context,
             LogicalOperator::Aggregate(Aggregate::new(
                 20,

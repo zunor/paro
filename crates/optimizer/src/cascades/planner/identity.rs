@@ -24,7 +24,7 @@ pub(super) fn typed_binding_fingerprint(
 
 #[cfg(test)]
 pub(super) fn query_operator_fingerprint(
-    plan: &LogicalPlan,
+    plan: &OwnedLogicalPlan,
     scalar_roots: &[ScalarExprId],
     scalars: &ScalarArena,
 ) -> Result<Fingerprint> {
@@ -35,7 +35,7 @@ pub(super) fn query_operator_fingerprint(
 /// The encoding is retained by the Memo payload and is the final equality
 /// check; the 128-bit digest is only an index accelerator.
 pub(super) fn query_operator_identity(
-    plan: &LogicalPlan,
+    plan: &OwnedLogicalPlan,
     scalar_roots: &[ScalarExprId],
     scalars: &ScalarArena,
 ) -> Result<(Fingerprint, Box<[u8]>)> {

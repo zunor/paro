@@ -6,12 +6,12 @@
 //!
 
 use crate::expression::Expression;
-use crate::plan::LogicalPlan;
+use crate::plan::OwnedLogicalPlan;
 use paro_common::types::LogicalType;
 
 /// Projection represents a projection operation (SELECT list).
-#[derive(Debug)]
-pub struct Projection {
+#[derive(Debug, Clone)]
+pub struct Projection<Child = Box<OwnedLogicalPlan>> {
     pub table_index: usize,
     pub expressions: Vec<Expression>,
     /// User-visible names form a prefix of `expressions`. Query binding may
@@ -24,12 +24,12 @@ pub struct Projection {
     /// Optional relation namespace owned by the visible output prefix. This
     /// survives CTE inlining so physical plans can qualify self-join inputs.
     pub visible_qualifier: Option<String>,
-    pub child: Box<LogicalPlan>,
+    pub child: Child,
     pub returned_types: Vec<LogicalType>, // Cached types of expressions
 }
 
 impl Projection {
-    pub fn new(table_index: usize, child: LogicalPlan, expressions: Vec<Expression>) -> Self {
+    pub fn new(table_index: usize, child: OwnedLogicalPlan, expressions: Vec<Expression>) -> Self {
         let visible_count = expressions.len();
         let returned_types = expressions.iter().map(|e| e.return_type()).collect();
         let visible_names = (0..expressions.len())

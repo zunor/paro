@@ -6,13 +6,13 @@
 use crate::binder::plan::subquery::flatten_dependent_join;
 use crate::binder::Binder;
 use crate::operator::{Join, LogicalOperator};
-use crate::plan::LogicalPlan;
+use crate::plan::OwnedLogicalPlan;
 use paro_common::error::Result;
 
 pub(crate) fn flatten_dependent_joins_in_plan(
     binder: &mut Binder,
-    plan: LogicalPlan,
-) -> Result<LogicalPlan> {
+    plan: OwnedLogicalPlan,
+) -> Result<OwnedLogicalPlan> {
     let (id, stats, operator) = plan.into_parts();
     let operator = match operator {
         LogicalOperator::DependentJoin(dep) => flatten_dependent_join(binder, dep)?,
@@ -145,7 +145,7 @@ pub(crate) fn flatten_dependent_joins_in_plan(
         | LogicalOperator::GraphMatch(_)
         | LogicalOperator::GraphScan(_)) => other,
     };
-    Ok(LogicalPlan {
+    Ok(OwnedLogicalPlan {
         id,
         stats,
         operator,
@@ -162,6 +162,9 @@ pub fn has_dependent_join(op: &LogicalOperator) -> bool {
     }
 }
 
-pub fn flatten_all_dependent_joins(binder: &mut Binder, plan: LogicalPlan) -> Result<LogicalPlan> {
+pub fn flatten_all_dependent_joins(
+    binder: &mut Binder,
+    plan: OwnedLogicalPlan,
+) -> Result<OwnedLogicalPlan> {
     flatten_dependent_joins_in_plan(binder, plan)
 }

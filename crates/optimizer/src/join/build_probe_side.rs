@@ -15,7 +15,7 @@ use paro_context::StatementContext;
 use paro_planner::operator::{Join, LogicalOperator};
 #[cfg(test)]
 use paro_planner::operator::{JoinBuildSideConstraint, JoinType, ProjectionMap};
-use paro_planner::plan::LogicalPlan;
+use paro_planner::plan::OwnedLogicalPlan;
 
 /// Choose a cheaper build side for joins.
 #[cfg(test)]
@@ -31,15 +31,15 @@ impl BuildProbeSideOptimizer {
 
     #[cfg(test)]
     fn optimize(&mut self, plan: LogicalOperator) -> LogicalOperator {
-        self.optimize_plan(LogicalPlan::synthetic(plan))
+        self.optimize_plan(OwnedLogicalPlan::synthetic(plan))
             .into_operator()
     }
 
-    pub fn optimize_plan(&mut self, plan: LogicalPlan) -> LogicalPlan {
+    pub fn optimize_plan(&mut self, plan: OwnedLogicalPlan) -> OwnedLogicalPlan {
         self.optimize_recursive_plan(plan)
     }
 
-    fn optimize_recursive_plan(&mut self, plan: LogicalPlan) -> LogicalPlan {
+    fn optimize_recursive_plan(&mut self, plan: OwnedLogicalPlan) -> OwnedLogicalPlan {
         let plan = plan.map_children(|child| self.optimize_recursive_plan(child));
         let (id, stats, operator) = plan.into_parts();
         let operator = match operator {
@@ -56,7 +56,7 @@ impl BuildProbeSideOptimizer {
             },
             other => other,
         };
-        LogicalPlan {
+        OwnedLogicalPlan {
             id,
             stats,
             operator,
@@ -163,7 +163,7 @@ impl BuildProbeSideOptimizer {
         }
     }
 
-    fn build_cost(&self, plan: &LogicalPlan) -> u128 {
+    fn build_cost(&self, plan: &OwnedLogicalPlan) -> u128 {
         let cardinality = self.estimated_cardinality(plan) as u128;
         let row_width = estimate_row_width(&plan.types()) as u128;
         cardinality.saturating_mul(row_width.max(1))
@@ -171,7 +171,7 @@ impl BuildProbeSideOptimizer {
 
     fn comparison_build_cost<'a>(
         &self,
-        plan: &LogicalPlan,
+        plan: &OwnedLogicalPlan,
         projection: &ProjectionMap,
         condition_expressions: impl Iterator<Item = &'a paro_planner::expression::Expression>,
         has_hash_key: bool,
@@ -206,14 +206,14 @@ impl BuildProbeSideOptimizer {
         cardinality * row_width.max(1.0)
     }
 
-    fn estimated_cardinality(&self, plan: &LogicalPlan) -> usize {
+    fn estimated_cardinality(&self, plan: &OwnedLogicalPlan) -> usize {
         estimate_plan_cardinality(self.session.as_ref(), plan)
     }
 }
 
 /// Estimate one atomic logical input consistently for join enumeration and
 /// final build/probe orientation.
-pub(crate) fn estimate_plan_cardinality(session: &StatementContext, plan: &LogicalPlan) -> usize {
+pub(crate) fn estimate_plan_cardinality(session: &StatementContext, plan: &OwnedLogicalPlan) -> usize {
     if let Some(estimate) = plan.stats.estimated_cardinality {
         return estimate.expected.max(1).min(usize::MAX as u64) as usize;
     }
@@ -244,7 +244,7 @@ fn default_cardinality(session: &StatementContext) -> usize {
     }
 }
 
-pub(crate) fn contains_control_region_boundary(plan: &LogicalPlan) -> bool {
+pub(crate) fn contains_control_region_boundary(plan: &OwnedLogicalPlan) -> bool {
     if let LogicalOperator::BoundReference(reference) = &plan.operator {
         return reference.facts.contains_control_region;
     }
@@ -391,7 +391,7 @@ mod tests {
         ColumnBinding, ComparisonJoin, CrossProduct, ExpressionGet, Get, Join,
         JoinBuildSideConstraint, JoinComparisonType, JoinCondition, JoinType, LogicalOperator,
     };
-    use paro_planner::plan::{CardinalityEstimate, LogicalPlan};
+    use paro_planner::plan::{CardinalityEstimate, OwnedLogicalPlan};
     use paro_storage::table::table_factory::TableFactory;
     use std::sync::Arc;
 
@@ -399,8 +399,8 @@ mod tests {
         ctx: &BindContext,
         op: LogicalOperator,
         estimated_rows: u64,
-    ) -> LogicalPlan {
-        let mut plan = LogicalPlan::new(ctx, op);
+    ) -> OwnedLogicalPlan {
+        let mut plan = OwnedLogicalPlan::new(ctx, op);
         plan.stats.estimated_cardinality = Some(CardinalityEstimate::exact(estimated_rows));
         plan
     }
@@ -453,7 +453,7 @@ mod tests {
             CatalogObjectId::from_raw(90_001),
             0,
         ));
-        let get = LogicalPlan::synthetic(LogicalOperator::Get(Get::new(
+        let get = OwnedLogicalPlan::synthetic(LogicalOperator::Get(Get::new(
             0,
             vec!["k".to_string()],
             vec![LogicalType::Integer],

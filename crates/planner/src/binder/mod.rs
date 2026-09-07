@@ -21,7 +21,7 @@ use crate::binder::ir::from::BoundFromItem;
 use crate::binder::ir::BoundStatementKind;
 use crate::expression::{Expression, ParameterExpression};
 use crate::operator::LogicalOperator;
-use crate::plan::{LogicalPlan, PlannedStatement};
+use crate::plan::{OwnedLogicalPlan, PlannedStatement};
 use crate::stack::maybe_grow_planner_stack;
 use paro_catalog::database_catalog::ParoCatalog;
 use paro_catalog::entry::{CatalogObjectId, Dependency, DependencyList, DependencyType};
@@ -148,10 +148,10 @@ impl Binder {
         self.session_context.as_ref()
     }
 
-    /// Wrap a logical operator as a child [`LogicalPlan`] using the current bind context.
+    /// Wrap a logical operator as a child [`OwnedLogicalPlan`] using the current bind context.
     #[inline]
-    pub(crate) fn wrap_plan(&self, op: LogicalOperator) -> crate::plan::LogicalPlan {
-        crate::plan::LogicalPlan::new(&self.bind_context, op)
+    pub(crate) fn wrap_plan(&self, op: LogicalOperator) -> crate::plan::OwnedLogicalPlan {
+        crate::plan::OwnedLogicalPlan::new(&self.bind_context, op)
     }
 
     /// Create a child binder for nested scopes (e.g., subqueries).
@@ -384,11 +384,11 @@ impl Binder {
         Ok(PlannedStatement { types, names, plan })
     }
 
-    pub fn create_plan(&mut self, statement: BoundStatementKind) -> Result<LogicalPlan> {
+    pub fn create_plan(&mut self, statement: BoundStatementKind) -> Result<OwnedLogicalPlan> {
         maybe_grow_planner_stack(|| self.create_plan_inner(statement))
     }
 
-    fn create_plan_inner(&mut self, statement: BoundStatementKind) -> Result<LogicalPlan> {
+    fn create_plan_inner(&mut self, statement: BoundStatementKind) -> Result<OwnedLogicalPlan> {
         let operator = match statement {
             BoundStatementKind::Query(node) => self.plan_query(*node),
             BoundStatementKind::Insert(info) => self.plan_insert(info),
@@ -413,7 +413,7 @@ impl Binder {
                 "Planning for statement: Dummy",
             )),
         }?;
-        Ok(LogicalPlan::new(&self.bind_context, operator))
+        Ok(OwnedLogicalPlan::new(&self.bind_context, operator))
     }
 
     /// Bind a table reference (FROM clause).
@@ -462,7 +462,7 @@ impl Binder {
         }
     }
 
-    pub fn flatten_dependent_joins(&mut self, plan: LogicalPlan) -> Result<LogicalPlan> {
+    pub fn flatten_dependent_joins(&mut self, plan: OwnedLogicalPlan) -> Result<OwnedLogicalPlan> {
         plan::subquery::flatten_all_dependent_joins(self, plan)
     }
 }

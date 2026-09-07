@@ -619,8 +619,8 @@ impl PlanInspection {
     }
 }
 
-fn inspect_plan(plan: &paro_planner::plan::LogicalPlan) -> PlanInspection {
-    fn visit(plan: &paro_planner::plan::LogicalPlan, result: &mut PlanInspection) {
+fn inspect_plan(plan: &paro_planner::plan::OwnedLogicalPlan) -> PlanInspection {
+    fn visit(plan: &paro_planner::plan::OwnedLogicalPlan, result: &mut PlanInspection) {
         match &plan.operator {
             LogicalOperator::RowFetch(fetch) => {
                 result.late_fetches += 1;
@@ -906,7 +906,7 @@ fn scalar_binding_visible_above_filter_does_not_rewrite() {
     let scalar_binding = find_single_scalar_binding(&plan).expect("correlated scalar binding");
     let scalar_type = find_binding_type(&plan, scalar_binding).expect("scalar type");
     let parent_index = planner.binder.bind_context.generate_table_index();
-    plan = paro_planner::plan::LogicalPlan::new(
+    plan = paro_planner::plan::OwnedLogicalPlan::new(
         &planner.binder.bind_context,
         LogicalOperator::Projection(Projection::new(
             parent_index,
@@ -929,7 +929,7 @@ fn scalar_binding_visible_above_filter_does_not_rewrite() {
     assert_eq!(inspection.delim_joins, 1, "{rewritten:#?}");
 }
 
-fn find_single_scalar_binding(plan: &paro_planner::plan::LogicalPlan) -> Option<ColumnBinding> {
+fn find_single_scalar_binding(plan: &paro_planner::plan::OwnedLogicalPlan) -> Option<ColumnBinding> {
     if let LogicalOperator::Join(paro_planner::operator::Join::Comparison(join)) = &plan.operator {
         if join.join_type == paro_planner::operator::JoinType::Single {
             return join.right.get_column_bindings().first().copied();
@@ -941,7 +941,7 @@ fn find_single_scalar_binding(plan: &paro_planner::plan::LogicalPlan) -> Option<
 }
 
 fn find_binding_type(
-    plan: &paro_planner::plan::LogicalPlan,
+    plan: &paro_planner::plan::OwnedLogicalPlan,
     binding: ColumnBinding,
 ) -> Option<LogicalType> {
     plan.get_column_bindings()
@@ -955,7 +955,7 @@ fn find_binding_type(
         })
 }
 
-fn optimize_sql(sql: &str) -> paro_planner::plan::LogicalPlan {
+fn optimize_sql(sql: &str) -> paro_planner::plan::OwnedLogicalPlan {
     let session = setup_session();
     let statement = paro_parser::parse_one(sql)
         .expect("parse negative case")

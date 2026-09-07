@@ -1509,16 +1509,16 @@ mod tests {
     fn detail_subsumption_keeps_unconsumed_relations_as_group_inputs() {
         use paro_common::types::LogicalType;
         use paro_planner::operator::{Aggregate, Distinct, Filter, Get};
-        let mut child = LogicalPlan::synthetic(LogicalOperator::Get(Get::new_without_table(
+        let mut child = OwnedLogicalPlan::synthetic(LogicalOperator::Get(Get::new_without_table(
             0,
             vec!["k".into()],
             vec![LogicalType::BigInt],
         )));
         for _ in 0..64 {
-            child = LogicalPlan::synthetic(LogicalOperator::Filter(Filter::new(child, vec![])));
+            child = OwnedLogicalPlan::synthetic(LogicalOperator::Filter(Filter::new(child, vec![])));
         }
-        let child = LogicalPlan::synthetic(LogicalOperator::Distinct(Distinct::new(child)));
-        let plan = LogicalPlan::synthetic(LogicalOperator::Aggregate(Aggregate::new(
+        let child = OwnedLogicalPlan::synthetic(LogicalOperator::Distinct(Distinct::new(child)));
+        let plan = OwnedLogicalPlan::synthetic(LogicalOperator::Aggregate(Aggregate::new(
             1,
             2,
             3,
@@ -1557,13 +1557,13 @@ mod tests {
     fn local_filter_binding_does_not_enumerate_or_subscribe_below_its_input() {
         use paro_common::types::LogicalType;
         use paro_planner::operator::{Filter, Get};
-        let mut child = LogicalPlan::synthetic(LogicalOperator::Get(Get::new_without_table(
+        let mut child = OwnedLogicalPlan::synthetic(LogicalOperator::Get(Get::new_without_table(
             0,
             vec!["k".into()],
             vec![LogicalType::BigInt],
         )));
         for _ in 0..64 {
-            child = LogicalPlan::synthetic(LogicalOperator::Filter(Filter::new(child, Vec::new())));
+            child = OwnedLogicalPlan::synthetic(LogicalOperator::Filter(Filter::new(child, Vec::new())));
         }
         let mut budget = SearchBudget::default();
         budget.max_rule_work_units_per_group = 8;

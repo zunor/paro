@@ -3054,7 +3054,7 @@ mod tests {
     };
     use paro_planner::operator::ColumnBinding;
     use paro_planner::operator::{ExpressionGet, LogicalOperator};
-    use paro_planner::plan::{LogicalPlan, PlannedStatement};
+    use paro_planner::plan::{OwnedLogicalPlan, PlannedStatement};
 
     static LOCAL_STATE_INIT_COUNT: AtomicUsize = AtomicUsize::new(0);
 
@@ -3094,7 +3094,7 @@ mod tests {
             subquery: Arc::new(PlannedStatement {
                 types: vec![LogicalType::Integer],
                 names: vec!["v".to_string()],
-                plan: LogicalPlan::new(
+                plan: OwnedLogicalPlan::new(
                     &BindContext::new(),
                     LogicalOperator::ExpressionGet(ExpressionGet::new(
                         99,

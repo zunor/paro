@@ -776,7 +776,7 @@ pub(super) fn search_payload_fingerprint(
 /// Bind-time query options form the root semantic contract. With Exact as the
 /// API default, seeing CostOptimized here necessarily represents an explicit
 /// opt-in and may therefore admit the matching approximate provider policy.
-pub(super) fn required_result_guarantee(plan: &LogicalPlan) -> ResultGuarantee {
+pub(super) fn required_result_guarantee(plan: &OwnedLogicalPlan) -> ResultGuarantee {
     match &plan.operator {
         LogicalOperator::TopN(topn)
             if topn.hnsw_options.objective

@@ -9,18 +9,18 @@
 use paro_common::types::LogicalType;
 
 use super::ColumnBinding;
-use crate::plan::LogicalPlan;
+use crate::plan::OwnedLogicalPlan;
 
 /// EmptyResult wraps an existing operator shape while forcing the
 /// cardinality to zero.
-#[derive(Debug)]
-pub struct EmptyResult {
+#[derive(Debug, Clone)]
+pub struct EmptyResult<Child = Box<OwnedLogicalPlan>> {
     /// Child operator whose schema/bindings are preserved.
-    pub child: Box<LogicalPlan>,
+    pub child: Child,
 }
 
 impl EmptyResult {
-    pub fn new(child: LogicalPlan) -> Self {
+    pub fn new(child: OwnedLogicalPlan) -> Self {
         Self {
             child: Box::new(child),
         }
@@ -43,7 +43,7 @@ impl EmptyResult {
 mod tests {
     use crate::binder::context::BindContext;
     use crate::operator::{ExpressionGet, LogicalOperator};
-    use crate::plan::LogicalPlan;
+    use crate::plan::OwnedLogicalPlan;
 
     use super::EmptyResult;
     use paro_common::types::LogicalType;
@@ -58,7 +58,7 @@ mod tests {
             vec![LogicalType::Integer],
         ));
         let expected_bindings = child_op.get_column_bindings();
-        let child = LogicalPlan::new(&ctx, child_op);
+        let child = OwnedLogicalPlan::new(&ctx, child_op);
         let empty = EmptyResult::new(child);
 
         assert_eq!(empty.get_types(), vec![LogicalType::Integer]);

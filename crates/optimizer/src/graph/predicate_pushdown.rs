@@ -34,7 +34,7 @@ use paro_planner::expression::{
     ColumnRefExpression, ConjunctionExpression, ConjunctionType, Expression,
 };
 use paro_planner::operator::{Filter, LogicalOperator, Projection};
-use paro_planner::plan::LogicalPlan;
+use paro_planner::plan::OwnedLogicalPlan;
 
 /// Pushes predicates from outer WHERE into graph scan/expand operators.
 pub struct GraphPredicatePushdown;
@@ -46,15 +46,15 @@ impl GraphPredicatePushdown {
 
     #[cfg(test)]
     fn optimize(&mut self, plan: LogicalOperator) -> LogicalOperator {
-        self.optimize_plan(LogicalPlan::synthetic(plan))
+        self.optimize_plan(OwnedLogicalPlan::synthetic(plan))
             .into_operator()
     }
 
-    pub fn optimize_plan(&mut self, plan: LogicalPlan) -> LogicalPlan {
+    pub fn optimize_plan(&mut self, plan: OwnedLogicalPlan) -> OwnedLogicalPlan {
         self.rewrite_plan(plan)
     }
 
-    fn rewrite_plan(&mut self, plan: LogicalPlan) -> LogicalPlan {
+    fn rewrite_plan(&mut self, plan: OwnedLogicalPlan) -> OwnedLogicalPlan {
         plan.try_map_post_order(|plan| {
             Ok(plan.map_operator(|operator| self.rewrite_operator(operator)))
         })
@@ -105,7 +105,7 @@ impl GraphPredicatePushdown {
                 .any(|expr| expr.evaluation_properties().is_reorder_fence())
         {
             return LogicalOperator::Filter(Filter::new(
-                LogicalPlan::synthetic(LogicalOperator::Projection(proj)),
+                OwnedLogicalPlan::synthetic(LogicalOperator::Projection(proj)),
                 filter.expressions,
             ));
         }
@@ -151,7 +151,7 @@ impl GraphPredicatePushdown {
             let LogicalOperator::Projection(mut p) = result else {
                 unreachable!();
             };
-            p.child = Box::new(LogicalPlan::synthetic(LogicalOperator::Filter(
+            p.child = Box::new(OwnedLogicalPlan::synthetic(LogicalOperator::Filter(
                 Filter::new(*p.child, unpushed),
             )));
             result = LogicalOperator::Projection(p);
@@ -159,7 +159,7 @@ impl GraphPredicatePushdown {
 
         if !remaining.is_empty() {
             result =
-                LogicalOperator::Filter(Filter::new(LogicalPlan::synthetic(result), remaining));
+                LogicalOperator::Filter(Filter::new(OwnedLogicalPlan::synthetic(result), remaining));
         }
 
         result
@@ -193,7 +193,7 @@ impl GraphPredicatePushdown {
     ///
     /// Returns `true` if the predicate was successfully pushed, `false` if it
     /// must remain as a filter above.
-    fn push_into_chain(chain: &mut LogicalPlan, pred: Expression) -> bool {
+    fn push_into_chain(chain: &mut OwnedLogicalPlan, pred: Expression) -> bool {
         let bindings = Self::extract_table_indices(&pred);
         if bindings.is_empty() {
             // Constant predicate — can't push into graph operators
@@ -205,7 +205,7 @@ impl GraphPredicatePushdown {
 
     /// Recursively walk the graph chain to find the right operator for the predicate.
     fn push_into_chain_recursive(
-        plan: &mut LogicalPlan,
+        plan: &mut OwnedLogicalPlan,
         pred: Expression,
         bindings: &HashSet<usize>,
     ) -> bool {
@@ -544,7 +544,7 @@ mod tests {
             paro_common::runtime_value::Value::Integer(30),
         );
         let filtered =
-            LogicalOperator::Filter(Filter::new(LogicalPlan::synthetic(plan), vec![pred]));
+            LogicalOperator::Filter(Filter::new(OwnedLogicalPlan::synthetic(plan), vec![pred]));
 
         let mut opt = GraphPredicatePushdown::new();
         let result = opt.optimize(filtered);
@@ -583,7 +583,7 @@ mod tests {
             paro_common::runtime_value::Value::Varchar("Alice".to_string()),
         );
         let filtered =
-            LogicalOperator::Filter(Filter::new(LogicalPlan::synthetic(plan), vec![pred]));
+            LogicalOperator::Filter(Filter::new(OwnedLogicalPlan::synthetic(plan), vec![pred]));
 
         let mut opt = GraphPredicatePushdown::new();
         let result = opt.optimize(filtered);
@@ -613,7 +613,7 @@ mod tests {
             paro_common::runtime_value::Value::Float(0.5),
         );
         let filtered =
-            LogicalOperator::Filter(Filter::new(LogicalPlan::synthetic(plan), vec![pred]));
+            LogicalOperator::Filter(Filter::new(OwnedLogicalPlan::synthetic(plan), vec![pred]));
 
         let mut opt = GraphPredicatePushdown::new();
         let result = opt.optimize(filtered);
@@ -655,7 +655,7 @@ mod tests {
             vec![pred_a, pred_k],
         ));
         let filtered =
-            LogicalOperator::Filter(Filter::new(LogicalPlan::synthetic(plan), vec![and_pred]));
+            LogicalOperator::Filter(Filter::new(OwnedLogicalPlan::synthetic(plan), vec![and_pred]));
 
         let mut opt = GraphPredicatePushdown::new();
         let result = opt.optimize(filtered);
@@ -694,7 +694,7 @@ mod tests {
             )),
         ));
         let filtered =
-            LogicalOperator::Filter(Filter::new(LogicalPlan::synthetic(plan), vec![cross_pred]));
+            LogicalOperator::Filter(Filter::new(OwnedLogicalPlan::synthetic(plan), vec![cross_pred]));
 
         let mut opt = GraphPredicatePushdown::new();
         let result = opt.optimize(filtered);
@@ -762,7 +762,7 @@ mod tests {
             paro_common::runtime_value::Value::Integer(30),
         );
         let filtered =
-            LogicalOperator::Filter(Filter::new(LogicalPlan::synthetic(decomposed), vec![pred]));
+            LogicalOperator::Filter(Filter::new(OwnedLogicalPlan::synthetic(decomposed), vec![pred]));
 
         let mut opt = GraphPredicatePushdown::new();
         let result = opt.optimize(filtered);
@@ -845,9 +845,9 @@ mod tests {
             paro_common::runtime_value::Value::Integer(30),
         );
         let filtered =
-            LogicalOperator::Filter(Filter::new(LogicalPlan::synthetic(plan), vec![pred]));
+            LogicalOperator::Filter(Filter::new(OwnedLogicalPlan::synthetic(plan), vec![pred]));
         let ordered = LogicalOperator::Order(paro_planner::operator::Order::new(
-            LogicalPlan::synthetic(filtered),
+            OwnedLogicalPlan::synthetic(filtered),
             vec![],
         ));
 

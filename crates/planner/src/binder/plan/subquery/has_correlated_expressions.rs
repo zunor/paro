@@ -6,7 +6,7 @@
 use crate::binder::CorrelatedColumnInfo;
 use crate::expression::{Expression, ExpressionIterator};
 use crate::operator::LogicalOperator;
-use crate::plan::LogicalPlan;
+use crate::plan::OwnedLogicalPlan;
 
 pub struct HasCorrelatedExpressions {
     has_correlated: bool,
@@ -105,7 +105,7 @@ impl HasCorrelatedExpressions {
         }
     }
 
-    fn visit_logical_plan(&mut self, plan: &LogicalPlan, lateral_depth: usize) {
+    fn visit_logical_plan(&mut self, plan: &OwnedLogicalPlan, lateral_depth: usize) {
         self.visit_operator_internal(&plan.operator, lateral_depth);
     }
 
@@ -253,7 +253,7 @@ mod tests {
         let ctx = BindContext::new();
         let nested_right = LogicalOperator::Projection(crate::operator::Projection::new(
             20,
-            crate::plan::LogicalPlan::new(&ctx, expression_get(30)),
+            crate::plan::OwnedLogicalPlan::new(&ctx, expression_get(30)),
             vec![Expression::ColumnRef(ColumnRefExpression::with_depth(
                 ColumnBinding::new(10, 0),
                 LogicalType::Integer,
@@ -261,8 +261,8 @@ mod tests {
             ))],
         ));
         let dependent = LogicalOperator::DependentJoin(crate::operator::DependentJoin::scalar(
-            crate::plan::LogicalPlan::new(&ctx, expression_get(11)),
-            crate::plan::LogicalPlan::new(&ctx, nested_right),
+            crate::plan::OwnedLogicalPlan::new(&ctx, expression_get(11)),
+            crate::plan::OwnedLogicalPlan::new(&ctx, nested_right),
             vec![correlated_column(1)],
             None,
         ));

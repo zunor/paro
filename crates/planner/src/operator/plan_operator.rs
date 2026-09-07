@@ -9,7 +9,7 @@ use std::ops::ControlFlow;
 
 use paro_common::{error::Result, types::LogicalType};
 
-use crate::plan::LogicalPlan;
+use crate::plan::OwnedLogicalPlan;
 
 use super::{
     Aggregate, Alter, BoundReference, CTERef, ColumnBinding, CopyTo, CreateIndex,
@@ -104,26 +104,26 @@ impl LogicalOutputLayout {
 }
 
 /// The LogicalOperator represents a node in the logical query plan.
-#[derive(Debug)]
-pub enum LogicalOperator {
+#[derive(Debug, Clone)]
+pub enum LogicalOperator<Child = Box<OwnedLogicalPlan>> {
     /// Reading data from a table
     Get(Get),
     /// Check data against a condition
-    Filter(Filter),
+    Filter(Filter<Child>),
     /// Project columns/expressions
-    Projection(Projection),
+    Projection(Projection<Child>),
     /// Materialize base-table columns from stable rowids carried by the child.
-    RowFetch(RowFetch),
+    RowFetch(RowFetch<Child>),
     /// Row-preserving external routine layer
-    ExternalProject(LogicalExternalProject),
+    ExternalProject(LogicalExternalProject<Child>),
     /// Relation-expanding external routine source
-    ExternalTable(LogicalExternalTable),
+    ExternalTable(LogicalExternalTable<Child>),
     /// Top N / Limit / Offset
-    Limit(Limit),
+    Limit(Limit<Child>),
     /// Order By
-    Order(Order),
+    Order(Order<Child>),
     /// TopN (optimized ORDER BY + LIMIT)
-    TopN(TopN),
+    TopN(TopN<Child>),
     /// Create Table
     CreateTable(CreateTable),
     /// Create Routine
@@ -146,33 +146,33 @@ pub enum LogicalOperator {
     DropPropertyGraph(DropPropertyGraph),
     /// Refresh Property Graph
     RefreshPropertyGraph(RefreshPropertyGraph),
-    Aggregate(Aggregate),
-    Insert(Insert),
+    Aggregate(Aggregate<Child>),
+    Insert(Insert<Child>),
     /// Delete rows from a table
-    Delete(Delete),
+    Delete(Delete<Child>),
     /// Update rows in a table
-    Update(Update),
+    Update(Update<Child>),
     ExpressionGet(ExpressionGet),
     /// Join operations (comparison, any, cross product)
-    Join(Join),
+    Join(Join<Child>),
     /// Duplicate-eliminated scan placeholder owned by a delim/dependent join.
     DelimGet(DelimGet),
     /// Dependent join (for correlated subqueries, temporary during planning)
-    DependentJoin(DependentJoin),
+    DependentJoin(DependentJoin<Child>),
     /// Set operations (UNION, INTERSECT, EXCEPT)
-    SetOperation(SetOperation),
+    SetOperation(SetOperation<Child>),
     /// DISTINCT operation
-    Distinct(Distinct),
+    Distinct(Distinct<Child>),
     /// Window function operation
-    Window(Window),
+    Window(Window<Child>),
     /// EXPLAIN/EXPLAIN ANALYZE
-    Explain(Explain),
+    Explain(Explain<Child>),
     /// Empty result preserving child schema.
-    EmptyResult(EmptyResult),
+    EmptyResult(EmptyResult<Child>),
     /// Materialized CTE definition
-    MaterializedCTE(MaterializedCTE),
+    MaterializedCTE(MaterializedCTE<Child>),
     /// Recursive CTE producer
-    RecursiveCTE(RecursiveCTE),
+    RecursiveCTE(RecursiveCTE<Child>),
     /// CTE reference
     CTERef(CTERef),
     /// Table function scan
@@ -182,13 +182,13 @@ pub enum LogicalOperator {
     /// Full-text filter scan replacing Filter/Get subgraphs.
     FullTextFilterScan(FullTextFilterScan),
     /// COPY TO file/stdout
-    CopyTo(CopyTo),
+    CopyTo(CopyTo<Child>),
     /// Graph pattern match (undecomposed GRAPH_TABLE)
     GraphMatch(GraphMatch),
     /// Graph vertex scan
     GraphScan(GraphScan),
     /// Graph edge expansion
-    GraphExpand(GraphExpand),
+    GraphExpand(GraphExpand<Child>),
 
     /// Opaque schema boundary used only inside a transformation transaction.
     /// Keep this transport-only variant after every executable operator so
@@ -204,65 +204,6 @@ impl LogicalOperator {
         derive_output_names(self)
     }
 
-    pub fn op_type(&self) -> LogicalOperatorType {
-        match self {
-            LogicalOperator::Get(_) => LogicalOperatorType::Get,
-            LogicalOperator::BoundReference(_) => LogicalOperatorType::BoundReference,
-            LogicalOperator::Filter(_) => LogicalOperatorType::Filter,
-            LogicalOperator::Projection(_) => LogicalOperatorType::Projection,
-            LogicalOperator::RowFetch(_) => LogicalOperatorType::RowFetch,
-            LogicalOperator::ExternalProject(_) => LogicalOperatorType::ExternalProject,
-            LogicalOperator::ExternalTable(_) => LogicalOperatorType::ExternalTable,
-            LogicalOperator::Limit(_) => LogicalOperatorType::Limit,
-            LogicalOperator::Order(_) => LogicalOperatorType::Order,
-            LogicalOperator::TopN(_) => LogicalOperatorType::TopN,
-            LogicalOperator::CreateTable(_) => LogicalOperatorType::CreateTable,
-            LogicalOperator::CreateRoutine(_) => LogicalOperatorType::CreateRoutine,
-            LogicalOperator::Alter(_) => LogicalOperatorType::Alter,
-            LogicalOperator::CreateSequence(_) => LogicalOperatorType::CreateSequence,
-            LogicalOperator::CreateSchema(_) => LogicalOperatorType::CreateSchema,
-            LogicalOperator::CreateIndex(_) => LogicalOperatorType::CreateIndex,
-            LogicalOperator::CreateView(_) => LogicalOperatorType::CreateView,
-            LogicalOperator::Drop(_) => LogicalOperatorType::Drop,
-            LogicalOperator::CreatePropertyGraph(_) => LogicalOperatorType::CreatePropertyGraph,
-            LogicalOperator::DropPropertyGraph(_) => LogicalOperatorType::DropPropertyGraph,
-            LogicalOperator::RefreshPropertyGraph(_) => LogicalOperatorType::RefreshPropertyGraph,
-            LogicalOperator::Aggregate(_) => LogicalOperatorType::Aggregate,
-            LogicalOperator::Insert(_) => LogicalOperatorType::Insert,
-            LogicalOperator::Delete(_) => LogicalOperatorType::Delete,
-            LogicalOperator::Update(_) => LogicalOperatorType::Update,
-            LogicalOperator::ExpressionGet(_) => LogicalOperatorType::Get,
-            LogicalOperator::Join(j) => match j {
-                Join::Comparison(_) => LogicalOperatorType::ComparisonJoin,
-                Join::Any(_) => LogicalOperatorType::AnyJoin,
-                Join::Cross(_) => LogicalOperatorType::CrossProduct,
-            },
-            LogicalOperator::DelimGet(_) => LogicalOperatorType::DelimGet,
-            LogicalOperator::DependentJoin(_) => LogicalOperatorType::DependentJoin,
-            LogicalOperator::SetOperation(s) => match s.setop_type {
-                SetOpType::Union => LogicalOperatorType::LogicalUnion,
-                SetOpType::Intersect => LogicalOperatorType::LogicalIntersect,
-                SetOpType::Except => LogicalOperatorType::LogicalExcept,
-            },
-            LogicalOperator::Distinct(_) => LogicalOperatorType::Distinct,
-            LogicalOperator::Window(_) => LogicalOperatorType::Window,
-            LogicalOperator::Explain(_) => LogicalOperatorType::Explain,
-            LogicalOperator::EmptyResult(_) => LogicalOperatorType::EmptyResult,
-            LogicalOperator::MaterializedCTE(_) => LogicalOperatorType::MaterializedCTE,
-            LogicalOperator::RecursiveCTE(_) => LogicalOperatorType::RecursiveCTE,
-            LogicalOperator::CTERef(_) => LogicalOperatorType::CTERef,
-            LogicalOperator::TableFunctionGet(_) => LogicalOperatorType::TableFunctionGet,
-            LogicalOperator::SearchScan(_) => LogicalOperatorType::SearchScan,
-            LogicalOperator::FullTextFilterScan(_) => LogicalOperatorType::FullTextFilterScan,
-            LogicalOperator::CopyTo(_) => LogicalOperatorType::LogicalCopy,
-            LogicalOperator::GraphMatch(_) => LogicalOperatorType::GraphMatch,
-            LogicalOperator::GraphScan(_) => LogicalOperatorType::GraphScan,
-            LogicalOperator::GraphExpand(_) => LogicalOperatorType::GraphExpand,
-            LogicalOperator::DummyScan => LogicalOperatorType::Get,
-        }
-    }
-
-    /// Get the logical types of the output of this operator.
     pub fn types(&self) -> Vec<LogicalType> {
         self.output_layout().into_types()
     }
@@ -278,7 +219,7 @@ impl LogicalOperator {
     }
 
     /// Get the children of this operator.
-    pub fn children(&self) -> Vec<&LogicalPlan> {
+    pub fn children(&self) -> Vec<&OwnedLogicalPlan> {
         match self {
             LogicalOperator::Get(_) => vec![],
             LogicalOperator::BoundReference(_) => vec![],
@@ -332,7 +273,7 @@ impl LogicalOperator {
     /// subtree and a bounded native stack.
     ///
     /// Read-only validation and analysis passes use this counterpart to
-    /// [`LogicalPlan::try_fold_post_order`] so they can reuse completed child
+    /// [`OwnedLogicalPlan::try_fold_post_order`] so they can reuse completed child
     /// facts instead of starting a fresh subtree traversal at every node.
     pub fn try_fold_ref_post_order<State>(
         &self,
@@ -340,7 +281,7 @@ impl LogicalOperator {
     ) -> Result<State> {
         struct Frame<'a, State> {
             operator: &'a LogicalOperator,
-            remaining: std::vec::IntoIter<&'a LogicalPlan>,
+            remaining: std::vec::IntoIter<&'a OwnedLogicalPlan>,
             child_states: Vec<State>,
         }
 
@@ -377,9 +318,9 @@ impl LogicalOperator {
         }
     }
 
-    pub fn visit_children_mut<F>(&mut self, mut f: F) -> ControlFlow<()>
+    pub fn visit_children_mut<'a, F>(&'a mut self, mut f: F) -> ControlFlow<()>
     where
-        F: for<'a> FnMut(&'a mut LogicalPlan) -> ControlFlow<()>,
+        F: FnMut(&'a mut OwnedLogicalPlan) -> ControlFlow<()>,
     {
         match self {
             LogicalOperator::Get(_) => ControlFlow::Continue(()),
@@ -463,7 +404,7 @@ impl LogicalOperator {
 
     pub(crate) fn try_map_owned_children(
         self,
-        f: &mut dyn FnMut(LogicalPlan) -> Result<LogicalPlan>,
+        f: &mut dyn FnMut(OwnedLogicalPlan) -> Result<OwnedLogicalPlan>,
     ) -> Result<Self> {
         match self {
             LogicalOperator::Get(op) => Ok(LogicalOperator::Get(op)),
@@ -1053,7 +994,66 @@ enum OutputLayoutTask<'a> {
     Finish(&'a LogicalOperator, OutputLayoutChildren),
 }
 
-impl LogicalOperator {
+impl<Child> LogicalOperator<Child> {
+    pub fn op_type(&self) -> LogicalOperatorType {
+        match self {
+            LogicalOperator::Get(_) => LogicalOperatorType::Get,
+            LogicalOperator::BoundReference(_) => LogicalOperatorType::BoundReference,
+            LogicalOperator::Filter(_) => LogicalOperatorType::Filter,
+            LogicalOperator::Projection(_) => LogicalOperatorType::Projection,
+            LogicalOperator::RowFetch(_) => LogicalOperatorType::RowFetch,
+            LogicalOperator::ExternalProject(_) => LogicalOperatorType::ExternalProject,
+            LogicalOperator::ExternalTable(_) => LogicalOperatorType::ExternalTable,
+            LogicalOperator::Limit(_) => LogicalOperatorType::Limit,
+            LogicalOperator::Order(_) => LogicalOperatorType::Order,
+            LogicalOperator::TopN(_) => LogicalOperatorType::TopN,
+            LogicalOperator::CreateTable(_) => LogicalOperatorType::CreateTable,
+            LogicalOperator::CreateRoutine(_) => LogicalOperatorType::CreateRoutine,
+            LogicalOperator::Alter(_) => LogicalOperatorType::Alter,
+            LogicalOperator::CreateSequence(_) => LogicalOperatorType::CreateSequence,
+            LogicalOperator::CreateSchema(_) => LogicalOperatorType::CreateSchema,
+            LogicalOperator::CreateIndex(_) => LogicalOperatorType::CreateIndex,
+            LogicalOperator::CreateView(_) => LogicalOperatorType::CreateView,
+            LogicalOperator::Drop(_) => LogicalOperatorType::Drop,
+            LogicalOperator::CreatePropertyGraph(_) => LogicalOperatorType::CreatePropertyGraph,
+            LogicalOperator::DropPropertyGraph(_) => LogicalOperatorType::DropPropertyGraph,
+            LogicalOperator::RefreshPropertyGraph(_) => LogicalOperatorType::RefreshPropertyGraph,
+            LogicalOperator::Aggregate(_) => LogicalOperatorType::Aggregate,
+            LogicalOperator::Insert(_) => LogicalOperatorType::Insert,
+            LogicalOperator::Delete(_) => LogicalOperatorType::Delete,
+            LogicalOperator::Update(_) => LogicalOperatorType::Update,
+            LogicalOperator::ExpressionGet(_) => LogicalOperatorType::Get,
+            LogicalOperator::Join(j) => match j {
+                Join::Comparison(_) => LogicalOperatorType::ComparisonJoin,
+                Join::Any(_) => LogicalOperatorType::AnyJoin,
+                Join::Cross(_) => LogicalOperatorType::CrossProduct,
+            },
+            LogicalOperator::DelimGet(_) => LogicalOperatorType::DelimGet,
+            LogicalOperator::DependentJoin(_) => LogicalOperatorType::DependentJoin,
+            LogicalOperator::SetOperation(s) => match s.setop_type {
+                SetOpType::Union => LogicalOperatorType::LogicalUnion,
+                SetOpType::Intersect => LogicalOperatorType::LogicalIntersect,
+                SetOpType::Except => LogicalOperatorType::LogicalExcept,
+            },
+            LogicalOperator::Distinct(_) => LogicalOperatorType::Distinct,
+            LogicalOperator::Window(_) => LogicalOperatorType::Window,
+            LogicalOperator::Explain(_) => LogicalOperatorType::Explain,
+            LogicalOperator::EmptyResult(_) => LogicalOperatorType::EmptyResult,
+            LogicalOperator::MaterializedCTE(_) => LogicalOperatorType::MaterializedCTE,
+            LogicalOperator::RecursiveCTE(_) => LogicalOperatorType::RecursiveCTE,
+            LogicalOperator::CTERef(_) => LogicalOperatorType::CTERef,
+            LogicalOperator::TableFunctionGet(_) => LogicalOperatorType::TableFunctionGet,
+            LogicalOperator::SearchScan(_) => LogicalOperatorType::SearchScan,
+            LogicalOperator::FullTextFilterScan(_) => LogicalOperatorType::FullTextFilterScan,
+            LogicalOperator::CopyTo(_) => LogicalOperatorType::LogicalCopy,
+            LogicalOperator::GraphMatch(_) => LogicalOperatorType::GraphMatch,
+            LogicalOperator::GraphScan(_) => LogicalOperatorType::GraphScan,
+            LogicalOperator::GraphExpand(_) => LogicalOperatorType::GraphExpand,
+            LogicalOperator::DummyScan => LogicalOperatorType::Get,
+        }
+    }
+
+    /// Get the logical types of the output of this operator.
     /// Derive this operator's execution layout from already-completed child
     /// layouts in the same order as [`Self::children`].
     ///
@@ -1063,7 +1063,9 @@ impl LogicalOperator {
         &self,
         child_layouts: &[LogicalOutputLayout],
     ) -> LogicalOutputLayout {
-        debug_assert_eq!(child_layouts.len(), self.children().len());
+        let mut arity = 0;
+        self.visit_child_links(&mut |_| arity += 1);
+        debug_assert_eq!(child_layouts.len(), arity);
         let (first, second) = match output_layout_children(self) {
             OutputLayoutChildren::None => (None, None),
             OutputLayoutChildren::First => (child_layouts.first().cloned(), None),
@@ -1135,7 +1137,7 @@ fn derive_output_layout(root: &LogicalOperator) -> LogicalOutputLayout {
     layouts.pop().expect("root output layout was checked")
 }
 
-fn output_layout_children(operator: &LogicalOperator) -> OutputLayoutChildren {
+fn output_layout_children<Child>(operator: &LogicalOperator<Child>) -> OutputLayoutChildren {
     use OutputLayoutChildren::*;
 
     match operator {
@@ -1199,8 +1201,8 @@ fn output_layout_children(operator: &LogicalOperator) -> OutputLayoutChildren {
     }
 }
 
-fn derive_local_output_layout(
-    operator: &LogicalOperator,
+fn derive_local_output_layout<Child>(
+    operator: &LogicalOperator<Child>,
     first: Option<LogicalOutputLayout>,
     second: Option<LogicalOutputLayout>,
 ) -> LogicalOutputLayout {
@@ -1378,8 +1380,8 @@ fn derive_local_output_layout(
     }
 }
 
-fn finish_join_layout(
-    join: &Join,
+fn finish_join_layout<Child>(
+    join: &Join<Child>,
     left: Option<LogicalOutputLayout>,
     right: Option<LogicalOutputLayout>,
 ) -> LogicalOutputLayout {
@@ -1474,17 +1476,17 @@ fn window_output_name(expr: &crate::expression::WindowExpression, idx: usize) ->
     }
 }
 
-fn visit_boxed_child(
-    child: &mut Box<LogicalPlan>,
-    f: &mut impl for<'a> FnMut(&'a mut LogicalPlan) -> ControlFlow<()>,
+fn visit_boxed_child<'a>(
+    child: &'a mut Box<OwnedLogicalPlan>,
+    f: &mut impl FnMut(&'a mut OwnedLogicalPlan) -> ControlFlow<()>,
 ) -> ControlFlow<()> {
     f(child.as_mut())
 }
 
 fn try_map_boxed_child(
-    child: Box<LogicalPlan>,
-    f: &mut dyn FnMut(LogicalPlan) -> Result<LogicalPlan>,
-) -> Result<Box<LogicalPlan>> {
+    child: Box<OwnedLogicalPlan>,
+    f: &mut dyn FnMut(OwnedLogicalPlan) -> Result<OwnedLogicalPlan>,
+) -> Result<Box<OwnedLogicalPlan>> {
     Ok(Box::new(f(*child)?))
 }
 
@@ -1503,7 +1505,7 @@ mod tests {
         Explain, ExplainSpec, ExpressionGet, Join, JoinType, SearchCandidate, SearchDecision,
         SearchScan,
     };
-    use crate::plan::LogicalPlan;
+    use crate::plan::OwnedLogicalPlan;
     use paro_catalog::entry::{ColumnDefinition, EdgeTableInfo, TableCatalogEntry};
     use paro_common::runtime_value::Value;
     use paro_function::aggregate::distributive::count::get_count_star_function;
@@ -1527,12 +1529,12 @@ mod tests {
         ))
     }
 
-    fn lp(op: LogicalOperator) -> LogicalPlan {
-        LogicalPlan::new(&BindContext::new(), op)
+    fn lp(op: LogicalOperator) -> OwnedLogicalPlan {
+        OwnedLogicalPlan::new(&BindContext::new(), op)
     }
 
-    fn leaf_plan(bind_ctx: &BindContext, table_index: usize) -> LogicalPlan {
-        LogicalPlan::new(
+    fn leaf_plan(bind_ctx: &BindContext, table_index: usize) -> OwnedLogicalPlan {
+        OwnedLogicalPlan::new(
             bind_ctx,
             expression_get(table_index, vec![LogicalType::Integer]),
         )
@@ -1571,7 +1573,7 @@ mod tests {
         ))
     }
 
-    fn create_copy_to(child: LogicalPlan) -> CopyTo {
+    fn create_copy_to(child: OwnedLogicalPlan) -> CopyTo {
         let copy_function = register_copy_functions()
             .into_iter()
             .next()

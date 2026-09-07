@@ -9,7 +9,7 @@ use paro_planner::expression::{Expression, ExpressionIterator, ExpressionVisitDe
 use paro_planner::operator::{
     ColumnBinding, ComparisonJoin, Filter, Get, Join, LogicalOperator, Projection,
 };
-use paro_planner::plan::LogicalPlan;
+use paro_planner::plan::OwnedLogicalPlan;
 
 use super::{clean_inner_join, is_movable};
 use crate::aggregate::semantic_kernels::{
@@ -23,7 +23,7 @@ pub(crate) struct AlphaBindings {
 }
 
 impl AlphaBindings {
-    pub(super) fn match_sources(grouped: &LogicalPlan, scalar: &LogicalPlan) -> Option<Self> {
+    pub(super) fn match_sources(grouped: &OwnedLogicalPlan, scalar: &OwnedLogicalPlan) -> Option<Self> {
         let mut bindings = Self::default();
         bindings.match_plan(grouped, scalar).then_some(bindings)
     }
@@ -165,7 +165,7 @@ impl AlphaBindings {
                 .all(|(left, right)| self.semantic_expression_equal(left, right))
     }
 
-    fn match_plan(&mut self, grouped: &LogicalPlan, scalar: &LogicalPlan) -> bool {
+    fn match_plan(&mut self, grouped: &OwnedLogicalPlan, scalar: &OwnedLogicalPlan) -> bool {
         match (&grouped.operator, &scalar.operator) {
             (LogicalOperator::Get(left), LogicalOperator::Get(right)) => {
                 self.match_get_pair(left, right)

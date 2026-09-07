@@ -3,7 +3,7 @@
 
 //! Logical Insert Operator
 
-use crate::plan::LogicalPlan;
+use crate::plan::OwnedLogicalPlan;
 use paro_catalog::entry::TableCatalogEntry;
 use paro_common::types::LogicalType;
 use std::sync::Arc;
@@ -23,8 +23,8 @@ pub enum InsertOnConflictAction {
     },
 }
 
-#[derive(Debug)]
-pub struct Insert {
+#[derive(Debug, Clone)]
+pub struct Insert<Child = Box<OwnedLogicalPlan>> {
     /// Target table
     pub table: Arc<TableCatalogEntry>,
     /// Column mapping (which input column goes to which table column)
@@ -34,7 +34,7 @@ pub struct Insert {
     /// Optional ON CONFLICT behavior.
     pub on_conflict: Option<InsertOnConflict>,
     /// The source of the data
-    pub child: Box<LogicalPlan>,
+    pub child: Child,
 }
 
 impl Insert {
@@ -43,7 +43,7 @@ impl Insert {
         column_index_map: Vec<usize>,
         expected_types: Vec<LogicalType>,
         on_conflict: Option<InsertOnConflict>,
-        child: LogicalPlan,
+        child: OwnedLogicalPlan,
     ) -> Self {
         Self {
             table,

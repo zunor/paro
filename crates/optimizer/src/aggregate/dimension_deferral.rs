@@ -22,7 +22,7 @@ use paro_planner::expression::{
 use paro_planner::operator::{
     Aggregate, ColumnBinding, ComparisonJoin, Join, JoinComparisonType, JoinType, LogicalOperator,
 };
-use paro_planner::plan::{LogicalPlan, NodeStats, PlanNodeId};
+use paro_planner::plan::{OwnedLogicalPlan, NodeStats, PlanNodeId};
 
 use crate::expression::traversal::visit_expression;
 
@@ -31,7 +31,7 @@ mod join_region;
 /// Produce one root-local aggregate alternative. Memo owns traversal and rule
 /// scheduling; recursively rewriting descendants here would duplicate work
 /// and make one firing consume unrelated equivalence groups.
-pub fn optimize_plan(plan: LogicalPlan, bind_context: &BindContext) -> Result<(LogicalPlan, bool)> {
+pub fn optimize_plan(plan: OwnedLogicalPlan, bind_context: &BindContext) -> Result<(OwnedLogicalPlan, bool)> {
     rewrite_node(plan, bind_context)
 }
 
@@ -70,7 +70,7 @@ struct DimensionRewriteInput {
     join: ComparisonJoin,
 }
 
-fn rewrite_node(plan: LogicalPlan, bind_context: &BindContext) -> Result<(LogicalPlan, bool)> {
+fn rewrite_node(plan: OwnedLogicalPlan, bind_context: &BindContext) -> Result<(OwnedLogicalPlan, bool)> {
     let plan = join_region::isolate_widest_dimension(plan, bind_context)?;
     let Some(witness) = recognize(&plan) else {
         return Ok((plan, false));
@@ -86,7 +86,7 @@ fn rewrite_node(plan: LogicalPlan, bind_context: &BindContext) -> Result<(Logica
 /// post-join merge. The dimension is moved, not copied: unmatched fact states
 /// disappear at the final inner join, so an earlier existence join would be
 /// both redundant and more expensive.
-fn recognize(plan: &LogicalPlan) -> Option<DimensionDeferral> {
+fn recognize(plan: &OwnedLogicalPlan) -> Option<DimensionDeferral> {
     let LogicalOperator::Aggregate(aggregate) = &plan.operator else {
         return None;
     };
@@ -269,12 +269,12 @@ impl DimensionRewriteInput {
     /// A future recognizer drift reconstructs and returns the original plan;
     /// the successful representation contains no fallible shape decisions.
     fn from_plan(
-        plan: LogicalPlan,
+        plan: OwnedLogicalPlan,
         projection_depth: usize,
-    ) -> std::result::Result<Self, Box<LogicalPlan>> {
+    ) -> std::result::Result<Self, Box<OwnedLogicalPlan>> {
         let (root_id, root_stats, operator) = plan.into_parts();
         let LogicalOperator::Aggregate(mut aggregate) = operator else {
-            return Err(Box::new(LogicalPlan {
+            return Err(Box::new(OwnedLogicalPlan {
                 id: root_id,
                 stats: root_stats,
                 operator,
@@ -282,7 +282,7 @@ impl DimensionRewriteInput {
         };
         let child = *std::mem::replace(
             &mut aggregate.child,
-            Box::new(LogicalPlan::synthetic(LogicalOperator::DummyScan)),
+            Box::new(OwnedLogicalPlan::synthetic(LogicalOperator::DummyScan)),
         );
         match take_join_below_projections(child, projection_depth) {
             Ok(join) => Ok(Self {
@@ -293,7 +293,7 @@ impl DimensionRewriteInput {
             }),
             Err(child) => {
                 aggregate.child = child;
-                Err(Box::new(LogicalPlan {
+                Err(Box::new(OwnedLogicalPlan {
                     id: root_id,
                     stats: root_stats,
                     operator: LogicalOperator::Aggregate(aggregate),
@@ -304,14 +304,14 @@ impl DimensionRewriteInput {
 }
 
 fn take_join_below_projections(
-    plan: LogicalPlan,
+    plan: OwnedLogicalPlan,
     projection_depth: usize,
-) -> std::result::Result<ComparisonJoin, Box<LogicalPlan>> {
+) -> std::result::Result<ComparisonJoin, Box<OwnedLogicalPlan>> {
     let (id, stats, operator) = plan.into_parts();
     if projection_depth == 0 {
         return match operator {
             LogicalOperator::Join(Join::Comparison(join)) => Ok(join),
-            operator => Err(Box::new(LogicalPlan {
+            operator => Err(Box::new(OwnedLogicalPlan {
                 id,
                 stats,
                 operator,
@@ -319,7 +319,7 @@ fn take_join_below_projections(
         };
     }
     let LogicalOperator::Projection(mut projection) = operator else {
-        return Err(Box::new(LogicalPlan {
+        return Err(Box::new(OwnedLogicalPlan {
             id,
             stats,
             operator,
@@ -329,7 +329,7 @@ fn take_join_below_projections(
         Ok(join) => Ok(join),
         Err(child) => {
             projection.child = child;
-            Err(Box::new(LogicalPlan {
+            Err(Box::new(OwnedLogicalPlan {
                 id,
                 stats,
                 operator: LogicalOperator::Projection(projection),
@@ -342,7 +342,7 @@ fn apply(
     input: DimensionRewriteInput,
     witness: DimensionDeferral,
     bind_context: &BindContext,
-) -> LogicalPlan {
+) -> OwnedLogicalPlan {
     let DimensionRewriteInput {
         root_id,
         root_stats,
@@ -388,7 +388,7 @@ fn apply(
             }
         })
         .collect::<Vec<_>>();
-    let partial = LogicalPlan::new(
+    let partial = OwnedLogicalPlan::new(
         bind_context,
         LogicalOperator::Aggregate(Aggregate::new(
             partial_group_index,
@@ -427,7 +427,7 @@ fn apply(
         })
         .collect();
 
-    aggregate.child = Box::new(LogicalPlan::new(
+    aggregate.child = Box::new(OwnedLogicalPlan::new(
         bind_context,
         LogicalOperator::Join(Join::Comparison(final_join)),
     ));
@@ -435,7 +435,7 @@ fn apply(
     aggregate.aggregates = outer_aggregates;
     aggregate.grouping_sets.clear();
     aggregate.recompute_returned_types();
-    LogicalPlan {
+    OwnedLogicalPlan {
         id: root_id,
         stats: root_stats,
         operator: LogicalOperator::Aggregate(aggregate),

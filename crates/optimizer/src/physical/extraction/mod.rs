@@ -33,7 +33,7 @@ use paro_planner::operator::{
     SetOpType, SetOperation as LogicalSetOperation, TableFunctionGet as LogicalTableFunctionGet,
     TopN as LogicalTopN, Update as LogicalUpdate, Window as LogicalWindow,
 };
-use paro_planner::plan::LogicalPlan;
+use paro_planner::plan::OwnedLogicalPlan;
 use paro_storage::search::{SearchIntent, SearchRequestMode};
 
 use super::children::PlanChildrenArena;
@@ -197,7 +197,7 @@ impl PhysicalPlanExtractor {
         self
     }
 
-    pub fn extract(&mut self, logical: &LogicalPlan) -> Result<PhysicalPlan> {
+    pub fn extract(&mut self, logical: &OwnedLogicalPlan) -> Result<PhysicalPlan> {
         self.arena = PhysicalPlanNodeArena::default();
         self.children = PlanChildrenArena::default();
         self.properties = PlanPropertyMap::default();
@@ -217,7 +217,7 @@ impl PhysicalPlanExtractor {
         Ok(plan)
     }
 
-    fn extract_node(&mut self, logical: &LogicalPlan) -> Result<PhysicalPlanNodeId> {
+    fn extract_node(&mut self, logical: &OwnedLogicalPlan) -> Result<PhysicalPlanNodeId> {
         let winner_contract = self.winner_contracts.get(&logical.id);
         if self.require_winner_contracts && winner_contract.is_none() {
             return Err(paro_error::internal(format!(
@@ -489,7 +489,7 @@ impl PhysicalPlanExtractor {
 
     fn apply_extracted_enforcers(
         &mut self,
-        logical: &LogicalPlan,
+        logical: &OwnedLogicalPlan,
         mut child: PhysicalPlanNodeId,
     ) -> Result<PhysicalPlanNodeId> {
         let Some(enforcers) = self.enforcer_contracts.get(&logical.id).cloned() else {

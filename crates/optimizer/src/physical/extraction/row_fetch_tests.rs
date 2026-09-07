@@ -7,7 +7,7 @@ use paro_planner::expression::{ColumnRefExpression, Expression};
 use paro_planner::operator::{
     ColumnBinding, ExpressionGet, LogicalOperator, Projection, RowFetch, RowFetchSource,
 };
-use paro_planner::plan::LogicalPlan;
+use paro_planner::plan::OwnedLogicalPlan;
 
 use super::*;
 
@@ -19,7 +19,7 @@ fn lowers_late_row_fetch_with_resolved_carrier_rowid() {
 
     let ctx = BindContext::new();
     let table = super::tests::test_get().table.expect("stored table");
-    let carrier = LogicalPlan::new(
+    let carrier = OwnedLogicalPlan::new(
         &ctx,
         LogicalOperator::ExpressionGet(ExpressionGet::new(
             CARRIER,
@@ -28,7 +28,7 @@ fn lowers_late_row_fetch_with_resolved_carrier_rowid() {
             vec![LogicalType::Integer, LogicalType::BigInt],
         )),
     );
-    let fetch = LogicalPlan::new(
+    let fetch = OwnedLogicalPlan::new(
         &ctx,
         LogicalOperator::RowFetch(RowFetch::new(
             CARRIER,
@@ -59,7 +59,7 @@ fn lowers_late_row_fetch_with_resolved_carrier_rowid() {
         ],
     )
     .with_visible_names(vec!["key".into(), "payload".into()]);
-    let mut logical = LogicalPlan::new(&ctx, LogicalOperator::Projection(projection));
+    let mut logical = OwnedLogicalPlan::new(&ctx, LogicalOperator::Projection(projection));
     crate::physical::slot_assignment::assign_expression_slots(&mut logical.operator)
         .expect("late row-fetch bindings resolve");
 
@@ -98,7 +98,7 @@ fn lowers_row_fetch_without_projection_parent() {
 
     let ctx = BindContext::new();
     let table = super::tests::test_get().table.expect("stored table");
-    let carrier = LogicalPlan::new(
+    let carrier = OwnedLogicalPlan::new(
         &ctx,
         LogicalOperator::ExpressionGet(ExpressionGet::new(
             CARRIER,
@@ -107,7 +107,7 @@ fn lowers_row_fetch_without_projection_parent() {
             vec![LogicalType::Integer, LogicalType::BigInt],
         )),
     );
-    let mut logical = LogicalPlan::new(
+    let mut logical = OwnedLogicalPlan::new(
         &ctx,
         LogicalOperator::RowFetch(RowFetch::new(
             CARRIER,

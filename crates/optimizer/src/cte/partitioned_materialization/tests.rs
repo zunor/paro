@@ -13,7 +13,7 @@ use paro_planner::operator::{
     CTERef, DependentJoin, ExpressionGet, Filter, Join, JoinType, LogicalOperator, MaterializedCTE,
     Projection, SetOperation,
 };
-use paro_planner::plan::LogicalPlan;
+use paro_planner::plan::OwnedLogicalPlan;
 
 use super::{join_null_supplying_inputs, CTEPartitioner};
 use crate::expression::traversal::visit_expression;
@@ -32,10 +32,10 @@ fn integer(value: i32) -> Expression {
     ))
 }
 
-fn branch(bind_context: &BindContext, discriminator: i32) -> LogicalPlan {
+fn branch(bind_context: &BindContext, discriminator: i32) -> OwnedLogicalPlan {
     let source = bind_context.generate_table_index();
     let projection = bind_context.generate_table_index();
-    let values = LogicalPlan::new(
+    let values = OwnedLogicalPlan::new(
         bind_context,
         LogicalOperator::ExpressionGet(ExpressionGet::new(
             source,
@@ -44,7 +44,7 @@ fn branch(bind_context: &BindContext, discriminator: i32) -> LogicalPlan {
             vec![LogicalType::Integer],
         )),
     );
-    LogicalPlan::new(
+    OwnedLogicalPlan::new(
         bind_context,
         LogicalOperator::Projection(Projection::new(
             projection,
@@ -59,7 +59,7 @@ fn reference(
     cte_index: usize,
     discriminator: i32,
     filtered: bool,
-) -> LogicalPlan {
+) -> OwnedLogicalPlan {
     reference_with_extra_filters(bind_context, cte_index, discriminator, filtered, Vec::new())
 }
 
@@ -69,9 +69,9 @@ fn reference_with_extra_filters(
     discriminator: i32,
     filtered: bool,
     mut extra_filters: Vec<Expression>,
-) -> LogicalPlan {
+) -> OwnedLogicalPlan {
     let table = bind_context.generate_table_index();
-    let reference = LogicalPlan::new(
+    let reference = OwnedLogicalPlan::new(
         bind_context,
         LogicalOperator::CTERef(CTERef::new(
             cte_index,
@@ -90,14 +90,14 @@ fn reference_with_extra_filters(
         integer(discriminator),
     ))];
     filters.append(&mut extra_filters);
-    LogicalPlan::new(
+    OwnedLogicalPlan::new(
         bind_context,
         LogicalOperator::Filter(Filter::new(reference, filters)),
     )
 }
 
-fn union(bind_context: &BindContext, left: LogicalPlan, right: LogicalPlan) -> LogicalPlan {
-    LogicalPlan::new(
+fn union(bind_context: &BindContext, left: OwnedLogicalPlan, right: OwnedLogicalPlan) -> OwnedLogicalPlan {
+    OwnedLogicalPlan::new(
         bind_context,
         LogicalOperator::SetOperation(SetOperation::union(
             bind_context.generate_table_index(),
@@ -111,8 +111,8 @@ fn union(bind_context: &BindContext, left: LogicalPlan, right: LogicalPlan) -> L
 
 fn plan_with_consumers(
     bind_context: &BindContext,
-    build_consumers: impl FnOnce(usize) -> LogicalPlan,
-) -> LogicalPlan {
+    build_consumers: impl FnOnce(usize) -> OwnedLogicalPlan,
+) -> OwnedLogicalPlan {
     let cte_index = bind_context.generate_table_index();
     let producer = union(
         bind_context,
@@ -124,7 +124,7 @@ fn plan_with_consumers(
         branch(bind_context, 3),
     );
     let consumers = build_consumers(cte_index);
-    LogicalPlan::new(
+    OwnedLogicalPlan::new(
         bind_context,
         LogicalOperator::MaterializedCTE(
             MaterializedCTE::new(
@@ -141,7 +141,7 @@ fn plan_with_consumers(
     )
 }
 
-fn plan(bind_context: &BindContext, leave_last_unfiltered: bool) -> LogicalPlan {
+fn plan(bind_context: &BindContext, leave_last_unfiltered: bool) -> OwnedLogicalPlan {
     plan_with_consumers(bind_context, |cte_index| {
         union(
             bind_context,
@@ -158,10 +158,10 @@ fn plan(bind_context: &BindContext, leave_last_unfiltered: bool) -> LogicalPlan 
 fn join(
     bind_context: &BindContext,
     join_type: JoinType,
-    left: LogicalPlan,
-    right: LogicalPlan,
-) -> LogicalPlan {
-    LogicalPlan::new(
+    left: OwnedLogicalPlan,
+    right: OwnedLogicalPlan,
+) -> OwnedLogicalPlan {
+    OwnedLogicalPlan::new(
         bind_context,
         LogicalOperator::Join(Join::any(
             join_type,
@@ -175,10 +175,10 @@ fn join(
     )
 }
 
-fn passthrough_projection(bind_context: &BindContext, child: LogicalPlan) -> LogicalPlan {
+fn passthrough_projection(bind_context: &BindContext, child: OwnedLogicalPlan) -> OwnedLogicalPlan {
     let bindings = child.get_column_bindings();
     let types = child.types();
-    LogicalPlan::new(
+    OwnedLogicalPlan::new(
         bind_context,
         LogicalOperator::Projection(Projection::new(
             bind_context.generate_table_index(),
@@ -194,8 +194,8 @@ fn passthrough_projection(bind_context: &BindContext, child: LogicalPlan) -> Log
     )
 }
 
-fn unrelated_rows(bind_context: &BindContext) -> LogicalPlan {
-    LogicalPlan::new(
+fn unrelated_rows(bind_context: &BindContext) -> OwnedLogicalPlan {
+    OwnedLogicalPlan::new(
         bind_context,
         LogicalOperator::ExpressionGet(ExpressionGet::new(
             bind_context.generate_table_index(),
@@ -240,7 +240,7 @@ fn inspect_partition_owners(operator: &LogicalOperator, owners: &mut Vec<(bool, 
     }
 }
 
-fn count_partition_discriminator_references(plan: &mut LogicalPlan) -> usize {
+fn count_partition_discriminator_references(plan: &mut OwnedLogicalPlan) -> usize {
     let mut reference_tables = Vec::new();
     plan.try_visit_pre_order(|node| {
         if let LogicalOperator::CTERef(reference) = &node.operator {
@@ -314,7 +314,7 @@ fn rejects_partitioning_when_a_producer_branch_has_no_reference() {
         *cte.cte_query,
         branch(&bind_context, 4),
     ));
-    let candidate = LogicalPlan {
+    let candidate = OwnedLogicalPlan {
         id,
         stats,
         operator: LogicalOperator::MaterializedCTE(cte),
@@ -406,7 +406,7 @@ fn rejects_reference_on_scalar_dependent_join_nullable_rhs() {
             reference(&bind_context, cte_index, 1, true),
             reference(&bind_context, cte_index, 3, true),
         );
-        LogicalPlan::new(
+        OwnedLogicalPlan::new(
             &bind_context,
             LogicalOperator::DependentJoin(DependentJoin::scalar(
                 preserved,

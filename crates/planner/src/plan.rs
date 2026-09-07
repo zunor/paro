@@ -3,6 +3,9 @@
 
 //! Logical plan wrapper and plan-node metadata.
 
+pub mod arena;
+pub use arena::LogicalPlan;
+
 use std::mem::ManuallyDrop;
 use std::ops::ControlFlow;
 
@@ -146,9 +149,11 @@ impl NodeStats {
     }
 }
 
-/// Logical plan wrapper that owns plan-node identity and node-local metadata.
+/// Mutable, occurrence-owned IR at binder and local semantic-rule boundaries.
+/// The relational search representation is [`LogicalPlan`], whose children
+/// are immutable arena indices. This type must not be stored in Memo payloads.
 #[derive(Debug)]
-pub struct LogicalPlan {
+pub struct OwnedLogicalPlan {
     pub id: PlanNodeId,
     pub stats: NodeStats,
     pub operator: LogicalOperator,
@@ -158,7 +163,7 @@ pub struct LogicalPlan {
 pub struct PlannedStatement {
     pub types: Vec<LogicalType>,
     pub names: Vec<String>,
-    pub plan: LogicalPlan,
+    pub plan: OwnedLogicalPlan,
 }
 
 /// Stateful consumer for the canonical iterative post-order plan traversal.
@@ -170,16 +175,19 @@ pub struct PlannedStatement {
 pub trait LogicalPlanPostOrderFolder<State> {
     fn child_completed(
         &mut self,
-        _parent_skeleton: &LogicalPlan,
-        _completed_children: &[LogicalPlan],
+        _parent_skeleton: &arena::LogicalPlanNode<()>,
+        _completed_children: &[Box<OwnedLogicalPlan>],
         _completed_states: &[State],
-        _remaining_children: &[LogicalPlan],
+        _remaining_children: &[Box<OwnedLogicalPlan>],
     ) -> Result<()> {
         Ok(())
     }
 
-    fn fold(&mut self, plan: LogicalPlan, child_states: Vec<State>)
-        -> Result<(LogicalPlan, State)>;
+    fn fold(
+        &mut self,
+        plan: OwnedLogicalPlan,
+        child_states: Vec<State>,
+    ) -> Result<(OwnedLogicalPlan, State)>;
 }
 
 struct ClosurePostOrderFolder<F> {
@@ -188,13 +196,13 @@ struct ClosurePostOrderFolder<F> {
 
 impl<State, F> LogicalPlanPostOrderFolder<State> for ClosurePostOrderFolder<F>
 where
-    F: FnMut(LogicalPlan, Vec<State>) -> Result<(LogicalPlan, State)>,
+    F: FnMut(OwnedLogicalPlan, Vec<State>) -> Result<(OwnedLogicalPlan, State)>,
 {
     fn fold(
         &mut self,
-        plan: LogicalPlan,
+        plan: OwnedLogicalPlan,
         child_states: Vec<State>,
-    ) -> Result<(LogicalPlan, State)> {
+    ) -> Result<(OwnedLogicalPlan, State)> {
         (self.transform)(plan, child_states)
     }
 }
@@ -209,7 +217,7 @@ impl PlannedStatement {
     }
 }
 
-impl LogicalPlan {
+impl OwnedLogicalPlan {
     pub fn new(bind_ctx: &BindContext, operator: LogicalOperator) -> Self {
         Self {
             id: bind_ctx.next_plan_id(),
@@ -253,7 +261,7 @@ impl LogicalPlan {
     }
 
     /// Child plan nodes (one level).
-    pub fn children(&self) -> Vec<&LogicalPlan> {
+    pub fn children(&self) -> Vec<&OwnedLogicalPlan> {
         self.operator.children()
     }
 
@@ -280,14 +288,14 @@ impl LogicalPlan {
         })
     }
 
-    pub fn map_children(self, mut f: impl FnMut(LogicalPlan) -> LogicalPlan) -> Self {
+    pub fn map_children(self, mut f: impl FnMut(OwnedLogicalPlan) -> OwnedLogicalPlan) -> Self {
         self.try_map_children(|child| Ok(f(child)))
             .expect("infallible child mapping cannot fail")
     }
 
     pub fn try_map_children(
         self,
-        mut f: impl FnMut(LogicalPlan) -> Result<LogicalPlan>,
+        mut f: impl FnMut(OwnedLogicalPlan) -> Result<OwnedLogicalPlan>,
     ) -> Result<Self> {
         let (id, mut stats, operator) = self.into_parts();
         let operator = operator.try_map_owned_children(&mut f)?;
@@ -303,11 +311,11 @@ impl LogicalPlan {
     ///
     /// This escape hatch exists for the canonical traversal engine and
     /// binder-owned structural copies. Rewriters must use
-    /// [`LogicalPlan::try_map_children`], whose contract invalidates cached
+    /// [`OwnedLogicalPlan::try_map_children`], whose contract invalidates cached
     /// layout-dependent facts.
     pub(crate) fn try_rebuild_children_preserving_stats(
         self,
-        mut f: impl FnMut(LogicalPlan) -> Result<LogicalPlan>,
+        mut f: impl FnMut(OwnedLogicalPlan) -> Result<OwnedLogicalPlan>,
     ) -> Result<Self> {
         let (id, stats, operator) = self.into_parts();
         Ok(Self {
@@ -326,8 +334,8 @@ impl LogicalPlan {
     /// detach/rebuild contract instead of duplicating recursive walkers.
     pub fn try_fold_post_order<State>(
         self,
-        transform: impl FnMut(LogicalPlan, Vec<State>) -> Result<(LogicalPlan, State)>,
-    ) -> Result<(LogicalPlan, State)> {
+        transform: impl FnMut(OwnedLogicalPlan, Vec<State>) -> Result<(OwnedLogicalPlan, State)>,
+    ) -> Result<(OwnedLogicalPlan, State)> {
         self.try_fold_post_order_with(&mut ClosurePostOrderFolder { transform })
     }
 
@@ -335,21 +343,20 @@ impl LogicalPlan {
     pub fn try_fold_post_order_with<State>(
         self,
         folder: &mut impl LogicalPlanPostOrderFolder<State>,
-    ) -> Result<(LogicalPlan, State)> {
+    ) -> Result<(OwnedLogicalPlan, State)> {
         struct Frame<State> {
-            skeleton: LogicalPlan,
-            remaining: std::vec::IntoIter<LogicalPlan>,
-            children: Vec<LogicalPlan>,
+            skeleton: arena::LogicalPlanNode<()>,
+            remaining: std::vec::IntoIter<Box<OwnedLogicalPlan>>,
+            // Keep the detached child allocations; unboxing/reboxing here
+            // adds an allocation for every unchanged ownership edge.
+            #[allow(clippy::vec_box)]
+            children: Vec<Box<OwnedLogicalPlan>>,
             child_states: Vec<State>,
         }
 
         impl<State> Frame<State> {
-            fn detach(plan: LogicalPlan) -> Result<Self> {
-                let mut detached = Vec::new();
-                let skeleton = plan.try_rebuild_children_preserving_stats(|child| {
-                    detached.push(child);
-                    Ok(LogicalPlan::synthetic(LogicalOperator::DummyScan))
-                })?;
+            fn detach(plan: OwnedLogicalPlan) -> Result<Self> {
+                let (skeleton, detached) = arena::LogicalPlanNode::detach(plan);
                 let child_count = detached.len();
                 Ok(Self {
                     skeleton,
@@ -359,18 +366,8 @@ impl LogicalPlan {
                 })
             }
 
-            fn rebuild(self) -> Result<(LogicalPlan, Vec<State>)> {
-                let mut children = self.children.into_iter();
-                let plan = self.skeleton.try_rebuild_children_preserving_stats(|_| {
-                    children.next().ok_or_else(|| {
-                        paro_error::internal("post-order traversal lost a transformed child")
-                    })
-                })?;
-                if children.next().is_some() {
-                    return Err(paro_error::internal(
-                        "post-order traversal produced excess transformed children",
-                    ));
-                }
+            fn rebuild(self) -> Result<(OwnedLogicalPlan, Vec<State>)> {
+                let plan = self.skeleton.assemble(self.children)?;
                 Ok((plan, self.child_states))
             }
         }
@@ -378,7 +375,7 @@ impl LogicalPlan {
         let mut frames = vec![Frame::detach(self)?];
         loop {
             if let Some(child) = frames.last_mut().and_then(|frame| frame.remaining.next()) {
-                frames.push(Frame::detach(child)?);
+                frames.push(Frame::detach(*child)?);
                 continue;
             }
             let frame = frames
@@ -389,7 +386,7 @@ impl LogicalPlan {
             let Some(parent) = frames.last_mut() else {
                 return Ok((plan, state));
             };
-            parent.children.push(plan);
+            parent.children.push(Box::new(plan));
             parent.child_states.push(state);
             folder.child_completed(
                 &parent.skeleton,
@@ -403,8 +400,8 @@ impl LogicalPlan {
     /// Iterative post-order map without a caller-visible fold state.
     pub fn try_map_post_order(
         self,
-        mut transform: impl FnMut(LogicalPlan) -> Result<LogicalPlan>,
-    ) -> Result<LogicalPlan> {
+        mut transform: impl FnMut(OwnedLogicalPlan) -> Result<OwnedLogicalPlan>,
+    ) -> Result<OwnedLogicalPlan> {
         self.try_fold_post_order(|plan, _children: Vec<()>| Ok((transform(plan)?, ())))
             .map(|(plan, ())| plan)
     }
@@ -418,8 +415,8 @@ impl LogicalPlan {
     pub fn try_replace_node(
         self,
         target: PlanNodeId,
-        replace: impl FnOnce(LogicalPlan) -> Result<LogicalPlan>,
-    ) -> Result<(LogicalPlan, bool)> {
+        replace: impl FnOnce(OwnedLogicalPlan) -> Result<OwnedLogicalPlan>,
+    ) -> Result<(OwnedLogicalPlan, bool)> {
         if target == PlanNodeId::SYNTHETIC {
             return Err(paro_error::internal(
                 "synthetic plan ids cannot identify a unique replacement target",
@@ -445,7 +442,7 @@ impl LogicalPlan {
     /// Visit every node with a bounded native stack.
     pub fn try_visit_pre_order(
         &self,
-        mut visitor: impl FnMut(&LogicalPlan) -> Result<()>,
+        mut visitor: impl FnMut(&OwnedLogicalPlan) -> Result<()>,
     ) -> Result<()> {
         let mut pending = vec![self];
         while let Some(plan) = pending.pop() {
@@ -455,9 +452,9 @@ impl LogicalPlan {
         Ok(())
     }
 
-    pub fn visit_children_mut<F>(&mut self, f: F) -> ControlFlow<()>
+    pub fn visit_children_mut<'a, F>(&'a mut self, f: F) -> ControlFlow<()>
     where
-        F: for<'a> FnMut(&'a mut LogicalPlan) -> ControlFlow<()>,
+        F: FnMut(&'a mut OwnedLogicalPlan) -> ControlFlow<()>,
     {
         self.operator.visit_children_mut(f)
     }
@@ -469,7 +466,7 @@ impl LogicalPlan {
 
     /// Dismantle an owned node without running its custom tree destructor.
     ///
-    /// This is the only supported way to move fields out of `LogicalPlan`:
+    /// This is the only supported way to move fields out of `OwnedLogicalPlan`:
     /// the type owns a stack-safe [`Drop`] implementation, so ordinary field
     /// moves are intentionally rejected by Rust.
     pub fn into_parts(self) -> (PlanNodeId, NodeStats, LogicalOperator) {
@@ -498,14 +495,14 @@ impl LogicalPlan {
     }
 }
 
-impl Drop for LogicalPlan {
+impl Drop for OwnedLogicalPlan {
     fn drop(&mut self) {
-        fn detach_children(operator: LogicalOperator) -> Vec<LogicalPlan> {
+        fn detach_children(operator: LogicalOperator) -> Vec<OwnedLogicalPlan> {
             let mut detached = Vec::new();
             let skeleton = operator
                 .try_map_owned_children(&mut |child| {
                     detached.push(child);
-                    Ok(LogicalPlan::synthetic(LogicalOperator::DummyScan))
+                    Ok(OwnedLogicalPlan::synthetic(LogicalOperator::DummyScan))
                 })
                 .expect("infallible plan-child detachment cannot fail");
             // The skeleton owns only shallow dummy children. Dropping it here
@@ -544,9 +541,9 @@ mod tests {
         let root_ctx = BindContext::new();
         let child_ctx = root_ctx.create_child();
 
-        let plan_a = LogicalPlan::dummy_scan(&root_ctx);
-        let plan_b = LogicalPlan::dummy_scan(&child_ctx);
-        let plan_c = LogicalPlan::dummy_scan(&root_ctx);
+        let plan_a = OwnedLogicalPlan::dummy_scan(&root_ctx);
+        let plan_b = OwnedLogicalPlan::dummy_scan(&child_ctx);
+        let plan_c = OwnedLogicalPlan::dummy_scan(&root_ctx);
 
         assert_eq!(plan_a.id, PlanNodeId(1));
         assert_eq!(plan_b.id, PlanNodeId(2));
@@ -555,7 +552,7 @@ mod tests {
 
     #[test]
     fn synthetic_plan_uses_shared_synthetic_id_and_default_stats() {
-        let synthetic = LogicalPlan::synthetic(LogicalOperator::DummyScan);
+        let synthetic = OwnedLogicalPlan::synthetic(LogicalOperator::DummyScan);
 
         assert_eq!(synthetic.id, PlanNodeId::SYNTHETIC);
         assert_eq!(synthetic.stats, NodeStats::default());
@@ -564,10 +561,10 @@ mod tests {
 
     #[test]
     fn structural_mutation_invalidates_positional_unique_keys() {
-        let mut child = LogicalPlan::synthetic(LogicalOperator::DummyScan);
+        let mut child = OwnedLogicalPlan::synthetic(LogicalOperator::DummyScan);
         child.stats.unique_keys.push(structural_key());
         let mut plan =
-            LogicalPlan::synthetic(LogicalOperator::EmptyResult(EmptyResult::new(child)));
+            OwnedLogicalPlan::synthetic(LogicalOperator::EmptyResult(EmptyResult::new(child)));
         plan.stats.unique_keys.push(structural_key());
 
         let plan = plan.map_children(|child| child);
@@ -578,7 +575,7 @@ mod tests {
 
     #[test]
     fn canonical_traversal_preserves_unmodified_node_facts() {
-        let mut plan = LogicalPlan::synthetic(LogicalOperator::DummyScan);
+        let mut plan = OwnedLogicalPlan::synthetic(LogicalOperator::DummyScan);
         plan.stats.unique_keys.push(structural_key());
 
         let (plan, ()) = plan
@@ -591,12 +588,12 @@ mod tests {
     #[test]
     fn node_replacement_invalidates_only_the_changed_ancestor_path() {
         let bind_context = BindContext::new();
-        let mut left = LogicalPlan::dummy_scan(&bind_context);
+        let mut left = OwnedLogicalPlan::dummy_scan(&bind_context);
         let left_id = left.id;
         left.stats.unique_keys.push(structural_key());
-        let mut right = LogicalPlan::dummy_scan(&bind_context);
+        let mut right = OwnedLogicalPlan::dummy_scan(&bind_context);
         right.stats.unique_keys.push(structural_key());
-        let mut root = LogicalPlan::new(
+        let mut root = OwnedLogicalPlan::new(
             &bind_context,
             LogicalOperator::Join(Join::cross(left, right)),
         );
@@ -615,9 +612,10 @@ mod tests {
     #[test]
     fn post_order_fold_handles_deep_plans_without_native_recursion() {
         const DEPTH: usize = 10_000;
-        let mut plan = LogicalPlan::synthetic(LogicalOperator::DummyScan);
+        let mut plan = OwnedLogicalPlan::synthetic(LogicalOperator::DummyScan);
         for _ in 0..DEPTH {
-            plan = LogicalPlan::synthetic(LogicalOperator::EmptyResult(EmptyResult::new(plan)));
+            plan =
+                OwnedLogicalPlan::synthetic(LogicalOperator::EmptyResult(EmptyResult::new(plan)));
         }
 
         let (plan, node_count) = plan
@@ -639,8 +637,8 @@ mod tests {
             .name("deep-output-layout".to_string())
             .stack_size(TEST_STACK_BYTES)
             .spawn(|| {
-                fn leaf(table_index: usize) -> LogicalPlan {
-                    LogicalPlan::synthetic(LogicalOperator::ExpressionGet(ExpressionGet::new(
+                fn leaf(table_index: usize) -> OwnedLogicalPlan {
+                    OwnedLogicalPlan::synthetic(LogicalOperator::ExpressionGet(ExpressionGet::new(
                         table_index,
                         vec![],
                         vec![format!("c{table_index}")],
@@ -650,7 +648,7 @@ mod tests {
 
                 let mut plan = leaf(0);
                 for table_index in 1..=DEPTH {
-                    plan = LogicalPlan::synthetic(LogicalOperator::Join(Join::cross(
+                    plan = OwnedLogicalPlan::synthetic(LogicalOperator::Join(Join::cross(
                         plan,
                         leaf(table_index),
                     )));

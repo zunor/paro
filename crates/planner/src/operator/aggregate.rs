@@ -10,7 +10,7 @@ use crate::expression::{AggregateType, Expression, ExpressionIterator, Expressio
 use crate::operator::{
     binding_preserving_get, ColumnBinding, Join, JoinComparisonType, JoinType, LogicalOperator,
 };
-use crate::plan::LogicalPlan;
+use crate::plan::OwnedLogicalPlan;
 use paro_catalog::entry::{CatalogEntry, CatalogObjectId, ConstraintType};
 use paro_common::error::{self as paro_error, Result};
 use paro_common::types::LogicalType;
@@ -225,7 +225,7 @@ struct InputLayout {
 }
 
 impl InputLayout {
-    fn new(input: &LogicalPlan) -> Option<Self> {
+    fn new(input: &OwnedLogicalPlan) -> Option<Self> {
         let bindings = input.get_column_bindings();
         let types = input.types();
         (bindings.len() == types.len()).then_some(Self { bindings, types })
@@ -324,8 +324,8 @@ pub struct PostAggregateReduction {
 }
 
 /// Aggregate performs groupings and aggregate function evaluations.
-#[derive(Debug)]
-pub struct Aggregate {
+#[derive(Debug, Clone)]
+pub struct Aggregate<Child = Box<OwnedLogicalPlan>> {
     /// Table index for group output columns.
     pub group_index: usize,
     /// Table index for aggregate output columns.
@@ -333,7 +333,7 @@ pub struct Aggregate {
     /// Table index for GROUPING() function outputs.
     pub groupings_index: usize,
     /// The input operator.
-    pub child: Box<LogicalPlan>,
+    pub child: Child,
     /// GROUP BY expressions.
     pub groups: Vec<Expression>,
     /// GROUPING SETS metadata.
@@ -360,7 +360,7 @@ impl Aggregate {
         group_index: usize,
         aggregate_index: usize,
         groupings_index: usize,
-        child: LogicalPlan,
+        child: OwnedLogicalPlan,
         groups: Vec<Expression>,
         grouping_sets: Vec<GroupingSet>,
         aggregates: Vec<Expression>,
@@ -426,44 +426,9 @@ impl Aggregate {
         Ok(())
     }
 
-    pub fn get_column_bindings(&self) -> Vec<ColumnBinding> {
-        let mut bindings = Vec::with_capacity(
-            self.groups.len() + self.aggregates.len() + self.grouping_functions.len(),
-        );
-        bindings
-            .extend((0..self.groups.len()).map(|idx| ColumnBinding::new(self.group_index, idx)));
-        bindings.extend(
-            (0..self.aggregates.len()).map(|idx| ColumnBinding::new(self.aggregate_index, idx)),
-        );
-        bindings.extend(
-            (0..self.grouping_functions.len())
-                .map(|idx| ColumnBinding::new(self.groupings_index, idx)),
-        );
-        bindings
-    }
-
     pub fn with_post_reduction(mut self, post_reduction: PostAggregateReduction) -> Self {
         self.post_reduction = Some(post_reduction);
         self
-    }
-
-    /// Whether all rows belong to one ordinary, non-empty grouping domain.
-    ///
-    /// Logical rewrites and physical lowering share this definition so a new
-    /// grouping-set representation cannot silently widen one consumer while
-    /// another rejects it.
-    pub fn has_plain_grouping_domain(&self) -> bool {
-        !self.groups.is_empty()
-            && self.grouping_functions.is_empty()
-            && (self.grouping_sets.is_empty()
-                || (self.grouping_sets.len() == 1
-                    && self.grouping_sets[0].expressions.len() == self.groups.len()
-                    && self.grouping_sets[0]
-                        .expressions
-                        .iter()
-                        .copied()
-                        .collect::<std::collections::HashSet<_>>()
-                        == (0..self.groups.len()).collect()))
     }
 
     /// Verify the correctness-bearing local expression domains of the optional
@@ -689,6 +654,40 @@ fn verify_local_scalar_expression(
     error.map_or(Ok(()), Err)
 }
 
+impl<Child> Aggregate<Child> {
+    pub fn get_column_bindings(&self) -> Vec<ColumnBinding> {
+        let mut bindings = Vec::with_capacity(
+            self.groups.len() + self.aggregates.len() + self.grouping_functions.len(),
+        );
+        bindings
+            .extend((0..self.groups.len()).map(|idx| ColumnBinding::new(self.group_index, idx)));
+        bindings.extend(
+            (0..self.aggregates.len()).map(|idx| ColumnBinding::new(self.aggregate_index, idx)),
+        );
+        bindings.extend(
+            (0..self.grouping_functions.len())
+                .map(|idx| ColumnBinding::new(self.groupings_index, idx)),
+        );
+        bindings
+    }
+
+    /// Whether all rows belong to one ordinary, non-empty grouping domain.
+    /// Logical rewrites and physical lowering share this exact definition.
+    pub fn has_plain_grouping_domain(&self) -> bool {
+        !self.groups.is_empty()
+            && self.grouping_functions.is_empty()
+            && (self.grouping_sets.is_empty()
+                || (self.grouping_sets.len() == 1
+                    && self.grouping_sets[0].expressions.len() == self.groups.len()
+                    && self.grouping_sets[0]
+                        .expressions
+                        .iter()
+                        .copied()
+                        .collect::<std::collections::HashSet<_>>()
+                        == (0..self.groups.len()).collect()))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -701,7 +700,7 @@ mod tests {
     use paro_function::aggregate::distributive::minmax::get_max_function;
 
     fn aggregate_with_reduction() -> Aggregate {
-        let child = LogicalPlan::synthetic(crate::operator::LogicalOperator::ExpressionGet(
+        let child = OwnedLogicalPlan::synthetic(crate::operator::LogicalOperator::ExpressionGet(
             ExpressionGet::new(
                 0,
                 Vec::new(),

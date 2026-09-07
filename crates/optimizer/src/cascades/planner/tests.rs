@@ -35,21 +35,21 @@ fn test_grant_classes() -> [ResourceGrantClass; 1] {
 
 #[test]
 fn cross_product_memory_tracks_only_the_materialized_build_side() {
-    let mut left = LogicalPlan::synthetic(LogicalOperator::ExpressionGet(ExpressionGet::new(
+    let mut left = OwnedLogicalPlan::synthetic(LogicalOperator::ExpressionGet(ExpressionGet::new(
         0,
         Vec::new(),
         vec!["left".to_string()],
         vec![LogicalType::BigInt],
     )));
     left.stats.estimated_cardinality = Some(CardinalityEstimate::exact(1_000_000_000));
-    let mut right = LogicalPlan::synthetic(LogicalOperator::ExpressionGet(ExpressionGet::new(
+    let mut right = OwnedLogicalPlan::synthetic(LogicalOperator::ExpressionGet(ExpressionGet::new(
         1,
         Vec::new(),
         vec!["right".to_string()],
         vec![LogicalType::BigInt],
     )));
     right.stats.estimated_cardinality = Some(CardinalityEstimate::exact(3));
-    let mut product = LogicalPlan::synthetic(LogicalOperator::Join(Join::cross(left, right)));
+    let mut product = OwnedLogicalPlan::synthetic(LogicalOperator::Join(Join::cross(left, right)));
     product.stats.estimated_cardinality = Some(CardinalityEstimate::exact(3_000_000_000));
 
     let cost = planner_operator_cost(
@@ -68,14 +68,14 @@ fn cross_product_memory_tracks_only_the_materialized_build_side() {
 fn materialized_cte_cost_tracks_the_producer_write() {
     let cost_for_rows = |rows| {
         let mut producer =
-            LogicalPlan::synthetic(LogicalOperator::ExpressionGet(ExpressionGet::new(
+            OwnedLogicalPlan::synthetic(LogicalOperator::ExpressionGet(ExpressionGet::new(
                 0,
                 Vec::new(),
                 vec!["v".to_string()],
                 vec![LogicalType::BigInt],
             )));
         producer.stats.estimated_cardinality = Some(CardinalityEstimate::exact(rows));
-        let mut consumer = LogicalPlan::synthetic(LogicalOperator::CTERef(CTERef::new(
+        let mut consumer = OwnedLogicalPlan::synthetic(LogicalOperator::CTERef(CTERef::new(
             1,
             1,
             "shared".to_string(),
@@ -84,7 +84,7 @@ fn materialized_cte_cost_tracks_the_producer_write() {
         )));
         consumer.stats.estimated_cardinality = Some(CardinalityEstimate::exact(1));
         let mut plan =
-            LogicalPlan::synthetic(LogicalOperator::MaterializedCTE(MaterializedCTE::new(
+            OwnedLogicalPlan::synthetic(LogicalOperator::MaterializedCTE(MaterializedCTE::new(
                 1,
                 "shared".to_string(),
                 vec!["v".to_string()],
@@ -116,11 +116,11 @@ fn materialized_cte_cost_is_monotone_in_producer_width() {
         let names = (0..types.len())
             .map(|index| format!("v{index}"))
             .collect::<Vec<_>>();
-        let mut producer = LogicalPlan::synthetic(LogicalOperator::ExpressionGet(
+        let mut producer = OwnedLogicalPlan::synthetic(LogicalOperator::ExpressionGet(
             ExpressionGet::new(0, Vec::new(), names.clone(), types.clone()),
         ));
         producer.stats.estimated_cardinality = Some(CardinalityEstimate::exact(1_000));
-        let mut consumer = LogicalPlan::synthetic(LogicalOperator::CTERef(CTERef::new(
+        let mut consumer = OwnedLogicalPlan::synthetic(LogicalOperator::CTERef(CTERef::new(
             1,
             1,
             "shared".to_string(),
@@ -129,7 +129,7 @@ fn materialized_cte_cost_is_monotone_in_producer_width() {
         )));
         consumer.stats.estimated_cardinality = Some(CardinalityEstimate::exact(1_000));
         let mut plan =
-            LogicalPlan::synthetic(LogicalOperator::MaterializedCTE(MaterializedCTE::new(
+            OwnedLogicalPlan::synthetic(LogicalOperator::MaterializedCTE(MaterializedCTE::new(
                 1,
                 "shared".to_string(),
                 names,
@@ -467,7 +467,7 @@ fn expression_cost_facts_read_current_group_cardinality() {
 #[test]
 fn graph_relation_identity_is_part_of_the_query_ir_fingerprint() {
     let scan = |label: &str, table_oid: u64| {
-        LogicalPlan::synthetic(LogicalOperator::GraphScan(GraphScan::new(
+        OwnedLogicalPlan::synthetic(LogicalOperator::GraphScan(GraphScan::new(
             VertexTableInfo {
                 table_name: label.to_ascii_lowercase(),
                 table_oid,
@@ -494,7 +494,7 @@ fn graph_relation_identity_is_part_of_the_query_ir_fingerprint() {
 #[test]
 fn graph_variable_identity_is_part_of_the_query_ir_fingerprint() {
     let scan = |table_index: usize| {
-        LogicalPlan::synthetic(LogicalOperator::GraphScan(GraphScan::new(
+        OwnedLogicalPlan::synthetic(LogicalOperator::GraphScan(GraphScan::new(
             VertexTableInfo {
                 table_name: "person".to_string(),
                 table_oid: 11,
@@ -519,7 +519,7 @@ fn graph_variable_identity_is_part_of_the_query_ir_fingerprint() {
 #[test]
 fn graph_filter_is_part_of_the_query_ir_fingerprint() {
     let scan = |value: bool| {
-        LogicalPlan::synthetic(LogicalOperator::GraphScan(GraphScan::new(
+        OwnedLogicalPlan::synthetic(LogicalOperator::GraphScan(GraphScan::new(
             VertexTableInfo {
                 table_name: "person".to_string(),
                 table_oid: 11,
@@ -538,7 +538,7 @@ fn graph_filter_is_part_of_the_query_ir_fingerprint() {
             "public".to_string(),
         )))
     };
-    let fingerprint = |mut plan: LogicalPlan| {
+    let fingerprint = |mut plan: OwnedLogicalPlan| {
         let mut binding_ids = BindingCatalog::default();
         let mut columns = ColumnCatalog::default();
         let mut scalars = ScalarArena::default();
@@ -560,7 +560,7 @@ fn graph_filter_is_part_of_the_query_ir_fingerprint() {
 #[test]
 fn cte_owner_is_part_of_the_query_ir_fingerprint() {
     let reference = |cte_index| {
-        LogicalPlan::synthetic(LogicalOperator::CTERef(CTERef::new(
+        OwnedLogicalPlan::synthetic(LogicalOperator::CTERef(CTERef::new(
             cte_index,
             7,
             "shared".to_string(),
@@ -577,8 +577,8 @@ fn cte_owner_is_part_of_the_query_ir_fingerprint() {
 #[test]
 fn memo_round_trip_derives_layout_after_winner_selection() {
     let bind_context = BindContext::new();
-    let leaf = LogicalPlan::dummy_scan(&bind_context);
-    let wrapped = LogicalPlan::new(
+    let leaf = OwnedLogicalPlan::dummy_scan(&bind_context);
+    let wrapped = OwnedLogicalPlan::new(
         &bind_context,
         LogicalOperator::EmptyResult(EmptyResult::new(leaf)),
     );
@@ -598,7 +598,7 @@ fn memo_round_trip_derives_layout_after_winner_selection() {
 #[test]
 fn memo_winner_names_the_hash_join_implementation() {
     let bind_context = BindContext::new();
-    let left = LogicalPlan::new(
+    let left = OwnedLogicalPlan::new(
         &bind_context,
         LogicalOperator::ExpressionGet(ExpressionGet::new(
             0,
@@ -607,7 +607,7 @@ fn memo_winner_names_the_hash_join_implementation() {
             vec![LogicalType::Integer],
         )),
     );
-    let right = LogicalPlan::new(
+    let right = OwnedLogicalPlan::new(
         &bind_context,
         LogicalOperator::ExpressionGet(ExpressionGet::new(
             1,
@@ -620,7 +620,7 @@ fn memo_winner_names_the_hash_join_implementation() {
         Expression::Reference(ReferenceExpression::new(0, LogicalType::Integer)),
         Expression::Reference(ReferenceExpression::new(0, LogicalType::Integer)),
     );
-    let join = LogicalPlan::new(
+    let join = OwnedLogicalPlan::new(
         &bind_context,
         LogicalOperator::Join(Join::comparison(
             JoinType::Inner,
@@ -645,7 +645,7 @@ fn memo_winner_names_the_hash_join_implementation() {
 #[test]
 fn memo_hash_join_can_select_logical_left_as_physical_build() {
     let bind_context = BindContext::new();
-    let mut left = LogicalPlan::new(
+    let mut left = OwnedLogicalPlan::new(
         &bind_context,
         LogicalOperator::ExpressionGet(ExpressionGet::new(
             0,
@@ -655,7 +655,7 @@ fn memo_hash_join_can_select_logical_left_as_physical_build() {
         )),
     );
     left.stats.estimated_cardinality = Some(CardinalityEstimate::exact(8));
-    let mut right = LogicalPlan::new(
+    let mut right = OwnedLogicalPlan::new(
         &bind_context,
         LogicalOperator::ExpressionGet(ExpressionGet::new(
             1,
@@ -669,7 +669,7 @@ fn memo_hash_join_can_select_logical_left_as_physical_build() {
         Expression::Reference(ReferenceExpression::new(0, LogicalType::Integer)),
         Expression::Reference(ReferenceExpression::new(0, LogicalType::Integer)),
     );
-    let mut join = LogicalPlan::new(
+    let mut join = OwnedLogicalPlan::new(
         &bind_context,
         LogicalOperator::Join(Join::comparison(
             JoinType::Left,
@@ -696,7 +696,7 @@ fn memo_hash_join_can_select_logical_left_as_physical_build() {
 #[test]
 fn memo_hash_join_does_not_materialize_a_selectivity_reduced_fact_subtree() {
     let bind_context = BindContext::new();
-    let mut reduced_fact = LogicalPlan::new(
+    let mut reduced_fact = OwnedLogicalPlan::new(
         &bind_context,
         LogicalOperator::ExpressionGet(ExpressionGet::new(
             0,
@@ -708,7 +708,7 @@ fn memo_hash_join_does_not_materialize_a_selectivity_reduced_fact_subtree() {
     reduced_fact.stats.estimated_cardinality = Some(CardinalityEstimate::exact(8));
     reduced_fact.stats.materialization_risk_cardinality = Some(1_000_000);
 
-    let mut dimension = LogicalPlan::new(
+    let mut dimension = OwnedLogicalPlan::new(
         &bind_context,
         LogicalOperator::ExpressionGet(ExpressionGet::new(
             1,
@@ -724,7 +724,7 @@ fn memo_hash_join_does_not_materialize_a_selectivity_reduced_fact_subtree() {
         Expression::Reference(ReferenceExpression::new(0, LogicalType::Integer)),
         Expression::Reference(ReferenceExpression::new(0, LogicalType::Integer)),
     );
-    let mut join = LogicalPlan::new(
+    let mut join = OwnedLogicalPlan::new(
         &bind_context,
         LogicalOperator::Join(Join::comparison(
             JoinType::Inner,
@@ -766,7 +766,7 @@ fn preserved_build_can_filter_a_direct_non_preserved_probe() {
     );
     assert!(supports_build_left_runtime_filter_auxiliary(&join, true));
     assert!(!supports_runtime_filter_auxiliary(&join, true));
-    let mut plan = LogicalPlan::synthetic(LogicalOperator::Join(Join::Comparison(join)));
+    let mut plan = OwnedLogicalPlan::synthetic(LogicalOperator::Join(Join::Comparison(join)));
     plan.stats.estimated_cardinality = Some(CardinalityEstimate::exact(538));
 
     let input = MemoBuilder::build(plan, BindContext::new(), SearchBudget::default()).unwrap();
@@ -794,7 +794,7 @@ fn calibration_revision_can_change_the_selected_physical_algorithm() {
 
     fn selected(calibration: MachineCalibrationBundle) -> PhysicalImplementationFlavor {
         let bind_context = BindContext::new();
-        let mut left = LogicalPlan::new(
+        let mut left = OwnedLogicalPlan::new(
             &bind_context,
             LogicalOperator::ExpressionGet(ExpressionGet::new(
                 0,
@@ -804,7 +804,7 @@ fn calibration_revision_can_change_the_selected_physical_algorithm() {
             )),
         );
         left.stats.estimated_cardinality = Some(CardinalityEstimate::exact(512));
-        let mut right = LogicalPlan::new(
+        let mut right = OwnedLogicalPlan::new(
             &bind_context,
             LogicalOperator::ExpressionGet(ExpressionGet::new(
                 1,
@@ -816,7 +816,7 @@ fn calibration_revision_can_change_the_selected_physical_algorithm() {
         right.stats.estimated_cardinality = Some(CardinalityEstimate::exact(512));
         let reference =
             |index| Expression::Reference(ReferenceExpression::new(index, LogicalType::Integer));
-        let mut join = LogicalPlan::new(
+        let mut join = OwnedLogicalPlan::new(
             &bind_context,
             LogicalOperator::Join(Join::comparison(
                 JoinType::Inner,
@@ -876,7 +876,7 @@ fn calibration_revision_can_change_the_selected_physical_algorithm() {
 #[test]
 fn memo_window_winner_is_the_node_lowered_by_the_physical_extractor() {
     let bind_context = BindContext::new();
-    let mut values = LogicalPlan::new(
+    let mut values = OwnedLogicalPlan::new(
         &bind_context,
         LogicalOperator::ExpressionGet(ExpressionGet::new(
             0,
@@ -888,7 +888,7 @@ fn memo_window_winner_is_the_node_lowered_by_the_physical_extractor() {
     values.stats.estimated_cardinality = Some(CardinalityEstimate::exact(1_024));
     let aggregate =
         AggregateExpression::new(get_count_star_function(), Vec::new(), LogicalType::BigInt);
-    let mut plan = LogicalPlan::new(
+    let mut plan = OwnedLogicalPlan::new(
         &bind_context,
         LogicalOperator::Window(LogicalWindow::new(
             1,
@@ -930,8 +930,8 @@ fn memo_window_winner_is_the_node_lowered_by_the_physical_extractor() {
 
 #[test]
 fn mark_join_to_semi_is_an_explicit_isolatable_transformation() {
-    fn plan(bind_context: &BindContext) -> LogicalPlan {
-        let left = LogicalPlan::new(
+    fn plan(bind_context: &BindContext) -> OwnedLogicalPlan {
+        let left = OwnedLogicalPlan::new(
             bind_context,
             LogicalOperator::ExpressionGet(ExpressionGet::new(
                 0,
@@ -940,7 +940,7 @@ fn mark_join_to_semi_is_an_explicit_isolatable_transformation() {
                 vec![LogicalType::Integer],
             )),
         );
-        let right = LogicalPlan::new(
+        let right = OwnedLogicalPlan::new(
             bind_context,
             LogicalOperator::ExpressionGet(ExpressionGet::new(
                 1,
@@ -966,14 +966,14 @@ fn mark_join_to_semi_is_an_explicit_isolatable_transformation() {
         );
         let mark_index = 90;
         join.mark_index = Some(mark_index);
-        let filter = LogicalPlan::new(
+        let filter = OwnedLogicalPlan::new(
             bind_context,
             LogicalOperator::Filter(Filter::new(
-                LogicalPlan::new(bind_context, LogicalOperator::Join(Join::Comparison(join))),
+                OwnedLogicalPlan::new(bind_context, LogicalOperator::Join(Join::Comparison(join))),
                 vec![column(mark_index, LogicalType::Boolean)],
             )),
         );
-        LogicalPlan::new(
+        OwnedLogicalPlan::new(
             bind_context,
             LogicalOperator::Projection(Projection::new(
                 91,
@@ -1004,7 +1004,7 @@ fn mark_join_to_semi_is_an_explicit_isolatable_transformation() {
     }
 
     fn selected_join_type(output: &OptimizationOutput) -> JoinType {
-        fn find(plan: &LogicalPlan) -> Option<JoinType> {
+        fn find(plan: &OwnedLogicalPlan) -> Option<JoinType> {
             if let LogicalOperator::Join(Join::Comparison(join)) = &plan.operator {
                 return Some(join.join_type);
             }
@@ -1049,7 +1049,7 @@ fn integer_value_rows(rows: usize, columns: usize) -> Vec<Vec<Expression>> {
         .collect()
 }
 
-pub(super) fn test_base_get(table_index: usize, oid: u64, name: &str, rows: usize) -> LogicalPlan {
+pub(super) fn test_base_get(table_index: usize, oid: u64, name: &str, rows: usize) -> OwnedLogicalPlan {
     let storage = Arc::new(
         TableFactory::default()
             .create_table(&[LogicalType::Integer])
@@ -1081,7 +1081,7 @@ pub(super) fn test_base_get(table_index: usize, oid: u64, name: &str, rows: usiz
         CatalogObjectId::from_raw(oid),
         0,
     ));
-    LogicalPlan::synthetic(LogicalOperator::Get(Get::new(
+    OwnedLogicalPlan::synthetic(LogicalOperator::Get(Get::new(
         table_index,
         vec!["id".to_string()],
         vec![LogicalType::Integer],
@@ -1101,7 +1101,7 @@ fn direct_rowset_reference_admits_and_selects_runtime_filter_region() {
     );
     let join = ComparisonJoin::new(JoinType::Inner, left, right, vec![condition]);
     assert!(supports_runtime_filter_auxiliary(&join, true));
-    let mut plan = LogicalPlan::synthetic(LogicalOperator::Join(Join::Comparison(join)));
+    let mut plan = OwnedLogicalPlan::synthetic(LogicalOperator::Join(Join::Comparison(join)));
     plan.stats.estimated_cardinality = Some(CardinalityEstimate::exact(20));
 
     let input =
@@ -1149,7 +1149,7 @@ fn oversized_runtime_filter_candidate_span_yields_to_the_baseline() {
     left.stats.estimated_cardinality = Some(CardinalityEstimate::exact(20_000));
     let mut right = test_base_get(1, 20_012, "build", 20);
     right.stats.estimated_cardinality = Some(CardinalityEstimate::exact(20));
-    let mut plan = LogicalPlan::synthetic(LogicalOperator::Join(Join::Comparison(
+    let mut plan = OwnedLogicalPlan::synthetic(LogicalOperator::Join(Join::Comparison(
         ComparisonJoin::new(
             JoinType::Inner,
             left,
@@ -1180,7 +1180,7 @@ fn oversized_runtime_filter_candidate_span_yields_to_the_baseline() {
 
 #[test]
 fn fully_pushable_filter_probe_requires_the_pushdown_compile_capability() {
-    let left = LogicalPlan::synthetic(LogicalOperator::Filter(Filter::new(
+    let left = OwnedLogicalPlan::synthetic(LogicalOperator::Filter(Filter::new(
         test_base_get(0, 20_003, "filtered_probe", 0),
         Vec::new(),
     )));
@@ -1203,7 +1203,7 @@ fn fully_pushable_filter_probe_requires_the_pushdown_compile_capability() {
 fn passthrough_projection_keeps_the_runtime_filter_consumer_lineage() {
     let mut probe = test_base_get(0, 20_005, "projected_probe", 20_000);
     probe.stats.estimated_cardinality = Some(CardinalityEstimate::exact(20_000));
-    let mut left = LogicalPlan::synthetic(LogicalOperator::Projection(Projection::new(
+    let mut left = OwnedLogicalPlan::synthetic(LogicalOperator::Projection(Projection::new(
         2,
         probe,
         vec![Expression::Reference(ReferenceExpression::new(
@@ -1224,7 +1224,7 @@ fn passthrough_projection_keeps_the_runtime_filter_consumer_lineage() {
         )],
     );
     assert!(supports_runtime_filter_auxiliary(&join, true));
-    let mut plan = LogicalPlan::synthetic(LogicalOperator::Join(Join::Comparison(join)));
+    let mut plan = OwnedLogicalPlan::synthetic(LogicalOperator::Join(Join::Comparison(join)));
     plan.stats.estimated_cardinality = Some(CardinalityEstimate::exact(20));
 
     let mut budget = SearchBudget::default();
@@ -1277,7 +1277,7 @@ fn inner_join_probe_keeps_runtime_filter_consumer_lineage() {
             Expression::Reference(ReferenceExpression::new(0, LogicalType::Integer)),
         )],
     );
-    let probe = LogicalPlan::synthetic(LogicalOperator::Join(Join::Comparison(first_join)));
+    let probe = OwnedLogicalPlan::synthetic(LogicalOperator::Join(Join::Comparison(first_join)));
     let build = test_base_get(2, 20_033, "second_build", 20);
     let join = ComparisonJoin::new(
         JoinType::Inner,
@@ -1290,7 +1290,7 @@ fn inner_join_probe_keeps_runtime_filter_consumer_lineage() {
     );
     assert!(supports_runtime_filter_auxiliary(&join, true));
 
-    let logical = LogicalPlan::synthetic(LogicalOperator::Join(Join::Comparison(join)));
+    let logical = OwnedLogicalPlan::synthetic(LogicalOperator::Join(Join::Comparison(join)));
     let physical =
         crate::physical::PhysicalPlanExtractor::new(crate::physical::ExtractionContext::default())
             .extract(&logical)
@@ -1319,7 +1319,7 @@ fn semi_join_preserved_probe_keeps_runtime_filter_consumer_lineage() {
             Expression::Reference(ReferenceExpression::new(0, LogicalType::Integer)),
         )],
     );
-    let probe = LogicalPlan::synthetic(LogicalOperator::Join(Join::Comparison(first_join)));
+    let probe = OwnedLogicalPlan::synthetic(LogicalOperator::Join(Join::Comparison(first_join)));
     let build = test_base_get(2, 20_046, "second_build", 20);
     let join = ComparisonJoin::new(
         JoinType::Inner,
@@ -1332,7 +1332,7 @@ fn semi_join_preserved_probe_keeps_runtime_filter_consumer_lineage() {
     );
     assert!(supports_runtime_filter_auxiliary(&join, true));
 
-    let logical = LogicalPlan::synthetic(LogicalOperator::Join(Join::Comparison(join)));
+    let logical = OwnedLogicalPlan::synthetic(LogicalOperator::Join(Join::Comparison(join)));
     let physical =
         crate::physical::PhysicalPlanExtractor::new(crate::physical::ExtractionContext::default())
             .extract(&logical)
@@ -1361,7 +1361,7 @@ fn left_outer_preserved_probe_keeps_runtime_filter_consumer_lineage() {
             Expression::Reference(ReferenceExpression::new(0, LogicalType::Integer)),
         )],
     );
-    let probe = LogicalPlan::synthetic(LogicalOperator::Join(Join::Comparison(left_join)));
+    let probe = OwnedLogicalPlan::synthetic(LogicalOperator::Join(Join::Comparison(left_join)));
     let build = test_base_get(2, 20_036, "filter_build", 20);
     let join = ComparisonJoin::new(
         JoinType::Inner,
@@ -1374,7 +1374,7 @@ fn left_outer_preserved_probe_keeps_runtime_filter_consumer_lineage() {
     );
     assert!(supports_runtime_filter_auxiliary(&join, true));
 
-    let logical = LogicalPlan::synthetic(LogicalOperator::Join(Join::Comparison(join)));
+    let logical = OwnedLogicalPlan::synthetic(LogicalOperator::Join(Join::Comparison(join)));
     let physical =
         crate::physical::PhysicalPlanExtractor::new(crate::physical::ExtractionContext::default())
             .extract(&logical)
@@ -1403,7 +1403,7 @@ fn left_outer_nullable_build_output_stops_runtime_filter_lineage() {
             Expression::Reference(ReferenceExpression::new(0, LogicalType::Integer)),
         )],
     );
-    let probe = LogicalPlan::synthetic(LogicalOperator::Join(Join::Comparison(left_join)));
+    let probe = OwnedLogicalPlan::synthetic(LogicalOperator::Join(Join::Comparison(left_join)));
     let build = test_base_get(2, 20_039, "filter_build", 20);
     let join = ComparisonJoin::new(
         JoinType::Inner,
@@ -1433,7 +1433,7 @@ fn nested_filters_share_one_ordered_source_work_lane() {
             Expression::Reference(ReferenceExpression::new(0, LogicalType::Integer)),
         )],
     );
-    let mut probe = LogicalPlan::synthetic(LogicalOperator::Join(Join::Comparison(first_join)));
+    let mut probe = OwnedLogicalPlan::synthetic(LogicalOperator::Join(Join::Comparison(first_join)));
     probe.stats.estimated_cardinality = Some(CardinalityEstimate::exact(200));
     // The second build is selective at the 20,000-row source and its lineage
     // crosses the first join. Source-work composition owns one lane and
@@ -1450,7 +1450,7 @@ fn nested_filters_share_one_ordered_source_work_lane() {
             Expression::Reference(ReferenceExpression::new(0, LogicalType::Integer)),
         )],
     );
-    let mut plan = LogicalPlan::synthetic(LogicalOperator::Join(Join::Comparison(second_join)));
+    let mut plan = OwnedLogicalPlan::synthetic(LogicalOperator::Join(Join::Comparison(second_join)));
     plan.stats.estimated_cardinality = Some(CardinalityEstimate::exact(20));
 
     let input = MemoBuilder::build(plan, BindContext::new(), SearchBudget::default())
@@ -1473,7 +1473,7 @@ fn union_all_probe_owns_one_runtime_filter_with_two_scan_consumers() {
     first.stats.estimated_cardinality = Some(CardinalityEstimate::exact(10_000));
     let mut second = test_base_get(1, 20_022, "second_probe", 10_000);
     second.stats.estimated_cardinality = Some(CardinalityEstimate::exact(10_000));
-    let mut union = LogicalPlan::synthetic(LogicalOperator::SetOperation(SetOperation::union(
+    let mut union = OwnedLogicalPlan::synthetic(LogicalOperator::SetOperation(SetOperation::union(
         2,
         first,
         second,
@@ -1493,7 +1493,7 @@ fn union_all_probe_owns_one_runtime_filter_with_two_scan_consumers() {
         )],
     );
     assert!(supports_runtime_filter_auxiliary(&join, true));
-    let mut plan = LogicalPlan::synthetic(LogicalOperator::Join(Join::Comparison(join)));
+    let mut plan = OwnedLogicalPlan::synthetic(LogicalOperator::Join(Join::Comparison(join)));
     plan.stats.estimated_cardinality = Some(CardinalityEstimate::exact(20));
 
     let mut budget = SearchBudget::default();
@@ -1544,7 +1544,7 @@ fn build_left_semi_join_filters_every_union_all_probe_source() {
     first.stats.estimated_cardinality = Some(CardinalityEstimate::exact(10_000));
     let mut second = test_base_get(1, 20_032, "second_probe", 10_000);
     second.stats.estimated_cardinality = Some(CardinalityEstimate::exact(10_000));
-    let mut union = LogicalPlan::synthetic(LogicalOperator::SetOperation(SetOperation::union(
+    let mut union = OwnedLogicalPlan::synthetic(LogicalOperator::SetOperation(SetOperation::union(
         2,
         first,
         second,
@@ -1564,7 +1564,7 @@ fn build_left_semi_join_filters_every_union_all_probe_source() {
         )],
     );
     assert!(supports_build_left_runtime_filter_auxiliary(&join, true));
-    let mut plan = LogicalPlan::synthetic(LogicalOperator::Join(Join::Comparison(join)));
+    let mut plan = OwnedLogicalPlan::synthetic(LogicalOperator::Join(Join::Comparison(join)));
     plan.stats.estimated_cardinality = Some(CardinalityEstimate::exact(20));
 
     let mut budget = SearchBudget::default();
@@ -1656,12 +1656,12 @@ fn global_sort_enforcer_is_extracted_as_an_executable_plan_node() {
     ));
 }
 
-fn constant_projection(bind_context: &BindContext, value: i32) -> LogicalPlan {
-    LogicalPlan::new(
+fn constant_projection(bind_context: &BindContext, value: i32) -> OwnedLogicalPlan {
+    OwnedLogicalPlan::new(
         bind_context,
         LogicalOperator::Projection(Projection::new(
             9,
-            LogicalPlan::dummy_scan(bind_context),
+            OwnedLogicalPlan::dummy_scan(bind_context),
             vec![Expression::Constant(ConstantExpression::new(
                 Value::Integer(value),
                 LogicalType::Integer,
@@ -1746,7 +1746,7 @@ fn query_ir_identity_uses_scalar_semantics_not_planner_node_id() {
 #[test]
 fn query_ir_identity_excludes_positional_projection_layout() {
     let child = || {
-        LogicalPlan::synthetic(LogicalOperator::ExpressionGet(ExpressionGet::new(
+        OwnedLogicalPlan::synthetic(LogicalOperator::ExpressionGet(ExpressionGet::new(
             41,
             Vec::new(),
             vec!["a".to_string(), "b".to_string()],
@@ -1760,13 +1760,13 @@ fn query_ir_identity_excludes_positional_projection_layout() {
     let scalars = ScalarArena::default();
 
     let identity = query_operator_fingerprint(
-        &LogicalPlan::synthetic(LogicalOperator::Filter(identity)),
+        &OwnedLogicalPlan::synthetic(LogicalOperator::Filter(identity)),
         &[],
         &scalars,
     )
     .unwrap();
     let permuted = query_operator_fingerprint(
-        &LogicalPlan::synthetic(LogicalOperator::Filter(permuted)),
+        &OwnedLogicalPlan::synthetic(LogicalOperator::Filter(permuted)),
         &[],
         &scalars,
     )
@@ -1778,10 +1778,10 @@ fn query_ir_identity_excludes_positional_projection_layout() {
 #[test]
 fn exact_is_the_default_root_contract_and_approximate_requires_opt_in() {
     let bind_context = BindContext::new();
-    let exact = LogicalPlan::new(
+    let exact = OwnedLogicalPlan::new(
         &bind_context,
         LogicalOperator::TopN(TopN::new(
-            LogicalPlan::dummy_scan(&bind_context),
+            OwnedLogicalPlan::dummy_scan(&bind_context),
             Vec::new(),
             1,
             0,
@@ -1789,10 +1789,10 @@ fn exact_is_the_default_root_contract_and_approximate_requires_opt_in() {
     );
     assert_eq!(required_result_guarantee(&exact), ResultGuarantee::Exact);
 
-    let approximate = LogicalPlan::new(
+    let approximate = OwnedLogicalPlan::new(
         &bind_context,
         LogicalOperator::TopN(
-            TopN::new(LogicalPlan::dummy_scan(&bind_context), Vec::new(), 1, 0).with_hnsw_options(
+            TopN::new(OwnedLogicalPlan::dummy_scan(&bind_context), Vec::new(), 1, 0).with_hnsw_options(
                 paro_storage::index::hnsw::HnswQueryOptions {
                     objective: paro_storage::index::hnsw::HnswSearchObjective::CostOptimized,
                     ..Default::default()

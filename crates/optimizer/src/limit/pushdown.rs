@@ -7,7 +7,7 @@ use paro_planner::expression::Expression;
 use paro_planner::operator::LogicalOperator;
 #[cfg(test)]
 use paro_planner::operator::LogicalOperatorType;
-use paro_planner::plan::LogicalPlan;
+use paro_planner::plan::OwnedLogicalPlan;
 
 pub struct LimitPushdown;
 
@@ -18,15 +18,15 @@ impl LimitPushdown {
 
     #[cfg(test)]
     fn optimize(&mut self, plan: LogicalOperator) -> LogicalOperator {
-        self.optimize_plan(LogicalPlan::synthetic(plan))
+        self.optimize_plan(OwnedLogicalPlan::synthetic(plan))
             .into_operator()
     }
 
-    pub fn optimize_plan(&mut self, plan: LogicalPlan) -> LogicalPlan {
+    pub fn optimize_plan(&mut self, plan: OwnedLogicalPlan) -> OwnedLogicalPlan {
         self.optimize_plan_with_change(plan).0
     }
 
-    pub fn optimize_plan_with_change(&mut self, plan: LogicalPlan) -> (LogicalPlan, bool) {
+    pub fn optimize_plan_with_change(&mut self, plan: OwnedLogicalPlan) -> (OwnedLogicalPlan, bool) {
         let mut changed = false;
         let plan = plan.map_children(|child| {
             let (child, child_changed) = self.optimize_plan_with_change(child);
@@ -89,10 +89,10 @@ impl LimitPushdown {
         }
     }
 
-    fn apply_optimization(&mut self, plan: LogicalPlan) -> LogicalPlan {
+    fn apply_optimization(&mut self, plan: OwnedLogicalPlan) -> OwnedLogicalPlan {
         let (id, stats, operator) = plan.into_parts();
         let LogicalOperator::Limit(mut limit) = operator else {
-            return LogicalPlan {
+            return OwnedLogicalPlan {
                 id,
                 stats,
                 operator,
@@ -102,12 +102,12 @@ impl LimitPushdown {
         let child_plan = *limit.child;
         let (child_id, child_stats, child_operator) = child_plan.into_parts();
         let LogicalOperator::Projection(mut projection) = child_operator else {
-            limit.child = Box::new(LogicalPlan {
+            limit.child = Box::new(OwnedLogicalPlan {
                 id: child_id,
                 stats: child_stats,
                 operator: child_operator,
             });
-            return LogicalPlan {
+            return OwnedLogicalPlan {
                 id,
                 stats,
                 operator: LogicalOperator::Limit(limit),
@@ -116,9 +116,9 @@ impl LimitPushdown {
 
         let inner_child = *projection.child;
         limit.child = Box::new(inner_child);
-        projection.child = Box::new(LogicalPlan::synthetic(LogicalOperator::Limit(limit)));
+        projection.child = Box::new(OwnedLogicalPlan::synthetic(LogicalOperator::Limit(limit)));
 
-        LogicalPlan {
+        OwnedLogicalPlan {
             id,
             stats,
             operator: LogicalOperator::Projection(projection),
@@ -182,7 +182,7 @@ mod tests {
             visible_count: 2,
             visible_qualifier: None,
             returned_types: vec![LogicalType::Integer, LogicalType::Varchar],
-            child: Box::new(LogicalPlan::synthetic(child)),
+            child: Box::new(OwnedLogicalPlan::synthetic(child)),
         })
     }
 
@@ -194,7 +194,7 @@ mod tests {
             .expect("random overload");
         LogicalOperator::Projection(Projection::new(
             1,
-            LogicalPlan::synthetic(child),
+            OwnedLogicalPlan::synthetic(child),
             vec![Expression::Function(FunctionExpression::new(
                 function,
                 vec![],
@@ -208,7 +208,7 @@ mod tests {
         let get = create_test_get();
         let projection = create_projection(get);
         let limit = LogicalOperator::Limit(Limit::new(
-            LogicalPlan::synthetic(projection),
+            OwnedLogicalPlan::synthetic(projection),
             Some(create_constant_expr(10)),
             None,
         ));
@@ -221,7 +221,7 @@ mod tests {
         let get = create_test_get();
         let projection = create_projection(get);
         let limit = LogicalOperator::Limit(Limit::new(
-            LogicalPlan::synthetic(projection),
+            OwnedLogicalPlan::synthetic(projection),
             Some(create_constant_expr(10)),
             Some(create_constant_expr(5)),
         ));
@@ -234,7 +234,7 @@ mod tests {
         let get = create_test_get();
         let projection = create_projection(get);
         let limit = LogicalOperator::Limit(Limit::new(
-            LogicalPlan::synthetic(projection),
+            OwnedLogicalPlan::synthetic(projection),
             Some(create_constant_expr(10000)),
             None,
         ));
@@ -246,7 +246,7 @@ mod tests {
     fn test_cannot_optimize_no_projection() {
         let get = create_test_get();
         let limit = LogicalOperator::Limit(Limit::new(
-            LogicalPlan::synthetic(get),
+            OwnedLogicalPlan::synthetic(get),
             Some(create_constant_expr(10)),
             None,
         ));
@@ -259,7 +259,7 @@ mod tests {
         let get = create_test_get();
         let projection = create_projection(get);
         let limit = LogicalOperator::Limit(Limit::new(
-            LogicalPlan::synthetic(projection),
+            OwnedLogicalPlan::synthetic(projection),
             Some(create_constant_expr(10)),
             Some(create_constant_expr(-1)),
         ));
@@ -271,7 +271,7 @@ mod tests {
     fn test_cannot_push_limit_through_volatile_projection() {
         let projection = create_volatile_projection(create_test_get());
         let limit = LogicalOperator::Limit(Limit::new(
-            LogicalPlan::synthetic(projection),
+            OwnedLogicalPlan::synthetic(projection),
             Some(create_constant_expr(10)),
             None,
         ));
@@ -285,7 +285,7 @@ mod tests {
         let get = create_test_get();
         let projection = create_projection(get);
         let limit = LogicalOperator::Limit(Limit::new(
-            LogicalPlan::synthetic(projection),
+            OwnedLogicalPlan::synthetic(projection),
             Some(create_constant_expr(10)),
             None,
         ));
@@ -311,7 +311,7 @@ mod tests {
         let mut optimizer = LimitPushdown::new();
         let get = create_test_get();
         let limit = LogicalOperator::Limit(Limit::new(
-            LogicalPlan::synthetic(get),
+            OwnedLogicalPlan::synthetic(get),
             Some(create_constant_expr(10)),
             None,
         ));

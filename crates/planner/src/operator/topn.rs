@@ -5,7 +5,7 @@
 
 use crate::binder::ir::OrderByNode;
 use crate::operator::ProjectionMap;
-use crate::plan::LogicalPlan;
+use crate::plan::OwnedLogicalPlan;
 use paro_storage::index::hnsw::HnswQueryOptions;
 
 /// TopN represents an optimized ORDER BY + LIMIT operation.
@@ -17,8 +17,8 @@ use paro_storage::index::hnsw::HnswQueryOptions;
 ///
 /// The TopN operator is more efficient than separate ORDER + LIMIT because it only
 /// maintains a heap of size (limit + offset) instead of sorting the entire input.
-#[derive(Debug)]
-pub struct TopN {
+#[derive(Debug, Clone)]
+pub struct TopN<Child = Box<OwnedLogicalPlan>> {
     /// The ORDER BY clauses
     pub orders: Vec<OrderByNode>,
     /// The LIMIT value (must be constant)
@@ -30,12 +30,17 @@ pub struct TopN {
     /// Exact output projection inherited from the fused Order operator.
     pub projection_map: ProjectionMap,
     /// The child operator
-    pub child: Box<LogicalPlan>,
+    pub child: Child,
 }
 
 impl TopN {
     /// Create a new TopN operator.
-    pub fn new(child: LogicalPlan, orders: Vec<OrderByNode>, limit: usize, offset: usize) -> Self {
+    pub fn new(
+        child: OwnedLogicalPlan,
+        orders: Vec<OrderByNode>,
+        limit: usize,
+        offset: usize,
+    ) -> Self {
         Self {
             orders,
             limit,

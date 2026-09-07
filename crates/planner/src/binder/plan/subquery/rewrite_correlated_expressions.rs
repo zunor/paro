@@ -10,7 +10,7 @@ use crate::binder::plan::subquery::copy_subquery_top_level_plan;
 use crate::binder::CorrelatedColumnInfo;
 use crate::expression::{Expression, ExpressionIterator};
 use crate::operator::{ColumnBinding, LogicalOperator};
-use crate::plan::{LogicalPlan, PlannedStatement};
+use crate::plan::{OwnedLogicalPlan, PlannedStatement};
 
 pub type CorrelatedColumnMap = HashMap<ColumnBinding, usize>;
 
@@ -190,9 +190,9 @@ impl RewriteCorrelatedExpressions {
         });
     }
 
-    pub fn rewrite_logical_plan(&self, plan: LogicalPlan) -> LogicalPlan {
+    pub fn rewrite_logical_plan(&self, plan: OwnedLogicalPlan) -> OwnedLogicalPlan {
         let (id, stats, operator) = plan.into_parts();
-        LogicalPlan {
+        OwnedLogicalPlan {
             id,
             stats,
             operator: self.rewrite_operator(operator),
@@ -433,7 +433,7 @@ mod tests {
         SubqueryType,
     };
     use crate::operator::{DependentJoin, ExpressionGet, LogicalOperator};
-    use crate::plan::LogicalPlan;
+    use crate::plan::OwnedLogicalPlan;
     use crate::{
         binder::context::BindContext, binder::CorrelatedColumnInfo, plan::PlannedStatement,
     };
@@ -529,7 +529,7 @@ mod tests {
             subquery: Arc::new(PlannedStatement {
                 types: vec![LogicalType::Integer],
                 names: vec!["c0".to_string()],
-                plan: LogicalPlan::new(&BindContext::new(), expression_get(20)),
+                plan: OwnedLogicalPlan::new(&BindContext::new(), expression_get(20)),
             }),
             children: vec![],
             child_types: vec![],
@@ -562,7 +562,7 @@ mod tests {
             subquery: Arc::new(PlannedStatement {
                 types: vec![LogicalType::Integer],
                 names: vec!["c0".to_string()],
-                plan: LogicalPlan::new(&BindContext::new(), expression_get(20)),
+                plan: OwnedLogicalPlan::new(&BindContext::new(), expression_get(20)),
             }),
             children: vec![],
             child_types: vec![],
@@ -601,7 +601,7 @@ mod tests {
             subquery: Arc::new(PlannedStatement {
                 types: vec![LogicalType::Integer],
                 names: vec!["c0".to_string()],
-                plan: LogicalPlan::new(&BindContext::new(), expression_get(20)),
+                plan: OwnedLogicalPlan::new(&BindContext::new(), expression_get(20)),
             }),
             children: vec![],
             child_types: vec![],
@@ -637,12 +637,12 @@ mod tests {
             RewriteCorrelatedExpressions::new_recursive(ColumnBinding::new(99, 0), map, 0);
         let ctx = BindContext::new();
         let dep = DependentJoin::scalar(
-            LogicalPlan::new(&ctx, expression_get(1)),
-            LogicalPlan::new(
+            OwnedLogicalPlan::new(&ctx, expression_get(1)),
+            OwnedLogicalPlan::new(
                 &ctx,
                 LogicalOperator::Projection(crate::operator::Projection::new(
                     2,
-                    LogicalPlan::new(&ctx, expression_get(3)),
+                    OwnedLogicalPlan::new(&ctx, expression_get(3)),
                     vec![Expression::ColumnRef(ColumnRefExpression::with_depth(
                         ColumnBinding::new(10, 0),
                         LogicalType::Integer,

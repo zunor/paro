@@ -22,7 +22,7 @@ use paro_planner::operator::{
     Limit, LogicalOperator, MaterializedCTE, Order as LogicalOrder, Projection, RecursiveCTE,
     SetOperation as LogicalSetOperation, TopN as LogicalTopN, Window as LogicalWindow,
 };
-use paro_planner::plan::{LogicalPlan, PlanNodeId};
+use paro_planner::plan::{OwnedLogicalPlan, PlanNodeId};
 use paro_storage::table::table_factory::TableFactory;
 
 use crate::physical::children::{PlanChildren, PlanChildrenArena};
@@ -44,7 +44,7 @@ use super::*;
 
 fn linear_plan() -> crate::physical::PhysicalPlan {
     let ctx = BindContext::new();
-    let values = LogicalPlan::new(
+    let values = OwnedLogicalPlan::new(
         &ctx,
         LogicalOperator::ExpressionGet(ExpressionGet::new(
             0,
@@ -53,15 +53,15 @@ fn linear_plan() -> crate::physical::PhysicalPlan {
             vec![LogicalType::Integer],
         )),
     );
-    let filter = LogicalPlan::new(&ctx, LogicalOperator::Filter(Filter::new(values, vec![])));
+    let filter = OwnedLogicalPlan::new(&ctx, LogicalOperator::Filter(Filter::new(values, vec![])));
     let project_expr = Expression::Reference(ReferenceExpression::new(0, LogicalType::Integer));
-    let project = LogicalPlan::new(
+    let project = OwnedLogicalPlan::new(
         &ctx,
         LogicalOperator::Projection(
             Projection::new(1, filter, vec![project_expr]).with_visible_names(vec!["a".into()]),
         ),
     );
-    let limit = LogicalPlan::new(
+    let limit = OwnedLogicalPlan::new(
         &ctx,
         LogicalOperator::Limit(Limit::new(project, None, None)),
     );
@@ -72,7 +72,7 @@ fn linear_plan() -> crate::physical::PhysicalPlan {
 
 fn projection_changes_schema_plan() -> crate::physical::PhysicalPlan {
     let ctx = BindContext::new();
-    let values = LogicalPlan::new(
+    let values = OwnedLogicalPlan::new(
         &ctx,
         LogicalOperator::ExpressionGet(ExpressionGet::new(
             0,
@@ -82,7 +82,7 @@ fn projection_changes_schema_plan() -> crate::physical::PhysicalPlan {
         )),
     );
     let project_expr = Expression::Reference(ReferenceExpression::new(1, LogicalType::Varchar));
-    let project = LogicalPlan::new(
+    let project = OwnedLogicalPlan::new(
         &ctx,
         LogicalOperator::Projection(
             Projection::new(1, values, vec![project_expr])
@@ -96,7 +96,7 @@ fn projection_changes_schema_plan() -> crate::physical::PhysicalPlan {
 
 fn grouped_aggregate_plan() -> crate::physical::PhysicalPlan {
     let ctx = BindContext::new();
-    let values = LogicalPlan::new(
+    let values = OwnedLogicalPlan::new(
         &ctx,
         LogicalOperator::ExpressionGet(ExpressionGet::new(
             0,
@@ -105,7 +105,7 @@ fn grouped_aggregate_plan() -> crate::physical::PhysicalPlan {
             vec![LogicalType::Integer],
         )),
     );
-    let aggregate = LogicalPlan::new(
+    let aggregate = OwnedLogicalPlan::new(
         &ctx,
         LogicalOperator::Aggregate(LogicalAggregate::new(
             1,
@@ -132,7 +132,7 @@ fn grouped_aggregate_plan() -> crate::physical::PhysicalPlan {
 
 fn aggregate_probe_hash_join_plan() -> crate::physical::PhysicalPlan {
     let ctx = BindContext::new();
-    let aggregate_input = LogicalPlan::new(
+    let aggregate_input = OwnedLogicalPlan::new(
         &ctx,
         LogicalOperator::ExpressionGet(ExpressionGet::new(
             0,
@@ -141,7 +141,7 @@ fn aggregate_probe_hash_join_plan() -> crate::physical::PhysicalPlan {
             vec![LogicalType::Integer],
         )),
     );
-    let aggregate = LogicalPlan::new(
+    let aggregate = OwnedLogicalPlan::new(
         &ctx,
         LogicalOperator::Aggregate(LogicalAggregate::new(
             1,
@@ -161,7 +161,7 @@ fn aggregate_probe_hash_join_plan() -> crate::physical::PhysicalPlan {
             Vec::new(),
         )),
     );
-    let build = LogicalPlan::new(
+    let build = OwnedLogicalPlan::new(
         &ctx,
         LogicalOperator::ExpressionGet(ExpressionGet::new(
             4,
@@ -170,7 +170,7 @@ fn aggregate_probe_hash_join_plan() -> crate::physical::PhysicalPlan {
             vec![LogicalType::Integer],
         )),
     );
-    let join = LogicalPlan::new(
+    let join = OwnedLogicalPlan::new(
         &ctx,
         LogicalOperator::Join(Join::comparison(
             JoinType::Inner,
@@ -189,7 +189,7 @@ fn aggregate_probe_hash_join_plan() -> crate::physical::PhysicalPlan {
 
 fn ungrouped_aggregate_plan() -> crate::physical::PhysicalPlan {
     let ctx = BindContext::new();
-    let values = LogicalPlan::new(
+    let values = OwnedLogicalPlan::new(
         &ctx,
         LogicalOperator::ExpressionGet(ExpressionGet::new(
             0,
@@ -198,7 +198,7 @@ fn ungrouped_aggregate_plan() -> crate::physical::PhysicalPlan {
             vec![LogicalType::Integer],
         )),
     );
-    let aggregate = LogicalPlan::new(
+    let aggregate = OwnedLogicalPlan::new(
         &ctx,
         LogicalOperator::Aggregate(LogicalAggregate::new(
             1,
@@ -245,7 +245,7 @@ fn ungrouped_aggregate_plan() -> crate::physical::PhysicalPlan {
 
 fn topn_plan() -> crate::physical::PhysicalPlan {
     let ctx = BindContext::new();
-    let values = LogicalPlan::new(
+    let values = OwnedLogicalPlan::new(
         &ctx,
         LogicalOperator::ExpressionGet(ExpressionGet::new(
             0,
@@ -259,7 +259,7 @@ fn topn_plan() -> crate::physical::PhysicalPlan {
         ascending: true,
         nulls_first: false,
     };
-    let topn = LogicalPlan::new(
+    let topn = OwnedLogicalPlan::new(
         &ctx,
         LogicalOperator::TopN(LogicalTopN::new(values, vec![order], 2, 0)),
     );
@@ -297,7 +297,7 @@ fn single_task_breaker_probe_hash_join_plan(
 ) -> crate::physical::PhysicalPlan {
     let ctx = BindContext::new();
     let values = |table_index| {
-        LogicalPlan::new(
+        OwnedLogicalPlan::new(
             &ctx,
             LogicalOperator::ExpressionGet(ExpressionGet::new(
                 table_index,
@@ -313,15 +313,15 @@ fn single_task_breaker_probe_hash_join_plan(
         nulls_first: false,
     };
     let probe = match breaker {
-        SingleTaskEmitBreaker::TopN => LogicalPlan::new(
+        SingleTaskEmitBreaker::TopN => OwnedLogicalPlan::new(
             &ctx,
             LogicalOperator::TopN(LogicalTopN::new(values(0), vec![order()], 2, 0)),
         ),
-        SingleTaskEmitBreaker::Sort => LogicalPlan::new(
+        SingleTaskEmitBreaker::Sort => OwnedLogicalPlan::new(
             &ctx,
             LogicalOperator::Order(LogicalOrder::new(values(0), vec![order()])),
         ),
-        SingleTaskEmitBreaker::Window => LogicalPlan::new(
+        SingleTaskEmitBreaker::Window => OwnedLogicalPlan::new(
             &ctx,
             LogicalOperator::Window(LogicalWindow::new(
                 2,
@@ -343,7 +343,7 @@ fn single_task_breaker_probe_hash_join_plan(
                 values(0),
             )),
         ),
-        SingleTaskEmitBreaker::SetOperation => LogicalPlan::new(
+        SingleTaskEmitBreaker::SetOperation => OwnedLogicalPlan::new(
             &ctx,
             LogicalOperator::SetOperation(LogicalSetOperation::union(
                 2,
@@ -355,7 +355,7 @@ fn single_task_breaker_probe_hash_join_plan(
         ),
     };
     let build = values(3);
-    let join = LogicalPlan::new(
+    let join = OwnedLogicalPlan::new(
         &ctx,
         LogicalOperator::Join(Join::comparison(
             JoinType::Inner,
@@ -379,7 +379,7 @@ fn hash_join_plan(join_type: JoinType) -> crate::physical::PhysicalPlan {
 fn union_all_probe_hash_join_plan() -> crate::physical::PhysicalPlan {
     let ctx = BindContext::new();
     let values = |table_index, name: &str| {
-        let values = LogicalPlan::new(
+        let values = OwnedLogicalPlan::new(
             &ctx,
             LogicalOperator::ExpressionGet(ExpressionGet::new(
                 table_index,
@@ -390,12 +390,12 @@ fn union_all_probe_hash_join_plan() -> crate::physical::PhysicalPlan {
         );
         // A streaming filter keeps the test source from being folded into the
         // row-literal UNION ALL fast path during physical extraction.
-        LogicalPlan::new(
+        OwnedLogicalPlan::new(
             &ctx,
             LogicalOperator::Filter(Filter::new(values, Vec::new())),
         )
     };
-    let left_union = LogicalPlan::new(
+    let left_union = OwnedLogicalPlan::new(
         &ctx,
         LogicalOperator::SetOperation(LogicalSetOperation::union(
             3,
@@ -405,7 +405,7 @@ fn union_all_probe_hash_join_plan() -> crate::physical::PhysicalPlan {
             vec![LogicalType::Integer],
         )),
     );
-    let nested_union = LogicalPlan::new(
+    let nested_union = OwnedLogicalPlan::new(
         &ctx,
         LogicalOperator::SetOperation(LogicalSetOperation::union(
             4,
@@ -415,11 +415,11 @@ fn union_all_probe_hash_join_plan() -> crate::physical::PhysicalPlan {
             vec![LogicalType::Integer],
         )),
     );
-    let filtered = LogicalPlan::new(
+    let filtered = OwnedLogicalPlan::new(
         &ctx,
         LogicalOperator::Filter(Filter::new(nested_union, Vec::new())),
     );
-    let projected = LogicalPlan::new(
+    let projected = OwnedLogicalPlan::new(
         &ctx,
         LogicalOperator::Projection(
             Projection::new(
@@ -433,7 +433,7 @@ fn union_all_probe_hash_join_plan() -> crate::physical::PhysicalPlan {
             .with_visible_names(vec!["probe_key".to_string()]),
         ),
     );
-    let join = LogicalPlan::new(
+    let join = OwnedLogicalPlan::new(
         &ctx,
         LogicalOperator::Join(Join::comparison(
             JoinType::Inner,
@@ -456,7 +456,7 @@ fn hash_join_plan_with_context(
     extraction_context: ExtractionContext,
 ) -> crate::physical::PhysicalPlan {
     let ctx = BindContext::new();
-    let left = LogicalPlan::new(
+    let left = OwnedLogicalPlan::new(
         &ctx,
         LogicalOperator::ExpressionGet(ExpressionGet::new(
             0,
@@ -465,7 +465,7 @@ fn hash_join_plan_with_context(
             vec![LogicalType::Integer, LogicalType::Integer],
         )),
     );
-    let right = LogicalPlan::new(
+    let right = OwnedLogicalPlan::new(
         &ctx,
         LogicalOperator::ExpressionGet(ExpressionGet::new(
             1,
@@ -478,7 +478,7 @@ fn hash_join_plan_with_context(
         Expression::Reference(ReferenceExpression::new(0, LogicalType::Integer)),
         Expression::Reference(ReferenceExpression::new(0, LogicalType::Integer)),
     );
-    let join = LogicalPlan::new(
+    let join = OwnedLogicalPlan::new(
         &ctx,
         LogicalOperator::Join(Join::comparison(join_type, left, right, vec![condition])),
     );
@@ -489,7 +489,7 @@ fn hash_join_plan_with_context(
 
 fn nested_loop_join_plan(join_type: JoinType) -> crate::physical::PhysicalPlan {
     let ctx = BindContext::new();
-    let left = LogicalPlan::new(
+    let left = OwnedLogicalPlan::new(
         &ctx,
         LogicalOperator::ExpressionGet(ExpressionGet::new(
             0,
@@ -498,7 +498,7 @@ fn nested_loop_join_plan(join_type: JoinType) -> crate::physical::PhysicalPlan {
             vec![LogicalType::Integer, LogicalType::Integer],
         )),
     );
-    let right = LogicalPlan::new(
+    let right = OwnedLogicalPlan::new(
         &ctx,
         LogicalOperator::ExpressionGet(ExpressionGet::new(
             1,
@@ -512,7 +512,7 @@ fn nested_loop_join_plan(join_type: JoinType) -> crate::physical::PhysicalPlan {
         Expression::Reference(ReferenceExpression::new(0, LogicalType::Integer)),
         JoinComparisonType::LessThan,
     );
-    let join = LogicalPlan::new(
+    let join = OwnedLogicalPlan::new(
         &ctx,
         LogicalOperator::Join(Join::comparison(join_type, left, right, vec![condition])),
     );
@@ -523,7 +523,7 @@ fn nested_loop_join_plan(join_type: JoinType) -> crate::physical::PhysicalPlan {
 
 fn sort_range_join_plan(join_type: JoinType) -> crate::physical::PhysicalPlan {
     let ctx = BindContext::new();
-    let left = LogicalPlan::new(
+    let left = OwnedLogicalPlan::new(
         &ctx,
         LogicalOperator::ExpressionGet(ExpressionGet::new(
             0,
@@ -532,7 +532,7 @@ fn sort_range_join_plan(join_type: JoinType) -> crate::physical::PhysicalPlan {
             vec![LogicalType::Integer, LogicalType::Integer],
         )),
     );
-    let right = LogicalPlan::new(
+    let right = OwnedLogicalPlan::new(
         &ctx,
         LogicalOperator::ExpressionGet(ExpressionGet::new(
             1,
@@ -553,7 +553,7 @@ fn sort_range_join_plan(join_type: JoinType) -> crate::physical::PhysicalPlan {
             JoinComparisonType::GreaterThan,
         ),
     ];
-    let join = LogicalPlan::new(
+    let join = OwnedLogicalPlan::new(
         &ctx,
         LogicalOperator::Join(Join::comparison(join_type, left, right, conditions)),
     );
@@ -564,7 +564,7 @@ fn sort_range_join_plan(join_type: JoinType) -> crate::physical::PhysicalPlan {
 
 fn project_above_nested_loop_join_plan() -> crate::physical::PhysicalPlan {
     let ctx = BindContext::new();
-    let left = LogicalPlan::new(
+    let left = OwnedLogicalPlan::new(
         &ctx,
         LogicalOperator::ExpressionGet(ExpressionGet::new(
             0,
@@ -573,7 +573,7 @@ fn project_above_nested_loop_join_plan() -> crate::physical::PhysicalPlan {
             vec![LogicalType::Integer, LogicalType::Integer],
         )),
     );
-    let right = LogicalPlan::new(
+    let right = OwnedLogicalPlan::new(
         &ctx,
         LogicalOperator::ExpressionGet(ExpressionGet::new(
             1,
@@ -587,7 +587,7 @@ fn project_above_nested_loop_join_plan() -> crate::physical::PhysicalPlan {
         Expression::Reference(ReferenceExpression::new(0, LogicalType::Integer)),
         JoinComparisonType::LessThan,
     );
-    let join = LogicalPlan::new(
+    let join = OwnedLogicalPlan::new(
         &ctx,
         LogicalOperator::Join(Join::comparison(
             JoinType::Inner,
@@ -596,7 +596,7 @@ fn project_above_nested_loop_join_plan() -> crate::physical::PhysicalPlan {
             vec![condition],
         )),
     );
-    let project = LogicalPlan::new(
+    let project = OwnedLogicalPlan::new(
         &ctx,
         LogicalOperator::Projection(
             Projection::new(
@@ -617,7 +617,7 @@ fn project_above_nested_loop_join_plan() -> crate::physical::PhysicalPlan {
 
 fn limit_above_right_nested_loop_join_plan() -> crate::physical::PhysicalPlan {
     let ctx = BindContext::new();
-    let left = LogicalPlan::new(
+    let left = OwnedLogicalPlan::new(
         &ctx,
         LogicalOperator::ExpressionGet(ExpressionGet::new(
             0,
@@ -626,7 +626,7 @@ fn limit_above_right_nested_loop_join_plan() -> crate::physical::PhysicalPlan {
             vec![LogicalType::Integer],
         )),
     );
-    let right = LogicalPlan::new(
+    let right = OwnedLogicalPlan::new(
         &ctx,
         LogicalOperator::ExpressionGet(ExpressionGet::new(
             1,
@@ -640,7 +640,7 @@ fn limit_above_right_nested_loop_join_plan() -> crate::physical::PhysicalPlan {
         Expression::Reference(ReferenceExpression::new(0, LogicalType::Integer)),
         JoinComparisonType::LessThan,
     );
-    let join = LogicalPlan::new(
+    let join = OwnedLogicalPlan::new(
         &ctx,
         LogicalOperator::Join(Join::comparison(
             JoinType::Right,
@@ -649,7 +649,7 @@ fn limit_above_right_nested_loop_join_plan() -> crate::physical::PhysicalPlan {
             vec![condition],
         )),
     );
-    let limit = LogicalPlan::new(
+    let limit = OwnedLogicalPlan::new(
         &ctx,
         LogicalOperator::Limit(Limit::new(
             join,
@@ -668,7 +668,7 @@ fn limit_above_right_nested_loop_join_plan() -> crate::physical::PhysicalPlan {
 fn left_deep_right_nested_loop_join_plan() -> crate::physical::PhysicalPlan {
     let ctx = BindContext::new();
     let make_values = |table_index, key: &str| {
-        LogicalPlan::new(
+        OwnedLogicalPlan::new(
             &ctx,
             LogicalOperator::ExpressionGet(ExpressionGet::new(
                 table_index,
@@ -686,7 +686,7 @@ fn left_deep_right_nested_loop_join_plan() -> crate::physical::PhysicalPlan {
         Expression::Reference(ReferenceExpression::new(0, LogicalType::Integer)),
         JoinComparisonType::LessThan,
     );
-    let right_nlj = LogicalPlan::new(
+    let right_nlj = OwnedLogicalPlan::new(
         &ctx,
         LogicalOperator::Join(Join::comparison(JoinType::Right, a, b, vec![nlj_condition])),
     );
@@ -694,7 +694,7 @@ fn left_deep_right_nested_loop_join_plan() -> crate::physical::PhysicalPlan {
         Expression::Reference(ReferenceExpression::new(0, LogicalType::Integer)),
         Expression::Reference(ReferenceExpression::new(0, LogicalType::Integer)),
     );
-    let join = LogicalPlan::new(
+    let join = OwnedLogicalPlan::new(
         &ctx,
         LogicalOperator::Join(Join::comparison(
             JoinType::Inner,
@@ -710,7 +710,7 @@ fn left_deep_right_nested_loop_join_plan() -> crate::physical::PhysicalPlan {
 
 fn cross_product_plan() -> crate::physical::PhysicalPlan {
     let ctx = BindContext::new();
-    let left = LogicalPlan::new(
+    let left = OwnedLogicalPlan::new(
         &ctx,
         LogicalOperator::ExpressionGet(ExpressionGet::new(
             0,
@@ -719,7 +719,7 @@ fn cross_product_plan() -> crate::physical::PhysicalPlan {
             vec![LogicalType::Integer],
         )),
     );
-    let right = LogicalPlan::new(
+    let right = OwnedLogicalPlan::new(
         &ctx,
         LogicalOperator::ExpressionGet(ExpressionGet::new(
             1,
@@ -728,7 +728,7 @@ fn cross_product_plan() -> crate::physical::PhysicalPlan {
             vec![LogicalType::Integer],
         )),
     );
-    let join = LogicalPlan::new(&ctx, LogicalOperator::Join(Join::cross(left, right)));
+    let join = OwnedLogicalPlan::new(&ctx, LogicalOperator::Join(Join::cross(left, right)));
 
     let mut extractor = PhysicalPlanExtractor::new(ExtractionContext::default());
     extractor.extract(&join).unwrap()
@@ -736,7 +736,7 @@ fn cross_product_plan() -> crate::physical::PhysicalPlan {
 
 fn hash_join_with_projected_cross_product_probe_plan() -> crate::physical::PhysicalPlan {
     let ctx = BindContext::new();
-    let a = LogicalPlan::new(
+    let a = OwnedLogicalPlan::new(
         &ctx,
         LogicalOperator::ExpressionGet(ExpressionGet::new(
             0,
@@ -745,7 +745,7 @@ fn hash_join_with_projected_cross_product_probe_plan() -> crate::physical::Physi
             vec![LogicalType::Integer],
         )),
     );
-    let b = LogicalPlan::new(
+    let b = OwnedLogicalPlan::new(
         &ctx,
         LogicalOperator::ExpressionGet(ExpressionGet::new(
             1,
@@ -754,7 +754,7 @@ fn hash_join_with_projected_cross_product_probe_plan() -> crate::physical::Physi
             vec![LogicalType::Integer],
         )),
     );
-    let c = LogicalPlan::new(
+    let c = OwnedLogicalPlan::new(
         &ctx,
         LogicalOperator::ExpressionGet(ExpressionGet::new(
             2,
@@ -763,8 +763,8 @@ fn hash_join_with_projected_cross_product_probe_plan() -> crate::physical::Physi
             vec![LogicalType::Integer],
         )),
     );
-    let cross = LogicalPlan::new(&ctx, LogicalOperator::Join(Join::cross(a, b)));
-    let project = LogicalPlan::new(
+    let cross = OwnedLogicalPlan::new(&ctx, LogicalOperator::Join(Join::cross(a, b)));
+    let project = OwnedLogicalPlan::new(
         &ctx,
         LogicalOperator::Projection(
             Projection::new(
@@ -782,7 +782,7 @@ fn hash_join_with_projected_cross_product_probe_plan() -> crate::physical::Physi
         Expression::Reference(ReferenceExpression::new(0, LogicalType::Integer)),
         Expression::Reference(ReferenceExpression::new(0, LogicalType::Integer)),
     );
-    let join = LogicalPlan::new(
+    let join = OwnedLogicalPlan::new(
         &ctx,
         LogicalOperator::Join(Join::comparison(
             JoinType::Inner,
@@ -798,7 +798,7 @@ fn hash_join_with_projected_cross_product_probe_plan() -> crate::physical::Physi
 
 fn aggregate_above_right_anti_hash_join_plan() -> crate::physical::PhysicalPlan {
     let ctx = BindContext::new();
-    let left = LogicalPlan::new(
+    let left = OwnedLogicalPlan::new(
         &ctx,
         LogicalOperator::ExpressionGet(ExpressionGet::new(
             0,
@@ -807,7 +807,7 @@ fn aggregate_above_right_anti_hash_join_plan() -> crate::physical::PhysicalPlan 
             vec![LogicalType::Integer],
         )),
     );
-    let right = LogicalPlan::new(
+    let right = OwnedLogicalPlan::new(
         &ctx,
         LogicalOperator::ExpressionGet(ExpressionGet::new(
             1,
@@ -820,7 +820,7 @@ fn aggregate_above_right_anti_hash_join_plan() -> crate::physical::PhysicalPlan 
         Expression::Reference(ReferenceExpression::new(0, LogicalType::Integer)),
         Expression::Reference(ReferenceExpression::new(0, LogicalType::Integer)),
     );
-    let join = LogicalPlan::new(
+    let join = OwnedLogicalPlan::new(
         &ctx,
         LogicalOperator::Join(Join::comparison(
             JoinType::RightAnti,
@@ -829,7 +829,7 @@ fn aggregate_above_right_anti_hash_join_plan() -> crate::physical::PhysicalPlan 
             vec![condition],
         )),
     );
-    let aggregate = LogicalPlan::new(
+    let aggregate = OwnedLogicalPlan::new(
         &ctx,
         LogicalOperator::Aggregate(LogicalAggregate::new(
             2,
@@ -853,7 +853,7 @@ fn aggregate_above_right_anti_hash_join_plan() -> crate::physical::PhysicalPlan 
 
 fn materialized_cte_plan() -> crate::physical::PhysicalPlan {
     let ctx = BindContext::new();
-    let cte_query = LogicalPlan::new(
+    let cte_query = OwnedLogicalPlan::new(
         &ctx,
         LogicalOperator::ExpressionGet(ExpressionGet::new(
             0,
@@ -862,7 +862,7 @@ fn materialized_cte_plan() -> crate::physical::PhysicalPlan {
             vec![LogicalType::Integer],
         )),
     );
-    let cte_ref = LogicalPlan::new(
+    let cte_ref = OwnedLogicalPlan::new(
         &ctx,
         LogicalOperator::CTERef(CTERef::new(
             7,
@@ -872,7 +872,7 @@ fn materialized_cte_plan() -> crate::physical::PhysicalPlan {
             vec![LogicalType::Integer],
         )),
     );
-    let cte = LogicalPlan::new(
+    let cte = OwnedLogicalPlan::new(
         &ctx,
         LogicalOperator::MaterializedCTE(
             MaterializedCTE::new(
@@ -902,7 +902,7 @@ fn recursive_cte_plan(union_all: bool) -> crate::physical::PhysicalPlan {
 
 fn recursive_cte_with_invariant_hash_build_plan() -> crate::physical::PhysicalPlan {
     let ctx = BindContext::new();
-    let anchor = LogicalPlan::new(
+    let anchor = OwnedLogicalPlan::new(
         &ctx,
         LogicalOperator::ExpressionGet(ExpressionGet::new(
             0,
@@ -911,7 +911,7 @@ fn recursive_cte_with_invariant_hash_build_plan() -> crate::physical::PhysicalPl
             vec![LogicalType::Integer],
         )),
     );
-    let recursive_ref = LogicalPlan::new(
+    let recursive_ref = OwnedLogicalPlan::new(
         &ctx,
         LogicalOperator::CTERef(CTERef::new(
             9,
@@ -921,7 +921,7 @@ fn recursive_cte_with_invariant_hash_build_plan() -> crate::physical::PhysicalPl
             vec![LogicalType::Integer],
         )),
     );
-    let edges = LogicalPlan::new(
+    let edges = OwnedLogicalPlan::new(
         &ctx,
         LogicalOperator::ExpressionGet(ExpressionGet::new(
             1,
@@ -930,7 +930,7 @@ fn recursive_cte_with_invariant_hash_build_plan() -> crate::physical::PhysicalPl
             vec![LogicalType::Integer, LogicalType::Integer],
         )),
     );
-    let join = LogicalPlan::new(
+    let join = OwnedLogicalPlan::new(
         &ctx,
         LogicalOperator::Join(Join::comparison(
             JoinType::Inner,
@@ -942,7 +942,7 @@ fn recursive_cte_with_invariant_hash_build_plan() -> crate::physical::PhysicalPl
             )],
         )),
     );
-    let recursive = LogicalPlan::new(
+    let recursive = OwnedLogicalPlan::new(
         &ctx,
         LogicalOperator::Projection(
             Projection::new(
@@ -956,7 +956,7 @@ fn recursive_cte_with_invariant_hash_build_plan() -> crate::physical::PhysicalPl
             .with_visible_names(vec!["node".to_string()]),
         ),
     );
-    let cte = LogicalPlan::new(
+    let cte = OwnedLogicalPlan::new(
         &ctx,
         LogicalOperator::RecursiveCTE(RecursiveCTE {
             cte_index: 9,
@@ -976,7 +976,7 @@ fn recursive_cte_with_invariant_hash_build_plan() -> crate::physical::PhysicalPl
 fn projected_recursive_cte_plan() -> crate::physical::PhysicalPlan {
     let ctx = BindContext::new();
     let cte = recursive_cte_logical_plan(&ctx, true);
-    let project = LogicalPlan::new(
+    let project = OwnedLogicalPlan::new(
         &ctx,
         LogicalOperator::Projection(
             Projection::new(
@@ -998,7 +998,7 @@ fn projected_recursive_cte_plan() -> crate::physical::PhysicalPlan {
 fn ordered_recursive_cte_plan() -> crate::physical::PhysicalPlan {
     let ctx = BindContext::new();
     let cte = recursive_cte_logical_plan(&ctx, true);
-    let order = LogicalPlan::new(
+    let order = OwnedLogicalPlan::new(
         &ctx,
         LogicalOperator::Order(LogicalOrder::new(
             cte,
@@ -1017,8 +1017,8 @@ fn ordered_recursive_cte_plan() -> crate::physical::PhysicalPlan {
     extractor.extract(&order).unwrap()
 }
 
-fn recursive_cte_logical_plan(ctx: &BindContext, union_all: bool) -> LogicalPlan {
-    let anchor = LogicalPlan::new(
+fn recursive_cte_logical_plan(ctx: &BindContext, union_all: bool) -> OwnedLogicalPlan {
+    let anchor = OwnedLogicalPlan::new(
         ctx,
         LogicalOperator::ExpressionGet(ExpressionGet::new(
             0,
@@ -1027,7 +1027,7 @@ fn recursive_cte_logical_plan(ctx: &BindContext, union_all: bool) -> LogicalPlan
             vec![LogicalType::Integer],
         )),
     );
-    let recursive_ref = LogicalPlan::new(
+    let recursive_ref = OwnedLogicalPlan::new(
         ctx,
         LogicalOperator::CTERef(CTERef::new(
             9,
@@ -1037,7 +1037,7 @@ fn recursive_cte_logical_plan(ctx: &BindContext, union_all: bool) -> LogicalPlan
             vec![LogicalType::Integer],
         )),
     );
-    LogicalPlan::new(
+    OwnedLogicalPlan::new(
         ctx,
         LogicalOperator::RecursiveCTE(RecursiveCTE {
             cte_index: 9,
@@ -1053,7 +1053,7 @@ fn recursive_cte_logical_plan(ctx: &BindContext, union_all: bool) -> LogicalPlan
 
 fn left_delim_join_plan() -> crate::physical::PhysicalPlan {
     let ctx = BindContext::new();
-    let left = LogicalPlan::new(
+    let left = OwnedLogicalPlan::new(
         &ctx,
         LogicalOperator::ExpressionGet(ExpressionGet::new(
             0,
@@ -1062,7 +1062,7 @@ fn left_delim_join_plan() -> crate::physical::PhysicalPlan {
             vec![LogicalType::Integer],
         )),
     );
-    let right = LogicalPlan::new(
+    let right = OwnedLogicalPlan::new(
         &ctx,
         LogicalOperator::DelimGet(DelimGet::new(99, vec![LogicalType::Integer])),
     );
@@ -1079,7 +1079,7 @@ fn left_delim_join_plan() -> crate::physical::PhysicalPlan {
         0,
         LogicalType::Integer,
     ))];
-    let plan = LogicalPlan::new(&ctx, LogicalOperator::Join(Join::Comparison(join)));
+    let plan = OwnedLogicalPlan::new(&ctx, LogicalOperator::Join(Join::Comparison(join)));
 
     let mut extractor = PhysicalPlanExtractor::new(ExtractionContext::default());
     extractor.extract(&plan).unwrap()
@@ -1087,7 +1087,7 @@ fn left_delim_join_plan() -> crate::physical::PhysicalPlan {
 
 fn hash_join_with_delim_probe_plan() -> crate::physical::PhysicalPlan {
     let ctx = BindContext::new();
-    let capture = LogicalPlan::new(
+    let capture = OwnedLogicalPlan::new(
         &ctx,
         LogicalOperator::ExpressionGet(ExpressionGet::new(
             0,
@@ -1096,7 +1096,7 @@ fn hash_join_with_delim_probe_plan() -> crate::physical::PhysicalPlan {
             vec![LogicalType::Integer],
         )),
     );
-    let dependent = LogicalPlan::new(
+    let dependent = OwnedLogicalPlan::new(
         &ctx,
         LogicalOperator::DelimGet(DelimGet::new(99, vec![LogicalType::Integer])),
     );
@@ -1112,8 +1112,8 @@ fn hash_join_with_delim_probe_plan() -> crate::physical::PhysicalPlan {
     delim_join.duplicate_eliminated_columns = vec![Expression::Reference(
         ReferenceExpression::new(0, LogicalType::Integer),
     )];
-    let delim_probe = LogicalPlan::new(&ctx, LogicalOperator::Join(Join::Comparison(delim_join)));
-    let probe = LogicalPlan::new(
+    let delim_probe = OwnedLogicalPlan::new(&ctx, LogicalOperator::Join(Join::Comparison(delim_join)));
+    let probe = OwnedLogicalPlan::new(
         &ctx,
         LogicalOperator::Projection(
             Projection::new(
@@ -1127,7 +1127,7 @@ fn hash_join_with_delim_probe_plan() -> crate::physical::PhysicalPlan {
             .with_visible_names(vec!["projected_capture".to_string()]),
         ),
     );
-    let build = LogicalPlan::new(
+    let build = OwnedLogicalPlan::new(
         &ctx,
         LogicalOperator::ExpressionGet(ExpressionGet::new(
             1,
@@ -1136,7 +1136,7 @@ fn hash_join_with_delim_probe_plan() -> crate::physical::PhysicalPlan {
             vec![LogicalType::Integer],
         )),
     );
-    let outer = LogicalPlan::new(
+    let outer = OwnedLogicalPlan::new(
         &ctx,
         LogicalOperator::Join(Join::comparison(
             JoinType::Inner,
@@ -1155,7 +1155,7 @@ fn hash_join_with_delim_probe_plan() -> crate::physical::PhysicalPlan {
 
 fn left_delim_join_with_recursive_dependent_plan() -> crate::physical::PhysicalPlan {
     let ctx = BindContext::new();
-    let left = LogicalPlan::new(
+    let left = OwnedLogicalPlan::new(
         &ctx,
         LogicalOperator::ExpressionGet(ExpressionGet::new(
             0,
@@ -1178,7 +1178,7 @@ fn left_delim_join_with_recursive_dependent_plan() -> crate::physical::PhysicalP
         0,
         LogicalType::Integer,
     ))];
-    let plan = LogicalPlan::new(&ctx, LogicalOperator::Join(Join::Comparison(join)));
+    let plan = OwnedLogicalPlan::new(&ctx, LogicalOperator::Join(Join::Comparison(join)));
 
     let mut extractor = PhysicalPlanExtractor::new(ExtractionContext::default());
     extractor.extract(&plan).unwrap()
@@ -1186,7 +1186,7 @@ fn left_delim_join_with_recursive_dependent_plan() -> crate::physical::PhysicalP
 
 fn projection_above_hash_join_plan() -> crate::physical::PhysicalPlan {
     let ctx = BindContext::new();
-    let left = LogicalPlan::new(
+    let left = OwnedLogicalPlan::new(
         &ctx,
         LogicalOperator::ExpressionGet(ExpressionGet::new(
             0,
@@ -1195,7 +1195,7 @@ fn projection_above_hash_join_plan() -> crate::physical::PhysicalPlan {
             vec![LogicalType::Integer, LogicalType::Integer],
         )),
     );
-    let right = LogicalPlan::new(
+    let right = OwnedLogicalPlan::new(
         &ctx,
         LogicalOperator::ExpressionGet(ExpressionGet::new(
             1,
@@ -1208,7 +1208,7 @@ fn projection_above_hash_join_plan() -> crate::physical::PhysicalPlan {
         Expression::Reference(ReferenceExpression::new(0, LogicalType::Integer)),
         Expression::Reference(ReferenceExpression::new(0, LogicalType::Integer)),
     );
-    let join = LogicalPlan::new(
+    let join = OwnedLogicalPlan::new(
         &ctx,
         LogicalOperator::Join(Join::comparison(
             JoinType::Inner,
@@ -1217,7 +1217,7 @@ fn projection_above_hash_join_plan() -> crate::physical::PhysicalPlan {
             vec![condition],
         )),
     );
-    let project = LogicalPlan::new(
+    let project = OwnedLogicalPlan::new(
         &ctx,
         LogicalOperator::Projection(
             Projection::new(
@@ -1241,7 +1241,7 @@ fn left_deep_hash_join_plan_with_context(
 ) -> crate::physical::PhysicalPlan {
     let ctx = BindContext::new();
     let make_values = |table_index, key: &str, value: &str| {
-        LogicalPlan::new(
+        OwnedLogicalPlan::new(
             &ctx,
             LogicalOperator::ExpressionGet(ExpressionGet::new(
                 table_index,
@@ -1260,11 +1260,11 @@ fn left_deep_hash_join_plan_with_context(
             Expression::Reference(ReferenceExpression::new(0, LogicalType::Integer)),
         )
     };
-    let ab = LogicalPlan::new(
+    let ab = OwnedLogicalPlan::new(
         &ctx,
         LogicalOperator::Join(Join::comparison(JoinType::Inner, a, b, vec![condition()])),
     );
-    let abc = LogicalPlan::new(
+    let abc = OwnedLogicalPlan::new(
         &ctx,
         LogicalOperator::Join(Join::comparison(JoinType::Inner, ab, c, vec![condition()])),
     );
@@ -1275,7 +1275,7 @@ fn left_deep_hash_join_plan_with_context(
 
 fn order_plan() -> crate::physical::PhysicalPlan {
     let ctx = BindContext::new();
-    let values = LogicalPlan::new(
+    let values = OwnedLogicalPlan::new(
         &ctx,
         LogicalOperator::ExpressionGet(ExpressionGet::new(
             0,
@@ -1289,7 +1289,7 @@ fn order_plan() -> crate::physical::PhysicalPlan {
         ascending: true,
         nulls_first: false,
     };
-    let order = LogicalPlan::new(
+    let order = OwnedLogicalPlan::new(
         &ctx,
         LogicalOperator::Order(LogicalOrder::new(values, vec![order])),
     );
@@ -1300,7 +1300,7 @@ fn order_plan() -> crate::physical::PhysicalPlan {
 
 fn order_with_final_projection_plan() -> crate::physical::PhysicalPlan {
     let ctx = BindContext::new();
-    let values = LogicalPlan::new(
+    let values = OwnedLogicalPlan::new(
         &ctx,
         LogicalOperator::ExpressionGet(ExpressionGet::new(
             0,
@@ -1309,7 +1309,7 @@ fn order_with_final_projection_plan() -> crate::physical::PhysicalPlan {
             vec![LogicalType::Integer, LogicalType::Integer],
         )),
     );
-    let hidden_project = LogicalPlan::new(
+    let hidden_project = OwnedLogicalPlan::new(
         &ctx,
         LogicalOperator::Projection(
             Projection::new(
@@ -1328,11 +1328,11 @@ fn order_with_final_projection_plan() -> crate::physical::PhysicalPlan {
         ascending: true,
         nulls_first: false,
     };
-    let order = LogicalPlan::new(
+    let order = OwnedLogicalPlan::new(
         &ctx,
         LogicalOperator::Order(LogicalOrder::new(hidden_project, vec![order])),
     );
-    let final_project = LogicalPlan::new(
+    let final_project = OwnedLogicalPlan::new(
         &ctx,
         LogicalOperator::Projection(
             Projection::new(
@@ -1353,7 +1353,7 @@ fn order_with_final_projection_plan() -> crate::physical::PhysicalPlan {
 
 fn partitioned_window_plan() -> crate::physical::PhysicalPlan {
     let ctx = BindContext::new();
-    let values = LogicalPlan::new(
+    let values = OwnedLogicalPlan::new(
         &ctx,
         LogicalOperator::ExpressionGet(ExpressionGet::new(
             0,
@@ -1362,7 +1362,7 @@ fn partitioned_window_plan() -> crate::physical::PhysicalPlan {
             vec![LogicalType::Integer, LogicalType::Integer],
         )),
     );
-    let window = LogicalPlan::new(
+    let window = OwnedLogicalPlan::new(
         &ctx,
         LogicalOperator::Window(LogicalWindow::new(
             1,
@@ -1394,7 +1394,7 @@ fn partitioned_window_plan() -> crate::physical::PhysicalPlan {
 
 fn partition_aggregate_window_plan() -> crate::physical::PhysicalPlan {
     let ctx = BindContext::new();
-    let values = LogicalPlan::new(
+    let values = OwnedLogicalPlan::new(
         &ctx,
         LogicalOperator::ExpressionGet(ExpressionGet::new(
             0,
@@ -1405,7 +1405,7 @@ fn partition_aggregate_window_plan() -> crate::physical::PhysicalPlan {
     );
     let aggregate =
         AggregateExpression::new(get_count_star_function(), Vec::new(), LogicalType::BigInt);
-    let window = LogicalPlan::new(
+    let window = OwnedLogicalPlan::new(
         &ctx,
         LogicalOperator::Window(LogicalWindow::new(
             1,

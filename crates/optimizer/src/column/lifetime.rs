@@ -8,7 +8,7 @@ use std::collections::HashSet;
 use paro_common::error::{self as paro_error, Result};
 use paro_planner::expression::{ColumnRefExpression, Expression};
 use paro_planner::operator::{ColumnBinding, Join, LogicalOperator, ProjectionMap};
-use paro_planner::plan::LogicalPlan;
+use paro_planner::plan::OwnedLogicalPlan;
 
 use crate::expression::traversal::visit_expression as traverse_expression;
 
@@ -48,12 +48,12 @@ impl ColumnLifetimeAnalyzer {
         }
     }
 
-    pub fn optimize(mut self, plan: LogicalPlan) -> Result<LogicalPlan> {
+    pub fn optimize(mut self, plan: OwnedLogicalPlan) -> Result<OwnedLogicalPlan> {
         let plan = self.optimize_plan(plan)?;
         crate::statistics::unique_keys::refresh_unique_keys(plan)
     }
 
-    fn optimize_plan(&mut self, plan: LogicalPlan) -> Result<LogicalPlan> {
+    fn optimize_plan(&mut self, plan: OwnedLogicalPlan) -> Result<OwnedLogicalPlan> {
         let (id, stats, operator) = plan.into_parts();
         let operator = match operator {
             LogicalOperator::Projection(mut proj) => {
@@ -224,7 +224,7 @@ impl ColumnLifetimeAnalyzer {
             LogicalOperator::Join(join) => self.optimize_join(join)?,
             other => other,
         };
-        Ok(LogicalPlan {
+        Ok(OwnedLogicalPlan {
             id,
             stats,
             operator,
@@ -512,7 +512,7 @@ mod tests {
         ColumnBinding, ComparisonJoin, CrossProduct, Distinct, ExpressionGet, Filter, Join,
         JoinComparisonType, JoinCondition, JoinType, LogicalOperator, Order, Projection, Window,
     };
-    use paro_planner::plan::LogicalPlan;
+    use paro_planner::plan::OwnedLogicalPlan;
 
     #[test]
     fn extract_column_bindings_visits_window_frame_offsets() {
@@ -543,7 +543,7 @@ mod tests {
     #[test]
     fn delim_join_preserves_visible_rhs_projection() {
         let ctx = BindContext::new();
-        let left = LogicalPlan::new(
+        let left = OwnedLogicalPlan::new(
             &ctx,
             LogicalOperator::ExpressionGet(ExpressionGet::new(
                 10,
@@ -552,7 +552,7 @@ mod tests {
                 vec![LogicalType::Integer],
             )),
         );
-        let right = LogicalPlan::new(
+        let right = OwnedLogicalPlan::new(
             &ctx,
             LogicalOperator::ExpressionGet(ExpressionGet::new(
                 20,
@@ -567,7 +567,7 @@ mod tests {
             LogicalType::Integer,
         ))];
         join.right_projection_map = vec![0].into();
-        let plan = LogicalPlan::new(&ctx, LogicalOperator::Join(Join::Comparison(join)));
+        let plan = OwnedLogicalPlan::new(&ctx, LogicalOperator::Join(Join::Comparison(join)));
 
         let optimized = ColumnLifetimeAnalyzer::new(true).optimize(plan).unwrap();
         let LogicalOperator::Join(Join::Comparison(join)) = &optimized.operator else {
@@ -580,7 +580,7 @@ mod tests {
     #[test]
     fn join_condition_columns_are_not_forced_into_join_output() {
         let ctx = BindContext::new();
-        let left = LogicalPlan::new(
+        let left = OwnedLogicalPlan::new(
             &ctx,
             LogicalOperator::ExpressionGet(ExpressionGet::new(
                 10,
@@ -589,7 +589,7 @@ mod tests {
                 vec![LogicalType::Integer, LogicalType::BigInt],
             )),
         );
-        let right = LogicalPlan::new(
+        let right = OwnedLogicalPlan::new(
             &ctx,
             LogicalOperator::ExpressionGet(ExpressionGet::new(
                 20,
@@ -614,8 +614,8 @@ mod tests {
                 JoinComparisonType::Equal,
             )],
         );
-        let joined = LogicalPlan::new(&ctx, LogicalOperator::Join(Join::Comparison(join)));
-        let plan = LogicalPlan::new(
+        let joined = OwnedLogicalPlan::new(&ctx, LogicalOperator::Join(Join::Comparison(join)));
+        let plan = OwnedLogicalPlan::new(
             &ctx,
             LogicalOperator::Projection(Projection::new(
                 30,
@@ -642,7 +642,7 @@ mod tests {
     #[test]
     fn root_analysis_preserves_an_explicit_join_output_contract() {
         let ctx = BindContext::new();
-        let left = LogicalPlan::new(
+        let left = OwnedLogicalPlan::new(
             &ctx,
             LogicalOperator::ExpressionGet(ExpressionGet::new(
                 10,
@@ -651,7 +651,7 @@ mod tests {
                 vec![LogicalType::Integer, LogicalType::BigInt],
             )),
         );
-        let right = LogicalPlan::new(
+        let right = OwnedLogicalPlan::new(
             &ctx,
             LogicalOperator::ExpressionGet(ExpressionGet::new(
                 20,
@@ -678,7 +678,7 @@ mod tests {
         );
         join.left_projection_map = vec![1].into();
         join.right_projection_map.clear();
-        let plan = LogicalPlan::new(&ctx, LogicalOperator::Join(Join::Comparison(join)));
+        let plan = OwnedLogicalPlan::new(&ctx, LogicalOperator::Join(Join::Comparison(join)));
 
         let optimized = ColumnLifetimeAnalyzer::new(true).optimize(plan).unwrap();
         let LogicalOperator::Join(Join::Comparison(join)) = &optimized.operator else {
@@ -692,7 +692,7 @@ mod tests {
     #[test]
     fn window_dependencies_do_not_keep_unrelated_join_payload_alive() {
         let ctx = BindContext::new();
-        let left = LogicalPlan::new(
+        let left = OwnedLogicalPlan::new(
             &ctx,
             LogicalOperator::ExpressionGet(ExpressionGet::new(
                 10,
@@ -705,7 +705,7 @@ mod tests {
                 ],
             )),
         );
-        let right = LogicalPlan::new(
+        let right = OwnedLogicalPlan::new(
             &ctx,
             LogicalOperator::ExpressionGet(ExpressionGet::new(
                 20,
@@ -714,7 +714,7 @@ mod tests {
                 vec![LogicalType::Integer, LogicalType::Varchar],
             )),
         );
-        let joined = LogicalPlan::new(
+        let joined = OwnedLogicalPlan::new(
             &ctx,
             LogicalOperator::Join(Join::Comparison(ComparisonJoin::new(
                 JoinType::Inner,
@@ -733,7 +733,7 @@ mod tests {
                 )],
             ))),
         );
-        let window = LogicalPlan::new(
+        let window = OwnedLogicalPlan::new(
             &ctx,
             LogicalOperator::Window(Window::new(
                 40,
@@ -757,7 +757,7 @@ mod tests {
                 joined,
             )),
         );
-        let plan = LogicalPlan::new(
+        let plan = OwnedLogicalPlan::new(
             &ctx,
             LogicalOperator::Projection(Projection::new(
                 50,
@@ -796,7 +796,7 @@ mod tests {
     #[test]
     fn root_semi_join_never_exposes_filtering_side_columns() {
         let ctx = BindContext::new();
-        let left = LogicalPlan::new(
+        let left = OwnedLogicalPlan::new(
             &ctx,
             LogicalOperator::ExpressionGet(ExpressionGet::new(
                 10,
@@ -805,7 +805,7 @@ mod tests {
                 vec![LogicalType::Integer],
             )),
         );
-        let right = LogicalPlan::new(
+        let right = OwnedLogicalPlan::new(
             &ctx,
             LogicalOperator::ExpressionGet(ExpressionGet::new(
                 20,
@@ -814,7 +814,7 @@ mod tests {
                 vec![LogicalType::Integer],
             )),
         );
-        let plan = LogicalPlan::new(
+        let plan = OwnedLogicalPlan::new(
             &ctx,
             LogicalOperator::Join(Join::Comparison(ComparisonJoin::new(
                 JoinType::Semi,
@@ -836,7 +836,7 @@ mod tests {
     #[test]
     fn order_key_is_an_execution_dependency_not_an_output_dependency() {
         let ctx = BindContext::new();
-        let input = LogicalPlan::new(
+        let input = OwnedLogicalPlan::new(
             &ctx,
             LogicalOperator::ExpressionGet(ExpressionGet::new(
                 10,
@@ -845,7 +845,7 @@ mod tests {
                 vec![LogicalType::Integer, LogicalType::BigInt],
             )),
         );
-        let order = LogicalPlan::new(
+        let order = OwnedLogicalPlan::new(
             &ctx,
             LogicalOperator::Order(Order::new(
                 input,
@@ -859,7 +859,7 @@ mod tests {
                 }],
             )),
         );
-        let plan = LogicalPlan::new(
+        let plan = OwnedLogicalPlan::new(
             &ctx,
             LogicalOperator::Projection(Projection::new(
                 30,
@@ -884,7 +884,7 @@ mod tests {
     #[test]
     fn filter_key_is_an_execution_dependency_not_an_output_dependency() {
         let ctx = BindContext::new();
-        let input = LogicalPlan::new(
+        let input = OwnedLogicalPlan::new(
             &ctx,
             LogicalOperator::ExpressionGet(ExpressionGet::new(
                 10,
@@ -893,7 +893,7 @@ mod tests {
                 vec![LogicalType::Integer, LogicalType::BigInt],
             )),
         );
-        let filter = LogicalPlan::new(
+        let filter = OwnedLogicalPlan::new(
             &ctx,
             LogicalOperator::Filter(Filter::new(
                 input,
@@ -910,7 +910,7 @@ mod tests {
                 ))],
             )),
         );
-        let plan = LogicalPlan::new(
+        let plan = OwnedLogicalPlan::new(
             &ctx,
             LogicalOperator::Projection(Projection::new(
                 30,
@@ -935,7 +935,7 @@ mod tests {
     #[test]
     fn unresolved_filter_key_does_not_expand_the_visible_output_contract() {
         let ctx = BindContext::new();
-        let input = LogicalPlan::new(
+        let input = OwnedLogicalPlan::new(
             &ctx,
             LogicalOperator::ExpressionGet(ExpressionGet::new(
                 10,
@@ -944,7 +944,7 @@ mod tests {
                 vec![LogicalType::Integer, LogicalType::BigInt],
             )),
         );
-        let filter = LogicalPlan::new(
+        let filter = OwnedLogicalPlan::new(
             &ctx,
             LogicalOperator::Filter(Filter::new(
                 input,
@@ -961,7 +961,7 @@ mod tests {
                 ))],
             )),
         );
-        let plan = LogicalPlan::new(
+        let plan = OwnedLogicalPlan::new(
             &ctx,
             LogicalOperator::Projection(Projection::new(
                 30,
@@ -986,7 +986,7 @@ mod tests {
     #[test]
     fn distinct_full_row_demand_is_isolated_from_parent_filter_output() {
         let ctx = BindContext::new();
-        let preserved = LogicalPlan::new(
+        let preserved = OwnedLogicalPlan::new(
             &ctx,
             LogicalOperator::ExpressionGet(ExpressionGet::new(
                 10,
@@ -995,7 +995,7 @@ mod tests {
                 vec![LogicalType::Integer, LogicalType::BigInt],
             )),
         );
-        let distinct_input = LogicalPlan::new(
+        let distinct_input = OwnedLogicalPlan::new(
             &ctx,
             LogicalOperator::ExpressionGet(ExpressionGet::new(
                 20,
@@ -1004,15 +1004,15 @@ mod tests {
                 vec![LogicalType::Integer],
             )),
         );
-        let distinct = LogicalPlan::new(
+        let distinct = OwnedLogicalPlan::new(
             &ctx,
             LogicalOperator::Distinct(Distinct::new(distinct_input)),
         );
-        let cross = LogicalPlan::new(
+        let cross = OwnedLogicalPlan::new(
             &ctx,
             LogicalOperator::Join(Join::Cross(CrossProduct::new(preserved, distinct))),
         );
-        let filter = LogicalPlan::new(
+        let filter = OwnedLogicalPlan::new(
             &ctx,
             LogicalOperator::Filter(Filter::new(
                 cross,
@@ -1029,7 +1029,7 @@ mod tests {
                 ))],
             )),
         );
-        let plan = LogicalPlan::new(
+        let plan = OwnedLogicalPlan::new(
             &ctx,
             LogicalOperator::Projection(Projection::new(
                 30,

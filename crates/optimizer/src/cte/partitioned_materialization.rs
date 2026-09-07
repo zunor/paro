@@ -25,7 +25,7 @@ use paro_planner::expression::{ComparisonType, ConjunctionType, Expression};
 use paro_planner::operator::{
     ColumnBinding, DependentJoinKind, JoinType, LogicalOperator, MaterializedCTE, SetOpType,
 };
-use paro_planner::plan::LogicalPlan;
+use paro_planner::plan::OwnedLogicalPlan;
 
 #[derive(Debug)]
 struct Partitioning {
@@ -48,7 +48,7 @@ impl<'a> CTEPartitioner<'a> {
     ///
     /// Restricting the input to DEFAULT `UNION ALL` and producing single-branch
     /// owners makes the rule structurally idempotent.
-    pub(crate) fn optimize_default_root(&self, plan: LogicalPlan) -> Option<LogicalPlan> {
+    pub(crate) fn optimize_default_root(&self, plan: OwnedLogicalPlan) -> Option<OwnedLogicalPlan> {
         let Some(partitioning) = recognize(&plan) else {
             return None;
         };
@@ -60,7 +60,7 @@ impl<'a> CTEPartitioner<'a> {
     /// This is an advisory optimizer alternative, so a stale or incomplete
     /// recognition witness rejects the alternative rather than turning an
     /// otherwise valid user query into an error.
-    fn apply(&self, plan: LogicalPlan, partitioning: Partitioning) -> Option<LogicalPlan> {
+    fn apply(&self, plan: OwnedLogicalPlan, partitioning: Partitioning) -> Option<OwnedLogicalPlan> {
         let LogicalOperator::MaterializedCTE(cte) = plan.into_operator() else {
             return None;
         };
@@ -93,7 +93,7 @@ impl<'a> CTEPartitioner<'a> {
             let name = format!("{}$partition{}", cte.cte_name, partition + 1);
             let partition_index = *partition_indices.get(partition)?;
             let reference_count = *partitioning.reference_counts.get(partition)?;
-            child = LogicalPlan::new(
+            child = OwnedLogicalPlan::new(
                 self.bind_context,
                 LogicalOperator::MaterializedCTE(
                     MaterializedCTE::new(
@@ -124,7 +124,7 @@ impl<'a> CTEPartitioner<'a> {
     }
 }
 
-fn recognize(plan: &LogicalPlan) -> Option<Partitioning> {
+fn recognize(plan: &OwnedLogicalPlan) -> Option<Partitioning> {
     let LogicalOperator::MaterializedCTE(cte) = &plan.operator else {
         return None;
     };
@@ -268,7 +268,7 @@ fn rewrite_partition_constants(
     });
 }
 
-fn collect_union_all<'a>(plan: &'a LogicalPlan, branches: &mut Vec<&'a LogicalPlan>) -> Option<()> {
+fn collect_union_all<'a>(plan: &'a OwnedLogicalPlan, branches: &mut Vec<&'a OwnedLogicalPlan>) -> Option<()> {
     match &plan.operator {
         LogicalOperator::SetOperation(set)
             if set.setop_type == SetOpType::Union && set.setop_all =>
@@ -281,7 +281,7 @@ fn collect_union_all<'a>(plan: &'a LogicalPlan, branches: &mut Vec<&'a LogicalPl
     Some(())
 }
 
-fn consume_union_all(plan: LogicalPlan, branches: &mut Vec<LogicalPlan>) {
+fn consume_union_all(plan: OwnedLogicalPlan, branches: &mut Vec<OwnedLogicalPlan>) {
     let (id, stats, operator) = plan.into_parts();
     match operator {
         LogicalOperator::SetOperation(set)
@@ -290,7 +290,7 @@ fn consume_union_all(plan: LogicalPlan, branches: &mut Vec<LogicalPlan>) {
             consume_union_all(*set.left, branches);
             consume_union_all(*set.right, branches);
         }
-        operator => branches.push(LogicalPlan {
+        operator => branches.push(OwnedLogicalPlan {
             id,
             stats,
             operator,
@@ -298,7 +298,7 @@ fn consume_union_all(plan: LogicalPlan, branches: &mut Vec<LogicalPlan>) {
     }
 }
 
-fn constant_output(plan: &LogicalPlan, ordinal: usize) -> Option<Value> {
+fn constant_output(plan: &OwnedLogicalPlan, ordinal: usize) -> Option<Value> {
     let binding = *plan.get_column_bindings().get(ordinal)?;
     match &plan.operator {
         LogicalOperator::Projection(projection)
@@ -319,7 +319,7 @@ fn constant_output(plan: &LogicalPlan, ordinal: usize) -> Option<Value> {
     }
 }
 
-fn constant_expression(expression: &Expression, child: &LogicalPlan) -> Option<Value> {
+fn constant_expression(expression: &Expression, child: &OwnedLogicalPlan) -> Option<Value> {
     match expression {
         Expression::Constant(constant) if !constant.value.is_null() => Some(constant.value.clone()),
         Expression::ColumnRef(column) if column.depth == 0 => {

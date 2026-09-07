@@ -7,7 +7,7 @@ use std::sync::Arc;
 
 use crate::expression::Expression;
 use crate::operator::{ColumnBinding, LogicalOperator};
-use crate::plan::LogicalPlan;
+use crate::plan::OwnedLogicalPlan;
 use paro_catalog::entry::TableCatalogEntry;
 use paro_common::types::LogicalType;
 use paro_storage::table::segment_reorderer::SegmentOrderOptions;
@@ -18,7 +18,7 @@ use paro_storage::table::segment_reorderer::SegmentOrderOptions;
 /// Derived values carry their source explicitly and therefore cannot be
 /// mistaken for the stored value by statistics, runtime-filter, or row-fetch
 /// consumers. A virtual row id has no catalog column at all.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum GetColumnSource {
     Stored {
         column_id: usize,
@@ -74,7 +74,7 @@ pub struct Get {
 /// non-NULL statistics or a declared unique key) can therefore be checked at
 /// their use site without mistaking a join's NULL-extended output for the
 /// stored column.
-pub fn binding_preserving_get(plan: &LogicalPlan) -> Option<&Get> {
+pub fn binding_preserving_get(plan: &OwnedLogicalPlan) -> Option<&Get> {
     match &plan.operator {
         LogicalOperator::Get(get) => Some(get),
         LogicalOperator::Filter(filter) => binding_preserving_get(filter.child.as_ref()),

@@ -206,7 +206,7 @@ mod tests {
     use paro_planner::operator::{
         Aggregate, ColumnBinding, ExpressionGet, Filter, LogicalOperator,
     };
-    use paro_planner::plan::{CardinalityEstimate, LogicalPlan};
+    use paro_planner::plan::{CardinalityEstimate, OwnedLogicalPlan};
     use paro_storage::statistics::{BaseStatistics, ColumnStatistics, NumericStats};
 
     use super::{
@@ -226,7 +226,7 @@ mod tests {
         let ctx = BindContext::new();
         let input_type = decimal(15);
         let output_type = decimal(38);
-        let mut input = LogicalPlan::new(
+        let mut input = OwnedLogicalPlan::new(
             &ctx,
             LogicalOperator::ExpressionGet(ExpressionGet::new(
                 10,
@@ -248,7 +248,7 @@ mod tests {
             ))],
             output_type.clone(),
         ));
-        let mut aggregate = LogicalPlan::new(
+        let mut aggregate = OwnedLogicalPlan::new(
             &ctx,
             LogicalOperator::Aggregate(Aggregate::new(
                 20,
