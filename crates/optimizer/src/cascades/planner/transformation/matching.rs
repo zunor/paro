@@ -1319,6 +1319,28 @@ pub(super) fn matches_transformation_root(
         };
         return cte_transformation_accepts(transformation, cte.materialized);
     }
+    if matches!(
+        transformation,
+        PlannerTransformation::AggregateJoinSubsumption
+    ) {
+        let Some(payload) = state.payloads.logical.get(expr.payload.index()) else {
+            return false;
+        };
+        return crate::aggregate::join_subsumption::recognizes_outer_aggregate(
+            &payload.semantic_template.operator,
+        );
+    }
+    if matches!(
+        transformation,
+        PlannerTransformation::AggregateInputMaterialization
+    ) {
+        let Some(payload) = state.payloads.logical.get(expr.payload.index()) else {
+            return false;
+        };
+        return crate::aggregate::input_materialization::recognizes_aggregate(
+            &payload.semantic_template.operator,
+        );
+    }
     transformation_root_operator_matches(
         transformation,
         metadata.operator_type,

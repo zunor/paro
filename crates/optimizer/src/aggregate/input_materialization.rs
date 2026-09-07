@@ -44,6 +44,28 @@ pub fn optimize_plan(plan: LogicalPlan, bind_context: &BindContext) -> Result<(L
     Ok((plan, changed))
 }
 
+/// Scalar-only prerequisite used by Memo root dispatch. Join alternatives can
+/// decide where a candidate is placed, but can never manufacture a narrowing,
+/// total aggregate input when the aggregate shell has none.
+pub(crate) fn recognizes_aggregate(operator: &LogicalOperator) -> bool {
+    let LogicalOperator::Aggregate(aggregate) = operator else {
+        return false;
+    };
+    aggregate.aggregates.iter().any(|expression| {
+        let Expression::Aggregate(aggregate_expression) = expression else {
+            return false;
+        };
+        aggregate_expression.children.iter().any(|candidate| {
+            aggregate_input_is_narrowing_total(candidate)
+                && inputs_are_dead_outside_candidate(
+                    candidate,
+                    &aggregate.groups,
+                    &aggregate.aggregates,
+                )
+        })
+    })
+}
+
 struct MaterializedInput {
     binding_map: HashMap<ColumnBinding, ColumnBinding>,
     binding: ColumnBinding,

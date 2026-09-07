@@ -71,6 +71,12 @@ pub fn optimize_plan_with_change(plan: LogicalPlan) -> (LogicalPlan, bool) {
     .expect("detail subsumption traversal cannot fail")
 }
 
+/// Allocation-free root predicate shared with Memo rule dispatch. Descendant
+/// alternatives cannot make an aggregate with the wrong algebra eligible.
+pub(crate) fn recognizes_outer_aggregate(operator: &LogicalOperator) -> bool {
+    matches!(operator, LogicalOperator::Aggregate(aggregate) if AggregateJoinSubsumption::outer_sum(aggregate).is_some())
+}
+
 /// Memo schedules descendant groups independently; a firing changes only
 /// the aggregate shell whose proof was matched.
 pub(crate) fn optimize_root_with_change(mut plan: LogicalPlan) -> (LogicalPlan, bool) {
