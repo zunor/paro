@@ -431,21 +431,29 @@ impl<'a> PlanEnumerator<'a> {
 
     fn insert_frontier(&mut self, set: Arc<JoinRelationSet>, candidate: DPJoinNode) {
         let frontier = self.plans.entry(set).or_default();
+        let candidate_shape = candidate.compact_shape();
         if frontier.iter().any(|existing| {
             existing.cost <= candidate.cost
                 && existing.peak_build_bytes <= candidate.peak_build_bytes
+                && (existing.cost < candidate.cost
+                    || existing.peak_build_bytes < candidate.peak_build_bytes
+                    || existing.compact_shape() <= candidate_shape)
         }) {
             return;
         }
         frontier.retain(|existing| {
             !(candidate.cost <= existing.cost
                 && candidate.peak_build_bytes <= existing.peak_build_bytes)
+                || (candidate.cost == existing.cost
+                    && candidate.peak_build_bytes == existing.peak_build_bytes
+                    && candidate_shape > existing.compact_shape())
         });
         frontier.push(candidate);
         frontier.sort_by(|left, right| {
             left.cost
                 .total_cmp(&right.cost)
                 .then_with(|| left.peak_build_bytes.cmp(&right.peak_build_bytes))
+                .then_with(|| left.compact_shape().cmp(&right.compact_shape()))
         });
         if frontier.len() > self.max_frontier_size {
             let lowest_memory = frontier
@@ -465,6 +473,7 @@ impl<'a> PlanEnumerator<'a> {
                 left.cost
                     .total_cmp(&right.cost)
                     .then_with(|| left.peak_build_bytes.cmp(&right.peak_build_bytes))
+                    .then_with(|| left.compact_shape().cmp(&right.compact_shape()))
             });
         }
     }

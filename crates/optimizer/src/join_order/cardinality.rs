@@ -4,7 +4,7 @@
 //! Cardinality estimation helpers for join-order planning.
 
 use std::cmp::Reverse;
-use std::collections::{BinaryHeap, HashMap, HashSet};
+use std::collections::{BTreeMap, BinaryHeap, HashMap, HashSet};
 use std::sync::Arc;
 
 use paro_common::logging::targets;
@@ -205,11 +205,11 @@ impl EqualityDenominatorScratch {
 struct CorrelatedEqualityDomains {
     strongest: f64,
     redundant_product: f64,
-    relation_bindings: HashMap<usize, HashSet<ColumnBinding>>,
+    relation_bindings: BTreeMap<usize, HashSet<ColumnBinding>>,
 }
 
 impl CorrelatedEqualityDomains {
-    fn new(domain: f64, relation_bindings: HashMap<usize, HashSet<ColumnBinding>>) -> Self {
+    fn new(domain: f64, relation_bindings: BTreeMap<usize, HashSet<ColumnBinding>>) -> Self {
         Self {
             strongest: domain,
             redundant_product: 1.0,
@@ -217,7 +217,7 @@ impl CorrelatedEqualityDomains {
         }
     }
 
-    fn add(&mut self, domain: f64, relation_bindings: HashMap<usize, HashSet<ColumnBinding>>) {
+    fn add(&mut self, domain: f64, relation_bindings: BTreeMap<usize, HashSet<ColumnBinding>>) {
         if domain > self.strongest {
             self.redundant_product *= self.strongest;
             self.strongest = domain;
@@ -236,14 +236,14 @@ impl CorrelatedEqualityDomains {
 #[derive(Debug)]
 struct EqualityPairDomain {
     domain: f64,
-    relation_bindings: HashMap<usize, HashSet<ColumnBinding>>,
+    relation_bindings: BTreeMap<usize, HashSet<ColumnBinding>>,
 }
 
 impl Default for EqualityPairDomain {
     fn default() -> Self {
         Self {
             domain: 1.0,
-            relation_bindings: HashMap::new(),
+            relation_bindings: BTreeMap::new(),
         }
     }
 }
@@ -708,7 +708,9 @@ impl CardinalityEstimator {
             "equality topology must be compiled before cardinality lookup"
         );
         let mut denominator = 1.0;
-        let mut correlated_pairs = HashMap::<(usize, usize), CorrelatedEqualityDomains>::new();
+        // The resulting domains feed floating-point cardinality reductions, so
+        // their iteration order is part of the optimizer's determinism contract.
+        let mut correlated_pairs = BTreeMap::<(usize, usize), CorrelatedEqualityDomains>::new();
         let mut consumed_filters = HashSet::new();
         let Self {
             relation_set_stats,
@@ -864,7 +866,7 @@ impl CardinalityEstimator {
 
             // Correlation is accounted against the exact spanning-tree edge
             // that owns each factor, never reconstructed from endpoint maxima.
-            let mut graph_pairs = HashMap::<(usize, usize), EqualityPairDomain>::new();
+            let mut graph_pairs = BTreeMap::<(usize, usize), EqualityPairDomain>::new();
             for (child, edge_index) in equality_scratch.owned_edges.iter().enumerate() {
                 let Some(edge_index) = edge_index else {
                     continue;
@@ -890,7 +892,7 @@ impl CardinalityEstimator {
                     .insert(graph.vertices[edge.right].binding);
             }
             for (pair, pair_domain) in graph_pairs {
-                use std::collections::hash_map::Entry;
+                use std::collections::btree_map::Entry;
                 match correlated_pairs.entry(pair) {
                     Entry::Occupied(mut entry) => entry
                         .get_mut()

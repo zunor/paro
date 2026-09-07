@@ -160,7 +160,6 @@ pub(super) fn identity_with_facts(
     for group in graph.inputs {
         let read = PatternRead::facts_from_group(memo, group)?;
         encoder.write_u64(group.0 as u64);
-        encoder.write_fingerprint(read.logical_fact_fingerprint);
         if let Some(facts) = facts {
             // The reader already resolved inherited and producer evidence.
             // Recipe ids and input-list growth are invalidation cursors, not
@@ -168,6 +167,7 @@ pub(super) fn identity_with_facts(
             // problem even after its evidence DAG gains another derivation.
             facts.encode_group(group, &mut encoder)?;
         } else {
+            encoder.write_fingerprint(read.logical_fact_fingerprint);
             encoder.write_fingerprint(read.statistics_snapshot_fingerprint);
         }
     }

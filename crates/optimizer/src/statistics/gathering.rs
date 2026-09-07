@@ -1,7 +1,7 @@
 // Copyright 2024-2026 Zunor
 // SPDX-License-Identifier: Apache-2.0
 
-use std::collections::{BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::sync::Arc;
 
 use paro_common::error::Result;
@@ -995,7 +995,10 @@ fn estimate_comparison_join_selectivity(
 fn correlate_join_condition_selectivities(
     conditions: impl IntoIterator<Item = (Option<(usize, usize)>, f64)>,
 ) -> f64 {
-    let mut equality_by_relation_pair = HashMap::<(usize, usize), f64>::new();
+    // This map participates in a floating-point reduction. Iterating a HashMap
+    // would make the estimate (and potentially the winning physical plan)
+    // depend on the process hash seed.
+    let mut equality_by_relation_pair = BTreeMap::<(usize, usize), f64>::new();
     let mut independent_selectivity = 1.0;
 
     for (relation_pair, selectivity) in conditions {

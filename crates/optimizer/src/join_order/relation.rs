@@ -3,7 +3,7 @@
 
 //! Join-relation sets used by the join-order optimizer.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashSet};
 use std::fmt;
 use std::sync::Arc;
 
@@ -216,14 +216,14 @@ struct JoinRelationTreeNode {
     /// The JoinRelationSet at this node (if any).
     relation: Option<Arc<JoinRelationSet>>,
     /// Child nodes indexed by relation index.
-    children: HashMap<usize, Box<JoinRelationTreeNode>>,
+    children: BTreeMap<usize, Box<JoinRelationTreeNode>>,
 }
 
 impl JoinRelationTreeNode {
     fn new() -> Self {
         Self {
             relation: None,
-            children: HashMap::new(),
+            children: BTreeMap::new(),
         }
     }
 }

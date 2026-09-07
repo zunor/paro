@@ -11,7 +11,7 @@
 //! 3. Prunes branches that have unsatisfiable filters:
 //!    `X = 5 AND X > 6` → FALSE (prune branch)
 
-use std::collections::HashMap;
+use std::collections::BTreeMap;
 
 use paro_common::runtime_value::Value;
 use paro_common::types::LogicalType;
@@ -54,7 +54,7 @@ pub struct ExpressionValueInformation {
 
 /// Key for expression equality in hash maps.
 /// Uses table_index and column_index for ColumnRef expressions.
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
 enum ExpressionKey {
     ColumnRef {
         table_index: usize,
@@ -81,13 +81,13 @@ pub struct FilterCombiner {
     /// Filters that couldn't be processed by the combiner.
     remaining_filters: Vec<Expression>,
     /// Map from expression key to stored expression.
-    stored_expressions: HashMap<ExpressionKey, Expression>,
+    stored_expressions: BTreeMap<ExpressionKey, Expression>,
     /// Map from expression key to equivalence set index.
-    equivalence_set_map: HashMap<ExpressionKey, usize>,
+    equivalence_set_map: BTreeMap<ExpressionKey, usize>,
     /// Map from equivalence set index to constant value information.
-    constant_values: HashMap<usize, Vec<ExpressionValueInformation>>,
+    constant_values: BTreeMap<usize, Vec<ExpressionValueInformation>>,
     /// Map from equivalence set index to expressions in that set.
-    equivalence_map: HashMap<usize, Vec<ExpressionKey>>,
+    equivalence_map: BTreeMap<usize, Vec<ExpressionKey>>,
     /// Next equivalence set index.
     set_index: usize,
 }
@@ -97,10 +97,10 @@ impl FilterCombiner {
     pub fn new() -> Self {
         Self {
             remaining_filters: Vec::new(),
-            stored_expressions: HashMap::new(),
-            equivalence_set_map: HashMap::new(),
-            constant_values: HashMap::new(),
-            equivalence_map: HashMap::new(),
+            stored_expressions: BTreeMap::new(),
+            equivalence_set_map: BTreeMap::new(),
+            constant_values: BTreeMap::new(),
+            equivalence_map: BTreeMap::new(),
             set_index: 0,
         }
     }
@@ -150,8 +150,13 @@ impl FilterCombiner {
         // First, add remaining filters
         result.append(&mut self.remaining_filters);
 
-        // Generate equality filters between expressions in the same equivalence set
-        for (equiv_set, keys) in &self.equivalence_map {
+        // Set ids are union-find allocation details. Emit classes and their
+        // members by semantic column identity, never map iteration order.
+        let mut classes = self.equivalence_map.iter().collect::<Vec<_>>();
+        classes.sort_by_key(|(_, keys)| keys.iter().min().cloned());
+        for (equiv_set, unordered_keys) in classes {
+            let mut keys = unordered_keys.clone();
+            keys.sort_unstable();
             // Generate equality comparisons between all pairs
             for i in 0..keys.len() {
                 for j in (i + 1)..keys.len() {
@@ -1134,5 +1139,31 @@ mod tests {
         let filters = combiner.generate_filters();
         // Should have two independent filters
         assert_eq!(filters.len(), 2);
+    }
+
+    #[test]
+    fn generated_equivalence_filters_ignore_class_insertion_order() {
+        fn build(classes: &[(usize, usize)]) -> Vec<Expression> {
+            let mut combiner = FilterCombiner::new();
+            for &(left, right) in classes {
+                assert_eq!(
+                    combiner.add_filter(make_comparison(
+                        ComparisonType::Equal,
+                        make_column_ref(0, left),
+                        make_column_ref(0, right),
+                    )),
+                    FilterResult::Success
+                );
+            }
+            combiner.generate_filters()
+        }
+
+        let forward = build(&[(0, 1), (2, 3)]);
+        let reverse = build(&[(2, 3), (0, 1)]);
+        assert_eq!(forward.len(), reverse.len());
+        assert!(forward
+            .iter()
+            .zip(reverse.iter())
+            .all(|(left, right)| left.equals(right)));
     }
 }

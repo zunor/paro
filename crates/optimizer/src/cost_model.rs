@@ -50,6 +50,14 @@ impl SelectivityEstimate {
 fn conjunction_estimate(
     estimates: impl Iterator<Item = SelectivityEstimate>,
 ) -> SelectivityEstimate {
+    let mut estimates = estimates.collect::<Vec<_>>();
+    // AND is a commutative operation. Fix the floating-point reduction order
+    // so equivalent predicate permutations produce bit-identical estimates.
+    estimates.sort_by(|left, right| {
+        left.fraction
+            .total_cmp(&right.fraction)
+            .then_with(|| left.proven.cmp(&right.proven))
+    });
     let mut fraction = 1.0;
     let mut proven = true;
     for estimate in estimates {
@@ -120,6 +128,13 @@ fn column_aware_conjunction_estimate(
 fn disjunction_estimate(
     estimates: impl Iterator<Item = SelectivityEstimate>,
 ) -> SelectivityEstimate {
+    let mut estimates = estimates.collect::<Vec<_>>();
+    // OR is commutative too; canonicalize the miss-probability reduction.
+    estimates.sort_by(|left, right| {
+        left.fraction
+            .total_cmp(&right.fraction)
+            .then_with(|| left.proven.cmp(&right.proven))
+    });
     let mut miss_fraction = 1.0;
     let mut proven = true;
     for estimate in estimates {
@@ -1498,6 +1513,38 @@ mod tests {
 
         assert!(!estimate.proven);
         assert!((estimate.fraction - (0.1 * 0.2_f64.sqrt())).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn boolean_selectivity_reductions_are_bitwise_permutation_invariant() {
+        let estimates = [
+            SelectivityEstimate::estimated(0.37),
+            SelectivityEstimate::estimated(0.11),
+            SelectivityEstimate::proven(0.83),
+        ];
+        let reversed = estimates.into_iter().rev();
+        let and_forward = conjunction_estimate(estimates.into_iter());
+        let and_reverse = conjunction_estimate(reversed);
+        assert_eq!(
+            and_forward.fraction.to_bits(),
+            and_reverse.fraction.to_bits()
+        );
+        assert_eq!(and_forward.proven, and_reverse.proven);
+
+        let or_forward = disjunction_estimate(estimates.into_iter());
+        let or_reverse = disjunction_estimate(estimates.into_iter().rev());
+        assert_eq!(or_forward.fraction.to_bits(), or_reverse.fraction.to_bits());
+        assert_eq!(or_forward.proven, or_reverse.proven);
+
+        let columns = [
+            (estimates[0], Some(ColumnBinding::new(7, 2))),
+            (estimates[1], Some(ColumnBinding::new(7, 0))),
+            (estimates[2], None),
+        ];
+        let forward = column_aware_conjunction_estimate(columns.into_iter());
+        let reverse = column_aware_conjunction_estimate(columns.into_iter().rev());
+        assert_eq!(forward.fraction.to_bits(), reverse.fraction.to_bits());
+        assert_eq!(forward.proven, reverse.proven);
     }
 
     #[test]
