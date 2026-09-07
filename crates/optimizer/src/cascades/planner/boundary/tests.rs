@@ -3,7 +3,7 @@
 
 use super::*;
 use paro_common::types::LogicalType;
-use paro_planner::expression::ColumnRefExpression;
+use paro_planner::expression::{ColumnRefExpression, ConstantExpression};
 use paro_planner::operator::{Projection, SetOpType, SetOperation};
 
 fn source(table: usize) -> LogicalPlan {
@@ -26,6 +26,38 @@ fn project(plan: LogicalPlan, table: usize) -> LogicalPlan {
 
 fn input(plan: LogicalPlan, budget: SearchBudget) -> OptimizationInput {
     MemoBuilder::build(plan, BindContext::new(), budget).unwrap()
+}
+
+fn grouped_branch_with_tag(source_table: usize, output_table: usize, tag: &str) -> LogicalPlan {
+    let aggregate = LogicalPlan::synthetic(LogicalOperator::Aggregate(
+        paro_planner::operator::Aggregate::new(
+            output_table + 10,
+            output_table + 11,
+            output_table + 12,
+            source(source_table),
+            vec![Expression::ColumnRef(ColumnRefExpression::new(
+                ColumnBinding::new(source_table, 0),
+                LogicalType::Integer,
+            ))],
+            vec![],
+            vec![],
+            vec![],
+        ),
+    ));
+    LogicalPlan::synthetic(LogicalOperator::Projection(Projection::new(
+        output_table,
+        aggregate,
+        vec![
+            Expression::ColumnRef(ColumnRefExpression::new(
+                ColumnBinding::new(output_table + 10, 0),
+                LogicalType::Integer,
+            )),
+            Expression::Constant(ConstantExpression::new(
+                Value::Varchar(tag.to_string()),
+                LogicalType::Varchar,
+            )),
+        ],
+    )))
 }
 
 #[test]
@@ -216,6 +248,36 @@ fn repeated_union_occurrences_cannot_claim_one_source_work_identity() {
         .lineage
         .values()
         .all(Option::is_none));
+}
+
+#[test]
+fn disjoint_finite_grouping_domains_make_union_all_key_composable() {
+    let plan = LogicalPlan::synthetic(LogicalOperator::SetOperation(SetOperation::new(
+        30,
+        grouped_branch_with_tag(0, 20, "store"),
+        grouped_branch_with_tag(1, 21, "web"),
+        SetOpType::Union,
+        true,
+        vec![LogicalType::Integer, LogicalType::Varchar],
+    )));
+    let mut input = input(plan, SearchBudget::default());
+    let state = input.planner_state.read().unwrap();
+    let mut context = TransformContext::new(&mut input.memo, input.root);
+    let snapshot = BoundarySnapshot::read(
+        &mut context,
+        &state,
+        &PatternOperand::Group(input.root),
+        BudgetDimension::RuleWorkPerGroup,
+    )
+    .unwrap()
+    .unwrap();
+    let output = input.memo.group(input.root).unwrap().schema.columns();
+    assert!(snapshot.groups[&input.root]
+        .unique_keys
+        .contains(&Box::from([output[0].id, output[1].id])));
+    assert!(snapshot.groups[&input.root]
+        .grouping_unique_keys
+        .contains(&Box::from([output[0].id, output[1].id])));
 }
 
 #[test]

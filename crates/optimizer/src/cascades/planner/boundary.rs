@@ -4,6 +4,7 @@
 //! Fact-backed Memo boundaries. No logical tree or representative is built.
 
 use super::*;
+use paro_common::runtime_value::Value;
 use paro_planner::operator::bound_reference::{BoundRelationFacts, BoundSourceColumn};
 use paro_planner::plan::{UniqueKey, UniqueKeyColumn, UniqueKeyProvenance};
 
@@ -14,9 +15,77 @@ mod tests;
 struct GroupFacts {
     relational: bool,
     unique_keys: BTreeSet<Box<[ColumnId]>>,
+    /// Structural keys whose equality is valid in the SQL GROUP BY domain.
+    /// Catalog UNIQUE keys are intentionally absent unless another proof has
+    /// established their NULL safety.
+    grouping_unique_keys: BTreeSet<Box<[ColumnId]>>,
+    /// Exact, finite SQL grouping domains. Absence means unknown; an empty set
+    /// is never published. These values make disjoint UNION ALL partitions a
+    /// composable uniqueness proof rather than a rule-local observation.
+    grouping_domains: BTreeMap<ColumnId, BTreeSet<SafeGroupingValue>>,
     cardinality: Option<CardinalityEnvelope>,
     lineage: BTreeMap<ColumnId, Option<Vec<BoundSourceColumn>>>,
     control: bool,
+}
+
+/// Values whose SQL grouping equality is total and matches structural
+/// equality. NULL, floating point, collated strings and nested values are
+/// deliberately excluded from this proof domain.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+enum SafeGroupingValue {
+    Boolean(bool),
+    TinyInt(i8),
+    SmallInt(i16),
+    Integer(i32),
+    BigInt(i64),
+    HugeInt(i128),
+    UTinyInt(u8),
+    USmallInt(u16),
+    UInteger(u32),
+    UBigInt(u64),
+    UHugeInt(u128),
+    Decimal(i128, u8, u8),
+    Varchar(String),
+    Blob(Vec<u8>),
+    Uuid(u128),
+    Date(i32),
+    Timestamp(i64),
+    TimestampTz(i64),
+    Time(i64),
+    Interval(i32, i32, i64),
+}
+
+impl SafeGroupingValue {
+    fn from_value(value: &Value) -> Option<Self> {
+        Some(match value {
+            Value::Boolean(value) => Self::Boolean(*value),
+            Value::TinyInt(value) => Self::TinyInt(*value),
+            Value::SmallInt(value) => Self::SmallInt(*value),
+            Value::Integer(value) => Self::Integer(*value),
+            Value::BigInt(value) => Self::BigInt(*value),
+            Value::HugeInt(value) => Self::HugeInt(*value),
+            Value::UTinyInt(value) => Self::UTinyInt(*value),
+            Value::USmallInt(value) => Self::USmallInt(*value),
+            Value::UInteger(value) => Self::UInteger(*value),
+            Value::UBigInt(value) => Self::UBigInt(*value),
+            Value::UHugeInt(value) => Self::UHugeInt(*value),
+            Value::Decimal(value, precision, scale) => Self::Decimal(*value, *precision, *scale),
+            Value::Varchar(value) => Self::Varchar(value.clone()),
+            Value::Blob(value) => Self::Blob(value.clone()),
+            Value::Uuid(value) => Self::Uuid(*value),
+            Value::Date(value) => Self::Date(*value),
+            Value::Timestamp(value) => Self::Timestamp(*value),
+            Value::TimestampTz(value) => Self::TimestampTz(*value),
+            Value::Time(value) => Self::Time(*value),
+            Value::Interval(months, days, micros) => Self::Interval(*months, *days, *micros),
+            Value::Null(_)
+            | Value::Float(_)
+            | Value::Double(_)
+            | Value::List(_, _)
+            | Value::Struct(_, _)
+            | Value::Array(_, _, _) => return None,
+        })
+    }
 }
 
 pub(super) struct BoundarySnapshot {
@@ -286,6 +355,13 @@ impl BoundarySnapshot {
                                                 .map(|key| key.len())
                                                 .sum::<usize>(),
                                         )
+                                        .saturating_add(
+                                            facts
+                                                .grouping_unique_keys
+                                                .iter()
+                                                .map(|key| key.len())
+                                                .sum::<usize>(),
+                                        )
                                 })
                                 .sum::<usize>()
                                 .saturating_add(
@@ -444,8 +520,26 @@ impl BoundarySnapshot {
                 Some(UniqueKey::new(columns, UniqueKeyProvenance::Structural))
             })
             .collect();
+        let grouping_unique_keys = facts
+            .grouping_unique_keys
+            .iter()
+            .filter_map(|key| {
+                let columns = key
+                    .iter()
+                    .map(|column| {
+                        let output_index = *ordinals.get(column)?;
+                        Some(UniqueKeyColumn {
+                            output_index,
+                            binding: layout.bindings[output_index],
+                        })
+                    })
+                    .collect::<Option<Vec<_>>>()?;
+                Some(UniqueKey::new(columns, UniqueKeyProvenance::Structural))
+            })
+            .collect();
         Ok(Arc::new(BoundRelationFacts {
             unique_keys,
+            grouping_unique_keys,
             source_lineage: columns
                 .iter()
                 .map(|column| facts.lineage.get(column).cloned().flatten())
@@ -496,7 +590,10 @@ impl BoundarySnapshot {
             });
         }
         let mut common: Option<BTreeMap<ColumnId, Option<Vec<BoundSourceColumn>>>> = None;
+        let mut common_grouping_domains: Option<BTreeMap<ColumnId, BTreeSet<SafeGroupingValue>>> =
+            None;
         let mut unique_keys = group.logical_properties.unique_keys.clone();
+        let mut grouping_unique_keys = BTreeSet::new();
         let mut control = false;
         for expression in group.logical_exprs() {
             let logical = memo
@@ -533,6 +630,48 @@ impl BoundarySnapshot {
                     }
                 })
                 .collect::<Result<Vec<_>>>()?;
+            let child_grouping_keys = logical
+                .key
+                .children
+                .iter()
+                .zip(&metadata.child_layouts)
+                .map(|(group, layout)| {
+                    let group = memo.canonical_group(*group);
+                    let Some(facts) = self.groups.get(&group) else {
+                        return Vec::new();
+                    };
+                    let ordinals = layout
+                        .bindings
+                        .iter()
+                        .zip(&layout.types)
+                        .enumerate()
+                        .filter_map(|(ordinal, (binding, ty))| {
+                            state
+                                .binding_ids
+                                .get(binding.table_index, binding.column_index, ty)
+                                .copied()
+                                .map(|column| (column, ordinal))
+                        })
+                        .collect::<BTreeMap<_, _>>();
+                    facts
+                        .grouping_unique_keys
+                        .iter()
+                        .filter_map(|key| {
+                            let columns = key
+                                .iter()
+                                .map(|column| {
+                                    let output_index = *ordinals.get(column)?;
+                                    Some(UniqueKeyColumn {
+                                        output_index,
+                                        binding: layout.bindings[output_index],
+                                    })
+                                })
+                                .collect::<Option<Vec<_>>>()?;
+                            Some(UniqueKey::new(columns, UniqueKeyProvenance::Structural))
+                        })
+                        .collect()
+                })
+                .collect::<Vec<Vec<UniqueKey>>>();
             let layout = operator.output_layout_from_children(&child_layouts);
             let local_keys = crate::statistics::unique_keys::derive_unique_keys_from_facts(
                 operator,
@@ -555,7 +694,55 @@ impl BoundarySnapshot {
                     })
                     .collect::<Option<BTreeSet<_>>>();
                 if let Some(key) = key {
-                    unique_keys.insert(key.into_iter().collect());
+                    if !key.is_empty() {
+                        unique_keys.insert(key.into_iter().collect());
+                    }
+                }
+            }
+            let local_grouping_keys = if let LogicalOperator::BoundReference(reference) = operator {
+                reference.facts.grouping_unique_keys.clone()
+            } else {
+                crate::statistics::unique_keys::derive_unique_keys_from_facts(
+                    operator,
+                    &layout,
+                    &child_layouts,
+                    &child_grouping_keys
+                        .iter()
+                        .map(Vec::as_slice)
+                        .collect::<Vec<_>>(),
+                )
+            };
+            for key in local_grouping_keys {
+                // Leaf catalog keys are not GROUP BY keys. All admitted keys
+                // must either descend from an already NULL-safe child proof or
+                // be created structurally by DISTINCT / grouped Aggregate.
+                let locally_structural = matches!(
+                    operator,
+                    LogicalOperator::Distinct(_) | LogicalOperator::Aggregate(_)
+                );
+                if child_grouping_keys.iter().all(Vec::is_empty)
+                    && !locally_structural
+                    && !matches!(operator, LogicalOperator::BoundReference(_))
+                {
+                    continue;
+                }
+                let key = key
+                    .columns
+                    .iter()
+                    .map(|column| {
+                        let ty = layout.types().get(column.output_index)?;
+                        let id = *state.binding_ids.get(
+                            column.binding.table_index,
+                            column.binding.column_index,
+                            ty,
+                        )?;
+                        metadata.output_columns.contains(&id).then_some(id)
+                    })
+                    .collect::<Option<BTreeSet<_>>>();
+                if let Some(key) = key {
+                    if !key.is_empty() {
+                        grouping_unique_keys.insert(key.into_iter().collect());
+                    }
                 }
             }
             let child = |index: usize| {
@@ -597,6 +784,127 @@ impl BoundarySnapshot {
                     _ => None,
                 }
             };
+            let expression_domain = |expression: &Expression, index: usize| {
+                if let Expression::Constant(constant) = expression {
+                    if matches!(
+                        constant.return_type,
+                        paro_common::types::LogicalType::VarcharCollation(_)
+                    ) {
+                        return None;
+                    }
+                    return SafeGroupingValue::from_value(&constant.value)
+                        .map(|value| BTreeSet::from([value]));
+                }
+                let column = expression_column(expression, index)?;
+                child(index)?.grouping_domains.get(&column).cloned()
+            };
+            let mut local_grouping_domains = BTreeMap::new();
+            for (ordinal, output) in metadata.output_columns.iter().copied().enumerate() {
+                let domain = match operator {
+                    LogicalOperator::Projection(projection) => projection
+                        .expressions
+                        .get(ordinal)
+                        .and_then(|expression| expression_domain(expression, 0)),
+                    LogicalOperator::Aggregate(aggregate) if ordinal < aggregate.groups.len() => {
+                        aggregate
+                            .groups
+                            .get(ordinal)
+                            .and_then(|expression| expression_domain(expression, 0))
+                    }
+                    LogicalOperator::SetOperation(setop)
+                        if setop.setop_type == paro_planner::operator::SetOpType::Union
+                            && setop.setop_all =>
+                    {
+                        let left = column_at(0, ordinal)
+                            .and_then(|column| child(0)?.grouping_domains.get(&column).cloned());
+                        let right = column_at(1, ordinal)
+                            .and_then(|column| child(1)?.grouping_domains.get(&column).cloned());
+                        left.zip(right).map(|(mut left, right)| {
+                            left.extend(right);
+                            left
+                        })
+                    }
+                    LogicalOperator::Filter(_)
+                    | LogicalOperator::Order(_)
+                    | LogicalOperator::Limit(_)
+                    | LogicalOperator::TopN(_)
+                    | LogicalOperator::Window(_)
+                    | LogicalOperator::EmptyResult(_)
+                    | LogicalOperator::RowFetch(_)
+                    | LogicalOperator::ExternalProject(_) => {
+                        child(0).and_then(|facts| facts.grouping_domains.get(&output).cloned())
+                    }
+                    LogicalOperator::MaterializedCTE(_) => {
+                        child(1).and_then(|facts| facts.grouping_domains.get(&output).cloned())
+                    }
+                    _ => None,
+                };
+                if let Some(domain) = domain.filter(|domain| !domain.is_empty()) {
+                    local_grouping_domains.insert(output, domain);
+                }
+            }
+            if let LogicalOperator::SetOperation(setop) = operator {
+                let union_children = (setop.setop_type == paro_planner::operator::SetOpType::Union
+                    && setop.setop_all)
+                    .then(|| child(0).zip(child(1)))
+                    .flatten();
+                if let Some((left, right)) = union_children {
+                    let key_ordinals = |facts: &GroupFacts, index: usize| {
+                        facts
+                            .grouping_unique_keys
+                            .iter()
+                            .filter_map(|key| {
+                                key.iter()
+                                    .map(|column| {
+                                        let layout = metadata.child_layouts.get(index)?;
+                                        layout.bindings.iter().zip(&layout.types).position(
+                                            |(binding, ty)| {
+                                                state.binding_ids.get(
+                                                    binding.table_index,
+                                                    binding.column_index,
+                                                    ty,
+                                                ) == Some(column)
+                                            },
+                                        )
+                                    })
+                                    .collect::<Option<BTreeSet<_>>>()
+                            })
+                            .collect::<Vec<_>>()
+                    };
+                    let left_keys = key_ordinals(left, 0);
+                    let right_keys = key_ordinals(right, 1);
+                    for left_key in &left_keys {
+                        for right_key in &right_keys {
+                            for ordinal in 0..metadata.output_columns.len() {
+                                let left_domain = column_at(0, ordinal)
+                                    .and_then(|column| left.grouping_domains.get(&column));
+                                let right_domain = column_at(1, ordinal)
+                                    .and_then(|column| right.grouping_domains.get(&column));
+                                let Some((left_domain, right_domain)) =
+                                    left_domain.zip(right_domain)
+                                else {
+                                    continue;
+                                };
+                                if left_domain.is_disjoint(right_domain) {
+                                    let mut key =
+                                        left_key.union(right_key).copied().collect::<BTreeSet<_>>();
+                                    key.insert(ordinal);
+                                    let key = key
+                                        .into_iter()
+                                        .filter_map(|ordinal| {
+                                            metadata.output_columns.get(ordinal).copied()
+                                        })
+                                        .collect::<BTreeSet<_>>()
+                                        .into_iter()
+                                        .collect::<Box<[_]>>();
+                                    unique_keys.insert(key.clone());
+                                    grouping_unique_keys.insert(key);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
             let lineage = |index: usize, column: ColumnId| {
                 child(index)
                     .and_then(|facts| facts.lineage.get(&column))
@@ -710,10 +1018,29 @@ impl BoundarySnapshot {
             } else {
                 common = Some(local);
             }
+            if let Some(common) = &mut common_grouping_domains {
+                // A finite domain proven by any equivalent expression is a
+                // relation fact. Multiple proofs intersect: missing evidence
+                // is unknown, not a contradiction that erases a stronger
+                // proof supplied by another alternative.
+                for (column, domain) in local_grouping_domains {
+                    common
+                        .entry(column)
+                        .and_modify(|current| {
+                            current.retain(|value| domain.contains(value));
+                        })
+                        .or_insert(domain);
+                }
+                common.retain(|_, domain| !domain.is_empty());
+            } else {
+                common_grouping_domains = Some(local_grouping_domains);
+            }
         }
         Ok(GroupFacts {
             relational,
             unique_keys,
+            grouping_unique_keys,
+            grouping_domains: common_grouping_domains.unwrap_or_default(),
             cardinality,
             lineage: common.unwrap_or_default(),
             control: control || group.logical_exprs().is_empty(),

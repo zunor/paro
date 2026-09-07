@@ -40,6 +40,10 @@ pub struct BoundSourceColumn {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BoundRelationFacts {
     pub unique_keys: Vec<UniqueKey>,
+    /// Keys that remain unique when SQL grouping treats NULL values as equal.
+    /// This is deliberately separate from ordinary/catalog uniqueness: a
+    /// nullable UNIQUE constraint can admit several NULL tuples.
+    pub grouping_unique_keys: Vec<UniqueKey>,
     pub source_lineage: Vec<Option<Vec<BoundSourceColumn>>>,
     pub contains_control_region: bool,
 }
@@ -48,6 +52,7 @@ impl Default for BoundRelationFacts {
     fn default() -> Self {
         Self {
             unique_keys: Vec::new(),
+            grouping_unique_keys: Vec::new(),
             source_lineage: Vec::new(),
             contains_control_region: true,
         }
