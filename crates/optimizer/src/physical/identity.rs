@@ -5,7 +5,7 @@
 
 use std::fmt;
 
-use sha2::{Digest, Sha256};
+use smallvec::SmallVec;
 
 macro_rules! id_type {
     ($name:ident) => {
@@ -87,17 +87,17 @@ impl fmt::Debug for Fingerprint {
 /// non-cryptographic lanes.
 #[derive(Debug, Clone)]
 pub struct StableFingerprintBuilder {
-    state: Sha256,
-    transcript: Option<Vec<u8>>,
+    bytes: SmallVec<[u8; 128]>,
+    recording: bool,
 }
 
 impl Default for StableFingerprintBuilder {
     fn default() -> Self {
-        let mut state = Sha256::new();
-        state.update(b"paro.stable-fingerprint.v2");
+        let mut bytes = SmallVec::new();
+        bytes.extend_from_slice(b"paro.stable-fingerprint.v3.blake3");
         Self {
-            state,
-            transcript: None,
+            bytes,
+            recording: false,
         }
     }
 }
@@ -112,15 +112,12 @@ impl StableFingerprintBuilder {
     /// selects a bucket and can never establish logical equivalence.
     pub fn recording() -> Self {
         let mut builder = Self::default();
-        builder.transcript = Some(b"paro.stable-fingerprint.v2".to_vec());
+        builder.recording = true;
         builder
     }
 
     fn update(&mut self, bytes: &[u8]) {
-        self.state.update(bytes);
-        if let Some(transcript) = &mut self.transcript {
-            transcript.extend_from_slice(bytes);
-        }
+        self.bytes.extend_from_slice(bytes);
     }
 
     pub fn write_bytes(&mut self, bytes: &[u8]) {
@@ -140,18 +137,22 @@ impl StableFingerprintBuilder {
     }
 
     pub fn finish(self) -> Fingerprint {
-        let digest = self.state.finalize();
+        let digest = blake3::hash(&self.bytes);
         let mut bytes = [0_u8; 16];
-        bytes.copy_from_slice(&digest[..16]);
+        bytes.copy_from_slice(&digest.as_bytes()[..16]);
         Fingerprint(u128::from_le_bytes(bytes))
     }
 
     pub fn finish_recording(self) -> (Fingerprint, Box<[u8]>) {
-        let transcript = self
-            .transcript
-            .clone()
-            .expect("finish_recording requires StableFingerprintBuilder::recording");
-        (self.finish(), transcript.into_boxed_slice())
+        assert!(
+            self.recording,
+            "finish_recording requires StableFingerprintBuilder::recording"
+        );
+        let digest = blake3::hash(&self.bytes);
+        let mut bytes = [0_u8; 16];
+        bytes.copy_from_slice(&digest.as_bytes()[..16]);
+        let fingerprint = Fingerprint(u128::from_le_bytes(bytes));
+        (fingerprint, self.bytes.into_vec().into_boxed_slice())
     }
 }
 
@@ -192,5 +193,20 @@ mod tests {
         assert_ne!(bytes, integer);
         assert_ne!(integer, fingerprint);
         assert_ne!(bytes, fingerprint);
+    }
+
+    #[test]
+    fn recording_reuses_the_hashed_transcript() {
+        let mut ordinary = StableFingerprintBuilder::default();
+        ordinary.write_bytes(b"operator");
+        ordinary.write_u64(17);
+
+        let mut recording = StableFingerprintBuilder::recording();
+        recording.write_bytes(b"operator");
+        recording.write_u64(17);
+        let (recorded_fingerprint, transcript) = recording.finish_recording();
+
+        assert_eq!(recorded_fingerprint, ordinary.finish());
+        assert!(transcript.starts_with(b"paro.stable-fingerprint.v3.blake3"));
     }
 }
