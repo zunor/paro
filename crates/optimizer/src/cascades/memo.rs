@@ -21,7 +21,7 @@ use super::properties::{PropertyInterner, ProvidedProperties, RequiredProperties
 use super::region::{JointCostProof, RegionFacet, RegionForest};
 use super::rules::CostComposition;
 use crate::physical::ObjectiveProfile;
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct LogicalProperties {
@@ -622,6 +622,11 @@ pub struct Group {
     pub schema: GroupSchema,
     pub logical_properties: LogicalProperties,
     pub cardinality: GroupCardinality,
+    /// Canonical fact identities are read far more often than facts change.
+    /// A mutable group borrow invalidates both cells conservatively; readers
+    /// then serialize each immutable value at most once per mutation epoch.
+    logical_fact_fingerprint: OnceLock<Fingerprint>,
+    statistics_snapshot_fingerprint: OnceLock<Fingerprint>,
     logical_exprs: Vec<LogicalExprId>,
     /// Last Memo-global revision that changed the logical expression set.
     /// Transformation consumers use it to distinguish a completed match from
@@ -644,11 +649,20 @@ impl Group {
     }
 
     pub fn logical_fact_fingerprint(&self) -> Fingerprint {
-        self.logical_properties.stable_fact_fingerprint()
+        *self
+            .logical_fact_fingerprint
+            .get_or_init(|| self.logical_properties.stable_fact_fingerprint())
     }
 
     pub fn statistics_snapshot_fingerprint(&self) -> Fingerprint {
-        self.cardinality.stable_snapshot_fingerprint()
+        *self
+            .statistics_snapshot_fingerprint
+            .get_or_init(|| self.cardinality.stable_snapshot_fingerprint())
+    }
+
+    fn invalidate_fact_fingerprints(&mut self) {
+        self.logical_fact_fingerprint.take();
+        self.statistics_snapshot_fingerprint.take();
     }
 
     pub fn physical_exprs(&self) -> &[PhysicalExprId] {
@@ -1073,6 +1087,8 @@ impl Memo {
             schema,
             logical_properties,
             cardinality,
+            logical_fact_fingerprint: OnceLock::new(),
+            statistics_snapshot_fingerprint: OnceLock::new(),
             logical_exprs: Vec::new(),
             logical_expression_version: 0,
             physical_exprs: Vec::new(),
@@ -1159,7 +1175,9 @@ impl Memo {
 
     pub fn group_mut(&mut self, id: GroupId) -> Option<&mut Group> {
         let id = self.canonical_group(id);
-        self.groups.get_mut(id.index())
+        let group = self.groups.get_mut(id.index())?;
+        group.invalidate_fact_fingerprints();
+        Some(group)
     }
 
     /// Resolve a group's canonical cardinality recipe and clamp it by every
@@ -1666,6 +1684,8 @@ impl Memo {
 
         let (canonical_group, secondary_group) =
             two_groups_mut(&mut self.groups, canonical.index(), secondary.index());
+        canonical_group.invalidate_fact_fingerprints();
+        secondary_group.invalidate_fact_fingerprints();
         // Equivalent expressions can establish different conservative row
         // bounds (for example, a decorrelated plan can prove a tighter cap
         // than its dependent form). Both proofs describe the same relation,
