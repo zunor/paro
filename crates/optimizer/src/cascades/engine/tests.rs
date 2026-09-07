@@ -1440,6 +1440,103 @@ fn application_only_fact_reads_wake_a_completed_negative_match() {
 }
 
 #[test]
+fn equal_resolved_fact_values_refresh_cursors_without_reapplying() {
+    struct ReadValueFacts {
+        group: GroupId,
+        calls: Arc<AtomicUsize>,
+        value: Arc<AtomicUsize>,
+    }
+    impl TransformationRule for ReadValueFacts {
+        fn id(&self) -> RuleId {
+            RuleId(905)
+        }
+        fn matches_root(&self, expression: &super::super::memo::LogicalExpr) -> bool {
+            expression.key.operator == Fingerprint(10)
+        }
+        fn matches(
+            &self,
+            expression: &super::super::memo::LogicalExpr,
+            _: &RuleContext<'_>,
+        ) -> bool {
+            self.matches_root(expression)
+        }
+        fn binding_fact_value(
+            &self,
+            _: &PatternBinding,
+            context: &mut TransformContext<'_>,
+        ) -> Result<Option<Fingerprint>> {
+            context.record_fact_read(PatternRead::from_group(context.memo(), self.group)?);
+            Ok(Some(Fingerprint(self.value.load(Ordering::SeqCst) as u128)))
+        }
+        fn apply(
+            &self,
+            _: LogicalExprId,
+            context: &mut TransformContext<'_>,
+        ) -> Result<Box<[EquivalentExpression]>> {
+            context.record_fact_read(PatternRead::from_group(context.memo(), self.group)?);
+            context.record_fact_value(Fingerprint(self.value.load(Ordering::SeqCst) as u128));
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            Ok(Box::new([]))
+        }
+    }
+
+    let mut budget = super::super::budget::SearchBudget::default();
+    budget.disable_transformation(RuleId(5));
+    let (mut engine, root, _) = engine_with_budget(budget);
+    let evidence = engine.memo_mut().create_group(
+        schema(),
+        LogicalProperties::default(),
+        GroupCardinality::default(),
+    );
+    let calls = Arc::new(AtomicUsize::new(0));
+    let value = Arc::new(AtomicUsize::new(777));
+    engine
+        .registry
+        .register_transformation(ReadValueFacts {
+            group: evidence,
+            calls: calls.clone(),
+            value: value.clone(),
+        })
+        .unwrap();
+    engine.explore_transformations().unwrap();
+    assert_eq!(calls.load(Ordering::SeqCst), 1);
+
+    engine
+        .memo_mut()
+        .insert_logical(
+            evidence,
+            LogicalExprKey {
+                operator: Fingerprint(61),
+                scalars: Box::new([]),
+                children: Box::new([]),
+            },
+            LogicalPayloadId(61),
+            EquivalenceProof::Initial,
+        )
+        .unwrap();
+    engine.explore_transformations().unwrap();
+    assert_eq!(
+        calls.load(Ordering::SeqCst),
+        1,
+        "a recipe-only revision with the same resolved fact value is a cache hit"
+    );
+    value.store(778, Ordering::SeqCst);
+    engine
+        .memo_mut()
+        .group_mut(evidence)
+        .unwrap()
+        .logical_properties
+        .maximum_cardinality = Some(1);
+    engine.explore_transformations().unwrap();
+    assert_eq!(
+        calls.load(Ordering::SeqCst),
+        2,
+        "a changed resolved fact value invalidates the cached application"
+    );
+    assert_eq!(engine.memo().group(root).unwrap().logical_exprs().len(), 1);
+}
+
+#[test]
 fn later_binding_observations_keep_all_application_fact_subscriptions() {
     let (mut engine, root, _) = engine_with_budget(super::super::budget::SearchBudget::default());
     let evidence = engine.memo_mut().create_group(

@@ -113,8 +113,7 @@ impl StableAgenda {
     }
 
     fn pop(&mut self) -> Option<SearchTask> {
-        let key = self.tasks.keys().next().copied()?;
-        self.tasks.remove(&key)
+        self.tasks.pop_first().map(|(_, task)| task)
     }
 }
 
@@ -155,10 +154,14 @@ impl EnforcerCostInput {
     }
 }
 
-type BindingApplications = BTreeMap<
-    (TransformationTaskId, Fingerprint),
-    Vec<(super::rules::PatternBinding, Box<[PatternRead]>)>,
->;
+#[derive(Debug, Clone)]
+struct BindingApplication {
+    binding: super::rules::PatternBinding,
+    reads: Box<[PatternRead]>,
+    fact_value: Option<Fingerprint>,
+}
+
+type BindingApplications = BTreeMap<(TransformationTaskId, Fingerprint), Vec<BindingApplication>>;
 
 /// The engine is deliberately operator-agnostic. Domain implementations live
 /// in the registry; this type owns stable scheduling, budgets, enforcement,
@@ -402,22 +405,16 @@ impl CascadesEngine {
                 expression,
                 rule,
             };
-            let (root_matches, budget_class) = {
+            let budget_class = {
                 let rule_impl = self
                     .registry
                     .transformation(rule)
                     .ok_or_else(|| paro_error::internal("rule disappeared from registry"))?;
-                let expression_ref = self.memo.logical_expr(expression).ok_or_else(|| {
+                self.memo.logical_expr(expression).ok_or_else(|| {
                     paro_error::internal("rule task references unknown expression")
                 })?;
-                (
-                    rule_impl.matches_root(expression_ref),
-                    rule_impl.budget_class(),
-                )
+                rule_impl.budget_class()
             };
-            if !root_matches {
-                continue;
-            }
             // A zero fire budget cannot admit any transformation. Avoid
             // constructing dependency closures for work the caller has
             // explicitly disabled. Likewise, the legacy region-work budget
@@ -517,27 +514,81 @@ impl CascadesEngine {
             }
             for binding in binding_set.bindings.iter() {
                 let application_key = (task_id, binding.fingerprint);
-                let mut already_applied = false;
-                if let Some(applications) = self.transformation_applications.get(&application_key) {
-                    for (previous, reads) in applications {
-                        if previous != binding {
-                            continue;
-                        }
-                        let mut current = true;
-                        for read in reads {
-                            if !read.is_current(&self.memo)? {
-                                current = false;
-                                break;
-                            }
-                        }
-                        if current {
-                            already_applied = true;
+                let previous_application = self
+                    .transformation_applications
+                    .get(&application_key)
+                    .and_then(|applications| {
+                        applications
+                            .iter()
+                            .find(|application| application.binding == *binding)
+                    })
+                    .cloned();
+                let previous_is_current = if let Some(previous) = &previous_application {
+                    let mut current = true;
+                    for read in &previous.reads {
+                        if !read.is_current(&self.memo)? {
+                            current = false;
                             break;
                         }
                     }
-                }
-                if already_applied {
+                    current
+                } else {
+                    false
+                };
+                if previous_is_current {
                     continue;
+                }
+                // A revision is only a wake-up cursor. If the resolved facts
+                // retain the same canonical value, advance the cursor and keep
+                // the previous result instead of executing the rule again.
+                if let Some(previous_value) = previous_application
+                    .as_ref()
+                    .and_then(|previous| previous.fact_value)
+                {
+                    let mut validation = TransformContext::new(&mut self.memo, group);
+                    let current_value = self
+                        .registry
+                        .transformation(rule)
+                        .ok_or_else(|| paro_error::internal("transformation disappeared"))?
+                        .binding_fact_value(binding, &mut validation)?;
+                    let fact_reads = validation.take_fact_reads();
+                    drop(validation);
+                    if current_value == Some(previous_value) {
+                        let mut reads = self
+                            .registry
+                            .transformation(rule)
+                            .ok_or_else(|| paro_error::internal("transformation disappeared"))?
+                            .binding_reads(
+                                binding,
+                                &binding_set.reads,
+                                &RuleContext {
+                                    memo: &self.memo,
+                                    group,
+                                },
+                            )?
+                            .into_vec();
+                        reads.extend(fact_reads.iter().copied());
+                        let reads = reads.into_boxed_slice();
+                        Self::merge_transformation_fact_reads(
+                            &self.memo,
+                            &mut self.transformation_fact_observations,
+                            task_id,
+                            &fact_reads,
+                        )?;
+                        self.seed_transformation_observation(task_id, &reads)?;
+                        if let Some(application) = self
+                            .transformation_applications
+                            .get_mut(&application_key)
+                            .and_then(|applications| {
+                                applications
+                                    .iter_mut()
+                                    .find(|application| application.binding == *binding)
+                            })
+                        {
+                            application.reads = reads;
+                        }
+                        continue;
+                    }
                 }
                 // Keep one current observation per exact binding, including
                 // hash-collision peers. Obsolete fact versions are not search
@@ -545,7 +596,7 @@ impl CascadesEngine {
                 if let Some(applications) =
                     self.transformation_applications.get_mut(&application_key)
                 {
-                    applications.retain(|(previous, _)| previous != binding);
+                    applications.retain(|application| application.binding != *binding);
                 }
                 let mut application_reads = self
                     .registry
@@ -628,33 +679,16 @@ impl CascadesEngine {
                         .ok_or_else(|| paro_error::internal("rule disappeared from registry"))?;
                     rule_impl.apply_binding(binding, &mut context)
                 };
+                let fact_value = context.fact_value_fingerprint();
                 let fact_reads = context.take_fact_reads();
                 application_reads.extend(fact_reads.iter().copied());
                 let application_reads = application_reads.into_boxed_slice();
-                if !fact_reads.is_empty() {
-                    self.transformation_fact_observations
-                        .entry(task_id)
-                        .or_default();
-                    let mut reads = self.transformation_fact_observations[&task_id]
-                        .iter()
-                        .map(|read| (read.group, *read))
-                        .collect::<BTreeMap<_, _>>();
-                    for read in fact_reads {
-                        // A facts-only access must not downgrade an earlier
-                        // frontier access made by another binding of this task.
-                        let read = if reads
-                            .get(&read.group)
-                            .is_some_and(|previous| previous.logical_frontier_revision.is_some())
-                        {
-                            PatternRead::from_group(context.memo(), read.group)?
-                        } else {
-                            read
-                        };
-                        reads.insert(read.group, read);
-                    }
-                    self.transformation_fact_observations
-                        .insert(task_id, reads.into_values().collect());
-                }
+                Self::merge_transformation_fact_reads(
+                    context.memo(),
+                    &mut self.transformation_fact_observations,
+                    task_id,
+                    &fact_reads,
+                )?;
                 let outputs = match outputs_result {
                     Ok(outputs) => outputs,
                     Err(error) => {
@@ -684,7 +718,11 @@ impl CascadesEngine {
                     self.transformation_applications
                         .entry(application_key)
                         .or_default()
-                        .push((binding.clone(), application_reads));
+                        .push(BindingApplication {
+                            binding: binding.clone(),
+                            reads: application_reads,
+                            fact_value,
+                        });
                     release_transformation_output_reservations(
                         &mut self.memo,
                         group,
@@ -818,6 +856,7 @@ impl CascadesEngine {
                         output_dimension,
                     )?;
                 } else {
+                    let newly_inserted_expressions = inserted_expressions.clone();
                     let appended_groups = context.commit()?;
                     release_transformation_output_reservations(
                         &mut self.memo,
@@ -850,7 +889,7 @@ impl CascadesEngine {
                                 .map(|group| PatternRead::from_group(&self.memo, group))
                                 .collect::<Result<Vec<_>>>()?,
                         );
-                        for (owner, inserted) in inserted_expressions {
+                        for (owner, inserted) in inserted_expressions.iter().copied() {
                             self.seed_transformation_observation(
                                 TransformationTaskId {
                                     group: owner,
@@ -861,8 +900,14 @@ impl CascadesEngine {
                             )?;
                         }
                     }
-                    inserted_groups.extend(appended_groups);
+                    inserted_groups.extend(appended_groups.iter().copied());
                     inserted_groups.extend(self.memo.take_changed_cte_readers());
+                    for (owner, inserted) in newly_inserted_expressions {
+                        self.schedule_transformation_expression(owner, inserted, &mut agenda)?;
+                    }
+                    for appended in appended_groups.iter().copied() {
+                        self.schedule_transformations(appended, &mut agenda)?;
+                    }
                 }
                 let mut observed = binding_set.reads.to_vec();
                 observed.extend(application_reads.iter().copied());
@@ -870,9 +915,12 @@ impl CascadesEngine {
                 self.transformation_applications
                     .entry(application_key)
                     .or_default()
-                    .push((binding.clone(), application_reads));
+                    .push(BindingApplication {
+                        binding: binding.clone(),
+                        reads: application_reads,
+                        fact_value,
+                    });
                 for target in inserted_groups {
-                    self.schedule_transformations(target, &mut agenda)?;
                     self.schedule_transformation_dependents(target, &mut agenda)?;
                 }
             }
@@ -894,33 +942,48 @@ impl CascadesEngine {
             .group(group)
             .ok_or_else(|| paro_error::internal("cannot schedule an unknown Memo group"))?;
         for &expression in group_ref.logical_exprs() {
-            let expression_ref = self.memo.logical_expr(expression).unwrap();
-            let context = RuleContext {
-                memo: &self.memo,
+            self.schedule_transformation_expression(group, expression, agenda)?;
+        }
+        Ok(())
+    }
+
+    fn schedule_transformation_expression(
+        &self,
+        group: GroupId,
+        expression: LogicalExprId,
+        agenda: &mut StableAgenda,
+    ) -> Result<()> {
+        let expression_ref = self
+            .memo
+            .logical_expr(expression)
+            .ok_or_else(|| paro_error::internal("cannot schedule an unknown logical expression"))?;
+        let context = RuleContext {
+            memo: &self.memo,
+            group,
+        };
+        for rule in self.registry.transformations() {
+            if !self.memo.budget().transformation_enabled(rule.id())
+                || !rule.matches_root(expression_ref)
+            {
+                continue;
+            }
+            let promise = rule.promise(expression_ref, &context);
+            let key = TaskKey {
+                priority: promise.priority,
+                kind: TaskKind::Transform,
+                stable_id: rule.id().0,
                 group,
+                expression,
+                goal: None,
             };
-            for rule in self.registry.transformations() {
-                if !self.memo.budget().transformation_enabled(rule.id()) {
-                    continue;
-                }
-                let promise = rule.promise(expression_ref, &context);
-                let key = TaskKey {
-                    priority: promise.priority,
-                    kind: TaskKind::Transform,
-                    stable_id: rule.id().0,
+            agenda.push(
+                key,
+                SearchTask::Transform {
                     group,
                     expression,
-                    goal: None,
-                };
-                agenda.push(
-                    key,
-                    SearchTask::Transform {
-                        group,
-                        expression,
-                        rule: rule.id(),
-                    },
-                );
-            }
+                    rule: rule.id(),
+                },
+            );
         }
         Ok(())
     }
@@ -933,9 +996,9 @@ impl CascadesEngine {
         let group = self.memo.canonical_group(group);
         let subscribers = self
             .transformation_subscribers
-            .iter()
-            .filter(|(observed, _)| self.memo.canonical_group(**observed) == group)
-            .flat_map(|(_, subscribers)| subscribers.iter().copied())
+            .get(&group)
+            .into_iter()
+            .flat_map(|subscribers| subscribers.iter().copied())
             .collect::<BTreeSet<_>>();
         for subscriber in subscribers {
             let expression_ref =
@@ -1048,6 +1111,38 @@ impl CascadesEngine {
         Ok(())
     }
 
+    fn merge_transformation_fact_reads(
+        memo: &Memo,
+        observations: &mut BTreeMap<TransformationTaskId, Box<[PatternRead]>>,
+        task: TransformationTaskId,
+        fact_reads: &[PatternRead],
+    ) -> Result<()> {
+        if fact_reads.is_empty() {
+            return Ok(());
+        }
+        let mut reads = observations
+            .get(&task)
+            .into_iter()
+            .flat_map(|reads| reads.iter())
+            .map(|read| (read.group, *read))
+            .collect::<BTreeMap<_, _>>();
+        for read in fact_reads.iter().copied() {
+            // A facts-only access must not downgrade an earlier frontier
+            // access made by another binding of this task.
+            let read = if reads
+                .get(&read.group)
+                .is_some_and(|previous| previous.logical_frontier_revision.is_some())
+            {
+                PatternRead::from_group(memo, read.group)?
+            } else {
+                read
+            };
+            reads.insert(read.group, read);
+        }
+        observations.insert(task, reads.into_values().collect());
+        Ok(())
+    }
+
     fn enumerate_implementations(&mut self, group: GroupId, goal: OptimizationGoal) -> Result<()> {
         let group = self.memo.canonical_group(group);
         if !self.implemented_goals.insert((group, goal)) {
@@ -1063,6 +1158,13 @@ impl CascadesEngine {
         for expression in logical_exprs {
             let expression_ref = self.memo.logical_expr(expression).unwrap();
             for implementation in self.registry.implementations() {
+                let context = ImplementationContext {
+                    memo: &self.memo,
+                    group,
+                };
+                if !implementation.matches(expression_ref, goal, &context) {
+                    continue;
+                }
                 let promise = implementation.promise(expression_ref, goal);
                 let key = TaskKey {
                     priority: promise.priority,
@@ -1099,16 +1201,13 @@ impl CascadesEngine {
                     .registry
                     .implementation(implementation)
                     .ok_or_else(|| paro_error::internal("implementation disappeared"))?;
-                let expression_ref = self.memo.logical_expr(expression).ok_or_else(|| {
+                self.memo.logical_expr(expression).ok_or_else(|| {
                     paro_error::internal("implementation task references unknown expression")
                 })?;
                 let context = ImplementationContext {
                     memo: &self.memo,
                     group,
                 };
-                if !implementation_ref.matches(expression_ref, goal, &context) {
-                    continue;
-                }
                 implementation_ref
                     .candidates(expression, goal, &context)?
                     .into_vec()

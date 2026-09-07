@@ -55,6 +55,45 @@ impl CachedFacts {
 }
 
 impl BoundarySnapshot {
+    /// Canonical value identity for every bound relational boundary. Group and
+    /// expression ids are deliberately excluded: the binding fingerprint owns
+    /// operator identity, while this value owns only transported facts.
+    pub(super) fn binding_value_fingerprint(
+        &self,
+        memo: &Memo,
+        binding: &PatternOperand,
+    ) -> Result<Fingerprint> {
+        let mut groups = BTreeSet::new();
+        let mut pending = vec![binding];
+        while let Some(operand) = pending.pop() {
+            let group = match operand {
+                PatternOperand::Group(group) => *group,
+                PatternOperand::Expression {
+                    group, children, ..
+                } => {
+                    pending.extend(children.iter());
+                    *group
+                }
+            };
+            groups.insert(memo.canonical_group(group));
+        }
+        let mut values = Vec::with_capacity(groups.len());
+        for group in groups {
+            let mut value = StableFingerprintBuilder::default();
+            value.write_bytes(b"paro.memo.boundary-value.v1");
+            self.encode_group(group, &mut value)?;
+            values.push(value.finish());
+        }
+        values.sort_unstable();
+        let mut encoder = StableFingerprintBuilder::default();
+        encoder.write_bytes(b"paro.memo.boundary-binding-value.v1");
+        encoder.write_u64(values.len() as u64);
+        for value in values {
+            encoder.write_fingerprint(value);
+        }
+        Ok(encoder.finish())
+    }
+
     /// Encode resolved boundary evidence, not internal binary join shape or
     /// the revisions of unrelated alternatives. A changed inherited input
     /// invalidates graph reuse exactly when its consumed facts change.

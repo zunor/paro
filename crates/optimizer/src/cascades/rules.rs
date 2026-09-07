@@ -311,6 +311,7 @@ pub struct TransformContext<'a> {
     memo_savepoint: Option<super::memo::TransformationSavepoint>,
     sidecar_rollbacks: Vec<TransformationRollback>,
     fact_reads: BTreeMap<GroupId, PatternRead>,
+    fact_value_fingerprint: Option<Fingerprint>,
 }
 
 impl<'a> TransformContext<'a> {
@@ -321,6 +322,7 @@ impl<'a> TransformContext<'a> {
             memo_savepoint: None,
             sidecar_rollbacks: Vec::new(),
             fact_reads: BTreeMap::new(),
+            fact_value_fingerprint: None,
         }
     }
 
@@ -374,6 +376,17 @@ impl<'a> TransformContext<'a> {
 
     pub(crate) fn take_fact_reads(&mut self) -> Vec<PatternRead> {
         std::mem::take(&mut self.fact_reads).into_values().collect()
+    }
+
+    /// Record the canonical value of the facts consumed by this binding.
+    /// Revalidation may then advance revision cursors without re-running the
+    /// transformation when a different fact recipe resolves to the same value.
+    pub fn record_fact_value(&mut self, fingerprint: Fingerprint) {
+        self.fact_value_fingerprint = Some(fingerprint);
+    }
+
+    pub(crate) fn fact_value_fingerprint(&self) -> Option<Fingerprint> {
+        self.fact_value_fingerprint
     }
 
     /// Obtain the bounded transformation writer. The Memo snapshot is created
@@ -470,6 +483,19 @@ pub trait TransformationRule: Send + Sync {
         _ctx: &RuleContext<'_>,
     ) -> Result<Box<[PatternRead]>> {
         Ok(discovery_reads.into())
+    }
+
+    /// Resolve the canonical value of facts consumed by one binding. This is
+    /// called only after an earlier application's revision cursor became
+    /// stale. Returning the same value proves the prior result (including a
+    /// no-match) remains valid and avoids repeating the rewrite. The default
+    /// retains revision-based invalidation for rules without value facts.
+    fn binding_fact_value(
+        &self,
+        _binding: &PatternBinding,
+        _ctx: &mut TransformContext<'_>,
+    ) -> Result<Option<Fingerprint>> {
+        Ok(None)
     }
 
     /// Allocation-free dispatch predicate over the immutable expression

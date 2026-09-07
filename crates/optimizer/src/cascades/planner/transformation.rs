@@ -149,6 +149,29 @@ impl TransformationRule for PlannerTransformationRule {
             .collect()
     }
 
+    fn binding_fact_value(
+        &self,
+        binding: &PatternBinding,
+        ctx: &mut TransformContext<'_>,
+    ) -> Result<Option<Fingerprint>> {
+        let state = self
+            .planner_state
+            .read()
+            .map_err(|_| paro_error::internal("planner transform state poisoned"))?;
+        let Some(facts) = boundary::BoundarySnapshot::read(
+            ctx,
+            &state,
+            &binding.root,
+            self.budget_class().work_dimension(),
+        )?
+        else {
+            return Ok(None);
+        };
+        Ok(Some(
+            facts.binding_value_fingerprint(ctx.memo(), &binding.root)?,
+        ))
+    }
+
     fn output_bound(&self, ctx: &RuleContext<'_>) -> usize {
         if matches!(
             self.transformation,
@@ -165,14 +188,14 @@ impl TransformationRule for PlannerTransformationRule {
             self.transformation,
             PlannerTransformation::JoinRegionEnumeration
                 | PlannerTransformation::AggregateDimensionDeferral
+                | PlannerTransformation::AggregateDimensionSharing
+                | PlannerTransformation::AggregateInputMaterialization
         )
     }
 
     fn matches_root(&self, expr: &crate::cascades::memo::LogicalExpr) -> bool {
-        if matches!(
-            self.transformation,
-            PlannerTransformation::JoinRegionEnumeration
-        ) && expression_is_only_rule_output(expr, self.id())
+        if self.output_saturates_observed_binding()
+            && expression_is_only_rule_output(expr, self.id())
         {
             return false;
         }
@@ -290,6 +313,7 @@ impl TransformationRule for PlannerTransformationRule {
             };
             facts
         };
+        ctx.record_fact_value(facts.binding_value_fingerprint(ctx.memo(), &binding.root)?);
         let region_identity = if matches!(
             self.transformation,
             PlannerTransformation::JoinRegionEnumeration
