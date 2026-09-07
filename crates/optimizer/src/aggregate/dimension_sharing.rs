@@ -66,7 +66,10 @@ struct OwnedBranch {
 /// Produce one root-local alternative that shares a compatible dimension
 /// attachment across two `UNION ALL` arms. Memo owns descendant enumeration;
 /// this rule consumes the exact pair of child alternatives in its binding.
-pub fn optimize_plan(plan: OwnedLogicalPlan, bind_context: &BindContext) -> Result<(OwnedLogicalPlan, bool)> {
+pub fn optimize_plan(
+    plan: OwnedLogicalPlan,
+    bind_context: &BindContext,
+) -> Result<(OwnedLogicalPlan, bool)> {
     let Some(witness) = recognize(&plan) else {
         return Ok((plan, false));
     };
@@ -975,7 +978,10 @@ mod tests {
         assert!(!grouping_constants_prove_distinct(&lower, &upper));
     }
 
-    fn defer_branch_aggregates(plan: OwnedLogicalPlan, bind_context: &BindContext) -> OwnedLogicalPlan {
+    fn defer_branch_aggregates(
+        plan: OwnedLogicalPlan,
+        bind_context: &BindContext,
+    ) -> OwnedLogicalPlan {
         plan.try_map_post_order(|plan| {
             let (plan, _) = dimension_deferral::optimize_plan(plan, bind_context)?;
             Ok(plan)

@@ -127,16 +127,18 @@ impl RelationStats {
 pub struct DistinctCount {
     /// The estimated distinct count.
     pub distinct_count: usize,
-    /// Whether this count came from HyperLogLog.
-    pub from_hll: bool,
+    /// Whether this is an expected domain at this relational boundary,
+    /// rather than a fallback derived only from a row/range upper estimate.
+    /// A Memo estimate need not own a storage HyperLogLog allocation.
+    pub has_expected_distinct: bool,
 }
 
 impl DistinctCount {
     /// Create a new distinct count.
-    pub fn new(distinct_count: usize, from_hll: bool) -> Self {
+    pub fn new(distinct_count: usize, has_expected_distinct: bool) -> Self {
         Self {
             distinct_count,
-            from_hll,
+            has_expected_distinct,
         }
     }
 }
@@ -379,6 +381,38 @@ impl RelationManager {
         }
     }
 
+    /// Local eligibility for a Memo operator payload. Descendant boundaries
+    /// are inspected by the native pattern on their own group edges.
+    pub(crate) fn join_shell_is_reorderable<Child>(join: &Join<Child>) -> bool {
+        if join.build_side_constraint() != JoinBuildSideConstraint::Either
+            || crate::expression::join_has_evaluation_fence(join)
+        {
+            return false;
+        }
+        match join {
+            Join::Cross(_) => true,
+            Join::Comparison(join) => {
+                join.duplicate_eliminated_columns.is_empty()
+                    && matches!(
+                        join.join_type,
+                        JoinType::Inner | JoinType::Semi | JoinType::Anti
+                    )
+                    && Self::comparison_has_binary_edge(join)
+            }
+            Join::Any(_) => false,
+        }
+    }
+
+    pub(crate) fn reduction_join_shell_is_reorderable<Child>(
+        join: &paro_planner::operator::ComparisonJoin<Child>,
+    ) -> bool {
+        matches!(join.join_type, JoinType::Semi | JoinType::Anti)
+            && join.build_side_constraint == JoinBuildSideConstraint::Either
+            && !crate::expression::comparison_join_has_evaluation_fence(join)
+            && join.duplicate_eliminated_columns.is_empty()
+            && Self::comparison_has_binary_edge(join)
+    }
+
     fn comparison_join_is_reorderable(join: &paro_planner::operator::ComparisonJoin) -> bool {
         !comparison_join_tree_has_evaluation_fence(join)
             && !Self::comparison_join_tree_has_build_side_boundary(join)
@@ -435,7 +469,9 @@ impl RelationManager {
             && Self::comparison_join_is_reorderable(join)
     }
 
-    fn comparison_has_binary_edge(join: &paro_planner::operator::ComparisonJoin) -> bool {
+    fn comparison_has_binary_edge<Child>(
+        join: &paro_planner::operator::ComparisonJoin<Child>,
+    ) -> bool {
         join.conditions.iter().any(|condition| {
             Self::expression_contains_column_ref(&condition.left)
                 && Self::expression_contains_column_ref(&condition.right)
@@ -1119,6 +1155,6 @@ mod tests {
     fn test_distinct_count() {
         let dc = DistinctCount::new(100, true);
         assert_eq!(dc.distinct_count, 100);
-        assert!(dc.from_hll);
+        assert!(dc.has_expected_distinct);
     }
 }

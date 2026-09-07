@@ -153,7 +153,7 @@ pub struct CardinalityHelper {
 struct BindingCardinalityStats {
     distinct_count: usize,
     relation_cardinality: usize,
-    from_hll: bool,
+    has_expected_distinct: bool,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -425,7 +425,7 @@ impl CardinalityEstimator {
                     BindingCardinalityStats {
                         distinct_count: count.distinct_count,
                         relation_cardinality: stats.cardinality,
-                        from_hll: count.from_hll,
+                        has_expected_distinct: count.has_expected_distinct,
                     },
                 )
             }));
@@ -513,11 +513,13 @@ impl CardinalityEstimator {
                     continue;
                 }
 
-                if distinct_count.from_hll && relation_to_tdom.has_distinct_count_hll {
+                if distinct_count.has_expected_distinct && relation_to_tdom.has_distinct_count_hll {
                     relation_to_tdom.distinct_count_hll = relation_to_tdom
                         .distinct_count_hll
                         .max(distinct_count.distinct_count);
-                } else if distinct_count.from_hll && !relation_to_tdom.has_distinct_count_hll {
+                } else if distinct_count.has_expected_distinct
+                    && !relation_to_tdom.has_distinct_count_hll
+                {
                     relation_to_tdom.has_distinct_count_hll = true;
                     relation_to_tdom.distinct_count_hll = distinct_count.distinct_count;
                 } else {
@@ -763,7 +765,7 @@ impl CardinalityEstimator {
                     continue;
                 }
                 let distinct = binding_stats.get(&vertex.binding).map(|binding| {
-                    if binding.from_hll {
+                    if binding.has_expected_distinct {
                         DistinctDomainEstimate::observed(binding.distinct_count)
                     } else {
                         DistinctDomainEstimate::upper_bound(binding.distinct_count)
@@ -1086,16 +1088,17 @@ impl CardinalityEstimator {
                         let domain_fraction = (filtering.distinct_count as f64
                             / preserved.distinct_count.max(filtering.distinct_count) as f64)
                             .clamp(0.0, 1.0);
-                        // Two boundary-observed HLLs estimate key coverage
-                        // directly. An inherited or synthetic domain is only
+                        // Two boundary-domain estimates estimate key coverage
+                        // directly. An inherited or synthetic fallback is only
                         // an upper bound: it may tighten the configured prior,
                         // but must not inflate that prior as if the derived
                         // relation had been observed after its filters.
-                        let matched_fraction = if preserved.from_hll && filtering.from_hll {
-                            domain_fraction
-                        } else {
-                            domain_fraction.min(self.selectivity_defaults.semi_anti_match)
-                        };
+                        let matched_fraction =
+                            if preserved.has_expected_distinct && filtering.has_expected_distinct {
+                                domain_fraction
+                            } else {
+                                domain_fraction.min(self.selectivity_defaults.semi_anti_match)
+                            };
                         (
                             matched_fraction,
                             1.0 / preserved.relation_cardinality.max(1) as f64,

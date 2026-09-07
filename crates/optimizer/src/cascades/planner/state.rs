@@ -18,7 +18,9 @@ pub(super) struct PlannerRegionScope(Arc<PlannerRegionScopeNode>);
 #[derive(Debug)]
 struct PlannerRegionScopeNode {
     group: GroupId,
-    children: Box<[PlannerRegionScope]>,
+    /// None is a native Memo reference, not an empty subtree. Its descendant
+    /// closure is read only if a real facet asks to materialize this scope.
+    children: Option<Box<[PlannerRegionScope]>>,
 }
 
 impl PlannerRegionScope {
@@ -28,20 +30,50 @@ impl PlannerRegionScope {
     ) -> Self {
         Self(Arc::new(PlannerRegionScopeNode {
             group,
-            children: children.into_iter().collect(),
+            children: Some(children.into_iter().collect()),
+        }))
+    }
+
+    pub(super) fn group(group: GroupId) -> Self {
+        Self(Arc::new(PlannerRegionScopeNode {
+            group,
+            children: None,
         }))
     }
 
     /// Materialize at most `ceiling + 1` unique groups. The overflow witness
     /// rejects an oversized facet without walking the remainder of its tree.
-    pub(super) fn materialize_bounded(&self, ceiling: usize) -> (BTreeSet<GroupId>, bool) {
+    pub(super) fn materialize_bounded(
+        &self,
+        memo: &Memo,
+        ceiling: usize,
+    ) -> (BTreeSet<GroupId>, bool) {
         let mut groups = BTreeSet::new();
         let mut pending = vec![self.clone()];
+        let mut scopes_seen = BTreeSet::new();
+        let mut memo_seen = BTreeSet::new();
         while let Some(scope) = pending.pop() {
-            if groups.insert(scope.0.group) && groups.len() > ceiling {
+            if scope.0.children.is_some() && !scopes_seen.insert(Arc::as_ptr(&scope.0) as usize) {
+                continue;
+            }
+            let group = memo.canonical_group(scope.0.group);
+            if groups.insert(group) && groups.len() > ceiling {
                 return (groups, true);
             }
-            pending.extend(scope.0.children.iter().cloned());
+            if let Some(children) = &scope.0.children {
+                pending.extend(children.iter().cloned());
+            } else if memo_seen.insert(group) {
+                if let Some(group) = memo.group(group) {
+                    pending.extend(
+                        group
+                            .logical_exprs()
+                            .iter()
+                            .filter_map(|expression| memo.logical_expr(*expression))
+                            .flat_map(|expression| expression.key.children.iter().copied())
+                            .map(Self::group),
+                    );
+                }
+            }
         }
         (groups, false)
     }
@@ -51,7 +83,7 @@ impl PlannerRegionScope {
 pub(super) struct PlannerLogicalPayload {
     /// Binding-based operator semantics. Positional projection maps and input
     /// slots are derived only after winner selection.
-    pub(super) semantic_template: OwnedLogicalPlan,
+    pub(super) semantic_template: paro_planner::plan::arena::LogicalPlanNode<()>,
     /// Exact canonical encoding of this operator shell. The Memo hashes this
     /// value for lookup but compares the bytes before declaring equivalence.
     pub(super) operator_encoding: Box<[u8]>,
@@ -111,6 +143,10 @@ pub(super) struct PlannerTransformState {
     /// revision and exact child fact identities validate every cache read.
     pub(super) boundary_cache: std::sync::Mutex<super::boundary::BoundaryFactCache>,
     pub(super) join_region_insertions: Vec<(GroupId, Box<[u8]>)>,
+    pub(super) cte_restrictions: Vec<super::transformation::cte::CteRestriction>,
+    pub(super) cte_partition_labels: super::transformation::cte::PartitionLabels,
+    pub(super) cte_bindings: Vec<super::transformation::cte::NativeCteBinding>,
+    pub(super) settlement_cache: super::transformation::settlement::SettlementCache,
     pub(super) binder: Option<Binder>,
     pub(super) bind_context: BindContext,
     pub(super) session: Option<Arc<paro_context::StatementContext>>,
@@ -129,6 +165,7 @@ pub(super) struct PlannerTransformSavepoint {
     expression_group_insertion_count: usize,
     metadata_runtime_filter_change_count: usize,
     join_region_insertion_count: usize,
+    cte_restriction_count: usize,
 }
 
 impl PlannerTransformState {
@@ -142,10 +179,13 @@ impl PlannerTransformState {
             expression_group_insertion_count: self.expression_group_insertions.len(),
             metadata_runtime_filter_change_count: self.metadata_runtime_filter_changes.len(),
             join_region_insertion_count: self.join_region_insertions.len(),
+            cte_restriction_count: self.cte_restrictions.len(),
         }
     }
 
     pub(super) fn rollback_to(&mut self, savepoint: PlannerTransformSavepoint) -> Result<()> {
+        self.cte_restrictions
+            .truncate(savepoint.cte_restriction_count);
         while self.join_region_insertions.len() > savepoint.join_region_insertion_count {
             let key = self
                 .join_region_insertions
@@ -300,7 +340,7 @@ pub(super) struct PlannerOperatorMetadata {
     pub(super) baseline_payload: PhysicalPayloadId,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub(super) struct PlannerBindingLayout {
     pub(super) bindings: Box<[ColumnBinding]>,
     pub(super) types: Box<[LogicalType]>,

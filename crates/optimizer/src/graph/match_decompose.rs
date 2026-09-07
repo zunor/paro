@@ -300,8 +300,11 @@ mod tests {
         let mut decompose = GraphMatchDecompose::new();
         let result = decompose.optimize(plan);
 
-        crate::verify::verify_logical_plan(&BindContext::new(), &OwnedLogicalPlan::synthetic(result))
-            .expect("decomposed graph projection should satisfy logical invariants");
+        crate::verify::verify_logical_plan(
+            &BindContext::new(),
+            &OwnedLogicalPlan::synthetic(result),
+        )
+        .expect("decomposed graph projection should satisfy logical invariants");
     }
 
     #[test]

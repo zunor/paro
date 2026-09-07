@@ -26,7 +26,10 @@ impl LimitPushdown {
         self.optimize_plan_with_change(plan).0
     }
 
-    pub fn optimize_plan_with_change(&mut self, plan: OwnedLogicalPlan) -> (OwnedLogicalPlan, bool) {
+    pub fn optimize_plan_with_change(
+        &mut self,
+        plan: OwnedLogicalPlan,
+    ) -> (OwnedLogicalPlan, bool) {
         let mut changed = false;
         let plan = plan.map_children(|child| {
             let (child, child_changed) = self.optimize_plan_with_change(child);

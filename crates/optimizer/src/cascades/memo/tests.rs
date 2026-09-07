@@ -418,9 +418,7 @@ fn exact_tie_keeps_the_mandatory_expression_ahead_of_ephemeral_fingerprints() {
 
 #[test]
 fn winner_frontier_retains_non_dominated_resource_tradeoffs() {
-    let mut budget = SearchBudget::default();
-    budget.max_pareto_winners_per_goal = 4;
-    let mut memo = Memo::new(budget);
+    let mut memo = Memo::new(SearchBudget::default());
     let group = memo.create_group(
         schema(1),
         LogicalProperties::default(),
@@ -459,7 +457,10 @@ fn winner_frontier_retains_non_dominated_resource_tradeoffs() {
         grant: GrantGoalKey::Invariant(AdmissibleGrantSetId(0)),
         context: OptimizationContextId(0),
     };
-    for (score, memory, fingerprint) in [(1.0, 100, 1), (2.0, 10, 2), (3.0, 200, 3)] {
+    // More than the old fixed frontier capacity. None of these memory/work
+    // tradeoffs can be discarded without knowing the parent context.
+    let tradeoffs = (1_u64..=16).map(|rank| (rank as f64, 1000 - rank * 50, u128::from(rank)));
+    for (score, memory, fingerprint) in tradeoffs.chain([(100.0, 2000, 100)]) {
         let cost = SearchCost {
             score: ScoreSummary {
                 range: CompactRange::point(score).unwrap(),
@@ -492,7 +493,7 @@ fn winner_frontier_retains_non_dominated_resource_tradeoffs() {
         .unwrap();
     }
     let frontier = memo.group(group).unwrap().winner_frontier(goal).unwrap();
-    assert_eq!(frontier.candidates().len(), 2);
+    assert_eq!(frontier.candidates().len(), 16);
     assert_eq!(
         frontier.selected().unwrap().physical_fingerprint,
         Fingerprint(1)
@@ -591,7 +592,7 @@ fn frontier_and_admission_share_the_same_objective_contract() {
         grant: GrantGoalKey::Invariant(AdmissibleGrantSetId(0)),
         context: OptimizationContextId(0),
     };
-    let mut frontier = WinnerFrontier::new(8);
+    let mut frontier = WinnerFrontier::default();
     frontier.insert(goal, latency.clone());
     frontier.insert(goal, robust.clone());
     assert_eq!(

@@ -173,7 +173,10 @@ impl FilterPushdown {
         }
 
         let expressions: Vec<Expression> = self.filters.drain(..).map(|f| f.filter).collect();
-        LogicalOperator::Filter(PlannerFilter::new(OwnedLogicalPlan::synthetic(op), expressions))
+        LogicalOperator::Filter(PlannerFilter::new(
+            OwnedLogicalPlan::synthetic(op),
+            expressions,
+        ))
     }
 
     fn empty_result(plan: OwnedLogicalPlan) -> OwnedLogicalPlan {
@@ -1084,9 +1087,9 @@ impl FilterPushdown {
             if left_pushdown.add_filter(left) == FilterResult::Unsatisfiable
                 || right_pushdown.add_filter(right) == FilterResult::Unsatisfiable
             {
-                return Self::empty_result(OwnedLogicalPlan::synthetic(LogicalOperator::SetOperation(
-                    setop,
-                )))
+                return Self::empty_result(OwnedLogicalPlan::synthetic(
+                    LogicalOperator::SetOperation(setop),
+                ))
                 .into_operator();
             }
         }

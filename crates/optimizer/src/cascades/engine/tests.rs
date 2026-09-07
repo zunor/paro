@@ -32,6 +32,9 @@ use crate::cascades::rules::{
 };
 use crate::physical::ObjectiveProfile;
 
+#[path = "tests/closure.rs"]
+mod closure;
+
 #[test]
 fn streaming_task_supply_is_inherited_from_the_child_pipeline() {
     let calibration = MachineCalibrationBundle::default();
@@ -468,7 +471,7 @@ impl TransformationRule for AddBoundedFrontier {
         RuleId(9)
     }
 
-    fn output_bound(&self, _: &RuleContext<'_>) -> usize {
+    fn output_bound(&self, _: &PatternBinding, _: &RuleContext<'_>) -> usize {
         2
     }
 
@@ -1049,6 +1052,48 @@ fn zero_rule_budget_precedes_dependency_observation() {
 
     assert!(engine.transformation_observations.is_empty());
     assert!(engine.transformation_subscribers.is_empty());
+    assert!(!engine.memo().search_obligations().is_empty());
+}
+
+#[test]
+fn shared_child_product_is_lazy_and_uses_immutable_candidate_references() {
+    let (engine, group, goal) = engine(8);
+    let candidate = ChildWinnerRef {
+        group,
+        goal,
+        candidate: crate::cascades::ids::CandidateId::new(0),
+    };
+    let frontiers = vec![vec![candidate; 2]; 64];
+    let mut batch = child_winner_combinations(frontiers, 8);
+    assert!(matches!(
+        batch.completion,
+        EnumerationCompletion::BudgetLimited {
+            first_omitted_ordinal: 8,
+            ..
+        }
+    ));
+    assert_eq!(
+        batch.combinations.len(),
+        9,
+        "eight candidates plus one denial witness"
+    );
+    assert_eq!(
+        batch
+            .combinations
+            .frontiers
+            .iter()
+            .map(Vec::len)
+            .sum::<usize>(),
+        128
+    );
+    assert!(batch
+        .combinations
+        .all(|combination| combination.len() == 64));
+    assert_eq!(
+        engine.memo().group_count(),
+        1,
+        "enumeration cannot allocate Memo nodes"
+    );
 }
 
 #[test]
@@ -1348,6 +1393,17 @@ fn failed_optional_transformation_rolls_back_and_keeps_baseline() {
 
     assert_eq!(winner.physical_fingerprint, Fingerprint(10));
     assert_eq!(engine.memo.group_count(), groups_before);
+    assert!(
+        engine
+            .memo
+            .search_obligations()
+            .iter()
+            .any(|obligation| matches!(
+                obligation.reason,
+                super::super::budget::SearchIncompleteReason::RuleFailure { .. }
+            )),
+        "an advisory failure is not a complete search"
+    );
     assert_eq!(
         engine
             .memo
@@ -2905,7 +2961,7 @@ fn parent_costs_every_source_sensitive_child_frontier_candidate() {
         .memo()
         .group(child)
         .unwrap()
-        .winner_frontier(goal)
+        .winner_frontier(winner.children[0].goal)
         .unwrap()
         .candidates()
         .iter()
@@ -2941,11 +2997,27 @@ fn parent_costs_every_source_sensitive_child_frontier_candidate() {
             .memo()
             .group(child)
             .unwrap()
-            .winner_frontier(goal)
+            .winner_frontier(winner.children[0].goal)
             .unwrap()
             .candidates()
             .len(),
         2
+    );
+    assert_ne!(winner.children[0].goal.context, goal.context);
+    // A closed consumer cannot filter the source, so the locally dominated
+    // response candidate is unnecessary there. The independent parent oracle
+    // above still consumes both candidates in its explicit filter context.
+    engine.optimize(child, goal, SearchMode::Direct).unwrap();
+    assert_eq!(
+        engine
+            .memo()
+            .group(child)
+            .unwrap()
+            .winner_frontier(goal)
+            .unwrap()
+            .candidates()
+            .len(),
+        1
     );
 }
 
@@ -3260,7 +3332,7 @@ fn child_product_cutoff_records_budget_limited_completion() {
             .memo()
             .group(child)
             .unwrap()
-            .winner_frontier(goal)
+            .winner_frontier(winner.children[0].goal)
             .unwrap()
             .candidates()
             .len();

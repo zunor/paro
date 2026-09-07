@@ -34,6 +34,34 @@ fn test_grant_classes() -> [ResourceGrantClass; 1] {
 }
 
 #[test]
+fn persistent_region_scope_visits_shared_arena_nodes_once() {
+    let mut memo = Memo::new(SearchBudget::default());
+    let mut scope = None;
+    let mut expected = BTreeSet::new();
+    for _ in 0..40 {
+        let group = memo.create_group(
+            GroupSchema::new([]).unwrap(),
+            LogicalProperties::default(),
+            GroupCardinality::default(),
+        );
+        expected.insert(group);
+        scope = Some(PlannerRegionScope::new(
+            group,
+            scope
+                .into_iter()
+                .flat_map(|prior: PlannerRegionScope| [prior.clone(), prior]),
+        ));
+    }
+    let scope = scope.unwrap();
+    let (groups, overflow) = scope.materialize_bounded(&memo, 40);
+    assert!(!overflow);
+    assert_eq!(groups, expected);
+    let (groups, overflow) = scope.materialize_bounded(&memo, 8);
+    assert!(overflow);
+    assert_eq!(groups.len(), 9);
+}
+
+#[test]
 fn cross_product_memory_tracks_only_the_materialized_build_side() {
     let mut left = OwnedLogicalPlan::synthetic(LogicalOperator::ExpressionGet(ExpressionGet::new(
         0,
@@ -42,12 +70,13 @@ fn cross_product_memory_tracks_only_the_materialized_build_side() {
         vec![LogicalType::BigInt],
     )));
     left.stats.estimated_cardinality = Some(CardinalityEstimate::exact(1_000_000_000));
-    let mut right = OwnedLogicalPlan::synthetic(LogicalOperator::ExpressionGet(ExpressionGet::new(
-        1,
-        Vec::new(),
-        vec!["right".to_string()],
-        vec![LogicalType::BigInt],
-    )));
+    let mut right =
+        OwnedLogicalPlan::synthetic(LogicalOperator::ExpressionGet(ExpressionGet::new(
+            1,
+            Vec::new(),
+            vec!["right".to_string()],
+            vec![LogicalType::BigInt],
+        )));
     right.stats.estimated_cardinality = Some(CardinalityEstimate::exact(3));
     let mut product = OwnedLogicalPlan::synthetic(LogicalOperator::Join(Join::cross(left, right)));
     product.stats.estimated_cardinality = Some(CardinalityEstimate::exact(3_000_000_000));
@@ -1049,7 +1078,12 @@ fn integer_value_rows(rows: usize, columns: usize) -> Vec<Vec<Expression>> {
         .collect()
 }
 
-pub(super) fn test_base_get(table_index: usize, oid: u64, name: &str, rows: usize) -> OwnedLogicalPlan {
+pub(super) fn test_base_get(
+    table_index: usize,
+    oid: u64,
+    name: &str,
+    rows: usize,
+) -> OwnedLogicalPlan {
     let storage = Arc::new(
         TableFactory::default()
             .create_table(&[LogicalType::Integer])
@@ -1135,7 +1169,9 @@ fn direct_rowset_reference_admits_and_selects_runtime_filter_region() {
         PhysicalImplementationFlavor::HashJoinRuntimeFilter
     );
     assert_eq!(contract.owned_artifacts.len(), 1);
-    assert_eq!(contract.owned_artifacts[0].fingerprint, artifact);
+    // The region facet names a reusable definition; extraction instantiates
+    // it in the root execution occurrence, so it is not the runtime handle.
+    assert_ne!(contract.owned_artifacts[0].fingerprint, artifact);
     assert!(contract.region_owner.is_some());
     assert!(matches!(
         contract.origin,
@@ -1433,7 +1469,8 @@ fn nested_filters_share_one_ordered_source_work_lane() {
             Expression::Reference(ReferenceExpression::new(0, LogicalType::Integer)),
         )],
     );
-    let mut probe = OwnedLogicalPlan::synthetic(LogicalOperator::Join(Join::Comparison(first_join)));
+    let mut probe =
+        OwnedLogicalPlan::synthetic(LogicalOperator::Join(Join::Comparison(first_join)));
     probe.stats.estimated_cardinality = Some(CardinalityEstimate::exact(200));
     // The second build is selective at the 20,000-row source and its lineage
     // crosses the first join. Source-work composition owns one lane and
@@ -1450,7 +1487,8 @@ fn nested_filters_share_one_ordered_source_work_lane() {
             Expression::Reference(ReferenceExpression::new(0, LogicalType::Integer)),
         )],
     );
-    let mut plan = OwnedLogicalPlan::synthetic(LogicalOperator::Join(Join::Comparison(second_join)));
+    let mut plan =
+        OwnedLogicalPlan::synthetic(LogicalOperator::Join(Join::Comparison(second_join)));
     plan.stats.estimated_cardinality = Some(CardinalityEstimate::exact(20));
 
     let input = MemoBuilder::build(plan, BindContext::new(), SearchBudget::default())
@@ -1473,13 +1511,9 @@ fn union_all_probe_owns_one_runtime_filter_with_two_scan_consumers() {
     first.stats.estimated_cardinality = Some(CardinalityEstimate::exact(10_000));
     let mut second = test_base_get(1, 20_022, "second_probe", 10_000);
     second.stats.estimated_cardinality = Some(CardinalityEstimate::exact(10_000));
-    let mut union = OwnedLogicalPlan::synthetic(LogicalOperator::SetOperation(SetOperation::union(
-        2,
-        first,
-        second,
-        true,
-        vec![LogicalType::Integer],
-    )));
+    let mut union = OwnedLogicalPlan::synthetic(LogicalOperator::SetOperation(
+        SetOperation::union(2, first, second, true, vec![LogicalType::Integer]),
+    ));
     union.stats.estimated_cardinality = Some(CardinalityEstimate::exact(20_000));
     let mut build = test_base_get(3, 20_023, "build", 20);
     build.stats.estimated_cardinality = Some(CardinalityEstimate::exact(20));
@@ -1544,13 +1578,9 @@ fn build_left_semi_join_filters_every_union_all_probe_source() {
     first.stats.estimated_cardinality = Some(CardinalityEstimate::exact(10_000));
     let mut second = test_base_get(1, 20_032, "second_probe", 10_000);
     second.stats.estimated_cardinality = Some(CardinalityEstimate::exact(10_000));
-    let mut union = OwnedLogicalPlan::synthetic(LogicalOperator::SetOperation(SetOperation::union(
-        2,
-        first,
-        second,
-        true,
-        vec![LogicalType::Integer],
-    )));
+    let mut union = OwnedLogicalPlan::synthetic(LogicalOperator::SetOperation(
+        SetOperation::union(2, first, second, true, vec![LogicalType::Integer]),
+    ));
     union.stats.estimated_cardinality = Some(CardinalityEstimate::exact(20_000));
     let mut build = test_base_get(3, 20_033, "build", 20);
     build.stats.estimated_cardinality = Some(CardinalityEstimate::exact(20));
@@ -1792,12 +1822,16 @@ fn exact_is_the_default_root_contract_and_approximate_requires_opt_in() {
     let approximate = OwnedLogicalPlan::new(
         &bind_context,
         LogicalOperator::TopN(
-            TopN::new(OwnedLogicalPlan::dummy_scan(&bind_context), Vec::new(), 1, 0).with_hnsw_options(
-                paro_storage::index::hnsw::HnswQueryOptions {
-                    objective: paro_storage::index::hnsw::HnswSearchObjective::CostOptimized,
-                    ..Default::default()
-                },
-            ),
+            TopN::new(
+                OwnedLogicalPlan::dummy_scan(&bind_context),
+                Vec::new(),
+                1,
+                0,
+            )
+            .with_hnsw_options(paro_storage::index::hnsw::HnswQueryOptions {
+                objective: paro_storage::index::hnsw::HnswSearchObjective::CostOptimized,
+                ..Default::default()
+            }),
         ),
     );
     assert_eq!(

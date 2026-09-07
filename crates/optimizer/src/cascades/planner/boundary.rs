@@ -13,6 +13,9 @@ mod tests;
 
 #[derive(Debug, Default, PartialEq, Eq)]
 struct GroupFacts {
+    can_replay: bool,
+    column_domains: BTreeMap<ColumnId, GroupColumnDomain>,
+    column_values: BTreeMap<ColumnId, paro_planner::operator::bound_reference::BoundColumnValues>,
     relational: bool,
     unique_keys: BTreeSet<Box<[ColumnId]>>,
     /// Structural keys whose equality is valid in the SQL GROUP BY domain.
@@ -24,6 +27,7 @@ struct GroupFacts {
     /// composable uniqueness proof rather than a rule-local observation.
     grouping_domains: BTreeMap<ColumnId, BTreeSet<SafeGroupingValue>>,
     cardinality: Option<CardinalityEnvelope>,
+    maximum_cardinality: Option<u64>,
     lineage: BTreeMap<ColumnId, Option<Vec<BoundSourceColumn>>>,
     control: bool,
 }
@@ -88,6 +92,7 @@ impl SafeGroupingValue {
     }
 }
 
+#[derive(Clone, Default)]
 pub(super) struct BoundarySnapshot {
     groups: BTreeMap<GroupId, Arc<GroupFacts>>,
 }
@@ -102,6 +107,68 @@ struct CachedFacts {
     read: PatternRead,
     inputs: Vec<(GroupId, Option<Arc<GroupFacts>>)>,
     facts: Arc<GroupFacts>,
+    reads: Option<Arc<FactReadLog>>,
+}
+
+/// Persistent evidence edges, not a copied transitive read set. A finite log
+/// permits a cache hit without rebuilding recipes, layouts or column domains.
+/// Cyclic/unfinished derivations deliberately do not publish such a log.
+#[derive(Debug)]
+struct FactReadLog {
+    local: PatternRead,
+    inputs: Box<[Arc<FactReadLog>]>,
+}
+
+type ReadValidation = HashMap<usize, (Arc<FactReadLog>, bool)>;
+
+impl FactReadLog {
+    fn validate(
+        root: Arc<Self>,
+        ctx: &mut TransformContext<'_>,
+        state: &PlannerTransformState,
+        dimension: BudgetDimension,
+        checked: &mut ReadValidation,
+    ) -> Result<Option<bool>> {
+        let identity = Arc::as_ptr(&root) as usize;
+        let mut pending = vec![(root, false)];
+        while let Some((read, finish)) = pending.pop() {
+            if let Some(session) = &state.session {
+                session.cancellation.check()?;
+            }
+            let key = Arc::as_ptr(&read) as usize;
+            if checked.contains_key(&key) {
+                continue;
+            }
+            if !ctx.admit_fact_work(dimension, 1)? {
+                return Ok(None);
+            }
+            if finish {
+                let current = read
+                    .inputs
+                    .iter()
+                    .all(|input| checked[&(Arc::as_ptr(input) as usize)].1);
+                checked.insert(key, (read, current));
+            } else if read.local.group.index() >= ctx.memo().group_count()
+                || !read.local.is_current(ctx.memo())?
+            {
+                checked.insert(key, (read, false));
+            } else {
+                ctx.record_fact_read(read.local);
+                if !ctx.admit_fact_work(dimension, read.inputs.len())? {
+                    return Ok(None);
+                }
+                pending.push((read.clone(), true));
+                pending.extend(
+                    read.inputs
+                        .iter()
+                        .rev()
+                        .cloned()
+                        .map(|input| (input, false)),
+                );
+            }
+        }
+        Ok(Some(checked[&identity].1))
+    }
 }
 
 impl CachedFacts {
@@ -124,6 +191,21 @@ impl CachedFacts {
 }
 
 impl BoundarySnapshot {
+    /// Derive one newly published shell from already observed input facts.
+    /// Staging is not allowed to choose or reconstruct input alternatives.
+    /// Missing evidence in another recipe remains conservatively unknown.
+    pub(super) fn settle_group(
+        &mut self,
+        memo: &Memo,
+        state: &PlannerTransformState,
+        group: GroupId,
+    ) -> Result<()> {
+        let group = memo.canonical_group(group);
+        let facts = self.derive(memo, state, group, true)?;
+        self.groups.insert(group, Arc::new(facts));
+        Ok(())
+    }
+
     /// Canonical value identity for every bound relational boundary. Group and
     /// expression ids are deliberately excluded: the binding fingerprint owns
     /// operator identity, while this value owns only transported facts.
@@ -187,6 +269,22 @@ impl BoundarySnapshot {
             }
         }
         encoder.write_u64(facts.control as u64);
+        encoder.write_u64(facts.can_replay as u64);
+        encoder.write_u64(facts.maximum_cardinality.is_some() as u64);
+        encoder.write_u64(facts.maximum_cardinality.unwrap_or(0));
+        encoder.write_u64(facts.column_domains.len() as u64);
+        for (column, domain) in &facts.column_domains {
+            encoder.write_u64(column.0 as u64);
+            encoder.write_u64(domain.expected_lower);
+            encoder.write_u64(domain.expected_upper);
+            encoder.write_u64(domain.guaranteed_upper.is_some() as u64);
+            encoder.write_u64(domain.guaranteed_upper.unwrap_or(0));
+        }
+        encoder.write_u64(facts.column_values.len() as u64);
+        for (column, value) in &facts.column_values {
+            encoder.write_u64(column.0 as u64);
+            encoder.write_bytes(value.encoding());
+        }
         encoder.write_u64(facts.unique_keys.len() as u64);
         for key in &facts.unique_keys {
             encoder.write_u64(key.len() as u64);
@@ -245,6 +343,8 @@ impl BoundarySnapshot {
             pending.push((ctx.memo().canonical_group(group), relational, false));
         }
         let mut active = BTreeSet::new();
+        let mut read_logs = BTreeMap::<GroupId, Arc<FactReadLog>>::new();
+        let mut checked_reads = ReadValidation::new();
         let mut result = Self {
             groups: BTreeMap::new(),
         };
@@ -313,15 +413,29 @@ impl BoundarySnapshot {
                 } else {
                     PatternRead::facts_from_group(ctx.memo(), group)?
                 };
+                let reads = inputs
+                    .iter()
+                    .map(|(input, _)| read_logs.get(input).cloned())
+                    .collect::<Option<Box<[_]>>>()
+                    .map(|inputs| {
+                        Arc::new(FactReadLog {
+                            local: read,
+                            inputs,
+                        })
+                    });
                 let mut cache = state
                     .boundary_cache
                     .lock()
                     .expect("boundary fact cache poisoned");
                 if let Some(cached) = cache
                     .entries
-                    .get(&(group, relational))
+                    .get_mut(&(group, relational))
                     .filter(|cached| cached.matches(read, &inputs))
                 {
+                    cached.reads = reads.clone();
+                    if let Some(reads) = reads {
+                        read_logs.insert(group, reads);
+                    }
                     result.groups.insert(group, cached.facts.clone());
                     active.remove(&(group, relational));
                     continue;
@@ -392,14 +506,42 @@ impl BoundarySnapshot {
                         read,
                         inputs,
                         facts: facts.clone(),
+                        reads: reads.clone(),
                     },
                 );
+                if let Some(reads) = reads {
+                    read_logs.insert(group, reads);
+                }
                 result.groups.insert(group, facts);
                 active.remove(&(group, relational));
                 continue;
             }
             if active.contains(&(group, relational)) {
                 continue;
+            }
+            let cached = state
+                .boundary_cache
+                .lock()
+                .expect("boundary fact cache poisoned")
+                .entries
+                .get(&(group, relational))
+                .and_then(|entry| Some((entry.facts.clone(), entry.reads.clone()?)));
+            if let Some((facts, reads)) = cached {
+                match FactReadLog::validate(
+                    reads.clone(),
+                    ctx,
+                    state,
+                    dimension,
+                    &mut checked_reads,
+                )? {
+                    None => return Ok(None),
+                    Some(true) => {
+                        result.groups.insert(group, facts);
+                        read_logs.insert(group, reads);
+                        continue;
+                    }
+                    Some(false) => {}
+                }
             }
             let width = ctx
                 .memo()
@@ -538,6 +680,24 @@ impl BoundarySnapshot {
             })
             .collect();
         Ok(Arc::new(BoundRelationFacts {
+            can_replay: facts.can_replay,
+            cardinality: self.cardinality(memo, group),
+            maximum_cardinality: facts.maximum_cardinality,
+            column_domains: columns
+                .iter()
+                .map(|column| {
+                    let domain = facts.column_domains.get(column);
+                    paro_planner::operator::bound_reference::BoundColumnDomain {
+                        expected_distinct: domain.and_then(|domain| domain.expected()),
+                        guaranteed_distinct_upper: domain
+                            .and_then(|domain| domain.guaranteed_upper),
+                    }
+                })
+                .collect(),
+            column_values: columns
+                .iter()
+                .map(|column| facts.column_values.get(column).cloned())
+                .collect(),
             unique_keys,
             grouping_unique_keys,
             source_lineage: columns
@@ -558,6 +718,16 @@ impl BoundarySnapshot {
         let group = memo
             .group(id)
             .ok_or_else(|| paro_error::internal("fact derivation lost group"))?;
+        let mut column_values = BTreeMap::new();
+        let mut column_domains = BTreeMap::new();
+        for column in group.schema.ids() {
+            if let Some(value) = memo.column_value_domain(id, column)? {
+                column_values.insert(column, value);
+            }
+            if let Some(domain) = memo.column_domain(id, column) {
+                column_domains.insert(column, domain);
+            }
+        }
         let mut inherited = None;
         let mut producer = None;
         for (input, is_producer) in memo.cardinality_dependencies(id) {
@@ -585,6 +755,9 @@ impl BoundarySnapshot {
         if !relational {
             return Ok(GroupFacts {
                 cardinality,
+                maximum_cardinality: group.logical_properties.maximum_cardinality,
+                column_domains,
+                column_values,
                 control: true,
                 ..GroupFacts::default()
             });
@@ -595,6 +768,7 @@ impl BoundarySnapshot {
         let mut unique_keys = group.logical_properties.unique_keys.clone();
         let mut grouping_unique_keys = BTreeSet::new();
         let mut control = false;
+        let mut can_replay = false;
         for expression in group.logical_exprs() {
             let logical = memo
                 .logical_expr(*expression)
@@ -606,6 +780,30 @@ impl BoundarySnapshot {
             let operator = &state.payloads.logical[logical.payload.index()]
                 .semantic_template
                 .operator;
+            // Replayability is a semantic proof of the equivalence class.
+            // One finite, effect-free derivation proves it; a recursive
+            // identity alternative must not erase that proof. As with keys,
+            // unknown evidence from another equivalent recipe is not false.
+            can_replay |= logical.key.scalars.iter().all(|root| {
+                state
+                    .scalars
+                    .get(*root)
+                    .is_some_and(|scalar| scalar.properties.can_repeat_evaluation())
+            }) && logical.key.children.iter().all(|child| {
+                self.groups
+                    .get(&memo.canonical_group(*child))
+                    .is_some_and(|facts| facts.can_replay)
+            }) && !matches!(
+                operator,
+                LogicalOperator::ExternalTable(_)
+                    | LogicalOperator::ExternalProject(_)
+                    | LogicalOperator::TableFunctionGet(_)
+                    | LogicalOperator::DependentJoin(_)
+                    | LogicalOperator::RecursiveCTE(_)
+                    | LogicalOperator::CTERef(_)
+                    | LogicalOperator::DelimGet(_)
+                    | LogicalOperator::MaterializedCTE(_)
+            );
             let child_layouts = metadata
                 .child_layouts
                 .iter()
@@ -1037,11 +1235,15 @@ impl BoundarySnapshot {
             }
         }
         Ok(GroupFacts {
+            column_domains,
+            column_values,
+            can_replay,
             relational,
             unique_keys,
             grouping_unique_keys,
             grouping_domains: common_grouping_domains.unwrap_or_default(),
             cardinality,
+            maximum_cardinality: group.logical_properties.maximum_cardinality,
             lineage: common.unwrap_or_default(),
             control: control || group.logical_exprs().is_empty(),
         })

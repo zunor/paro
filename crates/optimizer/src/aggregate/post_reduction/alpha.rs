@@ -23,7 +23,10 @@ pub(crate) struct AlphaBindings {
 }
 
 impl AlphaBindings {
-    pub(super) fn match_sources(grouped: &OwnedLogicalPlan, scalar: &OwnedLogicalPlan) -> Option<Self> {
+    pub(super) fn match_sources(
+        grouped: &OwnedLogicalPlan,
+        scalar: &OwnedLogicalPlan,
+    ) -> Option<Self> {
         let mut bindings = Self::default();
         bindings.match_plan(grouped, scalar).then_some(bindings)
     }

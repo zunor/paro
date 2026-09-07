@@ -38,7 +38,10 @@ use crate::aggregate::semantic_kernels::aggregate_kernels_equal;
 use alpha::AlphaBindings;
 /// Replace eligible grouped/scalar sibling plans with one grouped aggregate
 /// carrying a hidden post-aggregate reduction.
-pub fn optimize_plan(plan: OwnedLogicalPlan, bind_context: &BindContext) -> Result<OwnedLogicalPlan> {
+pub fn optimize_plan(
+    plan: OwnedLogicalPlan,
+    bind_context: &BindContext,
+) -> Result<OwnedLogicalPlan> {
     optimize_plan_with_change(plan, bind_context).map(|(plan, _)| plan)
 }
 
@@ -91,7 +94,10 @@ pub fn optimize_plan_with_change(
     }
 }
 
-fn rewrite_cte_max_reduction(cte: MaterializedCTE, rewrite: CteMaxRewrite) -> Option<OwnedLogicalPlan> {
+fn rewrite_cte_max_reduction(
+    cte: MaterializedCTE,
+    rewrite: CteMaxRewrite,
+) -> Option<OwnedLogicalPlan> {
     let grouped_plan = attach_cte_reduction(*cte.cte_query, rewrite.reduction)?;
     let rewritten_child = rewrite_cte_consumer(
         *cte.child,
@@ -283,7 +289,10 @@ struct CteScalarMax<'a> {
     scalar_expression: &'a Expression,
 }
 
-fn find_cte_scalar_max<'a>(plan: &'a OwnedLogicalPlan, cte_index: usize) -> Option<CteScalarMax<'a>> {
+fn find_cte_scalar_max<'a>(
+    plan: &'a OwnedLogicalPlan,
+    cte_index: usize,
+) -> Option<CteScalarMax<'a>> {
     let mut found = None;
     find_cte_scalar_max_inner(plan, cte_index, &mut found)?;
     found

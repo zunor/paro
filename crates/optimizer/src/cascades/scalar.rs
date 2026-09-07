@@ -104,6 +104,16 @@ pub struct ScalarProperties {
 }
 
 impl ScalarProperties {
+    /// Re-evaluating the same immutable input is weaker than commuting with
+    /// a row-removing operator. A deterministic SQL error remains the same
+    /// error on replay; it does not authorize evaluation on new input rows.
+    pub fn can_repeat_evaluation(&self) -> bool {
+        self.volatility != Volatility::Volatile
+            && !self.has_side_effects
+            && !self.depends_on_external_state
+            && self.deterministic
+    }
+
     pub fn is_evaluation_fence(&self) -> bool {
         self.volatility == Volatility::Volatile
             || self.may_error

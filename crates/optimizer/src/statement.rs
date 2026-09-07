@@ -22,7 +22,7 @@ use paro_planner::expression::Expression;
 use paro_planner::operator::{
     CopyTo, Delete, Explain, ExplainSpec, Insert, InsertOnConflict, LogicalOperator, Update,
 };
-use paro_planner::plan::{CardinalityEstimate, OwnedLogicalPlan, NodeStats, PlanNodeId};
+use paro_planner::plan::{CardinalityEstimate, NodeStats, OwnedLogicalPlan, PlanNodeId};
 
 #[derive(Debug, Clone)]
 pub(crate) struct ExplainEnvelope {

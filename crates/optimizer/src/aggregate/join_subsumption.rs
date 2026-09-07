@@ -73,7 +73,7 @@ pub fn optimize_plan_with_change(plan: OwnedLogicalPlan) -> (OwnedLogicalPlan, b
 
 /// Allocation-free root predicate shared with Memo rule dispatch. Descendant
 /// alternatives cannot make an aggregate with the wrong algebra eligible.
-pub(crate) fn recognizes_outer_aggregate(operator: &LogicalOperator) -> bool {
+pub(crate) fn recognizes_outer_aggregate<Child>(operator: &LogicalOperator<Child>) -> bool {
     matches!(operator, LogicalOperator::Aggregate(aggregate) if AggregateJoinSubsumption::outer_sum(aggregate).is_some())
 }
 
@@ -100,7 +100,7 @@ pub(crate) fn optimize_root_with_change(mut plan: OwnedLogicalPlan) -> (OwnedLog
 struct AggregateJoinSubsumption;
 
 impl AggregateJoinSubsumption {
-    fn outer_sum(aggregate: &Aggregate) -> Option<OuterSum> {
+    fn outer_sum<Child>(aggregate: &Aggregate<Child>) -> Option<OuterSum> {
         if aggregate.post_reduction.is_some()
             || aggregate.aggregates.len() != 1
             || !aggregate.grouping_functions.is_empty()
@@ -133,7 +133,10 @@ impl AggregateJoinSubsumption {
         })
     }
 
-    fn substitute_detail_join(plan: &mut OwnedLogicalPlan, outer_sum: &OuterSum) -> Option<Expression> {
+    fn substitute_detail_join(
+        plan: &mut OwnedLogicalPlan,
+        outer_sum: &OuterSum,
+    ) -> Option<Expression> {
         if let Some(replacement) = Self::try_substitute_reduction_join(plan, outer_sum) {
             return Some(replacement);
         }
@@ -836,16 +839,17 @@ mod tests {
         inner_table: Arc<TableCatalogEntry>,
     ) -> OwnedLogicalPlan {
         let inner_sum = sum(column(INNER_DETAIL, 1, decimal(15)));
-        let inner_aggregate = OwnedLogicalPlan::synthetic(LogicalOperator::Aggregate(Aggregate::new(
-            INNER_GROUP,
-            INNER_AGGREGATE,
-            42,
-            get(INNER_DETAIL, inner_table),
-            vec![column(INNER_DETAIL, 0, LogicalType::BigInt)],
-            vec![],
-            vec![inner_sum],
-            vec![],
-        )));
+        let inner_aggregate =
+            OwnedLogicalPlan::synthetic(LogicalOperator::Aggregate(Aggregate::new(
+                INNER_GROUP,
+                INNER_AGGREGATE,
+                42,
+                get(INNER_DETAIL, inner_table),
+                vec![column(INNER_DETAIL, 0, LogicalType::BigInt)],
+                vec![],
+                vec![inner_sum],
+                vec![],
+            )));
         let reduction = OwnedLogicalPlan::synthetic(LogicalOperator::Projection(Projection::new(
             REDUCTION_PROJECTION,
             inner_aggregate,
@@ -889,12 +893,13 @@ mod tests {
             outer.child.as_mut(),
             OwnedLogicalPlan::synthetic(LogicalOperator::DummyScan),
         );
-        let extra = OwnedLogicalPlan::synthetic(LogicalOperator::ExpressionGet(ExpressionGet::new(
-            EXTRA_RELATION,
-            vec![],
-            vec!["key".to_string()],
-            vec![LogicalType::BigInt],
-        )));
+        let extra =
+            OwnedLogicalPlan::synthetic(LogicalOperator::ExpressionGet(ExpressionGet::new(
+                EXTRA_RELATION,
+                vec![],
+                vec!["key".to_string()],
+                vec![LogicalType::BigInt],
+            )));
         outer.child = Box::new(OwnedLogicalPlan::synthetic(LogicalOperator::Join(
             Join::comparison(
                 JoinType::Inner,
@@ -911,16 +916,17 @@ mod tests {
 
     fn reduction_wraps_projected_detail_join(table: Arc<TableCatalogEntry>) -> OwnedLogicalPlan {
         let inner_sum = sum(column(INNER_DETAIL, 1, decimal(15)));
-        let inner_aggregate = OwnedLogicalPlan::synthetic(LogicalOperator::Aggregate(Aggregate::new(
-            INNER_GROUP,
-            INNER_AGGREGATE,
-            42,
-            get(INNER_DETAIL, table.clone()),
-            vec![column(INNER_DETAIL, 0, LogicalType::BigInt)],
-            vec![],
-            vec![inner_sum],
-            vec![],
-        )));
+        let inner_aggregate =
+            OwnedLogicalPlan::synthetic(LogicalOperator::Aggregate(Aggregate::new(
+                INNER_GROUP,
+                INNER_AGGREGATE,
+                42,
+                get(INNER_DETAIL, table.clone()),
+                vec![column(INNER_DETAIL, 0, LogicalType::BigInt)],
+                vec![],
+                vec![inner_sum],
+                vec![],
+            )));
         let reduction = OwnedLogicalPlan::synthetic(LogicalOperator::Projection(Projection::new(
             REDUCTION_PROJECTION,
             inner_aggregate,

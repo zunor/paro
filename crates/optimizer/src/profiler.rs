@@ -152,6 +152,19 @@ impl OptimizerProfiler {
             "search_complete".to_string(),
             u64::from(summary.is_complete()),
         );
+        self.counters.insert(
+            "search_rule_failure_count".to_string(),
+            summary
+                .obligations
+                .iter()
+                .filter(|obligation| {
+                    matches!(
+                        obligation.reason,
+                        crate::cascades::budget::SearchIncompleteReason::RuleFailure { .. }
+                    )
+                })
+                .count() as u64,
+        );
         self.counters
             .insert("memo_group_count".to_string(), summary.groups);
         self.counters.insert(
@@ -292,6 +305,7 @@ mod tests {
                 .into_iter()
                 .collect(),
             work_counters: [("transformation_binding_count", 7)].into_iter().collect(),
+            obligations: Box::new([]),
         });
         let snapshot = profiler.snapshot();
         assert_eq!(snapshot.counters.get("search_complete"), Some(&0));

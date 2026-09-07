@@ -929,7 +929,9 @@ fn scalar_binding_visible_above_filter_does_not_rewrite() {
     assert_eq!(inspection.delim_joins, 1, "{rewritten:#?}");
 }
 
-fn find_single_scalar_binding(plan: &paro_planner::plan::OwnedLogicalPlan) -> Option<ColumnBinding> {
+fn find_single_scalar_binding(
+    plan: &paro_planner::plan::OwnedLogicalPlan,
+) -> Option<ColumnBinding> {
     if let LogicalOperator::Join(paro_planner::operator::Join::Comparison(join)) = &plan.operator {
         if join.join_type == paro_planner::operator::JoinType::Single {
             return join.right.get_column_bindings().first().copied();

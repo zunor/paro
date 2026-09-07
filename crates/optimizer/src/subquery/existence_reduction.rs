@@ -71,7 +71,10 @@ fn reduce_existence_consumer(plan: OwnedLogicalPlan) -> (OwnedLogicalPlan, bool)
     )
 }
 
-fn reduce_input(plan: OwnedLogicalPlan, demanded: &HashSet<ColumnBinding>) -> (OwnedLogicalPlan, bool) {
+fn reduce_input(
+    plan: OwnedLogicalPlan,
+    demanded: &HashSet<ColumnBinding>,
+) -> (OwnedLogicalPlan, bool) {
     match &plan.operator {
         LogicalOperator::Projection(projection) => {
             let child_bindings = projection.child.get_column_bindings();

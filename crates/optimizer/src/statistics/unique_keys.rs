@@ -227,8 +227,8 @@ pub(crate) fn derive_local_unique_keys(
 
 /// One operator algebra shared by plan statistics and Memo-native facts.
 /// Inputs are schemas and proof sets, never representative child trees.
-pub(crate) fn derive_unique_keys_from_facts(
-    operator: &LogicalOperator,
+pub(crate) fn derive_unique_keys_from_facts<Child>(
+    operator: &LogicalOperator<Child>,
     layout: &paro_planner::operator::LogicalOutputLayout,
     child_layouts: &[paro_planner::operator::LogicalOutputLayout],
     children: &[&[UniqueKey]],
@@ -320,8 +320,8 @@ pub(crate) fn refresh_unique_keys(plan: OwnedLogicalPlan) -> Result<OwnedLogical
     .map(|(plan, _)| plan)
 }
 
-fn comparison_join_unique_keys(
-    join: &paro_planner::operator::ComparisonJoin,
+fn comparison_join_unique_keys<Child>(
+    join: &paro_planner::operator::ComparisonJoin<Child>,
     children: &[&[UniqueKey]],
     child_layouts: &[paro_planner::operator::LogicalOutputLayout],
     layout: &paro_planner::operator::LogicalOutputLayout,
@@ -693,12 +693,13 @@ mod tests {
 
     #[test]
     fn stale_positional_key_fails_closed_against_current_layout() {
-        let mut plan = OwnedLogicalPlan::synthetic(LogicalOperator::ExpressionGet(ExpressionGet::new(
-            7,
-            Vec::new(),
-            vec!["a".to_string(), "b".to_string()],
-            vec![LogicalType::BigInt, LogicalType::BigInt],
-        )));
+        let mut plan =
+            OwnedLogicalPlan::synthetic(LogicalOperator::ExpressionGet(ExpressionGet::new(
+                7,
+                Vec::new(),
+                vec!["a".to_string(), "b".to_string()],
+                vec![LogicalType::BigInt, LogicalType::BigInt],
+            )));
         plan.stats.unique_keys.push(UniqueKey::new(
             [UniqueKeyColumn {
                 output_index: 0,

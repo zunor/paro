@@ -90,14 +90,14 @@ pub(super) fn identity_with_facts(
                 .operator;
             match operator {
                 LogicalOperator::Join(join @ Join::Comparison(comparison))
-                    if comparison.join_type == JoinType::Inner && crate::join_order::relation_manager::RelationManager::join_is_reorderable(join)
+                    if comparison.join_type == JoinType::Inner && crate::join_order::relation_manager::RelationManager::join_shell_is_reorderable(join)
                         && logical.key.scalars.len() == comparison.conditions.len() => {
                     graph.predicates.extend(logical.key.scalars.iter().map(|scalar| scalar.0 as u64));
                     graph.joins += 1;
                     for child in children { visit(child, memo, state, graph)?; }
                     return Ok(());
                 }
-                LogicalOperator::Join(join @ Join::Cross(_)) if crate::join_order::relation_manager::RelationManager::join_is_reorderable(join) => {
+                LogicalOperator::Join(join @ Join::Cross(_)) if crate::join_order::relation_manager::RelationManager::join_shell_is_reorderable(join) => {
                     graph.joins += 1;
                     for child in children { visit(child, memo, state, graph)?; }
                     return Ok(());
@@ -181,7 +181,12 @@ mod tests {
         plan.stats.estimated_cardinality = Some(CardinalityEstimate::exact(100));
         plan
     }
-    fn join(left: OwnedLogicalPlan, right: OwnedLogicalPlan, a: usize, b: usize) -> OwnedLogicalPlan {
+    fn join(
+        left: OwnedLogicalPlan,
+        right: OwnedLogicalPlan,
+        a: usize,
+        b: usize,
+    ) -> OwnedLogicalPlan {
         let column = |table| {
             Expression::ColumnRef(ColumnRefExpression::new(
                 ColumnBinding::new(table, 0),

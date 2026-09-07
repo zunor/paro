@@ -32,6 +32,8 @@ pub struct LogicalProperties {
     /// Physical alternatives and parent transformations consume this shared
     /// fact instead of retaining an expression-local statistics snapshot.
     pub column_domains: BTreeMap<super::ids::ColumnId, GroupColumnDomain>,
+    pub column_values:
+        BTreeMap<super::ids::ColumnId, paro_planner::operator::bound_reference::BoundColumnValues>,
     /// Positional bridges from CTE scan-local ColumnIds to producer groups.
     /// Equivalent references may originate from different CTE identities, so
     /// this is a canonical set rather than an insertion-order-sensitive slot.
@@ -103,7 +105,7 @@ impl LogicalProperties {
         self.unique_keys == other.unique_keys && self.outer_references == other.outer_references
     }
 
-    pub fn merge_equivalent_facts(&mut self, other: &Self) {
+    pub fn merge_equivalent_facts(&mut self, other: &Self) -> Result<()> {
         self.maximum_cardinality = match (self.maximum_cardinality, other.maximum_cardinality) {
             (Some(left), Some(right)) => Some(left.min(right)),
             (Some(bound), None) | (None, Some(bound)) => Some(bound),
@@ -117,6 +119,16 @@ impl LogicalProperties {
         }
         self.cte_references
             .extend(other.cte_references.iter().cloned());
+        for (column, value) in &other.column_values {
+            let value = self
+                .column_values
+                .get(column)
+                .map(|previous| previous.hull(value))
+                .transpose()?
+                .unwrap_or_else(|| value.clone());
+            self.column_values.insert(*column, value);
+        }
+        Ok(())
     }
 
     fn stable_fact_fingerprint(&self) -> Fingerprint {
@@ -148,6 +160,11 @@ impl LogicalProperties {
             }
         }
         fingerprint.write_u64(self.cte_references.len() as u64);
+        fingerprint.write_u64(self.column_values.len() as u64);
+        for (column, value) in &self.column_values {
+            fingerprint.write_u64(column.0 as u64);
+            fingerprint.write_bytes(value.encoding());
+        }
         for reference in &self.cte_references {
             fingerprint.write_u64(reference.cte_index as u64);
             fingerprint.write_u64(reference.columns.len() as u64);
@@ -479,6 +496,7 @@ pub struct OptimizationGoal {
 #[derive(Debug, Clone, Default, PartialEq, Eq, PartialOrd, Ord)]
 pub struct OptimizationContext {
     required_region_facets: Box<[Fingerprint]>,
+    filterable_sources: BTreeSet<super::rules::WorkSourceId>,
 }
 
 impl OptimizationContext {
@@ -488,11 +506,16 @@ impl OptimizationContext {
         required_region_facets.dedup();
         Self {
             required_region_facets: required_region_facets.into_boxed_slice(),
+            filterable_sources: BTreeSet::new(),
         }
     }
 
     pub fn required_region_facets(&self) -> &[Fingerprint] {
         &self.required_region_facets
+    }
+
+    pub fn filterable_sources(&self) -> &BTreeSet<super::rules::WorkSourceId> {
+        &self.filterable_sources
     }
 }
 
@@ -531,20 +554,13 @@ pub struct Winner {
     pub joint_cost_proof: Option<JointCostProof>,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct WinnerFrontier {
     candidates: Vec<Winner>,
-    limit: usize,
+    filterable_sources: BTreeSet<super::rules::WorkSourceId>,
 }
 
 impl WinnerFrontier {
-    fn new(limit: u8) -> Self {
-        Self {
-            candidates: Vec::new(),
-            limit: usize::from(limit.max(1)),
-        }
-    }
-
     pub fn selected(&self) -> Option<&Winner> {
         self.candidates.first()
     }
@@ -553,7 +569,7 @@ impl WinnerFrontier {
         &self.candidates
     }
 
-    /// Retain the bounded non-dominated set, then order it by the explicit
+    /// Retain the complete non-dominated set, then order it by the explicit
     /// objective and deterministic Memo insertion rank.  The rank keeps the
     /// mandatory baseline ahead of cost-identical optional alternatives; the
     /// fingerprint only distinguishes recipes for the same physical
@@ -564,18 +580,18 @@ impl WinnerFrontier {
         let old_selected = self.selected().map(|entry| entry.physical_fingerprint);
 
         if self.candidates.iter().any(|incumbent| {
-            winner_dominates(incumbent, &winner)
+            winner_dominates(incumbent, &winner, &self.filterable_sources)
                 || (costs_equal(&incumbent.cost, &winner.cost)
-                    && incumbent.source_work == winner.source_work
+                    && source_response_equal(incumbent, &winner, &self.filterable_sources)
                     && winner_tie_break(incumbent) <= winner_tie_break(&winner))
         }) {
             return false;
         }
 
         self.candidates.retain(|incumbent| {
-            !(winner_dominates(&winner, incumbent)
+            !(winner_dominates(&winner, incumbent, &self.filterable_sources)
                 || costs_equal(&winner.cost, &incumbent.cost)
-                    && winner.source_work == incumbent.source_work
+                    && source_response_equal(&winner, incumbent, &self.filterable_sources)
                     && winner_tie_break(&winner) < winner_tie_break(incumbent))
         });
         self.candidates.push(winner);
@@ -583,19 +599,33 @@ impl WinnerFrontier {
             compare_objective(left, right, goal.objective)
                 .then_with(|| winner_tie_break(left).cmp(&winner_tie_break(right)))
         });
-        self.candidates.truncate(self.limit);
-
         old_selected != self.selected().map(|entry| entry.physical_fingerprint)
     }
 }
 
-fn winner_dominates(left: &Winner, right: &Winner) -> bool {
-    // Until source demand is part of the OptimizationContext, only prune two
-    // candidates when every parent-visible source response is identical.
-    // This is deliberately stricter than ordinary cost dominance: otherwise a
-    // parent filter can reverse the local ordering by removing work attributed
-    // to one source but not independent work in the competing candidate.
-    left.source_work == right.source_work
+fn source_response_equal(
+    left: &Winner,
+    right: &Winner,
+    sources: &BTreeSet<super::rules::WorkSourceId>,
+) -> bool {
+    left.source_work
+        .iter()
+        .filter(|lane| sources.contains(&lane.source))
+        .eq(right
+            .source_work
+            .iter()
+            .filter(|lane| sources.contains(&lane.source)))
+}
+
+fn winner_dominates(
+    left: &Winner,
+    right: &Winner,
+    sources: &BTreeSet<super::rules::WorkSourceId>,
+) -> bool {
+    // A physical goal declares every source an ancestor may filter. Preserve
+    // that exact response frontier, but do not retain irrelevant source
+    // histories forever across a closed root/sharing boundary.
+    source_response_equal(left, right, sources)
         && left.cost.output_pipeline_tasks == right.cost.output_pipeline_tasks
         && left.cost.dominates(&right.cost)
 }
@@ -709,6 +739,7 @@ pub struct Memo {
     optional_group_budget_sealed: bool,
     cte_producers: BTreeMap<usize, BTreeSet<CteProducerDomain>>,
     changed_cte_domains: BTreeSet<usize>,
+    failed_search_obligations: BTreeSet<super::budget::SearchObligation>,
 }
 
 #[derive(Debug, Clone)]
@@ -756,6 +787,7 @@ impl Memo {
             optional_group_budget_sealed: false,
             cte_producers: BTreeMap::new(),
             changed_cte_domains: BTreeSet::new(),
+            failed_search_obligations: BTreeSet::new(),
         }
     }
 
@@ -872,6 +904,46 @@ impl Memo {
             })
             .reduce(GroupColumnDomain::canonical_with);
         producer.or(direct)
+    }
+
+    pub(crate) fn column_value_domain(
+        &self,
+        id: GroupId,
+        column: super::ids::ColumnId,
+    ) -> Result<Option<paro_planner::operator::bound_reference::BoundColumnValues>> {
+        let Some(group) = self.group(self.canonical_group(id)) else {
+            return Ok(None);
+        };
+        let mut values = None;
+        for reference in &group.logical_properties.cte_references {
+            let Some(ordinal) = reference
+                .columns
+                .iter()
+                .position(|candidate| *candidate == column)
+            else {
+                continue;
+            };
+            for producer in self
+                .cte_producers
+                .get(&reference.cte_index)
+                .into_iter()
+                .flatten()
+            {
+                let Some(value) = producer.columns.get(ordinal).and_then(|column| {
+                    self.group(producer.group)?
+                        .logical_properties
+                        .column_values
+                        .get(column)
+                }) else {
+                    continue;
+                };
+                values = Some(match values {
+                    None => value.clone(),
+                    Some(previous) => value.hull(&previous)?,
+                });
+            }
+        }
+        Ok(values.or_else(|| group.logical_properties.column_values.get(&column).cloned()))
     }
 
     pub fn set_regions(&mut self, regions: RegionForest) {
@@ -1353,6 +1425,59 @@ impl Memo {
         counts
     }
 
+    pub fn search_obligations(&self) -> Box<[super::budget::SearchObligation]> {
+        use super::budget::{SearchIncompleteReason, SearchObligation};
+        let mut obligations = self
+            .failed_search_obligations
+            .iter()
+            .cloned()
+            .map(|mut obligation| {
+                obligation.group = obligation.group.map(|group| self.canonical_group(group));
+                obligation
+            })
+            .collect::<BTreeSet<_>>();
+        obligations.extend(
+            self.global_ledger
+                .exhaustion_events()
+                .map(|(dimension, witness)| SearchObligation {
+                    group: None,
+                    reason: SearchIncompleteReason::Budget(*dimension),
+                    witness: *witness,
+                }),
+        );
+        for group in self.groups() {
+            obligations.extend(
+                group
+                    .ledger
+                    .exhaustion_events()
+                    .map(|(dimension, witness)| SearchObligation {
+                        group: Some(group.id),
+                        reason: SearchIncompleteReason::Budget(*dimension),
+                        witness: *witness,
+                    }),
+            );
+        }
+        obligations.into_iter().collect()
+    }
+
+    pub(crate) fn record_failed_rule(
+        &mut self,
+        group: GroupId,
+        rule: RuleId,
+        witness: Fingerprint,
+        detail: impl Into<Arc<str>>,
+    ) {
+        self.failed_search_obligations
+            .insert(super::budget::SearchObligation {
+                group: Some(self.canonical_group(group)),
+                reason: super::budget::SearchIncompleteReason::RuleFailure {
+                    rule,
+                    detail: detail.into(),
+                },
+                witness,
+            });
+    }
+
     pub fn groups(&self) -> impl Iterator<Item = &Group> {
         self.groups
             .iter()
@@ -1397,6 +1522,9 @@ impl Memo {
     /// context. This proof makes context cardinality linear in the already
     /// admitted logical forest; optional rules cannot form a facet powerset.
     pub(super) fn freeze_optimization_contexts(&mut self) -> Result<()> {
+        if self.optimization_contexts_frozen {
+            return Ok(());
+        }
         let linear_bound = self.logical_exprs.len().saturating_mul(2).saturating_add(1);
         if self.optimization_contexts.len() > linear_bound {
             return Err(paro_error::internal(format!(
@@ -1411,6 +1539,40 @@ impl Memo {
 
     pub fn optimization_context(&self, id: OptimizationContextId) -> Option<&OptimizationContext> {
         self.optimization_contexts.get(id.index())
+    }
+
+    pub fn same_region_context(
+        &self,
+        left: OptimizationContextId,
+        right: OptimizationContextId,
+    ) -> bool {
+        self.optimization_context(left)
+            .zip(self.optimization_context(right))
+            .is_some_and(|(left, right)| {
+                left.required_region_facets == right.required_region_facets
+            })
+    }
+
+    /// Refine only physical source demand. Logical transformations cannot
+    /// manufacture region scopes after sealing; physical search can request a
+    /// different response frontier inside an already-bound region scope.
+    pub(super) fn intern_source_demand_context(
+        &mut self,
+        base: OptimizationContextId,
+        sources: BTreeSet<super::rules::WorkSourceId>,
+    ) -> Result<OptimizationContextId> {
+        let mut context = self
+            .optimization_context(base)
+            .cloned()
+            .ok_or_else(|| paro_error::internal("source demand has no region context"))?;
+        context.filterable_sources = sources;
+        if let Some(id) = self.optimization_context_index.get(&context) {
+            return Ok(*id);
+        }
+        let id = OptimizationContextId::new(self.optimization_contexts.len());
+        self.optimization_contexts.push(context.clone());
+        self.optimization_context_index.insert(context, id);
+        Ok(id)
     }
 
     pub fn insert_logical(
@@ -1627,11 +1789,16 @@ impl Memo {
             goal,
             winner: winner.clone(),
         });
-        let frontier_limit = self.budget.max_pareto_winners_per_goal;
+        let filterable_sources = self
+            .optimization_context(goal.context)
+            .ok_or_else(|| paro_error::internal("winner has no source-demand context"))?
+            .filterable_sources
+            .clone();
         let slot = self.groups[group.index()].winner_frontiers.entry(goal);
         match slot {
             std::collections::btree_map::Entry::Vacant(entry) => {
-                let mut frontier = WinnerFrontier::new(frontier_limit);
+                let mut frontier = WinnerFrontier::default();
+                frontier.filterable_sources = filterable_sources;
                 frontier.insert(goal, winner);
                 entry.insert(frontier);
                 Ok(true)
@@ -1692,7 +1859,7 @@ impl Memo {
         // so their intersection is valid for the complete equivalence class.
         canonical_group
             .logical_properties
-            .merge_equivalent_facts(&secondary_group.logical_properties);
+            .merge_equivalent_facts(&secondary_group.logical_properties)?;
         canonical_group.cardinality = std::mem::take(&mut canonical_group.cardinality)
             .canonical_with(std::mem::take(&mut secondary_group.cardinality));
         canonical_group.ledger.merge_from(&secondary_group.ledger);

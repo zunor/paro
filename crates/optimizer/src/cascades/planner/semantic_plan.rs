@@ -10,7 +10,9 @@
 
 use super::*;
 
-pub(super) fn detach_template(mut plan: OwnedLogicalPlan) -> OwnedLogicalPlan {
+pub(super) fn canonical_template(
+    mut plan: paro_planner::plan::arena::LogicalPlanNode<()>,
+) -> paro_planner::plan::arena::LogicalPlanNode<()> {
     canonicalize_projection_maps(&mut plan.operator);
     plan.stats = NodeStats::default();
     plan
@@ -141,21 +143,10 @@ pub(super) fn instantiate_bound_plan_with_group_holes(
                     .len()
                     .checked_sub(children.len())
                     .ok_or_else(|| paro_error::internal("bound shell lost a completed child"))?;
-                let mut bound_children = completed.split_off(start).into_iter();
-                let mut plan = duplicate_plan_preserving_indices(
-                    &payload.semantic_template,
-                    state.bind_context.shared().as_ref(),
-                )
-                .try_map_children(|_| {
-                    bound_children.next().ok_or_else(|| {
-                        paro_error::internal("planner payload lost a child expression")
-                    })
-                })?;
-                if bound_children.next().is_some() {
-                    return Err(paro_error::internal(
-                        "planner payload child arity disagrees with Memo expression",
-                    ));
-                }
+                let mut plan = payload.semantic_template.instantiate(
+                    state.bind_context.next_plan_id(),
+                    completed.split_off(start),
+                )?;
                 plan.stats.estimated_cardinality =
                     facts.and_then(|facts| facts.cardinality(memo, *group));
                 let output_columns = metadata.output_columns.clone();
@@ -190,6 +181,55 @@ pub(super) fn instantiate_bound_plan_with_group_holes(
 /// retain their natural left/right partition because Memo schemas are
 /// unordered ColumnId sets; parents and final presentation map identities to
 /// slots after winner selection.
+pub(super) fn freeze_arena_output_layout(
+    mut plan: paro_planner::plan::LogicalPlan,
+    output_columns: &[ColumnId],
+    state: &PlannerTransformState,
+) -> Result<paro_planner::plan::LogicalPlan> {
+    use paro_planner::plan::arena::LogicalPlanNode;
+    let root = plan.root_node().clone();
+    let mut edges = Vec::new();
+    let operator = root.operator.try_map_child_links(&mut |child| {
+        edges.push(child);
+        let layout = plan.arena().output_layout(child)?;
+        let reference = paro_planner::operator::BoundReference::new(
+            0,
+            layout.bindings().to_vec(),
+            layout.types().to_vec(),
+        );
+        Ok::<_, paro_common::error::ParoError>(Box::new(OwnedLogicalPlan {
+            id: plan.arena().get(child)?.id,
+            stats: plan.arena().get(child)?.stats.clone(),
+            operator: LogicalOperator::BoundReference(reference),
+        }))
+    })?;
+    let frozen = freeze_output_layout(
+        OwnedLogicalPlan {
+            id: root.id,
+            stats: root.stats,
+            operator,
+        },
+        output_columns,
+        state,
+    )?;
+    let shell = LogicalPlanNode::from_shell(frozen);
+    let mut edges = edges.into_iter();
+    let operator = shell.operator.try_map_child_links(&mut |_| {
+        edges
+            .next()
+            .ok_or_else(|| paro_error::internal("freezing output changed the input arity"))
+    })?;
+    if edges.next().is_some() {
+        return Err(paro_error::internal("freezing output dropped an input"));
+    }
+    plan.append_root(LogicalPlanNode {
+        id: shell.id,
+        stats: shell.stats,
+        operator,
+    })?;
+    Ok(plan)
+}
+
 pub(super) fn freeze_output_layout(
     mut plan: OwnedLogicalPlan,
     output_columns: &[ColumnId],
@@ -288,7 +328,7 @@ pub(super) fn freeze_output_layout(
     Ok(plan)
 }
 
-fn canonicalize_projection_maps(operator: &mut LogicalOperator) {
+fn canonicalize_projection_maps<Child>(operator: &mut LogicalOperator<Child>) {
     match operator {
         LogicalOperator::Filter(filter) => {
             filter.projection_map = paro_planner::operator::ProjectionMap::all();

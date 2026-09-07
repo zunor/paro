@@ -704,7 +704,6 @@ impl Optimizer {
             u64::from(budget.max_recursive_candidates),
             u64::from(budget.max_optional_enforcer_depth),
             u64::from(budget.max_optional_enforcer_chains_per_goal),
-            u64::from(budget.max_pareto_winners_per_goal),
             u64::from(budget.max_grant_classes),
             self.ctx.session.limits.max_threads as u64,
             self.ctx.session.limits.rowset_scan_pushdown as u64,
@@ -1086,7 +1085,11 @@ fn enumerate_graph_region_plans(
 ) -> Result<Vec<OwnedLogicalPlan>> {
     type PatternOrder = Vec<paro_planner::binder::bind::graph::BoundPatternElement>;
 
-    fn collect(plan: &OwnedLogicalPlan, patterns: &mut Vec<Vec<PatternOrder>>, per_pattern_max: usize) {
+    fn collect(
+        plan: &OwnedLogicalPlan,
+        patterns: &mut Vec<Vec<PatternOrder>>,
+        per_pattern_max: usize,
+    ) {
         if let LogicalOperator::GraphMatch(graph_match) = &plan.operator {
             patterns.push(
                 GraphFrontierEnumerator::new()

@@ -127,7 +127,10 @@ impl PhysicalImplementation for PlannerBaselineImplementation {
             .expect("planner transform state poisoned")
             .metadata
             .get(&expr.payload)
-            .is_some_and(|metadata| metadata.input_context == goal.context)
+            .is_some_and(|metadata| {
+                _ctx.memo
+                    .same_region_context(metadata.input_context, goal.context)
+            })
     }
 
     fn candidates(
@@ -307,7 +310,8 @@ impl PhysicalImplementation for AlternativeImplementation {
             .metadata
             .get(&expr.payload)
             .is_some_and(|metadata| {
-                metadata.input_context == goal.context
+                _ctx.memo
+                    .same_region_context(metadata.input_context, goal.context)
                     && metadata.implementations.supports(self.flavor)
             })
     }
@@ -481,7 +485,9 @@ impl PhysicalImplementation for PlannerSearchImplementation {
             .metadata
             .get(&expr.payload)
             .is_some_and(|metadata| {
-                metadata.input_context == goal.context && metadata.search.is_some()
+                _ctx.memo
+                    .same_region_context(metadata.input_context, goal.context)
+                    && metadata.search.is_some()
             })
     }
 

@@ -227,7 +227,8 @@ fn unique_build_proof_requires_a_key_preserving_join() {
     let mut preserving = ComparisonJoin::new(JoinType::Inner, left, right, join_conditions);
     preserving.left_projection_map = vec![1].into();
     preserving.right_projection_map = vec![1].into();
-    let preserving = OwnedLogicalPlan::new(&ctx, LogicalOperator::Join(Join::Comparison(preserving)));
+    let preserving =
+        OwnedLogicalPlan::new(&ctx, LogicalOperator::Join(Join::Comparison(preserving)));
     let preserving =
         crate::statistics::unique_keys::refresh_unique_keys(preserving).expect("cache unique keys");
     assert!(

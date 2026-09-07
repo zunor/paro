@@ -39,7 +39,10 @@ impl JoinElimination {
         self.optimize_required_plan(plan, &required_bindings)
     }
 
-    pub fn optimize_plan_with_change(&mut self, plan: OwnedLogicalPlan) -> (OwnedLogicalPlan, bool) {
+    pub fn optimize_plan_with_change(
+        &mut self,
+        plan: OwnedLogicalPlan,
+    ) -> (OwnedLogicalPlan, bool) {
         self.changed = false;
         let plan = self.optimize_plan(plan);
         (plan, self.changed)

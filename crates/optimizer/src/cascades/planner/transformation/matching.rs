@@ -696,7 +696,7 @@ pub(super) fn pattern_bindings(
         cancellation,
         PatternSpec {
             state: None,
-            scope: PatternScope::Subtree,
+            scope: PatternScope::TestSubtree,
             witness: None,
         },
     )
@@ -707,9 +707,12 @@ pub(super) fn pattern_bindings(
 /// to (or multiplying by) equivalent implementations below that boundary.
 #[derive(Debug, Clone, Copy)]
 enum PatternScope {
-    Subtree,
+    #[cfg(test)]
+    TestSubtree,
     Hole,
     Shell,
+    PredicateTransfer,
+    KeyDomainTransfer,
     TopN,
     Order,
     SearchInput,
@@ -733,35 +736,38 @@ enum PatternScope {
     SubsumptionInput,
     ScalarAggregatePath,
     OuterJoinPath,
-    CteFilterOwner,
-    CteFilterProducer,
+    CteInlineOwner,
+    CteDemandOwner,
+    CteDemandReferencePath,
+    CteDemandInput,
     CteReferencePath,
 }
 
 impl PatternScope {
-    fn children(self, operator: &LogicalOperator) -> Option<Vec<Self>> {
-        let arity = operator.children().len();
+    fn children(self, operator: &LogicalOperator<()>) -> Option<Vec<Self>> {
+        let mut arity = 0;
+        operator.visit_child_links(&mut |_| arity += 1);
         let repeat = |scope| Some(vec![scope; arity]);
         match self {
-            Self::Subtree => repeat(Self::Subtree),
-            Self::ScalarAggregatePath | Self::OuterJoinPath | Self::CteReferencePath => {
+            #[cfg(test)]
+            Self::TestSubtree => repeat(Self::TestSubtree),
+            Self::ScalarAggregatePath | Self::OuterJoinPath | Self::CteReferencePath
+            | Self::CteDemandReferencePath => {
                 unreachable!("witness paths choose child scopes from Memo facts")
             }
-            Self::CteFilterOwner => matches!(operator, LogicalOperator::MaterializedCTE(_))
-                .then(|| vec![Self::CteFilterProducer, Self::CteReferencePath]),
-            // CTE predicate derivation reads these shells on the producer side
-            // to move a consumer domain to its narrowest legal owner. Inputs
-            // below an unsupported boundary remain native Memo operands.
-            Self::CteFilterProducer => match operator {
-                LogicalOperator::Projection(_)
-                | LogicalOperator::Filter(_)
-                | LogicalOperator::Aggregate(_)
-                | LogicalOperator::SetOperation(_)
-                | LogicalOperator::Join(Join::Comparison(_)) => repeat(Self::CteFilterProducer),
-                _ => repeat(Self::Hole),
+            Self::CteInlineOwner => matches!(operator, LogicalOperator::MaterializedCTE(_))
+                .then(|| vec![Self::Hole, Self::CteReferencePath]),
+            Self::CteDemandOwner => matches!(operator, LogicalOperator::MaterializedCTE(_))
+                .then(|| vec![Self::Hole, Self::CteDemandReferencePath]),
+            Self::CteDemandInput => match operator {
+                LogicalOperator::Projection(_) | LogicalOperator::Filter(_) => repeat(Self::CteDemandInput),
+                LogicalOperator::Get(_) | LogicalOperator::ExpressionGet(_) | LogicalOperator::EmptyResult(_) => repeat(Self::Hole),
+                _ => None,
             },
             Self::Hole => unreachable!("group holes do not inspect operators"),
             Self::Shell => repeat(Self::Hole),
+            Self::PredicateTransfer => matches!(operator, LogicalOperator::Filter(_)).then(|| vec![Self::Shell]),
+            Self::KeyDomainTransfer => matches!(operator, LogicalOperator::Join(Join::Comparison(join)) if join.join_type == JoinType::Semi).then(|| vec![Self::Shell, Self::Hole]),
             Self::SubsumptionAggregate => matches!(operator, LogicalOperator::Aggregate(_)).then(|| vec![Self::SubsumptionInput]),
             // Detail subsumption consumes a clean join region, projection /
             // filter exposure paths, and one partial-aggregate shell. It
@@ -793,8 +799,8 @@ impl PatternScope {
             },
             Self::JoinRegion => match operator {
                 LogicalOperator::Filter(_) => repeat(Self::JoinRegion),
-                LogicalOperator::Join(join) if crate::join_order::relation_manager::RelationManager::join_is_reorderable(join)
-                    || matches!(join, Join::Comparison(join) if crate::join_order::relation_manager::RelationManager::reduction_join_is_reorderable(join)) => repeat(Self::JoinRegion),
+                LogicalOperator::Join(join) if crate::join_order::relation_manager::RelationManager::join_shell_is_reorderable(join)
+                    || matches!(join, Join::Comparison(join) if crate::join_order::relation_manager::RelationManager::reduction_join_shell_is_reorderable(join)) => repeat(Self::JoinRegion),
                 _ => repeat(Self::Hole),
             },
             Self::AggregateRegion => matches!(operator, LogicalOperator::Aggregate(_)).then(|| vec![Self::DimensionRegion]),
@@ -850,6 +856,8 @@ pub(super) fn scoped_pattern_bindings(
     work_dimension: BudgetDimension,
 ) -> Result<PatternBindingSet> {
     let scope = match transformation {
+        PlannerTransformation::PredicateTransfer => PatternScope::PredicateTransfer,
+        PlannerTransformation::KeyDomainTransfer => PatternScope::KeyDomainTransfer,
         PlannerTransformation::ExpensivePredicatePlacement => PatternScope::Shell,
         PlannerTransformation::TopNIntroduction => PatternScope::TopN,
         PlannerTransformation::LimitPushdown => PatternScope::LimitProjection,
@@ -864,8 +872,13 @@ pub(super) fn scoped_pattern_bindings(
         PlannerTransformation::AggregatePostReduction
         | PlannerTransformation::ScalarAggregateWindow => PatternScope::ScalarAggregatePath,
         PlannerTransformation::JoinElimination => PatternScope::OuterJoinPath,
-        PlannerTransformation::CteFilterPushdown => PatternScope::CteFilterOwner,
-        _ => PatternScope::Subtree,
+        PlannerTransformation::CtePartitionedMaterialization
+        | PlannerTransformation::CteInline
+        | PlannerTransformation::CteFilterPushdown => PatternScope::CteInlineOwner,
+        PlannerTransformation::CteDemandPushdown => PatternScope::CteDemandOwner,
+        PlannerTransformation::AggregateDimensionSharing => {
+            unreachable!("dimension sharing has its own native binding")
+        }
     };
     let witness = match transformation {
         PlannerTransformation::AggregatePostReduction
@@ -896,7 +909,7 @@ enum PatternWitness {
 }
 
 impl PatternWitness {
-    fn matches(self, operator: &LogicalOperator) -> bool {
+    fn matches<Child>(self, operator: &LogicalOperator<Child>) -> bool {
         match (self, operator) {
             (Self::ScalarAggregate, LogicalOperator::Aggregate(aggregate)) => {
                 aggregate.groups.is_empty()
@@ -1095,6 +1108,16 @@ fn enumerate_pattern_bindings(
                 return Ok(Vec::new());
             }
             if !active.insert(group) {
+                // A CTE ownership proof must enumerate every occurrence in
+                // its consumer scope. A recursion cut is not evidence that a
+                // subtree contains no reference; decline this cyclic binding
+                // and let finite alternatives establish the requirement.
+                if matches!(
+                    scope,
+                    PatternScope::CteReferencePath | PatternScope::CteDemandReferencePath
+                ) {
+                    return Ok(Vec::new());
+                }
                 if !self.admit_work(1)? {
                     return Ok(Vec::new());
                 }
@@ -1139,7 +1162,7 @@ fn enumerate_pattern_bindings(
             let logical = self.memo.logical_expr(expression).ok_or_else(|| {
                 paro_error::internal("pattern matcher references an unknown logical expression")
             })?;
-            let child_scopes = if matches!(scope, PatternScope::Subtree) {
+            let child_scopes = if self.state.is_none() {
                 vec![scope; logical.key.children.len()]
             } else {
                 let operator = &self
@@ -1151,7 +1174,9 @@ fn enumerate_pattern_bindings(
                 let path_witness = match scope {
                     PatternScope::ScalarAggregatePath => Some(PatternWitness::ScalarAggregate),
                     PatternScope::OuterJoinPath => Some(PatternWitness::OuterJoin),
-                    PatternScope::CteReferencePath => Some(PatternWitness::CteReference),
+                    PatternScope::CteReferencePath | PatternScope::CteDemandReferencePath => {
+                        Some(PatternWitness::CteReference)
+                    }
                     _ => None,
                 };
                 if let Some(witness) = path_witness {
@@ -1166,7 +1191,13 @@ fn enumerate_pattern_bindings(
                                 scopes.push(scope);
                                 found = true;
                             } else {
-                                scopes.push(PatternScope::Hole);
+                                scopes.push(
+                                    if matches!(scope, PatternScope::CteDemandReferencePath) {
+                                        PatternScope::CteDemandInput
+                                    } else {
+                                        PatternScope::Hole
+                                    },
+                                );
                             }
                         }
                         if !found {
@@ -1180,8 +1211,8 @@ fn enumerate_pattern_bindings(
                             operator,
                             LogicalOperator::Get(_) | LogicalOperator::Filter(_)
                         )
-                        && !matches!(operator, LogicalOperator::Join(join) if crate::join_order::relation_manager::RelationManager::join_is_reorderable(join)
-                        || matches!(join, Join::Comparison(join) if crate::join_order::relation_manager::RelationManager::reduction_join_is_reorderable(join)))
+                        && !matches!(operator, LogicalOperator::Join(join) if crate::join_order::relation_manager::RelationManager::join_shell_is_reorderable(join)
+                        || matches!(join, Join::Comparison(join) if crate::join_order::relation_manager::RelationManager::reduction_join_shell_is_reorderable(join)))
                     {
                         if active.len() == 1 {
                             return Ok(Vec::new());
@@ -1447,9 +1478,12 @@ fn cte_transformation_accepts(
     use paro_planner::binder::ir::CTEMaterialize;
     match transformation {
         PlannerTransformation::CteInline => materialized != CTEMaterialize::Materialized,
-        PlannerTransformation::CtePartitionedMaterialization
-        | PlannerTransformation::CteDemandPushdown
-        | PlannerTransformation::CteFilterPushdown => materialized == CTEMaterialize::Default,
+        PlannerTransformation::CtePartitionedMaterialization => {
+            materialized == CTEMaterialize::Default
+        }
+        PlannerTransformation::CteDemandPushdown | PlannerTransformation::CteFilterPushdown => {
+            materialized != CTEMaterialize::NotMaterialized
+        }
         _ => false,
     }
 }
@@ -1466,7 +1500,9 @@ fn transformation_root_operator_matches(
     use LogicalOperatorType as Op;
 
     match transformation {
-        PlannerTransformation::ExpensivePredicatePlacement => operator == Op::Filter,
+        PlannerTransformation::KeyDomainTransfer => operator == Op::ComparisonJoin,
+        PlannerTransformation::PredicateTransfer
+        | PlannerTransformation::ExpensivePredicatePlacement => operator == Op::Filter,
         PlannerTransformation::CtePartitionedMaterialization
         | PlannerTransformation::CteInline
         | PlannerTransformation::CteDemandPushdown
@@ -1515,7 +1551,8 @@ mod tests {
             vec![LogicalType::BigInt],
         )));
         for _ in 0..64 {
-            child = OwnedLogicalPlan::synthetic(LogicalOperator::Filter(Filter::new(child, vec![])));
+            child =
+                OwnedLogicalPlan::synthetic(LogicalOperator::Filter(Filter::new(child, vec![])));
         }
         let child = OwnedLogicalPlan::synthetic(LogicalOperator::Distinct(Distinct::new(child)));
         let plan = OwnedLogicalPlan::synthetic(LogicalOperator::Aggregate(Aggregate::new(
@@ -1563,7 +1600,10 @@ mod tests {
             vec![LogicalType::BigInt],
         )));
         for _ in 0..64 {
-            child = OwnedLogicalPlan::synthetic(LogicalOperator::Filter(Filter::new(child, Vec::new())));
+            child = OwnedLogicalPlan::synthetic(LogicalOperator::Filter(Filter::new(
+                child,
+                Vec::new(),
+            )));
         }
         let mut budget = SearchBudget::default();
         budget.max_rule_work_units_per_group = 8;
@@ -1781,11 +1821,10 @@ mod tests {
     }
 
     #[test]
-    fn cte_shell_rejects_rules_after_the_sharing_choice_is_frozen() {
+    fn cte_sql_policy_constrains_strategy_not_domain_proofs() {
         use paro_planner::binder::ir::CTEMaterialize;
 
         for transformation in [
-            PlannerTransformation::CtePartitionedMaterialization,
             PlannerTransformation::CteDemandPushdown,
             PlannerTransformation::CteFilterPushdown,
         ] {
@@ -1793,11 +1832,23 @@ mod tests {
                 transformation,
                 CTEMaterialize::Default
             ));
-            assert!(!cte_transformation_accepts(
+            assert!(cte_transformation_accepts(
                 transformation,
                 CTEMaterialize::Materialized
             ));
+            assert!(!cte_transformation_accepts(
+                transformation,
+                CTEMaterialize::NotMaterialized
+            ));
         }
+        assert!(cte_transformation_accepts(
+            PlannerTransformation::CtePartitionedMaterialization,
+            CTEMaterialize::Default
+        ));
+        assert!(!cte_transformation_accepts(
+            PlannerTransformation::CtePartitionedMaterialization,
+            CTEMaterialize::Materialized
+        ));
         assert!(!cte_transformation_accepts(
             PlannerTransformation::CteInline,
             CTEMaterialize::Materialized

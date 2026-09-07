@@ -35,7 +35,10 @@ use crate::subquery::output_contract::{
     child_output_contracts, OutputContract, RewriteOutputShape,
 };
 
-pub fn optimize_plan(plan: OwnedLogicalPlan, bind_context: &BindContext) -> Result<OwnedLogicalPlan> {
+pub fn optimize_plan(
+    plan: OwnedLogicalPlan,
+    bind_context: &BindContext,
+) -> Result<OwnedLogicalPlan> {
     optimize_plan_with_change(plan, bind_context).map(|(plan, _)| plan)
 }
 

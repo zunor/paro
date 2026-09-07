@@ -6,7 +6,29 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 
-use super::ids::{Fingerprint, RuleId};
+use super::ids::{Fingerprint, GroupId, RuleId};
+
+/// A first-class residual search obligation. An anytime winner is valid, but
+/// cannot claim closure while any of these candidate classes remain omitted.
+/// Global obligations have no group owner; their witness still has semantic
+/// event identity in the ledger which rejected the work.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+pub struct SearchObligation {
+    pub group: Option<GroupId>,
+    pub reason: SearchIncompleteReason,
+    pub witness: Fingerprint,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+pub enum SearchIncompleteReason {
+    Budget(BudgetDimension),
+    /// The baseline survives an advisory rule failure, but an unexamined
+    /// equivalence class must not be advertised as a completed search.
+    RuleFailure {
+        rule: RuleId,
+        detail: Arc<str>,
+    },
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum BudgetDimension {
@@ -111,7 +133,6 @@ pub struct SearchBudget {
     pub max_recursive_candidates: u16,
     pub max_optional_enforcer_depth: u8,
     pub max_optional_enforcer_chains_per_goal: u8,
-    pub max_pareto_winners_per_goal: u8,
     pub max_grant_classes: u8,
 }
 
@@ -150,7 +171,6 @@ impl Default for SearchBudget {
             max_recursive_candidates: 16,
             max_optional_enforcer_depth: 8,
             max_optional_enforcer_chains_per_goal: 8,
-            max_pareto_winners_per_goal: 8,
             max_grant_classes: 3,
         }
     }

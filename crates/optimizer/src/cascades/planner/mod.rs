@@ -19,31 +19,23 @@ use paro_planner::binder::Binder;
 use paro_planner::expression::Expression;
 use paro_planner::operator::join::{AntiJoinMode, Join, JoinComparisonType, JoinType};
 use paro_planner::operator::{ColumnBinding, LogicalOperator, LogicalOperatorType};
-use paro_planner::plan::{CardinalityEstimate, OwnedLogicalPlan, NodeStats};
+use paro_planner::plan::{CardinalityEstimate, NodeStats, OwnedLogicalPlan};
 use paro_storage::statistics::ColumnStatistics;
 use tracing::debug;
 
 use crate::aggregate::{
     dimension_deferral, dimension_sharing, input_materialization, join_preaggregation,
-    join_subsumption, late_payload, non_null_inputs, post_reduction, singleton_groups,
+    join_subsumption, late_payload, non_null_inputs, post_reduction,
 };
-use crate::column::lifetime::ColumnLifetimeAnalyzer;
-use crate::column::remove_unused::RemoveUnusedColumns;
 use crate::context::SharedColumnStatistics;
-use crate::cte::inlining::CTEInlining;
-use crate::cte::{demand_pushdown::CTEDemandPusher, filter_pusher::CTEFilterPusher};
-use crate::expression::normalize_scalar_expressions;
 use crate::filter::pushdown::FilterPushdown;
 use crate::filter::reorder::ReorderFilter;
 use crate::join::elimination::JoinElimination;
-use crate::join::mixed_predicates::JoinPredicateNormalizer;
 use crate::limit::pushdown::LimitPushdown;
 use crate::limit::topn::TopNOptimizer;
 use crate::statistics::gathering::StatisticsGathering;
 use crate::statistics::propagator::StatisticsPropagator;
-use crate::subquery::empty_result::EmptyResultPullup;
 use crate::subquery::scalar_aggregate_window;
-use crate::verify::verify_logical_plan;
 
 use super::budget::{BudgetDimension, SearchBudget};
 use super::calibration::{
@@ -87,8 +79,8 @@ use super::rules::{
     AGGREGATE_NON_NULL_INPUT_RULE, AGGREGATE_POST_REDUCTION_RULE, CTE_DEMAND_PUSHDOWN_RULE,
     CTE_FILTER_PUSHDOWN_RULE, CTE_INLINE_RULE, CTE_PARTITIONED_MATERIALIZATION_RULE,
     EXPENSIVE_PREDICATE_PLACEMENT_RULE, JOIN_ELIMINATION_RULE, JOIN_REGION_ENUMERATION_RULE,
-    LATE_PAYLOAD_FETCH_RULE, LIMIT_PUSHDOWN_RULE, MARK_JOIN_TO_SEMI_RULE,
-    SCALAR_AGGREGATE_WINDOW_RULE, TOP_N_INTRODUCTION_RULE,
+    KEY_DOMAIN_TRANSFER_RULE, LATE_PAYLOAD_FETCH_RULE, LIMIT_PUSHDOWN_RULE, MARK_JOIN_TO_SEMI_RULE,
+    PREDICATE_TRANSFER_RULE, SCALAR_AGGREGATE_WINDOW_RULE, TOP_N_INTRODUCTION_RULE,
 };
 use super::scalar::ScalarArena;
 use super::scalar_lowering::{
@@ -383,6 +375,15 @@ impl OptimizationInput {
         let rule_elapsed = engine.rule_elapsed().clone();
         let rule_allocated_bytes = engine.rule_allocated_bytes().clone();
         let rule_budget_exhaustions = engine.rule_budget_exhaustions().clone();
+        let mut work_counters = engine.search_work_counters();
+        {
+            let state = self
+                .planner_state
+                .read()
+                .expect("planner transform state poisoned");
+            work_counters.insert("settlement_local_hit_count", state.settlement_cache.hits);
+            work_counters.insert("settlement_local_miss_count", state.settlement_cache.misses);
+        }
         let search_summary = SearchSummary {
             groups: u64::try_from(engine.memo().canonical_group_count()).unwrap_or(u64::MAX),
             logical_expressions: u64::try_from(engine.memo().logical_expr_count())
@@ -390,7 +391,8 @@ impl OptimizationInput {
             physical_expressions: u64::try_from(engine.memo().physical_expr_count())
                 .unwrap_or(u64::MAX),
             exhaustion_events: engine.memo().exhaustion_counts(),
-            work_counters: engine.search_work_counters(),
+            obligations: engine.memo().search_obligations(),
+            work_counters,
         };
         Ok(OptimizationOutput {
             variants: variants.into_boxed_slice(),
@@ -427,15 +429,17 @@ pub struct SearchSummary {
     pub logical_expressions: u64,
     pub physical_expressions: u64,
     pub exhaustion_events: BTreeMap<BudgetDimension, u64>,
+    pub obligations: Box<[super::budget::SearchObligation]>,
     pub work_counters: BTreeMap<&'static str, u64>,
 }
 
 impl SearchSummary {
     /// Whether optional search reached every configured frontier. Mandatory
     /// normalization and baseline implementations remain valid when false,
-    /// but the selected winner is explicitly a budget-limited result.
+    /// but the selected winner is explicitly incomplete. Advisory rule
+    /// failures and budget omissions are distinguished in the obligations.
     pub fn is_complete(&self) -> bool {
-        self.exhaustion_events.is_empty()
+        self.obligations.is_empty() && self.exhaustion_events.is_empty()
     }
 }
 
@@ -464,9 +468,17 @@ fn attach_group_column_domains(
     output_columns: &[ColumnId],
     column_stats: &HashMap<ColumnBinding, Arc<ColumnStatistics>>,
     estimated_cardinality: Option<CardinalityEstimate>,
-) {
+) -> Result<()> {
     for (&binding, &column) in output_bindings.iter().zip(output_columns) {
         let statistics = column_stats.get(&binding);
+        if let Some(statistics) = statistics {
+            properties.column_values.insert(
+                column,
+                paro_planner::operator::bound_reference::BoundColumnValues::new(
+                    statistics.statistics().clone(),
+                )?,
+            );
+        }
         let expected = statistics
             .map(|statistics| statistics.get_distinct_count() as u64)
             .filter(|distinct| *distinct > 0)
@@ -489,6 +501,7 @@ fn attach_group_column_domains(
             .and_modify(|current| *current = current.canonical_with(domain))
             .or_insert(domain);
     }
+    Ok(())
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -578,7 +591,6 @@ impl MemoBuilder {
             BTreeMap::<LogicalPayloadId, PendingPlannerRegionFacets>::new();
         let mut expression_groups =
             BTreeMap::<LogicalExprKey, Vec<(GroupId, super::ids::LogicalExprId)>>::new();
-        let bind_shared = bind_context.shared().clone();
         let rowset_scan_pushdown = search_context
             .map(|context| context.session.limits.rowset_scan_pushdown)
             .unwrap_or(true);
@@ -666,7 +678,7 @@ impl MemoBuilder {
                         &output_columns,
                         candidate_stats.as_ref(),
                         plan.stats.estimated_cardinality,
-                    );
+                    )?;
                     if let LogicalOperator::CTERef(reference) = &plan.operator {
                         logical_properties.cte_references.insert(CteReferenceDomain {
                             cte_index: reference.cte_index,
@@ -690,27 +702,9 @@ impl MemoBuilder {
                     // Clone only the current operator shell. Duplicating `plan`
                     // here used to recopy the complete subtree at every
                     // post-order node, turning Memo construction into O(N²).
-                    let mut detached_children = Vec::with_capacity(child_states.len());
-                    let shell = plan.try_map_children(|child| {
-                        detached_children.push(child);
-                        Ok::<_, paro_common::error::ParoError>(OwnedLogicalPlan::synthetic(
-                            LogicalOperator::DummyScan,
-                        ))
-                    })?;
-                    let semantic_template = semantic_plan::detach_template(
-                        duplicate_plan_preserving_indices(&shell, bind_shared.as_ref()),
-                    );
-                    let mut detached_children = detached_children.into_iter();
-                    let mut plan = shell.try_map_children(|_| {
-                        detached_children
-                            .next()
-                            .ok_or_else(|| paro_error::internal("Memo shell lost a detached child"))
-                    })?;
-                    if detached_children.next().is_some() {
-                        return Err(paro_error::internal(
-                            "Memo shell retained excess detached children",
-                        ));
-                    }
+                    let (shell, detached_children) = paro_planner::plan::arena::LogicalPlanNode::detach(plan);
+                    let semantic_template = semantic_plan::canonical_template(shell.clone());
+                    let mut plan = shell.assemble(detached_children)?;
                     let search_candidate = match candidate_context.as_ref() {
                         Some(search_context)
                             if matches!(
@@ -735,7 +729,7 @@ impl MemoBuilder {
                         &mut scalars,
                     )?;
                     let (operator_fingerprint, operator_encoding) =
-                        query_operator_identity(&plan, &scalar_roots, &scalars)?;
+                        query_operator_identity(&plan.operator, &scalar_roots, &scalars)?;
                     let key = LogicalExprKey {
                         operator: operator_fingerprint,
                         scalars: scalar_roots,
@@ -796,6 +790,7 @@ impl MemoBuilder {
                     let mut pending = PendingPlannerRegionFacets::default();
                     if let Some(kind) = required_region_kind(&plan.operator) {
                         let (scope, overflow) = region_scope.materialize_bounded(
+                            &memo,
                             memo.budget().max_mandatory_region_groups as usize,
                         );
                         if overflow {
@@ -1113,6 +1108,10 @@ impl MemoBuilder {
             enumerated_join_regions: BTreeSet::new(),
             boundary_cache: std::sync::Mutex::new(boundary::BoundaryFactCache::default()),
             join_region_insertions: Vec::new(),
+            cte_restrictions: Vec::new(),
+            cte_partition_labels: Default::default(),
+            cte_bindings: Vec::new(),
+            settlement_cache: Default::default(),
             binder: planner_binder,
             bind_context: bind_context.clone(),
             session: search_context.map(|context| context.session.clone()),

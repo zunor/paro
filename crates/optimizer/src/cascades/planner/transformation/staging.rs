@@ -14,8 +14,10 @@ pub(super) struct StagedEquivalent {
 }
 
 pub(super) struct StagingRequest {
-    pub(super) plan: OwnedLogicalPlan,
+    pub(super) plan: paro_planner::plan::LogicalPlan,
+    pub(super) input_facts: boundary::BoundarySnapshot,
     pub(super) column_stats: SharedColumnStatistics,
+    pub(super) column_stat_scopes: HashMap<paro_planner::plan::PlanNodeId, SharedColumnStatistics>,
     pub(super) target: StagingTarget,
     pub(super) regions: StagingRegionRequirements,
     /// Opaque Memo inputs retained by the transformed expression. Inputs
@@ -46,7 +48,9 @@ pub(super) fn stage_transformed_expression(
 ) -> Result<Option<StagedEquivalent>> {
     let StagingRequest {
         plan,
+        input_facts,
         column_stats,
+        column_stat_scopes,
         target:
             StagingTarget {
                 group: target,
@@ -65,6 +69,7 @@ pub(super) fn stage_transformed_expression(
         nested_group_holes,
     } = request;
 
+    #[derive(Clone)]
     struct NodeState {
         group: GroupId,
         columns: Box<[ColumnId]>,
@@ -73,7 +78,7 @@ pub(super) fn stage_transformed_expression(
 
     struct StagingOptions<'a> {
         column_stats: &'a Arc<HashMap<ColumnBinding, Arc<ColumnStatistics>>>,
-        search_context: Option<&'a crate::context::OptimizationContext>,
+        column_stat_scopes: &'a HashMap<paro_planner::plan::PlanNodeId, SharedColumnStatistics>,
         rule: RuleId,
         group_budget: BudgetDimension,
     }
@@ -84,6 +89,8 @@ pub(super) fn stage_transformed_expression(
         options: StagingOptions<'a>,
         pending_runtime_filter_facets: Vec<RegionFacet>,
         nested_group_holes: BTreeMap<u32, GroupId>,
+        facts: boundary::BoundarySnapshot,
+        search_candidates: HashMap<paro_planner::plan::PlanNodeId, OwnedLogicalPlan>,
     }
 
     struct NodeStagingRequest {
@@ -96,38 +103,10 @@ pub(super) fn stage_transformed_expression(
         refined_cardinality_kind: Option<CardinalityRecipeKind>,
     }
 
-    fn referenced_group_scope(memo: &Memo, root: GroupId) -> PlannerRegionScope {
-        let root = memo.canonical_group(root);
-        let mut visited = BTreeSet::from([root]);
-        let mut pending = vec![root];
-        while let Some(group) = pending.pop() {
-            let Some(group) = memo.group(group) else {
-                continue;
-            };
-            for child in group
-                .logical_exprs()
-                .iter()
-                .filter_map(|expression| memo.logical_expr(*expression))
-                .flat_map(|expression| expression.key.children.iter().copied())
-                .map(|child| memo.canonical_group(child))
-            {
-                if visited.insert(child) {
-                    pending.push(child);
-                }
-            }
-        }
-        PlannerRegionScope::new(
-            root,
-            visited
-                .into_iter()
-                .filter(|group| *group != root)
-                .map(|group| PlannerRegionScope::new(group, std::iter::empty())),
-        )
-    }
-
     fn stage_node(
         session: &mut StagingSession<'_>,
         request: NodeStagingRequest,
+        child_states: Vec<NodeState>,
     ) -> Result<Option<(OwnedLogicalPlan, NodeState, Option<StagedEquivalent>)>> {
         let NodeStagingRequest {
             plan,
@@ -194,70 +173,22 @@ pub(super) fn stage_transformed_expression(
                     NodeState {
                         group,
                         columns: columns.into_boxed_slice(),
-                        region_scope: referenced_group_scope(session.memo, group),
+                        region_scope: PlannerRegionScope::group(group),
                     },
                     None,
                 )));
             }
         }
-        let mut detached = Vec::new();
-        let skeleton = plan.try_map_children(|child| {
-            detached.push(child);
-            Ok(OwnedLogicalPlan::synthetic(LogicalOperator::DummyScan))
-        })?;
-        // The payload recipe owns only this operator shell. Capturing it
-        // before children are reattached avoids duplicating the entire
-        // already-staged subtree at every ancestor (quadratic on chains).
-        let semantic_template = semantic_plan::detach_template(duplicate_plan_preserving_indices(
-            &skeleton,
-            session.state.bind_context.shared().as_ref(),
-        ));
-        // Recursive staging interns every node's scalar expressions into the
-        // Query IR.  Keep a second operator shell for the binding-semantic
-        // tree returned to the parent: provider matching and later rule
-        // staging must never observe a child's arena-local References.
-        let semantic_skeleton = duplicate_plan_preserving_indices(
-            &skeleton,
-            session.state.bind_context.shared().as_ref(),
-        );
-        let mut child_states = Vec::with_capacity(detached.len());
-        let mut children = Vec::with_capacity(detached.len());
-        let descendant_context = target_child_context.unwrap_or(node_context);
-        for child in detached {
-            let Some((child, child_state, staged)) = stage_node(
-                session,
-                NodeStagingRequest {
-                    plan: child,
-                    target: None,
-                    required_region_facet: None,
-                    inherited_runtime_filter_facet: None,
-                    node_context: descendant_context,
-                    target_child_context: None,
-                    refined_cardinality_kind: None,
-                },
-            )?
-            else {
-                return Ok(None);
-            };
-            debug_assert!(staged.is_none());
-            children.push(child);
-            child_states.push(child_state);
-        }
-        let mut children = children.into_iter();
-        let semantic_plan = semantic_skeleton.try_map_children(|_| {
-            children
-                .next()
-                .ok_or_else(|| paro_error::internal("transformed planner tree lost a staged child"))
-        })?;
-        if children.next().is_some() {
-            return Err(paro_error::internal(
-                "transformed planner tree produced an extra staged child",
-            ));
-        }
-
+        let (skeleton, children) = paro_planner::plan::arena::LogicalPlanNode::detach(plan);
+        let semantic_template = semantic_plan::canonical_template(skeleton.clone());
+        let semantic_plan = skeleton.clone().assemble(children)?;
         let memo = &mut *session.memo;
         let state = &mut *session.state;
         let options = &session.options;
+        let column_stats = options
+            .column_stat_scopes
+            .get(&semantic_plan.id)
+            .unwrap_or(options.column_stats);
         let pending_runtime_filter_facets = &mut session.pending_runtime_filter_facets;
 
         let output_bindings = semantic_plan.get_column_bindings();
@@ -326,9 +257,9 @@ pub(super) fn stage_transformed_expression(
             &mut logical_properties,
             &output_bindings,
             &output_columns,
-            options.column_stats.as_ref(),
+            column_stats.as_ref(),
             semantic_plan.stats.estimated_cardinality,
-        );
+        )?;
         if let LogicalOperator::CTERef(reference) = &semantic_plan.operator {
             logical_properties
                 .cte_references
@@ -343,17 +274,7 @@ pub(super) fn stage_transformed_expression(
             }
         }
         let output_rows_hard_upper = logical_properties.maximum_cardinality;
-        let search_candidate = if let Some(search_context) = options.search_context.filter(|_| {
-            matches!(
-                &semantic_plan.operator,
-                LogicalOperator::TopN(_) | LogicalOperator::Filter(_)
-            )
-        }) {
-            crate::search::optimizer::SearchOptimizer::new()
-                .physical_candidate_for_root(&semantic_plan, search_context)?
-        } else {
-            None
-        };
+        let search_candidate = session.search_candidates.remove(&semantic_plan.id);
         if search_candidate.is_some() {
             debug!(
                 target: targets::OPTIMIZER,
@@ -377,7 +298,7 @@ pub(super) fn stage_transformed_expression(
             &mut state.scalars,
         )?;
         let (operator_fingerprint, operator_encoding) =
-            query_operator_identity(&plan, &scalar_roots, &state.scalars)?;
+            query_operator_identity(&plan.operator, &scalar_roots, &state.scalars)?;
         let key = LogicalExprKey {
             operator: operator_fingerprint,
             scalars: scalar_roots,
@@ -471,7 +392,7 @@ pub(super) fn stage_transformed_expression(
                 // estimate.
                 existing
                     .logical_properties
-                    .merge_equivalent_facts(&logical_properties);
+                    .merge_equivalent_facts(&logical_properties)?;
                 existing.cardinality =
                     std::mem::take(&mut existing.cardinality).canonical_with(cardinality.clone());
                 return Ok(Some((
@@ -600,7 +521,7 @@ pub(super) fn stage_transformed_expression(
         let (payload, baseline_payload) = state.payloads.push_logical(PlannerLogicalPayload {
             semantic_template,
             operator_encoding: operator_encoding.clone(),
-            column_stats: options.column_stats.clone(),
+            column_stats: column_stats.clone(),
         });
         let search = search_candidate
             .map(|search_plan| {
@@ -614,18 +535,15 @@ pub(super) fn stage_transformed_expression(
                         binding_ids: &state.binding_ids,
                         operator_fingerprint,
                         output_rows_hard_upper,
-                        column_stats: options.column_stats.as_ref(),
+                        column_stats: column_stats.as_ref(),
                         scan_access_cost: state.scan_access_cost,
                     },
                     &mut state.payloads,
                 )
             })
             .transpose()?;
-        // Physical admission and costing need the recursively reattached
-        // semantic tree. `plan` is deliberately only an interned operator
-        // shell whose children are DummyScan placeholders; consulting it for
-        // lineage, widths, or child statistics would make every transformed
-        // join appear to have no rowset consumer.
+        // Physical admission consumes the bound semantic window. `plan` is
+        // an interned scalar shell with no child ownership at all.
         let implementations =
             planner_implementation_set(&semantic_plan, state.rowset_scan_pushdown);
         if let LogicalOperator::Join(Join::Comparison(join)) = &semantic_plan.operator {
@@ -678,7 +596,7 @@ pub(super) fn stage_transformed_expression(
             spillable: planner_operator_spillable(&semantic_plan.operator),
             cost_facts: planner_cost_facts(
                 &semantic_plan,
-                options.column_stats.as_ref(),
+                column_stats.as_ref(),
                 &state.binding_ids,
                 state.scan_access_cost,
             )?,
@@ -805,51 +723,132 @@ pub(super) fn stage_transformed_expression(
         )))
     }
 
-    let search_context =
-        if crate::search::optimizer::SearchOptimizer::contains_candidate_root(&plan) {
-            let session_context = state
-                .session
-                .clone()
-                .ok_or_else(|| paro_error::internal("search planning has no statement context"))?;
-            let mut search_context = crate::context::OptimizationContext::new(
-                session_context,
-                state.bind_context.clone(),
-            );
-            search_context.column_stats = column_stats.clone();
-            search_context.cost_model = state.cost_model.clone();
-            search_context.verify_enabled = state.verify_enabled;
-            Some(search_context)
-        } else {
-            None
-        };
+    let provider_roots = crate::search::optimizer::SearchOptimizer::candidate_arena_roots(&plan)?;
+    let search_context = if !provider_roots.is_empty() {
+        let session_context = state
+            .session
+            .clone()
+            .ok_or_else(|| paro_error::internal("search planning has no statement context"))?;
+        let mut search_context =
+            crate::context::OptimizationContext::new(session_context, state.bind_context.clone());
+        search_context.column_stats = column_stats.clone();
+        search_context.cost_model = state.cost_model.clone();
+        search_context.verify_enabled = state.verify_enabled;
+        Some(search_context)
+    } else {
+        None
+    };
 
+    // Search providers consume an explicit bounded Filter/TopN pattern. Read
+    // that window before detaching its children; the rest of staging operates
+    // on scalar shells and immutable group facts, never rebuilt descendants.
+    let mut search_candidates = HashMap::new();
+    if let Some(context) = &search_context {
+        for index in provider_roots {
+            let node = plan
+                .arena()
+                .export_checked(index, || context.session.cancellation.check())?;
+            if let Some(candidate) = crate::search::optimizer::SearchOptimizer::new()
+                .physical_candidate_for_root(&node, context)?
+            {
+                if search_candidates.insert(node.id, candidate).is_some() {
+                    return Err(paro_error::internal(
+                        "search provider has ambiguous occurrence identity",
+                    ));
+                }
+            }
+        }
+    }
     let (root, staged, pending_runtime_filter_facets) = {
         let mut session = StagingSession {
             memo,
             state,
             options: StagingOptions {
                 column_stats: &column_stats,
-                search_context: search_context.as_ref(),
+                column_stat_scopes: &column_stat_scopes,
                 rule,
                 group_budget: budget_class.group_dimension(),
             },
             pending_runtime_filter_facets: Vec::new(),
             nested_group_holes,
+            facts: input_facts,
+            search_candidates,
         };
-        let Some((_, root, staged)) = stage_node(
-            &mut session,
-            NodeStagingRequest {
-                plan,
-                target: Some(target),
-                required_region_facet: preserved_region_facet,
-                inherited_runtime_filter_facet,
-                node_context: input_context,
-                target_child_context: Some(child_context),
-                refined_cardinality_kind,
-            },
-        )?
-        else {
-            return Ok(None);
+        use paro_planner::plan::arena::{LogicalPlanNode, PlanIndex};
+        let (arena, root_index) = plan.into_parts();
+        let mut completed = BTreeMap::<PlanIndex, (LogicalPlanNode<()>, NodeState)>::new();
+        let mut root_result = None;
+        for index in arena.post_order(root_index)? {
+            if let Some(statement) = &session.state.session {
+                statement.cancellation.check()?;
+            }
+            let node = arena.get(index)?.clone();
+            let is_root = index == root_index;
+            let mut child_states = Vec::new();
+            let operator = node.operator.try_map_child_links(&mut |child| {
+                let (transport, state) = completed
+                    .get(&child)
+                    .ok_or_else(|| paro_error::internal("staging lost an arena input"))?;
+                child_states.push(state.clone());
+                transport.instantiate(transport.id, []).map(Box::new)
+            })?;
+            let plan = OwnedLogicalPlan {
+                id: node.id,
+                stats: node.stats,
+                operator,
+            };
+            let Some(result) = stage_node(
+                &mut session,
+                NodeStagingRequest {
+                    plan,
+                    target: is_root.then_some(target),
+                    required_region_facet: is_root.then_some(preserved_region_facet).flatten(),
+                    inherited_runtime_filter_facet: is_root
+                        .then_some(inherited_runtime_filter_facet)
+                        .flatten(),
+                    node_context: if is_root {
+                        input_context
+                    } else {
+                        child_context
+                    },
+                    target_child_context: is_root.then_some(child_context),
+                    refined_cardinality_kind: is_root.then_some(refined_cardinality_kind).flatten(),
+                },
+                child_states,
+            )?
+            else {
+                return Ok(None);
+            };
+            let (mut plan, node, staged) = result;
+            if !is_root && !matches!(plan.operator, LogicalOperator::BoundReference(_)) {
+                session
+                    .facts
+                    .settle_group(session.memo, session.state, node.group)?;
+                let layout = PlannerBindingLayout {
+                    bindings: plan.get_column_bindings().into_boxed_slice(),
+                    types: plan.types().into_boxed_slice(),
+                };
+                let facts =
+                    session
+                        .facts
+                        .transport(session.memo, session.state, node.group, &layout)?;
+                let reference = paro_planner::operator::BoundReference::new(
+                    plan.id.0,
+                    layout.bindings.into_vec(),
+                    layout.types.into_vec(),
+                )
+                .with_facts(facts);
+                plan.operator = LogicalOperator::BoundReference(reference);
+            }
+            if is_root {
+                root_result = Some((node, staged));
+            } else {
+                debug_assert!(staged.is_none());
+                completed.insert(index, (LogicalPlanNode::from_shell(plan), node));
+            }
+        }
+        let Some((root, staged)) = root_result else {
+            return Err(paro_error::internal("staging has no completed root"));
         };
         if !session.nested_group_holes.is_empty() {
             return Err(paro_error::internal(
@@ -879,7 +878,7 @@ pub(super) fn stage_transformed_expression(
             FacetCriticality::Required => memo.budget().max_mandatory_region_groups as usize,
             FacetCriticality::Optional => usize::from(memo.budget().max_composite_region_groups),
         };
-        let (scope, overflow) = root.region_scope.materialize_bounded(ceiling);
+        let (scope, overflow) = root.region_scope.materialize_bounded(memo, ceiling);
         if overflow && facet.criticality == FacetCriticality::Required {
             return Err(paro_error::internal(
                 "required planning-region closure exceeds query complexity ceiling",
@@ -940,7 +939,12 @@ mod tests {
 
     use super::*;
 
-    fn test_base_get(table_index: usize, object_id: u64, name: &str, rows: u64) -> OwnedLogicalPlan {
+    fn test_base_get(
+        table_index: usize,
+        object_id: u64,
+        name: &str,
+        rows: u64,
+    ) -> OwnedLogicalPlan {
         let storage = Arc::new(
             TableFactory::default()
                 .create_table(&[LogicalType::Integer])
@@ -968,7 +972,11 @@ mod tests {
         plan
     }
 
-    fn equality_join(left: OwnedLogicalPlan, right: OwnedLogicalPlan, rows: u64) -> OwnedLogicalPlan {
+    fn equality_join(
+        left: OwnedLogicalPlan,
+        right: OwnedLogicalPlan,
+        rows: u64,
+    ) -> OwnedLogicalPlan {
         let condition = JoinCondition::equality(
             Expression::Reference(ReferenceExpression::new(0, LogicalType::Integer)),
             Expression::Reference(ReferenceExpression::new(0, LogicalType::Integer)),
@@ -1014,8 +1022,11 @@ mod tests {
         state.session = Some(TestStatementContextBuilder::minimal().build());
         let staged = stage_transformed_expression(
             StagingRequest {
-                plan: union(project(2), project(3)),
+                input_facts: boundary::BoundarySnapshot::default(),
+                plan: paro_planner::plan::LogicalPlan::from_owned(union(project(2), project(3)))
+                    .unwrap(),
                 column_stats: Arc::new(HashMap::new()),
+                column_stat_scopes: HashMap::new(),
                 target: StagingTarget {
                     group: input.root,
                     rule: RuleId(999),
@@ -1086,8 +1097,10 @@ mod tests {
                     memo.create_group(schema, properties, cardinality);
                     stage_transformed_expression(
                         StagingRequest {
-                            plan: staged_plan,
+                            plan: paro_planner::plan::LogicalPlan::from_owned(staged_plan).unwrap(),
+                            input_facts: boundary::BoundarySnapshot::default(),
                             column_stats: Arc::new(HashMap::new()),
+                            column_stat_scopes: HashMap::new(),
                             target: StagingTarget {
                                 group: root,
                                 rule: RuleId(999),
@@ -1152,8 +1165,10 @@ mod tests {
                 |memo, state| {
                     stage_transformed_expression(
                         StagingRequest {
-                            plan: transformed,
+                            plan: paro_planner::plan::LogicalPlan::from_owned(transformed).unwrap(),
+                            input_facts: boundary::BoundarySnapshot::default(),
                             column_stats: Arc::new(HashMap::new()),
+                            column_stat_scopes: HashMap::new(),
                             target: StagingTarget {
                                 group: root,
                                 rule: JOIN_REGION_ENUMERATION_RULE,

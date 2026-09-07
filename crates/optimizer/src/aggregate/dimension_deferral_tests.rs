@@ -3,7 +3,7 @@
 
 use paro_planner::operator::{ColumnBinding, Join, LogicalOperator};
 use paro_planner::plan::{
-    CardinalityEstimate, CardinalityProvenance, OwnedLogicalPlan, NodeStats, PlanNodeId,
+    CardinalityEstimate, CardinalityProvenance, NodeStats, OwnedLogicalPlan, PlanNodeId,
 };
 use paro_planner::planner::Planner;
 
@@ -285,7 +285,10 @@ fn annotate_cardinalities(plan: OwnedLogicalPlan) -> OwnedLogicalPlan {
     annotate_cardinalities_with_join_rows(plan, 10_000)
 }
 
-fn annotate_cardinalities_with_join_rows(plan: OwnedLogicalPlan, join_rows: u64) -> OwnedLogicalPlan {
+fn annotate_cardinalities_with_join_rows(
+    plan: OwnedLogicalPlan,
+    join_rows: u64,
+) -> OwnedLogicalPlan {
     plan.try_map_post_order(|mut plan| {
         let expected = match &plan.operator {
             LogicalOperator::Get(get) => match get

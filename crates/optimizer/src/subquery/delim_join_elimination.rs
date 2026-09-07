@@ -1051,9 +1051,9 @@ mod tests {
             99,
             vec![LogicalType::Integer],
         )));
-        let cross = OwnedLogicalPlan::synthetic(LogicalOperator::Join(Join::Cross(CrossProduct::new(
-            base, delim,
-        ))));
+        let cross = OwnedLogicalPlan::synthetic(LogicalOperator::Join(Join::Cross(
+            CrossProduct::new(base, delim),
+        )));
         let correlated = comparison(ComparisonType::Equal, column(1), column(99));
         let local = comparison(
             ComparisonType::GreaterThan,
@@ -1122,10 +1122,9 @@ mod tests {
         let fact_and_delim = OwnedLogicalPlan::synthetic(LogicalOperator::Join(Join::Cross(
             CrossProduct::new(fact, delim),
         )));
-        let region = OwnedLogicalPlan::synthetic(LogicalOperator::Join(Join::Cross(CrossProduct::new(
-            fact_and_delim,
-            dimension,
-        ))));
+        let region = OwnedLogicalPlan::synthetic(LogicalOperator::Join(Join::Cross(
+            CrossProduct::new(fact_and_delim, dimension),
+        )));
         let correlated = comparison(ComparisonType::Equal, column(1), column(99));
         let side_local = comparison(ComparisonType::Equal, column(1), column(2));
         let filtered = OwnedLogicalPlan::synthetic(LogicalOperator::Filter(Filter::new(

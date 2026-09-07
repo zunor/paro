@@ -15,7 +15,10 @@ impl InClauseRewriter {
         Self
     }
 
-    pub fn rewrite(&mut self, plan: OwnedLogicalPlan) -> paro_common::error::Result<OwnedLogicalPlan> {
+    pub fn rewrite(
+        &mut self,
+        plan: OwnedLogicalPlan,
+    ) -> paro_common::error::Result<OwnedLogicalPlan> {
         plan.try_map_post_order(|plan| Ok(self.rewrite_current(plan)))
     }
 

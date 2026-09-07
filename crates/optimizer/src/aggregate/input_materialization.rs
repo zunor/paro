@@ -24,7 +24,10 @@ use paro_planner::plan::OwnedLogicalPlan;
 
 use crate::expression::traversal::visit_expression;
 
-pub fn optimize_plan(plan: OwnedLogicalPlan, bind_context: &BindContext) -> Result<(OwnedLogicalPlan, bool)> {
+pub fn optimize_plan(
+    plan: OwnedLogicalPlan,
+    bind_context: &BindContext,
+) -> Result<(OwnedLogicalPlan, bool)> {
     let mut changed = false;
     let plan = plan.try_map_post_order(|mut plan| {
         if let LogicalOperator::Aggregate(aggregate) = &mut plan.operator {
@@ -47,7 +50,7 @@ pub fn optimize_plan(plan: OwnedLogicalPlan, bind_context: &BindContext) -> Resu
 /// Scalar-only prerequisite used by Memo root dispatch. Join alternatives can
 /// decide where a candidate is placed, but can never manufacture a narrowing,
 /// total aggregate input when the aggregate shell has none.
-pub(crate) fn recognizes_aggregate(operator: &LogicalOperator) -> bool {
+pub(crate) fn recognizes_aggregate<Child>(operator: &LogicalOperator<Child>) -> bool {
     let LogicalOperator::Aggregate(aggregate) = operator else {
         return false;
     };
@@ -300,7 +303,10 @@ fn wrap_projection(
     bind_context: &BindContext,
 ) -> Option<MaterializedInput> {
     let expression_bindings = expression_bindings(expression)?;
-    let original = std::mem::replace(plan, OwnedLogicalPlan::synthetic(LogicalOperator::DummyScan));
+    let original = std::mem::replace(
+        plan,
+        OwnedLogicalPlan::synthetic(LogicalOperator::DummyScan),
+    );
     let old_bindings = original.get_column_bindings();
     let old_types = original.types();
     if old_bindings.len() != old_types.len()

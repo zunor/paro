@@ -22,7 +22,7 @@ use paro_planner::expression::{
 use paro_planner::operator::{
     Aggregate, ColumnBinding, ComparisonJoin, Join, JoinComparisonType, JoinType, LogicalOperator,
 };
-use paro_planner::plan::{OwnedLogicalPlan, NodeStats, PlanNodeId};
+use paro_planner::plan::{NodeStats, OwnedLogicalPlan, PlanNodeId};
 
 use crate::expression::traversal::visit_expression;
 
@@ -31,7 +31,10 @@ mod join_region;
 /// Produce one root-local aggregate alternative. Memo owns traversal and rule
 /// scheduling; recursively rewriting descendants here would duplicate work
 /// and make one firing consume unrelated equivalence groups.
-pub fn optimize_plan(plan: OwnedLogicalPlan, bind_context: &BindContext) -> Result<(OwnedLogicalPlan, bool)> {
+pub fn optimize_plan(
+    plan: OwnedLogicalPlan,
+    bind_context: &BindContext,
+) -> Result<(OwnedLogicalPlan, bool)> {
     rewrite_node(plan, bind_context)
 }
 
@@ -70,7 +73,10 @@ struct DimensionRewriteInput {
     join: ComparisonJoin,
 }
 
-fn rewrite_node(plan: OwnedLogicalPlan, bind_context: &BindContext) -> Result<(OwnedLogicalPlan, bool)> {
+fn rewrite_node(
+    plan: OwnedLogicalPlan,
+    bind_context: &BindContext,
+) -> Result<(OwnedLogicalPlan, bool)> {
     let plan = join_region::isolate_widest_dimension(plan, bind_context)?;
     let Some(witness) = recognize(&plan) else {
         return Ok((plan, false));

@@ -13,6 +13,77 @@ pub fn verify_logical_plan(_bind_context: &BindContext, plan: &OwnedLogicalPlan)
     verify_plan(_bind_context, &plan.operator)
 }
 
+/// Validate every arena shell against its immediate input schemas. No owned
+/// descendant tree is reconstructed, including in verification-enabled runs.
+pub(crate) fn verify_arena_plan(
+    plan: &paro_planner::plan::LogicalPlan,
+    mut check: impl FnMut() -> Result<()>,
+) -> Result<()> {
+    let arena = plan.arena();
+    let mut graph_scopes = std::collections::BTreeMap::new();
+    let mut verifier = Verifier {
+        seen_table_indices: HashSet::new(),
+    };
+    for index in arena.post_order_checked(plan.root(), &mut check)? {
+        check()?;
+        let node = arena.get(index)?;
+        let graph_scope =
+            match &node.operator {
+                LogicalOperator::GraphScan(scan) => Some(GraphProjectionScope {
+                    materialized_table_indices: HashSet::from([scan.table_index]),
+                    carrier_bindings: arena.output_layout(index)?.bindings().to_vec(),
+                }),
+                LogicalOperator::GraphExpand(expand) => graph_scopes
+                    .get(&expand.child)
+                    .cloned()
+                    .map(|mut scope: GraphProjectionScope| {
+                        scope
+                            .materialized_table_indices
+                            .extend([expand.edge_table_index, expand.target_table_index]);
+                        scope.carrier_bindings =
+                            arena.output_layout(index).unwrap().bindings().to_vec();
+                        scope
+                    }),
+                LogicalOperator::Filter(filter) => graph_scopes.get(&filter.child).cloned(),
+                LogicalOperator::EmptyResult(empty) => graph_scopes.get(&empty.child).cloned(),
+                _ => None,
+            };
+        if let Some(mut scope) = graph_scope {
+            scope.carrier_bindings = arena.output_layout(index)?.bindings().to_vec();
+            graph_scopes.insert(index, scope);
+        }
+        let projection_scope = match &node.operator {
+            LogicalOperator::Projection(projection) => graph_scopes.get(&projection.child),
+            _ => None,
+        };
+        let operator = node.operator.clone().try_map_child_links(&mut |child| {
+            let input = arena.get(child)?;
+            let layout = arena.output_layout(child)?;
+            Ok::<_, paro_common::error::ParoError>(Box::new(OwnedLogicalPlan {
+                id: input.id,
+                stats: input.stats.clone(),
+                operator: LogicalOperator::BoundReference(
+                    paro_planner::operator::BoundReference::new(
+                        input.id.0,
+                        layout.bindings().to_vec(),
+                        layout.types().to_vec(),
+                    ),
+                ),
+            }))
+        })?;
+        for table in operator.get_table_index() {
+            if !verifier.seen_table_indices.insert(table) {
+                return Err(paro_error::internal(format!(
+                    "Duplicate table index {table} in logical arena"
+                )));
+            }
+        }
+        verifier.verify_operator_invariants_with_scope(&operator, projection_scope)?;
+        verifier.verify_operator_expressions(&operator)?;
+    }
+    Ok(())
+}
+
 fn verify_plan(_bind_context: &BindContext, plan: &LogicalOperator) -> Result<()> {
     let mut verifier = Verifier {
         seen_table_indices: HashSet::new(),
@@ -24,7 +95,7 @@ struct Verifier {
     seen_table_indices: HashSet<usize>,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 struct GraphProjectionScope {
     materialized_table_indices: HashSet<usize>,
     carrier_bindings: Vec<ColumnBinding>,
@@ -89,6 +160,14 @@ impl Verifier {
     }
 
     fn verify_operator_invariants(&self, op: &LogicalOperator) -> Result<()> {
+        self.verify_operator_invariants_with_scope(op, None)
+    }
+
+    fn verify_operator_invariants_with_scope(
+        &self,
+        op: &LogicalOperator,
+        graph_scope: Option<&GraphProjectionScope>,
+    ) -> Result<()> {
         let binding_len = op.get_column_bindings().len();
         let type_len = op.types().len();
         if binding_len != type_len {
@@ -215,9 +294,13 @@ impl Verifier {
                         )));
                     }
                 }
-                if let Some(scope) = GraphProjectionScope::from_plan(proj.child.as_ref()) {
+                let owned_scope = graph_scope
+                    .is_none()
+                    .then(|| GraphProjectionScope::from_plan(proj.child.as_ref()))
+                    .flatten();
+                if let Some(scope) = graph_scope.or(owned_scope.as_ref()) {
                     for expression in &proj.expressions {
-                        self.verify_graph_projection_bindings(expression, &scope)?;
+                        self.verify_graph_projection_bindings(expression, scope)?;
                     }
                 } else {
                     let child_bindings = proj.child.get_column_bindings();

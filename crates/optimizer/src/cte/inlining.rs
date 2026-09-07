@@ -43,7 +43,10 @@ impl<'a> CTEInlining<'a> {
         self.optimize_plan_with_change(plan).0
     }
 
-    pub fn optimize_plan_with_change(&mut self, plan: OwnedLogicalPlan) -> (OwnedLogicalPlan, bool) {
+    pub fn optimize_plan_with_change(
+        &mut self,
+        plan: OwnedLogicalPlan,
+    ) -> (OwnedLogicalPlan, bool) {
         self.rewrite_plan(plan)
     }
 
@@ -51,7 +54,10 @@ impl<'a> CTEInlining<'a> {
     /// nested owners. Memo combines this local choice with each child group's
     /// winner; recursively rewriting here would collapse independent sharing
     /// decisions into only "all inline" and "all materialized" shapes.
-    pub fn optimize_root_with_change(&mut self, plan: OwnedLogicalPlan) -> (OwnedLogicalPlan, bool) {
+    pub fn optimize_root_with_change(
+        &mut self,
+        plan: OwnedLogicalPlan,
+    ) -> (OwnedLogicalPlan, bool) {
         let (id, stats, operator) = plan.into_parts();
         let (operator, changed) = self.try_inline(operator);
         (
@@ -288,7 +294,8 @@ mod tests {
             ),
         ));
 
-        let optimized = CTEInlining::new(&bind_context).optimize_plan(OwnedLogicalPlan::synthetic(plan));
+        let optimized =
+            CTEInlining::new(&bind_context).optimize_plan(OwnedLogicalPlan::synthetic(plan));
         verify_logical_plan(&bind_context, &optimized).expect("plan should verify after inlining");
         assert_eq!(optimized.operator.output_names(), ["v"]);
         assert!(!matches!(
@@ -327,7 +334,8 @@ mod tests {
             ),
         ));
 
-        let optimized = CTEInlining::new(&bind_context).optimize_plan(OwnedLogicalPlan::synthetic(plan));
+        let optimized =
+            CTEInlining::new(&bind_context).optimize_plan(OwnedLogicalPlan::synthetic(plan));
         verify_logical_plan(&bind_context, &optimized)
             .expect("plan should verify after multi-inline");
         assert!(!matches!(

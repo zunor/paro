@@ -20,6 +20,10 @@ use crate::rules::move_constants::MoveConstantsRule;
 /// Restore canonical scalar form after a relational substitution combines
 /// expressions that were previously separated by an operator boundary.
 pub(crate) fn normalize_scalar_expressions(plan: &mut OwnedLogicalPlan) {
+    scalar_normalizer().rewrite_plan(plan);
+}
+
+pub(crate) fn scalar_normalizer() -> rewriter::ExpressionRewriter {
     let mut rewriter = rewriter::ExpressionRewriter::new();
     rewriter.add_rule(Box::new(ConstantFoldingRule::new()));
     rewriter.add_rule(Box::new(ArithmeticSimplificationRule::new()));
@@ -27,10 +31,10 @@ pub(crate) fn normalize_scalar_expressions(plan: &mut OwnedLogicalPlan) {
     rewriter.add_rule(Box::new(ConjunctionSimplificationRule::new()));
     rewriter.add_rule(Box::new(CommonConjunctionFactorRule::new()));
     rewriter.add_rule(Box::new(MoveConstantsRule::new()));
-    rewriter.rewrite_plan(plan);
+    rewriter
 }
 
-pub(crate) fn join_has_evaluation_fence(join: &Join) -> bool {
+pub(crate) fn join_has_evaluation_fence<Child>(join: &Join<Child>) -> bool {
     match join {
         Join::Comparison(join) => comparison_join_has_evaluation_fence(join),
         Join::Any(join) => join.condition.evaluation_properties().is_reorder_fence(),
@@ -65,7 +69,7 @@ pub(crate) fn comparison_join_tree_has_evaluation_fence(join: &ComparisonJoin) -
             .any(|child| join_region_has_evaluation_fence(&child.operator))
 }
 
-fn comparison_join_has_evaluation_fence(join: &ComparisonJoin) -> bool {
+pub(crate) fn comparison_join_has_evaluation_fence<Child>(join: &ComparisonJoin<Child>) -> bool {
     join.conditions.iter().any(|condition| {
         condition.left.evaluation_properties().is_reorder_fence()
             || condition.right.evaluation_properties().is_reorder_fence()

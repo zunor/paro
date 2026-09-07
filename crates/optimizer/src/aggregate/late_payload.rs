@@ -75,7 +75,9 @@ pub fn optimize_matched_prefix_plan(plan: OwnedLogicalPlan) -> Result<(OwnedLogi
     })
 }
 
-pub(crate) fn rewrite_matched_prefix_node(plan: OwnedLogicalPlan) -> Result<(OwnedLogicalPlan, bool)> {
+pub(crate) fn rewrite_matched_prefix_node(
+    plan: OwnedLogicalPlan,
+) -> Result<(OwnedLogicalPlan, bool)> {
     match prove_matched_prefix_candidate(&plan) {
         Some(proof) => Ok((apply_matched_prefix_rewrite(plan, proof)?, true)),
         None => Ok((plan, false)),
@@ -1026,7 +1028,10 @@ fn prove_rowid_path(
 }
 
 #[cfg(test)]
-pub(super) fn proves_row_preserving_path(plan: &OwnedLogicalPlan, source_table_index: usize) -> bool {
+pub(super) fn proves_row_preserving_path(
+    plan: &OwnedLogicalPlan,
+    source_table_index: usize,
+) -> bool {
     prove_rowid_path(plan, source_table_index, RowIdPathPolicy::RowPreserving).is_some()
 }
 
@@ -1345,7 +1350,9 @@ fn apply_rewrite(
     let carrier = Projection::new(carrier_table_index, aggregate_plan, carrier_expressions)
         .with_visible_names(carrier_names)
         .with_internal_outputs();
-    topn.child = Box::new(OwnedLogicalPlan::synthetic(LogicalOperator::Projection(carrier)));
+    topn.child = Box::new(OwnedLogicalPlan::synthetic(LogicalOperator::Projection(
+        carrier,
+    )));
     let topn_plan = OwnedLogicalPlan {
         id: topn_id,
         stats: topn_stats.clone(),

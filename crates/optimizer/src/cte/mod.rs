@@ -2,8 +2,6 @@
 // SPDX-License-Identifier: Apache-2.0
 
 mod deep_copy;
-pub mod demand_pushdown;
-pub mod filter_pusher;
 pub mod inlining;
 pub(crate) mod iteration;
-pub(crate) mod partitioned_materialization;
+pub(crate) mod predicate_domain;

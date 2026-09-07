@@ -17,7 +17,7 @@ use paro_planner::operator::{
     SetOpType,
 };
 use paro_planner::plan::{
-    CardinalityEstimate, CardinalityProvenance, OwnedLogicalPlan, LogicalPlanPostOrderFolder,
+    CardinalityEstimate, CardinalityProvenance, LogicalPlanPostOrderFolder, OwnedLogicalPlan,
 };
 use paro_storage::index::graph::GraphStatsProvider;
 use paro_storage::statistics::{BaseStatistics, ColumnStatistics};
@@ -83,10 +83,10 @@ struct GatheredNodeProperties {
 impl LogicalPlanPostOrderFolder<GatheredNodeProperties> for StatisticsGatherFolder<'_> {
     fn child_completed(
         &mut self,
-        parent_skeleton: &OwnedLogicalPlan,
-        completed_children: &[OwnedLogicalPlan],
+        parent_skeleton: &paro_planner::plan::arena::LogicalPlanNode<()>,
+        completed_children: &[Box<OwnedLogicalPlan>],
         completed_properties: &[GatheredNodeProperties],
-        remaining_children: &[OwnedLogicalPlan],
+        remaining_children: &[Box<OwnedLogicalPlan>],
     ) -> Result<()> {
         self.gathering.publish_completed_first_child(
             parent_skeleton,
@@ -100,34 +100,17 @@ impl LogicalPlanPostOrderFolder<GatheredNodeProperties> for StatisticsGatherFold
 
     fn fold(
         &mut self,
-        mut plan: OwnedLogicalPlan,
+        plan: OwnedLogicalPlan,
         child_properties: Vec<GatheredNodeProperties>,
     ) -> Result<(OwnedLogicalPlan, GatheredNodeProperties)> {
         let (child_layouts, child_maximum_cardinalities): (Vec<_>, Vec<_>) = child_properties
             .into_iter()
             .map(|properties| (properties.layout, properties.maximum_cardinality))
             .unzip();
-        if plan.stats.cardinality_provenance != CardinalityProvenance::JoinGraph {
-            plan.stats.estimated_cardinality =
-                self.gathering
-                    .estimate_plan_cardinality(&plan, &child_layouts, self.context);
-            plan.stats.cardinality_provenance = CardinalityProvenance::Statistics;
-        }
-        let output_layout = plan.operator.output_layout_from_children(&child_layouts);
-        let maximum_cardinality = crate::statistics::cardinality_bound::derive_maximum_cardinality(
-            &plan.operator,
+        let (plan, output_layout, maximum_cardinality) = self.gathering.gather_local(
+            plan,
+            &child_layouts,
             &child_maximum_cardinalities,
-        );
-        plan.stats.unique_keys = crate::statistics::unique_keys::derive_local_unique_keys(
-            &plan.operator,
-            &output_layout,
-            &child_layouts,
-        );
-        self.gathering.update_output_column_stats(
-            &plan,
-            &output_layout,
-            &child_layouts,
-            maximum_cardinality,
             self.context,
         );
         Ok((
@@ -143,6 +126,46 @@ impl LogicalPlanPostOrderFolder<GatheredNodeProperties> for StatisticsGatherFold
 impl StatisticsGathering {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Derive one operator from completed input facts. This entry point never
+    /// visits descendants and is used by incremental arena settlement.
+    pub(crate) fn gather_local(
+        &mut self,
+        mut plan: OwnedLogicalPlan,
+        child_layouts: &[LogicalOutputLayout],
+        child_maximum_cardinalities: &[Option<u64>],
+        ctx: &mut OptimizationContext,
+    ) -> (OwnedLogicalPlan, LogicalOutputLayout, Option<u64>) {
+        if plan.stats.cardinality_provenance != CardinalityProvenance::JoinGraph {
+            plan.stats.estimated_cardinality =
+                self.estimate_plan_cardinality(&plan, child_layouts, ctx);
+            plan.stats.cardinality_provenance = CardinalityProvenance::Statistics;
+        }
+        let output = plan.operator.output_layout_from_children(child_layouts);
+        let maximum = crate::statistics::cardinality_bound::derive_maximum_cardinality(
+            &plan.operator,
+            child_maximum_cardinalities,
+        );
+        plan.stats.unique_keys = crate::statistics::unique_keys::derive_local_unique_keys(
+            &plan.operator,
+            &output,
+            child_layouts,
+        );
+        self.update_output_column_stats(&plan, &output, child_layouts, maximum, ctx);
+        (plan, output, maximum)
+    }
+
+    pub(crate) fn bind_cte_domain(
+        &mut self,
+        index: usize,
+        cardinality: Option<CardinalityEstimate>,
+        columns: Vec<Arc<ColumnStatistics>>,
+    ) {
+        if let Some(cardinality) = cardinality {
+            self.cte_cardinality.insert(index, cardinality);
+        }
+        self.cte_output_stats.insert(index, columns);
     }
 
     pub fn gather(
@@ -163,10 +186,10 @@ impl StatisticsGathering {
     /// explicitly instead of relying on native call-stack sequencing.
     fn publish_completed_first_child(
         &mut self,
-        parent_skeleton: &OwnedLogicalPlan,
-        completed_children: &[OwnedLogicalPlan],
+        parent_skeleton: &paro_planner::plan::arena::LogicalPlanNode<()>,
+        completed_children: &[Box<OwnedLogicalPlan>],
         completed_properties: &[GatheredNodeProperties],
-        remaining_children: &[OwnedLogicalPlan],
+        remaining_children: &[Box<OwnedLogicalPlan>],
         ctx: &OptimizationContext,
     ) {
         if completed_children.len() != 1 {
@@ -272,7 +295,7 @@ impl StatisticsGathering {
             // argument plans before an external table multiplies by its
             // per-invocation row estimate.
             LogicalOperator::DummyScan => Some(CardinalityEstimate::exact(1)),
-            LogicalOperator::BoundReference(_) => plan.stats.estimated_cardinality,
+            LogicalOperator::BoundReference(reference) => reference.facts.cardinality,
             LogicalOperator::Get(get) => Some(CardinalityEstimate::exact(
                 self.get_storage_rows(get, ctx) as u64,
             )),
@@ -718,9 +741,7 @@ impl StatisticsGathering {
     ) {
         let output_stats = match &plan.operator {
             LogicalOperator::Get(get) => self.get_output_stats(get, ctx),
-            LogicalOperator::BoundReference(_) => {
-                collect_output_stats_for_layout(output_layout, ctx)
-            }
+            LogicalOperator::BoundReference(reference) => reference.column_statistics(),
             LogicalOperator::Projection(proj) => proj
                 .expressions
                 .iter()
@@ -1110,7 +1131,8 @@ fn filter_output_stats(
             return;
         };
         *statistics = Arc::new(
-            ColumnStatistics::new(domain).with_guaranteed_distinct_upper(values.len() as u64),
+            ColumnStatistics::with_estimated_distinct(domain, Some(values.len()))
+                .with_guaranteed_distinct_upper(values.len() as u64),
         );
     }
 
@@ -1677,7 +1699,11 @@ mod tests {
         )
     }
 
-    fn values_relation(bind_context: &BindContext, table_index: usize, rows: usize) -> OwnedLogicalPlan {
+    fn values_relation(
+        bind_context: &BindContext,
+        table_index: usize,
+        rows: usize,
+    ) -> OwnedLogicalPlan {
         OwnedLogicalPlan::new(
             bind_context,
             LogicalOperator::ExpressionGet(ExpressionGet::new(
@@ -1836,8 +1862,10 @@ mod tests {
                     vec![equality(1, 0, 9, 0)],
                 );
                 join.duplicate_eliminated_columns = vec![column_ref(1, 0)];
-                let plan =
-                    OwnedLogicalPlan::new(&bind_context, LogicalOperator::Join(Join::Comparison(join)));
+                let plan = OwnedLogicalPlan::new(
+                    &bind_context,
+                    LogicalOperator::Join(Join::Comparison(join)),
+                );
 
                 let gathered = StatisticsGathering::new()
                     .gather(plan, &mut ctx)
@@ -2085,7 +2113,8 @@ mod tests {
             vec![equality(1, 0, 9, 0)],
         );
         join.duplicate_eliminated_columns = vec![column_ref(1, 0)];
-        let plan = OwnedLogicalPlan::new(&bind_context, LogicalOperator::Join(Join::Comparison(join)));
+        let plan =
+            OwnedLogicalPlan::new(&bind_context, LogicalOperator::Join(Join::Comparison(join)));
 
         let gathered = StatisticsGathering::new()
             .gather(plan, &mut ctx)
@@ -2271,7 +2300,7 @@ mod tests {
 
         let output = filter_output_stats(&filter, &filter.child.output_layout(), &ctx);
         assert_eq!(output.len(), 1);
-        assert_eq!(output[0].get_distinct_count(), 0);
+        assert_eq!(output[0].get_distinct_count(), 1);
         assert_eq!(
             output[0].statistics().min_value(),
             Some(Value::BigInt(2001))
@@ -2380,7 +2409,7 @@ mod tests {
 
         let output = filter_output_stats(&filter, &filter.child.output_layout(), &ctx);
         assert_eq!(output.len(), 1);
-        assert_eq!(output[0].get_distinct_count(), 0);
+        assert_eq!(output[0].get_distinct_count(), 2);
         assert_eq!(output[0].guaranteed_distinct_upper(), Some(2));
         assert_eq!(
             output[0].statistics().min_value(),

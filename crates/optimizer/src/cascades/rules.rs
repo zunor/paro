@@ -40,6 +40,8 @@ pub const TOP_N_INTRODUCTION_RULE: RuleId = RuleId(10_022);
 pub const CTE_FILTER_PUSHDOWN_RULE: RuleId = RuleId(10_023);
 pub const CTE_PARTITIONED_MATERIALIZATION_RULE: RuleId = RuleId(10_024);
 pub const AGGREGATE_DIMENSION_SHARING_RULE: RuleId = RuleId(10_025);
+pub const PREDICATE_TRANSFER_RULE: RuleId = RuleId(10_026);
+pub const KEY_DOMAIN_TRANSFER_RULE: RuleId = RuleId(10_027);
 
 const TRANSFORMATION_RULE_NAMES: &[(RuleId, &str)] = &[
     (
@@ -82,6 +84,8 @@ const TRANSFORMATION_RULE_NAMES: &[(RuleId, &str)] = &[
     (SCALAR_AGGREGATE_WINDOW_RULE, "scalar_aggregate_window"),
     (JOIN_REGION_ENUMERATION_RULE, "join_region_enumeration"),
     (TOP_N_INTRODUCTION_RULE, "top_n_introduction"),
+    (PREDICATE_TRANSFER_RULE, "predicate_transfer"),
+    (KEY_DOMAIN_TRANSFER_RULE, "key_domain_transfer"),
 ];
 
 pub fn transformation_rule_name(id: RuleId) -> Option<&'static str> {
@@ -508,7 +512,9 @@ pub trait TransformationRule: Send + Sync {
     /// rules keep the default of one. A bounded whole-region owner may expose
     /// a deterministic frontier, but the engine reserves every possible root
     /// expression before the rule mutates Memo or sidecar state.
-    fn output_bound(&self, _ctx: &RuleContext<'_>) -> usize {
+    /// Only the admitted binding's shells may be inspected here; discovering
+    /// new child alternatives belongs to pattern enumeration and its budget.
+    fn output_bound(&self, _binding: &PatternBinding, _ctx: &RuleContext<'_>) -> usize {
         1
     }
 
@@ -544,12 +550,15 @@ pub trait TransformationRule: Send + Sync {
             .memo
             .logical_expr(expr)
             .ok_or_else(|| paro_error::internal("rule binding lost its root expression"))?;
-        let reads = logical
-            .key
-            .children
-            .iter()
-            .copied()
-            .map(|group| PatternRead::from_group(ctx.memo, group))
+        let reads = std::iter::once(PatternRead::facts_from_group(ctx.memo, ctx.group))
+            .chain(
+                logical
+                    .key
+                    .children
+                    .iter()
+                    .copied()
+                    .map(|group| PatternRead::from_group(ctx.memo, group)),
+            )
             .collect::<Result<Vec<_>>>()?;
         let bindings = self
             .matches(logical, ctx)

@@ -76,7 +76,10 @@ impl FilterPullup {
     }
 
     /// Generate a Filter with the pulled up expressions.
-    fn generate_pullup_filter(child: OwnedLogicalPlan, expressions: Vec<Expression>) -> OwnedLogicalPlan {
+    fn generate_pullup_filter(
+        child: OwnedLogicalPlan,
+        expressions: Vec<Expression>,
+    ) -> OwnedLogicalPlan {
         if expressions.is_empty() {
             return child;
         }

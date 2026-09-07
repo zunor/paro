@@ -213,7 +213,10 @@ impl BuildProbeSideOptimizer {
 
 /// Estimate one atomic logical input consistently for join enumeration and
 /// final build/probe orientation.
-pub(crate) fn estimate_plan_cardinality(session: &StatementContext, plan: &OwnedLogicalPlan) -> usize {
+pub(crate) fn estimate_plan_cardinality(
+    session: &StatementContext,
+    plan: &OwnedLogicalPlan,
+) -> usize {
     if let Some(estimate) = plan.stats.estimated_cardinality {
         return estimate.expected.max(1).min(usize::MAX as u64) as usize;
     }

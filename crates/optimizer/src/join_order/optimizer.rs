@@ -711,11 +711,46 @@ impl JoinOrderOptimizer {
         // but advertising it as an observed output domain makes SEMI/ANTI
         // coverage estimates systematically ignore correlated filtering.
         let hll_is_boundary_observation = matches!(plan.operator, LogicalOperator::Get(_));
+        // Opaque Memo inputs own their occurrence's domain. The binding map
+        // belongs to the rule's original shell and may describe another CTE
+        // restriction or an earlier equivalent expression with the same
+        // column names. Never use it to override the input group's facts.
+        let boundary_columns = match &plan.operator {
+            LogicalOperator::BoundReference(reference) => Some(reference.column_statistics()),
+            LogicalOperator::Get(get) => get
+                .table
+                .as_ref()
+                .and_then(|table| table.get_storage())
+                .map(|storage| {
+                    get.returned_types
+                        .iter()
+                        .enumerate()
+                        .map(|(ordinal, ty)| {
+                            get.stored_column(ordinal)
+                                .and_then(|column| storage.column_statistics(column))
+                                .map(Arc::new)
+                                .unwrap_or_else(|| ColumnStatistics::create_unknown(ty.clone()))
+                        })
+                        .collect::<Vec<_>>()
+                }),
+            _ => None,
+        };
+        if let Some(columns) = &boundary_columns {
+            self.column_stats.extend(
+                plan.get_column_bindings()
+                    .into_iter()
+                    .zip(columns.iter().cloned()),
+            );
+        }
         let distinct_counts = plan
             .get_column_bindings()
             .into_iter()
-            .map(|binding| {
-                let column_stats = self.column_stats.get(&binding);
+            .enumerate()
+            .map(|(ordinal, binding)| {
+                let column_stats = match &boundary_columns {
+                    Some(columns) => columns.get(ordinal),
+                    None => self.column_stats.get(&binding),
+                };
                 let distinct = column_stats
                     .map(|stats| stats.get_distinct_count())
                     .unwrap_or(0);
@@ -734,7 +769,7 @@ impl JoinOrderOptimizer {
                         // rewriting base-column HLL or min/max statistics. The
                         // surviving domain cannot contain more values than rows.
                         distinct.min(cardinality.max(1)),
-                        has_hll && hll_is_boundary_observation,
+                        has_hll && (hll_is_boundary_observation || boundary_columns.is_some()),
                     ),
                 )
             })
@@ -845,12 +880,13 @@ impl JoinOrderOptimizer {
                     if predicates.has_join_conditions() {
                         return Ok(None);
                     }
-                    let mut plan =
-                        OwnedLogicalPlan::synthetic(LogicalOperator::Join(Join::Cross(CrossProduct {
+                    let mut plan = OwnedLogicalPlan::synthetic(LogicalOperator::Join(Join::Cross(
+                        CrossProduct {
                             left: join.left,
                             right: join.right,
                             build_side_constraint: Default::default(),
-                        })));
+                        },
+                    )));
                     Self::set_reconstructed_cardinality(&mut plan, node);
                     plan
                 } else {
@@ -955,7 +991,8 @@ impl JoinOrderOptimizer {
                 &self.column_stats,
             )
         });
-        result = OwnedLogicalPlan::synthetic(LogicalOperator::Filter(Filter::new(result, expressions)));
+        result =
+            OwnedLogicalPlan::synthetic(LogicalOperator::Filter(Filter::new(result, expressions)));
         result.stats.inherit_cardinality_from(&child_stats);
         result.stats.estimated_cardinality = estimated_cardinality;
         result.stats.cardinality_provenance = CardinalityProvenance::JoinGraph;
@@ -1206,10 +1243,11 @@ mod tests {
     fn optimize_converts_filtered_cross_product_to_comparison_join() {
         let session = make_test_session();
         let mut optimizer = JoinOrderOptimizer::new(SelectivityDefaults::default());
-        let cross = OwnedLogicalPlan::synthetic(LogicalOperator::Join(Join::Cross(CrossProduct::new(
-            OwnedLogicalPlan::synthetic(create_scan(0)),
-            OwnedLogicalPlan::synthetic(create_scan(1)),
-        ))));
+        let cross =
+            OwnedLogicalPlan::synthetic(LogicalOperator::Join(Join::Cross(CrossProduct::new(
+                OwnedLogicalPlan::synthetic(create_scan(0)),
+                OwnedLogicalPlan::synthetic(create_scan(1)),
+            ))));
         let equality = Expression::Comparison(paro_planner::expression::ComparisonExpression::new(
             ComparisonType::Equal,
             column_ref(0, 0),
@@ -1226,6 +1264,38 @@ mod tests {
         assert_eq!(join.join_type, JoinType::Inner);
         assert_eq!(join.conditions.len(), 1);
         assert_eq!(join.conditions[0].comparison, JoinComparisonType::Equal);
+    }
+
+    #[test]
+    fn memo_relation_uses_its_domain_instead_of_the_original_shell_snapshot() {
+        use paro_planner::operator::bound_reference::{BoundColumnDomain, BoundRelationFacts};
+        use paro_planner::operator::BoundReference;
+        let session = make_test_session();
+        let context = BindContext::new();
+        let binding = ColumnBinding::new(0, 0);
+        let mut reference = BoundReference::new(0, vec![binding], vec![LogicalType::Integer]);
+        reference.facts = Arc::new(BoundRelationFacts {
+            cardinality: Some(CardinalityEstimate::exact(100)),
+            column_domains: vec![BoundColumnDomain {
+                expected_distinct: Some(17),
+                guaranteed_distinct_upper: Some(20),
+            }],
+            ..BoundRelationFacts::default()
+        });
+        let mut plan = OwnedLogicalPlan::synthetic(LogicalOperator::BoundReference(reference));
+        plan.stats.estimated_cardinality = Some(CardinalityEstimate::exact(100));
+        let mut optimizer = JoinOrderOptimizer::new(SelectivityDefaults::default());
+        optimizer.column_stats.insert(
+            binding,
+            Arc::new(ColumnStatistics::with_estimated_distinct(
+                BaseStatistics::new(LogicalType::Integer),
+                Some(900),
+            )),
+        );
+        optimizer.add_relation_plan(&session, &context, &plan);
+        let stats = optimizer.relation_manager.get_relation_stats();
+        assert_eq!(stats[0].column_distinct_count[&binding].distinct_count, 17);
+        assert!(stats[0].column_distinct_count[&binding].has_expected_distinct);
     }
 
     #[test]
@@ -1259,7 +1329,7 @@ mod tests {
             .get(&ColumnBinding::new(0, 0))
             .expect("projection column should retain its binding-keyed statistics");
         assert_eq!(distinct_count.distinct_count, 9);
-        assert!(!distinct_count.from_hll);
+        assert!(!distinct_count.has_expected_distinct);
     }
 
     #[test]
@@ -1291,7 +1361,7 @@ mod tests {
             .column_distinct_count
             .get(&ColumnBinding::new(0, 0))
             .expect("projection column should retain synthetic statistics");
-        assert!(!distinct_count.from_hll);
+        assert!(!distinct_count.has_expected_distinct);
         assert_eq!(distinct_count.distinct_count, stats[0].cardinality);
         assert!(stats[0].cardinality < 100);
     }
@@ -1318,7 +1388,7 @@ mod tests {
             .get(&ColumnBinding::new(0, 0))
             .expect("projection column should retain its min/max domain");
         assert_eq!(distinct_count.distinct_count, 25);
-        assert!(!distinct_count.from_hll);
+        assert!(!distinct_count.has_expected_distinct);
     }
 
     #[test]
@@ -1731,10 +1801,9 @@ mod tests {
                 vec![LogicalType::Integer],
             ),
         ));
-        let cross = OwnedLogicalPlan::synthetic(LogicalOperator::Join(Join::Cross(CrossProduct::new(
-            cte_ref,
-            OwnedLogicalPlan::synthetic(create_scan(31)),
-        ))));
+        let cross = OwnedLogicalPlan::synthetic(LogicalOperator::Join(Join::Cross(
+            CrossProduct::new(cte_ref, OwnedLogicalPlan::synthetic(create_scan(31))),
+        )));
         let plan = LogicalOperator::Filter(Filter::new(
             cross,
             vec![Expression::Comparison(
@@ -1761,10 +1830,11 @@ mod tests {
     fn optimize_coalesces_single_relation_filters_after_join_reordering() {
         let session = make_test_session();
         let mut optimizer = JoinOrderOptimizer::new(SelectivityDefaults::default());
-        let cross = OwnedLogicalPlan::synthetic(LogicalOperator::Join(Join::Cross(CrossProduct::new(
-            OwnedLogicalPlan::synthetic(create_scan(0)),
-            OwnedLogicalPlan::synthetic(create_scan(1)),
-        ))));
+        let cross =
+            OwnedLogicalPlan::synthetic(LogicalOperator::Join(Join::Cross(CrossProduct::new(
+                OwnedLogicalPlan::synthetic(create_scan(0)),
+                OwnedLogicalPlan::synthetic(create_scan(1)),
+            ))));
         let compare = |comparison_type, left, right| {
             Expression::Comparison(paro_planner::expression::ComparisonExpression::new(
                 comparison_type,

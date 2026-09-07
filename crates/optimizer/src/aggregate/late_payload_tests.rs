@@ -205,7 +205,10 @@ fn selective_projection_candidate(source: GetColumnSource) -> OwnedLogicalPlan {
     )))
 }
 
-fn selective_join_projection_candidate(join_type: JoinType, source_on_left: bool) -> OwnedLogicalPlan {
+fn selective_join_projection_candidate(
+    join_type: JoinType,
+    source_on_left: bool,
+) -> OwnedLogicalPlan {
     let table = source_table();
     let mut source = OwnedLogicalPlan::synthetic(LogicalOperator::Get(Get::new(
         SOURCE,
@@ -279,7 +282,10 @@ fn selective_join_topn_candidate() -> OwnedLogicalPlan {
     )))
 }
 
-fn row_preserving_candidate(include_derived_prefix: bool, hidden_order_key: bool) -> OwnedLogicalPlan {
+fn row_preserving_candidate(
+    include_derived_prefix: bool,
+    hidden_order_key: bool,
+) -> OwnedLogicalPlan {
     let table = source_table();
     let mut get = Get::new(
         SOURCE,

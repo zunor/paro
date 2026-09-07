@@ -59,7 +59,7 @@ impl ExpressionRewriter {
     }
 
     /// Visit and rewrite expressions in a logical operator.
-    fn visit_operator_expressions(&mut self, op: &mut LogicalOperator) {
+    pub(crate) fn visit_operator_expressions(&mut self, op: &mut LogicalOperator) {
         // Expression rules do not inspect the surrounding operator today; use a stable leaf
         // for the `Rule::apply` context slot so we never clone a full [`LogicalOperator`].
         let rule_ctx = LogicalOperator::DummyScan;
@@ -496,16 +496,16 @@ mod tests {
         let mut rewriter = ExpressionRewriter::new();
         rewriter.add_rule(Box::new(IncrementSmallConstantRule::new()));
 
-        let values = OwnedLogicalPlan::synthetic(LogicalOperator::ExpressionGet(ExpressionGet::new(
-            0,
-            vec![vec![make_constant(97)]],
-            vec!["col0".to_string()],
-            vec![LogicalType::Integer],
-        )));
-        let distinct = OwnedLogicalPlan::synthetic(LogicalOperator::Distinct(Distinct::distinct_on(
-            vec![make_constant(98)],
-            values,
-        )));
+        let values =
+            OwnedLogicalPlan::synthetic(LogicalOperator::ExpressionGet(ExpressionGet::new(
+                0,
+                vec![vec![make_constant(97)]],
+                vec!["col0".to_string()],
+                vec![LogicalType::Integer],
+            )));
+        let distinct = OwnedLogicalPlan::synthetic(LogicalOperator::Distinct(
+            Distinct::distinct_on(vec![make_constant(98)], values),
+        ));
         let mut op = LogicalOperator::Limit(Limit::new(
             distinct,
             Some(make_constant(99)),

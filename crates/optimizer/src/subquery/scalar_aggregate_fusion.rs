@@ -35,7 +35,10 @@ use paro_planner::plan::OwnedLogicalPlan;
 use crate::aggregate::post_reduction::alpha::AlphaBindings;
 use crate::aggregate::semantic_kernels::aggregate_kernels_equal;
 
-pub fn optimize_plan(plan: OwnedLogicalPlan, bind_context: &BindContext) -> Result<OwnedLogicalPlan> {
+pub fn optimize_plan(
+    plan: OwnedLogicalPlan,
+    bind_context: &BindContext,
+) -> Result<OwnedLogicalPlan> {
     optimize_plan_with_change(plan, bind_context).map(|(plan, _)| plan)
 }
 
@@ -530,7 +533,8 @@ fn build_fused_group(
     branches: &[ScalarBranch],
     bind_context: &BindContext,
 ) -> Result<(OwnedLogicalPlan, Vec<(ColumnBinding, ColumnBinding)>)> {
-    let get_plan = OwnedLogicalPlan::new(bind_context, LogicalOperator::Get(group.fused_get.clone()));
+    let get_plan =
+        OwnedLogicalPlan::new(bind_context, LogicalOperator::Get(group.fused_get.clone()));
     let source = if group.filter_expressions.is_empty() {
         get_plan
     } else {
@@ -609,7 +613,10 @@ fn build_fused_group(
     ))
 }
 
-fn rebuild_cross(leaves: Vec<OwnedLogicalPlan>, bind_context: &BindContext) -> Result<OwnedLogicalPlan> {
+fn rebuild_cross(
+    leaves: Vec<OwnedLogicalPlan>,
+    bind_context: &BindContext,
+) -> Result<OwnedLogicalPlan> {
     let mut leaves = leaves.into_iter();
     let first = leaves
         .next()

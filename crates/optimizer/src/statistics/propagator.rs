@@ -22,7 +22,7 @@ use paro_planner::operator::{
     aggregate::GroupDependency, empty_result::EmptyResult, Aggregate, ColumnBinding, Join,
     JoinComparisonType, LogicalOperator, LogicalOutputLayout,
 };
-use paro_planner::plan::{OwnedLogicalPlan, LogicalPlanPostOrderFolder};
+use paro_planner::plan::{LogicalPlanPostOrderFolder, OwnedLogicalPlan};
 use paro_storage::statistics::{BaseStatistics, ColumnStatistics, NumericStats, StatsInfo};
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -185,10 +185,10 @@ struct StatisticsPropagationFolder<'a> {
 impl LogicalPlanPostOrderFolder<LogicalOutputLayout> for StatisticsPropagationFolder<'_> {
     fn child_completed(
         &mut self,
-        parent_skeleton: &OwnedLogicalPlan,
-        completed_children: &[OwnedLogicalPlan],
+        parent_skeleton: &paro_planner::plan::arena::LogicalPlanNode<()>,
+        completed_children: &[Box<OwnedLogicalPlan>],
         completed_layouts: &[LogicalOutputLayout],
-        _remaining_children: &[OwnedLogicalPlan],
+        _remaining_children: &[Box<OwnedLogicalPlan>],
     ) -> Result<()> {
         if completed_children.len() != 1 {
             return Ok(());
@@ -250,7 +250,11 @@ impl StatisticsPropagator {
     }
 
     /// Propagate statistics through a logical plan root.
-    pub fn propagate(&mut self, ctx: Arc<StatementContext>, plan: OwnedLogicalPlan) -> OwnedLogicalPlan {
+    pub fn propagate(
+        &mut self,
+        ctx: Arc<StatementContext>,
+        plan: OwnedLogicalPlan,
+    ) -> OwnedLogicalPlan {
         self.propagate_plan(ctx.as_ref(), plan)
     }
 
@@ -474,7 +478,11 @@ impl StatisticsPropagator {
         );
     }
 
-    fn propagate_plan(&mut self, ctx: &StatementContext, plan: OwnedLogicalPlan) -> OwnedLogicalPlan {
+    fn propagate_plan(
+        &mut self,
+        ctx: &StatementContext,
+        plan: OwnedLogicalPlan,
+    ) -> OwnedLogicalPlan {
         let mut folder = StatisticsPropagationFolder {
             propagator: self,
             context: ctx,
@@ -485,12 +493,23 @@ impl StatisticsPropagator {
     }
 
     /// Propagate statistics through an operator after all children have been propagated.
-    fn propagate_operator(
+    pub(crate) fn propagate_operator(
         &mut self,
         ctx: &StatementContext,
         op: LogicalOperator,
     ) -> LogicalOperator {
         match op {
+            LogicalOperator::BoundReference(reference) => {
+                for (binding, statistics) in reference
+                    .bindings
+                    .iter()
+                    .copied()
+                    .zip(reference.column_statistics())
+                {
+                    self.statistics_map.insert(binding, statistics);
+                }
+                LogicalOperator::BoundReference(reference)
+            }
             LogicalOperator::Projection(proj) => {
                 for (i, expr) in proj.expressions.iter().enumerate() {
                     if let Some(stats) = self.propagate_expression(expr) {
@@ -1078,6 +1097,48 @@ mod tests {
 
         aggregate.group_stats[0] = Some(NumericStats::create_empty(LogicalType::BigInt));
         assert_eq!(derive_group_dependencies(&aggregate).len(), 1);
+    }
+
+    #[test]
+    fn memo_boundary_domains_do_not_leak_between_occurrences() {
+        use paro_planner::operator::{BoundReference, SetOperation};
+        let input = |reference_id, value| {
+            let reference = BoundReference::new(
+                reference_id,
+                vec![ColumnBinding::new(7, 0)],
+                vec![LogicalType::Integer],
+            );
+            OwnedLogicalPlan::synthetic(LogicalOperator::Filter(Filter::new(
+                OwnedLogicalPlan::synthetic(LogicalOperator::BoundReference(reference)),
+                vec![Expression::Comparison(ComparisonExpression::new(
+                    ComparisonType::Equal,
+                    Expression::ColumnRef(ColumnRefExpression::new(
+                        ColumnBinding::new(7, 0),
+                        LogicalType::Integer,
+                    )),
+                    Expression::Constant(ConstantExpression::new(
+                        Value::Integer(value),
+                        LogicalType::Integer,
+                    )),
+                ))],
+            )))
+        };
+        for values in [[2001, 2002], [2002, 2001]] {
+            let plan =
+                OwnedLogicalPlan::synthetic(LogicalOperator::SetOperation(SetOperation::union(
+                    9,
+                    input(1, values[0]),
+                    input(2, values[1]),
+                    true,
+                    vec![LogicalType::Integer],
+                )));
+            let plan = StatisticsPropagator::new().propagate(make_test_session(), plan);
+            let LogicalOperator::SetOperation(union) = &plan.operator else {
+                panic!("lost union")
+            };
+            assert!(matches!(union.left.operator, LogicalOperator::Filter(_)));
+            assert!(matches!(union.right.operator, LogicalOperator::Filter(_)));
+        }
     }
 
     #[test]

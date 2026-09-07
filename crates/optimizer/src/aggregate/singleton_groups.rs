@@ -119,7 +119,10 @@ mod tests {
         ))
     }
 
-    fn candidate() -> (OwnedLogicalPlan, HashMap<ColumnBinding, Arc<ColumnStatistics>>) {
+    fn candidate() -> (
+        OwnedLogicalPlan,
+        HashMap<ColumnBinding, Arc<ColumnStatistics>>,
+    ) {
         let types = vec![LogicalType::BigInt];
         let storage = Arc::new(TableFactory::default().create_table(&types).unwrap());
         let info = CreateTableInfo::new(

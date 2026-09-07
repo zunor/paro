@@ -54,6 +54,7 @@ pub(super) fn extract_planner_tree(
             group: GroupId,
             goal: OptimizationGoal,
             candidate: Option<ChildWinnerRef>,
+            occurrence: Fingerprint,
         },
         Build(Box<BuildTask>),
     }
@@ -62,6 +63,7 @@ pub(super) fn extract_planner_tree(
         group: root,
         goal,
         candidate: None,
+        occurrence: Fingerprint(0),
     }];
     let mut plans = Vec::new();
     let mut contracts = std::collections::HashMap::new();
@@ -73,6 +75,7 @@ pub(super) fn extract_planner_tree(
                 group,
                 goal,
                 candidate,
+                occurrence,
             } => {
                 let winner = candidate
                     .map_or_else(
@@ -153,7 +156,13 @@ pub(super) fn extract_planner_tree(
                         SearchMode::Memo => crate::physical::properties::PlanOrigin::Memo,
                     }
                 };
-                let (region_owner, owned_artifacts) = extracted_region_ownership(memo, winner)?;
+                let (region_owner, mut owned_artifacts) = extracted_region_ownership(memo, winner)?;
+                // A Memo candidate is a reusable definition, not one execution
+                // occurrence. Two CTE domains can choose the same producer
+                // candidate while owning independent runtime-filter state.
+                for artifact in &mut owned_artifacts {
+                    artifact.fingerprint = artifact_instance(artifact.fingerprint, occurrence);
+                }
                 let mut child_costs = Vec::with_capacity(winner.children.len());
                 let mut child_source_work = Vec::with_capacity(winner.children.len());
                 for child in &winner.children {
@@ -221,11 +230,12 @@ pub(super) fn extract_planner_tree(
                         },
                     ),
                 })));
-                for child in winner.children.iter().rev() {
+                for (ordinal, child) in winner.children.iter().enumerate().rev() {
                     tasks.push(Task::Visit {
                         group: child.group,
                         goal: child.goal,
                         candidate: Some(*child),
+                        occurrence: child_occurrence(occurrence, ordinal),
                     });
                 }
             }
@@ -251,26 +261,25 @@ pub(super) fn extract_planner_tree(
                     .get_physical(payload)
                     .ok_or_else(|| paro_error::internal("unknown planner physical payload"))?;
                 let mut children = children.into_iter();
-                let template = match &payload.template {
-                    PlannerPhysicalTemplate::Logical(logical) => {
-                        &state
-                            .payloads
-                            .logical
-                            .get(logical.index())
-                            .ok_or_else(|| {
-                                paro_error::internal("physical payload lost its logical semantics")
+                let mut plan = match &payload.template {
+                    PlannerPhysicalTemplate::Logical(logical) => state
+                        .payloads
+                        .logical
+                        .get(logical.index())
+                        .ok_or_else(|| {
+                            paro_error::internal("physical payload lost its logical semantics")
+                        })?
+                        .semantic_template
+                        .instantiate(bind_context.next_plan_id(), &mut children)?,
+                    PlannerPhysicalTemplate::Executable(template) => {
+                        duplicate_plan_preserving_indices(template, bind_context.shared().as_ref())
+                            .try_map_children(|_| {
+                                children.next().ok_or_else(|| {
+                                    paro_error::internal("physical extraction lost a child plan")
+                                })
                             })?
-                            .semantic_template
                     }
-                    PlannerPhysicalTemplate::Executable(template) => template.as_ref(),
                 };
-                let mut plan =
-                    duplicate_plan_preserving_indices(template, bind_context.shared().as_ref())
-                        .try_map_children(|_| {
-                            children.next().ok_or_else(|| {
-                                paro_error::internal("physical extraction lost a child plan")
-                            })
-                        })?;
                 if children.next().is_some() {
                     return Err(paro_error::internal(
                         "physical extraction produced excess child plans",
@@ -378,6 +387,26 @@ pub(super) fn extract_planner_tree(
             .ok_or_else(|| paro_error::internal("physical extraction lost root output columns"))?,
     })
 }
+
+fn child_occurrence(parent: Fingerprint, ordinal: usize) -> Fingerprint {
+    let mut identity = StableFingerprintBuilder::default();
+    identity.write_bytes(b"paro.physical-occurrence.v1");
+    identity.write_fingerprint(parent);
+    identity.write_u64(ordinal as u64);
+    identity.finish()
+}
+
+fn artifact_instance(definition: Fingerprint, occurrence: Fingerprint) -> Fingerprint {
+    let mut identity = StableFingerprintBuilder::default();
+    identity.write_bytes(b"paro.auxiliary-artifact-instance.v1");
+    identity.write_fingerprint(definition);
+    identity.write_fingerprint(occurrence);
+    identity.finish()
+}
+
+#[cfg(test)]
+#[path = "extraction/occurrence_tests.rs"]
+mod occurrence_tests;
 
 /// A physical winner may use a different equivalent child expression from
 /// the one named by the group's canonical estimation recipe. Anchor the

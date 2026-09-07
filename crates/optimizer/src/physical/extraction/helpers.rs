@@ -1006,7 +1006,10 @@ pub(crate) fn collect_graph_filters_from_logical(plan: &OwnedLogicalPlan) -> Vec
     filters
 }
 
-pub(crate) fn collect_graph_filters_recursive(plan: &OwnedLogicalPlan, filters: &mut Vec<Expression>) {
+pub(crate) fn collect_graph_filters_recursive(
+    plan: &OwnedLogicalPlan,
+    filters: &mut Vec<Expression>,
+) {
     match &plan.operator {
         LogicalOperator::GraphScan(_) => {}
         LogicalOperator::GraphExpand(expand) => {

@@ -130,8 +130,32 @@ impl WinnerVerifier {
                     }
                     let mut child_costs = Vec::with_capacity(winner.children.len());
                     let mut child_source_work = Vec::with_capacity(winner.children.len());
-                    for child in &winner.children {
+                    for (ordinal, child) in winner.children.iter().enumerate() {
                         verify_optimization_context(memo, child.group, child.goal.context)?;
+                        let mut expected_sources = memo
+                            .optimization_context(goal.context)
+                            .ok_or_else(|| {
+                                paro_error::internal("winner source context disappeared")
+                            })?
+                            .filterable_sources()
+                            .clone();
+                        if let Some((filtered_child, sources)) =
+                            winner.cost_composition.sideways_filter()
+                        {
+                            if ordinal == filtered_child {
+                                expected_sources.extend(sources.iter().map(|source| source.source));
+                            }
+                        }
+                        if memo
+                            .optimization_context(child.goal.context)
+                            .unwrap()
+                            .filterable_sources()
+                            != &expected_sources
+                        {
+                            return Err(paro_error::internal(
+                                "winner child frontier has a different source-demand contract",
+                            ));
+                        }
                         let Some(child_winner) = memo.resolve_child_winner(*child) else {
                             return Err(paro_error::internal(
                                 "winner has no verified exact child candidate",
@@ -451,7 +475,7 @@ fn verify_joint_cost_proof(
         if winner
             .children
             .iter()
-            .any(|child| child.goal.context != owner_goal.context)
+            .any(|child| !memo.same_region_context(child.goal.context, owner_goal.context))
         {
             return Err(paro_error::internal(
                 "runtime-filter candidate crosses a required planning-region boundary",

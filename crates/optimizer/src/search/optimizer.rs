@@ -63,24 +63,44 @@ impl SearchOptimizer {
         Ok(candidate)
     }
 
-    /// Cheap structural guard for statement-context construction. Keep this
-    /// rooted in the exact same eligibility predicate as candidate derivation.
-    pub(crate) fn contains_candidate_root(plan: &OwnedLogicalPlan) -> bool {
-        let mut pending = vec![plan];
-        while let Some(plan) = pending.pop() {
-            let eligible = match &plan.operator {
-                LogicalOperator::TopN(topn) => extract_topn_pattern(topn).is_some(),
-                LogicalOperator::Filter(filter) => {
-                    matches!(filter.child.operator, LogicalOperator::Get(_))
+    /// Native structural binding for provider windows. Unrelated inputs stay
+    /// arena references; the only exportable path is TopN/Projection/Filter*
+    /// ending at Get, or a Filter directly on Get.
+    pub(crate) fn candidate_arena_roots(
+        plan: &paro_planner::plan::LogicalPlan,
+    ) -> Result<Vec<paro_planner::plan::arena::PlanIndex>> {
+        let arena = plan.arena();
+        let mut scan_paths = std::collections::BTreeSet::new();
+        let mut roots = Vec::new();
+        for index in arena.post_order(plan.root())? {
+            match &arena.get(index)?.operator {
+                LogicalOperator::Get(_) => {
+                    scan_paths.insert(index);
                 }
-                _ => false,
-            };
-            if eligible {
-                return true;
+                LogicalOperator::Filter(filter) => {
+                    if scan_paths.contains(&filter.child) {
+                        scan_paths.insert(index);
+                    }
+                    if matches!(arena.get(filter.child)?.operator, LogicalOperator::Get(_)) {
+                        roots.push(index);
+                    }
+                }
+                LogicalOperator::TopN(topn) if topn.offset == 0 && topn.orders.len() == 1 => {
+                    if let LogicalOperator::Projection(projection) =
+                        &arena.get(topn.child)?.operator
+                    {
+                        if scan_paths.contains(&projection.child)
+                            && order_expression_index(&topn.orders[0].expression)
+                                .is_some_and(|ordinal| ordinal < projection.expressions.len())
+                        {
+                            roots.push(index);
+                        }
+                    }
+                }
+                _ => {}
             }
-            pending.extend(plan.operator.children());
         }
-        false
+        Ok(roots)
     }
 
     /// Tables whose search capability state is a logical planning input even

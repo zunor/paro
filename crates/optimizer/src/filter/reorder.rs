@@ -15,7 +15,11 @@ impl ReorderFilter {
         Self
     }
 
-    pub fn rewrite(&mut self, plan: OwnedLogicalPlan, ctx: &OptimizationContext) -> Result<OwnedLogicalPlan> {
+    pub fn rewrite(
+        &mut self,
+        plan: OwnedLogicalPlan,
+        ctx: &OptimizationContext,
+    ) -> Result<OwnedLogicalPlan> {
         self.rewrite_with_change(plan, ctx).map(|(plan, _)| plan)
     }
 

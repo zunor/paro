@@ -1131,7 +1131,8 @@ mod tests {
                 int_column(2, 0),
             )],
         );
-        let plan = OwnedLogicalPlan::new(&bind_context, LogicalOperator::Join(Join::Comparison(join)));
+        let plan =
+            OwnedLogicalPlan::new(&bind_context, LogicalOperator::Join(Join::Comparison(join)));
 
         let lowered = lower(plan, &bind_context);
         let LogicalOperator::Join(Join::Comparison(join)) = &lowered.plan.operator else {

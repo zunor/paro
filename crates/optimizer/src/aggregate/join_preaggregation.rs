@@ -20,7 +20,10 @@ use paro_planner::operator::{
 use paro_planner::plan::OwnedLogicalPlan;
 /// Enumerate the semantics-preserving pre-aggregation alternative. Whether it
 /// is profitable belongs to Memo costing, not to the transformation itself.
-pub fn optimize_plan(plan: OwnedLogicalPlan, bind_context: &BindContext) -> (OwnedLogicalPlan, bool) {
+pub fn optimize_plan(
+    plan: OwnedLogicalPlan,
+    bind_context: &BindContext,
+) -> (OwnedLogicalPlan, bool) {
     fn rewrite(plan: OwnedLogicalPlan, bind_context: &BindContext) -> (OwnedLogicalPlan, bool) {
         let mut child_changed = false;
         let mut plan = plan.map_children(|child| {

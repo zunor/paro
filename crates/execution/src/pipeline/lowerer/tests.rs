@@ -1112,7 +1112,8 @@ fn hash_join_with_delim_probe_plan() -> crate::physical::PhysicalPlan {
     delim_join.duplicate_eliminated_columns = vec![Expression::Reference(
         ReferenceExpression::new(0, LogicalType::Integer),
     )];
-    let delim_probe = OwnedLogicalPlan::new(&ctx, LogicalOperator::Join(Join::Comparison(delim_join)));
+    let delim_probe =
+        OwnedLogicalPlan::new(&ctx, LogicalOperator::Join(Join::Comparison(delim_join)));
     let probe = OwnedLogicalPlan::new(
         &ctx,
         LogicalOperator::Projection(

@@ -23,6 +23,7 @@ pub(crate) fn derive_maximum_cardinality(
     };
     match operator {
         LogicalOperator::DummyScan => Some(1),
+        LogicalOperator::BoundReference(reference) => reference.facts.maximum_cardinality,
         LogicalOperator::EmptyResult(_) => Some(0),
         // Resident rows are snapshot evidence. Prepared plans survive DML.
         LogicalOperator::Get(_) => None,

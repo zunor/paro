@@ -158,8 +158,10 @@ impl GraphPredicatePushdown {
         }
 
         if !remaining.is_empty() {
-            result =
-                LogicalOperator::Filter(Filter::new(OwnedLogicalPlan::synthetic(result), remaining));
+            result = LogicalOperator::Filter(Filter::new(
+                OwnedLogicalPlan::synthetic(result),
+                remaining,
+            ));
         }
 
         result
@@ -654,8 +656,10 @@ mod tests {
             ConjunctionType::And,
             vec![pred_a, pred_k],
         ));
-        let filtered =
-            LogicalOperator::Filter(Filter::new(OwnedLogicalPlan::synthetic(plan), vec![and_pred]));
+        let filtered = LogicalOperator::Filter(Filter::new(
+            OwnedLogicalPlan::synthetic(plan),
+            vec![and_pred],
+        ));
 
         let mut opt = GraphPredicatePushdown::new();
         let result = opt.optimize(filtered);
@@ -693,8 +697,10 @@ mod tests {
                 LogicalType::Varchar,
             )),
         ));
-        let filtered =
-            LogicalOperator::Filter(Filter::new(OwnedLogicalPlan::synthetic(plan), vec![cross_pred]));
+        let filtered = LogicalOperator::Filter(Filter::new(
+            OwnedLogicalPlan::synthetic(plan),
+            vec![cross_pred],
+        ));
 
         let mut opt = GraphPredicatePushdown::new();
         let result = opt.optimize(filtered);
@@ -761,8 +767,10 @@ mod tests {
             ComparisonType::GreaterThan,
             paro_common::runtime_value::Value::Integer(30),
         );
-        let filtered =
-            LogicalOperator::Filter(Filter::new(OwnedLogicalPlan::synthetic(decomposed), vec![pred]));
+        let filtered = LogicalOperator::Filter(Filter::new(
+            OwnedLogicalPlan::synthetic(decomposed),
+            vec![pred],
+        ));
 
         let mut opt = GraphPredicatePushdown::new();
         let result = opt.optimize(filtered);

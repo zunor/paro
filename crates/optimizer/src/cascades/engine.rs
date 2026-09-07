@@ -443,6 +443,20 @@ impl CascadesEngine {
             if budget.optional_limit(fire_dimension) == Some(0)
                 || (budget.optional_limit(work_dimension) == Some(0) && expression_has_children)
             {
+                let dimension = if budget.optional_limit(fire_dimension) == Some(0) {
+                    fire_dimension
+                } else {
+                    work_dimension
+                };
+                let mut witness = StableFingerprintBuilder::default();
+                witness.write_bytes(b"paro.unexamined-pattern.v1");
+                witness.write_u64(expression.index() as u64);
+                witness.write_u64(rule.0 as u64);
+                self.memo
+                    .group_mut(group)
+                    .ok_or_else(|| paro_error::internal("pattern owner disappeared"))?
+                    .ledger
+                    .record_budget_limited(dimension, witness.finish());
                 continue;
             }
             // A task produced by this same rule inherits the exact read cursor
@@ -671,7 +685,7 @@ impl CascadesEngine {
                         memo: &self.memo,
                         group,
                     };
-                    rule_impl.output_bound(&context)
+                    rule_impl.output_bound(binding, &context)
                 };
                 let mut output_events = Vec::with_capacity(output_bound);
                 let mut output_budget_limited = false;
@@ -747,6 +761,8 @@ impl CascadesEngine {
                             group = group.index(),
                             "discarded failed optional transformation"
                         );
+                        self.memo
+                            .record_failed_rule(group, rule, event, error.to_string());
                         continue;
                     }
                 };
@@ -787,6 +803,14 @@ impl CascadesEngine {
                         reserved_outputs = output_events.len(),
                         "discarded optional transformation whose frontier exceeded its declared bound"
                     );
+                    if !output_budget_limited {
+                        self.memo.record_failed_rule(
+                            group,
+                            rule,
+                            event,
+                            "rule exceeded its binding output contract",
+                        );
+                    }
                     continue;
                 }
                 let insertion = (|| -> Result<TransformationInsertion> {
@@ -882,6 +906,8 @@ impl CascadesEngine {
                             group = group.index(),
                             "discarded invalid optional transformation output"
                         );
+                        self.memo
+                            .record_failed_rule(group, rule, event, error.to_string());
                         continue;
                     }
                 };
@@ -908,7 +934,9 @@ impl CascadesEngine {
                         let group = self.memo.group_mut(target).ok_or_else(|| {
                             paro_error::internal("committed transformation lost its target group")
                         })?;
-                        group.logical_properties.merge_equivalent_facts(&properties);
+                        group
+                            .logical_properties
+                            .merge_equivalent_facts(&properties)?;
                         group.cardinality =
                             std::mem::take(&mut group.cardinality).canonical_with(cardinality);
                     }
@@ -1307,8 +1335,23 @@ impl CascadesEngine {
                 "implementation candidate key does not match its registry task",
             ));
         }
-        for (child, child_goal) in candidate.child_goals.iter_mut() {
+        let inherited_sources = self
+            .memo
+            .optimization_context(goal.context)
+            .ok_or_else(|| paro_error::internal("physical goal has no source-demand context"))?
+            .filterable_sources()
+            .clone();
+        for (ordinal, (child, child_goal)) in candidate.child_goals.iter_mut().enumerate() {
             child_goal.grant = self.normalized_child_grant(*child, goal.grant)?;
+            let mut sources = inherited_sources.clone();
+            if let Some((filtered_child, filters)) = candidate.cost_composition.sideways_filter() {
+                if ordinal == filtered_child {
+                    sources.extend(filters.iter().map(|filter| filter.source));
+                }
+            }
+            child_goal.context = self
+                .memo
+                .intern_source_demand_context(child_goal.context, sources)?;
         }
         let canonical_key_children: Vec<_> = candidate
             .key
@@ -1340,6 +1383,14 @@ impl CascadesEngine {
                         region_candidate_count = admitted.len(),
                         "optional physical candidate rejected by its region budget"
                     );
+                    self.memo
+                        .group_mut(group)
+                        .unwrap()
+                        .ledger
+                        .record_budget_limited(
+                            BudgetDimension::CompositeRegionCandidate,
+                            candidate.stable_event(goal),
+                        );
                     return Ok(());
                 }
                 admitted.insert(candidate.physical_fingerprint);
@@ -1457,18 +1508,33 @@ impl CascadesEngine {
                     children_feasible = false;
                     break;
                 };
-                child_frontiers.push(frontier.candidates().to_vec());
+                child_frontiers.push(
+                    frontier
+                        .candidates()
+                        .iter()
+                        .map(|winner| ChildWinnerRef {
+                            group: child,
+                            goal: child_goal,
+                            candidate: winner.candidate,
+                        })
+                        .collect::<Vec<_>>(),
+                );
             }
             if !children_feasible {
                 continue;
             }
-            let admitted_combination_limit = self
-                .memo
-                .budget()
-                .max_child_frontier_combinations_per_group
-                .saturating_add(1) as usize;
+            let admitted_combination_limit =
+                (self.memo.budget().max_child_frontier_combinations_per_group as usize)
+                    .saturating_sub(
+                        self.memo
+                            .group(group)
+                            .unwrap()
+                            .ledger
+                            .consumed(BudgetDimension::ChildFrontierCombination),
+                    )
+                    .saturating_add(1);
             let combinations =
-                child_winner_combinations(&child_frontiers, admitted_combination_limit);
+                child_winner_combinations(child_frontiers, admitted_combination_limit);
             let (completion, first_omitted_ordinal, omitted_at_least) =
                 match combinations.completion {
                     EnumerationCompletion::Complete => ("complete", None, 0),
@@ -1481,6 +1547,22 @@ impl CascadesEngine {
                         omitted_at_least,
                     ),
                 };
+            if let Some(first_omitted) = first_omitted_ordinal {
+                let mut witness = StableFingerprintBuilder::default();
+                witness.write_bytes(b"paro.child-product-omission.v1");
+                witness.write_u64(physical.index() as u64);
+                witness.write_fingerprint(recipe.physical_fingerprint);
+                witness.write_u64(first_omitted as u64);
+                witness.write_u64(omitted_at_least as u64);
+                self.memo
+                    .group_mut(group)
+                    .ok_or_else(|| paro_error::internal("child-product owner disappeared"))?
+                    .ledger
+                    .record_budget_limited(
+                        BudgetDimension::ChildFrontierCombination,
+                        witness.finish(),
+                    );
+            }
             tracing::debug!(
                 target: "paro::optimizer",
                 parent_group = group.index(),
@@ -1491,13 +1573,13 @@ impl CascadesEngine {
                 generated_combinations = combinations.combinations.len(),
                 "enumerated bounded child frontier product"
             );
-            for (ordinal, child_winners) in combinations.combinations.into_iter().enumerate() {
+            for (ordinal, child_selections) in combinations.combinations.enumerate() {
                 if ordinal > 0 {
                     let event = child_frontier_combination_event(
                         physical,
                         goal,
                         recipe.physical_fingerprint,
-                        &child_winners,
+                        &child_selections,
                     );
                     if self
                         .memo
@@ -1510,6 +1592,14 @@ impl CascadesEngine {
                         continue;
                     }
                 }
+                let child_winners = child_selections
+                    .iter()
+                    .map(|child| {
+                        self.memo.resolve_child_winner(*child).ok_or_else(|| {
+                            paro_error::internal("child product lost an immutable candidate")
+                        })
+                    })
+                    .collect::<Result<Vec<_>>>()?;
                 let child_costs = child_winners
                     .iter()
                     .map(|winner| winner.cost)
@@ -1670,36 +1760,22 @@ impl CascadesEngine {
                         "costed an equivalent physical candidate"
                     );
                 }
-                self.memo.record_winner(
-                    group,
-                    goal,
-                    Winner {
-                        candidate: super::ids::CandidateId::INVALID,
-                        expression: physical,
-                        children: recipe
-                            .child_goals
-                            .iter()
-                            .copied()
-                            .zip(child_winners.iter())
-                            .map(|((child, child_goal), winner)| ChildWinnerRef {
-                                group: child,
-                                goal: child_goal,
-                                candidate: winner.candidate,
-                            })
-                            .collect::<Vec<_>>()
-                            .into_boxed_slice(),
-                        enforcers: enforced.steps,
-                        enforcer_cost_input: recipe.enforcer_cost_input,
-                        provided: enforced.provided,
-                        local_cost,
-                        source_filter_apply_cost: recipe.source_filter_apply_cost,
-                        cost_composition: recipe.cost_composition.clone(),
-                        cost,
-                        source_work,
-                        physical_fingerprint: fingerprint,
-                        joint_cost_proof,
-                    },
-                )?;
+                let winner = Winner {
+                    candidate: super::ids::CandidateId::INVALID,
+                    expression: physical,
+                    children: child_selections.into_boxed_slice(),
+                    enforcers: enforced.steps,
+                    enforcer_cost_input: recipe.enforcer_cost_input,
+                    provided: enforced.provided,
+                    local_cost,
+                    source_filter_apply_cost: recipe.source_filter_apply_cost,
+                    cost_composition: recipe.cost_composition.clone(),
+                    cost,
+                    source_work,
+                    physical_fingerprint: fingerprint,
+                    joint_cost_proof,
+                };
+                self.memo.record_winner(group, goal, winner)?;
             }
         }
         Ok(())
@@ -2008,38 +2084,53 @@ enum EnumerationCompletion {
 
 #[derive(Debug)]
 struct ChildCombinationBatch {
-    combinations: Vec<Vec<Winner>>,
+    combinations: ChildWinnerCombinations,
     completion: EnumerationCompletion,
 }
 
-/// Materialize only the admissible child product plus one rejection witness.
-/// The extra item lets the ledger prove that a finite search was truncated.
+/// A lazy product of immutable candidate references, never copies of winner
+/// trees/source-work histories. Storage is linear in the input frontier width
+/// even if their Cartesian product overflows usize.
+#[derive(Debug)]
+struct ChildWinnerCombinations {
+    frontiers: Vec<Vec<ChildWinnerRef>>,
+    next: usize,
+    end: usize,
+}
+
+impl Iterator for ChildWinnerCombinations {
+    type Item = Vec<ChildWinnerRef>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.next == self.end {
+            return None;
+        }
+        let mut ordinal = self.next;
+        self.next += 1;
+        let mut result = Vec::with_capacity(self.frontiers.len());
+        for frontier in self.frontiers.iter().rev() {
+            result.push(frontier[ordinal % frontier.len()]);
+            ordinal /= frontier.len();
+        }
+        result.reverse();
+        Some(result)
+    }
+
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        let remaining = self.end - self.next;
+        (remaining, Some(remaining))
+    }
+}
+
+impl ExactSizeIterator for ChildWinnerCombinations {}
+
+/// Admit only the remaining child-product credit plus a rejection witness.
 fn child_winner_combinations(
-    frontiers: &[Vec<Winner>],
+    frontiers: Vec<Vec<ChildWinnerRef>>,
     admitted_limit: usize,
 ) -> ChildCombinationBatch {
     let admitted_limit = admitted_limit.max(1);
     let witness_limit = admitted_limit.saturating_add(1);
-    let mut combinations = vec![Vec::new()];
-    for frontier in frontiers {
-        let mut next = Vec::with_capacity(
-            combinations
-                .len()
-                .saturating_mul(frontier.len())
-                .min(witness_limit),
-        );
-        'product: for prefix in combinations {
-            for winner in frontier {
-                if next.len() == witness_limit {
-                    break 'product;
-                }
-                let mut combination = prefix.clone();
-                combination.push(winner.clone());
-                next.push(combination);
-            }
-        }
-        combinations = next;
-    }
     let total = frontiers.iter().fold(1_usize, |product, frontier| {
         product.saturating_mul(frontier.len())
     });
@@ -2052,7 +2143,11 @@ fn child_winner_combinations(
                 omitted_at_least: total.saturating_sub(admitted_limit),
             }
         },
-        combinations,
+        combinations: ChildWinnerCombinations {
+            frontiers,
+            next: 0,
+            end: total.min(witness_limit),
+        },
     }
 }
 
@@ -2060,7 +2155,7 @@ fn child_frontier_combination_event(
     physical: PhysicalExprId,
     goal: OptimizationGoal,
     recipe: Fingerprint,
-    children: &[Winner],
+    children: &[ChildWinnerRef],
 ) -> Fingerprint {
     let mut event = StableFingerprintBuilder::default();
     event.write_bytes(b"paro.memo.child-frontier-combination.v1");

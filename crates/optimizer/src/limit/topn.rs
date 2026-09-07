@@ -146,9 +146,12 @@ impl TopNOptimizer {
                 while let Some((table_index, expressions, output_names, visible_count, qualifier)) =
                     projections.pop()
                 {
-                    let mut proj =
-                        Projection::new(table_index, OwnedLogicalPlan::synthetic(result), expressions)
-                            .with_visible_names(output_names);
+                    let mut proj = Projection::new(
+                        table_index,
+                        OwnedLogicalPlan::synthetic(result),
+                        expressions,
+                    )
+                    .with_visible_names(output_names);
                     proj.visible_count = visible_count;
                     if let Some(qualifier) = qualifier {
                         proj = proj.with_visible_qualifier(qualifier);
@@ -173,9 +176,12 @@ impl TopNOptimizer {
         while let Some((table_index, expressions, output_names, visible_count, qualifier)) =
             projections.pop()
         {
-            let mut proj =
-                Projection::new(table_index, OwnedLogicalPlan::synthetic(result), expressions)
-                    .with_visible_names(output_names);
+            let mut proj = Projection::new(
+                table_index,
+                OwnedLogicalPlan::synthetic(result),
+                expressions,
+            )
+            .with_visible_names(output_names);
             proj.visible_count = visible_count;
             if let Some(qualifier) = qualifier {
                 proj = proj.with_visible_qualifier(qualifier);
@@ -312,7 +318,8 @@ mod tests {
     fn test_cannot_optimize_no_limit() {
         let get = create_test_get();
         let order = create_order_by(get);
-        let limit = LogicalOperator::Limit(Limit::new(OwnedLogicalPlan::synthetic(order), None, None));
+        let limit =
+            LogicalOperator::Limit(Limit::new(OwnedLogicalPlan::synthetic(order), None, None));
 
         assert!(!TopNOptimizer::can_optimize(&limit));
     }

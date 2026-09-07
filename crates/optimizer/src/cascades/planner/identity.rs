@@ -28,19 +28,19 @@ pub(super) fn query_operator_fingerprint(
     scalar_roots: &[ScalarExprId],
     scalars: &ScalarArena,
 ) -> Result<Fingerprint> {
-    Ok(query_operator_identity(plan, scalar_roots, scalars)?.0)
+    Ok(query_operator_identity(&plan.operator, scalar_roots, scalars)?.0)
 }
 
 /// Hash-bucket key plus exact canonical encoding for one relational shell.
 /// The encoding is retained by the Memo payload and is the final equality
 /// check; the 128-bit digest is only an index accelerator.
-pub(super) fn query_operator_identity(
-    plan: &OwnedLogicalPlan,
+pub(super) fn query_operator_identity<Child>(
+    operator: &LogicalOperator<Child>,
     scalar_roots: &[ScalarExprId],
     scalars: &ScalarArena,
 ) -> Result<(Fingerprint, Box<[u8]>)> {
     let mut fingerprint = StableFingerprintBuilder::recording();
-    fingerprint.write_u64(operator_tag(plan.operator.op_type()));
+    fingerprint.write_u64(operator_tag(operator.op_type()));
     fingerprint.write_u64(scalar_roots.len() as u64);
     for root in scalar_roots {
         let scalar = scalars
@@ -48,7 +48,7 @@ pub(super) fn query_operator_identity(
             .ok_or_else(|| paro_error::internal("operator references an unknown scalar root"))?;
         fingerprint.write_fingerprint(scalar.fingerprint);
     }
-    match &plan.operator {
+    match operator {
         LogicalOperator::Get(get) => encode_get(&mut fingerprint, get),
         LogicalOperator::BoundReference(_) => {
             return Err(paro_error::internal(
@@ -518,9 +518,9 @@ pub(super) fn encode_external_call(
     fingerprint.write_u64(call.semantics.may_block as u64);
 }
 
-pub(super) fn encode_dependent_join(
+pub(super) fn encode_dependent_join<Child>(
     fingerprint: &mut StableFingerprintBuilder,
-    join: &paro_planner::operator::DependentJoin,
+    join: &paro_planner::operator::DependentJoin<Child>,
 ) {
     use paro_planner::operator::{DependentJoinKind, MarkSubqueryKind};
 

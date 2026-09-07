@@ -14,10 +14,13 @@ use paro_common::error::Result;
 use paro_planner::binder::context::BindContext;
 use paro_planner::expression::{AggregateType, ColumnRefExpression, Expression};
 use paro_planner::operator::{Aggregate, ColumnBinding, LogicalOperator};
-use paro_planner::plan::{OwnedLogicalPlan, NodeStats};
+use paro_planner::plan::{NodeStats, OwnedLogicalPlan};
 
 /// Rewrite every independently eligible grouped aggregate in post-order.
-pub fn optimize_plan(plan: OwnedLogicalPlan, bind_context: &BindContext) -> Result<(OwnedLogicalPlan, bool)> {
+pub fn optimize_plan(
+    plan: OwnedLogicalPlan,
+    bind_context: &BindContext,
+) -> Result<(OwnedLogicalPlan, bool)> {
     let mut changed = false;
     let plan = plan.try_map_post_order(|plan| {
         let (plan, node_changed) = rewrite_node(plan, bind_context);
@@ -27,7 +30,10 @@ pub fn optimize_plan(plan: OwnedLogicalPlan, bind_context: &BindContext) -> Resu
     Ok((plan, changed))
 }
 
-fn rewrite_node(mut plan: OwnedLogicalPlan, bind_context: &BindContext) -> (OwnedLogicalPlan, bool) {
+fn rewrite_node(
+    mut plan: OwnedLogicalPlan,
+    bind_context: &BindContext,
+) -> (OwnedLogicalPlan, bool) {
     let LogicalOperator::Aggregate(aggregate) = &mut plan.operator else {
         return (plan, false);
     };

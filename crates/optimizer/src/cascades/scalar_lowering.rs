@@ -107,8 +107,8 @@ impl BindingCatalog {
     }
 }
 
-pub(crate) fn intern_operator_scalars(
-    operator: &mut LogicalOperator,
+pub(crate) fn intern_operator_scalars<Child>(
+    operator: &mut LogicalOperator<Child>,
     output_columns: &[ColumnId],
     child_columns: &[Box<[ColumnId]>],
     binding_ids: &mut BindingCatalog,

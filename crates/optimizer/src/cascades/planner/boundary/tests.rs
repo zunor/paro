@@ -28,7 +28,11 @@ fn input(plan: OwnedLogicalPlan, budget: SearchBudget) -> OptimizationInput {
     MemoBuilder::build(plan, BindContext::new(), budget).unwrap()
 }
 
-fn grouped_branch_with_tag(source_table: usize, output_table: usize, tag: &str) -> OwnedLogicalPlan {
+fn grouped_branch_with_tag(
+    source_table: usize,
+    output_table: usize,
+    tag: &str,
+) -> OwnedLogicalPlan {
     let aggregate = OwnedLogicalPlan::synthetic(LogicalOperator::Aggregate(
         paro_planner::operator::Aggregate::new(
             output_table + 10,
@@ -90,6 +94,12 @@ fn native_boundary_retains_alias_lineage_and_records_inherited_statistics() {
     assert_eq!(sources.len(), 1);
     assert_eq!(sources[0].source, 0);
     let source_group = GroupId::new(sources[0].occurrence);
+    let first_work = context
+        .memo()
+        .group(input.root)
+        .unwrap()
+        .ledger
+        .consumed(BudgetDimension::RuleWorkPerGroup);
     let reused = BoundarySnapshot::read(
         &mut context,
         &state,
@@ -102,6 +112,17 @@ fn native_boundary_retains_alias_lineage_and_records_inherited_statistics() {
         &snapshot.groups[&input.root],
         &reused.groups[&input.root]
     ));
+    let second_work = context
+        .memo()
+        .group(input.root)
+        .unwrap()
+        .ledger
+        .consumed(BudgetDimension::RuleWorkPerGroup)
+        - first_work;
+    assert!(
+        second_work < first_work,
+        "a current read log must not rebuild the evidence recipes: {first_work} -> {second_work}"
+    );
     let reads = context.take_fact_reads();
     assert!(reads.iter().any(|read| read.group == source_group));
     let root_read = PatternRead::facts_from_group(context.memo(), input.root).unwrap();
@@ -136,6 +157,103 @@ fn native_boundary_retains_alias_lineage_and_records_inherited_statistics() {
             .unwrap()
             .expected,
         20
+    );
+}
+
+#[test]
+fn value_domain_change_invalidates_the_fact_value_not_only_the_read_cursor() {
+    use paro_planner::operator::bound_reference::BoundColumnValues;
+    use paro_storage::statistics::BaseStatistics;
+    let mut input = input(source(0), SearchBudget::default());
+    let state = input.planner_state.read().unwrap();
+    let column = *input
+        .memo
+        .group(input.root)
+        .unwrap()
+        .schema
+        .ids()
+        .first()
+        .unwrap();
+    let mut values = Vec::new();
+    for constant in [2001, 2002, 2001] {
+        input
+            .memo
+            .group_mut(input.root)
+            .unwrap()
+            .logical_properties
+            .column_values
+            .insert(
+                column,
+                BoundColumnValues::new(BaseStatistics::from_constant(&Value::Integer(constant)))
+                    .unwrap(),
+            );
+        let mut ctx = TransformContext::new(&mut input.memo, input.root);
+        let snapshot = BoundarySnapshot::read(
+            &mut ctx,
+            &state,
+            &PatternOperand::Group(input.root),
+            BudgetDimension::RuleWorkPerGroup,
+        )
+        .unwrap()
+        .unwrap();
+        let mut fingerprint = StableFingerprintBuilder::default();
+        snapshot.encode_group(input.root, &mut fingerprint).unwrap();
+        values.push(fingerprint.finish());
+    }
+    assert_ne!(values[0], values[1]);
+    assert_eq!(values[0], values[2]);
+}
+
+#[test]
+fn finite_replay_proof_survives_a_recursive_identity_alternative() {
+    let mut input = input(source(0), SearchBudget::default());
+    let mut state = input.planner_state.write().unwrap();
+    let expression = input.memo.group(input.root).unwrap().logical_exprs()[0];
+    let original = input.memo.logical_expr(expression).unwrap().payload;
+    let mut metadata = state.metadata[&original].clone();
+    metadata.operator_type = paro_planner::operator::LogicalOperatorType::Filter;
+    metadata.child_layouts = Box::new([PlannerBindingLayout {
+        bindings: Box::new([ColumnBinding::new(0, 0)]),
+        types: Box::new([LogicalType::Integer]),
+    }]);
+    let column_stats = state.payloads.logical[original.index()]
+        .column_stats
+        .clone();
+    let (payload, _) = state.payloads.push_logical(PlannerLogicalPayload {
+        semantic_template: paro_planner::plan::arena::LogicalPlanNode::from_shell(
+            OwnedLogicalPlan::synthetic(LogicalOperator::Filter(
+                paro_planner::operator::Filter::new(source(0), vec![]),
+            )),
+        ),
+        operator_encoding: Box::new([]),
+        column_stats,
+    });
+    state.metadata.insert(payload, metadata);
+    input
+        .memo
+        .insert_logical(
+            input.root,
+            LogicalExprKey {
+                operator: Fingerprint(9191),
+                scalars: Box::new([]),
+                children: Box::new([input.root]),
+            },
+            payload,
+            EquivalenceProof::Normalization { rule: RuleId(9191) },
+        )
+        .unwrap();
+    let mut ctx = TransformContext::new(&mut input.memo, input.root);
+    let snapshot = BoundarySnapshot::read(
+        &mut ctx,
+        &state,
+        &PatternOperand::Group(input.root),
+        BudgetDimension::RuleWorkPerGroup,
+    )
+    .unwrap()
+    .unwrap();
+    assert!(
+        snapshot.groups[&input.root].can_replay,
+        "unknown evidence from an identity cycle cannot refute a finite proof"
     );
 }
 
