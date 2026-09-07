@@ -1,5 +1,9 @@
 # Cold planning and Q11: 2026-09-07 checkpoint
 
+The subsequent structural migration and its separate performance evidence are
+recorded in [Native CTE requirements and logical arenas](native-cte-arena-20260908.md).
+The measurements below describe this historical checkpoint.
+
 This checkpoint closes the deterministic-search and Memo fact-replay defects
 found in the `adb0440e` review. It is still **not** completion of the
 cold-planning performance target: fresh-process Q11 statement latency remains
