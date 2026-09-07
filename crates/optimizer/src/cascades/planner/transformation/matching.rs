@@ -733,6 +733,9 @@ enum PatternScope {
     SubsumptionInput,
     ScalarAggregatePath,
     OuterJoinPath,
+    CteFilterOwner,
+    CteFilterProducer,
+    CteReferencePath,
 }
 
 impl PatternScope {
@@ -741,9 +744,22 @@ impl PatternScope {
         let repeat = |scope| Some(vec![scope; arity]);
         match self {
             Self::Subtree => repeat(Self::Subtree),
-            Self::ScalarAggregatePath | Self::OuterJoinPath => {
+            Self::ScalarAggregatePath | Self::OuterJoinPath | Self::CteReferencePath => {
                 unreachable!("witness paths choose child scopes from Memo facts")
             }
+            Self::CteFilterOwner => matches!(operator, LogicalOperator::MaterializedCTE(_))
+                .then(|| vec![Self::CteFilterProducer, Self::CteReferencePath]),
+            // CTE predicate derivation reads these shells on the producer side
+            // to move a consumer domain to its narrowest legal owner. Inputs
+            // below an unsupported boundary remain native Memo operands.
+            Self::CteFilterProducer => match operator {
+                LogicalOperator::Projection(_)
+                | LogicalOperator::Filter(_)
+                | LogicalOperator::Aggregate(_)
+                | LogicalOperator::SetOperation(_)
+                | LogicalOperator::Join(Join::Comparison(_)) => repeat(Self::CteFilterProducer),
+                _ => repeat(Self::Hole),
+            },
             Self::Hole => unreachable!("group holes do not inspect operators"),
             Self::Shell => repeat(Self::Hole),
             Self::SubsumptionAggregate => matches!(operator, LogicalOperator::Aggregate(_)).then(|| vec![Self::SubsumptionInput]),
@@ -848,6 +864,7 @@ pub(super) fn scoped_pattern_bindings(
         PlannerTransformation::AggregatePostReduction
         | PlannerTransformation::ScalarAggregateWindow => PatternScope::ScalarAggregatePath,
         PlannerTransformation::JoinElimination => PatternScope::OuterJoinPath,
+        PlannerTransformation::CteFilterPushdown => PatternScope::CteFilterOwner,
         _ => PatternScope::Subtree,
     };
     let witness = match transformation {
@@ -875,6 +892,7 @@ pub(super) fn scoped_pattern_bindings(
 enum PatternWitness {
     ScalarAggregate,
     OuterJoin,
+    CteReference,
 }
 
 impl PatternWitness {
@@ -886,6 +904,7 @@ impl PatternWitness {
             (Self::OuterJoin, LogicalOperator::Join(Join::Comparison(join))) => {
                 matches!(join.join_type, JoinType::Left | JoinType::Right)
             }
+            (Self::CteReference, LogicalOperator::CTERef(_)) => true,
             _ => false,
         }
     }
@@ -1132,6 +1151,7 @@ fn enumerate_pattern_bindings(
                 let path_witness = match scope {
                     PatternScope::ScalarAggregatePath => Some(PatternWitness::ScalarAggregate),
                     PatternScope::OuterJoinPath => Some(PatternWitness::OuterJoin),
+                    PatternScope::CteReferencePath => Some(PatternWitness::CteReference),
                     _ => None,
                 };
                 if let Some(witness) = path_witness {
