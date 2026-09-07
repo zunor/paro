@@ -344,6 +344,12 @@ impl CardinalityEnvelope {
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
 pub enum EquivalenceProof {
     Initial,
+    /// Seed expression of a child group created while staging a transformed
+    /// root. It establishes provenance without claiming equivalence to an
+    /// expression that belongs to the newly-created group.
+    TransformationDescendant {
+        rule: RuleId,
+    },
     Normalization {
         rule: RuleId,
     },
@@ -1342,8 +1348,10 @@ impl Memo {
             }
             *child = self.canonical_group(*child);
         }
-        if !matches!(proof, EquivalenceProof::Initial)
-            && self.groups[target.index()].logical_exprs.is_empty()
+        if !matches!(
+            proof,
+            EquivalenceProof::Initial | EquivalenceProof::TransformationDescendant { .. }
+        ) && self.groups[target.index()].logical_exprs.is_empty()
         {
             return Err(paro_error::internal(
                 "a non-initial equivalence proof cannot seed an empty group",
@@ -1358,11 +1366,13 @@ impl Memo {
                 return Ok(existing);
             }
         }
-        if matches!(proof, EquivalenceProof::Initial)
-            && !self.groups[target.index()].logical_exprs.is_empty()
+        if matches!(
+            proof,
+            EquivalenceProof::Initial | EquivalenceProof::TransformationDescendant { .. }
+        ) && !self.groups[target.index()].logical_exprs.is_empty()
         {
             return Err(paro_error::internal(
-                "Initial proof may only seed a newly-created Memo group",
+                "seed proof may only initialize a newly-created Memo group",
             ));
         }
         let id = LogicalExprId::new(self.logical_exprs.len());

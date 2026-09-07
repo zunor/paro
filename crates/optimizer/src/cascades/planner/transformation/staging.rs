@@ -786,7 +786,7 @@ pub(super) fn stage_transformed_expression(
                 group,
                 key.clone(),
                 payload,
-                EquivalenceProof::Initial,
+                EquivalenceProof::TransformationDescendant { rule: options.rule },
                 operator_encoding,
             )?;
             state.record_expression_group(key, group, logical);

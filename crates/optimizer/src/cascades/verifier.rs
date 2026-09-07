@@ -56,7 +56,9 @@ impl MemoVerifier {
                 }
                 for proof in &logical.proofs {
                     match proof {
-                        EquivalenceProof::Initial | EquivalenceProof::Normalization { .. } => {}
+                        EquivalenceProof::Initial
+                        | EquivalenceProof::TransformationDescendant { .. }
+                        | EquivalenceProof::Normalization { .. } => {}
                         EquivalenceProof::Transformation { source, .. } => {
                             if memo.logical_expr(*source).is_none() {
                                 return Err(paro_error::internal(

@@ -1341,7 +1341,8 @@ impl CascadesEngine {
                         self.memo.logical_expr(logical).and_then(|logical| {
                             logical.proofs.iter().find_map(|proof| match proof {
                                 EquivalenceProof::Transformation { rule, .. }
-                                | EquivalenceProof::SpecializedEnumerator { rule, .. } => {
+                                | EquivalenceProof::SpecializedEnumerator { rule, .. }
+                                | EquivalenceProof::TransformationDescendant { rule } => {
                                     Some(rule.0)
                                 }
                                 EquivalenceProof::Initial

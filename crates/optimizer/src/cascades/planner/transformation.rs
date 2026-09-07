@@ -142,6 +142,13 @@ impl TransformationRule for PlannerTransformationRule {
     }
 
     fn matches_root(&self, expr: &crate::cascades::memo::LogicalExpr) -> bool {
+        if matches!(
+            self.transformation,
+            PlannerTransformation::JoinRegionEnumeration
+        ) && expression_is_only_rule_output(expr, self.id())
+        {
+            return false;
+        }
         let state = self
             .planner_state
             .read()
@@ -520,6 +527,47 @@ impl TransformationRule for PlannerTransformationRule {
             })
             .collect())
     }
+}
+
+/// A bounded region enumerator already emits its complete candidate frontier
+/// for one exact input binding. Its output trees are equivalent results, not
+/// fresh region seeds. Re-enumerating those trees recursively turns a bounded
+/// `N`-candidate enumeration into an `N^depth` closure without exposing a new
+/// semantic input.
+///
+/// Initial expressions and expressions independently produced by another
+/// rule remain seeds. Their pattern read cursors still wake when a child
+/// frontier or fact changes, so this guard removes only enumerator self-feed.
+fn expression_is_only_rule_output(expr: &crate::cascades::memo::LogicalExpr, rule: RuleId) -> bool {
+    proofs_are_only_rule_output(&expr.proofs, rule)
+}
+
+fn proofs_are_only_rule_output(proofs: &BTreeSet<EquivalenceProof>, rule: RuleId) -> bool {
+    let mut produced_by_rule = false;
+    for proof in proofs {
+        match proof {
+            EquivalenceProof::Transformation {
+                rule: proof_rule, ..
+            }
+            | EquivalenceProof::SpecializedEnumerator {
+                rule: proof_rule, ..
+            }
+            | EquivalenceProof::TransformationDescendant { rule: proof_rule }
+                if *proof_rule == rule =>
+            {
+                produced_by_rule = true
+            }
+            EquivalenceProof::Normalization { rule: proof_rule } if *proof_rule == rule => {
+                produced_by_rule = true
+            }
+            EquivalenceProof::Initial
+            | EquivalenceProof::TransformationDescendant { .. }
+            | EquivalenceProof::Normalization { .. }
+            | EquivalenceProof::Transformation { .. }
+            | EquivalenceProof::SpecializedEnumerator { .. } => return false,
+        }
+    }
+    produced_by_rule
 }
 
 /// Match the direct `Limit(Order(group))` boundary in the Memo instead of
@@ -1021,4 +1069,64 @@ fn settle_transformed_expression(
         verify_logical_plan(&environment.bind_context, &plan)?;
     }
     Ok((plan, context.column_stats))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn enumerator_outputs_do_not_feed_the_same_enumerator() {
+        let rule = JOIN_REGION_ENUMERATION_RULE;
+        let source = LogicalExprId::new(7);
+        let premise = Fingerprint(11);
+        let generated = BTreeSet::from([
+            EquivalenceProof::Normalization { rule },
+            EquivalenceProof::Transformation {
+                rule,
+                source,
+                premise,
+            },
+        ]);
+        assert!(proofs_are_only_rule_output(&generated, rule));
+
+        let initial = BTreeSet::from([
+            EquivalenceProof::Initial,
+            EquivalenceProof::Transformation {
+                rule,
+                source,
+                premise,
+            },
+        ]);
+        assert!(!proofs_are_only_rule_output(&initial, rule));
+
+        let independently_generated = BTreeSet::from([
+            EquivalenceProof::Transformation {
+                rule,
+                source,
+                premise,
+            },
+            EquivalenceProof::Transformation {
+                rule: AGGREGATE_POST_REDUCTION_RULE,
+                source,
+                premise,
+            },
+        ]);
+        assert!(!proofs_are_only_rule_output(&independently_generated, rule));
+
+        let normalized_by_another_rule = BTreeSet::from([
+            EquivalenceProof::Normalization {
+                rule: AGGREGATE_POST_REDUCTION_RULE,
+            },
+            EquivalenceProof::Transformation {
+                rule,
+                source,
+                premise,
+            },
+        ]);
+        assert!(!proofs_are_only_rule_output(
+            &normalized_by_another_rule,
+            rule
+        ));
+    }
 }
