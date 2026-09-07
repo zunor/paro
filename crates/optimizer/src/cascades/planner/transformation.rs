@@ -290,7 +290,7 @@ impl TransformationRule for PlannerTransformationRule {
             for binding in bindings.bindings.into_vec() {
                 let identity =
                     join_region::identity_with_facts(&binding.root, ctx.memo, &state, None)?;
-                if identity.map_or(true, |identity| graph_identities.insert(identity)) {
+                if identity.is_none_or(|identity| graph_identities.insert(identity)) {
                     unique.push(binding);
                 }
             }
@@ -437,9 +437,10 @@ impl TransformationRule for PlannerTransformationRule {
 
         let mut prepared = Vec::with_capacity(plans.len());
         for plan in plans {
+            let retained_group_holes = retained_group_holes(&plan, &nested_group_holes)?;
             let group_hole_guard = GroupHoleTransportGuard::capture(
                 &plan,
-                nested_group_holes.keys().copied(),
+                retained_group_holes.keys().copied(),
                 &environment.bind_context,
             )?;
             let (plan, column_stats) = settle_transformed_expression(
@@ -528,7 +529,7 @@ impl TransformationRule for PlannerTransformationRule {
                 extended_required_region_facets.into_boxed_slice(),
                 output_input_context,
                 output_child_context,
-                nested_group_holes.clone(),
+                retained_group_holes,
             ));
         }
         if prepared.is_empty() {
@@ -953,6 +954,36 @@ struct GroupHoleTransportGuard {
     bind_context: BindContext,
 }
 
+/// Keep the exact Memo operands that survived a relational rewrite.
+///
+/// Eliminating an operator may legitimately eliminate one of its opaque
+/// inputs. Surviving references must still be registered exactly once; an
+/// introduced or duplicated reference is never accepted as equivalent.
+fn retained_group_holes(
+    plan: &LogicalPlan,
+    available: &BTreeMap<u32, GroupId>,
+) -> Result<BTreeMap<u32, GroupId>> {
+    let mut retained = BTreeMap::new();
+    plan.try_visit_pre_order(|node| {
+        let LogicalOperator::BoundReference(reference) = &node.operator else {
+            return Ok(());
+        };
+        let group = available
+            .get(&reference.reference_id)
+            .copied()
+            .ok_or_else(|| {
+                paro_error::internal("transformation introduced an unregistered Memo group hole")
+            })?;
+        if retained.insert(reference.reference_id, group).is_some() {
+            return Err(paro_error::internal(
+                "transformation duplicated an opaque Memo group hole",
+            ));
+        }
+        Ok(())
+    })?;
+    Ok(retained)
+}
+
 struct GroupHoleTransportTemplate {
     plan: LogicalPlan,
 }
@@ -998,11 +1029,7 @@ impl GroupHoleTransportGuard {
             }
             Ok(())
         })?;
-        if templates.len() != wanted.len() {
-            return Err(paro_error::internal(
-                "transformation output discarded a bound Memo group hole",
-            ));
-        }
+        debug_assert_eq!(templates.len(), wanted.len());
         Ok(Self {
             templates,
             bind_context: bind_context.clone(),

@@ -18,9 +18,9 @@ pub(super) struct StagingRequest {
     pub(super) column_stats: SharedColumnStatistics,
     pub(super) target: StagingTarget,
     pub(super) regions: StagingRegionRequirements,
-    /// Opaque Memo inputs retained at arbitrary depth by a native pattern.
-    /// Staging must consume every transport node exactly once and substitute
-    /// the named group before publishing the transformed expression.
+    /// Opaque Memo inputs retained by the transformed expression. Inputs
+    /// legitimately discarded by a relational rewrite are removed before
+    /// staging; every surviving transport node is consumed exactly once.
     pub(super) nested_group_holes: BTreeMap<u32, GroupId>,
 }
 

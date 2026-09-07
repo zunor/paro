@@ -347,10 +347,7 @@ impl JoinElimination {
             return false;
         }
 
-        let LogicalOperator::Get(get) = &join.right.operator else {
-            return false;
-        };
-        self.conditions_cover_unique_key(join, get, true)
+        self.conditions_cover_unique_key(join, join.right.as_ref(), true)
     }
 
     fn can_eliminate_left_side(
@@ -368,10 +365,7 @@ impl JoinElimination {
             return false;
         }
 
-        let LogicalOperator::Get(get) = &join.left.operator else {
-            return false;
-        };
-        self.conditions_cover_unique_key(join, get, false)
+        self.conditions_cover_unique_key(join, join.left.as_ref(), false)
     }
 
     fn join_shape_supported(&self, join: &ComparisonJoin) -> bool {
@@ -384,14 +378,10 @@ impl JoinElimination {
     fn conditions_cover_unique_key(
         &self,
         join: &ComparisonJoin,
-        get: &paro_planner::operator::Get,
+        eliminated: &LogicalPlan,
         eliminate_right: bool,
     ) -> bool {
-        let Some(table) = get.table.as_ref() else {
-            return false;
-        };
-
-        let mut key_columns = HashSet::new();
+        let mut key_bindings = HashSet::new();
         for condition in &join.conditions {
             if condition.comparison != JoinComparisonType::Equal {
                 return false;
@@ -415,29 +405,44 @@ impl JoinElimination {
             let Expression::ColumnRef(column_ref) = eliminated_expr else {
                 return false;
             };
-            if column_ref.binding.table_index != get.table_index {
-                return false;
-            }
-            let Some(column_id) = get.stored_column(column_ref.binding.column_index) else {
-                return false;
-            };
-            key_columns.insert(column_id);
+            key_bindings.insert(column_ref.binding);
         }
 
-        if key_columns.is_empty() {
+        if key_bindings.is_empty() {
             return false;
         }
-
-        table.constraints().iter().any(|constraint| {
-            matches!(
-                constraint.constraint_type,
-                ConstraintType::Unique | ConstraintType::PrimaryKey
-            ) && !constraint.columns.is_empty()
-                && constraint
-                    .columns
+        match &eliminated.operator {
+            LogicalOperator::Get(get) => {
+                let Some(table) = get.table.as_ref() else {
+                    return false;
+                };
+                let key_columns = key_bindings
                     .iter()
-                    .all(|column| key_columns.contains(column))
-        })
+                    .filter(|binding| binding.table_index == get.table_index)
+                    .filter_map(|binding| get.stored_column(binding.column_index))
+                    .collect::<HashSet<_>>();
+                table.constraints().iter().any(|constraint| {
+                    matches!(
+                        constraint.constraint_type,
+                        ConstraintType::Unique | ConstraintType::PrimaryKey
+                    ) && !constraint.columns.is_empty()
+                        && constraint
+                            .columns
+                            .iter()
+                            .all(|column| key_columns.contains(column))
+                })
+            }
+            LogicalOperator::BoundReference(reference) => {
+                reference.facts.unique_keys.iter().any(|key| {
+                    !key.columns.is_empty()
+                        && key
+                            .columns
+                            .iter()
+                            .all(|column| key_bindings.contains(&column.binding))
+                })
+            }
+            _ => false,
+        }
     }
 }
 
