@@ -1,123 +1,113 @@
 # Cold planning and Q11: 2026-09-07 checkpoint
 
-This is a partial performance delivery, not completion of the cold-planning
-target. Q11 steady execution remains faster than DuckDB under the measured
-configuration. Fresh-process planning remains orders of magnitude slower.
+This checkpoint closes the deterministic-search and Memo fact-replay defects
+found in the `adb0440e` review. It is still **not** completion of the
+cold-planning performance target: fresh-process Q11 statement latency remains
+materially slower than DuckDB, and the current steady-state confidence interval
+does not prove that Paro is faster.
 
-## Implemented contracts
+## Contracts implemented after `adb0440e`
 
-- `c76cd594`: distinguish discovery invalidation from application invalidation.
-  A newly discovered alternative does not require reapplying every unchanged
-  binding. Application observations compare exact bindings inside fingerprint
-  buckets, retain declined matches, and replace obsolete fact observations.
-  Statistics observations include the resolved cardinality envelope, rather
-  than only the local recipe that references another group.
-- `121d64b9`: bind local operator patterns and keep irrelevant descendants as
-  group holes. TopN includes the projection/filter/scan path required by its
-  vector and full-text implementations. Join enumeration and aggregate region
-  rewrites retain complete boundary evidence: schema-only holes cannot yet
-  supply all their source-lineage, uniqueness, and control-region facts.
-- A checked, nested group-hole transport replaces the separate root-only path.
-  Restoration uses one post-order walk. Duplicate, missing, unregistered, and
-  root transport nodes are rejected before publication.
-- Associative join enumeration is reused for an identical graph problem in
-  the same target group. Exact encoded atomic inputs, normalized predicates,
-  and consumed facts distinguish problems; binary parenthesization does not.
-  Entries participate in the staging transaction and roll back with it.
-- Staging searches the matching operator-key range instead of scanning the
-  complete expression reuse index. Optional group allocation includes the
-  output schema and logical contract, matching the reuse admission contract.
-  Freshly rebound projections therefore cannot share an allocation event while
-  requiring different groups.
+- Logical filter generation and conjunct selectivity are order invariant.
+  Equivalent predicate sets therefore produce the same estimates and plan
+  search, independent of randomized hash-map iteration.
+- Rule replay first revalidates the immutable fact value consumed by the prior
+  application. A changed derivation cursor with an equal value refreshes the
+  subscription without reconstructing and reapplying the binding.
+- Stable fingerprints batch scalar writes into one BLAKE3 transcript. BLAKE3 is
+  retained deliberately: several fingerprints are proof and scheduler
+  identities, so replacing them with a fast bucket hash before separating
+  bucket identity from proof identity would weaken a correctness contract.
+- Root dispatch rejects aggregate rules whose immutable operator payload cannot
+  match. Associative join bindings are deduplicated by their normalized graph
+  and resolved fact values before rule admission.
+- Winner verification traverses the retained candidate frontier rather than
+  every discarded physical expression. Search work, binding construction, and
+  fact-value cache hits/misses are published as stable optimizer counters.
+- Scalar-aggregate, aggregate post-reduction, join-elimination, and CTE filter
+  demand rules bind only their consumed operator paths. Opaque descendants stay
+  as exact Memo group references with transported cardinality, uniqueness,
+  lineage, and control-region facts.
+- Memo groups cache immutable logical-fact and statistics identities. Mutation
+  invalidates the cache at the group boundary; repeated reads no longer rebuild
+  identical transcripts.
+- Relational rewrites may discard an opaque input (for example, eliminating the
+  unique side of an outer join). Every surviving group reference must remain
+  registered exactly once and is atomically substituted during staging;
+  introduced or duplicated references are rejected.
 
-There are no Q11 identifiers, SQL fingerprints, budget reductions, or cost
-constant changes in this delivery. The existing search budget can still yield
-an incomplete optional closure; these changes do not claim otherwise.
+No Q11 fingerprint, query-specific cost, reduced search budget, compatibility
+path, or cached-statement timing is used in this delivery.
 
 ## Validation
 
-- `make static`: passed, including workspace/all-targets clippy.
-- `cargo test --workspace --no-fail-fast -j 4`: 6,324 passed, 85 ignored,
-  zero failed, including documentation tests.
-- SQL regress against a fresh data directory: 183/183 passed.
-- New tests cover collision-safe incremental applications, new alternatives,
-  root/child statistics invalidation, inherited cardinality invalidation,
-  opaque input boundaries under a small construction budget, associative
-  graph identity, and independently rebound projection allocation.
-- Two EXPLAIN baselines changed. CTE estimated rows changed from zero to one;
-  filtered vector queries now select exact index-backed vector search instead
-  of the former TopN/row-fetch shape. Query results did not change. The initial
-  loss of full-text/vector TopK caused by an underspecified local pattern was
-  fixed, not blessed.
+- `make static`: passed, including workspace/all-targets Clippy.
+- `cargo test --workspace --no-fail-fast -j4`: passed after the final
+  join-elimination boundary fix, including 914 optimizer tests and all
+  documentation tests.
+- SQL regress against a fresh data directory: **183/183 passed**.
+- Three EXPLAIN artifacts changed only because the stable fingerprint transcript
+  received a new domain; their plan structure and results are unchanged.
+- The outer-join elimination regression exposed by path binding is fixed using
+  transported Memo uniqueness, without reconstructing a representative child
+  tree.
 
-## Q11 evidence
+## Current Q11 evidence
 
-Measured source: clean `121d64b9ba7f6d00aa4e1aa188ee02655bfc0952`.
+Measured clean source: `4be4fe56446258c309dc93794fa02c7feab4a57d`.
 
 Binary SHA-256:
-`14823eff36adf6c04d40fc77f872111b6f43b93cce2ea61aa0ed7b922b09cd0d`.
+`a741ba5ad32e3cdadbcc687d877a2d9b267710bf8fcd3d7ff30201fadeb5c1a9`.
 
-SF1, four threads, 2 GiB, symmetric `none` uniqueness metadata, and Paro
-`optimizer_verify=true`. The execution comparator used five fresh-process
-blocks, two warmups per process, three ABBA rounds per block, and 10,000
-hierarchical bootstrap samples. All 30 measured samples per engine matched
-the complete 90-row multiset, schema, and ordering contract.
+TPC-DS SF1, four threads, 2 GiB, symmetric `none` metadata and
+`optimizer_verify=true`. The comparator used five fresh-process blocks, two
+warmups per process and three ABBA rounds per block. All 30 measured samples per
+engine matched the complete 90-row multiset, schema and ordering contract.
 
 | Measurement | Paro | DuckDB |
 |---|---:|---:|
-| Steady execute/fetch median | 101.575 ms | 105.618 ms |
-| First complete statement median | 3,362.762 ms | 108.716 ms |
-| First EXPLAIN median, separate three-process diagnostic | 2,803.818 ms | 4.486 ms |
+| Steady execute/fetch median | 106.645 ms | 106.910 ms |
+| First complete statement median | 984.773 ms | 110.929 ms |
 
-Steady geometric-mean ratio: **0.964431**, hierarchical 95% CI
-**[0.952739, 0.983643]**. All five block ratios were below one. The comparator
-qualified this evidence as faster than DuckDB; it does not establish an
-execution advantage for other data scales, memory grants, or DOP values.
+The steady geometric paired ratio is **0.980299**, with hierarchical 95% CI
+**[0.895510, 1.059492]**. The point estimate favors Paro, but the interval
+crosses one, so this run does not qualify as faster. The fresh-process result is
+about 8.9 times DuckDB and includes compile, execute, fetch, and result metadata;
+it must not be described as pure planning latency.
 
-The EXPLAIN diagnostic used a fresh Paro server and a fresh DuckDB process for
-each of three observations, alternating which engine was measured first.
-It excluded connection/setup time and did not execute Q11. This is
-process-cold planning, not disk-cold I/O. It is a diagnostic, not a second
-ABBA confidence-interval claim. First-statement latency must not be presented
-as pure planning latency.
+For comparison, the reviewed `adb0440e` source produced 4.7--9.7 second cold
+EXPLAIN observations and multiple plan shapes. The current source produces a
+stable plan and roughly one-second first statements. A debug diagnostic reports
+779 groups and these principal rule attempts: aggregate dimension deferral 531,
+aggregate join subsumption 468, and join-region enumeration 534. Search remains
+budget-limited.
 
-Local evidence artifacts (benchmark reports are intentionally git-ignored):
+Local evidence (benchmark reports are intentionally git-ignored):
 
-- `benchmark/report/tpcds-q11-cold-121d64b9-20260907.json`
-- `benchmark/report/tpcds-q11-explain-cold-121d64b9-20260907.json`
-- `/tmp/paro-cold-static-20260907.log`
-- `/tmp/paro-cold-workspace-tests-20260907.log`
-- `/tmp/paro-cold-regress-final-results-20260907.log`
+- `benchmark/report/tpcds-q11-cold-final-20260907.json`
+- `benchmark/report/tpcds-q11-cold-final-20260907.q11.*.parod.log`
 
-Execution reproduction:
+## Remaining structural work
 
-```sh
-benchmark/.venv/bin/python benchmark/corpora/tpcds_compare.py \
-  --server-data-dir /Users/linjunhong/workspace/tpcds-sf1/paro-data \
-  --listen 127.0.0.1:6433 \
-  --duckdb-database /Users/linjunhong/workspace/tpcds-sf1/tpcds-sf1.duckdb \
-  --dataset-source-dir /Users/linjunhong/workspace/tpcds-sf1/csv \
-  --query-dir /tmp/paro-q11-query-20260907 \
-  --report benchmark/report/tpcds-q11-cold-recheck.json \
-  --start 11 --end 11 --metadata-track none --threads 4 --memory-limit 2GB \
-  --warmups-per-process 2 --process-blocks 5 \
-  --measurement-rounds-per-process 3 --random-seed 11
-```
+Three transformations still use the complete-subtree adapter: CTE inlining,
+CTE demand pushdown, and partitioned CTE materialization. A mechanical group-hole
+migration is unsound: a CTE consumer occurrence has rebinding, predicate-demand,
+null-extension, and sharing-owner semantics that a relational GroupRef does not
+encode. Experiments with that migration either lost Q11's shared producer plan
+or expanded the search frontier, so they were not retained.
 
-## Remaining design work
+The next long-term boundary is a native CTE requirement value. It must carry a
+producer identity plus the complete set of consumer occurrence demands and
+scope/null-extension proofs. Inline, shared, and partitioned implementations can
+then compete under one requirement while preserving exact producer GroupRefs.
+Only after those three rules migrate can the generic `PatternScope::Subtree`
+adapter be deleted.
 
-The cold-planning target is **not met**. Reducing repeated work is useful, but
-does not remove tree reconstruction and settlement for region/CTE rules.
-
-The next prerequisite is a Memo-native boundary-facts contract for source
-lineage, uniqueness, statistics dependencies, and control-region ownership.
-Logical and physical consumers must declare the evidence they read. A smaller
-pattern cannot silently remove evidence needed by implementation selection.
-Only then can region/CTE transformations preserve group references throughout
-rewriting, and stage only changed shells with incremental fact propagation.
-
-Further acceptance must include actual dependency wake-up tests for inherited
-and CTE evidence, construction/read-work accounting, default-budget Q11 plan
-preservation, search TopK access-path coverage, and fresh-process EXPLAIN
-measurements. A cached-plan hit or the Q11 execution speedup is not evidence
-that the cold-planning contract has been completed.
+The remaining cold gap also requires incremental shell settlement: successful
+local rewrites currently repeat filter normalization, statistics gathering,
+column lifetime analysis, and verification over every retained shell path.
+Those passes need fact-keyed node results and invalidation, not a lower global
+budget. Acceptance remains: identical closure under rule/expression order
+permutations when budgets suffice, explicit incomplete status when they do not,
+byte-identical repeated EXPLAIN, fresh-process comparison, and a newly qualified
+Q11 execution result.
