@@ -45,6 +45,10 @@ pub struct ColumnStatistics {
     stats: BaseStatistics,
     /// Optional distinct statistics (HyperLogLog-based)
     distinct_stats: Option<Arc<DistinctStatistics>>,
+    /// Immutable planner-domain estimate. This is not an HLL observation and
+    /// does not allocate or pretend to own a mergeable sketch. Storage never
+    /// serializes this plan-local evidence.
+    estimated_distinct: Option<usize>,
     /// A proof-backed upper bound on the number of values this column can
     /// contain in the current relational expression.
     ///
@@ -70,6 +74,7 @@ impl ColumnStatistics {
         Self {
             stats,
             distinct_stats,
+            estimated_distinct: None,
             guaranteed_distinct_upper: None,
         }
     }
@@ -82,6 +87,18 @@ impl ColumnStatistics {
         Self {
             stats,
             distinct_stats: distinct_stats.map(Arc::new),
+            estimated_distinct: None,
+            guaranteed_distinct_upper: None,
+        }
+    }
+
+    /// Transport a resolved planner estimate without manufacturing an empty
+    /// HLL, whose zero observation would erase the supplied NDV.
+    pub fn with_estimated_distinct(stats: BaseStatistics, estimate: Option<usize>) -> Self {
+        Self {
+            stats,
+            distinct_stats: None,
+            estimated_distinct: estimate,
             guaranteed_distinct_upper: None,
         }
     }
@@ -122,6 +139,22 @@ impl ColumnStatistics {
     ///
     /// Both base statistics and distinct statistics are merged.
     pub fn merge(&mut self, other: &ColumnStatistics) {
+        let estimated_union =
+            if self.estimated_distinct.is_some() || other.estimated_distinct.is_some() {
+                let estimate = |column: &Self| {
+                    column.estimated_distinct.or_else(|| {
+                        column
+                            .distinct_stats
+                            .as_ref()
+                            .map(|statistics| statistics.get_count())
+                    })
+                };
+                estimate(self)
+                    .zip(estimate(other))
+                    .map(|(left, right)| left.saturating_add(right))
+            } else {
+                None
+            };
         self.stats.merge(&other.stats);
 
         self.guaranteed_distinct_upper = self
@@ -133,7 +166,11 @@ impl ColumnStatistics {
             (&mut self.distinct_stats, &other.distinct_stats)
         {
             Arc::make_mut(self_distinct).merge(other_distinct);
+        } else {
+            // A sketch for only one input is not a sketch of the union.
+            self.distinct_stats = None;
         }
+        self.estimated_distinct = estimated_union;
     }
 
     /// Update distinct statistics with hash values.
@@ -182,6 +219,7 @@ impl ColumnStatistics {
     ///
     /// This replaces any existing distinct statistics.
     pub fn set_distinct(&mut self, distinct_stats: Option<DistinctStatistics>) {
+        self.estimated_distinct = None;
         self.distinct_stats = distinct_stats.map(Arc::new);
     }
 
@@ -190,6 +228,7 @@ impl ColumnStatistics {
         Self {
             stats: self.stats.copy(),
             distinct_stats: self.distinct_stats.clone(),
+            estimated_distinct: self.estimated_distinct,
             guaranteed_distinct_upper: self.guaranteed_distinct_upper,
         }
     }
@@ -201,13 +240,15 @@ impl ColumnStatistics {
 
     /// Get the estimated distinct count.
     ///
+    /// Reads either a sketch observation or an explicit planner estimate.
     /// Returns 0 if distinct statistics are not available.
     pub fn get_distinct_count(&self) -> usize {
-        let observed = self
-            .distinct_stats
-            .as_ref()
-            .map(|d| d.get_count())
-            .unwrap_or(0);
+        let observed = self.estimated_distinct.unwrap_or_else(|| {
+            self.distinct_stats
+                .as_ref()
+                .map(|d| d.get_count())
+                .unwrap_or(0)
+        });
         if observed == 0 {
             return 0;
         }
@@ -261,6 +302,7 @@ impl ColumnStatistics {
         Ok(Self {
             stats,
             distinct_stats,
+            estimated_distinct: None,
             guaranteed_distinct_upper: None,
         })
     }
@@ -305,6 +347,49 @@ impl std::fmt::Display for ColumnStatistics {
 mod tests {
     use super::*;
     use paro_common::runtime_value::Value;
+
+    #[test]
+    fn immutable_domain_ndv_is_not_an_empty_sketch_or_a_storage_observation() {
+        let statistics = ColumnStatistics::with_estimated_distinct(
+            BaseStatistics::create_unknown(LogicalType::Integer),
+            Some(97),
+        )
+        .with_guaranteed_distinct_upper(80);
+        assert_eq!(statistics.get_distinct_count(), 80);
+        assert!(!statistics.has_distinct_stats());
+        assert_eq!(statistics.copy().get_distinct_count(), 80);
+        let restored =
+            ColumnStatistics::from_bytes(&statistics.to_bytes().unwrap(), LogicalType::Integer)
+                .unwrap();
+        assert_eq!(
+            restored.get_distinct_count(),
+            0,
+            "planning estimates are not persisted observations"
+        );
+        assert_eq!(restored.guaranteed_distinct_upper(), None);
+    }
+
+    #[test]
+    fn immutable_domain_union_is_commutative_and_unknown_input_stays_unknown() {
+        let domain = |rows| {
+            ColumnStatistics::with_estimated_distinct(
+                BaseStatistics::create_unknown(LogicalType::Integer),
+                Some(rows),
+            )
+        };
+        let mut left = domain(20);
+        left.merge(&domain(30));
+        let mut right = domain(30);
+        right.merge(&domain(20));
+        assert_eq!(left.get_distinct_count(), 50);
+        assert_eq!(left.get_distinct_count(), right.get_distinct_count());
+        assert!(!left.has_distinct_stats());
+        left.merge(&ColumnStatistics::with_estimated_distinct(
+            BaseStatistics::create_unknown(LogicalType::Integer),
+            None,
+        ));
+        assert_eq!(left.get_distinct_count(), 0);
+    }
 
     /// MurmurHash3 64-bit finalizer for better hash distribution in tests.
     fn murmur_hash_mix(mut h: u64) -> u64 {
