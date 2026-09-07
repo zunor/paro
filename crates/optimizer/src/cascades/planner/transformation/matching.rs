@@ -678,6 +678,7 @@ pub(super) fn dimension_sharing_pattern_bindings(
 /// Enumerate exact logical alternatives consumed by a planner transformation.
 /// Every visited group revision is returned even when later rule recognition
 /// declines, which gives no-match bindings an incremental wake-up edge.
+#[cfg(test)]
 pub(super) fn pattern_bindings(
     root_group: GroupId,
     root_expression: LogicalExprId,
@@ -686,8 +687,174 @@ pub(super) fn pattern_bindings(
     work_dimension: BudgetDimension,
     cancellation: Option<&paro_context::StatementCancellation>,
 ) -> Result<PatternBindingSet> {
+    enumerate_pattern_bindings(
+        root_group,
+        root_expression,
+        memo,
+        budget,
+        work_dimension,
+        cancellation,
+        PatternSpec {
+            state: None,
+            scope: PatternScope::Subtree,
+            witness: None,
+        },
+    )
+}
+
+/// A pattern owns only the operators whose semantics the rule reads. Opaque
+/// inputs retain their group identity, facts and statistics without subscribing
+/// to (or multiplying by) equivalent implementations below that boundary.
+#[derive(Debug, Clone, Copy)]
+enum PatternScope {
+    Subtree,
+    Hole,
+    Shell,
+    TopN,
+    Order,
+    SearchInput,
+    MarkConsumer,
+    MarkFilter,
+    MarkJoin,
+    LimitProjection,
+    Projection,
+    Preaggregate,
+    LeftJoin,
+    NonNullAggregate,
+    NonNullInput,
+}
+
+impl PatternScope {
+    fn children(self, operator: &LogicalOperator) -> Option<Vec<Self>> {
+        let arity = operator.children().len();
+        let repeat = |scope| Some(vec![scope; arity]);
+        match self {
+            Self::Subtree => repeat(Self::Subtree),
+            Self::Hole => unreachable!("group holes do not inspect operators"),
+            Self::Shell => repeat(Self::Hole),
+            Self::LimitProjection => matches!(operator, LogicalOperator::Limit(_)).then(|| vec![Self::Projection]),
+            Self::Projection => matches!(operator, LogicalOperator::Projection(_)).then(|| vec![Self::Hole]),
+            Self::Preaggregate => matches!(operator, LogicalOperator::Aggregate(aggregate) if aggregate.groups.len() == 1).then(|| vec![Self::LeftJoin]),
+            Self::LeftJoin => matches!(operator, LogicalOperator::Join(Join::Comparison(join)) if join.join_type == JoinType::Left).then(|| vec![Self::Shell; arity]),
+            Self::NonNullAggregate => matches!(operator, LogicalOperator::Aggregate(_)).then(|| vec![Self::NonNullInput]),
+            Self::NonNullInput => match operator {
+                LogicalOperator::Filter(_) | LogicalOperator::Order(_) | LogicalOperator::TopN(_) | LogicalOperator::Limit(_) => repeat(Self::NonNullInput),
+                LogicalOperator::Get(_) => repeat(Self::Hole),
+                _ => None,
+            },
+            Self::TopN => matches!(operator, LogicalOperator::Limit(_)).then(|| vec![Self::Order]),
+            Self::Order => match operator {
+                LogicalOperator::Projection(_) => Some(vec![Self::Order]),
+                LogicalOperator::Order(_) => Some(vec![Self::SearchInput]),
+                _ => None,
+            },
+            Self::SearchInput => match operator {
+                LogicalOperator::Projection(_) | LogicalOperator::Filter(_) => repeat(Self::SearchInput),
+                _ => repeat(Self::Hole),
+            },
+            Self::MarkConsumer => match operator {
+                LogicalOperator::Projection(_) => Some(vec![Self::MarkFilter]),
+                LogicalOperator::Filter(_) => Self::MarkFilter.children(operator),
+                _ => None,
+            },
+            Self::MarkFilter => match operator {
+                LogicalOperator::Filter(filter) if matches!(filter.expressions.as_slice(), [Expression::ColumnRef(_)]) => Some(vec![Self::MarkJoin]),
+                _ => None,
+            },
+            Self::MarkJoin => match operator {
+                LogicalOperator::Join(Join::Comparison(join)) if join.join_type == JoinType::Mark => repeat(Self::Hole),
+                _ => None,
+            },
+        }
+    }
+}
+
+pub(super) fn scoped_pattern_bindings(
+    transformation: PlannerTransformation,
+    root_group: GroupId,
+    root_expression: LogicalExprId,
+    memo: &Memo,
+    state: &PlannerTransformState,
+    cancellation: Option<&paro_context::StatementCancellation>,
+    work_dimension: BudgetDimension,
+) -> Result<PatternBindingSet> {
+    let scope = match transformation {
+        PlannerTransformation::ExpensivePredicatePlacement => PatternScope::Shell,
+        PlannerTransformation::TopNIntroduction => PatternScope::TopN,
+        PlannerTransformation::LimitPushdown => PatternScope::LimitProjection,
+        PlannerTransformation::AggregateJoinPreaggregation => PatternScope::Preaggregate,
+        PlannerTransformation::AggregateNonNullInput => PatternScope::NonNullAggregate,
+        // Region enumeration and aggregate deferral still consume boundary
+        // source lineage and uniqueness through semantic operator trees. Do
+        // not turn those inputs into schema-only holes until these physical
+        // facts are supplied by a first-class Memo contract.
+        PlannerTransformation::MarkJoinToSemi => PatternScope::MarkConsumer,
+        _ => PatternScope::Subtree,
+    };
+    let witness = match transformation {
+        PlannerTransformation::AggregatePostReduction
+        | PlannerTransformation::ScalarAggregateWindow => Some(PatternWitness::ScalarAggregate),
+        PlannerTransformation::JoinElimination => Some(PatternWitness::OuterJoin),
+        _ => None,
+    };
+    enumerate_pattern_bindings(
+        root_group,
+        root_expression,
+        memo,
+        memo.budget(),
+        work_dimension,
+        cancellation,
+        PatternSpec {
+            state: Some(state),
+            scope,
+            witness,
+        },
+    )
+}
+
+#[derive(Clone, Copy)]
+enum PatternWitness {
+    ScalarAggregate,
+    OuterJoin,
+}
+
+impl PatternWitness {
+    fn matches(self, operator: &LogicalOperator) -> bool {
+        match (self, operator) {
+            (Self::ScalarAggregate, LogicalOperator::Aggregate(aggregate)) => {
+                aggregate.groups.is_empty()
+            }
+            (Self::OuterJoin, LogicalOperator::Join(Join::Comparison(join))) => {
+                matches!(join.join_type, JoinType::Left | JoinType::Right)
+            }
+            _ => false,
+        }
+    }
+}
+
+struct PatternSpec<'a> {
+    state: Option<&'a PlannerTransformState>,
+    scope: PatternScope,
+    witness: Option<PatternWitness>,
+}
+
+fn enumerate_pattern_bindings(
+    root_group: GroupId,
+    root_expression: LogicalExprId,
+    memo: &Memo,
+    budget: &SearchBudget,
+    work_dimension: BudgetDimension,
+    cancellation: Option<&paro_context::StatementCancellation>,
+    pattern: PatternSpec<'_>,
+) -> Result<PatternBindingSet> {
+    let PatternSpec {
+        state,
+        scope,
+        witness,
+    } = pattern;
     struct Enumerator<'a> {
         memo: &'a Memo,
+        state: Option<&'a PlannerTransformState>,
         limit: usize,
         work_units: usize,
         reads: BTreeMap<GroupId, PatternRead>,
@@ -696,6 +863,54 @@ pub(super) fn pattern_bindings(
     }
 
     impl Enumerator<'_> {
+        /// Existential pattern lookahead over a DAG. A negative match records
+        /// all inspected frontiers, so adding a qualifying non-selected
+        /// expression wakes the rule. Admission precedes each inspected node.
+        fn contains_witness(
+            &mut self,
+            root: LogicalExprId,
+            witness: PatternWitness,
+        ) -> Result<bool> {
+            let mut pending = vec![root];
+            let mut visited = BTreeSet::new();
+            while let Some(expression) = pending.pop() {
+                if !self.admit_work(1)? {
+                    return Ok(false);
+                }
+                let logical = self
+                    .memo
+                    .logical_expr(expression)
+                    .ok_or_else(|| paro_error::internal("pattern lookahead lost expression"))?;
+                let operator = &self
+                    .state
+                    .and_then(|state| state.payloads.logical.get(logical.payload.index()))
+                    .ok_or_else(|| paro_error::internal("pattern lookahead has no operator shell"))?
+                    .semantic_template
+                    .operator;
+                if witness.matches(operator) {
+                    return Ok(true);
+                }
+                for child in logical.key.children.iter().copied() {
+                    let child = self.memo.canonical_group(child);
+                    if visited.insert(child) {
+                        if !self.observe(child)? {
+                            return Ok(false);
+                        }
+                        pending.extend(
+                            self.memo
+                                .group(child)
+                                .ok_or_else(|| {
+                                    paro_error::internal("pattern lookahead lost group")
+                                })?
+                                .logical_exprs()
+                                .iter()
+                                .copied(),
+                        );
+                    }
+                }
+            }
+            Ok(false)
+        }
         fn operand_work(operand: &PatternOperand) -> usize {
             match operand {
                 PatternOperand::Group(_) => 1,
@@ -750,11 +965,23 @@ pub(super) fn pattern_bindings(
             &mut self,
             group: GroupId,
             active: &mut BTreeSet<GroupId>,
+            scope: PatternScope,
         ) -> Result<Vec<(PatternOperand, Fingerprint)>> {
             let group = self.memo.canonical_group(group);
             let group_ref = self.memo.group(group).ok_or_else(|| {
                 paro_error::internal("pattern matcher references an unknown Memo group")
             })?;
+            if matches!(scope, PatternScope::Hole) {
+                if !self.observe_facts(group)? || !self.admit_work(1)? {
+                    return Ok(Vec::new());
+                }
+                let mut fingerprint = StableFingerprintBuilder::default();
+                fingerprint.write_bytes(b"paro.pattern.semantic-group-hole.v1");
+                fingerprint.write_u64(group.0 as u64);
+                fingerprint.write_fingerprint(group_ref.logical_fact_fingerprint());
+                fingerprint.write_fingerprint(group_ref.statistics_snapshot_fingerprint());
+                return Ok(vec![(PatternOperand::Group(group), fingerprint.finish())]);
+            }
             if !self.observe(group)? {
                 return Ok(Vec::new());
             }
@@ -776,7 +1003,7 @@ pub(super) fn pattern_bindings(
             });
             let mut result = Vec::new();
             for expression in expressions {
-                for candidate in self.expression(group, expression, active)? {
+                for candidate in self.expression(group, expression, active, scope)? {
                     if result.len() == self.limit {
                         self.limited = true;
                         break;
@@ -798,13 +1025,49 @@ pub(super) fn pattern_bindings(
             group: GroupId,
             expression: LogicalExprId,
             active: &mut BTreeSet<GroupId>,
+            scope: PatternScope,
         ) -> Result<Vec<(PatternOperand, Fingerprint)>> {
             let logical = self.memo.logical_expr(expression).ok_or_else(|| {
                 paro_error::internal("pattern matcher references an unknown logical expression")
             })?;
+            let child_scopes = if matches!(scope, PatternScope::Subtree) {
+                vec![scope; logical.key.children.len()]
+            } else {
+                let operator = &self
+                    .state
+                    .and_then(|state| state.payloads.logical.get(logical.payload.index()))
+                    .ok_or_else(|| paro_error::internal("scoped pattern has no operator shell"))?
+                    .semantic_template
+                    .operator;
+                // TopN implementation matching consumes its local search
+                // access path too, not just the ordering shell. Other inputs
+                // remain opaque rather than expanding unrelated join trees.
+                if matches!(scope, PatternScope::SearchInput)
+                    && !matches!(
+                        operator,
+                        LogicalOperator::Projection(_)
+                            | LogicalOperator::Filter(_)
+                            | LogicalOperator::Get(_)
+                            | LogicalOperator::SearchScan(_)
+                            | LogicalOperator::FullTextFilterScan(_)
+                    )
+                {
+                    if !self.observe_facts(group)? || !self.admit_work(1)? {
+                        return Ok(Vec::new());
+                    }
+                    let mut fingerprint = StableFingerprintBuilder::default();
+                    fingerprint.write_bytes(b"paro.pattern.search-input-hole.v1");
+                    fingerprint.write_u64(group.0 as u64);
+                    return Ok(vec![(PatternOperand::Group(group), fingerprint.finish())]);
+                }
+                let Some(scopes) = scope.children(operator) else {
+                    return Ok(Vec::new());
+                };
+                scopes
+            };
             let mut combinations: Vec<Vec<(PatternOperand, Fingerprint)>> = vec![Vec::new()];
-            for child in logical.key.children.iter().copied() {
-                let alternatives = self.group(child, active)?;
+            for (child, scope) in logical.key.children.iter().copied().zip(child_scopes) {
+                let alternatives = self.group(child, active, scope)?;
                 let mut next = Vec::new();
                 'outer: for prefix in combinations {
                     for alternative in &alternatives {
@@ -826,6 +1089,9 @@ pub(super) fn pattern_bindings(
                     }
                 }
                 combinations = next;
+                if combinations.is_empty() {
+                    break;
+                }
             }
             if logical.key.children.is_empty() {
                 combinations = vec![Vec::new()];
@@ -878,6 +1144,7 @@ pub(super) fn pattern_bindings(
     let limit = configured_limit.saturating_sub(already_consumed);
     let mut enumerator = Enumerator {
         memo,
+        state,
         limit,
         work_units: 0,
         reads: BTreeMap::new(),
@@ -900,11 +1167,20 @@ pub(super) fn pattern_bindings(
             },
         });
     }
-    let candidates = enumerator.expression(
-        root_group,
-        root_expression,
-        &mut BTreeSet::from([root_group]),
-    )?;
+    let can_match = match witness {
+        Some(witness) => enumerator.contains_witness(root_expression, witness)?,
+        None => true,
+    };
+    let candidates = if can_match {
+        enumerator.expression(
+            root_group,
+            root_expression,
+            &mut BTreeSet::from([root_group]),
+            scope,
+        )?
+    } else {
+        Vec::new()
+    };
     let mut bindings = candidates
         .into_iter()
         .map(|(root, fingerprint)| PatternBinding { root, fingerprint })
@@ -1026,6 +1302,79 @@ fn transformation_root_operator_matches(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn local_filter_binding_does_not_enumerate_or_subscribe_below_its_input() {
+        use paro_common::types::LogicalType;
+        use paro_planner::operator::{Filter, Get};
+        let mut child = LogicalPlan::synthetic(LogicalOperator::Get(Get::new_without_table(
+            0,
+            vec!["k".into()],
+            vec![LogicalType::BigInt],
+        )));
+        for _ in 0..64 {
+            child = LogicalPlan::synthetic(LogicalOperator::Filter(Filter::new(child, Vec::new())));
+        }
+        let mut budget = SearchBudget::default();
+        budget.max_rule_work_units_per_group = 8;
+        let mut input = MemoBuilder::build(child, BindContext::new(), budget).unwrap();
+        let expression = input.memo.group(input.root).unwrap().logical_exprs()[0];
+        let child = input.memo.logical_expr(expression).unwrap().key.children[0];
+        let state = input.planner_state.read().unwrap();
+        let before = scoped_pattern_bindings(
+            PlannerTransformation::ExpensivePredicatePlacement,
+            input.root,
+            expression,
+            &input.memo,
+            &state,
+            None,
+            BudgetDimension::RuleWorkPerGroup,
+        )
+        .unwrap();
+        assert_eq!(before.completion, PatternEnumerationCompletion::Complete);
+        assert_eq!(before.bindings.len(), 1);
+        assert_eq!(before.reads.len(), 2);
+        assert!(before.work_units <= 8);
+        let PatternOperand::Expression { children, .. } = &before.bindings[0].root else {
+            panic!("bound filter")
+        };
+        assert_eq!(children.as_ref(), &[PatternOperand::Group(child)]);
+        let payload = input
+            .memo
+            .logical_expr(input.memo.group(child).unwrap().logical_exprs()[0])
+            .unwrap()
+            .payload;
+        input
+            .memo
+            .insert_logical(
+                child,
+                LogicalExprKey {
+                    operator: Fingerprint(123456),
+                    scalars: Box::new([]),
+                    children: Box::new([]),
+                },
+                payload,
+                EquivalenceProof::Normalization {
+                    rule: RuleId(123456),
+                },
+            )
+            .unwrap();
+        assert!(before
+            .reads
+            .iter()
+            .all(|read| read.is_current(&input.memo).unwrap()));
+        let after = scoped_pattern_bindings(
+            PlannerTransformation::ExpensivePredicatePlacement,
+            input.root,
+            expression,
+            &input.memo,
+            &state,
+            None,
+            BudgetDimension::RuleWorkPerGroup,
+        )
+        .unwrap();
+        assert_eq!(before.bindings, after.bindings);
+    }
 
     fn binding_fingerprints(
         reverse: bool,
@@ -1281,6 +1630,29 @@ mod tests {
             9,
         );
         assert!(!root_read.is_current(&memo).unwrap());
+    }
+
+    #[test]
+    fn facts_read_invalidates_when_an_inherited_estimate_changes() {
+        let mut memo = Memo::new(SearchBudget::default());
+        let (input, _) = add_expression(&mut memo, 9001, vec![]);
+        let (root, _) = add_expression(&mut memo, 9002, vec![input]);
+        memo.group_mut(root).unwrap().cardinality =
+            GroupCardinality::inherit(Fingerprint(1), input);
+        let read = PatternRead::facts_from_group(&memo, root).unwrap();
+        let local = memo.group(root).unwrap().statistics_snapshot_fingerprint();
+        memo.group_mut(input).unwrap().cardinality = GroupCardinality::new(
+            Fingerprint(2),
+            CardinalityRecipeKind::Statistics,
+            10,
+            10,
+            10,
+        );
+        assert_eq!(
+            local,
+            memo.group(root).unwrap().statistics_snapshot_fingerprint()
+        );
+        assert!(!read.is_current(&memo).unwrap());
     }
 
     #[test]

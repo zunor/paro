@@ -16,14 +16,6 @@ pub(super) fn detach_template(mut plan: LogicalPlan) -> LogicalPlan {
     plan
 }
 
-pub(super) fn instantiate_bound_plan(
-    memo: &Memo,
-    state: &PlannerTransformState,
-    binding: &PatternOperand,
-) -> Result<LogicalPlan> {
-    instantiate_bound_plan_raw(memo, state, binding)
-}
-
 pub(super) struct InstantiatedPlanWithGroupHoles {
     pub(super) plan: LogicalPlan,
     /// Plan-node identities are transport labels only. Staging consumes every
@@ -162,65 +154,6 @@ pub(super) fn instantiate_bound_plan_with_group_holes(
     let mut group_holes = BTreeMap::new();
     let plan = instantiate(memo, state, binding, None, &mut group_holes)?;
     Ok(InstantiatedPlanWithGroupHoles { plan, group_holes })
-}
-
-fn instantiate_bound_plan_raw(
-    memo: &Memo,
-    state: &PlannerTransformState,
-    binding: &PatternOperand,
-) -> Result<LogicalPlan> {
-    let PatternOperand::Expression {
-        group,
-        expression: expr,
-        children: bound_children,
-    } = binding
-    else {
-        return Err(paro_error::internal(
-            "planner-plan instantiation reached an unconsumed Memo group hole",
-        ));
-    };
-    let logical = memo
-        .logical_expr(*expr)
-        .ok_or_else(|| paro_error::internal("planner rule references unknown expression"))?;
-    let payload = state
-        .payloads
-        .logical
-        .get(logical.payload.index())
-        .ok_or_else(|| paro_error::internal("planner rule references unknown payload"))?;
-    if bound_children.len() != logical.key.children.len() {
-        return Err(paro_error::internal(
-            "pattern binding child arity disagrees with its logical expression",
-        ));
-    }
-    let children = bound_children
-        .iter()
-        .map(|child| instantiate_bound_plan_raw(memo, state, child))
-        .collect::<Result<Vec<_>>>()?;
-    let mut children = children.into_iter();
-    let mut plan = duplicate_plan_preserving_indices(
-        &payload.semantic_template,
-        state.bind_context.shared().as_ref(),
-    )
-    .try_map_children(|_| {
-        children
-            .next()
-            .ok_or_else(|| paro_error::internal("planner payload lost a child expression"))
-    })?;
-    if children.next().is_some() {
-        return Err(paro_error::internal(
-            "planner payload child arity disagrees with Memo expression",
-        ));
-    }
-    plan.stats.estimated_cardinality = memo
-        .cardinality_estimate(*group)
-        .map(|(min, expected, max)| paro_planner::plan::CardinalityEstimate { min, expected, max });
-    let output_columns = state
-        .metadata
-        .get(&logical.payload)
-        .ok_or_else(|| paro_error::internal("planner rule payload has no operator metadata"))?
-        .output_columns
-        .clone();
-    freeze_output_layout(plan, &output_columns, state)
 }
 
 /// Restore the occurrence's output column set after materializing a canonical

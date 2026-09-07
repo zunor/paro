@@ -5,6 +5,7 @@
 
 use super::*;
 
+mod join_region;
 mod matching;
 mod staging;
 
@@ -122,6 +123,32 @@ impl TransformationRule for PlannerTransformationRule {
         self.transformation.id()
     }
 
+    fn binding_reads(
+        &self,
+        binding: &PatternBinding,
+        _discovery_reads: &[PatternRead],
+        ctx: &RuleContext<'_>,
+    ) -> Result<Box<[PatternRead]>> {
+        let mut groups = BTreeSet::new();
+        let mut pending = vec![&binding.root];
+        while let Some(operand) = pending.pop() {
+            let group = match operand {
+                PatternOperand::Group(group) => *group,
+                PatternOperand::Expression {
+                    group, children, ..
+                } => {
+                    pending.extend(children.iter());
+                    *group
+                }
+            };
+            groups.insert(ctx.memo.canonical_group(group));
+        }
+        groups
+            .into_iter()
+            .map(|group| PatternRead::facts_from_group(ctx.memo, group))
+            .collect()
+    }
+
     fn output_bound(&self, ctx: &RuleContext<'_>) -> usize {
         if matches!(
             self.transformation,
@@ -219,13 +246,14 @@ impl TransformationRule for PlannerTransformationRule {
                 cancellation.as_ref(),
             );
         }
-        matching::pattern_bindings(
+        matching::scoped_pattern_bindings(
+            self.transformation,
             ctx.group,
             expr,
             ctx.memo,
-            ctx.memo.budget(),
-            self.budget_class().work_dimension(),
+            &state,
             cancellation.as_ref(),
+            self.budget_class().work_dimension(),
         )
     }
 
@@ -246,6 +274,26 @@ impl TransformationRule for PlannerTransformationRule {
     ) -> Result<Box<[EquivalentExpression]>> {
         let expr = binding.root_expression();
         let target_group = ctx.group();
+        let region_identity = if matches!(
+            self.transformation,
+            PlannerTransformation::JoinRegionEnumeration
+        ) {
+            let state = self
+                .planner_state
+                .read()
+                .expect("planner transform state poisoned");
+            let identity = join_region::identity(&binding.root, ctx.memo(), &state)?
+                .map(|identity| (ctx.memo().canonical_group(target_group), identity));
+            if identity
+                .as_ref()
+                .is_some_and(|key| state.enumerated_join_regions.contains(key))
+            {
+                return Ok(Box::new([]));
+            }
+            identity
+        } else {
+            None
+        };
         let (
             plan,
             source_stats,
@@ -255,87 +303,67 @@ impl TransformationRule for PlannerTransformationRule {
             source_input_context,
             source_child_context,
             source_output_columns,
-            memo_group_holes,
             nested_group_holes,
             environment,
-        ) = {
-            let state = self
-                .planner_state
-                .read()
-                .expect("planner transform state poisoned");
-            let instantiated = if matches!(
-                self.transformation,
-                PlannerTransformation::AggregateDimensionSharing
-            ) {
-                semantic_plan::instantiate_bound_plan_with_group_holes(
+        ) =
+            {
+                let state = self
+                    .planner_state
+                    .read()
+                    .expect("planner transform state poisoned");
+                let instantiated = semantic_plan::instantiate_bound_plan_with_group_holes(
                     ctx.memo(),
                     &state,
                     &binding.root,
-                )?
-            } else {
-                semantic_plan::InstantiatedPlanWithGroupHoles {
-                    plan: semantic_plan::instantiate_bound_plan(ctx.memo(), &state, &binding.root)?,
-                    group_holes: BTreeMap::new(),
-                }
+                )?;
+                let plan = instantiated.plan;
+                let logical = ctx.memo().logical_expr(expr).ok_or_else(|| {
+                    paro_error::internal("planner rule lost its source expression")
+                })?;
+                let metadata = state
+                    .metadata
+                    .get(&logical.payload)
+                    .ok_or_else(|| paro_error::internal("planner rule lost its source metadata"))?;
+                let payload = state
+                    .payloads
+                    .logical
+                    .get(logical.payload.index())
+                    .ok_or_else(|| paro_error::internal("planner rule lost its source payload"))?;
+                let binder = state.binder.clone().ok_or_else(|| {
+                    paro_error::internal("planner rule has no binder environment")
+                })?;
+                let enclosing_required_region_facets = ctx
+                    .memo()
+                    .optimization_context(metadata.child_context)
+                    .ok_or_else(|| {
+                        paro_error::internal("planner expression has an unknown child context")
+                    })?
+                    .required_region_facets()
+                    .to_vec();
+                (
+                    plan,
+                    payload.column_stats.clone(),
+                    metadata
+                        .required_region_facet
+                        .map(|facet| (facet, metadata.operator_type)),
+                    enclosing_required_region_facets,
+                    metadata.runtime_filter_region_facet,
+                    metadata.input_context,
+                    metadata.child_context,
+                    metadata.output_columns.clone(),
+                    instantiated.group_holes,
+                    PlannerRuleEnvironment {
+                        binder,
+                        bind_context: state.bind_context.clone(),
+                        session: state.session.clone().ok_or_else(|| {
+                            paro_error::internal("planner rule has no statement context")
+                        })?,
+                        cost_model: state.cost_model.clone(),
+                        budget: ctx.memo().budget().clone(),
+                        verify_enabled: state.verify_enabled,
+                    },
+                )
             };
-            let plan = instantiated.plan;
-            let logical = ctx
-                .memo()
-                .logical_expr(expr)
-                .ok_or_else(|| paro_error::internal("planner rule lost its source expression"))?;
-            let metadata = state
-                .metadata
-                .get(&logical.payload)
-                .ok_or_else(|| paro_error::internal("planner rule lost its source metadata"))?;
-            let payload = state
-                .payloads
-                .logical
-                .get(logical.payload.index())
-                .ok_or_else(|| paro_error::internal("planner rule lost its source payload"))?;
-            let memo_group_holes =
-                if matches!(self.transformation, PlannerTransformation::TopNIntroduction) {
-                    topn_input_group(&binding.root, ctx.memo(), &state)
-                        .map(|group| vec![group].into_boxed_slice())
-                } else {
-                    None
-                };
-            let binder = state
-                .binder
-                .clone()
-                .ok_or_else(|| paro_error::internal("planner rule has no binder environment"))?;
-            let enclosing_required_region_facets = ctx
-                .memo()
-                .optimization_context(metadata.child_context)
-                .ok_or_else(|| {
-                    paro_error::internal("planner expression has an unknown child context")
-                })?
-                .required_region_facets()
-                .to_vec();
-            (
-                plan,
-                payload.column_stats.clone(),
-                metadata
-                    .required_region_facet
-                    .map(|facet| (facet, metadata.operator_type)),
-                enclosing_required_region_facets,
-                metadata.runtime_filter_region_facet,
-                metadata.input_context,
-                metadata.child_context,
-                metadata.output_columns.clone(),
-                memo_group_holes,
-                instantiated.group_holes,
-                PlannerRuleEnvironment {
-                    binder,
-                    bind_context: state.bind_context.clone(),
-                    session: state.session.clone().ok_or_else(|| {
-                        paro_error::internal("planner rule has no statement context")
-                    })?,
-                    cost_model: state.cost_model.clone(),
-                    budget: ctx.memo().budget().clone(),
-                    verify_enabled: state.verify_enabled,
-                },
-            )
-        };
         let plans = rewrite_planner_expressions(
             self.transformation,
             plan,
@@ -359,9 +387,6 @@ impl TransformationRule for PlannerTransformationRule {
                 &environment,
                 &group_hole_guard,
             )?;
-            let root_child_groups = memo_group_holes
-                .clone()
-                .filter(|_| matches!(plan.operator, LogicalOperator::TopN(_)));
             // The target Memo group owns the output contract. Settlement may
             // legitimately widen child carriers for predicates and ordering,
             // but the transformed root must be frozen back to the group's
@@ -442,7 +467,6 @@ impl TransformationRule for PlannerTransformationRule {
                 extended_required_region_facets.into_boxed_slice(),
                 output_input_context,
                 output_child_context,
-                root_child_groups,
                 nested_group_holes.clone(),
             ));
         }
@@ -462,7 +486,6 @@ impl TransformationRule for PlannerTransformationRule {
                     extended_required_region_facets,
                     input_context,
                     child_context,
-                    root_child_groups,
                     nested_group_holes,
                 ) in prepared
                 {
@@ -485,7 +508,6 @@ impl TransformationRule for PlannerTransformationRule {
                                 extended_required_facets: extended_required_region_facets,
                                 inherited_runtime_filter_facet: source_runtime_filter_facet,
                             },
-                            root_child_groups,
                             nested_group_holes,
                         },
                         memo,
@@ -495,6 +517,11 @@ impl TransformationRule for PlannerTransformationRule {
                         return Ok(None);
                     };
                     staged.push(expression);
+                }
+                if let Some(key) = region_identity {
+                    if state.enumerated_join_regions.insert(key.clone()) {
+                        state.join_region_insertions.push(key);
+                    }
                 }
                 Ok(Some(staged))
             },
@@ -568,49 +595,6 @@ fn proofs_are_only_rule_output(proofs: &BTreeSet<EquivalenceProof>, rule: RuleId
         }
     }
     produced_by_rule
-}
-
-/// Match the direct `Limit(Order(group))` boundary in the Memo instead of
-/// rediscovering it from one recursively materialized representative. The
-/// resulting TopN expression keeps the order input as the same group hole, so
-/// alternatives added below aggregate/join nodes remain composable.
-fn topn_input_group(
-    binding: &PatternOperand,
-    memo: &Memo,
-    state: &PlannerTransformState,
-) -> Option<GroupId> {
-    let PatternOperand::Expression {
-        expression,
-        children,
-        ..
-    } = binding
-    else {
-        return None;
-    };
-    let limit = memo.logical_expr(*expression)?;
-    if state.metadata.get(&limit.payload)?.operator_type != LogicalOperatorType::Limit {
-        return None;
-    }
-    let [PatternOperand::Expression {
-        expression: order_expression,
-        children: order_children,
-        ..
-    }] = children.as_ref()
-    else {
-        return None;
-    };
-    let order = memo.logical_expr(*order_expression)?;
-    if state.metadata.get(&order.payload)?.operator_type != LogicalOperatorType::Order {
-        return None;
-    }
-    let [input] = order_children.as_ref() else {
-        return None;
-    };
-    Some(match input {
-        PatternOperand::Expression { group, .. } | PatternOperand::Group(group) => {
-            memo.canonical_group(*group)
-        }
-    })
 }
 
 fn transformed_plan_matches_group_contract(
@@ -928,6 +912,11 @@ impl GroupHoleTransportGuard {
             let LogicalOperator::BoundReference(reference) = &node.operator else {
                 return Ok(());
             };
+            if !wanted.contains(&reference.reference_id) {
+                return Err(paro_error::internal(
+                    "transformation contains an unregistered Memo group hole",
+                ));
+            }
             if wanted.contains(&reference.reference_id) {
                 if templates
                     .insert(
@@ -959,42 +948,32 @@ impl GroupHoleTransportGuard {
         })
     }
 
-    fn restore(&self, mut plan: LogicalPlan) -> Result<LogicalPlan> {
+    fn restore(&self, plan: LogicalPlan) -> Result<LogicalPlan> {
         if self.templates.is_empty() {
             return Ok(plan);
         }
-        for (&reference_id, template) in &self.templates {
-            let mut current_node_id = None;
-            plan.try_visit_pre_order(|node| {
-                if matches!(
-                    &node.operator,
-                    LogicalOperator::BoundReference(reference)
-                        if reference.reference_id == reference_id
-                ) {
-                    if current_node_id.replace(node.id).is_some() {
-                        return Err(paro_error::internal(
-                            "optimizer duplicated an opaque Memo group-hole occurrence",
-                        ));
-                    }
-                }
-                Ok(())
-            })?;
-            let current_node_id = current_node_id.ok_or_else(|| {
-                paro_error::internal("settlement removed a protected Memo group hole")
-            })?;
-            let replacement = |_: LogicalPlan| {
-                Ok(duplicate_plan_preserving_indices(
-                    &template.plan,
-                    self.bind_context.shared().as_ref(),
-                ))
+        let mut seen = BTreeSet::new();
+        let plan = plan.try_map_post_order(|node| {
+            let LogicalOperator::BoundReference(reference) = &node.operator else {
+                return Ok(node);
             };
-            let (next, restored) = plan.try_replace_node(current_node_id, replacement)?;
-            plan = next;
-            if !restored {
+            let template = self.templates.get(&reference.reference_id).ok_or_else(|| {
+                paro_error::internal("settlement introduced an unregistered Memo group hole")
+            })?;
+            if !seen.insert(reference.reference_id) {
                 return Err(paro_error::internal(
-                    "settlement lost a located Memo group-hole occurrence",
+                    "optimizer duplicated an opaque Memo group-hole occurrence",
                 ));
             }
+            Ok(duplicate_plan_preserving_indices(
+                &template.plan,
+                self.bind_context.shared().as_ref(),
+            ))
+        })?;
+        if seen.len() != self.templates.len() {
+            return Err(paro_error::internal(
+                "settlement removed a protected Memo group hole",
+            ));
         }
         Ok(plan)
     }

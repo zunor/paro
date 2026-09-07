@@ -18,10 +18,6 @@ pub(super) struct StagingRequest {
     pub(super) column_stats: SharedColumnStatistics,
     pub(super) target: StagingTarget,
     pub(super) regions: StagingRegionRequirements,
-    /// Existing Memo groups referenced by the transformed root's child holes.
-    /// `None` imports an owned tree; `Some` preserves every listed boundary
-    /// and stages only the new operator shell.
-    pub(super) root_child_groups: Option<Box<[GroupId]>>,
     /// Opaque Memo inputs retained at arbitrary depth by a native pattern.
     /// Staging must consume every transport node exactly once and substitute
     /// the named group before publishing the transformed expression.
@@ -66,7 +62,6 @@ pub(super) fn stage_transformed_expression(
                 extended_required_facets: extended_required_region_facets,
                 inherited_runtime_filter_facet,
             },
-        root_child_groups,
         nested_group_holes,
     } = request;
 
@@ -99,7 +94,6 @@ pub(super) fn stage_transformed_expression(
         node_context: OptimizationContextId,
         target_child_context: Option<OptimizationContextId>,
         refined_cardinality_kind: Option<CardinalityRecipeKind>,
-        preserved_child_groups: Option<Box<[GroupId]>>,
     }
 
     fn referenced_group_scope(memo: &Memo, root: GroupId) -> PlannerRegionScope {
@@ -143,8 +137,18 @@ pub(super) fn stage_transformed_expression(
             node_context,
             target_child_context,
             refined_cardinality_kind,
-            preserved_child_groups,
         } = request;
+        if let LogicalOperator::BoundReference(reference) = &plan.operator {
+            if target.is_some()
+                || !session
+                    .nested_group_holes
+                    .contains_key(&reference.reference_id)
+            {
+                return Err(paro_error::internal(
+                    "staging reached an unregistered or root Memo group hole",
+                ));
+            }
+        }
         if target.is_none() {
             let nested_reference = match &plan.operator {
                 LogicalOperator::BoundReference(reference) => Some(reference.reference_id),
@@ -216,82 +220,28 @@ pub(super) fn stage_transformed_expression(
             &skeleton,
             session.state.bind_context.shared().as_ref(),
         );
-        if preserved_child_groups
-            .as_deref()
-            .is_some_and(|groups| groups.len() != detached.len())
-        {
-            return Err(paro_error::internal(
-                "transformation group-hole arity disagrees with its operator shell",
-            ));
-        }
-        let preserved_child_groups = preserved_child_groups.as_deref();
         let mut child_states = Vec::with_capacity(detached.len());
         let mut children = Vec::with_capacity(detached.len());
         let descendant_context = target_child_context.unwrap_or(node_context);
-        for (index, child) in detached.into_iter().enumerate() {
-            if let Some(group) = preserved_child_groups
-                .and_then(|groups| groups.get(index))
-                .copied()
-            {
-                let bindings = child.get_column_bindings();
-                let types = child.types();
-                if bindings.len() != types.len() {
-                    return Err(paro_error::internal(
-                        "transformation group hole has inconsistent binding/type arity",
-                    ));
-                }
-                let columns = bindings
-                    .into_iter()
-                    .zip(types)
-                    .map(|(binding, logical_type)| {
-                        session
-                            .state
-                            .binding_ids
-                            .get(binding.table_index, binding.column_index, &logical_type)
-                            .copied()
-                            .ok_or_else(|| {
-                                paro_error::internal(
-                                    "transformation group hole references an unknown column",
-                                )
-                            })
-                    })
-                    .collect::<Result<Vec<_>>>()?;
-                let group = session.memo.canonical_group(group);
-                let contract = session.memo.group(group).ok_or_else(|| {
-                    paro_error::internal("transformation group hole references an unknown group")
-                })?;
-                if columns.iter().copied().collect::<BTreeSet<_>>() != contract.schema.ids() {
-                    return Err(paro_error::internal(
-                        "transformation group hole changes its referenced group schema",
-                    ));
-                }
-                child_states.push(NodeState {
-                    group,
-                    columns: columns.into_boxed_slice(),
-                    region_scope: referenced_group_scope(session.memo, group),
-                });
-                children.push(child);
-            } else {
-                let Some((child, child_state, staged)) = stage_node(
-                    session,
-                    NodeStagingRequest {
-                        plan: child,
-                        target: None,
-                        required_region_facet: None,
-                        inherited_runtime_filter_facet: None,
-                        node_context: descendant_context,
-                        target_child_context: None,
-                        refined_cardinality_kind: None,
-                        preserved_child_groups: None,
-                    },
-                )?
-                else {
-                    return Ok(None);
-                };
-                debug_assert!(staged.is_none());
-                children.push(child);
-                child_states.push(child_state);
-            }
+        for child in detached {
+            let Some((child, child_state, staged)) = stage_node(
+                session,
+                NodeStagingRequest {
+                    plan: child,
+                    target: None,
+                    required_region_facet: None,
+                    inherited_runtime_filter_facet: None,
+                    node_context: descendant_context,
+                    target_child_context: None,
+                    refined_cardinality_kind: None,
+                },
+            )?
+            else {
+                return Ok(None);
+            };
+            debug_assert!(staged.is_none());
+            children.push(child);
+            child_states.push(child_state);
         }
         let mut children = children.into_iter();
         let semantic_plan = semantic_skeleton.try_map_children(|_| {
@@ -478,7 +428,14 @@ pub(super) fn stage_transformed_expression(
                 };
             if let Some((group, _)) = state
                 .expression_groups
-                .iter()
+                .range(
+                    LogicalExprKey {
+                        operator: key.operator,
+                        scalars: Box::new([]),
+                        children: Box::new([]),
+                    }..,
+                )
+                .take_while(|(candidate, _)| candidate.operator == key.operator)
                 .filter(|(candidate, _)| equivalent_key(candidate))
                 .flat_map(|(_, candidates)| candidates.iter().copied())
                 .find(|(group, logical)| {
@@ -554,9 +511,29 @@ pub(super) fn stage_transformed_expression(
                 options.group_budget,
                 {
                     let mut allocation = StableFingerprintBuilder::default();
-                    allocation.write_bytes(b"paro.transformed-group.v1");
+                    allocation.write_bytes(b"paro.transformed-group.v2");
                     allocation.write_fingerprint(logical_identity);
                     allocation.write_u64(node_context.0 as u64);
+                    // An operator shell can expose different output column
+                    // identities (notably a freshly rebound Projection).
+                    // Admission must name the same contract as group reuse.
+                    allocation.write_bytes(&operator_encoding);
+                    allocation.write_u64(schema.columns().len() as u64);
+                    for column in schema.columns() {
+                        allocation.write_u64(column.id.0 as u64);
+                        allocation.write_u64(column.nullable as u64);
+                    }
+                    allocation.write_u64(logical_properties.unique_keys.len() as u64);
+                    for key in &logical_properties.unique_keys {
+                        allocation.write_u64(key.len() as u64);
+                        for column in key {
+                            allocation.write_u64(column.0 as u64);
+                        }
+                    }
+                    allocation.write_u64(logical_properties.outer_references.len() as u64);
+                    for column in &logical_properties.outer_references {
+                        allocation.write_u64(column.0 as u64);
+                    }
                     allocation.finish()
                 },
                 schema,
@@ -869,7 +846,6 @@ pub(super) fn stage_transformed_expression(
                 node_context: input_context,
                 target_child_context: Some(child_context),
                 refined_cardinality_kind,
-                preserved_child_groups: root_child_groups,
             },
         )?
         else {
@@ -1005,6 +981,71 @@ mod tests {
     }
 
     #[test]
+    fn alias_projections_allocate_distinct_schema_contracts() {
+        use paro_planner::expression::ColumnRefExpression;
+        use paro_planner::operator::{Projection, SetOperation};
+        let source = || test_base_get(0, 30_099, "shared_source", 100);
+        let union = |left, right| {
+            LogicalPlan::synthetic(LogicalOperator::SetOperation(SetOperation::union(
+                10,
+                left,
+                right,
+                true,
+                vec![LogicalType::Integer],
+            )))
+        };
+        let mut input = MemoBuilder::build(
+            union(source(), source()),
+            BindContext::new(),
+            SearchBudget::default(),
+        )
+        .unwrap();
+        let project = |table| {
+            LogicalPlan::synthetic(LogicalOperator::Projection(Projection::new(
+                table,
+                source(),
+                vec![Expression::ColumnRef(ColumnRefExpression::new(
+                    ColumnBinding::new(0, 0),
+                    LogicalType::Integer,
+                ))],
+            )))
+        };
+        let mut state = input.planner_state.write().unwrap();
+        state.session = Some(TestStatementContextBuilder::minimal().build());
+        let staged = stage_transformed_expression(
+            StagingRequest {
+                plan: union(project(2), project(3)),
+                column_stats: Arc::new(HashMap::new()),
+                target: StagingTarget {
+                    group: input.root,
+                    rule: RuleId(999),
+                    budget_class: TransformationBudgetClass::Local,
+                    input_context: OptimizationContextId(0),
+                    child_context: OptimizationContextId(0),
+                    refined_cardinality_kind: None,
+                },
+                regions: StagingRegionRequirements {
+                    preserved_facet: None,
+                    extended_required_facets: Box::new([]),
+                    inherited_runtime_filter_facet: None,
+                },
+                nested_group_holes: BTreeMap::new(),
+            },
+            &mut input.memo,
+            &mut state,
+        )
+        .unwrap()
+        .expect("alias projections must not collide in group allocation admission");
+        let children = &staged.key.children;
+        assert_eq!(children.len(), 2);
+        assert_ne!(children[0], children[1]);
+        assert_ne!(
+            input.memo.group(children[0]).unwrap().schema,
+            input.memo.group(children[1]).unwrap().schema
+        );
+    }
+
+    #[test]
     fn root_key_collision_in_another_context_declines_and_rolls_back() {
         let bind_context = BindContext::new();
         let plan = LogicalPlan::new(
@@ -1060,7 +1101,6 @@ mod tests {
                                 extended_required_facets: Box::new([]),
                                 inherited_runtime_filter_facet: None,
                             },
-                            root_child_groups: None,
                             nested_group_holes: BTreeMap::new(),
                         },
                         memo,
@@ -1129,7 +1169,6 @@ mod tests {
                                 extended_required_facets: Box::new([]),
                                 inherited_runtime_filter_facet: None,
                             },
-                            root_child_groups: None,
                             nested_group_holes: BTreeMap::new(),
                         },
                         memo,

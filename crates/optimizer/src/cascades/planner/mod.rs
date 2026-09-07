@@ -321,6 +321,7 @@ impl OptimizationInput {
             self.mode,
         )?;
         let mut variants = Vec::with_capacity(grant_optimization.winners.len());
+        debug!(target: targets::OPTIMIZER, groups = engine.memo().group_count(), attempts = ?engine.rule_attempts(), insertions = ?engine.effective_rule_insertions(), "completed Memo search work");
         for grant_winner in grant_optimization.winners {
             let winner = &grant_winner.winner;
             if winner.provided.result_guarantee != ResultGuarantee::Exact {
@@ -1095,6 +1096,8 @@ impl MemoBuilder {
             expression_groups,
             expression_group_insertions: Vec::new(),
             metadata_runtime_filter_changes: Vec::new(),
+            enumerated_join_regions: BTreeSet::new(),
+            join_region_insertions: Vec::new(),
             binder: planner_binder,
             bind_context: bind_context.clone(),
             session: search_context.map(|context| context.session.clone()),

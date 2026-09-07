@@ -106,6 +106,8 @@ pub(super) struct PlannerTransformState {
     pub(super) expression_groups: BTreeMap<LogicalExprKey, Vec<(GroupId, LogicalExprId)>>,
     pub(super) expression_group_insertions: Vec<(LogicalExprKey, (GroupId, LogicalExprId))>,
     pub(super) metadata_runtime_filter_changes: Vec<MetadataRuntimeFilterChange>,
+    pub(super) enumerated_join_regions: BTreeSet<(GroupId, Box<[u8]>)>,
+    pub(super) join_region_insertions: Vec<(GroupId, Box<[u8]>)>,
     pub(super) binder: Option<Binder>,
     pub(super) bind_context: BindContext,
     pub(super) session: Option<Arc<paro_context::StatementContext>>,
@@ -123,6 +125,7 @@ pub(super) struct PlannerTransformSavepoint {
     physical_payload_count: usize,
     expression_group_insertion_count: usize,
     metadata_runtime_filter_change_count: usize,
+    join_region_insertion_count: usize,
 }
 
 impl PlannerTransformState {
@@ -135,10 +138,18 @@ impl PlannerTransformState {
             physical_payload_count: self.payloads.physical.len(),
             expression_group_insertion_count: self.expression_group_insertions.len(),
             metadata_runtime_filter_change_count: self.metadata_runtime_filter_changes.len(),
+            join_region_insertion_count: self.join_region_insertions.len(),
         }
     }
 
     pub(super) fn rollback_to(&mut self, savepoint: PlannerTransformSavepoint) -> Result<()> {
+        while self.join_region_insertions.len() > savepoint.join_region_insertion_count {
+            let key = self
+                .join_region_insertions
+                .pop()
+                .expect("join region journal length checked");
+            self.enumerated_join_regions.remove(&key);
+        }
         self.columns.truncate(savepoint.column_count)?;
         self.scalars.truncate(savepoint.scalar_count)?;
         self.binding_ids.rollback_to(savepoint.binding_checkpoint)?;
