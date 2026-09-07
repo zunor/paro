@@ -387,6 +387,7 @@ impl OptimizationInput {
             physical_expressions: u64::try_from(engine.memo().physical_expr_count())
                 .unwrap_or(u64::MAX),
             exhaustion_events: engine.memo().exhaustion_counts(),
+            work_counters: engine.search_work_counters(),
         };
         Ok(OptimizationOutput {
             variants: variants.into_boxed_slice(),
@@ -416,6 +417,7 @@ pub struct SearchSummary {
     pub logical_expressions: u64,
     pub physical_expressions: u64,
     pub exhaustion_events: BTreeMap<BudgetDimension, u64>,
+    pub work_counters: BTreeMap<&'static str, u64>,
 }
 
 impl SearchSummary {

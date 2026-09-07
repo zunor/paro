@@ -179,6 +179,9 @@ pub struct CascadesEngine {
     grant_sensitivity: BTreeMap<GroupId, GrantSensitivitySummary>,
     rule_attempts: BTreeMap<RuleId, u64>,
     effective_rule_insertions: BTreeMap<RuleId, u64>,
+    transformation_bindings: u64,
+    fact_value_revalidation_hits: u64,
+    fact_value_revalidation_misses: u64,
     /// Last child-expression frontier consumed by each transformation task.
     /// A task that declined a match is recorded as well: a later child
     /// alternative may make that same pattern applicable.
@@ -211,6 +214,9 @@ impl CascadesEngine {
             grant_sensitivity: BTreeMap::new(),
             rule_attempts: BTreeMap::new(),
             effective_rule_insertions: BTreeMap::new(),
+            transformation_bindings: 0,
+            fact_value_revalidation_hits: 0,
+            fact_value_revalidation_misses: 0,
             transformation_observations: BTreeMap::new(),
             transformation_fact_observations: BTreeMap::new(),
             transformation_applications: BTreeMap::new(),
@@ -512,6 +518,9 @@ impl CascadesEngine {
             if binding_set.bindings.is_empty() {
                 continue;
             }
+            self.transformation_bindings = self
+                .transformation_bindings
+                .saturating_add(binding_set.bindings.len() as u64);
             for binding in binding_set.bindings.iter() {
                 let application_key = (task_id, binding.fingerprint);
                 let previous_application = self
@@ -554,6 +563,8 @@ impl CascadesEngine {
                     let fact_reads = validation.take_fact_reads();
                     drop(validation);
                     if current_value == Some(previous_value) {
+                        self.fact_value_revalidation_hits =
+                            self.fact_value_revalidation_hits.saturating_add(1);
                         let mut reads = self
                             .registry
                             .transformation(rule)
@@ -589,6 +600,8 @@ impl CascadesEngine {
                         }
                         continue;
                     }
+                    self.fact_value_revalidation_misses =
+                        self.fact_value_revalidation_misses.saturating_add(1);
                 }
                 // Keep one current observation per exact binding, including
                 // hash-collision peers. Obsolete fact versions are not search
@@ -934,6 +947,20 @@ impl CascadesEngine {
 
     pub fn rule_attempts(&self) -> &BTreeMap<RuleId, u64> {
         &self.rule_attempts
+    }
+
+    pub fn search_work_counters(&self) -> BTreeMap<&'static str, u64> {
+        BTreeMap::from([
+            ("transformation_binding_count", self.transformation_bindings),
+            (
+                "fact_value_revalidation_hit_count",
+                self.fact_value_revalidation_hits,
+            ),
+            (
+                "fact_value_revalidation_miss_count",
+                self.fact_value_revalidation_misses,
+            ),
+        ])
     }
 
     fn schedule_transformations(&self, group: GroupId, agenda: &mut StableAgenda) -> Result<()> {

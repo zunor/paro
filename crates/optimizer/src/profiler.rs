@@ -136,6 +136,9 @@ impl OptimizerProfiler {
                 *count,
             );
         }
+        for (name, count) in &summary.work_counters {
+            self.counters.insert((*name).to_string(), *count);
+        }
     }
 }
 
@@ -219,9 +222,14 @@ mod tests {
             exhaustion_events: [(crate::cascades::budget::BudgetDimension::Group, 1)]
                 .into_iter()
                 .collect(),
+            work_counters: [("transformation_binding_count", 7)].into_iter().collect(),
         });
         let snapshot = profiler.snapshot();
         assert_eq!(snapshot.counters.get("search_complete"), Some(&0));
         assert_eq!(snapshot.counters.get("budget_exhaustion_group"), Some(&1));
+        assert_eq!(
+            snapshot.counters.get("transformation_binding_count"),
+            Some(&7)
+        );
     }
 }
