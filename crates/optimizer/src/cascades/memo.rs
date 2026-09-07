@@ -1597,13 +1597,11 @@ impl Memo {
             };
             child_winner.cost.validate()?;
         }
-        let recomputed = recompute_winner_cost(self, &winner)?;
-        if recomputed.cost != winner.cost || recomputed.source_work != winner.source_work {
-            return Err(paro_error::internal(
-                "winner cumulative cost or source-work evidence disagrees with composition",
-            ));
-        }
-
+        // Frontier admission is the hot path and receives a cost composed by
+        // the engine from exact child candidate references. Replaying that
+        // same algebra here would verify every candidate, including ones
+        // immediately removed by dominance. WinnerVerifier independently
+        // recomposes the bounded retained frontier once search is complete.
         let candidate = CandidateId::new(self.winner_candidates.len());
         winner.candidate = candidate;
         self.winner_candidates.push(WinnerCandidate {
@@ -1765,41 +1763,6 @@ impl Memo {
             }
         }
     }
-}
-
-fn recompute_winner_cost(memo: &Memo, winner: &Winner) -> Result<super::engine::ComposedCost> {
-    let mut child_costs = Vec::with_capacity(winner.children.len());
-    let mut child_source_work = Vec::with_capacity(winner.children.len());
-    for child in winner.children.iter().copied() {
-        let child_winner = memo.resolve_child_winner(child).ok_or_else(|| {
-            paro_error::internal("winner cost replay lost its exact child candidate")
-        })?;
-        child_costs.push(child_winner.cost);
-        child_source_work.push(child_winner.source_work.as_ref());
-    }
-    let mut composed = super::engine::compose_candidate_cost_with_sources_at(
-        winner.local_cost,
-        winner.source_filter_apply_cost,
-        &child_costs,
-        &child_source_work,
-        winner.cost_composition.clone(),
-        memo.calibration(),
-    )?;
-    composed.cost =
-        super::engine::constrain_composed_cost_to_grant(composed.cost, winner.enforcer_cost_input)?
-            .ok_or_else(|| paro_error::internal("recorded winner exceeds its resource grant"))?;
-    let enforcer_phase = super::engine::enforcer_cost(
-        &winner.enforcers,
-        winner.enforcer_cost_input,
-        memo.calibration(),
-    )?
-    .ok_or_else(|| paro_error::internal("recorded winner has an infeasible enforcer grant"))?;
-    composed.cost = super::engine::constrain_composed_cost_to_grant(
-        enforcer_phase.compose_after(composed.cost)?,
-        winner.enforcer_cost_input,
-    )?
-    .ok_or_else(|| paro_error::internal("recorded winner enforcers exceed its resource grant"))?;
-    Ok(composed)
 }
 
 fn two_groups_mut(groups: &mut [Group], left: usize, right: usize) -> (&mut Group, &mut Group) {

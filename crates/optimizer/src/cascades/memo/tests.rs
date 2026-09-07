@@ -842,7 +842,7 @@ fn peer_row_preserving_recipes_track_every_equivalent_input() {
 }
 
 #[test]
-fn winner_recording_recomputes_local_cost_instead_of_trusting_total() {
+fn final_winner_verifier_recomputes_cost_outside_frontier_admission() {
     let mut memo = Memo::new(SearchBudget::default());
     let group = memo.create_group(
         schema(1),
@@ -918,7 +918,8 @@ fn winner_recording_recomputes_local_cost_instead_of_trusting_total() {
                 joint_cost_proof: None,
             },
         )
-        .is_err());
+        .unwrap());
+    assert!(crate::cascades::verifier::WinnerVerifier::verify(&memo).is_err());
 }
 
 #[test]
