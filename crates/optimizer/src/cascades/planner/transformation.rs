@@ -274,6 +274,22 @@ impl TransformationRule for PlannerTransformationRule {
     ) -> Result<Box<[EquivalentExpression]>> {
         let expr = binding.root_expression();
         let target_group = ctx.group();
+        let facts = {
+            let state = self
+                .planner_state
+                .read()
+                .expect("planner transform state poisoned");
+            let Some(facts) = boundary::BoundarySnapshot::read(
+                ctx,
+                &state,
+                &binding.root,
+                self.budget_class().work_dimension(),
+            )?
+            else {
+                return Ok(Box::new([]));
+            };
+            facts
+        };
         let region_identity = if matches!(
             self.transformation,
             PlannerTransformation::JoinRegionEnumeration
@@ -282,8 +298,9 @@ impl TransformationRule for PlannerTransformationRule {
                 .planner_state
                 .read()
                 .expect("planner transform state poisoned");
-            let identity = join_region::identity(&binding.root, ctx.memo(), &state)?
-                .map(|identity| (ctx.memo().canonical_group(target_group), identity));
+            let identity =
+                join_region::identity_with_facts(&binding.root, ctx.memo(), &state, Some(&facts))?
+                    .map(|identity| (ctx.memo().canonical_group(target_group), identity));
             if identity
                 .as_ref()
                 .is_some_and(|key| state.enumerated_join_regions.contains(key))
@@ -315,6 +332,7 @@ impl TransformationRule for PlannerTransformationRule {
                     ctx.memo(),
                     &state,
                     &binding.root,
+                    Some(&facts),
                 )?;
                 let plan = instantiated.plan;
                 let logical = ctx.memo().logical_expr(expr).ok_or_else(|| {
@@ -756,7 +774,7 @@ fn rewrite_planner_expression(
         }
         PlannerTransformation::AggregateJoinSubsumption => {
             let plan = FilterPushdown::new().rewrite_plan(plan);
-            let (plan, changed) = join_subsumption::optimize_plan_with_change(plan);
+            let (plan, changed) = join_subsumption::optimize_root_with_change(plan);
             if !changed {
                 return Ok(None);
             }
@@ -812,8 +830,8 @@ fn rewrite_planner_expression(
             plan
         }
         PlannerTransformation::LatePayloadFetch => {
-            let (plan, prefix_changed) = late_payload::optimize_matched_prefix_plan(plan)?;
-            let (plan, payload_changed) = late_payload::optimize_plan(
+            let (plan, prefix_changed) = late_payload::rewrite_matched_prefix_node(plan)?;
+            let (plan, payload_changed) = late_payload::rewrite_node(
                 plan,
                 &environment.bind_context,
                 &environment.cost_model,

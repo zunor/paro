@@ -1360,6 +1360,120 @@ fn failed_optional_transformation_rolls_back_and_keeps_baseline() {
 }
 
 #[test]
+fn application_only_fact_reads_wake_a_completed_negative_match() {
+    struct ReadFacts {
+        group: GroupId,
+        calls: Arc<AtomicUsize>,
+    }
+    impl TransformationRule for ReadFacts {
+        fn id(&self) -> RuleId {
+            RuleId(904)
+        }
+        fn matches_root(&self, expression: &super::super::memo::LogicalExpr) -> bool {
+            expression.key.operator == Fingerprint(10)
+        }
+        fn matches(
+            &self,
+            expression: &super::super::memo::LogicalExpr,
+            _: &RuleContext<'_>,
+        ) -> bool {
+            self.matches_root(expression)
+        }
+        fn apply(
+            &self,
+            _: LogicalExprId,
+            context: &mut TransformContext<'_>,
+        ) -> Result<Box<[EquivalentExpression]>> {
+            assert!(context.admit_fact_work(BudgetDimension::RuleWorkPerGroup, 1)?);
+            context.record_fact_read(PatternRead::from_group(context.memo(), self.group)?);
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            Ok(Box::new([]))
+        }
+    }
+    let mut budget = super::super::budget::SearchBudget::default();
+    budget.disable_transformation(RuleId(5));
+    let (mut engine, root, _) = engine_with_budget(budget);
+    let evidence = engine.memo_mut().create_group(
+        schema(),
+        LogicalProperties::default(),
+        GroupCardinality::default(),
+    );
+    let calls = Arc::new(AtomicUsize::new(0));
+    engine
+        .registry
+        .register_transformation(ReadFacts {
+            group: evidence,
+            calls: calls.clone(),
+        })
+        .unwrap();
+    engine.explore_transformations().unwrap();
+    engine.explore_transformations().unwrap();
+    assert_eq!(calls.load(Ordering::SeqCst), 1);
+    engine
+        .memo_mut()
+        .group_mut(evidence)
+        .unwrap()
+        .logical_properties
+        .maximum_cardinality = Some(1);
+    engine.explore_transformations().unwrap();
+    assert_eq!(calls.load(Ordering::SeqCst), 2);
+    engine
+        .memo_mut()
+        .insert_logical(
+            evidence,
+            LogicalExprKey {
+                operator: Fingerprint(61),
+                scalars: Box::new([]),
+                children: Box::new([]),
+            },
+            LogicalPayloadId(61),
+            EquivalenceProof::Initial,
+        )
+        .unwrap();
+    engine.explore_transformations().unwrap();
+    assert_eq!(
+        calls.load(Ordering::SeqCst),
+        3,
+        "a non-selected alternative is evidence too"
+    );
+    assert_eq!(engine.memo().group(root).unwrap().logical_exprs().len(), 1);
+}
+
+#[test]
+fn later_binding_observations_keep_all_application_fact_subscriptions() {
+    let (mut engine, root, _) = engine_with_budget(super::super::budget::SearchBudget::default());
+    let evidence = engine.memo_mut().create_group(
+        schema(),
+        LogicalProperties::default(),
+        GroupCardinality::default(),
+    );
+    let task = TransformationTaskId {
+        group: root,
+        expression: engine.memo().group(root).unwrap().logical_exprs()[0],
+        rule: RuleId(904),
+    };
+    let root_read = PatternRead::from_group(engine.memo(), root).unwrap();
+    let fact_read = PatternRead::from_group(engine.memo(), evidence).unwrap();
+    engine
+        .transformation_fact_observations
+        .insert(task, Box::new([fact_read]));
+    engine
+        .seed_transformation_observation(task, &[root_read, fact_read])
+        .unwrap();
+    engine
+        .seed_transformation_observation(task, &[root_read])
+        .unwrap();
+    assert!(engine.transformation_subscribers[&evidence].contains(&task));
+    engine
+        .memo_mut()
+        .group_mut(evidence)
+        .unwrap()
+        .logical_properties
+        .maximum_cardinality = Some(1);
+    assert!(!engine.transformation_observation_is_current(task).unwrap());
+}
+
+#[test]
 fn engine_rejection_rolls_back_memo_and_enlisted_side_state() {
     let mut budget = super::super::budget::SearchBudget::default();
     budget.disable_transformation(RuleId(5));

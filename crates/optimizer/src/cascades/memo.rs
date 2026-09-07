@@ -321,7 +321,7 @@ impl GroupCardinality {
 }
 
 impl CardinalityEnvelope {
-    fn hull(self, other: Self) -> Self {
+    pub(crate) fn hull(self, other: Self) -> Self {
         Self {
             lower: self.lower.min(other.lower),
             expected_lower: self.expected_lower.min(other.expected_lower),
@@ -330,7 +330,7 @@ impl CardinalityEnvelope {
         }
     }
 
-    fn clamp(mut self, maximum: Option<u64>) -> Self {
+    pub(crate) fn clamp(mut self, maximum: Option<u64>) -> Self {
         if let Some(maximum) = maximum {
             self.lower = self.lower.min(maximum);
             self.expected_lower = self.expected_lower.min(maximum).max(self.lower);
@@ -694,6 +694,7 @@ pub struct Memo {
     global_ledger: SearchLedger,
     optional_group_budget_sealed: bool,
     cte_producers: BTreeMap<usize, BTreeSet<CteProducerDomain>>,
+    changed_cte_domains: BTreeSet<usize>,
 }
 
 #[derive(Debug, Clone)]
@@ -710,6 +711,7 @@ pub(crate) struct TransformationSavepoint {
     regions: RegionForest,
     global_ledger: SearchLedger,
     cte_producers: BTreeMap<usize, BTreeSet<CteProducerDomain>>,
+    changed_cte_domains: BTreeSet<usize>,
 }
 
 impl Memo {
@@ -739,6 +741,7 @@ impl Memo {
             global_ledger,
             optional_group_budget_sealed: false,
             cte_producers: BTreeMap::new(),
+            changed_cte_domains: BTreeSet::new(),
         }
     }
 
@@ -757,10 +760,62 @@ impl Memo {
         columns: Box<[super::ids::ColumnId]>,
     ) {
         let group = self.canonical_group(group);
-        self.cte_producers
+        if self
+            .cte_producers
             .entry(cte_index)
             .or_default()
-            .insert(CteProducerDomain { group, columns });
+            .insert(CteProducerDomain { group, columns })
+        {
+            self.changed_cte_domains.insert(cte_index);
+        }
+    }
+
+    /// Registry changes are facts too: a previously unresolved CTE reader
+    /// must be woken when its first producer is registered.
+    pub(crate) fn take_changed_cte_readers(&mut self) -> Vec<GroupId> {
+        let changed = std::mem::take(&mut self.changed_cte_domains);
+        if changed.is_empty() {
+            return Vec::new();
+        }
+        self.groups()
+            .filter(|group| {
+                group
+                    .logical_properties
+                    .cte_references
+                    .iter()
+                    .any(|reference| changed.contains(&reference.cte_index))
+            })
+            .map(|group| group.id)
+            .collect()
+    }
+
+    pub(crate) fn local_statistics_fingerprint(&self, id: GroupId) -> Fingerprint {
+        let group = self
+            .group(self.canonical_group(id))
+            .expect("observed group exists");
+        let mut fingerprint = StableFingerprintBuilder::default();
+        fingerprint.write_fingerprint(group.statistics_snapshot_fingerprint());
+        for reference in &group.logical_properties.cte_references {
+            fingerprint.write_u64(reference.cte_index as u64);
+            fingerprint.write_u64(
+                self.cte_producers
+                    .get(&reference.cte_index)
+                    .map_or(0, BTreeSet::len) as u64,
+            );
+            for producer in self
+                .cte_producers
+                .get(&reference.cte_index)
+                .into_iter()
+                .flatten()
+            {
+                fingerprint.write_u64(self.canonical_group(producer.group).0 as u64);
+                fingerprint.write_u64(producer.columns.len() as u64);
+                for column in &producer.columns {
+                    fingerprint.write_u64(column.0 as u64);
+                }
+            }
+        }
+        fingerprint.finish()
     }
 
     /// Resolve a column domain through the relational group, including a CTE
@@ -819,6 +874,7 @@ impl Memo {
             regions: self.regions.clone(),
             global_ledger: self.global_ledger.clone(),
             cte_producers: self.cte_producers.clone(),
+            changed_cte_domains: self.changed_cte_domains.clone(),
         }
     }
 
@@ -895,6 +951,7 @@ impl Memo {
         self.global_ledger
             .rollback_to_preserving_exhaustion(savepoint.global_ledger);
         self.cte_producers = savepoint.cte_producers;
+        self.changed_cte_domains = savepoint.changed_cte_domains;
         Ok(())
     }
 
@@ -1147,6 +1204,40 @@ impl Memo {
         }
 
         resolve(self, id, &mut BTreeSet::new())
+    }
+
+    pub(crate) fn local_cardinality_envelope(&self, id: GroupId) -> Option<CardinalityEnvelope> {
+        self.group(id)?.cardinality.range
+    }
+
+    /// Direct evidence dependencies only: callers own traversal, read
+    /// tracking, memoization and admission. `true` denotes a CTE producer
+    /// whose current range supersedes the scan-local fallback observation.
+    pub(crate) fn cardinality_dependencies(
+        &self,
+        id: GroupId,
+    ) -> impl Iterator<Item = (GroupId, bool)> + '_ {
+        self.group(id).into_iter().flat_map(move |group| {
+            group
+                .cardinality
+                .inputs
+                .iter()
+                .copied()
+                .map(|group| (group, false))
+                .chain(
+                    group
+                        .logical_properties
+                        .cte_references
+                        .iter()
+                        .flat_map(move |reference| {
+                            self.cte_producers
+                                .get(&reference.cte_index)
+                                .into_iter()
+                                .flatten()
+                                .map(|producer| (producer.group, true))
+                        }),
+                )
+        })
     }
 
     pub fn cardinality_estimate(&self, id: GroupId) -> Option<(u64, u64, u64)> {

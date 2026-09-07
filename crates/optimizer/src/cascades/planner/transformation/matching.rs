@@ -632,7 +632,7 @@ pub(super) fn dimension_sharing_pattern_bindings(
                 break 'frontiers;
             }
             let candidate = super::super::semantic_plan::instantiate_bound_plan_with_group_holes(
-                memo, state, &root,
+                memo, state, &root, None,
             )?;
             if !crate::aggregate::dimension_sharing::recognizes_plan(&candidate.plan) {
                 continue;
@@ -722,6 +722,15 @@ enum PatternScope {
     LeftJoin,
     NonNullAggregate,
     NonNullInput,
+    JoinRegion,
+    AggregateRegion,
+    DimensionRegion,
+    LatePayload,
+    LateProjection,
+    LateAggregate,
+    RowIdPath,
+    SubsumptionAggregate,
+    SubsumptionInput,
 }
 
 impl PatternScope {
@@ -732,6 +741,47 @@ impl PatternScope {
             Self::Subtree => repeat(Self::Subtree),
             Self::Hole => unreachable!("group holes do not inspect operators"),
             Self::Shell => repeat(Self::Hole),
+            Self::SubsumptionAggregate => matches!(operator, LogicalOperator::Aggregate(_)).then(|| vec![Self::SubsumptionInput]),
+            // Detail subsumption consumes a clean join region, projection /
+            // filter exposure paths, and one partial-aggregate shell. It
+            // does not inspect arbitrary relations hanging off that region.
+            Self::SubsumptionInput => match operator {
+                LogicalOperator::Projection(_) | LogicalOperator::Filter(_) => repeat(Self::SubsumptionInput),
+                LogicalOperator::Join(Join::Comparison(join)) if matches!(join.join_type, JoinType::Inner | JoinType::Semi | JoinType::RightSemi) => repeat(Self::SubsumptionInput),
+                LogicalOperator::Aggregate(_) => repeat(Self::Shell),
+                _ => repeat(Self::Hole),
+            },
+            Self::LatePayload => match operator {
+                LogicalOperator::Projection(_) => repeat(Self::RowIdPath),
+                LogicalOperator::TopN(_) => repeat(Self::LateProjection),
+                _ => None,
+            },
+            Self::LateProjection => matches!(operator, LogicalOperator::Projection(_)).then(|| vec![Self::LateAggregate]),
+            Self::LateAggregate => match operator {
+                LogicalOperator::Aggregate(_) => repeat(Self::RowIdPath),
+                _ => Self::RowIdPath.children(operator),
+            },
+            // The row-id proof inspects every branch to prove one source
+            // occurrence. Unknown operators decline; hiding them behind a
+            // schema-only hole could manufacture source uniqueness.
+            Self::RowIdPath => match operator {
+                LogicalOperator::Get(_) | LogicalOperator::Filter(_) | LogicalOperator::Window(_)
+                | LogicalOperator::Order(_) | LogicalOperator::Limit(_) | LogicalOperator::TopN(_)
+                | LogicalOperator::EmptyResult(_) | LogicalOperator::Join(_) => repeat(Self::RowIdPath),
+                _ => None,
+            },
+            Self::JoinRegion => match operator {
+                LogicalOperator::Filter(_) => repeat(Self::JoinRegion),
+                LogicalOperator::Join(join) if crate::join_order::relation_manager::RelationManager::join_is_reorderable(join)
+                    || matches!(join, Join::Comparison(join) if crate::join_order::relation_manager::RelationManager::reduction_join_is_reorderable(join)) => repeat(Self::JoinRegion),
+                _ => repeat(Self::Hole),
+            },
+            Self::AggregateRegion => matches!(operator, LogicalOperator::Aggregate(_)).then(|| vec![Self::DimensionRegion]),
+            Self::DimensionRegion => match operator {
+                LogicalOperator::Projection(_) => repeat(Self::DimensionRegion),
+                LogicalOperator::Join(Join::Comparison(join)) if join.join_type == JoinType::Inner && join.duplicate_eliminated_columns.is_empty() && !join.delim_flipped => repeat(Self::DimensionRegion),
+                _ => repeat(Self::Hole),
+            },
             Self::LimitProjection => matches!(operator, LogicalOperator::Limit(_)).then(|| vec![Self::Projection]),
             Self::Projection => matches!(operator, LogicalOperator::Projection(_)).then(|| vec![Self::Hole]),
             Self::Preaggregate => matches!(operator, LogicalOperator::Aggregate(aggregate) if aggregate.groups.len() == 1).then(|| vec![Self::LeftJoin]),
@@ -782,12 +832,13 @@ pub(super) fn scoped_pattern_bindings(
         PlannerTransformation::ExpensivePredicatePlacement => PatternScope::Shell,
         PlannerTransformation::TopNIntroduction => PatternScope::TopN,
         PlannerTransformation::LimitPushdown => PatternScope::LimitProjection,
+        PlannerTransformation::LatePayloadFetch => PatternScope::LatePayload,
         PlannerTransformation::AggregateJoinPreaggregation => PatternScope::Preaggregate,
+        PlannerTransformation::AggregateJoinSubsumption => PatternScope::SubsumptionAggregate,
         PlannerTransformation::AggregateNonNullInput => PatternScope::NonNullAggregate,
-        // Region enumeration and aggregate deferral still consume boundary
-        // source lineage and uniqueness through semantic operator trees. Do
-        // not turn those inputs into schema-only holes until these physical
-        // facts are supplied by a first-class Memo contract.
+        PlannerTransformation::JoinRegionEnumeration => PatternScope::JoinRegion,
+        PlannerTransformation::AggregateDimensionDeferral
+        | PlannerTransformation::AggregateInputMaterialization => PatternScope::AggregateRegion,
         PlannerTransformation::MarkJoinToSemi => PatternScope::MarkConsumer,
         _ => PatternScope::Subtree,
     };
@@ -1039,6 +1090,43 @@ fn enumerate_pattern_bindings(
                     .ok_or_else(|| paro_error::internal("scoped pattern has no operator shell"))?
                     .semantic_template
                     .operator;
+                if matches!(scope, PatternScope::JoinRegion)
+                    && !matches!(
+                        operator,
+                        LogicalOperator::Get(_) | LogicalOperator::Filter(_)
+                    )
+                    && !matches!(operator, LogicalOperator::Join(join) if crate::join_order::relation_manager::RelationManager::join_is_reorderable(join)
+                        || matches!(join, Join::Comparison(join) if crate::join_order::relation_manager::RelationManager::reduction_join_is_reorderable(join)))
+                {
+                    if active.len() == 1 {
+                        return Ok(Vec::new());
+                    }
+                    if !self.observe_facts(group)? || !self.admit_work(1)? {
+                        return Ok(Vec::new());
+                    }
+                    let mut fingerprint = StableFingerprintBuilder::default();
+                    fingerprint.write_bytes(b"paro.pattern.join-atom.v1");
+                    fingerprint.write_u64(group.0 as u64);
+                    return Ok(vec![(PatternOperand::Group(group), fingerprint.finish())]);
+                }
+                if matches!(scope, PatternScope::SubsumptionInput)
+                    && !matches!(
+                        operator,
+                        LogicalOperator::Get(_)
+                            | LogicalOperator::Filter(_)
+                            | LogicalOperator::Projection(_)
+                            | LogicalOperator::Aggregate(_)
+                            | LogicalOperator::Join(Join::Comparison(_))
+                    )
+                {
+                    if !self.observe_facts(group)? || !self.admit_work(1)? {
+                        return Ok(Vec::new());
+                    }
+                    let mut fingerprint = StableFingerprintBuilder::default();
+                    fingerprint.write_bytes(b"paro.pattern.subsumption-input-hole.v1");
+                    fingerprint.write_u64(group.0 as u64);
+                    return Ok(vec![(PatternOperand::Group(group), fingerprint.finish())]);
+                }
                 // TopN implementation matching consumes its local search
                 // access path too, not just the ordering shell. Other inputs
                 // remain opaque rather than expanding unrelated join trees.
@@ -1291,7 +1379,7 @@ fn transformation_root_operator_matches(
             operator == Op::Limit
         }
         PlannerTransformation::LatePayloadFetch => {
-            rowset_scan_pushdown && matches!(operator, Op::Projection | Op::Aggregate | Op::TopN)
+            rowset_scan_pushdown && matches!(operator, Op::Projection | Op::TopN)
         }
         PlannerTransformation::ScalarAggregateWindow => {
             matches!(operator, Op::ComparisonJoin | Op::Projection | Op::Filter)
@@ -1302,6 +1390,54 @@ fn transformation_root_operator_matches(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn detail_subsumption_keeps_unconsumed_relations_as_group_inputs() {
+        use paro_common::types::LogicalType;
+        use paro_planner::operator::{Aggregate, Distinct, Filter, Get};
+        let mut child = LogicalPlan::synthetic(LogicalOperator::Get(Get::new_without_table(
+            0,
+            vec!["k".into()],
+            vec![LogicalType::BigInt],
+        )));
+        for _ in 0..64 {
+            child = LogicalPlan::synthetic(LogicalOperator::Filter(Filter::new(child, vec![])));
+        }
+        let child = LogicalPlan::synthetic(LogicalOperator::Distinct(Distinct::new(child)));
+        let plan = LogicalPlan::synthetic(LogicalOperator::Aggregate(Aggregate::new(
+            1,
+            2,
+            3,
+            child,
+            vec![],
+            vec![],
+            vec![],
+            vec![],
+        )));
+        let mut budget = SearchBudget::default();
+        budget.max_rule_work_units_per_group = 12;
+        let input = MemoBuilder::build(plan, BindContext::new(), budget).unwrap();
+        let expression = input.memo.group(input.root).unwrap().logical_exprs()[0];
+        let child = input.memo.logical_expr(expression).unwrap().key.children[0];
+        let state = input.planner_state.read().unwrap();
+        let bound = scoped_pattern_bindings(
+            PlannerTransformation::AggregateJoinSubsumption,
+            input.root,
+            expression,
+            &input.memo,
+            &state,
+            None,
+            BudgetDimension::RuleWorkPerGroup,
+        )
+        .unwrap();
+        assert_eq!(bound.completion, PatternEnumerationCompletion::Complete);
+        assert_eq!(bound.bindings.len(), 1);
+        assert_eq!(bound.reads.len(), 2);
+        let PatternOperand::Expression { children, .. } = &bound.bindings[0].root else {
+            panic!("aggregate shell")
+        };
+        assert_eq!(children.as_ref(), &[PatternOperand::Group(child)]);
+    }
 
     #[test]
     fn local_filter_binding_does_not_enumerate_or_subscribe_below_its_input() {
@@ -1633,7 +1769,7 @@ mod tests {
     }
 
     #[test]
-    fn facts_read_invalidates_when_an_inherited_estimate_changes() {
+    fn shallow_fact_cursor_does_not_hide_inherited_reads() {
         let mut memo = Memo::new(SearchBudget::default());
         let (input, _) = add_expression(&mut memo, 9001, vec![]);
         let (root, _) = add_expression(&mut memo, 9002, vec![input]);
@@ -1652,7 +1788,7 @@ mod tests {
             local,
             memo.group(root).unwrap().statistics_snapshot_fingerprint()
         );
-        assert!(!read.is_current(&memo).unwrap());
+        assert!(read.is_current(&memo).unwrap());
     }
 
     #[test]

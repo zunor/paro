@@ -476,6 +476,7 @@ impl RelationManager {
         matches!(
             op_type,
             LogicalOperatorType::Projection
+                | LogicalOperatorType::BoundReference
                 | LogicalOperatorType::Get
                 | LogicalOperatorType::Aggregate
                 | LogicalOperatorType::Window

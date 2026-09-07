@@ -107,6 +107,9 @@ pub(super) struct PlannerTransformState {
     pub(super) expression_group_insertions: Vec<(LogicalExprKey, (GroupId, LogicalExprId))>,
     pub(super) metadata_runtime_filter_changes: Vec<MetadataRuntimeFilterChange>,
     pub(super) enumerated_join_regions: BTreeSet<(GroupId, Box<[u8]>)>,
+    /// Immutable value facts may survive a failed publication. Their local
+    /// revision and exact child fact identities validate every cache read.
+    pub(super) boundary_cache: std::sync::Mutex<super::boundary::BoundaryFactCache>,
     pub(super) join_region_insertions: Vec<(GroupId, Box<[u8]>)>,
     pub(super) binder: Option<Binder>,
     pub(super) bind_context: BindContext,

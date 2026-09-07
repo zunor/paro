@@ -270,25 +270,14 @@ impl PatternRead {
         let group_ref = memo
             .group(group)
             .ok_or_else(|| paro_error::internal("rule binding read an unknown group"))?;
-        // The semantic binding consumes the resolved estimate, not merely
-        // the local recipe. A row-preserving or CTE input can change without
-        // rewriting that recipe's list of group references.
-        let mut statistics = StableFingerprintBuilder::default();
-        statistics.write_fingerprint(group_ref.statistics_snapshot_fingerprint());
-        let range = memo.cardinality_envelope(group);
-        statistics.write_u64(range.is_some() as u64);
-        if let Some(range) = range {
-            statistics.write_u64(range.lower);
-            statistics.write_u64(range.expected_lower);
-            statistics.write_u64(range.expected_upper);
-            statistics.write_u64(range.upper);
-        }
+        // A cursor observes one recipe, not an unmetered recursive estimate.
+        // Readers resolving inherited facts must subscribe to their inputs.
         Ok(Self {
             group,
             logical_frontier_revision: reads_frontier
                 .then(|| group_ref.logical_expression_version()),
             logical_fact_fingerprint: group_ref.logical_fact_fingerprint(),
-            statistics_snapshot_fingerprint: statistics.finish(),
+            statistics_snapshot_fingerprint: memo.local_statistics_fingerprint(group),
         })
     }
 
@@ -321,6 +310,7 @@ pub struct TransformContext<'a> {
     group: GroupId,
     memo_savepoint: Option<super::memo::TransformationSavepoint>,
     sidecar_rollbacks: Vec<TransformationRollback>,
+    fact_reads: BTreeMap<GroupId, PatternRead>,
 }
 
 impl<'a> TransformContext<'a> {
@@ -330,6 +320,7 @@ impl<'a> TransformContext<'a> {
             group,
             memo_savepoint: None,
             sidecar_rollbacks: Vec::new(),
+            fact_reads: BTreeMap::new(),
         }
     }
 
@@ -339,6 +330,50 @@ impl<'a> TransformContext<'a> {
 
     pub fn group(&self) -> GroupId {
         self.group
+    }
+
+    /// Admit evidence work before traversal or allocation. Unlike a Memo
+    /// mutation, this work survives an unsuccessful transformation attempt.
+    pub fn admit_fact_work(&mut self, dimension: BudgetDimension, units: usize) -> Result<bool> {
+        if units == 0 {
+            return Ok(true);
+        }
+        if self.memo_savepoint.is_some() {
+            return Err(paro_error::internal(
+                "facts must be read before transformation publication",
+            ));
+        }
+        let group = self
+            .memo
+            .group_mut(self.group)
+            .ok_or_else(|| paro_error::internal("fact reader lost its owner"))?;
+        let mut event = StableFingerprintBuilder::default();
+        event.write_bytes(b"paro.memo.fact-read-work.v1");
+        event.write_u64(self.group.0 as u64);
+        event.write_u64(group.ledger.consumed(dimension) as u64);
+        Ok(group.ledger.admit_optional_units(
+            dimension,
+            event.finish(),
+            u32::try_from(units).unwrap_or(u32::MAX),
+        ) != super::budget::BudgetDecision::Exhausted)
+    }
+
+    pub fn record_fact_read(&mut self, read: PatternRead) {
+        if let Some(previous) = self.fact_reads.get_mut(&read.group) {
+            let frontier = read
+                .logical_frontier_revision
+                .or(previous.logical_frontier_revision);
+            *previous = PatternRead {
+                logical_frontier_revision: frontier,
+                ..read
+            };
+        } else {
+            self.fact_reads.insert(read.group, read);
+        }
+    }
+
+    pub(crate) fn take_fact_reads(&mut self) -> Vec<PatternRead> {
+        std::mem::take(&mut self.fact_reads).into_values().collect()
     }
 
     /// Obtain the bounded transformation writer. The Memo snapshot is created

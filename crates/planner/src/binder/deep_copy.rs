@@ -311,11 +311,13 @@ impl LogicalPlanDeepCopy {
                 LogicalOperator::Get(g)
             }
             LogicalOperator::BoundReference(reference) => {
-                LogicalOperator::BoundReference(crate::operator::BoundReference::new(
+                let mut copied = crate::operator::BoundReference::new(
                     reference.reference_id,
                     reference.bindings.clone(),
                     reference.types.clone(),
-                ))
+                );
+                copied.facts = reference.facts.clone();
+                LogicalOperator::BoundReference(copied)
             }
             LogicalOperator::Filter(f) => {
                 let child = self.copy_plan(f.child.as_ref(), bind_shared);

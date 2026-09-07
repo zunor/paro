@@ -1049,7 +1049,7 @@ fn integer_value_rows(rows: usize, columns: usize) -> Vec<Vec<Expression>> {
         .collect()
 }
 
-fn test_base_get(table_index: usize, oid: u64, name: &str, rows: usize) -> LogicalPlan {
+pub(super) fn test_base_get(table_index: usize, oid: u64, name: &str, rows: usize) -> LogicalPlan {
     let storage = Arc::new(
         TableFactory::default()
             .create_table(&[LogicalType::Integer])

@@ -1185,7 +1185,10 @@ mod tests {
             .iter()
             .all(|(_, _, _, insertions)| *insertions >= 2));
         assert!(variants.windows(2).all(|pair| pair[0].2 == pair[1].2));
-        assert!(variants.windows(2).all(|pair| pair[0].0 == pair[1].0));
+        assert!(
+            variants.windows(2).all(|pair| pair[0].0 == pair[1].0),
+            "{variants:?}"
+        );
         assert!(variants
             .windows(2)
             .all(|pair| (pair[0].1 - pair[1].1).abs() < 1e-9));

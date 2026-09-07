@@ -245,6 +245,9 @@ fn default_cardinality(session: &StatementContext) -> usize {
 }
 
 pub(crate) fn contains_control_region_boundary(plan: &LogicalPlan) -> bool {
+    if let LogicalOperator::BoundReference(reference) = &plan.operator {
+        return reference.facts.contains_control_region;
+    }
     let owns_region = matches!(
         &plan.operator,
         LogicalOperator::Join(Join::Comparison(join))

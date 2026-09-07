@@ -253,9 +253,13 @@ struct RuntimeFilterProbeLineage<'a> {
 struct RuntimeFilterProbeSource<'a> {
     plan: &'a LogicalPlan,
     output_index: usize,
+    boundary: Option<&'a paro_planner::operator::bound_reference::BoundSourceColumn>,
 }
 
 fn runtime_filter_source_id(source: RuntimeFilterProbeSource<'_>) -> Option<WorkSourceId> {
+    if let Some(boundary) = source.boundary {
+        return Some(WorkSourceId(boundary.source));
+    }
     let get = match &source.plan.operator {
         LogicalOperator::Get(get) => get,
         LogicalOperator::SearchScan(search) => &search.get,
@@ -271,7 +275,13 @@ fn runtime_filter_source_facts<'a>(
 ) -> Option<Box<[PlannerRuntimeFilterSource]>> {
     let bindings = plan.get_column_bindings();
     let mut expected_sources = None;
-    let mut source_keys = BTreeMap::<WorkSourceId, (&LogicalPlan, BTreeSet<usize>)>::new();
+    let mut source_keys = BTreeMap::<
+        WorkSourceId,
+        (
+            RuntimeFilterProbeSource<'_>,
+            BTreeMap<usize, RuntimeFilterProbeSource<'_>>,
+        ),
+    >::new();
     let mut saw_expression = false;
     for expression in expressions {
         saw_expression = true;
@@ -303,14 +313,19 @@ fn runtime_filter_source_facts<'a>(
             let source_id = runtime_filter_source_id(source)?;
             let entry = source_keys
                 .entry(source_id)
-                .or_insert_with(|| (source.plan, BTreeSet::new()));
+                .or_insert_with(|| (source, BTreeMap::new()));
             // One binding identity names one physical rowset occurrence. If a
             // future lineage maps it to two plan nodes, decline instead of
             // merging unrelated statistics under one source-work identity.
-            if !std::ptr::eq(entry.0, source.plan) {
+            let same_occurrence = match (entry.0.boundary, source.boundary) {
+                (Some(left), Some(right)) => left.occurrence == right.occurrence,
+                (None, None) => std::ptr::eq(entry.0.plan, source.plan),
+                _ => false,
+            };
+            if !same_occurrence {
                 return None;
             }
-            entry.1.insert(source.output_index);
+            entry.1.insert(source.output_index, source);
         }
     }
     if !saw_expression {
@@ -318,11 +333,33 @@ fn runtime_filter_source_facts<'a>(
     }
     source_keys
         .into_iter()
-        .map(|(source, (plan, output_indices))| {
+        .map(|(source, (first, keys))| {
+            if let Some(boundary) = first.boundary {
+                let multiplicity = if keys
+                    .values()
+                    .any(|key| key.boundary.is_some_and(|key| key.unique))
+                {
+                    RuntimeFilterProbeMultiplicity::DeclaredUnique
+                } else if keys.len() == 1 {
+                    boundary
+                        .distinct
+                        .map_or(RuntimeFilterProbeMultiplicity::Unknown, |keys| {
+                            RuntimeFilterProbeMultiplicity::EstimatedDistinct { keys }
+                        })
+                } else {
+                    RuntimeFilterProbeMultiplicity::Unknown
+                };
+                return Some(PlannerRuntimeFilterSource {
+                    source,
+                    rows: boundary.rows?,
+                    multiplicity,
+                });
+            }
+            let plan = first.plan;
             let types = plan.types();
             let bindings = plan.get_column_bindings();
-            let key_expressions = output_indices
-                .into_iter()
+            let key_expressions = keys
+                .into_keys()
                 .map(|index| {
                     Some(Expression::ColumnRef(
                         paro_planner::expression::ColumnRefExpression::new(
@@ -376,11 +413,28 @@ fn runtime_filter_probe_lineages(
     output_index: usize,
 ) -> Option<RuntimeFilterProbeLineage<'_>> {
     match &plan.operator {
+        LogicalOperator::BoundReference(reference) => {
+            let columns = reference.facts.source_lineage.get(output_index)?.as_ref()?;
+            Some(RuntimeFilterProbeLineage {
+                sources: columns
+                    .iter()
+                    .map(|column| RuntimeFilterProbeSource {
+                        plan,
+                        output_index: column.column,
+                        boundary: Some(column),
+                    })
+                    .collect(),
+            })
+        }
         LogicalOperator::Get(get)
             if get.table.is_some() && get.stored_column(output_index).is_some() =>
         {
             Some(RuntimeFilterProbeLineage {
-                sources: vec![RuntimeFilterProbeSource { plan, output_index }],
+                sources: vec![RuntimeFilterProbeSource {
+                    plan,
+                    output_index,
+                    boundary: None,
+                }],
             })
         }
         LogicalOperator::SearchScan(search) if search.get.table.is_some() => {
@@ -395,7 +449,11 @@ fn runtime_filter_probe_lineages(
             };
             search.get.stored_column(source_index)?;
             Some(RuntimeFilterProbeLineage {
-                sources: vec![RuntimeFilterProbeSource { plan, output_index }],
+                sources: vec![RuntimeFilterProbeSource {
+                    plan,
+                    output_index,
+                    boundary: None,
+                }],
             })
         }
         LogicalOperator::FullTextFilterScan(search) if search.get.table.is_some() => {
@@ -405,7 +463,11 @@ fn runtime_filter_probe_lineages(
                 .get(output_index)?;
             search.get.stored_column(source_index)?;
             Some(RuntimeFilterProbeLineage {
-                sources: vec![RuntimeFilterProbeSource { plan, output_index }],
+                sources: vec![RuntimeFilterProbeSource {
+                    plan,
+                    output_index,
+                    boundary: None,
+                }],
             })
         }
         LogicalOperator::Filter(filter) => {
@@ -488,7 +550,11 @@ fn runtime_filter_source_rows(
         lineage.sources.into_iter().try_fold(
             paro_planner::plan::CardinalityEstimate::exact(0),
             |sum, source| {
-                let rows = source.plan.stats.estimated_cardinality?;
+                let rows = source
+                    .boundary
+                    .map_or(source.plan.stats.estimated_cardinality, |column| {
+                        column.rows
+                    })?;
                 Some(paro_planner::plan::CardinalityEstimate {
                     min: sum.min.saturating_add(rows.min),
                     expected: sum.expected.saturating_add(rows.expected),

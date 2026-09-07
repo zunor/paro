@@ -64,29 +64,31 @@ pub fn optimize_plan(plan: LogicalPlan) -> LogicalPlan {
 }
 
 pub fn optimize_plan_with_change(plan: LogicalPlan) -> (LogicalPlan, bool) {
-    fn rewrite(plan: LogicalPlan, changed: &mut bool) -> LogicalPlan {
-        let mut plan = plan.map_children(|child| rewrite(child, changed));
-        let LogicalOperator::Aggregate(aggregate) = &mut plan.operator else {
-            return plan;
-        };
-        let Some(outer_sum) = AggregateJoinSubsumption::outer_sum(aggregate) else {
-            return plan;
-        };
-        let Some(replacement) =
-            AggregateJoinSubsumption::substitute_detail_join(aggregate.child.as_mut(), &outer_sum)
-        else {
-            return plan;
-        };
+    plan.try_fold_post_order(|plan, children: Vec<bool>| {
+        let (plan, changed) = optimize_root_with_change(plan);
+        Ok((plan, changed || children.into_iter().any(|changed| changed)))
+    })
+    .expect("detail subsumption traversal cannot fail")
+}
 
-        aggregate.aggregates[0] = replacement;
-        aggregate.recompute_returned_types();
-        *changed = true;
-        plan
-    }
+/// Memo schedules descendant groups independently; a firing changes only
+/// the aggregate shell whose proof was matched.
+pub(crate) fn optimize_root_with_change(mut plan: LogicalPlan) -> (LogicalPlan, bool) {
+    let LogicalOperator::Aggregate(aggregate) = &mut plan.operator else {
+        return (plan, false);
+    };
+    let Some(outer_sum) = AggregateJoinSubsumption::outer_sum(aggregate) else {
+        return (plan, false);
+    };
+    let Some(replacement) =
+        AggregateJoinSubsumption::substitute_detail_join(aggregate.child.as_mut(), &outer_sum)
+    else {
+        return (plan, false);
+    };
 
-    let mut changed = false;
-    let plan = rewrite(plan, &mut changed);
-    (plan, changed)
+    aggregate.aggregates[0] = replacement;
+    aggregate.recompute_returned_types();
+    (plan, true)
 }
 
 struct AggregateJoinSubsumption;

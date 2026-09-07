@@ -35,11 +35,13 @@ pub(super) fn instantiate_bound_plan_with_group_holes(
     memo: &Memo,
     state: &PlannerTransformState,
     binding: &PatternOperand,
+    facts: Option<&boundary::BoundarySnapshot>,
 ) -> Result<InstantiatedPlanWithGroupHoles> {
     fn group_hole_transport(
         state: &PlannerTransformState,
         layout: &PlannerBindingLayout,
         cardinality: Option<(u64, u64, u64)>,
+        facts: Option<Arc<paro_planner::operator::bound_reference::BoundRelationFacts>>,
     ) -> Result<LogicalPlan> {
         if layout.bindings.len() != layout.types.len() {
             return Err(paro_error::internal(
@@ -47,14 +49,20 @@ pub(super) fn instantiate_bound_plan_with_group_holes(
             ));
         }
         let reference_id = state.bind_context.next_plan_id().0;
+        let mut reference = paro_planner::operator::BoundReference::new(
+            reference_id,
+            layout.bindings.to_vec(),
+            layout.types.to_vec(),
+        );
+        if let Some(facts) = facts {
+            reference = reference.with_facts(facts);
+        }
+        let unique_keys = reference.facts.unique_keys.clone();
         let mut plan = LogicalPlan::new(
             &state.bind_context,
-            LogicalOperator::BoundReference(paro_planner::operator::BoundReference::new(
-                reference_id,
-                layout.bindings.to_vec(),
-                layout.types.to_vec(),
-            )),
+            LogicalOperator::BoundReference(reference),
         );
+        plan.stats.unique_keys = unique_keys;
         debug_assert_ne!(reference_id, paro_planner::plan::PlanNodeId::SYNTHETIC.0);
         plan.stats.estimated_cardinality =
             cardinality.map(
@@ -67,29 +75,35 @@ pub(super) fn instantiate_bound_plan_with_group_holes(
         Ok(plan)
     }
 
-    fn instantiate(
-        memo: &Memo,
-        state: &PlannerTransformState,
-        binding: &PatternOperand,
-        expected_layout: Option<&PlannerBindingLayout>,
-        holes: &mut BTreeMap<u32, GroupId>,
-    ) -> Result<LogicalPlan> {
+    let mut group_holes = BTreeMap::new();
+    let mut pending = vec![(binding, None, false)];
+    let mut completed = Vec::new();
+    while let Some((binding, expected_layout, finish)) = pending.pop() {
         match binding {
             PatternOperand::Group(group) => {
                 let group = memo.canonical_group(*group);
                 let layout = expected_layout.ok_or_else(|| {
                     paro_error::internal("root Memo group cannot be an untyped pattern hole")
                 })?;
-                let plan = group_hole_transport(state, layout, memo.cardinality_estimate(group))?;
+                let cardinality = facts.and_then(|facts| facts.cardinality(memo, group));
+                let transport = facts
+                    .map(|facts| facts.transport(memo, state, group, layout))
+                    .transpose()?;
+                let plan = group_hole_transport(
+                    state,
+                    layout,
+                    cardinality.map(|range| (range.min, range.expected, range.max)),
+                    transport,
+                )?;
                 let LogicalOperator::BoundReference(reference) = &plan.operator else {
                     unreachable!("group-hole transport constructor returned another operator")
                 };
-                if holes.insert(reference.reference_id, group).is_some() {
+                if group_holes.insert(reference.reference_id, group).is_some() {
                     return Err(paro_error::internal(
                         "group-hole transport reused a planner node identity",
                     ));
                 }
-                Ok(plan)
+                completed.push(plan);
             }
             PatternOperand::Expression {
                 group,
@@ -114,14 +128,20 @@ pub(super) fn instantiate_bound_plan_with_group_holes(
                         "pattern binding child arity disagrees with its logical expression",
                     ));
                 }
-                let bound_children = children
-                    .iter()
-                    .enumerate()
-                    .map(|(index, child)| {
-                        instantiate(memo, state, child, metadata.child_layouts.get(index), holes)
-                    })
-                    .collect::<Result<Vec<_>>>()?;
-                let mut bound_children = bound_children.into_iter();
+                if !finish {
+                    pending.push((binding, expected_layout, true));
+                    pending.extend(
+                        children.iter().enumerate().rev().map(|(index, child)| {
+                            (child, metadata.child_layouts.get(index), false)
+                        }),
+                    );
+                    continue;
+                }
+                let start = completed
+                    .len()
+                    .checked_sub(children.len())
+                    .ok_or_else(|| paro_error::internal("bound shell lost a completed child"))?;
+                let mut bound_children = completed.split_off(start).into_iter();
                 let mut plan = duplicate_plan_preserving_indices(
                     &payload.semantic_template,
                     state.bind_context.shared().as_ref(),
@@ -137,22 +157,31 @@ pub(super) fn instantiate_bound_plan_with_group_holes(
                     ));
                 }
                 plan.stats.estimated_cardinality =
-                    memo.cardinality_estimate(*group)
-                        .map(
-                            |(min, expected, max)| paro_planner::plan::CardinalityEstimate {
-                                min,
-                                expected,
-                                max,
-                            },
-                        );
+                    facts.and_then(|facts| facts.cardinality(memo, *group));
                 let output_columns = metadata.output_columns.clone();
-                freeze_output_layout(plan, &output_columns, state)
+                let mut plan = freeze_output_layout(plan, &output_columns, state)?;
+                let child_layouts = plan
+                    .children()
+                    .iter()
+                    .map(|child| child.output_layout())
+                    .collect::<Vec<_>>();
+                let layout = plan.operator.output_layout_from_children(&child_layouts);
+                plan.stats.unique_keys = crate::statistics::unique_keys::derive_local_unique_keys(
+                    &plan.operator,
+                    &layout,
+                    &child_layouts,
+                );
+                completed.push(plan);
             }
         }
     }
 
-    let mut group_holes = BTreeMap::new();
-    let plan = instantiate(memo, state, binding, None, &mut group_holes)?;
+    if completed.len() != 1 {
+        return Err(paro_error::internal(
+            "bound shell assembly has no unique root",
+        ));
+    }
+    let plan = completed.pop().unwrap();
     Ok(InstantiatedPlanWithGroupHoles { plan, group_holes })
 }
 

@@ -218,21 +218,37 @@ pub(crate) fn derive_local_unique_keys(
     child_layouts: &[paro_planner::operator::LogicalOutputLayout],
 ) -> Vec<UniqueKey> {
     let children = operator.children();
+    let keys = children
+        .iter()
+        .map(|child| child.stats.unique_keys.as_slice())
+        .collect::<Vec<_>>();
+    derive_unique_keys_from_facts(operator, layout, child_layouts, &keys)
+}
+
+/// One operator algebra shared by plan statistics and Memo-native facts.
+/// Inputs are schemas and proof sets, never representative child trees.
+pub(crate) fn derive_unique_keys_from_facts(
+    operator: &LogicalOperator,
+    layout: &paro_planner::operator::LogicalOutputLayout,
+    child_layouts: &[paro_planner::operator::LogicalOutputLayout],
+    children: &[&[UniqueKey]],
+) -> Vec<UniqueKey> {
     let mut keys = match operator {
+        LogicalOperator::BoundReference(reference) => reference.facts.unique_keys.clone(),
         LogicalOperator::Get(get) => declared_keys_in_layout(get, layout),
         LogicalOperator::SearchScan(search) => {
             declared_keys_through_projection(&search.get, &search.projections, layout)
         }
         LogicalOperator::FullTextFilterScan(search) => declared_keys_in_layout(&search.get, layout),
         LogicalOperator::Filter(filter) => project_unique_keys(
-            child_keys(&children, 0),
+            child_keys(children, 0),
             &filter
                 .projection_map
                 .to_indices(child_layout(child_layouts, 0).len()),
             layout,
         ),
         LogicalOperator::Order(order) => project_unique_keys(
-            child_keys(&children, 0),
+            child_keys(children, 0),
             &order
                 .projection_map
                 .to_indices(child_layout(child_layouts, 0).len()),
@@ -246,19 +262,19 @@ pub(crate) fn derive_local_unique_keys(
                     expression_output_index(expression, child_layout(child_layouts, 0))
                 })
                 .collect::<Vec<_>>();
-            remap_unique_keys(child_keys(&children, 0), &sources, layout)
+            remap_unique_keys(child_keys(children, 0), &sources, layout)
         }
         LogicalOperator::Limit(_)
         | LogicalOperator::TopN(_)
         | LogicalOperator::Window(_)
         | LogicalOperator::EmptyResult(_)
         | LogicalOperator::RowFetch(_)
-        | LogicalOperator::ExternalProject(_) => child_keys(&children, 0).to_vec(),
+        | LogicalOperator::ExternalProject(_) => child_keys(children, 0).to_vec(),
         // One input carrier can expand to many edge rows. The input key alone
         // is therefore never a key of GraphExpand's output.
         LogicalOperator::GraphExpand(_) => Vec::new(),
         LogicalOperator::Distinct(_) => {
-            let mut keys = child_keys(&children, 0).to_vec();
+            let mut keys = child_keys(children, 0).to_vec();
             if !layout.is_empty() {
                 keys.push(key_from_indices(
                     0..layout.len(),
@@ -278,10 +294,10 @@ pub(crate) fn derive_local_unique_keys(
         LogicalOperator::Join(Join::Comparison(join))
             if join.duplicate_eliminated_columns.is_empty() && !join.delim_flipped =>
         {
-            comparison_join_unique_keys(join, &children, child_layouts, layout)
+            comparison_join_unique_keys(join, children, child_layouts, layout)
         }
         LogicalOperator::MaterializedCTE(_) => {
-            remap_unique_keys_by_binding(child_keys(&children, 1), layout, false)
+            remap_unique_keys_by_binding(child_keys(children, 1), layout, false)
         }
         _ => Vec::new(),
     };
@@ -306,7 +322,7 @@ pub(crate) fn refresh_unique_keys(plan: LogicalPlan) -> Result<LogicalPlan> {
 
 fn comparison_join_unique_keys(
     join: &paro_planner::operator::ComparisonJoin,
-    children: &[&LogicalPlan],
+    children: &[&[UniqueKey]],
     child_layouts: &[paro_planner::operator::LogicalOutputLayout],
     layout: &paro_planner::operator::LogicalOutputLayout,
 ) -> Vec<UniqueKey> {
@@ -558,13 +574,6 @@ fn normalize_unique_keys(keys: &mut Vec<UniqueKey>) {
     *keys = retained;
 }
 
-fn child_plan<'a>(children: &'a [&LogicalPlan], index: usize) -> &'a LogicalPlan {
-    children
-        .get(index)
-        .copied()
-        .expect("unique-key derivation requires its logical child")
-}
-
 fn child_layout(
     children: &[paro_planner::operator::LogicalOutputLayout],
     index: usize,
@@ -574,8 +583,11 @@ fn child_layout(
         .expect("unique-key derivation requires its logical child layout")
 }
 
-fn child_keys<'a>(children: &'a [&LogicalPlan], index: usize) -> &'a [UniqueKey] {
-    &child_plan(children, index).stats.unique_keys
+fn child_keys<'a>(children: &'a [&[UniqueKey]], index: usize) -> &'a [UniqueKey] {
+    children
+        .get(index)
+        .copied()
+        .expect("unique-key derivation requires its child facts")
 }
 
 fn key_from_indices(

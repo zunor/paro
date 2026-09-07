@@ -180,6 +180,7 @@ pub struct CascadesEngine {
     /// A task that declined a match is recorded as well: a later child
     /// alternative may make that same pattern applicable.
     transformation_observations: BTreeMap<TransformationTaskId, Box<[PatternRead]>>,
+    transformation_fact_observations: BTreeMap<TransformationTaskId, Box<[PatternRead]>>,
     /// Collision-safe exact bindings already evaluated under these facts.
     /// Discovery can wake a task without invalidating its earlier bindings.
     transformation_applications: BindingApplications,
@@ -208,6 +209,7 @@ impl CascadesEngine {
             rule_attempts: BTreeMap::new(),
             effective_rule_insertions: BTreeMap::new(),
             transformation_observations: BTreeMap::new(),
+            transformation_fact_observations: BTreeMap::new(),
             transformation_applications: BTreeMap::new(),
             transformation_subscribers: BTreeMap::new(),
             region_candidates: BTreeMap::new(),
@@ -442,7 +444,7 @@ impl CascadesEngine {
             if self.transformation_observation_is_current(task_id)? {
                 continue;
             }
-            let binding_set = {
+            let mut binding_set = {
                 let rule_impl = self
                     .registry
                     .transformation(rule)
@@ -453,6 +455,18 @@ impl CascadesEngine {
                 };
                 rule_impl.bindings(expression, &context)?
             };
+            if let Some(previous) = self.transformation_fact_observations.get(&task_id) {
+                let mut reads = binding_set.reads.into_vec();
+                for read in previous {
+                    reads.push(if read.logical_frontier_revision.is_some() {
+                        PatternRead::from_group(&self.memo, read.group)?
+                    } else {
+                        PatternRead::facts_from_group(&self.memo, read.group)?
+                    });
+                }
+                binding_set.work_units = binding_set.work_units.saturating_add(previous.len());
+                binding_set.reads = reads.into_boxed_slice();
+            }
             let Some(read_version) =
                 self.observe_transformation_inputs(task_id, &binding_set.reads)?
             else {
@@ -533,7 +547,7 @@ impl CascadesEngine {
                 {
                     applications.retain(|(previous, _)| previous != binding);
                 }
-                let application_reads = self
+                let mut application_reads = self
                     .registry
                     .transformation(rule)
                     .ok_or_else(|| paro_error::internal("transformation disappeared"))?
@@ -544,7 +558,8 @@ impl CascadesEngine {
                             memo: &self.memo,
                             group,
                         },
-                    )?;
+                    )?
+                    .into_vec();
                 let dependency_version =
                     transformation_binding_fingerprint(read_version, binding.fingerprint);
                 // `applied_rules` remains an audit of whether this rule has ever
@@ -613,10 +628,38 @@ impl CascadesEngine {
                         .ok_or_else(|| paro_error::internal("rule disappeared from registry"))?;
                     rule_impl.apply_binding(binding, &mut context)
                 };
+                let fact_reads = context.take_fact_reads();
+                application_reads.extend(fact_reads.iter().copied());
+                let application_reads = application_reads.into_boxed_slice();
+                if !fact_reads.is_empty() {
+                    self.transformation_fact_observations
+                        .entry(task_id)
+                        .or_default();
+                    let mut reads = self.transformation_fact_observations[&task_id]
+                        .iter()
+                        .map(|read| (read.group, *read))
+                        .collect::<BTreeMap<_, _>>();
+                    for read in fact_reads {
+                        // A facts-only access must not downgrade an earlier
+                        // frontier access made by another binding of this task.
+                        let read = if reads
+                            .get(&read.group)
+                            .is_some_and(|previous| previous.logical_frontier_revision.is_some())
+                        {
+                            PatternRead::from_group(context.memo(), read.group)?
+                        } else {
+                            read
+                        };
+                        reads.insert(read.group, read);
+                    }
+                    self.transformation_fact_observations
+                        .insert(task_id, reads.into_values().collect());
+                }
                 let outputs = match outputs_result {
                     Ok(outputs) => outputs,
                     Err(error) => {
                         context.rollback()?;
+                        self.seed_transformation_observation(task_id, &binding_set.reads)?;
                         release_transformation_output_reservations(
                             &mut self.memo,
                             group,
@@ -635,6 +678,9 @@ impl CascadesEngine {
                 };
                 if outputs.is_empty() {
                     context.rollback()?;
+                    let mut observed = binding_set.reads.to_vec();
+                    observed.extend(application_reads.iter().copied());
+                    self.seed_transformation_observation(task_id, &observed)?;
                     self.transformation_applications
                         .entry(application_key)
                         .or_default()
@@ -796,6 +842,7 @@ impl CascadesEngine {
                         .output_saturates_observed_binding();
                     if saturates_binding {
                         let mut inherited_reads = binding_set.reads.to_vec();
+                        inherited_reads.extend(application_reads.iter().copied());
                         inherited_reads.extend(
                             appended_groups
                                 .iter()
@@ -815,7 +862,11 @@ impl CascadesEngine {
                         }
                     }
                     inserted_groups.extend(appended_groups);
+                    inserted_groups.extend(self.memo.take_changed_cte_readers());
                 }
+                let mut observed = binding_set.reads.to_vec();
+                observed.extend(application_reads.iter().copied());
+                self.seed_transformation_observation(task_id, &observed)?;
                 self.transformation_applications
                     .entry(application_key)
                     .or_default()
@@ -971,6 +1022,12 @@ impl CascadesEngine {
         reads: &[PatternRead],
     ) -> Result<()> {
         let mut dependencies = reads.to_vec();
+        // Discovery is shared by all bindings of a task. Application-only
+        // evidence remains subscribed even when a later binding reads a
+        // disjoint subset, declines, or rolls back an optional rewrite.
+        if let Some(actual) = self.transformation_fact_observations.get(&task) {
+            dependencies.extend(actual.iter().copied());
+        }
         dependencies.sort_unstable();
         dependencies.dedup();
         if let Some(previous) = self.transformation_observations.get(&task) {

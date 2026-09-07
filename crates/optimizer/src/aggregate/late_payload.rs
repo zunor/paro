@@ -39,7 +39,7 @@ pub fn optimize_plan(
     })
 }
 
-fn rewrite_node(
+pub(crate) fn rewrite_node(
     plan: LogicalPlan,
     bind_context: &BindContext,
     cost_model: &CostModel,
@@ -67,15 +67,19 @@ fn rewrite_node(
 /// row IDs nor changes where stored payload is materialized.
 pub fn optimize_matched_prefix_plan(plan: LogicalPlan) -> Result<(LogicalPlan, bool)> {
     plan.try_fold_post_order(|plan, child_changes: Vec<bool>| {
-        let (plan, node_changed) = match prove_matched_prefix_candidate(&plan) {
-            Some(proof) => (apply_matched_prefix_rewrite(plan, proof)?, true),
-            None => (plan, false),
-        };
+        let (plan, node_changed) = rewrite_matched_prefix_node(plan)?;
         Ok((
             plan,
             node_changed || child_changes.into_iter().any(|changed| changed),
         ))
     })
+}
+
+pub(crate) fn rewrite_matched_prefix_node(plan: LogicalPlan) -> Result<(LogicalPlan, bool)> {
+    match prove_matched_prefix_candidate(&plan) {
+        Some(proof) => Ok((apply_matched_prefix_rewrite(plan, proof)?, true)),
+        None => Ok((plan, false)),
+    }
 }
 
 #[derive(Debug)]

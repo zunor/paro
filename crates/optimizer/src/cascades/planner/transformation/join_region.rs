@@ -8,10 +8,20 @@ use super::*;
 /// Internal join order is not an input to the graph enumerator. Atomic
 /// boundaries, predicates and consumed facts are. Retain exact bytes rather
 /// than using a digest as evidence that two enumeration problems are equal.
+#[cfg(test)]
 pub(super) fn identity(
     binding: &PatternOperand,
     memo: &Memo,
     state: &PlannerTransformState,
+) -> Result<Option<Box<[u8]>>> {
+    identity_with_facts(binding, memo, state, None)
+}
+
+pub(super) fn identity_with_facts(
+    binding: &PatternOperand,
+    memo: &Memo,
+    state: &PlannerTransformState,
+    facts: Option<&boundary::BoundarySnapshot>,
 ) -> Result<Option<Box<[u8]>>> {
     struct Graph {
         atoms: Vec<Box<[u8]>>,
@@ -103,10 +113,19 @@ pub(super) fn identity(
         let mut encoded = StableFingerprintBuilder::recording();
         atom(operand, memo, &mut encoded)?;
         graph.atoms.push(encoded.finish_recording().1);
-        let group = match operand {
+        let owner = match operand {
             PatternOperand::Group(group) | PatternOperand::Expression { group, .. } => *group,
         };
-        graph.inputs.insert(memo.canonical_group(group));
+        graph.inputs.insert(memo.canonical_group(owner));
+        let mut inputs = vec![operand];
+        while let Some(input) = inputs.pop() {
+            match input {
+                PatternOperand::Group(group) => {
+                    graph.inputs.insert(memo.canonical_group(*group));
+                }
+                PatternOperand::Expression { children, .. } => inputs.extend(children.iter()),
+            }
+        }
         Ok(())
     }
     let mut graph = Graph {
@@ -142,7 +161,15 @@ pub(super) fn identity(
         let read = PatternRead::facts_from_group(memo, group)?;
         encoder.write_u64(group.0 as u64);
         encoder.write_fingerprint(read.logical_fact_fingerprint);
-        encoder.write_fingerprint(read.statistics_snapshot_fingerprint);
+        if let Some(facts) = facts {
+            // The reader already resolved inherited and producer evidence.
+            // Recipe ids and input-list growth are invalidation cursors, not
+            // inputs to enumeration. Equal fact values retain the same graph
+            // problem even after its evidence DAG gains another derivation.
+            facts.encode_group(group, &mut encoder)?;
+        } else {
+            encoder.write_fingerprint(read.statistics_snapshot_fingerprint);
+        }
     }
     Ok(Some(encoder.finish_recording().1))
 }
@@ -277,6 +304,38 @@ mod tests {
             })
             .unwrap()
             .id;
+        fn native_identity(
+            memo: &mut Memo,
+            state: &PlannerTransformState,
+            root: GroupId,
+            binding: &PatternOperand,
+        ) -> Box<[u8]> {
+            let mut ctx = TransformContext::new(memo, root);
+            let facts = boundary::BoundarySnapshot::read(
+                &mut ctx,
+                state,
+                binding,
+                BudgetDimension::RuleWorkPerGroup,
+            )
+            .unwrap()
+            .unwrap();
+            identity_with_facts(binding, ctx.memo(), state, Some(&facts))
+                .unwrap()
+                .unwrap()
+        }
+        let native = native_identity(&mut input.memo, &state, input.root, &bindings[0].root);
+        input.memo.group_mut(leaf).unwrap().cardinality = GroupCardinality::new(
+            Fingerprint(776),
+            CardinalityRecipeKind::Statistics,
+            100,
+            100,
+            100,
+        );
+        assert_eq!(
+            native,
+            native_identity(&mut input.memo, &state, input.root, &bindings[0].root),
+            "changing a recipe without changing its value is not a new graph problem"
+        );
         input.memo.group_mut(leaf).unwrap().cardinality = GroupCardinality::new(
             Fingerprint(777),
             CardinalityRecipeKind::Statistics,
@@ -289,6 +348,10 @@ mod tests {
             identity(&bindings[0].root, &input.memo, &state)
                 .unwrap()
                 .unwrap()
+        );
+        assert_ne!(
+            native,
+            native_identity(&mut input.memo, &state, input.root, &bindings[0].root)
         );
     }
 }

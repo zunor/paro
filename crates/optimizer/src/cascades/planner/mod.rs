@@ -3,6 +3,8 @@
 
 //! Construction of optimizer Query IR and Memo groups from bound plans.
 
+mod boundary;
+
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::sync::{Arc, RwLock};
 
@@ -1097,6 +1099,7 @@ impl MemoBuilder {
             expression_group_insertions: Vec::new(),
             metadata_runtime_filter_changes: Vec::new(),
             enumerated_join_regions: BTreeSet::new(),
+            boundary_cache: std::sync::Mutex::new(boundary::BoundaryFactCache::default()),
             join_region_insertions: Vec::new(),
             binder: planner_binder,
             bind_context: bind_context.clone(),

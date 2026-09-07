@@ -36,7 +36,8 @@ pub struct LogicalOutputLayout {
 }
 
 impl LogicalOutputLayout {
-    fn new(types: Vec<LogicalType>, bindings: Vec<ColumnBinding>) -> Self {
+    /// Construct an aligned local schema without consulting descendant plans.
+    pub fn new(types: Vec<LogicalType>, bindings: Vec<ColumnBinding>) -> Self {
         assert_eq!(
             types.len(),
             bindings.len(),
