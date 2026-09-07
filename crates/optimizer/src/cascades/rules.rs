@@ -270,12 +270,25 @@ impl PatternRead {
         let group_ref = memo
             .group(group)
             .ok_or_else(|| paro_error::internal("rule binding read an unknown group"))?;
+        // The semantic binding consumes the resolved estimate, not merely
+        // the local recipe. A row-preserving or CTE input can change without
+        // rewriting that recipe's list of group references.
+        let mut statistics = StableFingerprintBuilder::default();
+        statistics.write_fingerprint(group_ref.statistics_snapshot_fingerprint());
+        let range = memo.cardinality_envelope(group);
+        statistics.write_u64(range.is_some() as u64);
+        if let Some(range) = range {
+            statistics.write_u64(range.lower);
+            statistics.write_u64(range.expected_lower);
+            statistics.write_u64(range.expected_upper);
+            statistics.write_u64(range.upper);
+        }
         Ok(Self {
             group,
             logical_frontier_revision: reads_frontier
                 .then(|| group_ref.logical_expression_version()),
             logical_fact_fingerprint: group_ref.logical_fact_fingerprint(),
-            statistics_snapshot_fingerprint: group_ref.statistics_snapshot_fingerprint(),
+            statistics_snapshot_fingerprint: statistics.finish(),
         })
     }
 
@@ -410,6 +423,19 @@ impl<'a> TransformContext<'a> {
 
 pub trait TransformationRule: Send + Sync {
     fn id(&self) -> RuleId;
+
+    /// Evidence consumed when applying one exact binding. Discovery reads may
+    /// include unrelated alternatives; rules that consume only their bound
+    /// operands can narrow this to the operands' facts. The default retains
+    /// every discovery dependency for rules with additional Memo reads.
+    fn binding_reads(
+        &self,
+        _binding: &PatternBinding,
+        discovery_reads: &[PatternRead],
+        _ctx: &RuleContext<'_>,
+    ) -> Result<Box<[PatternRead]>> {
+        Ok(discovery_reads.into())
+    }
 
     /// Allocation-free dispatch predicate over the immutable expression
     /// shell. Implementations must not inspect child groups here: a false

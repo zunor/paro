@@ -1173,6 +1173,167 @@ fn saturated_transformation_cursor_invalidates_when_an_observed_frontier_advance
 }
 
 #[test]
+fn incremental_binding_applications_reuse_old_matches_but_refresh_changed_facts() {
+    use super::super::rules::PatternOperand;
+
+    struct CountBindings(Arc<AtomicUsize>);
+    impl TransformationRule for CountBindings {
+        fn id(&self) -> RuleId {
+            RuleId(903)
+        }
+        fn matches_root(&self, expr: &super::super::memo::LogicalExpr) -> bool {
+            expr.key.operator == Fingerprint(50)
+        }
+        fn matches(&self, expr: &super::super::memo::LogicalExpr, _: &RuleContext<'_>) -> bool {
+            self.matches_root(expr)
+        }
+        fn bindings(
+            &self,
+            expression: LogicalExprId,
+            ctx: &RuleContext<'_>,
+        ) -> Result<PatternBindingSet> {
+            let child = ctx.memo.logical_expr(expression).unwrap().key.children[0];
+            Ok(PatternBindingSet {
+                bindings: ctx
+                    .memo
+                    .group(child)
+                    .unwrap()
+                    .logical_exprs()
+                    .iter()
+                    .map(|alternative| PatternBinding {
+                        root: PatternOperand::Expression {
+                            group: ctx.group,
+                            expression,
+                            children: Box::new([PatternOperand::Expression {
+                                group: child,
+                                expression: *alternative,
+                                children: Box::new([]),
+                            }]),
+                        },
+                        // Deliberately collide: the fingerprint is only a bucket.
+                        fingerprint: Fingerprint(0),
+                    })
+                    .collect(),
+                reads: Box::new([
+                    PatternRead::from_group(ctx.memo, child)?,
+                    PatternRead::facts_from_group(ctx.memo, ctx.group)?,
+                ]),
+                work_units: 1,
+                work_dimension: BudgetDimension::RuleWorkPerGroup,
+                completion: PatternEnumerationCompletion::Complete,
+            })
+        }
+        fn binding_reads(
+            &self,
+            _: &PatternBinding,
+            reads: &[PatternRead],
+            ctx: &RuleContext<'_>,
+        ) -> Result<Box<[PatternRead]>> {
+            reads
+                .iter()
+                .map(|read| PatternRead::facts_from_group(ctx.memo, read.group))
+                .collect()
+        }
+        fn apply(
+            &self,
+            _: LogicalExprId,
+            _: &mut TransformContext<'_>,
+        ) -> Result<Box<[EquivalentExpression]>> {
+            self.0.fetch_add(1, Ordering::SeqCst);
+            Ok(Box::new([]))
+        }
+    }
+
+    let mut budget = super::super::budget::SearchBudget::default();
+    budget.disable_transformation(RuleId(5));
+    let (mut engine, root, _) = engine_with_budget(budget);
+    let child = engine.memo_mut().create_group(
+        schema(),
+        LogicalProperties::default(),
+        GroupCardinality::default(),
+    );
+    engine
+        .memo_mut()
+        .insert_logical(
+            child,
+            LogicalExprKey {
+                operator: Fingerprint(40),
+                scalars: Box::new([]),
+                children: Box::new([]),
+            },
+            LogicalPayloadId(40),
+            EquivalenceProof::Initial,
+        )
+        .unwrap();
+    engine
+        .memo_mut()
+        .insert_logical(
+            root,
+            LogicalExprKey {
+                operator: Fingerprint(50),
+                scalars: Box::new([]),
+                children: Box::new([child]),
+            },
+            LogicalPayloadId(50),
+            EquivalenceProof::Normalization { rule: RuleId(50) },
+        )
+        .unwrap();
+    let calls = Arc::new(AtomicUsize::new(0));
+    engine
+        .registry
+        .register_transformation(CountBindings(calls.clone()))
+        .unwrap();
+    engine.explore_transformations().unwrap();
+    assert_eq!(calls.load(Ordering::SeqCst), 1);
+
+    engine
+        .memo_mut()
+        .insert_logical(
+            child,
+            LogicalExprKey {
+                operator: Fingerprint(41),
+                scalars: Box::new([]),
+                children: Box::new([]),
+            },
+            LogicalPayloadId(41),
+            EquivalenceProof::Normalization { rule: RuleId(41) },
+        )
+        .unwrap();
+    engine.explore_transformations().unwrap();
+    assert_eq!(
+        calls.load(Ordering::SeqCst),
+        2,
+        "only the new binding runs, even with colliding fingerprints"
+    );
+
+    engine.memo_mut().group_mut(child).unwrap().cardinality = GroupCardinality::new(
+        Fingerprint(991),
+        super::super::memo::CardinalityRecipeKind::Statistics,
+        1,
+        4,
+        9,
+    );
+    engine.explore_transformations().unwrap();
+    assert_eq!(
+        calls.load(Ordering::SeqCst),
+        4,
+        "new child facts invalidate both applications"
+    );
+    engine
+        .memo_mut()
+        .group_mut(root)
+        .unwrap()
+        .logical_properties
+        .maximum_cardinality = Some(100);
+    engine.explore_transformations().unwrap();
+    assert_eq!(
+        calls.load(Ordering::SeqCst),
+        6,
+        "root facts are application dependencies too"
+    );
+}
+
+#[test]
 fn failed_optional_transformation_rolls_back_and_keeps_baseline() {
     let mut budget = super::super::budget::SearchBudget::default();
     budget.disable_transformation(RuleId(5));

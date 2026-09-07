@@ -155,6 +155,11 @@ impl EnforcerCostInput {
     }
 }
 
+type BindingApplications = BTreeMap<
+    (TransformationTaskId, Fingerprint),
+    Vec<(super::rules::PatternBinding, Box<[PatternRead]>)>,
+>;
+
 /// The engine is deliberately operator-agnostic. Domain implementations live
 /// in the registry; this type owns stable scheduling, budgets, enforcement,
 /// recursive goal optimization, and winner verification.
@@ -175,6 +180,9 @@ pub struct CascadesEngine {
     /// A task that declined a match is recorded as well: a later child
     /// alternative may make that same pattern applicable.
     transformation_observations: BTreeMap<TransformationTaskId, Box<[PatternRead]>>,
+    /// Collision-safe exact bindings already evaluated under these facts.
+    /// Discovery can wake a task without invalidating its earlier bindings.
+    transformation_applications: BindingApplications,
     /// Reverse index for incrementally closing transformation dependencies.
     /// Subscribers are woken only after a Memo transaction commits.
     transformation_subscribers: BTreeMap<GroupId, BTreeSet<TransformationTaskId>>,
@@ -200,6 +208,7 @@ impl CascadesEngine {
             rule_attempts: BTreeMap::new(),
             effective_rule_insertions: BTreeMap::new(),
             transformation_observations: BTreeMap::new(),
+            transformation_applications: BTreeMap::new(),
             transformation_subscribers: BTreeMap::new(),
             region_candidates: BTreeMap::new(),
         }
@@ -493,6 +502,49 @@ impl CascadesEngine {
                 continue;
             }
             for binding in binding_set.bindings.iter() {
+                let application_key = (task_id, binding.fingerprint);
+                let mut already_applied = false;
+                if let Some(applications) = self.transformation_applications.get(&application_key) {
+                    for (previous, reads) in applications {
+                        if previous != binding {
+                            continue;
+                        }
+                        let mut current = true;
+                        for read in reads {
+                            if !read.is_current(&self.memo)? {
+                                current = false;
+                                break;
+                            }
+                        }
+                        if current {
+                            already_applied = true;
+                            break;
+                        }
+                    }
+                }
+                if already_applied {
+                    continue;
+                }
+                // Keep one current observation per exact binding, including
+                // hash-collision peers. Obsolete fact versions are not search
+                // candidates and must not accumulate on repeated wake-ups.
+                if let Some(applications) =
+                    self.transformation_applications.get_mut(&application_key)
+                {
+                    applications.retain(|(previous, _)| previous != binding);
+                }
+                let application_reads = self
+                    .registry
+                    .transformation(rule)
+                    .ok_or_else(|| paro_error::internal("transformation disappeared"))?
+                    .binding_reads(
+                        binding,
+                        &binding_set.reads,
+                        &RuleContext {
+                            memo: &self.memo,
+                            group,
+                        },
+                    )?;
                 let dependency_version =
                     transformation_binding_fingerprint(read_version, binding.fingerprint);
                 // `applied_rules` remains an audit of whether this rule has ever
@@ -583,6 +635,10 @@ impl CascadesEngine {
                 };
                 if outputs.is_empty() {
                     context.rollback()?;
+                    self.transformation_applications
+                        .entry(application_key)
+                        .or_default()
+                        .push((binding.clone(), application_reads));
                     release_transformation_output_reservations(
                         &mut self.memo,
                         group,
@@ -760,6 +816,10 @@ impl CascadesEngine {
                     }
                     inserted_groups.extend(appended_groups);
                 }
+                self.transformation_applications
+                    .entry(application_key)
+                    .or_default()
+                    .push((binding.clone(), application_reads));
                 for target in inserted_groups {
                     self.schedule_transformations(target, &mut agenda)?;
                     self.schedule_transformation_dependents(target, &mut agenda)?;
