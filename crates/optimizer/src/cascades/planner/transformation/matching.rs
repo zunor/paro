@@ -731,6 +731,8 @@ enum PatternScope {
     RowIdPath,
     SubsumptionAggregate,
     SubsumptionInput,
+    ScalarAggregatePath,
+    OuterJoinPath,
 }
 
 impl PatternScope {
@@ -739,6 +741,9 @@ impl PatternScope {
         let repeat = |scope| Some(vec![scope; arity]);
         match self {
             Self::Subtree => repeat(Self::Subtree),
+            Self::ScalarAggregatePath | Self::OuterJoinPath => {
+                unreachable!("witness paths choose child scopes from Memo facts")
+            }
             Self::Hole => unreachable!("group holes do not inspect operators"),
             Self::Shell => repeat(Self::Hole),
             Self::SubsumptionAggregate => matches!(operator, LogicalOperator::Aggregate(_)).then(|| vec![Self::SubsumptionInput]),
@@ -840,6 +845,9 @@ pub(super) fn scoped_pattern_bindings(
         PlannerTransformation::AggregateDimensionDeferral
         | PlannerTransformation::AggregateInputMaterialization => PatternScope::AggregateRegion,
         PlannerTransformation::MarkJoinToSemi => PatternScope::MarkConsumer,
+        PlannerTransformation::AggregatePostReduction
+        | PlannerTransformation::ScalarAggregateWindow => PatternScope::ScalarAggregatePath,
+        PlannerTransformation::JoinElimination => PatternScope::OuterJoinPath,
         _ => PatternScope::Subtree,
     };
     let witness = match transformation {
@@ -863,7 +871,7 @@ pub(super) fn scoped_pattern_bindings(
     )
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 enum PatternWitness {
     ScalarAggregate,
     OuterJoin,
@@ -909,6 +917,7 @@ fn enumerate_pattern_bindings(
         limit: usize,
         work_units: usize,
         reads: BTreeMap<GroupId, PatternRead>,
+        witness_groups: BTreeMap<(GroupId, PatternWitness), bool>,
         limited: bool,
         cancellation: Option<&'a paro_context::StatementCancellation>,
     }
@@ -959,6 +968,36 @@ fn enumerate_pattern_bindings(
                         );
                     }
                 }
+            }
+            Ok(false)
+        }
+
+        fn group_contains_witness(
+            &mut self,
+            group: GroupId,
+            witness: PatternWitness,
+        ) -> Result<bool> {
+            let group = self.memo.canonical_group(group);
+            if let Some(matches) = self.witness_groups.get(&(group, witness)) {
+                return Ok(*matches);
+            }
+            if !self.observe(group)? {
+                return Ok(false);
+            }
+            let expressions = self
+                .memo
+                .group(group)
+                .ok_or_else(|| paro_error::internal("pattern witness lost group"))?
+                .logical_exprs()
+                .to_vec();
+            for expression in expressions {
+                if self.contains_witness(expression, witness)? {
+                    self.witness_groups.insert((group, witness), true);
+                    return Ok(true);
+                }
+            }
+            if !self.limited {
+                self.witness_groups.insert((group, witness), false);
             }
             Ok(false)
         }
@@ -1090,68 +1129,95 @@ fn enumerate_pattern_bindings(
                     .ok_or_else(|| paro_error::internal("scoped pattern has no operator shell"))?
                     .semantic_template
                     .operator;
-                if matches!(scope, PatternScope::JoinRegion)
-                    && !matches!(
-                        operator,
-                        LogicalOperator::Get(_) | LogicalOperator::Filter(_)
-                    )
-                    && !matches!(operator, LogicalOperator::Join(join) if crate::join_order::relation_manager::RelationManager::join_is_reorderable(join)
-                        || matches!(join, Join::Comparison(join) if crate::join_order::relation_manager::RelationManager::reduction_join_is_reorderable(join)))
-                {
-                    if active.len() == 1 {
-                        return Ok(Vec::new());
-                    }
-                    if !self.observe_facts(group)? || !self.admit_work(1)? {
-                        return Ok(Vec::new());
-                    }
-                    let mut fingerprint = StableFingerprintBuilder::default();
-                    fingerprint.write_bytes(b"paro.pattern.join-atom.v1");
-                    fingerprint.write_u64(group.0 as u64);
-                    return Ok(vec![(PatternOperand::Group(group), fingerprint.finish())]);
-                }
-                if matches!(scope, PatternScope::SubsumptionInput)
-                    && !matches!(
-                        operator,
-                        LogicalOperator::Get(_)
-                            | LogicalOperator::Filter(_)
-                            | LogicalOperator::Projection(_)
-                            | LogicalOperator::Aggregate(_)
-                            | LogicalOperator::Join(Join::Comparison(_))
-                    )
-                {
-                    if !self.observe_facts(group)? || !self.admit_work(1)? {
-                        return Ok(Vec::new());
-                    }
-                    let mut fingerprint = StableFingerprintBuilder::default();
-                    fingerprint.write_bytes(b"paro.pattern.subsumption-input-hole.v1");
-                    fingerprint.write_u64(group.0 as u64);
-                    return Ok(vec![(PatternOperand::Group(group), fingerprint.finish())]);
-                }
-                // TopN implementation matching consumes its local search
-                // access path too, not just the ordering shell. Other inputs
-                // remain opaque rather than expanding unrelated join trees.
-                if matches!(scope, PatternScope::SearchInput)
-                    && !matches!(
-                        operator,
-                        LogicalOperator::Projection(_)
-                            | LogicalOperator::Filter(_)
-                            | LogicalOperator::Get(_)
-                            | LogicalOperator::SearchScan(_)
-                            | LogicalOperator::FullTextFilterScan(_)
-                    )
-                {
-                    if !self.observe_facts(group)? || !self.admit_work(1)? {
-                        return Ok(Vec::new());
-                    }
-                    let mut fingerprint = StableFingerprintBuilder::default();
-                    fingerprint.write_bytes(b"paro.pattern.search-input-hole.v1");
-                    fingerprint.write_u64(group.0 as u64);
-                    return Ok(vec![(PatternOperand::Group(group), fingerprint.finish())]);
-                }
-                let Some(scopes) = scope.children(operator) else {
-                    return Ok(Vec::new());
+                let path_witness = match scope {
+                    PatternScope::ScalarAggregatePath => Some(PatternWitness::ScalarAggregate),
+                    PatternScope::OuterJoinPath => Some(PatternWitness::OuterJoin),
+                    _ => None,
                 };
-                scopes
+                if let Some(witness) = path_witness {
+                    if witness.matches(operator) {
+                        vec![PatternScope::Hole; logical.key.children.len()]
+                    } else {
+                        let children = logical.key.children.to_vec();
+                        let mut scopes = Vec::with_capacity(children.len());
+                        let mut found = false;
+                        for child in children {
+                            if self.group_contains_witness(child, witness)? {
+                                scopes.push(scope);
+                                found = true;
+                            } else {
+                                scopes.push(PatternScope::Hole);
+                            }
+                        }
+                        if !found {
+                            return Ok(Vec::new());
+                        }
+                        scopes
+                    }
+                } else {
+                    if matches!(scope, PatternScope::JoinRegion)
+                        && !matches!(
+                            operator,
+                            LogicalOperator::Get(_) | LogicalOperator::Filter(_)
+                        )
+                        && !matches!(operator, LogicalOperator::Join(join) if crate::join_order::relation_manager::RelationManager::join_is_reorderable(join)
+                        || matches!(join, Join::Comparison(join) if crate::join_order::relation_manager::RelationManager::reduction_join_is_reorderable(join)))
+                    {
+                        if active.len() == 1 {
+                            return Ok(Vec::new());
+                        }
+                        if !self.observe_facts(group)? || !self.admit_work(1)? {
+                            return Ok(Vec::new());
+                        }
+                        let mut fingerprint = StableFingerprintBuilder::default();
+                        fingerprint.write_bytes(b"paro.pattern.join-atom.v1");
+                        fingerprint.write_u64(group.0 as u64);
+                        return Ok(vec![(PatternOperand::Group(group), fingerprint.finish())]);
+                    }
+                    if matches!(scope, PatternScope::SubsumptionInput)
+                        && !matches!(
+                            operator,
+                            LogicalOperator::Get(_)
+                                | LogicalOperator::Filter(_)
+                                | LogicalOperator::Projection(_)
+                                | LogicalOperator::Aggregate(_)
+                                | LogicalOperator::Join(Join::Comparison(_))
+                        )
+                    {
+                        if !self.observe_facts(group)? || !self.admit_work(1)? {
+                            return Ok(Vec::new());
+                        }
+                        let mut fingerprint = StableFingerprintBuilder::default();
+                        fingerprint.write_bytes(b"paro.pattern.subsumption-input-hole.v1");
+                        fingerprint.write_u64(group.0 as u64);
+                        return Ok(vec![(PatternOperand::Group(group), fingerprint.finish())]);
+                    }
+                    // TopN implementation matching consumes its local search
+                    // access path too, not just the ordering shell. Other inputs
+                    // remain opaque rather than expanding unrelated join trees.
+                    if matches!(scope, PatternScope::SearchInput)
+                        && !matches!(
+                            operator,
+                            LogicalOperator::Projection(_)
+                                | LogicalOperator::Filter(_)
+                                | LogicalOperator::Get(_)
+                                | LogicalOperator::SearchScan(_)
+                                | LogicalOperator::FullTextFilterScan(_)
+                        )
+                    {
+                        if !self.observe_facts(group)? || !self.admit_work(1)? {
+                            return Ok(Vec::new());
+                        }
+                        let mut fingerprint = StableFingerprintBuilder::default();
+                        fingerprint.write_bytes(b"paro.pattern.search-input-hole.v1");
+                        fingerprint.write_u64(group.0 as u64);
+                        return Ok(vec![(PatternOperand::Group(group), fingerprint.finish())]);
+                    }
+                    let Some(scopes) = scope.children(operator) else {
+                        return Ok(Vec::new());
+                    };
+                    scopes
+                }
             };
             let mut combinations: Vec<Vec<(PatternOperand, Fingerprint)>> = vec![Vec::new()];
             for (child, scope) in logical.key.children.iter().copied().zip(child_scopes) {
@@ -1236,6 +1302,7 @@ fn enumerate_pattern_bindings(
         limit,
         work_units: 0,
         reads: BTreeMap::new(),
+        witness_groups: BTreeMap::new(),
         limited: false,
         cancellation,
     };
@@ -1255,7 +1322,12 @@ fn enumerate_pattern_bindings(
             },
         });
     }
+    let path_scoped = matches!(
+        scope,
+        PatternScope::ScalarAggregatePath | PatternScope::OuterJoinPath
+    );
     let can_match = match witness {
+        Some(_) if path_scoped => true,
         Some(witness) => enumerator.contains_witness(root_expression, witness)?,
         None => true,
     };
