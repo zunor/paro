@@ -37,6 +37,10 @@ pub struct DistinctStatistics {
     log: HyperLogLog,
     /// How many non-NULL values have been observed.
     total_count: usize,
+    /// Cached sketch estimate. Statistics are read many times while one Memo
+    /// is explored but mutate only at storage-maintenance boundaries; paying
+    /// the register scan on every planner read reverses that ownership model.
+    raw_count: usize,
 }
 
 impl DistinctStatistics {
@@ -45,6 +49,7 @@ impl DistinctStatistics {
         Self {
             log: HyperLogLog::new(),
             total_count: 0,
+            raw_count: 0,
         }
     }
 
@@ -54,7 +59,12 @@ impl DistinctStatistics {
     /// * `log` - Existing HyperLogLog
     /// * `total_count` - Total number of observed non-NULL values
     pub fn with_data(log: HyperLogLog, total_count: usize) -> Self {
-        Self { log, total_count }
+        let raw_count = log.count();
+        Self {
+            log,
+            total_count,
+            raw_count,
+        }
     }
 
     /// Merge another DistinctStatistics into this one.
@@ -63,6 +73,7 @@ impl DistinctStatistics {
     pub fn merge(&mut self, other: &DistinctStatistics) {
         self.log.merge(&other.log);
         self.total_count = self.total_count.saturating_add(other.total_count);
+        self.raw_count = self.log.count();
     }
 
     /// Create a copy of this DistinctStatistics.
@@ -70,6 +81,7 @@ impl DistinctStatistics {
         Self {
             log: self.log.copy(),
             total_count: self.total_count,
+            raw_count: self.raw_count,
         }
     }
 
@@ -86,6 +98,9 @@ impl DistinctStatistics {
         for &hash in hashes.iter().take(actual_count) {
             self.log.insert_element(hash);
         }
+        if actual_count != 0 {
+            self.raw_count = self.log.count();
+        }
     }
 
     /// Get the estimated distinct count.
@@ -95,12 +110,12 @@ impl DistinctStatistics {
         if self.total_count == 0 {
             return 0;
         }
-        self.log.count().min(self.total_count)
+        self.raw_count.min(self.total_count)
     }
 
     /// Get the raw HLL count without extrapolation.
     pub fn get_raw_count(&self) -> usize {
-        self.log.count()
+        self.raw_count
     }
 
     /// Get the total count.
@@ -137,6 +152,7 @@ impl DistinctStatistics {
     pub fn clear(&mut self) {
         self.log.clear();
         self.total_count = 0;
+        self.raw_count = 0;
     }
 
     /// Serialize the DistinctStatistics to a writer.
