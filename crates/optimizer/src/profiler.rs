@@ -62,6 +62,9 @@ pub struct OptimizerProfiler {
     entries: BTreeMap<OptimizerComponent, OptimizerTimingEntry>,
     rule_attempts: BTreeMap<RuleId, u64>,
     rule_insertions: BTreeMap<RuleId, u64>,
+    rule_elapsed: BTreeMap<RuleId, Duration>,
+    rule_allocated_bytes: BTreeMap<RuleId, u64>,
+    rule_budget_exhaustions: BTreeMap<RuleId, u64>,
     counters: BTreeMap<String, u64>,
 }
 
@@ -77,6 +80,9 @@ pub struct OptimizerProfileSnapshot {
     pub entries: Vec<OptimizerProfileSnapshotEntry>,
     pub rule_attempts: BTreeMap<RuleId, u64>,
     pub rule_insertions: BTreeMap<RuleId, u64>,
+    pub rule_elapsed: BTreeMap<RuleId, Duration>,
+    pub rule_allocated_bytes: BTreeMap<RuleId, u64>,
+    pub rule_budget_exhaustions: BTreeMap<RuleId, u64>,
     pub counters: BTreeMap<String, u64>,
 }
 
@@ -86,6 +92,17 @@ impl OptimizerProfiler {
         let entry = self.entries.entry(component).or_default();
         entry.last_elapsed = elapsed;
         entry.invocation_count = entry.invocation_count.saturating_add(1);
+    }
+
+    pub fn record_component_allocation(
+        &mut self,
+        component: OptimizerComponent,
+        allocated_bytes: u64,
+    ) {
+        self.counters.insert(
+            format!("allocation_bytes_{}", component.name()),
+            allocated_bytes,
+        );
     }
 
     pub fn snapshot(&self) -> OptimizerProfileSnapshot {
@@ -102,6 +119,9 @@ impl OptimizerProfiler {
                 })
                 .collect(),
             rule_insertions: self.rule_insertions.clone(),
+            rule_elapsed: self.rule_elapsed.clone(),
+            rule_allocated_bytes: self.rule_allocated_bytes.clone(),
+            rule_budget_exhaustions: self.rule_budget_exhaustions.clone(),
             rule_attempts: self.rule_attempts.clone(),
             counters: self.counters.clone(),
         }
@@ -113,6 +133,18 @@ impl OptimizerProfiler {
 
     pub fn record_rule_attempts(&mut self, attempts: BTreeMap<RuleId, u64>) {
         self.rule_attempts = attempts;
+    }
+
+    pub fn record_rule_elapsed(&mut self, elapsed: BTreeMap<RuleId, Duration>) {
+        self.rule_elapsed = elapsed;
+    }
+
+    pub fn record_rule_allocated_bytes(&mut self, allocated: BTreeMap<RuleId, u64>) {
+        self.rule_allocated_bytes = allocated;
+    }
+
+    pub fn record_rule_budget_exhaustions(&mut self, exhausted: BTreeMap<RuleId, u64>) {
+        self.rule_budget_exhaustions = exhausted;
     }
 
     pub fn record_search_summary(&mut self, summary: &crate::cascades::SearchSummary) {
@@ -156,13 +188,45 @@ pub fn publish_optimizer_profile_snapshot(
             invocation_count: entry.invocation_count.min(i64::MAX as u64) as i64,
         })
         .collect::<Vec<_>>();
+    let rule_elapsed = snapshot.rule_elapsed;
+    entries.extend(
+        snapshot
+            .rule_allocated_bytes
+            .into_iter()
+            .map(|(rule, bytes)| OptimizerDiagnostic {
+                name: crate::cascades::rules::transformation_rule_name(rule)
+                    .map(|name| format!("allocation_bytes_{name}"))
+                    .unwrap_or_else(|| format!("allocation_bytes_unknown_rule_{}", rule.0)),
+                kind: "search_counter".to_string(),
+                last_elapsed_us: 0,
+                invocation_count: bytes.min(i64::MAX as u64) as i64,
+            }),
+    );
+    entries.extend(
+        snapshot
+            .rule_budget_exhaustions
+            .into_iter()
+            .map(|(rule, count)| OptimizerDiagnostic {
+                name: crate::cascades::rules::transformation_rule_name(rule)
+                    .map(|name| format!("budget_exhaustion_{name}"))
+                    .unwrap_or_else(|| format!("budget_exhaustion_unknown_rule_{}", rule.0)),
+                kind: "search_counter".to_string(),
+                last_elapsed_us: 0,
+                invocation_count: count.min(i64::MAX as u64) as i64,
+            }),
+    );
     entries.extend(snapshot.rule_insertions.into_iter().map(|(rule, count)| {
         OptimizerDiagnostic {
             name: crate::cascades::rules::transformation_rule_name(rule)
                 .map(str::to_string)
                 .unwrap_or_else(|| format!("unknown_rule_{}", rule.0)),
             kind: "transformation_rule".to_string(),
-            last_elapsed_us: 0,
+            last_elapsed_us: rule_elapsed
+                .get(&rule)
+                .copied()
+                .unwrap_or_default()
+                .as_micros()
+                .min(i64::MAX as u128) as i64,
             invocation_count: count.min(i64::MAX as u64) as i64,
         }
     }));
@@ -172,7 +236,12 @@ pub fn publish_optimizer_profile_snapshot(
                 .map(str::to_string)
                 .unwrap_or_else(|| format!("unknown_rule_{}", rule.0)),
             kind: "transformation_rule_attempt".to_string(),
-            last_elapsed_us: 0,
+            last_elapsed_us: rule_elapsed
+                .get(&rule)
+                .copied()
+                .unwrap_or_default()
+                .as_micros()
+                .min(i64::MAX as u128) as i64,
             invocation_count: count.min(i64::MAX as u64) as i64,
         }
     }));
@@ -230,6 +299,40 @@ mod tests {
         assert_eq!(
             snapshot.counters.get("transformation_binding_count"),
             Some(&7)
+        );
+    }
+
+    #[test]
+    fn rule_elapsed_is_preserved_independently_of_attempt_and_insertion_counts() {
+        let rule = RuleId(91);
+        let mut profiler = OptimizerProfiler::default();
+        profiler.record_rule_attempts(BTreeMap::from([(rule, 7)]));
+        profiler.record_rule_insertions(BTreeMap::from([(rule, 2)]));
+        profiler.record_rule_elapsed(BTreeMap::from([(rule, Duration::from_micros(37))]));
+        profiler.record_rule_allocated_bytes(BTreeMap::from([(rule, 8192)]));
+        profiler.record_rule_budget_exhaustions(BTreeMap::from([(rule, 3)]));
+
+        let snapshot = profiler.snapshot();
+        assert_eq!(snapshot.rule_attempts.get(&rule), Some(&7));
+        assert_eq!(snapshot.rule_insertions.get(&rule), Some(&2));
+        assert_eq!(
+            snapshot.rule_elapsed.get(&rule),
+            Some(&Duration::from_micros(37))
+        );
+        assert_eq!(snapshot.rule_allocated_bytes.get(&rule), Some(&8192));
+        assert_eq!(snapshot.rule_budget_exhaustions.get(&rule), Some(&3));
+    }
+
+    #[test]
+    fn component_allocation_is_published_as_a_search_counter() {
+        let mut profiler = OptimizerProfiler::default();
+        profiler.record_component_allocation(OptimizerComponent::MemoExploration, 4096);
+        assert_eq!(
+            profiler
+                .snapshot()
+                .counters
+                .get("allocation_bytes_memo_exploration"),
+            Some(&4096)
         );
     }
 }

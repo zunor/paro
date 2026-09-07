@@ -380,6 +380,9 @@ impl OptimizationInput {
         }
         let rule_insertions = engine.effective_rule_insertions().clone();
         let rule_attempts = engine.rule_attempts().clone();
+        let rule_elapsed = engine.rule_elapsed().clone();
+        let rule_allocated_bytes = engine.rule_allocated_bytes().clone();
+        let rule_budget_exhaustions = engine.rule_budget_exhaustions().clone();
         let search_summary = SearchSummary {
             groups: u64::try_from(engine.memo().canonical_group_count()).unwrap_or(u64::MAX),
             logical_expressions: u64::try_from(engine.memo().logical_expr_count())
@@ -393,6 +396,9 @@ impl OptimizationInput {
             variants: variants.into_boxed_slice(),
             rule_attempts,
             rule_insertions,
+            rule_elapsed,
+            rule_allocated_bytes,
+            rule_budget_exhaustions,
             search_summary,
         })
     }
@@ -408,6 +414,10 @@ pub struct OptimizationOutput {
     /// each transformation. Matching, scheduling, and duplicate replay do not
     /// count as an effect.
     pub rule_insertions: BTreeMap<RuleId, u64>,
+    /// Binding construction plus rule application time, aggregated by rule.
+    pub rule_elapsed: BTreeMap<RuleId, std::time::Duration>,
+    pub rule_allocated_bytes: BTreeMap<RuleId, u64>,
+    pub rule_budget_exhaustions: BTreeMap<RuleId, u64>,
     pub search_summary: SearchSummary,
 }
 

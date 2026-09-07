@@ -156,6 +156,10 @@ impl Optimizer {
     }
 
     pub fn optimize(&mut self, plan: LogicalPlan) -> Result<OptimizedStatement> {
+        // Allocation attribution is a planning concern. The global allocator
+        // remains installed for observation, while counter updates are scoped
+        // to this synchronous compiler operation so execution pays no tax.
+        let _allocation_metrics = paro_common::allocator::begin_allocation_metrics();
         self.budget.disable_transformations_by_name(
             self.ctx.session.settings.disabled_optimizer_rules(),
         )?;
@@ -187,6 +191,7 @@ impl Optimizer {
         let observes_optimizer_diagnostics = observes_optimizer_diagnostics(&query);
         let explain = statement.explain;
         let phase_started = Instant::now();
+        let phase_allocated = paro_common::allocator::thread_allocated_bytes();
         let graph_plans = enumerate_graph_region_plans(
             query,
             &self.binder.bind_context,
@@ -324,7 +329,12 @@ impl Optimizer {
             OptimizerComponent::SemanticNormalization,
             phase_started.elapsed(),
         );
+        self.ctx.profiler.record_component_allocation(
+            OptimizerComponent::SemanticNormalization,
+            paro_common::allocator::allocated_bytes_since(phase_allocated),
+        );
         let phase_started = Instant::now();
+        let phase_allocated = paro_common::allocator::thread_allocated_bytes();
         for alternative in &alternatives {
             verify_physical_planner_invariants(&alternative.plan.operator)?;
         }
@@ -349,8 +359,13 @@ impl Optimizer {
             OptimizerComponent::QueryIrConstruction,
             phase_started.elapsed(),
         );
+        self.ctx.profiler.record_component_allocation(
+            OptimizerComponent::QueryIrConstruction,
+            paro_common::allocator::allocated_bytes_since(phase_allocated),
+        );
         let mode = input.mode;
         let phase_started = Instant::now();
+        let phase_allocated = paro_common::allocator::thread_allocated_bytes();
         let extraction = input.optimize(&grant_classes)?;
         self.ctx
             .profiler
@@ -358,6 +373,15 @@ impl Optimizer {
         self.ctx
             .profiler
             .record_rule_insertions(extraction.rule_insertions.clone());
+        self.ctx
+            .profiler
+            .record_rule_elapsed(extraction.rule_elapsed.clone());
+        self.ctx
+            .profiler
+            .record_rule_allocated_bytes(extraction.rule_allocated_bytes.clone());
+        self.ctx
+            .profiler
+            .record_rule_budget_exhaustions(extraction.rule_budget_exhaustions.clone());
         self.ctx
             .profiler
             .record_search_summary(&extraction.search_summary);
@@ -368,7 +392,15 @@ impl Optimizer {
             },
             phase_started.elapsed(),
         );
+        self.ctx.profiler.record_component_allocation(
+            match mode {
+                crate::cascades::SearchMode::Direct => OptimizerComponent::DirectPhysicalSearch,
+                crate::cascades::SearchMode::Memo => OptimizerComponent::MemoExploration,
+            },
+            paro_common::allocator::allocated_bytes_since(phase_allocated),
+        );
         let phase_started = Instant::now();
+        let phase_allocated = paro_common::allocator::thread_allocated_bytes();
         for variant in &extraction.variants {
             verify_physical_planner_invariants(&variant.plan.operator)?;
         }
@@ -376,7 +408,12 @@ impl Optimizer {
             OptimizerComponent::WinnerVerification,
             phase_started.elapsed(),
         );
+        self.ctx.profiler.record_component_allocation(
+            OptimizerComponent::WinnerVerification,
+            paro_common::allocator::allocated_bytes_since(phase_allocated),
+        );
         let phase_started = Instant::now();
+        let phase_allocated = paro_common::allocator::thread_allocated_bytes();
         let mut variants = extraction.variants.into_vec();
         for variant in &mut variants {
             self.attach_statement_layer(variant, &statement_layer)?;
@@ -401,6 +438,10 @@ impl Optimizer {
         self.ctx.profiler.record(
             OptimizerComponent::PhysicalExtraction,
             phase_started.elapsed(),
+        );
+        self.ctx.profiler.record_component_allocation(
+            OptimizerComponent::PhysicalExtraction,
+            paro_common::allocator::allocated_bytes_since(phase_allocated),
         );
         if !observes_optimizer_diagnostics {
             publish_optimizer_profile_snapshot(

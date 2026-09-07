@@ -4,6 +4,7 @@
 //! Deterministic mandatory-baseline plus bounded optional Cascades search.
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::time::{Duration, Instant};
 
 use paro_common::error::{self as paro_error, Result};
 
@@ -179,6 +180,9 @@ pub struct CascadesEngine {
     grant_sensitivity: BTreeMap<GroupId, GrantSensitivitySummary>,
     rule_attempts: BTreeMap<RuleId, u64>,
     effective_rule_insertions: BTreeMap<RuleId, u64>,
+    rule_elapsed: BTreeMap<RuleId, Duration>,
+    rule_allocated_bytes: BTreeMap<RuleId, u64>,
+    rule_budget_exhaustions: BTreeMap<RuleId, u64>,
     transformation_bindings: u64,
     fact_value_revalidation_hits: u64,
     fact_value_revalidation_misses: u64,
@@ -214,6 +218,9 @@ impl CascadesEngine {
             grant_sensitivity: BTreeMap::new(),
             rule_attempts: BTreeMap::new(),
             effective_rule_insertions: BTreeMap::new(),
+            rule_elapsed: BTreeMap::new(),
+            rule_allocated_bytes: BTreeMap::new(),
+            rule_budget_exhaustions: BTreeMap::new(),
             transformation_bindings: 0,
             fact_value_revalidation_hits: 0,
             fact_value_revalidation_misses: 0,
@@ -447,6 +454,8 @@ impl CascadesEngine {
             if self.transformation_observation_is_current(task_id)? {
                 continue;
             }
+            let binding_started = Instant::now();
+            let binding_allocated = paro_common::allocator::thread_allocated_bytes();
             let mut binding_set = {
                 let rule_impl = self
                     .registry
@@ -458,6 +467,10 @@ impl CascadesEngine {
                 };
                 rule_impl.bindings(expression, &context)?
             };
+            *self.rule_elapsed.entry(rule).or_default() += binding_started.elapsed();
+            let allocated = paro_common::allocator::allocated_bytes_since(binding_allocated);
+            let accumulated = self.rule_allocated_bytes.entry(rule).or_default();
+            *accumulated = accumulated.saturating_add(allocated);
             if let Some(previous) = self.transformation_fact_observations.get(&task_id) {
                 let mut reads = binding_set.reads.into_vec();
                 for read in previous {
@@ -485,6 +498,7 @@ impl CascadesEngine {
                 omitted_at_least,
             } = binding_set.completion
             {
+                *self.rule_budget_exhaustions.entry(rule).or_default() += 1;
                 let mut witness = StableFingerprintBuilder::default();
                 witness.write_bytes(b"paro.pattern-enumeration-limited.v1");
                 witness.write_u64(group.0 as u64);
@@ -513,6 +527,7 @@ impl CascadesEngine {
                 binding_set.work_units,
                 binding_set.work_dimension,
             )? {
+                *self.rule_budget_exhaustions.entry(rule).or_default() += 1;
                 continue;
             }
             if binding_set.bindings.is_empty() {
@@ -638,6 +653,7 @@ impl CascadesEngine {
                     .ledger
                     .admit_optional(fire_dimension, event);
                 if admitted == BudgetDecision::Exhausted {
+                    *self.rule_budget_exhaustions.entry(rule).or_default() += 1;
                     continue;
                 }
                 // Reserve the complete bounded frontier before the rule may append
@@ -658,6 +674,7 @@ impl CascadesEngine {
                     rule_impl.output_bound(&context)
                 };
                 let mut output_events = Vec::with_capacity(output_bound);
+                let mut output_budget_limited = false;
                 for ordinal in 0..output_bound {
                     let event = transformation_output_event(
                         group,
@@ -673,9 +690,13 @@ impl CascadesEngine {
                         .ledger
                         .admit_optional(output_dimension, event);
                     if admitted == BudgetDecision::Exhausted {
+                        output_budget_limited = true;
                         break;
                     }
                     output_events.push(event);
+                }
+                if output_budget_limited {
+                    *self.rule_budget_exhaustions.entry(rule).or_default() += 1;
                 }
                 if output_events.is_empty() {
                     continue;
@@ -685,6 +706,8 @@ impl CascadesEngine {
                 // lazy, and rule-specific side state enlists in the same rollback
                 // domain before its first write.
                 let mut context = TransformContext::new(&mut self.memo, group);
+                let apply_started = Instant::now();
+                let apply_allocated = paro_common::allocator::thread_allocated_bytes();
                 let outputs_result = {
                     let rule_impl = self
                         .registry
@@ -692,6 +715,10 @@ impl CascadesEngine {
                         .ok_or_else(|| paro_error::internal("rule disappeared from registry"))?;
                     rule_impl.apply_binding(binding, &mut context)
                 };
+                *self.rule_elapsed.entry(rule).or_default() += apply_started.elapsed();
+                let allocated = paro_common::allocator::allocated_bytes_since(apply_allocated);
+                let accumulated = self.rule_allocated_bytes.entry(rule).or_default();
+                *accumulated = accumulated.saturating_add(allocated);
                 let fact_value = context.fact_value_fingerprint();
                 let fact_reads = context.take_fact_reads();
                 application_reads.extend(fact_reads.iter().copied());
@@ -947,6 +974,18 @@ impl CascadesEngine {
 
     pub fn rule_attempts(&self) -> &BTreeMap<RuleId, u64> {
         &self.rule_attempts
+    }
+
+    pub fn rule_elapsed(&self) -> &BTreeMap<RuleId, Duration> {
+        &self.rule_elapsed
+    }
+
+    pub fn rule_allocated_bytes(&self) -> &BTreeMap<RuleId, u64> {
+        &self.rule_allocated_bytes
+    }
+
+    pub fn rule_budget_exhaustions(&self) -> &BTreeMap<RuleId, u64> {
+        &self.rule_budget_exhaustions
     }
 
     pub fn search_work_counters(&self) -> BTreeMap<&'static str, u64> {

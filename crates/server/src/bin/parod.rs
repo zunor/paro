@@ -12,6 +12,10 @@ use std::sync::Arc;
 use std::time::Duration;
 use tokio::runtime::Builder;
 
+#[global_allocator]
+static GLOBAL_ALLOCATOR: paro_common::allocator::MetricsSystemAllocator =
+    paro_common::allocator::MetricsSystemAllocator;
+
 const DEFAULT_PAROD_WORKER_STACK_SIZE: usize = 32 * 1024 * 1024;
 const MIN_PAROD_WORKER_STACK_SIZE: usize = 1024 * 1024;
 const PAROD_SHUTDOWN_GRACE_PERIOD: Duration = Duration::from_secs(5);

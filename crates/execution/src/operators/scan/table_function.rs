@@ -2694,6 +2694,9 @@ mod tests {
                 ],
                 rule_attempts: Default::default(),
                 rule_insertions: Default::default(),
+                rule_elapsed: Default::default(),
+                rule_allocated_bytes: Default::default(),
+                rule_budget_exhaustions: Default::default(),
                 counters: Default::default(),
             },
         );
@@ -2707,6 +2710,9 @@ mod tests {
                 }],
                 rule_attempts: Default::default(),
                 rule_insertions: Default::default(),
+                rule_elapsed: Default::default(),
+                rule_allocated_bytes: Default::default(),
+                rule_budget_exhaustions: Default::default(),
                 counters: Default::default(),
             },
         );
