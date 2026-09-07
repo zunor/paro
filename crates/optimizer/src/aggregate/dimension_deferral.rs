@@ -207,6 +207,16 @@ fn recognize(plan: &LogicalPlan) -> Option<DimensionDeferral> {
         return None;
     }
 
+    // A partial grouping over an already-covered key cannot be justified by
+    // further key-domain reduction. Keep the existing state boundary instead
+    // of recursively introducing equivalent aggregate/merge layers.
+    if crate::statistics::unique_keys::expressions_cover_unique_key(
+        &join.left,
+        &partial_groups.iter().collect::<Vec<_>>(),
+    ) {
+        return None;
+    }
+
     let mut partial_aggregates = Vec::with_capacity(aggregate.aggregates.len());
     let mut merge_functions = Vec::with_capacity(aggregate.aggregates.len());
     for expression in &aggregate.aggregates {

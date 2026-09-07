@@ -105,6 +105,25 @@ fn unique_dimension_payload_is_attached_after_partial_aggregation() {
 }
 
 #[test]
+fn settled_partial_key_prevents_repeated_dimension_deferral() {
+    let session = setup_session();
+    let statement = paro_parser::parse_one(
+        "SELECT n_name, sum(s_acctbal) FROM supplier JOIN nation ON s_nationkey = n_nationkey GROUP BY n_name",
+    ).unwrap().stmt;
+    let mut planner = Planner::new(session);
+    planner.create_plan(statement).unwrap();
+    let (plan, changed) =
+        rewrite_root_aggregate(planner.take_plan().unwrap(), &planner.binder.bind_context).unwrap();
+    assert!(changed);
+    let plan = crate::statistics::unique_keys::refresh_unique_keys(plan).unwrap();
+    let (_, changed) = rewrite_root_aggregate(plan, &planner.binder.bind_context).unwrap();
+    assert!(
+        !changed,
+        "a proven partial key must not grow another aggregate/merge layer"
+    );
+}
+
+#[test]
 fn duplicate_dimension_keys_retain_join_multiplicity_through_final_merge() {
     let session = setup_session();
     let statement = paro_parser::parse_one(
