@@ -17,6 +17,7 @@ use crate::physical::{
     RequiredProperties, ResourceGrantClass, ResourceGrantClassId, SpillPolicy,
     StableFingerprintBuilder,
 };
+use paro_catalog::entry::CatalogEntry;
 use paro_common::error::Result;
 use paro_common::identity::GraphId;
 use paro_common::logging::targets;
@@ -523,7 +524,7 @@ impl Optimizer {
                 max_memory,
                 max_threads: usize::from(grant.max_parallel_tasks),
                 scan_access_cost: Default::default(),
-                dependency_template: self.plan_dependency_template_for(&logical),
+                dependency_template: self.plan_dependency_template_for(&logical)?,
             })
             .extract(&logical)?;
             let root = plan.properties.get(plan.root).ok_or_else(|| {
@@ -585,7 +586,7 @@ impl Optimizer {
             }
             let max_memory = usize::try_from(grant.hard_memory_bytes).unwrap_or(usize::MAX);
             crate::physical::slot_assignment::assign_expression_slots(&mut variant.plan.operator)?;
-            let dependency_template = self.plan_dependency_template_for(&variant.plan);
+            let dependency_template = self.plan_dependency_template_for(&variant.plan)?;
             let plan = PhysicalPlanExtractor::new(ExtractionContext {
                 force_external: self.ctx.session.limits.force_external,
                 grant_spill_policy: grant.spill_policy,
@@ -696,7 +697,7 @@ impl Optimizer {
     fn plan_dependency_template_for(
         &self,
         plan: &LogicalPlan,
-    ) -> crate::physical::PlanDependencies {
+    ) -> Result<crate::physical::PlanDependencies> {
         fn graph_key(id: &GraphId) -> Fingerprint {
             let mut fingerprint = StableFingerprintBuilder::default();
             fingerprint.write_bytes(b"paro.graph-generation.v1");
@@ -728,7 +729,22 @@ impl Optimizer {
 
         let mut dependencies = self.plan_dependency_template();
         collect(self, plan, &mut dependencies);
-        dependencies
+        for table in crate::search::optimizer::SearchOptimizer::planning_observation_tables(plan)? {
+            let object = {
+                let mut fingerprint = StableFingerprintBuilder::default();
+                fingerprint.write_u64(1);
+                fingerprint.write_u64(table.object_id().raw());
+                fingerprint.finish()
+            };
+            dependencies.search_planning_signatures.insert(
+                object,
+                table
+                    .storage
+                    .as_ref()
+                    .map_or(0, |storage| storage.search_planning_signature()),
+            );
+        }
+        Ok(dependencies)
     }
 
     /// Only canonical, mandatory semantic work belongs here. Cost alternatives

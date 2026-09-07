@@ -4,7 +4,7 @@
 //! Bounded instance-wide cache for immutable compiled statement images.
 
 use parking_lot::Mutex;
-use paro_common::types::LogicalType;
+use paro_common::{logging::targets, types::LogicalType};
 use paro_context::{CompileEnvironmentKey, StatementEnvironment};
 use paro_execution::query_executor::compiled::CompiledStatement;
 use paro_parser::ast::Statement;
@@ -49,6 +49,8 @@ pub struct InstancePlanCache {
     entries: Mutex<VecDeque<CachedPlan>>,
     hits: AtomicU64,
     misses: AtomicU64,
+    key_misses: AtomicU64,
+    validation_misses: AtomicU64,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -57,6 +59,8 @@ pub struct InstancePlanCacheMetrics {
     pub capacity: usize,
     pub hits: u64,
     pub misses: u64,
+    pub key_misses: u64,
+    pub validation_misses: u64,
 }
 
 impl Default for InstancePlanCache {
@@ -72,6 +76,8 @@ impl InstancePlanCache {
             entries: Mutex::new(VecDeque::with_capacity(capacity)),
             hits: AtomicU64::new(0),
             misses: AtomicU64::new(0),
+            key_misses: AtomicU64::new(0),
+            validation_misses: AtomicU64::new(0),
         }
     }
 
@@ -95,6 +101,20 @@ impl InstancePlanCache {
             )
         }) else {
             self.misses.fetch_add(1, Ordering::Relaxed);
+            self.key_misses.fetch_add(1, Ordering::Relaxed);
+            let closest = entries.iter().find(|entry| {
+                entry.statement == *statement
+                    && entry.statement_format.as_deref() == statement_format
+                    && entry.parameter_types.as_ref() == parameter_types
+                    && entry.statement_environment == *statement_environment
+            });
+            tracing::debug!(
+                target: targets::QUERY,
+                cached_entries = entries.len(),
+                cached_environment = ?closest.map(|entry| &entry.environment),
+                requested_environment = ?environment,
+                "Instance plan cache key mismatch"
+            );
             return None;
         };
         let entry = entries
@@ -103,6 +123,11 @@ impl InstancePlanCache {
         let plan = entry.plan.clone();
         if !validate(&plan) {
             self.misses.fetch_add(1, Ordering::Relaxed);
+            self.validation_misses.fetch_add(1, Ordering::Relaxed);
+            tracing::debug!(
+                target: targets::QUERY,
+                "Instance plan cache dynamic dependency validation failed"
+            );
             return None;
         }
         entries.push_back(entry);
@@ -153,6 +178,8 @@ impl InstancePlanCache {
             capacity: self.capacity,
             hits: self.hits.load(Ordering::Relaxed),
             misses: self.misses.load(Ordering::Relaxed),
+            key_misses: self.key_misses.load(Ordering::Relaxed),
+            validation_misses: self.validation_misses.load(Ordering::Relaxed),
         }
     }
 }
@@ -164,7 +191,10 @@ mod tests {
     #[test]
     fn zero_capacity_is_an_explicit_disabled_cache() {
         let cache = InstancePlanCache::with_capacity(0);
-        assert_eq!(cache.metrics().capacity, 0);
-        assert_eq!(cache.metrics().entries, 0);
+        let metrics = cache.metrics();
+        assert_eq!(metrics.capacity, 0);
+        assert_eq!(metrics.entries, 0);
+        assert_eq!(metrics.key_misses, 0);
+        assert_eq!(metrics.validation_misses, 0);
     }
 }

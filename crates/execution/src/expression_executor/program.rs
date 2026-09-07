@@ -65,7 +65,7 @@ impl ExpressionProgramVersion {
             backend: ExpressionBackend::VectorTreeV1,
             physical_semantics_version: 1,
             visible_generation: env.visible_generation,
-            settings_fingerprint: env.settings_fingerprint,
+            settings_fingerprint: env.planning_settings_fingerprint,
         }
     }
 }

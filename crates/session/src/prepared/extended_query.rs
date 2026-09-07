@@ -2664,12 +2664,26 @@ mod tests {
         let after_peer = instance.plan_cache().metrics();
         assert_eq!(after_peer.hits, 2, "{after_peer:?}");
 
+        let mut unverified_peer = Session::new(3, instance.clone());
+        unverified_peer
+            .config
+            .set_setting("optimizer_verify", Value::Boolean(false));
+        crate::utility::settings::reconcile_effective_settings(&mut unverified_peer).unwrap();
+        assert_eq!(
+            session.compile_environment_key(),
+            unverified_peer.compile_environment_key(),
+            "verification observes a compiled image and cannot change its identity"
+        );
+        let mut unverified_sink = CollectingSink::new();
+        exec_simple_ok(&mut unverified_peer, &mut unverified_sink, "SELECT 1").await;
+        assert_eq!(instance.plan_cache().metrics().hits, 3);
+
         session.config.set_setting("threads", Value::Integer(2));
         crate::utility::settings::reconcile_effective_settings(&mut session).unwrap();
         let mut changed_sink = CollectingSink::new();
         exec_simple_ok(&mut session, &mut changed_sink, "SELECT 1").await;
         let changed = instance.plan_cache().metrics();
-        assert_eq!(changed.hits, 2);
+        assert_eq!(changed.hits, 3);
         assert_eq!(changed.misses, 2);
         assert_eq!(changed.entries, 2);
     }

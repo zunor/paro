@@ -1,6 +1,7 @@
 // Copyright 2024-2026 Zunor
 // SPDX-License-Identifier: Apache-2.0
 
+use paro_catalog::entry::CatalogEntry;
 use paro_common::error::{self as paro_error, Result};
 use paro_common::runtime_value::Value;
 use paro_common::types::LogicalType;
@@ -80,6 +81,56 @@ impl SearchOptimizer {
             pending.extend(plan.operator.children());
         }
         false
+    }
+
+    /// Tables whose search capability state is a logical planning input even
+    /// when a sequential expression wins. A plain relational scan is not a
+    /// negative search observation: adding a provider cannot create a legal
+    /// alternative unless the statement carries a matching search intent.
+    pub(crate) fn planning_observation_tables(
+        plan: &LogicalPlan,
+    ) -> Result<Vec<std::sync::Arc<paro_catalog::entry::TableCatalogEntry>>> {
+        let mut tables = std::collections::BTreeMap::new();
+        let mut pending = vec![plan];
+        while let Some(plan) = pending.pop() {
+            let observed_get = match &plan.operator {
+                LogicalOperator::TopN(topn) => extract_topn_pattern(topn)
+                    .map(|pattern| {
+                        let observes = extract_vector_intent(
+                            pattern.order_expr,
+                            pattern.get,
+                            topn.hnsw_options,
+                            topn.orders[0].ascending,
+                        )?
+                        .is_some()
+                            || extract_sparse_intent(pattern.order_expr, pattern.get)?.is_some()
+                            || extract_fulltext_score_intent(pattern.order_expr, pattern.get)?
+                                .is_some();
+                        Ok::<_, paro_common::error::ParoError>(observes.then_some(pattern.get))
+                    })
+                    .transpose()?
+                    .flatten(),
+                LogicalOperator::Filter(filter) => match &filter.child.operator {
+                    LogicalOperator::Get(get) => filter
+                        .expressions
+                        .iter()
+                        .try_fold(false, |observed, expression| {
+                            Ok::<_, paro_common::error::ParoError>(
+                                observed
+                                    || extract_fulltext_match_intent(expression, get)?.is_some(),
+                            )
+                        })?
+                        .then_some(get),
+                    _ => None,
+                },
+                _ => None,
+            };
+            if let Some(table) = observed_get.and_then(Get::get_table) {
+                tables.insert(table.object_id().raw(), table.clone());
+            }
+            pending.extend(plan.children());
+        }
+        Ok(tables.into_values().collect())
     }
 
     fn try_rewrite_topn(

@@ -160,13 +160,13 @@ pub(crate) fn physical_plan_dependencies_available(
         table: &paro_catalog::entry::TableCatalogEntry,
     ) -> bool {
         let key = domain_fingerprint(1, table.object_id().raw());
-        let Some(expected) = plan.dependencies.search_planning_revisions.get(&key) else {
+        let Some(expected) = plan.dependencies.search_planning_signatures.get(&key) else {
             return false;
         };
         table
             .storage
             .as_ref()
-            .map_or(0, |storage| storage.search_planning_revision())
+            .map_or(0, |storage| storage.search_planning_signature())
             == *expected
     }
 
@@ -207,9 +207,7 @@ pub(crate) fn physical_plan_dependencies_available(
     }
 
     plan.nodes.iter().all(|node| match &node.kind {
-        PhysicalNodeKind::RowsetScan(spec) => {
-            table_search_planning_state_available(plan, &spec.table)
-        }
+        PhysicalNodeKind::RowsetScan(_) => true,
         PhysicalNodeKind::VectorSearch(spec) => {
             table_search_planning_state_available(plan, &spec.table)
                 && search_available(&spec.table, &spec.capability_token)

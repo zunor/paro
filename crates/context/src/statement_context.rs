@@ -26,7 +26,7 @@ pub struct CompileEnvironmentKey {
     pub search_path: Vec<CatalogSearchEntry>,
     pub visible_generation: u64,
     pub catalog_epochs: Vec<(u64, u64)>,
-    pub settings_fingerprint: u64,
+    pub planning_settings_fingerprint: u64,
 }
 
 impl CompileEnvironmentKey {
@@ -52,7 +52,7 @@ impl CompileEnvironmentKey {
             search_path: search_path.to_vec(),
             visible_generation,
             catalog_epochs,
-            settings_fingerprint: settings.fingerprint(),
+            planning_settings_fingerprint: settings.planning_fingerprint(),
         }
     }
 }

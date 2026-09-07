@@ -214,14 +214,9 @@ impl std::fmt::Debug for SearchIndexRegistry {
 }
 
 impl SearchIndexRegistry {
-    /// Monotone revision of every provider state that can change the set or
-    /// cost of physical search implementations visible to the optimizer.
-    ///
-    /// Compiled plans record this even when the winning plan did not choose a
-    /// search provider: the absence of a candidate is itself an optimization
-    /// observation and must expire when a definition becomes queryable.
-    pub(crate) fn planning_revision(&self) -> u64 {
-        self.view.load().version
+    /// Identity of the optimizer-visible definition and capability set.
+    pub(crate) fn planning_signature(&self) -> u64 {
+        self.view.load().planning_signature()
     }
 
     fn disable_definition_capability(&self, definition_id: u64) -> Result<()> {

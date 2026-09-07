@@ -691,12 +691,19 @@ fn populate_plan_dependencies(
         dependencies
             .statistics_compatibility
             .insert(object, table.timestamp());
-        dependencies.search_planning_revisions.insert(
+    }
+
+    fn register_search_state(
+        dependencies: &mut crate::physical::PlanDependencies,
+        table: &paro_catalog::entry::TableCatalogEntry,
+    ) {
+        let object = domain_fingerprint(1, table.object_id().raw());
+        dependencies.search_planning_signatures.insert(
             object,
             table
                 .storage
                 .as_ref()
-                .map_or(0, |storage| storage.search_planning_revision()),
+                .map_or(0, |storage| storage.search_planning_signature()),
         );
     }
 
@@ -740,18 +747,22 @@ fn populate_plan_dependencies(
             PhysicalNodeKind::RowsetScan(spec) => register_table(dependencies, &spec.table),
             PhysicalNodeKind::VectorSearch(spec) => {
                 register_table(dependencies, &spec.table);
+                register_search_state(dependencies, &spec.table);
                 register_search(dependencies, &spec.capability_token);
             }
             PhysicalNodeKind::SparseVectorSearch(spec) => {
                 register_table(dependencies, &spec.table);
+                register_search_state(dependencies, &spec.table);
                 register_search(dependencies, &spec.capability_token);
             }
             PhysicalNodeKind::FullTextSearch(spec) => {
                 register_table(dependencies, &spec.table);
+                register_search_state(dependencies, &spec.table);
                 register_search(dependencies, &spec.capability_token);
             }
             PhysicalNodeKind::AdaptiveSearch(spec) => {
                 register_table(dependencies, &spec.table);
+                register_search_state(dependencies, &spec.table);
                 match spec.selected.as_ref() {
                     SearchSourceSpec::Vector(source) => {
                         register_search(dependencies, &source.capability_token)
