@@ -269,7 +269,7 @@ impl TransformationRule for PlannerTransformationRule {
                 cancellation.as_ref(),
             );
         }
-        matching::scoped_pattern_bindings(
+        let mut bindings = matching::scoped_pattern_bindings(
             self.transformation,
             ctx.group,
             expr,
@@ -277,7 +277,26 @@ impl TransformationRule for PlannerTransformationRule {
             &state,
             cancellation.as_ref(),
             self.budget_class().work_dimension(),
-        )
+        )?;
+        if matches!(
+            self.transformation,
+            PlannerTransformation::JoinRegionEnumeration
+        ) {
+            // Associative parenthesizations are not distinct inputs to the
+            // region enumerator. Collapse them before fact derivation and rule
+            // admission using the same exact graph transcript as apply.
+            let mut graph_identities = BTreeSet::new();
+            let mut unique = Vec::new();
+            for binding in bindings.bindings.into_vec() {
+                let identity =
+                    join_region::identity_with_facts(&binding.root, ctx.memo, &state, None)?;
+                if identity.map_or(true, |identity| graph_identities.insert(identity)) {
+                    unique.push(binding);
+                }
+            }
+            bindings.bindings = unique.into_boxed_slice();
+        }
+        Ok(bindings)
     }
 
     fn apply(

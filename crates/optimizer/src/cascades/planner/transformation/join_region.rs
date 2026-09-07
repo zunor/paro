@@ -117,15 +117,6 @@ pub(super) fn identity_with_facts(
             PatternOperand::Group(group) | PatternOperand::Expression { group, .. } => *group,
         };
         graph.inputs.insert(memo.canonical_group(owner));
-        let mut inputs = vec![operand];
-        while let Some(input) = inputs.pop() {
-            match input {
-                PatternOperand::Group(group) => {
-                    graph.inputs.insert(memo.canonical_group(*group));
-                }
-                PatternOperand::Expression { children, .. } => inputs.extend(children.iter()),
-            }
-        }
         Ok(())
     }
     let mut graph = Graph {
