@@ -36,7 +36,7 @@ impl PlanNodeId {
 }
 
 /// Cardinality interval persisted on a logical plan node.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct CardinalityEstimate {
     pub min: u64,
     pub expected: u64,
@@ -59,7 +59,7 @@ impl CardinalityEstimate {
 /// graph estimate, however, accounts for equality classes and joint domains
 /// across the whole associative region; reconstructing it from one physical
 /// tree cut loses that information.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, PartialOrd, Ord)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum CardinalityProvenance {
     #[default]
     Statistics,
@@ -71,21 +71,21 @@ pub enum CardinalityProvenance {
 /// Structural proofs are valid for planning and cardinality, but only a proof
 /// that remains rooted in an enforced catalog key may select execution paths
 /// where a duplicate is diagnosed as storage corruption.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum UniqueKeyProvenance {
     CatalogEnforced,
     Structural,
 }
 
 /// One column of a unique key in a node's current output layout.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct UniqueKeyColumn {
     pub output_index: usize,
     pub binding: ColumnBinding,
 }
 
 /// Cached unique-key proof produced by statistics gathering.
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct UniqueKey {
     pub columns: Box<[UniqueKeyColumn]>,
     pub provenance: UniqueKeyProvenance,
@@ -104,7 +104,7 @@ impl UniqueKey {
 }
 
 /// Statistics attached to a logical plan node.
-#[derive(Debug, Clone, Default, PartialEq, Eq, PartialOrd, Ord)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct NodeStats {
     pub estimated_cardinality: Option<CardinalityEstimate>,
     pub cardinality_provenance: CardinalityProvenance,

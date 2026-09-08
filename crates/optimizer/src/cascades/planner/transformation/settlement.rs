@@ -16,6 +16,7 @@ use paro_planner::plan::{NodeStats, PlanNodeId};
 use std::hash::{Hash, Hasher};
 
 mod demand;
+mod occurrence;
 
 type FactId = usize;
 type CteEnvironment = Arc<BTreeMap<usize, FactId>>;
@@ -151,6 +152,7 @@ pub(in crate::cascades::planner) struct SettlementCache {
     /// The BTreeSet above remains the cheap negative filter for scalar-bearing
     /// operators whose full identity depends on interned expression roots.
     local_shape_entries: BTreeMap<LocalShape, Vec<SettledLocal>>,
+    occurrences: occurrence::OccurrenceCache,
     facts: Vec<RelationFacts>,
     facts_by_columns: BTreeMap<Box<[usize]>, Vec<FactId>>,
     /// Interned column facts include evidence provenance, not just the
@@ -218,6 +220,7 @@ impl SettlementCache {
             .invalidation_visits
             .saturating_add(self.locals.len() as u64);
         self.locals.retain(|_, entry| arena.owns(entry.recipe));
+        self.occurrences.prune(arena);
         // A shape is only a fast negative filter. Rebuild it from the live
         // recipes after rollback so a stale shape can never turn a future
         // first visit into an incorrect cache hit.
@@ -341,6 +344,15 @@ impl SettlementCache {
         environment: &PlannerRuleEnvironment,
         recipes: &mut LogicalPlanArena,
     ) -> Result<SettledLocal> {
+        let occurrence =
+            occurrence::OccurrenceKey::capture(&shell, inputs, &self.facts, &self.scalars)?;
+        if let Some(key) = &occurrence {
+            if let Some(entry) = self.occurrences.get(key, recipes) {
+                self.hits += 1;
+                return Ok(entry);
+            }
+        }
+        let occurrence = occurrence.map(|key| key.witnessed(&shell.operator));
         let scalar_free = operator_has_no_scalar_payload(&shell.operator);
         let shape = LocalShape {
             operator_tag: operator_shape_tag(&shell.operator, &self.scalars)?,
@@ -442,6 +454,7 @@ impl SettlementCache {
         };
         if maybe_cached {
             if let Some(entry) = self.locals.get(&key) {
+                self.occurrences.insert(occurrence, entry, recipes);
                 self.hits += 1;
                 return Ok(entry.clone());
             }
@@ -524,6 +537,7 @@ impl SettlementCache {
                 .or_default()
                 .push(entry.clone());
             self.locals.insert(key, entry.clone());
+            self.occurrences.insert(occurrence, &entry, recipes);
             self.recipe_prefix = Some(recipes.checkpoint());
             return Ok(entry);
         }
@@ -605,8 +619,13 @@ impl SettlementCache {
             .or_default()
             .push(entry.clone());
         self.locals.insert(key, entry.clone());
+        self.occurrences.insert(occurrence, &entry, recipes);
         self.recipe_prefix = Some(recipes.checkpoint());
         Ok(entry)
+    }
+
+    pub(in crate::cascades::planner) fn immutable_occurrence_hits(&self) -> u64 {
+        self.occurrences.hits
     }
 
     fn output_layout_matches<Child>(
@@ -1096,6 +1115,92 @@ mod tests {
         assert_ne!(first.plan.id, second.plan.id);
         assert_eq!(first.plan.stats, second.plan.stats);
         assert_eq!(second.plan.stats.estimated_cardinality.unwrap().expected, 3);
+    }
+
+    #[test]
+    fn immutable_scalar_occurrence_hit_skips_lowering_without_weakening_facts() {
+        let env = environment();
+        let mut cache = SettlementCache::default();
+        let mut arena = LogicalPlanArena::default();
+        let fact = |rows| RelationFacts {
+            layout: LogicalOutputLayout::new(
+                vec![LogicalType::Integer],
+                vec![ColumnBinding::new(0, 0)],
+            ),
+            stats: NodeStats {
+                estimated_cardinality: Some(CardinalityEstimate::exact(rows)),
+                ..Default::default()
+            },
+            maximum: Some(rows),
+            columns: vec![ColumnStatistics::create_unknown(LogicalType::Integer)],
+            column_ids: Box::new([]),
+        };
+        let first_input = cache.intern_fact(fact(3)).unwrap();
+        let second_input = cache.intern_fact(fact(9)).unwrap();
+        let mut shell =
+            LogicalPlanNode::from_shell(project(&env.bind_context, values(&env.bind_context, 0)));
+        let ctes = Arc::new(BTreeMap::new());
+        let first = cache
+            .local(shell.clone(), &[first_input], &ctes, &env, &mut arena)
+            .unwrap();
+        let scalar_count = cache.scalars.len();
+        let second = cache
+            .local(shell.clone(), &[first_input], &ctes, &env, &mut arena)
+            .unwrap();
+        assert_eq!(first.recipe, second.recipe);
+        assert_eq!(cache.immutable_occurrence_hits(), 1);
+        assert_eq!(cache.scalars.len(), scalar_count);
+        assert_eq!(cache.misses, 1);
+
+        let changed = cache
+            .local(shell.clone(), &[second_input], &ctes, &env, &mut arena)
+            .unwrap();
+        assert_eq!(
+            cache.facts[changed.facts]
+                .stats
+                .estimated_cardinality
+                .unwrap()
+                .expected,
+            9
+        );
+        assert_eq!(
+            cache.immutable_occurrence_hits(),
+            1,
+            "input evidence is part of identity"
+        );
+
+        let LogicalOperator::Projection(projection) = &mut shell.operator else {
+            panic!("projection")
+        };
+        projection.table_index = 7;
+        let rebound = cache
+            .local(shell.clone(), &[first_input], &ctes, &env, &mut arena)
+            .unwrap();
+        assert_eq!(
+            cache.facts[rebound.facts].layout.bindings(),
+            &[ColumnBinding::new(7, 0)]
+        );
+        assert_eq!(
+            cache.immutable_occurrence_hits(),
+            1,
+            "output column identity is not an alias"
+        );
+
+        let LogicalOperator::Projection(projection) = &mut shell.operator else {
+            panic!("projection")
+        };
+        projection.expressions[0] = Expression::Constant(
+            ConstantExpression::new(Value::Integer(42), LogicalType::Integer).into(),
+        );
+        let replaced = cache
+            .local(shell.clone(), &[first_input], &ctes, &env, &mut arena)
+            .unwrap();
+        assert_ne!(replaced.recipe, rebound.recipe);
+        assert_eq!(
+            cache.immutable_occurrence_hits(),
+            1,
+            "copy-on-write scalar changes cannot hit"
+        );
     }
 
     #[test]

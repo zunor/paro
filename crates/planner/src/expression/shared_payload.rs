@@ -5,7 +5,7 @@
 //! immutable node; mutation detaches only that node, never its descendant DAG.
 
 use std::ops::{Deref, DerefMut};
-use std::sync::{Arc, OnceLock};
+use std::sync::{Arc, OnceLock, Weak};
 
 use super::*;
 
@@ -15,9 +15,22 @@ use super::*;
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct ExpressionIdentity(usize);
 
+/// Non-owning witness for an immutable scalar allocation. Cache entries must
+/// not turn allocation addresses into semantics or pin the expression DAG.
+/// Mutation either changes the expression's identity or expires a unique
+/// owner's weak witness; it never validates a changed value under the old key.
+#[derive(Debug, Clone)]
+pub struct ExpressionIdentityWitness(Weak<dyn std::any::Any + Send + Sync>);
+
+impl ExpressionIdentityWitness {
+    pub fn is_live(&self) -> bool {
+        self.0.strong_count() != 0
+    }
+}
+
 /// The complete owned-child contract of a scalar payload. Destruction consumes
 /// these edges iteratively, including aggregate modifiers and window frames.
-pub trait ExpressionPayload: Clone + std::fmt::Debug {
+pub trait ExpressionPayload: Clone + std::fmt::Debug + Send + Sync + 'static {
     fn into_expression_children(self, pending: &mut Vec<Expression>);
 }
 
@@ -45,6 +58,12 @@ impl<T: ExpressionPayload> SharedExpressionPayload<T> {
 
     pub(crate) fn evaluation_cache(&self) -> &OnceLock<EvaluationProperties> {
         &self.inner.as_ref().expect("live scalar payload").evaluation
+    }
+
+    pub(crate) fn identity_witness(&self) -> ExpressionIdentityWitness {
+        let erased: Arc<dyn std::any::Any + Send + Sync> =
+            self.inner.as_ref().expect("live scalar payload").clone();
+        ExpressionIdentityWitness(Arc::downgrade(&erased))
     }
 
     pub fn new(payload: T) -> Self {
@@ -439,5 +458,43 @@ mod tests {
             };
             assert!(left.ptr_eq(right));
         }
+    }
+    #[test]
+    fn identity_witness_neither_pins_a_dag_nor_survives_mutation() {
+        let mut expression = Expression::Constant(
+            ConstantExpression::new(
+                paro_common::runtime_value::Value::Integer(1),
+                paro_common::types::LogicalType::Integer,
+            )
+            .into(),
+        );
+        let witness = expression.identity_witness();
+        let prior = expression.clone();
+        let Expression::Constant(value) = &mut expression else {
+            unreachable!()
+        };
+        value.value = paro_common::runtime_value::Value::Integer(2);
+        assert_ne!(
+            expression.allocation_identity(),
+            prior.allocation_identity()
+        );
+        assert!(
+            witness.is_live(),
+            "the unmodified peer still owns the original allocation"
+        );
+        drop(prior);
+        assert!(!witness.is_live());
+        let detached = expression.identity_witness();
+        let Expression::Constant(value) = &mut expression else {
+            unreachable!()
+        };
+        value.value = paro_common::runtime_value::Value::Integer(3);
+        assert!(
+            !detached.is_live(),
+            "even unique-owner mutation must expire weak cache keys"
+        );
+        let last = expression.identity_witness();
+        drop(expression);
+        assert!(!last.is_live(), "the cache is not an owner");
     }
 }
