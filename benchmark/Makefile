@@ -53,7 +53,8 @@ export PARO_ALLOC_AUDIT
 
 QUALITY_REPORT ?=
 QUALITY_BASELINE ?=
-.PHONY: setup run check bless calibrate bisect quality archive-manifest archive-recompute-calibration archive-finalize-calibration ci test ping clean clean-venv distclean help
+QUALITY_LISTEN ?= 127.0.0.1:6442
+.PHONY: setup run check bless calibrate bisect quality quality-collect archive-manifest archive-recompute-calibration archive-finalize-calibration ci test ping clean clean-venv distclean help
 
 setup: ## Create .venv and install benchmark dependencies
 	@$(PYTHON_SYS) -m venv $(VENV_DIR)
@@ -149,6 +150,11 @@ test: ## Run benchmark harness unit tests
 quality: ## Check estimate-vs-actual q-error (QUALITY_REPORT= QUALITY_BASELINE=)
 	PYTHONPATH=.. $(PYTHON) -m harness.quality_gate \
 		--report $(QUALITY_REPORT) \
+		$(if $(QUALITY_BASELINE),--baseline $(QUALITY_BASELINE))
+
+quality-collect: ## Build and collect known-cardinality cases in a fresh owned server
+	$(PYTHON) corpora/plan_quality.py --report $(QUALITY_REPORT) \
+		--listen $(QUALITY_LISTEN) \
 		$(if $(QUALITY_BASELINE),--baseline $(QUALITY_BASELINE))
 
 ping: ## Verify Paro connectivity from config.toml
