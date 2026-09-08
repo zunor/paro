@@ -20,7 +20,7 @@ use paro_planner::plan::{
 use paro_storage::index::graph::GraphStatsProvider;
 use paro_storage::statistics::{BaseStatistics, ColumnStatistics};
 
-use crate::context::OptimizationContext;
+use crate::context::{GraphStatsCache, OptimizationContext, SharedColumnStatistics};
 use crate::statistics::aggregate_filter::estimate_grouped_sum_filter_selectivity;
 
 fn external_table_cardinality(
@@ -78,6 +78,17 @@ struct GatheredNodeProperties {
     maximum_cardinality: Option<u64>,
 }
 
+/// Estimation reads the completed inputs, not domains published by this
+/// operator's simplification. In particular, `x = c` has an input NDV and a
+/// different, singleton output NDV. Keeping the view separate prevents local
+/// settlement from feeding the output proof back into input selectivity.
+struct CardinalityInputs<'a> {
+    column_stats: &'a SharedColumnStatistics,
+    cost_model: &'a crate::cost_model::CostModel,
+    session: &'a paro_context::StatementContext,
+    graph_stats: &'a mut GraphStatsCache,
+}
+
 impl LogicalPlanPostOrderFolder<GatheredNodeProperties> for StatisticsGatherFolder<'_> {
     fn child_completed(
         &mut self,
@@ -109,6 +120,7 @@ impl LogicalPlanPostOrderFolder<GatheredNodeProperties> for StatisticsGatherFold
             plan,
             &child_layouts,
             &child_maximum_cardinalities,
+            self.context.column_stats.clone(),
             self.context,
         );
         Ok((
@@ -133,13 +145,24 @@ impl StatisticsGathering {
         mut plan: OwnedLogicalPlan,
         child_layouts: &[LogicalOutputLayout],
         child_maximum_cardinalities: &[Option<u64>],
+        input_column_stats: SharedColumnStatistics,
         ctx: &mut OptimizationContext,
     ) -> (OwnedLogicalPlan, LogicalOutputLayout, Option<u64>) {
         if plan.stats.cardinality_provenance != CardinalityProvenance::JoinGraph {
+            let mut inputs = CardinalityInputs {
+                column_stats: &input_column_stats,
+                cost_model: &ctx.cost_model,
+                session: &ctx.session,
+                graph_stats: &mut ctx.graph_stats,
+            };
             plan.stats.estimated_cardinality =
-                self.estimate_plan_cardinality(&plan, child_layouts, ctx);
+                self.estimate_plan_cardinality(&plan, child_layouts, &mut inputs);
             plan.stats.cardinality_provenance = CardinalityProvenance::Statistics;
         }
+        // The recursive baseline can use the current map as its input view.
+        // Release that read before publishing outputs: retaining the extra
+        // Arc would detach the entire accumulated map at every node.
+        drop(input_column_stats);
         let output = plan.operator.output_layout_from_children(child_layouts);
         let maximum = crate::statistics::cardinality_bound::derive_maximum_cardinality(
             &plan.operator,
@@ -285,7 +308,7 @@ impl StatisticsGathering {
         &mut self,
         plan: &OwnedLogicalPlan,
         child_layouts: &[LogicalOutputLayout],
-        ctx: &mut OptimizationContext,
+        ctx: &mut CardinalityInputs<'_>,
     ) -> Option<CardinalityEstimate> {
         match &plan.operator {
             // DUMMY_SCAN is the one-row, zero-column identity relation. It is
@@ -408,7 +431,7 @@ impl StatisticsGathering {
                     // pre-predicate group count to later join/order costing.
                     let selectivity = ctx
                         .cost_model
-                        .estimate_selectivity(&reduction.predicate, &ctx.column_stats);
+                        .estimate_selectivity(&reduction.predicate, ctx.column_stats);
                     Some(
                         ctx.cost_model
                             .apply_selectivity_to_cardinality(groups, selectivity),
@@ -527,11 +550,10 @@ impl StatisticsGathering {
         &self,
         filter: &Filter,
         child_layout: &LogicalOutputLayout,
-        ctx: &OptimizationContext,
+        ctx: &CardinalityInputs<'_>,
     ) -> Option<CardinalityEstimate> {
         let child = filter.child.stats.estimated_cardinality?;
-        if let Some(selectivity) =
-            estimate_grouped_sum_filter_selectivity(filter, &ctx.column_stats)
+        if let Some(selectivity) = estimate_grouped_sum_filter_selectivity(filter, ctx.column_stats)
         {
             return Some(
                 ctx.cost_model
@@ -541,7 +563,7 @@ impl StatisticsGathering {
         Some(ctx.cost_model.estimate_filter_cardinality_with_positions(
             child.expected,
             &filter.expressions,
-            &ctx.column_stats,
+            ctx.column_stats,
             child_layout.bindings(),
         ))
     }
@@ -550,7 +572,7 @@ impl StatisticsGathering {
         &self,
         child: &OwnedLogicalPlan,
         child_layout: &LogicalOutputLayout,
-        ctx: &OptimizationContext,
+        ctx: &CardinalityInputs<'_>,
     ) -> Option<CardinalityEstimate> {
         let child_est = child.stats.estimated_cardinality?;
         let stats = collect_output_stats_for_layout(child_layout, ctx);
@@ -578,7 +600,7 @@ impl StatisticsGathering {
         join: &Join,
         left_layout: &LogicalOutputLayout,
         right_layout: &LogicalOutputLayout,
-        ctx: &OptimizationContext,
+        ctx: &CardinalityInputs<'_>,
     ) -> Option<CardinalityEstimate> {
         match join {
             Join::Cross(cross) => Some(product_estimate(
@@ -590,7 +612,7 @@ impl StatisticsGathering {
                 let right = any.right.stats.estimated_cardinality?;
                 let selectivity = ctx
                     .cost_model
-                    .estimate_selectivity(&any.condition, &ctx.column_stats);
+                    .estimate_selectivity(&any.condition, ctx.column_stats);
                 Some(adjust_join_estimate(
                     apply_selectivity(product_estimate(left, right), selectivity),
                     left,
@@ -637,7 +659,7 @@ impl StatisticsGathering {
     fn estimate_search_scan_cardinality(
         &self,
         search: &SearchScan,
-        ctx: &OptimizationContext,
+        ctx: &CardinalityInputs<'_>,
     ) -> CardinalityEstimate {
         let base_rows = self.get_storage_rows(&search.get, ctx) as u64;
         let mut expressions = Vec::new();
@@ -646,14 +668,14 @@ impl StatisticsGathering {
         expressions.extend(search.get.runtime_filter_expressions.iter().cloned());
         let filtered =
             ctx.cost_model
-                .estimate_filter_cardinality(base_rows, &expressions, &ctx.column_stats);
+                .estimate_filter_cardinality(base_rows, &expressions, ctx.column_stats);
         apply_limit_estimate(filtered, Some(search.limit), 0)
     }
 
     fn estimate_fulltext_filter_cardinality(
         &self,
         scan: &FullTextFilterScan,
-        ctx: &OptimizationContext,
+        ctx: &CardinalityInputs<'_>,
     ) -> CardinalityEstimate {
         let base_rows = self.get_storage_rows(&scan.get, ctx) as u64;
         let mut expressions = vec![scan.match_expression.clone()];
@@ -661,13 +683,13 @@ impl StatisticsGathering {
         expressions.extend(scan.residual_predicates.iter().cloned());
         expressions.extend(scan.get.runtime_filter_expressions.iter().cloned());
         ctx.cost_model
-            .estimate_filter_cardinality(base_rows, &expressions, &ctx.column_stats)
+            .estimate_filter_cardinality(base_rows, &expressions, ctx.column_stats)
     }
 
     fn estimate_graph_scan_cardinality(
         &self,
         scan: &GraphScan,
-        ctx: &mut OptimizationContext,
+        ctx: &mut CardinalityInputs<'_>,
     ) -> CardinalityEstimate {
         let base = ctx
             .graph_stats
@@ -677,7 +699,7 @@ impl StatisticsGathering {
         let expected = if let Some(filter) = &scan.filter {
             let selectivity = ctx
                 .cost_model
-                .estimate_selectivity(filter, &ctx.column_stats);
+                .estimate_selectivity(filter, ctx.column_stats);
             ((base as f64) * selectivity).ceil() as u64
         } else {
             base
@@ -697,7 +719,7 @@ impl StatisticsGathering {
     fn estimate_graph_expand_cardinality(
         &self,
         expand: &GraphExpand,
-        ctx: &mut OptimizationContext,
+        ctx: &mut CardinalityInputs<'_>,
     ) -> CardinalityEstimate {
         let child = expand
             .child
@@ -850,7 +872,7 @@ impl StatisticsGathering {
             .collect()
     }
 
-    fn get_storage_rows(&self, get: &Get, ctx: &OptimizationContext) -> usize {
+    fn get_storage_rows(&self, get: &Get, ctx: &CardinalityInputs<'_>) -> usize {
         get.table
             .as_ref()
             .and_then(|table| table.get_storage())
@@ -875,7 +897,7 @@ fn estimate_same_domain_semi_join(
     right: CardinalityEstimate,
     left_bindings: &[ColumnBinding],
     right_bindings: &[ColumnBinding],
-    ctx: &OptimizationContext,
+    ctx: &CardinalityInputs<'_>,
 ) -> Option<CardinalityEstimate> {
     let (preserved, demand, preserved_bindings, demand_bindings) = match join.join_type {
         JoinType::Semi => (left, right, left_bindings, right_bindings),
@@ -930,7 +952,7 @@ fn estimate_unique_dimension_join(
     right: CardinalityEstimate,
     left_layout: &LogicalOutputLayout,
     right_layout: &LogicalOutputLayout,
-    ctx: &OptimizationContext,
+    ctx: &CardinalityInputs<'_>,
 ) -> Option<CardinalityEstimate> {
     let [condition] = join.conditions.as_slice() else {
         return None;
@@ -960,7 +982,7 @@ fn unique_lookup_estimate(
     fact: CardinalityEstimate,
     dimension: CardinalityEstimate,
     fact_key: ColumnBinding,
-    ctx: &OptimizationContext,
+    ctx: &CardinalityInputs<'_>,
 ) -> Option<CardinalityEstimate> {
     let domain = ctx.column_stats.get(&fact_key)?.distinct_evidence().point;
     if domain == 0 {
@@ -994,7 +1016,7 @@ fn estimate_comparison_join_selectivity(
     right_bindings: &[ColumnBinding],
     left_rows: u64,
     right_rows: u64,
-    ctx: &OptimizationContext,
+    ctx: &CardinalityInputs<'_>,
 ) -> f64 {
     correlate_join_condition_selectivities(conditions.iter().map(|condition| {
         (
@@ -1340,7 +1362,7 @@ fn fallback_group_distinct(child_rows: u64) -> u64 {
     ((child_rows.max(1) as f64).sqrt().ceil() as u64).max(1)
 }
 
-fn default_table_cardinality(ctx: &OptimizationContext) -> usize {
+fn default_table_cardinality(ctx: &CardinalityInputs<'_>) -> usize {
     match ctx.session.get_setting("default_table_cardinality") {
         Some(Value::BigInt(v)) if *v > 0 => *v as usize,
         Some(Value::Integer(v)) if *v > 0 => *v as usize,
@@ -1465,7 +1487,7 @@ fn estimate_join_condition_selectivity(
     right_bindings: &[ColumnBinding],
     left_rows: u64,
     right_rows: u64,
-    ctx: &OptimizationContext,
+    ctx: &CardinalityInputs<'_>,
 ) -> f64 {
     match condition.comparison {
         JoinComparisonType::Equal | JoinComparisonType::NotDistinctFrom => {
@@ -1515,8 +1537,7 @@ fn estimate_join_condition_selectivity(
         )
         .into(),
     );
-    ctx.cost_model
-        .estimate_selectivity(&expr, &ctx.column_stats)
+    ctx.cost_model.estimate_selectivity(&expr, ctx.column_stats)
 }
 
 fn join_comparison_to_comparison(comparison: JoinComparisonType) -> ComparisonType {
@@ -1645,6 +1666,12 @@ trait ColumnStatsView {
 }
 
 impl ColumnStatsView for OptimizationContext {
+    fn get_stat(&self, binding: &ColumnBinding) -> Option<Arc<ColumnStatistics>> {
+        self.column_stats.get(binding).cloned()
+    }
+}
+
+impl ColumnStatsView for CardinalityInputs<'_> {
     fn get_stat(&self, binding: &ColumnBinding) -> Option<Arc<ColumnStatistics>> {
         self.column_stats.get(binding).cloned()
     }
@@ -2468,7 +2495,12 @@ mod tests {
             },
             &[ColumnBinding::new(1, 0)],
             &[ColumnBinding::new(2, 0)],
-            &ctx,
+            &CardinalityInputs {
+                column_stats: &ctx.column_stats,
+                cost_model: &ctx.cost_model,
+                session: &ctx.session,
+                graph_stats: &mut ctx.graph_stats,
+            },
         )
         .expect("same-domain semi join estimate");
 

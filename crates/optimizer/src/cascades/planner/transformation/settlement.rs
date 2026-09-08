@@ -488,6 +488,7 @@ impl SettlementCache {
         }
         // Propagate this shell only. Input domains are immutable positional
         // snapshots, never recollected through another occurrence's bindings.
+        let input_column_stats = context.column_stats.clone();
         let mut propagator =
             StatisticsPropagator::with_statistics_map(context.column_stats.as_ref().clone());
         plan = plan.map_operator(|operator| {
@@ -526,8 +527,35 @@ impl SettlementCache {
             self.recipe_prefix = Some(recipes.checkpoint());
             return Ok(entry);
         }
-        let (plan, output, maximum) =
-            gathering.gather_local(plan, &child_layouts, &child_maxima, &mut context);
+        let (plan, output, maximum) = gathering.gather_local(
+            plan,
+            &child_layouts,
+            &child_maxima,
+            input_column_stats,
+            &mut context,
+        );
+        if tracing::enabled!(target: "paro::optimizer::settlement", tracing::Level::TRACE) {
+            let evidence = inputs
+                .iter()
+                .map(|id| {
+                    let fact = &self.facts[*id];
+                    (
+                        *id,
+                        fact.stats.estimated_cardinality,
+                        fact.layout
+                            .bindings()
+                            .iter()
+                            .zip(&fact.columns)
+                            .map(|(binding, statistics)| (*binding, statistics.distinct_evidence()))
+                            .collect::<Vec<_>>(),
+                    )
+                })
+                .collect::<Vec<_>>();
+            tracing::trace!(target: "paro::optimizer::settlement",
+                operator = ?plan.operator.op_type(), scalar_roots = ?key.scalars, ?evidence,
+                output = ?plan.stats.estimated_cardinality,
+                "derived node-local cardinality");
+        }
         // UNION inputs can deliberately have identical bindings (two domains
         // of the same producer). Merge their positional snapshots, not a map
         // in which the last visited branch overwrote the first.
@@ -1121,6 +1149,67 @@ mod tests {
         let full_id = cache.intern_column_value(&Arc::new(full)).unwrap();
         let partial_id = cache.intern_column_value(&Arc::new(partial)).unwrap();
         assert_ne!(full_id, partial_id);
+    }
+
+    #[test]
+    fn filter_estimates_input_domain_before_publishing_output_proof() {
+        use paro_planner::expression::{ComparisonExpression, ComparisonType};
+        use paro_planner::operator::Filter;
+        use paro_storage::statistics::BaseStatistics;
+
+        let env = environment();
+        let mut cache = SettlementCache::default();
+        let binding = ColumnBinding::new(0, 0);
+        let input = cache
+            .intern_fact(RelationFacts {
+                layout: LogicalOutputLayout::new(vec![LogicalType::Integer], vec![binding]),
+                stats: NodeStats {
+                    estimated_cardinality: Some(CardinalityEstimate::exact(5)),
+                    ..NodeStats::default()
+                },
+                maximum: None,
+                columns: vec![Arc::new(ColumnStatistics::with_estimated_distinct(
+                    BaseStatistics::create_unknown(LogicalType::Integer),
+                    Some(3),
+                ))],
+                column_ids: Box::new([]),
+            })
+            .unwrap();
+        let filter = OwnedLogicalPlan::new(
+            &env.bind_context,
+            LogicalOperator::Filter(Filter::new(
+                cache.boundary(0, input).unwrap(),
+                vec![Expression::Comparison(
+                    ComparisonExpression::new(
+                        ComparisonType::Equal,
+                        Expression::ColumnRef(
+                            ColumnRefExpression::new(binding, LogicalType::Integer).into(),
+                        ),
+                        Expression::Constant(
+                            ConstantExpression::new(Value::Integer(1), LogicalType::Integer).into(),
+                        ),
+                    )
+                    .into(),
+                )],
+            )),
+        );
+        let shell = LogicalPlanNode::from_shell(filter);
+        let mut arena = LogicalPlanArena::default();
+        let ctes = CteEnvironment::default();
+        for _ in 0..2 {
+            let result = cache
+                .local(shell.clone(), &[input], &ctes, &env, &mut arena)
+                .unwrap();
+            let facts = &cache.facts[result.facts];
+            assert_eq!(facts.stats.estimated_cardinality.unwrap().expected, 2);
+            assert_eq!(facts.columns[0].distinct_evidence().point, 1);
+            assert_eq!(facts.columns[0].guaranteed_distinct_upper(), Some(1));
+            assert_eq!(cache.facts[input].columns[0].distinct_evidence().point, 3);
+        }
+        assert_eq!(
+            cache.hits, 1,
+            "cache replay preserves the same input/output contract"
+        );
     }
 
     #[test]
