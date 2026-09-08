@@ -962,6 +962,35 @@ mod tests {
     }
 
     #[test]
+    fn limit_and_offset_keep_their_optional_operand_positions_in_cache_identity() {
+        let env = environment();
+        let value = Expression::Constant(
+            ConstantExpression::new(Value::BigInt(2), LogicalType::BigInt).into(),
+        );
+        let make = |limit, offset| {
+            OwnedLogicalPlan::new(
+                &env.bind_context,
+                LogicalOperator::Limit(Box::new(paro_planner::operator::Limit::new(
+                    values(&env.bind_context, 8),
+                    limit,
+                    offset,
+                ))),
+            )
+        };
+        let mut cache = SettlementCache::default();
+        let limited = cache.settle(make(Some(value.clone()), None), &env).unwrap();
+        let skipped = cache.settle(make(None, Some(value)), &env).unwrap();
+        let LogicalOperator::Limit(limited) = &limited.plan.operator else {
+            panic!("LIMIT")
+        };
+        let LogicalOperator::Limit(skipped) = &skipped.plan.operator else {
+            panic!("OFFSET")
+        };
+        assert!(limited.limit.is_some() && limited.offset.is_none());
+        assert!(skipped.limit.is_none() && skipped.offset.is_some());
+    }
+
+    #[test]
     fn a_local_boundary_preserves_expected_ndv_without_inventing_a_hard_bound() {
         let mut cache = SettlementCache::default();
         let facts = cache

@@ -79,6 +79,11 @@ pub(super) fn query_operator_identity<Child>(
             fingerprint.write_u64(table.parameterized as u64);
         }
         LogicalOperator::Limit(limit) => {
+            // Scalar roots retain traversal order, not the absent operand's
+            // slot. LIMIT n and OFFSET n have the same one-root sequence but
+            // different relational semantics.
+            fingerprint.write_u64(limit.limit.is_some() as u64);
+            fingerprint.write_u64(limit.offset.is_some() as u64);
             encode_hnsw_options(&mut fingerprint, limit.hnsw_options);
         }
         LogicalOperator::Order(order) => {
