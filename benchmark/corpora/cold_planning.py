@@ -19,7 +19,6 @@ import os
 import platform
 import subprocess
 import sys
-import tempfile
 import threading
 import time
 from pathlib import Path
@@ -28,7 +27,7 @@ from typing import Any
 import psycopg
 from psycopg import sql
 
-from benchmark_evidence import (ManagedParoServer, build_benchmark_server,
+from benchmark_evidence import (ImmutableDataSeed, isolated_paro_server, build_benchmark_server,
                                 content_digest, repository_identity, tree_digest)
 
 COMPONENTS = {"semantic_normalization", "query_ir_construction", "direct_physical_search",
@@ -92,10 +91,10 @@ def write_report(path: Path, report: dict[str, Any]) -> None:
 
 
 def sample(args: argparse.Namespace, binary: Path, query: str, name: str, block: int,
-           data_dir: Path) -> dict[str, Any]:
+           seed: ImmutableDataSeed) -> dict[str, Any]:
     result: dict[str, Any] = {"block": block, "status": "error"}
     log = args.report.with_suffix(f".{name}.{block}.parod.log")
-    with ManagedParoServer(binary, data_dir, args.listen, log,
+    with isolated_paro_server(binary, seed, args.listen, log,
                            max_memory=args.memory_limit, threads=args.threads) as server:
         result["server"] = server.identity()
         assert server.process is not None
@@ -158,14 +157,15 @@ def main() -> int:
     root = Path(__file__).resolve().parents[2]
     binary, build = build_benchmark_server(root, args.build_jobs,
                                            features=("alloc-metrics",) if args.alloc_metrics else ())
+    seed = ImmutableDataSeed.capture(args.server_data_dir)
     harness_files = (Path(__file__).resolve(), Path(__file__).with_name("benchmark_evidence.py"),
                      root / "benchmark/harness/cold_planning_gate.py")
     report: dict[str, Any] = {
-        "schema_version": 2,
+        "schema_version": 3,
         "configuration": {key: getattr(args, key) for key in ("process_blocks", "threads", "memory_limit",
                              "watchdog_seconds", "rss_limit_mb", "alloc_metrics")},
-        "evidence": {"build": build, "dataset_sha256": tree_digest(args.server_data_dir),
-                     "dataset_path": str(args.server_data_dir.resolve()),
+        "evidence": {"build": build, "dataset_sha256": seed.sha256,
+                     "dataset_path": str(seed.path),
                      "machine": {"system": platform.platform(), "machine": platform.machine(),
                                  "processor": platform.processor(), "host": platform.node(),
                                  "logical_cpus": os.cpu_count()},
@@ -184,11 +184,7 @@ def main() -> int:
                 # Startup mutates owner/checkpoint metadata even for EXPLAIN.
                 # Every sample starts from the same immutable seed, not the
                 # preceding process's database. Copying is outside the timer.
-                with tempfile.TemporaryDirectory(prefix="paro-cold-") as temporary:
-                    data_dir = Path(temporary) / "data"
-                    command = ["cp", "-cR"] if sys.platform == "darwin" else ["cp", "-R", "--reflink=auto"]
-                    subprocess.run([*command, str(args.server_data_dir.resolve()), str(data_dir)], check=True)
-                    measurement = sample(args, binary, query, path.stem, block, data_dir)
+                measurement = sample(args, binary, query, path.stem, block, seed)
             except Exception as error:
                 measurement = {"block": block, "status": "error", "error": f"{type(error).__name__}: {error}"}
             observation["samples"].append(measurement)

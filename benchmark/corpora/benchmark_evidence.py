@@ -7,14 +7,18 @@
 from __future__ import annotations
 
 import hashlib
+from contextlib import contextmanager
+from dataclasses import dataclass
 import os
 import random
 import socket
 import statistics
 import subprocess
+import sys
+import tempfile
 import time
 from pathlib import Path
-from typing import Any, Sequence
+from typing import Any, Iterator, Sequence
 
 
 def content_digest(path: Path) -> str:
@@ -34,6 +38,76 @@ def tree_digest(root: Path, include: tuple[str, ...] | None = None) -> str:
         digest.update(b"\0")
         digest.update(bytes.fromhex(content_digest(path)))
     return digest.hexdigest()
+
+
+def _validate_seed_files(root: Path) -> None:
+    if not root.is_dir():
+        raise ValueError(f"benchmark seed directory does not exist: {root}")
+    for path in root.rglob("*"):
+        # A retained symlink can direct a private server back into the seed or
+        # another user's database. Special files are not a persistent snapshot.
+        if path.is_symlink() or not (path.is_file() or path.is_dir()):
+            raise ValueError(f"benchmark seed contains a link or special file: {path}")
+
+
+@dataclass(frozen=True)
+class DataSnapshot:
+    path: Path
+    seed_path: Path
+    sha256: str
+
+    def identity(self) -> dict[str, str]:
+        return {"policy": "private_copy_per_process", "seed_path": str(self.seed_path),
+                "seed_sha256": self.sha256, "initial_sha256": self.sha256}
+
+
+@dataclass(frozen=True)
+class ImmutableDataSeed:
+    """A read-only input contract, not a directory a server may open in place."""
+
+    path: Path
+    sha256: str
+
+    @classmethod
+    def capture(cls, path: Path) -> "ImmutableDataSeed":
+        path = path.resolve()
+        _validate_seed_files(path)
+        return cls(path, tree_digest(path))
+
+    def verify_unchanged(self) -> None:
+        _validate_seed_files(self.path)
+        if tree_digest(self.path) != self.sha256:
+            raise RuntimeError("immutable benchmark seed changed during measurements")
+
+    @contextmanager
+    def snapshot(self) -> Iterator[DataSnapshot]:
+        with tempfile.TemporaryDirectory(prefix="paro-benchmark-snapshot-") as temporary:
+            path = Path(temporary).resolve() / "data"
+            command = ["cp", "-cR"] if sys.platform == "darwin" else ["cp", "-R", "--reflink=auto"]
+            subprocess.run([*command, str(self.path), str(path)], check=True)
+            _validate_seed_files(path)
+            # Verify the copy, rather than trusting path/size or assuming a
+            # concurrently changed input was copied as one coherent snapshot.
+            if tree_digest(path) != self.sha256:
+                raise RuntimeError("benchmark snapshot differs from its declared seed")
+            try:
+                yield DataSnapshot(path, self.path, self.sha256)
+            finally:
+                self.verify_unchanged()
+
+
+@contextmanager
+def isolated_paro_server(binary: Path, seed: ImmutableDataSeed, listen: str,
+                         log_path: Path, *, max_memory: str,
+                         threads: int) -> Iterator["ManagedParoServer"]:
+    """Every oracle and measurement process starts from the same verified input."""
+    if log_path.resolve().is_relative_to(seed.path):
+        raise ValueError("benchmark logs must not write into the immutable seed")
+    with seed.snapshot() as snapshot:
+        with ManagedParoServer(binary, snapshot.path, listen, log_path,
+                               max_memory=max_memory, threads=threads,
+                               input_snapshot=snapshot.identity()) as server:
+            yield server
 
 
 def repository_identity(root: Path) -> dict[str, Any]:
@@ -212,6 +286,7 @@ class ManagedParoServer:
         *,
         max_memory: str,
         threads: int,
+        input_snapshot: dict[str, str] | None = None,
     ) -> None:
         self.binary = binary.resolve()
         self.data_dir = data_dir.resolve()
@@ -219,6 +294,7 @@ class ManagedParoServer:
         self.log_path = log_path.resolve()
         self.max_memory = max_memory
         self.threads = max(1, threads)
+        self.input_snapshot = input_snapshot
         self.process: subprocess.Popen[bytes] | None = None
         self._log = None
         self._started_ns: int | None = None
@@ -291,6 +367,7 @@ class ManagedParoServer:
             "path": str(self.binary),
             "sha256": content_digest(self.binary),
             "data_dir": str(self.data_dir),
+            "input_snapshot": self.input_snapshot,
             "listen": self.listen,
             "log": str(self.log_path),
             "owned_by_harness": True,

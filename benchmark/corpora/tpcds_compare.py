@@ -23,7 +23,8 @@ import psycopg
 from psycopg import sql
 
 from benchmark_evidence import (
-    ManagedParoServer,
+    ImmutableDataSeed,
+    isolated_paro_server,
     build_benchmark_server,
     content_digest,
     hierarchical_abba_ratio,
@@ -337,6 +338,24 @@ def open_paro_connection(args: argparse.Namespace) -> psycopg.Connection[Any]:
     return connection
 
 
+def verify_measurement_inputs(repo_root: Path, binary: Path,
+                              args: argparse.Namespace, report: dict[str, Any]) -> None:
+    """Qualification requires the same source, binary, harness, SQL and data."""
+    checks = {
+        "source": repository_identity(repo_root) == report["source"] == report["build_attestation"]["source"],
+        "binary": content_digest(binary) == report["build_attestation"]["binary_sha256"],
+        "harness": all(content_digest(Path(item["path"])) == item["sha256"]
+                       for item in report["harness"]["files"]),
+        "SQL": tree_digest(args.query_dir, (".sql",)) == report["query_corpus_sha256"],
+        "source data": tree_digest(args.dataset_source_dir) == report["dataset"]["source_sha256"],
+        "Paro seed": tree_digest(args.server_data_dir) == report["dataset"]["paro_data_sha256"],
+        "DuckDB data": content_digest(args.duckdb_database) == report["dataset"]["duckdb_sha256"],
+    }
+    changed = [name for name, current in checks.items() if not current]
+    if changed:
+        raise RuntimeError(f"measurement inputs changed: {', '.join(changed)}")
+
+
 def main() -> int:
     args = parse_args()
     if not 1 <= args.start <= args.end <= 99:
@@ -356,6 +375,7 @@ def main() -> int:
 
     repo_root = Path(__file__).resolve().parents[2]
     server_binary, build = build_benchmark_server(repo_root, args.build_jobs)
+    seed = ImmutableDataSeed.capture(args.server_data_dir)
     harness_files = [
         Path(__file__).resolve(),
         Path(__file__).with_name("benchmark_evidence.py").resolve(),
@@ -363,7 +383,7 @@ def main() -> int:
         Path(__file__).with_name("tpcds_setup.py").resolve(),
     ]
     report: dict[str, Any] = {
-        "schema_version": 5,
+        "schema_version": 6,
         "corpus": "TPC-DS",
         "scale_factor": 1,
         "query_range": [args.start, args.end],
@@ -375,8 +395,8 @@ def main() -> int:
             "source_sha256": tree_digest(args.dataset_source_dir),
             "schema_sql_sha256": content_digest(args.dataset_source_dir / "schema.sql"),
             "load_sql_sha256": content_digest(args.dataset_source_dir / "load.sql"),
-            "paro_data_path": str(args.server_data_dir.resolve()),
-            "paro_data_sha256_before_run": tree_digest(args.server_data_dir),
+            "paro_data_path": str(seed.path),
+            "paro_data_sha256": seed.sha256,
             "duckdb_path": str(args.duckdb_database.resolve()),
             "duckdb_sha256": content_digest(args.duckdb_database),
             "requested_metadata_track": args.metadata_track,
@@ -407,6 +427,7 @@ def main() -> int:
             "measurement_order": (
                 "seeded_random_ABBA_per_round_within_fresh_process_block"
             ),
+            "paro_input_isolation": "private_copy_per_process",
             "paro_result_format": args.paro_result_format,
             "random_seed": args.random_seed,
         },
@@ -433,15 +454,15 @@ def main() -> int:
         result: dict[str, Any] = {"query": query_id}
         try:
             oracle_log = args.report.with_suffix(f".q{query_id}.oracle.parod.log")
-            oracle_server = ManagedParoServer(
+            oracle_server_context = isolated_paro_server(
                 server_binary,
-                args.server_data_dir,
+                seed,
                 args.listen,
                 oracle_log,
                 max_memory=args.memory_limit,
                 threads=args.threads,
             )
-            with oracle_server, DuckDBProcess(
+            with oracle_server_context as oracle_server, DuckDBProcess(
                 args.duckdb_database, args.threads, args.memory_limit
             ) as oracle_duck:
                 oracle_paro = open_paro_connection(args)
@@ -498,15 +519,15 @@ def main() -> int:
                 block_log = args.report.with_suffix(
                     f".q{query_id}.block{block_number:03d}.parod.log"
                 )
-                block_server = ManagedParoServer(
+                block_server_context = isolated_paro_server(
                     server_binary,
-                    args.server_data_dir,
+                    seed,
                     args.listen,
                     block_log,
                     max_memory=args.memory_limit,
                     threads=args.threads,
                 )
-                with block_server, DuckDBProcess(
+                with block_server_context as block_server, DuckDBProcess(
                     args.duckdb_database, args.threads, args.memory_limit
                 ) as duck_process:
                     paro = open_paro_connection(args)
@@ -583,6 +604,7 @@ def main() -> int:
             crossover = hierarchical_abba_ratio(blocks, args.bootstrap_samples)
             ratio = crossover["ratio"]
             confidence_high = crossover["hierarchical_confidence_interval_95"][1]
+            verify_measurement_inputs(repo_root, server_binary, args, report)
             evidence_qualifies = metadata_symmetric and confidence_high < 1
             result.update(
                 status="passed",

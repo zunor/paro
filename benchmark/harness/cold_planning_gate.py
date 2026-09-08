@@ -13,7 +13,7 @@ import statistics
 from pathlib import Path
 from typing import Any
 
-VERSION = 2
+VERSION = 3
 COUNTERS = ("search_complete", "memo_group_count", "memo_logical_expression_count",
             "memo_physical_expression_count", "settlement_local_hit_count", "settlement_local_miss_count",
             "search_rule_failure_count", "search_deadline_reached")
@@ -48,6 +48,7 @@ def validate(report: dict[str, Any]) -> dict[str, list[dict[str, Any]]]:
     if not isinstance(expected, int) or expected < 1:
         raise ValueError("invalid process block count")
     result = {}
+    snapshots = set()
     for query in queries:
         if not query.get("sql_sha256"):
             raise ValueError("missing SQL identity")
@@ -59,6 +60,16 @@ def validate(report: dict[str, Any]) -> dict[str, list[dict[str, Any]]]:
                 raise ValueError(f"unsuccessful sample: {query['name']}")
             if sample["server"]["sha256"] != evidence["build"]["binary_sha256"]:
                 raise ValueError("sample did not run the attested binary")
+            snapshot = sample["server"].get("input_snapshot") or {}
+            directory = sample["server"].get("data_dir")
+            if (snapshot.get("policy") != "private_copy_per_process"
+                    or snapshot.get("seed_path") != evidence["dataset_path"]
+                    or snapshot.get("seed_sha256") != evidence["dataset_sha256"]
+                    or snapshot.get("initial_sha256") != evidence["dataset_sha256"]
+                    or not directory or directory == evidence["dataset_path"]
+                    or directory in snapshots):
+                raise ValueError("sample has no independent verified seed snapshot")
+            snapshots.add(directory)
             for metric in METRICS:
                 positive(sample[metric])
             if sample["optimizer_ms"] > sample["explain_wall_ms"] * 1.01:

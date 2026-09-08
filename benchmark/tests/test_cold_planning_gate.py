@@ -9,12 +9,15 @@ from harness.cold_planning_gate import COUNTERS, evaluate
 
 def report():
     return {
-        "schema_version": 2, "configuration": {"process_blocks": 3, "runtime_environment": {"RUST_LOG": None}},
+        "schema_version": 3, "configuration": {"process_blocks": 3, "runtime_environment": {"RUST_LOG": None}},
         "evidence": {"build": {"binary_sha256": "binary", "source": {"commit": "commit",
                       "working_tree_sha256": "source"}}, "harness_sha256": "harness",
-                     "dataset_sha256": "data", "machine": "machine"},
+                     "dataset_sha256": "data", "dataset_path": "/seed", "machine": "machine"},
         "queries": [{"name": "q11", "sql_sha256": "original-sum-of-difference", "samples": [
-            {"block": block, "status": "ok", "server": {"pid": 100 + block, "sha256": "binary"},
+            {"block": block, "status": "ok", "server": {
+                "pid": 100 + block, "sha256": "binary", "data_dir": f"/snapshot/{block}",
+                "input_snapshot": {"policy": "private_copy_per_process", "seed_path": "/seed",
+                                   "seed_sha256": "data", "initial_sha256": "data"}},
              "explain_wall_ms": 20, "optimizer_ms": 15, "peak_rss_bytes": 1000, "plan_sha256": "plan",
              "counters": {counter: 0 if counter in ("search_rule_failure_count", "search_deadline_reached") else 1
                           for counter in COUNTERS}} for block in range(3)]}],
@@ -22,6 +25,20 @@ def report():
 
 
 class ColdPlanningGateTests(unittest.TestCase):
+    def test_reused_unverified_and_in_place_databases_are_not_fresh_samples(self):
+        for mutation in (
+            lambda s: s.pop("input_snapshot"),
+            lambda s: s["input_snapshot"].update(initial_sha256="different"),
+            lambda s: s["input_snapshot"].update(seed_path="/unrelated"),
+            lambda s: s.update(data_dir="/seed"),
+            lambda s: s.update(data_dir="/snapshot/1"),
+        ):
+            with self.subTest(mutation=mutation):
+                current = report()
+                mutation(current["queries"][0]["samples"][0]["server"])
+                with self.assertRaises(ValueError):
+                    evaluate(current)
+
     def test_deadline_and_logging_changes_cannot_claim_a_speedup(self):
         current = report()
         current["configuration"]["runtime_environment"]["RUST_LOG"] = "debug"
