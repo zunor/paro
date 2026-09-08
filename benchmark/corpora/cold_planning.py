@@ -35,6 +35,16 @@ COMPONENTS = {"semantic_normalization", "query_ir_construction", "direct_physica
               "memo_exploration", "physical_extraction", "winner_verification"}
 
 
+def diagnostic_rows(columns: list[str], rows: list[tuple]) -> list[dict[str, Any]]:
+    # pgwire may qualify unaliased system-function outputs. Accept the declared
+    # relation prefix, but never silently zip missing/duplicate metric fields.
+    columns = [name.removeprefix("paro_optimizers.") for name in columns]
+    expected = {"name", "kind", "last_elapsed_us", "metric_value", "metric_unit", "invocation_count"}
+    if len(columns) != len(expected) or set(columns) != expected:
+        raise ValueError("optimizer diagnostic schema differs from the measurement contract")
+    return [dict(zip(columns, row, strict=True)) for row in rows]
+
+
 class ProcessWatchdog:
     """Bound a single owned process even when cooperative query checks stall."""
 
@@ -107,7 +117,7 @@ def sample(args: argparse.Namespace, binary: Path, query: str, name: str, block:
                     result["plan_sha256"] = hashlib.sha256(result["plan"].encode()).hexdigest()
                     cursor = connection.execute("SELECT * FROM paro_optimizers()")
                     columns = [column.name for column in cursor.description or ()]
-                    diagnostics = [dict(zip(columns, row, strict=True)) for row in cursor.fetchall()]
+                    diagnostics = diagnostic_rows(columns, cursor.fetchall())
                     result["diagnostics"] = diagnostics
                     seen = {row["name"] for row in diagnostics if row["name"] in COMPONENTS}
                     if seen != COMPONENTS:
