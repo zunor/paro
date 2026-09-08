@@ -33,6 +33,13 @@ fn test_grant_classes() -> [ResourceGrantClass; 1] {
     }]
 }
 
+/// Memo winners are logical bindings, not executable vector positions. Tests
+/// which continue into physical extraction must use the production boundary.
+fn physical_input(mut plan: OwnedLogicalPlan) -> OwnedLogicalPlan {
+    crate::physical::slot_assignment::assign_expression_slots(&mut plan.operator).unwrap();
+    plan
+}
+
 #[test]
 fn persistent_region_scope_visits_shared_arena_nodes_once() {
     let mut memo = Memo::new(SearchBudget::default());
@@ -984,12 +991,60 @@ fn memo_window_winner_is_the_node_lowered_by_the_physical_extractor() {
             .with_winner_contracts(optimized.contracts)
             .with_enforcer_contracts(optimized.enforcers)
             .requiring_winner_contracts()
-            .extract(&optimized.plan)
+            .extract(&physical_input(optimized.plan))
             .unwrap();
     assert!(matches!(
         physical.node(physical.root).kind,
         crate::physical::PhysicalNodeKind::PartitionAggregateWindow(_)
     ));
+}
+
+#[test]
+fn selected_plan_reads_native_operands_not_the_legacy_scalar_payload() {
+    let bind_context = BindContext::new();
+    let original = Expression::Constant(
+        ConstantExpression::new(Value::Integer(42), LogicalType::Integer).into(),
+    );
+    let plan = OwnedLogicalPlan::new(
+        &bind_context,
+        LogicalOperator::Projection(Projection::new(
+            1,
+            OwnedLogicalPlan::new(&bind_context, LogicalOperator::DummyScan),
+            vec![original.clone()],
+        )),
+    );
+    let input = MemoBuilder::build(plan, bind_context, SearchBudget::default()).unwrap();
+    {
+        let mut state = input.planner_state.write().unwrap();
+        let mut overwritten = 0;
+        for payload in &mut state.payloads.logical {
+            if let LogicalOperator::Projection(projection) = &mut payload.semantic_template.operator
+            {
+                projection.expressions[0] = Expression::Constant(
+                    ConstantExpression::new(Value::Integer(999), LogicalType::Integer).into(),
+                );
+                overwritten += 1;
+            }
+        }
+        assert_eq!(overwritten, 1);
+    }
+    let output = input.optimize(&test_grant_classes()).unwrap();
+    let mut found = false;
+    output.variants[0]
+        .plan
+        .try_visit_pre_order(|plan| {
+            if let LogicalOperator::Projection(projection) = &plan.operator {
+                for expression in &projection.expressions {
+                    if matches!(expression, Expression::Constant(_)) {
+                        assert!(expression.equals(&original));
+                        found = true;
+                    }
+                }
+            }
+            Ok(())
+        })
+        .unwrap();
+    assert!(found);
 }
 
 #[test]
@@ -1323,7 +1378,7 @@ fn passthrough_projection_keeps_the_runtime_filter_consumer_lineage() {
             .with_winner_contracts(optimized.contracts)
             .with_enforcer_contracts(optimized.enforcers)
             .requiring_winner_contracts()
-            .extract(&optimized.plan)
+            .extract(&physical_input(optimized.plan))
             .unwrap();
     crate::physical::PhysicalPlanVerifier::verify(&physical).unwrap();
     assert!(physical.edges.iter().any(|edge| matches!(
@@ -1584,7 +1639,7 @@ fn union_all_probe_owns_one_runtime_filter_with_two_scan_consumers() {
             .with_winner_contracts(optimized.contracts)
             .with_enforcer_contracts(optimized.enforcers)
             .requiring_winner_contracts()
-            .extract(&optimized.plan)
+            .extract(&physical_input(optimized.plan))
             .unwrap();
     crate::physical::PhysicalPlanVerifier::verify(&physical).unwrap();
     let edges = physical
@@ -1651,7 +1706,7 @@ fn build_left_semi_join_filters_every_union_all_probe_source() {
             .with_winner_contracts(optimized.contracts)
             .with_enforcer_contracts(optimized.enforcers)
             .requiring_winner_contracts()
-            .extract(&optimized.plan)
+            .extract(&physical_input(optimized.plan))
             .unwrap();
     crate::physical::PhysicalPlanVerifier::verify(&physical).unwrap();
     assert_eq!(
@@ -1710,7 +1765,7 @@ fn global_sort_enforcer_is_extracted_as_an_executable_plan_node() {
         crate::physical::PhysicalPlanExtractor::new(crate::physical::ExtractionContext::default())
             .with_winner_contracts(optimized.contracts)
             .with_enforcer_contracts(optimized.enforcers)
-            .extract(&optimized.plan)
+            .extract(&physical_input(optimized.plan))
             .unwrap();
     assert!(matches!(
         physical.node(physical.root).kind,

@@ -47,6 +47,7 @@ pub(super) fn extract_planner_tree(
     )?;
     #[derive(Debug)]
     struct BuildTask {
+        logical: LogicalExprId,
         payload: PhysicalPayloadId,
         child_count: usize,
         output_columns: Box<[ColumnId]>,
@@ -240,6 +241,7 @@ pub(super) fn extract_planner_tree(
                     owned_artifacts,
                 };
                 tasks.push(Task::Build(Box::new(BuildTask {
+                    logical: physical.key.logical,
                     payload: physical.payload,
                     child_count: winner.children.len(),
                     output_columns: operator_metadata.output_columns.clone(),
@@ -266,6 +268,7 @@ pub(super) fn extract_planner_tree(
             }
             Task::Build(task) => {
                 let BuildTask {
+                    logical,
                     payload,
                     child_count,
                     output_columns,
@@ -311,6 +314,29 @@ pub(super) fn extract_planner_tree(
                     ));
                 }
                 if matches!(&payload.template, PlannerPhysicalTemplate::Logical(_)) {
+                    let logical = memo.logical_expr(logical).ok_or_else(|| {
+                        paro_error::internal("native extraction lost its selected logical operands")
+                    })?;
+                    crate::cascades::scalar_lowering::export_operator_scalars(
+                        &mut plan.operator,
+                        &logical.key.scalars,
+                        &state.scalars,
+                        &state.binding_ids,
+                        |child, column| {
+                            logical
+                                .key
+                                .children
+                                .get(child)
+                                .and_then(|group| memo.group(*group))
+                                .is_some_and(|group| group.schema.contains(column))
+                        },
+                        || {
+                            state
+                                .session
+                                .as_ref()
+                                .map_or(Ok(()), |session| session.cancellation.check())
+                        },
+                    )?;
                     plan = semantic_plan::freeze_output_layout(plan, &output_columns, state)?;
                 }
                 anchor_output_cardinality(&mut plan, output_estimate);

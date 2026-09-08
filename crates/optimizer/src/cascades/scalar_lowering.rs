@@ -19,9 +19,8 @@ use paro_external::routine::identity::{
 use paro_planner::expression::{
     ComparisonType, ConjunctionType, Expression, ExpressionIdentity, ExpressionIterator,
 };
-use paro_planner::operator::join::{Join, JoinComparisonType};
+use paro_planner::operator::join::JoinComparisonType;
 use paro_planner::operator::{ColumnBinding, LogicalOperator};
-use paro_planner::visitor::enumerate_expression_refs;
 
 use super::column::{ColumnCatalog, ColumnOrigin, ColumnVisibility};
 use super::ids::{ColumnId, Fingerprint, ScalarExprId, StableFingerprintBuilder};
@@ -31,7 +30,10 @@ use super::scalar::{
 };
 
 mod bindings;
+mod fields;
+mod operator_export;
 pub(crate) use bindings::BindingCatalog;
+pub(crate) use operator_export::export_operator_scalars;
 
 pub(crate) fn intern_operator_scalars<Child>(
     operator: &LogicalOperator<Child>,
@@ -41,6 +43,7 @@ pub(crate) fn intern_operator_scalars<Child>(
     columns: &mut ColumnCatalog,
     arena: &mut ScalarArena,
 ) -> Result<Box<[ScalarExprId]>> {
+    use fields::{OperandRef, ReferenceScope};
     let default_references = match operator {
         LogicalOperator::SearchScan(search) => {
             get_reference_columns(&search.get, binding_ids, columns)?
@@ -54,79 +57,52 @@ pub(crate) fn intern_operator_scalars<Child>(
             .flat_map(|columns| columns.iter().copied())
             .collect(),
     };
+    let left_columns = child_columns.first().map(Box::as_ref).unwrap_or(&[]);
+    let right_columns = child_columns.get(1).map(Box::as_ref).unwrap_or(&[]);
+    let mut reducer_columns = None;
     let mut roots = Vec::new();
-
-    match operator {
-        LogicalOperator::Aggregate(aggregate) => {
-            for expression in aggregate.groups.iter().chain(&aggregate.aggregates) {
-                roots.push(intern_expression(
-                    expression,
-                    &default_references,
-                    binding_ids,
-                    columns,
-                    arena,
-                )?);
+    fields::visit_fields(operator, |operand| {
+        let root = match operand {
+            OperandRef::Expression(expression, scope) => {
+                let references = match scope {
+                    ReferenceScope::Input => default_references.as_slice(),
+                    ReferenceScope::Output => output_columns,
+                    ReferenceScope::Left => left_columns,
+                    ReferenceScope::None => &[],
+                    ReferenceScope::Reducers => {
+                        if reducer_columns.is_none() {
+                            let LogicalOperator::Aggregate(aggregate) = operator else {
+                                return Err(paro_error::internal(
+                                    "reducer scope has no aggregate owner",
+                                ));
+                            };
+                            let reduction = aggregate.post_reduction.as_ref().ok_or_else(|| {
+                                paro_error::internal("reducer scope has no reduction owner")
+                            })?;
+                            reducer_columns = Some(
+                                reduction
+                                    .reducers
+                                    .iter()
+                                    .enumerate()
+                                    .map(|(ordinal, reducer)| {
+                                        binding_ids.intern_reducer_output(
+                                            reduction.reduction_index,
+                                            ordinal,
+                                            &reducer.return_type(),
+                                            columns,
+                                        )
+                                    })
+                                    .collect::<Result<Vec<_>>>()?,
+                            );
+                        }
+                        reducer_columns
+                            .as_deref()
+                            .ok_or_else(|| paro_error::internal("reducer scope lost its columns"))?
+                    }
+                };
+                intern_expression(expression, references, binding_ids, columns, arena)?
             }
-            if let Some(reduction) = &aggregate.post_reduction {
-                // The reducers consume finalized aggregate values, not input
-                // rows. Their scalar results form a third, operator-private
-                // coordinate system. In particular Reference(0) here must
-                // never alias the ordinary child's first column.
-                for reducer in &reduction.reducers {
-                    roots.push(intern_expression(
-                        reducer,
-                        &[],
-                        binding_ids,
-                        columns,
-                        arena,
-                    )?);
-                }
-                let reducer_columns = reduction
-                    .reducers
-                    .iter()
-                    .enumerate()
-                    .map(|(ordinal, reducer)| {
-                        binding_ids.intern_reducer_output(
-                            reduction.reduction_index,
-                            ordinal,
-                            &reducer.return_type(),
-                            columns,
-                        )
-                    })
-                    .collect::<Result<Vec<_>>>()?;
-                for expression in &reduction.scalar_expressions {
-                    roots.push(intern_expression(
-                        expression,
-                        &reducer_columns,
-                        binding_ids,
-                        columns,
-                        arena,
-                    )?);
-                }
-                roots.push(intern_expression(
-                    &reduction.predicate,
-                    &[],
-                    binding_ids,
-                    columns,
-                    arena,
-                )?);
-            }
-        }
-        LogicalOperator::Get(get) => {
-            for expression in &get.runtime_filter_expressions {
-                roots.push(intern_expression(
-                    expression,
-                    output_columns,
-                    binding_ids,
-                    columns,
-                    arena,
-                )?);
-            }
-        }
-        LogicalOperator::Join(Join::Comparison(join)) => {
-            let left_columns = child_columns.first().map(Box::as_ref).unwrap_or(&[]);
-            let right_columns = child_columns.get(1).map(Box::as_ref).unwrap_or(&[]);
-            for condition in &join.conditions {
+            OperandRef::Comparison(condition) => {
                 let left =
                     intern_expression(&condition.left, left_columns, binding_ids, columns, arena)?;
                 let right = intern_expression(
@@ -136,80 +112,9 @@ pub(crate) fn intern_operator_scalars<Child>(
                     columns,
                     arena,
                 )?;
-                roots.push(intern_comparison(
-                    join_comparison(condition.comparison),
-                    left,
-                    right,
-                    arena,
-                )?);
+                intern_comparison(join_comparison(condition.comparison), left, right, arena)?
             }
-            for expression in &join.duplicate_eliminated_columns {
-                roots.push(intern_expression(
-                    expression,
-                    left_columns,
-                    binding_ids,
-                    columns,
-                    arena,
-                )?);
-            }
-        }
-        LogicalOperator::GraphScan(scan) => {
-            if let Some(expression) = &scan.filter {
-                roots.push(intern_expression(
-                    expression,
-                    output_columns,
-                    binding_ids,
-                    columns,
-                    arena,
-                )?);
-            }
-        }
-        LogicalOperator::GraphExpand(expand) => {
-            for expression in [&expand.edge_filter, &expand.target_filter]
-                .into_iter()
-                .flatten()
-            {
-                roots.push(intern_expression(
-                    expression,
-                    &default_references,
-                    binding_ids,
-                    columns,
-                    arena,
-                )?);
-            }
-        }
-        LogicalOperator::GraphMatch(graph) => {
-            for element in &graph.bound_pattern.elements {
-                let filter = match element {
-                    paro_planner::binder::bind::graph::BoundPatternElement::Vertex(vertex) => {
-                        vertex.filter.as_ref()
-                    }
-                    paro_planner::binder::bind::graph::BoundPatternElement::Edge(edge) => {
-                        edge.filter.as_ref()
-                    }
-                };
-                if let Some(filter) = filter {
-                    roots.push(intern_expression(
-                        filter,
-                        &default_references,
-                        binding_ids,
-                        columns,
-                        arena,
-                    )?);
-                }
-            }
-            for column in &graph.columns {
-                roots.push(intern_expression(
-                    &column.expr,
-                    &default_references,
-                    binding_ids,
-                    columns,
-                    arena,
-                )?);
-            }
-        }
-        LogicalOperator::Window(window) => {
-            for expression in &window.expressions {
+            OperandRef::Window(expression) => {
                 let mut children = Vec::new();
                 ExpressionIterator::enumerate_window_children(expression, |child| {
                     children.push(child)
@@ -220,7 +125,7 @@ pub(crate) fn intern_operator_scalars<Child>(
                         intern_expression(child, &default_references, binding_ids, columns, arena)
                     })
                     .collect::<Result<Box<[_]>>>()?;
-                roots.push(arena.intern(ScalarSpec {
+                arena.intern(ScalarSpec {
                     kind: ScalarKind::Window {
                         function: ScalarWindow::from_bound(expression),
                     },
@@ -230,31 +135,12 @@ pub(crate) fn intern_operator_scalars<Child>(
                         may_error: true,
                         ..Default::default()
                     },
-                })?);
+                })?
             }
-        }
-        _ => {
-            let mut error = None;
-            enumerate_expression_refs(operator, |expression| {
-                if error.is_some() {
-                    return;
-                }
-                match intern_expression(
-                    expression,
-                    &default_references,
-                    binding_ids,
-                    columns,
-                    arena,
-                ) {
-                    Ok(root) => roots.push(root),
-                    Err(failure) => error = Some(failure),
-                }
-            });
-            if let Some(error) = error {
-                return Err(error);
-            }
-        }
-    }
+        };
+        roots.push(root);
+        Ok(())
+    })?;
     Ok(roots.into_boxed_slice())
 }
 
@@ -1200,7 +1086,7 @@ mod tests {
                 .unwrap()
             })
             .collect::<Vec<_>>();
-        let operator = LogicalOperator::Aggregate(Box::new(aggregate));
+        let mut operator = LogicalOperator::Aggregate(Box::new(aggregate));
         let mut arena = ScalarArena::default();
         let roots = intern_operator_scalars(
             &operator,
@@ -1231,6 +1117,26 @@ mod tests {
             ColumnVisibility::Hidden
         );
         assert_eq!(refs(roots[4]), [ids[2], ids[4]].into());
+
+        // Export must retain the private reducer coordinate, not turn every
+        // native ColumnId back into a relational ColumnRef.
+        export_operator_scalars(
+            &mut operator,
+            &roots,
+            &arena,
+            &bindings,
+            |child, column| child == 0 && column == ids[0],
+            || Ok(()),
+        )
+        .unwrap();
+        let LogicalOperator::Aggregate(exported) = &operator else {
+            unreachable!()
+        };
+        exported.verify_post_reduction().unwrap();
+        assert!(
+            matches!(&exported.post_reduction.as_ref().unwrap().scalar_expressions[0],
+            Expression::Reference(reference) if reference.index == 0)
+        );
 
         // A wider source cannot make a nonexistent reducer slot valid.
         let LogicalOperator::Aggregate(mut aggregate) = operator else {
