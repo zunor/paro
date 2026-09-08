@@ -46,7 +46,7 @@ fn boundary_value_identity_retains_which_operand_owns_each_fact() {
         children: vec![PatternOperand::Group(groups[1])].into_boxed_slice(),
     };
     let facts = |rows| {
-        Arc::new(GroupFacts {
+        Arc::new(GroupFacts::from(GroupFactValue {
             cardinality: Some(CardinalityEnvelope {
                 lower: rows,
                 expected_lower: rows,
@@ -54,7 +54,7 @@ fn boundary_value_identity_retains_which_operand_owns_each_fact() {
                 upper: rows,
             }),
             ..Default::default()
-        })
+        }))
     };
     let (small, large) = (facts(1), facts(100));
     let before = BoundarySnapshot {
@@ -74,18 +74,18 @@ fn boundary_value_identity_includes_grouping_proofs_and_finite_domains() {
     let group = GroupId(0);
     let encoded = |facts| {
         let snapshot = BoundarySnapshot {
-            groups: BTreeMap::from([(group, Arc::new(facts))]),
+            groups: BTreeMap::from([(group, Arc::new(GroupFacts::from(facts)))]),
         };
         let mut encoder = StableFingerprintBuilder::recording();
         snapshot.encode_group(group, &mut encoder).unwrap();
         encoder.finish_recording().1
     };
-    let unknown = encoded(GroupFacts::default());
-    let grouping = encoded(GroupFacts {
+    let unknown = encoded(GroupFactValue::default());
+    let grouping = encoded(GroupFactValue {
         grouping_unique_keys: BTreeSet::from([vec![ColumnId(1)].into_boxed_slice()]),
         ..Default::default()
     });
-    let domain = encoded(GroupFacts {
+    let domain = encoded(GroupFactValue {
         grouping_domains: BTreeMap::from([(
             ColumnId(1),
             BTreeSet::from([SafeGroupingValue::Integer(5)]),
@@ -95,6 +95,26 @@ fn boundary_value_identity_includes_grouping_proofs_and_finite_domains() {
     assert_ne!(unknown, grouping);
     assert_ne!(unknown, domain);
     assert_ne!(grouping, domain);
+}
+
+#[test]
+fn immutable_fact_identity_is_computed_once_and_keeps_the_exact_encoding_contract() {
+    let facts = GroupFacts::from(GroupFactValue {
+        grouping_domains: BTreeMap::from([(
+            ColumnId(1),
+            BTreeSet::from([SafeGroupingValue::Varchar("known".into())]),
+        )]),
+        ..Default::default()
+    });
+    assert!(facts.fingerprint.get().is_none());
+    let mut direct = StableFingerprintBuilder::default();
+    direct.write_bytes(b"paro.memo.boundary-value.v1");
+    facts.value.encode(&mut direct);
+    let expected = direct.finish();
+    for _ in 0..1_000 {
+        assert_eq!(facts.fingerprint(), expected);
+        assert_eq!(facts.fingerprint.get(), Some(&expected));
+    }
 }
 
 fn grouped_branch_with_tag(

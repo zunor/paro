@@ -32,7 +32,7 @@ fn encode_distinct_provenance(
 }
 
 #[derive(Debug, Default, PartialEq, Eq)]
-struct GroupFacts {
+struct GroupFactValue {
     can_replay: bool,
     column_domains: BTreeMap<ColumnId, GroupColumnDomain>,
     column_values: BTreeMap<ColumnId, paro_planner::operator::bound_reference::BoundColumnValues>,
@@ -50,6 +50,123 @@ struct GroupFacts {
     maximum_cardinality: Option<u64>,
     lineage: BTreeMap<ColumnId, Option<Vec<BoundSourceColumn>>>,
     control: bool,
+}
+
+/// Published immutable evidence owns its lazy value identity. A revision is a
+/// read cursor, not part of this identity; repeated binding checks reuse it
+/// without serializing every column, source lineage, and grouping proof.
+#[derive(Debug, Default)]
+struct GroupFacts {
+    value: GroupFactValue,
+    fingerprint: std::sync::OnceLock<Fingerprint>,
+}
+
+impl From<GroupFactValue> for GroupFacts {
+    fn from(value: GroupFactValue) -> Self {
+        Self {
+            value,
+            fingerprint: std::sync::OnceLock::new(),
+        }
+    }
+}
+
+impl std::ops::Deref for GroupFacts {
+    type Target = GroupFactValue;
+    fn deref(&self) -> &Self::Target {
+        &self.value
+    }
+}
+
+impl GroupFacts {
+    fn fingerprint(&self) -> Fingerprint {
+        *self.fingerprint.get_or_init(|| {
+            let mut encoder = StableFingerprintBuilder::default();
+            encoder.write_bytes(b"paro.memo.boundary-value.v1");
+            self.value.encode(&mut encoder);
+            encoder.finish()
+        })
+    }
+}
+
+impl GroupFactValue {
+    fn encode(&self, encoder: &mut StableFingerprintBuilder) {
+        let facts = self;
+        encoder.write_u64(facts.relational as u64);
+        encoder.write_u64(facts.cardinality.is_some() as u64);
+        if let Some(range) = facts.cardinality {
+            for value in [
+                range.lower,
+                range.expected_lower,
+                range.expected_upper,
+                range.upper,
+            ] {
+                encoder.write_u64(value);
+            }
+        }
+        encoder.write_u64(facts.control as u64);
+        encoder.write_u64(facts.can_replay as u64);
+        encoder.write_u64(facts.maximum_cardinality.is_some() as u64);
+        encoder.write_u64(facts.maximum_cardinality.unwrap_or(0));
+        encoder.write_u64(facts.column_domains.len() as u64);
+        for (column, domain) in &facts.column_domains {
+            encoder.write_u64(column.0 as u64);
+            encoder.write_u64(domain.expected_lower);
+            encoder.write_u64(domain.expected_upper);
+            encoder.write_u64(domain.ranking_point);
+            encode_distinct_provenance(encoder, domain.provenance);
+            encoder.write_u64(domain.guaranteed_upper.is_some() as u64);
+            encoder.write_u64(domain.guaranteed_upper.unwrap_or(0));
+        }
+        encoder.write_u64(facts.column_values.len() as u64);
+        for (column, value) in &facts.column_values {
+            encoder.write_u64(column.0 as u64);
+            encoder.write_bytes(value.encoding());
+        }
+        encoder.write_u64(facts.unique_keys.len() as u64);
+        for key in &facts.unique_keys {
+            encoder.write_u64(key.len() as u64);
+            for column in key {
+                encoder.write_u64(column.0 as u64);
+            }
+        }
+        encoder.write_u64(facts.grouping_unique_keys.len() as u64);
+        for key in &facts.grouping_unique_keys {
+            encoder.write_u64(key.len() as u64);
+            for column in key {
+                encoder.write_u64(column.0 as u64);
+            }
+        }
+        encoder.write_u64(facts.grouping_domains.len() as u64);
+        for (column, domain) in &facts.grouping_domains {
+            encoder.write_u64(column.0 as u64);
+            encoder.write_u64(domain.len() as u64);
+            for value in domain {
+                value.encode(encoder);
+            }
+        }
+        encoder.write_u64(facts.lineage.len() as u64);
+        for (column, sources) in &facts.lineage {
+            encoder.write_u64(column.0 as u64);
+            encoder.write_u64(sources.is_some() as u64);
+            if let Some(sources) = sources {
+                encoder.write_u64(sources.len() as u64);
+                for source in sources {
+                    for value in [source.source, source.occurrence, source.column] {
+                        encoder.write_u64(value as u64);
+                    }
+                    encoder.write_u64(source.rows.is_some() as u64);
+                    if let Some(rows) = source.rows {
+                        for value in [rows.min, rows.expected, rows.max] {
+                            encoder.write_u64(value);
+                        }
+                    }
+                    encoder.write_u64(source.distinct.is_some() as u64);
+                    encoder.write_u64(source.distinct.unwrap_or(0));
+                    encoder.write_u64(source.unique as u64);
+                }
+            }
+        }
+    }
 }
 
 /// Values whose SQL grouping equality is total and matches structural
@@ -255,7 +372,7 @@ impl BoundarySnapshot {
     ) -> Result<()> {
         let group = memo.canonical_group(group);
         let facts = self.derive(memo, state, group, true)?;
-        self.groups.insert(group, Arc::new(facts));
+        self.groups.insert(group, Arc::new(facts.into()));
         Ok(())
     }
 
@@ -283,10 +400,11 @@ impl BoundarySnapshot {
         }
         let mut values = Vec::with_capacity(groups.len());
         for group in groups {
-            let mut value = StableFingerprintBuilder::default();
-            value.write_bytes(b"paro.memo.boundary-value.v1");
-            self.encode_group(group, &mut value)?;
-            values.push((group, value.finish()));
+            let facts = self
+                .groups
+                .get(&group)
+                .ok_or_else(|| paro_error::internal("binding identity read unobserved facts"))?;
+            values.push((group, facts.fingerprint()));
         }
         let mut encoder = StableFingerprintBuilder::default();
         encoder.write_bytes(b"paro.memo.boundary-binding-value.v2");
@@ -310,81 +428,7 @@ impl BoundarySnapshot {
             .groups
             .get(&group)
             .ok_or_else(|| paro_error::internal("graph identity read unobserved facts"))?;
-        encoder.write_u64(facts.relational as u64);
-        encoder.write_u64(facts.cardinality.is_some() as u64);
-        if let Some(range) = facts.cardinality {
-            for value in [
-                range.lower,
-                range.expected_lower,
-                range.expected_upper,
-                range.upper,
-            ] {
-                encoder.write_u64(value);
-            }
-        }
-        encoder.write_u64(facts.control as u64);
-        encoder.write_u64(facts.can_replay as u64);
-        encoder.write_u64(facts.maximum_cardinality.is_some() as u64);
-        encoder.write_u64(facts.maximum_cardinality.unwrap_or(0));
-        encoder.write_u64(facts.column_domains.len() as u64);
-        for (column, domain) in &facts.column_domains {
-            encoder.write_u64(column.0 as u64);
-            encoder.write_u64(domain.expected_lower);
-            encoder.write_u64(domain.expected_upper);
-            encoder.write_u64(domain.ranking_point);
-            encode_distinct_provenance(encoder, domain.provenance);
-            encoder.write_u64(domain.guaranteed_upper.is_some() as u64);
-            encoder.write_u64(domain.guaranteed_upper.unwrap_or(0));
-        }
-        encoder.write_u64(facts.column_values.len() as u64);
-        for (column, value) in &facts.column_values {
-            encoder.write_u64(column.0 as u64);
-            encoder.write_bytes(value.encoding());
-        }
-        encoder.write_u64(facts.unique_keys.len() as u64);
-        for key in &facts.unique_keys {
-            encoder.write_u64(key.len() as u64);
-            for column in key {
-                encoder.write_u64(column.0 as u64);
-            }
-        }
-        encoder.write_u64(facts.grouping_unique_keys.len() as u64);
-        for key in &facts.grouping_unique_keys {
-            encoder.write_u64(key.len() as u64);
-            for column in key {
-                encoder.write_u64(column.0 as u64);
-            }
-        }
-        encoder.write_u64(facts.grouping_domains.len() as u64);
-        for (column, domain) in &facts.grouping_domains {
-            encoder.write_u64(column.0 as u64);
-            encoder.write_u64(domain.len() as u64);
-            for value in domain {
-                value.encode(encoder);
-            }
-        }
-        encoder.write_u64(facts.lineage.len() as u64);
-        for (column, sources) in &facts.lineage {
-            encoder.write_u64(column.0 as u64);
-            encoder.write_u64(sources.is_some() as u64);
-            if let Some(sources) = sources {
-                encoder.write_u64(sources.len() as u64);
-                for source in sources {
-                    for value in [source.source, source.occurrence, source.column] {
-                        encoder.write_u64(value as u64);
-                    }
-                    encoder.write_u64(source.rows.is_some() as u64);
-                    if let Some(rows) = source.rows {
-                        for value in [rows.min, rows.expected, rows.max] {
-                            encoder.write_u64(value);
-                        }
-                    }
-                    encoder.write_u64(source.distinct.is_some() as u64);
-                    encoder.write_u64(source.distinct.unwrap_or(0));
-                    encoder.write_u64(source.unique as u64);
-                }
-            }
-        }
+        facts.value.encode(encoder);
         Ok(())
     }
     /// Traverse the evidence DAG once, admitting every group, shell, edge and
@@ -568,9 +612,9 @@ impl BoundarySnapshot {
                 let facts = cache
                     .entries
                     .get(&(group, relational))
-                    .filter(|cached| cached.facts.as_ref() == &derived)
+                    .filter(|cached| cached.facts.value == derived)
                     .map(|cached| cached.facts.clone())
-                    .unwrap_or_else(|| Arc::new(derived));
+                    .unwrap_or_else(|| Arc::new(derived.into()));
                 cache.entries.insert(
                     (group, relational),
                     CachedFacts {
@@ -788,7 +832,7 @@ impl BoundarySnapshot {
         state: &PlannerTransformState,
         id: GroupId,
         relational: bool,
-    ) -> Result<GroupFacts> {
+    ) -> Result<GroupFactValue> {
         let group = memo
             .group(id)
             .ok_or_else(|| paro_error::internal("fact derivation lost group"))?;
@@ -827,13 +871,13 @@ impl BoundarySnapshot {
         cardinality =
             cardinality.map(|range| range.clamp(group.logical_properties.maximum_cardinality));
         if !relational {
-            return Ok(GroupFacts {
+            return Ok(GroupFactValue {
                 cardinality,
                 maximum_cardinality: group.logical_properties.maximum_cardinality,
                 column_domains,
                 column_values,
                 control: true,
-                ..GroupFacts::default()
+                ..GroupFactValue::default()
             });
         }
         let mut common: Option<BTreeMap<ColumnId, Option<Vec<BoundSourceColumn>>>> = None;
@@ -1308,7 +1352,7 @@ impl BoundarySnapshot {
                 common_grouping_domains = Some(local_grouping_domains);
             }
         }
-        Ok(GroupFacts {
+        Ok(GroupFactValue {
             column_domains,
             column_values,
             can_replay,
