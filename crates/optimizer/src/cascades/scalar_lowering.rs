@@ -28,7 +28,8 @@ use paro_planner::visitor::enumerate_expression_refs;
 use super::column::{ColumnCatalog, ColumnOrigin, ColumnVisibility};
 use super::ids::{ColumnId, Fingerprint, ScalarExprId, StableFingerprintBuilder};
 use super::scalar::{
-    ComparisonOp, ScalarArena, ScalarKind, ScalarLocalProperties, ScalarSpec, Volatility,
+    ComparisonOp, ScalarArena, ScalarKind, ScalarLiteral, ScalarLocalProperties, ScalarSpec,
+    Volatility,
 };
 
 type BindingKey = (usize, usize, u32);
@@ -456,7 +457,14 @@ fn intern_expression_node(
                 columns,
             )?;
             arena.intern(ScalarSpec {
-                kind: ScalarKind::Column(column_id),
+                kind: if column.depth == 0 {
+                    ScalarKind::Column(column_id)
+                } else {
+                    ScalarKind::CorrelatedColumn {
+                        column: column_id,
+                        depth: column.depth,
+                    }
+                },
                 logical_type: column.return_type.clone(),
                 children: Box::new([]),
                 local_properties: ScalarLocalProperties::default(),
@@ -482,7 +490,7 @@ fn intern_expression_node(
         }
         Expression::Constant(constant) => arena.intern(ScalarSpec {
             kind: ScalarKind::Constant {
-                value: value_fingerprint(&constant.value),
+                value: ScalarLiteral::from_bound(constant),
             },
             logical_type: constant.return_type.clone(),
             children: Box::new([]),
@@ -1153,6 +1161,37 @@ fn typed_binding_fingerprint(binding: ColumnBinding, type_domain: Fingerprint) -
 mod tests {
     use super::*;
     use paro_planner::expression::{CaseExpression, ConjunctionExpression, ConstantExpression};
+
+    #[test]
+    fn lowering_retains_lexical_depth_in_column_identity() {
+        let mut arena = ScalarArena::default();
+        let mut bindings = BindingCatalog::default();
+        let mut columns = ColumnCatalog::default();
+        let roots = (0..3)
+            .map(|depth| {
+                let expression = Expression::ColumnRef(
+                    paro_planner::expression::ColumnRefExpression::with_depth(
+                        ColumnBinding::new(0, 0),
+                        LogicalType::Integer,
+                        depth,
+                    )
+                    .into(),
+                );
+                intern_expression(&expression, &[], &mut bindings, &mut columns, &mut arena)
+                    .unwrap()
+            })
+            .collect::<Vec<_>>();
+        assert_ne!(roots[0], roots[1]);
+        assert_ne!(roots[1], roots[2]);
+        assert_ne!(
+            arena.get(roots[0]).unwrap().fingerprint,
+            arena.get(roots[1]).unwrap().fingerprint
+        );
+        assert!(matches!(
+            arena.get(roots[2]).unwrap().kind,
+            ScalarKind::CorrelatedColumn { depth: 2, .. }
+        ));
+    }
 
     #[test]
     fn shared_associative_dag_is_lowered_as_one_idempotent_domain() {

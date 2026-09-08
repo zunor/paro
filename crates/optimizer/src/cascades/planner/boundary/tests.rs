@@ -252,6 +252,87 @@ fn native_boundary_retains_alias_lineage_and_records_inherited_statistics() {
 }
 
 #[test]
+fn projection_domains_and_lineage_consume_native_operands_not_extraction_scalars() {
+    let plan = OwnedLogicalPlan::synthetic(LogicalOperator::Projection(Projection::new(
+        1,
+        source(0),
+        vec![
+            Expression::ColumnRef(
+                ColumnRefExpression::new(ColumnBinding::new(0, 0), LogicalType::Integer).into(),
+            ),
+            Expression::Constant(
+                ConstantExpression::new(Value::Varchar("native".into()), LogicalType::Varchar)
+                    .into(),
+            ),
+        ],
+    )));
+    let mut input = input(plan, SearchBudget::default());
+    let mut state = input.planner_state.write().unwrap();
+    let expr = input.memo.group(input.root).unwrap().logical_exprs()[0];
+    let payload = input.memo.logical_expr(expr).unwrap().payload;
+    let output_columns = state.metadata[&payload].output_columns.clone();
+    // Deliberately poison the extraction-only scalar carrier. These two fact
+    // recipes must use the immutable ColumnId/ScalarExprId operands instead.
+    let LogicalOperator::Projection(projection) = &mut state.payloads.logical[payload.index()]
+        .semantic_template
+        .operator
+    else {
+        panic!("projection fixture")
+    };
+    projection.expressions = vec![
+        Expression::Constant(
+            ConstantExpression::new(Value::Integer(99), LogicalType::Integer).into(),
+        ),
+        Expression::Constant(
+            ConstantExpression::new(Value::Varchar("carrier".into()), LogicalType::Varchar).into(),
+        ),
+    ];
+    let mut context = TransformContext::new(&mut input.memo, input.root);
+    let snapshot = BoundarySnapshot::read(
+        &mut context,
+        &state,
+        &PatternOperand::Group(input.root),
+        BudgetDimension::RuleWorkPerGroup,
+    )
+    .unwrap()
+    .unwrap();
+    let facts = &snapshot.groups[&input.root];
+    assert_eq!(
+        facts.grouping_domains[&output_columns[1]],
+        BTreeSet::from([SafeGroupingValue::Varchar("native".into())])
+    );
+    let lineage = facts.lineage[&output_columns[0]].as_ref().unwrap();
+    assert_eq!(lineage.len(), 1);
+    assert_eq!(lineage[0].source, 0);
+}
+
+#[test]
+fn outer_column_with_a_matching_binding_is_not_a_local_lineage_proof() {
+    let plan = OwnedLogicalPlan::synthetic(LogicalOperator::Projection(Projection::new(
+        1,
+        source(0),
+        vec![Expression::ColumnRef(
+            ColumnRefExpression::with_depth(ColumnBinding::new(0, 0), LogicalType::Integer, 1)
+                .into(),
+        )],
+    )));
+    let mut input = input(plan, SearchBudget::default());
+    let state = input.planner_state.read().unwrap();
+    let mut context = TransformContext::new(&mut input.memo, input.root);
+    let snapshot = BoundarySnapshot::read(
+        &mut context,
+        &state,
+        &PatternOperand::Group(input.root),
+        BudgetDimension::RuleWorkPerGroup,
+    )
+    .unwrap()
+    .unwrap();
+    let facts = &snapshot.groups[&input.root];
+    assert!(facts.lineage.values().all(Option::is_none));
+    assert!(facts.grouping_domains.is_empty());
+}
+
+#[test]
 fn value_domain_change_invalidates_the_fact_value_not_only_the_read_cursor() {
     use paro_planner::operator::bound_reference::BoundColumnValues;
     use paro_storage::statistics::BaseStatistics;

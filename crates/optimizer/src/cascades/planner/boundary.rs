@@ -4,6 +4,7 @@
 //! Fact-backed Memo boundaries. No logical tree or representative is built.
 
 use super::*;
+use crate::cascades::scalar::ScalarKind;
 use paro_common::runtime_value::Value;
 use paro_planner::operator::bound_reference::{BoundRelationFacts, BoundSourceColumn};
 use paro_planner::plan::{UniqueKey, UniqueKeyColumn, UniqueKeyNullSemantics, UniqueKeyProvenance};
@@ -1015,46 +1016,41 @@ impl BoundarySnapshot {
                     )
                     .copied()
             };
-            let expression_column = |expression: &Expression, index: usize| -> Option<ColumnId> {
-                match expression {
-                    Expression::ColumnRef(column) if column.depth == 0 => state
-                        .binding_ids
-                        .get(
-                            column.binding.table_index,
-                            column.binding.column_index,
-                            &column.return_type,
-                        )
-                        .copied(),
-                    Expression::Reference(reference) => column_at(index, reference.index),
+            let scalar_column = |root: ScalarExprId| -> Option<ColumnId> {
+                match state.scalars.get(root)?.kind {
+                    ScalarKind::Column(column) => Some(column),
                     _ => None,
                 }
             };
-            let expression_domain = |expression: &Expression, index: usize| {
-                if let Expression::Constant(constant) = expression {
+            let scalar_domain = |root: ScalarExprId, index: usize| {
+                let scalar = state.scalars.get(root)?;
+                if let ScalarKind::Constant { value } = &scalar.kind {
                     if matches!(
-                        constant.return_type,
+                        scalar.logical_type,
                         paro_common::types::LogicalType::VarcharCollation(_)
                     ) {
                         return None;
                     }
-                    return SafeGroupingValue::from_value(&constant.value)
+                    return SafeGroupingValue::from_value(value.value())
                         .map(|value| BTreeSet::from([value]));
                 }
-                let column = expression_column(expression, index)?;
+                let column = scalar_column(root)?;
                 child(index)?.grouping_domains.get(&column).cloned()
             };
             let mut local_grouping_domains = BTreeMap::new();
             for (ordinal, output) in metadata.output_columns.iter().copied().enumerate() {
                 let domain = match operator {
-                    LogicalOperator::Projection(projection) => projection
-                        .expressions
+                    LogicalOperator::Projection(_) => logical
+                        .key
+                        .scalars
                         .get(ordinal)
-                        .and_then(|expression| expression_domain(expression, 0)),
+                        .and_then(|root| scalar_domain(*root, 0)),
                     LogicalOperator::Aggregate(aggregate) if ordinal < aggregate.groups.len() => {
-                        aggregate
-                            .groups
+                        logical
+                            .key
+                            .scalars
                             .get(ordinal)
-                            .and_then(|expression| expression_domain(expression, 0))
+                            .and_then(|root| scalar_domain(*root, 0))
                     }
                     LogicalOperator::SetOperation(setop)
                         if setop.setop_type == paro_planner::operator::SetOpType::Union
@@ -1207,10 +1203,11 @@ impl BoundarySnapshot {
                         })
                         .and_then(|(index, _)| source(&search.get, index)),
                     LogicalOperator::Filter(_) => lineage(0, column),
-                    LogicalOperator::Projection(projection) => projection
-                        .expressions
+                    LogicalOperator::Projection(_) => logical
+                        .key
+                        .scalars
                         .get(ordinal)
-                        .and_then(|expression| expression_column(expression, 0))
+                        .and_then(|root| scalar_column(*root))
                         .and_then(|column| lineage(0, column)),
                     LogicalOperator::SetOperation(setop)
                         if setop.setop_type == paro_planner::operator::SetOpType::Union

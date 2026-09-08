@@ -10,6 +10,9 @@ use paro_common::types::LogicalType;
 
 use super::ids::{ColumnId, Fingerprint, ScalarExprId, StableFingerprintBuilder};
 
+mod literal;
+pub use literal::ScalarLiteral;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum Volatility {
     Immutable,
@@ -57,19 +60,39 @@ impl ComparisonOp {
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum ScalarKind {
-    Constant { value: Fingerprint },
+    Constant {
+        value: ScalarLiteral,
+    },
     Column(ColumnId),
+    /// An outer lexical scope is not a column of this relational input. Keep
+    /// its depth even when the bound column id happens to be the same.
+    CorrelatedColumn {
+        column: ColumnId,
+        depth: usize,
+    },
     Parameter(u32),
-    Function { routine: Fingerprint },
-    Cast { try_cast: bool },
+    Function {
+        routine: Fingerprint,
+    },
+    Cast {
+        try_cast: bool,
+    },
     And,
     Or,
     Comparison(ComparisonOp),
     Case,
-    Operator { operator: Fingerprint },
-    Aggregate { function: Fingerprint },
-    BoundSubquery { query: Fingerprint },
-    Window { function: Fingerprint },
+    Operator {
+        operator: Fingerprint,
+    },
+    Aggregate {
+        function: Fingerprint,
+    },
+    BoundSubquery {
+        query: Fingerprint,
+    },
+    Window {
+        function: Fingerprint,
+    },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -289,6 +312,13 @@ impl ScalarArena {
     }
 
     fn validate_shape(&self, spec: &ScalarSpec) -> Result<()> {
+        if let ScalarKind::Constant { value } = &spec.kind {
+            if value.logical_type() != &spec.logical_type {
+                return Err(paro_error::internal(
+                    "scalar literal type disagrees with its node",
+                ));
+            }
+        }
         if spec.children.iter().any(|id| self.get(*id).is_none()) {
             return Err(paro_error::internal(
                 "scalar node references a child outside its arena generation",
@@ -298,6 +328,7 @@ impl ScalarArena {
             ScalarKind::Constant { .. } | ScalarKind::Column(_) | ScalarKind::Parameter(_) => {
                 spec.children.is_empty()
             }
+            ScalarKind::CorrelatedColumn { depth, .. } => depth > 0 && spec.children.is_empty(),
             ScalarKind::Cast { .. } => spec.children.len() == 1,
             ScalarKind::Comparison(_) => spec.children.len() == 2,
             ScalarKind::Case => spec.children.len() == 3,
@@ -316,7 +347,8 @@ impl ScalarArena {
 
     fn derive_properties(&self, spec: &ScalarSpec) -> Result<ScalarProperties> {
         let mut referenced_columns = BTreeSet::new();
-        if let ScalarKind::Column(column) = spec.kind {
+        if let ScalarKind::Column(column) | ScalarKind::CorrelatedColumn { column, .. } = spec.kind
+        {
             referenced_columns.insert(column);
         }
         let mut volatility = spec.local_properties.volatility;
@@ -382,16 +414,21 @@ fn encode_kind(builder: &mut StableFingerprintBuilder, kind: &ScalarKind) {
         ScalarKind::Aggregate { .. } => 10,
         ScalarKind::BoundSubquery { .. } => 11,
         ScalarKind::Window { .. } => 12,
+        ScalarKind::CorrelatedColumn { .. } => 13,
     };
     builder.write_u64(tag);
     match kind {
-        ScalarKind::Constant { value }
-        | ScalarKind::Function { routine: value }
+        ScalarKind::Constant { value } => builder.write_fingerprint(value.fingerprint()),
+        ScalarKind::Function { routine: value }
         | ScalarKind::Operator { operator: value }
         | ScalarKind::Aggregate { function: value }
         | ScalarKind::BoundSubquery { query: value }
         | ScalarKind::Window { function: value } => builder.write_fingerprint(*value),
         ScalarKind::Column(column) => builder.write_u64(column.0 as u64),
+        ScalarKind::CorrelatedColumn { column, depth } => {
+            builder.write_u64(column.0 as u64);
+            builder.write_u64(*depth as u64);
+        }
         ScalarKind::Parameter(slot) => builder.write_u64(*slot as u64),
         ScalarKind::Comparison(op) => builder.write_u64(*op as u64),
         ScalarKind::Cast { try_cast } => builder.write_u64(*try_cast as u64),
