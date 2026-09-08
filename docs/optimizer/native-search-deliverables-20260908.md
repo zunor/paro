@@ -429,3 +429,29 @@ Post-change evidence at `f26fa6c2` (code `e70279b0`):
 The Q11 warmed-execution target is met at that revision. Cold planning parity,
 all native relational transformations and query-owned memory admission remain
 open. Further implementation needs its own post-change validation.
+
+### Input-isolation correction
+
+`6f8695d0` caches the native input-column array on each immutable settlement
+fact, lazily at the original interning point, and borrows leaf/unary reference
+columns. Optimizer **1015 tests** and strict workspace/all-target Clippy pass,
+including cache identity and recipe rollback assertions.
+`native-q11-cold-fact-columns-20260909.json` records median 1417.53 ms, exactly
+the preceding plan digest and all old search counters, plus 8856 input-column
+cache hits / 2035 misses. **The comparison against the published-winners report
+is not admissible**: the cold gate rejected a different dataset digest. The v5
+execution comparator had started oracle and measured processes directly in the
+input data directory; startup checkpoint/owner writes changed that seed between
+cold experiments. These cold times therefore do not isolate the column cache's
+effect, and neither a speedup nor a regression is attributed to it.
+
+The comparator's new v6 contract and cold collector/gate v3 use a shared immutable
+seed abstraction. Every process receives a separate copied directory whose
+initial digest must match the declared seed. Source symlinks/special files and
+logs inside the seed are refused; startup/query failure cleans only the private
+copy. The seed is rechecked after each process, and execution qualification also
+rechecks source, executable, harness, SQL, CSV data and the read-only DuckDB file.
+114 benchmark tests cover copy isolation, source drift, cleanup, server launch
+arguments and all declared evidence inputs. Old reports are retained as their
+original evidence, not silently upgraded to this stronger contract. A new
+same-seed/same-harness cold baseline and Q11 execution confirmation are required.
