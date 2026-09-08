@@ -566,22 +566,33 @@ impl TransformationRule for PlannerTransformationRule {
                     .expect("planner transform state poisoned");
                 settle_with_session_arena(&mut planner_state, plan, &environment)?
             };
-            group_hole_guard.validate_arena(&plan)?;
-            if environment.verify_enabled {
-                crate::verify::verify_arena_plan(&plan, || {
-                    environment.session.cancellation.check()
-                })?;
+            {
+                let state = self
+                    .planner_state
+                    .read()
+                    .expect("planner transform state poisoned");
+                let view = state.staging_arena.plan(plan)?;
+                group_hole_guard.validate_arena(&view)?;
+                if environment.verify_enabled {
+                    crate::verify::verify_arena_plan(&view, || {
+                        environment.session.cancellation.check()
+                    })?;
+                }
             }
             // The target Memo group owns the output contract. Settlement may
             // legitimately widen child carriers for predicates and ordering,
             // but the transformed root must be frozen back to the group's
             // exact binding layout before equivalence validation and staging.
-            let state = self
+            let mut state = self
                 .planner_state
-                .read()
+                .write()
                 .expect("planner transform state poisoned");
-            let plan =
-                semantic_plan::freeze_arena_output_layout(plan, &source_output_columns, &state)?;
+            let plan = semantic_plan::freeze_arena_output_layout(
+                plan,
+                &source_output_columns,
+                &mut state,
+            )?;
+            let root_operator = state.staging_arena.get(plan)?.operator.op_type();
             drop(state);
             let mut preserved_region_facet = None;
             let mut extended_required_region_facets = enclosing_required_region_facets.clone();
@@ -604,7 +615,7 @@ impl TransformationRule for PlannerTransformationRule {
                 let discharges_sharing =
                     matches!(self.transformation, PlannerTransformation::CteInline)
                         && kind == RegionFacetKind::Sharing
-                        && plan.root_node().operator.op_type() != source_operator;
+                        && root_operator != source_operator;
                 let preserves_sharing = matches!(
                     self.transformation,
                     PlannerTransformation::CtePartitionedMaterialization
@@ -612,7 +623,7 @@ impl TransformationRule for PlannerTransformationRule {
                         | PlannerTransformation::CteDemandPushdown
                         | PlannerTransformation::CteFilterPushdown
                 ) && kind == RegionFacetKind::Sharing
-                    && plan.root_node().operator.op_type() == source_operator;
+                    && root_operator == source_operator;
                 if preserves_sharing {
                     preserved_region_facet = Some(facet);
                 } else if discharges_sharing {
@@ -633,8 +644,9 @@ impl TransformationRule for PlannerTransformationRule {
                 .planner_state
                 .read()
                 .expect("planner transform state poisoned");
+            let output_layout = state.staging_arena.output_layout(plan)?;
             if !transformed_layout_matches_group_contract(
-                plan.output_layout(),
+                output_layout,
                 target_group,
                 ctx.memo(),
                 &state,
@@ -643,8 +655,8 @@ impl TransformationRule for PlannerTransformationRule {
                     target: targets::OPTIMIZER,
                     rule = self.id().0,
                     group = target_group.index(),
-                    output_bindings = ?plan.output_layout().bindings(),
-                    output_types = ?plan.output_layout().types(),
+                    output_bindings = ?output_layout.bindings(),
+                    output_types = ?output_layout.types(),
                     target_schema = ?ctx.memo().group(target_group).map(|group| &group.schema),
                     "discarded optional transformation before staging an incompatible root contract"
                 );

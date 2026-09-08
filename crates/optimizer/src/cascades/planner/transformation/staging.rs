@@ -14,7 +14,7 @@ pub(super) struct StagedEquivalent {
 }
 
 pub(super) struct StagingRequest {
-    pub(super) plan: paro_planner::plan::LogicalPlan,
+    pub(super) plan: paro_planner::plan::arena::PlanIndex,
     pub(super) input_facts: boundary::BoundarySnapshot,
     pub(super) column_stats: SharedColumnStatistics,
     pub(super) column_stat_scopes: HashMap<paro_planner::plan::PlanNodeId, SharedColumnStatistics>,
@@ -728,7 +728,9 @@ pub(super) fn stage_transformed_expression(
         )))
     }
 
-    let provider_roots = crate::search::optimizer::SearchOptimizer::candidate_arena_roots(&plan)?;
+    let plan_view = state.staging_arena.plan(plan)?;
+    let provider_roots =
+        crate::search::optimizer::SearchOptimizer::candidate_arena_roots(&plan_view)?;
     let search_context = if !provider_roots.is_empty() {
         let session_context = state
             .session
@@ -750,8 +752,8 @@ pub(super) fn stage_transformed_expression(
     let mut search_candidates = HashMap::new();
     if let Some(context) = &search_context {
         for index in provider_roots {
-            let node = plan
-                .arena()
+            let node = state
+                .staging_arena
                 .export_checked(index, || context.session.cancellation.check())?;
             if let Some(candidate) = crate::search::optimizer::SearchOptimizer::new()
                 .physical_candidate_for_root(&node, context)?
@@ -785,18 +787,8 @@ pub(super) fn stage_transformed_expression(
             search_candidates,
         };
         use paro_planner::plan::arena::{LogicalPlanNode, PlanIndex};
-        let (source_arena, source_root) = plan.into_parts();
-        let root_index = if session.state.staging_arena.owns(source_root) {
-            // Settlement may already have published into the session arena.
-            // Keep the existing root handle; absorbing an arena with the same
-            // identity would clone every shared slot behind the Arc handle.
-            source_root
-        } else {
-            session
-                .state
-                .staging_arena
-                .adopt_or_absorb(source_arena, source_root)?
-        };
+        let root_index = plan;
+        session.state.staging_arena.get(root_index)?;
         let mut completed = BTreeMap::<PlanIndex, (LogicalPlanNode<()>, NodeState)>::new();
         let mut root_result = None;
         let post_order = session.state.staging_arena.post_order(root_index)?;
@@ -1045,7 +1037,9 @@ mod tests {
         let staged = stage_transformed_expression(
             StagingRequest {
                 input_facts: boundary::BoundarySnapshot::default(),
-                plan: paro_planner::plan::LogicalPlan::from_owned(union(project(2), project(3)))
+                plan: state
+                    .staging_arena
+                    .import(union(project(2), project(3)))
                     .unwrap(),
                 column_stats: Arc::new(HashMap::new()),
                 column_stat_scopes: HashMap::new(),
@@ -1119,7 +1113,7 @@ mod tests {
                     memo.create_group(schema, properties, cardinality);
                     stage_transformed_expression(
                         StagingRequest {
-                            plan: paro_planner::plan::LogicalPlan::from_owned(staged_plan).unwrap(),
+                            plan: state.staging_arena.import(staged_plan).unwrap(),
                             input_facts: boundary::BoundarySnapshot::default(),
                             column_stats: Arc::new(HashMap::new()),
                             column_stat_scopes: HashMap::new(),
@@ -1187,7 +1181,7 @@ mod tests {
                 |memo, state| {
                     stage_transformed_expression(
                         StagingRequest {
-                            plan: paro_planner::plan::LogicalPlan::from_owned(transformed).unwrap(),
+                            plan: state.staging_arena.import(transformed).unwrap(),
                             input_facts: boundary::BoundarySnapshot::default(),
                             column_stats: Arc::new(HashMap::new()),
                             column_stat_scopes: HashMap::new(),

@@ -160,7 +160,7 @@ pub(in crate::cascades::planner) struct SettlementCache {
     test_arena: LogicalPlanArena,
 }
 
-pub(super) struct SettledExpression<Plan = paro_planner::plan::LogicalPlan> {
+pub(super) struct SettledExpression<Plan = PlanIndex> {
     pub(super) plan: Plan,
     pub(super) statistics: SharedColumnStatistics,
     pub(super) scopes: HashMap<PlanNodeId, SharedColumnStatistics>,
@@ -584,7 +584,7 @@ impl SettlementCache {
     ) -> Result<SettledExpression<OwnedLogicalPlan>> {
         let settled = self.settle_arena(plan, environment)?;
         Ok(SettledExpression {
-            plan: settled.plan.into_owned()?,
+            plan: self.test_arena.export(settled.plan)?,
             statistics: settled.statistics,
             scopes: settled.scopes,
         })
@@ -602,10 +602,8 @@ impl SettlementCache {
         result
     }
 
-    /// Settle into a caller-owned planning-session arena.  The returned plan
-    /// retains a cheap copy-on-write handle to that arena, while cached local
-    /// recipes and newly settled nodes use one index space.  The caller's
-    /// savepoint can therefore roll back all unpublished slots atomically.
+    /// Settle into the session's sole storage owner. The result is an index,
+    /// not a writable snapshot: subsequent alternatives cannot fork storage.
     pub(super) fn settle_arena_in(
         &mut self,
         plan: OwnedLogicalPlan,
@@ -794,7 +792,7 @@ impl SettlementCache {
         }
         let (root, _, statistics, _) = completed.pop().unwrap();
         Ok(SettledExpression {
-            plan: paro_planner::plan::LogicalPlan::new(arena.clone(), root)?,
+            plan: root,
             statistics,
             scopes,
         })

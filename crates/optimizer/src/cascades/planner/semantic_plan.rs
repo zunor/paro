@@ -186,11 +186,12 @@ pub(super) fn instantiate_bound_plan_with_group_holes(
 /// unordered ColumnId sets; parents and final presentation map identities to
 /// slots after winner selection.
 pub(super) fn freeze_arena_output_layout(
-    mut plan: paro_planner::plan::LogicalPlan,
+    root_index: paro_planner::plan::arena::PlanIndex,
     output_columns: &[ColumnId],
-    state: &PlannerTransformState,
-) -> Result<paro_planner::plan::LogicalPlan> {
+    state: &mut PlannerTransformState,
+) -> Result<paro_planner::plan::arena::PlanIndex> {
     use paro_planner::plan::arena::LogicalPlanNode;
+    let plan = state.staging_arena.plan(root_index)?;
     let root = plan.root_node().clone();
     let mut edges = Vec::new();
     let operator = root.operator.try_map_child_links(&mut |child| {
@@ -226,12 +227,11 @@ pub(super) fn freeze_arena_output_layout(
     if edges.next().is_some() {
         return Err(paro_error::internal("freezing output dropped an input"));
     }
-    plan.append_root(LogicalPlanNode {
+    state.staging_arena.append(LogicalPlanNode {
         id: shell.id,
         stats: shell.stats,
         operator,
-    })?;
-    Ok(plan)
+    })
 }
 
 pub(super) fn freeze_output_layout(
