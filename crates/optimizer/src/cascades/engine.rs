@@ -256,15 +256,18 @@ impl CascadesEngine {
         let root = self.memo.canonical_group(root);
         let mut incumbent = None;
         if mode == SearchMode::Memo {
+            let phase = self.memo.control().incumbent_phase();
             self.mandatory_only = true;
-            self.optimize_group(root, goal)?;
+            let baseline = self.optimize_group(root, goal);
+            self.mandatory_only = false;
+            drop(phase);
+            baseline?;
             super::verifier::MemoVerifier::verify(&self.memo, None)?;
             incumbent = self
                 .memo
                 .group(root)
                 .and_then(|group| group.winner(goal))
                 .cloned();
-            self.mandatory_only = false;
             self.memo.control().begin_optional();
             if !self.memo.control().checkpoint()? {
                 return incumbent.ok_or_else(|| self.infeasible_goal_error(root, goal));
@@ -317,9 +320,17 @@ impl CascadesEngine {
         self.memo.freeze_optimization_contexts()?;
         let root = self.memo.canonical_group(root);
         if mode == SearchMode::Memo {
+            let phase = self.memo.control().incumbent_phase();
             self.mandatory_only = true;
             let incumbent = self.optimize_grant_classes(root, base_goal, admissible_set, &classes);
             self.mandatory_only = false;
+            drop(phase);
+            if incumbent
+                .as_ref()
+                .is_err_and(|error| error.is_query_canceled())
+            {
+                return incumbent;
+            }
             // An infeasible initial implementation may become feasible under
             // an optional rewrite. Do not report a fabricated incumbent in
             // that case, but still permit the requested bounded search.

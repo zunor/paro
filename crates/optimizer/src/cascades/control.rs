@@ -6,6 +6,7 @@
 //! statement. Neither is an advisory failed equivalence rule.
 
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use paro_common::error::Result;
@@ -18,6 +19,22 @@ pub struct SearchControl {
     optional: AtomicBool,
     deadline_reached: AtomicBool,
     cancellation: Option<StatementCancellation>,
+}
+
+/// A required physical incumbent may be needed for another root/requirement
+/// after optional search expired. Its phase does not refresh the query clock
+/// or erase incompleteness, and cancellation still interrupts it.
+pub(crate) struct IncumbentPhase {
+    control: Arc<SearchControl>,
+    previous_optional: bool,
+}
+
+impl Drop for IncumbentPhase {
+    fn drop(&mut self) {
+        self.control
+            .optional
+            .store(self.previous_optional, Ordering::Relaxed);
+    }
 }
 
 impl SearchControl {
@@ -39,16 +56,25 @@ impl SearchControl {
         self.optional.store(true, Ordering::Relaxed);
     }
 
+    pub(crate) fn incumbent_phase(self: &Arc<Self>) -> IncumbentPhase {
+        IncumbentPhase {
+            control: self.clone(),
+            previous_optional: self.optional.swap(false, Ordering::Relaxed),
+        }
+    }
+
     /// False asks a caller to stop at its transaction boundary. The incumbent
     /// phase still checks cancellation, but cannot return an absent baseline.
     pub fn checkpoint(&self) -> Result<bool> {
         if let Some(cancellation) = &self.cancellation {
             cancellation.check()?;
         }
-        if self.optional.load(Ordering::Relaxed)
-            && self
-                .optional_time_limit
-                .is_some_and(|limit| self.started.elapsed() >= limit)
+        if !self.optional.load(Ordering::Relaxed) {
+            return Ok(true);
+        }
+        if self
+            .optional_time_limit
+            .is_some_and(|limit| self.started.elapsed() >= limit)
         {
             self.deadline_reached.store(true, Ordering::Relaxed);
         }

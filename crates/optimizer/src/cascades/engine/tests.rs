@@ -992,6 +992,26 @@ fn zero_wall_budget_returns_a_verified_incumbent_without_charging_work() {
     crate::cascades::verifier::WinnerVerifier::verify(&engine.memo).unwrap();
 }
 
+#[test]
+fn expired_search_can_produce_an_incumbent_for_a_new_requirement_without_new_credit() {
+    let budget = super::super::budget::SearchBudget {
+        optional_time_limit: Some(Duration::ZERO),
+        ..Default::default()
+    };
+    let (mut engine, group, goal) = engine_with_budget(budget);
+    engine.optimize(group, goal, SearchMode::Memo).unwrap();
+    let row_goal = OptimizationGoal {
+        row_goal: RowGoal::AtMost(1),
+        ..goal
+    };
+    let winner = engine.optimize(group, row_goal, SearchMode::Memo).unwrap();
+    assert_eq!(winner.physical_fingerprint, Fingerprint(10));
+    assert!(engine.memo.control().deadline_reached());
+    assert!(!engine.memo.control().checkpoint().unwrap());
+    assert!(engine.rule_attempts().is_empty());
+    crate::cascades::verifier::WinnerVerifier::verify(&engine.memo).unwrap();
+}
+
 struct StopAfterMemoWrite {
     cancel: bool,
 }
