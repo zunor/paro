@@ -44,6 +44,15 @@ pub struct DistinctStatistics {
 }
 
 impl DistinctStatistics {
+    /// Borrow the mutable sketch while invalidating its derived estimate in a
+    /// single place.  Any future mutator that changes HLL registers must pass
+    /// through this helper; stale `raw_count` values then become impossible to
+    /// introduce by forgetting one of the existing update paths.
+    fn log_mut(&mut self) -> &mut HyperLogLog {
+        self.raw_count = 0;
+        &mut self.log
+    }
+
     /// Create a new empty DistinctStatistics.
     pub fn new() -> Self {
         Self {
@@ -71,7 +80,7 @@ impl DistinctStatistics {
     ///
     /// After merging, this statistics represents the union of both sets.
     pub fn merge(&mut self, other: &DistinctStatistics) {
-        self.log.merge(&other.log);
+        self.log_mut().merge(&other.log);
         self.total_count = self.total_count.saturating_add(other.total_count);
         self.raw_count = self.log.count();
     }
@@ -95,11 +104,12 @@ impl DistinctStatistics {
     pub fn update(&mut self, hashes: &[u64], count: usize) {
         let actual_count = count.min(hashes.len());
         self.total_count = self.total_count.saturating_add(actual_count);
-        for &hash in hashes.iter().take(actual_count) {
-            self.log.insert_element(hash);
-        }
         if actual_count != 0 {
-            self.raw_count = self.log.count();
+            let log = self.log_mut();
+            for &hash in hashes.iter().take(actual_count) {
+                log.insert_element(hash);
+            }
+            self.raw_count = log.count();
         }
     }
 
@@ -150,7 +160,7 @@ impl DistinctStatistics {
 
     /// Reset the statistics to empty state.
     pub fn clear(&mut self) {
-        self.log.clear();
+        self.log_mut().clear();
         self.total_count = 0;
         self.raw_count = 0;
     }

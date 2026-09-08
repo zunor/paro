@@ -23,7 +23,7 @@ pub(super) struct InstantiatedPlanWithGroupHoles {
     /// Plan-node identities are transport labels only. Staging consumes every
     /// entry and substitutes the named Memo group before publishing a logical
     /// expression, so the representative subtree can never become semantics.
-    pub(super) group_holes: BTreeMap<u32, GroupId>,
+    pub(super) group_holes: BTreeMap<paro_planner::operator::BoundReferenceId, GroupId>,
 }
 
 /// Instantiate the operator shells explicitly consumed by a pattern while
@@ -50,7 +50,9 @@ pub(super) fn instantiate_bound_plan_with_group_holes(
                 "group-hole binding/type layout has inconsistent arity",
             ));
         }
-        let reference_id = state.bind_context.next_plan_id().0;
+        let reference_id = paro_planner::operator::BoundReferenceId::group_hole(
+            state.bind_context.next_plan_id().0,
+        );
         let mut reference = paro_planner::operator::BoundReference::new(
             reference_id,
             layout.bindings.to_vec(),
@@ -65,7 +67,9 @@ pub(super) fn instantiate_bound_plan_with_group_holes(
             LogicalOperator::BoundReference(reference),
         );
         plan.stats.unique_keys = unique_keys;
-        debug_assert_ne!(reference_id, paro_planner::plan::PlanNodeId::SYNTHETIC.0);
+        debug_assert!(
+            matches!(reference_id, paro_planner::operator::BoundReferenceId::GroupHole(id) if id != paro_planner::plan::PlanNodeId::SYNTHETIC.0)
+        );
         plan.stats.estimated_cardinality =
             cardinality.map(
                 |(min, expected, max)| paro_planner::plan::CardinalityEstimate {
@@ -193,7 +197,7 @@ pub(super) fn freeze_arena_output_layout(
         edges.push(child);
         let layout = plan.arena().output_layout(child)?;
         let reference = paro_planner::operator::BoundReference::new(
-            0,
+            paro_planner::operator::BoundReferenceId::frozen_output(),
             layout.bindings().to_vec(),
             layout.types().to_vec(),
         );

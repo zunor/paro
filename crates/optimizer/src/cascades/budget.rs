@@ -53,6 +53,7 @@ pub enum BudgetDimension {
     CompositeRegionCandidate,
     RecursiveCandidate,
     EnforcerChain,
+    WinnerFrontier,
 }
 
 impl BudgetDimension {
@@ -79,6 +80,7 @@ impl BudgetDimension {
             Self::CompositeRegionCandidate => "composite_region_candidate",
             Self::RecursiveCandidate => "recursive_candidate",
             Self::EnforcerChain => "enforcer_chain",
+            Self::WinnerFrontier => "winner_frontier",
         }
     }
 }
@@ -117,6 +119,13 @@ pub struct SearchBudget {
     /// Additional child-frontier combinations costed for a group. The
     /// selected-child baseline is mandatory and does not consume this credit.
     pub max_child_frontier_combinations_per_group: u32,
+    /// Hard resident bound for one physical winner frontier.  A frontier can
+    /// be genuinely high-dimensional (source response, memory proof, and
+    /// latency are independent axes), so arbitrary top-N truncation is not a
+    /// valid optimization.  This bound is instead an explicit anytime-search
+    /// boundary: evicted candidates leave a `WinnerFrontier` obligation and
+    /// the result is never reported as a complete closure.
+    pub max_winner_frontier_candidates_per_goal: u32,
     pub max_join_connected_pairs: u32,
     pub max_join_exact_relations: u16,
     pub join_beam_width: u16,
@@ -155,6 +164,7 @@ impl Default for SearchBudget {
             max_rule_work_units_per_group: 65_536,
             max_composition_rule_work_units_per_group: 65_536,
             max_child_frontier_combinations_per_group: 4_096,
+            max_winner_frontier_candidates_per_goal: 256,
             max_join_connected_pairs: 65_536,
             max_join_exact_relations: 12,
             join_beam_width: 64,
@@ -231,6 +241,11 @@ impl SearchBudget {
             BudgetDimension::ChildFrontierCombination => {
                 self.max_child_frontier_combinations_per_group
             }
+            // Winner frontier size is enforced by Memo admission and emits a
+            // residual obligation when the cap is reached. It is exposed here
+            // as a named contract so profiles and budget diagnostics can
+            // distinguish it from child-product enumeration.
+            BudgetDimension::WinnerFrontier => self.max_winner_frontier_candidates_per_goal,
             BudgetDimension::JoinConnectedPair => self.max_join_connected_pairs,
             BudgetDimension::GraphFrontier => self.max_graph_frontiers,
             BudgetDimension::FactorizationVariant => self.max_factorization_variants as u32,

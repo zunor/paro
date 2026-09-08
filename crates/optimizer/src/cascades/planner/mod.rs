@@ -84,7 +84,8 @@ use super::rules::{
 };
 use super::scalar::ScalarArena;
 use super::scalar_lowering::{
-    encode_routine_identity, intern_operator_scalars, logical_type_fingerprint, BindingCatalog,
+    encode_routine_identity, expression_fingerprint, intern_operator_scalars,
+    logical_type_fingerprint, BindingCatalog,
 };
 use crate::physical::{
     ExtractedEnforcerContract, ExtractedEnforcerContracts, ExtractedPhysicalEnforcer,
@@ -483,8 +484,14 @@ fn attach_group_column_domains(
             .map(|statistics| statistics.get_distinct_count() as u64)
             .filter(|distinct| *distinct > 0)
             .map(|distinct| {
+                // `expected` is a ranking point, not a semantic row bound.
+                // Capping NDV by it turns an uncertain one-row estimate into
+                // a false proof that the value domain has one member.  Only
+                // the conservative cardinality envelope may narrow the
+                // domain here; the expected point remains available to the
+                // cost model independently.
                 estimated_cardinality
-                    .map(|rows| rows.expected)
+                    .map(|rows| rows.max)
                     .map_or(distinct, |rows| distinct.min(rows))
             });
         let guaranteed_upper = statistics

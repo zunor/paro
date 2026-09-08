@@ -102,7 +102,7 @@ fn bind_copy_to(binder: &mut Binder, stmt: CopyStmt) -> Result<BoundStatementKin
     );
 
     Ok(BoundStatementKind::Copy(BoundCopyInfo {
-        plan: LogicalOperator::CopyTo(copy_to),
+        plan: LogicalOperator::CopyTo(Box::new(copy_to)),
         names: output_names,
         types: output_types,
     }))

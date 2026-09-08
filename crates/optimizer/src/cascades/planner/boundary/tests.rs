@@ -33,7 +33,7 @@ fn grouped_branch_with_tag(
     output_table: usize,
     tag: &str,
 ) -> OwnedLogicalPlan {
-    let aggregate = OwnedLogicalPlan::synthetic(LogicalOperator::Aggregate(
+    let aggregate = OwnedLogicalPlan::synthetic(LogicalOperator::Aggregate(Box::new(
         paro_planner::operator::Aggregate::new(
             output_table + 10,
             output_table + 11,
@@ -47,7 +47,7 @@ fn grouped_branch_with_tag(
             vec![],
             vec![],
         ),
-    ));
+    )));
     OwnedLogicalPlan::synthetic(LogicalOperator::Projection(Projection::new(
         output_table,
         aggregate,
@@ -259,7 +259,7 @@ fn finite_replay_proof_survives_a_recursive_identity_alternative() {
 
 #[test]
 fn aggregate_key_is_derived_from_native_shell_without_cached_plan_statistics() {
-    let aggregate = OwnedLogicalPlan::synthetic(LogicalOperator::Aggregate(
+    let aggregate = OwnedLogicalPlan::synthetic(LogicalOperator::Aggregate(Box::new(
         paro_planner::operator::Aggregate::new(
             1,
             2,
@@ -273,7 +273,7 @@ fn aggregate_key_is_derived_from_native_shell_without_cached_plan_statistics() {
             vec![],
             vec![],
         ),
-    ));
+    )));
     assert!(aggregate.stats.unique_keys.is_empty());
     let mut input = input(project(aggregate, 4), SearchBudget::default());
     let state = input.planner_state.read().unwrap();

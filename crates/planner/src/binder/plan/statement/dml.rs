@@ -37,7 +37,7 @@ impl Binder {
             info.table.clone(),
         );
         scan.append_virtual_rowid("rowid");
-        let mut root = LogicalOperator::Get(scan);
+        let mut root = LogicalOperator::Get(Box::new(scan));
 
         if let Some(mut condition) = info.condition {
             self.plan_subqueries(&mut condition, &mut root)?;
@@ -71,7 +71,7 @@ impl Binder {
             info.table.clone(),
         );
         scan.append_virtual_rowid("rowid");
-        let mut root = LogicalOperator::Get(scan);
+        let mut root = LogicalOperator::Get(Box::new(scan));
 
         if let Some(mut condition) = info.condition {
             self.plan_subqueries(&mut condition, &mut root)?;

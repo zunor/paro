@@ -313,7 +313,7 @@ fn peel_scalar_branch(plan: &OwnedLogicalPlan, leaf_index: usize) -> Option<Scal
         scalar_source_binding: ColumnBinding::new(reduction.aggregate_index, 0),
         aggregate: aggregate.clone(),
         filter_expressions,
-        source_get: source_get.clone(),
+        source_get: *source_get.clone(),
     })
 }
 
@@ -533,8 +533,10 @@ fn build_fused_group(
     branches: &[ScalarBranch],
     bind_context: &BindContext,
 ) -> Result<(OwnedLogicalPlan, Vec<(ColumnBinding, ColumnBinding)>)> {
-    let get_plan =
-        OwnedLogicalPlan::new(bind_context, LogicalOperator::Get(group.fused_get.clone()));
+    let get_plan = OwnedLogicalPlan::new(
+        bind_context,
+        LogicalOperator::Get(Box::new(group.fused_get.clone())),
+    );
     let source = if group.filter_expressions.is_empty() {
         get_plan
     } else {
@@ -590,7 +592,10 @@ fn build_fused_group(
         aggregates,
         Vec::new(),
     );
-    let aggregate_plan = OwnedLogicalPlan::new(bind_context, LogicalOperator::Aggregate(aggregate));
+    let aggregate_plan = OwnedLogicalPlan::new(
+        bind_context,
+        LogicalOperator::Aggregate(Box::new(aggregate)),
+    );
     let projection_index = bind_context.generate_table_index();
     let projection = Projection::new(projection_index, aggregate_plan, scalar_expressions)
         .with_internal_outputs();

@@ -97,10 +97,10 @@ impl FilterPushdown {
                 self.push_final_filters(LogicalOperator::RowFetch(fetch))
             }
             LogicalOperator::Join(join) => self.pushdown_join(join),
-            LogicalOperator::Aggregate(agg) => self.pushdown_aggregate(agg),
+            LogicalOperator::Aggregate(agg) => self.pushdown_aggregate(*agg),
             LogicalOperator::Distinct(distinct) => self.pushdown_distinct(distinct),
             LogicalOperator::Order(order) => self.pushdown_order(order),
-            LogicalOperator::Limit(limit) => self.pushdown_limit(limit),
+            LogicalOperator::Limit(limit) => self.pushdown_limit(*limit),
             LogicalOperator::Window(window) => self.pushdown_window(window),
             LogicalOperator::Get(_) => self.finish_pushdown(op),
             LogicalOperator::TableFunctionGet(_) => self.finish_pushdown(op),
@@ -941,7 +941,7 @@ impl FilterPushdown {
         child_pushdown.generate_filters();
         agg.child = Box::new(child_pushdown.rewrite_plan(*agg.child));
 
-        let result = LogicalOperator::Aggregate(agg);
+        let result = LogicalOperator::Aggregate(Box::new(agg));
         if remaining_filters.is_empty() {
             result
         } else {
@@ -996,7 +996,7 @@ impl FilterPushdown {
         // the child with an independent pushdown pass.
         let mut child_pushdown = FilterPushdown::new();
         limit.child = Box::new(child_pushdown.rewrite_plan(*limit.child));
-        self.push_final_filters(LogicalOperator::Limit(limit))
+        self.push_final_filters(LogicalOperator::Limit(Box::new(limit)))
     }
 
     /// Push down through a Window operator.

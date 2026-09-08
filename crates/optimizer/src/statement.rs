@@ -197,7 +197,7 @@ impl QueryStatementLayer {
             } => OwnedLogicalPlan {
                 id: *id,
                 stats: stats.clone(),
-                operator: LogicalOperator::CopyTo(CopyTo {
+                operator: LogicalOperator::CopyTo(Box::new(CopyTo {
                     copy_function: copy_function.clone(),
                     bind_data: bind_data.clone(),
                     file_path: file_path.clone(),
@@ -206,7 +206,7 @@ impl QueryStatementLayer {
                     child: Box::new(query),
                     names: names.clone(),
                     types: types.clone(),
-                }),
+                })),
             },
         }
     }

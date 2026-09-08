@@ -211,7 +211,9 @@ impl Expression {
                     }
             }
             (Expression::Cast(a), Expression::Cast(b)) => {
-                a.target_type == b.target_type && a.child.equals(&b.child)
+                a.target_type == b.target_type
+                    && a.try_cast == b.try_cast
+                    && a.child.equals(&b.child)
             }
             (Expression::Conjunction(a), Expression::Conjunction(b)) => {
                 a.conjunction_type == b.conjunction_type

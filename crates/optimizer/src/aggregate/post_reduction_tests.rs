@@ -68,12 +68,12 @@ fn table(object_id: u64) -> Arc<TableCatalogEntry> {
 }
 
 fn get(table_index: usize, table: Arc<TableCatalogEntry>) -> OwnedLogicalPlan {
-    OwnedLogicalPlan::synthetic(LogicalOperator::Get(Get::new(
+    OwnedLogicalPlan::synthetic(LogicalOperator::Get(Box::new(Get::new(
         table_index,
         vec!["key".to_string(), "value".to_string()],
         vec![LogicalType::BigInt, LogicalType::Integer],
         table,
-    )))
+    ))))
 }
 
 fn q11_shape(
@@ -114,7 +114,7 @@ fn q11_shape(
     ));
     let scalar_projection = Projection::new(
         SCALAR_PROJECTION,
-        OwnedLogicalPlan::synthetic(LogicalOperator::Aggregate(scalar_aggregate)),
+        OwnedLogicalPlan::synthetic(LogicalOperator::Aggregate(Box::new(scalar_aggregate))),
         vec![scalar_expression],
     );
 
@@ -152,11 +152,11 @@ fn q11_shape(
     ));
     let wrapper_projection = Projection::new(
         WRAPPER_PROJECTION,
-        OwnedLogicalPlan::synthetic(LogicalOperator::Aggregate(wrapper)),
+        OwnedLogicalPlan::synthetic(LogicalOperator::Aggregate(Box::new(wrapper))),
         vec![checked],
     );
     let cross = OwnedLogicalPlan::synthetic(LogicalOperator::Join(Join::Cross(CrossProduct::new(
-        OwnedLogicalPlan::synthetic(LogicalOperator::Aggregate(grouped)),
+        OwnedLogicalPlan::synthetic(LogicalOperator::Aggregate(Box::new(grouped))),
         OwnedLogicalPlan::synthetic(LogicalOperator::Projection(wrapper_projection)),
     ))));
     let predicate = Expression::Comparison(ComparisonExpression::new(

@@ -21,9 +21,18 @@ macro_rules! child_links {
                 })
             }
 
-            pub fn visit_child_links(&self, visit: &mut impl FnMut(&Child)) {
+            pub fn visit_child_links<'a>(&'a self, visit: &mut impl FnMut(&'a Child)) {
                 $(visit(&self.$required);)*
                 $(if let Some(child) = &self.$optional { visit(child); })*
+            }
+
+            /// Visit every child link mutably in declaration order.  Keeping
+            /// this beside the consuming mapper makes adding a new child a
+            /// compile-time change to one contract instead of a hunt through
+            /// several hand-written operator matches.
+            pub fn visit_child_links_mut<'a>(&'a mut self, visit: &mut impl FnMut(&'a mut Child)) {
+                $(visit(&mut self.$required);)*
+                $(if let Some(child) = &mut self.$optional { visit(child); })*
             }
         }
     };
@@ -191,11 +200,19 @@ impl<Child> Join<Child> {
         })
     }
 
-    pub fn visit_child_links(&self, visit: &mut impl FnMut(&Child)) {
+    pub fn visit_child_links<'a>(&'a self, visit: &mut impl FnMut(&'a Child)) {
         match self {
             Self::Comparison(join) => join.visit_child_links(visit),
             Self::Any(join) => join.visit_child_links(visit),
             Self::Cross(join) => join.visit_child_links(visit),
+        }
+    }
+
+    pub fn visit_child_links_mut<'a>(&'a mut self, visit: &mut impl FnMut(&'a mut Child)) {
+        match self {
+            Self::Comparison(join) => join.visit_child_links_mut(visit),
+            Self::Any(join) => join.visit_child_links_mut(visit),
+            Self::Cross(join) => join.visit_child_links_mut(visit),
         }
     }
 }
@@ -207,9 +224,11 @@ impl<Child> LogicalOperator<Child> {
     ) -> std::result::Result<LogicalOperator<Output>, E> {
         Ok(match self {
             Self::Aggregate(operator) => {
-                LogicalOperator::Aggregate(operator.try_map_child_links(map)?)
+                LogicalOperator::Aggregate(Box::new((*operator).try_map_child_links(map)?))
             }
-            Self::CopyTo(operator) => LogicalOperator::CopyTo(operator.try_map_child_links(map)?),
+            Self::CopyTo(operator) => {
+                LogicalOperator::CopyTo(Box::new((*operator).try_map_child_links(map)?))
+            }
             Self::MaterializedCTE(operator) => {
                 LogicalOperator::MaterializedCTE(operator.try_map_child_links(map)?)
             }
@@ -218,7 +237,7 @@ impl<Child> LogicalOperator<Child> {
             }
             Self::Delete(operator) => LogicalOperator::Delete(operator.try_map_child_links(map)?),
             Self::DependentJoin(operator) => {
-                LogicalOperator::DependentJoin(operator.try_map_child_links(map)?)
+                LogicalOperator::DependentJoin(Box::new((*operator).try_map_child_links(map)?))
             }
             Self::Distinct(operator) => {
                 LogicalOperator::Distinct(operator.try_map_child_links(map)?)
@@ -231,14 +250,16 @@ impl<Child> LogicalOperator<Child> {
                 LogicalOperator::ExternalProject(operator.try_map_child_links(map)?)
             }
             Self::ExternalTable(operator) => {
-                LogicalOperator::ExternalTable(operator.try_map_child_links(map)?)
+                LogicalOperator::ExternalTable(Box::new((*operator).try_map_child_links(map)?))
             }
             Self::Filter(operator) => LogicalOperator::Filter(operator.try_map_child_links(map)?),
             Self::GraphExpand(operator) => {
-                LogicalOperator::GraphExpand(operator.try_map_child_links(map)?)
+                LogicalOperator::GraphExpand(Box::new((*operator).try_map_child_links(map)?))
             }
             Self::Insert(operator) => LogicalOperator::Insert(operator.try_map_child_links(map)?),
-            Self::Limit(operator) => LogicalOperator::Limit(operator.try_map_child_links(map)?),
+            Self::Limit(operator) => {
+                LogicalOperator::Limit(Box::new((*operator).try_map_child_links(map)?))
+            }
             Self::Order(operator) => LogicalOperator::Order(operator.try_map_child_links(map)?),
             Self::Projection(operator) => {
                 LogicalOperator::Projection(operator.try_map_child_links(map)?)
@@ -269,16 +290,18 @@ impl<Child> LogicalOperator<Child> {
             Self::DelimGet(operator) => LogicalOperator::DelimGet(operator),
             Self::CTERef(operator) => LogicalOperator::CTERef(operator),
             Self::TableFunctionGet(operator) => LogicalOperator::TableFunctionGet(operator),
-            Self::SearchScan(operator) => LogicalOperator::SearchScan(operator),
-            Self::FullTextFilterScan(operator) => LogicalOperator::FullTextFilterScan(operator),
+            Self::SearchScan(operator) => LogicalOperator::SearchScan(Box::new(*operator)),
+            Self::FullTextFilterScan(operator) => {
+                LogicalOperator::FullTextFilterScan(Box::new(*operator))
+            }
             Self::GraphMatch(operator) => LogicalOperator::GraphMatch(operator),
-            Self::GraphScan(operator) => LogicalOperator::GraphScan(operator),
+            Self::GraphScan(operator) => LogicalOperator::GraphScan(Box::new(*operator)),
             Self::BoundReference(operator) => LogicalOperator::BoundReference(operator),
             Self::DummyScan => LogicalOperator::DummyScan,
         })
     }
 
-    pub fn visit_child_links(&self, visit: &mut impl FnMut(&Child)) {
+    pub fn visit_child_links<'a>(&'a self, visit: &mut impl FnMut(&'a Child)) {
         match self {
             Self::Aggregate(operator) => operator.visit_child_links(visit),
             Self::CopyTo(operator) => operator.visit_child_links(visit),
@@ -303,6 +326,56 @@ impl<Child> LogicalOperator<Child> {
             Self::Update(operator) => operator.visit_child_links(visit),
             Self::Window(operator) => operator.visit_child_links(visit),
             Self::Join(operator) => operator.visit_child_links(visit),
+            Self::Get(_)
+            | Self::CreateTable(_)
+            | Self::CreateRoutine(_)
+            | Self::Alter(_)
+            | Self::CreateSequence(_)
+            | Self::CreateSchema(_)
+            | Self::CreateIndex(_)
+            | Self::CreateView(_)
+            | Self::Drop(_)
+            | Self::CreatePropertyGraph(_)
+            | Self::DropPropertyGraph(_)
+            | Self::RefreshPropertyGraph(_)
+            | Self::ExpressionGet(_)
+            | Self::DelimGet(_)
+            | Self::CTERef(_)
+            | Self::TableFunctionGet(_)
+            | Self::SearchScan(_)
+            | Self::FullTextFilterScan(_)
+            | Self::GraphMatch(_)
+            | Self::GraphScan(_)
+            | Self::BoundReference(_)
+            | Self::DummyScan => {}
+        }
+    }
+
+    pub fn visit_child_links_mut<'a>(&'a mut self, visit: &mut impl FnMut(&'a mut Child)) {
+        match self {
+            Self::Aggregate(operator) => operator.visit_child_links_mut(visit),
+            Self::CopyTo(operator) => operator.visit_child_links_mut(visit),
+            Self::MaterializedCTE(operator) => operator.visit_child_links_mut(visit),
+            Self::RecursiveCTE(operator) => operator.visit_child_links_mut(visit),
+            Self::Delete(operator) => operator.visit_child_links_mut(visit),
+            Self::DependentJoin(operator) => operator.visit_child_links_mut(visit),
+            Self::Distinct(operator) => operator.visit_child_links_mut(visit),
+            Self::EmptyResult(operator) => operator.visit_child_links_mut(visit),
+            Self::Explain(operator) => operator.visit_child_links_mut(visit),
+            Self::ExternalProject(operator) => operator.visit_child_links_mut(visit),
+            Self::ExternalTable(operator) => operator.visit_child_links_mut(visit),
+            Self::Filter(operator) => operator.visit_child_links_mut(visit),
+            Self::GraphExpand(operator) => operator.visit_child_links_mut(visit),
+            Self::Insert(operator) => operator.visit_child_links_mut(visit),
+            Self::Limit(operator) => operator.visit_child_links_mut(visit),
+            Self::Order(operator) => operator.visit_child_links_mut(visit),
+            Self::Projection(operator) => operator.visit_child_links_mut(visit),
+            Self::RowFetch(operator) => operator.visit_child_links_mut(visit),
+            Self::SetOperation(operator) => operator.visit_child_links_mut(visit),
+            Self::TopN(operator) => operator.visit_child_links_mut(visit),
+            Self::Update(operator) => operator.visit_child_links_mut(visit),
+            Self::Window(operator) => operator.visit_child_links_mut(visit),
+            Self::Join(operator) => operator.visit_child_links_mut(visit),
             Self::Get(_)
             | Self::CreateTable(_)
             | Self::CreateRoutine(_)

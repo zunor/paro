@@ -319,12 +319,12 @@ mod tests {
     #[test]
     fn verify_rejects_remaining_dependent_join() {
         let ctx = BindContext::new();
-        let plan = LogicalOperator::DependentJoin(DependentJoin::scalar(
+        let plan = LogicalOperator::DependentJoin(Box::new(DependentJoin::scalar(
             wrap(&ctx, expression_get(0)),
             wrap(&ctx, expression_get(1)),
             vec![],
             None,
-        ));
+        )));
 
         let err = verify_physical_planner_invariants(&plan).expect_err("verify should fail");
         assert!(err.to_string().contains("DependentJoin"));

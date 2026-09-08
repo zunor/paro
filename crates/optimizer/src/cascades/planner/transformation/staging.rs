@@ -23,7 +23,7 @@ pub(super) struct StagingRequest {
     /// Opaque Memo inputs retained by the transformed expression. Inputs
     /// legitimately discarded by a relational rewrite are removed before
     /// staging; every surviving transport node is consumed exactly once.
-    pub(super) nested_group_holes: BTreeMap<u32, GroupId>,
+    pub(super) nested_group_holes: BTreeMap<paro_planner::operator::BoundReferenceId, GroupId>,
 }
 
 pub(super) struct StagingTarget {
@@ -88,7 +88,7 @@ pub(super) fn stage_transformed_expression(
         state: &'a mut PlannerTransformState,
         options: StagingOptions<'a>,
         pending_runtime_filter_facets: Vec<RegionFacet>,
-        nested_group_holes: BTreeMap<u32, GroupId>,
+        nested_group_holes: BTreeMap<paro_planner::operator::BoundReferenceId, GroupId>,
         facts: boundary::BoundarySnapshot,
         search_candidates: HashMap<paro_planner::plan::PlanNodeId, OwnedLogicalPlan>,
     }
@@ -185,6 +185,11 @@ pub(super) fn stage_transformed_expression(
         let memo = &mut *session.memo;
         let state = &mut *session.state;
         let options = &session.options;
+        if semantic_plan.id.is_synthetic() && !options.column_stat_scopes.is_empty() {
+            return Err(paro_error::internal(
+                "synthetic plan id cannot select a column-statistics scope",
+            ));
+        }
         let column_stats = options
             .column_stat_scopes
             .get(&semantic_plan.id)
@@ -751,6 +756,11 @@ pub(super) fn stage_transformed_expression(
             if let Some(candidate) = crate::search::optimizer::SearchOptimizer::new()
                 .physical_candidate_for_root(&node, context)?
             {
+                if node.id.is_synthetic() {
+                    return Err(paro_error::internal(
+                        "synthetic plan id cannot identify a search candidate",
+                    ));
+                }
                 if search_candidates.insert(node.id, candidate).is_some() {
                     return Err(paro_error::internal(
                         "search provider has ambiguous occurrence identity",
@@ -833,7 +843,7 @@ pub(super) fn stage_transformed_expression(
                         .facts
                         .transport(session.memo, session.state, node.group, &layout)?;
                 let reference = paro_planner::operator::BoundReference::new(
-                    plan.id.0,
+                    paro_planner::operator::BoundReferenceId::node_occurrence(plan.id.0),
                     layout.bindings.into_vec(),
                     layout.types.into_vec(),
                 )
@@ -962,12 +972,12 @@ mod tests {
             CatalogObjectId::from_raw(object_id),
             0,
         ));
-        let mut plan = OwnedLogicalPlan::synthetic(LogicalOperator::Get(Get::new(
+        let mut plan = OwnedLogicalPlan::synthetic(LogicalOperator::Get(Box::new(Get::new(
             table_index,
             vec!["id".to_string()],
             vec![LogicalType::Integer],
             table,
-        )));
+        ))));
         plan.stats.estimated_cardinality = Some(CardinalityEstimate::exact(rows));
         plan
     }

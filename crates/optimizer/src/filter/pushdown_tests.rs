@@ -104,11 +104,11 @@ fn make_comparison(comp_type: ComparisonType, left: Expression, right: Expressio
 }
 
 fn make_get(table_index: usize) -> LogicalOperator {
-    LogicalOperator::Get(Get::new_without_table(
+    LogicalOperator::Get(Box::new(Get::new_without_table(
         table_index,
         vec!["col0".to_string(), "col1".to_string()],
         vec![LogicalType::Integer, LogicalType::Varchar],
-    ))
+    )))
 }
 
 fn make_delim_join(ctx: &BindContext, join_type: JoinType) -> LogicalOperator {
@@ -322,7 +322,7 @@ fn group_filter_rebinds_to_aggregate_input() {
         vec![],
     );
     let filter = PlannerFilter::new(
-        plan(&ctx, LogicalOperator::Aggregate(aggregate)),
+        plan(&ctx, LogicalOperator::Aggregate(Box::new(aggregate))),
         vec![make_comparison(
             ComparisonType::Equal,
             make_column_ref(2, 0),
@@ -916,7 +916,10 @@ fn test_filter_stays_above_limit() {
         make_column_ref(0, 0),
         make_constant(5),
     );
-    let filter = PlannerFilter::new(plan(&ctx, LogicalOperator::Limit(limit)), vec![filter_expr]);
+    let filter = PlannerFilter::new(
+        plan(&ctx, LogicalOperator::Limit(Box::new(limit))),
+        vec![filter_expr],
+    );
     let op = LogicalOperator::Filter(filter);
 
     let mut pushdown = FilterPushdown::new();

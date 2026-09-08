@@ -260,12 +260,13 @@ mod tests {
                 2,
             ))],
         ));
-        let dependent = LogicalOperator::DependentJoin(crate::operator::DependentJoin::scalar(
-            crate::plan::OwnedLogicalPlan::new(&ctx, expression_get(11)),
-            crate::plan::OwnedLogicalPlan::new(&ctx, nested_right),
-            vec![correlated_column(1)],
-            None,
-        ));
+        let dependent =
+            LogicalOperator::DependentJoin(Box::new(crate::operator::DependentJoin::scalar(
+                crate::plan::OwnedLogicalPlan::new(&ctx, expression_get(11)),
+                crate::plan::OwnedLogicalPlan::new(&ctx, nested_right),
+                vec![correlated_column(1)],
+                None,
+            )));
 
         assert!(!operator_has_correlated_columns_at_depth(
             &dependent,

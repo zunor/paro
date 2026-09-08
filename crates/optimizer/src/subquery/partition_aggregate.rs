@@ -1326,7 +1326,10 @@ fn apply_grouped_join_rewrite(
         vec![Expression::Aggregate(rewrite.aggregate.clone())],
         Vec::new(),
     );
-    let aggregate = OwnedLogicalPlan::new(bind_context, LogicalOperator::Aggregate(aggregate));
+    let aggregate = OwnedLogicalPlan::new(
+        bind_context,
+        LogicalOperator::Aggregate(Box::new(aggregate)),
+    );
     let aggregate_binding = ColumnBinding::new(aggregate_index, 0);
     let aggregate_type = rewrite.aggregate.return_type.clone();
     let scalar = rewrite.scalar_expression.replace_column_ref(&|column| {

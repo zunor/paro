@@ -63,7 +63,7 @@ fn linear_plan() -> crate::physical::PhysicalPlan {
     );
     let limit = OwnedLogicalPlan::new(
         &ctx,
-        LogicalOperator::Limit(Limit::new(project, None, None)),
+        LogicalOperator::Limit(Box::new(Limit::new(project, None, None))),
     );
 
     let mut extractor = PhysicalPlanExtractor::new(ExtractionContext::default());
@@ -107,7 +107,7 @@ fn grouped_aggregate_plan() -> crate::physical::PhysicalPlan {
     );
     let aggregate = OwnedLogicalPlan::new(
         &ctx,
-        LogicalOperator::Aggregate(LogicalAggregate::new(
+        LogicalOperator::Aggregate(Box::new(LogicalAggregate::new(
             1,
             2,
             3,
@@ -123,7 +123,7 @@ fn grouped_aggregate_plan() -> crate::physical::PhysicalPlan {
                 LogicalType::BigInt,
             ))],
             Vec::new(),
-        )),
+        ))),
     );
 
     let mut extractor = PhysicalPlanExtractor::new(ExtractionContext::default());
@@ -143,7 +143,7 @@ fn aggregate_probe_hash_join_plan() -> crate::physical::PhysicalPlan {
     );
     let aggregate = OwnedLogicalPlan::new(
         &ctx,
-        LogicalOperator::Aggregate(LogicalAggregate::new(
+        LogicalOperator::Aggregate(Box::new(LogicalAggregate::new(
             1,
             2,
             3,
@@ -159,7 +159,7 @@ fn aggregate_probe_hash_join_plan() -> crate::physical::PhysicalPlan {
                 LogicalType::BigInt,
             ))],
             Vec::new(),
-        )),
+        ))),
     );
     let build = OwnedLogicalPlan::new(
         &ctx,
@@ -200,7 +200,7 @@ fn ungrouped_aggregate_plan() -> crate::physical::PhysicalPlan {
     );
     let aggregate = OwnedLogicalPlan::new(
         &ctx,
-        LogicalOperator::Aggregate(LogicalAggregate::new(
+        LogicalOperator::Aggregate(Box::new(LogicalAggregate::new(
             1,
             2,
             3,
@@ -213,7 +213,7 @@ fn ungrouped_aggregate_plan() -> crate::physical::PhysicalPlan {
                 LogicalType::BigInt,
             ))],
             Vec::new(),
-        )),
+        ))),
     );
 
     let mut extractor = PhysicalPlanExtractor::new(ExtractionContext::default());
@@ -651,14 +651,14 @@ fn limit_above_right_nested_loop_join_plan() -> crate::physical::PhysicalPlan {
     );
     let limit = OwnedLogicalPlan::new(
         &ctx,
-        LogicalOperator::Limit(Limit::new(
+        LogicalOperator::Limit(Box::new(Limit::new(
             join,
             Some(Expression::Constant(ConstantExpression::new(
                 Value::Integer(10),
                 LogicalType::Integer,
             ))),
             None,
-        )),
+        ))),
     );
 
     let mut extractor = PhysicalPlanExtractor::new(ExtractionContext::default());
@@ -831,7 +831,7 @@ fn aggregate_above_right_anti_hash_join_plan() -> crate::physical::PhysicalPlan 
     );
     let aggregate = OwnedLogicalPlan::new(
         &ctx,
-        LogicalOperator::Aggregate(LogicalAggregate::new(
+        LogicalOperator::Aggregate(Box::new(LogicalAggregate::new(
             2,
             3,
             4,
@@ -844,7 +844,7 @@ fn aggregate_above_right_anti_hash_join_plan() -> crate::physical::PhysicalPlan 
                 LogicalType::BigInt,
             ))],
             Vec::new(),
-        )),
+        ))),
     );
 
     let mut extractor = PhysicalPlanExtractor::new(ExtractionContext::default());

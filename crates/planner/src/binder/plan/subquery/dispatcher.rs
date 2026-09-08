@@ -157,7 +157,7 @@ impl Binder {
             return_type: LogicalType::BigInt,
         });
         let limited = Limit::new(self.wrap_plan(subquery_plan), Some(limit_expr), None);
-        let plan = LogicalOperator::Limit(limited);
+        let plan = LogicalOperator::Limit(Box::new(limited));
 
         let count_star = get_count_star_function();
         let count_agg = AggregateExpression::new(count_star, vec![], LogicalType::BigInt);
@@ -174,7 +174,7 @@ impl Binder {
             vec![Expression::Aggregate(count_agg)],
             vec![],
         );
-        let plan = LogicalOperator::Aggregate(aggregate);
+        let plan = LogicalOperator::Aggregate(Box::new(aggregate));
 
         let count_ref = Expression::ColumnRef(ColumnRefExpression::new(
             ColumnBinding::new(aggregate_index, 0),
@@ -255,7 +255,7 @@ impl Binder {
             ],
             vec![],
         );
-        let plan = LogicalOperator::Aggregate(aggregate);
+        let plan = LogicalOperator::Aggregate(Box::new(aggregate));
 
         let projection_index = self.bind_context.generate_table_index();
         let first_ref = Expression::ColumnRef(ColumnRefExpression::new(

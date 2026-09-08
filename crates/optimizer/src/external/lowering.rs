@@ -134,7 +134,7 @@ impl<'a> ExternalRoutineLowerer<'a> {
             LogicalOperator::Order(order) => LogicalOperator::Order(self.lower_order(order)?),
             LogicalOperator::TopN(topn) => LogicalOperator::TopN(self.lower_topn(topn)?),
             LogicalOperator::Aggregate(aggregate) => {
-                LogicalOperator::Aggregate(self.lower_aggregate(aggregate)?)
+                LogicalOperator::Aggregate(Box::new(self.lower_aggregate(*aggregate)?))
             }
             LogicalOperator::Window(window) => LogicalOperator::Window(self.lower_window(window)?),
             LogicalOperator::Distinct(distinct) => {

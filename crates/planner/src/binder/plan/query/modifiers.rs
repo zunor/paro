@@ -30,10 +30,10 @@ impl Binder {
         }
 
         if let Some(limit) = node.limit {
-            root = LogicalOperator::Limit(
+            root = LogicalOperator::Limit(Box::new(
                 Limit::new(self.wrap_plan(root), limit.limit, limit.offset)
                     .with_hnsw_options(node.hnsw_options),
-            );
+            ));
         }
 
         if let Some(projection_index) = node.prune_index {

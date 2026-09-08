@@ -139,32 +139,33 @@ mod tests {
             TableCatalogEntry::from_info(info, storage, CatalogObjectId::from_raw(91_001), 0)
                 .unwrap(),
         );
-        let left = OwnedLogicalPlan::synthetic(LogicalOperator::Get(Get::new(
+        let left = OwnedLogicalPlan::synthetic(LogicalOperator::Get(Box::new(Get::new(
             1,
             vec!["key".to_string()],
             types,
             table,
-        )));
+        ))));
         let source_count = count(column(2, 1));
         let Expression::Aggregate(source) = &source_count else {
             unreachable!()
         };
         let merge = source.function.partial_merge_function().unwrap();
-        let right = OwnedLogicalPlan::synthetic(LogicalOperator::Aggregate(Aggregate::new(
-            3,
-            4,
-            5,
-            OwnedLogicalPlan::synthetic(LogicalOperator::ExpressionGet(ExpressionGet::new(
-                2,
+        let right =
+            OwnedLogicalPlan::synthetic(LogicalOperator::Aggregate(Box::new(Aggregate::new(
+                3,
+                4,
+                5,
+                OwnedLogicalPlan::synthetic(LogicalOperator::ExpressionGet(ExpressionGet::new(
+                    2,
+                    vec![],
+                    vec!["key".to_string(), "value".to_string()],
+                    vec![LogicalType::BigInt, LogicalType::BigInt],
+                ))),
+                vec![column(2, 0)],
                 vec![],
-                vec!["key".to_string(), "value".to_string()],
-                vec![LogicalType::BigInt, LogicalType::BigInt],
-            ))),
-            vec![column(2, 0)],
-            vec![],
-            vec![source_count],
-            vec![],
-        )));
+                vec![source_count],
+                vec![],
+            ))));
         let join = OwnedLogicalPlan::synthetic(LogicalOperator::Join(Join::Comparison(
             ComparisonJoin::new(
                 JoinType::Left,
@@ -195,7 +196,7 @@ mod tests {
             ))),
         );
         (
-            OwnedLogicalPlan::synthetic(LogicalOperator::Aggregate(outer)),
+            OwnedLogicalPlan::synthetic(LogicalOperator::Aggregate(Box::new(outer))),
             statistics,
         )
     }

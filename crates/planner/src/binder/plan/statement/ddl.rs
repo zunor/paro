@@ -35,7 +35,7 @@ impl Binder {
         info: BoundCreateRoutineInfo,
     ) -> Result<LogicalOperator> {
         let op = CreateRoutine::new(info);
-        Ok(LogicalOperator::CreateRoutine(op))
+        Ok(LogicalOperator::CreateRoutine(Box::new(op)))
     }
 
     pub(crate) fn plan_create_sequence(
@@ -59,7 +59,7 @@ impl Binder {
         info: BoundCreateIndexInfo,
     ) -> Result<LogicalOperator> {
         let op = CreateIndex::new(info);
-        Ok(LogicalOperator::CreateIndex(op))
+        Ok(LogicalOperator::CreateIndex(Box::new(op)))
     }
 
     pub(crate) fn plan_create_view(

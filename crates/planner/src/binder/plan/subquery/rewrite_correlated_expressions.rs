@@ -660,7 +660,7 @@ mod tests {
             None,
         );
 
-        match rewriter.rewrite_operator(LogicalOperator::DependentJoin(dep)) {
+        match rewriter.rewrite_operator(LogicalOperator::DependentJoin(Box::new(dep))) {
             LogicalOperator::DependentJoin(dep) => match &dep.right.operator {
                 LogicalOperator::Projection(proj) => match &proj.expressions[0] {
                     Expression::ColumnRef(col_ref) => {

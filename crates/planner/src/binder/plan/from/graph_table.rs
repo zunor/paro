@@ -14,7 +14,7 @@ impl Binder {
         let output_types = graph_ref.output_types.clone();
         let path_mode = graph_ref.path_mode.clone();
         let has_path_functions = graph_ref.has_path_functions;
-        Ok(LogicalOperator::GraphMatch(GraphMatch::new(
+        Ok(LogicalOperator::GraphMatch(Box::new(GraphMatch::new(
             graph_ref.graph_entry,
             graph_ref.bound_pattern,
             graph_ref.bound_columns,
@@ -23,6 +23,6 @@ impl Binder {
             output_types,
             path_mode,
             has_path_functions,
-        )))
+        ))))
     }
 }

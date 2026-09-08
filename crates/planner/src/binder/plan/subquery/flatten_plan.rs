@@ -15,7 +15,7 @@ pub(crate) fn flatten_dependent_joins_in_plan(
 ) -> Result<OwnedLogicalPlan> {
     let (id, stats, operator) = plan.into_parts();
     let operator = match operator {
-        LogicalOperator::DependentJoin(dep) => flatten_dependent_join(binder, dep)?,
+        LogicalOperator::DependentJoin(dep) => flatten_dependent_join(binder, *dep)?,
         LogicalOperator::Filter(mut filter) => {
             filter.child = Box::new(flatten_dependent_joins_in_plan(binder, *filter.child)?);
             LogicalOperator::Filter(filter)

@@ -40,6 +40,11 @@ pub(in crate::cascades::planner) struct CteDomainProof {
     pub(in crate::cascades::planner) cte_index: usize,
     pub(in crate::cascades::planner) predicates: Box<[Expression]>,
     pub(super) keys: Box<[CteKeyDemand]>,
+    /// Canonical domain identity used as a hash-bucket key.  It excludes
+    /// Memo group ids (which can change during union/merge) and is therefore
+    /// safe across canonicalization revisions; exact structural comparison
+    /// remains the collision and group-identity check.
+    pub(super) fingerprint: Fingerprint,
 }
 
 impl PartialEq for CteDomainProof {
@@ -49,7 +54,26 @@ impl PartialEq for CteDomainProof {
 }
 
 impl CteDomainProof {
+    fn new(
+        cte_index: usize,
+        predicates: impl IntoIterator<Item = Expression>,
+        keys: impl IntoIterator<Item = CteKeyDemand>,
+    ) -> Self {
+        let predicates = predicates.into_iter().collect::<Vec<_>>();
+        let keys = keys.into_iter().collect::<Vec<_>>();
+        let fingerprint = domain_fingerprint(cte_index, &predicates, &keys);
+        Self {
+            cte_index,
+            predicates: predicates.into_boxed_slice(),
+            keys: keys.into_boxed_slice(),
+            fingerprint,
+        }
+    }
+
     fn same_domain_by(&self, other: &Self, canonical: impl Fn(GroupId) -> GroupId) -> bool {
+        if self.cte_index != other.cte_index || self.fingerprint != other.fingerprint {
+            return false;
+        }
         let same_key = |left: &CteKeyDemand, right: &CteKeyDemand| {
             canonical(left.group) == canonical(right.group)
                 && left.layout == right.layout
@@ -61,13 +85,87 @@ impl CteDomainProof {
                     .zip(&right.expressions)
                     .all(|(left, right)| left.equals(right))
         };
-        self.cte_index == other.cte_index
-            && predicate_domains_equal(&self.predicates, &other.predicates)
+        predicate_domains_equal(&self.predicates, &other.predicates)
             // Each occurrence contributes one arm of a UNION key domain.
             // Association, order and duplicate arms do not change membership.
             && self.keys.iter().all(|left| other.keys.iter().any(|right| same_key(left, right)))
             && other.keys.iter().all(|right| self.keys.iter().any(|left| same_key(left, right)))
     }
+}
+
+fn domain_fingerprint(
+    cte_index: usize,
+    predicates: &[Expression],
+    keys: &[CteKeyDemand],
+) -> Fingerprint {
+    let mut builder = StableFingerprintBuilder::default();
+    builder.write_bytes(b"paro.cte-domain.v1");
+    builder.write_u64(cte_index as u64);
+
+    let mut predicate_fingerprints = predicates
+        .iter()
+        .map(super::super::expression_fingerprint)
+        .collect::<Vec<_>>();
+    predicate_fingerprints.sort_unstable();
+    predicate_fingerprints.dedup();
+    builder.write_u64(predicate_fingerprints.len() as u64);
+    for fingerprint in predicate_fingerprints {
+        builder.write_fingerprint(fingerprint);
+    }
+
+    let mut key_fingerprints = keys
+        .iter()
+        .map(|key| {
+            let mut key_builder = StableFingerprintBuilder::default();
+            key_builder.write_u64(key.layout.bindings.len() as u64);
+            for binding in &key.layout.bindings {
+                key_builder.write_u64(binding.table_index as u64);
+                key_builder.write_u64(binding.column_index as u64);
+            }
+            key_builder.write_u64(key.layout.types.len() as u64);
+            for logical_type in &key.layout.types {
+                key_builder.write_fingerprint(super::super::logical_type_fingerprint(logical_type));
+            }
+            key_builder.write_u64(key.ordinals.len() as u64);
+            for ordinal in &key.ordinals {
+                key_builder.write_u64(*ordinal as u64);
+            }
+            let expressions = key
+                .expressions
+                .iter()
+                .map(super::super::expression_fingerprint)
+                .collect::<Vec<_>>();
+            key_builder.write_u64(expressions.len() as u64);
+            for fingerprint in expressions {
+                key_builder.write_fingerprint(fingerprint);
+            }
+            key_builder.finish()
+        })
+        .collect::<Vec<_>>();
+    key_fingerprints.sort_unstable();
+    key_fingerprints.dedup();
+    builder.write_u64(key_fingerprints.len() as u64);
+    for fingerprint in key_fingerprints {
+        builder.write_fingerprint(fingerprint);
+    }
+    builder.finish()
+}
+
+fn binding_domain_fingerprint(definition: usize, domains: &[CteDomainProof]) -> Fingerprint {
+    let mut builder = StableFingerprintBuilder::default();
+    builder.write_bytes(b"paro.cte-binding.v1");
+    builder.write_u64(definition as u64);
+    let mut fingerprints = domains
+        .iter()
+        .map(|domain| domain.fingerprint)
+        .collect::<Vec<_>>();
+    fingerprints.sort_unstable();
+    fingerprints.dedup();
+    builder.write_u64(fingerprints.len() as u64);
+    for fingerprint in fingerprints {
+        builder.write_fingerprint(fingerprint);
+    }
+    builder.finish()
 }
 
 /// Consumer join enumeration can change the order/association of a necessary
@@ -127,6 +225,7 @@ pub(in crate::cascades::planner) struct NativeCteBinding {
     /// Independent restrictions are intersected, not concatenated into one
     /// key UNION. The conjunction is commutative and idempotent.
     domains: Box<[CteDomainProof]>,
+    fingerprint: Fingerprint,
 }
 
 /// Query-local alpha names for a partition strategy. Replaying a requirement
@@ -785,16 +884,8 @@ mod tests {
         let (input, mut requirement, _, _) =
             bind_requirement(owner(reference(9, 1)), PlannerTransformation::CteInline);
         let mut state = input.planner_state.write().unwrap();
-        let first = CteDomainProof {
-            cte_index: 9,
-            predicates: vec![equality(0, 1)].into_boxed_slice(),
-            keys: Box::new([]),
-        };
-        let second = CteDomainProof {
-            cte_index: 9,
-            predicates: vec![equality(0, 2)].into_boxed_slice(),
-            keys: Box::new([]),
-        };
+        let first = CteDomainProof::new(9, [equality(0, 1)], std::iter::empty());
+        let second = CteDomainProof::new(9, [equality(0, 2)], std::iter::empty());
         let initial = requirement.producer;
         let intermediate = input.root;
         let final_group = input
@@ -841,6 +932,11 @@ mod tests {
             vec![c, a.clone(), b.clone(), a.clone()],
         )];
         assert!(predicate_domains_equal(&first, &reordered));
+        assert_eq!(
+            CteDomainProof::new(9, first.clone(), std::iter::empty()).fingerprint,
+            CteDomainProof::new(9, reordered.clone(), std::iter::empty()).fingerprint,
+            "domain fingerprints must follow the same flattening/idempotence contract as proof equality"
+        );
         assert!(!predicate_domains_equal(
             &first,
             &[conjunction(ConjunctionType::And, vec![a, b])]
@@ -852,10 +948,12 @@ mod tests {
         let (input, requirement, _, _) =
             bind_requirement(owner(reference(9, 1)), PlannerTransformation::CteInline);
         let mut state = input.planner_state.write().unwrap();
-        let proof = |value| CteDomainProof {
-            cte_index: requirement.definition,
-            predicates: vec![equality(0, value)].into_boxed_slice(),
-            keys: Box::new([]),
+        let proof = |value| {
+            CteDomainProof::new(
+                requirement.definition,
+                [equality(0, value)],
+                std::iter::empty(),
+            )
         };
         let a = proof(1);
         let b = proof(2);
@@ -988,9 +1086,11 @@ impl CteRequirement {
         if !domains.iter().any(|existing| equal(existing, proof)) {
             domains.push(proof.clone());
         }
+        let fingerprint = binding_domain_fingerprint(self.definition, &domains);
         if let Some(binding) = state.cte_bindings.iter().find(|binding| {
             binding.definition == self.definition
                 && memo.canonical_group(binding.input) == memo.canonical_group(input)
+                && binding.fingerprint == fingerprint
                 && domains
                     .iter()
                     .all(|domain| binding.domains.iter().any(|other| equal(domain, other)))
@@ -1007,6 +1107,7 @@ impl CteRequirement {
             definition: self.definition,
             input,
             domains: domains.into_boxed_slice(),
+            fingerprint,
         });
         symbol
     }
@@ -1079,7 +1180,7 @@ impl CteRequirement {
     pub(super) fn partitions(
         &self,
         plan: OwnedLogicalPlan,
-        holes: &mut BTreeMap<u32, GroupId>,
+        holes: &mut BTreeMap<paro_planner::operator::BoundReferenceId, GroupId>,
         bind: &BindContext,
         labels: &mut PartitionLabels,
     ) -> Result<Vec<OwnedLogicalPlan>> {
@@ -1136,7 +1237,7 @@ impl CteRequirement {
     fn partition(
         &self,
         plan: OwnedLogicalPlan,
-        holes: &mut BTreeMap<u32, GroupId>,
+        holes: &mut BTreeMap<paro_planner::operator::BoundReferenceId, GroupId>,
         bind: &BindContext,
     ) -> Result<Option<OwnedLogicalPlan>> {
         Ok(self
@@ -1148,7 +1249,7 @@ impl CteRequirement {
     fn partition_by_ordinal(
         &self,
         plan: OwnedLogicalPlan,
-        holes: &mut BTreeMap<u32, GroupId>,
+        holes: &mut BTreeMap<paro_planner::operator::BoundReferenceId, GroupId>,
         bind: &BindContext,
         ordinal: usize,
         labels: &mut PartitionLabels,
@@ -1283,7 +1384,8 @@ impl CteRequirement {
         holes.remove(&producer.reference_id);
         for (partition, predicates) in domains.into_iter().enumerate().rev() {
             let mut reference = producer.clone();
-            reference.reference_id = bind.next_plan_id().0;
+            reference.reference_id =
+                paro_planner::operator::BoundReferenceId::group_hole(bind.next_plan_id().0);
             holes.insert(reference.reference_id, self.producer);
             let input = OwnedLogicalPlan::new(bind, LogicalOperator::BoundReference(reference));
             let restricted = OwnedLogicalPlan::new(
@@ -1498,11 +1600,7 @@ impl CteRequirement {
         else {
             return Ok(None);
         };
-        let proof = CteDomainProof {
-            cte_index: self.definition,
-            predicates: predicates.clone().into_boxed_slice(),
-            keys: Box::new([]),
-        };
+        let proof = CteDomainProof::new(self.definition, predicates.clone(), std::iter::empty());
         if self.domain_is_proved(&proof, memo, state) {
             return Ok(None);
         }
@@ -1525,7 +1623,7 @@ impl CteRequirement {
     pub(super) fn restrict_key_domain(
         &self,
         plan: OwnedLogicalPlan,
-        holes: &mut BTreeMap<u32, GroupId>,
+        holes: &mut BTreeMap<paro_planner::operator::BoundReferenceId, GroupId>,
         memo: &Memo,
         state: &PlannerTransformState,
         facts: &boundary::BoundarySnapshot,
@@ -1546,18 +1644,15 @@ impl CteRequirement {
         if keys.iter().any(|key| key.ordinals != ordinals) {
             return Ok(None);
         }
-        let proof = CteDomainProof {
-            cte_index: self.definition,
-            predicates: Box::new([]),
-            keys: keys.clone().into_boxed_slice(),
-        };
+        let proof = CteDomainProof::new(self.definition, std::iter::empty(), keys.clone());
         if self.domain_is_proved(&proof, memo, state) {
             return Ok(None);
         }
         let bind = &state.bind_context;
         let mut domain: Option<OwnedLogicalPlan> = None;
         for key in keys {
-            let reference_id = bind.next_plan_id().0;
+            let reference_id =
+                paro_planner::operator::BoundReferenceId::group_hole(bind.next_plan_id().0);
             let transport = facts.transport(memo, state, key.group, &key.layout)?;
             let reference = BoundReference::new(
                 reference_id,
@@ -1640,7 +1735,7 @@ impl CteRequirement {
     pub(super) fn inline(
         &self,
         plan: OwnedLogicalPlan,
-        holes: &mut BTreeMap<u32, GroupId>,
+        holes: &mut BTreeMap<paro_planner::operator::BoundReferenceId, GroupId>,
         bind_context: &BindContext,
     ) -> Result<Option<OwnedLogicalPlan>> {
         if self.policy == CTEMaterialize::Materialized {
@@ -1680,7 +1775,7 @@ impl CteRequirement {
                 ));
             }
             let input = paro_planner::operator::BoundReference::new(
-                bind_context.next_plan_id().0,
+                paro_planner::operator::BoundReferenceId::group_hole(bind_context.next_plan_id().0),
                 producer.bindings.clone(),
                 producer.types.clone(),
             )

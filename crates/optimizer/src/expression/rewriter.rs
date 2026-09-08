@@ -506,11 +506,11 @@ mod tests {
         let distinct = OwnedLogicalPlan::synthetic(LogicalOperator::Distinct(
             Distinct::distinct_on(vec![make_constant(98)], values),
         ));
-        let mut op = LogicalOperator::Limit(Limit::new(
+        let mut op = LogicalOperator::Limit(Box::new(Limit::new(
             distinct,
             Some(make_constant(99)),
             Some(make_constant(99)),
-        ));
+        )));
 
         rewriter.visit_operator(&mut op);
 

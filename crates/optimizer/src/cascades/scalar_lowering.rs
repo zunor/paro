@@ -687,6 +687,168 @@ pub(crate) fn value_fingerprint(value: &Value) -> Fingerprint {
     builder.finish()
 }
 
+/// Stable structural identity for a bound expression used by planner-side
+/// domain proofs.  This deliberately does not depend on arena-local
+/// `ColumnId`s, insertion order, or pointer addresses.  Conjunction children
+/// are normalized as a multiset because CTE domain equality treats nested
+/// AND/OR arms as commutative and idempotent.
+pub(crate) fn expression_fingerprint(expression: &Expression) -> Fingerprint {
+    let mut builder = StableFingerprintBuilder::default();
+    encode_expression_fingerprint(&mut builder, expression);
+    builder.finish()
+}
+
+fn encode_expression_fingerprint(builder: &mut StableFingerprintBuilder, expression: &Expression) {
+    match expression {
+        Expression::Constant(constant) => {
+            builder.write_u64(0);
+            builder.write_fingerprint(value_fingerprint(&constant.value));
+        }
+        Expression::ColumnRef(column) => {
+            builder.write_u64(1);
+            builder.write_u64(column.binding.table_index as u64);
+            builder.write_u64(column.binding.column_index as u64);
+            builder.write_u64(column.depth as u64);
+        }
+        Expression::Function(function) => {
+            builder.write_u64(2);
+            builder.write_fingerprint(function_fingerprint(function));
+            builder.write_u64(function.children.len() as u64);
+            for child in &function.children {
+                encode_expression_fingerprint(builder, child);
+            }
+        }
+        Expression::Cast(cast) => {
+            builder.write_u64(3);
+            super::scalar::encode_logical_type(builder, &cast.target_type);
+            builder.write_u64(cast.try_cast as u64);
+            encode_expression_fingerprint(builder, &cast.child);
+        }
+        Expression::Conjunction(conjunction) => {
+            builder.write_u64(match conjunction.conjunction_type {
+                ConjunctionType::And => 4,
+                ConjunctionType::Or => 5,
+            });
+            // Domain proofs flatten nested conjunctions of the same kind and
+            // compare their arms as an idempotent set.  Encode that exact
+            // normalization here so the fingerprint remains a necessary
+            // condition for the structural proof (never a source of false
+            // negatives).
+            fn flatten<'a>(
+                expression: &'a Expression,
+                kind: ConjunctionType,
+                output: &mut Vec<&'a Expression>,
+            ) {
+                if let Expression::Conjunction(nested) = expression {
+                    if nested.conjunction_type == kind {
+                        for child in &nested.children {
+                            flatten(child, kind, output);
+                        }
+                        return;
+                    }
+                }
+                output.push(expression);
+            }
+            let mut leaves = Vec::new();
+            for child in &conjunction.children {
+                flatten(child, conjunction.conjunction_type, &mut leaves);
+            }
+            let mut children = leaves
+                .into_iter()
+                .map(expression_fingerprint)
+                .collect::<Vec<_>>();
+            children.sort_unstable();
+            children.dedup();
+            builder.write_u64(children.len() as u64);
+            for fingerprint in children {
+                builder.write_fingerprint(fingerprint);
+            }
+        }
+        Expression::Case(case) => {
+            builder.write_u64(6);
+            encode_expression_fingerprint(builder, &case.check);
+            encode_expression_fingerprint(builder, &case.result_if_true);
+            encode_expression_fingerprint(builder, &case.result_if_false);
+        }
+        Expression::Comparison(comparison) => {
+            builder.write_u64(7);
+            builder.write_u64(comparison.comparison_type as u64);
+            encode_expression_fingerprint(builder, &comparison.left);
+            encode_expression_fingerprint(builder, &comparison.right);
+        }
+        Expression::Operator(operator) => {
+            builder.write_u64(8);
+            builder.write_u64(operator.operator_type as u64);
+            builder.write_u64(operator.children.len() as u64);
+            for child in &operator.children {
+                encode_expression_fingerprint(builder, child);
+            }
+        }
+        Expression::Parameter(parameter) => {
+            builder.write_u64(9);
+            builder.write_u64(parameter.slot.index.index() as u64);
+            super::scalar::encode_logical_type(builder, &parameter.slot.ty);
+        }
+        Expression::Reference(reference) => {
+            builder.write_u64(10);
+            builder.write_u64(reference.index as u64);
+        }
+        Expression::Aggregate(aggregate) => {
+            builder.write_u64(11);
+            builder.write_fingerprint(aggregate_fingerprint(aggregate));
+            for child in &aggregate.children {
+                encode_expression_fingerprint(builder, child);
+            }
+            if let Some(filter) = &aggregate.filter {
+                builder.write_u64(1);
+                encode_expression_fingerprint(builder, filter);
+            } else {
+                builder.write_u64(0);
+            }
+            for order in &aggregate.order_bys {
+                builder.write_u64(order.ascending as u64);
+                builder.write_u64(order.nulls_first as u64);
+                encode_expression_fingerprint(builder, &order.expression);
+            }
+        }
+        Expression::Subquery(subquery) => {
+            // Unplanned scalar subqueries are rejected at the Query IR
+            // boundary. Keep a typed marker here so a malformed proof cannot
+            // alias a scalar expression of another variant.
+            builder.write_u64(12);
+            builder.write_bytes(format!("{subquery:?}").as_bytes());
+        }
+        Expression::Window(window) => {
+            builder.write_u64(13);
+            builder.write_fingerprint(window_fingerprint(window));
+            for partition in &window.partitions {
+                encode_expression_fingerprint(builder, partition);
+            }
+            for order in &window.orders {
+                builder.write_u64(order.ascending as u64);
+                builder.write_u64(order.nulls_first as u64);
+                encode_expression_fingerprint(builder, &order.expression);
+            }
+            encode_frame_bound_fingerprint(builder, &window.frame.start_bound);
+            encode_frame_bound_fingerprint(builder, &window.frame.end_bound);
+        }
+    }
+}
+
+fn encode_frame_bound_fingerprint(
+    builder: &mut StableFingerprintBuilder,
+    bound: &paro_planner::expression::WindowFrameBound,
+) {
+    match bound {
+        paro_planner::expression::WindowFrameBound::Unbounded => builder.write_u64(0),
+        paro_planner::expression::WindowFrameBound::CurrentRow => builder.write_u64(1),
+        paro_planner::expression::WindowFrameBound::Offset(expression) => {
+            builder.write_u64(2);
+            encode_expression_fingerprint(builder, expression);
+        }
+    }
+}
+
 pub(crate) fn encode_value(builder: &mut StableFingerprintBuilder, value: &Value) {
     macro_rules! integer {
         ($tag:expr, $value:expr) => {{

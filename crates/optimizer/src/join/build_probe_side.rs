@@ -456,12 +456,12 @@ mod tests {
             CatalogObjectId::from_raw(90_001),
             0,
         ));
-        let get = OwnedLogicalPlan::synthetic(LogicalOperator::Get(Get::new(
+        let get = OwnedLogicalPlan::synthetic(LogicalOperator::Get(Box::new(Get::new(
             0,
             vec!["k".to_string()],
             vec![LogicalType::Integer],
             table,
-        )));
+        ))));
 
         assert_eq!(estimate_plan_cardinality(&make_test_session(), &get), 1);
     }

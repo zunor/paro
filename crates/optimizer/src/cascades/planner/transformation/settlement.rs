@@ -13,6 +13,7 @@ use paro_common::types::LogicalType;
 use paro_planner::operator::{BoundReference, LogicalOutputLayout};
 use paro_planner::plan::arena::{LogicalPlanArena, LogicalPlanNode, PlanIndex};
 use paro_planner::plan::{NodeStats, PlanNodeId};
+use std::hash::{Hash, Hasher};
 
 mod demand;
 
@@ -35,11 +36,29 @@ struct LocalKey {
     output: Box<[ColumnId]>,
     inputs: Box<[FactId]>,
     cte: Option<(usize, FactId)>,
+    input_stats: NodeStats,
+}
+
+/// Cheap admission key used before constructing the complete local recipe
+/// identity.  A shape hit means a full key may be worth materializing; a
+/// shape miss proves that no cached local can match and avoids layout
+/// interning, scalar serialization, and operator identity encoding on the
+/// overwhelmingly common first-visit path.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+struct LocalShape {
+    operator_tag: u64,
+    inputs: Box<[FactId]>,
+    input_stats: NodeStats,
+}
+
+fn operator_shape_tag<Child>(operator: &LogicalOperator<Child>) -> u64 {
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    std::mem::discriminant(operator).hash(&mut hasher);
+    hasher.finish()
 }
 
 #[derive(Debug, Clone)]
 struct SettledLocal {
-    input_stats: NodeStats,
     recipe: PlanIndex,
     facts: FactId,
     /// Statistics needed by this operator's expressions, including columns
@@ -53,11 +72,16 @@ pub(in crate::cascades::planner) struct SettlementCache {
     bindings: BindingCatalog,
     scalars: ScalarArena,
     recipes: LogicalPlanArena,
-    locals: BTreeMap<LocalKey, Vec<SettledLocal>>,
+    locals: BTreeMap<LocalKey, SettledLocal>,
+    local_shapes: BTreeSet<LocalShape>,
     facts: Vec<RelationFacts>,
     facts_by_columns: BTreeMap<Box<[usize]>, Vec<FactId>>,
     column_values: HashMap<(LogicalType, Vec<u8>, usize, Option<u64>), usize>,
-    column_pointers: HashMap<usize, (Arc<ColumnStatistics>, usize)>,
+    /// Pointer fast path for live statistics allocations.  A `Weak` keeps
+    /// the cache from pinning every column fact for the lifetime of the
+    /// planner session while still making address reuse safe: an upgraded
+    /// weak pointer can only match the original allocation.
+    column_pointers: HashMap<usize, (std::sync::Weak<ColumnStatistics>, usize)>,
     scan_bindings: demand::ScanBindings,
     pub(in crate::cascades::planner) hits: u64,
     pub(in crate::cascades::planner) misses: u64,
@@ -107,10 +131,15 @@ impl SettlementCache {
         // leave those direct readers with the pre-filter storage NDV.
         if let Some(rows) = fact.stats.estimated_cardinality {
             for column in &mut fact.columns {
-                if column.get_distinct_count() as u64 > rows.expected {
+                // The point estimate is not a proof of the row domain.  A
+                // filter or aggregate may be underestimated while its HLL
+                // still carries a useful observed value domain.  Restricting
+                // NDV to the envelope's upper edge preserves that evidence
+                // and keeps expected/risk costing separate from hard facts.
+                if column.get_distinct_count() as u64 > rows.max {
                     let mut bounded = ColumnStatistics::with_estimated_distinct(
                         column.statistics().clone(),
-                        Some(rows.expected as usize),
+                        Some(rows.max as usize),
                     );
                     if let Some(upper) = column.guaranteed_distinct_upper() {
                         bounded = bounded.with_guaranteed_distinct_upper(upper);
@@ -122,21 +151,18 @@ impl SettlementCache {
         let mut columns = Vec::with_capacity(fact.columns.len());
         for column in &fact.columns {
             let pointer = Arc::as_ptr(column) as usize;
-            let id = if let Some((_, id)) = self.column_pointers.get(&pointer) {
-                *id
+            let id = if let Some((weak, id)) = self.column_pointers.get(&pointer) {
+                if weak
+                    .upgrade()
+                    .is_some_and(|existing| Arc::ptr_eq(&existing, column))
+                {
+                    *id
+                } else {
+                    self.column_pointers.remove(&pointer);
+                    self.intern_column_value(column)?
+                }
             } else {
-                let key = (
-                    column.statistics().get_type().clone(),
-                    column.to_bytes()?,
-                    column.get_distinct_count(),
-                    column.guaranteed_distinct_upper(),
-                );
-                let next = self.column_values.len();
-                let id = *self.column_values.entry(key).or_insert(next);
-                // Retain the Arc so address reuse can never validate a new
-                // allocation against an old fact.
-                self.column_pointers.insert(pointer, (column.clone(), id));
-                id
+                self.intern_column_value(column)?
             };
             columns.push(id);
         }
@@ -159,10 +185,25 @@ impl SettlementCache {
         Ok(id)
     }
 
+    fn intern_column_value(&mut self, column: &Arc<ColumnStatistics>) -> Result<usize> {
+        let pointer = Arc::as_ptr(column) as usize;
+        let key = (
+            column.statistics().get_type().clone(),
+            column.to_bytes()?,
+            column.get_distinct_count(),
+            column.guaranteed_distinct_upper(),
+        );
+        let next = self.column_values.len();
+        let id = *self.column_values.entry(key).or_insert(next);
+        self.column_pointers
+            .insert(pointer, (Arc::downgrade(column), id));
+        Ok(id)
+    }
+
     fn boundary(&self, ordinal: usize, fact: FactId) -> Result<OwnedLogicalPlan> {
         let fact = &self.facts[fact];
         let mut reference = BoundReference::new(
-            ordinal as u32,
+            paro_planner::operator::BoundReferenceId::input_ordinal(ordinal),
             fact.layout.bindings().to_vec(),
             fact.layout.types().to_vec(),
         );
@@ -181,7 +222,7 @@ impl SettlementCache {
                         .map(|distinct| {
                             fact.stats
                                 .estimated_cardinality
-                                .map_or(distinct, |rows| distinct.min(rows.expected))
+                                .map_or(distinct, |rows| distinct.min(rows.max))
                         }),
                     guaranteed_distinct_upper: column.guaranteed_distinct_upper(),
                 },
@@ -212,6 +253,12 @@ impl SettlementCache {
         ctes: &CteEnvironment,
         environment: &PlannerRuleEnvironment,
     ) -> Result<SettledLocal> {
+        let shape = LocalShape {
+            operator_tag: operator_shape_tag(&shell.operator),
+            inputs: inputs.into(),
+            input_stats: shell.stats.clone(),
+        };
+        let maybe_cached = self.local_shapes.contains(&shape);
         let child_layouts = inputs
             .iter()
             .map(|id| self.facts[*id].layout.clone())
@@ -247,17 +294,15 @@ impl SettlementCache {
             output: output_columns,
             inputs: inputs.into(),
             cte,
+            input_stats: shell.stats.clone(),
         };
-        if let Some(entry) = self.locals.get(&key).and_then(|entries| {
-            entries
-                .iter()
-                .find(|entry| entry.input_stats == shell.stats)
-        }) {
-            self.hits += 1;
-            return Ok(entry.clone());
+        if maybe_cached {
+            if let Some(entry) = self.locals.get(&key) {
+                self.hits += 1;
+                return Ok(entry.clone());
+            }
         }
         self.misses += 1;
-        let input_stats = shell.stats.clone();
         let mut plan = shell.assemble(
             inputs
                 .iter()
@@ -314,14 +359,17 @@ impl SettlementCache {
             // An identity filter can disappear during local propagation. Its
             // replacement is an input, not a new relation with unknown column
             // domains. Preserve the exact positional snapshot and hard bound.
-            let facts = inputs[reference.reference_id as usize];
+            let ordinal = reference.reference_id.input_ordinal_value()?;
+            let facts = *inputs.get(ordinal).ok_or_else(|| {
+                paro_error::internal("settlement boundary reference is outside its input set")
+            })?;
             let entry = SettledLocal {
-                input_stats,
                 recipe: self.recipes.import(plan)?,
                 facts,
                 statistics: context.column_stats,
             };
-            self.locals.entry(key).or_default().push(entry.clone());
+            self.local_shapes.insert(shape);
+            self.locals.insert(key, entry.clone());
             return Ok(entry);
         }
         let (plan, output, maximum) =
@@ -364,12 +412,12 @@ impl SettlementCache {
             column_ids: Box::new([]),
         })?;
         let entry = SettledLocal {
-            input_stats,
             recipe: self.recipes.import(plan)?,
             facts,
             statistics: context.column_stats,
         };
-        self.locals.entry(key).or_default().push(entry.clone());
+        self.local_shapes.insert(shape);
+        self.locals.insert(key, entry.clone());
         Ok(entry)
     }
 
@@ -464,6 +512,13 @@ impl SettlementCache {
                                 .zip(reference.column_statistics())
                                 .collect(),
                         );
+                        // Synthetic ids are intentionally non-unique and
+                        // cannot serve as scope-cache keys. Settlement is
+                        // the ownership boundary, so mint a real occurrence
+                        // id before publishing this scope.
+                        if node.id.is_synthetic() {
+                            node.id = environment.bind_context.next_plan_id();
+                        }
                         scopes.insert(node.id, statistics.clone());
                         let aliases = reference
                             .bindings
@@ -515,14 +570,10 @@ impl SettlementCache {
                     for recipe_index in self.recipes.post_order(local.recipe)? {
                         let recipe = self.recipes.get(recipe_index)?.clone();
                         if let LogicalOperator::BoundReference(reference) = &recipe.operator {
-                            let child =
-                                children
-                                    .get(reference.reference_id as usize)
-                                    .ok_or_else(|| {
-                                        paro_error::internal(
-                                            "settlement recipe changed its input contract",
-                                        )
-                                    })?;
+                            let ordinal = reference.reference_id.input_ordinal_value()?;
+                            let child = children.get(ordinal).ok_or_else(|| {
+                                paro_error::internal("settlement recipe changed its input contract")
+                            })?;
                             remapped.insert(recipe_index, child.0);
                             continue;
                         }
@@ -658,6 +709,47 @@ mod tests {
     }
 
     #[test]
+    fn uncertain_row_point_does_not_destroy_an_observed_domain() {
+        let mut cache = SettlementCache::default();
+        let facts = cache
+            .intern_fact(RelationFacts {
+                layout: LogicalOutputLayout::new(
+                    vec![LogicalType::Integer],
+                    vec![ColumnBinding::new(0, 0)],
+                ),
+                stats: NodeStats {
+                    estimated_cardinality: Some(CardinalityEstimate {
+                        min: 0,
+                        expected: 1,
+                        max: 100,
+                    }),
+                    ..NodeStats::default()
+                },
+                maximum: None,
+                columns: vec![Arc::new(ColumnStatistics::with_estimated_distinct(
+                    paro_storage::statistics::BaseStatistics::create_unknown(LogicalType::Integer),
+                    Some(10),
+                ))],
+                column_ids: Box::new([]),
+            })
+            .unwrap();
+
+        assert_eq!(
+            cache.facts[facts].columns[0].get_distinct_count(),
+            10,
+            "the expected row point is not a hard NDV proof"
+        );
+        let boundary = cache.boundary(0, facts).unwrap();
+        let LogicalOperator::BoundReference(reference) = &boundary.operator else {
+            panic!("not a boundary")
+        };
+        assert_eq!(
+            reference.facts.column_domains[0].expected_distinct,
+            Some(10)
+        );
+    }
+
+    #[test]
     fn unchanged_input_facts_reuse_local_recipes_with_fresh_occurrences() {
         let env = environment();
         let mut cache = SettlementCache::default();
@@ -722,11 +814,11 @@ mod tests {
         let env = environment();
         let scan = OwnedLogicalPlan::new(
             &env.bind_context,
-            LogicalOperator::Get(Get::new_without_table(
+            LogicalOperator::Get(Box::new(Get::new_without_table(
                 0,
                 vec!["a".into(), "b".into(), "c".into()],
                 vec![LogicalType::Integer; 3],
-            )),
+            ))),
         );
         let mut filter = Filter::new(
             scan,

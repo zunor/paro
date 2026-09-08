@@ -54,6 +54,10 @@ INSERT INTO nullable_singleton_customer VALUES (1), (NULL), (NULL);
 INSERT INTO prefix_nullable_singleton_customer VALUES
     ('13-a', 1), ('13-b', NULL), ('13-c', NULL);
 
+-- Known regression: the inner singleton proof currently lowers through a
+-- partial-merge aggregate above the LEFT JOIN.  This is semantically exact,
+-- but retains one extra hash-aggregate phase until native singleton state can
+-- be carried directly through the outer grouping contract.
 EXPLAIN SELECT c_count, count(*) AS customer_distribution
 FROM (
     SELECT c.customer_key, count(o.order_key) AS c_count

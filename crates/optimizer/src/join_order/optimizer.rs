@@ -705,12 +705,7 @@ impl JoinOrderOptimizer {
         stats.contains_control_region =
             crate::join::build_probe_side::contains_control_region_boundary(plan);
         stats.unique_keys = crate::statistics::unique_keys::proven_unique_keys(plan);
-        // A storage HLL is an observation of its base scan, not of an
-        // arbitrary derived relation. Once a binding crosses a row-reducing
-        // join/filter boundary the same value remains a useful upper bound,
-        // but advertising it as an observed output domain makes SEMI/ANTI
-        // coverage estimates systematically ignore correlated filtering.
-        let hll_is_boundary_observation = matches!(plan.operator, LogicalOperator::Get(_));
+        let memo_domain_observation = matches!(plan.operator, LogicalOperator::BoundReference(_));
         // Opaque Memo inputs own their occurrence's domain. The binding map
         // belongs to the rule's original shell and may describe another CTE
         // restriction or an earlier equivalent expression with the same
@@ -755,6 +750,8 @@ impl JoinOrderOptimizer {
                     .map(|stats| stats.get_distinct_count())
                     .unwrap_or(0);
                 let has_hll = distinct > 0;
+                let storage_observation =
+                    column_stats.is_some_and(|stats| stats.is_storage_observation());
                 let distinct = if has_hll {
                     distinct
                 } else {
@@ -769,7 +766,12 @@ impl JoinOrderOptimizer {
                         // rewriting base-column HLL or min/max statistics. The
                         // surviving domain cannot contain more values than rows.
                         distinct.min(cardinality.max(1)),
-                        has_hll && (hll_is_boundary_observation || boundary_columns.is_some()),
+                        // Provenance, not the root operator shape, decides
+                        // whether an HLL is an observed domain.  Filters,
+                        // projections, search scans, and CTE boundaries can
+                        // preserve a storage observation without being a
+                        // bare Get; derived expressions remain estimates.
+                        has_hll && (storage_observation || memo_domain_observation),
                     ),
                 )
             })
@@ -1273,7 +1275,11 @@ mod tests {
         let session = make_test_session();
         let context = BindContext::new();
         let binding = ColumnBinding::new(0, 0);
-        let mut reference = BoundReference::new(0, vec![binding], vec![LogicalType::Integer]);
+        let mut reference = BoundReference::new(
+            paro_planner::operator::BoundReferenceId::group_hole(0),
+            vec![binding],
+            vec![LogicalType::Integer],
+        );
         reference.facts = Arc::new(BoundRelationFacts {
             cardinality: Some(CardinalityEstimate::exact(100)),
             column_domains: vec![BoundColumnDomain {
@@ -1573,7 +1579,7 @@ mod tests {
                 estimated_cardinality: Some(CardinalityEstimate::exact(100)),
                 ..NodeStats::default()
             },
-            operator: LogicalOperator::Get(get),
+            operator: LogicalOperator::Get(Box::new(get)),
         };
         let plan =
             crate::statistics::unique_keys::refresh_unique_keys(plan).expect("cache unique keys");

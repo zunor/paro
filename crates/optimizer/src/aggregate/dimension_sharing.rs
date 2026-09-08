@@ -715,7 +715,7 @@ fn apply(
     let final_groupings_index = bind_context.generate_table_index();
     let final_aggregate = OwnedLogicalPlan::new(
         bind_context,
-        LogicalOperator::Aggregate(Aggregate::new(
+        LogicalOperator::Aggregate(Box::new(Aggregate::new(
             final_group_index,
             final_aggregate_index,
             final_groupings_index,
@@ -724,7 +724,7 @@ fn apply(
             vec![],
             final_aggregates,
             vec![],
-        )),
+        ))),
     );
 
     let mut outer_to_final = HashMap::new();
@@ -833,7 +833,7 @@ fn take_branch(plan: OwnedLogicalPlan) -> Result<OwnedBranch> {
     Ok(OwnedBranch {
         projection_expressions,
         filter_expressions,
-        outer,
+        outer: *outer,
         join,
         dimension,
         partial,

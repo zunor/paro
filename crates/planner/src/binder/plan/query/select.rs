@@ -158,7 +158,7 @@ impl Binder {
                 node.aggregates.clone(),
                 node.grouping_functions.clone(),
             );
-            root = LogicalOperator::Aggregate(aggregate);
+            root = LogicalOperator::Aggregate(Box::new(aggregate));
         } else if !node.groups.grouping_sets.is_empty() {
             // =================================================================
             // Edge case: grouping sets but no groups or aggregates

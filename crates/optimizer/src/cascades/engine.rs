@@ -1250,7 +1250,9 @@ impl CascadesEngine {
             .logical_exprs()
             .to_vec();
         for expression in logical_exprs {
-            let expression_ref = self.memo.logical_expr(expression).unwrap();
+            let expression_ref = self.memo.logical_expr(expression).ok_or_else(|| {
+                paro_error::internal("unknown logical expression during implementation")
+            })?;
             for implementation in self.registry.implementations() {
                 let context = ImplementationContext {
                     memo: &self.memo,
@@ -1385,7 +1387,9 @@ impl CascadesEngine {
                     );
                     self.memo
                         .group_mut(group)
-                        .unwrap()
+                        .ok_or_else(|| {
+                            paro_error::internal("unknown group during region admission")
+                        })?
                         .ledger
                         .record_budget_limited(
                             BudgetDimension::CompositeRegionCandidate,
@@ -1395,10 +1399,15 @@ impl CascadesEngine {
                 }
                 admitted.insert(candidate.physical_fingerprint);
             }
-            let decision = self.memo.group_mut(group).unwrap().ledger.admit_optional(
-                BudgetDimension::PhysicalExprPerGroup,
-                candidate.stable_event(goal),
-            );
+            let decision = self
+                .memo
+                .group_mut(group)
+                .ok_or_else(|| paro_error::internal("unknown group during physical admission"))?
+                .ledger
+                .admit_optional(
+                    BudgetDimension::PhysicalExprPerGroup,
+                    candidate.stable_event(goal),
+                );
             if decision == BudgetDecision::Exhausted {
                 tracing::debug!(
                     target: "paro::optimizer",
@@ -1528,7 +1537,9 @@ impl CascadesEngine {
                     .saturating_sub(
                         self.memo
                             .group(group)
-                            .unwrap()
+                            .ok_or_else(|| {
+                                paro_error::internal("unknown group during frontier admission")
+                            })?
                             .ledger
                             .consumed(BudgetDimension::ChildFrontierCombination),
                     )
@@ -1654,8 +1665,14 @@ impl CascadesEngine {
                 else {
                     continue;
                 };
-                let physical_properties =
-                    self.memo.physical_expr(physical).unwrap().provided.clone();
+                let physical_properties = self
+                    .memo
+                    .physical_expr(physical)
+                    .ok_or_else(|| {
+                        paro_error::internal("unknown physical expression during enforcement")
+                    })?
+                    .provided
+                    .clone();
                 let Some(enforced) = self
                     .enforcement
                     .canonical_baseline(physical_properties, &required)?

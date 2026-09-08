@@ -1084,7 +1084,7 @@ mod tests {
             ))],
             predicate,
         });
-        let aggregate = OwnedLogicalPlan::new(ctx, LogicalOperator::Aggregate(aggregate));
+        let aggregate = OwnedLogicalPlan::new(ctx, LogicalOperator::Aggregate(Box::new(aggregate)));
         // The public projection observes only the group key. Aggregate #1 is
         // nevertheless required exclusively by the hidden reduction.
         let mut plan = OwnedLogicalPlan::new(
@@ -1122,11 +1122,11 @@ mod tests {
         let ctx = &binder.bind_context;
         let left = OwnedLogicalPlan::new(
             ctx,
-            LogicalOperator::Get(Get::new_without_table(
+            LogicalOperator::Get(Box::new(Get::new_without_table(
                 10,
                 vec!["unused".into(), "key".into()],
                 vec![LogicalType::Integer, LogicalType::Integer],
-            )),
+            ))),
         );
         let right = OwnedLogicalPlan::new(
             ctx,
@@ -1181,7 +1181,7 @@ mod tests {
         let ctx = &binder.bind_context;
         let scan = OwnedLogicalPlan::new(
             ctx,
-            LogicalOperator::Get(Get::new_without_table(
+            LogicalOperator::Get(Box::new(Get::new_without_table(
                 10,
                 vec![
                     "payload_0".into(),
@@ -1193,7 +1193,7 @@ mod tests {
                     LogicalType::Integer,
                     LogicalType::Integer,
                 ],
-            )),
+            ))),
         );
         let mut correlation_projection = Projection::new(
             20,
@@ -1237,11 +1237,11 @@ mod tests {
         let ctx = &binder.bind_context;
         let scan = OwnedLogicalPlan::new(
             ctx,
-            LogicalOperator::Get(Get::new_without_table(
+            LogicalOperator::Get(Box::new(Get::new_without_table(
                 10,
                 vec!["dead".into(), "visible".into(), "hidden".into()],
                 vec![LogicalType::Integer; 3],
-            )),
+            ))),
         );
         let projection = Projection::new(
             20,
@@ -1290,7 +1290,7 @@ mod tests {
             vec![LogicalType::Integer; 4],
         );
         get.runtime_filter_expressions.push(int_column(10, 3));
-        let scan = OwnedLogicalPlan::new(ctx, LogicalOperator::Get(get));
+        let scan = OwnedLogicalPlan::new(ctx, LogicalOperator::Get(Box::new(get)));
         let mut plan = OwnedLogicalPlan::new(
             ctx,
             LogicalOperator::Projection(Projection::new(20, scan, vec![int_column(10, 0)])),
@@ -1324,7 +1324,7 @@ mod tests {
         );
         get.column_types[1] = LogicalType::VarcharCollation("C".into());
         get.returned_types[1] = LogicalType::Varchar;
-        let scan = OwnedLogicalPlan::new(ctx, LogicalOperator::Get(get));
+        let scan = OwnedLogicalPlan::new(ctx, LogicalOperator::Get(Box::new(get)));
         let text = Expression::ColumnRef(ColumnRefExpression::new(
             ColumnBinding::new(10, 1),
             LogicalType::Varchar,
@@ -1356,7 +1356,7 @@ mod tests {
         let ctx = &binder.bind_context;
         let scan = OwnedLogicalPlan::new(
             ctx,
-            LogicalOperator::Get(Get::new_without_table(
+            LogicalOperator::Get(Box::new(Get::new_without_table(
                 10,
                 vec!["key".into(), "dead".into(), "value".into()],
                 vec![
@@ -1364,7 +1364,7 @@ mod tests {
                     LogicalType::Integer,
                     LogicalType::Integer,
                 ],
-            )),
+            ))),
         );
         let predicate = Expression::Comparison(ComparisonExpression::new(
             ComparisonType::Equal,

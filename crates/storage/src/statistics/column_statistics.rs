@@ -57,6 +57,23 @@ pub struct ColumnStatistics {
     /// writes, while a schema constraint or a query predicate can. Storage
     /// serialization therefore never persists this plan-local fact.
     guaranteed_distinct_upper: Option<u64>,
+    /// Number of rows represented by the retained sketch versus the complete
+    /// row domain.  This is populated by rowset/tablet aggregation when one
+    /// input has no sketch; it lets the estimator extrapolate instead of
+    /// throwing away the surviving observation.  It is intentionally
+    /// derived metadata and is not persisted in a segment's on-disk format.
+    distinct_coverage: Option<DistinctCoverage>,
+    /// Whether the retained HLL is a direct observation of a storage
+    /// snapshot.  The planner must not infer this from the logical operator
+    /// shape: a Projection, SearchScan, or CTE boundary can preserve the same
+    /// observation while a bare Get can also carry a derived domain.
+    storage_observation: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct DistinctCoverage {
+    observed_rows: u64,
+    total_rows: u64,
 }
 
 impl ColumnStatistics {
@@ -76,6 +93,8 @@ impl ColumnStatistics {
             distinct_stats,
             estimated_distinct: None,
             guaranteed_distinct_upper: None,
+            distinct_coverage: None,
+            storage_observation: false,
         }
     }
 
@@ -89,6 +108,8 @@ impl ColumnStatistics {
             distinct_stats: distinct_stats.map(Arc::new),
             estimated_distinct: None,
             guaranteed_distinct_upper: None,
+            distinct_coverage: None,
+            storage_observation: false,
         }
     }
 
@@ -100,6 +121,8 @@ impl ColumnStatistics {
             distinct_stats: None,
             estimated_distinct: estimate,
             guaranteed_distinct_upper: None,
+            distinct_coverage: None,
+            storage_observation: false,
         }
     }
 
@@ -112,6 +135,33 @@ impl ColumnStatistics {
                 .map_or(upper, |current| current.min(upper)),
         );
         self
+    }
+
+    /// Mark the sketch as covering a complete row domain. Aggregators use
+    /// this before combining rowsets so a later one-sided merge can retain
+    /// the sketch together with an explicit coverage ratio.
+    pub fn with_observation_coverage(mut self, rows: u64) -> Self {
+        if self.distinct_stats.is_some() {
+            self.distinct_coverage = Some(DistinctCoverage {
+                observed_rows: rows,
+                total_rows: rows,
+            });
+        }
+        self
+    }
+
+    /// Mark a copied statistic as coming from a visible storage snapshot.
+    /// This is transient provenance used by the optimizer and is deliberately
+    /// not serialized with the sketch itself.
+    pub fn with_storage_observation(mut self) -> Self {
+        self.storage_observation = self.distinct_stats.is_some();
+        self
+    }
+
+    /// Whether the distinct sketch is a direct storage observation rather
+    /// than a derived planner statistic.
+    pub fn is_storage_observation(&self) -> bool {
+        self.storage_observation && self.distinct_stats.is_some()
     }
 
     /// Return the proof-backed distinct-count upper bound, when one exists.
@@ -139,6 +189,28 @@ impl ColumnStatistics {
     ///
     /// Both base statistics and distinct statistics are merged.
     pub fn merge(&mut self, other: &ColumnStatistics) {
+        self.merge_impl(other, None, None);
+    }
+
+    /// Merge column statistics while retaining coverage information supplied
+    /// by the owning rowset/tablet.  Unlike a plain `merge`, this operation can
+    /// preserve a sketch when only one side has one and records the observed
+    /// fraction so callers do not silently fall back to an unknown NDV.
+    pub fn merge_with_coverage(
+        &mut self,
+        other: &ColumnStatistics,
+        self_rows: u64,
+        other_rows: u64,
+    ) {
+        self.merge_impl(other, Some(self_rows), Some(other_rows));
+    }
+
+    fn merge_impl(
+        &mut self,
+        other: &ColumnStatistics,
+        self_rows: Option<u64>,
+        other_rows: Option<u64>,
+    ) {
         let estimated_union =
             if self.estimated_distinct.is_some() || other.estimated_distinct.is_some() {
                 let estimate = |column: &Self| {
@@ -162,15 +234,51 @@ impl ColumnStatistics {
             .zip(other.guaranteed_distinct_upper)
             .map(|(left, right)| left.saturating_add(right));
 
-        if let (Some(self_distinct), Some(other_distinct)) =
-            (&mut self.distinct_stats, &other.distinct_stats)
-        {
-            Arc::make_mut(self_distinct).merge(other_distinct);
-        } else {
-            // A sketch for only one input is not a sketch of the union.
-            self.distinct_stats = None;
+        match (
+            &mut self.distinct_stats,
+            &other.distinct_stats,
+            self_rows,
+            other_rows,
+        ) {
+            (Some(self_distinct), Some(other_distinct), Some(left_rows), Some(right_rows)) => {
+                Arc::make_mut(self_distinct).merge(other_distinct);
+                self.distinct_coverage = Some(DistinctCoverage {
+                    observed_rows: left_rows.saturating_add(right_rows),
+                    total_rows: left_rows.saturating_add(right_rows),
+                });
+            }
+            (Some(_), None, Some(left_rows), Some(right_rows)) => {
+                self.distinct_coverage = Some(DistinctCoverage {
+                    observed_rows: left_rows,
+                    total_rows: left_rows.saturating_add(right_rows),
+                });
+            }
+            (None, Some(other_distinct), Some(left_rows), Some(right_rows)) => {
+                self.distinct_stats = Some(other_distinct.clone());
+                self.distinct_coverage = Some(DistinctCoverage {
+                    observed_rows: right_rows,
+                    total_rows: left_rows.saturating_add(right_rows),
+                });
+            }
+            (_, _, Some(_), Some(_)) => {
+                self.distinct_stats = None;
+                self.distinct_coverage = None;
+            }
+            (Some(self_distinct), Some(other_distinct), None, None) => {
+                Arc::make_mut(self_distinct).merge(other_distinct);
+                self.distinct_coverage = None;
+            }
+            _ => {
+                // Without row-domain ownership, a one-sided sketch cannot be
+                // interpreted as a union. Keep the conservative legacy
+                // contract for direct callers and compaction paths.
+                self.distinct_stats = None;
+                self.distinct_coverage = None;
+            }
         }
         self.estimated_distinct = estimated_union;
+        self.storage_observation =
+            self.storage_observation && other.storage_observation && self.distinct_stats.is_some();
     }
 
     /// Update distinct statistics with hash values.
@@ -183,6 +291,7 @@ impl ColumnStatistics {
     pub fn update_distinct_statistics(&mut self, hashes: &[u64], count: usize) {
         if let Some(distinct) = &mut self.distinct_stats {
             Arc::make_mut(distinct).update(hashes, count);
+            self.distinct_coverage = None;
         }
     }
 
@@ -221,6 +330,8 @@ impl ColumnStatistics {
     pub fn set_distinct(&mut self, distinct_stats: Option<DistinctStatistics>) {
         self.estimated_distinct = None;
         self.distinct_stats = distinct_stats.map(Arc::new);
+        self.distinct_coverage = None;
+        self.storage_observation = false;
     }
 
     /// Create a copy of this ColumnStatistics.
@@ -230,6 +341,8 @@ impl ColumnStatistics {
             distinct_stats: self.distinct_stats.clone(),
             estimated_distinct: self.estimated_distinct,
             guaranteed_distinct_upper: self.guaranteed_distinct_upper,
+            distinct_coverage: self.distinct_coverage,
+            storage_observation: self.storage_observation,
         }
     }
 
@@ -252,6 +365,21 @@ impl ColumnStatistics {
         if observed == 0 {
             return 0;
         }
+        let observed = if self.estimated_distinct.is_none() {
+            self.distinct_coverage.map_or(observed, |coverage| {
+                if coverage.observed_rows == 0 || coverage.total_rows <= coverage.observed_rows {
+                    observed
+                } else {
+                    let scaled = (observed as u128)
+                        .saturating_mul(coverage.total_rows as u128)
+                        .saturating_add(coverage.observed_rows as u128 - 1)
+                        / coverage.observed_rows as u128;
+                    scaled.min(coverage.total_rows as u128) as usize
+                }
+            })
+        } else {
+            observed
+        };
         self.guaranteed_distinct_upper
             .and_then(|upper| usize::try_from(upper).ok())
             .map_or(observed, |upper| observed.min(upper))
@@ -304,6 +432,8 @@ impl ColumnStatistics {
             distinct_stats,
             estimated_distinct: None,
             guaranteed_distinct_upper: None,
+            distinct_coverage: None,
+            storage_observation: false,
         })
     }
 
@@ -389,6 +519,39 @@ mod tests {
             None,
         ));
         assert_eq!(left.get_distinct_count(), 0);
+    }
+
+    #[test]
+    fn one_sided_sketch_is_retained_with_explicit_row_coverage() {
+        let mut observed =
+            ColumnStatistics::new(BaseStatistics::create_empty(LogicalType::Integer));
+        let hashes: Vec<u64> = (0..100u64).map(murmur_hash_mix).collect();
+        observed.update_distinct_statistics(&hashes, hashes.len());
+        let unknown = ColumnStatistics::with_distinct(
+            BaseStatistics::create_unknown(LogicalType::Integer),
+            None,
+        );
+
+        observed.merge_with_coverage(&unknown, 100, 900);
+
+        assert!(observed.has_distinct_stats());
+        assert!(observed.get_distinct_count() >= 900);
+        assert!(observed.get_distinct_count() <= 1_000);
+    }
+
+    #[test]
+    fn storage_observation_provenance_is_transient_and_copyable() {
+        let mut stats = ColumnStatistics::new(BaseStatistics::create_empty(LogicalType::Integer));
+        stats.update_distinct_statistics(&[1, 2, 3], 3);
+        assert!(!stats.is_storage_observation());
+
+        let storage = stats.clone().with_storage_observation();
+        assert!(storage.is_storage_observation());
+        assert!(storage.copy().is_storage_observation());
+        let restored =
+            ColumnStatistics::from_bytes(&storage.to_bytes().unwrap(), LogicalType::Integer)
+                .unwrap();
+        assert!(!restored.is_storage_observation());
     }
 
     /// MurmurHash3 64-bit finalizer for better hash distribution in tests.

@@ -630,7 +630,7 @@ mod tests {
             .collect();
         get.column_types = types.clone();
         get.returned_types = types;
-        LogicalOperator::Get(get)
+        LogicalOperator::Get(Box::new(get))
     }
 
     fn create_projection(

@@ -127,11 +127,11 @@ mod tests {
     }
 
     fn scan(binding: ColumnBinding) -> OwnedLogicalPlan {
-        OwnedLogicalPlan::synthetic(LogicalOperator::Get(Get::new_without_table(
+        OwnedLogicalPlan::synthetic(LogicalOperator::Get(Box::new(Get::new_without_table(
             binding.table_index,
             vec!["value".to_string()],
             vec![LogicalType::BigInt],
-        )))
+        ))))
     }
 
     #[test]
@@ -235,11 +235,11 @@ mod tests {
                 10,
                 0,
             ))),
-            OwnedLogicalPlan::synthetic(LogicalOperator::Limit(Limit::new(
+            OwnedLogicalPlan::synthetic(LogicalOperator::Limit(Box::new(Limit::new(
                 scan(binding),
                 None,
                 None,
-            ))),
+            )))),
         ];
 
         for child in wrappers {

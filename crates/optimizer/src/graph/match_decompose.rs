@@ -43,7 +43,7 @@ impl GraphMatchDecompose {
         plan.try_map_post_order(|plan| {
             let (id, stats, operator) = plan.into_parts();
             let operator = match operator {
-                LogicalOperator::GraphMatch(gm) => self.decompose(gm),
+                LogicalOperator::GraphMatch(gm) => self.decompose(*gm),
                 other => other,
             };
             Ok(OwnedLogicalPlan {
@@ -86,15 +86,16 @@ impl GraphMatchDecompose {
             }
         };
 
-        let mut current = OwnedLogicalPlan::synthetic(LogicalOperator::GraphScan(GraphScan::new(
-            first_vertex.vertex_table_info.clone(),
-            first_vertex.filter.clone(),
-            first_vertex.table_index,
-            table_index,
-            first_vertex.vertex_table_info.label.clone(),
-            graph_name,
-            schema_name,
-        )));
+        let mut current =
+            OwnedLogicalPlan::synthetic(LogicalOperator::GraphScan(Box::new(GraphScan::new(
+                first_vertex.vertex_table_info.clone(),
+                first_vertex.filter.clone(),
+                first_vertex.table_index,
+                table_index,
+                first_vertex.vertex_table_info.label.clone(),
+                graph_name,
+                schema_name,
+            ))));
         let mut bound_vertices = HashMap::new();
         bound_vertices.insert(first_vertex.variable_name.clone(), first_vertex.clone());
 
@@ -155,7 +156,7 @@ impl GraphMatchDecompose {
             expand.path_mode = path_mode.clone();
             expand.has_path_functions = gm.has_path_functions && is_terminal_expand;
 
-            current = OwnedLogicalPlan::synthetic(LogicalOperator::GraphExpand(expand));
+            current = OwnedLogicalPlan::synthetic(LogicalOperator::GraphExpand(Box::new(expand)));
             bound_vertices.insert(target_vertex.variable_name.clone(), target_vertex);
         }
 
@@ -262,7 +263,7 @@ mod tests {
         table_index: usize,
     ) -> LogicalOperator {
         let output_types = columns.iter().map(|c| c.logical_type.clone()).collect();
-        LogicalOperator::GraphMatch(GraphMatch::new(
+        LogicalOperator::GraphMatch(Box::new(GraphMatch::new(
             Arc::new(paro_catalog::entry::PropertyGraphCatalogEntry::new(
                 paro_catalog::entry::CreatePropertyGraphInfo::new(
                     "test".to_string(),
@@ -280,7 +281,7 @@ mod tests {
             output_types,
             None,
             false,
-        ))
+        )))
     }
 
     #[test]

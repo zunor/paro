@@ -26,10 +26,17 @@ impl PlanNodeId {
     /// (for example `execution::physical_plan::search_lowering`), so synthetic
     /// ids are intentionally not unique.
     pub const SYNTHETIC: Self = Self(0);
+
+    /// Whether this id is the non-unique placeholder used by synthetic
+    /// plans. Identity-sensitive caches must reject it instead of silently
+    /// aliasing two occurrences.
+    pub const fn is_synthetic(self) -> bool {
+        self.0 == Self::SYNTHETIC.0
+    }
 }
 
 /// Cardinality interval persisted on a logical plan node.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub struct CardinalityEstimate {
     pub min: u64,
     pub expected: u64,
@@ -52,7 +59,7 @@ impl CardinalityEstimate {
 /// graph estimate, however, accounts for equality classes and joint domains
 /// across the whole associative region; reconstructing it from one physical
 /// tree cut loses that information.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, PartialOrd, Ord)]
 pub enum CardinalityProvenance {
     #[default]
     Statistics,
@@ -78,7 +85,7 @@ pub struct UniqueKeyColumn {
 }
 
 /// Cached unique-key proof produced by statistics gathering.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
 pub struct UniqueKey {
     pub columns: Box<[UniqueKeyColumn]>,
     pub provenance: UniqueKeyProvenance,
@@ -97,7 +104,7 @@ impl UniqueKey {
 }
 
 /// Statistics attached to a logical plan node.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, PartialOrd, Ord)]
 pub struct NodeStats {
     pub estimated_cardinality: Option<CardinalityEstimate>,
     pub cardinality_provenance: CardinalityProvenance,

@@ -501,6 +501,59 @@ fn winner_frontier_retains_non_dominated_resource_tradeoffs() {
 }
 
 #[test]
+fn bounded_winner_frontier_reports_an_anytime_obligation() {
+    let required = PropertySetId(0);
+    let goal = OptimizationGoal {
+        required,
+        row_goal: RowGoal::All,
+        objective: ObjectiveProfile::Latency,
+        grant: GrantGoalKey::Invariant(AdmissibleGrantSetId(0)),
+        context: OptimizationContextId(0),
+    };
+    let winner = |id: u32, score: f64, memory: u64| Winner {
+        candidate: CandidateId::INVALID,
+        expression: PhysicalExprId::new(id as usize),
+        children: Box::new([]),
+        enforcers: Box::new([]),
+        enforcer_cost_input: enforcer_cost_input(),
+        provided: provided(),
+        local_cost: SearchCost {
+            score: ScoreSummary {
+                range: CompactRange::point(score).unwrap(),
+                risk_adjusted: score,
+            },
+            peak_memory_upper: memory,
+            revocable_memory_target: memory,
+            ..SearchCost::ZERO
+        },
+        source_filter_apply_cost: None,
+        cost_composition: CostComposition::Sequential,
+        cost: SearchCost {
+            score: ScoreSummary {
+                range: CompactRange::point(score).unwrap(),
+                risk_adjusted: score,
+            },
+            peak_memory_upper: memory,
+            revocable_memory_target: memory,
+            ..SearchCost::ZERO
+        },
+        source_work: Box::new([]),
+        physical_fingerprint: Fingerprint(id as u128),
+        joint_cost_proof: None,
+    };
+    let mut frontier = WinnerFrontier::default();
+    let first = frontier.insert_with_limit(goal, winner(1, 1.0, 10_000), 1);
+    assert!(!first.truncated);
+    let second = frontier.insert_with_limit(goal, winner(2, 2.0, 1), 1);
+    assert!(second.truncated);
+    assert_eq!(frontier.candidates().len(), 1);
+    assert_eq!(
+        frontier.selected().unwrap().physical_fingerprint,
+        Fingerprint(1)
+    );
+}
+
+#[test]
 fn latency_and_robustness_profiles_rank_uncertainty_explicitly() {
     let winner = |expression, expected_path, expected_work, risk_upper, risk_adjusted| {
         let cost = SearchCost {
@@ -814,6 +867,20 @@ fn cte_reference_domain_reads_the_current_producer_group_fact() {
         Some(4)
     );
     assert_eq!(memo.cardinality_estimate(reference), Some((2, 4, 8)));
+}
+
+#[test]
+fn column_domain_expected_is_a_ranking_point_inside_the_proof_hull() {
+    let domain = GroupColumnDomain::new(Some(2), None)
+        .unwrap()
+        .canonical_with(GroupColumnDomain::new(Some(8), None).unwrap());
+    assert_eq!(domain.expected(), Some(5));
+    assert!(domain.expected().unwrap() >= domain.expected_lower);
+    assert!(domain.expected().unwrap() <= domain.expected_upper);
+    // A guaranteed bound remains independent from the statistical point
+    // estimate and must not be fabricated from the hull midpoint.
+    let bounded = GroupColumnDomain::new(Some(2), Some(8)).unwrap();
+    assert_eq!(bounded.guaranteed_upper, Some(8));
 }
 
 #[test]

@@ -88,7 +88,7 @@ fn stale_singleton_hint_falls_back_to_a_physical_aggregate() {
         Vec::new(),
     );
     aggregate.group_input_multiplicity = GroupInputMultiplicity::AtMostOne(proof);
-    let logical = OwnedLogicalPlan::new(&ctx, LogicalOperator::Aggregate(aggregate));
+    let logical = OwnedLogicalPlan::new(&ctx, LogicalOperator::Aggregate(Box::new(aggregate)));
 
     let physical = PhysicalPlanExtractor::new(ExtractionContext::default())
         .extract(&logical)

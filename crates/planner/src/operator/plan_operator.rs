@@ -107,7 +107,7 @@ impl LogicalOutputLayout {
 #[derive(Debug, Clone)]
 pub enum LogicalOperator<Child = Box<OwnedLogicalPlan>> {
     /// Reading data from a table
-    Get(Get),
+    Get(Box<Get>),
     /// Check data against a condition
     Filter(Filter<Child>),
     /// Project columns/expressions
@@ -117,9 +117,9 @@ pub enum LogicalOperator<Child = Box<OwnedLogicalPlan>> {
     /// Row-preserving external routine layer
     ExternalProject(LogicalExternalProject<Child>),
     /// Relation-expanding external routine source
-    ExternalTable(LogicalExternalTable<Child>),
+    ExternalTable(Box<LogicalExternalTable<Child>>),
     /// Top N / Limit / Offset
-    Limit(Limit<Child>),
+    Limit(Box<Limit<Child>>),
     /// Order By
     Order(Order<Child>),
     /// TopN (optimized ORDER BY + LIMIT)
@@ -127,7 +127,7 @@ pub enum LogicalOperator<Child = Box<OwnedLogicalPlan>> {
     /// Create Table
     CreateTable(CreateTable),
     /// Create Routine
-    CreateRoutine(CreateRoutine),
+    CreateRoutine(Box<CreateRoutine>),
     /// Alter existing catalog entry
     Alter(Alter),
     /// Create Sequence
@@ -135,7 +135,7 @@ pub enum LogicalOperator<Child = Box<OwnedLogicalPlan>> {
     /// Create Schema
     CreateSchema(CreateSchema),
     /// Create Index
-    CreateIndex(CreateIndex),
+    CreateIndex(Box<CreateIndex>),
     /// Create View
     CreateView(CreateView),
     /// Drop Table/Schema/Index/View
@@ -146,7 +146,7 @@ pub enum LogicalOperator<Child = Box<OwnedLogicalPlan>> {
     DropPropertyGraph(DropPropertyGraph),
     /// Refresh Property Graph
     RefreshPropertyGraph(RefreshPropertyGraph),
-    Aggregate(Aggregate<Child>),
+    Aggregate(Box<Aggregate<Child>>),
     Insert(Insert<Child>),
     /// Delete rows from a table
     Delete(Delete<Child>),
@@ -158,7 +158,7 @@ pub enum LogicalOperator<Child = Box<OwnedLogicalPlan>> {
     /// Duplicate-eliminated scan placeholder owned by a delim/dependent join.
     DelimGet(DelimGet),
     /// Dependent join (for correlated subqueries, temporary during planning)
-    DependentJoin(DependentJoin<Child>),
+    DependentJoin(Box<DependentJoin<Child>>),
     /// Set operations (UNION, INTERSECT, EXCEPT)
     SetOperation(SetOperation<Child>),
     /// DISTINCT operation
@@ -178,17 +178,17 @@ pub enum LogicalOperator<Child = Box<OwnedLogicalPlan>> {
     /// Table function scan
     TableFunctionGet(TableFunctionGet),
     /// Search path scan replacing TopN/Projection/Filter/Get subgraphs.
-    SearchScan(SearchScan),
+    SearchScan(Box<SearchScan>),
     /// Full-text filter scan replacing Filter/Get subgraphs.
-    FullTextFilterScan(FullTextFilterScan),
+    FullTextFilterScan(Box<FullTextFilterScan>),
     /// COPY TO file/stdout
-    CopyTo(CopyTo<Child>),
+    CopyTo(Box<CopyTo<Child>>),
     /// Graph pattern match (undecomposed GRAPH_TABLE)
-    GraphMatch(GraphMatch),
+    GraphMatch(Box<GraphMatch>),
     /// Graph vertex scan
-    GraphScan(GraphScan),
+    GraphScan(Box<GraphScan>),
     /// Graph edge expansion
-    GraphExpand(GraphExpand<Child>),
+    GraphExpand(Box<GraphExpand<Child>>),
 
     /// Opaque schema boundary used only inside a transformation transaction.
     /// Keep this transport-only variant after every executable operator so
@@ -198,6 +198,11 @@ pub enum LogicalOperator<Child = Box<OwnedLogicalPlan>> {
     /// A dummy scan that produces one row (used for SELECT 1)
     DummyScan,
 }
+
+// Arena slots must remain compact.  Any future payload that would cross this
+// envelope must be boxed at the enum boundary rather than charging every
+// logical node for its worst-case expression/configuration vector.
+const _: () = assert!(std::mem::size_of::<LogicalOperator>() <= 192);
 
 impl LogicalOperator {
     pub fn output_names(&self) -> Vec<String> {
@@ -220,53 +225,9 @@ impl LogicalOperator {
 
     /// Get the children of this operator.
     pub fn children(&self) -> Vec<&OwnedLogicalPlan> {
-        match self {
-            LogicalOperator::Get(_) => vec![],
-            LogicalOperator::BoundReference(_) => vec![],
-            LogicalOperator::Filter(op) => vec![op.child.as_ref()],
-            LogicalOperator::Projection(op) => vec![op.child.as_ref()],
-            LogicalOperator::RowFetch(op) => vec![op.child.as_ref()],
-            LogicalOperator::ExternalProject(op) => vec![op.child.as_ref()],
-            LogicalOperator::ExternalTable(op) => op.child.as_deref().into_iter().collect(),
-            LogicalOperator::Limit(op) => vec![op.child.as_ref()],
-            LogicalOperator::Order(op) => vec![op.child.as_ref()],
-            LogicalOperator::TopN(op) => vec![op.child.as_ref()],
-            LogicalOperator::CreateTable(_) => vec![],
-            LogicalOperator::CreateRoutine(_) => vec![],
-            LogicalOperator::Alter(_) => vec![],
-            LogicalOperator::CreateSequence(_) => vec![],
-            LogicalOperator::CreateSchema(_) => vec![],
-            LogicalOperator::CreateIndex(_) => vec![],
-            LogicalOperator::CreateView(_) => vec![],
-            LogicalOperator::Drop(_) => vec![],
-            LogicalOperator::CreatePropertyGraph(_) => vec![],
-            LogicalOperator::DropPropertyGraph(_) => vec![],
-            LogicalOperator::RefreshPropertyGraph(_) => vec![],
-            LogicalOperator::Aggregate(op) => vec![op.child.as_ref()],
-            LogicalOperator::Insert(op) => vec![op.child.as_ref()],
-            LogicalOperator::Delete(op) => vec![op.child.as_ref()],
-            LogicalOperator::Update(op) => vec![op.child.as_ref()],
-            LogicalOperator::ExpressionGet(_) => vec![],
-            LogicalOperator::DelimGet(_) => vec![],
-            LogicalOperator::Join(j) => vec![j.left(), j.right()],
-            LogicalOperator::DependentJoin(d) => vec![d.left.as_ref(), d.right.as_ref()],
-            LogicalOperator::SetOperation(s) => vec![s.left(), s.right()],
-            LogicalOperator::Distinct(d) => vec![d.child.as_ref()],
-            LogicalOperator::Window(w) => vec![w.child.as_ref()],
-            LogicalOperator::Explain(e) => vec![e.child.as_ref()],
-            LogicalOperator::EmptyResult(e) => vec![e.child.as_ref()],
-            LogicalOperator::MaterializedCTE(c) => vec![c.cte_query.as_ref(), c.child.as_ref()],
-            LogicalOperator::RecursiveCTE(c) => vec![c.anchor.as_ref(), c.recursive.as_ref()],
-            LogicalOperator::CTERef(_) => vec![],
-            LogicalOperator::TableFunctionGet(_) => vec![],
-            LogicalOperator::SearchScan(_) => vec![],
-            LogicalOperator::FullTextFilterScan(_) => vec![],
-            LogicalOperator::CopyTo(copy) => vec![copy.child.as_ref()],
-            LogicalOperator::GraphMatch(_) => vec![],
-            LogicalOperator::GraphScan(_) => vec![],
-            LogicalOperator::GraphExpand(ge) => vec![ge.child.as_ref()],
-            LogicalOperator::DummyScan => vec![],
-        }
+        let mut children = Vec::new();
+        self.visit_child_links(&mut |child| children.push(child.as_ref()));
+        children
     }
 
     /// Fold a borrowed plan in post-order with one caller-owned state per
@@ -322,229 +283,20 @@ impl LogicalOperator {
     where
         F: FnMut(&'a mut OwnedLogicalPlan) -> ControlFlow<()>,
     {
-        match self {
-            LogicalOperator::Get(_) => ControlFlow::Continue(()),
-            LogicalOperator::BoundReference(_) => ControlFlow::Continue(()),
-            LogicalOperator::Filter(op) => visit_boxed_child(&mut op.child, &mut f),
-            LogicalOperator::Projection(op) => visit_boxed_child(&mut op.child, &mut f),
-            LogicalOperator::RowFetch(op) => visit_boxed_child(&mut op.child, &mut f),
-            LogicalOperator::ExternalProject(op) => visit_boxed_child(&mut op.child, &mut f),
-            LogicalOperator::ExternalTable(op) => {
-                if let Some(child) = &mut op.child {
-                    visit_boxed_child(child, &mut f)
-                } else {
-                    ControlFlow::Continue(())
-                }
+        let mut result = ControlFlow::Continue(());
+        self.visit_child_links_mut(&mut |child| {
+            if result.is_continue() {
+                result = f(child.as_mut());
             }
-            LogicalOperator::Limit(op) => visit_boxed_child(&mut op.child, &mut f),
-            LogicalOperator::Order(op) => visit_boxed_child(&mut op.child, &mut f),
-            LogicalOperator::TopN(op) => visit_boxed_child(&mut op.child, &mut f),
-            LogicalOperator::CreateTable(_) => ControlFlow::Continue(()),
-            LogicalOperator::CreateRoutine(_) => ControlFlow::Continue(()),
-            LogicalOperator::Alter(_) => ControlFlow::Continue(()),
-            LogicalOperator::CreateSequence(_) => ControlFlow::Continue(()),
-            LogicalOperator::CreateSchema(_) => ControlFlow::Continue(()),
-            LogicalOperator::CreateIndex(_) => ControlFlow::Continue(()),
-            LogicalOperator::CreateView(_) => ControlFlow::Continue(()),
-            LogicalOperator::Drop(_) => ControlFlow::Continue(()),
-            LogicalOperator::CreatePropertyGraph(_) => ControlFlow::Continue(()),
-            LogicalOperator::DropPropertyGraph(_) => ControlFlow::Continue(()),
-            LogicalOperator::RefreshPropertyGraph(_) => ControlFlow::Continue(()),
-            LogicalOperator::Aggregate(op) => visit_boxed_child(&mut op.child, &mut f),
-            LogicalOperator::Insert(op) => visit_boxed_child(&mut op.child, &mut f),
-            LogicalOperator::Delete(op) => visit_boxed_child(&mut op.child, &mut f),
-            LogicalOperator::Update(op) => visit_boxed_child(&mut op.child, &mut f),
-            LogicalOperator::ExpressionGet(_) => ControlFlow::Continue(()),
-            LogicalOperator::Join(join) => match join {
-                Join::Comparison(join) => {
-                    visit_boxed_child(&mut join.left, &mut f)?;
-                    visit_boxed_child(&mut join.right, &mut f)
-                }
-                Join::Any(join) => {
-                    visit_boxed_child(&mut join.left, &mut f)?;
-                    visit_boxed_child(&mut join.right, &mut f)
-                }
-                Join::Cross(join) => {
-                    visit_boxed_child(&mut join.left, &mut f)?;
-                    visit_boxed_child(&mut join.right, &mut f)
-                }
-            },
-            LogicalOperator::DelimGet(_) => ControlFlow::Continue(()),
-            LogicalOperator::DependentJoin(join) => {
-                visit_boxed_child(&mut join.left, &mut f)?;
-                visit_boxed_child(&mut join.right, &mut f)
-            }
-            LogicalOperator::SetOperation(setop) => {
-                visit_boxed_child(&mut setop.left, &mut f)?;
-                visit_boxed_child(&mut setop.right, &mut f)
-            }
-            LogicalOperator::Distinct(distinct) => visit_boxed_child(&mut distinct.child, &mut f),
-            LogicalOperator::Window(window) => visit_boxed_child(&mut window.child, &mut f),
-            LogicalOperator::Explain(explain) => visit_boxed_child(&mut explain.child, &mut f),
-            LogicalOperator::EmptyResult(empty) => visit_boxed_child(&mut empty.child, &mut f),
-            LogicalOperator::MaterializedCTE(cte) => {
-                visit_boxed_child(&mut cte.cte_query, &mut f)?;
-                visit_boxed_child(&mut cte.child, &mut f)
-            }
-            LogicalOperator::RecursiveCTE(cte) => {
-                visit_boxed_child(&mut cte.anchor, &mut f)?;
-                visit_boxed_child(&mut cte.recursive, &mut f)
-            }
-            LogicalOperator::CTERef(_) => ControlFlow::Continue(()),
-            LogicalOperator::TableFunctionGet(_) => ControlFlow::Continue(()),
-            LogicalOperator::SearchScan(_) => ControlFlow::Continue(()),
-            LogicalOperator::FullTextFilterScan(_) => ControlFlow::Continue(()),
-            LogicalOperator::CopyTo(copy) => visit_boxed_child(&mut copy.child, &mut f),
-            LogicalOperator::GraphMatch(_) => ControlFlow::Continue(()),
-            LogicalOperator::GraphScan(_) => ControlFlow::Continue(()),
-            LogicalOperator::GraphExpand(expand) => visit_boxed_child(&mut expand.child, &mut f),
-            LogicalOperator::DummyScan => ControlFlow::Continue(()),
-        }
+        });
+        result
     }
 
     pub(crate) fn try_map_owned_children(
         self,
         f: &mut dyn FnMut(OwnedLogicalPlan) -> Result<OwnedLogicalPlan>,
     ) -> Result<Self> {
-        match self {
-            LogicalOperator::Get(op) => Ok(LogicalOperator::Get(op)),
-            LogicalOperator::BoundReference(op) => Ok(LogicalOperator::BoundReference(op)),
-            LogicalOperator::Filter(mut op) => {
-                op.child = try_map_boxed_child(op.child, f)?;
-                Ok(LogicalOperator::Filter(op))
-            }
-            LogicalOperator::Projection(mut op) => {
-                op.child = try_map_boxed_child(op.child, f)?;
-                Ok(LogicalOperator::Projection(op))
-            }
-            LogicalOperator::RowFetch(mut op) => {
-                op.child = try_map_boxed_child(op.child, f)?;
-                Ok(LogicalOperator::RowFetch(op))
-            }
-            LogicalOperator::ExternalProject(mut op) => {
-                op.child = try_map_boxed_child(op.child, f)?;
-                Ok(LogicalOperator::ExternalProject(op))
-            }
-            LogicalOperator::ExternalTable(mut op) => {
-                if let Some(child) = op.child.take() {
-                    op.child = Some(try_map_boxed_child(child, f)?);
-                }
-                Ok(LogicalOperator::ExternalTable(op))
-            }
-            LogicalOperator::Limit(mut op) => {
-                op.child = try_map_boxed_child(op.child, f)?;
-                Ok(LogicalOperator::Limit(op))
-            }
-            LogicalOperator::Order(mut op) => {
-                op.child = try_map_boxed_child(op.child, f)?;
-                Ok(LogicalOperator::Order(op))
-            }
-            LogicalOperator::TopN(mut op) => {
-                op.child = try_map_boxed_child(op.child, f)?;
-                Ok(LogicalOperator::TopN(op))
-            }
-            LogicalOperator::CreateTable(op) => Ok(LogicalOperator::CreateTable(op)),
-            LogicalOperator::CreateRoutine(op) => Ok(LogicalOperator::CreateRoutine(op)),
-            LogicalOperator::Alter(op) => Ok(LogicalOperator::Alter(op)),
-            LogicalOperator::CreateSequence(op) => Ok(LogicalOperator::CreateSequence(op)),
-            LogicalOperator::CreateSchema(op) => Ok(LogicalOperator::CreateSchema(op)),
-            LogicalOperator::CreateIndex(op) => Ok(LogicalOperator::CreateIndex(op)),
-            LogicalOperator::CreateView(op) => Ok(LogicalOperator::CreateView(op)),
-            LogicalOperator::Drop(op) => Ok(LogicalOperator::Drop(op)),
-            LogicalOperator::CreatePropertyGraph(op) => {
-                Ok(LogicalOperator::CreatePropertyGraph(op))
-            }
-            LogicalOperator::DropPropertyGraph(op) => Ok(LogicalOperator::DropPropertyGraph(op)),
-            LogicalOperator::RefreshPropertyGraph(op) => {
-                Ok(LogicalOperator::RefreshPropertyGraph(op))
-            }
-            LogicalOperator::Aggregate(mut op) => {
-                op.child = try_map_boxed_child(op.child, f)?;
-                Ok(LogicalOperator::Aggregate(op))
-            }
-            LogicalOperator::Insert(mut op) => {
-                op.child = try_map_boxed_child(op.child, f)?;
-                Ok(LogicalOperator::Insert(op))
-            }
-            LogicalOperator::Delete(mut op) => {
-                op.child = try_map_boxed_child(op.child, f)?;
-                Ok(LogicalOperator::Delete(op))
-            }
-            LogicalOperator::Update(mut op) => {
-                op.child = try_map_boxed_child(op.child, f)?;
-                Ok(LogicalOperator::Update(op))
-            }
-            LogicalOperator::ExpressionGet(op) => Ok(LogicalOperator::ExpressionGet(op)),
-            LogicalOperator::Join(join) => match join {
-                Join::Comparison(mut join) => {
-                    join.left = try_map_boxed_child(join.left, f)?;
-                    join.right = try_map_boxed_child(join.right, f)?;
-                    Ok(LogicalOperator::Join(Join::Comparison(join)))
-                }
-                Join::Any(mut join) => {
-                    join.left = try_map_boxed_child(join.left, f)?;
-                    join.right = try_map_boxed_child(join.right, f)?;
-                    Ok(LogicalOperator::Join(Join::Any(join)))
-                }
-                Join::Cross(mut join) => {
-                    join.left = try_map_boxed_child(join.left, f)?;
-                    join.right = try_map_boxed_child(join.right, f)?;
-                    Ok(LogicalOperator::Join(Join::Cross(join)))
-                }
-            },
-            LogicalOperator::DelimGet(op) => Ok(LogicalOperator::DelimGet(op)),
-            LogicalOperator::DependentJoin(mut join) => {
-                join.left = try_map_boxed_child(join.left, f)?;
-                join.right = try_map_boxed_child(join.right, f)?;
-                Ok(LogicalOperator::DependentJoin(join))
-            }
-            LogicalOperator::SetOperation(mut setop) => {
-                setop.left = try_map_boxed_child(setop.left, f)?;
-                setop.right = try_map_boxed_child(setop.right, f)?;
-                Ok(LogicalOperator::SetOperation(setop))
-            }
-            LogicalOperator::Distinct(mut distinct) => {
-                distinct.child = try_map_boxed_child(distinct.child, f)?;
-                Ok(LogicalOperator::Distinct(distinct))
-            }
-            LogicalOperator::Window(mut window) => {
-                window.child = try_map_boxed_child(window.child, f)?;
-                Ok(LogicalOperator::Window(window))
-            }
-            LogicalOperator::Explain(mut explain) => {
-                explain.child = try_map_boxed_child(explain.child, f)?;
-                Ok(LogicalOperator::Explain(explain))
-            }
-            LogicalOperator::EmptyResult(mut empty) => {
-                empty.child = try_map_boxed_child(empty.child, f)?;
-                Ok(LogicalOperator::EmptyResult(empty))
-            }
-            LogicalOperator::MaterializedCTE(mut cte) => {
-                cte.cte_query = try_map_boxed_child(cte.cte_query, f)?;
-                cte.child = try_map_boxed_child(cte.child, f)?;
-                Ok(LogicalOperator::MaterializedCTE(cte))
-            }
-            LogicalOperator::RecursiveCTE(mut cte) => {
-                cte.anchor = try_map_boxed_child(cte.anchor, f)?;
-                cte.recursive = try_map_boxed_child(cte.recursive, f)?;
-                Ok(LogicalOperator::RecursiveCTE(cte))
-            }
-            LogicalOperator::CTERef(op) => Ok(LogicalOperator::CTERef(op)),
-            LogicalOperator::TableFunctionGet(op) => Ok(LogicalOperator::TableFunctionGet(op)),
-            LogicalOperator::SearchScan(op) => Ok(LogicalOperator::SearchScan(op)),
-            LogicalOperator::FullTextFilterScan(op) => Ok(LogicalOperator::FullTextFilterScan(op)),
-            LogicalOperator::CopyTo(mut copy) => {
-                copy.child = try_map_boxed_child(copy.child, f)?;
-                Ok(LogicalOperator::CopyTo(copy))
-            }
-            LogicalOperator::GraphMatch(op) => Ok(LogicalOperator::GraphMatch(op)),
-            LogicalOperator::GraphScan(op) => Ok(LogicalOperator::GraphScan(op)),
-            LogicalOperator::GraphExpand(mut expand) => {
-                expand.child = try_map_boxed_child(expand.child, f)?;
-                Ok(LogicalOperator::GraphExpand(expand))
-            }
-            LogicalOperator::DummyScan => Ok(LogicalOperator::DummyScan),
-        }
+        self.try_map_child_links(&mut |child| f(*child).map(Box::new))
     }
 
     /// Resolve column bindings for this operator.
@@ -1063,19 +815,67 @@ impl<Child> LogicalOperator<Child> {
         &self,
         child_layouts: &[LogicalOutputLayout],
     ) -> LogicalOutputLayout {
+        let child_layout_refs = child_layouts.iter().collect::<Vec<_>>();
+        self.output_layout_from_child_refs(&child_layout_refs)
+    }
+
+    /// Reduce a node from borrowed child layouts.  The arena already owns
+    /// these layouts, so passing references avoids cloning every child schema
+    /// merely to select the one or two layouts an operator actually observes.
+    pub fn output_layout_from_child_refs(
+        &self,
+        child_layouts: &[&LogicalOutputLayout],
+    ) -> LogicalOutputLayout {
         let mut arity = 0;
         self.visit_child_links(&mut |_| arity += 1);
         debug_assert_eq!(child_layouts.len(), arity);
         let (first, second) = match output_layout_children(self) {
             OutputLayoutChildren::None => (None, None),
-            OutputLayoutChildren::First => (child_layouts.first().cloned(), None),
-            OutputLayoutChildren::Second => (None, child_layouts.get(1).cloned()),
+            OutputLayoutChildren::First => (child_layouts.first().copied(), None),
+            OutputLayoutChildren::Second => (None, child_layouts.get(1).copied()),
             OutputLayoutChildren::Both => (
-                child_layouts.first().cloned(),
-                child_layouts.get(1).cloned(),
+                child_layouts.first().copied(),
+                child_layouts.get(1).copied(),
             ),
         };
         derive_local_output_layout(self, first, second)
+    }
+
+    /// Return the child whose layout is exactly the node output, when that
+    /// fact follows from the operator contract.  Arena callers can reuse the
+    /// existing `Arc` in O(1) instead of constructing a layout and comparing
+    /// every binding/type to discover the same fact afterwards.
+    pub(crate) fn pass_through_child_index(
+        &self,
+        child_layouts: &[&LogicalOutputLayout],
+    ) -> Option<usize> {
+        match self {
+            LogicalOperator::Filter(filter)
+                if child_layouts
+                    .first()
+                    .is_some_and(|layout| filter.projection_map.is_identity(layout.len())) =>
+            {
+                Some(0)
+            }
+            LogicalOperator::Limit(_) | LogicalOperator::Distinct(_) => Some(0),
+            LogicalOperator::Order(order)
+                if child_layouts
+                    .first()
+                    .is_some_and(|layout| order.projection_map.is_identity(layout.len())) =>
+            {
+                Some(0)
+            }
+            LogicalOperator::TopN(topn)
+                if child_layouts
+                    .first()
+                    .is_some_and(|layout| topn.projection_map.is_identity(layout.len())) =>
+            {
+                Some(0)
+            }
+            LogicalOperator::EmptyResult(_) => Some(0),
+            LogicalOperator::MaterializedCTE(_) => Some(1),
+            _ => None,
+        }
     }
 }
 
@@ -1124,7 +924,11 @@ fn derive_output_layout(root: &LogicalOperator) -> LogicalOutputLayout {
                         (Some(first), Some(second))
                     }
                 };
-                layouts.push(derive_local_output_layout(operator, first, second));
+                layouts.push(derive_local_output_layout(
+                    operator,
+                    first.as_ref(),
+                    second.as_ref(),
+                ));
             }
         }
     }
@@ -1203,8 +1007,8 @@ fn output_layout_children<Child>(operator: &LogicalOperator<Child>) -> OutputLay
 
 fn derive_local_output_layout<Child>(
     operator: &LogicalOperator<Child>,
-    first: Option<LogicalOutputLayout>,
-    second: Option<LogicalOutputLayout>,
+    first: Option<&LogicalOutputLayout>,
+    second: Option<&LogicalOutputLayout>,
 ) -> LogicalOutputLayout {
     match operator {
         LogicalOperator::Get(get) => {
@@ -1382,8 +1186,8 @@ fn derive_local_output_layout<Child>(
 
 fn finish_join_layout<Child>(
     join: &Join<Child>,
-    left: Option<LogicalOutputLayout>,
-    right: Option<LogicalOutputLayout>,
+    left: Option<&LogicalOutputLayout>,
+    right: Option<&LogicalOutputLayout>,
 ) -> LogicalOutputLayout {
     let (left_projection, right_projection, mark_index) = match join {
         Join::Comparison(join) => (
@@ -1439,8 +1243,10 @@ fn finish_join_layout<Child>(
     }
 }
 
-fn required_output_layout(layout: Option<LogicalOutputLayout>, role: &str) -> LogicalOutputLayout {
-    layout.unwrap_or_else(|| panic!("logical output derivation lost {role}"))
+fn required_output_layout(layout: Option<&LogicalOutputLayout>, role: &str) -> LogicalOutputLayout {
+    layout
+        .cloned()
+        .unwrap_or_else(|| panic!("logical output derivation lost {role}"))
 }
 
 fn pop_output_layout(layouts: &mut Vec<LogicalOutputLayout>) -> LogicalOutputLayout {
@@ -1474,20 +1280,6 @@ fn window_output_name(expr: &crate::expression::WindowExpression, idx: usize) ->
     } else {
         expr.function_name().to_string()
     }
-}
-
-fn visit_boxed_child<'a>(
-    child: &'a mut Box<OwnedLogicalPlan>,
-    f: &mut impl FnMut(&'a mut OwnedLogicalPlan) -> ControlFlow<()>,
-) -> ControlFlow<()> {
-    f(child.as_mut())
-}
-
-fn try_map_boxed_child(
-    child: Box<OwnedLogicalPlan>,
-    f: &mut dyn FnMut(OwnedLogicalPlan) -> Result<OwnedLogicalPlan>,
-) -> Result<Box<OwnedLogicalPlan>> {
-    Ok(Box::new(f(*child)?))
 }
 
 #[cfg(test)]
@@ -1634,7 +1426,7 @@ mod tests {
                 let ctx = BindContext::new();
                 (
                     "limit",
-                    LogicalOperator::Limit(Limit::new(leaf_plan(&ctx, 10), None, None)),
+                    LogicalOperator::Limit(Box::new(Limit::new(leaf_plan(&ctx, 10), None, None))),
                 )
             },
             {
@@ -1655,7 +1447,7 @@ mod tests {
                 let ctx = BindContext::new();
                 (
                     "aggregate",
-                    LogicalOperator::Aggregate(Aggregate::new(
+                    LogicalOperator::Aggregate(Box::new(Aggregate::new(
                         30,
                         31,
                         32,
@@ -1664,7 +1456,7 @@ mod tests {
                         Vec::new(),
                         vec![],
                         vec![],
-                    )),
+                    ))),
                 )
             },
             {
@@ -1740,12 +1532,12 @@ mod tests {
                 let ctx = BindContext::new();
                 (
                     "dependent_join",
-                    LogicalOperator::DependentJoin(DependentJoin::scalar(
+                    LogicalOperator::DependentJoin(Box::new(DependentJoin::scalar(
                         leaf_plan(&ctx, 10),
                         leaf_plan(&ctx, 20),
                         vec![],
                         None,
-                    )),
+                    ))),
                 )
             },
             {
@@ -1826,14 +1618,14 @@ mod tests {
                 let ctx = BindContext::new();
                 (
                     "copy_to",
-                    LogicalOperator::CopyTo(create_copy_to(leaf_plan(&ctx, 10))),
+                    LogicalOperator::CopyTo(Box::new(create_copy_to(leaf_plan(&ctx, 10)))),
                 )
             },
             {
                 let ctx = BindContext::new();
                 (
                     "graph_expand",
-                    LogicalOperator::GraphExpand(GraphExpand::new(
+                    LogicalOperator::GraphExpand(Box::new(GraphExpand::new(
                         sample_edge_info(),
                         ExpandDirection::Forward,
                         "src".to_string(),
@@ -1846,7 +1638,7 @@ mod tests {
                         101,
                         "dst_table".to_string(),
                         leaf_plan(&ctx, 10),
-                    )),
+                    ))),
                 )
             },
         ]
@@ -2042,7 +1834,7 @@ mod tests {
             ))],
             vec![vec![0]],
         );
-        let op = LogicalOperator::Aggregate(aggregate);
+        let op = LogicalOperator::Aggregate(Box::new(aggregate));
 
         assert_eq!(
             op.types(),
@@ -2090,6 +1882,15 @@ mod tests {
                 ColumnBinding::new(10, 1),
                 ColumnBinding::new(77, 0),
             ]
+        );
+    }
+
+    #[test]
+    fn logical_operator_payloads_remain_compact_at_the_arena_boundary() {
+        let size = std::mem::size_of::<LogicalOperator>();
+        assert!(
+            size <= 192,
+            "LogicalOperator grew to {size} bytes; large payloads must stay out of arena slots"
         );
     }
 
@@ -2154,7 +1955,7 @@ mod tests {
         )
         .with_output_names(vec!["score".to_string()]);
 
-        let op = LogicalOperator::SearchScan(search);
+        let op = LogicalOperator::SearchScan(Box::new(search));
 
         assert_eq!(op.output_names(), vec!["score".to_string()]);
         assert_eq!(op.get_column_bindings(), vec![ColumnBinding::new(22, 0)]);

@@ -140,7 +140,7 @@ impl SearchOptimizer {
                                     || extract_fulltext_match_intent(expression, get)?.is_some(),
                             )
                         })?
-                        .then_some(get),
+                        .then_some(get.as_ref()),
                     _ => None,
                 },
                 _ => None,
@@ -402,15 +402,15 @@ impl SearchOptimizer {
 
             let mut other_predicates = filter.expressions.clone();
             let match_expression = other_predicates.remove(match_idx);
-            let operator = LogicalOperator::FullTextFilterScan(FullTextFilterScan {
-                get: get.clone(),
+            let operator = LogicalOperator::FullTextFilterScan(Box::new(FullTextFilterScan {
+                get: *get.clone(),
                 projection_map: filter.projection_map.clone(),
                 request,
                 match_expression,
                 other_predicates,
                 residual_predicates: Vec::new(),
                 decision,
-            });
+            }));
             let id = plan.id;
             let stats = plan.stats.clone();
             return Ok(Some(OwnedLogicalPlan {
@@ -469,7 +469,7 @@ fn build_search_scan(
         .iter()
         .position(|&index| index == pattern.order_expr_idx);
     let output_names = plan.output_names();
-    let operator = LogicalOperator::SearchScan(
+    let operator = LogicalOperator::SearchScan(Box::new(
         SearchScan::new(
             pattern.get.clone(),
             request,
@@ -484,7 +484,7 @@ fn build_search_scan(
             pattern.topn.limit,
         )
         .with_output_names(output_names),
-    );
+    ));
     let id = plan.id;
     let stats = plan.stats.clone();
     Ok(OwnedLogicalPlan {
@@ -1438,7 +1438,7 @@ mod tests {
                 confidence: Confidence::High,
             },
         };
-        let operator = LogicalOperator::FullTextFilterScan(scan);
+        let operator = LogicalOperator::FullTextFilterScan(Box::new(scan));
 
         assert_eq!(operator.output_names(), ["category", "id"]);
         assert_eq!(

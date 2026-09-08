@@ -184,6 +184,7 @@ impl TableHandle {
         num_rows: u64,
     ) -> ColumnStatistics {
         let mut stats = column_stats.copy();
+        stats = stats.with_storage_observation();
         if null_count > 0 {
             stats.statistics_mut().set_has_null_fast();
         }

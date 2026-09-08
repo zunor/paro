@@ -12,6 +12,7 @@ use std::sync::Arc;
 use std::time::Duration;
 use tokio::runtime::Builder;
 
+#[cfg(feature = "alloc-metrics")]
 #[global_allocator]
 static GLOBAL_ALLOCATOR: paro_common::allocator::MetricsSystemAllocator =
     paro_common::allocator::MetricsSystemAllocator;

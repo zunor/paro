@@ -1048,12 +1048,12 @@ mod tests {
             TableCatalogEntry::from_info(info, storage, CatalogObjectId::from_raw(20_001), 0)
                 .unwrap(),
         );
-        let child = OwnedLogicalPlan::synthetic(LogicalOperator::Get(Get::new(
+        let child = OwnedLogicalPlan::synthetic(LogicalOperator::Get(Box::new(Get::new(
             7,
             vec!["key".to_string(), "name".to_string(), "comment".to_string()],
             types.clone(),
             table,
-        )));
+        ))));
         let groups = types
             .into_iter()
             .enumerate()
@@ -1075,7 +1075,7 @@ mod tests {
     #[test]
     fn primary_key_proves_group_dependencies_without_runtime_statistics() {
         let aggregate = keyed_group_aggregate(Constraint::primary_key(vec![0]));
-        let plan = OwnedLogicalPlan::synthetic(LogicalOperator::Aggregate(aggregate));
+        let plan = OwnedLogicalPlan::synthetic(LogicalOperator::Aggregate(Box::new(aggregate)));
         let propagated = StatisticsPropagator::new().propagate(make_test_session(), plan);
         let LogicalOperator::Aggregate(aggregate) = &propagated.operator else {
             panic!("expected aggregate root");
@@ -1104,7 +1104,7 @@ mod tests {
         use paro_planner::operator::{BoundReference, SetOperation};
         let input = |reference_id, value| {
             let reference = BoundReference::new(
-                reference_id,
+                paro_planner::operator::BoundReferenceId::group_hole(reference_id),
                 vec![ColumnBinding::new(7, 0)],
                 vec![LogicalType::Integer],
             );
@@ -1201,7 +1201,7 @@ mod tests {
                 for _ in 0..DEPTH {
                     plan = OwnedLogicalPlan::new(
                         &bind_context,
-                        LogicalOperator::Limit(Limit::new(plan, None, None)),
+                        LogicalOperator::Limit(Box::new(Limit::new(plan, None, None))),
                     );
                 }
 
@@ -1233,13 +1233,14 @@ mod tests {
                 let mut aggregate = keyed_group_aggregate(Constraint::primary_key(vec![0]));
                 let mut child = *aggregate.child;
                 for _ in 0..DEPTH {
-                    child = OwnedLogicalPlan::synthetic(LogicalOperator::Limit(Limit::new(
-                        child, None, None,
+                    child = OwnedLogicalPlan::synthetic(LogicalOperator::Limit(Box::new(
+                        Limit::new(child, None, None),
                     )));
                 }
                 aggregate.child = Box::new(child);
 
-                let plan = OwnedLogicalPlan::synthetic(LogicalOperator::Aggregate(aggregate));
+                let plan =
+                    OwnedLogicalPlan::synthetic(LogicalOperator::Aggregate(Box::new(aggregate)));
                 let propagated = StatisticsPropagator::new().propagate(make_test_session(), plan);
                 let LogicalOperator::Aggregate(aggregate) = &propagated.operator else {
                     panic!("expected aggregate root");
@@ -1449,7 +1450,7 @@ mod tests {
         );
         let aggregate = OwnedLogicalPlan::new(
             &bind_context,
-            LogicalOperator::Aggregate(Aggregate::new(
+            LogicalOperator::Aggregate(Box::new(Aggregate::new(
                 20,
                 21,
                 22,
@@ -1463,7 +1464,7 @@ mod tests {
                 }],
                 Vec::new(),
                 Vec::new(),
-            )),
+            ))),
         );
 
         let optimized = StatisticsPropagator::new().propagate(make_test_session(), aggregate);

@@ -121,7 +121,7 @@ fn physical_rewrite_composes_consecutive_projects() {
 #[test]
 fn project_alias_does_not_rename_its_scan_input() {
     let ctx = BindContext::new();
-    let get = OwnedLogicalPlan::new(&ctx, LogicalOperator::Get(test_get()));
+    let get = OwnedLogicalPlan::new(&ctx, LogicalOperator::Get(Box::new(test_get())));
     let project = OwnedLogicalPlan::new(
         &ctx,
         LogicalOperator::Projection(
@@ -322,7 +322,7 @@ fn arena_extractor_builds_streaming_subset_without_runtime_objects() {
     );
     let limit = OwnedLogicalPlan::new(
         &ctx,
-        LogicalOperator::Limit(Limit::new(project, None, None)),
+        LogicalOperator::Limit(Box::new(Limit::new(project, None, None))),
     );
 
     let mut extractor = PhysicalPlanExtractor::new(ExtractionContext::default());
@@ -402,7 +402,7 @@ fn aggregate_uses_lossless_fixed_width_keys_for_bounded_strings() {
     let mut stats = StringStats::create_empty(LogicalType::Varchar);
     StringStats::update(&mut stats, "Brand45");
     aggregate.group_stats[0] = Some(stats);
-    let aggregate = OwnedLogicalPlan::new(&ctx, LogicalOperator::Aggregate(aggregate));
+    let aggregate = OwnedLogicalPlan::new(&ctx, LogicalOperator::Aggregate(Box::new(aggregate)));
 
     let mut extractor = PhysicalPlanExtractor::new(ExtractionContext::default());
     let plan = extractor
@@ -450,7 +450,7 @@ fn aggregate_packs_inline_strings_when_fixed_keys_preserve_row_width() {
     let mut stats = StringStats::create_empty(LogicalType::Varchar);
     StringStats::update(&mut stats, "UNITED KINGDOM");
     aggregate.group_stats[0] = Some(stats);
-    let aggregate = OwnedLogicalPlan::new(&ctx, LogicalOperator::Aggregate(aggregate));
+    let aggregate = OwnedLogicalPlan::new(&ctx, LogicalOperator::Aggregate(Box::new(aggregate)));
 
     let plan = PhysicalPlanExtractor::new(ExtractionContext::default())
         .extract(&aggregate)
@@ -504,7 +504,7 @@ fn aggregate_skips_offset_keys_that_only_replace_row_padding() {
         &paro_common::runtime_value::Value::Integer(250),
     );
     aggregate.group_stats[0] = Some(stats);
-    let aggregate = OwnedLogicalPlan::new(&ctx, LogicalOperator::Aggregate(aggregate));
+    let aggregate = OwnedLogicalPlan::new(&ctx, LogicalOperator::Aggregate(Box::new(aggregate)));
 
     let mut extractor = PhysicalPlanExtractor::new(ExtractionContext::default());
     let plan = extractor
@@ -554,7 +554,8 @@ fn aggregate_requires_complete_bounds_for_offset_keys() {
             vec![],
         );
         aggregate.group_stats = vec![Some(first_stats), Some(second_stats)];
-        let aggregate = OwnedLogicalPlan::new(&ctx, LogicalOperator::Aggregate(aggregate));
+        let aggregate =
+            OwnedLogicalPlan::new(&ctx, LogicalOperator::Aggregate(Box::new(aggregate)));
 
         let mut extractor = PhysicalPlanExtractor::new(ExtractionContext::default());
         let plan = extractor
@@ -630,7 +631,7 @@ fn aggregate_materializes_proven_dependent_groups_as_states() {
         determinants: Box::new([0]),
         dependents: Box::new([1, 2]),
     });
-    let aggregate = OwnedLogicalPlan::new(&ctx, LogicalOperator::Aggregate(aggregate));
+    let aggregate = OwnedLogicalPlan::new(&ctx, LogicalOperator::Aggregate(Box::new(aggregate)));
 
     let plan = PhysicalPlanExtractor::new(ExtractionContext::default())
         .extract(&aggregate)
@@ -674,7 +675,7 @@ fn arena_extractor_fuses_aggregate_only_having_into_aggregate_emit() {
     ));
     let aggregate = OwnedLogicalPlan::new(
         &ctx,
-        LogicalOperator::Aggregate(Aggregate::new(
+        LogicalOperator::Aggregate(Box::new(Aggregate::new(
             1,
             2,
             3,
@@ -683,7 +684,7 @@ fn arena_extractor_fuses_aggregate_only_having_into_aggregate_emit() {
             vec![],
             vec![count],
             vec![],
-        )),
+        ))),
     );
     let having = OwnedLogicalPlan::new(
         &ctx,
@@ -735,7 +736,7 @@ fn aggregate_having_fusion_preserves_an_independent_output_projection() {
     ));
     let aggregate = OwnedLogicalPlan::new(
         &ctx,
-        LogicalOperator::Aggregate(Aggregate::new(
+        LogicalOperator::Aggregate(Box::new(Aggregate::new(
             1,
             2,
             3,
@@ -744,7 +745,7 @@ fn aggregate_having_fusion_preserves_an_independent_output_projection() {
             vec![],
             vec![count],
             vec![],
-        )),
+        ))),
     );
     let mut filter = Filter::new(
         aggregate,
@@ -788,7 +789,7 @@ fn aggregate_having_fusion_preserves_an_independent_output_projection() {
 #[test]
 fn arena_extractor_pushes_filter_predicates_into_rowset_scan() {
     let ctx = BindContext::new();
-    let get = OwnedLogicalPlan::new(&ctx, LogicalOperator::Get(test_get()));
+    let get = OwnedLogicalPlan::new(&ctx, LogicalOperator::Get(Box::new(test_get())));
     let mut filter = Filter::new(
         get,
         vec![
@@ -840,7 +841,7 @@ fn arena_extractor_pushes_filter_predicates_into_rowset_scan() {
 #[test]
 fn zero_column_rowset_projection_never_enables_late_materialization() {
     let ctx = BindContext::new();
-    let get = OwnedLogicalPlan::new(&ctx, LogicalOperator::Get(test_get()));
+    let get = OwnedLogicalPlan::new(&ctx, LogicalOperator::Get(Box::new(test_get())));
     let mut filter = Filter::new(
         get,
         vec![comparison(
@@ -868,7 +869,7 @@ fn zero_column_rowset_projection_never_enables_late_materialization() {
 fn rowset_scan_materialization_policy_uses_estimated_filter_density() {
     let build_scan = |filtered_rows: u64| {
         let ctx = BindContext::new();
-        let mut get = OwnedLogicalPlan::new(&ctx, LogicalOperator::Get(test_get()));
+        let mut get = OwnedLogicalPlan::new(&ctx, LogicalOperator::Get(Box::new(test_get())));
         get.stats.estimated_cardinality =
             Some(paro_planner::plan::CardinalityEstimate::exact(1_000_000));
         let filter = Filter::new(
@@ -899,7 +900,7 @@ fn rowset_scan_materialization_policy_uses_estimated_filter_density() {
 #[test]
 fn arena_extractor_can_disable_rowset_scan_pushdown() {
     let ctx = BindContext::new();
-    let get = OwnedLogicalPlan::new(&ctx, LogicalOperator::Get(test_get()));
+    let get = OwnedLogicalPlan::new(&ctx, LogicalOperator::Get(Box::new(test_get())));
     let filter = Filter::new(
         get,
         vec![comparison(
@@ -932,7 +933,7 @@ fn arena_extractor_can_disable_rowset_scan_pushdown() {
 #[test]
 fn arena_extractor_keeps_residual_filter_above_pushed_rowset_scan() {
     let ctx = BindContext::new();
-    let get = OwnedLogicalPlan::new(&ctx, LogicalOperator::Get(test_get()));
+    let get = OwnedLogicalPlan::new(&ctx, LogicalOperator::Get(Box::new(test_get())));
     let filter = Filter::new(
         get,
         vec![Expression::Conjunction(ConjunctionExpression {
@@ -978,7 +979,7 @@ fn arena_extractor_pushes_get_runtime_filters_into_rowset_scan() {
         ref_expr(0, LogicalType::Integer),
         int_const(99),
     ));
-    let plan = OwnedLogicalPlan::new(&ctx, LogicalOperator::Get(get));
+    let plan = OwnedLogicalPlan::new(&ctx, LogicalOperator::Get(Box::new(get)));
 
     let mut extractor = PhysicalPlanExtractor::new(ExtractionContext::default());
     let physical = extractor.extract(&plan).expect("get should lower");
@@ -995,7 +996,7 @@ fn arena_extractor_hands_graph_expand_filters_to_graph_project() {
     let ctx = BindContext::new();
     let scan = OwnedLogicalPlan::new(
         &ctx,
-        LogicalOperator::GraphScan(GraphScan::new(
+        LogicalOperator::GraphScan(Box::new(GraphScan::new(
             VertexTableInfo {
                 table_name: "vertices".to_string(),
                 table_oid: 1,
@@ -1009,7 +1010,7 @@ fn arena_extractor_hands_graph_expand_filters_to_graph_project() {
             "v".to_string(),
             "g".to_string(),
             "public".to_string(),
-        )),
+        ))),
     );
     let mut expand = GraphExpand::new(
         EdgeTableInfo {
@@ -1045,7 +1046,7 @@ fn arena_extractor_hands_graph_expand_filters_to_graph_project() {
         Value::Boolean(true),
         LogicalType::Boolean,
     )));
-    let expand = OwnedLogicalPlan::new(&ctx, LogicalOperator::GraphExpand(expand));
+    let expand = OwnedLogicalPlan::new(&ctx, LogicalOperator::GraphExpand(Box::new(expand)));
     let project = OwnedLogicalPlan::new(
         &ctx,
         LogicalOperator::Projection(
@@ -1088,7 +1089,7 @@ fn arena_extractor_lowers_graph_path_functions_with_path_history() {
     let ctx = BindContext::new();
     let scan = OwnedLogicalPlan::new(
         &ctx,
-        LogicalOperator::GraphScan(GraphScan::new(
+        LogicalOperator::GraphScan(Box::new(GraphScan::new(
             VertexTableInfo {
                 table_name: "vertices".to_string(),
                 table_oid: 1,
@@ -1102,7 +1103,7 @@ fn arena_extractor_lowers_graph_path_functions_with_path_history() {
             "v".to_string(),
             "g".to_string(),
             "public".to_string(),
-        )),
+        ))),
     );
     let mut expand = GraphExpand::new(
         EdgeTableInfo {
@@ -1131,7 +1132,7 @@ fn arena_extractor_lowers_graph_path_functions_with_path_history() {
         scan,
     );
     expand.has_path_functions = true;
-    let plan = OwnedLogicalPlan::new(&ctx, LogicalOperator::GraphExpand(expand));
+    let plan = OwnedLogicalPlan::new(&ctx, LogicalOperator::GraphExpand(Box::new(expand)));
 
     let mut extractor = PhysicalPlanExtractor::new(ExtractionContext::default());
     let physical = extractor
@@ -1203,8 +1204,8 @@ fn auxiliary_runtime_filter_winner_emits_owned_physical_edge() {
     let left_get = test_get();
     let mut right_get = test_get();
     right_get.table_index = 1;
-    let left = OwnedLogicalPlan::new(&ctx, LogicalOperator::Get(left_get));
-    let right = OwnedLogicalPlan::new(&ctx, LogicalOperator::Get(right_get));
+    let left = OwnedLogicalPlan::new(&ctx, LogicalOperator::Get(Box::new(left_get)));
+    let right = OwnedLogicalPlan::new(&ctx, LogicalOperator::Get(Box::new(right_get)));
     let condition = JoinCondition::equality(
         Expression::ColumnRef(paro_planner::expression::ColumnRefExpression::new(
             paro_planner::operator::ColumnBinding::new(0, 0),
@@ -1289,10 +1290,10 @@ fn auxiliary_runtime_filter_winner_emits_owned_physical_edge() {
 #[test]
 fn build_left_runtime_filter_keeps_artifact_ownership_on_the_hash_join() {
     let ctx = BindContext::new();
-    let left = OwnedLogicalPlan::new(&ctx, LogicalOperator::Get(test_get()));
+    let left = OwnedLogicalPlan::new(&ctx, LogicalOperator::Get(Box::new(test_get())));
     let mut right_get = test_get();
     right_get.table_index = 1;
-    let right = OwnedLogicalPlan::new(&ctx, LogicalOperator::Get(right_get));
+    let right = OwnedLogicalPlan::new(&ctx, LogicalOperator::Get(Box::new(right_get)));
     let condition = JoinCondition::equality(
         Expression::ColumnRef(paro_planner::expression::ColumnRefExpression::new(
             paro_planner::operator::ColumnBinding::new(0, 0),
@@ -1476,7 +1477,7 @@ fn join_qualifiers_survive_wrapped_scans() {
     let left = OwnedLogicalPlan::new(
         &ctx,
         LogicalOperator::Filter(Filter::new(
-            OwnedLogicalPlan::new(&ctx, LogicalOperator::Get(left_get)),
+            OwnedLogicalPlan::new(&ctx, LogicalOperator::Get(Box::new(left_get))),
             vec![comparison(
                 ComparisonType::GreaterThan,
                 ref_expr(0, LogicalType::Integer),
@@ -1487,7 +1488,7 @@ fn join_qualifiers_survive_wrapped_scans() {
     let right = OwnedLogicalPlan::new(
         &ctx,
         LogicalOperator::Filter(Filter::new(
-            OwnedLogicalPlan::new(&ctx, LogicalOperator::Get(right_get)),
+            OwnedLogicalPlan::new(&ctx, LogicalOperator::Get(Box::new(right_get))),
             vec![comparison(
                 ComparisonType::GreaterThan,
                 ref_expr(0, LogicalType::Integer),
@@ -1572,7 +1573,7 @@ fn arena_extractor_lowers_search_scan_with_planned_token() {
         5,
     )
     .with_output_names(vec!["c".to_string(), "score".to_string()]);
-    let plan = OwnedLogicalPlan::new(&ctx, LogicalOperator::SearchScan(search));
+    let plan = OwnedLogicalPlan::new(&ctx, LogicalOperator::SearchScan(Box::new(search)));
 
     let mut extractor = PhysicalPlanExtractor::new(ExtractionContext::default());
     let physical = extractor.extract(&plan).expect("search scan should lower");
@@ -1656,7 +1657,7 @@ fn arena_extractor_projects_derived_values_from_the_canonical_search_score() {
         5,
     )
     .with_output_names(vec!["c".to_string(), "derived_score".to_string()]);
-    let plan = OwnedLogicalPlan::new(&ctx, LogicalOperator::SearchScan(search));
+    let plan = OwnedLogicalPlan::new(&ctx, LogicalOperator::SearchScan(Box::new(search)));
 
     let physical = PhysicalPlanExtractor::new(ExtractionContext::default())
         .extract(&plan)

@@ -4,8 +4,12 @@
 //! Immutable logical nodes with arena-owned storage and index-only edges.
 //!
 //! Publishing a rewrite appends nodes and returns a new root. Existing roots
-//! retain their semantics, so alternatives share unchanged subgraphs without
-//! cloning. Rollback removes unpublished slots without reusing their identity.
+//! retain their semantics, so alternatives *within one arena* share unchanged
+//! subgraphs without cloning. `LogicalPlan` intentionally owns its arena at
+//! this boundary; callers that need cross-alternative sharing must keep one
+//! arena/session and pass roots rather than repeatedly converting through
+//! `LogicalPlan::from_owned`. Rollback removes unpublished slots without
+//! reusing their identity.
 
 use super::{NodeStats, OwnedLogicalPlan, PlanNodeId};
 use crate::operator::{LogicalOperator, LogicalOutputLayout};
@@ -14,6 +18,8 @@ use std::sync::Arc;
 
 /// One immutable logical DAG and its selected root. Rewrites append nodes and
 /// change a root handle; they never mutate a published input or own its edges.
+/// The arena is plan-local; a future planning-session owner may retain it and
+/// exchange only `PlanIndex` roots to share subgraphs across alternatives.
 /// Owned IR conversion is an explicit boundary, not an implicit Clone/Deref.
 #[derive(Debug)]
 pub struct LogicalPlan {
@@ -238,18 +244,15 @@ impl LogicalPlanArena {
         node.operator.visit_child_links(&mut |child| {
             inputs.push(self.nodes[child.slot as usize].output.clone())
         });
-        let output = node.operator.output_layout_from_children(
-            &inputs
-                .iter()
-                .map(|layout| layout.as_ref().clone())
-                .collect::<Vec<_>>(),
-        );
+        let input_refs = inputs.iter().map(Arc::as_ref).collect::<Vec<_>>();
         // Row-preserving shells share a schema allocation as well as edges.
-        let output = inputs
-            .iter()
-            .find(|input| input.as_ref() == &output)
-            .cloned()
-            .unwrap_or_else(|| Arc::new(output));
+        // The operator contract tells us the source directly; do not allocate
+        // and compare a full layout just to rediscover that fact.
+        let output = node
+            .operator
+            .pass_through_child_index(&input_refs)
+            .and_then(|index| inputs.get(index).cloned())
+            .unwrap_or_else(|| Arc::new(node.operator.output_layout_from_child_refs(&input_refs)));
         self.nodes.push(Slot {
             generation,
             node,
@@ -467,6 +470,27 @@ mod tests {
         }
         assert_eq!(arena.len(), 33);
         assert_eq!(arena.post_order(root).unwrap().len(), 33);
+    }
+
+    #[test]
+    fn pass_through_nodes_reuse_the_child_layout_arc() {
+        let mut arena = LogicalPlanArena::default();
+        let child = arena.append(identity()).unwrap();
+        let filter = arena
+            .append(LogicalPlanNode {
+                id: PlanNodeId::SYNTHETIC,
+                stats: NodeStats::default(),
+                operator: LogicalOperator::Filter(Filter {
+                    child,
+                    expressions: vec![],
+                    projection_map: crate::operator::ProjectionMap::all(),
+                }),
+            })
+            .unwrap();
+        assert!(Arc::ptr_eq(
+            &arena.nodes[child.slot as usize].output,
+            &arena.nodes[filter.slot as usize].output,
+        ));
     }
 
     #[test]

@@ -250,7 +250,7 @@ mod tests {
         ));
         let mut aggregate = OwnedLogicalPlan::new(
             &ctx,
-            LogicalOperator::Aggregate(Aggregate::new(
+            LogicalOperator::Aggregate(Box::new(Aggregate::new(
                 20,
                 21,
                 22,
@@ -262,7 +262,7 @@ mod tests {
                 Vec::new(),
                 vec![sum],
                 Vec::new(),
-            )),
+            ))),
         );
         aggregate.stats.estimated_cardinality = Some(CardinalityEstimate::exact(1_500_000));
 

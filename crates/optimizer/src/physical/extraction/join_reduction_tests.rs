@@ -55,7 +55,7 @@ fn declared_unique_get(ctx: &BindContext) -> OwnedLogicalPlan {
     );
     OwnedLogicalPlan::new(
         ctx,
-        LogicalOperator::Get(Get {
+        LogicalOperator::Get(Box::new(Get {
             table_index: 7,
             returned_types: vec![LogicalType::Varchar, LogicalType::BigInt],
             names: vec!["payload".to_string(), "id".to_string()],
@@ -69,7 +69,7 @@ fn declared_unique_get(ctx: &BindContext) -> OwnedLogicalPlan {
             table: Some(table),
             scan_order: None,
             runtime_filter_expressions: Vec::new(),
-        }),
+        })),
     )
 }
 
@@ -164,7 +164,7 @@ fn graph_expand_does_not_promote_its_input_key_to_an_output_key() {
         "vertices".to_string(),
         declared_unique_get(&ctx),
     );
-    let expanded = OwnedLogicalPlan::new(&ctx, LogicalOperator::GraphExpand(expand));
+    let expanded = OwnedLogicalPlan::new(&ctx, LogicalOperator::GraphExpand(Box::new(expand)));
     let expanded =
         crate::statistics::unique_keys::refresh_unique_keys(expanded).expect("cache unique keys");
     let conditions = [JoinCondition::new(

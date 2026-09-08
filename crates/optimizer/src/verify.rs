@@ -40,8 +40,6 @@ pub(crate) fn verify_arena_plan(
                         scope
                             .materialized_table_indices
                             .extend([expand.edge_table_index, expand.target_table_index]);
-                        scope.carrier_bindings =
-                            arena.output_layout(index).unwrap().bindings().to_vec();
                         scope
                     }),
                 LogicalOperator::Filter(filter) => graph_scopes.get(&filter.child).cloned(),
@@ -64,7 +62,7 @@ pub(crate) fn verify_arena_plan(
                 stats: input.stats.clone(),
                 operator: LogicalOperator::BoundReference(
                     paro_planner::operator::BoundReference::new(
-                        input.id.0,
+                        paro_planner::operator::BoundReferenceId::node_occurrence(input.id.0),
                         layout.bindings().to_vec(),
                         layout.types().to_vec(),
                     ),

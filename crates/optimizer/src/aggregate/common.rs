@@ -246,7 +246,7 @@ mod tests {
             ))],
             predicate,
         });
-        let mut plan = OwnedLogicalPlan::synthetic(LogicalOperator::Aggregate(aggregate));
+        let mut plan = OwnedLogicalPlan::synthetic(LogicalOperator::Aggregate(Box::new(aggregate)));
 
         CommonAggregateOptimizer::new().optimize(&mut plan);
 

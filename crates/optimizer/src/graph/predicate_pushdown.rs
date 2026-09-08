@@ -465,7 +465,7 @@ mod tests {
         table_index: usize,
     ) -> LogicalOperator {
         let output_types = columns.iter().map(|c| c.logical_type.clone()).collect();
-        LogicalOperator::GraphMatch(GraphMatch::new(
+        LogicalOperator::GraphMatch(Box::new(GraphMatch::new(
             Arc::new(PropertyGraphCatalogEntry::new(
                 CreatePropertyGraphInfo::new(
                     "test".to_string(),
@@ -483,7 +483,7 @@ mod tests {
             output_types,
             None,
             false,
-        ))
+        )))
     }
 
     /// Build a decomposed plan: Projection → GraphExpand → GraphScan

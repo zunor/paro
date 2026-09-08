@@ -174,7 +174,7 @@ impl JoinPreaggregation {
         );
         let partial_plan = OwnedLogicalPlan::new(
             bind_context,
-            LogicalOperator::Aggregate(Aggregate::new(
+            LogicalOperator::Aggregate(Box::new(Aggregate::new(
                 group_index,
                 aggregate_index,
                 groupings_index,
@@ -187,7 +187,7 @@ impl JoinPreaggregation {
                 vec![],
                 partials,
                 vec![],
-            )),
+            ))),
         );
         *join.right = partial_plan;
         // The replacement introduces a group key and a partial-state column
@@ -283,7 +283,7 @@ mod tests {
         );
         OwnedLogicalPlan::new(
             bind_context,
-            LogicalOperator::Aggregate(Aggregate::new(
+            LogicalOperator::Aggregate(Box::new(Aggregate::new(
                 3,
                 4,
                 5,
@@ -292,7 +292,7 @@ mod tests {
                 vec![],
                 vec![count(column(2, 1))],
                 vec![],
-            )),
+            ))),
         )
     }
 

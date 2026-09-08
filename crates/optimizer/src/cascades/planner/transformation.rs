@@ -1063,7 +1063,7 @@ fn rewrite_positive_consumed_mark_filter(plan: OwnedLogicalPlan) -> Option<Owned
 }
 
 struct GroupHoleTransportGuard {
-    templates: BTreeMap<u32, GroupHoleTransportTemplate>,
+    templates: BTreeMap<paro_planner::operator::BoundReferenceId, GroupHoleTransportTemplate>,
 }
 
 /// Keep the exact Memo operands that survived a relational rewrite.
@@ -1073,8 +1073,8 @@ struct GroupHoleTransportGuard {
 /// introduced or duplicated reference is never accepted as equivalent.
 fn retained_group_holes(
     plan: &OwnedLogicalPlan,
-    available: &BTreeMap<u32, GroupId>,
-) -> Result<BTreeMap<u32, GroupId>> {
+    available: &BTreeMap<paro_planner::operator::BoundReferenceId, GroupId>,
+) -> Result<BTreeMap<paro_planner::operator::BoundReferenceId, GroupId>> {
     let mut retained = BTreeMap::new();
     plan.try_visit_pre_order(|node| {
         let LogicalOperator::BoundReference(reference) = &node.operator else {
@@ -1105,7 +1105,7 @@ struct GroupHoleTransportTemplate {
 impl GroupHoleTransportGuard {
     fn capture(
         plan: &OwnedLogicalPlan,
-        hole_ids: impl IntoIterator<Item = u32>,
+        hole_ids: impl IntoIterator<Item = paro_planner::operator::BoundReferenceId>,
         _bind_context: &BindContext,
     ) -> Result<Self> {
         let wanted = hole_ids.into_iter().collect::<BTreeSet<_>>();

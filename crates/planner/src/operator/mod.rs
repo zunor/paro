@@ -58,7 +58,7 @@ pub use aggregate::{
     Aggregate, GroupInputMultiplicity, PostAggregateReduction, SingletonGroupProof,
 };
 pub use alter::Alter;
-pub use bound_reference::BoundReference;
+pub use bound_reference::{BoundReference, BoundReferenceId};
 pub use column_binding::ColumnBinding;
 pub use copy_to::CopyTo;
 pub use create_index::CreateIndex;

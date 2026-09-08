@@ -144,7 +144,7 @@ mod tests {
     use paro_planner::operator::{Get, Limit, Projection};
 
     fn create_test_get() -> LogicalOperator {
-        LogicalOperator::Get(Get {
+        LogicalOperator::Get(Box::new(Get {
             table_index: 0,
             returned_types: vec![LogicalType::Integer, LogicalType::Varchar],
             names: vec!["id".to_string(), "name".to_string()],
@@ -158,7 +158,7 @@ mod tests {
             table: None,
             scan_order: None,
             runtime_filter_expressions: Vec::new(),
-        })
+        }))
     }
 
     fn create_constant_expr(value: i64) -> Expression {
@@ -210,11 +210,11 @@ mod tests {
     fn test_can_optimize_simple() {
         let get = create_test_get();
         let projection = create_projection(get);
-        let limit = LogicalOperator::Limit(Limit::new(
+        let limit = LogicalOperator::Limit(Box::new(Limit::new(
             OwnedLogicalPlan::synthetic(projection),
             Some(create_constant_expr(10)),
             None,
-        ));
+        )));
 
         assert!(LimitPushdown::can_optimize(&limit));
     }
@@ -223,11 +223,11 @@ mod tests {
     fn test_can_optimize_with_offset() {
         let get = create_test_get();
         let projection = create_projection(get);
-        let limit = LogicalOperator::Limit(Limit::new(
+        let limit = LogicalOperator::Limit(Box::new(Limit::new(
             OwnedLogicalPlan::synthetic(projection),
             Some(create_constant_expr(10)),
             Some(create_constant_expr(5)),
-        ));
+        )));
 
         assert!(LimitPushdown::can_optimize(&limit));
     }
@@ -236,11 +236,11 @@ mod tests {
     fn test_cannot_optimize_large_limit() {
         let get = create_test_get();
         let projection = create_projection(get);
-        let limit = LogicalOperator::Limit(Limit::new(
+        let limit = LogicalOperator::Limit(Box::new(Limit::new(
             OwnedLogicalPlan::synthetic(projection),
             Some(create_constant_expr(10000)),
             None,
-        ));
+        )));
 
         assert!(!LimitPushdown::can_optimize(&limit));
     }
@@ -248,11 +248,11 @@ mod tests {
     #[test]
     fn test_cannot_optimize_no_projection() {
         let get = create_test_get();
-        let limit = LogicalOperator::Limit(Limit::new(
+        let limit = LogicalOperator::Limit(Box::new(Limit::new(
             OwnedLogicalPlan::synthetic(get),
             Some(create_constant_expr(10)),
             None,
-        ));
+        )));
 
         assert!(!LimitPushdown::can_optimize(&limit));
     }
@@ -261,11 +261,11 @@ mod tests {
     fn test_cannot_optimize_negative_offset() {
         let get = create_test_get();
         let projection = create_projection(get);
-        let limit = LogicalOperator::Limit(Limit::new(
+        let limit = LogicalOperator::Limit(Box::new(Limit::new(
             OwnedLogicalPlan::synthetic(projection),
             Some(create_constant_expr(10)),
             Some(create_constant_expr(-1)),
-        ));
+        )));
 
         assert!(!LimitPushdown::can_optimize(&limit));
     }
@@ -273,11 +273,11 @@ mod tests {
     #[test]
     fn test_cannot_push_limit_through_volatile_projection() {
         let projection = create_volatile_projection(create_test_get());
-        let limit = LogicalOperator::Limit(Limit::new(
+        let limit = LogicalOperator::Limit(Box::new(Limit::new(
             OwnedLogicalPlan::synthetic(projection),
             Some(create_constant_expr(10)),
             None,
-        ));
+        )));
 
         assert!(!LimitPushdown::can_optimize(&limit));
     }
@@ -287,11 +287,11 @@ mod tests {
         let mut optimizer = LimitPushdown::new();
         let get = create_test_get();
         let projection = create_projection(get);
-        let limit = LogicalOperator::Limit(Limit::new(
+        let limit = LogicalOperator::Limit(Box::new(Limit::new(
             OwnedLogicalPlan::synthetic(projection),
             Some(create_constant_expr(10)),
             None,
-        ));
+        )));
 
         let result = optimizer.optimize(limit);
 
@@ -313,11 +313,11 @@ mod tests {
     fn test_no_optimization_when_not_applicable() {
         let mut optimizer = LimitPushdown::new();
         let get = create_test_get();
-        let limit = LogicalOperator::Limit(Limit::new(
+        let limit = LogicalOperator::Limit(Box::new(Limit::new(
             OwnedLogicalPlan::synthetic(get),
             Some(create_constant_expr(10)),
             None,
-        ));
+        )));
 
         let result = optimizer.optimize(limit);
 

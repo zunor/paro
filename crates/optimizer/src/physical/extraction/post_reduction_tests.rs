@@ -449,7 +449,7 @@ fn lower_aggregate(
     with_having: bool,
 ) -> crate::physical::specs::AggregateSpec {
     let aggregate_type = aggregate.aggregates[0].return_type();
-    let aggregate = OwnedLogicalPlan::new(ctx, LogicalOperator::Aggregate(aggregate));
+    let aggregate = OwnedLogicalPlan::new(ctx, LogicalOperator::Aggregate(Box::new(aggregate)));
     let mut root = if with_having {
         OwnedLogicalPlan::new(
             ctx,

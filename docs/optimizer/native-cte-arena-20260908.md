@@ -76,9 +76,11 @@ scope ownership recursively.
 
 Physical contexts declare the source work an ancestor may filter. Dominance
 preserves that parent-visible response and output task supply. The arbitrary
-eight-winner truncation is gone: admitted non-dominated candidates survive,
-and parents retain exact immutable child candidate identities independently
-of later frontier pruning.
+eight-winner truncation is gone: admitted non-dominated candidates survive
+until the explicit `SearchBudget` frontier bound. If that anytime bound is
+reached, omitted alternatives publish a search obligation, and parents retain
+exact immutable child candidate identities independently of later frontier
+pruning.
 
 Child products use a lazy mixed-radix iterator. Construction is linear in the
 input frontiers, not their Cartesian product. An omitted combination publishes

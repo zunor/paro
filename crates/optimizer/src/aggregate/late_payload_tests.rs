@@ -84,7 +84,7 @@ fn candidate(order_by_payload: bool) -> OwnedLogicalPlan {
         GROUP,
         AGGREGATE,
         GROUPINGS,
-        OwnedLogicalPlan::synthetic(LogicalOperator::Get(get)),
+        OwnedLogicalPlan::synthetic(LogicalOperator::Get(Box::new(get))),
         vec![
             column(SOURCE, 0, LogicalType::BigInt),
             column(SOURCE, 1, LogicalType::Varchar),
@@ -104,7 +104,8 @@ fn candidate(order_by_payload: bool) -> OwnedLogicalPlan {
     });
     aggregate.child.stats.estimated_cardinality =
         Some(paro_planner::plan::CardinalityEstimate::exact(100_000));
-    let mut aggregate_plan = OwnedLogicalPlan::synthetic(LogicalOperator::Aggregate(aggregate));
+    let mut aggregate_plan =
+        OwnedLogicalPlan::synthetic(LogicalOperator::Aggregate(Box::new(aggregate)));
     aggregate_plan.stats.estimated_cardinality =
         Some(paro_planner::plan::CardinalityEstimate::exact(10_000));
     let projection = Projection::new(
@@ -157,10 +158,8 @@ fn candidate_with_null_extended_source() -> OwnedLogicalPlan {
         aggregate.child.as_mut(),
         OwnedLogicalPlan::synthetic(LogicalOperator::DummyScan),
     );
-    let dimension = OwnedLogicalPlan::synthetic(LogicalOperator::Get(Get::new_without_table(
-        11,
-        vec!["key".to_string()],
-        vec![LogicalType::BigInt],
+    let dimension = OwnedLogicalPlan::synthetic(LogicalOperator::Get(Box::new(
+        Get::new_without_table(11, vec!["key".to_string()], vec![LogicalType::BigInt]),
     )));
     aggregate.child = Box::new(OwnedLogicalPlan::synthetic(LogicalOperator::Join(
         Join::Comparison(ComparisonJoin::new(
@@ -194,7 +193,7 @@ fn selective_projection_candidate(source: GetColumnSource) -> OwnedLogicalPlan {
         table,
     );
     get.column_sources[1] = source;
-    let mut get = OwnedLogicalPlan::synthetic(LogicalOperator::Get(get));
+    let mut get = OwnedLogicalPlan::synthetic(LogicalOperator::Get(Box::new(get)));
     get.stats.estimated_cardinality = Some(paro_planner::plan::CardinalityEstimate::exact(100_000));
     let mut filter = OwnedLogicalPlan::synthetic(LogicalOperator::Filter(Filter::new(get, vec![])));
     filter.stats.estimated_cardinality = Some(paro_planner::plan::CardinalityEstimate::exact(100));
@@ -210,7 +209,7 @@ fn selective_join_projection_candidate(
     source_on_left: bool,
 ) -> OwnedLogicalPlan {
     let table = source_table();
-    let mut source = OwnedLogicalPlan::synthetic(LogicalOperator::Get(Get::new(
+    let mut source = OwnedLogicalPlan::synthetic(LogicalOperator::Get(Box::new(Get::new(
         SOURCE,
         table
             .columns
@@ -223,13 +222,11 @@ fn selective_join_projection_candidate(
             .map(|column| column.logical_type.clone())
             .collect(),
         table,
-    )));
+    ))));
     source.stats.estimated_cardinality =
         Some(paro_planner::plan::CardinalityEstimate::exact(100_000));
-    let dimension = OwnedLogicalPlan::synthetic(LogicalOperator::Get(Get::new_without_table(
-        11,
-        vec!["key".to_string()],
-        vec![LogicalType::BigInt],
+    let dimension = OwnedLogicalPlan::synthetic(LogicalOperator::Get(Box::new(
+        Get::new_without_table(11, vec!["key".to_string()], vec![LogicalType::BigInt]),
     )));
     let (left, right, left_key, right_key) = if source_on_left {
         (
@@ -303,7 +300,7 @@ fn row_preserving_candidate(
     );
     let derived =
         include_derived_prefix.then(|| get.append_matched_utf8_prefix(1, 2, LogicalType::Varchar));
-    let mut get = OwnedLogicalPlan::synthetic(LogicalOperator::Get(get));
+    let mut get = OwnedLogicalPlan::synthetic(LogicalOperator::Get(Box::new(get)));
     get.stats.estimated_cardinality = Some(paro_planner::plan::CardinalityEstimate::exact(100_000));
 
     let expressions = if let Some(derived) = derived {
@@ -624,7 +621,7 @@ fn topn_prices_ordering_payload_from_its_source_scan_frontier() {
 fn three_matching_gets_never_restore_false_uniqueness() {
     let source = || {
         let table = source_table();
-        OwnedLogicalPlan::synthetic(LogicalOperator::Get(Get::new(
+        OwnedLogicalPlan::synthetic(LogicalOperator::Get(Box::new(Get::new(
             SOURCE,
             table
                 .columns
@@ -637,7 +634,7 @@ fn three_matching_gets_never_restore_false_uniqueness() {
                 .map(|column| column.logical_type.clone())
                 .collect(),
             table,
-        )))
+        ))))
     };
     let two = OwnedLogicalPlan::synthetic(LogicalOperator::Join(Join::Cross(CrossProduct::new(
         source(),
@@ -684,7 +681,7 @@ fn verifier_rejects_projection_name_and_get_physical_layout_drift() {
         vec![LogicalType::Integer],
     );
     get.returned_types[0] = LogicalType::Varchar;
-    let plan = OwnedLogicalPlan::synthetic(LogicalOperator::Get(get));
+    let plan = OwnedLogicalPlan::synthetic(LogicalOperator::Get(Box::new(get)));
     let error = crate::verify::verify_logical_plan(&context, &plan)
         .expect_err("physical Get layout drift must be rejected");
     assert!(error.to_string().contains("physical representation"));

@@ -817,12 +817,12 @@ mod tests {
     }
 
     fn get(table_index: usize, table: Arc<TableCatalogEntry>) -> OwnedLogicalPlan {
-        OwnedLogicalPlan::synthetic(LogicalOperator::Get(Get::new(
+        OwnedLogicalPlan::synthetic(LogicalOperator::Get(Box::new(Get::new(
             table_index,
             vec!["key".to_string(), "value".to_string()],
             vec![LogicalType::BigInt, decimal(15)],
             table,
-        )))
+        ))))
     }
 
     fn preserved() -> OwnedLogicalPlan {
@@ -840,7 +840,7 @@ mod tests {
     ) -> OwnedLogicalPlan {
         let inner_sum = sum(column(INNER_DETAIL, 1, decimal(15)));
         let inner_aggregate =
-            OwnedLogicalPlan::synthetic(LogicalOperator::Aggregate(Aggregate::new(
+            OwnedLogicalPlan::synthetic(LogicalOperator::Aggregate(Box::new(Aggregate::new(
                 INNER_GROUP,
                 INNER_AGGREGATE,
                 42,
@@ -849,7 +849,7 @@ mod tests {
                 vec![],
                 vec![inner_sum],
                 vec![],
-            )));
+            ))));
         let reduction = OwnedLogicalPlan::synthetic(LogicalOperator::Projection(Projection::new(
             REDUCTION_PROJECTION,
             inner_aggregate,
@@ -873,7 +873,7 @@ mod tests {
                 column(OUTER_DETAIL, 0, LogicalType::BigInt),
             )],
         )));
-        OwnedLogicalPlan::synthetic(LogicalOperator::Aggregate(Aggregate::new(
+        OwnedLogicalPlan::synthetic(LogicalOperator::Aggregate(Box::new(Aggregate::new(
             OUTER_GROUP,
             OUTER_AGGREGATE,
             62,
@@ -882,7 +882,7 @@ mod tests {
             vec![],
             vec![sum(column(OUTER_DETAIL, 1, decimal(15)))],
             vec![],
-        )))
+        ))))
     }
 
     fn with_join_above_detail_edge(mut plan: OwnedLogicalPlan) -> OwnedLogicalPlan {
@@ -917,7 +917,7 @@ mod tests {
     fn reduction_wraps_projected_detail_join(table: Arc<TableCatalogEntry>) -> OwnedLogicalPlan {
         let inner_sum = sum(column(INNER_DETAIL, 1, decimal(15)));
         let inner_aggregate =
-            OwnedLogicalPlan::synthetic(LogicalOperator::Aggregate(Aggregate::new(
+            OwnedLogicalPlan::synthetic(LogicalOperator::Aggregate(Box::new(Aggregate::new(
                 INNER_GROUP,
                 INNER_AGGREGATE,
                 42,
@@ -926,7 +926,7 @@ mod tests {
                 vec![],
                 vec![inner_sum],
                 vec![],
-            )));
+            ))));
         let reduction = OwnedLogicalPlan::synthetic(LogicalOperator::Projection(Projection::new(
             REDUCTION_PROJECTION,
             inner_aggregate,
@@ -964,7 +964,7 @@ mod tests {
         // detail value consumed by the outer aggregate.
         reduction_join.left_projection_map = ProjectionMap::new(vec![0, 2]);
 
-        OwnedLogicalPlan::synthetic(LogicalOperator::Aggregate(Aggregate::new(
+        OwnedLogicalPlan::synthetic(LogicalOperator::Aggregate(Box::new(Aggregate::new(
             OUTER_GROUP,
             OUTER_AGGREGATE,
             62,
@@ -973,7 +973,7 @@ mod tests {
             vec![],
             vec![sum(column(OUTER_DETAIL, 1, decimal(15)))],
             vec![],
-        )))
+        ))))
     }
 
     #[test]

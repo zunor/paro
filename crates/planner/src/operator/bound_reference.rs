@@ -10,6 +10,55 @@ use std::sync::Arc;
 
 use super::ColumnBinding;
 
+/// The identity carried by a bound relation boundary is role-specific.  A
+/// single integer previously served as an input ordinal, a Memo group-hole
+/// token, and a plan-node occurrence; mixing those domains made an invalid
+/// reference look plausible and allowed unchecked indexing.  Keeping the role
+/// in the value makes transport contracts explicit and lets maps preserve it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum BoundReferenceId {
+    InputOrdinal(usize),
+    GroupHole(u32),
+    NodeOccurrence(u32),
+    FrozenOutput,
+}
+
+impl BoundReferenceId {
+    pub const fn group_hole(value: u32) -> Self {
+        Self::GroupHole(value)
+    }
+
+    pub fn input_ordinal(value: usize) -> Self {
+        Self::InputOrdinal(value)
+    }
+
+    pub const fn node_occurrence(value: u32) -> Self {
+        Self::NodeOccurrence(value)
+    }
+
+    pub const fn frozen_output() -> Self {
+        Self::FrozenOutput
+    }
+
+    pub fn input_ordinal_value(self) -> paro_common::error::Result<usize> {
+        match self {
+            Self::InputOrdinal(value) => Ok(value),
+            _ => Err(paro_common::error::internal(
+                "bound reference is not an input ordinal",
+            )),
+        }
+    }
+
+    pub fn group_hole_value(self) -> paro_common::error::Result<u32> {
+        match self {
+            Self::GroupHole(value) => Ok(value),
+            _ => Err(paro_common::error::internal(
+                "bound reference is not a Memo group hole",
+            )),
+        }
+    }
+}
+
 /// Immutable value-domain evidence at a relational boundary. NDV estimates and
 /// their proofs are separate; this snapshot contains validity, typed bounds,
 /// and nested value domains, without carrying an HLL allocation into Memo.
@@ -73,7 +122,7 @@ impl BoundColumnValues {
 pub struct BoundReference {
     /// Stable identity of this reference occurrence. Unlike `PlanNodeId`, this
     /// survives optimizer passes that rebuild an operator shell.
-    pub reference_id: u32,
+    pub reference_id: BoundReferenceId,
     pub bindings: Vec<ColumnBinding>,
     pub types: Vec<LogicalType>,
     /// Immutable evidence resolved by the owning Memo, never by choosing or
@@ -174,7 +223,11 @@ impl BoundReference {
             })
             .collect()
     }
-    pub fn new(reference_id: u32, bindings: Vec<ColumnBinding>, types: Vec<LogicalType>) -> Self {
+    pub fn new(
+        reference_id: BoundReferenceId,
+        bindings: Vec<ColumnBinding>,
+        types: Vec<LogicalType>,
+    ) -> Self {
         assert_eq!(bindings.len(), types.len());
         Self {
             reference_id,

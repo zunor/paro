@@ -658,11 +658,11 @@ mod tests {
     }
 
     fn make_get(table_index: usize) -> LogicalOperator {
-        LogicalOperator::Get(Get::new_without_table(
+        LogicalOperator::Get(Box::new(Get::new_without_table(
             table_index,
             vec!["col0".to_string(), "col1".to_string()],
             vec![LogicalType::Integer, LogicalType::Varchar],
-        ))
+        )))
     }
 
     fn volatile_call() -> Expression {
@@ -943,7 +943,7 @@ mod tests {
             vec![],
             vec![],
         );
-        let op = LogicalOperator::Aggregate(agg);
+        let op = LogicalOperator::Aggregate(Box::new(agg));
 
         let mut pullup = FilterPullup::with_settings(true, false);
         let result = pullup.rewrite(op);

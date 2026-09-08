@@ -496,7 +496,7 @@ fn expression_cost_facts_read_current_group_cardinality() {
 #[test]
 fn graph_relation_identity_is_part_of_the_query_ir_fingerprint() {
     let scan = |label: &str, table_oid: u64| {
-        OwnedLogicalPlan::synthetic(LogicalOperator::GraphScan(GraphScan::new(
+        OwnedLogicalPlan::synthetic(LogicalOperator::GraphScan(Box::new(GraphScan::new(
             VertexTableInfo {
                 table_name: label.to_ascii_lowercase(),
                 table_oid,
@@ -510,7 +510,7 @@ fn graph_relation_identity_is_part_of_the_query_ir_fingerprint() {
             label.to_string(),
             "g".to_string(),
             "public".to_string(),
-        )))
+        ))))
     };
     let person = scan("Person", 11);
     let company = scan("Company", 12);
@@ -523,7 +523,7 @@ fn graph_relation_identity_is_part_of_the_query_ir_fingerprint() {
 #[test]
 fn graph_variable_identity_is_part_of_the_query_ir_fingerprint() {
     let scan = |table_index: usize| {
-        OwnedLogicalPlan::synthetic(LogicalOperator::GraphScan(GraphScan::new(
+        OwnedLogicalPlan::synthetic(LogicalOperator::GraphScan(Box::new(GraphScan::new(
             VertexTableInfo {
                 table_name: "person".to_string(),
                 table_oid: 11,
@@ -537,7 +537,7 @@ fn graph_variable_identity_is_part_of_the_query_ir_fingerprint() {
             "Person".to_string(),
             "g".to_string(),
             "public".to_string(),
-        )))
+        ))))
     };
     let scalars = ScalarArena::default();
     let first = query_operator_fingerprint(&scan(7), &[], &scalars).unwrap();
@@ -548,7 +548,7 @@ fn graph_variable_identity_is_part_of_the_query_ir_fingerprint() {
 #[test]
 fn graph_filter_is_part_of_the_query_ir_fingerprint() {
     let scan = |value: bool| {
-        OwnedLogicalPlan::synthetic(LogicalOperator::GraphScan(GraphScan::new(
+        OwnedLogicalPlan::synthetic(LogicalOperator::GraphScan(Box::new(GraphScan::new(
             VertexTableInfo {
                 table_name: "person".to_string(),
                 table_oid: 11,
@@ -565,7 +565,7 @@ fn graph_filter_is_part_of_the_query_ir_fingerprint() {
             "Person".to_string(),
             "g".to_string(),
             "public".to_string(),
-        )))
+        ))))
     };
     let fingerprint = |mut plan: OwnedLogicalPlan| {
         let mut binding_ids = BindingCatalog::default();
@@ -1115,12 +1115,12 @@ pub(super) fn test_base_get(
         CatalogObjectId::from_raw(oid),
         0,
     ));
-    OwnedLogicalPlan::synthetic(LogicalOperator::Get(Get::new(
+    OwnedLogicalPlan::synthetic(LogicalOperator::Get(Box::new(Get::new(
         table_index,
         vec!["id".to_string()],
         vec![LogicalType::Integer],
         table,
-    )))
+    ))))
 }
 
 #[test]

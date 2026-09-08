@@ -1545,25 +1545,16 @@ mod tests {
     fn detail_subsumption_keeps_unconsumed_relations_as_group_inputs() {
         use paro_common::types::LogicalType;
         use paro_planner::operator::{Aggregate, Distinct, Filter, Get};
-        let mut child = OwnedLogicalPlan::synthetic(LogicalOperator::Get(Get::new_without_table(
-            0,
-            vec!["k".into()],
-            vec![LogicalType::BigInt],
+        let mut child = OwnedLogicalPlan::synthetic(LogicalOperator::Get(Box::new(
+            Get::new_without_table(0, vec!["k".into()], vec![LogicalType::BigInt]),
         )));
         for _ in 0..64 {
             child =
                 OwnedLogicalPlan::synthetic(LogicalOperator::Filter(Filter::new(child, vec![])));
         }
         let child = OwnedLogicalPlan::synthetic(LogicalOperator::Distinct(Distinct::new(child)));
-        let plan = OwnedLogicalPlan::synthetic(LogicalOperator::Aggregate(Aggregate::new(
-            1,
-            2,
-            3,
-            child,
-            vec![],
-            vec![],
-            vec![],
-            vec![],
+        let plan = OwnedLogicalPlan::synthetic(LogicalOperator::Aggregate(Box::new(
+            Aggregate::new(1, 2, 3, child, vec![], vec![], vec![], vec![]),
         )));
         let mut budget = SearchBudget::default();
         budget.max_rule_work_units_per_group = 12;
@@ -1594,10 +1585,8 @@ mod tests {
     fn local_filter_binding_does_not_enumerate_or_subscribe_below_its_input() {
         use paro_common::types::LogicalType;
         use paro_planner::operator::{Filter, Get};
-        let mut child = OwnedLogicalPlan::synthetic(LogicalOperator::Get(Get::new_without_table(
-            0,
-            vec!["k".into()],
-            vec![LogicalType::BigInt],
+        let mut child = OwnedLogicalPlan::synthetic(LogicalOperator::Get(Box::new(
+            Get::new_without_table(0, vec!["k".into()], vec![LogicalType::BigInt]),
         )));
         for _ in 0..64 {
             child = OwnedLogicalPlan::synthetic(LogicalOperator::Filter(Filter::new(

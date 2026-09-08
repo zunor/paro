@@ -56,6 +56,9 @@ struct CteProducerDomain {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct GroupColumnDomain {
     /// Hull of observed/estimated NDV evidence for equivalent expressions.
+    /// The lower/upper pair is the only conservative contract.  `expected`
+    /// below is a deterministic ranking estimate for costing, not a claim
+    /// that any one physical alternative observed the midpoint value.
     pub expected_lower: u64,
     pub expected_upper: u64,
     /// Predicate/schema proof. Unlike observed HLL state, this remains a safe
@@ -560,6 +563,12 @@ pub struct WinnerFrontier {
     filterable_sources: BTreeSet<super::rules::WorkSourceId>,
 }
 
+#[derive(Debug, Clone, Copy, Default)]
+struct FrontierInsertion {
+    selected_changed: bool,
+    truncated: bool,
+}
+
 impl WinnerFrontier {
     pub fn selected(&self) -> Option<&Winner> {
         self.candidates.first()
@@ -576,7 +585,24 @@ impl WinnerFrontier {
     /// expression.  This prevents catalog object IDs and query-local carrier
     /// IDs embedded in a plan fingerprint from changing an exact-tie winner
     /// across cold compilations.
+    #[cfg(test)]
     fn insert(&mut self, goal: OptimizationGoal, winner: Winner) -> bool {
+        self.insert_with_limit(goal, winner, usize::MAX)
+            .selected_changed
+    }
+
+    /// Insert a candidate into the Pareto frontier with an explicit anytime
+    /// bound.  The bound is deliberately applied *after* exact dominance and
+    /// objective ordering: no candidate is discarded merely because it is
+    /// locally more expensive.  If the bounded representation has to evict a
+    /// candidate, the caller records a residual search obligation so the
+    /// resulting plan cannot claim global closure.
+    fn insert_with_limit(
+        &mut self,
+        goal: OptimizationGoal,
+        winner: Winner,
+        limit: usize,
+    ) -> FrontierInsertion {
         let old_selected = self.selected().map(|entry| entry.physical_fingerprint);
 
         if self.candidates.iter().any(|incumbent| {
@@ -585,7 +611,7 @@ impl WinnerFrontier {
                     && source_response_equal(incumbent, &winner, &self.filterable_sources)
                     && winner_tie_break(incumbent) <= winner_tie_break(&winner))
         }) {
-            return false;
+            return FrontierInsertion::default();
         }
 
         self.candidates.retain(|incumbent| {
@@ -599,7 +625,16 @@ impl WinnerFrontier {
             compare_objective(left, right, goal.objective)
                 .then_with(|| winner_tie_break(left).cmp(&winner_tie_break(right)))
         });
-        old_selected != self.selected().map(|entry| entry.physical_fingerprint)
+        let limit = limit.max(1);
+        let truncated = self.candidates.len() > limit;
+        if truncated {
+            self.candidates.truncate(limit);
+        }
+        FrontierInsertion {
+            selected_changed: old_selected
+                != self.selected().map(|entry| entry.physical_fingerprint),
+            truncated,
+        }
     }
 }
 
@@ -1794,19 +1829,36 @@ impl Memo {
             .ok_or_else(|| paro_error::internal("winner has no source-demand context"))?
             .filterable_sources
             .clone();
+        let frontier_limit = self.budget.max_winner_frontier_candidates_per_goal.max(1) as usize;
+        let mut frontier_witness = StableFingerprintBuilder::default();
+        frontier_witness.write_bytes(b"paro.winner-frontier-boundary.v1");
+        frontier_witness.write_u64(group.0 as u64);
+        frontier_witness.write_u64(goal.required.0 as u64);
+        frontier_witness.write_u64(goal.row_goal.stable_tag());
+        frontier_witness.write_u64(goal.objective.stable_tag());
+        frontier_witness.write_u64(goal.grant.stable_tag());
+        frontier_witness.write_u64(goal.context.0 as u64);
+        frontier_witness.write_fingerprint(winner.physical_fingerprint);
+        let frontier_witness = frontier_witness.finish();
         let slot = self.groups[group.index()].winner_frontiers.entry(goal);
-        match slot {
+        let insertion = match slot {
             std::collections::btree_map::Entry::Vacant(entry) => {
                 let mut frontier = WinnerFrontier::default();
                 frontier.filterable_sources = filterable_sources;
-                frontier.insert(goal, winner);
+                let insertion = frontier.insert_with_limit(goal, winner, frontier_limit);
                 entry.insert(frontier);
-                Ok(true)
+                insertion
             }
-            std::collections::btree_map::Entry::Occupied(mut entry) => {
-                Ok(entry.get_mut().insert(goal, winner))
-            }
+            std::collections::btree_map::Entry::Occupied(mut entry) => entry
+                .get_mut()
+                .insert_with_limit(goal, winner, frontier_limit),
+        };
+        if insertion.truncated {
+            self.groups[group.index()]
+                .ledger
+                .record_budget_limited(BudgetDimension::WinnerFrontier, frontier_witness);
         }
+        Ok(insertion.selected_changed)
     }
 
     pub fn resolve_child_winner(&self, child: ChildWinnerRef) -> Option<&Winner> {

@@ -57,7 +57,7 @@ fn rewrite_node(
     );
     let inner = OwnedLogicalPlan::new(
         bind_context,
-        LogicalOperator::Aggregate(Aggregate::new(
+        LogicalOperator::Aggregate(Box::new(Aggregate::new(
             inner_group_index,
             inner_aggregate_index,
             inner_groupings_index,
@@ -66,7 +66,7 @@ fn rewrite_node(
             Vec::new(),
             Vec::new(),
             Vec::new(),
-        )),
+        ))),
     );
 
     aggregate.groups = aggregate
@@ -194,7 +194,7 @@ mod tests {
         );
         let plan = OwnedLogicalPlan::new(
             &bind_context,
-            LogicalOperator::Aggregate(Aggregate::new(
+            LogicalOperator::Aggregate(Box::new(Aggregate::new(
                 1,
                 2,
                 3,
@@ -203,7 +203,7 @@ mod tests {
                 Vec::new(),
                 vec![count_distinct(column(0, 1))],
                 Vec::new(),
-            )),
+            ))),
         );
 
         let (rewritten, changed) = optimize_plan(plan, &bind_context).expect("rewrite");

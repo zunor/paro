@@ -680,7 +680,7 @@ mod tests {
     }
 
     fn create_test_get(table_index: usize) -> LogicalOperator {
-        LogicalOperator::Get(Get {
+        LogicalOperator::Get(Box::new(Get {
             table_index,
             returned_types: vec![LogicalType::Integer],
             names: vec!["col".to_string()],
@@ -691,7 +691,7 @@ mod tests {
             table: None,
             scan_order: None,
             runtime_filter_expressions: Vec::new(),
-        })
+        }))
     }
 
     fn volatile_expression_with_column(table_index: usize) -> Expression {

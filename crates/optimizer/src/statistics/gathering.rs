@@ -1756,14 +1756,14 @@ mod tests {
         );
         let plan = OwnedLogicalPlan::new(
             &bind_context,
-            LogicalOperator::Limit(Limit::new(
+            LogicalOperator::Limit(Box::new(Limit::new(
                 projection,
                 Some(Expression::Constant(ConstantExpression::new(
                     Value::BigInt(3),
                     LogicalType::BigInt,
                 ))),
                 None,
-            )),
+            ))),
         );
 
         let gathered = StatisticsGathering::new()
@@ -1809,7 +1809,7 @@ mod tests {
                 for _ in 0..DEPTH {
                     plan = OwnedLogicalPlan::new(
                         &bind_context,
-                        LogicalOperator::Limit(Limit::new(plan, None, None)),
+                        LogicalOperator::Limit(Box::new(Limit::new(plan, None, None))),
                     );
                 }
 
@@ -1852,7 +1852,7 @@ mod tests {
                 for _ in 0..DEPTH {
                     dependent = OwnedLogicalPlan::new(
                         &bind_context,
-                        LogicalOperator::Limit(Limit::new(dependent, None, None)),
+                        LogicalOperator::Limit(Box::new(Limit::new(dependent, None, None))),
                     );
                 }
                 let mut join = paro_planner::operator::ComparisonJoin::new(
@@ -1920,7 +1920,7 @@ mod tests {
                 ctx.graph_stats = GraphStatsCache::with_loader(Arc::new(StaticGraphStatsLoader));
                 let mut child = OwnedLogicalPlan::new(
                     &bind_context,
-                    LogicalOperator::GraphScan(GraphScan::new(
+                    LogicalOperator::GraphScan(Box::new(GraphScan::new(
                         VertexTableInfo {
                             table_name: "vertices".to_string(),
                             table_oid: 1,
@@ -1934,7 +1934,7 @@ mod tests {
                         "v".to_string(),
                         "g".to_string(),
                         "public".to_string(),
-                    )),
+                    ))),
                 );
                 for _ in 0..DEPTH {
                     child = OwnedLogicalPlan::new(
@@ -1944,7 +1944,7 @@ mod tests {
                 }
                 let plan = OwnedLogicalPlan::new(
                     &bind_context,
-                    LogicalOperator::GraphExpand(GraphExpand::new(
+                    LogicalOperator::GraphExpand(Box::new(GraphExpand::new(
                         EdgeTableInfo {
                             table_name: "edges".to_string(),
                             table_oid: 2,
@@ -1969,7 +1969,7 @@ mod tests {
                         1,
                         "vertices".to_string(),
                         child,
-                    )),
+                    ))),
                 );
 
                 let gathered = StatisticsGathering::new()
@@ -2195,7 +2195,10 @@ mod tests {
             Vec::new(),
             Vec::new(),
         );
-        let plan = OwnedLogicalPlan::new(&bind_context, LogicalOperator::Aggregate(aggregate));
+        let plan = OwnedLogicalPlan::new(
+            &bind_context,
+            LogicalOperator::Aggregate(Box::new(aggregate)),
+        );
 
         let gathered = StatisticsGathering::new()
             .gather(plan, &mut ctx)
@@ -2485,7 +2488,10 @@ mod tests {
             Vec::new(),
             Vec::new(),
         );
-        let plan = OwnedLogicalPlan::new(&bind_context, LogicalOperator::Aggregate(aggregate));
+        let plan = OwnedLogicalPlan::new(
+            &bind_context,
+            LogicalOperator::Aggregate(Box::new(aggregate)),
+        );
 
         let gathered = StatisticsGathering::new()
             .gather(plan, &mut ctx)

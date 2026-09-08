@@ -41,7 +41,7 @@ impl Binder {
             ),
         ));
 
-        Ok(LogicalOperator::ExternalTable(
+        Ok(LogicalOperator::ExternalTable(Box::new(
             LogicalExternalTable::new(
                 routine_ref.table_index,
                 routine_ref.column_names,
@@ -54,6 +54,6 @@ impl Binder {
                 routine_ref.lateral,
                 !routine_ref.correlated_columns.is_empty(),
             ),
-        ))
+        )))
     }
 }

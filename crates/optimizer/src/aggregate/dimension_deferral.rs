@@ -294,7 +294,7 @@ impl DimensionRewriteInput {
             Ok(join) => Ok(Self {
                 root_id,
                 root_stats,
-                aggregate,
+                aggregate: *aggregate,
                 join,
             }),
             Err(child) => {
@@ -396,7 +396,7 @@ fn apply(
         .collect::<Vec<_>>();
     let partial = OwnedLogicalPlan::new(
         bind_context,
-        LogicalOperator::Aggregate(Aggregate::new(
+        LogicalOperator::Aggregate(Box::new(Aggregate::new(
             partial_group_index,
             partial_aggregate_index,
             partial_groupings_index,
@@ -405,7 +405,7 @@ fn apply(
             vec![],
             partial_aggregates,
             vec![],
-        )),
+        ))),
     );
     // Unmatched partial states vanish here. Duplicate dimension rows are
     // intentionally retained, and the final merge reproduces their SQL join
@@ -444,7 +444,7 @@ fn apply(
     OwnedLogicalPlan {
         id: root_id,
         stats: root_stats,
-        operator: LogicalOperator::Aggregate(aggregate),
+        operator: LogicalOperator::Aggregate(Box::new(aggregate)),
     }
 }
 

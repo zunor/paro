@@ -173,10 +173,8 @@ mod tests {
     use paro_planner::operator::{ComparisonJoin, Get, JoinCondition};
 
     fn scan(table: usize) -> OwnedLogicalPlan {
-        let mut plan = OwnedLogicalPlan::synthetic(LogicalOperator::Get(Get::new_without_table(
-            table,
-            vec!["k".into()],
-            vec![LogicalType::BigInt],
+        let mut plan = OwnedLogicalPlan::synthetic(LogicalOperator::Get(Box::new(
+            Get::new_without_table(table, vec!["k".into()], vec![LogicalType::BigInt]),
         )));
         plan.stats.estimated_cardinality = Some(CardinalityEstimate::exact(100));
         plan

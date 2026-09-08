@@ -541,7 +541,7 @@ mod tests {
             &binder,
             expression_get(60, vec![LogicalType::Integer, LogicalType::Integer]),
         );
-        let mut root = LogicalOperator::Aggregate(Aggregate::new(
+        let mut root = LogicalOperator::Aggregate(Box::new(Aggregate::new(
             61,
             62,
             63,
@@ -550,7 +550,7 @@ mod tests {
             Vec::new(),
             Vec::new(),
             Vec::new(),
-        ));
+        )));
         let subquery = subquery_expression(
             SubqueryType::Exists,
             expression_get(70, vec![LogicalType::Integer]),
@@ -918,7 +918,7 @@ mod tests {
             ColumnBinding::new(250, 0),
             LogicalType::Integer,
         ));
-        let aggregate = LogicalOperator::Aggregate(Aggregate::new(
+        let aggregate = LogicalOperator::Aggregate(Box::new(Aggregate::new(
             251,
             252,
             253,
@@ -931,7 +931,7 @@ mod tests {
                 LogicalType::Integer,
             ))],
             vec![],
-        ));
+        )));
         let subquery = subquery_expression(
             SubqueryType::Scalar,
             aggregate,
@@ -1079,7 +1079,7 @@ mod tests {
     fn flatten_lateral_join_hides_correlated_group_keys_from_aggregate_rhs() {
         let mut binder = test_binder();
         let correlated = vec![correlated_column(330, 0, LogicalType::Integer)];
-        let aggregate = LogicalOperator::Aggregate(Aggregate::new(
+        let aggregate = LogicalOperator::Aggregate(Box::new(Aggregate::new(
             331,
             332,
             333,
@@ -1088,7 +1088,7 @@ mod tests {
             Vec::new(),
             Vec::new(),
             vec![],
-        ));
+        )));
         let dependent_join = DependentJoin::lateral(
             wrapped(&binder, expression_get(330, vec![LogicalType::Integer])),
             wrapped(&binder, aggregate),
@@ -1333,7 +1333,7 @@ mod tests {
                 WindowFrame::get_default_frame(&row_number_function),
                 false,
             )],
-            wrapped(&binder, LogicalOperator::Aggregate(aggregate)),
+            wrapped(&binder, LogicalOperator::Aggregate(Box::new(aggregate))),
         ));
         let dependent_join = DependentJoin::lateral(
             wrapped(&binder, expression_get(370, vec![LogicalType::Integer])),

@@ -1126,7 +1126,7 @@ fn grouped_aggregate_logical_plan(row_count: usize) -> OwnedLogicalPlan {
     let values = int_values(&ctx, 0, vec!["k"], rows);
     OwnedLogicalPlan::new(
         &ctx,
-        LogicalOperator::Aggregate(LogicalAggregate::new(
+        LogicalOperator::Aggregate(Box::new(LogicalAggregate::new(
             1,
             2,
             3,
@@ -1142,7 +1142,7 @@ fn grouped_aggregate_logical_plan(row_count: usize) -> OwnedLogicalPlan {
                 LogicalType::BigInt,
             ))],
             Vec::new(),
-        )),
+        ))),
     )
 }
 
