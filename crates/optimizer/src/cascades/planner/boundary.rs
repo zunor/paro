@@ -80,6 +80,39 @@ enum SafeGroupingValue {
 }
 
 impl SafeGroupingValue {
+    fn encode(&self, encoder: &mut StableFingerprintBuilder) {
+        macro_rules! primitive {
+            ($($variant:ident),* $(,)?) => {
+                match self {
+                    $(Self::$variant(value) => Value::$variant(*value),)*
+                    Self::Varchar(value) => Value::Varchar(value.clone()),
+                    Self::Blob(value) => Value::Blob(value.clone()),
+                    Self::Decimal(value, precision, scale) => Value::Decimal(*value, *precision, *scale),
+                    Self::Interval(months, days, micros) => Value::Interval(*months, *days, *micros),
+                }
+            };
+        }
+        let value = primitive!(
+            Boolean,
+            TinyInt,
+            SmallInt,
+            Integer,
+            BigInt,
+            HugeInt,
+            UTinyInt,
+            USmallInt,
+            UInteger,
+            UBigInt,
+            UHugeInt,
+            Uuid,
+            Date,
+            Timestamp,
+            TimestampTz,
+            Time
+        );
+        crate::cascades::scalar_lowering::encode_value(encoder, &value);
+    }
+
     fn from_value(value: &Value) -> Option<Self> {
         Some(match value {
             Value::Boolean(value) => Self::Boolean(*value),
@@ -226,9 +259,9 @@ impl BoundarySnapshot {
         Ok(())
     }
 
-    /// Canonical value identity for every bound relational boundary. Group and
-    /// expression ids are deliberately excluded: the binding fingerprint owns
-    /// operator identity, while this value owns only transported facts.
+    /// Canonical value identity for every bound relational boundary. Preserve
+    /// each fact's operand identity: an unordered bag aliases a selective
+    /// left input with a selective right input when their facts swap.
     pub(super) fn binding_value_fingerprint(
         &self,
         memo: &Memo,
@@ -253,13 +286,13 @@ impl BoundarySnapshot {
             let mut value = StableFingerprintBuilder::default();
             value.write_bytes(b"paro.memo.boundary-value.v1");
             self.encode_group(group, &mut value)?;
-            values.push(value.finish());
+            values.push((group, value.finish()));
         }
-        values.sort_unstable();
         let mut encoder = StableFingerprintBuilder::default();
-        encoder.write_bytes(b"paro.memo.boundary-binding-value.v1");
+        encoder.write_bytes(b"paro.memo.boundary-binding-value.v2");
         encoder.write_u64(values.len() as u64);
-        for value in values {
+        for (group, value) in values {
+            encoder.write_u64(group.0 as u64);
             encoder.write_fingerprint(value);
         }
         Ok(encoder.finish())
@@ -277,6 +310,7 @@ impl BoundarySnapshot {
             .groups
             .get(&group)
             .ok_or_else(|| paro_error::internal("graph identity read unobserved facts"))?;
+        encoder.write_u64(facts.relational as u64);
         encoder.write_u64(facts.cardinality.is_some() as u64);
         if let Some(range) = facts.cardinality {
             for value in [
@@ -312,6 +346,21 @@ impl BoundarySnapshot {
             encoder.write_u64(key.len() as u64);
             for column in key {
                 encoder.write_u64(column.0 as u64);
+            }
+        }
+        encoder.write_u64(facts.grouping_unique_keys.len() as u64);
+        for key in &facts.grouping_unique_keys {
+            encoder.write_u64(key.len() as u64);
+            for column in key {
+                encoder.write_u64(column.0 as u64);
+            }
+        }
+        encoder.write_u64(facts.grouping_domains.len() as u64);
+        for (column, domain) in &facts.grouping_domains {
+            encoder.write_u64(column.0 as u64);
+            encoder.write_u64(domain.len() as u64);
+            for value in domain {
+                value.encode(encoder);
             }
         }
         encoder.write_u64(facts.lineage.len() as u64);

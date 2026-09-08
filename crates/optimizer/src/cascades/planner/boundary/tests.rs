@@ -28,6 +28,75 @@ fn input(plan: OwnedLogicalPlan, budget: SearchBudget) -> OptimizationInput {
     MemoBuilder::build(plan, BindContext::new(), budget).unwrap()
 }
 
+#[test]
+fn boundary_value_identity_retains_which_operand_owns_each_fact() {
+    let mut memo = Memo::new(SearchBudget::default());
+    let groups = (0..2)
+        .map(|_| {
+            memo.create_group(
+                GroupSchema::new([]).unwrap(),
+                LogicalProperties::default(),
+                GroupCardinality::default(),
+            )
+        })
+        .collect::<Vec<_>>();
+    let binding = PatternOperand::Expression {
+        group: groups[0],
+        expression: LogicalExprId(0),
+        children: vec![PatternOperand::Group(groups[1])].into_boxed_slice(),
+    };
+    let facts = |rows| {
+        Arc::new(GroupFacts {
+            cardinality: Some(CardinalityEnvelope {
+                lower: rows,
+                expected_lower: rows,
+                expected_upper: rows,
+                upper: rows,
+            }),
+            ..Default::default()
+        })
+    };
+    let (small, large) = (facts(1), facts(100));
+    let before = BoundarySnapshot {
+        groups: BTreeMap::from([(groups[0], small.clone()), (groups[1], large.clone())]),
+    };
+    let after = BoundarySnapshot {
+        groups: BTreeMap::from([(groups[0], large), (groups[1], small)]),
+    };
+    assert_ne!(
+        before.binding_value_fingerprint(&memo, &binding).unwrap(),
+        after.binding_value_fingerprint(&memo, &binding).unwrap()
+    );
+}
+
+#[test]
+fn boundary_value_identity_includes_grouping_proofs_and_finite_domains() {
+    let group = GroupId(0);
+    let encoded = |facts| {
+        let snapshot = BoundarySnapshot {
+            groups: BTreeMap::from([(group, Arc::new(facts))]),
+        };
+        let mut encoder = StableFingerprintBuilder::recording();
+        snapshot.encode_group(group, &mut encoder).unwrap();
+        encoder.finish_recording().1
+    };
+    let unknown = encoded(GroupFacts::default());
+    let grouping = encoded(GroupFacts {
+        grouping_unique_keys: BTreeSet::from([vec![ColumnId(1)].into_boxed_slice()]),
+        ..Default::default()
+    });
+    let domain = encoded(GroupFacts {
+        grouping_domains: BTreeMap::from([(
+            ColumnId(1),
+            BTreeSet::from([SafeGroupingValue::Integer(5)]),
+        )]),
+        ..Default::default()
+    });
+    assert_ne!(unknown, grouping);
+    assert_ne!(unknown, domain);
+    assert_ne!(grouping, domain);
+}
+
 fn grouped_branch_with_tag(
     source_table: usize,
     output_table: usize,
