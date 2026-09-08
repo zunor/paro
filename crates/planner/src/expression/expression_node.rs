@@ -265,7 +265,17 @@ impl Expression {
         }
 
         let mut pending = vec![Pending::Expression(self, other)];
+        // Both DAGs are borrowed throughout this comparison, so allocation
+        // pairs cannot be reused or mutated. Check each pair once, without
+        // treating pointer identity as semantic equality (NaN, subqueries
+        // and opaque routine bind data need the normal local comparison).
+        let mut compared = std::collections::HashSet::new();
         while let Some(item) = pending.pop() {
+            if let Pending::Expression(left, right) = &item {
+                if !compared.insert((left.allocation_identity(), right.allocation_identity())) {
+                    continue;
+                }
+            }
             match item {
                 Pending::Expression(left, right) => match (left, right) {
                     (Expression::ColumnRef(a), Expression::ColumnRef(b)) => {
@@ -698,6 +708,34 @@ mod tests {
         };
         window.ignore_nulls = true;
         assert!(!original.equals(&different_null_treatment));
+    }
+
+    #[test]
+    fn equality_preserves_semantics_across_different_sharing_shapes() {
+        fn shared(mut expression: Expression) -> Expression {
+            for _ in 0..18 {
+                expression = Expression::Conjunction(
+                    ConjunctionExpression::new(
+                        ConjunctionType::Or,
+                        vec![expression.clone(), expression],
+                    )
+                    .into(),
+                );
+            }
+            expression
+        }
+        let original = shared(int_constant(1));
+        assert!(original.equals(&original.clone()));
+        assert!(original.equals(&shared(int_constant(1))));
+        assert!(!original.equals(&shared(int_constant(2))));
+        let Expression::Conjunction(children) = &original else {
+            unreachable!()
+        };
+        let different_arity = Expression::Conjunction(
+            ConjunctionExpression::new(ConjunctionType::Or, vec![children.children[0].clone()])
+                .into(),
+        );
+        assert!(!original.equals(&different_arity));
     }
 
     #[test]

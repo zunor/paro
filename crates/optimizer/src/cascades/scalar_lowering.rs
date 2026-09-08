@@ -7,7 +7,8 @@
 //! `ScalarExprId`s, while executable expression trees remain in extraction
 //! payloads and never participate in Memo identity.
 
-use std::collections::{BTreeMap, HashMap};
+use std::cell::RefCell;
+use std::collections::{BTreeMap, HashMap, HashSet};
 
 use paro_common::error::{self as paro_error, Result};
 use paro_common::runtime_value::Value;
@@ -17,7 +18,8 @@ use paro_external::routine::identity::{
 };
 use paro_function::scalar::{FunctionErrorMode, FunctionSideEffects, FunctionStability};
 use paro_planner::expression::{
-    ComparisonType, ConjunctionType, Expression, ExpressionIterator, WindowInvocation,
+    ComparisonType, ConjunctionType, Expression, ExpressionIdentity, ExpressionIterator,
+    WindowInvocation,
 };
 use paro_planner::operator::join::{Join, JoinComparisonType};
 use paro_planner::operator::{ColumnBinding, LogicalOperator};
@@ -305,45 +307,61 @@ fn intern_expression(
     arena: &mut ScalarArena,
 ) -> Result<ScalarExprId> {
     let mut pending = Vec::<PendingConjunction>::new();
-    let root = ExpressionIterator::try_fold_post_order(expression, |node, children| {
-        if let Expression::Conjunction(conjunction) = node {
-            // Defer safe associative nodes until their maximal run is known.
-            // Interning every prefix of a generated OR/AND chain eagerly
-            // stores O(n²) child IDs even though the final DAG is one node.
-            let safe = children.iter().all(|child| match child {
-                LoweredScalar::Pending(_) => true,
-                LoweredScalar::Interned(id) => arena
-                    .get(*id)
-                    .is_some_and(|node| node.properties.can_reorder_and_share()),
-            });
-            if safe {
-                let index = pending.len();
-                pending.push(PendingConjunction {
-                    kind: match conjunction.conjunction_type {
-                        ConjunctionType::And => ScalarKind::And,
-                        ConjunctionType::Or => ScalarKind::Or,
-                    },
-                    children: children.into(),
-                    resolved: None,
+    // These identities are scoped to the borrowed immutable DAG and one
+    // binding/reference namespace. They must never survive into another
+    // lowering call or a catalog rollback.
+    let lowered = RefCell::new(HashMap::new());
+    let root = ExpressionIterator::try_fold_post_order_cached(
+        expression,
+        |node| lowered.borrow().get(&node.allocation_identity()).copied(),
+        |node, children| {
+            if let Expression::Conjunction(conjunction) = node {
+                // Defer safe associative nodes until their maximal run is known.
+                // Interning every prefix of a generated OR/AND chain eagerly
+                // stores O(n²) child IDs even though the final DAG is one node.
+                let safe = children.iter().all(|child| match child {
+                    LoweredScalar::Pending(_) => true,
+                    LoweredScalar::Interned(id) => arena
+                        .get(*id)
+                        .is_some_and(|node| node.properties.can_reorder_and_share()),
                 });
-                return Ok(LoweredScalar::Pending(index));
+                if safe {
+                    let index = pending.len();
+                    pending.push(PendingConjunction {
+                        kind: match conjunction.conjunction_type {
+                            ConjunctionType::And => ScalarKind::And,
+                            ConjunctionType::Or => ScalarKind::Or,
+                        },
+                        children: children.into(),
+                        resolved: None,
+                    });
+                    let result = LoweredScalar::Pending(index);
+                    lowered
+                        .borrow_mut()
+                        .insert(node.allocation_identity(), result);
+                    return Ok(result);
+                }
             }
-        }
-        let children = children
-            .iter()
-            .copied()
-            .map(|child| resolve_lowered_scalar(child, &mut pending, arena))
-            .collect::<Result<Vec<_>>>()?;
-        intern_expression_node(
-            node,
-            &children,
-            reference_columns,
-            binding_ids,
-            columns,
-            arena,
-        )
-        .map(LoweredScalar::Interned)
-    })?;
+            let children = children
+                .iter()
+                .copied()
+                .map(|child| resolve_lowered_scalar(child, &mut pending, arena))
+                .collect::<Result<Vec<_>>>()?;
+            let result = intern_expression_node(
+                node,
+                &children,
+                reference_columns,
+                binding_ids,
+                columns,
+                arena,
+            )
+            .map(LoweredScalar::Interned)?;
+            lowered
+                .borrow_mut()
+                .insert(node.allocation_identity(), result);
+            Ok(result)
+        },
+    )?;
     resolve_lowered_scalar(root, &mut pending, arena)
 }
 
@@ -385,10 +403,16 @@ fn resolve_lowered_scalar(
                 }
                 let mut flatten = pending[index].children.to_vec();
                 let mut leaves = Vec::new();
+                let mut expanded = HashSet::new();
                 while let Some(child) = flatten.pop() {
                     if let LoweredScalar::Pending(child_index) = child {
                         if pending[child_index].kind == pending[index].kind {
-                            flatten.extend(pending[child_index].children.iter().copied());
+                            // Pending runs contain only reorderable,
+                            // idempotent predicates. A shared run contributes
+                            // its set of arms once, not once per DAG path.
+                            if expanded.insert(child_index) {
+                                flatten.extend(pending[child_index].children.iter().copied());
+                            }
                             continue;
                         }
                     }
@@ -824,12 +848,15 @@ pub(crate) fn expression_fingerprint(expression: &Expression) -> Fingerprint {
     // staging; a query must not be able to exhaust the native stack merely by
     // asking the CTE domain interner for a fingerprint.
     let mut pending = vec![(expression, false)];
-    let mut fingerprints = HashMap::<usize, Fingerprint>::new();
+    let mut fingerprints = HashMap::<ExpressionIdentity, Fingerprint>::new();
     while let Some((current, visited)) = pending.pop() {
+        if fingerprints.contains_key(&current.allocation_identity()) {
+            continue;
+        }
         if visited {
             let mut builder = StableFingerprintBuilder::default();
             encode_expression_node_fingerprint(&mut builder, current, &fingerprints);
-            fingerprints.insert(current as *const Expression as usize, builder.finish());
+            fingerprints.insert(current.allocation_identity(), builder.finish());
             continue;
         }
         pending.push((current, true));
@@ -839,7 +866,11 @@ pub(crate) fn expression_fingerprint(expression: &Expression) -> Fingerprint {
             // nested prefix and then flattening it again is quadratic on a
             // generated OR chain, even with an explicit traversal stack.
             let mut run = conjunction.children.iter().collect::<Vec<_>>();
+            let mut expanded = HashSet::new();
             while let Some(child) = run.pop() {
+                if !expanded.insert(child.allocation_identity()) {
+                    continue;
+                }
                 if let Expression::Conjunction(nested) = child {
                     if nested.conjunction_type == conjunction.conjunction_type {
                         run.extend(nested.children.iter());
@@ -853,22 +884,22 @@ pub(crate) fn expression_fingerprint(expression: &Expression) -> Fingerprint {
         }
         pending.extend(children.into_iter().rev().map(|child| (child, false)));
     }
-    fingerprints[&(expression as *const Expression as usize)]
+    fingerprints[&expression.allocation_identity()]
 }
 
 fn expression_child_fingerprint(
-    fingerprints: &HashMap<usize, Fingerprint>,
+    fingerprints: &HashMap<ExpressionIdentity, Fingerprint>,
     expression: &Expression,
 ) -> Fingerprint {
     *fingerprints
-        .get(&(expression as *const Expression as usize))
+        .get(&expression.allocation_identity())
         .expect("expression post-order must fingerprint every child")
 }
 
 fn encode_expression_node_fingerprint(
     builder: &mut StableFingerprintBuilder,
     expression: &Expression,
-    fingerprints: &HashMap<usize, Fingerprint>,
+    fingerprints: &HashMap<ExpressionIdentity, Fingerprint>,
 ) {
     let child_fp = |expression: &Expression| expression_child_fingerprint(fingerprints, expression);
     match expression {
@@ -908,7 +939,11 @@ fn encode_expression_node_fingerprint(
             // negatives).
             let mut leaves = Vec::new();
             let mut pending = conjunction.children.iter().collect::<Vec<_>>();
+            let mut expanded = HashSet::new();
             while let Some(child) = pending.pop() {
+                if !expanded.insert(child.allocation_identity()) {
+                    continue;
+                }
                 if let Expression::Conjunction(nested) = child {
                     if nested.conjunction_type == conjunction.conjunction_type {
                         pending.extend(nested.children.iter());
@@ -999,7 +1034,7 @@ fn encode_expression_node_fingerprint(
 fn encode_frame_bound_fingerprint(
     builder: &mut StableFingerprintBuilder,
     bound: &paro_planner::expression::WindowFrameBound,
-    fingerprints: &HashMap<usize, Fingerprint>,
+    fingerprints: &HashMap<ExpressionIdentity, Fingerprint>,
 ) {
     match bound {
         paro_planner::expression::WindowFrameBound::Unbounded => builder.write_u64(0),
@@ -1118,6 +1153,97 @@ fn typed_binding_fingerprint(binding: ColumnBinding, type_domain: Fingerprint) -
 mod tests {
     use super::*;
     use paro_planner::expression::{CaseExpression, ConjunctionExpression, ConstantExpression};
+
+    #[test]
+    fn shared_associative_dag_is_lowered_as_one_idempotent_domain() {
+        let leaf = Expression::Constant(
+            ConstantExpression::new(Value::Boolean(true), LogicalType::Boolean).into(),
+        );
+        let flat = Expression::Conjunction(
+            ConjunctionExpression::new(ConjunctionType::Or, vec![leaf.clone()]).into(),
+        );
+        let mut expression = leaf;
+        // Keep a finite upper bound even if a future change regresses DAG
+        // pruning. The generic fact-fold oracle separately verifies visit
+        // counts on a 2^50-path DAG with a hard callback budget.
+        for _ in 0..18 {
+            expression = Expression::Conjunction(
+                ConjunctionExpression::new(
+                    ConjunctionType::Or,
+                    vec![expression.clone(), expression],
+                )
+                .into(),
+            );
+        }
+        assert_eq!(
+            expression_fingerprint(&expression),
+            expression_fingerprint(&flat)
+        );
+        let mut arena = ScalarArena::default();
+        let root = intern_expression(
+            &expression,
+            &[],
+            &mut BindingCatalog::default(),
+            &mut ColumnCatalog::default(),
+            &mut arena,
+        )
+        .unwrap();
+        assert_eq!(arena.len(), 2);
+        assert_eq!(arena.get(root).unwrap().children.len(), 1);
+    }
+
+    #[test]
+    fn sharing_an_effectful_expression_never_deduplicates_evaluation_edges() {
+        use paro_planner::expression::{ComparisonExpression, FunctionExpression};
+        let function = paro_function::scalar::math::get_random_function()
+            .functions
+            .into_iter()
+            .next()
+            .unwrap();
+        let random = Expression::Function(
+            FunctionExpression::new(function, vec![], LogicalType::Double).into(),
+        );
+        let mut expression = Expression::Comparison(
+            ComparisonExpression::new(
+                ComparisonType::GreaterThan,
+                random,
+                Expression::Constant(
+                    ConstantExpression::new(Value::Double(0.0), LogicalType::Double).into(),
+                ),
+            )
+            .into(),
+        );
+        for _ in 0..18 {
+            expression = Expression::Conjunction(
+                ConjunctionExpression::new(
+                    ConjunctionType::Or,
+                    vec![expression.clone(), expression],
+                )
+                .into(),
+            );
+        }
+        let mut arena = ScalarArena::default();
+        let mut root = intern_expression(
+            &expression,
+            &[],
+            &mut BindingCatalog::default(),
+            &mut ColumnCatalog::default(),
+            &mut arena,
+        )
+        .unwrap();
+        assert_eq!(arena.len(), 21);
+        for _ in 0..18 {
+            let node = arena.get(root).unwrap();
+            assert!(!node.properties.can_reorder_and_share());
+            assert_eq!(node.children.len(), 2);
+            assert_eq!(node.children[0], node.children[1]);
+            root = node.children[0];
+        }
+        assert_eq!(
+            arena.get(root).unwrap().properties.volatility,
+            Volatility::Volatile
+        );
+    }
 
     #[test]
     fn lowering_and_evaluation_properties_are_stack_safe() {
