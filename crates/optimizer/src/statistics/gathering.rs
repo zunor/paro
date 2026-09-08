@@ -258,7 +258,7 @@ impl StatisticsGathering {
         let mut expected = 1u64;
         let mut all_known = true;
         for stat in &stats {
-            let distinct = stat.get_distinct_count() as u64;
+            let distinct = stat.distinct_evidence().point;
             if distinct == 0 {
                 all_known = false;
                 break;
@@ -559,7 +559,7 @@ impl StatisticsGathering {
         let mut expected = 1u64;
         let mut saw_distinct = false;
         for stat in stats {
-            let distinct = stat.get_distinct_count() as u64;
+            let distinct = stat.distinct_evidence().point;
             if distinct > 0 {
                 expected = saturating_mul_u64(expected, distinct).min(child_est.expected.max(1));
                 saw_distinct = true;
@@ -896,9 +896,9 @@ fn estimate_same_domain_semi_join(
         .or_else(|| expression_binding(&condition.left, demand_bindings))?;
     let preserved_stats = ctx.column_stats.get(&preserved_key)?;
     let demand_stats = ctx.column_stats.get(&demand_key)?;
-    let preserved_distinct = preserved_stats.get_distinct_count();
+    let preserved_distinct = preserved_stats.distinct_evidence().point;
     if preserved_distinct == 0
-        || preserved_distinct != demand_stats.get_distinct_count()
+        || preserved_distinct != demand_stats.distinct_evidence().point
         || preserved_stats.get_type() != demand_stats.get_type()
         || preserved_stats.statistics().min_value() != demand_stats.statistics().min_value()
         || preserved_stats.statistics().max_value() != demand_stats.statistics().max_value()
@@ -964,7 +964,7 @@ fn unique_lookup_estimate(
     fact_key: ColumnBinding,
     ctx: &OptimizationContext,
 ) -> Option<CardinalityEstimate> {
-    let domain = ctx.column_stats.get(&fact_key)?.get_distinct_count() as u64;
+    let domain = ctx.column_stats.get(&fact_key)?.distinct_evidence().point;
     if domain == 0 {
         return None;
     }
@@ -1317,7 +1317,7 @@ fn estimate_group_distinct(
                 .map(|upper| upper.min(child_max_rows));
             let distinct = statistics
                 .as_ref()
-                .map(|stats| stats.get_distinct_count() as u64)
+                .map(|stats| stats.distinct_evidence().point)
                 .filter(|count| *count > 0);
             match (distinct, guaranteed_upper) {
                 (Some(distinct), Some(upper)) => (distinct.min(upper), Some(upper)),
@@ -1478,12 +1478,12 @@ fn estimate_join_condition_selectivity(
                 let left_distinct = ctx
                     .column_stats
                     .get(&left)
-                    .map(|stats| stats.get_distinct_count())
+                    .map(|stats| stats.distinct_evidence().point)
                     .unwrap_or(0);
                 let right_distinct = ctx
                     .column_stats
                     .get(&right)
-                    .map(|stats| stats.get_distinct_count())
+                    .map(|stats| stats.distinct_evidence().point)
                     .unwrap_or(0);
                 if left_distinct > 0 && right_distinct > 0 {
                     // A filtered relation cannot expose more distinct values
@@ -1500,12 +1500,8 @@ fn estimate_join_condition_selectivity(
                             u64::MAX
                         }
                     };
-                    let left_domain = u64::try_from(left_distinct)
-                        .unwrap_or(u64::MAX)
-                        .min(side_rows(left));
-                    let right_domain = u64::try_from(right_distinct)
-                        .unwrap_or(u64::MAX)
-                        .min(side_rows(right));
+                    let left_domain = left_distinct.min(side_rows(left));
+                    let right_domain = right_distinct.min(side_rows(right));
                     return (1.0 / left_domain.max(right_domain).max(1) as f64).clamp(0.0, 1.0);
                 }
             }
@@ -2271,12 +2267,12 @@ mod tests {
         ));
 
         let unconstrained = aggregate_expression_statistics(&expression, &ctx, None);
-        assert_eq!(unconstrained.get_distinct_count(), 3);
+        assert_eq!(unconstrained.distinct_evidence().point, 3);
         assert_eq!(unconstrained.guaranteed_distinct_upper(), None);
 
         let output = aggregate_expression_statistics(&expression, &ctx, Some(1));
 
-        assert_eq!(output.get_distinct_count(), 1);
+        assert_eq!(output.distinct_evidence().point, 1);
         assert_eq!(output.statistics().min_value(), Some(Value::BigInt(7)));
         assert_eq!(output.statistics().max_value(), Some(Value::BigInt(7)));
     }
@@ -2305,7 +2301,7 @@ mod tests {
 
         let output = filter_output_stats(&filter, &filter.child.output_layout(), &ctx);
         assert_eq!(output.len(), 1);
-        assert_eq!(output[0].get_distinct_count(), 1);
+        assert_eq!(output[0].distinct_evidence().point, 1);
         assert_eq!(
             output[0].statistics().min_value(),
             Some(Value::BigInt(2001))
@@ -2414,7 +2410,7 @@ mod tests {
 
         let output = filter_output_stats(&filter, &filter.child.output_layout(), &ctx);
         assert_eq!(output.len(), 1);
-        assert_eq!(output[0].get_distinct_count(), 2);
+        assert_eq!(output[0].distinct_evidence().point, 2);
         assert_eq!(output[0].guaranteed_distinct_upper(), Some(2));
         assert_eq!(
             output[0].statistics().min_value(),

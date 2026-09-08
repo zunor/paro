@@ -395,7 +395,7 @@ fn predicate_ordering_hint(
             };
             let distinct = storage
                 .column_statistics(column_id as usize)
-                .map(|statistics| statistics.get_distinct_count())
+                .map(|statistics| statistics.distinct_evidence().point)
                 .filter(|distinct| *distinct > 0)
                 .map(|distinct| distinct as f64);
             let (selectivity, fallback_rank) = match predicate {

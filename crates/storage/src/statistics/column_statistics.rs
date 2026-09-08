@@ -574,14 +574,6 @@ impl ColumnStatistics {
         self.stats.get_type()
     }
 
-    /// Get the estimated distinct count.
-    ///
-    /// Reads either a sketch observation or an explicit planner estimate.
-    /// Returns 0 if distinct statistics are not available.
-    pub fn get_distinct_count(&self) -> usize {
-        self.distinct_evidence().point as usize
-    }
-
     /// Serialize the ColumnStatistics to a writer.
     pub fn serialize<W: Write>(&self, w: &mut W) -> Result<()> {
         // Serialize base statistics
@@ -683,14 +675,14 @@ mod tests {
             Some(97),
         )
         .with_guaranteed_distinct_upper(80);
-        assert_eq!(statistics.get_distinct_count(), 80);
+        assert_eq!(statistics.distinct_evidence().point, 80);
         assert!(!statistics.has_distinct_stats());
-        assert_eq!(statistics.copy().get_distinct_count(), 80);
+        assert_eq!(statistics.copy().distinct_evidence().point, 80);
         let restored =
             ColumnStatistics::from_bytes(&statistics.to_bytes().unwrap(), LogicalType::Integer)
                 .unwrap();
         assert_eq!(
-            restored.get_distinct_count(),
+            restored.distinct_evidence().point,
             0,
             "planning estimates are not persisted observations"
         );
@@ -709,14 +701,17 @@ mod tests {
         left.merge(&domain(30));
         let mut right = domain(30);
         right.merge(&domain(20));
-        assert_eq!(left.get_distinct_count(), 50);
-        assert_eq!(left.get_distinct_count(), right.get_distinct_count());
+        assert_eq!(left.distinct_evidence().point, 50);
+        assert_eq!(
+            left.distinct_evidence().point,
+            right.distinct_evidence().point
+        );
         assert!(!left.has_distinct_stats());
         left.merge(&ColumnStatistics::with_estimated_distinct(
             BaseStatistics::create_unknown(LogicalType::Integer),
             None,
         ));
-        assert_eq!(left.get_distinct_count(), 0);
+        assert_eq!(left.distinct_evidence().point, 0);
     }
 
     #[test]
@@ -743,7 +738,7 @@ mod tests {
             }
         ));
         assert_eq!(evidence.point, evidence.lower);
-        assert!(observed.get_distinct_count() < 900);
+        assert!(observed.distinct_evidence().point < 900);
     }
 
     #[test]
@@ -867,8 +862,8 @@ mod tests {
         stats1.update_distinct_statistics(&hashes1, hashes1.len());
         stats2.update_distinct_statistics(&hashes2, hashes2.len());
 
-        let count1 = stats1.get_distinct_count();
-        let count2 = stats2.get_distinct_count();
+        let count1 = stats1.distinct_evidence().point;
+        let count2 = stats2.distinct_evidence().point;
 
         stats1.merge(&stats2);
 
@@ -877,7 +872,7 @@ mod tests {
         assert_eq!(stats1.statistics().max_value(), Some(Value::Integer(20)));
 
         // Check distinct statistics merged
-        let merged_count = stats1.get_distinct_count();
+        let merged_count = stats1.distinct_evidence().point;
         assert!(
             merged_count >= count1.max(count2),
             "Merged count {} should be >= max({}, {})",
@@ -894,7 +889,7 @@ mod tests {
         let hashes: Vec<u64> = (0..1000u64).map(murmur_hash_mix).collect();
         stats.update_distinct_statistics(&hashes, hashes.len());
 
-        let count = stats.get_distinct_count();
+        let count = stats.distinct_evidence().point;
         assert!(count > 0, "Distinct count should be positive");
     }
 
@@ -916,7 +911,10 @@ mod tests {
             stats.statistics().max_value(),
             copy.statistics().max_value()
         );
-        assert_eq!(stats.get_distinct_count(), copy.get_distinct_count());
+        assert_eq!(
+            stats.distinct_evidence().point,
+            copy.distinct_evidence().point
+        );
     }
 
     #[test]
@@ -959,7 +957,10 @@ mod tests {
             restored.statistics().max_value()
         );
         assert_eq!(stats.has_distinct_stats(), restored.has_distinct_stats());
-        assert_eq!(stats.get_distinct_count(), restored.get_distinct_count());
+        assert_eq!(
+            stats.distinct_evidence().point,
+            restored.distinct_evidence().point
+        );
     }
 
     #[test]
@@ -1005,7 +1006,7 @@ mod tests {
         let stats = ColumnStatistics::new(BaseStatistics::create_empty(list_type));
 
         // Should return 0 when no distinct stats
-        assert_eq!(stats.get_distinct_count(), 0);
+        assert_eq!(stats.distinct_evidence().point, 0);
     }
 
     #[test]
@@ -1018,7 +1019,7 @@ mod tests {
             .with_guaranteed_distinct_upper(1);
 
         assert_eq!(stats.guaranteed_distinct_upper(), Some(1));
-        assert_eq!(stats.get_distinct_count(), 1);
+        assert_eq!(stats.distinct_evidence().point, 1);
     }
 
     #[test]

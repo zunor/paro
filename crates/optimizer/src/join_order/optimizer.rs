@@ -1336,7 +1336,7 @@ mod tests {
             .collect::<Vec<_>>();
         let mut column_stats = ColumnStatistics::new(BaseStatistics::new(LogicalType::Integer));
         column_stats.update_distinct_statistics(&hashes, hashes.len());
-        assert!(column_stats.get_distinct_count() > 9);
+        assert!(column_stats.distinct_evidence().point > 9);
 
         let mut optimizer = JoinOrderOptimizer::new(SelectivityDefaults::default());
         optimizer

@@ -1135,7 +1135,7 @@ fn populate_paro_storage_info(
                         .null_count
                         .map(|value| value.min(i64::MAX as u64) as i64),
                     distinct_count: stats
-                        .map(|stats| stats.get_distinct_count().min(i64::MAX as usize) as i64),
+                        .map(|stats| stats.distinct_evidence().point.min(i64::MAX as u64) as i64),
                     min_value: base_stats
                         .and_then(|stats| stats.min_value())
                         .map(|value| value.to_string()),

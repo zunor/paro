@@ -397,7 +397,7 @@ fn join_key_distinct_expected(
     };
     column_stats
         .get(&binding)
-        .map(|statistics| statistics.get_distinct_count() as u64)
+        .map(|statistics| statistics.distinct_evidence().point)
         .filter(|distinct| *distinct > 0)
 }
 
@@ -479,13 +479,13 @@ pub(super) fn infer_runtime_filter_probe_multiplicity<'a>(
     };
     let Some(distinct) = storage
         .column_statistics(column_id)
-        .map(|statistics| statistics.get_distinct_count())
+        .map(|statistics| statistics.distinct_evidence().point)
         .filter(|distinct| *distinct > 0)
     else {
         return RuntimeFilterProbeMultiplicity::Unknown;
     };
     RuntimeFilterProbeMultiplicity::EstimatedDistinct {
-        keys: u64::try_from(distinct.min(rows)).unwrap_or(u64::MAX),
+        keys: distinct.min(rows as u64),
     }
 }
 

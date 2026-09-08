@@ -301,8 +301,7 @@ impl SettlementCache {
             .iter()
             .map(
                 |column| paro_planner::operator::bound_reference::BoundColumnDomain {
-                    expected_distinct: u64::try_from(column.get_distinct_count())
-                        .ok()
+                    expected_distinct: Some(column.distinct_evidence().point)
                         .filter(|value| *value > 0)
                         // An estimated row point is not a semantic upper
                         // bound.  Only `fact.maximum` is proof-backed and
@@ -954,7 +953,10 @@ mod tests {
                 column_ids: Box::new([]),
             })
             .unwrap();
-        assert_eq!(cache.facts[facts].columns[0].get_distinct_count(), 10_000);
+        assert_eq!(
+            cache.facts[facts].columns[0].distinct_evidence().point,
+            10_000
+        );
         assert_eq!(
             cache.facts[facts].columns[0].guaranteed_distinct_upper(),
             None
@@ -1000,7 +1002,7 @@ mod tests {
             .unwrap();
 
         assert_eq!(
-            cache.facts[facts].columns[0].get_distinct_count(),
+            cache.facts[facts].columns[0].distinct_evidence().point,
             10,
             "the expected row point is not a hard NDV proof"
         );
@@ -1323,7 +1325,7 @@ mod tests {
             panic!()
         };
         let statistics = reference.column_statistics();
-        assert_eq!(statistics[0].get_distinct_count(), 30);
+        assert_eq!(statistics[0].distinct_evidence().point, 30);
         assert_eq!(statistics[0].guaranteed_distinct_upper(), Some(90));
         assert!(!statistics[0].has_distinct_stats());
         assert_eq!(reference.facts.maximum_cardinality, Some(200));

@@ -487,14 +487,14 @@ impl CostModel {
 
         match comparison_type {
             ComparisonType::Equal | ComparisonType::NotDistinctFrom => {
-                let distinct = stats.get_distinct_count();
+                let distinct = stats.distinct_evidence().point;
                 if distinct == 0 {
                     return default;
                 }
                 (1.0 / distinct as f64).max(MIN_SELECTIVITY)
             }
             ComparisonType::NotEqual | ComparisonType::DistinctFrom => {
-                let distinct = stats.get_distinct_count();
+                let distinct = stats.distinct_evidence().point;
                 if distinct == 0 {
                     return default;
                 }
@@ -583,7 +583,7 @@ impl CostModel {
         let Some(stats) = resolver.get(column) else {
             return clamp_selectivity(self.defaults.equality * probe_count);
         };
-        let distinct = stats.get_distinct_count();
+        let distinct = stats.distinct_evidence().point;
         if distinct == 0 {
             return clamp_selectivity(self.defaults.equality * probe_count);
         }
@@ -600,7 +600,7 @@ impl CostModel {
         };
         let distinct = resolver
             .get(candidate)
-            .map(|stats| stats.get_distinct_count())
+            .map(|stats| stats.distinct_evidence().point)
             .unwrap_or(0);
         if distinct == 0 {
             self.defaults.equality
@@ -1236,7 +1236,7 @@ mod tests {
         );
         let hashes = (0..50).map(paro_common::hash::hash_u64).collect::<Vec<_>>();
         size_stats.update_distinct_statistics(&hashes, hashes.len());
-        let distinct = size_stats.get_distinct_count();
+        let distinct = size_stats.distinct_evidence().point;
         let column_stats = HashMap::from([(size_binding, Arc::new(size_stats))]);
         let equality = |value| {
             Expression::Comparison(ComparisonExpression::new(
@@ -1559,7 +1559,7 @@ mod tests {
             .map(paro_common::hash::hash_u64)
             .collect::<Vec<_>>();
         stats.update_distinct_statistics(&hashes, hashes.len());
-        let distinct = stats.get_distinct_count();
+        let distinct = stats.distinct_evidence().point;
         let column_stats = HashMap::from([(binding, Arc::new(stats))]);
         let expression = Expression::Operator(OperatorExpression::new(
             OperatorType::Like,

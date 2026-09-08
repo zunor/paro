@@ -40,7 +40,7 @@ fn constant_column_statistics_arc(value: &Value) -> Arc<ColumnStatistics> {
 
 fn aggregate_group_statistics(statistics: &ColumnStatistics) -> BaseStatistics {
     let mut group = statistics.statistics().copy();
-    let distinct_count = statistics.get_distinct_count();
+    let distinct_count = statistics.distinct_evidence().point as usize;
     if distinct_count > 0 {
         group.set_distinct_count(distinct_count);
     }
@@ -1302,7 +1302,7 @@ mod tests {
             statistics.statistics().max_value(),
             Some(Value::Integer(2001))
         );
-        assert_eq!(statistics.get_distinct_count(), 0);
+        assert_eq!(statistics.distinct_evidence().point, 0);
     }
 
     #[test]
@@ -1484,8 +1484,11 @@ mod tests {
 
         let group = aggregate_group_statistics(&statistics);
 
-        assert!(statistics.get_distinct_count() > 0);
-        assert_eq!(group.get_distinct_count(), statistics.get_distinct_count());
+        assert!(statistics.distinct_evidence().point > 0);
+        assert_eq!(
+            group.get_distinct_count() as u64,
+            statistics.distinct_evidence().point
+        );
     }
 
     #[test]
