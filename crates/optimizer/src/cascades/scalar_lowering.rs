@@ -16,10 +16,8 @@ use paro_common::types::LogicalType;
 use paro_external::routine::identity::{
     BuiltinIntrinsicId, BuiltinSemanticTag, RoutineCallIdentity,
 };
-use paro_function::scalar::{FunctionErrorMode, FunctionSideEffects, FunctionStability};
 use paro_planner::expression::{
     ComparisonType, ConjunctionType, Expression, ExpressionIdentity, ExpressionIterator,
-    WindowInvocation,
 };
 use paro_planner::operator::join::{Join, JoinComparisonType};
 use paro_planner::operator::{ColumnBinding, LogicalOperator};
@@ -28,8 +26,8 @@ use paro_planner::visitor::enumerate_expression_refs;
 use super::column::{ColumnCatalog, ColumnOrigin, ColumnVisibility};
 use super::ids::{ColumnId, Fingerprint, ScalarExprId, StableFingerprintBuilder};
 use super::scalar::{
-    ComparisonOp, ScalarArena, ScalarKind, ScalarLiteral, ScalarLocalProperties, ScalarSpec,
-    Volatility,
+    ComparisonOp, ScalarAggregate, ScalarArena, ScalarCast, ScalarFunction, ScalarKind,
+    ScalarLiteral, ScalarLocalProperties, ScalarSpec, ScalarWindow, Volatility,
 };
 
 type BindingKey = (usize, usize, u32);
@@ -244,7 +242,7 @@ pub(crate) fn intern_operator_scalars<Child>(
                     .collect::<Result<Box<[_]>>>()?;
                 roots.push(arena.intern(ScalarSpec {
                     kind: ScalarKind::Window {
-                        function: window_fingerprint(expression),
+                        function: ScalarWindow::from_bound(expression),
                     },
                     logical_type: expression.return_type(),
                     children,
@@ -300,7 +298,7 @@ fn get_reference_columns(
         .collect()
 }
 
-fn intern_expression(
+pub(crate) fn intern_expression(
     expression: &Expression,
     reference_columns: &[ColumnId],
     binding_ids: &mut BindingCatalog,
@@ -504,15 +502,16 @@ fn intern_expression_node(
         }),
         Expression::Function(function) => arena.intern(ScalarSpec {
             kind: ScalarKind::Function {
-                routine: function_fingerprint(function),
+                routine: ScalarFunction::from_bound(function),
             },
             logical_type: function.return_type.clone(),
             children: children.into(),
-            local_properties: function_local_properties(function),
+            local_properties: ScalarLocalProperties::default(),
         }),
         Expression::Cast(cast) => arena.intern(ScalarSpec {
             kind: ScalarKind::Cast {
                 try_cast: cast.try_cast,
+                binding: ScalarCast::new(cast.cast_info.clone()),
             },
             logical_type: cast.target_type.clone(),
             children: children.into(),
@@ -539,7 +538,7 @@ fn intern_expression_node(
         }),
         Expression::Operator(operator) => arena.intern(ScalarSpec {
             kind: ScalarKind::Operator {
-                operator: tagged_fingerprint(30, operator.operator_type as u64),
+                operator: operator.operator_type,
             },
             logical_type: operator.return_type.clone(),
             children: children.into(),
@@ -547,7 +546,7 @@ fn intern_expression_node(
         }),
         Expression::Aggregate(aggregate) => arena.intern(ScalarSpec {
             kind: ScalarKind::Aggregate {
-                function: aggregate_fingerprint(aggregate),
+                function: ScalarAggregate::from_bound(aggregate),
             },
             logical_type: aggregate.return_type.clone(),
             children: children.into(),
@@ -555,7 +554,7 @@ fn intern_expression_node(
         }),
         Expression::Window(window) => arena.intern(ScalarSpec {
             kind: ScalarKind::Window {
-                function: window_fingerprint(window),
+                function: ScalarWindow::from_bound(window),
             },
             logical_type: window.return_type(),
             children: children.into(),
@@ -630,27 +629,6 @@ fn intern_column_binding(
     Ok(column)
 }
 
-fn function_local_properties(
-    function: &paro_planner::expression::FunctionExpression,
-) -> ScalarLocalProperties {
-    let volatility = match function.function.stability {
-        FunctionStability::Consistent => Volatility::Immutable,
-        FunctionStability::ConsistentWithinQuery => Volatility::Stable,
-        FunctionStability::Volatile => Volatility::Volatile,
-    };
-    let has_side_effects = function.function.side_effects == FunctionSideEffects::HasSideEffects;
-    let depends_on_external_state = function.crosses_execution_boundary();
-    ScalarLocalProperties {
-        volatility,
-        may_error: function.function.error_mode == FunctionErrorMode::CanError,
-        has_side_effects,
-        depends_on_external_state,
-        deterministic: volatility != Volatility::Volatile
-            && !has_side_effects
-            && !depends_on_external_state,
-    }
-}
-
 fn conservative_local_properties(expression: &Expression) -> ScalarLocalProperties {
     let evaluation = expression.local_evaluation_properties();
     ScalarLocalProperties {
@@ -692,69 +670,87 @@ fn join_comparison(comparison: JoinComparisonType) -> ComparisonOp {
     }
 }
 
-fn function_fingerprint(function: &paro_planner::expression::FunctionExpression) -> Fingerprint {
+pub(crate) fn function_fingerprint(
+    function: &paro_planner::expression::FunctionExpression,
+) -> Fingerprint {
+    function_binding_fingerprint(
+        &function.function,
+        &function.return_type,
+        function.routine_identity(),
+    )
+}
+
+pub(crate) fn function_binding_fingerprint(
+    function: &paro_function::scalar::BoundScalarFunction,
+    return_type: &LogicalType,
+    identity: Option<&RoutineCallIdentity>,
+) -> Fingerprint {
     let mut builder = StableFingerprintBuilder::default();
     builder.write_u64(40);
-    if let Some(identity) = function.routine_identity() {
+    if let Some(identity) = identity {
         encode_routine_identity(&mut builder, identity);
     } else {
-        builder.write_bytes(function.function.name.as_bytes());
+        builder.write_bytes(function.name.as_bytes());
     }
-    encode_signature(
-        &mut builder,
-        &function.function.arguments,
-        &function.return_type,
-    );
+    encode_signature(&mut builder, &function.arguments, return_type);
+    if let Some(data) = &function.bind_data {
+        builder.write_u64(1);
+        builder.write_u64(data.fingerprint());
+    }
     builder.finish()
 }
 
-fn aggregate_fingerprint(aggregate: &paro_planner::expression::AggregateExpression) -> Fingerprint {
+pub(crate) fn aggregate_fingerprint(
+    aggregate: &paro_planner::expression::AggregateExpression,
+) -> Fingerprint {
+    aggregate_binding_fingerprint(
+        &aggregate.function,
+        &aggregate.return_type,
+        aggregate.aggr_type,
+        aggregate.filter.is_some(),
+        aggregate
+            .order_bys
+            .iter()
+            .map(|order| (order.ascending, order.nulls_first)),
+        aggregate.bind_info.as_ref(),
+    )
+}
+
+pub(crate) fn aggregate_binding_fingerprint(
+    function: &paro_function::aggregate::AggregateFunction,
+    return_type: &LogicalType,
+    distinct: paro_planner::expression::AggregateType,
+    has_filter: bool,
+    orders: impl ExactSizeIterator<Item = (bool, bool)>,
+    bind_info: Option<&std::sync::Arc<dyn paro_function::scalar::FunctionData>>,
+) -> Fingerprint {
     let mut builder = StableFingerprintBuilder::default();
     builder.write_u64(41);
-    builder.write_bytes(aggregate.function.name.as_bytes());
-    encode_signature(
-        &mut builder,
-        &aggregate.function.arguments,
-        &aggregate.return_type,
-    );
-    builder.write_u64(aggregate.aggr_type as u64);
-    builder.write_u64(aggregate.filter.is_some() as u64);
-    builder.write_u64(aggregate.order_bys.len() as u64);
-    for order in &aggregate.order_bys {
-        builder.write_u64(order.ascending as u64);
-        builder.write_u64(order.nulls_first as u64);
+    builder.write_bytes(function.name.as_bytes());
+    encode_signature(&mut builder, &function.arguments, return_type);
+    builder.write_u64(distinct as u64);
+    builder.write_u64(has_filter as u64);
+    builder.write_u64(orders.len() as u64);
+    for (ascending, nulls_first) in orders {
+        builder.write_u64(ascending as u64);
+        builder.write_u64(nulls_first as u64);
+    }
+    for (role, data) in [(0, function.bind_data.as_ref()), (1, bind_info)] {
+        if let Some(data) = data {
+            builder.write_u64(role);
+            builder.write_u64(data.fingerprint());
+        }
     }
     builder.finish()
 }
 
-fn window_fingerprint(window: &paro_planner::expression::WindowExpression) -> Fingerprint {
-    let mut builder = StableFingerprintBuilder::default();
-    builder.write_u64(42);
-    match &window.invocation {
-        WindowInvocation::Native { function, .. } => {
-            builder.write_u64(0);
-            builder.write_bytes(function.name.as_bytes());
-            encode_signature(&mut builder, &function.arguments, &function.return_type);
-        }
-        WindowInvocation::Aggregate(aggregate) => {
-            builder.write_u64(1);
-            builder.write_fingerprint(aggregate_fingerprint(aggregate));
-        }
-    }
-    builder.write_u64(window.partitions.len() as u64);
-    builder.write_u64(window.orders.len() as u64);
-    for order in &window.orders {
-        builder.write_u64(order.ascending as u64);
-        builder.write_u64(order.nulls_first as u64);
-    }
-    builder.write_u64(window.frame.frame_type as u64);
-    builder.write_u64(window.frame.start_is_preceding as u64);
-    builder.write_u64(window.frame.end_is_preceding as u64);
-    builder.write_u64(window.ignore_nulls as u64);
-    builder.finish()
+pub(crate) fn window_fingerprint(
+    window: &paro_planner::expression::WindowExpression,
+) -> Fingerprint {
+    ScalarWindow::from_bound(window).fingerprint()
 }
 
-fn encode_signature(
+pub(crate) fn encode_signature(
     builder: &mut StableFingerprintBuilder,
     arguments: &[LogicalType],
     return_type: &LogicalType,
@@ -1134,13 +1130,6 @@ pub(crate) fn encode_value(builder: &mut StableFingerprintBuilder, value: &Value
             }
         }
     }
-}
-
-fn tagged_fingerprint(domain: u64, value: u64) -> Fingerprint {
-    let mut builder = StableFingerprintBuilder::default();
-    builder.write_u64(domain);
-    builder.write_u64(value);
-    builder.finish()
 }
 
 pub(crate) fn logical_type_fingerprint(logical_type: &LogicalType) -> Fingerprint {

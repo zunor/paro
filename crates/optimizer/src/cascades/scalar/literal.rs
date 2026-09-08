@@ -11,7 +11,7 @@ use std::hash::{Hash, Hasher};
 
 use paro_common::runtime_value::Value;
 use paro_common::types::LogicalType;
-use paro_planner::expression::{ConstantExpression, SharedExpressionPayload};
+use paro_planner::expression::{ConstantExpression, Expression, SharedExpressionPayload};
 
 use super::super::ids::{Fingerprint, StableFingerprintBuilder};
 use super::super::scalar_lowering::{encode_value, value_fingerprint};
@@ -40,6 +40,10 @@ impl ScalarLiteral {
 
     pub fn logical_type(&self) -> &LogicalType {
         &self.leaf.return_type
+    }
+
+    pub(super) fn expression(&self) -> Expression {
+        Expression::Constant(self.leaf.clone())
     }
 
     pub(super) fn fingerprint(&self) -> Fingerprint {

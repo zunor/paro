@@ -7,10 +7,18 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use paro_common::error::{self as paro_error, Result};
 use paro_common::types::LogicalType;
+use paro_planner::expression::OperatorType;
 
 use super::ids::{ColumnId, Fingerprint, ScalarExprId, StableFingerprintBuilder};
 
+mod call;
+mod export;
 mod literal;
+mod rewrite;
+pub use call::{
+    ScalarAggregate, ScalarAggregateSpec, ScalarCast, ScalarFrameBound, ScalarFunction, ScalarSort,
+    ScalarWindow, ScalarWindowInvocation, ScalarWindowSpec,
+};
 pub use literal::ScalarLiteral;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -72,26 +80,24 @@ pub enum ScalarKind {
     },
     Parameter(u32),
     Function {
-        routine: Fingerprint,
+        routine: ScalarFunction,
     },
     Cast {
         try_cast: bool,
+        binding: ScalarCast,
     },
     And,
     Or,
     Comparison(ComparisonOp),
     Case,
     Operator {
-        operator: Fingerprint,
+        operator: OperatorType,
     },
     Aggregate {
-        function: Fingerprint,
-    },
-    BoundSubquery {
-        query: Fingerprint,
+        function: ScalarAggregate,
     },
     Window {
-        function: Fingerprint,
+        function: ScalarWindow,
     },
 }
 
@@ -156,6 +162,10 @@ pub struct ScalarNode {
     pub logical_type: LogicalType,
     pub children: Box<[ScalarExprId]>,
     pub properties: ScalarProperties,
+    /// Intrinsic properties of this node, before consuming child evidence.
+    /// Native substitution must not mistake old descendant errors/effects for
+    /// this operator's own contract, or lose its intrinsic error fence.
+    pub local_properties: ScalarLocalProperties,
     pub fingerprint: Fingerprint,
 }
 
@@ -216,7 +226,27 @@ impl ScalarArena {
         Ok(())
     }
 
-    pub fn intern(&mut self, spec: ScalarSpec) -> Result<ScalarExprId> {
+    pub fn intern(&mut self, mut spec: ScalarSpec) -> Result<ScalarExprId> {
+        // Executable contracts are authoritative even for nodes constructed
+        // entirely by a native rule. A caller may be more conservative, but
+        // default properties must not make a volatile/erroring kernel total.
+        let intrinsic = match &spec.kind {
+            ScalarKind::Function { routine } => routine.local_properties(),
+            ScalarKind::Cast { .. }
+            | ScalarKind::Operator { .. }
+            | ScalarKind::Aggregate { .. }
+            | ScalarKind::Window { .. } => ScalarLocalProperties {
+                may_error: true,
+                ..Default::default()
+            },
+            _ => ScalarLocalProperties::default(),
+        };
+        spec.local_properties.volatility =
+            spec.local_properties.volatility.max(intrinsic.volatility);
+        spec.local_properties.may_error |= intrinsic.may_error;
+        spec.local_properties.has_side_effects |= intrinsic.has_side_effects;
+        spec.local_properties.depends_on_external_state |= intrinsic.depends_on_external_state;
+        spec.local_properties.deterministic &= intrinsic.deterministic;
         self.validate_shape(&spec)?;
         let properties = self.derive_properties(&spec)?;
         let fingerprint = self.fingerprint(&spec)?;
@@ -225,6 +255,7 @@ impl ScalarArena {
             logical_type: spec.logical_type,
             children: spec.children,
             properties,
+            local_properties: spec.local_properties,
             fingerprint,
         };
         if let Some(existing) = self.by_fingerprint.get(&fingerprint) {
@@ -324,20 +355,25 @@ impl ScalarArena {
                 "scalar node references a child outside its arena generation",
             ));
         }
-        let arity_ok = match spec.kind {
+        let arity_ok = match &spec.kind {
             ScalarKind::Constant { .. } | ScalarKind::Column(_) | ScalarKind::Parameter(_) => {
                 spec.children.is_empty()
             }
-            ScalarKind::CorrelatedColumn { depth, .. } => depth > 0 && spec.children.is_empty(),
+            ScalarKind::CorrelatedColumn { depth, .. } => *depth > 0 && spec.children.is_empty(),
             ScalarKind::Cast { .. } => spec.children.len() == 1,
             ScalarKind::Comparison(_) => spec.children.len() == 2,
             ScalarKind::Case => spec.children.len() == 3,
             ScalarKind::And | ScalarKind::Or => !spec.children.is_empty(),
-            ScalarKind::Function { .. }
-            | ScalarKind::Operator { .. }
-            | ScalarKind::Aggregate { .. }
-            | ScalarKind::BoundSubquery { .. }
-            | ScalarKind::Window { .. } => true,
+            ScalarKind::Function { routine } => routine.logical_type() == &spec.logical_type,
+            ScalarKind::Aggregate { function } => {
+                function.logical_type() == &spec.logical_type
+                    && function.child_count() == spec.children.len()
+            }
+            ScalarKind::Window { function } => {
+                function.logical_type() == &spec.logical_type
+                    && function.child_count() == spec.children.len()
+            }
+            ScalarKind::Operator { .. } => true,
         };
         if !arity_ok {
             return Err(paro_error::internal("invalid normalized scalar arity"));
@@ -412,18 +448,21 @@ fn encode_kind(builder: &mut StableFingerprintBuilder, kind: &ScalarKind) {
         ScalarKind::Case => 8,
         ScalarKind::Operator { .. } => 9,
         ScalarKind::Aggregate { .. } => 10,
-        ScalarKind::BoundSubquery { .. } => 11,
         ScalarKind::Window { .. } => 12,
         ScalarKind::CorrelatedColumn { .. } => 13,
     };
     builder.write_u64(tag);
     match kind {
         ScalarKind::Constant { value } => builder.write_fingerprint(value.fingerprint()),
-        ScalarKind::Function { routine: value }
-        | ScalarKind::Operator { operator: value }
-        | ScalarKind::Aggregate { function: value }
-        | ScalarKind::BoundSubquery { query: value }
-        | ScalarKind::Window { function: value } => builder.write_fingerprint(*value),
+        ScalarKind::Function { routine } => builder.write_fingerprint(routine.fingerprint()),
+        ScalarKind::Aggregate { function } => builder.write_fingerprint(function.fingerprint()),
+        ScalarKind::Window { function } => builder.write_fingerprint(function.fingerprint()),
+        ScalarKind::Operator { operator } => {
+            let mut identity = StableFingerprintBuilder::default();
+            identity.write_u64(30);
+            identity.write_u64(*operator as u64);
+            builder.write_fingerprint(identity.finish());
+        }
         ScalarKind::Column(column) => builder.write_u64(column.0 as u64),
         ScalarKind::CorrelatedColumn { column, depth } => {
             builder.write_u64(column.0 as u64);
@@ -431,7 +470,7 @@ fn encode_kind(builder: &mut StableFingerprintBuilder, kind: &ScalarKind) {
         }
         ScalarKind::Parameter(slot) => builder.write_u64(*slot as u64),
         ScalarKind::Comparison(op) => builder.write_u64(*op as u64),
-        ScalarKind::Cast { try_cast } => builder.write_u64(*try_cast as u64),
+        ScalarKind::Cast { try_cast, .. } => builder.write_u64(*try_cast as u64),
         ScalarKind::And | ScalarKind::Or | ScalarKind::Case => {}
     }
 }
@@ -524,11 +563,9 @@ mod tests {
 
         let risky = arena
             .intern(ScalarSpec {
-                kind: ScalarKind::Function {
-                    routine: Fingerprint(99),
-                },
+                kind: ScalarKind::Case,
                 logical_type: LogicalType::BigInt,
-                children: Box::new([]),
+                children: Box::new([a, b, b]),
                 local_properties: ScalarLocalProperties {
                     may_error: true,
                     ..Default::default()

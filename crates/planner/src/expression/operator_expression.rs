@@ -9,7 +9,7 @@ use super::Expression;
 use paro_common::types::LogicalType;
 
 /// Type of operator operation.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum OperatorType {
     /// `LHS IN (RHS1, RHS2,...)`
     In,
