@@ -437,17 +437,23 @@ impl StatisticsPropagator {
                 // If the filter is always true or false, replace the expression with a constant
                 match result {
                     FilterPropagateResult::FilterAlwaysTrue => {
-                        *expr = Expression::Constant(ConstantExpression {
-                            value: Value::Boolean(true),
-                            return_type: LogicalType::Boolean,
-                        });
+                        *expr = Expression::Constant(
+                            ConstantExpression {
+                                value: Value::Boolean(true),
+                                return_type: LogicalType::Boolean,
+                            }
+                            .into(),
+                        );
                         return result;
                     }
                     FilterPropagateResult::FilterAlwaysFalse => {
-                        *expr = Expression::Constant(ConstantExpression {
-                            value: Value::Boolean(false),
-                            return_type: LogicalType::Boolean,
-                        });
+                        *expr = Expression::Constant(
+                            ConstantExpression {
+                                value: Value::Boolean(false),
+                                return_type: LogicalType::Boolean,
+                            }
+                            .into(),
+                        );
                         return result;
                     }
                     _ => return result,
@@ -1058,17 +1064,15 @@ mod tests {
             .into_iter()
             .enumerate()
             .map(|(column_index, ty)| {
-                Expression::ColumnRef(ColumnRefExpression::new(
-                    ColumnBinding::new(7, column_index),
-                    ty,
-                ))
+                Expression::ColumnRef(
+                    ColumnRefExpression::new(ColumnBinding::new(7, column_index), ty).into(),
+                )
             })
             .collect();
-        let count = Expression::Aggregate(Box::new(AggregateExpression::new(
-            get_count_star_function(),
-            Vec::new(),
-            LogicalType::BigInt,
-        )));
+        let count = Expression::Aggregate(
+            AggregateExpression::new(get_count_star_function(), Vec::new(), LogicalType::BigInt)
+                .into(),
+        );
         Aggregate::new(8, 9, 10, child, groups, Vec::new(), vec![count], Vec::new())
     }
 
@@ -1110,17 +1114,23 @@ mod tests {
             );
             OwnedLogicalPlan::synthetic(LogicalOperator::Filter(Filter::new(
                 OwnedLogicalPlan::synthetic(LogicalOperator::BoundReference(reference)),
-                vec![Expression::Comparison(ComparisonExpression::new(
-                    ComparisonType::Equal,
-                    Expression::ColumnRef(ColumnRefExpression::new(
-                        ColumnBinding::new(7, 0),
-                        LogicalType::Integer,
-                    )),
-                    Expression::Constant(ConstantExpression::new(
-                        Value::Integer(value),
-                        LogicalType::Integer,
-                    )),
-                ))],
+                vec![Expression::Comparison(
+                    ComparisonExpression::new(
+                        ComparisonType::Equal,
+                        Expression::ColumnRef(
+                            ColumnRefExpression::new(
+                                ColumnBinding::new(7, 0),
+                                LogicalType::Integer,
+                            )
+                            .into(),
+                        ),
+                        Expression::Constant(
+                            ConstantExpression::new(Value::Integer(value), LogicalType::Integer)
+                                .into(),
+                        ),
+                    )
+                    .into(),
+                )],
             )))
         };
         for values in [[2001, 2002], [2002, 2001]] {
@@ -1148,10 +1158,9 @@ mod tests {
             &bind_context,
             LogicalOperator::ExpressionGet(ExpressionGet::new(
                 7,
-                vec![vec![Expression::ColumnRef(ColumnRefExpression::new(
-                    ColumnBinding::new(7, 0),
-                    LogicalType::Integer,
-                ))]],
+                vec![vec![Expression::ColumnRef(
+                    ColumnRefExpression::new(ColumnBinding::new(7, 0), LogicalType::Integer).into(),
+                )]],
                 vec!["quota".to_string()],
                 vec![LogicalType::Integer],
             )),
@@ -1160,10 +1169,9 @@ mod tests {
             &bind_context,
             LogicalOperator::Filter(Filter::new(
                 child,
-                vec![Expression::Constant(ConstantExpression::new(
-                    Value::Boolean(false),
-                    LogicalType::Boolean,
-                ))],
+                vec![Expression::Constant(
+                    ConstantExpression::new(Value::Boolean(false), LogicalType::Boolean).into(),
+                )],
             )),
         );
 
@@ -1190,10 +1198,9 @@ mod tests {
                     &bind_context,
                     LogicalOperator::ExpressionGet(ExpressionGet::new(
                         17,
-                        vec![vec![Expression::Constant(ConstantExpression::new(
-                            Value::Integer(1),
-                            LogicalType::Integer,
-                        ))]],
+                        vec![vec![Expression::Constant(
+                            ConstantExpression::new(Value::Integer(1), LogicalType::Integer).into(),
+                        )]],
                         vec!["v".to_string()],
                         vec![LogicalType::Integer],
                     )),
@@ -1277,14 +1284,18 @@ mod tests {
         propagator
             .statistics_map
             .insert(binding, Arc::new(original));
-        let mut predicate = Expression::Comparison(ComparisonExpression::new(
-            ComparisonType::Equal,
-            Expression::ColumnRef(ColumnRefExpression::new(binding, LogicalType::Integer)),
-            Expression::Constant(ConstantExpression::new(
-                Value::Integer(2001),
-                LogicalType::Integer,
-            )),
-        ));
+        let mut predicate = Expression::Comparison(
+            ComparisonExpression::new(
+                ComparisonType::Equal,
+                Expression::ColumnRef(
+                    ColumnRefExpression::new(binding, LogicalType::Integer).into(),
+                ),
+                Expression::Constant(
+                    ConstantExpression::new(Value::Integer(2001), LogicalType::Integer).into(),
+                ),
+            )
+            .into(),
+        );
 
         assert_eq!(
             propagator.handle_filter(&mut predicate),
@@ -1312,10 +1323,9 @@ mod tests {
             &bind_context,
             LogicalOperator::ExpressionGet(ExpressionGet::new(
                 7,
-                vec![vec![Expression::Constant(ConstantExpression::new(
-                    Value::Integer(1),
-                    LogicalType::Integer,
-                ))]],
+                vec![vec![Expression::Constant(
+                    ConstantExpression::new(Value::Integer(1), LogicalType::Integer).into(),
+                )]],
                 vec!["n".to_string()],
                 vec![LogicalType::Integer],
             )),
@@ -1334,17 +1344,19 @@ mod tests {
                         vec![LogicalType::Integer],
                     )),
                 ),
-                vec![Expression::Comparison(ComparisonExpression::new(
-                    ComparisonType::LessThan,
-                    Expression::ColumnRef(ColumnRefExpression::new(
-                        recursive_binding,
-                        LogicalType::Integer,
-                    )),
-                    Expression::Constant(ConstantExpression::new(
-                        Value::Integer(4),
-                        LogicalType::Integer,
-                    )),
-                ))],
+                vec![Expression::Comparison(
+                    ComparisonExpression::new(
+                        ComparisonType::LessThan,
+                        Expression::ColumnRef(
+                            ColumnRefExpression::new(recursive_binding, LogicalType::Integer)
+                                .into(),
+                        ),
+                        Expression::Constant(
+                            ConstantExpression::new(Value::Integer(4), LogicalType::Integer).into(),
+                        ),
+                    )
+                    .into(),
+                )],
             )),
         );
         let plan = OwnedLogicalPlan::new(
@@ -1378,10 +1390,9 @@ mod tests {
             LogicalOperator::Projection(Projection::new(
                 7,
                 OwnedLogicalPlan::new(&bind_context, LogicalOperator::DummyScan),
-                vec![Expression::Constant(ConstantExpression::new(
-                    Value::Integer(11),
-                    LogicalType::Integer,
-                ))],
+                vec![Expression::Constant(
+                    ConstantExpression::new(Value::Integer(11), LogicalType::Integer).into(),
+                )],
             )),
         );
         let function = WindowFunction::row_number();
@@ -1392,10 +1403,10 @@ mod tests {
                 vec![WindowExpression::native(
                     function.clone(),
                     Vec::new(),
-                    vec![Expression::ColumnRef(ColumnRefExpression::new(
-                        ColumnBinding::new(7, 0),
-                        LogicalType::Integer,
-                    ))],
+                    vec![Expression::ColumnRef(
+                        ColumnRefExpression::new(ColumnBinding::new(7, 0), LogicalType::Integer)
+                            .into(),
+                    )],
                     Vec::new(),
                     WindowFrame::get_default_frame(&function),
                     false,
@@ -1408,10 +1419,9 @@ mod tests {
             LogicalOperator::Projection(Projection::new(
                 30,
                 window,
-                vec![Expression::ColumnRef(ColumnRefExpression::new(
-                    ColumnBinding::new(20, 0),
-                    LogicalType::BigInt,
-                ))],
+                vec![Expression::ColumnRef(
+                    ColumnRefExpression::new(ColumnBinding::new(20, 0), LogicalType::BigInt).into(),
+                )],
             )),
         );
 
@@ -1442,10 +1452,10 @@ mod tests {
             LogicalOperator::Projection(Projection::new(
                 7,
                 OwnedLogicalPlan::new(&bind_context, LogicalOperator::DummyScan),
-                vec![Expression::Constant(ConstantExpression::new(
-                    Value::Varchar("R".to_string()),
-                    LogicalType::Varchar,
-                ))],
+                vec![Expression::Constant(
+                    ConstantExpression::new(Value::Varchar("R".to_string()), LogicalType::Varchar)
+                        .into(),
+                )],
             )),
         );
         let aggregate = OwnedLogicalPlan::new(
@@ -1455,10 +1465,9 @@ mod tests {
                 21,
                 22,
                 input,
-                vec![Expression::ColumnRef(ColumnRefExpression::new(
-                    ColumnBinding::new(7, 0),
-                    LogicalType::Varchar,
-                ))],
+                vec![Expression::ColumnRef(
+                    ColumnRefExpression::new(ColumnBinding::new(7, 0), LogicalType::Varchar).into(),
+                )],
                 vec![paro_planner::binder::ir::GroupingSet {
                     expressions: vec![0],
                 }],
@@ -1510,10 +1519,9 @@ mod tests {
         let ntile = WindowFunction::ntile();
         let ntile = WindowExpression::native(
             ntile.clone(),
-            vec![Expression::Constant(ConstantExpression::new(
-                Value::BigInt(4),
-                LogicalType::BigInt,
-            ))],
+            vec![Expression::Constant(
+                ConstantExpression::new(Value::BigInt(4), LogicalType::BigInt).into(),
+            )],
             Vec::new(),
             Vec::new(),
             WindowFrame::get_default_frame(&ntile),

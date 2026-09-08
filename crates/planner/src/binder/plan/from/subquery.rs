@@ -24,14 +24,17 @@ impl Binder {
                 .iter()
                 .enumerate()
                 .map(|(i, binding)| {
-                    Expression::ColumnRef(ColumnRefExpression::new(
-                        *binding,
-                        sub_ref
-                            .column_types
-                            .get(i)
-                            .cloned()
-                            .unwrap_or(paro_common::types::LogicalType::Unknown),
-                    ))
+                    Expression::ColumnRef(
+                        ColumnRefExpression::new(
+                            *binding,
+                            sub_ref
+                                .column_types
+                                .get(i)
+                                .cloned()
+                                .unwrap_or(paro_common::types::LogicalType::Unknown),
+                        )
+                        .into(),
+                    )
                 })
                 .collect();
 

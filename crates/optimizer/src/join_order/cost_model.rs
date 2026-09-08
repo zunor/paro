@@ -797,14 +797,17 @@ mod tests {
         table_index: usize,
         column_index: usize,
     ) -> paro_planner::expression::Expression {
-        paro_planner::expression::Expression::ColumnRef(ColumnRefExpression {
-            binding: paro_planner::operator::ColumnBinding {
-                table_index,
-                column_index,
-            },
-            depth: 0,
-            return_type: LogicalType::Integer,
-        })
+        paro_planner::expression::Expression::ColumnRef(
+            ColumnRefExpression {
+                binding: paro_planner::operator::ColumnBinding {
+                    table_index,
+                    column_index,
+                },
+                depth: 0,
+                return_type: LogicalType::Integer,
+            }
+            .into(),
+        )
     }
 
     fn create_equality_filter(
@@ -835,11 +838,14 @@ mod tests {
         filter_index: usize,
         comparison_type: ComparisonType,
     ) -> Arc<FilterInfo> {
-        let expr = paro_planner::expression::Expression::Comparison(ComparisonExpression {
-            left: Box::new(create_column_ref(left_table, left_col)),
-            right: Box::new(create_column_ref(right_table, right_col)),
-            comparison_type,
-        });
+        let expr = paro_planner::expression::Expression::Comparison(
+            ComparisonExpression {
+                left: Box::new(create_column_ref(left_table, left_col)),
+                right: Box::new(create_column_ref(right_table, right_col)),
+                comparison_type,
+            }
+            .into(),
+        );
 
         let set = set_manager.get_relation_from_vec(vec![left_table, right_table]);
         let left_set = set_manager.get_relation(left_table);
@@ -864,11 +870,14 @@ mod tests {
         join_type: JoinType,
     ) -> Arc<FilterInfo> {
         assert!(matches!(join_type, JoinType::Semi | JoinType::Anti));
-        let expr = paro_planner::expression::Expression::Comparison(ComparisonExpression {
-            left: Box::new(create_column_ref(preserved_table, preserved_col)),
-            right: Box::new(create_column_ref(filtering_table, filtering_col)),
-            comparison_type: ComparisonType::Equal,
-        });
+        let expr = paro_planner::expression::Expression::Comparison(
+            ComparisonExpression {
+                left: Box::new(create_column_ref(preserved_table, preserved_col)),
+                right: Box::new(create_column_ref(filtering_table, filtering_col)),
+                comparison_type: ComparisonType::Equal,
+            }
+            .into(),
+        );
         let set = set_manager.get_relation_from_vec(vec![preserved_table, filtering_table]);
         let preserved_set = set_manager.get_relation(preserved_table);
         let filtering_set = set_manager.get_relation(filtering_table);
@@ -1673,11 +1682,14 @@ mod tests {
         let right_set = sets.get_relation(1);
         let full_set = sets.union(&left_set, &right_set);
         let residual = Arc::new(FilterInfo::new_inner(
-            Expression::Operator(OperatorExpression::new(
-                OperatorType::Coalesce,
-                vec![create_column_ref(0, 0), create_column_ref(1, 0)],
-                LogicalType::Boolean,
-            )),
+            Expression::Operator(
+                OperatorExpression::new(
+                    OperatorType::Coalesce,
+                    vec![create_column_ref(0, 0), create_column_ref(1, 0)],
+                    LogicalType::Boolean,
+                )
+                .into(),
+            ),
             full_set,
             0,
         ));

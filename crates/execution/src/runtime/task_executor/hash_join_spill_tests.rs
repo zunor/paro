@@ -4,17 +4,15 @@
 use super::*;
 
 fn null_int_constant() -> Expression {
-    Expression::Constant(ConstantExpression::new(
-        Value::Null(LogicalType::Integer),
-        LogicalType::Integer,
-    ))
+    Expression::Constant(
+        ConstantExpression::new(Value::Null(LogicalType::Integer), LogicalType::Integer).into(),
+    )
 }
 
 fn varchar_constant(value: &str) -> Expression {
-    Expression::Constant(ConstantExpression::new(
-        Value::Varchar(value.to_string()),
-        LogicalType::Varchar,
-    ))
+    Expression::Constant(
+        ConstantExpression::new(Value::Varchar(value.to_string()), LogicalType::Varchar).into(),
+    )
 }
 
 #[test]

@@ -229,10 +229,13 @@ mod tests {
             ctx,
             LogicalOperator::ExpressionGet(ExpressionGet::new(
                 table_index,
-                vec![vec![Expression::ColumnRef(ColumnRefExpression::new(
-                    ColumnBinding::new(table_index, 0),
-                    LogicalType::Integer,
-                ))]],
+                vec![vec![Expression::ColumnRef(
+                    ColumnRefExpression::new(
+                        ColumnBinding::new(table_index, 0),
+                        LogicalType::Integer,
+                    )
+                    .into(),
+                )]],
                 vec!["v".to_string()],
                 vec![LogicalType::Integer],
             )),
@@ -253,10 +256,9 @@ mod tests {
             &ctx,
             LogicalOperator::ExpressionGet(ExpressionGet::new(
                 0,
-                vec![vec![Expression::ColumnRef(ColumnRefExpression::new(
-                    ColumnBinding::new(0, 0),
-                    LogicalType::Integer,
-                ))]],
+                vec![vec![Expression::ColumnRef(
+                    ColumnRefExpression::new(ColumnBinding::new(0, 0), LogicalType::Integer).into(),
+                )]],
                 vec!["v".to_string()],
                 vec![LogicalType::Integer],
             )),
@@ -267,21 +269,18 @@ mod tests {
             left,
             right,
             vec![JoinCondition::new(
-                Expression::ColumnRef(ColumnRefExpression::new(
-                    ColumnBinding::new(0, 0),
-                    LogicalType::Integer,
-                )),
-                Expression::ColumnRef(ColumnRefExpression::new(
-                    ColumnBinding::new(1, 0),
-                    LogicalType::Integer,
-                )),
+                Expression::ColumnRef(
+                    ColumnRefExpression::new(ColumnBinding::new(0, 0), LogicalType::Integer).into(),
+                ),
+                Expression::ColumnRef(
+                    ColumnRefExpression::new(ColumnBinding::new(1, 0), LogicalType::Integer).into(),
+                ),
                 JoinComparisonType::Equal,
             )],
         );
-        join.duplicate_eliminated_columns = vec![Expression::ColumnRef(ColumnRefExpression::new(
-            ColumnBinding::new(0, 0),
-            LogicalType::Integer,
-        ))];
+        join.duplicate_eliminated_columns = vec![Expression::ColumnRef(
+            ColumnRefExpression::new(ColumnBinding::new(0, 0), LogicalType::Integer).into(),
+        )];
 
         let result = EmptyResultPullup::new().optimize_plan(OwnedLogicalPlan::synthetic(
             LogicalOperator::Join(Join::Comparison(join)),
@@ -297,10 +296,9 @@ mod tests {
             &ctx,
             LogicalOperator::ExpressionGet(ExpressionGet::new(
                 1,
-                vec![vec![Expression::ColumnRef(ColumnRefExpression::new(
-                    ColumnBinding::new(1, 0),
-                    LogicalType::Integer,
-                ))]],
+                vec![vec![Expression::ColumnRef(
+                    ColumnRefExpression::new(ColumnBinding::new(1, 0), LogicalType::Integer).into(),
+                )]],
                 vec!["v".to_string()],
                 vec![LogicalType::Integer],
             )),
@@ -310,21 +308,18 @@ mod tests {
             left,
             right,
             vec![JoinCondition::new(
-                Expression::ColumnRef(ColumnRefExpression::new(
-                    ColumnBinding::new(0, 0),
-                    LogicalType::Integer,
-                )),
-                Expression::ColumnRef(ColumnRefExpression::new(
-                    ColumnBinding::new(1, 0),
-                    LogicalType::Integer,
-                )),
+                Expression::ColumnRef(
+                    ColumnRefExpression::new(ColumnBinding::new(0, 0), LogicalType::Integer).into(),
+                ),
+                Expression::ColumnRef(
+                    ColumnRefExpression::new(ColumnBinding::new(1, 0), LogicalType::Integer).into(),
+                ),
                 JoinComparisonType::Equal,
             )],
         );
-        join.duplicate_eliminated_columns = vec![Expression::ColumnRef(ColumnRefExpression::new(
-            ColumnBinding::new(0, 0),
-            LogicalType::Integer,
-        ))];
+        join.duplicate_eliminated_columns = vec![Expression::ColumnRef(
+            ColumnRefExpression::new(ColumnBinding::new(0, 0), LogicalType::Integer).into(),
+        )];
 
         let result = EmptyResultPullup::new().optimize_plan(OwnedLogicalPlan::synthetic(
             LogicalOperator::Join(Join::Comparison(join)),

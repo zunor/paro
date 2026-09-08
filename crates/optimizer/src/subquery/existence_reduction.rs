@@ -299,10 +299,9 @@ mod tests {
             ctx,
             LogicalOperator::ExpressionGet(ExpressionGet::new(
                 table,
-                vec![vec![Expression::Constant(ConstantExpression::new(
-                    Value::Integer(1),
-                    LogicalType::Integer,
-                ))]],
+                vec![vec![Expression::Constant(
+                    ConstantExpression::new(Value::Integer(1), LogicalType::Integer).into(),
+                )]],
                 vec!["k".into()],
                 vec![LogicalType::Integer],
             )),
@@ -310,10 +309,9 @@ mod tests {
     }
 
     fn column(table: usize) -> Expression {
-        Expression::ColumnRef(ColumnRefExpression::new(
-            ColumnBinding::new(table, 0),
-            LogicalType::Integer,
-        ))
+        Expression::ColumnRef(
+            ColumnRefExpression::new(ColumnBinding::new(table, 0), LogicalType::Integer).into(),
+        )
     }
 
     fn equality(left: usize, right: usize) -> JoinCondition {

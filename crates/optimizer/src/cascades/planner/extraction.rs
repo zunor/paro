@@ -490,10 +490,9 @@ pub(super) fn extract_physical_enforcer(
                     )
                 })?;
                 orders.push(OrderByNode {
-                    expression: Expression::Reference(ReferenceExpression::new(
-                        index,
-                        logical_type,
-                    )),
+                    expression: Expression::Reference(
+                        ReferenceExpression::new(index, logical_type).into(),
+                    ),
                     ascending: key.direction == SortDirection::Asc,
                     nulls_first: key.nulls == NullOrder::First,
                 });
@@ -605,10 +604,9 @@ pub(super) fn enforce_result_presentation(
             let logical_type = child_types.get(ordinal).cloned().ok_or_else(|| {
                 paro_error::internal("result presentation column lost its physical type")
             })?;
-            Ok(Expression::Reference(ReferenceExpression::new(
-                ordinal,
-                logical_type,
-            )))
+            Ok(Expression::Reference(
+                ReferenceExpression::new(ordinal, logical_type).into(),
+            ))
         })
         .collect::<Result<Vec<_>>>()?;
     let child_id = child.id;

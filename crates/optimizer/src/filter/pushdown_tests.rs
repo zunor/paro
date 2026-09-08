@@ -25,21 +25,27 @@ fn plan(ctx: &BindContext, op: LogicalOperator) -> OwnedLogicalPlan {
 }
 
 fn make_column_ref(table_index: usize, column_index: usize) -> Expression {
-    Expression::ColumnRef(ColumnRefExpression {
-        binding: paro_planner::operator::ColumnBinding {
-            table_index,
-            column_index,
-        },
-        depth: 0,
-        return_type: LogicalType::Integer,
-    })
+    Expression::ColumnRef(
+        ColumnRefExpression {
+            binding: paro_planner::operator::ColumnBinding {
+                table_index,
+                column_index,
+            },
+            depth: 0,
+            return_type: LogicalType::Integer,
+        }
+        .into(),
+    )
 }
 
 fn make_constant(value: i32) -> Expression {
-    Expression::Constant(ConstantExpression {
-        value: paro_common::runtime_value::Value::Integer(value),
-        return_type: LogicalType::Integer,
-    })
+    Expression::Constant(
+        ConstantExpression {
+            value: paro_common::runtime_value::Value::Integer(value),
+            return_type: LogicalType::Integer,
+        }
+        .into(),
+    )
 }
 
 fn noop_scalar_execute(
@@ -64,7 +70,7 @@ fn external_call() -> Expression {
         .expect("builtin routine metadata")
         .boundary
         .placement = PlacementClass::External;
-    Expression::Function(Box::new(expression))
+    Expression::Function(expression.into())
 }
 
 fn volatile_call() -> Expression {
@@ -75,32 +81,31 @@ fn volatile_call() -> Expression {
         noop_scalar_execute,
     )
     .with_stability(FunctionStability::Volatile);
-    Expression::Function(Box::new(FunctionExpression::new(
-        function,
-        vec![],
-        LogicalType::Integer,
-    )))
+    Expression::Function(FunctionExpression::new(function, vec![], LogicalType::Integer).into())
 }
 
 fn window_with_start_offset(offset: Expression) -> Expression {
-    Expression::Window(Box::new(WindowExpression::native(
-        paro_function::window::WindowFunction::row_number(),
-        vec![],
-        vec![],
-        vec![],
-        WindowFrame {
-            frame_type: WindowFrameType::Rows,
-            start_bound: WindowFrameBound::Offset(Box::new(offset)),
-            start_is_preceding: true,
-            end_bound: WindowFrameBound::CurrentRow,
-            end_is_preceding: false,
-        },
-        false,
-    )))
+    Expression::Window(
+        WindowExpression::native(
+            paro_function::window::WindowFunction::row_number(),
+            vec![],
+            vec![],
+            vec![],
+            WindowFrame {
+                frame_type: WindowFrameType::Rows,
+                start_bound: WindowFrameBound::Offset(Box::new(offset)),
+                start_is_preceding: true,
+                end_bound: WindowFrameBound::CurrentRow,
+                end_is_preceding: false,
+            },
+            false,
+        )
+        .into(),
+    )
 }
 
 fn make_comparison(comp_type: ComparisonType, left: Expression, right: Expression) -> Expression {
-    Expression::Comparison(ComparisonExpression::new(comp_type, left, right))
+    Expression::Comparison(ComparisonExpression::new(comp_type, left, right).into())
 }
 
 fn make_get(table_index: usize) -> LogicalOperator {
@@ -122,10 +127,9 @@ fn make_delim_join(ctx: &BindContext, join_type: JoinType) -> LogicalOperator {
         ),
         vec![JoinCondition::new(
             make_column_ref(1, 0),
-            Expression::ColumnRef(ColumnRefExpression::new(
-                ColumnBinding::new(99, 0),
-                LogicalType::Integer,
-            )),
+            Expression::ColumnRef(
+                ColumnRefExpression::new(ColumnBinding::new(99, 0), LogicalType::Integer).into(),
+            ),
             JoinComparisonType::Equal,
         )],
     )));
@@ -561,26 +565,28 @@ fn test_or_join_filter_derives_domains_for_both_inputs() {
     let ctx = BindContext::new();
     let cross = CrossProduct::new(plan(&ctx, make_get(0)), plan(&ctx, make_get(1)));
     let branch = |left_value, right_value| {
-        Expression::Conjunction(ConjunctionExpression::new(
-            ConjunctionType::And,
-            vec![
-                make_comparison(
-                    ComparisonType::Equal,
-                    make_column_ref(0, 0),
-                    make_constant(left_value),
-                ),
-                make_comparison(
-                    ComparisonType::Equal,
-                    make_column_ref(1, 0),
-                    make_constant(right_value),
-                ),
-            ],
-        ))
+        Expression::Conjunction(
+            ConjunctionExpression::new(
+                ConjunctionType::And,
+                vec![
+                    make_comparison(
+                        ComparisonType::Equal,
+                        make_column_ref(0, 0),
+                        make_constant(left_value),
+                    ),
+                    make_comparison(
+                        ComparisonType::Equal,
+                        make_column_ref(1, 0),
+                        make_constant(right_value),
+                    ),
+                ],
+            )
+            .into(),
+        )
     };
-    let predicate = Expression::Conjunction(ConjunctionExpression::new(
-        ConjunctionType::Or,
-        vec![branch(1, 2), branch(2, 1)],
-    ));
+    let predicate = Expression::Conjunction(
+        ConjunctionExpression::new(ConjunctionType::Or, vec![branch(1, 2), branch(2, 1)]).into(),
+    );
     let filter = PlannerFilter::new(
         plan(&ctx, LogicalOperator::Join(Join::Cross(cross))),
         vec![predicate],
@@ -635,10 +641,9 @@ fn positive_mark_filter_lowers_mark_join_to_semi_join() {
     );
     let mark_index = 90;
     join.mark_index = Some(mark_index);
-    let marker = Expression::ColumnRef(ColumnRefExpression::new(
-        ColumnBinding::new(mark_index, 0),
-        LogicalType::Boolean,
-    ));
+    let marker = Expression::ColumnRef(
+        ColumnRefExpression::new(ColumnBinding::new(mark_index, 0), LogicalType::Boolean).into(),
+    );
     let left_predicate = make_comparison(
         ComparisonType::Equal,
         make_column_ref(0, 0),
@@ -694,15 +699,18 @@ fn compound_marker_predicate_stays_above_the_join_that_produces_it() {
         }
 
         let marker = |table_index| {
-            Expression::ColumnRef(ColumnRefExpression::new(
-                ColumnBinding::new(table_index, 0),
-                LogicalType::Boolean,
-            ))
+            Expression::ColumnRef(
+                ColumnRefExpression::new(ColumnBinding::new(table_index, 0), LogicalType::Boolean)
+                    .into(),
+            )
         };
-        let predicate = Expression::Conjunction(ConjunctionExpression::new(
-            ConjunctionType::Or,
-            vec![marker(inner_mark_index), marker(outer_mark_index)],
-        ));
+        let predicate = Expression::Conjunction(
+            ConjunctionExpression::new(
+                ConjunctionType::Or,
+                vec![marker(inner_mark_index), marker(outer_mark_index)],
+            )
+            .into(),
+        );
         let filter = PlannerFilter::new(
             plan(&ctx, LogicalOperator::Join(Join::Comparison(outer))),
             vec![predicate],
@@ -742,15 +750,12 @@ fn negative_scalar_mark_filter_lowers_to_null_aware_anti_join() {
     );
     let mark_index = 90;
     join.mark_index = Some(mark_index);
-    let marker = Expression::ColumnRef(ColumnRefExpression::new(
-        ColumnBinding::new(mark_index, 0),
-        LogicalType::Boolean,
-    ));
-    let not_marker = Expression::Operator(OperatorExpression::new_unary(
-        OperatorType::Not,
-        marker,
-        LogicalType::Boolean,
-    ));
+    let marker = Expression::ColumnRef(
+        ColumnRefExpression::new(ColumnBinding::new(mark_index, 0), LogicalType::Boolean).into(),
+    );
+    let not_marker = Expression::Operator(
+        OperatorExpression::new_unary(OperatorType::Not, marker, LogicalType::Boolean).into(),
+    );
     let filter = PlannerFilter::new(
         plan(&ctx, LogicalOperator::Join(Join::Comparison(join))),
         vec![not_marker],
@@ -805,15 +810,12 @@ fn negative_marker_with_null_safe_condition_remains_mark_join() {
     );
     let mark_index = 90;
     join.mark_index = Some(mark_index);
-    let marker = Expression::ColumnRef(ColumnRefExpression::new(
-        ColumnBinding::new(mark_index, 0),
-        LogicalType::Boolean,
-    ));
-    let not_marker = Expression::Operator(OperatorExpression::new_unary(
-        OperatorType::Not,
-        marker,
-        LogicalType::Boolean,
-    ));
+    let marker = Expression::ColumnRef(
+        ColumnRefExpression::new(ColumnBinding::new(mark_index, 0), LogicalType::Boolean).into(),
+    );
+    let not_marker = Expression::Operator(
+        OperatorExpression::new_unary(OperatorType::Not, marker, LogicalType::Boolean).into(),
+    );
     let filter = PlannerFilter::new(
         plan(&ctx, LogicalOperator::Join(Join::Comparison(join))),
         vec![not_marker],
@@ -846,18 +848,23 @@ fn marker_equals_true_lowers_mark_join_to_semi_join() {
     );
     let mark_index = 90;
     join.mark_index = Some(mark_index);
-    let marker = Expression::ColumnRef(ColumnRefExpression::new(
-        ColumnBinding::new(mark_index, 0),
-        LogicalType::Boolean,
-    ));
-    let marker_equals_true = Expression::Comparison(ComparisonExpression::new(
-        ComparisonType::Equal,
-        marker,
-        Expression::Constant(ConstantExpression::new(
-            paro_common::runtime_value::Value::Boolean(true),
-            LogicalType::Boolean,
-        )),
-    ));
+    let marker = Expression::ColumnRef(
+        ColumnRefExpression::new(ColumnBinding::new(mark_index, 0), LogicalType::Boolean).into(),
+    );
+    let marker_equals_true = Expression::Comparison(
+        ComparisonExpression::new(
+            ComparisonType::Equal,
+            marker,
+            Expression::Constant(
+                ConstantExpression::new(
+                    paro_common::runtime_value::Value::Boolean(true),
+                    LogicalType::Boolean,
+                )
+                .into(),
+            ),
+        )
+        .into(),
+    );
     let filter = PlannerFilter::new(
         plan(&ctx, LogicalOperator::Join(Join::Comparison(join))),
         vec![marker_equals_true],
@@ -978,10 +985,9 @@ fn single_delim_join_keeps_right_output_predicate_above_row_preserving_boundary(
         ),
         vec![JoinCondition::new(
             make_column_ref(1, 0),
-            Expression::ColumnRef(ColumnRefExpression::new(
-                ColumnBinding::new(99, 0),
-                LogicalType::Integer,
-            )),
+            Expression::ColumnRef(
+                ColumnRefExpression::new(ColumnBinding::new(99, 0), LogicalType::Integer).into(),
+            ),
             JoinComparisonType::Equal,
         )],
     )));
@@ -1030,10 +1036,13 @@ fn test_split_predicates() {
         make_column_ref(0, 1),
         make_constant(10),
     );
-    let and_expr = Expression::Conjunction(ConjunctionExpression {
-        conjunction_type: ConjunctionType::And,
-        children: vec![left, right],
-    });
+    let and_expr = Expression::Conjunction(
+        ConjunctionExpression {
+            conjunction_type: ConjunctionType::And,
+            children: vec![left, right],
+        }
+        .into(),
+    );
 
     let predicates = FilterPushdown::split_predicates(and_expr);
     assert_eq!(predicates.len(), 2);

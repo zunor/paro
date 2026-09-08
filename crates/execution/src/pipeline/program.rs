@@ -1021,8 +1021,8 @@ mod tests {
 
     fn join_condition() -> JoinCondition {
         JoinCondition::equality(
-            Expression::Reference(ReferenceExpression::new(0, LogicalType::Integer)),
-            Expression::Reference(ReferenceExpression::new(0, LogicalType::Integer)),
+            Expression::Reference(ReferenceExpression::new(0, LogicalType::Integer).into()),
+            Expression::Reference(ReferenceExpression::new(0, LogicalType::Integer).into()),
         )
     }
 
@@ -1053,7 +1053,9 @@ mod tests {
 
     fn order_by_first_column() -> paro_planner::binder::ir::OrderByNode {
         paro_planner::binder::ir::OrderByNode {
-            expression: Expression::Reference(ReferenceExpression::new(0, LogicalType::Integer)),
+            expression: Expression::Reference(
+                ReferenceExpression::new(0, LogicalType::Integer).into(),
+            ),
             ascending: true,
             nulls_first: false,
         }
@@ -1196,18 +1198,16 @@ mod tests {
                     projection_map: Box::new([0]),
                 }),
                 TransformSpec::Project(ProjectSpec {
-                    expressions: Box::new([Expression::Reference(ReferenceExpression::new(
-                        0,
-                        LogicalType::Integer,
-                    ))]),
+                    expressions: Box::new([Expression::Reference(
+                        ReferenceExpression::new(0, LogicalType::Integer).into(),
+                    )]),
                     output_names: Box::new(["a".to_string()]),
                     visible_count: 1,
                 }),
                 TransformSpec::Limit(LimitSpec {
-                    limit: Some(Expression::Constant(ConstantExpression::new(
-                        Value::Integer(10),
-                        LogicalType::Integer,
-                    ))),
+                    limit: Some(Expression::Constant(
+                        ConstantExpression::new(Value::Integer(10), LogicalType::Integer).into(),
+                    )),
                     offset: None,
                     hnsw_options: Default::default(),
                 }),

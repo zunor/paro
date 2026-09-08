@@ -28,10 +28,9 @@ fn lower_full_partition_window(function: AggregateFunction) -> PhysicalPlan {
     let return_type = function.return_type.clone();
     let aggregate = AggregateExpression::new(
         function,
-        vec![Expression::Reference(ReferenceExpression::new(
-            1,
-            LogicalType::Integer,
-        ))],
+        vec![Expression::Reference(
+            ReferenceExpression::new(1, LogicalType::Integer).into(),
+        )],
         return_type,
     );
     let window = OwnedLogicalPlan::new(
@@ -40,10 +39,9 @@ fn lower_full_partition_window(function: AggregateFunction) -> PhysicalPlan {
             2,
             vec![WindowExpression::aggregate(
                 aggregate,
-                vec![Expression::Reference(ReferenceExpression::new(
-                    0,
-                    LogicalType::Integer,
-                ))],
+                vec![Expression::Reference(
+                    ReferenceExpression::new(0, LogicalType::Integer).into(),
+                )],
                 Vec::new(),
                 WindowFrame::default(),
             )],

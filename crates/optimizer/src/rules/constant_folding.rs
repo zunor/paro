@@ -64,10 +64,9 @@ impl Rule for ConstantFoldingRule {
         // expression remains the authoritative source of the logical type;
         // deriving it from the materialized value would erase that domain.
         let return_type = expr.return_type();
-        RuleResult::Changed(Box::new(Expression::Constant(ConstantExpression {
-            value,
-            return_type,
-        })))
+        RuleResult::Changed(Box::new(Expression::Constant(
+            ConstantExpression { value, return_type }.into(),
+        )))
     }
 
     fn name(&self) -> &'static str {
@@ -86,7 +85,7 @@ mod tests {
 
     fn constant(value: Value) -> Expression {
         let return_type = value.logical_type();
-        Expression::Constant(ConstantExpression { value, return_type })
+        Expression::Constant(ConstantExpression { value, return_type }.into())
     }
 
     #[test]
@@ -95,22 +94,28 @@ mod tests {
         let literal = constant(Value::Integer(42));
         assert!(!matcher.matches(&literal, &mut Vec::new()));
 
-        let comparison = Expression::Comparison(ComparisonExpression::new(
-            ComparisonType::Equal,
-            constant(Value::Integer(1)),
-            constant(Value::Integer(2)),
-        ));
+        let comparison = Expression::Comparison(
+            ComparisonExpression::new(
+                ComparisonType::Equal,
+                constant(Value::Integer(1)),
+                constant(Value::Integer(2)),
+            )
+            .into(),
+        );
         assert!(matcher.matches(&comparison, &mut Vec::new()));
     }
 
     #[test]
     fn rule_folds_comparison_with_sql_null_semantics() {
         let rule = ConstantFoldingRule::new();
-        let comparison = Expression::Comparison(ComparisonExpression::new(
-            ComparisonType::Equal,
-            constant(Value::Integer(1)),
-            constant(Value::Integer(1)),
-        ));
+        let comparison = Expression::Comparison(
+            ComparisonExpression::new(
+                ComparisonType::Equal,
+                constant(Value::Integer(1)),
+                constant(Value::Integer(1)),
+            )
+            .into(),
+        );
         let mut bindings = Vec::new();
         assert!(rule.matcher().matches(&comparison, &mut bindings));
         let RuleResult::Changed(result) = rule.apply(&LogicalOperator::DummyScan, bindings, false)
@@ -122,11 +127,14 @@ mod tests {
         };
         assert_eq!(result.value, Value::Boolean(true));
 
-        let null_comparison = Expression::Comparison(ComparisonExpression::new(
-            ComparisonType::Equal,
-            constant(Value::Integer(1)),
-            constant(Value::Null(LogicalType::Integer)),
-        ));
+        let null_comparison = Expression::Comparison(
+            ComparisonExpression::new(
+                ComparisonType::Equal,
+                constant(Value::Integer(1)),
+                constant(Value::Null(LogicalType::Integer)),
+            )
+            .into(),
+        );
         assert!(matches!(
             evaluate_constant(&null_comparison),
             Some(Value::Null(LogicalType::Boolean))
@@ -136,14 +144,20 @@ mod tests {
     #[test]
     fn folded_constant_preserves_the_bound_logical_domain() {
         let rule = ConstantFoldingRule::new();
-        let expression = Expression::Operator(paro_planner::expression::OperatorExpression::new(
-            paro_planner::expression::OperatorType::Coalesce,
-            vec![Expression::Constant(ConstantExpression {
-                value: Value::Varchar("{}".to_string()),
-                return_type: LogicalType::Json,
-            })],
-            LogicalType::Json,
-        ));
+        let expression = Expression::Operator(
+            paro_planner::expression::OperatorExpression::new(
+                paro_planner::expression::OperatorType::Coalesce,
+                vec![Expression::Constant(
+                    ConstantExpression {
+                        value: Value::Varchar("{}".to_string()),
+                        return_type: LogicalType::Json,
+                    }
+                    .into(),
+                )],
+                LogicalType::Json,
+            )
+            .into(),
+        );
         let mut bindings = Vec::new();
         assert!(rule.matcher().matches(&expression, &mut bindings));
         let RuleResult::Changed(result) = rule.apply(&LogicalOperator::DummyScan, bindings, false)
@@ -155,13 +169,16 @@ mod tests {
 
     #[test]
     fn rule_folds_boolean_conjunction() {
-        let expression = Expression::Conjunction(ConjunctionExpression {
-            conjunction_type: ConjunctionType::And,
-            children: vec![
-                constant(Value::Boolean(true)),
-                constant(Value::Boolean(false)),
-            ],
-        });
+        let expression = Expression::Conjunction(
+            ConjunctionExpression {
+                conjunction_type: ConjunctionType::And,
+                children: vec![
+                    constant(Value::Boolean(true)),
+                    constant(Value::Boolean(false)),
+                ],
+            }
+            .into(),
+        );
         assert_eq!(evaluate_constant(&expression), Some(Value::Boolean(false)));
     }
 

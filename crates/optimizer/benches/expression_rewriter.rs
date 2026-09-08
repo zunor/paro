@@ -55,14 +55,16 @@ impl Rule for NoChangeRule {
 
 fn nested_conjunction(depth: usize) -> Expression {
     if depth == 0 {
-        return Expression::Constant(ConstantExpression::new(
-            Value::Boolean(true),
-            LogicalType::Boolean,
-        ));
+        return Expression::Constant(
+            ConstantExpression::new(Value::Boolean(true), LogicalType::Boolean).into(),
+        );
     }
 
-    Expression::Conjunction(ConjunctionExpression::new(
-        ConjunctionType::And,
-        vec![nested_conjunction(depth - 1), nested_conjunction(depth - 1)],
-    ))
+    Expression::Conjunction(
+        ConjunctionExpression::new(
+            ConjunctionType::And,
+            vec![nested_conjunction(depth - 1), nested_conjunction(depth - 1)],
+        )
+        .into(),
+    )
 }

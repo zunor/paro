@@ -324,10 +324,13 @@ impl OrderByBinding {
         use crate::expression::ColumnRefExpression;
         use crate::operator::ColumnBinding;
 
-        crate::expression::Expression::ColumnRef(ColumnRefExpression::new(
-            ColumnBinding::new(projection_table_index, self.index),
-            return_type,
-        ))
+        crate::expression::Expression::ColumnRef(
+            ColumnRefExpression::new(
+                ColumnBinding::new(projection_table_index, self.index),
+                return_type,
+            )
+            .into(),
+        )
     }
 }
 

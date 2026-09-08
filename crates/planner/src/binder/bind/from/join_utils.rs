@@ -42,7 +42,7 @@ pub fn split_conjunction(expr: Expression) -> Vec<Expression> {
     match expr {
         Expression::Conjunction(conj) if conj.conjunction_type == ConjunctionType::And => {
             let mut result = Vec::new();
-            for child in conj.children {
+            for child in conj.into_inner().children {
                 result.extend(split_conjunction(child));
             }
             result
@@ -153,10 +153,13 @@ pub fn create_join_operator(
 
     if conditions.is_empty() {
         let condition = if arbitrary_expressions.is_empty() {
-            Expression::Constant(ConstantExpression {
-                value: Value::Boolean(true),
-                return_type: LogicalType::Boolean,
-            })
+            Expression::Constant(
+                ConstantExpression {
+                    value: Value::Boolean(true),
+                    return_type: LogicalType::Boolean,
+                }
+                .into(),
+            )
         } else {
             combine_expressions_with_and(arbitrary_expressions)
         };
@@ -224,7 +227,7 @@ fn join_condition_to_expression(cond: JoinCondition) -> Expression {
         JoinComparisonType::DistinctFrom => ComparisonType::DistinctFrom,
     };
 
-    Expression::Comparison(ComparisonExpression::new(comp_type, cond.left, cond.right))
+    Expression::Comparison(ComparisonExpression::new(comp_type, cond.left, cond.right).into())
 }
 
 fn combine_expressions_with_and(mut expressions: Vec<Expression>) -> Expression {
@@ -232,10 +235,13 @@ fn combine_expressions_with_and(mut expressions: Vec<Expression>) -> Expression 
         return expressions.pop().unwrap();
     }
 
-    Expression::Conjunction(ConjunctionExpression {
-        conjunction_type: ConjunctionType::And,
-        children: expressions,
-    })
+    Expression::Conjunction(
+        ConjunctionExpression {
+            conjunction_type: ConjunctionType::And,
+            children: expressions,
+        }
+        .into(),
+    )
 }
 
 #[cfg(test)]
@@ -253,19 +259,20 @@ mod tests {
     use paro_function::window::WindowFunction;
 
     fn col(table_index: usize, column_index: usize) -> Expression {
-        Expression::ColumnRef(ColumnRefExpression::new(
-            ColumnBinding::new(table_index, column_index),
-            LogicalType::Integer,
-        ))
+        Expression::ColumnRef(
+            ColumnRefExpression::new(
+                ColumnBinding::new(table_index, column_index),
+                LogicalType::Integer,
+            )
+            .into(),
+        )
     }
 
     #[test]
     fn extract_join_condition_keeps_left_and_right_operands_in_child_order() {
-        let expr = Expression::Comparison(ComparisonExpression::new(
-            ComparisonType::Equal,
-            col(6, 0),
-            col(7, 0),
-        ));
+        let expr = Expression::Comparison(
+            ComparisonExpression::new(ComparisonType::Equal, col(6, 0), col(7, 0)).into(),
+        );
         let left_bindings = HashSet::from([6]);
         let right_bindings = HashSet::from([7]);
         let mut conditions = Vec::new();
@@ -294,20 +301,23 @@ mod tests {
 
     #[test]
     fn get_expression_side_visits_window_frame_offsets() {
-        let expression = Expression::Window(Box::new(WindowExpression::native(
-            WindowFunction::row_number(),
-            vec![],
-            vec![],
-            vec![],
-            WindowFrame {
-                frame_type: WindowFrameType::Rows,
-                start_bound: WindowFrameBound::Offset(Box::new(col(7, 0))),
-                start_is_preceding: true,
-                end_bound: WindowFrameBound::CurrentRow,
-                end_is_preceding: false,
-            },
-            false,
-        )));
+        let expression = Expression::Window(
+            WindowExpression::native(
+                WindowFunction::row_number(),
+                vec![],
+                vec![],
+                vec![],
+                WindowFrame {
+                    frame_type: WindowFrameType::Rows,
+                    start_bound: WindowFrameBound::Offset(Box::new(col(7, 0))),
+                    start_is_preceding: true,
+                    end_bound: WindowFrameBound::CurrentRow,
+                    end_is_preceding: false,
+                },
+                false,
+            )
+            .into(),
+        );
 
         assert_eq!(
             get_expression_side(&expression, &HashSet::from([6]), &HashSet::from([7])),

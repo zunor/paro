@@ -102,21 +102,19 @@ mod tests {
     use paro_storage::table::table_factory::TableFactory;
 
     fn column(table: usize, ordinal: usize) -> Expression {
-        Expression::ColumnRef(ColumnRefExpression::new(
-            ColumnBinding::new(table, ordinal),
-            LogicalType::BigInt,
-        ))
+        Expression::ColumnRef(
+            ColumnRefExpression::new(ColumnBinding::new(table, ordinal), LogicalType::BigInt)
+                .into(),
+        )
     }
 
     fn count(input: Expression) -> Expression {
         let (function, _) = get_count_function()
             .bind(&[LogicalType::BigInt])
             .expect("bind count");
-        Expression::Aggregate(Box::new(AggregateExpression::new(
-            function,
-            vec![input],
-            LogicalType::BigInt,
-        )))
+        Expression::Aggregate(
+            AggregateExpression::new(function, vec![input], LogicalType::BigInt).into(),
+        )
     }
 
     fn candidate() -> (
@@ -181,11 +179,9 @@ mod tests {
             join,
             vec![column(1, 0)],
             vec![],
-            vec![Expression::Aggregate(Box::new(AggregateExpression::new(
-                merge,
-                vec![column(4, 0)],
-                LogicalType::BigInt,
-            )))],
+            vec![Expression::Aggregate(
+                AggregateExpression::new(merge, vec![column(4, 0)], LogicalType::BigInt).into(),
+            )],
             vec![],
         );
         let mut statistics = HashMap::new();
@@ -369,9 +365,9 @@ mod tests {
             .position(|binding| *binding == ColumnBinding::new(3, 0))
             .expect("right key");
         join.conditions[0].left =
-            Expression::Reference(ReferenceExpression::new(left_key, LogicalType::BigInt));
+            Expression::Reference(ReferenceExpression::new(left_key, LogicalType::BigInt).into());
         join.conditions[0].right =
-            Expression::Reference(ReferenceExpression::new(right_key, LogicalType::BigInt));
+            Expression::Reference(ReferenceExpression::new(right_key, LogicalType::BigInt).into());
 
         let child_bindings = aggregate.child.get_column_bindings();
         let group_key = child_bindings
@@ -383,12 +379,13 @@ mod tests {
             .position(|binding| *binding == ColumnBinding::new(4, 0))
             .expect("partial value");
         aggregate.groups[0] =
-            Expression::Reference(ReferenceExpression::new(group_key, LogicalType::BigInt));
+            Expression::Reference(ReferenceExpression::new(group_key, LogicalType::BigInt).into());
         let Expression::Aggregate(merge) = &mut aggregate.aggregates[0] else {
             panic!("merge aggregate")
         };
-        merge.children[0] =
-            Expression::Reference(ReferenceExpression::new(partial_value, LogicalType::BigInt));
+        merge.children[0] = Expression::Reference(
+            ReferenceExpression::new(partial_value, LogicalType::BigInt).into(),
+        );
 
         assert!(proof.is_valid_for(aggregate));
     }

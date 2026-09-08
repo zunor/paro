@@ -664,10 +664,13 @@ mod tests {
     use paro_planner::expression::ConstantExpression;
 
     fn create_dummy_filter(set: Arc<JoinRelationSet>, index: usize) -> Arc<FilterInfo> {
-        let expr = Expression::Constant(ConstantExpression {
-            value: Value::Boolean(true),
-            return_type: LogicalType::Boolean,
-        });
+        let expr = Expression::Constant(
+            ConstantExpression {
+                value: Value::Boolean(true),
+                return_type: LogicalType::Boolean,
+            }
+            .into(),
+        );
         Arc::new(FilterInfo::new_inner(expr, set, index))
     }
 
@@ -676,10 +679,13 @@ mod tests {
         let mut manager = JoinRelationSetManager::new();
         let set = manager.get_relation_from_vec(vec![0, 1]);
 
-        let expr = Expression::Constant(ConstantExpression {
-            value: Value::Boolean(true),
-            return_type: LogicalType::Boolean,
-        });
+        let expr = Expression::Constant(
+            ConstantExpression {
+                value: Value::Boolean(true),
+                return_type: LogicalType::Boolean,
+            }
+            .into(),
+        );
         let filter = FilterInfo::new_inner(expr, set.clone(), 0);
 
         assert_eq!(filter.filter_index, 0);
@@ -695,10 +701,13 @@ mod tests {
         let left = manager.get_relation(0);
         let right = manager.get_relation(1);
 
-        let expr = Expression::Constant(ConstantExpression {
-            value: Value::Boolean(true),
-            return_type: LogicalType::Boolean,
-        });
+        let expr = Expression::Constant(
+            ConstantExpression {
+                value: Value::Boolean(true),
+                return_type: LogicalType::Boolean,
+            }
+            .into(),
+        );
         let mut filter = FilterInfo::new(expr, set, 0, JoinType::Left, AntiJoinMode::Regular);
         filter.set_left_set(left.clone());
         filter.set_right_set(right.clone());
@@ -717,10 +726,13 @@ mod tests {
     fn reduction_join_bindings_name_preserved_and_filtering_sides() {
         let mut manager = JoinRelationSetManager::new();
         let set = manager.get_relation_from_vec(vec![0, 1]);
-        let expr = Expression::Constant(ConstantExpression {
-            value: Value::Boolean(true),
-            return_type: LogicalType::Boolean,
-        });
+        let expr = Expression::Constant(
+            ConstantExpression {
+                value: Value::Boolean(true),
+                return_type: LogicalType::Boolean,
+            }
+            .into(),
+        );
         let mut filter = FilterInfo::new(expr, set, 0, JoinType::Semi, AntiJoinMode::Regular);
         filter.set_left_set(manager.get_relation(0));
         filter.set_right_set(manager.get_relation(1));
@@ -743,10 +755,13 @@ mod tests {
         let preserved = manager.get_relation(0);
         let filtering = manager.get_relation(1);
         let joined = manager.union(&preserved, &filtering);
-        let expression = Expression::Constant(ConstantExpression {
-            value: Value::Boolean(true),
-            return_type: LogicalType::Boolean,
-        });
+        let expression = Expression::Constant(
+            ConstantExpression {
+                value: Value::Boolean(true),
+                return_type: LogicalType::Boolean,
+            }
+            .into(),
+        );
         let missing_roles = Arc::new(FilterInfo::new(
             expression.clone(),
             joined.clone(),
@@ -771,10 +786,13 @@ mod tests {
         let mut manager = JoinRelationSetManager::new();
         let joined = manager.get_relation_from_vec(vec![0, 1]);
         let missing_roles = Arc::new(FilterInfo::new(
-            Expression::Constant(ConstantExpression {
-                value: Value::Boolean(true),
-                return_type: LogicalType::Boolean,
-            }),
+            Expression::Constant(
+                ConstantExpression {
+                    value: Value::Boolean(true),
+                    return_type: LogicalType::Boolean,
+                }
+                .into(),
+            ),
             joined,
             0,
             JoinType::Anti,

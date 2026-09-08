@@ -116,14 +116,16 @@ mod tests {
         let (function, _) = get_count_function()
             .bind(&[LogicalType::BigInt])
             .expect("bind count");
-        Expression::Aggregate(Box::new(AggregateExpression::new(
-            function,
-            vec![Expression::ColumnRef(ColumnRefExpression::new(
-                binding,
+        Expression::Aggregate(
+            AggregateExpression::new(
+                function,
+                vec![Expression::ColumnRef(
+                    ColumnRefExpression::new(binding, LogicalType::BigInt).into(),
+                )],
                 LogicalType::BigInt,
-            ))],
-            LogicalType::BigInt,
-        )))
+            )
+            .into(),
+        )
     }
 
     fn scan(binding: ColumnBinding) -> OwnedLogicalPlan {
@@ -187,8 +189,12 @@ mod tests {
                 scan(left),
                 scan(right),
                 vec![JoinCondition::new(
-                    Expression::ColumnRef(ColumnRefExpression::new(left, LogicalType::BigInt)),
-                    Expression::ColumnRef(ColumnRefExpression::new(right, LogicalType::BigInt)),
+                    Expression::ColumnRef(
+                        ColumnRefExpression::new(left, LogicalType::BigInt).into(),
+                    ),
+                    Expression::ColumnRef(
+                        ColumnRefExpression::new(right, LogicalType::BigInt).into(),
+                    ),
                     JoinComparisonType::Equal,
                 )],
             ),

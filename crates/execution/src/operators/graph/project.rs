@@ -561,10 +561,13 @@ fn remap_graph_project_expression(
                 .copied()
                 .expect("graph project table mapping validated")
         };
-        Some(Expression::ColumnRef(ColumnRefExpression::new(
-            ColumnBinding::new(binding.table_index, new_index),
-            col_ref.return_type.clone(),
-        )))
+        Some(Expression::ColumnRef(
+            ColumnRefExpression::new(
+                ColumnBinding::new(binding.table_index, new_index),
+                col_ref.return_type.clone(),
+            )
+            .into(),
+        ))
     }))
 }
 

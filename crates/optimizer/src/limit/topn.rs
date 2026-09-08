@@ -231,20 +231,26 @@ mod tests {
     }
 
     fn create_constant_expr(value: i64) -> Expression {
-        Expression::Constant(ConstantExpression {
-            value: Value::BigInt(value),
-            return_type: LogicalType::BigInt,
-        })
+        Expression::Constant(
+            ConstantExpression {
+                value: Value::BigInt(value),
+                return_type: LogicalType::BigInt,
+            }
+            .into(),
+        )
     }
 
     fn create_order_by(child: LogicalOperator) -> LogicalOperator {
         LogicalOperator::Order(Order::new(
             OwnedLogicalPlan::synthetic(child),
             vec![OrderByNode {
-                expression: Expression::Constant(ConstantExpression {
-                    value: Value::Integer(1),
-                    return_type: LogicalType::Integer,
-                }),
+                expression: Expression::Constant(
+                    ConstantExpression {
+                        value: Value::Integer(1),
+                        return_type: LogicalType::Integer,
+                    }
+                    .into(),
+                ),
                 ascending: true,
                 nulls_first: false,
             }],
@@ -257,14 +263,20 @@ mod tests {
                 42,
                 OwnedLogicalPlan::synthetic(child),
                 vec![
-                    Expression::Reference(paro_planner::expression::ReferenceExpression {
-                        index: 0,
-                        return_type: LogicalType::Integer,
-                    }),
-                    Expression::Reference(paro_planner::expression::ReferenceExpression {
-                        index: 1,
-                        return_type: LogicalType::Integer,
-                    }),
+                    Expression::Reference(
+                        paro_planner::expression::ReferenceExpression {
+                            index: 0,
+                            return_type: LogicalType::Integer,
+                        }
+                        .into(),
+                    ),
+                    Expression::Reference(
+                        paro_planner::expression::ReferenceExpression {
+                            index: 1,
+                            return_type: LogicalType::Integer,
+                        }
+                        .into(),
+                    ),
                 ],
             )
             .with_visible_names(vec!["id_alias".to_string(), "score_alias".to_string()]),
@@ -280,11 +292,9 @@ mod tests {
         LogicalOperator::Projection(Projection::new(
             42,
             OwnedLogicalPlan::synthetic(child),
-            vec![Expression::Function(Box::new(FunctionExpression::new(
-                function,
-                vec![],
-                LogicalType::Double,
-            )))],
+            vec![Expression::Function(
+                FunctionExpression::new(function, vec![], LogicalType::Double).into(),
+            )],
         ))
     }
 

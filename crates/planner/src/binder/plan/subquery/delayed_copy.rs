@@ -61,18 +61,21 @@ mod tests {
         let op = LogicalOperator::Projection(Projection::new(
             11,
             OwnedLogicalPlan::new(&root_ctx, expression_get(7)),
-            vec![Expression::Subquery(SubqueryExpression {
-                subquery_type: SubqueryType::Scalar,
-                subquery: Arc::clone(&nested_stmt),
-                children: vec![],
-                child_types: vec![],
-                child_targets: vec![],
-                comparison_type: ComparisonType::Equal,
-                return_type: LogicalType::Integer,
-                correlated_columns: vec![],
-                bind_snapshot: Arc::clone(&nested_bind_snapshot),
-                planning_state: SubqueryPlanningState::Unplanned,
-            })],
+            vec![Expression::Subquery(
+                SubqueryExpression {
+                    subquery_type: SubqueryType::Scalar,
+                    subquery: Arc::clone(&nested_stmt),
+                    children: vec![],
+                    child_types: vec![],
+                    child_targets: vec![],
+                    comparison_type: ComparisonType::Equal,
+                    return_type: LogicalType::Integer,
+                    correlated_columns: vec![],
+                    bind_snapshot: Arc::clone(&nested_bind_snapshot),
+                    planning_state: SubqueryPlanningState::Unplanned,
+                }
+                .into(),
+            )],
         ));
 
         let copied = copy_subquery_top_level(&op, nested_bind_snapshot.as_ref());

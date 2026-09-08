@@ -664,12 +664,14 @@ impl JoinOrderOptimizer {
 
     fn extract_comparison_join_filters(join: &ComparisonJoin, filters: &mut Vec<ExtractedFilter>) {
         let expressions = join.conditions.iter().map(|condition| {
-            let expression =
-                Expression::Comparison(paro_planner::expression::ComparisonExpression::new(
+            let expression = Expression::Comparison(
+                paro_planner::expression::ComparisonExpression::new(
                     Self::to_comparison_type(condition.comparison),
                     condition.left.clone(),
                     condition.right.clone(),
-                ));
+                )
+                .into(),
+            );
             expression
         });
         if matches!(join.join_type, JoinType::Semi | JoinType::Anti) {
@@ -677,10 +679,9 @@ impl JoinOrderOptimizer {
             let expression = match expressions.as_slice() {
                 [] => return,
                 [expression] => expression.clone(),
-                _ => Expression::Conjunction(ConjunctionExpression::new(
-                    ConjunctionType::And,
-                    expressions,
-                )),
+                _ => Expression::Conjunction(
+                    ConjunctionExpression::new(ConjunctionType::And, expressions).into(),
+                ),
             };
             filters.push(ExtractedFilter::new(
                 expression,
@@ -1134,11 +1135,14 @@ mod tests {
     }
 
     fn column_ref(table_index: usize, column_index: usize) -> Expression {
-        Expression::ColumnRef(ColumnRefExpression {
-            binding: ColumnBinding::new(table_index, column_index),
-            depth: 0,
-            return_type: LogicalType::Integer,
-        })
+        Expression::ColumnRef(
+            ColumnRefExpression {
+                binding: ColumnBinding::new(table_index, column_index),
+                depth: 0,
+                return_type: LogicalType::Integer,
+            }
+            .into(),
+        )
     }
 
     fn join_condition(
@@ -1167,18 +1171,18 @@ mod tests {
             .next()
             .expect("random overload")
             .with_stability(FunctionStability::Volatile);
-        Expression::Comparison(paro_planner::expression::ComparisonExpression::new(
-            ComparisonType::GreaterThan,
-            Expression::Function(Box::new(FunctionExpression::new(
-                function,
-                Vec::new(),
-                LogicalType::Double,
-            ))),
-            Expression::Constant(ConstantExpression::new(
-                Value::Double(0.5),
-                LogicalType::Double,
-            )),
-        ))
+        Expression::Comparison(
+            paro_planner::expression::ComparisonExpression::new(
+                ComparisonType::GreaterThan,
+                Expression::Function(
+                    FunctionExpression::new(function, Vec::new(), LogicalType::Double).into(),
+                ),
+                Expression::Constant(
+                    ConstantExpression::new(Value::Double(0.5), LogicalType::Double).into(),
+                ),
+            )
+            .into(),
+        )
     }
 
     fn count_cross_products(plan: &LogicalOperator) -> usize {
@@ -1261,11 +1265,14 @@ mod tests {
                 OwnedLogicalPlan::synthetic(create_scan(0)),
                 OwnedLogicalPlan::synthetic(create_scan(1)),
             ))));
-        let equality = Expression::Comparison(paro_planner::expression::ComparisonExpression::new(
-            ComparisonType::Equal,
-            column_ref(0, 0),
-            column_ref(1, 0),
-        ));
+        let equality = Expression::Comparison(
+            paro_planner::expression::ComparisonExpression::new(
+                ComparisonType::Equal,
+                column_ref(0, 0),
+                column_ref(1, 0),
+            )
+            .into(),
+        );
         let plan = LogicalOperator::Filter(Filter::new(cross, vec![equality]));
 
         let bind_context = BindContext::new();
@@ -1362,15 +1369,16 @@ mod tests {
         let mut optimizer = JoinOrderOptimizer::new(SelectivityDefaults::default());
         optimizer.add_relation_plan(&session, &bind_context, &plan);
 
-        let predicate =
-            Expression::Comparison(paro_planner::expression::ComparisonExpression::new(
+        let predicate = Expression::Comparison(
+            paro_planner::expression::ComparisonExpression::new(
                 ComparisonType::LessThan,
                 column_ref(0, 0),
-                Expression::Constant(ConstantExpression::new(
-                    Value::Integer(10),
-                    LogicalType::Integer,
-                )),
-            ));
+                Expression::Constant(
+                    ConstantExpression::new(Value::Integer(10), LogicalType::Integer).into(),
+                ),
+            )
+            .into(),
+        );
         let filter = Arc::new(FilterInfo::new_inner(
             predicate,
             Arc::new(JoinRelationSet::single(0)),
@@ -1432,11 +1440,14 @@ mod tests {
         let relations = HashSet::from([0, 1]);
         let set = optimizer.set_manager.get_relation_from_set(&relations);
         let filter = Arc::new(FilterInfo::new(
-            Expression::Comparison(paro_planner::expression::ComparisonExpression::new(
-                ComparisonType::Equal,
-                column_ref(0, 0),
-                column_ref(1, 0),
-            )),
+            Expression::Comparison(
+                paro_planner::expression::ComparisonExpression::new(
+                    ComparisonType::Equal,
+                    column_ref(0, 0),
+                    column_ref(1, 0),
+                )
+                .into(),
+            ),
             set,
             0,
             JoinType::Inner,
@@ -1465,22 +1476,27 @@ mod tests {
 
     #[test]
     fn wildcard_string_predicates_are_open_ended_for_join_costing() {
-        let string_column = Expression::ColumnRef(ColumnRefExpression::new(
-            ColumnBinding::new(7, 0),
-            LogicalType::Varchar,
-        ));
+        let string_column = Expression::ColumnRef(
+            ColumnRefExpression::new(ColumnBinding::new(7, 0), LogicalType::Varchar).into(),
+        );
         let predicate = |operator_type, pattern: &str| {
-            Expression::Operator(OperatorExpression::new(
-                operator_type,
-                vec![
-                    string_column.clone(),
-                    Expression::Constant(ConstantExpression::new(
-                        Value::Varchar(pattern.to_string()),
-                        LogicalType::Varchar,
-                    )),
-                ],
-                LogicalType::Boolean,
-            ))
+            Expression::Operator(
+                OperatorExpression::new(
+                    operator_type,
+                    vec![
+                        string_column.clone(),
+                        Expression::Constant(
+                            ConstantExpression::new(
+                                Value::Varchar(pattern.to_string()),
+                                LogicalType::Varchar,
+                            )
+                            .into(),
+                        ),
+                    ],
+                    LogicalType::Boolean,
+                )
+                .into(),
+            )
         };
 
         assert!(has_open_ended_selectivity(&predicate(
@@ -1505,20 +1521,26 @@ mod tests {
         let mut optimizer = JoinOrderOptimizer::new(SelectivityDefaults::default());
         optimizer.add_relation_plan(&session, &bind_context, &plan);
 
-        let predicate = Expression::Operator(OperatorExpression::new(
-            OperatorType::ILike,
-            vec![
-                Expression::ColumnRef(ColumnRefExpression::new(
-                    ColumnBinding::new(0, 0),
-                    LogicalType::Varchar,
-                )),
-                Expression::Constant(ConstantExpression::new(
-                    Value::Varchar("%needle%".to_string()),
-                    LogicalType::Varchar,
-                )),
-            ],
-            LogicalType::Boolean,
-        ));
+        let predicate = Expression::Operator(
+            OperatorExpression::new(
+                OperatorType::ILike,
+                vec![
+                    Expression::ColumnRef(
+                        ColumnRefExpression::new(ColumnBinding::new(0, 0), LogicalType::Varchar)
+                            .into(),
+                    ),
+                    Expression::Constant(
+                        ConstantExpression::new(
+                            Value::Varchar("%needle%".to_string()),
+                            LogicalType::Varchar,
+                        )
+                        .into(),
+                    ),
+                ],
+                LogicalType::Boolean,
+            )
+            .into(),
+        );
         let filter = Arc::new(FilterInfo::new_inner(
             predicate,
             Arc::new(JoinRelationSet::single(0)),
@@ -1622,18 +1644,18 @@ mod tests {
             .map(|(filter_index, (left_column, right_column))| {
                 let left_binding = ColumnBinding::new(40, left_column);
                 let right_binding = ColumnBinding::new(50, right_column);
-                let expression =
-                    Expression::Comparison(paro_planner::expression::ComparisonExpression::new(
+                let expression = Expression::Comparison(
+                    paro_planner::expression::ComparisonExpression::new(
                         ComparisonType::Equal,
-                        Expression::ColumnRef(ColumnRefExpression::new(
-                            left_binding,
-                            LogicalType::Integer,
-                        )),
-                        Expression::ColumnRef(ColumnRefExpression::new(
-                            right_binding,
-                            LogicalType::Integer,
-                        )),
-                    ));
+                        Expression::ColumnRef(
+                            ColumnRefExpression::new(left_binding, LogicalType::Integer).into(),
+                        ),
+                        Expression::ColumnRef(
+                            ColumnRefExpression::new(right_binding, LogicalType::Integer).into(),
+                        ),
+                    )
+                    .into(),
+                );
                 let mut filter = FilterInfo::new_inner(
                     expression,
                     set_manager.get_relation_from_vec(vec![0, 1]),
@@ -1676,15 +1698,17 @@ mod tests {
     fn optimize_preserves_relation_independent_filter_above_reordered_join() {
         let session = make_test_session();
         let mut optimizer = JoinOrderOptimizer::new(SelectivityDefaults::default());
-        let equality = Expression::Comparison(paro_planner::expression::ComparisonExpression::new(
-            ComparisonType::Equal,
-            column_ref(0, 0),
-            column_ref(1, 0),
-        ));
-        let constant_false = Expression::Constant(ConstantExpression::new(
-            Value::Boolean(false),
-            LogicalType::Boolean,
-        ));
+        let equality = Expression::Comparison(
+            paro_planner::expression::ComparisonExpression::new(
+                ComparisonType::Equal,
+                column_ref(0, 0),
+                column_ref(1, 0),
+            )
+            .into(),
+        );
+        let constant_false = Expression::Constant(
+            ConstantExpression::new(Value::Boolean(false), LogicalType::Boolean).into(),
+        );
         let plan = LogicalOperator::Filter(Filter::new(
             cross_product(0, 1),
             vec![equality, constant_false.clone()],
@@ -1708,20 +1732,25 @@ mod tests {
     #[test]
     fn multi_relation_residual_is_costed_and_rebuilt_as_filtered_cross_product() {
         let comparison = |table_index| {
-            Expression::Comparison(paro_planner::expression::ComparisonExpression::new(
-                ComparisonType::GreaterThan,
-                column_ref(table_index, 0),
-                Expression::Constant(ConstantExpression::new(
-                    Value::Integer(0),
-                    LogicalType::Integer,
-                )),
-            ))
+            Expression::Comparison(
+                paro_planner::expression::ComparisonExpression::new(
+                    ComparisonType::GreaterThan,
+                    column_ref(table_index, 0),
+                    Expression::Constant(
+                        ConstantExpression::new(Value::Integer(0), LogicalType::Integer).into(),
+                    ),
+                )
+                .into(),
+            )
         };
-        let residual = Expression::Operator(OperatorExpression::new(
-            OperatorType::Coalesce,
-            vec![comparison(0), comparison(1)],
-            LogicalType::Boolean,
-        ));
+        let residual = Expression::Operator(
+            OperatorExpression::new(
+                OperatorType::Coalesce,
+                vec![comparison(0), comparison(1)],
+                LogicalType::Boolean,
+            )
+            .into(),
+        );
         let plan =
             LogicalOperator::Filter(Filter::new(cross_product(0, 1), vec![residual.clone()]));
 
@@ -1743,15 +1772,17 @@ mod tests {
     fn optimizer_keeps_original_tree_for_unmapped_or_bound_references() {
         let session = make_test_session();
         let plans = [
-            Expression::Comparison(paro_planner::expression::ComparisonExpression::new(
-                ComparisonType::Equal,
-                column_ref(99, 0),
-                Expression::Constant(ConstantExpression::new(
-                    Value::Integer(1),
-                    LogicalType::Integer,
-                )),
-            )),
-            Expression::Reference(ReferenceExpression::new(0, LogicalType::Boolean)),
+            Expression::Comparison(
+                paro_planner::expression::ComparisonExpression::new(
+                    ComparisonType::Equal,
+                    column_ref(99, 0),
+                    Expression::Constant(
+                        ConstantExpression::new(Value::Integer(1), LogicalType::Integer).into(),
+                    ),
+                )
+                .into(),
+            ),
+            Expression::Reference(ReferenceExpression::new(0, LogicalType::Boolean).into()),
         ];
 
         for predicate in plans {
@@ -1833,7 +1864,8 @@ mod tests {
                     ComparisonType::Equal,
                     column_ref(30, 0),
                     column_ref(31, 0),
-                ),
+                )
+                .into(),
             )],
         ));
 
@@ -1858,17 +1890,15 @@ mod tests {
                 OwnedLogicalPlan::synthetic(create_scan(1)),
             ))));
         let compare = |comparison_type, left, right| {
-            Expression::Comparison(paro_planner::expression::ComparisonExpression::new(
-                comparison_type,
-                left,
-                right,
-            ))
+            Expression::Comparison(
+                paro_planner::expression::ComparisonExpression::new(comparison_type, left, right)
+                    .into(),
+            )
         };
         let constant = |value| {
-            Expression::Constant(ConstantExpression::new(
-                Value::Integer(value),
-                LogicalType::Integer,
-            ))
+            Expression::Constant(
+                ConstantExpression::new(Value::Integer(value), LogicalType::Integer).into(),
+            )
         };
         let plan = LogicalOperator::Filter(Filter::new(
             cross,
@@ -2129,10 +2159,9 @@ mod tests {
                 OwnedLogicalPlan::synthetic(create_scan(0)),
                 OwnedLogicalPlan::synthetic(create_scan(1)),
                 vec![paro_planner::operator::JoinCondition::new(
-                    Expression::Constant(ConstantExpression::new(
-                        Value::Integer(5),
-                        LogicalType::Integer,
-                    )),
+                    Expression::Constant(
+                        ConstantExpression::new(Value::Integer(5), LogicalType::Integer).into(),
+                    ),
                     column_ref(1, 0),
                     JoinComparisonType::Equal,
                 )],
@@ -2182,10 +2211,9 @@ mod tests {
                 valid_inner_reduction,
                 OwnedLogicalPlan::synthetic(create_scan(2)),
                 vec![paro_planner::operator::JoinCondition::new(
-                    Expression::Constant(ConstantExpression::new(
-                        Value::Integer(5),
-                        LogicalType::Integer,
-                    )),
+                    Expression::Constant(
+                        ConstantExpression::new(Value::Integer(5), LogicalType::Integer).into(),
+                    ),
                     column_ref(2, 0),
                     JoinComparisonType::Equal,
                 )],
@@ -2235,10 +2263,9 @@ mod tests {
                 preserved,
                 OwnedLogicalPlan::synthetic(create_scan(2)),
                 vec![paro_planner::operator::JoinCondition::new(
-                    Expression::Constant(ConstantExpression::new(
-                        Value::Integer(5),
-                        LogicalType::Integer,
-                    )),
+                    Expression::Constant(
+                        ConstantExpression::new(Value::Integer(5), LogicalType::Integer).into(),
+                    ),
                     column_ref(2, 0),
                     JoinComparisonType::Equal,
                 )],
@@ -2268,10 +2295,9 @@ mod tests {
                 JoinType::Inner,
                 OwnedLogicalPlan::synthetic(create_scan(0)),
                 OwnedLogicalPlan::synthetic(create_scan(1)),
-                Expression::Constant(ConstantExpression::new(
-                    Value::Boolean(true),
-                    LogicalType::Boolean,
-                )),
+                Expression::Constant(
+                    ConstantExpression::new(Value::Boolean(true), LogicalType::Boolean).into(),
+                ),
             )))));
         let plan = OwnedLogicalPlan::synthetic(LogicalOperator::Join(Join::Comparison(
             ComparisonJoin::new(

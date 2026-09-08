@@ -314,10 +314,9 @@ mod tests {
             id: PipelineId::new(0),
             source: SourceSpec::Empty(EmptyResultSpec),
             transforms: vec![TransformSpec::Project(ProjectSpec {
-                expressions: Box::new([Expression::Reference(ReferenceExpression::new(
-                    0,
-                    LogicalType::Integer,
-                ))]),
+                expressions: Box::new([Expression::Reference(
+                    ReferenceExpression::new(0, LogicalType::Integer).into(),
+                )]),
                 output_names: Box::new(["v".to_string()]),
                 visible_count: 1,
             })],

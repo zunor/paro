@@ -538,21 +538,27 @@ mod tests {
     use paro_planner::expression::{ColumnRefExpression, ConstantExpression};
 
     fn make_constant(value: i32) -> Expression {
-        Expression::Constant(ConstantExpression {
-            value: Value::Integer(value),
-            return_type: LogicalType::Integer,
-        })
+        Expression::Constant(
+            ConstantExpression {
+                value: Value::Integer(value),
+                return_type: LogicalType::Integer,
+            }
+            .into(),
+        )
     }
 
     fn make_column_ref(table_index: usize, column_index: usize) -> Expression {
-        Expression::ColumnRef(ColumnRefExpression {
-            binding: paro_planner::operator::ColumnBinding {
-                table_index,
-                column_index,
-            },
-            depth: 0,
-            return_type: LogicalType::Integer,
-        })
+        Expression::ColumnRef(
+            ColumnRefExpression {
+                binding: paro_planner::operator::ColumnBinding {
+                    table_index,
+                    column_index,
+                },
+                depth: 0,
+                return_type: LogicalType::Integer,
+            }
+            .into(),
+        )
     }
 
     #[test]
@@ -599,22 +605,20 @@ mod tests {
     fn test_comparison_expression_matcher() {
         let matcher = ComparisonExpressionMatcher::with_type(ComparisonType::Equal);
 
-        let comp_expr = Expression::Comparison(ComparisonExpression::new(
-            ComparisonType::Equal,
-            make_constant(1),
-            make_constant(2),
-        ));
+        let comp_expr = Expression::Comparison(
+            ComparisonExpression::new(ComparisonType::Equal, make_constant(1), make_constant(2))
+                .into(),
+        );
 
         let mut bindings = Vec::new();
         assert!(matcher.matches(&comp_expr, &mut bindings));
         assert_eq!(bindings.len(), 1);
 
         // Wrong comparison type
-        let lt_expr = Expression::Comparison(ComparisonExpression::new(
-            ComparisonType::LessThan,
-            make_constant(1),
-            make_constant(2),
-        ));
+        let lt_expr = Expression::Comparison(
+            ComparisonExpression::new(ComparisonType::LessThan, make_constant(1), make_constant(2))
+                .into(),
+        );
 
         bindings.clear();
         assert!(!matcher.matches(&lt_expr, &mut bindings));
@@ -627,11 +631,10 @@ mod tests {
             Box::new(ConstantExpressionMatcher),
         );
 
-        let comp_expr = Expression::Comparison(ComparisonExpression::new(
-            ComparisonType::Equal,
-            make_constant(1),
-            make_constant(2),
-        ));
+        let comp_expr = Expression::Comparison(
+            ComparisonExpression::new(ComparisonType::Equal, make_constant(1), make_constant(2))
+                .into(),
+        );
 
         let mut bindings = Vec::new();
         assert!(matcher.matches(&comp_expr, &mut bindings));
@@ -643,19 +646,25 @@ mod tests {
     fn test_conjunction_expression_matcher() {
         let matcher = ConjunctionExpressionMatcher::and();
 
-        let and_expr = Expression::Conjunction(ConjunctionExpression {
-            conjunction_type: ConjunctionType::And,
-            children: vec![make_constant(1), make_constant(2)],
-        });
+        let and_expr = Expression::Conjunction(
+            ConjunctionExpression {
+                conjunction_type: ConjunctionType::And,
+                children: vec![make_constant(1), make_constant(2)],
+            }
+            .into(),
+        );
 
         let mut bindings = Vec::new();
         assert!(matcher.matches(&and_expr, &mut bindings));
 
         // Wrong conjunction type
-        let or_expr = Expression::Conjunction(ConjunctionExpression {
-            conjunction_type: ConjunctionType::Or,
-            children: vec![make_constant(1), make_constant(2)],
-        });
+        let or_expr = Expression::Conjunction(
+            ConjunctionExpression {
+                conjunction_type: ConjunctionType::Or,
+                children: vec![make_constant(1), make_constant(2)],
+            }
+            .into(),
+        );
 
         bindings.clear();
         assert!(!matcher.matches(&or_expr, &mut bindings));
@@ -675,11 +684,10 @@ mod tests {
         assert!(!matcher.matches(&col_expr, &mut bindings));
 
         // Comparison of two constants - should match (foldable but not a constant)
-        let comp_expr = Expression::Comparison(ComparisonExpression::new(
-            ComparisonType::Equal,
-            make_constant(1),
-            make_constant(2),
-        ));
+        let comp_expr = Expression::Comparison(
+            ComparisonExpression::new(ComparisonType::Equal, make_constant(1), make_constant(2))
+                .into(),
+        );
         assert!(matcher.matches(&comp_expr, &mut bindings));
         assert_eq!(bindings.len(), 1);
     }
@@ -702,31 +710,37 @@ mod tests {
         let matcher =
             FunctionExpressionMatcher::with_function(Box::new(SpecificFunctionMatcher::new("add")));
 
-        let func_expr = Expression::Function(Box::new(FunctionExpression::new(
-            ScalarFunction::new(
-                "add".to_string(),
-                vec![LogicalType::Integer, LogicalType::Integer],
+        let func_expr = Expression::Function(
+            FunctionExpression::new(
+                ScalarFunction::new(
+                    "add".to_string(),
+                    vec![LogicalType::Integer, LogicalType::Integer],
+                    LogicalType::Integer,
+                    dummy_fn,
+                ),
+                vec![make_constant(1), make_constant(2)],
                 LogicalType::Integer,
-                dummy_fn,
-            ),
-            vec![make_constant(1), make_constant(2)],
-            LogicalType::Integer,
-        )));
+            )
+            .into(),
+        );
 
         let mut bindings = Vec::new();
         assert!(matcher.matches(&func_expr, &mut bindings));
 
         // Wrong function name
-        let wrong_func = Expression::Function(Box::new(FunctionExpression::new(
-            ScalarFunction::new(
-                "subtract".to_string(),
-                vec![LogicalType::Integer, LogicalType::Integer],
+        let wrong_func = Expression::Function(
+            FunctionExpression::new(
+                ScalarFunction::new(
+                    "subtract".to_string(),
+                    vec![LogicalType::Integer, LogicalType::Integer],
+                    LogicalType::Integer,
+                    dummy_fn,
+                ),
+                vec![make_constant(1), make_constant(2)],
                 LogicalType::Integer,
-                dummy_fn,
-            ),
-            vec![make_constant(1), make_constant(2)],
-            LogicalType::Integer,
-        )));
+            )
+            .into(),
+        );
 
         bindings.clear();
         assert!(!matcher.matches(&wrong_func, &mut bindings));

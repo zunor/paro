@@ -192,10 +192,13 @@ impl Binder {
         for expr in &mut select_list {
             let mut e = std::mem::replace(
                 expr,
-                Expression::Constant(ConstantExpression {
-                    value: paro_common::runtime_value::Value::Null(LogicalType::Unknown),
-                    return_type: LogicalType::Unknown,
-                }),
+                Expression::Constant(
+                    ConstantExpression {
+                        value: paro_common::runtime_value::Value::Null(LogicalType::Unknown),
+                        return_type: LogicalType::Unknown,
+                    }
+                    .into(),
+                ),
             );
             e = e.extract_aggregates(&mut aggregates, group_count);
             let replaced = e.replace_groups(&groups.group_expressions);
@@ -247,10 +250,13 @@ impl Binder {
             for order in orders.iter_mut() {
                 let e = std::mem::replace(
                     &mut order.expression,
-                    Expression::Constant(ConstantExpression {
-                        value: paro_common::runtime_value::Value::Null(LogicalType::Unknown),
-                        return_type: LogicalType::Unknown,
-                    }),
+                    Expression::Constant(
+                        ConstantExpression {
+                            value: paro_common::runtime_value::Value::Null(LogicalType::Unknown),
+                            return_type: LogicalType::Unknown,
+                        }
+                        .into(),
+                    ),
                 );
                 let e = e.extract_aggregates(&mut aggregates, groups.group_expressions.len());
                 let replaced = e.replace_groups(&groups.group_expressions);
@@ -438,10 +444,13 @@ impl Binder {
             } else {
                 (aggregate_index, reference.index - group_count)
             };
-            *expr = Expression::ColumnRef(ColumnRefExpression::new(
-                ColumnBinding::new(table_index, column_index),
-                reference.return_type.clone(),
-            ));
+            *expr = Expression::ColumnRef(
+                ColumnRefExpression::new(
+                    ColumnBinding::new(table_index, column_index),
+                    reference.return_type.clone(),
+                )
+                .into(),
+            );
             return;
         }
 
@@ -1027,17 +1036,23 @@ mod tests {
     use paro_storage::index::hnsw::HnswSearchObjective;
 
     fn row_number(partition_column: usize) -> Expression {
-        Expression::Window(Box::new(WindowExpression::native(
-            WindowFunction::row_number(),
-            vec![],
-            vec![Expression::ColumnRef(ColumnRefExpression::new(
-                ColumnBinding::new(10, partition_column),
-                LogicalType::Integer,
-            ))],
-            vec![],
-            WindowFrame::default(),
-            false,
-        )))
+        Expression::Window(
+            WindowExpression::native(
+                WindowFunction::row_number(),
+                vec![],
+                vec![Expression::ColumnRef(
+                    ColumnRefExpression::new(
+                        ColumnBinding::new(10, partition_column),
+                        LogicalType::Integer,
+                    )
+                    .into(),
+                )],
+                vec![],
+                WindowFrame::default(),
+                false,
+            )
+            .into(),
+        )
     }
 
     fn random_call() -> Expression {
@@ -1046,11 +1061,7 @@ mod tests {
             .into_iter()
             .next()
             .expect("random overload");
-        Expression::Function(Box::new(FunctionExpression::new(
-            function,
-            vec![],
-            LogicalType::Double,
-        )))
+        Expression::Function(FunctionExpression::new(function, vec![], LogicalType::Double).into())
     }
 
     #[test]
@@ -1114,7 +1125,7 @@ mod tests {
         };
         expression.frame.start_bound =
             crate::expression::WindowFrameBound::Offset(Box::new(Expression::Reference(
-                crate::expression::ReferenceExpression::new(1, LogicalType::Integer),
+                crate::expression::ReferenceExpression::new(1, LogicalType::Integer).into(),
             )));
 
         let replaced = Binder::replace_aggregate_references_with_column_refs(window, 20, 1, 30);
@@ -1122,7 +1133,8 @@ mod tests {
         let Expression::Window(expression) = replaced else {
             panic!("expected window expression");
         };
-        let crate::expression::WindowFrameBound::Offset(offset) = expression.frame.start_bound
+        let crate::expression::WindowFrameBound::Offset(offset) =
+            expression.into_inner().frame.start_bound
         else {
             panic!("expected window frame offset");
         };

@@ -119,7 +119,8 @@ mod tests {
                 paro_planner::expression::ConstantExpression::new(
                     paro_common::runtime_value::Value::Integer(1),
                     LogicalType::Integer,
-                ),
+                )
+                .into(),
             )]],
             vec!["value".to_string()],
             vec![LogicalType::Integer],
@@ -142,14 +143,20 @@ mod tests {
         let static_table_index = 11;
         let recursive_table_index = 12;
         let condition = JoinCondition::new(
-            Expression::ColumnRef(ColumnRefExpression::new(
-                ColumnBinding::new(static_table_index, 0),
-                LogicalType::Integer,
-            )),
-            Expression::ColumnRef(ColumnRefExpression::new(
-                ColumnBinding::new(recursive_table_index, 0),
-                LogicalType::Integer,
-            )),
+            Expression::ColumnRef(
+                ColumnRefExpression::new(
+                    ColumnBinding::new(static_table_index, 0),
+                    LogicalType::Integer,
+                )
+                .into(),
+            ),
+            Expression::ColumnRef(
+                ColumnRefExpression::new(
+                    ColumnBinding::new(recursive_table_index, 0),
+                    LogicalType::Integer,
+                )
+                .into(),
+            ),
             JoinComparisonType::LessThan,
         );
         let recursive = OwnedLogicalPlan::synthetic(LogicalOperator::Join(Join::Comparison(
@@ -204,10 +211,13 @@ mod tests {
                 JoinType::Inner,
                 values(11),
                 recursive_reference(cte_index, 12),
-                Expression::Constant(paro_planner::expression::ConstantExpression::new(
-                    paro_common::runtime_value::Value::Boolean(true),
-                    LogicalType::Boolean,
-                )),
+                Expression::Constant(
+                    paro_planner::expression::ConstantExpression::new(
+                        paro_common::runtime_value::Value::Boolean(true),
+                        LogicalType::Boolean,
+                    )
+                    .into(),
+                ),
             )))));
         let plan = OwnedLogicalPlan::synthetic(LogicalOperator::RecursiveCTE(RecursiveCTE {
             cte_index,

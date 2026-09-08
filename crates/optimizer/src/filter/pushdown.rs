@@ -839,10 +839,13 @@ impl FilterPushdown {
             .into_iter()
             .map(|(_, comparisons)| match comparisons.as_slice() {
                 [comparison] => comparison.clone(),
-                _ => Expression::Conjunction(paro_planner::expression::ConjunctionExpression::new(
-                    ConjunctionType::Or,
-                    comparisons,
-                )),
+                _ => Expression::Conjunction(
+                    paro_planner::expression::ConjunctionExpression::new(
+                        ConjunctionType::Or,
+                        comparisons,
+                    )
+                    .into(),
+                ),
             })
             .collect()
     }
@@ -866,12 +869,14 @@ impl FilterPushdown {
                 else {
                     continue;
                 };
-                let canonical =
-                    Expression::Comparison(paro_planner::expression::ComparisonExpression::new(
+                let canonical = Expression::Comparison(
+                    paro_planner::expression::ComparisonExpression::new(
                         paro_planner::expression::ComparisonType::Equal,
                         Expression::ColumnRef(column.clone()),
                         Expression::Constant(constant.clone()),
-                    ));
+                    )
+                    .into(),
+                );
                 domains.entry(column.binding).or_default().push(canonical);
                 continue;
             };

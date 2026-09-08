@@ -33,10 +33,7 @@ const WRAPPER_PROJECTION: usize = 53;
 const OUTPUT_PROJECTION: usize = 60;
 
 fn column(table: usize, index: usize, ty: LogicalType) -> Expression {
-    Expression::ColumnRef(ColumnRefExpression::new(
-        ColumnBinding::new(table, index),
-        ty,
-    ))
+    Expression::ColumnRef(ColumnRefExpression::new(ColumnBinding::new(table, index), ty).into())
 }
 
 fn sum(input: Expression) -> Expression {
@@ -46,11 +43,7 @@ fn sum(input: Expression) -> Expression {
         .expect("bind SUM");
     assert_eq!(targets, [input_type]);
     let return_type = function.return_type.clone();
-    Expression::Aggregate(Box::new(AggregateExpression::new(
-        function,
-        vec![input],
-        return_type,
-    )))
+    Expression::Aggregate(AggregateExpression::new(function, vec![input], return_type).into())
 }
 
 fn table(object_id: u64) -> Arc<TableCatalogEntry> {
@@ -105,17 +98,19 @@ fn q11_shape(
         vec![sum(column(SCALAR_SOURCE, 1, LogicalType::Integer))],
         vec![],
     );
-    let scalar_expression = Expression::Operator(OperatorExpression::new(
-        OperatorType::Coalesce,
-        vec![
-            column(SCALAR_AGGREGATE, 0, LogicalType::BigInt),
-            Expression::Constant(ConstantExpression::new(
-                Value::BigInt(0),
-                LogicalType::BigInt,
-            )),
-        ],
-        LogicalType::BigInt,
-    ));
+    let scalar_expression = Expression::Operator(
+        OperatorExpression::new(
+            OperatorType::Coalesce,
+            vec![
+                column(SCALAR_AGGREGATE, 0, LogicalType::BigInt),
+                Expression::Constant(
+                    ConstantExpression::new(Value::BigInt(0), LogicalType::BigInt).into(),
+                ),
+            ],
+            LogicalType::BigInt,
+        )
+        .into(),
+    );
     let scalar_projection = Projection::new(
         SCALAR_PROJECTION,
         OwnedLogicalPlan::synthetic(LogicalOperator::Aggregate(Box::new(scalar_aggregate))),
@@ -133,27 +128,32 @@ fn q11_shape(
         vec![],
         vec![],
         vec![
-            Expression::Aggregate(Box::new(AggregateExpression::new(
-                first,
-                vec![column(SCALAR_PROJECTION, 0, LogicalType::BigInt)],
-                LogicalType::BigInt,
-            ))),
-            Expression::Aggregate(Box::new(AggregateExpression::new(
-                get_count_star_function(),
-                vec![],
-                LogicalType::BigInt,
-            ))),
+            Expression::Aggregate(
+                AggregateExpression::new(
+                    first,
+                    vec![column(SCALAR_PROJECTION, 0, LogicalType::BigInt)],
+                    LogicalType::BigInt,
+                )
+                .into(),
+            ),
+            Expression::Aggregate(
+                AggregateExpression::new(get_count_star_function(), vec![], LogicalType::BigInt)
+                    .into(),
+            ),
         ],
         vec![],
     );
-    let checked = Expression::Operator(OperatorExpression::new(
-        OperatorType::ErrorIfMultipleRows,
-        vec![
-            column(WRAPPER_AGGREGATE, 0, LogicalType::BigInt),
-            column(WRAPPER_AGGREGATE, 1, LogicalType::BigInt),
-        ],
-        LogicalType::BigInt,
-    ));
+    let checked = Expression::Operator(
+        OperatorExpression::new(
+            OperatorType::ErrorIfMultipleRows,
+            vec![
+                column(WRAPPER_AGGREGATE, 0, LogicalType::BigInt),
+                column(WRAPPER_AGGREGATE, 1, LogicalType::BigInt),
+            ],
+            LogicalType::BigInt,
+        )
+        .into(),
+    );
     let wrapper_projection = Projection::new(
         WRAPPER_PROJECTION,
         OwnedLogicalPlan::synthetic(LogicalOperator::Aggregate(Box::new(wrapper))),
@@ -163,11 +163,14 @@ fn q11_shape(
         OwnedLogicalPlan::synthetic(LogicalOperator::Aggregate(Box::new(grouped))),
         OwnedLogicalPlan::synthetic(LogicalOperator::Projection(wrapper_projection)),
     ))));
-    let predicate = Expression::Comparison(ComparisonExpression::new(
-        ComparisonType::GreaterThan,
-        column(GROUP_AGGREGATE, 0, LogicalType::BigInt),
-        column(WRAPPER_PROJECTION, 0, LogicalType::BigInt),
-    ));
+    let predicate = Expression::Comparison(
+        ComparisonExpression::new(
+            ComparisonType::GreaterThan,
+            column(GROUP_AGGREGATE, 0, LogicalType::BigInt),
+            column(WRAPPER_PROJECTION, 0, LogicalType::BigInt),
+        )
+        .into(),
+    );
     let filter =
         OwnedLogicalPlan::synthetic(LogicalOperator::Filter(Filter::new(cross, vec![predicate])));
     OwnedLogicalPlan::synthetic(LogicalOperator::Projection(Projection::new(
@@ -301,18 +304,24 @@ fn source_equivalence_distinguishes_cast_from_try_cast() {
         ColumnBinding::new(GROUPED_SOURCE, 0),
         ColumnBinding::new(SCALAR_SOURCE, 0),
     ));
-    let grouped = Expression::Cast(CastExpression::new(
-        column(GROUPED_SOURCE, 0, LogicalType::BigInt),
-        LogicalType::BigInt,
-        BoundCastInfo::identity(&LogicalType::BigInt, &LogicalType::BigInt),
-        false,
-    ));
-    let scalar = Expression::Cast(CastExpression::new(
-        column(SCALAR_SOURCE, 0, LogicalType::BigInt),
-        LogicalType::BigInt,
-        BoundCastInfo::identity(&LogicalType::BigInt, &LogicalType::BigInt),
-        true,
-    ));
+    let grouped = Expression::Cast(
+        CastExpression::new(
+            column(GROUPED_SOURCE, 0, LogicalType::BigInt),
+            LogicalType::BigInt,
+            BoundCastInfo::identity(&LogicalType::BigInt, &LogicalType::BigInt),
+            false,
+        )
+        .into(),
+    );
+    let scalar = Expression::Cast(
+        CastExpression::new(
+            column(SCALAR_SOURCE, 0, LogicalType::BigInt),
+            LogicalType::BigInt,
+            BoundCastInfo::identity(&LogicalType::BigInt, &LogicalType::BigInt),
+            true,
+        )
+        .into(),
+    );
 
     assert!(!bindings.expressions_equal(&grouped, &scalar));
 }

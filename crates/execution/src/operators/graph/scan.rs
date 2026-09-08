@@ -415,10 +415,13 @@ fn remap_graph_columns(expr: &Expression, column_ids: &[usize]) -> Result<Expres
             .iter()
             .position(|&column_id| column_id == original)
             .expect("graph filter column projection validated");
-        Some(Expression::ColumnRef(ColumnRefExpression::new(
-            ColumnBinding::new(col_ref.binding.table_index, column_index),
-            col_ref.return_type.clone(),
-        )))
+        Some(Expression::ColumnRef(
+            ColumnRefExpression::new(
+                ColumnBinding::new(col_ref.binding.table_index, column_index),
+                col_ref.return_type.clone(),
+            )
+            .into(),
+        ))
     }))
 }
 

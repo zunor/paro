@@ -72,8 +72,8 @@ fn physical_rewrite_composes_consecutive_projects() {
             1,
             values,
             vec![
-                Expression::Reference(ReferenceExpression::new(2, LogicalType::Integer)),
-                Expression::Reference(ReferenceExpression::new(0, LogicalType::Integer)),
+                Expression::Reference(ReferenceExpression::new(2, LogicalType::Integer).into()),
+                Expression::Reference(ReferenceExpression::new(0, LogicalType::Integer).into()),
             ],
         )),
     );
@@ -83,8 +83,8 @@ fn physical_rewrite_composes_consecutive_projects() {
             2,
             inner,
             vec![
-                Expression::Reference(ReferenceExpression::new(1, LogicalType::Integer)),
-                Expression::Reference(ReferenceExpression::new(0, LogicalType::Integer)),
+                Expression::Reference(ReferenceExpression::new(1, LogicalType::Integer).into()),
+                Expression::Reference(ReferenceExpression::new(0, LogicalType::Integer).into()),
             ],
         )),
     );
@@ -128,10 +128,9 @@ fn project_alias_does_not_rename_its_scan_input() {
             Projection::new(
                 1,
                 get,
-                vec![Expression::Reference(ReferenceExpression::new(
-                    0,
-                    LogicalType::Integer,
-                ))],
+                vec![Expression::Reference(
+                    ReferenceExpression::new(0, LogicalType::Integer).into(),
+                )],
             )
             .with_visible_names(vec!["renamed".to_string()]),
         ),
@@ -170,14 +169,16 @@ fn explain_size_is_bounded_for_deep_project_filter_chains() {
                         Projection::new(
                             index * 2 + 1,
                             plan,
-                            vec![Expression::Operator(OperatorExpression::new_unary(
-                                OperatorType::Not,
-                                Expression::Reference(ReferenceExpression::new(
-                                    0,
+                            vec![Expression::Operator(
+                                OperatorExpression::new_unary(
+                                    OperatorType::Not,
+                                    Expression::Reference(
+                                        ReferenceExpression::new(0, LogicalType::Boolean).into(),
+                                    ),
                                     LogicalType::Boolean,
-                                )),
-                                LogicalType::Boolean,
-                            ))],
+                                )
+                                .into(),
+                            )],
                         )
                         .with_visible_names(Vec::new()),
                     ),
@@ -186,10 +187,9 @@ fn explain_size_is_bounded_for_deep_project_filter_chains() {
                     &ctx,
                     LogicalOperator::Filter(Filter::new(
                         plan,
-                        vec![Expression::Reference(ReferenceExpression::new(
-                            0,
-                            LogicalType::Boolean,
-                        ))],
+                        vec![Expression::Reference(
+                            ReferenceExpression::new(0, LogicalType::Boolean).into(),
+                        )],
                     )),
                 );
             }
@@ -222,21 +222,27 @@ fn explain_parenthesizes_mixed_boolean_conjunctions() {
             vec![LogicalType::Boolean; 3],
         )),
     );
-    let disjunction = Expression::Conjunction(ConjunctionExpression {
-        conjunction_type: ConjunctionType::Or,
-        children: vec![
-            ref_expr(0, LogicalType::Boolean),
-            ref_expr(1, LogicalType::Boolean),
-        ],
-    });
+    let disjunction = Expression::Conjunction(
+        ConjunctionExpression {
+            conjunction_type: ConjunctionType::Or,
+            children: vec![
+                ref_expr(0, LogicalType::Boolean),
+                ref_expr(1, LogicalType::Boolean),
+            ],
+        }
+        .into(),
+    );
     let filter = OwnedLogicalPlan::new(
         &ctx,
         LogicalOperator::Filter(Filter::new(
             values,
-            vec![Expression::Conjunction(ConjunctionExpression {
-                conjunction_type: ConjunctionType::And,
-                children: vec![disjunction, ref_expr(2, LogicalType::Boolean)],
-            })],
+            vec![Expression::Conjunction(
+                ConjunctionExpression {
+                    conjunction_type: ConjunctionType::And,
+                    children: vec![disjunction, ref_expr(2, LogicalType::Boolean)],
+                }
+                .into(),
+            )],
         )),
     );
 
@@ -263,14 +269,16 @@ fn physical_rewrite_preserves_computed_expression_multiplicity() {
             vec![LogicalType::Integer],
         )),
     );
-    let computed = Expression::Comparison(ComparisonExpression::new(
-        ComparisonType::Equal,
-        Expression::Reference(ReferenceExpression::new(0, LogicalType::Integer)),
-        Expression::Constant(ConstantExpression::new(
-            Value::Integer(7),
-            LogicalType::Integer,
-        )),
-    ));
+    let computed = Expression::Comparison(
+        ComparisonExpression::new(
+            ComparisonType::Equal,
+            Expression::Reference(ReferenceExpression::new(0, LogicalType::Integer).into()),
+            Expression::Constant(
+                ConstantExpression::new(Value::Integer(7), LogicalType::Integer).into(),
+            ),
+        )
+        .into(),
+    );
     let inner = OwnedLogicalPlan::new(
         &ctx,
         LogicalOperator::Projection(Projection::new(1, values, vec![computed])),
@@ -281,8 +289,8 @@ fn physical_rewrite_preserves_computed_expression_multiplicity() {
             2,
             inner,
             vec![
-                Expression::Reference(ReferenceExpression::new(0, LogicalType::Boolean)),
-                Expression::Reference(ReferenceExpression::new(0, LogicalType::Boolean)),
+                Expression::Reference(ReferenceExpression::new(0, LogicalType::Boolean).into()),
+                Expression::Reference(ReferenceExpression::new(0, LogicalType::Boolean).into()),
             ],
         )),
     );
@@ -313,7 +321,8 @@ fn arena_extractor_builds_streaming_subset_without_runtime_objects() {
         )),
     );
     let filter = OwnedLogicalPlan::new(&ctx, LogicalOperator::Filter(Filter::new(values, vec![])));
-    let project_expr = Expression::Reference(ReferenceExpression::new(0, LogicalType::Integer));
+    let project_expr =
+        Expression::Reference(ReferenceExpression::new(0, LogicalType::Integer).into());
     let project = OwnedLogicalPlan::new(
         &ctx,
         LogicalOperator::Projection(
@@ -384,11 +393,9 @@ fn aggregate_uses_lossless_fixed_width_keys_for_bounded_strings() {
             vec![LogicalType::Varchar],
         )),
     );
-    let count = Expression::Aggregate(Box::new(AggregateExpression::new(
-        get_count_star_function(),
-        vec![],
-        LogicalType::BigInt,
-    )));
+    let count = Expression::Aggregate(
+        AggregateExpression::new(get_count_star_function(), vec![], LogicalType::BigInt).into(),
+    );
     let mut aggregate = Aggregate::new(
         1,
         2,
@@ -432,11 +439,9 @@ fn aggregate_packs_inline_strings_when_fixed_keys_preserve_row_width() {
             vec![LogicalType::Varchar],
         )),
     );
-    let count = Expression::Aggregate(Box::new(AggregateExpression::new(
-        get_count_star_function(),
-        vec![],
-        LogicalType::BigInt,
-    )));
+    let count = Expression::Aggregate(
+        AggregateExpression::new(get_count_star_function(), vec![], LogicalType::BigInt).into(),
+    );
     let mut aggregate = Aggregate::new(
         1,
         2,
@@ -479,11 +484,9 @@ fn aggregate_skips_offset_keys_that_only_replace_row_padding() {
             vec![LogicalType::Integer],
         )),
     );
-    let count = Expression::Aggregate(Box::new(AggregateExpression::new(
-        get_count_star_function(),
-        vec![],
-        LogicalType::BigInt,
-    )));
+    let count = Expression::Aggregate(
+        AggregateExpression::new(get_count_star_function(), vec![], LogicalType::BigInt).into(),
+    );
     let mut aggregate = Aggregate::new(
         1,
         2,
@@ -535,11 +538,9 @@ fn aggregate_requires_complete_bounds_for_offset_keys() {
                 vec![LogicalType::BigInt, LogicalType::BigInt],
             )),
         );
-        let count = Expression::Aggregate(Box::new(AggregateExpression::new(
-            get_count_star_function(),
-            vec![],
-            LogicalType::BigInt,
-        )));
+        let count = Expression::Aggregate(
+            AggregateExpression::new(get_count_star_function(), vec![], LogicalType::BigInt).into(),
+        );
         let mut aggregate = Aggregate::new(
             1,
             2,
@@ -608,11 +609,9 @@ fn aggregate_materializes_proven_dependent_groups_as_states() {
             ],
         )),
     );
-    let count = Expression::Aggregate(Box::new(AggregateExpression::new(
-        get_count_star_function(),
-        vec![],
-        LogicalType::BigInt,
-    )));
+    let count = Expression::Aggregate(
+        AggregateExpression::new(get_count_star_function(), vec![], LogicalType::BigInt).into(),
+    );
     let mut aggregate = Aggregate::new(
         1,
         2,
@@ -668,11 +667,9 @@ fn arena_extractor_fuses_aggregate_only_having_into_aggregate_emit() {
             vec![LogicalType::Integer],
         )),
     );
-    let count = Expression::Aggregate(Box::new(AggregateExpression::new(
-        get_count_star_function(),
-        vec![],
-        LogicalType::BigInt,
-    )));
+    let count = Expression::Aggregate(
+        AggregateExpression::new(get_count_star_function(), vec![], LogicalType::BigInt).into(),
+    );
     let aggregate = OwnedLogicalPlan::new(
         &ctx,
         LogicalOperator::Aggregate(Box::new(Aggregate::new(
@@ -693,10 +690,9 @@ fn arena_extractor_fuses_aggregate_only_having_into_aggregate_emit() {
             vec![comparison(
                 ComparisonType::GreaterThan,
                 ref_expr(1, LogicalType::BigInt),
-                Expression::Constant(ConstantExpression::new(
-                    Value::BigInt(1),
-                    LogicalType::BigInt,
-                )),
+                Expression::Constant(
+                    ConstantExpression::new(Value::BigInt(1), LogicalType::BigInt).into(),
+                ),
             )],
         )),
     );
@@ -729,11 +725,9 @@ fn aggregate_having_fusion_preserves_an_independent_output_projection() {
             vec![LogicalType::Integer],
         )),
     );
-    let count = Expression::Aggregate(Box::new(AggregateExpression::new(
-        get_count_star_function(),
-        vec![],
-        LogicalType::BigInt,
-    )));
+    let count = Expression::Aggregate(
+        AggregateExpression::new(get_count_star_function(), vec![], LogicalType::BigInt).into(),
+    );
     let aggregate = OwnedLogicalPlan::new(
         &ctx,
         LogicalOperator::Aggregate(Box::new(Aggregate::new(
@@ -752,10 +746,9 @@ fn aggregate_having_fusion_preserves_an_independent_output_projection() {
         vec![comparison(
             ComparisonType::GreaterThan,
             ref_expr(1, LogicalType::BigInt),
-            Expression::Constant(ConstantExpression::new(
-                Value::BigInt(10),
-                LogicalType::BigInt,
-            )),
+            Expression::Constant(
+                ConstantExpression::new(Value::BigInt(10), LogicalType::BigInt).into(),
+            ),
         )],
     );
     // COUNT is required by HAVING but not by the parent plan.
@@ -798,20 +791,26 @@ fn arena_extractor_pushes_filter_predicates_into_rowset_scan() {
                 ref_expr(0, LogicalType::Integer),
                 int_const(10),
             ),
-            Expression::Operator(OperatorExpression::new(
-                OperatorType::In,
-                vec![
-                    ref_expr(1, LogicalType::Integer),
-                    int_const(3),
-                    int_const(7),
-                ],
-                LogicalType::Boolean,
-            )),
-            Expression::Operator(OperatorExpression::new_unary(
-                OperatorType::IsNull,
-                ref_expr(2, LogicalType::Varchar),
-                LogicalType::Boolean,
-            )),
+            Expression::Operator(
+                OperatorExpression::new(
+                    OperatorType::In,
+                    vec![
+                        ref_expr(1, LogicalType::Integer),
+                        int_const(3),
+                        int_const(7),
+                    ],
+                    LogicalType::Boolean,
+                )
+                .into(),
+            ),
+            Expression::Operator(
+                OperatorExpression::new_unary(
+                    OperatorType::IsNull,
+                    ref_expr(2, LogicalType::Varchar),
+                    LogicalType::Boolean,
+                )
+                .into(),
+            ),
         ],
     );
     filter.projection_map = vec![0].into();
@@ -936,20 +935,22 @@ fn arena_extractor_keeps_residual_filter_above_pushed_rowset_scan() {
     let get = OwnedLogicalPlan::new(&ctx, LogicalOperator::Get(Box::new(test_get())));
     let filter = Filter::new(
         get,
-        vec![Expression::Conjunction(ConjunctionExpression {
-            conjunction_type: ConjunctionType::And,
-            children: vec![
-                comparison(
-                    ComparisonType::Equal,
-                    ref_expr(0, LogicalType::Integer),
-                    int_const(42),
-                ),
-                Expression::Constant(ConstantExpression::new(
-                    Value::Boolean(true),
-                    LogicalType::Boolean,
-                )),
-            ],
-        })],
+        vec![Expression::Conjunction(
+            ConjunctionExpression {
+                conjunction_type: ConjunctionType::And,
+                children: vec![
+                    comparison(
+                        ComparisonType::Equal,
+                        ref_expr(0, LogicalType::Integer),
+                        int_const(42),
+                    ),
+                    Expression::Constant(
+                        ConstantExpression::new(Value::Boolean(true), LogicalType::Boolean).into(),
+                    ),
+                ],
+            }
+            .into(),
+        )],
     );
     let plan = OwnedLogicalPlan::new(&ctx, LogicalOperator::Filter(filter));
 
@@ -1038,14 +1039,12 @@ fn arena_extractor_hands_graph_expand_filters_to_graph_project() {
         "vertices".to_string(),
         scan,
     );
-    expand.edge_filter = Some(Expression::Constant(ConstantExpression::new(
-        Value::Boolean(true),
-        LogicalType::Boolean,
-    )));
-    expand.target_filter = Some(Expression::Constant(ConstantExpression::new(
-        Value::Boolean(true),
-        LogicalType::Boolean,
-    )));
+    expand.edge_filter = Some(Expression::Constant(
+        ConstantExpression::new(Value::Boolean(true), LogicalType::Boolean).into(),
+    ));
+    expand.target_filter = Some(Expression::Constant(
+        ConstantExpression::new(Value::Boolean(true), LogicalType::Boolean).into(),
+    ));
     let expand = OwnedLogicalPlan::new(&ctx, LogicalOperator::GraphExpand(Box::new(expand)));
     let project = OwnedLogicalPlan::new(
         &ctx,
@@ -1053,10 +1052,9 @@ fn arena_extractor_hands_graph_expand_filters_to_graph_project() {
             Projection::new(
                 3,
                 expand,
-                vec![Expression::Reference(ReferenceExpression::new(
-                    0,
-                    LogicalType::UBigInt,
-                ))],
+                vec![Expression::Reference(
+                    ReferenceExpression::new(0, LogicalType::UBigInt).into(),
+                )],
             )
             .with_visible_names(vec!["src".to_string()]),
         ),
@@ -1170,8 +1168,8 @@ fn arena_extractor_lowers_single_join_to_typed_hash_path() {
         )),
     );
     let condition = JoinCondition::equality(
-        Expression::Reference(ReferenceExpression::new(0, LogicalType::Integer)),
-        Expression::Reference(ReferenceExpression::new(0, LogicalType::Integer)),
+        Expression::Reference(ReferenceExpression::new(0, LogicalType::Integer).into()),
+        Expression::Reference(ReferenceExpression::new(0, LogicalType::Integer).into()),
     );
     let join = OwnedLogicalPlan::new(
         &ctx,
@@ -1207,14 +1205,20 @@ fn auxiliary_runtime_filter_winner_emits_owned_physical_edge() {
     let left = OwnedLogicalPlan::new(&ctx, LogicalOperator::Get(Box::new(left_get)));
     let right = OwnedLogicalPlan::new(&ctx, LogicalOperator::Get(Box::new(right_get)));
     let condition = JoinCondition::equality(
-        Expression::ColumnRef(paro_planner::expression::ColumnRefExpression::new(
-            paro_planner::operator::ColumnBinding::new(0, 0),
-            LogicalType::Integer,
-        )),
-        Expression::ColumnRef(paro_planner::expression::ColumnRefExpression::new(
-            paro_planner::operator::ColumnBinding::new(1, 0),
-            LogicalType::Integer,
-        )),
+        Expression::ColumnRef(
+            paro_planner::expression::ColumnRefExpression::new(
+                paro_planner::operator::ColumnBinding::new(0, 0),
+                LogicalType::Integer,
+            )
+            .into(),
+        ),
+        Expression::ColumnRef(
+            paro_planner::expression::ColumnRefExpression::new(
+                paro_planner::operator::ColumnBinding::new(1, 0),
+                LogicalType::Integer,
+            )
+            .into(),
+        ),
     );
     let mut join = OwnedLogicalPlan::new(
         &ctx,
@@ -1295,14 +1299,20 @@ fn build_left_runtime_filter_keeps_artifact_ownership_on_the_hash_join() {
     right_get.table_index = 1;
     let right = OwnedLogicalPlan::new(&ctx, LogicalOperator::Get(Box::new(right_get)));
     let condition = JoinCondition::equality(
-        Expression::ColumnRef(paro_planner::expression::ColumnRefExpression::new(
-            paro_planner::operator::ColumnBinding::new(0, 0),
-            LogicalType::Integer,
-        )),
-        Expression::ColumnRef(paro_planner::expression::ColumnRefExpression::new(
-            paro_planner::operator::ColumnBinding::new(1, 0),
-            LogicalType::Integer,
-        )),
+        Expression::ColumnRef(
+            paro_planner::expression::ColumnRefExpression::new(
+                paro_planner::operator::ColumnBinding::new(0, 0),
+                LogicalType::Integer,
+            )
+            .into(),
+        ),
+        Expression::ColumnRef(
+            paro_planner::expression::ColumnRefExpression::new(
+                paro_planner::operator::ColumnBinding::new(1, 0),
+                LogicalType::Integer,
+            )
+            .into(),
+        ),
     );
     let mut join = OwnedLogicalPlan::new(
         &ctx,
@@ -1428,8 +1438,8 @@ fn build_left_output_permutation_covers_every_reversible_join_type() {
             left,
             right,
             vec![JoinCondition::equality(
-                Expression::Reference(ReferenceExpression::new(0, LogicalType::Integer)),
-                Expression::Reference(ReferenceExpression::new(0, LogicalType::Integer)),
+                Expression::Reference(ReferenceExpression::new(0, LogicalType::Integer).into()),
+                Expression::Reference(ReferenceExpression::new(0, LogicalType::Integer).into()),
             )],
         ) else {
             unreachable!()
@@ -1536,10 +1546,9 @@ fn arena_extractor_lowers_search_scan_with_planned_token() {
         root_version: 11,
         capability_state: SearchCapabilityState::Queryable,
     };
-    let score_expr = Expression::Constant(ConstantExpression::new(
-        Value::Float(0.75),
-        LogicalType::Float,
-    ));
+    let score_expr = Expression::Constant(
+        ConstantExpression::new(Value::Float(0.75), LogicalType::Float).into(),
+    );
     let search = LogicalSearchScan::new(
         get,
         NormalizedSearchRequest {
@@ -1600,21 +1609,22 @@ fn arena_extractor_projects_derived_values_from_the_canonical_search_score() {
         config: "simple".to_string(),
         score_mode: FullTextScoreMode::Bm25,
     });
-    let score_expr = Expression::Constant(ConstantExpression::new(
-        Value::Float(0.75),
-        LogicalType::Float,
-    ));
-    let derived_score = Expression::Operator(OperatorExpression::new(
-        OperatorType::Coalesce,
-        vec![
-            score_expr.clone(),
-            Expression::Constant(ConstantExpression::new(
-                Value::Float(0.0),
-                LogicalType::Float,
-            )),
-        ],
-        LogicalType::Float,
-    ));
+    let score_expr = Expression::Constant(
+        ConstantExpression::new(Value::Float(0.75), LogicalType::Float).into(),
+    );
+    let derived_score = Expression::Operator(
+        OperatorExpression::new(
+            OperatorType::Coalesce,
+            vec![
+                score_expr.clone(),
+                Expression::Constant(
+                    ConstantExpression::new(Value::Float(0.0), LogicalType::Float).into(),
+                ),
+            ],
+            LogicalType::Float,
+        )
+        .into(),
+    );
     let search = LogicalSearchScan::new(
         get,
         NormalizedSearchRequest {
@@ -1743,16 +1753,15 @@ pub(super) fn test_get() -> Get {
 }
 
 fn ref_expr(index: usize, ty: LogicalType) -> Expression {
-    Expression::Reference(ReferenceExpression::new(index, ty))
+    Expression::Reference(ReferenceExpression::new(index, ty).into())
 }
 
 fn int_const(value: i32) -> Expression {
-    Expression::Constant(ConstantExpression::new(
-        Value::Integer(value),
-        LogicalType::Integer,
-    ))
+    Expression::Constant(
+        ConstantExpression::new(Value::Integer(value), LogicalType::Integer).into(),
+    )
 }
 
 fn comparison(comparison_type: ComparisonType, left: Expression, right: Expression) -> Expression {
-    Expression::Comparison(ComparisonExpression::new(comparison_type, left, right))
+    Expression::Comparison(ComparisonExpression::new(comparison_type, left, right).into())
 }

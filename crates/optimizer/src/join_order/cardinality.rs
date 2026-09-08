@@ -1393,21 +1393,27 @@ mod tests {
     };
 
     fn create_column_ref(table_index: usize, column_index: usize) -> Expression {
-        Expression::ColumnRef(ColumnRefExpression {
-            binding: paro_planner::operator::ColumnBinding {
-                table_index,
-                column_index,
-            },
-            depth: 0,
-            return_type: LogicalType::Integer,
-        })
+        Expression::ColumnRef(
+            ColumnRefExpression {
+                binding: paro_planner::operator::ColumnBinding {
+                    table_index,
+                    column_index,
+                },
+                depth: 0,
+                return_type: LogicalType::Integer,
+            }
+            .into(),
+        )
     }
 
     fn create_constant(value: i64) -> Expression {
-        Expression::Constant(ConstantExpression {
-            value: Value::BigInt(value),
-            return_type: LogicalType::BigInt,
-        })
+        Expression::Constant(
+            ConstantExpression {
+                value: Value::BigInt(value),
+                return_type: LogicalType::BigInt,
+            }
+            .into(),
+        )
     }
 
     fn column_distinct_counts(
@@ -1449,11 +1455,14 @@ mod tests {
         filter_index: usize,
         comparison_type: ComparisonType,
     ) -> Arc<FilterInfo> {
-        let expr = Expression::Comparison(ComparisonExpression {
-            left: Box::new(create_column_ref(left_table, left_col)),
-            right: Box::new(create_column_ref(right_table, right_col)),
-            comparison_type,
-        });
+        let expr = Expression::Comparison(
+            ComparisonExpression {
+                left: Box::new(create_column_ref(left_table, left_col)),
+                right: Box::new(create_column_ref(right_table, right_col)),
+                comparison_type,
+            }
+            .into(),
+        );
 
         let set = set_manager.get_relation_from_vec(vec![left_table, right_table]);
         let left_set = set_manager.get_relation(left_table);
@@ -1472,11 +1481,14 @@ mod tests {
         set_manager: &mut JoinRelationSetManager,
         join_type: JoinType,
     ) -> Arc<FilterInfo> {
-        let expr = Expression::Comparison(ComparisonExpression {
-            left: Box::new(create_column_ref(0, 0)),
-            right: Box::new(create_column_ref(1, 0)),
-            comparison_type: ComparisonType::Equal,
-        });
+        let expr = Expression::Comparison(
+            ComparisonExpression {
+                left: Box::new(create_column_ref(0, 0)),
+                right: Box::new(create_column_ref(1, 0)),
+                comparison_type: ComparisonType::Equal,
+            }
+            .into(),
+        );
         let set = set_manager.get_relation_from_vec(vec![0, 1]);
         let left_set = set_manager.get_relation(0);
         let right_set = set_manager.get_relation(1);
@@ -1500,11 +1512,14 @@ mod tests {
         col: usize,
         filter_index: usize,
     ) -> Arc<FilterInfo> {
-        let expr = Expression::Comparison(ComparisonExpression {
-            left: Box::new(create_column_ref(table, col)),
-            right: Box::new(create_constant(10)),
-            comparison_type: ComparisonType::GreaterThan,
-        });
+        let expr = Expression::Comparison(
+            ComparisonExpression {
+                left: Box::new(create_column_ref(table, col)),
+                right: Box::new(create_constant(10)),
+                comparison_type: ComparisonType::GreaterThan,
+            }
+            .into(),
+        );
 
         let set = set_manager.get_relation(table);
         let left_set = set_manager.get_relation(table);
@@ -2251,33 +2266,42 @@ mod tests {
     #[test]
     fn test_get_comparison_type() {
         // Equal comparison
-        let eq_expr = Expression::Comparison(ComparisonExpression {
-            left: Box::new(create_column_ref(0, 0)),
-            right: Box::new(create_column_ref(1, 0)),
-            comparison_type: ComparisonType::Equal,
-        });
+        let eq_expr = Expression::Comparison(
+            ComparisonExpression {
+                left: Box::new(create_column_ref(0, 0)),
+                right: Box::new(create_column_ref(1, 0)),
+                comparison_type: ComparisonType::Equal,
+            }
+            .into(),
+        );
         assert_eq!(
             CardinalityEstimator::get_comparison_type(&eq_expr),
             Some(ComparisonKind::Equal)
         );
 
         // Not equal comparison
-        let ne_expr = Expression::Comparison(ComparisonExpression {
-            left: Box::new(create_column_ref(0, 0)),
-            right: Box::new(create_column_ref(1, 0)),
-            comparison_type: ComparisonType::NotEqual,
-        });
+        let ne_expr = Expression::Comparison(
+            ComparisonExpression {
+                left: Box::new(create_column_ref(0, 0)),
+                right: Box::new(create_column_ref(1, 0)),
+                comparison_type: ComparisonType::NotEqual,
+            }
+            .into(),
+        );
         assert_eq!(
             CardinalityEstimator::get_comparison_type(&ne_expr),
             Some(ComparisonKind::NotEqual)
         );
 
         // Range comparison
-        let lt_expr = Expression::Comparison(ComparisonExpression {
-            left: Box::new(create_column_ref(0, 0)),
-            right: Box::new(create_column_ref(1, 0)),
-            comparison_type: ComparisonType::LessThan,
-        });
+        let lt_expr = Expression::Comparison(
+            ComparisonExpression {
+                left: Box::new(create_column_ref(0, 0)),
+                right: Box::new(create_column_ref(1, 0)),
+                comparison_type: ComparisonType::LessThan,
+            }
+            .into(),
+        );
         assert_eq!(
             CardinalityEstimator::get_comparison_type(&lt_expr),
             Some(ComparisonKind::Range)
@@ -2287,10 +2311,10 @@ mod tests {
         let const_expr = create_constant(42);
         assert_eq!(CardinalityEstimator::get_comparison_type(&const_expr), None);
 
-        let disjunction = Expression::Conjunction(ConjunctionExpression::new(
-            ConjunctionType::Or,
-            vec![eq_expr, create_constant(7)],
-        ));
+        let disjunction = Expression::Conjunction(
+            ConjunctionExpression::new(ConjunctionType::Or, vec![eq_expr, create_constant(7)])
+                .into(),
+        );
         assert_eq!(
             CardinalityEstimator::get_comparison_type(&disjunction),
             None

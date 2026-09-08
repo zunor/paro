@@ -100,8 +100,9 @@ mod tests {
         let old_binding = ColumnBinding::new(0, 2);
         let new_binding = ColumnBinding::new(0, 1);
 
-        let mut expr =
-            Expression::ColumnRef(ColumnRefExpression::new(old_binding, LogicalType::Integer));
+        let mut expr = Expression::ColumnRef(
+            ColumnRefExpression::new(old_binding, LogicalType::Integer).into(),
+        );
 
         let mut replacer = ColumnBindingReplacer::new();
         replacer
@@ -123,8 +124,9 @@ mod tests {
         let new_binding = ColumnBinding::new(0, 1);
         let new_type = LogicalType::Varchar;
 
-        let mut expr =
-            Expression::ColumnRef(ColumnRefExpression::new(old_binding, LogicalType::Integer));
+        let mut expr = Expression::ColumnRef(
+            ColumnRefExpression::new(old_binding, LogicalType::Integer).into(),
+        );
 
         let mut replacer = ColumnBindingReplacer::new();
         replacer

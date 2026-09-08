@@ -16,8 +16,8 @@ fn arena_extractor_names_hidden_order_columns() {
         )),
     );
     let exprs = vec![
-        Expression::Reference(ReferenceExpression::new(0, LogicalType::Integer)),
-        Expression::Reference(ReferenceExpression::new(1, LogicalType::Integer)),
+        Expression::Reference(ReferenceExpression::new(0, LogicalType::Integer).into()),
+        Expression::Reference(ReferenceExpression::new(1, LogicalType::Integer).into()),
     ];
     let project = OwnedLogicalPlan::new(
         &ctx,
@@ -80,9 +80,9 @@ fn arena_extractor_names_hidden_window_child_columns() {
         )),
     );
     let exprs = vec![
-        Expression::Reference(ReferenceExpression::new(0, LogicalType::Integer)),
-        Expression::Reference(ReferenceExpression::new(1, LogicalType::Integer)),
-        Expression::Reference(ReferenceExpression::new(2, LogicalType::Integer)),
+        Expression::Reference(ReferenceExpression::new(0, LogicalType::Integer).into()),
+        Expression::Reference(ReferenceExpression::new(1, LogicalType::Integer).into()),
+        Expression::Reference(ReferenceExpression::new(2, LogicalType::Integer).into()),
     ];
     let project = OwnedLogicalPlan::new(
         &ctx,
@@ -143,10 +143,9 @@ fn whole_partition_aggregate_window_lowers_to_sort_free_breaker() {
     let return_type = sum.return_type.clone();
     let aggregate = AggregateExpression::new(
         sum,
-        vec![Expression::Reference(ReferenceExpression::new(
-            1,
-            LogicalType::Integer,
-        ))],
+        vec![Expression::Reference(
+            ReferenceExpression::new(1, LogicalType::Integer).into(),
+        )],
         return_type,
     );
     let window = OwnedLogicalPlan::new(
@@ -155,10 +154,9 @@ fn whole_partition_aggregate_window_lowers_to_sort_free_breaker() {
             2,
             vec![WindowExpression::aggregate(
                 aggregate,
-                vec![Expression::Reference(ReferenceExpression::new(
-                    0,
-                    LogicalType::Integer,
-                ))],
+                vec![Expression::Reference(
+                    ReferenceExpression::new(0, LogicalType::Integer).into(),
+                )],
                 Vec::new(),
                 WindowFrame::default(),
             )],
@@ -201,10 +199,9 @@ fn composite_varlen_partition_keys_lower_to_sort_free_breaker() {
     let return_type = sum.return_type.clone();
     let aggregate = AggregateExpression::new(
         sum,
-        vec![Expression::Reference(ReferenceExpression::new(
-            2,
-            LogicalType::Integer,
-        ))],
+        vec![Expression::Reference(
+            ReferenceExpression::new(2, LogicalType::Integer).into(),
+        )],
         return_type,
     );
     let window = OwnedLogicalPlan::new(
@@ -214,8 +211,8 @@ fn composite_varlen_partition_keys_lower_to_sort_free_breaker() {
             vec![WindowExpression::aggregate(
                 aggregate,
                 vec![
-                    Expression::Reference(ReferenceExpression::new(0, LogicalType::Varchar)),
-                    Expression::Reference(ReferenceExpression::new(1, LogicalType::Integer)),
+                    Expression::Reference(ReferenceExpression::new(0, LogicalType::Varchar).into()),
+                    Expression::Reference(ReferenceExpression::new(1, LogicalType::Integer).into()),
                 ],
                 Vec::new(),
                 WindowFrame::default(),
@@ -262,10 +259,9 @@ fn bigint_partition_key_lowers_to_typed_sort_free_breaker() {
             2,
             vec![WindowExpression::aggregate(
                 aggregate,
-                vec![Expression::Reference(ReferenceExpression::new(
-                    0,
-                    LogicalType::BigInt,
-                ))],
+                vec![Expression::Reference(
+                    ReferenceExpression::new(0, LogicalType::BigInt).into(),
+                )],
                 Vec::new(),
                 WindowFrame::default(),
             )],
@@ -300,10 +296,9 @@ fn ordered_full_partition_aggregate_keeps_the_semantic_window_fallback() {
         .expect("bind integer sum");
     let aggregate = AggregateExpression::new(
         sum,
-        vec![Expression::Reference(ReferenceExpression::new(
-            1,
-            LogicalType::Integer,
-        ))],
+        vec![Expression::Reference(
+            ReferenceExpression::new(1, LogicalType::Integer).into(),
+        )],
         LogicalType::BigInt,
     );
     let window = OwnedLogicalPlan::new(
@@ -312,15 +307,13 @@ fn ordered_full_partition_aggregate_keeps_the_semantic_window_fallback() {
             2,
             vec![WindowExpression::aggregate(
                 aggregate,
-                vec![Expression::Reference(ReferenceExpression::new(
-                    0,
-                    LogicalType::Integer,
-                ))],
+                vec![Expression::Reference(
+                    ReferenceExpression::new(0, LogicalType::Integer).into(),
+                )],
                 vec![OrderByExpression {
-                    expression: Expression::Reference(ReferenceExpression::new(
-                        1,
-                        LogicalType::Integer,
-                    )),
+                    expression: Expression::Reference(
+                        ReferenceExpression::new(1, LogicalType::Integer).into(),
+                    ),
                     ascending: true,
                     nulls_first: false,
                 }],
@@ -355,10 +348,9 @@ fn arena_extractor_lowers_row_literal_union_all_to_values() {
                 Projection::new(
                     1,
                     OwnedLogicalPlan::dummy_scan(&ctx),
-                    vec![Expression::Constant(ConstantExpression::new(
-                        Value::Integer(value),
-                        LogicalType::Integer,
-                    ))],
+                    vec![Expression::Constant(
+                        ConstantExpression::new(Value::Integer(value), LogicalType::Integer).into(),
+                    )],
                 )
                 .with_visible_names(vec!["v".to_string()]),
             ),

@@ -336,10 +336,9 @@ fn correlated_control_region_statement() -> StatementProgram {
                 transforms: Vec::new(),
                 sink: SinkSpec::DelimCapture(DelimCaptureSinkSpec {
                     handle: delim_values,
-                    duplicate_keys: vec![Expression::Reference(ReferenceExpression::new(
-                        0,
-                        LogicalType::Integer,
-                    ))]
+                    duplicate_keys: vec![Expression::Reference(
+                        ReferenceExpression::new(0, LogicalType::Integer).into(),
+                    )]
                     .into_boxed_slice(),
                     cached_outer: None,
                 }),
@@ -411,10 +410,9 @@ fn correlated_control_region_with_capture_dependency_statement() -> StatementPro
                 transforms: Vec::new(),
                 sink: SinkSpec::DelimCapture(DelimCaptureSinkSpec {
                     handle: delim_values,
-                    duplicate_keys: vec![Expression::Reference(ReferenceExpression::new(
-                        0,
-                        LogicalType::Integer,
-                    ))]
+                    duplicate_keys: vec![Expression::Reference(
+                        ReferenceExpression::new(0, LogicalType::Integer).into(),
+                    )]
                     .into_boxed_slice(),
                     cached_outer: None,
                 }),
@@ -481,10 +479,9 @@ fn correlated_control_region_with_external_dependent_producer_statement() -> Sta
                 transforms: Vec::new(),
                 sink: SinkSpec::DelimCapture(DelimCaptureSinkSpec {
                     handle: delim_values,
-                    duplicate_keys: vec![Expression::Reference(ReferenceExpression::new(
-                        0,
-                        LogicalType::Integer,
-                    ))]
+                    duplicate_keys: vec![Expression::Reference(
+                        ReferenceExpression::new(0, LogicalType::Integer).into(),
+                    )]
                     .into_boxed_slice(),
                     cached_outer: None,
                 }),

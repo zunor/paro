@@ -465,16 +465,14 @@ mod tests {
         map.insert(ColumnBinding::new(10, 0), 0);
         let rewriter = RewriteCorrelatedExpressions::new_shallow(ColumnBinding::new(99, 0), map, 1);
 
-        let matched = Expression::ColumnRef(ColumnRefExpression::with_depth(
-            ColumnBinding::new(10, 0),
-            LogicalType::Integer,
-            2,
-        ));
-        let deeper = Expression::ColumnRef(ColumnRefExpression::with_depth(
-            ColumnBinding::new(10, 0),
-            LogicalType::Integer,
-            3,
-        ));
+        let matched = Expression::ColumnRef(
+            ColumnRefExpression::with_depth(ColumnBinding::new(10, 0), LogicalType::Integer, 2)
+                .into(),
+        );
+        let deeper = Expression::ColumnRef(
+            ColumnRefExpression::with_depth(ColumnBinding::new(10, 0), LogicalType::Integer, 3)
+                .into(),
+        );
 
         match rewriter.rewrite_expression(matched) {
             Expression::ColumnRef(col_ref) => {
@@ -504,11 +502,9 @@ mod tests {
                 map.clone(),
                 lateral_depth,
             );
-            let expression = Expression::ColumnRef(ColumnRefExpression::with_depth(
-                binding,
-                LogicalType::Integer,
-                source_depth,
-            ));
+            let expression = Expression::ColumnRef(
+                ColumnRefExpression::with_depth(binding, LogicalType::Integer, source_depth).into(),
+            );
 
             let Expression::ColumnRef(rewritten) = rewriter.rewrite_expression(expression) else {
                 panic!("expected rewritten column ref");
@@ -541,7 +537,7 @@ mod tests {
             planning_state: SubqueryPlanningState::Unplanned,
         };
 
-        match rewriter.rewrite_expression(Expression::Subquery(subquery)) {
+        match rewriter.rewrite_expression(Expression::Subquery(subquery.into())) {
             Expression::Subquery(rewritten) => {
                 assert_eq!(rewritten.correlated_columns[0].table_index, 99);
                 assert_eq!(rewritten.correlated_columns[0].column_index, 0);
@@ -580,7 +576,7 @@ mod tests {
             planning_state: SubqueryPlanningState::Unplanned,
         };
 
-        match rewriter.rewrite_expression(Expression::Subquery(subquery)) {
+        match rewriter.rewrite_expression(Expression::Subquery(subquery.into())) {
             Expression::Subquery(rewritten) => {
                 assert_eq!(rewritten.correlated_columns[0].table_index, 99);
                 assert_eq!(rewritten.correlated_columns[0].column_index, 0);
@@ -619,7 +615,7 @@ mod tests {
             planning_state: SubqueryPlanningState::Unplanned,
         };
 
-        match rewriter.rewrite_expression(Expression::Subquery(subquery)) {
+        match rewriter.rewrite_expression(Expression::Subquery(subquery.into())) {
             Expression::Subquery(rewritten) => {
                 assert_eq!(rewritten.correlated_columns[0].table_index, 77);
                 assert_eq!(rewritten.correlated_columns[0].column_index, 0);
@@ -643,11 +639,14 @@ mod tests {
                 LogicalOperator::Projection(crate::operator::Projection::new(
                     2,
                     OwnedLogicalPlan::new(&ctx, expression_get(3)),
-                    vec![Expression::ColumnRef(ColumnRefExpression::with_depth(
-                        ColumnBinding::new(10, 0),
-                        LogicalType::Integer,
-                        2,
-                    ))],
+                    vec![Expression::ColumnRef(
+                        ColumnRefExpression::with_depth(
+                            ColumnBinding::new(10, 0),
+                            LogicalType::Integer,
+                            2,
+                        )
+                        .into(),
+                    )],
                 )),
             ),
             vec![CorrelatedColumnInfo {

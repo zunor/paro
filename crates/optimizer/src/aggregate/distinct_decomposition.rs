@@ -74,10 +74,13 @@ fn rewrite_node(
         .iter()
         .enumerate()
         .map(|(ordinal, group)| {
-            Expression::ColumnRef(ColumnRefExpression::new(
-                ColumnBinding::new(inner_group_index, ordinal),
-                group.return_type(),
-            ))
+            Expression::ColumnRef(
+                ColumnRefExpression::new(
+                    ColumnBinding::new(inner_group_index, ordinal),
+                    group.return_type(),
+                )
+                .into(),
+            )
         })
         .collect();
     aggregate.aggregates = aggregate
@@ -92,10 +95,13 @@ fn rewrite_node(
                 .iter()
                 .enumerate()
                 .map(|(ordinal, argument)| {
-                    Expression::ColumnRef(ColumnRefExpression::new(
-                        ColumnBinding::new(inner_group_index, original_group_count + ordinal),
-                        argument.return_type(),
-                    ))
+                    Expression::ColumnRef(
+                        ColumnRefExpression::new(
+                            ColumnBinding::new(inner_group_index, original_group_count + ordinal),
+                            argument.return_type(),
+                        )
+                        .into(),
+                    )
                 })
                 .collect();
             Expression::Aggregate(aggregate)
@@ -161,20 +167,21 @@ mod tests {
     use super::optimize_plan;
 
     fn column(table: usize, ordinal: usize) -> Expression {
-        Expression::ColumnRef(ColumnRefExpression::new(
-            ColumnBinding::new(table, ordinal),
-            LogicalType::BigInt,
-        ))
+        Expression::ColumnRef(
+            ColumnRefExpression::new(ColumnBinding::new(table, ordinal), LogicalType::BigInt)
+                .into(),
+        )
     }
 
     fn count_distinct(input: Expression) -> Expression {
         let (function, _) = get_count_function()
             .bind(&[LogicalType::BigInt])
             .expect("bind count(bigint)");
-        Expression::Aggregate(Box::new(
+        Expression::Aggregate(
             AggregateExpression::new(function, vec![input], LogicalType::BigInt)
-                .with_aggr_type(AggregateType::Distinct),
-        ))
+                .with_aggr_type(AggregateType::Distinct)
+                .into(),
+        )
     }
 
     #[test]

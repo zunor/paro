@@ -161,8 +161,8 @@ mod tests {
                 .unwrap();
         input.try_set_cardinality(2).unwrap();
         let conditions = [equality(
-            Expression::Reference(ReferenceExpression::new(1, LogicalType::BigInt)),
-            Expression::Reference(ReferenceExpression::new(0, LogicalType::BigInt)),
+            Expression::Reference(ReferenceExpression::new(1, LogicalType::BigInt).into()),
+            Expression::Reference(ReferenceExpression::new(0, LogicalType::BigInt).into()),
         )];
 
         let vectors = direct_join_key_vectors(
@@ -180,11 +180,10 @@ mod tests {
         let allocator = paro_common::test_utils::test_allocator();
         let input = Chunk::try_initialize(&[LogicalType::Integer], 1, allocator).unwrap();
         let conditions = [equality(
-            Expression::Constant(ConstantExpression::new(
-                Value::Integer(7),
-                LogicalType::Integer,
-            )),
-            Expression::Reference(ReferenceExpression::new(0, LogicalType::Integer)),
+            Expression::Constant(
+                ConstantExpression::new(Value::Integer(7), LogicalType::Integer).into(),
+            ),
+            Expression::Reference(ReferenceExpression::new(0, LogicalType::Integer).into()),
         )];
 
         assert!(direct_join_key_vectors(

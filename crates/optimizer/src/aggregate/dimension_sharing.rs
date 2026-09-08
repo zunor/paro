@@ -488,10 +488,9 @@ fn remap_expression(
             return None;
         }
         match bindings.get(&column.binding) {
-            Some(binding) => Some(Expression::ColumnRef(ColumnRefExpression::new(
-                *binding,
-                column.return_type.clone(),
-            ))),
+            Some(binding) => Some(Expression::ColumnRef(
+                ColumnRefExpression::new(*binding, column.return_type.clone()).into(),
+            )),
             None => {
                 valid.set(false);
                 None
@@ -507,10 +506,9 @@ fn replace_known_bindings(
 ) -> Expression {
     expression.replace_column_ref(&|column| {
         bindings.get(&column.binding).map(|binding| {
-            Expression::ColumnRef(ColumnRefExpression::new(
-                *binding,
-                column.return_type.clone(),
-            ))
+            Expression::ColumnRef(
+                ColumnRefExpression::new(*binding, column.return_type.clone()).into(),
+            )
         })
     })
 }
@@ -689,10 +687,13 @@ fn apply(
     final_groups.extend(witness.constant_outputs.iter().enumerate().map(
         |(constant_ordinal, _)| {
             let input_ordinal = partial_group_count + partial_aggregate_count + constant_ordinal;
-            Expression::ColumnRef(ColumnRefExpression::new(
-                ColumnBinding::new(union_index, input_ordinal),
-                setop.types[witness.constant_outputs[constant_ordinal]].clone(),
-            ))
+            Expression::ColumnRef(
+                ColumnRefExpression::new(
+                    ColumnBinding::new(union_index, input_ordinal),
+                    setop.types[witness.constant_outputs[constant_ordinal]].clone(),
+                )
+                .into(),
+            )
         },
     ));
     // Visible branch constants are not a branch identity: both arms may emit
@@ -700,10 +701,13 @@ fn apply(
     // each arm. Keep an internal identity through the merge and project it
     // away at the root.
     if let Some(branch_identity_ordinal) = branch_identity_ordinal {
-        final_groups.push(Expression::ColumnRef(ColumnRefExpression::new(
-            ColumnBinding::new(union_index, branch_identity_ordinal),
-            LogicalType::UBigInt,
-        )));
+        final_groups.push(Expression::ColumnRef(
+            ColumnRefExpression::new(
+                ColumnBinding::new(union_index, branch_identity_ordinal),
+                LogicalType::UBigInt,
+            )
+            .into(),
+        ));
     }
     let final_aggregates = left_outer
         .aggregates
@@ -761,22 +765,31 @@ fn apply(
         .into_iter()
         .enumerate()
         .map(|(output_ordinal, slot)| match slot {
-            OutputSlot::Group(ordinal) => Expression::ColumnRef(ColumnRefExpression::new(
-                ColumnBinding::new(final_group_index, ordinal),
-                setop.types[output_ordinal].clone(),
-            )),
-            OutputSlot::Aggregate(ordinal) => Expression::ColumnRef(ColumnRefExpression::new(
-                ColumnBinding::new(final_aggregate_index, ordinal),
-                setop.types[output_ordinal].clone(),
-            )),
+            OutputSlot::Group(ordinal) => Expression::ColumnRef(
+                ColumnRefExpression::new(
+                    ColumnBinding::new(final_group_index, ordinal),
+                    setop.types[output_ordinal].clone(),
+                )
+                .into(),
+            ),
+            OutputSlot::Aggregate(ordinal) => Expression::ColumnRef(
+                ColumnRefExpression::new(
+                    ColumnBinding::new(final_aggregate_index, ordinal),
+                    setop.types[output_ordinal].clone(),
+                )
+                .into(),
+            ),
             OutputSlot::Constant => {
                 let group_ordinal = original_group_count + constant_ordinal;
                 let output_ordinal = witness.constant_outputs[constant_ordinal];
                 constant_ordinal += 1;
-                Expression::ColumnRef(ColumnRefExpression::new(
-                    ColumnBinding::new(final_group_index, group_ordinal),
-                    setop.types[output_ordinal].clone(),
-                ))
+                Expression::ColumnRef(
+                    ColumnRefExpression::new(
+                        ColumnBinding::new(final_group_index, group_ordinal),
+                        setop.types[output_ordinal].clone(),
+                    )
+                    .into(),
+                )
             }
         })
         .collect();
@@ -887,23 +900,29 @@ fn partial_union_arm(
     let partial = aggregate_from_plan(&partial_plan)?;
     let expressions = (0..partial.groups.len())
         .map(|ordinal| {
-            Expression::ColumnRef(ColumnRefExpression::new(
-                ColumnBinding::new(partial.group_index, ordinal),
-                partial.groups[ordinal].return_type(),
-            ))
+            Expression::ColumnRef(
+                ColumnRefExpression::new(
+                    ColumnBinding::new(partial.group_index, ordinal),
+                    partial.groups[ordinal].return_type(),
+                )
+                .into(),
+            )
         })
         .chain((0..partial.aggregates.len()).map(|ordinal| {
-            Expression::ColumnRef(ColumnRefExpression::new(
-                ColumnBinding::new(partial.aggregate_index, ordinal),
-                partial.aggregates[ordinal].return_type(),
-            ))
+            Expression::ColumnRef(
+                ColumnRefExpression::new(
+                    ColumnBinding::new(partial.aggregate_index, ordinal),
+                    partial.aggregates[ordinal].return_type(),
+                )
+                .into(),
+            )
         }))
         .chain(constants)
         .chain(branch_identity.map(|branch_identity| {
-            Expression::Constant(ConstantExpression::new(
-                Value::UBigInt(branch_identity),
-                LogicalType::UBigInt,
-            ))
+            Expression::Constant(
+                ConstantExpression::new(Value::UBigInt(branch_identity), LogicalType::UBigInt)
+                    .into(),
+            )
         }))
         .collect();
     Ok(OwnedLogicalPlan::new(

@@ -255,7 +255,7 @@ fn program_from_graph_pipeline(
 }
 
 fn reference(index: usize, ty: LogicalType) -> Expression {
-    Expression::Reference(ReferenceExpression::new(index, ty))
+    Expression::Reference(ReferenceExpression::new(index, ty).into())
 }
 
 fn row_type(names: &[&str], types: &[LogicalType]) -> RowType {

@@ -279,9 +279,9 @@ impl LogicalOperatorVisitor for RemoveUnusedColumns<'_> {
                     if agg.aggregates.is_empty() && agg.groups.is_empty() {
                         let count_star = get_count_star_function();
                         let return_type = count_star.return_type.clone();
-                        agg.aggregates.push(Expression::Aggregate(Box::new(
-                            AggregateExpression::new(count_star, Vec::new(), return_type),
-                        )));
+                        agg.aggregates.push(Expression::Aggregate(
+                            AggregateExpression::new(count_star, Vec::new(), return_type).into(),
+                        ));
                     }
 
                     agg.recompute_returned_types();
@@ -333,11 +333,13 @@ impl LogicalOperatorVisitor for RemoveUnusedColumns<'_> {
 
                     // Ensure at least one expression
                     if proj.expressions.is_empty() {
-                        proj.expressions
-                            .push(Expression::Constant(ConstantExpression {
+                        proj.expressions.push(Expression::Constant(
+                            ConstantExpression {
                                 value: paro_common::runtime_value::Value::Integer(42),
                                 return_type: paro_common::types::LogicalType::Integer,
-                            }));
+                            }
+                            .into(),
+                        ));
                         proj.visible_names = vec!["42".to_string()];
                         proj.visible_count = 0;
                     } else {
@@ -747,10 +749,13 @@ impl LogicalOperatorVisitor for RemoveUnusedColumns<'_> {
                             let expressions: Vec<Expression> = new_entries
                                 .iter()
                                 .map(|&col_idx| {
-                                    Expression::ColumnRef(ColumnRefExpression::new(
-                                        child_bindings[col_idx],
-                                        child_types[col_idx].clone(),
-                                    ))
+                                    Expression::ColumnRef(
+                                        ColumnRefExpression::new(
+                                            child_bindings[col_idx],
+                                            child_types[col_idx].clone(),
+                                        )
+                                        .into(),
+                                    )
                                 })
                                 .collect();
 
@@ -1013,10 +1018,13 @@ mod tests {
     use paro_planner::plan::OwnedLogicalPlan;
 
     fn int_column(table_index: usize, column_index: usize) -> Expression {
-        Expression::ColumnRef(ColumnRefExpression::new(
-            ColumnBinding::new(table_index, column_index),
-            LogicalType::Integer,
-        ))
+        Expression::ColumnRef(
+            ColumnRefExpression::new(
+                ColumnBinding::new(table_index, column_index),
+                LogicalType::Integer,
+            )
+            .into(),
+        )
     }
 
     fn binding(expression: &Expression) -> ColumnBinding {
@@ -1041,34 +1049,40 @@ mod tests {
             )),
         );
         let count = || {
-            Expression::Aggregate(Box::new(AggregateExpression::new(
-                get_count_star_function(),
-                Vec::new(),
-                LogicalType::BigInt,
-            )))
+            Expression::Aggregate(
+                AggregateExpression::new(
+                    get_count_star_function(),
+                    Vec::new(),
+                    LogicalType::BigInt,
+                )
+                .into(),
+            )
         };
         let (max, _) = get_max_function()
             .bind(&[LogicalType::BigInt])
             .expect("bind max(bigint)");
-        let reducer = Expression::Aggregate(Box::new(AggregateExpression::new(
-            max,
-            vec![Expression::ColumnRef(ColumnRefExpression::new(
-                ColumnBinding::new(12, 1),
+        let reducer = Expression::Aggregate(
+            AggregateExpression::new(
+                max,
+                vec![Expression::ColumnRef(
+                    ColumnRefExpression::new(ColumnBinding::new(12, 1), LogicalType::BigInt).into(),
+                )],
                 LogicalType::BigInt,
-            ))],
-            LogicalType::BigInt,
-        )));
-        let predicate = Expression::Comparison(ComparisonExpression::new(
-            ComparisonType::Equal,
-            Expression::ColumnRef(ColumnRefExpression::new(
-                ColumnBinding::new(12, 1),
-                LogicalType::BigInt,
-            )),
-            Expression::ColumnRef(ColumnRefExpression::new(
-                ColumnBinding::new(14, 0),
-                LogicalType::BigInt,
-            )),
-        ));
+            )
+            .into(),
+        );
+        let predicate = Expression::Comparison(
+            ComparisonExpression::new(
+                ComparisonType::Equal,
+                Expression::ColumnRef(
+                    ColumnRefExpression::new(ColumnBinding::new(12, 1), LogicalType::BigInt).into(),
+                ),
+                Expression::ColumnRef(
+                    ColumnRefExpression::new(ColumnBinding::new(14, 0), LogicalType::BigInt).into(),
+                ),
+            )
+            .into(),
+        );
         let aggregate = Aggregate::new(
             11,
             12,
@@ -1082,10 +1096,9 @@ mod tests {
         .with_post_reduction(PostAggregateReduction {
             reduction_index: 14,
             reducers: vec![reducer],
-            scalar_expressions: vec![Expression::Reference(ReferenceExpression::new(
-                0,
-                LogicalType::BigInt,
-            ))],
+            scalar_expressions: vec![Expression::Reference(
+                ReferenceExpression::new(0, LogicalType::BigInt).into(),
+            )],
             predicate,
         });
         let aggregate = OwnedLogicalPlan::new(ctx, LogicalOperator::Aggregate(Box::new(aggregate)));
@@ -1329,10 +1342,9 @@ mod tests {
         get.column_types[1] = LogicalType::VarcharCollation("C".into());
         get.returned_types[1] = LogicalType::Varchar;
         let scan = OwnedLogicalPlan::new(ctx, LogicalOperator::Get(Box::new(get)));
-        let text = Expression::ColumnRef(ColumnRefExpression::new(
-            ColumnBinding::new(10, 1),
-            LogicalType::Varchar,
-        ));
+        let text = Expression::ColumnRef(
+            ColumnRefExpression::new(ColumnBinding::new(10, 1), LogicalType::Varchar).into(),
+        );
         let mut plan = OwnedLogicalPlan::new(
             ctx,
             LogicalOperator::Projection(Projection::new(20, scan, vec![text])),
@@ -1370,11 +1382,10 @@ mod tests {
                 ],
             ))),
         );
-        let predicate = Expression::Comparison(ComparisonExpression::new(
-            ComparisonType::Equal,
-            int_column(10, 0),
-            int_column(10, 0),
-        ));
+        let predicate = Expression::Comparison(
+            ComparisonExpression::new(ComparisonType::Equal, int_column(10, 0), int_column(10, 0))
+                .into(),
+        );
         let mut filter = Filter::new(scan, vec![predicate]);
         filter.projection_map = vec![0, 2].into();
         let filtered = OwnedLogicalPlan::new(ctx, LogicalOperator::Filter(filter));

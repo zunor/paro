@@ -442,15 +442,21 @@ impl DependentJoinFlattener {
         let mut conditions = Vec::new();
 
         for (idx, corr) in self.outer_correlated_columns.iter().enumerate() {
-            let left_expr = Expression::ColumnRef(ColumnRefExpression::new(
-                ColumnBinding::new(corr.table_index, corr.column_index),
-                corr.return_type.clone(),
-            ));
+            let left_expr = Expression::ColumnRef(
+                ColumnRefExpression::new(
+                    ColumnBinding::new(corr.table_index, corr.column_index),
+                    corr.return_type.clone(),
+                )
+                .into(),
+            );
 
-            let right_expr = Expression::ColumnRef(ColumnRefExpression::new(
-                ColumnBinding::new(base_binding.table_index, base_binding.column_index + idx),
-                corr.return_type.clone(),
-            ));
+            let right_expr = Expression::ColumnRef(
+                ColumnRefExpression::new(
+                    ColumnBinding::new(base_binding.table_index, base_binding.column_index + idx),
+                    corr.return_type.clone(),
+                )
+                .into(),
+            );
 
             conditions.push(JoinCondition::new(
                 left_expr,
@@ -553,10 +559,16 @@ impl DependentJoinFlattener {
             .iter()
             .enumerate()
             .map(|(idx, corr)| {
-                Expression::ColumnRef(ColumnRefExpression::new(
-                    ColumnBinding::new(base_binding.table_index, base_binding.column_index + idx),
-                    corr.return_type.clone(),
-                ))
+                Expression::ColumnRef(
+                    ColumnRefExpression::new(
+                        ColumnBinding::new(
+                            base_binding.table_index,
+                            base_binding.column_index + idx,
+                        ),
+                        corr.return_type.clone(),
+                    )
+                    .into(),
+                )
             })
             .collect()
     }
@@ -565,10 +577,13 @@ impl DependentJoinFlattener {
         self.outer_correlated_columns
             .iter()
             .map(|corr| {
-                Expression::ColumnRef(ColumnRefExpression::new(
-                    ColumnBinding::new(corr.table_index, corr.column_index),
-                    corr.return_type.clone(),
-                ))
+                Expression::ColumnRef(
+                    ColumnRefExpression::new(
+                        ColumnBinding::new(corr.table_index, corr.column_index),
+                        corr.return_type.clone(),
+                    )
+                    .into(),
+                )
             })
             .collect()
     }
@@ -691,10 +706,9 @@ impl DependentJoinFlattener {
                         child_types.len()
                     ))
                 })?;
-                Ok(Expression::ColumnRef(ColumnRefExpression::new(
-                    binding,
-                    logical_type,
-                )))
+                Ok(Expression::ColumnRef(
+                    ColumnRefExpression::new(binding, logical_type).into(),
+                ))
             })
             .collect::<Result<Vec<_>>>()?;
 
@@ -832,39 +846,52 @@ impl DependentJoinFlattener {
         let window_plan = binder.wrap_plan(window);
         let row_number_binding = ColumnBinding::new(window_index, 0);
         let row_number_ref = || {
-            Expression::ColumnRef(ColumnRefExpression::new(
-                row_number_binding,
-                LogicalType::BigInt,
-            ))
+            Expression::ColumnRef(
+                ColumnRefExpression::new(row_number_binding, LogicalType::BigInt).into(),
+            )
         };
 
         let mut filters = Vec::new();
         if let Some(limit) = limit {
             let upper_bound = offset.saturating_add(limit);
-            filters.push(Expression::Comparison(ComparisonExpression::new(
-                ComparisonType::LessThanOrEqual,
-                row_number_ref(),
-                Expression::Constant(ConstantExpression {
-                    value: Value::BigInt(upper_bound as i64),
-                    return_type: LogicalType::BigInt,
-                }),
-            )));
+            filters.push(Expression::Comparison(
+                ComparisonExpression::new(
+                    ComparisonType::LessThanOrEqual,
+                    row_number_ref(),
+                    Expression::Constant(
+                        ConstantExpression {
+                            value: Value::BigInt(upper_bound as i64),
+                            return_type: LogicalType::BigInt,
+                        }
+                        .into(),
+                    ),
+                )
+                .into(),
+            ));
         }
         if offset > 0 {
-            filters.push(Expression::Comparison(ComparisonExpression::new(
-                ComparisonType::GreaterThan,
-                row_number_ref(),
-                Expression::Constant(ConstantExpression {
-                    value: Value::BigInt(offset as i64),
-                    return_type: LogicalType::BigInt,
-                }),
-            )));
+            filters.push(Expression::Comparison(
+                ComparisonExpression::new(
+                    ComparisonType::GreaterThan,
+                    row_number_ref(),
+                    Expression::Constant(
+                        ConstantExpression {
+                            value: Value::BigInt(offset as i64),
+                            return_type: LogicalType::BigInt,
+                        }
+                        .into(),
+                    ),
+                )
+                .into(),
+            ));
         }
 
         let predicate = if filters.len() == 1 {
             filters.pop().expect("single filter")
         } else {
-            Expression::Conjunction(ConjunctionExpression::new(ConjunctionType::And, filters))
+            Expression::Conjunction(
+                ConjunctionExpression::new(ConjunctionType::And, filters).into(),
+            )
         };
         let mut filter = Filter::new(window_plan, vec![predicate]);
         filter.projection_map = Self::all_columns_visible(child_column_count).into();
@@ -1739,10 +1766,10 @@ impl DependentJoinFlattener {
 
         let mut conditions = Vec::with_capacity(expression_children.len());
         for child_idx in 0..expression_children.len() {
-            let right_expr = Expression::ColumnRef(ColumnRefExpression::new(
-                right_bindings[child_idx],
-                child_types[child_idx].clone(),
-            ));
+            let right_expr = Expression::ColumnRef(
+                ColumnRefExpression::new(right_bindings[child_idx], child_types[child_idx].clone())
+                    .into(),
+            );
             let right_expr = CastExpression::add_cast_if_needed(
                 right_expr,
                 child_targets[child_idx].clone(),

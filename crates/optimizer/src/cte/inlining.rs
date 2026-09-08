@@ -156,7 +156,7 @@ fn projection_for_cte_ref(
     let expressions = bindings
         .into_iter()
         .zip(types)
-        .map(|(binding, ty)| Expression::ColumnRef(ColumnRefExpression::new(binding, ty)))
+        .map(|(binding, ty)| Expression::ColumnRef(ColumnRefExpression::new(binding, ty).into()))
         .collect();
     LogicalOperator::Projection(
         Projection::new(table_index, definition, expressions)
@@ -247,10 +247,13 @@ mod tests {
                 table_index,
                 vals.iter()
                     .map(|v| {
-                        vec![Expression::Constant(ConstantExpression {
-                            value: paro_common::runtime_value::Value::Integer(*v),
-                            return_type: LogicalType::Integer,
-                        })]
+                        vec![Expression::Constant(
+                            ConstantExpression {
+                                value: paro_common::runtime_value::Value::Integer(*v),
+                                return_type: LogicalType::Integer,
+                            }
+                            .into(),
+                        )]
                     })
                     .collect(),
                 vec!["v".to_string()],
@@ -286,10 +289,13 @@ mod tests {
                 &bind_context,
                 LogicalOperator::Filter(Filter::new(
                     cte_ref(&bind_context, 10, 2),
-                    vec![Expression::ColumnRef(ColumnRefExpression::new(
-                        paro_planner::operator::ColumnBinding::new(2, 0),
-                        LogicalType::Integer,
-                    ))],
+                    vec![Expression::ColumnRef(
+                        ColumnRefExpression::new(
+                            paro_planner::operator::ColumnBinding::new(2, 0),
+                            LogicalType::Integer,
+                        )
+                        .into(),
+                    )],
                 )),
             ),
         ));
@@ -318,10 +324,13 @@ mod tests {
                 LogicalOperator::Projection(Projection::new(
                     3,
                     values(&bind_context, 1, &[1, 2, 3]),
-                    vec![Expression::ColumnRef(ColumnRefExpression::new(
-                        paro_planner::operator::ColumnBinding::new(1, 0),
-                        LogicalType::Integer,
-                    ))],
+                    vec![Expression::ColumnRef(
+                        ColumnRefExpression::new(
+                            paro_planner::operator::ColumnBinding::new(1, 0),
+                            LogicalType::Integer,
+                        )
+                        .into(),
+                    )],
                 )),
             ),
             OwnedLogicalPlan::new(

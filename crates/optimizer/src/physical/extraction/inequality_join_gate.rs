@@ -689,8 +689,8 @@ mod tests {
         comparison: JoinComparisonType,
     ) -> JoinCondition {
         JoinCondition::new(
-            Expression::Reference(ReferenceExpression::new(0, left_type)),
-            Expression::Reference(ReferenceExpression::new(0, right_type)),
+            Expression::Reference(ReferenceExpression::new(0, left_type).into()),
+            Expression::Reference(ReferenceExpression::new(0, right_type).into()),
             comparison,
         )
     }
@@ -729,8 +729,12 @@ mod tests {
         comparison: JoinComparisonType,
     ) -> JoinCondition {
         JoinCondition::new(
-            Expression::Reference(ReferenceExpression::new(left_index, LogicalType::Integer)),
-            Expression::Reference(ReferenceExpression::new(right_index, LogicalType::Integer)),
+            Expression::Reference(
+                ReferenceExpression::new(left_index, LogicalType::Integer).into(),
+            ),
+            Expression::Reference(
+                ReferenceExpression::new(right_index, LogicalType::Integer).into(),
+            ),
             comparison,
         )
     }

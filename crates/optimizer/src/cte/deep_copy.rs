@@ -25,7 +25,8 @@ mod tests {
                     paro_planner::expression::ConstantExpression {
                         value: paro_common::runtime_value::Value::Integer(*v),
                         return_type: LogicalType::Integer,
-                    },
+                    }
+                    .into(),
                 )]
             })
             .collect();
@@ -47,10 +48,13 @@ mod tests {
         let cte_query = LogicalOperator::Projection(Projection::new(
             3,
             plan_expr_get(&bind_context, 2, &[1, 2]),
-            vec![Expression::ColumnRef(ColumnRefExpression::new(
-                paro_planner::operator::ColumnBinding::new(2, 0),
-                LogicalType::Integer,
-            ))],
+            vec![Expression::ColumnRef(
+                ColumnRefExpression::new(
+                    paro_planner::operator::ColumnBinding::new(2, 0),
+                    LogicalType::Integer,
+                )
+                .into(),
+            )],
         ));
         let cte_query_with_nested = LogicalOperator::MaterializedCTE(MaterializedCTE::new(
             4,
@@ -90,14 +94,20 @@ mod tests {
             OwnedLogicalPlan::new(&bind_context, left_ref),
             OwnedLogicalPlan::new(&bind_context, right_ref),
             vec![JoinCondition::new(
-                Expression::ColumnRef(ColumnRefExpression::new(
-                    paro_planner::operator::ColumnBinding::new(6, 0),
-                    LogicalType::Integer,
-                )),
-                Expression::ColumnRef(ColumnRefExpression::new(
-                    paro_planner::operator::ColumnBinding::new(7, 0),
-                    LogicalType::Integer,
-                )),
+                Expression::ColumnRef(
+                    ColumnRefExpression::new(
+                        paro_planner::operator::ColumnBinding::new(6, 0),
+                        LogicalType::Integer,
+                    )
+                    .into(),
+                ),
+                Expression::ColumnRef(
+                    ColumnRefExpression::new(
+                        paro_planner::operator::ColumnBinding::new(7, 0),
+                        LogicalType::Integer,
+                    )
+                    .into(),
+                ),
                 JoinComparisonType::Equal,
             )],
         )));

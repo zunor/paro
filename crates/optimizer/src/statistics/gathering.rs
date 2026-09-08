@@ -8,9 +8,7 @@ use paro_common::error::Result;
 use paro_common::runtime_value::Value;
 use paro_common::types::LogicalType;
 use paro_parser::ast::PathQuantifier;
-use paro_planner::expression::{
-    ComparisonExpression, ComparisonType, ConjunctionType, ConstantExpression, Expression,
-};
+use paro_planner::expression::{ComparisonExpression, ComparisonType, ConjunctionType, Expression};
 use paro_planner::operator::{
     ColumnBinding, Filter, FullTextFilterScan, Get, GraphExpand, GraphScan, Join,
     JoinComparisonType, JoinCondition, JoinType, LogicalOperator, LogicalOutputLayout, SearchScan,
@@ -1509,11 +1507,14 @@ fn estimate_join_condition_selectivity(
         _ => {}
     }
 
-    let expr = Expression::Comparison(ComparisonExpression::new(
-        join_comparison_to_comparison(condition.comparison),
-        condition.left.clone(),
-        condition.right.clone(),
-    ));
+    let expr = Expression::Comparison(
+        ComparisonExpression::new(
+            join_comparison_to_comparison(condition.comparison),
+            condition.left.clone(),
+            condition.right.clone(),
+        )
+        .into(),
+    );
     ctx.cost_model
         .estimate_selectivity(&expr, &ctx.column_stats)
 }
@@ -1532,10 +1533,10 @@ fn join_comparison_to_comparison(comparison: JoinComparisonType) -> ComparisonTy
 }
 
 fn extract_constant_usize(expr: &Expression) -> Option<usize> {
-    let Expression::Constant(ConstantExpression { value, .. }) = expr else {
+    let Expression::Constant(constant) = expr else {
         return None;
     };
-    match value {
+    match &constant.value {
         Value::TinyInt(v) if *v >= 0 => Some(*v as usize),
         Value::SmallInt(v) if *v >= 0 => Some(*v as usize),
         Value::Integer(v) if *v >= 0 => Some(*v as usize),
@@ -1659,7 +1660,7 @@ mod tests {
     use paro_context::StatementContext;
     use paro_planner::binder::context::BindContext;
     use paro_planner::binder::ir::{CTEMaterialize, GroupingSet};
-    use paro_planner::expression::{ColumnRefExpression, ComparisonExpression};
+    use paro_planner::expression::{ColumnRefExpression, ComparisonExpression, ConstantExpression};
     use paro_planner::operator::graph_expand::ExpandDirection;
     use paro_planner::operator::{
         Aggregate, CTERef, DelimGet, ExpressionGet, Filter, GraphExpand, GraphScan, Limit,
@@ -1675,11 +1676,14 @@ mod tests {
     }
 
     fn column_ref(table_index: usize, column_index: usize) -> Expression {
-        Expression::ColumnRef(ColumnRefExpression {
-            binding: ColumnBinding::new(table_index, column_index),
-            depth: 0,
-            return_type: LogicalType::BigInt,
-        })
+        Expression::ColumnRef(
+            ColumnRefExpression {
+                binding: ColumnBinding::new(table_index, column_index),
+                depth: 0,
+                return_type: LogicalType::BigInt,
+            }
+            .into(),
+        )
     }
 
     fn equality(
@@ -1705,10 +1709,9 @@ mod tests {
             LogicalOperator::ExpressionGet(ExpressionGet::new(
                 table_index,
                 vec![
-                    vec![Expression::Constant(ConstantExpression::new(
-                        Value::BigInt(1),
-                        LogicalType::BigInt,
-                    ))];
+                    vec![Expression::Constant(
+                        ConstantExpression::new(Value::BigInt(1), LogicalType::BigInt,).into()
+                    )];
                     rows
                 ],
                 vec!["v".to_string()],
@@ -1728,10 +1731,9 @@ mod tests {
             LogicalOperator::ExpressionGet(ExpressionGet::new(
                 1,
                 vec![
-                    vec![Expression::Constant(ConstantExpression::new(
-                        Value::BigInt(1),
-                        LogicalType::BigInt,
-                    ))];
+                    vec![Expression::Constant(
+                        ConstantExpression::new(Value::BigInt(1), LogicalType::BigInt,).into()
+                    )];
                     10
                 ],
                 vec!["v".to_string()],
@@ -1743,21 +1745,23 @@ mod tests {
             LogicalOperator::Projection(Projection::new(
                 2,
                 child,
-                vec![Expression::ColumnRef(ColumnRefExpression {
-                    binding: ColumnBinding::new(1, 0),
-                    depth: 0,
-                    return_type: LogicalType::BigInt,
-                })],
+                vec![Expression::ColumnRef(
+                    ColumnRefExpression {
+                        binding: ColumnBinding::new(1, 0),
+                        depth: 0,
+                        return_type: LogicalType::BigInt,
+                    }
+                    .into(),
+                )],
             )),
         );
         let plan = OwnedLogicalPlan::new(
             &bind_context,
             LogicalOperator::Limit(Box::new(Limit::new(
                 projection,
-                Some(Expression::Constant(ConstantExpression::new(
-                    Value::BigInt(3),
-                    LogicalType::BigInt,
-                ))),
+                Some(Expression::Constant(
+                    ConstantExpression::new(Value::BigInt(3), LogicalType::BigInt).into(),
+                )),
                 None,
             ))),
         );
@@ -1794,10 +1798,9 @@ mod tests {
                     &bind_context,
                     LogicalOperator::ExpressionGet(ExpressionGet::new(
                         17,
-                        vec![vec![Expression::Constant(ConstantExpression::new(
-                            Value::Integer(1),
-                            LogicalType::Integer,
-                        ))]],
+                        vec![vec![Expression::Constant(
+                            ConstantExpression::new(Value::Integer(1), LogicalType::Integer).into(),
+                        )]],
                         vec!["v".to_string()],
                         vec![LogicalType::Integer],
                     )),
@@ -2088,10 +2091,10 @@ mod tests {
                 1,
                 (0..35)
                     .map(|value| {
-                        vec![Expression::Constant(ConstantExpression::new(
-                            Value::BigInt(value % 7),
-                            LogicalType::BigInt,
-                        ))]
+                        vec![Expression::Constant(
+                            ConstantExpression::new(Value::BigInt(value % 7), LogicalType::BigInt)
+                                .into(),
+                        )]
                     })
                     .collect(),
                 vec!["key".to_string()],
@@ -2258,13 +2261,14 @@ mod tests {
                 .expect("bind FIRST");
         assert_eq!(target_types, vec![LogicalType::BigInt]);
         let return_type = function.return_type.clone();
-        let expression = Expression::Aggregate(Box::new(
+        let expression = Expression::Aggregate(
             paro_planner::expression::AggregateExpression::new(
                 function,
                 vec![column_ref(1, 0)],
                 return_type,
-            ),
-        ));
+            )
+            .into(),
+        );
 
         let unconstrained = aggregate_expression_statistics(&expression, &ctx, None);
         assert_eq!(unconstrained.distinct_evidence().point, 3);
@@ -2289,14 +2293,16 @@ mod tests {
         ctx.column_stats_mut().insert(binding, Arc::new(storage));
         let filter = Filter::new(
             values_relation(&bind_context, 1, 4),
-            vec![Expression::Comparison(ComparisonExpression::new(
-                ComparisonType::Equal,
-                column_ref(1, 0),
-                Expression::Constant(ConstantExpression::new(
-                    Value::BigInt(2001),
-                    LogicalType::BigInt,
-                )),
-            ))],
+            vec![Expression::Comparison(
+                ComparisonExpression::new(
+                    ComparisonType::Equal,
+                    column_ref(1, 0),
+                    Expression::Constant(
+                        ConstantExpression::new(Value::BigInt(2001), LogicalType::BigInt).into(),
+                    ),
+                )
+                .into(),
+            )],
         );
 
         let output = filter_output_stats(&filter, &filter.child.output_layout(), &ctx);
@@ -2337,18 +2343,15 @@ mod tests {
             LogicalOperator::ExpressionGet(ExpressionGet::new(
                 1,
                 vec![vec![
-                    Expression::Constant(ConstantExpression::new(
-                        Value::BigInt(7),
-                        LogicalType::BigInt,
-                    )),
-                    Expression::Constant(ConstantExpression::new(
-                        Value::BigInt(8),
-                        LogicalType::BigInt,
-                    )),
-                    Expression::Constant(ConstantExpression::new(
-                        Value::BigInt(99),
-                        LogicalType::BigInt,
-                    )),
+                    Expression::Constant(
+                        ConstantExpression::new(Value::BigInt(7), LogicalType::BigInt).into(),
+                    ),
+                    Expression::Constant(
+                        ConstantExpression::new(Value::BigInt(8), LogicalType::BigInt).into(),
+                    ),
+                    Expression::Constant(
+                        ConstantExpression::new(Value::BigInt(99), LogicalType::BigInt).into(),
+                    ),
                 ]],
                 vec!["a".to_string(), "b".to_string(), "c".to_string()],
                 vec![LogicalType::BigInt; 3],
@@ -2356,14 +2359,16 @@ mod tests {
         );
         let mut filter = Filter::new(
             child,
-            vec![Expression::Comparison(ComparisonExpression::new(
-                ComparisonType::Equal,
-                column_ref(1, 0),
-                Expression::Constant(ConstantExpression::new(
-                    Value::BigInt(2001),
-                    LogicalType::BigInt,
-                )),
-            ))],
+            vec![Expression::Comparison(
+                ComparisonExpression::new(
+                    ComparisonType::Equal,
+                    column_ref(1, 0),
+                    Expression::Constant(
+                        ConstantExpression::new(Value::BigInt(2001), LogicalType::BigInt).into(),
+                    ),
+                )
+                .into(),
+            )],
         );
         filter.projection_map = vec![2, 0].into();
 
@@ -2389,14 +2394,16 @@ mod tests {
         storage.update_distinct_statistics(&[11, 29, 47], 3);
         ctx.column_stats_mut().insert(binding, Arc::new(storage));
         let equality = |year| {
-            Expression::Comparison(ComparisonExpression::new(
-                ComparisonType::Equal,
-                column_ref(1, 0),
-                Expression::Constant(ConstantExpression::new(
-                    Value::BigInt(year),
-                    LogicalType::BigInt,
-                )),
-            ))
+            Expression::Comparison(
+                ComparisonExpression::new(
+                    ComparisonType::Equal,
+                    column_ref(1, 0),
+                    Expression::Constant(
+                        ConstantExpression::new(Value::BigInt(year), LogicalType::BigInt).into(),
+                    ),
+                )
+                .into(),
+            )
         };
         let filter = Filter::new(
             values_relation(&bind_context, 1, 4),
@@ -2404,7 +2411,8 @@ mod tests {
                 paro_planner::expression::ConjunctionExpression::new(
                     ConjunctionType::Or,
                     vec![equality(2001), equality(2002), equality(2001)],
-                ),
+                )
+                .into(),
             )],
         );
 
@@ -2558,14 +2566,12 @@ mod tests {
     #[test]
     fn physical_references_recover_their_relation_pair_from_join_inputs() {
         let condition = JoinCondition::new(
-            Expression::Reference(paro_planner::expression::ReferenceExpression::new(
-                1,
-                LogicalType::BigInt,
-            )),
-            Expression::Reference(paro_planner::expression::ReferenceExpression::new(
-                0,
-                LogicalType::BigInt,
-            )),
+            Expression::Reference(
+                paro_planner::expression::ReferenceExpression::new(1, LogicalType::BigInt).into(),
+            ),
+            Expression::Reference(
+                paro_planner::expression::ReferenceExpression::new(0, LogicalType::BigInt).into(),
+            ),
             JoinComparisonType::Equal,
         );
         assert_eq!(

@@ -139,8 +139,9 @@ impl Binder {
             source_types.iter().zip(target_types.iter()).enumerate()
         {
             let binding = &child_bindings[i];
-            let col_ref =
-                Expression::ColumnRef(ColumnRefExpression::new(*binding, source_type.clone()));
+            let col_ref = Expression::ColumnRef(
+                ColumnRefExpression::new(*binding, source_type.clone()).into(),
+            );
 
             if source_type != target_type {
                 let cast_expr = CastExpression::add_explicit_cast(

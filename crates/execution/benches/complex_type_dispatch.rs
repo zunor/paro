@@ -124,7 +124,7 @@ fn embedding_vector(offset: f32) -> Vector {
 }
 
 fn reference(index: usize, logical_type: LogicalType) -> Expression {
-    Expression::Reference(ReferenceExpression::new(index, logical_type))
+    Expression::Reference(ReferenceExpression::new(index, logical_type).into())
 }
 
 fn array_length_expr(array_type: LogicalType) -> Expression {
@@ -133,11 +133,14 @@ fn array_length_expr(array_type: LogicalType) -> Expression {
         vec![array_type.clone(), LogicalType::Integer],
         vec![None, None],
     );
-    Expression::Function(Box::new(FunctionExpression::new(
-        bound,
-        vec![reference(0, array_type), reference(1, LogicalType::Integer)],
-        LogicalType::Integer,
-    )))
+    Expression::Function(
+        FunctionExpression::new(
+            bound,
+            vec![reference(0, array_type), reference(1, LogicalType::Integer)],
+            LogicalType::Integer,
+        )
+        .into(),
+    )
 }
 
 fn array_to_string_expr(array_type: LogicalType) -> Expression {
@@ -146,11 +149,14 @@ fn array_to_string_expr(array_type: LogicalType) -> Expression {
         vec![array_type.clone(), LogicalType::Varchar],
         vec![None, None],
     );
-    Expression::Function(Box::new(FunctionExpression::new(
-        bound,
-        vec![reference(0, array_type), reference(1, LogicalType::Varchar)],
-        LogicalType::Varchar,
-    )))
+    Expression::Function(
+        FunctionExpression::new(
+            bound,
+            vec![reference(0, array_type), reference(1, LogicalType::Varchar)],
+            LogicalType::Varchar,
+        )
+        .into(),
+    )
 }
 
 fn l2_distance_expr(array_type: LogicalType) -> Expression {
@@ -159,11 +165,14 @@ fn l2_distance_expr(array_type: LogicalType) -> Expression {
         vec![array_type.clone(), array_type.clone()],
         vec![None, None],
     );
-    Expression::Function(Box::new(FunctionExpression::new(
-        bound,
-        vec![reference(0, array_type.clone()), reference(1, array_type)],
-        LogicalType::Double,
-    )))
+    Expression::Function(
+        FunctionExpression::new(
+            bound,
+            vec![reference(0, array_type.clone()), reference(1, array_type)],
+            LogicalType::Double,
+        )
+        .into(),
+    )
 }
 
 #[divan::bench(sample_count = 10)]

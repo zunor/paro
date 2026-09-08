@@ -358,8 +358,8 @@ fn bind_using_clause(
             let mut expression_binder = expr::ExpressionBinder::new(binder);
             expr::bind_bound_comparison(
                 &mut expression_binder,
-                Expression::ColumnRef(left_col),
-                Expression::ColumnRef(right_col),
+                Expression::ColumnRef(left_col.into()),
+                Expression::ColumnRef(right_col.into()),
                 ComparisonType::Equal,
             )?
         };
@@ -371,10 +371,13 @@ fn bind_using_clause(
     if conditions.len() == 1 {
         Ok(Some(conditions.pop().unwrap()))
     } else {
-        Ok(Some(Expression::Conjunction(ConjunctionExpression {
-            conjunction_type: ConjunctionType::And,
-            children: conditions,
-        })))
+        Ok(Some(Expression::Conjunction(
+            ConjunctionExpression {
+                conjunction_type: ConjunctionType::And,
+                children: conditions,
+            }
+            .into(),
+        )))
     }
 }
 

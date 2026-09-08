@@ -53,10 +53,9 @@ fn bind_column_ref_inner(
         let column_index = local.column_index;
         let return_type = local.return_type;
         let binding = ColumnBinding::new(table_index, column_index);
-        Ok(Expression::ColumnRef(ColumnRefExpression::new(
-            binding,
-            return_type,
-        )))
+        Ok(Expression::ColumnRef(
+            ColumnRefExpression::new(binding, return_type).into(),
+        ))
     } else {
         // 3. Resolve virtual rowid pseudo-column.
         if column_name.eq_ignore_ascii_case("rowid") {
@@ -80,10 +79,10 @@ fn bind_column_ref_inner(
             if let Some((table_index, rowid_col_idx)) = rowid_binding {
                 binder.mark_row_id_binding(table_index);
                 let binding = ColumnBinding::new(table_index, rowid_col_idx);
-                return Ok(Expression::ColumnRef(ColumnRefExpression::new(
-                    binding,
-                    paro_common::types::LogicalType::BigInt,
-                )));
+                return Ok(Expression::ColumnRef(
+                    ColumnRefExpression::new(binding, paro_common::types::LogicalType::BigInt)
+                        .into(),
+                ));
             }
         }
 
@@ -102,11 +101,9 @@ fn bind_column_ref_inner(
             };
             binder.correlated_columns.push(corr.clone());
             let binding = ColumnBinding::new(corr.table_index, corr.column_index);
-            return Ok(Expression::ColumnRef(ColumnRefExpression::with_depth(
-                binding,
-                corr.return_type,
-                corr.depth,
-            )));
+            return Ok(Expression::ColumnRef(
+                ColumnRefExpression::with_depth(binding, corr.return_type, corr.depth).into(),
+            ));
         }
 
         // Build a descriptive error message including schema if present

@@ -255,10 +255,9 @@ impl GraphPredicatePushdown {
     fn merge_filter(slot: &mut Option<Expression>, pred: Expression) {
         match slot.take() {
             Some(existing) => {
-                *slot = Some(Expression::Conjunction(ConjunctionExpression::new(
-                    ConjunctionType::And,
-                    vec![existing, pred],
-                )));
+                *slot = Some(Expression::Conjunction(
+                    ConjunctionExpression::new(ConjunctionType::And, vec![existing, pred]).into(),
+                ));
             }
             None => {
                 *slot = Some(pred);
@@ -450,10 +449,10 @@ mod tests {
 
     fn make_column(table_index: usize, col_index: usize, ty: LogicalType) -> BoundGraphColumn {
         BoundGraphColumn {
-            expr: Expression::ColumnRef(ColumnRefExpression::new(
-                ColumnBinding::new(table_index, col_index),
-                ty.clone(),
-            )),
+            expr: Expression::ColumnRef(
+                ColumnRefExpression::new(ColumnBinding::new(table_index, col_index), ty.clone())
+                    .into(),
+            ),
             alias: format!("col_{}_{}", table_index, col_index),
             logical_type: ty,
         }
@@ -519,14 +518,20 @@ mod tests {
         cmp: ComparisonType,
         val: paro_common::runtime_value::Value,
     ) -> Expression {
-        Expression::Comparison(ComparisonExpression::new(
-            cmp,
-            Expression::ColumnRef(ColumnRefExpression::new(
-                ColumnBinding::new(table_index, col_index),
-                col_type.clone(),
-            )),
-            Expression::Constant(ConstantExpression::new(val, col_type)),
-        ))
+        Expression::Comparison(
+            ComparisonExpression::new(
+                cmp,
+                Expression::ColumnRef(
+                    ColumnRefExpression::new(
+                        ColumnBinding::new(table_index, col_index),
+                        col_type.clone(),
+                    )
+                    .into(),
+                ),
+                Expression::Constant(ConstantExpression::new(val, col_type).into()),
+            )
+            .into(),
+        )
     }
 
     // --- Tests ---
@@ -652,10 +657,9 @@ mod tests {
             ComparisonType::GreaterThan,
             paro_common::runtime_value::Value::Float(0.5),
         );
-        let and_pred = Expression::Conjunction(ConjunctionExpression::new(
-            ConjunctionType::And,
-            vec![pred_a, pred_k],
-        ));
+        let and_pred = Expression::Conjunction(
+            ConjunctionExpression::new(ConjunctionType::And, vec![pred_a, pred_k]).into(),
+        );
         let filtered = LogicalOperator::Filter(Filter::new(
             OwnedLogicalPlan::synthetic(plan),
             vec![and_pred],
@@ -686,17 +690,26 @@ mod tests {
         // Output col 0 = a.name (table_index=10, col 1)
         // Output col 2 = b.name (table_index=12, col 1)
         // After remapping, the predicate references both table 10 and 12.
-        let cross_pred = Expression::Comparison(ComparisonExpression::new(
-            ComparisonType::GreaterThan,
-            Expression::ColumnRef(ColumnRefExpression::new(
-                ColumnBinding::new(100, 0), // a.name
-                LogicalType::Varchar,
-            )),
-            Expression::ColumnRef(ColumnRefExpression::new(
-                ColumnBinding::new(100, 2), // b.name
-                LogicalType::Varchar,
-            )),
-        ));
+        let cross_pred = Expression::Comparison(
+            ComparisonExpression::new(
+                ComparisonType::GreaterThan,
+                Expression::ColumnRef(
+                    ColumnRefExpression::new(
+                        ColumnBinding::new(100, 0), // a.name
+                        LogicalType::Varchar,
+                    )
+                    .into(),
+                ),
+                Expression::ColumnRef(
+                    ColumnRefExpression::new(
+                        ColumnBinding::new(100, 2), // b.name
+                        LogicalType::Varchar,
+                    )
+                    .into(),
+                ),
+            )
+            .into(),
+        );
         let filtered = LogicalOperator::Filter(Filter::new(
             OwnedLogicalPlan::synthetic(plan),
             vec![cross_pred],

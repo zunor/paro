@@ -556,10 +556,13 @@ fn graph_filter_is_part_of_the_query_ir_fingerprint() {
                 label: "Person".to_string(),
                 property_column_ids: vec![1],
             },
-            Some(Expression::Constant(ConstantExpression {
-                value: Value::Boolean(value),
-                return_type: LogicalType::Boolean,
-            })),
+            Some(Expression::Constant(
+                ConstantExpression {
+                    value: Value::Boolean(value),
+                    return_type: LogicalType::Boolean,
+                }
+                .into(),
+            )),
             1,
             2,
             "Person".to_string(),
@@ -646,8 +649,8 @@ fn memo_winner_names_the_hash_join_implementation() {
         )),
     );
     let condition = JoinCondition::equality(
-        Expression::Reference(ReferenceExpression::new(0, LogicalType::Integer)),
-        Expression::Reference(ReferenceExpression::new(0, LogicalType::Integer)),
+        Expression::Reference(ReferenceExpression::new(0, LogicalType::Integer).into()),
+        Expression::Reference(ReferenceExpression::new(0, LogicalType::Integer).into()),
     );
     let join = OwnedLogicalPlan::new(
         &bind_context,
@@ -695,8 +698,8 @@ fn memo_hash_join_can_select_logical_left_as_physical_build() {
     );
     right.stats.estimated_cardinality = Some(CardinalityEstimate::exact(4096));
     let condition = JoinCondition::equality(
-        Expression::Reference(ReferenceExpression::new(0, LogicalType::Integer)),
-        Expression::Reference(ReferenceExpression::new(0, LogicalType::Integer)),
+        Expression::Reference(ReferenceExpression::new(0, LogicalType::Integer).into()),
+        Expression::Reference(ReferenceExpression::new(0, LogicalType::Integer).into()),
     );
     let mut join = OwnedLogicalPlan::new(
         &bind_context,
@@ -750,8 +753,8 @@ fn memo_hash_join_does_not_materialize_a_selectivity_reduced_fact_subtree() {
     dimension.stats.materialization_risk_cardinality = Some(4096);
 
     let condition = JoinCondition::equality(
-        Expression::Reference(ReferenceExpression::new(0, LogicalType::Integer)),
-        Expression::Reference(ReferenceExpression::new(0, LogicalType::Integer)),
+        Expression::Reference(ReferenceExpression::new(0, LogicalType::Integer).into()),
+        Expression::Reference(ReferenceExpression::new(0, LogicalType::Integer).into()),
     );
     let mut join = OwnedLogicalPlan::new(
         &bind_context,
@@ -784,8 +787,8 @@ fn preserved_build_can_filter_a_direct_non_preserved_probe() {
     let mut non_preserved_probe = test_base_get(1, 20_022, "non_preserved_probe", 719_384);
     non_preserved_probe.stats.estimated_cardinality = Some(CardinalityEstimate::exact(719_384));
     let condition = JoinCondition::equality(
-        Expression::Reference(ReferenceExpression::new(0, LogicalType::Integer)),
-        Expression::Reference(ReferenceExpression::new(0, LogicalType::Integer)),
+        Expression::Reference(ReferenceExpression::new(0, LogicalType::Integer).into()),
+        Expression::Reference(ReferenceExpression::new(0, LogicalType::Integer).into()),
     );
     let join = ComparisonJoin::new(
         JoinType::Left,
@@ -843,8 +846,9 @@ fn calibration_revision_can_change_the_selected_physical_algorithm() {
             )),
         );
         right.stats.estimated_cardinality = Some(CardinalityEstimate::exact(512));
-        let reference =
-            |index| Expression::Reference(ReferenceExpression::new(index, LogicalType::Integer));
+        let reference = |index| {
+            Expression::Reference(ReferenceExpression::new(index, LogicalType::Integer).into())
+        };
         let mut join = OwnedLogicalPlan::new(
             &bind_context,
             LogicalOperator::Join(Join::comparison(
@@ -923,10 +927,9 @@ fn memo_window_winner_is_the_node_lowered_by_the_physical_extractor() {
             1,
             vec![WindowExpression::aggregate(
                 aggregate,
-                vec![Expression::Reference(ReferenceExpression::new(
-                    0,
-                    LogicalType::Integer,
-                ))],
+                vec![Expression::Reference(
+                    ReferenceExpression::new(0, LogicalType::Integer).into(),
+                )],
                 Vec::new(),
                 WindowFrame::default(),
             )],
@@ -979,10 +982,9 @@ fn mark_join_to_semi_is_an_explicit_isolatable_transformation() {
             )),
         );
         let column = |table_index, logical_type| {
-            Expression::ColumnRef(ColumnRefExpression::new(
-                ColumnBinding::new(table_index, 0),
-                logical_type,
-            ))
+            Expression::ColumnRef(
+                ColumnRefExpression::new(ColumnBinding::new(table_index, 0), logical_type).into(),
+            )
         };
         let mut join = ComparisonJoin::new(
             JoinType::Mark,
@@ -1068,10 +1070,9 @@ fn integer_value_rows(rows: usize, columns: usize) -> Vec<Vec<Expression>> {
         .map(|_| {
             (0..columns)
                 .map(|_| {
-                    Expression::Constant(ConstantExpression::new(
-                        Value::Integer(0),
-                        LogicalType::Integer,
-                    ))
+                    Expression::Constant(
+                        ConstantExpression::new(Value::Integer(0), LogicalType::Integer).into(),
+                    )
                 })
                 .collect()
         })
@@ -1130,8 +1131,8 @@ fn direct_rowset_reference_admits_and_selects_runtime_filter_region() {
     let mut right = test_base_get(1, 20_002, "build", 20);
     right.stats.estimated_cardinality = Some(CardinalityEstimate::exact(20));
     let condition = JoinCondition::equality(
-        Expression::Reference(ReferenceExpression::new(0, LogicalType::Integer)),
-        Expression::Reference(ReferenceExpression::new(0, LogicalType::Integer)),
+        Expression::Reference(ReferenceExpression::new(0, LogicalType::Integer).into()),
+        Expression::Reference(ReferenceExpression::new(0, LogicalType::Integer).into()),
     );
     let join = ComparisonJoin::new(JoinType::Inner, left, right, vec![condition]);
     assert!(supports_runtime_filter_auxiliary(&join, true));
@@ -1191,8 +1192,8 @@ fn oversized_runtime_filter_candidate_span_yields_to_the_baseline() {
             left,
             right,
             vec![JoinCondition::equality(
-                Expression::Reference(ReferenceExpression::new(0, LogicalType::Integer)),
-                Expression::Reference(ReferenceExpression::new(0, LogicalType::Integer)),
+                Expression::Reference(ReferenceExpression::new(0, LogicalType::Integer).into()),
+                Expression::Reference(ReferenceExpression::new(0, LogicalType::Integer).into()),
             )],
         ),
     )));
@@ -1226,8 +1227,8 @@ fn fully_pushable_filter_probe_requires_the_pushdown_compile_capability() {
         left,
         right,
         vec![JoinCondition::equality(
-            Expression::Reference(ReferenceExpression::new(0, LogicalType::Integer)),
-            Expression::Reference(ReferenceExpression::new(0, LogicalType::Integer)),
+            Expression::Reference(ReferenceExpression::new(0, LogicalType::Integer).into()),
+            Expression::Reference(ReferenceExpression::new(0, LogicalType::Integer).into()),
         )],
     );
 
@@ -1242,10 +1243,9 @@ fn passthrough_projection_keeps_the_runtime_filter_consumer_lineage() {
     let mut left = OwnedLogicalPlan::synthetic(LogicalOperator::Projection(Projection::new(
         2,
         probe,
-        vec![Expression::Reference(ReferenceExpression::new(
-            0,
-            LogicalType::Integer,
-        ))],
+        vec![Expression::Reference(
+            ReferenceExpression::new(0, LogicalType::Integer).into(),
+        )],
     )));
     left.stats.estimated_cardinality = Some(CardinalityEstimate::exact(20_000));
     let mut right = test_base_get(1, 20_006, "build", 20);
@@ -1255,8 +1255,8 @@ fn passthrough_projection_keeps_the_runtime_filter_consumer_lineage() {
         left,
         right,
         vec![JoinCondition::equality(
-            Expression::Reference(ReferenceExpression::new(0, LogicalType::Integer)),
-            Expression::Reference(ReferenceExpression::new(0, LogicalType::Integer)),
+            Expression::Reference(ReferenceExpression::new(0, LogicalType::Integer).into()),
+            Expression::Reference(ReferenceExpression::new(0, LogicalType::Integer).into()),
         )],
     );
     assert!(supports_runtime_filter_auxiliary(&join, true));
@@ -1309,8 +1309,8 @@ fn inner_join_probe_keeps_runtime_filter_consumer_lineage() {
         fact,
         dimension,
         vec![JoinCondition::equality(
-            Expression::Reference(ReferenceExpression::new(0, LogicalType::Integer)),
-            Expression::Reference(ReferenceExpression::new(0, LogicalType::Integer)),
+            Expression::Reference(ReferenceExpression::new(0, LogicalType::Integer).into()),
+            Expression::Reference(ReferenceExpression::new(0, LogicalType::Integer).into()),
         )],
     );
     let probe = OwnedLogicalPlan::synthetic(LogicalOperator::Join(Join::Comparison(first_join)));
@@ -1320,8 +1320,8 @@ fn inner_join_probe_keeps_runtime_filter_consumer_lineage() {
         probe,
         build,
         vec![JoinCondition::equality(
-            Expression::Reference(ReferenceExpression::new(0, LogicalType::Integer)),
-            Expression::Reference(ReferenceExpression::new(0, LogicalType::Integer)),
+            Expression::Reference(ReferenceExpression::new(0, LogicalType::Integer).into()),
+            Expression::Reference(ReferenceExpression::new(0, LogicalType::Integer).into()),
         )],
     );
     assert!(supports_runtime_filter_auxiliary(&join, true));
@@ -1351,8 +1351,8 @@ fn semi_join_preserved_probe_keeps_runtime_filter_consumer_lineage() {
         fact,
         dimension,
         vec![JoinCondition::equality(
-            Expression::Reference(ReferenceExpression::new(0, LogicalType::Integer)),
-            Expression::Reference(ReferenceExpression::new(0, LogicalType::Integer)),
+            Expression::Reference(ReferenceExpression::new(0, LogicalType::Integer).into()),
+            Expression::Reference(ReferenceExpression::new(0, LogicalType::Integer).into()),
         )],
     );
     let probe = OwnedLogicalPlan::synthetic(LogicalOperator::Join(Join::Comparison(first_join)));
@@ -1362,8 +1362,8 @@ fn semi_join_preserved_probe_keeps_runtime_filter_consumer_lineage() {
         probe,
         build,
         vec![JoinCondition::equality(
-            Expression::Reference(ReferenceExpression::new(0, LogicalType::Integer)),
-            Expression::Reference(ReferenceExpression::new(0, LogicalType::Integer)),
+            Expression::Reference(ReferenceExpression::new(0, LogicalType::Integer).into()),
+            Expression::Reference(ReferenceExpression::new(0, LogicalType::Integer).into()),
         )],
     );
     assert!(supports_runtime_filter_auxiliary(&join, true));
@@ -1393,8 +1393,8 @@ fn left_outer_preserved_probe_keeps_runtime_filter_consumer_lineage() {
         preserved,
         nullable_build,
         vec![JoinCondition::equality(
-            Expression::Reference(ReferenceExpression::new(0, LogicalType::Integer)),
-            Expression::Reference(ReferenceExpression::new(0, LogicalType::Integer)),
+            Expression::Reference(ReferenceExpression::new(0, LogicalType::Integer).into()),
+            Expression::Reference(ReferenceExpression::new(0, LogicalType::Integer).into()),
         )],
     );
     let probe = OwnedLogicalPlan::synthetic(LogicalOperator::Join(Join::Comparison(left_join)));
@@ -1404,8 +1404,8 @@ fn left_outer_preserved_probe_keeps_runtime_filter_consumer_lineage() {
         probe,
         build,
         vec![JoinCondition::equality(
-            Expression::Reference(ReferenceExpression::new(0, LogicalType::Integer)),
-            Expression::Reference(ReferenceExpression::new(0, LogicalType::Integer)),
+            Expression::Reference(ReferenceExpression::new(0, LogicalType::Integer).into()),
+            Expression::Reference(ReferenceExpression::new(0, LogicalType::Integer).into()),
         )],
     );
     assert!(supports_runtime_filter_auxiliary(&join, true));
@@ -1435,8 +1435,8 @@ fn left_outer_nullable_build_output_stops_runtime_filter_lineage() {
         preserved,
         nullable_build,
         vec![JoinCondition::equality(
-            Expression::Reference(ReferenceExpression::new(0, LogicalType::Integer)),
-            Expression::Reference(ReferenceExpression::new(0, LogicalType::Integer)),
+            Expression::Reference(ReferenceExpression::new(0, LogicalType::Integer).into()),
+            Expression::Reference(ReferenceExpression::new(0, LogicalType::Integer).into()),
         )],
     );
     let probe = OwnedLogicalPlan::synthetic(LogicalOperator::Join(Join::Comparison(left_join)));
@@ -1446,8 +1446,8 @@ fn left_outer_nullable_build_output_stops_runtime_filter_lineage() {
         probe,
         build,
         vec![JoinCondition::equality(
-            Expression::Reference(ReferenceExpression::new(1, LogicalType::Integer)),
-            Expression::Reference(ReferenceExpression::new(0, LogicalType::Integer)),
+            Expression::Reference(ReferenceExpression::new(1, LogicalType::Integer).into()),
+            Expression::Reference(ReferenceExpression::new(0, LogicalType::Integer).into()),
         )],
     );
 
@@ -1465,8 +1465,8 @@ fn nested_filters_share_one_ordered_source_work_lane() {
         fact,
         first_build,
         vec![JoinCondition::equality(
-            Expression::Reference(ReferenceExpression::new(0, LogicalType::Integer)),
-            Expression::Reference(ReferenceExpression::new(0, LogicalType::Integer)),
+            Expression::Reference(ReferenceExpression::new(0, LogicalType::Integer).into()),
+            Expression::Reference(ReferenceExpression::new(0, LogicalType::Integer).into()),
         )],
     );
     let mut probe =
@@ -1483,8 +1483,8 @@ fn nested_filters_share_one_ordered_source_work_lane() {
         probe,
         second_build,
         vec![JoinCondition::equality(
-            Expression::Reference(ReferenceExpression::new(0, LogicalType::Integer)),
-            Expression::Reference(ReferenceExpression::new(0, LogicalType::Integer)),
+            Expression::Reference(ReferenceExpression::new(0, LogicalType::Integer).into()),
+            Expression::Reference(ReferenceExpression::new(0, LogicalType::Integer).into()),
         )],
     );
     let mut plan =
@@ -1522,8 +1522,8 @@ fn union_all_probe_owns_one_runtime_filter_with_two_scan_consumers() {
         union,
         build,
         vec![JoinCondition::equality(
-            Expression::Reference(ReferenceExpression::new(0, LogicalType::Integer)),
-            Expression::Reference(ReferenceExpression::new(0, LogicalType::Integer)),
+            Expression::Reference(ReferenceExpression::new(0, LogicalType::Integer).into()),
+            Expression::Reference(ReferenceExpression::new(0, LogicalType::Integer).into()),
         )],
     );
     assert!(supports_runtime_filter_auxiliary(&join, true));
@@ -1589,8 +1589,8 @@ fn build_left_semi_join_filters_every_union_all_probe_source() {
         build,
         union,
         vec![JoinCondition::equality(
-            Expression::Reference(ReferenceExpression::new(0, LogicalType::Integer)),
-            Expression::Reference(ReferenceExpression::new(0, LogicalType::Integer)),
+            Expression::Reference(ReferenceExpression::new(0, LogicalType::Integer).into()),
+            Expression::Reference(ReferenceExpression::new(0, LogicalType::Integer).into()),
         )],
     );
     assert!(supports_build_left_runtime_filter_auxiliary(&join, true));
@@ -1692,10 +1692,9 @@ fn constant_projection(bind_context: &BindContext, value: i32) -> OwnedLogicalPl
         LogicalOperator::Projection(Projection::new(
             9,
             OwnedLogicalPlan::dummy_scan(bind_context),
-            vec![Expression::Constant(ConstantExpression::new(
-                Value::Integer(value),
-                LogicalType::Integer,
-            ))],
+            vec![Expression::Constant(
+                ConstantExpression::new(Value::Integer(value), LogicalType::Integer).into(),
+            )],
         )),
     )
 }

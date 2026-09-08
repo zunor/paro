@@ -34,10 +34,10 @@ fn lowers_late_row_fetch_with_resolved_carrier_rowid() {
             CARRIER,
             vec![RowFetchSource {
                 materialized_table_index: MATERIALIZED,
-                rowid: Expression::ColumnRef(ColumnRefExpression::new(
-                    ColumnBinding::new(CARRIER, 1),
-                    LogicalType::BigInt,
-                )),
+                rowid: Expression::ColumnRef(
+                    ColumnRefExpression::new(ColumnBinding::new(CARRIER, 1), LogicalType::BigInt)
+                        .into(),
+                ),
                 table,
                 needed_columns: vec![2].into_boxed_slice(),
             }],
@@ -48,14 +48,14 @@ fn lowers_late_row_fetch_with_resolved_carrier_rowid() {
         OUTPUT,
         fetch,
         vec![
-            Expression::ColumnRef(ColumnRefExpression::new(
-                ColumnBinding::new(CARRIER, 0),
-                LogicalType::Integer,
-            )),
-            Expression::ColumnRef(ColumnRefExpression::new(
-                ColumnBinding::new(MATERIALIZED, 2),
-                LogicalType::Varchar,
-            )),
+            Expression::ColumnRef(
+                ColumnRefExpression::new(ColumnBinding::new(CARRIER, 0), LogicalType::Integer)
+                    .into(),
+            ),
+            Expression::ColumnRef(
+                ColumnRefExpression::new(ColumnBinding::new(MATERIALIZED, 2), LogicalType::Varchar)
+                    .into(),
+            ),
         ],
     )
     .with_visible_names(vec!["key".into(), "payload".into()]);
@@ -113,10 +113,10 @@ fn lowers_row_fetch_without_projection_parent() {
             CARRIER,
             vec![RowFetchSource {
                 materialized_table_index: MATERIALIZED,
-                rowid: Expression::ColumnRef(ColumnRefExpression::new(
-                    ColumnBinding::new(CARRIER, 1),
-                    LogicalType::BigInt,
-                )),
+                rowid: Expression::ColumnRef(
+                    ColumnRefExpression::new(ColumnBinding::new(CARRIER, 1), LogicalType::BigInt)
+                        .into(),
+                ),
                 table,
                 needed_columns: vec![2].into_boxed_slice(),
             }],

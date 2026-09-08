@@ -377,21 +377,25 @@ fn apply(
         debug_assert!(partial_groups
             .get(rewrite.key_ordinal)
             .is_some_and(|group| fact_expression.equals(group)));
-        *fact_expression = Expression::ColumnRef(ColumnRefExpression::new(
-            ColumnBinding::new(partial_group_index, rewrite.key_ordinal),
-            fact_expression.return_type(),
-        ));
+        *fact_expression = Expression::ColumnRef(
+            ColumnRefExpression::new(
+                ColumnBinding::new(partial_group_index, rewrite.key_ordinal),
+                fact_expression.return_type(),
+            )
+            .into(),
+        );
     }
     let outer_groups = outer_groups
         .into_iter()
         .map(|group| match group {
             DeferredOuterGroup::Dimension(expression) => *expression,
-            DeferredOuterGroup::Partial { ordinal } => {
-                Expression::ColumnRef(ColumnRefExpression::new(
+            DeferredOuterGroup::Partial { ordinal } => Expression::ColumnRef(
+                ColumnRefExpression::new(
                     ColumnBinding::new(partial_group_index, ordinal),
                     partial_groups[ordinal].return_type(),
-                ))
-            }
+                )
+                .into(),
+            ),
         })
         .collect::<Vec<_>>();
     let partial = OwnedLogicalPlan::new(
@@ -422,14 +426,20 @@ fn apply(
         .enumerate()
         .map(|(aggregate_index, merge)| {
             let return_type = merge.return_type.clone();
-            Expression::Aggregate(Box::new(AggregateExpression::new(
-                merge,
-                vec![Expression::ColumnRef(ColumnRefExpression::new(
-                    ColumnBinding::new(partial_aggregate_index, aggregate_index),
-                    return_type.clone(),
-                ))],
-                return_type,
-            )))
+            Expression::Aggregate(
+                AggregateExpression::new(
+                    merge,
+                    vec![Expression::ColumnRef(
+                        ColumnRefExpression::new(
+                            ColumnBinding::new(partial_aggregate_index, aggregate_index),
+                            return_type.clone(),
+                        )
+                        .into(),
+                    )],
+                    return_type,
+                )
+                .into(),
+            )
         })
         .collect();
 

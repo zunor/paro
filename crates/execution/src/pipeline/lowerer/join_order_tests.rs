@@ -178,10 +178,9 @@ fn union_all_probe_source_collection_uses_an_explicit_stack() {
             output: RowType::new(vec!["probe_key".to_string()], vec![LogicalType::Integer]),
             cardinality: None,
             kind: PhysicalNodeKind::Project(ProjectSpec {
-                expressions: vec![Expression::Reference(ReferenceExpression::new(
-                    0,
-                    LogicalType::Integer,
-                ))]
+                expressions: vec![Expression::Reference(
+                    ReferenceExpression::new(0, LogicalType::Integer).into(),
+                )]
                 .into_boxed_slice(),
                 output_names: vec!["probe_key".to_string()].into_boxed_slice(),
                 visible_count: 1,
@@ -480,10 +479,9 @@ fn passthrough_projection_traces_runtime_filter_to_rowset_column() {
         _ => panic!("expected hash join plan"),
     };
     let project = TransformSpec::Project(ProjectSpec {
-        expressions: vec![Expression::Reference(ReferenceExpression::new(
-            0,
-            LogicalType::Integer,
-        ))]
+        expressions: vec![Expression::Reference(
+            ReferenceExpression::new(0, LogicalType::Integer).into(),
+        )]
         .into_boxed_slice(),
         output_names: vec!["key".to_string()].into_boxed_slice(),
         visible_count: 1,
@@ -512,10 +510,9 @@ fn derived_projection_is_a_runtime_filter_lineage_barrier() {
         _ => panic!("expected hash join plan"),
     };
     let project = TransformSpec::Project(ProjectSpec {
-        expressions: vec![Expression::Constant(ConstantExpression::new(
-            Value::Integer(7),
-            LogicalType::Integer,
-        ))]
+        expressions: vec![Expression::Constant(
+            ConstantExpression::new(Value::Integer(7), LogicalType::Integer).into(),
+        )]
         .into_boxed_slice(),
         output_names: vec!["derived".to_string()].into_boxed_slice(),
         visible_count: 1,
@@ -544,7 +541,7 @@ fn left_deep_probe_does_not_trace_build_payload_to_rowset() {
     };
     let prior_probe = hash_join_probe_transform(BreakerHandleId::new(2), &spec);
     spec.key_conditions[0].left =
-        Expression::Reference(ReferenceExpression::new(1, LogicalType::Integer));
+        Expression::Reference(ReferenceExpression::new(1, LogicalType::Integer).into());
     let source = SourceSpec::Rowset(RowsetSourceSpec::new(rowset_spec_for_test()));
     let source = lowerer.attach_hash_join_runtime_filters(
         source,
@@ -730,10 +727,9 @@ fn physical_extraction_rejects_unimplemented_nodes_before_lowering() {
     let distinct = OwnedLogicalPlan::new(
         &ctx,
         LogicalOperator::Distinct(Distinct::distinct_on(
-            vec![Expression::Reference(ReferenceExpression::new(
-                0,
-                LogicalType::Integer,
-            ))],
+            vec![Expression::Reference(
+                ReferenceExpression::new(0, LogicalType::Integer).into(),
+            )],
             values,
         )),
     );

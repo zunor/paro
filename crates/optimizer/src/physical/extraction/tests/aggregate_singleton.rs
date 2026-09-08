@@ -62,10 +62,9 @@ fn stale_singleton_hint_falls_back_to_a_physical_aggregate() {
         &ctx,
         LogicalOperator::ExpressionGet(ExpressionGet::new(
             0,
-            vec![vec![Expression::Constant(ConstantExpression::new(
-                Value::Integer(1),
-                LogicalType::Integer,
-            ))]],
+            vec![vec![Expression::Constant(
+                ConstantExpression::new(Value::Integer(1), LogicalType::Integer).into(),
+            )]],
             vec!["key".to_string()],
             vec![LogicalType::Integer],
         )),
@@ -75,16 +74,14 @@ fn stale_singleton_hint_falls_back_to_a_physical_aggregate() {
         2,
         3,
         child,
-        vec![Expression::Reference(ReferenceExpression::new(
-            0,
-            LogicalType::Integer,
-        ))],
+        vec![Expression::Reference(
+            ReferenceExpression::new(0, LogicalType::Integer).into(),
+        )],
         Vec::new(),
-        vec![Expression::Aggregate(Box::new(AggregateExpression::new(
-            get_count_star_function(),
-            Vec::new(),
-            LogicalType::BigInt,
-        )))],
+        vec![Expression::Aggregate(
+            AggregateExpression::new(get_count_star_function(), Vec::new(), LogicalType::BigInt)
+                .into(),
+        )],
         Vec::new(),
     );
     aggregate.group_input_multiplicity = GroupInputMultiplicity::AtMostOne(proof);

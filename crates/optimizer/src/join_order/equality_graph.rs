@@ -170,31 +170,30 @@ mod tests {
     };
 
     fn equality() -> Expression {
-        Expression::Comparison(ComparisonExpression::new(
-            ComparisonType::Equal,
-            Expression::Constant(ConstantExpression::new(
-                Value::Integer(1),
-                LogicalType::Integer,
-            )),
-            Expression::Constant(ConstantExpression::new(
-                Value::Integer(1),
-                LogicalType::Integer,
-            )),
-        ))
+        Expression::Comparison(
+            ComparisonExpression::new(
+                ComparisonType::Equal,
+                Expression::Constant(
+                    ConstantExpression::new(Value::Integer(1), LogicalType::Integer).into(),
+                ),
+                Expression::Constant(
+                    ConstantExpression::new(Value::Integer(1), LogicalType::Integer).into(),
+                ),
+            )
+            .into(),
+        )
     }
 
     #[test]
     fn only_atomic_equalities_enter_the_equality_graph() {
         assert!(is_equality(&equality()));
-        let disjunction = Expression::Conjunction(ConjunctionExpression::new(
-            ConjunctionType::Or,
-            vec![equality(), equality()],
-        ));
+        let disjunction = Expression::Conjunction(
+            ConjunctionExpression::new(ConjunctionType::Or, vec![equality(), equality()]).into(),
+        );
         assert!(!is_equality(&disjunction));
-        let conjunction = Expression::Conjunction(ConjunctionExpression::new(
-            ConjunctionType::And,
-            vec![equality(), equality()],
-        ));
+        let conjunction = Expression::Conjunction(
+            ConjunctionExpression::new(ConjunctionType::And, vec![equality(), equality()]).into(),
+        );
         assert!(!is_equality(&conjunction));
     }
 }

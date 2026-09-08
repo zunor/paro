@@ -151,11 +151,9 @@ mod tests {
             .into_iter()
             .find(|function| function.arguments == [LogicalType::Double])
             .expect("count(double) overload");
-        Expression::Aggregate(Box::new(AggregateExpression::new(
-            function,
-            vec![expression],
-            LogicalType::BigInt,
-        )))
+        Expression::Aggregate(
+            AggregateExpression::new(function, vec![expression], LogicalType::BigInt).into(),
+        )
     }
 
     fn random_call() -> Expression {
@@ -164,11 +162,7 @@ mod tests {
             .into_iter()
             .next()
             .expect("random overload");
-        Expression::Function(Box::new(FunctionExpression::new(
-            function,
-            vec![],
-            LogicalType::Double,
-        )))
+        Expression::Function(FunctionExpression::new(function, vec![], LogicalType::Double).into())
     }
 
     #[test]
@@ -198,30 +192,46 @@ mod tests {
             paro_planner::expression::ConstantExpression::new(
                 paro_common::runtime_value::Value::Double(1.0),
                 LogicalType::Double,
-            ),
+            )
+            .into(),
         ));
         let (max, _) = get_max_function()
             .bind(&[LogicalType::BigInt])
             .expect("bind max(bigint)");
-        let reducer = Expression::Aggregate(Box::new(AggregateExpression::new(
-            max,
-            vec![Expression::ColumnRef(ColumnRefExpression::new(
-                ColumnBinding::new(aggregate_index, 1),
+        let reducer = Expression::Aggregate(
+            AggregateExpression::new(
+                max,
+                vec![Expression::ColumnRef(
+                    ColumnRefExpression::new(
+                        ColumnBinding::new(aggregate_index, 1),
+                        LogicalType::BigInt,
+                    )
+                    .into(),
+                )],
                 LogicalType::BigInt,
-            ))],
-            LogicalType::BigInt,
-        )));
-        let predicate = Expression::Comparison(ComparisonExpression::new(
-            ComparisonType::Equal,
-            Expression::ColumnRef(ColumnRefExpression::new(
-                ColumnBinding::new(aggregate_index, 1),
-                LogicalType::BigInt,
-            )),
-            Expression::ColumnRef(ColumnRefExpression::new(
-                ColumnBinding::new(reduction_index, 0),
-                LogicalType::BigInt,
-            )),
-        ));
+            )
+            .into(),
+        );
+        let predicate = Expression::Comparison(
+            ComparisonExpression::new(
+                ComparisonType::Equal,
+                Expression::ColumnRef(
+                    ColumnRefExpression::new(
+                        ColumnBinding::new(aggregate_index, 1),
+                        LogicalType::BigInt,
+                    )
+                    .into(),
+                ),
+                Expression::ColumnRef(
+                    ColumnRefExpression::new(
+                        ColumnBinding::new(reduction_index, 0),
+                        LogicalType::BigInt,
+                    )
+                    .into(),
+                ),
+            )
+            .into(),
+        );
         let aggregate = Aggregate::new(
             1,
             aggregate_index,
@@ -231,7 +241,8 @@ mod tests {
                 paro_planner::expression::ConstantExpression::new(
                     paro_common::runtime_value::Value::Integer(1),
                     LogicalType::Integer,
-                ),
+                )
+                .into(),
             )],
             vec![],
             vec![duplicate.clone(), duplicate],
@@ -240,10 +251,9 @@ mod tests {
         .with_post_reduction(PostAggregateReduction {
             reduction_index,
             reducers: vec![reducer],
-            scalar_expressions: vec![Expression::Reference(ReferenceExpression::new(
-                0,
-                LogicalType::BigInt,
-            ))],
+            scalar_expressions: vec![Expression::Reference(
+                ReferenceExpression::new(0, LogicalType::BigInt).into(),
+            )],
             predicate,
         });
         let mut plan = OwnedLogicalPlan::synthetic(LogicalOperator::Aggregate(Box::new(aggregate)));

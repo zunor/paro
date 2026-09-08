@@ -60,7 +60,7 @@ impl PhysicalPlanExtractor {
             .types()
             .into_iter()
             .enumerate()
-            .map(|(index, ty)| Expression::Reference(ReferenceExpression::new(index, ty)))
+            .map(|(index, ty)| Expression::Reference(ReferenceExpression::new(index, ty).into()))
             .collect::<Vec<_>>();
         materialize_window_inputs(&mut expressions, &mut input_expressions);
         if input_expressions.len() > input_width {
@@ -219,7 +219,8 @@ fn materialize_window_input(expression: &mut Expression, inputs: &mut Vec<Expres
             inputs.push(expression.clone());
             index
         });
-    *expression = Expression::Reference(ReferenceExpression::new(index, expression.return_type()));
+    *expression =
+        Expression::Reference(ReferenceExpression::new(index, expression.return_type()).into());
 }
 
 /// Lower complete-partition aggregate windows to a sort-free breaker.
@@ -274,12 +275,13 @@ fn lower_partition_aggregate_window_spec(
         .expressions
         .iter()
         .map(|expression| {
-            Expression::Aggregate(Box::new(
+            Expression::Aggregate(
                 expression
                     .aggregate_invocation()
                     .expect("partition aggregate eligibility checked")
-                    .clone(),
-            ))
+                    .clone()
+                    .into(),
+            )
         })
         .collect::<Vec<_>>();
     let input_types = window.child.types();
@@ -296,7 +298,7 @@ fn lower_partition_aggregate_window_spec(
             .iter()
             .cloned()
             .enumerate()
-            .map(|(index, ty)| Expression::Reference(ReferenceExpression::new(index, ty)))
+            .map(|(index, ty)| Expression::Reference(ReferenceExpression::new(index, ty).into()))
             .collect(),
         first.partitions.clone(),
         aggregate_expressions,

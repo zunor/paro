@@ -149,7 +149,8 @@ impl<'a> HavingBinder<'a> {
                 return_type,
                 binding,
                 depth: 0,
-            },
+            }
+            .into(),
         ))
     }
 }

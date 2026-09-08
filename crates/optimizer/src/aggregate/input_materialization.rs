@@ -111,10 +111,9 @@ fn materialize_inputs(
             rejected.push(candidate);
             continue;
         };
-        let replacement = Expression::ColumnRef(ColumnRefExpression::new(
-            materialized.binding,
-            materialized.return_type,
-        ));
+        let replacement = Expression::ColumnRef(
+            ColumnRefExpression::new(materialized.binding, materialized.return_type).into(),
+        );
         for expression in groups.iter_mut().chain(aggregates.iter_mut()) {
             replace_equal_subexpressions(expression, &candidate, &replacement);
             *expression = remap_bindings(expression.clone(), &materialized.binding_map);
@@ -325,7 +324,7 @@ fn wrap_projection(
         .iter()
         .copied()
         .zip(old_types)
-        .map(|(binding, ty)| Expression::ColumnRef(ColumnRefExpression::new(binding, ty)))
+        .map(|(binding, ty)| Expression::ColumnRef(ColumnRefExpression::new(binding, ty).into()))
         .collect::<Vec<_>>();
     expressions.push(expression.clone());
     output_names.push("__paro_materialized_aggregate_input".to_string());
@@ -389,11 +388,14 @@ fn remap_bindings(
 ) -> Expression {
     expression.replace_column_ref(&|column| {
         bindings.get(&column.binding).copied().map(|binding| {
-            Expression::ColumnRef(ColumnRefExpression {
-                binding,
-                depth: column.depth,
-                return_type: column.return_type.clone(),
-            })
+            Expression::ColumnRef(
+                ColumnRefExpression {
+                    binding,
+                    depth: column.depth,
+                    return_type: column.return_type.clone(),
+                }
+                .into(),
+            )
         })
     })
 }

@@ -1268,7 +1268,7 @@ fn remap_reduction_expression(
                 else {
                     return false;
                 };
-                *column = ColumnRefExpression::new(
+                **column = ColumnRefExpression::new(
                     paro_planner::operator::ColumnBinding::new(target_table_index, target_index),
                     column.return_type.clone(),
                 );
@@ -1327,10 +1327,13 @@ fn bind_reduction_source_expression(
                 if column.depth != 0 || column.binding.table_index != source_table_index {
                     return false;
                 }
-                *expression = Expression::Reference(ReferenceExpression::new(
-                    column.binding.column_index,
-                    column.return_type.clone(),
-                ));
+                *expression = Expression::Reference(
+                    ReferenceExpression::new(
+                        column.binding.column_index,
+                        column.return_type.clone(),
+                    )
+                    .into(),
+                );
                 true
             }
             Expression::Reference(_) => true,
@@ -1416,10 +1419,9 @@ fn combine_boolean_terms(
     match expressions.len() {
         0 => None,
         1 => expressions.pop(),
-        _ => Some(Expression::Conjunction(ConjunctionExpression::new(
-            conjunction_type,
-            expressions,
-        ))),
+        _ => Some(Expression::Conjunction(
+            ConjunctionExpression::new(conjunction_type, expressions).into(),
+        )),
     }
 }
 

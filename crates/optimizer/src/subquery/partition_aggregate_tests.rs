@@ -911,10 +911,9 @@ fn scalar_binding_visible_above_filter_does_not_rewrite() {
         LogicalOperator::Projection(Projection::new(
             parent_index,
             plan,
-            vec![Expression::ColumnRef(ColumnRefExpression::new(
-                scalar_binding,
-                scalar_type,
-            ))],
+            vec![Expression::ColumnRef(
+                ColumnRefExpression::new(scalar_binding, scalar_type).into(),
+            )],
         )),
     );
 

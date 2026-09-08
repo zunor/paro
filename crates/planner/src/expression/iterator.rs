@@ -105,10 +105,12 @@ impl ExpressionIterator {
     ) {
         let mut pending = vec![expr as *mut Expression];
         while let Some(pointer) = pending.pop() {
-            // SAFETY: `expr` owns the complete expression tree and is not
-            // moved during the walk. We create at most one mutable reference
-            // from a pointer at a time; child pointers are disjoint fields of
-            // that reference and are consumed only after the borrow ends.
+            // SAFETY: the root slot is not moved during the walk. Mutable
+            // child enumeration detaches a shared payload before collecting
+            // pointers, so all pending pointers address disjoint owned slots
+            // even if their scalar payloads still share descendants. Neither
+            // visiting nor detaching a descendant can move a sibling slot.
+            // Only one pointer is exposed as a mutable reference at a time.
             let current = unsafe { &mut *pointer };
             if visitor(current) == ExpressionVisitDecision::SkipChildren {
                 continue;
@@ -319,37 +321,40 @@ mod tests {
     use paro_function::window::WindowFunction;
 
     fn int_column(idx: usize) -> Expression {
-        Expression::ColumnRef(ColumnRefExpression::new(
-            ColumnBinding::new(10, idx),
-            LogicalType::Integer,
-        ))
+        Expression::ColumnRef(
+            ColumnRefExpression::new(ColumnBinding::new(10, idx), LogicalType::Integer).into(),
+        )
     }
 
     #[test]
     fn enumerate_children_visits_window_offsets_and_orders() {
-        let expr = Expression::Window(Box::new(WindowExpression::native(
-            WindowFunction::first_value(LogicalType::Integer),
-            vec![int_column(0)],
-            vec![int_column(1)],
-            vec![crate::expression::OrderByExpression {
-                expression: int_column(2),
-                ascending: true,
-                nulls_first: false,
-            }],
-            WindowFrame {
-                frame_type: WindowFrameType::Rows,
-                start_bound: WindowFrameBound::Offset(Box::new(Expression::Constant(
-                    ConstantExpression {
-                        value: Value::Integer(1),
-                        return_type: LogicalType::Integer,
-                    },
-                ))),
-                start_is_preceding: true,
-                end_bound: WindowFrameBound::Offset(Box::new(int_column(3))),
-                end_is_preceding: false,
-            },
-            false,
-        )));
+        let expr = Expression::Window(
+            WindowExpression::native(
+                WindowFunction::first_value(LogicalType::Integer),
+                vec![int_column(0)],
+                vec![int_column(1)],
+                vec![crate::expression::OrderByExpression {
+                    expression: int_column(2),
+                    ascending: true,
+                    nulls_first: false,
+                }],
+                WindowFrame {
+                    frame_type: WindowFrameType::Rows,
+                    start_bound: WindowFrameBound::Offset(Box::new(Expression::Constant(
+                        ConstantExpression {
+                            value: Value::Integer(1),
+                            return_type: LogicalType::Integer,
+                        }
+                        .into(),
+                    ))),
+                    start_is_preceding: true,
+                    end_bound: WindowFrameBound::Offset(Box::new(int_column(3))),
+                    end_is_preceding: false,
+                },
+                false,
+            )
+            .into(),
+        );
 
         let mut count = 0;
         ExpressionIterator::enumerate_children(&expr, |_| {
@@ -360,11 +365,9 @@ mod tests {
 
     #[test]
     fn enumerate_children_mut_allows_recursive_updates() {
-        let mut expr = Expression::Comparison(ComparisonExpression::new(
-            ComparisonType::Equal,
-            int_column(0),
-            int_column(1),
-        ));
+        let mut expr = Expression::Comparison(
+            ComparisonExpression::new(ComparisonType::Equal, int_column(0), int_column(1)).into(),
+        );
 
         ExpressionIterator::enumerate_children_mut(&mut expr, |child| {
             if let Expression::ColumnRef(col_ref) = child {
@@ -390,31 +393,33 @@ mod tests {
             .bind(&[LogicalType::Integer])
             .expect("bind count(integer)");
         let aggregate = AggregateExpression::new(count, vec![int_column(0)], LogicalType::BigInt)
-            .with_filter(Some(Expression::Constant(ConstantExpression::new(
-                Value::Boolean(true),
-                LogicalType::Boolean,
-            ))))
+            .with_filter(Some(Expression::Constant(
+                ConstantExpression::new(Value::Boolean(true), LogicalType::Boolean).into(),
+            )))
             .with_order_bys(vec![OrderByExpression {
                 expression: int_column(1),
                 ascending: true,
                 nulls_first: false,
             }]);
-        let expression = Expression::Window(Box::new(WindowExpression::aggregate(
-            aggregate,
-            vec![int_column(2)],
-            vec![OrderByExpression {
-                expression: int_column(3),
-                ascending: true,
-                nulls_first: false,
-            }],
-            WindowFrame {
-                frame_type: WindowFrameType::Rows,
-                start_bound: WindowFrameBound::Offset(Box::new(int_column(4))),
-                start_is_preceding: true,
-                end_bound: WindowFrameBound::Offset(Box::new(int_column(5))),
-                end_is_preceding: false,
-            },
-        )));
+        let expression = Expression::Window(
+            WindowExpression::aggregate(
+                aggregate,
+                vec![int_column(2)],
+                vec![OrderByExpression {
+                    expression: int_column(3),
+                    ascending: true,
+                    nulls_first: false,
+                }],
+                WindowFrame {
+                    frame_type: WindowFrameType::Rows,
+                    start_bound: WindowFrameBound::Offset(Box::new(int_column(4))),
+                    start_is_preceding: true,
+                    end_bound: WindowFrameBound::Offset(Box::new(int_column(5))),
+                    end_is_preceding: false,
+                },
+            )
+            .into(),
+        );
 
         let mut children = Vec::new();
         ExpressionIterator::enumerate_children(&expression, |child| {
@@ -428,10 +433,13 @@ mod tests {
     fn post_order_fold_handles_deep_generated_conjunctions() {
         let mut expression = int_column(0);
         for _ in 0..10_000 {
-            expression = Expression::Conjunction(crate::expression::ConjunctionExpression::new(
-                crate::expression::ConjunctionType::And,
-                vec![expression],
-            ));
+            expression = Expression::Conjunction(
+                crate::expression::ConjunctionExpression::new(
+                    crate::expression::ConjunctionType::And,
+                    vec![expression],
+                )
+                .into(),
+            );
         }
         let nodes = ExpressionIterator::try_fold_post_order(&expression, |_, children| {
             Ok::<_, paro_common::error::ParoError>(
@@ -440,17 +448,20 @@ mod tests {
         })
         .unwrap();
         assert_eq!(nodes, 10_001);
-        std::mem::forget(expression);
+        drop(expression);
     }
 
     #[test]
     fn pre_order_visit_handles_deep_generated_conjunctions() {
         let mut expression = int_column(0);
         for _ in 0..10_000 {
-            expression = Expression::Conjunction(crate::expression::ConjunctionExpression::new(
-                crate::expression::ConjunctionType::And,
-                vec![expression],
-            ));
+            expression = Expression::Conjunction(
+                crate::expression::ConjunctionExpression::new(
+                    crate::expression::ConjunctionType::And,
+                    vec![expression],
+                )
+                .into(),
+            );
         }
         let mut visited = 0usize;
         ExpressionIterator::visit(&expression, &mut |_| {
@@ -458,6 +469,6 @@ mod tests {
             ExpressionVisitDecision::Descend
         });
         assert_eq!(visited, 10_001);
-        std::mem::forget(expression);
+        drop(expression);
     }
 }

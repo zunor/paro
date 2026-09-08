@@ -54,7 +54,8 @@ fn linear_plan() -> crate::physical::PhysicalPlan {
         )),
     );
     let filter = OwnedLogicalPlan::new(&ctx, LogicalOperator::Filter(Filter::new(values, vec![])));
-    let project_expr = Expression::Reference(ReferenceExpression::new(0, LogicalType::Integer));
+    let project_expr =
+        Expression::Reference(ReferenceExpression::new(0, LogicalType::Integer).into());
     let project = OwnedLogicalPlan::new(
         &ctx,
         LogicalOperator::Projection(
@@ -81,7 +82,8 @@ fn projection_changes_schema_plan() -> crate::physical::PhysicalPlan {
             vec![LogicalType::Integer, LogicalType::Varchar],
         )),
     );
-    let project_expr = Expression::Reference(ReferenceExpression::new(1, LogicalType::Varchar));
+    let project_expr =
+        Expression::Reference(ReferenceExpression::new(1, LogicalType::Varchar).into());
     let project = OwnedLogicalPlan::new(
         &ctx,
         LogicalOperator::Projection(
@@ -112,16 +114,18 @@ fn grouped_aggregate_plan() -> crate::physical::PhysicalPlan {
             2,
             3,
             values,
-            vec![Expression::Reference(ReferenceExpression::new(
-                0,
-                LogicalType::Integer,
-            ))],
+            vec![Expression::Reference(
+                ReferenceExpression::new(0, LogicalType::Integer).into(),
+            )],
             Vec::new(),
-            vec![Expression::Aggregate(Box::new(AggregateExpression::new(
-                get_count_star_function(),
-                Vec::new(),
-                LogicalType::BigInt,
-            )))],
+            vec![Expression::Aggregate(
+                AggregateExpression::new(
+                    get_count_star_function(),
+                    Vec::new(),
+                    LogicalType::BigInt,
+                )
+                .into(),
+            )],
             Vec::new(),
         ))),
     );
@@ -148,16 +152,18 @@ fn aggregate_probe_hash_join_plan() -> crate::physical::PhysicalPlan {
             2,
             3,
             aggregate_input,
-            vec![Expression::Reference(ReferenceExpression::new(
-                0,
-                LogicalType::Integer,
-            ))],
+            vec![Expression::Reference(
+                ReferenceExpression::new(0, LogicalType::Integer).into(),
+            )],
             Vec::new(),
-            vec![Expression::Aggregate(Box::new(AggregateExpression::new(
-                get_count_star_function(),
-                Vec::new(),
-                LogicalType::BigInt,
-            )))],
+            vec![Expression::Aggregate(
+                AggregateExpression::new(
+                    get_count_star_function(),
+                    Vec::new(),
+                    LogicalType::BigInt,
+                )
+                .into(),
+            )],
             Vec::new(),
         ))),
     );
@@ -177,8 +183,8 @@ fn aggregate_probe_hash_join_plan() -> crate::physical::PhysicalPlan {
             aggregate,
             build,
             vec![JoinCondition::equality(
-                Expression::Reference(ReferenceExpression::new(0, LogicalType::Integer)),
-                Expression::Reference(ReferenceExpression::new(0, LogicalType::Integer)),
+                Expression::Reference(ReferenceExpression::new(0, LogicalType::Integer).into()),
+                Expression::Reference(ReferenceExpression::new(0, LogicalType::Integer).into()),
             )],
         )),
     );
@@ -207,11 +213,14 @@ fn ungrouped_aggregate_plan() -> crate::physical::PhysicalPlan {
             values,
             Vec::new(),
             Vec::new(),
-            vec![Expression::Aggregate(Box::new(AggregateExpression::new(
-                get_count_star_function(),
-                Vec::new(),
-                LogicalType::BigInt,
-            )))],
+            vec![Expression::Aggregate(
+                AggregateExpression::new(
+                    get_count_star_function(),
+                    Vec::new(),
+                    LogicalType::BigInt,
+                )
+                .into(),
+            )],
             Vec::new(),
         ))),
     );
@@ -255,7 +264,7 @@ fn topn_plan() -> crate::physical::PhysicalPlan {
         )),
     );
     let order = paro_planner::binder::ir::OrderByNode {
-        expression: Expression::Reference(ReferenceExpression::new(0, LogicalType::Integer)),
+        expression: Expression::Reference(ReferenceExpression::new(0, LogicalType::Integer).into()),
         ascending: true,
         nulls_first: false,
     };
@@ -308,7 +317,7 @@ fn single_task_breaker_probe_hash_join_plan(
         )
     };
     let order = || OrderByNode {
-        expression: Expression::Reference(ReferenceExpression::new(0, LogicalType::Integer)),
+        expression: Expression::Reference(ReferenceExpression::new(0, LogicalType::Integer).into()),
         ascending: true,
         nulls_first: false,
     };
@@ -330,10 +339,9 @@ fn single_task_breaker_probe_hash_join_plan(
                     Vec::new(),
                     Vec::new(),
                     vec![OrderByExpression {
-                        expression: Expression::Reference(ReferenceExpression::new(
-                            0,
-                            LogicalType::Integer,
-                        )),
+                        expression: Expression::Reference(
+                            ReferenceExpression::new(0, LogicalType::Integer).into(),
+                        ),
                         ascending: true,
                         nulls_first: false,
                     }],
@@ -362,8 +370,8 @@ fn single_task_breaker_probe_hash_join_plan(
             probe,
             build,
             vec![JoinCondition::equality(
-                Expression::Reference(ReferenceExpression::new(0, LogicalType::Integer)),
-                Expression::Reference(ReferenceExpression::new(0, LogicalType::Integer)),
+                Expression::Reference(ReferenceExpression::new(0, LogicalType::Integer).into()),
+                Expression::Reference(ReferenceExpression::new(0, LogicalType::Integer).into()),
             )],
         )),
     );
@@ -425,10 +433,9 @@ fn union_all_probe_hash_join_plan() -> crate::physical::PhysicalPlan {
             Projection::new(
                 5,
                 filtered,
-                vec![Expression::Reference(ReferenceExpression::new(
-                    0,
-                    LogicalType::Integer,
-                ))],
+                vec![Expression::Reference(
+                    ReferenceExpression::new(0, LogicalType::Integer).into(),
+                )],
             )
             .with_visible_names(vec!["probe_key".to_string()]),
         ),
@@ -440,8 +447,8 @@ fn union_all_probe_hash_join_plan() -> crate::physical::PhysicalPlan {
             projected,
             values(6, "build_key"),
             vec![JoinCondition::equality(
-                Expression::Reference(ReferenceExpression::new(0, LogicalType::Integer)),
-                Expression::Reference(ReferenceExpression::new(0, LogicalType::Integer)),
+                Expression::Reference(ReferenceExpression::new(0, LogicalType::Integer).into()),
+                Expression::Reference(ReferenceExpression::new(0, LogicalType::Integer).into()),
             )],
         )),
     );
@@ -475,8 +482,8 @@ fn hash_join_plan_with_context(
         )),
     );
     let condition = JoinCondition::equality(
-        Expression::Reference(ReferenceExpression::new(0, LogicalType::Integer)),
-        Expression::Reference(ReferenceExpression::new(0, LogicalType::Integer)),
+        Expression::Reference(ReferenceExpression::new(0, LogicalType::Integer).into()),
+        Expression::Reference(ReferenceExpression::new(0, LogicalType::Integer).into()),
     );
     let join = OwnedLogicalPlan::new(
         &ctx,
@@ -508,8 +515,8 @@ fn nested_loop_join_plan(join_type: JoinType) -> crate::physical::PhysicalPlan {
         )),
     );
     let condition = JoinCondition::new(
-        Expression::Reference(ReferenceExpression::new(0, LogicalType::Integer)),
-        Expression::Reference(ReferenceExpression::new(0, LogicalType::Integer)),
+        Expression::Reference(ReferenceExpression::new(0, LogicalType::Integer).into()),
+        Expression::Reference(ReferenceExpression::new(0, LogicalType::Integer).into()),
         JoinComparisonType::LessThan,
     );
     let join = OwnedLogicalPlan::new(
@@ -543,13 +550,13 @@ fn sort_range_join_plan(join_type: JoinType) -> crate::physical::PhysicalPlan {
     );
     let conditions = vec![
         JoinCondition::new(
-            Expression::Reference(ReferenceExpression::new(0, LogicalType::Integer)),
-            Expression::Reference(ReferenceExpression::new(0, LogicalType::Integer)),
+            Expression::Reference(ReferenceExpression::new(0, LogicalType::Integer).into()),
+            Expression::Reference(ReferenceExpression::new(0, LogicalType::Integer).into()),
             JoinComparisonType::LessThan,
         ),
         JoinCondition::new(
-            Expression::Reference(ReferenceExpression::new(1, LogicalType::Integer)),
-            Expression::Reference(ReferenceExpression::new(1, LogicalType::Integer)),
+            Expression::Reference(ReferenceExpression::new(1, LogicalType::Integer).into()),
+            Expression::Reference(ReferenceExpression::new(1, LogicalType::Integer).into()),
             JoinComparisonType::GreaterThan,
         ),
     ];
@@ -583,8 +590,8 @@ fn project_above_nested_loop_join_plan() -> crate::physical::PhysicalPlan {
         )),
     );
     let condition = JoinCondition::new(
-        Expression::Reference(ReferenceExpression::new(0, LogicalType::Integer)),
-        Expression::Reference(ReferenceExpression::new(0, LogicalType::Integer)),
+        Expression::Reference(ReferenceExpression::new(0, LogicalType::Integer).into()),
+        Expression::Reference(ReferenceExpression::new(0, LogicalType::Integer).into()),
         JoinComparisonType::LessThan,
     );
     let join = OwnedLogicalPlan::new(
@@ -602,10 +609,9 @@ fn project_above_nested_loop_join_plan() -> crate::physical::PhysicalPlan {
             Projection::new(
                 2,
                 join,
-                vec![Expression::Reference(ReferenceExpression::new(
-                    1,
-                    LogicalType::Integer,
-                ))],
+                vec![Expression::Reference(
+                    ReferenceExpression::new(1, LogicalType::Integer).into(),
+                )],
             )
             .with_visible_names(vec!["lv".to_string()]),
         ),
@@ -636,8 +642,8 @@ fn limit_above_right_nested_loop_join_plan() -> crate::physical::PhysicalPlan {
         )),
     );
     let condition = JoinCondition::new(
-        Expression::Reference(ReferenceExpression::new(0, LogicalType::Integer)),
-        Expression::Reference(ReferenceExpression::new(0, LogicalType::Integer)),
+        Expression::Reference(ReferenceExpression::new(0, LogicalType::Integer).into()),
+        Expression::Reference(ReferenceExpression::new(0, LogicalType::Integer).into()),
         JoinComparisonType::LessThan,
     );
     let join = OwnedLogicalPlan::new(
@@ -653,10 +659,9 @@ fn limit_above_right_nested_loop_join_plan() -> crate::physical::PhysicalPlan {
         &ctx,
         LogicalOperator::Limit(Box::new(Limit::new(
             join,
-            Some(Expression::Constant(ConstantExpression::new(
-                Value::Integer(10),
-                LogicalType::Integer,
-            ))),
+            Some(Expression::Constant(
+                ConstantExpression::new(Value::Integer(10), LogicalType::Integer).into(),
+            )),
             None,
         ))),
     );
@@ -682,8 +687,8 @@ fn left_deep_right_nested_loop_join_plan() -> crate::physical::PhysicalPlan {
     let b = make_values(1, "bk");
     let c = make_values(2, "ck");
     let nlj_condition = JoinCondition::new(
-        Expression::Reference(ReferenceExpression::new(0, LogicalType::Integer)),
-        Expression::Reference(ReferenceExpression::new(0, LogicalType::Integer)),
+        Expression::Reference(ReferenceExpression::new(0, LogicalType::Integer).into()),
+        Expression::Reference(ReferenceExpression::new(0, LogicalType::Integer).into()),
         JoinComparisonType::LessThan,
     );
     let right_nlj = OwnedLogicalPlan::new(
@@ -691,8 +696,8 @@ fn left_deep_right_nested_loop_join_plan() -> crate::physical::PhysicalPlan {
         LogicalOperator::Join(Join::comparison(JoinType::Right, a, b, vec![nlj_condition])),
     );
     let hash_condition = JoinCondition::equality(
-        Expression::Reference(ReferenceExpression::new(0, LogicalType::Integer)),
-        Expression::Reference(ReferenceExpression::new(0, LogicalType::Integer)),
+        Expression::Reference(ReferenceExpression::new(0, LogicalType::Integer).into()),
+        Expression::Reference(ReferenceExpression::new(0, LogicalType::Integer).into()),
     );
     let join = OwnedLogicalPlan::new(
         &ctx,
@@ -770,17 +775,16 @@ fn hash_join_with_projected_cross_product_probe_plan() -> crate::physical::Physi
             Projection::new(
                 3,
                 cross,
-                vec![Expression::Reference(ReferenceExpression::new(
-                    0,
-                    LogicalType::Integer,
-                ))],
+                vec![Expression::Reference(
+                    ReferenceExpression::new(0, LogicalType::Integer).into(),
+                )],
             )
             .with_visible_names(vec!["ak".to_string()]),
         ),
     );
     let condition = JoinCondition::equality(
-        Expression::Reference(ReferenceExpression::new(0, LogicalType::Integer)),
-        Expression::Reference(ReferenceExpression::new(0, LogicalType::Integer)),
+        Expression::Reference(ReferenceExpression::new(0, LogicalType::Integer).into()),
+        Expression::Reference(ReferenceExpression::new(0, LogicalType::Integer).into()),
     );
     let join = OwnedLogicalPlan::new(
         &ctx,
@@ -817,8 +821,8 @@ fn aggregate_above_right_anti_hash_join_plan() -> crate::physical::PhysicalPlan 
         )),
     );
     let condition = JoinCondition::equality(
-        Expression::Reference(ReferenceExpression::new(0, LogicalType::Integer)),
-        Expression::Reference(ReferenceExpression::new(0, LogicalType::Integer)),
+        Expression::Reference(ReferenceExpression::new(0, LogicalType::Integer).into()),
+        Expression::Reference(ReferenceExpression::new(0, LogicalType::Integer).into()),
     );
     let join = OwnedLogicalPlan::new(
         &ctx,
@@ -838,11 +842,14 @@ fn aggregate_above_right_anti_hash_join_plan() -> crate::physical::PhysicalPlan 
             join,
             Vec::new(),
             Vec::new(),
-            vec![Expression::Aggregate(Box::new(AggregateExpression::new(
-                get_count_star_function(),
-                Vec::new(),
-                LogicalType::BigInt,
-            )))],
+            vec![Expression::Aggregate(
+                AggregateExpression::new(
+                    get_count_star_function(),
+                    Vec::new(),
+                    LogicalType::BigInt,
+                )
+                .into(),
+            )],
             Vec::new(),
         ))),
     );
@@ -937,8 +944,8 @@ fn recursive_cte_with_invariant_hash_build_plan() -> crate::physical::PhysicalPl
             recursive_ref,
             edges,
             vec![JoinCondition::equality(
-                Expression::Reference(ReferenceExpression::new(0, LogicalType::Integer)),
-                Expression::Reference(ReferenceExpression::new(0, LogicalType::Integer)),
+                Expression::Reference(ReferenceExpression::new(0, LogicalType::Integer).into()),
+                Expression::Reference(ReferenceExpression::new(0, LogicalType::Integer).into()),
             )],
         )),
     );
@@ -948,10 +955,9 @@ fn recursive_cte_with_invariant_hash_build_plan() -> crate::physical::PhysicalPl
             Projection::new(
                 2,
                 join,
-                vec![Expression::Reference(ReferenceExpression::new(
-                    2,
-                    LogicalType::Integer,
-                ))],
+                vec![Expression::Reference(
+                    ReferenceExpression::new(2, LogicalType::Integer).into(),
+                )],
             )
             .with_visible_names(vec!["node".to_string()]),
         ),
@@ -982,10 +988,9 @@ fn projected_recursive_cte_plan() -> crate::physical::PhysicalPlan {
             Projection::new(
                 2,
                 cte,
-                vec![Expression::Reference(ReferenceExpression::new(
-                    0,
-                    LogicalType::Integer,
-                ))],
+                vec![Expression::Reference(
+                    ReferenceExpression::new(0, LogicalType::Integer).into(),
+                )],
             )
             .with_visible_names(vec!["v".to_string()]),
         ),
@@ -1003,10 +1008,9 @@ fn ordered_recursive_cte_plan() -> crate::physical::PhysicalPlan {
         LogicalOperator::Order(LogicalOrder::new(
             cte,
             vec![paro_planner::binder::ir::OrderByNode {
-                expression: Expression::Reference(ReferenceExpression::new(
-                    0,
-                    LogicalType::Integer,
-                )),
+                expression: Expression::Reference(
+                    ReferenceExpression::new(0, LogicalType::Integer).into(),
+                ),
                 ascending: true,
                 nulls_first: false,
             }],
@@ -1071,14 +1075,13 @@ fn left_delim_join_plan() -> crate::physical::PhysicalPlan {
         left,
         right,
         vec![JoinCondition::equality(
-            Expression::Reference(ReferenceExpression::new(0, LogicalType::Integer)),
-            Expression::Reference(ReferenceExpression::new(0, LogicalType::Integer)),
+            Expression::Reference(ReferenceExpression::new(0, LogicalType::Integer).into()),
+            Expression::Reference(ReferenceExpression::new(0, LogicalType::Integer).into()),
         )],
     );
-    join.duplicate_eliminated_columns = vec![Expression::Reference(ReferenceExpression::new(
-        0,
-        LogicalType::Integer,
-    ))];
+    join.duplicate_eliminated_columns = vec![Expression::Reference(
+        ReferenceExpression::new(0, LogicalType::Integer).into(),
+    )];
     let plan = OwnedLogicalPlan::new(&ctx, LogicalOperator::Join(Join::Comparison(join)));
 
     let mut extractor = PhysicalPlanExtractor::new(ExtractionContext::default());
@@ -1105,12 +1108,12 @@ fn hash_join_with_delim_probe_plan() -> crate::physical::PhysicalPlan {
         capture,
         dependent,
         vec![JoinCondition::equality(
-            Expression::Reference(ReferenceExpression::new(0, LogicalType::Integer)),
-            Expression::Reference(ReferenceExpression::new(0, LogicalType::Integer)),
+            Expression::Reference(ReferenceExpression::new(0, LogicalType::Integer).into()),
+            Expression::Reference(ReferenceExpression::new(0, LogicalType::Integer).into()),
         )],
     );
     delim_join.duplicate_eliminated_columns = vec![Expression::Reference(
-        ReferenceExpression::new(0, LogicalType::Integer),
+        ReferenceExpression::new(0, LogicalType::Integer).into(),
     )];
     let delim_probe =
         OwnedLogicalPlan::new(&ctx, LogicalOperator::Join(Join::Comparison(delim_join)));
@@ -1120,10 +1123,9 @@ fn hash_join_with_delim_probe_plan() -> crate::physical::PhysicalPlan {
             Projection::new(
                 2,
                 delim_probe,
-                vec![Expression::Reference(ReferenceExpression::new(
-                    0,
-                    LogicalType::Integer,
-                ))],
+                vec![Expression::Reference(
+                    ReferenceExpression::new(0, LogicalType::Integer).into(),
+                )],
             )
             .with_visible_names(vec!["projected_capture".to_string()]),
         ),
@@ -1144,8 +1146,8 @@ fn hash_join_with_delim_probe_plan() -> crate::physical::PhysicalPlan {
             probe,
             build,
             vec![JoinCondition::equality(
-                Expression::Reference(ReferenceExpression::new(0, LogicalType::Integer)),
-                Expression::Reference(ReferenceExpression::new(0, LogicalType::Integer)),
+                Expression::Reference(ReferenceExpression::new(0, LogicalType::Integer).into()),
+                Expression::Reference(ReferenceExpression::new(0, LogicalType::Integer).into()),
             )],
         )),
     );
@@ -1171,14 +1173,13 @@ fn left_delim_join_with_recursive_dependent_plan() -> crate::physical::PhysicalP
         left,
         right,
         vec![JoinCondition::equality(
-            Expression::Reference(ReferenceExpression::new(0, LogicalType::Integer)),
-            Expression::Reference(ReferenceExpression::new(0, LogicalType::Integer)),
+            Expression::Reference(ReferenceExpression::new(0, LogicalType::Integer).into()),
+            Expression::Reference(ReferenceExpression::new(0, LogicalType::Integer).into()),
         )],
     );
-    join.duplicate_eliminated_columns = vec![Expression::Reference(ReferenceExpression::new(
-        0,
-        LogicalType::Integer,
-    ))];
+    join.duplicate_eliminated_columns = vec![Expression::Reference(
+        ReferenceExpression::new(0, LogicalType::Integer).into(),
+    )];
     let plan = OwnedLogicalPlan::new(&ctx, LogicalOperator::Join(Join::Comparison(join)));
 
     let mut extractor = PhysicalPlanExtractor::new(ExtractionContext::default());
@@ -1206,8 +1207,8 @@ fn projection_above_hash_join_plan() -> crate::physical::PhysicalPlan {
         )),
     );
     let condition = JoinCondition::equality(
-        Expression::Reference(ReferenceExpression::new(0, LogicalType::Integer)),
-        Expression::Reference(ReferenceExpression::new(0, LogicalType::Integer)),
+        Expression::Reference(ReferenceExpression::new(0, LogicalType::Integer).into()),
+        Expression::Reference(ReferenceExpression::new(0, LogicalType::Integer).into()),
     );
     let join = OwnedLogicalPlan::new(
         &ctx,
@@ -1224,10 +1225,9 @@ fn projection_above_hash_join_plan() -> crate::physical::PhysicalPlan {
             Projection::new(
                 2,
                 join,
-                vec![Expression::Reference(ReferenceExpression::new(
-                    1,
-                    LogicalType::Integer,
-                ))],
+                vec![Expression::Reference(
+                    ReferenceExpression::new(1, LogicalType::Integer).into(),
+                )],
             )
             .with_visible_names(vec!["lv".to_string()]),
         ),
@@ -1257,8 +1257,8 @@ fn left_deep_hash_join_plan_with_context(
     let c = make_values(2, "ck", "cv");
     let condition = || {
         JoinCondition::equality(
-            Expression::Reference(ReferenceExpression::new(0, LogicalType::Integer)),
-            Expression::Reference(ReferenceExpression::new(0, LogicalType::Integer)),
+            Expression::Reference(ReferenceExpression::new(0, LogicalType::Integer).into()),
+            Expression::Reference(ReferenceExpression::new(0, LogicalType::Integer).into()),
         )
     };
     let ab = OwnedLogicalPlan::new(
@@ -1286,7 +1286,7 @@ fn order_plan() -> crate::physical::PhysicalPlan {
         )),
     );
     let order = paro_planner::binder::ir::OrderByNode {
-        expression: Expression::Reference(ReferenceExpression::new(0, LogicalType::Integer)),
+        expression: Expression::Reference(ReferenceExpression::new(0, LogicalType::Integer).into()),
         ascending: true,
         nulls_first: false,
     };
@@ -1317,15 +1317,15 @@ fn order_with_final_projection_plan() -> crate::physical::PhysicalPlan {
                 1,
                 values,
                 vec![
-                    Expression::Reference(ReferenceExpression::new(0, LogicalType::Integer)),
-                    Expression::Reference(ReferenceExpression::new(1, LogicalType::Integer)),
+                    Expression::Reference(ReferenceExpression::new(0, LogicalType::Integer).into()),
+                    Expression::Reference(ReferenceExpression::new(1, LogicalType::Integer).into()),
                 ],
             )
             .with_visible_names(vec!["a".to_string()]),
         ),
     );
     let order = paro_planner::binder::ir::OrderByNode {
-        expression: Expression::Reference(ReferenceExpression::new(0, LogicalType::Integer)),
+        expression: Expression::Reference(ReferenceExpression::new(0, LogicalType::Integer).into()),
         ascending: true,
         nulls_first: false,
     };
@@ -1339,10 +1339,9 @@ fn order_with_final_projection_plan() -> crate::physical::PhysicalPlan {
             Projection::new(
                 2,
                 order,
-                vec![Expression::Reference(ReferenceExpression::new(
-                    0,
-                    LogicalType::Integer,
-                ))],
+                vec![Expression::Reference(
+                    ReferenceExpression::new(0, LogicalType::Integer).into(),
+                )],
             )
             .with_visible_names(vec!["a".to_string()]),
         ),
@@ -1370,15 +1369,13 @@ fn partitioned_window_plan() -> crate::physical::PhysicalPlan {
             vec![WindowExpression::native(
                 WindowFunction::rank(),
                 Vec::new(),
-                vec![Expression::Reference(ReferenceExpression::new(
-                    0,
-                    LogicalType::Integer,
-                ))],
+                vec![Expression::Reference(
+                    ReferenceExpression::new(0, LogicalType::Integer).into(),
+                )],
                 vec![OrderByExpression {
-                    expression: Expression::Reference(ReferenceExpression::new(
-                        1,
-                        LogicalType::Integer,
-                    )),
+                    expression: Expression::Reference(
+                        ReferenceExpression::new(1, LogicalType::Integer).into(),
+                    ),
                     ascending: true,
                     nulls_first: false,
                 }],
@@ -1412,10 +1409,9 @@ fn partition_aggregate_window_plan() -> crate::physical::PhysicalPlan {
             1,
             vec![WindowExpression::aggregate(
                 aggregate,
-                vec![Expression::Reference(ReferenceExpression::new(
-                    0,
-                    LogicalType::Integer,
-                ))],
+                vec![Expression::Reference(
+                    ReferenceExpression::new(0, LogicalType::Integer).into(),
+                )],
                 Vec::new(),
                 WindowFrame::default(),
             )],

@@ -219,7 +219,7 @@ impl FilterPullup {
                 })
                 .unwrap_or_else(|| {
                     let output_index = proj_expressions.len();
-                    proj_expressions.push(Expression::ColumnRef(column.clone()));
+                    proj_expressions.push(Expression::ColumnRef(column.clone().into()));
                     output_index
                 });
             replacements.push((column.binding, output_index));
@@ -230,10 +230,13 @@ impl FilterPullup {
                 .iter()
                 .find(|(binding, _)| *binding == column.binding)
                 .map(|(_, output_index)| {
-                    Expression::ColumnRef(ColumnRefExpression::new(
-                        ColumnBinding::new(proj_table_idx, *output_index),
-                        column.return_type.clone(),
-                    ))
+                    Expression::ColumnRef(
+                        ColumnRefExpression::new(
+                            ColumnBinding::new(proj_table_idx, *output_index),
+                            column.return_type.clone(),
+                        )
+                        .into(),
+                    )
                 })
         });
         *expr = rewritten;
@@ -242,7 +245,7 @@ impl FilterPullup {
     fn collect_column_refs(expr: &Expression, columns: &mut Vec<ColumnRefExpression>) {
         visit_expression(expr, &mut |expression| {
             if let Expression::ColumnRef(column) = expression {
-                columns.push(column.clone());
+                columns.push(column.as_ref().clone());
             }
         });
     }
@@ -289,11 +292,14 @@ impl FilterPullup {
             for condition in &comp_join.conditions {
                 let comparison_type =
                     Self::join_comparison_to_comparison_type(condition.comparison);
-                let expr = Expression::Comparison(ComparisonExpression::new(
-                    comparison_type,
-                    condition.left.clone(),
-                    condition.right.clone(),
-                ));
+                let expr = Expression::Comparison(
+                    ComparisonExpression::new(
+                        comparison_type,
+                        condition.left.clone(),
+                        condition.right.clone(),
+                    )
+                    .into(),
+                );
                 expressions.push(expr);
             }
         }
@@ -632,21 +638,27 @@ mod tests {
     }
 
     fn make_column_ref(table_index: usize, column_index: usize) -> Expression {
-        Expression::ColumnRef(ColumnRefExpression {
-            binding: paro_planner::operator::ColumnBinding {
-                table_index,
-                column_index,
-            },
-            depth: 0,
-            return_type: LogicalType::Integer,
-        })
+        Expression::ColumnRef(
+            ColumnRefExpression {
+                binding: paro_planner::operator::ColumnBinding {
+                    table_index,
+                    column_index,
+                },
+                depth: 0,
+                return_type: LogicalType::Integer,
+            }
+            .into(),
+        )
     }
 
     fn make_constant(value: i32) -> Expression {
-        Expression::Constant(ConstantExpression {
-            value: paro_common::runtime_value::Value::Integer(value),
-            return_type: LogicalType::Integer,
-        })
+        Expression::Constant(
+            ConstantExpression {
+                value: paro_common::runtime_value::Value::Integer(value),
+                return_type: LogicalType::Integer,
+            }
+            .into(),
+        )
     }
 
     fn make_comparison(
@@ -654,7 +666,7 @@ mod tests {
         left: Expression,
         right: Expression,
     ) -> Expression {
-        Expression::Comparison(ComparisonExpression::new(comp_type, left, right))
+        Expression::Comparison(ComparisonExpression::new(comp_type, left, right).into())
     }
 
     fn make_get(table_index: usize) -> LogicalOperator {
@@ -671,11 +683,7 @@ mod tests {
             .into_iter()
             .next()
             .expect("random overload");
-        Expression::Function(Box::new(FunctionExpression::new(
-            function,
-            vec![],
-            LogicalType::Double,
-        )))
+        Expression::Function(FunctionExpression::new(function, vec![], LogicalType::Double).into())
     }
 
     #[test]
@@ -726,10 +734,13 @@ mod tests {
         let filter_expr = make_comparison(
             ComparisonType::GreaterThan,
             volatile_call(),
-            Expression::Constant(ConstantExpression::new(
-                paro_common::runtime_value::Value::Double(0.5),
-                LogicalType::Double,
-            )),
+            Expression::Constant(
+                ConstantExpression::new(
+                    paro_common::runtime_value::Value::Double(0.5),
+                    LogicalType::Double,
+                )
+                .into(),
+            ),
         );
         let filter = Filter::new(plan(&ctx, make_get(0)), vec![filter_expr]);
 

@@ -159,10 +159,9 @@ fn partition_aggregate_window_executes_bigint_key_domain() {
     let output = QueryOutputPort::unbounded();
     let query = query_context(output.clone());
     let bigint = |value| {
-        Expression::Constant(ConstantExpression::new(
-            Value::BigInt(value),
-            LogicalType::BigInt,
-        ))
+        Expression::Constant(
+            ConstantExpression::new(Value::BigInt(value), LogicalType::BigInt).into(),
+        )
     };
     let graph = partition_aggregate_window_graph(
         LogicalType::BigInt,
@@ -194,14 +193,15 @@ fn global_filtered_count_window_spec() -> PartitionAggregateWindowSpec {
         .bind(&[LogicalType::Integer])
         .expect("bind count(integer)");
     assert_eq!(targets, vec![LogicalType::Integer]);
-    let aggregate = Expression::Aggregate(Box::new(
+    let aggregate = Expression::Aggregate(
         AggregateExpression::new(
             count,
             vec![reference(0, LogicalType::Integer)],
             LogicalType::BigInt,
         )
-        .with_filter(Some(reference(1, LogicalType::Boolean))),
-    ));
+        .with_filter(Some(reference(1, LogicalType::Boolean)))
+        .into(),
+    );
     let input_types = Box::new([LogicalType::Integer, LogicalType::Boolean]);
     PartitionAggregateWindowSpec {
         domain: PartitionAggregateDomain::Global,
@@ -396,14 +396,15 @@ fn partition_aggregate_window_forced_external_preserves_filter_payload() {
         .bind(&[LogicalType::Integer])
         .expect("bind count(integer)");
     assert_eq!(targets, vec![LogicalType::Integer]);
-    let count = Expression::Aggregate(Box::new(
+    let count = Expression::Aggregate(
         AggregateExpression::new(
             count,
             vec![reference(1, LogicalType::Integer)],
             LogicalType::BigInt,
         )
-        .with_filter(Some(reference(2, LogicalType::Boolean))),
-    ));
+        .with_filter(Some(reference(2, LogicalType::Boolean)))
+        .into(),
+    );
     let input_types = Box::new([
         LogicalType::Integer,
         LogicalType::Integer,

@@ -488,10 +488,9 @@ fn delim_capture_deduplicates_values_and_keeps_cached_outer_explicit() {
                 transforms: Vec::new(),
                 sink: SinkSpec::DelimCapture(DelimCaptureSinkSpec {
                     handle: delim,
-                    duplicate_keys: vec![Expression::Reference(ReferenceExpression::new(
-                        0,
-                        LogicalType::Integer,
-                    ))]
+                    duplicate_keys: vec![Expression::Reference(
+                        ReferenceExpression::new(0, LogicalType::Integer).into(),
+                    )]
                     .into_boxed_slice(),
                     cached_outer: Some(cached_outer),
                 }),

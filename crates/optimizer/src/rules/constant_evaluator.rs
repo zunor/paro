@@ -278,7 +278,7 @@ mod tests {
 
     fn constant(value: Value) -> Expression {
         let return_type = value.logical_type();
-        Expression::Constant(ConstantExpression { value, return_type })
+        Expression::Constant(ConstantExpression { value, return_type }.into())
     }
 
     #[test]
@@ -297,14 +297,17 @@ mod tests {
         assert_eq!(function.stability, FunctionStability::Consistent);
         assert_eq!(function.side_effects, FunctionSideEffects::NoSideEffects);
 
-        let expression = Expression::Function(Box::new(FunctionExpression::new(
-            function,
-            vec![
-                constant(Value::Date(10_000)),
-                constant(Value::Interval(0, 90, 0)),
-            ],
-            LogicalType::Timestamp,
-        )));
+        let expression = Expression::Function(
+            FunctionExpression::new(
+                function,
+                vec![
+                    constant(Value::Date(10_000)),
+                    constant(Value::Interval(0, 90, 0)),
+                ],
+                LogicalType::Timestamp,
+            )
+            .into(),
+        );
         assert_eq!(
             evaluate_constant(&expression),
             Some(Value::Timestamp((10_000_i64 - 90) * 86_400_000_000))

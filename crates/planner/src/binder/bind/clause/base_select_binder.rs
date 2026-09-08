@@ -150,18 +150,24 @@ impl<'a> BaseSelectBinder<'a> {
             let aggr = &node.aggregates[aggr_index];
             let return_type = aggr.return_type();
             // For now, we simplify and return the column reference
-            Ok(Expression::ColumnRef(ColumnRefExpression {
-                return_type,
-                binding: ColumnBinding::new(node.aggregate_index, aggr_index),
-                depth: 0,
-            }))
+            Ok(Expression::ColumnRef(
+                ColumnRefExpression {
+                    return_type,
+                    binding: ColumnBinding::new(node.aggregate_index, aggr_index),
+                    depth: 0,
+                }
+                .into(),
+            ))
         } else {
             let group = &node.groups.group_expressions[group_index];
-            Ok(Expression::ColumnRef(ColumnRefExpression {
-                return_type: group.return_type(),
-                binding: ColumnBinding::new(node.group_index, group_index),
-                depth: 0,
-            }))
+            Ok(Expression::ColumnRef(
+                ColumnRefExpression {
+                    return_type: group.return_type(),
+                    binding: ColumnBinding::new(node.group_index, group_index),
+                    depth: 0,
+                }
+                .into(),
+            ))
         }
     }
 
@@ -235,10 +241,13 @@ impl<'a> BaseSelectBinder<'a> {
         let col_idx = node.grouping_functions.len();
         node.grouping_functions.push(group_indexes);
 
-        Ok(Expression::ColumnRef(ColumnRefExpression {
-            return_type: LogicalType::BigInt,
-            binding: ColumnBinding::new(node.groupings_index, col_idx),
-            depth: 0,
-        }))
+        Ok(Expression::ColumnRef(
+            ColumnRefExpression {
+                return_type: LogicalType::BigInt,
+                binding: ColumnBinding::new(node.groupings_index, col_idx),
+                depth: 0,
+            }
+            .into(),
+        ))
     }
 }

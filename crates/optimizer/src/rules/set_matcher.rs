@@ -133,10 +133,13 @@ mod tests {
     use paro_planner::expression::ConstantExpression;
 
     fn make_constant(value: i32) -> Expression {
-        Expression::Constant(ConstantExpression {
-            value: Value::Integer(value),
-            return_type: LogicalType::Integer,
-        })
+        Expression::Constant(
+            ConstantExpression {
+                value: Value::Integer(value),
+                return_type: LogicalType::Integer,
+            }
+            .into(),
+        )
     }
 
     #[test]

@@ -248,10 +248,13 @@ mod tests {
 
     fn make_column(table_index: usize, col_index: usize) -> BoundGraphColumn {
         BoundGraphColumn {
-            expr: Expression::ColumnRef(ColumnRefExpression::new(
-                ColumnBinding::new(table_index, col_index),
-                LogicalType::Varchar,
-            )),
+            expr: Expression::ColumnRef(
+                ColumnRefExpression::new(
+                    ColumnBinding::new(table_index, col_index),
+                    LogicalType::Varchar,
+                )
+                .into(),
+            ),
             alias: format!("col_{}_{}", table_index, col_index),
             logical_type: LogicalType::Varchar,
         }

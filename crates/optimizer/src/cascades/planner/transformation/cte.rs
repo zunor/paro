@@ -435,17 +435,23 @@ mod tests {
     }
 
     fn equality(table: usize, value: i32) -> Expression {
-        Expression::Comparison(paro_planner::expression::ComparisonExpression::new(
-            ComparisonType::Equal,
-            Expression::ColumnRef(ColumnRefExpression::new(
-                ColumnBinding::new(table, 0),
-                LogicalType::Integer,
-            )),
-            Expression::Constant(paro_planner::expression::ConstantExpression {
-                value: paro_common::runtime_value::Value::Integer(value),
-                return_type: LogicalType::Integer,
-            }),
-        ))
+        Expression::Comparison(
+            paro_planner::expression::ComparisonExpression::new(
+                ComparisonType::Equal,
+                Expression::ColumnRef(
+                    ColumnRefExpression::new(ColumnBinding::new(table, 0), LogicalType::Integer)
+                        .into(),
+                ),
+                Expression::Constant(
+                    paro_planner::expression::ConstantExpression {
+                        value: paro_common::runtime_value::Value::Integer(value),
+                        return_type: LogicalType::Integer,
+                    }
+                    .into(),
+                ),
+            )
+            .into(),
+        )
     }
 
     fn owner(consumer: OwnedLogicalPlan) -> OwnedLogicalPlan {
@@ -844,14 +850,14 @@ mod tests {
                 reference(9, 1),
                 super::super::super::tests::test_base_get(2, 8, "domain", 10),
                 vec![JoinCondition::new(
-                    Expression::ColumnRef(ColumnRefExpression::new(
-                        ColumnBinding::new(1, 0),
-                        LogicalType::Integer,
-                    )),
-                    Expression::ColumnRef(ColumnRefExpression::new(
-                        ColumnBinding::new(2, 0),
-                        LogicalType::Integer,
-                    )),
+                    Expression::ColumnRef(
+                        ColumnRefExpression::new(ColumnBinding::new(1, 0), LogicalType::Integer)
+                            .into(),
+                    ),
+                    Expression::ColumnRef(
+                        ColumnRefExpression::new(ColumnBinding::new(2, 0), LogicalType::Integer)
+                            .into(),
+                    ),
                     JoinComparisonType::Equal,
                 )],
             ),
@@ -922,8 +928,9 @@ mod tests {
     #[test]
     fn reordered_consumer_domains_do_not_create_another_producer_restriction() {
         use paro_planner::expression::{ConjunctionExpression, ConjunctionType};
-        let conjunction =
-            |kind, children| Expression::Conjunction(ConjunctionExpression::new(kind, children));
+        let conjunction = |kind, children| {
+            Expression::Conjunction(ConjunctionExpression::new(kind, children).into())
+        };
         let a = equality(0, 2001);
         let b = equality(0, 2002);
         let c = equality(0, 2003);
@@ -988,14 +995,14 @@ mod tests {
                 reference(9, 1),
                 reference(9, 2),
                 vec![JoinCondition::new(
-                    Expression::ColumnRef(ColumnRefExpression::new(
-                        ColumnBinding::new(1, 0),
-                        LogicalType::Integer,
-                    )),
-                    Expression::ColumnRef(ColumnRefExpression::new(
-                        ColumnBinding::new(2, 0),
-                        LogicalType::Integer,
-                    )),
+                    Expression::ColumnRef(
+                        ColumnRefExpression::new(ColumnBinding::new(1, 0), LogicalType::Integer)
+                            .into(),
+                    ),
+                    Expression::ColumnRef(
+                        ColumnRefExpression::new(ColumnBinding::new(2, 0), LogicalType::Integer)
+                            .into(),
+                    ),
                     JoinComparisonType::Equal,
                 )],
             ),
@@ -1749,11 +1756,11 @@ impl CteRequirement {
                     return Err(paro_error::internal("CTE key domain changed type"));
                 }
                 Ok(JoinCondition::new(
-                    Expression::ColumnRef(ColumnRefExpression::new(binding, ty.clone())),
-                    Expression::ColumnRef(ColumnRefExpression::new(
-                        domain_layout.bindings()[domain_ordinal],
-                        ty,
-                    )),
+                    Expression::ColumnRef(ColumnRefExpression::new(binding, ty.clone()).into()),
+                    Expression::ColumnRef(
+                        ColumnRefExpression::new(domain_layout.bindings()[domain_ordinal], ty)
+                            .into(),
+                    ),
                     JoinComparisonType::Equal,
                 ))
             })
@@ -1829,7 +1836,9 @@ impl CteRequirement {
                 .get_column_bindings()
                 .into_iter()
                 .zip(input_plan.types())
-                .map(|(binding, ty)| Expression::ColumnRef(ColumnRefExpression::new(binding, ty)))
+                .map(|(binding, ty)| {
+                    Expression::ColumnRef(ColumnRefExpression::new(binding, ty).into())
+                })
                 .collect();
             let projection = Projection::new(reference.table_index, input_plan, expressions)
                 .with_visible_names(reference.column_names)

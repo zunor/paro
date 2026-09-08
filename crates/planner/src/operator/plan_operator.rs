@@ -1370,17 +1370,15 @@ mod tests {
     }
 
     fn boolean_constant(value: bool) -> Expression {
-        Expression::Constant(ConstantExpression::new(
-            Value::Boolean(value),
-            LogicalType::Boolean,
-        ))
+        Expression::Constant(
+            ConstantExpression::new(Value::Boolean(value), LogicalType::Boolean).into(),
+        )
     }
 
     fn integer_constant(value: i32) -> Expression {
-        Expression::Constant(ConstantExpression::new(
-            Value::Integer(value),
-            LogicalType::Integer,
-        ))
+        Expression::Constant(
+            ConstantExpression::new(Value::Integer(value), LogicalType::Integer).into(),
+        )
     }
 
     fn create_storage(types: &[LogicalType]) -> TableHandle {
@@ -1728,10 +1726,13 @@ mod tests {
                 vec![LogicalType::Integer, LogicalType::BigInt],
             )),
             lp(expression_get(20, vec![LogicalType::Varchar])),
-            Expression::Constant(crate::expression::ConstantExpression::new(
-                paro_common::runtime_value::Value::Boolean(true),
-                LogicalType::Boolean,
-            )),
+            Expression::Constant(
+                crate::expression::ConstantExpression::new(
+                    paro_common::runtime_value::Value::Boolean(true),
+                    LogicalType::Boolean,
+                )
+                .into(),
+            ),
         );
         join.left_projection_map = vec![1].into();
         join.mark_index = Some(99);
@@ -1752,10 +1753,13 @@ mod tests {
                 20,
                 vec![LogicalType::Varchar, LogicalType::Boolean],
             )),
-            Expression::Constant(crate::expression::ConstantExpression::new(
-                paro_common::runtime_value::Value::Boolean(true),
-                LogicalType::Boolean,
-            )),
+            Expression::Constant(
+                crate::expression::ConstantExpression::new(
+                    paro_common::runtime_value::Value::Boolean(true),
+                    LogicalType::Boolean,
+                )
+                .into(),
+            ),
         );
         join.right_projection_map = vec![1].into();
 
@@ -1790,10 +1794,13 @@ mod tests {
                 20,
                 vec![LogicalType::Varchar, LogicalType::Boolean],
             )),
-            Expression::Constant(crate::expression::ConstantExpression::new(
-                paro_common::runtime_value::Value::Boolean(true),
-                LogicalType::Boolean,
-            )),
+            Expression::Constant(
+                crate::expression::ConstantExpression::new(
+                    paro_common::runtime_value::Value::Boolean(true),
+                    LogicalType::Boolean,
+                )
+                .into(),
+            ),
         );
         any.left_projection_map = vec![1].into();
         any.right_projection_map = vec![0].into();
@@ -1823,10 +1830,13 @@ mod tests {
             JoinType::Inner,
             lp(expression_get(10, vec![LogicalType::Integer])),
             lp(expression_get(20, vec![LogicalType::Varchar])),
-            Expression::Constant(crate::expression::ConstantExpression::new(
-                paro_common::runtime_value::Value::Boolean(true),
-                LogicalType::Boolean,
-            )),
+            Expression::Constant(
+                crate::expression::ConstantExpression::new(
+                    paro_common::runtime_value::Value::Boolean(true),
+                    LogicalType::Boolean,
+                )
+                .into(),
+            ),
         );
         any.left_projection_map.clear();
         any.right_projection_map.clear();
@@ -1859,16 +1869,14 @@ mod tests {
             31,
             32,
             lp(expression_get(10, vec![LogicalType::Integer])),
-            vec![Expression::Constant(ConstantExpression::new(
-                Value::Integer(42),
-                LogicalType::Integer,
-            ))],
+            vec![Expression::Constant(
+                ConstantExpression::new(Value::Integer(42), LogicalType::Integer).into(),
+            )],
             Vec::new(),
-            vec![Expression::Aggregate(Box::new(AggregateExpression::new(
-                get_count_star_function(),
-                vec![],
-                LogicalType::BigInt,
-            )))],
+            vec![Expression::Aggregate(
+                AggregateExpression::new(get_count_star_function(), vec![], LogicalType::BigInt)
+                    .into(),
+            )],
             vec![vec![0]],
         );
         let op = LogicalOperator::Aggregate(Box::new(aggregate));
@@ -1975,18 +1983,24 @@ mod tests {
                 },
                 confidence: crate::operator::Confidence::High,
             },
-            vec![Expression::Constant(ConstantExpression::new(
-                paro_common::runtime_value::Value::Integer(1),
-                LogicalType::Integer,
-            ))],
+            vec![Expression::Constant(
+                ConstantExpression::new(
+                    paro_common::runtime_value::Value::Integer(1),
+                    LogicalType::Integer,
+                )
+                .into(),
+            )],
             22,
             vec![],
             vec![],
             Some(0),
-            Expression::Constant(ConstantExpression::new(
-                paro_common::runtime_value::Value::Float(0.5),
-                LogicalType::Float,
-            )),
+            Expression::Constant(
+                ConstantExpression::new(
+                    paro_common::runtime_value::Value::Float(0.5),
+                    LogicalType::Float,
+                )
+                .into(),
+            ),
             true,
             5,
         )

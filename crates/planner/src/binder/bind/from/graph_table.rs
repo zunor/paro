@@ -136,7 +136,7 @@ pub fn bind_graph_table(
                             let expr = Expression::ColumnRef(ColumnRefExpression::new(
                                 binding,
                                 LogicalType::BigInt,
-                            ));
+                            ).into());
                             (expr, LogicalType::BigInt)
                         }
                         "element_id" => {
@@ -153,7 +153,7 @@ pub fn bind_graph_table(
                             let expr = Expression::ColumnRef(ColumnRefExpression::new(
                                 binding,
                                 logical_type.clone(),
-                            ));
+                            ).into());
                             (expr, logical_type)
                         }
                         "edges" => {
@@ -165,7 +165,7 @@ pub fn bind_graph_table(
                             let expr = Expression::ColumnRef(ColumnRefExpression::new(
                                 binding,
                                 logical_type.clone(),
-                            ));
+                            ).into());
                             (expr, logical_type)
                         }
                         _ => unreachable!(),

@@ -186,10 +186,9 @@ mod tests {
         b: usize,
     ) -> OwnedLogicalPlan {
         let column = |table| {
-            Expression::ColumnRef(ColumnRefExpression::new(
-                ColumnBinding::new(table, 0),
-                LogicalType::BigInt,
-            ))
+            Expression::ColumnRef(
+                ColumnRefExpression::new(ColumnBinding::new(table, 0), LogicalType::BigInt).into(),
+            )
         };
         OwnedLogicalPlan::synthetic(LogicalOperator::Join(Join::Comparison(
             ComparisonJoin::new(

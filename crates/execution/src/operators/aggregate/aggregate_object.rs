@@ -237,7 +237,7 @@ mod tests {
     }
 
     fn make_ref(index: usize, ty: LogicalType) -> Expression {
-        Expression::Reference(ReferenceExpression::new(index, ty))
+        Expression::Reference(ReferenceExpression::new(index, ty).into())
     }
 
     #[test]
@@ -284,7 +284,7 @@ mod tests {
         }]);
 
         let aggregate_data = GroupedAggregateData {
-            aggregates: vec![Expression::Aggregate(Box::new(aggregate))],
+            aggregates: vec![Expression::Aggregate(aggregate.into())],
             aggregate_inputs: vec![vec![0]],
             aggregate_filters: vec![Some(1)],
             aggregate_orders: vec![vec![2]],

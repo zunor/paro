@@ -81,21 +81,17 @@ fn bench_state() -> &'static BenchState {
 }
 
 fn reference_varchar(index: usize) -> Expression {
-    Expression::Reference(ReferenceExpression::new(index, LogicalType::Varchar))
+    Expression::Reference(ReferenceExpression::new(index, LogicalType::Varchar).into())
 }
 
 fn constant_varchar(value: &str) -> Expression {
-    Expression::Constant(ConstantExpression::new(
-        Value::Varchar(value.to_string()),
-        LogicalType::Varchar,
-    ))
+    Expression::Constant(
+        ConstantExpression::new(Value::Varchar(value.to_string()), LogicalType::Varchar).into(),
+    )
 }
 
 fn constant_bigint(value: i64) -> Expression {
-    Expression::Constant(ConstantExpression::new(
-        Value::BigInt(value),
-        LogicalType::BigInt,
-    ))
+    Expression::Constant(ConstantExpression::new(Value::BigInt(value), LogicalType::BigInt).into())
 }
 
 fn bind_or_default(
@@ -124,11 +120,14 @@ fn regexp_expr(specialized: bool) -> Expression {
         ),
     );
 
-    Expression::Function(Box::new(FunctionExpression::new(
-        bound,
-        vec![reference_varchar(0), constant_varchar("^hello_world$")],
-        LogicalType::Boolean,
-    )))
+    Expression::Function(
+        FunctionExpression::new(
+            bound,
+            vec![reference_varchar(0), constant_varchar("^hello_world$")],
+            LogicalType::Boolean,
+        )
+        .into(),
+    )
 }
 
 fn substring_expr(specialized: bool) -> Expression {
@@ -153,11 +152,14 @@ fn substring_expr(specialized: bool) -> Expression {
         ),
     );
 
-    Expression::Function(Box::new(FunctionExpression::new(
-        bound,
-        vec![reference_varchar(0), constant_bigint(8), constant_bigint(6)],
-        LogicalType::Varchar,
-    )))
+    Expression::Function(
+        FunctionExpression::new(
+            bound,
+            vec![reference_varchar(0), constant_bigint(8), constant_bigint(6)],
+            LogicalType::Varchar,
+        )
+        .into(),
+    )
 }
 
 #[divan::bench(sample_count = 10)]

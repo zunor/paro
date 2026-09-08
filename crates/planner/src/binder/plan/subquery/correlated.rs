@@ -26,12 +26,9 @@ fn append_scalar_presence_carrier(
 ) -> (LogicalOperator, ColumnBinding) {
     if let LogicalOperator::Projection(mut projection) = plan {
         let presence_ordinal = projection.expressions.len();
-        projection
-            .expressions
-            .push(Expression::Constant(ConstantExpression::new(
-                Value::Boolean(true),
-                LogicalType::Boolean,
-            )));
+        projection.expressions.push(Expression::Constant(
+            ConstantExpression::new(Value::Boolean(true), LogicalType::Boolean).into(),
+        ));
         projection.returned_types.push(LogicalType::Boolean);
         let presence_binding = ColumnBinding::new(projection.table_index, presence_ordinal);
         return (LogicalOperator::Projection(projection), presence_binding);
@@ -44,13 +41,12 @@ fn append_scalar_presence_carrier(
         .into_iter()
         .zip(child.types())
         .map(|(binding, logical_type)| {
-            Expression::ColumnRef(ColumnRefExpression::new(binding, logical_type))
+            Expression::ColumnRef(ColumnRefExpression::new(binding, logical_type).into())
         })
         .collect::<Vec<_>>();
-    expressions.push(Expression::Constant(ConstantExpression::new(
-        Value::Boolean(true),
-        LogicalType::Boolean,
-    )));
+    expressions.push(Expression::Constant(
+        ConstantExpression::new(Value::Boolean(true), LogicalType::Boolean).into(),
+    ));
     let table_index = binder.bind_context.generate_table_index();
     let presence_binding = ColumnBinding::new(table_index, expressions.len() - 1);
     (
@@ -184,10 +180,9 @@ impl crate::binder::Binder {
                     })?,
                     0,
                 );
-                Ok(Expression::ColumnRef(ColumnRefExpression::new(
-                    result_binding,
-                    LogicalType::Boolean,
-                )))
+                Ok(Expression::ColumnRef(
+                    ColumnRefExpression::new(result_binding, LogicalType::Boolean).into(),
+                ))
             }
             SubqueryType::NotExists | SubqueryType::All => {
                 let mark_index = planned_mark_index.ok_or_else(|| {
@@ -212,10 +207,9 @@ impl crate::binder::Binder {
                     .get(result_col_index)
                     .cloned()
                     .unwrap_or_else(|| subquery.return_type.clone());
-                let scalar = Expression::ColumnRef(ColumnRefExpression::new(
-                    result_binding,
-                    result_type.clone(),
-                ));
+                let scalar = Expression::ColumnRef(
+                    ColumnRefExpression::new(result_binding, result_type.clone()).into(),
+                );
                 let Some(empty_output) = scalar_empty_output else {
                     return Ok(scalar);
                 };
@@ -227,21 +221,20 @@ impl crate::binder::Binder {
                 let presence_binding = result_bindings.last().copied().ok_or_else(|| {
                     paro_error::internal("scalar subquery presence carrier is missing")
                 })?;
-                let presence = Expression::ColumnRef(ColumnRefExpression::new(
-                    presence_binding,
-                    LogicalType::Boolean,
-                ));
-                let missing = Expression::Operator(OperatorExpression::new_unary(
-                    OperatorType::IsNull,
-                    presence,
-                    LogicalType::Boolean,
-                ));
-                Ok(Expression::Case(CaseExpression::new(
-                    missing,
-                    empty_output,
-                    scalar,
-                    result_type,
-                )))
+                let presence = Expression::ColumnRef(
+                    ColumnRefExpression::new(presence_binding, LogicalType::Boolean).into(),
+                );
+                let missing = Expression::Operator(
+                    OperatorExpression::new_unary(
+                        OperatorType::IsNull,
+                        presence,
+                        LogicalType::Boolean,
+                    )
+                    .into(),
+                );
+                Ok(Expression::Case(
+                    CaseExpression::new(missing, empty_output, scalar, result_type).into(),
+                ))
             }
         }
     }
@@ -258,19 +251,20 @@ impl crate::binder::Binder {
     }
 
     fn negated_mark_expression(mark_index: usize) -> Expression {
-        let mark_ref = Expression::ColumnRef(ColumnRefExpression::new(
-            ColumnBinding::new(mark_index, 0),
-            LogicalType::Boolean,
-        ));
-        let false_const = Expression::Constant(ConstantExpression {
-            value: Value::Boolean(false),
-            return_type: LogicalType::Boolean,
-        });
-        Expression::Comparison(ComparisonExpression::new(
-            ComparisonType::Equal,
-            mark_ref,
-            false_const,
-        ))
+        let mark_ref = Expression::ColumnRef(
+            ColumnRefExpression::new(ColumnBinding::new(mark_index, 0), LogicalType::Boolean)
+                .into(),
+        );
+        let false_const = Expression::Constant(
+            ConstantExpression {
+                value: Value::Boolean(false),
+                return_type: LogicalType::Boolean,
+            }
+            .into(),
+        );
+        Expression::Comparison(
+            ComparisonExpression::new(ComparisonType::Equal, mark_ref, false_const).into(),
+        )
     }
 }
 
@@ -373,10 +367,13 @@ mod tests {
     }
 
     fn int_col(table_index: usize, column_index: usize) -> Expression {
-        Expression::ColumnRef(ColumnRefExpression::new(
-            ColumnBinding::new(table_index, column_index),
-            LogicalType::Integer,
-        ))
+        Expression::ColumnRef(
+            ColumnRefExpression::new(
+                ColumnBinding::new(table_index, column_index),
+                LogicalType::Integer,
+            )
+            .into(),
+        )
     }
 
     #[test]
@@ -385,10 +382,9 @@ mod tests {
         let outer = expression_get(10, vec![LogicalType::Integer]);
         let inner = expression_get(20, vec![LogicalType::Integer]);
         let correlated = vec![correlated_column(10, 0, LogicalType::Integer)];
-        let child = Expression::ColumnRef(ColumnRefExpression::new(
-            ColumnBinding::new(10, 0),
-            LogicalType::Integer,
-        ));
+        let child = Expression::ColumnRef(
+            ColumnRefExpression::new(ColumnBinding::new(10, 0), LogicalType::Integer).into(),
+        );
         let subquery = subquery_expression(
             SubqueryType::Any,
             inner,
@@ -612,10 +608,7 @@ mod tests {
                         );
                         assert!(matches!(
                             comp.right.as_ref(),
-                            Expression::Constant(ConstantExpression {
-                                value: Value::Boolean(false),
-                                ..
-                            })
+                            Expression::Constant(constant) if constant.value == Value::Boolean(false)
                         ));
                     }
                     other => panic!("expected negated mark comparison, got {other:?}"),
@@ -691,10 +684,9 @@ mod tests {
         let mut binder = test_binder();
         let correlated = vec![correlated_column(120, 0, LogicalType::Integer)];
         let any_left = CastExpression::add_cast_if_needed(
-            Expression::ColumnRef(ColumnRefExpression::new(
-                ColumnBinding::new(120, 1),
-                LogicalType::Integer,
-            )),
+            Expression::ColumnRef(
+                ColumnRefExpression::new(ColumnBinding::new(120, 1), LogicalType::Integer).into(),
+            ),
             LogicalType::BigInt,
             binder.cast_functions.as_ref(),
         )
@@ -750,10 +742,9 @@ mod tests {
         let subquery = subquery_expression(
             SubqueryType::All,
             expression_get(150, vec![LogicalType::Integer]),
-            vec![Expression::ColumnRef(ColumnRefExpression::new(
-                ColumnBinding::new(140, 1),
-                LogicalType::Integer,
-            ))],
+            vec![Expression::ColumnRef(
+                ColumnRefExpression::new(ColumnBinding::new(140, 1), LogicalType::Integer).into(),
+            )],
             vec![LogicalType::Integer],
             vec![LogicalType::Integer],
             correlated,
@@ -797,18 +788,27 @@ mod tests {
     fn correlated_exists_pushes_filter_to_delim_cross_product_leaf() {
         let mut binder = test_binder();
         let correlated = vec![correlated_column(200, 0, LogicalType::Integer)];
-        let filter_expr = Expression::Comparison(ComparisonExpression::new(
-            ComparisonType::GreaterThan,
-            Expression::ColumnRef(ColumnRefExpression::with_depth(
-                ColumnBinding::new(200, 0),
-                LogicalType::Integer,
-                1,
-            )),
-            Expression::Constant(ConstantExpression {
-                value: Value::Integer(10),
-                return_type: LogicalType::Integer,
-            }),
-        ));
+        let filter_expr = Expression::Comparison(
+            ComparisonExpression::new(
+                ComparisonType::GreaterThan,
+                Expression::ColumnRef(
+                    ColumnRefExpression::with_depth(
+                        ColumnBinding::new(200, 0),
+                        LogicalType::Integer,
+                        1,
+                    )
+                    .into(),
+                ),
+                Expression::Constant(
+                    ConstantExpression {
+                        value: Value::Integer(10),
+                        return_type: LogicalType::Integer,
+                    }
+                    .into(),
+                ),
+            )
+            .into(),
+        );
         let subquery = subquery_expression(
             SubqueryType::Exists,
             LogicalOperator::Filter(crate::operator::Filter::new(
@@ -873,10 +873,10 @@ mod tests {
             LogicalOperator::Projection(Projection::new(
                 221,
                 wrapped(&binder, expression_get(230, vec![LogicalType::Integer])),
-                vec![Expression::ColumnRef(ColumnRefExpression::new(
-                    ColumnBinding::new(230, 0),
-                    LogicalType::Integer,
-                ))],
+                vec![Expression::ColumnRef(
+                    ColumnRefExpression::new(ColumnBinding::new(230, 0), LogicalType::Integer)
+                        .into(),
+                )],
             )),
             vec![],
             vec![],
@@ -914,10 +914,9 @@ mod tests {
         let (first_func, _) = first_set
             .bind(&[LogicalType::Integer])
             .expect("bind first aggregate");
-        let inner_ref = Expression::ColumnRef(ColumnRefExpression::new(
-            ColumnBinding::new(250, 0),
-            LogicalType::Integer,
-        ));
+        let inner_ref = Expression::ColumnRef(
+            ColumnRefExpression::new(ColumnBinding::new(250, 0), LogicalType::Integer).into(),
+        );
         let aggregate = LogicalOperator::Aggregate(Box::new(Aggregate::new(
             251,
             252,
@@ -925,11 +924,9 @@ mod tests {
             wrapped(&binder, expression_get(250, vec![LogicalType::Integer])),
             Vec::new(),
             Vec::new(),
-            vec![Expression::Aggregate(Box::new(AggregateExpression::new(
-                first_func,
-                vec![inner_ref],
-                LogicalType::Integer,
-            )))],
+            vec![Expression::Aggregate(
+                AggregateExpression::new(first_func, vec![inner_ref], LogicalType::Integer).into(),
+            )],
             vec![],
         )));
         let subquery = subquery_expression(
@@ -956,10 +953,7 @@ mod tests {
                     assert_eq!(projection.expressions.len(), 3);
                     assert!(matches!(
                         &projection.expressions[1],
-                        Expression::Constant(ConstantExpression {
-                            value: Value::Boolean(true),
-                            ..
-                        })
+                        Expression::Constant(constant) if constant.value == Value::Boolean(true)
                     ));
                     let LogicalOperator::Aggregate(inner_agg) = &projection.child.operator else {
                         panic!("expected aggregate below scalar presence projection")
@@ -987,11 +981,14 @@ mod tests {
         let correlated_projection = LogicalOperator::Projection(Projection::new(
             261,
             wrapped(&binder, expression_get(262, vec![LogicalType::Integer])),
-            vec![Expression::ColumnRef(ColumnRefExpression::with_depth(
-                ColumnBinding::new(260, 0),
-                LogicalType::Integer,
-                1,
-            ))],
+            vec![Expression::ColumnRef(
+                ColumnRefExpression::with_depth(
+                    ColumnBinding::new(260, 0),
+                    LogicalType::Integer,
+                    1,
+                )
+                .into(),
+            )],
         ));
         let subquery = subquery_expression(
             SubqueryType::Exists,
@@ -1049,11 +1046,10 @@ mod tests {
     fn flatten_inner_lateral_join_uses_comparison_join_and_duplicate_elimination() {
         let mut binder = test_binder();
         let correlated = vec![correlated_column(300, 0, LogicalType::Integer)];
-        let join_condition = Expression::Comparison(ComparisonExpression::new(
-            ComparisonType::Equal,
-            int_col(300, 0),
-            int_col(301, 0),
-        ));
+        let join_condition = Expression::Comparison(
+            ComparisonExpression::new(ComparisonType::Equal, int_col(300, 0), int_col(301, 0))
+                .into(),
+        );
         let dependent_join = DependentJoin::lateral(
             wrapped(&binder, expression_get(300, vec![LogicalType::Integer])),
             wrapped(&binder, expression_get(301, vec![LogicalType::Integer])),
@@ -1094,10 +1090,13 @@ mod tests {
             wrapped(&binder, aggregate),
             correlated,
             JoinType::Inner,
-            Some(Expression::Constant(ConstantExpression {
-                value: Value::Boolean(true),
-                return_type: LogicalType::Boolean,
-            })),
+            Some(Expression::Constant(
+                ConstantExpression {
+                    value: Value::Boolean(true),
+                    return_type: LogicalType::Boolean,
+                }
+                .into(),
+            )),
         );
 
         let plan =
@@ -1141,10 +1140,13 @@ mod tests {
             wrapped(&binder, window),
             correlated,
             JoinType::Inner,
-            Some(Expression::Constant(ConstantExpression {
-                value: Value::Boolean(true),
-                return_type: LogicalType::Boolean,
-            })),
+            Some(Expression::Constant(
+                ConstantExpression {
+                    value: Value::Boolean(true),
+                    return_type: LogicalType::Boolean,
+                }
+                .into(),
+            )),
         );
 
         let plan =
@@ -1180,10 +1182,13 @@ mod tests {
             wrapped(&binder, distinct),
             correlated,
             JoinType::Inner,
-            Some(Expression::Constant(ConstantExpression {
-                value: Value::Boolean(true),
-                return_type: LogicalType::Boolean,
-            })),
+            Some(Expression::Constant(
+                ConstantExpression {
+                    value: Value::Boolean(true),
+                    return_type: LogicalType::Boolean,
+                }
+                .into(),
+            )),
         );
 
         let plan =
@@ -1215,10 +1220,13 @@ mod tests {
             wrapped(&binder, setop),
             correlated,
             JoinType::Inner,
-            Some(Expression::Constant(ConstantExpression {
-                value: Value::Boolean(true),
-                return_type: LogicalType::Boolean,
-            })),
+            Some(Expression::Constant(
+                ConstantExpression {
+                    value: Value::Boolean(true),
+                    return_type: LogicalType::Boolean,
+                }
+                .into(),
+            )),
         );
 
         let plan =
@@ -1276,10 +1284,13 @@ mod tests {
                 wrapped(&binder, setop),
                 correlated,
                 JoinType::Inner,
-                Some(Expression::Constant(ConstantExpression {
-                    value: Value::Boolean(true),
-                    return_type: LogicalType::Boolean,
-                })),
+                Some(Expression::Constant(
+                    ConstantExpression {
+                        value: Value::Boolean(true),
+                        return_type: LogicalType::Boolean,
+                    }
+                    .into(),
+                )),
             );
 
             let plan =
@@ -1323,10 +1334,10 @@ mod tests {
                 vec![],
                 vec![],
                 vec![OrderByExpression {
-                    expression: Expression::ColumnRef(ColumnRefExpression::new(
-                        ColumnBinding::new(371, 0),
-                        LogicalType::Integer,
-                    )),
+                    expression: Expression::ColumnRef(
+                        ColumnRefExpression::new(ColumnBinding::new(371, 0), LogicalType::Integer)
+                            .into(),
+                    ),
                     ascending: true,
                     nulls_first: false,
                 }],
@@ -1340,10 +1351,13 @@ mod tests {
             wrapped(&binder, window),
             correlated,
             JoinType::Inner,
-            Some(Expression::Constant(ConstantExpression {
-                value: Value::Boolean(true),
-                return_type: LogicalType::Boolean,
-            })),
+            Some(Expression::Constant(
+                ConstantExpression {
+                    value: Value::Boolean(true),
+                    return_type: LogicalType::Boolean,
+                }
+                .into(),
+            )),
         );
 
         let plan = flatten_dependent_join(&mut binder, dependent_join)
@@ -1368,10 +1382,13 @@ mod tests {
             wrapped(&binder, expression_get(311, vec![LogicalType::Integer])),
             correlated,
             JoinType::Left,
-            Some(Expression::Constant(ConstantExpression {
-                value: Value::Boolean(true),
-                return_type: LogicalType::Boolean,
-            })),
+            Some(Expression::Constant(
+                ConstantExpression {
+                    value: Value::Boolean(true),
+                    return_type: LogicalType::Boolean,
+                }
+                .into(),
+            )),
         );
 
         let plan = flatten_dependent_join(&mut binder, dependent_join)
@@ -1391,15 +1408,21 @@ mod tests {
     fn flatten_left_lateral_join_rejects_arbitrary_residuals() {
         let mut binder = test_binder();
         let correlated = vec![correlated_column(320, 0, LogicalType::Integer)];
-        let arbitrary_condition = Expression::Operator(OperatorExpression::new_unary(
-            OperatorType::Not,
-            Expression::Comparison(ComparisonExpression::new(
-                ComparisonType::Equal,
-                int_col(320, 0),
-                int_col(321, 0),
-            )),
-            LogicalType::Boolean,
-        ));
+        let arbitrary_condition = Expression::Operator(
+            OperatorExpression::new_unary(
+                OperatorType::Not,
+                Expression::Comparison(
+                    ComparisonExpression::new(
+                        ComparisonType::Equal,
+                        int_col(320, 0),
+                        int_col(321, 0),
+                    )
+                    .into(),
+                ),
+                LogicalType::Boolean,
+            )
+            .into(),
+        );
         let dependent_join = DependentJoin::lateral(
             wrapped(&binder, expression_get(320, vec![LogicalType::Integer])),
             wrapped(&binder, expression_get(321, vec![LogicalType::Integer])),

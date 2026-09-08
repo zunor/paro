@@ -490,14 +490,16 @@ fn ungrouped_aggregate_having_can_suppress_its_single_row() {
     let output = QueryOutputPort::unbounded();
     let query = query_context(output.clone());
     let mut spec = ungrouped_count_spec();
-    spec.having_filter = vec![Expression::Comparison(ComparisonExpression::new(
-        ComparisonType::GreaterThan,
-        reference(0, LogicalType::BigInt),
-        Expression::Constant(ConstantExpression::new(
-            Value::BigInt(3),
-            LogicalType::BigInt,
-        )),
-    ))]
+    spec.having_filter = vec![Expression::Comparison(
+        ComparisonExpression::new(
+            ComparisonType::GreaterThan,
+            reference(0, LogicalType::BigInt),
+            Expression::Constant(
+                ConstantExpression::new(Value::BigInt(3), LogicalType::BigInt).into(),
+            ),
+        )
+        .into(),
+    )]
     .into_boxed_slice();
     let graph = aggregate_breaker_graph(
         SinkSpec::UngroupedAggregate(UngroupedAggregateSinkSpec {
@@ -854,30 +856,38 @@ fn perfect_hash_having_rejection_still_validates_every_aggregate_state() {
         group_key_encodings: Box::new([crate::physical::specs::GroupKeyEncoding::Identity]),
         grouping_sets: Box::new([]),
         aggregates: Box::new([
-            Expression::Aggregate(Box::new(AggregateExpression::new(
-                narrow_sum,
-                vec![reference(1, narrow_type.clone())],
-                wide_type.clone(),
-            ))),
-            Expression::Aggregate(Box::new(AggregateExpression::new(
-                wide_sum,
-                vec![reference(2, wide_type.clone())],
-                wide_type.clone(),
-            ))),
+            Expression::Aggregate(
+                AggregateExpression::new(
+                    narrow_sum,
+                    vec![reference(1, narrow_type.clone())],
+                    wide_type.clone(),
+                )
+                .into(),
+            ),
+            Expression::Aggregate(
+                AggregateExpression::new(
+                    wide_sum,
+                    vec![reference(2, wide_type.clone())],
+                    wide_type.clone(),
+                )
+                .into(),
+            ),
         ]),
         grouping_functions: Box::new([]),
         aggregate_inputs: Box::new([Box::new([1]), Box::new([2])]),
         aggregate_filters: Box::new([None, None]),
         aggregate_orders: Box::new([Box::new([]), Box::new([])]),
         post_reduction: None,
-        having_filter: Box::new([Expression::Comparison(ComparisonExpression::new(
-            ComparisonType::GreaterThan,
-            reference(0, wide_type.clone()),
-            Expression::Constant(ConstantExpression::new(
-                Value::Decimal(10, 38, 0),
-                wide_type.clone(),
-            )),
-        ))]),
+        having_filter: Box::new([Expression::Comparison(
+            ComparisonExpression::new(
+                ComparisonType::GreaterThan,
+                reference(0, wide_type.clone()),
+                Expression::Constant(
+                    ConstantExpression::new(Value::Decimal(10, 38, 0), wide_type.clone()).into(),
+                ),
+            )
+            .into(),
+        )]),
         spill_policy: crate::physical::specs::SpillExecutionPolicy::InMemory,
         perfect_hash: Some(PerfectHashAggregatePlan {
             group_minima: Box::new([1]),
@@ -904,10 +914,9 @@ fn perfect_hash_having_rejection_still_validates_every_aggregate_state() {
         let LogicalType::Decimal { precision, scale } = ty else {
             unreachable!("test decimal constant requires DECIMAL type")
         };
-        Expression::Constant(ConstantExpression::new(
-            Value::Decimal(value, *precision, *scale),
-            ty.clone(),
-        ))
+        Expression::Constant(
+            ConstantExpression::new(Value::Decimal(value, *precision, *scale), ty.clone()).into(),
+        )
     };
 
     let output = QueryOutputPort::unbounded();
@@ -1156,11 +1165,14 @@ fn external_hash_post_reduction_filters_against_the_global_spilled_domain() {
 fn post_reduction_precedes_having_and_both_reject_null_predicates() {
     let output = QueryOutputPort::unbounded();
     let query = query_context(output.clone());
-    let having = Expression::Comparison(ComparisonExpression::new(
-        ComparisonType::LessThan,
-        reference(0, LogicalType::BigInt),
-        bigint_constant(100),
-    ));
+    let having = Expression::Comparison(
+        ComparisonExpression::new(
+            ComparisonType::LessThan,
+            reference(0, LogicalType::BigInt),
+            bigint_constant(100),
+        )
+        .into(),
+    );
     let spec = grouped_sum_post_max_spec(LogicalType::Integer, None, Box::new([having]));
     let graph = aggregate_breaker_graph(
         SinkSpec::HashAggregateBuild(HashAggregateBuildSinkSpec {

@@ -616,10 +616,13 @@ mod tests {
         Arc::new(
             Sort::new(
                 vec![OrderByNode {
-                    expression: Expression::Reference(ReferenceExpression {
-                        index: 0,
-                        return_type: LogicalType::Integer,
-                    }),
+                    expression: Expression::Reference(
+                        ReferenceExpression {
+                            index: 0,
+                            return_type: LogicalType::Integer,
+                        }
+                        .into(),
+                    ),
                     ascending: true,
                     nulls_first: false,
                 }],

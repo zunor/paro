@@ -280,22 +280,25 @@ fn residual_predicate(conditions: &[JoinCondition]) -> Expression {
         .iter()
         .enumerate()
         .map(|(idx, condition)| {
-            Expression::Comparison(ComparisonExpression::new(
-                expression_comparison(condition.comparison),
-                Expression::Reference(ReferenceExpression::new(idx, condition.left.return_type())),
-                Expression::Reference(ReferenceExpression::new(
-                    count + idx,
-                    condition.right.return_type(),
-                )),
-            ))
+            Expression::Comparison(
+                ComparisonExpression::new(
+                    expression_comparison(condition.comparison),
+                    Expression::Reference(
+                        ReferenceExpression::new(idx, condition.left.return_type()).into(),
+                    ),
+                    Expression::Reference(
+                        ReferenceExpression::new(count + idx, condition.right.return_type()).into(),
+                    ),
+                )
+                .into(),
+            )
         })
         .collect::<Vec<_>>();
     if comparisons.len() == 1 {
         comparisons.pop().expect("one residual comparison")
     } else {
-        Expression::Conjunction(ConjunctionExpression::new(
-            ConjunctionType::And,
-            comparisons,
-        ))
+        Expression::Conjunction(
+            ConjunctionExpression::new(ConjunctionType::And, comparisons).into(),
+        )
     }
 }

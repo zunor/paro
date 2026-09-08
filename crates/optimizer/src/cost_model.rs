@@ -1095,27 +1095,27 @@ mod tests {
     #[test]
     fn constant_false_selectivity_is_zero() {
         let model = CostModel::default();
-        let expr = Expression::Constant(ConstantExpression::new(
-            Value::Boolean(false),
-            LogicalType::Boolean,
-        ));
+        let expr = Expression::Constant(
+            ConstantExpression::new(Value::Boolean(false), LogicalType::Boolean).into(),
+        );
         assert_eq!(model.estimate_selectivity(&expr, &HashMap::new()), 0.0);
     }
 
     #[test]
     fn comparison_without_stats_uses_default_equality_selectivity() {
         let model = CostModel::default();
-        let expr = Expression::Comparison(ComparisonExpression::new(
-            ComparisonType::Equal,
-            Expression::ColumnRef(ColumnRefExpression::new(
-                ColumnBinding::new(1, 0),
-                LogicalType::Integer,
-            )),
-            Expression::Constant(ConstantExpression::new(
-                Value::Integer(7),
-                LogicalType::Integer,
-            )),
-        ));
+        let expr = Expression::Comparison(
+            ComparisonExpression::new(
+                ComparisonType::Equal,
+                Expression::ColumnRef(
+                    ColumnRefExpression::new(ColumnBinding::new(1, 0), LogicalType::Integer).into(),
+                ),
+                Expression::Constant(
+                    ConstantExpression::new(Value::Integer(7), LogicalType::Integer).into(),
+                ),
+            )
+            .into(),
+        );
 
         assert_eq!(
             model.estimate_selectivity(&expr, &HashMap::new()),
@@ -1133,19 +1133,18 @@ mod tests {
         NumericStats::set_guaranteed_min(stats.statistics_mut(), &Value::Date(0));
         NumericStats::set_guaranteed_max(stats.statistics_mut(), &Value::Date(100));
         let column_stats = HashMap::from([(binding, Arc::new(stats))]);
-        let column = || Expression::ColumnRef(ColumnRefExpression::new(binding, LogicalType::Date));
-        let constant =
-            || Expression::Constant(ConstantExpression::new(Value::Date(90), LogicalType::Date));
-        let upper_bound = Expression::Comparison(ComparisonExpression::new(
-            ComparisonType::LessThanOrEqual,
-            column(),
-            constant(),
-        ));
-        let reversed = Expression::Comparison(ComparisonExpression::new(
-            ComparisonType::GreaterThanOrEqual,
-            constant(),
-            column(),
-        ));
+        let column =
+            || Expression::ColumnRef(ColumnRefExpression::new(binding, LogicalType::Date).into());
+        let constant = || {
+            Expression::Constant(ConstantExpression::new(Value::Date(90), LogicalType::Date).into())
+        };
+        let upper_bound = Expression::Comparison(
+            ComparisonExpression::new(ComparisonType::LessThanOrEqual, column(), constant()).into(),
+        );
+        let reversed = Expression::Comparison(
+            ComparisonExpression::new(ComparisonType::GreaterThanOrEqual, constant(), column())
+                .into(),
+        );
 
         let expected = 91.0 / 101.0;
         assert_eq!(
@@ -1199,23 +1198,29 @@ mod tests {
         NumericStats::set_guaranteed_max(stats.statistics_mut(), &Value::Integer(9));
         let column_stats = HashMap::from([(binding, Arc::new(stats))]);
         let comparison = |comparison_type, value| {
-            Expression::Comparison(ComparisonExpression::new(
-                comparison_type,
-                Expression::ColumnRef(ColumnRefExpression::new(binding, LogicalType::Integer)),
-                Expression::Constant(ConstantExpression::new(
-                    Value::Integer(value),
-                    LogicalType::Integer,
-                )),
-            ))
+            Expression::Comparison(
+                ComparisonExpression::new(
+                    comparison_type,
+                    Expression::ColumnRef(
+                        ColumnRefExpression::new(binding, LogicalType::Integer).into(),
+                    ),
+                    Expression::Constant(
+                        ConstantExpression::new(Value::Integer(value), LogicalType::Integer).into(),
+                    ),
+                )
+                .into(),
+            )
         };
-        let expression =
-            Expression::Conjunction(paro_planner::expression::ConjunctionExpression::new(
+        let expression = Expression::Conjunction(
+            paro_planner::expression::ConjunctionExpression::new(
                 ConjunctionType::And,
                 vec![
                     comparison(ComparisonType::GreaterThanOrEqual, 2),
                     comparison(ComparisonType::LessThan, 5),
                 ],
-            ));
+            )
+            .into(),
+        );
 
         assert_eq!(model.estimate_selectivity(&expression, &column_stats), 0.3);
         assert_eq!(
@@ -1239,26 +1244,38 @@ mod tests {
         let distinct = size_stats.distinct_evidence().point;
         let column_stats = HashMap::from([(size_binding, Arc::new(size_stats))]);
         let equality = |value| {
-            Expression::Comparison(ComparisonExpression::new(
-                ComparisonType::NotEqual,
-                Expression::ColumnRef(ColumnRefExpression::new(size_binding, LogicalType::Integer)),
-                Expression::Constant(ConstantExpression::new(
-                    Value::Integer(value),
-                    LogicalType::Integer,
-                )),
-            ))
+            Expression::Comparison(
+                ComparisonExpression::new(
+                    ComparisonType::NotEqual,
+                    Expression::ColumnRef(
+                        ColumnRefExpression::new(size_binding, LogicalType::Integer).into(),
+                    ),
+                    Expression::Constant(
+                        ConstantExpression::new(Value::Integer(value), LogicalType::Integer).into(),
+                    ),
+                )
+                .into(),
+            )
         };
-        let suffix = Expression::Operator(OperatorExpression::new(
-            OperatorType::Like,
-            vec![
-                Expression::ColumnRef(ColumnRefExpression::new(type_binding, LogicalType::Varchar)),
-                Expression::Constant(ConstantExpression::new(
-                    Value::Varchar("%BRASS".to_string()),
-                    LogicalType::Varchar,
-                )),
-            ],
-            LogicalType::Boolean,
-        ));
+        let suffix = Expression::Operator(
+            OperatorExpression::new(
+                OperatorType::Like,
+                vec![
+                    Expression::ColumnRef(
+                        ColumnRefExpression::new(type_binding, LogicalType::Varchar).into(),
+                    ),
+                    Expression::Constant(
+                        ConstantExpression::new(
+                            Value::Varchar("%BRASS".to_string()),
+                            LogicalType::Varchar,
+                        )
+                        .into(),
+                    ),
+                ],
+                LogicalType::Boolean,
+            )
+            .into(),
+        );
 
         let same_column = (1.0 - 1.0 / distinct as f64).powi(2);
         let expected = model.defaults.like_contains * same_column.sqrt();
@@ -1276,17 +1293,22 @@ mod tests {
     fn conjunction_keeps_different_relations_independent() {
         let model = CostModel::default();
         let equality = |table_index| {
-            Expression::Comparison(ComparisonExpression::new(
-                ComparisonType::Equal,
-                Expression::ColumnRef(ColumnRefExpression::new(
-                    ColumnBinding::new(table_index, 0),
-                    LogicalType::Integer,
-                )),
-                Expression::Constant(ConstantExpression::new(
-                    Value::Integer(1),
-                    LogicalType::Integer,
-                )),
-            ))
+            Expression::Comparison(
+                ComparisonExpression::new(
+                    ComparisonType::Equal,
+                    Expression::ColumnRef(
+                        ColumnRefExpression::new(
+                            ColumnBinding::new(table_index, 0),
+                            LogicalType::Integer,
+                        )
+                        .into(),
+                    ),
+                    Expression::Constant(
+                        ConstantExpression::new(Value::Integer(1), LogicalType::Integer).into(),
+                    ),
+                )
+                .into(),
+            )
         };
 
         assert_eq!(
@@ -1342,20 +1364,29 @@ mod tests {
     fn like_selectivity_distinguishes_pattern_shapes() {
         let model = CostModel::default();
         let like = |pattern: &str| {
-            Expression::Operator(OperatorExpression::new(
-                OperatorType::Like,
-                vec![
-                    Expression::ColumnRef(ColumnRefExpression::new(
-                        ColumnBinding::new(1, 0),
-                        LogicalType::Varchar,
-                    )),
-                    Expression::Constant(ConstantExpression::new(
-                        Value::Varchar(pattern.to_string()),
-                        LogicalType::Varchar,
-                    )),
-                ],
-                LogicalType::Boolean,
-            ))
+            Expression::Operator(
+                OperatorExpression::new(
+                    OperatorType::Like,
+                    vec![
+                        Expression::ColumnRef(
+                            ColumnRefExpression::new(
+                                ColumnBinding::new(1, 0),
+                                LogicalType::Varchar,
+                            )
+                            .into(),
+                        ),
+                        Expression::Constant(
+                            ConstantExpression::new(
+                                Value::Varchar(pattern.to_string()),
+                                LogicalType::Varchar,
+                            )
+                            .into(),
+                        ),
+                    ],
+                    LogicalType::Boolean,
+                )
+                .into(),
+            )
         };
 
         assert_eq!(
@@ -1418,18 +1449,16 @@ mod tests {
             0.75
         );
 
-        let not_like = Expression::Operator(OperatorExpression::new_unary(
-            OperatorType::Not,
-            like("%green%"),
-            LogicalType::Boolean,
-        ));
+        let not_like = Expression::Operator(
+            OperatorExpression::new_unary(OperatorType::Not, like("%green%"), LogicalType::Boolean)
+                .into(),
+        );
         assert_eq!(model.estimate_selectivity(&not_like, &HashMap::new()), 0.95);
 
-        let not_match_all = Expression::Operator(OperatorExpression::new_unary(
-            OperatorType::Not,
-            like("%"),
-            LogicalType::Boolean,
-        ));
+        let not_match_all = Expression::Operator(
+            OperatorExpression::new_unary(OperatorType::Not, like("%"), LogicalType::Boolean)
+                .into(),
+        );
         assert_eq!(
             model.estimate_selectivity(&not_match_all, &HashMap::new()),
             MIN_SELECTIVITY
@@ -1440,41 +1469,56 @@ mod tests {
     fn only_proven_false_predicates_receive_zero_selectivity() {
         let model = CostModel::default();
         let constant = |value| {
-            Expression::Constant(ConstantExpression::new(
-                Value::Boolean(value),
-                LogicalType::Boolean,
-            ))
+            Expression::Constant(
+                ConstantExpression::new(Value::Boolean(value), LogicalType::Boolean).into(),
+            )
         };
-        let estimated_zero =
-            Expression::Conjunction(paro_planner::expression::ConjunctionExpression::new(
+        let estimated_zero = Expression::Conjunction(
+            paro_planner::expression::ConjunctionExpression::new(
                 ConjunctionType::And,
                 vec![
-                    Expression::Operator(OperatorExpression::new_unary(
-                        OperatorType::Not,
-                        Expression::Operator(OperatorExpression::new(
-                            OperatorType::Like,
-                            vec![
-                                Expression::ColumnRef(ColumnRefExpression::new(
-                                    ColumnBinding::new(1, 0),
-                                    LogicalType::Varchar,
-                                )),
-                                Expression::Constant(ConstantExpression::new(
-                                    Value::Varchar("%".to_string()),
-                                    LogicalType::Varchar,
-                                )),
-                            ],
+                    Expression::Operator(
+                        OperatorExpression::new_unary(
+                            OperatorType::Not,
+                            Expression::Operator(
+                                OperatorExpression::new(
+                                    OperatorType::Like,
+                                    vec![
+                                        Expression::ColumnRef(
+                                            ColumnRefExpression::new(
+                                                ColumnBinding::new(1, 0),
+                                                LogicalType::Varchar,
+                                            )
+                                            .into(),
+                                        ),
+                                        Expression::Constant(
+                                            ConstantExpression::new(
+                                                Value::Varchar("%".to_string()),
+                                                LogicalType::Varchar,
+                                            )
+                                            .into(),
+                                        ),
+                                    ],
+                                    LogicalType::Boolean,
+                                )
+                                .into(),
+                            ),
                             LogicalType::Boolean,
-                        )),
-                        LogicalType::Boolean,
-                    )),
+                        )
+                        .into(),
+                    ),
                     constant(true),
                 ],
-            ));
-        let proven_zero =
-            Expression::Conjunction(paro_planner::expression::ConjunctionExpression::new(
+            )
+            .into(),
+        );
+        let proven_zero = Expression::Conjunction(
+            paro_planner::expression::ConjunctionExpression::new(
                 ConjunctionType::And,
                 vec![estimated_zero.clone(), constant(false)],
-            ));
+            )
+            .into(),
+        );
 
         assert_eq!(
             model.estimate_selectivity(&estimated_zero, &HashMap::new()),
@@ -1561,17 +1605,25 @@ mod tests {
         stats.update_distinct_statistics(&hashes, hashes.len());
         let distinct = stats.distinct_evidence().point;
         let column_stats = HashMap::from([(binding, Arc::new(stats))]);
-        let expression = Expression::Operator(OperatorExpression::new(
-            OperatorType::Like,
-            vec![
-                Expression::ColumnRef(ColumnRefExpression::new(binding, LogicalType::Varchar)),
-                Expression::Constant(ConstantExpression::new(
-                    Value::Varchar("green".to_string()),
-                    LogicalType::Varchar,
-                )),
-            ],
-            LogicalType::Boolean,
-        ));
+        let expression = Expression::Operator(
+            OperatorExpression::new(
+                OperatorType::Like,
+                vec![
+                    Expression::ColumnRef(
+                        ColumnRefExpression::new(binding, LogicalType::Varchar).into(),
+                    ),
+                    Expression::Constant(
+                        ConstantExpression::new(
+                            Value::Varchar("green".to_string()),
+                            LogicalType::Varchar,
+                        )
+                        .into(),
+                    ),
+                ],
+                LogicalType::Boolean,
+            )
+            .into(),
+        );
 
         assert_eq!(
             model.estimate_selectivity(&expression, &column_stats),

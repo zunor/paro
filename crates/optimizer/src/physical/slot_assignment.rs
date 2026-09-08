@@ -304,10 +304,13 @@ impl LogicalOperatorVisitor for SlotAssigner {
             }
 
             // Replace with ReferenceExpression
-            return Some(Expression::Reference(ReferenceExpression {
-                index,
-                return_type: expr.return_type.clone(),
-            }));
+            return Some(Expression::Reference(
+                ReferenceExpression {
+                    index,
+                    return_type: expr.return_type.clone(),
+                }
+                .into(),
+            ));
         }
 
         if self.error.is_none() {

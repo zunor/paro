@@ -79,25 +79,29 @@ fn add_one_expr() -> Expression {
         LogicalType::Integer,
         add_one_function,
     );
-    Expression::Function(Box::new(FunctionExpression::new(
-        function,
-        vec![Expression::Reference(ReferenceExpression::new(
-            0,
+    Expression::Function(
+        FunctionExpression::new(
+            function,
+            vec![Expression::Reference(
+                ReferenceExpression::new(0, LogicalType::Integer).into(),
+            )],
             LogicalType::Integer,
-        ))],
-        LogicalType::Integer,
-    )))
+        )
+        .into(),
+    )
 }
 
 fn greater_than_expr(value: i32) -> Expression {
-    Expression::Comparison(ComparisonExpression::new(
-        ComparisonType::GreaterThan,
-        Expression::Reference(ReferenceExpression::new(0, LogicalType::Integer)),
-        Expression::Constant(ConstantExpression::new(
-            Value::Integer(value),
-            LogicalType::Integer,
-        )),
-    ))
+    Expression::Comparison(
+        ComparisonExpression::new(
+            ComparisonType::GreaterThan,
+            Expression::Reference(ReferenceExpression::new(0, LogicalType::Integer).into()),
+            Expression::Constant(
+                ConstantExpression::new(Value::Integer(value), LogicalType::Integer).into(),
+            ),
+        )
+        .into(),
+    )
 }
 
 #[divan::bench(sample_count = 10)]

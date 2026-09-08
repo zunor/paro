@@ -456,15 +456,13 @@ mod tests {
     use crate::physical::specs::{AggregateSpec, GroupKeyEncoding};
 
     fn reference(index: usize, ty: LogicalType) -> Expression {
-        Expression::Reference(ReferenceExpression::new(index, ty))
+        Expression::Reference(ReferenceExpression::new(index, ty).into())
     }
 
     fn count_star_expression() -> Expression {
-        Expression::Aggregate(Box::new(AggregateExpression::new(
-            get_count_star_function(),
-            vec![],
-            LogicalType::BigInt,
-        )))
+        Expression::Aggregate(
+            AggregateExpression::new(get_count_star_function(), vec![], LogicalType::BigInt).into(),
+        )
     }
 
     fn grouped_count_spec() -> AggregateSpec {

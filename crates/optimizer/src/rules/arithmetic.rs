@@ -138,18 +138,24 @@ impl Rule for ArithmeticSimplificationRule {
         // Check for NULL in either operand
         if let Expression::Constant(c) = left {
             if c.value.is_null() && right.is_passive_value() {
-                return RuleResult::Changed(Box::new(Expression::Constant(ConstantExpression {
-                    value: Value::Null(return_type),
-                    return_type: func.return_type.clone(),
-                })));
+                return RuleResult::Changed(Box::new(Expression::Constant(
+                    ConstantExpression {
+                        value: Value::Null(return_type),
+                        return_type: func.return_type.clone(),
+                    }
+                    .into(),
+                )));
             }
         }
         if let Expression::Constant(c) = right {
             if c.value.is_null() && left.is_passive_value() {
-                return RuleResult::Changed(Box::new(Expression::Constant(ConstantExpression {
-                    value: Value::Null(return_type),
-                    return_type: func.return_type.clone(),
-                })));
+                return RuleResult::Changed(Box::new(Expression::Constant(
+                    ConstantExpression {
+                        value: Value::Null(return_type),
+                        return_type: func.return_type.clone(),
+                    }
+                    .into(),
+                )));
             }
         }
         match func.builtin_intrinsic() {
@@ -229,10 +235,13 @@ fn simplify_divide_expr(
             return RuleResult::Changed(Box::new(left.clone()));
         }
         if is_zero(&c.value) && left.is_passive_value() {
-            return RuleResult::Changed(Box::new(Expression::Constant(ConstantExpression {
-                value: Value::Null(return_type.clone()),
-                return_type: return_type.clone(),
-            })));
+            return RuleResult::Changed(Box::new(Expression::Constant(
+                ConstantExpression {
+                    value: Value::Null(return_type.clone()),
+                    return_type: return_type.clone(),
+                }
+                .into(),
+            )));
         }
     }
     RuleResult::NoChange
@@ -295,83 +304,100 @@ mod tests {
     }
 
     fn make_constant(value: i32) -> Expression {
-        Expression::Constant(ConstantExpression {
-            value: Value::Integer(value),
-            return_type: LogicalType::Integer,
-        })
+        Expression::Constant(
+            ConstantExpression {
+                value: Value::Integer(value),
+                return_type: LogicalType::Integer,
+            }
+            .into(),
+        )
     }
 
     fn nullable_integer_value() -> Expression {
-        Expression::ColumnRef(ColumnRefExpression::new(
-            ColumnBinding::new(0, 0),
-            LogicalType::Integer,
-        ))
+        Expression::ColumnRef(
+            ColumnRefExpression::new(ColumnBinding::new(0, 0), LogicalType::Integer).into(),
+        )
     }
 
     fn make_add(left: Expression, right: Expression) -> Expression {
-        Expression::Function(Box::new(FunctionExpression::new(
-            ScalarFunction::new(
-                "+".to_string(),
-                vec![LogicalType::Integer, LogicalType::Integer],
+        Expression::Function(
+            FunctionExpression::new(
+                ScalarFunction::new(
+                    "+".to_string(),
+                    vec![LogicalType::Integer, LogicalType::Integer],
+                    LogicalType::Integer,
+                    dummy_fn,
+                ),
+                vec![left, right],
                 LogicalType::Integer,
-                dummy_fn,
-            ),
-            vec![left, right],
-            LogicalType::Integer,
-        )))
+            )
+            .into(),
+        )
     }
 
     fn make_subtract(left: Expression, right: Expression) -> Expression {
-        Expression::Function(Box::new(FunctionExpression::new(
-            ScalarFunction::new(
-                "-".to_string(),
-                vec![LogicalType::Integer, LogicalType::Integer],
+        Expression::Function(
+            FunctionExpression::new(
+                ScalarFunction::new(
+                    "-".to_string(),
+                    vec![LogicalType::Integer, LogicalType::Integer],
+                    LogicalType::Integer,
+                    dummy_fn,
+                ),
+                vec![left, right],
                 LogicalType::Integer,
-                dummy_fn,
-            ),
-            vec![left, right],
-            LogicalType::Integer,
-        )))
+            )
+            .into(),
+        )
     }
 
     fn make_multiply(left: Expression, right: Expression) -> Expression {
-        Expression::Function(Box::new(FunctionExpression::new(
-            ScalarFunction::new(
-                "*".to_string(),
-                vec![LogicalType::Integer, LogicalType::Integer],
+        Expression::Function(
+            FunctionExpression::new(
+                ScalarFunction::new(
+                    "*".to_string(),
+                    vec![LogicalType::Integer, LogicalType::Integer],
+                    LogicalType::Integer,
+                    dummy_fn,
+                ),
+                vec![left, right],
                 LogicalType::Integer,
-                dummy_fn,
-            ),
-            vec![left, right],
-            LogicalType::Integer,
-        )))
+            )
+            .into(),
+        )
     }
 
     fn make_divide(left: Expression, right: Expression) -> Expression {
-        Expression::Function(Box::new(FunctionExpression::new(
-            ScalarFunction::new(
-                "/".to_string(),
-                vec![LogicalType::Integer, LogicalType::Integer],
+        Expression::Function(
+            FunctionExpression::new(
+                ScalarFunction::new(
+                    "/".to_string(),
+                    vec![LogicalType::Integer, LogicalType::Integer],
+                    LogicalType::Integer,
+                    dummy_fn,
+                ),
+                vec![left, right],
                 LogicalType::Integer,
-                dummy_fn,
-            ),
-            vec![left, right],
-            LogicalType::Integer,
-        )))
+            )
+            .into(),
+        )
     }
 
     fn volatile_value() -> Expression {
-        Expression::Function(Box::new(FunctionExpression::new(
-            ScalarFunction::new(
-                "volatile_value".to_string(),
+        Expression::Function(
+            FunctionExpression::new(
+                ScalarFunction::new(
+                    "volatile_value".to_string(),
+                    vec![],
+                    LogicalType::Integer,
+                    dummy_fn,
+                )
+                .with_stability(FunctionStability::Volatile),
                 vec![],
                 LogicalType::Integer,
-                dummy_fn,
             )
-            .with_stability(FunctionStability::Volatile),
-            vec![],
-            LogicalType::Integer,
-        )))
+            .into(),
+        )
     }
 
     #[test]
@@ -517,25 +543,31 @@ mod tests {
     #[test]
     fn test_matcher_rejects_floating_point_identities() {
         let matcher = ArithmeticSimplificationMatcher;
-        let expression = Expression::Function(Box::new(FunctionExpression::new(
-            ScalarFunction::new(
-                "*".to_string(),
-                vec![LogicalType::Double, LogicalType::Double],
-                LogicalType::Double,
-                dummy_fn,
-            ),
-            vec![
-                Expression::ColumnRef(ColumnRefExpression::new(
-                    ColumnBinding::new(0, 0),
+        let expression = Expression::Function(
+            FunctionExpression::new(
+                ScalarFunction::new(
+                    "*".to_string(),
+                    vec![LogicalType::Double, LogicalType::Double],
                     LogicalType::Double,
-                )),
-                Expression::Constant(ConstantExpression {
-                    value: Value::Double(0.0),
-                    return_type: LogicalType::Double,
-                }),
-            ],
-            LogicalType::Double,
-        )));
+                    dummy_fn,
+                ),
+                vec![
+                    Expression::ColumnRef(
+                        ColumnRefExpression::new(ColumnBinding::new(0, 0), LogicalType::Double)
+                            .into(),
+                    ),
+                    Expression::Constant(
+                        ConstantExpression {
+                            value: Value::Double(0.0),
+                            return_type: LogicalType::Double,
+                        }
+                        .into(),
+                    ),
+                ],
+                LogicalType::Double,
+            )
+            .into(),
+        );
         let mut bindings = Vec::new();
 
         assert!(!matcher.matches(&expression, &mut bindings));
@@ -616,10 +648,13 @@ mod tests {
         let rule = ArithmeticSimplificationRule::new();
 
         // 5 + NULL → NULL
-        let null_const = Expression::Constant(ConstantExpression {
-            value: Value::Null(LogicalType::Integer),
-            return_type: LogicalType::Integer,
-        });
+        let null_const = Expression::Constant(
+            ConstantExpression {
+                value: Value::Null(LogicalType::Integer),
+                return_type: LogicalType::Integer,
+            }
+            .into(),
+        );
         let expr = make_add(make_constant(5), null_const);
         let mut bindings = Vec::new();
         assert!(rule.matcher().matches(&expr, &mut bindings));
@@ -641,10 +676,13 @@ mod tests {
     #[test]
     fn test_null_arithmetic_preserves_volatile_evaluation() {
         let rule = ArithmeticSimplificationRule::new();
-        let null = Expression::Constant(ConstantExpression {
-            value: Value::Null(LogicalType::Integer),
-            return_type: LogicalType::Integer,
-        });
+        let null = Expression::Constant(
+            ConstantExpression {
+                value: Value::Null(LogicalType::Integer),
+                return_type: LogicalType::Integer,
+            }
+            .into(),
+        );
         let expr = make_add(volatile_value(), null);
         let mut bindings = Vec::new();
         assert!(rule.matcher().matches(&expr, &mut bindings));

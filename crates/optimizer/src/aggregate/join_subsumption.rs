@@ -484,14 +484,17 @@ impl AggregateJoinSubsumption {
         {
             return None;
         }
-        Some(Expression::Aggregate(Box::new(AggregateExpression::new(
-            function,
-            vec![Expression::ColumnRef(ColumnRefExpression::new(
-                exposure.output_binding,
-                exposure.output_type.clone(),
-            ))],
-            outer_sum.return_type.clone(),
-        ))))
+        Some(Expression::Aggregate(
+            AggregateExpression::new(
+                function,
+                vec![Expression::ColumnRef(
+                    ColumnRefExpression::new(exposure.output_binding, exposure.output_type.clone())
+                        .into(),
+                )],
+                outer_sum.return_type.clone(),
+            )
+            .into(),
+        ))
     }
 
     fn inspect_reduction<'a>(
@@ -635,12 +638,9 @@ impl AggregateJoinSubsumption {
         else {
             return;
         };
-        projection
-            .expressions
-            .push(Expression::ColumnRef(ColumnRefExpression::new(
-                aggregate_binding,
-                aggregate_type.clone(),
-            )));
+        projection.expressions.push(Expression::ColumnRef(
+            ColumnRefExpression::new(aggregate_binding, aggregate_type.clone()).into(),
+        ));
         projection
             .visible_names
             .push("partial_aggregate".to_string());
@@ -782,10 +782,7 @@ mod tests {
     }
 
     fn column(table: usize, index: usize, ty: LogicalType) -> Expression {
-        Expression::ColumnRef(ColumnRefExpression::new(
-            ColumnBinding::new(table, index),
-            ty,
-        ))
+        Expression::ColumnRef(ColumnRefExpression::new(ColumnBinding::new(table, index), ty).into())
     }
 
     fn sum(input: Expression) -> Expression {
@@ -795,11 +792,7 @@ mod tests {
             .unwrap();
         assert_eq!(targets, [input_type]);
         let return_type = function.return_type.clone();
-        Expression::Aggregate(Box::new(AggregateExpression::new(
-            function,
-            vec![input],
-            return_type,
-        )))
+        Expression::Aggregate(AggregateExpression::new(function, vec![input], return_type).into())
     }
 
     fn detail_table(object_id: u64) -> Arc<TableCatalogEntry> {

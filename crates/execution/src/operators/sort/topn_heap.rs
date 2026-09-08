@@ -1157,7 +1157,9 @@ mod tests {
             MemoryAccountingClass::Revocable,
         );
         let orders = [OrderByNode {
-            expression: Expression::Reference(ReferenceExpression::new(0, LogicalType::Integer)),
+            expression: Expression::Reference(
+                ReferenceExpression::new(0, LogicalType::Integer).into(),
+            ),
             ascending: true,
             nulls_first: false,
         }];

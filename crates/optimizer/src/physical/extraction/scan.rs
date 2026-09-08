@@ -164,10 +164,13 @@ impl PhysicalPlanExtractor {
         let expressions = if filter.expressions.len() <= 1 {
             filter.expressions.clone()
         } else {
-            vec![Expression::Conjunction(ConjunctionExpression {
-                conjunction_type: ConjunctionType::And,
-                children: filter.expressions.clone(),
-            })]
+            vec![Expression::Conjunction(
+                ConjunctionExpression {
+                    conjunction_type: ConjunctionType::And,
+                    children: filter.expressions.clone(),
+                }
+                .into(),
+            )]
         };
         let spec = FilterSpec {
             expressions: expressions.into_boxed_slice(),
@@ -237,7 +240,7 @@ impl PhysicalPlanExtractor {
                     .returned_types
                     .get(index)
                     .cloned()
-                    .map(|ty| Expression::Reference(ReferenceExpression::new(index, ty)))
+                    .map(|ty| Expression::Reference(ReferenceExpression::new(index, ty).into()))
                     .ok_or_else(|| {
                         paro_error::internal(format!(
                             "aggregate HAVING projection index {index} is out of bounds for {aggregate_width} columns"
@@ -660,10 +663,9 @@ fn rebase_search_projection(
     score_index: usize,
 ) -> Result<()> {
     if expression.equals(score_expression) {
-        *expression = Expression::Reference(ReferenceExpression::new(
-            score_index,
-            score_expression.return_type(),
-        ));
+        *expression = Expression::Reference(
+            ReferenceExpression::new(score_index, score_expression.return_type()).into(),
+        );
         return Ok(());
     }
     if let Some(source_index) = search_projection_source_index(expression, get)? {
@@ -673,8 +675,9 @@ fn rebase_search_projection(
             .ok_or_else(|| {
                 paro_error::internal("search projection source was not collected before rebasing")
             })?;
-        *expression =
-            Expression::Reference(ReferenceExpression::new(rebased, expression.return_type()));
+        *expression = Expression::Reference(
+            ReferenceExpression::new(rebased, expression.return_type()).into(),
+        );
         return Ok(());
     }
 
@@ -838,10 +841,13 @@ fn normalize_filter_expressions(expressions: Vec<Expression>) -> Vec<Expression>
     if expressions.len() <= 1 {
         expressions
     } else {
-        vec![Expression::Conjunction(ConjunctionExpression {
-            conjunction_type: ConjunctionType::And,
-            children: expressions,
-        })]
+        vec![Expression::Conjunction(
+            ConjunctionExpression {
+                conjunction_type: ConjunctionType::And,
+                children: expressions,
+            }
+            .into(),
+        )]
     }
 }
 

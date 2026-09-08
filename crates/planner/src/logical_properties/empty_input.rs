@@ -78,10 +78,9 @@ impl EmptyInputBehavior {
                             }
                             AggregateEmptyInput::Unknown => return None,
                         };
-                        Some(Expression::Constant(ConstantExpression::new(
-                            value,
-                            return_type,
-                        )))
+                        Some(Expression::Constant(
+                            ConstantExpression::new(value, return_type).into(),
+                        ))
                     })
                     .collect::<Option<Vec<_>>>();
                 outputs.map_or(Self::Indeterminate, |outputs| Self::AtMostOneRow {
@@ -135,10 +134,10 @@ impl EmptyInputBehavior {
         return_type: &LogicalType,
     ) -> Result<Option<Expression>> {
         let typed_null = || {
-            Expression::Constant(ConstantExpression::new(
-                Value::Null(return_type.clone()),
-                return_type.clone(),
-            ))
+            Expression::Constant(
+                ConstantExpression::new(Value::Null(return_type.clone()), return_type.clone())
+                    .into(),
+            )
         };
         match self {
             Self::NotApplicable => Ok(None),
@@ -166,12 +165,10 @@ impl EmptyInputBehavior {
                     ));
                 }
                 Ok(Some(match predicate {
-                    Some(predicate) => Expression::Case(CaseExpression::new(
-                        predicate,
-                        output,
-                        typed_null(),
-                        return_type.clone(),
-                    )),
+                    Some(predicate) => Expression::Case(
+                        CaseExpression::new(predicate, output, typed_null(), return_type.clone())
+                            .into(),
+                    ),
                     None => output,
                 }))
             }
@@ -297,10 +294,9 @@ impl EmptyInputBehavior {
         let predicate = if rewritten_filters.len() == 1 {
             rewritten_filters.pop()
         } else {
-            Some(Expression::Conjunction(ConjunctionExpression::new(
-                ConjunctionType::And,
-                rewritten_filters,
-            )))
+            Some(Expression::Conjunction(
+                ConjunctionExpression::new(ConjunctionType::And, rewritten_filters).into(),
+            ))
         };
         Self::AtMostOneRow { outputs, predicate }
     }

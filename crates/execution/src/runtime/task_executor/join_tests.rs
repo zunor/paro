@@ -135,10 +135,9 @@ fn run_null_aware_anti_join(
 #[test]
 fn null_aware_anti_join_preserves_not_in_three_valued_logic() {
     let null_int = || {
-        Expression::Constant(ConstantExpression::new(
-            Value::Null(LogicalType::Integer),
-            LogicalType::Integer,
-        ))
+        Expression::Constant(
+            ConstantExpression::new(Value::Null(LogicalType::Integer), LogicalType::Integer).into(),
+        )
     };
     let probe_rows = || {
         vec![
@@ -566,11 +565,14 @@ fn hash_join_output_more_drains_cross_product_before_reusing_input() {
     let nation_rows = (0..25)
         .map(|nation| vec![int_constant(nation)])
         .collect::<Vec<_>>();
-    let predicate = Expression::Comparison(ComparisonExpression::new(
-        ComparisonType::Equal,
-        reference(0, LogicalType::Integer),
-        reference(2, LogicalType::Integer),
-    ));
+    let predicate = Expression::Comparison(
+        ComparisonExpression::new(
+            ComparisonType::Equal,
+            reference(0, LogicalType::Integer),
+            reference(2, LogicalType::Integer),
+        )
+        .into(),
+    );
 
     let graph = PipelineGraph {
         pipelines: vec![

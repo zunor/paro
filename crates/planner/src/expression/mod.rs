@@ -22,6 +22,7 @@ mod iterator;
 mod operator_expression;
 mod parameter_expression;
 mod reference_expression;
+mod shared_payload;
 mod subquery_expression;
 mod window_expression;
 
@@ -39,6 +40,7 @@ pub use iterator::{ExpressionIterator, ExpressionVisitDecision};
 pub use operator_expression::{OperatorExpression, OperatorType};
 pub use parameter_expression::ParameterExpression;
 pub use reference_expression::ReferenceExpression;
+pub use shared_payload::{ExpressionPayload, SharedExpressionPayload};
 pub use subquery_expression::{SubqueryExpression, SubqueryPlanningState, SubqueryType};
 pub use window_expression::{
     OrderByExpression, WindowExpression, WindowFrame, WindowFrameBound, WindowFrameType,

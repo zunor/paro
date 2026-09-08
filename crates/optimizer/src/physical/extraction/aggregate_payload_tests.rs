@@ -20,22 +20,22 @@ fn passive_conditional_decimal_sum_becomes_a_filtered_input() {
         .bind(std::slice::from_ref(&input_type))
         .expect("bind decimal sum");
     let result_type = function.return_type.clone();
-    let check = Expression::Reference(ReferenceExpression::new(0, LogicalType::Boolean));
-    let value = Expression::Reference(ReferenceExpression::new(1, input_type.clone()));
-    let conditional = Expression::Case(CaseExpression::new(
-        check,
-        value,
-        Expression::Constant(ConstantExpression::new(
-            Value::Null(input_type.clone()),
-            input_type.clone(),
-        )),
-        input_type,
-    ));
-    let aggregate = Expression::Aggregate(Box::new(AggregateExpression::new(
-        function,
-        vec![conditional],
-        result_type,
-    )));
+    let check = Expression::Reference(ReferenceExpression::new(0, LogicalType::Boolean).into());
+    let value = Expression::Reference(ReferenceExpression::new(1, input_type.clone()).into());
+    let conditional = Expression::Case(
+        CaseExpression::new(
+            check,
+            value,
+            Expression::Constant(
+                ConstantExpression::new(Value::Null(input_type.clone()), input_type.clone()).into(),
+            ),
+            input_type,
+        )
+        .into(),
+    );
+    let aggregate = Expression::Aggregate(
+        AggregateExpression::new(function, vec![conditional], result_type).into(),
+    );
 
     let payload = plan_aggregate_payload(vec![], vec![aggregate]).expect("plan payload");
 
@@ -63,20 +63,20 @@ fn non_null_conditional_else_preserves_case_semantics() {
         .bind(std::slice::from_ref(&input_type))
         .expect("bind decimal sum");
     let result_type = function.return_type.clone();
-    let conditional = Expression::Case(CaseExpression::new(
-        Expression::Reference(ReferenceExpression::new(0, LogicalType::Boolean)),
-        Expression::Reference(ReferenceExpression::new(1, input_type.clone())),
-        Expression::Constant(ConstantExpression::new(
-            Value::Decimal(0, 15, 2),
-            input_type.clone(),
-        )),
-        input_type,
-    ));
-    let aggregate = Expression::Aggregate(Box::new(AggregateExpression::new(
-        function,
-        vec![conditional],
-        result_type,
-    )));
+    let conditional = Expression::Case(
+        CaseExpression::new(
+            Expression::Reference(ReferenceExpression::new(0, LogicalType::Boolean).into()),
+            Expression::Reference(ReferenceExpression::new(1, input_type.clone()).into()),
+            Expression::Constant(
+                ConstantExpression::new(Value::Decimal(0, 15, 2), input_type.clone()).into(),
+            ),
+            input_type,
+        )
+        .into(),
+    );
+    let aggregate = Expression::Aggregate(
+        AggregateExpression::new(function, vec![conditional], result_type).into(),
+    );
 
     let payload = plan_aggregate_payload(vec![], vec![aggregate]).expect("plan payload");
 

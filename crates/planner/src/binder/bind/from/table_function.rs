@@ -331,7 +331,7 @@ fn bind_external_table_routine_ref(
     );
 
     let routine_meta = routine_meta_from_overload(&overload);
-    let call_expression = Expression::Function(Box::new(
+    let call_expression = Expression::Function(
         FunctionExpression::new(
             external_table_placeholder(function_name, &target_types, &column_types),
             final_arguments.clone(),
@@ -340,8 +340,9 @@ fn bind_external_table_routine_ref(
                 .cloned()
                 .unwrap_or(paro_common::types::LogicalType::Unknown),
         )
-        .with_routine_meta(routine_meta.clone()),
-    ));
+        .with_routine_meta(routine_meta.clone())
+        .into(),
+    );
 
     Ok(BoundFromItem::ExternalRoutine(BoundExternalRoutine {
         alias: table_alias,

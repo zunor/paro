@@ -63,7 +63,7 @@ struct LayerMapping {
 
 impl LayerMapping {
     fn replacement(&self) -> Expression {
-        Expression::ColumnRef(self.binding.clone())
+        Expression::ColumnRef(self.binding.clone().into())
     }
 }
 
@@ -241,13 +241,13 @@ impl<'a> ExternalRoutineLowerer<'a> {
         let mut expressions = window
             .expressions
             .into_iter()
-            .map(|expression| Expression::Window(Box::new(expression)))
+            .map(|expression| Expression::Window(expression.into()))
             .collect::<Vec<_>>();
         let child = self.lower_external_in_expression_vec(*window.child, &mut expressions)?;
         window.expressions = expressions
             .into_iter()
             .map(|expr| match expr {
-                Expression::Window(window_expr) => *window_expr,
+                Expression::Window(window_expr) => window_expr.into_inner(),
                 other => unreachable!("window lowering produced non-window expression: {other:?}"),
             })
             .collect();
@@ -693,7 +693,7 @@ impl<'a> ExternalRoutineLowerer<'a> {
                     .expressions
                     .iter()
                     .cloned()
-                    .map(|expression| Expression::Window(Box::new(expression)))
+                    .map(|expression| Expression::Window(expression.into()))
                     .collect::<Vec<_>>();
                 self.ensure_expressions_are_native("WINDOW", expressions.iter())
             }
@@ -875,17 +875,19 @@ mod tests {
     }
 
     fn int_column(table_index: usize, column_index: usize) -> Expression {
-        Expression::ColumnRef(ColumnRefExpression::new(
-            paro_planner::operator::ColumnBinding::new(table_index, column_index),
-            LogicalType::Integer,
-        ))
+        Expression::ColumnRef(
+            ColumnRefExpression::new(
+                paro_planner::operator::ColumnBinding::new(table_index, column_index),
+                LogicalType::Integer,
+            )
+            .into(),
+        )
     }
 
     fn bool_constant(value: bool) -> Expression {
-        Expression::Constant(ConstantExpression::new(
-            Value::Boolean(value),
-            LogicalType::Boolean,
-        ))
+        Expression::Constant(
+            ConstantExpression::new(Value::Boolean(value), LogicalType::Boolean).into(),
+        )
     }
 
     fn native_binary(
@@ -900,11 +902,14 @@ mod tests {
             return_type.clone(),
             noop_scalar_execute,
         );
-        Expression::Function(Box::new(paro_planner::expression::FunctionExpression::new(
-            function,
-            vec![left, right],
-            return_type,
-        )))
+        Expression::Function(
+            paro_planner::expression::FunctionExpression::new(
+                function,
+                vec![left, right],
+                return_type,
+            )
+            .into(),
+        )
     }
 
     fn external_call(
@@ -939,10 +944,11 @@ mod tests {
             spec: None,
         };
 
-        Expression::Function(Box::new(
+        Expression::Function(
             paro_planner::expression::FunctionExpression::new(function, arguments, return_type)
-                .with_routine_meta(meta),
-        ))
+                .with_routine_meta(meta)
+                .into(),
+        )
     }
 
     fn volatile_external_call(
@@ -971,10 +977,9 @@ mod tests {
             bind_context,
             LogicalOperator::ExpressionGet(ExpressionGet::new(
                 table_index,
-                vec![vec![Expression::Constant(ConstantExpression::new(
-                    Value::Integer(1),
-                    LogicalType::Integer,
-                ))]],
+                vec![vec![Expression::Constant(
+                    ConstantExpression::new(Value::Integer(1), LogicalType::Integer).into(),
+                )]],
                 vec!["v".to_string()],
                 vec![LogicalType::Integer],
             )),
@@ -1050,19 +1055,24 @@ mod tests {
     fn partitions_filter_predicates_around_external_project() {
         let bind_context = BindContext::new();
         let child = expression_get(&bind_context, 1);
-        let native_predicate = Expression::Comparison(ComparisonExpression::new(
-            ComparisonType::GreaterThan,
-            int_column(1, 0),
-            Expression::Constant(ConstantExpression::new(
-                Value::Integer(0),
-                LogicalType::Integer,
-            )),
-        ));
-        let external_predicate = Expression::Comparison(ComparisonExpression::new(
-            ComparisonType::Equal,
-            external_call("py_check", vec![int_column(1, 0)], LogicalType::Boolean),
-            bool_constant(true),
-        ));
+        let native_predicate = Expression::Comparison(
+            ComparisonExpression::new(
+                ComparisonType::GreaterThan,
+                int_column(1, 0),
+                Expression::Constant(
+                    ConstantExpression::new(Value::Integer(0), LogicalType::Integer).into(),
+                ),
+            )
+            .into(),
+        );
+        let external_predicate = Expression::Comparison(
+            ComparisonExpression::new(
+                ComparisonType::Equal,
+                external_call("py_check", vec![int_column(1, 0)], LogicalType::Boolean),
+                bool_constant(true),
+            )
+            .into(),
+        );
         let filter = Filter::new(child, vec![native_predicate, external_predicate]);
         let plan = OwnedLogicalPlan::new(&bind_context, LogicalOperator::Filter(filter));
 

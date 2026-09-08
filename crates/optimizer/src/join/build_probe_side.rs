@@ -423,10 +423,13 @@ mod tests {
                     .iter()
                     .enumerate()
                     .map(|(idx, ty)| {
-                        Expression::ColumnRef(ColumnRefExpression::new(
-                            ColumnBinding::new(table_index, idx),
-                            ty.clone(),
-                        ))
+                        Expression::ColumnRef(
+                            ColumnRefExpression::new(
+                                ColumnBinding::new(table_index, idx),
+                                ty.clone(),
+                            )
+                            .into(),
+                        )
                     })
                     .collect::<Vec<_>>()
             })
@@ -476,14 +479,12 @@ mod tests {
             plan_with_cardinality(&ctx, left, 1),
             plan_with_cardinality(&ctx, right, 64),
             vec![JoinCondition::new(
-                Expression::ColumnRef(ColumnRefExpression::new(
-                    ColumnBinding::new(0, 0),
-                    LogicalType::Integer,
-                )),
-                Expression::ColumnRef(ColumnRefExpression::new(
-                    ColumnBinding::new(1, 0),
-                    LogicalType::Varchar,
-                )),
+                Expression::ColumnRef(
+                    ColumnRefExpression::new(ColumnBinding::new(0, 0), LogicalType::Integer).into(),
+                ),
+                Expression::ColumnRef(
+                    ColumnRefExpression::new(ColumnBinding::new(1, 0), LogicalType::Varchar).into(),
+                ),
                 JoinComparisonType::Equal,
             )],
         );
@@ -522,14 +523,12 @@ mod tests {
             plan_with_cardinality(&ctx, expression_get(0, 1, vec![LogicalType::Integer]), 1),
             plan_with_cardinality(&ctx, expression_get(1, 64, vec![LogicalType::Integer]), 64),
             vec![JoinCondition::new(
-                Expression::ColumnRef(ColumnRefExpression::new(
-                    ColumnBinding::new(0, 0),
-                    LogicalType::Integer,
-                )),
-                Expression::ColumnRef(ColumnRefExpression::new(
-                    ColumnBinding::new(1, 0),
-                    LogicalType::Integer,
-                )),
+                Expression::ColumnRef(
+                    ColumnRefExpression::new(ColumnBinding::new(0, 0), LogicalType::Integer).into(),
+                ),
+                Expression::ColumnRef(
+                    ColumnRefExpression::new(ColumnBinding::new(1, 0), LogicalType::Integer).into(),
+                ),
                 JoinComparisonType::Equal,
             )],
         );
@@ -582,14 +581,12 @@ mod tests {
             plan_with_cardinality(&ctx, filtered_fact, 320_000),
             plan_with_cardinality(&ctx, dimension, 1_500_000),
             vec![JoinCondition::new(
-                Expression::ColumnRef(ColumnRefExpression::new(
-                    ColumnBinding::new(0, 0),
-                    LogicalType::BigInt,
-                )),
-                Expression::ColumnRef(ColumnRefExpression::new(
-                    ColumnBinding::new(1, 0),
-                    LogicalType::BigInt,
-                )),
+                Expression::ColumnRef(
+                    ColumnRefExpression::new(ColumnBinding::new(0, 0), LogicalType::BigInt).into(),
+                ),
+                Expression::ColumnRef(
+                    ColumnRefExpression::new(ColumnBinding::new(1, 0), LogicalType::BigInt).into(),
+                ),
                 JoinComparisonType::Equal,
             )],
         );
@@ -620,14 +617,12 @@ mod tests {
             plan_with_cardinality(&ctx, preserved, 1),
             plan_with_cardinality(&ctx, filtering, 64),
             vec![JoinCondition::new(
-                Expression::ColumnRef(ColumnRefExpression::new(
-                    ColumnBinding::new(0, 0),
-                    LogicalType::Integer,
-                )),
-                Expression::ColumnRef(ColumnRefExpression::new(
-                    ColumnBinding::new(1, 0),
-                    LogicalType::Integer,
-                )),
+                Expression::ColumnRef(
+                    ColumnRefExpression::new(ColumnBinding::new(0, 0), LogicalType::Integer).into(),
+                ),
+                Expression::ColumnRef(
+                    ColumnRefExpression::new(ColumnBinding::new(1, 0), LogicalType::Integer).into(),
+                ),
                 JoinComparisonType::Equal,
             )],
         );
@@ -654,33 +649,29 @@ mod tests {
             plan_with_cardinality(&ctx, dependent_left, 64),
             plan_with_cardinality(&ctx, dependent_right, 1),
             vec![JoinCondition::new(
-                Expression::ColumnRef(ColumnRefExpression::new(
-                    ColumnBinding::new(1, 0),
-                    LogicalType::Integer,
-                )),
-                Expression::ColumnRef(ColumnRefExpression::new(
-                    ColumnBinding::new(2, 0),
-                    LogicalType::Integer,
-                )),
+                Expression::ColumnRef(
+                    ColumnRefExpression::new(ColumnBinding::new(1, 0), LogicalType::Integer).into(),
+                ),
+                Expression::ColumnRef(
+                    ColumnRefExpression::new(ColumnBinding::new(2, 0), LogicalType::Integer).into(),
+                ),
                 JoinComparisonType::Equal,
             )],
         );
         dependent.duplicate_eliminated_columns = vec![Expression::ColumnRef(
-            ColumnRefExpression::new(ColumnBinding::new(1, 0), LogicalType::Integer),
+            ColumnRefExpression::new(ColumnBinding::new(1, 0), LogicalType::Integer).into(),
         )];
         let join = ComparisonJoin::new(
             JoinType::Semi,
             plan_with_cardinality(&ctx, preserved, 1),
             plan_with_cardinality(&ctx, LogicalOperator::Join(Join::Comparison(dependent)), 64),
             vec![JoinCondition::new(
-                Expression::ColumnRef(ColumnRefExpression::new(
-                    ColumnBinding::new(0, 0),
-                    LogicalType::Integer,
-                )),
-                Expression::ColumnRef(ColumnRefExpression::new(
-                    ColumnBinding::new(1, 0),
-                    LogicalType::Integer,
-                )),
+                Expression::ColumnRef(
+                    ColumnRefExpression::new(ColumnBinding::new(0, 0), LogicalType::Integer).into(),
+                ),
+                Expression::ColumnRef(
+                    ColumnRefExpression::new(ColumnBinding::new(1, 0), LogicalType::Integer).into(),
+                ),
                 JoinComparisonType::Equal,
             )],
         );
@@ -705,19 +696,17 @@ mod tests {
             plan_with_cardinality(&ctx, dependent_left, 64),
             plan_with_cardinality(&ctx, dependent_right, 1),
             vec![JoinCondition::new(
-                Expression::ColumnRef(ColumnRefExpression::new(
-                    ColumnBinding::new(0, 0),
-                    LogicalType::Integer,
-                )),
-                Expression::ColumnRef(ColumnRefExpression::new(
-                    ColumnBinding::new(1, 0),
-                    LogicalType::Integer,
-                )),
+                Expression::ColumnRef(
+                    ColumnRefExpression::new(ColumnBinding::new(0, 0), LogicalType::Integer).into(),
+                ),
+                Expression::ColumnRef(
+                    ColumnRefExpression::new(ColumnBinding::new(1, 0), LogicalType::Integer).into(),
+                ),
                 JoinComparisonType::Equal,
             )],
         );
         dependent.duplicate_eliminated_columns = vec![Expression::ColumnRef(
-            ColumnRefExpression::new(ColumnBinding::new(0, 0), LogicalType::Integer),
+            ColumnRefExpression::new(ColumnBinding::new(0, 0), LogicalType::Integer).into(),
         )];
         let preserved = expression_get(2, 1, vec![LogicalType::Integer]);
         let join = ComparisonJoin::new(
@@ -725,14 +714,12 @@ mod tests {
             plan_with_cardinality(&ctx, LogicalOperator::Join(Join::Comparison(dependent)), 64),
             plan_with_cardinality(&ctx, preserved, 1),
             vec![JoinCondition::new(
-                Expression::ColumnRef(ColumnRefExpression::new(
-                    ColumnBinding::new(0, 0),
-                    LogicalType::Integer,
-                )),
-                Expression::ColumnRef(ColumnRefExpression::new(
-                    ColumnBinding::new(2, 0),
-                    LogicalType::Integer,
-                )),
+                Expression::ColumnRef(
+                    ColumnRefExpression::new(ColumnBinding::new(0, 0), LogicalType::Integer).into(),
+                ),
+                Expression::ColumnRef(
+                    ColumnRefExpression::new(ColumnBinding::new(2, 0), LogicalType::Integer).into(),
+                ),
                 JoinComparisonType::Equal,
             )],
         );
@@ -758,14 +745,12 @@ mod tests {
             plan_with_cardinality(&ctx, left, 1),
             plan_with_cardinality(&ctx, right, 64),
             vec![JoinCondition::new(
-                Expression::ColumnRef(ColumnRefExpression::new(
-                    ColumnBinding::new(0, 0),
-                    LogicalType::Integer,
-                )),
-                Expression::ColumnRef(ColumnRefExpression::new(
-                    ColumnBinding::new(1, 0),
-                    LogicalType::Varchar,
-                )),
+                Expression::ColumnRef(
+                    ColumnRefExpression::new(ColumnBinding::new(0, 0), LogicalType::Integer).into(),
+                ),
+                Expression::ColumnRef(
+                    ColumnRefExpression::new(ColumnBinding::new(1, 0), LogicalType::Varchar).into(),
+                ),
                 JoinComparisonType::Equal,
             )],
         );
@@ -803,21 +788,18 @@ mod tests {
             plan_with_cardinality(&ctx, left, 1),
             plan_with_cardinality(&ctx, right, 64),
             vec![JoinCondition::new(
-                Expression::ColumnRef(ColumnRefExpression::new(
-                    ColumnBinding::new(0, 0),
-                    LogicalType::Integer,
-                )),
-                Expression::ColumnRef(ColumnRefExpression::new(
-                    ColumnBinding::new(1, 0),
-                    LogicalType::Varchar,
-                )),
+                Expression::ColumnRef(
+                    ColumnRefExpression::new(ColumnBinding::new(0, 0), LogicalType::Integer).into(),
+                ),
+                Expression::ColumnRef(
+                    ColumnRefExpression::new(ColumnBinding::new(1, 0), LogicalType::Varchar).into(),
+                ),
                 JoinComparisonType::Equal,
             )],
         );
-        join.duplicate_eliminated_columns = vec![Expression::ColumnRef(ColumnRefExpression::new(
-            ColumnBinding::new(0, 0),
-            LogicalType::Integer,
-        ))];
+        join.duplicate_eliminated_columns = vec![Expression::ColumnRef(
+            ColumnRefExpression::new(ColumnBinding::new(0, 0), LogicalType::Integer).into(),
+        )];
 
         let result = BuildProbeSideOptimizer::new(make_test_session())
             .optimize(LogicalOperator::Join(Join::Comparison(join)));
@@ -847,14 +829,12 @@ mod tests {
             plan_with_cardinality(&ctx, left, 8),
             plan_with_cardinality(&ctx, right, 1024),
             vec![JoinCondition::new(
-                Expression::ColumnRef(ColumnRefExpression::new(
-                    ColumnBinding::new(0, 0),
-                    LogicalType::Integer,
-                )),
-                Expression::ColumnRef(ColumnRefExpression::new(
-                    ColumnBinding::new(1, 0),
-                    LogicalType::Varchar,
-                )),
+                Expression::ColumnRef(
+                    ColumnRefExpression::new(ColumnBinding::new(0, 0), LogicalType::Integer).into(),
+                ),
+                Expression::ColumnRef(
+                    ColumnRefExpression::new(ColumnBinding::new(1, 0), LogicalType::Varchar).into(),
+                ),
                 JoinComparisonType::Equal,
             )],
         );

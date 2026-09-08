@@ -152,11 +152,14 @@ impl<'a> JoinPredicateNormalizer<'a> {
         let residuals = residuals
             .into_iter()
             .map(|condition| {
-                Expression::Comparison(ComparisonExpression::new(
-                    comparison_type(condition.comparison),
-                    condition.left,
-                    condition.right,
-                ))
+                Expression::Comparison(
+                    ComparisonExpression::new(
+                        comparison_type(condition.comparison),
+                        condition.left,
+                        condition.right,
+                    )
+                    .into(),
+                )
             })
             .collect();
         let join_plan = OwnedLogicalPlan {
@@ -191,8 +194,14 @@ fn cross_product_hash_condition(
     let right_input =
         expression_input(&comparison.right, left_width, left_bindings, right_bindings);
     let (left, right) = match (left_input, right_input) {
-        (JoinSide::Left, JoinSide::Right) => (*comparison.left, *comparison.right),
-        (JoinSide::Right, JoinSide::Left) => (*comparison.right, *comparison.left),
+        (JoinSide::Left, JoinSide::Right) => {
+            let comparison = comparison.into_inner();
+            (*comparison.left, *comparison.right)
+        }
+        (JoinSide::Right, JoinSide::Left) => {
+            let comparison = comparison.into_inner();
+            (*comparison.right, *comparison.left)
+        }
         _ => return HashCondition::Residual(Box::new(Expression::Comparison(comparison))),
     };
     HashCondition::Join(Box::new(JoinCondition::new(
@@ -282,14 +291,14 @@ mod tests {
     use paro_planner::plan::CardinalityEstimate;
 
     fn column(table: usize, column: usize) -> Expression {
-        Expression::ColumnRef(ColumnRefExpression::new(
-            ColumnBinding::new(table, column),
-            LogicalType::Integer,
-        ))
+        Expression::ColumnRef(
+            ColumnRefExpression::new(ColumnBinding::new(table, column), LogicalType::Integer)
+                .into(),
+        )
     }
 
     fn reference(index: usize) -> Expression {
-        Expression::Reference(ReferenceExpression::new(index, LogicalType::Integer))
+        Expression::Reference(ReferenceExpression::new(index, LogicalType::Integer).into())
     }
 
     fn input(context: &BindContext, table: usize) -> OwnedLogicalPlan {
@@ -369,11 +378,9 @@ mod tests {
                 build_side_constraint: Default::default(),
             })),
         );
-        let equality = Expression::Comparison(ComparisonExpression::new(
-            ComparisonType::Equal,
-            reference(1),
-            reference(2),
-        ));
+        let equality = Expression::Comparison(
+            ComparisonExpression::new(ComparisonType::Equal, reference(1), reference(2)).into(),
+        );
         let plan = OwnedLogicalPlan::new(
             &context,
             LogicalOperator::Filter(Filter::new(cross, vec![equality])),
@@ -403,11 +410,9 @@ mod tests {
                 build_side_constraint: Default::default(),
             })),
         );
-        let equality = Expression::Comparison(ComparisonExpression::new(
-            ComparisonType::Equal,
-            column(1, 1),
-            column(2, 0),
-        ));
+        let equality = Expression::Comparison(
+            ComparisonExpression::new(ComparisonType::Equal, column(1, 1), column(2, 0)).into(),
+        );
         let plan = OwnedLogicalPlan::new(
             &context,
             LogicalOperator::Filter(Filter::new(cross, vec![equality])),
@@ -436,16 +441,13 @@ mod tests {
                 build_side_constraint: Default::default(),
             })),
         );
-        let equality = Expression::Comparison(ComparisonExpression::new(
-            ComparisonType::Equal,
-            reference(0),
-            reference(2),
-        ));
-        let residual = Expression::Comparison(ComparisonExpression::new(
-            ComparisonType::GreaterThan,
-            reference(1),
-            reference(3),
-        ));
+        let equality = Expression::Comparison(
+            ComparisonExpression::new(ComparisonType::Equal, reference(0), reference(2)).into(),
+        );
+        let residual = Expression::Comparison(
+            ComparisonExpression::new(ComparisonType::GreaterThan, reference(1), reference(3))
+                .into(),
+        );
         let plan = OwnedLogicalPlan::new(
             &context,
             LogicalOperator::Filter(Filter::new(cross, vec![equality, residual.clone()])),

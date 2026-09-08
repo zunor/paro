@@ -35,14 +35,20 @@ pub(super) fn infer_equality_constants(
         .enumerate()
         .filter_map(|(offset, (column, constant))| {
             let relation = relations.get_relation_id(column.binding.table_index)?;
-            let expression = Expression::Comparison(ComparisonExpression::new(
-                ComparisonType::Equal,
-                Expression::ColumnRef(column.clone()),
-                Expression::Constant(ConstantExpression {
-                    value: constant.value,
-                    return_type: column.return_type.clone(),
-                }),
-            ));
+            let expression = Expression::Comparison(
+                ComparisonExpression::new(
+                    ComparisonType::Equal,
+                    Expression::ColumnRef(column.clone().into()),
+                    Expression::Constant(
+                        ConstantExpression {
+                            value: constant.value,
+                            return_type: column.return_type.clone(),
+                        }
+                        .into(),
+                    ),
+                )
+                .into(),
+            );
             let set = sets.get_relation(relation);
             let mut filter =
                 FilterInfo::new_inner(expression, set, first_filter_index.saturating_add(offset));
@@ -72,10 +78,12 @@ fn inferred_predicates(
         }
         match (comparison.left.as_ref(), comparison.right.as_ref()) {
             (Expression::ColumnRef(left), Expression::ColumnRef(right)) => {
-                columns.entry(left.binding).or_insert_with(|| left.clone());
+                columns
+                    .entry(left.binding)
+                    .or_insert_with(|| left.as_ref().clone());
                 columns
                     .entry(right.binding)
-                    .or_insert_with(|| right.clone());
+                    .or_insert_with(|| right.as_ref().clone());
                 adjacency
                     .entry(left.binding)
                     .or_default()
@@ -91,8 +99,8 @@ fn inferred_predicates(
             {
                 columns
                     .entry(column.binding)
-                    .or_insert_with(|| column.clone());
-                constants.push((column.binding, constant.clone()));
+                    .or_insert_with(|| column.as_ref().clone());
+                constants.push((column.binding, constant.as_ref().clone()));
                 existing.insert((column.binding, format!("{:?}", constant.value)));
             }
             _ => {}
@@ -127,10 +135,9 @@ mod tests {
     use super::*;
 
     fn column(table: usize) -> Expression {
-        Expression::ColumnRef(ColumnRefExpression::new(
-            ColumnBinding::new(table, 0),
-            LogicalType::Integer,
-        ))
+        Expression::ColumnRef(
+            ColumnRefExpression::new(ColumnBinding::new(table, 0), LogicalType::Integer).into(),
+        )
     }
 
     fn filter(
@@ -145,23 +152,23 @@ mod tests {
     fn inner_equality_class_propagates_non_null_constants() {
         let mut sets = JoinRelationSetManager::new();
         let equality = filter(
-            Expression::Comparison(ComparisonExpression::new(
-                ComparisonType::Equal,
-                column(10),
-                column(20),
-            )),
+            Expression::Comparison(
+                ComparisonExpression::new(ComparisonType::Equal, column(10), column(20)).into(),
+            ),
             sets.get_relation_from_vec(vec![0, 1]),
             0,
         );
         let constant = filter(
-            Expression::Comparison(ComparisonExpression::new(
-                ComparisonType::Equal,
-                column(10),
-                Expression::Constant(ConstantExpression::new(
-                    Value::Integer(25),
-                    LogicalType::Integer,
-                )),
-            )),
+            Expression::Comparison(
+                ComparisonExpression::new(
+                    ComparisonType::Equal,
+                    column(10),
+                    Expression::Constant(
+                        ConstantExpression::new(Value::Integer(25), LogicalType::Integer).into(),
+                    ),
+                )
+                .into(),
+            ),
             sets.get_relation(0),
             1,
         );

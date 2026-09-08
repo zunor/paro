@@ -33,10 +33,7 @@ impl ExpressionMatcher for ConjunctionSimplificationMatcher {
         let has_bool_constant = conj.children.iter().any(|c| {
             matches!(
                 c,
-                Expression::Constant(ConstantExpression {
-                    value: Value::Boolean(_),
-                    ..
-                })
+                Expression::Constant(constant) if matches!(constant.value, Value::Boolean(_))
             )
         });
 
@@ -237,7 +234,7 @@ fn build_conjunction(
     if children.len() == 1 {
         return children.pop().expect("single conjunction child");
     }
-    Expression::Conjunction(ConjunctionExpression::new(conjunction_type, children))
+    Expression::Conjunction(ConjunctionExpression::new(conjunction_type, children).into())
 }
 
 /// Simplify AND conjunction.
@@ -250,17 +247,17 @@ fn simplify_and(conj: &ConjunctionExpression) -> RuleResult {
     if conj.children.iter().any(|child| {
         matches!(
             child,
-            Expression::Constant(ConstantExpression {
-                value: Value::Boolean(false),
-                ..
-            })
+            Expression::Constant(constant) if constant.value == Value::Boolean(false)
         )
     }) && conj.children.iter().all(can_elide)
     {
-        return RuleResult::Changed(Box::new(Expression::Constant(ConstantExpression {
-            value: Value::Boolean(false),
-            return_type: LogicalType::Boolean,
-        })));
+        return RuleResult::Changed(Box::new(Expression::Constant(
+            ConstantExpression {
+                value: Value::Boolean(false),
+                return_type: LogicalType::Boolean,
+            }
+            .into(),
+        )));
     }
 
     let mut remaining_children: Vec<Expression> = Vec::new();
@@ -268,17 +265,11 @@ fn simplify_and(conj: &ConjunctionExpression) -> RuleResult {
 
     for child in &conj.children {
         match child {
-            Expression::Constant(ConstantExpression {
-                value: Value::Boolean(false),
-                ..
-            }) => {
+            Expression::Constant(constant) if constant.value == Value::Boolean(false) => {
                 // Keep the absorbing value when another input owns an evaluation.
                 remaining_children.push(child.clone());
             }
-            Expression::Constant(ConstantExpression {
-                value: Value::Boolean(true),
-                ..
-            }) => {
+            Expression::Constant(constant) if constant.value == Value::Boolean(true) => {
                 // TRUE in AND → skip this child (remove it)
                 removed_identity = true;
             }
@@ -300,17 +291,17 @@ fn simplify_or(conj: &ConjunctionExpression) -> RuleResult {
     if conj.children.iter().any(|child| {
         matches!(
             child,
-            Expression::Constant(ConstantExpression {
-                value: Value::Boolean(true),
-                ..
-            })
+            Expression::Constant(constant) if constant.value == Value::Boolean(true)
         )
     }) && conj.children.iter().all(can_elide)
     {
-        return RuleResult::Changed(Box::new(Expression::Constant(ConstantExpression {
-            value: Value::Boolean(true),
-            return_type: LogicalType::Boolean,
-        })));
+        return RuleResult::Changed(Box::new(Expression::Constant(
+            ConstantExpression {
+                value: Value::Boolean(true),
+                return_type: LogicalType::Boolean,
+            }
+            .into(),
+        )));
     }
 
     let mut remaining_children: Vec<Expression> = Vec::new();
@@ -318,17 +309,11 @@ fn simplify_or(conj: &ConjunctionExpression) -> RuleResult {
 
     for child in &conj.children {
         match child {
-            Expression::Constant(ConstantExpression {
-                value: Value::Boolean(true),
-                ..
-            }) => {
+            Expression::Constant(constant) if constant.value == Value::Boolean(true) => {
                 // Keep the absorbing value when another input owns an evaluation.
                 remaining_children.push(child.clone());
             }
-            Expression::Constant(ConstantExpression {
-                value: Value::Boolean(false),
-                ..
-            }) => {
+            Expression::Constant(constant) if constant.value == Value::Boolean(false) => {
                 // FALSE in OR → skip this child (remove it)
                 removed_identity = true;
             }
@@ -355,10 +340,13 @@ fn build_result(
         0 => {
             // All children were constants and removed
             // AND with all TRUE → TRUE, OR with all FALSE → FALSE
-            RuleResult::Changed(Box::new(Expression::Constant(ConstantExpression {
-                value: Value::Boolean(default_value),
-                return_type: LogicalType::Boolean,
-            })))
+            RuleResult::Changed(Box::new(Expression::Constant(
+                ConstantExpression {
+                    value: Value::Boolean(default_value),
+                    return_type: LogicalType::Boolean,
+                }
+                .into(),
+            )))
         }
         1 => {
             // Only one child remaining, return it directly
@@ -366,10 +354,13 @@ fn build_result(
         }
         _ => {
             // Multiple children remaining, rebuild conjunction
-            RuleResult::Changed(Box::new(Expression::Conjunction(ConjunctionExpression {
-                conjunction_type: conj_type,
-                children: remaining,
-            })))
+            RuleResult::Changed(Box::new(Expression::Conjunction(
+                ConjunctionExpression {
+                    conjunction_type: conj_type,
+                    children: remaining,
+                }
+                .into(),
+            )))
         }
     }
 }
@@ -383,35 +374,47 @@ mod tests {
     };
 
     fn make_bool_constant(value: bool) -> Expression {
-        Expression::Constant(ConstantExpression {
-            value: Value::Boolean(value),
-            return_type: LogicalType::Boolean,
-        })
+        Expression::Constant(
+            ConstantExpression {
+                value: Value::Boolean(value),
+                return_type: LogicalType::Boolean,
+            }
+            .into(),
+        )
     }
 
     fn make_column_ref(table_index: usize, column_index: usize) -> Expression {
-        Expression::ColumnRef(ColumnRefExpression {
-            binding: paro_planner::operator::ColumnBinding {
-                table_index,
-                column_index,
-            },
-            depth: 0,
-            return_type: LogicalType::Boolean,
-        })
+        Expression::ColumnRef(
+            ColumnRefExpression {
+                binding: paro_planner::operator::ColumnBinding {
+                    table_index,
+                    column_index,
+                },
+                depth: 0,
+                return_type: LogicalType::Boolean,
+            }
+            .into(),
+        )
     }
 
     fn make_and(children: Vec<Expression>) -> Expression {
-        Expression::Conjunction(ConjunctionExpression {
-            conjunction_type: ConjunctionType::And,
-            children,
-        })
+        Expression::Conjunction(
+            ConjunctionExpression {
+                conjunction_type: ConjunctionType::And,
+                children,
+            }
+            .into(),
+        )
     }
 
     fn make_or(children: Vec<Expression>) -> Expression {
-        Expression::Conjunction(ConjunctionExpression {
-            conjunction_type: ConjunctionType::Or,
-            children,
-        })
+        Expression::Conjunction(
+            ConjunctionExpression {
+                conjunction_type: ConjunctionType::Or,
+                children,
+            }
+            .into(),
+        )
     }
 
     fn volatile_bool() -> Expression {
@@ -421,17 +424,13 @@ mod tests {
             .next()
             .expect("random overload");
         let random = || {
-            Expression::Function(Box::new(FunctionExpression::new(
-                function.clone(),
-                vec![],
-                LogicalType::Double,
-            )))
+            Expression::Function(
+                FunctionExpression::new(function.clone(), vec![], LogicalType::Double).into(),
+            )
         };
-        Expression::Comparison(ComparisonExpression::new(
-            ComparisonType::GreaterThan,
-            random(),
-            random(),
-        ))
+        Expression::Comparison(
+            ComparisonExpression::new(ComparisonType::GreaterThan, random(), random()).into(),
+        )
     }
 
     #[test]
@@ -513,11 +512,14 @@ mod tests {
     #[test]
     fn test_and_false_elides_total_comparison() {
         let rule = ConjunctionSimplificationRule::new();
-        let comparison = Expression::Comparison(ComparisonExpression::new(
-            ComparisonType::Equal,
-            make_column_ref(0, 0),
-            make_bool_constant(true),
-        ));
+        let comparison = Expression::Comparison(
+            ComparisonExpression::new(
+                ComparisonType::Equal,
+                make_column_ref(0, 0),
+                make_bool_constant(true),
+            )
+            .into(),
+        );
         let expr = make_and(vec![comparison, make_bool_constant(false)]);
         let mut bindings = Vec::new();
         assert!(rule.matcher().matches(&expr, &mut bindings));
@@ -527,10 +529,8 @@ mod tests {
         assert!(matches!(
             result,
             RuleResult::Changed(expression)
-                if matches!(*expression, Expression::Constant(ConstantExpression {
-                    value: Value::Boolean(false),
-                    ..
-                }))
+                if matches!(&*expression, Expression::Constant(constant)
+                    if constant.value == Value::Boolean(false))
         ));
     }
 

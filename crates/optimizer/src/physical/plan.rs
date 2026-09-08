@@ -361,7 +361,7 @@ impl PhysicalPlan {
                 for (offset, expression) in spec.expressions.iter().enumerate() {
                     let index = spec.input_width + offset;
                     if let Some(name) = names.get_mut(index) {
-                        *name = formatter.format(&Expression::Window(Box::new(expression.clone())));
+                        *name = formatter.format(&Expression::Window(expression.clone().into()));
                     }
                 }
             }

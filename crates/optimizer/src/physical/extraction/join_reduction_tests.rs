@@ -85,17 +85,16 @@ fn unique_build_proof_resolves_physical_references_through_carriers() {
         LogicalOperator::Projection(Projection::new(
             8,
             filter,
-            vec![Expression::Reference(ReferenceExpression::new(
-                0,
-                LogicalType::BigInt,
-            ))],
+            vec![Expression::Reference(
+                ReferenceExpression::new(0, LogicalType::BigInt).into(),
+            )],
         )),
     );
     let projection =
         crate::statistics::unique_keys::refresh_unique_keys(projection).expect("cache unique keys");
     let conditions = [JoinCondition::new(
-        Expression::Reference(ReferenceExpression::new(0, LogicalType::BigInt)),
-        Expression::Reference(ReferenceExpression::new(0, LogicalType::BigInt)),
+        Expression::Reference(ReferenceExpression::new(0, LogicalType::BigInt).into()),
+        Expression::Reference(ReferenceExpression::new(0, LogicalType::BigInt).into()),
         JoinComparisonType::Equal,
     )];
 
@@ -124,8 +123,8 @@ fn unique_build_proof_propagates_through_windows() {
     let window =
         crate::statistics::unique_keys::refresh_unique_keys(window).expect("cache unique keys");
     let conditions = [JoinCondition::new(
-        Expression::Reference(ReferenceExpression::new(0, LogicalType::Varchar)),
-        Expression::Reference(ReferenceExpression::new(1, LogicalType::BigInt)),
+        Expression::Reference(ReferenceExpression::new(0, LogicalType::Varchar).into()),
+        Expression::Reference(ReferenceExpression::new(1, LogicalType::BigInt).into()),
         JoinComparisonType::Equal,
     )];
 
@@ -168,8 +167,8 @@ fn graph_expand_does_not_promote_its_input_key_to_an_output_key() {
     let expanded =
         crate::statistics::unique_keys::refresh_unique_keys(expanded).expect("cache unique keys");
     let conditions = [JoinCondition::new(
-        Expression::Reference(ReferenceExpression::new(0, LogicalType::Varchar)),
-        Expression::Reference(ReferenceExpression::new(1, LogicalType::BigInt)),
+        Expression::Reference(ReferenceExpression::new(0, LogicalType::Varchar).into()),
+        Expression::Reference(ReferenceExpression::new(1, LogicalType::BigInt).into()),
         JoinComparisonType::Equal,
     )];
 
@@ -198,8 +197,8 @@ fn unique_build_proof_requires_a_key_preserving_join() {
     let multiplicative = crate::statistics::unique_keys::refresh_unique_keys(multiplicative)
         .expect("cache unique keys");
     let outer_conditions = [JoinCondition::new(
-        Expression::Reference(ReferenceExpression::new(0, LogicalType::BigInt)),
-        Expression::Reference(ReferenceExpression::new(0, LogicalType::BigInt)),
+        Expression::Reference(ReferenceExpression::new(0, LogicalType::BigInt).into()),
+        Expression::Reference(ReferenceExpression::new(0, LogicalType::BigInt).into()),
         JoinComparisonType::Equal,
     )];
     assert!(!hash_join_build_keys_are_declared_unique(
@@ -214,14 +213,20 @@ fn unique_build_proof_requires_a_key_preserving_join() {
     left_get.table_index = 6;
     let right = declared_unique_get(&ctx);
     let join_conditions = vec![JoinCondition::new(
-        Expression::ColumnRef(paro_planner::expression::ColumnRefExpression::new(
-            paro_planner::operator::ColumnBinding::new(6, 1),
-            LogicalType::BigInt,
-        )),
-        Expression::ColumnRef(paro_planner::expression::ColumnRefExpression::new(
-            paro_planner::operator::ColumnBinding::new(7, 1),
-            LogicalType::BigInt,
-        )),
+        Expression::ColumnRef(
+            paro_planner::expression::ColumnRefExpression::new(
+                paro_planner::operator::ColumnBinding::new(6, 1),
+                LogicalType::BigInt,
+            )
+            .into(),
+        ),
+        Expression::ColumnRef(
+            paro_planner::expression::ColumnRefExpression::new(
+                paro_planner::operator::ColumnBinding::new(7, 1),
+                LogicalType::BigInt,
+            )
+            .into(),
+        ),
         JoinComparisonType::Equal,
     )];
     let mut preserving = ComparisonJoin::new(JoinType::Inner, left, right, join_conditions);
@@ -257,7 +262,7 @@ fn integer_build_hint_traces_projected_outputs_through_inner_join_carriers() {
     carrier.right_projection_map = vec![1].into();
     let carrier = OwnedLogicalPlan::new(&ctx, LogicalOperator::Join(Join::Comparison(carrier)));
 
-    let key = Expression::Reference(ReferenceExpression::new(1, LogicalType::BigInt));
+    let key = Expression::Reference(ReferenceExpression::new(1, LogicalType::BigInt).into());
     let (get, column_id) = resolve_base_get_column(&carrier, &key)
         .expect("inner join output must retain its base-column lineage");
     assert_eq!(get.table_index, 7);
@@ -273,17 +278,16 @@ fn unique_build_proof_declines_computed_keys_and_null_safe_equality() {
         LogicalOperator::Projection(Projection::new(
             8,
             get,
-            vec![Expression::Constant(ConstantExpression::new(
-                Value::BigInt(1),
-                LogicalType::BigInt,
-            ))],
+            vec![Expression::Constant(
+                ConstantExpression::new(Value::BigInt(1), LogicalType::BigInt).into(),
+            )],
         )),
     );
     let computed =
         crate::statistics::unique_keys::refresh_unique_keys(computed).expect("cache unique keys");
     let mut condition = JoinCondition::new(
-        Expression::Reference(ReferenceExpression::new(0, LogicalType::BigInt)),
-        Expression::Reference(ReferenceExpression::new(0, LogicalType::BigInt)),
+        Expression::Reference(ReferenceExpression::new(0, LogicalType::BigInt).into()),
+        Expression::Reference(ReferenceExpression::new(0, LogicalType::BigInt).into()),
         JoinComparisonType::Equal,
     );
     assert!(!hash_join_build_keys_are_declared_unique(
@@ -293,7 +297,8 @@ fn unique_build_proof_declines_computed_keys_and_null_safe_equality() {
 
     let get = crate::statistics::unique_keys::refresh_unique_keys(declared_unique_get(&ctx))
         .expect("cache unique keys");
-    condition.right = Expression::Reference(ReferenceExpression::new(1, LogicalType::BigInt));
+    condition.right =
+        Expression::Reference(ReferenceExpression::new(1, LogicalType::BigInt).into());
     condition.comparison = JoinComparisonType::NotDistinctFrom;
     assert!(!hash_join_build_keys_are_declared_unique(
         &get,
@@ -323,14 +328,16 @@ fn build_and_source_predicates_share_one_collision_free_namespace() {
 #[test]
 fn branch_runtime_filters_require_one_shared_pruning_contract() {
     fn bound(index: usize, value: i64) -> Expression {
-        Expression::Comparison(ComparisonExpression::new(
-            ComparisonType::GreaterThanOrEqual,
-            Expression::Reference(ReferenceExpression::new(index, LogicalType::BigInt)),
-            Expression::Constant(ConstantExpression::new(
-                Value::BigInt(value),
-                LogicalType::BigInt,
-            )),
-        ))
+        Expression::Comparison(
+            ComparisonExpression::new(
+                ComparisonType::GreaterThanOrEqual,
+                Expression::Reference(ReferenceExpression::new(index, LogicalType::BigInt).into()),
+                Expression::Constant(
+                    ConstantExpression::new(Value::BigInt(value), LogicalType::BigInt).into(),
+                ),
+            )
+            .into(),
+        )
     }
     let shared = vec![bound(0, 10), bound(1, 11)];
     let merged = plan_reduction_runtime_filter_fusion(
@@ -367,11 +374,13 @@ fn branch_runtime_filters_require_one_shared_pruning_contract() {
 
 #[test]
 fn reduction_remap_rejects_correlated_source_bindings() {
-    let expression =
-        Expression::ColumnRef(paro_planner::expression::ColumnRefExpression::with_depth(
+    let expression = Expression::ColumnRef(
+        paro_planner::expression::ColumnRefExpression::with_depth(
             paro_planner::operator::ColumnBinding::new(7, 0),
             LogicalType::BigInt,
             1,
-        ));
+        )
+        .into(),
+    );
     assert!(remap_reduction_expression(&expression, &[3], 7, &[3], 9).is_none());
 }

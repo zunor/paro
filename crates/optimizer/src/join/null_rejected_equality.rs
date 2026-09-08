@@ -130,13 +130,14 @@ fn expression_is_proven_non_null_at(plan: &OwnedLogicalPlan, expression: &Expres
             let return_type = expression.return_type();
             expression_is_proven_non_null_at(
                 setop.left.as_ref(),
-                &Expression::ColumnRef(ColumnRefExpression::new(
-                    *left_binding,
-                    return_type.clone(),
-                )),
+                &Expression::ColumnRef(
+                    ColumnRefExpression::new(*left_binding, return_type.clone()).into(),
+                ),
             ) && expression_is_proven_non_null_at(
                 setop.right.as_ref(),
-                &Expression::ColumnRef(ColumnRefExpression::new(*right_binding, return_type)),
+                &Expression::ColumnRef(
+                    ColumnRefExpression::new(*right_binding, return_type).into(),
+                ),
             )
         }
         LogicalOperator::Order(order) => {
@@ -210,10 +211,9 @@ mod tests {
     };
 
     fn column(table: usize) -> Expression {
-        Expression::ColumnRef(ColumnRefExpression::new(
-            ColumnBinding::new(table, 0),
-            LogicalType::Integer,
-        ))
+        Expression::ColumnRef(
+            ColumnRefExpression::new(ColumnBinding::new(table, 0), LogicalType::Integer).into(),
+        )
     }
 
     fn values(table: usize) -> OwnedLogicalPlan {
@@ -228,11 +228,14 @@ mod tests {
     fn non_null_filter(table: usize) -> OwnedLogicalPlan {
         OwnedLogicalPlan::synthetic(LogicalOperator::Filter(Filter::new(
             values(table),
-            vec![Expression::Operator(OperatorExpression::new_unary(
-                OperatorType::IsNotNull,
-                column(table),
-                LogicalType::Boolean,
-            ))],
+            vec![Expression::Operator(
+                OperatorExpression::new_unary(
+                    OperatorType::IsNotNull,
+                    column(table),
+                    LogicalType::Boolean,
+                )
+                .into(),
+            )],
         )))
     }
 

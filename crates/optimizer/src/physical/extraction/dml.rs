@@ -115,10 +115,10 @@ impl PhysicalPlanExtractor {
             if let Some(expr_idx) = assignment_positions[table_col_idx] {
                 projection_exprs.push(update.expressions[expr_idx].clone());
             } else {
-                projection_exprs.push(Expression::Reference(ReferenceExpression::new(
-                    table_col_idx,
-                    child_types[table_col_idx].clone(),
-                )));
+                projection_exprs.push(Expression::Reference(
+                    ReferenceExpression::new(table_col_idx, child_types[table_col_idx].clone())
+                        .into(),
+                ));
             }
             output_names.push(column.name.clone());
             output_types.push(column.logical_type.clone());
@@ -142,10 +142,10 @@ impl PhysicalPlanExtractor {
                 "UPDATE input must expose exactly one locator for its target relation",
             ));
         };
-        projection_exprs.push(Expression::Reference(ReferenceExpression::new(
-            *scan_row_id_index,
-            child_types[*scan_row_id_index].clone(),
-        )));
+        projection_exprs.push(Expression::Reference(
+            ReferenceExpression::new(*scan_row_id_index, child_types[*scan_row_id_index].clone())
+                .into(),
+        ));
         output_names.push("rowid".to_string());
         output_types.push(child_types[*scan_row_id_index].clone());
 

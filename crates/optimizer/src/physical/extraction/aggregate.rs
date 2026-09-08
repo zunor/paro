@@ -439,6 +439,7 @@ fn split_strict_conditional_input(expression: Expression) -> (Expression, Option
     if !false_is_null || !case.result_if_true.is_passive_value() {
         return (Expression::Case(case), None);
     }
+    let case = case.into_inner();
     (*case.result_if_true, Some(*case.check))
 }
 
@@ -507,13 +508,14 @@ impl PhysicalPlanExtractor {
             {
                 let input = aggregate.groups[group_idx].clone();
                 let input_type = input.return_type();
-                aggregate_expressions.push(Expression::Aggregate(Box::new(
+                aggregate_expressions.push(Expression::Aggregate(
                     paro_planner::expression::AggregateExpression::new(
                         function.clone(),
                         vec![input],
                         input_type,
-                    ),
-                )));
+                    )
+                    .into(),
+                ));
             }
         }
         let AggregatePayloadPlan {
@@ -651,11 +653,12 @@ impl PhysicalPlanExtractor {
         let mut projection_exprs = Vec::with_capacity(child_types.len());
         let mut groups = Vec::with_capacity(child_types.len());
         for (idx, ty) in child_types.iter().cloned().enumerate() {
-            projection_exprs.push(Expression::Reference(ReferenceExpression::new(
-                idx,
-                ty.clone(),
-            )));
-            groups.push(Expression::Reference(ReferenceExpression::new(idx, ty)));
+            projection_exprs.push(Expression::Reference(
+                ReferenceExpression::new(idx, ty.clone()).into(),
+            ));
+            groups.push(Expression::Reference(
+                ReferenceExpression::new(idx, ty).into(),
+            ));
         }
         let spill_supported = !groups.is_empty();
 
@@ -793,17 +796,20 @@ fn singleton_group_projection(aggregate: &LogicalAggregate) -> Result<Vec<Expres
                         "At-most-one aggregate output {ordinal} has an invalid fallback type"
                     ))
                 })?;
-                Expression::Operator(OperatorExpression::new(
-                    OperatorType::Coalesce,
-                    vec![
-                        input,
-                        Expression::Constant(ConstantExpression::new(
-                            value.clone(),
-                            merge.return_type.clone(),
-                        )),
-                    ],
-                    merge.return_type.clone(),
-                ))
+                Expression::Operator(
+                    OperatorExpression::new(
+                        OperatorType::Coalesce,
+                        vec![
+                            input,
+                            Expression::Constant(
+                                ConstantExpression::new(value.clone(), merge.return_type.clone())
+                                    .into(),
+                            ),
+                        ],
+                        merge.return_type.clone(),
+                    )
+                    .into(),
+                )
             }
             None => {
                 return Err(paro_error::internal(format!(
@@ -861,10 +867,10 @@ fn lower_post_aggregate_reduction(
                     "post-aggregate reducer {reducer_idx} argument {child_idx} cannot be lowered to the aggregate-only value domain"
                 )));
             }
-            *child = Expression::Reference(ReferenceExpression::new(
-                column.binding.column_index,
-                column.return_type.clone(),
-            ));
+            *child = Expression::Reference(
+                ReferenceExpression::new(column.binding.column_index, column.return_type.clone())
+                    .into(),
+            );
         }
     }
     let reducer_types = reducers
@@ -989,8 +995,9 @@ fn rebase_post_reduction_predicate(
                     "post-aggregate reduction predicate retained an unavailable binding",
                 ));
             };
-            *expression =
-                Expression::Reference(ReferenceExpression::new(index, column.return_type.clone()));
+            *expression = Expression::Reference(
+                ReferenceExpression::new(index, column.return_type.clone()).into(),
+            );
             Ok(())
         }
         Expression::Reference(_)

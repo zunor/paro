@@ -502,14 +502,20 @@ impl DelimJoinElimination {
                 paro_planner::operator::JoinComparisonType::NotDistinctFrom
                     | paro_planner::operator::JoinComparisonType::DistinctFrom
             ) {
-                filter_expressions.push(Expression::Operator(OperatorExpression::new_unary(
-                    OperatorType::IsNotNull,
-                    Expression::ColumnRef(ColumnRefExpression::new(
-                        other_colref.binding,
-                        other_colref.return_type.clone(),
-                    )),
-                    LogicalType::Boolean,
-                )));
+                filter_expressions.push(Expression::Operator(
+                    OperatorExpression::new_unary(
+                        OperatorType::IsNotNull,
+                        Expression::ColumnRef(
+                            ColumnRefExpression::new(
+                                other_colref.binding,
+                                other_colref.return_type.clone(),
+                            )
+                            .into(),
+                        ),
+                        LogicalType::Boolean,
+                    )
+                    .into(),
+                ));
             }
         }
 
@@ -888,6 +894,7 @@ fn correlated_join_condition(
     let Expression::Comparison(comparison) = expression else {
         return None;
     };
+    let comparison = comparison.into_inner();
     correlated_condition_from_parts(
         *comparison.left,
         *comparison.right,
@@ -1010,30 +1017,26 @@ mod tests {
             noop_scalar_execute,
         )
         .with_stability(FunctionStability::Volatile);
-        Expression::Function(Box::new(FunctionExpression::new(
-            function,
-            vec![],
-            LogicalType::Integer,
-        )))
+        Expression::Function(FunctionExpression::new(function, vec![], LogicalType::Integer).into())
     }
 
     fn expression_get(table_index: usize) -> OwnedLogicalPlan {
         OwnedLogicalPlan::synthetic(LogicalOperator::ExpressionGet(ExpressionGet::new(
             table_index,
-            vec![vec![Expression::ColumnRef(ColumnRefExpression::new(
-                ColumnBinding::new(table_index, 0),
-                LogicalType::Integer,
-            ))]],
+            vec![vec![Expression::ColumnRef(
+                ColumnRefExpression::new(ColumnBinding::new(table_index, 0), LogicalType::Integer)
+                    .into(),
+            )]],
             vec!["v".to_string()],
             vec![LogicalType::Integer],
         )))
     }
 
     fn column(table_index: usize) -> Expression {
-        Expression::ColumnRef(ColumnRefExpression::new(
-            ColumnBinding::new(table_index, 0),
-            LogicalType::Integer,
-        ))
+        Expression::ColumnRef(
+            ColumnRefExpression::new(ColumnBinding::new(table_index, 0), LogicalType::Integer)
+                .into(),
+        )
     }
 
     fn comparison(
@@ -1041,7 +1044,7 @@ mod tests {
         left: Expression,
         right: Expression,
     ) -> Expression {
-        Expression::Comparison(ComparisonExpression::new(comparison_type, left, right))
+        Expression::Comparison(ComparisonExpression::new(comparison_type, left, right).into())
     }
 
     fn correlated_existence_join(project_delim_column: bool) -> ComparisonJoin {
@@ -1058,10 +1061,9 @@ mod tests {
         let local = comparison(
             ComparisonType::GreaterThan,
             column(1),
-            Expression::Constant(ConstantExpression::new(
-                Value::Integer(5),
-                LogicalType::Integer,
-            )),
+            Expression::Constant(
+                ConstantExpression::new(Value::Integer(5), LogicalType::Integer).into(),
+            ),
         );
         let filtered = OwnedLogicalPlan::synthetic(LogicalOperator::Filter(Filter::new(
             cross,
@@ -1228,14 +1230,14 @@ mod tests {
                 base,
                 delim_get,
                 vec![JoinCondition::new(
-                    Expression::ColumnRef(ColumnRefExpression::new(
-                        ColumnBinding::new(1, 0),
-                        LogicalType::Integer,
-                    )),
-                    Expression::ColumnRef(ColumnRefExpression::new(
-                        ColumnBinding::new(99, 0),
-                        LogicalType::Integer,
-                    )),
+                    Expression::ColumnRef(
+                        ColumnRefExpression::new(ColumnBinding::new(1, 0), LogicalType::Integer)
+                            .into(),
+                    ),
+                    Expression::ColumnRef(
+                        ColumnRefExpression::new(ColumnBinding::new(99, 0), LogicalType::Integer)
+                            .into(),
+                    ),
                     JoinComparisonType::Equal,
                 )],
             ),
@@ -1246,19 +1248,17 @@ mod tests {
             outer,
             redundant,
             vec![JoinCondition::new(
-                Expression::ColumnRef(ColumnRefExpression::new(
-                    ColumnBinding::new(0, 0),
-                    LogicalType::Integer,
-                )),
-                Expression::ColumnRef(ColumnRefExpression::new(
-                    ColumnBinding::new(1, 0),
-                    LogicalType::Integer,
-                )),
+                Expression::ColumnRef(
+                    ColumnRefExpression::new(ColumnBinding::new(0, 0), LogicalType::Integer).into(),
+                ),
+                Expression::ColumnRef(
+                    ColumnRefExpression::new(ColumnBinding::new(1, 0), LogicalType::Integer).into(),
+                ),
                 JoinComparisonType::Equal,
             )],
         );
         root_join.duplicate_eliminated_columns = vec![Expression::ColumnRef(
-            ColumnRefExpression::new(ColumnBinding::new(0, 0), LogicalType::Integer),
+            ColumnRefExpression::new(ColumnBinding::new(0, 0), LogicalType::Integer).into(),
         )];
 
         let result = DelimJoinElimination::canonical().optimize_plan(OwnedLogicalPlan::synthetic(

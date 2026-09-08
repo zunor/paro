@@ -328,10 +328,13 @@ mod tests {
         use crate::expression::ConstantExpression;
         use paro_common::runtime_value::Value;
 
-        let condition = Expression::Constant(ConstantExpression {
-            value: Value::Boolean(true),
-            return_type: LogicalType::Boolean,
-        });
+        let condition = Expression::Constant(
+            ConstantExpression {
+                value: Value::Boolean(true),
+                return_type: LogicalType::Boolean,
+            }
+            .into(),
+        );
         let join = DependentJoin::lateral(
             dummy_plan(),
             dummy_plan(),

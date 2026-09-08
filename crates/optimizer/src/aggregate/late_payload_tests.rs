@@ -27,10 +27,7 @@ const GROUPINGS: usize = 22;
 const OUTPUT: usize = 30;
 
 fn column(table: usize, index: usize, ty: LogicalType) -> Expression {
-    Expression::ColumnRef(ColumnRefExpression::new(
-        ColumnBinding::new(table, index),
-        ty,
-    ))
+    Expression::ColumnRef(ColumnRefExpression::new(ColumnBinding::new(table, index), ty).into())
 }
 
 fn source_table() -> Arc<TableCatalogEntry> {
@@ -91,11 +88,14 @@ fn candidate(order_by_payload: bool) -> OwnedLogicalPlan {
             column(SOURCE, 2, LogicalType::Varchar),
         ],
         vec![],
-        vec![Expression::Aggregate(Box::new(AggregateExpression::new(
-            sum,
-            vec![column(SOURCE, 3, LogicalType::Integer)],
-            LogicalType::BigInt,
-        )))],
+        vec![Expression::Aggregate(
+            AggregateExpression::new(
+                sum,
+                vec![column(SOURCE, 3, LogicalType::Integer)],
+                LogicalType::BigInt,
+            )
+            .into(),
+        )],
         vec![],
     );
     aggregate.group_dependencies.push(GroupDependency {

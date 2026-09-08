@@ -575,10 +575,13 @@ mod tests {
     }
 
     fn col(table_index: usize, column_index: usize) -> Expression {
-        Expression::ColumnRef(ColumnRefExpression::new(
-            ColumnBinding::new(table_index, column_index),
-            LogicalType::Integer,
-        ))
+        Expression::ColumnRef(
+            ColumnRefExpression::new(
+                ColumnBinding::new(table_index, column_index),
+                LogicalType::Integer,
+            )
+            .into(),
+        )
     }
 
     fn create_table(

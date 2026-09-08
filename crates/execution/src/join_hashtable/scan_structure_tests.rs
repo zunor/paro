@@ -148,28 +148,24 @@ fn create_test_buffer_pool() -> Arc<BufferPool> {
 
 fn equality_condition() -> JoinCondition {
     JoinCondition::new(
-        Expression::Constant(ConstantExpression::new(
-            Value::Integer(1),
-            LogicalType::Integer,
-        )),
-        Expression::Constant(ConstantExpression::new(
-            Value::Integer(1),
-            LogicalType::Integer,
-        )),
+        Expression::Constant(
+            ConstantExpression::new(Value::Integer(1), LogicalType::Integer).into(),
+        ),
+        Expression::Constant(
+            ConstantExpression::new(Value::Integer(1), LogicalType::Integer).into(),
+        ),
         JoinComparisonType::Equal,
     )
 }
 
 fn not_distinct_condition() -> JoinCondition {
     JoinCondition::new(
-        Expression::Constant(ConstantExpression::new(
-            Value::Integer(1),
-            LogicalType::Integer,
-        )),
-        Expression::Constant(ConstantExpression::new(
-            Value::Integer(1),
-            LogicalType::Integer,
-        )),
+        Expression::Constant(
+            ConstantExpression::new(Value::Integer(1), LogicalType::Integer).into(),
+        ),
+        Expression::Constant(
+            ConstantExpression::new(Value::Integer(1), LogicalType::Integer).into(),
+        ),
         JoinComparisonType::NotDistinctFrom,
     )
 }

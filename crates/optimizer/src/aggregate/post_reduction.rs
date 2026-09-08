@@ -186,10 +186,13 @@ fn recognize_cte_max_reduction(
     let reducer = scalar.reducer.clone().replace_column_ref(&|column| {
         (column.binding == ColumnBinding::new(scalar.cte_table_index, scalar.cte_value_ordinal))
             .then(|| {
-                Expression::ColumnRef(ColumnRefExpression::new(
-                    ColumnBinding::new(grouped.aggregate_index, main_value_ordinal),
-                    grouped_value_type.clone(),
-                ))
+                Expression::ColumnRef(
+                    ColumnRefExpression::new(
+                        ColumnBinding::new(grouped.aggregate_index, main_value_ordinal),
+                        grouped_value_type.clone(),
+                    )
+                    .into(),
+                )
             })
     });
     let scalar_expression = rebase_scalar_expression(
@@ -530,15 +533,14 @@ fn find_cte_predicate_inner(
                 *found = Some(Expression::Comparison(
                     paro_planner::expression::ComparisonExpression::new(
                         paro_planner::expression::ComparisonType::Equal,
-                        Expression::ColumnRef(ColumnRefExpression::new(
-                            aggregate_binding,
-                            value_type.clone(),
-                        )),
-                        Expression::ColumnRef(ColumnRefExpression::new(
-                            reduction_binding,
-                            value_type.clone(),
-                        )),
-                    ),
+                        Expression::ColumnRef(
+                            ColumnRefExpression::new(aggregate_binding, value_type.clone()).into(),
+                        ),
+                        Expression::ColumnRef(
+                            ColumnRefExpression::new(reduction_binding, value_type.clone()).into(),
+                        ),
+                    )
+                    .into(),
                 ));
             }
         }
@@ -760,7 +762,7 @@ fn replace_main_cte_ref(
                     .into_iter()
                     .zip(types)
                     .map(|(binding, ty)| {
-                        Expression::ColumnRef(ColumnRefExpression::new(binding, ty))
+                        Expression::ColumnRef(ColumnRefExpression::new(binding, ty).into())
                     })
                     .collect(),
             )),
@@ -969,14 +971,20 @@ fn recognize_orientation(
         reduction_index,
         scalar.wrapper_type,
     )?;
-    let reducer = Expression::Aggregate(Box::new(AggregateExpression::new(
-        merge,
-        vec![Expression::ColumnRef(ColumnRefExpression::new(
-            ColumnBinding::new(grouped.aggregate_index, 0),
+    let reducer = Expression::Aggregate(
+        AggregateExpression::new(
+            merge,
+            vec![Expression::ColumnRef(
+                ColumnRefExpression::new(
+                    ColumnBinding::new(grouped.aggregate_index, 0),
+                    grouped_sum.return_type.clone(),
+                )
+                .into(),
+            )],
             grouped_sum.return_type.clone(),
-        ))],
-        grouped_sum.return_type.clone(),
-    )));
+        )
+        .into(),
+    );
 
     Some(Rewrite {
         grouped_side,
@@ -1198,8 +1206,9 @@ fn rebase_scalar_expression(
         return None;
     }
     Some(expression.clone().replace_column_ref(&|column| {
-        is_column(column, binding, &reducer_type)
-            .then(|| Expression::Reference(ReferenceExpression::new(0, reducer_type.clone())))
+        is_column(column, binding, &reducer_type).then(|| {
+            Expression::Reference(ReferenceExpression::new(0, reducer_type.clone()).into())
+        })
     }))
 }
 
@@ -1241,10 +1250,13 @@ fn rebase_predicate(
     }
     Some(predicate.clone().replace_column_ref(&|column| {
         (column.binding == scalar_binding).then(|| {
-            Expression::ColumnRef(ColumnRefExpression::new(
-                ColumnBinding::new(reduction_index, 0),
-                scalar_type.clone(),
-            ))
+            Expression::ColumnRef(
+                ColumnRefExpression::new(
+                    ColumnBinding::new(reduction_index, 0),
+                    scalar_type.clone(),
+                )
+                .into(),
+            )
         })
     }))
 }

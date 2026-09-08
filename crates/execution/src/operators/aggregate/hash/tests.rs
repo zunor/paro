@@ -75,7 +75,7 @@ fn insert_distinct_values(
 }
 
 fn reference(index: usize, ty: LogicalType) -> Expression {
-    Expression::Reference(ReferenceExpression::new(index, ty))
+    Expression::Reference(ReferenceExpression::new(index, ty).into())
 }
 
 fn distinct_count_object() -> AggregateObject {
@@ -98,14 +98,15 @@ fn distinct_count_expression(input_idx: usize) -> Expression {
     let (function, _) = get_count_function()
         .bind(&[LogicalType::Integer])
         .expect("bind count");
-    Expression::Aggregate(Box::new(
+    Expression::Aggregate(
         AggregateExpression::new(
             function,
             vec![reference(input_idx, LogicalType::Integer)],
             LogicalType::BigInt,
         )
-        .with_aggr_type(AggregateType::Distinct),
-    ))
+        .with_aggr_type(AggregateType::Distinct)
+        .into(),
+    )
 }
 
 fn distinct_spec() -> AggregateSpec {

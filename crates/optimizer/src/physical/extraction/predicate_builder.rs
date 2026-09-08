@@ -716,12 +716,14 @@ mod tests {
     fn search_predicate_template_retains_typed_runtime_parameter() {
         let get = Get::new_without_table(7, vec!["bucket".to_string()], vec![LogicalType::Integer]);
         let slot = ParameterSlot::new(RuntimeParamId::new(0), LogicalType::Integer);
-        let expression =
-            Expression::Comparison(paro_planner::expression::ComparisonExpression::new(
+        let expression = Expression::Comparison(
+            paro_planner::expression::ComparisonExpression::new(
                 ComparisonType::Equal,
-                Expression::Reference(ReferenceExpression::new(0, LogicalType::Integer)),
-                Expression::Parameter(ParameterExpression::new(slot.clone())),
-            ));
+                Expression::Reference(ReferenceExpression::new(0, LogicalType::Integer).into()),
+                Expression::Parameter(ParameterExpression::new(slot.clone()).into()),
+            )
+            .into(),
+        );
 
         let (template, residual) =
             build_search_predicate_template(&[expression], &get).expect("predicate template");
@@ -742,18 +744,23 @@ mod tests {
         let get =
             Get::new_without_table(7, vec!["bucket".to_string()], vec![LogicalType::SmallInt]);
         let slot = ParameterSlot::new(RuntimeParamId::new(0), LogicalType::Integer);
-        let widened_column = Expression::Cast(CastExpression::new(
-            Expression::Reference(ReferenceExpression::new(0, LogicalType::SmallInt)),
-            LogicalType::Integer,
-            BoundCastInfo::fixed(int16_to_int32),
-            false,
-        ));
-        let expression =
-            Expression::Comparison(paro_planner::expression::ComparisonExpression::new(
+        let widened_column = Expression::Cast(
+            CastExpression::new(
+                Expression::Reference(ReferenceExpression::new(0, LogicalType::SmallInt).into()),
+                LogicalType::Integer,
+                BoundCastInfo::fixed(int16_to_int32),
+                false,
+            )
+            .into(),
+        );
+        let expression = Expression::Comparison(
+            paro_planner::expression::ComparisonExpression::new(
                 ComparisonType::Equal,
                 widened_column,
-                Expression::Parameter(ParameterExpression::new(slot.clone())),
-            ));
+                Expression::Parameter(ParameterExpression::new(slot.clone()).into()),
+            )
+            .into(),
+        );
 
         let (template, residual) =
             build_search_predicate_template(&[expression], &get).expect("predicate template");
@@ -776,18 +783,18 @@ mod tests {
             vec!["commit_date".to_string(), "receipt_date".to_string()],
             vec![LogicalType::Date, LogicalType::Date],
         );
-        let expression =
-            Expression::Comparison(paro_planner::expression::ComparisonExpression::new(
+        let expression = Expression::Comparison(
+            paro_planner::expression::ComparisonExpression::new(
                 ComparisonType::LessThan,
-                Expression::Reference(paro_planner::expression::ReferenceExpression::new(
-                    0,
-                    LogicalType::Date,
-                )),
-                Expression::Reference(paro_planner::expression::ReferenceExpression::new(
-                    1,
-                    LogicalType::Date,
-                )),
-            ));
+                Expression::Reference(
+                    paro_planner::expression::ReferenceExpression::new(0, LogicalType::Date).into(),
+                ),
+                Expression::Reference(
+                    paro_planner::expression::ReferenceExpression::new(1, LogicalType::Date).into(),
+                ),
+            )
+            .into(),
+        );
 
         let predicate = build_predicate(&expression, &get).unwrap();
 
@@ -825,15 +832,21 @@ mod tests {
 
     #[test]
     fn bound_date_constant_is_evaluated_for_scan_pushdown() {
-        let expr = Expression::Cast(CastExpression::new(
-            Expression::Constant(ConstantExpression::new(
-                Value::Varchar("1994-01-01".to_string()),
-                LogicalType::Varchar,
-            )),
-            LogicalType::Date,
-            BoundCastInfo::fixed(varchar_to_date),
-            false,
-        ));
+        let expr = Expression::Cast(
+            CastExpression::new(
+                Expression::Constant(
+                    ConstantExpression::new(
+                        Value::Varchar("1994-01-01".to_string()),
+                        LogicalType::Varchar,
+                    )
+                    .into(),
+                ),
+                LogicalType::Date,
+                BoundCastInfo::fixed(varchar_to_date),
+                false,
+            )
+            .into(),
+        );
 
         assert_eq!(
             evaluate_constant_expression(&expr).unwrap(),
@@ -845,22 +858,32 @@ mod tests {
     fn exactly_representable_date_timestamp_comparison_is_pushed() {
         const MICROS_PER_DAY: i64 = 86_400_000_000;
         let get = Get::new_without_table(7, vec!["shipdate".to_string()], vec![LogicalType::Date]);
-        let date_column = Expression::Reference(ReferenceExpression::new(0, LogicalType::Date));
-        let timestamp_column = Expression::Cast(CastExpression::new(
-            date_column,
-            LogicalType::Timestamp,
-            BoundCastInfo::fixed(date_to_timestamp),
-            false,
-        ));
+        let date_column =
+            Expression::Reference(ReferenceExpression::new(0, LogicalType::Date).into());
+        let timestamp_column = Expression::Cast(
+            CastExpression::new(
+                date_column,
+                LogicalType::Timestamp,
+                BoundCastInfo::fixed(date_to_timestamp),
+                false,
+            )
+            .into(),
+        );
         let comparison = |timestamp| {
-            Expression::Comparison(paro_planner::expression::ComparisonExpression::new(
-                ComparisonType::LessThanOrEqual,
-                timestamp_column.clone(),
-                Expression::Constant(ConstantExpression::new(
-                    Value::Timestamp(timestamp),
-                    LogicalType::Timestamp,
-                )),
-            ))
+            Expression::Comparison(
+                paro_planner::expression::ComparisonExpression::new(
+                    ComparisonType::LessThanOrEqual,
+                    timestamp_column.clone(),
+                    Expression::Constant(
+                        ConstantExpression::new(
+                            Value::Timestamp(timestamp),
+                            LogicalType::Timestamp,
+                        )
+                        .into(),
+                    ),
+                )
+                .into(),
+            )
         };
 
         assert_eq!(
@@ -894,15 +917,17 @@ mod tests {
         )
         .unwrap()
         .unwrap();
-        let expr = Expression::Cast(CastExpression::new(
-            Expression::Constant(ConstantExpression::new(
-                Value::Decimal(5, 2, 2),
-                source_type,
-            )),
-            target_type,
-            cast_info,
-            false,
-        ));
+        let expr = Expression::Cast(
+            CastExpression::new(
+                Expression::Constant(
+                    ConstantExpression::new(Value::Decimal(5, 2, 2), source_type).into(),
+                ),
+                target_type,
+                cast_info,
+                false,
+            )
+            .into(),
+        );
 
         assert_eq!(
             evaluate_constant_expression(&expr).unwrap(),
@@ -912,37 +937,47 @@ mod tests {
 
     #[test]
     fn runtime_context_dependent_cast_is_not_folded_for_scan_pushdown() {
-        let expr = Expression::Cast(CastExpression::new(
-            Expression::Constant(ConstantExpression::new(
-                Value::Varchar("session-dependent".to_string()),
-                LogicalType::Varchar,
-            )),
-            LogicalType::Date,
-            BoundCastInfo::fixed(varchar_to_date).requiring_runtime_context(),
-            false,
-        ));
+        let expr = Expression::Cast(
+            CastExpression::new(
+                Expression::Constant(
+                    ConstantExpression::new(
+                        Value::Varchar("session-dependent".to_string()),
+                        LogicalType::Varchar,
+                    )
+                    .into(),
+                ),
+                LogicalType::Date,
+                BoundCastInfo::fixed(varchar_to_date).requiring_runtime_context(),
+                false,
+            )
+            .into(),
+        );
 
         assert_eq!(evaluate_constant_expression(&expr).unwrap(), None);
     }
 
     fn like_expression(pattern: &str, negated: bool) -> Expression {
-        let like = Expression::Operator(OperatorExpression::new(
-            OperatorType::Like,
-            vec![
-                Expression::Reference(ReferenceExpression::new(0, LogicalType::Varchar)),
-                Expression::Constant(ConstantExpression::new(
-                    Value::Varchar(pattern.to_string()),
-                    LogicalType::Varchar,
-                )),
-            ],
-            LogicalType::Boolean,
-        ));
-        if negated {
-            Expression::Operator(OperatorExpression::new_unary(
-                OperatorType::Not,
-                like,
+        let like = Expression::Operator(
+            OperatorExpression::new(
+                OperatorType::Like,
+                vec![
+                    Expression::Reference(ReferenceExpression::new(0, LogicalType::Varchar).into()),
+                    Expression::Constant(
+                        ConstantExpression::new(
+                            Value::Varchar(pattern.to_string()),
+                            LogicalType::Varchar,
+                        )
+                        .into(),
+                    ),
+                ],
                 LogicalType::Boolean,
-            ))
+            )
+            .into(),
+        );
+        if negated {
+            Expression::Operator(
+                OperatorExpression::new_unary(OperatorType::Not, like, LogicalType::Boolean).into(),
+            )
         } else {
             like
         }
@@ -1024,32 +1059,32 @@ mod tests {
             ))
             .unwrap();
         let constant_bigint = |value| {
-            Expression::Constant(ConstantExpression::new(
-                Value::BigInt(value),
-                LogicalType::BigInt,
-            ))
+            Expression::Constant(
+                ConstantExpression::new(Value::BigInt(value), LogicalType::BigInt).into(),
+            )
         };
-        let substring = Expression::Function(Box::new(FunctionExpression::new(
-            function,
-            vec![
-                Expression::Reference(ReferenceExpression::new(0, LogicalType::Varchar)),
-                constant_bigint(start),
-                constant_bigint(length),
-            ],
-            LogicalType::Varchar,
-        )));
+        let substring = Expression::Function(
+            FunctionExpression::new(
+                function,
+                vec![
+                    Expression::Reference(ReferenceExpression::new(0, LogicalType::Varchar).into()),
+                    constant_bigint(start),
+                    constant_bigint(length),
+                ],
+                LogicalType::Varchar,
+            )
+            .into(),
+        );
         let mut children = vec![substring];
         children.extend(values.iter().map(|value| {
-            Expression::Constant(ConstantExpression::new(
-                Value::Varchar((*value).to_string()),
-                LogicalType::Varchar,
-            ))
+            Expression::Constant(
+                ConstantExpression::new(Value::Varchar((*value).to_string()), LogicalType::Varchar)
+                    .into(),
+            )
         }));
-        Expression::Operator(OperatorExpression::new(
-            OperatorType::In,
-            children,
-            LogicalType::Boolean,
-        ))
+        Expression::Operator(
+            OperatorExpression::new(OperatorType::In, children, LogicalType::Boolean).into(),
+        )
     }
 
     #[test]

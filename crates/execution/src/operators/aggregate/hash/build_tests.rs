@@ -24,7 +24,7 @@ use crate::runtime::{
 use crate::thread_context::ThreadContext;
 
 fn reference(index: usize, ty: LogicalType) -> Expression {
-    Expression::Reference(ReferenceExpression::new(index, ty))
+    Expression::Reference(ReferenceExpression::new(index, ty).into())
 }
 
 fn grouped_count_spec() -> AggregateSpec {
@@ -38,11 +38,9 @@ fn grouped_count_spec() -> AggregateSpec {
         groups: Box::new([reference(0, LogicalType::Integer)]),
         group_key_encodings: Box::new([GroupKeyEncoding::Identity]),
         grouping_sets: Box::new([]),
-        aggregates: Box::new([Expression::Aggregate(Box::new(AggregateExpression::new(
-            get_count_star_function(),
-            vec![],
-            LogicalType::BigInt,
-        )))]),
+        aggregates: Box::new([Expression::Aggregate(
+            AggregateExpression::new(get_count_star_function(), vec![], LogicalType::BigInt).into(),
+        )]),
         grouping_functions: Box::new([]),
         aggregate_inputs: Box::new([Box::new([])]),
         aggregate_filters: Box::new([None]),
@@ -70,11 +68,14 @@ fn grouped_string_agg_spec() -> AggregateSpec {
         groups: Box::new([reference(0, LogicalType::Integer)]),
         group_key_encodings: Box::new([GroupKeyEncoding::Identity]),
         grouping_sets: Box::new([]),
-        aggregates: Box::new([Expression::Aggregate(Box::new(AggregateExpression::new(
-            string_agg,
-            vec![reference(1, LogicalType::Varchar)],
-            LogicalType::Varchar,
-        )))]),
+        aggregates: Box::new([Expression::Aggregate(
+            AggregateExpression::new(
+                string_agg,
+                vec![reference(1, LogicalType::Varchar)],
+                LogicalType::Varchar,
+            )
+            .into(),
+        )]),
         grouping_functions: Box::new([]),
         aggregate_inputs: Box::new([Box::new([1])]),
         aggregate_filters: Box::new([None]),

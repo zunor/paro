@@ -271,9 +271,13 @@ impl Binder {
 
     pub fn bind_protocol_parameter(&self, index: usize) -> Result<Expression> {
         let (index, logical_type) = self.protocol_parameter(index)?;
-        Ok(Expression::Parameter(ParameterExpression::new(
-            ParameterSlot::new(RuntimeParamId::new(index), logical_type.clone()),
-        )))
+        Ok(Expression::Parameter(
+            ParameterExpression::new(ParameterSlot::new(
+                RuntimeParamId::new(index),
+                logical_type.clone(),
+            ))
+            .into(),
+        ))
     }
 
     pub(crate) fn delayed_subquery_planning_enabled(&self) -> bool {

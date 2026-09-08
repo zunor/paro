@@ -992,10 +992,13 @@ mod tests {
                 Projection::new(
                     11,
                     OwnedLogicalPlan::new(&bind_context, expression_get(7)),
-                    vec![Expression::ColumnRef(ColumnRefExpression::new(
-                        crate::operator::ColumnBinding::new(7, 0),
-                        LogicalType::Integer,
-                    ))],
+                    vec![Expression::ColumnRef(
+                        ColumnRefExpression::new(
+                            crate::operator::ColumnBinding::new(7, 0),
+                            LogicalType::Integer,
+                        )
+                        .into(),
+                    )],
                 )
                 .with_visible_names(vec!["alias_v".to_string()]),
             ),
@@ -1035,10 +1038,13 @@ mod tests {
             operator: LogicalOperator::Projection(Projection::new(
                 11,
                 OwnedLogicalPlan::new(&bind_context, expression_get(7)),
-                vec![Expression::ColumnRef(ColumnRefExpression::new(
-                    crate::operator::ColumnBinding::new(7, 0),
-                    LogicalType::Integer,
-                ))],
+                vec![Expression::ColumnRef(
+                    ColumnRefExpression::new(
+                        crate::operator::ColumnBinding::new(7, 0),
+                        LogicalType::Integer,
+                    )
+                    .into(),
+                )],
             )),
         };
 
@@ -1141,10 +1147,9 @@ mod tests {
             .expect("bind min(integer)");
         let aggregate = AggregateExpression::new(
             minimum,
-            vec![Expression::ColumnRef(ColumnRefExpression::new(
-                ColumnBinding::new(7, 0),
-                LogicalType::Integer,
-            ))],
+            vec![Expression::ColumnRef(
+                ColumnRefExpression::new(ColumnBinding::new(7, 0), LogicalType::Integer).into(),
+            )],
             LogicalType::Integer,
         );
         let original = OwnedLogicalPlan::new(
@@ -1153,10 +1158,10 @@ mod tests {
                 8,
                 vec![WindowExpression::aggregate(
                     aggregate,
-                    vec![Expression::ColumnRef(ColumnRefExpression::new(
-                        ColumnBinding::new(7, 0),
-                        LogicalType::Integer,
-                    ))],
+                    vec![Expression::ColumnRef(
+                        ColumnRefExpression::new(ColumnBinding::new(7, 0), LogicalType::Integer)
+                            .into(),
+                    )],
                     vec![],
                     WindowFrame::default(),
                 )],
@@ -1203,10 +1208,13 @@ mod tests {
             operator: LogicalOperator::Projection(Projection::new(
                 11,
                 child,
-                vec![Expression::ColumnRef(ColumnRefExpression::new(
-                    crate::operator::ColumnBinding::new(7, 0),
-                    LogicalType::Integer,
-                ))],
+                vec![Expression::ColumnRef(
+                    ColumnRefExpression::new(
+                        crate::operator::ColumnBinding::new(7, 0),
+                        LogicalType::Integer,
+                    )
+                    .into(),
+                )],
             )),
         };
 
@@ -1230,42 +1238,43 @@ mod tests {
     #[test]
     fn deep_copy_remaps_hidden_post_reduction_binding_and_sources() {
         let bind_context = BindContext::new();
-        let count = Expression::Aggregate(Box::new(AggregateExpression::new(
-            get_count_star_function(),
-            Vec::new(),
-            LogicalType::BigInt,
-        )));
+        let count = Expression::Aggregate(
+            AggregateExpression::new(get_count_star_function(), Vec::new(), LogicalType::BigInt)
+                .into(),
+        );
         let (max, _) = get_max_function()
             .bind(&[LogicalType::BigInt])
             .expect("bind max(bigint)");
-        let reducer = Expression::Aggregate(Box::new(AggregateExpression::new(
-            max,
-            vec![Expression::ColumnRef(ColumnRefExpression::new(
-                ColumnBinding::new(12, 0),
+        let reducer = Expression::Aggregate(
+            AggregateExpression::new(
+                max,
+                vec![Expression::ColumnRef(
+                    ColumnRefExpression::new(ColumnBinding::new(12, 0), LogicalType::BigInt).into(),
+                )],
                 LogicalType::BigInt,
-            ))],
-            LogicalType::BigInt,
-        )));
-        let predicate = Expression::Comparison(ComparisonExpression::new(
-            ComparisonType::Equal,
-            Expression::ColumnRef(ColumnRefExpression::new(
-                ColumnBinding::new(12, 0),
-                LogicalType::BigInt,
-            )),
-            Expression::ColumnRef(ColumnRefExpression::new(
-                ColumnBinding::new(14, 0),
-                LogicalType::BigInt,
-            )),
-        ));
+            )
+            .into(),
+        );
+        let predicate = Expression::Comparison(
+            ComparisonExpression::new(
+                ComparisonType::Equal,
+                Expression::ColumnRef(
+                    ColumnRefExpression::new(ColumnBinding::new(12, 0), LogicalType::BigInt).into(),
+                ),
+                Expression::ColumnRef(
+                    ColumnRefExpression::new(ColumnBinding::new(14, 0), LogicalType::BigInt).into(),
+                ),
+            )
+            .into(),
+        );
         let aggregate = Aggregate::new(
             11,
             12,
             13,
             OwnedLogicalPlan::new(&bind_context, expression_get(7)),
-            vec![Expression::ColumnRef(ColumnRefExpression::new(
-                ColumnBinding::new(7, 0),
-                LogicalType::Integer,
-            ))],
+            vec![Expression::ColumnRef(
+                ColumnRefExpression::new(ColumnBinding::new(7, 0), LogicalType::Integer).into(),
+            )],
             Vec::new(),
             vec![count],
             Vec::new(),
@@ -1273,10 +1282,9 @@ mod tests {
         .with_post_reduction(PostAggregateReduction {
             reduction_index: 14,
             reducers: vec![reducer],
-            scalar_expressions: vec![Expression::Reference(ReferenceExpression::new(
-                0,
-                LogicalType::BigInt,
-            ))],
+            scalar_expressions: vec![Expression::Reference(
+                ReferenceExpression::new(0, LogicalType::BigInt).into(),
+            )],
             predicate,
         });
         let original = OwnedLogicalPlan::new(

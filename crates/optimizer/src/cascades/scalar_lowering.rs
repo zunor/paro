@@ -1125,19 +1125,16 @@ mod tests {
             .stack_size(256 * 1024)
             .spawn(|| {
                 let leaf = || {
-                    Expression::Constant(ConstantExpression::new(
-                        Value::Boolean(true),
-                        LogicalType::Boolean,
-                    ))
+                    Expression::Constant(
+                        ConstantExpression::new(Value::Boolean(true), LogicalType::Boolean).into(),
+                    )
                 };
                 let mut expression = leaf();
                 for _ in 0..10_000 {
-                    expression = Expression::Case(CaseExpression::new(
-                        leaf(),
-                        leaf(),
-                        expression,
-                        LogicalType::Boolean,
-                    ));
+                    expression = Expression::Case(
+                        CaseExpression::new(leaf(), leaf(), expression, LogicalType::Boolean)
+                            .into(),
+                    );
                 }
                 assert!(expression.evaluation_properties().is_infallible());
                 let mut arena = ScalarArena::default();
@@ -1150,8 +1147,8 @@ mod tests {
                 )
                 .unwrap();
                 assert!(!arena.get(id).unwrap().properties.may_error);
-                // Owned binder IR drop is a separate boundary from lowering.
-                std::mem::forget(expression);
+                // The last scalar owner is released iteratively too.
+                drop(expression);
             })
             .unwrap()
             .join()
@@ -1161,25 +1158,29 @@ mod tests {
     #[test]
     fn maximal_conjunction_fingerprint_preserves_associative_identity() {
         let leaf = |value| {
-            Expression::Constant(ConstantExpression::new(
-                Value::Boolean(value),
-                LogicalType::Boolean,
-            ))
+            Expression::Constant(
+                ConstantExpression::new(Value::Boolean(value), LogicalType::Boolean).into(),
+            )
         };
-        let nested = Expression::Conjunction(ConjunctionExpression::new(
-            ConjunctionType::Or,
-            vec![
-                leaf(true),
-                Expression::Conjunction(ConjunctionExpression::new(
-                    ConjunctionType::Or,
-                    vec![leaf(false), leaf(true)],
-                )),
-            ],
-        ));
-        let flat = Expression::Conjunction(ConjunctionExpression::new(
-            ConjunctionType::Or,
-            vec![leaf(false), leaf(true)],
-        ));
+        let nested = Expression::Conjunction(
+            ConjunctionExpression::new(
+                ConjunctionType::Or,
+                vec![
+                    leaf(true),
+                    Expression::Conjunction(
+                        ConjunctionExpression::new(
+                            ConjunctionType::Or,
+                            vec![leaf(false), leaf(true)],
+                        )
+                        .into(),
+                    ),
+                ],
+            )
+            .into(),
+        );
+        let flat = Expression::Conjunction(
+            ConjunctionExpression::new(ConjunctionType::Or, vec![leaf(false), leaf(true)]).into(),
+        );
         assert_eq!(
             expression_fingerprint(&nested),
             expression_fingerprint(&flat)
@@ -1190,17 +1191,16 @@ mod tests {
     fn lowering_a_long_distinct_or_chain_keeps_only_the_maximal_run() {
         use paro_planner::expression::ColumnRefExpression;
         let column = |index| {
-            Expression::ColumnRef(ColumnRefExpression::new(
-                ColumnBinding::new(0, index),
-                LogicalType::Boolean,
-            ))
+            Expression::ColumnRef(
+                ColumnRefExpression::new(ColumnBinding::new(0, index), LogicalType::Boolean).into(),
+            )
         };
         let mut expression = column(0);
         for index in 1..10_000 {
-            expression = Expression::Conjunction(ConjunctionExpression::new(
-                ConjunctionType::Or,
-                vec![expression, column(index)],
-            ));
+            expression = Expression::Conjunction(
+                ConjunctionExpression::new(ConjunctionType::Or, vec![expression, column(index)])
+                    .into(),
+            );
         }
         let mut arena = ScalarArena::default();
         let root = intern_expression(
@@ -1217,26 +1217,23 @@ mod tests {
             arena.get(root).unwrap().properties.referenced_columns.len(),
             10_000
         );
-        std::mem::forget(expression);
+        drop(expression);
     }
 
     #[test]
     fn fingerprint_handles_deep_conjunction_without_native_recursion() {
-        let leaf = Expression::Constant(ConstantExpression::new(
-            Value::Boolean(true),
-            LogicalType::Boolean,
-        ));
+        let leaf = Expression::Constant(
+            ConstantExpression::new(Value::Boolean(true), LogicalType::Boolean).into(),
+        );
         let mut expression = leaf.clone();
         for _ in 0..10_000 {
-            expression = Expression::Conjunction(ConjunctionExpression::new(
-                ConjunctionType::Or,
-                vec![expression, leaf.clone()],
-            ));
+            expression = Expression::Conjunction(
+                ConjunctionExpression::new(ConjunctionType::Or, vec![expression, leaf.clone()])
+                    .into(),
+            );
         }
         let fingerprint = expression_fingerprint(&expression);
         assert_ne!(fingerprint, Fingerprint::default());
-        // The planner's expression representation is recursively owned. Do
-        // not turn this safety test into a drop-stack test as well.
-        std::mem::forget(expression);
+        drop(expression);
     }
 }

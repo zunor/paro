@@ -697,21 +697,27 @@ mod tests {
     use paro_planner::plan::OwnedLogicalPlan;
 
     fn create_column_ref(table_index: usize, column_index: usize) -> Expression {
-        Expression::ColumnRef(ColumnRefExpression {
-            binding: paro_planner::operator::ColumnBinding {
-                table_index,
-                column_index,
-            },
-            depth: 0,
-            return_type: LogicalType::Integer,
-        })
+        Expression::ColumnRef(
+            ColumnRefExpression {
+                binding: paro_planner::operator::ColumnBinding {
+                    table_index,
+                    column_index,
+                },
+                depth: 0,
+                return_type: LogicalType::Integer,
+            }
+            .into(),
+        )
     }
 
     fn create_constant(value: i32) -> Expression {
-        Expression::Constant(ConstantExpression {
-            value: Value::Integer(value),
-            return_type: LogicalType::Integer,
-        })
+        Expression::Constant(
+            ConstantExpression {
+                value: Value::Integer(value),
+                return_type: LogicalType::Integer,
+            }
+            .into(),
+        )
     }
 
     fn create_test_get(table_index: usize) -> LogicalOperator {
@@ -736,22 +742,21 @@ mod tests {
             .next()
             .expect("random overload");
         let random = || {
-            Expression::Function(Box::new(FunctionExpression::new(
-                function.clone(),
-                vec![],
-                LogicalType::Double,
-            )))
+            Expression::Function(
+                FunctionExpression::new(function.clone(), vec![], LogicalType::Double).into(),
+            )
         };
-        Expression::Case(CaseExpression::new(
-            Expression::Comparison(ComparisonExpression::new(
-                ComparisonType::Equal,
-                random(),
-                random(),
-            )),
-            create_column_ref(table_index, 0),
-            create_column_ref(table_index, 0),
-            LogicalType::Integer,
-        ))
+        Expression::Case(
+            CaseExpression::new(
+                Expression::Comparison(
+                    ComparisonExpression::new(ComparisonType::Equal, random(), random()).into(),
+                ),
+                create_column_ref(table_index, 0),
+                create_column_ref(table_index, 0),
+                LogicalType::Integer,
+            )
+            .into(),
+        )
     }
 
     #[test]
@@ -764,20 +769,23 @@ mod tests {
     fn test_extract_bindings_visits_window_frame_offsets() {
         let mut manager = RelationManager::new();
         manager.add_relation(create_test_get(7), None, RelationStats::new());
-        let expression = Expression::Window(Box::new(WindowExpression::native(
-            paro_function::window::WindowFunction::row_number(),
-            vec![],
-            vec![],
-            vec![],
-            WindowFrame {
-                frame_type: WindowFrameType::Rows,
-                start_bound: WindowFrameBound::Offset(Box::new(create_column_ref(7, 0))),
-                start_is_preceding: true,
-                end_bound: WindowFrameBound::CurrentRow,
-                end_is_preceding: false,
-            },
-            false,
-        )));
+        let expression = Expression::Window(
+            WindowExpression::native(
+                paro_function::window::WindowFunction::row_number(),
+                vec![],
+                vec![],
+                vec![],
+                WindowFrame {
+                    frame_type: WindowFrameType::Rows,
+                    start_bound: WindowFrameBound::Offset(Box::new(create_column_ref(7, 0))),
+                    start_is_preceding: true,
+                    end_bound: WindowFrameBound::CurrentRow,
+                    end_is_preceding: false,
+                },
+                false,
+            )
+            .into(),
+        );
         let mut bindings = HashSet::new();
 
         assert!(manager.extract_bindings(&expression, &mut bindings));
@@ -871,11 +879,14 @@ mod tests {
         manager.add_relation(op2, None, RelationStats::new());
 
         // Create comparison: t1.a = t2.b
-        let expr = Expression::Comparison(ComparisonExpression {
-            left: Box::new(create_column_ref(0, 0)),
-            right: Box::new(create_column_ref(1, 0)),
-            comparison_type: ComparisonType::Equal,
-        });
+        let expr = Expression::Comparison(
+            ComparisonExpression {
+                left: Box::new(create_column_ref(0, 0)),
+                right: Box::new(create_column_ref(1, 0)),
+                comparison_type: ComparisonType::Equal,
+            }
+            .into(),
+        );
 
         let mut bindings = HashSet::new();
         let can_reorder = manager.extract_bindings(&expr, &mut bindings);
@@ -927,17 +938,23 @@ mod tests {
         manager.add_relation(op2, None, RelationStats::new());
 
         // Create filter expressions
-        let filter1 = Expression::Comparison(ComparisonExpression {
-            left: Box::new(create_column_ref(0, 0)),
-            right: Box::new(create_column_ref(1, 0)),
-            comparison_type: ComparisonType::Equal,
-        });
+        let filter1 = Expression::Comparison(
+            ComparisonExpression {
+                left: Box::new(create_column_ref(0, 0)),
+                right: Box::new(create_column_ref(1, 0)),
+                comparison_type: ComparisonType::Equal,
+            }
+            .into(),
+        );
 
-        let filter2 = Expression::Comparison(ComparisonExpression {
-            left: Box::new(create_column_ref(0, 0)),
-            right: Box::new(create_constant(10)),
-            comparison_type: ComparisonType::GreaterThan,
-        });
+        let filter2 = Expression::Comparison(
+            ComparisonExpression {
+                left: Box::new(create_column_ref(0, 0)),
+                right: Box::new(create_constant(10)),
+                comparison_type: ComparisonType::GreaterThan,
+            }
+            .into(),
+        );
 
         let extracted = manager
             .extract_edges(
@@ -969,11 +986,14 @@ mod tests {
         manager.add_relation(create_test_get(0), None, RelationStats::new());
         manager.add_relation(create_test_get(1), None, RelationStats::new());
 
-        let filter = Expression::Comparison(ComparisonExpression {
-            left: Box::new(create_column_ref(0, 0)),
-            right: Box::new(create_column_ref(1, 0)),
-            comparison_type: ComparisonType::GreaterThan,
-        });
+        let filter = Expression::Comparison(
+            ComparisonExpression {
+                left: Box::new(create_column_ref(0, 0)),
+                right: Box::new(create_column_ref(1, 0)),
+                comparison_type: ComparisonType::GreaterThan,
+            }
+            .into(),
+        );
 
         let filters = manager
             .extract_edges(
@@ -1008,10 +1028,9 @@ mod tests {
     fn extract_edges_retains_relation_independent_filters_at_the_root() {
         let manager = RelationManager::new();
         let mut set_manager = JoinRelationSetManager::new();
-        let predicate = Expression::Constant(ConstantExpression::new(
-            Value::Boolean(false),
-            LogicalType::Boolean,
-        ));
+        let predicate = Expression::Constant(
+            ConstantExpression::new(Value::Boolean(false), LogicalType::Boolean).into(),
+        );
 
         let extracted = manager
             .extract_edges(
@@ -1030,11 +1049,14 @@ mod tests {
         let mut manager = RelationManager::new();
         manager.add_relation(create_test_get(0), None, RelationStats::new());
         let mut set_manager = JoinRelationSetManager::new();
-        let external = Expression::Comparison(ComparisonExpression::new(
-            ComparisonType::Equal,
-            create_column_ref(99, 0),
-            create_constant(1),
-        ));
+        let external = Expression::Comparison(
+            ComparisonExpression::new(
+                ComparisonType::Equal,
+                create_column_ref(99, 0),
+                create_constant(1),
+            )
+            .into(),
+        );
 
         assert!(manager
             .extract_edges(&[ExtractedFilter::inner(external)], &mut set_manager)
@@ -1156,10 +1178,10 @@ mod tests {
             OwnedLogicalPlan::synthetic(right),
             vec![JoinCondition::new(
                 create_column_ref(0, 0),
-                Expression::ColumnRef(ColumnRefExpression::new(
-                    ColumnBinding::new(99, 0),
-                    LogicalType::Integer,
-                )),
+                Expression::ColumnRef(
+                    ColumnRefExpression::new(ColumnBinding::new(99, 0), LogicalType::Integer)
+                        .into(),
+                ),
                 JoinComparisonType::Equal,
             )],
         );

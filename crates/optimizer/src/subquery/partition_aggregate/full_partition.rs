@@ -476,10 +476,10 @@ mod tests {
     }
 
     fn column(table_index: usize) -> Expression {
-        Expression::ColumnRef(ColumnRefExpression::new(
-            ColumnBinding::new(table_index, 0),
-            LogicalType::BigInt,
-        ))
+        Expression::ColumnRef(
+            ColumnRefExpression::new(ColumnBinding::new(table_index, 0), LogicalType::BigInt)
+                .into(),
+        )
     }
 
     #[test]

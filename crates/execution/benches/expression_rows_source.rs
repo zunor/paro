@@ -69,10 +69,13 @@ impl ExpressionRowsBench {
             .map(|row| {
                 (0..COLUMNS)
                     .map(|column| {
-                        Expression::Constant(ConstantExpression::new(
-                            Value::BigInt((row * COLUMNS + column) as i64),
-                            LogicalType::BigInt,
-                        ))
+                        Expression::Constant(
+                            ConstantExpression::new(
+                                Value::BigInt((row * COLUMNS + column) as i64),
+                                LogicalType::BigInt,
+                            )
+                            .into(),
+                        )
                     })
                     .collect::<Vec<_>>()
                     .into_boxed_slice()

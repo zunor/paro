@@ -517,22 +517,25 @@ mod tests {
     #[test]
     fn extract_column_bindings_visits_window_frame_offsets() {
         let expected = ColumnBinding::new(7, 3);
-        let expression = Expression::Window(Box::new(WindowExpression::native(
-            WindowFunction::row_number(),
-            vec![],
-            vec![],
-            vec![],
-            WindowFrame {
-                frame_type: WindowFrameType::Rows,
-                start_bound: WindowFrameBound::Offset(Box::new(Expression::ColumnRef(
-                    ColumnRefExpression::new(expected, LogicalType::Integer),
-                ))),
-                start_is_preceding: true,
-                end_bound: WindowFrameBound::CurrentRow,
-                end_is_preceding: false,
-            },
-            false,
-        )));
+        let expression = Expression::Window(
+            WindowExpression::native(
+                WindowFunction::row_number(),
+                vec![],
+                vec![],
+                vec![],
+                WindowFrame {
+                    frame_type: WindowFrameType::Rows,
+                    start_bound: WindowFrameBound::Offset(Box::new(Expression::ColumnRef(
+                        ColumnRefExpression::new(expected, LogicalType::Integer).into(),
+                    ))),
+                    start_is_preceding: true,
+                    end_bound: WindowFrameBound::CurrentRow,
+                    end_is_preceding: false,
+                },
+                false,
+            )
+            .into(),
+        );
         let mut bindings = Vec::new();
 
         ColumnLifetimeAnalyzer::extract_column_bindings(&expression, &mut bindings);
@@ -562,10 +565,9 @@ mod tests {
             )),
         );
         let mut join = ComparisonJoin::new(JoinType::Single, left, right, Vec::new());
-        join.duplicate_eliminated_columns = vec![Expression::ColumnRef(ColumnRefExpression::new(
-            ColumnBinding::new(10, 0),
-            LogicalType::Integer,
-        ))];
+        join.duplicate_eliminated_columns = vec![Expression::ColumnRef(
+            ColumnRefExpression::new(ColumnBinding::new(10, 0), LogicalType::Integer).into(),
+        )];
         join.right_projection_map = vec![0].into();
         let plan = OwnedLogicalPlan::new(&ctx, LogicalOperator::Join(Join::Comparison(join)));
 
@@ -603,14 +605,14 @@ mod tests {
             left,
             right,
             vec![JoinCondition::new(
-                Expression::ColumnRef(ColumnRefExpression::new(
-                    ColumnBinding::new(10, 0),
-                    LogicalType::Integer,
-                )),
-                Expression::ColumnRef(ColumnRefExpression::new(
-                    ColumnBinding::new(20, 0),
-                    LogicalType::Integer,
-                )),
+                Expression::ColumnRef(
+                    ColumnRefExpression::new(ColumnBinding::new(10, 0), LogicalType::Integer)
+                        .into(),
+                ),
+                Expression::ColumnRef(
+                    ColumnRefExpression::new(ColumnBinding::new(20, 0), LogicalType::Integer)
+                        .into(),
+                ),
                 JoinComparisonType::Equal,
             )],
         );
@@ -620,10 +622,9 @@ mod tests {
             LogicalOperator::Projection(Projection::new(
                 30,
                 joined,
-                vec![Expression::ColumnRef(ColumnRefExpression::new(
-                    ColumnBinding::new(10, 1),
-                    LogicalType::BigInt,
-                ))],
+                vec![Expression::ColumnRef(
+                    ColumnRefExpression::new(ColumnBinding::new(10, 1), LogicalType::BigInt).into(),
+                )],
             )),
         );
 
@@ -665,14 +666,14 @@ mod tests {
             left,
             right,
             vec![JoinCondition::new(
-                Expression::ColumnRef(ColumnRefExpression::new(
-                    ColumnBinding::new(10, 0),
-                    LogicalType::Integer,
-                )),
-                Expression::ColumnRef(ColumnRefExpression::new(
-                    ColumnBinding::new(20, 0),
-                    LogicalType::Integer,
-                )),
+                Expression::ColumnRef(
+                    ColumnRefExpression::new(ColumnBinding::new(10, 0), LogicalType::Integer)
+                        .into(),
+                ),
+                Expression::ColumnRef(
+                    ColumnRefExpression::new(ColumnBinding::new(20, 0), LogicalType::Integer)
+                        .into(),
+                ),
                 JoinComparisonType::Equal,
             )],
         );
@@ -721,14 +722,14 @@ mod tests {
                 left,
                 right,
                 vec![JoinCondition::new(
-                    Expression::ColumnRef(ColumnRefExpression::new(
-                        ColumnBinding::new(10, 0),
-                        LogicalType::Integer,
-                    )),
-                    Expression::ColumnRef(ColumnRefExpression::new(
-                        ColumnBinding::new(20, 0),
-                        LogicalType::Integer,
-                    )),
+                    Expression::ColumnRef(
+                        ColumnRefExpression::new(ColumnBinding::new(10, 0), LogicalType::Integer)
+                            .into(),
+                    ),
+                    Expression::ColumnRef(
+                        ColumnRefExpression::new(ColumnBinding::new(20, 0), LogicalType::Integer)
+                            .into(),
+                    ),
                     JoinComparisonType::Equal,
                 )],
             ))),
@@ -740,10 +741,10 @@ mod tests {
                 vec![WindowExpression::native(
                     WindowFunction::row_number(),
                     vec![],
-                    vec![Expression::ColumnRef(ColumnRefExpression::new(
-                        ColumnBinding::new(10, 0),
-                        LogicalType::Integer,
-                    ))],
+                    vec![Expression::ColumnRef(
+                        ColumnRefExpression::new(ColumnBinding::new(10, 0), LogicalType::Integer)
+                            .into(),
+                    )],
                     vec![],
                     WindowFrame {
                         frame_type: WindowFrameType::Rows,
@@ -763,14 +764,14 @@ mod tests {
                 50,
                 window,
                 vec![
-                    Expression::ColumnRef(ColumnRefExpression::new(
-                        ColumnBinding::new(10, 1),
-                        LogicalType::BigInt,
-                    )),
-                    Expression::ColumnRef(ColumnRefExpression::new(
-                        ColumnBinding::new(40, 0),
-                        LogicalType::BigInt,
-                    )),
+                    Expression::ColumnRef(
+                        ColumnRefExpression::new(ColumnBinding::new(10, 1), LogicalType::BigInt)
+                            .into(),
+                    ),
+                    Expression::ColumnRef(
+                        ColumnRefExpression::new(ColumnBinding::new(40, 0), LogicalType::BigInt)
+                            .into(),
+                    ),
                 ],
             )),
         );
@@ -850,10 +851,10 @@ mod tests {
             LogicalOperator::Order(Order::new(
                 input,
                 vec![OrderByNode {
-                    expression: Expression::ColumnRef(ColumnRefExpression::new(
-                        ColumnBinding::new(10, 0),
-                        LogicalType::Integer,
-                    )),
+                    expression: Expression::ColumnRef(
+                        ColumnRefExpression::new(ColumnBinding::new(10, 0), LogicalType::Integer)
+                            .into(),
+                    ),
                     ascending: true,
                     nulls_first: false,
                 }],
@@ -864,10 +865,9 @@ mod tests {
             LogicalOperator::Projection(Projection::new(
                 30,
                 order,
-                vec![Expression::ColumnRef(ColumnRefExpression::new(
-                    ColumnBinding::new(10, 1),
-                    LogicalType::BigInt,
-                ))],
+                vec![Expression::ColumnRef(
+                    ColumnRefExpression::new(ColumnBinding::new(10, 1), LogicalType::BigInt).into(),
+                )],
             )),
         );
 
@@ -897,17 +897,26 @@ mod tests {
             &ctx,
             LogicalOperator::Filter(Filter::new(
                 input,
-                vec![Expression::Comparison(ComparisonExpression::new(
-                    ComparisonType::GreaterThan,
-                    Expression::ColumnRef(ColumnRefExpression::new(
-                        ColumnBinding::new(10, 0),
-                        LogicalType::Integer,
-                    )),
-                    Expression::ColumnRef(ColumnRefExpression::new(
-                        ColumnBinding::new(10, 0),
-                        LogicalType::Integer,
-                    )),
-                ))],
+                vec![Expression::Comparison(
+                    ComparisonExpression::new(
+                        ComparisonType::GreaterThan,
+                        Expression::ColumnRef(
+                            ColumnRefExpression::new(
+                                ColumnBinding::new(10, 0),
+                                LogicalType::Integer,
+                            )
+                            .into(),
+                        ),
+                        Expression::ColumnRef(
+                            ColumnRefExpression::new(
+                                ColumnBinding::new(10, 0),
+                                LogicalType::Integer,
+                            )
+                            .into(),
+                        ),
+                    )
+                    .into(),
+                )],
             )),
         );
         let plan = OwnedLogicalPlan::new(
@@ -915,10 +924,9 @@ mod tests {
             LogicalOperator::Projection(Projection::new(
                 30,
                 filter,
-                vec![Expression::ColumnRef(ColumnRefExpression::new(
-                    ColumnBinding::new(10, 1),
-                    LogicalType::BigInt,
-                ))],
+                vec![Expression::ColumnRef(
+                    ColumnRefExpression::new(ColumnBinding::new(10, 1), LogicalType::BigInt).into(),
+                )],
             )),
         );
 
@@ -948,17 +956,26 @@ mod tests {
             &ctx,
             LogicalOperator::Filter(Filter::new(
                 input,
-                vec![Expression::Comparison(ComparisonExpression::new(
-                    ComparisonType::GreaterThan,
-                    Expression::ColumnRef(ColumnRefExpression::new(
-                        ColumnBinding::new(99, 0),
-                        LogicalType::Integer,
-                    )),
-                    Expression::ColumnRef(ColumnRefExpression::new(
-                        ColumnBinding::new(99, 0),
-                        LogicalType::Integer,
-                    )),
-                ))],
+                vec![Expression::Comparison(
+                    ComparisonExpression::new(
+                        ComparisonType::GreaterThan,
+                        Expression::ColumnRef(
+                            ColumnRefExpression::new(
+                                ColumnBinding::new(99, 0),
+                                LogicalType::Integer,
+                            )
+                            .into(),
+                        ),
+                        Expression::ColumnRef(
+                            ColumnRefExpression::new(
+                                ColumnBinding::new(99, 0),
+                                LogicalType::Integer,
+                            )
+                            .into(),
+                        ),
+                    )
+                    .into(),
+                )],
             )),
         );
         let plan = OwnedLogicalPlan::new(
@@ -966,10 +983,9 @@ mod tests {
             LogicalOperator::Projection(Projection::new(
                 30,
                 filter,
-                vec![Expression::ColumnRef(ColumnRefExpression::new(
-                    ColumnBinding::new(10, 1),
-                    LogicalType::BigInt,
-                ))],
+                vec![Expression::ColumnRef(
+                    ColumnRefExpression::new(ColumnBinding::new(10, 1), LogicalType::BigInt).into(),
+                )],
             )),
         );
 
@@ -1016,17 +1032,26 @@ mod tests {
             &ctx,
             LogicalOperator::Filter(Filter::new(
                 cross,
-                vec![Expression::Comparison(ComparisonExpression::new(
-                    ComparisonType::GreaterThan,
-                    Expression::ColumnRef(ColumnRefExpression::new(
-                        ColumnBinding::new(10, 0),
-                        LogicalType::Integer,
-                    )),
-                    Expression::ColumnRef(ColumnRefExpression::new(
-                        ColumnBinding::new(10, 0),
-                        LogicalType::Integer,
-                    )),
-                ))],
+                vec![Expression::Comparison(
+                    ComparisonExpression::new(
+                        ComparisonType::GreaterThan,
+                        Expression::ColumnRef(
+                            ColumnRefExpression::new(
+                                ColumnBinding::new(10, 0),
+                                LogicalType::Integer,
+                            )
+                            .into(),
+                        ),
+                        Expression::ColumnRef(
+                            ColumnRefExpression::new(
+                                ColumnBinding::new(10, 0),
+                                LogicalType::Integer,
+                            )
+                            .into(),
+                        ),
+                    )
+                    .into(),
+                )],
             )),
         );
         let plan = OwnedLogicalPlan::new(
@@ -1034,10 +1059,9 @@ mod tests {
             LogicalOperator::Projection(Projection::new(
                 30,
                 filter,
-                vec![Expression::ColumnRef(ColumnRefExpression::new(
-                    ColumnBinding::new(10, 1),
-                    LogicalType::BigInt,
-                ))],
+                vec![Expression::ColumnRef(
+                    ColumnRefExpression::new(ColumnBinding::new(10, 1), LogicalType::BigInt).into(),
+                )],
             )),
         );
 

@@ -18,13 +18,15 @@ pub(crate) fn extract_payload_expression(
             .iter()
             .position(|existing| existing.equals(&expr))
         {
-            return Expression::Reference(ReferenceExpression::new(reference_index, return_type));
+            return Expression::Reference(
+                ReferenceExpression::new(reference_index, return_type).into(),
+            );
         }
     }
     let reference_index = projection_exprs.len();
     payload_types.push(return_type.clone());
     projection_exprs.push(expr);
-    Expression::Reference(ReferenceExpression::new(reference_index, return_type))
+    Expression::Reference(ReferenceExpression::new(reference_index, return_type).into())
 }
 
 pub(crate) fn can_use_perfect_hash_aggregate(
@@ -830,10 +832,13 @@ pub(crate) fn join_output_names(
 }
 
 pub(crate) fn explain_line_expression(line: impl Into<String>) -> Box<[Expression]> {
-    Box::new([Expression::Constant(ConstantExpression::new(
-        Value::Varchar(line.into()),
-        paro_common::types::LogicalType::Varchar,
-    ))])
+    Box::new([Expression::Constant(
+        ConstantExpression::new(
+            Value::Varchar(line.into()),
+            paro_common::types::LogicalType::Varchar,
+        )
+        .into(),
+    )])
 }
 
 pub(crate) fn is_graph_chain(plan: &OwnedLogicalPlan) -> bool {
@@ -1138,14 +1143,20 @@ mod output_name_tests {
             bind_context.generate_table_index(),
             OwnedLogicalPlan::new(&bind_context, LogicalOperator::DummyScan),
             vec![
-                Expression::Constant(ConstantExpression::new(
-                    paro_common::runtime_value::Value::Integer(1),
-                    LogicalType::Integer,
-                )),
-                Expression::Constant(ConstantExpression::new(
-                    paro_common::runtime_value::Value::Boolean(true),
-                    LogicalType::Boolean,
-                )),
+                Expression::Constant(
+                    ConstantExpression::new(
+                        paro_common::runtime_value::Value::Integer(1),
+                        LogicalType::Integer,
+                    )
+                    .into(),
+                ),
+                Expression::Constant(
+                    ConstantExpression::new(
+                        paro_common::runtime_value::Value::Boolean(true),
+                        LogicalType::Boolean,
+                    )
+                    .into(),
+                ),
             ],
         )
         .with_visible_names(vec!["visible".to_string()]);

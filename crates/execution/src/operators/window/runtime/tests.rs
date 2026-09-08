@@ -20,32 +20,27 @@ use super::build_window_output_chunks;
 use crate::physical::specs::WindowSpec;
 
 fn reference(index: usize, ty: LogicalType) -> Expression {
-    Expression::Reference(ReferenceExpression::new(index, ty))
+    Expression::Reference(ReferenceExpression::new(index, ty).into())
 }
 
 fn column_ref(index: usize, ty: LogicalType) -> Expression {
-    Expression::ColumnRef(ColumnRefExpression::new(ColumnBinding::new(7, index), ty))
+    Expression::ColumnRef(ColumnRefExpression::new(ColumnBinding::new(7, index), ty).into())
 }
 
 fn int_constant(value: i32) -> Expression {
-    Expression::Constant(ConstantExpression::new(
-        Value::Integer(value),
-        LogicalType::Integer,
-    ))
+    Expression::Constant(
+        ConstantExpression::new(Value::Integer(value), LogicalType::Integer).into(),
+    )
 }
 
 fn bigint_constant(value: i64) -> Expression {
-    Expression::Constant(ConstantExpression::new(
-        Value::BigInt(value),
-        LogicalType::BigInt,
-    ))
+    Expression::Constant(ConstantExpression::new(Value::BigInt(value), LogicalType::BigInt).into())
 }
 
 fn null_bigint_constant() -> Expression {
-    Expression::Constant(ConstantExpression::new(
-        Value::Null(LogicalType::BigInt),
-        LogicalType::BigInt,
-    ))
+    Expression::Constant(
+        ConstantExpression::new(Value::Null(LogicalType::BigInt), LogicalType::BigInt).into(),
+    )
 }
 
 fn rank_over(partition_idx: usize, order_idx: usize) -> WindowExpression {
@@ -455,7 +450,7 @@ fn window_breaker_rejects_non_direct_sort_expressions() {
         Vec::new(),
         vec![int_constant(1)],
         vec![OrderByExpression {
-            expression: Expression::Window(Box::new(rank_over(0, 1))),
+            expression: Expression::Window(rank_over(0, 1).into()),
             ascending: true,
             nulls_first: false,
         }],
@@ -475,7 +470,7 @@ fn window_breaker_rejects_non_direct_frame_offsets() {
         WindowFunction::last_value(LogicalType::Integer),
         vec![reference(0, LogicalType::Integer)],
         rows_frame(
-            WindowFrameBound::Offset(Box::new(Expression::Window(Box::new(rank_over(0, 1))))),
+            WindowFrameBound::Offset(Box::new(Expression::Window(rank_over(0, 1).into()))),
             true,
             WindowFrameBound::CurrentRow,
             false,
@@ -770,10 +765,10 @@ fn lead_and_lag_apply_ignore_nulls_while_navigating_the_partition() {
 fn rows_frame_offsets_reject_null_and_negative_values() {
     for (offset, expected) in [
         (
-            Expression::Constant(ConstantExpression::new(
-                Value::Null(LogicalType::Integer),
-                LogicalType::Integer,
-            )),
+            Expression::Constant(
+                ConstantExpression::new(Value::Null(LogicalType::Integer), LogicalType::Integer)
+                    .into(),
+            ),
             "window frame offset must not be null",
         ),
         (int_constant(-1), "window frame offset must not be negative"),

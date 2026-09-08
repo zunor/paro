@@ -214,11 +214,10 @@ mod tests {
 
     #[test]
     fn lateral_detection_ignores_local_correlations_from_same_scope() {
-        let expr = Expression::ColumnRef(ColumnRefExpression::with_depth(
-            ColumnBinding::new(10, 0),
-            LogicalType::Integer,
-            1,
-        ));
+        let expr = Expression::ColumnRef(
+            ColumnRefExpression::with_depth(ColumnBinding::new(10, 0), LogicalType::Integer, 1)
+                .into(),
+        );
 
         assert!(!expression_has_correlated_columns_at_depth(
             &expr,
@@ -229,11 +228,10 @@ mod tests {
 
     #[test]
     fn lateral_detection_only_matches_next_outer_scope() {
-        let expr = Expression::ColumnRef(ColumnRefExpression::with_depth(
-            ColumnBinding::new(10, 0),
-            LogicalType::Integer,
-            2,
-        ));
+        let expr = Expression::ColumnRef(
+            ColumnRefExpression::with_depth(ColumnBinding::new(10, 0), LogicalType::Integer, 2)
+                .into(),
+        );
 
         assert!(expression_has_correlated_columns_at_depth(
             &expr,
@@ -254,11 +252,10 @@ mod tests {
         let nested_right = LogicalOperator::Projection(crate::operator::Projection::new(
             20,
             crate::plan::OwnedLogicalPlan::new(&ctx, expression_get(30)),
-            vec![Expression::ColumnRef(ColumnRefExpression::with_depth(
-                ColumnBinding::new(10, 0),
-                LogicalType::Integer,
-                2,
-            ))],
+            vec![Expression::ColumnRef(
+                ColumnRefExpression::with_depth(ColumnBinding::new(10, 0), LogicalType::Integer, 2)
+                    .into(),
+            )],
         ));
         let dependent =
             LogicalOperator::DependentJoin(Box::new(crate::operator::DependentJoin::scalar(

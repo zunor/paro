@@ -2887,8 +2887,8 @@ mod tests {
         comparison: JoinComparisonType,
     ) -> JoinCondition {
         JoinCondition::new(
-            Expression::Reference(ReferenceExpression::new(left_idx, LogicalType::Integer)),
-            Expression::Reference(ReferenceExpression::new(right_idx, LogicalType::Integer)),
+            Expression::Reference(ReferenceExpression::new(left_idx, LogicalType::Integer).into()),
+            Expression::Reference(ReferenceExpression::new(right_idx, LogicalType::Integer).into()),
             comparison,
         )
     }

@@ -177,38 +177,44 @@ impl InClauseRewriter {
 
     fn rewrite_expression(&mut self, expr: Expression) -> Expression {
         match expr {
-            Expression::Function(mut function) => {
+            Expression::Function(function) => {
+                let mut function = function.into_inner();
                 function.children = function
                     .children
                     .into_iter()
                     .map(|child| self.rewrite_expression(child))
                     .collect();
-                Expression::Function(function)
+                Expression::Function(function.into())
             }
-            Expression::Cast(mut cast) => {
+            Expression::Cast(cast) => {
+                let mut cast = cast.into_inner();
                 cast.child = Box::new(self.rewrite_expression(*cast.child));
-                Expression::Cast(cast)
+                Expression::Cast(cast.into())
             }
-            Expression::Conjunction(mut conjunction) => {
+            Expression::Conjunction(conjunction) => {
+                let mut conjunction = conjunction.into_inner();
                 conjunction.children = conjunction
                     .children
                     .into_iter()
                     .map(|child| self.rewrite_expression(child))
                     .collect();
-                Expression::Conjunction(conjunction)
+                Expression::Conjunction(conjunction.into())
             }
-            Expression::Case(mut case) => {
+            Expression::Case(case) => {
+                let mut case = case.into_inner();
                 case.check = Box::new(self.rewrite_expression(*case.check));
                 case.result_if_true = Box::new(self.rewrite_expression(*case.result_if_true));
                 case.result_if_false = Box::new(self.rewrite_expression(*case.result_if_false));
-                Expression::Case(case)
+                Expression::Case(case.into())
             }
-            Expression::Comparison(mut comparison) => {
+            Expression::Comparison(comparison) => {
+                let mut comparison = comparison.into_inner();
                 comparison.left = Box::new(self.rewrite_expression(*comparison.left));
                 comparison.right = Box::new(self.rewrite_expression(*comparison.right));
-                Expression::Comparison(comparison)
+                Expression::Comparison(comparison.into())
             }
-            Expression::Operator(mut operator) => {
+            Expression::Operator(operator) => {
+                let mut operator = operator.into_inner();
                 operator.children = operator
                     .children
                     .into_iter()
@@ -216,7 +222,8 @@ impl InClauseRewriter {
                     .collect();
                 rewrite_in_operator(operator)
             }
-            Expression::Aggregate(mut aggregate) => {
+            Expression::Aggregate(aggregate) => {
+                let mut aggregate = aggregate.into_inner();
                 aggregate.children = aggregate
                     .children
                     .into_iter()
@@ -228,18 +235,19 @@ impl InClauseRewriter {
                 for order in &mut aggregate.order_bys {
                     order.expression = self.rewrite_expression(order.expression.clone());
                 }
-                Expression::Aggregate(aggregate)
+                Expression::Aggregate(aggregate.into())
             }
             Expression::Window(window) => {
-                Expression::Window(Box::new(self.rewrite_window_expression(*window)))
+                Expression::Window(self.rewrite_window_expression(window.into_inner()).into())
             }
-            Expression::Subquery(mut subquery) => {
+            Expression::Subquery(subquery) => {
+                let mut subquery = subquery.into_inner();
                 subquery.children = subquery
                     .children
                     .into_iter()
                     .map(|child| self.rewrite_expression(child))
                     .collect();
-                Expression::Subquery(subquery)
+                Expression::Subquery(subquery.into())
             }
             leaf => leaf,
         }
@@ -293,7 +301,7 @@ fn rewrite_in_operator(operator: OperatorExpression) -> Expression {
         OperatorType::In | OperatorType::NotIn
     ) || operator.children.len() != 2
     {
-        return Expression::Operator(operator);
+        return Expression::Operator(operator.into());
     }
     let negate = matches!(operator.operator_type, OperatorType::NotIn);
     build_single_item_in(operator.children, negate)
@@ -307,7 +315,7 @@ fn build_single_item_in(mut children: Vec<Expression>, negate: bool) -> Expressi
     };
     let rhs = children.pop().expect("single-item IN rhs");
     let lhs = children.pop().expect("single-item IN lhs");
-    Expression::Comparison(ComparisonExpression::new(comparison_type, lhs, rhs))
+    Expression::Comparison(ComparisonExpression::new(comparison_type, lhs, rhs).into())
 }
 
 fn rewrite_window_frame_bounds(
@@ -344,28 +352,37 @@ mod tests {
     }
 
     fn integer_column(table_index: usize, column_index: usize) -> Expression {
-        Expression::ColumnRef(ColumnRefExpression::new(
-            ColumnBinding::new(table_index, column_index),
-            LogicalType::Integer,
-        ))
+        Expression::ColumnRef(
+            ColumnRefExpression::new(
+                ColumnBinding::new(table_index, column_index),
+                LogicalType::Integer,
+            )
+            .into(),
+        )
     }
 
     fn int_constant(value: i32) -> Expression {
-        Expression::Constant(paro_planner::expression::ConstantExpression::new(
-            Value::Integer(value),
-            LogicalType::Integer,
-        ))
+        Expression::Constant(
+            paro_planner::expression::ConstantExpression::new(
+                Value::Integer(value),
+                LogicalType::Integer,
+            )
+            .into(),
+        )
     }
 
     #[test]
     fn rewrites_single_item_in_to_comparison() {
         let bind_context = BindContext::new();
         let child = integer_get(&bind_context, 0);
-        let expr = Expression::Operator(OperatorExpression::new(
-            OperatorType::In,
-            vec![integer_column(0, 0), int_constant(1)],
-            LogicalType::Boolean,
-        ));
+        let expr = Expression::Operator(
+            OperatorExpression::new(
+                OperatorType::In,
+                vec![integer_column(0, 0), int_constant(1)],
+                LogicalType::Boolean,
+            )
+            .into(),
+        );
         let plan = OwnedLogicalPlan::new(
             &bind_context,
             LogicalOperator::Filter(Filter::new(child, vec![expr])),
@@ -389,18 +406,21 @@ mod tests {
     fn preserves_large_constant_in_filter_for_execution_and_pushdown() {
         let bind_context = BindContext::new();
         let child = integer_get(&bind_context, 0);
-        let expr = Expression::Operator(OperatorExpression::new(
-            OperatorType::In,
-            vec![
-                integer_column(0, 0),
-                int_constant(1),
-                int_constant(2),
-                int_constant(3),
-                int_constant(4),
-                int_constant(5),
-            ],
-            LogicalType::Boolean,
-        ));
+        let expr = Expression::Operator(
+            OperatorExpression::new(
+                OperatorType::In,
+                vec![
+                    integer_column(0, 0),
+                    int_constant(1),
+                    int_constant(2),
+                    int_constant(3),
+                    int_constant(4),
+                    int_constant(5),
+                ],
+                LogicalType::Boolean,
+            )
+            .into(),
+        );
         let plan = OwnedLogicalPlan::new(
             &bind_context,
             LogicalOperator::Filter(Filter::new(child, vec![expr])),
@@ -430,18 +450,21 @@ mod tests {
         let bind_context = BindContext::new();
         let left = integer_get(&bind_context, 0);
         let right = integer_get(&bind_context, 1);
-        let condition = Expression::Operator(OperatorExpression::new(
-            OperatorType::In,
-            vec![
-                integer_column(0, 0),
-                int_constant(1),
-                int_constant(2),
-                int_constant(3),
-                int_constant(4),
-                int_constant(5),
-            ],
-            LogicalType::Boolean,
-        ));
+        let condition = Expression::Operator(
+            OperatorExpression::new(
+                OperatorType::In,
+                vec![
+                    integer_column(0, 0),
+                    int_constant(1),
+                    int_constant(2),
+                    int_constant(3),
+                    int_constant(4),
+                    int_constant(5),
+                ],
+                LogicalType::Boolean,
+            )
+            .into(),
+        );
         let join = Join::any(JoinType::Inner, left, right, condition);
         let plan = OwnedLogicalPlan::new(&bind_context, LogicalOperator::Join(join));
 

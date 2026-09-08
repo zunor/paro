@@ -147,17 +147,19 @@ mod tests {
     }
 
     fn int_column(table_index: usize, column_index: usize) -> Expression {
-        Expression::ColumnRef(ColumnRefExpression::new(
-            ColumnBinding::new(table_index, column_index),
-            LogicalType::Integer,
-        ))
+        Expression::ColumnRef(
+            ColumnRefExpression::new(
+                ColumnBinding::new(table_index, column_index),
+                LogicalType::Integer,
+            )
+            .into(),
+        )
     }
 
     fn int_constant(value: i32) -> Expression {
-        Expression::Constant(ConstantExpression::new(
-            Value::Integer(value),
-            LogicalType::Integer,
-        ))
+        Expression::Constant(
+            ConstantExpression::new(Value::Integer(value), LogicalType::Integer).into(),
+        )
     }
 
     fn comparison(
@@ -165,7 +167,7 @@ mod tests {
         left: Expression,
         right: Expression,
     ) -> Expression {
-        Expression::Comparison(ComparisonExpression::new(comparison_type, left, right))
+        Expression::Comparison(ComparisonExpression::new(comparison_type, left, right).into())
     }
 
     fn volatile_expression() -> Expression {
@@ -174,11 +176,7 @@ mod tests {
             .into_iter()
             .next()
             .expect("random overload");
-        Expression::Function(Box::new(FunctionExpression::new(
-            function,
-            vec![],
-            LogicalType::Double,
-        )))
+        Expression::Function(FunctionExpression::new(function, vec![], LogicalType::Double).into())
     }
 
     #[test]

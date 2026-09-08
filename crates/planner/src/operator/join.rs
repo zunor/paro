@@ -867,10 +867,10 @@ mod tests {
             right,
             vec![JoinCondition::new(
                 crate::expression::Expression::Reference(
-                    crate::expression::ReferenceExpression::new(0, LogicalType::Integer),
+                    crate::expression::ReferenceExpression::new(0, LogicalType::Integer).into(),
                 ),
                 crate::expression::Expression::Reference(
-                    crate::expression::ReferenceExpression::new(0, LogicalType::Integer),
+                    crate::expression::ReferenceExpression::new(0, LogicalType::Integer).into(),
                 ),
                 JoinComparisonType::NotDistinctFrom,
             )],
@@ -926,10 +926,13 @@ mod tests {
             JoinType::Mark,
             expression_get_plan(10, vec![LogicalType::Integer, LogicalType::BigInt]),
             expression_get_plan(20, vec![LogicalType::Varchar]),
-            crate::expression::Expression::Constant(crate::expression::ConstantExpression::new(
-                paro_common::runtime_value::Value::Boolean(true),
-                LogicalType::Boolean,
-            )),
+            crate::expression::Expression::Constant(
+                crate::expression::ConstantExpression::new(
+                    paro_common::runtime_value::Value::Boolean(true),
+                    LogicalType::Boolean,
+                )
+                .into(),
+            ),
         );
         join.left_projection_map = vec![1].into();
 
@@ -947,10 +950,13 @@ mod tests {
             JoinType::RightSemi,
             expression_get_plan(10, vec![LogicalType::Integer]),
             expression_get_plan(20, right_types.clone()),
-            crate::expression::Expression::Constant(crate::expression::ConstantExpression::new(
-                paro_common::runtime_value::Value::Boolean(true),
-                LogicalType::Boolean,
-            )),
+            crate::expression::Expression::Constant(
+                crate::expression::ConstantExpression::new(
+                    paro_common::runtime_value::Value::Boolean(true),
+                    LogicalType::Boolean,
+                )
+                .into(),
+            ),
         );
         right_semi.right_projection_map = vec![1].into();
         assert_eq!(right_semi.get_types(), vec![LogicalType::Boolean]);
@@ -959,10 +965,13 @@ mod tests {
             JoinType::RightAnti,
             expression_get_plan(10, vec![LogicalType::Integer]),
             expression_get_plan(20, right_types.clone()),
-            crate::expression::Expression::Constant(crate::expression::ConstantExpression::new(
-                paro_common::runtime_value::Value::Boolean(true),
-                LogicalType::Boolean,
-            )),
+            crate::expression::Expression::Constant(
+                crate::expression::ConstantExpression::new(
+                    paro_common::runtime_value::Value::Boolean(true),
+                    LogicalType::Boolean,
+                )
+                .into(),
+            ),
         );
         assert_eq!(right_anti.get_types(), right_types);
     }
@@ -986,10 +995,13 @@ mod tests {
             JoinType::Inner,
             left,
             right,
-            crate::expression::Expression::Constant(crate::expression::ConstantExpression::new(
-                paro_common::runtime_value::Value::Boolean(true),
-                LogicalType::Boolean,
-            )),
+            crate::expression::Expression::Constant(
+                crate::expression::ConstantExpression::new(
+                    paro_common::runtime_value::Value::Boolean(true),
+                    LogicalType::Boolean,
+                )
+                .into(),
+            ),
         );
         any.left_projection_map = vec![1].into();
         any.right_projection_map = vec![0].into();

@@ -298,10 +298,9 @@ fn apply_matched_prefix_rewrite(
             .expressions
             .get_mut(output_index)
             .ok_or_else(|| rewrite_invariant("matched-prefix output ordinal is stale"))?;
-        *expression = Expression::ColumnRef(ColumnRefExpression::new(
-            derived_binding,
-            LogicalType::Varchar,
-        ));
+        *expression = Expression::ColumnRef(
+            ColumnRefExpression::new(derived_binding, LogicalType::Varchar).into(),
+        );
     }
     output.returned_types = output
         .expressions
@@ -1202,7 +1201,7 @@ fn apply_rewrite(
     )
     .ok_or_else(|| rewrite_invariant("rowid witness no longer matches aggregate source"))?;
     let rowid_expression =
-        Expression::ColumnRef(ColumnRefExpression::new(rowid_binding, LogicalType::BigInt));
+        Expression::ColumnRef(ColumnRefExpression::new(rowid_binding, LogicalType::BigInt).into());
 
     let dependent = aggregate
         .group_dependencies
@@ -1258,10 +1257,13 @@ fn apply_rewrite(
         if column.binding.table_index == aggregate.group_index {
             let old_group = column.binding.column_index;
             if let Some(&catalog_column) = candidate.dependent_catalog_columns.get(&old_group) {
-                final_expressions.push(Expression::ColumnRef(ColumnRefExpression::new(
-                    ColumnBinding::new(materialized_table_index, catalog_column),
-                    column.return_type.clone(),
-                )));
+                final_expressions.push(Expression::ColumnRef(
+                    ColumnRefExpression::new(
+                        ColumnBinding::new(materialized_table_index, catalog_column),
+                        column.return_type.clone(),
+                    )
+                    .into(),
+                ));
                 continue;
             }
             let new_group = old_to_new
@@ -1270,16 +1272,22 @@ fn apply_rewrite(
                 .flatten()
                 .ok_or_else(|| rewrite_invariant("aggregate group remap is incomplete"))?;
             let carrier_index = carrier_expressions.len();
-            carrier_expressions.push(Expression::ColumnRef(ColumnRefExpression::new(
-                ColumnBinding::new(aggregate.group_index, new_group),
-                column.return_type.clone(),
-            )));
+            carrier_expressions.push(Expression::ColumnRef(
+                ColumnRefExpression::new(
+                    ColumnBinding::new(aggregate.group_index, new_group),
+                    column.return_type.clone(),
+                )
+                .into(),
+            ));
             carrier_names.push(format!("late_group_{new_group}"));
             output_to_carrier[output_index] = Some(carrier_index);
-            final_expressions.push(Expression::ColumnRef(ColumnRefExpression::new(
-                ColumnBinding::new(carrier_table_index, carrier_index),
-                column.return_type.clone(),
-            )));
+            final_expressions.push(Expression::ColumnRef(
+                ColumnRefExpression::new(
+                    ColumnBinding::new(carrier_table_index, carrier_index),
+                    column.return_type.clone(),
+                )
+                .into(),
+            ));
             continue;
         }
         if column.binding.table_index == aggregate.aggregate_index {
@@ -1287,10 +1295,13 @@ fn apply_rewrite(
             carrier_expressions.push(expression.clone());
             carrier_names.push(format!("late_aggregate_{}", column.binding.column_index));
             output_to_carrier[output_index] = Some(carrier_index);
-            final_expressions.push(Expression::ColumnRef(ColumnRefExpression::new(
-                ColumnBinding::new(carrier_table_index, carrier_index),
-                column.return_type.clone(),
-            )));
+            final_expressions.push(Expression::ColumnRef(
+                ColumnRefExpression::new(
+                    ColumnBinding::new(carrier_table_index, carrier_index),
+                    column.return_type.clone(),
+                )
+                .into(),
+            ));
             continue;
         }
         return Err(rewrite_invariant(
@@ -1311,10 +1322,13 @@ fn apply_rewrite(
     }
 
     let rowid_carrier_index = carrier_expressions.len();
-    carrier_expressions.push(Expression::ColumnRef(ColumnRefExpression::new(
-        ColumnBinding::new(aggregate.group_index, rowid_group_index),
-        LogicalType::BigInt,
-    )));
+    carrier_expressions.push(Expression::ColumnRef(
+        ColumnRefExpression::new(
+            ColumnBinding::new(aggregate.group_index, rowid_group_index),
+            LogicalType::BigInt,
+        )
+        .into(),
+    ));
     carrier_names.push("__late_rowid".to_string());
 
     let needed_columns = projected_output_indices
@@ -1365,10 +1379,13 @@ fn apply_rewrite(
             carrier_table_index,
             vec![RowFetchSource {
                 materialized_table_index,
-                rowid: Expression::ColumnRef(ColumnRefExpression::new(
-                    ColumnBinding::new(carrier_table_index, rowid_carrier_index),
-                    LogicalType::BigInt,
-                )),
+                rowid: Expression::ColumnRef(
+                    ColumnRefExpression::new(
+                        ColumnBinding::new(carrier_table_index, rowid_carrier_index),
+                        LogicalType::BigInt,
+                    )
+                    .into(),
+                ),
                 table: candidate.table,
                 needed_columns: needed_columns
                     .into_iter()
@@ -1491,10 +1508,9 @@ fn apply_row_preserving_rewrite(
     }
     for source in &mut sources {
         source.narrow_rowid_index = narrow_expressions.len();
-        narrow_expressions.push(Expression::ColumnRef(ColumnRefExpression::new(
-            source.rowid_binding,
-            LogicalType::BigInt,
-        )));
+        narrow_expressions.push(Expression::ColumnRef(
+            ColumnRefExpression::new(source.rowid_binding, LogicalType::BigInt).into(),
+        ));
         narrow_names.push(format!("__late_rowid_{}", source.source.source_table_index));
     }
     let narrow = Projection::new(narrow_table_index, *output.child, narrow_expressions)
@@ -1522,10 +1538,13 @@ fn apply_row_preserving_rewrite(
                 .ordered_table_index
                 .ok_or_else(|| rewrite_invariant("ordered payload namespace is missing"))?;
             let topn_index = topn_expressions.len();
-            topn_expressions.push(Expression::ColumnRef(ColumnRefExpression::new(
-                ColumnBinding::new(materialized_table_index, catalog_column),
-                expression.return_type(),
-            )));
+            topn_expressions.push(Expression::ColumnRef(
+                ColumnRefExpression::new(
+                    ColumnBinding::new(materialized_table_index, catalog_column),
+                    expression.return_type(),
+                )
+                .into(),
+            ));
             topn_names.push(output_names[output_index].clone());
             output_to_topn[output_index] = Some(topn_index);
             continue;
@@ -1544,10 +1563,13 @@ fn apply_row_preserving_rewrite(
             .copied()
             .flatten()
             .ok_or_else(|| rewrite_invariant("ordinary output has no narrow carrier column"))?;
-        topn_expressions.push(Expression::ColumnRef(ColumnRefExpression::new(
-            ColumnBinding::new(narrow_table_index, narrow_output),
-            expression.return_type(),
-        )));
+        topn_expressions.push(Expression::ColumnRef(
+            ColumnRefExpression::new(
+                ColumnBinding::new(narrow_table_index, narrow_output),
+                expression.return_type(),
+            )
+            .into(),
+        ));
         topn_names.push(output_names[output_index].clone());
         output_to_topn[output_index] = Some(topn_index);
     }
@@ -1556,10 +1578,13 @@ fn apply_row_preserving_rewrite(
             continue;
         }
         source.topn_rowid_index = Some(topn_expressions.len());
-        topn_expressions.push(Expression::ColumnRef(ColumnRefExpression::new(
-            ColumnBinding::new(narrow_table_index, source.narrow_rowid_index),
-            LogicalType::BigInt,
-        )));
+        topn_expressions.push(Expression::ColumnRef(
+            ColumnRefExpression::new(
+                ColumnBinding::new(narrow_table_index, source.narrow_rowid_index),
+                LogicalType::BigInt,
+            )
+            .into(),
+        ));
         topn_names.push(format!("__late_rowid_{}", source.source.source_table_index));
     }
     let ordered_fetch_sources = sources
@@ -1569,10 +1594,13 @@ fn apply_row_preserving_rewrite(
                 .ordered_table_index
                 .map(|materialized_table_index| RowFetchSource {
                     materialized_table_index,
-                    rowid: Expression::ColumnRef(ColumnRefExpression::new(
-                        ColumnBinding::new(narrow_table_index, source.narrow_rowid_index),
-                        LogicalType::BigInt,
-                    )),
+                    rowid: Expression::ColumnRef(
+                        ColumnRefExpression::new(
+                            ColumnBinding::new(narrow_table_index, source.narrow_rowid_index),
+                            LogicalType::BigInt,
+                        )
+                        .into(),
+                    ),
                     table: source.source.table.clone(),
                     needed_columns: source
                         .source
@@ -1648,20 +1676,26 @@ fn apply_row_preserving_rewrite(
             let output_table_index = source
                 .output_table_index
                 .ok_or_else(|| rewrite_invariant("output payload namespace is missing"))?;
-            final_expressions.push(Expression::ColumnRef(ColumnRefExpression::new(
-                ColumnBinding::new(output_table_index, catalog_column),
-                expression.return_type(),
-            )));
+            final_expressions.push(Expression::ColumnRef(
+                ColumnRefExpression::new(
+                    ColumnBinding::new(output_table_index, catalog_column),
+                    expression.return_type(),
+                )
+                .into(),
+            ));
         } else {
             let topn_output = output_to_topn
                 .get(output_index)
                 .copied()
                 .flatten()
                 .ok_or_else(|| rewrite_invariant("ordinary output is absent from TopN carrier"))?;
-            final_expressions.push(Expression::ColumnRef(ColumnRefExpression::new(
-                ColumnBinding::new(topn_table_index, topn_output),
-                expression.return_type(),
-            )));
+            final_expressions.push(Expression::ColumnRef(
+                ColumnRefExpression::new(
+                    ColumnBinding::new(topn_table_index, topn_output),
+                    expression.return_type(),
+                )
+                .into(),
+            ));
         }
     }
     let mut output_fetch_sources = Vec::new();
@@ -1674,10 +1708,13 @@ fn apply_row_preserving_rewrite(
             .ok_or_else(|| rewrite_invariant("output payload rowid is absent from TopN carrier"))?;
         output_fetch_sources.push(RowFetchSource {
             materialized_table_index,
-            rowid: Expression::ColumnRef(ColumnRefExpression::new(
-                ColumnBinding::new(topn_table_index, rowid_index),
-                LogicalType::BigInt,
-            )),
+            rowid: Expression::ColumnRef(
+                ColumnRefExpression::new(
+                    ColumnBinding::new(topn_table_index, rowid_index),
+                    LogicalType::BigInt,
+                )
+                .into(),
+            ),
             table: source.source.table,
             needed_columns: source
                 .source
@@ -1796,7 +1833,9 @@ fn apply_selective_projection_rewrite(
     let carrier_table_index = bind_context.generate_table_index();
     let mut carrier_expressions = ordinary
         .iter()
-        .map(|(binding, ty)| Expression::ColumnRef(ColumnRefExpression::new(*binding, ty.clone())))
+        .map(|(binding, ty)| {
+            Expression::ColumnRef(ColumnRefExpression::new(*binding, ty.clone()).into())
+        })
         .collect::<Vec<_>>();
     let mut carrier_names = (0..carrier_expressions.len())
         .map(|index| format!("late_carrier_{index}"))
@@ -1804,10 +1843,9 @@ fn apply_selective_projection_rewrite(
     let mut rowid_indices = Vec::with_capacity(sources.len());
     for source in &sources {
         rowid_indices.push(carrier_expressions.len());
-        carrier_expressions.push(Expression::ColumnRef(ColumnRefExpression::new(
-            source.rowid_binding,
-            LogicalType::BigInt,
-        )));
+        carrier_expressions.push(Expression::ColumnRef(
+            ColumnRefExpression::new(source.rowid_binding, LogicalType::BigInt).into(),
+        ));
         carrier_names.push(format!("__late_rowid_{}", source.source.source_table_index));
     }
 
@@ -1817,16 +1855,22 @@ fn apply_selective_projection_rewrite(
                 return None;
             }
             if let Some((table_index, catalog_column, ty)) = delayed.get(&column.binding) {
-                return Some(Expression::ColumnRef(ColumnRefExpression::new(
-                    ColumnBinding::new(*table_index, *catalog_column),
-                    ty.clone(),
-                )));
+                return Some(Expression::ColumnRef(
+                    ColumnRefExpression::new(
+                        ColumnBinding::new(*table_index, *catalog_column),
+                        ty.clone(),
+                    )
+                    .into(),
+                ));
             }
             ordinary_index.get(&column.binding).map(|&index| {
-                Expression::ColumnRef(ColumnRefExpression::new(
-                    ColumnBinding::new(carrier_table_index, index),
-                    column.return_type.clone(),
-                ))
+                Expression::ColumnRef(
+                    ColumnRefExpression::new(
+                        ColumnBinding::new(carrier_table_index, index),
+                        column.return_type.clone(),
+                    )
+                    .into(),
+                )
             })
         });
     }
@@ -1851,10 +1895,13 @@ fn apply_selective_projection_rewrite(
         .zip(rowid_indices)
         .map(|(source, rowid_index)| RowFetchSource {
             materialized_table_index: source.materialized_table_index,
-            rowid: Expression::ColumnRef(ColumnRefExpression::new(
-                ColumnBinding::new(carrier_table_index, rowid_index),
-                LogicalType::BigInt,
-            )),
+            rowid: Expression::ColumnRef(
+                ColumnRefExpression::new(
+                    ColumnBinding::new(carrier_table_index, rowid_index),
+                    LogicalType::BigInt,
+                )
+                .into(),
+            ),
             table: source.source.table,
             needed_columns: source
                 .source

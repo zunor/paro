@@ -162,24 +162,33 @@ mod tests {
     }
 
     fn create_constant_expr(value: i64) -> Expression {
-        Expression::Constant(ConstantExpression {
-            value: Value::BigInt(value),
-            return_type: LogicalType::BigInt,
-        })
+        Expression::Constant(
+            ConstantExpression {
+                value: Value::BigInt(value),
+                return_type: LogicalType::BigInt,
+            }
+            .into(),
+        )
     }
 
     fn create_projection(child: LogicalOperator) -> LogicalOperator {
         LogicalOperator::Projection(Projection {
             table_index: 1,
             expressions: vec![
-                Expression::Constant(ConstantExpression {
-                    value: Value::Integer(0),
-                    return_type: LogicalType::Integer,
-                }),
-                Expression::Constant(ConstantExpression {
-                    value: Value::Integer(1),
-                    return_type: LogicalType::Integer,
-                }),
+                Expression::Constant(
+                    ConstantExpression {
+                        value: Value::Integer(0),
+                        return_type: LogicalType::Integer,
+                    }
+                    .into(),
+                ),
+                Expression::Constant(
+                    ConstantExpression {
+                        value: Value::Integer(1),
+                        return_type: LogicalType::Integer,
+                    }
+                    .into(),
+                ),
             ],
             visible_names: vec!["id".to_string(), "name".to_string()],
             visible_count: 2,
@@ -198,11 +207,9 @@ mod tests {
         LogicalOperator::Projection(Projection::new(
             1,
             OwnedLogicalPlan::synthetic(child),
-            vec![Expression::Function(Box::new(FunctionExpression::new(
-                function,
-                vec![],
-                LogicalType::Double,
-            )))],
+            vec![Expression::Function(
+                FunctionExpression::new(function, vec![], LogicalType::Double).into(),
+            )],
         ))
     }
 

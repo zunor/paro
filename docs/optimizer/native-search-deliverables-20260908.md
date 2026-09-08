@@ -63,8 +63,14 @@ target has been attained; do not treat this ledger as a completion claim.
   precedence; entering another mandatory grant phase does not refresh the
   optional clock. Work budgets were not lowered.
 - Scalar conjunction lowering visits maximal associative runs once. A 10,000
-  term test checks linear interned-node growth. General owned scalar cloning
-  and destruction have not yet acquired the same stack-safety contract.
+  term test checks linear interned-node growth. Executable expression nodes now
+  share immutable payloads: an `Expression` is a 16-byte tag/handle, and mutation
+  detaches one node without cloning its descendants. Last-owner destruction
+  follows the exhaustive scalar child contract iteratively, including aggregate
+  modifiers and window frames. Small-stack tests cover 10,000-level cloning,
+  mutation and release, exponentially many paths through a linear shared DAG,
+  and concurrent last-owner release. This does not by itself remove the native
+  rule/owned-IR boundary or prove a cold-latency improvement.
 - Arena rollback no longer scans unaffected settlement recipes. Search ledger
   checkpoints use a mutation journal, not whole-ledger copies. Ledger writes
   do not invalidate logical facts. Demand analysis reads borrowed child layouts
@@ -129,6 +135,9 @@ performance target. Later changes need a new execution comparison.
 - `19d80c63`: 28 column-statistics tests and 966 optimizer library tests passed;
   workspace/all-target Clippy passed. Three deterministic graph lifetime tests
   cover publication between phases, next-statement revalidation and pin release.
+- Shared scalar ownership migration: full workspace **6,423 passed, 85 ignored**;
+  workspace/all-target Clippy passed. SQL/cold measurements still need a rebuilt
+  server from this migration before they can qualify it.
 
 For SQL regress, set `ulimit -n 8192` in **both** the server shell and runner
 shell. Restart-control cases inherit the runner's limit. Use the regression

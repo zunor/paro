@@ -872,7 +872,7 @@ mod tests {
             row_semantics: RowSemantics::RowPreserving,
             may_block: false,
         };
-        let expr = Expression::Function(Box::new(
+        let expr = Expression::Function(
             FunctionExpression::new(
                 ScalarFunction::new(
                     "add_one".to_string(),
@@ -880,10 +880,9 @@ mod tests {
                     LogicalType::Integer,
                     add_one,
                 ),
-                vec![Expression::Reference(ReferenceExpression::new(
-                    0,
-                    LogicalType::Integer,
-                ))],
+                vec![Expression::Reference(
+                    ReferenceExpression::new(0, LogicalType::Integer).into(),
+                )],
                 LogicalType::Integer,
             )
             .with_routine_meta(BoundRoutineCallMeta {
@@ -898,8 +897,9 @@ mod tests {
                     row_semantics: RowSemantics::RowPreserving,
                 },
                 spec: None,
-            }),
-        ));
+            })
+            .into(),
+        );
 
         ExternalProjectExpression {
             output_name: "__ext".to_string(),

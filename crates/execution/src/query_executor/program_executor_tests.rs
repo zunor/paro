@@ -59,10 +59,13 @@ use tokio_util::sync::CancellationToken;
 #[test]
 fn execute_program_uses_compiled_parameter_bindings() {
     let ctx = BindContext::new();
-    let param = Expression::Parameter(ParameterExpression::new(ParameterSlot::new(
-        RuntimeParamId::new(0),
-        LogicalType::Integer,
-    )));
+    let param = Expression::Parameter(
+        ParameterExpression::new(ParameterSlot::new(
+            RuntimeParamId::new(0),
+            LogicalType::Integer,
+        ))
+        .into(),
+    );
     let logical = OwnedLogicalPlan::new(
         &ctx,
         LogicalOperator::ExpressionGet(ExpressionGet::new(
@@ -1086,8 +1089,8 @@ fn hash_join_logical_plan(row_count: usize) -> OwnedLogicalPlan {
     let left = int_values(&ctx, 0, vec!["lk", "lv"], left_rows);
     let right = int_values(&ctx, 1, vec!["rk", "rv"], right_rows);
     let condition = JoinCondition::equality(
-        Expression::Reference(ReferenceExpression::new(0, LogicalType::Integer)),
-        Expression::Reference(ReferenceExpression::new(0, LogicalType::Integer)),
+        Expression::Reference(ReferenceExpression::new(0, LogicalType::Integer).into()),
+        Expression::Reference(ReferenceExpression::new(0, LogicalType::Integer).into()),
     );
     OwnedLogicalPlan::new(
         &ctx,
@@ -1108,7 +1111,7 @@ fn sort_logical_plan(row_count: usize) -> OwnedLogicalPlan {
         .collect::<Vec<_>>();
     let values = int_values(&ctx, 0, vec!["v"], rows);
     let order = OrderByNode {
-        expression: Expression::Reference(ReferenceExpression::new(0, LogicalType::Integer)),
+        expression: Expression::Reference(ReferenceExpression::new(0, LogicalType::Integer).into()),
         ascending: true,
         nulls_first: false,
     };
@@ -1131,16 +1134,18 @@ fn grouped_aggregate_logical_plan(row_count: usize) -> OwnedLogicalPlan {
             2,
             3,
             values,
-            vec![Expression::Reference(ReferenceExpression::new(
-                0,
-                LogicalType::Integer,
-            ))],
+            vec![Expression::Reference(
+                ReferenceExpression::new(0, LogicalType::Integer).into(),
+            )],
             Vec::new(),
-            vec![Expression::Aggregate(Box::new(AggregateExpression::new(
-                get_count_star_function(),
-                Vec::new(),
-                LogicalType::BigInt,
-            )))],
+            vec![Expression::Aggregate(
+                AggregateExpression::new(
+                    get_count_star_function(),
+                    Vec::new(),
+                    LogicalType::BigInt,
+                )
+                .into(),
+            )],
             Vec::new(),
         ))),
     )
@@ -1165,10 +1170,9 @@ fn int_values(
 }
 
 fn int_constant(value: i32) -> Expression {
-    Expression::Constant(ConstantExpression::new(
-        Value::Integer(value),
-        LogicalType::Integer,
-    ))
+    Expression::Constant(
+        ConstantExpression::new(Value::Integer(value), LogicalType::Integer).into(),
+    )
 }
 
 fn materialized_statement(

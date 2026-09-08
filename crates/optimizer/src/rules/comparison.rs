@@ -120,10 +120,13 @@ fn simplify_comparison(comp: &ComparisonExpression) -> RuleResult {
             }
             _ => {
                 // Regular comparison with NULL returns NULL
-                RuleResult::Changed(Box::new(Expression::Constant(ConstantExpression {
-                    value: Value::Null(LogicalType::Boolean),
-                    return_type: LogicalType::Boolean,
-                })))
+                RuleResult::Changed(Box::new(Expression::Constant(
+                    ConstantExpression {
+                        value: Value::Null(LogicalType::Boolean),
+                        return_type: LogicalType::Boolean,
+                    }
+                    .into(),
+                )))
             }
         }
     } else if is_null_safe_self_comparison(comp) {
@@ -153,11 +156,10 @@ fn simplify_not_comparison(inner: &Expression) -> RuleResult {
         ComparisonType::NotDistinctFrom => ComparisonType::DistinctFrom,
     };
 
-    RuleResult::Changed(Box::new(Expression::Comparison(ComparisonExpression::new(
-        inverted_type,
-        (*comp.left).clone(),
-        (*comp.right).clone(),
-    ))))
+    RuleResult::Changed(Box::new(Expression::Comparison(
+        ComparisonExpression::new(inverted_type, (*comp.left).clone(), (*comp.right).clone())
+            .into(),
+    )))
 }
 
 /// Simplify self-comparison (x op x).
@@ -169,10 +171,13 @@ fn simplify_self_comparison(comp_type: ComparisonType) -> RuleResult {
     };
 
     match result {
-        Some(value) => RuleResult::Changed(Box::new(Expression::Constant(ConstantExpression {
-            value: Value::Boolean(value),
-            return_type: LogicalType::Boolean,
-        }))),
+        Some(value) => RuleResult::Changed(Box::new(Expression::Constant(
+            ConstantExpression {
+                value: Value::Boolean(value),
+                return_type: LogicalType::Boolean,
+            }
+            .into(),
+        ))),
         None => RuleResult::NoChange,
     }
 }
@@ -202,28 +207,37 @@ mod tests {
     use paro_planner::expression::OperatorExpression;
 
     fn make_constant(value: i32) -> Expression {
-        Expression::Constant(ConstantExpression {
-            value: Value::Integer(value),
-            return_type: LogicalType::Integer,
-        })
+        Expression::Constant(
+            ConstantExpression {
+                value: Value::Integer(value),
+                return_type: LogicalType::Integer,
+            }
+            .into(),
+        )
     }
 
     fn make_null_constant() -> Expression {
-        Expression::Constant(ConstantExpression {
-            value: Value::Null(LogicalType::Integer),
-            return_type: LogicalType::Integer,
-        })
+        Expression::Constant(
+            ConstantExpression {
+                value: Value::Null(LogicalType::Integer),
+                return_type: LogicalType::Integer,
+            }
+            .into(),
+        )
     }
 
     fn make_column_ref(table_index: usize, column_index: usize) -> Expression {
-        Expression::ColumnRef(ColumnRefExpression {
-            binding: paro_planner::operator::ColumnBinding {
-                table_index,
-                column_index,
-            },
-            depth: 0,
-            return_type: LogicalType::Integer,
-        })
+        Expression::ColumnRef(
+            ColumnRefExpression {
+                binding: paro_planner::operator::ColumnBinding {
+                    table_index,
+                    column_index,
+                },
+                depth: 0,
+                return_type: LogicalType::Integer,
+            }
+            .into(),
+        )
     }
 
     fn make_comparison(
@@ -231,15 +245,13 @@ mod tests {
         left: Expression,
         right: Expression,
     ) -> Expression {
-        Expression::Comparison(ComparisonExpression::new(comp_type, left, right))
+        Expression::Comparison(ComparisonExpression::new(comp_type, left, right).into())
     }
 
     fn make_not(child: Expression) -> Expression {
-        Expression::Operator(OperatorExpression::new_unary(
-            OperatorType::Not,
-            child,
-            LogicalType::Boolean,
-        ))
+        Expression::Operator(
+            OperatorExpression::new_unary(OperatorType::Not, child, LogicalType::Boolean).into(),
+        )
     }
 
     fn make_volatile_call() -> Expression {
@@ -248,11 +260,7 @@ mod tests {
             .into_iter()
             .next()
             .expect("random overload");
-        Expression::Function(Box::new(FunctionExpression::new(
-            function,
-            vec![],
-            LogicalType::Double,
-        )))
+        Expression::Function(FunctionExpression::new(function, vec![], LogicalType::Double).into())
     }
 
     #[test]
@@ -305,10 +313,13 @@ mod tests {
         let expr = make_comparison(
             ComparisonType::Equal,
             make_volatile_call(),
-            Expression::Constant(ConstantExpression {
-                value: Value::Null(LogicalType::Double),
-                return_type: LogicalType::Double,
-            }),
+            Expression::Constant(
+                ConstantExpression {
+                    value: Value::Null(LogicalType::Double),
+                    return_type: LogicalType::Double,
+                }
+                .into(),
+            ),
         );
         let mut bindings = Vec::new();
         assert!(rule.matcher().matches(&expr, &mut bindings));

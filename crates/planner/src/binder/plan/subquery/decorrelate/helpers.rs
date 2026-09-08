@@ -4,7 +4,7 @@
 //! Shared helpers for dependent-join decorrelation (pushdown + lateral flatten).
 
 use crate::binder::Binder;
-use crate::expression::{ConstantExpression, Expression};
+use crate::expression::Expression;
 use crate::operator::{Filter, JoinType, LogicalOperator};
 use crate::plan::OwnedLogicalPlan;
 use paro_common::runtime_value::Value;
@@ -41,9 +41,6 @@ pub(super) fn push_filter_to_child(
 pub(super) fn should_eliminate_join_condition(expr: &Expression) -> bool {
     matches!(
         expr,
-        Expression::Constant(ConstantExpression {
-            value: Value::Boolean(true),
-            ..
-        })
+        Expression::Constant(constant) if constant.value == Value::Boolean(true)
     )
 }

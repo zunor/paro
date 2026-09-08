@@ -3072,47 +3072,59 @@ mod tests {
     }
 
     fn scalar_subquery_check_expr(row_count: i64) -> Expression {
-        Expression::Operator(OperatorExpression::new(
-            OperatorType::ErrorIfMultipleRows,
-            vec![
-                Expression::Constant(ConstantExpression {
-                    value: Value::Integer(42),
-                    return_type: LogicalType::Integer,
-                }),
-                Expression::Constant(ConstantExpression {
-                    value: Value::BigInt(row_count),
-                    return_type: LogicalType::BigInt,
-                }),
-            ],
-            LogicalType::Integer,
-        ))
+        Expression::Operator(
+            OperatorExpression::new(
+                OperatorType::ErrorIfMultipleRows,
+                vec![
+                    Expression::Constant(
+                        ConstantExpression {
+                            value: Value::Integer(42),
+                            return_type: LogicalType::Integer,
+                        }
+                        .into(),
+                    ),
+                    Expression::Constant(
+                        ConstantExpression {
+                            value: Value::BigInt(row_count),
+                            return_type: LogicalType::BigInt,
+                        }
+                        .into(),
+                    ),
+                ],
+                LogicalType::Integer,
+            )
+            .into(),
+        )
     }
 
     fn unflattened_subquery_expr() -> Expression {
-        Expression::Subquery(SubqueryExpression {
-            subquery_type: SubqueryType::Scalar,
-            subquery: Arc::new(PlannedStatement {
-                types: vec![LogicalType::Integer],
-                names: vec!["v".to_string()],
-                plan: OwnedLogicalPlan::new(
-                    &BindContext::new(),
-                    LogicalOperator::ExpressionGet(ExpressionGet::new(
-                        99,
-                        vec![],
-                        vec!["v".to_string()],
-                        vec![LogicalType::Integer],
-                    )),
-                ),
-            }),
-            children: vec![],
-            child_types: vec![],
-            child_targets: vec![],
-            comparison_type: paro_planner::expression::ComparisonType::Equal,
-            return_type: LogicalType::Integer,
-            correlated_columns: vec![],
-            bind_snapshot: BindContext::new().snapshot(),
-            planning_state: SubqueryPlanningState::Unplanned,
-        })
+        Expression::Subquery(
+            SubqueryExpression {
+                subquery_type: SubqueryType::Scalar,
+                subquery: Arc::new(PlannedStatement {
+                    types: vec![LogicalType::Integer],
+                    names: vec!["v".to_string()],
+                    plan: OwnedLogicalPlan::new(
+                        &BindContext::new(),
+                        LogicalOperator::ExpressionGet(ExpressionGet::new(
+                            99,
+                            vec![],
+                            vec!["v".to_string()],
+                            vec![LogicalType::Integer],
+                        )),
+                    ),
+                }),
+                children: vec![],
+                child_types: vec![],
+                child_targets: vec![],
+                comparison_type: paro_planner::expression::ComparisonType::Equal,
+                return_type: LogicalType::Integer,
+                correlated_columns: vec![],
+                bind_snapshot: BindContext::new().snapshot(),
+                planning_state: SubqueryPlanningState::Unplanned,
+            }
+            .into(),
+        )
     }
 
     fn integer_chunk(values: &[i32]) -> Chunk {
@@ -3167,31 +3179,35 @@ mod tests {
     }
 
     fn constant_i32(value: i32) -> Expression {
-        Expression::Constant(ConstantExpression::new(
-            Value::Integer(value),
-            LogicalType::Integer,
-        ))
+        Expression::Constant(
+            ConstantExpression::new(Value::Integer(value), LogicalType::Integer).into(),
+        )
     }
 
     fn constant_varchar(value: &str) -> Expression {
-        Expression::Constant(ConstantExpression::new(
-            Value::Varchar(value.to_string()),
-            LogicalType::Varchar,
-        ))
+        Expression::Constant(
+            ConstantExpression::new(Value::Varchar(value.to_string()), LogicalType::Varchar).into(),
+        )
     }
 
     fn parameter_i32(index: usize) -> Expression {
-        Expression::Parameter(ParameterExpression::new(ParameterSlot::new(
-            RuntimeParamId::new(index),
-            LogicalType::Integer,
-        )))
+        Expression::Parameter(
+            ParameterExpression::new(ParameterSlot::new(
+                RuntimeParamId::new(index),
+                LogicalType::Integer,
+            ))
+            .into(),
+        )
     }
 
     fn parameter_bool(index: usize) -> Expression {
-        Expression::Parameter(ParameterExpression::new(ParameterSlot::new(
-            RuntimeParamId::new(index),
-            LogicalType::Boolean,
-        )))
+        Expression::Parameter(
+            ParameterExpression::new(ParameterSlot::new(
+                RuntimeParamId::new(index),
+                LogicalType::Boolean,
+            ))
+            .into(),
+        )
     }
 
     fn parameter_bindings(
@@ -3204,19 +3220,19 @@ mod tests {
     }
 
     fn reference_i32(index: usize) -> Expression {
-        Expression::Reference(ReferenceExpression::new(index, LogicalType::Integer))
+        Expression::Reference(ReferenceExpression::new(index, LogicalType::Integer).into())
     }
 
     fn reference_i64(index: usize) -> Expression {
-        Expression::Reference(ReferenceExpression::new(index, LogicalType::BigInt))
+        Expression::Reference(ReferenceExpression::new(index, LogicalType::BigInt).into())
     }
 
     fn reference_varchar(index: usize) -> Expression {
-        Expression::Reference(ReferenceExpression::new(index, LogicalType::Varchar))
+        Expression::Reference(ReferenceExpression::new(index, LogicalType::Varchar).into())
     }
 
     fn reference_timestamp(index: usize) -> Expression {
-        Expression::Reference(ReferenceExpression::new(index, LogicalType::Timestamp))
+        Expression::Reference(ReferenceExpression::new(index, LogicalType::Timestamp).into())
     }
 
     fn cast_expr(
@@ -3225,38 +3241,41 @@ mod tests {
         cast_info: BoundCastInfo,
         try_cast: bool,
     ) -> Expression {
-        Expression::Cast(CastExpression::new(child, target_type, cast_info, try_cast))
+        Expression::Cast(CastExpression::new(child, target_type, cast_info, try_cast).into())
     }
 
     fn greater_than_i32(index: usize, value: i32) -> Expression {
-        Expression::Comparison(ComparisonExpression::new(
-            ComparisonType::GreaterThan,
-            reference_i32(index),
-            constant_i32(value),
-        ))
+        Expression::Comparison(
+            ComparisonExpression::new(
+                ComparisonType::GreaterThan,
+                reference_i32(index),
+                constant_i32(value),
+            )
+            .into(),
+        )
     }
 
     fn less_than_i32(index: usize, value: i32) -> Expression {
-        Expression::Comparison(ComparisonExpression::new(
-            ComparisonType::LessThan,
-            reference_i32(index),
-            constant_i32(value),
-        ))
+        Expression::Comparison(
+            ComparisonExpression::new(
+                ComparisonType::LessThan,
+                reference_i32(index),
+                constant_i32(value),
+            )
+            .into(),
+        )
     }
 
     fn null_i32() -> Expression {
-        Expression::Constant(ConstantExpression::new(
-            Value::Null(LogicalType::Integer),
-            LogicalType::Integer,
-        ))
+        Expression::Constant(
+            ConstantExpression::new(Value::Null(LogicalType::Integer), LogicalType::Integer).into(),
+        )
     }
 
     fn coalesce_i32_expr(children: Vec<Expression>) -> Expression {
-        Expression::Operator(OperatorExpression::new(
-            OperatorType::Coalesce,
-            children,
-            LogicalType::Integer,
-        ))
+        Expression::Operator(
+            OperatorExpression::new(OperatorType::Coalesce, children, LogicalType::Integer).into(),
+        )
     }
 
     fn in_list_i32_expr(values: &[Option<i32>], not: bool) -> Expression {
@@ -3268,19 +3287,22 @@ mod tests {
             };
             children.push(expr);
         }
-        Expression::Operator(OperatorExpression::new(
-            if not {
-                OperatorType::NotIn
-            } else {
-                OperatorType::In
-            },
-            children,
-            LogicalType::Boolean,
-        ))
+        Expression::Operator(
+            OperatorExpression::new(
+                if not {
+                    OperatorType::NotIn
+                } else {
+                    OperatorType::In
+                },
+                children,
+                LogicalType::Boolean,
+            )
+            .into(),
+        )
     }
 
     fn reference_bool(index: usize) -> Expression {
-        Expression::Reference(ReferenceExpression::new(index, LogicalType::Boolean))
+        Expression::Reference(ReferenceExpression::new(index, LogicalType::Boolean).into())
     }
 
     fn add_one_function(
@@ -3310,11 +3332,10 @@ mod tests {
             LogicalType::Integer,
             add_one_function,
         );
-        Expression::Function(Box::new(FunctionExpression::new(
-            function,
-            vec![reference_i32(index)],
-            LogicalType::Integer,
-        )))
+        Expression::Function(
+            FunctionExpression::new(function, vec![reference_i32(index)], LogicalType::Integer)
+                .into(),
+        )
     }
 
     #[derive(Debug, Clone, PartialEq, Hash)]
@@ -3400,11 +3421,10 @@ mod tests {
         ))
         .with_bind_data(OffsetBindData { offset: 7 })
         .with_init_local_state(init_offset_local_state);
-        Expression::Function(Box::new(FunctionExpression::new(
-            function,
-            vec![reference_i32(index)],
-            LogicalType::Integer,
-        )))
+        Expression::Function(
+            FunctionExpression::new(function, vec![reference_i32(index)], LogicalType::Integer)
+                .into(),
+        )
     }
 
     #[derive(Debug, Clone)]
@@ -3499,11 +3519,10 @@ mod tests {
         .with_error_mode(FunctionErrorMode::Infallible)
         .with_dictionary_strategy(DictionaryStrategy::StorageDictionaryCache { input_idx: 0 });
         (
-            Expression::Function(Box::new(FunctionExpression::new(
-                function,
-                vec![reference_i32(index)],
-                LogicalType::Integer,
-            ))),
+            Expression::Function(
+                FunctionExpression::new(function, vec![reference_i32(index)], LogicalType::Integer)
+                    .into(),
+            ),
             counter,
         )
     }
@@ -3525,11 +3544,14 @@ mod tests {
         .with_error_mode(FunctionErrorMode::Infallible)
         .with_dictionary_strategy(DictionaryStrategy::StorageDictionaryCache { input_idx: 0 });
         (
-            Expression::Function(Box::new(FunctionExpression::new(
-                function,
-                vec![reference_i32(left_index), reference_i32(right_index)],
-                LogicalType::Integer,
-            ))),
+            Expression::Function(
+                FunctionExpression::new(
+                    function,
+                    vec![reference_i32(left_index), reference_i32(right_index)],
+                    LogicalType::Integer,
+                )
+                .into(),
+            ),
             counter,
         )
     }
@@ -3647,11 +3669,14 @@ mod tests {
     fn parameter_expression_reads_epoch_scoped_bindings() {
         let session = test_session();
         let runtime = test_runtime(session);
-        let expr = Expression::Comparison(ComparisonExpression::new(
-            ComparisonType::GreaterThan,
-            reference_i32(0),
-            parameter_i32(0),
-        ));
+        let expr = Expression::Comparison(
+            ComparisonExpression::new(
+                ComparisonType::GreaterThan,
+                reference_i32(0),
+                parameter_i32(0),
+            )
+            .into(),
+        );
         let mut executor = ExpressionExecutor::new(&expr);
         let input = integer_chunk(&[1, 3, 5]);
         let first_bindings =
@@ -3742,10 +3767,13 @@ mod tests {
     fn conjunction_select_path_intersects_child_predicates_without_bool_materialization() {
         let session = test_session();
         let runtime = test_runtime(session);
-        let expr = Expression::Conjunction(ConjunctionExpression::new(
-            ConjunctionType::And,
-            vec![greater_than_i32(0, 1), less_than_i32(0, 4)],
-        ));
+        let expr = Expression::Conjunction(
+            ConjunctionExpression::new(
+                ConjunctionType::And,
+                vec![greater_than_i32(0, 1), less_than_i32(0, 4)],
+            )
+            .into(),
+        );
         let mut executor = ExpressionExecutor::new(&expr);
         let input = integer_chunk(&[0, 2, 3, 5]);
         let mut selection = paro_common::test_utils::test_selection_with_capacity(input.size());
@@ -3772,11 +3800,14 @@ mod tests {
     fn distinct_from_truth_table_matches_sql_null_semantics() {
         let session = test_session();
         let runtime = test_runtime(session);
-        let expr = Expression::Comparison(ComparisonExpression::new(
-            ComparisonType::DistinctFrom,
-            reference_i32(0),
-            reference_i32(1),
-        ));
+        let expr = Expression::Comparison(
+            ComparisonExpression::new(
+                ComparisonType::DistinctFrom,
+                reference_i32(0),
+                reference_i32(1),
+            )
+            .into(),
+        );
         let mut executor = ExpressionExecutor::new(&expr);
         let input = Chunk::from_vectors(
             vec![
@@ -3886,11 +3917,9 @@ mod tests {
         for value in 0..16 {
             children.push(constant_varchar(&format!("value_{value}")));
         }
-        let expr = Expression::Operator(OperatorExpression::new(
-            OperatorType::In,
-            children,
-            LogicalType::Boolean,
-        ));
+        let expr = Expression::Operator(
+            OperatorExpression::new(OperatorType::In, children, LogicalType::Boolean).into(),
+        );
         let executor = ExpressionExecutor::new(&expr);
 
         match executor.compiled_state(0) {
@@ -3908,11 +3937,14 @@ mod tests {
     fn not_operator_respects_selection_overlay_from_filter_results() {
         let session = test_session();
         let runtime = test_runtime(session);
-        let expr = Expression::Operator(OperatorExpression::new(
-            OperatorType::Not,
-            vec![reference_bool(0)],
-            LogicalType::Boolean,
-        ));
+        let expr = Expression::Operator(
+            OperatorExpression::new(
+                OperatorType::Not,
+                vec![reference_bool(0)],
+                LogicalType::Boolean,
+            )
+            .into(),
+        );
         let mut executor = ExpressionExecutor::new(&expr);
         let input = boolean_chunk(&[Some(true), None, Some(false)]);
         let selection = paro_common::test_utils::test_selection(vec![2, 0, 1]);
@@ -4061,11 +4093,10 @@ mod tests {
     fn comparison_handles_dictionary_inputs_from_join_results() {
         let session = test_session();
         let runtime = test_runtime(session);
-        let expr = Expression::Comparison(ComparisonExpression::new(
-            ComparisonType::Equal,
-            reference_i32(0),
-            reference_i32(1),
-        ));
+        let expr = Expression::Comparison(
+            ComparisonExpression::new(ComparisonType::Equal, reference_i32(0), reference_i32(1))
+                .into(),
+        );
         let mut executor = ExpressionExecutor::new(&expr);
         let left = paro_common::test_utils::test_dictionary(
             Arc::new(paro_common::test_utils::test_i32_vector_with_allocator(
@@ -4251,10 +4282,9 @@ mod tests {
     fn column_ref_expression_uses_dictionary_overlay_when_selection_is_present() {
         let session = test_session();
         let runtime = test_runtime(session);
-        let expr = Expression::ColumnRef(ColumnRefExpression::new(
-            ColumnBinding::new(0, 0),
-            LogicalType::Integer,
-        ));
+        let expr = Expression::ColumnRef(
+            ColumnRefExpression::new(ColumnBinding::new(0, 0), LogicalType::Integer).into(),
+        );
         let mut executor = ExpressionExecutor::new(&expr);
         let input = integer_chunk(&[10, 20, 30]);
         let selection = paro_common::test_utils::test_selection(vec![1, 2]);
@@ -4446,11 +4476,9 @@ mod tests {
         let function = BoundScalarFunction::from(
             paro_function::scalar::system::get_current_user_functions().functions[0].clone(),
         );
-        let expression = Expression::Function(Box::new(FunctionExpression::new(
-            function,
-            Vec::new(),
-            LogicalType::Varchar,
-        )));
+        let expression = Expression::Function(
+            FunctionExpression::new(function, Vec::new(), LogicalType::Varchar).into(),
+        );
         let mut executor = ExpressionExecutor::new(&expression);
         let mut input =
             Chunk::try_new(paro_common::test_utils::test_allocator()).expect("input chunk");
@@ -4525,16 +4553,18 @@ mod tests {
         let session = test_session();
         let runtime = test_runtime(session);
         let (shared_expr, counter) = cached_identity_expr(0);
-        let greater = Expression::Comparison(ComparisonExpression::new(
-            ComparisonType::GreaterThan,
-            shared_expr.clone(),
-            constant_i32(1),
-        ));
-        let less = Expression::Comparison(ComparisonExpression::new(
-            ComparisonType::LessThan,
-            shared_expr,
-            constant_i32(4),
-        ));
+        let greater = Expression::Comparison(
+            ComparisonExpression::new(
+                ComparisonType::GreaterThan,
+                shared_expr.clone(),
+                constant_i32(1),
+            )
+            .into(),
+        );
+        let less = Expression::Comparison(
+            ComparisonExpression::new(ComparisonType::LessThan, shared_expr, constant_i32(4))
+                .into(),
+        );
         let mut executor = ExpressionExecutor::with_expressions(&[greater, less]);
         let mut output = Chunk::try_new(paro_common::test_utils::test_allocator())
             .expect("test chunk allocation failed");
@@ -4567,11 +4597,14 @@ mod tests {
         let session = test_session();
         let runtime = test_runtime(session);
         let (shared_expr, counter) = cached_identity_expr(0);
-        let consumer = Expression::Comparison(ComparisonExpression::new(
-            ComparisonType::GreaterThan,
-            shared_expr.clone(),
-            constant_i32(0),
-        ));
+        let consumer = Expression::Comparison(
+            ComparisonExpression::new(
+                ComparisonType::GreaterThan,
+                shared_expr.clone(),
+                constant_i32(0),
+            )
+            .into(),
+        );
         let mut executor = ExpressionExecutor::with_expressions(&[shared_expr, consumer]);
         let mut output = Chunk::try_new(paro_common::test_utils::test_allocator())
             .expect("test chunk allocation failed");
@@ -4605,16 +4638,18 @@ mod tests {
         let session = test_session();
         let runtime = test_runtime(session);
         let (shared_expr, counter) = cached_identity_expr(0);
-        let greater = Expression::Comparison(ComparisonExpression::new(
-            ComparisonType::GreaterThan,
-            shared_expr.clone(),
-            constant_i32(1),
-        ));
-        let less = Expression::Comparison(ComparisonExpression::new(
-            ComparisonType::LessThan,
-            shared_expr,
-            constant_i32(4),
-        ));
+        let greater = Expression::Comparison(
+            ComparisonExpression::new(
+                ComparisonType::GreaterThan,
+                shared_expr.clone(),
+                constant_i32(1),
+            )
+            .into(),
+        );
+        let less = Expression::Comparison(
+            ComparisonExpression::new(ComparisonType::LessThan, shared_expr, constant_i32(4))
+                .into(),
+        );
         let mut executor = ExpressionExecutor::with_expressions(&[greater, less]);
         let input = integer_chunk(&[0, 2, 5]);
         let selection = paro_common::test_utils::test_selection(vec![1, 2]);
@@ -4645,11 +4680,10 @@ mod tests {
         let session = test_session();
         let runtime = test_runtime(session);
         let (shared_expr, counter) = cached_identity_expr(0);
-        let expr = Expression::Comparison(ComparisonExpression::new(
-            ComparisonType::Equal,
-            shared_expr.clone(),
-            shared_expr,
-        ));
+        let expr = Expression::Comparison(
+            ComparisonExpression::new(ComparisonType::Equal, shared_expr.clone(), shared_expr)
+                .into(),
+        );
         let mut executor = ExpressionExecutor::new(&expr);
         let input = integer_chunk(&[7, 8, 9]);
 
@@ -4738,21 +4772,30 @@ mod tests {
         let session = test_session();
         let runtime = test_runtime(session);
         let expressions = [
-            Expression::Comparison(ComparisonExpression::new(
-                ComparisonType::Equal,
-                reference_varchar(0),
-                constant_varchar("Sunday"),
-            )),
-            Expression::Comparison(ComparisonExpression::new(
-                ComparisonType::Equal,
-                constant_varchar("Monday"),
-                reference_varchar(0),
-            )),
-            Expression::Comparison(ComparisonExpression::new(
-                ComparisonType::Equal,
-                reference_varchar(0),
-                constant_varchar("Tuesday"),
-            )),
+            Expression::Comparison(
+                ComparisonExpression::new(
+                    ComparisonType::Equal,
+                    reference_varchar(0),
+                    constant_varchar("Sunday"),
+                )
+                .into(),
+            ),
+            Expression::Comparison(
+                ComparisonExpression::new(
+                    ComparisonType::Equal,
+                    constant_varchar("Monday"),
+                    reference_varchar(0),
+                )
+                .into(),
+            ),
+            Expression::Comparison(
+                ComparisonExpression::new(
+                    ComparisonType::Equal,
+                    reference_varchar(0),
+                    constant_varchar("Tuesday"),
+                )
+                .into(),
+            ),
         ];
         let mut executor = ExpressionExecutor::with_expressions(&expressions);
         assert_eq!(
@@ -4816,8 +4859,8 @@ mod tests {
         let session = test_session();
         let runtime = test_runtime(session);
         let expressions = [
-            Expression::Reference(ReferenceExpression::new(0, LogicalType::Integer)),
-            Expression::Reference(ReferenceExpression::new(1, LogicalType::Varchar)),
+            Expression::Reference(ReferenceExpression::new(0, LogicalType::Integer).into()),
+            Expression::Reference(ReferenceExpression::new(1, LogicalType::Varchar).into()),
         ];
         let mut executor = ExpressionExecutor::with_expressions(&expressions);
         let input = paro_common::test_utils::test_empty_chunk(&[]);
@@ -4861,14 +4904,17 @@ mod tests {
     fn conjunction_uses_ping_pong_scratch_slots() {
         let session = test_session();
         let runtime = test_runtime(session);
-        let expr = Expression::Conjunction(ConjunctionExpression::new(
-            ConjunctionType::And,
-            vec![
-                greater_than_i32(0, 0),
-                less_than_i32(0, 10),
-                greater_than_i32(0, 3),
-            ],
-        ));
+        let expr = Expression::Conjunction(
+            ConjunctionExpression::new(
+                ConjunctionType::And,
+                vec![
+                    greater_than_i32(0, 0),
+                    less_than_i32(0, 10),
+                    greater_than_i32(0, 3),
+                ],
+            )
+            .into(),
+        );
         let mut executor = ExpressionExecutor::new(&expr);
         let input = integer_chunk(&[5, 8]);
 

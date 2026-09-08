@@ -149,15 +149,17 @@ impl JoinPreaggregation {
                     .function
                     .partial_merge_function()
                     .expect("candidate partial merge was validated");
-                let partial_ref = Expression::ColumnRef(ColumnRefExpression::new(
-                    ColumnBinding::new(aggregate_index, index),
-                    partial.return_type.clone(),
-                ));
-                Expression::Aggregate(Box::new(AggregateExpression::new(
-                    merge,
-                    vec![partial_ref],
-                    partial.return_type.clone(),
-                )))
+                let partial_ref = Expression::ColumnRef(
+                    ColumnRefExpression::new(
+                        ColumnBinding::new(aggregate_index, index),
+                        partial.return_type.clone(),
+                    )
+                    .into(),
+                );
+                Expression::Aggregate(
+                    AggregateExpression::new(merge, vec![partial_ref], partial.return_type.clone())
+                        .into(),
+                )
             })
             .collect::<Vec<_>>();
 
@@ -198,14 +200,17 @@ impl JoinPreaggregation {
         join.left_projection_map = paro_planner::operator::ProjectionMap::all();
         join.right_projection_map = paro_planner::operator::ProjectionMap::all();
 
-        let group_ref = Expression::ColumnRef(ColumnRefExpression::new(
-            ColumnBinding::new(group_index, 0),
-            if right_is_condition_right {
-                condition.right.return_type()
-            } else {
-                condition.left.return_type()
-            },
-        ));
+        let group_ref = Expression::ColumnRef(
+            ColumnRefExpression::new(
+                ColumnBinding::new(group_index, 0),
+                if right_is_condition_right {
+                    condition.right.return_type()
+                } else {
+                    condition.left.return_type()
+                },
+            )
+            .into(),
+        );
         if right_is_condition_right {
             condition.right = group_ref;
         } else {
@@ -246,10 +251,9 @@ mod tests {
     use super::{optimize_plan, JoinPreaggregation};
 
     fn column(table: usize, index: usize) -> Expression {
-        Expression::ColumnRef(ColumnRefExpression::new(
-            ColumnBinding::new(table, index),
-            LogicalType::BigInt,
-        ))
+        Expression::ColumnRef(
+            ColumnRefExpression::new(ColumnBinding::new(table, index), LogicalType::BigInt).into(),
+        )
     }
 
     fn input(table: usize, columns: usize) -> OwnedLogicalPlan {
@@ -264,11 +268,9 @@ mod tests {
     fn count(input: Expression) -> Expression {
         let (function, targets) = get_count_function().bind(&[LogicalType::BigInt]).unwrap();
         assert_eq!(targets, [LogicalType::BigInt]);
-        Expression::Aggregate(Box::new(AggregateExpression::new(
-            function,
-            vec![input],
-            LogicalType::BigInt,
-        )))
+        Expression::Aggregate(
+            AggregateExpression::new(function, vec![input], LogicalType::BigInt).into(),
+        )
     }
 
     fn candidate(bind_context: &BindContext) -> OwnedLogicalPlan {

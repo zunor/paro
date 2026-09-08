@@ -9,11 +9,10 @@ fn random_call() -> Expression {
         .into_iter()
         .next()
         .expect("random overload");
-    Expression::Function(Box::new(paro_planner::expression::FunctionExpression::new(
-        function,
-        vec![],
-        LogicalType::Double,
-    )))
+    Expression::Function(
+        paro_planner::expression::FunctionExpression::new(function, vec![], LogicalType::Double)
+            .into(),
+    )
 }
 
 #[test]
@@ -28,17 +27,19 @@ fn arena_extractor_materializes_computed_window_arguments_once() {
             vec![LogicalType::Integer, LogicalType::BigInt],
         )),
     );
-    let offset = Expression::Operator(OperatorExpression::new(
-        OperatorType::Coalesce,
-        vec![
-            ref_expr(1, LogicalType::BigInt),
-            Expression::Constant(ConstantExpression::new(
-                Value::BigInt(1),
-                LogicalType::BigInt,
-            )),
-        ],
-        LogicalType::BigInt,
-    ));
+    let offset = Expression::Operator(
+        OperatorExpression::new(
+            OperatorType::Coalesce,
+            vec![
+                ref_expr(1, LogicalType::BigInt),
+                Expression::Constant(
+                    ConstantExpression::new(Value::BigInt(1), LogicalType::BigInt).into(),
+                ),
+            ],
+            LogicalType::BigInt,
+        )
+        .into(),
+    );
     let function = WindowFunction::nth_value(LogicalType::Integer);
     let window = OwnedLogicalPlan::new(
         &ctx,

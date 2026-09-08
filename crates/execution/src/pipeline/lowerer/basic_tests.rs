@@ -45,18 +45,17 @@ fn lowerer_uses_root_output_schema_after_transforms() {
 fn pipeline_fuses_projects_created_by_consumer_distribution() {
     let inner = ProjectSpec {
         expressions: vec![
-            Expression::Reference(ReferenceExpression::new(1, LogicalType::Integer)),
-            Expression::Reference(ReferenceExpression::new(0, LogicalType::Integer)),
+            Expression::Reference(ReferenceExpression::new(1, LogicalType::Integer).into()),
+            Expression::Reference(ReferenceExpression::new(0, LogicalType::Integer).into()),
         ]
         .into_boxed_slice(),
         output_names: vec!["b".to_string(), "a".to_string()].into_boxed_slice(),
         visible_count: 2,
     };
     let outer = ProjectSpec {
-        expressions: vec![Expression::Reference(ReferenceExpression::new(
-            0,
-            LogicalType::Integer,
-        ))]
+        expressions: vec![Expression::Reference(
+            ReferenceExpression::new(0, LogicalType::Integer).into(),
+        )]
         .into_boxed_slice(),
         output_names: vec!["result".to_string()].into_boxed_slice(),
         visible_count: 1,
@@ -410,10 +409,9 @@ fn hash_join_merges_optional_branches_before_stateful_transforms() {
             plan.root,
             &spec,
             vec![TransformSpec::Limit(crate::physical::LimitSpec {
-                limit: Some(Expression::Constant(ConstantExpression::new(
-                    Value::Integer(1),
-                    LogicalType::Integer,
-                ))),
+                limit: Some(Expression::Constant(
+                    ConstantExpression::new(Value::Integer(1), LogicalType::Integer).into(),
+                )),
                 offset: None,
                 hnsw_options: Default::default(),
             })],
@@ -600,7 +598,9 @@ fn hash_join_merges_optional_branches_directly_into_topn_heap() {
     let output = plan.node(plan.root).output.clone();
     let topn = TopNSpec {
         orders: vec![OrderByNode {
-            expression: Expression::Reference(ReferenceExpression::new(0, output.types[0].clone())),
+            expression: Expression::Reference(
+                ReferenceExpression::new(0, output.types[0].clone()).into(),
+            ),
             ascending: true,
             nulls_first: true,
         }]

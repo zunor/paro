@@ -262,11 +262,14 @@ pub(super) fn apply_shared_relation_rewrite(
         .iter()
         .cloned()
         .map(|partition| {
-            Expression::Operator(OperatorExpression::new_unary(
-                OperatorType::IsNotNull,
-                partition,
-                paro_common::types::LogicalType::Boolean,
-            ))
+            Expression::Operator(
+                OperatorExpression::new_unary(
+                    OperatorType::IsNotNull,
+                    partition,
+                    paro_common::types::LogicalType::Boolean,
+                )
+                .into(),
+            )
         })
         .collect::<Vec<_>>();
     let mut window_expression = Some(WindowExpression::aggregate(
@@ -281,10 +284,9 @@ pub(super) fn apply_shared_relation_rewrite(
         .verify_bound_contract()?;
     let scalar = rewrite.scalar_expression.replace_column_ref(&|column| {
         (column.depth == 0 && column.binding == rewrite.scalar_source_binding).then(|| {
-            Expression::ColumnRef(ColumnRefExpression::new(
-                window_binding,
-                window_type.clone(),
-            ))
+            Expression::ColumnRef(
+                ColumnRefExpression::new(window_binding, window_type.clone()).into(),
+            )
         })
     });
     if !expression_uses_only_binding(&scalar, window_binding) {

@@ -79,10 +79,13 @@ impl AlphaBindings {
         valid.then(|| {
             expression.clone().replace_column_ref(&|column| {
                 self.reverse.get(&column.binding).copied().map(|binding| {
-                    Expression::ColumnRef(paro_planner::expression::ColumnRefExpression::new(
-                        binding,
-                        column.return_type.clone(),
-                    ))
+                    Expression::ColumnRef(
+                        paro_planner::expression::ColumnRefExpression::new(
+                            binding,
+                            column.return_type.clone(),
+                        )
+                        .into(),
+                    )
                 })
             })
         })

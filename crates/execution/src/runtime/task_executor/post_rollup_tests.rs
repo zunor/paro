@@ -30,7 +30,7 @@ fn decimal_cast(child: Expression, target_type: LogicalType) -> Expression {
     let cast_info = casts
         .get_cast_function(&source_type, &target_type)
         .expect("bind canonical DECIMAL cast");
-    Expression::Cast(CastExpression::new(child, target_type, cast_info, false))
+    Expression::Cast(CastExpression::new(child, target_type, cast_info, false).into())
 }
 
 fn projected_reference(
@@ -62,22 +62,31 @@ fn decimal_sum_rollup_spec(
         .expect("DECIMAL SUM declares its finalized-partial reducer");
     assert_eq!(reducer_function.return_type, output_type);
 
-    let source_aggregate = Expression::Aggregate(Box::new(AggregateExpression::new(
-        source_function,
-        vec![reference(1, input_type.clone())],
-        output_type.clone(),
-    )));
-    let reducer = Expression::Aggregate(Box::new(AggregateExpression::new(
-        reducer_function,
-        vec![reference(0, output_type.clone())],
-        output_type.clone(),
-    )));
+    let source_aggregate = Expression::Aggregate(
+        AggregateExpression::new(
+            source_function,
+            vec![reference(1, input_type.clone())],
+            output_type.clone(),
+        )
+        .into(),
+    );
+    let reducer = Expression::Aggregate(
+        AggregateExpression::new(
+            reducer_function,
+            vec![reference(0, output_type.clone())],
+            output_type.clone(),
+        )
+        .into(),
+    );
     let scalar_expression = projected_reference(0, &output_type, &projected_type);
-    let predicate = Expression::Comparison(ComparisonExpression::new(
-        comparison,
-        projected_reference(0, &output_type, &projected_type),
-        reference(1, projected_type.clone()),
-    ));
+    let predicate = Expression::Comparison(
+        ComparisonExpression::new(
+            comparison,
+            projected_reference(0, &output_type, &projected_type),
+            reference(1, projected_type.clone()),
+        )
+        .into(),
+    );
     let post_reduction = PostAggregateReductionSpec {
         aggregate_types: Box::new([output_type.clone()]),
         reducers: Box::new([reducer]),

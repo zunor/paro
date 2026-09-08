@@ -188,14 +188,20 @@ mod tests {
     fn test_logical_table_function_get_new() {
         let func = create_generate_series_function();
         let args = vec![
-            Expression::Constant(ConstantExpression {
-                value: Value::BigInt(1),
-                return_type: LogicalType::BigInt,
-            }),
-            Expression::Constant(ConstantExpression {
-                value: Value::BigInt(10),
-                return_type: LogicalType::BigInt,
-            }),
+            Expression::Constant(
+                ConstantExpression {
+                    value: Value::BigInt(1),
+                    return_type: LogicalType::BigInt,
+                }
+                .into(),
+            ),
+            Expression::Constant(
+                ConstantExpression {
+                    value: Value::BigInt(10),
+                    return_type: LogicalType::BigInt,
+                }
+                .into(),
+            ),
         ];
 
         let op = TableFunctionGet::new(

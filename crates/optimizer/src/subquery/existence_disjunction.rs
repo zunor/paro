@@ -384,10 +384,13 @@ fn apply(
         .map(|(column_index, left)| {
             JoinCondition::new(
                 left,
-                Expression::ColumnRef(ColumnRefExpression::new(
-                    ColumnBinding::new(union_index, column_index),
-                    key_types[column_index].clone(),
-                )),
+                Expression::ColumnRef(
+                    ColumnRefExpression::new(
+                        ColumnBinding::new(union_index, column_index),
+                        key_types[column_index].clone(),
+                    )
+                    .into(),
+                ),
                 witness.comparisons[column_index],
             )
         })
@@ -444,10 +447,9 @@ mod tests {
             LogicalOperator::ExpressionGet(ExpressionGet::new(
                 table_index,
                 vec![vec![
-                    Expression::Constant(ConstantExpression::new(
-                        Value::Integer(1),
-                        LogicalType::Integer,
-                    ));
+                    Expression::Constant(
+                        ConstantExpression::new(Value::Integer(1), LogicalType::Integer,).into()
+                    );
                     width
                 ]],
                 (0..width).map(|index| format!("c{index}")).collect(),
@@ -457,10 +459,9 @@ mod tests {
     }
 
     fn column(table_index: usize, column_index: usize, ty: LogicalType) -> Expression {
-        Expression::ColumnRef(ColumnRefExpression::new(
-            ColumnBinding::new(table_index, column_index),
-            ty,
-        ))
+        Expression::ColumnRef(
+            ColumnRefExpression::new(ColumnBinding::new(table_index, column_index), ty).into(),
+        )
     }
 
     fn mark(
@@ -506,13 +507,16 @@ mod tests {
         let base = value_plan(&ctx, 0, 2);
         let inner = mark(&ctx, base, 1, 10);
         let outer = mark(&ctx, inner, 2, 11);
-        let disjunction = Expression::Conjunction(ConjunctionExpression::new(
-            ConjunctionType::Or,
-            vec![
-                column(10, 0, LogicalType::Boolean),
-                column(11, 0, LogicalType::Boolean),
-            ],
-        ));
+        let disjunction = Expression::Conjunction(
+            ConjunctionExpression::new(
+                ConjunctionType::Or,
+                vec![
+                    column(10, 0, LogicalType::Boolean),
+                    column(11, 0, LogicalType::Boolean),
+                ],
+            )
+            .into(),
+        );
         let mut filter = Filter::new(outer, vec![disjunction]);
         filter.projection_map = ProjectionMap::new(vec![1]);
         let plan = OwnedLogicalPlan::new(&ctx, LogicalOperator::Filter(filter));
@@ -538,13 +542,16 @@ mod tests {
         let base = value_plan(&ctx, 0, 2);
         let inner = mark(&ctx, base, 1, 10);
         let outer = mark(&ctx, inner, 2, 11);
-        let disjunction = Expression::Conjunction(ConjunctionExpression::new(
-            ConjunctionType::Or,
-            vec![
-                column(10, 0, LogicalType::Boolean),
-                column(11, 0, LogicalType::Boolean),
-            ],
-        ));
+        let disjunction = Expression::Conjunction(
+            ConjunctionExpression::new(
+                ConjunctionType::Or,
+                vec![
+                    column(10, 0, LogicalType::Boolean),
+                    column(11, 0, LogicalType::Boolean),
+                ],
+            )
+            .into(),
+        );
         let mut filter = Filter::new(outer, vec![disjunction]);
         filter.projection_map = ProjectionMap::new(vec![1, 2]);
         let plan = OwnedLogicalPlan::new(&ctx, LogicalOperator::Filter(filter));
@@ -559,21 +566,26 @@ mod tests {
         let base = value_plan(&ctx, 0, 2);
         let inner = mark(&ctx, base, 1, 10);
         let outer = mark(&ctx, inner, 2, 11);
-        let disjunction = Expression::Conjunction(ConjunctionExpression::new(
-            ConjunctionType::Or,
-            vec![
-                column(10, 0, LogicalType::Boolean),
-                column(11, 0, LogicalType::Boolean),
-            ],
-        ));
-        let residual = Expression::Comparison(ComparisonExpression::new(
-            ComparisonType::Equal,
-            column(0, 0, LogicalType::Integer),
-            Expression::Constant(ConstantExpression::new(
-                Value::Integer(1),
-                LogicalType::Integer,
-            )),
-        ));
+        let disjunction = Expression::Conjunction(
+            ConjunctionExpression::new(
+                ConjunctionType::Or,
+                vec![
+                    column(10, 0, LogicalType::Boolean),
+                    column(11, 0, LogicalType::Boolean),
+                ],
+            )
+            .into(),
+        );
+        let residual = Expression::Comparison(
+            ComparisonExpression::new(
+                ComparisonType::Equal,
+                column(0, 0, LogicalType::Integer),
+                Expression::Constant(
+                    ConstantExpression::new(Value::Integer(1), LogicalType::Integer).into(),
+                ),
+            )
+            .into(),
+        );
         let mut filter = Filter::new(outer, vec![disjunction, residual]);
         filter.projection_map = ProjectionMap::new(vec![1]);
 
@@ -604,13 +616,16 @@ mod tests {
         let base = value_plan(&ctx, 0, 1);
         let inner = mark_with_comparison(&ctx, base, 1, 10, JoinComparisonType::NotDistinctFrom);
         let outer = mark_with_comparison(&ctx, inner, 2, 11, JoinComparisonType::NotDistinctFrom);
-        let disjunction = Expression::Conjunction(ConjunctionExpression::new(
-            ConjunctionType::Or,
-            vec![
-                column(10, 0, LogicalType::Boolean),
-                column(11, 0, LogicalType::Boolean),
-            ],
-        ));
+        let disjunction = Expression::Conjunction(
+            ConjunctionExpression::new(
+                ConjunctionType::Or,
+                vec![
+                    column(10, 0, LogicalType::Boolean),
+                    column(11, 0, LogicalType::Boolean),
+                ],
+            )
+            .into(),
+        );
         let mut filter = Filter::new(outer, vec![disjunction]);
         filter.projection_map = ProjectionMap::new(vec![0]);
 

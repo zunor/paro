@@ -12,36 +12,50 @@ use super::{
     AggregateExpression, CaseExpression, CastExpression, ColumnRefExpression, ComparisonExpression,
     ConjunctionExpression, ConstantExpression, ExpressionIterator, ExpressionVisitDecision,
     FunctionExpression, OperatorExpression, ParameterExpression, ReferenceExpression,
-    SubqueryExpression, WindowExpression, WindowFrameBound, WindowInvocation,
+    SharedExpressionPayload, SubqueryExpression, WindowExpression, WindowFrameBound,
+    WindowInvocation,
 };
 use crate::operator::ColumnBinding;
 
 /// Expression represents a semantic-aware version of a SQL expression.
 #[derive(Debug, Clone)]
 pub enum Expression {
-    Constant(ConstantExpression),
-    ColumnRef(ColumnRefExpression),
-    /// Scalar routine calls are boxed so a single variadic/routine payload
-    /// cannot inflate every expression value in the planner and arena.
-    Function(Box<FunctionExpression>),
-    Cast(CastExpression),
-    Conjunction(ConjunctionExpression),
-    Case(CaseExpression),
-    Comparison(ComparisonExpression),
-    Operator(OperatorExpression),
-    Parameter(ParameterExpression),
-    Reference(ReferenceExpression),
-    Aggregate(Box<AggregateExpression>),
-    Subquery(SubqueryExpression),
-    Window(Box<WindowExpression>),
+    Constant(SharedExpressionPayload<ConstantExpression>),
+    ColumnRef(SharedExpressionPayload<ColumnRefExpression>),
+    Function(SharedExpressionPayload<FunctionExpression>),
+    Cast(SharedExpressionPayload<CastExpression>),
+    Conjunction(SharedExpressionPayload<ConjunctionExpression>),
+    Case(SharedExpressionPayload<CaseExpression>),
+    Comparison(SharedExpressionPayload<ComparisonExpression>),
+    Operator(SharedExpressionPayload<OperatorExpression>),
+    Parameter(SharedExpressionPayload<ParameterExpression>),
+    Reference(SharedExpressionPayload<ReferenceExpression>),
+    Aggregate(SharedExpressionPayload<AggregateExpression>),
+    Subquery(SharedExpressionPayload<SubqueryExpression>),
+    Window(SharedExpressionPayload<WindowExpression>),
 }
 
-// Keep expression values compact for Memo payloads and arena shells. Large
-// routine/window/aggregate payloads are owned behind one pointer; adding a
-// new inline variant beyond this envelope is an explicit design decision.
-const _: () = assert!(std::mem::size_of::<Expression>() <= 192);
+// One tag and one immutable payload handle, irrespective of scalar kind.
+const _: () = assert!(std::mem::size_of::<Expression>() <= 16);
 
 impl Expression {
+    pub(crate) fn release_children_into(&mut self, pending: &mut Vec<Expression>) {
+        match self {
+            Self::Constant(value) => value.release_into(pending),
+            Self::ColumnRef(value) => value.release_into(pending),
+            Self::Function(value) => value.release_into(pending),
+            Self::Cast(value) => value.release_into(pending),
+            Self::Conjunction(value) => value.release_into(pending),
+            Self::Case(value) => value.release_into(pending),
+            Self::Comparison(value) => value.release_into(pending),
+            Self::Operator(value) => value.release_into(pending),
+            Self::Parameter(value) => value.release_into(pending),
+            Self::Reference(value) => value.release_into(pending),
+            Self::Aggregate(value) => value.release_into(pending),
+            Self::Subquery(value) => value.release_into(pending),
+            Self::Window(value) => value.release_into(pending),
+        }
+    }
     pub fn return_type(&self) -> LogicalType {
         match self {
             Expression::Constant(expr) => expr.return_type.clone(),
@@ -124,7 +138,8 @@ impl Expression {
         ExpressionIterator::visit_mut(self, &mut |expression| {
             if let Some(index) = groups.iter().position(|group| expression.equals(group)) {
                 let return_type = expression.return_type();
-                *expression = Expression::Reference(ReferenceExpression::new(index, return_type));
+                *expression =
+                    Expression::Reference(ReferenceExpression::new(index, return_type).into());
                 ExpressionVisitDecision::SkipChildren
             } else {
                 ExpressionVisitDecision::Descend
@@ -149,7 +164,7 @@ impl Expression {
                 let index = offset + aggregates.len();
                 let return_type = aggregate.return_type.clone();
                 let replacement =
-                    Expression::Reference(ReferenceExpression::new(index, return_type));
+                    Expression::Reference(ReferenceExpression::new(index, return_type).into());
                 aggregates.push(std::mem::replace(expression, replacement));
                 return ExpressionVisitDecision::SkipChildren;
             }
@@ -181,10 +196,13 @@ impl Expression {
                 .then(|| windows.iter().position(|window| window.equals(expression)))
                 .flatten();
             let output_index = existing.unwrap_or(windows.len());
-            let replacement = Expression::ColumnRef(ColumnRefExpression::new(
-                ColumnBinding::new(window_index, output_index),
-                return_type,
-            ));
+            let replacement = Expression::ColumnRef(
+                ColumnRefExpression::new(
+                    ColumnBinding::new(window_index, output_index),
+                    return_type,
+                )
+                .into(),
+            );
 
             if existing.is_some() {
                 *expression = replacement;
@@ -439,8 +457,8 @@ mod tests {
     use super::Expression;
     use crate::expression::{
         AggregateExpression, ColumnRefExpression, ConjunctionExpression, ConjunctionType,
-        ConstantExpression, FunctionExpression, OrderByExpression, ReferenceExpression,
-        WindowExpression, WindowFrame, WindowFrameBound, WindowFrameType,
+        ConstantExpression, FunctionExpression, OrderByExpression, WindowExpression, WindowFrame,
+        WindowFrameBound, WindowFrameType,
     };
     use crate::operator::ColumnBinding;
     use paro_common::runtime_value::Value;
@@ -449,17 +467,16 @@ mod tests {
     use paro_function::window::WindowFunction;
 
     fn int_column(column_index: usize) -> Expression {
-        Expression::ColumnRef(ColumnRefExpression::new(
-            ColumnBinding::new(10, column_index),
-            LogicalType::Integer,
-        ))
+        Expression::ColumnRef(
+            ColumnRefExpression::new(ColumnBinding::new(10, column_index), LogicalType::Integer)
+                .into(),
+        )
     }
 
     fn int_constant(value: i32) -> Expression {
-        Expression::Constant(ConstantExpression::new(
-            Value::Integer(value),
-            LogicalType::Integer,
-        ))
+        Expression::Constant(
+            ConstantExpression::new(Value::Integer(value), LogicalType::Integer).into(),
+        )
     }
 
     fn random_call() -> Expression {
@@ -468,32 +485,31 @@ mod tests {
             .into_iter()
             .next()
             .expect("random overload");
-        Expression::Function(Box::new(FunctionExpression::new(
-            function,
-            vec![],
-            LogicalType::Double,
-        )))
+        Expression::Function(FunctionExpression::new(function, vec![], LogicalType::Double).into())
     }
 
     fn window_expression(start_bound: WindowFrameBound) -> Expression {
-        Expression::Window(Box::new(WindowExpression::native(
-            WindowFunction::first_value(LogicalType::Integer),
-            vec![int_column(0)],
-            vec![int_column(1)],
-            vec![OrderByExpression {
-                expression: int_column(2),
-                ascending: true,
-                nulls_first: false,
-            }],
-            WindowFrame {
-                frame_type: WindowFrameType::Rows,
-                start_bound,
-                start_is_preceding: true,
-                end_bound: WindowFrameBound::CurrentRow,
-                end_is_preceding: false,
-            },
-            false,
-        )))
+        Expression::Window(
+            WindowExpression::native(
+                WindowFunction::first_value(LogicalType::Integer),
+                vec![int_column(0)],
+                vec![int_column(1)],
+                vec![OrderByExpression {
+                    expression: int_column(2),
+                    ascending: true,
+                    nulls_first: false,
+                }],
+                WindowFrame {
+                    frame_type: WindowFrameType::Rows,
+                    start_bound,
+                    start_is_preceding: true,
+                    end_bound: WindowFrameBound::CurrentRow,
+                    end_is_preceding: false,
+                },
+                false,
+            )
+            .into(),
+        )
     }
 
     #[test]
@@ -506,7 +522,7 @@ mod tests {
         let Expression::Window(window) = rewritten else {
             panic!("expected window expression");
         };
-        let WindowFrameBound::Offset(offset) = window.frame.start_bound else {
+        let WindowFrameBound::Offset(offset) = window.into_inner().frame.start_bound else {
             panic!("expected frame offset");
         };
         assert!(matches!(*offset, Expression::Constant(_)));
@@ -520,22 +536,20 @@ mod tests {
         let Expression::Window(window) = rewritten else {
             panic!("expected window expression");
         };
-        let WindowFrameBound::Offset(offset) = window.frame.start_bound else {
+        let WindowFrameBound::Offset(offset) = window.into_inner().frame.start_bound else {
             panic!("expected frame offset");
         };
         assert!(matches!(
             *offset,
-            Expression::Reference(ReferenceExpression { index: 0, .. })
+            Expression::Reference(reference) if reference.index == 0
         ));
     }
 
     #[test]
     fn extract_aggregates_visits_window_clauses() {
-        let aggregate = Expression::Aggregate(Box::new(AggregateExpression::new(
-            get_count_star_function(),
-            vec![],
-            LogicalType::BigInt,
-        )));
+        let aggregate = Expression::Aggregate(
+            AggregateExpression::new(get_count_star_function(), vec![], LogicalType::BigInt).into(),
+        );
         let mut expression = window_expression(WindowFrameBound::CurrentRow);
         let Expression::Window(window) = &mut expression else {
             unreachable!();
@@ -551,8 +565,8 @@ mod tests {
             panic!("expected window expression");
         };
         assert!(matches!(
-            window.orders[0].expression,
-            Expression::Reference(ReferenceExpression { index: 3, .. })
+            &window.orders[0].expression,
+            Expression::Reference(reference) if reference.index == 3
         ));
     }
 
@@ -560,12 +574,15 @@ mod tests {
     fn extract_aggregates_preserves_window_owned_aggregate_kernel() {
         let aggregate =
             AggregateExpression::new(get_count_star_function(), vec![], LogicalType::BigInt);
-        let mut expression = Expression::Window(Box::new(WindowExpression::aggregate(
-            aggregate,
-            vec![int_column(0)],
-            vec![],
-            WindowFrame::default(),
-        )));
+        let mut expression = Expression::Window(
+            WindowExpression::aggregate(
+                aggregate,
+                vec![int_column(0)],
+                vec![],
+                WindowFrame::default(),
+            )
+            .into(),
+        );
         let mut aggregates = Vec::new();
 
         expression.extract_aggregates_in_place(&mut aggregates, 0);
@@ -650,20 +667,15 @@ mod tests {
         let mut left = int_constant(1);
         let mut right = int_constant(1);
         for _ in 0..10_000 {
-            left = Expression::Conjunction(ConjunctionExpression::new(
-                ConjunctionType::And,
-                vec![left],
-            ));
-            right = Expression::Conjunction(ConjunctionExpression::new(
-                ConjunctionType::And,
-                vec![right],
-            ));
+            left = Expression::Conjunction(
+                ConjunctionExpression::new(ConjunctionType::And, vec![left]).into(),
+            );
+            right = Expression::Conjunction(
+                ConjunctionExpression::new(ConjunctionType::And, vec![right]).into(),
+            );
         }
         assert!(left.equals(&right));
-        // Dropping a deeply nested value is itself recursive through Vec and
-        // the enum.  The production plan owns these values behind an arena;
-        // this test only exercises the equality contract.
-        std::mem::forget(left);
-        std::mem::forget(right);
+        drop(left);
+        drop(right);
     }
 }

@@ -17,10 +17,9 @@ fn project(plan: OwnedLogicalPlan, table: usize) -> OwnedLogicalPlan {
     OwnedLogicalPlan::synthetic(LogicalOperator::Projection(Projection::new(
         table,
         plan,
-        vec![Expression::ColumnRef(ColumnRefExpression::new(
-            binding,
-            LogicalType::Integer,
-        ))],
+        vec![Expression::ColumnRef(
+            ColumnRefExpression::new(binding, LogicalType::Integer).into(),
+        )],
     )))
 }
 
@@ -128,10 +127,10 @@ fn grouped_branch_with_tag(
             output_table + 11,
             output_table + 12,
             source(source_table),
-            vec![Expression::ColumnRef(ColumnRefExpression::new(
-                ColumnBinding::new(source_table, 0),
-                LogicalType::Integer,
-            ))],
+            vec![Expression::ColumnRef(
+                ColumnRefExpression::new(ColumnBinding::new(source_table, 0), LogicalType::Integer)
+                    .into(),
+            )],
             vec![],
             vec![],
             vec![],
@@ -141,14 +140,17 @@ fn grouped_branch_with_tag(
         output_table,
         aggregate,
         vec![
-            Expression::ColumnRef(ColumnRefExpression::new(
-                ColumnBinding::new(output_table + 10, 0),
-                LogicalType::Integer,
-            )),
-            Expression::Constant(ConstantExpression::new(
-                Value::Varchar(tag.to_string()),
-                LogicalType::Varchar,
-            )),
+            Expression::ColumnRef(
+                ColumnRefExpression::new(
+                    ColumnBinding::new(output_table + 10, 0),
+                    LogicalType::Integer,
+                )
+                .into(),
+            ),
+            Expression::Constant(
+                ConstantExpression::new(Value::Varchar(tag.to_string()), LogicalType::Varchar)
+                    .into(),
+            ),
         ],
     )))
 }
@@ -354,10 +356,9 @@ fn aggregate_key_is_derived_from_native_shell_without_cached_plan_statistics() {
             2,
             3,
             source(0),
-            vec![Expression::ColumnRef(ColumnRefExpression::new(
-                ColumnBinding::new(0, 0),
-                LogicalType::Integer,
-            ))],
+            vec![Expression::ColumnRef(
+                ColumnRefExpression::new(ColumnBinding::new(0, 0), LogicalType::Integer).into(),
+            )],
             vec![],
             vec![],
             vec![],

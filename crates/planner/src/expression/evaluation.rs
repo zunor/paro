@@ -248,7 +248,7 @@ mod tests {
                 .boundary
                 .placement = PlacementClass::External;
         }
-        Expression::Function(Box::new(expression))
+        Expression::Function(expression.into())
     }
 
     fn infallible_call(children: Vec<Expression>) -> Expression {
@@ -331,34 +331,40 @@ mod tests {
 
     #[test]
     fn primitive_comparison_is_total_when_its_children_are_total() {
-        let comparison = Expression::Comparison(super::super::ComparisonExpression::new(
-            super::super::ComparisonType::Equal,
-            Expression::Constant(super::super::ConstantExpression::new(
-                Value::Integer(1),
-                LogicalType::Integer,
-            )),
-            Expression::Constant(super::super::ConstantExpression::new(
-                Value::Integer(2),
-                LogicalType::Integer,
-            )),
-        ));
+        let comparison = Expression::Comparison(
+            super::super::ComparisonExpression::new(
+                super::super::ComparisonType::Equal,
+                Expression::Constant(
+                    super::super::ConstantExpression::new(Value::Integer(1), LogicalType::Integer)
+                        .into(),
+                ),
+                Expression::Constant(
+                    super::super::ConstantExpression::new(Value::Integer(2), LogicalType::Integer)
+                        .into(),
+                ),
+            )
+            .into(),
+        );
 
         assert!(comparison.evaluation_properties().is_infallible());
     }
 
     #[test]
     fn comparison_without_bound_input_contract_is_not_total() {
-        let comparison = Expression::Comparison(super::super::ComparisonExpression {
-            left: Box::new(Expression::Constant(super::super::ConstantExpression::new(
-                Value::Integer(1),
-                LogicalType::Integer,
-            ))),
-            right: Box::new(Expression::Constant(super::super::ConstantExpression::new(
-                Value::BigInt(1),
-                LogicalType::BigInt,
-            ))),
-            comparison_type: super::super::ComparisonType::Equal,
-        });
+        let comparison = Expression::Comparison(
+            super::super::ComparisonExpression {
+                left: Box::new(Expression::Constant(
+                    super::super::ConstantExpression::new(Value::Integer(1), LogicalType::Integer)
+                        .into(),
+                )),
+                right: Box::new(Expression::Constant(
+                    super::super::ConstantExpression::new(Value::BigInt(1), LogicalType::BigInt)
+                        .into(),
+                )),
+                comparison_type: super::super::ComparisonType::Equal,
+            }
+            .into(),
+        );
 
         assert!(!comparison.evaluation_properties().is_infallible());
     }

@@ -150,7 +150,7 @@ fn recognize_detail_left_scalar_right(
         .collect::<Option<Vec<_>>>()?;
 
     let Expression::Aggregate(mut aggregate) =
-        bindings.rebase_scalar(&Expression::Aggregate(Box::new(scalar.aggregate.clone())))?
+        bindings.rebase_scalar(&Expression::Aggregate(scalar.aggregate.clone().into()))?
     else {
         return None;
     };
@@ -175,11 +175,14 @@ fn recognize_detail_left_scalar_right(
         .conditions
         .iter()
         .map(|condition| {
-            Expression::Comparison(ComparisonExpression::new(
-                condition.comparison.into(),
-                condition.left.clone(),
-                condition.right.clone(),
-            ))
+            Expression::Comparison(
+                ComparisonExpression::new(
+                    condition.comparison.into(),
+                    condition.left.clone(),
+                    condition.right.clone(),
+                )
+                .into(),
+            )
         })
         .collect::<Vec<_>>();
     if !condition_expressions.iter().all(is_movable)
@@ -199,7 +202,7 @@ fn recognize_detail_left_scalar_right(
         scalar_binding,
         scalar_source_binding: ColumnBinding::new(scalar.aggregate_index, 0),
         scalar_expression: scalar.scalar_expression.clone(),
-        aggregate: *aggregate,
+        aggregate: aggregate.into_inner(),
     })
 }
 
@@ -417,10 +420,9 @@ fn and_predicates(mut predicates: Vec<Expression>) -> Option<Expression> {
     match predicates.len() {
         0 => None,
         1 => predicates.pop(),
-        _ => Some(Expression::Conjunction(ConjunctionExpression::new(
-            ConjunctionType::And,
-            predicates,
-        ))),
+        _ => Some(Expression::Conjunction(
+            ConjunctionExpression::new(ConjunctionType::And, predicates).into(),
+        )),
     }
 }
 
@@ -545,10 +547,9 @@ fn apply_rewrite(
     };
     let scalar = rewrite.scalar_expression.replace_column_ref(&|column| {
         (column.depth == 0 && column.binding == rewrite.scalar_source_binding).then(|| {
-            Expression::ColumnRef(ColumnRefExpression::new(
-                window_binding,
-                window_type.clone(),
-            ))
+            Expression::ColumnRef(
+                ColumnRefExpression::new(window_binding, window_type.clone()).into(),
+            )
         })
     });
     if !expression_uses_only_binding(&scalar, window_binding) {
@@ -560,17 +561,20 @@ fn apply_rewrite(
         .conditions
         .into_iter()
         .map(|condition| {
-            Expression::Comparison(ComparisonExpression::new(
-                condition.comparison.into(),
-                condition.left.replace_column_ref(&|column| {
-                    (column.depth == 0 && column.binding == rewrite.scalar_binding)
-                        .then(|| scalar.clone())
-                }),
-                condition.right.replace_column_ref(&|column| {
-                    (column.depth == 0 && column.binding == rewrite.scalar_binding)
-                        .then(|| scalar.clone())
-                }),
-            ))
+            Expression::Comparison(
+                ComparisonExpression::new(
+                    condition.comparison.into(),
+                    condition.left.replace_column_ref(&|column| {
+                        (column.depth == 0 && column.binding == rewrite.scalar_binding)
+                            .then(|| scalar.clone())
+                    }),
+                    condition.right.replace_column_ref(&|column| {
+                        (column.depth == 0 && column.binding == rewrite.scalar_binding)
+                            .then(|| scalar.clone())
+                    }),
+                )
+                .into(),
+            )
         })
         .collect::<Vec<_>>();
     if predicates

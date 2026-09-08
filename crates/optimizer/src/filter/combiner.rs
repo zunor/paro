@@ -164,11 +164,14 @@ impl FilterCombiner {
                         self.stored_expressions.get(&keys[i]),
                         self.stored_expressions.get(&keys[j]),
                     ) {
-                        let comparison = Expression::Comparison(ComparisonExpression::new(
-                            ComparisonType::Equal,
-                            left.clone(),
-                            right.clone(),
-                        ));
+                        let comparison = Expression::Comparison(
+                            ComparisonExpression::new(
+                                ComparisonType::Equal,
+                                left.clone(),
+                                right.clone(),
+                            )
+                            .into(),
+                        );
                         result.push(comparison);
                     }
                 }
@@ -191,16 +194,21 @@ impl FilterCombiner {
                                 }
                                 _ => {
                                     // Generate individual comparison
-                                    let constant = Expression::Constant(ConstantExpression {
-                                        value: info.constant.clone(),
-                                        return_type: expr.return_type(),
-                                    });
-                                    let comparison =
-                                        Expression::Comparison(ComparisonExpression::new(
+                                    let constant = Expression::Constant(
+                                        ConstantExpression {
+                                            value: info.constant.clone(),
+                                            return_type: expr.return_type(),
+                                        }
+                                        .into(),
+                                    );
+                                    let comparison = Expression::Comparison(
+                                        ComparisonExpression::new(
                                             info.comparison_type,
                                             expr.clone(),
                                             constant,
-                                        ));
+                                        )
+                                        .into(),
+                                    );
                                     result.push(comparison);
                                 }
                             }
@@ -208,28 +216,40 @@ impl FilterCombiner {
 
                         // Generate range comparisons
                         if let Some(lower) = lower_bound {
-                            let constant = Expression::Constant(ConstantExpression {
-                                value: lower.constant.clone(),
-                                return_type: expr.return_type(),
-                            });
-                            let comparison = Expression::Comparison(ComparisonExpression::new(
-                                lower.comparison_type,
-                                expr.clone(),
-                                constant,
-                            ));
+                            let constant = Expression::Constant(
+                                ConstantExpression {
+                                    value: lower.constant.clone(),
+                                    return_type: expr.return_type(),
+                                }
+                                .into(),
+                            );
+                            let comparison = Expression::Comparison(
+                                ComparisonExpression::new(
+                                    lower.comparison_type,
+                                    expr.clone(),
+                                    constant,
+                                )
+                                .into(),
+                            );
                             result.push(comparison);
                         }
 
                         if let Some(upper) = upper_bound {
-                            let constant = Expression::Constant(ConstantExpression {
-                                value: upper.constant.clone(),
-                                return_type: expr.return_type(),
-                            });
-                            let comparison = Expression::Comparison(ComparisonExpression::new(
-                                upper.comparison_type,
-                                expr.clone(),
-                                constant,
-                            ));
+                            let constant = Expression::Constant(
+                                ConstantExpression {
+                                    value: upper.constant.clone(),
+                                    return_type: expr.return_type(),
+                                }
+                                .into(),
+                            );
+                            let comparison = Expression::Comparison(
+                                ComparisonExpression::new(
+                                    upper.comparison_type,
+                                    expr.clone(),
+                                    constant,
+                                )
+                                .into(),
+                            );
                             result.push(comparison);
                         }
                     }
@@ -679,28 +699,37 @@ mod tests {
     use paro_planner::expression::ColumnRefExpression;
 
     fn make_column_ref(table_index: usize, column_index: usize) -> Expression {
-        Expression::ColumnRef(ColumnRefExpression {
-            binding: paro_planner::operator::ColumnBinding {
-                table_index,
-                column_index,
-            },
-            depth: 0,
-            return_type: LogicalType::Integer,
-        })
+        Expression::ColumnRef(
+            ColumnRefExpression {
+                binding: paro_planner::operator::ColumnBinding {
+                    table_index,
+                    column_index,
+                },
+                depth: 0,
+                return_type: LogicalType::Integer,
+            }
+            .into(),
+        )
     }
 
     fn make_constant(value: i32) -> Expression {
-        Expression::Constant(ConstantExpression {
-            value: Value::Integer(value),
-            return_type: LogicalType::Integer,
-        })
+        Expression::Constant(
+            ConstantExpression {
+                value: Value::Integer(value),
+                return_type: LogicalType::Integer,
+            }
+            .into(),
+        )
     }
 
     fn make_null_constant() -> Expression {
-        Expression::Constant(ConstantExpression {
-            value: Value::Null(LogicalType::Integer),
-            return_type: LogicalType::Integer,
-        })
+        Expression::Constant(
+            ConstantExpression {
+                value: Value::Null(LogicalType::Integer),
+                return_type: LogicalType::Integer,
+            }
+            .into(),
+        )
     }
 
     fn make_comparison(
@@ -708,21 +737,27 @@ mod tests {
         left: Expression,
         right: Expression,
     ) -> Expression {
-        Expression::Comparison(ComparisonExpression::new(comp_type, left, right))
+        Expression::Comparison(ComparisonExpression::new(comp_type, left, right).into())
     }
 
     fn make_and(children: Vec<Expression>) -> Expression {
-        Expression::Conjunction(ConjunctionExpression {
-            conjunction_type: ConjunctionType::And,
-            children,
-        })
+        Expression::Conjunction(
+            ConjunctionExpression {
+                conjunction_type: ConjunctionType::And,
+                children,
+            }
+            .into(),
+        )
     }
 
     fn make_or(children: Vec<Expression>) -> Expression {
-        Expression::Conjunction(ConjunctionExpression {
-            conjunction_type: ConjunctionType::Or,
-            children,
-        })
+        Expression::Conjunction(
+            ConjunctionExpression {
+                conjunction_type: ConjunctionType::Or,
+                children,
+            }
+            .into(),
+        )
     }
 
     #[test]
@@ -1059,10 +1094,13 @@ mod tests {
         let mut combiner = FilterCombiner::new();
 
         // A Reference expression (used in physical layer) is unsupported by FilterCombiner
-        let filter = Expression::Reference(paro_planner::expression::ReferenceExpression {
-            index: 0,
-            return_type: LogicalType::Boolean,
-        });
+        let filter = Expression::Reference(
+            paro_planner::expression::ReferenceExpression {
+                index: 0,
+                return_type: LogicalType::Boolean,
+            }
+            .into(),
+        );
 
         // Should return Success but add to remaining filters
         assert_eq!(combiner.add_filter(filter), FilterResult::Success);
@@ -1097,10 +1135,13 @@ mod tests {
     fn test_true_constant_filter() {
         let mut combiner = FilterCombiner::new();
 
-        let filter = Expression::Constant(ConstantExpression {
-            value: Value::Boolean(true),
-            return_type: LogicalType::Boolean,
-        });
+        let filter = Expression::Constant(
+            ConstantExpression {
+                value: Value::Boolean(true),
+                return_type: LogicalType::Boolean,
+            }
+            .into(),
+        );
 
         assert_eq!(combiner.add_filter(filter), FilterResult::Success);
     }
@@ -1109,10 +1150,13 @@ mod tests {
     fn test_false_constant_filter() {
         let mut combiner = FilterCombiner::new();
 
-        let filter = Expression::Constant(ConstantExpression {
-            value: Value::Boolean(false),
-            return_type: LogicalType::Boolean,
-        });
+        let filter = Expression::Constant(
+            ConstantExpression {
+                value: Value::Boolean(false),
+                return_type: LogicalType::Boolean,
+            }
+            .into(),
+        );
 
         assert_eq!(combiner.add_filter(filter), FilterResult::Unsatisfiable);
     }

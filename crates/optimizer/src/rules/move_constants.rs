@@ -107,11 +107,9 @@ fn move_comparison_constant(comp: &ComparisonExpression) -> RuleResult {
     // Flip the comparison type when swapping operands
     let flipped_type = flip_comparison(comp.comparison_type);
 
-    RuleResult::Changed(Box::new(Expression::Comparison(ComparisonExpression::new(
-        flipped_type,
-        (*comp.right).clone(),
-        (*comp.left).clone(),
-    ))))
+    RuleResult::Changed(Box::new(Expression::Comparison(
+        ComparisonExpression::new(flipped_type, (*comp.right).clone(), (*comp.left).clone()).into(),
+    )))
 }
 
 /// Flip a comparison type (for swapping operands).
@@ -135,14 +133,15 @@ fn move_function_constant(func: &paro_planner::expression::FunctionExpression) -
     // Swap children: constant moves to right
     let new_children = vec![func.children[1].clone(), func.children[0].clone()];
 
-    RuleResult::Changed(Box::new(Expression::Function(Box::new(
+    RuleResult::Changed(Box::new(Expression::Function(
         FunctionExpression {
             function: func.function.clone(),
             children: new_children,
             return_type: func.return_type.clone(),
             routine_meta: func.routine_meta.clone(),
-        },
-    ))))
+        }
+        .into(),
+    )))
 }
 
 #[cfg(test)]
@@ -166,47 +165,59 @@ mod tests {
     }
 
     fn make_constant(value: i32) -> Expression {
-        Expression::Constant(ConstantExpression {
-            value: Value::Integer(value),
-            return_type: LogicalType::Integer,
-        })
+        Expression::Constant(
+            ConstantExpression {
+                value: Value::Integer(value),
+                return_type: LogicalType::Integer,
+            }
+            .into(),
+        )
     }
 
     fn make_column_ref(table_index: usize, column_index: usize) -> Expression {
-        Expression::ColumnRef(ColumnRefExpression {
-            binding: paro_planner::operator::ColumnBinding {
-                table_index,
-                column_index,
-            },
-            depth: 0,
-            return_type: LogicalType::Integer,
-        })
+        Expression::ColumnRef(
+            ColumnRefExpression {
+                binding: paro_planner::operator::ColumnBinding {
+                    table_index,
+                    column_index,
+                },
+                depth: 0,
+                return_type: LogicalType::Integer,
+            }
+            .into(),
+        )
     }
 
     fn make_add(left: Expression, right: Expression) -> Expression {
-        Expression::Function(Box::new(FunctionExpression::new(
-            ScalarFunction::new(
-                "+".to_string(),
-                vec![LogicalType::Integer, LogicalType::Integer],
+        Expression::Function(
+            FunctionExpression::new(
+                ScalarFunction::new(
+                    "+".to_string(),
+                    vec![LogicalType::Integer, LogicalType::Integer],
+                    LogicalType::Integer,
+                    dummy_fn,
+                ),
+                vec![left, right],
                 LogicalType::Integer,
-                dummy_fn,
-            ),
-            vec![left, right],
-            LogicalType::Integer,
-        )))
+            )
+            .into(),
+        )
     }
 
     fn make_multiply(left: Expression, right: Expression) -> Expression {
-        Expression::Function(Box::new(FunctionExpression::new(
-            ScalarFunction::new(
-                "*".to_string(),
-                vec![LogicalType::Integer, LogicalType::Integer],
+        Expression::Function(
+            FunctionExpression::new(
+                ScalarFunction::new(
+                    "*".to_string(),
+                    vec![LogicalType::Integer, LogicalType::Integer],
+                    LogicalType::Integer,
+                    dummy_fn,
+                ),
+                vec![left, right],
                 LogicalType::Integer,
-                dummy_fn,
-            ),
-            vec![left, right],
-            LogicalType::Integer,
-        )))
+            )
+            .into(),
+        )
     }
 
     fn make_comparison(
@@ -214,7 +225,7 @@ mod tests {
         left: Expression,
         right: Expression,
     ) -> Expression {
-        Expression::Comparison(ComparisonExpression::new(comp_type, left, right))
+        Expression::Comparison(ComparisonExpression::new(comp_type, left, right).into())
     }
 
     #[test]

@@ -56,10 +56,13 @@ pub fn bind_case(
     let mut bound_else = if let Some(else_expr) = else_result {
         binder.bind_child(*else_expr)?
     } else {
-        Expression::Constant(ConstantExpression {
-            value: Value::Null(LogicalType::Null),
-            return_type: LogicalType::Null,
-        })
+        Expression::Constant(
+            ConstantExpression {
+                value: Value::Null(LogicalType::Null),
+                return_type: LogicalType::Null,
+            }
+            .into(),
+        )
     };
 
     // 2. Determine common return type across all branches
@@ -93,12 +96,9 @@ pub fn bind_case(
         .zip(bound_results.into_iter())
         .rev()
     {
-        current_expr = Expression::Case(CaseExpression::new(
-            cond,
-            res,
-            current_expr,
-            return_type.clone(),
-        ));
+        current_expr = Expression::Case(
+            CaseExpression::new(cond, res, current_expr, return_type.clone()).into(),
+        );
     }
 
     Ok(current_expr)

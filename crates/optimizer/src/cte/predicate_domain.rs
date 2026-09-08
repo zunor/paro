@@ -123,7 +123,7 @@ fn conjunction(kind: ConjunctionType, mut expressions: Vec<Expression>) -> Expre
     if expressions.len() == 1 {
         expressions.pop().expect("one expression")
     } else {
-        Expression::Conjunction(ConjunctionExpression::new(kind, expressions))
+        Expression::Conjunction(ConjunctionExpression::new(kind, expressions).into())
     }
 }
 
@@ -193,10 +193,9 @@ fn build_or_filter(
         let and_expr = if rewritten_filters.len() == 1 {
             rewritten_filters.pop().unwrap()
         } else {
-            Expression::Conjunction(ConjunctionExpression::new(
-                ConjunctionType::And,
-                rewritten_filters,
-            ))
+            Expression::Conjunction(
+                ConjunctionExpression::new(ConjunctionType::And, rewritten_filters).into(),
+            )
         };
         refs.push(and_expr);
     }
@@ -204,10 +203,9 @@ fn build_or_filter(
     match refs.len() {
         0 => None,
         1 => refs.pop(),
-        _ => Some(Expression::Conjunction(ConjunctionExpression::new(
-            ConjunctionType::Or,
-            refs,
-        ))),
+        _ => Some(Expression::Conjunction(
+            ConjunctionExpression::new(ConjunctionType::Or, refs).into(),
+        )),
     }
 }
 
@@ -223,17 +221,26 @@ mod tests {
     };
 
     fn integer_equality(table_index: usize, column_index: usize, value: i32) -> Expression {
-        Expression::Comparison(ComparisonExpression::new(
-            ComparisonType::Equal,
-            Expression::ColumnRef(ColumnRefExpression::new(
-                paro_planner::operator::ColumnBinding::new(table_index, column_index),
-                LogicalType::Integer,
-            )),
-            Expression::Constant(ConstantExpression {
-                value: paro_common::runtime_value::Value::Integer(value),
-                return_type: LogicalType::Integer,
-            }),
-        ))
+        Expression::Comparison(
+            ComparisonExpression::new(
+                ComparisonType::Equal,
+                Expression::ColumnRef(
+                    ColumnRefExpression::new(
+                        paro_planner::operator::ColumnBinding::new(table_index, column_index),
+                        LogicalType::Integer,
+                    )
+                    .into(),
+                ),
+                Expression::Constant(
+                    ConstantExpression {
+                        value: paro_common::runtime_value::Value::Integer(value),
+                        return_type: LogicalType::Integer,
+                    }
+                    .into(),
+                ),
+            )
+            .into(),
+        )
     }
 
     #[test]
@@ -244,20 +251,17 @@ mod tests {
             .next()
             .expect("random overload");
         let random = || {
-            Expression::Function(Box::new(FunctionExpression::new(
-                function.clone(),
-                vec![],
-                LogicalType::Double,
-            )))
+            Expression::Function(
+                FunctionExpression::new(function.clone(), vec![], LogicalType::Double).into(),
+            )
         };
         let info = MaterializedCTEInfo {
             filtered_refs: vec![FilteredCTERef {
                 old_bindings: vec![],
-                filters: vec![Expression::Comparison(ComparisonExpression::new(
-                    ComparisonType::GreaterThan,
-                    random(),
-                    random(),
-                ))],
+                filters: vec![Expression::Comparison(
+                    ComparisonExpression::new(ComparisonType::GreaterThan, random(), random())
+                        .into(),
+                )],
             }],
         };
 

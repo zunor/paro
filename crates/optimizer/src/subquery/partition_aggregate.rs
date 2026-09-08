@@ -1170,10 +1170,9 @@ fn apply_rewrite(
     );
     let scalar = rewrite.scalar_expression.replace_column_ref(&|column| {
         (column.depth == 0 && column.binding == rewrite.scalar_source_binding).then(|| {
-            Expression::ColumnRef(ColumnRefExpression::new(
-                window_binding,
-                window_type.clone(),
-            ))
+            Expression::ColumnRef(
+                ColumnRefExpression::new(window_binding, window_type.clone()).into(),
+            )
         })
     });
     if !expression_uses_only_binding(&scalar, window_binding) {
@@ -1256,7 +1255,9 @@ fn apply_grouped_join_rewrite(
                 })?;
             Ok(JoinCondition::new(
                 left.clone(),
-                Expression::ColumnRef(ColumnRefExpression::new(binding, right.return_type.clone())),
+                Expression::ColumnRef(
+                    ColumnRefExpression::new(binding, right.return_type.clone()).into(),
+                ),
                 JoinComparisonType::Equal,
             ))
         })
@@ -1300,7 +1301,9 @@ fn apply_grouped_join_rewrite(
             let ty = rewrite.outer_types.get(ordinal).cloned().ok_or_else(|| {
                 paro_error::internal("grouped-join witness lost a grouped binding type")
             })?;
-            Ok(Expression::ColumnRef(ColumnRefExpression::new(binding, ty)))
+            Ok(Expression::ColumnRef(
+                ColumnRefExpression::new(binding, ty).into(),
+            ))
         })
         .collect::<Result<Vec<_>>>()?;
     let group_index = bind_context.generate_table_index();
@@ -1323,7 +1326,7 @@ fn apply_grouped_join_rewrite(
         joined,
         groups,
         Vec::new(),
-        vec![Expression::Aggregate(Box::new(rewrite.aggregate.clone()))],
+        vec![Expression::Aggregate(rewrite.aggregate.clone().into())],
         Vec::new(),
     );
     let aggregate = OwnedLogicalPlan::new(
@@ -1334,10 +1337,9 @@ fn apply_grouped_join_rewrite(
     let aggregate_type = rewrite.aggregate.return_type.clone();
     let scalar = rewrite.scalar_expression.replace_column_ref(&|column| {
         (column.depth == 0 && column.binding == rewrite.scalar_source_binding).then(|| {
-            Expression::ColumnRef(ColumnRefExpression::new(
-                aggregate_binding,
-                aggregate_type.clone(),
-            ))
+            Expression::ColumnRef(
+                ColumnRefExpression::new(aggregate_binding, aggregate_type.clone()).into(),
+            )
         })
     });
     if !expression_uses_only_binding(&scalar, aggregate_binding) {
@@ -1363,10 +1365,9 @@ fn apply_grouped_join_rewrite(
                     .then(|| group_binding_map.get(&column.binding).copied())
                     .flatten()
                     .map(|binding| {
-                        Expression::ColumnRef(ColumnRefExpression::new(
-                            binding,
-                            column.return_type.clone(),
-                        ))
+                        Expression::ColumnRef(
+                            ColumnRefExpression::new(binding, column.return_type.clone()).into(),
+                        )
                     })
             })
         })
@@ -1392,7 +1393,9 @@ fn apply_grouped_join_rewrite(
                 .ok_or_else(|| {
                     paro_error::internal("grouped-join output prefix contains an ungrouped binding")
                 })?;
-            Ok(Expression::ColumnRef(ColumnRefExpression::new(binding, ty)))
+            Ok(Expression::ColumnRef(
+                ColumnRefExpression::new(binding, ty).into(),
+            ))
         })
         .collect::<Result<Vec<_>>>()?;
     let output_table_index = rewrite
@@ -1411,10 +1414,13 @@ fn apply_grouped_join_rewrite(
 }
 
 fn scalar_presence_true() -> Expression {
-    Expression::Constant(paro_planner::expression::ConstantExpression::new(
-        paro_common::runtime_value::Value::Boolean(true),
-        paro_common::types::LogicalType::Boolean,
-    ))
+    Expression::Constant(
+        paro_planner::expression::ConstantExpression::new(
+            paro_common::runtime_value::Value::Boolean(true),
+            paro_common::types::LogicalType::Boolean,
+        )
+        .into(),
+    )
 }
 
 fn take_direct_delim_join_source(
@@ -1585,10 +1591,9 @@ fn rebase_expression(expression: &Expression, bindings: &BindingMap) -> Option<E
             valid.set(false);
             return None;
         };
-        Some(Expression::ColumnRef(ColumnRefExpression::new(
-            binding,
-            column.return_type.clone(),
-        )))
+        Some(Expression::ColumnRef(
+            ColumnRefExpression::new(binding, column.return_type.clone()).into(),
+        ))
     });
     (valid.get() && is_movable(&rebased)).then_some(rebased)
 }
@@ -1842,10 +1847,13 @@ mod proof_tests {
         );
         let inner = OwnedLogicalPlan::dummy_scan(&context);
         let column = |table_index, column_index| {
-            Expression::ColumnRef(ColumnRefExpression::new(
-                ColumnBinding::new(table_index, column_index),
-                LogicalType::BigInt,
-            ))
+            Expression::ColumnRef(
+                ColumnRefExpression::new(
+                    ColumnBinding::new(table_index, column_index),
+                    LogicalType::BigInt,
+                )
+                .into(),
+            )
         };
         let plan = OwnedLogicalPlan::new(
             &context,

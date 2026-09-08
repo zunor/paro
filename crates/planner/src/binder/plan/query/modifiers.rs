@@ -49,10 +49,9 @@ impl Binder {
                 .iter()
                 .enumerate()
                 .map(|(index, return_type)| {
-                    Expression::ColumnRef(ColumnRefExpression::new(
-                        bindings[index],
-                        return_type.clone(),
-                    ))
+                    Expression::ColumnRef(
+                        ColumnRefExpression::new(bindings[index], return_type.clone()).into(),
+                    )
                 })
                 .collect();
             root = LogicalOperator::Projection(

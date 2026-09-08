@@ -673,14 +673,17 @@ mod tests {
         table_index: usize,
         column_index: usize,
     ) -> paro_planner::expression::Expression {
-        paro_planner::expression::Expression::ColumnRef(ColumnRefExpression {
-            binding: paro_planner::operator::ColumnBinding {
-                table_index,
-                column_index,
-            },
-            depth: 0,
-            return_type: LogicalType::Integer,
-        })
+        paro_planner::expression::Expression::ColumnRef(
+            ColumnRefExpression {
+                binding: paro_planner::operator::ColumnBinding {
+                    table_index,
+                    column_index,
+                },
+                depth: 0,
+                return_type: LogicalType::Integer,
+            }
+            .into(),
+        )
     }
 
     fn create_equality_filter(
@@ -691,11 +694,14 @@ mod tests {
         right_col: usize,
         filter_index: usize,
     ) -> Arc<FilterInfo> {
-        let expr = paro_planner::expression::Expression::Comparison(ComparisonExpression {
-            left: Box::new(create_column_ref(left_table, left_col)),
-            right: Box::new(create_column_ref(right_table, right_col)),
-            comparison_type: ComparisonType::Equal,
-        });
+        let expr = paro_planner::expression::Expression::Comparison(
+            ComparisonExpression {
+                left: Box::new(create_column_ref(left_table, left_col)),
+                right: Box::new(create_column_ref(right_table, right_col)),
+                comparison_type: ComparisonType::Equal,
+            }
+            .into(),
+        );
 
         let set = set_manager.get_relation_from_vec(vec![left_table, right_table]);
         let left_set = set_manager.get_relation(left_table);
@@ -716,11 +722,14 @@ mod tests {
         filtering: usize,
         filter_index: usize,
     ) -> Arc<FilterInfo> {
-        let expression = paro_planner::expression::Expression::Comparison(ComparisonExpression {
-            left: Box::new(create_column_ref(preserved, 0)),
-            right: Box::new(create_column_ref(filtering, 0)),
-            comparison_type: ComparisonType::Equal,
-        });
+        let expression = paro_planner::expression::Expression::Comparison(
+            ComparisonExpression {
+                left: Box::new(create_column_ref(preserved, 0)),
+                right: Box::new(create_column_ref(filtering, 0)),
+                comparison_type: ComparisonType::Equal,
+            }
+            .into(),
+        );
         let set = set_manager
             .get_relation_from_vec(vec![preserved.min(filtering), preserved.max(filtering)]);
         let mut filter = FilterInfo::new(

@@ -28,19 +28,20 @@ use super::*;
 fn aggregate_lowers_post_reduction_into_separate_local_reference_domains() {
     let ctx = BindContext::new();
     let values = values(&ctx, vec![LogicalType::Integer]);
-    let count = Expression::Aggregate(Box::new(AggregateExpression::new(
-        get_count_star_function(),
-        vec![],
-        LogicalType::BigInt,
-    )));
+    let count = Expression::Aggregate(
+        AggregateExpression::new(get_count_star_function(), vec![], LogicalType::BigInt).into(),
+    );
     let (max_function, _) = get_max_function()
         .bind(&[LogicalType::BigInt])
         .expect("bind max(bigint)");
-    let reducer = Expression::Aggregate(Box::new(AggregateExpression::new(
-        max_function,
-        vec![aggregate_column(0, LogicalType::BigInt)],
-        LogicalType::BigInt,
-    )));
+    let reducer = Expression::Aggregate(
+        AggregateExpression::new(
+            max_function,
+            vec![aggregate_column(0, LogicalType::BigInt)],
+            LogicalType::BigInt,
+        )
+        .into(),
+    );
     let aggregate = Aggregate::new(
         1,
         2,
@@ -134,6 +135,7 @@ fn scalar_left_q11_predicate_preserves_comparison_orientation() {
     let Expression::Comparison(predicate) = &mut post.predicate else {
         unreachable!()
     };
+    let predicate = predicate.as_mut();
     std::mem::swap(&mut predicate.left, &mut predicate.right);
     predicate.comparison_type = ComparisonType::LessThan;
 
@@ -291,17 +293,18 @@ fn force_input_rollup(spec: &mut crate::physical::specs::AggregateSpec) {
 fn post_reduction_disables_dependent_group_state_projection() {
     let ctx = BindContext::new();
     let values = values(&ctx, vec![LogicalType::Integer, LogicalType::Integer]);
-    let count = Expression::Aggregate(Box::new(AggregateExpression::new(
-        get_count_star_function(),
-        vec![],
-        LogicalType::BigInt,
-    )));
+    let count = Expression::Aggregate(
+        AggregateExpression::new(get_count_star_function(), vec![], LogicalType::BigInt).into(),
+    );
     let (max_function, _) = get_max_function().bind(&[LogicalType::BigInt]).unwrap();
-    let reducer = Expression::Aggregate(Box::new(AggregateExpression::new(
-        max_function,
-        vec![aggregate_column(0, LogicalType::BigInt)],
-        LogicalType::BigInt,
-    )));
+    let reducer = Expression::Aggregate(
+        AggregateExpression::new(
+            max_function,
+            vec![aggregate_column(0, LogicalType::BigInt)],
+            LogicalType::BigInt,
+        )
+        .into(),
+    );
     let mut aggregate = Aggregate::new(
         1,
         2,
@@ -341,16 +344,22 @@ fn integer_sum_reduction(ctx: &BindContext) -> Aggregate {
     let values = values(ctx, vec![LogicalType::Integer, LogicalType::Integer]);
     let (sum, _) = get_sum_function().bind(&[LogicalType::Integer]).unwrap();
     let merge = sum.partial_merge_function().unwrap();
-    let source = Expression::Aggregate(Box::new(AggregateExpression::new(
-        sum,
-        vec![reference(1, LogicalType::Integer)],
-        LogicalType::BigInt,
-    )));
-    let reducer = Expression::Aggregate(Box::new(AggregateExpression::new(
-        merge,
-        vec![aggregate_column(0, LogicalType::BigInt)],
-        LogicalType::BigInt,
-    )));
+    let source = Expression::Aggregate(
+        AggregateExpression::new(
+            sum,
+            vec![reference(1, LogicalType::Integer)],
+            LogicalType::BigInt,
+        )
+        .into(),
+    );
+    let reducer = Expression::Aggregate(
+        AggregateExpression::new(
+            merge,
+            vec![aggregate_column(0, LogicalType::BigInt)],
+            LogicalType::BigInt,
+        )
+        .into(),
+    );
     bounded_group(Aggregate::new(
         1,
         2,
@@ -391,16 +400,17 @@ fn decimal_sum_reduction(ctx: &BindContext, complex_predicate: bool) -> Aggregat
         .bind(std::slice::from_ref(&input_type))
         .unwrap();
     let merge = sum.partial_merge_function().unwrap();
-    let source = Expression::Aggregate(Box::new(AggregateExpression::new(
-        sum,
-        vec![reference(1, input_type)],
-        sum_type.clone(),
-    )));
-    let reducer = Expression::Aggregate(Box::new(AggregateExpression::new(
-        merge,
-        vec![aggregate_column(0, sum_type.clone())],
-        sum_type.clone(),
-    )));
+    let source = Expression::Aggregate(
+        AggregateExpression::new(sum, vec![reference(1, input_type)], sum_type.clone()).into(),
+    );
+    let reducer = Expression::Aggregate(
+        AggregateExpression::new(
+            merge,
+            vec![aggregate_column(0, sum_type.clone())],
+            sum_type.clone(),
+        )
+        .into(),
+    );
     let scalar = decimal_cast(reference(0, sum_type.clone()), comparison_type.clone());
     let comparison = comparison(
         ComparisonType::GreaterThan,
@@ -411,16 +421,18 @@ fn decimal_sum_reduction(ctx: &BindContext, complex_predicate: bool) -> Aggregat
         scalar_column(0, comparison_type),
     );
     let predicate = if complex_predicate {
-        Expression::Conjunction(ConjunctionExpression {
-            conjunction_type: ConjunctionType::And,
-            children: vec![
-                comparison,
-                Expression::Constant(ConstantExpression::new(
-                    Value::Boolean(true),
-                    LogicalType::Boolean,
-                )),
-            ],
-        })
+        Expression::Conjunction(
+            ConjunctionExpression {
+                conjunction_type: ConjunctionType::And,
+                children: vec![
+                    comparison,
+                    Expression::Constant(
+                        ConstantExpression::new(Value::Boolean(true), LogicalType::Boolean).into(),
+                    ),
+                ],
+            }
+            .into(),
+        )
     } else {
         comparison
     };
@@ -458,15 +470,18 @@ fn lower_aggregate(
                 vec![comparison(
                     ComparisonType::GreaterThan,
                     reference(1, aggregate_type.clone()),
-                    Expression::Constant(ConstantExpression::new(
-                        match aggregate_type {
-                            LogicalType::Decimal { precision, scale } => {
-                                Value::Decimal(0, precision, scale)
-                            }
-                            _ => unreachable!(),
-                        },
-                        aggregate_type,
-                    )),
+                    Expression::Constant(
+                        ConstantExpression::new(
+                            match aggregate_type {
+                                LogicalType::Decimal { precision, scale } => {
+                                    Value::Decimal(0, precision, scale)
+                                }
+                                _ => unreachable!(),
+                            },
+                            aggregate_type,
+                        )
+                        .into(),
+                    ),
                 )],
             )),
         )
@@ -505,7 +520,7 @@ fn decimal_cast(child: Expression, target: LogicalType) -> Expression {
     let mut casts = CastFunctionSet::new();
     casts.register_bind_function(bind_decimal_casts);
     let cast_info = casts.get_cast_function(&source, &target).unwrap();
-    Expression::Cast(CastExpression::new(child, target, cast_info, false))
+    Expression::Cast(CastExpression::new(child, target, cast_info, false).into())
 }
 
 fn values(ctx: &BindContext, types: Vec<LogicalType>) -> OwnedLogicalPlan {
@@ -521,19 +536,19 @@ fn values(ctx: &BindContext, types: Vec<LogicalType>) -> OwnedLogicalPlan {
 }
 
 fn aggregate_column(index: usize, ty: LogicalType) -> Expression {
-    Expression::ColumnRef(ColumnRefExpression::new(ColumnBinding::new(2, index), ty))
+    Expression::ColumnRef(ColumnRefExpression::new(ColumnBinding::new(2, index), ty).into())
 }
 
 fn scalar_column(index: usize, ty: LogicalType) -> Expression {
-    Expression::ColumnRef(ColumnRefExpression::new(ColumnBinding::new(4, index), ty))
+    Expression::ColumnRef(ColumnRefExpression::new(ColumnBinding::new(4, index), ty).into())
 }
 
 fn reference(index: usize, ty: LogicalType) -> Expression {
-    Expression::Reference(ReferenceExpression::new(index, ty))
+    Expression::Reference(ReferenceExpression::new(index, ty).into())
 }
 
 fn comparison(kind: ComparisonType, left: Expression, right: Expression) -> Expression {
-    Expression::Comparison(ComparisonExpression::new(kind, left, right))
+    Expression::Comparison(ComparisonExpression::new(kind, left, right).into())
 }
 
 fn parallel_context() -> ExtractionContext {

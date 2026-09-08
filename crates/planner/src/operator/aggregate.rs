@@ -708,42 +708,43 @@ mod tests {
                 vec![LogicalType::Integer],
             ),
         ));
-        let count = Expression::Aggregate(Box::new(AggregateExpression::new(
-            get_count_star_function(),
-            Vec::new(),
-            LogicalType::BigInt,
-        )));
+        let count = Expression::Aggregate(
+            AggregateExpression::new(get_count_star_function(), Vec::new(), LogicalType::BigInt)
+                .into(),
+        );
         let (max, _) = get_max_function()
             .bind(&[LogicalType::BigInt])
             .expect("bind max(bigint)");
-        let reducer = Expression::Aggregate(Box::new(AggregateExpression::new(
-            max,
-            vec![Expression::ColumnRef(ColumnRefExpression::new(
-                ColumnBinding::new(2, 0),
+        let reducer = Expression::Aggregate(
+            AggregateExpression::new(
+                max,
+                vec![Expression::ColumnRef(
+                    ColumnRefExpression::new(ColumnBinding::new(2, 0), LogicalType::BigInt).into(),
+                )],
                 LogicalType::BigInt,
-            ))],
-            LogicalType::BigInt,
-        )));
-        let predicate = Expression::Comparison(ComparisonExpression::new(
-            ComparisonType::Equal,
-            Expression::ColumnRef(ColumnRefExpression::new(
-                ColumnBinding::new(2, 0),
-                LogicalType::BigInt,
-            )),
-            Expression::ColumnRef(ColumnRefExpression::new(
-                ColumnBinding::new(4, 0),
-                LogicalType::BigInt,
-            )),
-        ));
+            )
+            .into(),
+        );
+        let predicate = Expression::Comparison(
+            ComparisonExpression::new(
+                ComparisonType::Equal,
+                Expression::ColumnRef(
+                    ColumnRefExpression::new(ColumnBinding::new(2, 0), LogicalType::BigInt).into(),
+                ),
+                Expression::ColumnRef(
+                    ColumnRefExpression::new(ColumnBinding::new(4, 0), LogicalType::BigInt).into(),
+                ),
+            )
+            .into(),
+        );
         Aggregate::new(
             1,
             2,
             3,
             child,
-            vec![Expression::Reference(ReferenceExpression::new(
-                0,
-                LogicalType::Integer,
-            ))],
+            vec![Expression::Reference(
+                ReferenceExpression::new(0, LogicalType::Integer).into(),
+            )],
             Vec::new(),
             vec![count],
             Vec::new(),
@@ -751,10 +752,9 @@ mod tests {
         .with_post_reduction(PostAggregateReduction {
             reduction_index: 4,
             reducers: vec![reducer],
-            scalar_expressions: vec![Expression::Reference(ReferenceExpression::new(
-                0,
-                LogicalType::BigInt,
-            ))],
+            scalar_expressions: vec![Expression::Reference(
+                ReferenceExpression::new(0, LogicalType::BigInt).into(),
+            )],
             predicate,
         })
     }
@@ -785,7 +785,7 @@ mod tests {
             .as_mut()
             .expect("reduction")
             .scalar_expressions[0] =
-            Expression::Reference(ReferenceExpression::new(1, LogicalType::BigInt));
+            Expression::Reference(ReferenceExpression::new(1, LogicalType::BigInt).into());
 
         let error = aggregate
             .verify_post_reduction()

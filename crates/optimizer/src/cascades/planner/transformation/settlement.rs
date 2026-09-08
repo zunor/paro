@@ -866,10 +866,13 @@ mod tests {
                 0,
                 (0..rows)
                     .map(|row| {
-                        vec![Expression::Constant(ConstantExpression::new(
-                            Value::Integer(row as i32),
-                            LogicalType::Integer,
-                        ))]
+                        vec![Expression::Constant(
+                            ConstantExpression::new(
+                                Value::Integer(row as i32),
+                                LogicalType::Integer,
+                            )
+                            .into(),
+                        )]
                     })
                     .collect(),
                 vec!["key".into()],
@@ -884,10 +887,9 @@ mod tests {
             LogicalOperator::Projection(Projection::new(
                 1,
                 child,
-                vec![Expression::ColumnRef(ColumnRefExpression::new(
-                    ColumnBinding::new(0, 0),
-                    LogicalType::Integer,
-                ))],
+                vec![Expression::ColumnRef(
+                    ColumnRefExpression::new(ColumnBinding::new(0, 0), LogicalType::Integer).into(),
+                )],
             )),
         )
     }
@@ -896,10 +898,9 @@ mod tests {
     fn limits_and_distinct_targets_are_not_scalar_free_cache_keys() {
         let env = environment();
         let literal = |value| {
-            Expression::Constant(ConstantExpression::new(
-                Value::BigInt(value),
-                LogicalType::BigInt,
-            ))
+            Expression::Constant(
+                ConstantExpression::new(Value::BigInt(value), LogicalType::BigInt).into(),
+            )
         };
         let limit = |value| {
             OwnedLogicalPlan::new(
@@ -1132,10 +1133,9 @@ mod tests {
             &env.bind_context,
             LogicalOperator::Filter(paro_planner::operator::Filter::new(
                 values(&env.bind_context, 3),
-                vec![Expression::Constant(ConstantExpression::new(
-                    Value::Boolean(true),
-                    LogicalType::Boolean,
-                ))],
+                vec![Expression::Constant(
+                    ConstantExpression::new(Value::Boolean(true), LogicalType::Boolean).into(),
+                )],
             )),
         );
         let actual = cache.settle(filtered, &env).unwrap();
@@ -1171,17 +1171,19 @@ mod tests {
         );
         let mut filter = Filter::new(
             scan,
-            vec![Expression::Comparison(ComparisonExpression::new(
-                ComparisonType::GreaterThan,
-                Expression::ColumnRef(ColumnRefExpression::new(
-                    ColumnBinding::new(0, 0),
-                    LogicalType::Integer,
-                )),
-                Expression::Constant(ConstantExpression::new(
-                    Value::Integer(0),
-                    LogicalType::Integer,
-                )),
-            ))],
+            vec![Expression::Comparison(
+                ComparisonExpression::new(
+                    ComparisonType::GreaterThan,
+                    Expression::ColumnRef(
+                        ColumnRefExpression::new(ColumnBinding::new(0, 0), LogicalType::Integer)
+                            .into(),
+                    ),
+                    Expression::Constant(
+                        ConstantExpression::new(Value::Integer(0), LogicalType::Integer).into(),
+                    ),
+                )
+                .into(),
+            )],
         );
         filter.projection_map = ProjectionMap::new(vec![0]);
         let plan = OwnedLogicalPlan::new(
@@ -1189,10 +1191,9 @@ mod tests {
             LogicalOperator::Projection(Projection::new(
                 1,
                 OwnedLogicalPlan::new(&env.bind_context, LogicalOperator::Filter(filter)),
-                vec![Expression::ColumnRef(ColumnRefExpression::new(
-                    ColumnBinding::new(0, 2),
-                    LogicalType::Integer,
-                ))],
+                vec![Expression::ColumnRef(
+                    ColumnRefExpression::new(ColumnBinding::new(0, 2), LogicalType::Integer).into(),
+                )],
             )),
         );
         let mut cache = SettlementCache::default();

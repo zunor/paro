@@ -441,10 +441,13 @@ impl<'a> ExpressionBinder<'a> {
         let text = format!("{value} {unit}");
         let interval = paro_function::scalar::cast::date_casts::parse_interval_text(&text)
             .ok_or_else(|| paro_error::invalid_value("INTERVAL", &text))?;
-        Ok(Expression::Constant(ConstantExpression::new(
-            Value::Interval(interval.months, interval.days, interval.micros),
-            LogicalType::Interval,
-        )))
+        Ok(Expression::Constant(
+            ConstantExpression::new(
+                Value::Interval(interval.months, interval.days, interval.micros),
+                LogicalType::Interval,
+            )
+            .into(),
+        ))
     }
 
     fn bind_column_ref(&mut self, column: ColumnRef) -> Result<Expression> {
@@ -770,10 +773,13 @@ impl<'a> ExpressionBinder<'a> {
             })?;
         let col_idx = grouping_context.grouping_functions.len();
         grouping_context.grouping_functions.push(group_indexes);
-        Ok(Expression::ColumnRef(ColumnRefExpression::new(
-            ColumnBinding::new(groupings_index, col_idx),
-            LogicalType::BigInt,
-        )))
+        Ok(Expression::ColumnRef(
+            ColumnRefExpression::new(
+                ColumnBinding::new(groupings_index, col_idx),
+                LogicalType::BigInt,
+            )
+            .into(),
+        ))
     }
 
     fn bind_in_subquery(
@@ -792,11 +798,14 @@ impl<'a> ExpressionBinder<'a> {
         )?;
 
         if not {
-            Ok(Expression::Operator(OperatorExpression::new_unary(
-                OperatorType::Not,
-                bound_subquery,
-                LogicalType::Boolean,
-            )))
+            Ok(Expression::Operator(
+                OperatorExpression::new_unary(
+                    OperatorType::Not,
+                    bound_subquery,
+                    LogicalType::Boolean,
+                )
+                .into(),
+            ))
         } else {
             Ok(bound_subquery)
         }

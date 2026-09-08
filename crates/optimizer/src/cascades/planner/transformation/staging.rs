@@ -1008,8 +1008,8 @@ mod tests {
         rows: u64,
     ) -> OwnedLogicalPlan {
         let condition = JoinCondition::equality(
-            Expression::Reference(ReferenceExpression::new(0, LogicalType::Integer)),
-            Expression::Reference(ReferenceExpression::new(0, LogicalType::Integer)),
+            Expression::Reference(ReferenceExpression::new(0, LogicalType::Integer).into()),
+            Expression::Reference(ReferenceExpression::new(0, LogicalType::Integer).into()),
         );
         let mut plan = OwnedLogicalPlan::synthetic(LogicalOperator::Join(Join::Comparison(
             ComparisonJoin::new(JoinType::Inner, left, right, vec![condition]),
@@ -1042,10 +1042,9 @@ mod tests {
             OwnedLogicalPlan::synthetic(LogicalOperator::Projection(Projection::new(
                 table,
                 source(),
-                vec![Expression::ColumnRef(ColumnRefExpression::new(
-                    ColumnBinding::new(0, 0),
-                    LogicalType::Integer,
-                ))],
+                vec![Expression::ColumnRef(
+                    ColumnRefExpression::new(ColumnBinding::new(0, 0), LogicalType::Integer).into(),
+                )],
             )))
         };
         let mut state = input.planner_state.write().unwrap();

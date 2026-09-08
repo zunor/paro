@@ -240,14 +240,16 @@ mod tests {
             .bind(std::slice::from_ref(&input_type))
             .unwrap();
         assert_eq!(targets, [input_type.clone()]);
-        let sum = Expression::Aggregate(Box::new(AggregateExpression::new(
-            function,
-            vec![Expression::Reference(ReferenceExpression::new(
-                1,
-                input_type.clone(),
-            ))],
-            output_type.clone(),
-        )));
+        let sum = Expression::Aggregate(
+            AggregateExpression::new(
+                function,
+                vec![Expression::Reference(
+                    ReferenceExpression::new(1, input_type.clone()).into(),
+                )],
+                output_type.clone(),
+            )
+            .into(),
+        );
         let mut aggregate = OwnedLogicalPlan::new(
             &ctx,
             LogicalOperator::Aggregate(Box::new(Aggregate::new(
@@ -255,10 +257,9 @@ mod tests {
                 21,
                 22,
                 input,
-                vec![Expression::Reference(ReferenceExpression::new(
-                    0,
-                    LogicalType::BigInt,
-                ))],
+                vec![Expression::Reference(
+                    ReferenceExpression::new(0, LogicalType::BigInt).into(),
+                )],
                 Vec::new(),
                 vec![sum],
                 Vec::new(),
@@ -266,11 +267,10 @@ mod tests {
         );
         aggregate.stats.estimated_cardinality = Some(CardinalityEstimate::exact(1_500_000));
 
-        let output = Expression::Reference(ReferenceExpression::new(1, output_type.clone()));
-        let constant = Expression::Constant(ConstantExpression::new(
-            Value::Decimal(30_000, 38, 2),
-            output_type,
-        ));
+        let output = Expression::Reference(ReferenceExpression::new(1, output_type.clone()).into());
+        let constant = Expression::Constant(
+            ConstantExpression::new(Value::Decimal(30_000, 38, 2), output_type).into(),
+        );
         let comparison = if constant_on_left {
             ComparisonExpression::new(ComparisonType::LessThan, constant, output)
         } else {
@@ -285,7 +285,7 @@ mod tests {
             Arc::new(ColumnStatistics::new(base)),
         )]);
         (
-            Filter::new(aggregate, vec![Expression::Comparison(comparison)]),
+            Filter::new(aggregate, vec![Expression::Comparison(comparison.into())]),
             stats,
         )
     }

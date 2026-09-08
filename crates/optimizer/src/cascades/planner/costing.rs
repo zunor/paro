@@ -365,7 +365,8 @@ fn runtime_filter_source_facts<'a>(
                         paro_planner::expression::ColumnRefExpression::new(
                             *bindings.get(index)?,
                             types.get(index)?.clone(),
-                        ),
+                        )
+                        .into(),
                     ))
                 })
                 .collect::<Option<Vec<_>>>()?;

@@ -182,7 +182,8 @@ mod tests {
                             ConstantExpression {
                                 value: Value::Integer(v + 1),
                                 return_type: LogicalType::Integer,
-                            },
+                            }
+                            .into(),
                         )));
                     }
                 }
@@ -222,7 +223,8 @@ mod tests {
                         ConstantExpression {
                             value: Value::Boolean(true),
                             return_type: LogicalType::Boolean,
-                        },
+                        }
+                        .into(),
                     )));
                 }
             }
@@ -264,7 +266,8 @@ mod tests {
                             ConstantExpression {
                                 value: Value::Boolean(true),
                                 return_type: LogicalType::Boolean,
-                            },
+                            }
+                            .into(),
                         )));
                     }
                 }
@@ -274,10 +277,13 @@ mod tests {
     }
 
     fn make_constant(value: i32) -> Expression {
-        Expression::Constant(ConstantExpression {
-            value: Value::Integer(value),
-            return_type: LogicalType::Integer,
-        })
+        Expression::Constant(
+            ConstantExpression {
+                value: Value::Integer(value),
+                return_type: LogicalType::Integer,
+            }
+            .into(),
+        )
     }
 
     #[test]
@@ -321,11 +327,10 @@ mod tests {
         rewriter.add_rule(Box::new(IncrementSmallConstantRule::new()));
 
         // Create comparison: 98 = 99
-        let mut expr = Expression::Comparison(ComparisonExpression::new(
-            ComparisonType::Equal,
-            make_constant(98),
-            make_constant(99),
-        ));
+        let mut expr = Expression::Comparison(
+            ComparisonExpression::new(ComparisonType::Equal, make_constant(98), make_constant(99))
+                .into(),
+        );
         let op = LogicalOperator::DummyScan;
 
         rewriter.rewrite_expression(&mut expr, &op);
@@ -352,20 +357,23 @@ mod tests {
         let mut rewriter = ExpressionRewriter::new();
         rewriter.add_rule(Box::new(IncrementSmallConstantRule::new()));
 
-        let mut expr = Expression::Window(Box::new(WindowExpression::native(
-            WindowFunction::row_number(),
-            Vec::new(),
-            Vec::new(),
-            Vec::new(),
-            WindowFrame {
-                frame_type: WindowFrameType::Rows,
-                start_bound: WindowFrameBound::Offset(Box::new(make_constant(98))),
-                start_is_preceding: true,
-                end_bound: WindowFrameBound::Offset(Box::new(make_constant(99))),
-                end_is_preceding: false,
-            },
-            false,
-        )));
+        let mut expr = Expression::Window(
+            WindowExpression::native(
+                WindowFunction::row_number(),
+                Vec::new(),
+                Vec::new(),
+                Vec::new(),
+                WindowFrame {
+                    frame_type: WindowFrameType::Rows,
+                    start_bound: WindowFrameBound::Offset(Box::new(make_constant(98))),
+                    start_is_preceding: true,
+                    end_bound: WindowFrameBound::Offset(Box::new(make_constant(99))),
+                    end_is_preceding: false,
+                },
+                false,
+            )
+            .into(),
+        );
 
         rewriter.rewrite_expression(&mut expr, &LogicalOperator::DummyScan);
         let Expression::Window(window) = expr else {
@@ -387,11 +395,10 @@ mod tests {
         rewriter.add_rule(Box::new(SelfEqualityRule::new()));
 
         // Create comparison: 42 = 42
-        let mut expr = Expression::Comparison(ComparisonExpression::new(
-            ComparisonType::Equal,
-            make_constant(42),
-            make_constant(42),
-        ));
+        let mut expr = Expression::Comparison(
+            ComparisonExpression::new(ComparisonType::Equal, make_constant(42), make_constant(42))
+                .into(),
+        );
         let op = LogicalOperator::DummyScan;
 
         rewriter.rewrite_expression(&mut expr, &op);
@@ -410,11 +417,10 @@ mod tests {
         rewriter.add_rule(Box::new(IncrementSmallConstantRule::new()));
 
         // Create filter with expressions: [99 = 99]
-        let condition = Expression::Comparison(ComparisonExpression::new(
-            ComparisonType::Equal,
-            make_constant(99),
-            make_constant(99),
-        ));
+        let condition = Expression::Comparison(
+            ComparisonExpression::new(ComparisonType::Equal, make_constant(99), make_constant(99))
+                .into(),
+        );
 
         let mut op = LogicalOperator::Filter(Filter::new(
             OwnedLogicalPlan::synthetic(LogicalOperator::DummyScan),
@@ -468,11 +474,10 @@ mod tests {
         let mut rewriter = ExpressionRewriter::new();
         rewriter.add_rule(Box::new(ConstantFoldingRule::new()));
 
-        let foldable = Expression::Comparison(ComparisonExpression::new(
-            ComparisonType::Equal,
-            make_constant(42),
-            make_constant(42),
-        ));
+        let foldable = Expression::Comparison(
+            ComparisonExpression::new(ComparisonType::Equal, make_constant(42), make_constant(42))
+                .into(),
+        );
         let mut op = LogicalOperator::ExpressionGet(ExpressionGet::new(
             0,
             vec![vec![foldable]],
@@ -544,11 +549,10 @@ mod tests {
         rewriter.add_rule(Box::new(ConstantComparisonFoldingRule::new()));
 
         // Create comparison: 42 = 42 (should fold to true)
-        let mut expr = Expression::Comparison(ComparisonExpression::new(
-            ComparisonType::Equal,
-            make_constant(42),
-            make_constant(42),
-        ));
+        let mut expr = Expression::Comparison(
+            ComparisonExpression::new(ComparisonType::Equal, make_constant(42), make_constant(42))
+                .into(),
+        );
         let op = LogicalOperator::DummyScan;
 
         rewriter.rewrite_expression(&mut expr, &op);

@@ -259,10 +259,13 @@ impl<'a> RecursiveSubqueryPlanner<'a> {
             LogicalOperator::Join(Join::Any(any)) => {
                 let mut condition = std::mem::replace(
                     &mut any.condition,
-                    crate::expression::Expression::Constant(ConstantExpression {
-                        value: Value::Boolean(true),
-                        return_type: LogicalType::Boolean,
-                    }),
+                    crate::expression::Expression::Constant(
+                        ConstantExpression {
+                            value: Value::Boolean(true),
+                            return_type: LogicalType::Boolean,
+                        }
+                        .into(),
+                    ),
                 );
                 let mut found = false;
                 found |= self

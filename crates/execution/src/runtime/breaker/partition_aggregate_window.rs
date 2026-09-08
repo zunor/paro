@@ -753,7 +753,7 @@ mod tests {
     use crate::pipeline::handles::{BreakerHandleId, BreakerHandleKind};
 
     fn reference(index: usize, ty: LogicalType) -> Expression {
-        Expression::Reference(ReferenceExpression::new(index, ty))
+        Expression::Reference(ReferenceExpression::new(index, ty).into())
     }
 
     fn test_spec() -> PartitionAggregateWindowSpec {
@@ -770,11 +770,14 @@ mod tests {
             groups: Box::new([reference(0, LogicalType::Integer)]),
             group_key_encodings: Box::new([GroupKeyEncoding::Identity]),
             grouping_sets: Box::new([]),
-            aggregates: Box::new([Expression::Aggregate(Box::new(AggregateExpression::new(
-                get_count_star_function(),
-                Vec::new(),
-                LogicalType::BigInt,
-            )))]),
+            aggregates: Box::new([Expression::Aggregate(
+                AggregateExpression::new(
+                    get_count_star_function(),
+                    Vec::new(),
+                    LogicalType::BigInt,
+                )
+                .into(),
+            )]),
             grouping_functions: Box::new([]),
             aggregate_inputs: Box::new([Box::new([])]),
             aggregate_filters: Box::new([None]),

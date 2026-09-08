@@ -311,7 +311,7 @@ fn peel_scalar_branch(plan: &OwnedLogicalPlan, leaf_index: usize) -> Option<Scal
         wrapper_type: checked.return_type.clone(),
         scalar_expression: scalar_expression.clone(),
         scalar_source_binding: ColumnBinding::new(reduction.aggregate_index, 0),
-        aggregate: *aggregate.clone(),
+        aggregate: aggregate.as_ref().clone(),
         filter_expressions,
         source_get: *source_get.clone(),
     })
@@ -481,10 +481,9 @@ fn apply_rewrite(
                 .then(|| replacements.get(&column.binding).copied())
                 .flatten()
                 .map(|binding| {
-                    Expression::ColumnRef(ColumnRefExpression::new(
-                        binding,
-                        column.return_type.clone(),
-                    ))
+                    Expression::ColumnRef(
+                        ColumnRefExpression::new(binding, column.return_type.clone()).into(),
+                    )
                 })
         });
     }
@@ -553,7 +552,7 @@ fn build_fused_group(
         let bindings = AlphaBindings::match_gets(&group.fused_get, &branch.source_get)
             .ok_or_else(|| paro_error::internal("fused scan no longer covers a scalar branch"))?;
         let Expression::Aggregate(aggregate) = bindings
-            .rebase_scalar(&Expression::Aggregate(Box::new(branch.aggregate.clone())))
+            .rebase_scalar(&Expression::Aggregate(branch.aggregate.clone().into()))
             .ok_or_else(|| {
                 paro_error::internal("scalar aggregate inputs escaped the fused scan")
             })?
@@ -569,10 +568,13 @@ fn build_fused_group(
             .clone()
             .replace_column_ref(&|column| {
                 (column.depth == 0 && column.binding == branch.scalar_source_binding).then(|| {
-                    Expression::ColumnRef(ColumnRefExpression::new(
-                        aggregate_binding,
-                        branch.aggregate.return_type.clone(),
-                    ))
+                    Expression::ColumnRef(
+                        ColumnRefExpression::new(
+                            aggregate_binding,
+                            branch.aggregate.return_type.clone(),
+                        )
+                        .into(),
+                    )
                 })
             });
         if !expression_uses_only_binding(&scalar_expression, aggregate_binding) {

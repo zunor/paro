@@ -51,7 +51,7 @@ impl NullRejectedKeyProof {
                 }
                 Some(NullRejectedRightKey {
                     left: condition.left,
-                    right,
+                    right: right.into_inner(),
                 })
             })
             .collect::<Option<Vec<_>>>()?;
@@ -69,7 +69,7 @@ impl NullRejectedKeyProof {
         self.keys.iter().map(|key| {
             JoinCondition::new(
                 key.left.clone(),
-                Expression::ColumnRef(key.right.clone()),
+                Expression::ColumnRef(key.right.clone().into()),
                 JoinComparisonType::Equal,
             )
         })
@@ -650,10 +650,13 @@ mod tests {
     use super::*;
 
     fn column(table_index: usize, column_index: usize) -> Expression {
-        Expression::ColumnRef(ColumnRefExpression::new(
-            ColumnBinding::new(table_index, column_index),
-            LogicalType::BigInt,
-        ))
+        Expression::ColumnRef(
+            ColumnRefExpression::new(
+                ColumnBinding::new(table_index, column_index),
+                LogicalType::BigInt,
+            )
+            .into(),
+        )
     }
 
     #[test]
@@ -707,7 +710,8 @@ mod tests {
             }],
             UniqueKeyProvenance::CatalogEnforced,
         ));
-        let reference = Expression::Reference(ReferenceExpression::new(0, LogicalType::BigInt));
+        let reference =
+            Expression::Reference(ReferenceExpression::new(0, LogicalType::BigInt).into());
 
         assert!(!expressions_cover_catalog_unique_key(&plan, &[&reference]));
         assert!(proven_unique_keys(&plan).is_empty());
