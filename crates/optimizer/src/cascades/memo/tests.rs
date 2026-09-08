@@ -31,6 +31,87 @@ fn schema(column: u32) -> GroupSchema {
     .unwrap()
 }
 
+#[test]
+fn statistics_read_cache_revalidates_registry_rollback_reinsert_and_merge() {
+    let mut memo = Memo::new(SearchBudget::default());
+    let canonical = memo.create_group(
+        schema(1),
+        LogicalProperties::default(),
+        GroupCardinality::default(),
+    );
+    let producer = memo.create_group(
+        schema(1),
+        LogicalProperties::default(),
+        GroupCardinality::default(),
+    );
+    let mut properties = LogicalProperties::default();
+    properties.cte_references.insert(CteReferenceDomain {
+        cte_index: 7,
+        columns: BTreeMap::from([(CteColumnId(0), ColumnId(2))]),
+    });
+    let reader = memo.create_group(schema(2), properties, GroupCardinality::default());
+    let check = |memo: &Memo| {
+        let cached = memo.local_statistics_fingerprint(reader);
+        assert_eq!(
+            cached,
+            memo.compute_local_statistics_fingerprint(memo.group(reader).unwrap())
+        );
+        assert_eq!(memo.local_statistics_fingerprint(reader), cached);
+        cached
+    };
+    let missing = check(&memo);
+    let checkpoint = memo.transformation_savepoint();
+    let correspondence = BTreeMap::from([(CteColumnId(0), ColumnId(1))]);
+    memo.register_cte_producer(7, producer, correspondence.clone())
+        .unwrap();
+    let published = check(&memo);
+    assert_ne!(published, missing);
+    let published_revision = memo.cte_registry_revision;
+    memo.register_cte_producer(7, producer, correspondence.clone())
+        .unwrap();
+    assert_eq!(memo.cte_registry_revision, published_revision);
+    memo.rollback_transformation(checkpoint).unwrap();
+    assert!(memo.cte_registry_revision > published_revision);
+    assert_eq!(check(&memo), missing);
+    memo.register_cte_producer(7, producer, correspondence)
+        .unwrap();
+    assert!(memo.cte_registry_revision > published_revision);
+    assert_eq!(check(&memo), published);
+    memo.merge_groups(canonical, producer).unwrap();
+    assert_ne!(check(&memo), published);
+    let before_local_change = check(&memo);
+    memo.group_mut(reader).unwrap().cardinality.range = Some(CardinalityEnvelope {
+        lower: 1,
+        expected_lower: 2,
+        expected_upper: 2,
+        upper: 3,
+    });
+    assert_ne!(check(&memo), before_local_change);
+}
+
+#[test]
+fn non_cte_statistics_cache_is_independent_of_registry_mutations() {
+    let mut memo = Memo::new(SearchBudget::default());
+    let group = memo.create_group(
+        schema(1),
+        LogicalProperties::default(),
+        GroupCardinality::default(),
+    );
+    let fingerprint = memo.local_statistics_fingerprint(group);
+    memo.register_cte_producer(7, group, BTreeMap::from([(CteColumnId(0), ColumnId(1))]))
+        .unwrap();
+    assert_eq!(memo.local_statistics_fingerprint(group), fingerprint);
+    assert_eq!(
+        *memo
+            .group(group)
+            .unwrap()
+            .statistics_read_fingerprint
+            .lock()
+            .unwrap(),
+        Some((0, fingerprint))
+    );
+}
+
 fn provided() -> ProvidedProperties {
     ProvidedProperties {
         ordering: ProvidedOrdering::Unordered,

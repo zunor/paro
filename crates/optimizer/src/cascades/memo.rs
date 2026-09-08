@@ -23,7 +23,7 @@ use super::rules::CostComposition;
 use crate::physical::ObjectiveProfile;
 use paro_planner::operator::cte::CteColumnId;
 use paro_storage::statistics::{DistinctEvidence, DistinctProvenance};
-use std::sync::{Arc, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock};
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct LogicalProperties {
@@ -835,6 +835,10 @@ pub struct Group {
     /// then serialize each immutable value at most once per mutation epoch.
     logical_fact_fingerprint: OnceLock<Fingerprint>,
     statistics_snapshot_fingerprint: OnceLock<Fingerprint>,
+    /// The read transcript adds definition-to-producer correspondences to
+    /// local statistics. Cache its value separately from the registry cursor:
+    /// cursor changes cause revalidation, never a new semantic fingerprint.
+    statistics_read_fingerprint: Mutex<Option<(u64, Fingerprint)>>,
     logical_exprs: Vec<LogicalExprId>,
     /// Last Memo-global revision that changed the logical expression set.
     /// Transformation consumers use it to distinguish a completed match from
@@ -871,6 +875,10 @@ impl Group {
     fn invalidate_fact_fingerprints(&mut self) {
         self.logical_fact_fingerprint.take();
         self.statistics_snapshot_fingerprint.take();
+        *self
+            .statistics_read_fingerprint
+            .get_mut()
+            .expect("Memo statistics read cache poisoned") = None;
     }
 
     pub fn physical_exprs(&self) -> &[PhysicalExprId] {
@@ -918,6 +926,9 @@ pub struct Memo {
     optional_group_budget_sealed: bool,
     cte_producers: BTreeMap<usize, BTreeSet<CteProducerDomain>>,
     cte_producer_insertions: Vec<(usize, CteProducerDomain)>,
+    /// Monotone even across rollback/reinsert. Group merges also advance this
+    /// cursor because producer correspondences encode canonical GroupIds.
+    cte_registry_revision: u64,
     cte_column_types: BTreeMap<(usize, CteColumnId), paro_common::types::LogicalType>,
     cte_type_insertions: Vec<(usize, CteColumnId)>,
     changed_cte_domains: BTreeSet<usize>,
@@ -973,6 +984,7 @@ impl Memo {
             optional_group_budget_sealed: false,
             cte_producers: BTreeMap::new(),
             cte_producer_insertions: Vec::new(),
+            cte_registry_revision: 0,
             cte_column_types: BTreeMap::new(),
             cte_type_insertions: Vec::new(),
             changed_cte_domains: BTreeSet::new(),
@@ -1057,6 +1069,7 @@ impl Memo {
             .or_default()
             .insert(producer.clone())
         {
+            self.advance_cte_registry_revision()?;
             self.cte_producer_insertions.push((cte_index, producer));
             self.changed_cte_domains.insert(cte_index);
         }
@@ -1086,6 +1099,34 @@ impl Memo {
         let group = self
             .group(self.canonical_group(id))
             .expect("observed group exists");
+        let revision = if group.logical_properties.cte_references.is_empty() {
+            0
+        } else {
+            self.cte_registry_revision
+        };
+        let mut cached = group
+            .statistics_read_fingerprint
+            .lock()
+            .expect("Memo statistics read cache poisoned");
+        if let Some((previous, fingerprint)) = *cached {
+            if previous == revision {
+                return fingerprint;
+            }
+        }
+        let fingerprint = self.compute_local_statistics_fingerprint(group);
+        *cached = Some((revision, fingerprint));
+        fingerprint
+    }
+
+    fn advance_cte_registry_revision(&mut self) -> Result<()> {
+        self.cte_registry_revision = self
+            .cte_registry_revision
+            .checked_add(1)
+            .ok_or_else(|| paro_error::internal("Memo CTE registry revision overflow"))?;
+        Ok(())
+    }
+
+    fn compute_local_statistics_fingerprint(&self, group: &Group) -> Fingerprint {
         let mut fingerprint = StableFingerprintBuilder::default();
         fingerprint.write_fingerprint(group.statistics_snapshot_fingerprint());
         for reference in &group.logical_properties.cte_references {
@@ -1317,6 +1358,9 @@ impl Memo {
         self.regions = savepoint.regions;
         self.global_ledger
             .rollback_to_preserving_exhaustion(savepoint.global_ledger)?;
+        if self.cte_producer_insertions.len() != savepoint.cte_producer_insertions {
+            self.advance_cte_registry_revision()?;
+        }
         for (domain, producer) in self
             .cte_producer_insertions
             .drain(savepoint.cte_producer_insertions..)
@@ -1458,6 +1502,7 @@ impl Memo {
             cardinality,
             logical_fact_fingerprint: OnceLock::new(),
             statistics_snapshot_fingerprint: OnceLock::new(),
+            statistics_read_fingerprint: Mutex::new(None),
             logical_exprs: Vec::new(),
             logical_expression_version: 0,
             physical_exprs: Vec::new(),
@@ -2173,6 +2218,7 @@ impl Memo {
                 self.groups[secondary.index()].logical_properties,
             )));
         }
+        self.advance_cte_registry_revision()?;
         self.parents[secondary.index()] = canonical;
         self.logical_frontier_revision = self
             .logical_frontier_revision
