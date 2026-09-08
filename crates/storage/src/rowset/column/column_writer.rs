@@ -538,8 +538,6 @@ fn fixed_type_size(opts: &ColumnWriterOptions) -> Option<usize> {
 fn normalize_stats_logical_type(logical_type: LogicalType) -> LogicalType {
     match logical_type {
         LogicalType::VarcharCollation(_) => LogicalType::Varchar,
-        // Use i128 for decimal statistics until scale-aware stats are supported.
-        LogicalType::Decimal { .. } => LogicalType::HugeInt,
         other => other,
     }
 }
@@ -957,9 +955,14 @@ impl<W: DataWriter> ScalarColumnWriter<W> {
             | LogicalType::StringLiteral => {
                 return Ok(None);
             }
-            LogicalType::Decimal { .. } => {
-                // Decimal stats are tracked as i128 (HugeInt) after normalization.
-                Value::HugeInt(decode_signed_wide_integer(bytes, "Decimal")?)
+            LogicalType::Decimal { precision, scale } => {
+                // The backing integer is an encoding, not the SQL value's
+                // type. NumericStats already retains scale-aware endpoints.
+                Value::Decimal(
+                    decode_signed_wide_integer(bytes, "Decimal")?,
+                    *precision,
+                    *scale,
+                )
             }
         };
 
@@ -1733,6 +1736,48 @@ mod tests {
             meta.column_stats.statistics().max_value(),
             Some(Value::Date(10_591))
         );
+    }
+
+    #[test]
+    fn decimal_column_statistics_preserve_precision_scale_and_roundtrip() {
+        for (precision, scale) in [(7, 2), (18, 4), (38, 12)] {
+            let ty = LogicalType::Decimal { precision, scale };
+            let opts = ColumnWriterOptions::new(FieldType::Decimal, 0)
+                .with_logical_type(ty.clone())
+                .with_nullable(false)
+                .with_compression(CompressionType::None);
+            let mut writer = ScalarColumnWriter::new(opts, Cursor::new(Vec::new())).unwrap();
+            let values = [-1234_i128, 0, 5678];
+            let bytes = values
+                .iter()
+                .flat_map(|value| {
+                    if fixed_row_width(&ty).unwrap() == 8 {
+                        (*value as i64).to_le_bytes().to_vec()
+                    } else {
+                        value.to_le_bytes().to_vec()
+                    }
+                })
+                .collect::<Vec<_>>();
+            writer.append(&bytes, None, values.len() as u32).unwrap();
+            let metadata = writer.finish().unwrap();
+            assert_eq!(metadata.column_stats.get_type(), &ty);
+            let restored = ColumnStatistics::from_bytes(
+                &metadata.column_stats.to_bytes().unwrap(),
+                ty.clone(),
+            )
+            .unwrap();
+            for stats in [&metadata.column_stats, &restored] {
+                assert_eq!(stats.get_type(), &ty);
+                assert_eq!(
+                    stats.statistics().min_value(),
+                    Some(Value::Decimal(-1234, precision, scale))
+                );
+                assert_eq!(
+                    stats.statistics().max_value(),
+                    Some(Value::Decimal(5678, precision, scale))
+                );
+            }
+        }
     }
 
     #[test]
