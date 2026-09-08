@@ -151,9 +151,40 @@ impl DistinctEvidence {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct DistinctCoverage {
-    observed_rows: u64,
-    total_rows: u64,
+enum DistinctCoverage {
+    Known {
+        observed_rows: u64,
+        total_rows: u64,
+    },
+    /// The sketch survived a union for which at least one partial input did
+    /// not carry a row-domain size. Absence of coverage means a complete
+    /// segment sketch; unknown coverage must therefore be represented.
+    Unknown,
+}
+
+impl DistinctCoverage {
+    fn is_complete(self) -> bool {
+        matches!(self, Self::Known { observed_rows, total_rows } if observed_rows == total_rows)
+    }
+
+    fn union(self, other: Self) -> Self {
+        match (self, other) {
+            (
+                Self::Known {
+                    observed_rows: left,
+                    total_rows: left_total,
+                },
+                Self::Known {
+                    observed_rows: right,
+                    total_rows: right_total,
+                },
+            ) => Self::Known {
+                observed_rows: left.saturating_add(right),
+                total_rows: left_total.saturating_add(right_total),
+            },
+            _ => Self::Unknown,
+        }
+    }
 }
 
 impl ColumnStatistics {
@@ -218,14 +249,7 @@ impl ColumnStatistics {
     ) -> Self {
         let mut result = Self::with_estimated_distinct(stats, estimate);
         if estimate.is_some() {
-            result.estimated_provenance =
-                Some(if matches!(provenance, DistinctProvenance::Unknown) {
-                    // An explicit point is at least a derived estimate even when
-                    // an older transport producer did not label its provenance.
-                    DistinctProvenance::Derived
-                } else {
-                    provenance
-                });
+            result.estimated_provenance = Some(provenance);
         }
         result
     }
@@ -241,17 +265,38 @@ impl ColumnStatistics {
         self
     }
 
-    /// Mark the sketch as covering a complete row domain. Aggregators use
-    /// this before combining rowsets so a later one-sided merge can retain
-    /// the sketch together with an explicit coverage ratio.
+    /// Attach the owning row domain. An unbound segment sketch covers its
+    /// segment, but reattaching a partial rowset never promotes it to full.
     pub fn with_observation_coverage(mut self, rows: u64) -> Self {
         if self.distinct_stats.is_some() {
-            self.distinct_coverage = Some(DistinctCoverage {
-                observed_rows: rows,
-                total_rows: rows,
-            });
+            self.distinct_coverage = Some(self.coverage_in(rows));
         }
         self
+    }
+
+    fn coverage_in(&self, rows: u64) -> DistinctCoverage {
+        if self.distinct_stats.is_none() {
+            return DistinctCoverage::Known {
+                observed_rows: 0,
+                total_rows: rows,
+            };
+        }
+        match self.distinct_coverage {
+            None => DistinctCoverage::Known {
+                observed_rows: rows,
+                total_rows: rows,
+            },
+            Some(DistinctCoverage::Known {
+                observed_rows,
+                total_rows,
+            }) if total_rows <= rows => DistinctCoverage::Known {
+                observed_rows,
+                total_rows: rows,
+            },
+            // An arbitrary narrower row domain has no proven correspondence
+            // to the subset represented by the existing sketch.
+            Some(_) => DistinctCoverage::Unknown,
+        }
     }
 
     /// Mark a copied statistic as coming from a visible storage snapshot.
@@ -269,7 +314,7 @@ impl ColumnStatistics {
             && self.distinct_stats.is_some()
             && self
                 .distinct_coverage
-                .is_none_or(|coverage| coverage.observed_rows >= coverage.total_rows)
+                .is_none_or(DistinctCoverage::is_complete)
     }
 
     /// Return distinct-count evidence without erasing coverage or provenance.
@@ -322,20 +367,25 @@ impl ColumnStatistics {
         }
 
         let (point, provenance) = match (self.storage_observation, self.distinct_coverage) {
-            (true, Some(coverage))
-                if coverage.observed_rows < coverage.total_rows && coverage.observed_rows > 0 =>
-            {
+            (
+                true,
+                Some(DistinctCoverage::Known {
+                    observed_rows,
+                    total_rows,
+                }),
+            ) if observed_rows < total_rows => {
                 (
                     // A partial sketch proves only what it observed.  Keep the
                     // point conservative; a later, explicit estimator can choose
                     // to model uncertainty using the coverage values.
                     observed,
                     DistinctProvenance::ObservedPartial {
-                        observed_rows: coverage.observed_rows,
-                        total_rows: coverage.total_rows,
+                        observed_rows,
+                        total_rows,
                     },
                 )
             }
+            (true, Some(DistinctCoverage::Unknown)) => (observed, DistinctProvenance::Derived),
             (true, _) => (observed, DistinctProvenance::ObservedFull),
             // HLL state created by a planner expression is useful as a ranking
             // point, but it is not a storage-domain observation.  Do not let a
@@ -414,11 +464,30 @@ impl ColumnStatistics {
         self_rows: Option<u64>,
         other_rows: Option<u64>,
     ) {
-        let estimated_provenance = match (self.estimated_distinct, other.estimated_distinct) {
-            (Some(_), Some(_)) => Some(DistinctProvenance::Derived),
-            (Some(_), None) => self.estimated_provenance,
-            (None, Some(_)) => other.estimated_provenance,
-            (None, None) => None,
+        // Capture ownership before merging can turn None + Some into Some.
+        let has_left_sketch = self.distinct_stats.is_some();
+        let has_right_sketch = other.distinct_stats.is_some();
+        let storage_observation = match (has_left_sketch, has_right_sketch) {
+            (true, true) => self.storage_observation && other.storage_observation,
+            (true, false) => self.storage_observation,
+            (false, true) => other.storage_observation,
+            (false, false) => false,
+        };
+        let coverage = match (self_rows, other_rows) {
+            (Some(left_rows), Some(right_rows)) => Some(
+                self.coverage_in(left_rows)
+                    .union(other.coverage_in(right_rows)),
+            ),
+            _ => match (self.distinct_coverage, other.distinct_coverage) {
+                (Some(left), Some(right)) => Some(left.union(right)),
+                (left, right)
+                    if left.is_none_or(DistinctCoverage::is_complete)
+                        && right.is_none_or(DistinctCoverage::is_complete) =>
+                {
+                    None
+                }
+                _ => Some(DistinctCoverage::Unknown),
+            },
         };
         let estimated_union =
             if self.estimated_distinct.is_some() || other.estimated_distinct.is_some() {
@@ -449,57 +518,31 @@ impl ColumnStatistics {
             self_rows,
             other_rows,
         ) {
-            (Some(self_distinct), Some(other_distinct), Some(left_rows), Some(right_rows)) => {
+            (Some(self_distinct), Some(other_distinct), Some(_), Some(_)) => {
                 Arc::make_mut(self_distinct).merge(other_distinct);
-                self.distinct_coverage = Some(DistinctCoverage {
-                    observed_rows: left_rows.saturating_add(right_rows),
-                    total_rows: left_rows.saturating_add(right_rows),
-                });
             }
-            (Some(_), None, Some(left_rows), Some(right_rows)) => {
-                self.distinct_coverage = Some(DistinctCoverage {
-                    observed_rows: left_rows,
-                    total_rows: left_rows.saturating_add(right_rows),
-                });
-            }
-            (None, Some(other_distinct), Some(left_rows), Some(right_rows)) => {
+            (Some(_), None, Some(_), Some(_)) => {}
+            (None, Some(other_distinct), Some(_), Some(_)) => {
                 self.distinct_stats = Some(other_distinct.clone());
-                self.distinct_coverage = Some(DistinctCoverage {
-                    observed_rows: right_rows,
-                    total_rows: left_rows.saturating_add(right_rows),
-                });
             }
             (_, _, Some(_), Some(_)) => {
                 self.distinct_stats = None;
-                self.distinct_coverage = None;
             }
             (Some(self_distinct), Some(other_distinct), None, None) => {
                 Arc::make_mut(self_distinct).merge(other_distinct);
-                self.distinct_coverage = None;
             }
             _ => {
                 // Without row-domain ownership, a one-sided sketch cannot be
-                // interpreted as a union. Keep the conservative legacy
-                // contract for direct callers and compaction paths.
+                // interpreted as a union.
                 self.distinct_stats = None;
-                self.distinct_coverage = None;
             }
         }
         self.estimated_distinct = estimated_union;
-        self.estimated_provenance = self.estimated_distinct.and(estimated_provenance);
-        // A one-sided merge with a column that has no sketch still describes
-        // the observed side of the storage snapshot.  Do not erase that
-        // provenance merely because the missing side cannot contribute an
-        // HLL.  When both sides have sketches, however, both observations
-        // must be storage-backed before the union can claim that provenance.
-        let self_observed = self.storage_observation;
-        let other_observed = other.storage_observation;
-        self.storage_observation = match (&self.distinct_stats, &other.distinct_stats) {
-            (Some(_), Some(_)) => self_observed && other_observed,
-            (Some(_), None) => self_observed,
-            (None, Some(_)) => other_observed,
-            (None, None) => false,
-        };
+        // Adding marginal NDV points is a union estimate, never an observed
+        // union sketch, even when one operand was a complete observation.
+        self.estimated_provenance = self.estimated_distinct.map(|_| DistinctProvenance::Derived);
+        self.distinct_coverage = self.distinct_stats.as_ref().and(coverage);
+        self.storage_observation = self.distinct_stats.is_some() && storage_observation;
     }
 
     /// Update distinct statistics with hash values.
@@ -756,6 +799,123 @@ mod tests {
             storage.distinct_evidence().provenance,
             DistinctProvenance::ObservedPartial { .. }
         ));
+    }
+
+    #[test]
+    fn nested_storage_coverage_is_associative_and_never_becomes_complete() {
+        fn observed(start: u64, rows: u64) -> ColumnStatistics {
+            let mut stats =
+                ColumnStatistics::new(BaseStatistics::create_empty(LogicalType::Integer));
+            let hashes = (start..start + rows)
+                .map(murmur_hash_mix)
+                .collect::<Vec<_>>();
+            stats.update_distinct_statistics(&hashes, hashes.len());
+            stats
+                .with_observation_coverage(rows)
+                .with_storage_observation()
+        }
+        let pieces = [
+            (observed(0, 3), 3),
+            (
+                ColumnStatistics::with_distinct(
+                    BaseStatistics::create_unknown(LogicalType::Integer),
+                    None,
+                ),
+                97,
+            ),
+            (observed(3, 2), 2),
+        ];
+        let merge = |left: &(ColumnStatistics, u64), right: &(ColumnStatistics, u64)| {
+            let mut stats = left.0.clone();
+            stats.merge_with_coverage(&right.0, left.1, right.1);
+            (stats, left.1 + right.1)
+        };
+        let expected = DistinctProvenance::ObservedPartial {
+            observed_rows: 5,
+            total_rows: 102,
+        };
+        for [a, b, c] in [
+            [0, 1, 2],
+            [0, 2, 1],
+            [1, 0, 2],
+            [1, 2, 0],
+            [2, 0, 1],
+            [2, 1, 0],
+        ] {
+            let left = merge(&merge(&pieces[a], &pieces[b]), &pieces[c]);
+            let right = merge(&pieces[a], &merge(&pieces[b], &pieces[c]));
+            for (stats, rows) in [left, right] {
+                assert_eq!(
+                    stats.distinct_evidence().provenance,
+                    expected,
+                    "order={a},{b},{c}"
+                );
+                assert!(!stats.is_storage_observation());
+                // A tablet taking ownership of a rowset must not erase its
+                // existing partial coverage when attaching the total rows.
+                let rebound = stats
+                    .with_observation_coverage(rows)
+                    .with_storage_observation();
+                assert_eq!(rebound.distinct_evidence().provenance, expected);
+                assert!(!rebound.is_storage_observation());
+            }
+        }
+    }
+
+    #[test]
+    fn unowned_partial_union_cannot_be_relabelled_as_a_complete_storage_domain() {
+        let mut observed =
+            ColumnStatistics::new(BaseStatistics::create_empty(LogicalType::Integer));
+        observed.update_distinct_statistics(&[murmur_hash_mix(1)], 1);
+        let mut partial = observed.clone().with_storage_observation();
+        let missing = ColumnStatistics::with_distinct(
+            BaseStatistics::create_unknown(LogicalType::Integer),
+            None,
+        );
+        partial.merge_with_coverage(&missing, 1, 99);
+        // This complete segment does not supply its row count to plain merge.
+        let complete = observed.with_storage_observation();
+        partial.merge(&complete);
+        let relabelled = partial
+            .with_storage_observation()
+            .with_observation_coverage(200);
+        assert!(!relabelled.is_storage_observation());
+        assert!(!relabelled.distinct_evidence().is_complete_observation());
+        assert!(relabelled.distinct_evidence().point > 0);
+    }
+
+    #[test]
+    fn adding_an_observed_point_to_a_sketch_is_a_derived_union_estimate() {
+        let point = ColumnStatistics::with_estimated_distinct_provenance(
+            BaseStatistics::create_unknown(LogicalType::Integer),
+            Some(10),
+            DistinctProvenance::ObservedFull,
+        );
+        let mut observed =
+            ColumnStatistics::new(BaseStatistics::create_empty(LogicalType::Integer));
+        observed.update_distinct_statistics(&[murmur_hash_mix(1)], 1);
+        let observed = observed.with_storage_observation();
+        for (mut left, right) in [(point.clone(), observed.clone()), (observed, point)] {
+            left.merge_with_coverage(&right, 100, 100);
+            assert_eq!(
+                left.distinct_evidence().provenance,
+                DistinctProvenance::Derived
+            );
+        }
+    }
+
+    #[test]
+    fn explicit_unknown_provenance_survives_point_transport() {
+        let column = ColumnStatistics::with_estimated_distinct_provenance(
+            BaseStatistics::create_unknown(LogicalType::Integer),
+            Some(10),
+            DistinctProvenance::Unknown,
+        );
+        assert_eq!(column.distinct_evidence().point, 10);
+        assert_eq!(
+            column.distinct_evidence().provenance,
+            DistinctProvenance::Unknown
+        );
     }
 
     #[test]
