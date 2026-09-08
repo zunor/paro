@@ -21,7 +21,7 @@ use paro_planner::expression::{
 };
 use paro_planner::operator::join::{Join, JoinComparisonType};
 use paro_planner::operator::{ColumnBinding, LogicalOperator};
-use paro_planner::visitor::enumerate_expressions;
+use paro_planner::visitor::enumerate_expression_refs;
 
 use super::column::{ColumnCatalog, ColumnOrigin, ColumnVisibility};
 use super::ids::{ColumnId, Fingerprint, ScalarExprId, StableFingerprintBuilder};
@@ -108,14 +108,14 @@ impl BindingCatalog {
 }
 
 pub(crate) fn intern_operator_scalars<Child>(
-    operator: &mut LogicalOperator<Child>,
+    operator: &LogicalOperator<Child>,
     output_columns: &[ColumnId],
     child_columns: &[Box<[ColumnId]>],
     binding_ids: &mut BindingCatalog,
     columns: &mut ColumnCatalog,
     arena: &mut ScalarArena,
 ) -> Result<Box<[ScalarExprId]>> {
-    let default_references = match &*operator {
+    let default_references = match operator {
         LogicalOperator::SearchScan(search) => {
             get_reference_columns(&search.get, binding_ids, columns)?
         }
@@ -229,18 +229,32 @@ pub(crate) fn intern_operator_scalars<Child>(
         }
         LogicalOperator::Window(window) => {
             for expression in &window.expressions {
-                roots.push(intern_expression(
-                    &Expression::Window(Box::new(expression.clone())),
-                    &default_references,
-                    binding_ids,
-                    columns,
-                    arena,
-                )?);
+                let mut children = Vec::new();
+                ExpressionIterator::enumerate_window_children(expression, |child| {
+                    children.push(child)
+                });
+                let children = children
+                    .into_iter()
+                    .map(|child| {
+                        intern_expression(child, &default_references, binding_ids, columns, arena)
+                    })
+                    .collect::<Result<Box<[_]>>>()?;
+                roots.push(arena.intern(ScalarSpec {
+                    kind: ScalarKind::Window {
+                        function: window_fingerprint(expression),
+                    },
+                    logical_type: expression.return_type(),
+                    children,
+                    local_properties: ScalarLocalProperties {
+                        may_error: true,
+                        ..Default::default()
+                    },
+                })?);
             }
         }
         _ => {
             let mut error = None;
-            enumerate_expressions(operator, |expression| {
+            enumerate_expression_refs(operator, |expression| {
                 if error.is_some() {
                     return;
                 }
@@ -290,13 +304,26 @@ fn intern_expression(
     columns: &mut ColumnCatalog,
     arena: &mut ScalarArena,
 ) -> Result<ScalarExprId> {
-    let mut children = Vec::new();
-    ExpressionIterator::enumerate_children(expression, |child| children.push(child));
-    let children = children
-        .into_iter()
-        .map(|child| intern_expression(child, reference_columns, binding_ids, columns, arena))
-        .collect::<Result<Vec<_>>>()?;
+    ExpressionIterator::try_fold_post_order(expression, |node, children| {
+        intern_expression_node(
+            node,
+            children,
+            reference_columns,
+            binding_ids,
+            columns,
+            arena,
+        )
+    })
+}
 
+fn intern_expression_node(
+    expression: &Expression,
+    children: &[ScalarExprId],
+    reference_columns: &[ColumnId],
+    binding_ids: &mut BindingCatalog,
+    columns: &mut ColumnCatalog,
+    arena: &mut ScalarArena,
+) -> Result<ScalarExprId> {
     match expression {
         Expression::ColumnRef(column) => {
             let column_id = intern_column_binding(
@@ -349,7 +376,7 @@ fn intern_expression(
                 routine: function_fingerprint(function),
             },
             logical_type: function.return_type.clone(),
-            children: children.into_boxed_slice(),
+            children: children.into(),
             local_properties: function_local_properties(function),
         }),
         Expression::Cast(cast) => arena.intern(ScalarSpec {
@@ -357,7 +384,7 @@ fn intern_expression(
                 try_cast: cast.try_cast,
             },
             logical_type: cast.target_type.clone(),
-            children: children.into_boxed_slice(),
+            children: children.into(),
             local_properties: conservative_local_properties(expression),
         }),
         Expression::Conjunction(conjunction) => {
@@ -365,7 +392,7 @@ fn intern_expression(
                 ConjunctionType::And => ScalarKind::And,
                 ConjunctionType::Or => ScalarKind::Or,
             };
-            arena.canonical_conjunction(kind, children)
+            arena.canonical_conjunction(kind, children.to_vec())
         }
         Expression::Comparison(comparison) => intern_comparison(
             comparison_op(comparison.comparison_type),
@@ -376,7 +403,7 @@ fn intern_expression(
         Expression::Case(case) => arena.intern(ScalarSpec {
             kind: ScalarKind::Case,
             logical_type: case.return_type.clone(),
-            children: children.into_boxed_slice(),
+            children: children.into(),
             local_properties: conservative_local_properties(expression),
         }),
         Expression::Operator(operator) => arena.intern(ScalarSpec {
@@ -384,7 +411,7 @@ fn intern_expression(
                 operator: tagged_fingerprint(30, operator.operator_type as u64),
             },
             logical_type: operator.return_type.clone(),
-            children: children.into_boxed_slice(),
+            children: children.into(),
             local_properties: conservative_local_properties(expression),
         }),
         Expression::Aggregate(aggregate) => arena.intern(ScalarSpec {
@@ -392,7 +419,7 @@ fn intern_expression(
                 function: aggregate_fingerprint(aggregate),
             },
             logical_type: aggregate.return_type.clone(),
-            children: children.into_boxed_slice(),
+            children: children.into(),
             local_properties: conservative_local_properties(expression),
         }),
         Expression::Window(window) => arena.intern(ScalarSpec {
@@ -400,7 +427,7 @@ fn intern_expression(
                 function: window_fingerprint(window),
             },
             logical_type: window.return_type(),
-            children: children.into_boxed_slice(),
+            children: children.into(),
             local_properties: conservative_local_properties(expression),
         }),
         Expression::Subquery(_) => Err(paro_error::internal(
@@ -494,7 +521,7 @@ fn function_local_properties(
 }
 
 fn conservative_local_properties(expression: &Expression) -> ScalarLocalProperties {
-    let evaluation = expression.evaluation_properties();
+    let evaluation = expression.local_evaluation_properties();
     ScalarLocalProperties {
         volatility: if evaluation.can_share_evaluation() {
             Volatility::Immutable
@@ -708,7 +735,23 @@ pub(crate) fn expression_fingerprint(expression: &Expression) -> Fingerprint {
         }
         pending.push((current, true));
         let mut children = Vec::new();
-        ExpressionIterator::enumerate_children(current, |child| children.push(child));
+        if let Expression::Conjunction(conjunction) = current {
+            // Fingerprint only maximal associative runs. Fingerprinting each
+            // nested prefix and then flattening it again is quadratic on a
+            // generated OR chain, even with an explicit traversal stack.
+            let mut run = conjunction.children.iter().collect::<Vec<_>>();
+            while let Some(child) = run.pop() {
+                if let Expression::Conjunction(nested) = child {
+                    if nested.conjunction_type == conjunction.conjunction_type {
+                        run.extend(nested.children.iter());
+                        continue;
+                    }
+                }
+                children.push(child);
+            }
+        } else {
+            ExpressionIterator::enumerate_children(current, |child| children.push(child));
+        }
         pending.extend(children.into_iter().rev().map(|child| (child, false)));
     }
     fingerprints[&(expression as *const Expression as usize)]
@@ -975,7 +1018,74 @@ fn typed_binding_fingerprint(binding: ColumnBinding, type_domain: Fingerprint) -
 #[cfg(test)]
 mod tests {
     use super::*;
-    use paro_planner::expression::{ConjunctionExpression, ConstantExpression};
+    use paro_planner::expression::{CaseExpression, ConjunctionExpression, ConstantExpression};
+
+    #[test]
+    fn lowering_and_evaluation_properties_are_stack_safe() {
+        std::thread::Builder::new()
+            .stack_size(256 * 1024)
+            .spawn(|| {
+                let leaf = || {
+                    Expression::Constant(ConstantExpression::new(
+                        Value::Boolean(true),
+                        LogicalType::Boolean,
+                    ))
+                };
+                let mut expression = leaf();
+                for _ in 0..10_000 {
+                    expression = Expression::Case(CaseExpression::new(
+                        leaf(),
+                        leaf(),
+                        expression,
+                        LogicalType::Boolean,
+                    ));
+                }
+                assert!(expression.evaluation_properties().is_infallible());
+                let mut arena = ScalarArena::default();
+                let id = intern_expression(
+                    &expression,
+                    &[],
+                    &mut BindingCatalog::default(),
+                    &mut ColumnCatalog::default(),
+                    &mut arena,
+                )
+                .unwrap();
+                assert!(!arena.get(id).unwrap().properties.may_error);
+                // Owned binder IR drop is a separate boundary from lowering.
+                std::mem::forget(expression);
+            })
+            .unwrap()
+            .join()
+            .unwrap();
+    }
+
+    #[test]
+    fn maximal_conjunction_fingerprint_preserves_associative_identity() {
+        let leaf = |value| {
+            Expression::Constant(ConstantExpression::new(
+                Value::Boolean(value),
+                LogicalType::Boolean,
+            ))
+        };
+        let nested = Expression::Conjunction(ConjunctionExpression::new(
+            ConjunctionType::Or,
+            vec![
+                leaf(true),
+                Expression::Conjunction(ConjunctionExpression::new(
+                    ConjunctionType::Or,
+                    vec![leaf(false), leaf(true)],
+                )),
+            ],
+        ));
+        let flat = Expression::Conjunction(ConjunctionExpression::new(
+            ConjunctionType::Or,
+            vec![leaf(false), leaf(true)],
+        ));
+        assert_eq!(
+            expression_fingerprint(&nested),
+            expression_fingerprint(&flat)
+        );
+    }
 
     #[test]
     fn fingerprint_handles_deep_conjunction_without_native_recursion() {

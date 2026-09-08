@@ -144,7 +144,18 @@ impl Expression {
 
     /// Compute the evaluation contract for this expression tree.
     pub fn evaluation_properties(&self) -> EvaluationProperties {
-        let mut properties = match self {
+        let mut properties = EvaluationProperties::default();
+        ExpressionIterator::visit(self, &mut |node| {
+            properties.merge(node.local_evaluation_properties());
+            super::ExpressionVisitDecision::Descend
+        });
+        properties
+    }
+
+    /// Intrinsic operator contract, excluding children. Native scalar DAGs
+    /// combine this with already-derived child facts exactly once per node.
+    pub fn local_evaluation_properties(&self) -> EvaluationProperties {
+        match self {
             Expression::Function(function) => EvaluationProperties {
                 stability: function.function.stability,
                 side_effects: function.function.side_effects,
@@ -179,12 +190,7 @@ impl Expression {
                 ..EvaluationProperties::default()
             },
             _ => EvaluationProperties::default(),
-        };
-
-        ExpressionIterator::enumerate_children(self, |child| {
-            properties.merge(child.evaluation_properties());
-        });
-        properties
+        }
     }
 }
 

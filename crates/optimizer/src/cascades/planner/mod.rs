@@ -384,6 +384,10 @@ impl OptimizationInput {
                 .expect("planner transform state poisoned");
             work_counters.insert("settlement_local_hit_count", state.settlement_cache.hits);
             work_counters.insert("settlement_local_miss_count", state.settlement_cache.misses);
+            work_counters.insert(
+                "settlement_invalidation_visit_count",
+                state.settlement_cache.invalidation_visits,
+            );
         }
         let search_summary = SearchSummary {
             groups: u64::try_from(engine.memo().canonical_group_count()).unwrap_or(u64::MAX),

@@ -127,6 +127,7 @@ pub(in crate::cascades::planner) struct SettlementCache {
     bindings: BindingCatalog,
     scalars: ScalarArena,
     locals: BTreeMap<LocalKey, SettledLocal>,
+    recipe_prefix: Option<paro_planner::plan::arena::PlanArenaCheckpoint>,
     local_shapes: BTreeSet<LocalShape>,
     /// Exact scalar-free shape buckets used for an allocation-free cache hit.
     /// The BTreeSet above remains the cheap negative filter for scalar-bearing
@@ -156,6 +157,7 @@ pub(in crate::cascades::planner) struct SettlementCache {
     scan_bindings: demand::ScanBindings,
     pub(in crate::cascades::planner) hits: u64,
     pub(in crate::cascades::planner) misses: u64,
+    pub(in crate::cascades::planner) invalidation_visits: u64,
     #[cfg(test)]
     test_arena: LogicalPlanArena,
 }
@@ -196,6 +198,15 @@ fn intern_columns_into(
 
 impl SettlementCache {
     pub(in crate::cascades::planner) fn discard_stale_recipes(&mut self, arena: &LogicalPlanArena) {
+        if self
+            .recipe_prefix
+            .is_none_or(|prefix| arena.retains_prefix(prefix))
+        {
+            return;
+        }
+        self.invalidation_visits = self
+            .invalidation_visits
+            .saturating_add(self.locals.len() as u64);
         self.locals.retain(|_, entry| arena.owns(entry.recipe));
         // A shape is only a fast negative filter. Rebuild it from the live
         // recipes after rollback so a stale shape can never turn a future
@@ -209,6 +220,7 @@ impl SettlementCache {
                 .or_default()
                 .push(entry.clone());
         }
+        self.recipe_prefix = Some(arena.checkpoint());
     }
 
     fn intern_fact(&mut self, mut fact: RelationFacts) -> Result<FactId> {
@@ -390,22 +402,21 @@ impl SettlementCache {
                 )
             })
             .collect::<Result<Vec<_>>>()?;
-        let (_operator, roots, operator_identity) = if scalar_free {
+        let (roots, operator_identity) = if scalar_free {
             let roots: Box<[ScalarExprId]> = Box::new([]);
             let identity = query_operator_identity(&shell.operator, &roots, &self.scalars)?.1;
-            (None, roots, identity)
+            (roots, identity)
         } else {
-            let mut operator = shell.operator.clone();
             let roots = intern_operator_scalars(
-                &mut operator,
+                &shell.operator,
                 &output_columns,
                 &child_columns,
                 &mut self.bindings,
                 &mut self.columns,
                 &mut self.scalars,
             )?;
-            let identity = query_operator_identity(&operator, &roots, &self.scalars)?.1;
-            (Some(operator), roots, identity)
+            let identity = query_operator_identity(&shell.operator, &roots, &self.scalars)?.1;
+            (roots, identity)
         };
         let cte = if let LogicalOperator::CTERef(reference) = &shell.operator {
             ctes.get(&reference.cte_index)
@@ -504,6 +515,7 @@ impl SettlementCache {
                 .or_default()
                 .push(entry.clone());
             self.locals.insert(key, entry.clone());
+            self.recipe_prefix = Some(recipes.checkpoint());
             return Ok(entry);
         }
         let (plan, output, maximum) =
@@ -557,6 +569,7 @@ impl SettlementCache {
             .or_default()
             .push(entry.clone());
         self.locals.insert(key, entry.clone());
+        self.recipe_prefix = Some(recipes.checkpoint());
         Ok(entry)
     }
 
@@ -958,6 +971,55 @@ mod tests {
         assert_ne!(first.plan.id, second.plan.id);
         assert_eq!(first.plan.stats, second.plan.stats);
         assert_eq!(second.plan.stats.estimated_cardinality.unwrap().expected, 3);
+    }
+
+    #[test]
+    fn rollback_of_unrelated_slots_does_not_walk_the_settlement_cache() {
+        let environment = environment();
+        let mut cache = SettlementCache::default();
+        let mut arena = LogicalPlanArena::default();
+        let empty = arena.checkpoint();
+        let first = cache
+            .settle_arena_in(
+                project(
+                    &environment.bind_context,
+                    values(&environment.bind_context, 4),
+                ),
+                &environment,
+                &mut arena,
+            )
+            .unwrap();
+        let retained = arena.checkpoint();
+        assert!(!cache.locals.is_empty());
+        for _ in 0..1000 {
+            arena
+                .append(LogicalPlanNode {
+                    id: PlanNodeId::SYNTHETIC,
+                    stats: NodeStats::default(),
+                    operator: LogicalOperator::DummyScan,
+                })
+                .unwrap();
+            arena.rollback_to(retained).unwrap();
+            cache.discard_stale_recipes(&arena);
+            assert!(arena.owns(first.plan));
+        }
+        assert_eq!(cache.invalidation_visits, 0);
+        arena.rollback_to(empty).unwrap();
+        cache.discard_stale_recipes(&arena);
+        assert!(cache.invalidation_visits > 0);
+        assert!(cache.locals.is_empty());
+        let next = cache
+            .settle_arena_in(
+                project(
+                    &environment.bind_context,
+                    values(&environment.bind_context, 4),
+                ),
+                &environment,
+                &mut arena,
+            )
+            .unwrap();
+        assert!(!arena.owns(first.plan));
+        assert!(arena.owns(next.plan));
     }
 
     #[test]

@@ -262,15 +262,20 @@ impl LogicalPlanArena {
         }
     }
 
-    pub fn rollback_to(&mut self, checkpoint: PlanArenaCheckpoint) -> Result<()> {
-        if checkpoint.arena != self.identity
-            || checkpoint.len > self.nodes.len()
-            || checkpoint.prefix_generation
-                != checkpoint
+    /// O(1) proof that every slot in a captured immutable prefix is still
+    /// present. Generations never repeat, including after rollback/reinsert.
+    pub fn retains_prefix(&self, checkpoint: PlanArenaCheckpoint) -> bool {
+        checkpoint.arena == self.identity
+            && checkpoint.len <= self.nodes.len()
+            && checkpoint.prefix_generation
+                == checkpoint
                     .len
                     .checked_sub(1)
                     .and_then(|index| self.nodes.get(index).map(|slot| slot.generation))
-        {
+    }
+
+    pub fn rollback_to(&mut self, checkpoint: PlanArenaCheckpoint) -> Result<()> {
+        if !self.retains_prefix(checkpoint) {
             return Err(paro_error::internal(
                 "logical arena checkpoint is no longer reachable",
             ));

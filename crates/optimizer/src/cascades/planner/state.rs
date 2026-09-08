@@ -240,8 +240,10 @@ impl PlannerTransformState {
         self.payloads
             .physical
             .truncate(savepoint.physical_payload_count);
+        // Payload IDs are append-only within a transaction. Remove the delta
+        // by ordered range, not a scan of all earlier immutable metadata.
         self.metadata
-            .retain(|payload, _| payload.index() < savepoint.logical_payload_count);
+            .split_off(&LogicalPayloadId::new(savepoint.logical_payload_count));
 
         if savepoint.metadata_runtime_filter_change_count
             > self.metadata_runtime_filter_changes.len()

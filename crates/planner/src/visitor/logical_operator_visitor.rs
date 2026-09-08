@@ -148,11 +148,13 @@ pub trait LogicalOperatorVisitor {
     }
 }
 
-/// Enumerate all expressions in a logical operator and call the callback for each.
-/// This is a static helper function that can be used independently of the visitor.
-pub fn enumerate_expressions<Child, F>(op: &mut LogicalOperator<Child>, mut callback: F)
+/// One local-scalar field contract generates both borrowed and mutable walks.
+/// Immutable consumers must never clone an operator just to visit its scalars.
+macro_rules! define_expression_enumerator {
+    ($name:ident, [$($borrow:tt)*], $window:ident, $payload:ident, $condition:ident) => {
+pub fn $name<Child, F>(op: &$($borrow)* LogicalOperator<Child>, mut callback: F)
 where
-    F: FnMut(&mut Expression),
+    F: FnMut(&$($borrow)* Expression),
 {
     match op {
         LogicalOperator::Get(get) => {
@@ -161,61 +163,61 @@ where
             let _ = get;
         }
         LogicalOperator::Filter(filter) => {
-            for expr in &mut filter.expressions {
+            for expr in &$($borrow)* filter.expressions {
                 callback(expr);
             }
         }
         LogicalOperator::Projection(proj) => {
-            for expr in &mut proj.expressions {
+            for expr in &$($borrow)* proj.expressions {
                 callback(expr);
             }
         }
         LogicalOperator::RowFetch(fetch) => {
-            for source in &mut fetch.sources {
-                callback(&mut source.rowid);
+            for source in &$($borrow)* fetch.sources {
+                callback(&$($borrow)* source.rowid);
             }
         }
         LogicalOperator::ExternalProject(project) => {
-            for expr in &mut project.expressions {
-                callback(&mut expr.expression);
+            for expr in &$($borrow)* project.expressions {
+                callback(&$($borrow)* expr.expression);
             }
         }
         LogicalOperator::ExternalTable(table) => {
-            callback(&mut table.call_expression);
+            callback(&$($borrow)* table.call_expression);
         }
         LogicalOperator::Limit(limit) => {
-            if let Some(ref mut expr) = limit.limit {
+            if let Some(expr) = &$($borrow)* limit.limit {
                 callback(expr);
             }
-            if let Some(ref mut expr) = limit.offset {
+            if let Some(expr) = &$($borrow)* limit.offset {
                 callback(expr);
             }
         }
         LogicalOperator::Order(order) => {
-            for bound_order in &mut order.orders {
-                callback(&mut bound_order.expression);
+            for bound_order in &$($borrow)* order.orders {
+                callback(&$($borrow)* bound_order.expression);
             }
         }
         LogicalOperator::TopN(topn) => {
-            for bound_order in &mut topn.orders {
-                callback(&mut bound_order.expression);
+            for bound_order in &$($borrow)* topn.orders {
+                callback(&$($borrow)* bound_order.expression);
             }
         }
         LogicalOperator::Aggregate(agg) => {
-            for expr in &mut agg.groups {
+            for expr in &$($borrow)* agg.groups {
                 callback(expr);
             }
-            for expr in &mut agg.aggregates {
+            for expr in &$($borrow)* agg.aggregates {
                 callback(expr);
             }
-            if let Some(reduction) = &mut agg.post_reduction {
-                for reducer in &mut reduction.reducers {
+            if let Some(reduction) = &$($borrow)* agg.post_reduction {
+                for reducer in &$($borrow)* reduction.reducers {
                     callback(reducer);
                 }
-                for scalar in &mut reduction.scalar_expressions {
+                for scalar in &$($borrow)* reduction.scalar_expressions {
                     callback(scalar);
                 }
-                callback(&mut reduction.predicate);
+                callback(&$($borrow)* reduction.predicate);
             }
         }
         LogicalOperator::Insert(_insert) => {
@@ -227,7 +229,7 @@ where
             // The filter is in the child operator
         }
         LogicalOperator::Update(update) => {
-            for expr in &mut update.expressions {
+            for expr in &$($borrow)* update.expressions {
                 callback(expr);
             }
         }
@@ -235,7 +237,7 @@ where
             // COPY TO doesn't have expressions to enumerate
         }
         LogicalOperator::ExpressionGet(expr_get) => {
-            for expr_list in &mut expr_get.expressions {
+            for expr_list in &$($borrow)* expr_get.expressions {
                 for expr in expr_list {
                     callback(expr);
                 }
@@ -247,13 +249,13 @@ where
         LogicalOperator::Join(join) => {
             match join {
                 crate::operator::Join::Comparison(cj) => {
-                    for cond in &mut cj.conditions {
-                        callback(&mut cond.left);
-                        callback(&mut cond.right);
+                    for cond in &$($borrow)* cj.conditions {
+                        callback(&$($borrow)* cond.left);
+                        callback(&$($borrow)* cond.right);
                     }
                 }
                 crate::operator::Join::Any(aj) => {
-                    callback(&mut aj.condition);
+                    callback(&$($borrow)* aj.condition);
                 }
                 crate::operator::Join::Cross(_) => {
                     // Cross product has no join conditions
@@ -261,12 +263,12 @@ where
             }
         }
         LogicalOperator::DependentJoin(dj) => {
-            if let Some(payload) = dj.any_all_payload_mut() {
-                for expr in &mut payload.expression_children {
+            if let Some(payload) = dj.$payload() {
+                for expr in &$($borrow)* payload.expression_children {
                     callback(expr);
                 }
             }
-            if let Some(cond) = dj.join_condition_mut() {
+            if let Some(cond) = dj.$condition() {
                 callback(cond);
             }
         }
@@ -274,18 +276,18 @@ where
             // Set operations don't have expressions to enumerate
         }
         LogicalOperator::Distinct(distinct) => {
-            for expr in &mut distinct.distinct_targets {
+            for expr in &$($borrow)* distinct.distinct_targets {
                 callback(expr);
             }
-            if let Some(ref mut orders) = distinct.order_by {
+            if let Some(orders) = &$($borrow)* distinct.order_by {
                 for order in orders {
-                    callback(&mut order.expression);
+                    callback(&$($borrow)* order.expression);
                 }
             }
         }
         LogicalOperator::Window(window) => {
-            for window_expr in &mut window.expressions {
-                ExpressionIterator::enumerate_window_children_mut(window_expr, &mut callback);
+            for window_expr in &$($borrow)* window.expressions {
+                ExpressionIterator::$window(window_expr, &mut callback);
             }
         }
         LogicalOperator::Explain(_) => {
@@ -301,28 +303,28 @@ where
             // CTERef doesn't have expressions
         }
         LogicalOperator::TableFunctionGet(tf) => {
-            for expr in &mut tf.arguments {
+            for expr in &$($borrow)* tf.arguments {
                 callback(expr);
             }
         }
         LogicalOperator::SearchScan(search) => {
-            for expr in &mut search.projections {
+            for expr in &$($borrow)* search.projections {
                 callback(expr);
             }
-            for expr in &mut search.absorbed_predicates {
+            for expr in &$($borrow)* search.absorbed_predicates {
                 callback(expr);
             }
-            for expr in &mut search.residual_predicates {
+            for expr in &$($borrow)* search.residual_predicates {
                 callback(expr);
             }
-            callback(&mut search.score_expression);
+            callback(&$($borrow)* search.score_expression);
         }
         LogicalOperator::FullTextFilterScan(scan) => {
-            callback(&mut scan.match_expression);
-            for expr in &mut scan.other_predicates {
+            callback(&$($borrow)* scan.match_expression);
+            for expr in &$($borrow)* scan.other_predicates {
                 callback(expr);
             }
-            for expr in &mut scan.residual_predicates {
+            for expr in &$($borrow)* scan.residual_predicates {
                 callback(expr);
             }
         }
@@ -345,6 +347,17 @@ where
         | LogicalOperator::DummyScan => {}
     }
 }
+    };
+}
+
+define_expression_enumerator!(enumerate_expressions, [mut], enumerate_window_children_mut, any_all_payload_mut, join_condition_mut);
+define_expression_enumerator!(
+    enumerate_expression_refs,
+    [],
+    enumerate_window_children,
+    any_all_payload,
+    join_condition
+);
 
 #[cfg(test)]
 mod tests {
