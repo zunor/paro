@@ -868,8 +868,7 @@ impl Optimizer {
 
     fn finalize_query_candidate(&self, mut candidate: CandidatePlan) -> Result<CandidatePlan> {
         candidate.plan = normalize_iteration_ownership(candidate.plan)?;
-        candidate.plan =
-            singleton_groups::optimize_plan(candidate.plan, candidate.column_stats.as_ref());
+        candidate.plan = singleton_groups::optimize_plan(candidate.plan)?;
         candidate.plan = ColumnLifetimeAnalyzer::new(true).optimize(candidate.plan)?;
 
         if self.ctx.verify_enabled {

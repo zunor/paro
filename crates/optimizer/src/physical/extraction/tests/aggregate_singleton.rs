@@ -35,10 +35,9 @@ fn stale_singleton_hint_falls_back_to_a_physical_aggregate() {
                 "paro".to_string(),
                 "public".to_string(),
                 "proof_source".to_string(),
-                vec![ColumnDefinition::new(
-                    "key".to_string(),
-                    LogicalType::Integer,
-                )],
+                vec![
+                    ColumnDefinition::new("key".to_string(), LogicalType::Integer).with_not_null(),
+                ],
             )
             .with_constraints(vec![Constraint::unique(vec![0])]),
             storage,
@@ -54,7 +53,7 @@ fn stale_singleton_hint_falls_back_to_a_physical_aggregate() {
         table,
     );
     let proof =
-        SingletonGroupProof::from_null_free_declared_key(&proof_get, &[ColumnBinding::new(10, 0)])
+        SingletonGroupProof::from_declared_grouping_key(&proof_get, &[ColumnBinding::new(10, 0)])
             .expect("declared key witness");
 
     let ctx = BindContext::new();

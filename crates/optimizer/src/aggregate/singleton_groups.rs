@@ -15,39 +15,31 @@
 //! makes duplicate declared keys observable as extra output groups; data that
 //! violates its declared constraint is outside this optimization's contract.
 
-use std::collections::HashMap;
-use std::sync::Arc;
-
+use paro_common::error::Result;
 use paro_planner::expression::Expression;
 use paro_planner::operator::{
     binding_preserving_get, Aggregate, ColumnBinding, GroupInputMultiplicity, Join,
     LogicalOperator, SingletonGroupProof,
 };
 use paro_planner::plan::OwnedLogicalPlan;
-use paro_storage::statistics::ColumnStatistics;
 
 use crate::statistics::unique_keys::declared_unique_keys;
 
-pub fn optimize_plan(
-    plan: OwnedLogicalPlan,
-    column_stats: &HashMap<ColumnBinding, Arc<ColumnStatistics>>,
-) -> OwnedLogicalPlan {
-    plan.map_children(|child| optimize_plan(child, column_stats))
-        .map_operator(|operator| match operator {
+pub fn optimize_plan(plan: OwnedLogicalPlan) -> Result<OwnedLogicalPlan> {
+    plan.try_map_post_order(|plan| {
+        Ok(plan.map_operator(|operator| match operator {
             LogicalOperator::Aggregate(mut aggregate) => {
-                aggregate.group_input_multiplicity = prove_at_most_one(&aggregate, column_stats)
+                aggregate.group_input_multiplicity = prove_at_most_one(&aggregate)
                     .map(GroupInputMultiplicity::AtMostOne)
                     .unwrap_or(GroupInputMultiplicity::Arbitrary);
                 LogicalOperator::Aggregate(aggregate)
             }
             operator => operator,
-        })
+        }))
+    })
 }
 
-fn prove_at_most_one(
-    aggregate: &Aggregate,
-    column_stats: &HashMap<ColumnBinding, Arc<ColumnStatistics>>,
-) -> Option<SingletonGroupProof> {
+fn prove_at_most_one(aggregate: &Aggregate) -> Option<SingletonGroupProof> {
     let LogicalOperator::Join(Join::Comparison(join)) = &aggregate.child.operator else {
         return None;
     };
@@ -57,21 +49,17 @@ fn prove_at_most_one(
         .iter()
         .map(column_binding)
         .collect::<Option<Vec<_>>>()?;
-    let key = declared_unique_keys(preserved).into_iter().find(|key| {
-        key.bindings
+    declared_unique_keys(preserved).into_iter().find_map(|key| {
+        if !key
+            .bindings
             .iter()
             .all(|binding| group_bindings.contains(binding))
-            && key.is_unique_with_nulls_equal(|binding| {
-                column_stats
-                    .get(&binding)
-                    .is_some_and(|statistics| !statistics.statistics().can_have_null())
-            })
-    })?;
-    let proof = SingletonGroupProof::from_null_free_declared_key(preserved, &key.bindings)?;
-    if !proof.is_valid_for(aggregate) {
-        return None;
-    };
-    Some(proof)
+        {
+            return None;
+        }
+        let proof = SingletonGroupProof::from_declared_grouping_key(preserved, &key.bindings)?;
+        proof.is_valid_for(aggregate).then_some(proof)
+    })
 }
 
 fn column_binding(expression: &Expression) -> Option<ColumnBinding> {
@@ -100,6 +88,8 @@ mod tests {
     };
     use paro_storage::statistics::{BaseStatistics, ColumnStatistics};
     use paro_storage::table::table_factory::TableFactory;
+    use std::collections::HashMap;
+    use std::sync::Arc;
 
     fn column(table: usize, ordinal: usize) -> Expression {
         Expression::ColumnRef(
@@ -121,16 +111,26 @@ mod tests {
         OwnedLogicalPlan,
         HashMap<ColumnBinding, Arc<ColumnStatistics>>,
     ) {
+        candidate_with_nullability(true)
+    }
+
+    fn candidate_with_nullability(
+        not_null: bool,
+    ) -> (
+        OwnedLogicalPlan,
+        HashMap<ColumnBinding, Arc<ColumnStatistics>>,
+    ) {
         let types = vec![LogicalType::BigInt];
         let storage = Arc::new(TableFactory::default().create_table(&types).unwrap());
         let info = CreateTableInfo::new(
             "paro".to_string(),
             "public".to_string(),
             "preserved".to_string(),
-            vec![ColumnDefinition::new(
-                "key".to_string(),
-                LogicalType::BigInt,
-            )],
+            vec![{
+                let mut column = ColumnDefinition::new("key".to_string(), LogicalType::BigInt);
+                column.not_null = not_null;
+                column
+            }],
         )
         .with_constraints(vec![Constraint::unique(vec![0])]);
         let table = Arc::new(
@@ -207,6 +207,25 @@ mod tests {
         join
     }
 
+    #[test]
+    fn annotation_walk_is_stack_safe() {
+        std::thread::Builder::new()
+            .stack_size(512 * 1024)
+            .spawn(|| {
+                let mut plan = OwnedLogicalPlan::synthetic(LogicalOperator::DummyScan);
+                for _ in 0..10_000 {
+                    plan = OwnedLogicalPlan::synthetic(LogicalOperator::Filter(Filter::new(
+                        plan,
+                        vec![],
+                    )));
+                }
+                drop(optimize_plan(plan).unwrap());
+            })
+            .unwrap()
+            .join()
+            .unwrap();
+    }
+
     fn candidate_aggregate_mut(plan: &mut OwnedLogicalPlan) -> &mut Aggregate {
         let LogicalOperator::Aggregate(aggregate) = &mut plan.operator else {
             panic!("aggregate root")
@@ -216,8 +235,8 @@ mod tests {
 
     #[test]
     fn unique_preserved_key_and_partial_merge_prove_singleton_groups() {
-        let (plan, statistics) = candidate();
-        let optimized = optimize_plan(plan, &statistics);
+        let (plan, _) = candidate();
+        let optimized = optimize_plan(plan).unwrap();
         let LogicalOperator::Aggregate(aggregate) = &optimized.operator else {
             panic!("aggregate root")
         };
@@ -229,8 +248,8 @@ mod tests {
 
     #[test]
     fn proven_singleton_group_is_an_explicit_memo_implementation() {
-        let (plan, statistics) = candidate();
-        let optimized = optimize_plan(plan, &statistics);
+        let (plan, _) = candidate();
+        let optimized = optimize_plan(plan).unwrap();
         let input = crate::cascades::planner::MemoBuilder::build(
             optimized,
             BindContext::new(),
@@ -270,12 +289,14 @@ mod tests {
 
     #[test]
     fn nullable_unique_key_does_not_prove_group_by_singletons() {
-        let (plan, mut statistics) = candidate();
-        statistics.insert(
-            ColumnBinding::new(1, 0),
-            ColumnStatistics::create_unknown(LogicalType::BigInt),
+        let (plan, statistics) = candidate_with_nullability(false);
+        assert!(
+            !statistics[&ColumnBinding::new(1, 0)]
+                .statistics()
+                .can_have_null(),
+            "the fixture observation is NULL-free, but the reusable contract is not"
         );
-        let optimized = optimize_plan(plan, &statistics);
+        let optimized = optimize_plan(plan).unwrap();
         let LogicalOperator::Aggregate(aggregate) = &optimized.operator else {
             panic!("aggregate root")
         };
@@ -287,7 +308,7 @@ mod tests {
 
     #[test]
     fn preserved_filter_keeps_the_declared_key_proof() {
-        let (mut plan, statistics) = candidate();
+        let (mut plan, _) = candidate();
         let join = candidate_join_mut(&mut plan);
         let left = std::mem::replace(
             &mut join.left,
@@ -297,7 +318,7 @@ mod tests {
             Filter::new(*left, Vec::new()),
         )));
 
-        let optimized = optimize_plan(plan, &statistics);
+        let optimized = optimize_plan(plan).unwrap();
         let LogicalOperator::Aggregate(aggregate) = &optimized.operator else {
             panic!("aggregate root")
         };
@@ -309,7 +330,7 @@ mod tests {
 
     #[test]
     fn uncovered_partial_group_key_rejects_singleton_lowering() {
-        let (mut plan, statistics) = candidate();
+        let (mut plan, _) = candidate();
         let join = candidate_join_mut(&mut plan);
         let LogicalOperator::Aggregate(partial) = &mut join.right.operator else {
             panic!("partial aggregate")
@@ -317,7 +338,7 @@ mod tests {
         partial.groups.push(column(2, 1));
         partial.recompute_returned_types();
 
-        let optimized = optimize_plan(plan, &statistics);
+        let optimized = optimize_plan(plan).unwrap();
         let LogicalOperator::Aggregate(aggregate) = &optimized.operator else {
             panic!("aggregate root")
         };
@@ -329,10 +350,10 @@ mod tests {
 
     #[test]
     fn non_equality_join_rejects_singleton_lowering() {
-        let (mut plan, statistics) = candidate();
+        let (mut plan, _) = candidate();
         candidate_join_mut(&mut plan).conditions[0].comparison = JoinComparisonType::GreaterThan;
 
-        let optimized = optimize_plan(plan, &statistics);
+        let optimized = optimize_plan(plan).unwrap();
         let LogicalOperator::Aggregate(aggregate) = &optimized.operator else {
             panic!("aggregate root")
         };
@@ -344,8 +365,8 @@ mod tests {
 
     #[test]
     fn resolved_input_references_preserve_the_structural_witness() {
-        let (plan, statistics) = candidate();
-        let mut optimized = optimize_plan(plan, &statistics);
+        let (plan, _) = candidate();
+        let mut optimized = optimize_plan(plan).unwrap();
         let aggregate = candidate_aggregate_mut(&mut optimized);
         let GroupInputMultiplicity::AtMostOne(proof) = aggregate.group_input_multiplicity.clone()
         else {
@@ -392,8 +413,8 @@ mod tests {
 
     #[test]
     fn stale_structural_witness_fails_closed_after_join_mutation() {
-        let (plan, statistics) = candidate();
-        let mut optimized = optimize_plan(plan, &statistics);
+        let (plan, _) = candidate();
+        let mut optimized = optimize_plan(plan).unwrap();
         let aggregate = candidate_aggregate_mut(&mut optimized);
         let GroupInputMultiplicity::AtMostOne(proof) = aggregate.group_input_multiplicity.clone()
         else {
@@ -413,8 +434,8 @@ mod tests {
 
     #[test]
     fn catalog_column_identity_survives_get_ordinal_reuse() {
-        let (plan, statistics) = candidate();
-        let mut optimized = optimize_plan(plan, &statistics);
+        let (plan, _) = candidate();
+        let mut optimized = optimize_plan(plan).unwrap();
         let aggregate = candidate_aggregate_mut(&mut optimized);
         let GroupInputMultiplicity::AtMostOne(proof) = aggregate.group_input_multiplicity.clone()
         else {
@@ -460,8 +481,8 @@ mod tests {
 
     #[test]
     fn row_preserving_expression_relocation_retains_a_valid_witness() {
-        let (plan, statistics) = candidate();
-        let mut optimized = optimize_plan(plan, &statistics);
+        let (plan, _) = candidate();
+        let mut optimized = optimize_plan(plan).unwrap();
         let aggregate = candidate_aggregate_mut(&mut optimized);
 
         aggregate.recompute_returned_types_after_row_preserving_relocation();
@@ -474,7 +495,7 @@ mod tests {
 
     #[test]
     fn merge_without_singleton_law_rejects_projection_lowering() {
-        let (mut plan, statistics) = candidate();
+        let (mut plan, _) = candidate();
         let aggregate = candidate_aggregate_mut(&mut plan);
         let Expression::Aggregate(merge) = &mut aggregate.aggregates[0] else {
             panic!("merge aggregate")
@@ -482,7 +503,7 @@ mod tests {
         merge.function = get_count_star_function();
         assert!(merge.function.singleton_merge().is_none());
 
-        let optimized = optimize_plan(plan, &statistics);
+        let optimized = optimize_plan(plan).unwrap();
         let LogicalOperator::Aggregate(aggregate) = &optimized.operator else {
             panic!("aggregate root")
         };
@@ -494,7 +515,7 @@ mod tests {
 
     #[test]
     fn multiple_grouping_domains_reject_singleton_lowering() {
-        let (mut plan, statistics) = candidate();
+        let (mut plan, _) = candidate();
         candidate_aggregate_mut(&mut plan).grouping_sets = vec![
             GroupingSet {
                 expressions: vec![0],
@@ -504,7 +525,7 @@ mod tests {
             },
         ];
 
-        let optimized = optimize_plan(plan, &statistics);
+        let optimized = optimize_plan(plan).unwrap();
         let LogicalOperator::Aggregate(aggregate) = &optimized.operator else {
             panic!("aggregate root")
         };

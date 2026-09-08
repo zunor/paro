@@ -41,14 +41,14 @@ pub struct SingletonGroupProof {
 }
 
 impl SingletonGroupProof {
-    /// Capture a declared key after the caller proves every nullable UNIQUE
-    /// column non-NULL at the aggregate's use site.
+    /// Capture a declared grouping key whose NULL safety is itself a catalog
+    /// guarantee. Snapshot statistics cannot authorize reusable plan semantics.
     ///
     /// The witness deliberately stores catalog identity rather than logical
     /// bindings. Table indices and Get output ordinals are optimizer-local and
     /// may be regenerated or compacted; the table object and stored column ids
     /// remain stable across those rewrites.
-    pub fn from_null_free_declared_key(
+    pub fn from_declared_grouping_key(
         get: &crate::operator::Get,
         bindings: &[ColumnBinding],
     ) -> Option<Self> {
@@ -64,8 +64,8 @@ impl SingletonGroupProof {
     }
 
     /// Revalidate every structural obligation that can change after the
-    /// statistics proof was issued. Exact no-NULL evidence is captured by the
-    /// witness; the catalog key, grouping domain, join direction, predicates,
+    /// schema proof was issued. The catalog key and NULL constraints are
+    /// rechecked, along with the grouping domain, join direction, predicates,
     /// partial grouping keys, and aggregate laws must still match the current
     /// tree before physical lowering may erase the hash aggregate.
     pub fn is_valid_for(&self, aggregate: &Aggregate) -> bool {
@@ -267,6 +267,12 @@ fn declared_key_matches(get: &crate::operator::Get, column_ids: &[usize]) -> boo
         return false;
     };
     let column_ids = column_ids.iter().copied().collect::<HashSet<_>>();
+    if !column_ids
+        .iter()
+        .all(|column| table.column_is_declared_not_null(*column))
+    {
+        return false;
+    }
     table.constraints().iter().any(|constraint| {
         matches!(
             constraint.constraint_type,

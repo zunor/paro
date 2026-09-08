@@ -410,16 +410,9 @@ fn declared_key_null_semantics(get: &Get, key: &DeclaredUniqueKey) -> UniqueKeyN
     let null_safe = key.is_unique_with_nulls_equal(|binding| {
         get.stored_column(binding.column_index)
             .is_some_and(|column| {
-                get.table.as_ref().is_some_and(|table| {
-                    table
-                        .columns
-                        .get(column)
-                        .is_some_and(|column| column.not_null)
-                        || table.constraints().iter().any(|constraint| {
-                            constraint.constraint_type == ConstraintType::NotNull
-                                && constraint.columns.contains(&column)
-                        })
-                })
+                get.table
+                    .as_ref()
+                    .is_some_and(|table| table.column_is_declared_not_null(column))
             })
     });
     if null_safe {
