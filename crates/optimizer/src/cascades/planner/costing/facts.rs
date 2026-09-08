@@ -70,9 +70,13 @@ pub(in crate::cascades::planner) fn planner_cost_facts(
         LogicalOperator::Get(get) => get
             .table
             .as_ref()
-            .and_then(|table| table.statistics())
-            .map(|statistics| statistics.row_count)
-            .filter(|rows| *rows > 0),
+            .and_then(|table| table.get_storage())
+            // Task supply describes physical source work, not an ANALYZE
+            // catalog estimate. The latter can be absent on a fully populated
+            // table, or stale after an append. Capture storage's row evidence
+            // on this cost-fact boundary; it is advisory, never a row bound.
+            .and_then(|storage| storage.total_rows().ok())
+            .map(|rows| rows as u64),
         _ => None,
     };
     let scan_work_source = match &plan.operator {

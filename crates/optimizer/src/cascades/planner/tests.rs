@@ -296,6 +296,38 @@ fn scan_parallelism_uses_pre_predicate_physical_work() {
 }
 
 #[test]
+fn scan_work_evidence_does_not_require_analyze_catalog_statistics() {
+    let scan = test_base_get(0, 24_101, "unanalysed_source", 10_000);
+    let LogicalOperator::Get(get) = &scan.operator else {
+        unreachable!()
+    };
+    assert!(get
+        .table
+        .as_ref()
+        .unwrap()
+        .statistics()
+        .is_none_or(|statistics| statistics.row_count == 0));
+    let facts = planner_cost_facts(
+        &scan,
+        &HashMap::new(),
+        &BindingCatalog::default(),
+        Default::default(),
+    )
+    .unwrap();
+    assert_eq!(facts.scan_physical_rows, Some(10_000));
+    // Unknown and an observed empty source are different evidence states.
+    let empty = test_base_get(1, 24_102, "empty_source", 0);
+    let facts = planner_cost_facts(
+        &empty,
+        &HashMap::new(),
+        &BindingCatalog::default(),
+        Default::default(),
+    )
+    .unwrap();
+    assert_eq!(facts.scan_physical_rows, Some(0));
+}
+
+#[test]
 fn replaceable_runtime_filter_work_is_serial_until_bound_to_a_source() {
     let facts = ResolvedPlannerCostFacts {
         output_rows: CompactRange::point(10.0).unwrap(),
