@@ -9,18 +9,29 @@ from harness.cold_planning_gate import COUNTERS, evaluate
 
 def report():
     return {
-        "schema_version": 1, "configuration": {"process_blocks": 3},
+        "schema_version": 2, "configuration": {"process_blocks": 3, "runtime_environment": {"RUST_LOG": None}},
         "evidence": {"build": {"binary_sha256": "binary", "source": {"commit": "commit",
                       "working_tree_sha256": "source"}}, "harness_sha256": "harness",
                      "dataset_sha256": "data", "machine": "machine"},
         "queries": [{"name": "q11", "sql_sha256": "original-sum-of-difference", "samples": [
             {"block": block, "status": "ok", "server": {"pid": 100 + block, "sha256": "binary"},
              "explain_wall_ms": 20, "optimizer_ms": 15, "peak_rss_bytes": 1000, "plan_sha256": "plan",
-             "counters": {counter: 1 for counter in COUNTERS}} for block in range(3)]}],
+             "counters": {counter: 0 if counter in ("search_rule_failure_count", "search_deadline_reached") else 1
+                          for counter in COUNTERS}} for block in range(3)]}],
     }
 
 
 class ColdPlanningGateTests(unittest.TestCase):
+    def test_deadline_and_logging_changes_cannot_claim_a_speedup(self):
+        current = report()
+        current["configuration"]["runtime_environment"]["RUST_LOG"] = "debug"
+        with self.assertRaises(ValueError):
+            evaluate(current, report())
+        current = report()
+        current["queries"][0]["samples"][0]["counters"]["search_deadline_reached"] = 1
+        with self.assertRaises(ValueError):
+            evaluate(current, report())
+
     def test_same_report_passes(self):
         self.assertTrue(evaluate(report(), report())["passed"])
 

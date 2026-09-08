@@ -13,9 +13,10 @@ import statistics
 from pathlib import Path
 from typing import Any
 
-VERSION = 1
+VERSION = 2
 COUNTERS = ("search_complete", "memo_group_count", "memo_logical_expression_count",
-            "memo_physical_expression_count", "settlement_local_hit_count", "settlement_local_miss_count")
+            "memo_physical_expression_count", "settlement_local_hit_count", "settlement_local_miss_count",
+            "search_rule_failure_count", "search_deadline_reached")
 METRICS = ("explain_wall_ms", "optimizer_ms", "peak_rss_bytes")
 
 
@@ -33,6 +34,8 @@ def validate(report: dict[str, Any]) -> dict[str, list[dict[str, Any]]]:
     if report.get("invalidated"):
         raise ValueError("measurement provenance was invalidated")
     evidence = report["evidence"]
+    if set(report["configuration"]["runtime_environment"]) != {"RUST_LOG"}:
+        raise ValueError("missing runtime logging configuration")
     for value in (evidence["build"]["binary_sha256"], evidence["build"]["source"]["commit"],
                   evidence["build"]["source"]["working_tree_sha256"], evidence["harness_sha256"],
                   evidence["dataset_sha256"]):
@@ -68,8 +71,10 @@ def validate(report: dict[str, Any]) -> dict[str, list[dict[str, Any]]]:
                     raise ValueError("invalid search counter")
             if sample["counters"]["search_complete"] not in (0, 1):
                 raise ValueError("invalid completion state")
-            if sample["counters"].get("search_rule_failure_count", 0):
+            if sample["counters"]["search_rule_failure_count"]:
                 raise ValueError("advisory rule failure in a performance sample")
+            if sample["counters"]["search_deadline_reached"]:
+                raise ValueError("deadline-limited search is not qualifying latency evidence")
         result[query["name"]] = samples
     return result
 

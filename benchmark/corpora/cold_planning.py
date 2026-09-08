@@ -161,7 +161,7 @@ def main() -> int:
     harness_files = (Path(__file__).resolve(), Path(__file__).with_name("benchmark_evidence.py"),
                      root / "benchmark/harness/cold_planning_gate.py")
     report: dict[str, Any] = {
-        "schema_version": 1,
+        "schema_version": 2,
         "configuration": {key: getattr(args, key) for key in ("process_blocks", "threads", "memory_limit",
                              "watchdog_seconds", "rss_limit_mb", "alloc_metrics")},
         "evidence": {"build": build, "dataset_sha256": tree_digest(args.server_data_dir),
@@ -173,6 +173,9 @@ def main() -> int:
                      "harness": [{"path": str(p), "sha256": content_digest(p)} for p in harness_files]},
         "queries": [{"name": path.stem, "path": str(path.resolve()), "sql_sha256": content_digest(path),
                      "samples": []} for path in args.query],
+    }
+    report["configuration"]["runtime_environment"] = {
+        "RUST_LOG": os.environ.get("RUST_LOG"),
     }
     for path, observation in zip(args.query, report["queries"], strict=True):
         query = path.read_text().strip()
