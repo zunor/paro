@@ -976,13 +976,58 @@ fn column_domain_expected_is_a_ranking_point_inside_the_proof_hull() {
     let domain = GroupColumnDomain::new(Some(2), None)
         .unwrap()
         .canonical_with(GroupColumnDomain::new(Some(8), None).unwrap());
-    assert_eq!(domain.expected(), Some(5));
+    assert_eq!(domain.expected(), Some(8));
     assert!(domain.expected().unwrap() >= domain.expected_lower);
     assert!(domain.expected().unwrap() <= domain.expected_upper);
     // A guaranteed bound remains independent from the statistical point
     // estimate and must not be fabricated from the hull midpoint.
     let bounded = GroupColumnDomain::new(Some(2), Some(8)).unwrap();
     assert_eq!(bounded.guaranteed_upper, Some(8));
+}
+
+#[test]
+fn column_evidence_merge_is_a_semilattice_not_a_running_average() {
+    let provenances = [
+        DistinctProvenance::Unknown,
+        DistinctProvenance::Derived,
+        DistinctProvenance::ObservedFull,
+        DistinctProvenance::ObservedPartial {
+            observed_rows: 10,
+            total_rows: 100,
+        },
+        DistinctProvenance::ObservedPartial {
+            observed_rows: 30,
+            total_rows: 400,
+        },
+    ];
+    let domains = provenances
+        .into_iter()
+        .enumerate()
+        .map(|(index, provenance)| {
+            let mut domain =
+                GroupColumnDomain::new((index > 0).then_some(2 + 7 * index as u64), Some(100))
+                    .unwrap();
+            domain.provenance = provenance;
+            domain
+        })
+        .collect::<Vec<_>>();
+    for a in &domains {
+        assert_eq!(a.canonical_with(*a), *a);
+        for b in &domains {
+            assert_eq!(
+                a.canonical_with(*b),
+                b.canonical_with(*a),
+                "commutativity: {a:?}, {b:?}"
+            );
+            for c in &domains {
+                assert_eq!(
+                    a.canonical_with(*b).canonical_with(*c),
+                    a.canonical_with(b.canonical_with(*c)),
+                    "associativity: {a:?}, {b:?}, {c:?}"
+                );
+            }
+        }
+    }
 }
 
 #[test]

@@ -67,8 +67,9 @@ pub struct GroupColumnDomain {
     /// that any one physical alternative observed the midpoint value.
     pub expected_lower: u64,
     pub expected_upper: u64,
-    /// Stable costing point retained from the evidence sources. It is not
-    /// reconstructed from the uncertainty hull midpoint.
+    /// Largest supplied costing point. This is an existing estimate, never
+    /// an average manufactured by alternative insertion order. Keep it
+    /// unclamped while composing; apply proof bounds only when reading it.
     pub ranking_point: u64,
     /// Predicate/schema proof. Unlike observed HLL state, this remains a safe
     /// upper bound after data changes permitted by the compiled plan.
@@ -131,14 +132,13 @@ impl GroupColumnDomain {
     }
 
     pub fn expected(self) -> Option<u64> {
-        (self.ranking_point > 0).then_some(self.ranking_point)
+        let point = self
+            .guaranteed_upper
+            .map_or(self.ranking_point, |upper| self.ranking_point.min(upper));
+        (point > 0).then_some(point)
     }
 
     pub(crate) fn canonical_with(self, other: Self) -> Self {
-        let ranking_point = match (self.ranking_point, other.ranking_point) {
-            (0, point) | (point, 0) => point,
-            (left, right) => left.saturating_add(right.saturating_sub(left) / 2),
-        };
         Self {
             expected_lower: match (self.expected_lower, other.expected_lower) {
                 (0, right) => right,
@@ -151,7 +151,11 @@ impl GroupColumnDomain {
                 (Some(bound), None) | (None, Some(bound)) => Some(bound),
                 (None, None) => None,
             },
-            ranking_point,
+            // NDV evidence forms an idempotent semilattice: rediscovering a
+            // derivation cannot cast another vote for a different average.
+            // Choosing the largest supplied point is conservative for group
+            // state/work ranking, but is not a correctness upper bound.
+            ranking_point: self.ranking_point.max(other.ranking_point),
             provenance: merge_distinct_provenance(self.provenance, other.provenance),
         }
     }
@@ -163,6 +167,11 @@ fn merge_distinct_provenance(
 ) -> DistinctProvenance {
     use DistinctProvenance::*;
     match (left, right) {
+        // Complete-domain proof requires every contributing domain to have
+        // complete evidence. Missing/derived provenance cannot be restored
+        // just by merging a later complete observation.
+        (Unknown, _) | (_, Unknown) => Unknown,
+        (Derived, _) | (_, Derived) => Derived,
         (ObservedFull, ObservedFull) => ObservedFull,
         (
             ObservedPartial {
@@ -194,12 +203,6 @@ fn merge_distinct_provenance(
             observed_rows: left_rows.min(right_rows),
             total_rows: left_total.max(right_total),
         },
-        (ObservedFull, Derived) | (Derived, ObservedFull) | (Derived, Derived) => Derived,
-        (ObservedPartial { .. }, Derived)
-        | (Derived, ObservedPartial { .. })
-        | (ObservedPartial { .. }, Unknown)
-        | (Unknown, ObservedPartial { .. }) => Derived,
-        (Unknown, other) | (other, Unknown) => other,
     }
 }
 
