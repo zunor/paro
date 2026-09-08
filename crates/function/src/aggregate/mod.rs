@@ -474,7 +474,13 @@ impl AggregateSingletonMerge {
 /// - `varargs`: Optional type for variable arguments
 /// - `bind_data`: Optional bind-time data
 #[derive(Clone)]
-pub struct AggregateFunction {
+pub struct AggregateFunction(Arc<AggregateFunctionData>);
+
+/// Shared bound kernel storage. Mutation during binding/specialization is
+/// copy-on-write; cloning a plan or native invocation never copies its kernel,
+/// signature vectors, or correctness-bearing capabilities.
+#[derive(Clone)]
+pub struct AggregateFunctionData {
     pub name: String,
     pub arguments: Vec<LogicalType>,
     pub return_type: LogicalType,
@@ -554,6 +560,21 @@ pub struct AggregateFunction {
     pub bind_data: Option<Arc<dyn FunctionData>>,
 }
 
+impl std::ops::Deref for AggregateFunction {
+    type Target = AggregateFunctionData;
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+
+impl std::ops::DerefMut for AggregateFunction {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        Arc::make_mut(&mut self.0)
+    }
+}
+
+const _: () = assert!(std::mem::size_of::<AggregateFunction>() <= 16);
+
 impl fmt::Debug for AggregateFunction {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("AggregateFunction")
@@ -574,6 +595,10 @@ impl fmt::Debug for AggregateFunction {
 }
 
 impl AggregateFunction {
+    pub fn shares_binding_with(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.0, &other.0)
+    }
+
     pub fn new(
         name: String,
         arguments: Vec<LogicalType>,
@@ -586,7 +611,7 @@ impl AggregateFunction {
         simple_update: Option<AggregateSimpleUpdateFn>,
         destructor: Option<AggregateDestructorFn>,
     ) -> Self {
-        Self {
+        Self(Arc::new(AggregateFunctionData {
             name,
             arguments,
             return_type,
@@ -613,7 +638,7 @@ impl AggregateFunction {
             state_deserialize: None,
             varargs: None,
             bind_data: None,
-        }
+        }))
     }
 
     pub fn with_state_filter(mut self, filter: AggregateStateFilterFn) -> Self {
@@ -692,6 +717,9 @@ impl AggregateFunction {
     /// correctness-bearing capability are included. Physical-plan validators
     /// should use this method instead of reconstructing this identity ad hoc.
     pub fn execution_semantics_equal(&self, other: &Self) -> bool {
+        if self.shares_binding_with(other) {
+            return true;
+        }
         macro_rules! optional_fn_equal {
             ($left:expr, $right:expr) => {
                 match ($left, $right) {
@@ -1322,6 +1350,33 @@ mod tests {
             .with_singleton_merge(AggregateSingletonMerge::Input);
 
         assert!(plain.execution_semantics_equal(&annotated));
+    }
+
+    #[test]
+    fn aggregate_kernel_and_proofs_share_immutable_storage_until_specialized() {
+        let original = create_dummy_aggregate(
+            "shared_aggregate",
+            vec![LogicalType::Integer],
+            LogicalType::BigInt,
+        );
+        let cloned = original.clone();
+        assert!(original.shares_binding_with(&cloned));
+        assert_eq!(original.arguments.as_ptr(), cloned.arguments.as_ptr());
+        let mut specialized = cloned.with_singleton_merge(AggregateSingletonMerge::Input);
+        assert!(!original.shares_binding_with(&specialized));
+        assert!(original.singleton_merge().is_none());
+        assert_eq!(
+            specialized.singleton_merge(),
+            Some(&AggregateSingletonMerge::Input)
+        );
+        assert!(original.execution_semantics_equal(&specialized));
+        specialized.arguments[0] = LogicalType::BigInt;
+        assert_eq!(original.arguments, [LogicalType::Integer]);
+        assert!(!original.execution_semantics_equal(&specialized));
+        assert_eq!(
+            std::mem::size_of::<AggregateFunction>(),
+            std::mem::size_of::<usize>()
+        );
     }
 
     #[test]

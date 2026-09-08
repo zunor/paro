@@ -144,6 +144,9 @@ impl ScalarFunction {
 }
 
 fn scalar_kernel_equal(left: &BoundScalarFunction, right: &BoundScalarFunction) -> bool {
+    if left.shares_binding_with(right) {
+        return true;
+    }
     macro_rules! optional_fn_equal {
         ($left:expr, $right:expr) => {
             match ($left, $right) {
