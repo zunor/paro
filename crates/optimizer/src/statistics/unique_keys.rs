@@ -16,7 +16,9 @@ use paro_planner::expression::{ColumnRefExpression, Expression};
 use paro_planner::operator::{
     ColumnBinding, Get, Join, JoinComparisonType, JoinCondition, JoinType, LogicalOperator,
 };
-use paro_planner::plan::{OwnedLogicalPlan, UniqueKey, UniqueKeyColumn, UniqueKeyProvenance};
+use paro_planner::plan::{
+    OwnedLogicalPlan, UniqueKey, UniqueKeyColumn, UniqueKeyNullSemantics, UniqueKeyProvenance,
+};
 
 /// Evidence that every candidate key binding is evaluated by an ordinary
 /// equality predicate and therefore rejects NULL before uniqueness is used.
@@ -234,7 +236,13 @@ pub(crate) fn derive_unique_keys_from_facts<Child>(
     children: &[&[UniqueKey]],
 ) -> Vec<UniqueKey> {
     let mut keys = match operator {
-        LogicalOperator::BoundReference(reference) => reference.facts.unique_keys.clone(),
+        LogicalOperator::BoundReference(reference) => reference
+            .facts
+            .unique_keys
+            .iter()
+            .chain(&reference.facts.grouping_unique_keys)
+            .cloned()
+            .collect(),
         LogicalOperator::Get(get) => declared_keys_in_layout(get, layout),
         LogicalOperator::SearchScan(search) => {
             declared_keys_through_projection(&search.get, &search.projections, layout)
@@ -254,6 +262,13 @@ pub(crate) fn derive_unique_keys_from_facts<Child>(
                 .to_indices(child_layout(child_layouts, 0).len()),
             layout,
         ),
+        LogicalOperator::TopN(topn) => project_unique_keys(
+            child_keys(children, 0),
+            &topn
+                .projection_map
+                .to_indices(child_layout(child_layouts, 0).len()),
+            layout,
+        ),
         LogicalOperator::Projection(projection) => {
             let sources = projection
                 .expressions
@@ -265,7 +280,6 @@ pub(crate) fn derive_unique_keys_from_facts<Child>(
             remap_unique_keys(child_keys(children, 0), &sources, layout)
         }
         LogicalOperator::Limit(_)
-        | LogicalOperator::TopN(_)
         | LogicalOperator::Window(_)
         | LogicalOperator::EmptyResult(_)
         | LogicalOperator::RowFetch(_)
@@ -366,21 +380,53 @@ fn comparison_join_unique_keys<Child>(
             join.join_type,
             JoinType::Inner | JoinType::Left | JoinType::Right | JoinType::Outer
         );
-        keys.extend(remap_unique_keys_by_binding(
-            child_keys(children, 0),
-            layout,
-            structural,
-        ));
+        let mut preserved =
+            remap_unique_keys_by_binding(child_keys(children, 0), layout, structural);
+        if matches!(join.join_type, JoinType::Right | JoinType::Outer) {
+            for key in &mut preserved {
+                key.null_semantics = UniqueKeyNullSemantics::NullsDistinct;
+            }
+        }
+        keys.extend(preserved);
     }
     if preserve_right {
         let structural = !matches!(join.join_type, JoinType::RightSemi | JoinType::RightAnti);
-        keys.extend(remap_unique_keys_by_binding(
-            child_keys(children, 1),
-            layout,
-            structural,
-        ));
+        let mut preserved =
+            remap_unique_keys_by_binding(child_keys(children, 1), layout, structural);
+        if matches!(
+            join.join_type,
+            JoinType::Left | JoinType::Outer | JoinType::Single
+        ) {
+            for key in &mut preserved {
+                key.null_semantics = UniqueKeyNullSemantics::NullsDistinct;
+            }
+        }
+        keys.extend(preserved);
     }
     keys
+}
+
+fn declared_key_null_semantics(get: &Get, key: &DeclaredUniqueKey) -> UniqueKeyNullSemantics {
+    let null_safe = key.is_unique_with_nulls_equal(|binding| {
+        get.stored_column(binding.column_index)
+            .is_some_and(|column| {
+                get.table.as_ref().is_some_and(|table| {
+                    table
+                        .columns
+                        .get(column)
+                        .is_some_and(|column| column.not_null)
+                        || table.constraints().iter().any(|constraint| {
+                            constraint.constraint_type == ConstraintType::NotNull
+                                && constraint.columns.contains(&column)
+                        })
+                })
+            })
+    });
+    if null_safe {
+        UniqueKeyNullSemantics::NullsEqual
+    } else {
+        UniqueKeyNullSemantics::NullsDistinct
+    }
 }
 
 fn declared_keys_in_layout(
@@ -407,6 +453,7 @@ fn declared_keys_in_layout(
             Some(UniqueKey::new(
                 columns,
                 UniqueKeyProvenance::CatalogEnforced,
+                declared_key_null_semantics(get, &key),
             ))
         })
         .collect()
@@ -450,6 +497,7 @@ fn declared_keys_through_projection(
             Some(UniqueKey::new(
                 columns,
                 UniqueKeyProvenance::CatalogEnforced,
+                declared_key_null_semantics(get, &key),
             ))
         })
         .collect()
@@ -481,7 +529,7 @@ fn project_unique_keys(
                         })
                 })
                 .collect::<Option<Vec<_>>>()?;
-            Some(UniqueKey::new(columns, key.provenance))
+            Some(UniqueKey::new(columns, key.provenance, key.null_semantics))
         })
         .collect()
 }
@@ -512,7 +560,7 @@ fn remap_unique_keys(
                         })
                 })
                 .collect::<Option<Vec<_>>>()?;
-            Some(UniqueKey::new(columns, key.provenance))
+            Some(UniqueKey::new(columns, key.provenance, key.null_semantics))
         })
         .collect()
 }
@@ -557,6 +605,7 @@ fn normalize_unique_keys(keys: &mut Vec<UniqueKey>) {
             .cmp(&right.columns.len())
             .then_with(|| left.columns.cmp(&right.columns))
             .then_with(|| left.provenance.cmp(&right.provenance))
+            .then_with(|| left.null_semantics.cmp(&right.null_semantics))
     });
     let mut retained = Vec::<UniqueKey>::new();
     for key in keys.drain(..) {
@@ -566,6 +615,7 @@ fn normalize_unique_keys(keys: &mut Vec<UniqueKey>) {
                     .iter()
                     .any(|other| other.output_index == column.output_index)
             }) && candidate.provenance <= key.provenance
+                && candidate.null_semantics <= key.null_semantics
         }) {
             continue;
         }
@@ -601,6 +651,7 @@ fn key_from_indices(
             binding: layout.bindings()[output_index],
         }),
         provenance,
+        UniqueKeyNullSemantics::NullsEqual,
     )
 }
 
@@ -636,6 +687,7 @@ fn remap_unique_keys_by_binding(
                 } else {
                     key.provenance
                 },
+                key.null_semantics,
             ))
         })
         .collect()
@@ -643,11 +695,192 @@ fn remap_unique_keys_by_binding(
 
 #[cfg(test)]
 mod tests {
+    use paro_catalog::entry::{
+        CatalogObjectId, ColumnDefinition, Constraint, CreateTableInfo, TableCatalogEntry,
+    };
     use paro_common::types::LogicalType;
     use paro_planner::expression::{ColumnRefExpression, ReferenceExpression};
     use paro_planner::operator::ExpressionGet;
 
     use super::*;
+
+    #[test]
+    fn null_extension_key_proofs_match_an_independent_bag_oracle() {
+        use paro_planner::operator::{ComparisonJoin, LogicalOutputLayout};
+        let layouts = [1, 2].map(|table| {
+            LogicalOutputLayout::new(
+                vec![LogicalType::BigInt],
+                vec![ColumnBinding::new(table, 0)],
+            )
+        });
+        let output = LogicalOutputLayout::new(
+            vec![LogicalType::BigInt; 2],
+            vec![ColumnBinding::new(1, 0), ColumnBinding::new(2, 0)],
+        );
+        for left_nulls in 0..=2 {
+            for right_nulls in 0..=2 {
+                for left_mask in 0..8 {
+                    for right_mask in 0..8 {
+                        let bag = |mask: usize, nulls| {
+                            (0..3)
+                                .filter(|value| mask & (1 << value) != 0)
+                                .map(Some)
+                                .chain(std::iter::repeat_n(None, nulls))
+                                .collect::<Vec<_>>()
+                        };
+                        let left = bag(left_mask, left_nulls);
+                        let right = bag(right_mask, right_nulls);
+                        let key = |index: usize, nulls| {
+                            UniqueKey::new(
+                                [UniqueKeyColumn {
+                                    output_index: 0,
+                                    binding: layouts[index].bindings()[0],
+                                }],
+                                UniqueKeyProvenance::Structural,
+                                if nulls < 2 {
+                                    UniqueKeyNullSemantics::NullsEqual
+                                } else {
+                                    UniqueKeyNullSemantics::NullsDistinct
+                                },
+                            )
+                        };
+                        let child_keys = [vec![key(0, left_nulls)], vec![key(1, right_nulls)]];
+                        for kind in [
+                            JoinType::Inner,
+                            JoinType::Left,
+                            JoinType::Right,
+                            JoinType::Outer,
+                        ] {
+                            let join =
+                                LogicalOperator::Join(Join::Comparison(ComparisonJoin::new(
+                                    kind,
+                                    OwnedLogicalPlan::synthetic(LogicalOperator::DummyScan),
+                                    OwnedLogicalPlan::synthetic(LogicalOperator::DummyScan),
+                                    vec![JoinCondition::equality(column(1, 0), column(2, 0))],
+                                )));
+                            let keys = derive_unique_keys_from_facts(
+                                &join,
+                                &output,
+                                &layouts,
+                                &[&child_keys[0], &child_keys[1]],
+                            );
+                            let mut rows = Vec::new();
+                            for l in &left {
+                                let mut matched = false;
+                                for r in &right {
+                                    if l.is_some() && l == r {
+                                        rows.push([*l, *r]);
+                                        matched = true;
+                                    }
+                                }
+                                if !matched && matches!(kind, JoinType::Left | JoinType::Outer) {
+                                    rows.push([*l, None]);
+                                }
+                            }
+                            if matches!(kind, JoinType::Right | JoinType::Outer) {
+                                for r in &right {
+                                    if !r.is_some_and(|r| left.contains(&Some(r))) {
+                                        rows.push([None, *r]);
+                                    }
+                                }
+                            }
+                            for key in keys {
+                                let mut seen = HashSet::new();
+                                for row in &rows {
+                                    let tuple = key
+                                        .columns
+                                        .iter()
+                                        .map(|column| row[column.output_index])
+                                        .collect::<Vec<_>>();
+                                    if key.null_semantics == UniqueKeyNullSemantics::NullsDistinct
+                                        && tuple.contains(&None)
+                                    {
+                                        continue;
+                                    }
+                                    assert!(
+                                        seen.insert(tuple),
+                                        "{kind:?} {left:?} {right:?} falsely proved {key:?}"
+                                    );
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn catalog_grouping_uniqueness_requires_schema_not_a_null_free_observation() {
+        use paro_storage::table::table_factory::TableFactory;
+        use std::sync::Arc;
+        for (primary, not_null, expected) in [
+            (false, false, UniqueKeyNullSemantics::NullsDistinct),
+            (false, true, UniqueKeyNullSemantics::NullsEqual),
+            (true, false, UniqueKeyNullSemantics::NullsEqual),
+        ] {
+            let mut definition = ColumnDefinition::new("key".into(), LogicalType::BigInt);
+            definition.not_null = not_null;
+            let table = Arc::new(
+                TableCatalogEntry::from_info(
+                    CreateTableInfo::new(
+                        "paro".into(),
+                        "public".into(),
+                        "keys".into(),
+                        vec![definition],
+                    )
+                    .with_constraints(vec![if primary {
+                        Constraint::primary_key(vec![0])
+                    } else {
+                        Constraint::unique(vec![0])
+                    }]),
+                    Arc::new(
+                        TableFactory::default()
+                            .create_table(&[LogicalType::BigInt])
+                            .unwrap(),
+                    ),
+                    CatalogObjectId::from_raw(71_001),
+                    0,
+                )
+                .unwrap(),
+            );
+            let plan = OwnedLogicalPlan::synthetic(LogicalOperator::Get(Box::new(Get::new(
+                3,
+                vec!["key".into()],
+                vec![LogicalType::BigInt],
+                table,
+            ))));
+            let keys = derive_local_unique_keys(&plan.operator, &plan.output_layout(), &[]);
+            assert_eq!(keys.len(), 1);
+            assert_eq!(keys[0].null_semantics, expected);
+        }
+    }
+
+    #[test]
+    fn weaker_nullable_key_does_not_prune_a_grouping_key() {
+        let columns = [UniqueKeyColumn {
+            output_index: 0,
+            binding: ColumnBinding::new(1, 0),
+        }];
+        let mut keys = vec![
+            UniqueKey::new(
+                columns,
+                UniqueKeyProvenance::CatalogEnforced,
+                UniqueKeyNullSemantics::NullsDistinct,
+            ),
+            UniqueKey::new(
+                columns,
+                UniqueKeyProvenance::Structural,
+                UniqueKeyNullSemantics::NullsEqual,
+            ),
+        ];
+        normalize_unique_keys(&mut keys);
+        assert_eq!(
+            keys.len(),
+            2,
+            "catalog origin and NULL equality are independent obligations"
+        );
+    }
 
     fn column(table_index: usize, column_index: usize) -> Expression {
         Expression::ColumnRef(
@@ -709,6 +942,7 @@ mod tests {
                 binding: ColumnBinding::new(7, 1),
             }],
             UniqueKeyProvenance::CatalogEnforced,
+            UniqueKeyNullSemantics::NullsDistinct,
         ));
         let reference =
             Expression::Reference(ReferenceExpression::new(0, LogicalType::BigInt).into());

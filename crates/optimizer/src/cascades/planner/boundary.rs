@@ -6,7 +6,7 @@
 use super::*;
 use paro_common::runtime_value::Value;
 use paro_planner::operator::bound_reference::{BoundRelationFacts, BoundSourceColumn};
-use paro_planner::plan::{UniqueKey, UniqueKeyColumn, UniqueKeyProvenance};
+use paro_planner::plan::{UniqueKey, UniqueKeyColumn, UniqueKeyNullSemantics, UniqueKeyProvenance};
 
 #[cfg(test)]
 mod tests;
@@ -762,7 +762,7 @@ impl BoundarySnapshot {
             .collect::<BTreeMap<_, _>>();
         let unique_keys = facts
             .unique_keys
-            .iter()
+            .union(&facts.grouping_unique_keys)
             .filter_map(|key| {
                 let columns = key
                     .iter()
@@ -774,7 +774,16 @@ impl BoundarySnapshot {
                         })
                     })
                     .collect::<Option<Vec<_>>>()?;
-                Some(UniqueKey::new(columns, UniqueKeyProvenance::Structural))
+                let null_semantics = if facts.grouping_unique_keys.contains(key) {
+                    UniqueKeyNullSemantics::NullsEqual
+                } else {
+                    UniqueKeyNullSemantics::NullsDistinct
+                };
+                Some(UniqueKey::new(
+                    columns,
+                    UniqueKeyProvenance::Structural,
+                    null_semantics,
+                ))
             })
             .collect();
         let grouping_unique_keys = facts
@@ -791,7 +800,11 @@ impl BoundarySnapshot {
                         })
                     })
                     .collect::<Option<Vec<_>>>()?;
-                Some(UniqueKey::new(columns, UniqueKeyProvenance::Structural))
+                Some(UniqueKey::new(
+                    columns,
+                    UniqueKeyProvenance::Structural,
+                    UniqueKeyNullSemantics::NullsEqual,
+                ))
             })
             .collect();
         Ok(Arc::new(BoundRelationFacts {
@@ -946,48 +959,6 @@ impl BoundarySnapshot {
                     }
                 })
                 .collect::<Result<Vec<_>>>()?;
-            let child_grouping_keys = logical
-                .key
-                .children
-                .iter()
-                .zip(&metadata.child_layouts)
-                .map(|(group, layout)| {
-                    let group = memo.canonical_group(*group);
-                    let Some(facts) = self.groups.get(&group) else {
-                        return Vec::new();
-                    };
-                    let ordinals = layout
-                        .bindings
-                        .iter()
-                        .zip(&layout.types)
-                        .enumerate()
-                        .filter_map(|(ordinal, (binding, ty))| {
-                            state
-                                .binding_ids
-                                .get(binding.table_index, binding.column_index, ty)
-                                .copied()
-                                .map(|column| (column, ordinal))
-                        })
-                        .collect::<BTreeMap<_, _>>();
-                    facts
-                        .grouping_unique_keys
-                        .iter()
-                        .filter_map(|key| {
-                            let columns = key
-                                .iter()
-                                .map(|column| {
-                                    let output_index = *ordinals.get(column)?;
-                                    Some(UniqueKeyColumn {
-                                        output_index,
-                                        binding: layout.bindings[output_index],
-                                    })
-                                })
-                                .collect::<Option<Vec<_>>>()?;
-                            Some(UniqueKey::new(columns, UniqueKeyProvenance::Structural))
-                        })
-                        .collect()
-                })
-                .collect::<Vec<Vec<UniqueKey>>>();
             let layout = operator.output_layout_from_children(&child_layouts);
             let local_keys = crate::statistics::unique_keys::derive_unique_keys_from_facts(
                 operator,
@@ -996,6 +967,7 @@ impl BoundarySnapshot {
                 &child_keys.iter().map(Vec::as_slice).collect::<Vec<_>>(),
             );
             for key in local_keys {
+                let null_safe = key.null_semantics == UniqueKeyNullSemantics::NullsEqual;
                 let key = key
                     .columns
                     .iter()
@@ -1011,53 +983,10 @@ impl BoundarySnapshot {
                     .collect::<Option<BTreeSet<_>>>();
                 if let Some(key) = key {
                     if !key.is_empty() {
+                        if null_safe {
+                            grouping_unique_keys.insert(key.iter().copied().collect());
+                        }
                         unique_keys.insert(key.into_iter().collect());
-                    }
-                }
-            }
-            let local_grouping_keys = if let LogicalOperator::BoundReference(reference) = operator {
-                reference.facts.grouping_unique_keys.clone()
-            } else {
-                crate::statistics::unique_keys::derive_unique_keys_from_facts(
-                    operator,
-                    &layout,
-                    &child_layouts,
-                    &child_grouping_keys
-                        .iter()
-                        .map(Vec::as_slice)
-                        .collect::<Vec<_>>(),
-                )
-            };
-            for key in local_grouping_keys {
-                // Leaf catalog keys are not GROUP BY keys. All admitted keys
-                // must either descend from an already NULL-safe child proof or
-                // be created structurally by DISTINCT / grouped Aggregate.
-                let locally_structural = matches!(
-                    operator,
-                    LogicalOperator::Distinct(_) | LogicalOperator::Aggregate(_)
-                );
-                if child_grouping_keys.iter().all(Vec::is_empty)
-                    && !locally_structural
-                    && !matches!(operator, LogicalOperator::BoundReference(_))
-                {
-                    continue;
-                }
-                let key = key
-                    .columns
-                    .iter()
-                    .map(|column| {
-                        let ty = layout.types().get(column.output_index)?;
-                        let id = *state.binding_ids.get(
-                            column.binding.table_index,
-                            column.binding.column_index,
-                            ty,
-                        )?;
-                        metadata.output_columns.contains(&id).then_some(id)
-                    })
-                    .collect::<Option<BTreeSet<_>>>();
-                if let Some(key) = key {
-                    if !key.is_empty() {
-                        grouping_unique_keys.insert(key.into_iter().collect());
                     }
                 }
             }

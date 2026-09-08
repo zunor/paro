@@ -85,20 +85,33 @@ pub struct UniqueKeyColumn {
 }
 
 /// Cached unique-key proof produced by statistics gathering.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum UniqueKeyNullSemantics {
+    /// SQL grouping equality: even a tuple containing NULL occurs at most once.
+    NullsEqual,
+    /// Ordinary SQL UNIQUE: tuples containing NULL may repeat.
+    NullsDistinct,
+}
+
+/// Uniqueness is a proof about both output identity and an equality domain.
+/// NULL extension may weaken NullsEqual to NullsDistinct, never the converse.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
 pub struct UniqueKey {
     pub columns: Box<[UniqueKeyColumn]>,
     pub provenance: UniqueKeyProvenance,
+    pub null_semantics: UniqueKeyNullSemantics,
 }
 
 impl UniqueKey {
     pub fn new(
         columns: impl IntoIterator<Item = UniqueKeyColumn>,
         provenance: UniqueKeyProvenance,
+        null_semantics: UniqueKeyNullSemantics,
     ) -> Self {
         Self {
             columns: columns.into_iter().collect(),
             provenance,
+            null_semantics,
         }
     }
 }
@@ -567,6 +580,7 @@ mod tests {
                 binding: ColumnBinding::new(1, 0),
             }],
             UniqueKeyProvenance::Structural,
+            UniqueKeyNullSemantics::NullsEqual,
         )
     }
 

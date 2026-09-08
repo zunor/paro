@@ -912,11 +912,7 @@ fn push_aggregate_properties(
         .map(|expression| format_aggregate_expr(expression, spec, &formatter))
         .collect::<Vec<_>>();
     if !aggregate_names.is_empty() {
-        push_string_property(
-            properties,
-            "Aggregates",
-            aggregate_names.join(", "),
-        );
+        push_string_property(properties, "Aggregates", aggregate_names.join(", "));
     }
     // Emit-time HAVING references aggregate results, not the output layout
     // (which also contains grouping keys and may be independently projected).

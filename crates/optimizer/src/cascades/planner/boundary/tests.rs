@@ -392,6 +392,77 @@ fn aggregate_key_is_derived_from_native_shell_without_cached_plan_statistics() {
         transported.unique_keys[0].provenance,
         UniqueKeyProvenance::Structural
     );
+    assert_eq!(
+        transported.unique_keys[0].null_semantics,
+        UniqueKeyNullSemantics::NullsEqual
+    );
+}
+
+#[test]
+fn native_group_hole_does_not_publish_null_extended_grouping_keys() {
+    use paro_planner::operator::{Aggregate, ComparisonJoin, Join, JoinCondition, JoinType};
+    let aggregate = |table| {
+        OwnedLogicalPlan::synthetic(LogicalOperator::Aggregate(Box::new(Aggregate::new(
+            table + 1,
+            table + 2,
+            table + 3,
+            source(table),
+            vec![Expression::ColumnRef(
+                ColumnRefExpression::new(ColumnBinding::new(table, 0), LogicalType::Integer).into(),
+            )],
+            vec![],
+            vec![],
+            vec![],
+        ))))
+    };
+    let join = OwnedLogicalPlan::synthetic(LogicalOperator::Join(Join::Comparison(
+        ComparisonJoin::new(
+            JoinType::Left,
+            aggregate(0),
+            aggregate(10),
+            vec![JoinCondition::equality(
+                Expression::ColumnRef(
+                    ColumnRefExpression::new(ColumnBinding::new(1, 0), LogicalType::Integer).into(),
+                ),
+                Expression::ColumnRef(
+                    ColumnRefExpression::new(ColumnBinding::new(11, 0), LogicalType::Integer)
+                        .into(),
+                ),
+            )],
+        ),
+    )));
+    let mut input = input(join, SearchBudget::default());
+    let state = input.planner_state.read().unwrap();
+    let mut ctx = TransformContext::new(&mut input.memo, input.root);
+    let snapshot = BoundarySnapshot::read(
+        &mut ctx,
+        &state,
+        &PatternOperand::Group(input.root),
+        BudgetDimension::RuleWorkPerGroup,
+    )
+    .unwrap()
+    .unwrap();
+    let transported = snapshot
+        .transport(
+            ctx.memo(),
+            &state,
+            input.root,
+            &PlannerBindingLayout {
+                bindings: Box::new([ColumnBinding::new(1, 0), ColumnBinding::new(11, 0)]),
+                types: Box::new([LogicalType::Integer, LogicalType::Integer]),
+            },
+        )
+        .unwrap();
+    assert_eq!(transported.grouping_unique_keys.len(), 1);
+    assert_eq!(
+        transported.grouping_unique_keys[0].columns[0].binding,
+        ColumnBinding::new(1, 0)
+    );
+    assert!(transported
+        .unique_keys
+        .iter()
+        .any(|key| key.columns[0].binding == ColumnBinding::new(11, 0)
+            && key.null_semantics == UniqueKeyNullSemantics::NullsDistinct));
 }
 
 #[test]
