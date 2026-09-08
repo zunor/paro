@@ -613,10 +613,7 @@ pub(super) fn stage_transformed_expression(
             child_layouts: semantic_plan
                 .children()
                 .into_iter()
-                .map(|child| PlannerBindingLayout {
-                    bindings: child.get_column_bindings().into_boxed_slice(),
-                    types: child.types().into_boxed_slice(),
-                })
+                .map(|child| Arc::new(child.output_layout()))
                 .collect::<Vec<_>>()
                 .into_boxed_slice(),
             child_required: intern_child_requirements(
@@ -854,18 +851,16 @@ pub(super) fn stage_transformed_expression(
                 session
                     .facts
                     .settle_group(session.memo, session.state, node.group)?;
-                let layout = PlannerBindingLayout {
-                    bindings: plan.get_column_bindings().into_boxed_slice(),
-                    types: plan.types().into_boxed_slice(),
-                };
+                let layout = Arc::new(plan.output_layout());
                 let facts =
                     session
                         .facts
                         .transport(session.memo, session.state, node.group, &layout)?;
+                let (types, bindings) = Arc::unwrap_or_clone(layout).into_parts();
                 let reference = paro_planner::operator::BoundReference::new(
                     paro_planner::operator::BoundReferenceId::node_occurrence(plan.id.0),
-                    layout.bindings.into_vec(),
-                    layout.types.into_vec(),
+                    bindings,
+                    types,
                 )
                 .with_facts(facts);
                 plan.operator = LogicalOperator::BoundReference(reference);

@@ -69,6 +69,77 @@ fn boundary_value_identity_retains_which_operand_owns_each_fact() {
 }
 
 #[test]
+fn metadata_clones_share_the_aligned_child_schema() {
+    let input = input(project(source(0), 1), SearchBudget::default());
+    let state = input.planner_state.read().unwrap();
+    let expression = input.memo.group(input.root).unwrap().logical_exprs()[0];
+    let metadata = &state.metadata[&input.memo.logical_expr(expression).unwrap().payload];
+    let cloned = metadata.clone();
+    assert!(Arc::ptr_eq(
+        &metadata.child_layouts[0],
+        &cloned.child_layouts[0]
+    ));
+    assert_eq!(
+        cloned.child_layouts[0].bindings(),
+        &[ColumnBinding::new(0, 0)]
+    );
+    assert_eq!(cloned.child_layouts[0].types(), &[LogicalType::Integer]);
+}
+
+#[test]
+fn narrow_key_facet_preserves_null_domains_when_outputs_are_permuted_or_pruned() {
+    let facts = GroupFacts::from(GroupFactValue {
+        unique_keys: BTreeSet::from([
+            vec![ColumnId(1)].into_boxed_slice(),
+            vec![ColumnId(1), ColumnId(2)].into_boxed_slice(),
+        ]),
+        grouping_unique_keys: BTreeSet::from([vec![ColumnId(2)].into_boxed_slice()]),
+        ..Default::default()
+    });
+    for columns in [
+        vec![ColumnId(1), ColumnId(2)],
+        vec![ColumnId(2), ColumnId(1)],
+        vec![ColumnId(1)],
+        vec![],
+    ] {
+        let layout = paro_planner::operator::LogicalOutputLayout::new(
+            vec![LogicalType::Integer; columns.len()],
+            columns
+                .iter()
+                .map(|column| ColumnBinding::new(7, column.index()))
+                .collect(),
+        );
+        let keys = facts.keys_in_layout(&layout, &columns);
+        assert_eq!(
+            keys.len(),
+            match columns.len() {
+                2 => 3,
+                1 => 1,
+                _ => 0,
+            }
+        );
+        for key in keys {
+            let referenced = key
+                .columns
+                .iter()
+                .map(|column| {
+                    assert_eq!(layout.bindings()[column.output_index], column.binding);
+                    column.binding.column_index
+                })
+                .collect::<Vec<_>>();
+            assert_eq!(
+                key.null_semantics,
+                if referenced == [2] {
+                    UniqueKeyNullSemantics::NullsEqual
+                } else {
+                    UniqueKeyNullSemantics::NullsDistinct
+                }
+            );
+        }
+    }
+}
+
+#[test]
 fn boundary_value_identity_includes_grouping_proofs_and_finite_domains() {
     let group = GroupId(0);
     let encoded = |facts| {
@@ -384,10 +455,11 @@ fn finite_replay_proof_survives_a_recursive_identity_alternative() {
     let original = input.memo.logical_expr(expression).unwrap().payload;
     let mut metadata = state.metadata[&original].clone();
     metadata.operator_type = paro_planner::operator::LogicalOperatorType::Filter;
-    metadata.child_layouts = Box::new([PlannerBindingLayout {
-        bindings: Box::new([ColumnBinding::new(0, 0)]),
-        types: Box::new([LogicalType::Integer]),
-    }]);
+    metadata.child_layouts =
+        Box::new([Arc::new(paro_planner::operator::LogicalOutputLayout::new(
+            vec![LogicalType::Integer],
+            vec![ColumnBinding::new(0, 0)],
+        ))]);
     let column_stats = state.payloads.logical[original.index()]
         .column_stats
         .clone();
@@ -457,17 +529,17 @@ fn aggregate_key_is_derived_from_native_shell_without_cached_plan_statistics() {
     )
     .unwrap()
     .unwrap();
-    let layout = PlannerBindingLayout {
-        bindings: Box::new([ColumnBinding::new(4, 0)]),
-        types: Box::new([LogicalType::Integer]),
-    };
+    let layout = Arc::new(paro_planner::operator::LogicalOutputLayout::new(
+        vec![LogicalType::Integer],
+        vec![ColumnBinding::new(4, 0)],
+    ));
     let transported = snapshot
         .transport(context.memo(), &state, input.root, &layout)
         .unwrap();
     assert_eq!(transported.unique_keys.len(), 1);
     assert_eq!(
         transported.unique_keys[0].columns[0].binding,
-        layout.bindings[0]
+        layout.bindings()[0]
     );
     assert_eq!(
         transported.unique_keys[0].provenance,
@@ -528,10 +600,10 @@ fn native_group_hole_does_not_publish_null_extended_grouping_keys() {
             ctx.memo(),
             &state,
             input.root,
-            &PlannerBindingLayout {
-                bindings: Box::new([ColumnBinding::new(1, 0), ColumnBinding::new(11, 0)]),
-                types: Box::new([LogicalType::Integer, LogicalType::Integer]),
-            },
+            &Arc::new(paro_planner::operator::LogicalOutputLayout::new(
+                vec![LogicalType::Integer, LogicalType::Integer],
+                vec![ColumnBinding::new(1, 0), ColumnBinding::new(11, 0)],
+            )),
         )
         .unwrap();
     assert_eq!(transported.grouping_unique_keys.len(), 1);

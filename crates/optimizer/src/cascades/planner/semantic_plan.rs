@@ -45,7 +45,7 @@ pub(super) fn instantiate_bound_plan_with_group_holes(
         cardinality: Option<(u64, u64, u64)>,
         facts: Option<Arc<paro_planner::operator::bound_reference::BoundRelationFacts>>,
     ) -> Result<OwnedLogicalPlan> {
-        if layout.bindings.len() != layout.types.len() {
+        if layout.bindings().len() != layout.types().len() {
             return Err(paro_error::internal(
                 "group-hole binding/type layout has inconsistent arity",
             ));
@@ -55,8 +55,8 @@ pub(super) fn instantiate_bound_plan_with_group_holes(
         );
         let mut reference = paro_planner::operator::BoundReference::new(
             reference_id,
-            layout.bindings.to_vec(),
-            layout.types.to_vec(),
+            layout.bindings().to_vec(),
+            layout.types().to_vec(),
         );
         if let Some(facts) = facts {
             reference = reference.with_facts(facts);

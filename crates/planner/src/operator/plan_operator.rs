@@ -75,6 +75,11 @@ impl LogicalOutputLayout {
         self.bindings
     }
 
+    /// Transfer both aligned schema components without cloning either one.
+    pub fn into_parts(self) -> (Vec<LogicalType>, Vec<ColumnBinding>) {
+        (self.types, self.bindings)
+    }
+
     fn push(&mut self, logical_type: LogicalType, binding: ColumnBinding) {
         self.types.push(logical_type);
         self.bindings.push(binding);

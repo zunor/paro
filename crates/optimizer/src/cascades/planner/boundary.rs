@@ -12,6 +12,24 @@ use paro_planner::plan::{UniqueKey, UniqueKeyColumn, UniqueKeyNullSemantics, Uni
 #[cfg(test)]
 mod tests;
 
+fn layout_column_ids(
+    state: &PlannerTransformState,
+    layout: &paro_planner::operator::LogicalOutputLayout,
+) -> Result<Vec<ColumnId>> {
+    layout
+        .bindings()
+        .iter()
+        .zip(layout.types())
+        .map(|(binding, ty)| {
+            state
+                .binding_ids
+                .get(binding.table_index, binding.column_index, ty)
+                .copied()
+                .ok_or_else(|| paro_error::internal("boundary layout has an unknown column"))
+        })
+        .collect()
+}
+
 fn encode_distinct_provenance(
     encoder: &mut StableFingerprintBuilder,
     provenance: paro_storage::statistics::DistinctProvenance,
@@ -79,6 +97,46 @@ impl std::ops::Deref for GroupFacts {
 }
 
 impl GroupFacts {
+    /// Publish only key witnesses. Callers deriving relational keys must not
+    /// materialize distributions, NDV domains and source lineage as a side
+    /// effect of reading this one facet.
+    fn keys_in_layout(
+        &self,
+        layout: &paro_planner::operator::LogicalOutputLayout,
+        columns: &[ColumnId],
+    ) -> Vec<UniqueKey> {
+        let ordinals = columns
+            .iter()
+            .enumerate()
+            .map(|(index, column)| (*column, index))
+            .collect::<BTreeMap<_, _>>();
+        self.unique_keys
+            .union(&self.grouping_unique_keys)
+            .filter_map(|key| {
+                let columns = key
+                    .iter()
+                    .map(|column| {
+                        let output_index = *ordinals.get(column)?;
+                        Some(UniqueKeyColumn {
+                            output_index,
+                            binding: layout.bindings()[output_index],
+                        })
+                    })
+                    .collect::<Option<Vec<_>>>()?;
+                let null_semantics = if self.grouping_unique_keys.contains(key) {
+                    UniqueKeyNullSemantics::NullsEqual
+                } else {
+                    UniqueKeyNullSemantics::NullsDistinct
+                };
+                Some(UniqueKey::new(
+                    columns,
+                    UniqueKeyProvenance::Structural,
+                    null_semantics,
+                ))
+            })
+            .collect()
+    }
+
     fn fingerprint(&self) -> Fingerprint {
         *self.fingerprint.get_or_init(|| {
             let mut encoder = StableFingerprintBuilder::default();
@@ -598,7 +656,7 @@ impl BoundarySnapshot {
                                     state.metadata[&logical.payload]
                                         .child_layouts
                                         .iter()
-                                        .map(|layout| layout.bindings.len())
+                                        .map(|layout| layout.bindings().len())
                                         .sum::<usize>(),
                                 )
                         })
@@ -744,69 +802,12 @@ impl BoundarySnapshot {
             .groups
             .get(&group)
             .ok_or_else(|| paro_error::internal("unobserved Memo boundary"))?;
-        let columns = layout
-            .bindings
+        let columns = layout_column_ids(state, layout)?;
+        let unique_keys = facts.keys_in_layout(layout, &columns);
+        let grouping_unique_keys = unique_keys
             .iter()
-            .zip(&layout.types)
-            .map(|(binding, ty)| {
-                state
-                    .binding_ids
-                    .get(binding.table_index, binding.column_index, ty)
-                    .copied()
-                    .ok_or_else(|| paro_error::internal("boundary layout has an unknown column"))
-            })
-            .collect::<Result<Vec<_>>>()?;
-        let ordinals = columns
-            .iter()
-            .enumerate()
-            .map(|(index, column)| (*column, index))
-            .collect::<BTreeMap<_, _>>();
-        let unique_keys = facts
-            .unique_keys
-            .union(&facts.grouping_unique_keys)
-            .filter_map(|key| {
-                let columns = key
-                    .iter()
-                    .map(|column| {
-                        let output_index = *ordinals.get(column)?;
-                        Some(UniqueKeyColumn {
-                            output_index,
-                            binding: layout.bindings[output_index],
-                        })
-                    })
-                    .collect::<Option<Vec<_>>>()?;
-                let null_semantics = if facts.grouping_unique_keys.contains(key) {
-                    UniqueKeyNullSemantics::NullsEqual
-                } else {
-                    UniqueKeyNullSemantics::NullsDistinct
-                };
-                Some(UniqueKey::new(
-                    columns,
-                    UniqueKeyProvenance::Structural,
-                    null_semantics,
-                ))
-            })
-            .collect();
-        let grouping_unique_keys = facts
-            .grouping_unique_keys
-            .iter()
-            .filter_map(|key| {
-                let columns = key
-                    .iter()
-                    .map(|column| {
-                        let output_index = *ordinals.get(column)?;
-                        Some(UniqueKeyColumn {
-                            output_index,
-                            binding: layout.bindings[output_index],
-                        })
-                    })
-                    .collect::<Option<Vec<_>>>()?;
-                Some(UniqueKey::new(
-                    columns,
-                    UniqueKeyProvenance::Structural,
-                    UniqueKeyNullSemantics::NullsEqual,
-                ))
-            })
+            .filter(|key| key.null_semantics == UniqueKeyNullSemantics::NullsEqual)
+            .cloned()
             .collect();
         Ok(Arc::new(BoundRelationFacts {
             can_replay: facts.can_replay,
@@ -939,12 +940,7 @@ impl BoundarySnapshot {
             let child_layouts = metadata
                 .child_layouts
                 .iter()
-                .map(|layout| {
-                    paro_planner::operator::LogicalOutputLayout::new(
-                        layout.types.to_vec(),
-                        layout.bindings.to_vec(),
-                    )
-                })
+                .map(Arc::as_ref)
                 .collect::<Vec<_>>();
             let child_keys = logical
                 .key
@@ -953,14 +949,15 @@ impl BoundarySnapshot {
                 .zip(&metadata.child_layouts)
                 .map(|(group, layout)| {
                     if self.groups.contains_key(&memo.canonical_group(*group)) {
-                        self.transport(memo, state, *group, layout)
-                            .map(|facts| facts.unique_keys.clone())
+                        let columns = layout_column_ids(state, layout)?;
+                        Ok(self.groups[&memo.canonical_group(*group)]
+                            .keys_in_layout(layout, &columns))
                     } else {
                         Ok(Vec::new())
                     }
                 })
                 .collect::<Result<Vec<_>>>()?;
-            let layout = operator.output_layout_from_children(&child_layouts);
+            let layout = operator.output_layout_from_child_refs(&child_layouts);
             let local_keys = crate::statistics::unique_keys::derive_unique_keys_from_facts(
                 operator,
                 &layout,
@@ -1006,13 +1003,13 @@ impl BoundarySnapshot {
                     .any(|index| child(index).is_none_or(|facts| facts.control));
             let column_at = |index: usize, ordinal: usize| -> Option<ColumnId> {
                 let layout = metadata.child_layouts.get(index)?;
-                let binding = layout.bindings.get(ordinal)?;
+                let binding = layout.bindings().get(ordinal)?;
                 state
                     .binding_ids
                     .get(
                         binding.table_index,
                         binding.column_index,
-                        layout.types.get(ordinal)?,
+                        layout.types().get(ordinal)?,
                     )
                     .copied()
             };
@@ -1098,7 +1095,7 @@ impl BoundarySnapshot {
                                 key.iter()
                                     .map(|column| {
                                         let layout = metadata.child_layouts.get(index)?;
-                                        layout.bindings.iter().zip(&layout.types).position(
+                                        layout.bindings().iter().zip(layout.types()).position(
                                             |(binding, ty)| {
                                                 state.binding_ids.get(
                                                     binding.table_index,

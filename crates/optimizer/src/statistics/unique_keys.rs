@@ -224,7 +224,12 @@ pub(crate) fn derive_local_unique_keys(
         .iter()
         .map(|child| child.stats.unique_keys.as_slice())
         .collect::<Vec<_>>();
-    derive_unique_keys_from_facts(operator, layout, child_layouts, &keys)
+    derive_unique_keys_from_facts(
+        operator,
+        layout,
+        &child_layouts.iter().collect::<Vec<_>>(),
+        &keys,
+    )
 }
 
 /// One operator algebra shared by plan statistics and Memo-native facts.
@@ -232,7 +237,7 @@ pub(crate) fn derive_local_unique_keys(
 pub(crate) fn derive_unique_keys_from_facts<Child>(
     operator: &LogicalOperator<Child>,
     layout: &paro_planner::operator::LogicalOutputLayout,
-    child_layouts: &[paro_planner::operator::LogicalOutputLayout],
+    child_layouts: &[&paro_planner::operator::LogicalOutputLayout],
     children: &[&[UniqueKey]],
 ) -> Vec<UniqueKey> {
     let mut keys = match operator {
@@ -337,7 +342,7 @@ pub(crate) fn refresh_unique_keys(plan: OwnedLogicalPlan) -> Result<OwnedLogical
 fn comparison_join_unique_keys<Child>(
     join: &paro_planner::operator::ComparisonJoin<Child>,
     children: &[&[UniqueKey]],
-    child_layouts: &[paro_planner::operator::LogicalOutputLayout],
+    child_layouts: &[&paro_planner::operator::LogicalOutputLayout],
     layout: &paro_planner::operator::LogicalOutputLayout,
 ) -> Vec<UniqueKey> {
     let left_layout = child_layout(child_layouts, 0);
@@ -617,10 +622,10 @@ fn normalize_unique_keys(keys: &mut Vec<UniqueKey>) {
     *keys = retained;
 }
 
-fn child_layout(
-    children: &[paro_planner::operator::LogicalOutputLayout],
+fn child_layout<'a>(
+    children: &[&'a paro_planner::operator::LogicalOutputLayout],
     index: usize,
-) -> &paro_planner::operator::LogicalOutputLayout {
+) -> &'a paro_planner::operator::LogicalOutputLayout {
     children
         .get(index)
         .expect("unique-key derivation requires its logical child layout")
@@ -754,7 +759,7 @@ mod tests {
                             let keys = derive_unique_keys_from_facts(
                                 &join,
                                 &output,
-                                &layouts,
+                                &layouts.iter().collect::<Vec<_>>(),
                                 &[&child_keys[0], &child_keys[1]],
                             );
                             let mut rows = Vec::new();

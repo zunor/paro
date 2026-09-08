@@ -973,10 +973,7 @@ impl MemoBuilder {
                         child_layouts: plan
                             .children()
                             .into_iter()
-                            .map(|child| PlannerBindingLayout {
-                                bindings: child.get_column_bindings().into_boxed_slice(),
-                                types: child.types().into_boxed_slice(),
-                            })
+                            .map(|child| Arc::new(child.output_layout()))
                             .collect::<Vec<_>>()
                             .into_boxed_slice(),
                         child_required: intern_child_requirements(

@@ -112,13 +112,13 @@ fn domain_fingerprint(
         .iter()
         .map(|key| {
             let mut key_builder = StableFingerprintBuilder::default();
-            key_builder.write_u64(key.layout.bindings.len() as u64);
-            for binding in &key.layout.bindings {
+            key_builder.write_u64(key.layout.bindings().len() as u64);
+            for binding in key.layout.bindings() {
                 key_builder.write_u64(binding.table_index as u64);
                 key_builder.write_u64(binding.column_index as u64);
             }
-            key_builder.write_u64(key.layout.types.len() as u64);
-            for logical_type in &key.layout.types {
+            key_builder.write_u64(key.layout.types().len() as u64);
+            for logical_type in key.layout.types() {
                 key_builder.write_fingerprint(super::super::logical_type_fingerprint(logical_type));
             }
             key_builder.write_u64(key.ordinals.len() as u64);
@@ -369,7 +369,7 @@ fn key_demand(
         .get(1 - ordinal)
         .ok_or_else(|| paro_error::internal("CTE demand lost its input layout"))?
         .clone();
-    let available = layout.bindings.iter().copied().collect::<BTreeSet<_>>();
+    let available = layout.bindings().iter().copied().collect::<BTreeSet<_>>();
     let mut keys = Vec::new();
     for condition in &join.conditions {
         if condition.comparison != JoinComparisonType::Equal {
@@ -1370,7 +1370,7 @@ impl CteRequirement {
                 occurrences
                     .iter()
                     .map(|occurrence| crate::cte::predicate_domain::FilteredCTERef {
-                        old_bindings: occurrence.output.bindings.to_vec(),
+                        old_bindings: occurrence.output.bindings().to_vec(),
                         filters: occurrence
                             .predicates
                             .as_deref()
@@ -1548,12 +1548,12 @@ impl CteRequirement {
                         path: path.into_boxed_slice(),
                         table_index: reference.table_index,
                         null_extended,
-                        output: PlannerBindingLayout {
-                            bindings: (0..reference.column_types.len())
+                        output: Arc::new(paro_planner::operator::LogicalOutputLayout::new(
+                            reference.column_types.clone(),
+                            (0..reference.column_types.len())
                                 .map(|ordinal| ColumnBinding::new(reference.table_index, ordinal))
                                 .collect(),
-                            types: reference.column_types.clone().into_boxed_slice(),
-                        },
+                        )),
                         predicates,
                         keys,
                     });
@@ -1635,7 +1635,7 @@ impl CteRequirement {
             .iter()
             .map(|occurrence| {
                 Some(FilteredCTERef {
-                    old_bindings: occurrence.output.bindings.to_vec(),
+                    old_bindings: occurrence.output.bindings().to_vec(),
                     filters: occurrence.predicates.as_ref()?.to_vec(),
                 })
             })
@@ -1704,8 +1704,8 @@ impl CteRequirement {
             let transport = facts.transport(memo, state, key.group, &key.layout)?;
             let reference = BoundReference::new(
                 reference_id,
-                key.layout.bindings.to_vec(),
-                key.layout.types.to_vec(),
+                key.layout.bindings().to_vec(),
+                key.layout.types().to_vec(),
             )
             .with_facts(transport);
             holes.insert(reference_id, key.group);
@@ -1816,7 +1816,7 @@ impl CteRequirement {
             let reference: CTERef = reference.clone();
             if !self.occurrences.iter().any(|occurrence| {
                 occurrence.table_index == reference.table_index
-                    && occurrence.output.types.as_ref() == reference.column_types.as_slice()
+                    && occurrence.output.types() == reference.column_types.as_slice()
             }) {
                 return Err(paro_error::internal(
                     "CTE inline reached an unproved consumer occurrence",

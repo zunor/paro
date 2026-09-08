@@ -380,11 +380,9 @@ pub(super) struct PlannerOperatorMetadata {
     pub(super) baseline_payload: PhysicalPayloadId,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(super) struct PlannerBindingLayout {
-    pub(super) bindings: Box<[ColumnBinding]>,
-    pub(super) types: Box<[LogicalType]>,
-}
+/// One immutable, aligned schema shared by metadata, requirement witnesses and
+/// boundary readers. Cloning a requirement must not copy every column/type.
+pub(super) type PlannerBindingLayout = Arc<paro_planner::operator::LogicalOutputLayout>;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum PlannerChildRowGoal {
