@@ -116,7 +116,7 @@ PROJECTION  (rows=3)
   ->  ROWSET_SCAN on public.join_elim_left l  (rows=3)
     Columns: id, payload
 
-SELECT name, kind, invocation_count > 0 AS observed
+SELECT name, kind, metric_unit, metric_value > 0 AS observed
 FROM paro_optimizers()
 WHERE name IN (
     'join_elimination',
@@ -125,9 +125,9 @@ WHERE name IN (
     'memo_physical_expression_count'
 )
 ORDER BY kind, name;
-name	kind	observed
-memo_group_count	search_counter	true
-memo_logical_expression_count	search_counter	true
-memo_physical_expression_count	search_counter	true
-join_elimination	transformation_rule	true
-join_elimination	transformation_rule_attempt	true
+name	kind	metric_unit	observed
+memo_group_count	search_counter	count	true
+memo_logical_expression_count	search_counter	count	true
+memo_physical_expression_count	search_counter	count	true
+join_elimination	transformation_rule	insertions	true
+join_elimination	transformation_rule_attempt	attempts	true

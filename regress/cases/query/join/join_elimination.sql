@@ -104,7 +104,7 @@ SELECT l.id, l.payload
 FROM join_elim_left AS l
 LEFT JOIN join_elim_right_unique AS r ON l.id = r.id;
 
-SELECT name, kind, invocation_count > 0 AS observed
+SELECT name, kind, metric_unit, metric_value > 0 AS observed
 FROM paro_optimizers()
 WHERE name IN (
     'join_elimination',
