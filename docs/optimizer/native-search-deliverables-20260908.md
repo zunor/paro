@@ -9,8 +9,10 @@ optimization in this delivery.
 - [x] Reproducers and fresh-process cold planning evidence collector/gate.
 - [x] Explicit CTE definition-column correspondence for all domain facts.
 - [x] Single-writer session storage; alternatives hold references, not COW arenas.
-- [ ] Verified incumbent before optional search; time, work, memory, cancellation
-      have explicit completion/exit contracts.
+- [x] Verified incumbent before optional search; cooperative time/work limits
+      and cancellation have explicit completion/exit contracts.
+- [ ] Query-owned planning-memory admission and bounded work inside every
+      remaining legacy operation (a cooperative clock is not a hard cap).
 - [ ] Native scalar/group rule construction and incremental fact settlement.
 - [ ] Post-change profiling and elimination of measured redundant work.
 - [ ] Independent closure/cost oracle, SQL regress, original Q11 correctness and
@@ -181,5 +183,105 @@ changes two settings assertions. The final successful run used the private
 4. Locate the low Q11/cardinality estimates and the previously reviewed vector
    and aggregate estimate deviations; retain an independent plan-quality gate.
 5. Final closure/oracle, fresh-process latency/RSS, SQL regress and original Q11
-   execution evidence after the last implementation commit. Performance claims
-   require those measurements, not the pre-change reports above.
+      execution evidence after the last implementation commit. Performance claims
+      require those measurements, not the pre-change reports above.
+
+## Subsequent evidence and contract repairs (2026-09-09)
+
+This section supersedes the pending measurements and estimate investigation
+above. It does **not** close the native-transformation or planning-memory items.
+
+### Estimate investigation is resolved, not merely blessed
+
+- `a78b6c35`: a Filter's refined output statistics were being reused to estimate
+  that same Filter's input. Retain immutable input evidence before publishing
+  the output. The five-row vector fixture now estimates two matching rows,
+  agreeing with its independent two-row oracle (previously one).
+- `8131f591`: aggregate-result distribution evidence disappeared at a Memo
+  group boundary. Preserve the query-local numeric distribution in the value
+  fact and replay the existing SUM estimate without requiring a Filter(Agg)
+  representative tree. The inner post-HAVING boundary is now 3/3 estimated/
+  actual rows, and the join is 4/3 (previously 1/3 for both). The final grouped
+  result is 4/2: its q-error is still two, not an exact estimate.
+- `e66acd6d`: EXPLAIN publishes an aggregate's fused HAVING predicate, using
+  aggregate-result coordinates rather than group-key coordinates. The quality
+  collector accepts either this boundary or the equivalent standalone Filter,
+  and rejects missing or ambiguous matches. It cannot accidentally compare a
+  pre-HAVING estimate with the post-HAVING oracle.
+- `native-plan-quality-having-boundary-20260909.json`: all ten independently
+  authored boundaries pass; max q-error 2, mean 1.30833, median 1. The collector
+  contract changed, so this is not a comparison against an incompatible old
+  collector baseline.
+
+### Execution operating points and SQL NULL equality
+
+`fa0e5f1d` split truly invariant algorithms from task-capacity-dependent ones;
+shared Memo goals retain worker capacity. `f8ade134` supplies scan tasks from
+physical storage row evidence, not optional ANALYZE metadata. The subsequent
+workspace run exposed a separate search-provider extraction defect, fixed in
+`cdcfe03d`: a group searched under a class-specific goal can select an invariant
+provider. The node carries the selected implementation's proof, not its
+sibling algorithms' search context. Enforcers use the actual grant, and
+portfolio identity includes their executable admission constraints. Every node
+is still verified; equal-cost class-specific enforcers cannot merge proofs.
+
+`d51dbab8` makes NULL equality explicit on unique-key evidence. Outer joins
+weaken keys on the NULL-extended side; grouping-safe keys and ordinary nullable
+UNIQUE keys cannot prune one another without an equally strong domain proof.
+An independent oracle checks 2,304 small join bags. `7e9bfb23` requires a schema
+non-NULL guarantee for singleton lowering and replay; a NULL-free observation
+is insufficient for a reusable plan. The annotation walk is iterative.
+
+The nullable-UNIQUE SQL fixture's merge aggregate is semantically necessary
+under its declared schema, not an optimization that a new fact tag alone may
+erase. A NULL-aware singleton algorithm would need a lossless grouping path
+for duplicate NULL tuples. The prepared-plan regression checks complete rows
+before and after adding two NULLs within a transaction: exactly one new NULL
+group is returned. The fixture was not changed to NOT NULL to manufacture a
+plan-quality win.
+
+### Measured progress and a rejected optimization
+
+| Report | Revision | Observation |
+| --- | --- | --- |
+| `native-q11-cold-physical-supply-20260909.json` | `f8ade134` | Five fresh processes, median 1407.76 ms; 1012 groups / 1815 logical / 2894 physical |
+| `native-q11-cold-limit-identity-20260909.json` | `14ec9409` | Median 1349.58 ms; 1022 / 1821 / 2900; 6308 settlement hits / 2866 misses |
+| `native-q11-cold-immutable-occurrences-20260909.json` | `6d8c3dce` | Median 1367.25 ms, unchanged search counters, only 60 extra cache hits; reverted in `250a79e3` |
+| `native-q11-execution-physical-supply-20260909.json` | `f8ade134` | Paro 101.071 ms / DuckDB 105.716 ms; ratio 0.967, hierarchical 95% CI [0.942, 1.011] |
+
+The execution interval crosses one: a stable win has **not** been established.
+Cold latency remains far from the requested DuckDB-level target. The limit
+identity correction preserves the distinction between an absent LIMIT and an
+absent OFFSET; it changes bounded-search scheduling, so its timing difference
+is not evidence for a unit-cost improvement. All these cold reports retain
+explicit search incompleteness, with no deadline expiry or rule failures.
+
+The allocation-instrumented
+`native-q11-allocation-physical-supply-20260909.json` at `14ec9409` records
+2,606,593,471 bytes of Memo allocation traffic. Main rule elapsed times are
+predicate transfer 218.8 ms, join enumeration 124.1 ms, dimension sharing
+97.4 ms, subsumption 68.7 ms and dimension deferral 53.6 ms. These measurements
+still identify the native rule/settlement boundary as unfinished work. The
+immutable-occurrence cache was removed rather than reported as a speedup.
+
+### Current native operand boundary and validation scope
+
+`18c1c301` gives scalar constants an inspectable immutable leaf and exact
+equality after a digest-bucket match. Scalar identity now retains correlated
+column depth. Projection lineage and projection/grouping finite domains read
+`ScalarExprId`/`ColumnId`, not extraction scalars; a poisoned-carrier test checks
+that separation. This is a native fact consumer, **not** migration of all 21
+transformations. Function/operator executable payloads and rule construction
+still need a common native representation. A syntactic no-op shortcut is not
+admitted while legacy settlement can discover new semantic alternatives from
+changed facts.
+
+- At `cdcfe03d`: full workspace 6,453 passed / 85 ignored; workspace/all-target
+  Clippy passed, including previously failing vector and fulltext integration.
+- `0e8b30bc`: reviewed SQL baselines plus the full-row transaction probe;
+  rebuilt `cdcfe03d` release passes **184/184**, 44.86 s, in a new private
+  instance. An earlier repeat on the same instance failed because the cursor
+  fixture leaves its table behind; that data was not blessed as expected.
+- At `18c1c301`: optimizer 993 passed; workspace/all-target Clippy passed.
+  New post-change cold/execution measurements and a final full suite are still
+  required. Do not reuse the historical performance reports as its evidence.
