@@ -46,7 +46,7 @@ struct LocalKey {
 /// overwhelmingly common first-visit path.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
 struct LocalShape {
-    operator_tag: Fingerprint,
+    operator_tag: Box<[u8]>,
     inputs: Box<[FactId]>,
     input_stats: NodeStats,
 }
@@ -54,7 +54,7 @@ struct LocalShape {
 fn operator_shape_tag<Child>(
     operator: &LogicalOperator<Child>,
     scalars: &ScalarArena,
-) -> Result<Fingerprint> {
+) -> Result<Box<[u8]>> {
     // Scalar-free shells can be fingerprinted without cloning or interning
     // their children. Reuse the canonical operator encoding so a fast hit is
     // never allowed to alias two filters/orders that differ only in their
@@ -62,10 +62,10 @@ fn operator_shape_tag<Child>(
     if operator_has_no_scalar_payload(operator)
         && !matches!(operator, LogicalOperator::BoundReference(_))
     {
-        let fingerprint = query_operator_fingerprint_only(operator, &[], scalars)?;
-        let mut builder = StableFingerprintBuilder::default();
+        let encoding = query_operator_identity(operator, &[], scalars)?.1;
+        let mut builder = StableFingerprintBuilder::recording();
         builder.write_bytes(b"paro.settlement-local-shape.v2");
-        builder.write_fingerprint(fingerprint);
+        builder.write_bytes(&encoding);
         match operator {
             LogicalOperator::Filter(filter) => {
                 encode_projection_map(&mut builder, &filter.projection_map)
@@ -78,37 +78,46 @@ fn operator_shape_tag<Child>(
             }
             _ => {}
         }
-        return Ok(builder.finish());
+        return Ok(builder.finish_recording().1);
     }
-    let mut builder = StableFingerprintBuilder::default();
+    let mut builder = StableFingerprintBuilder::recording();
     builder.write_bytes(b"paro.settlement-local-shape.v2");
     let mut hasher = std::collections::hash_map::DefaultHasher::new();
     std::mem::discriminant(operator).hash(&mut hasher);
     builder.write_u64(hasher.finish());
-    Ok(builder.finish())
+    Ok(builder.finish_recording().1)
 }
 
-/// Operators in this set carry no scalar expression roots.  Their cache key
-/// can be encoded directly from the borrowed shell, so a hit does not clone a
-/// 2KB logical operator merely to discover that no scalar interning is needed.
+/// Only the shared scalar visitor may establish absence of expression roots.
+/// The operator whitelist keeps unsupported payloads out of the fast path.
 fn operator_has_no_scalar_payload<Child>(operator: &LogicalOperator<Child>) -> bool {
-    match operator {
-        LogicalOperator::Get(get) => get.runtime_filter_expressions.is_empty(),
-        LogicalOperator::Filter(filter) => filter.expressions.is_empty(),
-        LogicalOperator::Projection(projection) => projection.expressions.is_empty(),
-        LogicalOperator::RowFetch(_) => true,
-        LogicalOperator::Limit(_) => true,
-        LogicalOperator::Order(order) => order.orders.is_empty(),
-        LogicalOperator::TopN(topn) => topn.orders.is_empty(),
-        LogicalOperator::Distinct(distinct) => distinct.order_by.is_none(),
-        LogicalOperator::EmptyResult(_)
-        | LogicalOperator::MaterializedCTE(_)
-        | LogicalOperator::RecursiveCTE(_)
-        | LogicalOperator::CTERef(_)
-        | LogicalOperator::SetOperation(_)
-        | LogicalOperator::DummyScan => true,
-        _ => false,
+    if let LogicalOperator::Get(get) = operator {
+        return get.runtime_filter_expressions.is_empty();
     }
+    if !matches!(
+        operator,
+        LogicalOperator::Filter(_)
+            | LogicalOperator::Projection(_)
+            | LogicalOperator::RowFetch(_)
+            | LogicalOperator::Limit(_)
+            | LogicalOperator::Order(_)
+            | LogicalOperator::TopN(_)
+            | LogicalOperator::Distinct(_)
+            | LogicalOperator::EmptyResult(_)
+            | LogicalOperator::MaterializedCTE(_)
+            | LogicalOperator::RecursiveCTE(_)
+            | LogicalOperator::CTERef(_)
+            | LogicalOperator::SetOperation(_)
+            | LogicalOperator::DummyScan
+    ) {
+        return false;
+    }
+    // Share the scalar enumeration contract with lowering. LIMIT/OFFSET,
+    // DISTINCT ON targets and row-fetch rowids are scalar payloads too;
+    // their presence must never be guessed from the operator tag.
+    let mut has_scalar = false;
+    paro_planner::visitor::enumerate_expression_refs(operator, |_| has_scalar = true);
+    !has_scalar
 }
 
 #[derive(Debug, Clone)]
@@ -882,6 +891,46 @@ mod tests {
                 ))],
             )),
         )
+    }
+
+    #[test]
+    fn limits_and_distinct_targets_are_not_scalar_free_cache_keys() {
+        let env = environment();
+        let literal = |value| {
+            Expression::Constant(ConstantExpression::new(
+                Value::BigInt(value),
+                LogicalType::BigInt,
+            ))
+        };
+        let limit = |value| {
+            OwnedLogicalPlan::new(
+                &env.bind_context,
+                LogicalOperator::Limit(Box::new(paro_planner::operator::Limit::new(
+                    values(&env.bind_context, 8),
+                    Some(literal(value)),
+                    None,
+                ))),
+            )
+        };
+        assert!(!operator_has_no_scalar_payload(&limit(2).operator));
+        let distinct = LogicalOperator::Distinct(paro_planner::operator::Distinct::distinct_on(
+            vec![literal(1)],
+            values(&env.bind_context, 8),
+        ));
+        assert!(!operator_has_no_scalar_payload(&distinct));
+        let mut cache = SettlementCache::default();
+        let first = cache.settle(limit(2), &env).unwrap();
+        let second = cache.settle(limit(5), &env).unwrap();
+        let bound = |plan: &OwnedLogicalPlan| {
+            let LogicalOperator::Limit(limit) = &plan.operator else {
+                panic!("expected limit");
+            };
+            let Some(Expression::Constant(constant)) = &limit.limit else {
+                panic!("expected constant");
+            };
+            constant.value.clone()
+        };
+        assert_ne!(bound(&first.plan), bound(&second.plan));
     }
 
     #[test]

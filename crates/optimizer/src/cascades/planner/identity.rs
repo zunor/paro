@@ -39,36 +39,7 @@ pub(super) fn query_operator_identity<Child>(
     scalar_roots: &[ScalarExprId],
     scalars: &ScalarArena,
 ) -> Result<(Fingerprint, Box<[u8]>)> {
-    query_operator_identity_inner(operator, scalar_roots, scalars, true)
-}
-
-/// Compute only the hash bucket for a borrowed operator shell.
-///
-/// Settlement's fast shape path uses this before it knows whether a complete
-/// local recipe exists.  The old implementation used the collision-safe
-/// recording form and then discarded its byte stream, which made every cache
-/// probe allocate.  Exact operator bytes are still generated on a miss; a
-/// shape probe only needs the same digest and never establishes equivalence by
-/// itself.
-pub(super) fn query_operator_fingerprint_only<Child>(
-    operator: &LogicalOperator<Child>,
-    scalar_roots: &[ScalarExprId],
-    scalars: &ScalarArena,
-) -> Result<Fingerprint> {
-    Ok(query_operator_identity_inner(operator, scalar_roots, scalars, false)?.0)
-}
-
-fn query_operator_identity_inner<Child>(
-    operator: &LogicalOperator<Child>,
-    scalar_roots: &[ScalarExprId],
-    scalars: &ScalarArena,
-    recording: bool,
-) -> Result<(Fingerprint, Box<[u8]>)> {
-    let mut fingerprint = if recording {
-        StableFingerprintBuilder::recording()
-    } else {
-        StableFingerprintBuilder::default()
-    };
+    let mut fingerprint = StableFingerprintBuilder::recording();
     fingerprint.write_u64(operator_tag(operator.op_type()));
     fingerprint.write_u64(scalar_roots.len() as u64);
     for root in scalar_roots {
@@ -358,11 +329,7 @@ fn query_operator_identity_inner<Child>(
             ));
         }
     }
-    if recording {
-        Ok(fingerprint.finish_recording())
-    } else {
-        Ok((fingerprint.finish(), Box::new([])))
-    }
+    Ok(fingerprint.finish_recording())
 }
 
 pub(super) fn encode_graph_pattern(
