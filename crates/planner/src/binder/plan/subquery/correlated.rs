@@ -925,11 +925,11 @@ mod tests {
             wrapped(&binder, expression_get(250, vec![LogicalType::Integer])),
             Vec::new(),
             Vec::new(),
-            vec![Expression::Aggregate(AggregateExpression::new(
+            vec![Expression::Aggregate(Box::new(AggregateExpression::new(
                 first_func,
                 vec![inner_ref],
                 LogicalType::Integer,
-            ))],
+            )))],
             vec![],
         )));
         let subquery = subquery_expression(

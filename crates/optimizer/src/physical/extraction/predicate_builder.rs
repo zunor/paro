@@ -1029,7 +1029,7 @@ mod tests {
                 LogicalType::BigInt,
             ))
         };
-        let substring = Expression::Function(FunctionExpression::new(
+        let substring = Expression::Function(Box::new(FunctionExpression::new(
             function,
             vec![
                 Expression::Reference(ReferenceExpression::new(0, LogicalType::Varchar)),
@@ -1037,7 +1037,7 @@ mod tests {
                 constant_bigint(length),
             ],
             LogicalType::Varchar,
-        ));
+        )));
         let mut children = vec![substring];
         children.extend(values.iter().map(|value| {
             Expression::Constant(ConstantExpression::new(

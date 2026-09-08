@@ -2262,10 +2262,12 @@ mod tests {
                 .expect("bind FIRST");
         assert_eq!(target_types, vec![LogicalType::BigInt]);
         let return_type = function.return_type.clone();
-        let expression = Expression::Aggregate(paro_planner::expression::AggregateExpression::new(
-            function,
-            vec![column_ref(1, 0)],
-            return_type,
+        let expression = Expression::Aggregate(Box::new(
+            paro_planner::expression::AggregateExpression::new(
+                function,
+                vec![column_ref(1, 0)],
+                return_type,
+            ),
         ));
 
         let unconstrained = aggregate_expression_statistics(&expression, &ctx, None);

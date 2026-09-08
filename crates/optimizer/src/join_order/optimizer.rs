@@ -24,7 +24,7 @@ use paro_planner::operator::{
     JoinType, LogicalOperator,
 };
 use paro_planner::plan::{CardinalityEstimate, CardinalityProvenance, OwnedLogicalPlan};
-use paro_storage::statistics::{ColumnStatistics, NumericStats};
+use paro_storage::statistics::{ColumnStatistics, DistinctProvenance, NumericStats};
 use tracing::debug;
 
 use crate::column::lifetime::ColumnLifetimeAnalyzer;
@@ -746,32 +746,43 @@ impl JoinOrderOptimizer {
                     Some(columns) => columns.get(ordinal),
                     None => self.column_stats.get(&binding),
                 };
-                let distinct = column_stats
-                    .map(|stats| stats.get_distinct_count())
-                    .unwrap_or(0);
-                let has_hll = distinct > 0;
-                let storage_observation =
-                    column_stats.is_some_and(|stats| stats.is_storage_observation());
-                let distinct = if has_hll {
-                    distinct
+                let evidence = column_stats.map(|stats| stats.distinct_evidence());
+                let has_evidence = evidence.is_some_and(|evidence| evidence.is_known());
+                let storage_observation = column_stats
+                    .is_some_and(|stats| stats.is_storage_observation())
+                    && evidence.is_some_and(|evidence| evidence.is_complete_observation());
+                let distinct = if has_evidence {
+                    evidence.map_or(0, |evidence| evidence.point as usize)
                 } else {
                     column_stats
                         .and_then(|stats| integral_domain_cardinality(stats))
                         .unwrap_or(cardinality.max(1))
                 };
+                let distinct = distinct.min(cardinality.max(1));
+                let provenance =
+                    evidence.map_or(DistinctProvenance::Unknown, |evidence| evidence.provenance);
                 (
                     binding,
-                    DistinctCount::new(
-                        // A filter can reduce the relation cardinality without
-                        // rewriting base-column HLL or min/max statistics. The
-                        // surviving domain cannot contain more values than rows.
-                        distinct.min(cardinality.max(1)),
+                    DistinctCount::from_evidence(
+                        paro_storage::statistics::DistinctEvidence {
+                            point: distinct as u64,
+                            lower: evidence
+                                .map_or(0, |evidence| evidence.lower.min(distinct as u64)),
+                            upper: evidence.and_then(|evidence| evidence.upper),
+                            provenance,
+                        },
                         // Provenance, not the root operator shape, decides
                         // whether an HLL is an observed domain.  Filters,
                         // projections, search scans, and CTE boundaries can
                         // preserve a storage observation without being a
                         // bare Get; derived expressions remain estimates.
-                        has_hll && (storage_observation || memo_domain_observation),
+                        has_evidence
+                            && (storage_observation
+                                || (memo_domain_observation
+                                    && !matches!(
+                                        provenance,
+                                        DistinctProvenance::ObservedPartial { .. }
+                                    ))),
                     ),
                 )
             })
@@ -1158,11 +1169,11 @@ mod tests {
             .with_stability(FunctionStability::Volatile);
         Expression::Comparison(paro_planner::expression::ComparisonExpression::new(
             ComparisonType::GreaterThan,
-            Expression::Function(FunctionExpression::new(
+            Expression::Function(Box::new(FunctionExpression::new(
                 function,
                 Vec::new(),
                 LogicalType::Double,
-            )),
+            ))),
             Expression::Constant(ConstantExpression::new(
                 Value::Double(0.5),
                 LogicalType::Double,
@@ -1285,6 +1296,7 @@ mod tests {
             column_domains: vec![BoundColumnDomain {
                 expected_distinct: Some(17),
                 guaranteed_distinct_upper: Some(20),
+                provenance: DistinctProvenance::Derived,
             }],
             ..BoundRelationFacts::default()
         });
@@ -1302,6 +1314,10 @@ mod tests {
         let stats = optimizer.relation_manager.get_relation_stats();
         assert_eq!(stats[0].column_distinct_count[&binding].distinct_count, 17);
         assert!(stats[0].column_distinct_count[&binding].has_expected_distinct);
+        assert_eq!(
+            stats[0].column_distinct_count[&binding].evidence.provenance,
+            DistinctProvenance::Derived
+        );
     }
 
     #[test]

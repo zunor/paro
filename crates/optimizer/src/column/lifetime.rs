@@ -517,7 +517,7 @@ mod tests {
     #[test]
     fn extract_column_bindings_visits_window_frame_offsets() {
         let expected = ColumnBinding::new(7, 3);
-        let expression = Expression::Window(WindowExpression::native(
+        let expression = Expression::Window(Box::new(WindowExpression::native(
             WindowFunction::row_number(),
             vec![],
             vec![],
@@ -532,7 +532,7 @@ mod tests {
                 end_is_preceding: false,
             },
             false,
-        ));
+        )));
         let mut bindings = Vec::new();
 
         ColumnLifetimeAnalyzer::extract_column_bindings(&expression, &mut bindings);

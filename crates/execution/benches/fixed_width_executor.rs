@@ -280,11 +280,11 @@ fn abs_expr() -> Expression {
         LogicalType::BigInt,
         abs_function,
     );
-    Expression::Function(FunctionExpression::new(
+    Expression::Function(Box::new(FunctionExpression::new(
         function,
         vec![reference_bigint(0)],
         LogicalType::BigInt,
-    ))
+    )))
 }
 
 fn cast_i32_to_i64_expr() -> Expression {
@@ -303,11 +303,11 @@ fn not_expr() -> Expression {
         LogicalType::Boolean,
         not_function,
     );
-    Expression::Function(FunctionExpression::new(
+    Expression::Function(Box::new(FunctionExpression::new(
         function,
         vec![reference_bool(0)],
         LogicalType::Boolean,
-    ))
+    )))
 }
 
 fn add_expr() -> Expression {
@@ -317,11 +317,11 @@ fn add_expr() -> Expression {
         LogicalType::BigInt,
         add_function,
     );
-    Expression::Function(FunctionExpression::new(
+    Expression::Function(Box::new(FunctionExpression::new(
         function,
         vec![reference_bigint(0), reference_bigint(1)],
         LogicalType::BigInt,
-    ))
+    )))
 }
 
 fn comparison_expr(comparison_type: ComparisonType) -> Expression {
@@ -343,7 +343,7 @@ fn between_expr() -> Expression {
         LogicalType::Boolean,
         between_function,
     );
-    Expression::Function(FunctionExpression::new(
+    Expression::Function(Box::new(FunctionExpression::new(
         function,
         vec![
             reference_bigint(0),
@@ -351,7 +351,7 @@ fn between_expr() -> Expression {
             reference_bigint(2),
         ],
         LogicalType::Boolean,
-    ))
+    )))
 }
 
 fn is_null_expr() -> Expression {

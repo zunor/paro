@@ -311,7 +311,7 @@ fn peel_scalar_branch(plan: &OwnedLogicalPlan, leaf_index: usize) -> Option<Scal
         wrapper_type: checked.return_type.clone(),
         scalar_expression: scalar_expression.clone(),
         scalar_source_binding: ColumnBinding::new(reduction.aggregate_index, 0),
-        aggregate: aggregate.clone(),
+        aggregate: *aggregate.clone(),
         filter_expressions,
         source_get: *source_get.clone(),
     })
@@ -553,7 +553,7 @@ fn build_fused_group(
         let bindings = AlphaBindings::match_gets(&group.fused_get, &branch.source_get)
             .ok_or_else(|| paro_error::internal("fused scan no longer covers a scalar branch"))?;
         let Expression::Aggregate(aggregate) = bindings
-            .rebase_scalar(&Expression::Aggregate(branch.aggregate.clone()))
+            .rebase_scalar(&Expression::Aggregate(Box::new(branch.aggregate.clone())))
             .ok_or_else(|| {
                 paro_error::internal("scalar aggregate inputs escaped the fused scan")
             })?

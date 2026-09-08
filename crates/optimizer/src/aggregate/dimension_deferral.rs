@@ -422,14 +422,14 @@ fn apply(
         .enumerate()
         .map(|(aggregate_index, merge)| {
             let return_type = merge.return_type.clone();
-            Expression::Aggregate(AggregateExpression::new(
+            Expression::Aggregate(Box::new(AggregateExpression::new(
                 merge,
                 vec![Expression::ColumnRef(ColumnRefExpression::new(
                     ColumnBinding::new(partial_aggregate_index, aggregate_index),
                     return_type.clone(),
                 ))],
                 return_type,
-            ))
+            )))
         })
         .collect();
 

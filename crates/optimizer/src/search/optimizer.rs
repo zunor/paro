@@ -1303,7 +1303,7 @@ mod tests {
     #[test]
     fn fulltext_match_extracts_query_terms() {
         let get = Get::new_without_table(1, vec!["body".to_string()], vec![LogicalType::Varchar]);
-        let expr = Expression::Function(FunctionExpression::new(
+        let expr = Expression::Function(Box::new(FunctionExpression::new(
             scalar_function(
                 "fulltext_match",
                 vec![LogicalType::Varchar, LogicalType::Varchar],
@@ -1320,7 +1320,7 @@ mod tests {
                 )),
             ],
             LogicalType::Boolean,
-        ));
+        )));
 
         let intent = extract_fulltext_match_intent(&expr, &get).unwrap().unwrap();
         assert_eq!(intent.column_id, 0);
@@ -1333,7 +1333,7 @@ mod tests {
     #[test]
     fn internal_fulltext_match_accepts_a_folded_tsquery_constant() {
         let get = Get::new_without_table(1, vec!["body".to_string()], vec![LogicalType::Varchar]);
-        let vector = Expression::Function(FunctionExpression::new(
+        let vector = Expression::Function(Box::new(FunctionExpression::new(
             scalar_function(
                 "to_tsvector",
                 vec![LogicalType::Varchar, LogicalType::Varchar],
@@ -1350,8 +1350,8 @@ mod tests {
                 )),
             ],
             LogicalType::TsVector,
-        ));
-        let expression = Expression::Function(FunctionExpression::new(
+        )));
+        let expression = Expression::Function(Box::new(FunctionExpression::new(
             scalar_function(
                 "fulltext_match_internal",
                 vec![LogicalType::TsVector, LogicalType::TsQuery],
@@ -1365,7 +1365,7 @@ mod tests {
                 )),
             ],
             LogicalType::Boolean,
-        ));
+        )));
 
         let intent = extract_fulltext_match_intent(&expression, &get)
             .unwrap()

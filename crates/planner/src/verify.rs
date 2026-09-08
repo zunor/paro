@@ -356,7 +356,7 @@ mod tests {
     fn verify_rejects_subquery_in_window_frame_offset() {
         let ctx = BindContext::new();
         let child = wrap(&ctx, expression_get(0));
-        let window = Expression::Window(WindowExpression::native(
+        let window = Expression::Window(Box::new(WindowExpression::native(
             WindowFunction::row_number(),
             vec![],
             vec![],
@@ -369,7 +369,7 @@ mod tests {
                 end_is_preceding: false,
             },
             false,
-        ));
+        )));
         let plan = LogicalOperator::Projection(Projection::new(42, child, vec![window]));
 
         let err = verify_physical_planner_invariants(&plan).expect_err("verify should fail");
@@ -382,12 +382,12 @@ mod tests {
         let child = wrap(&ctx, expression_get(0));
         let aggregate =
             AggregateExpression::new(get_count_star_function(), vec![], LogicalType::Integer);
-        let window = Expression::Window(WindowExpression::aggregate(
+        let window = Expression::Window(Box::new(WindowExpression::aggregate(
             aggregate,
             vec![],
             vec![],
             WindowFrame::default(),
-        ));
+        )));
         let plan = LogicalOperator::Projection(Projection::new(42, child, vec![window]));
 
         let err = verify_physical_planner_invariants(&plan).expect_err("verify should fail");

@@ -46,7 +46,11 @@ fn sum(input: Expression) -> Expression {
         .expect("bind SUM");
     assert_eq!(targets, [input_type]);
     let return_type = function.return_type.clone();
-    Expression::Aggregate(AggregateExpression::new(function, vec![input], return_type))
+    Expression::Aggregate(Box::new(AggregateExpression::new(
+        function,
+        vec![input],
+        return_type,
+    )))
 }
 
 fn table(object_id: u64) -> Arc<TableCatalogEntry> {
@@ -129,16 +133,16 @@ fn q11_shape(
         vec![],
         vec![],
         vec![
-            Expression::Aggregate(AggregateExpression::new(
+            Expression::Aggregate(Box::new(AggregateExpression::new(
                 first,
                 vec![column(SCALAR_PROJECTION, 0, LogicalType::BigInt)],
                 LogicalType::BigInt,
-            )),
-            Expression::Aggregate(AggregateExpression::new(
+            ))),
+            Expression::Aggregate(Box::new(AggregateExpression::new(
                 get_count_star_function(),
                 vec![],
                 LogicalType::BigInt,
-            )),
+            ))),
         ],
         vec![],
     );

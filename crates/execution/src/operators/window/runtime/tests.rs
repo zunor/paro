@@ -455,7 +455,7 @@ fn window_breaker_rejects_non_direct_sort_expressions() {
         Vec::new(),
         vec![int_constant(1)],
         vec![OrderByExpression {
-            expression: Expression::Window(rank_over(0, 1)),
+            expression: Expression::Window(Box::new(rank_over(0, 1))),
             ascending: true,
             nulls_first: false,
         }],
@@ -475,7 +475,7 @@ fn window_breaker_rejects_non_direct_frame_offsets() {
         WindowFunction::last_value(LogicalType::Integer),
         vec![reference(0, LogicalType::Integer)],
         rows_frame(
-            WindowFrameBound::Offset(Box::new(Expression::Window(rank_over(0, 1)))),
+            WindowFrameBound::Offset(Box::new(Expression::Window(Box::new(rank_over(0, 1))))),
             true,
             WindowFrameBound::CurrentRow,
             false,

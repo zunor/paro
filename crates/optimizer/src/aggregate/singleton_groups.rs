@@ -112,11 +112,11 @@ mod tests {
         let (function, _) = get_count_function()
             .bind(&[LogicalType::BigInt])
             .expect("bind count");
-        Expression::Aggregate(AggregateExpression::new(
+        Expression::Aggregate(Box::new(AggregateExpression::new(
             function,
             vec![input],
             LogicalType::BigInt,
-        ))
+        )))
     }
 
     fn candidate() -> (
@@ -181,11 +181,11 @@ mod tests {
             join,
             vec![column(1, 0)],
             vec![],
-            vec![Expression::Aggregate(AggregateExpression::new(
+            vec![Expression::Aggregate(Box::new(AggregateExpression::new(
                 merge,
                 vec![column(4, 0)],
                 LogicalType::BigInt,
-            ))],
+            )))],
             vec![],
         );
         let mut statistics = HashMap::new();

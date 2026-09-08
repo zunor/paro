@@ -15,6 +15,16 @@ use staging::{
     stage_transformed_expression, StagingRegionRequirements, StagingRequest, StagingTarget,
 };
 
+fn settle_with_session_arena(
+    state: &mut PlannerTransformState,
+    plan: OwnedLogicalPlan,
+    environment: &PlannerRuleEnvironment,
+) -> Result<settlement::SettledExpression> {
+    state
+        .settlement_cache
+        .settle_arena_in(plan, environment, &mut state.staging_arena)
+}
+
 pub(super) fn register_transformations(
     registry: &mut ImplementationRegistry,
     planner_state: Arc<RwLock<PlannerTransformState>>,
@@ -485,11 +495,13 @@ impl TransformationRule for PlannerTransformationRule {
                     .planner_state
                     .write()
                     .expect("planner transform state poisoned");
+                let (cte_partition_labels, staging_arena) = state.cte_partition_state_mut();
                 requirement.partitions(
                     plan,
                     &mut nested_group_holes,
                     &environment.bind_context,
-                    &mut state.cte_partition_labels,
+                    cte_partition_labels,
+                    staging_arena,
                 )?
             } else {
                 let restricted = if matches!(
@@ -547,12 +559,13 @@ impl TransformationRule for PlannerTransformationRule {
                 plan,
                 statistics: column_stats,
                 scopes,
-            } = self
-                .planner_state
-                .write()
-                .expect("planner transform state poisoned")
-                .settlement_cache
-                .settle_arena(plan, &environment)?;
+            } = {
+                let mut planner_state = self
+                    .planner_state
+                    .write()
+                    .expect("planner transform state poisoned");
+                settle_with_session_arena(&mut planner_state, plan, &environment)?
+            };
             group_hole_guard.validate_arena(&plan)?;
             if environment.verify_enabled {
                 crate::verify::verify_arena_plan(&plan, || {

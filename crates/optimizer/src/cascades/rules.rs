@@ -647,10 +647,17 @@ pub struct SourceRetentionProof {
 pub struct SourceFilterWork {
     pub domain: DomainProofId,
     pub evaluation: EvaluationOccurrenceId,
+    /// Immutable input-row domain on which this evaluation is charged.  This
+    /// is intentionally carried next to the occurrence rather than inferred
+    /// from `SourceWork::cost`: the latter already contains survivor
+    /// reductions and therefore changes with join composition order.
+    pub evaluation_rows: u64,
     pub expected_retained_ppm: u32,
     pub upper_retained_ppm: u32,
-    /// Cost of evaluating this predicate against the unfiltered source. Joint
-    /// composition orders and scales these costs by preceding predicates.
+    /// Cost of evaluating this predicate against the unfiltered source.  It is
+    /// allocated once from the operator-local full-source term and then only
+    /// scaled by preceding *distinct* domain proofs.  It must never be derived
+    /// from a lane's already-retained `cost`.
     pub full_apply_cost: SearchCost,
 }
 

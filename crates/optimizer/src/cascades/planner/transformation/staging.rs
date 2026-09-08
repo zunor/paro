@@ -181,7 +181,7 @@ pub(super) fn stage_transformed_expression(
         }
         let (skeleton, children) = paro_planner::plan::arena::LogicalPlanNode::detach(plan);
         let semantic_template = semantic_plan::canonical_template(skeleton.clone());
-        let semantic_plan = skeleton.clone().assemble(children)?;
+        let semantic_plan = semantic_template.clone().assemble(children)?;
         let memo = &mut *session.memo;
         let state = &mut *session.state;
         let options = &session.options;
@@ -785,14 +785,26 @@ pub(super) fn stage_transformed_expression(
             search_candidates,
         };
         use paro_planner::plan::arena::{LogicalPlanNode, PlanIndex};
-        let (arena, root_index) = plan.into_parts();
+        let (source_arena, source_root) = plan.into_parts();
+        let root_index = if session.state.staging_arena.owns(source_root) {
+            // Settlement may already have published into the session arena.
+            // Keep the existing root handle; absorbing an arena with the same
+            // identity would clone every shared slot behind the Arc handle.
+            source_root
+        } else {
+            session
+                .state
+                .staging_arena
+                .adopt_or_absorb(source_arena, source_root)?
+        };
         let mut completed = BTreeMap::<PlanIndex, (LogicalPlanNode<()>, NodeState)>::new();
         let mut root_result = None;
-        for index in arena.post_order(root_index)? {
+        let post_order = session.state.staging_arena.post_order(root_index)?;
+        for index in post_order {
             if let Some(statement) = &session.state.session {
                 statement.cancellation.check()?;
             }
-            let node = arena.get(index)?.clone();
+            let node = session.state.staging_arena.get(index)?.clone();
             let is_root = index == root_index;
             let mut child_states = Vec::new();
             let operator = node.operator.try_map_child_links(&mut |child| {

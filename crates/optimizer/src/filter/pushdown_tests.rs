@@ -64,7 +64,7 @@ fn external_call() -> Expression {
         .expect("builtin routine metadata")
         .boundary
         .placement = PlacementClass::External;
-    Expression::Function(expression)
+    Expression::Function(Box::new(expression))
 }
 
 fn volatile_call() -> Expression {
@@ -75,15 +75,15 @@ fn volatile_call() -> Expression {
         noop_scalar_execute,
     )
     .with_stability(FunctionStability::Volatile);
-    Expression::Function(FunctionExpression::new(
+    Expression::Function(Box::new(FunctionExpression::new(
         function,
         vec![],
         LogicalType::Integer,
-    ))
+    )))
 }
 
 fn window_with_start_offset(offset: Expression) -> Expression {
-    Expression::Window(WindowExpression::native(
+    Expression::Window(Box::new(WindowExpression::native(
         paro_function::window::WindowFunction::row_number(),
         vec![],
         vec![],
@@ -96,7 +96,7 @@ fn window_with_start_offset(offset: Expression) -> Expression {
             end_is_preceding: false,
         },
         false,
-    ))
+    )))
 }
 
 fn make_comparison(comp_type: ComparisonType, left: Expression, right: Expression) -> Expression {

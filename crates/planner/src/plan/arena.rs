@@ -5,22 +5,22 @@
 //!
 //! Publishing a rewrite appends nodes and returns a new root. Existing roots
 //! retain their semantics, so alternatives *within one arena* share unchanged
-//! subgraphs without cloning. `LogicalPlan` intentionally owns its arena at
-//! this boundary; callers that need cross-alternative sharing must keep one
-//! arena/session and pass roots rather than repeatedly converting through
-//! `LogicalPlan::from_owned`. Rollback removes unpublished slots without
-//! reusing their identity.
+//! subgraphs without cloning. The slot vector is copy-on-write: a cheap arena
+//! handle can be retained by a published `LogicalPlan` while a planning
+//! session continues appending new alternatives. Rollback removes unpublished
+//! slots without reusing their identity.
 
 use super::{NodeStats, OwnedLogicalPlan, PlanNodeId};
 use crate::operator::{LogicalOperator, LogicalOutputLayout};
 use paro_common::error::{self as paro_error, Result};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
 /// One immutable logical DAG and its selected root. Rewrites append nodes and
 /// change a root handle; they never mutate a published input or own its edges.
-/// The arena is plan-local; a future planning-session owner may retain it and
-/// exchange only `PlanIndex` roots to share subgraphs across alternatives.
-/// Owned IR conversion is an explicit boundary, not an implicit Clone/Deref.
+/// A planner session may retain one arena and exchange only `PlanIndex` roots
+/// to share subgraphs across alternatives. Owned IR conversion is an explicit
+/// boundary, not an implicit Clone/Deref.
 #[derive(Debug)]
 pub struct LogicalPlan {
     arena: LogicalPlanArena,
@@ -158,7 +158,7 @@ impl LogicalPlanNode<()> {
     }
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 struct Slot {
     generation: u64,
     node: LogicalPlanNode,
@@ -172,32 +172,41 @@ pub struct PlanArenaCheckpoint {
     prefix_generation: Option<u64>,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct LogicalPlanArena {
     identity: u64,
-    nodes: Vec<Slot>,
-    next_generation: u64,
+    nodes: Arc<Vec<Arc<Slot>>>,
+    /// Generation allocation is shared by copy-on-write handles.  A frozen
+    /// alternative may append a suffix while the session arena continues to
+    /// grow; sharing this counter prevents both branches from manufacturing
+    /// the same `(arena, slot, generation)` index for different nodes.
+    next_generation: Arc<AtomicU64>,
 }
 
 impl Default for LogicalPlanArena {
     fn default() -> Self {
-        static NEXT_ARENA: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+        static NEXT_ARENA: AtomicU64 = AtomicU64::new(1);
         let identity = NEXT_ARENA
-            .fetch_update(
-                std::sync::atomic::Ordering::Relaxed,
-                std::sync::atomic::Ordering::Relaxed,
-                |value| value.checked_add(1),
-            )
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |value| {
+                value.checked_add(1)
+            })
             .expect("logical arena identity exhausted");
         Self {
             identity,
-            nodes: Vec::new(),
-            next_generation: 0,
+            nodes: Arc::new(Vec::new()),
+            next_generation: Arc::new(AtomicU64::new(0)),
         }
     }
 }
 
 impl LogicalPlanArena {
+    /// Whether an index belongs to this arena generation domain.  A session
+    /// can use this to retain an existing root directly instead of absorbing
+    /// (and potentially cloning) an arena that is already shared by handle.
+    pub fn owns(&self, index: PlanIndex) -> bool {
+        index.arena == self.identity && self.get(index).is_ok()
+    }
+
     pub fn len(&self) -> usize {
         self.nodes.len()
     }
@@ -237,9 +246,12 @@ impl LogicalPlanArena {
             .map_err(|_| paro_error::internal("logical arena exhausted its index domain"))?;
         let generation = self
             .next_generation
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |value| {
+                value.checked_add(1)
+            })
+            .map_err(|_| paro_error::internal("logical arena exhausted its revision domain"))?
             .checked_add(1)
             .ok_or_else(|| paro_error::internal("logical arena exhausted its revision domain"))?;
-        self.next_generation = generation;
         let mut inputs = Vec::new();
         node.operator.visit_child_links(&mut |child| {
             inputs.push(self.nodes[child.slot as usize].output.clone())
@@ -253,16 +265,117 @@ impl LogicalPlanArena {
             .pass_through_child_index(&input_refs)
             .and_then(|index| inputs.get(index).cloned())
             .unwrap_or_else(|| Arc::new(node.operator.output_layout_from_child_refs(&input_refs)));
-        self.nodes.push(Slot {
+        Arc::make_mut(&mut self.nodes).push(Arc::new(Slot {
             generation,
             node,
             output,
-        });
+        }));
         Ok(PlanIndex {
             arena: self.identity,
             slot,
             generation,
         })
+    }
+
+    /// Move an arena into a planning-session arena without cloning operator
+    /// payloads.  Child indices are remapped once while slots and their
+    /// already-derived layouts are transferred by ownership.  This is the
+    /// ownership boundary used by Memo staging: alternatives from one query
+    /// now retain a single session arena instead of allocating a fresh arena
+    /// for every transformed expression.
+    pub fn absorb(&mut self, other: LogicalPlanArena, root: PlanIndex) -> Result<PlanIndex> {
+        if root.arena != other.identity {
+            return Err(paro_error::internal(
+                "logical arena absorb received a root from another arena",
+            ));
+        }
+        let source_nodes = Arc::try_unwrap(other.nodes).unwrap_or_else(|nodes| (*nodes).clone());
+        let mut remapped: Vec<PlanIndex> = Vec::with_capacity(source_nodes.len());
+        for slot in source_nodes {
+            let slot = Arc::try_unwrap(slot).unwrap_or_else(|slot| (*slot).clone());
+            let generation = self
+                .next_generation
+                .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |value| {
+                    value.checked_add(1)
+                })
+                .map_err(|_| paro_error::internal("logical arena exhausted its revision domain"))?
+                .checked_add(1)
+                .ok_or_else(|| {
+                    paro_error::internal("logical arena exhausted its revision domain")
+                })?;
+            let operator = slot.node.operator.try_map_child_links(&mut |child| {
+                remapped
+                    .get(child.slot as usize)
+                    .copied()
+                    .ok_or_else(|| paro_error::internal("logical arena absorb lost a child"))
+            })?;
+            let slot_index = u32::try_from(self.nodes.len())
+                .map_err(|_| paro_error::internal("logical arena exhausted its index domain"))?;
+            let index = PlanIndex {
+                arena: self.identity,
+                slot: slot_index,
+                generation,
+            };
+            Arc::make_mut(&mut self.nodes).push(Arc::new(Slot {
+                generation,
+                node: LogicalPlanNode {
+                    id: slot.node.id,
+                    stats: slot.node.stats,
+                    operator,
+                },
+                output: slot.output,
+            }));
+            remapped.push(index);
+        }
+        remapped
+            .get(root.slot as usize)
+            .copied()
+            .ok_or_else(|| paro_error::internal("logical arena absorb lost its root"))
+    }
+
+    /// Adopt a root from an arena handle that shares this session's identity.
+    /// A published `LogicalPlan` may have appended a frozen root through
+    /// copy-on-write, leaving the session with the same immutable prefix and
+    /// a short suffix.  Reattach only that suffix; cloning the prefix would
+    /// defeat the arena's ownership contract.
+    pub fn adopt_or_absorb(
+        &mut self,
+        other: LogicalPlanArena,
+        root: PlanIndex,
+    ) -> Result<PlanIndex> {
+        if other.identity != self.identity {
+            return self.absorb(other, root);
+        }
+        // A root that is already live in the session is unambiguous because
+        // COW handles share a global generation allocator.  This is the
+        // common path for a settled alternative whose suffix was published
+        // before another alternative was prepared.
+        if self.owns(root) {
+            return Ok(root);
+        }
+        if self.len() <= other.len()
+            && self
+                .nodes
+                .iter()
+                .zip(other.nodes.iter())
+                .all(|(left, right)| Arc::ptr_eq(left, right))
+        {
+            let suffix = other
+                .nodes
+                .iter()
+                .skip(self.len())
+                .cloned()
+                .collect::<Vec<_>>();
+            Arc::make_mut(&mut self.nodes).extend(suffix);
+            if self.owns(root) {
+                return Ok(root);
+            }
+        }
+        // The two handles grew divergent suffixes.  Rebase the complete
+        // snapshot once, remapping edges and preserving the session identity;
+        // this is slower than suffix adoption but remains correct even when a
+        // later alternative occupied the same slot in the session vector.
+        self.absorb(other, root)
     }
 
     pub fn checkpoint(&self) -> PlanArenaCheckpoint {
@@ -286,7 +399,7 @@ impl LogicalPlanArena {
                 "logical arena checkpoint is no longer reachable",
             ));
         }
-        self.nodes.truncate(checkpoint.len);
+        Arc::make_mut(&mut self.nodes).truncate(checkpoint.len);
         Ok(())
     }
 
@@ -515,6 +628,65 @@ mod tests {
                 })
             })
             .is_err());
+    }
+
+    #[test]
+    fn absorb_moves_a_plan_without_cloning_its_slots() {
+        let mut source = LogicalPlanArena::default();
+        let root = source.append(identity()).unwrap();
+        let mut session = LogicalPlanArena::default();
+        let moved = session.absorb(source, root).unwrap();
+        assert_eq!(session.len(), 1);
+        assert_ne!(moved, root);
+        assert!(session.get(moved).is_ok());
+    }
+
+    #[test]
+    fn cloned_arena_handles_share_slots_until_an_append() {
+        let mut arena = LogicalPlanArena::default();
+        let root = arena.append(identity()).unwrap();
+        let snapshot = arena.clone();
+        assert!(Arc::ptr_eq(&arena.nodes, &snapshot.nodes));
+
+        // Publishing an alternative is copy-on-write. The old root remains
+        // valid while the retained snapshot continues to observe the
+        // published prefix without cloning its operator payloads.
+        let _next = arena
+            .append(LogicalPlanNode {
+                id: PlanNodeId::SYNTHETIC,
+                stats: NodeStats::default(),
+                operator: LogicalOperator::Filter(Filter {
+                    child: root,
+                    expressions: vec![],
+                    projection_map: crate::operator::ProjectionMap::all(),
+                }),
+            })
+            .unwrap();
+        assert_eq!(snapshot.len(), 1);
+        assert_eq!(snapshot.post_order(root).unwrap(), vec![root]);
+        assert_eq!(arena.len(), 2);
+    }
+
+    #[test]
+    fn same_identity_adoption_moves_only_copy_on_write_suffix() {
+        let mut arena = LogicalPlanArena::default();
+        let root = arena.append(identity()).unwrap();
+        let mut fork = arena.clone();
+        let suffix = fork
+            .append(LogicalPlanNode {
+                id: PlanNodeId::SYNTHETIC,
+                stats: NodeStats::default(),
+                operator: LogicalOperator::Filter(Filter {
+                    child: root,
+                    expressions: vec![],
+                    projection_map: crate::operator::ProjectionMap::all(),
+                }),
+            })
+            .unwrap();
+        let adopted = arena.adopt_or_absorb(fork, suffix).unwrap();
+        assert_eq!(adopted, suffix);
+        assert_eq!(arena.len(), 2);
+        assert!(arena.owns(adopted));
     }
 
     #[test]

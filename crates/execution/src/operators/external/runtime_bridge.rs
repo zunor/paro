@@ -872,7 +872,7 @@ mod tests {
             row_semantics: RowSemantics::RowPreserving,
             may_block: false,
         };
-        let expr = Expression::Function(
+        let expr = Expression::Function(Box::new(
             FunctionExpression::new(
                 ScalarFunction::new(
                     "add_one".to_string(),
@@ -899,7 +899,7 @@ mod tests {
                 },
                 spec: None,
             }),
-        );
+        ));
 
         ExternalProjectExpression {
             output_name: "__ext".to_string(),

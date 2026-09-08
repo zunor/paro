@@ -988,6 +988,10 @@ fn enumerate_pattern_bindings(
                         if !self.observe(child)? {
                             return Ok(false);
                         }
+                        if self.work_units >= self.limit {
+                            self.limited = true;
+                            return Ok(false);
+                        }
                         pending.extend(
                             self.memo
                                 .group(child)
@@ -1014,6 +1018,10 @@ fn enumerate_pattern_bindings(
                 return Ok(*matches);
             }
             if !self.observe(group)? {
+                return Ok(false);
+            }
+            if self.work_units >= self.limit {
+                self.limited = true;
                 return Ok(false);
             }
             let expressions = self
@@ -1089,10 +1097,21 @@ fn enumerate_pattern_bindings(
             active: &mut BTreeSet<GroupId>,
             scope: PatternScope,
         ) -> Result<Vec<(PatternOperand, Fingerprint)>> {
+            if let Some(cancellation) = self.cancellation {
+                cancellation.check()?;
+            }
             let group = self.memo.canonical_group(group);
             let group_ref = self.memo.group(group).ok_or_else(|| {
                 paro_error::internal("pattern matcher references an unknown Memo group")
             })?;
+            // Do not materialize or sort a frontier after the work budget has
+            // already been exhausted.  Admission must precede copying the
+            // expression ids so a large shared DAG cannot hide work behind a
+            // Complete result.
+            if self.work_units >= self.limit {
+                self.limited = true;
+                return Ok(Vec::new());
+            }
             if matches!(scope, PatternScope::Hole) {
                 if !self.observe_facts(group)? || !self.admit_work(1)? {
                     return Ok(Vec::new());
@@ -1159,6 +1178,13 @@ fn enumerate_pattern_bindings(
             active: &mut BTreeSet<GroupId>,
             scope: PatternScope,
         ) -> Result<Vec<(PatternOperand, Fingerprint)>> {
+            if let Some(cancellation) = self.cancellation {
+                cancellation.check()?;
+            }
+            if self.work_units >= self.limit {
+                self.limited = true;
+                return Ok(Vec::new());
+            }
             let logical = self.memo.logical_expr(expression).ok_or_else(|| {
                 paro_error::internal("pattern matcher references an unknown logical expression")
             })?;

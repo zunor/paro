@@ -79,14 +79,14 @@ fn add_one_expr() -> Expression {
         LogicalType::Integer,
         add_one_function,
     );
-    Expression::Function(FunctionExpression::new(
+    Expression::Function(Box::new(FunctionExpression::new(
         function,
         vec![Expression::Reference(ReferenceExpression::new(
             0,
             LogicalType::Integer,
         ))],
         LogicalType::Integer,
-    ))
+    )))
 }
 
 fn greater_than_expr(value: i32) -> Expression {

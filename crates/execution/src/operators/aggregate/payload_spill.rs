@@ -460,11 +460,11 @@ mod tests {
     }
 
     fn count_star_expression() -> Expression {
-        Expression::Aggregate(AggregateExpression::new(
+        Expression::Aggregate(Box::new(AggregateExpression::new(
             get_count_star_function(),
             vec![],
             LogicalType::BigInt,
-        ))
+        )))
     }
 
     fn grouped_count_spec() -> AggregateSpec {

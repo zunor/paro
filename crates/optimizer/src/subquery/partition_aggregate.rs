@@ -1323,7 +1323,7 @@ fn apply_grouped_join_rewrite(
         joined,
         groups,
         Vec::new(),
-        vec![Expression::Aggregate(rewrite.aggregate.clone())],
+        vec![Expression::Aggregate(Box::new(rewrite.aggregate.clone()))],
         Vec::new(),
     );
     let aggregate = OwnedLogicalPlan::new(

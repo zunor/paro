@@ -1054,6 +1054,8 @@ fn populate_paro_optimizers(
                 name: entry.name,
                 kind: entry.kind,
                 last_elapsed_us: entry.last_elapsed_us,
+                metric_value: entry.metric_value,
+                metric_unit: entry.metric_unit.as_str().to_string(),
                 invocation_count: entry.invocation_count,
             })
             .collect::<Vec<_>>();
@@ -2697,6 +2699,7 @@ mod tests {
                 rule_elapsed: Default::default(),
                 rule_allocated_bytes: Default::default(),
                 rule_budget_exhaustions: Default::default(),
+                component_allocated_bytes: Default::default(),
                 counters: Default::default(),
             },
         );
@@ -2713,6 +2716,7 @@ mod tests {
                 rule_elapsed: Default::default(),
                 rule_allocated_bytes: Default::default(),
                 rule_budget_exhaustions: Default::default(),
+                component_allocated_bytes: Default::default(),
                 counters: Default::default(),
             },
         );

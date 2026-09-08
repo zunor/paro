@@ -135,12 +135,14 @@ fn move_function_constant(func: &paro_planner::expression::FunctionExpression) -
     // Swap children: constant moves to right
     let new_children = vec![func.children[1].clone(), func.children[0].clone()];
 
-    RuleResult::Changed(Box::new(Expression::Function(FunctionExpression {
-        function: func.function.clone(),
-        children: new_children,
-        return_type: func.return_type.clone(),
-        routine_meta: func.routine_meta.clone(),
-    })))
+    RuleResult::Changed(Box::new(Expression::Function(Box::new(
+        FunctionExpression {
+            function: func.function.clone(),
+            children: new_children,
+            return_type: func.return_type.clone(),
+            routine_meta: func.routine_meta.clone(),
+        },
+    ))))
 }
 
 #[cfg(test)]
@@ -182,7 +184,7 @@ mod tests {
     }
 
     fn make_add(left: Expression, right: Expression) -> Expression {
-        Expression::Function(FunctionExpression::new(
+        Expression::Function(Box::new(FunctionExpression::new(
             ScalarFunction::new(
                 "+".to_string(),
                 vec![LogicalType::Integer, LogicalType::Integer],
@@ -191,11 +193,11 @@ mod tests {
             ),
             vec![left, right],
             LogicalType::Integer,
-        ))
+        )))
     }
 
     fn make_multiply(left: Expression, right: Expression) -> Expression {
-        Expression::Function(FunctionExpression::new(
+        Expression::Function(Box::new(FunctionExpression::new(
             ScalarFunction::new(
                 "*".to_string(),
                 vec![LogicalType::Integer, LogicalType::Integer],
@@ -204,7 +206,7 @@ mod tests {
             ),
             vec![left, right],
             LogicalType::Integer,
-        ))
+        )))
     }
 
     fn make_comparison(

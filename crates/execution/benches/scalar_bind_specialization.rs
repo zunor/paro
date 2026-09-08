@@ -124,11 +124,11 @@ fn regexp_expr(specialized: bool) -> Expression {
         ),
     );
 
-    Expression::Function(FunctionExpression::new(
+    Expression::Function(Box::new(FunctionExpression::new(
         bound,
         vec![reference_varchar(0), constant_varchar("^hello_world$")],
         LogicalType::Boolean,
-    ))
+    )))
 }
 
 fn substring_expr(specialized: bool) -> Expression {
@@ -153,11 +153,11 @@ fn substring_expr(specialized: bool) -> Expression {
         ),
     );
 
-    Expression::Function(FunctionExpression::new(
+    Expression::Function(Box::new(FunctionExpression::new(
         bound,
         vec![reference_varchar(0), constant_bigint(8), constant_bigint(6)],
         LogicalType::Varchar,
-    ))
+    )))
 }
 
 #[divan::bench(sample_count = 10)]

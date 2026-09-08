@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use crate::expression::{Expression, WindowExpression, WindowFrameBound, WindowInvocation};
+use paro_common::error::Result;
 
 pub struct ExpressionIterator;
 
@@ -12,6 +13,61 @@ pub enum ExpressionVisitDecision {
 }
 
 impl ExpressionIterator {
+    /// Fold an expression in post-order without using the native call stack.
+    /// Expression children include aggregate/window modifiers and frame
+    /// offsets, so callers get one complete traversal contract instead of
+    /// reimplementing recursive walkers for each new expression variant.
+    pub fn try_fold_post_order<State>(
+        expr: &Expression,
+        mut fold: impl FnMut(&Expression, &[State]) -> Result<State>,
+    ) -> Result<State> {
+        struct Frame<'a, State> {
+            expr: &'a Expression,
+            children: Vec<&'a Expression>,
+            next_child: usize,
+            completed: Vec<State>,
+        }
+
+        fn frame<'a, State>(expr: &'a Expression) -> Frame<'a, State> {
+            let mut children = Vec::new();
+            ExpressionIterator::enumerate_children(expr, |child| children.push(child));
+            Frame {
+                expr,
+                next_child: 0,
+                completed: Vec::with_capacity(children.len()),
+                children,
+            }
+        }
+
+        let mut stack = vec![frame(expr)];
+        loop {
+            let descend = {
+                let current = stack
+                    .last_mut()
+                    .expect("expression post-order traversal retains its root frame");
+                if let Some(child) = current.children.get(current.next_child).copied() {
+                    current.next_child += 1;
+                    Some(child)
+                } else {
+                    None
+                }
+            };
+            if let Some(child) = descend {
+                stack.push(frame(child));
+                continue;
+            }
+
+            let completed = stack
+                .pop()
+                .expect("expression post-order traversal retains its completed frame");
+            let state = fold(completed.expr, &completed.completed)?;
+            let Some(parent) = stack.last_mut() else {
+                return Ok(state);
+            };
+            parent.completed.push(state);
+        }
+    }
+
     /// Visit an expression tree in pre-order with explicit subtree pruning.
     /// All child enumeration remains centralized here, so adding an expression
     /// variant cannot silently omit it from downstream analyses.
@@ -19,10 +75,50 @@ impl ExpressionIterator {
         expr: &'a Expression,
         visitor: &mut impl FnMut(&'a Expression) -> ExpressionVisitDecision,
     ) {
-        if visitor(expr) == ExpressionVisitDecision::SkipChildren {
-            return;
+        // Expression trees can be generated from very long IN/OR lists. Keep
+        // the public traversal contract stack-safe just like the logical-plan
+        // walkers; recursive visitors make otherwise harmless diagnostics
+        // depend on the native thread stack size.
+        let mut pending = vec![expr];
+        while let Some(current) = pending.pop() {
+            if visitor(current) == ExpressionVisitDecision::SkipChildren {
+                continue;
+            }
+            let mut children = Vec::new();
+            Self::enumerate_children(current, |child| children.push(child));
+            pending.extend(children.into_iter().rev());
         }
-        Self::enumerate_children(expr, |child| Self::visit(child, visitor));
+    }
+
+    /// Visit an expression tree mutably without recursion.
+    ///
+    /// The expression itself is never moved while this function runs.  The
+    /// raw pointers are therefore stable for the duration of the walk; the
+    /// visitor receives one exclusive reference at a time and child pointers
+    /// are collected before that borrow ends.  Keeping this primitive here
+    /// gives all in-place rewrites the same stack-safety contract as the
+    /// immutable walkers instead of each rewrite growing its own recursive
+    /// helper.
+    pub fn visit_mut(
+        expr: &mut Expression,
+        visitor: &mut impl FnMut(&mut Expression) -> ExpressionVisitDecision,
+    ) {
+        let mut pending = vec![expr as *mut Expression];
+        while let Some(pointer) = pending.pop() {
+            // SAFETY: `expr` owns the complete expression tree and is not
+            // moved during the walk. We create at most one mutable reference
+            // from a pointer at a time; child pointers are disjoint fields of
+            // that reference and are consumed only after the borrow ends.
+            let current = unsafe { &mut *pointer };
+            if visitor(current) == ExpressionVisitDecision::SkipChildren {
+                continue;
+            }
+            let mut children = Vec::new();
+            Self::enumerate_children_mut(current, |child| {
+                children.push(child as *mut Expression);
+            });
+            pending.extend(children.into_iter().rev());
+        }
     }
 
     pub fn enumerate_children<'a>(expr: &'a Expression, mut f: impl FnMut(&'a Expression)) {
@@ -210,7 +306,7 @@ impl ExpressionIterator {
 
 #[cfg(test)]
 mod tests {
-    use super::ExpressionIterator;
+    use super::{ExpressionIterator, ExpressionVisitDecision};
     use crate::expression::{
         AggregateExpression, ColumnRefExpression, ComparisonExpression, ComparisonType,
         ConstantExpression, Expression, OrderByExpression, WindowExpression, WindowFrame,
@@ -231,7 +327,7 @@ mod tests {
 
     #[test]
     fn enumerate_children_visits_window_offsets_and_orders() {
-        let expr = Expression::Window(WindowExpression::native(
+        let expr = Expression::Window(Box::new(WindowExpression::native(
             WindowFunction::first_value(LogicalType::Integer),
             vec![int_column(0)],
             vec![int_column(1)],
@@ -253,7 +349,7 @@ mod tests {
                 end_is_preceding: false,
             },
             false,
-        ));
+        )));
 
         let mut count = 0;
         ExpressionIterator::enumerate_children(&expr, |_| {
@@ -303,7 +399,7 @@ mod tests {
                 ascending: true,
                 nulls_first: false,
             }]);
-        let expression = Expression::Window(WindowExpression::aggregate(
+        let expression = Expression::Window(Box::new(WindowExpression::aggregate(
             aggregate,
             vec![int_column(2)],
             vec![OrderByExpression {
@@ -318,7 +414,7 @@ mod tests {
                 end_bound: WindowFrameBound::Offset(Box::new(int_column(5))),
                 end_is_preceding: false,
             },
-        ));
+        )));
 
         let mut children = Vec::new();
         ExpressionIterator::enumerate_children(&expression, |child| {
@@ -326,5 +422,42 @@ mod tests {
         });
         assert_eq!(children.len(), 7);
         assert_eq!(children[1], LogicalType::Boolean);
+    }
+
+    #[test]
+    fn post_order_fold_handles_deep_generated_conjunctions() {
+        let mut expression = int_column(0);
+        for _ in 0..10_000 {
+            expression = Expression::Conjunction(crate::expression::ConjunctionExpression::new(
+                crate::expression::ConjunctionType::And,
+                vec![expression],
+            ));
+        }
+        let nodes = ExpressionIterator::try_fold_post_order(&expression, |_, children| {
+            Ok::<_, paro_common::error::ParoError>(
+                1usize.saturating_add(children.iter().copied().sum::<usize>()),
+            )
+        })
+        .unwrap();
+        assert_eq!(nodes, 10_001);
+        std::mem::forget(expression);
+    }
+
+    #[test]
+    fn pre_order_visit_handles_deep_generated_conjunctions() {
+        let mut expression = int_column(0);
+        for _ in 0..10_000 {
+            expression = Expression::Conjunction(crate::expression::ConjunctionExpression::new(
+                crate::expression::ConjunctionType::And,
+                vec![expression],
+            ));
+        }
+        let mut visited = 0usize;
+        ExpressionIterator::visit(&expression, &mut |_| {
+            visited += 1;
+            ExpressionVisitDecision::Descend
+        });
+        assert_eq!(visited, 10_001);
+        std::mem::forget(expression);
     }
 }

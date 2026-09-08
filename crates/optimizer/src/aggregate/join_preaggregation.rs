@@ -153,11 +153,11 @@ impl JoinPreaggregation {
                     ColumnBinding::new(aggregate_index, index),
                     partial.return_type.clone(),
                 ));
-                Expression::Aggregate(AggregateExpression::new(
+                Expression::Aggregate(Box::new(AggregateExpression::new(
                     merge,
                     vec![partial_ref],
                     partial.return_type.clone(),
-                ))
+                )))
             })
             .collect::<Vec<_>>();
 
@@ -264,11 +264,11 @@ mod tests {
     fn count(input: Expression) -> Expression {
         let (function, targets) = get_count_function().bind(&[LogicalType::BigInt]).unwrap();
         assert_eq!(targets, [LogicalType::BigInt]);
-        Expression::Aggregate(AggregateExpression::new(
+        Expression::Aggregate(Box::new(AggregateExpression::new(
             function,
             vec![input],
             LogicalType::BigInt,
-        ))
+        )))
     }
 
     fn candidate(bind_context: &BindContext) -> OwnedLogicalPlan {

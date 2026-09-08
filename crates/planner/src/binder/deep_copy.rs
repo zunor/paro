@@ -679,7 +679,7 @@ impl LogicalPlanDeepCopy {
             LogicalOperator::TableFunctionGet(t) => {
                 let mut table_index = t.table_index;
                 self.remap_table_index(bind_shared, &mut table_index);
-                LogicalOperator::TableFunctionGet(TblFnGetNode {
+                LogicalOperator::TableFunctionGet(Box::new(TblFnGetNode {
                     function: t.function.clone(),
                     bind_data: t.bind_data.clone(),
                     table_index,
@@ -690,7 +690,7 @@ impl LogicalPlanDeepCopy {
                     input_table_types: t.input_table_types.clone(),
                     input_table_names: t.input_table_names.clone(),
                     with_ordinality: t.with_ordinality,
-                })
+                }))
             }
             LogicalOperator::SearchScan(s) => {
                 let mut get = s.get.clone();
@@ -1224,22 +1224,22 @@ mod tests {
     #[test]
     fn deep_copy_remaps_hidden_post_reduction_binding_and_sources() {
         let bind_context = BindContext::new();
-        let count = Expression::Aggregate(AggregateExpression::new(
+        let count = Expression::Aggregate(Box::new(AggregateExpression::new(
             get_count_star_function(),
             Vec::new(),
             LogicalType::BigInt,
-        ));
+        )));
         let (max, _) = get_max_function()
             .bind(&[LogicalType::BigInt])
             .expect("bind max(bigint)");
-        let reducer = Expression::Aggregate(AggregateExpression::new(
+        let reducer = Expression::Aggregate(Box::new(AggregateExpression::new(
             max,
             vec![Expression::ColumnRef(ColumnRefExpression::new(
                 ColumnBinding::new(12, 0),
                 LogicalType::BigInt,
             ))],
             LogicalType::BigInt,
-        ));
+        )));
         let predicate = Expression::Comparison(ComparisonExpression::new(
             ComparisonType::Equal,
             Expression::ColumnRef(ColumnRefExpression::new(

@@ -280,7 +280,7 @@ mod tests {
         assert_eq!(names[0], "a");
         assert_eq!(names[1], "c");
 
-        let layout = LogicalOperator::TableFunctionGet(op).output_layout();
+        let layout = LogicalOperator::TableFunctionGet(Box::new(op)).output_layout();
         assert_eq!(layout.types(), &[LogicalType::Integer, LogicalType::BigInt]);
         assert_eq!(
             layout.bindings(),

@@ -484,14 +484,14 @@ impl AggregateJoinSubsumption {
         {
             return None;
         }
-        Some(Expression::Aggregate(AggregateExpression::new(
+        Some(Expression::Aggregate(Box::new(AggregateExpression::new(
             function,
             vec![Expression::ColumnRef(ColumnRefExpression::new(
                 exposure.output_binding,
                 exposure.output_type.clone(),
             ))],
             outer_sum.return_type.clone(),
-        )))
+        ))))
     }
 
     fn inspect_reduction<'a>(
@@ -795,7 +795,11 @@ mod tests {
             .unwrap();
         assert_eq!(targets, [input_type]);
         let return_type = function.return_type.clone();
-        Expression::Aggregate(AggregateExpression::new(function, vec![input], return_type))
+        Expression::Aggregate(Box::new(AggregateExpression::new(
+            function,
+            vec![input],
+            return_type,
+        )))
     }
 
     fn detail_table(object_id: u64) -> Arc<TableCatalogEntry> {

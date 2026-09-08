@@ -239,11 +239,11 @@ fn join_condition() -> JoinCondition {
 }
 
 fn count_star_expression() -> Expression {
-    Expression::Aggregate(AggregateExpression::new(
+    Expression::Aggregate(Box::new(AggregateExpression::new(
         get_count_star_function(),
         vec![],
         LogicalType::BigInt,
-    ))
+    )))
 }
 
 fn grouped_count_spec(perfect_hash: Option<PerfectHashAggregatePlan>) -> AggregateSpec {
@@ -293,11 +293,11 @@ fn grouped_sum_post_max_spec(
         .expect("bind max(bigint)");
     let post_reduction = PostAggregateReductionSpec {
         aggregate_types: Box::new([LogicalType::BigInt]),
-        reducers: Box::new([Expression::Aggregate(AggregateExpression::new(
+        reducers: Box::new([Expression::Aggregate(Box::new(AggregateExpression::new(
             max,
             vec![reference(0, LogicalType::BigInt)],
             LogicalType::BigInt,
-        ))]),
+        )))]),
         reducer_types: Box::new([LogicalType::BigInt]),
         scalar_expressions: Box::new([reference(0, LogicalType::BigInt)]),
         scalar_types: Box::new([LogicalType::BigInt]),
@@ -318,11 +318,11 @@ fn grouped_sum_post_max_spec(
         groups: Box::new([reference(0, key_type.clone())]),
         group_key_encodings: Box::new([crate::physical::specs::GroupKeyEncoding::Identity]),
         grouping_sets: Box::new([]),
-        aggregates: Box::new([Expression::Aggregate(AggregateExpression::new(
+        aggregates: Box::new([Expression::Aggregate(Box::new(AggregateExpression::new(
             sum,
             vec![reference(1, LogicalType::Integer)],
             LogicalType::BigInt,
-        ))]),
+        )))]),
         grouping_functions: Box::new([]),
         aggregate_inputs: Box::new([Box::new([1])]),
         aggregate_filters: Box::new([None]),
@@ -379,14 +379,14 @@ fn ungrouped_distinct_count_spec() -> AggregateSpec {
         groups: Box::new([]),
         group_key_encodings: Box::new([]),
         grouping_sets: Box::new([]),
-        aggregates: vec![Expression::Aggregate(
+        aggregates: vec![Expression::Aggregate(Box::new(
             AggregateExpression::new(
                 function,
                 vec![reference(0, LogicalType::Integer)],
                 LogicalType::BigInt,
             )
             .with_aggr_type(AggregateType::Distinct),
-        )]
+        ))]
         .into_boxed_slice(),
         grouping_functions: Box::new([]),
         aggregate_inputs: vec![vec![0].into_boxed_slice()].into_boxed_slice(),
@@ -415,14 +415,14 @@ fn grouped_distinct_count_spec() -> AggregateSpec {
         groups: Box::new([reference(0, LogicalType::Integer)]),
         group_key_encodings: Box::new([crate::physical::specs::GroupKeyEncoding::Identity]),
         grouping_sets: Box::new([]),
-        aggregates: Box::new([Expression::Aggregate(
+        aggregates: Box::new([Expression::Aggregate(Box::new(
             AggregateExpression::new(
                 function,
                 vec![reference(1, LogicalType::Integer)],
                 LogicalType::BigInt,
             )
             .with_aggr_type(AggregateType::Distinct),
-        )]),
+        ))]),
         grouping_functions: Box::new([]),
         aggregate_inputs: Box::new([Box::new([1])]),
         aggregate_filters: Box::new([None]),

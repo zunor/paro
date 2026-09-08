@@ -309,7 +309,7 @@ mod tests {
     }
 
     fn make_add(left: Expression, right: Expression) -> Expression {
-        Expression::Function(FunctionExpression::new(
+        Expression::Function(Box::new(FunctionExpression::new(
             ScalarFunction::new(
                 "+".to_string(),
                 vec![LogicalType::Integer, LogicalType::Integer],
@@ -318,11 +318,11 @@ mod tests {
             ),
             vec![left, right],
             LogicalType::Integer,
-        ))
+        )))
     }
 
     fn make_subtract(left: Expression, right: Expression) -> Expression {
-        Expression::Function(FunctionExpression::new(
+        Expression::Function(Box::new(FunctionExpression::new(
             ScalarFunction::new(
                 "-".to_string(),
                 vec![LogicalType::Integer, LogicalType::Integer],
@@ -331,11 +331,11 @@ mod tests {
             ),
             vec![left, right],
             LogicalType::Integer,
-        ))
+        )))
     }
 
     fn make_multiply(left: Expression, right: Expression) -> Expression {
-        Expression::Function(FunctionExpression::new(
+        Expression::Function(Box::new(FunctionExpression::new(
             ScalarFunction::new(
                 "*".to_string(),
                 vec![LogicalType::Integer, LogicalType::Integer],
@@ -344,11 +344,11 @@ mod tests {
             ),
             vec![left, right],
             LogicalType::Integer,
-        ))
+        )))
     }
 
     fn make_divide(left: Expression, right: Expression) -> Expression {
-        Expression::Function(FunctionExpression::new(
+        Expression::Function(Box::new(FunctionExpression::new(
             ScalarFunction::new(
                 "/".to_string(),
                 vec![LogicalType::Integer, LogicalType::Integer],
@@ -357,11 +357,11 @@ mod tests {
             ),
             vec![left, right],
             LogicalType::Integer,
-        ))
+        )))
     }
 
     fn volatile_value() -> Expression {
-        Expression::Function(FunctionExpression::new(
+        Expression::Function(Box::new(FunctionExpression::new(
             ScalarFunction::new(
                 "volatile_value".to_string(),
                 vec![],
@@ -371,7 +371,7 @@ mod tests {
             .with_stability(FunctionStability::Volatile),
             vec![],
             LogicalType::Integer,
-        ))
+        )))
     }
 
     #[test]
@@ -517,7 +517,7 @@ mod tests {
     #[test]
     fn test_matcher_rejects_floating_point_identities() {
         let matcher = ArithmeticSimplificationMatcher;
-        let expression = Expression::Function(FunctionExpression::new(
+        let expression = Expression::Function(Box::new(FunctionExpression::new(
             ScalarFunction::new(
                 "*".to_string(),
                 vec![LogicalType::Double, LogicalType::Double],
@@ -535,7 +535,7 @@ mod tests {
                 }),
             ],
             LogicalType::Double,
-        ));
+        )));
         let mut bindings = Vec::new();
 
         assert!(!matcher.matches(&expression, &mut bindings));

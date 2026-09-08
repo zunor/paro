@@ -28,19 +28,19 @@ use super::*;
 fn aggregate_lowers_post_reduction_into_separate_local_reference_domains() {
     let ctx = BindContext::new();
     let values = values(&ctx, vec![LogicalType::Integer]);
-    let count = Expression::Aggregate(AggregateExpression::new(
+    let count = Expression::Aggregate(Box::new(AggregateExpression::new(
         get_count_star_function(),
         vec![],
         LogicalType::BigInt,
-    ));
+    )));
     let (max_function, _) = get_max_function()
         .bind(&[LogicalType::BigInt])
         .expect("bind max(bigint)");
-    let reducer = Expression::Aggregate(AggregateExpression::new(
+    let reducer = Expression::Aggregate(Box::new(AggregateExpression::new(
         max_function,
         vec![aggregate_column(0, LogicalType::BigInt)],
         LogicalType::BigInt,
-    ));
+    )));
     let aggregate = Aggregate::new(
         1,
         2,
@@ -291,17 +291,17 @@ fn force_input_rollup(spec: &mut crate::physical::specs::AggregateSpec) {
 fn post_reduction_disables_dependent_group_state_projection() {
     let ctx = BindContext::new();
     let values = values(&ctx, vec![LogicalType::Integer, LogicalType::Integer]);
-    let count = Expression::Aggregate(AggregateExpression::new(
+    let count = Expression::Aggregate(Box::new(AggregateExpression::new(
         get_count_star_function(),
         vec![],
         LogicalType::BigInt,
-    ));
+    )));
     let (max_function, _) = get_max_function().bind(&[LogicalType::BigInt]).unwrap();
-    let reducer = Expression::Aggregate(AggregateExpression::new(
+    let reducer = Expression::Aggregate(Box::new(AggregateExpression::new(
         max_function,
         vec![aggregate_column(0, LogicalType::BigInt)],
         LogicalType::BigInt,
-    ));
+    )));
     let mut aggregate = Aggregate::new(
         1,
         2,
@@ -341,16 +341,16 @@ fn integer_sum_reduction(ctx: &BindContext) -> Aggregate {
     let values = values(ctx, vec![LogicalType::Integer, LogicalType::Integer]);
     let (sum, _) = get_sum_function().bind(&[LogicalType::Integer]).unwrap();
     let merge = sum.partial_merge_function().unwrap();
-    let source = Expression::Aggregate(AggregateExpression::new(
+    let source = Expression::Aggregate(Box::new(AggregateExpression::new(
         sum,
         vec![reference(1, LogicalType::Integer)],
         LogicalType::BigInt,
-    ));
-    let reducer = Expression::Aggregate(AggregateExpression::new(
+    )));
+    let reducer = Expression::Aggregate(Box::new(AggregateExpression::new(
         merge,
         vec![aggregate_column(0, LogicalType::BigInt)],
         LogicalType::BigInt,
-    ));
+    )));
     bounded_group(Aggregate::new(
         1,
         2,
@@ -391,16 +391,16 @@ fn decimal_sum_reduction(ctx: &BindContext, complex_predicate: bool) -> Aggregat
         .bind(std::slice::from_ref(&input_type))
         .unwrap();
     let merge = sum.partial_merge_function().unwrap();
-    let source = Expression::Aggregate(AggregateExpression::new(
+    let source = Expression::Aggregate(Box::new(AggregateExpression::new(
         sum,
         vec![reference(1, input_type)],
         sum_type.clone(),
-    ));
-    let reducer = Expression::Aggregate(AggregateExpression::new(
+    )));
+    let reducer = Expression::Aggregate(Box::new(AggregateExpression::new(
         merge,
         vec![aggregate_column(0, sum_type.clone())],
         sum_type.clone(),
-    ));
+    )));
     let scalar = decimal_cast(reference(0, sum_type.clone()), comparison_type.clone());
     let comparison = comparison(
         ComparisonType::GreaterThan,

@@ -400,27 +400,51 @@ fn encode_kind(builder: &mut StableFingerprintBuilder, kind: &ScalarKind) {
 }
 
 pub(crate) fn encode_logical_type(builder: &mut StableFingerprintBuilder, ty: &LogicalType) {
-    builder.write_u64(ty.type_id() as u64);
-    match ty {
-        LogicalType::Decimal { precision, scale } => {
-            builder.write_u64(*precision as u64);
-            builder.write_u64(*scale as u64);
-        }
-        LogicalType::VarcharCollation(collation) => builder.write_bytes(collation.as_bytes()),
-        LogicalType::IntegerLiteral(value) => builder.write_u64(*value as u64),
-        LogicalType::Array(child, length) => {
-            encode_logical_type(builder, child);
-            builder.write_u64(*length as u64);
-        }
-        LogicalType::List(child) => encode_logical_type(builder, child),
-        LogicalType::Struct(fields) => {
-            builder.write_u64(fields.len() as u64);
-            for (name, field) in fields {
-                builder.write_bytes(name.as_bytes());
-                encode_logical_type(builder, field);
+    // Logical types can be nested independently of the expression tree (for
+    // example, a deeply nested LIST/STRUCT literal).  Keep this identity
+    // encoder stack-safe as well; expression_fingerprint and value_fingerprint
+    // both call it on their hot cache-key paths.
+    enum Task<'a> {
+        Type(&'a LogicalType),
+        StructName(&'a str),
+        U64(u64),
+    }
+
+    let mut pending = vec![Task::Type(ty)];
+    while let Some(task) = pending.pop() {
+        match task {
+            Task::Type(ty) => {
+                builder.write_u64(ty.type_id() as u64);
+                match ty {
+                    LogicalType::Decimal { precision, scale } => {
+                        builder.write_u64(*precision as u64);
+                        builder.write_u64(*scale as u64);
+                    }
+                    LogicalType::VarcharCollation(collation) => {
+                        builder.write_bytes(collation.as_bytes())
+                    }
+                    LogicalType::IntegerLiteral(value) => builder.write_u64(*value as u64),
+                    LogicalType::Array(child, length) => {
+                        // The child encoding precedes the fixed length.
+                        pending.push(Task::U64(*length as u64));
+                        pending.push(Task::Type(child));
+                    }
+                    LogicalType::List(child) => pending.push(Task::Type(child)),
+                    LogicalType::Struct(fields) => {
+                        builder.write_u64(fields.len() as u64);
+                        // Push in reverse so each field is encoded as
+                        // name, type, matching the historical wire format.
+                        for (name, field) in fields.iter().rev() {
+                            pending.push(Task::Type(field));
+                            pending.push(Task::StructName(name));
+                        }
+                    }
+                    _ => {}
+                }
             }
+            Task::StructName(name) => builder.write_bytes(name.as_bytes()),
+            Task::U64(value) => builder.write_u64(value),
         }
-        _ => {}
     }
 }
 

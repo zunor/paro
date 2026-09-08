@@ -1136,11 +1136,11 @@ fn grouped_aggregate_logical_plan(row_count: usize) -> OwnedLogicalPlan {
                 LogicalType::Integer,
             ))],
             Vec::new(),
-            vec![Expression::Aggregate(AggregateExpression::new(
+            vec![Expression::Aggregate(Box::new(AggregateExpression::new(
                 get_count_star_function(),
                 Vec::new(),
                 LogicalType::BigInt,
-            ))],
+            )))],
             Vec::new(),
         ))),
     )

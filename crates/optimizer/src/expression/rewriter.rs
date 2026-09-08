@@ -352,7 +352,7 @@ mod tests {
         let mut rewriter = ExpressionRewriter::new();
         rewriter.add_rule(Box::new(IncrementSmallConstantRule::new()));
 
-        let mut expr = Expression::Window(WindowExpression::native(
+        let mut expr = Expression::Window(Box::new(WindowExpression::native(
             WindowFunction::row_number(),
             Vec::new(),
             Vec::new(),
@@ -365,7 +365,7 @@ mod tests {
                 end_is_preceding: false,
             },
             false,
-        ));
+        )));
 
         rewriter.rewrite_expression(&mut expr, &LogicalOperator::DummyScan);
         let Expression::Window(window) = expr else {

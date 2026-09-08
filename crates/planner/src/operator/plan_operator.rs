@@ -129,7 +129,7 @@ pub enum LogicalOperator<Child = Box<OwnedLogicalPlan>> {
     /// Create Routine
     CreateRoutine(Box<CreateRoutine>),
     /// Alter existing catalog entry
-    Alter(Alter),
+    Alter(Box<Alter>),
     /// Create Sequence
     CreateSequence(CreateSequence),
     /// Create Schema
@@ -137,7 +137,7 @@ pub enum LogicalOperator<Child = Box<OwnedLogicalPlan>> {
     /// Create Index
     CreateIndex(Box<CreateIndex>),
     /// Create View
-    CreateView(CreateView),
+    CreateView(Box<CreateView>),
     /// Drop Table/Schema/Index/View
     Drop(Drop),
     /// Create Property Graph
@@ -176,7 +176,7 @@ pub enum LogicalOperator<Child = Box<OwnedLogicalPlan>> {
     /// CTE reference
     CTERef(CTERef),
     /// Table function scan
-    TableFunctionGet(TableFunctionGet),
+    TableFunctionGet(Box<TableFunctionGet>),
     /// Search path scan replacing TopN/Projection/Filter/Get subgraphs.
     SearchScan(Box<SearchScan>),
     /// Full-text filter scan replacing Filter/Get subgraphs.
@@ -202,7 +202,7 @@ pub enum LogicalOperator<Child = Box<OwnedLogicalPlan>> {
 // Arena slots must remain compact.  Any future payload that would cross this
 // envelope must be boxed at the enum boundary rather than charging every
 // logical node for its worst-case expression/configuration vector.
-const _: () = assert!(std::mem::size_of::<LogicalOperator>() <= 192);
+const _: () = assert!(std::mem::size_of::<LogicalOperator>() <= 160);
 
 impl LogicalOperator {
     pub fn output_names(&self) -> Vec<String> {
@@ -1827,11 +1827,11 @@ mod tests {
                 LogicalType::Integer,
             ))],
             Vec::new(),
-            vec![Expression::Aggregate(AggregateExpression::new(
+            vec![Expression::Aggregate(Box::new(AggregateExpression::new(
                 get_count_star_function(),
                 vec![],
                 LogicalType::BigInt,
-            ))],
+            )))],
             vec![vec![0]],
         );
         let op = LogicalOperator::Aggregate(Box::new(aggregate));
@@ -1889,7 +1889,7 @@ mod tests {
     fn logical_operator_payloads_remain_compact_at_the_arena_boundary() {
         let size = std::mem::size_of::<LogicalOperator>();
         assert!(
-            size <= 192,
+            size <= 160,
             "LogicalOperator grew to {size} bytes; large payloads must stay out of arena slots"
         );
     }
@@ -1991,6 +1991,32 @@ mod tests {
             let actual_ids: Vec<_> = mapped.children().iter().map(|child| child.id).collect();
             assert_eq!(actual_ids, expected_ids, "{name}");
             assert_eq!(mapped_ids, expected_ids, "{name}");
+        }
+    }
+
+    #[test]
+    fn pass_through_contract_matches_derived_layout() {
+        // The arena relies on this predicate to reuse an Arc without doing a
+        // structural comparison.  Keep the predicate and the layout
+        // derivation coupled by construction: every representative operator
+        // must return the exact layout selected by its contract.
+        for (name, op) in sample_non_leaf_operators() {
+            let children = op.children();
+            if children.is_empty() {
+                continue;
+            }
+            let layouts = children
+                .iter()
+                .map(|child| child.output_layout())
+                .collect::<Vec<_>>();
+            let refs = layouts.iter().collect::<Vec<_>>();
+            if let Some(index) = op.pass_through_child_index(&refs) {
+                assert_eq!(
+                    op.output_layout_from_child_refs(&refs),
+                    *refs[index],
+                    "{name} pass-through layout diverges from its child contract"
+                );
+            }
         }
     }
 }

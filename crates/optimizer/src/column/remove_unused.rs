@@ -279,12 +279,9 @@ impl LogicalOperatorVisitor for RemoveUnusedColumns<'_> {
                     if agg.aggregates.is_empty() && agg.groups.is_empty() {
                         let count_star = get_count_star_function();
                         let return_type = count_star.return_type.clone();
-                        agg.aggregates
-                            .push(Expression::Aggregate(AggregateExpression::new(
-                                count_star,
-                                Vec::new(),
-                                return_type,
-                            )));
+                        agg.aggregates.push(Expression::Aggregate(Box::new(
+                            AggregateExpression::new(count_star, Vec::new(), return_type),
+                        )));
                     }
 
                     agg.recompute_returned_types();
@@ -1037,23 +1034,23 @@ mod tests {
             )),
         );
         let count = || {
-            Expression::Aggregate(AggregateExpression::new(
+            Expression::Aggregate(Box::new(AggregateExpression::new(
                 get_count_star_function(),
                 Vec::new(),
                 LogicalType::BigInt,
-            ))
+            )))
         };
         let (max, _) = get_max_function()
             .bind(&[LogicalType::BigInt])
             .expect("bind max(bigint)");
-        let reducer = Expression::Aggregate(AggregateExpression::new(
+        let reducer = Expression::Aggregate(Box::new(AggregateExpression::new(
             max,
             vec![Expression::ColumnRef(ColumnRefExpression::new(
                 ColumnBinding::new(12, 1),
                 LogicalType::BigInt,
             ))],
             LogicalType::BigInt,
-        ));
+        )));
         let predicate = Expression::Comparison(ComparisonExpression::new(
             ComparisonType::Equal,
             Expression::ColumnRef(ColumnRefExpression::new(

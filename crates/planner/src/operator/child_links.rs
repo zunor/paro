@@ -277,11 +277,11 @@ impl<Child> LogicalOperator<Child> {
             Self::Get(operator) => LogicalOperator::Get(operator),
             Self::CreateTable(operator) => LogicalOperator::CreateTable(operator),
             Self::CreateRoutine(operator) => LogicalOperator::CreateRoutine(operator),
-            Self::Alter(operator) => LogicalOperator::Alter(operator),
+            Self::Alter(operator) => LogicalOperator::Alter(Box::new(*operator)),
             Self::CreateSequence(operator) => LogicalOperator::CreateSequence(operator),
             Self::CreateSchema(operator) => LogicalOperator::CreateSchema(operator),
             Self::CreateIndex(operator) => LogicalOperator::CreateIndex(operator),
-            Self::CreateView(operator) => LogicalOperator::CreateView(operator),
+            Self::CreateView(operator) => LogicalOperator::CreateView(Box::new(*operator)),
             Self::Drop(operator) => LogicalOperator::Drop(operator),
             Self::CreatePropertyGraph(operator) => LogicalOperator::CreatePropertyGraph(operator),
             Self::DropPropertyGraph(operator) => LogicalOperator::DropPropertyGraph(operator),
@@ -289,7 +289,9 @@ impl<Child> LogicalOperator<Child> {
             Self::ExpressionGet(operator) => LogicalOperator::ExpressionGet(operator),
             Self::DelimGet(operator) => LogicalOperator::DelimGet(operator),
             Self::CTERef(operator) => LogicalOperator::CTERef(operator),
-            Self::TableFunctionGet(operator) => LogicalOperator::TableFunctionGet(operator),
+            Self::TableFunctionGet(operator) => {
+                LogicalOperator::TableFunctionGet(Box::new(*operator))
+            }
             Self::SearchScan(operator) => LogicalOperator::SearchScan(Box::new(*operator)),
             Self::FullTextFilterScan(operator) => {
                 LogicalOperator::FullTextFilterScan(Box::new(*operator))

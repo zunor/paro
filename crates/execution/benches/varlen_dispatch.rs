@@ -117,20 +117,20 @@ fn length_expr() -> Expression {
         vec![LogicalType::Varchar],
         vec![None],
     );
-    Expression::Function(FunctionExpression::new(
+    Expression::Function(Box::new(FunctionExpression::new(
         bound,
         vec![reference_varchar(0)],
         LogicalType::BigInt,
-    ))
+    )))
 }
 
 fn lower_expr() -> Expression {
     let bound = bind_function(get_lower_function(), vec![LogicalType::Varchar], vec![None]);
-    Expression::Function(FunctionExpression::new(
+    Expression::Function(Box::new(FunctionExpression::new(
         bound,
         vec![reference_varchar(0)],
         LogicalType::Varchar,
-    ))
+    )))
 }
 
 fn replace_expr() -> Expression {
@@ -147,7 +147,7 @@ fn replace_expr() -> Expression {
             Some(Value::Varchar("hello".to_string())),
         ],
     );
-    Expression::Function(FunctionExpression::new(
+    Expression::Function(Box::new(FunctionExpression::new(
         bound,
         vec![
             reference_varchar(0),
@@ -155,7 +155,7 @@ fn replace_expr() -> Expression {
             constant_varchar("hello"),
         ],
         LogicalType::Varchar,
-    ))
+    )))
 }
 
 fn cast_varchar_to_i64_expr() -> Expression {

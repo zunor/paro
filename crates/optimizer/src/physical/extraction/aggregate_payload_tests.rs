@@ -31,11 +31,11 @@ fn passive_conditional_decimal_sum_becomes_a_filtered_input() {
         )),
         input_type,
     ));
-    let aggregate = Expression::Aggregate(AggregateExpression::new(
+    let aggregate = Expression::Aggregate(Box::new(AggregateExpression::new(
         function,
         vec![conditional],
         result_type,
-    ));
+    )));
 
     let payload = plan_aggregate_payload(vec![], vec![aggregate]).expect("plan payload");
 
@@ -72,11 +72,11 @@ fn non_null_conditional_else_preserves_case_semantics() {
         )),
         input_type,
     ));
-    let aggregate = Expression::Aggregate(AggregateExpression::new(
+    let aggregate = Expression::Aggregate(Box::new(AggregateExpression::new(
         function,
         vec![conditional],
         result_type,
-    ));
+    )));
 
     let payload = plan_aggregate_payload(vec![], vec![aggregate]).expect("plan payload");
 

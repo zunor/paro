@@ -294,7 +294,7 @@ mod tests {
 
     #[test]
     fn get_expression_side_visits_window_frame_offsets() {
-        let expression = Expression::Window(WindowExpression::native(
+        let expression = Expression::Window(Box::new(WindowExpression::native(
             WindowFunction::row_number(),
             vec![],
             vec![],
@@ -307,7 +307,7 @@ mod tests {
                 end_is_preceding: false,
             },
             false,
-        ));
+        )));
 
         assert_eq!(
             get_expression_side(&expression, &HashSet::from([6]), &HashSet::from([7])),

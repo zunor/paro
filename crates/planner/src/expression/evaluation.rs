@@ -242,7 +242,7 @@ mod tests {
                 .boundary
                 .placement = PlacementClass::External;
         }
-        Expression::Function(expression)
+        Expression::Function(Box::new(expression))
     }
 
     fn infallible_call(children: Vec<Expression>) -> Expression {

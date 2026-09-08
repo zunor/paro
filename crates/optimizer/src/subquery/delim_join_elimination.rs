@@ -1010,11 +1010,11 @@ mod tests {
             noop_scalar_execute,
         )
         .with_stability(FunctionStability::Volatile);
-        Expression::Function(FunctionExpression::new(
+        Expression::Function(Box::new(FunctionExpression::new(
             function,
             vec![],
             LogicalType::Integer,
-        ))
+        )))
     }
 
     fn expression_get(table_index: usize) -> OwnedLogicalPlan {

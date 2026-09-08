@@ -384,11 +384,11 @@ fn aggregate_uses_lossless_fixed_width_keys_for_bounded_strings() {
             vec![LogicalType::Varchar],
         )),
     );
-    let count = Expression::Aggregate(AggregateExpression::new(
+    let count = Expression::Aggregate(Box::new(AggregateExpression::new(
         get_count_star_function(),
         vec![],
         LogicalType::BigInt,
-    ));
+    )));
     let mut aggregate = Aggregate::new(
         1,
         2,
@@ -432,11 +432,11 @@ fn aggregate_packs_inline_strings_when_fixed_keys_preserve_row_width() {
             vec![LogicalType::Varchar],
         )),
     );
-    let count = Expression::Aggregate(AggregateExpression::new(
+    let count = Expression::Aggregate(Box::new(AggregateExpression::new(
         get_count_star_function(),
         vec![],
         LogicalType::BigInt,
-    ));
+    )));
     let mut aggregate = Aggregate::new(
         1,
         2,
@@ -479,11 +479,11 @@ fn aggregate_skips_offset_keys_that_only_replace_row_padding() {
             vec![LogicalType::Integer],
         )),
     );
-    let count = Expression::Aggregate(AggregateExpression::new(
+    let count = Expression::Aggregate(Box::new(AggregateExpression::new(
         get_count_star_function(),
         vec![],
         LogicalType::BigInt,
-    ));
+    )));
     let mut aggregate = Aggregate::new(
         1,
         2,
@@ -535,11 +535,11 @@ fn aggregate_requires_complete_bounds_for_offset_keys() {
                 vec![LogicalType::BigInt, LogicalType::BigInt],
             )),
         );
-        let count = Expression::Aggregate(AggregateExpression::new(
+        let count = Expression::Aggregate(Box::new(AggregateExpression::new(
             get_count_star_function(),
             vec![],
             LogicalType::BigInt,
-        ));
+        )));
         let mut aggregate = Aggregate::new(
             1,
             2,
@@ -608,11 +608,11 @@ fn aggregate_materializes_proven_dependent_groups_as_states() {
             ],
         )),
     );
-    let count = Expression::Aggregate(AggregateExpression::new(
+    let count = Expression::Aggregate(Box::new(AggregateExpression::new(
         get_count_star_function(),
         vec![],
         LogicalType::BigInt,
-    ));
+    )));
     let mut aggregate = Aggregate::new(
         1,
         2,
@@ -668,11 +668,11 @@ fn arena_extractor_fuses_aggregate_only_having_into_aggregate_emit() {
             vec![LogicalType::Integer],
         )),
     );
-    let count = Expression::Aggregate(AggregateExpression::new(
+    let count = Expression::Aggregate(Box::new(AggregateExpression::new(
         get_count_star_function(),
         vec![],
         LogicalType::BigInt,
-    ));
+    )));
     let aggregate = OwnedLogicalPlan::new(
         &ctx,
         LogicalOperator::Aggregate(Box::new(Aggregate::new(
@@ -729,11 +729,11 @@ fn aggregate_having_fusion_preserves_an_independent_output_projection() {
             vec![LogicalType::Integer],
         )),
     );
-    let count = Expression::Aggregate(AggregateExpression::new(
+    let count = Expression::Aggregate(Box::new(AggregateExpression::new(
         get_count_star_function(),
         vec![],
         LogicalType::BigInt,
-    ));
+    )));
     let aggregate = OwnedLogicalPlan::new(
         &ctx,
         LogicalOperator::Aggregate(Box::new(Aggregate::new(

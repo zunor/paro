@@ -1064,11 +1064,11 @@ mod tests {
                 ))
             })
             .collect();
-        let count = Expression::Aggregate(AggregateExpression::new(
+        let count = Expression::Aggregate(Box::new(AggregateExpression::new(
             get_count_star_function(),
             Vec::new(),
             LogicalType::BigInt,
-        ));
+        )));
         Aggregate::new(8, 9, 10, child, groups, Vec::new(), vec![count], Vec::new())
     }
 

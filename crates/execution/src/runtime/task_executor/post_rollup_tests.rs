@@ -62,16 +62,16 @@ fn decimal_sum_rollup_spec(
         .expect("DECIMAL SUM declares its finalized-partial reducer");
     assert_eq!(reducer_function.return_type, output_type);
 
-    let source_aggregate = Expression::Aggregate(AggregateExpression::new(
+    let source_aggregate = Expression::Aggregate(Box::new(AggregateExpression::new(
         source_function,
         vec![reference(1, input_type.clone())],
         output_type.clone(),
-    ));
-    let reducer = Expression::Aggregate(AggregateExpression::new(
+    )));
+    let reducer = Expression::Aggregate(Box::new(AggregateExpression::new(
         reducer_function,
         vec![reference(0, output_type.clone())],
         output_type.clone(),
-    ));
+    )));
     let scalar_expression = projected_reference(0, &output_type, &projected_type);
     let predicate = Expression::Comparison(ComparisonExpression::new(
         comparison,

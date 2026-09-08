@@ -421,11 +421,11 @@ mod tests {
             .next()
             .expect("random overload");
         let random = || {
-            Expression::Function(FunctionExpression::new(
+            Expression::Function(Box::new(FunctionExpression::new(
                 function.clone(),
                 vec![],
                 LogicalType::Double,
-            ))
+            )))
         };
         Expression::Comparison(ComparisonExpression::new(
             ComparisonType::GreaterThan,

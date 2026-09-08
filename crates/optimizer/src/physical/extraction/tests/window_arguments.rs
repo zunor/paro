@@ -9,11 +9,11 @@ fn random_call() -> Expression {
         .into_iter()
         .next()
         .expect("random overload");
-    Expression::Function(paro_planner::expression::FunctionExpression::new(
+    Expression::Function(Box::new(paro_planner::expression::FunctionExpression::new(
         function,
         vec![],
         LogicalType::Double,
-    ))
+    )))
 }
 
 #[test]

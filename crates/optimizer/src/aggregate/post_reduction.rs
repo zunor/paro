@@ -969,14 +969,14 @@ fn recognize_orientation(
         reduction_index,
         scalar.wrapper_type,
     )?;
-    let reducer = Expression::Aggregate(AggregateExpression::new(
+    let reducer = Expression::Aggregate(Box::new(AggregateExpression::new(
         merge,
         vec![Expression::ColumnRef(ColumnRefExpression::new(
             ColumnBinding::new(grouped.aggregate_index, 0),
             grouped_sum.return_type.clone(),
         ))],
         grouped_sum.return_type.clone(),
-    ));
+    )));
 
     Some(Rewrite {
         grouped_side,

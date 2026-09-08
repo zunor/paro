@@ -198,11 +198,11 @@ mod tests {
         LogicalOperator::Projection(Projection::new(
             1,
             OwnedLogicalPlan::synthetic(child),
-            vec![Expression::Function(FunctionExpression::new(
+            vec![Expression::Function(Box::new(FunctionExpression::new(
                 function,
                 vec![],
                 LogicalType::Double,
-            ))],
+            )))],
         ))
     }
 

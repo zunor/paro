@@ -215,7 +215,7 @@ fn bind_copy_from(binder: &mut Binder, stmt: CopyStmt) -> Result<BoundStatementK
     )
     .with_bind_data(BoundTableFunctionData::new(bind_data));
 
-    let mut source = LogicalOperator::TableFunctionGet(table_function_get);
+    let mut source = LogicalOperator::TableFunctionGet(Box::new(table_function_get));
     if let Some(expr) = where_clause {
         let condition = bind_copy_from_where_clause(
             binder,

@@ -8,7 +8,7 @@ use std::collections::BTreeMap;
 use std::time::Duration;
 
 use crate::cascades::RuleId;
-use paro_context::{OptimizerDiagnostic, SessionDiagnostics};
+use paro_context::{OptimizerDiagnostic, OptimizerMetricUnit, SessionDiagnostics};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum OptimizerComponent {
@@ -65,6 +65,7 @@ pub struct OptimizerProfiler {
     rule_elapsed: BTreeMap<RuleId, Duration>,
     rule_allocated_bytes: BTreeMap<RuleId, u64>,
     rule_budget_exhaustions: BTreeMap<RuleId, u64>,
+    component_allocated_bytes: BTreeMap<OptimizerComponent, u64>,
     counters: BTreeMap<String, u64>,
 }
 
@@ -83,6 +84,7 @@ pub struct OptimizerProfileSnapshot {
     pub rule_elapsed: BTreeMap<RuleId, Duration>,
     pub rule_allocated_bytes: BTreeMap<RuleId, u64>,
     pub rule_budget_exhaustions: BTreeMap<RuleId, u64>,
+    pub component_allocated_bytes: BTreeMap<OptimizerComponent, u64>,
     pub counters: BTreeMap<String, u64>,
 }
 
@@ -99,10 +101,8 @@ impl OptimizerProfiler {
         component: OptimizerComponent,
         allocated_bytes: u64,
     ) {
-        self.counters.insert(
-            format!("allocation_bytes_{}", component.name()),
-            allocated_bytes,
-        );
+        self.component_allocated_bytes
+            .insert(component, allocated_bytes);
     }
 
     pub fn snapshot(&self) -> OptimizerProfileSnapshot {
@@ -122,6 +122,7 @@ impl OptimizerProfiler {
             rule_elapsed: self.rule_elapsed.clone(),
             rule_allocated_bytes: self.rule_allocated_bytes.clone(),
             rule_budget_exhaustions: self.rule_budget_exhaustions.clone(),
+            component_allocated_bytes: self.component_allocated_bytes.clone(),
             rule_attempts: self.rule_attempts.clone(),
             counters: self.counters.clone(),
         }
@@ -198,9 +199,24 @@ pub fn publish_optimizer_profile_snapshot(
             name: entry.component.name().to_string(),
             kind: entry.component.kind().to_string(),
             last_elapsed_us: entry.last_elapsed.as_micros().min(i64::MAX as u128) as i64,
+            metric_value: entry.invocation_count.min(i64::MAX as u64) as i64,
+            metric_unit: OptimizerMetricUnit::Invocations,
             invocation_count: entry.invocation_count.min(i64::MAX as u64) as i64,
         })
         .collect::<Vec<_>>();
+    entries.extend(
+        snapshot
+            .component_allocated_bytes
+            .into_iter()
+            .map(|(component, bytes)| OptimizerDiagnostic {
+                name: format!("allocation_bytes_{}", component.name()),
+                kind: "allocation".to_string(),
+                last_elapsed_us: 0,
+                metric_value: bytes.min(i64::MAX as u64) as i64,
+                metric_unit: OptimizerMetricUnit::Bytes,
+                invocation_count: 0,
+            }),
+    );
     let rule_elapsed = snapshot.rule_elapsed;
     entries.extend(
         snapshot
@@ -212,7 +228,9 @@ pub fn publish_optimizer_profile_snapshot(
                     .unwrap_or_else(|| format!("allocation_bytes_unknown_rule_{}", rule.0)),
                 kind: "search_counter".to_string(),
                 last_elapsed_us: 0,
-                invocation_count: bytes.min(i64::MAX as u64) as i64,
+                metric_value: bytes.min(i64::MAX as u64) as i64,
+                metric_unit: OptimizerMetricUnit::Bytes,
+                invocation_count: 0,
             }),
     );
     entries.extend(
@@ -225,7 +243,9 @@ pub fn publish_optimizer_profile_snapshot(
                     .unwrap_or_else(|| format!("budget_exhaustion_unknown_rule_{}", rule.0)),
                 kind: "search_counter".to_string(),
                 last_elapsed_us: 0,
-                invocation_count: count.min(i64::MAX as u64) as i64,
+                metric_value: count.min(i64::MAX as u64) as i64,
+                metric_unit: OptimizerMetricUnit::Count,
+                invocation_count: 0,
             }),
     );
     entries.extend(snapshot.rule_insertions.into_iter().map(|(rule, count)| {
@@ -240,7 +260,9 @@ pub fn publish_optimizer_profile_snapshot(
                 .unwrap_or_default()
                 .as_micros()
                 .min(i64::MAX as u128) as i64,
-            invocation_count: count.min(i64::MAX as u64) as i64,
+            metric_value: count.min(i64::MAX as u64) as i64,
+            metric_unit: OptimizerMetricUnit::Insertions,
+            invocation_count: 0,
         }
     }));
     entries.extend(snapshot.rule_attempts.into_iter().map(|(rule, count)| {
@@ -255,7 +277,9 @@ pub fn publish_optimizer_profile_snapshot(
                 .unwrap_or_default()
                 .as_micros()
                 .min(i64::MAX as u128) as i64,
-            invocation_count: count.min(i64::MAX as u64) as i64,
+            metric_value: count.min(i64::MAX as u64) as i64,
+            metric_unit: OptimizerMetricUnit::Attempts,
+            invocation_count: 0,
         }
     }));
     entries.extend(
@@ -266,7 +290,9 @@ pub fn publish_optimizer_profile_snapshot(
                 name,
                 kind: "search_counter".to_string(),
                 last_elapsed_us: 0,
-                invocation_count: count.min(i64::MAX as u64) as i64,
+                metric_value: count.min(i64::MAX as u64) as i64,
+                metric_unit: OptimizerMetricUnit::Count,
+                invocation_count: 0,
             }),
     );
     diagnostics.publish_optimizer(entries);
@@ -338,15 +364,31 @@ mod tests {
     }
 
     #[test]
-    fn component_allocation_is_published_as_a_search_counter() {
+    fn component_allocation_is_published_as_a_typed_metric() {
         let mut profiler = OptimizerProfiler::default();
         profiler.record_component_allocation(OptimizerComponent::MemoExploration, 4096);
         assert_eq!(
             profiler
                 .snapshot()
-                .counters
-                .get("allocation_bytes_memo_exploration"),
+                .component_allocated_bytes
+                .get(&OptimizerComponent::MemoExploration),
             Some(&4096)
         );
+    }
+
+    #[test]
+    fn non_timing_metric_never_reuses_invocation_field() {
+        let diagnostics = SessionDiagnostics::default();
+        let mut profiler = OptimizerProfiler::default();
+        profiler.record_rule_insertions(BTreeMap::from([(RuleId(7), 3)]));
+        publish_optimizer_profile_snapshot(&diagnostics, profiler.snapshot());
+        let row = diagnostics
+            .optimizer_snapshot()
+            .into_iter()
+            .find(|row| row.name == "unknown_rule_7")
+            .expect("rule insertion metric");
+        assert_eq!(row.metric_unit, OptimizerMetricUnit::Insertions);
+        assert_eq!(row.metric_value, 3);
+        assert_eq!(row.invocation_count, 0);
     }
 }

@@ -11,6 +11,26 @@ use paro_planner::plan::{UniqueKey, UniqueKeyColumn, UniqueKeyProvenance};
 #[cfg(test)]
 mod tests;
 
+fn encode_distinct_provenance(
+    encoder: &mut StableFingerprintBuilder,
+    provenance: paro_storage::statistics::DistinctProvenance,
+) {
+    use paro_storage::statistics::DistinctProvenance::*;
+    match provenance {
+        Unknown => encoder.write_u64(0),
+        Derived => encoder.write_u64(1),
+        ObservedFull => encoder.write_u64(2),
+        ObservedPartial {
+            observed_rows,
+            total_rows,
+        } => {
+            encoder.write_u64(3);
+            encoder.write_u64(observed_rows);
+            encoder.write_u64(total_rows);
+        }
+    }
+}
+
 #[derive(Debug, Default, PartialEq, Eq)]
 struct GroupFacts {
     can_replay: bool,
@@ -277,6 +297,8 @@ impl BoundarySnapshot {
             encoder.write_u64(column.0 as u64);
             encoder.write_u64(domain.expected_lower);
             encoder.write_u64(domain.expected_upper);
+            encoder.write_u64(domain.ranking_point);
+            encode_distinct_provenance(encoder, domain.provenance);
             encoder.write_u64(domain.guaranteed_upper.is_some() as u64);
             encoder.write_u64(domain.guaranteed_upper.unwrap_or(0));
         }
@@ -691,6 +713,9 @@ impl BoundarySnapshot {
                         expected_distinct: domain.and_then(|domain| domain.expected()),
                         guaranteed_distinct_upper: domain
                             .and_then(|domain| domain.guaranteed_upper),
+                        provenance: domain
+                            .map(|domain| domain.provenance)
+                            .unwrap_or(paro_storage::statistics::DistinctProvenance::Unknown),
                     }
                 })
                 .collect(),

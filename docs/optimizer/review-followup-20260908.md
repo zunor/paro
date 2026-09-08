@@ -10,9 +10,9 @@ Large, configuration-heavy logical payloads are boxed at the
 `LogicalOperator` boundary (including base-table/external scans, aggregates,
 search and graph scans, graph expansion, CTE helpers, and graph matches).
 Arena slots no longer reserve space for the largest inline payload.  A
-compile-time size assertion keeps the enum below the current 192-byte envelope;
-remaining inline payloads are intentionally small and scan metadata is copied
-only at owned-IR boundaries.
+compile-time size assertion keeps the enum below a 160-byte envelope with room
+for small metadata additions; remaining inline payloads are intentionally
+small and scan metadata is copied only at owned-IR boundaries.
 
 `LogicalPlanArena::append` reduces layouts from borrowed child references.  It
 does not clone every child layout merely to select a pass-through input.  The
@@ -49,9 +49,10 @@ fingerprint before exact structural comparison; Memo group IDs are excluded
 from this necessary-condition key.
 
 Storage rowset/tablet aggregation carries explicit observed/total row coverage
-for one-sided HLL sketches.  A surviving sketch is extrapolated conservatively
-instead of being silently discarded.  Coverage is derived planner/storage
-metadata and is not added to the existing segment serialization format.
+for one-sided HLL sketches.  A surviving partial sketch remains an observed
+lower-bound point and is never silently promoted to a complete-domain proof or
+linearly extrapolated.  Coverage is derived planner/storage metadata and is not
+added to the existing segment serialization format.
 
 ## Estimation and partition evidence
 

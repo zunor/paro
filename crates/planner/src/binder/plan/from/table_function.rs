@@ -20,7 +20,9 @@ impl Binder {
             tf_ref.bound_arguments,
         )
         .with_ordinality_flag(tf_ref.with_ordinality);
-        Ok(LogicalOperator::TableFunctionGet(table_function_get))
+        Ok(LogicalOperator::TableFunctionGet(Box::new(
+            table_function_get,
+        )))
     }
 
     pub(crate) fn plan_external_routine_ref(

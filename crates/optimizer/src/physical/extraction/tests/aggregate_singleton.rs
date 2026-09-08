@@ -80,11 +80,11 @@ fn stale_singleton_hint_falls_back_to_a_physical_aggregate() {
             LogicalType::Integer,
         ))],
         Vec::new(),
-        vec![Expression::Aggregate(AggregateExpression::new(
+        vec![Expression::Aggregate(Box::new(AggregateExpression::new(
             get_count_star_function(),
             Vec::new(),
             LogicalType::BigInt,
-        ))],
+        )))],
         Vec::new(),
     );
     aggregate.group_input_multiplicity = GroupInputMultiplicity::AtMostOne(proof);

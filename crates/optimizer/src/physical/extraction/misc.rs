@@ -274,12 +274,12 @@ fn lower_partition_aggregate_window_spec(
         .expressions
         .iter()
         .map(|expression| {
-            Expression::Aggregate(
+            Expression::Aggregate(Box::new(
                 expression
                     .aggregate_invocation()
                     .expect("partition aggregate eligibility checked")
                     .clone(),
-            )
+            ))
         })
         .collect::<Vec<_>>();
     let input_types = window.child.types();

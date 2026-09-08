@@ -174,11 +174,11 @@ mod tests {
             .into_iter()
             .next()
             .expect("random overload");
-        Expression::Function(FunctionExpression::new(
+        Expression::Function(Box::new(FunctionExpression::new(
             function,
             vec![],
             LogicalType::Double,
-        ))
+        )))
     }
 
     #[test]

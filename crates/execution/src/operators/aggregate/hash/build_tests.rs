@@ -38,11 +38,11 @@ fn grouped_count_spec() -> AggregateSpec {
         groups: Box::new([reference(0, LogicalType::Integer)]),
         group_key_encodings: Box::new([GroupKeyEncoding::Identity]),
         grouping_sets: Box::new([]),
-        aggregates: Box::new([Expression::Aggregate(AggregateExpression::new(
+        aggregates: Box::new([Expression::Aggregate(Box::new(AggregateExpression::new(
             get_count_star_function(),
             vec![],
             LogicalType::BigInt,
-        ))]),
+        )))]),
         grouping_functions: Box::new([]),
         aggregate_inputs: Box::new([Box::new([])]),
         aggregate_filters: Box::new([None]),
@@ -70,11 +70,11 @@ fn grouped_string_agg_spec() -> AggregateSpec {
         groups: Box::new([reference(0, LogicalType::Integer)]),
         group_key_encodings: Box::new([GroupKeyEncoding::Identity]),
         grouping_sets: Box::new([]),
-        aggregates: Box::new([Expression::Aggregate(AggregateExpression::new(
+        aggregates: Box::new([Expression::Aggregate(Box::new(AggregateExpression::new(
             string_agg,
             vec![reference(1, LogicalType::Varchar)],
             LogicalType::Varchar,
-        ))]),
+        )))]),
         grouping_functions: Box::new([]),
         aggregate_inputs: Box::new([Box::new([1])]),
         aggregate_filters: Box::new([None]),

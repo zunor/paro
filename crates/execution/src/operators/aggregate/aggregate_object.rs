@@ -284,7 +284,7 @@ mod tests {
         }]);
 
         let aggregate_data = GroupedAggregateData {
-            aggregates: vec![Expression::Aggregate(aggregate)],
+            aggregates: vec![Expression::Aggregate(Box::new(aggregate))],
             aggregate_inputs: vec![vec![0]],
             aggregate_filters: vec![Some(1)],
             aggregate_orders: vec![vec![2]],

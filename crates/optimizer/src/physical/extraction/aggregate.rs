@@ -507,13 +507,13 @@ impl PhysicalPlanExtractor {
             {
                 let input = aggregate.groups[group_idx].clone();
                 let input_type = input.return_type();
-                aggregate_expressions.push(Expression::Aggregate(
+                aggregate_expressions.push(Expression::Aggregate(Box::new(
                     paro_planner::expression::AggregateExpression::new(
                         function.clone(),
                         vec![input],
                         input_type,
                     ),
-                ));
+                )));
             }
         }
         let AggregatePayloadPlan {

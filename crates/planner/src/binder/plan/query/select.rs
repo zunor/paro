@@ -27,9 +27,9 @@ use crate::operator::{
 use paro_common::error::{self as paro_error, Result};
 
 fn group_window_expressions(
-    expressions: Vec<(usize, WindowExpression)>,
-) -> Vec<Vec<(usize, WindowExpression)>> {
-    let mut groups: Vec<Vec<(usize, WindowExpression)>> = Vec::new();
+    expressions: Vec<(usize, Box<WindowExpression>)>,
+) -> Vec<Vec<(usize, Box<WindowExpression>)>> {
+    let mut groups: Vec<Vec<(usize, Box<WindowExpression>)>> = Vec::new();
     for (original_index, expression) in expressions {
         if let Some(group) = groups
             .iter_mut()
@@ -216,7 +216,7 @@ impl Binder {
                 for (local_index, (original_index, expression)) in group.into_iter().enumerate() {
                     output_bindings[original_index] =
                         Some(ColumnBinding::new(window_index, local_index));
-                    expressions.push(expression);
+                    expressions.push(*expression);
                 }
                 planned_groups.push((window_index, expressions));
             }
@@ -346,9 +346,9 @@ mod tests {
     #[test]
     fn window_groups_are_stable_and_combine_equal_layouts() {
         let groups = group_window_expressions(vec![
-            (0, row_number(0)),
-            (1, row_number(1)),
-            (2, row_number(0)),
+            (0, Box::new(row_number(0))),
+            (1, Box::new(row_number(1))),
+            (2, Box::new(row_number(0))),
         ]);
 
         assert_eq!(groups.len(), 2);

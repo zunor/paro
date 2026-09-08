@@ -2347,18 +2347,38 @@ pub(crate) fn compose_candidate_cost_with_sources_at(
                             "sideways-filter composition has no predicate-application cost",
                         )
                     })?;
-                    cost = cost.replace_work(full_apply_cost, SearchCost::ZERO)?;
+                    let total_rows = lanes
+                        .iter()
+                        .map(|lane| lane.source_rows)
+                        .fold(0_u64, u64::saturating_add);
                     let matching_rows = lanes
                         .iter()
                         .filter(|lane| sources.iter().any(|source| source.source == lane.source))
                         .map(|lane| lane.source_rows)
-                        .sum::<u64>();
+                        .fold(0_u64, u64::saturating_add);
+                    // Attribute the operator-local full-source term by the
+                    // immutable row domain, not by `lane.cost` (which may
+                    // already be reduced by a filter introduced by another
+                    // join).  If lineage is incomplete, retain the
+                    // unattributed fraction on the parent instead of turning
+                    // a physical-source mismatch into a cost discount.
+                    let matched_share = if total_rows == 0 {
+                        1_000_000_u32
+                    } else {
+                        ((matching_rows as f64 / total_rows as f64 * 1_000_000.0).ceil() as u32)
+                            .min(1_000_000)
+                    };
+                    let unmatched_share = 1_000_000_u32.saturating_sub(matched_share);
+                    cost = cost.replace_work(
+                        full_apply_cost,
+                        full_apply_cost.retain_work(unmatched_share, unmatched_share)?,
+                    )?;
                     // Predicate evaluation is one operator-local cost before it
                     // is attributed to source lanes. Allocate every ppm exactly
                     // once so splitting a UNION into more branches cannot create
                     // or discard work through independent rounding.
                     let mut apply_shares = Vec::with_capacity(matching_lanes);
-                    let mut unallocated_ppm = 1_000_000_u32;
+                    let mut unallocated_ppm = matched_share;
                     for lane in lanes
                         .iter()
                         .filter(|lane| sources.iter().any(|source| source.source == lane.source))
@@ -2420,6 +2440,7 @@ pub(crate) fn compose_candidate_cost_with_sources_at(
                                 filters.push(SourceFilterWork {
                                     domain: source.domain,
                                     evaluation: source.evaluation,
+                                    evaluation_rows: lane.source_rows,
                                     expected_retained_ppm: source.expected_retained_ppm,
                                     upper_retained_ppm: source.upper_retained_ppm,
                                     full_apply_cost: full_apply_cost.work_only(),

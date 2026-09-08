@@ -171,10 +171,10 @@ mod tests {
         let (function, _) = get_count_function()
             .bind(&[LogicalType::BigInt])
             .expect("bind count(bigint)");
-        Expression::Aggregate(
+        Expression::Aggregate(Box::new(
             AggregateExpression::new(function, vec![input], LogicalType::BigInt)
                 .with_aggr_type(AggregateType::Distinct),
-        )
+        ))
     }
 
     #[test]

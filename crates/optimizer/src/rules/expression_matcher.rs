@@ -702,7 +702,7 @@ mod tests {
         let matcher =
             FunctionExpressionMatcher::with_function(Box::new(SpecificFunctionMatcher::new("add")));
 
-        let func_expr = Expression::Function(FunctionExpression::new(
+        let func_expr = Expression::Function(Box::new(FunctionExpression::new(
             ScalarFunction::new(
                 "add".to_string(),
                 vec![LogicalType::Integer, LogicalType::Integer],
@@ -711,13 +711,13 @@ mod tests {
             ),
             vec![make_constant(1), make_constant(2)],
             LogicalType::Integer,
-        ));
+        )));
 
         let mut bindings = Vec::new();
         assert!(matcher.matches(&func_expr, &mut bindings));
 
         // Wrong function name
-        let wrong_func = Expression::Function(FunctionExpression::new(
+        let wrong_func = Expression::Function(Box::new(FunctionExpression::new(
             ScalarFunction::new(
                 "subtract".to_string(),
                 vec![LogicalType::Integer, LogicalType::Integer],
@@ -726,7 +726,7 @@ mod tests {
             ),
             vec![make_constant(1), make_constant(2)],
             LogicalType::Integer,
-        ));
+        )));
 
         bindings.clear();
         assert!(!matcher.matches(&wrong_func, &mut bindings));

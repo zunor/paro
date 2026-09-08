@@ -68,14 +68,14 @@ pub fn bind_window_expression(
         )?;
         let default_frame = WindowFrame::get_default_frame(&window_func);
         let frame = bind_window_frame(binder, spec.window_frame, default_frame)?;
-        return Ok(Expression::Window(WindowExpression::native(
+        return Ok(Expression::Window(Box::new(WindowExpression::native(
             window_func,
             bound_args,
             partitions,
             orders,
             frame,
             ignore_nulls,
-        )));
+        ))));
     }
 
     if ignore_nulls {
@@ -101,9 +101,9 @@ pub fn bind_window_expression(
     )?;
     let frame = bind_window_frame(binder, spec.window_frame, WindowFrame::default())?;
 
-    Ok(Expression::Window(WindowExpression::aggregate(
+    Ok(Expression::Window(Box::new(WindowExpression::aggregate(
         aggregate, partitions, orders, frame,
-    )))
+    ))))
 }
 
 fn is_native_window_function(name: &str) -> bool {

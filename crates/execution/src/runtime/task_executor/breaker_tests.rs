@@ -854,16 +854,16 @@ fn perfect_hash_having_rejection_still_validates_every_aggregate_state() {
         group_key_encodings: Box::new([crate::physical::specs::GroupKeyEncoding::Identity]),
         grouping_sets: Box::new([]),
         aggregates: Box::new([
-            Expression::Aggregate(AggregateExpression::new(
+            Expression::Aggregate(Box::new(AggregateExpression::new(
                 narrow_sum,
                 vec![reference(1, narrow_type.clone())],
                 wide_type.clone(),
-            )),
-            Expression::Aggregate(AggregateExpression::new(
+            ))),
+            Expression::Aggregate(Box::new(AggregateExpression::new(
                 wide_sum,
                 vec![reference(2, wide_type.clone())],
                 wide_type.clone(),
-            )),
+            ))),
         ]),
         grouping_functions: Box::new([]),
         aggregate_inputs: Box::new([Box::new([1]), Box::new([2])]),

@@ -1027,7 +1027,7 @@ mod tests {
     use paro_storage::index::hnsw::HnswSearchObjective;
 
     fn row_number(partition_column: usize) -> Expression {
-        Expression::Window(WindowExpression::native(
+        Expression::Window(Box::new(WindowExpression::native(
             WindowFunction::row_number(),
             vec![],
             vec![Expression::ColumnRef(ColumnRefExpression::new(
@@ -1037,7 +1037,7 @@ mod tests {
             vec![],
             WindowFrame::default(),
             false,
-        ))
+        )))
     }
 
     fn random_call() -> Expression {
@@ -1046,11 +1046,11 @@ mod tests {
             .into_iter()
             .next()
             .expect("random overload");
-        Expression::Function(FunctionExpression::new(
+        Expression::Function(Box::new(FunctionExpression::new(
             function,
             vec![],
             LogicalType::Double,
-        ))
+        )))
     }
 
     #[test]

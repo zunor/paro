@@ -468,7 +468,7 @@ fn attach_group_column_domains(
     output_bindings: &[ColumnBinding],
     output_columns: &[ColumnId],
     column_stats: &HashMap<ColumnBinding, Arc<ColumnStatistics>>,
-    estimated_cardinality: Option<CardinalityEstimate>,
+    _estimated_cardinality: Option<CardinalityEstimate>,
 ) -> Result<()> {
     for (&binding, &column) in output_bindings.iter().zip(output_columns) {
         let statistics = column_stats.get(&binding);
@@ -480,28 +480,27 @@ fn attach_group_column_domains(
                 )?,
             );
         }
-        let expected = statistics
-            .map(|statistics| statistics.get_distinct_count() as u64)
-            .filter(|distinct| *distinct > 0)
-            .map(|distinct| {
-                // `expected` is a ranking point, not a semantic row bound.
-                // Capping NDV by it turns an uncertain one-row estimate into
-                // a false proof that the value domain has one member.  Only
-                // the conservative cardinality envelope may narrow the
-                // domain here; the expected point remains available to the
-                // cost model independently.
-                estimated_cardinality
-                    .map(|rows| rows.max)
-                    .map_or(distinct, |rows| distinct.min(rows))
-            });
-        let guaranteed_upper = statistics
-            .and_then(|statistics| statistics.guaranteed_distinct_upper())
+        let evidence = statistics.map(|statistics| statistics.distinct_evidence());
+        let evidence = evidence.unwrap_or_default();
+        let Some(mut domain) = GroupColumnDomain::from_evidence(
+            evidence,
+            // CardinalityEstimate::max is an uncertain observation, not a
+            // semantic row bound. Using it to cap NDV made a three-valued
+            // column collapse to one whenever a sibling alternative had a
+            // one-row estimate. Only the group's explicit maximum proof may
+            // narrow a distinct domain here.
+            properties.maximum_cardinality,
+        ) else {
+            continue;
+        };
+        // A maximum-cardinality proof is stronger than an HLL point but must
+        // not change its ranking point. Keep it as a separate upper bound so
+        // costing and semantic admission consume the right evidence channel.
+        domain.guaranteed_upper = domain
+            .guaranteed_upper
             .into_iter()
             .chain(properties.maximum_cardinality)
             .min();
-        let Some(domain) = GroupColumnDomain::new(expected, guaranteed_upper) else {
-            continue;
-        };
         properties
             .column_domains
             .entry(column)
@@ -1104,6 +1103,7 @@ impl MemoBuilder {
             || planner_binder.is_some()
             || memo.groups().any(|group| group.logical_exprs().len() > 1);
         let planner_state = Arc::new(RwLock::new(PlannerTransformState {
+            staging_arena: paro_planner::plan::arena::LogicalPlanArena::default(),
             columns,
             scalars,
             binding_ids,
@@ -1118,6 +1118,7 @@ impl MemoBuilder {
             cte_restrictions: Vec::new(),
             cte_partition_labels: Default::default(),
             cte_bindings: Vec::new(),
+            cte_binding_index: BTreeMap::new(),
             settlement_cache: Default::default(),
             binder: planner_binder,
             bind_context: bind_context.clone(),

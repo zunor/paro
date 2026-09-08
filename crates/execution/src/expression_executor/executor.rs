@@ -3310,11 +3310,11 @@ mod tests {
             LogicalType::Integer,
             add_one_function,
         );
-        Expression::Function(FunctionExpression::new(
+        Expression::Function(Box::new(FunctionExpression::new(
             function,
             vec![reference_i32(index)],
             LogicalType::Integer,
-        ))
+        )))
     }
 
     #[derive(Debug, Clone, PartialEq, Hash)]
@@ -3400,11 +3400,11 @@ mod tests {
         ))
         .with_bind_data(OffsetBindData { offset: 7 })
         .with_init_local_state(init_offset_local_state);
-        Expression::Function(FunctionExpression::new(
+        Expression::Function(Box::new(FunctionExpression::new(
             function,
             vec![reference_i32(index)],
             LogicalType::Integer,
-        ))
+        )))
     }
 
     #[derive(Debug, Clone)]
@@ -3499,11 +3499,11 @@ mod tests {
         .with_error_mode(FunctionErrorMode::Infallible)
         .with_dictionary_strategy(DictionaryStrategy::StorageDictionaryCache { input_idx: 0 });
         (
-            Expression::Function(FunctionExpression::new(
+            Expression::Function(Box::new(FunctionExpression::new(
                 function,
                 vec![reference_i32(index)],
                 LogicalType::Integer,
-            )),
+            ))),
             counter,
         )
     }
@@ -3525,11 +3525,11 @@ mod tests {
         .with_error_mode(FunctionErrorMode::Infallible)
         .with_dictionary_strategy(DictionaryStrategy::StorageDictionaryCache { input_idx: 0 });
         (
-            Expression::Function(FunctionExpression::new(
+            Expression::Function(Box::new(FunctionExpression::new(
                 function,
                 vec![reference_i32(left_index), reference_i32(right_index)],
                 LogicalType::Integer,
-            )),
+            ))),
             counter,
         )
     }
@@ -4446,11 +4446,11 @@ mod tests {
         let function = BoundScalarFunction::from(
             paro_function::scalar::system::get_current_user_functions().functions[0].clone(),
         );
-        let expression = Expression::Function(FunctionExpression::new(
+        let expression = Expression::Function(Box::new(FunctionExpression::new(
             function,
             Vec::new(),
             LogicalType::Varchar,
-        ));
+        )));
         let mut executor = ExpressionExecutor::new(&expression);
         let mut input =
             Chunk::try_new(paro_common::test_utils::test_allocator()).expect("input chunk");

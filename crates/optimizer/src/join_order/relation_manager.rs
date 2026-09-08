@@ -18,6 +18,7 @@ use crate::expression::{
 };
 use crate::join_order::query_graph::FilterInfo;
 use crate::join_order::relation::JoinRelationSetManager;
+use paro_storage::statistics::{DistinctEvidence, DistinctProvenance};
 use tracing::debug;
 
 /// A filter extracted from the logical plan together with the join semantics it came from.
@@ -131,15 +132,49 @@ pub struct DistinctCount {
     /// rather than a fallback derived only from a row/range upper estimate.
     /// A Memo estimate need not own a storage HyperLogLog allocation.
     pub has_expected_distinct: bool,
+    /// Evidence retained alongside the legacy costing point.  The point is
+    /// suitable for ranking only; callers that need a complete domain proof
+    /// must inspect this provenance instead of inferring it from the number.
+    pub evidence: DistinctEvidence,
 }
 
 impl DistinctCount {
     /// Create a new distinct count.
     pub fn new(distinct_count: usize, has_expected_distinct: bool) -> Self {
+        let provenance = if has_expected_distinct {
+            DistinctProvenance::ObservedFull
+        } else if distinct_count == 0 {
+            DistinctProvenance::Unknown
+        } else {
+            DistinctProvenance::Derived
+        };
         Self {
             distinct_count,
             has_expected_distinct,
+            evidence: DistinctEvidence {
+                lower: if matches!(provenance, DistinctProvenance::ObservedFull) {
+                    distinct_count as u64
+                } else {
+                    0
+                },
+                upper: None,
+                point: distinct_count as u64,
+                provenance,
+            },
         }
+    }
+
+    pub fn from_evidence(evidence: DistinctEvidence, has_expected_distinct: bool) -> Self {
+        let evidence = evidence.normalized();
+        Self {
+            distinct_count: evidence.point as usize,
+            has_expected_distinct,
+            evidence,
+        }
+    }
+
+    pub fn is_complete_observation(&self) -> bool {
+        self.evidence.is_complete_observation()
     }
 }
 
@@ -701,11 +736,11 @@ mod tests {
             .next()
             .expect("random overload");
         let random = || {
-            Expression::Function(FunctionExpression::new(
+            Expression::Function(Box::new(FunctionExpression::new(
                 function.clone(),
                 vec![],
                 LogicalType::Double,
-            ))
+            )))
         };
         Expression::Case(CaseExpression::new(
             Expression::Comparison(ComparisonExpression::new(
@@ -729,7 +764,7 @@ mod tests {
     fn test_extract_bindings_visits_window_frame_offsets() {
         let mut manager = RelationManager::new();
         manager.add_relation(create_test_get(7), None, RelationStats::new());
-        let expression = Expression::Window(WindowExpression::native(
+        let expression = Expression::Window(Box::new(WindowExpression::native(
             paro_function::window::WindowFunction::row_number(),
             vec![],
             vec![],
@@ -742,7 +777,7 @@ mod tests {
                 end_is_preceding: false,
             },
             false,
-        ));
+        )));
         let mut bindings = HashSet::new();
 
         assert!(manager.extract_bindings(&expression, &mut bindings));

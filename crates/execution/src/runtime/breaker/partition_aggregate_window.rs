@@ -770,11 +770,11 @@ mod tests {
             groups: Box::new([reference(0, LogicalType::Integer)]),
             group_key_encodings: Box::new([GroupKeyEncoding::Identity]),
             grouping_sets: Box::new([]),
-            aggregates: Box::new([Expression::Aggregate(AggregateExpression::new(
+            aggregates: Box::new([Expression::Aggregate(Box::new(AggregateExpression::new(
                 get_count_star_function(),
                 Vec::new(),
                 LogicalType::BigInt,
-            ))]),
+            )))]),
             grouping_functions: Box::new([]),
             aggregate_inputs: Box::new([Box::new([])]),
             aggregate_filters: Box::new([None]),

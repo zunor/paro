@@ -240,14 +240,14 @@ mod tests {
             .bind(std::slice::from_ref(&input_type))
             .unwrap();
         assert_eq!(targets, [input_type.clone()]);
-        let sum = Expression::Aggregate(AggregateExpression::new(
+        let sum = Expression::Aggregate(Box::new(AggregateExpression::new(
             function,
             vec![Expression::Reference(ReferenceExpression::new(
                 1,
                 input_type.clone(),
             ))],
             output_type.clone(),
-        ));
+        )));
         let mut aggregate = OwnedLogicalPlan::new(
             &ctx,
             LogicalOperator::Aggregate(Box::new(Aggregate::new(

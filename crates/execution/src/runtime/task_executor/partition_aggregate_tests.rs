@@ -194,14 +194,14 @@ fn global_filtered_count_window_spec() -> PartitionAggregateWindowSpec {
         .bind(&[LogicalType::Integer])
         .expect("bind count(integer)");
     assert_eq!(targets, vec![LogicalType::Integer]);
-    let aggregate = Expression::Aggregate(
+    let aggregate = Expression::Aggregate(Box::new(
         AggregateExpression::new(
             count,
             vec![reference(0, LogicalType::Integer)],
             LogicalType::BigInt,
         )
         .with_filter(Some(reference(1, LogicalType::Boolean))),
-    );
+    ));
     let input_types = Box::new([LogicalType::Integer, LogicalType::Boolean]);
     PartitionAggregateWindowSpec {
         domain: PartitionAggregateDomain::Global,
@@ -396,14 +396,14 @@ fn partition_aggregate_window_forced_external_preserves_filter_payload() {
         .bind(&[LogicalType::Integer])
         .expect("bind count(integer)");
     assert_eq!(targets, vec![LogicalType::Integer]);
-    let count = Expression::Aggregate(
+    let count = Expression::Aggregate(Box::new(
         AggregateExpression::new(
             count,
             vec![reference(1, LogicalType::Integer)],
             LogicalType::BigInt,
         )
         .with_filter(Some(reference(2, LogicalType::Boolean))),
-    );
+    ));
     let input_types = Box::new([
         LogicalType::Integer,
         LogicalType::Integer,

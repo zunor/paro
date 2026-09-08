@@ -171,7 +171,7 @@ impl Binder {
             self.wrap_plan(plan),
             Vec::new(),
             Vec::new(),
-            vec![Expression::Aggregate(count_agg)],
+            vec![Expression::Aggregate(Box::new(count_agg))],
             vec![],
         );
         let plan = LogicalOperator::Aggregate(Box::new(aggregate));
@@ -250,8 +250,8 @@ impl Binder {
             Vec::new(),
             Vec::new(),
             vec![
-                Expression::Aggregate(first_agg),
-                Expression::Aggregate(count_agg),
+                Expression::Aggregate(Box::new(first_agg)),
+                Expression::Aggregate(Box::new(count_agg)),
             ],
             vec![],
         );

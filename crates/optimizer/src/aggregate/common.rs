@@ -151,11 +151,11 @@ mod tests {
             .into_iter()
             .find(|function| function.arguments == [LogicalType::Double])
             .expect("count(double) overload");
-        Expression::Aggregate(AggregateExpression::new(
+        Expression::Aggregate(Box::new(AggregateExpression::new(
             function,
             vec![expression],
             LogicalType::BigInt,
-        ))
+        )))
     }
 
     fn random_call() -> Expression {
@@ -164,11 +164,11 @@ mod tests {
             .into_iter()
             .next()
             .expect("random overload");
-        Expression::Function(FunctionExpression::new(
+        Expression::Function(Box::new(FunctionExpression::new(
             function,
             vec![],
             LogicalType::Double,
-        ))
+        )))
     }
 
     #[test]
@@ -203,14 +203,14 @@ mod tests {
         let (max, _) = get_max_function()
             .bind(&[LogicalType::BigInt])
             .expect("bind max(bigint)");
-        let reducer = Expression::Aggregate(AggregateExpression::new(
+        let reducer = Expression::Aggregate(Box::new(AggregateExpression::new(
             max,
             vec![Expression::ColumnRef(ColumnRefExpression::new(
                 ColumnBinding::new(aggregate_index, 1),
                 LogicalType::BigInt,
             ))],
             LogicalType::BigInt,
-        ));
+        )));
         let predicate = Expression::Comparison(ComparisonExpression::new(
             ComparisonType::Equal,
             Expression::ColumnRef(ColumnRefExpression::new(

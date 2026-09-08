@@ -34,7 +34,7 @@ mod vector_index_statistics;
 
 pub use array_stats::{ArrayStatsData, ChildStats};
 pub use base_statistics::{BaseStatistics, StatsData};
-pub use column_statistics::ColumnStatistics;
+pub use column_statistics::{ColumnStatistics, DistinctEvidence, DistinctProvenance};
 pub use delete_statistics::DeleteStatistics;
 pub use distinct_statistics::DistinctStatistics;
 pub use fulltext_statistics::FullTextIndexStatistics;

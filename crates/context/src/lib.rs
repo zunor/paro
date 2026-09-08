@@ -51,7 +51,7 @@ pub use query_resources::{
     QueryResourceGovernance, QueryResources,
 };
 pub use runtime_limits::RuntimeLimits;
-pub use session_diagnostics::{OptimizerDiagnostic, SessionDiagnostics};
+pub use session_diagnostics::{OptimizerDiagnostic, OptimizerMetricUnit, SessionDiagnostics};
 pub use session_metadata::{
     CursorSummary, PreparedStatementSummary, SessionMetadataProvider, SessionMetadataRows,
     SettingRow,

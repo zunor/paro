@@ -67,7 +67,7 @@ impl Binder {
         info: BoundCreateViewInfo,
     ) -> Result<LogicalOperator> {
         let op = CreateView::new(info);
-        Ok(LogicalOperator::CreateView(op))
+        Ok(LogicalOperator::CreateView(Box::new(op)))
     }
 
     pub(crate) fn plan_drop(&mut self, info: BoundDropInfo) -> Result<LogicalOperator> {
@@ -80,7 +80,7 @@ impl Binder {
         info: BoundAlterEntryInfo,
     ) -> Result<LogicalOperator> {
         let op = Alter::new(info);
-        Ok(LogicalOperator::Alter(op))
+        Ok(LogicalOperator::Alter(Box::new(op)))
     }
 
     pub(crate) fn plan_create_property_graph(

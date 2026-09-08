@@ -51,7 +51,9 @@ export PARO_ALLOC_AUDIT
 
 .DEFAULT_GOAL := help
 
-.PHONY: setup run check bless calibrate bisect archive-manifest archive-recompute-calibration archive-finalize-calibration ci test ping clean clean-venv distclean help
+QUALITY_REPORT ?=
+QUALITY_BASELINE ?=
+.PHONY: setup run check bless calibrate bisect quality archive-manifest archive-recompute-calibration archive-finalize-calibration ci test ping clean clean-venv distclean help
 
 setup: ## Create .venv and install benchmark dependencies
 	@$(PYTHON_SYS) -m venv $(VENV_DIR)
@@ -143,6 +145,11 @@ ci: ## Run CI benchmark suite (default: SUITE=pr-smoke)
 
 test: ## Run benchmark harness unit tests
 	PYTHONPATH=.. $(PYTHON) -m unittest discover -s tests -p 'test_*.py' -v
+
+quality: ## Check estimate-vs-actual q-error (QUALITY_REPORT= QUALITY_BASELINE=)
+	PYTHONPATH=.. $(PYTHON) -m harness.quality_gate \
+		--report $(QUALITY_REPORT) \
+		$(if $(QUALITY_BASELINE),--baseline $(QUALITY_BASELINE))
 
 ping: ## Verify Paro connectivity from config.toml
 	@$(PYTHON) -c "\

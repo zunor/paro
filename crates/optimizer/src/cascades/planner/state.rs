@@ -130,6 +130,10 @@ impl PlannerPayloadArena {
 }
 
 pub(super) struct PlannerTransformState {
+    /// Planning-session arena.  Staged alternatives transfer their immutable
+    /// DAG slots here once and retain index-only edges across subsequent
+    /// Memo operations; it is intentionally not reconstructed per rule.
+    pub(super) staging_arena: paro_planner::plan::arena::LogicalPlanArena,
     pub(super) columns: ColumnCatalog,
     pub(super) scalars: ScalarArena,
     pub(super) binding_ids: BindingCatalog,
@@ -146,6 +150,10 @@ pub(super) struct PlannerTransformState {
     pub(super) cte_restrictions: Vec<super::transformation::cte::CteRestriction>,
     pub(super) cte_partition_labels: super::transformation::cte::PartitionLabels,
     pub(super) cte_bindings: Vec<super::transformation::cte::NativeCteBinding>,
+    /// Fingerprint buckets for CTE domain symbols.  Exact canonical-domain
+    /// comparison remains the collision check, but ordinary lookups no longer
+    /// scan every binding created earlier in the planning session.
+    pub(super) cte_binding_index: BTreeMap<(usize, crate::cascades::ids::Fingerprint), Vec<usize>>,
     pub(super) settlement_cache: super::transformation::settlement::SettlementCache,
     pub(super) binder: Option<Binder>,
     pub(super) bind_context: BindContext,
@@ -157,6 +165,7 @@ pub(super) struct PlannerTransformState {
 }
 
 pub(super) struct PlannerTransformSavepoint {
+    staging_arena_checkpoint: paro_planner::plan::arena::PlanArenaCheckpoint,
     column_count: usize,
     scalar_count: usize,
     binding_checkpoint: usize,
@@ -166,11 +175,22 @@ pub(super) struct PlannerTransformSavepoint {
     metadata_runtime_filter_change_count: usize,
     join_region_insertion_count: usize,
     cte_restriction_count: usize,
+    cte_binding_count: usize,
 }
 
 impl PlannerTransformState {
+    pub(super) fn cte_partition_state_mut(
+        &mut self,
+    ) -> (
+        &mut super::transformation::cte::PartitionLabels,
+        &mut paro_planner::plan::arena::LogicalPlanArena,
+    ) {
+        (&mut self.cte_partition_labels, &mut self.staging_arena)
+    }
+
     pub(super) fn savepoint(&self) -> PlannerTransformSavepoint {
         PlannerTransformSavepoint {
+            staging_arena_checkpoint: self.staging_arena.checkpoint(),
             column_count: self.columns.len(),
             scalar_count: self.scalars.len(),
             binding_checkpoint: self.binding_ids.checkpoint(),
@@ -180,12 +200,30 @@ impl PlannerTransformState {
             metadata_runtime_filter_change_count: self.metadata_runtime_filter_changes.len(),
             join_region_insertion_count: self.join_region_insertions.len(),
             cte_restriction_count: self.cte_restrictions.len(),
+            cte_binding_count: self.cte_bindings.len(),
         }
     }
 
     pub(super) fn rollback_to(&mut self, savepoint: PlannerTransformSavepoint) -> Result<()> {
+        self.staging_arena
+            .rollback_to(savepoint.staging_arena_checkpoint)?;
+        self.settlement_cache
+            .discard_stale_recipes(&self.staging_arena);
         self.cte_restrictions
             .truncate(savepoint.cte_restriction_count);
+        if savepoint.cte_binding_count > self.cte_bindings.len() {
+            return Err(paro_error::internal(
+                "planner CTE binding rollback exceeds its append journal",
+            ));
+        }
+        self.cte_bindings.truncate(savepoint.cte_binding_count);
+        // The index stores append-only binding ordinals.  Truncate its
+        // buckets together with the binding vector so a rolled-back symbol
+        // can never be returned by a later fingerprint lookup.
+        self.cte_binding_index.retain(|_, indices| {
+            indices.retain(|index| *index < savepoint.cte_binding_count);
+            !indices.is_empty()
+        });
         while self.join_region_insertions.len() > savepoint.join_region_insertion_count {
             let key = self
                 .join_region_insertions

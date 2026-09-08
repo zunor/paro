@@ -74,14 +74,14 @@ fn length_expr() -> Expression {
             vec![None],
         ))
         .expect("length binding should succeed");
-    Expression::Function(FunctionExpression::new(
+    Expression::Function(Box::new(FunctionExpression::new(
         function,
         vec![Expression::Reference(ReferenceExpression::new(
             0,
             LogicalType::Varchar,
         ))],
         LogicalType::BigInt,
-    ))
+    )))
 }
 
 #[divan::bench(sample_count = 10)]

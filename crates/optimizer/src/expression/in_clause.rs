@@ -231,7 +231,7 @@ impl InClauseRewriter {
                 Expression::Aggregate(aggregate)
             }
             Expression::Window(window) => {
-                Expression::Window(self.rewrite_window_expression(window))
+                Expression::Window(Box::new(self.rewrite_window_expression(*window)))
             }
             Expression::Subquery(mut subquery) => {
                 subquery.children = subquery

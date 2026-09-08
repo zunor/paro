@@ -46,21 +46,76 @@ struct LocalKey {
 /// overwhelmingly common first-visit path.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
 struct LocalShape {
-    operator_tag: u64,
+    operator_tag: Fingerprint,
     inputs: Box<[FactId]>,
     input_stats: NodeStats,
 }
 
-fn operator_shape_tag<Child>(operator: &LogicalOperator<Child>) -> u64 {
+fn operator_shape_tag<Child>(
+    operator: &LogicalOperator<Child>,
+    scalars: &ScalarArena,
+) -> Result<Fingerprint> {
+    // Scalar-free shells can be fingerprinted without cloning or interning
+    // their children. Reuse the canonical operator encoding so a fast hit is
+    // never allowed to alias two filters/orders that differ only in their
+    // output projection map.
+    if operator_has_no_scalar_payload(operator)
+        && !matches!(operator, LogicalOperator::BoundReference(_))
+    {
+        let fingerprint = query_operator_fingerprint_only(operator, &[], scalars)?;
+        let mut builder = StableFingerprintBuilder::default();
+        builder.write_bytes(b"paro.settlement-local-shape.v2");
+        builder.write_fingerprint(fingerprint);
+        match operator {
+            LogicalOperator::Filter(filter) => {
+                encode_projection_map(&mut builder, &filter.projection_map)
+            }
+            LogicalOperator::Order(order) => {
+                encode_projection_map(&mut builder, &order.projection_map)
+            }
+            LogicalOperator::TopN(topn) => {
+                encode_projection_map(&mut builder, &topn.projection_map)
+            }
+            _ => {}
+        }
+        return Ok(builder.finish());
+    }
+    let mut builder = StableFingerprintBuilder::default();
+    builder.write_bytes(b"paro.settlement-local-shape.v2");
     let mut hasher = std::collections::hash_map::DefaultHasher::new();
     std::mem::discriminant(operator).hash(&mut hasher);
-    hasher.finish()
+    builder.write_u64(hasher.finish());
+    Ok(builder.finish())
+}
+
+/// Operators in this set carry no scalar expression roots.  Their cache key
+/// can be encoded directly from the borrowed shell, so a hit does not clone a
+/// 2KB logical operator merely to discover that no scalar interning is needed.
+fn operator_has_no_scalar_payload<Child>(operator: &LogicalOperator<Child>) -> bool {
+    match operator {
+        LogicalOperator::Get(get) => get.runtime_filter_expressions.is_empty(),
+        LogicalOperator::Filter(filter) => filter.expressions.is_empty(),
+        LogicalOperator::Projection(projection) => projection.expressions.is_empty(),
+        LogicalOperator::RowFetch(_) => true,
+        LogicalOperator::Limit(_) => true,
+        LogicalOperator::Order(order) => order.orders.is_empty(),
+        LogicalOperator::TopN(topn) => topn.orders.is_empty(),
+        LogicalOperator::Distinct(distinct) => distinct.order_by.is_none(),
+        LogicalOperator::EmptyResult(_)
+        | LogicalOperator::MaterializedCTE(_)
+        | LogicalOperator::RecursiveCTE(_)
+        | LogicalOperator::CTERef(_)
+        | LogicalOperator::SetOperation(_)
+        | LogicalOperator::DummyScan => true,
+        _ => false,
+    }
 }
 
 #[derive(Debug, Clone)]
 struct SettledLocal {
     recipe: PlanIndex,
     facts: FactId,
+    shape: LocalShape,
     /// Statistics needed by this operator's expressions, including columns
     /// which are consumed locally but not returned by its projection map.
     statistics: SharedColumnStatistics,
@@ -71,12 +126,28 @@ pub(in crate::cascades::planner) struct SettlementCache {
     columns: ColumnCatalog,
     bindings: BindingCatalog,
     scalars: ScalarArena,
-    recipes: LogicalPlanArena,
     locals: BTreeMap<LocalKey, SettledLocal>,
     local_shapes: BTreeSet<LocalShape>,
+    /// Exact scalar-free shape buckets used for an allocation-free cache hit.
+    /// The BTreeSet above remains the cheap negative filter for scalar-bearing
+    /// operators whose full identity depends on interned expression roots.
+    local_shape_entries: BTreeMap<LocalShape, Vec<SettledLocal>>,
     facts: Vec<RelationFacts>,
     facts_by_columns: BTreeMap<Box<[usize]>, Vec<FactId>>,
-    column_values: HashMap<(LogicalType, Vec<u8>, usize, Option<u64>), usize>,
+    /// Interned column facts include evidence provenance, not just the
+    /// serialized storage payload.  The latter intentionally omits planner
+    /// metadata such as partial coverage, so two byte-identical sketches can
+    /// still have different proof contracts (ObservedFull vs
+    /// ObservedPartial/Derived) and must never share a ColumnId.
+    column_values: HashMap<
+        (
+            LogicalType,
+            Vec<u8>,
+            paro_storage::statistics::DistinctEvidence,
+            bool,
+        ),
+        usize,
+    >,
     /// Pointer fast path for live statistics allocations.  A `Weak` keeps
     /// the cache from pinning every column fact for the lifetime of the
     /// planner session while still making address reuse safe: an upgraded
@@ -85,6 +156,8 @@ pub(in crate::cascades::planner) struct SettlementCache {
     scan_bindings: demand::ScanBindings,
     pub(in crate::cascades::planner) hits: u64,
     pub(in crate::cascades::planner) misses: u64,
+    #[cfg(test)]
+    test_arena: LogicalPlanArena,
 }
 
 pub(super) struct SettledExpression<Plan = paro_planner::plan::LogicalPlan> {
@@ -93,61 +166,52 @@ pub(super) struct SettledExpression<Plan = paro_planner::plan::LogicalPlan> {
     pub(super) scopes: HashMap<PlanNodeId, SharedColumnStatistics>,
 }
 
+fn intern_columns_into(
+    bindings: &mut BindingCatalog,
+    columns: &mut ColumnCatalog,
+    layout: &LogicalOutputLayout,
+) -> Result<Box<[ColumnId]>> {
+    layout
+        .bindings()
+        .iter()
+        .zip(layout.types())
+        .map(|(binding, ty)| {
+            if let Some(id) = bindings.get(binding.table_index, binding.column_index, ty) {
+                return Ok(*id);
+            }
+            let column = columns.intern(
+                ty.clone(),
+                true,
+                ColumnOrigin::Internal {
+                    key: Fingerprint(columns.len() as u128),
+                },
+                ColumnVisibility::Visible,
+                None,
+            )?;
+            bindings.insert(binding.table_index, binding.column_index, ty, column)?;
+            Ok(column)
+        })
+        .collect()
+}
+
 impl SettlementCache {
-    fn intern_columns(&mut self, layout: &LogicalOutputLayout) -> Result<Box<[ColumnId]>> {
-        layout
-            .bindings()
-            .iter()
-            .zip(layout.types())
-            .map(|(binding, ty)| {
-                if let Some(id) = self
-                    .bindings
-                    .get(binding.table_index, binding.column_index, ty)
-                {
-                    return Ok(*id);
-                }
-                // This private arena's exact binding interner owns the identity.
-                // The ordinal is never used as a semantic or scheduling priority.
-                let column = self.columns.intern(
-                    ty.clone(),
-                    true,
-                    ColumnOrigin::Internal {
-                        key: Fingerprint(self.columns.len() as u128),
-                    },
-                    ColumnVisibility::Visible,
-                    None,
-                )?;
-                self.bindings
-                    .insert(binding.table_index, binding.column_index, ty, column)?;
-                Ok(column)
-            })
-            .collect()
+    pub(in crate::cascades::planner) fn discard_stale_recipes(&mut self, arena: &LogicalPlanArena) {
+        self.locals.retain(|_, entry| arena.owns(entry.recipe));
+        // A shape is only a fast negative filter. Rebuild it from the live
+        // recipes after rollback so a stale shape can never turn a future
+        // first visit into an incorrect cache hit.
+        self.local_shapes.clear();
+        self.local_shape_entries.clear();
+        for entry in self.locals.values() {
+            self.local_shapes.insert(entry.shape.clone());
+            self.local_shape_entries
+                .entry(entry.shape.clone())
+                .or_default()
+                .push(entry.clone());
+        }
     }
 
     fn intern_fact(&mut self, mut fact: RelationFacts) -> Result<FactId> {
-        // Every consumer of this boundary, including expression costing and
-        // join estimation through the local statistics map, sees the same
-        // row-domain estimate. Capping only BoundReference transport would
-        // leave those direct readers with the pre-filter storage NDV.
-        if let Some(rows) = fact.stats.estimated_cardinality {
-            for column in &mut fact.columns {
-                // The point estimate is not a proof of the row domain.  A
-                // filter or aggregate may be underestimated while its HLL
-                // still carries a useful observed value domain.  Restricting
-                // NDV to the envelope's upper edge preserves that evidence
-                // and keeps expected/risk costing separate from hard facts.
-                if column.get_distinct_count() as u64 > rows.max {
-                    let mut bounded = ColumnStatistics::with_estimated_distinct(
-                        column.statistics().clone(),
-                        Some(rows.max as usize),
-                    );
-                    if let Some(upper) = column.guaranteed_distinct_upper() {
-                        bounded = bounded.with_guaranteed_distinct_upper(upper);
-                    }
-                    *column = Arc::new(bounded);
-                }
-            }
-        }
         let mut columns = Vec::with_capacity(fact.columns.len());
         for column in &fact.columns {
             let pointer = Arc::as_ptr(column) as usize;
@@ -190,8 +254,8 @@ impl SettlementCache {
         let key = (
             column.statistics().get_type().clone(),
             column.to_bytes()?,
-            column.get_distinct_count(),
-            column.guaranteed_distinct_upper(),
+            column.distinct_evidence(),
+            column.is_storage_observation(),
         );
         let next = self.column_values.len();
         let id = *self.column_values.entry(key).or_insert(next);
@@ -219,12 +283,15 @@ impl SettlementCache {
                     expected_distinct: u64::try_from(column.get_distinct_count())
                         .ok()
                         .filter(|value| *value > 0)
-                        .map(|distinct| {
-                            fact.stats
-                                .estimated_cardinality
-                                .map_or(distinct, |rows| distinct.min(rows.max))
-                        }),
+                        // An estimated row point is not a semantic upper
+                        // bound.  Only `fact.maximum` is proof-backed and
+                        // may constrain a distinct domain; preserving the
+                        // estimator point prevents low-cardinality columns
+                        // from collapsing when a sibling alternative has a
+                        // one-row estimate.
+                        .map(|distinct| fact.maximum.map_or(distinct, |rows| distinct.min(rows))),
                     guaranteed_distinct_upper: column.guaranteed_distinct_upper(),
+                    provenance: column.distinct_evidence().provenance,
                 },
             )
             .collect();
@@ -252,44 +319,102 @@ impl SettlementCache {
         inputs: &[FactId],
         ctes: &CteEnvironment,
         environment: &PlannerRuleEnvironment,
+        recipes: &mut LogicalPlanArena,
     ) -> Result<SettledLocal> {
+        let scalar_free = operator_has_no_scalar_payload(&shell.operator);
         let shape = LocalShape {
-            operator_tag: operator_shape_tag(&shell.operator),
+            operator_tag: operator_shape_tag(&shell.operator, &self.scalars)?,
             inputs: inputs.into(),
             input_stats: shell.stats.clone(),
         };
+        // A scalar-free shell has a complete identity before output layouts
+        // or column/scalar catalogs are touched. Probe the exact shape bucket
+        // first; only a surviving recipe in the caller's arena may be
+        // returned. This removes the dominant hit-path copies while keeping a
+        // full-key fallback for scalar-bearing or CTE-environment-sensitive
+        // operators.
+        if scalar_free && !matches!(shell.operator, LogicalOperator::CTERef(_)) {
+            let candidate = self
+                .local_shape_entries
+                .get(&shape)
+                .into_iter()
+                .flat_map(|entries| entries.iter())
+                // The map key already proves the complete cheap shape.  Do
+                // not recompute the operator fingerprint for every hit; only
+                // the arena ownership and borrowed output-layout contract
+                // remain to be checked before reusing the cached local.
+                .find(|entry| recipes.owns(entry.recipe))
+                .cloned();
+            if let Some(entry) = candidate {
+                // The shape tag is intentionally cheap and therefore only a
+                // necessary condition.  Re-derive the output layout from the
+                // current child facts before publishing a hit.  This is a
+                // small borrowed-layout operation (and is skipped entirely
+                // on the miss path until the full recipe is needed), but it
+                // prevents a future operator/layout contract drift from
+                // aliasing two scalar-free locals in the same bucket.
+                let layout_matches =
+                    recipes
+                        .output_layout(entry.recipe)
+                        .ok()
+                        .is_some_and(|cached| {
+                            self.output_layout_matches(&shell.operator, inputs, cached)
+                        });
+                if layout_matches {
+                    self.hits += 1;
+                    return Ok(entry);
+                }
+            }
+        }
         let maybe_cached = self.local_shapes.contains(&shape);
-        let child_layouts = inputs
+        let child_layout_refs = inputs
             .iter()
-            .map(|id| self.facts[*id].layout.clone())
+            .map(|id| &self.facts[*id].layout)
             .collect::<Vec<_>>();
         let child_maxima = inputs
             .iter()
             .map(|id| self.facts[*id].maximum)
             .collect::<Vec<_>>();
-        let output = shell.operator.output_layout_from_children(&child_layouts);
-        let output_columns = self.intern_columns(&output)?;
-        let child_columns = child_layouts
+        let output = shell
+            .operator
+            .output_layout_from_child_refs(&child_layout_refs);
+        drop(child_layout_refs);
+        let output_columns = intern_columns_into(&mut self.bindings, &mut self.columns, &output)?;
+        let child_columns = inputs
             .iter()
-            .map(|layout| self.intern_columns(layout))
+            .map(|id| {
+                intern_columns_into(
+                    &mut self.bindings,
+                    &mut self.columns,
+                    &self.facts[*id].layout,
+                )
+            })
             .collect::<Result<Vec<_>>>()?;
-        let mut operator = shell.operator.clone();
-        let roots = intern_operator_scalars(
-            &mut operator,
-            &output_columns,
-            &child_columns,
-            &mut self.bindings,
-            &mut self.columns,
-            &mut self.scalars,
-        )?;
-        let cte = if let LogicalOperator::CTERef(reference) = &operator {
+        let (_operator, roots, operator_identity) = if scalar_free {
+            let roots: Box<[ScalarExprId]> = Box::new([]);
+            let identity = query_operator_identity(&shell.operator, &roots, &self.scalars)?.1;
+            (None, roots, identity)
+        } else {
+            let mut operator = shell.operator.clone();
+            let roots = intern_operator_scalars(
+                &mut operator,
+                &output_columns,
+                &child_columns,
+                &mut self.bindings,
+                &mut self.columns,
+                &mut self.scalars,
+            )?;
+            let identity = query_operator_identity(&operator, &roots, &self.scalars)?.1;
+            (Some(operator), roots, identity)
+        };
+        let cte = if let LogicalOperator::CTERef(reference) = &shell.operator {
             ctes.get(&reference.cte_index)
                 .map(|fact| (reference.cte_index, *fact))
         } else {
             None
         };
         let key = LocalKey {
-            operator: query_operator_identity(&operator, &roots, &self.scalars)?.1,
+            operator: operator_identity,
             scalars: roots,
             output: output_columns,
             inputs: inputs.into(),
@@ -303,6 +428,10 @@ impl SettlementCache {
             }
         }
         self.misses += 1;
+        let child_layouts = inputs
+            .iter()
+            .map(|id| self.facts[*id].layout.clone())
+            .collect::<Vec<_>>();
         let mut plan = shell.assemble(
             inputs
                 .iter()
@@ -364,11 +493,16 @@ impl SettlementCache {
                 paro_error::internal("settlement boundary reference is outside its input set")
             })?;
             let entry = SettledLocal {
-                recipe: self.recipes.import(plan)?,
+                recipe: recipes.import(plan)?,
                 facts,
+                shape: shape.clone(),
                 statistics: context.column_stats,
             };
             self.local_shapes.insert(shape);
+            self.local_shape_entries
+                .entry(entry.shape.clone())
+                .or_default()
+                .push(entry.clone());
             self.locals.insert(key, entry.clone());
             return Ok(entry);
         }
@@ -412,13 +546,34 @@ impl SettlementCache {
             column_ids: Box::new([]),
         })?;
         let entry = SettledLocal {
-            recipe: self.recipes.import(plan)?,
+            recipe: recipes.import(plan)?,
             facts,
+            shape: shape.clone(),
             statistics: context.column_stats,
         };
         self.local_shapes.insert(shape);
+        self.local_shape_entries
+            .entry(entry.shape.clone())
+            .or_default()
+            .push(entry.clone());
         self.locals.insert(key, entry.clone());
         Ok(entry)
+    }
+
+    fn output_layout_matches<Child>(
+        &self,
+        operator: &LogicalOperator<Child>,
+        inputs: &[FactId],
+        cached: &LogicalOutputLayout,
+    ) -> bool {
+        let child_layouts = inputs
+            .iter()
+            .filter_map(|id| self.facts.get(*id).map(|fact| &fact.layout))
+            .collect::<Vec<_>>();
+        if child_layouts.len() != inputs.len() {
+            return false;
+        }
+        operator.output_layout_from_child_refs(&child_layouts) == *cached
     }
 
     #[cfg(test)]
@@ -435,20 +590,53 @@ impl SettlementCache {
         })
     }
 
+    #[cfg(test)]
     pub(super) fn settle_arena(
         &mut self,
         plan: OwnedLogicalPlan,
         environment: &PlannerRuleEnvironment,
+    ) -> Result<SettledExpression> {
+        let mut arena = std::mem::take(&mut self.test_arena);
+        let result = self.settle_arena_in(plan, environment, &mut arena);
+        self.test_arena = arena;
+        result
+    }
+
+    /// Settle into a caller-owned planning-session arena.  The returned plan
+    /// retains a cheap copy-on-write handle to that arena, while cached local
+    /// recipes and newly settled nodes use one index space.  The caller's
+    /// savepoint can therefore roll back all unpublished slots atomically.
+    pub(super) fn settle_arena_in(
+        &mut self,
+        plan: OwnedLogicalPlan,
+        environment: &PlannerRuleEnvironment,
+        arena: &mut LogicalPlanArena,
+    ) -> Result<SettledExpression> {
+        let checkpoint = arena.checkpoint();
+        let result = self.settle_arena_impl(plan, environment, arena);
+        if result.is_err() {
+            arena.rollback_to(checkpoint)?;
+        }
+        result
+    }
+
+    fn settle_arena_impl(
+        &mut self,
+        plan: OwnedLogicalPlan,
+        environment: &PlannerRuleEnvironment,
+        arena: &mut LogicalPlanArena,
     ) -> Result<SettledExpression> {
         enum Task {
             Enter(PlanIndex, CteEnvironment),
             Consumer(PlanIndex, usize, CteEnvironment),
             Finish(PlanIndex, CteEnvironment, usize),
         }
-        let mut input = LogicalPlanArena::default();
-        let root = input.import_checked(plan, || environment.session.cancellation.check())?;
-        let demands = demand::derive(&input, root, environment)?;
-        let mut result = LogicalPlanArena::default();
+        let root = arena.import_checked(plan, || environment.session.cancellation.check())?;
+        let demands = demand::derive(arena, root, environment)?;
+        // Keep the imported source DAG and settled output in one arena.  The
+        // source edges are immutable and remain valid while settled nodes are
+        // appended, so settlement no longer allocates a second arena or
+        // copies the complete input DAG before publishing the result.
         let mut pending = vec![Task::Enter(root, Arc::default())];
         let mut completed = Vec::<(
             PlanIndex,
@@ -461,7 +649,7 @@ impl SettlementCache {
             environment.session.cancellation.check()?;
             match task {
                 Task::Enter(index, ctes) => {
-                    let node = input.get(index)?;
+                    let node = arena.get(index)?;
                     let mut children = Vec::new();
                     node.operator
                         .visit_child_links(&mut |child| children.push(*child));
@@ -487,7 +675,7 @@ impl SettlementCache {
                     pending.push(Task::Enter(index, ctes));
                 }
                 Task::Finish(index, ctes, arity) => {
-                    let mut node = input.get(index)?.clone();
+                    let mut node = arena.get(index)?.clone();
                     let start = completed
                         .len()
                         .checked_sub(arity)
@@ -525,7 +713,7 @@ impl SettlementCache {
                             .iter()
                             .map(|binding| (*binding, *binding))
                             .collect();
-                        completed.push((result.append(node)?, facts, statistics, aliases));
+                        completed.push((arena.append(node)?, facts, statistics, aliases));
                         continue;
                     }
                     let mut before = Vec::new();
@@ -565,10 +753,11 @@ impl SettlementCache {
                             .collect::<Vec<_>>(),
                         &ctes,
                         environment,
+                        arena,
                     )?;
                     let mut remapped = BTreeMap::new();
-                    for recipe_index in self.recipes.post_order(local.recipe)? {
-                        let recipe = self.recipes.get(recipe_index)?.clone();
+                    for recipe_index in arena.post_order(local.recipe)? {
+                        let recipe = arena.get(recipe_index)?.clone();
                         if let LogicalOperator::BoundReference(reference) = &recipe.operator {
                             let ordinal = reference.reference_id.input_ordinal_value()?;
                             let child = children.get(ordinal).ok_or_else(|| {
@@ -584,7 +773,7 @@ impl SettlementCache {
                         })?;
                         let id = environment.bind_context.next_plan_id();
                         scopes.insert(id, local.statistics.clone());
-                        let mapped = result.append(LogicalPlanNode {
+                        let mapped = arena.append(LogicalPlanNode {
                             id,
                             stats: recipe.stats,
                             operator,
@@ -605,7 +794,7 @@ impl SettlementCache {
         }
         let (root, _, statistics, _) = completed.pop().unwrap();
         Ok(SettledExpression {
-            plan: paro_planner::plan::LogicalPlan::new(result, root)?,
+            plan: paro_planner::plan::LogicalPlan::new(arena.clone(), root)?,
             statistics,
             scopes,
         })
@@ -669,7 +858,7 @@ mod tests {
     }
 
     #[test]
-    fn a_local_boundary_caps_expected_ndv_without_inventing_a_hard_bound() {
+    fn a_local_boundary_preserves_expected_ndv_without_inventing_a_hard_bound() {
         let mut cache = SettlementCache::default();
         let facts = cache
             .intern_fact(RelationFacts {
@@ -689,7 +878,7 @@ mod tests {
                 column_ids: Box::new([]),
             })
             .unwrap();
-        assert_eq!(cache.facts[facts].columns[0].get_distinct_count(), 100);
+        assert_eq!(cache.facts[facts].columns[0].get_distinct_count(), 10_000);
         assert_eq!(
             cache.facts[facts].columns[0].guaranteed_distinct_upper(),
             None
@@ -700,7 +889,7 @@ mod tests {
         };
         assert_eq!(
             reference.facts.column_domains[0].expected_distinct,
-            Some(100)
+            Some(10_000)
         );
         assert_eq!(
             reference.facts.column_domains[0].guaranteed_distinct_upper,
@@ -771,6 +960,37 @@ mod tests {
         assert_ne!(first.plan.id, second.plan.id);
         assert_eq!(first.plan.stats, second.plan.stats);
         assert_eq!(second.plan.stats.estimated_cardinality.unwrap().expected, 3);
+    }
+
+    #[test]
+    fn column_fact_interning_keeps_distinct_proof_provenance_separate() {
+        let hashes: Vec<u64> = (0..32u64)
+            .map(|value| value.wrapping_mul(0x9e37_79b9_7f4a_7c15))
+            .collect();
+        let mut full = ColumnStatistics::new(
+            paro_storage::statistics::BaseStatistics::create_empty(LogicalType::Integer),
+        )
+        .with_storage_observation();
+        full.update_distinct_statistics(&hashes, hashes.len());
+
+        let mut partial = full.copy();
+        let unknown = ColumnStatistics::with_distinct(
+            paro_storage::statistics::BaseStatistics::create_empty(LogicalType::Integer),
+            None,
+        );
+        partial.merge_with_coverage(&unknown, hashes.len() as u64, 128);
+        partial = partial.with_storage_observation();
+
+        assert_ne!(
+            full.distinct_evidence(),
+            partial.distinct_evidence(),
+            "partial coverage is a different proof contract even when the sketch bytes match"
+        );
+
+        let mut cache = SettlementCache::default();
+        let full_id = cache.intern_column_value(&Arc::new(full)).unwrap();
+        let partial_id = cache.intern_column_value(&Arc::new(partial)).unwrap();
+        assert_ne!(full_id, partial_id);
     }
 
     #[test]

@@ -5,7 +5,7 @@
 
 use crate::plan::{CardinalityEstimate, UniqueKey};
 use paro_common::types::LogicalType;
-use paro_storage::statistics::{BaseStatistics, ColumnStatistics};
+use paro_storage::statistics::{BaseStatistics, ColumnStatistics, DistinctProvenance};
 use std::sync::Arc;
 
 use super::ColumnBinding;
@@ -188,6 +188,10 @@ impl Default for BoundRelationFacts {
 pub struct BoundColumnDomain {
     pub expected_distinct: Option<u64>,
     pub guaranteed_distinct_upper: Option<u64>,
+    /// Provenance of the ranking point. Bound references remain planner-owned
+    /// facts; consumers requiring a complete observed domain must check this
+    /// explicitly instead of inferring it from `expected_distinct`.
+    pub provenance: DistinctProvenance,
 }
 
 impl BoundReference {
@@ -210,11 +214,12 @@ impl BoundReference {
                     .map(|value| value.statistics().clone())
                     .unwrap_or_else(|| BaseStatistics::create_unknown(ty.clone()));
                 base.set_distinct_count(0);
-                let mut column = ColumnStatistics::with_estimated_distinct(
+                let mut column = ColumnStatistics::with_estimated_distinct_provenance(
                     base,
                     domain
                         .expected_distinct
                         .map(|distinct| usize::try_from(distinct).unwrap_or(usize::MAX)),
+                    domain.provenance,
                 );
                 if let Some(upper) = domain.guaranteed_distinct_upper {
                     column = column.with_guaranteed_distinct_upper(upper);

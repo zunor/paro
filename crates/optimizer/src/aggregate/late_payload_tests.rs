@@ -91,11 +91,11 @@ fn candidate(order_by_payload: bool) -> OwnedLogicalPlan {
             column(SOURCE, 2, LogicalType::Varchar),
         ],
         vec![],
-        vec![Expression::Aggregate(AggregateExpression::new(
+        vec![Expression::Aggregate(Box::new(AggregateExpression::new(
             sum,
             vec![column(SOURCE, 3, LogicalType::Integer)],
             LogicalType::BigInt,
-        ))],
+        )))],
         vec![],
     );
     aggregate.group_dependencies.push(GroupDependency {

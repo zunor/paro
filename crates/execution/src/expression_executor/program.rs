@@ -1219,11 +1219,11 @@ mod tests {
             collision_dispatch,
         ))
         .with_bind_data(CollidingBindData(id));
-        Expression::Function(FunctionExpression::new(
+        Expression::Function(Box::new(FunctionExpression::new(
             function,
             vec![reference(0, LogicalType::Integer)],
             LogicalType::Integer,
-        ))
+        )))
     }
 
     #[test]
@@ -1272,44 +1272,45 @@ mod tests {
             scale: 2,
         };
         let discount = bind_decimal("-", &[LogicalType::Integer, factor_type.clone()]);
-        let discount_expr = Expression::Function(FunctionExpression::new(
+        let discount_expr = Expression::Function(Box::new(FunctionExpression::new(
             discount.clone(),
             vec![integer_one(), reference(1, factor_type.clone())],
             discount.return_type.clone(),
-        ));
+        )));
         let discounted_price =
             bind_decimal("*", &[price_type.clone(), discount.return_type.clone()]);
-        let discounted_price_expr = Expression::Function(FunctionExpression::new(
+        let discounted_price_expr = Expression::Function(Box::new(FunctionExpression::new(
             discounted_price.clone(),
             vec![reference(0, price_type.clone()), discount_expr],
             discounted_price.return_type.clone(),
-        ));
+        )));
 
         // Bind an equivalent producer independently. Semantic bind-data
         // fingerprints, rather than Arc identity, must still expose the common
         // subexpression used by the output root and the charge expression.
         let discount_for_charge = bind_decimal("-", &[LogicalType::Integer, factor_type.clone()]);
-        let discount_for_charge_expr = Expression::Function(FunctionExpression::new(
+        let discount_for_charge_expr = Expression::Function(Box::new(FunctionExpression::new(
             discount_for_charge.clone(),
             vec![integer_one(), reference(1, factor_type.clone())],
             discount_for_charge.return_type.clone(),
-        ));
+        )));
         let discounted_price_for_charge = bind_decimal(
             "*",
             &[price_type.clone(), discount_for_charge.return_type.clone()],
         );
-        let discounted_price_for_charge_expr = Expression::Function(FunctionExpression::new(
-            discounted_price_for_charge.clone(),
-            vec![reference(0, price_type), discount_for_charge_expr],
-            discounted_price_for_charge.return_type.clone(),
-        ));
+        let discounted_price_for_charge_expr =
+            Expression::Function(Box::new(FunctionExpression::new(
+                discounted_price_for_charge.clone(),
+                vec![reference(0, price_type), discount_for_charge_expr],
+                discounted_price_for_charge.return_type.clone(),
+            )));
 
         let tax = bind_decimal("+", &[factor_type.clone(), LogicalType::Integer]);
-        let tax_expr = Expression::Function(FunctionExpression::new(
+        let tax_expr = Expression::Function(Box::new(FunctionExpression::new(
             tax.clone(),
             vec![reference(2, factor_type), integer_one()],
             tax.return_type.clone(),
-        ));
+        )));
         let charge = bind_decimal(
             "*",
             &[
@@ -1317,11 +1318,11 @@ mod tests {
                 tax.return_type.clone(),
             ],
         );
-        let charge_expr = Expression::Function(FunctionExpression::new(
+        let charge_expr = Expression::Function(Box::new(FunctionExpression::new(
             charge.clone(),
             vec![discounted_price_for_charge_expr, tax_expr],
             charge.return_type.clone(),
-        ));
+        )));
 
         let program = PhysicalExpressionProgram::compile(
             &[discounted_price_expr, charge_expr],
@@ -1358,32 +1359,32 @@ mod tests {
             scale: 2,
         };
         let discount = bind_decimal("-", &[LogicalType::Integer, rate.clone()]);
-        let discount_expr = Expression::Function(FunctionExpression::new(
+        let discount_expr = Expression::Function(Box::new(FunctionExpression::new(
             discount.clone(),
             vec![integer_one(), reference(1, rate)],
             discount.return_type.clone(),
-        ));
+        )));
         let revenue = bind_decimal("*", &[money.clone(), discount.return_type.clone()]);
-        let revenue_expr = Expression::Function(FunctionExpression::new(
+        let revenue_expr = Expression::Function(Box::new(FunctionExpression::new(
             revenue.clone(),
             vec![reference(0, money.clone()), discount_expr],
             revenue.return_type.clone(),
-        ));
+        )));
         let cost = bind_decimal("*", &[money.clone(), money.clone()]);
-        let cost_expr = Expression::Function(FunctionExpression::new(
+        let cost_expr = Expression::Function(Box::new(FunctionExpression::new(
             cost.clone(),
             vec![reference(2, money.clone()), reference(3, money)],
             cost.return_type.clone(),
-        ));
+        )));
         let profit = bind_decimal(
             "-",
             &[revenue.return_type.clone(), cost.return_type.clone()],
         );
-        let profit_expr = Expression::Function(FunctionExpression::new(
+        let profit_expr = Expression::Function(Box::new(FunctionExpression::new(
             profit.clone(),
             vec![revenue_expr, cost_expr],
             profit.return_type.clone(),
-        ));
+        )));
 
         let program = PhysicalExpressionProgram::compile(
             &[profit_expr],

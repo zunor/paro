@@ -241,13 +241,13 @@ impl<'a> ExternalRoutineLowerer<'a> {
         let mut expressions = window
             .expressions
             .into_iter()
-            .map(Expression::Window)
+            .map(|expression| Expression::Window(Box::new(expression)))
             .collect::<Vec<_>>();
         let child = self.lower_external_in_expression_vec(*window.child, &mut expressions)?;
         window.expressions = expressions
             .into_iter()
             .map(|expr| match expr {
-                Expression::Window(window_expr) => window_expr,
+                Expression::Window(window_expr) => *window_expr,
                 other => unreachable!("window lowering produced non-window expression: {other:?}"),
             })
             .collect();
@@ -693,7 +693,7 @@ impl<'a> ExternalRoutineLowerer<'a> {
                     .expressions
                     .iter()
                     .cloned()
-                    .map(Expression::Window)
+                    .map(|expression| Expression::Window(Box::new(expression)))
                     .collect::<Vec<_>>();
                 self.ensure_expressions_are_native("WINDOW", expressions.iter())
             }
@@ -900,11 +900,11 @@ mod tests {
             return_type.clone(),
             noop_scalar_execute,
         );
-        Expression::Function(paro_planner::expression::FunctionExpression::new(
+        Expression::Function(Box::new(paro_planner::expression::FunctionExpression::new(
             function,
             vec![left, right],
             return_type,
-        ))
+        )))
     }
 
     fn external_call(
@@ -939,10 +939,10 @@ mod tests {
             spec: None,
         };
 
-        Expression::Function(
+        Expression::Function(Box::new(
             paro_planner::expression::FunctionExpression::new(function, arguments, return_type)
                 .with_routine_meta(meta),
-        )
+        ))
     }
 
     fn volatile_external_call(

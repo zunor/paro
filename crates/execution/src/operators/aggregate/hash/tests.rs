@@ -98,14 +98,14 @@ fn distinct_count_expression(input_idx: usize) -> Expression {
     let (function, _) = get_count_function()
         .bind(&[LogicalType::Integer])
         .expect("bind count");
-    Expression::Aggregate(
+    Expression::Aggregate(Box::new(
         AggregateExpression::new(
             function,
             vec![reference(input_idx, LogicalType::Integer)],
             LogicalType::BigInt,
         )
         .with_aggr_type(AggregateType::Distinct),
-    )
+    ))
 }
 
 fn distinct_spec() -> AggregateSpec {

@@ -2270,7 +2270,8 @@ fn sideways_filter_degrades_to_matching_source_lanes() {
             .score
             .range
             .expected,
-        20.0
+        5.0,
+        "predicate work is attributed by the matched immutable row domain"
     );
     assert_eq!(filtered.source_work[1].cost.score.range.expected, 300.0);
     assert_eq!(
@@ -2280,6 +2281,99 @@ fn sideways_filter_degrades_to_matching_source_lanes() {
             .range
             .expected,
         0.0
+    );
+}
+
+#[test]
+fn source_filter_charges_full_evaluation_domain_after_prior_retention() {
+    let source = WorkSourceId(2_001);
+    let scan = compose_candidate_cost_with_sources(
+        cost(1_000.0),
+        None,
+        &[],
+        &[],
+        CostComposition::Source {
+            source,
+            source_rows: 1_000,
+        },
+    )
+    .unwrap();
+    // A previous runtime filter has already reduced the lane's current work
+    // to ten units.  The next predicate still evaluates its immutable input
+    // domain and therefore costs the full operator-local term, not ten units.
+    let reduced = SourceWork {
+        cost: cost(10.0),
+        phased_cost: cost(10.0),
+        ..scan.source_work[0].clone()
+    };
+    let filtered = compose_candidate_cost_with_sources(
+        cost(100.0),
+        Some(cost(100.0)),
+        &[cost(10.0)],
+        &[std::slice::from_ref(&reduced)],
+        CostComposition::SidewaysFilter {
+            overlapping_children: 0,
+            filtered_child: 0,
+            sources: Box::new([retained_source(source, 500_000, 500_000)]),
+        },
+    )
+    .unwrap();
+    assert_eq!(
+        filtered.source_work[0]
+            .filter_apply_cost
+            .work_latency
+            .expected,
+        100.0,
+        "evaluation cost must use full_apply_cost, never the reduced lane cost"
+    );
+    assert_eq!(filtered.source_work[0].filters[0].evaluation_rows, 1_000);
+}
+
+#[test]
+fn source_filter_keeps_unmatched_apply_work_on_the_parent() {
+    let matched = WorkSourceId(2_010);
+    let unrelated = WorkSourceId(2_011);
+    let lanes = [
+        SourceWork {
+            source: matched,
+            source_rows: 100,
+            base_cost: cost(100.0),
+            cost: cost(100.0),
+            retentions: Box::new([]),
+            filters: Box::new([]),
+            filter_apply_cost: SearchCost::ZERO,
+            phased_cost: cost(100.0),
+            phase_tasks: 1,
+        },
+        SourceWork {
+            source: unrelated,
+            source_rows: 900,
+            base_cost: cost(900.0),
+            cost: cost(900.0),
+            retentions: Box::new([]),
+            filters: Box::new([]),
+            filter_apply_cost: SearchCost::ZERO,
+            phased_cost: cost(900.0),
+            phase_tasks: 1,
+        },
+    ];
+    let filtered = compose_candidate_cost_with_sources(
+        cost(100.0),
+        Some(cost(100.0)),
+        &[cost(1_000.0)],
+        &[&lanes],
+        CostComposition::SidewaysFilter {
+            overlapping_children: 0,
+            filtered_child: 0,
+            sources: Box::new([retained_source(matched, 500_000, 500_000)]),
+        },
+    )
+    .unwrap();
+    assert_eq!(filtered.source_work[0].filters.len(), 1);
+    assert!(filtered.source_work[1].filters.is_empty());
+    assert_eq!(
+        filtered.cost.score.range.expected, 1_050.0,
+        "the 90% lineage gap must remain charged at the parent"
     );
 }
 

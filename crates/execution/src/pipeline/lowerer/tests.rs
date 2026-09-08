@@ -117,11 +117,11 @@ fn grouped_aggregate_plan() -> crate::physical::PhysicalPlan {
                 LogicalType::Integer,
             ))],
             Vec::new(),
-            vec![Expression::Aggregate(AggregateExpression::new(
+            vec![Expression::Aggregate(Box::new(AggregateExpression::new(
                 get_count_star_function(),
                 Vec::new(),
                 LogicalType::BigInt,
-            ))],
+            )))],
             Vec::new(),
         ))),
     );
@@ -153,11 +153,11 @@ fn aggregate_probe_hash_join_plan() -> crate::physical::PhysicalPlan {
                 LogicalType::Integer,
             ))],
             Vec::new(),
-            vec![Expression::Aggregate(AggregateExpression::new(
+            vec![Expression::Aggregate(Box::new(AggregateExpression::new(
                 get_count_star_function(),
                 Vec::new(),
                 LogicalType::BigInt,
-            ))],
+            )))],
             Vec::new(),
         ))),
     );
@@ -207,11 +207,11 @@ fn ungrouped_aggregate_plan() -> crate::physical::PhysicalPlan {
             values,
             Vec::new(),
             Vec::new(),
-            vec![Expression::Aggregate(AggregateExpression::new(
+            vec![Expression::Aggregate(Box::new(AggregateExpression::new(
                 get_count_star_function(),
                 Vec::new(),
                 LogicalType::BigInt,
-            ))],
+            )))],
             Vec::new(),
         ))),
     );
@@ -838,11 +838,11 @@ fn aggregate_above_right_anti_hash_join_plan() -> crate::physical::PhysicalPlan 
             join,
             Vec::new(),
             Vec::new(),
-            vec![Expression::Aggregate(AggregateExpression::new(
+            vec![Expression::Aggregate(Box::new(AggregateExpression::new(
                 get_count_star_function(),
                 Vec::new(),
                 LogicalType::BigInt,
-            ))],
+            )))],
             Vec::new(),
         ))),
     );

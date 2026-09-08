@@ -618,14 +618,14 @@ mod tests {
             .expect("decimal sum has a closed partial merge");
         PostAggregateReductionSpec {
             aggregate_types: vec![decimal.clone()].into_boxed_slice(),
-            reducers: vec![Expression::Aggregate(AggregateExpression::new(
+            reducers: vec![Expression::Aggregate(Box::new(AggregateExpression::new(
                 merge,
                 vec![Expression::Reference(ReferenceExpression::new(
                     0,
                     decimal.clone(),
                 ))],
                 decimal.clone(),
-            ))]
+            )))]
             .into_boxed_slice(),
             reducer_types: vec![decimal.clone()].into_boxed_slice(),
             scalar_expressions: vec![Expression::Reference(ReferenceExpression::new(
@@ -824,11 +824,12 @@ mod tests {
         let (abs, _) = get_abs_functions()
             .bind(&[LogicalType::BigInt])
             .expect("bind abs(bigint)");
-        spec.scalar_expressions = Box::new([Expression::Function(FunctionExpression::new(
-            abs,
-            vec![Expression::Reference(ReferenceExpression::new(0, decimal))],
-            LogicalType::BigInt,
-        ))]);
+        spec.scalar_expressions =
+            Box::new([Expression::Function(Box::new(FunctionExpression::new(
+                abs,
+                vec![Expression::Reference(ReferenceExpression::new(0, decimal))],
+                LogicalType::BigInt,
+            )))]);
         spec.scalar_types = Box::new([LogicalType::BigInt]);
         spec.predicate = Expression::Operator(OperatorExpression::new_unary(
             OperatorType::IsNotNull,

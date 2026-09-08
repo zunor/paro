@@ -11,6 +11,7 @@ use super::*;
 use paro_planner::binder::ir::CTEMaterialize;
 use paro_planner::expression::{ColumnRefExpression, ComparisonType};
 use paro_planner::operator::{CTERef, MaterializedCTE, Projection};
+use paro_planner::plan::arena::LogicalPlanArena;
 
 #[derive(Debug, Clone)]
 pub(super) struct CteOccurrenceRequirement {
@@ -45,12 +46,6 @@ pub(in crate::cascades::planner) struct CteDomainProof {
     /// safe across canonicalization revisions; exact structural comparison
     /// remains the collision and group-identity check.
     pub(super) fingerprint: Fingerprint,
-}
-
-impl PartialEq for CteDomainProof {
-    fn eq(&self, other: &Self) -> bool {
-        self.same_domain_by(other, |group| group)
-    }
 }
 
 impl CteDomainProof {
@@ -195,10 +190,20 @@ fn predicate_domains_equal(left: &[Expression], right: &[Expression]) -> bool {
                     }
                     leaves
                 }
-                let a = flatten(&left.children, left.conjunction_type);
-                let b = flatten(&right.children, right.conjunction_type);
-                a.iter().all(|a| b.iter().any(|b| equal(a, b)))
-                    && b.iter().all(|b| a.iter().any(|a| equal(a, b)))
+                fn dedup<'a>(expressions: Vec<&'a Expression>) -> Vec<&'a Expression> {
+                    let mut unique: Vec<&Expression> = Vec::with_capacity(expressions.len());
+                    for expression in expressions {
+                        if !unique.iter().any(|candidate| expression.equals(candidate)) {
+                            unique.push(expression);
+                        }
+                    }
+                    unique
+                }
+                let a = dedup(flatten(&left.children, left.conjunction_type));
+                let b = dedup(flatten(&right.children, right.conjunction_type));
+                a.len() == b.len()
+                    && a.iter().all(|a| b.iter().any(|b| a.equals(b)))
+                    && b.iter().all(|b| a.iter().any(|a| b.equals(a)))
             }
             _ => left.equals(right),
         }
@@ -517,6 +522,7 @@ mod tests {
                     &mut instantiated.group_holes.clone(),
                     &input.bind_context,
                     &mut labels,
+                    &mut arena,
                 )
                 .unwrap();
             assert_eq!(
@@ -1087,21 +1093,28 @@ impl CteRequirement {
             domains.push(proof.clone());
         }
         let fingerprint = binding_domain_fingerprint(self.definition, &domains);
-        if let Some(binding) = state.cte_bindings.iter().find(|binding| {
-            binding.definition == self.definition
-                && memo.canonical_group(binding.input) == memo.canonical_group(input)
-                && binding.fingerprint == fingerprint
-                && domains
-                    .iter()
-                    .all(|domain| binding.domains.iter().any(|other| equal(domain, other)))
-                && binding
-                    .domains
-                    .iter()
-                    .all(|domain| domains.iter().any(|other| equal(domain, other)))
-        }) {
-            return binding.symbol;
+        let bucket = (self.definition, fingerprint);
+        if let Some(indices) = state.cte_binding_index.get(&bucket) {
+            if let Some(binding) = indices
+                .iter()
+                .filter_map(|index| state.cte_bindings.get(*index))
+                .find(|binding: &&NativeCteBinding| {
+                    binding.fingerprint == fingerprint
+                        && memo.canonical_group(binding.input) == memo.canonical_group(input)
+                        && domains
+                            .iter()
+                            .all(|domain| binding.domains.iter().any(|other| equal(domain, other)))
+                        && binding
+                            .domains
+                            .iter()
+                            .all(|domain| domains.iter().any(|other| equal(domain, other)))
+                })
+            {
+                return binding.symbol;
+            }
         }
         let symbol = state.bind_context.generate_table_index();
+        let index = state.cte_bindings.len();
         state.cte_bindings.push(NativeCteBinding {
             symbol,
             definition: self.definition,
@@ -1109,6 +1122,11 @@ impl CteRequirement {
             domains: domains.into_boxed_slice(),
             fingerprint,
         });
+        state
+            .cte_binding_index
+            .entry(bucket)
+            .or_default()
+            .push(index);
         symbol
     }
 
@@ -1183,6 +1201,7 @@ impl CteRequirement {
         holes: &mut BTreeMap<paro_planner::operator::BoundReferenceId, GroupId>,
         bind: &BindContext,
         labels: &mut PartitionLabels,
+        arena: &mut LogicalPlanArena,
     ) -> Result<Vec<OwnedLogicalPlan>> {
         let candidates = self
             .occurrences
@@ -1202,33 +1221,52 @@ impl CteRequirement {
             })
             .collect::<BTreeSet<_>>();
         debug!(target: targets::OPTIMIZER, owner = self.owner.index(), occurrences = self.occurrences.len(), ?ordinals, "native CTE partition domain coverage");
-        let mut arena = paro_planner::plan::arena::LogicalPlanArena::default();
-        let root = arena.import(plan)?;
-        let available = holes.clone();
-        let mut partitions_seen = BTreeSet::new();
-        let mut plans = Vec::new();
-        for ordinal in ordinals {
-            let mut candidate_holes = available.clone();
-            if let Some(candidate) = self.partition_by_ordinal(
-                arena.export(root)?,
-                &mut candidate_holes,
-                bind,
-                ordinal,
-                labels,
-                &mut partitions_seen,
-            )? {
-                holes.extend(candidate_holes);
-                plans.push(candidate);
+        // Use the planner-session arena for the one shared source snapshot.
+        // Candidate plans are exported at the owned-IR rule boundary, then
+        // the temporary suffix is rolled back. This keeps arena identity and
+        // generation ownership session-scoped without retaining dead CTE
+        // partition roots after a declined transformation.
+        let checkpoint = arena.checkpoint();
+        let result = (|| {
+            let root = arena.import(plan)?;
+            let available = holes.clone();
+            let mut published_holes = available.clone();
+            let mut partitions_seen = BTreeSet::new();
+            let mut plans = Vec::new();
+            for ordinal in ordinals {
+                let mut candidate_holes = available.clone();
+                if let Some(candidate) = self.partition_by_ordinal(
+                    arena.export(root)?,
+                    &mut candidate_holes,
+                    bind,
+                    ordinal,
+                    labels,
+                    &mut partitions_seen,
+                )? {
+                    published_holes.extend(candidate_holes);
+                    plans.push(candidate);
+                }
             }
-        }
-        if !plans.is_empty() {
-            if let LogicalOperator::MaterializedCTE(cte) = &arena.get(root)?.operator {
+            let producer_hole = if plans.is_empty() {
+                None
+            } else if let LogicalOperator::MaterializedCTE(cte) = &arena.get(root)?.operator {
                 if let LogicalOperator::BoundReference(reference) =
                     &arena.get(cte.cte_query)?.operator
                 {
-                    holes.remove(&reference.reference_id);
+                    Some(reference.reference_id)
+                } else {
+                    None
                 }
-            }
+            } else {
+                None
+            };
+            Ok::<_, paro_common::error::ParoError>((plans, published_holes, producer_hole))
+        })();
+        arena.rollback_to(checkpoint)?;
+        let (plans, published_holes, producer_hole) = result?;
+        *holes = published_holes;
+        if let Some(reference_id) = producer_hole {
+            holes.remove(&reference_id);
         }
         Ok(plans)
     }
@@ -1240,8 +1278,9 @@ impl CteRequirement {
         holes: &mut BTreeMap<paro_planner::operator::BoundReferenceId, GroupId>,
         bind: &BindContext,
     ) -> Result<Option<OwnedLogicalPlan>> {
+        let mut arena = LogicalPlanArena::default();
         Ok(self
-            .partitions(plan, holes, bind, &mut PartitionLabels::new())?
+            .partitions(plan, holes, bind, &mut PartitionLabels::new(), &mut arena)?
             .into_iter()
             .next())
     }

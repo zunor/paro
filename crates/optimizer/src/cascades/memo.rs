@@ -21,6 +21,7 @@ use super::properties::{PropertyInterner, ProvidedProperties, RequiredProperties
 use super::region::{JointCostProof, RegionFacet, RegionForest};
 use super::rules::CostComposition;
 use crate::physical::ObjectiveProfile;
+use paro_storage::statistics::{DistinctEvidence, DistinctProvenance};
 use std::sync::{Arc, OnceLock};
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -61,9 +62,15 @@ pub struct GroupColumnDomain {
     /// that any one physical alternative observed the midpoint value.
     pub expected_lower: u64,
     pub expected_upper: u64,
+    /// Stable costing point retained from the evidence sources. It is not
+    /// reconstructed from the uncertainty hull midpoint.
+    pub ranking_point: u64,
     /// Predicate/schema proof. Unlike observed HLL state, this remains a safe
     /// upper bound after data changes permitted by the compiled plan.
     pub guaranteed_upper: Option<u64>,
+    /// Only a domain made entirely from complete observations may satisfy a
+    /// complete-domain runtime-filter proof.
+    pub provenance: DistinctProvenance,
 }
 
 impl GroupColumnDomain {
@@ -75,18 +82,58 @@ impl GroupColumnDomain {
         Some(Self {
             expected_lower: expected,
             expected_upper: expected,
+            ranking_point: expected,
             guaranteed_upper,
+            provenance: if expected == 0 {
+                DistinctProvenance::Unknown
+            } else {
+                DistinctProvenance::Derived
+            },
+        })
+    }
+
+    /// Construct a domain directly from column evidence.  The ranking point
+    /// remains the estimator's point, while lower/upper retain proof bounds;
+    /// callers no longer have to infer provenance from a scalar NDV.
+    pub fn from_evidence(
+        evidence: DistinctEvidence,
+        cardinality_maximum: Option<u64>,
+    ) -> Option<Self> {
+        let evidence = evidence.normalized();
+        let point = evidence.point;
+        let expected = cardinality_maximum.map_or(point, |rows| point.min(rows));
+        let lower = cardinality_maximum.map_or(evidence.lower, |rows| evidence.lower.min(rows));
+        let upper = cardinality_maximum
+            .or(evidence.upper)
+            .unwrap_or(expected)
+            .max(lower)
+            .max(expected);
+        if expected == 0 && lower == 0 && evidence.upper.is_none() && cardinality_maximum.is_none()
+        {
+            return None;
+        }
+        Some(Self {
+            expected_lower: lower,
+            expected_upper: upper,
+            ranking_point: expected.clamp(lower, upper),
+            guaranteed_upper: cardinality_maximum
+                .zip(evidence.upper)
+                .map(|(rows, distinct)| rows.min(distinct))
+                .or(cardinality_maximum)
+                .or(evidence.upper),
+            provenance: evidence.provenance,
         })
     }
 
     pub fn expected(self) -> Option<u64> {
-        (self.expected_upper > 0).then(|| {
-            self.expected_lower
-                .saturating_add(self.expected_upper.saturating_sub(self.expected_lower) / 2)
-        })
+        (self.ranking_point > 0).then_some(self.ranking_point)
     }
 
     pub(crate) fn canonical_with(self, other: Self) -> Self {
+        let ranking_point = match (self.ranking_point, other.ranking_point) {
+            (0, point) | (point, 0) => point,
+            (left, right) => left.saturating_add(right.saturating_sub(left) / 2),
+        };
         Self {
             expected_lower: match (self.expected_lower, other.expected_lower) {
                 (0, right) => right,
@@ -99,7 +146,55 @@ impl GroupColumnDomain {
                 (Some(bound), None) | (None, Some(bound)) => Some(bound),
                 (None, None) => None,
             },
+            ranking_point,
+            provenance: merge_distinct_provenance(self.provenance, other.provenance),
         }
+    }
+}
+
+fn merge_distinct_provenance(
+    left: DistinctProvenance,
+    right: DistinctProvenance,
+) -> DistinctProvenance {
+    use DistinctProvenance::*;
+    match (left, right) {
+        (ObservedFull, ObservedFull) => ObservedFull,
+        (
+            ObservedPartial {
+                observed_rows,
+                total_rows,
+            },
+            ObservedFull,
+        )
+        | (
+            ObservedFull,
+            ObservedPartial {
+                observed_rows,
+                total_rows,
+            },
+        ) => ObservedPartial {
+            observed_rows,
+            total_rows,
+        },
+        (
+            ObservedPartial {
+                observed_rows: left_rows,
+                total_rows: left_total,
+            },
+            ObservedPartial {
+                observed_rows: right_rows,
+                total_rows: right_total,
+            },
+        ) => ObservedPartial {
+            observed_rows: left_rows.min(right_rows),
+            total_rows: left_total.max(right_total),
+        },
+        (ObservedFull, Derived) | (Derived, ObservedFull) | (Derived, Derived) => Derived,
+        (ObservedPartial { .. }, Derived)
+        | (Derived, ObservedPartial { .. })
+        | (ObservedPartial { .. }, Unknown)
+        | (Unknown, ObservedPartial { .. }) => Derived,
+        (Unknown, other) | (other, Unknown) => other,
     }
 }
 
@@ -157,6 +252,8 @@ impl LogicalProperties {
             fingerprint.write_u64(column.0 as u64);
             fingerprint.write_u64(domain.expected_lower);
             fingerprint.write_u64(domain.expected_upper);
+            fingerprint.write_u64(domain.ranking_point);
+            encode_distinct_provenance(&mut fingerprint, domain.provenance);
             fingerprint.write_u64(domain.guaranteed_upper.is_some() as u64);
             if let Some(upper) = domain.guaranteed_upper {
                 fingerprint.write_u64(upper);
@@ -176,6 +273,25 @@ impl LogicalProperties {
             }
         }
         fingerprint.finish()
+    }
+}
+
+fn encode_distinct_provenance(
+    fingerprint: &mut StableFingerprintBuilder,
+    provenance: DistinctProvenance,
+) {
+    match provenance {
+        DistinctProvenance::Unknown => fingerprint.write_u64(0),
+        DistinctProvenance::Derived => fingerprint.write_u64(1),
+        DistinctProvenance::ObservedFull => fingerprint.write_u64(2),
+        DistinctProvenance::ObservedPartial {
+            observed_rows,
+            total_rows,
+        } => {
+            fingerprint.write_u64(3);
+            fingerprint.write_u64(observed_rows);
+            fingerprint.write_u64(total_rows);
+        }
     }
 }
 

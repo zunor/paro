@@ -708,22 +708,22 @@ mod tests {
                 vec![LogicalType::Integer],
             ),
         ));
-        let count = Expression::Aggregate(AggregateExpression::new(
+        let count = Expression::Aggregate(Box::new(AggregateExpression::new(
             get_count_star_function(),
             Vec::new(),
             LogicalType::BigInt,
-        ));
+        )));
         let (max, _) = get_max_function()
             .bind(&[LogicalType::BigInt])
             .expect("bind max(bigint)");
-        let reducer = Expression::Aggregate(AggregateExpression::new(
+        let reducer = Expression::Aggregate(Box::new(AggregateExpression::new(
             max,
             vec![Expression::ColumnRef(ColumnRefExpression::new(
                 ColumnBinding::new(2, 0),
                 LogicalType::BigInt,
             ))],
             LogicalType::BigInt,
-        ));
+        )));
         let predicate = Expression::Comparison(ComparisonExpression::new(
             ComparisonType::Equal,
             Expression::ColumnRef(ColumnRefExpression::new(

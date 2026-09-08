@@ -649,15 +649,16 @@ fn reverse_comparison(comparison_type: ComparisonType) -> ComparisonType {
 }
 
 fn flatten_and<'e>(expression: &'e Expression, output: &mut Vec<&'e Expression>) {
-    if let Expression::Conjunction(conjunction) = expression {
-        if conjunction.conjunction_type == ConjunctionType::And {
-            for child in &conjunction.children {
-                flatten_and(child, output);
+    let mut pending = vec![expression];
+    while let Some(current) = pending.pop() {
+        if let Expression::Conjunction(conjunction) = current {
+            if conjunction.conjunction_type == ConjunctionType::And {
+                pending.extend(conjunction.children.iter().rev());
+                continue;
             }
-            return;
         }
+        output.push(current);
     }
-    output.push(expression);
 }
 
 fn expression_single_binding(

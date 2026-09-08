@@ -38,6 +38,8 @@ pub struct OptimizerData {
     pub name: String,
     pub kind: String,
     pub last_elapsed_us: i64,
+    pub metric_value: i64,
+    pub metric_unit: String,
     pub invocation_count: i64,
 }
 
@@ -82,6 +84,12 @@ fn paro_optimizers_bind(
     names.push("last_elapsed_us".to_string());
     return_types.push(LogicalType::BigInt);
 
+    names.push("metric_value".to_string());
+    return_types.push(LogicalType::BigInt);
+
+    names.push("metric_unit".to_string());
+    return_types.push(LogicalType::Varchar);
+
     names.push("invocation_count".to_string());
     return_types.push(LogicalType::BigInt);
 
@@ -120,12 +128,16 @@ fn paro_optimizers_function(
     let mut names = Vec::with_capacity(batch_size);
     let mut kinds = Vec::with_capacity(batch_size);
     let mut last_elapsed = Vec::with_capacity(batch_size);
+    let mut metric_values = Vec::with_capacity(batch_size);
+    let mut metric_units = Vec::with_capacity(batch_size);
     let mut invocations = Vec::with_capacity(batch_size);
 
     for entry in gstate.entries.iter().skip(offset).take(batch_size) {
         names.push(entry.name.clone());
         kinds.push(entry.kind.clone());
         last_elapsed.push(entry.last_elapsed_us);
+        metric_values.push(entry.metric_value);
+        metric_units.push(entry.metric_unit.clone());
         invocations.push(entry.invocation_count);
     }
 
@@ -143,6 +155,13 @@ fn paro_optimizers_function(
         *col = Vector::try_from_i64(&last_elapsed, output_allocator.clone())?;
     }
     if let Some(col) = output.column_mut(3) {
+        *col = Vector::try_from_i64(&metric_values, output_allocator.clone())?;
+    }
+    if let Some(col) = output.column_mut(4) {
+        let unit_refs: Vec<&str> = metric_units.iter().map(|value| value.as_str()).collect();
+        *col = Vector::try_from_strings(&unit_refs, output_allocator.clone())?;
+    }
+    if let Some(col) = output.column_mut(5) {
         *col = Vector::try_from_i64(&invocations, output_allocator.clone())?;
     }
     output.set_cardinality(batch_size);
@@ -203,7 +222,14 @@ mod tests {
         assert!(bind.is_some());
         assert_eq!(
             names,
-            vec!["name", "kind", "last_elapsed_us", "invocation_count"]
+            vec![
+                "name",
+                "kind",
+                "last_elapsed_us",
+                "metric_value",
+                "metric_unit",
+                "invocation_count"
+            ]
         );
         assert_eq!(
             return_types,
@@ -211,6 +237,8 @@ mod tests {
                 LogicalType::Varchar,
                 LogicalType::Varchar,
                 LogicalType::BigInt,
+                LogicalType::BigInt,
+                LogicalType::Varchar,
                 LogicalType::BigInt,
             ]
         );
@@ -232,12 +260,16 @@ mod tests {
                     name: "semantic_normalization".to_string(),
                     kind: "frontend".to_string(),
                     last_elapsed_us: 42,
+                    metric_value: 7,
+                    metric_unit: "invocations".to_string(),
                     invocation_count: 7,
                 },
                 OptimizerData {
                     name: "memo_exploration".to_string(),
                     kind: "search".to_string(),
                     last_elapsed_us: 0,
+                    metric_value: 0,
+                    metric_unit: "invocations".to_string(),
                     invocation_count: 0,
                 },
             ],
@@ -258,6 +290,8 @@ mod tests {
                 LogicalType::Varchar,
                 LogicalType::BigInt,
                 LogicalType::BigInt,
+                LogicalType::Varchar,
+                LogicalType::BigInt,
             ],
             2048,
         );
@@ -275,6 +309,11 @@ mod tests {
         );
         assert_eq!(chunk.column(2).unwrap().get_value(0), Value::BigInt(42));
         assert_eq!(chunk.column(3).unwrap().get_value(0), Value::BigInt(7));
+        assert_eq!(
+            chunk.column(4).unwrap().get_value(0),
+            Value::Varchar("invocations".to_string())
+        );
+        assert_eq!(chunk.column(5).unwrap().get_value(0), Value::BigInt(7));
         assert_eq!(
             chunk.column(0).unwrap().get_value(1),
             Value::Varchar("memo_exploration".to_string())
@@ -296,6 +335,8 @@ mod tests {
                 name: "semantic_normalization".to_string(),
                 kind: "frontend".to_string(),
                 last_elapsed_us: 1,
+                metric_value: 1,
+                metric_unit: "invocations".to_string(),
                 invocation_count: 1,
             }],
         );
