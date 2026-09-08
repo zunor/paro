@@ -389,10 +389,6 @@ impl OptimizationInput {
                 .read()
                 .expect("planner transform state poisoned");
             work_counters.insert("settlement_local_hit_count", state.settlement_cache.hits);
-            work_counters.insert(
-                "settlement_immutable_occurrence_hit_count",
-                state.settlement_cache.immutable_occurrence_hits(),
-            );
             work_counters.insert("settlement_local_miss_count", state.settlement_cache.misses);
             work_counters.insert(
                 "settlement_invalidation_visit_count",

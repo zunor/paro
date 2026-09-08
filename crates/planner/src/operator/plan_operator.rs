@@ -29,7 +29,7 @@ use super::{
 /// remain private to keep their lengths aligned. SQL-visible display names are
 /// intentionally separate: unlike bindings, they are presentation metadata and
 /// need not survive every execution-only projection or rewrite.
-#[derive(Debug, Clone, Default, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct LogicalOutputLayout {
     types: Vec<LogicalType>,
     bindings: Vec<ColumnBinding>,

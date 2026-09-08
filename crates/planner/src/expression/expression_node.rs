@@ -77,24 +77,6 @@ impl Expression {
         }
     }
 
-    pub fn identity_witness(&self) -> super::ExpressionIdentityWitness {
-        match self {
-            Self::Constant(value) => value.identity_witness(),
-            Self::ColumnRef(value) => value.identity_witness(),
-            Self::Function(value) => value.identity_witness(),
-            Self::Cast(value) => value.identity_witness(),
-            Self::Conjunction(value) => value.identity_witness(),
-            Self::Case(value) => value.identity_witness(),
-            Self::Comparison(value) => value.identity_witness(),
-            Self::Operator(value) => value.identity_witness(),
-            Self::Parameter(value) => value.identity_witness(),
-            Self::Reference(value) => value.identity_witness(),
-            Self::Aggregate(value) => value.identity_witness(),
-            Self::Subquery(value) => value.identity_witness(),
-            Self::Window(value) => value.identity_witness(),
-        }
-    }
-
     pub(crate) fn release_children_into(&mut self, pending: &mut Vec<Expression>) {
         match self {
             Self::Constant(value) => value.release_into(pending),
