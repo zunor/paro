@@ -709,22 +709,25 @@ pub struct Winner {
 
 #[derive(Debug, Clone, Default)]
 pub struct WinnerFrontier {
-    candidates: Vec<Winner>,
+    // The frontier indexes immutable published candidates. Its reordering and
+    // pruning must neither copy their proof trees nor retire parent references.
+    candidates: Vec<Arc<Winner>>,
     filterable_sources: BTreeSet<super::rules::WorkSourceId>,
 }
 
-#[derive(Debug, Clone, Copy, Default)]
+#[derive(Debug, Default)]
 struct FrontierInsertion {
     selected_changed: bool,
     truncated: bool,
+    published: Option<Arc<Winner>>,
 }
 
 impl WinnerFrontier {
     pub fn selected(&self) -> Option<&Winner> {
-        self.candidates.first()
+        self.candidates.first().map(Arc::as_ref)
     }
 
-    pub fn candidates(&self) -> &[Winner] {
+    pub fn candidates(&self) -> &[Arc<Winner>] {
         &self.candidates
     }
 
@@ -770,13 +773,21 @@ impl WinnerFrontier {
                     && source_response_equal(&winner, incumbent, &self.filterable_sources)
                     && winner_tie_break(&winner) < winner_tie_break(incumbent))
         });
-        self.candidates.push(winner);
-        self.candidates.sort_by(|left, right| {
-            compare_objective(left, right, goal.objective)
-                .then_with(|| winner_tie_break(left).cmp(&winner_tie_break(right)))
+        // Removal preserves the existing ordering. Insert after exact ties,
+        // as a stable full sort would, without sorting the whole frontier for
+        // every costed proposal or moving its large inline Winner payloads.
+        let position = self.candidates.partition_point(|incumbent| {
+            !compare_objective(incumbent, &winner, goal.objective)
+                .then_with(|| winner_tie_break(incumbent).cmp(&winner_tie_break(&winner)))
+                .is_gt()
         });
         let limit = limit.max(1);
-        let truncated = self.candidates.len() > limit;
+        let truncated = self.candidates.len().saturating_add(1) > limit;
+        let published = (position < limit).then(|| {
+            let winner = Arc::new(winner);
+            self.candidates.insert(position, Arc::clone(&winner));
+            winner
+        });
         if truncated {
             self.candidates.truncate(limit);
         }
@@ -784,6 +795,7 @@ impl WinnerFrontier {
             selected_changed: old_selected
                 != self.selected().map(|entry| entry.physical_fingerprint),
             truncated,
+            published,
         }
     }
 }
@@ -921,6 +933,7 @@ pub struct Memo {
     logical_owners: Vec<GroupId>,
     physical_owners: Vec<GroupId>,
     winner_candidates: Vec<WinnerCandidate>,
+    winner_proposals: u64,
     properties: PropertyInterner,
     optimization_contexts: Vec<OptimizationContext>,
     optimization_context_index: BTreeMap<OptimizationContext, OptimizationContextId>,
@@ -946,7 +959,7 @@ pub struct Memo {
 struct WinnerCandidate {
     group: GroupId,
     goal: OptimizationGoal,
-    winner: Winner,
+    winner: Arc<Winner>,
 }
 
 #[derive(Debug)]
@@ -976,6 +989,7 @@ impl Memo {
             logical_owners: Vec::new(),
             physical_owners: Vec::new(),
             winner_candidates: Vec::new(),
+            winner_proposals: 0,
             properties: PropertyInterner::default(),
             optimization_contexts: vec![root_context.clone()],
             optimization_context_index: BTreeMap::from([(
@@ -2147,34 +2161,24 @@ impl Memo {
         // same algebra here would verify every candidate, including ones
         // immediately removed by dominance. WinnerVerifier independently
         // recomposes the bounded retained frontier once search is complete.
-        let candidate = CandidateId::new(self.winner_candidates.len());
-        winner.candidate = candidate;
-        self.winner_candidates.push(WinnerCandidate {
-            group,
-            goal,
-            winner: winner.clone(),
-        });
-        let filterable_sources = self
-            .optimization_context(goal.context)
-            .ok_or_else(|| paro_error::internal("winner has no source-demand context"))?
-            .filterable_sources
-            .clone();
+        let context = self
+            .optimization_contexts
+            .get(goal.context.index())
+            .ok_or_else(|| paro_error::internal("winner has no source-demand context"))?;
+        // Assign a permanent identity only when the proposal is published.
+        // A rejected proposal cannot yet have a parent reference; once an ID
+        // escapes, its single immutable allocation remains in the archive even
+        // after later frontier pruning or a group merge.
+        winner.candidate = CandidateId::new(self.winner_candidates.len());
+        let physical_fingerprint = winner.physical_fingerprint;
         let frontier_limit = self.budget.max_winner_frontier_candidates_per_goal.max(1) as usize;
-        let mut frontier_witness = StableFingerprintBuilder::default();
-        frontier_witness.write_bytes(b"paro.winner-frontier-boundary.v1");
-        frontier_witness.write_u64(group.0 as u64);
-        frontier_witness.write_u64(goal.required.0 as u64);
-        frontier_witness.write_u64(goal.row_goal.stable_tag());
-        frontier_witness.write_u64(goal.objective.stable_tag());
-        frontier_witness.write_u64(goal.grant.stable_tag());
-        frontier_witness.write_u64(goal.context.0 as u64);
-        frontier_witness.write_fingerprint(winner.physical_fingerprint);
-        let frontier_witness = frontier_witness.finish();
+        self.winner_proposals = self.winner_proposals.saturating_add(1);
         let slot = self.groups[group.index()].winner_frontiers.entry(goal);
         let insertion = match slot {
             std::collections::btree_map::Entry::Vacant(entry) => {
                 let mut frontier = WinnerFrontier::default();
-                frontier.filterable_sources = filterable_sources;
+                // Only a new frontier owns a separate demand set.
+                frontier.filterable_sources = context.filterable_sources.clone();
                 let insertion = frontier.insert_with_limit(goal, winner, frontier_limit);
                 entry.insert(frontier);
                 insertion
@@ -2184,11 +2188,35 @@ impl Memo {
                 .insert_with_limit(goal, winner, frontier_limit),
         };
         if insertion.truncated {
+            let mut frontier_witness = StableFingerprintBuilder::default();
+            frontier_witness.write_bytes(b"paro.winner-frontier-boundary.v1");
+            frontier_witness.write_u64(group.0 as u64);
+            frontier_witness.write_u64(goal.required.0 as u64);
+            frontier_witness.write_u64(goal.row_goal.stable_tag());
+            frontier_witness.write_u64(goal.objective.stable_tag());
+            frontier_witness.write_u64(goal.grant.stable_tag());
+            frontier_witness.write_u64(goal.context.0 as u64);
+            frontier_witness.write_fingerprint(physical_fingerprint);
             self.groups[group.index()]
                 .ledger
-                .record_budget_limited(BudgetDimension::WinnerFrontier, frontier_witness);
+                .record_budget_limited(BudgetDimension::WinnerFrontier, frontier_witness.finish());
+        }
+        if let Some(winner) = insertion.published {
+            self.winner_candidates.push(WinnerCandidate {
+                group,
+                goal,
+                winner,
+            });
         }
         Ok(insertion.selected_changed)
+    }
+
+    pub fn winner_proposal_count(&self) -> u64 {
+        self.winner_proposals
+    }
+
+    pub fn published_winner_count(&self) -> u64 {
+        self.winner_candidates.len() as u64
     }
 
     pub fn resolve_child_winner(&self, child: ChildWinnerRef) -> Option<&Winner> {

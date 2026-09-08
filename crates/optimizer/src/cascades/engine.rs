@@ -407,7 +407,7 @@ impl CascadesEngine {
                                 || class.spill_policy == SpillPolicy::Allowed)
                     })
                 })
-                .cloned()
+                .map(|winner| winner.as_ref().clone())
             {
                 winners.push(GrantWinner {
                     class: class.id,
@@ -1161,6 +1161,8 @@ impl CascadesEngine {
 
     pub fn search_work_counters(&self) -> BTreeMap<&'static str, u64> {
         BTreeMap::from([
+            ("winner_proposal_count", self.memo.winner_proposal_count()),
+            ("published_winner_count", self.memo.published_winner_count()),
             ("transformation_binding_count", self.transformation_bindings),
             (
                 "fact_value_revalidation_hit_count",

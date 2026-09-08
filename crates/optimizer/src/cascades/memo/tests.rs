@@ -414,6 +414,69 @@ fn winner_is_keyed_by_goal_and_uses_stable_tie_break() {
         Fingerprint(20),
         "an exact child reference must survive frontier pruning"
     );
+    let selected = memo.group(group).unwrap().winner(goal).unwrap().clone();
+    let selected_id = selected.candidate;
+    let rejected = Winner {
+        candidate: CandidateId::INVALID,
+        physical_fingerprint: Fingerprint(30),
+        ..selected
+    };
+    for _ in 0..2_000 {
+        assert!(!memo.record_winner(group, goal, rejected.clone()).unwrap());
+    }
+    assert_eq!(memo.winner_proposal_count(), 2_002);
+    assert_eq!(memo.published_winner_count(), 2);
+    assert!(
+        memo.resolve_child_winner(ChildWinnerRef {
+            group,
+            goal,
+            candidate: CandidateId::new(2),
+        })
+        .is_none(),
+        "rejected identities must never escape into the archive"
+    );
+    let frontier = memo.group(group).unwrap().winner_frontier(goal).unwrap();
+    assert!(
+        Arc::ptr_eq(
+            &frontier.candidates()[0],
+            &memo.winner_candidates[selected_id.index()].winner,
+        ),
+        "archive and frontier must own the same immutable allocation"
+    );
+
+    // Publishing another candidate after many rejected proposals must not
+    // reuse either previously published identity, including the retired one.
+    let improved = Winner {
+        physical_fingerprint: Fingerprint(5),
+        ..rejected
+    };
+    assert!(memo.record_winner(group, goal, improved).unwrap());
+    assert_eq!(
+        memo.group(group).unwrap().winner(goal).unwrap().candidate,
+        CandidateId::new(2)
+    );
+    let peer = memo.create_group(
+        schema(1),
+        LogicalProperties::default(),
+        GroupCardinality::default(),
+    );
+    let merged = memo.merge_groups(peer, group).unwrap();
+    for (candidate, fingerprint) in [
+        (retired_candidate, 20),
+        (selected_id, 10),
+        (CandidateId::new(2), 5),
+    ] {
+        assert_eq!(
+            memo.resolve_child_winner(ChildWinnerRef {
+                group: merged,
+                goal,
+                candidate
+            })
+            .unwrap()
+            .physical_fingerprint,
+            Fingerprint(fingerprint)
+        );
+    }
 }
 
 #[test]
@@ -652,13 +715,105 @@ fn bounded_winner_frontier_reports_an_anytime_obligation() {
     let mut frontier = WinnerFrontier::default();
     let first = frontier.insert_with_limit(goal, winner(1, 1.0, 10_000), 1);
     assert!(!first.truncated);
+    let retired = first.published.unwrap();
     let second = frontier.insert_with_limit(goal, winner(2, 2.0, 1), 1);
     assert!(second.truncated);
+    assert!(second.published.is_none());
     assert_eq!(frontier.candidates().len(), 1);
     assert_eq!(
         frontier.selected().unwrap().physical_fingerprint,
         Fingerprint(1)
     );
+    let third = frontier.insert_with_limit(goal, winner(3, 0.5, 20_000), 1);
+    assert!(third.truncated);
+    let retained = third.published.unwrap();
+    assert!(Arc::ptr_eq(&retained, &frontier.candidates()[0]));
+    assert_eq!(retired.physical_fingerprint, Fingerprint(1));
+    assert_eq!(retained.physical_fingerprint, Fingerprint(3));
+}
+
+#[test]
+fn incremental_frontier_matches_an_independent_exhaustive_pareto_oracle() {
+    let samples = [(1_u64, 100_u64), (2, 10), (3, 1), (3, 80), (4, 1)];
+    let mut expected = samples
+        .iter()
+        .copied()
+        .filter(|&(work, memory)| {
+            !samples.iter().any(|&(other_work, other_memory)| {
+                other_work <= work
+                    && other_memory <= memory
+                    && (other_work < work || other_memory < memory)
+            })
+        })
+        .collect::<Vec<_>>();
+    expected.sort_unstable();
+    let goal = OptimizationGoal {
+        required: PropertySetId(0),
+        row_goal: RowGoal::All,
+        objective: ObjectiveProfile::Latency,
+        grant: GrantGoalKey::Invariant(AdmissibleGrantSetId(0)),
+        context: OptimizationContextId(0),
+    };
+    // Enumerate all 5! insertion orders independently, not just reverse order
+    // or a production comparator replay. Every permutation must retain the
+    // same set as the two-dimensional mathematical dominance relation above.
+    for a in 0..5 {
+        for b in 0..5 {
+            for c in 0..5 {
+                for d in 0..5 {
+                    for e in 0..5 {
+                        let order = [a, b, c, d, e];
+                        if order.into_iter().collect::<BTreeSet<_>>().len() != 5 {
+                            continue;
+                        }
+                        let mut frontier = WinnerFrontier::default();
+                        for index in order {
+                            let (work, memory) = samples[index];
+                            let cost = SearchCost {
+                                score: ScoreSummary {
+                                    range: CompactRange::point(work as f64).unwrap(),
+                                    risk_adjusted: work as f64,
+                                },
+                                critical_path: CompactRange::point(work as f64).unwrap(),
+                                peak_memory_upper: memory,
+                                revocable_memory_target: memory,
+                                ..SearchCost::ZERO
+                            };
+                            frontier.insert(
+                                goal,
+                                Winner {
+                                    candidate: CandidateId::INVALID,
+                                    expression: PhysicalExprId::new(index),
+                                    children: Box::new([]),
+                                    enforcers: Box::new([]),
+                                    enforcer_cost_input: enforcer_cost_input(),
+                                    provided: provided(),
+                                    local_cost: cost,
+                                    cost,
+                                    source_filter_apply_cost: None,
+                                    cost_composition: CostComposition::Sequential,
+                                    source_work: Box::new([]),
+                                    physical_fingerprint: Fingerprint(index as u128),
+                                    joint_cost_proof: None,
+                                },
+                            );
+                        }
+                        let actual = frontier
+                            .candidates()
+                            .iter()
+                            .map(|winner| {
+                                (
+                                    winner.cost.score.range.expected as u64,
+                                    winner.cost.peak_memory_upper,
+                                )
+                            })
+                            .collect::<Vec<_>>();
+                        assert_eq!(actual, expected, "insertion order {order:?}");
+                    }
+                }
+            }
+        }
+    }
 }
 
 #[test]
