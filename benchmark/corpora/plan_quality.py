@@ -50,16 +50,44 @@ def plan_metrics(root: dict[str, Any]) -> dict[str, int]:
             "materialized_cte_nodes": counts.get("MATERIALIZED_CTE", 0)}
 
 
+def validate_selector(selector: dict[str, Any]) -> None:
+    if not isinstance(selector, dict):
+        raise ValueError("semantic boundary selector must be an object")
+    if "alternatives" in selector:
+        alternatives = selector["alternatives"]
+        if set(selector) != {"alternatives"} or not isinstance(alternatives, list) or not alternatives:
+            raise ValueError("boundary alternatives must be a nonempty list with no sibling fields")
+        for alternative in alternatives:
+            validate_selector(alternative)
+        return
+    if (not isinstance(selector.get("operator"), str)
+            or set(selector) - {"operator", "relation", "properties", "child"}
+            or not isinstance(selector.get("properties", {}), dict)):
+        raise ValueError(f"invalid semantic boundary selector: {selector}")
+    if "child" in selector:
+        validate_selector(selector["child"])
+
+
+def matches_boundary(node: dict[str, Any], selector: dict[str, Any]) -> bool:
+    if "alternatives" in selector:
+        return any(matches_boundary(node, alternative) for alternative in selector["alternatives"])
+    if (node.get("operator") != selector["operator"]
+            or ("relation" in selector and node.get("relation") != selector["relation"])
+            or any(node.get("properties", {}).get(key) != value
+                   for key, value in selector.get("properties", {}).items())):
+        return False
+    children = node.get("children", [])
+    return "child" not in selector or (len(children) == 1 and matches_boundary(children[0], selector["child"]))
+
+
 def select_boundary(root: dict[str, Any], selector: dict[str, Any] | None) -> dict[str, Any]:
     if selector is None:
         return root
+    validate_selector(selector)
     matches, pending = [], [root]
     while pending:
         node = pending.pop()
-        if (node.get("operator") == selector["operator"]
-                and ("relation" not in selector or node.get("relation") == selector["relation"])
-                and all(node.get("properties", {}).get(key) == value
-                        for key, value in selector.get("properties", {}).items())):
+        if matches_boundary(node, selector):
             matches.append(node)
         pending.extend(node.get("children", []))
     if len(matches) != 1:

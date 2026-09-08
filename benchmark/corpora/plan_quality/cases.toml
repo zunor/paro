@@ -46,7 +46,10 @@ GROUP BY p.order_key, p.label ORDER BY p.order_key
 query = "subsumed_inner_having"
 expected_rows = 3
 expected_result_rows = 2
-selector = { operator = "AGGREGATE", properties = { "Group Key" = "public.quality_detail.order_key" } }
+# The oracle counts rows after HAVING. Accept either a fused aggregate emit
+# predicate or a standalone Filter directly over the same aggregate, never
+# the pre-HAVING aggregate merely because its grouping key matches.
+selector = { alternatives = [ { operator = "AGGREGATE", properties = { "Group Key" = "public.quality_detail.order_key", "Having" = "sum(public.quality_detail.quantity) > 100.00" } }, { operator = "FILTER", properties = { "Filter" = "sum(public.quality_detail.quantity) > 100.00" }, child = { operator = "AGGREGATE", properties = { "Group Key" = "public.quality_detail.order_key" } } } ] }
 oracle_sql = "SELECT order_key, sum(quantity) FROM quality_detail GROUP BY order_key HAVING sum(quantity) > 100.00"
 sql = """
 SELECT p.order_key, p.label, sum(d.quantity) AS total_quantity

@@ -906,38 +906,47 @@ fn push_aggregate_properties(
             );
         }
     }
-    if !spec.aggregates.is_empty() {
+    let aggregate_names = spec
+        .aggregates
+        .iter()
+        .map(|expression| format_aggregate_expr(expression, spec, &formatter))
+        .collect::<Vec<_>>();
+    if !aggregate_names.is_empty() {
         push_string_property(
             properties,
             "Aggregates",
-            spec.aggregates
+            aggregate_names.join(", "),
+        );
+    }
+    // Emit-time HAVING references aggregate results, not the output layout
+    // (which also contains grouping keys and may be independently projected).
+    let result_formatter = ExplainExpressionFormatter::new(&aggregate_names);
+    if !spec.having_filter.is_empty() {
+        push_string_property(
+            properties,
+            "Having",
+            spec.having_filter
                 .iter()
-                .map(|expression| format_aggregate_expr(expression, spec, &formatter))
+                .map(|expression| result_formatter.format(expression))
                 .collect::<Vec<_>>()
-                .join(", "),
+                .join(" AND "),
         );
     }
     if let Some(reduction) = &spec.post_reduction {
-        let aggregate_names = spec
-            .aggregates
-            .iter()
-            .map(|expression| format_aggregate_expr(expression, spec, &formatter))
-            .collect::<Vec<_>>();
-        let reduction_formatter = ExplainExpressionFormatter::new(&aggregate_names);
         push_string_property(
             properties,
             "Post Reduction",
             reduction
                 .reducers
                 .iter()
-                .map(|expression| reduction_formatter.format(expression))
+                .map(|expression| result_formatter.format(expression))
                 .collect::<Vec<_>>()
                 .join(", "),
         );
         push_string_property(
             properties,
             "Post Predicate",
-            reduction_formatter.format(&reduction.predicate),
+            result_formatter.format(&reduction.predicate),
         );
     }
     if !spec.grouping_sets.is_empty() {

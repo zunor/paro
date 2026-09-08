@@ -126,6 +126,33 @@ class QualityGateTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             select_boundary(root, {"operator": "ROWSET_SCAN"})
 
+    def test_having_boundary_survives_fusion_without_selecting_pre_filter_rows(self):
+        predicate = "sum(quantity) > 100"
+        aggregate = {"operator": "AGGREGATE", "properties": {"Group Key": "key"}}
+        selector = {"alternatives": [
+            {"operator": "AGGREGATE", "properties": {"Group Key": "key", "Having": predicate}},
+            {"operator": "FILTER", "properties": {"Filter": predicate},
+             "child": {"operator": "AGGREGATE", "properties": {"Group Key": "key"}}},
+        ]}
+        with self.assertRaises(ValueError):
+            select_boundary(aggregate, selector)
+        standalone = {"operator": "FILTER", "properties": {"Filter": predicate}, "children": [aggregate]}
+        self.assertIs(select_boundary(standalone, selector), standalone)
+        fused = {"operator": "AGGREGATE", "properties": {"Group Key": "key", "Having": predicate}}
+        self.assertIs(select_boundary(fused, selector), fused)
+        with self.assertRaises(ValueError):
+            select_boundary({"operator": "UNION", "children": [standalone, fused]}, selector)
+        wrong_input = {**standalone, "children": [{"operator": "ROWSET_SCAN"}]}
+        with self.assertRaises(ValueError):
+            select_boundary(wrong_input, selector)
+
+    def test_selector_schema_fails_closed_instead_of_ignoring_misspellings(self):
+        for selector in ({"alternatives": []}, {"operator": "FILTER", "property": {}},
+                         {"operator": "FILTER", "child": {"operatr": "AGGREGATE"}},
+                         {"operator": "FILTER", "alternatives": [{"operator": "FILTER"}]}):
+            with self.subTest(selector=selector), self.assertRaises(ValueError):
+                select_boundary({"operator": "FILTER"}, selector)
+
 
 if __name__ == "__main__":
     unittest.main()

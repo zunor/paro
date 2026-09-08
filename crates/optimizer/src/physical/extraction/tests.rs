@@ -711,6 +711,13 @@ fn arena_extractor_fuses_aggregate_only_having_into_aggregate_emit() {
         panic!("expected aggregate reference in HAVING");
     };
     assert_eq!(reference.index, 0);
+    let explain: serde_json::Value =
+        serde_json::from_str(&plan.format_explain_json(ExplainSpec::default())).unwrap();
+    assert_eq!(
+        explain["plan"]["properties"]["Having"],
+        "count_star(*) > 1",
+        "HAVING must name the aggregate result, not grouping column zero"
+    );
 }
 
 #[test]
