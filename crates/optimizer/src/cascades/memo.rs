@@ -611,6 +611,10 @@ impl RowGoal {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum GrantGoalKey {
     Invariant(AdmissibleGrantSetId),
+    Parallelism {
+        admissible: AdmissibleGrantSetId,
+        tasks: u16,
+    },
     Class(ResourceGrantClassId),
 }
 
@@ -618,6 +622,9 @@ impl GrantGoalKey {
     pub(crate) const fn stable_tag(self) -> u64 {
         match self {
             Self::Invariant(set) => set.0 as u64,
+            Self::Parallelism { admissible, tasks } => {
+                (1_u64 << 62) | ((tasks as u64) << 32) | admissible.0 as u64
+            }
             Self::Class(class) => (1_u64 << 63) | class.0 as u64,
         }
     }

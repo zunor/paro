@@ -239,15 +239,9 @@ impl StatementProgram {
             dependency_available,
         )?;
         admitted.plan.execution_resources = Some(admitted.resources);
-        admitted
-            .plan
-            .properties
-            .get_mut(admitted.plan.root)
-            .ok_or_else(|| {
-                paro_common::error::internal("admitted physical root lost its property contract")
-            })?
-            .grant_contract =
-            paro_optimizer::physical::PhysicalGrantContract::Class(admitted.resources.class);
+        // Retain the optimizer's sharing proof. The reservation selects an
+        // operating point; it does not change which points the winner was
+        // costed for. Physical verification checks root and child contracts.
         Self::from_physical_plan(admitted.plan)
     }
 

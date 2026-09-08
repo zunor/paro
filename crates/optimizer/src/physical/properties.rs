@@ -19,7 +19,25 @@ pub type MemoryBytes = u64;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PhysicalGrantContract {
     Invariant(AdmissibleGrantSetId),
+    Parallelism {
+        admissible: AdmissibleGrantSetId,
+        tasks: u16,
+    },
     Class(ResourceGrantClassId),
+}
+
+impl PhysicalGrantContract {
+    /// A shared Memo winner is executable only at an operating point for
+    /// which its cost and task-supply contract were proved. Admission must
+    /// check every selected child, not just overwrite the root's proof.
+    pub(crate) fn accepts(self, class: ResourceGrantClassId, tasks: u16) -> bool {
+        tasks != 0
+            && match self {
+                Self::Invariant(_) => true,
+                Self::Parallelism { tasks: priced, .. } => priced == tasks,
+                Self::Class(priced) => priced == class,
+            }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

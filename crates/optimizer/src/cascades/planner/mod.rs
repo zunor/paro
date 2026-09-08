@@ -317,7 +317,7 @@ impl OptimizationInput {
             self.root,
             self.root_goal,
             AdmissibleGrantSetId(0),
-            grant_classes.keys().copied(),
+            grant_classes.values().copied(),
             self.mode,
         )?;
         let mut variants = Vec::with_capacity(grant_optimization.winners.len());

@@ -154,6 +154,16 @@ pub(super) fn planner_grant_dependency(operator: &LogicalOperator) -> GrantDepen
             | LogicalOperator::Join(_)
     ) {
         GrantDependencyDescriptor::Sensitive
+    } else if matches!(
+        operator,
+        LogicalOperator::Get(_)
+            | LogicalOperator::SearchScan(_)
+            | LogicalOperator::FullTextFilterScan(_)
+            | LogicalOperator::GraphScan(_)
+            | LogicalOperator::CTERef(_)
+            | LogicalOperator::ExternalTable(_)
+    ) {
+        GrantDependencyDescriptor::Parallelism
     } else {
         GrantDependencyDescriptor::Invariant
     }
@@ -548,7 +558,7 @@ pub(super) fn append_grant_fingerprint(
     dependency: GrantDependencyDescriptor,
     grant: GrantGoalKey,
 ) {
-    if dependency == GrantDependencyDescriptor::Sensitive {
+    if dependency != GrantDependencyDescriptor::Invariant {
         fingerprint.write_u64(grant.stable_tag());
     }
 }
@@ -561,7 +571,7 @@ pub(super) fn cost_for_grant(
     classes: &BTreeMap<crate::cascades::ids::ResourceGrantClassId, ResourceGrantClass>,
     force_spill: bool,
 ) -> Result<Option<SearchCost>> {
-    if dependency == GrantDependencyDescriptor::Invariant {
+    if dependency != GrantDependencyDescriptor::Sensitive {
         if cost.peak_memory_upper == u64::MAX || cost.memory_completion.is_runtime_capped() {
             return Err(paro_error::internal(
                 "unbounded or runtime-capped memory makes an implementation grant-sensitive",
@@ -674,6 +684,8 @@ pub(super) fn planner_enforcer_cost_input(
         input.hard_memory_bytes = class.hard_memory_bytes;
         input.spill_policy = class.spill_policy;
         input.max_parallel_tasks = class.max_parallel_tasks.max(1);
+    } else if let GrantGoalKey::Parallelism { tasks, .. } = grant {
+        input.max_parallel_tasks = tasks;
     }
     Ok(input)
 }

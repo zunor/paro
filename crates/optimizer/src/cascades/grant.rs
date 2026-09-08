@@ -12,8 +12,9 @@ use super::memo::Memo;
 use super::rules::{GrantDependencyDescriptor, ImplementationContext, ImplementationRegistry};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct GrantInvarianceProof {
+pub struct GrantSharingProof {
     pub root: GroupId,
+    pub dependency: GrantDependencyDescriptor,
     pub registry_fingerprint: Fingerprint,
     pub groups: Box<[GroupId]>,
     pub implementations: Box<[ImplementationId]>,
@@ -21,16 +22,43 @@ pub struct GrantInvarianceProof {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum GrantSensitivitySummary {
-    Invariant(GrantInvarianceProof),
+    Shared(GrantSharingProof),
     Sensitive {
         witness_group: GroupId,
         witness_implementation: ImplementationId,
+    },
+    RequiredEnforcement {
+        group: GroupId,
+        required: super::ids::PropertySetId,
     },
 }
 
 impl GrantSensitivitySummary {
     pub fn is_sensitive(&self) -> bool {
-        matches!(self, Self::Sensitive { .. })
+        matches!(
+            self,
+            Self::Sensitive { .. } | Self::RequiredEnforcement { .. }
+        )
+    }
+
+    pub fn goal_for(
+        &self,
+        admissible: super::ids::AdmissibleGrantSetId,
+        class: crate::physical::ResourceGrantClass,
+    ) -> super::memo::GrantGoalKey {
+        use super::memo::GrantGoalKey;
+        match self {
+            Self::Shared(proof) if proof.dependency == GrantDependencyDescriptor::Invariant => {
+                GrantGoalKey::Invariant(admissible)
+            }
+            Self::Shared(proof) if proof.dependency == GrantDependencyDescriptor::Parallelism => {
+                GrantGoalKey::Parallelism {
+                    admissible,
+                    tasks: class.max_parallel_tasks,
+                }
+            }
+            _ => GrantGoalKey::Class(class.id),
+        }
     }
 }
 
@@ -46,6 +74,7 @@ pub fn derive_grant_sensitivity(
     let mut pending = vec![root];
     let mut groups = BTreeSet::new();
     let mut implementations = BTreeSet::new();
+    let mut dependency = GrantDependencyDescriptor::Invariant;
 
     while let Some(group) = pending.pop() {
         let group = memo.canonical_group(group);
@@ -63,20 +92,25 @@ pub fn derive_grant_sensitivity(
             let context = ImplementationContext { memo, group };
             for (implementation_id, implementation) in registry.implementation_entries() {
                 implementations.insert(implementation_id);
-                if implementation.grant_dependency_for(logical, &context)
-                    == GrantDependencyDescriptor::Sensitive
-                {
-                    return Ok(GrantSensitivitySummary::Sensitive {
-                        witness_group: group,
-                        witness_implementation: implementation_id,
-                    });
+                match implementation.grant_dependency_for(logical, &context) {
+                    GrantDependencyDescriptor::Sensitive => {
+                        return Ok(GrantSensitivitySummary::Sensitive {
+                            witness_group: group,
+                            witness_implementation: implementation_id,
+                        });
+                    }
+                    GrantDependencyDescriptor::Parallelism => {
+                        dependency = GrantDependencyDescriptor::Parallelism;
+                    }
+                    GrantDependencyDescriptor::Invariant => {}
                 }
             }
         }
     }
 
-    Ok(GrantSensitivitySummary::Invariant(GrantInvarianceProof {
+    Ok(GrantSensitivitySummary::Shared(GrantSharingProof {
         root,
+        dependency,
         registry_fingerprint: registry_fingerprint(registry),
         groups: groups.into_iter().collect::<Vec<_>>().into_boxed_slice(),
         implementations: implementations
@@ -86,18 +120,19 @@ pub fn derive_grant_sensitivity(
     }))
 }
 
-pub fn verify_grant_invariance(
+pub fn verify_grant_sharing(
     memo: &Memo,
     registry: &ImplementationRegistry,
-    proof: &GrantInvarianceProof,
+    proof: &GrantSharingProof,
 ) -> Result<()> {
     match derive_grant_sensitivity(memo, registry, proof.root)? {
-        GrantSensitivitySummary::Invariant(recomputed) if &recomputed == proof => Ok(()),
-        GrantSensitivitySummary::Invariant(_) => Err(paro_error::internal(
-            "grant invariance proof does not match the current Memo/registry closure",
+        GrantSensitivitySummary::Shared(recomputed) if &recomputed == proof => Ok(()),
+        GrantSensitivitySummary::Shared(_) => Err(paro_error::internal(
+            "grant sharing proof does not match the current Memo/registry closure",
         )),
-        GrantSensitivitySummary::Sensitive { .. } => Err(paro_error::internal(
-            "grant invariance proof covers a grant-sensitive implementation",
+        GrantSensitivitySummary::Sensitive { .. }
+        | GrantSensitivitySummary::RequiredEnforcement { .. } => Err(paro_error::internal(
+            "grant sharing proof covers a memory-class-sensitive implementation",
         )),
     }
 }
@@ -108,7 +143,8 @@ fn registry_fingerprint(registry: &ImplementationRegistry) -> Fingerprint {
         builder.write_u64(id.0 as u64);
         builder.write_u64(match implementation.grant_dependency() {
             GrantDependencyDescriptor::Invariant => 0,
-            GrantDependencyDescriptor::Sensitive => 1,
+            GrantDependencyDescriptor::Parallelism => 1,
+            GrantDependencyDescriptor::Sensitive => 2,
         });
     }
     builder.finish()
@@ -193,12 +229,12 @@ mod tests {
     fn invariant_proof_is_recomputed_against_registry_closure() {
         let (memo, root) = seeded_memo();
         let registry = ImplementationRegistry::default();
-        let GrantSensitivitySummary::Invariant(proof) =
+        let GrantSensitivitySummary::Shared(proof) =
             derive_grant_sensitivity(&memo, &registry, root).unwrap()
         else {
             panic!("expected invariant closure")
         };
-        verify_grant_invariance(&memo, &registry, &proof).unwrap();
+        verify_grant_sharing(&memo, &registry, &proof).unwrap();
     }
 
     #[test]

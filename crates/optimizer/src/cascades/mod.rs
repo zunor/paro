@@ -39,7 +39,7 @@ pub use column::{
 };
 pub use cost::{CompactRange, SearchCost};
 pub use engine::{CascadesEngine, GrantOptimization, GrantWinner, SearchMode};
-pub use grant::{GrantInvarianceProof, GrantSensitivitySummary};
+pub use grant::{GrantSensitivitySummary, GrantSharingProof};
 pub use ids::*;
 pub use memo::{Memo, OptimizationGoal, Winner};
 pub use planner::{

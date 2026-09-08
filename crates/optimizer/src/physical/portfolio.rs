@@ -313,6 +313,15 @@ impl PhysicalPlanPortfolio<PhysicalPlan> {
                         "physical portfolio variant references an undeclared grant class",
                     )
                 })?;
+                if variant.plan.properties.iter().any(|(_, properties)| {
+                    !properties
+                        .grant_contract
+                        .accepts(grant.id, grant.max_parallel_tasks)
+                }) {
+                    return Err(paro_error::internal(
+                        "physical portfolio advertises an incompatible node grant contract",
+                    ));
+                }
                 if variant.cost.peak_memory_upper > grant.hard_memory_bytes {
                     return Err(paro_error::internal(
                         "physical portfolio variant exceeds an advertised grant class",
@@ -360,15 +369,6 @@ impl PhysicalPlanPortfolio<PhysicalPlan> {
                 return Err(paro_error::internal(
                     "portfolio cost disagrees with the verified root winner cost",
                 ));
-            }
-            if let crate::physical::PhysicalGrantContract::Class(required) =
-                root_properties.grant_contract
-            {
-                if !variant.admissible_classes.contains(&required) {
-                    return Err(paro_error::internal(
-                        "class-specific plan is not advertised for its optimization class",
-                    ));
-                }
             }
         }
         let candidate_space = &self.variants[0].plan.dependencies;

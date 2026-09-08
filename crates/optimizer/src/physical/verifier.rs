@@ -352,12 +352,14 @@ impl PhysicalPlanVerifier {
                     "admitted plan exceeds its execution resource contract",
                 ));
             }
-            if let crate::physical::PhysicalGrantContract::Class(required) = root.grant_contract {
-                if required != resources.class {
-                    return Err(paro_error::internal(
-                        "admitted plan reservation has the wrong grant class",
-                    ));
-                }
+            if plan.properties.iter().any(|(_, properties)| {
+                !properties
+                    .grant_contract
+                    .accepts(resources.class, resources.max_parallel_tasks)
+            }) {
+                return Err(paro_error::internal(
+                    "admitted plan reservation violates a node grant contract",
+                ));
             }
         }
         verify_acyclic(&dependencies)
@@ -673,6 +675,44 @@ mod tests {
             PlanChildrenArena::default(),
             properties_by_node,
         );
+        PhysicalPlanVerifier::verify(&plan).unwrap();
+    }
+
+    #[test]
+    fn admission_checks_child_capacity_not_only_the_root_class() {
+        let class = crate::physical::ResourceGrantClassId(7);
+        let mut nodes = PhysicalPlanNodeArena::default();
+        let source = nodes.push(node(PlanChildren::Empty));
+        let mut children = PlanChildrenArena::default();
+        let root = nodes.push(node(children.pack(vec![source])));
+        let mut properties_by_node = PlanPropertyMap::default();
+        let mut source_properties = properties(&[]);
+        source_properties.grant_contract = PhysicalGrantContract::Parallelism {
+            admissible: AdmissibleGrantSetId(0),
+            tasks: 4,
+        };
+        properties_by_node.insert(source, source_properties);
+        let mut root_properties = properties(&[]);
+        root_properties.grant_contract = PhysicalGrantContract::Class(class);
+        properties_by_node.insert(root, root_properties);
+        let mut plan = PhysicalPlan::new(root, nodes, children, properties_by_node);
+        plan.execution_resources = Some(crate::physical::ExecutionResourceContract {
+            class,
+            minimum_memory_bytes: 0,
+            working_set_memory_bytes: 0,
+            memory_ceiling_bytes: 1024,
+            memory_completion: crate::physical::MemoryCompletion::Guaranteed,
+            max_parallel_tasks: 2,
+            external_worker_slots: 0,
+        });
+        assert!(PhysicalPlanVerifier::verify(&plan)
+            .unwrap_err()
+            .to_string()
+            .contains("node grant contract"));
+        plan.execution_resources
+            .as_mut()
+            .unwrap()
+            .max_parallel_tasks = 4;
         PhysicalPlanVerifier::verify(&plan).unwrap();
     }
 

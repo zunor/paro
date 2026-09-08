@@ -18,9 +18,12 @@ fn parallel_tasks_for_goal(
                     "physical implementation references an unknown resource grant class",
                 )
             }),
-        // Grant-invariant implementations own no task-scaled blocking state.
-        // Keeping their local contract single-task avoids smuggling a session
-        // setting into an otherwise shareable winner.
+        GrantGoalKey::Parallelism { tasks, .. } if tasks > 0 => Ok(tasks),
+        GrantGoalKey::Parallelism { .. } => {
+            Err(paro_error::internal("capacity goal has zero workers"))
+        }
+        // Only an explicit proof of independence from both memory and task
+        // capacity permits this shared single-task operating point.
         GrantGoalKey::Invariant(_) => Ok(1),
     }
 }
@@ -105,14 +108,24 @@ impl PhysicalImplementation for PlannerBaselineImplementation {
     fn grant_dependency_for(
         &self,
         expr: &crate::cascades::memo::LogicalExpr,
-        _ctx: &ImplementationContext<'_>,
+        ctx: &ImplementationContext<'_>,
     ) -> GrantDependencyDescriptor {
         self.planner_state
             .read()
             .expect("planner transform state poisoned")
             .metadata
             .get(&expr.payload)
-            .map(|metadata| metadata.grant_dependency)
+            .map(|metadata| {
+                if metadata.child_required.iter().any(|required| {
+                    ctx.memo.required(*required).is_none_or(
+                        crate::cascades::enforcer::EnforcementPlanner::requires_memory_class,
+                    )
+                }) {
+                    GrantDependencyDescriptor::Sensitive
+                } else {
+                    metadata.grant_dependency
+                }
+            })
             .unwrap_or(GrantDependencyDescriptor::Sensitive)
     }
 

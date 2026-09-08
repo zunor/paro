@@ -334,6 +334,20 @@ pub struct EnforcementPlanner {
 }
 
 impl EnforcementPlanner {
+    /// A logical closure can be memory independent while its *required*
+    /// output needs a blocking conversion. Keep those goals class specific
+    /// before deriving candidates; otherwise the enforcer would be priced
+    /// with an unbounded memory grant. A requirement is an upper bound on
+    /// possible enforcement, not a claim that every candidate needs it.
+    pub(crate) fn requires_memory_class(required: &RequiredProperties) -> bool {
+        matches!(required.ordering, OrderingRequirement::Ordered(_))
+            || matches!(
+                required.mutation_safety,
+                MutationSafetyRequirement::StableReadBeforeWrite { .. }
+            )
+            || required.replayability == ReplayabilityRequirement::Rewindable
+    }
+
     pub fn new(max_optional_depth: u8, max_optional_chains: u8) -> Self {
         Self {
             templates: BTreeMap::new(),

@@ -152,6 +152,12 @@ pub(super) fn extract_planner_tree(
                     GrantGoalKey::Invariant(set) => {
                         crate::physical::properties::PhysicalGrantContract::Invariant(set)
                     }
+                    GrantGoalKey::Parallelism { admissible, tasks } => {
+                        crate::physical::properties::PhysicalGrantContract::Parallelism {
+                            admissible,
+                            tasks,
+                        }
+                    }
                     GrantGoalKey::Class(class) => {
                         crate::physical::properties::PhysicalGrantContract::Class(class)
                     }

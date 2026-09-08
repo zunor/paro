@@ -35,6 +35,9 @@ use crate::physical::ObjectiveProfile;
 #[path = "tests/closure.rs"]
 mod closure;
 
+#[path = "tests/grant_capacity.rs"]
+mod grant_capacity;
+
 #[test]
 fn streaming_task_supply_is_inherited_from_the_child_pipeline() {
     let calibration = MachineCalibrationBundle::default();
@@ -3029,7 +3032,12 @@ fn grant_sensitive_parent_reuses_invariant_child_goal_across_classes() {
             root,
             goal,
             AdmissibleGrantSetId(9),
-            [ResourceGrantClassId(1), ResourceGrantClassId(2)],
+            [1, 2].map(|id| ResourceGrantClass {
+                id: ResourceGrantClassId(id),
+                hard_memory_bytes: 1 << 30,
+                max_parallel_tasks: 4,
+                spill_policy: SpillPolicy::Allowed,
+            }),
             SearchMode::Direct,
         )
         .unwrap();

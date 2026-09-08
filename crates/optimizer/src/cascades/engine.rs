@@ -15,7 +15,7 @@ use super::calibration::{
 };
 use super::cost::{CompactRange, MemoryCompletion, ResourceDimension, SearchCost};
 use super::enforcer::{EnforcementPlanner, EnforcerStep};
-use super::grant::{derive_grant_sensitivity, verify_grant_invariance, GrantSensitivitySummary};
+use super::grant::{derive_grant_sensitivity, verify_grant_sharing, GrantSensitivitySummary};
 use super::ids::{
     AdmissibleGrantSetId, Fingerprint, GroupId, ImplementationId, LogicalExprId, PhysicalExprId,
     ResourceGrantClassId, RuleId, StableFingerprintBuilder,
@@ -35,7 +35,7 @@ use super::rules::{
     PatternRead, PhysicalCandidate, RuleContext, SourceFilterWork, SourceRetentionProof,
     SourceWork, TaskSupplyContract, TransformContext,
 };
-use crate::physical::SpillPolicy;
+use crate::physical::{ResourceGrantClass, SpillPolicy};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SearchMode {
@@ -178,6 +178,7 @@ pub struct CascadesEngine {
     infeasible_goals: BTreeSet<(GroupId, OptimizationGoal)>,
     active_goals: BTreeSet<(GroupId, OptimizationGoal)>,
     grant_class_sets: BTreeMap<ResourceGrantClassId, AdmissibleGrantSetId>,
+    grant_classes: BTreeMap<ResourceGrantClassId, ResourceGrantClass>,
     grant_sensitivity: BTreeMap<GroupId, GrantSensitivitySummary>,
     rule_attempts: BTreeMap<RuleId, u64>,
     effective_rule_insertions: BTreeMap<RuleId, u64>,
@@ -217,6 +218,7 @@ impl CascadesEngine {
             infeasible_goals: BTreeSet::new(),
             active_goals: BTreeSet::new(),
             grant_class_sets: BTreeMap::new(),
+            grant_classes: BTreeMap::new(),
             grant_sensitivity: BTreeMap::new(),
             rule_attempts: BTreeMap::new(),
             effective_rule_insertions: BTreeMap::new(),
@@ -303,10 +305,24 @@ impl CascadesEngine {
         root: GroupId,
         base_goal: OptimizationGoal,
         admissible_set: AdmissibleGrantSetId,
-        classes: impl IntoIterator<Item = ResourceGrantClassId>,
+        classes: impl IntoIterator<Item = ResourceGrantClass>,
         mode: SearchMode,
     ) -> Result<GrantOptimization> {
-        let classes: BTreeSet<_> = classes.into_iter().collect();
+        let mut class_map = BTreeMap::new();
+        for class in classes {
+            if class.max_parallel_tasks == 0 {
+                return Err(paro_error::internal("grant class has zero worker capacity"));
+            }
+            if class_map
+                .insert(class.id, class)
+                .is_some_and(|prior| prior != class)
+            {
+                return Err(paro_error::internal(
+                    "grant class id has conflicting operating points",
+                ));
+            }
+        }
+        let classes = class_map;
         if classes.is_empty() {
             return Err(paro_error::internal(
                 "grant portfolio optimization requires at least one class",
@@ -360,74 +376,54 @@ impl CascadesEngine {
         root: GroupId,
         base_goal: OptimizationGoal,
         admissible_set: AdmissibleGrantSetId,
-        classes: &BTreeSet<ResourceGrantClassId>,
+        classes: &BTreeMap<ResourceGrantClassId, ResourceGrantClass>,
     ) -> Result<GrantOptimization> {
         self.grant_class_sets.clear();
         self.grant_class_sets
-            .extend(classes.iter().copied().map(|class| (class, admissible_set)));
+            .extend(classes.keys().copied().map(|class| (class, admissible_set)));
+        self.grant_classes.clone_from(classes);
         self.grant_sensitivity.clear();
         let root = self.memo.canonical_group(root);
-        let mut sensitivity = self.grant_sensitivity(root)?;
-        if matches!(
-            self.memo
-                .required(base_goal.required)
-                .map(|required| &required.mutation_safety),
-            Some(super::properties::MutationSafetyRequirement::StableReadBeforeWrite { .. })
-        ) {
-            // MutationInputSpool is a blocking, currently non-spillable
-            // correctness enforcer. It must never hide under an invariant
-            // root goal even when every relational implementation is itself
-            // grant invariant.
-            sensitivity = GrantSensitivitySummary::Sensitive {
-                witness_group: root,
-                witness_implementation: ImplementationId::INVALID,
-            };
-        }
+        let sensitivity = self.goal_grant_sensitivity(root, base_goal.required)?;
         let mut winners = Vec::with_capacity(classes.len());
-        match &sensitivity {
-            GrantSensitivitySummary::Invariant(proof) => {
-                let goal = OptimizationGoal {
-                    grant: GrantGoalKey::Invariant(admissible_set),
-                    ..base_goal
-                };
-                let winner = self.optimize(root, goal, SearchMode::Direct)?;
-                verify_grant_invariance(&self.memo, &self.registry, proof)?;
-                winners.extend(classes.iter().copied().map(|class| GrantWinner {
-                    class,
+        let mut last_infeasible = None;
+        for class in classes.values().copied() {
+            let goal = OptimizationGoal {
+                grant: sensitivity.goal_for(admissible_set, class),
+                ..base_goal
+            };
+            self.optimize_group(root, goal)?;
+            if let Some(winner) = self
+                .memo
+                .group(root)
+                .and_then(|group| group.winner_frontier(goal))
+                .and_then(|frontier| {
+                    // Sharing removes redundant costing, not per-class
+                    // feasibility. A memory-independent implementation can
+                    // still have a finite, nonzero working set.
+                    frontier.candidates().iter().find(|winner| {
+                        winner.cost.peak_memory_upper <= class.hard_memory_bytes
+                            && (winner.cost.spill_bytes_expected == 0
+                                || class.spill_policy == SpillPolicy::Allowed)
+                    })
+                })
+                .cloned()
+            {
+                winners.push(GrantWinner {
+                    class: class.id,
                     goal,
-                    winner: winner.clone(),
-                }));
+                    winner,
+                });
+            } else {
+                last_infeasible = Some(goal);
             }
-            GrantSensitivitySummary::Sensitive { .. } => {
-                let mut last_infeasible = None;
-                for class in classes.iter().copied() {
-                    let goal = OptimizationGoal {
-                        grant: GrantGoalKey::Class(class),
-                        ..base_goal
-                    };
-                    self.optimize_group(root, goal)?;
-                    if let Some(winner) = self
-                        .memo
-                        .group(root)
-                        .and_then(|group| group.winner(goal))
-                        .cloned()
-                    {
-                        winners.push(GrantWinner {
-                            class,
-                            goal,
-                            winner,
-                        });
-                    } else {
-                        last_infeasible = Some(goal);
-                    }
-                }
-                super::verifier::MemoVerifier::verify(&self.memo, None)?;
-                if winners.is_empty() {
-                    return Err(
-                        self.infeasible_goal_error(root, last_infeasible.unwrap_or(base_goal))
-                    );
-                }
-            }
+        }
+        super::verifier::MemoVerifier::verify(&self.memo, None)?;
+        if let GrantSensitivitySummary::Shared(proof) = &sensitivity {
+            verify_grant_sharing(&self.memo, &self.registry, proof)?;
+        }
+        if winners.is_empty() {
+            return Err(self.infeasible_goal_error(root, last_infeasible.unwrap_or(base_goal)));
         }
         Ok(GrantOptimization {
             sensitivity,
@@ -448,22 +444,65 @@ impl CascadesEngine {
     fn normalized_child_grant(
         &mut self,
         child: GroupId,
+        required: super::ids::PropertySetId,
         parent: GrantGoalKey,
     ) -> Result<GrantGoalKey> {
+        let sensitivity = self.goal_grant_sensitivity(child, required)?;
         match parent {
-            GrantGoalKey::Invariant(set) => Ok(GrantGoalKey::Invariant(set)),
+            GrantGoalKey::Invariant(set) => match sensitivity {
+                GrantSensitivitySummary::Shared(proof)
+                    if proof.dependency == super::rules::GrantDependencyDescriptor::Invariant =>
+                {
+                    Ok(GrantGoalKey::Invariant(set))
+                }
+                _ => Err(paro_error::internal(
+                    "invariant goal lost a child grant dependency",
+                )),
+            },
+            GrantGoalKey::Parallelism { admissible, tasks } => match sensitivity {
+                GrantSensitivitySummary::Shared(proof) => match proof.dependency {
+                    super::rules::GrantDependencyDescriptor::Invariant => {
+                        Ok(GrantGoalKey::Invariant(admissible))
+                    }
+                    super::rules::GrantDependencyDescriptor::Parallelism => Ok(parent),
+                    super::rules::GrantDependencyDescriptor::Sensitive => {
+                        Err(paro_error::internal("invalid grant-sharing proof"))
+                    }
+                },
+                GrantSensitivitySummary::Sensitive { .. }
+                | GrantSensitivitySummary::RequiredEnforcement { .. } => Err(paro_error::internal(
+                    format!("capacity-only goal ({tasks} tasks) lost a child memory dependency"),
+                )),
+            },
             GrantGoalKey::Class(class) => {
                 let set = self.grant_class_sets.get(&class).copied().ok_or_else(|| {
                     paro_error::internal(
                         "class goal was optimized outside a declared admissible grant set",
                     )
                 })?;
-                Ok(match self.grant_sensitivity(child)? {
-                    GrantSensitivitySummary::Invariant(_) => GrantGoalKey::Invariant(set),
-                    GrantSensitivitySummary::Sensitive { .. } => GrantGoalKey::Class(class),
-                })
+                let operating_point = self.grant_classes.get(&class).copied().ok_or_else(|| {
+                    paro_error::internal("class goal lost its worker-capacity contract")
+                })?;
+                Ok(sensitivity.goal_for(set, operating_point))
             }
         }
+    }
+
+    fn goal_grant_sensitivity(
+        &mut self,
+        group: GroupId,
+        required: super::ids::PropertySetId,
+    ) -> Result<GrantSensitivitySummary> {
+        let properties = self.memo.required(required).ok_or_else(|| {
+            paro_error::internal("grant dependency references unknown required properties")
+        })?;
+        if EnforcementPlanner::requires_memory_class(properties) {
+            return Ok(GrantSensitivitySummary::RequiredEnforcement {
+                group: self.memo.canonical_group(group),
+                required,
+            });
+        }
+        self.grant_sensitivity(group)
     }
 
     fn explore_transformations(&mut self) -> Result<()> {
@@ -1454,7 +1493,8 @@ impl CascadesEngine {
             .filterable_sources()
             .clone();
         for (ordinal, (child, child_goal)) in candidate.child_goals.iter_mut().enumerate() {
-            child_goal.grant = self.normalized_child_grant(*child, goal.grant)?;
+            child_goal.grant =
+                self.normalized_child_grant(*child, child_goal.required, goal.grant)?;
             let mut sources = inherited_sources.clone();
             if let Some((filtered_child, filters)) = candidate.cost_composition.sideways_filter() {
                 if ordinal == filtered_child {
