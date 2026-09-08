@@ -404,3 +404,28 @@ At `e70279b0`: full workspace **6486 passed / 85 ignored**, optimizer **1015
 passed**, strict workspace/all-target Clippy passes. New cold and instrumented
 allocation measurements will establish whether the storage change improves
 the measured workload; no search-budget constant was changed.
+
+Post-change evidence at `f26fa6c2` (code `e70279b0`):
+
+- `native-q11-cold-published-winners-20260909.json`: five fresh processes,
+  median **1377.81 ms**, versus 1442.61 ms in the shared-kernels report. Median
+  peak RSS **348,913,664 bytes**, versus 563,888,128 bytes. The strict cold gate
+  passes at `--max-ratio 1.0`; every pre-existing search, settlement and exhaustion
+  counter is identical. The plan-text digest differs following native scalar
+  export/presentation changes; this is not a claim of identical EXPLAIN text.
+  New counters consistently record **28,440 proposals / 13,244 publications**.
+- `native-q11-allocation-published-winners-20260909.json`: Memo allocation
+  traffic **2,311,132,057 bytes**, versus 2,865,500,578. Rule-attempt counts are
+  unchanged; this instrumented run is not the latency baseline.
+- `native-q11-execution-published-winners-20260909.json`: seven fresh process
+  blocks, 70 measured samples per engine, all complete **90-row** results and
+  ordered keys verified. Paro median **98.9705 ms**, DuckDB **105.0055 ms**;
+  paired ratio **0.943802**, hierarchical 95% CI **[0.938306, 0.949709]**. The
+  report qualifies as faster than DuckDB for this four-thread, 2 GB, SF1,
+  metadata-symmetric configuration. This is warmed execution, not cold end-to-end
+  parity: first-statement medians are Paro **1493.322 ms** and DuckDB **107.612
+  ms**. No general latency or scaling result is inferred from this comparison.
+
+The Q11 warmed-execution target is met at that revision. Cold planning parity,
+all native relational transformations and query-owned memory admission remain
+open. Further implementation needs its own post-change validation.
