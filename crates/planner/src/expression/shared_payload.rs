@@ -9,6 +9,12 @@ use std::sync::Arc;
 
 use super::*;
 
+/// Identity of one currently live immutable allocation, not scalar semantics.
+/// Equality is useful while both expressions are borrowed. A retained cache
+/// must also hold a liveness witness; an address alone may be reused after drop.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct ExpressionIdentity(usize);
+
 /// The complete owned-child contract of a scalar payload. Destruction consumes
 /// these edges iteratively, including aggregate modifiers and window frames.
 pub trait ExpressionPayload: Clone + std::fmt::Debug {
@@ -27,6 +33,10 @@ impl<T: ExpressionPayload> std::fmt::Debug for SharedExpressionPayload<T> {
 }
 
 impl<T: ExpressionPayload> SharedExpressionPayload<T> {
+    pub(crate) fn allocation_identity(&self) -> ExpressionIdentity {
+        ExpressionIdentity(Arc::as_ptr(self.inner.as_ref().expect("live scalar payload")) as usize)
+    }
+
     pub fn new(payload: T) -> Self {
         Self {
             inner: Some(Arc::new(payload)),

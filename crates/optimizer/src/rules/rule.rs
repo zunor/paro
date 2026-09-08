@@ -12,9 +12,6 @@ use super::expression_matcher::ExpressionMatcher;
 pub enum RuleResult {
     /// The rule made changes and returned a new expression.
     Changed(Box<Expression>),
-    /// The rule made changes but the root expression is the same (in-place modification).
-    /// The rewriter should re-run rules on the children.
-    Rerun,
     /// The rule did not make any changes.
     NoChange,
 }
@@ -60,7 +57,6 @@ pub trait Rule {
     ///
     /// # Returns
     /// * `RuleResult::Changed(expr)` - The rule transformed the expression
-    /// * `RuleResult::Rerun` - The rule made changes, re-run rules on same expression
     /// * `RuleResult::NoChange` - The rule did not apply
     fn apply(&self, op: &LogicalOperator, bindings: Vec<&Expression>, is_root: bool) -> RuleResult;
 

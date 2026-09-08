@@ -102,14 +102,24 @@ or debug-logging builds from latency evidence.
 | `native-q11-cold-journal-20260908.json` | `9e6e0c69` | 1490.2 ms | 1021 groups / 1841 logical / 2983 physical |
 | `native-q11-cold-evidence-20260908.json` | `62392da9` | 1652.7 ms | 1023 / 1817 / 2906; more frontier exhaustion and RSS |
 | `native-q11-cold-fact-cache-20260908.json` | `30240f8d` | 1490.4 ms | Exactly the preceding row's counts, hit/miss and exhaustion counters |
+| `native-q11-cold-shared-scalars-20260909.json` | `8321589e` | 1411.7 ms | Exactly the preceding row's counters; median peak RSS 580,042,752 bytes |
 
-The last comparison isolates about 9.8% less cold latency without reducing
-search. All three v2 reports have zero deadline expiry and zero rule failures,
+The fact-cache comparison isolates about 9.8% less cold latency without reducing
+search. All v2 reports above have zero deadline expiry and zero rule failures,
 but `search_complete=0`: finite deterministic search budgets still truncate
 exploration. The evidence-algebra change increased frontier pressure; the
 newer reports must **not** be blessed as a no-regression replacement for the
-journal report. No latency measurement above represents revisions after
-`30240f8d`.
+journal report. The shared-scalar migration reduces median cold latency a
+further 5.3% without changing those counters; its cold gate passes against
+`30240f8d`. No latency measurement above represents revisions after `8321589e`.
+
+The separately instrumented `native-q11-allocation-shared-scalars-20260909.json`
+at `8321589e` records 3,641,969,536 bytes in Memo exploration. Its main rule
+times are predicate transfer (217.8 ms), join-region enumeration (123.5 ms),
+dimension sharing (96.9 ms) and aggregate join subsumption (68.9 ms). Do not
+attribute its allocation difference from the older journal profile solely to
+scalar ownership: the intervening evidence-algebra change increased physical
+frontier work, and those reports have different search counts.
 
 The allocation-instrumented `native-q11-allocation-journal-20260908.json` recorded
 2,402,817,165 bytes in Memo exploration. This is allocation traffic, not peak
@@ -135,9 +145,16 @@ performance target. Later changes need a new execution comparison.
 - `19d80c63`: 28 column-statistics tests and 966 optimizer library tests passed;
   workspace/all-target Clippy passed. Three deterministic graph lifetime tests
   cover publication between phases, next-statement revalidation and pin release.
-- Shared scalar ownership migration: full workspace **6,423 passed, 85 ignored**;
-  workspace/all-target Clippy passed. SQL/cold measurements still need a rebuilt
-  server from this migration before they can qualify it.
+- Shared scalar ownership migration (`8321589e`): full workspace **6,423 passed,
+  85 ignored**; workspace/all-target Clippy passed. Rebuilt release SQL regress
+  is **184/184**, with no expected-result updates, using the fresh private
+  `/tmp/paro-shared-scalar-regress-w3MdTi/data` (45.31 s).
+- Persistent scalar normalization preserves the exact input handle on no-op;
+  child replacements detach only their ancestor path. It retains the existing
+  top-down rule order and fixed-point semantics but uses an explicit stack for
+  expressions and post-order operator visitation. The unused implicit-mutation
+  `Rerun` result was removed. Optimizer library tests: **968 passed**; planner
+  traversal tests: **8 passed**, including a 10,000-level small-stack check.
 
 For SQL regress, set `ulimit -n 8192` in **both** the server shell and runner
 shell. Restart-control cases inherit the runner's limit. Use the regression

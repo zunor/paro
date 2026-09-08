@@ -3,8 +3,6 @@
 
 //! Apply expression-level rewrite rules to a logical plan.
 
-use std::ops::ControlFlow;
-
 use paro_planner::expression::{Expression, ExpressionIterator};
 use paro_planner::operator::LogicalOperator;
 use paro_planner::plan::OwnedLogicalPlan;
@@ -34,28 +32,7 @@ impl ExpressionRewriter {
 
     /// Rewrite every operator/expression in a logical plan.
     pub fn rewrite_plan(&mut self, plan: &mut OwnedLogicalPlan) {
-        self.visit_logical_plan(plan);
-    }
-
-    /// Visit a logical operator and rewrite all expressions in it.
-    fn visit_operator(&mut self, op: &mut LogicalOperator) {
-        // First visit children
-        self.visit_operator_children(op);
-
-        // Then rewrite expressions in this operator
-        self.visit_operator_expressions(op);
-    }
-
-    fn visit_logical_plan(&mut self, plan: &mut OwnedLogicalPlan) {
-        self.visit_operator(&mut plan.operator);
-    }
-
-    /// Visit children of a logical operator.
-    fn visit_operator_children(&mut self, op: &mut LogicalOperator) {
-        let _ = op.visit_children_mut(|child| {
-            self.visit_logical_plan(child);
-            ControlFlow::Continue(())
-        });
+        plan.visit_post_order_mut(|node| self.visit_operator_expressions(&mut node.operator));
     }
 
     /// Visit and rewrite expressions in a logical operator.
@@ -78,50 +55,95 @@ impl ExpressionRewriter {
     fn rewrite_expression(&self, expr: &mut Expression, op: &LogicalOperator) {
         loop {
             let mut changes_made = false;
-            self.apply_rules(expr, op, &mut changes_made, true);
+            *expr = self.apply_rules(expr, op, &mut changes_made);
             if !changes_made {
                 break;
             }
         }
     }
 
-    /// Apply rules to an expression and its children.
+    /// Persistent top-down rewrite. A no-op retains the input allocation;
+    /// only parents of changed child occurrences are detached. The explicit
+    /// stack preserves rule order and root context without recursive calls.
     fn apply_rules(
         &self,
-        expr: &mut Expression,
+        expr: &Expression,
         op: &LogicalOperator,
         changes_made: &mut bool,
-        is_root: bool,
-    ) {
-        // Try to apply each rule to this expression
-        for rule in &self.rules {
-            let mut bindings = Vec::new();
-            if rule.matcher().matches(expr, &mut bindings) {
-                // Rule matches, try to apply it
-                match rule.apply(op, bindings, is_root) {
-                    RuleResult::Changed(new_expr) => {
+    ) -> Expression {
+        enum Task {
+            Enter(Expression, bool),
+            Finish(Expression, usize),
+        }
+        let mut pending = vec![Task::Enter(expr.clone(), true)];
+        let mut completed = Vec::<Expression>::new();
+        while let Some(task) = pending.pop() {
+            match task {
+                Task::Enter(mut expression, is_root) => {
+                    // A replacement is immediately reconsidered by the first
+                    // rule, before its children, just as in the rule contract.
+                    loop {
+                        let mut replacement = None;
+                        for rule in &self.rules {
+                            let mut bindings = Vec::new();
+                            if rule.matcher().matches(&expression, &mut bindings) {
+                                if let RuleResult::Changed(rewritten) =
+                                    rule.apply(op, bindings, is_root)
+                                {
+                                    replacement = Some(*rewritten);
+                                    break;
+                                }
+                            }
+                        }
+                        let Some(rewritten) = replacement else { break };
                         *changes_made = true;
-                        // Re-run rules on the new expression
-                        *expr = *new_expr;
-                        self.apply_rules(expr, op, changes_made, is_root);
-                        return;
+                        expression = rewritten;
                     }
-                    RuleResult::Rerun => {
-                        *changes_made = true;
-                        // Re-run rules on the same expression
-                        return;
+                    let mut children = Vec::new();
+                    ExpressionIterator::enumerate_children(&expression, |child| {
+                        children.push(child.clone())
+                    });
+                    if children.is_empty() {
+                        completed.push(expression);
+                    } else {
+                        pending.push(Task::Finish(expression, children.len()));
+                        pending.extend(
+                            children
+                                .into_iter()
+                                .rev()
+                                .map(|child| Task::Enter(child, false)),
+                        );
                     }
-                    RuleResult::NoChange => {
-                        // Continue to next rule
+                }
+                Task::Finish(mut expression, count) => {
+                    let start = completed
+                        .len()
+                        .checked_sub(count)
+                        .expect("scalar rewrite retained every child");
+                    let mut index = start;
+                    let mut changed = false;
+                    ExpressionIterator::enumerate_children(&expression, |child| {
+                        changed |=
+                            child.allocation_identity() != completed[index].allocation_identity();
+                        index += 1;
+                    });
+                    if changed {
+                        let mut children = completed.drain(start..);
+                        ExpressionIterator::enumerate_children_mut(&mut expression, |child| {
+                            *child = children
+                                .next()
+                                .expect("scalar rewrite retained every child");
+                        });
+                        debug_assert!(children.next().is_none());
+                    } else {
+                        completed.truncate(start);
                     }
+                    completed.push(expression);
                 }
             }
         }
-
-        // No rule applied, recursively process children
-        ExpressionIterator::enumerate_children_mut(expr, |child| {
-            self.apply_rules(child, op, changes_made, false);
-        });
+        debug_assert_eq!(completed.len(), 1);
+        completed.pop().expect("scalar rewrite retained its root")
     }
 }
 
@@ -286,6 +308,90 @@ mod tests {
         )
     }
 
+    fn rewrite_operator(rewriter: &mut ExpressionRewriter, operator: &mut LogicalOperator) {
+        let mut plan =
+            OwnedLogicalPlan::synthetic(std::mem::replace(operator, LogicalOperator::DummyScan));
+        rewriter.rewrite_plan(&mut plan);
+        *operator = plan.into_operator();
+    }
+
+    #[test]
+    fn no_op_preserves_shared_root_and_changed_child_detaches_only_its_path() {
+        use paro_planner::expression::{ColumnRefExpression, ComparisonExpression, ComparisonType};
+        use paro_planner::operator::ColumnBinding;
+        let column = Expression::ColumnRef(
+            ColumnRefExpression::new(ColumnBinding::new(0, 0), LogicalType::Integer).into(),
+        );
+        let original = Expression::Comparison(
+            ComparisonExpression::new(ComparisonType::Equal, column.clone(), make_constant(99))
+                .into(),
+        );
+        let mut rewriter = ExpressionRewriter::new();
+        rewriter.add_rule(Box::new(IncrementSmallConstantRule::new()));
+        let mut rewritten = original.clone();
+        rewriter.rewrite_expression(&mut rewritten, &LogicalOperator::DummyScan);
+        assert_ne!(
+            rewritten.allocation_identity(),
+            original.allocation_identity()
+        );
+        let (Expression::Comparison(before), Expression::Comparison(after)) =
+            (&original, &rewritten)
+        else {
+            unreachable!()
+        };
+        assert_eq!(
+            before.left.allocation_identity(),
+            after.left.allocation_identity()
+        );
+        assert_eq!(
+            after.left.allocation_identity(),
+            column.allocation_identity()
+        );
+        assert!(
+            matches!(before.right.as_ref(), Expression::Constant(value) if value.value == Value::Integer(99))
+        );
+        assert!(
+            matches!(after.right.as_ref(), Expression::Constant(value) if value.value == Value::Integer(100))
+        );
+        let identity = rewritten.allocation_identity();
+        rewriter.rewrite_expression(&mut rewritten, &LogicalOperator::DummyScan);
+        assert_eq!(rewritten.allocation_identity(), identity);
+    }
+
+    #[test]
+    fn deep_scalar_and_plan_normalization_use_bounded_native_stack() {
+        std::thread::Builder::new()
+            .stack_size(128 * 1024)
+            .spawn(|| {
+                use paro_planner::expression::{ConjunctionExpression, ConjunctionType};
+                let mut expression = make_constant(100);
+                for _ in 0..10_000 {
+                    expression = Expression::Conjunction(
+                        ConjunctionExpression::new(ConjunctionType::And, vec![expression]).into(),
+                    );
+                }
+                let identity = expression.allocation_identity();
+                let mut rewriter = ExpressionRewriter::new();
+                rewriter.add_rule(Box::new(IncrementSmallConstantRule::new()));
+                rewriter.rewrite_expression(&mut expression, &LogicalOperator::DummyScan);
+                assert_eq!(expression.allocation_identity(), identity);
+                drop(expression);
+
+                let mut plan = OwnedLogicalPlan::synthetic(LogicalOperator::DummyScan);
+                for _ in 0..10_000 {
+                    plan = OwnedLogicalPlan::synthetic(LogicalOperator::Filter(Filter::new(
+                        plan,
+                        vec![],
+                    )));
+                }
+                rewriter.rewrite_plan(&mut plan);
+                drop(plan);
+            })
+            .unwrap()
+            .join()
+            .unwrap();
+    }
+
     #[test]
     fn test_expression_rewriter_no_rules() {
         let rewriter = ExpressionRewriter::new();
@@ -427,7 +533,7 @@ mod tests {
             vec![condition],
         ));
 
-        rewriter.visit_operator(&mut op);
+        rewrite_operator(&mut rewriter, &mut op);
 
         // Check that constants were incremented to 100
         if let LogicalOperator::Filter(filter) = op {
@@ -455,7 +561,7 @@ mod tests {
             vec![make_constant(98), make_constant(99)],
         ));
 
-        rewriter.visit_operator(&mut op);
+        rewrite_operator(&mut rewriter, &mut op);
 
         // Check that constants were incremented to 100
         if let LogicalOperator::Projection(proj) = op {
@@ -485,7 +591,7 @@ mod tests {
             vec![LogicalType::Boolean],
         ));
 
-        rewriter.visit_operator(&mut op);
+        rewrite_operator(&mut rewriter, &mut op);
 
         let LogicalOperator::ExpressionGet(values) = op else {
             panic!("expected expression get");
@@ -517,7 +623,7 @@ mod tests {
             Some(make_constant(99)),
         )));
 
-        rewriter.visit_operator(&mut op);
+        rewrite_operator(&mut rewriter, &mut op);
 
         let LogicalOperator::Limit(limit) = op else {
             panic!("expected limit");

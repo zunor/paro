@@ -459,6 +459,33 @@ impl OwnedLogicalPlan {
         Ok(())
     }
 
+    /// Visit owned occurrences bottom-up without rebuilding their links.
+    /// A visitor may replace the current node: all of its descendants have
+    /// already been consumed, and no ancestor is exposed until it returns.
+    /// As with `visit_children_mut`, the visitor owns semantic fact updates;
+    /// structural substitutions should use `try_replace_node` instead.
+    pub fn visit_post_order_mut(&mut self, mut visitor: impl FnMut(&mut Self)) {
+        let mut pending = vec![(self as *mut Self, false)];
+        while let Some((pointer, complete)) = pending.pop() {
+            // SAFETY: Box-owned occurrences have disjoint, stable slots.
+            // Descendant pointers are consumed before exposing their parent
+            // to mutation; a sibling cannot move any other pending slot.
+            // Only one exclusive reference is exposed at a time.
+            let node = unsafe { &mut *pointer };
+            if complete {
+                visitor(node);
+                continue;
+            }
+            pending.push((pointer, true));
+            let start = pending.len();
+            let _ = node.visit_children_mut(|child| {
+                pending.push((child as *mut Self, false));
+                ControlFlow::Continue(())
+            });
+            pending[start..].reverse();
+        }
+    }
+
     pub fn visit_children_mut<'a, F>(&'a mut self, f: F) -> ControlFlow<()>
     where
         F: FnMut(&'a mut OwnedLogicalPlan) -> ControlFlow<()>,
@@ -590,6 +617,35 @@ mod tests {
             .expect("identity traversal");
 
         assert_eq!(plan.stats.unique_keys, vec![structural_key()]);
+    }
+
+    #[test]
+    fn mutable_post_order_preserves_child_order_and_releases_descendants_before_parent() {
+        let bind_context = BindContext::new();
+        let left_leaf = OwnedLogicalPlan::dummy_scan(&bind_context);
+        let left_leaf_id = left_leaf.id;
+        let left = OwnedLogicalPlan::new(
+            &bind_context,
+            LogicalOperator::EmptyResult(EmptyResult::new(left_leaf)),
+        );
+        let left_id = left.id;
+        let right = OwnedLogicalPlan::dummy_scan(&bind_context);
+        let right_id = right.id;
+        let mut plan = OwnedLogicalPlan::new(
+            &bind_context,
+            LogicalOperator::Join(Join::cross(left, right)),
+        );
+        let root_id = plan.id;
+        let mut order = Vec::new();
+        plan.visit_post_order_mut(|node| {
+            order.push(node.id);
+            if node.id == left_id {
+                // The descendant slot is no longer pending when the callback
+                // replaces its parent's payload and releases that subtree.
+                node.operator = LogicalOperator::DummyScan;
+            }
+        });
+        assert_eq!(order, vec![left_leaf_id, left_id, right_id, root_id]);
     }
 
     #[test]

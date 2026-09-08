@@ -39,6 +39,26 @@ pub enum Expression {
 const _: () = assert!(std::mem::size_of::<Expression>() <= 16);
 
 impl Expression {
+    /// Query-local allocation identity. This is never a semantic fingerprint
+    /// and cannot be persisted or used without the allocation's lifetime.
+    pub fn allocation_identity(&self) -> super::ExpressionIdentity {
+        match self {
+            Self::Constant(value) => value.allocation_identity(),
+            Self::ColumnRef(value) => value.allocation_identity(),
+            Self::Function(value) => value.allocation_identity(),
+            Self::Cast(value) => value.allocation_identity(),
+            Self::Conjunction(value) => value.allocation_identity(),
+            Self::Case(value) => value.allocation_identity(),
+            Self::Comparison(value) => value.allocation_identity(),
+            Self::Operator(value) => value.allocation_identity(),
+            Self::Parameter(value) => value.allocation_identity(),
+            Self::Reference(value) => value.allocation_identity(),
+            Self::Aggregate(value) => value.allocation_identity(),
+            Self::Subquery(value) => value.allocation_identity(),
+            Self::Window(value) => value.allocation_identity(),
+        }
+    }
+
     pub(crate) fn release_children_into(&mut self, pending: &mut Vec<Expression>) {
         match self {
             Self::Constant(value) => value.release_into(pending),
