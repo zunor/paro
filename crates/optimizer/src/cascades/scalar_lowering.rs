@@ -3,12 +3,12 @@
 
 //! Canonical lowering from bound scalar expressions to optimizer-owned IR.
 //!
-//! The boundary is deliberately one-way: relational Memo expressions keep only
-//! `ScalarExprId`s, while executable expression trees remain in extraction
-//! payloads and never participate in Memo identity.
+//! Relational Memo expressions keep `ScalarExprId`s. The native DAG retains
+//! executable call descriptors, while explicit binding domains preserve the
+//! meaning of positional operands at the import/export boundary.
 
 use std::cell::RefCell;
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{HashMap, HashSet};
 
 use paro_common::error::{self as paro_error, Result};
 use paro_common::runtime_value::Value;
@@ -30,83 +30,8 @@ use super::scalar::{
     ScalarLiteral, ScalarLocalProperties, ScalarSpec, ScalarWindow, Volatility,
 };
 
-type BindingKey = (usize, usize, u32);
-
-/// Stable planner binding to optimizer column identities with an append-only
-/// insertion journal. Transformations can therefore roll back the delta
-/// instead of cloning the complete query binding map for every rule attempt.
-#[derive(Debug, Clone, Default)]
-pub(crate) struct BindingCatalog {
-    entries: BTreeMap<BindingKey, ColumnId>,
-    insertions: Vec<BindingKey>,
-    /// Exact query-local type interning. Binding lookup is a hot layout path;
-    /// it must not recompute a cryptographic digest for every column visit.
-    types: Vec<LogicalType>,
-    type_ids: HashMap<LogicalType, u32>,
-}
-
-impl BindingCatalog {
-    pub(crate) fn get(
-        &self,
-        table_index: usize,
-        column_index: usize,
-        logical_type: &LogicalType,
-    ) -> Option<&ColumnId> {
-        let type_id = self.type_ids.get(logical_type)?;
-        self.entries.get(&(table_index, column_index, *type_id))
-    }
-
-    pub(crate) fn insert(
-        &mut self,
-        table_index: usize,
-        column_index: usize,
-        logical_type: &LogicalType,
-        column: ColumnId,
-    ) -> Result<()> {
-        let type_id = if let Some(type_id) = self.type_ids.get(logical_type).copied() {
-            type_id
-        } else {
-            let type_id = u32::try_from(self.types.len())
-                .map_err(|_| paro_error::internal("query type arena exceeds u32 identity space"))?;
-            self.types.push(logical_type.clone());
-            self.type_ids.insert(logical_type.clone(), type_id);
-            type_id
-        };
-        let key = (table_index, column_index, type_id);
-        if let Some(existing) = self.entries.get(&key) {
-            if *existing != column {
-                return Err(paro_error::internal(
-                    "planner binding changed its optimizer column identity",
-                ));
-            }
-            return Ok(());
-        }
-        self.entries.insert(key, column);
-        self.insertions.push(key);
-        Ok(())
-    }
-
-    pub(crate) fn checkpoint(&self) -> usize {
-        self.insertions.len()
-    }
-
-    pub(crate) fn rollback_to(&mut self, checkpoint: usize) -> Result<()> {
-        if checkpoint > self.insertions.len() {
-            return Err(paro_error::internal(
-                "binding catalog rollback exceeds its insertion journal",
-            ));
-        }
-        while self.insertions.len() > checkpoint {
-            let key = self.insertions.pop().expect("journal length was checked");
-            if self.entries.remove(&key).is_none() {
-                return Err(paro_error::internal(
-                    "binding catalog insertion journal disagrees with its index",
-                ));
-            }
-        }
-        Ok(())
-    }
-}
+mod bindings;
+pub(crate) use bindings::BindingCatalog;
 
 pub(crate) fn intern_operator_scalars<Child>(
     operator: &LogicalOperator<Child>,
@@ -132,6 +57,61 @@ pub(crate) fn intern_operator_scalars<Child>(
     let mut roots = Vec::new();
 
     match operator {
+        LogicalOperator::Aggregate(aggregate) => {
+            for expression in aggregate.groups.iter().chain(&aggregate.aggregates) {
+                roots.push(intern_expression(
+                    expression,
+                    &default_references,
+                    binding_ids,
+                    columns,
+                    arena,
+                )?);
+            }
+            if let Some(reduction) = &aggregate.post_reduction {
+                // The reducers consume finalized aggregate values, not input
+                // rows. Their scalar results form a third, operator-private
+                // coordinate system. In particular Reference(0) here must
+                // never alias the ordinary child's first column.
+                for reducer in &reduction.reducers {
+                    roots.push(intern_expression(
+                        reducer,
+                        &[],
+                        binding_ids,
+                        columns,
+                        arena,
+                    )?);
+                }
+                let reducer_columns = reduction
+                    .reducers
+                    .iter()
+                    .enumerate()
+                    .map(|(ordinal, reducer)| {
+                        binding_ids.intern_reducer_output(
+                            reduction.reduction_index,
+                            ordinal,
+                            &reducer.return_type(),
+                            columns,
+                        )
+                    })
+                    .collect::<Result<Vec<_>>>()?;
+                for expression in &reduction.scalar_expressions {
+                    roots.push(intern_expression(
+                        expression,
+                        &reducer_columns,
+                        binding_ids,
+                        columns,
+                        arena,
+                    )?);
+                }
+                roots.push(intern_expression(
+                    &reduction.predicate,
+                    &[],
+                    binding_ids,
+                    columns,
+                    arena,
+                )?);
+            }
+        }
         LogicalOperator::Get(get) => {
             for expression in &get.runtime_filter_expressions {
                 roots.push(intern_expression(
@@ -479,6 +459,15 @@ fn intern_expression_node(
                         reference_columns.len()
                     ))
                 })?;
+            let descriptor = columns.get(column_id).ok_or_else(|| {
+                paro_error::internal("Query IR reference resolves to an unknown column")
+            })?;
+            if descriptor.logical_type != reference.return_type {
+                return Err(paro_error::internal(format!(
+                    "Query IR reference {} type disagrees with its input domain: expected {:?}, got {:?}",
+                    reference.index, descriptor.logical_type, reference.return_type
+                )));
+            }
             arena.intern(ScalarSpec {
                 kind: ScalarKind::Column(column_id),
                 logical_type: reference.return_type.clone(),
@@ -1150,6 +1139,145 @@ fn typed_binding_fingerprint(binding: ColumnBinding, type_domain: Fingerprint) -
 mod tests {
     use super::*;
     use paro_planner::expression::{CaseExpression, ConjunctionExpression, ConstantExpression};
+
+    #[test]
+    fn post_reduction_scalar_references_do_not_read_the_aggregate_input() {
+        use paro_function::aggregate::distributive::{
+            count::get_count_star_function, minmax::get_max_function,
+        };
+        use paro_planner::expression::{
+            AggregateExpression, ColumnRefExpression, ComparisonExpression, ReferenceExpression,
+        };
+        use paro_planner::operator::{Aggregate, PostAggregateReduction};
+        use paro_planner::plan::OwnedLogicalPlan;
+
+        // Matching types make an ordinal error silent: all four domains have
+        // a BIGINT in slot zero, but none denotes the same value.
+        let ty = LogicalType::BigInt;
+        let col = |table| {
+            Expression::ColumnRef(
+                ColumnRefExpression::new(ColumnBinding::new(table, 0), ty.clone()).into(),
+            )
+        };
+        let (max, _) = get_max_function().bind(std::slice::from_ref(&ty)).unwrap();
+        let aggregate = Aggregate::new(
+            1,
+            2,
+            3,
+            OwnedLogicalPlan::synthetic(LogicalOperator::DummyScan),
+            vec![Expression::Reference(
+                ReferenceExpression::new(0, ty.clone()).into(),
+            )],
+            vec![],
+            vec![Expression::Aggregate(
+                AggregateExpression::new(get_count_star_function(), vec![], ty.clone()).into(),
+            )],
+            vec![],
+        )
+        .with_post_reduction(PostAggregateReduction {
+            reduction_index: 4,
+            reducers: vec![Expression::Aggregate(
+                AggregateExpression::new(max, vec![col(2)], ty.clone()).into(),
+            )],
+            scalar_expressions: vec![Expression::Reference(
+                ReferenceExpression::new(0, ty.clone()).into(),
+            )],
+            predicate: Expression::Comparison(
+                ComparisonExpression::new(ComparisonType::Equal, col(2), col(4)).into(),
+            ),
+        });
+        aggregate.verify_post_reduction().unwrap();
+        let mut columns = ColumnCatalog::default();
+        let mut bindings = BindingCatalog::default();
+        let ids = (0..5)
+            .map(|table| {
+                intern_column_binding(
+                    ColumnBinding::new(table, 0),
+                    ty.clone(),
+                    &mut bindings,
+                    &mut columns,
+                )
+                .unwrap()
+            })
+            .collect::<Vec<_>>();
+        let operator = LogicalOperator::Aggregate(Box::new(aggregate));
+        let mut arena = ScalarArena::default();
+        let roots = intern_operator_scalars(
+            &operator,
+            &ids[1..3],
+            &[Box::new([ids[0]])],
+            &mut bindings,
+            &mut columns,
+            &mut arena,
+        )
+        .unwrap();
+        assert_eq!(roots.len(), 5);
+        let refs = |root| {
+            arena
+                .get(root)
+                .unwrap()
+                .properties
+                .referenced_columns
+                .clone()
+        };
+        assert_eq!(refs(roots[0]), [ids[0]].into());
+        assert_eq!(refs(roots[2]), [ids[2]].into());
+        let reducer_input = refs(roots[3]);
+        assert_eq!(reducer_input.len(), 1);
+        let private = *reducer_input.first().unwrap();
+        assert!(!ids.contains(&private));
+        assert_eq!(
+            columns.get(private).unwrap().visibility,
+            ColumnVisibility::Hidden
+        );
+        assert_eq!(refs(roots[4]), [ids[2], ids[4]].into());
+
+        // A wider source cannot make a nonexistent reducer slot valid.
+        let LogicalOperator::Aggregate(mut aggregate) = operator else {
+            unreachable!()
+        };
+        aggregate
+            .post_reduction
+            .as_mut()
+            .unwrap()
+            .scalar_expressions[0] = Expression::Reference(ReferenceExpression::new(1, ty).into());
+        let error = intern_operator_scalars(
+            &LogicalOperator::Aggregate(aggregate),
+            &ids[1..3],
+            &[ids.clone().into()],
+            &mut bindings,
+            &mut columns,
+            &mut arena,
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("outside its 1-column input"));
+    }
+
+    #[test]
+    fn reference_lowering_checks_the_resolved_column_type() {
+        let mut columns = ColumnCatalog::default();
+        let mut bindings = BindingCatalog::default();
+        let id = intern_column_binding(
+            ColumnBinding::new(0, 0),
+            LogicalType::Integer,
+            &mut bindings,
+            &mut columns,
+        )
+        .unwrap();
+        let error = intern_expression(
+            &Expression::Reference(
+                paro_planner::expression::ReferenceExpression::new(0, LogicalType::BigInt).into(),
+            ),
+            &[id],
+            &mut bindings,
+            &mut columns,
+            &mut ScalarArena::default(),
+        )
+        .unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("type disagrees with its input domain"));
+    }
 
     #[test]
     fn lowering_retains_lexical_depth_in_column_identity() {
