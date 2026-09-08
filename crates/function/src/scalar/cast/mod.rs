@@ -27,6 +27,9 @@ pub mod numeric_casts;
 pub mod string_casts;
 pub mod struct_casts;
 
+#[cfg(test)]
+mod identity_tests;
+
 use crate::scalar::FunctionExecContext;
 
 /// Input passed to cast binding functions.
@@ -107,6 +110,12 @@ impl CastContextDependency {
 pub trait BoundCastData: fmt::Debug + Send + Sync {
     fn copy(&self) -> Box<dyn BoundCastData>;
 
+    /// Compare local metadata, excluding nested casts. All child kernels are
+    /// exposed separately so executable identity is an iterative DAG walk.
+    fn local_equals(&self, other: &dyn BoundCastData) -> bool;
+
+    fn child_casts(&self) -> &[BoundCastInfo];
+
     /// Returns self as Any for downcasting.
     fn as_any(&self) -> &dyn std::any::Any;
 }
@@ -127,6 +136,53 @@ pub struct BoundCastInfo {
 }
 
 impl BoundCastInfo {
+    /// Exact query-local executable identity. Addresses validate bound kernels;
+    /// they are never serialized into a stable plan fingerprint.
+    pub fn execution_semantics_equal(&self, other: &Self) -> bool {
+        let mut pending = vec![(self, other)];
+        let mut compared = std::collections::HashSet::new();
+        while let Some((left, right)) = pending.pop() {
+            let dispatch_equal = match (left.dispatch, right.dispatch) {
+                (CastDispatch::Fixed(left), CastDispatch::Fixed(right))
+                | (CastDispatch::Varlen(left), CastDispatch::Varlen(right))
+                | (CastDispatch::Array(left), CastDispatch::Array(right))
+                | (CastDispatch::Struct(left), CastDispatch::Struct(right)) => {
+                    std::ptr::fn_addr_eq(left, right)
+                }
+                _ => false,
+            };
+            if !dispatch_equal
+                || left.context_dependency != right.context_dependency
+                || left.source_type != right.source_type
+                || left.target_type != right.target_type
+            {
+                return false;
+            }
+            match (&left.cast_data, &right.cast_data) {
+                (None, None) => {}
+                (Some(left), Some(right)) => {
+                    if Arc::ptr_eq(left, right) {
+                        continue;
+                    }
+                    if !compared.insert((
+                        Arc::as_ptr(left) as *const () as usize,
+                        Arc::as_ptr(right) as *const () as usize,
+                    )) {
+                        continue;
+                    }
+                    if !left.local_equals(right.as_ref())
+                        || left.child_casts().len() != right.child_casts().len()
+                    {
+                        return false;
+                    }
+                    pending.extend(left.child_casts().iter().zip(right.child_casts()));
+                }
+                _ => return false,
+            }
+        }
+        true
+    }
+
     pub fn fixed(function: FixedCastFn) -> Self {
         Self {
             dispatch: CastDispatch::Fixed(function),
