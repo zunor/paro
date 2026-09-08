@@ -45,7 +45,7 @@ MATERIALIZED_CTE  (rows=1)
         ->  PROJECTION  (rows=1)
           Output: id, peer_id, grp
           ->  FILTER  (rows=1)
-            Filter: l.id < r.id
+            Filter: r.id > l.id
             ->  HASH_JOIN  (rows=3)
               Join Type: INNER
               Join Condition: l.grp = r.grp
