@@ -99,7 +99,7 @@ def sample(args: argparse.Namespace, binary: Path, query: str, name: str, block:
                     connection.execute(sql.SQL("SET threads={}").format(sql.Literal(args.threads)))
                     connection.execute(sql.SQL("SET memory_limit={}").format(sql.Literal(args.memory_limit)))
                     connection.execute(sql.SQL("SET statement_timeout={}").format(
-                        sql.Literal(f"{args.watchdog_seconds}s")))
+                        sql.Literal(args.watchdog_seconds * 1000)))
                     started = time.perf_counter_ns()
                     plan = connection.execute("EXPLAIN " + query).fetchall()
                     result["explain_wall_ms"] = (time.perf_counter_ns() - started) / 1_000_000
