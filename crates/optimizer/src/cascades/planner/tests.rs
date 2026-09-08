@@ -616,7 +616,7 @@ fn graph_filter_is_part_of_the_query_ir_fingerprint() {
         let roots = intern_operator_scalars(
             &plan.operator,
             &[],
-            &[],
+            &[] as &[&[ColumnId]],
             &mut binding_ids,
             &mut columns,
             &mut scalars,

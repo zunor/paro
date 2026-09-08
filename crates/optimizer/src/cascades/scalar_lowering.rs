@@ -38,34 +38,36 @@ pub(crate) use operator_export::export_operator_scalars;
 pub(crate) fn intern_operator_scalars<Child>(
     operator: &LogicalOperator<Child>,
     output_columns: &[ColumnId],
-    child_columns: &[Box<[ColumnId]>],
+    child_columns: &[impl AsRef<[ColumnId]>],
     binding_ids: &mut BindingCatalog,
     columns: &mut ColumnCatalog,
     arena: &mut ScalarArena,
 ) -> Result<Box<[ScalarExprId]>> {
     use fields::{OperandRef, ReferenceScope};
-    let default_references = match operator {
+    let default_references: std::borrow::Cow<'_, [ColumnId]> = match operator {
         LogicalOperator::SearchScan(search) => {
-            get_reference_columns(&search.get, binding_ids, columns)?
+            get_reference_columns(&search.get, binding_ids, columns)?.into()
         }
         LogicalOperator::FullTextFilterScan(search) => {
-            get_reference_columns(&search.get, binding_ids, columns)?
+            get_reference_columns(&search.get, binding_ids, columns)?.into()
         }
-        _ if child_columns.is_empty() => output_columns.to_vec(),
+        _ if child_columns.is_empty() => output_columns.into(),
+        _ if child_columns.len() == 1 => child_columns[0].as_ref().into(),
         _ => child_columns
             .iter()
-            .flat_map(|columns| columns.iter().copied())
-            .collect(),
+            .flat_map(|columns| columns.as_ref().iter().copied())
+            .collect::<Vec<_>>()
+            .into(),
     };
-    let left_columns = child_columns.first().map(Box::as_ref).unwrap_or(&[]);
-    let right_columns = child_columns.get(1).map(Box::as_ref).unwrap_or(&[]);
+    let left_columns = child_columns.first().map(AsRef::as_ref).unwrap_or(&[]);
+    let right_columns = child_columns.get(1).map(AsRef::as_ref).unwrap_or(&[]);
     let mut reducer_columns = None;
     let mut roots = Vec::new();
     fields::visit_fields(operator, |operand| {
         let root = match operand {
             OperandRef::Expression(expression, scope) => {
                 let references = match scope {
-                    ReferenceScope::Input => default_references.as_slice(),
+                    ReferenceScope::Input => default_references.as_ref(),
                     ReferenceScope::Output => output_columns,
                     ReferenceScope::Left => left_columns,
                     ReferenceScope::None => &[],
@@ -1091,7 +1093,7 @@ mod tests {
         let roots = intern_operator_scalars(
             &operator,
             &ids[1..3],
-            &[Box::new([ids[0]])],
+            &[[ids[0]]],
             &mut bindings,
             &mut columns,
             &mut arena,
@@ -1150,7 +1152,7 @@ mod tests {
         let error = intern_operator_scalars(
             &LogicalOperator::Aggregate(aggregate),
             &ids[1..3],
-            &[ids.clone().into()],
+            &[ids.as_slice()],
             &mut bindings,
             &mut columns,
             &mut arena,

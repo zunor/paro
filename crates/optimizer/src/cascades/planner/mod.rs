@@ -391,6 +391,14 @@ impl OptimizationInput {
             work_counters.insert("settlement_local_hit_count", state.settlement_cache.hits);
             work_counters.insert("settlement_local_miss_count", state.settlement_cache.misses);
             work_counters.insert(
+                "settlement_input_column_cache_hits",
+                state.settlement_cache.input_column_cache_hits,
+            );
+            work_counters.insert(
+                "settlement_input_column_cache_misses",
+                state.settlement_cache.input_column_cache_misses,
+            );
+            work_counters.insert(
                 "settlement_invalidation_visit_count",
                 state.settlement_cache.invalidation_visits,
             );

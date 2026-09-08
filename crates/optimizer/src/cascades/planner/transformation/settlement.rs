@@ -27,6 +27,10 @@ struct RelationFacts {
     maximum: Option<u64>,
     columns: Vec<Arc<ColumnStatistics>>,
     column_ids: Box<[usize]>,
+    /// Immutable layout columns in this settlement cache's native namespace.
+    /// Populate on first use, at the original interning point, so caching does
+    /// not rename scalar identities or change bounded-search scheduling.
+    binding_columns: Option<Box<[ColumnId]>>,
 }
 
 #[derive(Debug, PartialEq, Eq, Hash)]
@@ -168,6 +172,8 @@ pub(in crate::cascades::planner) struct SettlementCache {
     pub(in crate::cascades::planner) hits: u64,
     pub(in crate::cascades::planner) misses: u64,
     pub(in crate::cascades::planner) invalidation_visits: u64,
+    pub(in crate::cascades::planner) input_column_cache_hits: u64,
+    pub(in crate::cascades::planner) input_column_cache_misses: u64,
     #[cfg(test)]
     test_arena: LogicalPlanArena,
 }
@@ -400,14 +406,27 @@ impl SettlementCache {
             .output_layout_from_child_refs(&child_layout_refs);
         drop(child_layout_refs);
         let output_columns = intern_columns_into(&mut self.bindings, &mut self.columns, &output)?;
+        for id in inputs {
+            let fact = self.facts.get_mut(*id).ok_or_else(|| {
+                paro_error::internal("settlement input references an unknown fact")
+            })?;
+            if fact.binding_columns.is_none() {
+                fact.binding_columns = Some(intern_columns_into(
+                    &mut self.bindings,
+                    &mut self.columns,
+                    &fact.layout,
+                )?);
+                self.input_column_cache_misses += 1;
+            } else {
+                self.input_column_cache_hits += 1;
+            }
+        }
         let child_columns = inputs
             .iter()
             .map(|id| {
-                intern_columns_into(
-                    &mut self.bindings,
-                    &mut self.columns,
-                    &self.facts[*id].layout,
-                )
+                self.facts[*id].binding_columns.as_deref().ok_or_else(|| {
+                    paro_error::internal("settlement input has no interned layout columns")
+                })
             })
             .collect::<Result<Vec<_>>>()?;
         let (roots, operator_identity) = if scalar_free {
@@ -592,6 +611,7 @@ impl SettlementCache {
             stats: plan.stats.clone(),
             maximum,
             column_ids: Box::new([]),
+            binding_columns: None,
         })?;
         let entry = SettledLocal {
             recipe: recipes.import(plan)?,
@@ -753,6 +773,7 @@ impl SettlementCache {
                             maximum: reference.facts.maximum_cardinality,
                             columns: reference.column_statistics(),
                             column_ids: Box::new([]),
+                            binding_columns: None,
                         })?;
                         let statistics: SharedColumnStatistics = Arc::new(
                             reference
@@ -1009,6 +1030,7 @@ mod tests {
                     Some(10_000),
                 ))],
                 column_ids: Box::new([]),
+                binding_columns: None,
             })
             .unwrap();
         assert_eq!(
@@ -1056,6 +1078,7 @@ mod tests {
                     Some(10),
                 ))],
                 column_ids: Box::new([]),
+                binding_columns: None,
             })
             .unwrap();
 
@@ -1085,6 +1108,17 @@ mod tests {
             )
             .unwrap();
         let misses = cache.misses;
+        let input_column_arrays = cache
+            .facts
+            .iter()
+            .filter_map(|fact| {
+                fact.binding_columns
+                    .as_ref()
+                    .map(|columns| (columns.as_ptr(), columns.to_vec()))
+            })
+            .collect::<Vec<_>>();
+        let native_column_count = cache.columns.len();
+        assert_eq!(cache.input_column_cache_misses, 1);
         let second = cache
             .settle(
                 project(&env.bind_context, values(&env.bind_context, 3)),
@@ -1093,6 +1127,21 @@ mod tests {
             .unwrap();
         assert_eq!(cache.misses, misses);
         assert_eq!(cache.hits, 2);
+        assert_eq!(cache.input_column_cache_misses, 1);
+        assert_eq!(cache.input_column_cache_hits, 1);
+        assert_eq!(cache.columns.len(), native_column_count);
+        assert_eq!(
+            cache
+                .facts
+                .iter()
+                .filter_map(|fact| {
+                    fact.binding_columns
+                        .as_ref()
+                        .map(|columns| (columns.as_ptr(), columns.to_vec()))
+                })
+                .collect::<Vec<_>>(),
+            input_column_arrays
+        );
         assert_ne!(first.plan.id, second.plan.id);
         assert_eq!(first.plan.stats, second.plan.stats);
         assert_eq!(second.plan.stats.estimated_cardinality.unwrap().expected, 3);
@@ -1116,6 +1165,8 @@ mod tests {
             .unwrap()
             .unwrap();
         let retained = arena.checkpoint();
+        let native_columns = cache.columns.len();
+        let interned_layouts = cache.input_column_cache_misses;
         assert!(!cache.locals.is_empty());
         for _ in 0..1000 {
             arena
@@ -1147,6 +1198,11 @@ mod tests {
             .unwrap();
         assert!(!arena.owns(first.plan));
         assert!(arena.owns(next.plan));
+        assert_eq!(cache.columns.len(), native_columns);
+        assert_eq!(
+            cache.input_column_cache_misses, interned_layouts,
+            "recipe rollback must not invalidate the immutable fact/column namespace"
+        );
     }
 
     #[test]
@@ -1211,6 +1267,7 @@ mod tests {
                     Arc::new(ColumnStatistics::with_estimated_distinct(amount, Some(6))),
                 ],
                 column_ids: Box::new([]),
+                binding_columns: None,
             })
             .unwrap();
         let column = |table, index, ty| {
@@ -1255,6 +1312,7 @@ mod tests {
                     amount,
                 ],
                 column_ids: Box::new([]),
+                binding_columns: None,
             })
             .unwrap();
         for renamed in [false, true] {
@@ -1329,6 +1387,7 @@ mod tests {
                     Some(3),
                 ))],
                 column_ids: Box::new([]),
+                binding_columns: None,
             })
             .unwrap();
         let filter = OwnedLogicalPlan::new(
@@ -1530,6 +1589,7 @@ mod tests {
                 .with_guaranteed_distinct_upper(upper),
             )],
             column_ids: Box::new([]),
+            binding_columns: None,
         };
         let a = cache.intern_fact(fact(3)).unwrap();
         let b = cache.intern_fact(fact(7)).unwrap();
@@ -1558,6 +1618,7 @@ mod tests {
                 .with_guaranteed_distinct_upper(90),
             )],
             column_ids: Box::new([]),
+            binding_columns: None,
         };
         let first = cache.intern_fact(fact(30)).unwrap();
         let second = cache.intern_fact(fact(70)).unwrap();
