@@ -304,16 +304,115 @@ fn intern_expression(
     columns: &mut ColumnCatalog,
     arena: &mut ScalarArena,
 ) -> Result<ScalarExprId> {
-    ExpressionIterator::try_fold_post_order(expression, |node, children| {
+    let mut pending = Vec::<PendingConjunction>::new();
+    let root = ExpressionIterator::try_fold_post_order(expression, |node, children| {
+        if let Expression::Conjunction(conjunction) = node {
+            // Defer safe associative nodes until their maximal run is known.
+            // Interning every prefix of a generated OR/AND chain eagerly
+            // stores O(n²) child IDs even though the final DAG is one node.
+            let safe = children.iter().all(|child| match child {
+                LoweredScalar::Pending(_) => true,
+                LoweredScalar::Interned(id) => arena
+                    .get(*id)
+                    .is_some_and(|node| node.properties.can_reorder_and_share()),
+            });
+            if safe {
+                let index = pending.len();
+                pending.push(PendingConjunction {
+                    kind: match conjunction.conjunction_type {
+                        ConjunctionType::And => ScalarKind::And,
+                        ConjunctionType::Or => ScalarKind::Or,
+                    },
+                    children: children.into(),
+                    resolved: None,
+                });
+                return Ok(LoweredScalar::Pending(index));
+            }
+        }
+        let children = children
+            .iter()
+            .copied()
+            .map(|child| resolve_lowered_scalar(child, &mut pending, arena))
+            .collect::<Result<Vec<_>>>()?;
         intern_expression_node(
             node,
-            children,
+            &children,
             reference_columns,
             binding_ids,
             columns,
             arena,
         )
-    })
+        .map(LoweredScalar::Interned)
+    })?;
+    resolve_lowered_scalar(root, &mut pending, arena)
+}
+
+#[derive(Clone, Copy)]
+enum LoweredScalar {
+    Interned(ScalarExprId),
+    Pending(usize),
+}
+
+struct PendingConjunction {
+    kind: ScalarKind,
+    children: Box<[LoweredScalar]>,
+    resolved: Option<ScalarExprId>,
+}
+
+/// Local indexed construction storage avoids recursively owned pending ropes.
+/// Every associative run is flattened once, including on error/drop paths.
+fn resolve_lowered_scalar(
+    root: LoweredScalar,
+    pending: &mut [PendingConjunction],
+    arena: &mut ScalarArena,
+) -> Result<ScalarExprId> {
+    if let LoweredScalar::Interned(id) = root {
+        return Ok(id);
+    }
+    enum Task {
+        Enter(LoweredScalar),
+        Finish(usize, usize),
+    }
+    let mut tasks = vec![Task::Enter(root)];
+    let mut completed = Vec::new();
+    while let Some(task) = tasks.pop() {
+        match task {
+            Task::Enter(LoweredScalar::Interned(id)) => completed.push(id),
+            Task::Enter(LoweredScalar::Pending(index)) => {
+                if let Some(id) = pending[index].resolved {
+                    completed.push(id);
+                    continue;
+                }
+                let mut flatten = pending[index].children.to_vec();
+                let mut leaves = Vec::new();
+                while let Some(child) = flatten.pop() {
+                    if let LoweredScalar::Pending(child_index) = child {
+                        if pending[child_index].kind == pending[index].kind {
+                            flatten.extend(pending[child_index].children.iter().copied());
+                            continue;
+                        }
+                    }
+                    leaves.push(child);
+                }
+                tasks.push(Task::Finish(index, leaves.len()));
+                tasks.extend(leaves.into_iter().map(Task::Enter));
+            }
+            Task::Finish(index, count) => {
+                let start = completed
+                    .len()
+                    .checked_sub(count)
+                    .ok_or_else(|| paro_error::internal("scalar run lost a completed input"))?;
+                let children = completed.split_off(start);
+                let id = arena.canonical_conjunction(pending[index].kind.clone(), children)?;
+                pending[index].resolved = Some(id);
+                completed.push(id);
+            }
+        }
+    }
+    if completed.len() != 1 {
+        return Err(paro_error::internal("scalar run has no unique root"));
+    }
+    Ok(completed[0])
 }
 
 fn intern_expression_node(
@@ -1085,6 +1184,40 @@ mod tests {
             expression_fingerprint(&nested),
             expression_fingerprint(&flat)
         );
+    }
+
+    #[test]
+    fn lowering_a_long_distinct_or_chain_keeps_only_the_maximal_run() {
+        use paro_planner::expression::ColumnRefExpression;
+        let column = |index| {
+            Expression::ColumnRef(ColumnRefExpression::new(
+                ColumnBinding::new(0, index),
+                LogicalType::Boolean,
+            ))
+        };
+        let mut expression = column(0);
+        for index in 1..10_000 {
+            expression = Expression::Conjunction(ConjunctionExpression::new(
+                ConjunctionType::Or,
+                vec![expression, column(index)],
+            ));
+        }
+        let mut arena = ScalarArena::default();
+        let root = intern_expression(
+            &expression,
+            &[],
+            &mut BindingCatalog::default(),
+            &mut ColumnCatalog::default(),
+            &mut arena,
+        )
+        .unwrap();
+        assert_eq!(arena.len(), 10_001);
+        assert_eq!(arena.get(root).unwrap().children.len(), 10_000);
+        assert_eq!(
+            arena.get(root).unwrap().properties.referenced_columns.len(),
+            10_000
+        );
+        std::mem::forget(expression);
     }
 
     #[test]
