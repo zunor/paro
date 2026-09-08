@@ -16,8 +16,8 @@ use std::collections::BTreeMap;
 use paro_common::runtime_value::Value;
 use paro_common::types::LogicalType;
 use paro_planner::expression::ComparisonType;
+use paro_planner::expression::ConjunctionType;
 use paro_planner::expression::{ComparisonExpression, ConstantExpression, Expression};
-use paro_planner::expression::{ConjunctionExpression, ConjunctionType};
 
 /// Result of adding a filter to the combiner.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -66,7 +66,9 @@ enum ExpressionKey {
 impl ExpressionKey {
     fn from_expression(expr: &Expression) -> Option<Self> {
         match expr {
-            Expression::ColumnRef(col) => Some(ExpressionKey::ColumnRef {
+            // A correlated reference is not a member of the current input's
+            // equality domain, even when planner table/column ordinals match.
+            Expression::ColumnRef(col) if col.depth == 0 => Some(ExpressionKey::ColumnRef {
                 table_index: col.binding.table_index,
                 column_index: col.binding.column_index,
             }),
@@ -112,6 +114,28 @@ impl FilterCombiner {
     /// - `Unsatisfiable`: Filter combination is impossible
     /// - `Unsupported`: Filter type is not supported
     pub fn add_filter(&mut self, expr: Expression) -> FilterResult {
+        // Every conjunct goes through the complete admission path. Calling
+        // only add_filter_internal used to silently discard unsupported arms
+        // of an AND and made nested generated expressions recurse natively.
+        let mut pending = vec![expr];
+        while let Some(expr) = pending.pop() {
+            if let Expression::Conjunction(conjunction) = &expr {
+                if conjunction.conjunction_type == ConjunctionType::And {
+                    let Expression::Conjunction(conjunction) = expr else {
+                        unreachable!()
+                    };
+                    pending.extend(conjunction.into_inner().children.into_iter().rev());
+                    continue;
+                }
+            }
+            if self.add_filter_leaf(expr) == FilterResult::Unsatisfiable {
+                return FilterResult::Unsatisfiable;
+            }
+        }
+        FilterResult::Success
+    }
+
+    fn add_filter_leaf(&mut self, expr: Expression) -> FilterResult {
         let result = self.add_filter_internal(&expr);
         if result == FilterResult::Unsupported {
             // Unsupported shapes still admit exact structural deduplication
@@ -270,7 +294,7 @@ impl FilterCombiner {
     fn add_filter_internal(&mut self, expr: &Expression) -> FilterResult {
         match expr {
             Expression::Comparison(comp) => self.add_comparison_filter(comp),
-            Expression::Conjunction(conj) => self.add_conjunction_filter(conj),
+            Expression::Conjunction(_) => FilterResult::Unsupported,
             Expression::Constant(c) => {
                 // Scalar condition - check if it's always true or false
                 if c.return_type == LogicalType::Boolean {
@@ -292,6 +316,9 @@ impl FilterCombiner {
 
     /// Add a comparison filter.
     fn add_comparison_filter(&mut self, comp: &ComparisonExpression) -> FilterResult {
+        if !comp.has_bound_input_contract() {
+            return FilterResult::Unsupported;
+        }
         // Check if comparison type is supported
         if !Self::is_supported_comparison(comp.comparison_type) {
             return FilterResult::Unsupported;
@@ -369,19 +396,21 @@ impl FilterCombiner {
             return FilterResult::Unsupported;
         }
 
-        let left_key = match ExpressionKey::from_expression(comp.left.as_ref()) {
+        let left_key = match self.compatible_key(comp.left.as_ref()) {
             Some(k) => k,
             None => return FilterResult::Unsupported,
         };
 
-        let right_key = match ExpressionKey::from_expression(comp.right.as_ref()) {
+        let right_key = match self.compatible_key(comp.right.as_ref()) {
             Some(k) => k,
             None => return FilterResult::Unsupported,
         };
 
         if left_key == right_key {
-            // Same expression, trivially true
-            return FilterResult::Success;
+            // SQL x = x is UNKNOWN for NULL, not a tautology. This combiner
+            // has no non-NULL proof: retain the original predicate instead of
+            // allowing an empty equivalence class to erase its truth test.
+            return FilterResult::Unsupported;
         }
 
         // Store expressions
@@ -424,29 +453,9 @@ impl FilterCombiner {
         FilterResult::Success
     }
 
-    /// Add a conjunction (AND/OR) filter.
-    fn add_conjunction_filter(&mut self, conj: &ConjunctionExpression) -> FilterResult {
-        match conj.conjunction_type {
-            ConjunctionType::And => {
-                // For AND, all children must be satisfiable
-                for (_i, child) in conj.children.iter().enumerate() {
-                    let result = self.add_filter_internal(child);
-                    if result == FilterResult::Unsatisfiable {
-                        return FilterResult::Unsatisfiable;
-                    }
-                }
-                FilterResult::Success
-            }
-            ConjunctionType::Or => {
-                // OR filters are not directly supported by the combiner
-                FilterResult::Unsupported
-            }
-        }
-    }
-
     /// Get or create an equivalence set for an expression.
     fn get_or_create_equivalence_set(&mut self, expr: &Expression) -> Option<usize> {
-        let key = ExpressionKey::from_expression(expr)?;
+        let key = self.compatible_key(expr)?;
 
         // Store the expression
         self.stored_expressions
@@ -454,6 +463,18 @@ impl FilterCombiner {
             .or_insert_with(|| expr.clone());
 
         Some(self.get_or_create_equivalence_set_by_key(&key))
+    }
+
+    fn compatible_key(&self, expression: &Expression) -> Option<ExpressionKey> {
+        let key = ExpressionKey::from_expression(expression)?;
+        // Ordinals select a bucket; the bound type and lexical identity still
+        // have to agree before a predicate can join an existing value domain.
+        if self.stored_expressions.get(&key).is_some_and(|stored| {
+            stored.return_type() != expression.return_type() || !stored.equals(expression)
+        }) {
+            return None;
+        }
+        Some(key)
     }
 
     /// Get or create an equivalence set by key.
@@ -696,7 +717,7 @@ impl Default for FilterCombiner {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use paro_planner::expression::ColumnRefExpression;
+    use paro_planner::expression::{ColumnRefExpression, ConjunctionExpression};
 
     fn make_column_ref(table_index: usize, column_index: usize) -> Expression {
         Expression::ColumnRef(
@@ -758,6 +779,175 @@ mod tests {
             }
             .into(),
         )
+    }
+
+    #[test]
+    fn self_equality_and_unsupported_conjuncts_keep_their_truth_tests() {
+        let column = make_column_ref(0, 0);
+        let equal = make_comparison(ComparisonType::Equal, column.clone(), column);
+        let unsupported = make_or(vec![
+            equal.clone(),
+            make_comparison(
+                ComparisonType::Equal,
+                make_column_ref(0, 1),
+                make_constant(7),
+            ),
+        ]);
+        let mut combiner = FilterCombiner::new();
+        assert_eq!(
+            combiner.add_filter(make_and(vec![equal.clone(), unsupported.clone()])),
+            FilterResult::Success
+        );
+        let filters = combiner.generate_filters();
+        assert_eq!(filters.len(), 2);
+        assert!(filters.iter().any(|filter| filter.equals(&equal)));
+        assert!(filters.iter().any(|filter| filter.equals(&unsupported)));
+    }
+
+    #[test]
+    fn value_domains_do_not_merge_outer_scopes_or_incompatible_types() {
+        let mut combiner = FilterCombiner::new();
+        let local = make_comparison(
+            ComparisonType::Equal,
+            make_column_ref(0, 0),
+            make_constant(1),
+        );
+        let outer_column = Expression::ColumnRef(
+            ColumnRefExpression::with_depth(
+                paro_planner::operator::ColumnBinding::new(0, 0),
+                LogicalType::Integer,
+                1,
+            )
+            .into(),
+        );
+        let outer = make_comparison(ComparisonType::Equal, outer_column, make_constant(2));
+        let typed = make_comparison(
+            ComparisonType::Equal,
+            Expression::ColumnRef(
+                ColumnRefExpression::new(
+                    paro_planner::operator::ColumnBinding::new(0, 0),
+                    LogicalType::BigInt,
+                )
+                .into(),
+            ),
+            Expression::Constant(
+                ConstantExpression::new(Value::BigInt(3), LogicalType::BigInt).into(),
+            ),
+        );
+        for predicate in [&local, &outer, &typed] {
+            assert_eq!(
+                combiner.add_filter(predicate.clone()),
+                FilterResult::Success
+            );
+        }
+        let filters = combiner.generate_filters();
+        assert_eq!(filters.len(), 3);
+        assert!(filters.iter().any(|filter| filter.equals(&local)));
+        assert!(filters.iter().any(|filter| filter.equals(&outer)));
+        assert!(filters.iter().any(|filter| filter.equals(&typed)));
+    }
+
+    #[test]
+    fn combined_predicates_match_an_independent_nullable_bag_oracle() {
+        fn value(expression: &Expression, row: &[Option<i32>; 2]) -> Option<i32> {
+            match expression {
+                Expression::ColumnRef(column) => row[column.binding.column_index],
+                Expression::Constant(constant) => match constant.value {
+                    Value::Integer(value) => Some(value),
+                    Value::Null(_) => None,
+                    _ => panic!("oracle integer operand"),
+                },
+                _ => panic!("oracle column or literal operand"),
+            }
+        }
+        fn truth(expression: &Expression, row: &[Option<i32>; 2]) -> Option<bool> {
+            match expression {
+                Expression::Comparison(comparison) => {
+                    let left = value(&comparison.left, row);
+                    let right = value(&comparison.right, row);
+                    match comparison.comparison_type {
+                        ComparisonType::DistinctFrom => Some(left != right),
+                        ComparisonType::NotDistinctFrom => Some(left == right),
+                        op => {
+                            let (left, right) = (left?, right?);
+                            Some(match op {
+                                ComparisonType::Equal => left == right,
+                                ComparisonType::NotEqual => left != right,
+                                ComparisonType::LessThan => left < right,
+                                ComparisonType::LessThanOrEqual => left <= right,
+                                ComparisonType::GreaterThan => left > right,
+                                ComparisonType::GreaterThanOrEqual => left >= right,
+                                _ => unreachable!(),
+                            })
+                        }
+                    }
+                }
+                Expression::Conjunction(conjunction) => {
+                    let and = conjunction.conjunction_type == ConjunctionType::And;
+                    let mut unknown = false;
+                    for child in &conjunction.children {
+                        match truth(child, row) {
+                            Some(value) if value != and => return Some(!and),
+                            None => unknown = true,
+                            _ => (),
+                        }
+                    }
+                    (!unknown).then_some(and)
+                }
+                _ => panic!("oracle predicate"),
+            }
+        }
+        let mut predicates = Vec::new();
+        for op in [
+            ComparisonType::Equal,
+            ComparisonType::NotEqual,
+            ComparisonType::LessThan,
+            ComparisonType::LessThanOrEqual,
+            ComparisonType::GreaterThan,
+            ComparisonType::GreaterThanOrEqual,
+            ComparisonType::DistinctFrom,
+            ComparisonType::NotDistinctFrom,
+        ] {
+            predicates.push(make_comparison(
+                op,
+                make_column_ref(0, 0),
+                make_column_ref(0, 0),
+            ));
+            predicates.push(make_comparison(
+                op,
+                make_column_ref(0, 0),
+                make_column_ref(0, 1),
+            ));
+            predicates.push(make_comparison(op, make_column_ref(0, 0), make_constant(0)));
+            predicates.push(make_comparison(
+                op,
+                make_column_ref(0, 1),
+                make_null_constant(),
+            ));
+        }
+        predicates.push(make_or(vec![predicates[0].clone(), predicates[2].clone()]));
+        let domain = [None, Some(-1), Some(0), Some(1), Some(1)]; // retain bag duplicates
+        for left in &predicates {
+            for right in &predicates {
+                let input = make_and(vec![left.clone(), right.clone()]);
+                let mut combiner = FilterCombiner::new();
+                let unsatisfiable =
+                    combiner.add_filter(input.clone()) == FilterResult::Unsatisfiable;
+                let output = combiner.generate_filters();
+                for x in domain {
+                    for y in domain {
+                        let row = [x, y];
+                        let expected = truth(&input, &row) == Some(true);
+                        let actual = !unsatisfiable
+                            && output.iter().all(|term| truth(term, &row) == Some(true));
+                        assert_eq!(
+                            actual, expected,
+                            "row={row:?}, input={input:?}, output={output:?}"
+                        );
+                    }
+                }
+            }
+        }
     }
 
     #[test]
