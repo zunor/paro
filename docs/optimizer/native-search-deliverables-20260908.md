@@ -338,3 +338,69 @@ Validation at committed `0ba087b4`: full workspace **6472 passed, 85 ignored**;
 strict workspace/all-target Clippy passes. The new SQL/plan-quality/Q11 execution
 checks after this commit are still pending; the earlier 184/184 SQL run and
 execution comparison must not be presented as verification of the new binary.
+
+## Native winner operands, predicate truth and candidate ownership
+
+`1926400d` shares immutable bound routine kernels, with copy-on-write mutation
+and exact semantic comparison. `d2d8c449` separates ordinary input columns from
+post-aggregate reducer outputs in the typed binding catalog. Equal ordinals and
+types do not alias these domains; rollback covers both namespaces and positional
+references cannot escape the reducer that owns them.
+
+`23f76ec8` moves production logical-template winner extraction onto the native
+scalar DAG. A shared operand-field manifest defines import/export scopes;
+comparison operands recover their left/right role from child column identity,
+not fingerprint order. A poisoned legacy projection scalar no longer changes
+the extracted expression. Search-provider executable payloads retain their
+separate fused provider contract. **Transformation rule construction still uses
+the legacy adapter**, so this is not completion of all 21 native rules.
+
+Canonical scalar ordering exposed an EXPLAIN presentation dependency:
+`native-plan-quality-native-export-20260909.json` failed one strict HAVING
+selector because `SUM(...) > 100` displayed as `100 < SUM(...)`. No estimate
+changed. `742ed05b` renders lone literals on the right using the exact flipped
+comparison, without changing scalar identity, search or the gate. The subsequent
+`native-plan-quality-native-export-display-20260909.json` passes **10/10** against
+the unchanged scalar-operands baseline: maximum q-error 2, mean 1.30833. Both
+reports remain available; the failed selector report was not overwritten.
+
+The release SQL suite initially passed 183/184 with just `l.id < r.id` versus
+`r.id > l.id` in the CTE EXPLAIN. `541741ab` acknowledges that single line after
+independently comparing the complete SELECT result with DuckDB. During the next
+predicate migration's safety probes, `WHERE x = x` was independently found to
+retain NULL incorrectly. `9262cf92` preserves that truth test, unsupported AND
+residuals, and typed/lexical equality domains. Its independent three-valued
+integer oracle covers 27,225 bag-row evaluations. All three added SQL probes
+match DuckDB; a rebuilt release on a fresh instance passes **184/184**, 40.86 s.
+No failing query result was blessed.
+
+| Report | Revision | Observation |
+| --- | --- | --- |
+| `native-q11-cold-shared-kernels-20260909.json` | `1926400d` | Five fresh processes, median 1442.61 ms versus 1475.47 ms; every prior search/settlement counter and plan digest matches |
+| `native-q11-allocation-shared-kernels-20260909.json` | `1926400d` | Memo allocation traffic 2,865,500,578 bytes versus 2,867,054,086; this is traffic, not live peak RSS |
+
+The small cold median difference is not a confidence-interval claim, and the
+allocation reduction is only 0.054%. These measurements precede native physical
+export and the predicate repair. They do not establish performance for those
+new binaries. The previous execution CI still crosses one; stable Q11 victory,
+the native relational-rule boundary and planning-memory admission are unfinished.
+
+Validation: at `23f76ec8`, full workspace **6481 passed / 85 ignored**;
+at `9262cf92`, optimizer **1014 passed**, strict workspace/all-target Clippy and
+the fresh SQL suite above pass.
+
+`e70279b0` admits immutable winner candidates before archiving them. Rejected
+proposals never acquire a published identity; candidates evicted after
+publication remain resolvable for existing parent references. The frontier and
+archive share one allocation, and incremental binary insertion preserves the
+same ordering/dominance contract. Two thousand duplicate proposals keep only
+two previously published candidates in the reference-lifetime test. An
+independent two-dimensional Pareto oracle checks all 120 insertion orders;
+the existing source-sensitive child-composition and closure oracles also pass.
+Proposal/publication counts are now explicit profile counters. This is an
+ownership/work-complexity improvement, not a query-wide memory cap.
+
+At `e70279b0`: full workspace **6486 passed / 85 ignored**, optimizer **1015
+passed**, strict workspace/all-target Clippy passes. New cold and instrumented
+allocation measurements will establish whether the storage change improves
+the measured workload; no search-budget constant was changed.
