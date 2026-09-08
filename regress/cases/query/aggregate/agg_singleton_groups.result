@@ -162,6 +162,38 @@ c_count	grouped_key_distribution
 0	1
 2	1
 
+BEGIN;
+BEGIN
+
+PREPARE singleton_reuse AS
+SELECT c.customer_key, count(o.order_key)
+FROM singleton_customer c LEFT JOIN singleton_orders o
+  ON c.customer_key = o.customer_key
+GROUP BY c.customer_key ORDER BY c.customer_key NULLS FIRST;
+PREPARE
+
+EXECUTE singleton_reuse;
+c.customer_key	count(o.order_key)
+1	2
+2	1
+3	0
+
+INSERT INTO singleton_customer VALUES (NULL), (NULL);
+INSERT 0 2
+
+EXECUTE singleton_reuse;
+c.customer_key	count(o.order_key)
+NULL	0
+1	2
+2	1
+3	0
+
+DEALLOCATE singleton_reuse;
+DEALLOCATE
+
+ROLLBACK;
+ROLLBACK
+
 DROP TABLE IF EXISTS nullable_singleton_customer;
 DROP TABLE
 

@@ -2,12 +2,10 @@
 -- SPDX-License-Identifier: Apache-2.0
 
 -- End-to-end coverage for a Q13-shaped left join reduction. The declared
--- nullable UNIQUE key and exact no-NULL data admit singleton lowering; the
--- EXPLAIN no longer shows a merge AGGREGATE because projection-chain folding
--- merges the singleton Project into the visible c_count projection. The
--- second query uses a
--- nullable UNIQUE key with duplicate NULLs and must retain ordinary GROUP BY
--- multiplicity.
+-- nullable UNIQUE key does not prove grouping uniqueness, even while its
+-- observed data is NULL-free. Only a revalidated schema/predicate guarantee
+-- may authorize singleton lowering in a reusable plan. Duplicate NULLs must
+-- retain ordinary GROUP BY multiplicity.
 -- @setup
 DROP TABLE IF EXISTS singleton_orders;
 DROP TABLE IF EXISTS singleton_orders_large;
@@ -54,10 +52,11 @@ INSERT INTO nullable_singleton_customer VALUES (1), (NULL), (NULL);
 INSERT INTO prefix_nullable_singleton_customer VALUES
     ('13-a', 1), ('13-b', NULL), ('13-c', NULL);
 
--- Known regression: the inner singleton proof currently lowers through a
--- partial-merge aggregate above the LEFT JOIN.  This is semantically exact,
--- but retains one extra hash-aggregate phase until native singleton state can
--- be carried directly through the outer grouping contract.
+-- The extra partial-merge AGGREGATE is required for this nullable UNIQUE
+-- declaration. The plan-quality corpus tracks it as a performance opportunity,
+-- not as permission to treat a NULL-free data observation as a schema proof.
+-- A future NULL-aware singleton implementation needs a lossless grouping path
+-- for NULL tuples; merely forwarding rows would change their multiplicity.
 EXPLAIN SELECT c_count, count(*) AS customer_distribution
 FROM (
     SELECT c.customer_key, count(o.order_key) AS c_count
@@ -122,6 +121,22 @@ FROM (
 ) AS counts
 GROUP BY c_count
 ORDER BY c_count;
+
+-- Reusing a plan after a data-only change must not carry an observation-based
+-- no-NULL proof from the first execution into the second execution.
+BEGIN;
+PREPARE singleton_reuse AS
+SELECT c.customer_key, count(o.order_key)
+FROM singleton_customer c LEFT JOIN singleton_orders o
+  ON c.customer_key = o.customer_key
+GROUP BY c.customer_key ORDER BY c.customer_key NULLS FIRST;
+-- @query nosort
+EXECUTE singleton_reuse;
+INSERT INTO singleton_customer VALUES (NULL), (NULL);
+-- @query nosort
+EXECUTE singleton_reuse;
+DEALLOCATE singleton_reuse;
+ROLLBACK;
 
 -- @teardown
 DROP TABLE IF EXISTS prefix_nullable_singleton_customer;
