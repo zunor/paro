@@ -5,7 +5,9 @@
 
 use crate::plan::{CardinalityEstimate, UniqueKey};
 use paro_common::types::LogicalType;
-use paro_storage::statistics::{BaseStatistics, ColumnStatistics, DistinctProvenance};
+use paro_storage::statistics::{
+    BaseStatistics, ColumnStatistics, DistinctProvenance, EstimatedNumericDistribution,
+};
 use std::sync::Arc;
 
 use super::ColumnBinding;
@@ -65,6 +67,7 @@ impl BoundReferenceId {
 #[derive(Debug, Clone)]
 pub struct BoundColumnValues {
     statistics: Arc<BaseStatistics>,
+    distribution: Option<EstimatedNumericDistribution>,
     encoding: Arc<[u8]>,
 }
 
@@ -77,12 +80,31 @@ impl PartialEq for BoundColumnValues {
 impl Eq for BoundColumnValues {}
 
 impl BoundColumnValues {
-    pub fn new(mut statistics: BaseStatistics) -> paro_common::error::Result<Self> {
+    pub fn new(statistics: BaseStatistics) -> paro_common::error::Result<Self> {
+        Self::with_distribution(statistics, None)
+    }
+
+    pub fn from_column(column: &ColumnStatistics) -> paro_common::error::Result<Self> {
+        Self::with_distribution(
+            column.statistics().clone(),
+            column.estimated_numeric_distribution(),
+        )
+    }
+
+    fn with_distribution(
+        mut statistics: BaseStatistics,
+        distribution: Option<EstimatedNumericDistribution>,
+    ) -> paro_common::error::Result<Self> {
         statistics.set_distinct_count(0);
-        let encoding = statistics.to_bytes()?.into();
+        let mut encoding = statistics.to_bytes()?;
+        encoding.push(u8::from(distribution.is_some()));
+        if let Some(distribution) = distribution {
+            encoding.extend_from_slice(&distribution.encoding());
+        }
         Ok(Self {
             statistics: Arc::new(statistics),
-            encoding,
+            distribution,
+            encoding: encoding.into(),
         })
     }
 
@@ -111,7 +133,12 @@ impl BoundColumnValues {
         };
         let mut statistics = left.statistics.as_ref().clone();
         statistics.merge(&right.statistics);
-        Self::new(statistics)
+        Self::with_distribution(
+            statistics,
+            (self.distribution == other.distribution)
+                .then_some(self.distribution)
+                .flatten(),
+        )
     }
 }
 
@@ -220,6 +247,13 @@ impl BoundReference {
                         .expected_distinct
                         .map(|distinct| usize::try_from(distinct).unwrap_or(usize::MAX)),
                     domain.provenance,
+                )
+                .with_estimated_numeric_distribution(
+                    self.facts
+                        .column_values
+                        .get(ordinal)
+                        .and_then(Option::as_ref)
+                        .and_then(|value| value.distribution),
                 );
                 if let Some(upper) = domain.guaranteed_distinct_upper {
                     column = column.with_guaranteed_distinct_upper(upper);
@@ -246,5 +280,43 @@ impl BoundReference {
         assert_eq!(self.bindings.len(), facts.source_lineage.len());
         self.facts = facts;
         self
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn distribution_transport_has_a_value_identity_and_never_becomes_a_bound() {
+        let distribution = EstimatedNumericDistribution::normal(200.0, 30.0).unwrap();
+        let column = ColumnStatistics::with_estimated_distinct(
+            BaseStatistics::create_unknown(LogicalType::Double),
+            None,
+        )
+        .with_estimated_numeric_distribution(Some(distribution));
+        let values = BoundColumnValues::from_column(&column).unwrap();
+        let unknown = BoundColumnValues::new(column.statistics().clone()).unwrap();
+        assert_ne!(values, unknown);
+        assert_eq!(values.hull(&values).unwrap(), values);
+        assert_eq!(values.hull(&unknown).unwrap(), unknown);
+        assert_eq!(unknown.hull(&values).unwrap(), unknown);
+        let mut reference = BoundReference::new(
+            BoundReferenceId::input_ordinal(0),
+            vec![ColumnBinding::new(7, 0)],
+            vec![LogicalType::Double],
+        );
+        reference.facts = Arc::new(BoundRelationFacts {
+            column_values: vec![Some(values)],
+            ..BoundRelationFacts::default()
+        });
+        let restored = reference.column_statistics().remove(0);
+        assert_eq!(
+            restored.estimated_numeric_distribution(),
+            Some(distribution)
+        );
+        assert_eq!(restored.statistics().min_value(), None);
+        assert_eq!(restored.statistics().max_value(), None);
+        assert_eq!(restored.guaranteed_distinct_upper(), None);
     }
 }

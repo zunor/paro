@@ -29,6 +29,15 @@ struct RelationFacts {
     column_ids: Box<[usize]>,
 }
 
+#[derive(Debug, PartialEq, Eq, Hash)]
+struct ColumnFactKey {
+    logical_type: LogicalType,
+    storage: Vec<u8>,
+    distinct: paro_storage::statistics::DistinctEvidence,
+    distribution: Option<paro_storage::statistics::EstimatedNumericDistribution>,
+    storage_observation: bool,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
 struct LocalKey {
     operator: Box<[u8]>,
@@ -149,15 +158,7 @@ pub(in crate::cascades::planner) struct SettlementCache {
     /// metadata such as partial coverage, so two byte-identical sketches can
     /// still have different proof contracts (ObservedFull vs
     /// ObservedPartial/Derived) and must never share a ColumnId.
-    column_values: HashMap<
-        (
-            LogicalType,
-            Vec<u8>,
-            paro_storage::statistics::DistinctEvidence,
-            bool,
-        ),
-        usize,
-    >,
+    column_values: HashMap<ColumnFactKey, usize>,
     /// Pointer fast path for live statistics allocations.  A `Weak` keeps
     /// the cache from pinning every column fact for the lifetime of the
     /// planner session while still making address reuse safe: an upgraded
@@ -272,12 +273,13 @@ impl SettlementCache {
 
     fn intern_column_value(&mut self, column: &Arc<ColumnStatistics>) -> Result<usize> {
         let pointer = Arc::as_ptr(column) as usize;
-        let key = (
-            column.statistics().get_type().clone(),
-            column.to_bytes()?,
-            column.distinct_evidence(),
-            column.is_storage_observation(),
-        );
+        let key = ColumnFactKey {
+            logical_type: column.statistics().get_type().clone(),
+            storage: column.to_bytes()?,
+            distinct: column.distinct_evidence(),
+            distribution: column.estimated_numeric_distribution(),
+            storage_observation: column.is_storage_observation(),
+        };
         let next = self.column_values.len();
         let id = *self.column_values.entry(key).or_insert(next);
         self.column_pointers
@@ -319,10 +321,8 @@ impl SettlementCache {
             .columns
             .iter()
             .map(|column| {
-                paro_planner::operator::bound_reference::BoundColumnValues::new(
-                    column.statistics().clone(),
-                )
-                .map(Some)
+                paro_planner::operator::bound_reference::BoundColumnValues::from_column(column)
+                    .map(Some)
             })
             .collect::<Result<Vec<_>>>()?;
         reference.facts = Arc::new(domain);
@@ -1149,6 +1149,133 @@ mod tests {
         let full_id = cache.intern_column_value(&Arc::new(full)).unwrap();
         let partial_id = cache.intern_column_value(&Arc::new(partial)).unwrap();
         assert_ne!(full_id, partial_id);
+    }
+
+    #[test]
+    fn grouped_sum_estimate_crosses_group_holes_and_renaming_without_a_tree_witness() {
+        use paro_function::aggregate::distributive::sum::get_sum_function;
+        use paro_planner::expression::{AggregateExpression, ComparisonExpression, ComparisonType};
+        use paro_planner::operator::{Aggregate, Filter};
+        use paro_storage::statistics::{BaseStatistics, NumericStats};
+
+        let env = environment();
+        let mut cache = SettlementCache::default();
+        let mut amount = BaseStatistics::create_empty(LogicalType::Integer);
+        NumericStats::update(&mut amount, &Value::Integer(0));
+        NumericStats::update(&mut amount, &Value::Integer(200));
+        let input = cache
+            .intern_fact(RelationFacts {
+                layout: LogicalOutputLayout::new(
+                    vec![LogicalType::Integer; 2],
+                    vec![ColumnBinding::new(0, 0), ColumnBinding::new(0, 1)],
+                ),
+                stats: NodeStats {
+                    estimated_cardinality: Some(CardinalityEstimate::exact(8)),
+                    ..NodeStats::default()
+                },
+                maximum: None,
+                columns: vec![
+                    Arc::new(ColumnStatistics::with_estimated_distinct(
+                        BaseStatistics::create_unknown(LogicalType::Integer),
+                        Some(4),
+                    )),
+                    Arc::new(ColumnStatistics::with_estimated_distinct(amount, Some(6))),
+                ],
+                column_ids: Box::new([]),
+            })
+            .unwrap();
+        let column = |table, index, ty| {
+            Expression::ColumnRef(
+                ColumnRefExpression::new(ColumnBinding::new(table, index), ty).into(),
+            )
+        };
+        let (sum, _) = get_sum_function().bind(&[LogicalType::Integer]).unwrap();
+        let aggregate = OwnedLogicalPlan::new(
+            &env.bind_context,
+            LogicalOperator::Aggregate(Box::new(Aggregate::new(
+                1,
+                2,
+                3,
+                cache.boundary(0, input).unwrap(),
+                vec![column(0, 0, LogicalType::Integer)],
+                Vec::new(),
+                vec![Expression::Aggregate(
+                    AggregateExpression::new(
+                        sum,
+                        vec![column(0, 1, LogicalType::Integer)],
+                        LogicalType::BigInt,
+                    )
+                    .into(),
+                )],
+                Vec::new(),
+            ))),
+        );
+        let settled = cache.settle(aggregate, &env).unwrap();
+        let amount = settled.statistics[&ColumnBinding::new(2, 0)].clone();
+        assert_eq!(
+            amount.estimated_numeric_distribution().unwrap().mean(),
+            200.0
+        );
+        let output = cache
+            .intern_fact(RelationFacts {
+                layout: settled.plan.output_layout(),
+                stats: settled.plan.stats.clone(),
+                maximum: None,
+                columns: vec![
+                    settled.statistics[&ColumnBinding::new(1, 0)].clone(),
+                    amount,
+                ],
+                column_ids: Box::new([]),
+            })
+            .unwrap();
+        for renamed in [false, true] {
+            // No Aggregate exists in either consumer's bound input. The
+            // selectivity must come exclusively from the column fact.
+            let boundary = cache.boundary(0, output).unwrap();
+            let (child, amount) = if renamed {
+                (
+                    OwnedLogicalPlan::new(
+                        &env.bind_context,
+                        LogicalOperator::Projection(Projection::new(
+                            4,
+                            boundary,
+                            vec![
+                                column(1, 0, LogicalType::Integer),
+                                column(2, 0, LogicalType::BigInt),
+                            ],
+                        )),
+                    ),
+                    column(4, 1, LogicalType::BigInt),
+                )
+            } else {
+                (boundary, column(2, 0, LogicalType::BigInt))
+            };
+            let filter = OwnedLogicalPlan::new(
+                &env.bind_context,
+                LogicalOperator::Filter(Filter::new(
+                    child,
+                    vec![Expression::Comparison(
+                        ComparisonExpression::new(
+                            ComparisonType::GreaterThan,
+                            amount,
+                            Expression::Constant(
+                                ConstantExpression::new(Value::BigInt(100), LogicalType::BigInt)
+                                    .into(),
+                            ),
+                        )
+                        .into(),
+                    )],
+                )),
+            );
+            let output = cache.settle(filter, &env).unwrap();
+            assert_eq!(output.plan.stats.estimated_cardinality.unwrap().expected, 3);
+            let amount = ColumnBinding::new(if renamed { 4 } else { 2 }, usize::from(renamed));
+            assert_eq!(
+                output.statistics[&amount].estimated_numeric_distribution(),
+                None,
+                "a filtered output cannot republish its unconditional input distribution"
+            );
+        }
     }
 
     #[test]

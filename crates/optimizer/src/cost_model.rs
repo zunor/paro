@@ -411,14 +411,6 @@ impl CostModel {
         self.cardinality_from_selectivity(base_cardinality, combined.fraction, combined.proven)
     }
 
-    pub(crate) fn estimate_cardinality_from_selectivity(
-        &self,
-        base_cardinality: u64,
-        selectivity: f64,
-    ) -> CardinalityEstimate {
-        self.cardinality_from_selectivity(base_cardinality, selectivity, false)
-    }
-
     pub(crate) fn apply_selectivity_to_cardinality(
         &self,
         base: CardinalityEstimate,
@@ -825,6 +817,17 @@ fn estimate_range_selectivity(
     constant: &Value,
     comparison_type: ComparisonType,
 ) -> Option<f64> {
+    if let Some(distribution) = stats.estimated_numeric_distribution() {
+        let constant =
+            crate::statistics::aggregate_filter::numeric_value(constant, stats.get_type())
+                .filter(|value| value.is_finite())?;
+        return crate::statistics::aggregate_filter::normal_comparison_selectivity(
+            distribution.mean(),
+            distribution.variance(),
+            constant,
+            comparison_type,
+        );
+    }
     let minimum = NumericStats::min(stats.statistics())?;
     let maximum = NumericStats::max(stats.statistics())?;
 

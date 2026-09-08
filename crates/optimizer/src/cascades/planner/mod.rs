@@ -498,8 +498,8 @@ fn attach_group_column_domains(
         if let Some(statistics) = statistics {
             properties.column_values.insert(
                 column,
-                paro_planner::operator::bound_reference::BoundColumnValues::new(
-                    statistics.statistics().clone(),
+                paro_planner::operator::bound_reference::BoundColumnValues::from_column(
+                    statistics,
                 )?,
             );
         }

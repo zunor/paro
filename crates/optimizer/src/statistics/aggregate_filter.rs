@@ -17,40 +17,22 @@ use std::sync::Arc;
 use paro_common::runtime_value::Value;
 use paro_common::types::LogicalType;
 use paro_function::aggregate::AggregateAlgebra;
-use paro_planner::expression::{AggregateType, ComparisonType, ConstantExpression, Expression};
-use paro_planner::operator::{ColumnBinding, Filter, LogicalOperator};
-use paro_storage::statistics::{ColumnStatistics, NumericStats};
+use paro_planner::expression::{AggregateType, ComparisonType, Expression};
+use paro_planner::operator::ColumnBinding;
+use paro_storage::statistics::{ColumnStatistics, EstimatedNumericDistribution, NumericStats};
 
-pub(crate) fn estimate_grouped_sum_filter_selectivity(
-    filter: &Filter,
+/// Derive the aggregate output once, at its producer. Consumers read these
+/// moments as column evidence, including through a Memo group hole or a pure
+/// renaming projection; they never reconstruct an Aggregate child to discover
+/// the distribution. The model and its assumptions are unchanged.
+pub(crate) fn estimate_grouped_sum_distribution(
+    expression: &Expression,
+    input_rows: u64,
+    group_rows: u64,
+    input_bindings: &[ColumnBinding],
     column_stats: &HashMap<ColumnBinding, Arc<ColumnStatistics>>,
-) -> Option<f64> {
-    let [Expression::Comparison(comparison)] = filter.expressions.as_slice() else {
-        return None;
-    };
-    let (output, constant, comparison_type) = normalized_comparison(
-        comparison.left.as_ref(),
-        comparison.right.as_ref(),
-        comparison.comparison_type,
-    )?;
-    let LogicalOperator::Aggregate(aggregate) = &filter.child.operator else {
-        return None;
-    };
-    let aggregate_index = match output {
-        Expression::ColumnRef(column)
-            if column.depth == 0 && column.binding.table_index == aggregate.aggregate_index =>
-        {
-            column.binding.column_index
-        }
-        Expression::Reference(reference)
-            if reference.index >= aggregate.groups.len()
-                && reference.index < aggregate.groups.len() + aggregate.aggregates.len() =>
-        {
-            reference.index - aggregate.groups.len()
-        }
-        _ => return None,
-    };
-    let Expression::Aggregate(sum) = aggregate.aggregates.get(aggregate_index)? else {
+) -> Option<EstimatedNumericDistribution> {
+    let Expression::Aggregate(sum) = expression else {
         return None;
     };
     if sum.function.algebra != Some(AggregateAlgebra::Sum)
@@ -65,9 +47,7 @@ pub(crate) fn estimate_grouped_sum_filter_selectivity(
     };
     let input_binding = match input {
         Expression::ColumnRef(column) if column.depth == 0 => column.binding,
-        Expression::Reference(reference) => {
-            *aggregate.child.get_column_bindings().get(reference.index)?
-        }
+        Expression::Reference(reference) => *input_bindings.get(reference.index)?,
         _ => return None,
     };
     let stats = column_stats.get(&input_binding)?;
@@ -75,13 +55,12 @@ pub(crate) fn estimate_grouped_sum_filter_selectivity(
     let input_type = input.return_type();
     let minimum = numeric_value(&minimum, &input_type)?;
     let maximum = numeric_value(&maximum, &input_type)?;
-    let constant = numeric_value(&constant.value, &constant.return_type)?;
-    if !minimum.is_finite() || !maximum.is_finite() || !constant.is_finite() || minimum > maximum {
+    if !minimum.is_finite() || !maximum.is_finite() || minimum > maximum {
         return None;
     }
 
-    let input_rows = aggregate.child.stats.estimated_cardinality?.expected.max(1) as f64;
-    let group_rows = filter.child.stats.estimated_cardinality?.expected.max(1) as f64;
+    let input_rows = input_rows.max(1) as f64;
+    let group_rows = group_rows.max(1) as f64;
     let rows_per_group = (input_rows / group_rows).max(1.0);
 
     // Model every non-empty group as one mandatory observation plus a
@@ -93,10 +72,10 @@ pub(crate) fn estimate_grouped_sum_filter_selectivity(
     let sum_mean = rows_per_group * input_mean;
     let sum_variance =
         rows_per_group * input_variance + (rows_per_group - 1.0).max(0.0) * input_mean.powi(2);
-    normal_comparison_selectivity(sum_mean, sum_variance, constant, comparison_type)
+    EstimatedNumericDistribution::normal(sum_mean, sum_variance)
 }
 
-fn normal_comparison_selectivity(
+pub(crate) fn normal_comparison_selectivity(
     mean: f64,
     variance: f64,
     constant: f64,
@@ -119,38 +98,7 @@ fn normal_comparison_selectivity(
     })
 }
 
-fn normalized_comparison<'a>(
-    left: &'a Expression,
-    right: &'a Expression,
-    comparison_type: ComparisonType,
-) -> Option<(&'a Expression, &'a ConstantExpression, ComparisonType)> {
-    match (left, right) {
-        (
-            output @ (Expression::ColumnRef(_) | Expression::Reference(_)),
-            Expression::Constant(constant),
-        ) => Some((output, constant, comparison_type)),
-        (
-            Expression::Constant(constant),
-            output @ (Expression::ColumnRef(_) | Expression::Reference(_)),
-        ) => Some((output, constant, flip_comparison(comparison_type))),
-        _ => None,
-    }
-}
-
-fn flip_comparison(comparison: ComparisonType) -> ComparisonType {
-    match comparison {
-        ComparisonType::Equal => ComparisonType::Equal,
-        ComparisonType::NotEqual => ComparisonType::NotEqual,
-        ComparisonType::LessThan => ComparisonType::GreaterThan,
-        ComparisonType::GreaterThan => ComparisonType::LessThan,
-        ComparisonType::LessThanOrEqual => ComparisonType::GreaterThanOrEqual,
-        ComparisonType::GreaterThanOrEqual => ComparisonType::LessThanOrEqual,
-        ComparisonType::DistinctFrom => ComparisonType::DistinctFrom,
-        ComparisonType::NotDistinctFrom => ComparisonType::NotDistinctFrom,
-    }
-}
-
-fn numeric_value(value: &Value, logical_type: &LogicalType) -> Option<f64> {
+pub(crate) fn numeric_value(value: &Value, logical_type: &LogicalType) -> Option<f64> {
     let raw = match value {
         Value::TinyInt(value) => Some(*value as f64),
         Value::SmallInt(value) => Some(*value as f64),
@@ -209,9 +157,7 @@ mod tests {
     use paro_planner::plan::{CardinalityEstimate, OwnedLogicalPlan};
     use paro_storage::statistics::{BaseStatistics, ColumnStatistics, NumericStats};
 
-    use super::{
-        estimate_grouped_sum_filter_selectivity, normal_cdf, normal_comparison_selectivity,
-    };
+    use super::{estimate_grouped_sum_distribution, normal_cdf, normal_comparison_selectivity};
 
     fn decimal(precision: u8) -> LogicalType {
         LogicalType::Decimal {
@@ -311,12 +257,41 @@ mod tests {
     fn grouped_decimal_sum_uses_logical_scale_and_reference_lineage() {
         for constant_on_left in [false, true] {
             let (filter, stats) = q18_sum_filter(constant_on_left);
-            let selectivity = estimate_grouped_sum_filter_selectivity(&filter, &stats).unwrap();
-            assert!(
-                selectivity < 0.001,
-                "expected a selective upper tail, got {selectivity}"
+            let LogicalOperator::Aggregate(aggregate) = &filter.child.operator else {
+                unreachable!()
+            };
+            let distribution = estimate_grouped_sum_distribution(
+                &aggregate.aggregates[0],
+                6_000_000,
+                1_500_000,
+                &aggregate.child.get_column_bindings(),
+                &stats,
+            )
+            .unwrap();
+            assert_eq!(
+                distribution.mean(),
+                102.0,
+                "decimal moments use logical units"
             );
-            assert!(selectivity > 0.0);
+            let output = Arc::new(
+                ColumnStatistics::with_estimated_distinct(
+                    BaseStatistics::create_unknown(decimal(38)),
+                    None,
+                )
+                .with_estimated_numeric_distribution(Some(distribution)),
+            );
+            let estimate = crate::cost_model::CostModel::default()
+                .estimate_filter_cardinality_with_positions(
+                    1_500_000,
+                    &filter.expressions,
+                    &HashMap::from([(ColumnBinding::new(21, 0), output)]),
+                    &aggregate.get_column_bindings(),
+                );
+            assert!(
+                estimate.expected < 1_500,
+                "expected a selective upper tail: {estimate:?}"
+            );
+            assert!(estimate.expected > 1);
         }
     }
 }

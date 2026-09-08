@@ -21,7 +21,7 @@ use paro_storage::index::graph::GraphStatsProvider;
 use paro_storage::statistics::{BaseStatistics, ColumnStatistics};
 
 use crate::context::{GraphStatsCache, OptimizationContext, SharedColumnStatistics};
-use crate::statistics::aggregate_filter::estimate_grouped_sum_filter_selectivity;
+use crate::statistics::aggregate_filter::estimate_grouped_sum_distribution;
 
 fn external_table_cardinality(
     table: &paro_planner::operator::LogicalExternalTable,
@@ -553,13 +553,6 @@ impl StatisticsGathering {
         ctx: &CardinalityInputs<'_>,
     ) -> Option<CardinalityEstimate> {
         let child = filter.child.stats.estimated_cardinality?;
-        if let Some(selectivity) = estimate_grouped_sum_filter_selectivity(filter, ctx.column_stats)
-        {
-            return Some(
-                ctx.cost_model
-                    .estimate_cardinality_from_selectivity(child.expected, selectivity),
-            );
-        }
         Some(ctx.cost_model.estimate_filter_cardinality_with_positions(
             child.expected,
             &filter.expressions,
@@ -798,7 +791,38 @@ impl StatisticsGathering {
                         .map(|expr| expression_statistics(expr, ctx)),
                 );
                 stats.extend(agg.aggregates.iter().map(|expr| {
-                    aggregate_expression_statistics(expr, ctx, guaranteed_output_rows)
+                    let output = aggregate_expression_statistics(expr, ctx, guaranteed_output_rows);
+                    let distribution = if agg.post_reduction.is_none()
+                        && agg.grouping_sets.is_empty()
+                        && !agg.groups.is_empty()
+                    {
+                        agg.child
+                            .stats
+                            .estimated_cardinality
+                            .zip(plan.stats.estimated_cardinality)
+                            .zip(child_layouts.first())
+                            .and_then(|((input, groups), layout)| {
+                                estimate_grouped_sum_distribution(
+                                    expr,
+                                    input.expected,
+                                    groups.expected,
+                                    layout.bindings(),
+                                    &ctx.column_stats,
+                                )
+                            })
+                    } else {
+                        None
+                    };
+                    if distribution.is_some() {
+                        Arc::new(
+                            output
+                                .as_ref()
+                                .copy()
+                                .with_estimated_numeric_distribution(distribution),
+                        )
+                    } else {
+                        output
+                    }
                 }));
                 stats.extend(
                     agg.grouping_functions
@@ -844,7 +868,32 @@ impl StatisticsGathering {
             _ => collect_output_stats_for_layout(output_layout, ctx),
         };
 
-        for (binding, stats) in output_layout.bindings().iter().copied().zip(output_stats) {
+        // A conditional or multiplicity-changing boundary cannot retain an
+        // unconditional value distribution without an explicit conditioning
+        // model. Value bounds and NDV remain separate and are not erased.
+        let preserves_distribution = matches!(
+            plan.operator,
+            LogicalOperator::Get(_)
+                | LogicalOperator::BoundReference(_)
+                | LogicalOperator::Projection(_)
+                | LogicalOperator::RowFetch(_)
+                | LogicalOperator::ExternalProject(_)
+                | LogicalOperator::Order(_)
+                | LogicalOperator::Aggregate(_)
+                | LogicalOperator::SetOperation(_)
+                | LogicalOperator::MaterializedCTE(_)
+                | LogicalOperator::CTERef(_)
+                | LogicalOperator::DelimGet(_)
+        );
+        for (binding, mut stats) in output_layout.bindings().iter().copied().zip(output_stats) {
+            if !preserves_distribution && stats.estimated_numeric_distribution().is_some() {
+                stats = Arc::new(
+                    stats
+                        .as_ref()
+                        .copy()
+                        .with_estimated_numeric_distribution(None),
+                );
+            }
             ctx.column_stats_mut().insert(binding, stats);
         }
     }

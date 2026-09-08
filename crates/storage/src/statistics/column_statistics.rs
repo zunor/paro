@@ -14,6 +14,7 @@ use paro_common::types::LogicalType;
 
 use super::base_statistics::BaseStatistics;
 use super::distinct_statistics::DistinctStatistics;
+use super::EstimatedNumericDistribution;
 
 /// Column-level statistics combining base statistics with distinct statistics.
 ///
@@ -73,6 +74,9 @@ pub struct ColumnStatistics {
     /// shape: a Projection, SearchScan, or CTE boundary can preserve the same
     /// observation while a bare Get can also carry a derived domain.
     storage_observation: bool,
+    /// Distribution of values at this relational boundary. It is costing
+    /// evidence only; BaseStatistics remains the sole value-bound contract.
+    estimated_numeric_distribution: Option<EstimatedNumericDistribution>,
 }
 
 /// Provenance of a distinct-count estimate.  A scalar NDV is not sufficient
@@ -207,6 +211,7 @@ impl ColumnStatistics {
             guaranteed_distinct_upper: None,
             distinct_coverage: None,
             storage_observation: false,
+            estimated_numeric_distribution: None,
         }
     }
 
@@ -223,6 +228,7 @@ impl ColumnStatistics {
             guaranteed_distinct_upper: None,
             distinct_coverage: None,
             storage_observation: false,
+            estimated_numeric_distribution: None,
         }
     }
 
@@ -237,6 +243,7 @@ impl ColumnStatistics {
             guaranteed_distinct_upper: None,
             distinct_coverage: None,
             storage_observation: false,
+            estimated_numeric_distribution: None,
         }
     }
 
@@ -263,6 +270,18 @@ impl ColumnStatistics {
                 .map_or(upper, |current| current.min(upper)),
         );
         self
+    }
+
+    pub fn with_estimated_numeric_distribution(
+        mut self,
+        distribution: Option<EstimatedNumericDistribution>,
+    ) -> Self {
+        self.estimated_numeric_distribution = distribution;
+        self
+    }
+
+    pub fn estimated_numeric_distribution(&self) -> Option<EstimatedNumericDistribution> {
+        self.estimated_numeric_distribution
     }
 
     /// Attach the owning row domain. An unbound segment sketch covers its
@@ -464,6 +483,11 @@ impl ColumnStatistics {
         self_rows: Option<u64>,
         other_rows: Option<u64>,
     ) {
+        // A mixture has the same moments only when both inputs agree. Without
+        // row weights, inventing a mean from one arm would hide uncertainty.
+        if self.estimated_numeric_distribution != other.estimated_numeric_distribution {
+            self.estimated_numeric_distribution = None;
+        }
         // Capture ownership before merging can turn None + Some into Some.
         let has_left_sketch = self.distinct_stats.is_some();
         let has_right_sketch = other.distinct_stats.is_some();
@@ -553,6 +577,7 @@ impl ColumnStatistics {
     /// * `hashes` - Hash values of the data
     /// * `count` - Number of values
     pub fn update_distinct_statistics(&mut self, hashes: &[u64], count: usize) {
+        self.estimated_numeric_distribution = None;
         if let Some(distinct) = &mut self.distinct_stats {
             Arc::make_mut(distinct).update(hashes, count);
             self.distinct_coverage = None;
@@ -566,6 +591,7 @@ impl ColumnStatistics {
 
     /// Get a mutable reference to the base statistics.
     pub fn statistics_mut(&mut self) -> &mut BaseStatistics {
+        self.estimated_numeric_distribution = None;
         &mut self.stats
     }
 
@@ -585,6 +611,7 @@ impl ColumnStatistics {
     ///
     /// Returns None if distinct statistics are not available.
     pub fn distinct_stats_mut(&mut self) -> Option<&mut DistinctStatistics> {
+        self.estimated_numeric_distribution = None;
         self.distinct_stats.as_mut().map(Arc::make_mut)
     }
 
@@ -592,6 +619,7 @@ impl ColumnStatistics {
     ///
     /// This replaces any existing distinct statistics.
     pub fn set_distinct(&mut self, distinct_stats: Option<DistinctStatistics>) {
+        self.estimated_numeric_distribution = None;
         self.estimated_distinct = None;
         self.estimated_provenance = None;
         self.distinct_stats = distinct_stats.map(Arc::new);
@@ -609,6 +637,7 @@ impl ColumnStatistics {
             guaranteed_distinct_upper: self.guaranteed_distinct_upper,
             distinct_coverage: self.distinct_coverage,
             storage_observation: self.storage_observation,
+            estimated_numeric_distribution: self.estimated_numeric_distribution,
         }
     }
 
@@ -667,6 +696,7 @@ impl ColumnStatistics {
             guaranteed_distinct_upper: None,
             distinct_coverage: None,
             storage_observation: false,
+            estimated_numeric_distribution: None,
         })
     }
 
@@ -710,6 +740,33 @@ impl std::fmt::Display for ColumnStatistics {
 mod tests {
     use super::*;
     use paro_common::runtime_value::Value;
+
+    #[test]
+    fn distribution_estimates_are_query_local_and_merge_only_when_both_inputs_agree() {
+        let distribution = EstimatedNumericDistribution::normal(30.0, 4.0).unwrap();
+        let unknown = ColumnStatistics::with_estimated_distinct(
+            BaseStatistics::create_unknown(LogicalType::Double),
+            None,
+        );
+        let estimated = unknown
+            .copy()
+            .with_estimated_numeric_distribution(Some(distribution));
+        assert_eq!(
+            estimated.copy().estimated_numeric_distribution(),
+            Some(distribution)
+        );
+        let restored =
+            ColumnStatistics::from_bytes(&estimated.to_bytes().unwrap(), LogicalType::Double)
+                .unwrap();
+        assert_eq!(restored.estimated_numeric_distribution(), None);
+        let mut same = estimated.copy();
+        same.merge(&estimated);
+        assert_eq!(same.estimated_numeric_distribution(), Some(distribution));
+        for (mut left, right) in [(estimated.copy(), unknown.copy()), (unknown, estimated)] {
+            left.merge(&right);
+            assert_eq!(left.estimated_numeric_distribution(), None);
+        }
+    }
 
     #[test]
     fn immutable_domain_ndv_is_not_an_empty_sketch_or_a_storage_observation() {
